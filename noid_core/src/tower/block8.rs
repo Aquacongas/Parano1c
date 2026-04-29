@@ -96,19 +96,35 @@ static GF256_MUL_TABLE: [[u8; 256]; 256] = {
         let mut p: u16 = 0;
         let mut i = 0u16;
         while i < 8 {
-            if (b >> i) & 1 == 1 { p ^= a << i; }
+            if (b >> i) & 1 == 1 {
+                p ^= a << i;
+            }
             i += 1;
         }
         // Reduce mod 0x11B (x^8+x^4+x^3+x+1).
         // Process bits 14 down to 8.
         const POLY: u16 = 0x1B;
-        if (p >> 14) & 1 == 1 { p ^= POLY << 6; }
-        if (p >> 13) & 1 == 1 { p ^= POLY << 5; }
-        if (p >> 12) & 1 == 1 { p ^= POLY << 4; }
-        if (p >> 11) & 1 == 1 { p ^= POLY << 3; }
-        if (p >> 10) & 1 == 1 { p ^= POLY << 2; }
-        if (p >>  9) & 1 == 1 { p ^= POLY << 1; }
-        if (p >>  8) & 1 == 1 { p ^= POLY; }
+        if (p >> 14) & 1 == 1 {
+            p ^= POLY << 6;
+        }
+        if (p >> 13) & 1 == 1 {
+            p ^= POLY << 5;
+        }
+        if (p >> 12) & 1 == 1 {
+            p ^= POLY << 4;
+        }
+        if (p >> 11) & 1 == 1 {
+            p ^= POLY << 3;
+        }
+        if (p >> 10) & 1 == 1 {
+            p ^= POLY << 2;
+        }
+        if (p >> 9) & 1 == 1 {
+            p ^= POLY << 1;
+        }
+        if (p >> 8) & 1 == 1 {
+            p ^= POLY;
+        }
         p as u8
     }
     const fn build() -> [[u8; 256]; 256] {
@@ -251,4 +267,3 @@ mod tests {
         assert_eq!(secret, Block8::ZERO);
     }
 }
-

@@ -130,4 +130,3 @@ mod tests {
         assert_eq!(x7, manual);
     }
 }
-

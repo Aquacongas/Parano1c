@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid. All rights reserved.
 
@@ -11,14 +10,14 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
+use noid_core::ntt::forward_ntt_parallel;
 use noid_core::packed::PackedBlock128;
 use noid_core::sumcheck::prove::prove_single_packed;
-use noid_core::ntt::forward_ntt_parallel;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 
-use noid_fri::merkle::MerkleTree;
 use noid_fri::channel::Channel;
 use noid_fri::code::LOG_RATE;
+use noid_fri::merkle::MerkleTree;
 use noid_fri::prover::{commit, prove};
 
 use noid_poseidon2b::native::compression::Poseidon2bSponge;

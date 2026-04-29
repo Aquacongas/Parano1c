@@ -20,4 +20,3 @@ use crate::Block128;
 pub fn mul_block128_fast(a: Block128, b: Block128) -> Block128 {
     a * b
 }
-

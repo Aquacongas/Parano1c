@@ -285,5 +285,3 @@ mod tests {
         assert_eq!(transcript_scalar, transcript_packed);
     }
 }
-
-

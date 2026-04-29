@@ -84,9 +84,9 @@ pub fn fold(
     let twiddle = ntt.get_subspace_eval(round, idx);
     let mut x0 = val0;
     let mut x1 = val1;
-    x1 += x0;                     // x1 = val0 + val1
-    x0 += x1 * twiddle;           // x0 = val0 + (val0+val1)*twiddle
-    x0 + r * (x0 + x1)            // fold at challenge r
+    x1 += x0; // x1 = val0 + val1
+    x0 += x1 * twiddle; // x0 = val0 + (val0+val1)*twiddle
+    x0 + r * (x0 + x1) // fold at challenge r
 }
 
 #[cfg(test)]
@@ -107,9 +107,7 @@ mod tests {
 
         assert_eq!(code.encoding.len(), poly.len() * RATE);
 
-        let r: Vec<Block128> = (0..l)
-            .map(|_| Block128::from(rng.gen::<u128>()))
-            .collect();
+        let r: Vec<Block128> = (0..l).map(|_| Block128::from(rng.gen::<u128>())).collect();
 
         let mut folded = code.fold_code(r[0], 0, &ntt);
         for (round, &challenge) in r.iter().enumerate().skip(1) {
@@ -135,7 +133,9 @@ mod tests {
         let mut rng = rand::thread_rng();
         let log_msg = 2usize; // 4-element message → 16 code symbols
         let ntt = AdditiveNTT::<Block128>::new(log_msg + LOG_RATE);
-        let msg: Vec<Block128> = (0..1<<log_msg).map(|_| Block128::from(rng.gen::<u128>())).collect();
+        let msg: Vec<Block128> = (0..1 << log_msg)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
         let code = Code::new(&msg, &ntt);
 
         let r = Block128::from(rng.gen::<u128>());
@@ -144,9 +144,18 @@ mod tests {
         // For each pair, fold(r, 0, i, code[2i], code[2i+1]) must equal folded[i].
         for i in 0..(code.encoding.len() / 2) {
             let expected = folded.encoding[i];
-            let computed = fold(r, 0, i, code.encoding[2*i], code.encoding[2*i+1], &ntt);
-            assert_eq!(computed, expected,
-                "fold mismatch at i={i}: computed={computed:?} expected={expected:?}");
+            let computed = fold(
+                r,
+                0,
+                i,
+                code.encoding[2 * i],
+                code.encoding[2 * i + 1],
+                &ntt,
+            );
+            assert_eq!(
+                computed, expected,
+                "fold mismatch at i={i}: computed={computed:?} expected={expected:?}"
+            );
         }
     }
 
@@ -162,9 +171,10 @@ mod tests {
         let msg = vec![Block128::from(42u128)];
         let code = Code::new(&msg, &ntt);
         // A 1-element message encodes to RATE=4 equal symbols (constant codeword).
-        assert!(code.encoding.windows(2).all(|w| w[0] == w[1]),
-            "RS encoding of 1 element should be constant: {:?}", code.encoding);
+        assert!(
+            code.encoding.windows(2).all(|w| w[0] == w[1]),
+            "RS encoding of 1 element should be constant: {:?}",
+            code.encoding
+        );
     }
-
 }
-

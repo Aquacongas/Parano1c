@@ -19,10 +19,17 @@ use crate::{Block128, TowerField};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub const PACKED_LANES: usize = 4;
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f"), target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_feature = "avx512f"),
+    target_feature = "avx2"
+))]
 pub const PACKED_LANES: usize = 2;
 
-#[cfg(not(all(target_arch = "x86_64", any(target_feature = "avx512f", target_feature = "avx2"))))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx512f", target_feature = "avx2")
+)))]
 pub const PACKED_LANES: usize = 1;
 
 /// SIMD-packed block of Block128 values.
@@ -33,14 +40,21 @@ pub struct PackedBlock128 {
     lanes: [u128; 4],
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f"), target_feature = "avx2"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(target_feature = "avx512f"),
+    target_feature = "avx2"
+))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedBlock128 {
     lanes: [u128; 2],
 }
 
-#[cfg(not(all(target_arch = "x86_64", any(target_feature = "avx512f", target_feature = "avx2"))))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx512f", target_feature = "avx2")
+)))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedBlock128 {
@@ -49,10 +63,14 @@ pub struct PackedBlock128 {
 
 impl PackedBlock128 {
     /// Zero constant.
-    pub const ZERO: Self = Self { lanes: [0; PACKED_LANES] };
+    pub const ZERO: Self = Self {
+        lanes: [0; PACKED_LANES],
+    };
 
     /// One constant (all lanes set to Block128::ONE).
-    pub const ONE: Self = Self { lanes: [1; PACKED_LANES] };
+    pub const ONE: Self = Self {
+        lanes: [1; PACKED_LANES],
+    };
 
     /// Create from a slice of Block128. Panics if slice is too short.
     #[inline(always)]
@@ -142,7 +160,6 @@ impl std::ops::BitXorAssign for PackedBlock128 {
 /// The input slice must be aligned to at least 16 bytes.
 #[inline(always)]
 pub fn pack_slice(slice: &[Block128]) -> &[PackedBlock128] {
-
     if PACKED_LANES > 1 {
         assert_eq!(slice.len() % PACKED_LANES, 0);
     }
@@ -206,11 +223,9 @@ mod tests {
     #[test]
     fn packed_reduce_xor() {
         // reduce_xor must equal the lane-wise XOR reduction.
-        let arr: [Block128; PACKED_LANES] =
-            std::array::from_fn(|i| Block128::from(i as u128 + 1));
+        let arr: [Block128; PACKED_LANES] = std::array::from_fn(|i| Block128::from(i as u128 + 1));
         let packed = PackedBlock128::from_array(arr);
         let expected = arr.iter().fold(Block128::ZERO, |a, &b| a + b);
         assert_eq!(packed.reduce_xor(), expected);
     }
 }
-

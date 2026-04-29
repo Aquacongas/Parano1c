@@ -37,7 +37,7 @@ impl PackedBlock128 {
     /// Packed squaring using linear Frobenius endomorphism.
     ///
     /// In GF(2^n), squaring is linear: (a+b)^2 = a^2 + b^2.
-    /// Squaring remains in the tower basis because it is already extremely 
+    /// Squaring remains in the tower basis because it is already extremely
     /// fast and does not require CLMUL.
     #[inline(always)]
     pub fn square(self) -> Self {

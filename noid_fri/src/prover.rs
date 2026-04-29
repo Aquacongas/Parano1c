@@ -86,13 +86,14 @@ use noid_core::packed::PACKED_LANES;
 /// Uses packed SIMD when the evaluation vector is large enough.
 fn mle_evaluate(evals: &[Block128], point: &[Block128]) -> Block128 {
     if point.is_empty() {
-        return if evals.is_empty() { Block128::ZERO } else { evals[0] };
+        return if evals.is_empty() {
+            Block128::ZERO
+        } else {
+            evals[0]
+        };
     }
     // Use packed path when alignment and size allow it.
-    if PACKED_LANES > 1
-        && evals.len() >= PACKED_LANES
-        && evals.len().is_multiple_of(PACKED_LANES)
-    {
+    if PACKED_LANES > 1 && evals.len() >= PACKED_LANES && evals.len().is_multiple_of(PACKED_LANES) {
         noid_core::mle::evaluate::evaluate_packed(evals, point)
     } else {
         mle_evaluate_scalar(evals, point)
@@ -115,21 +116,12 @@ fn mle_evaluate_scalar(evals: &[Block128], point: &[Block128]) -> Block128 {
 /// Fold an evaluation vector in half using packed ops when possible.
 fn fold_evals(evals: &[Block128], r: Block128) -> Vec<Block128> {
     let half = evals.len() / 2;
-    if PACKED_LANES > 1
-        && half >= PACKED_LANES
-        && evals.len().is_multiple_of(PACKED_LANES)
-    {
+    if PACKED_LANES > 1 && half >= PACKED_LANES && evals.len().is_multiple_of(PACKED_LANES) {
         let mut data = evals.to_vec();
-        noid_core::sumcheck::prove::fold_highest_var_packed_inplace(
-            &mut data,
-            r,
-            half,
-        );
+        noid_core::sumcheck::prove::fold_highest_var_packed_inplace(&mut data, r, half);
         data
     } else {
-        (0..half)
-            .map(|i| evals[i] + r * evals[i + half])
-            .collect()
+        (0..half).map(|i| evals[i] + r * evals[i + half]).collect()
     }
 }
 
@@ -352,8 +344,8 @@ pub fn prove(
         let mut symbols_round: Vec<(Block128, Block128)> = Vec::new();
         let mut paths_round: Vec<Vec<HashOutput>> = Vec::new();
         for &qi in &query_indices {
-            let scaled = qi >> round;              // descend into folded domain
-            let pair_idx = scaled >> 1;            // pair of adjacent symbols
+            let scaled = qi >> round; // descend into folded domain
+            let pair_idx = scaled >> 1; // pair of adjacent symbols
             let s0 = code.idx(pair_idx * 2);
             let s1 = code.idx(pair_idx * 2 + 1);
             symbols_round.push((s0, s1));
@@ -395,9 +387,7 @@ fn compute_sumcheck_round_oracle(evals: &[Block128], claim: Block128) -> Univari
     let half = evals.len() / 2;
 
     // p(0) = sum of the lower half (evals with leading variable = 0).
-    let p0 = evals[..half]
-        .iter()
-        .fold(Block128::ZERO, |acc, &v| acc + v);
+    let p0 = evals[..half].iter().fold(Block128::ZERO, |acc, &v| acc + v);
 
     // p(1) is forced so that p(0)+p(1) == claim  (in GF(2), + == XOR).
     let p1 = claim + p0;
@@ -428,7 +418,10 @@ mod tests {
         // p(X) = 3 + 2*X
         let p = Univariate::new(vec![Block128::from(3u8), Block128::from(2u8)]);
         assert_eq!(p.evaluate(Block128::ZERO), Block128::from(3u8));
-        assert_eq!(p.evaluate(Block128::ONE), Block128::from(3u8) + Block128::from(2u8));
+        assert_eq!(
+            p.evaluate(Block128::ONE),
+            Block128::from(3u8) + Block128::from(2u8)
+        );
     }
 
     #[test]
@@ -494,7 +487,7 @@ mod tests {
         use crate::channel::TAU;
         use crate::verifier::verify;
 
-        let log_len = TAU + 2;                    // 9 → n_rounds = 2
+        let log_len = TAU + 2; // 9 → n_rounds = 2
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
         let evals = make_random_evals(log_len);
@@ -507,18 +500,34 @@ mod tests {
             .collect();
 
         let mut prover_channel = Channel::new();
-        let proof = prove(&commitment, &evals, &eval_point, &ntt,
-                          &mut prover_channel, &hasher);
+        let proof = prove(
+            &commitment,
+            &evals,
+            &eval_point,
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+        );
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
         let mut verifier_channel = Channel::new();
-        let result = verify(&commitment, &eval_point, claimed_eval,
-                            proof, &ntt, &mut verifier_channel, &hasher);
+        let result = verify(
+            &commitment,
+            &eval_point,
+            claimed_eval,
+            proof,
+            &ntt,
+            &mut verifier_channel,
+            &hasher,
+        );
 
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "prove/verify with {} folding rounds failed: {:?}",
-            log_len - TAU, result);
+            log_len - TAU,
+            result
+        );
     }
 
     /// Prove and verify with log_len = TAU+4 (4 FRI folding rounds).
@@ -527,7 +536,7 @@ mod tests {
         use crate::channel::TAU;
         use crate::verifier::verify;
 
-        let log_len = TAU + 4;                    // 11 → n_rounds = 4
+        let log_len = TAU + 4; // 11 → n_rounds = 4
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
         let evals = make_random_evals(log_len);
@@ -540,18 +549,34 @@ mod tests {
             .collect();
 
         let mut prover_channel = Channel::new();
-        let proof = prove(&commitment, &evals, &eval_point, &ntt,
-                          &mut prover_channel, &hasher);
+        let proof = prove(
+            &commitment,
+            &evals,
+            &eval_point,
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+        );
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
         let mut verifier_channel = Channel::new();
-        let result = verify(&commitment, &eval_point, claimed_eval,
-                            proof, &ntt, &mut verifier_channel, &hasher);
+        let result = verify(
+            &commitment,
+            &eval_point,
+            claimed_eval,
+            proof,
+            &ntt,
+            &mut verifier_channel,
+            &hasher,
+        );
 
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "prove/verify with {} folding rounds failed: {:?}",
-            log_len - TAU, result);
+            log_len - TAU,
+            result
+        );
     }
 
     /// Minimal 1-fold debug test: TAU+1 rounds, seeded RNG.
@@ -559,7 +584,6 @@ mod tests {
     fn test_fold_1_round_minimal() {
         use crate::channel::TAU;
         use crate::verifier::verify;
-
 
         let log_len = TAU + 1; // 8 → 1 fold round, row_len=1
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
@@ -576,16 +600,28 @@ mod tests {
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
         let mut prover_channel = Channel::new();
-        let proof = prove(&commitment, &evals, &eval_point, &ntt,
-                          &mut prover_channel, &hasher);
+        let proof = prove(
+            &commitment,
+            &evals,
+            &eval_point,
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+        );
 
         eprintln!("final_codeword={:?}", proof.final_codeword);
         eprintln!("n_rounds={}", proof.fri_oracles.len());
 
         let mut verifier_channel = Channel::new();
-        let result = verify(&commitment, &eval_point, claimed_eval,
-                            proof, &ntt, &mut verifier_channel, &hasher);
+        let result = verify(
+            &commitment,
+            &eval_point,
+            claimed_eval,
+            proof,
+            &ntt,
+            &mut verifier_channel,
+            &hasher,
+        );
         assert!(result.is_ok(), "1-fold minimal failed: {:?}", result);
     }
 }
-

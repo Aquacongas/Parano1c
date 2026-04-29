@@ -6,7 +6,7 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 
 use crate::channel::Channel;
-use crate::code::{LOG_RATE, fold};
+use crate::code::{fold, LOG_RATE};
 use crate::hasher::CryptographicHasher;
 use crate::merkle::verify_merkle_path;
 use crate::prover::{EvalProof, FriCommitment};
@@ -37,7 +37,11 @@ pub fn verify(
 
     // Check: Σ left_eq[i] * upper_partial_evals[i] == eval
     let mut derived_eval = Block128::ZERO;
-    for (lhs, rhs) in left_eq.iter().zip(eval_proof.upper_partial_evals.iter()).take(1 << tau) {
+    for (lhs, rhs) in left_eq
+        .iter()
+        .zip(eval_proof.upper_partial_evals.iter())
+        .take(1 << tau)
+    {
         derived_eval += *lhs * *rhs;
     }
     if derived_eval != eval {
@@ -65,9 +69,7 @@ pub fn verify(
         // Core sum-check check: p(0) + p(1) == current claim.
         let sum_check = oracle.evaluate(Block128::ZERO) + oracle.evaluate(Block128::ONE);
         if sum_check != sum_check_claim {
-            return Err(format!(
-                "Sum of oracle evaluations failed on round {round}"
-            ));
+            return Err(format!("Sum of oracle evaluations failed on round {round}"));
         }
 
         // Transcript order (must match prover exactly):
@@ -88,7 +90,7 @@ pub fn verify(
     let final_codeword_len = eval_proof.final_codeword.len().max(1);
 
     let query_indices = channel.gen_queries(rounds + LOG_RATE);
-    let n_queries     = query_indices.len();
+    let n_queries = query_indices.len();
 
     let mut folded_symbols: Vec<Option<Block128>> = vec![None; n_queries];
 
@@ -96,12 +98,12 @@ pub fn verify(
         let mut round_folded = Vec::with_capacity(n_queries);
 
         for i in 0..n_queries {
-            let qi        = query_indices[i];
-            let scaled    = qi >> round;
-            let pair_idx  = scaled >> 1;
-            let parity    = scaled & 1;
+            let qi = query_indices[i];
+            let scaled = qi >> round;
+            let pair_idx = scaled >> 1;
+            let parity = scaled & 1;
 
-            let (s0, s1)  = eval_proof.fri_queried_symbols[round][i];
+            let (s0, s1) = eval_proof.fri_queried_symbols[round][i];
             let merkle_path = &eval_proof.fri_merkle_paths[round][i];
 
             let leaf_hash = hasher.hash_pair(&s0, &s1);
@@ -110,7 +112,9 @@ pub fn verify(
             if round > 0 {
                 let expected = if parity == 1 { s1 } else { s0 };
                 if folded_symbols[i] != Some(expected) {
-                    return Err(format!("Symbol not consistent at query {i} in round {round}"));
+                    return Err(format!(
+                        "Symbol not consistent at query {i} in round {round}"
+                    ));
                 }
             }
 
@@ -129,11 +133,13 @@ pub fn verify(
     // After `rounds` halvings, query qi maps to symbol index `qi >> rounds`.
     for (i, sym) in folded_symbols.iter().enumerate() {
         if let Some(s) = sym {
-            let qi         = query_indices[i];
-            let final_sym  = qi >> rounds;           // symbol index in final code
-            let expected   = eval_proof.final_codeword[final_sym % final_codeword_len];
+            let qi = query_indices[i];
+            let final_sym = qi >> rounds; // symbol index in final code
+            let expected = eval_proof.final_codeword[final_sym % final_codeword_len];
             if *s != expected {
-                return Err(format!("final folded value mismatch at query {i}: got {s:?} expected {expected:?}"));
+                return Err(format!(
+                    "final folded value mismatch at query {i}: got {s:?} expected {expected:?}"
+                ));
             }
         }
     }

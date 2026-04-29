@@ -4,8 +4,8 @@
 //! GF(2^64) — quadratic extension of GF(2^32).
 
 use crate::{
-    Bit, Block16, Block32, Block8, CanonicalDeserialize, CanonicalSerialize,
-    SerializationError, TowerField,
+    Bit, Block16, Block32, Block8, CanonicalDeserialize, CanonicalSerialize, SerializationError,
+    TowerField,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
@@ -224,4 +224,3 @@ mod tests {
         }
     }
 }
-

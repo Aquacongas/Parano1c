@@ -10,7 +10,7 @@ pub mod merkle;
 pub mod prover;
 pub mod verifier;
 
+pub use channel::{Channel, NUM_QUERIES, TAU};
 pub use hasher::*;
-pub use channel::{Channel, TAU, NUM_QUERIES};
 pub use prover::{EvalProof, FriCommitment, Univariate};
 pub use verifier::compute_eq_table;

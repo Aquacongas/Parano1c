@@ -44,7 +44,9 @@ pub fn evaluate_packed(poly: &[Block128], point: &[Block128]) -> Block128 {
     let mut point_iter = point.iter().rev();
 
     while evals.len() > 1 {
-        let Some(&r) = point_iter.next() else { break; };
+        let Some(&r) = point_iter.next() else {
+            break;
+        };
         let half = evals.len() / 2;
         for i in 0..half {
             let lo = evals[i];
@@ -102,4 +104,3 @@ mod tests {
         assert_eq!(evaluate_slice(&evals, &[F::ONE, F::ONE]), a + b + c + d);
     }
 }
-

@@ -138,7 +138,6 @@ impl CanonicalSerialize for Block128 {
 
     fn serialize(&self, writer: &mut [u8]) -> Result<(), SerializationError> {
         if writer.len() < 16 {
-
             return Err(SerializationError);
         }
         writer[..16].copy_from_slice(&self.0.to_le_bytes());
@@ -147,10 +146,8 @@ impl CanonicalSerialize for Block128 {
 }
 
 impl CanonicalDeserialize for Block128 {
-
     fn deserialize(bytes: &[u8]) -> Result<Self, SerializationError> {
         if bytes.len() < 16 {
-
             return Err(SerializationError);
         }
         let mut buf = [0u8; 16];
@@ -246,4 +243,3 @@ mod tests {
         }
     }
 }
-

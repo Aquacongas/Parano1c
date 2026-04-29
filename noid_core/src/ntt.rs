@@ -80,10 +80,10 @@ pub fn inverse_ntt<F: TowerField>(evals: &[F], basis: &[F]) -> Vec<F> {
 // Parallel variants for Block128
 // ---------------------------------------------------------------------------
 
-use rayon::prelude::*;
 use crate::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
 use crate::packed::{PackedBlock128, PACKED_LANES};
 use crate::Block128;
+use rayon::prelude::*;
 
 /// Minimum size to justify parallel NTT.
 const NTT_PARALLEL_THRESHOLD: usize = 4096;
@@ -393,4 +393,3 @@ mod tests {
         assert_eq!(ntt.get_subspace_eval(1, 1), ntt.basis[0]);
     }
 }
-

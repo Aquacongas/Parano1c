@@ -3,9 +3,9 @@
 
 //! GF(2^16) — quadratic extension of GF(2^8) with TAU = (0x20 left-shifted).
 
-
-
-use crate::{Bit, Block8, CanonicalDeserialize, CanonicalSerialize, SerializationError, TowerField};
+use crate::{
+    Bit, Block8, CanonicalDeserialize, CanonicalSerialize, SerializationError, TowerField,
+};
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use zeroize::Zeroize;
@@ -138,7 +138,6 @@ impl CanonicalSerialize for Block16 {
 
     fn serialize(&self, writer: &mut [u8]) -> Result<(), SerializationError> {
         if writer.len() < 2 {
-
             return Err(SerializationError);
         }
         writer[..2].copy_from_slice(&self.0.to_le_bytes());
@@ -147,10 +146,8 @@ impl CanonicalSerialize for Block16 {
 }
 
 impl CanonicalDeserialize for Block16 {
-
     fn deserialize(bytes: &[u8]) -> Result<Self, SerializationError> {
         if bytes.len() < 2 {
-
             return Err(SerializationError);
         }
         let mut buf = [0u8; 2];
@@ -244,4 +241,3 @@ mod tests {
         }
     }
 }
-

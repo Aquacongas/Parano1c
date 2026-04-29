@@ -63,7 +63,8 @@ impl Channel {
     pub fn observe_field_elem(&mut self, elem: Block128) {
         self.enter_absorb_mode();
         let mut bytes = [0u8; 16];
-        elem.serialize(&mut bytes).expect("Block128 serializes into 16 bytes");
+        elem.serialize(&mut bytes)
+            .expect("Block128 serializes into 16 bytes");
         self.sponge.update(&bytes);
     }
 
@@ -72,7 +73,8 @@ impl Channel {
         self.enter_absorb_mode();
         for &elem in elems {
             let mut bytes = [0u8; 16];
-            elem.serialize(&mut bytes).expect("Block128 serializes into 16 bytes");
+            elem.serialize(&mut bytes)
+                .expect("Block128 serializes into 16 bytes");
             self.sponge.update(&bytes);
         }
     }
@@ -87,7 +89,8 @@ impl Channel {
     /// Absorb a `FriCommitment` (vector commitment + packing factor).
     pub fn observe_fri_commitment(&mut self, commitment: &FriCommitment) {
         self.observe_vector_commitment(&commitment.vector_commitment);
-        self.sponge.update(&(commitment.packing_factor as u64).to_le_bytes());
+        self.sponge
+            .update(&(commitment.packing_factor as u64).to_le_bytes());
     }
 
     // -----------------------------------------------------------------------

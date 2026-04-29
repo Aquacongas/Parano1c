@@ -26,4 +26,3 @@ use crate::Block128;
 pub fn square_block128(x: Block128) -> Block128 {
     x.square()
 }
-

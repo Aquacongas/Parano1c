@@ -349,10 +349,18 @@ fn build_nibble_table(matrix: &[u128; 128]) -> [u128; 32 * 16] {
         let r3 = matrix[chunk * 4 + 3];
         for nib in 0..16usize {
             let mut acc = 0u128;
-            if nib & 1 != 0 { acc ^= r0; }
-            if nib & 2 != 0 { acc ^= r1; }
-            if nib & 4 != 0 { acc ^= r2; }
-            if nib & 8 != 0 { acc ^= r3; }
+            if nib & 1 != 0 {
+                acc ^= r0;
+            }
+            if nib & 2 != 0 {
+                acc ^= r1;
+            }
+            if nib & 4 != 0 {
+                acc ^= r2;
+            }
+            if nib & 8 != 0 {
+                acc ^= r3;
+            }
             table[chunk * 16 + nib] = acc;
         }
     }
@@ -438,10 +446,10 @@ const fn expand_bits_u64_to_u128(v: u64) -> u128 {
     let mut x = v as u128;
     x = (x | (x << 32)) & 0x00000000FFFFFFFF00000000FFFFFFFF;
     x = (x | (x << 16)) & 0x0000FFFF0000FFFF0000FFFF0000FFFF;
-    x = (x | (x << 8))  & 0x00FF00FF00FF00FF00FF00FF00FF00FF;
-    x = (x | (x << 4))  & 0x0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F;
-    x = (x | (x << 2))  & 0x33333333333333333333333333333333;
-    x = (x | (x << 1))  & 0x55555555555555555555555555555555;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF00FF00FF00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F;
+    x = (x | (x << 2)) & 0x33333333333333333333333333333333;
+    x = (x | (x << 1)) & 0x55555555555555555555555555555555;
     x
 }
 
@@ -499,15 +507,15 @@ mod x86_64_clmul {
 
         let v0 = _mm_clmulepi64_si128(a_reg, b_reg, 0x00);
         let v1 = _mm_clmulepi64_si128(a_reg, b_reg, 0x11);
-        
+
         let a_lo_dup = _mm_unpacklo_epi64(a_reg, a_reg);
         let a_hi_dup = _mm_unpackhi_epi64(a_reg, a_reg);
         let b_lo_dup = _mm_unpacklo_epi64(b_reg, b_reg);
         let b_hi_dup = _mm_unpackhi_epi64(b_reg, b_reg);
-        
+
         let a_xor = _mm_xor_si128(a_lo_dup, a_hi_dup);
         let b_xor = _mm_xor_si128(b_lo_dup, b_hi_dup);
-        
+
         let v_mid = _mm_clmulepi64_si128(a_xor, b_xor, 0x00);
         let v_mid = _mm_xor_si128(_mm_xor_si128(v_mid, v0), v1);
 
@@ -596,36 +604,56 @@ impl Mul for Flat<Block128> {
 }
 
 impl AddAssign for Flat<Block128> {
-    fn add_assign(&mut self, r: Self) { *self = *self + r; }
+    fn add_assign(&mut self, r: Self) {
+        *self = *self + r;
+    }
 }
 impl SubAssign for Flat<Block128> {
-    fn sub_assign(&mut self, r: Self) { *self = *self - r; }
+    fn sub_assign(&mut self, r: Self) {
+        *self = *self - r;
+    }
 }
 impl MulAssign for Flat<Block128> {
-    fn mul_assign(&mut self, r: Self) { *self = *self * r; }
+    fn mul_assign(&mut self, r: Self) {
+        *self = *self * r;
+    }
 }
 
 // ---- Field Trait Implementations ----
 
 impl CanonicalSerialize for Flat<Block128> {
-    fn serialized_size(&self) -> usize { 16 }
-    fn serialize(&self, w: &mut [u8]) -> Result<(), SerializationError> { self.0.serialize(w) }
+    fn serialized_size(&self) -> usize {
+        16
+    }
+    fn serialize(&self, w: &mut [u8]) -> Result<(), SerializationError> {
+        self.0.serialize(w)
+    }
 }
 impl CanonicalDeserialize for Flat<Block128> {
-    fn deserialize(b: &[u8]) -> Result<Self, SerializationError> { Block128::deserialize(b).map(Flat) }
+    fn deserialize(b: &[u8]) -> Result<Self, SerializationError> {
+        Block128::deserialize(b).map(Flat)
+    }
 }
 
 impl From<u8> for Flat<Block128> {
-    fn from(v: u8) -> Self { Self(Block128::from(v)) }
+    fn from(v: u8) -> Self {
+        Self(Block128::from(v))
+    }
 }
 impl From<u32> for Flat<Block128> {
-    fn from(v: u32) -> Self { Self(Block128::from(v)) }
+    fn from(v: u32) -> Self {
+        Self(Block128::from(v))
+    }
 }
 impl From<u64> for Flat<Block128> {
-    fn from(v: u64) -> Self { Self(Block128::from(v)) }
+    fn from(v: u64) -> Self {
+        Self(Block128::from(v))
+    }
 }
 impl From<u128> for Flat<Block128> {
-    fn from(v: u128) -> Self { Self(Block128::from(v)) }
+    fn from(v: u128) -> Self {
+        Self(Block128::from(v))
+    }
 }
 
 impl TowerField for Flat<Block128> {
@@ -659,7 +687,10 @@ impl HardwareField for Flat<Block128> {
     fn to_flat(&self) -> Self {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            Self(Block128(apply_matrix(&conversion_matrix::TOWER_TO_FLAT, self.0 .0)))
+            Self(Block128(apply_matrix(
+                &conversion_matrix::TOWER_TO_FLAT,
+                self.0 .0,
+            )))
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -671,7 +702,10 @@ impl HardwareField for Flat<Block128> {
     fn to_tower(&self) -> Self {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            Self(Block128(apply_matrix(&conversion_matrix::FLAT_TO_TOWER, self.0 .0)))
+            Self(Block128(apply_matrix(
+                &conversion_matrix::FLAT_TO_TOWER,
+                self.0 .0,
+            )))
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {

@@ -123,7 +123,10 @@ impl MerkleTree {
 
     pub fn get_merkle_path(&self, leaf_index: usize) -> Vec<HashOutput> {
         let leaf_depth = self.data.len() - 1;
-        assert!(leaf_index < self.data[leaf_depth].len(), "Leaf index out of bounds");
+        assert!(
+            leaf_index < self.data[leaf_depth].len(),
+            "Leaf index out of bounds"
+        );
 
         let mut index = leaf_index;
         let mut path = Vec::with_capacity(leaf_depth);
@@ -163,7 +166,10 @@ pub fn verify_merkle_path(
     hash == commitment.root
 }
 
-fn build_parent_layer(child_layer: &[HashOutput], hasher: &dyn CryptographicHasher) -> Vec<HashOutput> {
+fn build_parent_layer(
+    child_layer: &[HashOutput],
+    hasher: &dyn CryptographicHasher,
+) -> Vec<HashOutput> {
     assert_eq!(
         child_layer.len() & 1,
         0,
@@ -221,9 +227,8 @@ pub fn compute_leaf_hashes(
         let threads = rayon::current_num_threads().max(1);
         // pair-count chunks must be a multiple of PACKED_LANES and at least
         // BATCH_HASH_THRESHOLD to amortise the batched kernel.
-        let mut chunk_pairs = ((n / threads).max(BATCH_HASH_THRESHOLD)) & !(
-            (noid_core::packed::PACKED_LANES.max(1)) - 1
-        );
+        let mut chunk_pairs = ((n / threads).max(BATCH_HASH_THRESHOLD))
+            & !((noid_core::packed::PACKED_LANES.max(1)) - 1);
         if chunk_pairs == 0 {
             chunk_pairs = BATCH_HASH_THRESHOLD;
         }
@@ -274,4 +279,3 @@ mod tests {
         }
     }
 }
-

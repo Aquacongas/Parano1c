@@ -6,4 +6,3 @@
 //! Re-exports the table already built into `tower::block8`.
 
 pub use crate::Block8;
-

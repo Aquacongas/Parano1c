@@ -14,15 +14,14 @@
 // readability without changing generated code.
 #![allow(clippy::needless_range_loop)]
 
+use crate::native::compression::Poseidon2bSponge;
+use crate::native::permutation::{
+    F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
+};
 use noid_core::hardware::tower_to_flat_u128;
 use noid_core::packed::{PackedBlock128, PACKED_LANES};
 use noid_core::Block128;
 use std::sync::OnceLock;
-use crate::native::compression::Poseidon2bSponge;
-use crate::native::permutation::{
-    ROUND_CONSTANTS, MDS_FULL, MDS_PARTIAL,
-    STATE_SIZE, F_ROUNDS, P_ROUNDS, N_ROUNDS,
-};
 
 /// Padding constants for Poseidon2b sponge finalization.
 const PAD0: u128 = u128::from_le_bytes([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -94,7 +93,11 @@ pub fn hash_pair_batch(a: &[Block128], b: &[Block128]) -> Vec<[u8; 32]> {
 /// `hash_pair_batch` callers would otherwise have to do on an interleaved
 /// input.
 pub fn hash_pair_batch_interleaved_into(pairs: &[Block128], out: &mut [[u8; 32]]) {
-    assert_eq!(pairs.len() & 1, 0, "hash_pair_batch_interleaved expects even length");
+    assert_eq!(
+        pairs.len() & 1,
+        0,
+        "hash_pair_batch_interleaved expects even length"
+    );
     let n = pairs.len() / 2;
     assert_eq!(out.len(), n, "output length must match pair count");
 
@@ -175,8 +178,12 @@ pub fn hash_concatenation_batch(a: &[[u8; 32]], b: &[[u8; 32]]) -> Vec<[u8; 32]>
 
         // Load a into rate (states start at zero, so set = XOR)
         for lane in 0..PACKED_LANES {
-            let a0 = Block128::from(u128::from_le_bytes(a[off + lane][0..16].try_into().unwrap()));
-            let a1 = Block128::from(u128::from_le_bytes(a[off + lane][16..32].try_into().unwrap()));
+            let a0 = Block128::from(u128::from_le_bytes(
+                a[off + lane][0..16].try_into().unwrap(),
+            ));
+            let a1 = Block128::from(u128::from_le_bytes(
+                a[off + lane][16..32].try_into().unwrap(),
+            ));
             states[0] = states[0].set_lane(lane, a0);
             states[1] = states[1].set_lane(lane, a1);
         }
@@ -188,8 +195,12 @@ pub fn hash_concatenation_batch(a: &[[u8; 32]], b: &[[u8; 32]]) -> Vec<[u8; 32]>
         let mut pb0 = PackedBlock128::ZERO;
         let mut pb1 = PackedBlock128::ZERO;
         for lane in 0..PACKED_LANES {
-            let b0 = Block128::from(u128::from_le_bytes(b[off + lane][0..16].try_into().unwrap()));
-            let b1 = Block128::from(u128::from_le_bytes(b[off + lane][16..32].try_into().unwrap()));
+            let b0 = Block128::from(u128::from_le_bytes(
+                b[off + lane][0..16].try_into().unwrap(),
+            ));
+            let b1 = Block128::from(u128::from_le_bytes(
+                b[off + lane][16..32].try_into().unwrap(),
+            ));
             pb0 = pb0.set_lane(lane, b0);
             pb1 = pb1.set_lane(lane, b1);
         }
@@ -255,8 +266,12 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
 
         // Load a into rate (states start at zero)
         for lane in 0..PACKED_LANES {
-            let a0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][0..16].try_into().unwrap()));
-            let a1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][16..32].try_into().unwrap()));
+            let a0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][0..16].try_into().unwrap(),
+            ));
+            let a1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][16..32].try_into().unwrap(),
+            ));
             states[0] = states[0].set_lane(lane, a0);
             states[1] = states[1].set_lane(lane, a1);
         }
@@ -267,8 +282,12 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
         let mut pb0 = PackedBlock128::ZERO;
         let mut pb1 = PackedBlock128::ZERO;
         for lane in 0..PACKED_LANES {
-            let b0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][0..16].try_into().unwrap()));
-            let b1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][16..32].try_into().unwrap()));
+            let b0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][0..16].try_into().unwrap(),
+            ));
+            let b1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][16..32].try_into().unwrap(),
+            ));
             pb0 = pb0.set_lane(lane, b0);
             pb1 = pb1.set_lane(lane, b1);
         }
@@ -304,7 +323,11 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
 /// `[a0, a1, b0, b1]` with no padding and no IV. One permutation per pair
 /// vs. three for `hash_concatenation_batch_interleaved_into`.
 pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]]) {
-    assert_eq!(pairs.len() & 1, 0, "Interleaved pairs must have even length");
+    assert_eq!(
+        pairs.len() & 1,
+        0,
+        "Interleaved pairs must have even length"
+    );
     let n = pairs.len() / 2;
     assert_eq!(out.len(), n, "Output length must match pair count");
 
@@ -326,10 +349,18 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
         let off = chunk * PACKED_LANES;
 
         for lane in 0..PACKED_LANES {
-            let a0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][0..16].try_into().unwrap()));
-            let a1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][16..32].try_into().unwrap()));
-            let b0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][0..16].try_into().unwrap()));
-            let b1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][16..32].try_into().unwrap()));
+            let a0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][0..16].try_into().unwrap(),
+            ));
+            let a1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][16..32].try_into().unwrap(),
+            ));
+            let b0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][0..16].try_into().unwrap(),
+            ));
+            let b1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][16..32].try_into().unwrap(),
+            ));
             states[0] = states[0].set_lane(lane, a0);
             states[1] = states[1].set_lane(lane, a1);
             states[2] = states[2].set_lane(lane, b0);
@@ -355,7 +386,11 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
 /// Like `hash_concatenation_batch_interleaved` but writes into a caller-provided
 /// output slice. Skips the Vec allocation per layer.
 pub fn hash_concatenation_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]]) {
-    assert_eq!(pairs.len() & 1, 0, "Interleaved pairs must have even length");
+    assert_eq!(
+        pairs.len() & 1,
+        0,
+        "Interleaved pairs must have even length"
+    );
     let n = pairs.len() / 2;
     assert_eq!(out.len(), n, "Output length must match pair count");
 
@@ -380,8 +415,12 @@ pub fn hash_concatenation_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [
         let off = chunk * PACKED_LANES;
 
         for lane in 0..PACKED_LANES {
-            let a0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][0..16].try_into().unwrap()));
-            let a1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane)][16..32].try_into().unwrap()));
+            let a0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][0..16].try_into().unwrap(),
+            ));
+            let a1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane)][16..32].try_into().unwrap(),
+            ));
             states[0] = states[0].set_lane(lane, a0);
             states[1] = states[1].set_lane(lane, a1);
         }
@@ -391,8 +430,12 @@ pub fn hash_concatenation_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [
         let mut pb0 = PackedBlock128::ZERO;
         let mut pb1 = PackedBlock128::ZERO;
         for lane in 0..PACKED_LANES {
-            let b0 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][0..16].try_into().unwrap()));
-            let b1 = Block128::from(u128::from_le_bytes(pairs[2 * (off + lane) + 1][16..32].try_into().unwrap()));
+            let b0 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][0..16].try_into().unwrap(),
+            ));
+            let b1 = Block128::from(u128::from_le_bytes(
+                pairs[2 * (off + lane) + 1][16..32].try_into().unwrap(),
+            ));
             pb0 = pb0.set_lane(lane, b0);
             pb1 = pb1.set_lane(lane, b1);
         }
@@ -448,7 +491,11 @@ fn flat_tables() -> &'static FlatTables {
                 mds_partial[i][j] = tower_to_flat_u128(MDS_PARTIAL[i][j]);
             }
         }
-        FlatTables { rc, mds_full, mds_partial }
+        FlatTables {
+            rc,
+            mds_full,
+            mds_partial,
+        }
     })
 }
 
@@ -457,9 +504,7 @@ fn flat_tables() -> &'static FlatTables {
 /// Runs the entire schedule in flat basis: a single tower→flat pass at the
 /// start and flat→tower pass at the end replaces what was previously 3
 /// basis conversions per CLMUL (hundreds per permutation).
-pub fn packed_poseidon2b_permute(
-    states: &mut [PackedBlock128; STATE_SIZE],
-) {
+pub fn packed_poseidon2b_permute(states: &mut [PackedBlock128; STATE_SIZE]) {
     let tables = flat_tables();
 
     // Convert state to flat basis once.
@@ -516,10 +561,7 @@ fn packed_sbox_x7_flat(x: PackedBlock128) -> PackedBlock128 {
     x6.flat_mul(x4)
 }
 
-fn packed_apply_mds_full_flat(
-    state: &mut [PackedBlock128; STATE_SIZE],
-    tables: &FlatTables,
-) {
+fn packed_apply_mds_full_flat(state: &mut [PackedBlock128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
     for i in 0..STATE_SIZE {
         let mut out = PackedBlock128::ZERO;
@@ -530,10 +572,7 @@ fn packed_apply_mds_full_flat(
     }
 }
 
-fn packed_apply_mds_partial_flat(
-    state: &mut [PackedBlock128; STATE_SIZE],
-    tables: &FlatTables,
-) {
+fn packed_apply_mds_partial_flat(state: &mut [PackedBlock128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
     for i in 0..STATE_SIZE {
         let mut out = PackedBlock128::ZERO;
@@ -547,8 +586,8 @@ fn packed_apply_mds_partial_flat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::compression::Poseidon2bSponge;
     use crate::hasher::CryptographicHasher;
+    use crate::native::compression::Poseidon2bSponge;
     use noid_core::TowerField;
     use rand::Rng;
 
@@ -560,9 +599,7 @@ mod tests {
         let b: Vec<Block128> = (0..n).map(|_| Block128::from(rng.gen::<u128>())).collect();
 
         let sponge = Poseidon2bSponge::new();
-        let expected: Vec<[u8; 32]> = (0..n)
-            .map(|i| sponge.hash_pair(&a[i], &b[i]))
-            .collect();
+        let expected: Vec<[u8; 32]> = (0..n).map(|i| sponge.hash_pair(&a[i], &b[i])).collect();
 
         let got = hash_pair_batch(&a, &b);
         assert_eq!(got, expected);
@@ -643,4 +680,3 @@ mod tests {
         assert_eq!(got, expected);
     }
 }
-
