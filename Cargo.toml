@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "bench_prover",
+    "noid_core",
+    "noid_fri",
+    "noid_poseidon2b",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"

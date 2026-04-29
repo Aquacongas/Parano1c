@@ -1,0 +1,17 @@
+[package]
+name = "bench_prover"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+noid_core = { path = "../noid_core" }
+noid_fri = { path = "../noid_fri" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+
+[[bench]]
+name = "bench_prover"
+harness = false

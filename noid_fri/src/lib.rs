@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid. All rights reserved.
+
+//! FRI Protocol: Fast Reed-Solomon IOP of Proximity.
+
+pub mod channel;
+pub mod code;
+pub mod hasher;
+pub mod merkle;
+pub mod prover;
+pub mod verifier;
+
+pub use hasher::*;
+pub use channel::{Channel, TAU, NUM_QUERIES};
+pub use prover::{EvalProof, FriCommitment, Univariate};
+pub use verifier::compute_eq_table;
