@@ -469,6 +469,11 @@ struct FlatTables {
     rc: [[u128; N_ROUNDS]; STATE_SIZE],
     mds_full: [[u128; STATE_SIZE]; STATE_SIZE],
     mds_partial: [[u128; STATE_SIZE]; STATE_SIZE],
+    // Sparsity masks: `is_one[i][j] = true` when MDS[i][j] == tower 0x1.
+    // In that case multiplication is the identity and the CLMUL can be
+    // replaced with a bare XOR of the input.
+    mds_full_is_one: [[bool; STATE_SIZE]; STATE_SIZE],
+    mds_partial_is_one: [[bool; STATE_SIZE]; STATE_SIZE],
 }
 
 fn flat_tables() -> &'static FlatTables {
@@ -482,16 +487,22 @@ fn flat_tables() -> &'static FlatTables {
         }
         let mut mds_full = [[0u128; STATE_SIZE]; STATE_SIZE];
         let mut mds_partial = [[0u128; STATE_SIZE]; STATE_SIZE];
+        let mut mds_full_is_one = [[false; STATE_SIZE]; STATE_SIZE];
+        let mut mds_partial_is_one = [[false; STATE_SIZE]; STATE_SIZE];
         for i in 0..STATE_SIZE {
             for j in 0..STATE_SIZE {
                 mds_full[i][j] = tower_to_flat_u128(MDS_FULL[i][j]);
                 mds_partial[i][j] = tower_to_flat_u128(MDS_PARTIAL[i][j]);
+                mds_full_is_one[i][j] = MDS_FULL[i][j] == 1;
+                mds_partial_is_one[i][j] = MDS_PARTIAL[i][j] == 1;
             }
         }
         FlatTables {
             rc,
             mds_full,
             mds_partial,
+            mds_full_is_one,
+            mds_partial_is_one,
         }
     })
 }
@@ -558,23 +569,35 @@ fn packed_sbox_x7_flat(x: PackedBlock128) -> PackedBlock128 {
     x6.flat_mul(x4)
 }
 
+#[inline(always)]
 fn packed_apply_mds_full_flat(state: &mut [PackedBlock128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
     for i in 0..STATE_SIZE {
         let mut out = PackedBlock128::ZERO;
         for j in 0..STATE_SIZE {
-            out = out.xor(input[j].flat_scalar_mul(tables.mds_full[i][j]));
+            // Skip CLMUL when the MDS entry is 1 (identity); XOR the lane
+            // directly. On GF(2^128) over flat basis, `a * 1 = a`.
+            if tables.mds_full_is_one[i][j] {
+                out = out.xor(input[j]);
+            } else {
+                out = out.xor(input[j].flat_scalar_mul(tables.mds_full[i][j]));
+            }
         }
         state[i] = out;
     }
 }
 
+#[inline(always)]
 fn packed_apply_mds_partial_flat(state: &mut [PackedBlock128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
     for i in 0..STATE_SIZE {
         let mut out = PackedBlock128::ZERO;
         for j in 0..STATE_SIZE {
-            out = out.xor(input[j].flat_scalar_mul(tables.mds_partial[i][j]));
+            if tables.mds_partial_is_one[i][j] {
+                out = out.xor(input[j]);
+            } else {
+                out = out.xor(input[j].flat_scalar_mul(tables.mds_partial[i][j]));
+            }
         }
         state[i] = out;
     }

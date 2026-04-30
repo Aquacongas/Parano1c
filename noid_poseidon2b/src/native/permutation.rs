@@ -21,17 +21,10 @@ impl Poseidon2bPermutation {
     /// Apply the full permutation to `state` in-place.
     pub fn permute_mut(&self, state: &mut [Block128; STATE_SIZE]) {
         // Initial MDS_FULL multiplication
-        let input = *state;
-        for i in 0..STATE_SIZE {
-            let mut out = Block128::ZERO;
-            for j in 0..STATE_SIZE {
-                out += Block128::from(MDS_FULL[i][j]) * input[j];
-            }
-            state[i] = out;
-        }
+        apply_mds_full(state);
 
         // Full and partial rounds
-        for (r, _) in (0..N_ROUNDS).enumerate() {
+        for r in 0..N_ROUNDS {
             if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {
                 // Full round
                 for i in 0..STATE_SIZE {
@@ -40,28 +33,50 @@ impl Poseidon2bPermutation {
                 for elem in state.iter_mut() {
                     *elem = sbox_x7(*elem);
                 }
-                let input = *state;
-                for i in 0..STATE_SIZE {
-                    let mut out = Block128::ZERO;
-                    for j in 0..STATE_SIZE {
-                        out += Block128::from(MDS_FULL[i][j]) * input[j];
-                    }
-                    state[i] = out;
-                }
+                apply_mds_full(state);
             } else {
                 // Partial round
                 state[0] += Block128::from(ROUND_CONSTANTS[0][r]);
                 state[0] = sbox_x7(state[0]);
-                let input = *state;
-                for i in 0..STATE_SIZE {
-                    let mut out = Block128::ZERO;
-                    for j in 0..STATE_SIZE {
-                        out += Block128::from(MDS_PARTIAL[i][j]) * input[j];
-                    }
-                    state[i] = out;
-                }
+                apply_mds_partial(state);
             }
         }
+    }
+}
+
+#[inline(always)]
+fn apply_mds_full(state: &mut [Block128; STATE_SIZE]) {
+    let input = *state;
+    for i in 0..STATE_SIZE {
+        let mut out = Block128::ZERO;
+        for j in 0..STATE_SIZE {
+            // MDS entries equal to 0x1 (the tower-basis identity) act as
+            // identity under multiplication. Replace the scalar mul with a
+            // direct XOR. MDS constants are compile-time so the branch is
+            // predictable and trivially const-foldable.
+            if MDS_FULL[i][j] == 1 {
+                out += input[j];
+            } else {
+                out += Block128::from(MDS_FULL[i][j]) * input[j];
+            }
+        }
+        state[i] = out;
+    }
+}
+
+#[inline(always)]
+fn apply_mds_partial(state: &mut [Block128; STATE_SIZE]) {
+    let input = *state;
+    for i in 0..STATE_SIZE {
+        let mut out = Block128::ZERO;
+        for j in 0..STATE_SIZE {
+            if MDS_PARTIAL[i][j] == 1 {
+                out += input[j];
+            } else {
+                out += Block128::from(MDS_PARTIAL[i][j]) * input[j];
+            }
+        }
+        state[i] = out;
     }
 }
 
