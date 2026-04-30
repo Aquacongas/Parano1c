@@ -104,6 +104,15 @@ impl PackedBlock128 {
     /// Square a flat-basis packed value (no basis conversion).
     #[inline(always)]
     pub fn flat_square(self) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f"),
+        ))]
+        {
+            return unsafe { super::simd_square_avx2::packed_square_flat_avx2(self) };
+        }
+        #[allow(unreachable_code)]
         Self {
             lanes: self.lanes.map(square_flat_u128),
         }

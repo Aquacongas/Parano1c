@@ -213,7 +213,7 @@ fn bench_utxo_primitives(c: &mut Criterion) {
     let spend = derive_spend_secret(&ms, 0);
     let commitment = hash_commitment(
         1_000,
-        addr.as_fields()[0],
+        &addr,
         Block128::from(rng.gen::<u128>()),
         Block128::ZERO,
     );
@@ -228,7 +228,7 @@ fn bench_utxo_primitives(c: &mut Criterion) {
         b.iter(|| {
             hash_commitment(
                 black_box(1_000),
-                black_box(addr.as_fields()[0]),
+                black_box(&addr),
                 black_box(Block128::from(7u8)),
                 black_box(Block128::ZERO),
             )

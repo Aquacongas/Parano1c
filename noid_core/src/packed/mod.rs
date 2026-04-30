@@ -11,6 +11,7 @@
 pub mod arith;
 pub mod karatsuba;
 pub mod mul_table;
+pub mod simd_square_avx2;
 pub mod square;
 
 use crate::{Block128, TowerField};

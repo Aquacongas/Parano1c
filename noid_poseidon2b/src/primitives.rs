@@ -117,23 +117,25 @@ pub fn hash_leaf(fields: &[Block128]) -> Digest {
     s.finalize()
 }
 
-/// Coin / output commitment. CRYPTO.md §4.3. Four field inputs:
-/// `value` (little-endian u128), `owner` (128-bit address slot),
-/// `blinding`, `asset_tag` (`Block128::ZERO` for native asset in v1).
+/// Coin / output commitment. CRYPTO.md §4.3. Five field inputs:
+/// `value` (little-endian u128), `owner` (full 256-bit address,
+/// absorbed as two `Block128` halves), `blinding`, `asset_tag`
+/// (`Block128::ZERO` for native asset, reserved for multi-asset).
 ///
-/// Accepts the full 256-bit address; this primitive compresses the
-/// address into a single Block128 slot via a length-preserving XOR of
-/// the two halves. For true 256-bit address binding, use
-/// `hash_commitment_full`.
+/// Absorbing both halves of the address preserves the full 256-bit
+/// collision resistance of the sponge capacity — a single 128-bit
+/// address slot would cap commitment binding at ~2^64 work.
 pub fn hash_commitment(
     value: u128,
-    owner: Block128,
+    owner: &Address,
     blinding: Block128,
     asset_tag: Block128,
 ) -> Commitment {
+    let [owner_hi, owner_lo] = owner.as_fields();
     let mut s = sponge(TAG_COMMIT);
     s.absorb(Block128::from(value));
-    s.absorb(owner);
+    s.absorb(owner_hi);
+    s.absorb(owner_lo);
     s.absorb(blinding);
     s.absorb(asset_tag);
     Commitment(s.finalize())
@@ -259,20 +261,10 @@ mod tests {
         let spend = derive_spend_secret(&MS, 0);
         assert_eq!(spend, derive_spend_secret(&MS, 0));
 
-        let c = hash_commitment(
-            100,
-            addr.as_fields()[0],
-            Block128::from(9u8),
-            Block128::ZERO,
-        );
+        let c = hash_commitment(100, &addr, Block128::from(9u8), Block128::ZERO);
         assert_eq!(
             c,
-            hash_commitment(
-                100,
-                addr.as_fields()[0],
-                Block128::from(9u8),
-                Block128::ZERO
-            )
+            hash_commitment(100, &addr, Block128::from(9u8), Block128::ZERO)
         );
 
         let n = hash_nullifier(&spend, &c);
@@ -331,8 +323,10 @@ mod tests {
 
     #[test]
     fn tx_body_sensitive_to_ordering_and_fee() {
-        let c1 = hash_commitment(1, Block128::from(1u8), Block128::from(1u8), Block128::ZERO);
-        let c2 = hash_commitment(2, Block128::from(2u8), Block128::from(2u8), Block128::ZERO);
+        let a1 = Address([1u8; 32]);
+        let a2 = Address([2u8; 32]);
+        let c1 = hash_commitment(1, &a1, Block128::from(1u8), Block128::ZERO);
+        let c2 = hash_commitment(2, &a2, Block128::from(2u8), Block128::ZERO);
 
         let h_a = hash_tx_body(&[0u8; 32], 10, &[c1], &[c2]);
         let h_b = hash_tx_body(&[0u8; 32], 10, &[c2], &[c1]);
@@ -365,7 +359,8 @@ mod tests {
 
         let prev = [0x11u8; 32];
         let fee = 7u128;
-        let c = hash_commitment(5, Block128::from(1u8), Block128::from(2u8), Block128::ZERO);
+        let addr = Address([1u8; 32]);
+        let c = hash_commitment(5, &addr, Block128::from(2u8), Block128::ZERO);
 
         let mut fee_leaf = [0u8; 32];
         fee_leaf[..16].copy_from_slice(&fee.to_le_bytes());
@@ -379,12 +374,8 @@ mod tests {
 
     #[test]
     fn nullifier_unlinkable_per_secret() {
-        let c = hash_commitment(
-            42,
-            Block128::from(1u8),
-            Block128::from(123u8),
-            Block128::ZERO,
-        );
+        let addr = Address([1u8; 32]);
+        let c = hash_commitment(42, &addr, Block128::from(123u8), Block128::ZERO);
         let s1 = derive_spend_secret(&MasterSecret([1u8; 32]), 0);
         let s2 = derive_spend_secret(&MasterSecret([2u8; 32]), 0);
         assert_ne!(hash_nullifier(&s1, &c), hash_nullifier(&s2, &c));

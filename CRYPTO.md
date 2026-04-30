@@ -1,12 +1,12 @@
-# Paranoid (NOID) — Cryptographic Primitive Specification (v0.1)
+# Paranoid (NOID) — Cryptographic Primitive Specification
 
 Status: **draft**, pinned before commitment-format-sensitive code (Merkle compression, UTXO primitives, PoW) is written.
 Scope: hashing, commitments, nullifiers, addresses, transaction binding, PoW, recursion-readiness.
-Non-scope (v1): recursive STARKs / IVC (design for, do not build).
+Non-scope: recursive STARKs / IVC (design for, do not build).
 
 ---
 
-## 0. Design goals, restated
+## 0. Design goals
 
 - Paranoid, post-quantum ready.
 - **No elliptic curves, no pairings, no trusted setup.**
@@ -19,12 +19,12 @@ Non-scope (v1): recursive STARKs / IVC (design for, do not build).
 
 - **Primary field**: `GF(2^128)` binary tower (`Block128`).
 - **Rationale**: native to our Poseidon2b + FRI stack, hash/NTT are cheap, no CLMUL dependency outside what we already have.
-- **Open issue (non-blocking v1)**: integer range / balance constraints arithmetize less naturally in GF(2^128) than in a prime field. If those costs become painful inside the circuit we will introduce a companion small-prime sub-structure for range tables only. We will NOT change the hash field.
+- **Open issue (non-blocking)**: integer range / balance constraints arithmetize less naturally in GF(2^128) than in a prime field. If those costs become painful inside the circuit we will introduce a companion small-prime sub-structure for range tables only. We will NOT change the hash field.
 
 ## 2. Permutation
 
 - **Primitive**: Poseidon2b, state width `t = 4`, rate `r = 2`, capacity `c = 2`.
-- **Rounds**: 8 full + 58 partial, x^7 S-box. (As implemented.)
+- **Rounds**: 8 full + 58 partial, x^7 S-box.
 - **Target security** (256-bit output, 256-bit capacity):
   - Classical collision: ~2^128 (birthday / sponge c/2 bound).
   - Classical preimage: ~2^256 (capped by sponge c/2 = 2^128 in the generic model).
@@ -34,7 +34,7 @@ Non-scope (v1): recursive STARKs / IVC (design for, do not build).
 ## 3. Domain separation
 
 - **Placement**: capacity-IV style. Each construction initializes `state[2]`, `state[3]` with a domain-tag constant derived from a 64-bit ASCII label. `state[0]`, `state[1]` hold the rate.
-- **Tag derivation**: `tag_i = Block128::from(LABEL_u64 << 64 | i)` for `i ∈ {0,1}` producing the two capacity words. Labels are distinct 8-byte ASCII strings — see §11.
+- **Tag derivation**: given `LABEL_u64 = u64::from_be_bytes(label)`, the two capacity words are `state[2] = Block128::from((LABEL_u64 as u128) << 64)` and `state[3] = Block128::from(LABEL_u64 as u128)`. Distinct high/low halves prevent a cheap cancellation. Labels are 8-byte ASCII strings — see §11.
 - **Never** reuse the same permutation with the same IV for two different constructions.
 
 ## 4. Primitives
@@ -62,8 +62,9 @@ Every primitive below is built from the same Poseidon2b permutation, distinguish
 ### 4.3 `hash_commitment(value, owner, blinding, asset_tag) -> [u8; 32]`
 
 - **Use**: coin / output commitment. Same primitive for both.
-- **Input**: 4 `Block128` (value as LE-128 integer; owner as 128-bit address; blinding as 128-bit random; asset_tag = `Block128::ZERO` for native asset in v1, reserved for multi-asset).
-- **Construction**: sponge with IV = `COMMIT__`. Absorb the 4 fields, pad, squeeze 32 bytes.
+- **Input**: 5 `Block128` — `value` as LE-128 integer; `owner` is the full 256-bit address, absorbed as two `Block128` halves (high then low); `blinding` is 128-bit random; `asset_tag = Block128::ZERO` for native asset, reserved for multi-asset.
+- **Construction**: sponge with IV = `COMMIT__`. Absorb the 5 fields in order `[value, owner_hi, owner_lo, blinding, asset_tag]`, pad, squeeze 32 bytes.
+- **Rationale for absorbing both address halves**: a single 128-bit address slot would cap commitment binding at ~2^64 work (birthday on the truncated address), well below the ~2^128 collision floor targeted by the rest of the stack. Absorbing both halves preserves the full 256-bit sponge capacity.
 - **Binding**: hash-binding (hiding under preimage-resistance, binding under collision-resistance; blinding is the randomness).
 
 ### 4.4 `hash_nullifier(spend_secret, coin_commitment) -> [u8; 32]`
@@ -82,7 +83,7 @@ Every primitive below is built from the same Poseidon2b permutation, distinguish
 
 ### 4.6 `derive_address(master_secret, account_index) -> [u8; 32]`
 
-- **Use**: address = `H_ADDRESS(master_secret, account_index)`. Flat derivation, no hierarchy in v1.
+- **Use**: address = `H_ADDRESS(master_secret, account_index)`. Flat derivation, no hierarchy.
 - **Input**: `master_secret` (2 fields) + `account_index` (1 field, little-endian u128) → 3 fields.
 - **Construction**: sponge with IV = `ADDRESS_`.
 - **Spend key**: per address, the spend secret is `H_ADDRESS_SPEND(master_secret, account_index)` with IV = `ADDRSPND`. The address is public; the spend secret is private and never leaves the wallet.
@@ -100,12 +101,11 @@ Every primitive below is built from the same Poseidon2b permutation, distinguish
 - **Reduction**: while `len > 1`, `next[i] = compress(level[2i], level[2i+1])`.
 - **Rationale for no per-leaf hash**: every payload is already a 256-bit cryptographic digest or a canonically encoded scalar; an extra sponge per leaf would add cost without adding domain separation (the fixed tree shape and the `COMPRESS_` IV already provide it).
 - **Why Merkle and not a sponge**: lets the circuit expose a logarithmic auth path if the prover wants to commit to a specific input without revealing all siblings. Keeps the door open.
-- **Breaking change vs. v0**: v0 hashed each leaf with `hash_leaf` before the Merkle reduction. v1 removes the leaf sponge. Digests are not compatible. KATs updated.
 
 ### 4.8 `fiat_shamir_challenge(transcript) -> Block128`
 
 - **Use**: verifier challenges inside the STARK (sumcheck, FRI query positions).
-- **Construction**: existing `Poseidon2bChannel` with IV = `FSCHALNG`. Already implemented; add the IV on the next breaking change.
+- **Construction**: `Poseidon2bChannel` with IV = `FSCHALNG`.
 
 ## 5. Merkle tree
 
@@ -119,7 +119,7 @@ Every primitive below is built from the same Poseidon2b permutation, distinguish
   - Note tree (per-wallet, off-chain index): wallet-local, depth grows.
 - **Rationale for uniform depth**: one circuit arithmetization for inclusion proofs.
 
-## 6. Transaction format (v1)
+## 6. Transaction format
 
 - **Weight classes**: one circuit with max width **4 inputs / 8 outputs**, padded with dummy slots. Dummy = zeroed commitment + "valid = false" witness bit; circuit enforces that dummies contribute zero to balance and do not touch the nullifier set.
 - **Fee**: explicit. Balance constraint: `Σ input_values = Σ output_values + fee`.
@@ -152,13 +152,13 @@ where `proof_transcript_hash` is the Fiat-Shamir seed of the aggregated block pr
 
 Every mining attempt produces a verifiable STARK of a valid state transition. There is no wasted SHA grinding; the work done is exactly the work required to validate the block.
 
-## 8. Recursion-readiness (not shipped in v1)
+## 8. Recursion-readiness (not yet shipped)
 
 - Public-input layout of the block proof is fixed and self-describing.
 - The verifier is deterministic and pure: given `(public_inputs, proof_bytes)` it returns accept/reject with no hidden state.
 - No construction in this spec assumes a non-recursive verifier. A future `cumulative_block_proof_{N+1}` can be a STARK over the statement:
   > "I know `prev_cumulative_proof_N` and `block_proof_{N+1}` such that both verify against the declared public inputs."
-- Binary-tower STARK recursion is an open research area; we expect to prototype it in a separate track once v1 is stable.
+- Binary-tower STARK recursion is an open research area; we expect to prototype it in a separate track once the base prover is stable.
 
 ## 9. Storage (local node)
 
@@ -167,7 +167,7 @@ Every mining attempt produces a verifiable STARK of a valid state transition. Th
 - **Wallet secrets**: master secret encrypted at rest (Argon2id KDF from user passphrase → XChaCha20-Poly1305).
 - **Genesis**: CLI command `paranoid genesis --to <address> --count N --value V` writes `N` initial commitments into the state tree, publishes the genesis state root.
 
-## 10. Open issues (tracked, not blocking compress v1)
+## 10. Open issues (tracked, non-blocking)
 
 - **In-circuit range check encoding** for 64-bit values over GF(2^128): bit-decomposition vs. lookup-based (if/when a lookup argument is added).
 - **Recursion field choice**: if binary-tower recursion turns out too expensive to arithmetize, we may split: block proofs in GF(2^128), cumulative proofs in a prime field, with a translation layer. Deferred.

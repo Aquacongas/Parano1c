@@ -315,7 +315,7 @@ fn print_environment() {
 fn print_params() {
     println!("  +------------------------- PARAMETERS --------------------------+");
     println!("  | {:<28} {:<32} |", "field:", "GF(2^128) binary tower");
-    println!("  | {:<28} {:<32} |", "commitment hash:", "Poseidon2b (t=8, 128-bit state)");
+    println!("  | {:<28} {:<32} |", "commitment hash:", "Poseidon2b (t=4, 128-bit state)");
     println!("  | {:<28} {:<32} |", "PCS:", "FRI (DEEP-FRI style)");
     println!("  | {:<28} {:<32} |", "code rate (RATE):", format!("{} (log2 = {})", RATE, LOG_RATE));
     println!("  | {:<28} {:<32} |", "num FRI queries:", NUM_QUERIES.to_string());
