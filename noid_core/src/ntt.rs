@@ -154,7 +154,7 @@ pub fn forward_ntt_parallel_inplace(data: &mut [Block128], basis: &[Block128]) {
                 *slot = Block128(flat_to_tower_u128(v));
             });
     } else {
-        for (slot, v) in data.iter_mut().zip(evals_flat.into_iter()) {
+        for (slot, v) in data.iter_mut().zip(evals_flat) {
             *slot = Block128(flat_to_tower_u128(v));
         }
     }

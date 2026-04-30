@@ -219,9 +219,7 @@ fn bench_row(log_len: usize, hasher: &Blake3Hasher) -> Row {
 
     // Sumcheck on a trace-sized polynomial.
     let sumcheck_poly: Vec<Block128> = evals.clone();
-    let claimed_sum = sumcheck_poly
-        .iter()
-        .fold(Block128::ZERO, |a, b| a + *b);
+    let claimed_sum = sumcheck_poly.iter().fold(Block128::ZERO, |a, b| a + *b);
     let sumcheck_ms = time(|| {
         let mut t = Vec::new();
         prove_single_packed(&sumcheck_poly, claimed_sum, &mut t);
@@ -291,7 +289,10 @@ const BANNER: &str = r#"
 fn print_banner() {
     println!("{}", BANNER);
     println!("  Binary-tower GF(2^128) prover. All measurements are wall-clock,");
-    println!("  median of {} samples, single-process multi-threaded.", SAMPLES);
+    println!(
+        "  median of {} samples, single-process multi-threaded.",
+        SAMPLES
+    );
     println!();
 }
 
@@ -305,8 +306,20 @@ fn print_environment() {
     println!("  | {:<18} {:<42} |", "simd:", detect_simd());
     println!("  | {:<18} {:<42} |", "os:", std::env::consts::OS);
     println!("  | {:<18} {:<42} |", "threads (rayon):", threads);
-    println!("  | {:<18} {:<42} |", "packed lanes:", PACKED_LANES.to_string());
-    println!("  | {:<18} {:<42} |", "profile:", if cfg!(debug_assertions) { "debug (!)" } else { "release" });
+    println!(
+        "  | {:<18} {:<42} |",
+        "packed lanes:",
+        PACKED_LANES.to_string()
+    );
+    println!(
+        "  | {:<18} {:<42} |",
+        "profile:",
+        if cfg!(debug_assertions) {
+            "debug (!)"
+        } else {
+            "release"
+        }
+    );
     println!("  +---------------------------------------------------------------+");
     println!();
 }
@@ -315,11 +328,26 @@ fn print_params() {
     println!("  +------------------------- PARAMETERS --------------------------+");
     println!("  | {:<28} {:<32} |", "field:", "GF(2^128) binary tower");
     println!("  | {:<28} {:<32} |", "merkle hash:", "Blake3 (fast tier)");
-    println!("  | {:<28} {:<32} |", "transcript hash:", "Poseidon2b (t=4, recursion tier)");
+    println!(
+        "  | {:<28} {:<32} |",
+        "transcript hash:", "Poseidon2b (t=4, recursion tier)"
+    );
     println!("  | {:<28} {:<32} |", "PCS:", "FRI (DEEP-FRI style)");
-    println!("  | {:<28} {:<32} |", "code rate (RATE):", format!("{} (log2 = {})", RATE, LOG_RATE));
-    println!("  | {:<28} {:<32} |", "num FRI queries:", NUM_QUERIES.to_string());
-    println!("  | {:<28} {:<32} |", "TAU (batched vars):", TAU.to_string());
+    println!(
+        "  | {:<28} {:<32} |",
+        "code rate (RATE):",
+        format!("{} (log2 = {})", RATE, LOG_RATE)
+    );
+    println!(
+        "  | {:<28} {:<32} |",
+        "num FRI queries:",
+        NUM_QUERIES.to_string()
+    );
+    println!(
+        "  | {:<28} {:<32} |",
+        "TAU (batched vars):",
+        TAU.to_string()
+    );
     println!("  | {:<28} {:<32} |", "NTT:", "additive (Lin-Chung-Han)");
     println!("  +---------------------------------------------------------------+");
     println!();
@@ -349,7 +377,10 @@ fn print_table(rows: &[Row]) {
     println!();
 
     println!("  +------------------------- THROUGHPUT --------------------------+");
-    println!("  | {:>7} | {:>12} | {:>24} |", "log_n", "sumcheck", "prove throughput");
+    println!(
+        "  | {:>7} | {:>12} | {:>24} |",
+        "log_n", "sumcheck", "prove throughput"
+    );
     println!("  |---------+--------------+--------------------------|");
     for r in rows {
         let cells_s = r.throughput_cells_per_s;

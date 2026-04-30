@@ -25,8 +25,15 @@ use crate::batch::compress_batch_interleaved_into;
 use crate::native::compression::Poseidon2bSponge;
 use crate::native::domain::{
     capacity_iv, DomainTag, TAG_ADDRESS, TAG_ADDRSPND, TAG_AUTHTAG, TAG_COMMIT, TAG_LEAF,
-    TAG_NULLIFIER,
+    TAG_NULLIFIER, TAG_SCANTAG, TAG_TXBODY, TAG_VIEWKEY,
 };
+use crate::native::permutation::Poseidon2bPermutation;
+use noid_core::{CanonicalSerialize, TowerField};
+
+/// Nullifier scheme version (CRYPTO.md §5.4). Absorbed as the final field
+/// input to `hash_nullifier`. Increment to rotate the scheme; cross-version
+/// collisions are impossible because the version is inside the sponge.
+pub const NULLIFIER_VERSION: u128 = 1;
 
 /// Generic 32-byte Poseidon2b digest.
 pub type Digest = [u8; 32];
@@ -92,6 +99,16 @@ newtype_digest!(
     /// The wallet master secret (stored encrypted at rest).
     MasterSecret
 );
+newtype_digest!(
+    /// Wallet view key. Reveals incoming payments when shared; never
+    /// grants spend authority. See CRYPTO.md §5.9.
+    ViewKey
+);
+newtype_digest!(
+    /// Per-output public scan tag. Lets a holder of the matching view key
+    /// detect their outputs in O(1) per block scan. See CRYPTO.md §5.10.
+    ScanTag
+);
 
 #[inline]
 fn sponge(tag: DomainTag) -> Poseidon2bSponge {
@@ -141,13 +158,16 @@ pub fn hash_commitment(
     Commitment(s.finalize())
 }
 
-/// Spend nullifier. CRYPTO.md §4.4.
+/// Spend nullifier. CRYPTO.md §5.4. Absorbs the spend secret, the coin
+/// commitment, and the scheme [`NULLIFIER_VERSION`] as the final field so
+/// future versions cannot collide with v1 outputs.
 pub fn hash_nullifier(spend_secret: &SpendSecret, coin_commitment: &Commitment) -> Nullifier {
     let mut s = sponge(TAG_NULLIFIER);
     let [a, b] = spend_secret.as_fields();
     let [c, d] = coin_commitment.as_fields();
     s.absorb_pair(a, b);
     s.absorb_pair(c, d);
+    s.absorb(Block128::from(NULLIFIER_VERSION));
     Nullifier(s.finalize())
 }
 
@@ -162,23 +182,60 @@ pub fn hash_auth_tag(spend_secret: &SpendSecret, tx_body_hash: &TxBodyHash) -> A
     AuthTag(s.finalize())
 }
 
-/// Derive an address from the wallet master secret and an account
-/// index. CRYPTO.md §4.6.
-pub fn derive_address(master_secret: &MasterSecret, account_index: u128) -> Address {
+/// Derive a stealth address from the wallet master secret and a
+/// payer-chosen public salt. CRYPTO.md §5.6.
+///
+/// Each output on-chain includes its own salt; recipients recover
+/// `spend_secret` from `(master_secret, salt)`. Distinct salts produce
+/// unlinkable addresses for the same logical wallet.
+pub fn derive_address(master_secret: &MasterSecret, salt: Block128) -> Address {
     let mut s = sponge(TAG_ADDRESS);
     let [a, b] = master_secret.as_fields();
     s.absorb_pair(a, b);
-    s.absorb(Block128::from(account_index));
+    // Salt is a 128-bit public value. Absorb as a single rate slot plus a
+    // zero companion so the schedule matches `derive_spend_secret` exactly.
+    s.absorb_pair(salt, Block128::ZERO);
     Address(s.finalize())
 }
 
-/// Derive the spend secret for a given account index. CRYPTO.md §4.6.
-pub fn derive_spend_secret(master_secret: &MasterSecret, account_index: u128) -> SpendSecret {
+/// Derive the spend secret for a stealth address. CRYPTO.md §5.6.
+pub fn derive_spend_secret(master_secret: &MasterSecret, salt: Block128) -> SpendSecret {
     let mut s = sponge(TAG_ADDRSPND);
     let [a, b] = master_secret.as_fields();
     s.absorb_pair(a, b);
-    s.absorb(Block128::from(account_index));
+    s.absorb_pair(salt, Block128::ZERO);
     SpendSecret(s.finalize())
+}
+
+/// Derive the wallet view key from the master secret. CRYPTO.md §5.9.
+///
+/// Sharing the view key reveals incoming payments (via `hash_scan_tag`) but
+/// does NOT grant spend authority — the spend path uses `ADDRSPND`, which
+/// is a disjoint IV. The view key is wallet-wide (not per-output), which is
+/// what makes third-party scanning cheap.
+pub fn derive_view_key(master_secret: &MasterSecret) -> ViewKey {
+    let mut s = sponge(TAG_VIEWKEY);
+    let [a, b] = master_secret.as_fields();
+    s.absorb_pair(a, b);
+    ViewKey(s.finalize())
+}
+
+/// Compute the public scan tag for an output. CRYPTO.md §5.10.
+///
+/// Each output carries `(salt, scan_tag)` on-chain. A scanner holding the
+/// matching view key recomputes `hash_scan_tag(view_key, salt)` for every
+/// output and compares — a single Poseidon2b sponge per output, no secret
+/// state. Non-holders cannot distinguish outputs because the view key is
+/// preimage-protected by the sponge.
+///
+/// The `SCANTAG_` IV is disjoint from `ADDRESS_` / `ADDRSPND` / `VIEWKEY_`,
+/// so a view-key holder cannot grind cross-domain collisions.
+pub fn hash_scan_tag(view_key: &ViewKey, salt: Block128) -> ScanTag {
+    let mut s = sponge(TAG_SCANTAG);
+    let [a, b] = view_key.as_fields();
+    s.absorb_pair(a, b);
+    s.absorb_pair(salt, Block128::ZERO);
+    ScanTag(s.finalize())
 }
 
 /// Canonical transaction-body hash. CRYPTO.md §4.7.
@@ -243,7 +300,19 @@ pub fn hash_tx_body(
         level = next;
     }
 
-    TxBodyHash(level[0])
+    // Final wrap — CRYPTO.md §5.7 step 3. Single permutation with
+    // capacity IV = `TXBODY__`. Provides explicit domain separation over
+    // the COMPRESS-domain Merkle tree.
+    let root = level[0];
+    let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
+    let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
+    let [iv_hi, iv_lo] = capacity_iv(TAG_TXBODY);
+    let mut state = [r0, r1, iv_hi, iv_lo];
+    Poseidon2bPermutation.permute_mut(&mut state);
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&state[0].to_bytes());
+    out[16..].copy_from_slice(&state[1].to_bytes());
+    TxBodyHash(out)
 }
 
 #[cfg(test)]
@@ -255,11 +324,11 @@ mod tests {
 
     #[test]
     fn determinism_all_primitives() {
-        let addr = derive_address(&MS, 0);
-        assert_eq!(addr, derive_address(&MS, 0));
+        let addr = derive_address(&MS, Block128::from(0u128));
+        assert_eq!(addr, derive_address(&MS, Block128::from(0u128)));
 
-        let spend = derive_spend_secret(&MS, 0);
-        assert_eq!(spend, derive_spend_secret(&MS, 0));
+        let spend = derive_spend_secret(&MS, Block128::from(0u128));
+        assert_eq!(spend, derive_spend_secret(&MS, Block128::from(0u128)));
 
         let c = hash_commitment(100, &addr, Block128::from(9u8), Block128::ZERO);
         assert_eq!(
@@ -279,8 +348,8 @@ mod tests {
 
     #[test]
     fn address_and_spend_secret_are_different_domains() {
-        let addr = derive_address(&MS, 0);
-        let spend = derive_spend_secret(&MS, 0);
+        let addr = derive_address(&MS, Block128::from(0u128));
+        let spend = derive_spend_secret(&MS, Block128::from(0u128));
         assert_ne!(addr.as_bytes(), spend.as_bytes());
     }
 
@@ -335,10 +404,26 @@ mod tests {
         assert_ne!(h_a, h_c);
     }
 
+    fn txbody_wrap(root: [u8; 32]) -> [u8; 32] {
+        use crate::native::domain::{capacity_iv, TAG_TXBODY};
+        use crate::native::permutation::Poseidon2bPermutation;
+        use noid_core::CanonicalSerialize;
+
+        let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
+        let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
+        let [hi, lo] = capacity_iv(TAG_TXBODY);
+        let mut state = [r0, r1, hi, lo];
+        Poseidon2bPermutation.permute_mut(&mut state);
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&state[0].to_bytes());
+        out[16..].copy_from_slice(&state[1].to_bytes());
+        out
+    }
+
     #[test]
     fn tx_body_matches_reference_construction() {
-        // With zero I/O the tree has exactly 2 leaves and must equal
-        // compress(prev_root, fee_leaf) per CRYPTO.md §4.7.
+        // Zero I/O → exactly 2 leaves. tree root = compress(prev, fee_leaf),
+        // then the TXBODY final wrap.
         use crate::native::compress;
 
         let prev = [0xAAu8; 32];
@@ -346,15 +431,15 @@ mod tests {
         let mut fee_leaf = [0u8; 32];
         fee_leaf[..16].copy_from_slice(&fee.to_le_bytes());
 
-        let expected = compress(&prev, &fee_leaf);
+        let root = compress(&prev, &fee_leaf);
+        let expected = txbody_wrap(root);
         let got = hash_tx_body(&prev, fee, &[], &[]);
         assert_eq!(got.0, expected);
     }
 
     #[test]
     fn tx_body_pads_with_zero_digest() {
-        // One-input tx: 3 leaves -> padded to 4 with ZERO_DIGEST.
-        // Root = compress(compress(prev, fee_leaf), compress(in0, ZERO)).
+        // 3 leaves → padded to 4 with ZERO_DIGEST, then TXBODY wrap.
         use crate::native::compress;
 
         let prev = [0x11u8; 32];
@@ -366,18 +451,69 @@ mod tests {
         fee_leaf[..16].copy_from_slice(&fee.to_le_bytes());
         let left = compress(&prev, &fee_leaf);
         let right = compress(&c.0, &[0u8; 32]);
-        let expected = compress(&left, &right);
+        let root = compress(&left, &right);
+        let expected = txbody_wrap(root);
 
         let got = hash_tx_body(&prev, fee, &[c], &[]);
         assert_eq!(got.0, expected);
     }
 
     #[test]
+    fn view_key_independent_of_spend_secret() {
+        let ms = MasterSecret([9u8; 32]);
+        let vk = derive_view_key(&ms);
+        let sp = derive_spend_secret(&ms, Block128::from(0u128));
+        // Distinct IVs over overlapping inputs must land on distinct digests.
+        assert_ne!(vk.as_bytes(), sp.as_bytes());
+    }
+
+    #[test]
+    fn scan_tag_detectable_with_view_key_only() {
+        let ms = MasterSecret([9u8; 32]);
+        let vk = derive_view_key(&ms);
+        let salt = Block128::from(0x1234_5678u128);
+
+        // A sender knowing the recipient's view key (e.g., a payment URI
+        // exposed out-of-band) can compute the scan tag and attach it.
+        let tag_sender = hash_scan_tag(&vk, salt);
+
+        // The recipient's scanner recomputes from the same view_key and
+        // matches — no secrets leaked.
+        let tag_scanner = hash_scan_tag(&vk, salt);
+        assert_eq!(tag_sender, tag_scanner);
+
+        // A different view key produces a different tag for the same salt.
+        let other_vk = derive_view_key(&MasterSecret([10u8; 32]));
+        assert_ne!(hash_scan_tag(&other_vk, salt), tag_scanner);
+    }
+
+    #[test]
+    fn scan_tag_changes_per_salt() {
+        let ms = MasterSecret([9u8; 32]);
+        let vk = derive_view_key(&ms);
+        let t1 = hash_scan_tag(&vk, Block128::from(1u128));
+        let t2 = hash_scan_tag(&vk, Block128::from(2u128));
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn view_key_domain_disjoint_from_scan_tag() {
+        // Protects against an attacker who sees a view-key-derived digest
+        // trying to reuse it as a scan tag or vice versa.
+        let ms = MasterSecret([11u8; 32]);
+        let vk = derive_view_key(&ms);
+        let salt = Block128::from(7u128);
+        let st = hash_scan_tag(&vk, salt);
+        assert_ne!(vk.as_bytes(), st.as_bytes());
+    }
+
+    #[test]
     fn nullifier_unlinkable_per_secret() {
         let addr = Address([1u8; 32]);
         let c = hash_commitment(42, &addr, Block128::from(123u8), Block128::ZERO);
-        let s1 = derive_spend_secret(&MasterSecret([1u8; 32]), 0);
-        let s2 = derive_spend_secret(&MasterSecret([2u8; 32]), 0);
+        let salt = Block128::from(0u128);
+        let s1 = derive_spend_secret(&MasterSecret([1u8; 32]), salt);
+        let s2 = derive_spend_secret(&MasterSecret([2u8; 32]), salt);
         assert_ne!(hash_nullifier(&s1, &c), hash_nullifier(&s2, &c));
     }
 }

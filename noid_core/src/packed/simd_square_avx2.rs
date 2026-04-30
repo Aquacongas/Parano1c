@@ -52,8 +52,7 @@ unsafe fn bit_spread(x: __m256i) -> __m256i {
     let x = _mm256_and_si256(_mm256_or_si256(x, shl_u128!(x, 8)), mask8);
     let x = _mm256_and_si256(_mm256_or_si256(x, shl_u128!(x, 4)), mask4);
     let x = _mm256_and_si256(_mm256_or_si256(x, shl_u128!(x, 2)), mask2);
-    let x = _mm256_and_si256(_mm256_or_si256(x, shl_u128!(x, 1)), mask1);
-    x
+    _mm256_and_si256(_mm256_or_si256(x, shl_u128!(x, 1)), mask1)
 }
 
 /// Multiply each 128-bit lane by the GCM tail polynomial
@@ -169,8 +168,7 @@ mod tests {
         ];
         for &v0 in &edge_values {
             for &v1 in &edge_values {
-                let pa =
-                    PackedBlock128::from_array([Block128::from(v0), Block128::from(v1)]);
+                let pa = PackedBlock128::from_array([Block128::from(v0), Block128::from(v1)]);
                 let expected = [square_flat_u128(v0), square_flat_u128(v1)];
                 let got = unsafe { packed_square_flat_avx2(pa) };
                 assert_eq!(

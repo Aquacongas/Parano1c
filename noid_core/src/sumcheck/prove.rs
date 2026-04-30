@@ -151,8 +151,7 @@ pub fn prove_single_packed(
                         (
                             a0 ^ v_lo_flat,
                             a1 ^ v_hi_flat,
-                            a2 ^ clmul_gcm(v_lo_flat, c_lo_flat)
-                                ^ clmul_gcm(v_hi_flat, c_hi_flat),
+                            a2 ^ clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat),
                         )
                     },
                 )
@@ -169,8 +168,7 @@ pub fn prove_single_packed(
                 let v_hi_flat = tower_to_flat_u128(hi_half[j].0);
                 u0_flat ^= v_lo_flat;
                 u1_flat ^= v_hi_flat;
-                u2_flat ^=
-                    clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat);
+                u2_flat ^= clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat);
             }
             (u0_flat, u1_flat, u2_flat)
         };

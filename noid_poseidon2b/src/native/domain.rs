@@ -48,6 +48,9 @@ pub const TAG_ADDRSPND: DomainTag = DomainTag::new(b"ADDRSPND");
 pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
+pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
+pub const TAG_VIEWKEY: DomainTag = DomainTag::new(b"VIEWKEY_");
+pub const TAG_SCANTAG: DomainTag = DomainTag::new(b"SCANTAG_");
 
 #[cfg(test)]
 mod tests {
@@ -66,6 +69,9 @@ mod tests {
             TAG_TXBODY,
             TAG_BLOCKHDR,
             TAG_FSCHALNG,
+            TAG_COMPRESS,
+            TAG_VIEWKEY,
+            TAG_SCANTAG,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

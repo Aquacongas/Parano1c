@@ -24,6 +24,7 @@ impl Poseidon2bPermutation {
         apply_mds_full(state);
 
         // Full and partial rounds
+        #[allow(clippy::needless_range_loop)]
         for r in 0..N_ROUNDS {
             if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {
                 // Full round

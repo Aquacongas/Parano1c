@@ -15,6 +15,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::native::compression::Poseidon2bSponge;
+use crate::native::domain::{capacity_iv, TAG_COMPRESS};
 use crate::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
@@ -316,9 +317,9 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
 
 /// Batched 2-to-1 compression of interleaved 32-byte digest pairs.
 ///
-/// Matches `native::compress` exactly: a single Poseidon2b permutation over
-/// `[a0, a1, b0, b1]` with no padding and no IV. One permutation per pair
-/// vs. three for `hash_concatenation_batch_interleaved_into`.
+/// Matches `native::compress` exactly: two Poseidon2b permutations per
+/// pair with capacity IV = `COMPRESS` absorbed before `a`, then `b` XORed
+/// into the rate between permutations (CRYPTO.md §5.1).
 pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]]) {
     assert_eq!(
         pairs.len() & 1,
@@ -339,12 +340,16 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
         return;
     }
 
+    let [iv_hi, iv_lo] = capacity_iv(TAG_COMPRESS);
     let chunks = n / PACKED_LANES;
 
     for chunk in 0..chunks {
         let mut states = [PackedBlock128::ZERO; STATE_SIZE];
         let off = chunk * PACKED_LANES;
 
+        // state = [a0, a1, IV_hi, IV_lo]
+        states[2] = PackedBlock128::broadcast(iv_hi);
+        states[3] = PackedBlock128::broadcast(iv_lo);
         for lane in 0..PACKED_LANES {
             let a0 = Block128::from(u128::from_le_bytes(
                 pairs[2 * (off + lane)][0..16].try_into().unwrap(),
@@ -352,17 +357,27 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
             let a1 = Block128::from(u128::from_le_bytes(
                 pairs[2 * (off + lane)][16..32].try_into().unwrap(),
             ));
+            states[0] = states[0].set_lane(lane, a0);
+            states[1] = states[1].set_lane(lane, a1);
+        }
+
+        packed_poseidon2b_permute(&mut states);
+
+        // XOR b into rate.
+        let mut pb0 = PackedBlock128::ZERO;
+        let mut pb1 = PackedBlock128::ZERO;
+        for lane in 0..PACKED_LANES {
             let b0 = Block128::from(u128::from_le_bytes(
                 pairs[2 * (off + lane) + 1][0..16].try_into().unwrap(),
             ));
             let b1 = Block128::from(u128::from_le_bytes(
                 pairs[2 * (off + lane) + 1][16..32].try_into().unwrap(),
             ));
-            states[0] = states[0].set_lane(lane, a0);
-            states[1] = states[1].set_lane(lane, a1);
-            states[2] = states[2].set_lane(lane, b0);
-            states[3] = states[3].set_lane(lane, b1);
+            pb0 = pb0.set_lane(lane, b0);
+            pb1 = pb1.set_lane(lane, b1);
         }
+        states[0] = states[0].xor(pb0);
+        states[1] = states[1].xor(pb1);
 
         packed_poseidon2b_permute(&mut states);
 

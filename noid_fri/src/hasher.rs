@@ -39,7 +39,8 @@ impl Blake3Hasher {
 
 fn block128_to_bytes(x: &Block128) -> [u8; 16] {
     let mut b = [0u8; 16];
-    x.serialize(&mut b).expect("Block128 serialises to 16 bytes");
+    x.serialize(&mut b)
+        .expect("Block128 serialises to 16 bytes");
     b
 }
 
@@ -131,10 +132,7 @@ mod tests {
         let mut batch_out = vec![[0u8; 32]; n];
         h.batch_hash_pair(&pairs, &mut batch_out);
         for i in 0..n {
-            assert_eq!(
-                batch_out[i],
-                h.hash_pair(&pairs[2 * i], &pairs[2 * i + 1])
-            );
+            assert_eq!(batch_out[i], h.hash_pair(&pairs[2 * i], &pairs[2 * i + 1]));
         }
 
         let digs: Vec<HashOutput> = (0..2 * n).map(|i| [i as u8; 32]).collect();

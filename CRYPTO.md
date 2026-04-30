@@ -1,221 +1,531 @@
-# Paranoid (NOID) — Cryptographic Primitive Specification
+# **Paranoid (NOID) — Cryptographic Primitive Specification (Locked)**
 
-Status: **draft**, pinned before commitment-format-sensitive code (Merkle compression, UTXO primitives, PoW) is written.
-Scope: hashing, commitments, nullifiers, addresses, transaction binding, PoW, recursion-readiness.
-Non-scope: recursive STARKs / IVC (design for, do not build).
+## **Goal**
+
+Design a **proof-native, post-quantum, signatureless PoW blockchain** based on transparent STARKs (no trusted setup), with:
+
+* Non-interactive transactions (Fiat–Shamir only)
+* Deterministic proofs (no external randomness)
+* Fast sync for light clients
+* Recursion-ready primitives and formats
 
 ---
 
-## 0. Design goals
+# **0. Design Principles**
 
-- Paranoid, post-quantum ready.
-- **No elliptic curves, no pairings, no trusted setup.**
-- **Signatureless.** The STARK proof is the only spend authorization.
-- **Non-interactive transactions** (MUST). All randomness from Fiat-Shamir.
-- Fast and lightweight per block. Proof-native PoW.
-- Recursion-ready: primitive formats and public-input layouts must not foreclose future IVC.
+* No elliptic curves, no pairings, no trusted setup
+* All authorization = STARK proof validity
+* Deterministic cryptography (no entropy sources outside FS)
+* Strict domain separation for every primitive
+* Canonical encoding everywhere (no ambiguity tolerated)
+* Recursion compatibility is preserved by design
 
-## 1. Field
+---
 
-- **Primary field**: `GF(2^128)` binary tower (`Block128`).
-- **Rationale**: native to our Poseidon2b + FRI stack, hash/NTT are cheap, no CLMUL dependency outside what we already have.
-- **Open issue (non-blocking)**: integer range / balance constraints arithmetize less naturally in GF(2^128) than in a prime field. If those costs become painful inside the circuit we will introduce a companion small-prime sub-structure for range tables only. We will NOT change the hash field.
+# **1. Field**
 
-## 2. Permutation
+* Primary field: **GF(2^128)** (binary tower, `Block128`)
 
-- **Primitive**: Poseidon2b, state width `t = 4`, rate `r = 2`, capacity `c = 2`.
-- **Rounds**: 8 full + 58 partial, x^7 S-box.
-- **Target security** (256-bit output, 256-bit capacity):
-  - Classical collision: ~2^128 (birthday / sponge c/2 bound).
-  - Classical preimage: ~2^256 (capped by sponge c/2 = 2^128 in the generic model).
-  - Quantum preimage (Grover): ~2^128.
-  - Quantum collision: ~2^85 under the BHT model (requires exponential qRAM; widely considered unrealistic), and ~2^128 under parallel-Rho which remains the best practical quantum collision attack. We therefore target ~85–128-bit PQ collision resistance depending on the adversary model.
+### Rationale
 
-## 3. Domain separation
+* Native to additive NTT and Poseidon2b
+* SIMD-efficient
+* No dependency on large integer modular arithmetic
 
-- **Placement**: capacity-IV style. Each construction initializes `state[2]`, `state[3]` with a domain-tag constant derived from a 64-bit ASCII label. `state[0]`, `state[1]` hold the rate.
-- **Tag derivation**: given `LABEL_u64 = u64::from_be_bytes(label)`, the two capacity words are `state[2] = Block128::from((LABEL_u64 as u128) << 64)` and `state[3] = Block128::from(LABEL_u64 as u128)`. Distinct high/low halves prevent a cheap cancellation. Labels are 8-byte ASCII strings — see §11.
-- **Never** reuse the same permutation with the same IV for two different constructions.
+### Constraint Note
 
-## 4. Primitives
+Range constraints are non-native in binary fields. If needed, introduce auxiliary lookup/range systems — without changing the hash field.
 
-Every primitive below is built from the same Poseidon2b permutation, distinguished only by IV and input layout.
+---
 
-### 4.1 `compress(a, b) -> [u8; 32]`
+# **2. Permutation**
 
-- **Use**: inner Merkle nodes. The hot path — called ~`2N` times per tree of `N` leaves.
-- **Construction (truncated fixed-width permutation)**:
-  ```
-  state = [a0, a1, b0, b1]       // a, b each 32 bytes = 2 Block128 words
-  permute_mut(&mut state)
-  return (state[0] || state[1])
-  ```
-- **No padding, no IV.** Safe because the input width is fixed (128 bytes → 64 bytes). Inner-node domain is distinct from every other construction because every other construction either uses sponge-mode (padding marker) or a capacity IV, so no collision across uses.
-- **Cost**: 1 permutation per call.
+* Primitive: Poseidon2b
+* State width: `t = 4`, rate = 2, capacity = 2
+* S-box: x⁷
+* Rounds: 8 full + 58 partial
 
-### 4.2 `hash_leaf(fields: &[Block128]) -> [u8; 32]`
+### Security Targets
 
-- **Use**: leaves of the state / note / nullifier Merkle trees.
-- **Construction**: sponge with capacity IV = `LEAF`. Absorb all field elements, standard pad, squeeze 32 bytes.
-- **Cost**: `ceil(len/2) + 1` permutations. Called once per leaf, not hot.
+| Property                      | Security               |
+| ----------------------------- | ---------------------- |
+| Collision (classical)         | ~2¹²⁸                  |
+| Preimage (classical)          | ~2¹²⁸ (capacity bound) |
+| Preimage (quantum)            | ~2¹²⁸                  |
+| Collision (quantum practical) | ~2¹²⁸                  |
 
-### 4.3 `hash_commitment(value, owner, blinding, asset_tag) -> [u8; 32]`
+---
 
-- **Use**: coin / output commitment. Same primitive for both.
-- **Input**: 5 `Block128` — `value` as LE-128 integer; `owner` is the full 256-bit address, absorbed as two `Block128` halves (high then low); `blinding` is 128-bit random; `asset_tag = Block128::ZERO` for native asset, reserved for multi-asset.
-- **Construction**: sponge with IV = `COMMIT__`. Absorb the 5 fields in order `[value, owner_hi, owner_lo, blinding, asset_tag]`, pad, squeeze 32 bytes.
-- **Rationale for absorbing both address halves**: a single 128-bit address slot would cap commitment binding at ~2^64 work (birthday on the truncated address), well below the ~2^128 collision floor targeted by the rest of the stack. Absorbing both halves preserves the full 256-bit sponge capacity.
-- **Binding**: hash-binding (hiding under preimage-resistance, binding under collision-resistance; blinding is the randomness).
+# **3. Domain Separation**
 
-### 4.4 `hash_nullifier(spend_secret, coin_commitment) -> [u8; 32]`
+## 3.1 Method
 
-- **Use**: spend nullifier. Revealed on spend; uniqueness is checked against the nullifier-set Merkle root.
-- **Input**: 2 `Block128` from `spend_secret` + 2 `Block128` from `coin_commitment` digest → 4 fields.
-- **Construction**: sponge with IV = `NULLIFIE`. Absorb 4 fields, pad, squeeze 32 bytes.
-- **Security**: un-linkability = preimage-resistance of the hash over the secret. Uniqueness = collision-resistance.
+Each sponge-mode construction initializes capacity words:
 
-### 4.5 `hash_auth_tag(spend_secret, tx_body_hash) -> [u8; 32]`
+```text
+state[2] = (LABEL << 64)    // high 64 bits of the 128-bit capacity word
+state[3] = LABEL            // low 64 bits of the next 128-bit capacity word
+```
 
-- **Use**: binds the STARK proof to this specific tx body; prevents replay with different outputs.
-- **Input**: `spend_secret` (2 fields) + `tx_body_hash` (2 fields) → 4 fields.
-- **Construction**: sponge with IV = `AUTHTAG_`.
-- **Public input** of the STARK includes the auth tag; the circuit verifies it in-circuit.
+`LABEL` is the 8-byte ASCII constant interpreted as a big-endian `u64`.
 
-### 4.6 `derive_address(master_secret, account_index) -> [u8; 32]`
+## 3.2 Rule
 
-- **Use**: address = `H_ADDRESS(master_secret, account_index)`. Flat derivation, no hierarchy.
-- **Input**: `master_secret` (2 fields) + `account_index` (1 field, little-endian u128) → 3 fields.
-- **Construction**: sponge with IV = `ADDRESS_`.
-- **Spend key**: per address, the spend secret is `H_ADDRESS_SPEND(master_secret, account_index)` with IV = `ADDRSPND`. The address is public; the spend secret is private and never leaves the wallet.
+* Every primitive MUST use a unique domain label (see §11)
+* No reuse across constructions
+* No implicit domains
 
-### 4.7 `hash_tx_body(prev_state_root, inputs, outputs, fee) -> [u8; 32]`
+---
 
-- **Use**: canonical tx identifier; input to `hash_auth_tag`; hashed into the Fiat-Shamir transcript.
-- **Construction**: binary Merkle tree over 32-byte canonical leaf encodings, reduced by [`compress`]. No per-leaf sponge.
-- **Leaf encoding (all 32 bytes, little-endian)**:
-  1. `prev_state_root` — passthrough (already 32 bytes).
-  2. `fee_leaf = le_bytes_u128(fee) || [0u8; 16]`.
-  3. Each `input_commitment` — passthrough.
-  4. Each `output_commitment` — passthrough.
-- **Padding**: pad the leaf list to the next power of two (min 2) with `ZERO_DIGEST = [0u8; 32]`.
-- **Reduction**: while `len > 1`, `next[i] = compress(level[2i], level[2i+1])`.
-- **Rationale for no per-leaf hash**: every payload is already a 256-bit cryptographic digest or a canonically encoded scalar; an extra sponge per leaf would add cost without adding domain separation (the fixed tree shape and the `COMPRESS_` IV already provide it).
-- **Why Merkle and not a sponge**: lets the circuit expose a logarithmic auth path if the prover wants to commit to a specific input without revealing all siblings. Keeps the door open.
+# **4. Canonical Encoding (MANDATORY)**
 
-### 4.8 `fiat_shamir_challenge(transcript) -> Block128`
+All inputs to hash functions MUST follow:
 
-- **Use**: verifier challenges inside the STARK (sumcheck, FRI query positions).
-- **Construction**: `Poseidon2bChannel` with IV = `FSCHALNG`.
+* Fixed-width encoding
+* Little-endian for integers
+* No variable-length ambiguity
+* No implicit padding
 
-## 5. Merkle tree
+### Block128 encoding
 
-- **Arity**: binary.
-- **Leaf rule**: `leaf = hash_leaf(field_elements_of_payload)`. Always.
-- **Inner rule**: `parent = compress(left, right)`. Always. Position-independent; the path bit lives in the witness.
-- **Empty subtree handling**: sparse, with precomputed zero-subtree roots `Z[0], Z[1], ..., Z[DEPTH]`, `Z[0] = hash_leaf(&[])`, `Z[k] = compress(Z[k-1], Z[k-1])`.
-- **Depth**:
-  - State tree (coin commitments): **32** (4B leaves).
-  - Nullifier tree: **32**, sparse-by-construction.
-  - Note tree (per-wallet, off-chain index): wallet-local, depth grows.
-- **Rationale for uniform depth**: one circuit arithmetization for inclusion proofs.
+* 16 bytes, little-endian
 
-## 6. Transaction format
+### Digest encoding (locked)
 
-- **Weight classes**: one circuit with max width **4 inputs / 8 outputs**, padded with dummy slots. Dummy = zeroed commitment + "valid = false" witness bit; circuit enforces that dummies contribute zero to balance and do not touch the nullifier set.
-- **Fee**: explicit. Balance constraint: `Σ input_values = Σ output_values + fee`.
-- **Range**: each `value` range-checked to 64 bits in-circuit via bit decomposition.
-- **Public inputs of the STARK**:
-  1. `prev_state_root`
-  2. `new_state_root`
-  3. `nullifier_insertions_root` (Merkle root of the nullifiers added by this tx)
-  4. `tx_body_hash`
-  5. `fee`
-- **Auth tags** are in the witness (per-input), verified against the spend-secret + `tx_body_hash` inside the circuit.
+* 32 bytes interpreted as two `Block128` words:
+  * `bytes[0..16]`  → `Block128[0]` (high half of the digest)
+  * `bytes[16..32]` → `Block128[1]` (low half of the digest)
+* This rule is identical in every construction that accepts a digest as input.
 
-## 7. Proof-of-Work
+### ZERO_DIGEST (locked)
 
-### 7.1 Block hash
+```text
+ZERO_DIGEST = [0u8; 32]
+```
 
-`block_hash = H_BLOCKHDR(prev_block_hash, state_root, tx_batch_root, timestamp, miner_address, nonce, proof_transcript_hash)`
+Identical across all contexts (sparse-tree padding, tx-body leaf padding, etc.).
 
-where `proof_transcript_hash` is the Fiat-Shamir seed of the aggregated block proof.
+### Leaf canonicalization (locked)
 
-### 7.2 Mining
+* For tx-body Merkle input, leaves are **already** canonical 32-byte values.
+* **No implicit per-leaf hashing.**
+* Scalar leaves (`fee`) are canonicalized as `le_bytes_u128(scalar) || [0u8; 16]`.
 
-- Miners produce an aggregated STARK (`block_proof`) over the batch of transactions plus the state-transition correctness proof.
-- **Nonce is the only grinding surface.** The Fiat-Shamir transcript is seeded with `(prev_block_hash, state_root, tx_batch_root, timestamp, miner_address, nonce)`. Given those, the proof is deterministic.
-- Difficulty target applies to `block_hash`.
-- A miner attempting to vary tx ordering or drop a tx changes `tx_batch_root` → new seed → fresh proof, which is a valid (but costlier) grind strategy. That is acceptable and is the honest "usable work" property.
-- **Not acceptable**: re-proving the same logical block with fresh FRI randomness to re-roll the hash. This is prevented by making the proof deterministic given the seed (no external randomness source).
+---
 
-### 7.3 Useful-work property
+# **5. Core Primitives**
 
-Every mining attempt produces a verifiable STARK of a valid state transition. There is no wasted SHA grinding; the work done is exactly the work required to validate the block.
+---
 
-## 7a. FRI parameters
+## **5.1 `compress(a, b) → 32 bytes`** — TWO-PERMUTATION SPONGE
 
-### 7a.1 Code rate
+### Use
 
-- **Rate** R = 4 (log2 R = 2). Each query opens one leaf and contributes `log2(R) = 2` bits of proven soundness under the JACM FRI bound (`queries · log2(R)`), `log2(R)` bits under the conjectured bound.
+Merkle inner nodes for every Poseidon2b-backed Merkle tree (state tree, nullifier tree, tx-body tree). FRI Merkle trees use Blake3 (§9).
 
-### 7a.2 Query count
+### Construction (locked)
 
-- **Target**: 128-bit proven soundness with comfortable slack.
-- **Minimum**: `ceil(128 / log2(R)) = 64` queries.
-- **Chosen**: **96 queries** — gives ~192 bits of proven soundness, ~50% cheaper than the previous 144-query setting, still well above any realistic grinding budget. Raise back to ~128 if we ever need proven 256-bit soundness.
-- A larger query count does not tighten the FRI proximity argument once the list-decoding bound saturates; beyond ~128 queries the extra cost is pure margin.
+```text
+// a, b : [u8; 32]   (digests, encoded per §4)
+// COMPRESS_hi, COMPRESS_lo : capacity IV words derived from LABEL = "COMPRESS"
 
-### 7a.3 Hash tiering
+state = [a0, a1, COMPRESS_hi, COMPRESS_lo]
+permute(state)
 
-Two hashers with different roles:
+state[0] ^= b0
+state[1] ^= b1
+permute(state)
 
-- **Merkle-layer hash (fast tier)**: Blake3. Used for FRI leaves and inner nodes. Byte-native, ~5–10 GB/s on commodity x86_64 — matches the expected prover wall-clock profile where commitment-hashing dominates (~90% of `commit()` at log_n = 20). Not arithmetization-friendly, but acceptable because the block-level verifier runs natively, not in-circuit.
-- **Transcript-layer hash (recursion tier)**: Poseidon2b. Used for the Fiat-Shamir channel (§4.8) and every UTXO primitive in §4 (commitments, nullifiers, addresses, tx body). These are the digests that a future recursion layer would need to re-hash in-circuit; keeping them algebraic preserves recursion-readiness.
+return state[0] || state[1]
+```
 
-**Recursion boundary contract**: if/when we add recursion, the recursion verifier ingests the Poseidon2b transcript state and the block's public inputs, *not* the Blake3 Merkle proofs. Block proofs at rest always pin the full Blake3 Merkle paths; recursion never re-verifies them in-circuit.
+### Notes
 
-## 8. Recursion-readiness (not yet shipped)
+* Two permutations per inner node (mandatory).
+* Domain is carried in the capacity IV before any data is absorbed — no ad-hoc mixing.
+* Uniform security model across all primitives (capacity-IV sponge everywhere).
 
-- Public-input layout of the block proof is fixed and self-describing.
-- The verifier is deterministic and pure: given `(public_inputs, proof_bytes)` it returns accept/reject with no hidden state.
-- No construction in this spec assumes a non-recursive verifier. A future `cumulative_block_proof_{N+1}` can be a STARK over the statement:
-  > "I know `prev_cumulative_proof_N` and `block_proof_{N+1}` such that both verify against the declared public inputs."
-- Binary-tower STARK recursion is an open research area; we expect to prototype it in a separate track once the base prover is stable.
+---
 
-## 9. Storage (local node)
+## **5.2 `hash_leaf(fields[]) → 32 bytes`**
 
-- **Primary store**: `sled` (pure-Rust, embedded, zero-config) for chain state, note set, nullifier bloom + exact table, wallet data.
-- **Chain history**: append-only log; full node retains all blocks. Light node keeps only the latest block header + proof.
-- **Wallet secrets**: master secret encrypted at rest (Argon2id KDF from user passphrase → XChaCha20-Poly1305).
-- **Genesis**: CLI command `paranoid genesis --to <address> --count N --value V` writes `N` initial commitments into the state tree, publishes the genesis state root.
+* Sponge, IV = `LEAF____`
+* Absorb all fields
+* Standard padding
+* Output: 32 bytes
 
-## 10. Open issues (tracked, non-blocking)
+---
 
-- **In-circuit range check encoding** for 64-bit values over GF(2^128): bit-decomposition vs. lookup-based (if/when a lookup argument is added).
-- **Recursion field choice**: if binary-tower recursion turns out too expensive to arithmetize, we may split: block proofs in GF(2^128), cumulative proofs in a prime field, with a translation layer. Deferred.
-- **Difficulty adjustment algorithm**: not part of crypto spec; tracked separately in consensus spec.
+## **5.3 `hash_commitment(...) → 32 bytes`**
 
-## 11. Domain-tag registry
+```text
+H_COMMIT(value, owner_hi, owner_lo, blinding, asset_tag)
+```
 
-All tags are exactly 8 ASCII bytes. `state[2] = Block128::from((LABEL_u64 as u128) << 64)`, `state[3] = Block128::from(LABEL_u64 as u128)` (distinct high/low halves prevent a cheap cancellation).
+* IV = `COMMIT__`
+* `value` absorbed as `Block128::from(value_u128)`
+* `owner` absorbed as two halves (`owner_hi`, `owner_lo`) — preserves full 256-bit binding
+* `blinding` : 128-bit random
+* `asset_tag` : `Block128::ZERO` for native asset; reserved for multi-asset
 
-| Label      | Use                                   |
-|------------|---------------------------------------|
-| `LEAF____` | leaf hashing of arbitrary field sets  |
-| `COMMIT__` | coin / output commitment              |
-| `NULLIFIE` | spend nullifier                       |
-| `AUTHTAG_` | per-input authorization tag           |
-| `ADDRESS_` | address derivation                    |
-| `ADDRSPND` | spend secret derivation               |
-| `TXBODY__` | tx body hashing                       |
-| `BLOCKHDR` | block header hash / PoW target domain |
-| `FSCHALNG` | Fiat-Shamir challenge channel         |
+### Properties
 
-`compress` uses **no IV** and carries no label (fixed-width truncated permutation — see §4.1).
+* Binding: collision resistance
+* Hiding: via blinding randomness
 
-## 12. Non-changes (explicit)
+---
 
-- No Schnorr / EdDSA / Lamport / XMSS. Ever.
-- No Groth16 / Plonk / anything pairing-based.
-- No SHA-2/SHA-3 as primary hash. (Allowed outside cryptographic binding — e.g. logging, debug dumps.)
-- No wallet format or auth flow that depends on an online service.
+## **5.4 `hash_nullifier(...) → 32 bytes`** — VERSIONED
+
+```text
+NULLIFIER_VERSION = Block128::from(1u128)
+
+H_NULL(
+  spend_secret_hi,
+  spend_secret_lo,
+  commitment_hi,
+  commitment_lo,
+  NULLIFIER_VERSION
+)
+```
+
+* IV = `NULLIFIE`
+* Version MUST be part of the hash input.
+* Future scheme rotation: increment (2, 3, …). Cross-version collisions impossible.
+
+### Properties
+
+* Unique per spend
+* Unlinkable without secret
+
+---
+
+## **5.5 `hash_auth_tag(spend_secret, tx_body_hash) → 32 bytes`**
+
+```text
+H_AUTH(spend_secret_hi, spend_secret_lo, tx_body_hi, tx_body_lo)
+```
+
+* IV = `AUTHTAG_`
+* Binds the STARK proof to this tx body.
+
+---
+
+## **5.6 `derive_address(...)` — STEALTH-ADDRESS MODEL**
+
+The salt model is **payer-chosen, public salt**, carried in the transaction output.
+
+### Address
+
+```text
+address = H_ADDR(master_secret_hi, master_secret_lo, salt_hi, salt_lo)
+```
+
+* IV = `ADDRESS_`
+* `salt` : 128-bit public value, chosen by the payer, included in the output.
+
+### Spend secret
+
+```text
+spend_secret = H_ADDRSPND(master_secret_hi, master_secret_lo, salt_hi, salt_lo)
+```
+
+* IV = `ADDRSPND`
+* The spend secret is recoverable by the recipient from `(master_secret, salt)`; `salt` is part of the output, `master_secret` never leaves the wallet.
+
+### Properties
+
+* Unlinkability across payments to the same logical wallet (salt differs per payment).
+* No deterministic address clustering.
+* Addresses are per-output; no on-chain "account".
+
+### Notes
+
+* `master_secret` is a private 256-bit value (two `Block128` halves), stored encrypted at rest in the wallet.
+* `salt` encoded as 128 bits. Protocol convention: if extended to 256 bits later, both halves feed both IVs.
+
+---
+
+## **5.7 `hash_tx_body(...)` — MERKLE + FINAL WRAP**
+
+### Step 1 — Build Merkle tree over canonical 32-byte leaves
+
+Leaves (in order):
+
+1. `prev_state_root`                   (32 bytes, passthrough)
+2. `fee_leaf = le_bytes_u128(fee) || [0u8; 16]`
+3. input commitments                   (32 bytes each, passthrough)
+4. output commitments                  (32 bytes each, passthrough)
+
+Pad with `ZERO_DIGEST` to the next power of two (minimum 2).
+
+### Step 2 — Reduce with `compress` (§5.1)
+
+```text
+root = MerkleReduce(compress, leaves)
+```
+
+### Step 3 — Final wrap (single permutation, locked)
+
+```text
+state = [root_hi, root_lo, TXBODY_hi, TXBODY_lo]
+permute(state)
+tx_body_hash = state[0] || state[1]
+```
+
+* IV = `TXBODY__`
+* Single permutation (no re-absorb, no padding — input is exactly one rate block).
+* Provides explicit TXBODY domain separation on top of the COMPRESS-domain Merkle tree.
+
+---
+
+## **5.8 Fiat–Shamir**
+
+* Sponge channel, IV = `FSCHALNG`
+* Deterministic transcript; challenges squeezed after padding flush.
+
+---
+
+## **5.9 `derive_view_key(master_secret) → 32 bytes`** — OBSERVABILITY
+
+```text
+view_key = H_VIEW(master_secret_hi, master_secret_lo)
+```
+
+* IV = `VIEWKEY_`
+* Wallet-wide (one view key per wallet, not per address).
+* **Strictly separated from `ADDRSPND`**: sharing `view_key` never leaks `spend_secret` — the two use disjoint IVs and the sponge is preimage-resistant.
+
+### Capability of a view-key holder
+
+* Can detect all incoming payments to the wallet by recomputing `hash_scan_tag` (§5.10) for each output in a block.
+* Cannot spend. Cannot derive `spend_secret`. Cannot create valid `auth_tag`.
+* Revoking view access requires rotating the master secret (i.e., a new wallet).
+
+### Use cases
+
+* Exchanges / custodians tracking deposits.
+* Block explorers that a user voluntarily grants read access to.
+* Light wallets syncing without downloading the full note set.
+
+---
+
+## **5.10 `hash_scan_tag(view_key, salt) → 32 bytes`** — OBSERVABILITY
+
+Every on-chain output carries `(commitment, salt, scan_tag)` where
+
+```text
+scan_tag = H_TAG(view_key_hi, view_key_lo, salt, 0)
+```
+
+* IV = `SCANTAG_`
+* `salt` is the same 128-bit public salt used in §5.6 address derivation.
+* The trailing `0` field pads the salt absorb to a rate boundary and matches `derive_address` / `derive_spend_secret` in shape.
+
+### Scanning algorithm (pseudocode)
+
+```text
+for each output (commitment, salt, scan_tag) in the new block:
+    expected = hash_scan_tag(my_view_key, salt)
+    if constant_time_eq(expected, scan_tag):
+        this output is mine
+        spend_secret = derive_spend_secret(master_secret, salt)   # spender only
+```
+
+### Cost
+
+* **One Poseidon2b sponge per output per scanner**, no state, no secrets beyond the view key. ~microseconds per output at current benchmarks.
+
+### Privacy
+
+* A non-holder of `view_key` sees `scan_tag` as a uniformly random 32-byte string — the sponge is indistinguishable without the key.
+* Scan tags do not link a recipient across outputs (same view key, different salts → different tags).
+
+---
+
+# **6. Merkle Trees**
+
+* Binary
+* Inner node: `compress` (§5.1)
+* Leaves: `hash_leaf` (§5.2) for field-element payloads; passthrough 32-byte digests where the leaf is already a digest (tx body)
+
+### Sparse trees (locked)
+
+* Fixed depth (per tree, see §6.1)
+* Precomputed zero subtree roots:
+
+```text
+Z[0] = hash_leaf(&[])
+Z[i] = compress(Z[i-1], Z[i-1])
+```
+
+### 6.1 Depths
+
+| Tree                              | Depth |
+| --------------------------------- | ----- |
+| State tree (coin commitments)     | 32    |
+| Nullifier tree                    | 32    |
+| Note tree (wallet-local, off-chain) | grows |
+
+---
+
+# **7. Transaction Model**
+
+### Structure
+
+* Max: 4 inputs / 8 outputs
+* Dummy slots allowed (zero commitment; `valid=false` witness bit; contributes 0 to balance; no nullifier insert).
+
+### Output schema (observable, per §5.10)
+
+Each on-chain output is the triple:
+
+```text
+output = (
+  commitment : 32 bytes,   // §5.3, binds value/owner/blinding/asset_tag
+  salt       : 16 bytes,   // §5.6, public, payer-chosen
+  scan_tag   : 32 bytes    // §5.10, computed from recipient's view_key + salt
+)
+```
+
+`salt` and `scan_tag` are covered by `tx_body_hash` — see §7.1.
+
+### 7.1 Tx-body coverage of salt + scan_tag (binding extension)
+
+To prevent a relay from rewriting `(salt, scan_tag)` while leaving `commitment` untouched, the tx-body Merkle leaves for outputs are the 2-to-1 compression of `(commitment, compress(salt_leaf, scan_tag))`, where `salt_leaf = le_bytes(salt) || [0u8; 16]`. Inputs remain passthrough commitments.
+
+Concretely, per output the leaf absorbed into the tx-body Merkle is:
+
+```text
+output_leaf = compress(commitment, compress(salt_leaf, scan_tag))
+```
+
+This keeps the tx-body Merkle shape (32-byte leaves reduced by `compress`) while binding the full observable output tuple. `hash_tx_body`'s implementation (`noid_poseidon2b::primitives::hash_tx_body`) currently takes only commitments; the signature extension lands in a follow-up alongside the `noid_tx` crate so this spec bump is not a breaking change to the present library.
+
+### Constraints
+
+* Balance: `Σ inputs = Σ outputs + fee`
+* Range: 64-bit values enforced in-circuit (bit decomposition)
+
+### Public Inputs
+
+1. `prev_state_root`
+2. `new_state_root`
+3. `nullifier_root`
+4. `tx_body_hash`
+5. `fee`
+
+---
+
+# **8. Proof-of-Work**
+
+## **8.1 Block Hash**
+
+```text
+H_BLOCK(
+  prev_block_hash,
+  state_root,
+  tx_root,
+  timestamp,
+  miner_address,
+  nonce,
+  proof_transcript_hash
+)
+```
+
+IV = `BLOCKHDR`.
+
+## **8.2 Mining Rules**
+
+* Proof MUST be deterministic from seed
+* Only entropy source: `nonce`
+* Allowed variation: transaction ordering, batch composition
+* Forbidden: re-randomizing the proof to re-roll the block hash
+
+## **8.3 Useful-Work Property**
+
+Every mining attempt produces a valid state-transition STARK; there is no wasted work.
+
+---
+
+# **9. FRI Parameters**
+
+* Rate: 4
+* Queries: 96
+* Soundness: ~192-bit conservative bound
+
+### Hash Tiering
+
+| Layer                              | Hash       |
+| ---------------------------------- | ---------- |
+| FRI Merkle (native verifier)       | Blake3     |
+| UTXO primitives / transcript       | Poseidon2b |
+
+---
+
+# **10. Recursion Readiness**
+
+* Deterministic verifier
+* Fixed public-input layout
+* No dependency on non-recursive assumptions
+* Future `cumulative_block_proof` is a STARK over "I know prev cumulative + block proof that verify"
+
+---
+
+# **11. Domain Tags**
+
+All tags are exactly 8 ASCII bytes.
+
+| Label      | Purpose                           |
+| ---------- | --------------------------------- |
+| `LEAF____` | leaf hashing                      |
+| `COMMIT__` | output / coin commitments         |
+| `NULLIFIE` | nullifiers                        |
+| `AUTHTAG_` | auth binding                      |
+| `ADDRESS_` | stealth address derivation        |
+| `ADDRSPND` | spend-secret derivation           |
+| `TXBODY__` | tx-body final wrap                |
+| `BLOCKHDR` | block header hash                 |
+| `FSCHALNG` | Fiat-Shamir channel               |
+| `COMPRESS` | Merkle inner compression          |
+| `VIEWKEY_` | wallet view-key derivation        |
+| `SCANTAG_` | per-output public scan tag        |
+
+---
+
+# **12. Non-Goals**
+
+* No signatures (ever)
+* No trusted setup
+* No pairing-based systems
+* No SHA-family for binding logic
+
+---
+
+# **13. Observability Scope (added)**
+
+The view-key / scan-tag pair lives in CRYPTO.md because it defines on-chain output shape. Other observability concerns — finality rule, reorg limit, RPC surface, DoS model — are **deliberately not pinned here**. They depend on empirical block-time data and adversarial benchmarks that don't yet exist, and premature numbers in the crypto spec would either be wrong or foreclose changes. Those specs track separately as `CONSENSUS.md` and `NETWORK.md` once testnet produces the data.
+
+What this spec guarantees for integrators:
+
+1. **Output format is forward-stable.** `(commitment, salt, scan_tag)` is what a block explorer or exchange parses today and the same tuple ships in every future minor version.
+2. **View-key scanning is universal.** No version negotiation needed — a view key issued on day 1 keeps working.
+3. **View-key holders can never spend.** `VIEWKEY_` and `ADDRSPND` are disjoint IVs over the sponge; there is no "upgrade path" from a view key to a spend key.
+
+---
+
+# **Final Decisions (locked)**
+
+| Topic                | Decision                                          |
+| -------------------- | ------------------------------------------------- |
+| `compress`           | Two-permutation sponge, IV = `COMPRESS`           |
+| `hash_nullifier`     | Version = `1` mandatory input                     |
+| `derive_address`     | Stealth-address: `(master_secret, salt)`, public salt |
+| `hash_tx_body`       | Merkle(compress) + final wrap permutation, IV = `TXBODY__` |
+| View key             | `H_VIEW(master_secret)`, IV = `VIEWKEY_`, non-spending |
+| Scan tag             | `H_TAG(view_key, salt)`, IV = `SCANTAG_`, on every output |
+| Output schema        | `(commitment, salt, scan_tag)` — locked            |
+| Digest encoding      | `bytes[0..16] → Block128[0]`, `bytes[16..32] → Block128[1]` |
+| `ZERO_DIGEST`        | `[0u8; 32]` everywhere                            |
+
+This spec is suitable as a **production cryptographic specification base** for the Paranoid blockchain.

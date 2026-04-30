@@ -663,8 +663,14 @@ mod tests {
         assert_eq!(p1.upper_partial_evals, p4.upper_partial_evals);
         assert_eq!(p1.upper_partial_evals, p8.upper_partial_evals);
         for i in 0..p1.sum_check_oracles.len() {
-            assert_eq!(p1.sum_check_oracles[i].coeffs, p4.sum_check_oracles[i].coeffs);
-            assert_eq!(p1.sum_check_oracles[i].coeffs, p8.sum_check_oracles[i].coeffs);
+            assert_eq!(
+                p1.sum_check_oracles[i].coeffs,
+                p4.sum_check_oracles[i].coeffs
+            );
+            assert_eq!(
+                p1.sum_check_oracles[i].coeffs,
+                p8.sum_check_oracles[i].coeffs
+            );
         }
         for i in 0..p1.fri_oracles.len() {
             assert_eq!(p1.fri_oracles[i].root, p4.fri_oracles[i].root);

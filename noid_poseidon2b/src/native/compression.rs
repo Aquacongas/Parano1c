@@ -5,6 +5,7 @@
 //!
 //! Sponge parameters: t=4, rate=2, cap=2.
 
+use super::domain::{capacity_iv, TAG_COMPRESS};
 use super::permutation::Poseidon2bPermutation;
 use noid_core::{Block128, CanonicalSerialize, TowerField};
 
@@ -140,13 +141,20 @@ impl Poseidon2bSponge {
     }
 }
 
-/// 2-to-1 fixed-width compression of two 32-byte digests via a single
-/// Poseidon2b permutation. See CRYPTO.md §4.1.
+/// 2-to-1 compression of two 32-byte digests. See CRYPTO.md §5.1.
 ///
-/// The input is fixed width (64 bytes). There is no padding and no IV:
-/// the permutation is applied to `[a0, a1, b0, b1]` directly, and the
-/// first two rate words of the output state are returned. Saves two
-/// permutations over sponge-mode `hash_concatenation`.
+/// Two-permutation sponge with capacity IV = `COMPRESS`:
+///
+/// ```text
+/// state = [a0, a1, COMPRESS_hi, COMPRESS_lo]
+/// permute
+/// state[0] ^= b0; state[1] ^= b1
+/// permute
+/// return state[0] || state[1]
+/// ```
+///
+/// Domain separation is carried in the capacity IV before any data is
+/// absorbed. Uniform with every other sponge-mode primitive in §5.
 #[inline]
 pub fn compress(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let a0 = Block128::from(u128::from_le_bytes(a[..16].try_into().unwrap()));
@@ -154,7 +162,11 @@ pub fn compress(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let b0 = Block128::from(u128::from_le_bytes(b[..16].try_into().unwrap()));
     let b1 = Block128::from(u128::from_le_bytes(b[16..].try_into().unwrap()));
 
-    let mut state = [a0, a1, b0, b1];
+    let [iv_hi, iv_lo] = capacity_iv(TAG_COMPRESS);
+    let mut state = [a0, a1, iv_hi, iv_lo];
+    Poseidon2bPermutation.permute_mut(&mut state);
+    state[0] += b0;
+    state[1] += b1;
     Poseidon2bPermutation.permute_mut(&mut state);
 
     let mut out = [0u8; 32];

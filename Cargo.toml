@@ -4,6 +4,8 @@ members = [
     "noid_core",
     "noid_fri",
     "noid_poseidon2b",
+    "noid_tx",
+    "noid_chain",
 ]
 resolver = "2"
 

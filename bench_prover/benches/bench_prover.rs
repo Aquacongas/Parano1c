@@ -209,8 +209,9 @@ fn bench_utxo_primitives(c: &mut Criterion) {
 
     let mut rng = StdRng::seed_from_u64(0x0000_7E57_AB1E_7E57);
     let ms = MasterSecret(rng.gen());
-    let addr = derive_address(&ms, 0);
-    let spend = derive_spend_secret(&ms, 0);
+    let salt = Block128::from(rng.gen::<u128>());
+    let addr = derive_address(&ms, salt);
+    let spend = derive_spend_secret(&ms, salt);
     let commitment = hash_commitment(
         1_000,
         &addr,
@@ -219,10 +220,10 @@ fn bench_utxo_primitives(c: &mut Criterion) {
     );
 
     group.bench_function("derive_address", |b| {
-        b.iter(|| derive_address(black_box(&ms), black_box(0)))
+        b.iter(|| derive_address(black_box(&ms), black_box(salt)))
     });
     group.bench_function("derive_spend_secret", |b| {
-        b.iter(|| derive_spend_secret(black_box(&ms), black_box(0)))
+        b.iter(|| derive_spend_secret(black_box(&ms), black_box(salt)))
     });
     group.bench_function("hash_commitment", |b| {
         b.iter(|| {
