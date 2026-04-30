@@ -250,15 +250,16 @@ fn bench_utxo_primitives(c: &mut Criterion) {
     for &n_io in &[2usize, 8, 32, 128, 512] {
         let ins: Vec<Commitment> = (0..n_io).map(|_| commitment).collect();
         let outs: Vec<Commitment> = (0..n_io).map(|_| commitment).collect();
-        group.bench_with_input(
-            BenchmarkId::new("hash_tx_body", n_io),
-            &n_io,
-            |b, _| {
-                b.iter(|| {
-                    hash_tx_body(black_box(&prev), black_box(5), black_box(&ins), black_box(&outs))
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hash_tx_body", n_io), &n_io, |b, _| {
+            b.iter(|| {
+                hash_tx_body(
+                    black_box(&prev),
+                    black_box(5),
+                    black_box(&ins),
+                    black_box(&outs),
+                )
+            })
+        });
     }
 
     group.finish();

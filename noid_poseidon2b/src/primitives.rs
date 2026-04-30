@@ -259,10 +259,20 @@ mod tests {
         let spend = derive_spend_secret(&MS, 0);
         assert_eq!(spend, derive_spend_secret(&MS, 0));
 
-        let c = hash_commitment(100, addr.as_fields()[0], Block128::from(9u8), Block128::ZERO);
+        let c = hash_commitment(
+            100,
+            addr.as_fields()[0],
+            Block128::from(9u8),
+            Block128::ZERO,
+        );
         assert_eq!(
             c,
-            hash_commitment(100, addr.as_fields()[0], Block128::from(9u8), Block128::ZERO)
+            hash_commitment(
+                100,
+                addr.as_fields()[0],
+                Block128::from(9u8),
+                Block128::ZERO
+            )
         );
 
         let n = hash_nullifier(&spend, &c);
