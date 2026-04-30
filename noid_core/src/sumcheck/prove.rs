@@ -124,6 +124,9 @@ pub fn prove_single_packed(
     let _claim = claimed_sum;
 
     use crate::hardware::{clmul_gcm, flat_to_tower_u128};
+    // Minimum `half` to justify rayon parallelism on the round-poly
+    // accumulator. Below this the fold/reduce overhead dominates.
+    const SUMCHECK_PAR_THRESHOLD: usize = 1 << 12;
     for _round in 0..n {
         let half = current_evals.len() / 2;
         let f2 = Block128::from(2u8);
@@ -135,16 +138,42 @@ pub fn prove_single_packed(
         // convert each element to flat once and accumulate both sums (u0,
         // u1) and u2 (via CLMUL) in flat. Convert u0, u1, u2 back at the
         // end — three matrix applies per round instead of `half` tower muls.
-        let mut u0_flat: u128 = 0;
-        let mut u1_flat: u128 = 0;
-        let mut u2_flat: u128 = 0;
-        for j in 0..half {
-            let v_lo_flat = tower_to_flat_u128(current_evals[j].0);
-            let v_hi_flat = tower_to_flat_u128(current_evals[j + half].0);
-            u0_flat ^= v_lo_flat;
-            u1_flat ^= v_hi_flat;
-            u2_flat ^= clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat);
-        }
+        let (lo_half, hi_half) = current_evals.split_at(half);
+        let (u0_flat, u1_flat, u2_flat) = if half >= SUMCHECK_PAR_THRESHOLD {
+            lo_half
+                .par_iter()
+                .zip(hi_half.par_iter())
+                .fold(
+                    || (0u128, 0u128, 0u128),
+                    |(a0, a1, a2), (v_lo, v_hi)| {
+                        let v_lo_flat = tower_to_flat_u128(v_lo.0);
+                        let v_hi_flat = tower_to_flat_u128(v_hi.0);
+                        (
+                            a0 ^ v_lo_flat,
+                            a1 ^ v_hi_flat,
+                            a2 ^ clmul_gcm(v_lo_flat, c_lo_flat)
+                                ^ clmul_gcm(v_hi_flat, c_hi_flat),
+                        )
+                    },
+                )
+                .reduce(
+                    || (0u128, 0u128, 0u128),
+                    |(a0, a1, a2), (b0, b1, b2)| (a0 ^ b0, a1 ^ b1, a2 ^ b2),
+                )
+        } else {
+            let mut u0_flat: u128 = 0;
+            let mut u1_flat: u128 = 0;
+            let mut u2_flat: u128 = 0;
+            for j in 0..half {
+                let v_lo_flat = tower_to_flat_u128(lo_half[j].0);
+                let v_hi_flat = tower_to_flat_u128(hi_half[j].0);
+                u0_flat ^= v_lo_flat;
+                u1_flat ^= v_hi_flat;
+                u2_flat ^=
+                    clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat);
+            }
+            (u0_flat, u1_flat, u2_flat)
+        };
         let u0 = Block128(flat_to_tower_u128(u0_flat));
         let u1 = Block128(flat_to_tower_u128(u1_flat));
         let u2 = Block128(flat_to_tower_u128(u2_flat));

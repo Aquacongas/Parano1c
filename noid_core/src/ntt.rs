@@ -96,12 +96,23 @@ const NTT_PARALLEL_THRESHOLD: usize = 512;
 /// tower-basis multiplication per butterfly (~95 ns) with a single CLMUL
 /// (~5 ns) and amortises basis conversion over the whole transform.
 pub fn forward_ntt_parallel(coeffs: &[Block128], basis: &[Block128]) -> Vec<Block128> {
-    let n = coeffs.len();
+    let mut out = coeffs.to_vec();
+    forward_ntt_parallel_inplace(&mut out, basis);
+    out
+}
+
+/// In-place variant of [`forward_ntt_parallel`]. Avoids the output `Vec`
+/// allocation + copy so callers with a pre-sized destination buffer (e.g.
+/// `Code::new_parallel`) can transform directly into it.
+pub fn forward_ntt_parallel_inplace(data: &mut [Block128], basis: &[Block128]) {
+    let n = data.len();
     assert!(n.is_power_of_two(), "length must be power of two");
     assert_eq!(basis.len(), n.trailing_zeros() as usize);
 
-    // Work buffer in flat-basis u128.
-    let mut evals_flat: Vec<u128> = coeffs.iter().map(|c| tower_to_flat_u128(c.0)).collect();
+    // Work buffer in flat-basis u128. Butterflies run on this representation
+    // because `clmul_gcm` / `flat_scalar_mul` need the flat basis; we convert
+    // once on the way in and once on the way out.
+    let mut evals_flat: Vec<u128> = data.iter().map(|c| tower_to_flat_u128(c.0)).collect();
 
     let mut len = 1usize;
     for &b in basis.iter() {
@@ -132,10 +143,9 @@ pub fn forward_ntt_parallel(coeffs: &[Block128], basis: &[Block128]) -> Vec<Bloc
         len *= 2;
     }
 
-    evals_flat
-        .into_iter()
-        .map(|v| Block128(flat_to_tower_u128(v)))
-        .collect()
+    for (slot, v) in data.iter_mut().zip(evals_flat.into_iter()) {
+        *slot = Block128(flat_to_tower_u128(v));
+    }
 }
 
 #[inline(always)]
@@ -338,8 +348,7 @@ impl AdditiveNTT<Block128> {
             return;
         }
         let sub_basis = &self.basis[start..end];
-        let transformed = forward_ntt_parallel(data, sub_basis);
-        data.copy_from_slice(&transformed);
+        forward_ntt_parallel_inplace(data, sub_basis);
     }
 }
 

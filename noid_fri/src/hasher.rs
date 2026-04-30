@@ -22,12 +22,6 @@
 pub use noid_poseidon2b::hasher::{CryptographicHasher, HashOutput};
 
 use noid_core::{Block128, CanonicalSerialize};
-use rayon::prelude::*;
-
-/// Minimum batch size above which we parallelise over rayon. Blake3 is
-/// already extremely fast per call, so the cutoff is higher than it would
-/// be for an algebraic hash.
-const BLAKE3_PAR_THRESHOLD: usize = 1024;
 
 /// Blake3-backed hasher. Zero-state (the Blake3 function is keyless; domain
 /// separation for the Merkle leaf/compress layer comes from the fixed input
@@ -75,33 +69,25 @@ impl CryptographicHasher for Blake3Hasher {
 
     fn batch_hash_pair(&self, pairs: &[Block128], out: &mut [HashOutput]) {
         assert_eq!(pairs.len(), 2 * out.len());
-        if out.len() >= BLAKE3_PAR_THRESHOLD {
-            pairs
-                .par_chunks(2)
-                .zip(out.par_iter_mut())
-                .for_each(|(pair, slot)| {
-                    *slot = self.hash_pair(&pair[0], &pair[1]);
-                });
-        } else {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = self.hash_pair(&pairs[2 * i], &pairs[2 * i + 1]);
-            }
+        // Tight serial loop: the caller (`compute_leaf_hashes`) already
+        // distributes chunks across the rayon pool; nesting another par_iter
+        // here only adds task-graph overhead.
+        let mut buf = [0u8; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            buf[..16].copy_from_slice(&block128_to_bytes(&pairs[2 * i]));
+            buf[16..].copy_from_slice(&block128_to_bytes(&pairs[2 * i + 1]));
+            *slot = *blake3::hash(&buf).as_bytes();
         }
     }
 
     fn batch_compress(&self, pairs: &[HashOutput], out: &mut [HashOutput]) {
         assert_eq!(pairs.len(), 2 * out.len());
-        if out.len() >= BLAKE3_PAR_THRESHOLD {
-            pairs
-                .par_chunks(2)
-                .zip(out.par_iter_mut())
-                .for_each(|(pair, slot)| {
-                    *slot = self.compress(&pair[0], &pair[1]);
-                });
-        } else {
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = self.compress(&pairs[2 * i], &pairs[2 * i + 1]);
-            }
+        // Serial loop for the same reason as `batch_hash_pair`.
+        let mut buf = [0u8; 64];
+        for (i, slot) in out.iter_mut().enumerate() {
+            buf[..32].copy_from_slice(&pairs[2 * i]);
+            buf[32..].copy_from_slice(&pairs[2 * i + 1]);
+            *slot = *blake3::hash(&buf).as_bytes();
         }
     }
 }
