@@ -69,14 +69,29 @@ impl CryptographicHasher for Blake3Hasher {
 
     fn batch_hash_pair(&self, pairs: &[Block128], out: &mut [HashOutput]) {
         assert_eq!(pairs.len(), 2 * out.len());
-        // Tight serial loop: the caller (`compute_leaf_hashes`) already
-        // distributes chunks across the rayon pool; nesting another par_iter
-        // here only adds task-graph overhead.
-        let mut buf = [0u8; 32];
-        for (i, slot) in out.iter_mut().enumerate() {
-            buf[..16].copy_from_slice(&block128_to_bytes(&pairs[2 * i]));
-            buf[16..].copy_from_slice(&block128_to_bytes(&pairs[2 * i + 1]));
-            *slot = *blake3::hash(&buf).as_bytes();
+        // Block128 is `#[repr(transparent)]` over `u128`, and `u128` has a
+        // defined little-endian memory layout on all supported targets (LE
+        // x86_64 / aarch64). On these targets the in-memory bytes of
+        // `&[Block128]` are exactly what `CanonicalSerialize::serialize`
+        // would write, so we reinterpret the slice as bytes with zero copies
+        // and feed 32-byte windows straight to blake3.
+        #[cfg(target_endian = "little")]
+        {
+            let ptr = pairs.as_ptr() as *const u8;
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, pairs.len() * 16) };
+            for (i, slot) in out.iter_mut().enumerate() {
+                let w = &bytes[32 * i..32 * i + 32];
+                *slot = *blake3::hash(w).as_bytes();
+            }
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = [0u8; 32];
+            for (i, slot) in out.iter_mut().enumerate() {
+                buf[..16].copy_from_slice(&pairs[2 * i].0.to_le_bytes());
+                buf[16..].copy_from_slice(&pairs[2 * i + 1].0.to_le_bytes());
+                *slot = *blake3::hash(&buf).as_bytes();
+            }
         }
     }
 

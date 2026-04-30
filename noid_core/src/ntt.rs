@@ -112,7 +112,11 @@ pub fn forward_ntt_parallel_inplace(data: &mut [Block128], basis: &[Block128]) {
     // Work buffer in flat-basis u128. Butterflies run on this representation
     // because `clmul_gcm` / `flat_scalar_mul` need the flat basis; we convert
     // once on the way in and once on the way out.
-    let mut evals_flat: Vec<u128> = data.iter().map(|c| tower_to_flat_u128(c.0)).collect();
+    let mut evals_flat: Vec<u128> = if n >= NTT_PARALLEL_THRESHOLD {
+        data.par_iter().map(|c| tower_to_flat_u128(c.0)).collect()
+    } else {
+        data.iter().map(|c| tower_to_flat_u128(c.0)).collect()
+    };
 
     let mut len = 1usize;
     for &b in basis.iter() {
@@ -143,8 +147,16 @@ pub fn forward_ntt_parallel_inplace(data: &mut [Block128], basis: &[Block128]) {
         len *= 2;
     }
 
-    for (slot, v) in data.iter_mut().zip(evals_flat.into_iter()) {
-        *slot = Block128(flat_to_tower_u128(v));
+    if n >= NTT_PARALLEL_THRESHOLD {
+        data.par_iter_mut()
+            .zip(evals_flat.par_iter())
+            .for_each(|(slot, &v)| {
+                *slot = Block128(flat_to_tower_u128(v));
+            });
+    } else {
+        for (slot, v) in data.iter_mut().zip(evals_flat.into_iter()) {
+            *slot = Block128(flat_to_tower_u128(v));
+        }
     }
 }
 
