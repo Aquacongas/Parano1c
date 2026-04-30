@@ -6,6 +6,9 @@ members = [
     "noid_poseidon2b",
     "noid_tx",
     "noid_chain",
+    "noid_air",
+    "noid_stark",
+    "noid_ivc",
 ]
 resolver = "2"
 

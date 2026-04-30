@@ -16,8 +16,15 @@
 //!   native-side shadow of the state-transition relation that the STARK
 //!   enforces in-circuit.
 
+pub mod block;
 pub mod block_header;
 pub mod state;
+pub mod wire;
 
+pub use block::{
+    apply_block, compute_tx_root, proof_transcript_hash, Block, BlockApplyError, BLOCK_MAX_TXS,
+    BLOCK_VERSION,
+};
 pub use block_header::{hash_block_header, BlockHeader};
-pub use state::{apply_tx, ChainState, StateTransition};
+pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
+pub use wire::BLOCK_HEADER_WIRE_SIZE;

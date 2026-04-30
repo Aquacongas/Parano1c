@@ -11,6 +11,10 @@ rand = "0.8"
 noid_core = { path = "../noid_core" }
 noid_fri = { path = "../noid_fri" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_air = { path = "../noid_air" }
+noid_stark = { path = "../noid_stark" }
+noid_ivc = { path = "../noid_ivc" }
+noid_tx = { path = "../noid_tx" }
 
 [[bench]]
 name = "bench_prover"
@@ -18,4 +22,8 @@ harness = false
 
 [[bench]]
 name = "release_report"
+harness = false
+
+[[bench]]
+name = "air_bench"
 harness = false

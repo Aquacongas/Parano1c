@@ -57,7 +57,7 @@ impl TxOutput {
 
 /// Canonical transaction body. Fields are exactly those covered by the
 /// body hash plus the state-root triple exposed as public inputs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxBody {
     pub prev_state_root: Digest,
     pub new_state_root: Digest,
@@ -69,7 +69,7 @@ pub struct TxBody {
 
 /// A full transaction: body plus per-input auth tags binding each spend
 /// secret to `tx_body_hash`. CRYPTO.md §5.5.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub body: TxBody,
     pub tx_body_hash: TxBodyHash,

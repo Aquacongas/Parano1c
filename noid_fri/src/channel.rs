@@ -16,22 +16,19 @@ use crate::merkle::VectorCommitment;
 use crate::prover::FriCommitment;
 
 /// Number of FRI queries. With code rate R = 4 each query contributes
-/// `log2(R) = 2` bits of proven soundness (JACM FRI bound) and `log2(R)`
-/// bits under the conjectured bound. We target **128-bit proven soundness
-/// with a safety margin**, which requires `ceil(128 / 2) = 64` queries;
-/// we pick 96 to keep ~192 bits of headroom for list-decoding slack
-/// (`> 1/2 * log_2(|F|)` rounds of folding stay well inside the unique
-/// decoding radius).
+/// `log2(R) = 2` bits of proven soundness (JACM FRI bound). We target
+/// **128-bit proven soundness**, which requires `ceil(128 / 2) = 64`
+/// queries.
 ///
-/// The previous value of 144 was sized for 288-bit conjectured soundness
-/// — comfortably over-provisioned for any realistic threat model and
-/// costing ~50% unnecessary prover/verifier work. See CRYPTO.md §8.
+/// Previous values (96, 144) were sized for 192/288-bit conjectured
+/// soundness — over-provisioned for any realistic threat model and
+/// costing unnecessary prover/verifier work. See CRYPTO.md §8.
 ///
 /// In test/debug builds we use a much smaller count so the test suite
 /// runs in seconds rather than minutes — the protocol is still exercised
 /// fully end-to-end.
 #[cfg(not(any(test, debug_assertions)))]
-pub const NUM_QUERIES: usize = 96;
+pub const NUM_QUERIES: usize = 64;
 #[cfg(any(test, debug_assertions))]
 pub const NUM_QUERIES: usize = 10;
 
