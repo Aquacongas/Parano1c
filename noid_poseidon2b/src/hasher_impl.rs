@@ -38,6 +38,14 @@ impl CryptographicHasher for Poseidon2bSponge {
     fn compress(&self, a: &HashOutput, b: &HashOutput) -> HashOutput {
         crate::native::compress(a, b)
     }
+
+    fn batch_hash_pair(&self, pairs: &[Block128], out: &mut [HashOutput]) {
+        crate::batch::hash_pair_batch_interleaved_into(pairs, out);
+    }
+
+    fn batch_compress(&self, pairs: &[HashOutput], out: &mut [HashOutput]) {
+        crate::batch::compress_batch_interleaved_into(pairs, out);
+    }
 }
 
 #[cfg(test)]

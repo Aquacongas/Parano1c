@@ -19,12 +19,11 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 
 use noid_fri::channel::Channel;
 use noid_fri::code::{LOG_RATE, RATE};
+use noid_fri::hasher::Blake3Hasher;
 use noid_fri::merkle::{compute_leaf_hashes, MerkleTree};
 use noid_fri::prover::{commit, prove};
 use noid_fri::verifier::verify;
 use noid_fri::{NUM_QUERIES, TAU};
-
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -184,7 +183,7 @@ struct Row {
     throughput_cells_per_s: f64,
 }
 
-fn bench_row(log_len: usize, hasher: &Poseidon2bSponge) -> Row {
+fn bench_row(log_len: usize, hasher: &Blake3Hasher) -> Row {
     let n = 1usize << log_len;
     let mut rng = StdRng::seed_from_u64(0xBEAD_C0DE_DEAD_BEEF ^ log_len as u64);
 
@@ -286,7 +285,7 @@ const BANNER: &str = r#"
   |  __/ ___ \|  _ <  / ___ \| |\  | |_| | || |_| |
   |_| /_/   \_\_| \_\/_/   \_\_| \_|\___/___|____/
 
-  PARANOID  --  FRI + Poseidon2b  --  Release Report
+  PARANOID  --  FRI + Blake3 (merkle) + Poseidon2b (transcript)
 "#;
 
 fn print_banner() {
@@ -315,7 +314,8 @@ fn print_environment() {
 fn print_params() {
     println!("  +------------------------- PARAMETERS --------------------------+");
     println!("  | {:<28} {:<32} |", "field:", "GF(2^128) binary tower");
-    println!("  | {:<28} {:<32} |", "commitment hash:", "Poseidon2b (t=4, 128-bit state)");
+    println!("  | {:<28} {:<32} |", "merkle hash:", "Blake3 (fast tier)");
+    println!("  | {:<28} {:<32} |", "transcript hash:", "Poseidon2b (t=4, recursion tier)");
     println!("  | {:<28} {:<32} |", "PCS:", "FRI (DEEP-FRI style)");
     println!("  | {:<28} {:<32} |", "code rate (RATE):", format!("{} (log2 = {})", RATE, LOG_RATE));
     println!("  | {:<28} {:<32} |", "num FRI queries:", NUM_QUERIES.to_string());
@@ -373,7 +373,7 @@ fn print_footer() {
     println!("  columns:");
     println!("    trace   = 2^log_n multilinear evaluations committed (KiB/MiB, binary)");
     println!("    ntt     = parallel additive NTT over the rate-expanded domain (size n*RATE)");
-    println!("    merkle  = leaf hashing + Poseidon2b Merkle tree build over RS-encoded leaves");
+    println!("    merkle  = leaf hashing + Blake3 Merkle tree build over RS-encoded leaves");
     println!("    commit  = full commit() = NTT + leaf hash + Merkle tree (end-to-end)");
     println!("    prove   = end-to-end evaluation proof (commit excluded)");
     println!("    verify  = end-to-end verification on the prover's proof");
@@ -399,7 +399,7 @@ fn main() {
     print_environment();
     print_params();
 
-    let hasher = Poseidon2bSponge::new();
+    let hasher = Blake3Hasher::new();
 
     let mut rows = Vec::with_capacity(LOG_TRACES.len());
     for &log_len in LOG_TRACES {

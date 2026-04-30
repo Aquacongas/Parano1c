@@ -20,7 +20,7 @@ pub fn verify(
     eval_proof: EvalProof,
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
-    _hasher: &dyn CryptographicHasher,
+    hasher: &dyn CryptographicHasher,
 ) -> Result<(), String> {
     // Replay the statement.
     channel.observe_fri_commitment(commitment);
@@ -122,7 +122,7 @@ pub fn verify(
         }
 
         // Batch-hash all (s0, s1) leaves in one SIMD-packed pass.
-        noid_poseidon2b::batch::hash_pair_batch_interleaved_into(&leaf_pairs, &mut leaf_hashes[..n_queries]);
+        hasher.batch_hash_pair(&leaf_pairs, &mut leaf_hashes[..n_queries]);
 
         // Validate Merkle path lengths up-front.
         for i in 0..n_queries {
@@ -151,10 +151,7 @@ pub fn verify(
                     merkle_pairs.push(running[i]);
                 }
             }
-            noid_poseidon2b::batch::compress_batch_interleaved_into(
-                &merkle_pairs,
-                &mut merkle_next[..n_queries],
-            );
+            hasher.batch_compress(&merkle_pairs, &mut merkle_next[..n_queries]);
             running.copy_from_slice(&merkle_next[..n_queries]);
         }
 

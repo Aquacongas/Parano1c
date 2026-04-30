@@ -82,9 +82,9 @@ impl MerkleTree {
             let dst = &mut dst_part[..next_len];
 
             if parallel && next_len >= MERKLE_PARALLEL_THRESHOLD / 2 {
-                hash_layer_par_into(src, dst);
+                hash_layer_par_into(src, dst, hasher);
             } else if next_len >= BATCH_HASH_THRESHOLD {
-                noid_poseidon2b::batch::compress_batch_interleaved_into(src, dst);
+                hasher.batch_compress(src, dst);
             } else {
                 for (pair, out) in src.chunks_exact(2).zip(dst.iter_mut()) {
                     *out = hasher.compress(&pair[0], &pair[1]);
@@ -190,7 +190,13 @@ pub fn verify_merkle_path(
 /// Parallel batched layer hashing writing directly into `dst`.
 ///
 /// `src` is a slice of 2N children; `dst` is the N-entry parent layer.
-fn hash_layer_par_into(src: &[HashOutput], dst: &mut [HashOutput]) {
+/// Dispatches per-chunk through `hasher.batch_compress` so each backend
+/// can use its own SIMD / multi-lane kernel.
+fn hash_layer_par_into(
+    src: &[HashOutput],
+    dst: &mut [HashOutput],
+    hasher: &dyn CryptographicHasher,
+) {
     assert_eq!(src.len(), dst.len() * 2);
     let threads = rayon::current_num_threads().max(1);
     let mut chunk_pairs = ((src.len() / threads).max(BATCH_HASH_THRESHOLD * 2)) & !1;
@@ -202,7 +208,7 @@ fn hash_layer_par_into(src: &[HashOutput], dst: &mut [HashOutput]) {
     src.par_chunks(chunk_pairs)
         .zip(dst.par_chunks_mut(chunk_dst))
         .for_each(|(src_chunk, dst_chunk)| {
-            noid_poseidon2b::batch::compress_batch_interleaved_into(src_chunk, dst_chunk);
+            hasher.batch_compress(src_chunk, dst_chunk);
         });
 }
 
@@ -237,10 +243,10 @@ pub fn compute_leaf_hashes(
         vals.par_chunks(chunk_vals)
             .zip(out.par_chunks_mut(chunk_pairs))
             .for_each(|(vals_chunk, out_chunk)| {
-                noid_poseidon2b::batch::hash_pair_batch_interleaved_into(vals_chunk, out_chunk);
+                hasher.batch_hash_pair(vals_chunk, out_chunk);
             });
     } else if n >= BATCH_HASH_THRESHOLD {
-        noid_poseidon2b::batch::hash_pair_batch_interleaved_into(vals, &mut out);
+        hasher.batch_hash_pair(vals, &mut out);
     } else {
         for (pair, slot) in vals.chunks_exact(2).zip(out.iter_mut()) {
             *slot = hasher.hash_pair(&pair[0], &pair[1]);

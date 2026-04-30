@@ -152,6 +152,28 @@ where `proof_transcript_hash` is the Fiat-Shamir seed of the aggregated block pr
 
 Every mining attempt produces a verifiable STARK of a valid state transition. There is no wasted SHA grinding; the work done is exactly the work required to validate the block.
 
+## 7a. FRI parameters
+
+### 7a.1 Code rate
+
+- **Rate** R = 4 (log2 R = 2). Each query opens one leaf and contributes `log2(R) = 2` bits of proven soundness under the JACM FRI bound (`queries · log2(R)`), `log2(R)` bits under the conjectured bound.
+
+### 7a.2 Query count
+
+- **Target**: 128-bit proven soundness with comfortable slack.
+- **Minimum**: `ceil(128 / log2(R)) = 64` queries.
+- **Chosen**: **96 queries** — gives ~192 bits of proven soundness, ~50% cheaper than the previous 144-query setting, still well above any realistic grinding budget. Raise back to ~128 if we ever need proven 256-bit soundness.
+- A larger query count does not tighten the FRI proximity argument once the list-decoding bound saturates; beyond ~128 queries the extra cost is pure margin.
+
+### 7a.3 Hash tiering
+
+Two hashers with different roles:
+
+- **Merkle-layer hash (fast tier)**: Blake3. Used for FRI leaves and inner nodes. Byte-native, ~5–10 GB/s on commodity x86_64 — matches the expected prover wall-clock profile where commitment-hashing dominates (~90% of `commit()` at log_n = 20). Not arithmetization-friendly, but acceptable because the block-level verifier runs natively, not in-circuit.
+- **Transcript-layer hash (recursion tier)**: Poseidon2b. Used for the Fiat-Shamir channel (§4.8) and every UTXO primitive in §4 (commitments, nullifiers, addresses, tx body). These are the digests that a future recursion layer would need to re-hash in-circuit; keeping them algebraic preserves recursion-readiness.
+
+**Recursion boundary contract**: if/when we add recursion, the recursion verifier ingests the Poseidon2b transcript state and the block's public inputs, *not* the Blake3 Merkle proofs. Block proofs at rest always pin the full Blake3 Merkle paths; recursion never re-verifies them in-circuit.
+
 ## 8. Recursion-readiness (not yet shipped)
 
 - Public-input layout of the block proof is fixed and self-describing.
