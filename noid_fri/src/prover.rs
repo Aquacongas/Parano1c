@@ -199,12 +199,16 @@ pub fn prove(
     // -----------------------------------------------------------------------
     let n_rows = 1 << tau;
     let row_len = evals.len() / n_rows;
-    let upper_partial_evals: Vec<Block128> = (0..n_rows)
-        .map(|row| {
-            let row_evals = &evals[row * row_len..(row + 1) * row_len];
-            mle_evaluate(row_evals, right)
-        })
-        .collect();
+    let upper_partial_evals: Vec<Block128> = {
+        use rayon::prelude::*;
+        (0..n_rows)
+            .into_par_iter()
+            .map(|row| {
+                let row_evals = &evals[row * row_len..(row + 1) * row_len];
+                mle_evaluate(row_evals, right)
+            })
+            .collect()
+    };
 
     // Compute the claimed evaluation = inner product of upper_partial_evals
     // and the eq indicator over the left (high) variables.
@@ -223,15 +227,34 @@ pub fn prove(
     let batching_eq = noid_core::mle::eq::eq_ind_partial_eval(&tensor_batching_point);
 
     // Batched eval vector: batched[j] = Σ_i batching_eq[i] * row[i][j]
-    let mut batched_evals = vec![Block128::ZERO; row_len];
-    for (row_idx, &coeff) in batching_eq.iter().enumerate() {
-        for (j, val) in evals[row_idx * row_len..(row_idx + 1) * row_len]
-            .iter()
-            .enumerate()
-        {
-            batched_evals[j] += coeff * *val;
+    // Parallelize over output columns; each column reads one value per row
+    // independently. Deterministic: reduction order is fixed per column.
+    let batched_evals: Vec<Block128> = {
+        use rayon::prelude::*;
+        if row_len >= 1024 {
+            (0..row_len)
+                .into_par_iter()
+                .map(|j| {
+                    let mut acc = Block128::ZERO;
+                    for (row_idx, &coeff) in batching_eq.iter().enumerate() {
+                        acc += coeff * evals[row_idx * row_len + j];
+                    }
+                    acc
+                })
+                .collect()
+        } else {
+            let mut out = vec![Block128::ZERO; row_len];
+            for (row_idx, &coeff) in batching_eq.iter().enumerate() {
+                for (j, val) in evals[row_idx * row_len..(row_idx + 1) * row_len]
+                    .iter()
+                    .enumerate()
+                {
+                    out[j] += coeff * *val;
+                }
+            }
+            out
         }
-    }
+    };
 
     // -----------------------------------------------------------------------
     // Step 3: FRI commit phase — iteratively fold.
@@ -250,11 +273,22 @@ pub fn prove(
 
     // Pointwise multiply: h[j] = batched[j] * eq_right[j].
     // Σ_j h[j] = <batching_eq, upper_partial_evals> (the sumcheck claim).
-    let sumcheck_evals: Vec<Block128> = batched_evals
-        .iter()
-        .zip(eq_right.iter())
-        .map(|(&g, &e)| g * e)
-        .collect();
+    let sumcheck_evals: Vec<Block128> = {
+        use rayon::prelude::*;
+        if batched_evals.len() >= 1024 {
+            batched_evals
+                .par_iter()
+                .zip(eq_right.par_iter())
+                .map(|(&g, &e)| g * e)
+                .collect()
+        } else {
+            batched_evals
+                .iter()
+                .zip(eq_right.iter())
+                .map(|(&g, &e)| g * e)
+                .collect()
+        }
+    };
 
     // Initial sumcheck claim = Σ_j h[j] = <batching_eq, upper_partial_evals>.
     // This is what the verifier independently computes from upper_partial_evals.
@@ -273,7 +307,7 @@ pub fn prove(
 
     // Encode the sumcheck polynomial h = g * eq(·, right) into an RS codeword.
     // The code and evals must stay in sync throughout folding.
-    let mut current_code = Code::new(&current_evals, ntt);
+    let mut current_code = Code::new_parallel(&current_evals, ntt);
 
     // `claim` tracks the running sumcheck claim across rounds.
     // Round 0 starts with the batched-polynomial sum over the hypercube.
@@ -584,6 +618,60 @@ mod tests {
             log_len - TAU,
             result
         );
+    }
+
+    /// Determinism: the same seed must produce byte-identical proofs
+    /// across different rayon thread-pool sizes. This guards PoW (CRYPTO.md §7.2)
+    /// — the Fiat-Shamir transcript must be deterministic given the seed, so
+    /// the final proof-transcript hash is a valid grinding target.
+    #[test]
+    fn test_prove_determinism_across_thread_counts() {
+        use crate::channel::TAU;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let log_len = TAU + 3;
+        let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
+        let hasher = Poseidon2bSponge::new();
+
+        let mut rng = StdRng::seed_from_u64(0xDEAD_C0DE_D00D_F00D);
+        let evals: Vec<Block128> = (0..1 << log_len)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
+        let eval_point: Vec<Block128> = (0..log_len)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
+
+        let run = |threads: usize| -> EvalProof {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (commitment, _t, _c) = commit(&evals, &ntt, &hasher);
+                let mut ch = Channel::new();
+                prove(&commitment, &evals, &eval_point, &ntt, &mut ch, &hasher)
+            })
+        };
+
+        let p1 = run(1);
+        let p4 = run(4);
+        let p8 = run(8);
+
+        // Compare on the transcript-visible fields; byte-identical means the
+        // Fiat-Shamir transcript evolved identically across thread counts.
+        assert_eq!(p1.upper_partial_evals, p4.upper_partial_evals);
+        assert_eq!(p1.upper_partial_evals, p8.upper_partial_evals);
+        for i in 0..p1.sum_check_oracles.len() {
+            assert_eq!(p1.sum_check_oracles[i].coeffs, p4.sum_check_oracles[i].coeffs);
+            assert_eq!(p1.sum_check_oracles[i].coeffs, p8.sum_check_oracles[i].coeffs);
+        }
+        for i in 0..p1.fri_oracles.len() {
+            assert_eq!(p1.fri_oracles[i].root, p4.fri_oracles[i].root);
+            assert_eq!(p1.fri_oracles[i].root, p8.fri_oracles[i].root);
+        }
+        assert_eq!(p1.final_codeword, p4.final_codeword);
+        assert_eq!(p1.final_codeword, p8.final_codeword);
     }
 
     /// Minimal 1-fold debug test: TAU+1 rounds, seeded RNG.

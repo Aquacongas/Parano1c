@@ -34,12 +34,21 @@ impl Code {
     /// Fold the code by pairing adjacent symbols and applying the FRI fold
     /// operator with challenge `r`.
     pub fn fold_code(&self, r: Block128, round: usize, ntt: &AdditiveNTT<Block128>) -> Self {
-        let encoding: Vec<Block128> = self
-            .encoding
-            .chunks_exact(2)
-            .enumerate()
-            .map(|(i, pair)| fold(r, round, i, pair[0], pair[1], ntt))
-            .collect();
+        use rayon::prelude::*;
+        let pairs = self.encoding.len() / 2;
+        let encoding: Vec<Block128> = if pairs >= 1024 {
+            self.encoding
+                .par_chunks_exact(2)
+                .enumerate()
+                .map(|(i, pair)| fold(r, round, i, pair[0], pair[1], ntt))
+                .collect()
+        } else {
+            self.encoding
+                .chunks_exact(2)
+                .enumerate()
+                .map(|(i, pair)| fold(r, round, i, pair[0], pair[1], ntt))
+                .collect()
+        };
 
         Code { encoding }
     }
