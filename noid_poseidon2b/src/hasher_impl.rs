@@ -5,13 +5,21 @@
 
 use crate::compression::Poseidon2bSponge;
 use crate::hasher::{CryptographicHasher, HashOutput};
-use noid_core::Block128;
+use crate::native::permutation::Poseidon2bPermutation;
+use noid_core::{Block128, CanonicalSerialize, TowerField};
 
 impl CryptographicHasher for Poseidon2bSponge {
+    // Fixed-width 2-field-element → 32-byte digest via a single Poseidon2b
+    // permutation on `[a, b, 0, 0]`. One permutation instead of two (absorb
+    // + finalize in sponge mode). Safe because the input is fixed width —
+    // length-extension does not apply.
     fn hash_pair(&self, a: &Block128, b: &Block128) -> HashOutput {
-        let mut sponge = Poseidon2bSponge::new();
-        sponge.absorb_pair(*a, *b);
-        sponge.finalize()
+        let mut state = [*a, *b, Block128::ZERO, Block128::ZERO];
+        Poseidon2bPermutation.permute_mut(&mut state);
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&state[0].to_bytes());
+        out[16..].copy_from_slice(&state[1].to_bytes());
+        out
     }
 
     fn hash_field(&self, _elem: &Block128) -> HashOutput {

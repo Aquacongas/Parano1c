@@ -86,7 +86,7 @@ use crate::Block128;
 use rayon::prelude::*;
 
 /// Minimum size to justify parallel NTT.
-const NTT_PARALLEL_THRESHOLD: usize = 4096;
+const NTT_PARALLEL_THRESHOLD: usize = 512;
 
 /// Forward additive NTT with parallel, flat-basis SIMD butterflies.
 ///

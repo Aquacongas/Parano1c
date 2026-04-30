@@ -11,12 +11,19 @@ use rayon::prelude::*;
 const MERKLE_PARALLEL_THRESHOLD: usize = 256;
 
 /// Minimum number of hashes to justify batch hashing.
-const BATCH_HASH_THRESHOLD: usize = 64;
+const BATCH_HASH_THRESHOLD: usize = 16;
 
 /// Merkle tree backed by contiguous layers (index 0 = root, last = leaves).
+///
+/// Nodes are stored in a single flat buffer laid out bottom-up:
+/// `[leaves (n), parent_layer (n/2), ..., root (1)]`.
+/// `layer_offsets[d]` = offset (in `nodes`) of the layer at depth `d`
+/// from the ROOT (depth 0 = root; depth `tree_depth` = leaves).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MerkleTree {
-    pub data: Vec<Vec<HashOutput>>,
+    nodes: Vec<HashOutput>,
+    layer_offsets: Vec<usize>,
+    layer_lens: Vec<usize>,
 }
 
 /// Commitment that stores the Merkle root and tree depth.
@@ -38,40 +45,31 @@ impl VectorCommitment {
 impl MerkleTree {
     /// Build a Merkle tree from a power-of-two set of leaf hashes.
     pub fn new(leaf_hashes: Vec<HashOutput>, hasher: &dyn CryptographicHasher) -> Self {
-        assert!(
-            leaf_hashes.len().is_power_of_two(),
-            "Leaf hashes must be a power of two"
-        );
-
-        let tree_depth = leaf_hashes.len().trailing_zeros() as usize;
-        let mut layers: Vec<Vec<HashOutput>> = Vec::with_capacity(tree_depth + 1);
-        layers.push(leaf_hashes);
-
-        for _ in 0..tree_depth {
-            let prev = layers.last().unwrap();
-            let next = build_parent_layer(prev, hasher);
-            layers.push(next);
-        }
-
-        layers.reverse();
-        MerkleTree { data: layers }
+        Self::build(leaf_hashes, hasher, false)
     }
 
     /// Build a Merkle tree with parallel, allocation-free layer hashing.
     ///
     /// All 2N-1 nodes are allocated once in a single buffer; each level is
     /// then filled in place by parallel batched hashing over adjacent pairs.
-    /// Previously every layer was a fresh Vec allocation + copy.
     pub fn new_parallel(leaf_hashes: Vec<HashOutput>, hasher: &dyn CryptographicHasher) -> Self {
+        Self::build(leaf_hashes, hasher, true)
+    }
+
+    fn build(
+        leaf_hashes: Vec<HashOutput>,
+        hasher: &dyn CryptographicHasher,
+        parallel: bool,
+    ) -> Self {
         let n = leaf_hashes.len();
         assert!(n.is_power_of_two(), "Leaf hashes must be a power of two");
 
         let tree_depth = n.trailing_zeros() as usize;
         let total = 2 * n - 1;
 
-        let mut buf: Vec<HashOutput> = Vec::with_capacity(total);
-        buf.extend_from_slice(&leaf_hashes);
-        buf.resize(total, [0u8; 32]);
+        let mut nodes: Vec<HashOutput> = Vec::with_capacity(total);
+        nodes.extend_from_slice(&leaf_hashes);
+        nodes.resize(total, [0u8; 32]);
 
         let mut level_start = 0usize;
         let mut level_len = n;
@@ -79,11 +77,11 @@ impl MerkleTree {
             let next_start = level_start + level_len;
             let next_len = level_len / 2;
 
-            let (src_part, dst_part) = buf.split_at_mut(next_start);
+            let (src_part, dst_part) = nodes.split_at_mut(next_start);
             let src = &src_part[level_start..level_start + level_len];
             let dst = &mut dst_part[..next_len];
 
-            if next_len >= MERKLE_PARALLEL_THRESHOLD / 2 {
+            if parallel && next_len >= MERKLE_PARALLEL_THRESHOLD / 2 {
                 hash_layer_par_into(src, dst);
             } else if next_len >= BATCH_HASH_THRESHOLD {
                 noid_poseidon2b::batch::compress_batch_interleaved_into(src, dst);
@@ -97,34 +95,56 @@ impl MerkleTree {
             level_len = next_len;
         }
 
-        // Re-slice the flat buffer into per-depth layers (top-down).
-        let mut layers: Vec<Vec<HashOutput>> = Vec::with_capacity(tree_depth + 1);
-        let mut top_down: Vec<Vec<HashOutput>> = Vec::with_capacity(tree_depth + 1);
-        let mut start = 0usize;
-        let mut len = n;
-        loop {
-            top_down.push(buf[start..start + len].to_vec());
-            if len == 1 {
-                break;
+        // Build top-down offset index: depth 0 = root, depth `tree_depth` = leaves.
+        let mut layer_offsets = Vec::with_capacity(tree_depth + 1);
+        let mut layer_lens = Vec::with_capacity(tree_depth + 1);
+        // Nodes are laid out bottom-up in `nodes`; compute offsets top-down.
+        let mut bottom_up_offsets = Vec::with_capacity(tree_depth + 1);
+        let mut bottom_up_lens = Vec::with_capacity(tree_depth + 1);
+        {
+            let mut off = 0usize;
+            let mut len = n;
+            loop {
+                bottom_up_offsets.push(off);
+                bottom_up_lens.push(len);
+                if len == 1 {
+                    break;
+                }
+                off += len;
+                len /= 2;
             }
-            start += len;
-            len /= 2;
         }
-        for lvl in top_down.into_iter().rev() {
-            layers.push(lvl);
+        for i in (0..bottom_up_offsets.len()).rev() {
+            layer_offsets.push(bottom_up_offsets[i]);
+            layer_lens.push(bottom_up_lens[i]);
         }
 
-        MerkleTree { data: layers }
+        MerkleTree {
+            nodes,
+            layer_offsets,
+            layer_lens,
+        }
     }
 
     pub fn get_root(&self) -> HashOutput {
-        self.data[0][0]
+        let off = self.layer_offsets[0];
+        self.nodes[off]
+    }
+
+    /// Number of layers (depth + 1). Matches legacy `data.len()`.
+    pub fn num_layers(&self) -> usize {
+        self.layer_offsets.len()
+    }
+
+    /// Number of nodes at layer `depth` (0 = root, last = leaves).
+    pub fn layer_len(&self, depth: usize) -> usize {
+        self.layer_lens[depth]
     }
 
     pub fn get_merkle_path(&self, leaf_index: usize) -> Vec<HashOutput> {
-        let leaf_depth = self.data.len() - 1;
+        let leaf_depth = self.num_layers() - 1;
         assert!(
-            leaf_index < self.data[leaf_depth].len(),
+            leaf_index < self.layer_lens[leaf_depth],
             "Leaf index out of bounds"
         );
 
@@ -133,7 +153,8 @@ impl MerkleTree {
 
         for depth in (1..=leaf_depth).rev() {
             let sibling = index ^ 1;
-            path.push(self.data[depth][sibling]);
+            let off = self.layer_offsets[depth];
+            path.push(self.nodes[off + sibling]);
             index >>= 1;
         }
 
@@ -164,27 +185,6 @@ pub fn verify_merkle_path(
     }
 
     hash == commitment.root
-}
-
-fn build_parent_layer(
-    child_layer: &[HashOutput],
-    hasher: &dyn CryptographicHasher,
-) -> Vec<HashOutput> {
-    assert_eq!(
-        child_layer.len() & 1,
-        0,
-        "Child layer must contain an even number of nodes"
-    );
-    let n = child_layer.len() / 2;
-    let mut out = vec![[0u8; 32]; n];
-    if n >= BATCH_HASH_THRESHOLD {
-        noid_poseidon2b::batch::compress_batch_interleaved_into(child_layer, &mut out);
-    } else {
-        for (pair, slot) in child_layer.chunks_exact(2).zip(out.iter_mut()) {
-            *slot = hasher.compress(&pair[0], &pair[1]);
-        }
-    }
-    out
 }
 
 /// Parallel batched layer hashing writing directly into `dst`.

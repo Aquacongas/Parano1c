@@ -115,11 +115,18 @@ fn mle_evaluate_scalar(evals: &[Block128], point: &[Block128]) -> Block128 {
 
 /// Fold an evaluation vector in half using packed ops when possible.
 fn fold_evals(evals: &[Block128], r: Block128) -> Vec<Block128> {
+    use rayon::prelude::*;
     let half = evals.len() / 2;
     if PACKED_LANES > 1 && half >= PACKED_LANES && evals.len().is_multiple_of(PACKED_LANES) {
         let mut data = evals.to_vec();
         noid_core::sumcheck::prove::fold_highest_var_packed_inplace(&mut data, r, half);
         data
+    } else if half >= 1024 {
+        let (lo, hi) = evals.split_at(half);
+        lo.par_iter()
+            .zip(hi.par_iter())
+            .map(|(l, h)| *l + r * *h)
+            .collect()
     } else {
         (0..half).map(|i| evals[i] + r * evals[i + half]).collect()
     }
@@ -152,7 +159,7 @@ pub fn commit(
     let leaf_hashes = compute_leaf_hashes(&code.encoding, hasher);
     let tree = MerkleTree::new_parallel(leaf_hashes, hasher);
     let root = tree.get_root();
-    let depth = tree.data.len() - 1;
+    let depth = tree.num_layers() - 1;
 
     let commitment = FriCommitment {
         vector_commitment: VectorCommitment { root, depth },
@@ -292,7 +299,7 @@ pub fn prove(
         let tree = MerkleTree::new_parallel(leaf_hashes, hasher);
         let vc = VectorCommitment {
             root: tree.get_root(),
-            depth: tree.data.len() - 1,
+            depth: tree.num_layers() - 1,
         };
         fri_oracles.push(vc.clone());
         fri_trees.push(tree);

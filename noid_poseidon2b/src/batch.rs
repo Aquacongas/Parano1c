@@ -37,11 +37,7 @@ pub fn hash_pair_batch(a: &[Block128], b: &[Block128]) -> Vec<[u8; 32]> {
     let n = a.len();
     let mut out = vec![[0u8; 32]; n];
 
-    let scalar = |i: usize| {
-        let mut sponge = Poseidon2bSponge::new();
-        sponge.absorb_pair(a[i], b[i]);
-        sponge.finalize()
-    };
+    let scalar = |i: usize| scalar_hash_pair(a[i], b[i]);
 
     if PACKED_LANES == 1 || n < PACKED_LANES {
         for i in 0..n {
@@ -62,12 +58,7 @@ pub fn hash_pair_batch(a: &[Block128], b: &[Block128]) -> Vec<[u8; 32]> {
             states[1] = states[1].set_lane(lane, b[off + lane]);
         }
 
-        // absorb_pair = one permute_buffer
-        packed_poseidon2b_permute(&mut states);
-
-        // finalize padding
-        states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
-        states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
+        // Fixed-width compression: one permutation on [a, b, 0, 0].
         packed_poseidon2b_permute(&mut states);
 
         for lane in 0..PACKED_LANES {
@@ -102,9 +93,7 @@ pub fn hash_pair_batch_interleaved_into(pairs: &[Block128], out: &mut [[u8; 32]]
     assert_eq!(out.len(), n, "output length must match pair count");
 
     let scalar = |i: usize, out: &mut [[u8; 32]]| {
-        let mut sponge = Poseidon2bSponge::new();
-        sponge.absorb_pair(pairs[2 * i], pairs[2 * i + 1]);
-        out[i] = sponge.finalize();
+        out[i] = scalar_hash_pair(pairs[2 * i], pairs[2 * i + 1]);
     };
 
     if PACKED_LANES == 1 || n < PACKED_LANES {
@@ -125,12 +114,7 @@ pub fn hash_pair_batch_interleaved_into(pairs: &[Block128], out: &mut [[u8; 32]]
             states[1] = states[1].set_lane(lane, pairs[2 * (off + lane) + 1]);
         }
 
-        // absorb_pair = one permute_buffer
-        packed_poseidon2b_permute(&mut states);
-
-        // finalize padding
-        states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
-        states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
+        // Fixed-width compression: one permutation on [a, b, 0, 0].
         packed_poseidon2b_permute(&mut states);
 
         for lane in 0..PACKED_LANES {
@@ -145,6 +129,19 @@ pub fn hash_pair_batch_interleaved_into(pairs: &[Block128], out: &mut [[u8; 32]]
     for i in rem_off..n {
         scalar(i, out);
     }
+}
+
+/// Scalar fixed-width `(Block128, Block128) → [u8; 32]` compression.
+/// Matches `CryptographicHasher::hash_pair` — one Poseidon2b permutation.
+fn scalar_hash_pair(a: Block128, b: Block128) -> [u8; 32] {
+    use crate::native::permutation::Poseidon2bPermutation;
+    use noid_core::{CanonicalSerialize, TowerField};
+    let mut state = [a, b, Block128::ZERO, Block128::ZERO];
+    Poseidon2bPermutation.permute_mut(&mut state);
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&state[0].to_bytes());
+    out[16..].copy_from_slice(&state[1].to_bytes());
+    out
 }
 
 /// Hash concatenations of 32-byte digests using packed permutations.

@@ -7,8 +7,7 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 
 use crate::channel::Channel;
 use crate::code::{fold, LOG_RATE};
-use crate::hasher::CryptographicHasher;
-use crate::merkle::verify_merkle_path;
+use crate::hasher::{CryptographicHasher, HashOutput};
 use crate::prover::{EvalProof, FriCommitment};
 
 /// Verify a FRI evaluation proof.
@@ -21,7 +20,7 @@ pub fn verify(
     eval_proof: EvalProof,
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
-    hasher: &dyn CryptographicHasher,
+    _hasher: &dyn CryptographicHasher,
 ) -> Result<(), String> {
     // Replay the statement.
     channel.observe_fri_commitment(commitment);
@@ -94,21 +93,22 @@ pub fn verify(
 
     let mut folded_symbols: Vec<Option<Block128>> = vec![None; n_queries];
 
+    // Scratch buffers reused across rounds.
+    let mut leaf_pairs: Vec<Block128> = Vec::with_capacity(n_queries * 2);
+    let mut leaf_hashes: Vec<HashOutput> = vec![[0u8; 32]; n_queries];
+    let mut merkle_pairs: Vec<HashOutput> = Vec::with_capacity(n_queries * 2);
+    let mut merkle_next: Vec<HashOutput> = vec![[0u8; 32]; n_queries];
+
     for (round, oracle) in eval_proof.fri_oracles.iter().enumerate().take(rounds) {
         let mut round_folded = Vec::with_capacity(n_queries);
 
+        // Fold-consistency check (round > 0) + collect (s0, s1) pairs for batched leaf hashing.
+        leaf_pairs.clear();
         for i in 0..n_queries {
             let qi = query_indices[i];
             let scaled = qi >> round;
-            let pair_idx = scaled >> 1;
             let parity = scaled & 1;
-
             let (s0, s1) = eval_proof.fri_queried_symbols[round][i];
-            let merkle_path = &eval_proof.fri_merkle_paths[round][i];
-
-            let leaf_hash = hasher.hash_pair(&s0, &s1);
-
-            // Fold-consistency with the previous round.
             if round > 0 {
                 let expected = if parity == 1 { s1 } else { s0 };
                 if folded_symbols[i] != Some(expected) {
@@ -117,12 +117,58 @@ pub fn verify(
                     ));
                 }
             }
+            leaf_pairs.push(s0);
+            leaf_pairs.push(s1);
+        }
 
-            // Merkle membership.
-            if !verify_merkle_path(oracle, leaf_hash, pair_idx, merkle_path, hasher) {
+        // Batch-hash all (s0, s1) leaves in one SIMD-packed pass.
+        noid_poseidon2b::batch::hash_pair_batch_interleaved_into(&leaf_pairs, &mut leaf_hashes[..n_queries]);
+
+        // Validate Merkle path lengths up-front.
+        for i in 0..n_queries {
+            let path = &eval_proof.fri_merkle_paths[round][i];
+            if path.len() != oracle.depth {
                 return Err(format!("Merkle path failed at query {i} round {round}"));
             }
+        }
 
+        // Batch-verify Merkle paths one tree-layer at a time.
+        // At each depth d, each query's running hash is combined with its
+        // sibling at path[d] in the correct order (left/right).
+        let mut running: Vec<HashOutput> = leaf_hashes[..n_queries].to_vec();
+        for d in 0..oracle.depth {
+            merkle_pairs.clear();
+            for i in 0..n_queries {
+                let qi = query_indices[i];
+                let pair_idx = (qi >> round) >> 1;
+                let is_left_child = ((pair_idx >> d) & 1) == 0;
+                let sibling = eval_proof.fri_merkle_paths[round][i][d];
+                if is_left_child {
+                    merkle_pairs.push(running[i]);
+                    merkle_pairs.push(sibling);
+                } else {
+                    merkle_pairs.push(sibling);
+                    merkle_pairs.push(running[i]);
+                }
+            }
+            noid_poseidon2b::batch::compress_batch_interleaved_into(
+                &merkle_pairs,
+                &mut merkle_next[..n_queries],
+            );
+            running.copy_from_slice(&merkle_next[..n_queries]);
+        }
+
+        for (i, r) in running.iter().enumerate().take(n_queries) {
+            if *r != oracle.root {
+                return Err(format!("Merkle path failed at query {i} round {round}"));
+            }
+        }
+
+        // Now compute the folds.
+        for (i, &qi) in query_indices.iter().enumerate().take(n_queries) {
+            let scaled = qi >> round;
+            let pair_idx = scaled >> 1;
+            let (s0, s1) = eval_proof.fri_queried_symbols[round][i];
             round_folded.push(fold(random_point[round], round, pair_idx, s0, s1, ntt));
         }
         folded_symbols = round_folded.into_iter().map(Some).collect();

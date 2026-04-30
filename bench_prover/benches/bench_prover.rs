@@ -273,7 +273,7 @@ fn bench_end_to_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("end_to_end_optimized");
     group.sample_size(50);
 
-    let log_len = 10usize;
+    let log_len = 16usize;
     let n = 1usize << log_len;
     let mut rng = StdRng::seed_from_u64(0xBEAD_C0DE_DEAD_BEEF);
     let evals: Vec<Block128> = (0..n).map(|_| Block128::from(rng.gen::<u128>())).collect();

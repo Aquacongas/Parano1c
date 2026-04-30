@@ -15,3 +15,7 @@ noid_poseidon2b = { path = "../noid_poseidon2b" }
 [[bench]]
 name = "bench_prover"
 harness = false
+
+[[bench]]
+name = "release_report"
+harness = false
