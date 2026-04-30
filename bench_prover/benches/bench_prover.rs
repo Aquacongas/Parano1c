@@ -195,12 +195,82 @@ fn bench_compress(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// UTXO primitives (CRYPTO.md §4)
+// ---------------------------------------------------------------------------
+
+fn bench_utxo_primitives(c: &mut Criterion) {
+    use noid_poseidon2b::primitives::{
+        derive_address, derive_spend_secret, hash_auth_tag, hash_commitment, hash_nullifier,
+        hash_tx_body, Commitment, MasterSecret,
+    };
+
+    let mut group = c.benchmark_group("utxo_primitives");
+    group.sample_size(20);
+
+    let mut rng = StdRng::seed_from_u64(0x0000_7E57_AB1E_7E57);
+    let ms = MasterSecret(rng.gen());
+    let addr = derive_address(&ms, 0);
+    let spend = derive_spend_secret(&ms, 0);
+    let commitment = hash_commitment(
+        1_000,
+        addr.as_fields()[0],
+        Block128::from(rng.gen::<u128>()),
+        Block128::ZERO,
+    );
+
+    group.bench_function("derive_address", |b| {
+        b.iter(|| derive_address(black_box(&ms), black_box(0)))
+    });
+    group.bench_function("derive_spend_secret", |b| {
+        b.iter(|| derive_spend_secret(black_box(&ms), black_box(0)))
+    });
+    group.bench_function("hash_commitment", |b| {
+        b.iter(|| {
+            hash_commitment(
+                black_box(1_000),
+                black_box(addr.as_fields()[0]),
+                black_box(Block128::from(7u8)),
+                black_box(Block128::ZERO),
+            )
+        })
+    });
+    group.bench_function("hash_nullifier", |b| {
+        b.iter(|| hash_nullifier(black_box(&spend), black_box(&commitment)))
+    });
+
+    let prev = [0u8; 32];
+    let body_small = hash_tx_body(&prev, 5, &[commitment], &[commitment]);
+    group.bench_function("hash_auth_tag", |b| {
+        b.iter(|| hash_auth_tag(black_box(&spend), black_box(&body_small)))
+    });
+
+    // Larger sizes (128, 512) run into the hundreds of ms per iter; drop
+    // the sample count for the whole group so wall time stays bounded.
+    group.sample_size(10);
+    for &n_io in &[2usize, 8, 32, 128, 512] {
+        let ins: Vec<Commitment> = (0..n_io).map(|_| commitment).collect();
+        let outs: Vec<Commitment> = (0..n_io).map(|_| commitment).collect();
+        group.bench_with_input(
+            BenchmarkId::new("hash_tx_body", n_io),
+            &n_io,
+            |b, _| {
+                b.iter(|| {
+                    hash_tx_body(black_box(&prev), black_box(5), black_box(&ins), black_box(&outs))
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // End to End (Fully optimized FRI)
 // ---------------------------------------------------------------------------
 
 fn bench_end_to_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("end_to_end_optimized");
-    group.sample_size(10);
+    group.sample_size(50);
 
     let log_len = 10usize;
     let n = 1usize << log_len;
@@ -242,6 +312,7 @@ criterion_group!(
     bench_ntt,
     bench_merkle,
     bench_compress,
+    bench_utxo_primitives,
     bench_end_to_end,
 );
 criterion_main!(benches);

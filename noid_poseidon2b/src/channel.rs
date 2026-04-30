@@ -7,14 +7,20 @@
 //! This is the *production* transcript for protocols in `noid_core` that
 //! previously used the insecure XOR-sum placeholder. Every squeeze advances
 //! the sponge by one permutation and emits one Block128 challenge.
+//!
+//! Breaking change: the channel is now seeded with the capacity IV
+//! `FSCHALNG` (CRYPTO.md §4.8). Any pinned test vectors downstream
+//! (notably in `noid_fri` prover/verifier and sumcheck transcripts)
+//! must be regenerated in the same commit that bumps this crate.
 
 use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 
 use crate::native::compression::Poseidon2bSponge;
+use crate::native::domain::{capacity_iv, TAG_FSCHALNG};
 
 /// Fiat-Shamir channel backed by a Poseidon2b sponge.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Poseidon2bChannel {
     sponge: Poseidon2bSponge,
     /// When we squeeze a rate block (two Block128s) we hand out the second
@@ -22,10 +28,16 @@ pub struct Poseidon2bChannel {
     pending: Option<Block128>,
 }
 
+impl Default for Poseidon2bChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Poseidon2bChannel {
     pub fn new() -> Self {
         Self {
-            sponge: Poseidon2bSponge::new(),
+            sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_FSCHALNG)),
             pending: None,
         }
     }
@@ -82,5 +94,20 @@ mod tests {
         let b = c2.squeeze();
 
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn channel_iv_diverges_from_bare_sponge() {
+        // Same absorb, different IV => different squeezes.
+        let mut c = Poseidon2bChannel::new();
+        c.absorb(Block128::from(1u128));
+        let iv_challenge = c.squeeze();
+
+        let mut bare = Poseidon2bSponge::new();
+        bare.absorb(Block128::from(1u128));
+        bare.flush_to_squeeze();
+        let [bare_a, _] = bare.squeeze();
+
+        assert_ne!(iv_challenge, bare_a);
     }
 }

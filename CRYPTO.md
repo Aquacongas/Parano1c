@@ -90,8 +90,17 @@ Every primitive below is built from the same Poseidon2b permutation, distinguish
 ### 4.7 `hash_tx_body(prev_state_root, inputs, outputs, fee) -> [u8; 32]`
 
 - **Use**: canonical tx identifier; input to `hash_auth_tag`; hashed into the Fiat-Shamir transcript.
-- **Construction**: Merkle-over-canonical-encoding. Leaves = `[prev_state_root, fee, input_commitments..., output_commitments...]`, padded to next power of two with `Block128::ZERO`, hashed with `hash_leaf` and `compress`.
+- **Construction**: binary Merkle tree over 32-byte canonical leaf encodings, reduced by [`compress`]. No per-leaf sponge.
+- **Leaf encoding (all 32 bytes, little-endian)**:
+  1. `prev_state_root` — passthrough (already 32 bytes).
+  2. `fee_leaf = le_bytes_u128(fee) || [0u8; 16]`.
+  3. Each `input_commitment` — passthrough.
+  4. Each `output_commitment` — passthrough.
+- **Padding**: pad the leaf list to the next power of two (min 2) with `ZERO_DIGEST = [0u8; 32]`.
+- **Reduction**: while `len > 1`, `next[i] = compress(level[2i], level[2i+1])`.
+- **Rationale for no per-leaf hash**: every payload is already a 256-bit cryptographic digest or a canonically encoded scalar; an extra sponge per leaf would add cost without adding domain separation (the fixed tree shape and the `COMPRESS_` IV already provide it).
 - **Why Merkle and not a sponge**: lets the circuit expose a logarithmic auth path if the prover wants to commit to a specific input without revealing all siblings. Keeps the door open.
+- **Breaking change vs. v0**: v0 hashed each leaf with `hash_leaf` before the Merkle reduction. v1 removes the leaf sponge. Digests are not compatible. KATs updated.
 
 ### 4.8 `fiat_shamir_challenge(transcript) -> Block128`
 

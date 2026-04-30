@@ -39,6 +39,18 @@ impl Poseidon2bSponge {
         }
     }
 
+    /// Construct a sponge seeded with a capacity IV. See CRYPTO.md §3.
+    /// `state[0]`, `state[1]` are zeroed (rate); `state[2]`, `state[3]`
+    /// carry the IV.
+    pub fn with_iv(iv: [Block128; 2]) -> Self {
+        Self {
+            state: [Block128::ZERO, Block128::ZERO, iv[0], iv[1]],
+            buffer: [0u8; 32],
+            filled_bytes: 0,
+            permutation: Poseidon2bPermutation,
+        }
+    }
+
     /// Absorb raw bytes into the sponge.
     pub fn update(&mut self, mut data: &[u8]) {
         if self.filled_bytes != 0 {
