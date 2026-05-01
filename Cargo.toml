@@ -9,6 +9,7 @@ members = [
     "noid_air",
     "noid_stark",
     "noid_ivc",
+    "noid_binius",
 ]
 resolver = "2"
 

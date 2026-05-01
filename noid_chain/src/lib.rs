@@ -18,8 +18,11 @@
 
 pub mod block;
 pub mod block_header;
+pub mod da;
 pub mod state;
 pub mod wire;
+
+pub use da::{pack_trace, payload_bytes, unpack_trace, DaError, PackedWitness, PackedWitnessColumn};
 
 pub use block::{
     apply_block, compute_tx_root, proof_transcript_hash, Block, BlockApplyError, BLOCK_MAX_TXS,

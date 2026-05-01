@@ -463,6 +463,44 @@ Every mining attempt produces a valid state-transition STARK; there is no wasted
 
 ---
 
+# **9a. Binius-style Packing (DA / bandwidth)**
+
+Witnesses that are semantically defined over a subfield of GF(2^128) are
+committed in their **packed** representation rather than via one Block128 per
+cell. Two packings are standardized:
+
+| Witness domain | Cells per Block128 | Payload shrink |
+| -------------- | ------------------ | --------------- |
+| GF(2)     (bit)     | 128              | 128x          |
+| GF(2^8)   (byte)    | 16               | 16x           |
+
+The packing layout is canonical:
+
+* Bit `i` of a bit-witness sits at bit `i mod 128` of packed word `i / 128`.
+* Byte `i` of a byte-witness sits at byte `i mod 16` of packed word `i / 16`.
+
+Commitments are produced by the unchanged FRI PCS on the packed vector, so
+soundness is inherited verbatim. The DA block carries the packed Block128
+words only; full nodes reconstruct the expanded witness locally before
+verification.
+
+### Scope bound (today)
+
+* `noid_binius::PackedCommit` supports raw, byte-packed, and bit-packed
+  commitments and openings *of the packed MLE*.
+* Reducing a bit- / byte-level claim "bit_mle(ẑ, r_z) = v" to a packed MLE
+  opening uses the Binius ring-switching sumcheck. That protocol is **not**
+  shipped in this revision — it is deferred until its soundness argument and
+  transcript layout are fully pinned. AIRs that need bit-level evaluation
+  claims currently enforce bit-decomposition in-circuit on the packed MLE.
+
+### Non-breaking
+
+Existing commitments (Block128-per-cell) remain valid; `commit_raw` is
+identical to the previous FRI commit.
+
+---
+
 # **10. Recursion Readiness**
 
 * Deterministic verifier

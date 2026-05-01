@@ -37,28 +37,88 @@ use noid_core::{Block128, TowerField};
 use noid_tx::{TxBody, MAX_INPUTS, MAX_OUTPUTS};
 
 // ---------------------------------------------------------------------------
+// Column domain (Binius small-field tag)
+// ---------------------------------------------------------------------------
+
+/// The logical small-field a column lives in. Used by the DA / commitment
+/// layer to decide whether to ship the column on the bit-packed, byte-packed,
+/// or raw Block128 path. Evaluation / constraint checking always lifts to
+/// `Block128` — the domain tag is purely a serialisation / commitment hint,
+/// so it is soundness-neutral until Phase 4 wires it to the packed PCS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnDomain {
+    /// Every cell is `0` or `1`. Can be bit-packed 128x on DA.
+    Bit,
+    /// Every cell fits in the low byte. Can be byte-packed 16x on DA.
+    Byte,
+    /// Cell is a full GF(2^128) element; no packing.
+    Block128,
+}
+
+// ---------------------------------------------------------------------------
 // Trace
 // ---------------------------------------------------------------------------
 
 /// A witness trace: columns of equal power-of-two length. Each column
 /// is the evaluation vector of a multilinear polynomial over
-/// `log_rows` boolean variables.
+/// `log_rows` boolean variables. Each column carries a [`ColumnDomain`]
+/// tag describing its logical small-field; by default all columns are
+/// tagged `Block128` so legacy callers stay unchanged.
 #[derive(Debug, Clone)]
 pub struct Trace {
     pub columns: Vec<Vec<Block128>>,
+    pub domains: Vec<ColumnDomain>,
     pub log_rows: usize,
 }
 
 impl Trace {
     pub fn new(columns: Vec<Vec<Block128>>) -> Self {
+        let domains = vec![ColumnDomain::Block128; columns.len()];
+        Self::new_with_domains(columns, domains)
+    }
+
+    pub fn new_with_domains(
+        columns: Vec<Vec<Block128>>,
+        domains: Vec<ColumnDomain>,
+    ) -> Self {
         assert!(!columns.is_empty(), "trace needs at least one column");
+        assert_eq!(
+            columns.len(),
+            domains.len(),
+            "one domain tag required per column"
+        );
         let len = columns[0].len();
         assert!(len.is_power_of_two(), "column length must be a power of two");
         for c in &columns {
             assert_eq!(c.len(), len, "all columns must have equal length");
         }
         let log_rows = len.trailing_zeros() as usize;
-        Self { columns, log_rows }
+        for (col, dom) in columns.iter().zip(domains.iter()) {
+            match dom {
+                ColumnDomain::Bit => {
+                    for v in col {
+                        debug_assert!(
+                            *v == Block128::ZERO || *v == Block128::ONE,
+                            "Bit-tagged column contains non-bit cell"
+                        );
+                    }
+                }
+                ColumnDomain::Byte => {
+                    for v in col {
+                        debug_assert!(
+                            v.to_u128() <= 0xff,
+                            "Byte-tagged column contains cell > 0xff"
+                        );
+                    }
+                }
+                ColumnDomain::Block128 => {}
+            }
+        }
+        Self {
+            columns,
+            domains,
+            log_rows,
+        }
     }
 
     pub fn n_cols(&self) -> usize {
@@ -67,6 +127,10 @@ impl Trace {
 
     pub fn n_rows(&self) -> usize {
         1 << self.log_rows
+    }
+
+    pub fn domain(&self, col: usize) -> ColumnDomain {
+        self.domains[col]
     }
 }
 
@@ -207,7 +271,7 @@ impl TxValidityAir {
                 Block128::ZERO
             };
         }
-        Trace::new(vec![col])
+        Trace::new_with_domains(vec![col], vec![ColumnDomain::Bit])
     }
 }
 
