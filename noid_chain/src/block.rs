@@ -308,6 +308,7 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             proof_transcript_hash: [0u8; 32],
+            witness_root: [0u8; 32],
         };
         let block = Block {
             header,
@@ -331,6 +332,7 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             proof_transcript_hash: [0u8; 32],
+            witness_root: [0u8; 32],
         };
         let block = Block {
             header,
@@ -358,6 +360,7 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             proof_transcript_hash: [0u8; 32],
+            witness_root: [0u8; 32],
         };
         let block = Block {
             header,
@@ -398,6 +401,7 @@ mod tests {
                 miner_address: Address([7u8; 32]),
                 nonce: 99,
                 proof_transcript_hash: proof_transcript_hash(b"hello"),
+                witness_root: [0xAAu8; 32],
             },
             transactions: vec![tx],
         };
@@ -422,6 +426,7 @@ mod tests {
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
                 proof_transcript_hash: [0u8; 32],
+                witness_root: [0u8; 32],
             },
             transactions: vec![],
         };
@@ -441,6 +446,7 @@ mod tests {
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
                 proof_transcript_hash: [0u8; 32],
+                witness_root: [0u8; 32],
             },
             transactions: vec![],
         };

@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid. All rights reserved.
 
+//! Criterion micro-benchmarks for the performance-critical primitives.
+//!
 //! Every benchmark exercises the production-optimized code:
 //!   - Packed field arithmetic (SIMD lanes)
 //!   - Parallel sumcheck proving
 //!   - Parallel NTT
 //!   - Parallel Merkle tree construction
 //!   - End-to-end FRI commit + prove (parallel NTT + parallel Merkle + packed MLE)
+//!   - Compression primitives (compress vs. sponge hash_concatenation)
+//!   - UTXO primitives (CRYPTO.md §4)
+//!
+//! When to use this vs. other benches:
+//!   - `release_report`  — one-shot overview across every layer with a
+//!                         branded table. Start here for a first look.
+//!   - `bench_prover`    — (this bench) criterion statistical runner for
+//!                         micro-benchmarks; use to compare two commits
+//!                         of the same primitive with confidence
+//!                         intervals and HTML reports.
+//!   - `air_bench`       — focused AIR / STARK / IVC sweeps.
+//!   - `binius_packing`  — focused Binius packing breakdown.
+//!
+//! Run:  cargo bench --bench bench_prover
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 

@@ -33,6 +33,12 @@ pub struct BlockHeader {
     pub miner_address: Address,
     pub nonce: u64,
     pub proof_transcript_hash: Digest,
+    /// Canonical digest of the Binius-packed witness shipped on DA
+    /// (`noid_chain::da::packed_witness_root`). Binds the 128x / 16x
+    /// packed bytes into consensus so the chain is Binius-native end to
+    /// end — full nodes recompute this against the downloaded DA blob
+    /// and reject any block whose header disagrees.
+    pub witness_root: Digest,
 }
 
 /// Compute `H_BLOCK` per CRYPTO.md §8.1.
@@ -46,6 +52,7 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     absorb_digest(&mut s, hdr.miner_address.as_bytes());
     s.absorb(Block128::from(hdr.nonce as u128));
     absorb_digest(&mut s, &hdr.proof_transcript_hash);
+    absorb_digest(&mut s, &hdr.witness_root);
 
     s.finalize()
 }
@@ -70,6 +77,7 @@ mod tests {
             miner_address: Address([0x44u8; 32]),
             nonce: 0xDEAD_BEEFu64,
             proof_transcript_hash: [0x55u8; 32],
+            witness_root: [0x66u8; 32],
         }
     }
 
@@ -111,6 +119,10 @@ mod tests {
         let mut h = base;
         h.proof_transcript_hash = [0xAAu8; 32];
         assert_ne!(hash_block_header(&h), baseline);
+
+        let mut h = base;
+        h.witness_root = [0xAAu8; 32];
+        assert_ne!(hash_block_header(&h), baseline);
     }
 
     #[test]
@@ -132,6 +144,7 @@ mod tests {
         absorb_digest(&mut s, h.miner_address.as_bytes());
         s.absorb(Block128::from(h.nonce as u128));
         absorb_digest(&mut s, &h.proof_transcript_hash);
+        absorb_digest(&mut s, &h.witness_root);
         let txbody_flavor = s.finalize();
 
         assert_ne!(block_digest, txbody_flavor);

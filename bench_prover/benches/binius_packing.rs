@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid. All rights reserved.
 
-//! Binius-style packing benchmark: compares raw Block128 commits against
-//! bit- and byte-packed commits of the *same logical witness*.
+//! Binius-style packing benchmark — focused view of DA / bandwidth
+//! savings with full proof-size accounting.
 //!
-//! The point of this benchmark is the DA / bandwidth column: how much
-//! smaller does the wire payload get when the witness is semantically
-//! bit- or byte-valued?
+//! Compares raw Block128 commits against bit- and byte-packed commits of
+//! the *same logical witness*, and — unlike `release_report` — also
+//! itemizes the actual serialized FRI eval-proof size per mode. Use this
+//! when you want to verify that the 128x / 16x savings really do carry
+//! through to the proof bytes, not just the committed payload.
+//!
+//! When to use this vs. other benches:
+//!   - `release_report`  — one-shot overview; packing is one row in a
+//!                         multi-section report. Start here.
+//!   - `binius_packing`  — (this bench) drill-down on packing overhead,
+//!                         including FRI proof-size deltas per mode.
+//!   - `bench_prover`    — criterion micro-benchmarks of the primitives
+//!                         underneath packing (field ops, NTT, Merkle).
+//!
+//! Run:  cargo bench --bench binius_packing
 
 use std::time::{Duration, Instant};
 

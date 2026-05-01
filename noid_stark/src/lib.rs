@@ -155,8 +155,25 @@ fn fold_highest<F: TowerField>(table: &mut Vec<F>, r: F) {
 
 /// Partial evaluation of a multilinear table at a field point `s` on
 /// its highest variable — returns a new table of length `half`.
+///
+/// The general formula is `table[j] + s · (table[j+half] + table[j])`.
+/// When `s = 0` it collapses to `table[j]` (lower half); when `s = 1`
+/// (i.e. `Block128::ONE`) it collapses to `table[j+half]` (upper
+/// half). Those two cases are hit by every sumcheck round (the round
+/// polynomial is sampled at integer points `0, 1, 2, …, degree`, so
+/// `s ∈ {0, 1}` always fire) and avoiding the `s · (…)` multiplication
+/// removes most of the per-round Block128 arithmetic on packable
+/// columns. This is a local algebraic identity: outputs are
+/// bit-identical to the general branch, so soundness is unaffected.
+#[inline]
 fn partial_eval_highest(table: &[Block128], s: Block128) -> Vec<Block128> {
     let half = table.len() / 2;
+    if s == Block128::ZERO {
+        return table[..half].to_vec();
+    }
+    if s == Block128::ONE {
+        return table[half..].to_vec();
+    }
     (0..half)
         .map(|j| table[j] + s * (table[j + half] + table[j]))
         .collect()
@@ -213,24 +230,36 @@ fn prove_zero_check(
 
     for _ in 0..n {
         // Build round polynomial evaluations at 0, 1, 2, …, degree.
-        let mut evals = Vec::with_capacity(n_points);
-        for s_idx in 0..n_points {
-            let s = Block128::from(s_idx as u8);
-            let eq_at_s = partial_eval_highest(&cur_eq, s);
-            let cols_at_s: Vec<Vec<Block128>> = cur_cols
-                .iter()
-                .map(|c| partial_eval_highest(c, s))
-                .collect();
-            evals.push(accumulate_sum(&eq_at_s, &cols_at_s, constraints, betas));
-        }
+        // The `n_points` sample points are independent; at each `s`
+        // we do one `partial_eval_highest` per column + one for eq,
+        // then an `accumulate_sum` over the remaining hypercube.
+        // Evaluate them in parallel across sample points.
+        let evals: Vec<Block128> = {
+            use rayon::prelude::*;
+            (0..n_points)
+                .into_par_iter()
+                .map(|s_idx| {
+                    let s = Block128::from(s_idx as u8);
+                    let eq_at_s = partial_eval_highest(&cur_eq, s);
+                    let cols_at_s: Vec<Vec<Block128>> = cur_cols
+                        .iter()
+                        .map(|c| partial_eval_highest(c, s))
+                        .collect();
+                    accumulate_sum(&eq_at_s, &cols_at_s, constraints, betas)
+                })
+                .collect()
+        };
 
         channel.observe_field_elems(&evals);
         let r = channel.get_random_point();
 
-        fold_highest(&mut cur_eq, r);
-        for c in cur_cols.iter_mut() {
-            fold_highest(c, r);
+        // Folding each column's highest variable at `r` is also
+        // independent per column; parallelise across columns.
+        {
+            use rayon::prelude::*;
+            cur_cols.par_iter_mut().for_each(|c| fold_highest(c, r));
         }
+        fold_highest(&mut cur_eq, r);
 
         round_polys.push(evals);
         challenges.push(r);

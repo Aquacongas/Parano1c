@@ -17,32 +17,11 @@
 //!   all shrink by 128x.
 //! * A length-`N` byte witness (GF(2^8)) shrinks by 16x.
 //!
-//! This is the same representation Binius / Ulvetanna use at the packing
-//! layer. It targets three of the benchmark columns directly:
-//!
-//! ```text
-//!   log_n = 20 (1M cells, Block128 payload) : trace 16 MiB, commit 171 ms
-//!   log_n = 20 (1M bits,  bit-packed)       : trace 128 KiB, commit ~1-2 ms
-//! ```
-//!
-//! # What this crate is NOT (yet)
-//!
-//! It does **not** implement the full Binius ring-switching PCS opening for
-//! the *bit*-MLE. That protocol requires a careful sumcheck-plus-row-reveal
-//! construction whose soundness argument depends on very specific challenge
-//! ordering and basis choices. Shipping it half-right would be worse than
-//! not shipping it. Until the full spec + proofs land, users open the
-//! *packed* MLE (which FRI already makes sound), and any bit-level identity
-//! that cannot be expressed over the packed MLE must go through the
-//! non-compressing code path.
-//!
-//! # Use cases enabled today
-//!
-//! * Block DA payload: publish packed witnesses; every full node reconstructs
-//!   the expanded vector locally before running FRI verification.
-//! * State-tree / nullifier-tree leaves that are bit strings: pack them.
-//! * Any AIR column whose cells are bits/bytes: commit the packed column and
-//!   add bit-decomposition constraints in-circuit (standard AIR technique).
+//! For the **Byte** and **Block128** domains, FRI opens the packed MLE
+//! directly — the packed vector *is* the polynomial the AIR reasons about.
+//! For the **Bit** domain, the packed commitment is canonical for DA and
+//! for the Merkle root on chain; inside prove/verify the column is expanded
+//! back to Block128 and opened via the standard FRI PCS.
 
 pub mod commit;
 pub mod pack;

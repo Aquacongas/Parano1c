@@ -22,14 +22,22 @@
 //! multilinear extension of the packed Block128 vector. That is exactly the
 //! claim FRI is built for.
 //!
-//! # Reducing small-field claims to packed claims
+//! # Byte and Block128 domains
 //!
-//! A bit-level claim "bit_mle(ẑ, r_z) = v" (where `ẑ` are the 7 "inner"
-//! variables indexing a bit within a 128-bit word and `r_z` the remaining
-//! variables) reduces to a packed claim via the Binius ring-switching
-//! sumcheck. That reduction is intentionally out of scope for this first
-//! landing — `open_packed` below is the sound primitive applications use
-//! today.
+//! For cells that live natively in GF(2^8) (byte domain) or GF(2^128) (raw
+//! Block128), the packed MLE *is* the polynomial the AIR reasons about —
+//! there is no reduction step. A byte in cell `j` of the logical column
+//! corresponds to the `(j % 16)`-th byte of packed word `j / 16`, and the
+//! multilinear extension the verifier wants to evaluate is the MLE of the
+//! packed vector in the `log(len/16)` outer variables.
+//!
+//! # Bit domain
+//!
+//! For cells that live in GF(2), the packed vector serves as the canonical
+//! DA/root representation; prove/verify expand the bit column back to a
+//! Block128 vector (embedding 0→0, 1→1) before running FRI. This keeps the
+//! 128x DA/commit savings, while the opening itself runs on the expanded
+//! form with unchanged soundness.
 
 use noid_core::{AdditiveNTT, Block128};
 use noid_fri::channel::Channel;

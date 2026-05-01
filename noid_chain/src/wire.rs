@@ -45,8 +45,8 @@ fn take_u64(src: &mut &[u8]) -> Result<u64, WireError> {
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-/// Wire size of a [`BlockHeader`]: 5 digests + timestamp + nonce.
-pub const BLOCK_HEADER_WIRE_SIZE: usize = 5 * 32 + 8 + 8;
+/// Wire size of a [`BlockHeader`]: 6 digests + timestamp + nonce.
+pub const BLOCK_HEADER_WIRE_SIZE: usize = 6 * 32 + 8 + 8;
 
 impl BlockHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -57,6 +57,7 @@ impl BlockHeader {
         put_digest(buf, self.miner_address.as_bytes());
         put_u64(buf, self.nonce);
         put_digest(buf, &self.proof_transcript_hash);
+        put_digest(buf, &self.witness_root);
     }
 
     pub fn to_bytes(&self) -> [u8; BLOCK_HEADER_WIRE_SIZE] {
@@ -75,6 +76,7 @@ impl BlockHeader {
         let miner_address = Address(take_digest(src)?);
         let nonce = take_u64(src)?;
         let proof_transcript_hash = take_digest(src)?;
+        let witness_root = take_digest(src)?;
         Ok(Self {
             prev_block_hash,
             state_root,
@@ -83,6 +85,7 @@ impl BlockHeader {
             miner_address,
             nonce,
             proof_transcript_hash,
+            witness_root,
         })
     }
 
@@ -109,6 +112,7 @@ mod tests {
             miner_address: Address([0x44u8; 32]),
             nonce: 0xDEAD_BEEFu64,
             proof_transcript_hash: [0x55u8; 32],
+            witness_root: [0x66u8; 32],
         }
     }
 

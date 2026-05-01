@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! End-to-end AIR + STARK + IVC benchmark.
+//! End-to-end AIR + STARK + IVC benchmark — focused view of the
+//! arithmetization and recursion layers.
 //!
 //! Reports wall-clock timings for:
 //!
 //!   - TxValidityAir prove / verify (one tx)
-//!   - LinearCombinationAir prove / verify at several trace sizes
+//!   - LinearCombinationAir prove / verify across several trace sizes
 //!   - IVC fold_step_prove + decide over a batch of folded columns
 //!
-//! Run with:  cargo bench --bench air_bench
+//! When to use this vs. other benches:
+//!   - `release_report`  — one-shot overview across every layer. Start here.
+//!   - `air_bench`       — (this bench) deeper sweep of AIRs / IVC shapes
+//!                         than what the release report prints.
+//!   - `bench_prover`    — criterion micro-benchmarks of primitives
+//!                         (packed-field ops, NTT, Merkle, UTXO hashes).
+//!
+//! Run:  cargo bench --bench air_bench
 
 use std::time::{Duration, Instant};
 

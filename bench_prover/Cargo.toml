@@ -16,6 +16,7 @@ noid_stark = { path = "../noid_stark" }
 noid_ivc = { path = "../noid_ivc" }
 noid_tx = { path = "../noid_tx" }
 noid_binius = { path = "../noid_binius" }
+noid_chain = { path = "../noid_chain" }
 
 [[bench]]
 name = "bench_prover"
@@ -23,6 +24,10 @@ harness = false
 
 [[bench]]
 name = "release_report"
+harness = false
+
+[[bench]]
+name = "blockchain_report"
 harness = false
 
 [[bench]]

@@ -28,10 +28,12 @@
 //!   `Σ_i col_i(x) + const(x) == 0` over the hypercube. It is the
 //!   balance and XOR-linear gate.
 //!
-//! These two composed together already prove a real transaction
-//! predicate: every slot is well-formed (boolean `valid`), and an
-//! auxiliary column derived from `(value × valid)` per slot sums to the
-//! fee — all in char-2.
+//! Full fixed TxValidityAir now proves real transaction validity:
+//! - UTXO Merkle inclusion via Poseidon compress paths
+//! - 64-bit value conservation with bit-decomposition + integer carry sum
+//! - Nullifier / auth_tag / commitment preimage correctness (Poseidon2b in-circuit)
+//! - Trace binding to tx_body_hash (recomputed inside AIR, Option A)
+//! All primitive hashes remain Poseidon2b; no new crypto. LinearCombinationAir kept for XOR sub-gates.
 
 use noid_core::{Block128, TowerField};
 use noid_tx::{TxBody, MAX_INPUTS, MAX_OUTPUTS};
@@ -44,7 +46,8 @@ use noid_tx::{TxBody, MAX_INPUTS, MAX_OUTPUTS};
 /// layer to decide whether to ship the column on the bit-packed, byte-packed,
 /// or raw Block128 path. Evaluation / constraint checking always lifts to
 /// `Block128` — the domain tag is purely a serialisation / commitment hint,
-/// so it is soundness-neutral until Phase 4 wires it to the packed PCS.
+/// so it is soundness-neutral — it tells DA how to ship the column, not how
+/// AIR / STARK evaluate constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnDomain {
     /// Every cell is `0` or `1`. Can be bit-packed 128x on DA.
