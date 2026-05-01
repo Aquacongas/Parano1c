@@ -27,8 +27,8 @@ use noid_core::{Block128, TowerField};
 #[allow(non_snake_case)]
 pub fn BETA() -> [Block128; 128] {
     let mut out = [Block128::ZERO; 128];
-    for k in 0..128 {
-        out[k] = Block128::from(1u128 << k);
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = Block128::from(1u128 << k);
     }
     out
 }
@@ -43,7 +43,7 @@ pub fn BETA() -> [Block128; 128] {
 /// bit `i % 128` of word `i / 128`.
 pub fn pack_bits(bits: &[u8]) -> Vec<Block128> {
     assert!(
-        bits.len() % 128 == 0,
+        bits.len().is_multiple_of(128),
         "bit vector length must be a multiple of 128 (got {})",
         bits.len()
     );
@@ -88,7 +88,7 @@ pub fn unpack_bits(packed: &[Block128]) -> Vec<u8> {
 /// 8 of the 128 bits of its word, in the canonical position.
 pub fn pack_bytes(bytes: &[u8]) -> Vec<Block128> {
     assert!(
-        bytes.len() % 16 == 0,
+        bytes.len().is_multiple_of(16),
         "byte vector length must be a multiple of 16 (got {})",
         bytes.len()
     );

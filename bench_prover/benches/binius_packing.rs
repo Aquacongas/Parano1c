@@ -12,11 +12,11 @@
 //!
 //! When to use this vs. other benches:
 //!   - `release_report`  — one-shot overview; packing is one row in a
-//!                         multi-section report. Start here.
+//!     multi-section report. Start here.
 //!   - `binius_packing`  — (this bench) drill-down on packing overhead,
-//!                         including FRI proof-size deltas per mode.
+//!     including FRI proof-size deltas per mode.
 //!   - `bench_prover`    — criterion micro-benchmarks of the primitives
-//!                         underneath packing (field ops, NTT, Merkle).
+//!     underneath packing (field ops, NTT, Merkle).
 //!
 //! Run:  cargo bench --bench binius_packing
 

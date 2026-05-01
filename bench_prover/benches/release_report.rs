@@ -29,12 +29,10 @@
 //!
 //! Companion benches (use these for deeper dives, not first-look numbers):
 //!   - `cargo bench --bench bench_prover`    — criterion micro-benchmarks
-//!                                             (packed-field ops, NTT,
-//!                                             Merkle, UTXO primitives).
+//!     (packed-field ops, NTT, Merkle, UTXO primitives).
 //!   - `cargo bench --bench air_bench`       — focused AIR/STARK/IVC perf.
 //!   - `cargo bench --bench binius_packing`  — focused packing-savings
-//!                                             breakdown with proof-size
-//!                                             deltas.
+//!     breakdown with proof-size deltas.
 
 use std::time::{Duration, Instant};
 

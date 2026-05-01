@@ -135,7 +135,11 @@ impl Channel {
     /// and reduce each modulo the domain size. If the domain is smaller
     /// than 144 we query every index once.
     pub fn gen_queries(&mut self, log_max_len: usize) -> Vec<usize> {
-        let domain_size = 1usize << log_max_len;
+        let Some(domain_size) = 1usize.checked_shl(log_max_len as u32) else {
+            // Out-of-range log size (malformed input): return no queries so
+            // higher-level verifiers can fail shape checks cleanly.
+            return vec![];
+        };
 
         if domain_size == 0 {
             return vec![];

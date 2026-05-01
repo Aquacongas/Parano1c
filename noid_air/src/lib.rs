@@ -33,6 +33,7 @@
 //! - 64-bit value conservation with bit-decomposition + integer carry sum
 //! - Nullifier / auth_tag / commitment preimage correctness (Poseidon2b in-circuit)
 //! - Trace binding to tx_body_hash (recomputed inside AIR, Option A)
+//!
 //! All primitive hashes remain Poseidon2b; no new crypto. LinearCombinationAir kept for XOR sub-gates.
 
 use noid_core::{Block128, TowerField};

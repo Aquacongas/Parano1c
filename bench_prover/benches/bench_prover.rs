@@ -14,11 +14,11 @@
 //!
 //! When to use this vs. other benches:
 //!   - `release_report`  — one-shot overview across every layer with a
-//!                         branded table. Start here for a first look.
+//!     branded table. Start here for a first look.
 //!   - `bench_prover`    — (this bench) criterion statistical runner for
-//!                         micro-benchmarks; use to compare two commits
-//!                         of the same primitive with confidence
-//!                         intervals and HTML reports.
+//!     micro-benchmarks; use to compare two commits
+//!     of the same primitive with confidence
+//!     intervals and HTML reports.
 //!   - `air_bench`       — focused AIR / STARK / IVC sweeps.
 //!   - `binius_packing`  — focused Binius packing breakdown.
 //!

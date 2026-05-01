@@ -45,6 +45,8 @@ pub enum DaError {
     LogRowsMismatch,
     PayloadLenMismatch,
     RowCountNotPowerOfTwo,
+    InvalidLogRows,
+    InvalidBlockEncoding,
 }
 
 /// Encode a [`Trace`] into its packed DA form.
@@ -62,10 +64,12 @@ pub fn pack_trace(trace: &Trace) -> PackedWitness {
 
 /// Decode a [`PackedWitness`] back into a [`Trace`].
 pub fn unpack_trace(pw: &PackedWitness) -> Result<Trace, DaError> {
-    if !(1usize << pw.log_rows).is_power_of_two() {
+    let Some(n_rows) = 1usize.checked_shl(pw.log_rows as u32) else {
+        return Err(DaError::InvalidLogRows);
+    };
+    if !n_rows.is_power_of_two() {
         return Err(DaError::RowCountNotPowerOfTwo);
     }
-    let n_rows = 1usize << pw.log_rows;
     let mut columns = Vec::with_capacity(pw.columns.len());
     let mut domains = Vec::with_capacity(pw.columns.len());
     for pc in &pw.columns {
@@ -123,7 +127,7 @@ fn unpack_column(pc: &PackedWitnessColumn, n_rows: usize) -> Result<Vec<Block128
             if pc.payload.len() != want {
                 return Err(DaError::PayloadLenMismatch);
             }
-            let packed = bytes_to_block128s(&pc.payload);
+            let packed = bytes_to_block128s(&pc.payload)?;
             let w = BitWitness::from_packed(packed);
             // Truncate the expanded vector back to the logical n_rows.
             Ok(w.as_expanded_field().into_iter().take(n_rows).collect())
@@ -136,7 +140,7 @@ fn unpack_column(pc: &PackedWitnessColumn, n_rows: usize) -> Result<Vec<Block128
             if pc.payload.len() != want {
                 return Err(DaError::PayloadLenMismatch);
             }
-            let packed = bytes_to_block128s(&pc.payload);
+            let packed = bytes_to_block128s(&pc.payload)?;
             let w = ByteWitness::from_packed(packed);
             // Truncate the expanded vector back to the logical n_rows.
             Ok(w.as_expanded_field().into_iter().take(n_rows).collect())
@@ -145,7 +149,7 @@ fn unpack_column(pc: &PackedWitnessColumn, n_rows: usize) -> Result<Vec<Block128
             if pc.payload.len() != n_rows * 16 {
                 return Err(DaError::PayloadLenMismatch);
             }
-            Ok(bytes_to_block128s(&pc.payload))
+            bytes_to_block128s(&pc.payload)
         }
     }
 }
@@ -158,15 +162,17 @@ fn block128s_to_bytes(xs: &[Block128]) -> Vec<u8> {
     out
 }
 
-fn bytes_to_block128s(bytes: &[u8]) -> Vec<Block128> {
-    assert_eq!(bytes.len() % 16, 0, "bytes must be a multiple of 16");
+fn bytes_to_block128s(bytes: &[u8]) -> Result<Vec<Block128>, DaError> {
+    if !bytes.len().is_multiple_of(16) {
+        return Err(DaError::InvalidBlockEncoding);
+    }
     let mut out = Vec::with_capacity(bytes.len() / 16);
     for chunk in bytes.chunks_exact(16) {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(chunk);
         out.push(Block128::from(u128::from_le_bytes(buf)));
     }
-    out
+    Ok(out)
 }
 
 /// Canonical digest of a packed witness, computed over the packed form
@@ -253,7 +259,7 @@ mod tests {
     #[test]
     fn roundtrip_bit_column() {
         let n = 256;
-        let trace = Trace::new_with_domains(vec![bit_col(n, 0xa5a5_5a5a_deadbeef)], vec![ColumnDomain::Bit]);
+        let trace = Trace::new_with_domains(vec![bit_col(n, 0xa5a5_5a5a_dead_beef)], vec![ColumnDomain::Bit]);
         let pw = pack_trace(&trace);
         assert_eq!(pw.columns[0].payload.len(), n / 8);
         let back = unpack_trace(&pw).unwrap();

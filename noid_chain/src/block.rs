@@ -16,7 +16,7 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_FSCHALNG};
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::wire::WireError;
-use noid_tx::Transaction;
+use noid_tx::{hash_tx_body, Transaction};
 
 use crate::block_header::BlockHeader;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
@@ -45,6 +45,8 @@ pub enum BlockApplyError {
     Tx(ApplyError),
     /// `tx.body.prev_state_root` does not match the running chain root.
     UnchainedPrevRoot,
+    /// `tx.body_hash` does not match the canonical hash of `tx.body`.
+    WrongTxBodyHash,
     /// `tx.body.new_state_root` disagrees with what `apply_tx` computed.
     WrongNewStateRoot,
     /// Same check for nullifier_root.
@@ -77,6 +79,17 @@ pub fn apply_block(
         if tx.body.prev_state_root != snap.state_root() {
             return Err(BlockApplyError::UnchainedPrevRoot);
         }
+
+        let expected_hash = hash_tx_body(
+            &tx.body.prev_state_root,
+            tx.body.fee,
+            &tx.body.inputs,
+            &tx.body.outputs,
+        );
+        if tx.tx_body_hash != expected_hash {
+            return Err(BlockApplyError::WrongTxBodyHash);
+        }
+
         let st = apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
         if tx.body.new_state_root != st.new_state_root {
             return Err(BlockApplyError::WrongNewStateRoot);
@@ -343,6 +356,33 @@ mod tests {
             Err(BlockApplyError::HeaderTxRootMismatch)
         );
         assert_eq!(state.next_leaf_index, 0);
+    }
+
+    #[test]
+    fn apply_block_rejects_wrong_tx_body_hash() {
+        let mut state = ChainState::new();
+        let mut tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        tx.tx_body_hash.0[0] ^= 1;
+
+        let header = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+            timestamp: 1,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            proof_transcript_hash: [0u8; 32],
+            witness_root: [0u8; 32],
+        };
+        let block = Block {
+            header,
+            transactions: vec![tx],
+        };
+
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::WrongTxBodyHash)
+        );
     }
 
     #[test]

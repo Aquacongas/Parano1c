@@ -13,9 +13,9 @@
 //! When to use this vs. other benches:
 //!   - `release_report`  — one-shot overview across every layer. Start here.
 //!   - `air_bench`       — (this bench) deeper sweep of AIRs / IVC shapes
-//!                         than what the release report prints.
+//!     than what the release report prints.
 //!   - `bench_prover`    — criterion micro-benchmarks of primitives
-//!                         (packed-field ops, NTT, Merkle, UTXO hashes).
+//!     (packed-field ops, NTT, Merkle, UTXO hashes).
 //!
 //! Run:  cargo bench --bench air_bench
 

@@ -27,20 +27,38 @@ pub fn verify(
     channel.observe_field_elems(eval_point);
     channel.observe_field_elem(eval);
 
+    if commitment.log_len != eval_point.len() {
+        return Err(format!(
+            "eval-point length mismatch: commitment expects {}, got {}",
+            commitment.log_len,
+            eval_point.len()
+        ));
+    }
+
     let tau = crate::channel::TAU.min(eval_point.len());
     let n = eval_point.len();
     let (right, left) = eval_point.split_at(n - tau);
 
+    let expected_upper = 1usize
+        .checked_shl(tau as u32)
+        .ok_or_else(|| "tau overflow while sizing upper partial evals".to_string())?;
+    if eval_proof.upper_partial_evals.len() != expected_upper {
+        return Err(format!(
+            "upper_partial_evals length mismatch: expected {}, got {}",
+            expected_upper,
+            eval_proof.upper_partial_evals.len()
+        ));
+    }
+
     // Reconstruct the eq table for the left (high) variables.
     let left_eq = compute_eq_table(left);
+    if left_eq.len() != expected_upper {
+        return Err("left eq table length mismatch".to_string());
+    }
 
     // Check: Σ left_eq[i] * upper_partial_evals[i] == eval
     let mut derived_eval = Block128::ZERO;
-    for (lhs, rhs) in left_eq
-        .iter()
-        .zip(eval_proof.upper_partial_evals.iter())
-        .take(1 << tau)
-    {
+    for (lhs, rhs) in left_eq.iter().zip(eval_proof.upper_partial_evals.iter()) {
         derived_eval += *lhs * *rhs;
     }
     if derived_eval != eval {
@@ -50,16 +68,25 @@ pub fn verify(
     // Draw tensor-batching challenge.
     let tensor_batching_point = channel.get_random_points(tau);
     let batching_eq = compute_eq_table(&tensor_batching_point);
+    if batching_eq.len() != expected_upper {
+        return Err("batching eq-table length mismatch".to_string());
+    }
 
     // Recompute the sum-check claim from the upper partial evaluations.
     let mut sum_check_claim = compute_row_batch(&batching_eq, &eval_proof.upper_partial_evals);
 
     let rounds = right.len();
-    if rounds != eval_proof.sum_check_oracles.len() {
+    if rounds != eval_proof.sum_check_oracles.len()
+        || rounds != eval_proof.fri_oracles.len()
+        || rounds != eval_proof.fri_queried_symbols.len()
+        || rounds != eval_proof.fri_merkle_paths.len()
+    {
         return Err(format!(
-            "round count mismatch: expected {}, got {}",
-            rounds,
-            eval_proof.sum_check_oracles.len()
+            "round count mismatch: expected {rounds}, got sumcheck={}, fri_oracles={}, queried_symbols={}, merkle_paths={}",
+            eval_proof.sum_check_oracles.len(),
+            eval_proof.fri_oracles.len(),
+            eval_proof.fri_queried_symbols.len(),
+            eval_proof.fri_merkle_paths.len()
         ));
     }
 
@@ -69,6 +96,9 @@ pub fn verify(
         let sum_check = oracle.evaluate(Block128::ZERO) + oracle.evaluate(Block128::ONE);
         if sum_check != sum_check_claim {
             return Err(format!("Sum of oracle evaluations failed on round {round}"));
+        }
+        if oracle.coeffs.is_empty() {
+            return Err(format!("empty sumcheck oracle at round {round}"));
         }
 
         // Transcript order (must match prover exactly):
@@ -85,8 +115,11 @@ pub fn verify(
     }
 
     // Absorb the final codeword into the transcript.
+    if eval_proof.final_codeword.is_empty() {
+        return Err("empty final codeword".to_string());
+    }
     channel.observe_field_elems(&eval_proof.final_codeword);
-    let final_codeword_len = eval_proof.final_codeword.len().max(1);
+    let final_codeword_len = eval_proof.final_codeword.len();
 
     let query_indices = channel.gen_queries(rounds + LOG_RATE);
     let n_queries = query_indices.len();
@@ -102,13 +135,23 @@ pub fn verify(
     for (round, oracle) in eval_proof.fri_oracles.iter().enumerate().take(rounds) {
         let mut round_folded = Vec::with_capacity(n_queries);
 
+        let queried_symbols = &eval_proof.fri_queried_symbols[round];
+        let merkle_paths = &eval_proof.fri_merkle_paths[round];
+        if queried_symbols.len() != n_queries || merkle_paths.len() != n_queries {
+            return Err(format!(
+                "query vector length mismatch at round {round}: symbols={}, paths={}, expected={n_queries}",
+                queried_symbols.len(),
+                merkle_paths.len()
+            ));
+        }
+
         // Fold-consistency check (round > 0) + collect (s0, s1) pairs for batched leaf hashing.
         leaf_pairs.clear();
         for i in 0..n_queries {
             let qi = query_indices[i];
             let scaled = qi >> round;
             let parity = scaled & 1;
-            let (s0, s1) = eval_proof.fri_queried_symbols[round][i];
+            let (s0, s1) = queried_symbols[i];
             if round > 0 {
                 let expected = if parity == 1 { s1 } else { s0 };
                 if folded_symbols[i] != Some(expected) {
@@ -125,8 +168,7 @@ pub fn verify(
         hasher.batch_hash_pair(&leaf_pairs, &mut leaf_hashes[..n_queries]);
 
         // Validate Merkle path lengths up-front.
-        for i in 0..n_queries {
-            let path = &eval_proof.fri_merkle_paths[round][i];
+        for (i, path) in merkle_paths.iter().enumerate().take(n_queries) {
             if path.len() != oracle.depth {
                 return Err(format!("Merkle path failed at query {i} round {round}"));
             }
@@ -136,13 +178,14 @@ pub fn verify(
         // At each depth d, each query's running hash is combined with its
         // sibling at path[d] in the correct order (left/right).
         let mut running: Vec<HashOutput> = leaf_hashes[..n_queries].to_vec();
-        for d in 0..oracle.depth {
+        let mut d = 0usize;
+        while d < oracle.depth {
             merkle_pairs.clear();
             for i in 0..n_queries {
                 let qi = query_indices[i];
                 let pair_idx = (qi >> round) >> 1;
                 let is_left_child = ((pair_idx >> d) & 1) == 0;
-                let sibling = eval_proof.fri_merkle_paths[round][i][d];
+                let sibling = merkle_paths[i][d];
                 if is_left_child {
                     merkle_pairs.push(running[i]);
                     merkle_pairs.push(sibling);
@@ -153,6 +196,7 @@ pub fn verify(
             }
             hasher.batch_compress(&merkle_pairs, &mut merkle_next[..n_queries]);
             running.copy_from_slice(&merkle_next[..n_queries]);
+            d += 1;
         }
 
         for (i, r) in running.iter().enumerate().take(n_queries) {
@@ -165,7 +209,7 @@ pub fn verify(
         for (i, &qi) in query_indices.iter().enumerate().take(n_queries) {
             let scaled = qi >> round;
             let pair_idx = scaled >> 1;
-            let (s0, s1) = eval_proof.fri_queried_symbols[round][i];
+            let (s0, s1) = queried_symbols[i];
             round_folded.push(fold(random_point[round], round, pair_idx, s0, s1, ntt));
         }
         folded_symbols = round_folded.into_iter().map(Some).collect();
@@ -192,19 +236,22 @@ pub fn verify(
 
 /// Compute the equality indicator table eq(r) for a point r.
 pub fn compute_eq_table(r: &[Block128]) -> Vec<Block128> {
-    let mut eq = vec![Block128::ZERO; 1 << r.len()];
+    let Some(size) = 1usize.checked_shl(r.len() as u32) else {
+        return Vec::new();
+    };
+    let mut eq = vec![Block128::ZERO; size];
     eq[0] = Block128::ONE;
-    let mut size = 1;
+    let mut span = 1;
 
-    for &r_i in r.iter() {
-        let (eq_left, eq_right) = eq.split_at_mut(size);
-        let (eq_right, _) = eq_right.split_at_mut(size);
+    for &r_i in r {
+        let (eq_left, eq_right) = eq.split_at_mut(span);
+        let (eq_right, _) = eq_right.split_at_mut(span);
 
-        for j in 0..size {
+        for j in 0..span {
             eq_right[j] = eq_left[j] * r_i;
             eq_left[j] += eq_right[j]; // eq_left[j] - eq_right[j] == same in char 2
         }
-        size *= 2;
+        span *= 2;
     }
 
     eq
