@@ -24,6 +24,8 @@ pub enum WireError {
     Truncated,
     /// A count field exceeds the hard protocol bound (e.g. > MAX_INPUTS).
     CountTooLarge,
+    /// Cross-field shape mismatch (e.g. auth_tags count vs. valid inputs).
+    ShapeMismatch,
     /// The `valid` byte decoded to a value other than 0 or 1.
     InvalidBool,
     /// Trailing bytes after a top-level decode.
@@ -169,6 +171,15 @@ pub const TX_BODY_VERSION: u8 = 1;
 
 impl TxBody {
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.inputs.len() <= crate::types::MAX_INPUTS,
+            "inputs exceed MAX_INPUTS"
+        );
+        assert!(
+            self.outputs.len() <= crate::types::MAX_OUTPUTS,
+            "outputs exceed MAX_OUTPUTS"
+        );
+
         buf.push(TX_BODY_VERSION);
         put_digest(buf, &self.prev_state_root);
         put_digest(buf, &self.new_state_root);
@@ -251,6 +262,15 @@ impl TxBody {
 
 impl Transaction {
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.auth_tags.len() <= crate::types::MAX_INPUTS,
+            "auth_tags exceed MAX_INPUTS"
+        );
+        assert!(
+            self.has_canonical_auth_tag_count(),
+            "auth_tags count must equal number of valid inputs"
+        );
+
         self.body.encode(buf);
         put_digest(buf, &self.tx_body_hash.0);
         put_u32(buf, self.auth_tags.len() as u32);
@@ -276,11 +296,15 @@ impl Transaction {
         for _ in 0..n {
             auth_tags.push(AuthTag(take_digest(src)?));
         }
-        Ok(Self {
+        let tx = Self {
             body,
             tx_body_hash,
             auth_tags,
-        })
+        };
+        if !tx.has_canonical_auth_tag_count() {
+            return Err(WireError::ShapeMismatch);
+        }
+        Ok(tx)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
@@ -526,5 +550,91 @@ mod tests {
             let res = TxBody::from_bytes(&bytes[..cut]);
             assert!(res.is_err(), "expected error at cut={}", cut);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "inputs exceed MAX_INPUTS")]
+    fn tx_body_encode_panics_when_inputs_exceed_bound() {
+        let body = TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            nullifier_root: [0u8; 32],
+            fee: 0,
+            inputs: vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
+            outputs: vec![],
+        };
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "outputs exceed MAX_OUTPUTS")]
+    fn tx_body_encode_panics_when_outputs_exceed_bound() {
+        let body = TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            nullifier_root: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],
+        };
+        let mut buf = Vec::new();
+        body.encode(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "auth_tags exceed MAX_INPUTS")]
+    fn transaction_encode_panics_when_auth_tags_exceed_bound() {
+        let tx = Transaction {
+            body: TxBody {
+                prev_state_root: [0u8; 32],
+                new_state_root: [0u8; 32],
+                nullifier_root: [0u8; 32],
+                fee: 0,
+                inputs: vec![],
+                outputs: vec![],
+            },
+            tx_body_hash: TxBodyHash([0u8; 32]),
+            auth_tags: vec![AuthTag([0u8; 32]); crate::types::MAX_INPUTS + 1],
+        };
+        let mut buf = Vec::new();
+        tx.encode(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "auth_tags count must equal number of valid inputs")]
+    fn transaction_encode_panics_when_auth_tags_count_mismatches_valid_inputs() {
+        let tx = Transaction {
+            body: TxBody {
+                prev_state_root: [0u8; 32],
+                new_state_root: [0u8; 32],
+                nullifier_root: [0u8; 32],
+                fee: 0,
+                inputs: vec![mk_input(1)],
+                outputs: vec![],
+            },
+            tx_body_hash: TxBodyHash([0u8; 32]),
+            auth_tags: vec![],
+        };
+        let mut buf = Vec::new();
+        tx.encode(&mut buf);
+    }
+
+    #[test]
+    fn transaction_decode_rejects_auth_tag_shape_mismatch() {
+        let body = TxBody {
+            prev_state_root: [0xAAu8; 32],
+            new_state_root: [0xBBu8; 32],
+            nullifier_root: [0xCCu8; 32],
+            fee: 7,
+            inputs: vec![mk_input(3)],
+            outputs: vec![mk_output(4, 99)],
+        };
+
+        let mut bytes = body.to_bytes();
+        bytes.extend_from_slice(&[0x99u8; 32]); // tx_body_hash
+        put_u32(&mut bytes, 0); // zero auth tags, but one valid input
+
+        assert_eq!(Transaction::from_bytes(&bytes), Err(WireError::ShapeMismatch));
     }
 }

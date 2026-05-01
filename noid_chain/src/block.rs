@@ -45,6 +45,14 @@ pub enum BlockApplyError {
     Tx(ApplyError),
     /// `tx.body.prev_state_root` does not match the running chain root.
     UnchainedPrevRoot,
+    /// Block carries more transactions than the hard wire/DoS cap.
+    TooManyTransactions,
+    /// Header does not bind a non-zero proof transcript digest.
+    MissingProofTranscriptHash,
+    /// Header does not bind a non-zero DA witness digest.
+    MissingWitnessRoot,
+    /// `tx.auth_tags.len()` is not equal to the number of real (`valid`) inputs.
+    AuthTagCountMismatch,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
     WrongTxBodyHash,
     /// `tx.body.new_state_root` disagrees with what `apply_tx` computed.
@@ -69,6 +77,16 @@ pub fn apply_block(
     state: &mut ChainState,
     block: &Block,
 ) -> Result<StateTransition, BlockApplyError> {
+    if block.transactions.len() > BLOCK_MAX_TXS {
+        return Err(BlockApplyError::TooManyTransactions);
+    }
+    if block.header.proof_transcript_hash == [0u8; 32] {
+        return Err(BlockApplyError::MissingProofTranscriptHash);
+    }
+    if block.header.witness_root == [0u8; 32] {
+        return Err(BlockApplyError::MissingWitnessRoot);
+    }
+
     let mut snap = state.clone();
     let mut last = StateTransition {
         new_state_root: snap.state_root(),
@@ -78,6 +96,9 @@ pub fn apply_block(
     for tx in &block.transactions {
         if tx.body.prev_state_root != snap.state_root() {
             return Err(BlockApplyError::UnchainedPrevRoot);
+        }
+        if !tx.has_canonical_auth_tag_count() {
+            return Err(BlockApplyError::AuthTagCountMismatch);
         }
 
         let expected_hash = hash_tx_body(
@@ -173,6 +194,11 @@ fn take_u32(src: &mut &[u8]) -> Result<u32, WireError> {
 
 impl Block {
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.transactions.len() <= BLOCK_MAX_TXS,
+            "transactions exceed BLOCK_MAX_TXS"
+        );
+
         buf.push(BLOCK_VERSION);
         self.header.encode(buf);
         put_u32(buf, self.transactions.len() as u32);
@@ -222,7 +248,8 @@ mod tests {
     use super::*;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::primitives::{
-        derive_view_key, hash_commitment, hash_scan_tag, Address, MasterSecret, Nullifier,
+        derive_view_key, hash_commitment, hash_scan_tag, Address, AuthTag, MasterSecret,
+        Nullifier,
     };
     use noid_tx::{hash_tx_body, TxBody, TxInput, TxOutput};
 
@@ -285,10 +312,11 @@ mod tests {
             &body.inputs,
             &body.outputs,
         );
+        let auth_tags = vec![AuthTag([0u8; 32]); body.valid_input_count()];
         Transaction {
             body,
             tx_body_hash: tbh,
-            auth_tags: vec![],
+            auth_tags,
         }
     }
 
@@ -320,8 +348,8 @@ mod tests {
             timestamp: 1,
             miner_address: Address([9u8; 32]),
             nonce: 0,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
         };
         let block = Block {
             header,
@@ -344,8 +372,8 @@ mod tests {
             timestamp: 1,
             miner_address: Address([9u8; 32]),
             nonce: 0,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
         };
         let block = Block {
             header,
@@ -371,8 +399,8 @@ mod tests {
             timestamp: 1,
             miner_address: Address([9u8; 32]),
             nonce: 0,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
         };
         let block = Block {
             header,
@@ -382,6 +410,33 @@ mod tests {
         assert_eq!(
             apply_block(&mut state, &block),
             Err(BlockApplyError::WrongTxBodyHash)
+        );
+    }
+
+    #[test]
+    fn apply_block_rejects_auth_tag_count_mismatch() {
+        let mut state = ChainState::new();
+        let mut tx = build_tx(&state, vec![mk_input(1)], vec![mk_output(2, 2)]);
+        tx.auth_tags.clear();
+
+        let header = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+            timestamp: 1,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
+        };
+        let block = Block {
+            header,
+            transactions: vec![tx],
+        };
+
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::AuthTagCountMismatch)
         );
     }
 
@@ -399,8 +454,8 @@ mod tests {
             timestamp: 1,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
         };
         let block = Block {
             header,
@@ -424,6 +479,56 @@ mod tests {
             proof_transcript_hash(b"abc")
         );
         assert_ne!(proof_transcript_hash(b"a"), proof_transcript_hash(b"b"));
+    }
+
+    #[test]
+    fn apply_block_rejects_missing_proof_transcript_hash() {
+        let mut state = ChainState::new();
+        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut probe = state.clone();
+        let st = apply_tx(&mut probe, &tx.body).unwrap();
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: st.new_state_root,
+                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+                timestamp: 42,
+                miner_address: Address([7u8; 32]),
+                nonce: 99,
+                proof_transcript_hash: [0u8; 32],
+                witness_root: [2u8; 32],
+            },
+            transactions: vec![tx],
+        };
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::MissingProofTranscriptHash)
+        );
+    }
+
+    #[test]
+    fn apply_block_rejects_missing_witness_root() {
+        let mut state = ChainState::new();
+        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut probe = state.clone();
+        let st = apply_tx(&mut probe, &tx.body).unwrap();
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: st.new_state_root,
+                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+                timestamp: 42,
+                miner_address: Address([7u8; 32]),
+                nonce: 99,
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [0u8; 32],
+            },
+            transactions: vec![tx],
+        };
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::MissingWitnessRoot)
+        );
     }
 
     #[test]
@@ -465,8 +570,8 @@ mod tests {
                 timestamp: 0,
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
-                proof_transcript_hash: [0u8; 32],
-                witness_root: [0u8; 32],
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [2u8; 32],
             },
             transactions: vec![],
         };
@@ -485,8 +590,8 @@ mod tests {
                 timestamp: 0,
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
-                proof_transcript_hash: [0u8; 32],
-                witness_root: [0u8; 32],
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [2u8; 32],
             },
             transactions: vec![],
         };

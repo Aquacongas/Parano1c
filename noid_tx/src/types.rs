@@ -67,6 +67,14 @@ pub struct TxBody {
     pub outputs: Vec<TxOutput>,
 }
 
+impl TxBody {
+    /// Number of real spend inputs (`valid = true`) in this body.
+    #[inline]
+    pub fn valid_input_count(&self) -> usize {
+        self.inputs.iter().filter(|i| i.valid).count()
+    }
+}
+
 /// A full transaction: body plus per-input auth tags binding each spend
 /// secret to `tx_body_hash`. CRYPTO.md §5.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,4 +82,12 @@ pub struct Transaction {
     pub body: TxBody,
     pub tx_body_hash: TxBodyHash,
     pub auth_tags: Vec<AuthTag>,
+}
+
+impl Transaction {
+    /// Canonical shape requires exactly one auth tag per real spend input.
+    #[inline]
+    pub fn has_canonical_auth_tag_count(&self) -> bool {
+        self.auth_tags.len() == self.body.valid_input_count()
+    }
 }

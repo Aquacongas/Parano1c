@@ -447,10 +447,11 @@ fn bench_chain(c: &mut Criterion) {
                         &body.inputs,
                         &body.outputs,
                     );
+                    let auth_tag_count = body.inputs.iter().filter(|i| i.valid).count();
                     txs.push(Transaction {
                         body,
                         tx_body_hash: body_hash,
-                        auth_tags: vec![AuthTag([k; 32])],
+                        auth_tags: vec![AuthTag([k; 32]); auth_tag_count],
                     });
                     cur_root = st.new_state_root;
                 }
@@ -463,8 +464,8 @@ fn bench_chain(c: &mut Criterion) {
                     timestamp: 1_700_000_000,
                     miner_address: Address([0u8; 32]),
                     nonce: 0,
-                    proof_transcript_hash: [0u8; 32],
-                    witness_root: [0u8; 32],
+                    proof_transcript_hash: [1u8; 32],
+                    witness_root: [2u8; 32],
                 };
                 let block = Block {
                     header,

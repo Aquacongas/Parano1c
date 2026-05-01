@@ -78,10 +78,12 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
-    /// Re-derive the root from `leaf`, `index`, and `siblings`. Callers
-    /// pass the expected root and compare.
-    pub fn compute_root(&self) -> Digest {
-        assert_eq!(self.siblings.len(), self.depth, "proof depth mismatch");
+    /// Re-derive the root from `leaf`, `index`, and `siblings`.
+    /// Returns `None` if the proof shape is malformed (`siblings.len() != depth`).
+    pub fn try_compute_root(&self) -> Option<Digest> {
+        if self.siblings.len() != self.depth {
+            return None;
+        }
         let mut cur = self.leaf;
         let mut idx = self.index;
         for sib in &self.siblings {
@@ -93,13 +95,21 @@ impl MerkleProof {
             };
             idx >>= 1;
         }
-        cur
+        Some(cur)
+    }
+
+    /// Re-derive the root from `leaf`, `index`, and `siblings`.
+    ///
+    /// # Panics
+    /// Panics if the proof shape is malformed (`siblings.len() != depth`).
+    pub fn compute_root(&self) -> Digest {
+        self.try_compute_root().expect("proof depth mismatch")
     }
 
     /// Verify the proof against an expected root.
     #[inline]
     pub fn verify(&self, expected_root: &Digest) -> bool {
-        &self.compute_root() == expected_root
+        self.try_compute_root().is_some_and(|r| &r == expected_root)
     }
 }
 
@@ -116,9 +126,13 @@ pub struct SparseMerkleTree {
 }
 
 impl SparseMerkleTree {
-    /// Create an empty tree of the given depth. `depth` must be ≤ 64.
+    /// Create an empty tree of the given depth. `depth` must be ≤ 63.
+    ///
+    /// Depth 64 would require full-width `u64` range handling in internal
+    /// subtree scans; this implementation intentionally keeps the index space
+    /// strict and panic-free for all supported depths.
     pub fn new(depth: usize) -> Self {
-        assert!(depth <= 64, "depth > 64 unsupported");
+        assert!(depth <= 63, "depth > 63 unsupported");
         Self {
             depth,
             leaves: BTreeMap::new(),
@@ -131,8 +145,7 @@ impl SparseMerkleTree {
         self.depth
     }
 
-    /// Maximum leaf index + 1. For `depth == 64` this overflows — callers
-    /// at that depth must index with `u64` modular arithmetic.
+    /// Maximum leaf index + 1.
     #[inline]
     pub fn capacity(&self) -> u128 {
         1u128 << self.depth
@@ -168,6 +181,7 @@ impl SparseMerkleTree {
 
     /// Remove an explicit leaf, restoring the sparse default (`Z[0]`).
     pub fn clear(&mut self, index: u64) {
+        self.assert_in_range(index);
         self.leaves.remove(&index);
     }
 
@@ -360,5 +374,21 @@ mod tests {
         let p = t.proof(i);
         assert_eq!(p.siblings.len(), CHAIN_TREE_DEPTH);
         assert!(p.verify(&t.root()));
+    }
+
+    #[test]
+    fn malformed_proof_shape_rejected_without_panic() {
+        let mut t = SparseMerkleTree::new(8);
+        t.insert(5, [0xAB; 32]);
+        let mut p = t.proof(5);
+        p.siblings.pop();
+        assert_eq!(p.try_compute_root(), None);
+        assert!(!p.verify(&t.root()));
+    }
+
+    #[test]
+    #[should_panic(expected = "depth > 63 unsupported")]
+    fn depth_64_is_rejected() {
+        let _ = SparseMerkleTree::new(64);
     }
 }
