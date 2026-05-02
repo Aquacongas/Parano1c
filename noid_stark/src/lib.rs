@@ -27,6 +27,7 @@
 //! polynomials carry that many evaluations.
 
 pub mod ladder_batch;
+pub mod multipoint_batch;
 pub mod vshift;
 
 use noid_air::{Air, Constraint, EvalFrame, Trace};
@@ -34,8 +35,7 @@ use crate::vshift::{cyclic_rotate_left, ladder_points, reconstruct_shifted_openi
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::batch::{prove_batched, verify_batched, BatchedEvalProof};
 use noid_fri::channel::TAU;
-use noid_fri::prover::{commit, prove, EvalProof, FriCommitment};
-use noid_fri::verifier::verify as fri_verify;
+use noid_fri::prover::{commit, FriCommitment};
 use noid_fri::Channel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_tx::PublicInputs;
@@ -49,22 +49,22 @@ use noid_tx::PublicInputs;
 /// batched zero-check polynomial.
 pub type RoundPoly = Vec<Block128>;
 
-/// A STARK proof. One FRI commitment per column, one shared opening
-/// point `r` (the sumcheck's final challenge), one **RLC-batched**
-/// FRI evaluation proof at `r` covering every base column
-/// (CRYPTO.md §12b), plus the batched zero-check sumcheck transcript.
-///
-/// The `base_batch` field replaces the per-column `column_proofs` from
-/// 3b-0.4: one FRI oracle transcript instead of `n_cols`. Per-column
-/// openings are exposed via `base_batch.column_openings` so the
-/// verifier's terminal zero-check equation still has access to
-/// individual `e_i = MLE_i(r)` values.
+/// A STARK proof. One FRI commitment per column, the zero-check
+/// sumcheck transcript, per-column base openings `e_i = MLE_i(r_point)`,
+/// VSHIFT ladder partials + per-slot product sumcheck transcripts
+/// (§12a), and finally the §12c multipoint-batch sumcheck plus a
+/// **single** batched FRI opening at the shared terminal point `r''`
+/// that closes every base- and ladder-claim together.
 #[derive(Debug, Clone)]
 pub struct StarkProof {
     pub log_rows: usize,
     pub column_commitments: Vec<FriCommitment>,
-    /// CRYPTO.md §12b batched base-column opening at `r`.
-    pub base_batch: BatchedEvalProof,
+    /// Per-column base openings `e_i = MLE_i(r_point)` at the
+    /// zero-check's own challenge point. Absorbed into the parent
+    /// transcript before the §12c multipoint-batch β is squeezed; no
+    /// FRI is attached at `r_point` — soundness comes from the single
+    /// multipoint FRI at `r''`.
+    pub base_openings: Vec<Block128>,
     /// Batched zero-check sumcheck: one `RoundPoly` per variable
     /// (`log_len` total), each a length-`(D+1)` vector of field
     /// evaluations.
@@ -77,18 +77,26 @@ pub struct StarkProof {
     /// pre-image of the ladder-batch sumcheck (CRYPTO.md §12a).
     pub shift_partials: Vec<Vec<Block128>>,
     /// Per shifted column: the degree-2 product sumcheck transcript
-    /// (`log_len` rounds, three field elements per round) that
-    /// batched-opens the base column at all ladder points via CRYPTO.md
-    /// §12a. Outer index matches `shift_partials`.
+    /// (`log_len` rounds, three field elements per round) that reduces
+    /// the `n+1` ladder partials to a single opening claim
+    /// `C(r'_slot)` (CRYPTO.md §12a). Outer index matches `shift_partials`.
     pub ladder_batch_rounds: Vec<Vec<RoundPoly>>,
-    /// Per shifted column: the single FRI evaluation proof of the base
-    /// column at the sumcheck's terminal challenge `r'`. Replaces the
-    /// `log_len + 1` per-ladder-point FRI openings from the 3b-0.3
-    /// protocol.
-    pub ladder_batch_proofs: Vec<EvalProof>,
-    /// Per shifted column: `C(r')`, the single MLE opening that the
-    /// FRI proof in `ladder_batch_proofs` attests to.
+    /// Per shifted column: the terminal ladder-sumcheck claim `C(r'_s)`.
+    /// This value is **not** closed by its own FRI opening; it enters
+    /// the §12c multipoint-batch sumcheck together with the base
+    /// claims, and a single batched FRI at the multipoint challenge
+    /// `r''` closes them all.
     pub ladder_batch_openings: Vec<Block128>,
+    /// CRYPTO.md §12c multipoint-batch sumcheck transcript. `log_len`
+    /// degree-2 round polynomials (3 field elements each) that reduce
+    /// the combined base+ladder multi-point claim to a single common
+    /// point `r''`.
+    pub multipoint_rounds: Vec<RoundPoly>,
+    /// Batched FRI opening of all base columns at the multipoint
+    /// challenge `r''`. Replaces the per-slot ladder FRI openings from
+    /// 3b-0.3 and the separate base opening at `r_point` from 3b-0.4a
+    /// combined — this single FRI now closes both.
+    pub multipoint_batch: BatchedEvalProof,
 }
 
 // ---------------------------------------------------------------------------
@@ -351,21 +359,24 @@ pub fn prove_air<A: Air>(
 
 /// Wall-clock breakdown of [`prove_air_timed`] for a single proof.
 ///
-/// Bucket layout parallels [`VerifyTimings`]:
-/// column commitments, transcript + zero-check sumcheck, base-column FRI
-/// openings at `r`, and VSHIFT ladder FRI openings. Bucket (4) is the
-/// Stage 3b-0.4 prover-side decision driver.
+/// Post-3b-0.4 bucket layout:
+/// * `commit` — column commitments.
+/// * `transcript_sumcheck` — parent transcript + zero-check sumcheck.
+/// * `ladder_sumcheck` — per-slot ladder product sumchecks (§12a).
+/// * `multipoint_fri` — §12c multipoint-batch sumcheck plus the single
+///   batched FRI opening at `r''`. This bucket replaces the old
+///   `base_fri` and `ladder_fri` buckets combined.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProveTimings {
     pub commit: std::time::Duration,
     pub transcript_sumcheck: std::time::Duration,
-    pub base_fri: std::time::Duration,
-    pub ladder_fri: std::time::Duration,
+    pub ladder_sumcheck: std::time::Duration,
+    pub multipoint_fri: std::time::Duration,
 }
 
 impl ProveTimings {
     pub fn total(&self) -> std::time::Duration {
-        self.commit + self.transcript_sumcheck + self.base_fri + self.ladder_fri
+        self.commit + self.transcript_sumcheck + self.ladder_sumcheck + self.multipoint_fri
     }
 }
 
@@ -460,132 +471,218 @@ pub fn prove_air_unchecked_timed<A: Air>(
 
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
-    // CRYPTO.md §12b: one batched FRI opening for all base columns
-    // at the shared zero-check point `r_point`. The batched-opening
-    // sub-protocol runs directly on the parent `channel`, which has
-    // already absorbed PI, column roots, and the zero-check sumcheck
-    // transcript at this point — exactly the prefix §12b.4 pins.
     let t2 = Instant::now();
-    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
-    let base_batch = prove_batched(&col_refs, &r_point, &ntt, &mut channel, &hasher);
-    t.base_fri = t2.elapsed();
+    let (
+        base_openings,
+        shift_partials,
+        ladder_batch_rounds,
+        ladder_batch_openings,
+        ladder_challenges,
+    ) = prove_base_and_ladder_claims(
+        &padded_columns,
+        &shifted_indices,
+        &r_point,
+        log_len,
+        &mut channel,
+    );
+    t.ladder_sumcheck = t2.elapsed();
 
     let t3 = Instant::now();
-    let (shift_partials, ladder_batch_rounds, ladder_batch_proofs, ladder_batch_openings) =
-        prove_ladder_batch(
-            &padded_columns,
-            &commitments,
-            &shifted_indices,
-            &r_point,
-            log_len,
-            &ntt,
-            pi,
-            &hasher,
-        );
-    t.ladder_fri = t3.elapsed();
+    let (multipoint_rounds, multipoint_batch) = prove_multipoint_close(
+        &padded_columns,
+        &base_openings,
+        &r_point,
+        &shifted_indices,
+        &ladder_batch_openings,
+        &ladder_challenges,
+        log_len,
+        &ntt,
+        &mut channel,
+        &hasher,
+    );
+    t.multipoint_fri = t3.elapsed();
 
     (
         StarkProof {
             log_rows,
             column_commitments: commitments,
-            base_batch,
+            base_openings,
             zero_check_rounds,
             shift_partials,
             ladder_batch_rounds,
-            ladder_batch_proofs,
             ladder_batch_openings,
+            multipoint_rounds,
+            multipoint_batch,
         },
         t,
     )
 }
 
-/// Shared prover routine for the Stage 3b-0.4 ladder batched-open.
-/// Returns, per shifted column (slot-ordered):
-/// - the VSHIFT ladder partials `v_k = C(P_k)` (shape: `n+1` each);
-/// - the product-sumcheck transcript (`log_len` rounds, 3 evals each);
-/// - a single FRI opening of `C` at `r'`;
-/// - the claimed `C(r')`.
-fn prove_ladder_batch(
+/// Stage 3b-0.4 prover — compute base per-column openings at
+/// `r_point`, the VSHIFT ladder partials, and run per-slot product
+/// sumchecks that collapse each ladder into a single claim
+/// `C(r'_s)`. All sumchecks run on the parent `channel`; the base
+/// openings and partials are absorbed in a deterministic order before
+/// each γ / round polynomial squeeze so the verifier can replay
+/// bit-for-bit.
+///
+/// Returns, in slot order:
+/// - base openings `e_i` (one per column);
+/// - ladder partials `v_k` (length `log_len + 1` per slot);
+/// - per-slot product-sumcheck round polynomials;
+/// - per-slot terminal openings `C(r'_s)`;
+/// - per-slot terminal challenge vectors (highest-var-first).
+fn prove_base_and_ladder_claims(
     padded_columns: &[Vec<Block128>],
-    commitments: &[FriCommitment],
     shifted_indices: &[usize],
     r_point: &[Block128],
     log_len: usize,
-    ntt: &AdditiveNTT<Block128>,
-    pi: &PublicInputs,
-    hasher: &Poseidon2bSponge,
+    channel: &mut Channel,
 ) -> (
+    Vec<Block128>,
     Vec<Vec<Block128>>,
     Vec<Vec<RoundPoly>>,
-    Vec<EvalProof>,
     Vec<Block128>,
+    Vec<Vec<Block128>>,
 ) {
     use rayon::prelude::*;
 
+    // Base openings e_i = MLE_i(r_point). Parallel across columns.
+    let base_openings: Vec<Block128> = padded_columns
+        .par_iter()
+        .map(|col| mle_eval(col, r_point))
+        .collect();
+    channel.observe_field_elems(&base_openings);
+
     let ladder = ladder_points(r_point);
 
-    // Per-slot work: (1) compute ladder partials, (2) seed the ladder
-    // sub-channel from (PI, roots, col_id, LADDERFS|slot, partials),
-    // (3) run the product sumcheck, (4) open C at r'.
-    let per_slot: Vec<(Vec<Block128>, Vec<RoundPoly>, EvalProof, Block128)> = shifted_indices
+    // Ladder partials per slot — parallel.
+    let partials_per_slot: Vec<Vec<Block128>> = shifted_indices
         .par_iter()
-        .enumerate()
-        .map(|(slot, &col_id)| {
+        .map(|&col_id| {
             let col = &padded_columns[col_id];
-
-            // (1) Ladder partials.
-            let partials: Vec<Block128> =
-                ladder.par_iter().map(|p| mle_eval(col, p)).collect();
-
-            // (2) Seed the ladder sub-channel. Distinct tag from the
-            //     base opening (§VSHIFT used 0xFFFF_…; §12a uses
-            //     0xFFFE_…). `col_id` goes in so shifted columns
-            //     don't collide across slots with the same log_len.
-            let mut col_ch = Channel::new();
-            absorb_public_inputs(&mut col_ch, pi);
-            for c in commitments {
-                col_ch.observe_fri_commitment(c);
-            }
-            col_ch.observe_field_elem(Block128::from(col_id as u128));
-            col_ch.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
-            col_ch.observe_field_elems(&partials);
-
-            let gamma = col_ch.get_random_point();
-            let target = crate::ladder_batch::target_claim(gamma, &partials);
-            let w = crate::ladder_batch::build_weight_table(gamma, &ladder, log_len);
-
-            // (3) Product sumcheck over C·W.
-            let (rounds, challenges) =
-                crate::ladder_batch::prove_product_sumcheck(col.clone(), w, target, &mut col_ch);
-
-            // (4) Single FRI opening of C at r'. 3b-0.5.1 contract:
-            // the caller binds the commitment into the sub-channel
-            // before calling `prove`.
-            let r_prime: Vec<Block128> = challenges.iter().rev().cloned().collect();
-            let opening = mle_eval(col, &r_prime);
-            col_ch.observe_fri_commitment(&commitments[col_id]);
-            let proof = prove(col, &r_prime, ntt, &mut col_ch, hasher);
-
-            (partials, rounds, proof, opening)
+            ladder.par_iter().map(|p| mle_eval(col, p)).collect()
         })
         .collect();
 
-    let mut shift_partials = Vec::with_capacity(per_slot.len());
-    let mut ladder_batch_rounds = Vec::with_capacity(per_slot.len());
-    let mut ladder_batch_proofs = Vec::with_capacity(per_slot.len());
-    let mut ladder_batch_openings = Vec::with_capacity(per_slot.len());
-    for (p, rds, pr, op) in per_slot {
-        shift_partials.push(p);
-        ladder_batch_rounds.push(rds);
-        ladder_batch_proofs.push(pr);
-        ladder_batch_openings.push(op);
+    let mut ladder_batch_rounds: Vec<Vec<RoundPoly>> =
+        Vec::with_capacity(shifted_indices.len());
+    let mut ladder_batch_openings: Vec<Block128> = Vec::with_capacity(shifted_indices.len());
+    let mut ladder_challenges: Vec<Vec<Block128>> = Vec::with_capacity(shifted_indices.len());
+
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        let partials = &partials_per_slot[slot];
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+        let gamma = channel.get_random_point();
+        let target = crate::ladder_batch::target_claim(gamma, partials);
+        let w = crate::ladder_batch::build_weight_table(gamma, &ladder, log_len);
+        let col = padded_columns[col_id].clone();
+        let (rounds, challenges) =
+            crate::ladder_batch::prove_product_sumcheck(col, w, target, channel);
+        let r_prime: Vec<Block128> = challenges.iter().rev().cloned().collect();
+        let opening = mle_eval(&padded_columns[col_id], &r_prime);
+        // Absorb terminal opening so the §12c β below cannot be
+        // re-used against a different terminal claim.
+        channel.observe_field_elem(opening);
+        ladder_batch_rounds.push(rounds);
+        ladder_batch_openings.push(opening);
+        ladder_challenges.push(challenges);
     }
+
     (
-        shift_partials,
+        base_openings,
+        partials_per_slot,
         ladder_batch_rounds,
-        ladder_batch_proofs,
         ladder_batch_openings,
+        ladder_challenges,
     )
+}
+
+/// Stage 3b-0.4 §12c prover — multipoint-to-single-point reduction.
+///
+/// Collects every `(point, column_id, scalar)` claim (one per base
+/// column at `r_point`, one per ladder slot at `r'_s`), squeezes β,
+/// builds the degree-2 product sumcheck on
+/// `H(x) = Σ_k λ_k · eq(point_k, x) · MLE_{col_k}(x)`, and closes the
+/// terminal claim via a single batched FRI opening of all base
+/// columns at the sumcheck's final challenge `r''`.
+#[allow(clippy::too_many_arguments)]
+fn prove_multipoint_close(
+    padded_columns: &[Vec<Block128>],
+    base_openings: &[Block128],
+    r_point: &[Block128],
+    shifted_indices: &[usize],
+    ladder_batch_openings: &[Block128],
+    ladder_challenges: &[Vec<Block128>],
+    log_len: usize,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &Poseidon2bSponge,
+) -> (Vec<RoundPoly>, BatchedEvalProof) {
+    use noid_core::mle::eq::eq_ind_partial_eval;
+    use rayon::prelude::*;
+
+    let n = padded_columns.len();
+    let s_count = shifted_indices.len();
+
+    // Squeeze β after absorbing domain tag. Horner weights λ_k = β^k.
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(n + s_count);
+    let mut cur = Block128::ONE;
+    for _ in 0..(n + s_count) {
+        lambdas.push(cur);
+        cur = cur * beta;
+    }
+
+    // Claims:
+    //   base k ∈ [0, n):    point = r_point,       col_id = k
+    //   ladder k ∈ [n, n+s): point = r'_slot (rev), col_id = shifted_indices[slot]
+    let mut points: Vec<Vec<Block128>> = Vec::with_capacity(n + s_count);
+    let mut col_ids: Vec<usize> = Vec::with_capacity(n + s_count);
+    let mut openings: Vec<Block128> = Vec::with_capacity(n + s_count);
+    for i in 0..n {
+        points.push(r_point.to_vec());
+        col_ids.push(i);
+        openings.push(base_openings[i]);
+    }
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        let r_prime: Vec<Block128> = ladder_challenges[slot].iter().rev().cloned().collect();
+        points.push(r_prime);
+        col_ids.push(col_id);
+        openings.push(ladder_batch_openings[slot]);
+    }
+
+    // Target T = Σ λ_k · opening_k.
+    let mut target = Block128::ZERO;
+    for (l, o) in lambdas.iter().zip(openings.iter()) {
+        target += *l * *o;
+    }
+
+    // Build (A_k, B_k) pairs: A_k = λ_k · eq(point_k, ·), B_k = MLE_{col_id_k}.
+    // eq-tables scale cheaply; we fold λ_k into A_k so B_k stays the raw column.
+    let pairs: Vec<(Vec<Block128>, Vec<Block128>)> = (0..(n + s_count))
+        .into_par_iter()
+        .map(|k| {
+            let mut eq_table = eq_ind_partial_eval(&points[k]);
+            let lam = lambdas[k];
+            for v in eq_table.iter_mut() {
+                *v = *v * lam;
+            }
+            (eq_table, padded_columns[col_ids[k]].clone())
+        })
+        .collect();
+
+    let (rounds, challenges) =
+        crate::multipoint_batch::prove_multipoint_sumcheck(pairs, target, channel);
+    let r_pp: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    debug_assert_eq!(r_pp.len(), log_len);
+
+    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
+    let batch = prove_batched(&col_refs, &r_pp, ntt, channel, hasher);
+
+    (rounds, batch)
 }
 
 /// Prover variant that skips the native AIR self-check. Exposed for
@@ -679,47 +776,50 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
     );
 
     // --- Column openings at the sumcheck's final challenge point ---
-    // The sumcheck folds the highest variable first, so
-    // `challenges[k]` binds `x_{n-1-k}`. For FRI / MLE-eval calls that
-    // treat `point[i]` as `x_i`, we reverse the challenge vector.
-    //
-    // CRYPTO.md §12b: single RLC-batched FRI opening instead of
-    // `n_cols` independent ones. The batched-opening sub-protocol
-    // runs on the parent `channel` in the transcript order pinned by
-    // §12b.4.
+    // Sumcheck folds the highest variable first, so `challenges[k]`
+    // binds `x_{n-1-k}`. Reverse for MLE-eval / FRI-eval consumption.
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
-    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
-    let base_batch = prove_batched(&col_refs, &r_point, &ntt, &mut channel, &hasher);
 
-    // --- VSHIFT ladder batched-open (CRYPTO.md §12a) ---
-    //
-    // For each shifted column we ship the `log_len + 1` ladder partials
-    // `v_k = C(P_k)` (used by the verifier to reconstruct `C'(r)`) plus
-    // a short degree-2 product sumcheck that ties those partials to the
-    // committed `C`, reducing to a single FRI opening at a fresh random
-    // point `r'`. See `prove_ladder_batch` for the exact transcript
-    // order.
-    let (shift_partials, ladder_batch_rounds, ladder_batch_proofs, ladder_batch_openings) =
-        prove_ladder_batch(
-            &padded_columns,
-            &commitments,
-            &shifted_indices,
-            &r_point,
-            log_len,
-            &ntt,
-            pi,
-            &hasher,
-        );
+    // Base openings + VSHIFT ladder sumchecks (§12a).
+    let (
+        base_openings,
+        shift_partials,
+        ladder_batch_rounds,
+        ladder_batch_openings,
+        ladder_challenges,
+    ) = prove_base_and_ladder_claims(
+        &padded_columns,
+        &shifted_indices,
+        &r_point,
+        log_len,
+        &mut channel,
+    );
+
+    // §12c multipoint consolidation — one batched FRI closes both the
+    // base claims at `r_point` and every ladder claim at `r'_slot`.
+    let (multipoint_rounds, multipoint_batch) = prove_multipoint_close(
+        &padded_columns,
+        &base_openings,
+        &r_point,
+        &shifted_indices,
+        &ladder_batch_openings,
+        &ladder_challenges,
+        log_len,
+        &ntt,
+        &mut channel,
+        &hasher,
+    );
 
     StarkProof {
         log_rows,
         column_commitments: commitments,
-        base_batch,
+        base_openings,
         zero_check_rounds,
         shift_partials,
         ladder_batch_rounds,
-        ladder_batch_proofs,
         ladder_batch_openings,
+        multipoint_rounds,
+        multipoint_batch,
     }
 }
 
@@ -744,7 +844,8 @@ pub fn verify_air<A: Air>(
         return Err(VerifyError::ShapeMismatch);
     }
     if proof.column_commitments.len() != air.n_columns()
-        || proof.base_batch.column_openings.len() != air.n_columns()
+        || proof.base_openings.len() != air.n_columns()
+        || proof.multipoint_batch.column_openings.len() != air.n_columns()
     {
         return Err(VerifyError::ShapeMismatch);
     }
@@ -802,7 +903,6 @@ pub fn verify_air<A: Air>(
     let shifted_indices: Vec<usize> = air.shifted_column_indices();
     if proof.shift_partials.len() != shifted_indices.len()
         || proof.ladder_batch_rounds.len() != shifted_indices.len()
-        || proof.ladder_batch_proofs.len() != shifted_indices.len()
         || proof.ladder_batch_openings.len() != shifted_indices.len()
     {
         return Err(VerifyError::ShapeMismatch);
@@ -823,6 +923,14 @@ pub fn verify_air<A: Air>(
             }
         }
     }
+    if proof.multipoint_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    for rp in &proof.multipoint_rounds {
+        if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
     let mut shifted_slot: Vec<Option<usize>> = vec![None; air.n_columns()];
     for (slot, &col_id) in shifted_indices.iter().enumerate() {
         shifted_slot[col_id] = Some(slot);
@@ -836,7 +944,7 @@ pub fn verify_air<A: Air>(
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
 
-    let column_openings = &proof.base_batch.column_openings;
+    let column_openings = &proof.base_openings;
     let mut composition = Block128::ZERO;
     let mut local_scratch: Vec<Block128> = Vec::new();
     let mut next_scratch: Vec<Block128> = Vec::new();
@@ -860,76 +968,114 @@ pub fn verify_air<A: Air>(
         return Err(VerifyError::ConstraintViolated);
     }
 
-    // --- Verify the CRYPTO.md §12b batched base-column opening ---
-    //
-    // The batched sub-protocol runs on the parent `channel`, which the
-    // verifier has already driven up to the same prefix the prover
-    // did (PI + roots + zero-check). `verify_batched` re-derives α
-    // from that prefix and runs one FRI-verify against the batched
-    // commitment, which recursively binds every per-column opening
-    // through the batched claim `Σ λ_i · e_i`.
-    verify_batched(
-        &proof.column_commitments,
+    // --- Replay §12a ladder sumchecks + §12c multipoint close ---
+    verify_multipoint_close(
+        proof,
         &r_point,
-        &proof.base_batch,
+        &shifted_indices,
+        log_len,
         &ntt,
         &mut channel,
         &hasher,
     )
-    .map_err(VerifyError::FriFailed)?;
+}
 
-    // --- Verify VSHIFT ladder batched-open (CRYPTO.md §12a) ---
-    //
-    // Per shifted column: replay the ladder sub-channel (PI, roots,
-    // col_id, LADDERFS|slot, partials → γ), run the degree-2 product
-    // sumcheck, verify that the terminal claim equals
-    // `C(r') · W(r')`, and then verify the single FRI opening of `C`
-    // at `r'` threaded through the same sub-channel.
-    {
-        use rayon::prelude::*;
-        let ladder = ladder_points(&r_point);
-        let results: Vec<Result<(), VerifyError>> = shifted_indices
-            .par_iter()
-            .enumerate()
-            .map(|(slot, &col_id)| {
-                let partials = &proof.shift_partials[slot];
-                let rounds = &proof.ladder_batch_rounds[slot];
+/// Verifier-side replay of the §12a ladder sumchecks and the §12c
+/// multipoint consolidation. Absorbs per-slot partials on the parent
+/// `channel`, re-derives γ_s and the multipoint β, runs the degree-2
+/// sumcheck replay, and finishes with a single `verify_batched` at
+/// `r''` that closes every base and ladder claim in one FRI opening.
+fn verify_multipoint_close(
+    proof: &StarkProof,
+    r_point: &[Block128],
+    shifted_indices: &[usize],
+    log_len: usize,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &Poseidon2bSponge,
+) -> Result<(), VerifyError> {
+    channel.observe_field_elems(&proof.base_openings);
 
-                let mut col_ch = Channel::new();
-                absorb_public_inputs(&mut col_ch, pi);
-                for c in &proof.column_commitments {
-                    col_ch.observe_fri_commitment(c);
-                }
-                col_ch.observe_field_elem(Block128::from(col_id as u128));
-                col_ch.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
-                col_ch.observe_field_elems(partials);
-
-                let gamma = col_ch.get_random_point();
-                let target = crate::ladder_batch::target_claim(gamma, partials);
-                let (challenges, final_claim) =
-                    crate::ladder_batch::verify_product_sumcheck(rounds, target, &mut col_ch)?;
-                let r_prime: Vec<Block128> = challenges.iter().rev().cloned().collect();
-                let c_r = proof.ladder_batch_openings[slot];
-                let w_r = crate::ladder_batch::weight_at(gamma, &ladder, &r_prime);
-                if c_r * w_r != final_claim {
-                    return Err(VerifyError::ConstraintViolated);
-                }
-                col_ch.observe_fri_commitment(&proof.column_commitments[col_id]);
-                fri_verify(
-                    &r_prime,
-                    c_r,
-                    proof.ladder_batch_proofs[slot].clone(),
-                    &ntt,
-                    &mut col_ch,
-                    &hasher,
-                )
-                .map_err(VerifyError::FriFailed)
-            })
-            .collect();
-        for r in results {
-            r?;
+    let ladder = ladder_points(r_point);
+    let mut ladder_r_primes: Vec<Vec<Block128>> = Vec::with_capacity(shifted_indices.len());
+    for (slot, _col_id) in shifted_indices.iter().enumerate() {
+        let partials = &proof.shift_partials[slot];
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+        let gamma = channel.get_random_point();
+        let target = crate::ladder_batch::target_claim(gamma, partials);
+        let (challenges, final_claim) = crate::ladder_batch::verify_product_sumcheck(
+            &proof.ladder_batch_rounds[slot],
+            target,
+            channel,
+        )?;
+        let r_prime: Vec<Block128> = challenges.iter().rev().cloned().collect();
+        let c_r = proof.ladder_batch_openings[slot];
+        let w_r = crate::ladder_batch::weight_at(gamma, &ladder, &r_prime);
+        if c_r * w_r != final_claim {
+            return Err(VerifyError::ConstraintViolated);
         }
+        channel.observe_field_elem(c_r);
+        ladder_r_primes.push(r_prime);
     }
+
+    // §12c: absorb tag, squeeze β, compute λ_k.
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let n = proof.base_openings.len();
+    let s_count = shifted_indices.len();
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(n + s_count);
+    let mut cur = Block128::ONE;
+    for _ in 0..(n + s_count) {
+        lambdas.push(cur);
+        cur = cur * beta;
+    }
+    let mut target = Block128::ZERO;
+    for (k, &lam) in lambdas.iter().enumerate() {
+        let op = if k < n {
+            proof.base_openings[k]
+        } else {
+            proof.ladder_batch_openings[k - n]
+        };
+        target += lam * op;
+    }
+
+    let (challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck(
+        &proof.multipoint_rounds,
+        target,
+        channel,
+    )?;
+    let r_pp: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    if r_pp.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    // Reconstruct terminal claim from multipoint_batch.column_openings
+    // m_i at r''. All base claims share the same point `r_point`, so
+    // `eq(r_point, r'')` is computed once.
+    let m = &proof.multipoint_batch.column_openings;
+    let eq_base = noid_core::mle::eq::eq_ind(r_point, &r_pp);
+    let mut expected = Block128::ZERO;
+    for k in 0..n {
+        expected += lambdas[k] * eq_base * m[k];
+    }
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        let eq_l = noid_core::mle::eq::eq_ind(&ladder_r_primes[slot], &r_pp);
+        expected += lambdas[n + slot] * eq_l * m[col_id];
+    }
+    if expected != final_claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    verify_batched(
+        &proof.column_commitments,
+        &r_pp,
+        &proof.multipoint_batch,
+        ntt,
+        channel,
+        hasher,
+    )
+    .map_err(VerifyError::FriFailed)?;
 
     Ok(())
 }
@@ -940,21 +1086,23 @@ pub fn verify_air<A: Air>(
 
 /// Wall-clock breakdown of `verify_air_timed` for a single proof.
 ///
-/// Matches the four buckets from `ROADMAP.md` §Stage 3b-0.3:
-/// transcript + sumcheck, composition reconstruction, base-column FRI
-/// openings, ladder FRI openings. Bucket (3) is the 3b-0.4 decision
-/// driver and is reported separately.
+/// Post-3b-0.4 bucket layout:
+/// * `transcript_sumcheck` — parent transcript + zero-check replay.
+/// * `composition` — zero-check terminal equation.
+/// * `ladder_sumcheck` — per-slot §12a ladder sumcheck replays.
+/// * `multipoint_fri` — §12c multipoint sumcheck replay + single batched
+///   FRI verify at `r''`. Replaces the old `base_fri` + `ladder_fri`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VerifyTimings {
     pub transcript_sumcheck: std::time::Duration,
     pub composition: std::time::Duration,
-    pub base_fri: std::time::Duration,
-    pub ladder_fri: std::time::Duration,
+    pub ladder_sumcheck: std::time::Duration,
+    pub multipoint_fri: std::time::Duration,
 }
 
 impl VerifyTimings {
     pub fn total(&self) -> std::time::Duration {
-        self.transcript_sumcheck + self.composition + self.base_fri + self.ladder_fri
+        self.transcript_sumcheck + self.composition + self.ladder_sumcheck + self.multipoint_fri
     }
 }
 
@@ -974,7 +1122,8 @@ pub fn verify_air_timed<A: Air>(
         return (Err(VerifyError::ShapeMismatch), t);
     }
     if proof.column_commitments.len() != air.n_columns()
-        || proof.base_batch.column_openings.len() != air.n_columns()
+        || proof.base_openings.len() != air.n_columns()
+        || proof.multipoint_batch.column_openings.len() != air.n_columns()
     {
         return (Err(VerifyError::ShapeMismatch), t);
     }
@@ -1022,7 +1171,6 @@ pub fn verify_air_timed<A: Air>(
     let shifted_indices: Vec<usize> = air.shifted_column_indices();
     if proof.shift_partials.len() != shifted_indices.len()
         || proof.ladder_batch_rounds.len() != shifted_indices.len()
-        || proof.ladder_batch_proofs.len() != shifted_indices.len()
         || proof.ladder_batch_openings.len() != shifted_indices.len()
     {
         return (Err(VerifyError::ShapeMismatch), t);
@@ -1043,6 +1191,14 @@ pub fn verify_air_timed<A: Air>(
             }
         }
     }
+    if proof.multipoint_rounds.len() != log_len {
+        return (Err(VerifyError::ShapeMismatch), t);
+    }
+    for rp in &proof.multipoint_rounds {
+        if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            return (Err(VerifyError::ShapeMismatch), t);
+        }
+    }
     let mut shifted_slot: Vec<Option<usize>> = vec![None; air.n_columns()];
     for (slot, &col_id) in shifted_indices.iter().enumerate() {
         shifted_slot[col_id] = Some(slot);
@@ -1052,7 +1208,7 @@ pub fn verify_air_timed<A: Air>(
         .iter()
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
-    let column_openings = &proof.base_batch.column_openings;
+    let column_openings = &proof.base_openings;
     let mut composition = Block128::ZERO;
     let mut local_scratch: Vec<Block128> = Vec::new();
     let mut next_scratch: Vec<Block128> = Vec::new();
@@ -1084,71 +1240,101 @@ pub fn verify_air_timed<A: Air>(
     }
     t.composition = t1.elapsed();
 
-    // --- CRYPTO.md §12b batched base-column opening ---
+    // --- §12a ladder sumcheck replays (serial, on parent channel) ---
     let t2 = Instant::now();
+    channel.observe_field_elems(&proof.base_openings);
+    let ladder = ladder_points(&r_point);
+    let mut ladder_r_primes: Vec<Vec<Block128>> = Vec::with_capacity(shifted_indices.len());
+    for slot in 0..shifted_indices.len() {
+        let partials = &proof.shift_partials[slot];
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+        let gamma = channel.get_random_point();
+        let target = crate::ladder_batch::target_claim(gamma, partials);
+        let (ch_s, final_claim) = match crate::ladder_batch::verify_product_sumcheck(
+            &proof.ladder_batch_rounds[slot],
+            target,
+            &mut channel,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                t.ladder_sumcheck = t2.elapsed();
+                return (Err(e), t);
+            }
+        };
+        let r_prime: Vec<Block128> = ch_s.iter().rev().cloned().collect();
+        let c_r = proof.ladder_batch_openings[slot];
+        let w_r = crate::ladder_batch::weight_at(gamma, &ladder, &r_prime);
+        if c_r * w_r != final_claim {
+            t.ladder_sumcheck = t2.elapsed();
+            return (Err(VerifyError::ConstraintViolated), t);
+        }
+        channel.observe_field_elem(c_r);
+        ladder_r_primes.push(r_prime);
+    }
+    t.ladder_sumcheck = t2.elapsed();
+
+    // --- §12c multipoint sumcheck replay + batched FRI at r'' ---
+    let t3 = Instant::now();
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let n = proof.base_openings.len();
+    let s_count = shifted_indices.len();
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(n + s_count);
+    {
+        let mut cur = Block128::ONE;
+        for _ in 0..(n + s_count) {
+            lambdas.push(cur);
+            cur = cur * beta;
+        }
+    }
+    let mut mp_target = Block128::ZERO;
+    for (k, &lam) in lambdas.iter().enumerate() {
+        let op = if k < n {
+            proof.base_openings[k]
+        } else {
+            proof.ladder_batch_openings[k - n]
+        };
+        mp_target += lam * op;
+    }
+    let (mp_challenges, mp_final) = match crate::multipoint_batch::verify_multipoint_sumcheck(
+        &proof.multipoint_rounds,
+        mp_target,
+        &mut channel,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            t.multipoint_fri = t3.elapsed();
+            return (Err(e), t);
+        }
+    };
+    let r_pp: Vec<Block128> = mp_challenges.iter().rev().cloned().collect();
+    let m = &proof.multipoint_batch.column_openings;
+    let eq_base = noid_core::mle::eq::eq_ind(&r_point, &r_pp);
+    let mut expected = Block128::ZERO;
+    for k in 0..n {
+        expected += lambdas[k] * eq_base * m[k];
+    }
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        let eq_l = noid_core::mle::eq::eq_ind(&ladder_r_primes[slot], &r_pp);
+        expected += lambdas[n + slot] * eq_l * m[col_id];
+    }
+    if expected != mp_final {
+        t.multipoint_fri = t3.elapsed();
+        return (Err(VerifyError::ConstraintViolated), t);
+    }
     if let Err(e) = verify_batched(
         &proof.column_commitments,
-        &r_point,
-        &proof.base_batch,
+        &r_pp,
+        &proof.multipoint_batch,
         &ntt,
         &mut channel,
         &hasher,
     ) {
-        t.base_fri = t2.elapsed();
+        t.multipoint_fri = t3.elapsed();
         return (Err(VerifyError::FriFailed(e)), t);
     }
-    t.base_fri = t2.elapsed();
-
-    let t3 = Instant::now();
-    {
-        use rayon::prelude::*;
-        let ladder = ladder_points(&r_point);
-        let results: Vec<Result<(), VerifyError>> = shifted_indices
-            .par_iter()
-            .enumerate()
-            .map(|(slot, &col_id)| {
-                let partials = &proof.shift_partials[slot];
-                let rounds = &proof.ladder_batch_rounds[slot];
-
-                let mut col_ch = Channel::new();
-                absorb_public_inputs(&mut col_ch, pi);
-                for c in &proof.column_commitments {
-                    col_ch.observe_fri_commitment(c);
-                }
-                col_ch.observe_field_elem(Block128::from(col_id as u128));
-                col_ch.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
-                col_ch.observe_field_elems(partials);
-
-                let gamma = col_ch.get_random_point();
-                let target = crate::ladder_batch::target_claim(gamma, partials);
-                let (challenges, final_claim) =
-                    crate::ladder_batch::verify_product_sumcheck(rounds, target, &mut col_ch)?;
-                let r_prime: Vec<Block128> = challenges.iter().rev().cloned().collect();
-                let c_r = proof.ladder_batch_openings[slot];
-                let w_r = crate::ladder_batch::weight_at(gamma, &ladder, &r_prime);
-                if c_r * w_r != final_claim {
-                    return Err(VerifyError::ConstraintViolated);
-                }
-                col_ch.observe_fri_commitment(&proof.column_commitments[col_id]);
-                fri_verify(
-                    &r_prime,
-                    c_r,
-                    proof.ladder_batch_proofs[slot].clone(),
-                    &ntt,
-                    &mut col_ch,
-                    &hasher,
-                )
-                .map_err(VerifyError::FriFailed)
-            })
-            .collect();
-        for r in results {
-            if let Err(e) = r {
-                t.ladder_fri = t3.elapsed();
-                return (Err(e), t);
-            }
-        }
-    }
-    t.ladder_fri = t3.elapsed();
+    t.multipoint_fri = t3.elapsed();
 
     (Ok(()), t)
 }
@@ -1461,7 +1647,7 @@ mod tests {
         let trace = TxValidityAir::build_trace(&mk_body());
         let pi = mk_pi();
         let mut proof = prove_air(&air, &trace, &pi).expect("prove");
-        proof.base_batch.column_openings[0] += Block128::ONE;
+        proof.base_openings[0] += Block128::ONE;
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
 

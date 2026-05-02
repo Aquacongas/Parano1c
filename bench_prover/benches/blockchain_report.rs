@@ -111,17 +111,25 @@ fn stark_proof_size(proof: &StarkProof) -> usize {
     for _c in &proof.column_commitments {
         n += 32 + 8 + 8; // root + depth + packing_factor
     }
-    n += proof.base_batch.column_openings.len() * 16;
-    // CRYPTO.md §12b: one batched base-column FRI proof replaces the
-    // per-column `column_proofs` block from 3b-0.4. Size is estimated
-    // the same way: per-round oracle roots, query symbol pairs, Merkle
-    // path bytes, and the final codeword. We fall back to the struct
-    // size-of hint to stay consistent with the previous accounting.
-    n += std::mem::size_of_val(&proof.base_batch.batch_proof);
-    n += 32 + 8 + 8; // base_batch commitment: root + depth + packing_factor
+    n += proof.base_openings.len() * 16;
+    n += proof.multipoint_batch.column_openings.len() * 16;
+    n += std::mem::size_of_val(&proof.multipoint_batch.batch_proof);
+    n += 32 + 8 + 8; // multipoint batch commitment metadata
     for rp in &proof.zero_check_rounds {
         n += rp.len() * 16;
     }
+    for rp in &proof.multipoint_rounds {
+        n += rp.len() * 16;
+    }
+    for slot in &proof.ladder_batch_rounds {
+        for rp in slot {
+            n += rp.len() * 16;
+        }
+    }
+    for partials in &proof.shift_partials {
+        n += partials.len() * 16;
+    }
+    n += proof.ladder_batch_openings.len() * 16;
     n
 }
 

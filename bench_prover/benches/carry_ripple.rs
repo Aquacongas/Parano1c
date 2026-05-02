@@ -124,21 +124,16 @@ fn estimate_stark_proof_bytes(
 ) -> (usize, usize, usize) {
     let per_opening = fri_opening_bytes(log_len);
     let column_roots = n_cols * 32;
-    let column_openings = n_cols * 16;
+    // Base openings at r_point and multipoint openings at r''.
+    let base_openings = n_cols * 16;
+    let multipoint_openings = n_cols * 16;
     let sumcheck = proof
         .zero_check_rounds
         .iter()
         .map(|r| r.len() * 16)
         .sum::<usize>();
     let shift_partials = n_shifted * (log_len + 1) * 16;
-    // CRYPTO.md §12b: one batched base-column FRI opening instead of
-    // `n_cols` independent ones. The base-block cost in bytes is a
-    // single `per_opening` plus the extra 32 B Merkle root for the
-    // batched commitment.
-    let base_fri = per_opening + 32;
-    // Stage 3b-0.4: per shifted column the ladder block is now
-    //   log_len degree-2 round polys (3 field elems each) +
-    //   1 terminal opening (16 B) + 1 FRI proof at r'.
+    // Ladder sumchecks (no per-slot FRI anymore).
     let ladder_batch_rounds = proof
         .ladder_batch_rounds
         .iter()
@@ -146,10 +141,22 @@ fn estimate_stark_proof_bytes(
         .map(|r| r.len() * 16)
         .sum::<usize>();
     let ladder_openings = n_shifted * 16;
-    let ladder_fri = n_shifted * per_opening + ladder_batch_rounds + ladder_openings;
-    let total =
-        column_roots + column_openings + sumcheck + shift_partials + base_fri + ladder_fri;
-    (total, base_fri, ladder_fri)
+    let ladder_block = ladder_batch_rounds + ladder_openings;
+    // §12c multipoint-batch sumcheck (log_len degree-2 rounds) plus
+    // the single batched FRI opening at r''.
+    let multipoint_rounds = proof
+        .multipoint_rounds
+        .iter()
+        .map(|r| r.len() * 16)
+        .sum::<usize>();
+    let multipoint_fri = per_opening + 32 + multipoint_rounds + multipoint_openings;
+    let total = column_roots
+        + base_openings
+        + sumcheck
+        + shift_partials
+        + ladder_block
+        + multipoint_fri;
+    (total, multipoint_fri, ladder_block)
 }
 
 struct Row {
@@ -160,8 +167,8 @@ struct Row {
     prove_buckets: ProveTimings,
     verify: VerifyTimings,
     proof_bytes: usize,
-    base_fri_bytes: usize,
-    ladder_fri_bytes: usize,
+    multipoint_fri_bytes: usize,
+    ladder_block_bytes: usize,
 }
 
 fn bench_config(label: &'static str, log_rows: usize) -> Row {
@@ -203,7 +210,7 @@ fn bench_config(label: &'static str, log_rows: usize) -> Row {
     let log_len = padded_log_len(log_rows);
     let n_cols = air.n_columns();
     let n_shifted = air.shifted_column_indices().len();
-    let (proof_bytes, base_fri_bytes, ladder_fri_bytes) =
+    let (proof_bytes, multipoint_fri_bytes, ladder_block_bytes) =
         estimate_stark_proof_bytes(&proof, log_len, n_cols, n_shifted);
 
     Row {
@@ -214,8 +221,8 @@ fn bench_config(label: &'static str, log_rows: usize) -> Row {
         prove_buckets,
         verify,
         proof_bytes,
-        base_fri_bytes,
-        ladder_fri_bytes,
+        multipoint_fri_bytes,
+        ladder_block_bytes,
     }
 }
 
@@ -229,13 +236,13 @@ fn percent(part: Duration, whole: Duration) -> f64 {
 
 fn emit_report(rows: &[Row]) -> String {
     let mut s = String::new();
-    s.push_str("# CarryRippleAir benchmark (Stage 3b-0.3)\n\n");
+    s.push_str("# CarryRippleAir benchmark (Stage 3b-0.4)\n\n");
     s.push_str("AIR: 64-bit ripple-carry adder, 5 columns (a, b, sum, carry, is_reset), ");
     s.push_str("single rotation read on `carry` (`shifted_columns = [3]`).\n\n");
-    s.push_str("Proof-size column is an estimate built from the FRI opening size at ");
-    s.push_str("`log_len + LOG_RATE` (same formula as `release_report`) plus the sumcheck ");
-    s.push_str("transcript and VSHIFT ladder partials. `ladder_fri` is the 3b-0.4 ");
-    s.push_str("decision driver.\n\n");
+    s.push_str("Post-3b-0.4: `multipoint_fri` is the single batched FRI opening at `r''` ");
+    s.push_str("that closes both the base claims at `r_point` and every ladder claim at ");
+    s.push_str("`r'_s` (CRYPTO.md §12c). `ladder_block` is the per-slot §12a partials + ");
+    s.push_str("product sumcheck transcript — no per-slot FRI anymore.\n\n");
 
     s.push_str("## Summary\n\n");
     s.push_str("| label | log_rows | adders | prove | verify (total) | proof size |\n");
@@ -254,10 +261,10 @@ fn emit_report(rows: &[Row]) -> String {
 
     s.push_str("\n## Prover time buckets\n\n");
     s.push_str(
-        "| label | commit | transcript+sumcheck | base FRI open | ladder FRI open | total |\n",
+        "| label | commit | transcript+sumcheck | ladder sumcheck | multipoint+FRI | total |\n",
     );
     s.push_str(
-        "|-------|--------|---------------------|---------------|-----------------|-------|\n",
+        "|-------|--------|---------------------|-----------------|----------------|-------|\n",
     );
     for r in rows {
         let total = r.prove_buckets.total();
@@ -268,20 +275,20 @@ fn emit_report(rows: &[Row]) -> String {
             percent(r.prove_buckets.commit, total),
             fmt_ms(r.prove_buckets.transcript_sumcheck),
             percent(r.prove_buckets.transcript_sumcheck, total),
-            fmt_ms(r.prove_buckets.base_fri),
-            percent(r.prove_buckets.base_fri, total),
-            fmt_ms(r.prove_buckets.ladder_fri),
-            percent(r.prove_buckets.ladder_fri, total),
+            fmt_ms(r.prove_buckets.ladder_sumcheck),
+            percent(r.prove_buckets.ladder_sumcheck, total),
+            fmt_ms(r.prove_buckets.multipoint_fri),
+            percent(r.prove_buckets.multipoint_fri, total),
             fmt_ms(total),
         ));
     }
 
     s.push_str("\n## Verifier time buckets\n\n");
     s.push_str(
-        "| label | transcript+sumcheck | composition | base FRI | ladder FRI | total |\n",
+        "| label | transcript+sumcheck | composition | ladder sumcheck | multipoint+FRI | total |\n",
     );
     s.push_str(
-        "|-------|---------------------|-------------|----------|------------|-------|\n",
+        "|-------|---------------------|-------------|-----------------|----------------|-------|\n",
     );
     for r in rows {
         let total = r.verify.total();
@@ -292,57 +299,30 @@ fn emit_report(rows: &[Row]) -> String {
             percent(r.verify.transcript_sumcheck, total),
             fmt_ms(r.verify.composition),
             percent(r.verify.composition, total),
-            fmt_ms(r.verify.base_fri),
-            percent(r.verify.base_fri, total),
-            fmt_ms(r.verify.ladder_fri),
-            percent(r.verify.ladder_fri, total),
+            fmt_ms(r.verify.ladder_sumcheck),
+            percent(r.verify.ladder_sumcheck, total),
+            fmt_ms(r.verify.multipoint_fri),
+            percent(r.verify.multipoint_fri, total),
             fmt_ms(total),
         ));
     }
 
     s.push_str("\n## Proof-size buckets\n\n");
-    s.push_str("| label | base FRI | ladder FRI | ladder share | total |\n");
-    s.push_str("|-------|----------|------------|--------------|-------|\n");
+    s.push_str("| label | multipoint FRI | ladder block | multipoint share | total |\n");
+    s.push_str("|-------|----------------|--------------|------------------|-------|\n");
     for r in rows {
         let share = if r.proof_bytes == 0 {
             0.0
         } else {
-            100.0 * r.ladder_fri_bytes as f64 / r.proof_bytes as f64
+            100.0 * r.multipoint_fri_bytes as f64 / r.proof_bytes as f64
         };
         s.push_str(&format!(
             "| {} | {} | {} | {:.1}% | {} |\n",
             r.label,
-            fmt_bytes(r.base_fri_bytes),
-            fmt_bytes(r.ladder_fri_bytes),
+            fmt_bytes(r.multipoint_fri_bytes),
+            fmt_bytes(r.ladder_block_bytes),
             share,
             fmt_bytes(r.proof_bytes),
-        ));
-    }
-
-    s.push_str("\n## 3b-0.4 trigger evaluation\n\n");
-    s.push_str("Thresholds (from ROADMAP.md):\n\n");
-    s.push_str("- ladder FRI > 30% of verifier time → execute 3b-0.4\n");
-    s.push_str("- ladder FRI > 25% of prover time   → execute 3b-0.4\n");
-    s.push_str("- ladder FRI > 40% of proof size    → execute 3b-0.4\n\n");
-
-    if let Some(r) = rows.iter().find(|r| r.log_rows == 16) {
-        let vtot = r.verify.total();
-        let ptot = r.prove_buckets.total();
-        let v_share = percent(r.verify.ladder_fri, vtot);
-        let p_share = percent(r.prove_buckets.ladder_fri, ptot);
-        let s_share = 100.0 * r.ladder_fri_bytes as f64 / r.proof_bytes as f64;
-        s.push_str(&format!(
-            "`prod` (log_rows=16): ladder FRI verifier share = {:.1}%, prover share = {:.1}%, proof-size share = {:.1}%.\n",
-            v_share, p_share, s_share
-        ));
-        let fire_v = v_share > 30.0;
-        let fire_p = p_share > 25.0;
-        let fire_s = s_share > 40.0;
-        s.push_str(&format!(
-            "Triggers: verifier {} | prover {} | size {}.\n",
-            if fire_v { "FIRED" } else { "below" },
-            if fire_p { "FIRED" } else { "below" },
-            if fire_s { "FIRED" } else { "below" },
         ));
     }
 
@@ -370,27 +350,27 @@ fn main() {
         );
         let ptot = r.prove_buckets.total();
         println!(
-            "          prove  buckets: commit {} ({:.1}%) | ts+sc {} ({:.1}%) | base {} ({:.1}%) | ladder {} ({:.1}%)",
+            "          prove  buckets: commit {} ({:.1}%) | ts+sc {} ({:.1}%) | ladsc {} ({:.1}%) | mp+fri {} ({:.1}%)",
             fmt_ms(r.prove_buckets.commit),
             percent(r.prove_buckets.commit, ptot),
             fmt_ms(r.prove_buckets.transcript_sumcheck),
             percent(r.prove_buckets.transcript_sumcheck, ptot),
-            fmt_ms(r.prove_buckets.base_fri),
-            percent(r.prove_buckets.base_fri, ptot),
-            fmt_ms(r.prove_buckets.ladder_fri),
-            percent(r.prove_buckets.ladder_fri, ptot),
+            fmt_ms(r.prove_buckets.ladder_sumcheck),
+            percent(r.prove_buckets.ladder_sumcheck, ptot),
+            fmt_ms(r.prove_buckets.multipoint_fri),
+            percent(r.prove_buckets.multipoint_fri, ptot),
         );
         let total = r.verify.total();
         println!(
-            "          verify buckets: ts+sc {} ({:.1}%) | comp {} ({:.1}%) | base {} ({:.1}%) | ladder {} ({:.1}%)",
+            "          verify buckets: ts+sc {} ({:.1}%) | comp {} ({:.1}%) | ladsc {} ({:.1}%) | mp+fri {} ({:.1}%)",
             fmt_ms(r.verify.transcript_sumcheck),
             percent(r.verify.transcript_sumcheck, total),
             fmt_ms(r.verify.composition),
             percent(r.verify.composition, total),
-            fmt_ms(r.verify.base_fri),
-            percent(r.verify.base_fri, total),
-            fmt_ms(r.verify.ladder_fri),
-            percent(r.verify.ladder_fri, total),
+            fmt_ms(r.verify.ladder_sumcheck),
+            percent(r.verify.ladder_sumcheck, total),
+            fmt_ms(r.verify.multipoint_fri),
+            percent(r.verify.multipoint_fri, total),
         );
     }
     println!();
