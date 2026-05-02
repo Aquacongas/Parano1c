@@ -23,7 +23,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 /// `timestamp` is seconds since Unix epoch; `nonce` is the PoW nonce.
 /// Both are absorbed as 128-bit field elements (zero-extended), which
 /// matches the binary-tower convention used for every other scalar in
-/// the spec (fee, value, salt).
+/// the spec (fee, value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     pub prev_block_hash: Digest,

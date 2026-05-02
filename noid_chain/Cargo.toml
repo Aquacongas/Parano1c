@@ -10,4 +10,5 @@ noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_tx = { path = "../noid_tx" }
 noid_air = { path = "../noid_air" }
 noid_binius = { path = "../noid_binius" }
+noid_fri = { path = "../noid_fri" }
 blake3 = "1"

@@ -20,24 +20,26 @@
 //! - [`CompositeAir`] — stacks several AIRs side-by-side into one
 //!   column matrix, re-indexing their constraints.
 //!
-//! Concrete AIRs shipped here:
+//! Module layout:
 //!
-//! - [`TxValidityAir`] — every entry of the single column is boolean.
-//!   Used for the `valid` flag column.
-//! - [`LinearCombinationAir`] — in char-2 this enforces
-//!   `Σ_i col_i(x) + const(x) == 0` over the hypercube. It is the
-//!   balance and XOR-linear gate.
-//!
-//! Full fixed TxValidityAir now proves real transaction validity:
-//! - UTXO Merkle inclusion via Poseidon compress paths
-//! - 64-bit value conservation with bit-decomposition + integer carry sum
-//! - Nullifier / auth_tag / commitment preimage correctness (Poseidon2b in-circuit)
-//! - Trace binding to tx_body_hash (recomputed inside AIR, Option A)
-//!
-//! All primitive hashes remain Poseidon2b; no new crypto. LinearCombinationAir kept for XOR sub-gates.
+//! - [`gates`] — reusable Stage 3b-1 primitives (`BoolGate`,
+//!   `WeightedLinearGate`, `SelectorGate`).
+//! - [`airs`] — concrete AIRs (`TxValidityAir`, `CarryRippleAir`,
+//!   `LinearCombinationAir`).
 
 use noid_core::{Block128, TowerField};
-use noid_tx::{TxBody, MAX_INPUTS, MAX_OUTPUTS};
+
+pub mod airs;
+pub mod gates;
+
+pub use airs::{
+    CarryInitGate, CarryNextGate, CarryRippleAir, LinearCombinationAir, TxValidityAir,
+    TxValidityCol, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B, CARRY_RIPPLE_COL_CARRY,
+    CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM, CARRY_RIPPLE_LOG_WORD_BITS,
+    CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
+    TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
+};
+pub use gates::{BoolGate, SelectorGate, WeightedLinearGate};
 
 // ---------------------------------------------------------------------------
 // Column domain (Binius small-field tag)
@@ -142,16 +144,32 @@ impl Trace {
 // Constraint abstraction
 // ---------------------------------------------------------------------------
 
+/// Per-row evaluation frame presented to a [`Constraint`]. `local`
+/// carries the column values at the current row (indexed by
+/// [`Constraint::columns`]); `next` carries the values at the
+/// cyclically-next row (indexed by [`Constraint::shifted_columns`]).
+#[derive(Debug, Clone, Copy)]
+pub struct EvalFrame<'a> {
+    pub local: &'a [Block128],
+    pub next: &'a [Block128],
+}
+
 /// A single algebraic constraint. `evaluate` is called either with
 /// per-row column values (native check) or with field evaluations of
 /// each column's MLE at one challenge point (zero-check sumcheck).
 pub trait Constraint: Send + Sync {
     /// Maximum total degree in the column variables.
     fn degree(&self) -> usize;
-    /// Column indices this constraint reads.
+    /// Column indices this constraint reads at the current row.
     fn columns(&self) -> &[usize];
-    /// Evaluate given the column values.
-    fn evaluate(&self, cols: &[Block128]) -> Block128;
+    /// Column indices this constraint additionally reads at the
+    /// cyclically-next row. Default is empty; gates that don't need
+    /// rotation ignore `EvalFrame::next`.
+    fn shifted_columns(&self) -> &[usize] {
+        &[]
+    }
+    /// Evaluate the constraint on the given frame.
+    fn evaluate(&self, frame: EvalFrame) -> Block128;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,172 +181,48 @@ pub trait Air {
     fn log_rows(&self) -> usize;
     fn constraints(&self) -> &[Box<dyn Constraint>];
 
+    /// Sorted, de-duplicated union of `Constraint::shifted_columns()`
+    /// across all constraints. This is the set of columns the STARK
+    /// layer must materialise cyclically-rotated tables for, and for
+    /// which VSHIFT ladder openings are required. Default-computed;
+    /// override only for concrete AIRs that want to pin the layout.
+    fn shifted_column_indices(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for c in self.constraints() {
+            for &j in c.shifted_columns() {
+                if !out.contains(&j) {
+                    out.push(j);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// Native correctness check — catches malformed witnesses before
-    /// the STARK is invoked.
+    /// the STARK is invoked. Rotation is cyclic: `next(last) = first`.
     fn check(&self, trace: &Trace) -> bool {
         if trace.n_cols() != self.n_columns() || trace.log_rows != self.log_rows() {
             return false;
         }
         let n = trace.n_rows();
         for row in 0..n {
+            let next_row = if row + 1 == n { 0 } else { row + 1 };
             for c in self.constraints() {
-                let vals: Vec<Block128> =
+                let local: Vec<Block128> =
                     c.columns().iter().map(|&j| trace.columns[j][row]).collect();
-                if c.evaluate(&vals) != Block128::ZERO {
+                let next: Vec<Block128> = c
+                    .shifted_columns()
+                    .iter()
+                    .map(|&j| trace.columns[j][next_row])
+                    .collect();
+                let frame = EvalFrame { local: &local, next: &next };
+                if c.evaluate(frame) != Block128::ZERO {
                     return false;
                 }
             }
         }
         true
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Concrete gates
-// ---------------------------------------------------------------------------
-
-/// `v * (v + 1) == 0` (char-2): forces `v ∈ {0,1}`.
-pub struct BoolGate {
-    cols: [usize; 1],
-}
-
-impl BoolGate {
-    pub fn new(col: usize) -> Self {
-        Self { cols: [col] }
-    }
-}
-
-impl Constraint for BoolGate {
-    fn degree(&self) -> usize {
-        2
-    }
-    fn columns(&self) -> &[usize] {
-        &self.cols
-    }
-    fn evaluate(&self, cols: &[Block128]) -> Block128 {
-        let v = cols[0];
-        v * v + v
-    }
-}
-
-/// `Σ_i col_i == 0` (char-2 linear gate). In GF(2^128) the per-column
-/// weights can be arbitrary field elements — we use `ONE` for each
-/// column by default since XOR-linear balance doesn't need weighting.
-pub struct XorLinearGate {
-    cols: Vec<usize>,
-}
-
-impl XorLinearGate {
-    pub fn new(cols: Vec<usize>) -> Self {
-        assert!(!cols.is_empty(), "linear gate needs at least one column");
-        Self { cols }
-    }
-}
-
-impl Constraint for XorLinearGate {
-    fn degree(&self) -> usize {
-        1
-    }
-    fn columns(&self) -> &[usize] {
-        &self.cols
-    }
-    fn evaluate(&self, cols: &[Block128]) -> Block128 {
-        cols.iter().fold(Block128::ZERO, |a, &b| a + b)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TxValidityAir (single boolean column)
-// ---------------------------------------------------------------------------
-
-pub const TX_VALIDITY_SLOTS: usize = MAX_INPUTS + MAX_OUTPUTS;
-pub const TX_VALIDITY_LOG_ROWS: usize = 4;
-
-pub struct TxValidityAir {
-    constraints: Vec<Box<dyn Constraint>>,
-}
-
-impl Default for TxValidityAir {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TxValidityAir {
-    pub fn new() -> Self {
-        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(BoolGate::new(0))];
-        Self { constraints }
-    }
-
-    /// Row layout: inputs first, then outputs, then zero pad to
-    /// `2^TX_VALIDITY_LOG_ROWS`.
-    pub fn build_trace(body: &TxBody) -> Trace {
-        let n_rows = 1 << TX_VALIDITY_LOG_ROWS;
-        let mut col = vec![Block128::ZERO; n_rows];
-        for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
-            col[i] = if input.valid { Block128::ONE } else { Block128::ZERO };
-        }
-        for (i, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-            col[MAX_INPUTS + i] = if output.valid {
-                Block128::ONE
-            } else {
-                Block128::ZERO
-            };
-        }
-        Trace::new_with_domains(vec![col], vec![ColumnDomain::Bit])
-    }
-}
-
-impl Air for TxValidityAir {
-    fn n_columns(&self) -> usize {
-        1
-    }
-    fn log_rows(&self) -> usize {
-        TX_VALIDITY_LOG_ROWS
-    }
-    fn constraints(&self) -> &[Box<dyn Constraint>] {
-        &self.constraints
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LinearCombinationAir
-// ---------------------------------------------------------------------------
-
-/// Fixed shape: `n_cols` columns, each of length `2^log_rows`. The
-/// single constraint is `Σ_i col_i(x) == 0` for every hypercube point
-/// `x`. This is the XOR-linear / balance gate — in GF(2^128), addition
-/// is XOR, so forcing a sum to zero forces the columns to XOR to zero
-/// row-by-row. To prove `Σ inputs + Σ outputs == fee` without range
-/// checks, the prover supplies a "fee" column whose every row carries
-/// the fee and lets the balance gate cancel it.
-pub struct LinearCombinationAir {
-    n_cols: usize,
-    log_rows: usize,
-    constraints: Vec<Box<dyn Constraint>>,
-}
-
-impl LinearCombinationAir {
-    pub fn new(n_cols: usize, log_rows: usize) -> Self {
-        let cols: Vec<usize> = (0..n_cols).collect();
-        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(XorLinearGate::new(cols))];
-        Self {
-            n_cols,
-            log_rows,
-            constraints,
-        }
-    }
-}
-
-impl Air for LinearCombinationAir {
-    fn n_columns(&self) -> usize {
-        self.n_cols
-    }
-    fn log_rows(&self) -> usize {
-        self.log_rows
-    }
-    fn constraints(&self) -> &[Box<dyn Constraint>] {
-        &self.constraints
     }
 }
 
@@ -377,78 +271,22 @@ impl Air for CompositeAir {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Cross-module composition tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_tx::{TxInput, TxOutput};
-
-    fn mk_body() -> TxBody {
-        TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
-            fee: 0,
-            inputs: vec![TxInput::dummy(), TxInput::dummy()],
-            outputs: vec![TxOutput::dummy(), TxOutput::dummy(), TxOutput::dummy()],
-        }
-    }
-
-    #[test]
-    fn validity_air_native_check() {
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
-        assert!(air.check(&trace));
-    }
-
-    #[test]
-    fn validity_air_rejects_non_bool() {
-        let air = TxValidityAir::new();
-        let mut trace = TxValidityAir::build_trace(&mk_body());
-        trace.columns[0][3] = Block128::from(5u128);
-        assert!(!air.check(&trace));
-    }
-
-    #[test]
-    fn linear_gate_native_check() {
-        let log_rows = 3;
-        let air = LinearCombinationAir::new(3, log_rows);
-        let n = 1 << log_rows;
-        // col0 + col1 + col2 == 0 per row. Pick col0 and col1 random;
-        // col2 = col0 + col1.
-        let col0: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 * 7 + 1)).collect();
-        let col1: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 * 11 + 3)).collect();
-        let col2: Vec<Block128> = col0
-            .iter()
-            .zip(col1.iter())
-            .map(|(a, b)| *a + *b)
-            .collect();
-        let trace = Trace::new(vec![col0, col1, col2]);
-        assert!(air.check(&trace));
-    }
-
-    #[test]
-    fn linear_gate_rejects_imbalance() {
-        let air = LinearCombinationAir::new(2, 2);
-        let trace = Trace::new(vec![
-            vec![Block128::from(1u128); 4],
-            vec![Block128::from(2u128); 4], // 1 + 2 = 3 != 0 in char-2
-        ]);
-        assert!(!air.check(&trace));
-    }
 
     #[test]
     fn composite_from_parts() {
         // 2 columns: bool check on col0, linear sum(col0, col1)==0 on col1.
         let constraints: Vec<Box<dyn Constraint>> = vec![
             Box::new(BoolGate::new(0)),
-            Box::new(XorLinearGate::new(vec![0, 1])),
+            Box::new(WeightedLinearGate::new_xor(vec![0, 1])),
         ];
         let air = CompositeAir::from_parts(3, 2, constraints);
         let n = 1 << 3;
-        // col0 ∈ {0,1}, col1 == col0 to satisfy XOR-linear sum == 0.
         let col0: Vec<Block128> = (0..n)
             .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
             .collect();

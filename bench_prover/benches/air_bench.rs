@@ -72,7 +72,6 @@ fn mk_pi() -> PublicInputs {
     PublicInputs {
         prev_state_root: [0x11; 32],
         new_state_root: [0x22; 32],
-        nullifier_root: [0x33; 32],
         tx_body_hash: TxBodyHash([0x44; 32]),
         fee: 7,
     }
@@ -82,7 +81,6 @@ fn mk_body() -> TxBody {
     TxBody {
         prev_state_root: [0u8; 32],
         new_state_root: [0u8; 32],
-        nullifier_root: [0u8; 32],
         fee: 0,
         inputs: vec![TxInput::dummy(), TxInput::dummy()],
         outputs: vec![TxOutput::dummy(), TxOutput::dummy()],

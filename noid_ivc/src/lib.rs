@@ -159,7 +159,7 @@ pub fn fold_step_prove(
     // α is already derived above; absorbing it here binds the FRI
     // proof to the exact challenge used in the fold.
     proof_ch.observe_field_elem(alpha);
-    let fri_proof = prove(&commitment, column, &acc.z, &ntt, &mut proof_ch, &hasher);
+    let fri_proof = prove(column, &acc.z, &ntt, &mut proof_ch, &hasher);
 
     // Update running accumulator (char-2 is free).
     acc.y_acc += alpha * opening;
@@ -242,7 +242,6 @@ pub fn decide(acc: &Accumulator) -> Result<(), DecideError> {
         proof_ch.observe_field_elem(alpha);
 
         fri_verify(
-            commitment,
             &acc.z,
             opening,
             proof.clone(),

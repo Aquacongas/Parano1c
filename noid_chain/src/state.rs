@@ -1,56 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Native-side state transition. CRYPTO.md §6, §7.
+//! Native-side state transition for the transparent UTXO chain.
 //!
-//! Drives the two chain-level sparse Merkle trees:
-//!
-//! - **State tree** (depth 32): coin commitments appended at a monotonic
-//!   `next_leaf_index`. Depth is a hard cap (2^32 commitments); chain
-//!   logic enforces reuse/compaction before that limit, which is out of
-//!   scope here.
-//! - **Nullifier tree** (depth 32): each spent nullifier inserted at the
-//!   low 32 bits of its digest (little-endian). At chain scale this is a
-//!   cryptographic hash keyed tree, so collisions are negligible; we
-//!   still reject insertions at an already-populated slot so a
-//!   pathological collision surfaces as an error rather than silently
-//!   overwriting.
+//! The chain state is a single `FriState` — a FRI-committed vector of
+//! `2^STATE_LOG_SLOTS` UTXO slots, each holding a `(value, owner)`
+//! pair. A spend zeroes the slot at `input.slot_index`; a mint writes
+//! `(value, owner)` into the slot at the monotonic `next_slot_index`
+//! cursor. The state root is `FriState::root()`.
 //!
 //! This is *not* the in-circuit state transition — it is the native
-//! reference the prover uses to compute the post-roots that the STARK
-//! then proves.
+//! reference the prover uses to compute the post-root that the STARK
+//! then proves through §FriStateOpen.
 
-use noid_poseidon2b::primitives::{Digest, Nullifier};
-use noid_poseidon2b::sparse_merkle::{SparseMerkleTree, CHAIN_TREE_DEPTH};
-use noid_tx::{TxBody, TxOutput};
+use noid_core::Block128;
+use noid_poseidon2b::primitives::Digest;
+use noid_tx::{TxBody, TxInput, TxOutput};
 
-/// Chain-level mutable state. Holds the two trees plus the next free
-/// commitment index. Clone before `apply_tx` if you need a snapshot.
+use crate::fri_state::{FriState, SlotValue, STATE_LOG_SLOTS};
+
+/// Chain-level mutable state.
 #[derive(Debug, Clone)]
 pub struct ChainState {
-    pub state_tree: SparseMerkleTree,
-    pub nullifier_tree: SparseMerkleTree,
-    pub next_leaf_index: u64,
+    pub fri: FriState,
+    /// Monotonic cursor: next free slot for a new output.
+    pub next_slot_index: u64,
 }
 
 impl ChainState {
-    /// Fresh state with both trees empty.
+    /// Fresh mainnet-sized state: `2^STATE_LOG_SLOTS` empty slots.
     pub fn new() -> Self {
+        Self::with_log_slots(STATE_LOG_SLOTS)
+    }
+
+    /// Fresh state with a custom slot depth. Tests use a small depth
+    /// to keep the FRI commitment cheap.
+    pub fn with_log_slots(log_slots: usize) -> Self {
         Self {
-            state_tree: SparseMerkleTree::new(CHAIN_TREE_DEPTH),
-            nullifier_tree: SparseMerkleTree::new(CHAIN_TREE_DEPTH),
-            next_leaf_index: 0,
+            fri: FriState::new_empty(log_slots),
+            next_slot_index: 0,
         }
     }
 
     #[inline]
-    pub fn state_root(&self) -> Digest {
-        self.state_tree.root()
-    }
-
-    #[inline]
-    pub fn nullifier_root(&self) -> Digest {
-        self.nullifier_tree.root()
+    pub fn state_root(&mut self) -> Digest {
+        self.fri.root()
     }
 }
 
@@ -60,32 +54,29 @@ impl Default for ChainState {
     }
 }
 
-/// Outcome of applying one transaction: the post-transition roots that
-/// will appear as public inputs to the STARK (`new_state_root`,
-/// `nullifier_root`) alongside `prev_state_root` and `tx_body_hash`.
+/// Outcome of applying one transaction: the post-transition state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateTransition {
     pub new_state_root: Digest,
-    pub nullifier_root: Digest,
 }
 
 /// Error cases that invalidate a transaction at the state-transition
 /// level (independent of balance / range, which the circuit checks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyError {
-    /// The `prev_state_root` in the body does not match the current
-    /// chain state. The transaction is stale or forged.
+    /// `body.prev_state_root` does not match the current chain state.
     StaleState,
-    /// A nullifier in the body collides with a previously-spent one.
-    /// Real double-spend, or an astronomically unlikely hash collision.
-    DoubleSpend,
-    /// The state tree's append cursor has reached `2^DEPTH`.
-    StateTreeFull,
+    /// `input.slot_index` is outside the state vector.
+    SlotOutOfRange,
+    /// The slot's `(value, owner)` does not match the input's claimed
+    /// fields — spending a non-existent or already-spent UTXO.
+    UnknownOrSpentInput,
+    /// The state vector's append cursor has reached its capacity.
+    StateFull,
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
-/// roots on success. Dummy slots (`valid = false`) are skipped entirely
-/// — they neither insert nullifiers nor consume output indices.
+/// root on success. Dummy slots (`valid = false`) are skipped entirely.
 ///
 /// On `Err`, `state` is left untouched.
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
@@ -99,7 +90,7 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
         if !input.valid {
             continue;
         }
-        insert_nullifier(&mut snapshot, &input.nullifier)?;
+        spend_input(&mut snapshot, input)?;
     }
 
     for output in &body.outputs {
@@ -109,93 +100,76 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
         insert_output(&mut snapshot, output)?;
     }
 
-    let out = StateTransition {
-        new_state_root: snapshot.state_root(),
-        nullifier_root: snapshot.nullifier_root(),
-    };
+    let new_state_root = snapshot.state_root();
     *state = snapshot;
-    Ok(out)
+    Ok(StateTransition { new_state_root })
 }
 
-fn insert_nullifier(state: &mut ChainState, n: &Nullifier) -> Result<(), ApplyError> {
-    let idx = nullifier_index(n);
-    if state.nullifier_tree.get(idx) != empty_leaf_digest() {
-        return Err(ApplyError::DoubleSpend);
+fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError> {
+    if (input.slot_index as u64) >= state.fri.num_slots() {
+        return Err(ApplyError::SlotOutOfRange);
     }
-    state.nullifier_tree.insert(idx, n.0);
+    let expected = SlotValue {
+        value: Block128::from(input.value as u128),
+        owner_hi: input.owner.as_fields()[0],
+        owner_lo: input.owner.as_fields()[1],
+    };
+    let current = state.fri.slot(input.slot_index);
+    if current != expected {
+        return Err(ApplyError::UnknownOrSpentInput);
+    }
+    state
+        .fri
+        .set_slot(input.slot_index, SlotValue::EMPTY)
+        .expect("bounds checked above");
     Ok(())
 }
 
 fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyError> {
-    if (state.next_leaf_index as u128) >= (1u128 << CHAIN_TREE_DEPTH) {
-        return Err(ApplyError::StateTreeFull);
+    if state.next_slot_index >= state.fri.num_slots() {
+        return Err(ApplyError::StateFull);
     }
+    let slot = SlotValue {
+        value: Block128::from(out.value as u128),
+        owner_hi: out.owner.as_fields()[0],
+        owner_lo: out.owner.as_fields()[1],
+    };
+    let idx = state.next_slot_index as u32;
     state
-        .state_tree
-        .insert(state.next_leaf_index, out.commitment.0);
-    state.next_leaf_index += 1;
+        .fri
+        .set_slot(idx, slot)
+        .expect("bounds checked above");
+    state.next_slot_index += 1;
     Ok(())
-}
-
-/// Deterministic index assignment for a nullifier: low 32 bits of the
-/// digest, interpreted little-endian. The nullifier is a Poseidon2b
-/// output, so low bits are uniform — depth-32 is the natural width.
-#[inline]
-fn nullifier_index(n: &Nullifier) -> u64 {
-    let bytes = n.as_bytes();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
-}
-
-/// Empty-leaf digest used by the sparse tree (`Z[0]`). We compare
-/// against this when detecting double-spend.
-#[inline]
-fn empty_leaf_digest() -> Digest {
-    noid_poseidon2b::sparse_merkle::zero_root(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_core::{Block128, TowerField};
-    use noid_poseidon2b::primitives::{
-        derive_view_key, hash_commitment, hash_scan_tag, Address, MasterSecret, Nullifier,
-    };
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
     use noid_tx::TxInput;
 
-    fn mk_output(seed: u8, salt: u128) -> TxOutput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        let vk = derive_view_key(&MasterSecret([seed; 32]));
-        let salt = Block128::from(salt);
+    const TEST_LOG_SLOTS: usize = 6; // 64 slots — cheap FRI
+
+    fn fresh() -> ChainState {
+        ChainState::with_log_slots(TEST_LOG_SLOTS)
+    }
+
+    fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
-            commitment: c,
-            salt,
-            scan_tag: hash_scan_tag(&vk, salt),
+            value: (seed as u64) * 100,
+            owner: Address([seed; 32]),
             valid: true,
         }
     }
 
-    fn mk_input(seed: u8) -> TxInput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        // A deterministic fake nullifier — not cryptographically
-        // sound, but fine for testing state transitions.
-        let mut n = [0u8; 32];
-        n[0] = seed;
-        n[1] = 0xAB;
+    fn mk_input_for(slot_index: u32, out: &TxOutput) -> TxInput {
         TxInput {
-            commitment: c,
-            nullifier: Nullifier(n),
+            slot_index,
+            value: out.value,
+            owner: out.owner,
+            spend_secret: SpendSecret([0u8; 32]),
+            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         }
     }
@@ -204,7 +178,6 @@ mod tests {
         TxBody {
             prev_state_root: prev,
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee,
             inputs,
             outputs,
@@ -213,82 +186,94 @@ mod tests {
 
     #[test]
     fn fresh_state_accepts_mint_only_body() {
-        let mut state = ChainState::new();
+        let mut state = fresh();
         let prev = state.state_root();
-        let body = body_with(prev, 0, vec![], vec![mk_output(1, 1), mk_output(2, 2)]);
+        let body = body_with(prev, 0, vec![], vec![mk_output(1), mk_output(2)]);
         let out = apply_tx(&mut state, &body).expect("apply");
         assert_eq!(out.new_state_root, state.state_root());
-        assert_eq!(out.nullifier_root, state.nullifier_root());
-        assert_eq!(state.next_leaf_index, 2);
+        assert_eq!(state.next_slot_index, 2);
     }
 
     #[test]
     fn stale_prev_root_rejects() {
-        let mut state = ChainState::new();
-        let body = body_with([0xFFu8; 32], 0, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh();
+        let body = body_with([0xFFu8; 32], 0, vec![], vec![mk_output(1)]);
         assert_eq!(apply_tx(&mut state, &body), Err(ApplyError::StaleState));
-        // state untouched
-        assert_eq!(state.next_leaf_index, 0);
+        assert_eq!(state.next_slot_index, 0);
     }
 
     #[test]
-    fn double_spend_detected() {
-        let mut state = ChainState::new();
+    fn spend_known_utxo_then_double_spend_rejects() {
+        let mut state = fresh();
         let prev = state.state_root();
-        let i = mk_input(7);
-        let body1 = body_with(prev, 0, vec![i], vec![]);
-        apply_tx(&mut state, &body1).expect("first spend");
+        let out = mk_output(7);
+        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![out])).unwrap();
 
         let prev = state.state_root();
-        let body2 = body_with(prev, 0, vec![i], vec![]);
-        assert_eq!(apply_tx(&mut state, &body2), Err(ApplyError::DoubleSpend));
+        let input = mk_input_for(0, &out);
+        apply_tx(&mut state, &body_with(prev, 0, vec![input], vec![])).expect("first spend");
+
+        let prev = state.state_root();
+        assert_eq!(
+            apply_tx(&mut state, &body_with(prev, 0, vec![input], vec![])),
+            Err(ApplyError::UnknownOrSpentInput)
+        );
     }
 
     #[test]
     fn dummy_slots_ignored() {
-        let mut state = ChainState::new();
+        let mut state = fresh();
         let prev = state.state_root();
-        let valid_out = mk_output(1, 1);
-        let dummy_out = TxOutput::dummy();
-        let dummy_in = TxInput::dummy();
-        let body = body_with(prev, 0, vec![dummy_in], vec![valid_out, dummy_out]);
+        let valid_out = mk_output(1);
+        let body = body_with(
+            prev,
+            0,
+            vec![TxInput::dummy()],
+            vec![valid_out, TxOutput::dummy()],
+        );
         apply_tx(&mut state, &body).expect("apply");
-        assert_eq!(state.next_leaf_index, 1);
-        // nullifier tree still empty (no valid inputs)
-        assert_eq!(state.nullifier_root(), ChainState::new().nullifier_root());
+        assert_eq!(state.next_slot_index, 1);
     }
 
     #[test]
-    fn post_roots_flow_into_next_tx() {
-        let mut state = ChainState::new();
+    fn post_root_flows_into_next_tx() {
+        let mut state = fresh();
         let prev = state.state_root();
-        let body1 = body_with(prev, 0, vec![], vec![mk_output(1, 1)]);
+        let body1 = body_with(prev, 0, vec![], vec![mk_output(1)]);
         let st1 = apply_tx(&mut state, &body1).expect("apply 1");
 
-        // Second tx uses st1.new_state_root as its prev — this is the
-        // exact chaining the prover does on a block.
-        let body2 = body_with(st1.new_state_root, 0, vec![], vec![mk_output(2, 2)]);
+        let body2 = body_with(st1.new_state_root, 0, vec![], vec![mk_output(2)]);
         let st2 = apply_tx(&mut state, &body2).expect("apply 2");
         assert_ne!(st1.new_state_root, st2.new_state_root);
     }
 
     #[test]
     fn err_leaves_state_untouched() {
-        let mut state = ChainState::new();
+        let mut state = fresh();
         let prev = state.state_root();
-        // populate once
-        apply_tx(
-            &mut state,
-            &body_with(prev, 0, vec![], vec![mk_output(1, 1)]),
-        )
-        .unwrap();
+        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![mk_output(1)])).unwrap();
         let snap_root = state.state_root();
-        let snap_idx = state.next_leaf_index;
+        let snap_idx = state.next_slot_index;
 
-        // stale tx with outputs — should not append anything
-        let bad = body_with([0u8; 32], 0, vec![], vec![mk_output(2, 2)]);
+        let bad = body_with([0u8; 32], 0, vec![], vec![mk_output(2)]);
         assert!(apply_tx(&mut state, &bad).is_err());
         assert_eq!(state.state_root(), snap_root);
-        assert_eq!(state.next_leaf_index, snap_idx);
+        assert_eq!(state.next_slot_index, snap_idx);
+    }
+
+    #[test]
+    fn input_with_wrong_owner_rejects() {
+        let mut state = fresh();
+        let prev = state.state_root();
+        let real = mk_output(5);
+        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![real])).unwrap();
+
+        let prev = state.state_root();
+        let mut bogus = mk_input_for(0, &real);
+        bogus.owner = Address([0xDE; 32]);
+        assert_eq!(
+            apply_tx(&mut state, &body_with(prev, 0, vec![bogus], vec![])),
+            Err(ApplyError::UnknownOrSpentInput)
+        );
     }
 }

@@ -139,8 +139,8 @@ impl PackedCommit {
         hasher: &dyn CryptographicHasher,
     ) -> PackedEvalProof {
         assert_eq!(point.len(), self.commitment.log_packed_len);
+        channel.observe_fri_commitment(&self.commitment.inner);
         fri_prove(
-            &self.commitment.inner,
             &self.packed,
             point,
             ntt,
@@ -161,8 +161,8 @@ pub fn verify_packed(
     hasher: &dyn CryptographicHasher,
 ) -> Result<(), String> {
     assert_eq!(point.len(), commitment.log_packed_len);
+    channel.observe_fri_commitment(&commitment.inner);
     fri_verify(
-        &commitment.inner,
         point,
         claimed_eval,
         proof,

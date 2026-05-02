@@ -27,7 +27,7 @@ pub const BLOCK_VERSION: u8 = 1;
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 /// The economic / consensus limit is enforced elsewhere; this just keeps
 /// a malformed wire blob from allocating unbounded memory.
-pub const BLOCK_MAX_TXS: usize = 1 << 20;
+pub const BLOCK_MAX_TXS: usize = 1024;
 
 /// A block: header plus transactions. A block's STARK proof lives
 /// outside this struct; its transcript is bound into
@@ -51,14 +51,10 @@ pub enum BlockApplyError {
     MissingProofTranscriptHash,
     /// Header does not bind a non-zero DA witness digest.
     MissingWitnessRoot,
-    /// `tx.auth_tags.len()` is not equal to the number of real (`valid`) inputs.
-    AuthTagCountMismatch,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
     WrongTxBodyHash,
     /// `tx.body.new_state_root` disagrees with what `apply_tx` computed.
     WrongNewStateRoot,
-    /// Same check for nullifier_root.
-    WrongNullifierRoot,
     /// `header.state_root` disagrees with the post-apply chain root.
     HeaderStateRootMismatch,
     /// `header.tx_root` disagrees with the computed tx-root.
@@ -90,15 +86,11 @@ pub fn apply_block(
     let mut snap = state.clone();
     let mut last = StateTransition {
         new_state_root: snap.state_root(),
-        nullifier_root: snap.nullifier_root(),
     };
 
     for tx in &block.transactions {
         if tx.body.prev_state_root != snap.state_root() {
             return Err(BlockApplyError::UnchainedPrevRoot);
-        }
-        if !tx.has_canonical_auth_tag_count() {
-            return Err(BlockApplyError::AuthTagCountMismatch);
         }
 
         let expected_hash = hash_tx_body(
@@ -114,9 +106,6 @@ pub fn apply_block(
         let st = apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
         if tx.body.new_state_root != st.new_state_root {
             return Err(BlockApplyError::WrongNewStateRoot);
-        }
-        if tx.body.nullifier_root != st.nullifier_root {
-            return Err(BlockApplyError::WrongNullifierRoot);
         }
         last = st;
     }
@@ -246,87 +235,71 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_core::{Block128, TowerField};
-    use noid_poseidon2b::primitives::{
-        derive_view_key, hash_commitment, hash_scan_tag, Address, AuthTag, MasterSecret,
-        Nullifier,
-    };
-    use noid_tx::{hash_tx_body, TxBody, TxInput, TxOutput};
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_tx::{TxBody, TxInput, TxOutput};
 
-    fn mk_output(seed: u8, salt: u128) -> TxOutput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        let vk = derive_view_key(&MasterSecret([seed; 32]));
-        let salt = Block128::from(salt);
+    const TEST_LOG_SLOTS: usize = 6;
+
+    fn fresh_state() -> ChainState {
+        ChainState::with_log_slots(TEST_LOG_SLOTS)
+    }
+
+    fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
-            commitment: c,
-            salt,
-            scan_tag: hash_scan_tag(&vk, salt),
+            value: (seed as u64) * 100,
+            owner: Address([seed; 32]),
             valid: true,
         }
     }
 
-    fn mk_input(seed: u8) -> TxInput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        let mut n = [0u8; 32];
-        n[0] = seed;
-        n[1] = 0xAB;
+    fn mk_input_for(slot_index: u32, out: &TxOutput) -> TxInput {
         TxInput {
-            commitment: c,
-            nullifier: Nullifier(n),
+            slot_index,
+            value: out.value,
+            owner: out.owner,
+            spend_secret: SpendSecret([0u8; 32]),
+            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         }
     }
 
-    /// Build a transaction whose `new_state_root` / `nullifier_root` /
-    /// `tx_body_hash` are filled in against a probe of the given state.
-    /// The resulting tx applies cleanly as long as `state` doesn't drift
-    /// between the probe and the real apply.
-    fn build_tx(state: &ChainState, inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> Transaction {
+    fn build_tx(
+        state: &mut ChainState,
+        inputs: Vec<TxInput>,
+        outputs: Vec<TxOutput>,
+    ) -> Transaction {
         let mut probe = state.clone();
         let mut body = TxBody {
             prev_state_root: state.state_root(),
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs,
             outputs,
         };
         let st = apply_tx(&mut probe, &body).expect("probe apply");
         body.new_state_root = st.new_state_root;
-        body.nullifier_root = st.nullifier_root;
         let tbh = hash_tx_body(
             &body.prev_state_root,
             body.fee,
             &body.inputs,
             &body.outputs,
         );
-        let auth_tags = vec![AuthTag([0u8; 32]); body.valid_input_count()];
         Transaction {
             body,
             tx_body_hash: tbh,
-            auth_tags,
         }
     }
 
     #[test]
     fn apply_block_happy_path_two_chained_txs() {
-        let mut state = ChainState::new();
-        let tx1 = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let minted = mk_output(1);
+        let tx1 = build_tx(&mut state, vec![], vec![minted]);
         let mut probe = state.clone();
         apply_tx(&mut probe, &tx1.body).unwrap();
-        let tx2 = build_tx(&probe, vec![mk_input(2)], vec![mk_output(3, 3)]);
+        // tx2 spends the freshly-minted UTXO at slot 0.
+        let spend = mk_input_for(0, &minted);
+        let tx2 = build_tx(&mut probe, vec![spend], vec![mk_output(3)]);
 
         let txs = vec![tx1, tx2];
         let tx_root = compute_tx_root(&txs);
@@ -334,7 +307,6 @@ mod tests {
         let mut dry = state.clone();
         let mut last = StateTransition {
             new_state_root: dry.state_root(),
-            nullifier_root: dry.nullifier_root(),
         };
         for tx in &txs {
             last = apply_tx(&mut dry, &tx.body).unwrap();
@@ -361,8 +333,8 @@ mod tests {
 
     #[test]
     fn apply_block_rejects_wrong_tx_root() {
-        let mut state = ChainState::new();
-        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         let mut probe = state.clone();
         let st = apply_tx(&mut probe, &tx.body).unwrap();
         let header = BlockHeader {
@@ -383,13 +355,13 @@ mod tests {
             apply_block(&mut state, &block),
             Err(BlockApplyError::HeaderTxRootMismatch)
         );
-        assert_eq!(state.next_leaf_index, 0);
+        assert_eq!(state.next_slot_index, 0);
     }
 
     #[test]
     fn apply_block_rejects_wrong_tx_body_hash() {
-        let mut state = ChainState::new();
-        let mut tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let mut tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         tx.tx_body_hash.0[0] ^= 1;
 
         let header = BlockHeader {
@@ -414,38 +386,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_block_rejects_auth_tag_count_mismatch() {
-        let mut state = ChainState::new();
-        let mut tx = build_tx(&state, vec![mk_input(1)], vec![mk_output(2, 2)]);
-        tx.auth_tags.clear();
-
-        let header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: [0u8; 32],
-            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-            timestamp: 1,
-            miner_address: Address([9u8; 32]),
-            nonce: 0,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [2u8; 32],
-        };
-        let block = Block {
-            header,
-            transactions: vec![tx],
-        };
-
-        assert_eq!(
-            apply_block(&mut state, &block),
-            Err(BlockApplyError::AuthTagCountMismatch)
-        );
-    }
-
-    #[test]
     fn apply_block_rejects_broken_chain() {
-        let mut state = ChainState::new();
-        let tx1 = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let tx1 = build_tx(&mut state.clone(), vec![], vec![mk_output(1)]);
         // Second tx also uses the pre-tx1 root — not chained.
-        let tx2 = build_tx(&state, vec![], vec![mk_output(2, 2)]);
+        let tx2 = build_tx(&mut state.clone(), vec![], vec![mk_output(2)]);
         let txs = vec![tx1, tx2];
         let header = BlockHeader {
             prev_block_hash: [0u8; 32],
@@ -483,8 +428,8 @@ mod tests {
 
     #[test]
     fn apply_block_rejects_missing_proof_transcript_hash() {
-        let mut state = ChainState::new();
-        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         let mut probe = state.clone();
         let st = apply_tx(&mut probe, &tx.body).unwrap();
         let block = Block {
@@ -508,8 +453,8 @@ mod tests {
 
     #[test]
     fn apply_block_rejects_missing_witness_root() {
-        let mut state = ChainState::new();
-        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         let mut probe = state.clone();
         let st = apply_tx(&mut probe, &tx.body).unwrap();
         let block = Block {
@@ -533,8 +478,8 @@ mod tests {
 
     #[test]
     fn block_wire_roundtrip() {
-        let state = ChainState::new();
-        let tx = build_tx(&state, vec![], vec![mk_output(1, 1)]);
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         let mut probe = state.clone();
         let st = apply_tx(&mut probe, &tx.body).unwrap();
         let block = Block {

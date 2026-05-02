@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Canonical wire encoding for transaction types.
+//! Canonical wire encoding for transparent transaction types.
 //!
 //! Fixed-width, little-endian. Counts on variable-length vectors
-//! (`inputs`, `outputs`, `auth_tags`) are explicit `u32`s, each bounded
-//! by its spec-level maximum (§7). Every 32-byte digest is a passthrough
-//! byte copy; every 128-bit scalar is 16 LE bytes.
-//!
-//! The encoding is designed to be consumed byte-for-byte — no
-//! length-prefix ambiguity, no hidden padding, no hidden branches.
+//! (`inputs`, `outputs`) are explicit `u32`s, each bounded by its
+//! spec-level maximum. Every 32-byte digest is a passthrough byte copy;
+//! `value` is 8 LE bytes; `slot_index` is 4 LE bytes.
 
-use noid_core::Block128;
-use noid_poseidon2b::primitives::{AuthTag, Commitment, Digest, Nullifier, ScanTag, TxBodyHash};
+use noid_poseidon2b::primitives::{Address, AuthTag, Digest, SpendSecret, TxBodyHash};
 
 use crate::public::PublicInputs;
 use crate::types::{Transaction, TxBody, TxInput, TxOutput};
@@ -20,39 +16,30 @@ use crate::types::{Transaction, TxBody, TxInput, TxOutput};
 /// Encoding / decoding errors surfaced to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
-    /// Buffer ended before the type was fully parsed.
     Truncated,
-    /// A count field exceeds the hard protocol bound (e.g. > MAX_INPUTS).
     CountTooLarge,
-    /// Cross-field shape mismatch (e.g. auth_tags count vs. valid inputs).
     ShapeMismatch,
-    /// The `valid` byte decoded to a value other than 0 or 1.
     InvalidBool,
-    /// Trailing bytes after a top-level decode.
     TrailingBytes,
-    /// Wire version byte does not match this build.
     UnknownVersion,
 }
-
-// ---------------------------------------------------------------------------
-// Low-level helpers
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn put_digest(buf: &mut Vec<u8>, d: &Digest) {
     buf.extend_from_slice(d);
 }
-
 #[inline]
 fn put_u128(buf: &mut Vec<u8>, v: u128) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
-
+#[inline]
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
 #[inline]
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
-
 #[inline]
 fn put_bool(buf: &mut Vec<u8>, v: bool) {
     buf.push(if v { 1u8 } else { 0u8 });
@@ -67,7 +54,6 @@ fn take<'a>(src: &mut &'a [u8], n: usize) -> Result<&'a [u8], WireError> {
     *src = tail;
     Ok(head)
 }
-
 #[inline]
 fn take_digest(src: &mut &[u8]) -> Result<Digest, WireError> {
     let bytes = take(src, 32)?;
@@ -75,19 +61,21 @@ fn take_digest(src: &mut &[u8]) -> Result<Digest, WireError> {
     out.copy_from_slice(bytes);
     Ok(out)
 }
-
 #[inline]
 fn take_u128(src: &mut &[u8]) -> Result<u128, WireError> {
     let bytes = take(src, 16)?;
     Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
 }
-
+#[inline]
+fn take_u64(src: &mut &[u8]) -> Result<u64, WireError> {
+    let bytes = take(src, 8)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
 #[inline]
 fn take_u32(src: &mut &[u8]) -> Result<u32, WireError> {
     let bytes = take(src, 4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
-
 #[inline]
 fn take_bool(src: &mut &[u8]) -> Result<bool, WireError> {
     let b = take(src, 1)?[0];
@@ -100,52 +88,60 @@ fn take_bool(src: &mut &[u8]) -> Result<bool, WireError> {
 
 // ---------------------------------------------------------------------------
 // TxInput
+//   slot_index (4) + value (8) + owner (32) + spend_secret (32)
+//   + auth_tag (32) + valid (1) = 109 bytes
 // ---------------------------------------------------------------------------
 
-pub const TX_INPUT_WIRE_SIZE: usize = 32 + 32 + 1;
+pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 32 + 1;
 
 impl TxInput {
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        put_digest(buf, &self.commitment.0);
-        put_digest(buf, &self.nullifier.0);
+        put_u32(buf, self.slot_index);
+        put_u64(buf, self.value);
+        put_digest(buf, &self.owner.0);
+        put_digest(buf, &self.spend_secret.0);
+        put_digest(buf, &self.auth_tag.0);
         put_bool(buf, self.valid);
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
-        let commitment = Commitment(take_digest(src)?);
-        let nullifier = Nullifier(take_digest(src)?);
+        let slot_index = take_u32(src)?;
+        let value = take_u64(src)?;
+        let owner = Address(take_digest(src)?);
+        let spend_secret = SpendSecret(take_digest(src)?);
+        let auth_tag = AuthTag(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
-            commitment,
-            nullifier,
+            slot_index,
+            value,
+            owner,
+            spend_secret,
+            auth_tag,
             valid,
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// TxOutput
+// TxOutput : value (8) + owner (32) + valid (1) = 41 bytes
 // ---------------------------------------------------------------------------
 
-pub const TX_OUTPUT_WIRE_SIZE: usize = 32 + 16 + 32 + 1;
+pub const TX_OUTPUT_WIRE_SIZE: usize = 8 + 32 + 1;
 
 impl TxOutput {
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        put_digest(buf, &self.commitment.0);
-        put_u128(buf, self.salt.to_u128());
-        put_digest(buf, &self.scan_tag.0);
+        put_u64(buf, self.value);
+        put_digest(buf, &self.owner.0);
         put_bool(buf, self.valid);
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
-        let commitment = Commitment(take_digest(src)?);
-        let salt = Block128::from(take_u128(src)?);
-        let scan_tag = ScanTag(take_digest(src)?);
+        let value = take_u64(src)?;
+        let owner = Address(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
-            commitment,
-            salt,
-            scan_tag,
+            value,
+            owner,
             valid,
         })
     }
@@ -155,18 +151,6 @@ impl TxOutput {
 // TxBody
 // ---------------------------------------------------------------------------
 
-/// Wire layout (version=1):
-/// ```text
-/// u8   version = 1
-/// [32] prev_state_root
-/// [32] new_state_root
-/// [32] nullifier_root
-/// u128 fee
-/// u32  n_inputs  (<= MAX_INPUTS)
-/// TxInput[n_inputs]
-/// u32  n_outputs (<= MAX_OUTPUTS)
-/// TxOutput[n_outputs]
-/// ```
 pub const TX_BODY_VERSION: u8 = 1;
 
 impl TxBody {
@@ -183,7 +167,6 @@ impl TxBody {
         buf.push(TX_BODY_VERSION);
         put_digest(buf, &self.prev_state_root);
         put_digest(buf, &self.new_state_root);
-        put_digest(buf, &self.nullifier_root);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
         for i in &self.inputs {
@@ -197,7 +180,7 @@ impl TxBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 3 * 32
+            1 + 2 * 32
                 + 16
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
@@ -215,7 +198,6 @@ impl TxBody {
         }
         let prev_state_root = take_digest(src)?;
         let new_state_root = take_digest(src)?;
-        let nullifier_root = take_digest(src)?;
         let fee = take_u128(src)?;
 
         let n_in = take_u32(src)? as usize;
@@ -239,7 +221,6 @@ impl TxBody {
         Ok(Self {
             prev_state_root,
             new_state_root,
-            nullifier_root,
             fee,
             inputs,
             outputs,
@@ -257,26 +238,13 @@ impl TxBody {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction
+// Transaction : body + tx_body_hash. Auth tags travel inside TxInput.
 // ---------------------------------------------------------------------------
 
 impl Transaction {
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        assert!(
-            self.auth_tags.len() <= crate::types::MAX_INPUTS,
-            "auth_tags exceed MAX_INPUTS"
-        );
-        assert!(
-            self.has_canonical_auth_tag_count(),
-            "auth_tags count must equal number of valid inputs"
-        );
-
         self.body.encode(buf);
         put_digest(buf, &self.tx_body_hash.0);
-        put_u32(buf, self.auth_tags.len() as u32);
-        for t in &self.auth_tags {
-            put_digest(buf, &t.0);
-        }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -288,23 +256,10 @@ impl Transaction {
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let body = TxBody::decode(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
-        let n = take_u32(src)? as usize;
-        if n > crate::types::MAX_INPUTS {
-            return Err(WireError::CountTooLarge);
-        }
-        let mut auth_tags = Vec::with_capacity(n);
-        for _ in 0..n {
-            auth_tags.push(AuthTag(take_digest(src)?));
-        }
-        let tx = Self {
+        Ok(Self {
             body,
             tx_body_hash,
-            auth_tags,
-        };
-        if !tx.has_canonical_auth_tag_count() {
-            return Err(WireError::ShapeMismatch);
-        }
-        Ok(tx)
+        })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
@@ -318,16 +273,15 @@ impl Transaction {
 }
 
 // ---------------------------------------------------------------------------
-// PublicInputs
+// PublicInputs : prev_root (32) + new_root (32) + tx_body_hash (32) + fee (16)
 // ---------------------------------------------------------------------------
 
-pub const PUBLIC_INPUTS_WIRE_SIZE: usize = 4 * 32 + 16;
+pub const PUBLIC_INPUTS_WIRE_SIZE: usize = 3 * 32 + 16;
 
 impl PublicInputs {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         put_digest(buf, &self.prev_state_root);
         put_digest(buf, &self.new_state_root);
-        put_digest(buf, &self.nullifier_root);
         put_digest(buf, &self.tx_body_hash.0);
         put_u128(buf, self.fee);
     }
@@ -339,8 +293,6 @@ impl PublicInputs {
         i += 32;
         out[i..i + 32].copy_from_slice(&self.new_state_root);
         i += 32;
-        out[i..i + 32].copy_from_slice(&self.nullifier_root);
-        i += 32;
         out[i..i + 32].copy_from_slice(&self.tx_body_hash.0);
         i += 32;
         out[i..i + 16].copy_from_slice(&self.fee.to_le_bytes());
@@ -350,13 +302,11 @@ impl PublicInputs {
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let prev_state_root = take_digest(src)?;
         let new_state_root = take_digest(src)?;
-        let nullifier_root = take_digest(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
         let fee = take_u128(src)?;
         Ok(Self {
             prev_state_root,
             new_state_root,
-            nullifier_root,
             tx_body_hash,
             fee,
         })
@@ -375,40 +325,23 @@ impl PublicInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_core::TowerField;
-    use noid_poseidon2b::primitives::{
-        derive_view_key, hash_commitment, hash_scan_tag, Address, MasterSecret,
-    };
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 
-    fn mk_output(seed: u8, salt: u128) -> TxOutput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        let vk = derive_view_key(&MasterSecret([seed; 32]));
-        let salt = Block128::from(salt);
+    fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
-            commitment: c,
-            salt,
-            scan_tag: hash_scan_tag(&vk, salt),
+            value: (seed as u64) * 7,
+            owner: Address([seed; 32]),
             valid: true,
         }
     }
 
     fn mk_input(seed: u8) -> TxInput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
         TxInput {
-            commitment: c,
-            nullifier: Nullifier([seed; 32]),
+            slot_index: seed as u32,
+            value: (seed as u64) * 11,
+            owner: Address([seed; 32]),
+            spend_secret: SpendSecret([seed ^ 0xAA; 32]),
+            auth_tag: AuthTag([seed ^ 0x55; 32]),
             valid: true,
         }
     }
@@ -427,7 +360,7 @@ mod tests {
 
     #[test]
     fn tx_output_roundtrip() {
-        let o = mk_output(7, 0xDEAD_BEEFu128);
+        let o = mk_output(7);
         let mut buf = Vec::new();
         o.encode(&mut buf);
         assert_eq!(buf.len(), TX_OUTPUT_WIRE_SIZE);
@@ -442,26 +375,19 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0x11u8; 32],
             new_state_root: [0x22u8; 32],
-            nullifier_root: [0x33u8; 32],
             fee: 42u128,
             inputs: vec![mk_input(1), mk_input(2), TxInput::dummy()],
-            outputs: vec![mk_output(1, 10), mk_output(2, 20), TxOutput::dummy()],
+            outputs: vec![mk_output(1), mk_output(2), TxOutput::dummy()],
         };
         let bytes = body.to_bytes();
         let back = TxBody::from_bytes(&bytes).unwrap();
-        assert_eq!(back.prev_state_root, body.prev_state_root);
-        assert_eq!(back.new_state_root, body.new_state_root);
-        assert_eq!(back.nullifier_root, body.nullifier_root);
-        assert_eq!(back.fee, body.fee);
-        assert_eq!(back.inputs, body.inputs);
-        assert_eq!(back.outputs, body.outputs);
+        assert_eq!(back, body);
     }
 
     #[test]
     fn tx_body_rejects_too_many_inputs() {
         let mut buf = Vec::new();
         buf.push(TX_BODY_VERSION);
-        buf.extend_from_slice(&[0u8; 32]);
         buf.extend_from_slice(&[0u8; 32]);
         buf.extend_from_slice(&[0u8; 32]);
         buf.extend_from_slice(&[0u8; 16]);
@@ -474,7 +400,6 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
@@ -489,7 +414,6 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
@@ -504,20 +428,18 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0xAAu8; 32],
             new_state_root: [0xBBu8; 32],
-            nullifier_root: [0xCCu8; 32],
             fee: 7,
             inputs: vec![mk_input(3)],
-            outputs: vec![mk_output(4, 99)],
+            outputs: vec![mk_output(4)],
         };
         let tx = Transaction {
             tx_body_hash: TxBodyHash([0x99u8; 32]),
-            auth_tags: vec![AuthTag([0x12u8; 32])],
             body,
         };
         let bytes = tx.to_bytes();
         let back = Transaction::from_bytes(&bytes).unwrap();
         assert_eq!(back.tx_body_hash, tx.tx_body_hash);
-        assert_eq!(back.auth_tags, tx.auth_tags);
+        assert_eq!(back.body, tx.body);
     }
 
     #[test]
@@ -525,7 +447,6 @@ mod tests {
         let p = PublicInputs {
             prev_state_root: [1u8; 32],
             new_state_root: [2u8; 32],
-            nullifier_root: [3u8; 32],
             tx_body_hash: TxBodyHash([4u8; 32]),
             fee: 0xFEED_FACE_CAFE_BEEFu128,
         };
@@ -540,7 +461,6 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs: vec![mk_input(1)],
             outputs: vec![],
@@ -558,7 +478,6 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs: vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
             outputs: vec![],
@@ -573,68 +492,11 @@ mod tests {
         let body = TxBody {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
-            nullifier_root: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],
         };
         let mut buf = Vec::new();
         body.encode(&mut buf);
-    }
-
-    #[test]
-    #[should_panic(expected = "auth_tags exceed MAX_INPUTS")]
-    fn transaction_encode_panics_when_auth_tags_exceed_bound() {
-        let tx = Transaction {
-            body: TxBody {
-                prev_state_root: [0u8; 32],
-                new_state_root: [0u8; 32],
-                nullifier_root: [0u8; 32],
-                fee: 0,
-                inputs: vec![],
-                outputs: vec![],
-            },
-            tx_body_hash: TxBodyHash([0u8; 32]),
-            auth_tags: vec![AuthTag([0u8; 32]); crate::types::MAX_INPUTS + 1],
-        };
-        let mut buf = Vec::new();
-        tx.encode(&mut buf);
-    }
-
-    #[test]
-    #[should_panic(expected = "auth_tags count must equal number of valid inputs")]
-    fn transaction_encode_panics_when_auth_tags_count_mismatches_valid_inputs() {
-        let tx = Transaction {
-            body: TxBody {
-                prev_state_root: [0u8; 32],
-                new_state_root: [0u8; 32],
-                nullifier_root: [0u8; 32],
-                fee: 0,
-                inputs: vec![mk_input(1)],
-                outputs: vec![],
-            },
-            tx_body_hash: TxBodyHash([0u8; 32]),
-            auth_tags: vec![],
-        };
-        let mut buf = Vec::new();
-        tx.encode(&mut buf);
-    }
-
-    #[test]
-    fn transaction_decode_rejects_auth_tag_shape_mismatch() {
-        let body = TxBody {
-            prev_state_root: [0xAAu8; 32],
-            new_state_root: [0xBBu8; 32],
-            nullifier_root: [0xCCu8; 32],
-            fee: 7,
-            inputs: vec![mk_input(3)],
-            outputs: vec![mk_output(4, 99)],
-        };
-
-        let mut bytes = body.to_bytes();
-        bytes.extend_from_slice(&[0x99u8; 32]); // tx_body_hash
-        put_u32(&mut bytes, 0); // zero auth tags, but one valid input
-
-        assert_eq!(Transaction::from_bytes(&bytes), Err(WireError::ShapeMismatch));
     }
 }

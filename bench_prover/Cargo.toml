@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "binius_packing"
 harness = false
+
+[[bench]]
+name = "carry_ripple"
+harness = false

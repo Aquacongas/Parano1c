@@ -1,136 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Canonical transaction-body hash. CRYPTO.md §5.7 and §7.1.
+//! Canonical transaction-body hash for the transparent UTXO model.
 //!
-//! Leaf order (all 32-byte canonical values, passthrough into the
-//! COMPRESS-domain Merkle tree):
-//!
-//! 1. `prev_state_root`
-//! 2. `fee_leaf = le_bytes_u128(fee) || [0u8; 16]`
-//! 3. `input.commitment` for each input (passthrough)
-//! 4. `output_leaf = compress(commitment, compress(salt_leaf, scan_tag))`
-//!    for each output — §7.1 binding extension. `salt_leaf =
-//!    le_bytes_u128(salt.to_u128()) || [0u8; 16]`.
-//!
-//! The leaf set is padded with `ZERO_DIGEST` to the next power of two
-//! (minimum 2), reduced by `compress`, and wrapped once under
-//! `TXBODY__`.
+//! Adapter over `noid_poseidon2b::primitives::hash_tx_body`. The
+//! primitives layer enforces a fixed 16-leaf / depth-4 layout (see
+//! `TXBODY_LEAVES`); this adapter builds the per-input and per-output
+//! leaves from `TxInput` / `TxOutput`, padding dummy / missing slots
+//! with the zero digest.
 
-use noid_core::{Block128, CanonicalSerialize};
-use noid_poseidon2b::native::compress;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_TXBODY};
-use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
-use noid_poseidon2b::primitives::{Digest, TxBodyHash};
+use noid_poseidon2b::primitives::{
+    hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core, Digest, TxBodyHash,
+    TXBODY_INPUTS, TXBODY_OUTPUTS,
+};
 
-use crate::types::{TxInput, TxOutput};
+use crate::types::{TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
-/// Encode a 128-bit scalar as a 32-byte canonical Merkle leaf.
-/// `le_bytes(scalar) || [0u8; 16]`. CRYPTO.md §4.
-fn scalar_leaf_u128(v: u128) -> Digest {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&v.to_le_bytes());
-    out
-}
-
-/// Per-output leaf for the tx-body Merkle. CRYPTO.md §7.1.
-fn output_leaf(out: &TxOutput) -> Digest {
-    let salt_leaf = scalar_leaf_u128(out.salt.to_u128());
-    let inner = compress(&salt_leaf, out.scan_tag.as_bytes());
-    compress(out.commitment.as_bytes(), &inner)
-}
-
-/// Compute the canonical transaction-body hash.
-///
-/// Inputs are passthrough 32-byte commitments. Outputs are bound as
-/// per §7.1 so a relay cannot swap `(salt, scan_tag)` without
-/// invalidating the hash.
+/// Compute the canonical transaction-body hash. `inputs.len()` and
+/// `outputs.len()` must not exceed `MAX_INPUTS` / `MAX_OUTPUTS`;
+/// missing slots are zero-padded so the leaf tree is always depth-4.
 pub fn hash_tx_body(
     prev_state_root: &Digest,
     fee: u128,
     inputs: &[TxInput],
     outputs: &[TxOutput],
 ) -> TxBodyHash {
-    let n = 2 + inputs.len() + outputs.len();
-    let target = n.next_power_of_two().max(2);
+    assert!(inputs.len() <= MAX_INPUTS, "inputs exceed MAX_INPUTS");
+    assert!(outputs.len() <= MAX_OUTPUTS, "outputs exceed MAX_OUTPUTS");
+    debug_assert_eq!(MAX_INPUTS, TXBODY_INPUTS);
+    debug_assert_eq!(MAX_OUTPUTS, TXBODY_OUTPUTS);
 
-    let mut leaves: Vec<Digest> = Vec::with_capacity(target);
-    leaves.push(*prev_state_root);
-    leaves.push(scalar_leaf_u128(fee));
-    for i in inputs {
-        leaves.push(i.commitment.0);
-    }
-    for o in outputs {
-        leaves.push(output_leaf(o));
-    }
-    leaves.resize(target, [0u8; 32]);
-
-    // Merkle reduce with compress (§5.1). Sequential — tx sizes are
-    // bounded (≤4 inputs, ≤8 outputs, so ≤16 leaves after padding) and
-    // parallelism is noise at this scale.
-    while leaves.len() > 1 {
-        let mut next = Vec::with_capacity(leaves.len() / 2);
-        for pair in leaves.chunks_exact(2) {
-            next.push(compress(&pair[0], &pair[1]));
+    let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
+    for (i, inp) in inputs.iter().enumerate() {
+        // Dummy slots collapse to the zero digest — same as a missing
+        // slot — so the body hash cannot distinguish `valid=false` from
+        // an absent slot, matching the AIR's selector treatment.
+        if inp.valid {
+            input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
         }
-        leaves = next;
     }
 
-    // Final TXBODY wrap (§5.7 step 3): single permutation with capacity
-    // IV = `TXBODY__`.
-    let root = leaves[0];
-    let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
-    let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
-    let [iv_hi, iv_lo] = capacity_iv(TAG_TXBODY);
-    let mut state = [r0, r1, iv_hi, iv_lo];
-    Poseidon2bPermutation.permute_mut(&mut state);
+    let mut output_leaves: [Digest; TXBODY_OUTPUTS] = [[0u8; 32]; TXBODY_OUTPUTS];
+    for (i, out) in outputs.iter().enumerate() {
+        if out.valid {
+            output_leaves[i] = hash_output_leaf(out.value, &out.owner);
+        }
+    }
 
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&state[0].to_bytes());
-    out[16..].copy_from_slice(&state[1].to_bytes());
-    TxBodyHash(out)
+    hash_tx_body_core(prev_state_root, fee, &input_leaves, &output_leaves)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_core::TowerField;
-    use noid_poseidon2b::primitives::{
-        hash_commitment, hash_scan_tag, Address, Commitment, Nullifier, ScanTag,
-    };
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 
     fn mk_input(seed: u8) -> TxInput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
         TxInput {
-            commitment: c,
-            nullifier: Nullifier([seed; 32]),
+            slot_index: seed as u32,
+            value: (seed as u64) * 11,
+            owner: Address([seed; 32]),
+            spend_secret: SpendSecret([seed ^ 0xAA; 32]),
+            auth_tag: AuthTag([seed ^ 0x55; 32]),
             valid: true,
         }
     }
 
-    fn mk_output(seed: u8, salt: u128) -> TxOutput {
-        let addr = Address([seed; 32]);
-        let c = hash_commitment(
-            seed as u128,
-            &addr,
-            Block128::from(seed as u128),
-            Block128::ZERO,
-        );
-        let vk = noid_poseidon2b::primitives::derive_view_key(
-            &noid_poseidon2b::primitives::MasterSecret([seed; 32]),
-        );
-        let salt = Block128::from(salt);
-        let tag = hash_scan_tag(&vk, salt);
+    fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
-            commitment: c,
-            salt,
-            scan_tag: tag,
+            value: (seed as u64) * 7,
+            owner: Address([seed; 32]),
             valid: true,
         }
     }
@@ -139,7 +78,7 @@ mod tests {
     fn determinism() {
         let prev = [0xABu8; 32];
         let i = [mk_input(1)];
-        let o = [mk_output(2, 7), mk_output(3, 9)];
+        let o = [mk_output(2), mk_output(3)];
         assert_eq!(
             hash_tx_body(&prev, 5, &i, &o),
             hash_tx_body(&prev, 5, &i, &o)
@@ -147,51 +86,28 @@ mod tests {
     }
 
     #[test]
-    fn salt_flip_changes_body_hash() {
+    fn output_value_flip_changes_body_hash() {
         let prev = [0u8; 32];
-        let o1 = mk_output(1, 100);
+        let o1 = mk_output(1);
         let mut o2 = o1;
-        o2.salt = Block128::from(101u128);
-        // Intentionally keep scan_tag and commitment identical to prove
-        // §7.1 binds salt independently.
-        assert_ne!(o1.salt, o2.salt);
+        o2.value ^= 0xFF;
         let h1 = hash_tx_body(&prev, 0, &[], &[o1]);
         let h2 = hash_tx_body(&prev, 0, &[], &[o2]);
         assert_ne!(h1, h2);
     }
 
     #[test]
-    fn scan_tag_flip_changes_body_hash() {
+    fn input_slot_index_is_bound() {
+        // Body hash must bind the slot index, since the AIR checks
+        // state openings at that index.
         let prev = [0u8; 32];
-        let o1 = mk_output(1, 100);
-        let mut o2 = o1;
-        o2.scan_tag = ScanTag([0xFFu8; 32]);
-        let h1 = hash_tx_body(&prev, 0, &[], &[o1]);
-        let h2 = hash_tx_body(&prev, 0, &[], &[o2]);
+        let mut i1 = mk_input(1);
+        let mut i2 = i1;
+        i2.slot_index ^= 0x55;
+        i1.valid = true;
+        let h1 = hash_tx_body(&prev, 0, &[i1], &[]);
+        let h2 = hash_tx_body(&prev, 0, &[i2], &[]);
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn commitment_flip_changes_body_hash() {
-        let prev = [0u8; 32];
-        let o1 = mk_output(1, 100);
-        let mut o2 = o1;
-        o2.commitment = Commitment([0x11u8; 32]);
-        let h1 = hash_tx_body(&prev, 0, &[], &[o1]);
-        let h2 = hash_tx_body(&prev, 0, &[], &[o2]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn differs_from_legacy_commitment_only_hash() {
-        // The §7.1 binding hash must not equal the commitment-only
-        // hash in `noid_poseidon2b` — if it did, the binding would be
-        // a no-op.
-        let prev = [0u8; 32];
-        let o = mk_output(1, 42);
-        let bound = hash_tx_body(&prev, 0, &[], &[o]);
-        let legacy = noid_poseidon2b::primitives::hash_tx_body(&prev, 0, &[], &[o.commitment]);
-        assert_ne!(bound.0, legacy.0);
     }
 
     #[test]
@@ -204,5 +120,16 @@ mod tests {
         let h_c = hash_tx_body(&prev, 11, &[i1, i2], &[]);
         assert_ne!(h_a, h_b);
         assert_ne!(h_a, h_c);
+    }
+
+    #[test]
+    fn dummy_input_equals_zero_leaf() {
+        // A body with `valid=false` inputs must hash the same as a body
+        // missing those inputs outright.
+        let prev = [0u8; 32];
+        let real = mk_input(1);
+        let h1 = hash_tx_body(&prev, 0, &[real], &[]);
+        let h2 = hash_tx_body(&prev, 0, &[real, TxInput::dummy(), TxInput::dummy()], &[]);
+        assert_eq!(h1, h2);
     }
 }

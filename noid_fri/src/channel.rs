@@ -28,7 +28,7 @@ use crate::prover::FriCommitment;
 /// runs in seconds rather than minutes — the protocol is still exercised
 /// fully end-to-end.
 #[cfg(not(any(test, debug_assertions)))]
-pub const NUM_QUERIES: usize = 64;
+pub const NUM_QUERIES: usize = 96;
 #[cfg(any(test, debug_assertions))]
 pub const NUM_QUERIES: usize = 10;
 

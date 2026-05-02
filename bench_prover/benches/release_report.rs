@@ -282,16 +282,18 @@ fn bench_fri_row(log_len: usize, hasher: &Blake3Hasher) -> FriRow {
 
     let prove_ms = time(|| {
         let mut ch = Channel::new();
-        let _ = prove(&commitment, &evals, &eval_point, &ntt, &mut ch, hasher);
+        ch.observe_fri_commitment(&commitment);
+        let _ = prove(&evals, &eval_point, &ntt, &mut ch, hasher);
     });
     let mut ch = Channel::new();
-    let proof = prove(&commitment, &evals, &eval_point, &ntt, &mut ch, hasher);
+    ch.observe_fri_commitment(&commitment);
+    let proof = prove(&evals, &eval_point, &ntt, &mut ch, hasher);
 
     let claimed_eval = noid_core::mle::evaluate::evaluate_slice(&evals, &eval_point);
     let verify_ms = time(|| {
         let mut ch = Channel::new();
+        ch.observe_fri_commitment(&commitment);
         let _ = verify(
-            &commitment,
             &eval_point,
             claimed_eval,
             proof.clone(),
@@ -434,7 +436,6 @@ fn mk_pi() -> PublicInputs {
     PublicInputs {
         prev_state_root: [0x11; 32],
         new_state_root: [0x22; 32],
-        nullifier_root: [0x33; 32],
         tx_body_hash: TxBodyHash([0x44; 32]),
         fee: 7,
     }

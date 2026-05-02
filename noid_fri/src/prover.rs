@@ -173,16 +173,24 @@ pub fn commit(
 /// Generate a FRI evaluation proof for `eval_point`.
 ///
 /// Assumes `evals` is the same vector that was committed with `commit()`.
+///
+/// The caller is responsible for having absorbed the commitment that binds
+/// `evals` into the transcript **before** this call (via
+/// `channel.observe_fri_commitment(...)`). This is what lets Stage 3b-0.5.1
+/// skip the commitment step entirely in the RLC-batched path: the batched
+/// codeword `C_batch = Σ λ_i · C_i` is a linear combination of already-
+/// committed columns, so the per-column roots upstream are sufficient
+/// binding — no extra Merkle tree over `C_batch` is needed.
 pub fn prove(
-    commitment: &FriCommitment,
     evals: &[Block128],
     eval_point: &[Block128],
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
 ) -> EvalProof {
-    // Absorb statement into the transcript.
-    channel.observe_fri_commitment(commitment);
+    // Absorb the opening point. Any statement that binds the *polynomial*
+    // (a commitment root, a tower of column roots, etc.) must already be
+    // in the transcript by this point — see the doc comment above.
     channel.observe_field_elems(eval_point);
 
     // Split eval_point:
@@ -493,10 +501,11 @@ mod tests {
             .map(|_| Block128::from(rng.gen::<u128>()))
             .collect();
 
-        // Prove
+        // Prove — caller binds the commitment into the transcript
+        // before calling `prove` (Stage 3b-0.5.1 contract).
         let mut prover_channel = Channel::new();
+        prover_channel.observe_fri_commitment(&commitment);
         let proof = prove(
-            &commitment,
             &evals,
             &eval_point,
             &ntt,
@@ -509,8 +518,8 @@ mod tests {
 
         // Verify
         let mut verifier_channel = Channel::new();
+        verifier_channel.observe_fri_commitment(&commitment);
         let result = verify(
-            &commitment,
             &eval_point,
             claimed_eval,
             proof,
@@ -541,8 +550,8 @@ mod tests {
             .collect();
 
         let mut prover_channel = Channel::new();
+        prover_channel.observe_fri_commitment(&commitment);
         let proof = prove(
-            &commitment,
             &evals,
             &eval_point,
             &ntt,
@@ -553,8 +562,8 @@ mod tests {
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
         let mut verifier_channel = Channel::new();
+        verifier_channel.observe_fri_commitment(&commitment);
         let result = verify(
-            &commitment,
             &eval_point,
             claimed_eval,
             proof,
@@ -590,8 +599,8 @@ mod tests {
             .collect();
 
         let mut prover_channel = Channel::new();
+        prover_channel.observe_fri_commitment(&commitment);
         let proof = prove(
-            &commitment,
             &evals,
             &eval_point,
             &ntt,
@@ -602,8 +611,8 @@ mod tests {
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
         let mut verifier_channel = Channel::new();
+        verifier_channel.observe_fri_commitment(&commitment);
         let result = verify(
-            &commitment,
             &eval_point,
             claimed_eval,
             proof,
@@ -650,7 +659,8 @@ mod tests {
             pool.install(|| {
                 let (commitment, _t, _c) = commit(&evals, &ntt, &hasher);
                 let mut ch = Channel::new();
-                prove(&commitment, &evals, &eval_point, &ntt, &mut ch, &hasher)
+                ch.observe_fri_commitment(&commitment);
+                prove(&evals, &eval_point, &ntt, &mut ch, &hasher)
             })
         };
 
@@ -701,8 +711,8 @@ mod tests {
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
         let mut prover_channel = Channel::new();
+        prover_channel.observe_fri_commitment(&commitment);
         let proof = prove(
-            &commitment,
             &evals,
             &eval_point,
             &ntt,
@@ -714,8 +724,8 @@ mod tests {
         eprintln!("n_rounds={}", proof.fri_oracles.len());
 
         let mut verifier_channel = Channel::new();
+        verifier_channel.observe_fri_commitment(&commitment);
         let result = verify(
-            &commitment,
             &eval_point,
             claimed_eval,
             proof,

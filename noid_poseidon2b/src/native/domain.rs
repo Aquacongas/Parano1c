@@ -41,16 +41,12 @@ pub fn capacity_iv(tag: DomainTag) -> [Block128; 2] {
 
 pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
 pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
-pub const TAG_NULLIFIER: DomainTag = DomainTag::new(b"NULLIFIE");
 pub const TAG_AUTHTAG: DomainTag = DomainTag::new(b"AUTHTAG_");
 pub const TAG_ADDRESS: DomainTag = DomainTag::new(b"ADDRESS_");
-pub const TAG_ADDRSPND: DomainTag = DomainTag::new(b"ADDRSPND");
 pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
-pub const TAG_VIEWKEY: DomainTag = DomainTag::new(b"VIEWKEY_");
-pub const TAG_SCANTAG: DomainTag = DomainTag::new(b"SCANTAG_");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
 
 #[cfg(test)]
@@ -63,16 +59,12 @@ mod tests {
         let tags = [
             TAG_LEAF,
             TAG_COMMIT,
-            TAG_NULLIFIER,
             TAG_AUTHTAG,
             TAG_ADDRESS,
-            TAG_ADDRSPND,
             TAG_TXBODY,
             TAG_BLOCKHDR,
             TAG_FSCHALNG,
             TAG_COMPRESS,
-            TAG_VIEWKEY,
-            TAG_SCANTAG,
             TAG_DAWTNSS,
         ];
         for i in 0..tags.len() {

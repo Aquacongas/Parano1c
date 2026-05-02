@@ -38,9 +38,7 @@ use noid_fri::verifier::verify as fri_verify;
 use noid_fri::Channel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
-use noid_poseidon2b::primitives::{
-    derive_view_key, hash_commitment, hash_scan_tag, Address, AuthTag, MasterSecret, Nullifier,
-};
+use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 use noid_stark::{prove_air, verify_air, StarkProof};
 use noid_tx::{
     hash_tx_body, PublicInputs, Transaction, TxBody, TxInput, TxOutput, PUBLIC_INPUTS_WIRE_SIZE,
@@ -51,52 +49,34 @@ use noid_tx::{
 // ---------------------------------------------------------------------------
 
 fn mk_input(seed: u8) -> TxInput {
-    let addr = Address([seed; 32]);
-    let c = hash_commitment(
-        seed as u128,
-        &addr,
-        Block128::from(seed as u128),
-        Block128::ZERO,
-    );
-    let mut n = [0u8; 32];
-    n[0] = seed;
-    n[1] = 0xAB;
     TxInput {
-        commitment: c,
-        nullifier: Nullifier(n),
+        slot_index: seed as u32,
+        value: seed as u64,
+        owner: Address([seed; 32]),
+        spend_secret: SpendSecret([seed ^ 0xAA; 32]),
+        auth_tag: AuthTag([seed ^ 0x55; 32]),
         valid: true,
     }
 }
 
-fn mk_output(seed: u8, salt: u128) -> TxOutput {
-    let addr = Address([seed; 32]);
-    let c = hash_commitment(
-        seed as u128,
-        &addr,
-        Block128::from(seed as u128),
-        Block128::ZERO,
-    );
-    let vk = derive_view_key(&MasterSecret([seed; 32]));
-    let salt = Block128::from(salt);
+fn mk_output(seed: u8) -> TxOutput {
     TxOutput {
-        commitment: c,
-        salt,
-        scan_tag: hash_scan_tag(&vk, salt),
+        value: seed as u64,
+        owner: Address([seed; 32]),
         valid: true,
     }
 }
 
-fn mk_tx_body(state_root: [u8; 32], nullifier_root: [u8; 32], new_root: [u8; 32]) -> TxBody {
+fn mk_tx_body(state_root: [u8; 32], new_root: [u8; 32]) -> TxBody {
     TxBody {
         prev_state_root: state_root,
         new_state_root: new_root,
-        nullifier_root,
         fee: 7,
         inputs: vec![mk_input(1), mk_input(2), TxInput::dummy(), TxInput::dummy()],
         outputs: vec![
-            mk_output(3, 10),
-            mk_output(4, 11),
-            mk_output(5, 12),
+            mk_output(3),
+            mk_output(4),
+            mk_output(5),
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
@@ -116,7 +96,6 @@ fn mk_public_inputs(body: &TxBody) -> PublicInputs {
     PublicInputs {
         prev_state_root: body.prev_state_root,
         new_state_root: body.new_state_root,
-        nullifier_root: body.nullifier_root,
         tx_body_hash,
         fee: body.fee,
     }
@@ -132,15 +111,14 @@ fn stark_proof_size(proof: &StarkProof) -> usize {
     for _c in &proof.column_commitments {
         n += 32 + 8 + 8; // root + depth + packing_factor
     }
-    n += proof.column_openings.len() * 16;
-    for ep in &proof.column_proofs {
-        // Each EvalProof carries a sequence of round commitments, query
-        // openings, and final polynomial evaluations. We approximate its
-        // serialized size by bincode-like accounting: 16 bytes per
-        // Block128 value + 32 per Merkle node. The actual struct
-        // internals are opaque, so we fall back to the size-of hint.
-        n += std::mem::size_of_val(ep);
-    }
+    n += proof.base_batch.column_openings.len() * 16;
+    // CRYPTO.md §12b: one batched base-column FRI proof replaces the
+    // per-column `column_proofs` block from 3b-0.4. Size is estimated
+    // the same way: per-round oracle roots, query symbol pairs, Merkle
+    // path bytes, and the final codeword. We fall back to the struct
+    // size-of hint to stay consistent with the previous accounting.
+    n += std::mem::size_of_val(&proof.base_batch.batch_proof);
+    n += 32 + 8 + 8; // base_batch commitment: root + depth + packing_factor
     for rp in &proof.zero_check_rounds {
         n += rp.len() * 16;
     }
@@ -178,8 +156,8 @@ fn bench_poseidon(c: &mut Criterion) {
     g.bench_function("hash_tx_body_full_4in_8out", |b| {
         let inputs = vec![mk_input(1), mk_input(2), mk_input(3), mk_input(4)];
         let outputs = vec![
-            mk_output(10, 1), mk_output(11, 2), mk_output(12, 3), mk_output(13, 4),
-            mk_output(14, 5), mk_output(15, 6), mk_output(16, 7), mk_output(17, 8),
+            mk_output(10), mk_output(11), mk_output(12), mk_output(13),
+            mk_output(14), mk_output(15), mk_output(16), mk_output(17),
         ];
         let prev = [0xABu8; 32];
         b.iter(|| hash_tx_body(&prev, 42, &inputs, &outputs));
@@ -229,20 +207,22 @@ fn bench_fri(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("prove", log_len), &log_len, |b, _| {
             b.iter(|| {
                 let mut ch = Channel::new();
-                fri_prove(&commitment, &col, &point, &ntt, &mut ch, &hasher)
+                ch.observe_fri_commitment(&commitment);
+                fri_prove(&col, &point, &ntt, &mut ch, &hasher)
             });
         });
 
         let mut ch = Channel::new();
-        let proof = fri_prove(&commitment, &col, &point, &ntt, &mut ch, &hasher);
+        ch.observe_fri_commitment(&commitment);
+        let proof = fri_prove(&col, &point, &ntt, &mut ch, &hasher);
         // Evaluate the opening locally so verify has a claim to check.
         let opening = mle_eval(&col, &point);
 
         g.bench_with_input(BenchmarkId::new("verify", log_len), &log_len, |b, _| {
             b.iter(|| {
                 let mut ch = Channel::new();
+                ch.observe_fri_commitment(&commitment);
                 fri_verify(
-                    &commitment,
                     &point,
                     opening,
                     proof.clone(),
@@ -343,13 +323,13 @@ fn bench_air(c: &mut Criterion) {
     let mut g = c.benchmark_group("04_air_trace");
 
     g.bench_function("tx_validity_build_trace", |b| {
-        let body = mk_tx_body([0u8; 32], [0u8; 32], [0u8; 32]);
+        let body = mk_tx_body([0u8; 32], [0u8; 32]);
         b.iter(|| TxValidityAir::build_trace(&body));
     });
 
     g.bench_function("tx_validity_native_check", |b| {
         let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32], [0u8; 32]));
+        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32]));
         b.iter(|| assert!(air.check(&trace)));
     });
 
@@ -365,7 +345,7 @@ fn bench_stark(c: &mut Criterion) {
     g.measurement_time(Duration::from_secs(10));
 
     let air = TxValidityAir::new();
-    let body = mk_tx_body([0u8; 32], [0u8; 32], [0u8; 32]);
+    let body = mk_tx_body([0u8; 32], [0u8; 32]);
     let trace = TxValidityAir::build_trace(&body);
     let pi = mk_public_inputs(&body);
 
@@ -402,21 +382,17 @@ fn bench_stark(c: &mut Criterion) {
 fn bench_chain(c: &mut Criterion) {
     let mut g = c.benchmark_group("06_chain");
 
-    // apply_tx: insert nullifiers + append output commitments into the
-    // depth-32 sparse Merkle trees.
-    g.bench_function("apply_tx_4in_8out", |b| {
+    // apply_tx: mint-only body exercises the state-tree append path.
+    g.bench_function("apply_tx_mint_8out", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let mut state = ChainState::new();
+                let mut state = ChainState::with_log_slots(10);
                 let prev = state.state_root();
-                let nr = state.nullifier_root();
-                let mut body = mk_tx_body(prev, nr, prev);
-                // Pre-compute the correct post-roots by a shadow apply.
+                let mut body = mint_only_body(prev);
                 let mut shadow = state.clone();
                 let st = apply_tx(&mut shadow, &body).expect("shadow apply");
                 body.new_state_root = st.new_state_root;
-                body.nullifier_root = st.nullifier_root;
                 let t = Instant::now();
                 let _ = apply_tx(&mut state, &body).expect("apply_tx");
                 total += t.elapsed();
@@ -425,21 +401,19 @@ fn bench_chain(c: &mut Criterion) {
         });
     });
 
-    // Block apply: 8 txs with root chaining + tx_root check.
+    // Block apply: 8 mint-only txs chained end-to-end.
     g.bench_function("apply_block_8_txs", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let mut reference = ChainState::new();
+                let mut reference = ChainState::with_log_slots(10);
                 let mut txs: Vec<Transaction> = Vec::with_capacity(8);
                 let mut cur_root = reference.state_root();
                 for k in 0..8u8 {
-                    let nr = reference.nullifier_root();
-                    let mut body = mk_tx_body_unique(cur_root, nr, k);
+                    let mut body = mk_tx_body_unique(cur_root, k);
                     let mut shadow = reference.clone();
                     let st = apply_tx(&mut shadow, &body).expect("shadow apply");
                     body.new_state_root = st.new_state_root;
-                    body.nullifier_root = st.nullifier_root;
                     let _ = apply_tx(&mut reference, &body).expect("ref apply");
                     let body_hash = hash_tx_body(
                         &body.prev_state_root,
@@ -447,11 +421,9 @@ fn bench_chain(c: &mut Criterion) {
                         &body.inputs,
                         &body.outputs,
                     );
-                    let auth_tag_count = body.inputs.iter().filter(|i| i.valid).count();
                     txs.push(Transaction {
                         body,
                         tx_body_hash: body_hash,
-                        auth_tags: vec![AuthTag([k; 32]); auth_tag_count],
                     });
                     cur_root = st.new_state_root;
                 }
@@ -472,7 +444,7 @@ fn bench_chain(c: &mut Criterion) {
                     transactions: txs,
                 };
 
-                let mut fresh = ChainState::new();
+                let mut fresh = ChainState::with_log_slots(10);
                 let t = Instant::now();
                 let _ = apply_block(&mut fresh, &block).expect("apply_block");
                 total += t.elapsed();
@@ -505,7 +477,7 @@ fn bench_chain(c: &mut Criterion) {
 
     // DA: pack trace + hash root (blake3, byte-native).
     g.bench_function("da_pack_and_root_validity_trace", |b| {
-        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32], [0u8; 32]));
+        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32]));
         b.iter(|| {
             let pw = pack_trace(&trace);
             packed_witness_root(&pw)
@@ -514,7 +486,7 @@ fn bench_chain(c: &mut Criterion) {
 
     // DA roundtrip to prove full-node invariance.
     g.bench_function("da_roundtrip_validity_trace", |b| {
-        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32], [0u8; 32]));
+        let trace = TxValidityAir::build_trace(&mk_tx_body([0u8; 32], [0u8; 32]));
         b.iter(|| {
             let pw = pack_trace(&trace);
             let back = unpack_trace(&pw).expect("unpack");
@@ -525,27 +497,50 @@ fn bench_chain(c: &mut Criterion) {
     g.finish();
 }
 
-fn mk_tx_body_unique(prev_state_root: [u8; 32], nullifier_root: [u8; 32], seed: u8) -> TxBody {
+fn mk_tx_body_unique(prev_state_root: [u8; 32], seed: u8) -> TxBody {
     TxBody {
         prev_state_root,
         new_state_root: [0u8; 32],
-        nullifier_root,
         fee: seed as u128,
         inputs: vec![
-            mk_input(0x10 | seed),
-            mk_input(0x20 | seed),
+            TxInput::dummy(),
+            TxInput::dummy(),
             TxInput::dummy(),
             TxInput::dummy(),
         ],
         outputs: vec![
-            mk_output(0x30 | seed, seed as u128),
-            mk_output(0x40 | seed, (seed as u128) << 1),
+            mk_output(0x30 | seed),
+            mk_output(0x40 | seed),
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
+        ],
+    }
+}
+
+fn mint_only_body(prev: [u8; 32]) -> TxBody {
+    TxBody {
+        prev_state_root: prev,
+        new_state_root: [0u8; 32],
+        fee: 0,
+        inputs: vec![
+            TxInput::dummy(),
+            TxInput::dummy(),
+            TxInput::dummy(),
+            TxInput::dummy(),
+        ],
+        outputs: vec![
+            mk_output(1),
+            mk_output(2),
+            mk_output(3),
+            mk_output(4),
+            mk_output(5),
+            mk_output(6),
+            mk_output(7),
+            mk_output(8),
         ],
     }
 }
@@ -557,7 +552,7 @@ fn mk_tx_body_unique(prev_state_root: [u8; 32], nullifier_root: [u8; 32], seed: 
 fn bench_wire(c: &mut Criterion) {
     let mut g = c.benchmark_group("07_wire");
 
-    let body = mk_tx_body([1u8; 32], [2u8; 32], [3u8; 32]);
+    let body = mk_tx_body([1u8; 32], [2u8; 32]);
     let bytes = body.to_bytes();
     println!(
         "# wire sizes: TxBody(4in 8out)={}B  BlockHeader={}B  PublicInputs={}B  BLOCK_VERSION={}",

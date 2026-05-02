@@ -216,43 +216,22 @@ fn bench_compress(c: &mut Criterion) {
 
 fn bench_utxo_primitives(c: &mut Criterion) {
     use noid_poseidon2b::primitives::{
-        derive_address, derive_spend_secret, hash_auth_tag, hash_commitment, hash_nullifier,
-        hash_tx_body, Commitment, MasterSecret,
+        derive_address, hash_auth_tag, hash_tx_body, hash_utxo_leaf, Commitment, SpendSecret,
     };
 
     let mut group = c.benchmark_group("utxo_primitives");
     group.sample_size(20);
 
     let mut rng = StdRng::seed_from_u64(0x0000_7E57_AB1E_7E57);
-    let ms = MasterSecret(rng.gen());
-    let salt = Block128::from(rng.gen::<u128>());
-    let addr = derive_address(&ms, salt);
-    let spend = derive_spend_secret(&ms, salt);
-    let commitment = hash_commitment(
-        1_000,
-        &addr,
-        Block128::from(rng.gen::<u128>()),
-        Block128::ZERO,
-    );
+    let spend = SpendSecret(rng.gen());
+    let addr = derive_address(&spend);
+    let commitment = hash_utxo_leaf(1_000, &addr);
 
     group.bench_function("derive_address", |b| {
-        b.iter(|| derive_address(black_box(&ms), black_box(salt)))
+        b.iter(|| derive_address(black_box(&spend)))
     });
-    group.bench_function("derive_spend_secret", |b| {
-        b.iter(|| derive_spend_secret(black_box(&ms), black_box(salt)))
-    });
-    group.bench_function("hash_commitment", |b| {
-        b.iter(|| {
-            hash_commitment(
-                black_box(1_000),
-                black_box(&addr),
-                black_box(Block128::from(7u8)),
-                black_box(Block128::ZERO),
-            )
-        })
-    });
-    group.bench_function("hash_nullifier", |b| {
-        b.iter(|| hash_nullifier(black_box(&spend), black_box(&commitment)))
+    group.bench_function("hash_utxo_leaf", |b| {
+        b.iter(|| hash_utxo_leaf(black_box(1_000), black_box(&addr)))
     });
 
     let prev = [0u8; 32];
@@ -305,8 +284,8 @@ fn bench_end_to_end(c: &mut Criterion) {
         bencher.iter(|| {
             let (commitment, _tree, _code) = commit(&evals, &ntt, &hasher);
             let mut prover_channel = Channel::new();
+            prover_channel.observe_fri_commitment(&commitment);
             let _proof = prove(
-                &commitment,
                 &evals,
                 &eval_point,
                 &ntt,

@@ -8,13 +8,20 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 use crate::channel::Channel;
 use crate::code::{fold, LOG_RATE};
 use crate::hasher::{CryptographicHasher, HashOutput};
-use crate::prover::{EvalProof, FriCommitment};
+use crate::prover::EvalProof;
 
 /// Verify a FRI evaluation proof.
 ///
 /// Returns `Ok(())` if the proof is valid, `Err` with a description otherwise.
+///
+/// The caller is responsible for having absorbed any commitment that binds
+/// the polynomial being opened into the transcript **before** this call —
+/// mirrors the contract of [`crate::prover::prove`]. For a standalone
+/// (non-batched) opening, callers should absorb the single
+/// `FriCommitment` via `channel.observe_fri_commitment(...)`. For the
+/// RLC-batched path (§12b), per-column commitments upstream provide the
+/// binding and no extra commitment is needed here.
 pub fn verify(
-    commitment: &FriCommitment,
     eval_point: &[Block128],
     eval: Block128,
     eval_proof: EvalProof,
@@ -22,18 +29,8 @@ pub fn verify(
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
 ) -> Result<(), String> {
-    // Replay the statement.
-    channel.observe_fri_commitment(commitment);
     channel.observe_field_elems(eval_point);
     channel.observe_field_elem(eval);
-
-    if commitment.log_len != eval_point.len() {
-        return Err(format!(
-            "eval-point length mismatch: commitment expects {}, got {}",
-            commitment.log_len,
-            eval_point.len()
-        ));
-    }
 
     let tau = crate::channel::TAU.min(eval_point.len());
     let n = eval_point.len();
