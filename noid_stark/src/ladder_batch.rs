@@ -54,20 +54,53 @@ pub fn weight_at(gamma: Block128, points: &[Vec<Block128>], r_prime: &[Block128]
 
 /// Build the weight table `W(x)` for all `x ∈ {0,1}^n` as a length
 /// `2^n` vector in the crate's LSB-first flat-index convention
-/// (matches `padded_columns`). `points` must be in ladder order
-/// `[P_0, …, P_n]` and every point must have length `n`.
-pub fn build_weight_table(gamma: Block128, points: &[Vec<Block128>], n: usize) -> Vec<Block128> {
+/// (matches `padded_columns`).
+///
+/// Exploits the structural sparsity of `ladder_points(r)`: for `k < n`
+/// the point `P_k` has eq-table supported only on indices
+/// `(j << (k+1)) | (1 << k)` where `j ∈ [0, 2^{n-k-1})` and the values
+/// there equal `eq_ind_partial_eval(r[k+1..])`. `P_n` contributes only
+/// to index 0 (value `1`). The per-`k` supports are disjoint, so the
+/// scatter is parallel-safe. Total work is `O(2^n)` muls, independent
+/// of `n`, versus the old `O(n · 2^n)`.
+pub fn build_weight_table(gamma: Block128, r: &[Block128], n: usize) -> Vec<Block128> {
+    debug_assert_eq!(r.len(), n);
+    use rayon::prelude::*;
+
     let len = 1usize << n;
     let mut w = vec![Block128::ZERO; len];
-    let mut gk = Block128::ONE;
-    for pk in points {
-        debug_assert_eq!(pk.len(), n);
-        let eq_table = noid_core::mle::eq::eq_ind_partial_eval(pk);
-        debug_assert_eq!(eq_table.len(), len);
-        for i in 0..len {
-            w[i] += gk * eq_table[i];
+
+    // Precompute powers γ^0..γ^n once.
+    let mut gammas = Vec::with_capacity(n + 1);
+    {
+        let mut gk = Block128::ONE;
+        for _ in 0..=n {
+            gammas.push(gk);
+            gk *= gamma;
         }
-        gk *= gamma;
+    }
+
+    // P_n contributes γ^n at index 0.
+    w[0] = gammas[n];
+
+    // Scatter per-k into disjoint strides. Writes from different k
+    // never collide, so we can safely produce each fragment in
+    // parallel and apply them sequentially.
+    let fragments: Vec<(usize, usize, Vec<Block128>)> = (0..n)
+        .into_par_iter()
+        .map(|k| {
+            let trail = noid_core::mle::eq::eq_ind_partial_eval(&r[k + 1..n]);
+            let gk = gammas[k];
+            let scaled: Vec<Block128> = trail.into_iter().map(|v| gk * v).collect();
+            let stride = 1usize << (k + 1);
+            let base = 1usize << k;
+            (stride, base, scaled)
+        })
+        .collect();
+    for (stride, base, scaled) in fragments {
+        for (j, v) in scaled.into_iter().enumerate() {
+            w[base + j * stride] = v;
+        }
     }
     w
 }
@@ -91,51 +124,48 @@ pub fn prove_product_sumcheck(
     debug_assert_eq!(c.len(), w.len());
     debug_assert_eq!(c.len(), 1usize << n);
 
+    use rayon::prelude::*;
+
     let mut rounds: Vec<RoundPoly> = Vec::with_capacity(n);
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
     let mut claim = target;
+    let two = Block128::from(2u8);
 
     for _ in 0..n {
-        // Degree-2 round polynomial
-        //   p(s) = Σ_{j < half} ((c[j] + s*(c[j+half]+c[j]))
-        //                      · (w[j] + s*(w[j+half]+w[j])))
-        // sent as evaluations at s ∈ {0, 1, 2}. We exploit s=0 and
-        // s=1 directly and only pay the general branch at s=2.
         let half = c.len() / 2;
-        let mut p0 = Block128::ZERO;
-        let mut p1 = Block128::ZERO;
-        let mut p2 = Block128::ZERO;
-        let two = Block128::from(2u8);
-        for j in 0..half {
-            let c0 = c[j];
-            let c1 = c[j + half];
-            let w0 = w[j];
-            let w1 = w[j + half];
-            p0 += c0 * w0;
-            p1 += c1 * w1;
-            // s = 2 = Block128::from(2u8). Char 2 so 1+s = 3, but
-            // we use the generic formula for clarity.
-            let cs = c0 + two * (c1 + c0);
-            let ws = w0 + two * (w1 + w0);
-            p2 += cs * ws;
-        }
+        let (p0, p1, p2) = (0..half)
+            .into_par_iter()
+            .map(|j| {
+                let c0 = c[j];
+                let c1 = c[j + half];
+                let w0 = w[j];
+                let w1 = w[j + half];
+                let cs = c0 + two * (c1 + c0);
+                let ws = w0 + two * (w1 + w0);
+                (c0 * w0, c1 * w1, cs * ws)
+            })
+            .reduce(
+                || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+            );
 
-        // Sanity (debug only): p(0) + p(1) must match the running claim.
         debug_assert_eq!(p0 + p1, claim, "product sumcheck consistency failure");
 
         let rp = vec![p0, p1, p2];
         channel.observe_field_elems(&rp);
         let r = channel.get_random_point();
 
-        // Fold both tables at r on the highest variable.
-        let mut c_next = Vec::with_capacity(half);
-        let mut w_next = Vec::with_capacity(half);
-        for j in 0..half {
-            c_next.push(c[j] + r * (c[j + half] + c[j]));
-            w_next.push(w[j] + r * (w[j + half] + w[j]));
-        }
-        c = c_next;
-        w = w_next;
+        // In-place fold at the highest variable.
+        let (lo_c, hi_c) = c.split_at_mut(half);
+        lo_c.par_iter_mut()
+            .zip(hi_c.par_iter())
+            .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+        c.truncate(half);
+        let (lo_w, hi_w) = w.split_at_mut(half);
+        lo_w.par_iter_mut()
+            .zip(hi_w.par_iter())
+            .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+        w.truncate(half);
 
         claim = crate::lagrange_eval_at_pub(&rp, r);
         rounds.push(rp);
@@ -215,7 +245,7 @@ mod tests {
         let r = random_vec(n, 0x1111);
         let points = ladder_points(&r);
         let gamma = Block128::from(0xDEAD_BEEF_u128);
-        let table = build_weight_table(gamma, &points, n);
+        let table = build_weight_table(gamma, &r, n);
         for idx in 0..(1usize << n) {
             let x: Vec<Block128> = (0..n)
                 .map(|b| if (idx >> b) & 1 == 1 { Block128::ONE } else { Block128::ZERO })
@@ -243,7 +273,7 @@ mod tests {
         let mut pch = Channel::new();
         let gamma = pch.get_random_point();
         let target = target_claim(gamma, &partials);
-        let w = build_weight_table(gamma, &points, n);
+        let w = build_weight_table(gamma, &r, n);
         let (rounds, _challenges) =
             prove_product_sumcheck(col.clone(), w.clone(), target, &mut pch);
 

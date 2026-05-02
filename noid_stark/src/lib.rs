@@ -576,7 +576,7 @@ fn prove_base_and_ladder_claims(
         channel.observe_field_elems(partials);
         let gamma = channel.get_random_point();
         let target = crate::ladder_batch::target_claim(gamma, partials);
-        let w = crate::ladder_batch::build_weight_table(gamma, &ladder, log_len);
+        let w = crate::ladder_batch::build_weight_table(gamma, r_point, log_len);
         let col = padded_columns[col_id].clone();
         let (rounds, challenges) =
             crate::ladder_batch::prove_product_sumcheck(col, w, target, channel);

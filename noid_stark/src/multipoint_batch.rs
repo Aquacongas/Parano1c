@@ -54,6 +54,8 @@ pub fn prove_multipoint_sumcheck(
         debug_assert_eq!(b.len(), 1 << n);
     }
 
+    use rayon::prelude::*;
+
     let mut rounds: Vec<RoundPoly> = Vec::with_capacity(n);
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
     let mut claim = target;
@@ -61,38 +63,47 @@ pub fn prove_multipoint_sumcheck(
 
     for _ in 0..n {
         let half = pairs[0].0.len() / 2;
-        let mut p0 = Block128::ZERO;
-        let mut p1 = Block128::ZERO;
-        let mut p2 = Block128::ZERO;
-        for (a, b) in &pairs {
-            for j in 0..half {
-                let a0 = a[j];
-                let a1 = a[j + half];
-                let b0 = b[j];
-                let b1 = b[j + half];
-                p0 += a0 * b0;
-                p1 += a1 * b1;
-                let as_ = a0 + two * (a1 + a0);
-                let bs_ = b0 + two * (b1 + b0);
-                p2 += as_ * bs_;
-            }
-        }
+        let (p0, p1, p2) = pairs
+            .par_iter()
+            .map(|(a, b)| {
+                (0..half)
+                    .into_par_iter()
+                    .map(|j| {
+                        let a0 = a[j];
+                        let a1 = a[j + half];
+                        let b0 = b[j];
+                        let b1 = b[j + half];
+                        let as_ = a0 + two * (a1 + a0);
+                        let bs_ = b0 + two * (b1 + b0);
+                        (a0 * b0, a1 * b1, as_ * bs_)
+                    })
+                    .reduce(
+                        || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
+                        |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                    )
+            })
+            .reduce(
+                || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+            );
         debug_assert_eq!(p0 + p1, claim, "multipoint sumcheck consistency failure");
 
         let rp = vec![p0, p1, p2];
         channel.observe_field_elems(&rp);
         let r = channel.get_random_point();
 
-        for (a, b) in pairs.iter_mut() {
-            let mut a_next = Vec::with_capacity(half);
-            let mut b_next = Vec::with_capacity(half);
-            for j in 0..half {
-                a_next.push(a[j] + r * (a[j + half] + a[j]));
-                b_next.push(b[j] + r * (b[j + half] + b[j]));
-            }
-            *a = a_next;
-            *b = b_next;
-        }
+        pairs.par_iter_mut().for_each(|(a, b)| {
+            let (lo_a, hi_a) = a.split_at_mut(half);
+            lo_a.par_iter_mut()
+                .zip(hi_a.par_iter())
+                .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+            a.truncate(half);
+            let (lo_b, hi_b) = b.split_at_mut(half);
+            lo_b.par_iter_mut()
+                .zip(hi_b.par_iter())
+                .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+            b.truncate(half);
+        });
 
         claim = crate::lagrange_eval_at_pub(&rp, r);
         rounds.push(rp);
