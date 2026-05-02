@@ -22,7 +22,7 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::channel::Channel;
 use noid_fri::hasher::Blake3Hasher;
-use noid_fri::prover::{commit as fri_commit, prove as fri_prove, EvalProof, FriCommitment};
+use noid_fri::prover::{commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment};
 use noid_fri::verifier::verify as fri_verify;
 
 /// Default state vector depth used by mainnet. 16 777 216 slots fits
@@ -266,7 +266,7 @@ fn open_column(
 ) -> SlotColumnOpening {
     let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
-    let (commitment, _tree, _code) = fri_commit(evals, &ntt, &hasher);
+    let commitment = fri_commit_fast(evals, &ntt);
     let mut ch = Channel::new();
     ch.observe_fri_commitment(&commitment);
     let proof = fri_prove(evals, point, &ntt, &mut ch, &hasher);
@@ -339,8 +339,7 @@ const STATE_DOMAIN: &[u8; 20] = b"PARANOID/FRISTATE/v1";
 fn column_root(log_slots: usize, evals: &[Block128]) -> [u8; 32] {
     debug_assert_eq!(evals.len(), 1usize << log_slots);
     let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
-    let (commitment, _tree, _code) = fri_commit(evals, &ntt, &hasher);
+    let commitment = fri_commit_fast(evals, &ntt);
     commitment.vector_commitment.root
 }
 

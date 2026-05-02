@@ -1,46 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid. All rights reserved.
 
-//! Paranoid release report — one branded, screenshot-ready dump of every
-//! number a reviewer, an integrator, or a competing team is likely to ask
-//! about. If you only run one benchmark in this repo, run this one.
+//! Paranoid release report — one branded, screenshot-ready dump of the
+//! hardware floor of the implemented primitive stack. Every number here
+//! is on real data, production code paths, release-profile.
 //!
 //!   cargo bench --bench release_report
 //!
 //! What this prints, in order:
 //!
-//!   1. Environment block (arch, SIMD tier, threads, build profile).
+//!   1. Environment (arch, SIMD tier, threads, build profile).
 //!   2. Protocol parameters (field, hash, FRI rate / queries / TAU, NTT).
-//!   3. FRI prover scaling table across `log_n ∈ {14, 16, 18, 20}`:
-//!      NTT, Merkle, commit, prove, verify, proof size.
-//!   4. Sumcheck + prove-throughput summary (cells/s).
-//!   5. Binius packing table: same logical witness committed raw
-//!      (1x / 128-bit cells), byte-packed (16x), bit-packed (128x) — the
-//!      DA / bandwidth headline.
-//!   6. STARK end-to-end table on `LinearCombinationAir`: real AIR
-//!      commit + zero-check sumcheck + per-column FRI opening.
-//!   7. DA witness-root throughput: Poseidon2b over the packed DA blob
-//!      (this is what every full node recomputes against the block header).
-//!   8. IVC fold / decide numbers on a realistic column batch.
+//!   3. Poseidon2b — native permutation, sponge, tx-body-hash.
+//!   4. FRI PCS scaling on log_n ∈ {14, 16, 18, 20}: NTT, Merkle, commit,
+//!      prove, verify, proof-bytes (estimated), sumcheck, prover throughput.
+//!   5. Binius packing at log_cells = 20: raw / bytes / bits — payload,
+//!      shrink, commit, open.
+//!   6. DA witness-root: Blake3 over the packed block witness blob.
+//!   7. Wire codecs: TxBody encode / decode, BlockHeader encode / decode,
+//!      plus the exact wire sizes printed in the header.
 //!
-//! Every data point is a wall-clock median over a small number of samples.
-//! `prove`/`verify` timings exclude compile-time constants and are
-//! end-to-end; no pre-computation is hoisted out.
+//! What this explicitly does NOT do:
+//!   * No toy AIRs. STARK / AIR numbers live in `stark_report`, which is
+//!     the roadmap tracker and grows as real AIRs ship.
+//!   * No synthetic IVC. Fold / decide on fabricated columns is misleading
+//!     before the tx-AIR is done.
 //!
-//! Companion benches (use these for deeper dives, not first-look numbers):
-//!   - `cargo bench --bench bench_prover`    — criterion micro-benchmarks
-//!     (packed-field ops, NTT, Merkle, UTXO primitives).
-//!   - `cargo bench --bench air_bench`       — focused AIR/STARK/IVC perf.
-//!   - `cargo bench --bench binius_packing`  — focused packing-savings
-//!     breakdown with proof-size deltas.
+//! Companion: `cargo bench --bench stark_report` (roadmap progress),
+//! `cargo bench --bench bench_prover` (criterion micro-benchmarks).
 
 use std::time::{Duration, Instant};
 
+use noid_binius::{pack_bits, pack_bytes, BitWitness, ByteWitness, PackedCommit};
+use noid_chain::{
+    packed_witness_root, trace_witness_root, BlockHeader, BLOCK_HEADER_WIRE_SIZE, BLOCK_VERSION,
+};
 use noid_core::ntt::forward_ntt_parallel;
 use noid_core::packed::PACKED_LANES;
 use noid_core::sumcheck::prove::prove_single_packed;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 
+use noid_air::{ColumnDomain, Trace};
 use noid_fri::channel::Channel;
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::hasher::Blake3Hasher;
@@ -49,13 +49,12 @@ use noid_fri::prover::{commit, prove};
 use noid_fri::verifier::verify;
 use noid_fri::{NUM_QUERIES, TAU};
 
-use noid_air::{ColumnDomain, LinearCombinationAir, Trace};
-use noid_binius::{pack_bits, pack_bytes, PackedCommit};
-use noid_chain::{packed_witness_root, trace_witness_root};
-use noid_ivc::{decide, fold_step_prove, Accumulator};
-use noid_poseidon2b::primitives::TxBodyHash;
-use noid_stark::{padded_log_len, prove_air, verify_air};
-use noid_tx::PublicInputs;
+use noid_poseidon2b::native::compression::Poseidon2bSponge;
+use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+use noid_tx::{
+    hash_tx_body, TxBody, TxInput, TxOutput, PUBLIC_INPUTS_WIRE_SIZE,
+};
 
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -65,20 +64,10 @@ use rand::SeedableRng;
 // Config
 // ---------------------------------------------------------------------------
 
-/// Trace sizes (log2) shown in the main FRI scaling table.
 const LOG_TRACES: &[usize] = &[14, 16, 18, 20];
-
-/// STARK table sweeps. `(log_rows, n_cols)`.
-const STARK_SHAPES: &[(usize, usize)] = &[(10, 3), (12, 3), (14, 3), (14, 6)];
-
-/// IVC sweep. `(log_rows, steps)`.
-const IVC_SHAPES: &[(usize, usize)] = &[(10, 8), (12, 16), (14, 16)];
-
-/// `log_cells` used for the Binius packing table. One value keeps the
-/// table compact; anyone who wants a sweep runs `binius_packing`.
 const PACKING_LOG_CELLS: usize = 20;
+const DA_LOG_ROWS: &[usize] = &[14, 16, 18];
 
-/// Warmup + sample counts for each data point.
 const WARMUP: usize = 1;
 const SAMPLES: usize = 3;
 
@@ -201,7 +190,7 @@ fn detect_simd() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Proof-size estimator (FRI eval proof)
+// Proof-size estimator (single-column FRI eval proof)
 // ---------------------------------------------------------------------------
 
 fn estimate_proof_bytes(log_len: usize) -> usize {
@@ -224,7 +213,67 @@ fn estimate_proof_bytes(log_len: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// FRI prover scaling row
+// Poseidon2b
+// ---------------------------------------------------------------------------
+
+struct PoseidonRows {
+    permutation: Duration,
+    sponge_1kib: Duration,
+    tx_body_hash: Duration,
+}
+
+fn mk_input(seed: u8) -> TxInput {
+    TxInput {
+        slot_index: seed as u32,
+        value: seed as u64,
+        owner: Address([seed; 32]),
+        spend_secret: SpendSecret([seed ^ 0xAA; 32]),
+        auth_tag: AuthTag([seed ^ 0x55; 32]),
+        valid: true,
+    }
+}
+
+fn mk_output(seed: u8) -> TxOutput {
+    TxOutput {
+        value: seed as u64,
+        owner: Address([seed; 32]),
+        valid: true,
+    }
+}
+
+fn bench_poseidon() -> PoseidonRows {
+    let permutation = time(|| {
+        let mut state = [
+            Block128::from(1u128),
+            Block128::from(2u128),
+            Block128::from(3u128),
+            Block128::from(4u128),
+        ];
+        Poseidon2bPermutation.permute_mut(&mut state);
+    });
+
+    let data = vec![0xA5u8; 1024];
+    let sponge_1kib = time(|| {
+        let mut s = Poseidon2bSponge::new();
+        s.update(&data);
+        let _ = s.finalize();
+    });
+
+    let inputs = vec![mk_input(1), mk_input(2), mk_input(3), mk_input(4)];
+    let outputs = vec![
+        mk_output(10), mk_output(11), mk_output(12), mk_output(13),
+        mk_output(14), mk_output(15), mk_output(16), mk_output(17),
+    ];
+    let prev = [0xABu8; 32];
+    let tx_body_hash = time(|| {
+        let _ = hash_tx_body(&prev, 42, &inputs, &outputs);
+    });
+
+    PoseidonRows { permutation, sponge_1kib, tx_body_hash }
+}
+
+// ---------------------------------------------------------------------------
+// FRI PCS scaling
 // ---------------------------------------------------------------------------
 
 struct FriRow {
@@ -320,7 +369,7 @@ fn bench_fri_row(log_len: usize, hasher: &Blake3Hasher) -> FriRow {
 }
 
 // ---------------------------------------------------------------------------
-// Binius packing row
+// Binius packing
 // ---------------------------------------------------------------------------
 
 struct PackRow {
@@ -355,7 +404,6 @@ fn bench_packing_rows(log_cells: usize, hasher: &Blake3Hasher) -> Vec<PackRow> {
 
     let mut out = Vec::with_capacity(3);
 
-    // raw
     let commit_raw_t = time(|| {
         let _ = PackedCommit::commit_raw(blocks.clone(), &ntt_raw, hasher);
     });
@@ -376,7 +424,6 @@ fn bench_packing_rows(log_cells: usize, hasher: &Blake3Hasher) -> Vec<PackRow> {
         open_ms: open_raw_t,
     });
 
-    // bytes
     let commit_bytes_t = time(|| {
         let _ = PackedCommit::commit_bytes(bytes_packed.clone(), &ntt_bytes, hasher);
     });
@@ -397,7 +444,6 @@ fn bench_packing_rows(log_cells: usize, hasher: &Blake3Hasher) -> Vec<PackRow> {
         open_ms: open_bytes_t,
     });
 
-    // bits
     let commit_bits_t = time(|| {
         let _ = PackedCommit::commit_bits(bits_packed.clone(), &ntt_bits, hasher);
     });
@@ -418,69 +464,16 @@ fn bench_packing_rows(log_cells: usize, hasher: &Blake3Hasher) -> Vec<PackRow> {
         open_ms: open_bits_t,
     });
 
+    let w = BitWitness::from_bits(&bits);
+    let _ = BitWitness::from_packed(w.as_packed().to_vec()).as_expanded();
+    let w = ByteWitness::from_bytes(&bytes);
+    let _ = ByteWitness::from_packed(w.as_packed().to_vec()).as_expanded();
+
     out
 }
 
 // ---------------------------------------------------------------------------
-// STARK row (AIR + STARK wrapper, end-to-end)
-// ---------------------------------------------------------------------------
-
-struct StarkRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_ms: Duration,
-    verify_ms: Duration,
-}
-
-fn mk_pi() -> PublicInputs {
-    PublicInputs {
-        prev_state_root: [0x11; 32],
-        new_state_root: [0x22; 32],
-        tx_body_hash: TxBodyHash([0x44; 32]),
-        fee: 7,
-    }
-}
-
-fn mk_linear_trace(log_rows: usize, n_cols: usize) -> Trace {
-    let n = 1usize << log_rows;
-    let mut cols: Vec<Vec<Block128>> = (0..n_cols - 1)
-        .map(|c| {
-            (0..n)
-                .map(|i| Block128::from((i as u128).wrapping_mul(c as u128 + 1) ^ 0xABCD))
-                .collect()
-        })
-        .collect();
-    let mut last = vec![Block128::ZERO; n];
-    for c in &cols {
-        for i in 0..n {
-            last[i] += c[i];
-        }
-    }
-    cols.push(last);
-    Trace::new(cols)
-}
-
-fn bench_stark_row(log_rows: usize, n_cols: usize) -> StarkRow {
-    let air = LinearCombinationAir::new(n_cols, log_rows);
-    let trace = mk_linear_trace(log_rows, n_cols);
-    let pi = mk_pi();
-    let prove_ms = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-    let verify_ms = time(|| {
-        verify_air(&air, &pi, &proof).unwrap();
-    });
-    StarkRow {
-        log_rows,
-        n_cols,
-        prove_ms,
-        verify_ms,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DA witness-root row
+// DA witness-root (Blake3 over packed blob)
 // ---------------------------------------------------------------------------
 
 struct DaRow {
@@ -496,15 +489,8 @@ fn bench_witness_root(log_rows: usize) -> DaRow {
     let n = 1usize << log_rows;
     let mut rng = StdRng::seed_from_u64(0xDAD0_DAD0_0000_0000 ^ log_rows as u64);
 
-    // Realistic mixed trace: bits + bytes + raw.
     let bit_col: Vec<Block128> = (0..n)
-        .map(|_| {
-            if rng.gen::<bool>() {
-                Block128::ONE
-            } else {
-                Block128::ZERO
-            }
-        })
+        .map(|_| if rng.gen::<bool>() { Block128::ONE } else { Block128::ZERO })
         .collect();
     let byte_col: Vec<Block128> = (0..n)
         .map(|_| Block128::from(rng.gen::<u8>() as u128))
@@ -523,8 +509,6 @@ fn bench_witness_root(log_rows: usize) -> DaRow {
     let hash_ms = time(|| {
         let _ = packed_witness_root(&pw);
     });
-    // Sanity: also time the convenience shortcut, but only use the primary
-    // number for the table.
     let _ = trace_witness_root(&trace);
 
     let bytes_per_s = packed_bytes as f64 / hash_ms.as_secs_f64();
@@ -537,46 +521,64 @@ fn bench_witness_root(log_rows: usize) -> DaRow {
 }
 
 // ---------------------------------------------------------------------------
-// IVC row
+// Wire codecs
 // ---------------------------------------------------------------------------
 
-struct IvcRow {
-    log_rows: usize,
-    steps: usize,
-    fold_ms: Duration,
-    decide_ms: Duration,
+struct WireRow {
+    tx_body_bytes: usize,
+    tx_body_encode: Duration,
+    tx_body_decode: Duration,
+    header_encode: Duration,
+    header_decode: Duration,
 }
 
-fn bench_ivc_row(log_rows: usize, steps: usize) -> IvcRow {
-    let log_len = padded_log_len(log_rows);
-    let z: Vec<Block128> = (0..log_len)
-        .map(|i| Block128::from(0xC0DEu128 << (i % 32)))
-        .collect();
-    let cols: Vec<Vec<Block128>> = (0..steps)
-        .map(|s| {
-            (0..1 << log_len)
-                .map(|i| Block128::from((s as u128).wrapping_mul(i as u128 + 7)))
-                .collect()
-        })
-        .collect();
-    let fold_ms = time(|| {
-        let mut acc = Accumulator::new(log_len, z.clone());
-        for c in &cols {
-            fold_step_prove(&mut acc, c);
-        }
+fn bench_wire() -> WireRow {
+    let body = TxBody {
+        prev_state_root: [1u8; 32],
+        new_state_root: [2u8; 32],
+        fee: 7,
+        inputs: vec![mk_input(1), mk_input(2), TxInput::dummy(), TxInput::dummy()],
+        outputs: vec![
+            mk_output(3), mk_output(4), mk_output(5),
+            TxOutput::dummy(), TxOutput::dummy(), TxOutput::dummy(),
+            TxOutput::dummy(), TxOutput::dummy(),
+        ],
+    };
+    let bytes = body.to_bytes();
+    let tx_body_bytes = bytes.len();
+
+    let tx_body_encode = time(|| {
+        let _ = body.to_bytes();
     });
-    let mut acc = Accumulator::new(log_len, z);
-    for c in &cols {
-        fold_step_prove(&mut acc, c);
-    }
-    let decide_ms = time(|| {
-        decide(&acc).unwrap();
+    let tx_body_decode = time(|| {
+        let _ = TxBody::from_bytes(&bytes).expect("decode");
     });
-    IvcRow {
-        log_rows,
-        steps,
-        fold_ms,
-        decide_ms,
+
+    let header = BlockHeader {
+        prev_block_hash: [0u8; 32],
+        state_root: [1u8; 32],
+        tx_root: [2u8; 32],
+        timestamp: 1_700_000_000,
+        miner_address: Address([3u8; 32]),
+        nonce: 0,
+        proof_transcript_hash: [4u8; 32],
+        witness_root: [5u8; 32],
+    };
+    let hbytes = header.to_bytes();
+
+    let header_encode = time(|| {
+        let _ = header.to_bytes();
+    });
+    let header_decode = time(|| {
+        let _ = BlockHeader::from_bytes(&hbytes).expect("decode");
+    });
+
+    WireRow {
+        tx_body_bytes,
+        tx_body_encode,
+        tx_body_decode,
+        header_encode,
+        header_decode,
     }
 }
 
@@ -591,7 +593,7 @@ const BANNER: &str = r#"
   |  __/ ___ \|  _ <  / ___ \| |\  | |_| | || |_| |
   |_| /_/   \_\_| \_\/_/   \_\_| \_|\___/___|____/
 
-  PARANOID  --  RELEASE REPORT
+  PARANOID  --  RELEASE REPORT (primitives floor)
   FRI + Blake3 (merkle) + Poseidon2b (transcript) + Binius packing
 "#;
 
@@ -662,6 +664,15 @@ fn print_params() {
         "Binius packing:", "bit 128x / byte 16x / raw 1x"
     );
     println!("  +---------------------------------------------------------------+");
+    println!();
+}
+
+fn print_poseidon(r: &PoseidonRows) {
+    println!("  +----------------------- POSEIDON2B (t=4) -----------------------+");
+    println!("  | {:<36} {:>24} |", "permutation (4x128b):", fmt_ms(r.permutation));
+    println!("  | {:<36} {:>24} |", "sponge absorb 1 KiB + squeeze:", fmt_ms(r.sponge_1kib));
+    println!("  | {:<36} {:>24} |", "hash_tx_body (4in, 8out):", fmt_ms(r.tx_body_hash));
+    println!("  +----------------------------------------------------------------+");
     println!();
 }
 
@@ -737,27 +748,6 @@ fn print_packing_table(log_cells: usize, rows: &[PackRow]) {
     println!();
 }
 
-fn print_stark_table(rows: &[StarkRow]) {
-    println!("  +---------- STARK END-TO-END (LinearCombinationAir, zero-check) ----------+");
-    println!(
-        "  | {:>8} | {:>8} | {:>7} | {:>14} | {:>14} |",
-        "log_rows", "rows", "n_cols", "prove", "verify"
-    );
-    println!("  |----------+----------+---------+----------------+----------------|");
-    for r in rows {
-        println!(
-            "  | {:>8} | {:>8} | {:>7} | {:>14} | {:>14} |",
-            r.log_rows,
-            fmt_count(1 << r.log_rows),
-            r.n_cols,
-            fmt_ms(r.prove_ms),
-            fmt_ms(r.verify_ms),
-        );
-    }
-    println!("  +-------------------------------------------------------------------------+");
-    println!();
-}
-
 fn print_da_table(rows: &[DaRow]) {
     println!("  +---------------- DA WITNESS-ROOT  (Blake3 over packed blob) -----------------+");
     println!(
@@ -778,23 +768,19 @@ fn print_da_table(rows: &[DaRow]) {
     println!();
 }
 
-fn print_ivc_table(rows: &[IvcRow]) {
-    println!("  +------------------------------ IVC ------------------------------+");
+fn print_wire(r: &WireRow) {
+    println!("  +------------------------------ WIRE CODECS ------------------------------+");
     println!(
-        "  | {:>8} | {:>6} | {:>14} | {:>14} |",
-        "log_rows", "steps", "fold (total)", "decide"
+        "  | sizes: TxBody(4in,8out) = {} B   BlockHeader = {} B   PublicInputs = {} B",
+        r.tx_body_bytes, BLOCK_HEADER_WIRE_SIZE, PUBLIC_INPUTS_WIRE_SIZE
     );
-    println!("  |----------+--------+----------------+----------------|");
-    for r in rows {
-        println!(
-            "  | {:>8} | {:>6} | {:>14} | {:>14} |",
-            r.log_rows,
-            r.steps,
-            fmt_ms(r.fold_ms),
-            fmt_ms(r.decide_ms),
-        );
-    }
-    println!("  +-----------------------------------------------------------------+");
+    println!("  |          BLOCK_VERSION = {}", BLOCK_VERSION);
+    println!("  |--------------------------------------------------------------------------|");
+    println!("  | {:<28} {:>14}                                |", "tx_body encode:",  fmt_ms(r.tx_body_encode));
+    println!("  | {:<28} {:>14}                                |", "tx_body decode:",  fmt_ms(r.tx_body_decode));
+    println!("  | {:<28} {:>14}                                |", "block_header encode:", fmt_ms(r.header_encode));
+    println!("  | {:<28} {:>14}                                |", "block_header decode:", fmt_ms(r.header_decode));
+    println!("  +--------------------------------------------------------------------------+");
     println!();
 }
 
@@ -814,15 +800,12 @@ fn print_footer() {
     println!("      2^(log_n - TAU) polynomial and so is faster than the row above.");
     println!("    * Binius packing: 'payload' is the on-wire committed vector only");
     println!("      (DA cost). Commitment root + FRI proof sizes are unchanged.");
-    println!("    * STARK uses the Block128-expanded trace; Binius packing affects");
-    println!("      DA and the on-header witness_root, not proof soundness.");
     println!("    * DA witness-root throughput scales with the packed blob: bit");
     println!("      columns contribute 128x less bytes than raw.");
     println!();
-    println!("  companion benches (deeper dives):");
-    println!("    cargo bench --bench bench_prover    (criterion micro-benchmarks)");
-    println!("    cargo bench --bench air_bench       (focused AIR + STARK + IVC)");
-    println!("    cargo bench --bench binius_packing  (packing savings + proof sizes)");
+    println!("  what this report explicitly does NOT measure:");
+    println!("    * STARK prove/verify on AIRs. See `cargo bench --bench stark_report`.");
+    println!("    * IVC fold/decide. Deferred until the tx-AIR is real.");
     println!();
     println!("  reproduce: cargo bench --bench release_report");
     println!();
@@ -839,42 +822,34 @@ fn main() {
 
     let hasher = Blake3Hasher::new();
 
-    eprintln!("  [1/5] FRI prover scaling ...");
+    eprintln!("  [1/5] Poseidon2b ...");
+    let poseidon = bench_poseidon();
+
+    eprintln!("  [2/5] FRI prover scaling ...");
     let mut fri_rows = Vec::with_capacity(LOG_TRACES.len());
     for &log_len in LOG_TRACES {
         eprintln!("        log_n = {} ...", log_len);
         fri_rows.push(bench_fri_row(log_len, &hasher));
     }
 
-    eprintln!("  [2/5] Binius packing savings ...");
+    eprintln!("  [3/5] Binius packing savings ...");
     let pack_rows = bench_packing_rows(PACKING_LOG_CELLS, &hasher);
 
-    eprintln!("  [3/5] STARK end-to-end ...");
-    let mut stark_rows = Vec::with_capacity(STARK_SHAPES.len());
-    for &(lr, nc) in STARK_SHAPES {
-        eprintln!("        log_rows = {}, n_cols = {} ...", lr, nc);
-        stark_rows.push(bench_stark_row(lr, nc));
-    }
-
     eprintln!("  [4/5] DA witness-root ...");
-    let mut da_rows = Vec::with_capacity(3);
-    for &lr in &[14usize, 16, 18] {
+    let mut da_rows = Vec::with_capacity(DA_LOG_ROWS.len());
+    for &lr in DA_LOG_ROWS {
         eprintln!("        log_rows = {} ...", lr);
         da_rows.push(bench_witness_root(lr));
     }
 
-    eprintln!("  [5/5] IVC fold / decide ...");
-    let mut ivc_rows = Vec::with_capacity(IVC_SHAPES.len());
-    for &(lr, s) in IVC_SHAPES {
-        eprintln!("        log_rows = {}, steps = {} ...", lr, s);
-        ivc_rows.push(bench_ivc_row(lr, s));
-    }
+    eprintln!("  [5/5] Wire codecs ...");
+    let wire = bench_wire();
     eprintln!();
 
+    print_poseidon(&poseidon);
     print_fri_table(&fri_rows);
     print_packing_table(PACKING_LOG_CELLS, &pack_rows);
-    print_stark_table(&stark_rows);
     print_da_table(&da_rows);
-    print_ivc_table(&ivc_rows);
+    print_wire(&wire);
     print_footer();
 }

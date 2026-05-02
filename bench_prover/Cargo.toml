@@ -13,7 +13,6 @@ noid_fri = { path = "../noid_fri" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_air = { path = "../noid_air" }
 noid_stark = { path = "../noid_stark" }
-noid_ivc = { path = "../noid_ivc" }
 noid_tx = { path = "../noid_tx" }
 noid_binius = { path = "../noid_binius" }
 noid_chain = { path = "../noid_chain" }
@@ -27,17 +26,5 @@ name = "release_report"
 harness = false
 
 [[bench]]
-name = "blockchain_report"
-harness = false
-
-[[bench]]
-name = "air_bench"
-harness = false
-
-[[bench]]
-name = "binius_packing"
-harness = false
-
-[[bench]]
-name = "carry_ripple"
+name = "stark_report"
 harness = false

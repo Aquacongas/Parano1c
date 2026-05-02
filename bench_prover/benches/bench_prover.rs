@@ -13,14 +13,14 @@
 //!   - UTXO primitives (CRYPTO.md §4)
 //!
 //! When to use this vs. other benches:
-//!   - `release_report`  — one-shot overview across every layer with a
-//!     branded table. Start here for a first look.
+//!   - `release_report`  — primitives hardware floor (Poseidon, FRI,
+//!     packing, DA, wire). Start here for a first look.
+//!   - `stark_report`    — roadmap tracker: every real `*Air` + STARK
+//!     prove/verify/proof-size. Grows as gates land.
 //!   - `bench_prover`    — (this bench) criterion statistical runner for
 //!     micro-benchmarks; use to compare two commits
 //!     of the same primitive with confidence
 //!     intervals and HTML reports.
-//!   - `air_bench`       — focused AIR / STARK / IVC sweeps.
-//!   - `binius_packing`  — focused Binius packing breakdown.
 //!
 //! Run:  cargo bench --bench bench_prover
 

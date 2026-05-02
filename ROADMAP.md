@@ -213,8 +213,9 @@ row-0-of-each-instance boundary, analogously to `CarryRippleAir`.
 - `range_gate_rejects_mismatched_public_value` — honest bits, wrong
   claimed `x`, caught by `acc_final`.
 
-**Bench.** `bench_prover/benches/range_gate.rs` at `log_rows ∈ {8, 12, 16}`
-mirroring the `carry_ripple` bucket layout. Target on `prod`
+**Bench.** New `[D]` block in `bench_prover/benches/stark_report.rs` at
+`log_rows ∈ {8, 12, 16}`, mirroring the CarryRipple `small/mid/prod`
+bucket layout that currently sits under `[B]`. Target on `prod`
 (`log_rows = 16`): prove < 2.5 s, verify < 150 ms, proof < 1.5 MB.
 
 **Size.** ~400 LOC in `noid_air` + ~300 LOC tests + ~100 LOC bench.
@@ -297,8 +298,10 @@ verifier-side public-input binding (`is_reset`, `is_final`, bit-position
 programme columns, etc.). First honest `TxValidityAir` end-to-end.
 
 **Acceptance.** `cargo test -p noid_air` green on the negative-test
-matrix for every sub-circuit; `bench_prover/benches/tx_validity.rs`
-reports prove/verify/proof-size on `prod` (log_rows=16).
+matrix for every sub-circuit; `[A] TxValidityAir` block in
+`bench_prover/benches/stark_report.rs` is promoted from the Stage 3a
+skeleton (log_rows=4, bool-only) to the full composition
+(log_rows=16), with honest prove/verify/proof-size numbers.
 
 ---
 
@@ -331,7 +334,7 @@ impl Node {
 
 1. `noid_chain::sync::fold_block(cum_proof, block_proof) -> cum_proof'`
    via `noid_ivc`.
-2. `bench_prover/benches/mainnet_workflow.rs`:
+2. New `[E] mainnet workflow` section in `bench_prover/benches/stark_report.rs`:
    - `empty_block`
    - `single_tx_alice_to_bob` (1 in / 1 out)
    - `max_tx` (4 in / 8 out, depth-24 FRI openings, value saturates 64

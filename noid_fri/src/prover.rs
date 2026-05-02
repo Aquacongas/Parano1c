@@ -6,7 +6,7 @@
 //! Implements a PCS (Polynomial Commitment Scheme) over binary tower fields
 //! using the FRI protocol with Poseidon2b Merkle trees.
 
-use noid_core::{AdditiveNTT, Block128, TowerField};
+use noid_core::{AdditiveNTT, Block128, CanonicalSerialize, TowerField};
 
 use crate::channel::{Channel, TAU};
 use crate::code::{Code, LOG_RATE};
@@ -168,6 +168,68 @@ pub fn commit(
     };
 
     (commitment, tree, code)
+}
+
+/// Commit to a multilinear polynomial, returning only the [`FriCommitment`].
+///
+/// Stage 3b-0.5.1 / CRYPTO.md §12b: the round-0 Merkle tree built by
+/// [`commit`] is **never opened** — FRI query openings authenticate only
+/// the per-round folded oracles that `prove` builds internally, and the
+/// batched-opening path binds the round-0 codeword via the per-column
+/// transcript roots alone. The full Poseidon2b tree over `code.encoding`
+/// therefore exists solely as a 32-byte Fiat–Shamir fingerprint.
+///
+/// This function computes an equivalent fingerprint with a flat Blake3
+/// hash of the RS-encoded codeword bytes, skipping the pair hashing and
+/// layer-by-layer tree build entirely. The `depth` field is preserved
+/// (`log_len + LOG_RATE - 1`) so the transcript absorption byte pattern
+/// is unchanged — only the hash family used to derive the 32-byte root
+/// differs, and prover + verifier both absorb that same root.
+///
+/// Soundness: Blake3 is collision-resistant over the full codeword
+/// (RATE · 2^log_len elements · 16 bytes each), which is exactly the
+/// binding guarantee the transcript depends on.
+pub fn commit_fast(
+    evals: &[Block128],
+    ntt: &AdditiveNTT<Block128>,
+) -> FriCommitment {
+    assert!(
+        evals.len().is_power_of_two(),
+        "evaluation vector length must be a power of two"
+    );
+    let log_len = evals.len().trailing_zeros() as usize;
+
+    let code = Code::new_parallel(evals, ntt);
+
+    // Flat Blake3 over the codeword bytes. Each Block128 serialises to
+    // 16 little-endian bytes; Blake3 internally parallelises over large
+    // inputs via its tree mode.
+    let mut hasher_blake = blake3::Hasher::new();
+    hasher_blake.update(b"PARANOID/FRI-COMMIT-FAST/v1");
+    hasher_blake.update(&(log_len as u64).to_le_bytes());
+
+    // Batch-serialise codeword into a byte buffer so Blake3's SIMD path
+    // fires on large chunks instead of one 16-byte update per element.
+    const CHUNK_ELEMS: usize = 4096;
+    let mut buf = vec![0u8; CHUNK_ELEMS * 16];
+    for chunk in code.encoding.chunks(CHUNK_ELEMS) {
+        for (i, sym) in chunk.iter().enumerate() {
+            sym.serialize(&mut buf[i * 16..(i + 1) * 16])
+                .expect("Block128 serializes into 16 bytes");
+        }
+        hasher_blake.update(&buf[..chunk.len() * 16]);
+    }
+    let root: HashOutput = *hasher_blake.finalize().as_bytes();
+
+    // Depth matches the number of layers a Merkle tree over `compute_leaf_hashes`
+    // would have: log2(n_symbols / 2) = log_len + LOG_RATE - 1.
+    let depth = log_len + crate::code::LOG_RATE - 1;
+
+    FriCommitment {
+        vector_commitment: VectorCommitment { root, depth },
+        packing_factor: 1,
+        log_len,
+    }
 }
 
 /// Generate a FRI evaluation proof for `eval_point`.

@@ -35,7 +35,7 @@ use crate::vshift::{cyclic_rotate_left, ladder_points, reconstruct_shifted_openi
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::batch::{prove_batched, verify_batched, BatchedEvalProof};
 use noid_fri::channel::TAU;
-use noid_fri::prover::{commit, FriCommitment};
+use noid_fri::prover::{commit_fast, FriCommitment};
 use noid_fri::Channel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_tx::PublicInputs;
@@ -416,7 +416,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
             .par_iter()
             .map(|col| {
                 let padded = pad_column(col, log_len);
-                let (commitment, _tree, _code) = commit(&padded, &ntt, &hasher);
+                let commitment = commit_fast(&padded, &ntt);
                 (commitment, padded)
             })
             .unzip()
@@ -704,7 +704,7 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
             .par_iter()
             .map(|col| {
                 let padded = pad_column(col, log_len);
-                let (commitment, _tree, _code) = commit(&padded, &ntt, &hasher);
+                let commitment = commit_fast(&padded, &ntt);
                 (commitment, padded)
             })
             .unzip()
