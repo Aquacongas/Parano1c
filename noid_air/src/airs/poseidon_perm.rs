@@ -350,6 +350,81 @@ pub fn write_perm_trace_at(
     state
 }
 
+/// Row-offset variant of [`write_perm_trace_at`]. Writes rows
+/// `row_offset..=row_offset + N_ROUNDS` of `cols` for a single Poseidon2b
+/// permutation of `input`. Used by `TxBodyMerkleAir` (3c-5) to stack N
+/// homogeneous permutation instances row-major into one trace.
+///
+/// Caller is responsible for sizing `cols` so `row_offset + N_ROUNDS <
+/// cols[_].len()` and for ensuring the rows being written are zero.
+/// Leaves all other rows untouched.
+pub fn write_perm_trace_at_offset(
+    cols: &mut [Vec<Block128>],
+    layout: PermLayout,
+    input: [Block128; STATE_SIZE],
+    row_offset: usize,
+) -> [Block128; STATE_SIZE] {
+    let mut state = mds_full(input);
+    for lane in 0..STATE_SIZE {
+        cols[layout.s + lane][row_offset] = state[lane];
+    }
+
+    for r in 0..N_ROUNDS {
+        let row = row_offset + r;
+        let is_full = is_full_round(r);
+        cols[layout.is_full][row] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[layout.is_round][row] = Block128::ONE;
+        for lane in 0..STATE_SIZE {
+            cols[layout.rc + lane][row] = Block128::from(ROUND_CONSTANTS[lane][r]);
+        }
+
+        if is_full {
+            let mut sout = [Block128::ZERO; STATE_SIZE];
+            for lane in 0..STATE_SIZE {
+                let sin = state[lane] + Block128::from(ROUND_CONSTANTS[lane][r]);
+                let x2 = sin * sin;
+                let x4 = x2 * x2;
+                let x3 = x2 * sin;
+                let so = x4 * x3;
+                cols[layout.sin + lane][row] = sin;
+                cols[layout.x2 + lane][row] = x2;
+                cols[layout.x4 + lane][row] = x4;
+                cols[layout.x3 + lane][row] = x3;
+                cols[layout.sout + lane][row] = so;
+                sout[lane] = so;
+                debug_assert_eq!(so, sbox_x7(sin));
+            }
+            state = mds_full(sout);
+        } else {
+            let sin0 = state[0] + Block128::from(ROUND_CONSTANTS[0][r]);
+            let x2 = sin0 * sin0;
+            let x4 = x2 * x2;
+            let x3 = x2 * sin0;
+            let sout0 = x4 * x3;
+            cols[layout.sin + 0][row] = sin0;
+            cols[layout.x2 + 0][row] = x2;
+            cols[layout.x4 + 0][row] = x4;
+            cols[layout.x3 + 0][row] = x3;
+            cols[layout.sout + 0][row] = sout0;
+            debug_assert_eq!(sout0, sbox_x7(sin0));
+
+            let mut mds_in = [Block128::ZERO; STATE_SIZE];
+            mds_in[0] = sout0;
+            for lane in 1..STATE_SIZE {
+                mds_in[lane] = state[lane];
+            }
+            state = mds_partial(mds_in);
+        }
+
+        let next_row = row + 1;
+        for lane in 0..STATE_SIZE {
+            cols[layout.s + lane][next_row] = state[lane];
+        }
+    }
+
+    state
+}
+
 /// Emit the per-lane S-box chain constraints for `PoseidonPermAir`.
 ///
 /// Four gates per lane × 4 lanes = 16 degree-2 constraints, all local

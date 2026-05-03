@@ -2879,3 +2879,82 @@ mod hleaf_stark_tests {
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3c-5.8 — TxBodyMerkleAir STARK integration tests (homogeneous 68-stack)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tx_body_merkle_stark_tests {
+    use super::*;
+    use noid_air::{
+        build_tx_body_merkle_trace, instance_row_offset, Air, Trace, TxBodyMerkleAir,
+        TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
+    };
+    use noid_core::Block128;
+    use noid_poseidon2b::native::permutation::STATE_SIZE;
+    use noid_poseidon2b::primitives::TxBodyHash;
+
+    fn mk_pi() -> PublicInputs {
+        PublicInputs {
+            prev_state_root: [0x11; 32],
+            new_state_root: [0x22; 32],
+            tx_body_hash: TxBodyHash([0x44; 32]),
+            fee: 7,
+        }
+    }
+
+    fn mk_input(seed: u128) -> [Block128; STATE_SIZE] {
+        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        [
+            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
+            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
+            Block128::from(s.wrapping_add(2) ^ 0xFFFF_0000_FFFF_0000),
+            Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
+        ]
+    }
+
+    fn mk_batch() -> [[Block128; STATE_SIZE]; TXBODY_MERKLE_N_PERMS] {
+        let mut out = [[Block128::ZERO; STATE_SIZE]; TXBODY_MERKLE_N_PERMS];
+        for k in 0..TXBODY_MERKLE_N_PERMS {
+            out[k] = mk_input(k as u128 + 1);
+        }
+        out
+    }
+
+    #[test]
+    fn tx_body_merkle_honest_prove_verify() {
+        let air = TxBodyMerkleAir::new();
+        let trace = air.build_trace(&mk_batch());
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn tx_body_merkle_tamper_first_instance_rejected() {
+        let air = TxBodyMerkleAir::new();
+        let mut cols = build_tx_body_merkle_trace(&mk_batch());
+        let row = instance_row_offset(0) + 2;
+        cols[TXBODY_MERKLE_LAYOUT.sout + 1][row] =
+            cols[TXBODY_MERKLE_LAYOUT.sout + 1][row] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn tx_body_merkle_tamper_last_instance_rejected() {
+        let air = TxBodyMerkleAir::new();
+        let mut cols = build_tx_body_merkle_trace(&mk_batch());
+        let row = instance_row_offset(TXBODY_MERKLE_N_PERMS - 1) + 3;
+        cols[TXBODY_MERKLE_LAYOUT.s + 2][row] =
+            cols[TXBODY_MERKLE_LAYOUT.s + 2][row] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+}

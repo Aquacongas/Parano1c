@@ -30,6 +30,19 @@
 //!                                  two shifted columns. `small/mid/prod`
 //!                                  mirrors the CarryRipple buckets.
 //!
+//!   [K] TxBodyMerkleAir          — Stage 3c-5 homogeneous stack:
+//!                                  68 Poseidon2b permutations laid out
+//!                                  row-major over a single 30-column
+//!                                  lane (log_rows=14, 128-row slot per
+//!                                  instance). Constraint set = ONE
+//!                                  copy of PoseidonPermAir's 29
+//!                                  interior gates, holding at every
+//!                                  row. First real load for the
+//!                                  ladder-sumcheck bucket: amortizes
+//!                                  across all 68 instances so the
+//!                                  per-perm prover cost drops below
+//!                                  the single-perm baseline.
+//!
 //!   [J] HLeafAir                 — Stage 3c-4 `hash_leaf(4 fields)`:
 //!                                  three permutations (absorb #1 +
 //!                                  absorb #2 + padding flush),
@@ -100,10 +113,11 @@ use std::time::{Duration, Instant};
 
 use noid_air::{
     build_perm_trace, emit_perm_all, Air, BalanceGateAir, CarryRippleAir, CompositeAir, HAddrAir,
-    HAuthAir, HLeafAir, LinearCombinationAir, RangeGateAir, Trace, TxValidityAir,
-    BIT_ADDER_LOG_WORD_BITS, HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS,
-    HLEAF_LOG_ROWS, HLEAF_N_COLS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
-    TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
+    HAuthAir, HLeafAir, LinearCombinationAir, RangeGateAir, Trace, TxBodyMerkleAir,
+    TxValidityAir, BIT_ADDER_LOG_WORD_BITS, HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS,
+    HAUTH_N_COLS, HLEAF_LOG_ROWS, HLEAF_N_COLS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
+    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TX_VALIDITY_3B4_LOG_ROWS,
+    TX_VALIDITY_3B4_N_COLS, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
 };
 use noid_core::{Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
@@ -1264,6 +1278,148 @@ fn print_hleaf(r: &HLeafRow) {
 }
 
 // ---------------------------------------------------------------------------
+// [K] TxBodyMerkleAir — Stage 3c-5 (homogeneous 68-instance permutation stack)
+// ---------------------------------------------------------------------------
+
+struct TxBodyMerkleRow {
+    log_rows: usize,
+    n_cols: usize,
+    n_perms: usize,
+    prove_total: Duration,
+    prove_buckets: ProveTimings,
+    verify: VerifyTimings,
+    proof_bytes: usize,
+}
+
+fn bench_tx_body_merkle() -> TxBodyMerkleRow {
+    let air = TxBodyMerkleAir::new();
+
+    // 68 diverse inputs — avoids any accidental coincident state chains
+    // that could let a degenerate constraint slip.
+    let mut inputs = [[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS];
+    for k in 0..TXBODY_MERKLE_N_PERMS {
+        let s = (k as u128 + 1).wrapping_mul(0x9E3779B97F4A7C15);
+        inputs[k] = [
+            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
+            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
+            Block128::from(s.wrapping_add(2) ^ 0xFFFF_0000_FFFF_0000),
+            Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
+        ];
+    }
+
+    let trace = air.build_trace(&inputs);
+    assert!(air.check(&trace), "TxBodyMerkleAir native check failed");
+    let pi = mk_pi();
+
+    let prove_total = time(|| {
+        let _ = prove_air(&air, &trace, &pi).unwrap();
+    });
+    // Stacked trace is 16384 rows × 30 cols; warm-up + SAMPLES would be
+    // slow. One warm-up, half the samples — still stable enough for a
+    // median bucket estimate.
+    for _ in 0..WARMUP {
+        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
+    }
+    let stack_samples = SAMPLES.max(1).min(5);
+    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(stack_samples);
+    for _ in 0..stack_samples {
+        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
+        prove_samples.push(t);
+    }
+    prove_samples.sort_by_key(|t| t.total());
+    let prove_buckets = prove_samples[prove_samples.len() / 2];
+    let proof = prove_air(&air, &trace, &pi).unwrap();
+
+    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(stack_samples);
+    for _ in 0..WARMUP {
+        let (r, _) = verify_air_timed(&air, &pi, &proof);
+        r.unwrap();
+    }
+    for _ in 0..stack_samples {
+        let (r, t) = verify_air_timed(&air, &pi, &proof);
+        r.unwrap();
+        verify_samples.push(t);
+    }
+    verify_samples.sort_by_key(|t| t.total());
+    let verify = verify_samples[verify_samples.len() / 2];
+
+    let log_len = padded_log_len(air.log_rows());
+    let n_shifted = air.shifted_column_indices().len();
+    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
+
+    TxBodyMerkleRow {
+        log_rows: air.log_rows(),
+        n_cols: air.n_columns(),
+        n_perms: TXBODY_MERKLE_N_PERMS,
+        prove_total,
+        prove_buckets,
+        verify,
+        proof_bytes,
+    }
+}
+
+fn print_tx_body_merkle(r: &TxBodyMerkleRow) {
+    println!("  [K] TxBodyMerkleAir  (Stage 3c-5 — homogeneous {}-perm stack)", r.n_perms);
+    println!("  +--------------------------------------------------------------------------+");
+    println!(
+        "  | log_rows={:>3}  n_cols={:>3}  prove={}  verify={}             |",
+        r.log_rows,
+        r.n_cols,
+        fmt_ms(r.prove_total),
+        fmt_ms(r.verify.total()),
+    );
+    let per_perm_prove = r.prove_total / r.n_perms as u32;
+    let per_perm_verify = r.verify.total() / r.n_perms as u32;
+    println!(
+        "  | per-perm: prove={} verify={}    proof(estimated)={} |",
+        fmt_ms(per_perm_prove),
+        fmt_ms(per_perm_verify),
+        fmt_bytes(r.proof_bytes),
+    );
+    println!("  +--------------------------------------------------------------------------+");
+    println!();
+    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
+    let total = r.prove_buckets.total();
+    println!(
+        "    3c-5  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
+        fmt_ms(r.prove_buckets.commit),
+        percent(r.prove_buckets.commit, total),
+        fmt_ms(r.prove_buckets.transcript_sumcheck),
+        percent(r.prove_buckets.transcript_sumcheck, total),
+        fmt_ms(r.prove_buckets.ladder_sumcheck),
+        percent(r.prove_buckets.ladder_sumcheck, total),
+        fmt_ms(r.prove_buckets.multipoint_fri),
+        percent(r.prove_buckets.multipoint_fri, total),
+    );
+    println!();
+    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
+    let vtotal = r.verify.total();
+    println!(
+        "    3c-5  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
+        fmt_ms(r.verify.transcript_sumcheck),
+        percent(r.verify.transcript_sumcheck, vtotal),
+        fmt_ms(r.verify.composition),
+        percent(r.verify.composition, vtotal),
+        fmt_ms(r.verify.ladder_sumcheck),
+        percent(r.verify.ladder_sumcheck, vtotal),
+        fmt_ms(r.verify.multipoint_fri),
+        percent(r.verify.multipoint_fri, vtotal),
+    );
+    println!();
+    println!("  Layout: single 30-col permutation lane stacked row-major over 68");
+    println!("  instances × 128-row slots (log_rows=14). Gate set is ONE copy of");
+    println!("  PoseidonPermAir's 29 interior constraints — holds at every row.");
+    println!("  Expected win: ladder-sc amortizes across all 68 instances, so");
+    println!("  per-perm cost should drop versus 68 × single-perm proofs.");
+    println!("  Note: interior-only. Inter-instance boundary ties (leaf IV,");
+    println!("  compress IV, wrap tag, output→next-input wiring) deferred to §3d.");
+    println!();
+    assert_eq!(r.n_cols, TXBODY_MERKLE_N_COLS);
+    assert_eq!(r.log_rows, TXBODY_MERKLE_LOG_ROWS);
+    assert_eq!(r.n_perms, TXBODY_MERKLE_N_PERMS);
+}
+
+// ---------------------------------------------------------------------------
 // [C] LinearCombinationAir — synthetic scaling harness
 // ---------------------------------------------------------------------------
 
@@ -1309,7 +1465,7 @@ const BANNER: &str = r#"
   |_| /_/   \_\_| \_\/_/   \_\_| \_|\___/___|____/
 
   PARANOID  --  STARK REPORT (roadmap tracker)
-  TxValidity (3a) + CarryRipple (3b-0) + Range (3b-2) + Balance (3b-3) + TxValidity3b4 (3b-4) + PoseidonPerm (3c-1) + HAddr (3c-2) + HAuth (3c-3) + HLeaf (3c-4) + LinearCombination
+  TxValidity (3a) + CarryRipple (3b-0) + Range (3b-2) + Balance (3b-3) + TxValidity3b4 (3b-4) + PoseidonPerm (3c-1) + HAddr (3c-2) + HAuth (3c-3) + HLeaf (3c-4) + TxBodyMerkle (3c-5) + LinearCombination
 "#;
 
 fn print_banner() {
@@ -1567,7 +1723,7 @@ fn print_footer() {
     println!("    [H] HAddrAir       (Stage 3c-2 — interior)  shipped (boundary ties -> 3d)");
     println!("    [I] HAuthAir       (Stage 3c-3 — interior)  shipped (boundary ties -> 3d)");
     println!("    [J] HLeafAir       (Stage 3c-4 — interior)  shipped (boundary ties -> 3d)");
-    println!("    [ ] TxBodyMerkleAir (Stage 3c-5)  NEXT (ladder batching under load)");
+    println!("    [K] TxBodyMerkleAir (Stage 3c-5 — homogeneous 68-stack)  shipped (boundary ties -> 3d)");
     println!("    [ ] TxValidityAir  (Stage 3d — full)        planned");
     println!();
     println!("  reproduce: cargo bench --bench stark_report");
@@ -1620,6 +1776,9 @@ fn main() {
     eprintln!("  [J] HLeafAir (Stage 3c-4) ...");
     let hleaf_row = bench_hleaf();
 
+    eprintln!("  [K] TxBodyMerkleAir (Stage 3c-5) ...");
+    let tx_body_merkle_row = bench_tx_body_merkle();
+
     eprintln!("  [C] LinearCombinationAir (scaling harness) ...");
     let mut lin_rows = Vec::with_capacity(LINCOMB_SHAPES.len());
     for &(lr, nc) in LINCOMB_SHAPES {
@@ -1637,6 +1796,7 @@ fn main() {
     print_haddr(&haddr_row);
     print_hauth(&hauth_row);
     print_hleaf(&hleaf_row);
+    print_tx_body_merkle(&tx_body_merkle_row);
     print_linear_table(&lin_rows);
     print_footer();
 }

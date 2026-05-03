@@ -590,17 +590,32 @@ perm-C partial sin-kill, perm-C rc on full-round row), STARK
 round-trip (4 tests), and bench block `[J] HLeafAir` in
 `stark_report.rs`. Boundary ties deferred to §3d.
 
-### 3c-5 — `TxBodyMerkleAir` (depth-4 tree + wrap)
+### 3c-5 — `TxBodyMerkleAir` (homogeneous 68-stack) — interior shipped
 
 4 inputs + 8 outputs = 12 leaves → pad to 16 → depth-4 binary tree =
 15 internal `compress` calls (two permutations each) → one final
 `compress(tx_body_hash, wrap_tag)`. Total: 12 × 3 + 15 × 2 + 2 = 68
-permutations per tx. At ~30 ms/permutation (first bench est.) that is
-~2 s/tx in prover cost — will need §3b-0-style ladder batching, but
-that is already in place on the bus.
+permutations per tx.
 
-Targets and exact constraint counts written up when §3c-1 closes and
-we know the per-permutation prover cost at `log_rows = 16`.
+**Layout chosen: homogeneous row-major stacking.** A single 30-column
+Poseidon2b lane, reused across all 68 instances laid out at a
+128-row stride (`log_rows = 14`, 16384 rows total, 68 × 128 = 8704 live
+rows + padding). The constraint set is **the same 29 gates as
+`PoseidonPermAir`**, emitted once — they hold at every row, so
+coverage of all 68 instances is free at the gate layer. Per-instance
+column blow-up is eliminated; the ladder-sumcheck bucket now has a
+real load to amortize over.
+
+Ships: row-offset trace writer (`write_perm_trace_at_offset`), stacked
+trace builder, native equivalence test across all 68 instances against
+`Poseidon2bPermutation`, 4-site forgery matrix (instance 0 / mid /
+last active + inter-instance padding suppression), STARK round-trip
+(3 tests), and bench block `[K] TxBodyMerkleAir` in `stark_report.rs`.
+
+**Boundary ties** (leaf IV, compress IV, wrap tag, instance-k output →
+instance-(k+1) input wiring) deferred to §3d's `ConstColumnGate` /
+`RowSelectorGate` bundle. 3c-5 proves: "these 68 row-chunks are each a
+legal Poseidon2b permutation whose input sits at their first row."
 
 ---
 

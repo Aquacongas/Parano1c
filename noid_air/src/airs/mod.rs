@@ -11,6 +11,7 @@ pub mod haddr;
 pub mod hauth;
 pub mod hleaf;
 pub mod linear_combination;
+pub mod tx_body_merkle;
 pub mod poseidon_mds;
 pub mod poseidon_perm;
 pub mod poseidon_sbox;
@@ -44,6 +45,12 @@ pub use hleaf::{
     HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_PERM_A_BASE,
     HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE,
 };
+pub use tx_body_merkle::{
+    build_tx_body_merkle_trace, emit_tx_body_merkle_constraints, extract_instance_output,
+    instance_row_offset, TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS,
+    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_SLOT_LOG_ROWS,
+    TXBODY_MERKLE_SLOT_ROWS,
+};
 pub use carry_ripple::{
     CarryInitGate, CarryNextGate, CarryRippleAir, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
     CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
@@ -57,7 +64,8 @@ pub use poseidon_perm::{
     build_perm_trace, emit_perm_all, emit_perm_all_at, emit_perm_mds_blend,
     emit_perm_mds_blend_at, emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at,
     emit_perm_rc_binding, emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
-    extract_perm_output, is_full_round, write_perm_trace_at, PartialSboxKillGate, PermLayout,
+    extract_perm_output, is_full_round, write_perm_trace_at, write_perm_trace_at_offset,
+    PartialSboxKillGate, PermLayout,
     PermMdsBlendGate, PoseidonPermColumns, DEFAULT_PERM_LAYOUT, POSEIDON_COL_IS_FULL,
     POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
     POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
