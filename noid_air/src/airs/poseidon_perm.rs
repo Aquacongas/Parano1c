@@ -60,7 +60,7 @@
 //! constraints that enforce this.
 
 use crate::airs::poseidon_sbox::{emit_sbox_x7_constraints, SboxX7Layout};
-use crate::gates::{BoolGate, SelectorGate, WeightedLinearGate};
+use crate::gates::{BoolGate, PublicColumn, SelectorGate, WeightedLinearGate};
 use crate::{Constraint, EvalFrame};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{
@@ -714,6 +714,71 @@ impl Constraint for PartialSboxKillGate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3d-0.3 — Public-column programmes for the perm selectors + RC
+// ---------------------------------------------------------------------------
+
+/// Build the `is_full` programme column as a length-`POSEIDON_PERM_N_ROWS`
+/// vector: `1` on full-round rows in `0..N_ROUNDS`, `0` everywhere else
+/// (partial rows, output row, padding).
+pub fn perm_is_full_values() -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; POSEIDON_PERM_N_ROWS];
+    for r in 0..N_ROUNDS {
+        if is_full_round(r) {
+            out[r] = Block128::ONE;
+        }
+    }
+    out
+}
+
+/// Build the `is_round` programme column: `1` on rows `0..N_ROUNDS`,
+/// `0` on the output row and padding. Matches the selector written by
+/// `build_perm_trace` / `write_perm_trace_at`.
+pub fn perm_is_round_values() -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; POSEIDON_PERM_N_ROWS];
+    for r in 0..N_ROUNDS {
+        out[r] = Block128::ONE;
+    }
+    out
+}
+
+/// Build `rc[lane]` programme column: `ROUND_CONSTANTS[lane][r]` for
+/// `r ∈ 0..N_ROUNDS`, `0` on the output row and padding.
+pub fn perm_rc_values(lane: usize) -> Vec<Block128> {
+    assert!(lane < STATE_SIZE);
+    let mut out = vec![Block128::ZERO; POSEIDON_PERM_N_ROWS];
+    for r in 0..N_ROUNDS {
+        out[r] = Block128::from(ROUND_CONSTANTS[lane][r]);
+    }
+    out
+}
+
+/// Declare every selector / round-constant column of a standalone
+/// `PoseidonPermAir` as a [`PublicColumn`]. One declaration each for
+/// `is_full`, `is_round`, and `rc[0..STATE_SIZE]` — six columns total.
+/// The caller (typically a `CompositeAir::from_parts_with_publics`)
+/// feeds these alongside the constraint list returned by
+/// [`emit_perm_all_at`]. This closes the 3c-1 "trusted public input"
+/// debt on `rc` / `is_full` / `is_round`: native `Air::check` verifies
+/// the trace cells match the programme, and the STARK verifier re-
+/// evaluates each programme MLE at `r_point` and asserts equality with
+/// `base_openings[col]` (bound to the FRI commitment by the §12c'
+/// multipoint opening).
+pub fn emit_perm_public_columns_at(layout: PermLayout) -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(STATE_SIZE + 2);
+    out.push(PublicColumn::new(layout.is_full, perm_is_full_values()));
+    out.push(PublicColumn::new(layout.is_round, perm_is_round_values()));
+    for lane in 0..STATE_SIZE {
+        out.push(PublicColumn::new(layout.rc + lane, perm_rc_values(lane)));
+    }
+    out
+}
+
+/// Default-layout shorthand for [`emit_perm_public_columns_at`].
+pub fn emit_perm_public_columns() -> Vec<PublicColumn> {
+    emit_perm_public_columns_at(DEFAULT_PERM_LAYOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,5 +1246,100 @@ mod tests {
         for c in &cols {
             assert_eq!(c.len(), POSEIDON_PERM_N_ROWS);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 3d-0.3 — PublicColumn programmes for rc / is_full / is_round
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn perm_public_columns_match_builder_output() {
+        // The helper programmes must be bit-identical to what
+        // `build_perm_trace` writes into the witness columns.
+        let input = mk_input(0x1337);
+        let cols = build_perm_trace(input);
+        assert_eq!(perm_is_full_values(), cols[POSEIDON_COL_IS_FULL]);
+        assert_eq!(perm_is_round_values(), cols[POSEIDON_COL_IS_ROUND]);
+        for lane in 0..STATE_SIZE {
+            assert_eq!(perm_rc_values(lane), cols[POSEIDON_COL_RC + lane]);
+        }
+    }
+
+    #[test]
+    fn perm_public_columns_declaration_shape() {
+        let publics = emit_perm_public_columns();
+        // is_full, is_round, rc[0..STATE_SIZE]
+        assert_eq!(publics.len(), STATE_SIZE + 2);
+        for p in &publics {
+            assert_eq!(p.values.len(), POSEIDON_PERM_N_ROWS);
+        }
+    }
+
+    #[test]
+    fn perm_all_with_publics_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xF00D);
+        let cols = build_perm_trace(input);
+        let air = CompositeAir::from_parts_with_publics(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+            emit_perm_public_columns(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_public_columns_reject_rc_tamper() {
+        // Tamper a single cell of the `rc` witness column. With the
+        // 3d-0.3 public-column declaration, native `Air::check` rejects
+        // without needing the (imperfect) RC-binding gate to catch it.
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xBEEF);
+        let mut cols = build_perm_trace(input);
+        cols[POSEIDON_COL_RC + 2][5] = cols[POSEIDON_COL_RC + 2][5] + Block128::ONE;
+        let air = CompositeAir::from_parts_with_publics(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+            emit_perm_public_columns(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_public_columns_reject_is_full_flip() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xCAFE);
+        let mut cols = build_perm_trace(input);
+        // Flip is_full at a full-round row — the programme says 1, we
+        // write 0. Native check must reject.
+        assert!(is_full_round(0));
+        cols[POSEIDON_COL_IS_FULL][0] = Block128::ZERO;
+        let air = CompositeAir::from_parts_with_publics(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+            emit_perm_public_columns(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_public_columns_reject_is_round_extension() {
+        // Attempt to pretend the output row (`r = N_ROUNDS`) is still
+        // an active round by flipping is_round to 1 there. Programme
+        // forbids it — reject.
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xDEAD);
+        let mut cols = build_perm_trace(input);
+        cols[POSEIDON_COL_IS_ROUND][N_ROUNDS] = Block128::ONE;
+        let air = CompositeAir::from_parts_with_publics(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+            emit_perm_public_columns(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
     }
 }

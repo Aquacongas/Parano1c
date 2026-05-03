@@ -45,6 +45,8 @@ pub use airs::{
     CarryRippleAir, FaSumGate, PartialSboxKillGate, PermLayout, PermMdsBlendGate,
     LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate, PoseidonPermColumns,
     DEFAULT_PERM_LAYOUT,
+    emit_perm_public_columns, emit_perm_public_columns_at, perm_is_full_values,
+    perm_is_round_values, perm_rc_values,
     build_haddr_trace, emit_haddr_constraints, extract_haddr_output, HAddrAir, HADDR_LAYOUT_A,
     HADDR_LAYOUT_B, HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_PAD_0, HADDR_PAD_1,
     HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
@@ -292,6 +294,7 @@ pub struct CompositeAir {
     log_rows: usize,
     n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl CompositeAir {
@@ -308,6 +311,25 @@ impl CompositeAir {
             log_rows,
             n_cols,
             constraints,
+            public_columns: Vec::new(),
+        }
+    }
+
+    /// Like [`from_parts`] but also declares a set of AIR-pinned public
+    /// (programme) columns. Each declaration is native-checked by
+    /// [`Air::check`] and bound at the STARK verifier via
+    /// `check_public_columns` in `noid_stark`.
+    pub fn from_parts_with_publics(
+        log_rows: usize,
+        n_cols: usize,
+        constraints: Vec<Box<dyn Constraint>>,
+        public_columns: Vec<PublicColumn>,
+    ) -> Self {
+        Self {
+            log_rows,
+            n_cols,
+            constraints,
+            public_columns,
         }
     }
 }
@@ -321,6 +343,9 @@ impl Air for CompositeAir {
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 

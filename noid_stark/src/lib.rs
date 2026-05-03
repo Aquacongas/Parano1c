@@ -3149,6 +3149,70 @@ mod tx_body_merkle_stark_tests {
     }
 
     #[test]
+    fn poseidon_perm_with_publics_end_to_end() {
+        // Full STARK round-trip: Poseidon perm AIR with `rc` / `is_full`
+        // / `is_round` declared as public columns. Honest trace must
+        // verify; a single-cell RC tamper must be rejected by the
+        // 3d-0.2 MLE re-eval at the sumcheck terminal point `r`.
+        use noid_air::{
+            build_perm_trace, emit_perm_all, emit_perm_public_columns, CompositeAir,
+            POSEIDON_COL_RC, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
+        };
+
+        let input = [
+            Block128::from(0xA5A5_u128),
+            Block128::from(0x5A5A_u128),
+            Block128::from(0xDEAD_u128),
+            Block128::from(0xBEEF_u128),
+        ];
+        let air = CompositeAir::from_parts_with_publics(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+            emit_perm_public_columns(),
+        );
+
+        // Honest: programme matches, verifier accepts.
+        {
+            let cols = build_perm_trace(input);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Malicious A: tamper rc[1][3] on a live full-round row. The
+        // verifier must reject — in this case the RC-binding gate is
+        // also tripped, but so is the 3d-0.2 public-column check.
+        {
+            let mut cols = build_perm_trace(input);
+            cols[POSEIDON_COL_RC + 1][3] = cols[POSEIDON_COL_RC + 1][3] + Block128::ONE;
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Malicious B: tamper rc[2] on a *padding* row (r >= N_ROUNDS).
+        // There, is_full = is_round = 0 so both the lane-0 and lane-1..3
+        // RC-binding selectors are suppressed — the constraint system
+        // cannot see the tamper. Only the 3d-0.2 public-column MLE re-
+        // evaluation closes this gap. If we remove `check_public_columns`
+        // from the verifier, this test fails.
+        {
+            use noid_air::POSEIDON_PERM_N_ROWS;
+            use noid_poseidon2b::native::permutation::N_ROUNDS;
+            let mut cols = build_perm_trace(input);
+            assert!(N_ROUNDS + 3 < POSEIDON_PERM_N_ROWS);
+            cols[POSEIDON_COL_RC + 2][N_ROUNDS + 3] = Block128::from(0x1234_5678u128);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+    }
+
+    #[test]
     fn public_column_multi_column_enforced() {
         // Two pinned programme columns; tamper the second, verifier
         // must still reject.

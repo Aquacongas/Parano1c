@@ -674,13 +674,38 @@ No prover-side changes — the native `Air::check` from 3d-0.1 already
 rejects malformed programme values before `prove_air` runs; forgery
 tests use `prove_air_unchecked` to reach the cryptographic verifier.
 
-### 3d-0.3 — consumer migration (planned)
+### 3d-0.3 — `PoseidonPermAir` programme binding [DONE]
 
-Once 3d-0.2 lands, migrate `rc[..]`, `is_full`, `is_round`
-(`PoseidonPermAir`, 3c-1) off trusted-input by declaring them as public
-columns. Each consumer AIR (`HAddrAir`, `HAuthAir`, `HLeafAir`,
-`TxBodyMerkleAir`) gains the same treatment plus its sponge boundary
+Migrate `PoseidonPermAir`'s selectors and round constants off
+"trusted public input" by declaring them as `PublicColumn`s. Ships:
+
+- `perm_is_full_values` / `perm_is_round_values` / `perm_rc_values(lane)`
+  helpers that materialize the standalone-perm programme columns (256
+  rows, matching `POSEIDON_PERM_N_ROWS`).
+- `emit_perm_public_columns_at(layout)` + default-layout shorthand
+  `emit_perm_public_columns` — six declarations per permutation block
+  (`is_full`, `is_round`, `rc[0..4]`).
+- `CompositeAir::from_parts_with_publics(log_rows, n_cols, constraints,
+  public_columns)` for callers that stack constraint-only helpers with
+  programme declarations into one AIR.
+
+Soundness test (in `noid_stark::tests`): `poseidon_perm_with_publics_end_to_end`
+runs full STARK prove + verify and exercises two forgery cases.
+Case A (RC cell tampered on a live full-round row) is already caught
+by the RC-binding gate; case B (RC cell tampered on a **padding** row,
+where `is_full = is_round = 0` suppresses every RC-binding selector)
+is caught **only** by the 3d-0.2 public-column MLE re-eval. Case B is
+the test that proves programme binding is load-bearing: remove
+`check_public_columns` from the verifier and the assertion fails.
+
+### 3d-0.4 — consumer migration (planned)
+
+With 3d-0.3 in place, migrate `HAddrAir` / `HAuthAir` / `HLeafAir` /
+`TxBodyMerkleAir` to use `emit_perm_public_columns_at(layout)` for
+each embedded permutation block, plus each AIR's own sponge boundary
 pins (capacity IV, absorb XOR, inter-perm carry, output squeeze).
+`TxBodyMerkleAir` needs a row-offset-aware programme variant since it
+stacks N permutation instances row-major rather than column-major.
 
 
 **Debt carried forward from §3b-4** (known soundness caveats,

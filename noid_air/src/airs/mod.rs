@@ -63,8 +63,10 @@ pub use poseidon_mds::{
 pub use poseidon_perm::{
     build_perm_trace, emit_perm_all, emit_perm_all_at, emit_perm_mds_blend,
     emit_perm_mds_blend_at, emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at,
-    emit_perm_rc_binding, emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
-    extract_perm_output, is_full_round, write_perm_trace_at, write_perm_trace_at_offset,
+    emit_perm_public_columns, emit_perm_public_columns_at, emit_perm_rc_binding,
+    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at, extract_perm_output,
+    is_full_round, perm_is_full_values, perm_is_round_values, perm_rc_values, write_perm_trace_at,
+    write_perm_trace_at_offset,
     PartialSboxKillGate, PermLayout,
     PermMdsBlendGate, PoseidonPermColumns, DEFAULT_PERM_LAYOUT, POSEIDON_COL_IS_FULL,
     POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
