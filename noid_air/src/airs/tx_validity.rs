@@ -1,11 +1,65 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! `TxValidityAir` — Stage 3a witness skeleton for the transparent
-//! transaction circuit. Carries every raw field the Stage 3b/3c/3d
-//! gates will read but algebraically enforces only that the two
-//! selector columns are boolean.
+//! `TxValidityAir` — transaction-validity AIR.
+//!
+//! Two entry points coexist in this module:
+//!
+//! * [`TxValidityAir::new`] — Stage-3a witness skeleton (10 witness
+//!   columns, two [`BoolGate`] constraints, `log_rows = 4`). Kept as a
+//!   smoke-test target for the commit path and as a regression baseline
+//!   for the Stage-3a bench row. No balance, no range, no tx algebra.
+//!
+//! * [`TxValidityAir::new_3b4`] — Stage-3b-4 composition: witness
+//!   skeleton + [`BalanceGateAir`] embedded at a column offset. Enforces
+//!   the UTXO conservation law `Σ inputs = Σ outputs + fee` with every
+//!   balance operand bit-decomposed inside the balance circuit. Bit
+//!   ranges of every operand are pinned by the per-bit [`BoolGate`]
+//!   constraints that the `bit_adder` blocks already carry (each of the
+//!   four input u64s, eight output u64s, and the fee appears as the
+//!   low-bits of a `bit_adder.a` or `.b` column), so there is no
+//!   separate [`super::range_gate::RangeGateAir`] instance on the 3b-4
+//!   composite — the range check is inlined in the balance witness.
+//!
+//! ## Layout of the 3b-4 trace
+//!
+//! Columns `0..TX_VALIDITY_N_COLS` carry the Stage-3a witness fields
+//! (selectors, value, owner, spend-secret, auth-tag). Columns
+//! `TX_VALIDITY_N_COLS..(TX_VALIDITY_N_COLS + BALANCE_N_COLS)` hold the
+//! `BalanceGateAir` columns in the standard balance block order (see
+//! `balance_gate.rs`).
+//!
+//! Witness rows `0..MAX_INPUTS` carry per-input fields on their home
+//! columns; rows `MAX_INPUTS..MAX_INPUTS+MAX_OUTPUTS` hold per-output
+//! fields. Beyond row `MAX_INPUTS + MAX_OUTPUTS = 12` the witness region
+//! is zero-filled. The balance block region uses the standard 128-row
+//! per-instance layout demanded by [`super::BitAdderAir`]; instance 0
+//! carries the real tx and any remaining instances are zero-padded.
+//!
+//! ## Soundness caveats — what 3b-4 still does *not* bind
+//!
+//! 3b-4 is the first real non-Poseidon composition; it intentionally
+//! stops short of binding the witness `Value` column to the balance
+//! operands. That binding needs a `ConstColumnGate` for the integer
+//! weight vector and lands in Stage 3d. Concretely:
+//!
+//! 1. The `Value` column of the witness region is not wired to the
+//!    first row of any balance block's `a`/`b` column. An adversary
+//!    could populate the balance circuit with a balanced `(i, o, fee)`
+//!    tuple that has nothing to do with the witness rows; 3b-4 still
+//!    accepts. Stage 3d closes this by pinning the integer-embedded
+//!    accumulator of each balance operand against the witness value via
+//!    a `ConstColumnGate` + `WeightedLinearGate` pair.
+//! 2. Poseidon-derived fields (`OwnerHi/Lo`, `SpendSecretHi/Lo`,
+//!    `AuthTagHi/Lo`) are free variables: no constraint relates them
+//!    yet. That is the job of Stage 3c.
+//! 3. The `InputValid` / `OutputValid` selectors are only pinned to the
+//!    `{0, 1}` domain; their correspondence to the `valid` flag of each
+//!    `TxInput` / `TxOutput` is trace-side only. Stage 3d adds the
+//!    per-row selector-consistency gate.
 
+use crate::airs::balance_gate::{build_balance_columns, emit_balance_constraints};
+use crate::airs::{BALANCE_MIN_LOG_ROWS, BALANCE_N_COLS};
 use crate::gates::BoolGate;
 use crate::{Air, ColumnDomain, Constraint, Trace};
 use noid_core::{Block128, TowerField};
@@ -50,6 +104,20 @@ pub enum TxValidityCol {
 
 pub const TX_VALIDITY_N_COLS: usize = 10;
 
+/// Column offset of the balance circuit inside the Stage-3b-4 composite
+/// trace. Balance columns occupy
+/// `[TX_VALIDITY_BALANCE_COL_OFFSET .. TX_VALIDITY_BALANCE_COL_OFFSET + BALANCE_N_COLS)`.
+pub const TX_VALIDITY_BALANCE_COL_OFFSET: usize = TX_VALIDITY_N_COLS;
+
+/// Total column count of the Stage-3b-4 composite trace.
+pub const TX_VALIDITY_3B4_N_COLS: usize = TX_VALIDITY_N_COLS + BALANCE_N_COLS;
+
+/// Stage-3b-4 default `log_rows`. Picked to satisfy both the balance
+/// floor (`BALANCE_MIN_LOG_ROWS = 8`, one 128-row instance × 2) and
+/// the TAU+1 = 8 rotation-AIR floor. Room for the witness region
+/// (`MAX_INPUTS + MAX_OUTPUTS = 12` rows) is trivial at 256 rows.
+pub const TX_VALIDITY_3B4_LOG_ROWS: usize = BALANCE_MIN_LOG_ROWS;
+
 impl TxValidityCol {
     #[inline]
     pub const fn index(self) -> usize {
@@ -57,7 +125,19 @@ impl TxValidityCol {
     }
 }
 
+/// Which composition level the AIR was built at. Stage 3a is the
+/// selectors-only skeleton; Stage 3b-4 is the witness + balance
+/// composition described at module level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxValidityStage {
+    Skeleton3a,
+    Composite3b4,
+}
+
 pub struct TxValidityAir {
+    stage: TxValidityStage,
+    log_rows: usize,
+    n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
 }
 
@@ -68,72 +148,149 @@ impl Default for TxValidityAir {
 }
 
 impl TxValidityAir {
-    /// Build the Stage 3a AIR: boolean constraints on the two selector
-    /// columns. Further algebraic gates (Poseidon, balance, tx-body
-    /// Merkle, FRI-state openings) land in Stage 3b/3c/3d.
+    /// Build the Stage-3a AIR: boolean constraints on the two selector
+    /// columns, 10 witness columns, `log_rows = 4`. No balance, no
+    /// range, no tx algebra.
     pub fn new() -> Self {
         let constraints: Vec<Box<dyn Constraint>> = vec![
             Box::new(BoolGate::new(TxValidityCol::InputValid.index())),
             Box::new(BoolGate::new(TxValidityCol::OutputValid.index())),
         ];
-        Self { constraints }
+        Self {
+            stage: TxValidityStage::Skeleton3a,
+            log_rows: TX_VALIDITY_LOG_ROWS,
+            n_cols: TX_VALIDITY_N_COLS,
+            constraints,
+        }
     }
 
-    /// Build the raw witness trace from a `TxBody`. Column order is fixed
-    /// by [`TxValidityCol`]. Missing / dummy inputs and outputs contribute
-    /// zero rows; selector bits are zero on those rows so higher-level
-    /// gates (added in later substages) can use them as row masks.
+    /// Build the Stage-3b-4 composite AIR: 10 witness columns +
+    /// `BALANCE_N_COLS` balance columns, with the full balance-circuit
+    /// constraint set emitted at the balance column offset plus the
+    /// two skeleton selector `BoolGate`s. `log_rows` must satisfy the
+    /// balance and STARK floors (`>= BALANCE_MIN_LOG_ROWS = 8`).
+    pub fn new_3b4(log_rows: usize) -> Self {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "TxValidityAir::new_3b4 requires log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        let mut constraints: Vec<Box<dyn Constraint>> = vec![
+            Box::new(BoolGate::new(TxValidityCol::InputValid.index())),
+            Box::new(BoolGate::new(TxValidityCol::OutputValid.index())),
+        ];
+        constraints.extend(emit_balance_constraints(TX_VALIDITY_BALANCE_COL_OFFSET));
+        Self {
+            stage: TxValidityStage::Composite3b4,
+            log_rows,
+            n_cols: TX_VALIDITY_3B4_N_COLS,
+            constraints,
+        }
+    }
+
+    /// Build the Stage-3a witness trace from a `TxBody`. Column order
+    /// is fixed by [`TxValidityCol`]; 10 columns × 16 rows.
     pub fn build_trace(body: &TxBody) -> Trace {
-        let n_rows = TX_VALIDITY_ROWS;
-        let mut cols: Vec<Vec<Block128>> =
-            (0..TX_VALIDITY_N_COLS).map(|_| vec![Block128::ZERO; n_rows]).collect();
-
-        let write_owner = |cols: &mut [Vec<Block128>], row: usize, owner: &[Block128; 2]| {
-            cols[TxValidityCol::OwnerHi.index()][row] = owner[0];
-            cols[TxValidityCol::OwnerLo.index()][row] = owner[1];
-        };
-
-        for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
-            if !input.valid {
-                continue;
-            }
-            let row = i;
-            cols[TxValidityCol::InputValid.index()][row] = Block128::ONE;
-            cols[TxValidityCol::SlotIndex.index()][row] =
-                Block128::from(input.slot_index as u128);
-            cols[TxValidityCol::Value.index()][row] = Block128::from(input.value as u128);
-            write_owner(&mut cols, row, &input.owner.as_fields());
-            let secret = input.spend_secret.as_fields();
-            cols[TxValidityCol::SpendSecretHi.index()][row] = secret[0];
-            cols[TxValidityCol::SpendSecretLo.index()][row] = secret[1];
-            let tag = input.auth_tag.as_fields();
-            cols[TxValidityCol::AuthTagHi.index()][row] = tag[0];
-            cols[TxValidityCol::AuthTagLo.index()][row] = tag[1];
-        }
-
-        for (i, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-            if !output.valid {
-                continue;
-            }
-            let row = MAX_INPUTS + i;
-            cols[TxValidityCol::OutputValid.index()][row] = Block128::ONE;
-            cols[TxValidityCol::Value.index()][row] = Block128::from(output.value as u128);
-            write_owner(&mut cols, row, &output.owner.as_fields());
-        }
-
-        let mut domains = vec![ColumnDomain::Block128; TX_VALIDITY_N_COLS];
-        domains[TxValidityCol::InputValid.index()] = ColumnDomain::Bit;
-        domains[TxValidityCol::OutputValid.index()] = ColumnDomain::Bit;
+        let (cols, domains) = build_witness_columns(body, TX_VALIDITY_LOG_ROWS);
         Trace::new_with_domains(cols, domains)
     }
+
+    /// Build the Stage-3b-4 composite witness trace from a `TxBody`
+    /// and the balance-circuit view of the same tx. Columns
+    /// `0..TX_VALIDITY_N_COLS` carry the Stage-3a witness fields at
+    /// `log_rows` rows each (same semantics as [`Self::build_trace`],
+    /// zero-padded beyond `TX_VALIDITY_SLOTS`); columns
+    /// `TX_VALIDITY_N_COLS..` carry the balance trace built from
+    /// `(balance_inputs, balance_outputs, balance_fee)`. `log_rows`
+    /// must match [`Self::log_rows`] of the AIR.
+    ///
+    /// The balance-view tuple is supplied explicitly instead of being
+    /// derived from `body` because `TxBody::fee` is a `u128` (chain
+    /// constant) and the balance circuit wants `u64`; promoting or
+    /// truncating that silently would hide bugs. Stage 3d narrows this
+    /// to a single `(body, log_rows)` entry once the fee type is
+    /// finalised.
+    pub fn build_trace_3b4(
+        body: &TxBody,
+        balance_inputs: [u64; 4],
+        balance_outputs: [u64; 8],
+        balance_fee: u64,
+        log_rows: usize,
+    ) -> Trace {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "Stage-3b-4 trace requires log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        let (mut cols, mut domains) = build_witness_columns(body, log_rows);
+        let (balance_cols, balance_domains) =
+            build_balance_columns(balance_inputs, balance_outputs, balance_fee, log_rows);
+        cols.extend(balance_cols.into_iter());
+        domains.extend(balance_domains.into_iter());
+        Trace::new_with_domains(cols, domains)
+    }
+
+    /// Which composition stage this AIR was built at.
+    pub fn is_composite_3b4(&self) -> bool {
+        self.stage == TxValidityStage::Composite3b4
+    }
+}
+
+fn build_witness_columns(
+    body: &TxBody,
+    log_rows: usize,
+) -> (Vec<Vec<Block128>>, Vec<ColumnDomain>) {
+    let n_rows = 1usize << log_rows;
+    assert!(
+        n_rows >= TX_VALIDITY_SLOTS,
+        "log_rows = {log_rows} too small for {TX_VALIDITY_SLOTS} witness rows"
+    );
+    let mut cols: Vec<Vec<Block128>> =
+        (0..TX_VALIDITY_N_COLS).map(|_| vec![Block128::ZERO; n_rows]).collect();
+
+    let write_owner = |cols: &mut [Vec<Block128>], row: usize, owner: &[Block128; 2]| {
+        cols[TxValidityCol::OwnerHi.index()][row] = owner[0];
+        cols[TxValidityCol::OwnerLo.index()][row] = owner[1];
+    };
+
+    for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
+        if !input.valid {
+            continue;
+        }
+        let row = i;
+        cols[TxValidityCol::InputValid.index()][row] = Block128::ONE;
+        cols[TxValidityCol::SlotIndex.index()][row] =
+            Block128::from(input.slot_index as u128);
+        cols[TxValidityCol::Value.index()][row] = Block128::from(input.value as u128);
+        write_owner(&mut cols, row, &input.owner.as_fields());
+        let secret = input.spend_secret.as_fields();
+        cols[TxValidityCol::SpendSecretHi.index()][row] = secret[0];
+        cols[TxValidityCol::SpendSecretLo.index()][row] = secret[1];
+        let tag = input.auth_tag.as_fields();
+        cols[TxValidityCol::AuthTagHi.index()][row] = tag[0];
+        cols[TxValidityCol::AuthTagLo.index()][row] = tag[1];
+    }
+
+    for (i, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+        if !output.valid {
+            continue;
+        }
+        let row = MAX_INPUTS + i;
+        cols[TxValidityCol::OutputValid.index()][row] = Block128::ONE;
+        cols[TxValidityCol::Value.index()][row] = Block128::from(output.value as u128);
+        write_owner(&mut cols, row, &output.owner.as_fields());
+    }
+
+    let mut domains = vec![ColumnDomain::Block128; TX_VALIDITY_N_COLS];
+    domains[TxValidityCol::InputValid.index()] = ColumnDomain::Bit;
+    domains[TxValidityCol::OutputValid.index()] = ColumnDomain::Bit;
+    (cols, domains)
 }
 
 impl Air for TxValidityAir {
     fn n_columns(&self) -> usize {
-        TX_VALIDITY_N_COLS
+        self.n_cols
     }
     fn log_rows(&self) -> usize {
-        TX_VALIDITY_LOG_ROWS
+        self.log_rows
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
@@ -298,5 +455,128 @@ mod tests {
         let output_valid = &trace.columns[TxValidityCol::OutputValid.index()];
         assert!(input_valid.iter().all(|v| *v == Block128::ZERO));
         assert!(output_valid.iter().all(|v| *v == Block128::ZERO));
+    }
+
+    // --------------------------------------------------------------------
+    // Stage 3b-4 composite
+    // --------------------------------------------------------------------
+
+    fn mk_body_balanced_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
+        assert_eq!(in_val, out_val + fee, "mk_body must be balanced");
+        TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            fee: fee as u128,
+            inputs: vec![
+                TxInput {
+                    slot_index: 0,
+                    value: in_val,
+                    owner: Address([0x11; 32]),
+                    spend_secret: SpendSecret([0x22; 32]),
+                    auth_tag: AuthTag([0x33; 32]),
+                    valid: true,
+                },
+                TxInput::dummy(),
+                TxInput::dummy(),
+                TxInput::dummy(),
+            ],
+            outputs: vec![
+                TxOutput {
+                    value: out_val,
+                    owner: Address([0x44; 32]),
+                    valid: true,
+                },
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+            ],
+        }
+    }
+
+    #[test]
+    fn validity_3b4_shape() {
+        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+        assert_eq!(air.n_columns(), TX_VALIDITY_3B4_N_COLS);
+        assert_eq!(air.log_rows(), TX_VALIDITY_3B4_LOG_ROWS);
+        assert!(air.is_composite_3b4());
+        // Skeleton 2 BoolGates + 11-block balance + bridges + tail gates.
+        assert!(air.constraints().len() > 2);
+    }
+
+    #[test]
+    fn validity_3b4_accepts_balanced_tx() {
+        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+        let body = mk_body_balanced_1in1out(1000, 995, 5);
+        let ins = [1000u64, 0, 0, 0];
+        let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
+        let trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            5,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert_eq!(trace.n_cols(), TX_VALIDITY_3B4_N_COLS);
+        assert!(air.check(&trace));
+    }
+
+    #[test]
+    fn validity_3b4_rejects_unbalanced_tx() {
+        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+        let body = mk_body_balanced_1in1out(1000, 995, 5);
+        // Witness says balanced but balance circuit carries an
+        // unbalanced tuple — the composite AIR must reject.
+        let ins = [1000u64, 0, 0, 0];
+        let outs = [994u64, 0, 0, 0, 0, 0, 0, 0];
+        let trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            5,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn validity_3b4_rejects_tampered_witness_selector() {
+        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+        let body = mk_body_balanced_1in1out(1234, 1234, 0);
+        let ins = [1234u64, 0, 0, 0];
+        let outs = [1234u64, 0, 0, 0, 0, 0, 0, 0];
+        let mut trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            0,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        // Break the InputValid selector `{0,1}` bool constraint.
+        trace.columns[TxValidityCol::InputValid.index()][7] = Block128::from(3u128);
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn validity_3b4_rejects_tampered_balance_column() {
+        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+        let body = mk_body_balanced_1in1out(1000, 995, 5);
+        let ins = [1000u64, 0, 0, 0];
+        let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
+        let mut trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            5,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        // Flip a bit of the A0.a column at row 0 (an active input
+        // bit) — the balance circuit must catch it.
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET; // A0.a is col 0 of balance
+        trace.columns[col][0] += Block128::ONE;
+        assert!(!air.check(&trace));
     }
 }

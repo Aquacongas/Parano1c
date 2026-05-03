@@ -771,15 +771,18 @@ fn print_da_table(rows: &[DaRow]) {
 fn print_wire(r: &WireRow) {
     println!("  +------------------------------ WIRE CODECS ------------------------------+");
     println!(
-        "  | sizes: TxBody(4in,8out) = {} B   BlockHeader = {} B   PublicInputs = {} B",
-        r.tx_body_bytes, BLOCK_HEADER_WIRE_SIZE, PUBLIC_INPUTS_WIRE_SIZE
+        "  | {:<70} |",
+        format!(
+            "sizes: TxBody(4in,8out) = {} B   BlockHeader = {} B   PublicInputs = {} B",
+            r.tx_body_bytes, BLOCK_HEADER_WIRE_SIZE, PUBLIC_INPUTS_WIRE_SIZE
+        )
     );
-    println!("  |          BLOCK_VERSION = {}", BLOCK_VERSION);
+    println!("  | {:<70} |", format!("       BLOCK_VERSION = {}", BLOCK_VERSION));
     println!("  |--------------------------------------------------------------------------|");
-    println!("  | {:<28} {:>14}                                |", "tx_body encode:",  fmt_ms(r.tx_body_encode));
-    println!("  | {:<28} {:>14}                                |", "tx_body decode:",  fmt_ms(r.tx_body_decode));
-    println!("  | {:<28} {:>14}                                |", "block_header encode:", fmt_ms(r.header_encode));
-    println!("  | {:<28} {:>14}                                |", "block_header decode:", fmt_ms(r.header_decode));
+    println!("  | {:<30} {:>39} |", "tx_body encode:", fmt_ms(r.tx_body_encode));
+    println!("  | {:<30} {:>39} |", "tx_body decode:", fmt_ms(r.tx_body_decode));
+    println!("  | {:<30} {:>39} |", "block_header encode:", fmt_ms(r.header_encode));
+    println!("  | {:<30} {:>39} |", "block_header decode:", fmt_ms(r.header_decode));
     println!("  +--------------------------------------------------------------------------+");
     println!();
 }

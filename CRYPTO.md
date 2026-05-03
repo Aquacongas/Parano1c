@@ -381,90 +381,37 @@ FS channel (§5.7).
    `[p(0), p(1), …, p(d+1)]` (where `d` is the max constraint degree,
    ROADMAP §3b-0), squeeze round challenge `r_i`. The final opening
    point is the **reversed** challenge vector `r ∈ F^{log_rows}`.
-4. For each shifted column slot `(slot, col_id)`, open the base column
-   through the Ladder-FRI sub-channel (§12a).
-5. Open the `n_cols` base columns at `r` via the RLC-batched protocol
-   (§12b).
-6. Emit `StarkProof { zero_check_rounds, shift_partials, shift_proofs,
-   base_openings, base_batched_proof }`.
+4. Observe the `n_cols` base openings `e_i = MLE_i(r)` in column-index
+   order.
+5. For each shifted column slot `s` in slot-index order, absorb the
+   sub-channel tag `0xFFFE_0000_0000_0000 | s` followed by the `n+1`
+   ladder partials `v_{s,0}, …, v_{s,n}` (§12c').
+6. Run the merged multipoint sumcheck (§12c'): squeeze one `γ_s` per
+   slot, absorb the multipoint domain tag, squeeze `β`, then observe
+   round polynomials and squeeze fold challenges for `log_len` rounds.
+7. Open the `n_cols` base columns at `r''` via the RLC-batched protocol
+   (§12b), with `r''` = reversed multipoint-sumcheck challenge vector.
+8. Emit `StarkProof { zero_check_rounds, base_openings, shift_partials,
+   multipoint_rounds, base_batched_proof }`.
 
-The VSHIFT ladder separator (opening-point tag) is
-`0xFFFF_0000_0000_0000 | slot`; the Ladder-FRI sub-channel separator is
-`0xFFFE_0000_0000_0000 | slot` (§12a.4). These two tags **must**
-remain distinct — see §12a rationale.
+The VSHIFT ladder separator (opening-point tag for reconstruction of
+`C'(r)` via `reconstruct_shifted_opening`) is `0xFFFF_0000_0000_0000 |
+slot`; the slot sub-channel tag absorbed alongside each slot's ladder
+partials is `0xFFFE_0000_0000_0000 | slot`. The two tags live in
+different transcript positions and **must** remain distinct.
 
-### 12a Ladder-FRI batched opening (shipped, Stage 3b-0.4)
+### 12a Ladder-FRI batched opening (removed in Stage 3b-0.6)
 
-Collapses the `n + 1`-point ladder (`n = log_len`) per shifted column
-into a **single** FRI opening of the base column at a freshly sampled
-random point `r'`, with a short product-sumcheck binding the batched
-claim.
+Historical note. §12a previously ran a separate degree-2 product
+sumcheck per shifted column, consuming `n_shifted × (n_rounds ·
+Poseidon-squeeze + n · (fold + scale))` prover work and mirroring it
+on the verifier. Stage 3b-0.6 ("Ladder Merge") collapses every per-
+slot reduction directly into §12c' below, eliminating the per-slot
+sumcheck. The ladder partials `v_k` and the `0xFFFE_…` slot tag
+survive — they now seed §12c' rather than a per-slot sub-channel.
 
-#### 12a.1 Inputs at this point in the transcript
-
-- Parent channel has already absorbed PI, all column roots, and the
-  zero-check sumcheck.
-- VSHIFT ladder partials `v_k = C(P_k)` for `k = 0, …, n` are
-  produced by the prover; `P_k` are deterministic from `r`.
-
-#### 12a.2 Per shifted column `(slot, col_id)`
-
-1. **Seed sub-channel.** Clone parent channel; absorb
-   `LADDERFS_TAG = 0xFFFE_0000_0000_0000 | slot`, then `col_id` as
-   `Block128`, then `v_0, …, v_n`.
-2. **Squeeze batching scalar `γ`** (one field element).
-3. **Target.** `T = Σ_{k=0}^{n} γ^k · v_k`; computed locally by both
-   parties.
-4. **Weight polynomial.**
-   `W(x) = Σ_k γ^k · eq(P_k, x)` on `{0,1}^n`. Then
-   `Σ_{x ∈ {0,1}^n} C(x) · W(x) = Σ_k γ^k · v_k = T`.
-5. **Batched sumcheck.** Prove `Σ_x C(x)·W(x) = T` in `n` rounds,
-   degree-2 per round (three evaluations at `X ∈ {0,1,2}`); verifier
-   checks `p(0) + p(1) == claim`, folds `claim ← p(r'_i)`, LSB-first.
-6. **Final.** The terminal claim equals `C(r') · W(r')`; `W(r')` is
-   computable by both parties from `(γ, r, r')`. Prover opens `C(r')`
-   with one FRI evaluation proof; verifier checks
-   `C(r') · W(r') == terminal_claim`.
-
-The zero-check terminal equation continues to use the ladder partials
-`v_k` and the closed-form `C'(r) = Σ_k w_k(r) · v_k` — steps 5–6 only
-attest that the `v_k` are *consistent with* the committed `C`.
-
-#### 12a.3 Soundness
-
-With `Δ_k = v_k - C(P_k)` and `p_Δ(γ) = Σ_k γ^k · Δ_k`:
-
-- `Pr_γ[T = T*] ≤ n / |F| = n / 2^128` (Schwartz–Zippel).
-- Degree-2 `n`-round sumcheck error ≤ `2n / |F|` (LFKN over GF(2^128)).
-- Base FRI error inherited from §9.
-
-Union bound: `ε_ladder ≤ 3n / |F| ≤ 48 / 2^128` — negligible.
-
-#### 12a.4 Canonical sub-channel order
-
-Per slot `(slot, col_id)`:
-
-1. absorb `0xFFFE_0000_0000_0000 | slot`;
-2. absorb `col_id as Block128`;
-3. absorb `v_0, v_1, …, v_n`;
-4. squeeze `γ`;
-5. for `i = 0, …, n-1`: observe `[p(0), p(1), p(2)]`, squeeze `r'_i`;
-6. observe the single `C(r')` FRI opening (internal FRI FS is handled
-   by `noid_fri::prover::prove`).
-
-The `0xFFFE_…` / `0xFFFF_…` split is mandatory: the old per-ladder-
-point FRI openings remain reachable in historical proof blobs, and
-tag reuse would risk replay-style FS collisions if a pre-3b-0.4 proof
-were ever resubmitted through the new verifier.
-
-#### 12a.5 Cost (`prod`, `log_len = 16`, `n_shifted = 5`)
-
-| Metric                         | Before (3b-0.3) | After (3b-0.4) |
-| ------------------------------ | --------------- | -------------- |
-| FRI openings per shifted col   | `n + 1 = 17`    | `1`            |
-| Extra sumcheck rounds per col  | 0               | `n = 16`, d=2  |
-| Proof size (ladder block)      | ~ 11.2 MB       | ~ 0.6 MB       |
-| Verifier ladder share          | ~ 78 %          | < 15 %         |
+See §12c' for the active protocol. The `StarkProof` wire format no
+longer carries `ladder_batch_rounds` or `ladder_batch_openings`.
 
 ### 12b RLC-batched column opening (shipped, Stage 3b-0.5 / 0.5.1)
 
@@ -552,12 +499,132 @@ against existing per-column roots).
 Measured on `prod`: verify 98.7 ms (−29 % vs 3b-0.4), proof 1.12 MB
 (−57 %), prove 2.15 s (−3.6 %). See ROADMAP §3b-0.5 / 0.5.1.
 
-### 12c Interaction between §12a and §12b
+### 12c' Merged multipoint sumcheck with inlined ladder (shipped, Stage 3b-0.6)
 
-Out of scope for 3b-0.5. The ladder sub-channel opens the base column
-at a *different* point `r'` per shifted column, so RLC-batching ladder
-openings would require choosing a shared `r'` across shifted columns
-— possible, but a distinct protocol change, not on the critical path.
+Motivation. Stage 3b-0.5.1 left two independent multipoint-to-single-
+point reductions on the critical path: the §12a per-slot product
+sumcheck (one per shifted column, reducing its ladder to a single
+point `r'_s`), and the §12c multipoint sumcheck (reducing the `n_cols`
+base openings at `r` to a shared point `r''`). Both are degree-2
+sumchecks of length `log_len`. 3b-0.6 ("Ladder Merge") collapses the
+ladder reductions into §12c by treating each ladder as one extra
+`(A, B)` pair, eliminating `s_count` full sumchecks.
+
+#### 12c'.1 Pairs and target
+
+After absorbing base openings `e_i` and all slot partials
+`{v_{s,k}}_k` (with slot tags, §12.0 steps 4–5), the prover and
+verifier both run:
+
+- squeeze one `γ_s ∈ F` per shifted slot, in slot order;
+- absorb the multipoint domain tag;
+- squeeze `β ∈ F`; set `λ_i = β^i` for `i ∈ [0, n)` and
+  `η_s = β^{n+s}` for `s ∈ [0, s_count)`.
+
+Define for each base column `i` the pair
+
+```text
+A_i(x) = λ_i · eq(r, x),       B_i(x) = MLE_i(x)
+```
+
+and for each shifted slot `s` (committing column index `col_s`) the
+pair
+
+```text
+W_s(x) = Σ_{k=0}^{n} γ_s^k · eq(P_{s,k}, x)
+A_s(x) = η_s · W_s(x),         B_s(x) = MLE_{col_s}(x)
+```
+
+where `P_{s,k}` are the VSHIFT ladder points of slot `s` at opening
+point `r` (§12 / `ladder_points`).
+
+The target is
+
+```text
+T = Σ_i λ_i · e_i  +  Σ_s η_s · (Σ_k γ_s^k · v_{s,k})
+```
+
+Both sides compute `T` identically: the verifier uses the per-slot
+partials that the prover absorbed in step 5.
+
+#### 12c'.2 Sumcheck
+
+Run `prove_multipoint_sumcheck` / `verify_multipoint_sumcheck` on the
+concatenated pair list `(A_i, B_i) ++ (A_s, B_s)` with target `T`.
+Each round observes the degree-2 round polynomial `p_j(X) = p_j(0) +
+p_j(1)·X + p_j(2)·X^2` and squeezes `r_j`. After `log_len` rounds the
+reversed challenge vector `r''` is the common opening point for all
+pairs.
+
+Terminal check (verifier, closed-form):
+
+```text
+expected  = (Σ_i λ_i · MLE_i(r''))  ·  eq(r, r'')                 ← absent, see below
+          + Σ_s η_s · W_s(r'') · MLE_{col_s}(r'')
+```
+
+Since base and ladder pairs share the *same* terminal opening at
+`r''` against the batched FRI (§12b), the verifier instead takes the
+single batched opening `MLE_i(r'')` from §12b, computes
+`eq(r, r'')` once, and multiplies in the precomputed
+`W_s(r'') = Σ_k γ_s^k · eq(P_{s,k}, r'')`
+(closed form, no committed data). If the assembled product equals the
+last-round polynomial's evaluation at `r_{log_len}`, the proof passes.
+
+#### 12c'.3 Soundness
+
+Two independent Fiat–Shamir steps:
+
+- **`γ_s` (per slot).** If the prover lies about any `v_{s,k}`, the
+  target `T` becomes a non-zero polynomial of degree `n = log_len` in
+  `γ_s`; Schwartz–Zippel gives `Pr ≤ n / 2^128` per slot.
+- **`β` (cross-pair).** If the base/ladder claims are inconsistent
+  across pairs, the aggregate is a non-zero polynomial of degree
+  `n + s_count - 1` in `β`; Schwartz–Zippel gives
+  `Pr ≤ (n + s_count - 1) / 2^128`.
+
+Union bound over slots and the cross-pair step:
+`≤ (s_count · n + n + s_count) / 2^128`. For `prod`
+(`log_len = 16`, `s_count ≤ 8`), this is `≤ 2^{-120}`, negligible
+against the 192-bit FRI soundness floor. The sub-channel tag
+`0xFFFE_…|s` prevents cross-slot partial reuse from altering any
+`γ_s` while keeping `T` unchanged.
+
+#### 12c'.4 Canonical transcript order
+
+Strictly:
+
+1. observe `e_0, …, e_{n-1}` (§12.0 step 4);
+2. for `s = 0, …, s_count-1`: observe `0xFFFE_…|s`, then
+   `v_{s,0}, …, v_{s,n}`;
+3. squeeze `γ_0, …, γ_{s_count-1}` in slot order;
+4. observe `MULTIPOINT_TAG`;
+5. squeeze `β`;
+6. observe multipoint sumcheck round polynomials and squeeze fold
+   challenges for `log_len` rounds;
+7. run §12b batched FRI opening at `r''`.
+
+Steps 3 and 5 **must** happen after all prover-controlled data in
+steps 1–2 is absorbed; otherwise a malicious prover could adapt
+partials to a known `γ_s` or `β`.
+
+#### 12c'.5 Cost vs 3b-0.5.1
+
+| Metric                           | Before (3b-0.5.1)                | After (3b-0.6)                     |
+| -------------------------------- | -------------------------------- | ---------------------------------- |
+| Ladder sumchecks                 | `s_count` × `log_len` rounds     | 0                                  |
+| Merged multipoint rounds         | `log_len`                        | `log_len` (+ `s_count` extra pairs)|
+| Prover ladder work               | `s_count` × `O(2^{log_len})`     | weight-table fill `O(s · 2^n)`     |
+| Verifier ladder work             | `s_count` × replay + FRI open    | `s_count` × closed-form `W_s(r'')` |
+| FRI openings                     | `1` batched + `s_count` per-slot | `1` batched at `r''`               |
+| Wire: `ladder_batch_rounds`      | `s_count` × `log_len` polys      | removed                            |
+| Wire: `ladder_batch_openings`    | `s_count` `EvalProof`            | removed                            |
+
+The ladder contribution shifts from ~`s_count` full degree-2 sumchecks
+to `s_count` extra degree-2 pairs inside a single existing sumcheck —
+roughly a `1 / (1 + n/(n + s_count))` reduction in the per-slot
+pipeline, plus the complete removal of every per-slot FRI opening.
+See ROADMAP §3b-0.6 for measured numbers.
 
 ---
 
@@ -586,7 +653,7 @@ openings would require choosing a shared `r'` across shifted columns
 | `hash_tx_body`        | Depth-4 Merkle (`compress`) + wrap permutation, IV = `TXBODY__` |
 | State commitment      | 3-column FRI MLE over `2^24` slots, Blake3 cross-column root    |
 | Public inputs         | `(prev_state_root, new_state_root, tx_body_hash, fee)`          |
-| Ladder-FRI separator  | `0xFFFE_0000_0000_0000 \| slot` (see §12a.4)                    |
+| Ladder slot sub-tag   | `0xFFFE_0000_0000_0000 \| slot` (see §12c'.3)                   |
 | VSHIFT opening tag    | `0xFFFF_0000_0000_0000 \| slot`                                 |
 | Digest encoding       | `bytes[0..16] -> Block128[0]`, `bytes[16..32] -> Block128[1]`   |
 | `ZERO_DIGEST`         | `[0u8; 32]` everywhere                                          |

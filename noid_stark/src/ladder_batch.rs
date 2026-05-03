@@ -1,32 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 3b-0.4 Candidate A — batched ladder-FRI opening via a
-//! degree-2 multilinear product sumcheck.
+//! Stage 3b-0.6 — shared helpers for the ladder-merge protocol.
 //!
-//! See CRYPTO.md §12a for the protocol and soundness argument. In
-//! short: given the committed base column `C: {0,1}^n → F` and the
-//! ladder partials `v_k = C(P_k)` for `k = 0, …, n`, the prover
-//! proves
+//! See CRYPTO.md §12c' for the protocol and soundness argument. The
+//! legacy per-slot product sumcheck (old §12a) is gone: ladder claims
+//! are inlined directly into the §12c' multipoint sumcheck as
+//! γ_s-weighted eq-sums over `ladder_points(r_point)`.
 //!
-//! ```text
-//!   Σ_{x ∈ {0,1}^n}  C(x) · W(x)  =  Σ_{k=0}^{n} γ^k · v_k   (= T)
-//! ```
-//!
-//! where `W(x) = Σ_k γ^k · eq(P_k, x)` and `γ` is Fiat–Shamir from
-//! the ladder-batch sub-channel. The sumcheck collapses into a
-//! single claim `C(r') · W(r')` at a random `r' ∈ F^n`; one FRI
-//! opening of `C` at `r'` closes the statement. The ladder partials
-//! `v_k` are kept in the proof because the verifier still needs them
-//! to reconstruct `C'(r)` via `crate::vshift::reconstruct_shifted_opening`.
+//! What survives here:
+//!   * `target_claim(γ, partials)` — computes `Σ_k γ^k · v_k`, used
+//!     both prover- and verifier-side to build the §12c' target.
+//!   * `weight_at(γ, points, r'')` — closed-form verifier evaluator
+//!     for `W_s(r'') = Σ_k γ_s^k · eq(P_{s,k}, r'')`.
+//!   * `WeightTrails` + `build_weight_table_from_trails` — hypercube
+//!     materialisation of `W_s(x)` on `{0,1}^n`, used prover-side to
+//!     build the ladder pairs for `prove_multipoint_sumcheck`.
+//!   * `sub_channel_tag(slot)` — domain tag absorbed with each slot's
+//!     partials so that cross-slot confusion is impossible.
 
 use noid_core::{Block128, TowerField};
-
-use crate::RoundPoly;
-
-/// Number of evaluations per round polynomial for the degree-2
-/// product sumcheck (evaluations at `X = 0, 1, 2`).
-pub const PRODUCT_ROUND_POINTS: usize = 3;
 
 /// Compute the ladder-batch target
 /// `T = Σ_{k=0}^{n} γ^k · v_k`.
@@ -42,6 +35,11 @@ pub fn target_claim(gamma: Block128, partials: &[Block128]) -> Block128 {
 
 /// Evaluate `W(r') = Σ_k γ^k · eq(P_k, r')` in closed form. `points`
 /// must be `ladder_points(r)` (same LSB-first convention as `r'`).
+///
+/// Reference implementation — O((n+1) · n) field ops via per-point
+/// `eq_ind`. Prefer [`LadderWeightAxes`] + [`weight_at_axes`] when
+/// evaluating `W_s(r'')` for many slots at a shared `(r, r'')`: each
+/// slot drops to O(n) after a one-time O(n) precompute.
 pub fn weight_at(gamma: Block128, points: &[Vec<Block128>], r_prime: &[Block128]) -> Block128 {
     let mut acc = Block128::ZERO;
     let mut gk = Block128::ONE;
@@ -52,21 +50,109 @@ pub fn weight_at(gamma: Block128, points: &[Vec<Block128>], r_prime: &[Block128]
     acc
 }
 
-/// Build the weight table `W(x)` for all `x ∈ {0,1}^n` as a length
-/// `2^n` vector in the crate's LSB-first flat-index convention
-/// (matches `padded_columns`).
+/// Closed-form axes for `eq(P_k, r'')` shared by every slot of a single
+/// `prove_air` / `verify_air` call. Derived from the structural
+/// sparsity of `ladder_points(r)`:
+///
+/// ```text
+///   eq(P_k, r'') = prefix[k] · r''[k] · suffix[k+1]      (k < n)
+///   eq(P_n, r'') = prefix[n]
+/// ```
+///
+/// with (char-2 tower, `1 - x = 1 + x`)
+///
+/// ```text
+///   prefix[0] = 1,   prefix[k+1] = prefix[k] · (1 + r''[k])
+///   suffix[n] = 1,   suffix[k]   = suffix[k+1] · (1 + r[k] + r''[k])
+/// ```
+///
+/// Per-slot `weight_at_axes` is then O(n) field ops instead of O(n^2).
+pub struct LadderWeightAxes {
+    prefix: Vec<Block128>,
+    suffix: Vec<Block128>,
+    r_prime: Vec<Block128>,
+    n: usize,
+}
+
+impl LadderWeightAxes {
+    pub fn new(r: &[Block128], r_prime: &[Block128]) -> Self {
+        let n = r.len();
+        assert_eq!(r_prime.len(), n, "r and r'' must share length");
+        let one = Block128::ONE;
+
+        let mut prefix = Vec::with_capacity(n + 1);
+        prefix.push(one);
+        for k in 0..n {
+            let last = prefix[k];
+            prefix.push(last * (one + r_prime[k]));
+        }
+
+        let mut suffix = vec![Block128::ZERO; n + 1];
+        suffix[n] = one;
+        for k in (0..n).rev() {
+            suffix[k] = suffix[k + 1] * (one + r[k] + r_prime[k]);
+        }
+
+        Self {
+            prefix,
+            suffix,
+            r_prime: r_prime.to_vec(),
+            n,
+        }
+    }
+}
+
+/// `W_s(r'') = Σ_{k=0}^{n-1} γ^k · prefix[k] · r''[k] · suffix[k+1]
+///           + γ^n · prefix[n]`.
+pub fn weight_at_axes(gamma: Block128, axes: &LadderWeightAxes) -> Block128 {
+    let n = axes.n;
+    let mut acc = Block128::ZERO;
+    let mut gk = Block128::ONE;
+    for k in 0..n {
+        acc += gk * axes.prefix[k] * axes.r_prime[k] * axes.suffix[k + 1];
+        gk *= gamma;
+    }
+    acc += gk * axes.prefix[n];
+    acc
+}
+
+/// γ-independent fragments of the weight table. Computed once per
+/// `r_point`, reused across every ladder slot. See
+/// [`build_weight_table_from_trails`].
+///
+/// `trails[k]` is `eq_ind_partial_eval(r[k+1..n])` (length `2^{n-k-1}`).
+/// `trails.len() == n`.
+pub struct WeightTrails {
+    trails: Vec<Vec<Block128>>,
+    n: usize,
+}
+
+impl WeightTrails {
+    pub fn new(r: &[Block128]) -> Self {
+        let n = r.len();
+        let trails: Vec<Vec<Block128>> = (0..n)
+            .map(|k| noid_core::mle::eq::eq_ind_partial_eval(&r[k + 1..n]))
+            .collect();
+        Self { trails, n }
+    }
+}
+
+/// Build the weight table `W(x)` for all `x ∈ {0,1}^n` using
+/// precomputed γ-independent trails. Because every ladder slot in a
+/// `prove_air` call shares the same `r_point`, hoisting the trails out
+/// of the slot loop and only doing the `γ^k` scale here saves N_slots
+/// calls to `eq_ind_partial_eval`.
 ///
 /// Exploits the structural sparsity of `ladder_points(r)`: for `k < n`
 /// the point `P_k` has eq-table supported only on indices
 /// `(j << (k+1)) | (1 << k)` where `j ∈ [0, 2^{n-k-1})` and the values
 /// there equal `eq_ind_partial_eval(r[k+1..])`. `P_n` contributes only
-/// to index 0 (value `1`). The per-`k` supports are disjoint, so the
-/// scatter is parallel-safe. Total work is `O(2^n)` muls, independent
-/// of `n`, versus the old `O(n · 2^n)`.
-pub fn build_weight_table(gamma: Block128, r: &[Block128], n: usize) -> Vec<Block128> {
-    debug_assert_eq!(r.len(), n);
-    use rayon::prelude::*;
-
+/// to index 0 (value `1`). The per-`k` supports are disjoint.
+pub fn build_weight_table_from_trails(
+    gamma: Block128,
+    trails: &WeightTrails,
+) -> Vec<Block128> {
+    let n = trails.n;
     let len = 1usize << n;
     let mut w = vec![Block128::ZERO; len];
 
@@ -83,127 +169,22 @@ pub fn build_weight_table(gamma: Block128, r: &[Block128], n: usize) -> Vec<Bloc
     // P_n contributes γ^n at index 0.
     w[0] = gammas[n];
 
-    // Scatter per-k into disjoint strides. Writes from different k
-    // never collide, so we can safely produce each fragment in
-    // parallel and apply them sequentially.
-    let fragments: Vec<(usize, usize, Vec<Block128>)> = (0..n)
-        .into_par_iter()
-        .map(|k| {
-            let trail = noid_core::mle::eq::eq_ind_partial_eval(&r[k + 1..n]);
-            let gk = gammas[k];
-            let scaled: Vec<Block128> = trail.into_iter().map(|v| gk * v).collect();
-            let stride = 1usize << (k + 1);
-            let base = 1usize << k;
-            (stride, base, scaled)
-        })
-        .collect();
-    for (stride, base, scaled) in fragments {
-        for (j, v) in scaled.into_iter().enumerate() {
-            w[base + j * stride] = v;
+    // Scatter per-k into disjoint strides.
+    for k in 0..n {
+        let gk = gammas[k];
+        let stride = 1usize << (k + 1);
+        let base = 1usize << k;
+        let trail = &trails.trails[k];
+        for (j, &v) in trail.iter().enumerate() {
+            w[base + j * stride] = gk * v;
         }
     }
     w
 }
 
-/// Run the degree-2 product sumcheck in-place. Given initial tables
-/// `c` and `w` of length `2^n`, returns the `n` round polynomials and
-/// the final challenge vector `challenges`. The first challenge binds
-/// the highest variable (upper half), matching the zero-check
-/// convention in `crate::prove_zero_check`.
-///
-/// After this routine returns, the caller forms
-/// `r_prime = challenges.iter().rev().collect()` to use as the MLE
-/// opening point of `C` (LSB-first).
-pub fn prove_product_sumcheck(
-    mut c: Vec<Block128>,
-    mut w: Vec<Block128>,
-    target: Block128,
-    channel: &mut noid_fri::Channel,
-) -> (Vec<RoundPoly>, Vec<Block128>) {
-    let n = c.len().trailing_zeros() as usize;
-    debug_assert_eq!(c.len(), w.len());
-    debug_assert_eq!(c.len(), 1usize << n);
-
-    use rayon::prelude::*;
-
-    let mut rounds: Vec<RoundPoly> = Vec::with_capacity(n);
-    let mut challenges: Vec<Block128> = Vec::with_capacity(n);
-    let mut claim = target;
-    let two = Block128::from(2u8);
-
-    for _ in 0..n {
-        let half = c.len() / 2;
-        let (p0, p1, p2) = (0..half)
-            .into_par_iter()
-            .map(|j| {
-                let c0 = c[j];
-                let c1 = c[j + half];
-                let w0 = w[j];
-                let w1 = w[j + half];
-                let cs = c0 + two * (c1 + c0);
-                let ws = w0 + two * (w1 + w0);
-                (c0 * w0, c1 * w1, cs * ws)
-            })
-            .reduce(
-                || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
-            );
-
-        debug_assert_eq!(p0 + p1, claim, "product sumcheck consistency failure");
-
-        let rp = vec![p0, p1, p2];
-        channel.observe_field_elems(&rp);
-        let r = channel.get_random_point();
-
-        // In-place fold at the highest variable.
-        let (lo_c, hi_c) = c.split_at_mut(half);
-        lo_c.par_iter_mut()
-            .zip(hi_c.par_iter())
-            .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
-        c.truncate(half);
-        let (lo_w, hi_w) = w.split_at_mut(half);
-        lo_w.par_iter_mut()
-            .zip(hi_w.par_iter())
-            .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
-        w.truncate(half);
-
-        claim = crate::lagrange_eval_at_pub(&rp, r);
-        rounds.push(rp);
-        challenges.push(r);
-    }
-
-    (rounds, challenges)
-}
-
-/// Verify-side replay of the degree-2 product sumcheck. Consumes the
-/// round polynomials one by one and returns the challenge vector plus
-/// the terminal claim (which must equal `C(r') · W(r')`).
-pub fn verify_product_sumcheck(
-    rounds: &[RoundPoly],
-    target: Block128,
-    channel: &mut noid_fri::Channel,
-) -> Result<(Vec<Block128>, Block128), crate::VerifyError> {
-    let mut claim = target;
-    let mut challenges: Vec<Block128> = Vec::with_capacity(rounds.len());
-    for rp in rounds {
-        if rp.len() != PRODUCT_ROUND_POINTS {
-            return Err(crate::VerifyError::ShapeMismatch);
-        }
-        if rp[0] + rp[1] != claim {
-            return Err(crate::VerifyError::ZeroCheckFailed);
-        }
-        channel.observe_field_elems(rp);
-        let r = channel.get_random_point();
-        claim = crate::lagrange_eval_at_pub(rp, r);
-        challenges.push(r);
-    }
-    Ok((challenges, claim))
-}
-
-/// Domain tag used to seed the ladder-batch sub-channel for a given
-/// shifted-column `slot`. CRYPTO.md §12a.4 pins the exact value
-/// `0xFFFE_0000_0000_0000 | slot`; deliberately distinct from the old
-/// per-ladder-point tag `0xFFFF_0000_0000_0000 | slot`.
+/// Domain tag absorbed alongside a slot's ladder partials on the
+/// parent channel so that two distinct slots can never be confused:
+/// `0xFFFE_0000_0000_0000 | slot`. CRYPTO.md §12c'.3.
 #[inline]
 pub fn sub_channel_tag(slot: usize) -> Block128 {
     Block128::from(0xFFFE_0000_0000_0000_u128 | (slot as u128))
@@ -245,7 +226,8 @@ mod tests {
         let r = random_vec(n, 0x1111);
         let points = ladder_points(&r);
         let gamma = Block128::from(0xDEAD_BEEF_u128);
-        let table = build_weight_table(gamma, &r, n);
+        let trails = WeightTrails::new(&r);
+        let table = build_weight_table_from_trails(gamma, &trails);
         for idx in 0..(1usize << n) {
             let x: Vec<Block128> = (0..n)
                 .map(|b| if (idx >> b) & 1 == 1 { Block128::ONE } else { Block128::ZERO })
@@ -261,32 +243,25 @@ mod tests {
     }
 
     #[test]
-    fn product_sumcheck_roundtrip() {
-        use noid_fri::Channel;
-
-        let n = 4usize;
-        let col = random_vec(1usize << n, 0xABCD);
-        let r = random_vec(n, 0xF00D);
-        let points = ladder_points(&r);
-        let partials: Vec<Block128> = points.iter().map(|p| mle_eval_at(&col, p)).collect();
-
-        let mut pch = Channel::new();
-        let gamma = pch.get_random_point();
-        let target = target_claim(gamma, &partials);
-        let w = build_weight_table(gamma, &r, n);
-        let (rounds, _challenges) =
-            prove_product_sumcheck(col.clone(), w.clone(), target, &mut pch);
-
-        let mut vch = Channel::new();
-        let gamma_v = vch.get_random_point();
-        assert_eq!(gamma, gamma_v);
-        let target_v = target_claim(gamma_v, &partials);
-        let (challenges_v, final_claim) =
-            verify_product_sumcheck(&rounds, target_v, &mut vch).unwrap();
-        let r_prime: Vec<Block128> = challenges_v.iter().rev().cloned().collect();
-        let c_r = mle_eval_at(&col, &r_prime);
-        let w_r = weight_at(gamma_v, &points, &r_prime);
-        assert_eq!(final_claim, c_r * w_r);
+    fn weight_at_axes_matches_reference() {
+        for n in 1..=6 {
+            for trial in 0..5u128 {
+                let r = random_vec(n, 0xAA00 ^ trial ^ (n as u128));
+                let r_prime = random_vec(n, 0xBB00 ^ trial ^ (n as u128));
+                let points = ladder_points(&r);
+                let axes = LadderWeightAxes::new(&r, &r_prime);
+                for slot in 0..4 {
+                    let gamma = Block128::from(0x1234_0000u128 ^ (slot as u128) ^ trial);
+                    let reference = weight_at(gamma, &points, &r_prime);
+                    let fast = weight_at_axes(gamma, &axes);
+                    assert_eq!(
+                        fast, reference,
+                        "axes eval mismatch n={} trial={} slot={}",
+                        n, trial, slot
+                    );
+                }
+            }
+        }
     }
 
     #[test]

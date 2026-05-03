@@ -82,6 +82,53 @@ pub fn ladder_points(r: &[Block128]) -> Vec<Vec<Block128>> {
     out
 }
 
+/// Compute all `n + 1` ladder partials `v_k = C(P_k)` in `O(2^n)` total
+/// field operations (vs `O((n+1) · 2^n)` for independent per-point
+/// evaluations).
+///
+/// Exploits the structural nesting of the ladder points. Let
+/// `S_k(x_0,…,x_k) = C(x_0,…,x_k, r[k+1],…,r[n-1])` — the MLE over the
+/// first `k+1` hypercube coords with every higher coord bound to `r`.
+/// Then
+///
+/// ```text
+///   v_n = C(0,…,0) = col[0]
+///   v_k = S_k(0,…,0,1)    — flat index 2^k in S_k's 2^{k+1}-entry table   (k < n)
+///   S_{k-1} = fold(S_k, r[k])                                              (halves)
+/// ```
+///
+/// One descent from `k = n-1` down to `k = 0` extracts every partial
+/// with total work `Σ_{k=0}^{n-1} 2^k = 2^n - 1` half-folds.
+pub fn ladder_partials(col: &[Block128], r: &[Block128]) -> Vec<Block128> {
+    let n = r.len();
+    assert_eq!(col.len(), 1usize << n, "column length must be 2^n");
+
+    let mut partials = vec![Block128::ZERO; n + 1];
+    partials[n] = col[0];
+    if n == 0 {
+        return partials;
+    }
+
+    // Each fold step consumes the current MSB coord of `buf`. Start
+    // with all `n` coords live (`buf.len() = 2^n`) and fold coord
+    // `n-1`, then `n-2`, …, until only coords `0..=k` remain. At that
+    // point the table has length `2^{k+1}` and equals `S_k(x_0,…,x_k)`;
+    // read `v_k = buf[2^k]` before folding coord `k` away.
+    let mut buf: Vec<Block128> = col.to_vec();
+    for k in (0..n).rev() {
+        let half = 1usize << k;
+        // v_k sits at flat index 2^k in the current length-2·half table.
+        partials[k] = buf[half];
+        // Consume coord `k` (current MSB) with `r[k]`.
+        let rk = r[k];
+        for i in 0..half {
+            buf[i] = buf[i] + rk * (buf[i + half] + buf[i]);
+        }
+        buf.truncate(half);
+    }
+    partials
+}
+
 /// Reconstruct `C'(r)` from the ladder `partials = [P_0, …, P_n]` and
 /// the opening point `r`:
 ///
@@ -176,6 +223,23 @@ mod tests {
             Block128::from(40u128),
             Block128::from(10u128),
         ]);
+    }
+
+    /// `ladder_partials` (nested-fold, O(2^n)) agrees with the
+    /// reference per-point `mle_eval_at` for every ladder point.
+    #[test]
+    fn ladder_partials_matches_per_point_eval() {
+        for n in 1..=6 {
+            for trial in 0..5u128 {
+                let col = random_column(n, 0xC0DE_0000 ^ trial);
+                let r = random_point(n, 0xBEEF_0000 ^ trial ^ (n as u128));
+                let points = ladder_points(&r);
+                let reference: Vec<Block128> =
+                    points.iter().map(|p| mle_eval_at(&col, p)).collect();
+                let fast = ladder_partials(&col, &r);
+                assert_eq!(fast, reference, "ladder_partials mismatch at n={} trial={}", n, trial);
+            }
+        }
     }
 
     /// For every n in {1,…,5}, for random columns and random points,

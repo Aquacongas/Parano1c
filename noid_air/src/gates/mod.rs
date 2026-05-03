@@ -7,8 +7,10 @@
 
 pub mod bool;
 pub mod linear;
+pub mod mul;
 pub mod selector;
 
 pub use bool::BoolGate;
 pub use linear::WeightedLinearGate;
+pub use mul::{MulGate, SquareGate};
 pub use selector::SelectorGate;

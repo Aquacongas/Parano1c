@@ -1,0 +1,961 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid.
+
+//! Stage 3c-1.4a — `PoseidonPermAir` witness layout + trace builder.
+//!
+//! One Poseidon2b permutation rendered as a witness trace on the
+//! boolean hypercube. This module pins the column layout and supplies
+//! a `build_trace(input)` helper that produces a witness bit-for-bit
+//! equivalent to `noid_poseidon2b::native::permutation::permute_mut`.
+//! The STARK constraint emitter lands in 3c-1.4b; shipping the builder
+//! first gives us a golden reference to validate gates against.
+//!
+//! # Row programme
+//!
+//! Native Poseidon2b applies `MDS_FULL` to the input, then 66 rounds:
+//! rounds `[0, F_ROUNDS/2)` and `[F_ROUNDS/2 + P_ROUNDS, N_ROUNDS)` are
+//! **full** (RC + S-box on all 4 lanes + MDS_FULL); rounds
+//! `[F_ROUNDS/2, F_ROUNDS/2 + P_ROUNDS)` are **partial** (RC + S-box on
+//! lane 0 only + MDS_PARTIAL). With `F_ROUNDS = 8`, `P_ROUNDS = 58`:
+//!
+//! | rows  | round type | `is_full` |
+//! |-------|------------|-----------|
+//! | 0..3  | full       | 1         |
+//! | 4..61 | partial    | 0         |
+//! | 62..65| full       | 1         |
+//! | 66    | output     | 0         |
+//! | 67..  | padding    | 0         |
+//!
+//! Row `r ∈ 0..66` represents the round step whose **input** state is
+//! `s[0..4]` at row `r`, and whose **output** state is `s[0..4]` at row
+//! `r+1` (after this round's MDS). Row 0's `s[..]` is the post-initial-
+//! MDS state (i.e. `MDS_FULL(input)`). Row 66's `s[..]` is the
+//! permutation output.
+//!
+//! # Column layout (30 columns)
+//!
+//! | range    | name         | semantics                              |
+//! |----------|--------------|----------------------------------------|
+//! | 0..4     | `s[0..4]`    | state at row start                     |
+//! | 4..8     | `sin[0..4]`  | S-box input = `s[i] + RC[i][r]`        |
+//! | 8..12    | `x2[0..4]`   | `sin[i]²`                              |
+//! | 12..16   | `x4[0..4]`   | `x2[i]²`                               |
+//! | 16..20   | `x3[0..4]`   | `x2[i] · sin[i]`                       |
+//! | 20..24   | `sout[0..4]` | `x4[i] · x3[i]`                        |
+//! | 24       | `is_full`    | `1` on full-round rows, `0` otherwise  |
+//! | 25..29   | `rc[0..4]`   | `ROUND_CONSTANTS[i][r]` programme      |
+//! | 29       | `is_round`   | `1` on rows `0..N_ROUNDS`, `0` on      |
+//! |          |              | output row + padding                   |
+//!
+//! The `rc[..]` columns carry the round-constant programme verbatim on
+//! active rows `0..N_ROUNDS` and zero on the output/padding rows. At
+//! this stage they are trusted public input; §3d's `ConstColumnGate`
+//! will pin them to the literal constants.
+//!
+//! Partial-round rows zero out lanes 1..3 of `sin`, `x2`, `x4`, `x3`,
+//! `sout` — the MDS_PARTIAL gate then reads `sout[0]` as the only live
+//! lane plus `s[1..4]` for the other three lanes (per the native
+//! implementation, which feeds un-S-boxed state into lanes 1..3 of the
+//! partial-round MDS multiplication). 3c-1.4b wires the selector
+//! constraints that enforce this.
+
+use crate::airs::poseidon_sbox::{emit_sbox_x7_constraints, SboxX7Layout};
+use crate::gates::{BoolGate, SelectorGate, WeightedLinearGate};
+use crate::{Constraint, EvalFrame};
+use noid_core::{Block128, TowerField};
+use noid_poseidon2b::native::permutation::{
+    sbox_x7, F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
+};
+
+pub const POSEIDON_PERM_N_COLS: usize = 30;
+/// 256 rows. We need `log_rows >= TAU+1 = 8` for the STARK's VSHIFT
+/// ladder to coincide with cyclic rotation on the committed MLE
+/// (`MdsBlendGate` reads `s_next[lane]`). 67 active rows comfortably
+/// fit under 256.
+pub const POSEIDON_PERM_LOG_ROWS: usize = 8;
+pub const POSEIDON_PERM_N_ROWS: usize = 1 << POSEIDON_PERM_LOG_ROWS;
+
+/// Column offsets. Each of `s`, `sin`, `x2`, `x4`, `x3`, `sout` occupies
+/// 4 consecutive columns (one per lane).
+pub const POSEIDON_COL_S: usize = 0;
+pub const POSEIDON_COL_SIN: usize = 4;
+pub const POSEIDON_COL_X2: usize = 8;
+pub const POSEIDON_COL_X4: usize = 12;
+pub const POSEIDON_COL_X3: usize = 16;
+pub const POSEIDON_COL_SOUT: usize = 20;
+pub const POSEIDON_COL_IS_FULL: usize = 24;
+pub const POSEIDON_COL_RC: usize = 25;
+pub const POSEIDON_COL_IS_ROUND: usize = 29;
+
+/// Number of active round rows in one permutation instance (`N_ROUNDS`
+/// rounds + one output row).
+pub const POSEIDON_N_ACTIVE_ROWS: usize = N_ROUNDS + 1;
+
+/// Returns `true` iff round `r` is a full round. Matches the
+/// `if !(F_ROUNDS/2..F_ROUNDS/2 + P_ROUNDS).contains(&r)` branch in
+/// `Poseidon2bPermutation::permute_mut`.
+#[inline]
+pub fn is_full_round(r: usize) -> bool {
+    !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r)
+}
+
+/// Apply the MDS_FULL matrix natively (used to seed row 0's state).
+fn mds_full(state: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
+    let mut out = [Block128::ZERO; STATE_SIZE];
+    for i in 0..STATE_SIZE {
+        let mut acc = Block128::ZERO;
+        for j in 0..STATE_SIZE {
+            let w = MDS_FULL[i][j];
+            if w == 1 {
+                acc = acc + state[j];
+            } else if w != 0 {
+                acc = acc + Block128::from(w) * state[j];
+            }
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+/// Apply the MDS_PARTIAL matrix natively.
+fn mds_partial(state: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
+    let mut out = [Block128::ZERO; STATE_SIZE];
+    for i in 0..STATE_SIZE {
+        let mut acc = Block128::ZERO;
+        for j in 0..STATE_SIZE {
+            let w = MDS_PARTIAL[i][j];
+            if w == 1 {
+                acc = acc + state[j];
+            } else if w != 0 {
+                acc = acc + Block128::from(w) * state[j];
+            }
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+/// One permutation instance's witness columns.
+///
+/// Outer index: column (0..`POSEIDON_PERM_N_COLS`).
+/// Inner index: row (0..`POSEIDON_PERM_N_ROWS`).
+pub type PoseidonPermColumns = Vec<Vec<Block128>>;
+
+/// Build a full witness trace for one Poseidon2b permutation of
+/// `input`. The active rows `0..67` encode the round chain; rows
+/// `67..128` are zero padding.
+///
+/// Row 0's `s[..]` is `MDS_FULL(input)` (so the first round's RC+S-box
+/// acts on the post-initial-MDS state, matching `permute_mut`). Row
+/// 66's `s[..]` is the permutation output.
+pub fn build_perm_trace(input: [Block128; STATE_SIZE]) -> PoseidonPermColumns {
+    let mut cols: PoseidonPermColumns = (0..POSEIDON_PERM_N_COLS)
+        .map(|_| vec![Block128::ZERO; POSEIDON_PERM_N_ROWS])
+        .collect();
+
+    // Row 0 state = MDS_FULL(input). This matches the initial
+    // `apply_mds_full(state)` before the round loop in permute_mut.
+    let mut state = mds_full(input);
+    for lane in 0..STATE_SIZE {
+        cols[POSEIDON_COL_S + lane][0] = state[lane];
+    }
+
+    for r in 0..N_ROUNDS {
+        let is_full = is_full_round(r);
+        cols[POSEIDON_COL_IS_FULL][r] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[POSEIDON_COL_IS_ROUND][r] = Block128::ONE;
+        for lane in 0..STATE_SIZE {
+            cols[POSEIDON_COL_RC + lane][r] = Block128::from(ROUND_CONSTANTS[lane][r]);
+        }
+
+        if is_full {
+            // sin[i] = s[i] + RC[i][r]; x-chain on all lanes.
+            let mut sout = [Block128::ZERO; STATE_SIZE];
+            for lane in 0..STATE_SIZE {
+                let sin = state[lane] + Block128::from(ROUND_CONSTANTS[lane][r]);
+                let x2 = sin * sin;
+                let x4 = x2 * x2;
+                let x3 = x2 * sin;
+                let so = x4 * x3;
+                cols[POSEIDON_COL_SIN + lane][r] = sin;
+                cols[POSEIDON_COL_X2 + lane][r] = x2;
+                cols[POSEIDON_COL_X4 + lane][r] = x4;
+                cols[POSEIDON_COL_X3 + lane][r] = x3;
+                cols[POSEIDON_COL_SOUT + lane][r] = so;
+                sout[lane] = so;
+                // Sanity: matches native sbox_x7.
+                debug_assert_eq!(so, sbox_x7(sin));
+            }
+            state = mds_full(sout);
+        } else {
+            // Partial round: RC + S-box on lane 0 only; lanes 1..3 of
+            // sin/x*/sout are pinned to zero on this row. MDS_PARTIAL
+            // mixes [sbox(lane0), state[1], state[2], state[3]] in the
+            // native implementation; we capture that by feeding
+            // `[sout_0, state[1], state[2], state[3]]` into mds_partial.
+            let sin0 = state[0] + Block128::from(ROUND_CONSTANTS[0][r]);
+            let x2 = sin0 * sin0;
+            let x4 = x2 * x2;
+            let x3 = x2 * sin0;
+            let sout0 = x4 * x3;
+            cols[POSEIDON_COL_SIN + 0][r] = sin0;
+            cols[POSEIDON_COL_X2 + 0][r] = x2;
+            cols[POSEIDON_COL_X4 + 0][r] = x4;
+            cols[POSEIDON_COL_X3 + 0][r] = x3;
+            cols[POSEIDON_COL_SOUT + 0][r] = sout0;
+            debug_assert_eq!(sout0, sbox_x7(sin0));
+
+            let mut mds_in = [Block128::ZERO; STATE_SIZE];
+            mds_in[0] = sout0;
+            for lane in 1..STATE_SIZE {
+                mds_in[lane] = state[lane];
+            }
+            state = mds_partial(mds_in);
+        }
+
+        // Write next state into row r+1.
+        let next_row = r + 1;
+        for lane in 0..STATE_SIZE {
+            cols[POSEIDON_COL_S + lane][next_row] = state[lane];
+        }
+    }
+
+    cols
+}
+
+/// Extract the permutation output (state at row `N_ROUNDS`).
+pub fn extract_perm_output(cols: &PoseidonPermColumns) -> [Block128; STATE_SIZE] {
+    let row = N_ROUNDS;
+    let mut out = [Block128::ZERO; STATE_SIZE];
+    for lane in 0..STATE_SIZE {
+        out[lane] = cols[POSEIDON_COL_S + lane][row];
+    }
+    out
+}
+
+/// Emit the per-lane S-box chain constraints for `PoseidonPermAir`.
+///
+/// Four gates per lane × 4 lanes = 16 degree-2 constraints, all local
+/// (no rotations). They pin
+/// `x2[i] = sin[i]²`, `x4[i] = x2[i]²`, `x3[i] = x2[i]·sin[i]`,
+/// `sout[i] = x4[i]·x3[i]` on every row.
+///
+/// Partial rounds and padding rows hold `sin[i] = 0` for the relevant
+/// lanes (by construction in `build_perm_trace`); the chain then
+/// forces `x2=x4=x3=sout = 0` trivially — no extra selector needed for
+/// this layer. Selector gating for lanes 1..3 during partial rounds
+/// (i.e. forcing `sin[lane] = 0`) comes with the RC / selector layer
+/// in 3c-1.4c and the MDS blend in 3c-1.4d.
+pub fn emit_perm_sbox_chain() -> Vec<Box<dyn Constraint>> {
+    let mut out = Vec::with_capacity(16);
+    for lane in 0..STATE_SIZE {
+        let layout = SboxX7Layout {
+            sin: POSEIDON_COL_SIN + lane,
+            x2: POSEIDON_COL_X2 + lane,
+            x4: POSEIDON_COL_X4 + lane,
+            x3: POSEIDON_COL_X3 + lane,
+            sout: POSEIDON_COL_SOUT + lane,
+        };
+        out.extend(emit_sbox_x7_constraints(layout));
+    }
+    out
+}
+
+/// Emit the RC-binding layer.
+///
+/// - Lane 0 (live on full and partial rounds): gated by `is_round`, so
+///   `is_round · (sin[0] + s[0] + rc[0]) == 0`. On the output row
+///   (`r = N_ROUNDS`) `s[0]` is the permutation output and
+///   `sin[0] = rc[0] = 0`, so we must suppress the XOR there.
+/// - Lanes 1..3 (live only on full rounds): gated by `is_full`, i.e.
+///   `is_full · (sin[i] + s[i] + rc[i]) == 0`. On partial rows
+///   `is_full = 0` suppresses the XOR; the kill-selector in 3c-1.4e
+///   still has to enforce `sin[i] = 0` on partial rows.
+/// - Bool gates on both selectors: `is_full ∈ {0,1}`, `is_round ∈ {0,1}`.
+pub fn emit_perm_rc_binding() -> Vec<Box<dyn Constraint>> {
+    let mut out: Vec<Box<dyn Constraint>> = Vec::with_capacity(STATE_SIZE + 2);
+
+    // Lane 0: gated by is_round.
+    let lane0_inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![
+        POSEIDON_COL_SIN,
+        POSEIDON_COL_S,
+        POSEIDON_COL_RC,
+    ]));
+    out.push(Box::new(SelectorGate::new(POSEIDON_COL_IS_ROUND, lane0_inner)));
+
+    // Lanes 1..3: gated by is_full.
+    for lane in 1..STATE_SIZE {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![
+            POSEIDON_COL_SIN + lane,
+            POSEIDON_COL_S + lane,
+            POSEIDON_COL_RC + lane,
+        ]));
+        out.push(Box::new(SelectorGate::new(POSEIDON_COL_IS_FULL, inner)));
+    }
+
+    out.push(Box::new(BoolGate::new(POSEIDON_COL_IS_FULL)));
+    out.push(Box::new(BoolGate::new(POSEIDON_COL_IS_ROUND)));
+    out
+}
+
+/// Blended MDS transition gate for one output lane.
+///
+/// On active round rows, exactly one arm fires:
+///
+/// - Full round (`is_full = 1`):
+///   `s_next[i] == Σ_j MDS_FULL[i][j] · sout[j]`.
+/// - Partial round (`is_full = 0`, `is_round = 1`):
+///   `s_next[i] == MDS_PARTIAL[i][0] · sout[0] +
+///                 Σ_{j=1..3} MDS_PARTIAL[i][j] · s[j]`.
+///   Lanes 1..3 feed un-S-boxed state (matches the native reference).
+///
+/// On the output row and padding (`is_round = 0`), the whole gate is
+/// suppressed — next-row state is unconstrained here.
+///
+/// Expressed as a single polynomial via the identity
+/// `is_full · (is_full + 1) = 0` for bool `is_full`:
+///
+/// ```text
+///   is_round · [ is_full · full_residue + (is_full + 1) · partial_residue ] == 0
+/// ```
+///
+/// Degree: 3 (selector · selector · residue). Rotation: one `s_next[i]`.
+/// Locals: `sout[0..4]`, `s[1..4]`, `is_full`, `is_round` — 10 columns.
+pub struct PermMdsBlendGate {
+    lane: usize,
+    locals: Vec<usize>,
+    shifted: [usize; 1],
+    /// Index inside `locals` of `sout[j]` for j=0..4.
+    sout_idx: [usize; STATE_SIZE],
+    /// Index inside `locals` of `s[j]` for j=1..4. (`s[0]` is not read.)
+    s_idx: [usize; STATE_SIZE - 1],
+    /// Index inside `locals` of `is_full`, `is_round`.
+    is_full_idx: usize,
+    is_round_idx: usize,
+}
+
+impl PermMdsBlendGate {
+    pub fn new(lane: usize) -> Self {
+        assert!(lane < STATE_SIZE);
+        // Build the local column list in a deterministic order and
+        // remember each role's index within it.
+        let mut locals: Vec<usize> = Vec::with_capacity(10);
+        let mut sout_idx = [0usize; STATE_SIZE];
+        for j in 0..STATE_SIZE {
+            sout_idx[j] = locals.len();
+            locals.push(POSEIDON_COL_SOUT + j);
+        }
+        let mut s_idx = [0usize; STATE_SIZE - 1];
+        for (k, j) in (1..STATE_SIZE).enumerate() {
+            s_idx[k] = locals.len();
+            locals.push(POSEIDON_COL_S + j);
+        }
+        let is_full_idx = locals.len();
+        locals.push(POSEIDON_COL_IS_FULL);
+        let is_round_idx = locals.len();
+        locals.push(POSEIDON_COL_IS_ROUND);
+
+        Self {
+            lane,
+            locals,
+            shifted: [POSEIDON_COL_S + lane],
+            sout_idx,
+            s_idx,
+            is_full_idx,
+            is_round_idx,
+        }
+    }
+
+    #[inline]
+    fn apply_row(mat: &[[u128; STATE_SIZE]; STATE_SIZE], lane: usize, vals: [Block128; STATE_SIZE]) -> Block128 {
+        let mut acc = Block128::ZERO;
+        for j in 0..STATE_SIZE {
+            let w = mat[lane][j];
+            if w == 1 {
+                acc = acc + vals[j];
+            } else if w != 0 {
+                acc = acc + Block128::from(w) * vals[j];
+            }
+        }
+        acc
+    }
+}
+
+impl Constraint for PermMdsBlendGate {
+    fn degree(&self) -> usize {
+        3
+    }
+    fn columns(&self) -> &[usize] {
+        &self.locals
+    }
+    fn shifted_columns(&self) -> &[usize] {
+        &self.shifted
+    }
+    fn evaluate(&self, frame: EvalFrame) -> Block128 {
+        let s_next = frame.next[0];
+        let sout: [Block128; STATE_SIZE] = [
+            frame.local[self.sout_idx[0]],
+            frame.local[self.sout_idx[1]],
+            frame.local[self.sout_idx[2]],
+            frame.local[self.sout_idx[3]],
+        ];
+        let is_full = frame.local[self.is_full_idx];
+        let is_round = frame.local[self.is_round_idx];
+
+        // Full arm: s_next + MDS_FULL[lane] · sout
+        let full_residue = s_next + Self::apply_row(&MDS_FULL, self.lane, sout);
+
+        // Partial arm: s_next + MDS_PARTIAL[lane] · [sout[0], s[1], s[2], s[3]]
+        let partial_input: [Block128; STATE_SIZE] = [
+            sout[0],
+            frame.local[self.s_idx[0]],
+            frame.local[self.s_idx[1]],
+            frame.local[self.s_idx[2]],
+        ];
+        let partial_residue = s_next + Self::apply_row(&MDS_PARTIAL, self.lane, partial_input);
+
+        let one_plus_is_full = is_full + Block128::ONE;
+        is_round * (is_full * full_residue + one_plus_is_full * partial_residue)
+    }
+}
+
+/// Emit the MDS blend layer: one `PermMdsBlendGate` per output lane.
+pub fn emit_perm_mds_blend() -> Vec<Box<dyn Constraint>> {
+    (0..STATE_SIZE)
+        .map(|lane| Box::new(PermMdsBlendGate::new(lane)) as Box<dyn Constraint>)
+        .collect()
+}
+
+/// Emit the complete `PoseidonPermAir` constraint set: S-box chain +
+/// RC binding (with is_full / is_round selectors) + MDS blend +
+/// partial-round S-box kill. Lays out as
+/// `16 + 6 + 4 + 3 = 29` gates.
+pub fn emit_perm_all() -> Vec<Box<dyn Constraint>> {
+    let mut out = Vec::new();
+    out.extend(emit_perm_sbox_chain());
+    out.extend(emit_perm_rc_binding());
+    out.extend(emit_perm_mds_blend());
+    out.extend(emit_perm_partial_sbox_kill());
+    out
+}
+
+/// Emit the partial-round S-box-kill layer: on non-full rows, pin
+/// `sin[lane] = 0` for lanes 1..3. Concretely:
+///
+/// ```text
+///   (is_full + 1) · sin[lane] == 0       for lane ∈ {1, 2, 3}
+/// ```
+///
+/// (Char-2: `is_full + 1 = 1 - is_full`.) Forces the canonical
+/// partial-round layout that `build_perm_trace` produces: S-box acts on
+/// lane 0 only; lanes 1..3 of `sin`/`x2`/`x4`/`x3`/`sout` are zero.
+/// Together with the S-box chain (`x2 = sin²` etc.), killing `sin`
+/// cascades through the rest: `sin=0 ⇒ x2=x4=x3=sout=0`. Padding rows
+/// (`is_round=0`, `is_full=0`) also fall under this kill — fine, they
+/// carry zero by construction.
+pub fn emit_perm_partial_sbox_kill() -> Vec<Box<dyn Constraint>> {
+    // One quadratic gate per lane in {1, 2, 3}.
+    let mut out: Vec<Box<dyn Constraint>> = Vec::with_capacity(STATE_SIZE - 1);
+    for lane in 1..STATE_SIZE {
+        out.push(Box::new(PartialSboxKillGate::new(lane)));
+    }
+    out
+}
+
+/// `(is_full + 1) · sin[lane] == 0`. Degree 2, one local read + is_full.
+pub struct PartialSboxKillGate {
+    locals: [usize; 2],
+}
+
+impl PartialSboxKillGate {
+    pub fn new(lane: usize) -> Self {
+        assert!(lane >= 1 && lane < STATE_SIZE);
+        Self {
+            locals: [POSEIDON_COL_IS_FULL, POSEIDON_COL_SIN + lane],
+        }
+    }
+}
+
+impl Constraint for PartialSboxKillGate {
+    fn degree(&self) -> usize {
+        2
+    }
+    fn columns(&self) -> &[usize] {
+        &self.locals
+    }
+    fn evaluate(&self, frame: EvalFrame) -> Block128 {
+        let is_full = frame.local[0];
+        let sin = frame.local[1];
+        (is_full + Block128::ONE) * sin
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+
+    fn mk_input(seed: u128) -> [Block128; STATE_SIZE] {
+        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        [
+            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
+            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
+            Block128::from(s.wrapping_add(2) ^ 0xFFFF_0000_FFFF_0000),
+            Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
+        ]
+    }
+
+    #[test]
+    fn round_schedule_matches_native_branch() {
+        // First F/2 full, then P partial, then F/2 full.
+        let f_half = F_ROUNDS / 2;
+        for r in 0..f_half {
+            assert!(is_full_round(r), "round {r} should be full");
+        }
+        for r in f_half..f_half + P_ROUNDS {
+            assert!(!is_full_round(r), "round {r} should be partial");
+        }
+        for r in f_half + P_ROUNDS..N_ROUNDS {
+            assert!(is_full_round(r), "round {r} should be full");
+        }
+    }
+
+    #[test]
+    fn perm_trace_output_matches_native_permutation() {
+        for seed in 0..4 {
+            let input = mk_input(seed);
+            let cols = build_perm_trace(input);
+
+            // Native reference: copy input, permute in place.
+            let mut native_state = input;
+            Poseidon2bPermutation.permute_mut(&mut native_state);
+
+            let trace_out = extract_perm_output(&cols);
+            assert_eq!(
+                trace_out, native_state,
+                "seed {seed}: trace output must match native permute_mut"
+            );
+        }
+    }
+
+    #[test]
+    fn perm_trace_row_0_is_initial_mds() {
+        let input = mk_input(0x1234);
+        let cols = build_perm_trace(input);
+        let expected_row0 = mds_full(input);
+        for lane in 0..STATE_SIZE {
+            assert_eq!(cols[POSEIDON_COL_S + lane][0], expected_row0[lane]);
+        }
+    }
+
+    #[test]
+    fn perm_trace_is_full_selector_matches_schedule() {
+        let input = mk_input(42);
+        let cols = build_perm_trace(input);
+        for r in 0..N_ROUNDS {
+            let expected = if is_full_round(r) { Block128::ONE } else { Block128::ZERO };
+            assert_eq!(cols[POSEIDON_COL_IS_FULL][r], expected, "row {r}");
+        }
+        // Padding rows 67..128: is_full stays zero.
+        for r in N_ROUNDS + 1..POSEIDON_PERM_N_ROWS {
+            assert_eq!(cols[POSEIDON_COL_IS_FULL][r], Block128::ZERO);
+        }
+    }
+
+    #[test]
+    fn perm_trace_partial_rounds_zero_unused_lanes() {
+        let input = mk_input(7);
+        let cols = build_perm_trace(input);
+        for r in F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS {
+            for lane in 1..STATE_SIZE {
+                assert_eq!(cols[POSEIDON_COL_SIN + lane][r], Block128::ZERO);
+                assert_eq!(cols[POSEIDON_COL_X2 + lane][r], Block128::ZERO);
+                assert_eq!(cols[POSEIDON_COL_X4 + lane][r], Block128::ZERO);
+                assert_eq!(cols[POSEIDON_COL_X3 + lane][r], Block128::ZERO);
+                assert_eq!(cols[POSEIDON_COL_SOUT + lane][r], Block128::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn perm_sbox_chain_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xBEEF);
+        let cols = build_perm_trace(input);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_sbox_chain(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_sbox_chain_rejects_sout_tamper() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xABCD);
+        let mut cols = build_perm_trace(input);
+        // Flip one byte of sout[2] at an arbitrary active row.
+        cols[POSEIDON_COL_SOUT + 2][10] = cols[POSEIDON_COL_SOUT + 2][10] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_sbox_chain(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_sbox_chain_rejects_x2_tamper_on_partial_row() {
+        // Partial-round lane-0 values are live; tampering them must
+        // also trip the chain.
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x5555);
+        let mut cols = build_perm_trace(input);
+        let partial_row = F_ROUNDS / 2 + 3;
+        cols[POSEIDON_COL_X2 + 0][partial_row] =
+            cols[POSEIDON_COL_X2 + 0][partial_row] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_sbox_chain(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_sbox_chain_constraint_count_and_degree() {
+        let cs = emit_perm_sbox_chain();
+        assert_eq!(cs.len(), 4 * STATE_SIZE, "4 gates per lane × 4 lanes");
+        for c in &cs {
+            assert_eq!(c.degree(), 2);
+            assert!(c.shifted_columns().is_empty(), "S-box chain is local only");
+        }
+    }
+
+    #[test]
+    fn perm_rc_binding_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xC0DE);
+        let cols = build_perm_trace(input);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_rc_binding(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_rc_binding_rejects_sin_tamper() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xDEAD);
+        let mut cols = build_perm_trace(input);
+        // Row 2 is a full round — lane-1..3 RC binding is live there.
+        assert!(is_full_round(2));
+        cols[POSEIDON_COL_SIN + 1][2] = cols[POSEIDON_COL_SIN + 1][2] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_rc_binding(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_rc_binding_rejects_rc_tamper() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xFACE);
+        let mut cols = build_perm_trace(input);
+        cols[POSEIDON_COL_RC + 0][0] = cols[POSEIDON_COL_RC + 0][0] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_rc_binding(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_rc_binding_rejects_is_full_non_bool() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xBAAD);
+        let mut cols = build_perm_trace(input);
+        // Stuff a non-{0,1} value into is_full at a padding row.
+        cols[POSEIDON_COL_IS_FULL][N_ROUNDS + 2] = Block128::from(0x1234_5678_u128);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_rc_binding(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_rc_binding_does_not_fire_on_partial_row_for_lane_1_to_3() {
+        // Sanity: on a partial row, s[lane]!=0 and rc[lane]!=0 while
+        // sin[lane]==0. The unconditional lane-0 gate is happy because
+        // lane 0 is live; the gated lane-1..3 gates must be suppressed
+        // by is_full=0.
+        let input = mk_input(0xAAAA);
+        let cols = build_perm_trace(input);
+        let partial_row = F_ROUNDS / 2 + 1;
+        assert!(!is_full_round(partial_row));
+        for lane in 1..STATE_SIZE {
+            assert_eq!(cols[POSEIDON_COL_SIN + lane][partial_row], Block128::ZERO);
+            assert_ne!(cols[POSEIDON_COL_S + lane][partial_row], Block128::ZERO);
+        }
+    }
+
+    #[test]
+    fn perm_rc_columns_match_programme_on_active_rows() {
+        let input = mk_input(0);
+        let cols = build_perm_trace(input);
+        for r in 0..N_ROUNDS {
+            for lane in 0..STATE_SIZE {
+                assert_eq!(
+                    cols[POSEIDON_COL_RC + lane][r],
+                    Block128::from(ROUND_CONSTANTS[lane][r]),
+                    "rc[{lane}][{r}]",
+                );
+            }
+        }
+        for r in N_ROUNDS..POSEIDON_PERM_N_ROWS {
+            for lane in 0..STATE_SIZE {
+                assert_eq!(cols[POSEIDON_COL_RC + lane][r], Block128::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn perm_mds_blend_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x11);
+        let cols = build_perm_trace(input);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_mds_blend_rejects_s_next_tamper_on_full_row() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x22);
+        let mut cols = build_perm_trace(input);
+        // row 0 is a full round, so s_next lives at row 1.
+        assert!(is_full_round(0));
+        cols[POSEIDON_COL_S + 2][1] = cols[POSEIDON_COL_S + 2][1] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_mds_blend_rejects_s_next_tamper_on_partial_row() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x33);
+        let mut cols = build_perm_trace(input);
+        let partial_row = F_ROUNDS / 2 + 5;
+        assert!(!is_full_round(partial_row));
+        // s_next for this row sits at partial_row + 1.
+        cols[POSEIDON_COL_S + 3][partial_row + 1] =
+            cols[POSEIDON_COL_S + 3][partial_row + 1] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_mds_blend_rejects_sout_tamper_on_full_row() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x44);
+        let mut cols = build_perm_trace(input);
+        assert!(is_full_round(1));
+        cols[POSEIDON_COL_SOUT + 1][1] = cols[POSEIDON_COL_SOUT + 1][1] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_mds_blend_rejects_s_lane_tamper_on_partial_row() {
+        use crate::{Air, CompositeAir, Trace};
+        // On partial rows the blend reads s[1..3] from the CURRENT row.
+        // Tampering s[2] at a partial row must trip the gate.
+        let input = mk_input(0x55);
+        let mut cols = build_perm_trace(input);
+        let partial_row = F_ROUNDS / 2 + 2;
+        assert!(!is_full_round(partial_row));
+        cols[POSEIDON_COL_S + 2][partial_row] =
+            cols[POSEIDON_COL_S + 2][partial_row] + Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_mds_blend_suppressed_on_output_and_padding_rows() {
+        use crate::{Air, CompositeAir, Trace};
+        // Tamper s at a padding row transition — is_round=0 should
+        // suppress the blend (this only checks the MDS blend gate, so
+        // no other constraints complain about the edit).
+        let input = mk_input(0x66);
+        let mut cols = build_perm_trace(input);
+        // Row N_ROUNDS is the output row; its s_next (= row N_ROUNDS+1)
+        // is padding. With is_round=0 on row N_ROUNDS, the blend must
+        // accept arbitrary garbage in the padding column.
+        cols[POSEIDON_COL_S + 1][N_ROUNDS + 1] = Block128::from(0xFEEDFACEu128);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_mds_blend(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_partial_sbox_kill_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x77);
+        let cols = build_perm_trace(input);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_partial_sbox_kill(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_partial_sbox_kill_rejects_nonzero_sin_on_partial_row() {
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0x88);
+        let mut cols = build_perm_trace(input);
+        let partial_row = F_ROUNDS / 2 + 4;
+        assert!(!is_full_round(partial_row));
+        cols[POSEIDON_COL_SIN + 2][partial_row] = Block128::ONE;
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_partial_sbox_kill(),
+        );
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_partial_sbox_kill_allows_nonzero_sin_on_full_row() {
+        use crate::{Air, CompositeAir, Trace};
+        // On full rows, is_full=1 so (is_full+1)=0 kills the constraint.
+        // We edit sin[2] at a full row and the kill should accept it.
+        // (RC binding would reject, but we're only checking the kill
+        // layer in isolation here.)
+        let input = mk_input(0x99);
+        let mut cols = build_perm_trace(input);
+        assert!(is_full_round(2));
+        cols[POSEIDON_COL_SIN + 2][2] = Block128::from(0xABCDEFu128);
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_partial_sbox_kill(),
+        );
+        assert!(air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_partial_sbox_kill_constraint_count_and_degree() {
+        let cs = emit_perm_partial_sbox_kill();
+        assert_eq!(cs.len(), STATE_SIZE - 1);
+        for c in &cs {
+            assert_eq!(c.degree(), 2);
+            assert!(c.shifted_columns().is_empty());
+        }
+    }
+
+    #[test]
+    fn perm_mds_blend_constraint_count_and_degree() {
+        let cs = emit_perm_mds_blend();
+        assert_eq!(cs.len(), STATE_SIZE);
+        for c in &cs {
+            assert_eq!(c.degree(), 3);
+            assert_eq!(c.shifted_columns().len(), 1);
+        }
+    }
+
+    #[test]
+    fn perm_all_accepts_honest_trace() {
+        use crate::{Air, CompositeAir, Trace};
+        for seed in 0..4u128 {
+            let input = mk_input(seed);
+            let cols = build_perm_trace(input);
+            let air = CompositeAir::from_parts(
+                POSEIDON_PERM_LOG_ROWS,
+                POSEIDON_PERM_N_COLS,
+                emit_perm_all(),
+            );
+            assert!(air.check(&Trace::new(cols)), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn perm_all_forgery_matrix() {
+        // For every (column, row) cell that the builder populates
+        // non-trivially, tampering must trip at least one gate.
+        use crate::{Air, CompositeAir, Trace};
+        let input = mk_input(0xABC);
+
+        // Smoke-check a broad selection of tamper sites.
+        let sites: &[(usize, usize, &str)] = &[
+            (POSEIDON_COL_S + 0, 1, "state lane0 row1"),
+            (POSEIDON_COL_S + 2, 3, "state lane2 row3"),
+            (POSEIDON_COL_SIN + 0, 0, "sin lane0 row0 (full)"),
+            (POSEIDON_COL_SIN + 1, 2, "sin lane1 row2 (full)"),
+            (POSEIDON_COL_X2 + 0, F_ROUNDS / 2 + 1, "x2 lane0 partial"),
+            (POSEIDON_COL_X4 + 3, 1, "x4 lane3 full"),
+            (POSEIDON_COL_X3 + 2, 62, "x3 lane2 final full"),
+            (POSEIDON_COL_SOUT + 0, F_ROUNDS / 2 + 7, "sout lane0 partial"),
+            (POSEIDON_COL_SOUT + 2, 63, "sout lane2 final full"),
+            (POSEIDON_COL_RC + 1, 0, "rc lane1 row0"),
+            (POSEIDON_COL_IS_FULL, 0, "is_full row0"),
+            (POSEIDON_COL_IS_ROUND, N_ROUNDS / 2, "is_round mid"),
+        ];
+        let air = CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+        );
+
+        for &(col, row, label) in sites {
+            let mut cols = build_perm_trace(input);
+            cols[col][row] = cols[col][row] + Block128::from(0xDEADBEEFu128);
+            assert!(
+                !air.check(&Trace::new(cols)),
+                "forgery at ({col}, {row}) = {label} slipped through",
+            );
+        }
+    }
+
+    #[test]
+    fn perm_trace_column_count_and_row_count_match_constants() {
+        let input = mk_input(0);
+        let cols = build_perm_trace(input);
+        assert_eq!(cols.len(), POSEIDON_PERM_N_COLS);
+        for c in &cols {
+            assert_eq!(c.len(), POSEIDON_PERM_N_ROWS);
+        }
+    }
+}

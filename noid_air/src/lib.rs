@@ -33,13 +33,31 @@ pub mod airs;
 pub mod gates;
 
 pub use airs::{
-    CarryInitGate, CarryNextGate, CarryRippleAir, LinearCombinationAir, TxValidityAir,
-    TxValidityCol, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B, CARRY_RIPPLE_COL_CARRY,
-    CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM, CARRY_RIPPLE_LOG_WORD_BITS,
-    CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
-    TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
+    build_balance_columns, emit_balance_constraints, emit_block_constraints, AccInitGate,
+    AccNextGate, BalanceBridgeBitsGate, BalanceBridgeCarryGate, BalanceFinalCarryGate,
+    BalanceFinalSumGate, BalanceGateAir, BalanceZeroAtTransitionGate, BitAdderAir,
+    BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, CarryInitGate, CarryNextGate,
+    apply_mds_row, build_perm_trace, build_sbox_x7_columns, emit_mds_row_constraints,
+    emit_perm_all, emit_perm_mds_blend, emit_perm_partial_sbox_kill, emit_perm_rc_binding, emit_perm_sbox_chain,
+    emit_sbox_x7_constraints, extract_perm_output, is_full_round, CarryRippleAir, FaSumGate,
+    PartialSboxKillGate, PermMdsBlendGate,
+    LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate, PoseidonPermColumns,
+    RangeGateAir, SboxX7Layout, TxValidityAir,
+    TxValidityCol, WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
+    BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
+    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
+    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
+    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
+    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, RANGE_GATE_COL_ACC,
+    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
+    POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S,
+    POSEIDON_COL_SIN, POSEIDON_COL_SOUT, POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS, RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS,
+    SBOX_X7_N_COLS, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
+    TX_VALIDITY_BALANCE_COL_OFFSET, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS, TX_VALIDITY_ROWS,
+    TX_VALIDITY_SLOTS,
 };
-pub use gates::{BoolGate, SelectorGate, WeightedLinearGate};
+pub use gates::{BoolGate, MulGate, SelectorGate, SquareGate, WeightedLinearGate};
 
 // ---------------------------------------------------------------------------
 // Column domain (Binius small-field tag)
