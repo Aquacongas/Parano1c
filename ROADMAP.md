@@ -621,9 +621,45 @@ legal Poseidon2b permutation whose input sits at their first row."
 
 ## Stage 3d — `TxValidityAir` (full composition)
 
-Fold §3c gates into the §3b-4 skeleton + add `ConstColumnGate` for
-verifier-side public-input binding (`is_reset`, `is_final`, bit-position
-programme columns, etc.). First honest `TxValidityAir` end-to-end.
+Fold §3c gates into the §3b-4 skeleton + add a verifier-side
+public-column primitive for programme binding (`is_reset`, `is_final`,
+round-constant columns, sponge IVs, bit-position weights, etc.). First
+honest `TxValidityAir` end-to-end.
+
+### 3d-0.1 — `PublicColumn` primitive (native-check layer) [DONE]
+
+`PublicColumn { col, values }`: AIR-level declaration that a trace
+column must match a publicly-known value sequence. Not a `Constraint`
+— row-local constraints live at an arbitrary sumcheck `r` where "row
+index" has no meaning; threading row-index into the sumcheck creates an
+infinite regress (the row-index column would itself need pinning). The
+`Air` trait grows `public_columns(&self) -> &[PublicColumn]` with a
+default empty impl, and `Air::check` enforces
+`trace[col][row] == values[row]` row-by-row.
+
+Ships: primitive at `noid_air::gates::const_column`, re-export at crate
+root, seven unit tests (round-trip, constructor rejects empty / non-
+pow2, `Air::check` accepts matching programme, rejects single-cell
+tamper, rejects length mismatch, rejects out-of-range column, multi-
+column enforcement). No STARK-layer wiring yet — next commit.
+
+### 3d-0.2 — `PublicColumn` STARK integration (planned)
+
+Verifier-side: evaluate the public MLE at the zero-check sumcheck's
+terminal point `r` (O(log n) work per pinned column, no FRI commitment
+needed). Prover: drop the pinned column from the commitment set; the
+column's `base_opening` becomes the programme MLE evaluation at `r`,
+deterministically reproducible by the verifier. Same transcript
+discipline as §3b-0.5 base-column openings.
+
+### 3d-0.3 — consumer migration (planned)
+
+Once 3d-0.2 lands, migrate `rc[..]`, `is_full`, `is_round`
+(`PoseidonPermAir`, 3c-1) off trusted-input by declaring them as public
+columns. Each consumer AIR (`HAddrAir`, `HAuthAir`, `HLeafAir`,
+`TxBodyMerkleAir`) gains the same treatment plus its sponge boundary
+pins (capacity IV, absorb XOR, inter-perm carry, output squeeze).
+
 
 **Debt carried forward from §3b-4** (known soundness caveats,
 expected — 3b-4 is the "non-Poseidon half" of TxValidity):

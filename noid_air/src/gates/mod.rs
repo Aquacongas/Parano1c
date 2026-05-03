@@ -6,11 +6,13 @@
 //! balance, Poseidon) is built from.
 
 pub mod bool;
+pub mod const_column;
 pub mod linear;
 pub mod mul;
 pub mod selector;
 
 pub use bool::BoolGate;
+pub use const_column::PublicColumn;
 pub use linear::WeightedLinearGate;
 pub use mul::{MulGate, SquareGate};
 pub use selector::SelectorGate;

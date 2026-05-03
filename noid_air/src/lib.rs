@@ -73,7 +73,7 @@ pub use airs::{
     TX_VALIDITY_BALANCE_COL_OFFSET, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS, TX_VALIDITY_ROWS,
     TX_VALIDITY_SLOTS,
 };
-pub use gates::{BoolGate, MulGate, SelectorGate, SquareGate, WeightedLinearGate};
+pub use gates::{BoolGate, MulGate, PublicColumn, SelectorGate, SquareGate, WeightedLinearGate};
 
 // ---------------------------------------------------------------------------
 // Column domain (Binius small-field tag)
@@ -215,6 +215,16 @@ pub trait Air {
     fn log_rows(&self) -> usize;
     fn constraints(&self) -> &[Box<dyn Constraint>];
 
+    /// Trace columns pinned to a publicly-known, verifier-side value
+    /// sequence (Stage 3d-0.1). Default empty: AIRs without pinned
+    /// columns keep legacy behaviour. Each declared column must be in
+    /// `0..n_columns()` and carry `2^log_rows()` values; duplicates are
+    /// rejected by `Air::check`. STARK-layer verification of public
+    /// columns lands in Stage 3d-0.2.
+    fn public_columns(&self) -> &[PublicColumn] {
+        &[]
+    }
+
     /// Sorted, de-duplicated union of `Constraint::shifted_columns()`
     /// across all constraints. This is the set of columns the STARK
     /// layer must materialise cyclically-rotated tables for, and for
@@ -240,6 +250,16 @@ pub trait Air {
             return false;
         }
         let n = trace.n_rows();
+        for pc in self.public_columns() {
+            if pc.col >= self.n_columns() || pc.values.len() != n {
+                return false;
+            }
+            for row in 0..n {
+                if trace.columns[pc.col][row] != pc.values[row] {
+                    return false;
+                }
+            }
+        }
         for row in 0..n {
             let next_row = if row + 1 == n { 0 } else { row + 1 };
             for c in self.constraints() {
