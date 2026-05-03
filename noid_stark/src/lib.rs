@@ -2657,3 +2657,225 @@ mod poseidon_perm_stark_tests {
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3c-2.8 — HAddrAir STARK integration tests (interior-only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod haddr_stark_tests {
+    use super::*;
+    use noid_air::{build_haddr_trace, Air, HAddrAir, Trace, HADDR_LAYOUT_A, HADDR_LAYOUT_B};
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::TxBodyHash;
+
+    fn mk_pi() -> PublicInputs {
+        PublicInputs {
+            prev_state_root: [0x11; 32],
+            new_state_root: [0x22; 32],
+            tx_body_hash: TxBodyHash([0x44; 32]),
+            fee: 7,
+        }
+    }
+
+    fn mk_secret(seed: u128) -> [Block128; 2] {
+        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        [
+            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
+            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
+        ]
+    }
+
+    #[test]
+    fn haddr_stark_honest_prove_verify() {
+        let air = HAddrAir::new();
+        let trace = air.build_trace(mk_secret(0xDECAF));
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn haddr_stark_perm_a_sout_tamper_rejected() {
+        let air = HAddrAir::new();
+        let mut cols = build_haddr_trace(mk_secret(0xABCD));
+        cols[HADDR_LAYOUT_A.sout + 2][1] = cols[HADDR_LAYOUT_A.sout + 2][1] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn haddr_stark_perm_b_rc_tamper_rejected() {
+        let air = HAddrAir::new();
+        let mut cols = build_haddr_trace(mk_secret(0xFADE));
+        cols[HADDR_LAYOUT_B.rc][3] = cols[HADDR_LAYOUT_B.rc][3] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn haddr_stark_perm_b_partial_sin_kill_rejected() {
+        let air = HAddrAir::new();
+        let mut cols = build_haddr_trace(mk_secret(0xC0FFEE));
+        cols[HADDR_LAYOUT_B.sin + 1][5] = Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3c-3.8 — HAuthAir STARK integration tests (interior-only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hauth_stark_tests {
+    use super::*;
+    use noid_air::{
+        build_hauth_trace, Air, HAuthAir, Trace, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C,
+    };
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::TxBodyHash;
+
+    fn mk_pi() -> PublicInputs {
+        PublicInputs {
+            prev_state_root: [0x11; 32],
+            new_state_root: [0x22; 32],
+            tx_body_hash: TxBodyHash([0x44; 32]),
+            fee: 7,
+        }
+    }
+
+    fn mk_fields(seed: u128) -> [Block128; 2] {
+        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        [
+            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
+            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
+        ]
+    }
+
+    #[test]
+    fn hauth_stark_honest_prove_verify() {
+        let air = HAuthAir::new();
+        let trace = air.build_trace(mk_fields(0xCAFE), mk_fields(0xBABE));
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn hauth_stark_perm_a_sout_tamper_rejected() {
+        let air = HAuthAir::new();
+        let mut cols = build_hauth_trace(mk_fields(1), mk_fields(2));
+        cols[HAUTH_LAYOUT_A.sout + 2][1] = cols[HAUTH_LAYOUT_A.sout + 2][1] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hauth_stark_perm_b_mds_tamper_rejected() {
+        let air = HAuthAir::new();
+        let mut cols = build_hauth_trace(mk_fields(3), mk_fields(4));
+        cols[HAUTH_LAYOUT_B.s + 1][3] = cols[HAUTH_LAYOUT_B.s + 1][3] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hauth_stark_perm_c_rc_tamper_rejected() {
+        let air = HAuthAir::new();
+        let mut cols = build_hauth_trace(mk_fields(5), mk_fields(6));
+        cols[HAUTH_LAYOUT_C.rc + 1][1] = cols[HAUTH_LAYOUT_C.rc + 1][1] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3c-4.8 — HLeafAir STARK integration tests (interior-only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hleaf_stark_tests {
+    use super::*;
+    use noid_air::{
+        build_hleaf_trace, Air, HLeafAir, Trace, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C,
+    };
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::TxBodyHash;
+
+    fn mk_pi() -> PublicInputs {
+        PublicInputs {
+            prev_state_root: [0x11; 32],
+            new_state_root: [0x22; 32],
+            tx_body_hash: TxBodyHash([0x44; 32]),
+            fee: 7,
+        }
+    }
+
+    fn mk_fields4(seed: u128) -> [Block128; 4] {
+        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        [
+            Block128::from(s ^ 0x1111_1111_1111_1111),
+            Block128::from(s.wrapping_add(1) ^ 0x2222_2222_2222_2222),
+            Block128::from(s.wrapping_add(2) ^ 0x3333_3333_3333_3333),
+            Block128::from(s.wrapping_add(3) ^ 0x4444_4444_4444_4444),
+        ]
+    }
+
+    #[test]
+    fn hleaf_stark_honest_prove_verify() {
+        let air = HLeafAir::new();
+        let trace = air.build_trace(mk_fields4(0x1EAF));
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn hleaf_stark_perm_a_sout_tamper_rejected() {
+        let air = HLeafAir::new();
+        let mut cols = build_hleaf_trace(mk_fields4(1));
+        cols[HLEAF_LAYOUT_A.sout + 2][1] = cols[HLEAF_LAYOUT_A.sout + 2][1] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hleaf_stark_perm_b_mds_tamper_rejected() {
+        let air = HLeafAir::new();
+        let mut cols = build_hleaf_trace(mk_fields4(2));
+        cols[HLEAF_LAYOUT_B.s + 1][3] = cols[HLEAF_LAYOUT_B.s + 1][3] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hleaf_stark_perm_c_rc_tamper_rejected() {
+        let air = HLeafAir::new();
+        let mut cols = build_hleaf_trace(mk_fields4(3));
+        cols[HLEAF_LAYOUT_C.rc + 1][1] = cols[HLEAF_LAYOUT_C.rc + 1][1] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+}

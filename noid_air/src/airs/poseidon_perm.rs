@@ -99,6 +99,49 @@ pub fn is_full_round(r: usize) -> bool {
     !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r)
 }
 
+/// Column layout for one Poseidon permutation block inside a larger
+/// trace. The default layout (`PermLayout::at(0)`) reproduces the
+/// single-instance column constants used by 3c-1. `HAddrAir` (3c-2)
+/// stacks two perm blocks side-by-side by passing different bases.
+///
+/// Within a block, columns are contiguous in the same order the
+/// `POSEIDON_COL_*` constants describe: `s (4) | sin (4) | x2 (4) |
+/// x4 (4) | x3 (4) | sout (4) | is_full (1) | rc (4) | is_round (1)`.
+#[derive(Debug, Clone, Copy)]
+pub struct PermLayout {
+    pub s: usize,
+    pub sin: usize,
+    pub x2: usize,
+    pub x4: usize,
+    pub x3: usize,
+    pub sout: usize,
+    pub is_full: usize,
+    pub rc: usize,
+    pub is_round: usize,
+}
+
+impl PermLayout {
+    /// Contiguous block starting at column `base`, matching the
+    /// single-instance layout used by 3c-1.
+    pub const fn at(base: usize) -> Self {
+        Self {
+            s: base + POSEIDON_COL_S,
+            sin: base + POSEIDON_COL_SIN,
+            x2: base + POSEIDON_COL_X2,
+            x4: base + POSEIDON_COL_X4,
+            x3: base + POSEIDON_COL_X3,
+            sout: base + POSEIDON_COL_SOUT,
+            is_full: base + POSEIDON_COL_IS_FULL,
+            rc: base + POSEIDON_COL_RC,
+            is_round: base + POSEIDON_COL_IS_ROUND,
+        }
+    }
+}
+
+/// Default layout: column 0 of the trace. Equivalent to
+/// `PermLayout::at(0)`; restates the 3c-1 column constants.
+pub const DEFAULT_PERM_LAYOUT: PermLayout = PermLayout::at(0);
+
 /// Apply the MDS_FULL matrix natively (used to seed row 0's state).
 fn mds_full(state: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
     let mut out = [Block128::ZERO; STATE_SIZE];
@@ -233,6 +276,80 @@ pub fn extract_perm_output(cols: &PoseidonPermColumns) -> [Block128; STATE_SIZE]
     out
 }
 
+/// Write one Poseidon2b permutation of `input` into columns `cols` at
+/// the given `layout`. Columns are assumed pre-allocated with
+/// `POSEIDON_PERM_N_ROWS` rows. Rows written: `0..=N_ROUNDS`; rows
+/// `N_ROUNDS+1..` are left untouched (caller may rely on them being
+/// zero-initialised).
+///
+/// Returns the permutation output `state[N_ROUNDS] = s[..]` for
+/// convenience (same as `extract_perm_output` would read).
+pub fn write_perm_trace_at(
+    cols: &mut [Vec<Block128>],
+    layout: PermLayout,
+    input: [Block128; STATE_SIZE],
+) -> [Block128; STATE_SIZE] {
+    // Row 0 state = MDS_FULL(input).
+    let mut state = mds_full(input);
+    for lane in 0..STATE_SIZE {
+        cols[layout.s + lane][0] = state[lane];
+    }
+
+    for r in 0..N_ROUNDS {
+        let is_full = is_full_round(r);
+        cols[layout.is_full][r] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[layout.is_round][r] = Block128::ONE;
+        for lane in 0..STATE_SIZE {
+            cols[layout.rc + lane][r] = Block128::from(ROUND_CONSTANTS[lane][r]);
+        }
+
+        if is_full {
+            let mut sout = [Block128::ZERO; STATE_SIZE];
+            for lane in 0..STATE_SIZE {
+                let sin = state[lane] + Block128::from(ROUND_CONSTANTS[lane][r]);
+                let x2 = sin * sin;
+                let x4 = x2 * x2;
+                let x3 = x2 * sin;
+                let so = x4 * x3;
+                cols[layout.sin + lane][r] = sin;
+                cols[layout.x2 + lane][r] = x2;
+                cols[layout.x4 + lane][r] = x4;
+                cols[layout.x3 + lane][r] = x3;
+                cols[layout.sout + lane][r] = so;
+                sout[lane] = so;
+                debug_assert_eq!(so, sbox_x7(sin));
+            }
+            state = mds_full(sout);
+        } else {
+            let sin0 = state[0] + Block128::from(ROUND_CONSTANTS[0][r]);
+            let x2 = sin0 * sin0;
+            let x4 = x2 * x2;
+            let x3 = x2 * sin0;
+            let sout0 = x4 * x3;
+            cols[layout.sin + 0][r] = sin0;
+            cols[layout.x2 + 0][r] = x2;
+            cols[layout.x4 + 0][r] = x4;
+            cols[layout.x3 + 0][r] = x3;
+            cols[layout.sout + 0][r] = sout0;
+            debug_assert_eq!(sout0, sbox_x7(sin0));
+
+            let mut mds_in = [Block128::ZERO; STATE_SIZE];
+            mds_in[0] = sout0;
+            for lane in 1..STATE_SIZE {
+                mds_in[lane] = state[lane];
+            }
+            state = mds_partial(mds_in);
+        }
+
+        let next_row = r + 1;
+        for lane in 0..STATE_SIZE {
+            cols[layout.s + lane][next_row] = state[lane];
+        }
+    }
+
+    state
+}
+
 /// Emit the per-lane S-box chain constraints for `PoseidonPermAir`.
 ///
 /// Four gates per lane × 4 lanes = 16 degree-2 constraints, all local
@@ -247,16 +364,21 @@ pub fn extract_perm_output(cols: &PoseidonPermColumns) -> [Block128; STATE_SIZE]
 /// (i.e. forcing `sin[lane] = 0`) comes with the RC / selector layer
 /// in 3c-1.4c and the MDS blend in 3c-1.4d.
 pub fn emit_perm_sbox_chain() -> Vec<Box<dyn Constraint>> {
+    emit_perm_sbox_chain_at(DEFAULT_PERM_LAYOUT)
+}
+
+/// Layout-parameterized version of [`emit_perm_sbox_chain`].
+pub fn emit_perm_sbox_chain_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out = Vec::with_capacity(16);
     for lane in 0..STATE_SIZE {
-        let layout = SboxX7Layout {
-            sin: POSEIDON_COL_SIN + lane,
-            x2: POSEIDON_COL_X2 + lane,
-            x4: POSEIDON_COL_X4 + lane,
-            x3: POSEIDON_COL_X3 + lane,
-            sout: POSEIDON_COL_SOUT + lane,
+        let sx = SboxX7Layout {
+            sin: layout.sin + lane,
+            x2: layout.x2 + lane,
+            x4: layout.x4 + lane,
+            x3: layout.x3 + lane,
+            sout: layout.sout + lane,
         };
-        out.extend(emit_sbox_x7_constraints(layout));
+        out.extend(emit_sbox_x7_constraints(sx));
     }
     out
 }
@@ -273,28 +395,31 @@ pub fn emit_perm_sbox_chain() -> Vec<Box<dyn Constraint>> {
 ///   still has to enforce `sin[i] = 0` on partial rows.
 /// - Bool gates on both selectors: `is_full ∈ {0,1}`, `is_round ∈ {0,1}`.
 pub fn emit_perm_rc_binding() -> Vec<Box<dyn Constraint>> {
+    emit_perm_rc_binding_at(DEFAULT_PERM_LAYOUT)
+}
+
+/// Layout-parameterized version of [`emit_perm_rc_binding`].
+pub fn emit_perm_rc_binding_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out: Vec<Box<dyn Constraint>> = Vec::with_capacity(STATE_SIZE + 2);
 
-    // Lane 0: gated by is_round.
     let lane0_inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![
-        POSEIDON_COL_SIN,
-        POSEIDON_COL_S,
-        POSEIDON_COL_RC,
+        layout.sin,
+        layout.s,
+        layout.rc,
     ]));
-    out.push(Box::new(SelectorGate::new(POSEIDON_COL_IS_ROUND, lane0_inner)));
+    out.push(Box::new(SelectorGate::new(layout.is_round, lane0_inner)));
 
-    // Lanes 1..3: gated by is_full.
     for lane in 1..STATE_SIZE {
         let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![
-            POSEIDON_COL_SIN + lane,
-            POSEIDON_COL_S + lane,
-            POSEIDON_COL_RC + lane,
+            layout.sin + lane,
+            layout.s + lane,
+            layout.rc + lane,
         ]));
-        out.push(Box::new(SelectorGate::new(POSEIDON_COL_IS_FULL, inner)));
+        out.push(Box::new(SelectorGate::new(layout.is_full, inner)));
     }
 
-    out.push(Box::new(BoolGate::new(POSEIDON_COL_IS_FULL)));
-    out.push(Box::new(BoolGate::new(POSEIDON_COL_IS_ROUND)));
+    out.push(Box::new(BoolGate::new(layout.is_full)));
+    out.push(Box::new(BoolGate::new(layout.is_round)));
     out
 }
 
@@ -336,29 +461,33 @@ pub struct PermMdsBlendGate {
 
 impl PermMdsBlendGate {
     pub fn new(lane: usize) -> Self {
+        Self::with_layout(lane, DEFAULT_PERM_LAYOUT)
+    }
+
+    /// Layout-parameterized constructor. The single shifted column is
+    /// `s_next[lane]` within `layout`.
+    pub fn with_layout(lane: usize, layout: PermLayout) -> Self {
         assert!(lane < STATE_SIZE);
-        // Build the local column list in a deterministic order and
-        // remember each role's index within it.
         let mut locals: Vec<usize> = Vec::with_capacity(10);
         let mut sout_idx = [0usize; STATE_SIZE];
         for j in 0..STATE_SIZE {
             sout_idx[j] = locals.len();
-            locals.push(POSEIDON_COL_SOUT + j);
+            locals.push(layout.sout + j);
         }
         let mut s_idx = [0usize; STATE_SIZE - 1];
         for (k, j) in (1..STATE_SIZE).enumerate() {
             s_idx[k] = locals.len();
-            locals.push(POSEIDON_COL_S + j);
+            locals.push(layout.s + j);
         }
         let is_full_idx = locals.len();
-        locals.push(POSEIDON_COL_IS_FULL);
+        locals.push(layout.is_full);
         let is_round_idx = locals.len();
-        locals.push(POSEIDON_COL_IS_ROUND);
+        locals.push(layout.is_round);
 
         Self {
             lane,
             locals,
-            shifted: [POSEIDON_COL_S + lane],
+            shifted: [layout.s + lane],
             sout_idx,
             s_idx,
             is_full_idx,
@@ -421,8 +550,13 @@ impl Constraint for PermMdsBlendGate {
 
 /// Emit the MDS blend layer: one `PermMdsBlendGate` per output lane.
 pub fn emit_perm_mds_blend() -> Vec<Box<dyn Constraint>> {
+    emit_perm_mds_blend_at(DEFAULT_PERM_LAYOUT)
+}
+
+/// Layout-parameterized version of [`emit_perm_mds_blend`].
+pub fn emit_perm_mds_blend_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     (0..STATE_SIZE)
-        .map(|lane| Box::new(PermMdsBlendGate::new(lane)) as Box<dyn Constraint>)
+        .map(|lane| Box::new(PermMdsBlendGate::with_layout(lane, layout)) as Box<dyn Constraint>)
         .collect()
 }
 
@@ -431,11 +565,17 @@ pub fn emit_perm_mds_blend() -> Vec<Box<dyn Constraint>> {
 /// partial-round S-box kill. Lays out as
 /// `16 + 6 + 4 + 3 = 29` gates.
 pub fn emit_perm_all() -> Vec<Box<dyn Constraint>> {
+    emit_perm_all_at(DEFAULT_PERM_LAYOUT)
+}
+
+/// Layout-parameterized version of [`emit_perm_all`]. Used by HAddrAir
+/// (3c-2) to stack two permutation blocks side-by-side.
+pub fn emit_perm_all_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out = Vec::new();
-    out.extend(emit_perm_sbox_chain());
-    out.extend(emit_perm_rc_binding());
-    out.extend(emit_perm_mds_blend());
-    out.extend(emit_perm_partial_sbox_kill());
+    out.extend(emit_perm_sbox_chain_at(layout));
+    out.extend(emit_perm_rc_binding_at(layout));
+    out.extend(emit_perm_mds_blend_at(layout));
+    out.extend(emit_perm_partial_sbox_kill_at(layout));
     out
 }
 
@@ -454,10 +594,14 @@ pub fn emit_perm_all() -> Vec<Box<dyn Constraint>> {
 /// (`is_round=0`, `is_full=0`) also fall under this kill — fine, they
 /// carry zero by construction.
 pub fn emit_perm_partial_sbox_kill() -> Vec<Box<dyn Constraint>> {
-    // One quadratic gate per lane in {1, 2, 3}.
+    emit_perm_partial_sbox_kill_at(DEFAULT_PERM_LAYOUT)
+}
+
+/// Layout-parameterized version of [`emit_perm_partial_sbox_kill`].
+pub fn emit_perm_partial_sbox_kill_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out: Vec<Box<dyn Constraint>> = Vec::with_capacity(STATE_SIZE - 1);
     for lane in 1..STATE_SIZE {
-        out.push(Box::new(PartialSboxKillGate::new(lane)));
+        out.push(Box::new(PartialSboxKillGate::with_layout(lane, layout)));
     }
     out
 }
@@ -469,9 +613,14 @@ pub struct PartialSboxKillGate {
 
 impl PartialSboxKillGate {
     pub fn new(lane: usize) -> Self {
+        Self::with_layout(lane, DEFAULT_PERM_LAYOUT)
+    }
+
+    /// Layout-parameterized constructor.
+    pub fn with_layout(lane: usize, layout: PermLayout) -> Self {
         assert!(lane >= 1 && lane < STATE_SIZE);
         Self {
-            locals: [POSEIDON_COL_IS_FULL, POSEIDON_COL_SIN + lane],
+            locals: [layout.is_full, layout.sin + lane],
         }
     }
 }

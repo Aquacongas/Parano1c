@@ -505,60 +505,90 @@ not one — matching the native code, not the original one-liner.
 
 **Sub-steps** (mirrors §3c-1 cadence):
 
-1. **3c-2.1 — Layout + honest trace builder.** Allocate column bands
-   for two permutation instances (one block per instance, each block
-   is `POSEIDON_PERM_N_ROWS` rows wide = 256 at the floor) plus three
-   shared witness columns: `secret_hi`, `secret_lo`, and the two
-   constant padding field elements. Emit `build_haddr_trace(secret)`
-   reusing `build_perm_trace`.
-2. **3c-2.2 — Capacity-IV binding.** `ConstColumnGate` pins
-   `state[2], state[3]` at row 0 of the first permutation to the
-   literal IV derived from `TAG_ADDRESS`. (Requires `ConstColumnGate`
-   — same primitive deferred to §3d; land it here instead, because
-   without IV binding the sponge is soundness-broken and it's the
-   smallest AIR that needs it.)
-3. **3c-2.3 — Absorb gates.**
-   - Gate 1: `state[0]@0 + secret_hi == 0` (rate-0 absorb XOR at
-     row 0 of perm #1).
-   - Gate 2: `state[1]@0 + secret_lo == 0` (rate-1 absorb XOR).
-4. **3c-2.4 — Capacity carry between permutations.** Gate
-   `state_after_perm1[2..3] == state_at_start_perm2[2..3]` plus
-   `state_after_perm1[0..1] + padding_field[0..1] == state_start_perm2[0..1]`
-   (XOR-absorb of the padding block into the rate).
-5. **3c-2.5 — Padding-field constant binding.** `ConstColumnGate`
-   pins `padding_field[0]` to `Block128::from(0x80_u128)` (padding
-   start byte at LSB position) and `padding_field[1]` to
-   `Block128::from(0x01_u128 << 120)` (padding end byte at MSB of the
-   16-byte word). (Precise values to be pinned by a unit test that
-   compares against `native::compression::fill_padding`.)
-6. **3c-2.6 — Public-input binding (`addr_hi`, `addr_lo`).** Two
-   `ConstColumnGate`s pin the final-row squeeze `state[0..1]` of
-   perm #2 to public inputs `addr_hi`, `addr_lo`.
-7. **3c-2.7 — Native acceptance + forgery matrix.** Honest trace
-   passes; tamper at each of (secret_hi, secret_lo, IV, padding,
-   inter-permutation carry, output binding) is rejected.
-8. **3c-2.8 — STARK round-trip** at `log_rows = ceil(log2(2 *
-   POSEIDON_PERM_N_ROWS)) = 9`, reusing the forgery matrix.
-9. **3c-2.9 — Bench block `[H] HAddrAir`** in `stark_report.rs`.
+1. **3c-2.1 (done) — Layout + honest trace builder.** Two 30-column
+   permutation blocks stacked side-by-side (60 cols, 256 rows), with
+   `PermLayout::at(base)` parameterizing the Poseidon emitters so the
+   same constraint logic applies to both blocks.
+   `build_haddr_trace(secret)` seeds block A at row 0 with
+   `[secret_hi, secret_lo, IV_hi, IV_lo]` (where `(IV_hi, IV_lo) =
+   capacity_iv(TAG_ADDRESS)`), runs `write_perm_trace_at`, XORs the
+   padding block `(0x80, 0x01<<120)` into the rate of the post-perm-A
+   state, and runs a second `write_perm_trace_at` on block B. The
+   native tests verify the extracted output bytes match both
+   `Poseidon2bSponge::with_iv + absorb_pair + finalize` and
+   `primitives::derive_address(SpendSecret)`.
+2. **3c-2.2 — Capacity-IV binding (deferred to §3d).** Needs a
+   `RowSelectorGate` + `ConstColumnGate` primitive that the current
+   row-local constraint system lacks. Without it, `state[2],
+   state[3]` at block-A row 0 are trusted-input, same treatment as
+   `rc` / `is_full` / `is_round` in 3c-1. Captured in the §3d debt
+   block below.
+3. **3c-2.3..6 — Boundary gates (deferred to §3d).** Absorb XOR,
+   inter-permutation carry (rate: XOR with padding block; capacity:
+   straight equality), and output squeeze pinning all need the same
+   `RowSelectorGate` + `ConstColumnGate` primitive. Landing them here
+   would also benefit `PoseidonPermAir` by closing the §3c-1 debts
+   (`rc` / `is_full` / `is_round` trusted-input); the primitive is a
+   shared dependency. §3d schedules this as a single bundle.
+4. **3c-2.7 (partial) — Native acceptance + forgery matrix.** Honest
+   trace passes (two native tests vs `Poseidon2bSponge::finalize` and
+   `primitives::derive_address`); four forgery tests cover perm-A
+   S-box / perm-A MDS / perm-B RC / perm-B partial-row sin. Boundary
+   forgeries (IV, absorb XOR, inter-perm carry, output squeeze) gain
+   gate coverage once §3d's boundary primitives land.
+5. **3c-2.8 — STARK round-trip** at `log_rows = POSEIDON_PERM_LOG_ROWS
+   = 8` (single-block rows; both perm blocks share the row axis).
+6. **3c-2.9 — Bench block `[H] HAddrAir`** in `stark_report.rs`.
 
-**`ConstColumnGate` note.** This is the first sub-circuit that truly
-needs a column-to-public-input pin. Land it in `noid_air/src/gates/`
-during 3c-2.2 (small, ~80 LOC + verifier-side eval); §3c-3/4/5 and
-§3d all reuse it. Adjust §3d's "ConstColumnGate" debt line once it
-lands.
+**Boundary-primitive note.** The §3c-1 and §3c-2 interior gates land
+clean, but every "boundary tie" in this codebase (IV at row 0, absorb
+XOR at row 0, inter-perm carry between blocks, output squeeze at row
+`N_ROUNDS`, round-constant programme, `is_full` / `is_round` schedule)
+all require the same missing primitive: a row-index-aware selector
+(`RowSelectorGate` or a `ConstColumnGate` that reads a synthesized
+row-index column). §3d tracks the whole bundle as one work item —
+landing it unblocks 3c-1's trusted-input debts AND 3c-2's boundary
+gates AND the §3d skeleton-selector pinning all at once.
 
-**Size estimate.** ~500 LOC + ~350 LOC tests. Two permutations worth
-of state columns (2 × 30 = 60), plus ~6 absorb/carry gates, plus
-`ConstColumnGate` primitive.
+### 3c-3 — `HAuthAir` (4-field sponge, `hash_auth_tag`) — interior shipped
 
-### 3c-3 — `HAuthAir` (4-field sponge)
+Three permutations back-to-back, matching
+`Poseidon2bSponge::with_iv(TAG_AUTHTAG) + absorb_pair(secret) +
+absorb_pair(tx_body_hash) + finalize()`:
 
-Two permutations back-to-back: first absorbs (a0, a1), second absorbs
-(a2, a3) after XOR into rate.
+1. **Perm A.** XOR `(secret_hi, secret_lo)` into rate; permute.
+2. **Perm B.** XOR `(tx_body_hi, tx_body_lo)` into rate; permute.
+3. **Perm C (padding flush).** XOR `(0x80, 0x01<<120)` into rate;
+   permute. Output = `state[0..2]`.
 
-### 3c-4 — `HLeafAir` (3-absorb UTXO leaf)
+`HAuthAir` lays out three perm blocks at column bases `0`, `30`, `60`
+(90 cols total), sharing the row axis at `log_rows = 8`. Interior
+constraints: `3 × emit_perm_all_at = 87` gates. Boundary ties (IV,
+each absorb XOR, two inter-perm carries, output squeeze) are
+trusted-input, deferred to §3d under the same `RowSelectorGate` /
+`ConstColumnGate` bundle as §3c-1 and §3c-2.
 
-Three permutations. Consumed by `TxBodyMerkleAir` leaves.
+Ships: trace builder, native equivalence test vs
+`primitives::hash_auth_tag`, interior forgery matrix (perm-A sout,
+perm-B MDS, perm-C partial sin-kill, perm-C rc), STARK round-trip
+(4 tests), and bench block `[I] HAuthAir` in `stark_report.rs`.
+
+### 3c-4 — `HLeafAir` (4-field `hash_leaf`) — interior shipped
+
+Mirrors `primitives::hash_leaf(&[f0, f1, f2, f3])` under `TAG_LEAF`:
+`absorb_pair(f0, f1)` + `absorb_pair(f2, f3)` + padding flush = 3
+permutations. Structurally identical to `HAuthAir`; only the capacity
+IV differs. 90 cols, `log_rows = 8`, 87 interior gates.
+
+Used by `hash_input_leaf(slot, value, owner)` which feeds the tx-body
+Merkle tree leaves. Verified in tests by a direct vector equality
+against `hash_input_leaf` (slot=42, value=1_234_567, owner=0..31).
+
+Ships: trace builder, two native equivalence tests (`hash_leaf` and
+`hash_input_leaf`), interior forgery matrix (perm-A sout, perm-B MDS,
+perm-C partial sin-kill, perm-C rc on full-round row), STARK
+round-trip (4 tests), and bench block `[J] HLeafAir` in
+`stark_report.rs`. Boundary ties deferred to §3d.
 
 ### 3c-5 — `TxBodyMerkleAir` (depth-4 tree + wrap)
 
@@ -616,7 +646,30 @@ expected — 3b-4 is the "non-Poseidon half" of TxValidity):
   `POSEIDON_PERM_LOG_ROWS = 8`; `[G] PoseidonPermAir` bench block
   landed at ~25 ms prove / ~13 ms verify / ~35 KB proof on the floor).
 
-**Debt carried forward from §3c-2…5** (sponges + merkle): to be
+**Debt carried forward from §3c-2** (`HAddrAir`, two-permutation
+sponge):
+
+- **Capacity-IV binding.** Block-A row 0 must be pinned:
+  `state[2]@A_row0 == IV_hi(TAG_ADDRESS)`,
+  `state[3]@A_row0 == IV_lo(TAG_ADDRESS)`. Currently trusted-input.
+- **Absorb XOR at row 0.** Block-A row 0's `state[0..1]` must equal
+  the public-input `(secret_hi, secret_lo)`. Currently trusted.
+- **Inter-permutation carry.** Block-B row 0 must equal block-A's
+  row-`N_ROUNDS` state XOR'd with the fixed padding word on the rate
+  lanes, straight-copied on the capacity lanes:
+  - `B.s[0]@row0 = A.s[0]@row_N + 0x80`
+  - `B.s[1]@row0 = A.s[1]@row_N + (0x01 << 120)`
+  - `B.s[2]@row0 = A.s[2]@row_N`
+  - `B.s[3]@row0 = A.s[3]@row_N`
+  Currently trusted.
+- **Output squeeze binding.** `B.s[0]@row_N`, `B.s[1]@row_N` must
+  equal the public `addr_hi`, `addr_lo`. Currently trusted.
+
+All four bullets share the same missing primitive:
+`RowSelectorGate` / `ConstColumnGate`. Landing it closes §3c-1's
+trusted-input list simultaneously.
+
+**Debt carried forward from §3c-3…5** (sponges + merkle): to be
 enumerated when those sub-stages land; at minimum each sponge will
 need capacity-IV binding and rate-XOR-absorb gates wired in §3d.
 
