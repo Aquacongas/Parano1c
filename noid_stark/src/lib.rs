@@ -898,6 +898,10 @@ pub fn verify_air<A: Air>(
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
 
+    // Stage 3d-0.2: bind every `PublicColumn` to its committed base
+    // opening via MLE re-evaluation at `r_point`.
+    check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
+
     let column_openings = &proof.base_openings;
     let mut composition = Block128::ZERO;
     let mut local_scratch: Vec<Block128> = Vec::new();
@@ -1142,6 +1146,12 @@ pub fn verify_air_timed<A: Air>(
         .iter()
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
+    // Stage 3d-0.2: bind declared public columns to their base openings.
+    if let Err(e) = check_public_columns(air, &proof.base_openings, &r_point, log_len) {
+        t.composition = t1.elapsed();
+        return (Err(e), t);
+    }
+
     let column_openings = &proof.base_openings;
     let mut composition = Block128::ZERO;
     let mut local_scratch: Vec<Block128> = Vec::new();
@@ -1265,6 +1275,49 @@ fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
         buf.truncate(half);
     }
     buf[0]
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3d-0.2: PublicColumn verifier-side binding
+// ---------------------------------------------------------------------------
+
+/// Enforce every `PublicColumn` declaration on the given proof.
+/// For each pinned column, re-compute the MLE of the programme (zero-
+/// padded from the AIR's native `log_rows` up to the proof's `log_len`)
+/// at the sumcheck terminal `r_point`, and compare against
+/// `base_openings[col]`. The base opening is itself bound to the
+/// committed column by the §12c' multipoint FRI, so any programme
+/// deviation surfaces here with overwhelming probability.
+fn check_public_columns<A: Air>(
+    air: &A,
+    base_openings: &[Block128],
+    r_point: &[Block128],
+    log_len: usize,
+) -> Result<(), VerifyError> {
+    let expected_rows = 1usize << air.log_rows();
+    let target = 1usize << log_len;
+    for pc in air.public_columns() {
+        if pc.col >= air.n_columns() || pc.values.len() != expected_rows {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        // Zero-pad the programme MLE up to the commitment hypercube.
+        // Identical padding to `pad_column` used on witness columns in
+        // the prover so `base_openings[pc.col]` and this expected value
+        // live on the same hypercube.
+        let padded: Vec<Block128> = if pc.values.len() == target {
+            pc.values.clone()
+        } else {
+            let mut out = Vec::with_capacity(target);
+            out.extend_from_slice(&pc.values);
+            out.resize(target, Block128::ZERO);
+            out
+        };
+        let expected = mle_eval(&padded, r_point);
+        if base_openings[pc.col] != expected {
+            return Err(VerifyError::ConstraintViolated);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2956,5 +3009,179 @@ mod tx_body_merkle_stark_tests {
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    // =====================================================================
+    // Stage 3d-0.2 — PublicColumn verifier-side binding
+    // =====================================================================
+
+    use noid_air::{BoolGate, Constraint, PublicColumn};
+    use noid_core::TowerField;
+
+    fn pubcol_bool_col(log_rows: usize, seed: u64) -> Vec<Block128> {
+        (0..(1usize << log_rows))
+            .map(|i| {
+                let bit = ((seed.wrapping_mul(2654435761).wrapping_add(i as u64)) >> 7) & 1;
+                if bit == 0 { Block128::ZERO } else { Block128::ONE }
+            })
+            .collect()
+    }
+
+    /// Minimal AIR with one ordinary witness column and one declared
+    /// public (programme) column. Used purely to exercise the
+    /// verifier-side `check_public_columns` path without pulling in
+    /// a Poseidon-sized AIR.
+    struct PubColTestAir {
+        log_rows: usize,
+        n_cols: usize,
+        constraints: Vec<Box<dyn Constraint>>,
+        publics: Vec<PublicColumn>,
+    }
+
+    impl Air for PubColTestAir {
+        fn n_columns(&self) -> usize {
+            self.n_cols
+        }
+        fn log_rows(&self) -> usize {
+            self.log_rows
+        }
+        fn constraints(&self) -> &[Box<dyn Constraint>] {
+            &self.constraints
+        }
+        fn public_columns(&self) -> &[PublicColumn] {
+            &self.publics
+        }
+    }
+
+    fn mk_programme(log_rows: usize) -> Vec<Block128> {
+        (0..(1usize << log_rows))
+            .map(|i| Block128::from(0x1000_0000_0000u128 ^ i as u128))
+            .collect()
+    }
+
+    #[test]
+    fn public_column_honest_accepts() {
+        // Witness col 0 is a boolean; col 1 is the pinned programme.
+        let log_rows = 4;
+        let programme = mk_programme(log_rows);
+        let air = PubColTestAir {
+            log_rows,
+            n_cols: 2,
+            constraints: vec![Box::new(BoolGate::new(0))],
+            publics: vec![PublicColumn::new(1, programme.clone())],
+        };
+        let col0 = pubcol_bool_col(log_rows, 0xcafe);
+        let trace = Trace::new(vec![col0, programme]);
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn public_column_tampered_cell_rejected() {
+        // Malicious prover swaps one cell of the "programme" column.
+        // `prove_air_unchecked` bypasses the native check so we actually
+        // reach the verifier; the 3d-0.2 MLE re-eval must reject.
+        let log_rows = 4;
+        let programme = mk_programme(log_rows);
+        let air = PubColTestAir {
+            log_rows,
+            n_cols: 2,
+            constraints: vec![Box::new(BoolGate::new(0))],
+            publics: vec![PublicColumn::new(1, programme.clone())],
+        };
+        let col0 = pubcol_bool_col(log_rows, 0xfade);
+        let mut bad_programme = programme;
+        bad_programme[7] = bad_programme[7] + Block128::ONE;
+        let trace = Trace::new(vec![col0, bad_programme]);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn public_column_wrong_programme_declaration_rejected() {
+        // Prover honestly carries programme `A` in the trace but the
+        // (shared) AIR declares a different programme `B`. The verifier
+        // must reject since `base_openings[col]` matches A's MLE at r,
+        // not B's.
+        let log_rows = 4;
+        let prog_a = mk_programme(log_rows);
+        let prog_b: Vec<Block128> = (0..(1usize << log_rows))
+            .map(|i| Block128::from(0xBEEF_0000_u128 ^ i as u128))
+            .collect();
+        let air = PubColTestAir {
+            log_rows,
+            n_cols: 2,
+            constraints: vec![Box::new(BoolGate::new(0))],
+            publics: vec![PublicColumn::new(1, prog_b)], // declared: B
+        };
+        let col0 = pubcol_bool_col(log_rows, 0xdeaf);
+        let trace = Trace::new(vec![col0, prog_a]); // witness: A
+        let pi = mk_pi();
+        // Native check rejects (AIR expects B, witness has A), so use
+        // the unchecked path to reach the cryptographic verifier.
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn public_column_shape_checks() {
+        // AIR declares a public column with the wrong row count: the
+        // verifier must reject with ShapeMismatch before any MLE work.
+        let log_rows = 4;
+        let bad_programme: Vec<Block128> = vec![Block128::ZERO; 2]; // 2 rows, not 16
+        let air = PubColTestAir {
+            log_rows,
+            n_cols: 2,
+            constraints: vec![Box::new(BoolGate::new(0))],
+            publics: vec![PublicColumn::new(1, bad_programme)],
+        };
+        let col0 = pubcol_bool_col(log_rows, 0x5eed);
+        let col1 = vec![Block128::ZERO; 1 << log_rows];
+        let trace = Trace::new(vec![col0, col1]);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(matches!(
+            verify_air(&air, &pi, &proof),
+            Err(VerifyError::ShapeMismatch)
+        ));
+    }
+
+    #[test]
+    fn public_column_multi_column_enforced() {
+        // Two pinned programme columns; tamper the second, verifier
+        // must still reject.
+        let log_rows = 4;
+        let prog_a = mk_programme(log_rows);
+        let prog_b: Vec<Block128> = (0..(1usize << log_rows))
+            .map(|i| Block128::from(0x0BAD_F00Du128 ^ i as u128))
+            .collect();
+        let air = PubColTestAir {
+            log_rows,
+            n_cols: 3,
+            constraints: vec![Box::new(BoolGate::new(0))],
+            publics: vec![
+                PublicColumn::new(1, prog_a.clone()),
+                PublicColumn::new(2, prog_b.clone()),
+            ],
+        };
+        let col0 = pubcol_bool_col(log_rows, 0xabba);
+        // Honest trace passes.
+        {
+            let trace = Trace::new(vec![col0.clone(), prog_a.clone(), prog_b.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+        // Tamper prog_b, use unchecked prover, verifier rejects.
+        {
+            let mut bad_b = prog_b;
+            bad_b[0] = bad_b[0] + Block128::ONE;
+            let trace = Trace::new(vec![col0, prog_a, bad_b]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
     }
 }

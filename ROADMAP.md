@@ -643,14 +643,36 @@ pow2, `Air::check` accepts matching programme, rejects single-cell
 tamper, rejects length mismatch, rejects out-of-range column, multi-
 column enforcement). No STARK-layer wiring yet — next commit.
 
-### 3d-0.2 — `PublicColumn` STARK integration (planned)
+### 3d-0.2 — `PublicColumn` STARK integration [DONE]
 
-Verifier-side: evaluate the public MLE at the zero-check sumcheck's
-terminal point `r` (O(log n) work per pinned column, no FRI commitment
-needed). Prover: drop the pinned column from the commitment set; the
-column's `base_opening` becomes the programme MLE evaluation at `r`,
-deterministically reproducible by the verifier. Same transcript
-discipline as §3b-0.5 base-column openings.
+Verifier-side check `check_public_columns` that, for every AIR-declared
+`PublicColumn`, re-computes the MLE of the programme (zero-padded from
+`log_rows` up to `log_len = padded_log_len`) at the sumcheck terminal
+`r_point` and asserts equality with `proof.base_openings[col]`. The
+base opening is itself bound to the committed column by the §12c'
+multipoint FRI, so any programme deviation surfaces here with
+overwhelming probability.
+
+Design choice. Kept the pinned column as an ordinary committed witness
+column rather than a verifier-reconstructed column. Rationale: the
+§12c' multipoint close already batches every base column's opening
+into one FRI; removing a column from the commitment set would require
+a dedicated "reconstructed-column" code path in the multipoint batch
+and split the authentication story in two. One extra `mle_eval` per
+pinned column on the verifier is O(2^log_len) at the final row — cheap
+next to the FRI replay and trivial to audit. If this ever becomes
+hot, the O(log n) eq-prefix reduction is a drop-in optimisation at
+the same soundness.
+
+Ships: `check_public_columns` helper in `noid_stark::lib`, called from
+both `verify_air` and `verify_air_timed` before the composition check;
+five STARK integration tests (`public_column_honest_accepts`,
+`public_column_tampered_cell_rejected`,
+`public_column_wrong_programme_declaration_rejected`,
+`public_column_shape_checks`, `public_column_multi_column_enforced`).
+No prover-side changes — the native `Air::check` from 3d-0.1 already
+rejects malformed programme values before `prove_air` runs; forgery
+tests use `prove_air_unchecked` to reach the cryptographic verifier.
 
 ### 3d-0.3 — consumer migration (planned)
 
