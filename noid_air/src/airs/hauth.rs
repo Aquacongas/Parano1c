@@ -29,14 +29,15 @@
 //! §3c-1 and §3c-2.
 
 use crate::airs::poseidon_perm::{
-    write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
-    POSEIDON_PERM_N_ROWS,
+    emit_perm_public_columns_at, write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
 use crate::airs::haddr::{HADDR_PAD_0, HADDR_PAD_1};
+use crate::gates::{emit_public_cell, PublicColumn};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_AUTHTAG};
-use noid_poseidon2b::native::permutation::STATE_SIZE;
+use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 pub const HAUTH_PERM_A_BASE: usize = 0;
 pub const HAUTH_PERM_B_BASE: usize = POSEIDON_PERM_N_COLS;
@@ -48,6 +49,12 @@ pub const HAUTH_N_ROWS: usize = POSEIDON_PERM_N_ROWS;
 pub const HAUTH_LAYOUT_A: PermLayout = PermLayout::at(HAUTH_PERM_A_BASE);
 pub const HAUTH_LAYOUT_B: PermLayout = PermLayout::at(HAUTH_PERM_B_BASE);
 pub const HAUTH_LAYOUT_C: PermLayout = PermLayout::at(HAUTH_PERM_C_BASE);
+
+/// §3d-0.7 output-squeeze indicator column. Holds `ONE` at row
+/// `N_ROUNDS` of block C and zero elsewhere.
+pub const HAUTH_OUTPUT_INDICATOR_COL: usize = HAUTH_N_COLS;
+/// Total column count when the output-squeeze binding is enabled.
+pub const HAUTH_N_COLS_PINNED: usize = HAUTH_N_COLS + 1;
 
 /// Build an honest witness trace for
 /// `hash_auth_tag(spend_secret, tx_body_hash)`. Inputs are the
@@ -107,14 +114,71 @@ pub fn emit_hauth_constraints() -> Vec<Box<dyn Constraint>> {
     out
 }
 
+/// Emit the public-column declarations for all three permutation
+/// blocks: `3 × (is_full, is_round, rc[0..STATE_SIZE]) = 18`.
+pub fn emit_hauth_public_columns() -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(3 * (STATE_SIZE + 2));
+    out.extend(emit_perm_public_columns_at(HAUTH_LAYOUT_A));
+    out.extend(emit_perm_public_columns_at(HAUTH_LAYOUT_B));
+    out.extend(emit_perm_public_columns_at(HAUTH_LAYOUT_C));
+    out
+}
+
+/// §3d-0.7 — pin `state[0..2]@C_row_N_ROUNDS` to the publicly-declared
+/// `expected_tag`. Returns the shared indicator `PublicColumn` plus the
+/// two `emit_public_cell` gates.
+pub fn emit_hauth_output_squeeze_ties(
+    indicator_col: usize,
+    expected_tag: [Block128; 2],
+) -> (PublicColumn, Vec<Box<dyn Constraint>>) {
+    let (pc_hi, gate_hi) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HAUTH_N_ROWS,
+        HAUTH_LAYOUT_C.s,
+        expected_tag[0],
+    );
+    let (_pc_lo, gate_lo) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HAUTH_N_ROWS,
+        HAUTH_LAYOUT_C.s + 1,
+        expected_tag[1],
+    );
+    (pc_hi, vec![gate_hi, gate_lo])
+}
+
 pub struct HAuthAir {
+    n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl HAuthAir {
     pub fn new() -> Self {
         Self {
+            n_cols: HAUTH_N_COLS,
             constraints: emit_hauth_constraints(),
+            public_columns: emit_hauth_public_columns(),
+        }
+    }
+
+    /// §3d-0.7 — interior construction plus the **output-squeeze**
+    /// boundary tie: `state[0]@C_row_N_ROUNDS == expected_tag[0]`,
+    /// `state[1]@C_row_N_ROUNDS == expected_tag[1]`. IV binding,
+    /// absorb XOR, and the two inter-permutation carries remain
+    /// trusted-input until §3d-0.6b's `ColumnEqAtRowGate` primitive.
+    pub fn new_with_output_pin(expected_tag: [Block128; 2]) -> Self {
+        let mut constraints = emit_hauth_constraints();
+        let mut public_columns = emit_hauth_public_columns();
+        let (ind_pc, mut gates) =
+            emit_hauth_output_squeeze_ties(HAUTH_OUTPUT_INDICATOR_COL, expected_tag);
+        public_columns.push(ind_pc);
+        constraints.append(&mut gates);
+        Self {
+            n_cols: HAUTH_N_COLS_PINNED,
+            constraints,
+            public_columns,
         }
     }
 
@@ -124,6 +188,20 @@ impl HAuthAir {
         tx_body: [Block128; 2],
     ) -> Trace {
         Trace::new(build_hauth_trace(secret, tx_body))
+    }
+
+    /// §3d-0.7 — interior trace plus the row-`N_ROUNDS` indicator
+    /// column appended as the final column.
+    pub fn build_trace_with_output_pin(
+        &self,
+        secret: [Block128; 2],
+        tx_body: [Block128; 2],
+    ) -> Trace {
+        let mut cols = build_hauth_trace(secret, tx_body);
+        let mut indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        Trace::new(cols)
     }
 }
 
@@ -135,13 +213,16 @@ impl Default for HAuthAir {
 
 impl Air for HAuthAir {
     fn n_columns(&self) -> usize {
-        HAUTH_N_COLS
+        self.n_cols
     }
     fn log_rows(&self) -> usize {
         HAUTH_LOG_ROWS
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 
@@ -225,6 +306,119 @@ mod tests {
         cols[HAUTH_LAYOUT_C.rc + 1][1] = cols[HAUTH_LAYOUT_C.rc + 1][1] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn hauth_public_columns_match_builder_output() {
+        use crate::airs::poseidon_perm::{
+            perm_is_full_values, perm_is_round_values, perm_rc_values,
+        };
+        use noid_poseidon2b::native::permutation::STATE_SIZE;
+        let cols = build_hauth_trace(mk_fields(0x1234), mk_fields(0x5678));
+        let publics = emit_hauth_public_columns();
+        assert_eq!(publics.len(), 3 * (STATE_SIZE + 2));
+        for layout in [HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C] {
+            assert_eq!(cols[layout.is_full], perm_is_full_values());
+            assert_eq!(cols[layout.is_round], perm_is_round_values());
+            for lane in 0..STATE_SIZE {
+                assert_eq!(cols[layout.rc + lane], perm_rc_values(lane));
+            }
+        }
+    }
+
+    #[test]
+    fn hauth_air_rejects_padding_row_rc_tamper() {
+        // Padding row: `is_round = 0` suppresses the lane-0 RC-binding
+        // gate and `is_full = 0` suppresses the lane-1..3 gates, so the
+        // RC-binding layer does NOT observe this tamper. Defence comes
+        // from the public-column programme: `perm_rc_values` pins rc to
+        // ZERO on padding rows, and `Air::check` compares the witness
+        // column against the programme. In prod the same binding is
+        // enforced by the multipoint opening tying `base_openings[rc]`
+        // to the public-column MLE (see §12c'). This test therefore
+        // exercises the public-column layer, not the gate.
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HAuthAir::new();
+        let mut cols = build_hauth_trace(mk_fields(11), mk_fields(22));
+        cols[HAUTH_LAYOUT_C.rc + 0][N_ROUNDS + 5] = Block128::from(0xCAFEBABEu128);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn hauth_air_rejects_active_row_lane0_rc_binding_gate() {
+        // Companion to the padding-row test: on a partial-round active
+        // row (`is_round = 1`, `is_full = 0`) only the lane-0 XOR gate
+        //   is_round · (sin[0] + s[0] + rc[0]) == 0
+        // constrains lane 0 via the gate layer. Tampering `s[0]` there
+        // leaves rc/sin unchanged on this row but breaks the XOR — the
+        // RC-binding gate must reject. (The MDS blend for the previous
+        // row also observes this via `s_next`, so the rejection is
+        // belt-and-braces, exactly as in prod.)
+        let air = HAuthAir::new();
+        let mut cols = build_hauth_trace(mk_fields(33), mk_fields(44));
+        let row = noid_poseidon2b::native::permutation::F_ROUNDS / 2 + 3;
+        assert!(!crate::airs::poseidon_perm::is_full_round(row));
+        cols[HAUTH_LAYOUT_C.s + 0][row] =
+            cols[HAUTH_LAYOUT_C.s + 0][row] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.7 — output-squeeze boundary tie
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hauth_pinned_air_accepts_honest_trace() {
+        let secret = mk_fields(0xAA);
+        let txbody = mk_fields(0xBB);
+        let honest = build_hauth_trace(secret, txbody);
+        let expected = extract_hauth_output(&honest);
+        let air = HAuthAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(secret, txbody);
+        assert!(air.check(&trace));
+        assert_eq!(air.n_columns(), HAUTH_N_COLS_PINNED);
+    }
+
+    #[test]
+    fn hauth_pinned_air_rejects_wrong_declared_tag() {
+        let secret = mk_fields(0xCC);
+        let txbody = mk_fields(0xDD);
+        let honest = build_hauth_trace(secret, txbody);
+        let mut expected = extract_hauth_output(&honest);
+        expected[1] = expected[1] + Block128::ONE;
+        let air = HAuthAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(secret, txbody);
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn hauth_pinned_air_rejects_tampered_output_cell() {
+        let secret = mk_fields(0xEE);
+        let txbody = mk_fields(0xFF);
+        let honest = build_hauth_trace(secret, txbody);
+        let expected = extract_hauth_output(&honest);
+        let air = HAuthAir::new_with_output_pin(expected);
+        let mut cols = build_hauth_trace(secret, txbody);
+        cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] =
+            cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] + Block128::ONE;
+        let mut indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn hauth_pinned_air_rejects_tampered_indicator_column() {
+        let secret = mk_fields(0x11);
+        let txbody = mk_fields(0x22);
+        let honest = build_hauth_trace(secret, txbody);
+        let expected = extract_hauth_output(&honest);
+        let air = HAuthAir::new_with_output_pin(expected);
+        let mut cols = build_hauth_trace(secret, txbody);
+        let mut bad_indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
+        bad_indicator[N_ROUNDS + 1] = Block128::ONE;
+        cols.push(bad_indicator);
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]

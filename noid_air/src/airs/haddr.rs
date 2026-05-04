@@ -41,20 +41,28 @@
 //! `is_round` — trusted-input until §3d.
 
 use crate::airs::poseidon_perm::{
-    write_perm_trace_at, PermLayout, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
-    POSEIDON_PERM_LOG_ROWS,
+    emit_perm_public_columns_at, write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
+use crate::gates::{emit_public_cell, PublicColumn};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRESS};
-use noid_poseidon2b::native::permutation::STATE_SIZE;
+use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 /// Column offset of the first (absorb) permutation block.
 pub const HADDR_PERM_A_BASE: usize = 0;
 /// Column offset of the second (padding flush) permutation block.
 pub const HADDR_PERM_B_BASE: usize = POSEIDON_PERM_N_COLS;
-/// Total column count.
+/// Total column count (interior-only construction).
 pub const HADDR_N_COLS: usize = 2 * POSEIDON_PERM_N_COLS;
+
+/// Output-squeeze indicator column (only used by the §3d-0.6a
+/// boundary-pinned construction). Holds `1` at row `N_ROUNDS` and `0`
+/// everywhere else — the row where the sponge output is read.
+pub const HADDR_OUTPUT_INDICATOR_COL: usize = HADDR_N_COLS;
+/// Total column count when the output-squeeze binding is enabled.
+pub const HADDR_N_COLS_PINNED: usize = HADDR_N_COLS + 1;
 /// Trace row count must accommodate one permutation (both blocks
 /// occupy the same row range; they differ in column, not row).
 pub const HADDR_LOG_ROWS: usize = POSEIDON_PERM_LOG_ROWS;
@@ -129,19 +137,98 @@ pub fn emit_haddr_constraints() -> Vec<Box<dyn Constraint>> {
     out
 }
 
+/// Emit the public-column declarations for both permutation blocks:
+/// `2 × (is_full, is_round, rc[0..STATE_SIZE]) = 12` declarations.
+pub fn emit_haddr_public_columns() -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(2 * (STATE_SIZE + 2));
+    out.extend(emit_perm_public_columns_at(HADDR_LAYOUT_A));
+    out.extend(emit_perm_public_columns_at(HADDR_LAYOUT_B));
+    out
+}
+
+/// §3d-0.6a — emit the output-squeeze boundary tie for HAddr: two
+/// `emit_public_cell` gates pinning `state[0]` and `state[1]` of block B
+/// at row `N_ROUNDS` to the publicly-declared `expected_addr` (hi/lo).
+/// Returns `(indicator_public_column, [pin_hi, pin_lo])` — the caller
+/// appends the indicator to its `public_columns` and the two gates to
+/// its `constraints`.
+pub fn emit_haddr_output_squeeze_ties(
+    indicator_col: usize,
+    expected_addr: [Block128; 2],
+) -> (PublicColumn, Vec<Box<dyn Constraint>>) {
+    let (pc_hi, gate_hi) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HADDR_N_ROWS,
+        HADDR_LAYOUT_B.s,
+        expected_addr[0],
+    );
+    let (_pc_lo, gate_lo) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HADDR_N_ROWS,
+        HADDR_LAYOUT_B.s + 1,
+        expected_addr[1],
+    );
+    // Both ties share the same indicator column and target row, so they
+    // emit bit-identical `PublicColumn` declarations. Keep one copy.
+    (pc_hi, vec![gate_hi, gate_lo])
+}
+
 pub struct HAddrAir {
+    n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl HAddrAir {
+    /// Interior-only construction: 58 permutation gates + the
+    /// `rc` / `is_full` / `is_round` programme-column declarations
+    /// from §3d-0.4. No boundary ties.
     pub fn new() -> Self {
         Self {
+            n_cols: HADDR_N_COLS,
             constraints: emit_haddr_constraints(),
+            public_columns: emit_haddr_public_columns(),
+        }
+    }
+
+    /// §3d-0.6a — interior construction plus the **output-squeeze**
+    /// boundary tie: `state[0]@B_row_N_ROUNDS == expected_addr[0]`,
+    /// `state[1]@B_row_N_ROUNDS == expected_addr[1]`. Adds one
+    /// indicator column (`HADDR_OUTPUT_INDICATOR_COL`) pinned to the
+    /// row-`N_ROUNDS` indicator programme and two single-cell gates.
+    ///
+    /// IV binding / absorb XOR / inter-permutation carry remain
+    /// trusted-input pending §3d-0.6b (those need a pre-MDS input
+    /// column; the interior trace stores only post-MDS `s[..]` at
+    /// row 0, so they cannot be expressed without a trace extension).
+    pub fn new_with_output_pin(expected_addr: [Block128; 2]) -> Self {
+        let mut constraints = emit_haddr_constraints();
+        let mut public_columns = emit_haddr_public_columns();
+        let (ind_pc, mut gates) =
+            emit_haddr_output_squeeze_ties(HADDR_OUTPUT_INDICATOR_COL, expected_addr);
+        public_columns.push(ind_pc);
+        constraints.append(&mut gates);
+        Self {
+            n_cols: HADDR_N_COLS_PINNED,
+            constraints,
+            public_columns,
         }
     }
 
     pub fn build_trace(&self, secret: [Block128; 2]) -> Trace {
         Trace::new(build_haddr_trace(secret))
+    }
+
+    /// §3d-0.6a — interior trace plus the row-`N_ROUNDS` indicator
+    /// column as the final column. Use with [`HAddrAir::new_with_output_pin`].
+    pub fn build_trace_with_output_pin(&self, secret: [Block128; 2]) -> Trace {
+        let mut cols = build_haddr_trace(secret);
+        let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        Trace::new(cols)
     }
 }
 
@@ -153,13 +240,16 @@ impl Default for HAddrAir {
 
 impl Air for HAddrAir {
     fn n_columns(&self) -> usize {
-        HADDR_N_COLS
+        self.n_cols
     }
     fn log_rows(&self) -> usize {
         HADDR_LOG_ROWS
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 
@@ -261,6 +351,99 @@ mod tests {
         cols[HADDR_LAYOUT_A.s + 1][3] = cols[HADDR_LAYOUT_A.s + 1][3] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn haddr_public_columns_match_builder_output() {
+        // Stage 3d-0.4: every declared programme column must be bit-
+        // identical to what `build_haddr_trace` writes into the witness.
+        use crate::airs::poseidon_perm::{
+            perm_is_full_values, perm_is_round_values, perm_rc_values,
+        };
+        use noid_poseidon2b::native::permutation::STATE_SIZE;
+        let cols = build_haddr_trace(mk_secret(0x1337));
+        let publics = emit_haddr_public_columns();
+        // 2 perm blocks × (is_full + is_round + STATE_SIZE rc) declarations.
+        assert_eq!(publics.len(), 2 * (STATE_SIZE + 2));
+        for layout in [HADDR_LAYOUT_A, HADDR_LAYOUT_B] {
+            assert_eq!(cols[layout.is_full], perm_is_full_values());
+            assert_eq!(cols[layout.is_round], perm_is_round_values());
+            for lane in 0..STATE_SIZE {
+                assert_eq!(cols[layout.rc + lane], perm_rc_values(lane));
+            }
+        }
+    }
+
+    #[test]
+    fn haddr_air_rejects_padding_row_rc_tamper() {
+        // Case B: tamper `rc` on a padding row where every constraint
+        // selector is suppressed. Only the 3d-0.4 public-column
+        // declaration catches this.
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HAddrAir::new();
+        let mut cols = build_haddr_trace(mk_secret(0x5ADC0DE));
+        cols[HADDR_LAYOUT_B.rc + 2][N_ROUNDS + 3] = Block128::from(0xDEAD_BEEFu128);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.6a — output-squeeze boundary tie
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn haddr_pinned_air_accepts_honest_trace() {
+        let secret = mk_secret(0xF00DBABE);
+        let honest = build_haddr_trace(secret);
+        let expected = extract_haddr_output(&honest);
+        let air = HAddrAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(secret);
+        assert!(air.check(&trace));
+        assert_eq!(air.n_columns(), HADDR_N_COLS_PINNED);
+    }
+
+    #[test]
+    fn haddr_pinned_air_rejects_wrong_declared_addr() {
+        // AIR declares the wrong output; even if the trace is honest
+        // the pinned-cell gate fires because `state[0]@N_ROUNDS` does
+        // not equal the wrong constant.
+        let secret = mk_secret(0xC0DE);
+        let honest = build_haddr_trace(secret);
+        let mut expected = extract_haddr_output(&honest);
+        expected[0] = expected[0] + Block128::ONE; // wrong
+        let air = HAddrAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(secret);
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn haddr_pinned_air_rejects_tampered_output_cell() {
+        let secret = mk_secret(0x1111);
+        let honest = build_haddr_trace(secret);
+        let expected = extract_haddr_output(&honest);
+        let air = HAddrAir::new_with_output_pin(expected);
+        let mut cols = build_haddr_trace(secret);
+        // Flip s[0]@N_ROUNDS — pinned cell tamper. Breaks many gates,
+        // including the output-squeeze tie.
+        cols[HADDR_LAYOUT_B.s][N_ROUNDS] = cols[HADDR_LAYOUT_B.s][N_ROUNDS] + Block128::ONE;
+        let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_pinned_air_rejects_tampered_indicator_column() {
+        // Shift the indicator to a non-target row; `PublicColumn` MLE
+        // mismatch rejects independently of the inner gates.
+        let secret = mk_secret(0x2222);
+        let honest = build_haddr_trace(secret);
+        let expected = extract_haddr_output(&honest);
+        let air = HAddrAir::new_with_output_pin(expected);
+        let mut cols = build_haddr_trace(secret);
+        let mut bad_indicator = vec![Block128::ZERO; HADDR_N_ROWS];
+        bad_indicator[N_ROUNDS - 1] = Block128::ONE; // wrong row
+        cols.push(bad_indicator);
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]

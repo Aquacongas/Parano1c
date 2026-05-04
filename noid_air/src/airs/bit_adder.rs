@@ -277,6 +277,37 @@ impl Constraint for BitAdderCarryNextGate {
 /// offsets in the same composite trace can each call this with their
 /// own layout — the returned vectors can be concatenated directly.
 ///
+/// Selector programmes for one `bit_adder` block. Both columns are
+/// pure public data: `is_input` is `1` on rows `inst*128 + b` for
+/// `b ∈ 0..width`, `0` elsewhere; `is_reset` is `1` only on row
+/// `inst*128` of every instance. Used by §3d-0.10 to pin the block's
+/// selector columns via `PublicColumn` declarations.
+pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block128> {
+    assert!(width >= 1 && width <= BIT_ADDER_MAX_WIDTH);
+    assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
+    let n_rows = 1usize << log_rows;
+    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
+    let mut v = vec![Block128::ZERO; n_rows];
+    for inst in 0..n_instances {
+        let base = inst * BIT_ADDER_WORD_BITS;
+        for b in 0..width {
+            v[base + b] = Block128::ONE;
+        }
+    }
+    v
+}
+
+pub fn bit_adder_is_reset_programme(log_rows: usize) -> Vec<Block128> {
+    assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
+    let n_rows = 1usize << log_rows;
+    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
+    let mut v = vec![Block128::ZERO; n_rows];
+    for inst in 0..n_instances {
+        v[inst * BIT_ADDER_WORD_BITS] = Block128::ONE;
+    }
+    v
+}
+
 /// Gate list is identical to the one baked into [`BitAdderAir::new`]:
 /// one `BoolGate` per column, three `PadZeroGate`s on the bit columns,
 /// and the three full-adder gates (`FaSumGate`,

@@ -913,8 +913,10 @@ fn print_poseidon_perm(r: &PoseidonRow) {
     println!();
     println!("  Note: 29 selector-gated constraints — S-box chain (16), RC binding (6),");
     println!("  MDS blend (4, full+partial fused via is_full selector), partial-round");
-    println!("  sin kill (3). `rc`, `is_full`, `is_round` are trusted input columns; §3d");
-    println!("  will pin them via ConstColumnGate.");
+    println!("  sin kill (3). `rc`, `is_full`, `is_round` are now pinned via §3d-0.3");
+    println!("  PublicColumn programmes (no longer trusted input). Boundary ties");
+    println!("  (capacity IV, absorb XOR, inter-perm carry, output squeeze) remain");
+    println!("  open pending §3d RowSelectorGate.");
     println!();
     assert_eq!(r.n_cols, POSEIDON_PERM_N_COLS);
     assert_eq!(r.log_rows, POSEIDON_PERM_LOG_ROWS);
@@ -1029,10 +1031,11 @@ fn print_haddr(r: &HAddrRow) {
         percent(r.verify.multipoint_fri, vtotal),
     );
     println!();
-    println!("  Note: interior-only — 58 gates (2 x emit_perm_all_at). Capacity-IV,");
-    println!("  absorb-XOR, inter-permutation carry, and output squeeze are still");
-    println!("  trusted-input (same posture as 3c-1's rc/is_full/is_round); §3d's");
-    println!("  RowSelectorGate / ConstColumnGate primitive closes them.");
+    println!("  Note: interior-only — 58 gates (2 x emit_perm_all_at). Selector +");
+    println!("  round-constant columns are pinned via §3d-0.3 PublicColumn declarations");
+    println!("  (12 columns: 2 x (is_full + is_round + 4 rc)). Capacity-IV, absorb-XOR,");
+    println!("  inter-permutation carry, and output squeeze remain trusted-input");
+    println!("  pending §3d's RowSelectorGate primitive.");
     println!();
     assert_eq!(r.n_cols, HADDR_N_COLS);
     assert_eq!(r.log_rows, HADDR_LOG_ROWS);
@@ -1151,8 +1154,10 @@ fn print_hauth(r: &HAuthRow) {
         percent(r.verify.multipoint_fri, vtotal),
     );
     println!();
-    println!("  Note: interior-only — 87 gates (3 x emit_perm_all_at). Boundary ties");
-    println!("  (IV, absorb XORs, inter-perm carries, squeeze) deferred to §3d.");
+    println!("  Note: interior-only — 87 gates (3 x emit_perm_all_at). Selector +");
+    println!("  round-constant columns pinned via §3d-0.3 PublicColumn declarations");
+    println!("  (18 columns: 3 x (is_full + is_round + 4 rc)). Boundary ties (IV,");
+    println!("  absorb XORs, inter-perm carries, squeeze) deferred to §3d.");
     println!();
     assert_eq!(r.n_cols, HAUTH_N_COLS);
     assert_eq!(r.log_rows, HAUTH_LOG_ROWS);
@@ -1270,8 +1275,9 @@ fn print_hleaf(r: &HLeafRow) {
     );
     println!();
     println!("  Note: interior-only — 87 gates (3 x emit_perm_all_at). Structurally");
-    println!("  identical to HAuthAir; only the capacity IV (TAG_LEAF) differs and is");
-    println!("  trusted-input pending §3d boundary ties.");
+    println!("  identical to HAuthAir; rc/is_full/is_round pinned via §3d-0.3");
+    println!("  PublicColumns (18 cols). Capacity IV (TAG_LEAF) remains trusted-input");
+    println!("  pending §3d boundary ties.");
     println!();
     assert_eq!(r.n_cols, HLEAF_N_COLS);
     assert_eq!(r.log_rows, HLEAF_LOG_ROWS);
@@ -1411,8 +1417,10 @@ fn print_tx_body_merkle(r: &TxBodyMerkleRow) {
     println!("  PoseidonPermAir's 29 interior constraints — holds at every row.");
     println!("  Expected win: ladder-sc amortizes across all 68 instances, so");
     println!("  per-perm cost should drop versus 68 × single-perm proofs.");
-    println!("  Note: interior-only. Inter-instance boundary ties (leaf IV,");
-    println!("  compress IV, wrap tag, output→next-input wiring) deferred to §3d.");
+    println!("  Note: interior-only. rc/is_full/is_round across all 68 instance");
+    println!("  slots pinned via §3d-0.4 row-major PublicColumn programmes (6 cols,");
+    println!("  stride = 128 rows). Inter-instance boundary ties (leaf IV, compress");
+    println!("  IV, wrap tag, output -> next-input wiring) deferred to §3d.");
     println!();
     assert_eq!(r.n_cols, TXBODY_MERKLE_N_COLS);
     assert_eq!(r.log_rows, TXBODY_MERKLE_LOG_ROWS);
@@ -1724,6 +1732,8 @@ fn print_footer() {
     println!("    [I] HAuthAir       (Stage 3c-3 — interior)  shipped (boundary ties -> 3d)");
     println!("    [J] HLeafAir       (Stage 3c-4 — interior)  shipped (boundary ties -> 3d)");
     println!("    [K] TxBodyMerkleAir (Stage 3c-5 — homogeneous 68-stack)  shipped (boundary ties -> 3d)");
+    println!("    [*] Stage 3d-0.3/0.4 PublicColumn programmes (rc/is_full/is_round)  shipped");
+    println!("    [ ] Stage 3d RowSelectorGate (capacity IV, absorb XOR, carries, squeeze)  planned");
     println!("    [ ] TxValidityAir  (Stage 3d — full)        planned");
     println!();
     println!("  reproduce: cargo bench --bench stark_report");

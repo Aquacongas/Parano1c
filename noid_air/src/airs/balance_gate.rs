@@ -46,10 +46,12 @@
 //! as integer-doubling anywhere in the chain.
 
 use crate::airs::bit_adder::{
-    emit_block_constraints, BitAdderAir, BitAdderLayout, BIT_ADDER_COL_A, BIT_ADDER_COL_B,
-    BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS,
+    bit_adder_is_input_programme, bit_adder_is_reset_programme, emit_block_constraints,
+    BitAdderAir, BitAdderLayout, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY,
+    BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS,
     BIT_ADDER_N_COLS,
 };
+use crate::gates::PublicColumn;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
 use noid_core::{Block128, TowerField};
 
@@ -476,11 +478,43 @@ pub fn build_balance_trace_parts(
     (cols, domains)
 }
 
+/// Pin every `bit_adder` block's `is_reset` / `is_input` selector
+/// columns to their literal programmes (22 declarations across the
+/// 11 blocks). §3d-0.10 wiring: zero new constraints — just the
+/// `PublicColumn` machinery from §3d-0.2 applied to columns that
+/// used to be free witnesses. `base_col` is the column offset of the
+/// balance block inside the composite trace; pass `0` for the
+/// standalone `BalanceGateAir`.
+pub fn emit_balance_selector_public_columns(
+    base_col: usize,
+    log_rows: usize,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "balance selector publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let mut out = Vec::with_capacity(2 * BALANCE_N_BLOCKS);
+    for blk in 0..BALANCE_N_BLOCKS {
+        let block_base = base_col + blk * BIT_ADDER_N_COLS;
+        let width = BLOCK_WIDTHS[blk];
+        out.push(PublicColumn::new(
+            block_base + BIT_ADDER_COL_IS_RESET,
+            bit_adder_is_reset_programme(log_rows),
+        ));
+        out.push(PublicColumn::new(
+            block_base + BIT_ADDER_COL_IS_INPUT,
+            bit_adder_is_input_programme(width, log_rows),
+        ));
+    }
+    out
+}
+
 /// Composite AIR proving `Σ inputs = Σ outputs + fee` for a 4-in / 8-out
 /// tx. See module-level docs for the chain layout.
 pub struct BalanceGateAir {
     log_rows: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl BalanceGateAir {
@@ -492,6 +526,26 @@ impl BalanceGateAir {
         Self {
             log_rows,
             constraints: emit_balance_constraints(0),
+            public_columns: Vec::new(),
+        }
+    }
+
+    /// §3d-0.10 — balance AIR with the 22 `bit_adder` selector
+    /// programmes pinned. Constraints are unchanged; the selector
+    /// columns become `PublicColumn`-bound, so a prover that tampers
+    /// `is_reset` / `is_input` on any row is rejected by the native
+    /// check and by the STARK verifier's `check_public_columns` MLE
+    /// re-eval — closes the "selectors are witness, not pinned"
+    /// bullet from §3b-4's debt list.
+    pub fn new_with_selector_pins(log_rows: usize) -> Self {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "BalanceGateAir needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        Self {
+            log_rows,
+            constraints: emit_balance_constraints(0),
+            public_columns: emit_balance_selector_public_columns(0, log_rows),
         }
     }
 
@@ -519,6 +573,9 @@ impl Air for BalanceGateAir {
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 
@@ -682,5 +739,66 @@ mod tests {
         let col_b21_sum = src_sum_col(BLK_B21);
         bad_b.columns[col_b21_sum][7] += Block128::ONE;
         assert!(!air.check(&bad_b));
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.10 — selector programme pinning
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn balance_selector_publics_cover_all_blocks() {
+        let publics = emit_balance_selector_public_columns(0, LOG_ROWS);
+        // Two public columns per block: is_reset, is_input.
+        assert_eq!(publics.len(), 2 * BALANCE_N_BLOCKS);
+        // Columns pinned are in the expected positions.
+        for blk in 0..BALANCE_N_BLOCKS {
+            let base = blk * BIT_ADDER_N_COLS;
+            assert_eq!(publics[2 * blk].col, base + BIT_ADDER_COL_IS_RESET);
+            assert_eq!(publics[2 * blk + 1].col, base + BIT_ADDER_COL_IS_INPUT);
+        }
+    }
+
+    #[test]
+    fn balance_selector_publics_match_honest_witness() {
+        let air = BalanceGateAir::new_with_selector_pins(LOG_ROWS);
+        let (ins, outs, fee) = balanced_tuple(17);
+        let trace = air.build_trace(ins, outs, fee);
+        assert!(air.check(&trace));
+        assert_eq!(air.public_columns().len(), 2 * BALANCE_N_BLOCKS);
+    }
+
+    #[test]
+    fn balance_selector_pin_rejects_tampered_is_input() {
+        let air = BalanceGateAir::new_with_selector_pins(LOG_ROWS);
+        let (ins, outs, fee) = balanced_tuple(21);
+        let mut bad = air.build_trace(ins, outs, fee);
+        // Flip is_input of block A0 at a padding row (the gate layer
+        // would not observe it — only the public-column check catches
+        // this).
+        let col = BLK_A0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
+        // Block A0 is 64 bits wide, so row 100 is in the padding region.
+        bad.columns[col][100] = Block128::ONE;
+        assert!(!air.check(&bad));
+    }
+
+    #[test]
+    fn balance_selector_pin_rejects_tampered_is_reset() {
+        let air = BalanceGateAir::new_with_selector_pins(LOG_ROWS);
+        let (ins, outs, fee) = balanced_tuple(22);
+        let mut bad = air.build_trace(ins, outs, fee);
+        let col = BLK_B21 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_RESET;
+        // Row 1 is not an instance-start row for any instance in a
+        // 128-row stride, so programme pins it to ZERO. Set it to ONE.
+        bad.columns[col][1] = Block128::ONE;
+        assert!(!air.check(&bad));
+    }
+
+    #[test]
+    fn balance_without_selector_pin_is_backward_compatible() {
+        // Legacy `new()` still works, no public columns declared.
+        let air = BalanceGateAir::new(LOG_ROWS);
+        let (ins, outs, fee) = balanced_tuple(23);
+        assert!(air.check(&air.build_trace(ins, outs, fee)));
+        assert!(air.public_columns().is_empty());
     }
 }

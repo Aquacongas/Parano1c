@@ -30,13 +30,14 @@
 
 use crate::airs::haddr::{HADDR_PAD_0, HADDR_PAD_1};
 use crate::airs::poseidon_perm::{
-    write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
-    POSEIDON_PERM_N_ROWS,
+    emit_perm_public_columns_at, write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
+use crate::gates::{emit_public_cell, PublicColumn};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_LEAF};
-use noid_poseidon2b::native::permutation::STATE_SIZE;
+use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 pub const HLEAF_PERM_A_BASE: usize = 0;
 pub const HLEAF_PERM_B_BASE: usize = POSEIDON_PERM_N_COLS;
@@ -48,6 +49,12 @@ pub const HLEAF_N_ROWS: usize = POSEIDON_PERM_N_ROWS;
 pub const HLEAF_LAYOUT_A: PermLayout = PermLayout::at(HLEAF_PERM_A_BASE);
 pub const HLEAF_LAYOUT_B: PermLayout = PermLayout::at(HLEAF_PERM_B_BASE);
 pub const HLEAF_LAYOUT_C: PermLayout = PermLayout::at(HLEAF_PERM_C_BASE);
+
+/// §3d-0.8 output-squeeze indicator column. Holds `ONE` at row
+/// `N_ROUNDS` of block C and zero elsewhere.
+pub const HLEAF_OUTPUT_INDICATOR_COL: usize = HLEAF_N_COLS;
+/// Total column count when the output-squeeze binding is enabled.
+pub const HLEAF_N_COLS_PINNED: usize = HLEAF_N_COLS + 1;
 
 /// Build an honest witness trace for `hash_leaf(&[f0, f1, f2, f3])`
 /// under `TAG_LEAF`.
@@ -103,19 +110,81 @@ pub fn emit_hleaf_constraints() -> Vec<Box<dyn Constraint>> {
     out
 }
 
+/// Emit the public-column declarations for all three permutation
+/// blocks: `3 × (is_full, is_round, rc[0..STATE_SIZE]) = 18`.
+pub fn emit_hleaf_public_columns() -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(3 * (STATE_SIZE + 2));
+    out.extend(emit_perm_public_columns_at(HLEAF_LAYOUT_A));
+    out.extend(emit_perm_public_columns_at(HLEAF_LAYOUT_B));
+    out.extend(emit_perm_public_columns_at(HLEAF_LAYOUT_C));
+    out
+}
+
+/// §3d-0.8 — pin `state[0..2]@C_row_N_ROUNDS` to the publicly-declared
+/// `expected_leaf`. Returns the indicator `PublicColumn` + the two
+/// pinned-cell gates.
+pub fn emit_hleaf_output_squeeze_ties(
+    indicator_col: usize,
+    expected_leaf: [Block128; 2],
+) -> (PublicColumn, Vec<Box<dyn Constraint>>) {
+    let (pc_hi, gate_hi) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HLEAF_N_ROWS,
+        HLEAF_LAYOUT_C.s,
+        expected_leaf[0],
+    );
+    let (_pc_lo, gate_lo) = emit_public_cell(
+        indicator_col,
+        N_ROUNDS,
+        HLEAF_N_ROWS,
+        HLEAF_LAYOUT_C.s + 1,
+        expected_leaf[1],
+    );
+    (pc_hi, vec![gate_hi, gate_lo])
+}
+
 pub struct HLeafAir {
+    n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl HLeafAir {
     pub fn new() -> Self {
         Self {
+            n_cols: HLEAF_N_COLS,
             constraints: emit_hleaf_constraints(),
+            public_columns: emit_hleaf_public_columns(),
+        }
+    }
+
+    /// §3d-0.8 — interior construction plus the output-squeeze
+    /// boundary tie pinning the leaf hash output.
+    pub fn new_with_output_pin(expected_leaf: [Block128; 2]) -> Self {
+        let mut constraints = emit_hleaf_constraints();
+        let mut public_columns = emit_hleaf_public_columns();
+        let (ind_pc, mut gates) =
+            emit_hleaf_output_squeeze_ties(HLEAF_OUTPUT_INDICATOR_COL, expected_leaf);
+        public_columns.push(ind_pc);
+        constraints.append(&mut gates);
+        Self {
+            n_cols: HLEAF_N_COLS_PINNED,
+            constraints,
+            public_columns,
         }
     }
 
     pub fn build_trace(&self, fields: [Block128; 4]) -> Trace {
         Trace::new(build_hleaf_trace(fields))
+    }
+
+    pub fn build_trace_with_output_pin(&self, fields: [Block128; 4]) -> Trace {
+        let mut cols = build_hleaf_trace(fields);
+        let mut indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        Trace::new(cols)
     }
 }
 
@@ -127,13 +196,16 @@ impl Default for HLeafAir {
 
 impl Air for HLeafAir {
     fn n_columns(&self) -> usize {
-        HLEAF_N_COLS
+        self.n_cols
     }
     fn log_rows(&self) -> usize {
         HLEAF_LOG_ROWS
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 
@@ -235,6 +307,89 @@ mod tests {
         cols[HLEAF_LAYOUT_C.rc + 1][1] = cols[HLEAF_LAYOUT_C.rc + 1][1] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn hleaf_public_columns_match_builder_output() {
+        use crate::airs::poseidon_perm::{
+            perm_is_full_values, perm_is_round_values, perm_rc_values,
+        };
+        use noid_poseidon2b::native::permutation::STATE_SIZE;
+        let cols = build_hleaf_trace(mk_fields4(0x1EAF));
+        let publics = emit_hleaf_public_columns();
+        assert_eq!(publics.len(), 3 * (STATE_SIZE + 2));
+        for layout in [HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C] {
+            assert_eq!(cols[layout.is_full], perm_is_full_values());
+            assert_eq!(cols[layout.is_round], perm_is_round_values());
+            for lane in 0..STATE_SIZE {
+                assert_eq!(cols[layout.rc + lane], perm_rc_values(lane));
+            }
+        }
+    }
+
+    #[test]
+    fn hleaf_air_rejects_padding_row_rc_tamper() {
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HLeafAir::new();
+        let mut cols = build_hleaf_trace(mk_fields4(0xFADE));
+        cols[HLEAF_LAYOUT_B.rc + 3][N_ROUNDS + 7] = Block128::from(0xC0DEFEEDu128);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.8 — output-squeeze boundary tie
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hleaf_pinned_air_accepts_honest_trace() {
+        let fields = mk_fields4(0x5EED_AAAA);
+        let honest = build_hleaf_trace(fields);
+        let expected = extract_hleaf_output(&honest);
+        let air = HLeafAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(fields);
+        assert!(air.check(&trace));
+        assert_eq!(air.n_columns(), HLEAF_N_COLS_PINNED);
+    }
+
+    #[test]
+    fn hleaf_pinned_air_rejects_wrong_declared_leaf() {
+        let fields = mk_fields4(0x5EED_BBBB);
+        let honest = build_hleaf_trace(fields);
+        let mut expected = extract_hleaf_output(&honest);
+        expected[0] = expected[0] + Block128::ONE;
+        let air = HLeafAir::new_with_output_pin(expected);
+        let trace = air.build_trace_with_output_pin(fields);
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn hleaf_pinned_air_rejects_tampered_output_cell() {
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let fields = mk_fields4(0x5EED_CCCC);
+        let honest = build_hleaf_trace(fields);
+        let expected = extract_hleaf_output(&honest);
+        let air = HLeafAir::new_with_output_pin(expected);
+        let mut cols = build_hleaf_trace(fields);
+        cols[HLEAF_LAYOUT_C.s][N_ROUNDS] =
+            cols[HLEAF_LAYOUT_C.s][N_ROUNDS] + Block128::ONE;
+        let mut indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
+        indicator[N_ROUNDS] = Block128::ONE;
+        cols.push(indicator);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn hleaf_pinned_air_rejects_tampered_indicator_column() {
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let fields = mk_fields4(0x5EED_DDDD);
+        let honest = build_hleaf_trace(fields);
+        let expected = extract_hleaf_output(&honest);
+        let air = HLeafAir::new_with_output_pin(expected);
+        let mut cols = build_hleaf_trace(fields);
+        let mut bad_indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
+        bad_indicator[N_ROUNDS + 3] = Block128::ONE;
+        cols.push(bad_indicator);
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]

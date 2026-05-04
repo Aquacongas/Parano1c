@@ -52,9 +52,10 @@
 //! Poseidon2b permutation whose input sits at their first row".
 
 use crate::airs::poseidon_perm::{
-    emit_perm_all_at, write_perm_trace_at_offset, PermLayout, DEFAULT_PERM_LAYOUT,
-    POSEIDON_PERM_N_COLS,
+    emit_perm_all_at, emit_perm_public_columns_row_major_at, write_perm_trace_at_offset,
+    PermLayout, DEFAULT_PERM_LAYOUT, POSEIDON_PERM_N_COLS,
 };
+use crate::gates::PublicColumn;
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
@@ -127,14 +128,29 @@ pub fn emit_tx_body_merkle_constraints() -> Vec<Box<dyn Constraint>> {
     emit_perm_all_at(TXBODY_MERKLE_LAYOUT)
 }
 
+/// Emit the row-major public-column declarations for the 68-instance
+/// stack: `(is_full, is_round, rc[0..STATE_SIZE]) = 6` columns, each a
+/// `TXBODY_MERKLE_N_ROWS`-long programme tiling the per-instance
+/// schedule at `TXBODY_MERKLE_SLOT_ROWS` stride.
+pub fn emit_tx_body_merkle_public_columns() -> Vec<PublicColumn> {
+    emit_perm_public_columns_row_major_at(
+        TXBODY_MERKLE_LAYOUT,
+        TXBODY_MERKLE_N_PERMS,
+        TXBODY_MERKLE_SLOT_ROWS,
+        TXBODY_MERKLE_N_ROWS,
+    )
+}
+
 pub struct TxBodyMerkleAir {
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl TxBodyMerkleAir {
     pub fn new() -> Self {
         Self {
             constraints: emit_tx_body_merkle_constraints(),
+            public_columns: emit_tx_body_merkle_public_columns(),
         }
     }
 
@@ -161,6 +177,9 @@ impl Air for TxBodyMerkleAir {
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &self.public_columns
     }
 }
 
@@ -280,6 +299,59 @@ mod tests {
     }
 
     #[test]
+    fn tx_body_merkle_public_columns_match_builder_output() {
+        use crate::airs::poseidon_perm::{
+            perm_is_full_values_row_major, perm_is_round_values_row_major,
+            perm_rc_values_row_major,
+        };
+        let cols = build_tx_body_merkle_trace(&mk_batch());
+        let publics = emit_tx_body_merkle_public_columns();
+        // is_full + is_round + STATE_SIZE rc columns.
+        assert_eq!(publics.len(), STATE_SIZE + 2);
+        assert_eq!(
+            cols[TXBODY_MERKLE_LAYOUT.is_full],
+            perm_is_full_values_row_major(
+                TXBODY_MERKLE_N_PERMS,
+                TXBODY_MERKLE_SLOT_ROWS,
+                TXBODY_MERKLE_N_ROWS,
+            ),
+        );
+        assert_eq!(
+            cols[TXBODY_MERKLE_LAYOUT.is_round],
+            perm_is_round_values_row_major(
+                TXBODY_MERKLE_N_PERMS,
+                TXBODY_MERKLE_SLOT_ROWS,
+                TXBODY_MERKLE_N_ROWS,
+            ),
+        );
+        for lane in 0..STATE_SIZE {
+            assert_eq!(
+                cols[TXBODY_MERKLE_LAYOUT.rc + lane],
+                perm_rc_values_row_major(
+                    lane,
+                    TXBODY_MERKLE_N_PERMS,
+                    TXBODY_MERKLE_SLOT_ROWS,
+                    TXBODY_MERKLE_N_ROWS,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn tx_body_merkle_rejects_inter_instance_rc_tamper() {
+        // Case B: between instance k's output row and k+1's row 0 every
+        // constraint selector is zero. Pre-3d-0.4, tampering `rc` here
+        // was silently accepted. With programme binding, the public-
+        // column check now catches it.
+        let air = TxBodyMerkleAir::new();
+        let mut cols = build_tx_body_merkle_trace(&mk_batch());
+        let pad_row = instance_row_offset(5) + N_ROUNDS + 10;
+        assert!(pad_row < instance_row_offset(6));
+        cols[TXBODY_MERKLE_LAYOUT.rc + 1][pad_row] = Block128::from(0xCAFE_BABE_u128);
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
     fn tamper_in_inter_instance_padding_is_suppressed() {
         // Between instance k's output row and instance k+1's row 0,
         // is_round = is_full = 0 — so the MDS blend and RC binding
@@ -288,14 +360,15 @@ mod tests {
         //
         // Note: the S-box chain (x2=sin², sout=x4·x3, ...) is NOT
         // selector-gated — it holds at every row. So sin/x2/x3/x4/sout
-        // must remain zero on padding; only `s` and `rc` are free.
+        // must remain zero on padding; and with Stage 3d-0.4 programme
+        // binding in place, `rc`/`is_full`/`is_round` are pinned too.
+        // Only `s` is a free witness on padding rows.
         let air = TxBodyMerkleAir::new();
         let mut cols = build_tx_body_merkle_trace(&mk_batch());
         let pad_row = instance_row_offset(5) + N_ROUNDS + 10;
         assert!(pad_row < instance_row_offset(6));
         cols[TXBODY_MERKLE_LAYOUT.s + 0][pad_row] = Block128::from(0xFEEDFACE_DEADBEEF_u128);
         cols[TXBODY_MERKLE_LAYOUT.s + 2][pad_row] = Block128::from(0xABCD_1234_u128);
-        cols[TXBODY_MERKLE_LAYOUT.rc + 1][pad_row] = Block128::from(0x9999_8888_u128);
         assert!(air.check(&Trace::new(cols)));
     }
 }

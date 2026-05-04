@@ -779,6 +779,109 @@ pub fn emit_perm_public_columns() -> Vec<PublicColumn> {
     emit_perm_public_columns_at(DEFAULT_PERM_LAYOUT)
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3d-0.4 — Row-major public-column programmes for stacked permutations
+// ---------------------------------------------------------------------------
+
+/// Build the `is_full` programme column for a row-major stack of
+/// `n_instances` Poseidon2b permutations at `stride` rows per instance,
+/// laid out over `total_rows = 1 << log_rows`. Matches
+/// [`write_perm_trace_at_offset`] semantics: inside each instance slot
+/// `k * stride .. k * stride + stride`, only the `N_ROUNDS` active
+/// rows carry the selector; the output row and every row beyond
+/// `n_instances * stride` is zero.
+pub fn perm_is_full_values_row_major(
+    n_instances: usize,
+    stride: usize,
+    total_rows: usize,
+) -> Vec<Block128> {
+    assert!(total_rows.is_power_of_two() && total_rows > 0);
+    assert!(stride >= N_ROUNDS + 1);
+    assert!(n_instances * stride <= total_rows);
+    let mut out = vec![Block128::ZERO; total_rows];
+    for k in 0..n_instances {
+        let base = k * stride;
+        for r in 0..N_ROUNDS {
+            if is_full_round(r) {
+                out[base + r] = Block128::ONE;
+            }
+        }
+    }
+    out
+}
+
+/// Row-major version of [`perm_is_round_values`].
+pub fn perm_is_round_values_row_major(
+    n_instances: usize,
+    stride: usize,
+    total_rows: usize,
+) -> Vec<Block128> {
+    assert!(total_rows.is_power_of_two() && total_rows > 0);
+    assert!(stride >= N_ROUNDS + 1);
+    assert!(n_instances * stride <= total_rows);
+    let mut out = vec![Block128::ZERO; total_rows];
+    for k in 0..n_instances {
+        let base = k * stride;
+        for r in 0..N_ROUNDS {
+            out[base + r] = Block128::ONE;
+        }
+    }
+    out
+}
+
+/// Row-major version of [`perm_rc_values`]: writes
+/// `ROUND_CONSTANTS[lane][r]` at row `k*stride + r` for every instance
+/// `k ∈ 0..n_instances` and every round `r ∈ 0..N_ROUNDS`. All other
+/// rows (output, intra-slot padding, trailing trace padding) are zero.
+pub fn perm_rc_values_row_major(
+    lane: usize,
+    n_instances: usize,
+    stride: usize,
+    total_rows: usize,
+) -> Vec<Block128> {
+    assert!(lane < STATE_SIZE);
+    assert!(total_rows.is_power_of_two() && total_rows > 0);
+    assert!(stride >= N_ROUNDS + 1);
+    assert!(n_instances * stride <= total_rows);
+    let mut out = vec![Block128::ZERO; total_rows];
+    for k in 0..n_instances {
+        let base = k * stride;
+        for r in 0..N_ROUNDS {
+            out[base + r] = Block128::from(ROUND_CONSTANTS[lane][r]);
+        }
+    }
+    out
+}
+
+/// Declare every selector / round-constant column of a row-major
+/// stacked permutation AIR (e.g. `TxBodyMerkleAir`) as a
+/// [`PublicColumn`]. The `layout` identifies the columns; `n_instances`
+/// and `stride` describe the row-major packing; `total_rows` is the
+/// hypercube size (`1 << air.log_rows()`).
+pub fn emit_perm_public_columns_row_major_at(
+    layout: PermLayout,
+    n_instances: usize,
+    stride: usize,
+    total_rows: usize,
+) -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(STATE_SIZE + 2);
+    out.push(PublicColumn::new(
+        layout.is_full,
+        perm_is_full_values_row_major(n_instances, stride, total_rows),
+    ));
+    out.push(PublicColumn::new(
+        layout.is_round,
+        perm_is_round_values_row_major(n_instances, stride, total_rows),
+    ));
+    for lane in 0..STATE_SIZE {
+        out.push(PublicColumn::new(
+            layout.rc + lane,
+            perm_rc_values_row_major(lane, n_instances, stride, total_rows),
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,6 +1426,50 @@ mod tests {
             emit_perm_public_columns(),
         );
         assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn perm_public_columns_row_major_match_builder_output() {
+        // Build a stacked trace with 3 instances at stride = POSEIDON_N_ACTIVE_ROWS
+        // (67) rounded up to 128 rows — same shape TxBodyMerkleAir uses.
+        const N_INSTANCES: usize = 3;
+        const STRIDE: usize = 128;
+        const LOG_ROWS: usize = 10; // 1024 >= 3*128
+        const TOTAL: usize = 1 << LOG_ROWS;
+
+        let mut cols: Vec<Vec<Block128>> = (0..POSEIDON_PERM_N_COLS)
+            .map(|_| vec![Block128::ZERO; TOTAL])
+            .collect();
+        for k in 0..N_INSTANCES {
+            let input = [
+                Block128::from((k as u128 + 1) * 0x1111),
+                Block128::from((k as u128 + 1) * 0x2222),
+                Block128::from((k as u128 + 1) * 0x3333),
+                Block128::from((k as u128 + 1) * 0x4444),
+            ];
+            write_perm_trace_at_offset(&mut cols, DEFAULT_PERM_LAYOUT, input, k * STRIDE);
+        }
+
+        let is_full = perm_is_full_values_row_major(N_INSTANCES, STRIDE, TOTAL);
+        let is_round = perm_is_round_values_row_major(N_INSTANCES, STRIDE, TOTAL);
+        assert_eq!(is_full, cols[POSEIDON_COL_IS_FULL]);
+        assert_eq!(is_round, cols[POSEIDON_COL_IS_ROUND]);
+        for lane in 0..STATE_SIZE {
+            let rc = perm_rc_values_row_major(lane, N_INSTANCES, STRIDE, TOTAL);
+            assert_eq!(rc, cols[POSEIDON_COL_RC + lane]);
+        }
+    }
+
+    #[test]
+    fn perm_public_columns_row_major_declaration_shape() {
+        const LOG_ROWS: usize = 14;
+        const TOTAL: usize = 1 << LOG_ROWS;
+        let publics =
+            emit_perm_public_columns_row_major_at(DEFAULT_PERM_LAYOUT, 68, 128, TOTAL);
+        assert_eq!(publics.len(), STATE_SIZE + 2);
+        for p in &publics {
+            assert_eq!(p.values.len(), TOTAL);
+        }
     }
 
     #[test]

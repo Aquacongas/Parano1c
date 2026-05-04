@@ -20,35 +20,40 @@ pub mod tx_validity;
 
 pub use balance_gate::{
     build_balance_columns, build_balance_trace_parts, emit_balance_constraints,
-    BalanceBridgeBitsGate, BalanceBridgeCarryGate, BalanceFinalCarryGate, BalanceFinalSumGate,
-    BalanceGateAir, BalanceZeroAtTransitionGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
-    BALANCE_N_COLS,
+    emit_balance_selector_public_columns, BalanceBridgeBitsGate, BalanceBridgeCarryGate,
+    BalanceFinalCarryGate, BalanceFinalSumGate, BalanceGateAir, BalanceZeroAtTransitionGate,
+    BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS,
 };
 pub use bit_adder::{
-    emit_block_constraints, BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate,
-    BitAdderLayout, FaSumGate, PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY,
-    BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS,
-    BIT_ADDER_MAX_WIDTH, BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
+    bit_adder_is_input_programme, bit_adder_is_reset_programme, emit_block_constraints,
+    BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, FaSumGate,
+    PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
+    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
+    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
 };
 pub use haddr::{
-    build_haddr_trace, emit_haddr_constraints, extract_haddr_output, HAddrAir, HADDR_LAYOUT_A,
-    HADDR_LAYOUT_B, HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_PAD_0, HADDR_PAD_1,
-    HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
+    build_haddr_trace, emit_haddr_constraints, emit_haddr_output_squeeze_ties,
+    emit_haddr_public_columns, extract_haddr_output, HAddrAir, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_COLS_PINNED, HADDR_N_ROWS, HADDR_OUTPUT_INDICATOR_COL,
+    HADDR_PAD_0, HADDR_PAD_1, HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
 };
 pub use hauth::{
-    build_hauth_trace, emit_hauth_constraints, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_A,
-    HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS, HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_PERM_A_BASE,
-    HAUTH_PERM_B_BASE, HAUTH_PERM_C_BASE,
+    build_hauth_trace, emit_hauth_constraints, emit_hauth_output_squeeze_ties,
+    emit_hauth_public_columns, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B,
+    HAUTH_LAYOUT_C, HAUTH_LOG_ROWS, HAUTH_N_COLS, HAUTH_N_COLS_PINNED, HAUTH_N_ROWS,
+    HAUTH_OUTPUT_INDICATOR_COL, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE, HAUTH_PERM_C_BASE,
 };
 pub use hleaf::{
-    build_hleaf_trace, emit_hleaf_constraints, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_A,
-    HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_PERM_A_BASE,
-    HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE,
+    build_hleaf_trace, emit_hleaf_constraints, emit_hleaf_output_squeeze_ties,
+    emit_hleaf_public_columns, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B,
+    HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_COLS_PINNED, HLEAF_N_ROWS,
+    HLEAF_OUTPUT_INDICATOR_COL, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE,
 };
 pub use tx_body_merkle::{
-    build_tx_body_merkle_trace, emit_tx_body_merkle_constraints, extract_instance_output,
-    instance_row_offset, TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS,
-    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_SLOT_LOG_ROWS,
+    build_tx_body_merkle_trace, emit_tx_body_merkle_constraints,
+    emit_tx_body_merkle_public_columns, extract_instance_output, instance_row_offset,
+    TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS,
+    TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_SLOT_LOG_ROWS,
     TXBODY_MERKLE_SLOT_ROWS,
 };
 pub use carry_ripple::{
@@ -63,10 +68,11 @@ pub use poseidon_mds::{
 pub use poseidon_perm::{
     build_perm_trace, emit_perm_all, emit_perm_all_at, emit_perm_mds_blend,
     emit_perm_mds_blend_at, emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at,
-    emit_perm_public_columns, emit_perm_public_columns_at, emit_perm_rc_binding,
-    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at, extract_perm_output,
-    is_full_round, perm_is_full_values, perm_is_round_values, perm_rc_values, write_perm_trace_at,
-    write_perm_trace_at_offset,
+    emit_perm_public_columns, emit_perm_public_columns_at, emit_perm_public_columns_row_major_at,
+    emit_perm_rc_binding, emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
+    extract_perm_output, is_full_round, perm_is_full_values, perm_is_full_values_row_major,
+    perm_is_round_values, perm_is_round_values_row_major, perm_rc_values,
+    perm_rc_values_row_major, write_perm_trace_at, write_perm_trace_at_offset,
     PartialSboxKillGate, PermLayout,
     PermMdsBlendGate, PoseidonPermColumns, DEFAULT_PERM_LAYOUT, POSEIDON_COL_IS_FULL,
     POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
@@ -83,6 +89,7 @@ pub use range_gate::{
 };
 pub use tx_validity::{
     TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
-    TX_VALIDITY_BALANCE_COL_OFFSET, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS, TX_VALIDITY_ROWS,
-    TX_VALIDITY_SLOTS,
+    TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
+    TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
+    TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
 };

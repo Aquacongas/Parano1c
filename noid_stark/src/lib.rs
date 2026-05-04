@@ -2439,10 +2439,11 @@ mod tx_validity_3b4_tests {
     use super::*;
     use noid_air::{
         Air, TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
-        TX_VALIDITY_BALANCE_COL_OFFSET,
+        TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
+        TX_VALIDITY_INPUT_VALID_MASK_COL,
     };
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret, TxBodyHash};
-    use noid_tx::{TxBody, TxInput, TxOutput};
+    use noid_tx::{TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
@@ -2574,6 +2575,137 @@ mod tx_validity_3b4_tests {
         );
         // Balance A0.a lives at column `TX_VALIDITY_BALANCE_COL_OFFSET + 0`.
         trace.columns[TX_VALIDITY_BALANCE_COL_OFFSET][0] += Block128::ONE;
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn tx_validity_3b4_with_balance_selector_pins_honest_prove_verify() {
+        // §3d-0.10 composite path: the 22 balance-block selector
+        // programmes are surfaced as `PublicColumn`s at
+        // `TX_VALIDITY_BALANCE_COL_OFFSET`. Honest trace closes prove /
+        // verify cleanly — no witness change is needed; the programmes
+        // match what `build_balance_trace_parts` already writes.
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let body = balanced_1in1out(500_000, 499_900, 100);
+        let ins = [500_000u64, 0, 0, 0];
+        let outs = [499_900u64, 0, 0, 0, 0, 0, 0, 0];
+        let trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            100,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn tx_validity_3b4_with_balance_selector_pins_tamper_rejected() {
+        // Tampering a balance-block selector cell on a row that no FA
+        // / bridge gate observes (e.g. an is_input padding row). The
+        // native selector-column pinning rejects, and the STARK
+        // verifier's `check_public_columns` MLE re-eval rejects too.
+        use noid_air::{BIT_ADDER_COL_IS_INPUT, BIT_ADDER_N_COLS};
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let body = balanced_1in1out(42, 42, 0);
+        let ins = [42u64, 0, 0, 0];
+        let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
+        let mut trace = TxValidityAir::build_trace_3b4(
+            &body,
+            ins,
+            outs,
+            0,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let col =
+            TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
+        // Row 100 is inside block A0's padding region (width 64).
+        trace.columns[col][100] = Block128::ONE;
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    // --------------------------------------------------------------------
+    // §3d-0.10 skeleton-selector row-domain pins (3d-0.5.1 primitive)
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn tx_validity_3b4_with_skeleton_pins_honest_prove_verify() {
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert_eq!(air.n_columns(), TX_VALIDITY_3B4_PINNED_N_COLS);
+        let body = balanced_1in1out(250_000, 249_993, 7);
+        let ins = [250_000u64, 0, 0, 0];
+        let outs = [249_993u64, 0, 0, 0, 0, 0, 0, 0];
+        let trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
+            &body,
+            ins,
+            outs,
+            7,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert!(air.check(&trace));
+        let pi = mk_pi();
+        let proof = prove_air(&air, &trace, &pi).expect("prove");
+        verify_air(&air, &pi, &proof).expect("verify");
+    }
+
+    #[test]
+    fn tx_validity_3b4_skeleton_pin_rejects_selector_on_forbidden_row() {
+        // InputValid = 1 on the pad row beyond MAX_INPUTS + MAX_OUTPUTS —
+        // the bool gate still accepts but the multi-hot row-domain pin
+        // rejects, and the STARK verifier's `check_public_columns` MLE
+        // re-eval catches any attempt to also tamper the mask column.
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let body = balanced_1in1out(42, 42, 0);
+        let ins = [42u64, 0, 0, 0];
+        let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
+        let mut trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
+            &body,
+            ins,
+            outs,
+            0,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let pad_row = MAX_INPUTS + MAX_OUTPUTS;
+        trace.columns[TxValidityCol::InputValid.index()][pad_row] = Block128::ONE;
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn tx_validity_3b4_skeleton_pin_rejects_mask_tamper() {
+        // Tamper only the mask column — the PublicColumn MLE re-eval at
+        // the verifier's r_point catches it.
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        let body = balanced_1in1out(100, 100, 0);
+        let ins = [100u64, 0, 0, 0];
+        let outs = [100u64, 0, 0, 0, 0, 0, 0, 0];
+        let mut trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
+            &body,
+            ins,
+            outs,
+            0,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        // Flip mask on an allowed input row (0) — programme says ZERO.
+        trace.columns[TX_VALIDITY_INPUT_VALID_MASK_COL][0] = Block128::ONE;
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
@@ -2781,6 +2913,56 @@ mod haddr_stark_tests {
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.6a — output-squeeze boundary tie (STARK-level)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn haddr_output_pin_stark_honest_and_tamper() {
+        use noid_air::{extract_haddr_output, HADDR_N_ROWS};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+
+        let secret = mk_secret(0xABAB_CAFE);
+        let honest_cols = build_haddr_trace(secret);
+        let expected = extract_haddr_output(&honest_cols);
+        let air = HAddrAir::new_with_output_pin(expected);
+
+        // Honest round-trip.
+        {
+            let trace = air.build_trace_with_output_pin(secret);
+            assert!(air.check(&trace));
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper the pinned output cell: verifier rejects.
+        {
+            let mut cols = build_haddr_trace(secret);
+            cols[HADDR_LAYOUT_B.s][N_ROUNDS] =
+                cols[HADDR_LAYOUT_B.s][N_ROUNDS] + Block128::ONE;
+            let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
+            indicator[N_ROUNDS] = Block128::ONE;
+            cols.push(indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper the indicator column: public-column MLE mismatch rejects.
+        {
+            let mut cols = build_haddr_trace(secret);
+            let mut bad_indicator = vec![Block128::ZERO; HADDR_N_ROWS];
+            bad_indicator[N_ROUNDS + 2] = Block128::ONE; // wrong row
+            cols.push(bad_indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2854,6 +3036,56 @@ mod hauth_stark_tests {
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.7 — output-squeeze boundary tie (STARK-level)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hauth_output_pin_stark_honest_and_tamper() {
+        use noid_air::{extract_hauth_output, HAUTH_N_ROWS};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+
+        let secret = mk_fields(0x1357);
+        let txbody = mk_fields(0x2468);
+        let honest = build_hauth_trace(secret, txbody);
+        let expected = extract_hauth_output(&honest);
+        let air = HAuthAir::new_with_output_pin(expected);
+
+        {
+            let trace = air.build_trace_with_output_pin(secret, txbody);
+            assert!(air.check(&trace));
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper pinned output cell: rejected.
+        {
+            let mut cols = build_hauth_trace(secret, txbody);
+            cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] =
+                cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] + Block128::ONE;
+            let mut indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
+            indicator[N_ROUNDS] = Block128::ONE;
+            cols.push(indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper indicator column: rejected by public-column MLE.
+        {
+            let mut cols = build_hauth_trace(secret, txbody);
+            let mut bad_indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
+            bad_indicator[N_ROUNDS - 2] = Block128::ONE;
+            cols.push(bad_indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
     }
 }
 
@@ -2930,6 +3162,55 @@ mod hleaf_stark_tests {
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.8 — output-squeeze boundary tie (STARK-level)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hleaf_output_pin_stark_honest_and_tamper() {
+        use noid_air::{extract_hleaf_output, HLEAF_N_ROWS};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+
+        let fields = mk_fields4(0xCAFE_FEED);
+        let honest = build_hleaf_trace(fields);
+        let expected = extract_hleaf_output(&honest);
+        let air = HLeafAir::new_with_output_pin(expected);
+
+        {
+            let trace = air.build_trace_with_output_pin(fields);
+            assert!(air.check(&trace));
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper pinned output cell.
+        {
+            let mut cols = build_hleaf_trace(fields);
+            cols[HLEAF_LAYOUT_C.s][N_ROUNDS] =
+                cols[HLEAF_LAYOUT_C.s][N_ROUNDS] + Block128::ONE;
+            let mut indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
+            indicator[N_ROUNDS] = Block128::ONE;
+            cols.push(indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper indicator column.
+        {
+            let mut cols = build_hleaf_trace(fields);
+            let mut bad_indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
+            bad_indicator[N_ROUNDS + 5] = Block128::ONE;
+            cols.push(bad_indicator);
+            let trace = Trace::new(cols);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
     }
 }
 
@@ -3212,6 +3493,90 @@ mod tx_body_merkle_stark_tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Stage 3d-0.4 — consumer migration case-B tests
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn haddr_stark_padding_rc_tamper_rejected() {
+        // Case B for HAddrAir: tamper `rc` on a padding row where every
+        // constraint selector is suppressed. Only the 3d-0.4 public-
+        // column declaration + 3d-0.2 verifier MLE re-eval close this.
+        use noid_air::{build_haddr_trace, HAddrAir, HADDR_LAYOUT_B};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HAddrAir::new();
+        let secret = [Block128::from(0xA5u128), Block128::from(0x5Au128)];
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.rc + 2][N_ROUNDS + 3] = Block128::from(0x1234_5678u128);
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hauth_stark_padding_rc_tamper_rejected() {
+        use noid_air::{build_hauth_trace, HAuthAir, HAUTH_LAYOUT_C};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HAuthAir::new();
+        let secret = [Block128::from(1u128), Block128::from(2u128)];
+        let tx_body = [Block128::from(3u128), Block128::from(4u128)];
+        let mut cols = build_hauth_trace(secret, tx_body);
+        cols[HAUTH_LAYOUT_C.rc + 0][N_ROUNDS + 5] = Block128::from(0xDEAD_BEEFu128);
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn tx_body_merkle_stark_inter_instance_rc_tamper_rejected() {
+        // Case B for TxBodyMerkleAir: tamper `rc` on an inter-instance
+        // padding row where every interior selector is zero. Caught
+        // only by the row-major public-column declaration.
+        use noid_air::{
+            build_tx_body_merkle_trace, instance_row_offset, TxBodyMerkleAir,
+            TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
+        };
+        use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
+        let air = TxBodyMerkleAir::new();
+        let mut batch = [[Block128::ZERO; STATE_SIZE]; TXBODY_MERKLE_N_PERMS];
+        for k in 0..TXBODY_MERKLE_N_PERMS {
+            batch[k] = [
+                Block128::from((k as u128 + 1) * 0x11),
+                Block128::from((k as u128 + 1) * 0x22),
+                Block128::from((k as u128 + 1) * 0x33),
+                Block128::from((k as u128 + 1) * 0x44),
+            ];
+        }
+        let mut cols = build_tx_body_merkle_trace(&batch);
+        let pad_row = instance_row_offset(5) + N_ROUNDS + 10;
+        cols[TXBODY_MERKLE_LAYOUT.rc + 1][pad_row] = Block128::from(0xCAFE_BABE_u128);
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    #[test]
+    fn hleaf_stark_padding_rc_tamper_rejected() {
+        use noid_air::{build_hleaf_trace, HLeafAir, HLEAF_LAYOUT_B};
+        use noid_poseidon2b::native::permutation::N_ROUNDS;
+        let air = HLeafAir::new();
+        let fields = [
+            Block128::from(0x11u128),
+            Block128::from(0x22u128),
+            Block128::from(0x33u128),
+            Block128::from(0x44u128),
+        ];
+        let mut cols = build_hleaf_trace(fields);
+        cols[HLEAF_LAYOUT_B.rc + 3][N_ROUNDS + 7] = Block128::from(0xC0DE_FEEDu128);
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
     #[test]
     fn public_column_multi_column_enforced() {
         // Two pinned programme columns; tamper the second, verifier
@@ -3243,6 +3608,214 @@ mod tx_body_merkle_stark_tests {
             let mut bad_b = prog_b;
             bad_b[0] = bad_b[0] + Block128::ONE;
             let trace = Trace::new(vec![col0, prog_a, bad_b]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+    }
+
+    // =====================================================================
+    // Stage 3d-0.5 — RowSelectorGate primitive (STARK-level)
+    // =====================================================================
+
+    #[test]
+    fn row_selector_honest_accept_and_tamper_reject() {
+        // End-to-end STARK check of a "pin target_col[row] == constant"
+        // row-selector tie: honest trace verifies; tampering the pinned
+        // cell produces a rejecting verifier. Exercises the same code
+        // path that §3d-0.6..0.10 boundary ties will exercise per tie.
+        use noid_air::{emit_public_cell, BoolGate, CompositeAir, Constraint};
+
+        let log_rows = 4;
+        let n = 1usize << log_rows;
+        let target_row = 5;
+        let constant = Block128::from(0xFEED_FACEu128);
+
+        // Cols: [0] indicator programme (pinned), [1] target (witness),
+        //       [2] ordinary bool witness so we always have a non-empty
+        //       constraint system on every row.
+        let (pc, gate) = emit_public_cell(0, target_row, n, 1, constant);
+        let constraints: Vec<Box<dyn Constraint>> = vec![gate, Box::new(BoolGate::new(2))];
+        let air = CompositeAir::from_parts_with_publics(log_rows, 3, constraints, vec![pc]);
+
+        let indicator = {
+            let mut v = vec![Block128::ZERO; n];
+            v[target_row] = Block128::ONE;
+            v
+        };
+        let bool_col: Vec<Block128> = (0..n)
+            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .collect();
+
+        // Honest: target row carries `constant`, other rows free.
+        {
+            let mut target = vec![Block128::ZERO; n];
+            target[target_row] = constant;
+            target[0] = Block128::from(0xDEADu128);
+            target[n - 1] = Block128::from(0xBEEFu128);
+            let trace = Trace::new(vec![indicator.clone(), target, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper the pinned cell: verifier rejects.
+        {
+            let mut target = vec![Block128::ZERO; n];
+            target[target_row] = constant + Block128::ONE;
+            let trace = Trace::new(vec![indicator.clone(), target, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper the indicator column to fire on the wrong row — the
+        // programme MLE re-eval rejects even before the selector fires.
+        {
+            let mut bad_indicator = vec![Block128::ZERO; n];
+            bad_indicator[target_row + 1] = Block128::ONE;
+            let mut target = vec![Block128::ZERO; n];
+            target[target_row] = constant;
+            let trace = Trace::new(vec![bad_indicator, target, bool_col]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+    }
+
+    #[test]
+    fn column_eq_at_row_honest_accept_and_tamper_reject() {
+        // §3d-0.6b / §3d-0.9 cross-column, same-row equality primitive.
+        // `emit_column_eq_at_row` pins `col_a@row == col_b@row` via a
+        // shared row-indicator programme. Honest traces verify; tampers
+        // that break the equality on the pinned row, or shift the
+        // indicator off-schedule, both reject at the verifier.
+        use noid_air::{emit_column_eq_at_row, BoolGate, CompositeAir, Constraint};
+
+        let log_rows = 4;
+        let n = 1usize << log_rows;
+        let target_row = 9;
+
+        // Cols: [0] indicator, [1] col_a, [2] col_b, [3] filler bool.
+        let (pc, gate) = emit_column_eq_at_row(0, target_row, n, 1, 2);
+        let constraints: Vec<Box<dyn Constraint>> = vec![gate, Box::new(BoolGate::new(3))];
+        let air = CompositeAir::from_parts_with_publics(log_rows, 4, constraints, vec![pc]);
+
+        let indicator = {
+            let mut v = vec![Block128::ZERO; n];
+            v[target_row] = Block128::ONE;
+            v
+        };
+        let bool_col: Vec<Block128> = (0..n)
+            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .collect();
+
+        // Honest: col_a and col_b agree on `target_row`, disagree freely
+        // elsewhere (selector suppresses non-target rows).
+        {
+            let mut col_a = vec![Block128::ZERO; n];
+            let mut col_b = vec![Block128::ZERO; n];
+            col_a[0] = Block128::from(0x1111u128);
+            col_b[0] = Block128::from(0x9999u128);
+            col_a[target_row] = Block128::from(0xCAFE_F00Du128);
+            col_b[target_row] = Block128::from(0xCAFE_F00Du128);
+            let trace = Trace::new(vec![indicator.clone(), col_a, col_b, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper — two cells disagree on the pinned row.
+        {
+            let mut col_a = vec![Block128::ZERO; n];
+            let mut col_b = vec![Block128::ZERO; n];
+            col_a[target_row] = Block128::from(0xCAFE_F00Du128);
+            col_b[target_row] = Block128::from(0xCAFE_F00Du128) + Block128::ONE;
+            let trace = Trace::new(vec![indicator.clone(), col_a, col_b, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper the indicator — programme MLE re-eval rejects.
+        {
+            let mut bad_indicator = vec![Block128::ZERO; n];
+            bad_indicator[target_row - 1] = Block128::ONE;
+            let col_a = vec![Block128::ZERO; n];
+            let col_b = vec![Block128::ZERO; n];
+            let trace = Trace::new(vec![bad_indicator, col_a, col_b, bool_col]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+    }
+
+    #[test]
+    fn column_eq_at_next_row_honest_accept_and_tamper_reject() {
+        // §3d-0.5.2 off-by-one cross-row equality primitive. Pins
+        // `col_a@row == col_b@row+1` through the base `Air`'s cyclic
+        // rotation. End-to-end STARK round-trip confirms the zero-check
+        // composition handles a gate with `next`-slot reads combined
+        // with a `PublicColumn` indicator.
+        use noid_air::{emit_column_eq_at_next_row, BoolGate, CompositeAir, Constraint};
+
+        // log_rows must clear the VSHIFT floor (TAU+1) because this gate
+        // opts into rotation via `shifted_columns`.
+        let log_rows = padded_log_len(0);
+        let n = 1usize << log_rows;
+        let target_row = 5;
+
+        // Cols: [0] indicator, [1] col_a (read local), [2] col_b (read next),
+        // [3] filler bool.
+        let (pc, gate) = emit_column_eq_at_next_row(0, target_row, n, 1, 2);
+        let constraints: Vec<Box<dyn Constraint>> = vec![gate, Box::new(BoolGate::new(3))];
+        let air = CompositeAir::from_parts_with_publics(log_rows, 4, constraints, vec![pc]);
+
+        let indicator = {
+            let mut v = vec![Block128::ZERO; n];
+            v[target_row] = Block128::ONE;
+            v
+        };
+        let bool_col: Vec<Block128> = (0..n)
+            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .collect();
+
+        // Honest: col_a[target_row] == col_b[target_row + 1].
+        {
+            let shared = Block128::from(0x1234_5678u128);
+            let mut col_a = vec![Block128::ZERO; n];
+            let mut col_b = vec![Block128::ZERO; n];
+            col_a[target_row] = shared;
+            col_b[target_row + 1] = shared;
+            // Other cells free.
+            col_a[0] = Block128::from(0xAAu128);
+            col_b[0] = Block128::from(0xBBu128);
+            let trace = Trace::new(vec![indicator.clone(), col_a, col_b, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air(&air, &trace, &pi).expect("prove");
+            verify_air(&air, &pi, &proof).expect("verify");
+        }
+
+        // Tamper — col_b on the adjacent row disagrees.
+        {
+            let shared = Block128::from(0x1234_5678u128);
+            let mut col_a = vec![Block128::ZERO; n];
+            let mut col_b = vec![Block128::ZERO; n];
+            col_a[target_row] = shared;
+            col_b[target_row + 1] = shared + Block128::ONE;
+            let trace = Trace::new(vec![indicator.clone(), col_a, col_b, bool_col.clone()]);
+            let pi = mk_pi();
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(verify_air(&air, &pi, &proof).is_err());
+        }
+
+        // Tamper the indicator — programme MLE re-eval rejects.
+        {
+            let mut bad_indicator = vec![Block128::ZERO; n];
+            bad_indicator[target_row + 2] = Block128::ONE;
+            let col_a = vec![Block128::ZERO; n];
+            let col_b = vec![Block128::ZERO; n];
+            let trace = Trace::new(vec![bad_indicator, col_a, col_b, bool_col]);
             let pi = mk_pi();
             let proof = prove_air_unchecked(&air, &trace, &pi);
             assert!(verify_air(&air, &pi, &proof).is_err());
