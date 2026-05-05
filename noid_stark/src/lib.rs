@@ -199,8 +199,11 @@ fn fold_highest<F: TowerField>(table: &mut Vec<F>, r: F) {
 /// polynomial is sampled at integer points `0, 1, 2, …, degree`, so
 /// `s ∈ {0, 1}` always fire) and avoiding the `s · (…)` multiplication
 /// removes most of the per-round Block128 arithmetic on packable
-/// columns. This is a local algebraic identity: outputs are
-/// bit-identical to the general branch, so soundness is unaffected.
+/// columns. The general branch allocates the output with an exact
+/// `with_capacity(half)` so `push` never grows-and-copies — this is
+/// the same allocation pattern the prover used before Upgrade-1.1
+/// attempted a scratch pool (the pool variant lost the outer
+/// parallelism across sample points and regressed every AIR; reverted).
 #[inline]
 fn partial_eval_highest(table: &[Block128], s: Block128) -> Vec<Block128> {
     let half = table.len() / 2;
@@ -210,9 +213,88 @@ fn partial_eval_highest(table: &[Block128], s: Block128) -> Vec<Block128> {
     if s == Block128::ONE {
         return table[half..].to_vec();
     }
-    (0..half)
-        .map(|j| table[j] + s * (table[j + half] + table[j]))
-        .collect()
+    let mut out = Vec::with_capacity(half);
+    for j in 0..half {
+        out.push(table[j] + s * (table[j + half] + table[j]));
+    }
+    out
+}
+
+/// Upgrade-1.2 — Structure-of-Arrays view of the constraint list, built
+/// once per zero-check invocation and reused across every round × sample
+/// point. It collapses three sources of per-row overhead from the hot
+/// accumulation loop:
+///
+/// 1. `Box<dyn Constraint>::columns()` / `::shifted_columns()` virtual
+///    calls — now resolved once into flat `Vec<u32>` tables.
+/// 2. `shifted_slot[idx].expect(...)` per-row branches — pre-baked into
+///    absolute indices `n_base + slot` at compile time.
+/// 3. Separate `betas[k] * C_k` multiply per row — still needed, but the
+///    compile step lays `beta_k` into its own densely-packed `Vec`.
+///
+/// The `evaluate` call itself still goes through the trait object; the
+/// remaining virtual-dispatch cost is closed in Wave-2 (generated fused
+/// evaluator). `Constraint` implementations are untouched — every
+/// existing AIR keeps compiling.
+struct CompiledGates<'a> {
+    constraints: &'a [Box<dyn Constraint>],
+    /// For constraint `k`, `col_index_starts[k]..col_index_starts[k+1]`
+    /// slices `col_indices` to yield its local-row column indices.
+    col_indices: Vec<u32>,
+    col_index_starts: Vec<u32>,
+    /// For constraint `k`, `next_index_starts[k]..next_index_starts[k+1]`
+    /// slices `next_indices` to yield its shifted-row column indices,
+    /// already rewritten to absolute positions `n_base + slot`.
+    next_indices: Vec<u32>,
+    next_index_starts: Vec<u32>,
+    /// Maximum arity of `columns()` / `shifted_columns()` across all
+    /// constraints — sizes the per-thread scratch buffers so `push` can
+    /// never reallocate.
+    max_local_arity: usize,
+    max_next_arity: usize,
+}
+
+impl<'a> CompiledGates<'a> {
+    fn new(
+        constraints: &'a [Box<dyn Constraint>],
+        shifted_slot: &[Option<usize>],
+        n_base: usize,
+    ) -> Self {
+        let n = constraints.len();
+        let mut col_indices: Vec<u32> = Vec::new();
+        let mut col_index_starts: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut next_indices: Vec<u32> = Vec::new();
+        let mut next_index_starts: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut max_local_arity = 0usize;
+        let mut max_next_arity = 0usize;
+        col_index_starts.push(0);
+        next_index_starts.push(0);
+        for c in constraints {
+            let locals = c.columns();
+            max_local_arity = max_local_arity.max(locals.len());
+            for &idx in locals {
+                col_indices.push(idx as u32);
+            }
+            col_index_starts.push(col_indices.len() as u32);
+            let nexts = c.shifted_columns();
+            max_next_arity = max_next_arity.max(nexts.len());
+            for &idx in nexts {
+                let slot = shifted_slot[idx]
+                    .expect("shifted column must have a registered slot");
+                next_indices.push((n_base + slot) as u32);
+            }
+            next_index_starts.push(next_indices.len() as u32);
+        }
+        Self {
+            constraints,
+            col_indices,
+            col_index_starts,
+            next_indices,
+            next_index_starts,
+            max_local_arity,
+            max_next_arity,
+        }
+    }
 }
 
 /// Evaluate the per-row composition `eq · Σ β_j · C_j` given partial
@@ -221,41 +303,50 @@ fn partial_eval_highest(table: &[Block128], s: Block128) -> Vec<Block128> {
 ///
 /// The layout of `col_tables_at_s` is `[base cols..., rotated cols...]`
 /// where the rotated-column block is ordered by `shifted_slot`
-/// (`shifted_slot[col_id] = Some(slot)` for rotated columns). When a
-/// constraint reads `shifted_columns()[k] = col_id`, we feed it the
-/// rotated copy at index `n_base + shifted_slot[col_id].unwrap()`.
+/// (`shifted_slot[col_id] = Some(slot)` for rotated columns).
+/// `compiled.next_indices` has already been rewritten to absolute
+/// column indices (i.e. `n_base + slot` for each shifted read), so the
+/// hot loop is a plain indexed load.
 fn accumulate_sum(
     eq_at_s: &[Block128],
     col_tables_at_s: &[Vec<Block128>],
-    constraints: &[Box<dyn Constraint>],
+    compiled: &CompiledGates<'_>,
     betas: &[Block128],
-    shifted_slot: &[Option<usize>],
-    n_base: usize,
 ) -> Block128 {
     use rayon::prelude::*;
     let half = eq_at_s.len();
+    let n_constraints = compiled.constraints.len();
+    let local_cap = compiled.max_local_arity;
+    let next_cap = compiled.max_next_arity;
     (0..half)
         .into_par_iter()
         .map_init(
-            || (Vec::<Block128>::new(), Vec::<Block128>::new()),
+            || {
+                (
+                    Vec::<Block128>::with_capacity(local_cap),
+                    Vec::<Block128>::with_capacity(next_cap),
+                )
+            },
             |(local_scratch, next_scratch), j| {
                 let mut composition = Block128::ZERO;
-                for (k, c) in constraints.iter().enumerate() {
+                for k in 0..n_constraints {
+                    let lo_s = compiled.col_index_starts[k] as usize;
+                    let lo_e = compiled.col_index_starts[k + 1] as usize;
                     local_scratch.clear();
-                    for &idx in c.columns() {
-                        local_scratch.push(col_tables_at_s[idx][j]);
+                    for &idx in &compiled.col_indices[lo_s..lo_e] {
+                        local_scratch.push(col_tables_at_s[idx as usize][j]);
                     }
+                    let ne_s = compiled.next_index_starts[k] as usize;
+                    let ne_e = compiled.next_index_starts[k + 1] as usize;
                     next_scratch.clear();
-                    for &idx in c.shifted_columns() {
-                        let slot = shifted_slot[idx]
-                            .expect("shifted column must have a registered slot");
-                        next_scratch.push(col_tables_at_s[n_base + slot][j]);
+                    for &idx in &compiled.next_indices[ne_s..ne_e] {
+                        next_scratch.push(col_tables_at_s[idx as usize][j]);
                     }
                     let frame = EvalFrame {
                         local: local_scratch.as_slice(),
                         next: next_scratch.as_slice(),
                     };
-                    composition += betas[k] * c.evaluate(frame);
+                    composition += betas[k] * compiled.constraints[k].evaluate(frame);
                 }
                 eq_at_s[j] * composition
             },
@@ -278,6 +369,13 @@ fn prove_zero_check(
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
     let n = z.len();
     let n_points = degree + 1;
+    let n_cols = cols.len();
+
+    // Upgrade-1.2: compile-once SoA view of the constraint list. Lifts
+    // `columns()` / `shifted_columns()` virtual calls and the
+    // `shifted_slot[..].expect()` check out of the hot per-row loop.
+    let compiled = CompiledGates::new(constraints, shifted_slot, n_base);
+    let _ = n_cols;
 
     // Folded tables, one per column plus one for eq(z, ·).
     let mut cur_cols: Vec<Vec<Block128>> = cols.to_vec();
@@ -287,11 +385,11 @@ fn prove_zero_check(
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
 
     for _ in 0..n {
-        // Build round polynomial evaluations at 0, 1, 2, …, degree.
-        // The `n_points` sample points are independent; at each `s`
-        // we do one `partial_eval_highest` per column + one for eq,
-        // then an `accumulate_sum` over the remaining hypercube.
-        // Evaluate them in parallel across sample points.
+        // Build round polynomial evaluations at 0, 1, 2, …, degree in
+        // parallel across the `n_points` sample points. Each task has
+        // its own transient scratch `Vec`s; `partial_eval_highest`
+        // allocates these via `with_capacity(half)` so there is no
+        // grow-on-push traffic inside the hot `accumulate_sum` either.
         let evals: Vec<Block128> = {
             use rayon::prelude::*;
             (0..n_points)
@@ -303,14 +401,7 @@ fn prove_zero_check(
                         .iter()
                         .map(|c| partial_eval_highest(c, s))
                         .collect();
-                    accumulate_sum(
-                        &eq_at_s,
-                        &cols_at_s,
-                        constraints,
-                        betas,
-                        shifted_slot,
-                        n_base,
-                    )
+                    accumulate_sum(&eq_at_s, &cols_at_s, &compiled, betas)
                 })
                 .collect()
         };
@@ -2844,14 +2935,19 @@ mod poseidon_perm_stark_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3c-2.8 — HAddrAir STARK integration tests (interior-only)
+// Stage 3d-0.6b — HAddrAir STARK integration tests (full boundary ties)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod haddr_stark_tests {
     use super::*;
-    use noid_air::{build_haddr_trace, Air, HAddrAir, Trace, HADDR_LAYOUT_A, HADDR_LAYOUT_B};
+    use noid_air::{
+        build_haddr_trace, extract_haddr_output, Air, HAddrAir, Trace, HADDR_B_SEED_ROW,
+        HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B, HADDR_OUTPUT_ROW,
+        HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
+    };
     use noid_core::Block128;
+    use noid_poseidon2b::native::permutation::N_ROUNDS;
     use noid_poseidon2b::primitives::TxBodyHash;
 
     fn mk_pi() -> PublicInputs {
@@ -2871,10 +2967,15 @@ mod haddr_stark_tests {
         ]
     }
 
+    fn expected_for(secret: [Block128; 2]) -> [Block128; 2] {
+        extract_haddr_output(&build_haddr_trace(secret))
+    }
+
     #[test]
     fn haddr_stark_honest_prove_verify() {
-        let air = HAddrAir::new();
-        let trace = air.build_trace(mk_secret(0xDECAF));
+        let secret = mk_secret(0xDECAF);
+        let air = HAddrAir::new(expected_for(secret));
+        let trace = air.build_trace(secret);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -2883,8 +2984,9 @@ mod haddr_stark_tests {
 
     #[test]
     fn haddr_stark_perm_a_sout_tamper_rejected() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xABCD));
+        let secret = mk_secret(0xABCD);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
         cols[HADDR_LAYOUT_A.sout + 2][1] = cols[HADDR_LAYOUT_A.sout + 2][1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
@@ -2894,9 +2996,11 @@ mod haddr_stark_tests {
 
     #[test]
     fn haddr_stark_perm_b_rc_tamper_rejected() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xFADE));
-        cols[HADDR_LAYOUT_B.rc][3] = cols[HADDR_LAYOUT_B.rc][3] + Block128::ONE;
+        let secret = mk_secret(0xFADE);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.rc][HADDR_B_SEED_ROW + 1] =
+            cols[HADDR_LAYOUT_B.rc][HADDR_B_SEED_ROW + 1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -2905,63 +3009,78 @@ mod haddr_stark_tests {
 
     #[test]
     fn haddr_stark_perm_b_partial_sin_kill_rejected() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xC0FFEE));
-        cols[HADDR_LAYOUT_B.sin + 1][5] = Block128::ONE;
+        let secret = mk_secret(0xC0FFEE);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.sin + 1][HADDR_B_SEED_ROW + 5] = Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
 
-    // -----------------------------------------------------------------
-    // Stage 3d-0.6a — output-squeeze boundary tie (STARK-level)
-    // -----------------------------------------------------------------
+    #[test]
+    fn haddr_stark_wrong_declared_addr_rejected() {
+        let secret = mk_secret(0xABAB_CAFE);
+        let mut wrong = expected_for(secret);
+        wrong[0] = wrong[0] + Block128::ONE;
+        let air = HAddrAir::new(wrong);
+        let trace = air.build_trace(secret);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
 
     #[test]
-    fn haddr_output_pin_stark_honest_and_tamper() {
-        use noid_air::{extract_haddr_output, HADDR_N_ROWS};
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
+    fn haddr_stark_output_cell_tamper_rejected() {
+        let secret = mk_secret(0xF00D_BABE);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] =
+            cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
 
-        let secret = mk_secret(0xABAB_CAFE);
-        let honest_cols = build_haddr_trace(secret);
-        let expected = extract_haddr_output(&honest_cols);
-        let air = HAddrAir::new_with_output_pin(expected);
+    #[test]
+    fn haddr_stark_iv_pin_tamper_rejected() {
+        let secret = mk_secret(0xDEAD_BEEF);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_PRE_S_A_BASE + 2][0] =
+            cols[HADDR_PRE_S_A_BASE + 2][0] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
 
-        // Honest round-trip.
-        {
-            let trace = air.build_trace_with_output_pin(secret);
-            assert!(air.check(&trace));
-            let pi = mk_pi();
-            let proof = prove_air(&air, &trace, &pi).expect("prove");
-            verify_air(&air, &pi, &proof).expect("verify");
-        }
+    #[test]
+    fn haddr_stark_inter_perm_carry_tamper_rejected() {
+        let secret = mk_secret(0xCAFE_F00D);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] =
+            cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
+    }
 
-        // Tamper the pinned output cell: verifier rejects.
-        {
-            let mut cols = build_haddr_trace(secret);
-            cols[HADDR_LAYOUT_B.s][N_ROUNDS] =
-                cols[HADDR_LAYOUT_B.s][N_ROUNDS] + Block128::ONE;
-            let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
-            indicator[N_ROUNDS] = Block128::ONE;
-            cols.push(indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
-
-        // Tamper the indicator column: public-column MLE mismatch rejects.
-        {
-            let mut cols = build_haddr_trace(secret);
-            let mut bad_indicator = vec![Block128::ZERO; HADDR_N_ROWS];
-            bad_indicator[N_ROUNDS + 2] = Block128::ONE; // wrong row
-            cols.push(bad_indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
+    #[test]
+    fn haddr_stark_tampered_indicator_rejected() {
+        let secret = mk_secret(0xBADC_0DE);
+        let air = HAddrAir::new(expected_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW] = Block128::ZERO;
+        cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW - 1] = Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
 
@@ -2973,7 +3092,8 @@ mod haddr_stark_tests {
 mod hauth_stark_tests {
     use super::*;
     use noid_air::{
-        build_hauth_trace, Air, HAuthAir, Trace, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C,
+        build_hauth_trace, extract_hauth_output, Air, HAuthAir, Trace, HAUTH_LAYOUT_A,
+        HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_OUTPUT_ROW,
     };
     use noid_core::Block128;
     use noid_poseidon2b::primitives::TxBodyHash;
@@ -2995,10 +3115,16 @@ mod hauth_stark_tests {
         ]
     }
 
+    fn expected_tag_for(secret: [Block128; 2], tx_body: [Block128; 2]) -> [Block128; 2] {
+        extract_hauth_output(&build_hauth_trace(secret, tx_body))
+    }
+
     #[test]
     fn hauth_stark_honest_prove_verify() {
-        let air = HAuthAir::new();
-        let trace = air.build_trace(mk_fields(0xCAFE), mk_fields(0xBABE));
+        let secret = mk_fields(0xCAFE);
+        let tx_body = mk_fields(0xBABE);
+        let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
+        let trace = air.build_trace(secret, tx_body);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -3007,8 +3133,10 @@ mod hauth_stark_tests {
 
     #[test]
     fn hauth_stark_perm_a_sout_tamper_rejected() {
-        let air = HAuthAir::new();
-        let mut cols = build_hauth_trace(mk_fields(1), mk_fields(2));
+        let secret = mk_fields(1);
+        let tx_body = mk_fields(2);
+        let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
+        let mut cols = build_hauth_trace(secret, tx_body);
         cols[HAUTH_LAYOUT_A.sout + 2][1] = cols[HAUTH_LAYOUT_A.sout + 2][1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
@@ -3018,9 +3146,13 @@ mod hauth_stark_tests {
 
     #[test]
     fn hauth_stark_perm_b_mds_tamper_rejected() {
-        let air = HAuthAir::new();
-        let mut cols = build_hauth_trace(mk_fields(3), mk_fields(4));
-        cols[HAUTH_LAYOUT_B.s + 1][3] = cols[HAUTH_LAYOUT_B.s + 1][3] + Block128::ONE;
+        use noid_air::HAUTH_B_SEED_ROW;
+        let secret = mk_fields(3);
+        let tx_body = mk_fields(4);
+        let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
+        let mut cols = build_hauth_trace(secret, tx_body);
+        cols[HAUTH_LAYOUT_B.s + 1][HAUTH_B_SEED_ROW + 3] =
+            cols[HAUTH_LAYOUT_B.s + 1][HAUTH_B_SEED_ROW + 3] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3029,9 +3161,13 @@ mod hauth_stark_tests {
 
     #[test]
     fn hauth_stark_perm_c_rc_tamper_rejected() {
-        let air = HAuthAir::new();
-        let mut cols = build_hauth_trace(mk_fields(5), mk_fields(6));
-        cols[HAUTH_LAYOUT_C.rc + 1][1] = cols[HAUTH_LAYOUT_C.rc + 1][1] + Block128::ONE;
+        use noid_air::HAUTH_C_SEED_ROW;
+        let secret = mk_fields(5);
+        let tx_body = mk_fields(6);
+        let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
+        let mut cols = build_hauth_trace(secret, tx_body);
+        cols[HAUTH_LAYOUT_C.rc + 1][HAUTH_C_SEED_ROW + 1] =
+            cols[HAUTH_LAYOUT_C.rc + 1][HAUTH_C_SEED_ROW + 1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3043,49 +3179,18 @@ mod hauth_stark_tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn hauth_output_pin_stark_honest_and_tamper() {
-        use noid_air::{extract_hauth_output, HAUTH_N_ROWS};
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
-
+    fn hauth_output_pin_stark_tampered_output_rejected() {
         let secret = mk_fields(0x1357);
-        let txbody = mk_fields(0x2468);
-        let honest = build_hauth_trace(secret, txbody);
-        let expected = extract_hauth_output(&honest);
-        let air = HAuthAir::new_with_output_pin(expected);
+        let tx_body = mk_fields(0x2468);
+        let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
 
-        {
-            let trace = air.build_trace_with_output_pin(secret, txbody);
-            assert!(air.check(&trace));
-            let pi = mk_pi();
-            let proof = prove_air(&air, &trace, &pi).expect("prove");
-            verify_air(&air, &pi, &proof).expect("verify");
-        }
-
-        // Tamper pinned output cell: rejected.
-        {
-            let mut cols = build_hauth_trace(secret, txbody);
-            cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] =
-                cols[HAUTH_LAYOUT_C.s + 1][N_ROUNDS] + Block128::ONE;
-            let mut indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
-            indicator[N_ROUNDS] = Block128::ONE;
-            cols.push(indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
-
-        // Tamper indicator column: rejected by public-column MLE.
-        {
-            let mut cols = build_hauth_trace(secret, txbody);
-            let mut bad_indicator = vec![Block128::ZERO; HAUTH_N_ROWS];
-            bad_indicator[N_ROUNDS - 2] = Block128::ONE;
-            cols.push(bad_indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
+        let mut cols = build_hauth_trace(secret, tx_body);
+        cols[HAUTH_LAYOUT_C.s + 1][HAUTH_OUTPUT_ROW] =
+            cols[HAUTH_LAYOUT_C.s + 1][HAUTH_OUTPUT_ROW] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
 
@@ -3097,7 +3202,8 @@ mod hauth_stark_tests {
 mod hleaf_stark_tests {
     use super::*;
     use noid_air::{
-        build_hleaf_trace, Air, HLeafAir, Trace, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C,
+        build_hleaf_trace, extract_hleaf_output, Air, HLeafAir, Trace, HLEAF_LAYOUT_A,
+        HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_OUTPUT_ROW,
     };
     use noid_core::Block128;
     use noid_poseidon2b::primitives::TxBodyHash;
@@ -3121,10 +3227,15 @@ mod hleaf_stark_tests {
         ]
     }
 
+    fn expected_leaf_for(fields: [Block128; 4]) -> [Block128; 2] {
+        extract_hleaf_output(&build_hleaf_trace(fields))
+    }
+
     #[test]
     fn hleaf_stark_honest_prove_verify() {
-        let air = HLeafAir::new();
-        let trace = air.build_trace(mk_fields4(0x1EAF));
+        let fields = mk_fields4(0x1EAF);
+        let air = HLeafAir::new(fields, expected_leaf_for(fields));
+        let trace = air.build_trace(fields);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -3133,8 +3244,9 @@ mod hleaf_stark_tests {
 
     #[test]
     fn hleaf_stark_perm_a_sout_tamper_rejected() {
-        let air = HLeafAir::new();
-        let mut cols = build_hleaf_trace(mk_fields4(1));
+        let fields = mk_fields4(1);
+        let air = HLeafAir::new(fields, expected_leaf_for(fields));
+        let mut cols = build_hleaf_trace(fields);
         cols[HLEAF_LAYOUT_A.sout + 2][1] = cols[HLEAF_LAYOUT_A.sout + 2][1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
@@ -3144,9 +3256,12 @@ mod hleaf_stark_tests {
 
     #[test]
     fn hleaf_stark_perm_b_mds_tamper_rejected() {
-        let air = HLeafAir::new();
-        let mut cols = build_hleaf_trace(mk_fields4(2));
-        cols[HLEAF_LAYOUT_B.s + 1][3] = cols[HLEAF_LAYOUT_B.s + 1][3] + Block128::ONE;
+        use noid_air::HLEAF_B_SEED_ROW;
+        let fields = mk_fields4(2);
+        let air = HLeafAir::new(fields, expected_leaf_for(fields));
+        let mut cols = build_hleaf_trace(fields);
+        cols[HLEAF_LAYOUT_B.s + 1][HLEAF_B_SEED_ROW + 3] =
+            cols[HLEAF_LAYOUT_B.s + 1][HLEAF_B_SEED_ROW + 3] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3155,9 +3270,12 @@ mod hleaf_stark_tests {
 
     #[test]
     fn hleaf_stark_perm_c_rc_tamper_rejected() {
-        let air = HLeafAir::new();
-        let mut cols = build_hleaf_trace(mk_fields4(3));
-        cols[HLEAF_LAYOUT_C.rc + 1][1] = cols[HLEAF_LAYOUT_C.rc + 1][1] + Block128::ONE;
+        use noid_air::HLEAF_C_SEED_ROW;
+        let fields = mk_fields4(3);
+        let air = HLeafAir::new(fields, expected_leaf_for(fields));
+        let mut cols = build_hleaf_trace(fields);
+        cols[HLEAF_LAYOUT_C.rc + 1][HLEAF_C_SEED_ROW + 1] =
+            cols[HLEAF_LAYOUT_C.rc + 1][HLEAF_C_SEED_ROW + 1] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3169,48 +3287,17 @@ mod hleaf_stark_tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn hleaf_output_pin_stark_honest_and_tamper() {
-        use noid_air::{extract_hleaf_output, HLEAF_N_ROWS};
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
-
+    fn hleaf_output_pin_stark_tampered_output_rejected() {
         let fields = mk_fields4(0xCAFE_FEED);
-        let honest = build_hleaf_trace(fields);
-        let expected = extract_hleaf_output(&honest);
-        let air = HLeafAir::new_with_output_pin(expected);
+        let air = HLeafAir::new(fields, expected_leaf_for(fields));
 
-        {
-            let trace = air.build_trace_with_output_pin(fields);
-            assert!(air.check(&trace));
-            let pi = mk_pi();
-            let proof = prove_air(&air, &trace, &pi).expect("prove");
-            verify_air(&air, &pi, &proof).expect("verify");
-        }
-
-        // Tamper pinned output cell.
-        {
-            let mut cols = build_hleaf_trace(fields);
-            cols[HLEAF_LAYOUT_C.s][N_ROUNDS] =
-                cols[HLEAF_LAYOUT_C.s][N_ROUNDS] + Block128::ONE;
-            let mut indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
-            indicator[N_ROUNDS] = Block128::ONE;
-            cols.push(indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
-
-        // Tamper indicator column.
-        {
-            let mut cols = build_hleaf_trace(fields);
-            let mut bad_indicator = vec![Block128::ZERO; HLEAF_N_ROWS];
-            bad_indicator[N_ROUNDS + 5] = Block128::ONE;
-            cols.push(bad_indicator);
-            let trace = Trace::new(cols);
-            let pi = mk_pi();
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(verify_air(&air, &pi, &proof).is_err());
-        }
+        let mut cols = build_hleaf_trace(fields);
+        cols[HLEAF_LAYOUT_C.s][HLEAF_OUTPUT_ROW] =
+            cols[HLEAF_LAYOUT_C.s][HLEAF_OUTPUT_ROW] + Block128::ONE;
+        let trace = Trace::new(cols);
+        let pi = mk_pi();
+        let proof = prove_air_unchecked(&air, &trace, &pi);
+        assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
 
@@ -3290,6 +3377,78 @@ mod tx_body_merkle_stark_tests {
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
+    }
+
+    // =====================================================================
+    // §3d-0.9.F — STARK round-trip forgery tests for §3d-0.9.E.4.c
+    // leaf rate-lane absorb. The honest round-trip
+    // (`tx_body_merkle_honest_prove_verify`) already covers the +32 new
+    // gates and the payload witness block; these tamper tests exercise
+    // the verifier path via `prove_air_unchecked` so a bug in the absorb
+    // gate or the payload-column wiring cannot slip past STARK verify.
+    // =====================================================================
+
+    #[test]
+    fn tx_body_merkle_stark_rejects_leaf_rate_pre_s_tamper() {
+        // Flip pre_s[0] on every leaf non-head row-0. The 3-term absorb
+        // gate `pre_s + echo_prev_out + payload == 0` must make the
+        // STARK verifier reject every such forgery.
+        use noid_air::{
+            build_instance_layout, build_tx_body_merkle_trace, leaf_rate_absorb_instance_ids,
+            TxBodyMerkleAir, TXBODY_MERKLE_PRE_S_BASE,
+        };
+        let air = TxBodyMerkleAir::new();
+        let pi = mk_pi();
+        let layout = build_instance_layout();
+        let ids = leaf_rate_absorb_instance_ids(&layout);
+        assert_eq!(ids.len(), 16);
+        // Sample a representative: first input-leaf PermB, first output-
+        // leaf PermB, and the last id. Covering all 16 in a STARK round
+        // trip would blow test runtime; the native tamper matrix in
+        // noid_air already covers the full 16 × 2 fan-out.
+        let sample: [usize; 3] = [ids[0], ids[4], *ids.last().unwrap()];
+        for &id in &sample {
+            let mut cols = build_tx_body_merkle_trace(&mk_batch());
+            let row = instance_row_offset(id);
+            cols[TXBODY_MERKLE_PRE_S_BASE][row] =
+                cols[TXBODY_MERKLE_PRE_S_BASE][row] + Block128::ONE;
+            let trace = Trace::new(cols);
+            let proof = prove_air_unchecked(&air, &trace, &pi);
+            assert!(
+                verify_air(&air, &pi, &proof).is_err(),
+                "E.4.c pre_s tamper on leaf non-head instance {id} must be rejected by STARK",
+            );
+        }
+    }
+
+    #[test]
+    fn tx_body_merkle_stark_rejects_leaf_rate_payload_tamper() {
+        // Flipping a payload witness column on a leaf non-head row-0 is
+        // symmetric (same gate, other term). Covers the cross-check that
+        // payload columns are committed and bound by the E.4.c gate.
+        use noid_air::{
+            build_instance_layout, build_tx_body_merkle_trace, leaf_rate_absorb_instance_ids,
+            leaf_rate_payload_col, TxBodyMerkleAir,
+        };
+        let air = TxBodyMerkleAir::new();
+        let pi = mk_pi();
+        let layout = build_instance_layout();
+        let ids = leaf_rate_absorb_instance_ids(&layout);
+        // Sample slot 0, slot 7 (middle of output leaves), slot 15 (last).
+        for slot in [0usize, 7, 15] {
+            for lane in 0..2 {
+                let mut cols = build_tx_body_merkle_trace(&mk_batch());
+                let row = instance_row_offset(ids[slot]);
+                let col = leaf_rate_payload_col(slot, lane);
+                cols[col][row] = cols[col][row] + Block128::ONE;
+                let trace = Trace::new(cols);
+                let proof = prove_air_unchecked(&air, &trace, &pi);
+                assert!(
+                    verify_air(&air, &pi, &proof).is_err(),
+                    "E.4.c payload tamper slot {slot} lane {lane} must be rejected by STARK",
+                );
+            }
+        }
     }
 
     // =====================================================================
@@ -3502,12 +3661,15 @@ mod tx_body_merkle_stark_tests {
         // Case B for HAddrAir: tamper `rc` on a padding row where every
         // constraint selector is suppressed. Only the 3d-0.4 public-
         // column declaration + 3d-0.2 verifier MLE re-eval close this.
-        use noid_air::{build_haddr_trace, HAddrAir, HADDR_LAYOUT_B};
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
-        let air = HAddrAir::new();
+        use noid_air::{
+            build_haddr_trace, extract_haddr_output, HAddrAir, HADDR_LAYOUT_B, HADDR_OUTPUT_ROW,
+        };
         let secret = [Block128::from(0xA5u128), Block128::from(0x5Au128)];
+        let expected = extract_haddr_output(&build_haddr_trace(secret));
+        let air = HAddrAir::new(expected);
         let mut cols = build_haddr_trace(secret);
-        cols[HADDR_LAYOUT_B.rc + 2][N_ROUNDS + 3] = Block128::from(0x1234_5678u128);
+        // Tamper `rc` on a trace-padding row (row past block B's output).
+        cols[HADDR_LAYOUT_B.rc + 2][HADDR_OUTPUT_ROW + 3] = Block128::from(0x1234_5678u128);
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3516,11 +3678,14 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn hauth_stark_padding_rc_tamper_rejected() {
-        use noid_air::{build_hauth_trace, HAuthAir, HAUTH_LAYOUT_C};
+        use noid_air::{
+            build_hauth_trace, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_C,
+        };
         use noid_poseidon2b::native::permutation::N_ROUNDS;
-        let air = HAuthAir::new();
         let secret = [Block128::from(1u128), Block128::from(2u128)];
         let tx_body = [Block128::from(3u128), Block128::from(4u128)];
+        let expected = extract_hauth_output(&build_hauth_trace(secret, tx_body));
+        let air = HAuthAir::new(tx_body, expected);
         let mut cols = build_hauth_trace(secret, tx_body);
         cols[HAUTH_LAYOUT_C.rc + 0][N_ROUNDS + 5] = Block128::from(0xDEAD_BEEFu128);
         let trace = Trace::new(cols);
@@ -3560,15 +3725,18 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn hleaf_stark_padding_rc_tamper_rejected() {
-        use noid_air::{build_hleaf_trace, HLeafAir, HLEAF_LAYOUT_B};
+        use noid_air::{
+            build_hleaf_trace, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_B,
+        };
         use noid_poseidon2b::native::permutation::N_ROUNDS;
-        let air = HLeafAir::new();
         let fields = [
             Block128::from(0x11u128),
             Block128::from(0x22u128),
             Block128::from(0x33u128),
             Block128::from(0x44u128),
         ];
+        let expected = extract_hleaf_output(&build_hleaf_trace(fields));
+        let air = HLeafAir::new(fields, expected);
         let mut cols = build_hleaf_trace(fields);
         cols[HLEAF_LAYOUT_B.rc + 3][N_ROUNDS + 7] = Block128::from(0xC0DE_FEEDu128);
         let trace = Trace::new(cols);

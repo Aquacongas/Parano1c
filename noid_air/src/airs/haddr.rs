@@ -1,70 +1,103 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 3c-2 — `HAddrAir` (2-field sponge, `derive_address`).
+//! Stage 3d-0.6b — `HAddrAir`: two-permutation sponge for
+//! `derive_address(secret)` with all four boundary ties installed
+//! (capacity IV, absorb XOR, inter-permutation carry, output squeeze).
 //!
-//! Witnesses the native `noid_poseidon2b::primitives::derive_address`
-//! pipeline:
+//! # Privacy invariant
 //!
-//! ```text
-//! state = [0, 0, capacity_iv(TAG_ADDRESS)]   // IV seed
-//! state[0] ^= secret_hi; state[1] ^= secret_lo
-//! Poseidon2bPermutation.permute_mut(&mut state)   // perm #1 (absorb)
-//! state[0] ^= PAD_0; state[1] ^= PAD_1
-//! Poseidon2bPermutation.permute_mut(&mut state)   // perm #2 (padding flush)
-//! output = state[0] || state[1]
-//! ```
+//! `SpendSecret` is a **private witness** — known only to the prover
+//! (the wallet). The verifier sees only the commitment to the trace
+//! columns plus the public inputs (prev_state_root, new_state_root,
+//! tx_body_hash, fee). No secret-derived value ever lands in a
+//! `PublicColumn` or any verifier-reconstructable pin.
 //!
-//! Column layout (60 cols = 2 × [`POSEIDON_PERM_N_COLS`]):
+//! # Trace layout
 //!
-//! - Block A (cols `0..30`)  — `PermLayout::at(0)` — first permutation,
-//!   row 0 state seeded with `[secret_hi, secret_lo, IV_hi, IV_lo]`.
-//! - Block B (cols `30..60`) — `PermLayout::at(30)` — second permutation,
-//!   row 0 state seeded with `[A.s0@N_ROUNDS + PAD_0, A.s1@N_ROUNDS + PAD_1,
-//!   A.s2@N_ROUNDS, A.s3@N_ROUNDS]`.
+//! `HADDR_N_COLS = 71`, `HADDR_N_ROWS = 2^POSEIDON_PERM_LOG_ROWS = 256`.
 //!
-//! Constraints emitted at this stage: `2 × emit_perm_all_at = 58` gates.
-//! These lock the two permutation interiors. Boundary ties
-//! (capacity-IV binding, absorb XOR at row 0, inter-permutation carry,
-//! output squeeze binding) are **not** yet constrained — see §3d.
+//! | cols   | contents                                                  |
+//! |--------|-----------------------------------------------------------|
+//! | 0..30  | Block A permutation, rows `0..=N_ROUNDS`                  |
+//! | 30..60 | Block B permutation, rows `N_ROUNDS+1..=2*N_ROUNDS+1`     |
+//! | 60..64 | `pre_s_A[0..4]` — pre-MDS seed for block A at row 0 only  |
+//! | 64..68 | `pre_s_B[0..4]` — pre-MDS seed for block B at row N_ROUNDS|
+//! | 68     | `ind_row_0`       — `1` at row 0, else 0                  |
+//! | 69     | `ind_row_N_ROUNDS`— `1` at row N_ROUNDS, else 0           |
+//! | 70     | `ind_row_output`  — `1` at row 2*N_ROUNDS+1, else 0       |
 //!
-//! # Debt deferred to §3d
+//! Row 0 of `pre_s_A` carries `[secret_hi, secret_lo, IV_hi, IV_lo]`.
+//! Lanes 2 and 3 (the IV lanes) are pinned to the public domain-
+//! separation constants via `emit_public_cell`; lanes 0 and 1 (the
+//! secret) are pure witness — no public pin.
 //!
-//! The AIR constraint system is row-local (no row-index selector).
-//! Enforcing "row-0 state = IV", "Block-B row-0 state = post-perm-A
-//! state XOR padding" and "Block-B row-N_ROUNDS state = `(addr_hi,
-//! addr_lo)`" all need a `RowSelectorGate` / `ConstColumnGate` that
-//! the §3d debt block tracks. In the interim, `build_haddr_trace`
-//! produces an honest witness matching the native primitive and the
-//! prover is trusted to pin boundaries. This is identical to how
-//! `PoseidonPermAir` (3c-1) currently treats `rc` / `is_full` /
-//! `is_round` — trusted-input until §3d.
+//! Row `N_ROUNDS` of `pre_s_B` carries
+//! `[A.s[0]@N_ROUNDS + PAD_0, A.s[1]@N_ROUNDS + PAD_1,
+//!   A.s[2]@N_ROUNDS, A.s[3]@N_ROUNDS]` — the padding-flushed state
+//! that seeds block B's permutation.
+//!
+//! # Boundary ties
+//!
+//! 1. **Capacity IV (public)** — `pre_s_A[2]@0 == IV_hi`,
+//!    `pre_s_A[3]@0 == IV_lo`. Both pinned via `emit_public_cell`.
+//! 2. **Absorb XOR (witness)** — no public pin. Secret lanes
+//!    `pre_s_A[0..2]@0` are witness cells. Their value is constrained
+//!    only through the MDS gate into `s_A[..]@0`, the block-A interior
+//!    gates, the inter-permutation carry (tie 3), the MDS-B gate, the
+//!    block-B interior gates, and the output squeeze (tie 4). A
+//!    prover that tampers the secret produces a mismatched
+//!    `(addr_hi, addr_lo)` and is caught by tie 4.
+//! 3. **MDS-A (row 0)** — `s_A[lane]@0 == Σ MDS_FULL[lane][j] ·
+//!    pre_s_A[j]@0` for every lane, gated by `ind_row_0`.
+//! 4. **Inter-permutation carry (row N_ROUNDS)** —
+//!    `A.s[lane]@N_ROUNDS + pre_s_B[lane]@N_ROUNDS + PAD_lane == 0`
+//!    for every lane, gated by `ind_row_N_ROUNDS`.
+//!    `PAD_lane ∈ {PAD_0, PAD_1, 0, 0}`.
+//! 5. **MDS-B (row N_ROUNDS → N_ROUNDS+1)** —
+//!    `s_B[lane]@(N_ROUNDS+1) == Σ MDS_FULL[lane][j] ·
+//!    pre_s_B[j]@N_ROUNDS` via `WeightedLinearGateShifted`, gated by
+//!    `ind_row_N_ROUNDS`.
+//! 6. **Output squeeze (public)** — `s_B[0]@(2*N_ROUNDS+1) ==
+//!    addr_hi`, `s_B[1]@(2*N_ROUNDS+1) == addr_lo`. Pinned via
+//!    `emit_public_cell`.
 
 use crate::airs::poseidon_perm::{
-    emit_perm_public_columns_at, write_perm_trace_at, PermLayout, POSEIDON_PERM_LOG_ROWS,
-    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
+    is_full_round, write_perm_trace_at, write_perm_trace_at_offset, PermLayout,
+    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
-use crate::gates::{emit_public_cell, PublicColumn};
+use crate::gates::row_selector::row_indicator_programme;
+use crate::gates::{
+    PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted,
+};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRESS};
-use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
+use noid_poseidon2b::native::permutation::{
+    MDS_FULL, N_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
+};
 
-/// Column offset of the first (absorb) permutation block.
+// ---------------------------------------------------------------------------
+// Layout constants
+// ---------------------------------------------------------------------------
+
+/// Column offset of the block-A permutation.
 pub const HADDR_PERM_A_BASE: usize = 0;
-/// Column offset of the second (padding flush) permutation block.
+/// Column offset of the block-B permutation.
 pub const HADDR_PERM_B_BASE: usize = POSEIDON_PERM_N_COLS;
-/// Total column count (interior-only construction).
-pub const HADDR_N_COLS: usize = 2 * POSEIDON_PERM_N_COLS;
-
-/// Output-squeeze indicator column (only used by the §3d-0.6a
-/// boundary-pinned construction). Holds `1` at row `N_ROUNDS` and `0`
-/// everywhere else — the row where the sponge output is read.
-pub const HADDR_OUTPUT_INDICATOR_COL: usize = HADDR_N_COLS;
-/// Total column count when the output-squeeze binding is enabled.
-pub const HADDR_N_COLS_PINNED: usize = HADDR_N_COLS + 1;
-/// Trace row count must accommodate one permutation (both blocks
-/// occupy the same row range; they differ in column, not row).
+/// Column offset of the block-A pre-MDS seed (`pre_s_A[0..4]`).
+pub const HADDR_PRE_S_A_BASE: usize = 2 * POSEIDON_PERM_N_COLS;
+/// Column offset of the block-B pre-MDS seed (`pre_s_B[0..4]`).
+pub const HADDR_PRE_S_B_BASE: usize = HADDR_PRE_S_A_BASE + STATE_SIZE;
+/// Indicator column: `1` at row 0, `0` elsewhere.
+pub const HADDR_IND_ROW_0: usize = HADDR_PRE_S_B_BASE + STATE_SIZE;
+/// Indicator column: `1` at row `N_ROUNDS`, `0` elsewhere.
+pub const HADDR_IND_ROW_N_ROUNDS: usize = HADDR_IND_ROW_0 + 1;
+/// Indicator column: `1` at row `2*N_ROUNDS+1`, `0` elsewhere.
+pub const HADDR_IND_ROW_OUTPUT: usize = HADDR_IND_ROW_N_ROUNDS + 1;
+/// Total column count.
+pub const HADDR_N_COLS: usize = HADDR_IND_ROW_OUTPUT + 1;
+/// Trace row count.
 pub const HADDR_LOG_ROWS: usize = POSEIDON_PERM_LOG_ROWS;
 pub const HADDR_N_ROWS: usize = POSEIDON_PERM_N_ROWS;
 
@@ -72,22 +105,70 @@ pub const HADDR_N_ROWS: usize = POSEIDON_PERM_N_ROWS;
 pub const HADDR_LAYOUT_A: PermLayout = PermLayout::at(HADDR_PERM_A_BASE);
 pub const HADDR_LAYOUT_B: PermLayout = PermLayout::at(HADDR_PERM_B_BASE);
 
-/// Native padding field elements produced by the sponge's
-/// `fill_padding` routine when only `absorb_pair(secret_hi,
-/// secret_lo)` has been called and no raw-byte `update` follows:
-/// after that absorb, `filled_bytes == 0` so the full 32-byte buffer
-/// is zero-padded and `fill_padding` stamps `0x80` at byte 0 and
-/// `0x01` at byte 31.
-///
-/// The sponge splits the 32-byte buffer into two little-endian
-/// `Block128` rate words:
-/// - `PAD_0 = u128::from_le_bytes([0x80, 0, .., 0])           = 0x80`
-/// - `PAD_1 = u128::from_le_bytes([0, 0, .., 0, 0x01])        = 0x01 << 120`
-///
-/// Verified against `Poseidon2bSponge::finalize` in
-/// `native::compression.rs`.
+/// Row at which block B's post-MDS state `s[lane]@row` lives
+/// (block B's row-0 in local coordinates).
+pub const HADDR_B_SEED_ROW: usize = N_ROUNDS + 1;
+/// Row at which block B's permutation output lives.
+pub const HADDR_OUTPUT_ROW: usize = 2 * N_ROUNDS + 1;
+
+/// Padding constants from the sponge's `fill_padding` routine after a
+/// single `absorb_pair(secret_hi, secret_lo)` with no further updates:
+/// `0x80` at byte 0 and `0x01` at byte 31 of the 32-byte rate buffer.
 pub const HADDR_PAD_0: u128 = 0x80;
 pub const HADDR_PAD_1: u128 = 0x01u128 << 120;
+
+// ---------------------------------------------------------------------------
+// Programme-column helpers for the two permutation blocks
+// ---------------------------------------------------------------------------
+
+fn haddr_is_full_values(row_offset: usize) -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; HADDR_N_ROWS];
+    for r in 0..N_ROUNDS {
+        if is_full_round(r) {
+            out[row_offset + r] = Block128::ONE;
+        }
+    }
+    out
+}
+
+fn haddr_is_round_values(row_offset: usize) -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; HADDR_N_ROWS];
+    for r in 0..N_ROUNDS {
+        out[row_offset + r] = Block128::ONE;
+    }
+    out
+}
+
+fn haddr_rc_values(lane: usize, row_offset: usize) -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; HADDR_N_ROWS];
+    for r in 0..N_ROUNDS {
+        out[row_offset + r] = Block128::from(ROUND_CONSTANTS[lane][r]);
+    }
+    out
+}
+
+fn emit_perm_publics_offset(layout: PermLayout, row_offset: usize) -> Vec<PublicColumn> {
+    let mut out = Vec::with_capacity(STATE_SIZE + 2);
+    out.push(PublicColumn::new(
+        layout.is_full,
+        haddr_is_full_values(row_offset),
+    ));
+    out.push(PublicColumn::new(
+        layout.is_round,
+        haddr_is_round_values(row_offset),
+    ));
+    for lane in 0..STATE_SIZE {
+        out.push(PublicColumn::new(
+            layout.rc + lane,
+            haddr_rc_values(lane, row_offset),
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Trace builder
+// ---------------------------------------------------------------------------
 
 /// Build an honest witness trace for `derive_address(secret)`.
 ///
@@ -98,13 +179,14 @@ pub fn build_haddr_trace(secret: [Block128; 2]) -> Vec<Vec<Block128>> {
         .map(|_| vec![Block128::ZERO; HADDR_N_ROWS])
         .collect();
 
-    // Perm A: absorb. state = [secret_hi, secret_lo, IV_hi, IV_lo].
     let [iv_hi, iv_lo] = capacity_iv(TAG_ADDRESS);
+
+    // Block A — absorb. Pre-MDS seed = [secret_hi, secret_lo, IV_hi, IV_lo].
     let perm_a_input: [Block128; STATE_SIZE] = [secret[0], secret[1], iv_hi, iv_lo];
     let state_after_a = write_perm_trace_at(&mut cols, HADDR_LAYOUT_A, perm_a_input);
 
-    // Perm B: padding flush. state = [A.out[0] + PAD_0, A.out[1] +
-    // PAD_1, A.out[2], A.out[3]].
+    // Block B — padding flush. Pre-MDS seed at row N_ROUNDS, permutation
+    // at rows N_ROUNDS+1..=2*N_ROUNDS+1.
     let pad0 = Block128::from(HADDR_PAD_0);
     let pad1 = Block128::from(HADDR_PAD_1);
     let perm_b_input: [Block128; STATE_SIZE] = [
@@ -113,105 +195,172 @@ pub fn build_haddr_trace(secret: [Block128; 2]) -> Vec<Vec<Block128>> {
         state_after_a[2],
         state_after_a[3],
     ];
-    write_perm_trace_at(&mut cols, HADDR_LAYOUT_B, perm_b_input);
+    write_perm_trace_at_offset(&mut cols, HADDR_LAYOUT_B, perm_b_input, HADDR_B_SEED_ROW);
+
+    // Pre-MDS witness rows.
+    cols[HADDR_PRE_S_A_BASE + 0][0] = secret[0];
+    cols[HADDR_PRE_S_A_BASE + 1][0] = secret[1];
+    cols[HADDR_PRE_S_A_BASE + 2][0] = iv_hi;
+    cols[HADDR_PRE_S_A_BASE + 3][0] = iv_lo;
+    for lane in 0..STATE_SIZE {
+        cols[HADDR_PRE_S_B_BASE + lane][N_ROUNDS] = perm_b_input[lane];
+    }
+
+    // Row indicators.
+    cols[HADDR_IND_ROW_0][0] = Block128::ONE;
+    cols[HADDR_IND_ROW_N_ROUNDS][N_ROUNDS] = Block128::ONE;
+    cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW] = Block128::ONE;
 
     cols
 }
 
-/// Extract the final-row state of block B (the `derive_address` output
-/// before byte serialization).
+/// Extract `(addr_hi, addr_lo) = s_B[0..2]@HADDR_OUTPUT_ROW`.
 pub fn extract_haddr_output(cols: &[Vec<Block128>]) -> [Block128; 2] {
-    let row = noid_poseidon2b::native::permutation::N_ROUNDS;
     [
-        cols[HADDR_LAYOUT_B.s][row],
-        cols[HADDR_LAYOUT_B.s + 1][row],
+        cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW],
+        cols[HADDR_LAYOUT_B.s + 1][HADDR_OUTPUT_ROW],
     ]
 }
 
-/// Emit the `HAddrAir` constraint set: two independent
-/// `emit_perm_all_at` blocks = 58 gates.
-pub fn emit_haddr_constraints() -> Vec<Box<dyn Constraint>> {
-    let mut out = Vec::with_capacity(58);
-    out.extend(crate::airs::emit_perm_all_at(HADDR_LAYOUT_A));
-    out.extend(crate::airs::emit_perm_all_at(HADDR_LAYOUT_B));
-    out
+// ---------------------------------------------------------------------------
+// Constraint / public-column emission
+// ---------------------------------------------------------------------------
+
+fn mds_full_row_terms(
+    lane: usize,
+    pre_s_base: usize,
+) -> Vec<(usize, Block128)> {
+    (0..STATE_SIZE)
+        .map(|j| (pre_s_base + j, Block128::from(MDS_FULL[lane][j])))
+        .collect()
 }
 
-/// Emit the public-column declarations for both permutation blocks:
-/// `2 × (is_full, is_round, rc[0..STATE_SIZE]) = 12` declarations.
-pub fn emit_haddr_public_columns() -> Vec<PublicColumn> {
-    let mut out = Vec::with_capacity(2 * (STATE_SIZE + 2));
-    out.extend(emit_perm_public_columns_at(HADDR_LAYOUT_A));
-    out.extend(emit_perm_public_columns_at(HADDR_LAYOUT_B));
-    out
+fn pad_constant(lane: usize) -> Block128 {
+    match lane {
+        0 => Block128::from(HADDR_PAD_0),
+        1 => Block128::from(HADDR_PAD_1),
+        _ => Block128::ZERO,
+    }
 }
 
-/// §3d-0.6a — emit the output-squeeze boundary tie for HAddr: two
-/// `emit_public_cell` gates pinning `state[0]` and `state[1]` of block B
-/// at row `N_ROUNDS` to the publicly-declared `expected_addr` (hi/lo).
-/// Returns `(indicator_public_column, [pin_hi, pin_lo])` — the caller
-/// appends the indicator to its `public_columns` and the two gates to
-/// its `constraints`.
-pub fn emit_haddr_output_squeeze_ties(
-    indicator_col: usize,
+/// Build the full `HAddrAir` constraint list and public-column set.
+///
+/// `expected_addr = [addr_hi, addr_lo]` is the publicly-declared address
+/// that the sponge must produce. Everything else — the secret, the
+/// intermediate states — stays in the witness. Returns
+/// `(constraints, public_columns)`.
+pub fn emit_haddr(
     expected_addr: [Block128; 2],
-) -> (PublicColumn, Vec<Box<dyn Constraint>>) {
-    let (pc_hi, gate_hi) = emit_public_cell(
-        indicator_col,
-        N_ROUNDS,
-        HADDR_N_ROWS,
-        HADDR_LAYOUT_B.s,
-        expected_addr[0],
-    );
-    let (_pc_lo, gate_lo) = emit_public_cell(
-        indicator_col,
-        N_ROUNDS,
-        HADDR_N_ROWS,
-        HADDR_LAYOUT_B.s + 1,
-        expected_addr[1],
-    );
-    // Both ties share the same indicator column and target row, so they
-    // emit bit-identical `PublicColumn` declarations. Keep one copy.
-    (pc_hi, vec![gate_hi, gate_lo])
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
+    let mut public_columns: Vec<PublicColumn> = Vec::new();
+
+    // Interior gates: two independent permutation blocks.
+    constraints.extend(crate::airs::emit_perm_all_at(HADDR_LAYOUT_A));
+    constraints.extend(crate::airs::emit_perm_all_at(HADDR_LAYOUT_B));
+
+    // Programme columns for the two permutation blocks.
+    public_columns.extend(emit_perm_publics_offset(HADDR_LAYOUT_A, 0));
+    public_columns.extend(emit_perm_publics_offset(HADDR_LAYOUT_B, HADDR_B_SEED_ROW));
+
+    // Row indicator programmes (shared across multiple gates each).
+    public_columns.push(PublicColumn::new(
+        HADDR_IND_ROW_0,
+        row_indicator_programme(0, HADDR_N_ROWS),
+    ));
+    public_columns.push(PublicColumn::new(
+        HADDR_IND_ROW_N_ROUNDS,
+        row_indicator_programme(N_ROUNDS, HADDR_N_ROWS),
+    ));
+    public_columns.push(PublicColumn::new(
+        HADDR_IND_ROW_OUTPUT,
+        row_indicator_programme(HADDR_OUTPUT_ROW, HADDR_N_ROWS),
+    ));
+
+    // Tie 1 — capacity IV pin on pre_s_A[2..4] at row 0. The indicator
+    // column is already declared above; `emit_public_cell` would
+    // re-declare it, so we bypass it and build the selector directly.
+    let [iv_hi, iv_lo] = capacity_iv(TAG_ADDRESS);
+    for (lane, iv) in [(2usize, iv_hi), (3usize, iv_lo)] {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
+            vec![(HADDR_PRE_S_A_BASE + lane, Block128::ONE)],
+            iv,
+        ));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_0, inner)));
+    }
+
+    // Tie 3a — MDS-A: s_A[lane]@0 + Σ MDS_FULL[lane][j] · pre_s_A[j]@0 == 0.
+    // Row-local gate gated by ind_row_0.
+    for lane in 0..STATE_SIZE {
+        let mut terms = vec![(HADDR_LAYOUT_A.s + lane, Block128::ONE)];
+        terms.extend(mds_full_row_terms(lane, HADDR_PRE_S_A_BASE));
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_0, inner)));
+    }
+
+    // Tie 3b — inter-permutation carry at row N_ROUNDS:
+    // A.s[lane]@N_ROUNDS + pre_s_B[lane]@N_ROUNDS + PAD_lane == 0.
+    for lane in 0..STATE_SIZE {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
+            vec![
+                (HADDR_LAYOUT_A.s + lane, Block128::ONE),
+                (HADDR_PRE_S_B_BASE + lane, Block128::ONE),
+            ],
+            pad_constant(lane),
+        ));
+        constraints.push(Box::new(SelectorGate::new(
+            HADDR_IND_ROW_N_ROUNDS,
+            inner,
+        )));
+    }
+
+    // Tie 3c — MDS-B across rows N_ROUNDS → N_ROUNDS+1:
+    // s_B[lane]@(N_ROUNDS+1) + Σ MDS_FULL[lane][j] · pre_s_B[j]@N_ROUNDS == 0.
+    for lane in 0..STATE_SIZE {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGateShifted::new(
+            mds_full_row_terms(lane, HADDR_PRE_S_B_BASE),
+            vec![(HADDR_LAYOUT_B.s + lane, Block128::ONE)],
+            Block128::ZERO,
+        ));
+        constraints.push(Box::new(SelectorGate::new(
+            HADDR_IND_ROW_N_ROUNDS,
+            inner,
+        )));
+    }
+
+    // Tie 4 — output squeeze at HADDR_OUTPUT_ROW. Pin s_B[0..2] to the
+    // declared address. Indicator already declared above, so bypass
+    // `emit_public_cell` and wire SelectorGate directly.
+    for (lane, expected) in expected_addr.iter().enumerate() {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
+            vec![(HADDR_LAYOUT_B.s + lane, Block128::ONE)],
+            *expected,
+        ));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_OUTPUT, inner)));
+    }
+
+    (constraints, public_columns)
 }
 
+// ---------------------------------------------------------------------------
+// HAddrAir
+// ---------------------------------------------------------------------------
+
+/// `HAddrAir` — Poseidon2b two-permutation sponge for `derive_address`,
+/// with all four boundary ties installed. The constructor receives the
+/// public `expected_addr` that the sponge must produce; the private
+/// `secret` is supplied to [`HAddrAir::build_trace`] and never leaves
+/// the witness.
 pub struct HAddrAir {
-    n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
     public_columns: Vec<PublicColumn>,
 }
 
 impl HAddrAir {
-    /// Interior-only construction: 58 permutation gates + the
-    /// `rc` / `is_full` / `is_round` programme-column declarations
-    /// from §3d-0.4. No boundary ties.
-    pub fn new() -> Self {
+    pub fn new(expected_addr: [Block128; 2]) -> Self {
+        let (constraints, public_columns) = emit_haddr(expected_addr);
         Self {
-            n_cols: HADDR_N_COLS,
-            constraints: emit_haddr_constraints(),
-            public_columns: emit_haddr_public_columns(),
-        }
-    }
-
-    /// §3d-0.6a — interior construction plus the **output-squeeze**
-    /// boundary tie: `state[0]@B_row_N_ROUNDS == expected_addr[0]`,
-    /// `state[1]@B_row_N_ROUNDS == expected_addr[1]`. Adds one
-    /// indicator column (`HADDR_OUTPUT_INDICATOR_COL`) pinned to the
-    /// row-`N_ROUNDS` indicator programme and two single-cell gates.
-    ///
-    /// IV binding / absorb XOR / inter-permutation carry remain
-    /// trusted-input pending §3d-0.6b (those need a pre-MDS input
-    /// column; the interior trace stores only post-MDS `s[..]` at
-    /// row 0, so they cannot be expressed without a trace extension).
-    pub fn new_with_output_pin(expected_addr: [Block128; 2]) -> Self {
-        let mut constraints = emit_haddr_constraints();
-        let mut public_columns = emit_haddr_public_columns();
-        let (ind_pc, mut gates) =
-            emit_haddr_output_squeeze_ties(HADDR_OUTPUT_INDICATOR_COL, expected_addr);
-        public_columns.push(ind_pc);
-        constraints.append(&mut gates);
-        Self {
-            n_cols: HADDR_N_COLS_PINNED,
             constraints,
             public_columns,
         }
@@ -220,27 +369,11 @@ impl HAddrAir {
     pub fn build_trace(&self, secret: [Block128; 2]) -> Trace {
         Trace::new(build_haddr_trace(secret))
     }
-
-    /// §3d-0.6a — interior trace plus the row-`N_ROUNDS` indicator
-    /// column as the final column. Use with [`HAddrAir::new_with_output_pin`].
-    pub fn build_trace_with_output_pin(&self, secret: [Block128; 2]) -> Trace {
-        let mut cols = build_haddr_trace(secret);
-        let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
-        indicator[N_ROUNDS] = Block128::ONE;
-        cols.push(indicator);
-        Trace::new(cols)
-    }
-}
-
-impl Default for HAddrAir {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Air for HAddrAir {
     fn n_columns(&self) -> usize {
-        self.n_cols
+        HADDR_N_COLS
     }
     fn log_rows(&self) -> usize {
         HADDR_LOG_ROWS
@@ -253,12 +386,15 @@ impl Air for HAddrAir {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use noid_core::CanonicalSerialize;
     use noid_poseidon2b::native::compression::Poseidon2bSponge;
-    use noid_poseidon2b::native::permutation::N_ROUNDS;
 
     fn mk_secret(seed: u128) -> [Block128; 2] {
         let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
@@ -268,13 +404,20 @@ mod tests {
         ]
     }
 
-    /// Native `derive_address` reference via the sponge. Equivalent to
-    /// `noid_poseidon2b::primitives::derive_address(secret).0`.
     fn native_derive_address(secret: [Block128; 2]) -> [u8; 32] {
         let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_ADDRESS));
         s.absorb_pair(secret[0], secret[1]);
         s.finalize()
     }
+
+    fn expected_addr_for(secret: [Block128; 2]) -> [Block128; 2] {
+        let cols = build_haddr_trace(secret);
+        extract_haddr_output(&cols)
+    }
+
+    // -----------------------------------------------------------------
+    // Trace vs native reference
+    // -----------------------------------------------------------------
 
     #[test]
     fn haddr_trace_matches_native_derive_address() {
@@ -290,14 +433,11 @@ mod tests {
     #[test]
     fn haddr_trace_matches_primitives_derive_address() {
         use noid_poseidon2b::primitives::{derive_address, SpendSecret};
-        // Pack two Block128 halves back into SpendSecret bytes so the
-        // native side sees the same bits.
         let secret_fields = mk_secret(0x1234_5678_9ABC);
         let mut bytes = [0u8; 32];
         bytes[..16].copy_from_slice(&secret_fields[0].to_bytes());
         bytes[16..].copy_from_slice(&secret_fields[1].to_bytes());
         let native = derive_address(&SpendSecret(bytes));
-
         let cols = build_haddr_trace(secret_fields);
         let out_fields = extract_haddr_output(&cols);
         let mut out_bytes = [0u8; 32];
@@ -306,172 +446,170 @@ mod tests {
         assert_eq!(out_bytes, native.0);
     }
 
+    // -----------------------------------------------------------------
+    // Honest accept
+    // -----------------------------------------------------------------
+
     #[test]
     fn haddr_air_accepts_honest_trace() {
-        let air = HAddrAir::new();
-        let trace = air.build_trace(mk_secret(0xBEEF));
+        let secret = mk_secret(0xBEEF);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let trace = air.build_trace(secret);
         assert!(air.check(&trace));
     }
 
+    // -----------------------------------------------------------------
+    // Interior-gate tamper negatives
+    // -----------------------------------------------------------------
+
     #[test]
     fn haddr_air_rejects_perm_a_sout_tamper() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xABCD));
-        // Flip sout[2] on row 1 of block A — breaks S-box chain.
+        let secret = mk_secret(0xABCD);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
         cols[HADDR_LAYOUT_A.sout + 2][1] = cols[HADDR_LAYOUT_A.sout + 2][1] + Block128::ONE;
-        let trace = Trace::new(cols);
-        assert!(!air.check(&trace));
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]
     fn haddr_air_rejects_perm_b_rc_tamper() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xFADE));
-        // Tamper rc lane 0 row 3 of block B — breaks RC binding.
-        cols[HADDR_LAYOUT_B.rc][3] = cols[HADDR_LAYOUT_B.rc][3] + Block128::ONE;
-        let trace = Trace::new(cols);
-        assert!(!air.check(&trace));
+        let secret = mk_secret(0xFADE);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        // Block B rc lives at rows N_ROUNDS+1..2*N_ROUNDS+1; pick a full-round row.
+        cols[HADDR_LAYOUT_B.rc][HADDR_B_SEED_ROW + 1] =
+            cols[HADDR_LAYOUT_B.rc][HADDR_B_SEED_ROW + 1] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]
     fn haddr_air_rejects_perm_b_partial_row_sin_kill() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0xC0FFEE));
-        // Force sin[1] nonzero on a partial row (row 5) of block B.
-        cols[HADDR_LAYOUT_B.sin + 1][5] = Block128::ONE;
-        let trace = Trace::new(cols);
-        assert!(!air.check(&trace));
-    }
-
-    #[test]
-    fn haddr_air_rejects_perm_a_s_next_tamper() {
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0x5EED));
-        // Break the MDS transition on block A row 2.
-        cols[HADDR_LAYOUT_A.s + 1][3] = cols[HADDR_LAYOUT_A.s + 1][3] + Block128::ONE;
-        let trace = Trace::new(cols);
-        assert!(!air.check(&trace));
-    }
-
-    #[test]
-    fn haddr_public_columns_match_builder_output() {
-        // Stage 3d-0.4: every declared programme column must be bit-
-        // identical to what `build_haddr_trace` writes into the witness.
-        use crate::airs::poseidon_perm::{
-            perm_is_full_values, perm_is_round_values, perm_rc_values,
-        };
-        use noid_poseidon2b::native::permutation::STATE_SIZE;
-        let cols = build_haddr_trace(mk_secret(0x1337));
-        let publics = emit_haddr_public_columns();
-        // 2 perm blocks × (is_full + is_round + STATE_SIZE rc) declarations.
-        assert_eq!(publics.len(), 2 * (STATE_SIZE + 2));
-        for layout in [HADDR_LAYOUT_A, HADDR_LAYOUT_B] {
-            assert_eq!(cols[layout.is_full], perm_is_full_values());
-            assert_eq!(cols[layout.is_round], perm_is_round_values());
-            for lane in 0..STATE_SIZE {
-                assert_eq!(cols[layout.rc + lane], perm_rc_values(lane));
-            }
-        }
+        let secret = mk_secret(0xC0FFEE);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        // Partial-round inside block B: `sin[1]` must be zero.
+        cols[HADDR_LAYOUT_B.sin + 1][HADDR_B_SEED_ROW + 5] = Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]
     fn haddr_air_rejects_padding_row_rc_tamper() {
-        // Case B: tamper `rc` on a padding row where every constraint
-        // selector is suppressed. Only the 3d-0.4 public-column
-        // declaration catches this.
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
-        let air = HAddrAir::new();
-        let mut cols = build_haddr_trace(mk_secret(0x5ADC0DE));
-        cols[HADDR_LAYOUT_B.rc + 2][N_ROUNDS + 3] = Block128::from(0xDEAD_BEEFu128);
+        // Tamper `rc` on a row outside block B's active range — caught
+        // only by the B programme-column declaration.
+        let secret = mk_secret(0x5ADC0DE);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.rc + 2][HADDR_OUTPUT_ROW + 3] = Block128::from(0xDEAD_BEEFu128);
         assert!(!air.check(&Trace::new(cols)));
     }
 
     // -----------------------------------------------------------------
-    // Stage 3d-0.6a — output-squeeze boundary tie
+    // Boundary-tie negatives
     // -----------------------------------------------------------------
 
     #[test]
-    fn haddr_pinned_air_accepts_honest_trace() {
-        let secret = mk_secret(0xF00DBABE);
-        let honest = build_haddr_trace(secret);
-        let expected = extract_haddr_output(&honest);
-        let air = HAddrAir::new_with_output_pin(expected);
-        let trace = air.build_trace_with_output_pin(secret);
-        assert!(air.check(&trace));
-        assert_eq!(air.n_columns(), HADDR_N_COLS_PINNED);
-    }
-
-    #[test]
-    fn haddr_pinned_air_rejects_wrong_declared_addr() {
-        // AIR declares the wrong output; even if the trace is honest
-        // the pinned-cell gate fires because `state[0]@N_ROUNDS` does
-        // not equal the wrong constant.
+    fn haddr_air_rejects_wrong_declared_addr() {
+        // Declared output does not match the honest sponge: the output-
+        // squeeze tie rejects.
         let secret = mk_secret(0xC0DE);
-        let honest = build_haddr_trace(secret);
-        let mut expected = extract_haddr_output(&honest);
-        expected[0] = expected[0] + Block128::ONE; // wrong
-        let air = HAddrAir::new_with_output_pin(expected);
-        let trace = air.build_trace_with_output_pin(secret);
+        let mut wrong = expected_addr_for(secret);
+        wrong[0] = wrong[0] + Block128::ONE;
+        let air = HAddrAir::new(wrong);
+        let trace = air.build_trace(secret);
         assert!(!air.check(&trace));
     }
 
     #[test]
-    fn haddr_pinned_air_rejects_tampered_output_cell() {
+    fn haddr_air_rejects_output_cell_tamper() {
+        // Honest declared address, but s_B[0]@output_row flipped.
         let secret = mk_secret(0x1111);
-        let honest = build_haddr_trace(secret);
-        let expected = extract_haddr_output(&honest);
-        let air = HAddrAir::new_with_output_pin(expected);
+        let air = HAddrAir::new(expected_addr_for(secret));
         let mut cols = build_haddr_trace(secret);
-        // Flip s[0]@N_ROUNDS — pinned cell tamper. Breaks many gates,
-        // including the output-squeeze tie.
-        cols[HADDR_LAYOUT_B.s][N_ROUNDS] = cols[HADDR_LAYOUT_B.s][N_ROUNDS] + Block128::ONE;
-        let mut indicator = vec![Block128::ZERO; HADDR_N_ROWS];
-        indicator[N_ROUNDS] = Block128::ONE;
-        cols.push(indicator);
+        cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] =
+            cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]
-    fn haddr_pinned_air_rejects_tampered_indicator_column() {
-        // Shift the indicator to a non-target row; `PublicColumn` MLE
-        // mismatch rejects independently of the inner gates.
+    fn haddr_air_rejects_iv_pin_tamper() {
+        // Flip pre_s_A[2]@0 — violates the capacity-IV pin.
         let secret = mk_secret(0x2222);
-        let honest = build_haddr_trace(secret);
-        let expected = extract_haddr_output(&honest);
-        let air = HAddrAir::new_with_output_pin(expected);
+        let air = HAddrAir::new(expected_addr_for(secret));
         let mut cols = build_haddr_trace(secret);
-        let mut bad_indicator = vec![Block128::ZERO; HADDR_N_ROWS];
-        bad_indicator[N_ROUNDS - 1] = Block128::ONE; // wrong row
-        cols.push(bad_indicator);
+        cols[HADDR_PRE_S_A_BASE + 2][0] = cols[HADDR_PRE_S_A_BASE + 2][0] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_air_rejects_secret_pre_mds_tamper() {
+        // Flip pre_s_A[0]@0 without updating block A's s[0]@0 — the
+        // MDS-A gate rejects.
+        let secret = mk_secret(0x3333);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_PRE_S_A_BASE][0] = cols[HADDR_PRE_S_A_BASE][0] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_air_rejects_inter_perm_carry_tamper() {
+        // Flip pre_s_B[0]@N_ROUNDS — breaks the inter-permutation carry.
+        let secret = mk_secret(0x4444);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] =
+            cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_air_rejects_mds_b_output_tamper() {
+        // Flip s_B[0]@(N_ROUNDS+1) — breaks the MDS-B shifted gate.
+        let secret = mk_secret(0x5555);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.s][HADDR_B_SEED_ROW] =
+            cols[HADDR_LAYOUT_B.s][HADDR_B_SEED_ROW] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_air_rejects_tampered_indicator_row_0() {
+        // Move the row-0 indicator to another row — PublicColumn MLE
+        // mismatch rejects.
+        let secret = mk_secret(0x6666);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_IND_ROW_0][0] = Block128::ZERO;
+        cols[HADDR_IND_ROW_0][3] = Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_air_rejects_tampered_indicator_output() {
+        let secret = mk_secret(0x7777);
+        let air = HAddrAir::new(expected_addr_for(secret));
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW] = Block128::ZERO;
+        cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW - 1] = Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
     #[test]
     fn haddr_blocks_are_independent_in_column_space() {
-        // Sanity: the two layouts share no columns.
         let a_cols = [
-            HADDR_LAYOUT_A.s,
-            HADDR_LAYOUT_A.sin,
-            HADDR_LAYOUT_A.sout,
-            HADDR_LAYOUT_A.rc,
-            HADDR_LAYOUT_A.is_full,
-            HADDR_LAYOUT_A.is_round,
+            HADDR_LAYOUT_A.s, HADDR_LAYOUT_A.sin, HADDR_LAYOUT_A.sout,
+            HADDR_LAYOUT_A.rc, HADDR_LAYOUT_A.is_full, HADDR_LAYOUT_A.is_round,
         ];
         let b_cols = [
-            HADDR_LAYOUT_B.s,
-            HADDR_LAYOUT_B.sin,
-            HADDR_LAYOUT_B.sout,
-            HADDR_LAYOUT_B.rc,
-            HADDR_LAYOUT_B.is_full,
-            HADDR_LAYOUT_B.is_round,
+            HADDR_LAYOUT_B.s, HADDR_LAYOUT_B.sin, HADDR_LAYOUT_B.sout,
+            HADDR_LAYOUT_B.rc, HADDR_LAYOUT_B.is_full, HADDR_LAYOUT_B.is_round,
         ];
         for a in a_cols {
             for b in b_cols {
                 assert_ne!(a, b);
             }
         }
-        assert_eq!(HADDR_N_COLS, 2 * POSEIDON_PERM_N_COLS);
-        // Honest trace round-trips through N_ROUNDS.
-        let _ = N_ROUNDS;
+        assert_eq!(HADDR_N_COLS, 2 * POSEIDON_PERM_N_COLS + 2 * STATE_SIZE + 3);
     }
 }

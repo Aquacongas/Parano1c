@@ -32,29 +32,33 @@ pub use bit_adder::{
     BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
 };
 pub use haddr::{
-    build_haddr_trace, emit_haddr_constraints, emit_haddr_output_squeeze_ties,
-    emit_haddr_public_columns, extract_haddr_output, HAddrAir, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
-    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_COLS_PINNED, HADDR_N_ROWS, HADDR_OUTPUT_INDICATOR_COL,
-    HADDR_PAD_0, HADDR_PAD_1, HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
+    build_haddr_trace, emit_haddr, extract_haddr_output, HAddrAir, HADDR_B_SEED_ROW,
+    HADDR_IND_ROW_0, HADDR_IND_ROW_N_ROUNDS, HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_OUTPUT_ROW, HADDR_PAD_0, HADDR_PAD_1,
+    HADDR_PERM_A_BASE, HADDR_PERM_B_BASE, HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
 };
 pub use hauth::{
-    build_hauth_trace, emit_hauth_constraints, emit_hauth_output_squeeze_ties,
-    emit_hauth_public_columns, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B,
-    HAUTH_LAYOUT_C, HAUTH_LOG_ROWS, HAUTH_N_COLS, HAUTH_N_COLS_PINNED, HAUTH_N_ROWS,
-    HAUTH_OUTPUT_INDICATOR_COL, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE, HAUTH_PERM_C_BASE,
+    build_hauth_trace, emit_hauth, extract_hauth_output, HAuthAir, HAUTH_B_SEED_ROW,
+    HAUTH_C_SEED_ROW, HAUTH_IND_ROW_0, HAUTH_IND_ROW_2N_PLUS_1, HAUTH_IND_ROW_N_ROUNDS,
+    HAUTH_IND_ROW_OUTPUT, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS,
+    HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_OUTPUT_ROW, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE,
+    HAUTH_PERM_C_BASE, HAUTH_PRE_S_A_BASE, HAUTH_PRE_S_B_BASE, HAUTH_PRE_S_C_BASE,
 };
 pub use hleaf::{
-    build_hleaf_trace, emit_hleaf_constraints, emit_hleaf_output_squeeze_ties,
-    emit_hleaf_public_columns, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B,
-    HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_COLS_PINNED, HLEAF_N_ROWS,
-    HLEAF_OUTPUT_INDICATOR_COL, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE,
+    build_hleaf_trace, emit_hleaf, extract_hleaf_output, HLeafAir, HLEAF_B_SEED_ROW,
+    HLEAF_C_SEED_ROW, HLEAF_IND_ROW_0, HLEAF_IND_ROW_2N_PLUS_1, HLEAF_IND_ROW_N_ROUNDS,
+    HLEAF_IND_ROW_OUTPUT, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS,
+    HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_OUTPUT_ROW, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE,
+    HLEAF_PERM_C_BASE, HLEAF_PRE_S_A_BASE, HLEAF_PRE_S_B_BASE, HLEAF_PRE_S_C_BASE,
 };
 pub use tx_body_merkle::{
-    build_tx_body_merkle_trace, emit_tx_body_merkle_constraints,
-    emit_tx_body_merkle_public_columns, extract_instance_output, instance_row_offset,
-    TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS,
-    TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_SLOT_LOG_ROWS,
-    TXBODY_MERKLE_SLOT_ROWS,
+    build_instance_layout, build_tx_body_merkle_trace, build_tx_body_merkle_typed_trace,
+    emit_tx_body_merkle_constraints, emit_tx_body_merkle_public_columns,
+    extract_instance_output, instance_row_offset, leaf_rate_absorb_instance_ids,
+    leaf_rate_payload_col, tx_body_merkle_column_domains, TxBodyMerkleAir,
+    N_LEAF_RATE_PAYLOAD_COLS, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS,
+    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS,
+    TXBODY_MERKLE_PRE_S_BASE, TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS,
 };
 pub use carry_ripple::{
     CarryInitGate, CarryNextGate, CarryRippleAir, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,

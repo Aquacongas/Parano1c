@@ -51,23 +51,28 @@ pub use airs::{
     emit_perm_public_columns_row_major_at, perm_is_full_values, perm_is_full_values_row_major,
     perm_is_round_values, perm_is_round_values_row_major, perm_rc_values,
     perm_rc_values_row_major,
-    build_haddr_trace, emit_haddr_constraints, emit_haddr_output_squeeze_ties,
-    emit_haddr_public_columns, extract_haddr_output, HAddrAir, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
-    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_COLS_PINNED, HADDR_N_ROWS, HADDR_OUTPUT_INDICATOR_COL,
-    HADDR_PAD_0, HADDR_PAD_1, HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
-    build_hauth_trace, emit_hauth_constraints, emit_hauth_output_squeeze_ties,
-    emit_hauth_public_columns, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B,
-    HAUTH_LAYOUT_C, HAUTH_LOG_ROWS, HAUTH_N_COLS, HAUTH_N_COLS_PINNED, HAUTH_N_ROWS,
-    HAUTH_OUTPUT_INDICATOR_COL, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE, HAUTH_PERM_C_BASE,
-    build_hleaf_trace, emit_hleaf_constraints, emit_hleaf_output_squeeze_ties,
-    emit_hleaf_public_columns, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B,
-    HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_COLS_PINNED, HLEAF_N_ROWS,
-    HLEAF_OUTPUT_INDICATOR_COL, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE,
-    build_tx_body_merkle_trace, emit_tx_body_merkle_constraints,
-    emit_tx_body_merkle_public_columns, extract_instance_output, instance_row_offset,
-    write_perm_trace_at_offset, TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT,
-    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS,
-    TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS,
+    build_haddr_trace, emit_haddr, extract_haddr_output, HAddrAir, HADDR_B_SEED_ROW,
+    HADDR_IND_ROW_0, HADDR_IND_ROW_N_ROUNDS, HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_OUTPUT_ROW, HADDR_PAD_0, HADDR_PAD_1,
+    HADDR_PERM_A_BASE, HADDR_PERM_B_BASE, HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
+    build_hauth_trace, emit_hauth, extract_hauth_output, HAuthAir, HAUTH_B_SEED_ROW,
+    HAUTH_C_SEED_ROW, HAUTH_IND_ROW_0, HAUTH_IND_ROW_2N_PLUS_1, HAUTH_IND_ROW_N_ROUNDS,
+    HAUTH_IND_ROW_OUTPUT, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS,
+    HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_OUTPUT_ROW, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE,
+    HAUTH_PERM_C_BASE, HAUTH_PRE_S_A_BASE, HAUTH_PRE_S_B_BASE, HAUTH_PRE_S_C_BASE,
+    build_hleaf_trace, emit_hleaf, extract_hleaf_output, HLeafAir, HLEAF_B_SEED_ROW,
+    HLEAF_C_SEED_ROW, HLEAF_IND_ROW_0, HLEAF_IND_ROW_2N_PLUS_1, HLEAF_IND_ROW_N_ROUNDS,
+    HLEAF_IND_ROW_OUTPUT, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS,
+    HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_OUTPUT_ROW, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE,
+    HLEAF_PERM_C_BASE, HLEAF_PRE_S_A_BASE, HLEAF_PRE_S_B_BASE, HLEAF_PRE_S_C_BASE,
+    build_instance_layout, build_tx_body_merkle_trace, build_tx_body_merkle_typed_trace,
+    emit_tx_body_merkle_constraints, emit_tx_body_merkle_public_columns,
+    extract_instance_output, instance_row_offset, leaf_rate_absorb_instance_ids,
+    leaf_rate_payload_col, tx_body_merkle_column_domains, write_perm_trace_at_offset,
+    TxBodyMerkleAir, N_LEAF_RATE_PAYLOAD_COLS, TXBODY_MERKLE_LAYOUT,
+    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS,
+    TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE, TXBODY_MERKLE_SLOT_LOG_ROWS,
+    TXBODY_MERKLE_SLOT_ROWS,
     RangeGateAir, SboxX7Layout, TxValidityAir,
     TxValidityCol, WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
     BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
@@ -261,39 +266,173 @@ pub trait Air {
 
     /// Native correctness check — catches malformed witnesses before
     /// the STARK is invoked. Rotation is cyclic: `next(last) = first`.
+    ///
+    /// # Safety-critical
+    ///
+    /// This pre-check is part of the node safety contour and MUST
+    /// remain always-on in every release build from genesis onward.
+    /// The fast path below is an identity-preserving rewrite of the
+    /// reference implementation in [`check_legacy`]: for every `Trace`,
+    /// both paths return the same `bool`. Regression is guarded by
+    /// [`check_equivalence_for_tests`] plus per-AIR tamper tests.
+    ///
+    /// The rewrite avoids two hotspot costs from the reference path:
+    ///   * per-row `Vec::<Block128>` heap allocations for
+    ///     `c.columns()` and `c.shifted_columns()` projections,
+    ///   * single-threaded execution on 2^log_rows rows × n_constraints.
+    /// The *semantics* of the check are untouched.
     fn check(&self, trace: &Trace) -> bool {
+        use rayon::prelude::*;
+
         if trace.n_cols() != self.n_columns() || trace.log_rows != self.log_rows() {
             return false;
         }
         let n = trace.n_rows();
+
+        // Public-column pin-check — same linear scan, same order as the
+        // reference implementation.
         for pc in self.public_columns() {
             if pc.col >= self.n_columns() || pc.values.len() != n {
                 return false;
             }
+            let col = &trace.columns[pc.col];
             for row in 0..n {
-                if trace.columns[pc.col][row] != pc.values[row] {
+                if col[row] != pc.values[row] {
                     return false;
                 }
             }
+        }
+
+        let constraints = self.constraints();
+        if constraints.is_empty() || n == 0 {
+            return true;
+        }
+
+        // SoA projection of the constraint index plan, built once per
+        // `check` call. Mirrors the reference inner loop: for every
+        // constraint we resolve `columns()` and `shifted_columns()` into
+        // flat `u32` index arrays plus offsets. Doing this per-call
+        // (rather than caching across calls) keeps `Air::check` free of
+        // internal state and therefore safe to call on any `Trace`.
+        let mut local_offsets: Vec<u32> = Vec::with_capacity(constraints.len() + 1);
+        let mut next_offsets: Vec<u32> = Vec::with_capacity(constraints.len() + 1);
+        let mut local_idx: Vec<u32> = Vec::new();
+        let mut next_idx: Vec<u32> = Vec::new();
+        let mut max_local = 0usize;
+        let mut max_next = 0usize;
+        local_offsets.push(0);
+        next_offsets.push(0);
+        // The top-of-function `trace.n_cols() == self.n_columns()`
+        // equality plus the AIR's own invariant that its constraints
+        // reference indices in `0..n_columns()` together imply every
+        // `j` here is in-range for `trace.columns`. No added checks —
+        // the reference path also panics on malformed AIRs.
+        for c in constraints {
+            let cols = c.columns();
+            let shifted = c.shifted_columns();
+            max_local = max_local.max(cols.len());
+            max_next = max_next.max(shifted.len());
+            for &j in cols {
+                local_idx.push(j as u32);
+            }
+            for &j in shifted {
+                next_idx.push(j as u32);
+            }
+            local_offsets.push(local_idx.len() as u32);
+            next_offsets.push(next_idx.len() as u32);
+        }
+
+        // Parallel row sweep with `find_any`: equivalent to the
+        // reference short-circuit `return false` on the first failing
+        // constraint, just distributed across threads. Each worker
+        // re-uses two scratch `Vec`s via `map_init`, matching the exact
+        // slices the reference code passes to `c.evaluate`.
+        let cols_ref: &[Vec<Block128>] = &trace.columns;
+        let local_offsets_ref = &local_offsets;
+        let next_offsets_ref = &next_offsets;
+        let local_idx_ref = &local_idx;
+        let next_idx_ref = &next_idx;
+
+        let bad_row = (0..n).into_par_iter().map_init(
+            || (Vec::<Block128>::with_capacity(max_local),
+                Vec::<Block128>::with_capacity(max_next)),
+            |(local_buf, next_buf), row| {
+                let next_row = if row + 1 == n { 0 } else { row + 1 };
+                for (ci, c) in constraints.iter().enumerate() {
+                    let l_start = local_offsets_ref[ci] as usize;
+                    let l_end = local_offsets_ref[ci + 1] as usize;
+                    let n_start = next_offsets_ref[ci] as usize;
+                    let n_end = next_offsets_ref[ci + 1] as usize;
+
+                    local_buf.clear();
+                    for &j in &local_idx_ref[l_start..l_end] {
+                        local_buf.push(cols_ref[j as usize][row]);
+                    }
+                    next_buf.clear();
+                    for &j in &next_idx_ref[n_start..n_end] {
+                        next_buf.push(cols_ref[j as usize][next_row]);
+                    }
+
+                    let frame = EvalFrame {
+                        local: local_buf,
+                        next: next_buf,
+                    };
+                    if c.evaluate(frame) != Block128::ZERO {
+                        return true;
+                    }
+                }
+                false
+            },
+        );
+
+        !bad_row.any(|failed| failed)
+    }
+}
+
+/// Reference implementation of [`Air::check`]. Kept for equivalence
+/// testing — the optimized `Air::check` must agree with this on every
+/// input, both honest and malformed. **Never** call this from prod: it
+/// exists solely as the oracle for regression guards.
+#[doc(hidden)]
+pub fn check_legacy<A: Air + ?Sized>(air: &A, trace: &Trace) -> bool {
+    if trace.n_cols() != air.n_columns() || trace.log_rows != air.log_rows() {
+        return false;
+    }
+    let n = trace.n_rows();
+    for pc in air.public_columns() {
+        if pc.col >= air.n_columns() || pc.values.len() != n {
+            return false;
         }
         for row in 0..n {
-            let next_row = if row + 1 == n { 0 } else { row + 1 };
-            for c in self.constraints() {
-                let local: Vec<Block128> =
-                    c.columns().iter().map(|&j| trace.columns[j][row]).collect();
-                let next: Vec<Block128> = c
-                    .shifted_columns()
-                    .iter()
-                    .map(|&j| trace.columns[j][next_row])
-                    .collect();
-                let frame = EvalFrame { local: &local, next: &next };
-                if c.evaluate(frame) != Block128::ZERO {
-                    return false;
-                }
+            if trace.columns[pc.col][row] != pc.values[row] {
+                return false;
             }
         }
-        true
     }
+    for row in 0..n {
+        let next_row = if row + 1 == n { 0 } else { row + 1 };
+        for c in air.constraints() {
+            let local: Vec<Block128> =
+                c.columns().iter().map(|&j| trace.columns[j][row]).collect();
+            let next: Vec<Block128> = c
+                .shifted_columns()
+                .iter()
+                .map(|&j| trace.columns[j][next_row])
+                .collect();
+            let frame = EvalFrame { local: &local, next: &next };
+            if c.evaluate(frame) != Block128::ZERO {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Asserts [`Air::check`] and [`check_legacy`] agree on `trace`. Used
+/// by regression tests across concrete AIRs.
+#[doc(hidden)]
+pub fn check_equivalence_for_tests<A: Air + ?Sized>(air: &A, trace: &Trace) -> bool {
+    air.check(trace) == check_legacy(air, trace)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,14 +510,17 @@ impl Air for CompositeAir {
 mod tests {
     use super::*;
 
-    #[test]
-    fn composite_from_parts() {
-        // 2 columns: bool check on col0, linear sum(col0, col1)==0 on col1.
+    fn build_bool_xor_air(log_rows: usize) -> CompositeAir {
         let constraints: Vec<Box<dyn Constraint>> = vec![
             Box::new(BoolGate::new(0)),
             Box::new(WeightedLinearGate::new_xor(vec![0, 1])),
         ];
-        let air = CompositeAir::from_parts(3, 2, constraints);
+        CompositeAir::from_parts(log_rows, 2, constraints)
+    }
+
+    #[test]
+    fn composite_from_parts() {
+        let air = build_bool_xor_air(3);
         let n = 1 << 3;
         let col0: Vec<Block128> = (0..n)
             .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
@@ -386,5 +528,90 @@ mod tests {
         let col1 = col0.clone();
         let trace = Trace::new(vec![col0, col1]);
         assert!(air.check(&trace));
+        assert!(check_equivalence_for_tests(&air, &trace));
+    }
+
+    /// Accept / reject equivalence between the optimized `Air::check`
+    /// and the reference `check_legacy`, across a grid of:
+    ///   * honest traces,
+    ///   * every single-cell tamper (row × col flips),
+    ///   * malformed shapes (wrong log_rows, wrong n_cols).
+    /// Regression guard for [2.A].
+    #[test]
+    fn check_matches_legacy_on_honest_and_tampered() {
+        for &log_rows in &[1usize, 2, 3, 6] {
+            let n = 1usize << log_rows;
+            let air = build_bool_xor_air(log_rows);
+
+            // Honest: col0 = bit pattern, col1 = col0 (XOR == 0).
+            let col0_honest: Vec<Block128> = (0..n)
+                .map(|i| {
+                    if i & 1 == 0 {
+                        Block128::ZERO
+                    } else {
+                        Block128::ONE
+                    }
+                })
+                .collect();
+            let col1_honest = col0_honest.clone();
+            let trace = Trace::new(vec![col0_honest.clone(), col1_honest.clone()]);
+            assert_eq!(air.check(&trace), check_legacy(&air, &trace));
+            assert!(air.check(&trace));
+
+            // Tamper every single cell — flip bit, assert legacy and
+            // fast-path agree (both should reject for any flip that
+            // breaks bool-ness on col0 or XOR on col1).
+            for col in 0..2 {
+                for row in 0..n {
+                    let mut c0 = col0_honest.clone();
+                    let mut c1 = col1_honest.clone();
+                    {
+                        let cell = if col == 0 { &mut c0[row] } else { &mut c1[row] };
+                        *cell = *cell + Block128::ONE;
+                    }
+                    let tampered = Trace::new(vec![c0, c1]);
+                    assert_eq!(
+                        air.check(&tampered),
+                        check_legacy(&air, &tampered),
+                        "divergence at log_rows={log_rows} col={col} row={row}"
+                    );
+                }
+            }
+
+            // Additional tamper: replace a cell with a non-bit element
+            // on col0 (breaks BoolGate but not XOR if col1 mirrors it).
+            for row in 0..n {
+                let mut c0 = col0_honest.clone();
+                let mut c1 = col1_honest.clone();
+                let garbage = Block128::from(0x1234_5678_9abc_def0_u128);
+                c0[row] = garbage;
+                c1[row] = garbage;
+                let tampered = Trace::new(vec![c0, c1]);
+                assert_eq!(
+                    air.check(&tampered),
+                    check_legacy(&air, &tampered),
+                    "divergence on garbage tamper log_rows={log_rows} row={row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_matches_legacy_on_shape_mismatch() {
+        let air = build_bool_xor_air(3);
+        let n = 1 << 3;
+        let zeros: Vec<Block128> = vec![Block128::ZERO; n];
+
+        // Wrong column count.
+        let wrong_cols = Trace::new(vec![zeros.clone()]);
+        assert_eq!(air.check(&wrong_cols), check_legacy(&air, &wrong_cols));
+        assert!(!air.check(&wrong_cols));
+
+        // Wrong log_rows (4 instead of 3).
+        let wrong_rows0: Vec<Block128> = vec![Block128::ZERO; 1 << 4];
+        let wrong_rows1 = wrong_rows0.clone();
+        let wrong_rows = Trace::new(vec![wrong_rows0, wrong_rows1]);
+        assert_eq!(air.check(&wrong_rows), check_legacy(&air, &wrong_rows));
+        assert!(!air.check(&wrong_rows));
     }
 }

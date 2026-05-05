@@ -30,18 +30,28 @@
 //!                                  two shifted columns. `small/mid/prod`
 //!                                  mirrors the CarryRipple buckets.
 //!
-//!   [K] TxBodyMerkleAir          — Stage 3c-5 homogeneous stack:
-//!                                  68 Poseidon2b permutations laid out
-//!                                  row-major over a single 30-column
-//!                                  lane (log_rows=14, 128-row slot per
-//!                                  instance). Constraint set = ONE
-//!                                  copy of PoseidonPermAir's 29
-//!                                  interior gates, holding at every
-//!                                  row. First real load for the
-//!                                  ladder-sumcheck bucket: amortizes
-//!                                  across all 68 instances so the
-//!                                  per-perm prover cost drops below
-//!                                  the single-perm baseline.
+//!   [K] TxBodyMerkleAir          — Stage 3d-0.9.E.4.c stack + pre-MDS
+//!                                  binding + full inter-perm echo wiring:
+//!                                  59 Poseidon2b permutations laid out
+//!                                  row-major over a 30-col perm lane +
+//!                                  4 pre_s + 1 head_row_0 + 2 iv_prog +
+//!                                  1 any_row_0 + echo / mask block +
+//!                                  2 leaf-rate payload witness columns
+//!                                  (Opt E.4.c-1 — 16 instances share
+//!                                  one column per rate lane; payload
+//!                                  lives on that instance's row_0,
+//!                                  absorb gate is row-gated)
+//!                                  (log_rows=13, 128-row slot per
+//!                                  instance). Constraint set = 29
+//!                                  interior gates + 4 row-0 MDS + 2
+//!                                  capacity-IV + transition/src_pin/
+//!                                  dst_pin families + 30 E.4.b compress
+//!                                  rate-absorb + 32 E.4.c leaf rate-
+//!                                  absorb. Payload columns stay free
+//!                                  witnesses here; §3d-0.9.H pins them
+//!                                  to §3b-4 tx-body columns (and Opt
+//!                                  H-1 is expected to fold most of the
+//!                                  32 payload-column commitment away).
 //!
 //!   [J] HLeafAir                 — Stage 3c-4 `hash_leaf(4 fields)`:
 //!                                  three permutations (absorb #1 +
@@ -936,11 +946,13 @@ struct HAddrRow {
 }
 
 fn bench_haddr() -> HAddrRow {
-    let air = HAddrAir::new();
+    use noid_air::{build_haddr_trace, extract_haddr_output};
     let secret = [
         Block128::from(0xDECAF_CAFE_BABEu128 ^ 0xA5A5_A5A5_A5A5_A5A5),
         Block128::from(0xDECAF_CAFE_BABFu128 ^ 0x5A5A_5A5A_5A5A_5A5A),
     ];
+    let expected = extract_haddr_output(&build_haddr_trace(secret));
+    let air = HAddrAir::new(expected);
     let trace = air.build_trace(secret);
     assert!(air.check(&trace), "HAddrAir native check failed");
     let pi = mk_pi();
@@ -1031,11 +1043,10 @@ fn print_haddr(r: &HAddrRow) {
         percent(r.verify.multipoint_fri, vtotal),
     );
     println!();
-    println!("  Note: interior-only — 58 gates (2 x emit_perm_all_at). Selector +");
-    println!("  round-constant columns are pinned via §3d-0.3 PublicColumn declarations");
-    println!("  (12 columns: 2 x (is_full + is_round + 4 rc)). Capacity-IV, absorb-XOR,");
-    println!("  inter-permutation carry, and output squeeze remain trusted-input");
-    println!("  pending §3d's RowSelectorGate primitive.");
+    println!("  Note: full 3d-0.6b construction — 58 interior gates (2 x emit_perm_all_at)");
+    println!("  plus all four boundary ties (capacity IV pin, MDS-A linear, inter-perm");
+    println!("  carry with padding XOR, MDS-B shifted, output squeeze). Secret is");
+    println!("  witness-only — never appears in a PublicColumn.");
     println!();
     assert_eq!(r.n_cols, HADDR_N_COLS);
     assert_eq!(r.log_rows, HADDR_LOG_ROWS);
@@ -1055,7 +1066,7 @@ struct HAuthRow {
 }
 
 fn bench_hauth() -> HAuthRow {
-    let air = HAuthAir::new();
+    use noid_air::{build_hauth_trace, extract_hauth_output};
     let secret = [
         Block128::from(0xA07_5EED_DEAD_BEEFu128),
         Block128::from(0xFACE_FEED_CAFE_F00Du128),
@@ -1064,6 +1075,8 @@ fn bench_hauth() -> HAuthRow {
         Block128::from(0x5C0FF_B0D_F00D_FACEu128),
         Block128::from(0xBEEF_DEAD_BABE_CAFEu128),
     ];
+    let expected = extract_hauth_output(&build_hauth_trace(secret, txbody));
+    let air = HAuthAir::new(txbody, expected);
     let trace = air.build_trace(secret, txbody);
     assert!(air.check(&trace), "HAuthAir native check failed");
     let pi = mk_pi();
@@ -1177,13 +1190,15 @@ struct HLeafRow {
 }
 
 fn bench_hleaf() -> HLeafRow {
-    let air = HLeafAir::new();
+    use noid_air::{build_hleaf_trace, extract_hleaf_output};
     let fields = [
         Block128::from(0x1EAF_5EED_DEAD_BEEFu128),
         Block128::from(0xFACE_FEED_CAFE_F00Du128),
         Block128::from(0x5C0FF_B0D_F00D_FACEu128),
         Block128::from(0xBEEF_DEAD_BABE_CAFEu128),
     ];
+    let expected = extract_hleaf_output(&build_hleaf_trace(fields));
+    let air = HLeafAir::new(fields, expected);
     let trace = air.build_trace(fields);
     assert!(air.check(&trace), "HLeafAir native check failed");
     let pi = mk_pi();
@@ -1284,7 +1299,7 @@ fn print_hleaf(r: &HLeafRow) {
 }
 
 // ---------------------------------------------------------------------------
-// [K] TxBodyMerkleAir — Stage 3c-5 (homogeneous 68-instance permutation stack)
+// [K] TxBodyMerkleAir — Stage 3d-0.9.E.4.c (59-instance stack + full inter-perm echo)
 // ---------------------------------------------------------------------------
 
 struct TxBodyMerkleRow {
@@ -1300,7 +1315,7 @@ struct TxBodyMerkleRow {
 fn bench_tx_body_merkle() -> TxBodyMerkleRow {
     let air = TxBodyMerkleAir::new();
 
-    // 68 diverse inputs — avoids any accidental coincident state chains
+    // 59 diverse inputs — avoids any accidental coincident state chains
     // that could let a degenerate constraint slip.
     let mut inputs = [[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS];
     for k in 0..TXBODY_MERKLE_N_PERMS {
@@ -1365,7 +1380,10 @@ fn bench_tx_body_merkle() -> TxBodyMerkleRow {
 }
 
 fn print_tx_body_merkle(r: &TxBodyMerkleRow) {
-    println!("  [K] TxBodyMerkleAir  (Stage 3c-5 — homogeneous {}-perm stack)", r.n_perms);
+    println!(
+        "  [K] TxBodyMerkleAir  (Stage 3d-0.9.E.4.c — {}-perm stack + full inter-perm echo)",
+        r.n_perms,
+    );
     println!("  +--------------------------------------------------------------------------+");
     println!(
         "  | log_rows={:>3}  n_cols={:>3}  prove={}  verify={}             |",
@@ -1412,17 +1430,12 @@ fn print_tx_body_merkle(r: &TxBodyMerkleRow) {
         percent(r.verify.multipoint_fri, vtotal),
     );
     println!();
-    println!("  Layout: single 30-col permutation lane stacked row-major over 68");
-    println!("  instances × 128-row slots (log_rows=14). Gate set is ONE copy of");
-    println!("  PoseidonPermAir's 29 interior constraints — holds at every row.");
-    println!("  Expected win: ladder-sc amortizes across all 68 instances, so");
-    println!("  per-perm cost should drop versus 68 × single-perm proofs.");
-    println!("  Note: interior-only. rc/is_full/is_round across all 68 instance");
-    println!("  slots pinned via §3d-0.4 row-major PublicColumn programmes (6 cols,");
-    println!("  stride = 128 rows). Inter-instance boundary ties (leaf IV, compress");
-    println!("  IV, wrap tag, output -> next-input wiring) deferred to §3d.");
+    println!("  Layout: 30-col permutation lane + 4 pre_s + 1 head_row_0 indicator,");
+    println!("  stacked row-major over 59 instances × 128-row slots (log_rows=13).");
+    println!("  Gate set: 29 interior Poseidon2b gates + 4 row-0 MDS binding gates.");
+    println!("  Inter-instance echo wiring + leaf/compress IV pins land in 3d-0.9.E+.");
     println!();
-    assert_eq!(r.n_cols, TXBODY_MERKLE_N_COLS);
+    assert_eq!(r.n_cols, *TXBODY_MERKLE_N_COLS);
     assert_eq!(r.log_rows, TXBODY_MERKLE_LOG_ROWS);
     assert_eq!(r.n_perms, TXBODY_MERKLE_N_PERMS);
 }
@@ -1731,7 +1744,10 @@ fn print_footer() {
     println!("    [H] HAddrAir       (Stage 3c-2 — interior)  shipped (boundary ties -> 3d)");
     println!("    [I] HAuthAir       (Stage 3c-3 — interior)  shipped (boundary ties -> 3d)");
     println!("    [J] HLeafAir       (Stage 3c-4 — interior)  shipped (boundary ties -> 3d)");
-    println!("    [K] TxBodyMerkleAir (Stage 3c-5 — homogeneous 68-stack)  shipped (boundary ties -> 3d)");
+    println!(
+        "    [K] TxBodyMerkleAir (Stage 3d-0.9.E.4.c — 59-stack + full inter-perm echo)  \
+         shipped (payload pinning -> 3d-0.9.H)",
+    );
     println!("    [*] Stage 3d-0.3/0.4 PublicColumn programmes (rc/is_full/is_round)  shipped");
     println!("    [ ] Stage 3d RowSelectorGate (capacity IV, absorb XOR, carries, squeeze)  planned");
     println!("    [ ] TxValidityAir  (Stage 3d — full)        planned");
