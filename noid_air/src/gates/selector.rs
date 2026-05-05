@@ -5,7 +5,8 @@
 //! the underlying gate is suppressed at boundary / padding rows without
 //! baking the selector into every constituent term by hand.
 
-use crate::{Constraint, EvalFrame};
+use crate::{Constraint, EvalFrame, FlatEvalFrame};
+use noid_core::hardware::clmul_gcm;
 use noid_core::Block128;
 
 /// `selector · inner == 0`. Degree is `1 + inner.degree()`. Rotation
@@ -77,6 +78,32 @@ impl Constraint for SelectorGate {
         };
         selector * self.inner.evaluate(inner_frame)
     }
+    /// [2.C.4] Flat-basis evaluator. Selector columns are GF(2)-valued
+    /// (`BoolGate`-constrained upstream), so `F(selector) = selector` and
+    /// the tower `selector * inner` becomes `clmul_gcm(selector,
+    /// inner.evaluate_flat(...))`. The index-remap mirrors the tower path.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let selector = frame.local[0];
+        if self.inner_local_remap.is_empty() {
+            return clmul_gcm(
+                selector,
+                self.inner.evaluate_flat(FlatEvalFrame {
+                    local: &[],
+                    next: frame.next,
+                }),
+            );
+        }
+        let inner_local: Vec<u128> = self
+            .inner_local_remap
+            .iter()
+            .map(|&i| frame.local[i])
+            .collect();
+        let inner_frame = FlatEvalFrame {
+            local: &inner_local,
+            next: frame.next,
+        };
+        clmul_gcm(selector, self.inner.evaluate_flat(inner_frame))
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +139,42 @@ mod tests {
         let col2 = vec![Block128::from(42u128); n];
         let trace = Trace::new(vec![col0, col1, col2]);
         assert!(!air.check(&trace));
+    }
+
+    /// [2.C.4] Native `evaluate_flat` must equal
+    /// `tower_to_flat_u128(evaluate(...))` on every honest input.
+    #[test]
+    fn selector_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let sel = SelectorGate::new(0, inner);
+        for (s_raw, a_raw, b_raw) in [
+            (0u128, 0u128, 0u128),
+            (1, 0xdeadbeef, 0xcafef00d),
+            (0, 0xffff_ffff_ffff_ffff, 1),
+            (1, 0x1234_5678_90ab_cdef, 0xfedc_ba98_7654_3210),
+        ] {
+            let s = Block128::from(s_raw);
+            let a = Block128::from(a_raw);
+            let b = Block128::from(b_raw);
+            let tower_out = <SelectorGate as Constraint>::evaluate(
+                &sel,
+                EvalFrame { local: &[s, a, b], next: &[] },
+            );
+            let flat_out = <SelectorGate as Constraint>::evaluate_flat(
+                &sel,
+                FlatEvalFrame {
+                    local: &[
+                        tower_to_flat_u128(s.0),
+                        tower_to_flat_u128(a.0),
+                        tower_to_flat_u128(b.0),
+                    ],
+                    next: &[],
+                },
+            );
+            assert_eq!(flat_out, tower_to_flat_u128(tower_out.0));
+        }
     }
 
     #[test]

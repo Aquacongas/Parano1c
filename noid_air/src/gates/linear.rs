@@ -6,7 +6,8 @@
 //! the special case exposed through [`WeightedLinearGate::new_xor`] and
 //! used by balance / bit-XOR gates.
 
-use crate::{Constraint, EvalFrame};
+use crate::{Constraint, EvalFrame, FlatEvalFrame};
+use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
 
 /// `Σ_i weight_i · col_i + constant == 0`.
@@ -14,6 +15,12 @@ pub struct WeightedLinearGate {
     terms: Vec<(usize, Block128)>,
     constant: Block128,
     cols: Vec<usize>,
+    /// [2.C.3] Flat-basis image of `terms[i].1`, pre-converted once at
+    /// construction so the hot `evaluate_flat` path needs only XOR +
+    /// `clmul_gcm`. Same length / order as `terms`.
+    weights_flat: Vec<u128>,
+    /// [2.C.3] Flat-basis image of `constant`.
+    constant_flat: u128,
 }
 
 impl WeightedLinearGate {
@@ -31,7 +38,16 @@ impl WeightedLinearGate {
                 );
             }
         }
-        Self { terms, constant, cols }
+        let weights_flat: Vec<u128> =
+            terms.iter().map(|(_, w)| tower_to_flat_u128(w.0)).collect();
+        let constant_flat = tower_to_flat_u128(constant.0);
+        Self {
+            terms,
+            constant,
+            cols,
+            weights_flat,
+            constant_flat,
+        }
     }
 
     /// `Σ col_i == 0` — the XOR-linear special case used by balance
@@ -56,6 +72,18 @@ impl Constraint for WeightedLinearGate {
         }
         acc
     }
+    /// [2.C.3] Flat-basis evaluator. Weights are cached in flat basis
+    /// at construction time so each term costs one `clmul_gcm` + XOR.
+    /// Equivalent to `evaluate` by field-isomorphism argument: `F` is
+    /// linear in `+` and multiplicative on `·`, so
+    ///   `F(Σ w_i · v_i + c) = Σ F(w_i)·F(v_i) + F(c)`.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let mut acc = self.constant_flat;
+        for (i, &wf) in self.weights_flat.iter().enumerate() {
+            acc ^= clmul_gcm(wf, frame.local[i]);
+        }
+        acc
+    }
 }
 
 /// Linear gate with mixed local-row and next-row column reads:
@@ -74,6 +102,10 @@ pub struct WeightedLinearGateShifted {
     constant: Block128,
     cols: Vec<usize>,
     shifted: Vec<usize>,
+    /// [2.C.3] Flat-basis caches for the hot `evaluate_flat` path.
+    local_weights_flat: Vec<u128>,
+    next_weights_flat: Vec<u128>,
+    constant_flat: u128,
 }
 
 impl WeightedLinearGateShifted {
@@ -106,12 +138,24 @@ impl WeightedLinearGateShifted {
                 );
             }
         }
+        let local_weights_flat: Vec<u128> = local_terms
+            .iter()
+            .map(|(_, w)| tower_to_flat_u128(w.0))
+            .collect();
+        let next_weights_flat: Vec<u128> = next_terms
+            .iter()
+            .map(|(_, w)| tower_to_flat_u128(w.0))
+            .collect();
+        let constant_flat = tower_to_flat_u128(constant.0);
         Self {
             local_terms,
             next_terms,
             constant,
             cols,
             shifted,
+            local_weights_flat,
+            next_weights_flat,
+            constant_flat,
         }
     }
 
@@ -143,6 +187,18 @@ impl Constraint for WeightedLinearGateShifted {
         }
         for (i, &(_, w)) in self.next_terms.iter().enumerate() {
             acc = acc + w * frame.next[i];
+        }
+        acc
+    }
+    /// [2.C.3] Flat-basis evaluator; mirrors the tower path with
+    /// cached flat weights for both the local and next terms.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let mut acc = self.constant_flat;
+        for (i, &wf) in self.local_weights_flat.iter().enumerate() {
+            acc ^= clmul_gcm(wf, frame.local[i]);
+        }
+        for (i, &wf) in self.next_weights_flat.iter().enumerate() {
+            acc ^= clmul_gcm(wf, frame.next[i]);
         }
         acc
     }
@@ -250,5 +306,66 @@ mod tests {
     #[should_panic(expected = "at least one term")]
     fn shifted_gate_rejects_empty() {
         let _ = WeightedLinearGateShifted::new(vec![], vec![], Block128::ZERO);
+    }
+
+    /// [2.C.3] Native `evaluate_flat` must agree with the tower path
+    /// after basis mapping, for both gates. Sweep over random-looking
+    /// weights / values covering zero, one, and full-width inputs.
+    #[test]
+    fn weighted_linear_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let w0 = Block128::from(0xdead_beef_u128);
+        let w1 = Block128::from(0xffff_ffff_ffff_ffff_0000_0000_0000_0001_u128);
+        let k = Block128::from(0x1234_5678_9abc_def0_u128);
+        let gate = WeightedLinearGate::new(vec![(0, w0), (1, w1)], k);
+        for raw_a in [0u128, 1, 7, 0xcafe, 0xffff_ffff_ffff_ffff_u128] {
+            for raw_b in [0u128, 1, 2, 0xbeef_u128, 0x8000_0000_0000_0000_u128] {
+                let a = Block128::from(raw_a);
+                let b = Block128::from(raw_b);
+                let tower_out = gate.evaluate(EvalFrame {
+                    local: &[a, b],
+                    next: &[],
+                });
+                let flat_local = [tower_to_flat_u128(a.0), tower_to_flat_u128(b.0)];
+                let flat_out = gate.evaluate_flat(FlatEvalFrame {
+                    local: &flat_local,
+                    next: &[],
+                });
+                assert_eq!(
+                    flat_out,
+                    tower_to_flat_u128(tower_out.0),
+                    "WeightedLinearGate flat diverged at a={raw_a:#x} b={raw_b:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_linear_shifted_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let gate = WeightedLinearGateShifted::new(
+            vec![(0, Block128::from(0xabcd_u128))],
+            vec![(1, Block128::from(0xef01_u128))],
+            Block128::from(0x5a5a_u128),
+        );
+        for raw_local in [0u128, 1, 0xdead_cafe_u128, 0xffff_0000_ffff_0000_u128] {
+            for raw_next in [0u128, 1, 0xbeef_u128, 0x8000_0000_0000_0000_u128] {
+                let l = Block128::from(raw_local);
+                let n = Block128::from(raw_next);
+                let tower_out = gate.evaluate(EvalFrame {
+                    local: &[l],
+                    next: &[n],
+                });
+                let flat_out = gate.evaluate_flat(FlatEvalFrame {
+                    local: &[tower_to_flat_u128(l.0)],
+                    next: &[tower_to_flat_u128(n.0)],
+                });
+                assert_eq!(
+                    flat_out,
+                    tower_to_flat_u128(tower_out.0),
+                    "WeightedLinearGateShifted flat diverged at local={raw_local:#x} next={raw_next:#x}"
+                );
+            }
+        }
     }
 }

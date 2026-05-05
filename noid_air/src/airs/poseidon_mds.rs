@@ -21,7 +21,8 @@
 //! they multiply through the constraint engine exactly like the
 //! weights in `WeightedLinearGate`.
 
-use crate::{Constraint, EvalFrame};
+use crate::{Constraint, EvalFrame, FlatEvalFrame};
+use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{MDS_FULL, MDS_PARTIAL, STATE_SIZE};
 
@@ -69,6 +70,13 @@ impl MdsKind {
 /// read: `s[lane]`.
 pub struct MdsRowGate {
     row_coeffs: [u128; STATE_SIZE],
+    /// [2.C.4] Flat-basis image of `row_coeffs`, pre-converted once at
+    /// construction so the hot `evaluate_flat` path needs only XOR +
+    /// `clmul_gcm`. Entries equal to `0` or `1` in the tower basis are
+    /// preserved as `0` and `1` in flat (both are GF(2) subfield
+    /// elements), so the fast `w==0`/`w==1` short-circuits transfer
+    /// across bases unchanged.
+    row_coeffs_flat: [u128; STATE_SIZE],
     locals: [usize; STATE_SIZE],
     shifted: [usize; 1],
 }
@@ -77,8 +85,17 @@ impl MdsRowGate {
     pub fn new(lane: usize, kind: MdsKind, layout: MdsLayout) -> Self {
         assert!(lane < STATE_SIZE);
         let row_coeffs = kind.matrix()[lane];
+        let mut row_coeffs_flat = [0u128; STATE_SIZE];
+        for j in 0..STATE_SIZE {
+            row_coeffs_flat[j] = match row_coeffs[j] {
+                0 => 0,
+                1 => 1,
+                w => tower_to_flat_u128(w),
+            };
+        }
         Self {
             row_coeffs,
+            row_coeffs_flat,
             locals: layout.sout,
             shifted: [layout.s_next[lane]],
         }
@@ -104,6 +121,23 @@ impl Constraint for MdsRowGate {
                 acc = acc + frame.local[j];
             } else if w != 0 {
                 acc = acc + Block128::from(w) * frame.local[j];
+            }
+        }
+        acc
+    }
+    /// [2.C.4] Flat-basis evaluator: XOR of pre-converted
+    /// `clmul_gcm(w_flat, local_j)` terms. Handles the `w=0` / `w=1`
+    /// short-circuits with the flat image, which are numerically
+    /// identical to the tower image for these special values.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let s_next = frame.next[0];
+        let mut acc = s_next;
+        for j in 0..STATE_SIZE {
+            let wf = self.row_coeffs_flat[j];
+            if wf == 1 {
+                acc ^= frame.local[j];
+            } else if wf != 0 {
+                acc ^= clmul_gcm(wf, frame.local[j]);
             }
         }
         acc

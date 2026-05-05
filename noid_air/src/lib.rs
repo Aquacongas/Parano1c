@@ -27,6 +27,7 @@
 //! - [`airs`] — concrete AIRs (`TxValidityAir`, `CarryRippleAir`,
 //!   `LinearCombinationAir`).
 
+use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
 
 pub mod airs;
@@ -209,6 +210,24 @@ pub struct EvalFrame<'a> {
     pub next: &'a [Block128],
 }
 
+/// Flat-basis (GCM polynomial basis) evaluation frame — same
+/// semantics as [`EvalFrame`] but the field elements are carried in
+/// the `tower_to_flat_u128`-image basis. Used by
+/// [`Constraint::evaluate_flat`] to avoid per-mul basis conversion in
+/// the STARK zero-check hot path. XOR (additive group operation) is
+/// basis-agnostic; multiplication in flat basis is a single
+/// `clmul_gcm` call versus tower-basis Karatsuba.
+///
+/// **Invariant**: every element in `local` / `next` equals
+/// `tower_to_flat_u128(v.0)` for the corresponding tower-basis
+/// `Block128 v` that a tower-path caller would have supplied in
+/// [`EvalFrame`]. Callers MUST NOT mix bases.
+#[derive(Debug, Clone, Copy)]
+pub struct FlatEvalFrame<'a> {
+    pub local: &'a [u128],
+    pub next: &'a [u128],
+}
+
 /// A single algebraic constraint. `evaluate` is called either with
 /// per-row column values (native check) or with field evaluations of
 /// each column's MLE at one challenge point (zero-check sumcheck).
@@ -225,6 +244,41 @@ pub trait Constraint: Send + Sync {
     }
     /// Evaluate the constraint on the given frame.
     fn evaluate(&self, frame: EvalFrame) -> Block128;
+
+    /// [2.C.1] Flat-basis evaluator — default implementation converts
+    /// the flat inputs back to tower, delegates to [`evaluate`], and
+    /// converts the result back to flat. Bit-identical to the
+    /// tower-basis path by construction (every operation factors
+    /// through the same `evaluate` routine).
+    ///
+    /// Concrete gates can override this with a direct flat-basis
+    /// implementation; overrides MUST satisfy: for every legal
+    /// `EvalFrame f`, `evaluate_flat(frame_flat(f))` equals
+    /// `tower_to_flat_u128(self.evaluate(f).0)`. This equivalence is
+    /// what enables the STARK zero-check to swap bases without
+    /// changing transcript bytes or the accept/reject set.
+    ///
+    /// Default-implementation: O(arity) basis conversions per
+    /// `evaluate_flat` call — same cost as a no-op switch. Hot AIRs
+    /// are expected to override once the STARK layer starts calling
+    /// this path (landing in [2.C.2+]).
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let local_tower: Vec<Block128> = frame
+            .local
+            .iter()
+            .map(|&v| Block128::from(flat_to_tower_u128(v)))
+            .collect();
+        let next_tower: Vec<Block128> = frame
+            .next
+            .iter()
+            .map(|&v| Block128::from(flat_to_tower_u128(v)))
+            .collect();
+        let out = self.evaluate(EvalFrame {
+            local: &local_tower,
+            next: &next_tower,
+        });
+        tower_to_flat_u128(out.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +647,47 @@ mod tests {
                     "divergence on garbage tamper log_rows={log_rows} row={row}"
                 );
             }
+        }
+    }
+
+    /// [2.C.1] The default `evaluate_flat` must, by construction,
+    /// agree with `evaluate` after basis conversion. Guard against
+    /// accidental override drift by exercising every concrete gate we
+    /// hit in the bool-XOR composite.
+    #[test]
+    fn default_evaluate_flat_matches_tower() {
+        let air = build_bool_xor_air(2);
+        // Seed a mixed frame: non-bit values, non-zero XOR pattern.
+        let local_tower = [
+            Block128::from(0xdeadbeefcafef00d_u128),
+            Block128::from(0x1234567890abcdef_u128),
+        ];
+        let next_tower = [Block128::ZERO, Block128::ONE];
+        let local_flat: Vec<u128> =
+            local_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+        let next_flat: Vec<u128> =
+            next_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+        for c in air.constraints() {
+            // Slice to this constraint's arity — BoolGate reads 1 col,
+            // WeightedLinearGate XOR reads 2 cols; local_tower has ≥2.
+            let local_arity = c.columns().len();
+            let next_arity = c.shifted_columns().len();
+            let tf = EvalFrame {
+                local: &local_tower[..local_arity],
+                next: &next_tower[..next_arity],
+            };
+            let ff = FlatEvalFrame {
+                local: &local_flat[..local_arity],
+                next: &next_flat[..next_arity],
+            };
+            let tower_out = c.evaluate(tf);
+            let flat_out = c.evaluate_flat(ff);
+            assert_eq!(
+                flat_out,
+                tower_to_flat_u128(tower_out.0),
+                "default evaluate_flat disagreed with tower path on {:?}",
+                c.columns()
+            );
         }
     }
 

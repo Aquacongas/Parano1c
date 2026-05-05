@@ -30,7 +30,7 @@ pub mod ladder_batch;
 pub mod multipoint_batch;
 pub mod vshift;
 
-use noid_air::{Air, Constraint, EvalFrame, Trace};
+use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::batch::{prove_batched, verify_batched, BatchedEvalProof};
@@ -177,49 +177,6 @@ fn lagrange_eval_at(p: &[Block128], target: Block128) -> Block128 {
     acc
 }
 
-/// Fold the highest variable of a multilinear table at an arbitrary
-/// field point `r`, in place.
-fn fold_highest<F: TowerField>(table: &mut Vec<F>, r: F) {
-    let half = table.len() / 2;
-    for j in 0..half {
-        let lo = table[j];
-        let hi = table[j + half];
-        table[j] = lo + r * (hi + lo);
-    }
-    table.truncate(half);
-}
-
-/// Partial evaluation of a multilinear table at a field point `s` on
-/// its highest variable — returns a new table of length `half`.
-///
-/// The general formula is `table[j] + s · (table[j+half] + table[j])`.
-/// When `s = 0` it collapses to `table[j]` (lower half); when `s = 1`
-/// (i.e. `Block128::ONE`) it collapses to `table[j+half]` (upper
-/// half). Those two cases are hit by every sumcheck round (the round
-/// polynomial is sampled at integer points `0, 1, 2, …, degree`, so
-/// `s ∈ {0, 1}` always fire) and avoiding the `s · (…)` multiplication
-/// removes most of the per-round Block128 arithmetic on packable
-/// columns. The general branch allocates the output with an exact
-/// `with_capacity(half)` so `push` never grows-and-copies — this is
-/// the same allocation pattern the prover used before Upgrade-1.1
-/// attempted a scratch pool (the pool variant lost the outer
-/// parallelism across sample points and regressed every AIR; reverted).
-#[inline]
-fn partial_eval_highest(table: &[Block128], s: Block128) -> Vec<Block128> {
-    let half = table.len() / 2;
-    if s == Block128::ZERO {
-        return table[..half].to_vec();
-    }
-    if s == Block128::ONE {
-        return table[half..].to_vec();
-    }
-    let mut out = Vec::with_capacity(half);
-    for j in 0..half {
-        out.push(table[j] + s * (table[j + half] + table[j]));
-    }
-    out
-}
-
 /// Upgrade-1.2 — Structure-of-Arrays view of the constraint list, built
 /// once per zero-check invocation and reused across every round × sample
 /// point. It collapses three sources of per-row overhead from the hot
@@ -252,6 +209,10 @@ struct CompiledGates<'a> {
     /// never reallocate.
     max_local_arity: usize,
     max_next_arity: usize,
+    /// Flat-basis image of `betas`, pre-converted once at
+    /// `CompiledGates::new` time; the zero-check hot path reads it
+    /// instead of invoking `tower_to_flat_u128` per row.
+    betas_flat: Vec<u128>,
 }
 
 impl<'a> CompiledGates<'a> {
@@ -259,6 +220,7 @@ impl<'a> CompiledGates<'a> {
         constraints: &'a [Box<dyn Constraint>],
         shifted_slot: &[Option<usize>],
         n_base: usize,
+        betas: &[Block128],
     ) -> Self {
         let n = constraints.len();
         let mut col_indices: Vec<u32> = Vec::new();
@@ -285,6 +247,10 @@ impl<'a> CompiledGates<'a> {
             }
             next_index_starts.push(next_indices.len() as u32);
         }
+        let betas_flat: Vec<u128> = betas
+            .iter()
+            .map(|b| noid_core::hardware::tower_to_flat_u128(b.0))
+            .collect();
         Self {
             constraints,
             col_indices,
@@ -293,26 +259,70 @@ impl<'a> CompiledGates<'a> {
             next_index_starts,
             max_local_arity,
             max_next_arity,
+            betas_flat,
         }
     }
 }
 
-/// Evaluate the per-row composition `eq · Σ β_j · C_j` given partial
-/// tables at some value `s` of the current round variable, accumulated
-/// over the remaining `half` hypercube positions.
+// ---------------------------------------------------------------------------
+// [2.C] Flat-basis zero-check inner loops
+// ---------------------------------------------------------------------------
+
+/// Fold the highest variable of a multilinear table in flat basis.
+/// Multiplication is the only basis-sensitive op in `a + r·(a+b)`; it
+/// is replaced here with `clmul_gcm` (flat-basis mul).
+fn fold_highest_flat(table: &mut Vec<u128>, r_flat: u128) {
+    use noid_core::hardware::clmul_gcm;
+    let half = table.len() / 2;
+    for j in 0..half {
+        let lo = table[j];
+        let hi = table[j + half];
+        table[j] = lo ^ clmul_gcm(r_flat, hi ^ lo);
+    }
+    table.truncate(half);
+}
+
+/// Partial evaluation at sample-integer `s_idx ∈ {0, 1, ..., degree}`
+/// on the highest variable of a flat-basis multilinear table. For
+/// `s_idx == 0` / `s_idx == 1` we short-circuit to a half-slice copy:
+/// those sample points live in GF(2) ⊂ GF(2^128), and their `u128`
+/// bit patterns (0 and 1) are identical in tower and flat basis. For
+/// `s_idx >= 2` the caller passes the already-flat-converted scalar
+/// `s_flat`.
+#[inline]
+fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> Vec<u128> {
+    use noid_core::hardware::clmul_gcm;
+    let half = table.len() / 2;
+    if s_idx == 0 {
+        return table[..half].to_vec();
+    }
+    if s_idx == 1 {
+        return table[half..].to_vec();
+    }
+    let mut out = Vec::with_capacity(half);
+    for j in 0..half {
+        out.push(table[j] ^ clmul_gcm(s_flat, table[j + half] ^ table[j]));
+    }
+    out
+}
+
+/// Evaluate the per-row composition `eq · Σ β_k · C_k` in flat basis,
+/// given partial tables at some value `s` of the current round
+/// variable, accumulated over the remaining `half` hypercube
+/// positions. Uses precomputed `compiled.betas_flat` and
+/// `Constraint::evaluate_flat` so that every inner product runs
+/// through flat-basis CLMUL rather than tower-basis Karatsuba.
 ///
 /// The layout of `col_tables_at_s` is `[base cols..., rotated cols...]`
-/// where the rotated-column block is ordered by `shifted_slot`
-/// (`shifted_slot[col_id] = Some(slot)` for rotated columns).
+/// where the rotated-column block is ordered by `shifted_slot`.
 /// `compiled.next_indices` has already been rewritten to absolute
-/// column indices (i.e. `n_base + slot` for each shifted read), so the
-/// hot loop is a plain indexed load.
-fn accumulate_sum(
-    eq_at_s: &[Block128],
-    col_tables_at_s: &[Vec<Block128>],
+/// column indices (i.e. `n_base + slot` for each shifted read).
+fn accumulate_sum_flat(
+    eq_at_s: &[u128],
+    col_tables_at_s: &[Vec<u128>],
     compiled: &CompiledGates<'_>,
-    betas: &[Block128],
-) -> Block128 {
+) -> u128 {
+    use noid_core::hardware::clmul_gcm;
     use rayon::prelude::*;
     let half = eq_at_s.len();
     let n_constraints = compiled.constraints.len();
@@ -321,14 +331,9 @@ fn accumulate_sum(
     (0..half)
         .into_par_iter()
         .map_init(
-            || {
-                (
-                    Vec::<Block128>::with_capacity(local_cap),
-                    Vec::<Block128>::with_capacity(next_cap),
-                )
-            },
+            || (Vec::<u128>::with_capacity(local_cap), Vec::<u128>::with_capacity(next_cap)),
             |(local_scratch, next_scratch), j| {
-                let mut composition = Block128::ZERO;
+                let mut composition: u128 = 0;
                 for k in 0..n_constraints {
                     let lo_s = compiled.col_index_starts[k] as usize;
                     let lo_e = compiled.col_index_starts[k + 1] as usize;
@@ -342,21 +347,35 @@ fn accumulate_sum(
                     for &idx in &compiled.next_indices[ne_s..ne_e] {
                         next_scratch.push(col_tables_at_s[idx as usize][j]);
                     }
-                    let frame = EvalFrame {
+                    let frame = FlatEvalFrame {
                         local: local_scratch.as_slice(),
                         next: next_scratch.as_slice(),
                     };
-                    composition += betas[k] * compiled.constraints[k].evaluate(frame);
+                    let ck = compiled.constraints[k].evaluate_flat(frame);
+                    composition ^= clmul_gcm(compiled.betas_flat[k], ck);
                 }
-                eq_at_s[j] * composition
+                clmul_gcm(eq_at_s[j], composition)
             },
         )
-        .reduce(|| Block128::ZERO, |a, b| a + b)
+        .reduce(|| 0u128, |a, b| a ^ b)
 }
 
-/// Prover for the batched zero-check sumcheck. Returns the list of
-/// round polynomials (one per variable, each of length `degree + 1`)
-/// and the vector of challenge points `r = (r_0, …, r_{n-1})`.
+/// Prover for the batched zero-check sumcheck. Holds the folded
+/// column tables + eq table in flat basis (GCM polynomial basis)
+/// across every round; converts to/from tower only at four
+/// boundaries:
+///   * inputs: every column of `cols` → flat once at entry;
+///   * `eq_ind_partial_eval(z)` result → flat once at entry;
+///   * each round's `evals` (n_points field elements) → tower before
+///     `channel.observe_field_elems` so transcript bytes stay in the
+///     observable tower basis;
+///   * each round's challenge `r` → flat before `fold_highest_flat`.
+/// Every other op (fold, partial_eval, accumulate_sum) is flat and
+/// hits `clmul_gcm` / `square_flat_u128` hardware paths directly.
+///
+/// Returns `(round_polys, challenges)` in tower basis — transcript
+/// bytes are identical to a naive tower-basis prover run on the same
+/// inputs.
 fn prove_zero_check(
     cols: &[Vec<Block128>],
     constraints: &[Box<dyn Constraint>],
@@ -367,55 +386,66 @@ fn prove_zero_check(
     shifted_slot: &[Option<usize>],
     n_base: usize,
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
+    use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
     let n = z.len();
     let n_points = degree + 1;
-    let n_cols = cols.len();
 
-    // Upgrade-1.2: compile-once SoA view of the constraint list. Lifts
-    // `columns()` / `shifted_columns()` virtual calls and the
-    // `shifted_slot[..].expect()` check out of the hot per-row loop.
-    let compiled = CompiledGates::new(constraints, shifted_slot, n_base);
-    let _ = n_cols;
+    let compiled = CompiledGates::new(constraints, shifted_slot, n_base, betas);
 
-    // Folded tables, one per column plus one for eq(z, ·).
-    let mut cur_cols: Vec<Vec<Block128>> = cols.to_vec();
-    let mut cur_eq = noid_core::mle::eq::eq_ind_partial_eval(z);
+    // Convert the initial folded tables to flat basis once; they stay
+    // in flat for the full sumcheck.
+    let mut cur_cols: Vec<Vec<u128>> = cols
+        .iter()
+        .map(|c| c.iter().map(|v| tower_to_flat_u128(v.0)).collect())
+        .collect();
+    let eq_tower = noid_core::mle::eq::eq_ind_partial_eval(z);
+    let mut cur_eq: Vec<u128> = eq_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+
+    // Pre-convert the small fixed set of sample-point scalars
+    // `{2, 3, ..., degree}` to flat once. Points `0` and `1` are
+    // GF(2) elements, their `u128` bit patterns are basis-invariant.
+    let s_flat_table: Vec<u128> = (0..n_points)
+        .map(|s_idx| {
+            if s_idx <= 1 {
+                s_idx as u128
+            } else {
+                tower_to_flat_u128(Block128::from(s_idx as u8).0)
+            }
+        })
+        .collect();
 
     let mut round_polys: Vec<RoundPoly> = Vec::with_capacity(n);
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
 
     for _ in 0..n {
-        // Build round polynomial evaluations at 0, 1, 2, …, degree in
-        // parallel across the `n_points` sample points. Each task has
-        // its own transient scratch `Vec`s; `partial_eval_highest`
-        // allocates these via `with_capacity(half)` so there is no
-        // grow-on-push traffic inside the hot `accumulate_sum` either.
         let evals: Vec<Block128> = {
             use rayon::prelude::*;
             (0..n_points)
                 .into_par_iter()
                 .map(|s_idx| {
-                    let s = Block128::from(s_idx as u8);
-                    let eq_at_s = partial_eval_highest(&cur_eq, s);
-                    let cols_at_s: Vec<Vec<Block128>> = cur_cols
+                    let s_flat = s_flat_table[s_idx];
+                    let eq_at_s = partial_eval_highest_flat_at(&cur_eq, s_idx, s_flat);
+                    let cols_at_s: Vec<Vec<u128>> = cur_cols
                         .iter()
-                        .map(|c| partial_eval_highest(c, s))
+                        .map(|c| partial_eval_highest_flat_at(c, s_idx, s_flat))
                         .collect();
-                    accumulate_sum(&eq_at_s, &cols_at_s, &compiled, betas)
+                    let acc_flat = accumulate_sum_flat(&eq_at_s, &cols_at_s, &compiled);
+                    Block128::from(flat_to_tower_u128(acc_flat))
                 })
                 .collect()
         };
 
         channel.observe_field_elems(&evals);
         let r = channel.get_random_point();
+        let r_flat = tower_to_flat_u128(r.0);
 
-        // Folding each column's highest variable at `r` is also
-        // independent per column; parallelise across columns.
         {
             use rayon::prelude::*;
-            cur_cols.par_iter_mut().for_each(|c| fold_highest(c, r));
+            cur_cols
+                .par_iter_mut()
+                .for_each(|c| fold_highest_flat(c, r_flat));
         }
-        fold_highest(&mut cur_eq, r);
+        fold_highest_flat(&mut cur_eq, r_flat);
 
         round_polys.push(evals);
         challenges.push(r);

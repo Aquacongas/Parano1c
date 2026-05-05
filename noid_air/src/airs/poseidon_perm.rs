@@ -61,7 +61,8 @@
 
 use crate::airs::poseidon_sbox::{emit_sbox_x7_constraints, SboxX7Layout};
 use crate::gates::{BoolGate, PublicColumn, SelectorGate, WeightedLinearGate};
-use crate::{Constraint, EvalFrame};
+use crate::{Constraint, EvalFrame, FlatEvalFrame};
+use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{
     sbox_x7, F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
@@ -532,6 +533,15 @@ pub struct PermMdsBlendGate {
     /// Index inside `locals` of `is_full`, `is_round`.
     is_full_idx: usize,
     is_round_idx: usize,
+    /// [2.C.4] Flat-basis image of `MDS_FULL[lane][0..4]` and
+    /// `MDS_PARTIAL[lane][0..4]`. Pre-converted once in
+    /// `with_layout`; hot `evaluate_flat` reads these as CLMUL
+    /// operands without per-row conversion. Matches the tower-path
+    /// `w == 0` / `w == 1` short-circuits — both special values are
+    /// GF(2) subfield elements and survive `tower_to_flat_u128` as
+    /// themselves.
+    mds_full_flat: [u128; STATE_SIZE],
+    mds_partial_flat: [u128; STATE_SIZE],
 }
 
 impl PermMdsBlendGate {
@@ -559,6 +569,21 @@ impl PermMdsBlendGate {
         let is_round_idx = locals.len();
         locals.push(layout.is_round);
 
+        let mut mds_full_flat = [0u128; STATE_SIZE];
+        let mut mds_partial_flat = [0u128; STATE_SIZE];
+        for j in 0..STATE_SIZE {
+            mds_full_flat[j] = match MDS_FULL[lane][j] {
+                0 => 0,
+                1 => 1,
+                w => tower_to_flat_u128(w),
+            };
+            mds_partial_flat[j] = match MDS_PARTIAL[lane][j] {
+                0 => 0,
+                1 => 1,
+                w => tower_to_flat_u128(w),
+            };
+        }
+
         Self {
             lane,
             locals,
@@ -567,6 +592,8 @@ impl PermMdsBlendGate {
             s_idx,
             is_full_idx,
             is_round_idx,
+            mds_full_flat,
+            mds_partial_flat,
         }
     }
 
@@ -620,6 +647,56 @@ impl Constraint for PermMdsBlendGate {
 
         let one_plus_is_full = is_full + Block128::ONE;
         is_round * (is_full * full_residue + one_plus_is_full * partial_residue)
+    }
+
+    /// [2.C.4] Flat-basis evaluator. Mirrors `evaluate` operation by
+    /// operation, using `clmul_gcm` for the basis-sensitive mults and
+    /// XOR for addition. Coefficients come from the pre-converted
+    /// `mds_full_flat` / `mds_partial_flat` caches. Bit-identical to
+    /// `tower_to_flat_u128(self.evaluate(...))` by the flat isomorphism.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let s_next = frame.next[0];
+        let sout: [u128; STATE_SIZE] = [
+            frame.local[self.sout_idx[0]],
+            frame.local[self.sout_idx[1]],
+            frame.local[self.sout_idx[2]],
+            frame.local[self.sout_idx[3]],
+        ];
+        let is_full = frame.local[self.is_full_idx];
+        let is_round = frame.local[self.is_round_idx];
+
+        // Full arm: s_next ^ Σ MDS_FULL_FLAT[lane][j] · sout[j]
+        let mut full_residue = s_next;
+        for j in 0..STATE_SIZE {
+            let wf = self.mds_full_flat[j];
+            if wf == 1 {
+                full_residue ^= sout[j];
+            } else if wf != 0 {
+                full_residue ^= clmul_gcm(wf, sout[j]);
+            }
+        }
+
+        // Partial arm operands: [sout[0], s[1], s[2], s[3]].
+        let partial_inputs: [u128; STATE_SIZE] = [
+            sout[0],
+            frame.local[self.s_idx[0]],
+            frame.local[self.s_idx[1]],
+            frame.local[self.s_idx[2]],
+        ];
+        let mut partial_residue = s_next;
+        for j in 0..STATE_SIZE {
+            let wf = self.mds_partial_flat[j];
+            if wf == 1 {
+                partial_residue ^= partial_inputs[j];
+            } else if wf != 0 {
+                partial_residue ^= clmul_gcm(wf, partial_inputs[j]);
+            }
+        }
+
+        // `is_full + 1` = `is_full ^ 1` (GF(2) elements are basis-invariant).
+        let one_plus_is_full = is_full ^ 1;
+        let inner = clmul_gcm(is_full, full_residue) ^ clmul_gcm(one_plus_is_full, partial_residue);
+        clmul_gcm(is_round, inner)
     }
 }
 
@@ -711,6 +788,14 @@ impl Constraint for PartialSboxKillGate {
         let is_full = frame.local[0];
         let sin = frame.local[1];
         (is_full + Block128::ONE) * sin
+    }
+    /// [2.C.4] Flat-basis evaluator: `is_full` is a GF(2) selector, so
+    /// `(is_full + 1)` equals `is_full ^ 1` in every basis. Single
+    /// `clmul_gcm` and one XOR.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_full = frame.local[0];
+        let sin = frame.local[1];
+        clmul_gcm(is_full ^ 1, sin)
     }
 }
 

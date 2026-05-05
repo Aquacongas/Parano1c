@@ -14,7 +14,8 @@
 //! `out − a·b == 0`; we write the char-2 form because `+` and `−`
 //! coincide on `Block128` and `Block128::ZERO` is additive identity.
 
-use crate::{Constraint, EvalFrame};
+use crate::{Constraint, EvalFrame, FlatEvalFrame};
+use noid_core::hardware::{clmul_gcm, square_flat_u128};
 use noid_core::Block128;
 
 /// `out == a · b` (local-only, degree 2).
@@ -42,6 +43,16 @@ impl Constraint for MulGate {
         let a = frame.local[1];
         let b = frame.local[2];
         out + a * b
+    }
+    /// [2.C.3] Flat-basis evaluator: XOR + single CLMUL. Equivalent
+    /// to the tower path by isomorphism of the multiplicative group
+    /// under `F = tower_to_flat_u128`:
+    ///   `F(out + a*b) = F(out) ^ F(a)*F(b) = out_flat ^ clmul_gcm(a_flat, b_flat)`.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let out = frame.local[0];
+        let a = frame.local[1];
+        let b = frame.local[2];
+        out ^ clmul_gcm(a, b)
     }
 }
 
@@ -71,6 +82,14 @@ impl Constraint for SquareGate {
         let out = frame.local[0];
         let a = frame.local[1];
         out + a * a
+    }
+    /// [2.C.3] Flat-basis squaring via the dedicated
+    /// `square_flat_u128` kernel (single Frobenius linear map, no
+    /// CLMUL needed). Equivalent to tower path as for `BoolGate`.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let out = frame.local[0];
+        let a = frame.local[1];
+        out ^ square_flat_u128(a)
     }
 }
 
@@ -136,5 +155,74 @@ mod tests {
     #[should_panic(expected = "distinct")]
     fn square_gate_rejects_duplicate_columns() {
         let _ = SquareGate::new(0, 0);
+    }
+
+    /// [2.C.3] Flat-vs-tower equivalence for MulGate across a
+    /// parameter sweep including 0, 1, and random-looking values.
+    #[test]
+    fn mul_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let gate = MulGate::new(0, 1, 2);
+        let raws: [u128; 6] = [
+            0,
+            1,
+            0xdead_beef,
+            0xcafe_f00d_1234_5678_u128,
+            0xffff_ffff_ffff_ffff_0000_0000_0000_0001_u128,
+            0x1234_5678_9abc_def0_fedc_ba98_7654_3210_u128,
+        ];
+        for &o in &raws {
+            for &a in &raws {
+                for &b in &raws {
+                    let out = Block128::from(o);
+                    let ab = Block128::from(a);
+                    let bb = Block128::from(b);
+                    let tower_out = gate.evaluate(EvalFrame {
+                        local: &[out, ab, bb],
+                        next: &[],
+                    });
+                    let flat_local = [
+                        tower_to_flat_u128(out.0),
+                        tower_to_flat_u128(ab.0),
+                        tower_to_flat_u128(bb.0),
+                    ];
+                    let flat_out = gate.evaluate_flat(FlatEvalFrame {
+                        local: &flat_local,
+                        next: &[],
+                    });
+                    assert_eq!(
+                        flat_out,
+                        tower_to_flat_u128(tower_out.0),
+                        "MulGate flat diverged at o={o:#x} a={a:#x} b={b:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn square_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let gate = SquareGate::new(0, 1);
+        for raw_o in [0u128, 1, 0xdead, 0xffff_ffff_ffff_ffff_u128] {
+            for raw_a in [0u128, 1, 7, 0x1234_5678_9abc_def0_u128] {
+                let out = Block128::from(raw_o);
+                let a = Block128::from(raw_a);
+                let tower_out = gate.evaluate(EvalFrame {
+                    local: &[out, a],
+                    next: &[],
+                });
+                let flat_local = [tower_to_flat_u128(out.0), tower_to_flat_u128(a.0)];
+                let flat_out = gate.evaluate_flat(FlatEvalFrame {
+                    local: &flat_local,
+                    next: &[],
+                });
+                assert_eq!(
+                    flat_out,
+                    tower_to_flat_u128(tower_out.0),
+                    "SquareGate flat diverged at o={raw_o:#x} a={raw_a:#x}"
+                );
+            }
+        }
     }
 }
