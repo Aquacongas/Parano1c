@@ -37,13 +37,18 @@ pub use bit_adder::{
     BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
 };
 pub use fri_state_combiner::{
-    build_combiner_side_trace, combiner_instance_output_row, combiner_instance_row_offset,
-    combiner_pre_seeds, extract_combiner_digest, rate_block_to_lanes, FriStateCombinerPreimage,
+    build_combiner_side_trace, combiner_digest_row, combiner_ind_prev_out,
+    combiner_instance_output_row, combiner_instance_row_offset, combiner_pre_s_base,
+    combiner_pre_s_row, combiner_pre_seeds, emit_fri_state_combiner,
+    extract_combiner_digest, extract_combiner_digest_fields, rate_block_to_lanes,
+    FriStateCombinerAir, FriStateCombinerPreimage, COMBINER_IND_DIGEST,
+    COMBINER_IND_PERM_0_ROW_0, COMBINER_IND_PREV_OUT_BASE, COMBINER_PERM_BASE,
+    COMBINER_PERM_LAYOUT, COMBINER_PRE_S_BASE, COMBINER_PRE_S_N_COLS,
     FRI_STATE_COMBINER_LOG_ROWS, FRI_STATE_COMBINER_N_ABSORB_BLOCKS,
-    FRI_STATE_COMBINER_N_PERMS_PER_SIDE, FRI_STATE_COMBINER_N_ROWS,
-    FRI_STATE_COMBINER_PAD_LANE_0, FRI_STATE_COMBINER_PAD_LANE_1,
-    FRI_STATE_COMBINER_PREIMAGE_BYTES, FRI_STATE_COMBINER_SCAFFOLD_N_COLS,
-    FRI_STATE_COMBINER_SLOT_LOG_ROWS, FRI_STATE_COMBINER_SLOT_ROWS,
+    FRI_STATE_COMBINER_N_COLS, FRI_STATE_COMBINER_N_PERMS_PER_SIDE,
+    FRI_STATE_COMBINER_N_ROWS, FRI_STATE_COMBINER_PAD_LANE_0,
+    FRI_STATE_COMBINER_PAD_LANE_1, FRI_STATE_COMBINER_PREIMAGE_BYTES,
+    FRI_STATE_COMBINER_SCAFFOLD_N_COLS, FRI_STATE_COMBINER_SLOT_ROWS,
 };
 pub use fri_state_open::{
     col_delta_acc_owner_hi, col_delta_acc_owner_lo, col_delta_acc_value, col_delta_owner_hi,
