@@ -48,6 +48,7 @@ pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
+pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
 
 #[cfg(test)]
 mod tests {
@@ -66,6 +67,7 @@ mod tests {
             TAG_FSCHALNG,
             TAG_COMPRESS,
             TAG_DAWTNSS,
+            TAG_FRISTATE,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

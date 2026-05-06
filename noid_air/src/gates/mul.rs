@@ -93,6 +93,65 @@ impl Constraint for SquareGate {
     }
 }
 
+/// `out == a · b · c` (local-only, degree 3).
+///
+/// Motivation. Several AIR stages stack two `MulGate`s through an
+/// intermediate committed column to express a triple product —
+/// e.g. `FriStateOpenAir`'s β.2.a pipeline
+///   `gp_lane = γ^i · (eq(r, slot_bits) · opened_pre_lane)`
+/// which α + β.2.a split via a committed `col_mle_prod_*`
+/// intermediate. Fusing to one degree-3 gate drops the intermediate
+/// column (one fewer FRI commitment per lane) at the cost of one
+/// more degree level, which the quotient machinery already
+/// absorbs (e.g. `HLeafAir` / MDS-blend constraints are degree-3).
+pub struct TripleProductGate {
+    cols: [usize; 4],
+}
+
+impl TripleProductGate {
+    /// New `TripleProductGate` asserting `col[out] == col[a] · col[b]
+    /// · col[c]` on every row. All four column indices must be
+    /// pairwise distinct.
+    pub fn new(out: usize, a: usize, b: usize, c: usize) -> Self {
+        let all = [out, a, b, c];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(
+                    all[i], all[j],
+                    "TripleProductGate: columns must be pairwise distinct"
+                );
+            }
+        }
+        Self { cols: all }
+    }
+}
+
+impl Constraint for TripleProductGate {
+    fn degree(&self) -> usize {
+        3
+    }
+    fn columns(&self) -> &[usize] {
+        &self.cols
+    }
+    fn evaluate(&self, frame: EvalFrame) -> Block128 {
+        let out = frame.local[0];
+        let a = frame.local[1];
+        let b = frame.local[2];
+        let c = frame.local[3];
+        out + a * b * c
+    }
+    /// Flat-basis evaluator: two chained CLMULs + XOR. Equivalent
+    /// to the tower path by the same `F(a·b) = clmul_gcm(F(a), F(b))`
+    /// isomorphism used in `MulGate::evaluate_flat`.
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let out = frame.local[0];
+        let a = frame.local[1];
+        let b = frame.local[2];
+        let c = frame.local[3];
+        out ^ clmul_gcm(clmul_gcm(a, b), c)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

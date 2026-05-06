@@ -5,9 +5,12 @@
 //!
 //! The chain state is a vector of `2^log_slots` UTXO slots. Each slot is
 //! a `SlotValue { value, owner_hi, owner_lo }` tuple. The commitment is
-//! the Blake3 compression of three independent FRI Merkle roots — one
-//! per slot-column — plus the `log_slots` depth tag. Unused / spent
-//! slots carry `SlotValue::EMPTY` (all zeros).
+//! a Poseidon2b sponge over three independent FRI Merkle roots — one
+//! per slot-column — keyed by `TAG_FRISTATE` capacity IV with `log_slots`
+//! absorbed first. Unused / spent slots carry `SlotValue::EMPTY` (all
+//! zeros). Poseidon2b (not Blake3) was chosen so that the in-circuit
+//! Stage 4c.3 combiner AIR reuses the already-arithmetised
+//! `PoseidonPermAir` primitive. FRI Merkle internals still use Blake3.
 //!
 //! Why FRI over SMT: opening a slot is a batched FRI opening, which the
 //! transaction AIR verifies via sumcheck rather than through 32+ hash
@@ -22,6 +25,7 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::channel::Channel;
 use noid_fri::hasher::Blake3Hasher;
+use noid_poseidon2b::native::{capacity_iv, Poseidon2bSponge, TAG_FRISTATE};
 use noid_fri::prover::{
     commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment,
 };
@@ -177,11 +181,12 @@ impl FriState {
     /// Compute (or return cached) state root. The root is
     ///
     /// ```text
-    /// blake3( "PARANOID/FRISTATE/v1"
-    ///       || log_slots (LE u32)
-    ///       || fri_root(values)
-    ///       || fri_root(owners_hi)
-    ///       || fri_root(owners_lo) )
+    /// Poseidon2bSponge::with_iv(capacity_iv(TAG_FRISTATE))
+    ///     .absorb( log_slots (LE u32, zero-padded to 32 bytes) )
+    ///     .absorb( fri_root(values) )
+    ///     .absorb( fri_root(owners_hi) )
+    ///     .absorb( fri_root(owners_lo) )
+    ///     .finalize()
     /// ```
     ///
     /// Each column root is the FRI Merkle commitment of the column's
@@ -305,13 +310,12 @@ pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotVa
             .map_err(|_| StateError::OpeningFailed)?;
     }
 
-    let mut buf = Vec::with_capacity(STATE_DOMAIN.len() + 4 + 32 * 3);
-    buf.extend_from_slice(STATE_DOMAIN);
-    buf.extend_from_slice(&(op.log_slots as u32).to_le_bytes());
-    buf.extend_from_slice(&op.values.commitment.vector_commitment.root);
-    buf.extend_from_slice(&op.owners_hi.commitment.vector_commitment.root);
-    buf.extend_from_slice(&op.owners_lo.commitment.vector_commitment.root);
-    let combined: StateRoot = *blake3::hash(&buf).as_bytes();
+    let combined: StateRoot = combine_roots(
+        op.log_slots,
+        &op.values.commitment.vector_commitment.root,
+        &op.owners_hi.commitment.vector_commitment.root,
+        &op.owners_lo.commitment.vector_commitment.root,
+    );
     if combined != *state_root {
         return Err(StateError::OpeningFailed);
     }
@@ -322,13 +326,29 @@ pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotVa
 // Root computation
 // ---------------------------------------------------------------------------
 
-const STATE_DOMAIN: &[u8; 20] = b"PARANOID/FRISTATE/v1";
-
 fn column_root(log_slots: usize, evals: &[Block128]) -> [u8; 32] {
     debug_assert_eq!(evals.len(), 1usize << log_slots);
     let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
     let commitment = fri_commit_fast(evals, &ntt);
     commitment.vector_commitment.root
+}
+
+/// Domain-separated Poseidon2b sponge over `log_slots` and the three
+/// per-lane FRI roots. Matches the in-circuit Stage 4c.3 combiner AIR.
+fn combine_roots(
+    log_slots: usize,
+    r_val: &[u8; 32],
+    r_hi: &[u8; 32],
+    r_lo: &[u8; 32],
+) -> StateRoot {
+    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_FRISTATE));
+    let mut depth = [0u8; 32];
+    depth[..4].copy_from_slice(&(log_slots as u32).to_le_bytes());
+    sponge.update(&depth);
+    sponge.update(r_val);
+    sponge.update(r_hi);
+    sponge.update(r_lo);
+    sponge.finalize()
 }
 
 fn combined_root(
@@ -340,14 +360,7 @@ fn combined_root(
     let r_val = column_root(log_slots, values);
     let r_hi = column_root(log_slots, owners_hi);
     let r_lo = column_root(log_slots, owners_lo);
-
-    let mut buf = Vec::with_capacity(STATE_DOMAIN.len() + 4 + 32 * 3);
-    buf.extend_from_slice(STATE_DOMAIN);
-    buf.extend_from_slice(&(log_slots as u32).to_le_bytes());
-    buf.extend_from_slice(&r_val);
-    buf.extend_from_slice(&r_hi);
-    buf.extend_from_slice(&r_lo);
-    *blake3::hash(&buf).as_bytes()
+    combine_roots(log_slots, &r_val, &r_hi, &r_lo)
 }
 
 // ---------------------------------------------------------------------------

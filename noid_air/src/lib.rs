@@ -97,8 +97,8 @@ pub use airs::{
 pub use gates::{
     emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector,
     emit_public_cell, emit_row_selector, emit_rows_must_be_zero,
-    multi_row_indicator_programme, row_indicator_programme, BoolGate, MulGate, PublicColumn,
-    SelectorGate, SquareGate, WeightedLinearGate, WeightedLinearGateShifted,
+    multi_row_indicator_programme, row_indicator_programme, BoolGate, EqLadderStepGate, MulGate,
+    PublicColumn, SelectorGate, SquareGate, WeightedLinearGate, WeightedLinearGateShifted,
 };
 
 // ---------------------------------------------------------------------------

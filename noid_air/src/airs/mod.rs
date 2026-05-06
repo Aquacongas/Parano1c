@@ -7,6 +7,7 @@
 pub mod balance_gate;
 pub mod bit_adder;
 pub mod carry_ripple;
+pub mod fri_state_combiner;
 pub mod fri_state_open;
 pub mod haddr;
 pub mod hauth;
@@ -35,14 +36,24 @@ pub use bit_adder::{
     BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
     BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
 };
+pub use fri_state_combiner::{
+    build_combiner_side_trace, combiner_instance_output_row, combiner_instance_row_offset,
+    combiner_pre_seeds, extract_combiner_digest, rate_block_to_lanes, FriStateCombinerPreimage,
+    FRI_STATE_COMBINER_LOG_ROWS, FRI_STATE_COMBINER_N_ABSORB_BLOCKS,
+    FRI_STATE_COMBINER_N_PERMS_PER_SIDE, FRI_STATE_COMBINER_N_ROWS,
+    FRI_STATE_COMBINER_PAD_LANE_0, FRI_STATE_COMBINER_PAD_LANE_1,
+    FRI_STATE_COMBINER_PREIMAGE_BYTES, FRI_STATE_COMBINER_SCAFFOLD_N_COLS,
+    FRI_STATE_COMBINER_SLOT_LOG_ROWS, FRI_STATE_COMBINER_SLOT_ROWS,
+};
 pub use fri_state_open::{
-    col_delta_owner_hi, col_delta_owner_lo, col_delta_value, col_eval_point, col_is_mint,
-    col_is_spend, col_live_mask, col_new_state_root_hi, col_new_state_root_lo,
+    col_delta_acc_owner_hi, col_delta_acc_owner_lo, col_delta_acc_value, col_delta_owner_hi,
+    col_delta_owner_lo, col_delta_value, col_eq_delta_owner_hi, col_eq_delta_owner_lo,
+    col_eq_delta_value, col_eq_ladder, col_eval_point, col_is_mint, col_is_spend, col_live_mask,
     col_opened_pre_owner_hi, col_opened_pre_owner_lo, col_opened_pre_value,
-    col_proof_round_digest,
-    FriStateOpenAir, FriStateOpenClaim, FriStateOpenWitness, COL_IDX_BIT_BASE, COL_OWNER_HI,
-    COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_LOG_SLOTS,
-    FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS, FRI_STATE_OPEN_WITNESS_COLS,
+    col_proof_round_digest, FriStateOpenAir, FriStateOpenClaim, FriStateOpenWitness,
+    COL_IDX_BIT_BASE, COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_LOG_ROWS,
+    FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS,
+    FRI_STATE_OPEN_WITNESS_COLS,
 };
 pub use haddr::{
     build_haddr_trace, emit_haddr, extract_haddr_output, HAddrAir, HADDR_B_SEED_ROW,
