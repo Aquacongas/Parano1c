@@ -71,7 +71,13 @@ impl BitWitness {
     pub fn as_expanded_field(&self) -> Vec<Block128> {
         let bits = self.as_expanded();
         bits.into_iter()
-            .map(|b| if b == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|b| {
+                if b == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect()
     }
 }

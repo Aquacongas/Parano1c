@@ -259,7 +259,10 @@ mod tests {
     #[test]
     fn roundtrip_bit_column() {
         let n = 256;
-        let trace = Trace::new_with_domains(vec![bit_col(n, 0xa5a5_5a5a_dead_beef)], vec![ColumnDomain::Bit]);
+        let trace = Trace::new_with_domains(
+            vec![bit_col(n, 0xa5a5_5a5a_dead_beef)],
+            vec![ColumnDomain::Bit],
+        );
         let pw = pack_trace(&trace);
         assert_eq!(pw.columns[0].payload.len(), n / 8);
         let back = unpack_trace(&pw).unwrap();
@@ -292,7 +295,11 @@ mod tests {
         let n = 256;
         let trace = Trace::new_with_domains(
             vec![bit_col(n, 0x1234_5678), byte_col(n), block_col(n)],
-            vec![ColumnDomain::Bit, ColumnDomain::Byte, ColumnDomain::Block128],
+            vec![
+                ColumnDomain::Bit,
+                ColumnDomain::Byte,
+                ColumnDomain::Block128,
+            ],
         );
         let pw = pack_trace(&trace);
         let back = unpack_trace(&pw).unwrap();
@@ -315,7 +322,11 @@ mod tests {
         let n = 256;
         let trace = Trace::new_with_domains(
             vec![bit_col(n, 0x1234), byte_col(n), block_col(n)],
-            vec![ColumnDomain::Bit, ColumnDomain::Byte, ColumnDomain::Block128],
+            vec![
+                ColumnDomain::Bit,
+                ColumnDomain::Byte,
+                ColumnDomain::Block128,
+            ],
         );
         assert_eq!(trace_witness_root(&trace), trace_witness_root(&trace));
     }
@@ -353,7 +364,10 @@ mod tests {
         ));
         let mut impostor = bit_payload.clone();
         impostor.columns[0].domain = ColumnDomain::Byte;
-        assert_ne!(packed_witness_root(&bit_payload), packed_witness_root(&impostor));
+        assert_ne!(
+            packed_witness_root(&bit_payload),
+            packed_witness_root(&impostor)
+        );
     }
 
     #[test]

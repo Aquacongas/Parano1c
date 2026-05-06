@@ -28,5 +28,5 @@ pub mod pack;
 pub mod witness;
 
 pub use commit::{PackedCommit, PackedCommitment, PackedEvalProof};
-pub use pack::{unpack_bits, unpack_bytes, pack_bits, pack_bytes, BETA};
+pub use pack::{pack_bits, pack_bytes, unpack_bits, unpack_bytes, BETA};
 pub use witness::{BitWitness, ByteWitness};

@@ -62,10 +62,11 @@ impl Constraint for SelectorGate {
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         let selector = frame.local[0];
         if self.inner_local_remap.is_empty() {
-            return selector * self.inner.evaluate(EvalFrame {
-                local: &[],
-                next: frame.next,
-            });
+            return selector
+                * self.inner.evaluate(EvalFrame {
+                    local: &[],
+                    next: frame.next,
+                });
         }
         let inner_local: Vec<Block128> = self
             .inner_local_remap
@@ -115,8 +116,7 @@ mod tests {
 
     #[test]
     fn selector_gate_suppresses_on_zero_selector() {
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
         let sel = SelectorGate::new(0, inner);
         let air = CompositeAir::from_parts(2, 3, vec![Box::new(sel)]);
         let n = 1 << 2;
@@ -129,8 +129,7 @@ mod tests {
 
     #[test]
     fn selector_gate_fires_on_one_selector() {
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
         let sel = SelectorGate::new(0, inner);
         let air = CompositeAir::from_parts(2, 3, vec![Box::new(sel)]);
         let n = 1 << 2;
@@ -146,8 +145,7 @@ mod tests {
     #[test]
     fn selector_flat_matches_tower() {
         use noid_core::hardware::tower_to_flat_u128;
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
         let sel = SelectorGate::new(0, inner);
         for (s_raw, a_raw, b_raw) in [
             (0u128, 0u128, 0u128),
@@ -160,7 +158,10 @@ mod tests {
             let b = Block128::from(b_raw);
             let tower_out = <SelectorGate as Constraint>::evaluate(
                 &sel,
-                EvalFrame { local: &[s, a, b], next: &[] },
+                EvalFrame {
+                    local: &[s, a, b],
+                    next: &[],
+                },
             );
             let flat_out = <SelectorGate as Constraint>::evaluate_flat(
                 &sel,

@@ -46,10 +46,10 @@
 //! as integer-doubling anywhere in the chain.
 
 use crate::airs::bit_adder::{
-    bit_adder_is_input_programme, bit_adder_is_reset_programme, emit_block_constraints,
-    BitAdderAir, BitAdderLayout, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY,
-    BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS,
-    BIT_ADDER_N_COLS,
+    bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
+    emit_block_constraints, BitAdderAir, BitAdderLayout, BIT_ADDER_COL_A, BIT_ADDER_COL_B,
+    BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM,
+    BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_N_COLS,
 };
 use crate::gates::PublicColumn;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
@@ -221,9 +221,7 @@ impl Constraint for BalanceFinalCarryGate {
         let is_input_a2_next = frame.next[0];
         let a2_carry_next = frame.next[1];
         let b21_sum_next = frame.next[2];
-        is_input_a2
-            * (Block128::ONE + is_input_a2_next)
-            * (a2_carry_next + b21_sum_next)
+        is_input_a2 * (Block128::ONE + is_input_a2_next) * (a2_carry_next + b21_sum_next)
     }
 }
 
@@ -282,18 +280,54 @@ struct BridgeSpec {
 
 const BRIDGES: [BridgeSpec; 9] = [
     // Chain A
-    BridgeSpec { src: BLK_A0, dst: BLK_A2, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_A1, dst: BLK_A2, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_A0,
+        dst: BLK_A2,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_A1,
+        dst: BLK_A2,
+        slot: OperandSlot::B,
+    },
     // Chain B — level 1 → 2
-    BridgeSpec { src: BLK_B00, dst: BLK_B10, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B01, dst: BLK_B10, slot: OperandSlot::B },
-    BridgeSpec { src: BLK_B02, dst: BLK_B11, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B03, dst: BLK_B11, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_B00,
+        dst: BLK_B10,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B01,
+        dst: BLK_B10,
+        slot: OperandSlot::B,
+    },
+    BridgeSpec {
+        src: BLK_B02,
+        dst: BLK_B11,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B03,
+        dst: BLK_B11,
+        slot: OperandSlot::B,
+    },
     // Chain B — level 2 → 3
-    BridgeSpec { src: BLK_B10, dst: BLK_B20, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B11, dst: BLK_B20, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_B10,
+        dst: BLK_B20,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B11,
+        dst: BLK_B20,
+        slot: OperandSlot::B,
+    },
     // Chain B — fee tail
-    BridgeSpec { src: BLK_B20, dst: BLK_B21, slot: OperandSlot::A },
+    BridgeSpec {
+        src: BLK_B20,
+        dst: BLK_B21,
+        slot: OperandSlot::A,
+    },
 ];
 
 fn dst_col_at(block: usize, slot: OperandSlot, base_col: usize) -> usize {
@@ -485,10 +519,7 @@ pub fn build_balance_trace_parts(
 /// used to be free witnesses. `base_col` is the column offset of the
 /// balance block inside the composite trace; pass `0` for the
 /// standalone `BalanceGateAir`.
-pub fn emit_balance_selector_public_columns(
-    base_col: usize,
-    log_rows: usize,
-) -> Vec<PublicColumn> {
+pub fn emit_balance_selector_public_columns(base_col: usize, log_rows: usize) -> Vec<PublicColumn> {
     assert!(
         log_rows >= BALANCE_MIN_LOG_ROWS,
         "balance selector publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
@@ -504,6 +535,70 @@ pub fn emit_balance_selector_public_columns(
         out.push(PublicColumn::new(
             block_base + BIT_ADDER_COL_IS_INPUT,
             bit_adder_is_input_programme(width, log_rows),
+        ));
+    }
+    out
+}
+
+/// One primary-operand pin: which block's which slot carries which of
+/// the 13 public u64s of `TxBody` (`i0..i3`, `o0..o7`, `fee`).
+const PRIMARY_OPERAND_PINS: [(usize, OperandSlot); 13] = [
+    (BLK_A0, OperandSlot::A),  // i0
+    (BLK_A0, OperandSlot::B),  // i1
+    (BLK_A1, OperandSlot::A),  // i2
+    (BLK_A1, OperandSlot::B),  // i3
+    (BLK_B00, OperandSlot::A), // o0
+    (BLK_B00, OperandSlot::B), // o1
+    (BLK_B01, OperandSlot::A), // o2
+    (BLK_B01, OperandSlot::B), // o3
+    (BLK_B02, OperandSlot::A), // o4
+    (BLK_B02, OperandSlot::B), // o5
+    (BLK_B03, OperandSlot::A), // o6
+    (BLK_B03, OperandSlot::B), // o7
+    (BLK_B21, OperandSlot::B), // fee
+];
+
+/// §3d-0.10.5 — pin every primary balance operand (`i0..i3`, `o0..o7`,
+/// `fee`) to its public `TxBody` u64 value via `PublicColumn`
+/// declarations on the corresponding `.a` / `.b` bit-column of the
+/// owning `bit_adder` block. Each pin is a single-column, 64-row
+/// programme: bit `r` on row `r`, zero elsewhere (across every
+/// instance of the hypercube — only instance 0 is populated by the
+/// honest prover, higher instances are zero-filled padding).
+///
+/// Closes the §3b-4 debt item: "witness `Value` column is not wired to
+/// any balance operand; an adversary could populate the balance
+/// circuit with a balanced tuple unrelated to the witness". Since
+/// every `TxInput.value` / `TxOutput.value` / `TxBody.fee` is part of
+/// the public `TxBody`, the binding is a pure public-input equality —
+/// no in-circuit integer accumulator, no new gate types, no widening
+/// of the trace. 13 × 1 `PublicColumn`s = 13 declarations.
+///
+/// `base_col` is the column offset of the balance block inside the
+/// composite trace (use `0` for the standalone `BalanceGateAir`).
+pub fn emit_balance_value_public_columns(
+    base_col: usize,
+    log_rows: usize,
+    inputs: [u64; 4],
+    outputs: [u64; 8],
+    fee: u64,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "balance value publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let values: [u64; 13] = [
+        inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1], outputs[2], outputs[3],
+        outputs[4], outputs[5], outputs[6], outputs[7], fee,
+    ];
+    let mut out = Vec::with_capacity(13);
+    for (i, &(blk, slot)) in PRIMARY_OPERAND_PINS.iter().enumerate() {
+        let col = dst_col_at(blk, slot, base_col);
+        // Every primary operand is a u64; the containing bit_adder block
+        // has width >= 64, so 64-row programme coverage is well-defined.
+        out.push(PublicColumn::new(
+            col,
+            bit_adder_operand_programme(64, values[i], log_rows),
         ));
     }
     out
@@ -549,6 +644,34 @@ impl BalanceGateAir {
         }
     }
 
+    /// §3d-0.10.5 — balance AIR with both the 22 selector programmes
+    /// AND the 13 primary-operand value programmes pinned. Constraints
+    /// are unchanged; adversaries that populate the balance circuit
+    /// with values disagreeing with `TxBody` are caught by the public
+    /// value pins (native) and by the STARK verifier's public-column
+    /// MLE re-eval. Requires the concrete `(inputs, outputs, fee)` at
+    /// AIR construction time because the programmes depend on them.
+    pub fn new_with_value_pins(
+        log_rows: usize,
+        inputs: [u64; 4],
+        outputs: [u64; 8],
+        fee: u64,
+    ) -> Self {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "BalanceGateAir needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        let mut public_columns = emit_balance_selector_public_columns(0, log_rows);
+        public_columns.extend(emit_balance_value_public_columns(
+            0, log_rows, inputs, outputs, fee,
+        ));
+        Self {
+            log_rows,
+            constraints: emit_balance_constraints(0),
+            public_columns,
+        }
+    }
+
     pub fn n_instances(&self) -> usize {
         1usize << (self.log_rows - BIT_ADDER_LOG_WORD_BITS)
     }
@@ -558,8 +681,7 @@ impl BalanceGateAir {
     /// the actual tx, instances `1..n_instances` are zero-filled
     /// padding (operands `(0, 0)` trivially satisfy every constraint).
     pub fn build_trace(&self, inputs: [u64; 4], outputs: [u64; 8], fee: u64) -> Trace {
-        let (cols, domains) =
-            build_balance_trace_parts(self.log_rows, inputs, outputs, fee);
+        let (cols, domains) = build_balance_trace_parts(self.log_rows, inputs, outputs, fee);
         Trace::new_with_domains(cols, domains)
     }
 }
@@ -791,6 +913,80 @@ mod tests {
         // 128-row stride, so programme pins it to ZERO. Set it to ONE.
         bad.columns[col][1] = Block128::ONE;
         assert!(!air.check(&bad));
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 3d-0.10.5 — primary-operand value pinning
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn balance_value_publics_cover_13_operands() {
+        let publics = emit_balance_value_public_columns(
+            0,
+            LOG_ROWS,
+            [1, 2, 3, 4],
+            [5, 6, 7, 8, 9, 10, 11, 12],
+            13,
+        );
+        assert_eq!(publics.len(), 13);
+        // The fee pin must land on BLK_B21.b.
+        let expected_fee_col = BLK_B21 * BIT_ADDER_N_COLS + BIT_ADDER_COL_B;
+        assert_eq!(publics[12].col, expected_fee_col);
+        assert_eq!(publics[12].values.len(), 1 << LOG_ROWS);
+        // Fee value is 13 = 0b1101 → bits 0, 2, 3 should be ONE.
+        assert_eq!(publics[12].values[0], Block128::ONE);
+        assert_eq!(publics[12].values[1], Block128::ZERO);
+        assert_eq!(publics[12].values[2], Block128::ONE);
+        assert_eq!(publics[12].values[3], Block128::ONE);
+    }
+
+    #[test]
+    fn balance_value_pins_accept_honest_witness() {
+        let (ins, outs, fee) = balanced_tuple(50);
+        let air = BalanceGateAir::new_with_value_pins(LOG_ROWS, ins, outs, fee);
+        let trace = air.build_trace(ins, outs, fee);
+        assert!(air.check(&trace));
+        // 22 selector publics + 13 value publics.
+        assert_eq!(air.public_columns().len(), 22 + 13);
+    }
+
+    #[test]
+    fn balance_value_pins_reject_mismatched_operand() {
+        // Build the AIR for one (ins, outs, fee) tuple but feed the trace
+        // of a DIFFERENT tuple that also happens to be balanced. The
+        // circuit-internal gates accept (both tuples are self-consistent)
+        // but the value public-column pins must reject.
+        let (ins_a, outs_a, fee_a) = balanced_tuple(91);
+        let (ins_b, outs_b, fee_b) = balanced_tuple(92);
+        // Ensure the two tuples genuinely differ.
+        assert_ne!(ins_a, ins_b);
+        let air = BalanceGateAir::new_with_value_pins(LOG_ROWS, ins_a, outs_a, fee_a);
+        let trace = air.build_trace(ins_b, outs_b, fee_b);
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn balance_value_pins_reject_single_bit_tamper() {
+        let (ins, outs, fee) = balanced_tuple(77);
+        let air = BalanceGateAir::new_with_value_pins(LOG_ROWS, ins, outs, fee);
+        let mut trace = air.build_trace(ins, outs, fee);
+        // Flip BLK_A0.a[0] (bit 0 of i0). The FA/bridge gates would
+        // catch this too — but the pin catches it first (identical-
+        // behaviour assertion: `check` still rejects).
+        let col = BLK_A0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_A;
+        trace.columns[col][0] += Block128::ONE;
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn balance_value_pins_reject_fee_bit_tamper() {
+        let (ins, outs, fee) = balanced_tuple(3);
+        let air = BalanceGateAir::new_with_value_pins(LOG_ROWS, ins, outs, fee);
+        let mut trace = air.build_trace(ins, outs, fee);
+        // Flip BLK_B21.b[5] (bit 5 of fee).
+        let col = BLK_B21 * BIT_ADDER_N_COLS + BIT_ADDER_COL_B;
+        trace.columns[col][5] += Block128::ONE;
+        assert!(!air.check(&trace));
     }
 
     #[test]

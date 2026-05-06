@@ -148,10 +148,7 @@ impl WeightTrails {
 /// `(j << (k+1)) | (1 << k)` where `j ∈ [0, 2^{n-k-1})` and the values
 /// there equal `eq_ind_partial_eval(r[k+1..])`. `P_n` contributes only
 /// to index 0 (value `1`). The per-`k` supports are disjoint.
-pub fn build_weight_table_from_trails(
-    gamma: Block128,
-    trails: &WeightTrails,
-) -> Vec<Block128> {
+pub fn build_weight_table_from_trails(gamma: Block128, trails: &WeightTrails) -> Vec<Block128> {
     let n = trails.n;
     let len = 1usize << n;
     let mut w = vec![Block128::ZERO; len];
@@ -230,7 +227,13 @@ mod tests {
         let table = build_weight_table_from_trails(gamma, &trails);
         for idx in 0..(1usize << n) {
             let x: Vec<Block128> = (0..n)
-                .map(|b| if (idx >> b) & 1 == 1 { Block128::ONE } else { Block128::ZERO })
+                .map(|b| {
+                    if (idx >> b) & 1 == 1 {
+                        Block128::ONE
+                    } else {
+                        Block128::ZERO
+                    }
+                })
                 .collect();
             let mut expected = Block128::ZERO;
             let mut gk = Block128::ONE;

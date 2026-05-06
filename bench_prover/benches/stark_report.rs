@@ -1,121 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Paranoid STARK report — roadmap tracker.
+//! Paranoid STARK report — **Transparent UTXO Validity Engine**.
 //!
 //!   cargo bench --bench stark_report
 //!
-//! Unlike `release_report` (which is a stable hardware-floor dump of
-//! primitives), this report grows alongside the roadmap. It measures
-//! every `*Air` that has actually landed in `noid_air::airs`, on trace
-//! sizes that are relevant to the Stage 3b/3c/3d critical path.
+//! # What this is
 //!
-//! Current coverage (maps to ROADMAP.md):
+//! Paranoid is a transparent (no encrypted values, no shielded pools)
+//! UTXO chain whose state transitions are proven correct by a
+//! client-side STARK. Every wallet transaction produces one STARK
+//! proof before it is broadcast to the mempool; block builders
+//! aggregate per-tx proofs via IVC (separate workload, not covered
+//! here).
 //!
-//!   [A] TxValidityAir            — Stage 3a witness skeleton.
-//!                                  log_rows = 4 (padded to the STARK
-//!                                  engine's minimum), 10 columns, two
-//!                                  boolean selectors. Zero algebraic
-//!                                  content beyond bool — this number is
-//!                                  a *shape baseline*, not a speed claim.
+//! The proof system is a Binius-style STARK over the GF(2^128) tower
+//! field, implemented end-to-end in this repository (no external zk
+//! dependencies). The AIRs below encode one UTXO transition:
 //!
-//!   [B] CarryRippleAir           — Stage 3b-0.3/0.4/0.5 rotation-consuming
-//!                                  AIR. 5 columns, 64-bit ripple adder,
-//!                                  one shifted column. `small/mid/prod`
-//!                                  buckets drive the ladder FRI tuning.
+//!   - `BalanceGateAir`      — Σ inputs = Σ outputs + fee (bit-adder
+//!                             composition over GF(2^128)).
+//!   - `RangeGateAir`        — u64 range check via bit-decomposition.
+//!   - `PoseidonPermAir`     — Poseidon2b permutation over GF(2^128).
+//!   - `HAddrAir`            — 2-field sponge: derive_address.
+//!   - `HAuthAir`            — 4-field sponge: hash_auth_tag.
+//!   - `HLeafAir`            — 4-field sponge: hash_input_leaf /
+//!                             hash_utxo_leaf.
+//!   - `TxBodyMerkleAir`     — tx-body Merkle spine: 59 stacked
+//!                             Poseidon2b permutations hashing
+//!                             `(prev_state_root, fee, 4 inputs,
+//!                             8 outputs)` into `tx_body_hash`.
+//!   - `TxValidityAir`       — non-Poseidon half of the transition:
+//!                             witness skeleton, selector discipline,
+//!                             embedded BalanceGate, value-operand
+//!                             public-column pins.
+//!   - `TxBodySpineComposite` — end-to-end transition AIR: TxValidity
+//!                              and TxBodyMerkle stitched with cross-AIR
+//!                              payload ties (production prover path).
 //!
-//!   [D] RangeGateAir             — Stage 3b-2 u64 range check via
-//!                                  bit-decomposition + GF(2^128) weight
-//!                                  ladder. 4 columns, 6 constraints,
-//!                                  two shifted columns. `small/mid/prod`
-//!                                  mirrors the CarryRipple buckets.
+//! # What this report measures
 //!
-//!   [K] TxBodyMerkleAir          — Stage 3d-0.9.E.4.c stack + pre-MDS
-//!                                  binding + full inter-perm echo wiring:
-//!                                  59 Poseidon2b permutations laid out
-//!                                  row-major over a 30-col perm lane +
-//!                                  4 pre_s + 1 head_row_0 + 2 iv_prog +
-//!                                  1 any_row_0 + echo / mask block +
-//!                                  2 leaf-rate payload witness columns
-//!                                  (Opt E.4.c-1 — 16 instances share
-//!                                  one column per rate lane; payload
-//!                                  lives on that instance's row_0,
-//!                                  absorb gate is row-gated)
-//!                                  (log_rows=13, 128-row slot per
-//!                                  instance). Constraint set = 29
-//!                                  interior gates + 4 row-0 MDS + 2
-//!                                  capacity-IV + transition/src_pin/
-//!                                  dst_pin families + 30 E.4.b compress
-//!                                  rate-absorb + 32 E.4.c leaf rate-
-//!                                  absorb. Payload columns stay free
-//!                                  witnesses here; §3d-0.9.H pins them
-//!                                  to §3b-4 tx-body columns (and Opt
-//!                                  H-1 is expected to fold most of the
-//!                                  32 payload-column commitment away).
+//! For each AIR: wall-clock median prove time, verify time, and
+//! estimated proof size (via `estimate_proof_bytes`, not the
+//! serialiser). Prover and verifier wall-clock are bucketed by phase
+//! (commit / transcript+sumcheck / ladder-sumcheck / multipoint+FRI)
+//! so optimisation work has a direct target.
 //!
-//!   [J] HLeafAir                 — Stage 3c-4 `hash_leaf(4 fields)`:
-//!                                  three permutations (absorb #1 +
-//!                                  absorb #2 + padding flush),
-//!                                  structurally identical to HAuthAir,
-//!                                  differs only in capacity IV
-//!                                  (`TAG_LEAF`). Used by
-//!                                  `hash_input_leaf` in the tx-body
-//!                                  Merkle tree. 90 cols, 87 gates.
-//!                                  Boundary ties deferred to §3d.
+//! The critical number is `[P] TxBodySpineComposite` — the actual
+//! per-tx client prover path. Everything above it is a component
+//! bench kept for regression coverage and optimisation guidance.
 //!
-//!   [I] HAuthAir                 — Stage 3c-3 4-field sponge interior:
-//!                                  three permutations back-to-back
-//!                                  (absorb #1 + absorb #2 + padding
-//!                                  flush) matching `hash_auth_tag`.
-//!                                  90 columns, 87 interior gates.
-//!                                  Boundary ties deferred to §3d.
+//! # What this report is not
 //!
-//!   [H] HAddrAir                 — Stage 3c-2 2-field sponge interior:
-//!                                  two permutations back-to-back
-//!                                  (absorb + padding flush) matching
-//!                                  `derive_address(spend_secret)`.
-//!                                  60 columns, 58 interior gates.
-//!                                  Boundary ties deferred to §3d.
-//!
-//!   [G] PoseidonPermAir          — Stage 3c-1 Poseidon2b permutation.
-//!                                  30 columns, 29 selector-gated
-//!                                  constraints (S-box chain / RC binding
-//!                                  / MDS blend / partial-round sin kill),
-//!                                  one shifted column (MDS blend).
-//!                                  `log_rows = POSEIDON_PERM_LOG_ROWS`
-//!                                  (= 8, STARK floor). One permutation
-//!                                  instance per proof — the hash hot
-//!                                  path is one permutation per leaf.
-//!
-//!   [F] TxValidityAir (3b-4)     — Stage 3b-4 composite: witness
-//!                                  skeleton + BalanceGate embedded at
-//!                                  column offset 10. Non-Poseidon half
-//!                                  of the transaction-validity AIR.
-//!                                  `log_rows = TX_VALIDITY_3B4_LOG_ROWS`
-//!                                  (= balance floor, 8), 76 columns.
-//!
-//!   [E] BalanceGateAir           — Stage 3b-3 UTXO conservation law
-//!                                  (`Σ inputs = Σ outputs + fee`). 11
-//!                                  parametric `bit_adder` blocks over
-//!                                  66 columns, cross-block carry bridges
-//!                                  + asymmetric-width tail comparison.
-//!                                  One shifted column per block (11),
-//!                                  128 rows per instance, `small/mid/prod`
-//!                                  mirrors the CarryRipple/Range buckets.
-//!
-//!   [C] LinearCombinationAir     — scaling harness (synthetic constraint
-//!                                  `last = sum of others`). Not a real
-//!                                  gate; included to expose how the
-//!                                  STARK engine scales in `n_cols` and
-//!                                  `log_rows` independent of AIR
-//!                                  algebra. Marked as such in the output.
-//!
-//! As §3c (Poseidon gates), §3d (TxValidityAir full composition) land,
-//! each one gets a new block here. `[C]` will be removed once enough
-//! real gates exist to span the `n_cols` / `log_rows` space honestly.
-//!
-//! For each AIR this report prints wall-clock prove, verify, and proof
-//! size (via `estimate_proof_bytes`, not serialisation).
+//! - Not a batched-proof benchmark. The chain has no flat batching;
+//!   aggregation is IVC-folded.
+//! - Not a circuit sizing study. Gate counts and witness widths are
+//!   printed but not swept.
+//! - Not a hardware-floor microbench. See `release_report` for
+//!   Poseidon / FRI primitives in isolation.
 //!
 //! Companion: `cargo bench --bench release_report`.
 
@@ -124,18 +66,19 @@ use std::time::{Duration, Instant};
 use noid_air::{
     build_perm_trace, emit_perm_all, Air, BalanceGateAir, CarryRippleAir, CompositeAir, HAddrAir,
     HAuthAir, HLeafAir, LinearCombinationAir, RangeGateAir, Trace, TxBodyMerkleAir,
-    TxValidityAir, BIT_ADDER_LOG_WORD_BITS, HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS,
-    HAUTH_N_COLS, HLEAF_LOG_ROWS, HLEAF_N_COLS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
-    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TX_VALIDITY_3B4_LOG_ROWS,
-    TX_VALIDITY_3B4_N_COLS, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
+    TxBodyMerkleBoundaryPins, TxBodySpineComposite, TxValidityAir, BIT_ADDER_LOG_WORD_BITS,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS, HLEAF_LOG_ROWS, HLEAF_N_COLS,
+    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LOG_ROWS,
+    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
+    TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
 };
 use noid_core::{Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::{NUM_QUERIES, TAU};
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::{
-    padded_log_len, prove_air, prove_air_timed, verify_air, verify_air_timed, ProveTimings,
-    StarkProof, VerifyTimings,
+    padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings, StarkProof,
+    VerifyTimings,
 };
 use noid_tx::{PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
@@ -145,43 +88,25 @@ use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 // Config
 // ---------------------------------------------------------------------------
 
-/// CarryRippleAir sweep (Stage 3b-0.3 / 0.4 / 0.5 buckets).
+/// CarryRippleAir sweep — exposes STARK engine scaling for a
+/// single-column algebra (one 64-bit ripple adder per instance).
 const CARRY_SHAPES: &[(&str, usize)] = &[("small", 8), ("mid", 12), ("prod", 16)];
 
-/// RangeGateAir sweep (Stage 3b-2) — same bucket layout as CarryRipple
-/// so numbers can be compared apples-to-apples (both AIRs have 64 rows
-/// per instance, one bit-domain per row).
+/// RangeGateAir sweep — same bucket layout as CarryRipple so the two
+/// numbers are directly comparable (both are 64 rows per instance).
 const RANGE_SHAPES: &[(&str, usize)] = &[("small", 8), ("mid", 12), ("prod", 16)];
 
-/// BalanceGateAir — the ONLY shape we care about in a UTXO /
-/// bitcoin-like model: one transaction per proving session.
+/// BalanceGateAir: one transaction per proof. The chain has no flat
+/// multi-tx batching — the wallet signs one tx, proves one tx, then
+/// broadcasts. Block builders fold per-tx proofs via IVC, not by
+/// re-proving a wider batch.
 ///
-/// The chain has no smart contracts — no approve/swap, no multicall,
-/// no bundled user intents. A wallet signs exactly one tx and proves
-/// exactly one tx before broadcasting; the mempool carries
-/// (tx, proof) pairs; block builders aggregate N per-tx proofs via
-/// IVC / folding in §3e (`noid_ivc`), not via flat batching.
-///
-/// So there is only one meaningful number to measure here: per-tx
-/// client-side prove latency at the STARK floor (TAU=7 ⇒ log_rows ≥ 8).
-/// Each tx instance occupies 128 rows × 66 cols; log_rows=8 ⇒ 2 tx
-/// instance slots (1 active + zero-pad).
-///
-/// Deliberately NOT measured:
-/// - Flat multi-tx batches (log_rows ≥ 10): not a product scenario in
-///   a UTXO chain. Block builders fold, not flat-batch.
-/// - IVC / folding aggregation: separate workload with its own cost
-///   model; lands in `ivc_report.rs` when §3e is ready.
-/// - General scaling-with-size behaviour: already covered by the
-///   CarryRipple and Range sweeps, which use clean per-instance
-///   matrices better suited for scaling studies.
-///
-/// If you ever need a one-off stress run, call
-/// `bench_balance("stress", N)` manually.
+/// `per_tx` at `log_rows = 8` is the STARK floor (TAU = 7 ⇒ log_rows ≥ 8).
+/// One active instance + zero-padded slots.
 const BALANCE_SHAPES: &[(&str, usize)] = &[("per_tx", 8)];
 
-/// LinearCombinationAir scaling harness. Kept small (`log_rows ≤ 14`) so
-/// the report stays under ~2 minutes; bigger sweeps belong in ad-hoc runs.
+/// LinearCombinationAir scaling harness — synthetic constraint used
+/// to expose raw engine scaling independent of AIR algebra.
 const LINCOMB_SHAPES: &[(usize, usize)] = &[(10, 3), (12, 3), (14, 3), (14, 6)];
 
 const WARMUP: usize = 1;
@@ -252,7 +177,7 @@ fn percent(part: Duration, whole: Duration) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Proof-size estimator (matches the one used in `release_report` + `carry_ripple`)
+// Proof-size estimator
 // ---------------------------------------------------------------------------
 
 fn fri_opening_bytes(log_len: usize) -> usize {
@@ -297,7 +222,7 @@ fn estimate_stark_proof_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// Fixture builders
+// Fixtures
 // ---------------------------------------------------------------------------
 
 fn mk_pi() -> PublicInputs {
@@ -327,28 +252,31 @@ fn random_adders(n: usize, mut seed: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
-fn mk_tx_body() -> TxBody {
-    let inputs = (0..MAX_INPUTS)
-        .map(|i| TxInput {
-            slot_index: i as u32,
-            value: 100 + i as u64,
-            owner: Address([i as u8; 32]),
-            spend_secret: SpendSecret([(i ^ 0xAA) as u8; 32]),
-            auth_tag: AuthTag([(i ^ 0x55) as u8; 32]),
-            valid: true,
-        })
-        .collect();
-    let outputs = (0..MAX_OUTPUTS)
-        .map(|i| TxOutput {
-            value: 50 + i as u64,
-            owner: Address([(0x30 | i) as u8; 32]),
-            valid: true,
-        })
-        .collect();
+fn random_u64s(n: usize, mut seed: u64) -> Vec<u64> {
+    (0..n).map(|_| splitmix(&mut seed)).collect()
+}
+
+fn mk_tx_body_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
+    assert_eq!(in_val, out_val + fee);
+    let mut inputs = vec![TxInput::dummy(); MAX_INPUTS];
+    inputs[0] = TxInput {
+        slot_index: 0,
+        value: in_val,
+        owner: Address([0x11; 32]),
+        spend_secret: SpendSecret([0x22; 32]),
+        auth_tag: AuthTag([0x33; 32]),
+        valid: true,
+    };
+    let mut outputs = vec![TxOutput::dummy(); MAX_OUTPUTS];
+    outputs[0] = TxOutput {
+        value: out_val,
+        owner: Address([0x44; 32]),
+        valid: true,
+    };
     TxBody {
         prev_state_root: [0x11; 32],
         new_state_root: [0x22; 32],
-        fee: 7,
+        fee: fee as u128,
         inputs,
         outputs,
     }
@@ -374,207 +302,209 @@ fn mk_linear_trace(log_rows: usize, n_cols: usize) -> Trace {
 }
 
 // ---------------------------------------------------------------------------
-// [A] TxValidityAir — Stage 3a
+// Sample-collection helpers for bucketed prove/verify
 // ---------------------------------------------------------------------------
 
-struct TxValidityRow {
+fn collect_prove_buckets<A: Air>(
+    air: &A,
+    trace: &Trace,
+    pi: &PublicInputs,
+    samples: usize,
+) -> ProveTimings {
+    for _ in 0..WARMUP {
+        let _ = prove_air_timed(air, trace, pi).unwrap();
+    }
+    let mut xs: Vec<ProveTimings> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (_p, t) = prove_air_timed(air, trace, pi).unwrap();
+        xs.push(t);
+    }
+    xs.sort_by_key(|t| t.total());
+    xs[xs.len() / 2]
+}
+
+fn collect_verify_buckets<A: Air>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &StarkProof,
+    samples: usize,
+) -> VerifyTimings {
+    for _ in 0..WARMUP {
+        let (r, _) = verify_air_timed(air, pi, proof);
+        r.unwrap();
+    }
+    let mut xs: Vec<VerifyTimings> = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (r, t) = verify_air_timed(air, pi, proof);
+        r.unwrap();
+        xs.push(t);
+    }
+    xs.sort_by_key(|t| t.total());
+    xs[xs.len() / 2]
+}
+
+// ---------------------------------------------------------------------------
+// Common row / metrics struct used for every AIR
+// ---------------------------------------------------------------------------
+
+struct AirRow {
+    label: String,
     log_rows: usize,
     n_cols: usize,
-    build_ms: Duration,
-    prove_ms: Duration,
-    verify_ms: Duration,
+    n_shifted: usize,
+    extra: Option<String>,
+    prove_total: Duration,
+    prove_buckets: ProveTimings,
+    verify: VerifyTimings,
     proof_bytes: usize,
 }
 
-fn bench_tx_validity() -> TxValidityRow {
-    let air = TxValidityAir::new();
-    let body = mk_tx_body();
-    let build_ms = time(|| {
-        let _ = TxValidityAir::build_trace(&body);
-    });
-    let trace = TxValidityAir::build_trace(&body);
-    assert!(air.check(&trace), "TxValidityAir native check failed");
+fn bench_air<A: Air, F>(
+    label: &str,
+    extra: Option<String>,
+    air: A,
+    trace: Trace,
+    samples: usize,
+    check_msg: F,
+) -> AirRow
+where
+    F: FnOnce() -> String,
+{
+    assert!(air.check(&trace), "{}", check_msg());
     let pi = mk_pi();
 
-    let prove_ms = time(|| {
+    let prove_total = time(|| {
         let _ = prove_air(&air, &trace, &pi).unwrap();
     });
+    let prove_buckets = collect_prove_buckets(&air, &trace, &pi, samples);
+
     let proof = prove_air(&air, &trace, &pi).unwrap();
-    let verify_ms = time(|| {
-        verify_air(&air, &pi, &proof).unwrap();
-    });
+    let verify = collect_verify_buckets(&air, &pi, &proof, samples);
 
     let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air
-        .constraints()
-        .iter()
-        .flat_map(|c| c.shifted_columns().iter().copied())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let n_shifted = air.shifted_column_indices().len();
     let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
 
-    TxValidityRow {
+    AirRow {
+        label: label.to_string(),
         log_rows: air.log_rows(),
         n_cols: air.n_columns(),
-        build_ms,
-        prove_ms,
-        verify_ms,
+        n_shifted,
+        extra,
+        prove_total,
+        prove_buckets,
+        verify,
         proof_bytes,
     }
 }
 
-// ---------------------------------------------------------------------------
-// [B] CarryRippleAir — Stage 3b-0.3/0.4/0.5
-// ---------------------------------------------------------------------------
-
-struct CarryRow {
-    label: &'static str,
-    log_rows: usize,
-    n_instances: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
+fn print_row(tag: &str, r: &AirRow) {
+    println!("  [{tag}] {}", r.label);
+    println!("  +--------------------------------------------------------------------------+");
+    let extra_line = r
+        .extra
+        .as_deref()
+        .map(|s| format!("  {s}"))
+        .unwrap_or_default();
+    println!(
+        "  | log_rows={:>3}  n_cols={:>4}  shifted={:>2}  prove={}  verify={} |",
+        r.log_rows,
+        r.n_cols,
+        r.n_shifted,
+        fmt_ms(r.prove_total),
+        fmt_ms(r.verify.total()),
+    );
+    println!(
+        "  | proof(estimated)={}                                               |",
+        fmt_bytes(r.proof_bytes)
+    );
+    println!("  +--------------------------------------------------------------------------+");
+    if !extra_line.is_empty() {
+        println!("{extra_line}");
+    }
+    let ptot = r.prove_buckets.total();
+    println!(
+        "    prove  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
+        fmt_ms(r.prove_buckets.commit),
+        percent(r.prove_buckets.commit, ptot),
+        fmt_ms(r.prove_buckets.transcript_sumcheck),
+        percent(r.prove_buckets.transcript_sumcheck, ptot),
+        fmt_ms(r.prove_buckets.ladder_sumcheck),
+        percent(r.prove_buckets.ladder_sumcheck, ptot),
+        fmt_ms(r.prove_buckets.multipoint_fri),
+        percent(r.prove_buckets.multipoint_fri, ptot),
+    );
+    let vtot = r.verify.total();
+    println!(
+        "    verify ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
+        fmt_ms(r.verify.transcript_sumcheck),
+        percent(r.verify.transcript_sumcheck, vtot),
+        fmt_ms(r.verify.composition),
+        percent(r.verify.composition, vtot),
+        fmt_ms(r.verify.ladder_sumcheck),
+        percent(r.verify.ladder_sumcheck, vtot),
+        fmt_ms(r.verify.multipoint_fri),
+        percent(r.verify.multipoint_fri, vtot),
+    );
+    println!();
 }
 
-fn bench_carry(label: &'static str, log_rows: usize) -> CarryRow {
+// ---------------------------------------------------------------------------
+// [A] Primitive scaling — CarryRipple / Range / LinearCombination
+// ---------------------------------------------------------------------------
+
+fn bench_carry(label: &'static str, log_rows: usize) -> AirRow {
     let air = CarryRippleAir::new(log_rows);
-    let n_instances = air.n_instances();
-    let adders = random_adders(n_instances, 0xA5A5_0000 ^ log_rows as u64);
+    let n = air.n_instances();
+    let adders = random_adders(n, 0xA5A5_0000 ^ log_rows as u64);
     let trace = air.build_trace(&adders);
-    assert!(air.check(&trace), "CarryRippleAir native check failed at log_rows={log_rows}");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(log_rows);
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    CarryRow {
-        label,
-        log_rows,
-        n_instances,
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+    bench_air(
+        &format!("CarryRippleAir (64-bit ripple, {label})"),
+        Some(format!("    instances: {n}")),
+        air,
+        trace,
+        SAMPLES,
+        || format!("CarryRippleAir native check failed at log_rows={log_rows}"),
+    )
 }
 
-// ---------------------------------------------------------------------------
-// [D] RangeGateAir — Stage 3b-2
-// ---------------------------------------------------------------------------
-
-struct RangeRow {
-    label: &'static str,
-    log_rows: usize,
-    n_instances: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn random_u64s(n: usize, mut seed: u64) -> Vec<u64> {
-    (0..n).map(|_| splitmix(&mut seed)).collect()
-}
-
-fn bench_range(label: &'static str, log_rows: usize) -> RangeRow {
+fn bench_range(label: &'static str, log_rows: usize) -> AirRow {
     let air = RangeGateAir::new(log_rows);
-    let n_instances = air.n_instances();
-    let values = random_u64s(n_instances, 0xBEEF_CAFE ^ log_rows as u64);
+    let n = air.n_instances();
+    let values = random_u64s(n, 0xBEEF_CAFE ^ log_rows as u64);
     let trace = air.build_trace(&values);
-    assert!(air.check(&trace), "RangeGateAir native check failed at log_rows={log_rows}");
-    let pi = mk_pi();
+    bench_air(
+        &format!("RangeGateAir (u64 bit-decomp, {label})"),
+        Some(format!("    instances: {n}")),
+        air,
+        trace,
+        SAMPLES,
+        || format!("RangeGateAir native check failed at log_rows={log_rows}"),
+    )
+}
 
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(log_rows);
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    RangeRow {
-        label,
-        log_rows,
-        n_instances,
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+fn bench_linear(log_rows: usize, n_cols: usize) -> AirRow {
+    let air = LinearCombinationAir::new(n_cols, log_rows);
+    let trace = mk_linear_trace(log_rows, n_cols);
+    bench_air(
+        &format!(
+            "LinearCombinationAir (scaling harness, {} rows × {} cols)",
+            fmt_count(1 << log_rows),
+            n_cols
+        ),
+        None,
+        air,
+        trace,
+        SAMPLES,
+        || "LinearCombinationAir native check failed".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
-// [E] BalanceGateAir — Stage 3b-3
+// [B] BalanceGateAir — per-tx
 // ---------------------------------------------------------------------------
 
-struct BalanceRow {
-    label: &'static str,
-    log_rows: usize,
-    n_instances: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-/// Deterministic balanced (inputs, outputs, fee) tuple with
-/// `Σ in = Σ out + fee`. Mirrors the `balanced_tuple` helper used by
-/// `balance_gate`'s own tests.
-fn balanced_tuple_bench(seed: u64) -> ([u64; 4], [u64; 8], u64) {
+fn balanced_tuple(seed: u64) -> ([u64; 4], [u64; 8], u64) {
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     let mut next = || -> u64 {
         s = s
@@ -602,350 +532,52 @@ fn balanced_tuple_bench(seed: u64) -> ([u64; 4], [u64; 8], u64) {
     (inputs, outs, fee)
 }
 
-fn bench_balance(label: &'static str, log_rows: usize) -> BalanceRow {
+fn bench_balance(label: &'static str, log_rows: usize) -> AirRow {
     let air = BalanceGateAir::new(log_rows);
-    let n_instances = air.n_instances();
-    let (ins, outs, fee) = balanced_tuple_bench(0xBA1A_0000 ^ log_rows as u64);
+    let n = air.n_instances();
+    let (ins, outs, fee) = balanced_tuple(0xBA1A_0000 ^ log_rows as u64);
     let trace = air.build_trace(ins, outs, fee);
-    assert!(
-        air.check(&trace),
-        "BalanceGateAir native check failed at log_rows={log_rows}"
-    );
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(log_rows);
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    BalanceRow {
-        label,
-        log_rows,
-        n_instances,
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+    bench_air(
+        &format!("BalanceGateAir (UTXO conservation, {label})"),
+        Some(format!("    tx slots: {n}  |  4 inputs / 8 outputs / fee")),
+        air,
+        trace,
+        SAMPLES,
+        || format!("BalanceGateAir native check failed at log_rows={log_rows}"),
+    )
 }
 
 // ---------------------------------------------------------------------------
-// [F] TxValidityAir (Stage 3b-4) — skeleton + balance composition
+// [C] Poseidon2b primitives — Perm / HAddr / HAuth / HLeaf
 // ---------------------------------------------------------------------------
 
-struct TxValidity3b4Row {
-    log_rows: usize,
-    n_cols: usize,
-    n_instances: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn mk_tx_body_balanced_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
-    assert_eq!(in_val, out_val + fee);
-    let mut inputs = vec![TxInput::dummy(); MAX_INPUTS];
-    inputs[0] = TxInput {
-        slot_index: 0,
-        value: in_val,
-        owner: Address([0x11; 32]),
-        spend_secret: SpendSecret([0x22; 32]),
-        auth_tag: AuthTag([0x33; 32]),
-        valid: true,
-    };
-    let mut outputs = vec![TxOutput::dummy(); MAX_OUTPUTS];
-    outputs[0] = TxOutput {
-        value: out_val,
-        owner: Address([0x44; 32]),
-        valid: true,
-    };
-    TxBody {
-        prev_state_root: [0x11; 32],
-        new_state_root: [0x22; 32],
-        fee: fee as u128,
-        inputs,
-        outputs,
-    }
-}
-
-fn bench_tx_validity_3b4(log_rows: usize) -> TxValidity3b4Row {
-    let air = TxValidityAir::new_3b4(log_rows);
-    let body = mk_tx_body_balanced_1in1out(1000, 995, 5);
-    let ins = [1000u64, 0, 0, 0];
-    let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
-    let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 5, log_rows);
-    assert!(
-        air.check(&trace),
-        "TxValidityAir 3b-4 native check failed at log_rows={log_rows}"
+fn bench_poseidon_perm() -> AirRow {
+    let air = CompositeAir::from_parts(
+        POSEIDON_PERM_LOG_ROWS,
+        POSEIDON_PERM_N_COLS,
+        emit_perm_all(),
     );
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(log_rows);
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
-
-    TxValidity3b4Row {
-        log_rows,
-        n_cols: air.n_columns(),
-        n_instances,
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
-}
-
-fn print_tx_validity_3b4(r: &TxValidity3b4Row) {
-    println!("  [F] TxValidityAir (Stage 3b-4 — skeleton + BalanceGate composition)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>3}  bal_inst={:>2}  prove={}  verify={} |",
-        r.log_rows,
-        r.n_cols,
-        r.n_instances,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
-    );
-    println!(
-        "  | proof(estimated)={}                                                |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3b-4  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3b-4  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Note: non-Poseidon half of TxValidity — skeleton bool selectors plus full");
-    println!("  BalanceGate (Σ inputs = Σ outputs + fee). Value binding to balance operands");
-    println!("  and Poseidon gates land in §3c/§3d.");
-    println!();
-    assert_eq!(r.n_cols, TX_VALIDITY_3B4_N_COLS);
-}
-
-// ---------------------------------------------------------------------------
-// [G] PoseidonPermAir — Stage 3c-1
-// ---------------------------------------------------------------------------
-
-struct PoseidonRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn mk_perm_input(seed: u128) -> [Block128; 4] {
-    let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
-    [
-        Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
-        Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
-        Block128::from(s.wrapping_add(2) ^ 0xFFFF_0000_FFFF_0000),
-        Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
-    ]
-}
-
-fn bench_poseidon_perm() -> PoseidonRow {
-    let air = CompositeAir::from_parts(POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, emit_perm_all());
-    let cols = build_perm_trace(mk_perm_input(0xDECAF_CAFE_BABE));
+    let cols = build_perm_trace([
+        Block128::from(0xDECAF_CAFE_BABEu128 ^ 0xA5A5_A5A5_A5A5_A5A5),
+        Block128::from(0xDECAF_CAFE_BABFu128 ^ 0x5A5A_5A5A_5A5A_5A5A),
+        Block128::from(0xDECAF_CAFE_BAC0u128 ^ 0xFFFF_0000_FFFF_0000),
+        Block128::from(0xDECAF_CAFE_BAC1u128 ^ 0x0F0F_F0F0_0F0F_F0F0),
+    ]);
     let trace = Trace::new(cols);
-    assert!(air.check(&trace), "PoseidonPermAir native check failed");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(POSEIDON_PERM_LOG_ROWS);
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    PoseidonRow {
-        log_rows: POSEIDON_PERM_LOG_ROWS,
-        n_cols: air.n_columns(),
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+    let row = bench_air(
+        "PoseidonPermAir (Poseidon2b permutation, 66 rounds)",
+        Some("    one permutation per proof (hash hot path)".to_string()),
+        air,
+        trace,
+        SAMPLES,
+        || "PoseidonPermAir native check failed".to_string(),
+    );
+    assert_eq!(row.n_cols, POSEIDON_PERM_N_COLS);
+    assert_eq!(row.log_rows, POSEIDON_PERM_LOG_ROWS);
+    row
 }
 
-fn print_poseidon_perm(r: &PoseidonRow) {
-    println!("  [G] PoseidonPermAir  (Stage 3c-1 — Poseidon2b permutation, 66 rounds)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>3}  prove={}  verify={}            |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
-    );
-    println!(
-        "  | proof(estimated)={}                                                |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3c-1  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3c-1  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Note: 29 selector-gated constraints — S-box chain (16), RC binding (6),");
-    println!("  MDS blend (4, full+partial fused via is_full selector), partial-round");
-    println!("  sin kill (3). `rc`, `is_full`, `is_round` are now pinned via §3d-0.3");
-    println!("  PublicColumn programmes (no longer trusted input). Boundary ties");
-    println!("  (capacity IV, absorb XOR, inter-perm carry, output squeeze) remain");
-    println!("  open pending §3d RowSelectorGate.");
-    println!();
-    assert_eq!(r.n_cols, POSEIDON_PERM_N_COLS);
-    assert_eq!(r.log_rows, POSEIDON_PERM_LOG_ROWS);
-}
-
-// ---------------------------------------------------------------------------
-// [H] HAddrAir — Stage 3c-2 (2-field sponge interior)
-// ---------------------------------------------------------------------------
-
-struct HAddrRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn bench_haddr() -> HAddrRow {
+fn bench_haddr() -> AirRow {
     use noid_air::{build_haddr_trace, extract_haddr_output};
     let secret = [
         Block128::from(0xDECAF_CAFE_BABEu128 ^ 0xA5A5_A5A5_A5A5_A5A5),
@@ -954,118 +586,20 @@ fn bench_haddr() -> HAddrRow {
     let expected = extract_haddr_output(&build_haddr_trace(secret));
     let air = HAddrAir::new(expected);
     let trace = air.build_trace(secret);
-    assert!(air.check(&trace), "HAddrAir native check failed");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    HAddrRow {
-        log_rows: air.log_rows(),
-        n_cols: air.n_columns(),
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+    let row = bench_air(
+        "HAddrAir (2-field sponge, derive_address, 2 perms)",
+        Some("    secret is witness-only; all boundary ties closed".to_string()),
+        air,
+        trace,
+        SAMPLES,
+        || "HAddrAir native check failed".to_string(),
+    );
+    assert_eq!(row.n_cols, HADDR_N_COLS);
+    assert_eq!(row.log_rows, HADDR_LOG_ROWS);
+    row
 }
 
-fn print_haddr(r: &HAddrRow) {
-    println!("  [H] HAddrAir  (Stage 3c-2 — 2-field sponge, derive_address, 2 permutations)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>3}  prove={}  verify={}            |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
-    );
-    println!(
-        "  | proof(estimated)={}                                                |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3c-2  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3c-2  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Note: full 3d-0.6b construction — 58 interior gates (2 x emit_perm_all_at)");
-    println!("  plus all four boundary ties (capacity IV pin, MDS-A linear, inter-perm");
-    println!("  carry with padding XOR, MDS-B shifted, output squeeze). Secret is");
-    println!("  witness-only — never appears in a PublicColumn.");
-    println!();
-    assert_eq!(r.n_cols, HADDR_N_COLS);
-    assert_eq!(r.log_rows, HADDR_LOG_ROWS);
-}
-
-// ---------------------------------------------------------------------------
-// [I] HAuthAir — Stage 3c-3 (4-field sponge interior)
-// ---------------------------------------------------------------------------
-
-struct HAuthRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn bench_hauth() -> HAuthRow {
+fn bench_hauth() -> AirRow {
     use noid_air::{build_hauth_trace, extract_hauth_output};
     let secret = [
         Block128::from(0xA07_5EED_DEAD_BEEFu128),
@@ -1078,118 +612,20 @@ fn bench_hauth() -> HAuthRow {
     let expected = extract_hauth_output(&build_hauth_trace(secret, txbody));
     let air = HAuthAir::new(txbody, expected);
     let trace = air.build_trace(secret, txbody);
-    assert!(air.check(&trace), "HAuthAir native check failed");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    HAuthRow {
-        log_rows: air.log_rows(),
-        n_cols: air.n_columns(),
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
+    let row = bench_air(
+        "HAuthAir (4-field sponge, hash_auth_tag, 3 perms)",
+        Some("    interior-only; capacity IV pinned via PublicColumn".to_string()),
+        air,
+        trace,
+        SAMPLES,
+        || "HAuthAir native check failed".to_string(),
+    );
+    assert_eq!(row.n_cols, HAUTH_N_COLS);
+    assert_eq!(row.log_rows, HAUTH_LOG_ROWS);
+    row
 }
 
-fn print_hauth(r: &HAuthRow) {
-    println!("  [I] HAuthAir  (Stage 3c-3 — 4-field sponge, hash_auth_tag, 3 permutations)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>3}  prove={}  verify={}            |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
-    );
-    println!(
-        "  | proof(estimated)={}                                                |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3c-3  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3c-3  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Note: interior-only — 87 gates (3 x emit_perm_all_at). Selector +");
-    println!("  round-constant columns pinned via §3d-0.3 PublicColumn declarations");
-    println!("  (18 columns: 3 x (is_full + is_round + 4 rc)). Boundary ties (IV,");
-    println!("  absorb XORs, inter-perm carries, squeeze) deferred to §3d.");
-    println!();
-    assert_eq!(r.n_cols, HAUTH_N_COLS);
-    assert_eq!(r.log_rows, HAUTH_LOG_ROWS);
-}
-
-// ---------------------------------------------------------------------------
-// [J] HLeafAir — Stage 3c-4 (4-field hash_leaf interior, 3 permutations)
-// ---------------------------------------------------------------------------
-
-struct HLeafRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
-}
-
-fn bench_hleaf() -> HLeafRow {
+fn bench_hleaf() -> AirRow {
     use noid_air::{build_hleaf_trace, extract_hleaf_output};
     let fields = [
         Block128::from(0x1EAF_5EED_DEAD_BEEFu128),
@@ -1200,123 +636,89 @@ fn bench_hleaf() -> HLeafRow {
     let expected = extract_hleaf_output(&build_hleaf_trace(fields));
     let air = HLeafAir::new(fields, expected);
     let trace = air.build_trace(fields);
-    assert!(air.check(&trace), "HLeafAir native check failed");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(SAMPLES);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..SAMPLES {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    HLeafRow {
-        log_rows: air.log_rows(),
-        n_cols: air.n_columns(),
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
-}
-
-fn print_hleaf(r: &HLeafRow) {
-    println!("  [J] HLeafAir  (Stage 3c-4 — hash_leaf 4 fields, 3 permutations)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>3}  prove={}  verify={}            |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
+    let row = bench_air(
+        "HLeafAir (4-field sponge, hash_input_leaf, 3 perms)",
+        Some("    interior-only; TAG_LEAF capacity IV pinned".to_string()),
+        air,
+        trace,
+        SAMPLES,
+        || "HLeafAir native check failed".to_string(),
     );
-    println!(
-        "  | proof(estimated)={}                                                |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3c-4  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3c-4  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Note: interior-only — 87 gates (3 x emit_perm_all_at). Structurally");
-    println!("  identical to HAuthAir; rc/is_full/is_round pinned via §3d-0.3");
-    println!("  PublicColumns (18 cols). Capacity IV (TAG_LEAF) remains trusted-input");
-    println!("  pending §3d boundary ties.");
-    println!();
-    assert_eq!(r.n_cols, HLEAF_N_COLS);
-    assert_eq!(r.log_rows, HLEAF_LOG_ROWS);
+    assert_eq!(row.n_cols, HLEAF_N_COLS);
+    assert_eq!(row.log_rows, HLEAF_LOG_ROWS);
+    row
 }
 
 // ---------------------------------------------------------------------------
-// [K] TxBodyMerkleAir — Stage 3d-0.9.E.4.c (59-instance stack + full inter-perm echo)
+// [D] Transaction validity — TxValidityAir (non-Poseidon half)
 // ---------------------------------------------------------------------------
 
-struct TxBodyMerkleRow {
-    log_rows: usize,
-    n_cols: usize,
-    n_perms: usize,
-    prove_total: Duration,
-    prove_buckets: ProveTimings,
-    verify: VerifyTimings,
-    proof_bytes: usize,
+fn bench_tx_validity() -> AirRow {
+    let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
+    let body = mk_tx_body_1in1out(1000, 995, 5);
+    let ins = [1000u64, 0, 0, 0];
+    let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
+    let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 5, TX_VALIDITY_3B4_LOG_ROWS);
+    let n_tx = 1usize << (TX_VALIDITY_3B4_LOG_ROWS - BIT_ADDER_LOG_WORD_BITS);
+    let row = bench_air(
+        "TxValidityAir (non-Poseidon half: skeleton + BalanceGate)",
+        Some(format!(
+            "    tx slots: {n_tx}  |  embedded BalanceGate at col offset 10",
+        )),
+        air,
+        trace,
+        SAMPLES,
+        || "TxValidityAir native check failed".to_string(),
+    );
+    assert_eq!(row.n_cols, TX_VALIDITY_3B4_N_COLS);
+    row
 }
 
-fn bench_tx_body_merkle() -> TxBodyMerkleRow {
+// ---------------------------------------------------------------------------
+// [E] TxBodyMerkleAir — prod path (with boundary pins)
+// ---------------------------------------------------------------------------
+
+fn bench_tx_body_merkle() -> AirRow {
+    // Run the permutation chain once with a placeholder pin set and
+    // read back the wrap output, so the O2 pin is self-consistent
+    // with the honest trace.
+    let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
+        Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
+    let placeholder = TxBodyMerkleBoundaryPins::default();
+    let seed_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
+    let layout = noid_air::build_instance_layout();
+    // Wrap instance id 58.
+    let wrap_out_row = layout[58].slot_base_row + 66; // N_ROUNDS = 66
+    let s_base = noid_air::TXBODY_MERKLE_LAYOUT.s;
+    let pins = TxBodyMerkleBoundaryPins {
+        tx_body_hash: [
+            seed_cols[s_base][wrap_out_row],
+            seed_cols[s_base + 1][wrap_out_row],
+        ],
+        ..TxBodyMerkleBoundaryPins::default()
+    };
+
+    let air = TxBodyMerkleAir::new_with_boundary_pins(pins);
+    let trace_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &pins);
+    let domains =
+        noid_air::airs::tx_body_merkle::tx_body_merkle_column_domains_with_boundary_pins();
+    let trace = Trace::new_with_domains(trace_cols, domains);
+
+    let row = bench_air(
+        "TxBodyMerkleAir (tx-body spine: 59 Poseidon2b perms + boundary pins)",
+        Some(format!("    per-perm: {{prove, verify, proof}} / 59",)),
+        air,
+        trace,
+        SAMPLES.min(3),
+        || "TxBodyMerkleAir native check failed".to_string(),
+    );
+    assert_eq!(row.log_rows, TXBODY_MERKLE_LOG_ROWS);
+    assert_eq!(row.n_cols, *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
+    row
+}
+
+fn bench_tx_body_merkle_legacy() -> AirRow {
     let air = TxBodyMerkleAir::new();
-
-    // 59 diverse inputs — avoids any accidental coincident state chains
-    // that could let a degenerate constraint slip.
     let mut inputs = [[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS];
     for k in 0..TXBODY_MERKLE_N_PERMS {
         let s = (k as u128 + 1).wrapping_mul(0x9E3779B97F4A7C15);
@@ -1327,155 +729,65 @@ fn bench_tx_body_merkle() -> TxBodyMerkleRow {
             Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
         ];
     }
-
     let trace = air.build_trace(&inputs);
-    assert!(air.check(&trace), "TxBodyMerkleAir native check failed");
-    let pi = mk_pi();
-
-    let prove_total = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    // Stacked trace is 16384 rows × 30 cols; warm-up + SAMPLES would be
-    // slow. One warm-up, half the samples — still stable enough for a
-    // median bucket estimate.
-    for _ in 0..WARMUP {
-        let _ = prove_air_timed(&air, &trace, &pi).unwrap();
-    }
-    let stack_samples = SAMPLES.max(1).min(5);
-    let mut prove_samples: Vec<ProveTimings> = Vec::with_capacity(stack_samples);
-    for _ in 0..stack_samples {
-        let (_p, t) = prove_air_timed(&air, &trace, &pi).unwrap();
-        prove_samples.push(t);
-    }
-    prove_samples.sort_by_key(|t| t.total());
-    let prove_buckets = prove_samples[prove_samples.len() / 2];
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-
-    let mut verify_samples: Vec<VerifyTimings> = Vec::with_capacity(stack_samples);
-    for _ in 0..WARMUP {
-        let (r, _) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-    }
-    for _ in 0..stack_samples {
-        let (r, t) = verify_air_timed(&air, &pi, &proof);
-        r.unwrap();
-        verify_samples.push(t);
-    }
-    verify_samples.sort_by_key(|t| t.total());
-    let verify = verify_samples[verify_samples.len() / 2];
-
-    let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air.shifted_column_indices().len();
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, air.n_columns(), n_shifted);
-
-    TxBodyMerkleRow {
-        log_rows: air.log_rows(),
-        n_cols: air.n_columns(),
-        n_perms: TXBODY_MERKLE_N_PERMS,
-        prove_total,
-        prove_buckets,
-        verify,
-        proof_bytes,
-    }
-}
-
-fn print_tx_body_merkle(r: &TxBodyMerkleRow) {
-    println!(
-        "  [K] TxBodyMerkleAir  (Stage 3d-0.9.E.4.c — {}-perm stack + full inter-perm echo)",
-        r.n_perms,
+    let row = bench_air(
+        "TxBodyMerkleAir (interior-only, no boundary pins — regression baseline)",
+        None,
+        air,
+        trace,
+        SAMPLES.min(3),
+        || "TxBodyMerkleAir (interior) native check failed".to_string(),
     );
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>3}  n_cols={:>3}  prove={}  verify={}             |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.prove_total),
-        fmt_ms(r.verify.total()),
-    );
-    let per_perm_prove = r.prove_total / r.n_perms as u32;
-    let per_perm_verify = r.verify.total() / r.n_perms as u32;
-    println!(
-        "  | per-perm: prove={} verify={}    proof(estimated)={} |",
-        fmt_ms(per_perm_prove),
-        fmt_ms(per_perm_verify),
-        fmt_bytes(r.proof_bytes),
-    );
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    let total = r.prove_buckets.total();
-    println!(
-        "    3c-5  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.prove_buckets.commit),
-        percent(r.prove_buckets.commit, total),
-        fmt_ms(r.prove_buckets.transcript_sumcheck),
-        percent(r.prove_buckets.transcript_sumcheck, total),
-        fmt_ms(r.prove_buckets.ladder_sumcheck),
-        percent(r.prove_buckets.ladder_sumcheck, total),
-        fmt_ms(r.prove_buckets.multipoint_fri),
-        percent(r.prove_buckets.multipoint_fri, total),
-    );
-    println!();
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    let vtotal = r.verify.total();
-    println!(
-        "    3c-5  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-        fmt_ms(r.verify.transcript_sumcheck),
-        percent(r.verify.transcript_sumcheck, vtotal),
-        fmt_ms(r.verify.composition),
-        percent(r.verify.composition, vtotal),
-        fmt_ms(r.verify.ladder_sumcheck),
-        percent(r.verify.ladder_sumcheck, vtotal),
-        fmt_ms(r.verify.multipoint_fri),
-        percent(r.verify.multipoint_fri, vtotal),
-    );
-    println!();
-    println!("  Layout: 30-col permutation lane + 4 pre_s + 1 head_row_0 indicator,");
-    println!("  stacked row-major over 59 instances × 128-row slots (log_rows=13).");
-    println!("  Gate set: 29 interior Poseidon2b gates + 4 row-0 MDS binding gates.");
-    println!("  Inter-instance echo wiring + leaf/compress IV pins land in 3d-0.9.E+.");
-    println!();
-    assert_eq!(r.n_cols, *TXBODY_MERKLE_N_COLS);
-    assert_eq!(r.log_rows, TXBODY_MERKLE_LOG_ROWS);
-    assert_eq!(r.n_perms, TXBODY_MERKLE_N_PERMS);
+    assert_eq!(row.n_cols, *TXBODY_MERKLE_N_COLS);
+    row
 }
 
 // ---------------------------------------------------------------------------
-// [C] LinearCombinationAir — synthetic scaling harness
+// [P] TxBodySpineComposite — full per-tx prover path
 // ---------------------------------------------------------------------------
 
-struct LinearRow {
-    log_rows: usize,
-    n_cols: usize,
-    prove_ms: Duration,
-    verify_ms: Duration,
-    proof_bytes: usize,
-}
+fn bench_spine_composite() -> AirRow {
+    // Derive consistent pins by running the honest permutation chain
+    // against a zero input set and reading back `tx_body_hash`.
+    let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
+        Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
+    let placeholder = TxBodyMerkleBoundaryPins::default();
+    let seed_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
+    let layout = noid_air::build_instance_layout();
+    let wrap_out_row = layout[58].slot_base_row + 66;
+    let s_base = noid_air::TXBODY_MERKLE_LAYOUT.s;
+    let pins = TxBodyMerkleBoundaryPins {
+        tx_body_hash: [
+            seed_cols[s_base][wrap_out_row],
+            seed_cols[s_base + 1][wrap_out_row],
+        ],
+        ..TxBodyMerkleBoundaryPins::default()
+    };
 
-fn bench_linear(log_rows: usize, n_cols: usize) -> LinearRow {
-    let air = LinearCombinationAir::new(n_cols, log_rows);
-    let trace = mk_linear_trace(log_rows, n_cols);
-    let pi = mk_pi();
-    let prove_ms = time(|| {
-        let _ = prove_air(&air, &trace, &pi).unwrap();
-    });
-    let proof = prove_air(&air, &trace, &pi).unwrap();
-    let verify_ms = time(|| {
-        verify_air(&air, &pi, &proof).unwrap();
-    });
-    let log_len = padded_log_len(log_rows);
-    let proof_bytes = estimate_stark_proof_bytes(&proof, log_len, n_cols, 0);
-    LinearRow {
-        log_rows,
-        n_cols,
-        prove_ms,
-        verify_ms,
-        proof_bytes,
-    }
+    let spine = TxBodySpineComposite::new(pins);
+    let body = TxBody {
+        prev_state_root: [0u8; 32],
+        new_state_root: [0u8; 32],
+        fee: 0,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    };
+    let trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &inputs);
+
+    let row = bench_air(
+        "TxBodySpineComposite (PROD: TxValidity + TxBodyMerkle + cross-AIR ties)",
+        Some("    this is the per-tx client prover path".to_string()),
+        spine,
+        trace,
+        SAMPLES.min(3),
+        || "TxBodySpineComposite native check failed".to_string(),
+    );
+    assert_eq!(row.log_rows, SPINE_LOG_ROWS);
+    row
 }
 
 // ---------------------------------------------------------------------------
-// Printing
+// Banner / footer
 // ---------------------------------------------------------------------------
 
 const BANNER: &str = r#"
@@ -1485,274 +797,66 @@ const BANNER: &str = r#"
   |  __/ ___ \|  _ <  / ___ \| |\  | |_| | || |_| |
   |_| /_/   \_\_| \_\/_/   \_\_| \_|\___/___|____/
 
-  PARANOID  --  STARK REPORT (roadmap tracker)
-  TxValidity (3a) + CarryRipple (3b-0) + Range (3b-2) + Balance (3b-3) + TxValidity3b4 (3b-4) + PoseidonPerm (3c-1) + HAddr (3c-2) + HAuth (3c-3) + HLeaf (3c-4) + TxBodyMerkle (3c-5) + LinearCombination
+  PARANOID  --  Transparent UTXO Validity Engine (STARK-based)
+  Binius-style STARK over GF(2^128). Per-tx client-side proof.
 "#;
 
 fn print_banner() {
     println!("{}", BANNER);
     println!(
-        "  Wall-clock medians over {} samples ({} warmup); release profile.",
-        SAMPLES, WARMUP
+        "  Wall-clock medians, release profile. Warmup: {} / Samples: {}.",
+        WARMUP, SAMPLES
     );
+    println!();
+    println!("  Sections:");
+    println!("    [A] Engine scaling primitives   (CarryRipple / Range / LinearCombination)");
+    println!("    [B] Balance gate                (BalanceGate, per-tx)");
+    println!("    [C] Poseidon2b hashes           (Perm / HAddr / HAuth / HLeaf)");
+    println!("    [D] Transaction validity        (TxValidity, non-Poseidon half)");
+    println!("    [E] Transaction-body Merkle     (TxBodyMerkle, with boundary pins)");
+    println!("    [P] PROD per-tx prover path     (TxBodySpineComposite)");
     println!();
 }
 
-fn print_tx_validity(r: &TxValidityRow) {
-    println!("  [A] TxValidityAir  (Stage 3a — witness skeleton, bool-only gates)");
-    println!("  +---------------------------------------------------------------------+");
-    println!(
-        "  | log_rows={:>2}  n_cols={:>2}  build_trace={}  prove={}  verify={} |",
-        r.log_rows,
-        r.n_cols,
-        fmt_ms(r.build_ms),
-        fmt_ms(r.prove_ms),
-        fmt_ms(r.verify_ms),
-    );
-    println!(
-        "  | proof(estimated)={}                                         |",
-        fmt_bytes(r.proof_bytes)
-    );
-    println!("  +---------------------------------------------------------------------+");
-    println!("  Note: this AIR is a Stage 3a witness skeleton — only InputValid,");
-    println!("  OutputValid are constrained (bool). Real tx validity lands once");
-    println!("  Stage 3b Range + Balance + Stage 3c Poseidon gates are composed in.");
-    println!();
-    assert_eq!(r.log_rows, TX_VALIDITY_LOG_ROWS);
-    assert_eq!(r.n_cols, TX_VALIDITY_N_COLS);
-}
-
-fn print_carry_table(rows: &[CarryRow]) {
-    println!("  [B] CarryRippleAir  (Stage 3b-0 — rotation-consuming gate, ladder FRI)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-        "label", "log_rows", "adders", "prove", "verify (tot)", "proof"
-    );
-    println!(
-        "  |-------+----------+----------+--------------+--------------+--------------|"
-    );
-    for r in rows {
-        println!(
-            "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-            r.label,
-            r.log_rows,
-            r.n_instances,
-            fmt_ms(r.prove_total),
-            fmt_ms(r.verify.total()),
-            fmt_bytes(r.proof_bytes),
-        );
-    }
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.prove_buckets.total();
-        println!(
-            "    {:>5}  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.prove_buckets.commit),
-            percent(r.prove_buckets.commit, total),
-            fmt_ms(r.prove_buckets.transcript_sumcheck),
-            percent(r.prove_buckets.transcript_sumcheck, total),
-            fmt_ms(r.prove_buckets.ladder_sumcheck),
-            percent(r.prove_buckets.ladder_sumcheck, total),
-            fmt_ms(r.prove_buckets.multipoint_fri),
-            percent(r.prove_buckets.multipoint_fri, total),
-        );
-    }
-    println!();
-
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.verify.total();
-        println!(
-            "    {:>5}  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.verify.transcript_sumcheck),
-            percent(r.verify.transcript_sumcheck, total),
-            fmt_ms(r.verify.composition),
-            percent(r.verify.composition, total),
-            fmt_ms(r.verify.ladder_sumcheck),
-            percent(r.verify.ladder_sumcheck, total),
-            fmt_ms(r.verify.multipoint_fri),
-            percent(r.verify.multipoint_fri, total),
-        );
-    }
+fn print_section(title: &str) {
+    println!("==========================================================================");
+    println!("  {title}");
+    println!("==========================================================================");
     println!();
 }
 
-fn print_range_table(rows: &[RangeRow]) {
-    println!("  [D] RangeGateAir  (Stage 3b-2 — u64 bit-decomposition range check)");
-    println!("  +--------------------------------------------------------------------------+");
+fn print_footer(prod: &AirRow) {
+    print_section("Summary");
     println!(
-        "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-        "label", "log_rows", "values", "prove", "verify (tot)", "proof"
+        "  PROD per-tx prover:  prove={}  verify={}  proof≈{}",
+        fmt_ms(prod.prove_total),
+        fmt_ms(prod.verify.total()),
+        fmt_bytes(prod.proof_bytes),
     );
     println!(
-        "  |-------+----------+----------+--------------+--------------+--------------|"
+        "  composite log_rows = {}  |  n_cols = {}",
+        prod.log_rows, prod.n_cols
     );
-    for r in rows {
-        println!(
-            "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-            r.label,
-            r.log_rows,
-            r.n_instances,
-            fmt_ms(r.prove_total),
-            fmt_ms(r.verify.total()),
-            fmt_bytes(r.proof_bytes),
-        );
-    }
-    println!("  +--------------------------------------------------------------------------+");
     println!();
-
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.prove_buckets.total();
+    println!("  Optimisation targets (by share of prove wall-clock):");
+    let p = &prod.prove_buckets;
+    let mut buckets = [
+        ("commit          ", p.commit),
+        ("transcript + sc ", p.transcript_sumcheck),
+        ("ladder sumcheck ", p.ladder_sumcheck),
+        ("multipoint + FRI", p.multipoint_fri),
+    ];
+    buckets.sort_by(|a, b| b.1.cmp(&a.1));
+    let total = p.total();
+    for (name, dur) in &buckets {
         println!(
-            "    {:>5}  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.prove_buckets.commit),
-            percent(r.prove_buckets.commit, total),
-            fmt_ms(r.prove_buckets.transcript_sumcheck),
-            percent(r.prove_buckets.transcript_sumcheck, total),
-            fmt_ms(r.prove_buckets.ladder_sumcheck),
-            percent(r.prove_buckets.ladder_sumcheck, total),
-            fmt_ms(r.prove_buckets.multipoint_fri),
-            percent(r.prove_buckets.multipoint_fri, total),
+            "    {name}  {:>10}  ({:>5.1}%)",
+            fmt_ms(*dur),
+            percent(*dur, total)
         );
     }
     println!();
-
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.verify.total();
-        println!(
-            "    {:>5}  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.verify.transcript_sumcheck),
-            percent(r.verify.transcript_sumcheck, total),
-            fmt_ms(r.verify.composition),
-            percent(r.verify.composition, total),
-            fmt_ms(r.verify.ladder_sumcheck),
-            percent(r.verify.ladder_sumcheck, total),
-            fmt_ms(r.verify.multipoint_fri),
-            percent(r.verify.multipoint_fri, total),
-        );
-    }
-    println!();
-}
-
-fn print_balance_table(rows: &[BalanceRow]) {
-    println!("  [E] BalanceGateAir  (Stage 3b-3 — UTXO conservation law, 4-in / 8-out / fee)");
-    println!("  +--------------------------------------------------------------------------+");
-    println!(
-        "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-        "label", "log_rows", "tx inst", "prove", "verify (tot)", "proof"
-    );
-    println!(
-        "  |-------+----------+----------+--------------+--------------+--------------|"
-    );
-    for r in rows {
-        println!(
-            "  | {:>5} | {:>8} | {:>8} | {:>12} | {:>12} | {:>12} |",
-            r.label,
-            r.log_rows,
-            r.n_instances,
-            fmt_ms(r.prove_total),
-            fmt_ms(r.verify.total()),
-            fmt_bytes(r.proof_bytes),
-        );
-    }
-    println!("  +--------------------------------------------------------------------------+");
-    println!();
-
-    println!("  prover buckets (commit / ts+sc / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.prove_buckets.total();
-        println!(
-            "    {:>5}  commit {} ({:>5.1}%) | ts+sc {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.prove_buckets.commit),
-            percent(r.prove_buckets.commit, total),
-            fmt_ms(r.prove_buckets.transcript_sumcheck),
-            percent(r.prove_buckets.transcript_sumcheck, total),
-            fmt_ms(r.prove_buckets.ladder_sumcheck),
-            percent(r.prove_buckets.ladder_sumcheck, total),
-            fmt_ms(r.prove_buckets.multipoint_fri),
-            percent(r.prove_buckets.multipoint_fri, total),
-        );
-    }
-    println!();
-
-    println!("  verifier buckets (ts+sc / composition / ladder-sc / multipoint+FRI):");
-    for r in rows {
-        let total = r.verify.total();
-        println!(
-            "    {:>5}  ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
-            r.label,
-            fmt_ms(r.verify.transcript_sumcheck),
-            percent(r.verify.transcript_sumcheck, total),
-            fmt_ms(r.verify.composition),
-            percent(r.verify.composition, total),
-            fmt_ms(r.verify.ladder_sumcheck),
-            percent(r.verify.ladder_sumcheck, total),
-            fmt_ms(r.verify.multipoint_fri),
-            percent(r.verify.multipoint_fri, total),
-        );
-    }
-    println!();
-}
-
-fn print_linear_table(rows: &[LinearRow]) {
-    println!("  [C] LinearCombinationAir  (SYNTHETIC scaling harness, NOT a real gate)");
-    println!("  +-------------------------------------------------------------------+");
-    println!(
-        "  | {:>8} | {:>7} | {:>8} | {:>12} | {:>12} | {:>12} |",
-        "log_rows", "n_cols", "rows", "prove", "verify", "proof"
-    );
-    println!(
-        "  |----------+---------+----------+--------------+--------------+--------------|"
-    );
-    for r in rows {
-        println!(
-            "  | {:>8} | {:>7} | {:>8} | {:>12} | {:>12} | {:>12} |",
-            r.log_rows,
-            r.n_cols,
-            fmt_count(1 << r.log_rows),
-            fmt_ms(r.prove_ms),
-            fmt_ms(r.verify_ms),
-            fmt_bytes(r.proof_bytes),
-        );
-    }
-    println!("  +-------------------------------------------------------------------+");
-    println!("  Note: constraint is 'last column = sum of others' — no real algebra.");
-    println!("  Purpose: expose engine scaling in (log_rows, n_cols). Gets deleted");
-    println!("  from this report once real §3b-2/3b-3/§3c AIRs populate the grid.");
-    println!();
-}
-
-fn print_footer() {
-    println!("  roadmap checkpoint (see ROADMAP.md):");
-    println!("    [A] TxValidityAir  (Stage 3a)               shipped (skeleton)");
-    println!("    [B] CarryRippleAir (Stage 3b-0.3..0.5)      shipped");
-    println!("    [D] RangeGateAir   (Stage 3b-2)             shipped");
-    println!("    [E] BalanceGateAir (Stage 3b-3)             shipped");
-    println!("    [F] TxValidityAir  (Stage 3b-4 — non-Pos)   shipped");
-    println!("    [G] PoseidonPermAir (Stage 3c-1)            shipped");
-    println!("    [H] HAddrAir       (Stage 3c-2 — interior)  shipped (boundary ties -> 3d)");
-    println!("    [I] HAuthAir       (Stage 3c-3 — interior)  shipped (boundary ties -> 3d)");
-    println!("    [J] HLeafAir       (Stage 3c-4 — interior)  shipped (boundary ties -> 3d)");
-    println!(
-        "    [K] TxBodyMerkleAir (Stage 3d-0.9.E.4.c — 59-stack + full inter-perm echo)  \
-         shipped (payload pinning -> 3d-0.9.H)",
-    );
-    println!("    [*] Stage 3d-0.3/0.4 PublicColumn programmes (rc/is_full/is_round)  shipped");
-    println!("    [ ] Stage 3d RowSelectorGate (capacity IV, absorb XOR, carries, squeeze)  planned");
-    println!("    [ ] TxValidityAir  (Stage 3d — full)        planned");
-    println!();
-    println!("  reproduce: cargo bench --bench stark_report");
+    println!("  Reproduce: cargo bench --bench stark_report");
     println!();
 }
 
@@ -1763,66 +867,80 @@ fn print_footer() {
 fn main() {
     print_banner();
 
-    eprintln!("  [A] TxValidityAir (Stage 3a) ...");
-    let tx_row = bench_tx_validity();
-
-    eprintln!("  [B] CarryRippleAir ...");
+    // ---- Run all benches (eprintln progress so long sweeps are visible) ----
+    eprintln!("  [A] primitive scaling ...");
     let mut carry_rows = Vec::with_capacity(CARRY_SHAPES.len());
     for (label, log_rows) in CARRY_SHAPES {
-        eprintln!("        {} (log_rows = {}) ...", label, log_rows);
+        eprintln!("        carry  ({label}, log_rows={log_rows}) ...");
         carry_rows.push(bench_carry(label, *log_rows));
     }
-
-    eprintln!("  [D] RangeGateAir ...");
     let mut range_rows = Vec::with_capacity(RANGE_SHAPES.len());
     for (label, log_rows) in RANGE_SHAPES {
-        eprintln!("        {} (log_rows = {}) ...", label, log_rows);
+        eprintln!("        range  ({label}, log_rows={log_rows}) ...");
         range_rows.push(bench_range(label, *log_rows));
     }
-
-    eprintln!("  [E] BalanceGateAir ...");
-    let mut balance_rows = Vec::with_capacity(BALANCE_SHAPES.len());
-    for (label, log_rows) in BALANCE_SHAPES {
-        eprintln!("        {} (log_rows = {}) ...", label, log_rows);
-        balance_rows.push(bench_balance(label, *log_rows));
-    }
-
-    eprintln!("  [F] TxValidityAir (Stage 3b-4) ...");
-    let tx3b4_row = bench_tx_validity_3b4(TX_VALIDITY_3B4_LOG_ROWS);
-
-    eprintln!("  [G] PoseidonPermAir (Stage 3c-1) ...");
-    let poseidon_row = bench_poseidon_perm();
-
-    eprintln!("  [H] HAddrAir (Stage 3c-2) ...");
-    let haddr_row = bench_haddr();
-
-    eprintln!("  [I] HAuthAir (Stage 3c-3) ...");
-    let hauth_row = bench_hauth();
-
-    eprintln!("  [J] HLeafAir (Stage 3c-4) ...");
-    let hleaf_row = bench_hleaf();
-
-    eprintln!("  [K] TxBodyMerkleAir (Stage 3c-5) ...");
-    let tx_body_merkle_row = bench_tx_body_merkle();
-
-    eprintln!("  [C] LinearCombinationAir (scaling harness) ...");
     let mut lin_rows = Vec::with_capacity(LINCOMB_SHAPES.len());
     for &(lr, nc) in LINCOMB_SHAPES {
-        eprintln!("        log_rows = {}, n_cols = {} ...", lr, nc);
+        eprintln!("        lincomb  (log_rows={lr}, n_cols={nc}) ...");
         lin_rows.push(bench_linear(lr, nc));
     }
+
+    eprintln!("  [B] balance gate ...");
+    let mut bal_rows = Vec::with_capacity(BALANCE_SHAPES.len());
+    for (label, log_rows) in BALANCE_SHAPES {
+        eprintln!("        balance  ({label}, log_rows={log_rows}) ...");
+        bal_rows.push(bench_balance(label, *log_rows));
+    }
+
+    eprintln!("  [C] Poseidon2b ...");
+    let perm_row = bench_poseidon_perm();
+    let haddr_row = bench_haddr();
+    let hauth_row = bench_hauth();
+    let hleaf_row = bench_hleaf();
+
+    eprintln!("  [D] tx validity ...");
+    let txv_row = bench_tx_validity();
+
+    eprintln!("  [E] tx body merkle ...");
+    let merkle_legacy = bench_tx_body_merkle_legacy();
+    let merkle_prod = bench_tx_body_merkle();
+
+    eprintln!("  [P] spine composite (prod) ...");
+    let spine_row = bench_spine_composite();
     eprintln!();
 
-    print_tx_validity(&tx_row);
-    print_carry_table(&carry_rows);
-    print_range_table(&range_rows);
-    print_balance_table(&balance_rows);
-    print_tx_validity_3b4(&tx3b4_row);
-    print_poseidon_perm(&poseidon_row);
-    print_haddr(&haddr_row);
-    print_hauth(&hauth_row);
-    print_hleaf(&hleaf_row);
-    print_tx_body_merkle(&tx_body_merkle_row);
-    print_linear_table(&lin_rows);
-    print_footer();
+    // ---- Render ----
+    print_section("[A] Engine scaling primitives");
+    for r in &carry_rows {
+        print_row("A.carry  ", r);
+    }
+    for r in &range_rows {
+        print_row("A.range  ", r);
+    }
+    for r in &lin_rows {
+        print_row("A.lincomb", r);
+    }
+
+    print_section("[B] Balance gate");
+    for r in &bal_rows {
+        print_row("B.bal    ", r);
+    }
+
+    print_section("[C] Poseidon2b hashes");
+    print_row("C.perm   ", &perm_row);
+    print_row("C.haddr  ", &haddr_row);
+    print_row("C.hauth  ", &hauth_row);
+    print_row("C.hleaf  ", &hleaf_row);
+
+    print_section("[D] Transaction validity");
+    print_row("D.txv    ", &txv_row);
+
+    print_section("[E] Transaction-body Merkle");
+    print_row("E.legacy ", &merkle_legacy);
+    print_row("E.prod   ", &merkle_prod);
+
+    print_section("[P] PROD — per-tx prover path");
+    print_row("P.spine  ", &spine_row);
+
+    print_footer(&spine_row);
 }

@@ -217,12 +217,15 @@ mod tests {
             Block128::from(40u128),
         ];
         let rot = cyclic_rotate_left(&col);
-        assert_eq!(rot, vec![
-            Block128::from(20u128),
-            Block128::from(30u128),
-            Block128::from(40u128),
-            Block128::from(10u128),
-        ]);
+        assert_eq!(
+            rot,
+            vec![
+                Block128::from(20u128),
+                Block128::from(30u128),
+                Block128::from(40u128),
+                Block128::from(10u128),
+            ]
+        );
     }
 
     /// `ladder_partials` (nested-fold, O(2^n)) agrees with the
@@ -237,7 +240,11 @@ mod tests {
                 let reference: Vec<Block128> =
                     points.iter().map(|p| mle_eval_at(&col, p)).collect();
                 let fast = ladder_partials(&col, &r);
-                assert_eq!(fast, reference, "ladder_partials mismatch at n={} trial={}", n, trial);
+                assert_eq!(
+                    fast, reference,
+                    "ladder_partials mismatch at n={} trial={}",
+                    n, trial
+                );
             }
         }
     }
@@ -256,8 +263,7 @@ mod tests {
                 let expected = mle_eval_at(&rot, &r);
 
                 let points = ladder_points(&r);
-                let partials: Vec<Block128> =
-                    points.iter().map(|p| mle_eval_at(&col, p)).collect();
+                let partials: Vec<Block128> = points.iter().map(|p| mle_eval_at(&col, p)).collect();
                 let got = reconstruct_shifted_opening(&r, &partials);
 
                 assert_eq!(
@@ -315,7 +321,11 @@ mod tests {
             let saved = partials[k];
             partials[k] = saved + Block128::from(0x42u128);
             let tampered = reconstruct_shifted_opening(&r, &partials);
-            assert_ne!(honest, tampered, "tamper at ladder index {} went undetected", k);
+            assert_ne!(
+                honest, tampered,
+                "tamper at ladder index {} went undetected",
+                k
+            );
             partials[k] = saved;
         }
     }

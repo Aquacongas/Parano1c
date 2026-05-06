@@ -278,12 +278,7 @@ mod tests {
         };
         let st = apply_tx(&mut probe, &body).expect("probe apply");
         body.new_state_root = st.new_state_root;
-        let tbh = hash_tx_body(
-            &body.prev_state_root,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-        );
+        let tbh = hash_tx_body(&body.prev_state_root, body.fee, &body.inputs, &body.outputs);
         Transaction {
             body,
             tx_body_hash: tbh,
@@ -419,10 +414,7 @@ mod tests {
 
     #[test]
     fn proof_transcript_hash_is_deterministic() {
-        assert_eq!(
-            proof_transcript_hash(b"abc"),
-            proof_transcript_hash(b"abc")
-        );
+        assert_eq!(proof_transcript_hash(b"abc"), proof_transcript_hash(b"abc"));
         assert_ne!(proof_transcript_hash(b"a"), proof_transcript_hash(b"b"));
     }
 

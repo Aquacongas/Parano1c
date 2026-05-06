@@ -189,10 +189,7 @@ pub fn commit(
 /// Soundness: Blake3 is collision-resistant over the full codeword
 /// (RATE · 2^log_len elements · 16 bytes each), which is exactly the
 /// binding guarantee the transcript depends on.
-pub fn commit_fast(
-    evals: &[Block128],
-    ntt: &AdditiveNTT<Block128>,
-) -> FriCommitment {
+pub fn commit_fast(evals: &[Block128], ntt: &AdditiveNTT<Block128>) -> FriCommitment {
     assert!(
         evals.len().is_power_of_two(),
         "evaluation vector length must be a power of two"
@@ -567,13 +564,7 @@ mod tests {
         // before calling `prove` (Stage 3b-0.5.1 contract).
         let mut prover_channel = Channel::new();
         prover_channel.observe_fri_commitment(&commitment);
-        let proof = prove(
-            &evals,
-            &eval_point,
-            &ntt,
-            &mut prover_channel,
-            &hasher,
-        );
+        let proof = prove(&evals, &eval_point, &ntt, &mut prover_channel, &hasher);
 
         // The claimed evaluation
         let claimed_eval = mle_evaluate(&evals, &eval_point);
@@ -613,13 +604,7 @@ mod tests {
 
         let mut prover_channel = Channel::new();
         prover_channel.observe_fri_commitment(&commitment);
-        let proof = prove(
-            &evals,
-            &eval_point,
-            &ntt,
-            &mut prover_channel,
-            &hasher,
-        );
+        let proof = prove(&evals, &eval_point, &ntt, &mut prover_channel, &hasher);
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
@@ -662,13 +647,7 @@ mod tests {
 
         let mut prover_channel = Channel::new();
         prover_channel.observe_fri_commitment(&commitment);
-        let proof = prove(
-            &evals,
-            &eval_point,
-            &ntt,
-            &mut prover_channel,
-            &hasher,
-        );
+        let proof = prove(&evals, &eval_point, &ntt, &mut prover_channel, &hasher);
 
         let claimed_eval = mle_evaluate(&evals, &eval_point);
 
@@ -774,13 +753,7 @@ mod tests {
         let claimed_eval = mle_evaluate(&evals, &eval_point);
         let mut prover_channel = Channel::new();
         prover_channel.observe_fri_commitment(&commitment);
-        let proof = prove(
-            &evals,
-            &eval_point,
-            &ntt,
-            &mut prover_channel,
-            &hasher,
-        );
+        let proof = prove(&evals, &eval_point, &ntt, &mut prover_channel, &hasher);
 
         eprintln!("final_codeword={:?}", proof.final_codeword);
         eprintln!("n_rounds={}", proof.fri_oracles.len());

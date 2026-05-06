@@ -67,15 +67,11 @@ use crate::airs::poseidon_perm::{
     POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
 use crate::gates::row_selector::row_indicator_programme;
-use crate::gates::{
-    PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted,
-};
+use crate::gates::{PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRESS};
-use noid_poseidon2b::native::permutation::{
-    MDS_FULL, N_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
-};
+use noid_poseidon2b::native::permutation::{MDS_FULL, N_ROUNDS, ROUND_CONSTANTS, STATE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Layout constants
@@ -226,10 +222,7 @@ pub fn extract_haddr_output(cols: &[Vec<Block128>]) -> [Block128; 2] {
 // Constraint / public-column emission
 // ---------------------------------------------------------------------------
 
-fn mds_full_row_terms(
-    lane: usize,
-    pre_s_base: usize,
-) -> Vec<(usize, Block128)> {
+fn mds_full_row_terms(lane: usize, pre_s_base: usize) -> Vec<(usize, Block128)> {
     (0..STATE_SIZE)
         .map(|j| (pre_s_base + j, Block128::from(MDS_FULL[lane][j])))
         .collect()
@@ -249,9 +242,7 @@ fn pad_constant(lane: usize) -> Block128 {
 /// that the sponge must produce. Everything else — the secret, the
 /// intermediate states — stays in the witness. Returns
 /// `(constraints, public_columns)`.
-pub fn emit_haddr(
-    expected_addr: [Block128; 2],
-) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+pub fn emit_haddr(expected_addr: [Block128; 2]) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
     let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
     let mut public_columns: Vec<PublicColumn> = Vec::new();
 
@@ -294,8 +285,7 @@ pub fn emit_haddr(
     for lane in 0..STATE_SIZE {
         let mut terms = vec![(HADDR_LAYOUT_A.s + lane, Block128::ONE)];
         terms.extend(mds_full_row_terms(lane, HADDR_PRE_S_A_BASE));
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
         constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_0, inner)));
     }
 
@@ -309,10 +299,7 @@ pub fn emit_haddr(
             ],
             pad_constant(lane),
         ));
-        constraints.push(Box::new(SelectorGate::new(
-            HADDR_IND_ROW_N_ROUNDS,
-            inner,
-        )));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_N_ROUNDS, inner)));
     }
 
     // Tie 3c — MDS-B across rows N_ROUNDS → N_ROUNDS+1:
@@ -323,10 +310,7 @@ pub fn emit_haddr(
             vec![(HADDR_LAYOUT_B.s + lane, Block128::ONE)],
             Block128::ZERO,
         ));
-        constraints.push(Box::new(SelectorGate::new(
-            HADDR_IND_ROW_N_ROUNDS,
-            inner,
-        )));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_N_ROUNDS, inner)));
     }
 
     // Tie 4 — output squeeze at HADDR_OUTPUT_ROW. Pin s_B[0..2] to the
@@ -557,8 +541,7 @@ mod tests {
         let secret = mk_secret(0x4444);
         let air = HAddrAir::new(expected_addr_for(secret));
         let mut cols = build_haddr_trace(secret);
-        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] =
-            cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] = cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -598,12 +581,20 @@ mod tests {
     #[test]
     fn haddr_blocks_are_independent_in_column_space() {
         let a_cols = [
-            HADDR_LAYOUT_A.s, HADDR_LAYOUT_A.sin, HADDR_LAYOUT_A.sout,
-            HADDR_LAYOUT_A.rc, HADDR_LAYOUT_A.is_full, HADDR_LAYOUT_A.is_round,
+            HADDR_LAYOUT_A.s,
+            HADDR_LAYOUT_A.sin,
+            HADDR_LAYOUT_A.sout,
+            HADDR_LAYOUT_A.rc,
+            HADDR_LAYOUT_A.is_full,
+            HADDR_LAYOUT_A.is_round,
         ];
         let b_cols = [
-            HADDR_LAYOUT_B.s, HADDR_LAYOUT_B.sin, HADDR_LAYOUT_B.sout,
-            HADDR_LAYOUT_B.rc, HADDR_LAYOUT_B.is_full, HADDR_LAYOUT_B.is_round,
+            HADDR_LAYOUT_B.s,
+            HADDR_LAYOUT_B.sin,
+            HADDR_LAYOUT_B.sout,
+            HADDR_LAYOUT_B.rc,
+            HADDR_LAYOUT_B.is_full,
+            HADDR_LAYOUT_B.is_round,
         ];
         for a in a_cols {
             for b in b_cols {

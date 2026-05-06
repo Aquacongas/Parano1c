@@ -18,13 +18,5 @@ noid_binius = { path = "../noid_binius" }
 noid_chain = { path = "../noid_chain" }
 
 [[bench]]
-name = "bench_prover"
-harness = false
-
-[[bench]]
-name = "release_report"
-harness = false
-
-[[bench]]
 name = "stark_report"
 harness = false

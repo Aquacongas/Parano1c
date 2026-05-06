@@ -30,9 +30,7 @@ use crate::airs::poseidon_perm::{
     POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
 use crate::gates::row_selector::row_indicator_programme;
-use crate::gates::{
-    PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted,
-};
+use crate::gates::{PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_LEAF};
@@ -96,8 +94,14 @@ fn perm_rc_at(lane: usize, row_offset: usize) -> Vec<Block128> {
 
 fn emit_perm_publics_offset(layout: PermLayout, row_offset: usize) -> Vec<PublicColumn> {
     let mut out = Vec::with_capacity(STATE_SIZE + 2);
-    out.push(PublicColumn::new(layout.is_full, perm_is_full_at(row_offset)));
-    out.push(PublicColumn::new(layout.is_round, perm_is_round_at(row_offset)));
+    out.push(PublicColumn::new(
+        layout.is_full,
+        perm_is_full_at(row_offset),
+    ));
+    out.push(PublicColumn::new(
+        layout.is_round,
+        perm_is_round_at(row_offset),
+    ));
     for lane in 0..STATE_SIZE {
         out.push(PublicColumn::new(
             layout.rc + lane,
@@ -229,8 +233,7 @@ pub fn emit_hleaf(
     for lane in 0..STATE_SIZE {
         let mut terms = vec![(HLEAF_LAYOUT_A.s + lane, Block128::ONE)];
         terms.extend(mds_full_row_terms(lane, HLEAF_PRE_S_A_BASE));
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
         constraints.push(Box::new(SelectorGate::new(HLEAF_IND_ROW_0, inner)));
     }
 
@@ -383,7 +386,10 @@ mod tests {
         let slot = 42u32;
         let value = 1_234_567u64;
         let mut owner_bytes = [0u8; 32];
-        owner_bytes.iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        owner_bytes
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, b)| *b = i as u8);
         let owner = Address(owner_bytes);
         let [owner_hi, owner_lo] = owner.as_fields();
 
@@ -483,8 +489,7 @@ mod tests {
         let fields = mk_fields4(0x7777);
         let air = HLeafAir::new(fields, expected_leaf_for(fields));
         let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_PRE_S_B_BASE][N_ROUNDS] =
-            cols[HLEAF_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        cols[HLEAF_PRE_S_B_BASE][N_ROUNDS] = cols[HLEAF_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -559,10 +564,7 @@ mod tests {
                 assert_ne!(layouts[i].rc, layouts[j].rc);
             }
         }
-        assert_eq!(
-            HLEAF_N_COLS,
-            3 * POSEIDON_PERM_N_COLS + 3 * STATE_SIZE + 4
-        );
+        assert_eq!(HLEAF_N_COLS, 3 * POSEIDON_PERM_N_COLS + 3 * STATE_SIZE + 4);
         assert!(HLEAF_OUTPUT_ROW < HLEAF_N_ROWS);
     }
 }

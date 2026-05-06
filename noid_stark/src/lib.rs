@@ -30,8 +30,8 @@ pub mod ladder_batch;
 pub mod multipoint_batch;
 pub mod vshift;
 
-use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
+use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::batch::{prove_batched, verify_batched, BatchedEvalProof};
 use noid_fri::channel::TAU;
@@ -241,8 +241,7 @@ impl<'a> CompiledGates<'a> {
             let nexts = c.shifted_columns();
             max_next_arity = max_next_arity.max(nexts.len());
             for &idx in nexts {
-                let slot = shifted_slot[idx]
-                    .expect("shifted column must have a registered slot");
+                let slot = shifted_slot[idx].expect("shifted column must have a registered slot");
                 next_indices.push((n_base + slot) as u32);
             }
             next_index_starts.push(next_indices.len() as u32);
@@ -331,7 +330,12 @@ fn accumulate_sum_flat(
     (0..half)
         .into_par_iter()
         .map_init(
-            || (Vec::<u128>::with_capacity(local_cap), Vec::<u128>::with_capacity(next_cap)),
+            || {
+                (
+                    Vec::<u128>::with_capacity(local_cap),
+                    Vec::<u128>::with_capacity(next_cap),
+                )
+            },
             |(local_scratch, next_scratch), j| {
                 let mut composition: u128 = 0;
                 for k in 0..n_constraints {
@@ -568,8 +572,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
         .iter()
         .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> =
-        Vec::with_capacity(n_base + rotated_columns.len());
+    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns);
     sumcheck_cols.extend(rotated_columns.into_iter());
 
@@ -589,12 +592,8 @@ pub fn prove_air_unchecked_timed<A: Air>(
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
     let t2 = Instant::now();
-    let (base_openings, shift_partials) = prove_base_and_ladder_partials(
-        &padded_columns,
-        &shifted_indices,
-        &r_point,
-        &mut channel,
-    );
+    let (base_openings, shift_partials) =
+        prove_base_and_ladder_partials(&padded_columns, &shifted_indices, &r_point, &mut channel);
     t.ladder_sumcheck = t2.elapsed();
 
     let t3 = Instant::now();
@@ -755,11 +754,10 @@ fn prove_multipoint_close(
         .into_par_iter()
         .map(|slot| {
             let col_id = shifted_indices[slot];
-            let trails = weight_trails.as_ref().expect("trails present when s_count > 0");
-            let mut w = crate::ladder_batch::build_weight_table_from_trails(
-                gammas[slot],
-                trails,
-            );
+            let trails = weight_trails
+                .as_ref()
+                .expect("trails present when s_count > 0");
+            let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
             let eta = lambdas[n + slot];
             for v in w.iter_mut() {
                 *v = *v * eta;
@@ -854,8 +852,7 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
         .iter()
         .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> =
-        Vec::with_capacity(n_base + rotated_columns.len());
+    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns);
     sumcheck_cols.extend(rotated_columns.into_iter());
 
@@ -878,12 +875,8 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
     // Base openings + VSHIFT ladder partials (absorbed on channel).
-    let (base_openings, shift_partials) = prove_base_and_ladder_partials(
-        &padded_columns,
-        &shifted_indices,
-        &r_point,
-        &mut channel,
-    );
+    let (base_openings, shift_partials) =
+        prove_base_and_ladder_partials(&padded_columns, &shifted_indices, &r_point, &mut channel);
 
     // §12c' multipoint consolidation — one batched FRI closes both the
     // base claims at `r_point` and every ladder claim (inlined as a
@@ -1523,7 +1516,11 @@ mod tests {
         (0..(1usize << log_rows))
             .map(|i| {
                 let bit = ((seed.wrapping_mul(2654435761).wrapping_add(i as u64)) >> 7) & 1;
-                if bit == 0 { Block128::ZERO } else { Block128::ONE }
+                if bit == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
             })
             .collect()
     }
@@ -1573,9 +1570,8 @@ mod tests {
         // col0 · col1 · col2 == 0 when at least one column is all-zero on
         // the hypercube. Use col2 = 0 as the "indicator" column.
         let log_rows = 4;
-        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(Deg3ProductGate {
-            cols: [0, 1, 2],
-        })];
+        let constraints: Vec<Box<dyn Constraint>> =
+            vec![Box::new(Deg3ProductGate { cols: [0, 1, 2] })];
         let air = CompositeAir::from_parts(log_rows, 3, constraints);
         let n = 1 << log_rows;
         let col0: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 * 13 + 5)).collect();
@@ -1591,8 +1587,7 @@ mod tests {
     fn honest_quartic_degree_4() {
         // (col0)^2 · (col1)^2 == 0 when col0 is all-zero on the hypercube.
         let log_rows = 4;
-        let constraints: Vec<Box<dyn Constraint>> =
-            vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
+        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
         let air = CompositeAir::from_parts(log_rows, 2, constraints);
         let col0 = zero_col(log_rows);
         let n = 1 << log_rows;
@@ -1679,9 +1674,8 @@ mod tests {
     fn malicious_cubic_violation_rejected() {
         // Degree-3 constraint violated on the hypercube.
         let log_rows = 4;
-        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(Deg3ProductGate {
-            cols: [0, 1, 2],
-        })];
+        let constraints: Vec<Box<dyn Constraint>> =
+            vec![Box::new(Deg3ProductGate { cols: [0, 1, 2] })];
         let air = CompositeAir::from_parts(log_rows, 3, constraints);
         let n = 1 << log_rows;
         let col0: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 + 1)).collect();
@@ -1696,8 +1690,7 @@ mod tests {
     #[test]
     fn malicious_quartic_violation_rejected() {
         let log_rows = 4;
-        let constraints: Vec<Box<dyn Constraint>> =
-            vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
+        let constraints: Vec<Box<dyn Constraint>> = vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
         let air = CompositeAir::from_parts(log_rows, 2, constraints);
         let n = 1 << log_rows;
         let col0: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 + 1)).collect();
@@ -1772,7 +1765,8 @@ mod tests {
         // `max_constraint_degree + 2`, independent of AIR.
         for (air_deg, air) in [
             (1usize, {
-                let c: Vec<Box<dyn Constraint>> = vec![Box::new(WeightedLinearGate::new_xor(vec![0, 1]))];
+                let c: Vec<Box<dyn Constraint>> =
+                    vec![Box::new(WeightedLinearGate::new_xor(vec![0, 1]))];
                 CompositeAir::from_parts(4, 2, c)
             }),
             (2usize, {
@@ -1780,14 +1774,12 @@ mod tests {
                 CompositeAir::from_parts(4, 1, c)
             }),
             (3usize, {
-                let c: Vec<Box<dyn Constraint>> = vec![Box::new(Deg3ProductGate {
-                    cols: [0, 1, 2],
-                })];
+                let c: Vec<Box<dyn Constraint>> =
+                    vec![Box::new(Deg3ProductGate { cols: [0, 1, 2] })];
                 CompositeAir::from_parts(4, 3, c)
             }),
             (4usize, {
-                let c: Vec<Box<dyn Constraint>> =
-                    vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
+                let c: Vec<Box<dyn Constraint>> = vec![Box::new(Deg4SquareGate { cols: [0, 1] })];
                 CompositeAir::from_parts(4, 2, c)
             }),
         ] {
@@ -1821,12 +1813,8 @@ mod tests {
             Block128::from(7u8),
             Block128::from(11u8),
         ];
-        let pt = |x: Block128| {
-            a[0] + x * (a[1] + x * (a[2] + x * a[3]))
-        };
-        let evals: Vec<Block128> = (0..4)
-            .map(|i| pt(Block128::from(i as u8)))
-            .collect();
+        let pt = |x: Block128| a[0] + x * (a[1] + x * (a[2] + x * a[3]));
+        let evals: Vec<Block128> = (0..4).map(|i| pt(Block128::from(i as u8))).collect();
         for target_i in 0..8u8 {
             let target = Block128::from(target_i);
             assert_eq!(lagrange_eval_at(&evals, target), pt(target));
@@ -1854,9 +1842,7 @@ mod tests {
             Block128::from(8u8),
             Block128::from(13u8),
         ];
-        let p5 = |x: Block128| {
-            a[0] + x * (a[1] + x * (a[2] + x * (a[3] + x * (a[4] + x * a[5]))))
-        };
+        let p5 = |x: Block128| a[0] + x * (a[1] + x * (a[2] + x * (a[3] + x * (a[4] + x * a[5]))));
         let e5: Vec<Block128> = (0..6).map(|i| p5(Block128::from(i as u8))).collect();
         for target_i in 0..12u8 {
             let t = Block128::from(target_i);
@@ -2128,9 +2114,7 @@ mod tests {
         let log_rows = 8;
         let air = CarryRippleAir::new(log_rows);
         // u64::MAX + 1 overflows: carry-out = 1 each instance.
-        let adders: Vec<(u64, u64)> = (0..air.n_instances())
-            .map(|_| (u64::MAX, 1u64))
-            .collect();
+        let adders: Vec<(u64, u64)> = (0..air.n_instances()).map(|_| (u64::MAX, 1u64)).collect();
         let trace = air.build_trace(&adders);
         // Sanity: the last instance's carry on the last row must be 1
         // (propagated all the way), so the wrap from row N-1 -> row 0
@@ -2143,10 +2127,7 @@ mod tests {
             trace.columns[CARRY_RIPPLE_COL_CARRY][last_row],
             Block128::ONE
         );
-        assert_eq!(
-            trace.columns[CARRY_RIPPLE_COL_IS_RESET][0],
-            Block128::ONE
-        );
+        assert_eq!(trace.columns[CARRY_RIPPLE_COL_IS_RESET][0], Block128::ONE);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -2289,8 +2270,7 @@ mod tests {
             }
             let last = inst * RANGE_GATE_WORD_BITS + RANGE_GATE_WORD_BITS - 1;
             assert_eq!(
-                trace.columns[RANGE_GATE_COL_ACC][last],
-                expected,
+                trace.columns[RANGE_GATE_COL_ACC][last], expected,
                 "acc mismatch at instance {inst}"
             );
         }
@@ -2622,13 +2602,7 @@ mod tx_validity_3b4_tests {
         let body = balanced_1in1out(1_000_000, 999_950, 50);
         let ins = [1_000_000u64, 0, 0, 0];
         let outs = [999_950u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            50,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 50, TX_VALIDITY_3B4_LOG_ROWS);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -2646,13 +2620,7 @@ mod tx_validity_3b4_tests {
         // Off-by-one in the output — witness still looks OK, balance
         // circuit disagrees.
         let outs = [4998u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            1,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 1, TX_VALIDITY_3B4_LOG_ROWS);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
         assert!(verify_air(&air, &pi, &proof).is_err());
@@ -2666,13 +2634,8 @@ mod tx_validity_3b4_tests {
         let body = balanced_1in1out(10_000, 10_000, 0);
         let ins = [10_000u64, 0, 0, 0];
         let outs = [10_000u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            0,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
         trace.columns[TxValidityCol::InputValid.index()][5] = Block128::from(9u128);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -2687,13 +2650,8 @@ mod tx_validity_3b4_tests {
         let body = balanced_1in1out(1234, 1230, 4);
         let ins = [1234u64, 0, 0, 0];
         let outs = [1230u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            4,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 4, TX_VALIDITY_3B4_LOG_ROWS);
         // Balance A0.a lives at column `TX_VALIDITY_BALANCE_COL_OFFSET + 0`.
         trace.columns[TX_VALIDITY_BALANCE_COL_OFFSET][0] += Block128::ONE;
         let pi = mk_pi();
@@ -2708,19 +2666,11 @@ mod tx_validity_3b4_tests {
         // `TX_VALIDITY_BALANCE_COL_OFFSET`. Honest trace closes prove /
         // verify cleanly — no witness change is needed; the programmes
         // match what `build_balance_trace_parts` already writes.
-        let air = TxValidityAir::new_3b4_with_balance_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = balanced_1in1out(500_000, 499_900, 100);
         let ins = [500_000u64, 0, 0, 0];
         let outs = [499_900u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            100,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 100, TX_VALIDITY_3B4_LOG_ROWS);
         assert!(air.check(&trace));
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -2734,21 +2684,13 @@ mod tx_validity_3b4_tests {
         // native selector-column pinning rejects, and the STARK
         // verifier's `check_public_columns` MLE re-eval rejects too.
         use noid_air::{BIT_ADDER_COL_IS_INPUT, BIT_ADDER_N_COLS};
-        let air = TxValidityAir::new_3b4_with_balance_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = balanced_1in1out(42, 42, 0);
         let ins = [42u64, 0, 0, 0];
         let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            0,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
-        let col =
-            TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
         // Row 100 is inside block A0's padding region (width 64).
         trace.columns[col][100] = Block128::ONE;
         let pi = mk_pi();
@@ -2762,9 +2704,7 @@ mod tx_validity_3b4_tests {
 
     #[test]
     fn tx_validity_3b4_with_skeleton_pins_honest_prove_verify() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         assert_eq!(air.n_columns(), TX_VALIDITY_3B4_PINNED_N_COLS);
         let body = balanced_1in1out(250_000, 249_993, 7);
         let ins = [250_000u64, 0, 0, 0];
@@ -2788,9 +2728,7 @@ mod tx_validity_3b4_tests {
         // the bool gate still accepts but the multi-hot row-domain pin
         // rejects, and the STARK verifier's `check_public_columns` MLE
         // re-eval catches any attempt to also tamper the mask column.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = balanced_1in1out(42, 42, 0);
         let ins = [42u64, 0, 0, 0];
         let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
@@ -2812,9 +2750,7 @@ mod tx_validity_3b4_tests {
     fn tx_validity_3b4_skeleton_pin_rejects_mask_tamper() {
         // Tamper only the mask column — the PublicColumn MLE re-eval at
         // the verifier's r_point catches it.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = balanced_1in1out(100, 100, 0);
         let ins = [100u64, 0, 0, 0];
         let outs = [100u64, 0, 0, 0, 0, 0, 0, 0];
@@ -2869,7 +2805,11 @@ mod poseidon_perm_stark_tests {
     }
 
     fn mk_air() -> CompositeAir {
-        CompositeAir::from_parts(POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, emit_perm_all())
+        CompositeAir::from_parts(
+            POSEIDON_PERM_LOG_ROWS,
+            POSEIDON_PERM_N_COLS,
+            emit_perm_all(),
+        )
     }
 
     #[test]
@@ -2973,8 +2913,8 @@ mod haddr_stark_tests {
     use super::*;
     use noid_air::{
         build_haddr_trace, extract_haddr_output, Air, HAddrAir, Trace, HADDR_B_SEED_ROW,
-        HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B, HADDR_OUTPUT_ROW,
-        HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
+        HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B, HADDR_OUTPUT_ROW, HADDR_PRE_S_A_BASE,
+        HADDR_PRE_S_B_BASE,
     };
     use noid_core::Block128;
     use noid_poseidon2b::native::permutation::N_ROUNDS;
@@ -3079,8 +3019,7 @@ mod haddr_stark_tests {
         let secret = mk_secret(0xDEAD_BEEF);
         let air = HAddrAir::new(expected_for(secret));
         let mut cols = build_haddr_trace(secret);
-        cols[HADDR_PRE_S_A_BASE + 2][0] =
-            cols[HADDR_PRE_S_A_BASE + 2][0] + Block128::ONE;
+        cols[HADDR_PRE_S_A_BASE + 2][0] = cols[HADDR_PRE_S_A_BASE + 2][0] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3092,8 +3031,7 @@ mod haddr_stark_tests {
         let secret = mk_secret(0xCAFE_F00D);
         let air = HAddrAir::new(expected_for(secret));
         let mut cols = build_haddr_trace(secret);
-        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] =
-            cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        cols[HADDR_PRE_S_B_BASE][N_ROUNDS] = cols[HADDR_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3492,7 +3430,11 @@ mod tx_body_merkle_stark_tests {
         (0..(1usize << log_rows))
             .map(|i| {
                 let bit = ((seed.wrapping_mul(2654435761).wrapping_add(i as u64)) >> 7) & 1;
-                if bit == 0 { Block128::ZERO } else { Block128::ONE }
+                if bit == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
             })
             .collect()
     }
@@ -3708,9 +3650,7 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn hauth_stark_padding_rc_tamper_rejected() {
-        use noid_air::{
-            build_hauth_trace, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_C,
-        };
+        use noid_air::{build_hauth_trace, extract_hauth_output, HAuthAir, HAUTH_LAYOUT_C};
         use noid_poseidon2b::native::permutation::N_ROUNDS;
         let secret = [Block128::from(1u128), Block128::from(2u128)];
         let tx_body = [Block128::from(3u128), Block128::from(4u128)];
@@ -3730,8 +3670,8 @@ mod tx_body_merkle_stark_tests {
         // padding row where every interior selector is zero. Caught
         // only by the row-major public-column declaration.
         use noid_air::{
-            build_tx_body_merkle_trace, instance_row_offset, TxBodyMerkleAir,
-            TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
+            build_tx_body_merkle_trace, instance_row_offset, TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT,
+            TXBODY_MERKLE_N_PERMS,
         };
         use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
         let air = TxBodyMerkleAir::new();
@@ -3755,9 +3695,7 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn hleaf_stark_padding_rc_tamper_rejected() {
-        use noid_air::{
-            build_hleaf_trace, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_B,
-        };
+        use noid_air::{build_hleaf_trace, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_B};
         use noid_poseidon2b::native::permutation::N_ROUNDS;
         let fields = [
             Block128::from(0x11u128),
@@ -3842,7 +3780,13 @@ mod tx_body_merkle_stark_tests {
             v
         };
         let bool_col: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
 
         // Honest: target row carries `constant`, other rows free.
@@ -3905,7 +3849,13 @@ mod tx_body_merkle_stark_tests {
             v
         };
         let bool_col: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
 
         // Honest: col_a and col_b agree on `target_row`, disagree freely
@@ -3975,7 +3925,13 @@ mod tx_body_merkle_stark_tests {
             v
         };
         let bool_col: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
 
         // Honest: col_a[target_row] == col_b[target_row + 1].

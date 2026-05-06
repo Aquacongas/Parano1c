@@ -52,11 +52,10 @@ pub const TREE_LEAF_PAD_BASE: usize = 14;
 /// Total number of Poseidon2b permutations proved by the tx-body AIR
 /// under the Option α layout. Must equal `TXBODY_MERKLE_N_PERMS` once
 /// 3d-0.9.D retires the 68-instance 3c-5 path.
-pub const N_INSTANCES: usize =
-    TXBODY_N_INPUT_LEAVES * PERMS_PER_INPUT_LEAF
-        + TXBODY_N_OUTPUT_LEAVES * PERMS_PER_OUTPUT_LEAF
-        + 15 * PERMS_PER_COMPRESS
-        + PERMS_PER_WRAP;
+pub const N_INSTANCES: usize = TXBODY_N_INPUT_LEAVES * PERMS_PER_INPUT_LEAF
+    + TXBODY_N_OUTPUT_LEAVES * PERMS_PER_OUTPUT_LEAF
+    + 15 * PERMS_PER_COMPRESS
+    + PERMS_PER_WRAP;
 
 /// Classification of one permutation instance inside the stack. The
 /// `leaf_idx` for input / output variants is the positional slot
@@ -110,9 +109,7 @@ impl InstanceRole {
         match *self {
             Self::InputLeafPermA { leaf_idx }
             | Self::InputLeafPermB { leaf_idx }
-            | Self::InputLeafPermC { leaf_idx } => {
-                Some(TREE_LEAF_INPUT_BASE + leaf_idx as usize)
-            }
+            | Self::InputLeafPermC { leaf_idx } => Some(TREE_LEAF_INPUT_BASE + leaf_idx as usize),
             Self::OutputLeafPermA { leaf_idx } | Self::OutputLeafPermB { leaf_idx } => {
                 Some(TREE_LEAF_OUTPUT_BASE + leaf_idx as usize)
             }
@@ -186,21 +183,27 @@ pub fn build_instance_layout() -> Vec<InstanceMeta> {
         let tree_leaf = TREE_LEAF_INPUT_BASE + leaf_slot;
         let a_id = out.len();
         out.push(make_meta(
-            InstanceRole::InputLeafPermA { leaf_idx: leaf_slot as u8 },
+            InstanceRole::InputLeafPermA {
+                leaf_idx: leaf_slot as u8,
+            },
             a_id,
             None,
             None,
         ));
         let b_id = out.len();
         out.push(make_meta(
-            InstanceRole::InputLeafPermB { leaf_idx: leaf_slot as u8 },
+            InstanceRole::InputLeafPermB {
+                leaf_idx: leaf_slot as u8,
+            },
             b_id,
             None,
             None,
         ));
         let c_id = out.len();
         out.push(make_meta(
-            InstanceRole::InputLeafPermC { leaf_idx: leaf_slot as u8 },
+            InstanceRole::InputLeafPermC {
+                leaf_idx: leaf_slot as u8,
+            },
             c_id,
             None,
             None,
@@ -213,14 +216,18 @@ pub fn build_instance_layout() -> Vec<InstanceMeta> {
         let tree_leaf = TREE_LEAF_OUTPUT_BASE + leaf_slot;
         let a_id = out.len();
         out.push(make_meta(
-            InstanceRole::OutputLeafPermA { leaf_idx: leaf_slot as u8 },
+            InstanceRole::OutputLeafPermA {
+                leaf_idx: leaf_slot as u8,
+            },
             a_id,
             None,
             None,
         ));
         let b_id = out.len();
         out.push(make_meta(
-            InstanceRole::OutputLeafPermB { leaf_idx: leaf_slot as u8 },
+            InstanceRole::OutputLeafPermB {
+                leaf_idx: leaf_slot as u8,
+            },
             b_id,
             None,
             None,
@@ -404,7 +411,10 @@ mod tests {
                     .children
                     .map(|[l, r]| [l, r].into_iter().flatten().any(|c| c == child_id))
                     .unwrap_or(false);
-                assert!(refs_child, "parent {parent_id} must reference child {child_id}");
+                assert!(
+                    refs_child,
+                    "parent {parent_id} must reference child {child_id}"
+                );
             }
         }
     }
@@ -487,7 +497,10 @@ mod tests {
     fn perms_for_tree_leaf_dispatch() {
         assert_eq!(perms_for_tree_leaf(TREE_LEAF_PREV_STATE_ROOT), 0);
         assert_eq!(perms_for_tree_leaf(TREE_LEAF_FEE), 0);
-        assert_eq!(perms_for_tree_leaf(TREE_LEAF_INPUT_BASE), PERMS_PER_INPUT_LEAF);
+        assert_eq!(
+            perms_for_tree_leaf(TREE_LEAF_INPUT_BASE),
+            PERMS_PER_INPUT_LEAF
+        );
         assert_eq!(
             perms_for_tree_leaf(TREE_LEAF_INPUT_BASE + 3),
             PERMS_PER_INPUT_LEAF

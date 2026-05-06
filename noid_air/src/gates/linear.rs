@@ -38,8 +38,7 @@ impl WeightedLinearGate {
                 );
             }
         }
-        let weights_flat: Vec<u128> =
-            terms.iter().map(|(_, w)| tower_to_flat_u128(w.0)).collect();
+        let weights_flat: Vec<u128> = terms.iter().map(|(_, w)| tower_to_flat_u128(w.0)).collect();
         let constant_flat = tower_to_flat_u128(constant.0);
         Self {
             terms,
@@ -229,8 +228,7 @@ mod tests {
     fn weighted_linear_gate_rejects_wrong_constant() {
         let w0 = Block128::from(3u128);
         let w1 = Block128::from(5u128);
-        let gate =
-            WeightedLinearGate::new(vec![(0, w0), (1, w1)], Block128::from(7u128));
+        let gate = WeightedLinearGate::new(vec![(0, w0), (1, w1)], Block128::from(7u128));
         let air = CompositeAir::from_parts(2, 2, vec![Box::new(gate)]);
         let col0: Vec<Block128> = (0..4).map(|i| Block128::from(i as u128)).collect();
         let inv_w1 = w1.invert();

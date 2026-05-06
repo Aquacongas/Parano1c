@@ -15,12 +15,15 @@ pub mod echo;
 pub mod layout;
 
 pub use air::{
-    build_tx_body_merkle_trace, build_tx_body_merkle_typed_trace,
-    emit_tx_body_merkle_constraints, emit_tx_body_merkle_public_columns,
-    extract_instance_output, instance_row_offset, leaf_rate_absorb_instance_ids,
-    leaf_rate_payload_col, tx_body_merkle_column_domains, TxBodyMerkleAir,
-    N_LEAF_RATE_PAYLOAD_COLS, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS,
-    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS,
+    build_tx_body_merkle_trace, build_tx_body_merkle_trace_with_boundary_pins,
+    build_tx_body_merkle_typed_trace, emit_tx_body_merkle_constraints,
+    emit_tx_body_merkle_constraints_with_boundary_pins, emit_tx_body_merkle_public_columns,
+    emit_tx_body_merkle_public_columns_with_boundary_pins, extract_instance_output,
+    instance_row_offset, leaf_rate_absorb_instance_ids, leaf_rate_payload_col,
+    tx_body_merkle_column_domains, tx_body_merkle_column_domains_with_boundary_pins,
+    TxBodyMerkleAir, TxBodyMerkleBoundaryPins, N_LEAF_RATE_PAYLOAD_COLS, N_ROUNDS,
+    TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS,
+    TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS,
     TXBODY_MERKLE_PRE_S_BASE, TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS,
 };
-pub use layout::build_instance_layout;
+pub use layout::{build_instance_layout, InstanceMeta, InstanceRole};

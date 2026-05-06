@@ -102,11 +102,7 @@ impl Accumulator {
     /// Initialise with the shared opening point `z`. `log_len` must
     /// match the padded length every folded column will use.
     pub fn new(log_len: usize, z: Vec<Block128>) -> Self {
-        assert_eq!(
-            z.len(),
-            log_len,
-            "opening-point length must equal log_len"
-        );
+        assert_eq!(z.len(), log_len, "opening-point length must equal log_len");
         Self {
             log_len,
             z,
@@ -241,15 +237,8 @@ pub fn decide(acc: &Accumulator) -> Result<(), DecideError> {
         proof_ch.observe_field_elem(opening);
         proof_ch.observe_field_elem(alpha);
 
-        fri_verify(
-            &acc.z,
-            opening,
-            proof.clone(),
-            &ntt,
-            &mut proof_ch,
-            &hasher,
-        )
-        .map_err(|e| DecideError::FriFailed(k, e))?;
+        fri_verify(&acc.z, opening, proof.clone(), &ntt, &mut proof_ch, &hasher)
+            .map_err(|e| DecideError::FriFailed(k, e))?;
 
         y_replay += alpha * opening;
     }

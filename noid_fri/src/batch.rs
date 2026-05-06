@@ -266,7 +266,10 @@ pub fn rlc_codewords(lambdas: &[Block128], codewords: &[&[Block128]]) -> Vec<Blo
         codewords.len(),
         "rlc_codewords: lambda / codeword count mismatch"
     );
-    assert!(!codewords.is_empty(), "rlc_codewords: need at least one codeword");
+    assert!(
+        !codewords.is_empty(),
+        "rlc_codewords: need at least one codeword"
+    );
     let len = codewords[0].len();
     for (i, cw) in codewords.iter().enumerate() {
         assert_eq!(
@@ -375,8 +378,9 @@ mod tests {
         let mut r = rng();
         let n_cols = 4;
         let len = 32;
-        let cws: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cws: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..len).map(|_| rand_block(&mut r)).collect())
+            .collect();
         let lambdas: Vec<Block128> = (0..n_cols).map(|_| rand_block(&mut r)).collect();
 
         let cw_refs: Vec<&[Block128]> = cws.iter().map(|v| v.as_slice()).collect();
@@ -398,8 +402,9 @@ mod tests {
         let mut r = rng();
         let n_cols = 3;
         let len = 2048;
-        let cws: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cws: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..len).map(|_| rand_block(&mut r)).collect())
+            .collect();
         let lambdas: Vec<Block128> = (0..n_cols).map(|_| rand_block(&mut r)).collect();
 
         let cw_refs: Vec<&[Block128]> = cws.iter().map(|v| v.as_slice()).collect();
@@ -419,8 +424,9 @@ mod tests {
     fn rlc_symbol_pairs_is_linear_on_each_side() {
         let mut r = rng();
         let lambdas = horner_weights(rand_block(&mut r), 5);
-        let pairs: Vec<(Block128, Block128)> =
-            (0..5).map(|_| (rand_block(&mut r), rand_block(&mut r))).collect();
+        let pairs: Vec<(Block128, Block128)> = (0..5)
+            .map(|_| (rand_block(&mut r), rand_block(&mut r)))
+            .collect();
         let (s0, s1) = rlc_symbol_pairs(&lambdas, &pairs);
 
         // Reference via explicit loop.
@@ -482,8 +488,9 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
 
-        let cols: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cols: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect())
+            .collect();
 
         // Simulate the outer protocol: commit each column and absorb
         // the roots into a parent transcript before calling into
@@ -515,9 +522,15 @@ mod tests {
         for c in &commitments {
             verifier_ch.observe_fri_commitment(c);
         }
-        let openings =
-            verify_batched(&commitments, &eval_point, &proof, &ntt, &mut verifier_ch, &hasher)
-                .expect("batched verify must succeed on honest proof");
+        let openings = verify_batched(
+            &commitments,
+            &eval_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
+        )
+        .expect("batched verify must succeed on honest proof");
         assert_eq!(openings, expected_openings);
     }
 
@@ -532,12 +545,11 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
 
-        let cols: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect()).collect();
-        let commitments: Vec<FriCommitment> = cols
-            .iter()
-            .map(|c| commit(c, &ntt, &hasher).0)
+        let cols: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect())
             .collect();
+        let commitments: Vec<FriCommitment> =
+            cols.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
         let eval_point = mk_eval_point(&mut r, log_len);
 
         let mut prover_ch = Channel::new();
@@ -554,7 +566,14 @@ mod tests {
         for c in &commitments {
             verifier_ch.observe_fri_commitment(c);
         }
-        let res = verify_batched(&commitments, &eval_point, &proof, &ntt, &mut verifier_ch, &hasher);
+        let res = verify_batched(
+            &commitments,
+            &eval_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
+        );
         assert!(res.is_err(), "tampered opening must be rejected");
     }
 
@@ -572,8 +591,9 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
 
-        let cols: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cols: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect())
+            .collect();
         let commitments: Vec<FriCommitment> =
             cols.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
         let eval_point = mk_eval_point(&mut r, log_len);
@@ -599,7 +619,12 @@ mod tests {
             verifier_ch.observe_fri_commitment(c);
         }
         let res = verify_batched(
-            &commitments, &eval_point, &proof, &ntt, &mut verifier_ch, &hasher,
+            &commitments,
+            &eval_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
         );
         assert!(res.is_err(), "tampered FRI oracle root must be rejected");
     }
@@ -618,8 +643,9 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
 
-        let cols: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cols: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect())
+            .collect();
         let commitments: Vec<FriCommitment> =
             cols.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
         let eval_point = mk_eval_point(&mut r, log_len);
@@ -638,7 +664,12 @@ mod tests {
             verifier_ch.observe_fri_commitment(c);
         }
         let res = verify_batched(
-            &commitments, &eval_point, &proof, &ntt, &mut verifier_ch, &hasher,
+            &commitments,
+            &eval_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
         );
         assert!(res.is_err(), "divergent parent transcript must be rejected");
     }
@@ -655,8 +686,9 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
         let hasher = Poseidon2bSponge::new();
 
-        let cols: Vec<Vec<Block128>> =
-            (0..n_cols).map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect()).collect();
+        let cols: Vec<Vec<Block128>> = (0..n_cols)
+            .map(|_| (0..1 << log_len).map(|_| rand_block(&mut r)).collect())
+            .collect();
         let commitments: Vec<FriCommitment> =
             cols.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
         let eval_point = mk_eval_point(&mut r, log_len);
@@ -676,7 +708,12 @@ mod tests {
             verifier_ch.observe_fri_commitment(c);
         }
         let res = verify_batched(
-            &commitments, &bad_point, &proof, &ntt, &mut verifier_ch, &hasher,
+            &commitments,
+            &bad_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
         );
         assert!(res.is_err(), "tampered eval_point must be rejected");
     }
@@ -710,7 +747,14 @@ mod tests {
 
         let mut verifier_ch = Channel::new();
         verifier_ch.observe_fri_commitment(&commitment);
-        verify_batched(&[commitment], &eval_point, &proof, &ntt, &mut verifier_ch, &hasher)
-            .expect("single-column batched verify must succeed");
+        verify_batched(
+            &[commitment],
+            &eval_point,
+            &proof,
+            &ntt,
+            &mut verifier_ch,
+            &hasher,
+        )
+        .expect("single-column batched verify must succeed");
     }
 }

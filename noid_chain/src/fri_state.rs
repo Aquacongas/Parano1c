@@ -22,7 +22,9 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::channel::Channel;
 use noid_fri::hasher::Blake3Hasher;
-use noid_fri::prover::{commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment};
+use noid_fri::prover::{
+    commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment,
+};
 use noid_fri::verifier::verify as fri_verify;
 
 /// Default state vector depth used by mainnet. 16 777 216 slots fits
@@ -151,10 +153,7 @@ impl FriState {
     /// Apply a batch of `(index, new_value)` updates in place and
     /// return the post-update state root. Later entries in `deltas`
     /// override earlier ones at the same index.
-    pub fn apply_delta(
-        &mut self,
-        deltas: &[(u32, SlotValue)],
-    ) -> Result<StateRoot, StateError> {
+    pub fn apply_delta(&mut self, deltas: &[(u32, SlotValue)]) -> Result<StateRoot, StateError> {
         for (idx, _) in deltas {
             if (*idx as u64) >= self.num_slots() {
                 return Err(StateError::SlotOutOfRange);
@@ -259,11 +258,7 @@ pub fn eval_point_for_index(idx: u32, log_slots: usize) -> Vec<Block128> {
         .collect()
 }
 
-fn open_column(
-    log_slots: usize,
-    evals: &[Block128],
-    point: &[Block128],
-) -> SlotColumnOpening {
+fn open_column(log_slots: usize, evals: &[Block128], point: &[Block128]) -> SlotColumnOpening {
     let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
     let commitment = fri_commit_fast(evals, &ntt);
@@ -306,15 +301,8 @@ pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotVa
         let hasher = Blake3Hasher::new();
         let mut ch = Channel::new();
         ch.observe_fri_commitment(&col.commitment);
-        fri_verify(
-            &point,
-            col.value,
-            col.proof.clone(),
-            &ntt,
-            &mut ch,
-            &hasher,
-        )
-        .map_err(|_| StateError::OpeningFailed)?;
+        fri_verify(&point, col.value, col.proof.clone(), &ntt, &mut ch, &hasher)
+            .map_err(|_| StateError::OpeningFailed)?;
     }
 
     let mut buf = Vec::with_capacity(STATE_DOMAIN.len() + 4 + 32 * 3);
@@ -480,7 +468,10 @@ mod tests {
         state.set_slot(0, sv(7)).unwrap();
         let op = state.open(0).expect("open");
         let bad_root = [0xAAu8; 32];
-        assert_eq!(verify_opening(&bad_root, &op), Err(StateError::OpeningFailed));
+        assert_eq!(
+            verify_opening(&bad_root, &op),
+            Err(StateError::OpeningFailed)
+        );
     }
 
     #[test]

@@ -256,10 +256,7 @@ impl Transaction {
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let body = TxBody::decode(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
-        Ok(Self {
-            body,
-            tx_body_hash,
-        })
+        Ok(Self { body, tx_body_hash })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {

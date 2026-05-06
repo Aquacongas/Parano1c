@@ -38,18 +38,20 @@
 //!
 //! ## Soundness caveats — what 3b-4 still does *not* bind
 //!
-//! 3b-4 is the first real non-Poseidon composition; it intentionally
-//! stops short of binding the witness `Value` column to the balance
-//! operands. That binding needs a `ConstColumnGate` for the integer
-//! weight vector and lands in Stage 3d. Concretely:
+//! 3b-4 is the first real non-Poseidon composition; the full binding
+//! of the balance operands to the public `TxBody` u64 fields was
+//! originally scoped for Stage 3d via an in-circuit weighted
+//! accumulator. Stage 3d-0.10.5 replaces that plan with a cheaper
+//! public-input pin — each of the 13 primary operand columns
+//! (`i0..i3`, `o0..o7`, `fee`) is declared as a `PublicColumn` whose
+//! 64-row programme encodes the bit decomposition of the
+//! verifier-known u64, exposed through
+//! [`Self::new_3b4_with_value_pins`]. Remaining caveats:
 //!
-//! 1. The `Value` column of the witness region is not wired to the
-//!    first row of any balance block's `a`/`b` column. An adversary
-//!    could populate the balance circuit with a balanced `(i, o, fee)`
-//!    tuple that has nothing to do with the witness rows; 3b-4 still
-//!    accepts. Stage 3d closes this by pinning the integer-embedded
-//!    accumulator of each balance operand against the witness value via
-//!    a `ConstColumnGate` + `WeightedLinearGate` pair.
+//! 1. (Closed by §3d-0.10.5.) The `Value` witness column is *not*
+//!    directly wired to the balance operands — that column is derived
+//!    from the same public `TxBody`, so a secondary intra-trace tie is
+//!    redundant once the balance operands are themselves pinned public.
 //! 2. Poseidon-derived fields (`OwnerHi/Lo`, `SpendSecretHi/Lo`,
 //!    `AuthTagHi/Lo`) are free variables: no constraint relates them
 //!    yet. That is the job of Stage 3c.
@@ -60,11 +62,10 @@
 
 use crate::airs::balance_gate::{
     build_balance_columns, emit_balance_constraints, emit_balance_selector_public_columns,
+    emit_balance_value_public_columns,
 };
 use crate::airs::{BALANCE_MIN_LOG_ROWS, BALANCE_N_COLS};
-use crate::gates::{
-    emit_rows_must_be_zero, multi_row_indicator_programme, BoolGate, PublicColumn,
-};
+use crate::gates::{emit_rows_must_be_zero, multi_row_indicator_programme, BoolGate, PublicColumn};
 use crate::{Air, ColumnDomain, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_tx::{TxBody, MAX_INPUTS, MAX_OUTPUTS};
@@ -215,6 +216,41 @@ impl TxValidityAir {
         let mut air = Self::new_3b4(log_rows);
         air.public_columns =
             emit_balance_selector_public_columns(TX_VALIDITY_BALANCE_COL_OFFSET, log_rows);
+        air
+    }
+
+    /// §3d-0.10.5 — composite AIR with the 22 balance-selector pins
+    /// AND the 13 primary-operand value pins. Closes the §3b-4 debt
+    /// item that the balance circuit operands were witness-free
+    /// variables unrelated to the public `TxBody` u64 fields: each
+    /// of the 4 input values, 8 output values, and fee is now pinned
+    /// to its home `bit_adder.a` / `.b` column via a `PublicColumn`
+    /// carrying the 64-bit-decomposition programme of the public u64.
+    ///
+    /// Programmes depend on `(balance_inputs, balance_outputs, balance_fee)`,
+    /// so they must be supplied at AIR construction time (mirroring the
+    /// verifier-known public-input contract). An honest prover that
+    /// produces the matching trace via [`Self::build_trace_3b4`] with
+    /// the same triple verifies; any prover that populates the balance
+    /// region with different operand bits is rejected by the value
+    /// pins without touching the in-circuit constraint set.
+    pub fn new_3b4_with_value_pins(
+        log_rows: usize,
+        balance_inputs: [u64; 4],
+        balance_outputs: [u64; 8],
+        balance_fee: u64,
+    ) -> Self {
+        let mut air = Self::new_3b4(log_rows);
+        let mut publics =
+            emit_balance_selector_public_columns(TX_VALIDITY_BALANCE_COL_OFFSET, log_rows);
+        publics.extend(emit_balance_value_public_columns(
+            TX_VALIDITY_BALANCE_COL_OFFSET,
+            log_rows,
+            balance_inputs,
+            balance_outputs,
+            balance_fee,
+        ));
+        air.public_columns = publics;
         air
     }
 
@@ -372,8 +408,9 @@ fn build_witness_columns(
         n_rows >= TX_VALIDITY_SLOTS,
         "log_rows = {log_rows} too small for {TX_VALIDITY_SLOTS} witness rows"
     );
-    let mut cols: Vec<Vec<Block128>> =
-        (0..TX_VALIDITY_N_COLS).map(|_| vec![Block128::ZERO; n_rows]).collect();
+    let mut cols: Vec<Vec<Block128>> = (0..TX_VALIDITY_N_COLS)
+        .map(|_| vec![Block128::ZERO; n_rows])
+        .collect();
 
     let write_owner = |cols: &mut [Vec<Block128>], row: usize, owner: &[Block128; 2]| {
         cols[TxValidityCol::OwnerHi.index()][row] = owner[0];
@@ -386,8 +423,7 @@ fn build_witness_columns(
         }
         let row = i;
         cols[TxValidityCol::InputValid.index()][row] = Block128::ONE;
-        cols[TxValidityCol::SlotIndex.index()][row] =
-            Block128::from(input.slot_index as u128);
+        cols[TxValidityCol::SlotIndex.index()][row] = Block128::from(input.slot_index as u128);
         cols[TxValidityCol::Value.index()][row] = Block128::from(input.value as u128);
         write_owner(&mut cols, row, &input.owner.as_fields());
         let secret = input.spend_secret.as_fields();
@@ -412,6 +448,15 @@ fn build_witness_columns(
     domains[TxValidityCol::InputValid.index()] = ColumnDomain::Bit;
     domains[TxValidityCol::OutputValid.index()] = ColumnDomain::Bit;
     (cols, domains)
+}
+
+impl TxValidityAir {
+    /// Move out the constraint list and public-column list.
+    /// Used by higher-level composites (e.g. `TxBodySpineComposite`)
+    /// that need to shift the column indices and re-wrap.
+    pub fn into_parts(self) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (self.constraints, self.public_columns)
+    }
 }
 
 impl Air for TxValidityAir {
@@ -459,7 +504,12 @@ mod tests {
             prev_state_root: [0u8; 32],
             new_state_root: [0u8; 32],
             fee: 0,
-            inputs: vec![mk_input(1), TxInput::dummy(), TxInput::dummy(), TxInput::dummy()],
+            inputs: vec![
+                mk_input(1),
+                TxInput::dummy(),
+                TxInput::dummy(),
+                TxInput::dummy(),
+            ],
             outputs: vec![
                 mk_output(2),
                 mk_output(3),
@@ -523,7 +573,11 @@ mod tests {
         let slot = &trace.columns[TxValidityCol::SlotIndex.index()];
         assert_eq!(slot[0], Block128::from(body.inputs[0].slot_index as u128));
         for row in MAX_INPUTS..TX_VALIDITY_ROWS {
-            assert_eq!(slot[row], Block128::ZERO, "slot index leaked onto output/pad row");
+            assert_eq!(
+                slot[row],
+                Block128::ZERO,
+                "slot index leaked onto output/pad row"
+            );
         }
 
         let auth_hi = &trace.columns[TxValidityCol::AuthTagHi.index()];
@@ -549,8 +603,7 @@ mod tests {
     fn validity_air_rejects_non_bool_output_selector() {
         let air = TxValidityAir::new();
         let mut trace = TxValidityAir::build_trace(&mk_body());
-        trace.columns[TxValidityCol::OutputValid.index()][MAX_INPUTS + 4] =
-            Block128::from(7u128);
+        trace.columns[TxValidityCol::OutputValid.index()][MAX_INPUTS + 4] = Block128::from(7u128);
         assert!(!air.check(&trace));
     }
 
@@ -645,13 +698,7 @@ mod tests {
         let body = mk_body_balanced_1in1out(1000, 995, 5);
         let ins = [1000u64, 0, 0, 0];
         let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            5,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 5, TX_VALIDITY_3B4_LOG_ROWS);
         assert_eq!(trace.n_cols(), TX_VALIDITY_3B4_N_COLS);
         assert!(air.check(&trace));
     }
@@ -664,13 +711,7 @@ mod tests {
         // unbalanced tuple — the composite AIR must reject.
         let ins = [1000u64, 0, 0, 0];
         let outs = [994u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            5,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 5, TX_VALIDITY_3B4_LOG_ROWS);
         assert!(!air.check(&trace));
     }
 
@@ -680,13 +721,8 @@ mod tests {
         let body = mk_body_balanced_1in1out(1234, 1234, 0);
         let ins = [1234u64, 0, 0, 0];
         let outs = [1234u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            0,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
         // Break the InputValid selector `{0,1}` bool constraint.
         trace.columns[TxValidityCol::InputValid.index()][7] = Block128::from(3u128);
         assert!(!air.check(&trace));
@@ -698,8 +734,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_balance_selector_pins_shape() {
-        let air =
-            TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         assert_eq!(air.n_columns(), TX_VALIDITY_3B4_N_COLS);
         // 22 = 2 selector programmes × 11 balance blocks.
         assert_eq!(air.public_columns().len(), 22);
@@ -712,21 +747,18 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_balance_selector_pins_accepts_honest_tx() {
-        let air =
-            TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(777, 770, 7);
         let ins = [777u64, 0, 0, 0];
         let outs = [770u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace =
-            TxValidityAir::build_trace_3b4(&body, ins, outs, 7, TX_VALIDITY_3B4_LOG_ROWS);
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 7, TX_VALIDITY_3B4_LOG_ROWS);
         assert!(air.check(&trace));
     }
 
     #[test]
     fn validity_3b4_with_balance_selector_pins_rejects_selector_tamper() {
         use crate::airs::bit_adder::{BIT_ADDER_COL_IS_INPUT, BIT_ADDER_N_COLS};
-        let air =
-            TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
+        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(1000, 1000, 0);
         let ins = [1000u64, 0, 0, 0];
         let outs = [1000u64, 0, 0, 0, 0, 0, 0, 0];
@@ -736,9 +768,7 @@ mod tests {
         // row of instance 0. Without the selector pin the FA gates stay
         // silent (no active data there); the `PublicColumn` check is
         // what fires.
-        let col = TX_VALIDITY_BALANCE_COL_OFFSET
-            + 0 * BIT_ADDER_N_COLS
-            + BIT_ADDER_COL_IS_INPUT;
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
         trace.columns[col][100] = Block128::ONE;
         assert!(!air.check(&trace));
     }
@@ -749,13 +779,8 @@ mod tests {
         let body = mk_body_balanced_1in1out(1000, 995, 5);
         let ins = [1000u64, 0, 0, 0];
         let outs = [995u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4(
-            &body,
-            ins,
-            outs,
-            5,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 5, TX_VALIDITY_3B4_LOG_ROWS);
         // Flip a bit of the A0.a column at row 0 (an active input
         // bit) — the balance circuit must catch it.
         let col = TX_VALIDITY_BALANCE_COL_OFFSET; // A0.a is col 0 of balance
@@ -769,9 +794,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_skeleton_pins_shape() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         assert_eq!(air.n_columns(), TX_VALIDITY_3B4_PINNED_N_COLS);
         // 22 balance selector publics + 2 skeleton-mask publics.
         assert_eq!(air.public_columns().len(), 24);
@@ -789,9 +812,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_skeleton_pins_accepts_honest_tx() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(500, 500, 0);
         let ins = [500u64, 0, 0, 0];
         let outs = [500u64, 0, 0, 0, 0, 0, 0, 0];
@@ -810,9 +831,7 @@ mod tests {
         // Adversary: try to set InputValid = 1 on an output row
         // (MAX_INPUTS). The bool constraint accepts (still {0,1}), but
         // the row-domain pin rejects.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(99, 99, 0);
         let ins = [99u64, 0, 0, 0];
         let outs = [99u64, 0, 0, 0, 0, 0, 0, 0];
@@ -829,9 +848,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_skeleton_pins_rejects_output_valid_on_input_row() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(99, 99, 0);
         let ins = [99u64, 0, 0, 0];
         let outs = [99u64, 0, 0, 0, 0, 0, 0, 0];
@@ -850,9 +867,7 @@ mod tests {
     fn validity_3b4_with_skeleton_pins_rejects_selector_on_pad_row() {
         // Both selectors must be zero on rows beyond the slot window.
         // Pad row = MAX_INPUTS + MAX_OUTPUTS.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(77, 77, 0);
         let ins = [77u64, 0, 0, 0];
         let outs = [77u64, 0, 0, 0, 0, 0, 0, 0];
@@ -870,9 +885,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_skeleton_pins_rejects_tampered_mask() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
+        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(123, 123, 0);
         let ins = [123u64, 0, 0, 0];
         let outs = [123u64, 0, 0, 0, 0, 0, 0, 0];
@@ -886,6 +899,75 @@ mod tests {
         // Flip the InputValid mask on a legitimate input row (0) —
         // programme says ZERO, tamper ONE.
         trace.columns[TX_VALIDITY_INPUT_VALID_MASK_COL][0] = Block128::ONE;
+        assert!(!air.check(&trace));
+    }
+
+    // --------------------------------------------------------------------
+    // Stage 3d-0.10.5 — primary-operand value pins on the composite
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn validity_3b4_with_value_pins_shape() {
+        let ins = [777u64, 0, 0, 0];
+        let outs = [770u64, 0, 0, 0, 0, 0, 0, 0];
+        let air = TxValidityAir::new_3b4_with_value_pins(TX_VALIDITY_3B4_LOG_ROWS, ins, outs, 7);
+        assert_eq!(air.n_columns(), TX_VALIDITY_3B4_N_COLS);
+        // 22 selector + 13 value = 35.
+        assert_eq!(air.public_columns().len(), 22 + 13);
+        // All pinned columns live inside the balance region.
+        for pc in air.public_columns() {
+            assert!(pc.col >= TX_VALIDITY_BALANCE_COL_OFFSET);
+            assert!(pc.col < TX_VALIDITY_BALANCE_COL_OFFSET + BALANCE_N_COLS);
+        }
+    }
+
+    #[test]
+    fn validity_3b4_with_value_pins_accepts_honest_tx() {
+        let body = mk_body_balanced_1in1out(777, 770, 7);
+        let ins = [777u64, 0, 0, 0];
+        let outs = [770u64, 0, 0, 0, 0, 0, 0, 0];
+        let air = TxValidityAir::new_3b4_with_value_pins(TX_VALIDITY_3B4_LOG_ROWS, ins, outs, 7);
+        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 7, TX_VALIDITY_3B4_LOG_ROWS);
+        assert!(air.check(&trace));
+    }
+
+    #[test]
+    fn validity_3b4_with_value_pins_rejects_operand_swap() {
+        // AIR expects (777, 770, 7); prover submits a different but
+        // internally-balanced tuple (500, 495, 5). Balance gates accept
+        // either (both balanced), but the value pins commit to the
+        // (777, 770, 7) bit decomposition and must reject.
+        let body = mk_body_balanced_1in1out(500, 495, 5);
+        let pinned_ins = [777u64, 0, 0, 0];
+        let pinned_outs = [770u64, 0, 0, 0, 0, 0, 0, 0];
+        let air = TxValidityAir::new_3b4_with_value_pins(
+            TX_VALIDITY_3B4_LOG_ROWS,
+            pinned_ins,
+            pinned_outs,
+            7,
+        );
+        let trace = TxValidityAir::build_trace_3b4(
+            &body,
+            [500u64, 0, 0, 0],
+            [495u64, 0, 0, 0, 0, 0, 0, 0],
+            5,
+            TX_VALIDITY_3B4_LOG_ROWS,
+        );
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn validity_3b4_with_value_pins_rejects_fee_tamper() {
+        use crate::airs::bit_adder::{BIT_ADDER_COL_B, BIT_ADDER_N_COLS};
+        let body = mk_body_balanced_1in1out(1000, 993, 7);
+        let ins = [1000u64, 0, 0, 0];
+        let outs = [993u64, 0, 0, 0, 0, 0, 0, 0];
+        let air = TxValidityAir::new_3b4_with_value_pins(TX_VALIDITY_3B4_LOG_ROWS, ins, outs, 7);
+        let mut trace =
+            TxValidityAir::build_trace_3b4(&body, ins, outs, 7, TX_VALIDITY_3B4_LOG_ROWS);
+        // Flip bit 0 of the fee column (BLK_B21 is block ordinal 10).
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET + 10 * BIT_ADDER_N_COLS + BIT_ADDER_COL_B;
+        trace.columns[col][0] += Block128::ONE;
         assert!(!air.check(&trace));
     }
 }

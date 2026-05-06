@@ -135,10 +135,7 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
         owner_lo: out.owner.as_fields()[1],
     };
     let idx = state.next_slot_index as u32;
-    state
-        .fri
-        .set_slot(idx, slot)
-        .expect("bounds checked above");
+    state.fri.set_slot(idx, slot).expect("bounds checked above");
     state.next_slot_index += 1;
     Ok(())
 }

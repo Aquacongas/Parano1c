@@ -140,13 +140,7 @@ impl PackedCommit {
     ) -> PackedEvalProof {
         assert_eq!(point.len(), self.commitment.log_packed_len);
         channel.observe_fri_commitment(&self.commitment.inner);
-        fri_prove(
-            &self.packed,
-            point,
-            ntt,
-            channel,
-            hasher,
-        )
+        fri_prove(&self.packed, point, ntt, channel, hasher)
     }
 }
 
@@ -162,14 +156,7 @@ pub fn verify_packed(
 ) -> Result<(), String> {
     assert_eq!(point.len(), commitment.log_packed_len);
     channel.observe_fri_commitment(&commitment.inner);
-    fri_verify(
-        point,
-        claimed_eval,
-        proof,
-        ntt,
-        channel,
-        hasher,
-    )
+    fri_verify(point, claimed_eval, proof, ntt, channel, hasher)
 }
 
 #[cfg(test)]
@@ -199,7 +186,9 @@ mod tests {
         let n_packed = 1usize << log_packed_len;
 
         let mut rng = rand::thread_rng();
-        let bits: Vec<u8> = (0..n_packed * 128).map(|_| rng.gen::<bool>() as u8).collect();
+        let bits: Vec<u8> = (0..n_packed * 128)
+            .map(|_| rng.gen::<bool>() as u8)
+            .collect();
         let w = BitWitness::from_bits(&bits);
         assert_eq!(w.n_packed(), n_packed);
 

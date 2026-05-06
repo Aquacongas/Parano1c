@@ -113,7 +113,9 @@ pub enum EchoError {
     /// Tie has neither `dst_pins` nor `live_consumers` — nothing to
     /// widen the live interval to.
     NoConsumers,
-    DstBeforeOrAtSrc { tie_idx: usize },
+    DstBeforeOrAtSrc {
+        tie_idx: usize,
+    },
     EmptySrcCol,
 }
 
