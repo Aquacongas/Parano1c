@@ -145,7 +145,10 @@ impl Constraint for MdsRowGate {
 }
 
 /// Emit 4 gates for one row's MDS layer (one gate per output lane).
-pub fn emit_mds_row_constraints(kind: MdsKind, layout: MdsLayout) -> Vec<Box<dyn Constraint>> {
+pub fn emit_mds_row_constraints(
+    kind: MdsKind,
+    layout: MdsLayout,
+) -> Vec<Box<dyn Constraint>> {
     (0..STATE_SIZE)
         .map(|lane| Box::new(MdsRowGate::new(lane, kind, layout)) as Box<dyn Constraint>)
         .collect()
@@ -179,7 +182,8 @@ mod tests {
     use noid_core::TowerField;
 
     fn mk_rows(n: usize, seed: u128) -> [Vec<Block128>; STATE_SIZE] {
-        let mut out: [Vec<Block128>; STATE_SIZE] = [vec![], vec![], vec![], vec![]];
+        let mut out: [Vec<Block128>; STATE_SIZE] =
+            [vec![], vec![], vec![], vec![]];
         for i in 0..n {
             for lane in 0..STATE_SIZE {
                 out[lane].push(Block128::from(
@@ -203,17 +207,11 @@ mod tests {
         // poseidon_sbox::tests.
         let sout_cols: Vec<Vec<Block128>> = mk_rows(n, seed).to_vec();
         // Compute next-row state from this row's sout via native MDS.
-        let mut s_cols: Vec<Vec<Block128>> =
-            (0..STATE_SIZE).map(|_| vec![Block128::ZERO; n]).collect();
+        let mut s_cols: Vec<Vec<Block128>> = (0..STATE_SIZE).map(|_| vec![Block128::ZERO; n]).collect();
         // The AIR reads s at NEXT row, so s_cols[lane][i+1] = MDS(sout at row i).
         // Row 0 of s is unconstrained (acts as input to round 0); set it to 0.
         for i in 0..n {
-            let row_sout = [
-                sout_cols[0][i],
-                sout_cols[1][i],
-                sout_cols[2][i],
-                sout_cols[3][i],
-            ];
+            let row_sout = [sout_cols[0][i], sout_cols[1][i], sout_cols[2][i], sout_cols[3][i]];
             let next_s = apply_mds_row(kind, row_sout);
             // Cyclic next: (i + 1) % n
             let nxt = (i + 1) % n;
@@ -279,12 +277,7 @@ mod tests {
     fn mds_full_vs_partial_differs() {
         // Independent sanity: native MDS_FULL != MDS_PARTIAL on at least
         // one input (catches accidental sharing between arms).
-        let sout = [
-            Block128::from(1u8),
-            Block128::from(2u8),
-            Block128::from(3u8),
-            Block128::from(4u8),
-        ];
+        let sout = [Block128::from(1u8), Block128::from(2u8), Block128::from(3u8), Block128::from(4u8)];
         let f = apply_mds_row(MdsKind::Full, sout);
         let p = apply_mds_row(MdsKind::Partial, sout);
         assert_ne!(f, p);

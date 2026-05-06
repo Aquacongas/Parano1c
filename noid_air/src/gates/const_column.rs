@@ -179,9 +179,7 @@ mod tests {
     fn multiple_public_columns_all_enforced() {
         use noid_core::TowerField;
         let prog_a = round_constants_like();
-        let prog_b: Vec<Block128> = (0..4)
-            .map(|i| Block128::from(0xABCDu128 ^ i as u128))
-            .collect();
+        let prog_b: Vec<Block128> = (0..4).map(|i| Block128::from(0xABCDu128 ^ i as u128)).collect();
         let air = TestAir {
             log_rows: 2,
             n_cols: 3,

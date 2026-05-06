@@ -145,7 +145,8 @@ pub const TXBODY_MERKLE_ECHO_BASE: usize = TXBODY_MERKLE_ANY_ROW_0 + 1;
 /// Currently derived from the 3d-0.9.E.1 enumeration (left-child
 /// digest ties only). 3d-0.9.E.4 will extend enumeration with
 /// right-child / pad / IV ties.
-pub static N_ECHO_COLS: LazyLock<usize> = LazyLock::new(|| ECHO_ASSIGNMENTS.columns.len());
+pub static N_ECHO_COLS: LazyLock<usize> =
+    LazyLock::new(|| ECHO_ASSIGNMENTS.columns.len());
 
 /// §3d-0.9.E.4.c — number of leaf non-head rate-lane payload witness
 /// columns. Opt E.4.c-1: the 16 leaf non-head instances share two
@@ -230,7 +231,10 @@ const BOUNDARY_INSTANCE_WRAP: usize = 58;
 /// range; `TXBODY_MERKLE_N_COLS` tracks the total width (witness + public)
 /// including those programmes via [`ECHO_MASK_COLUMNS`].
 pub static TXBODY_MERKLE_N_COLS: LazyLock<usize> = LazyLock::new(|| {
-    TXBODY_MERKLE_ECHO_BASE + *N_ECHO_COLS + ECHO_MASK_COLUMNS.total + N_LEAF_RATE_PAYLOAD_COLS
+    TXBODY_MERKLE_ECHO_BASE
+        + *N_ECHO_COLS
+        + ECHO_MASK_COLUMNS.total
+        + N_LEAF_RATE_PAYLOAD_COLS
 });
 
 /// Base column index for the §3d-0.9.E.4.c leaf-rate payload witness
@@ -265,9 +269,9 @@ pub static TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS: LazyLock<usize> = LazyLock::
 /// Stage 1b — base column index of the `leaf_perm_a_row_0` multi-hot
 /// selector. The two `o1_prog[0..1]` programme columns sit at
 /// `+1` and `+2`.
-pub static TXBODY_MERKLE_O1_BASE: LazyLock<usize> = LazyLock::new(|| {
-    *TXBODY_MERKLE_PAYLOAD_BASE + N_LEAF_RATE_PAYLOAD_COLS + TXBODY_MERKLE_BOUNDARY_PIN_N_COLS
-});
+pub static TXBODY_MERKLE_O1_BASE: LazyLock<usize> =
+    LazyLock::new(|| *TXBODY_MERKLE_PAYLOAD_BASE + N_LEAF_RATE_PAYLOAD_COLS
+        + TXBODY_MERKLE_BOUNDARY_PIN_N_COLS);
 pub const TXBODY_MERKLE_O1_LEAF_PERM_A_ROW_0_OFFSET: usize = 0;
 pub const TXBODY_MERKLE_O1_PROG_BASE_OFFSET: usize = 1;
 /// Stage 1b compression — offset of the `leaf_non_head_row_0`
@@ -438,15 +442,18 @@ pub struct EchoMaskPlan {
 /// programmes coincide. `transition` for echo `c` is hot on
 /// `[src_row, max_dst_row - 1]` across every epoch; `src_pin` for tie
 /// `t` is hot on the single row `src_row`.
-fn plan_echo_mask_columns(assignments: &EchoAssignments, ties: &[EchoTie]) -> EchoMaskPlan {
+fn plan_echo_mask_columns(
+    assignments: &EchoAssignments,
+    ties: &[EchoTie],
+) -> EchoMaskPlan {
     let mask_base = TXBODY_MERKLE_ECHO_BASE + assignments.columns.len();
     let mut seen: HashMap<EchoMaskProgramme, usize> = HashMap::new();
     let mut programmes: Vec<EchoMaskProgramme> = Vec::new();
     let mut single_hot_col: HashMap<usize, usize> = HashMap::new();
     let intern = |p: EchoMaskProgramme,
-                  programmes: &mut Vec<EchoMaskProgramme>,
-                  seen: &mut HashMap<EchoMaskProgramme, usize>,
-                  single_hot_col: &mut HashMap<usize, usize>|
+                      programmes: &mut Vec<EchoMaskProgramme>,
+                      seen: &mut HashMap<EchoMaskProgramme, usize>,
+                      single_hot_col: &mut HashMap<usize, usize>|
      -> usize {
         if let Some(&idx) = seen.get(&p) {
             return idx;
@@ -601,12 +608,14 @@ fn build_tx_body_merkle_trace_inner(
             match meta.role {
                 InstanceRole::InputLeafPermA { leaf_idx } => {
                     for lane in 0..2 {
-                        effective_input[lane] = p.input_leaf_absorb[leaf_idx as usize][lane];
+                        effective_input[lane] =
+                            p.input_leaf_absorb[leaf_idx as usize][lane];
                     }
                 }
                 InstanceRole::OutputLeafPermA { leaf_idx } => {
                     for lane in 0..2 {
-                        effective_input[lane] = p.output_leaf_absorb[leaf_idx as usize][lane];
+                        effective_input[lane] =
+                            p.output_leaf_absorb[leaf_idx as usize][lane];
                     }
                 }
                 // Stage 1b — O1 leaf non-head rate-lane override. The
@@ -616,7 +625,8 @@ fn build_tx_body_merkle_trace_inner(
                 InstanceRole::InputLeafPermB { leaf_idx } => {
                     let prev_row = (k - 1) * TXBODY_MERKLE_SLOT_ROWS + N_ROUNDS;
                     for lane in 0..2 {
-                        let prev_out = cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
+                        let prev_out =
+                            cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
                         effective_input[lane] =
                             prev_out + p.input_leaf_absorb[leaf_idx as usize][2 + lane];
                     }
@@ -628,7 +638,8 @@ fn build_tx_body_merkle_trace_inner(
                         Block128::from(O1_INPUT_LEAF_PAD_WORD_1),
                     ];
                     for lane in 0..2 {
-                        let prev_out = cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
+                        let prev_out =
+                            cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
                         effective_input[lane] = prev_out + pad[lane];
                     }
                 }
@@ -639,14 +650,20 @@ fn build_tx_body_merkle_trace_inner(
                         Block128::from(O1_OUTPUT_LEAF_PAD_WORD),
                     ];
                     for lane in 0..2 {
-                        let prev_out = cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
+                        let prev_out =
+                            cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
                         effective_input[lane] = prev_out + declared[lane];
                     }
                 }
                 _ => {}
             }
         }
-        write_perm_trace_at_offset(&mut cols, TXBODY_MERKLE_LAYOUT, effective_input, row_offset);
+        write_perm_trace_at_offset(
+            &mut cols,
+            TXBODY_MERKLE_LAYOUT,
+            effective_input,
+            row_offset,
+        );
 
         // pre_s@row_offset mirrors the effective input on every head
         // row-0: lanes 0..1 come from the caller (leaf) or the echoed
@@ -662,7 +679,8 @@ fn build_tx_body_merkle_trace_inner(
         // output (§3d-0.9.E.4.a); rate lanes 0..1 will be pinned by
         // the absorb-based ties of §3d-0.9.E.4.b / E.4.c.
         for lane in 0..STATE_SIZE {
-            cols[TXBODY_MERKLE_PRE_S_BASE + lane][row_offset] = effective_input[lane];
+            cols[TXBODY_MERKLE_PRE_S_BASE + lane][row_offset] =
+                effective_input[lane];
         }
         if meta.is_head {
             cols[TXBODY_MERKLE_HEAD_ROW_0][row_offset] = Block128::ONE;
@@ -790,7 +808,8 @@ pub fn tx_body_merkle_column_domains_with_boundary_pins() -> Vec<ColumnDomain> {
     for i in 0..TXBODY_MERKLE_BOUNDARY_PIN_N_COLS {
         domains[pin_base + i] = ColumnDomain::Bit;
     }
-    domains[*TXBODY_MERKLE_O1_BASE + TXBODY_MERKLE_O1_LEAF_PERM_A_ROW_0_OFFSET] = ColumnDomain::Bit;
+    domains[*TXBODY_MERKLE_O1_BASE + TXBODY_MERKLE_O1_LEAF_PERM_A_ROW_0_OFFSET] =
+        ColumnDomain::Bit;
     domains[*TXBODY_MERKLE_O1_BASE + TXBODY_MERKLE_O1_LEAF_NON_HEAD_ROW_0_OFFSET] =
         ColumnDomain::Bit;
     domains
@@ -830,7 +849,8 @@ pub fn build_tx_body_merkle_trace_with_boundary_pins(
     let pin_base = *TXBODY_MERKLE_BOUNDARY_PIN_BASE;
     cols[pin_base][layout[BOUNDARY_INSTANCE_POS_0_PERM_A].slot_base_row] = Block128::ONE;
     cols[pin_base + 1][layout[BOUNDARY_INSTANCE_POS_7_PERM_A].slot_base_row] = Block128::ONE;
-    cols[pin_base + 2][layout[BOUNDARY_INSTANCE_WRAP].slot_base_row + N_ROUNDS] = Block128::ONE;
+    cols[pin_base + 2]
+        [layout[BOUNDARY_INSTANCE_WRAP].slot_base_row + N_ROUNDS] = Block128::ONE;
 
     // Stage 1b — O1 public-column cell values. `leaf_perm_a_row_0` is
     // multi-hot on the 12 leaf PermA head rows; `o1_prog[lane]`
@@ -855,7 +875,10 @@ pub fn build_tx_body_merkle_trace_with_boundary_pins(
 }
 
 /// Extract instance `k`'s permutation output.
-pub fn extract_instance_output(cols: &[Vec<Block128>], k: usize) -> [Block128; STATE_SIZE] {
+pub fn extract_instance_output(
+    cols: &[Vec<Block128>],
+    k: usize,
+) -> [Block128; STATE_SIZE] {
     let row = instance_row_offset(k) + N_ROUNDS;
     let mut out = [Block128::ZERO; STATE_SIZE];
     for lane in 0..STATE_SIZE {
@@ -1051,7 +1074,9 @@ fn effective_perm_input(
 ///
 /// Rate-lane (0..1) continuation is §3d-0.9.E.4.b / E.4.c and adds
 /// an absorb term; capacity lanes are the pure-`dst_pin` subset.
-pub fn enumerate_capacity_continuation_ties(layout: &[InstanceMeta]) -> Vec<EchoTie> {
+pub fn enumerate_capacity_continuation_ties(
+    layout: &[InstanceMeta],
+) -> Vec<EchoTie> {
     let mut ties: Vec<EchoTie> = Vec::new();
     for (k, meta) in layout.iter().enumerate() {
         if meta.is_head {
@@ -1062,22 +1087,15 @@ pub fn enumerate_capacity_continuation_ties(layout: &[InstanceMeta]) -> Vec<Echo
         // All non-head roles in this layout chain directly off the
         // immediately preceding perm; assert it.
         match (prev.role, meta.role) {
-            (
-                InstanceRole::InputLeafPermA { leaf_idx: a },
-                InstanceRole::InputLeafPermB { leaf_idx: b },
-            ) if a == b => {}
-            (
-                InstanceRole::InputLeafPermB { leaf_idx: a },
-                InstanceRole::InputLeafPermC { leaf_idx: b },
-            ) if a == b => {}
-            (
-                InstanceRole::OutputLeafPermA { leaf_idx: a },
-                InstanceRole::OutputLeafPermB { leaf_idx: b },
-            ) if a == b => {}
-            (
-                InstanceRole::CompressPermA { level: la, pos: pa },
-                InstanceRole::CompressPermB { level: lb, pos: pb },
-            ) if la == lb && pa == pb => {}
+            (InstanceRole::InputLeafPermA { leaf_idx: a },
+             InstanceRole::InputLeafPermB { leaf_idx: b }) if a == b => {}
+            (InstanceRole::InputLeafPermB { leaf_idx: a },
+             InstanceRole::InputLeafPermC { leaf_idx: b }) if a == b => {}
+            (InstanceRole::OutputLeafPermA { leaf_idx: a },
+             InstanceRole::OutputLeafPermB { leaf_idx: b }) if a == b => {}
+            (InstanceRole::CompressPermA { level: la, pos: pa },
+             InstanceRole::CompressPermB { level: lb, pos: pb })
+                if la == lb && pa == pb => {}
             _ => panic!(
                 "non-head instance {k} ({:?}) predecessor {:?} is not \
                  the previous perm of the same sub-sponge",
@@ -1118,7 +1136,9 @@ pub fn enumerate_capacity_continuation_ties(layout: &[InstanceMeta]) -> Vec<Echo
 /// zero-digest, not a TAG_LEAF padding digest) only emit the prev_out
 /// ties; their absorb gate collapses to the 2-term form
 /// `pre_s_B[lane] + echo_prev_A[lane] == 0` at emit time.
-pub fn enumerate_compress_rate_continuation_ties(layout: &[InstanceMeta]) -> Vec<EchoTie> {
+pub fn enumerate_compress_rate_continuation_ties(
+    layout: &[InstanceMeta],
+) -> Vec<EchoTie> {
     let mut ties: Vec<EchoTie> = Vec::new();
     for (b_id, b_meta) in layout.iter().enumerate() {
         let (level, pos) = match b_meta.role {
@@ -1175,7 +1195,9 @@ pub fn enumerate_compress_rate_continuation_ties(layout: &[InstanceMeta]) -> Vec
 /// dedicated witness column (see [`N_LEAF_RATE_PAYLOAD_COLS`] /
 /// [`leaf_rate_payload_col`]), not from another instance's trace.
 /// §3d-0.9.H pins the payload columns to the §3b-4 tx-body columns.
-pub fn enumerate_leaf_rate_continuation_ties(layout: &[InstanceMeta]) -> Vec<EchoTie> {
+pub fn enumerate_leaf_rate_continuation_ties(
+    layout: &[InstanceMeta],
+) -> Vec<EchoTie> {
     let mut ties: Vec<EchoTie> = Vec::new();
     for (id, meta) in layout.iter().enumerate() {
         let is_leaf_non_head = matches!(
@@ -1204,7 +1226,9 @@ pub fn enumerate_leaf_rate_continuation_ties(layout: &[InstanceMeta]) -> Vec<Ech
     ties
 }
 
-pub fn enumerate_child_digest_ties(layout: &[InstanceMeta]) -> Vec<EchoTie> {
+pub fn enumerate_child_digest_ties(
+    layout: &[InstanceMeta],
+) -> Vec<EchoTie> {
     let mut ties: Vec<EchoTie> = Vec::new();
     for (parent_id, meta) in layout.iter().enumerate() {
         // Only Perm A of a compress / wrap carries a left-child digest
@@ -1326,10 +1350,7 @@ fn emit_tx_body_merkle_constraints_inner(
             vec![(echo_col, Block128::ONE), (tie.src_col, Block128::ONE)],
             Block128::ZERO,
         ));
-        out.push(Box::new(SelectorGate::new(
-            mask.src_pin_col[tie_idx],
-            inner,
-        )));
+        out.push(Box::new(SelectorGate::new(mask.src_pin_col[tie_idx], inner)));
     }
 
     // dst_pin gates — one per (tie, dst_pin). Each binds the echo column
@@ -1405,7 +1426,8 @@ fn emit_tx_body_merkle_constraints_inner(
                 Some(p) if b_id == BOUNDARY_INSTANCE_POS_0_PERM_B => p.fee_leaf[lane],
                 _ => Block128::ZERO,
             };
-            let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(terms, constant));
+            let inner: Box<dyn Constraint> =
+                Box::new(WeightedLinearGate::new(terms, constant));
             out.push(Box::new(SelectorGate::new(selector, inner)));
         }
     }
@@ -1517,7 +1539,9 @@ pub fn capacity_iv_programme(lane: usize) -> Vec<Block128> {
 ///    selector is multi-hot; the non-head selector re-uses
 ///    `ECHO_MASK_COLUMNS.single_hot_col`, which is guaranteed single-
 ///    hot on that row by the existing E.4.c / E.4.a interning).
-fn o1_row_schedule(pins: &TxBodyMerkleBoundaryPins) -> (Vec<usize>, Vec<(usize, [Block128; 2])>) {
+fn o1_row_schedule(
+    pins: &TxBodyMerkleBoundaryPins,
+) -> (Vec<usize>, Vec<(usize, [Block128; 2])>) {
     let layout = build_instance_layout();
     let mut head_rows: Vec<usize> = Vec::with_capacity(12);
     let mut nonhead: Vec<(usize, [Block128; 2])> = Vec::with_capacity(16);
@@ -1566,21 +1590,11 @@ fn o1_row_schedule(pins: &TxBodyMerkleBoundaryPins) -> (Vec<usize>, Vec<(usize, 
     }
     // Safeguard 2: every row is strictly less than the trace height.
     for &r in &head_rows {
-        assert!(
-            r < TXBODY_MERKLE_N_ROWS,
-            "Stage 1b: head row {r} out of bounds"
-        );
+        assert!(r < TXBODY_MERKLE_N_ROWS, "Stage 1b: head row {r} out of bounds");
     }
-    assert_eq!(
-        nonhead.len(),
-        16,
-        "Stage 1b: must have 16 leaf non-head rows"
-    );
+    assert_eq!(nonhead.len(), 16, "Stage 1b: must have 16 leaf non-head rows");
     for &(r, _) in &nonhead {
-        assert!(
-            r < TXBODY_MERKLE_N_ROWS,
-            "Stage 1b: non-head row {r} out of bounds"
-        );
+        assert!(r < TXBODY_MERKLE_N_ROWS, "Stage 1b: non-head row {r} out of bounds");
     }
     // Safeguard 3: head rows and non-head rows are disjoint sets.
     let head_set: std::collections::HashSet<usize> = head_rows.iter().copied().collect();
@@ -1918,7 +1932,10 @@ impl TxBodyMerkleAir {
         }
     }
 
-    pub fn build_trace(&self, inputs: &[[Block128; STATE_SIZE]; TXBODY_MERKLE_N_PERMS]) -> Trace {
+    pub fn build_trace(
+        &self,
+        inputs: &[[Block128; STATE_SIZE]; TXBODY_MERKLE_N_PERMS],
+    ) -> Trace {
         match self.boundary_pins {
             None => build_tx_body_merkle_typed_trace(inputs),
             Some(pins) => Trace::new_with_domains(
@@ -2084,10 +2101,12 @@ mod tests {
                 if matches!(meta.role, InstanceRole::CompressPermB { .. }) {
                     let right_id = meta.children.and_then(|[_, r]| r);
                     for lane in 0..2 {
-                        let mut expected = cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
+                        let mut expected =
+                            cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
                         if let Some(rid) = right_id {
                             let r_row = rid * TXBODY_MERKLE_SLOT_ROWS + N_ROUNDS;
-                            expected = expected + cols[TXBODY_MERKLE_LAYOUT.s + lane][r_row];
+                            expected = expected
+                                + cols[TXBODY_MERKLE_LAYOUT.s + lane][r_row];
                         }
                         assert_eq!(
                             cols[TXBODY_MERKLE_PRE_S_BASE + lane][row],
@@ -2153,7 +2172,12 @@ mod tests {
         let n_leaf_rate_absorb = 16 * 2;
         assert_eq!(
             cs.len(),
-            29 + STATE_SIZE + 2 + n_echo + n_ties + n_dst_pins + n_rate_absorb + n_leaf_rate_absorb,
+            29 + STATE_SIZE + 2
+                + n_echo
+                + n_ties
+                + n_dst_pins
+                + n_rate_absorb
+                + n_leaf_rate_absorb,
         );
     }
 
@@ -2176,10 +2200,7 @@ mod tests {
         // programme is Bit.
         // is_full + is_round + head_row_0 + any_row_0 + mask cols.
         let expected_bit_count = 4 + ECHO_MASK_COLUMNS.total;
-        let bit_count = domains
-            .iter()
-            .filter(|d| matches!(d, ColumnDomain::Bit))
-            .count();
+        let bit_count = domains.iter().filter(|d| matches!(d, ColumnDomain::Bit)).count();
         assert_eq!(bit_count, expected_bit_count);
 
         let cols = build_tx_body_merkle_trace(&mk_batch());
@@ -2559,9 +2580,7 @@ mod tests {
                 let expected_src_row = layout[left].slot_base_row + N_ROUNDS;
                 let matches = ties
                     .iter()
-                    .filter(|t| {
-                        t.src_row == expected_src_row && t.dst_pins[0].dst_row == m.slot_base_row
-                    })
+                    .filter(|t| t.src_row == expected_src_row && t.dst_pins[0].dst_row == m.slot_base_row)
                     .count();
                 assert_eq!(matches, 2, "parent {pid} should have 2 lane-ties");
                 produced += 2;
@@ -2584,10 +2603,7 @@ mod tests {
                 let expected = cols[t.src_col][t.src_row];
                 assert_ne!(expected, Block128::ZERO, "honest src must be nonzero");
                 for row in epoch.src_row..=epoch.max_dst_row {
-                    assert_eq!(
-                        cols[echo_col][row], expected,
-                        "echo col {col_idx} row {row}"
-                    );
+                    assert_eq!(cols[echo_col][row], expected, "echo col {col_idx} row {row}");
                 }
             }
         }
@@ -2743,7 +2759,8 @@ mod tests {
         let ties = &*ECHO_TIES;
         let tie = &ties[0];
         let pin = tie.dst_pins[0];
-        cols[pin.dst_col][pin.dst_row] = cols[pin.dst_col][pin.dst_row] + Block128::ONE;
+        cols[pin.dst_col][pin.dst_row] =
+            cols[pin.dst_col][pin.dst_row] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -2874,7 +2891,9 @@ mod tests {
         assert_eq!(TXBODY_MERKLE_O1_N_COLS, 4);
         assert_eq!(
             *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS,
-            *TXBODY_MERKLE_N_COLS + TXBODY_MERKLE_BOUNDARY_PIN_N_COLS + TXBODY_MERKLE_O1_N_COLS,
+            *TXBODY_MERKLE_N_COLS
+                + TXBODY_MERKLE_BOUNDARY_PIN_N_COLS
+                + TXBODY_MERKLE_O1_N_COLS,
         );
         assert_eq!(
             *TXBODY_MERKLE_BOUNDARY_PIN_BASE,
@@ -2932,14 +2951,16 @@ mod tests {
         for (offset, row) in [
             (0, layout[BOUNDARY_INSTANCE_POS_0_PERM_A].slot_base_row),
             (1, layout[BOUNDARY_INSTANCE_POS_7_PERM_A].slot_base_row),
-            (2, layout[BOUNDARY_INSTANCE_WRAP].slot_base_row + N_ROUNDS),
+            (
+                2,
+                layout[BOUNDARY_INSTANCE_WRAP].slot_base_row + N_ROUNDS,
+            ),
         ] {
             let col = &cols[pin_base + offset];
             assert_eq!(col[row], Block128::ONE);
             let hot = col.iter().filter(|v| **v == Block128::ONE).count();
             assert_eq!(
-                hot,
-                1,
+                hot, 1,
                 "indicator col {} must be single-hot",
                 pin_base + offset
             );
@@ -2952,9 +2973,12 @@ mod tests {
         let air = TxBodyMerkleAir::new_with_boundary_pins(pins);
         let mut cols = build_tx_body_merkle_trace_with_boundary_pins(&inputs, &pins);
         let row = instance_row_offset(BOUNDARY_INSTANCE_POS_0_PERM_A);
-        cols[TXBODY_MERKLE_PRE_S_BASE][row] = cols[TXBODY_MERKLE_PRE_S_BASE][row] + Block128::ONE;
-        let trace =
-            Trace::new_with_domains(cols, tx_body_merkle_column_domains_with_boundary_pins());
+        cols[TXBODY_MERKLE_PRE_S_BASE][row] =
+            cols[TXBODY_MERKLE_PRE_S_BASE][row] + Block128::ONE;
+        let trace = Trace::new_with_domains(
+            cols,
+            tx_body_merkle_column_domains_with_boundary_pins(),
+        );
         assert!(!air.check(&trace));
     }
 
@@ -2966,8 +2990,10 @@ mod tests {
         let row = instance_row_offset(BOUNDARY_INSTANCE_POS_7_PERM_A);
         cols[TXBODY_MERKLE_PRE_S_BASE + 1][row] =
             cols[TXBODY_MERKLE_PRE_S_BASE + 1][row] + Block128::ONE;
-        let trace =
-            Trace::new_with_domains(cols, tx_body_merkle_column_domains_with_boundary_pins());
+        let trace = Trace::new_with_domains(
+            cols,
+            tx_body_merkle_column_domains_with_boundary_pins(),
+        );
         assert!(!air.check(&trace));
     }
 
@@ -2977,9 +3003,12 @@ mod tests {
         let air = TxBodyMerkleAir::new_with_boundary_pins(pins);
         let mut cols = build_tx_body_merkle_trace_with_boundary_pins(&inputs, &pins);
         let row = instance_row_offset(BOUNDARY_INSTANCE_WRAP) + N_ROUNDS;
-        cols[TXBODY_MERKLE_LAYOUT.s][row] = cols[TXBODY_MERKLE_LAYOUT.s][row] + Block128::ONE;
-        let trace =
-            Trace::new_with_domains(cols, tx_body_merkle_column_domains_with_boundary_pins());
+        cols[TXBODY_MERKLE_LAYOUT.s][row] =
+            cols[TXBODY_MERKLE_LAYOUT.s][row] + Block128::ONE;
+        let trace = Trace::new_with_domains(
+            cols,
+            tx_body_merkle_column_domains_with_boundary_pins(),
+        );
         assert!(!air.check(&trace));
     }
 
@@ -3015,8 +3044,10 @@ mod tests {
         };
         let air = TxBodyMerkleAir::new_with_boundary_pins(bad_pins);
         let cols = build_tx_body_merkle_trace_with_boundary_pins(&inputs, &honest_pins);
-        let trace =
-            Trace::new_with_domains(cols, tx_body_merkle_column_domains_with_boundary_pins());
+        let trace = Trace::new_with_domains(
+            cols,
+            tx_body_merkle_column_domains_with_boundary_pins(),
+        );
         assert!(!air.check(&trace));
     }
 

@@ -119,11 +119,7 @@ impl ShiftedColumnsConstraint {
             );
         }
         let shifted_cols = inner.columns().iter().map(|&c| c + offset).collect();
-        let shifted_next = inner
-            .shifted_columns()
-            .iter()
-            .map(|&c| c + offset)
-            .collect();
+        let shifted_next = inner.shifted_columns().iter().map(|&c| c + offset).collect();
         Self {
             inner,
             shifted_cols,
@@ -171,7 +167,10 @@ impl Constraint for ShiftedColumnsConstraint {
 /// (`[slot, value, owner_hi, owner_lo]`) and
 /// `hash_output_leaf` / `hash_utxo_leaf` (`[value, owner_hi,
 /// owner_lo]`).
-fn txv_tx_body_col_programme(col: TxValidityCol, pins: &TxBodyMerkleBoundaryPins) -> Vec<Block128> {
+fn txv_tx_body_col_programme(
+    col: TxValidityCol,
+    pins: &TxBodyMerkleBoundaryPins,
+) -> Vec<Block128> {
     let total = 1usize << SPINE_LOG_ROWS;
     let mut out = vec![Block128::ZERO; total];
     match col {
@@ -204,14 +203,18 @@ fn txv_tx_body_col_programme(col: TxValidityCol, pins: &TxBodyMerkleBoundaryPins
                 out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][2];
             }
         }
-        _ => panic!("txv_tx_body_col_programme: column {col:?} is not a tx-body payload column"),
+        _ => panic!(
+            "txv_tx_body_col_programme: column {col:?} is not a tx-body payload column"
+        ),
     }
     out
 }
 
 /// Stage 2(b) — emit the four `PublicColumn`s that pin TxValidity's
 /// tx-body witness columns to the Stage-1b leaf-absorb pins.
-pub fn emit_txv_tx_body_public_columns(pins: &TxBodyMerkleBoundaryPins) -> Vec<PublicColumn> {
+pub fn emit_txv_tx_body_public_columns(
+    pins: &TxBodyMerkleBoundaryPins,
+) -> Vec<PublicColumn> {
     [
         TxValidityCol::SlotIndex,
         TxValidityCol::Value,
@@ -413,10 +416,7 @@ impl TxBodySpineComposite {
             build_tx_body_merkle_trace_with_boundary_pins(merkle_inputs, &self.boundary_pins);
         let merkle_domains = tx_body_merkle_column_domains_with_boundary_pins();
         assert_eq!(merkle_cols.len(), *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
-        assert_eq!(
-            merkle_domains.len(),
-            *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS
-        );
+        assert_eq!(merkle_domains.len(), *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
 
         let total_rows = 1usize << SPINE_LOG_ROWS;
         let mut cols = txv_trace.columns;
@@ -668,15 +668,17 @@ mod tests {
         let slot_index: u32 = 7;
         let value: u64 = 1234;
         let in_owner_bytes: [u8; 32] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
-            0xFF, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
-            0x76, 0x54, 0x32, 0x10,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
         ];
         let in_owner = Address(in_owner_bytes);
         let out_owner_bytes: [u8; 32] = [
-            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E,
-            0x8F, 0x90, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4,
-            0xC3, 0xD2, 0xE1, 0xF0,
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+            0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90,
+            0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+            0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
         ];
         let out_owner = Address(out_owner_bytes);
 
@@ -694,7 +696,11 @@ mod tests {
 
         // Output leaf absorb matches hash_utxo_leaf([value, hi, lo]).
         let mut output_leaf_absorb = [[Block128::ZERO; 3]; 8];
-        output_leaf_absorb[0] = [Block128::from(value as u128), out_owner_hi, out_owner_lo];
+        output_leaf_absorb[0] = [
+            Block128::from(value as u128),
+            out_owner_hi,
+            out_owner_lo,
+        ];
 
         // Derive a self-consistent wrap output for the tx_body_hash pin
         // by running the trace builder once with a placeholder hash.
@@ -742,11 +748,7 @@ mod tests {
                 TxInput::dummy(),
             ],
             outputs: vec![
-                TxOutput {
-                    value,
-                    owner: out_owner,
-                    valid: true,
-                },
+                TxOutput { value, owner: out_owner, valid: true },
                 TxOutput::dummy(),
                 TxOutput::dummy(),
                 TxOutput::dummy(),

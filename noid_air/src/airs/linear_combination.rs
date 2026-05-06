@@ -57,7 +57,11 @@ mod tests {
         let n = 1 << log_rows;
         let col0: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 * 7 + 1)).collect();
         let col1: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 * 11 + 3)).collect();
-        let col2: Vec<Block128> = col0.iter().zip(col1.iter()).map(|(a, b)| *a + *b).collect();
+        let col2: Vec<Block128> = col0
+            .iter()
+            .zip(col1.iter())
+            .map(|(a, b)| *a + *b)
+            .collect();
         let trace = Trace::new(vec![col0, col1, col2]);
         assert!(air.check(&trace));
     }

@@ -36,7 +36,9 @@ use crate::airs::poseidon_perm::{
     POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
 };
 use crate::gates::row_selector::row_indicator_programme;
-use crate::gates::{PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted};
+use crate::gates::{
+    PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinearGateShifted,
+};
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_AUTHTAG};
@@ -100,14 +102,8 @@ fn perm_rc_at(lane: usize, row_offset: usize) -> Vec<Block128> {
 
 fn emit_perm_publics_offset(layout: PermLayout, row_offset: usize) -> Vec<PublicColumn> {
     let mut out = Vec::with_capacity(STATE_SIZE + 2);
-    out.push(PublicColumn::new(
-        layout.is_full,
-        perm_is_full_at(row_offset),
-    ));
-    out.push(PublicColumn::new(
-        layout.is_round,
-        perm_is_round_at(row_offset),
-    ));
+    out.push(PublicColumn::new(layout.is_full, perm_is_full_at(row_offset)));
+    out.push(PublicColumn::new(layout.is_round, perm_is_round_at(row_offset)));
     for lane in 0..STATE_SIZE {
         out.push(PublicColumn::new(
             layout.rc + lane,
@@ -129,7 +125,10 @@ fn mds_full_row_terms(lane: usize, pre_base: usize) -> Vec<(usize, Block128)> {
 
 /// Build an honest witness trace for
 /// `hash_auth_tag(spend_secret, tx_body_hash)`.
-pub fn build_hauth_trace(secret: [Block128; 2], tx_body: [Block128; 2]) -> Vec<Vec<Block128>> {
+pub fn build_hauth_trace(
+    secret: [Block128; 2],
+    tx_body: [Block128; 2],
+) -> Vec<Vec<Block128>> {
     let mut cols: Vec<Vec<Block128>> = (0..HAUTH_N_COLS)
         .map(|_| vec![Block128::ZERO; HAUTH_N_ROWS])
         .collect();
@@ -238,7 +237,8 @@ pub fn emit_hauth(
     for lane in 0..STATE_SIZE {
         let mut terms = vec![(HAUTH_LAYOUT_A.s + lane, Block128::ONE)];
         terms.extend(mds_full_row_terms(lane, HAUTH_PRE_S_A_BASE));
-        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
         constraints.push(Box::new(SelectorGate::new(HAUTH_IND_ROW_0, inner)));
     }
 
@@ -328,7 +328,11 @@ impl HAuthAir {
         }
     }
 
-    pub fn build_trace(&self, secret: [Block128; 2], tx_body: [Block128; 2]) -> Trace {
+    pub fn build_trace(
+        &self,
+        secret: [Block128; 2],
+        tx_body: [Block128; 2],
+    ) -> Trace {
         Trace::new(build_hauth_trace(secret, tx_body))
     }
 }
@@ -481,7 +485,8 @@ mod tests {
         let tx_body = mk_fields(0x8888);
         let air = HAuthAir::new(tx_body, expected_tag_for(secret, tx_body));
         let mut cols = build_hauth_trace(secret, tx_body);
-        cols[HAUTH_PRE_S_B_BASE][N_ROUNDS] = cols[HAUTH_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
+        cols[HAUTH_PRE_S_B_BASE][N_ROUNDS] =
+            cols[HAUTH_PRE_S_B_BASE][N_ROUNDS] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -562,7 +567,10 @@ mod tests {
                 assert_ne!(layouts[i].rc, layouts[j].rc);
             }
         }
-        assert_eq!(HAUTH_N_COLS, 3 * POSEIDON_PERM_N_COLS + 3 * STATE_SIZE + 4);
+        assert_eq!(
+            HAUTH_N_COLS,
+            3 * POSEIDON_PERM_N_COLS + 3 * STATE_SIZE + 4
+        );
         assert!(HAUTH_OUTPUT_ROW < HAUTH_N_ROWS);
     }
 }

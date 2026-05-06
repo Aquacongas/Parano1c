@@ -17,7 +17,8 @@ pub mod layout;
 pub use air::{
     build_tx_body_merkle_trace, build_tx_body_merkle_trace_with_boundary_pins,
     build_tx_body_merkle_typed_trace, emit_tx_body_merkle_constraints,
-    emit_tx_body_merkle_constraints_with_boundary_pins, emit_tx_body_merkle_public_columns,
+    emit_tx_body_merkle_constraints_with_boundary_pins,
+    emit_tx_body_merkle_public_columns,
     emit_tx_body_merkle_public_columns_with_boundary_pins, extract_instance_output,
     instance_row_offset, leaf_rate_absorb_instance_ids, leaf_rate_payload_col,
     tx_body_merkle_column_domains, tx_body_merkle_column_domains_with_boundary_pins,

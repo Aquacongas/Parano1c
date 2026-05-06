@@ -34,67 +34,71 @@ pub mod airs;
 pub mod gates;
 
 pub use airs::{
-    apply_mds_row, bit_adder_is_input_programme, bit_adder_is_reset_programme,
-    bit_adder_operand_programme, build_balance_columns, build_haddr_trace, build_hauth_trace,
-    build_hleaf_trace, build_instance_layout, build_perm_trace, build_sbox_x7_columns,
-    build_tx_body_merkle_trace, build_tx_body_merkle_trace_with_boundary_pins,
-    build_tx_body_merkle_typed_trace, emit_balance_constraints,
-    emit_balance_selector_public_columns, emit_balance_value_public_columns,
-    emit_block_constraints, emit_haddr, emit_hauth, emit_hleaf, emit_mds_row_constraints,
-    emit_perm_all, emit_perm_all_at, emit_perm_mds_blend, emit_perm_mds_blend_at,
-    emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at, emit_perm_public_columns,
-    emit_perm_public_columns_at, emit_perm_public_columns_row_major_at, emit_perm_rc_binding,
-    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
-    emit_sbox_x7_constraints, emit_tx_body_merkle_constraints,
-    emit_tx_body_merkle_constraints_with_boundary_pins, emit_tx_body_merkle_public_columns,
-    emit_tx_body_merkle_public_columns_with_boundary_pins, extract_haddr_output,
-    extract_hauth_output, extract_hleaf_output, extract_instance_output, extract_perm_output,
-    instance_row_offset, is_full_round, leaf_rate_absorb_instance_ids, leaf_rate_payload_col,
-    perm_is_full_values, perm_is_full_values_row_major, perm_is_round_values,
-    perm_is_round_values_row_major, perm_rc_values, perm_rc_values_row_major,
-    tx_body_merkle_column_domains, write_perm_trace_at, write_perm_trace_at_offset, AccInitGate,
+    bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
+    build_balance_columns, emit_balance_constraints, emit_balance_selector_public_columns,
+    emit_balance_value_public_columns, emit_block_constraints,
+    AccInitGate,
     AccNextGate, BalanceBridgeBitsGate, BalanceBridgeCarryGate, BalanceFinalCarryGate,
     BalanceFinalSumGate, BalanceGateAir, BalanceZeroAtTransitionGate, BitAdderAir,
     BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, CarryInitGate, CarryNextGate,
-    CarryRippleAir, FaSumGate, HAddrAir, HAuthAir, HLeafAir, LinearCombinationAir, MdsKind,
-    MdsLayout, MdsRowGate, PadZeroGate, PartialSboxKillGate, PermLayout, PermMdsBlendGate,
-    PoseidonPermColumns, RangeGateAir, SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins,
-    TxBodySpineComposite, TxValidityAir, TxValidityCol, WeightInitGate, WeightNextGate,
-    BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B,
-    BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM,
-    BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH, BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
-    CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B, CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET,
-    CARRY_RIPPLE_COL_SUM, CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS,
-    DEFAULT_PERM_LAYOUT, HADDR_B_SEED_ROW, HADDR_IND_ROW_0, HADDR_IND_ROW_N_ROUNDS,
-    HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B, HADDR_LOG_ROWS, HADDR_N_COLS,
-    HADDR_N_ROWS, HADDR_OUTPUT_ROW, HADDR_PAD_0, HADDR_PAD_1, HADDR_PERM_A_BASE, HADDR_PERM_B_BASE,
-    HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE, HAUTH_B_SEED_ROW, HAUTH_C_SEED_ROW, HAUTH_IND_ROW_0,
-    HAUTH_IND_ROW_2N_PLUS_1, HAUTH_IND_ROW_N_ROUNDS, HAUTH_IND_ROW_OUTPUT, HAUTH_LAYOUT_A,
-    HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS, HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_OUTPUT_ROW,
-    HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE, HAUTH_PERM_C_BASE, HAUTH_PRE_S_A_BASE,
-    HAUTH_PRE_S_B_BASE, HAUTH_PRE_S_C_BASE, HLEAF_B_SEED_ROW, HLEAF_C_SEED_ROW, HLEAF_IND_ROW_0,
-    HLEAF_IND_ROW_2N_PLUS_1, HLEAF_IND_ROW_N_ROUNDS, HLEAF_IND_ROW_OUTPUT, HLEAF_LAYOUT_A,
-    HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS, HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_OUTPUT_ROW,
-    HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE, HLEAF_PERM_C_BASE, HLEAF_PRE_S_A_BASE,
-    HLEAF_PRE_S_B_BASE, HLEAF_PRE_S_C_BASE, N_LEAF_RATE_PAYLOAD_COLS, POSEIDON_COL_IS_FULL,
-    POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
-    POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
-    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS, RANGE_GATE_COL_ACC,
-    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
-    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS, SBOX_X7_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LAYOUT,
+    apply_mds_row, build_perm_trace, build_sbox_x7_columns, emit_mds_row_constraints,
+    emit_perm_all, emit_perm_all_at, emit_perm_mds_blend, emit_perm_mds_blend_at,
+    emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at, emit_perm_rc_binding,
+    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
+    emit_sbox_x7_constraints, extract_perm_output, is_full_round, write_perm_trace_at,
+    CarryRippleAir, FaSumGate, PartialSboxKillGate, PermLayout, PermMdsBlendGate,
+    LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate, PoseidonPermColumns,
+    DEFAULT_PERM_LAYOUT,
+    emit_perm_public_columns, emit_perm_public_columns_at,
+    emit_perm_public_columns_row_major_at, perm_is_full_values, perm_is_full_values_row_major,
+    perm_is_round_values, perm_is_round_values_row_major, perm_rc_values,
+    perm_rc_values_row_major,
+    build_haddr_trace, emit_haddr, extract_haddr_output, HAddrAir, HADDR_B_SEED_ROW,
+    HADDR_IND_ROW_0, HADDR_IND_ROW_N_ROUNDS, HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_OUTPUT_ROW, HADDR_PAD_0, HADDR_PAD_1,
+    HADDR_PERM_A_BASE, HADDR_PERM_B_BASE, HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
+    build_hauth_trace, emit_hauth, extract_hauth_output, HAuthAir, HAUTH_B_SEED_ROW,
+    HAUTH_C_SEED_ROW, HAUTH_IND_ROW_0, HAUTH_IND_ROW_2N_PLUS_1, HAUTH_IND_ROW_N_ROUNDS,
+    HAUTH_IND_ROW_OUTPUT, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS,
+    HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_OUTPUT_ROW, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE,
+    HAUTH_PERM_C_BASE, HAUTH_PRE_S_A_BASE, HAUTH_PRE_S_B_BASE, HAUTH_PRE_S_C_BASE,
+    build_hleaf_trace, emit_hleaf, extract_hleaf_output, HLeafAir, HLEAF_B_SEED_ROW,
+    HLEAF_C_SEED_ROW, HLEAF_IND_ROW_0, HLEAF_IND_ROW_2N_PLUS_1, HLEAF_IND_ROW_N_ROUNDS,
+    HLEAF_IND_ROW_OUTPUT, HLEAF_LAYOUT_A, HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_LOG_ROWS,
+    HLEAF_N_COLS, HLEAF_N_ROWS, HLEAF_OUTPUT_ROW, HLEAF_PERM_A_BASE, HLEAF_PERM_B_BASE,
+    HLEAF_PERM_C_BASE, HLEAF_PRE_S_A_BASE, HLEAF_PRE_S_B_BASE, HLEAF_PRE_S_C_BASE,
+    build_instance_layout, build_tx_body_merkle_trace,
+    build_tx_body_merkle_trace_with_boundary_pins, build_tx_body_merkle_typed_trace,
+    emit_tx_body_merkle_constraints, emit_tx_body_merkle_constraints_with_boundary_pins,
+    emit_tx_body_merkle_public_columns, emit_tx_body_merkle_public_columns_with_boundary_pins,
+    extract_instance_output, instance_row_offset, leaf_rate_absorb_instance_ids,
+    leaf_rate_payload_col, tx_body_merkle_column_domains, write_perm_trace_at_offset,
+    TxBodyMerkleAir, TxBodyMerkleBoundaryPins, N_LEAF_RATE_PAYLOAD_COLS, TXBODY_MERKLE_LAYOUT,
     TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS,
     TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE,
-    TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
-    TX_BODY_MERKLE_COL_OFFSET, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
+    TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS, TxBodySpineComposite,
+    SPINE_LOG_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS, TX_BODY_MERKLE_COL_OFFSET,
+    RangeGateAir, SboxX7Layout, TxValidityAir,
+    TxValidityCol, WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
+    BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
+    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
+    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
+    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
+    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, RANGE_GATE_COL_ACC,
+    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
+    POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S,
+    POSEIDON_COL_SIN, POSEIDON_COL_SOUT, POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS, RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS,
+    SBOX_X7_N_COLS, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
     TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
     TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
     TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
 };
 pub use gates::{
-    emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector, emit_public_cell,
-    emit_row_selector, emit_rows_must_be_zero, multi_row_indicator_programme,
-    row_indicator_programme, BoolGate, MulGate, PublicColumn, SelectorGate, SquareGate,
-    WeightedLinearGate, WeightedLinearGateShifted,
+    emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector,
+    emit_public_cell, emit_row_selector, emit_rows_must_be_zero,
+    multi_row_indicator_programme, row_indicator_programme, BoolGate, MulGate, PublicColumn,
+    SelectorGate, SquareGate, WeightedLinearGate, WeightedLinearGateShifted,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,7 +143,10 @@ impl Trace {
         Self::new_with_domains(columns, domains)
     }
 
-    pub fn new_with_domains(columns: Vec<Vec<Block128>>, domains: Vec<ColumnDomain>) -> Self {
+    pub fn new_with_domains(
+        columns: Vec<Vec<Block128>>,
+        domains: Vec<ColumnDomain>,
+    ) -> Self {
         assert!(!columns.is_empty(), "trace needs at least one column");
         assert_eq!(
             columns.len(),
@@ -147,10 +154,7 @@ impl Trace {
             "one domain tag required per column"
         );
         let len = columns[0].len();
-        assert!(
-            len.is_power_of_two(),
-            "column length must be a power of two"
-        );
+        assert!(len.is_power_of_two(), "column length must be a power of two");
         for c in &columns {
             assert_eq!(c.len(), len, "all columns must have equal length");
         }
@@ -408,12 +412,8 @@ pub trait Air {
         let next_idx_ref = &next_idx;
 
         let bad_row = (0..n).into_par_iter().map_init(
-            || {
-                (
-                    Vec::<Block128>::with_capacity(max_local),
-                    Vec::<Block128>::with_capacity(max_next),
-                )
-            },
+            || (Vec::<Block128>::with_capacity(max_local),
+                Vec::<Block128>::with_capacity(max_next)),
             |(local_buf, next_buf), row| {
                 let next_row = if row + 1 == n { 0 } else { row + 1 };
                 for (ci, c) in constraints.iter().enumerate() {
@@ -470,16 +470,14 @@ pub fn check_legacy<A: Air + ?Sized>(air: &A, trace: &Trace) -> bool {
     for row in 0..n {
         let next_row = if row + 1 == n { 0 } else { row + 1 };
         for c in air.constraints() {
-            let local: Vec<Block128> = c.columns().iter().map(|&j| trace.columns[j][row]).collect();
+            let local: Vec<Block128> =
+                c.columns().iter().map(|&j| trace.columns[j][row]).collect();
             let next: Vec<Block128> = c
                 .shifted_columns()
                 .iter()
                 .map(|&j| trace.columns[j][next_row])
                 .collect();
-            let frame = EvalFrame {
-                local: &local,
-                next: &next,
-            };
+            let frame = EvalFrame { local: &local, next: &next };
             if c.evaluate(frame) != Block128::ZERO {
                 return false;
             }
@@ -583,13 +581,7 @@ mod tests {
         let air = build_bool_xor_air(3);
         let n = 1 << 3;
         let col0: Vec<Block128> = (0..n)
-            .map(|i| {
-                if i & 1 == 0 {
-                    Block128::ZERO
-                } else {
-                    Block128::ONE
-                }
-            })
+            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
             .collect();
         let col1 = col0.clone();
         let trace = Trace::new(vec![col0, col1]);
@@ -675,11 +667,10 @@ mod tests {
             Block128::from(0x1234567890abcdef_u128),
         ];
         let next_tower = [Block128::ZERO, Block128::ONE];
-        let local_flat: Vec<u128> = local_tower
-            .iter()
-            .map(|v| tower_to_flat_u128(v.0))
-            .collect();
-        let next_flat: Vec<u128> = next_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+        let local_flat: Vec<u128> =
+            local_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+        let next_flat: Vec<u128> =
+            next_tower.iter().map(|v| tower_to_flat_u128(v.0)).collect();
         for c in air.constraints() {
             // Slice to this constraint's arity — BoolGate reads 1 col,
             // WeightedLinearGate XOR reads 2 cols; local_tower has ≥2.

@@ -66,19 +66,20 @@ use std::time::{Duration, Instant};
 use noid_air::{
     build_perm_trace, emit_perm_all, Air, BalanceGateAir, CarryRippleAir, CompositeAir, HAddrAir,
     HAuthAir, HLeafAir, LinearCombinationAir, RangeGateAir, Trace, TxBodyMerkleAir,
-    TxBodyMerkleBoundaryPins, TxBodySpineComposite, TxValidityAir, BIT_ADDER_LOG_WORD_BITS,
-    HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS, HLEAF_LOG_ROWS, HLEAF_N_COLS,
-    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LOG_ROWS,
-    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
-    TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
+    TxBodyMerkleBoundaryPins, TxBodySpineComposite, TxValidityAir,
+    BIT_ADDER_LOG_WORD_BITS, HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS,
+    HLEAF_LOG_ROWS, HLEAF_N_COLS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
+    SPINE_LOG_ROWS, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS,
+    TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS, TX_VALIDITY_3B4_LOG_ROWS,
+    TX_VALIDITY_3B4_N_COLS,
 };
 use noid_core::{Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::{NUM_QUERIES, TAU};
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::{
-    padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings, StarkProof,
-    VerifyTimings,
+    padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings,
+    StarkProof, VerifyTimings,
 };
 use noid_tx::{PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
@@ -691,22 +692,20 @@ fn bench_tx_body_merkle() -> AirRow {
     let wrap_out_row = layout[58].slot_base_row + 66; // N_ROUNDS = 66
     let s_base = noid_air::TXBODY_MERKLE_LAYOUT.s;
     let pins = TxBodyMerkleBoundaryPins {
-        tx_body_hash: [
-            seed_cols[s_base][wrap_out_row],
-            seed_cols[s_base + 1][wrap_out_row],
-        ],
+        tx_body_hash: [seed_cols[s_base][wrap_out_row], seed_cols[s_base + 1][wrap_out_row]],
         ..TxBodyMerkleBoundaryPins::default()
     };
 
     let air = TxBodyMerkleAir::new_with_boundary_pins(pins);
     let trace_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &pins);
-    let domains =
-        noid_air::airs::tx_body_merkle::tx_body_merkle_column_domains_with_boundary_pins();
+    let domains = noid_air::airs::tx_body_merkle::tx_body_merkle_column_domains_with_boundary_pins();
     let trace = Trace::new_with_domains(trace_cols, domains);
 
     let row = bench_air(
         "TxBodyMerkleAir (tx-body spine: 59 Poseidon2b perms + boundary pins)",
-        Some(format!("    per-perm: {{prove, verify, proof}} / 59",)),
+        Some(format!(
+            "    per-perm: {{prove, verify, proof}} / 59",
+        )),
         air,
         trace,
         SAMPLES.min(3),
@@ -757,10 +756,7 @@ fn bench_spine_composite() -> AirRow {
     let wrap_out_row = layout[58].slot_base_row + 66;
     let s_base = noid_air::TXBODY_MERKLE_LAYOUT.s;
     let pins = TxBodyMerkleBoundaryPins {
-        tx_body_hash: [
-            seed_cols[s_base][wrap_out_row],
-            seed_cols[s_base + 1][wrap_out_row],
-        ],
+        tx_body_hash: [seed_cols[s_base][wrap_out_row], seed_cols[s_base + 1][wrap_out_row]],
         ..TxBodyMerkleBoundaryPins::default()
     };
 
@@ -776,7 +772,10 @@ fn bench_spine_composite() -> AirRow {
 
     let row = bench_air(
         "TxBodySpineComposite (PROD: TxValidity + TxBodyMerkle + cross-AIR ties)",
-        Some("    this is the per-tx client prover path".to_string()),
+        Some(
+            "    this is the per-tx client prover path"
+                .to_string(),
+        ),
         spine,
         trace,
         SAMPLES.min(3),
@@ -833,10 +832,7 @@ fn print_footer(prod: &AirRow) {
         fmt_ms(prod.verify.total()),
         fmt_bytes(prod.proof_bytes),
     );
-    println!(
-        "  composite log_rows = {}  |  n_cols = {}",
-        prod.log_rows, prod.n_cols
-    );
+    println!("  composite log_rows = {}  |  n_cols = {}", prod.log_rows, prod.n_cols);
     println!();
     println!("  Optimisation targets (by share of prove wall-clock):");
     let p = &prod.prove_buckets;
@@ -911,20 +907,12 @@ fn main() {
 
     // ---- Render ----
     print_section("[A] Engine scaling primitives");
-    for r in &carry_rows {
-        print_row("A.carry  ", r);
-    }
-    for r in &range_rows {
-        print_row("A.range  ", r);
-    }
-    for r in &lin_rows {
-        print_row("A.lincomb", r);
-    }
+    for r in &carry_rows { print_row("A.carry  ", r); }
+    for r in &range_rows { print_row("A.range  ", r); }
+    for r in &lin_rows   { print_row("A.lincomb", r); }
 
     print_section("[B] Balance gate");
-    for r in &bal_rows {
-        print_row("B.bal    ", r);
-    }
+    for r in &bal_rows   { print_row("B.bal    ", r); }
 
     print_section("[C] Poseidon2b hashes");
     print_row("C.perm   ", &perm_row);

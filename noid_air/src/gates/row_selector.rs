@@ -43,9 +43,9 @@
 //! single-row, so that variant is deferred until something actually
 //! needs it.
 
-use crate::gates::const_column::PublicColumn;
-use crate::gates::linear::{WeightedLinearGate, WeightedLinearGateShifted};
 use crate::gates::selector::SelectorGate;
+use crate::gates::linear::{WeightedLinearGate, WeightedLinearGateShifted};
+use crate::gates::const_column::PublicColumn;
 use crate::Constraint;
 use noid_core::{Block128, TowerField};
 
@@ -246,13 +246,13 @@ mod tests {
     fn public_cell_accepts_matching() {
         let constant = Block128::from(0xDEAD_BEEFu128);
         let (pc, gate) = emit_public_cell(0, 2, 4, 1, constant);
-        let air = CompositeAir::from_parts_with_publics(2, 2, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let air = CompositeAir::from_parts_with_publics(
+            2,
+            2,
+            vec![gate],
+            vec![pc],
+        );
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let mut target = vec![Block128::ZERO; 4];
         target[2] = constant;
         let trace = Trace::new(vec![indicator, target]);
@@ -263,13 +263,13 @@ mod tests {
     fn public_cell_rejects_wrong_cell_on_target_row() {
         let constant = Block128::from(0xDEAD_BEEFu128);
         let (pc, gate) = emit_public_cell(0, 2, 4, 1, constant);
-        let air = CompositeAir::from_parts_with_publics(2, 2, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let air = CompositeAir::from_parts_with_publics(
+            2,
+            2,
+            vec![gate],
+            vec![pc],
+        );
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let mut target = vec![Block128::ZERO; 4];
         target[2] = constant + Block128::ONE;
         let trace = Trace::new(vec![indicator, target]);
@@ -284,13 +284,13 @@ mod tests {
     fn public_cell_silent_on_non_target_rows() {
         let constant = Block128::from(0xDEAD_BEEFu128);
         let (pc, gate) = emit_public_cell(0, 2, 4, 1, constant);
-        let air = CompositeAir::from_parts_with_publics(2, 2, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let air = CompositeAir::from_parts_with_publics(
+            2,
+            2,
+            vec![gate],
+            vec![pc],
+        );
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let mut target = vec![Block128::ZERO; 4];
         target[0] = Block128::from(0x1234u128);
         target[1] = Block128::from(0x5678u128);
@@ -306,14 +306,14 @@ mod tests {
     fn tampered_indicator_column_rejected() {
         let constant = Block128::from(0xDEAD_BEEFu128);
         let (pc, gate) = emit_public_cell(0, 2, 4, 1, constant);
-        let air = CompositeAir::from_parts_with_publics(2, 2, vec![gate], vec![pc]);
+        let air = CompositeAir::from_parts_with_publics(
+            2,
+            2,
+            vec![gate],
+            vec![pc],
+        );
         // Move the `1` to row 0 — programme says row 2.
-        let indicator = vec![
-            Block128::ONE,
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ONE, Block128::ZERO, Block128::ZERO, Block128::ZERO];
         let mut target = vec![Block128::ZERO; 4];
         target[2] = constant;
         let trace = Trace::new(vec![indicator, target]);
@@ -335,12 +335,7 @@ mod tests {
         let sel1: Box<dyn Constraint> = Box::new(SelectorGate::new(0, Box::new(inner1)));
         let sel2: Box<dyn Constraint> = Box::new(SelectorGate::new(0, Box::new(inner2)));
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![sel1, sel2], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ZERO, Block128::ONE];
         let mut c1 = vec![Block128::ZERO; 4];
         c1[3] = k1;
         let mut c2 = vec![Block128::ZERO; 4];
@@ -350,16 +345,12 @@ mod tests {
         // Tamper c2[3] — second gate rejects.
         let mut c2_bad = c2.clone();
         c2_bad[3] = k2 + Block128::ONE;
-        let trace_bad = Trace::new(vec![
-            vec![
-                Block128::ZERO,
-                Block128::ZERO,
-                Block128::ZERO,
-                Block128::ONE,
-            ],
-            c1,
-            c2_bad,
-        ]);
+        let trace_bad =
+            Trace::new(vec![
+                vec![Block128::ZERO, Block128::ZERO, Block128::ZERO, Block128::ONE],
+                c1,
+                c2_bad,
+            ]);
         assert!(!air.check(&trace_bad));
     }
 
@@ -390,25 +381,10 @@ mod tests {
         // Indicator on col 0, equate col 1 vs col 2 at row 2.
         let (pc, gate) = emit_column_eq_at_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let shared = Block128::from(0xDEAD_u128);
-        let col_a = vec![
-            Block128::ZERO,
-            Block128::from(1u128),
-            shared,
-            Block128::ZERO,
-        ];
-        let col_b = vec![
-            Block128::from(99u128),
-            Block128::from(42u128),
-            shared,
-            Block128::ZERO,
-        ];
+        let col_a = vec![Block128::ZERO, Block128::from(1u128), shared, Block128::ZERO];
+        let col_b = vec![Block128::from(99u128), Block128::from(42u128), shared, Block128::ZERO];
         let trace = Trace::new(vec![indicator, col_a, col_b]);
         assert!(air.check(&trace));
     }
@@ -417,12 +393,7 @@ mod tests {
     fn column_eq_rejects_mismatch_on_target_row() {
         let (pc, gate) = emit_column_eq_at_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let col_a = vec![Block128::ZERO; 4];
         let mut col_b = vec![Block128::ZERO; 4];
         col_b[2] = Block128::ONE;
@@ -435,12 +406,7 @@ mod tests {
         // Rows 0, 1, 3 can freely disagree; only row 2 is pinned.
         let (pc, gate) = emit_column_eq_at_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let col_a = vec![
             Block128::from(0xAAu128),
             Block128::from(0xBBu128),
@@ -462,12 +428,7 @@ mod tests {
         let (pc, gate) = emit_column_eq_at_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
         // Indicator fires on row 0 instead — programme rejects.
-        let indicator = vec![
-            Block128::ONE,
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ONE, Block128::ZERO, Block128::ZERO, Block128::ZERO];
         let col_a = vec![Block128::ZERO; 4];
         let col_b = vec![Block128::ZERO; 4];
         let trace = Trace::new(vec![indicator, col_a, col_b]);
@@ -512,15 +473,7 @@ mod tests {
     #[test]
     fn multi_row_programme_tolerates_duplicates() {
         let p = multi_row_indicator_programme(&[2, 2, 2], 4);
-        assert_eq!(
-            p,
-            vec![
-                Block128::ZERO,
-                Block128::ZERO,
-                Block128::ONE,
-                Block128::ZERO
-            ]
-        );
+        assert_eq!(p, vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO]);
     }
 
     #[test]
@@ -609,12 +562,7 @@ mod tests {
         // Indicator on col 0, pin col1@row2 == col2@row3.
         let (pc, gate) = emit_column_eq_at_next_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let shared = Block128::from(0xC0FFEEu128);
         // col1[2] == shared; col2[3] == shared. Rows 0, 1, 3 of col1 and
         // rows 0, 1, 2 of col2 are free.
@@ -638,18 +586,8 @@ mod tests {
     fn column_eq_next_rejects_mismatch() {
         let (pc, gate) = emit_column_eq_at_next_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
-        let col1 = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
+        let col1 = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         let col2 = vec![Block128::ZERO; 4]; // col2[3] = 0, but col1[2] = 1.
         let trace = Trace::new(vec![indicator, col1, col2]);
         assert!(!air.check(&trace));
@@ -660,12 +598,7 @@ mod tests {
         // row = 3 pins col1[3] == col2[0] (cyclic rotation).
         let (pc, gate) = emit_column_eq_at_next_row(0, 3, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ZERO, Block128::ONE];
         let shared = Block128::from(0xAAu128);
         let col1 = vec![Block128::ZERO, Block128::ZERO, Block128::ZERO, shared];
         let col2 = vec![shared, Block128::ZERO, Block128::ZERO, Block128::ZERO];
@@ -677,12 +610,7 @@ mod tests {
     fn column_eq_next_silent_on_other_rows() {
         let (pc, gate) = emit_column_eq_at_next_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ONE,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ZERO, Block128::ZERO, Block128::ONE, Block128::ZERO];
         // col1[2] == col2[3]; any other (row, row+1) pair may disagree.
         let shared = Block128::from(7u128);
         let col1 = vec![
@@ -705,12 +633,7 @@ mod tests {
     fn column_eq_next_rejects_tampered_indicator() {
         let (pc, gate) = emit_column_eq_at_next_row(0, 2, 4, 1, 2);
         let air = CompositeAir::from_parts_with_publics(2, 3, vec![gate], vec![pc]);
-        let indicator = vec![
-            Block128::ONE,
-            Block128::ZERO,
-            Block128::ZERO,
-            Block128::ZERO,
-        ];
+        let indicator = vec![Block128::ONE, Block128::ZERO, Block128::ZERO, Block128::ZERO];
         let col1 = vec![Block128::ZERO; 4];
         let col2 = vec![Block128::ZERO; 4];
         let trace = Trace::new(vec![indicator, col1, col2]);

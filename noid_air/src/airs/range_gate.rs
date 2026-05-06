@@ -253,13 +253,7 @@ impl RangeGateAir {
     /// consecutive rows.
     pub fn build_trace(&self, values: &[u64]) -> Trace {
         let n = self.n_instances();
-        assert_eq!(
-            values.len(),
-            n,
-            "expected {} values, got {}",
-            n,
-            values.len()
-        );
+        assert_eq!(values.len(), n, "expected {} values, got {}", n, values.len());
         let n_rows = 1usize << self.log_rows;
         let w = RANGE_GATE_WORD_BITS;
 
@@ -325,7 +319,12 @@ mod tests {
     }
 
     fn mk_values() -> Vec<u64> {
-        vec![0u64, 1u64, 0xdead_beef_cafe_babeu64, u64::MAX]
+        vec![
+            0u64,
+            1u64,
+            0xdead_beef_cafe_babeu64,
+            u64::MAX,
+        ]
     }
 
     #[test]

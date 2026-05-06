@@ -266,7 +266,9 @@ impl Constraint for BitAdderCarryNextGate {
         let carry = frame.local[3];
         let next_carry = frame.next[0];
         let is_reset_next = frame.next[1];
-        is_input * (Block128::ONE + is_reset_next) * (next_carry + a * b + a * carry + b * carry)
+        is_input
+            * (Block128::ONE + is_reset_next)
+            * (next_carry + a * b + a * carry + b * carry)
     }
 }
 
@@ -306,7 +308,11 @@ pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block1
 /// to the public `TxBody` u64 value via a single `PublicColumn`
 /// declaration, closing the "witness `Value` ↔ balance-operand bits"
 /// binding gap from §3b-4 without any new gate types or widened trace.
-pub fn bit_adder_operand_programme(width: usize, value: u64, log_rows: usize) -> Vec<Block128> {
+pub fn bit_adder_operand_programme(
+    width: usize,
+    value: u64,
+    log_rows: usize,
+) -> Vec<Block128> {
     assert!(width >= 1 && width <= 64);
     assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
     if width < 64 {
@@ -411,13 +417,7 @@ impl BitAdderAir {
     /// though the AIR does not constrain them).
     pub fn build_trace(&self, adders: &[(u128, u128)]) -> Trace {
         let n = self.n_instances();
-        assert_eq!(
-            adders.len(),
-            n,
-            "expected {} adders, got {}",
-            n,
-            adders.len()
-        );
+        assert_eq!(adders.len(), n, "expected {} adders, got {}", n, adders.len());
         let n_rows = 1usize << self.log_rows;
         let w_word = BIT_ADDER_WORD_BITS;
         let w_in = self.width;
@@ -467,7 +467,14 @@ impl BitAdderAir {
             carry_col[base + w_in] = Block128::from(c);
         }
 
-        let cols = vec![a_col, b_col, sum_col, carry_col, is_reset_col, is_input_col];
+        let cols = vec![
+            a_col,
+            b_col,
+            sum_col,
+            carry_col,
+            is_reset_col,
+            is_input_col,
+        ];
         let domains = vec![ColumnDomain::Bit; BIT_ADDER_N_COLS];
         Trace::new_with_domains(cols, domains)
     }
@@ -546,7 +553,10 @@ mod tests {
             let air = BitAdderAir::new(width, 8);
             let pairs = mk_pairs(air.n_instances(), width, 0xA5A5 ^ width as u64);
             let trace = air.build_trace(&pairs);
-            assert!(air.check(&trace), "honest trace rejected at width={width}");
+            assert!(
+                air.check(&trace),
+                "honest trace rejected at width={width}"
+            );
             // Spot-check: sum + (carry_out << width) == a + b (mod 2^(width+1)).
             for (inst, &(a, b)) in pairs.iter().enumerate() {
                 let sum = read_sum(&trace, inst, width);
