@@ -334,8 +334,11 @@ fn column_root(log_slots: usize, evals: &[Block128]) -> [u8; 32] {
 }
 
 /// Domain-separated Poseidon2b sponge over `log_slots` and the three
-/// per-lane FRI roots. Matches the in-circuit Stage 4c.3 combiner AIR.
-fn combine_roots(
+/// per-lane FRI roots. Matches the in-circuit Stage 4c.3 combiner AIR
+/// (`noid_air::airs::fri_state_combiner`): both absorb the same
+/// `log_slots ‖ r_val ‖ r_hi ‖ r_lo` preimage under `TAG_FRISTATE` and
+/// must yield bit-identical 32-byte digests.
+pub fn combine_roots(
     log_slots: usize,
     r_val: &[u8; 32],
     r_hi: &[u8; 32],
@@ -504,6 +507,80 @@ mod tests {
     fn open_out_of_range_errors() {
         let state = FriState::new_empty(2); // 4 slots
         assert!(matches!(state.open(4), Err(StateError::SlotOutOfRange)));
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 4 closure — native `combine_roots` <-> AIR combiner identity.
+    //
+    // Closes the `{prev,new}_state_root` arrow: the 32-byte digest
+    // `combine_roots` produces for a given preimage (log_slots, three
+    // FRI roots) is bit-identical to the digest the Stage 4c.3 combiner
+    // AIR pins as `expected_state_root_fields`. Any drift between the
+    // native root-computation path and the arithmetised sponge would
+    // desync `PublicInputs.{prev,new}_state_root` between prover and
+    // node — this test is the fixed point that catches it.
+    // ------------------------------------------------------------------
+    #[test]
+    fn combine_roots_matches_stage_4c3_combiner_air() {
+        use noid_air::airs::{
+            build_combiner_side_trace, extract_combiner_digest, FriStateCombinerComposite,
+            FriStateCombinerPreimage, COMBINER_PERM_LAYOUT,
+        };
+
+        // Two distinct preimages — one stands in for `prev`, one for
+        // `new`. Bytes are arbitrary but deterministic.
+        let mk = |seed: u8| FriStateCombinerPreimage {
+            log_slots: 24,
+            r_val: std::array::from_fn(|i| seed ^ (i as u8)),
+            r_owner_hi: std::array::from_fn(|i| seed.wrapping_add(0x11) ^ (i as u8).wrapping_mul(3)),
+            r_owner_lo: std::array::from_fn(|i| seed.wrapping_add(0x22) ^ (i as u8).wrapping_mul(5)),
+        };
+
+        let prev = mk(0x11);
+        let new = mk(0x77);
+
+        // Native digest through `combine_roots`.
+        let native_prev = combine_roots(prev.log_slots as usize, &prev.r_val, &prev.r_owner_hi, &prev.r_owner_lo);
+        let native_new = combine_roots(new.log_slots as usize, &new.r_val, &new.r_owner_hi, &new.r_owner_lo);
+
+        // Digest extracted from an honest AIR trace.
+        let air_prev = extract_combiner_digest(&build_combiner_side_trace(&prev), COMBINER_PERM_LAYOUT);
+        let air_new = extract_combiner_digest(&build_combiner_side_trace(&new), COMBINER_PERM_LAYOUT);
+
+        assert_eq!(
+            native_prev, air_prev,
+            "Stage 4c.3 combiner AIR diverged from native combine_roots on prev side"
+        );
+        assert_eq!(
+            native_new, air_new,
+            "Stage 4c.3 combiner AIR diverged from native combine_roots on new side"
+        );
+
+        // The same digests, split into the two 16-byte little-endian
+        // field lanes, are what the composite pins as public inputs;
+        // the honest trace must accept.
+        let to_fields = |d: &[u8; 32]| -> [Block128; 2] {
+            let mut lo = [0u8; 16];
+            let mut hi = [0u8; 16];
+            lo.copy_from_slice(&d[..16]);
+            hi.copy_from_slice(&d[16..]);
+            [
+                Block128::from(u128::from_le_bytes(lo)),
+                Block128::from(u128::from_le_bytes(hi)),
+            ]
+        };
+
+        let composite = FriStateCombinerComposite::new(
+            prev,
+            to_fields(&native_prev),
+            new,
+            to_fields(&native_new),
+        );
+        let trace = composite.build_trace();
+        assert!(
+            <FriStateCombinerComposite as noid_air::Air>::check(&composite, &trace),
+            "composite must accept the honest trace under native-derived expected fields"
+        );
     }
 
     #[test]

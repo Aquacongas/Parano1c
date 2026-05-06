@@ -8,6 +8,7 @@ pub mod balance_gate;
 pub mod bit_adder;
 pub mod carry_ripple;
 pub mod fri_state_combiner;
+pub mod fri_state_combiner_composite;
 pub mod fri_state_open;
 pub mod haddr;
 pub mod hauth;
@@ -49,6 +50,10 @@ pub use fri_state_combiner::{
     FRI_STATE_COMBINER_N_ROWS, FRI_STATE_COMBINER_PAD_LANE_0,
     FRI_STATE_COMBINER_PAD_LANE_1, FRI_STATE_COMBINER_PREIMAGE_BYTES,
     FRI_STATE_COMBINER_SCAFFOLD_N_COLS, FRI_STATE_COMBINER_SLOT_ROWS,
+};
+pub use fri_state_combiner_composite::{
+    FriStateCombinerComposite, COMBINER_COMPOSITE_LOG_ROWS, COMBINER_COMPOSITE_N_COLS,
+    COMBINER_COMPOSITE_N_ROWS, COMBINER_COMPOSITE_NEW_OFFSET, COMBINER_COMPOSITE_PREV_OFFSET,
 };
 pub use fri_state_open::{
     col_delta_acc_owner_hi, col_delta_acc_owner_lo, col_delta_acc_value, col_delta_owner_hi,

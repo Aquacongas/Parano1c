@@ -834,9 +834,12 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
     // log_rows` the witness lives on a prefix of that hypercube and the
     // cyclic-next of the last witness row is a padding row, not row 0
     // of the witness. Every current AIR that opts into rotation
-    // (`log_rows = TX_VALIDITY_LOG_ROWS = 4` will be lifted to
-    // `log_rows = 16` in Stage 3b+) will satisfy `log_rows >= TAU+1`,
-    // so the padded case is not part of the protocol contract.
+    // (shipped sub-AIRs: `POSEIDON_PERM_LOG_ROWS = 8`,
+    // `TXBODY_MERKLE_LOG_ROWS = 13`, `FRI_STATE_COMBINER_LOG_ROWS = 9`;
+    // the stitched Stage 7 `[L]` composite lands at its own derived
+    // `log_rows`, measured — not hardcoded) satisfies
+    // `log_rows >= TAU+1`, so the padded case is not part of the
+    // protocol contract.
     assert!(
         shifted_indices.is_empty() || log_rows == padded_log_len(log_rows),
         "VSHIFT requires log_rows >= TAU+1; got log_rows={} padded={}",
