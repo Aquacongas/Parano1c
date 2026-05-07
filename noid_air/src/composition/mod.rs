@@ -71,6 +71,6 @@ pub use tx_validity_leaf::{
     TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
 };
 pub use tx_validity_with_spine::{
-    tx_validity_with_spine_n_cols, TxValidityCompositeWithSpine, LEAF_BAND_RESERVED,
-    SPINE_BLOCK_OUTER_BASE, TX_VALIDITY_WITH_SPINE_LOG_ROWS,
+    build_stage_5_7_honest_fixture, tx_validity_with_spine_n_cols, TxValidityCompositeWithSpine,
+    LEAF_BAND_RESERVED, SPINE_BLOCK_OUTER_BASE, TX_VALIDITY_WITH_SPINE_LOG_ROWS,
 };

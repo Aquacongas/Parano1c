@@ -182,10 +182,10 @@ const fn auth_tag_lo_dst_row(input: usize) -> usize {
 // bridge intervals on a shared column don't alias. (Currently each
 // T2b dst has its own column pair per input; rows still need to
 // differ from the src row N_ROUNDS — which they do by construction.)
-const fn pre_s_b_hi_dst_row(input: usize) -> usize {
+pub const fn pre_s_b_hi_dst_row(input: usize) -> usize {
     crate::airs::hauth::HAUTH_N_ROWS + 6 + 8 * input
 }
-const fn pre_s_b_lo_dst_row(input: usize) -> usize {
+pub const fn pre_s_b_lo_dst_row(input: usize) -> usize {
     crate::airs::hauth::HAUTH_N_ROWS + 8 + 8 * input
 }
 

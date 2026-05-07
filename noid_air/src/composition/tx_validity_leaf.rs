@@ -166,13 +166,95 @@ const fn leaf_lo_dst_row(output: usize) -> usize {
     crate::airs::hleaf::HLEAF_N_ROWS + 4 + 4 * output
 }
 
+/// Per-output T3 dst override. When supplied via
+/// [`LeafConstructionOptions::t3_dst_override`] the HLeaf block's
+/// hi/lo bridge dst cells are routed at these `(col, row)` pairs
+/// instead of the canonical `leaf_hash_dst_cols / leaf_*_dst_row`,
+/// AND the per-output `PublicColumn` programme that pins the dst to
+/// the declared leaf hash is **omitted**. Used by Stage 5.7 PR B.4 to
+/// retarget T3 dsts at spine `OutputLeafPermA` rate-payload cells.
+#[derive(Debug, Clone, Copy)]
+pub struct T3DstOverride {
+    pub hi_col: usize,
+    pub hi_row: usize,
+    pub lo_col: usize,
+    pub lo_row: usize,
+}
+
+/// Per-input T2a dst override. When supplied via
+/// [`LeafConstructionOptions::t2a_dst_override`] the HAuth block's
+/// hi/lo auth-tag bridge dst cells are routed at these `(col, row)`
+/// pairs instead of the canonical `auth_tag_dst_cols /
+/// auth_tag_*_dst_row`, AND the per-input `PublicColumn` programme
+/// that pins the dst to the declared auth tag is **omitted**. Used
+/// by Stage 5.7 PR B.6 to retarget T2a dsts at spine
+/// `TxValidityCol::AuthTagHi/Lo[i]` cells.
+#[derive(Debug, Clone, Copy)]
+pub struct T2aDstOverride {
+    pub hi_col: usize,
+    pub hi_row: usize,
+    pub lo_col: usize,
+    pub lo_row: usize,
+}
+
+/// Per-input T2b dst override. When supplied via
+/// [`LeafConstructionOptions::t2b_dst_override`] the HAuth block's
+/// hi/lo `pre_s_b` (== `tx_body_hash`) bridge dst cells are routed at
+/// these `(col, row)` pairs instead of the canonical
+/// `pre_s_b_dst_cols / pre_s_b_*_dst_row`. The 5.5/5.6 leaf composite
+/// emits no `PublicColumn` programmes for T2b dsts (they are unpinned
+/// — see `tx_validity_hauth.rs:427`), so unlike T2a/T3 the override
+/// only re-routes the bridge dst cells. Used by Stage 5.7 PR B.7 to
+/// point all per-input T2b dsts at the spine's single canonical
+/// wrap-output cell carrying `tx_body_hash`.
+#[derive(Debug, Clone, Copy)]
+pub struct T2bDstOverride {
+    pub hi_col: usize,
+    pub hi_row: usize,
+    pub lo_col: usize,
+    pub lo_row: usize,
+}
+
+/// Optional construction-time tweaks for [`TxValidityCompositeLeaf`].
+/// `Default` reproduces 5.6 behavior bit-identically.
+#[derive(Debug, Clone, Default)]
+pub struct LeafConstructionOptions {
+    /// When `Some`, override every HLeaf block's bridge dst cells and
+    /// skip the T3 PI-pin emission. Caller must guarantee each
+    /// override cell lies inside the outer composite and (in honest
+    /// traces) carries the corresponding leaf hash.
+    pub t3_dst_override: Option<[T3DstOverride; N_OUTPUTS]>,
+    /// When `Some`, override every HAuth block's bridge dst cells
+    /// (auth-tag hi/lo) and skip the T2a PI-pin emission. Caller
+    /// must guarantee each override cell lies inside the outer
+    /// composite and (in honest traces) carries the corresponding
+    /// `native_auth_tag(secrets[i], tx_body_hash)`.
+    pub t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
+    /// When `Some`, override every HAuth block's `pre_s_b` (==
+    /// `tx_body_hash`) bridge dst cells. Caller must guarantee each
+    /// override cell lies inside the outer composite and (in honest
+    /// traces) carries `tx_body_hash[lane]`. No PI-pin gating is
+    /// needed since the leaf composite emits no T2b programmes.
+    pub t2b_dst_override: Option<[T2bDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
+}
+
 fn hleaf_block_params_for(
     output: usize,
     outer_n_cols: usize,
     fields: [Block128; 4],
+    override_cell: Option<T3DstOverride>,
 ) -> HLeafBlockParams {
     let base = leaf_block_base(output);
-    let (hi_col, lo_col) = leaf_hash_dst_cols(output);
+    let (default_hi_col, default_lo_col) = leaf_hash_dst_cols(output);
+    let (hi_col, hi_row, lo_col, lo_row) = match override_cell {
+        Some(o) => (o.hi_col, o.hi_row, o.lo_col, o.lo_row),
+        None => (
+            default_hi_col,
+            leaf_hi_dst_row(output),
+            default_lo_col,
+            leaf_lo_dst_row(output),
+        ),
+    };
     HLeafBlockParams {
         cols: HLeafBlockColumns {
             col_offset: base + REL_HLEAF_SUBAIR_COL,
@@ -196,9 +278,9 @@ fn hleaf_block_params_for(
         fields,
         targets: HLeafBlockTargets {
             leaf_hi_dst_col: hi_col,
-            leaf_hi_dst_row: leaf_hi_dst_row(output),
+            leaf_hi_dst_row: hi_row,
             leaf_lo_dst_col: lo_col,
-            leaf_lo_dst_row: leaf_lo_dst_row(output),
+            leaf_lo_dst_row: lo_row,
         },
     }
 }
@@ -243,12 +325,32 @@ fn hauth_block_params_for(
     input: usize,
     outer_n_cols: usize,
     tx_body_hash: [Block128; 2],
+    t2a_override: Option<T2aDstOverride>,
+    t2b_override: Option<T2bDstOverride>,
 ) -> HAuthBlockParams {
     let base = full_hauth_block_base(input);
-    let (tag_hi_col, tag_lo_col) =
+    let (default_tag_hi_col, default_tag_lo_col) =
         crate::composition::tx_validity_hauth::auth_tag_dst_cols(input);
-    let (pre_hi_col, pre_lo_col) =
+    let (tag_hi_col, tag_hi_row, tag_lo_col, tag_lo_row) = match t2a_override {
+        Some(o) => (o.hi_col, o.hi_row, o.lo_col, o.lo_row),
+        None => (
+            default_tag_hi_col,
+            auth_tag_hi_dst_row(input),
+            default_tag_lo_col,
+            auth_tag_lo_dst_row(input),
+        ),
+    };
+    let (default_pre_hi_col, default_pre_lo_col) =
         crate::composition::tx_validity_hauth::pre_s_b_dst_cols(input);
+    let (pre_hi_col, pre_hi_row, pre_lo_col, pre_lo_row) = match t2b_override {
+        Some(o) => (o.hi_col, o.hi_row, o.lo_col, o.lo_row),
+        None => (
+            default_pre_hi_col,
+            pre_s_b_hi_dst_row(input),
+            default_pre_lo_col,
+            pre_s_b_lo_dst_row(input),
+        ),
+    };
     HAuthBlockParams {
         cols: HAuthBlockColumns {
             col_offset: base + REL_HAUTH_SUBAIR_COL,
@@ -284,13 +386,13 @@ fn hauth_block_params_for(
         tx_body_hash,
         targets: HAuthBlockTargets {
             auth_tag_hi_dst_col: tag_hi_col,
-            auth_tag_hi_dst_row: auth_tag_hi_dst_row(input),
+            auth_tag_hi_dst_row: tag_hi_row,
             auth_tag_lo_dst_col: tag_lo_col,
-            auth_tag_lo_dst_row: auth_tag_lo_dst_row(input),
+            auth_tag_lo_dst_row: tag_lo_row,
             tx_body_hi_dst_col: pre_hi_col,
-            tx_body_hi_dst_row: pre_s_b_hi_dst_row(input),
+            tx_body_hi_dst_row: pre_hi_row,
             tx_body_lo_dst_col: pre_lo_col,
-            tx_body_lo_dst_row: pre_s_b_lo_dst_row(input),
+            tx_body_lo_dst_row: pre_lo_row,
         },
     }
 }
@@ -356,6 +458,18 @@ pub struct TxValidityCompositeLeaf {
     /// Per-output declared leaf hash `(hi, lo)`. Pinned on per-output T3
     /// destinations.
     output_leaf_hashes: [[Block128; 2]; N_OUTPUTS],
+    /// Optional per-output T3 dst override (PR B.4). When `Some`, the
+    /// HLeaf bridge dst cells are routed at these `(col, row)` pairs
+    /// and the T3 PI-pin loop is skipped at construction.
+    t3_dst_override: Option<[T3DstOverride; N_OUTPUTS]>,
+    /// Optional per-input T2a dst override (PR B.6). When `Some`, the
+    /// HAuth bridge dst cells are routed at these `(col, row)` pairs
+    /// and the T2a PI-pin loop is skipped at construction.
+    t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
+    /// Optional per-input T2b (`pre_s_b == tx_body_hash`) dst override
+    /// (PR B.7). When `Some`, the HAuth `pre_s_b` bridge dst cells are
+    /// routed at these `(col, row)` pairs.
+    t2b_dst_override: Option<[T2bDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
 }
 
 impl TxValidityCompositeLeaf {
@@ -368,6 +482,33 @@ impl TxValidityCompositeLeaf {
         auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
         output_fields: [[Block128; 4]; N_OUTPUTS],
         output_leaf_hashes: [[Block128; 2]; N_OUTPUTS],
+    ) -> Self {
+        Self::new_with_options(
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            output_fields,
+            output_leaf_hashes,
+            LeafConstructionOptions::default(),
+        )
+    }
+
+    /// Construct a [`TxValidityCompositeLeaf`] with caller-controlled
+    /// option overrides. See [`LeafConstructionOptions`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        combiner: FriStateCombinerComposite,
+        open_air: FriStateOpenAir,
+        open_witness: FriStateOpenWitness,
+        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+        tx_body_hash: [Block128; 2],
+        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+        output_fields: [[Block128; 4]; N_OUTPUTS],
+        output_leaf_hashes: [[Block128; 2]; N_OUTPUTS],
+        options: LeafConstructionOptions,
     ) -> Self {
         let outer_n_cols = TX_VALIDITY_LEAF_N_COLS;
         let outer_log_rows = TX_VALIDITY_LEAF_LOG_ROWS;
@@ -437,53 +578,86 @@ impl TxValidityCompositeLeaf {
 
         // Block D — HAuth × N_INPUTS + T2a/T2b.
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
-            let params = hauth_block_params_for(input, outer_n_cols, tx_body_hash);
+            let t2a_override = options.t2a_dst_override.map(|arr| arr[input]);
+            let t2b_override = options.t2b_dst_override.map(|arr| arr[input]);
+            let params = hauth_block_params_for(
+                input,
+                outer_n_cols,
+                tx_body_hash,
+                t2a_override,
+                t2b_override,
+            );
             let wiring = emit_hauth_block(params);
             constraints.extend(wiring.constraints);
             public_columns.extend(wiring.public_columns);
         }
 
-        // Pin per-input T2a destinations to declared auth tags.
-        for input in 0..FRI_STATE_OPEN_N_INPUTS {
-            let (hi_col, lo_col) =
-                crate::composition::tx_validity_hauth::auth_tag_dst_cols(input);
-            public_columns.push(PublicColumn::new(
-                hi_col,
-                pinned_row_programme(auth_tag_hi_dst_row(input), auth_tags[input][0], outer_n_rows),
-            ));
-            public_columns.push(PublicColumn::new(
-                lo_col,
-                pinned_row_programme(auth_tag_lo_dst_row(input), auth_tags[input][1], outer_n_rows),
-            ));
+        // Pin per-input T2a destinations to declared auth tags —
+        // skipped when the caller supplied a `t2a_dst_override` (PR
+        // B.6: the override cell is expected to carry the correct
+        // value via the spine's `TxValidityCol::AuthTagHi/Lo` cells).
+        if options.t2a_dst_override.is_none() {
+            for input in 0..FRI_STATE_OPEN_N_INPUTS {
+                let (hi_col, lo_col) =
+                    crate::composition::tx_validity_hauth::auth_tag_dst_cols(input);
+                public_columns.push(PublicColumn::new(
+                    hi_col,
+                    pinned_row_programme(
+                        auth_tag_hi_dst_row(input),
+                        auth_tags[input][0],
+                        outer_n_rows,
+                    ),
+                ));
+                public_columns.push(PublicColumn::new(
+                    lo_col,
+                    pinned_row_programme(
+                        auth_tag_lo_dst_row(input),
+                        auth_tags[input][1],
+                        outer_n_rows,
+                    ),
+                ));
+            }
         }
 
         // Block E — HLeaf × N_OUTPUTS + T3.
         for output in 0..N_OUTPUTS {
-            let params = hleaf_block_params_for(output, outer_n_cols, output_fields[output]);
+            let override_cell = options.t3_dst_override.map(|arr| arr[output]);
+            let params = hleaf_block_params_for(
+                output,
+                outer_n_cols,
+                output_fields[output],
+                override_cell,
+            );
             let wiring = emit_hleaf_block(params);
             constraints.extend(wiring.constraints);
             public_columns.extend(wiring.public_columns);
         }
 
-        // Pin per-output T3 destinations to declared leaf hashes.
-        for output in 0..N_OUTPUTS {
-            let (hi_col, lo_col) = leaf_hash_dst_cols(output);
-            public_columns.push(PublicColumn::new(
-                hi_col,
-                pinned_row_programme(
-                    leaf_hi_dst_row(output),
-                    output_leaf_hashes[output][0],
-                    outer_n_rows,
-                ),
-            ));
-            public_columns.push(PublicColumn::new(
-                lo_col,
-                pinned_row_programme(
-                    leaf_lo_dst_row(output),
-                    output_leaf_hashes[output][1],
-                    outer_n_rows,
-                ),
-            ));
+        // Pin per-output T3 destinations to declared leaf hashes —
+        // skipped when the caller supplied a `t3_dst_override` (the
+        // override cell is expected to carry the correct value via
+        // some other mechanism, typically the spine's
+        // `OutputLeafPermA` absorb chain).
+        if options.t3_dst_override.is_none() {
+            for output in 0..N_OUTPUTS {
+                let (hi_col, lo_col) = leaf_hash_dst_cols(output);
+                public_columns.push(PublicColumn::new(
+                    hi_col,
+                    pinned_row_programme(
+                        leaf_hi_dst_row(output),
+                        output_leaf_hashes[output][0],
+                        outer_n_rows,
+                    ),
+                ));
+                public_columns.push(PublicColumn::new(
+                    lo_col,
+                    pinned_row_programme(
+                        leaf_lo_dst_row(output),
+                        output_leaf_hashes[output][1],
+                        outer_n_rows,
+                    ),
+                ));
+            }
         }
 
         let air = CompositeAir::from_parts_with_publics(
@@ -503,6 +677,9 @@ impl TxValidityCompositeLeaf {
             auth_tags,
             output_fields,
             output_leaf_hashes,
+            t3_dst_override: options.t3_dst_override,
+            t2a_dst_override: options.t2a_dst_override,
+            t2b_dst_override: options.t2b_dst_override,
         }
     }
 
@@ -522,6 +699,9 @@ impl TxValidityCompositeLeaf {
             &self.output_fields,
             TX_VALIDITY_LEAF_N_COLS,
             TX_VALIDITY_LEAF_LOG_ROWS,
+            self.t3_dst_override,
+            self.t2a_dst_override,
+            self.t2b_dst_override,
         );
 
         // Final pass: overwrite every public column with its programme.
@@ -646,6 +826,9 @@ pub fn write_leaf_block_traces(
     output_fields: &[[Block128; 4]; N_OUTPUTS],
     outer_n_cols: usize,
     outer_log_rows: usize,
+    t3_dst_override: Option<[T3DstOverride; N_OUTPUTS]>,
+    t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
+    t2b_dst_override: Option<[T2bDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
 ) {
     assert_eq!(outer_log_rows, TX_VALIDITY_LEAF_LOG_ROWS);
     assert!(outer_n_cols >= TX_VALIDITY_LEAF_N_COLS);
@@ -681,13 +864,27 @@ pub fn write_leaf_block_traces(
 
     // HAuth blocks.
     for input in 0..FRI_STATE_OPEN_N_INPUTS {
-        let params = hauth_block_params_for(input, outer_n_cols, tx_body_hash);
+        let t2a_override = t2a_dst_override.map(|arr| arr[input]);
+        let t2b_override = t2b_dst_override.map(|arr| arr[input]);
+        let params = hauth_block_params_for(
+            input,
+            outer_n_cols,
+            tx_body_hash,
+            t2a_override,
+            t2b_override,
+        );
         let _ = write_hauth_block_trace(cols, params, secrets[input]);
     }
 
     // HLeaf blocks.
     for output in 0..N_OUTPUTS {
-        let params = hleaf_block_params_for(output, outer_n_cols, output_fields[output]);
+        let override_cell = t3_dst_override.map(|arr| arr[output]);
+        let params = hleaf_block_params_for(
+            output,
+            outer_n_cols,
+            output_fields[output],
+            override_cell,
+        );
         let _ = write_hleaf_block_trace(cols, params);
     }
 }
@@ -970,6 +1167,125 @@ mod tests {
             assert!(seen.insert((hi_col, leaf_hi_dst_row(output))));
             assert!(seen.insert((lo_col, leaf_lo_dst_row(output))));
         }
+    }
+
+    /// Build a leaf composite with `t3_dst_override = Some(...)` whose
+    /// cells coincide with the canonical default T3 dsts. Skips the
+    /// T3 PI-pin emission. Used by PR B.4 unit tests to validate the
+    /// override hook end-to-end without coupling to a spine.
+    fn build_with_default_override() -> TxValidityCompositeLeaf {
+        let prev_preimage = mk_combiner_preimage(0x5A);
+        let new_preimage = mk_combiner_preimage(0xA5);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage,
+            prev_fields,
+            new_preimage,
+            new_fields,
+        );
+
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]), native_address(secrets[1]),
+            native_address(secrets[2]), native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [
+            Block128::from(0x1111_2222_3333_4444_u128),
+            Block128::from(0x5555_6666_7777_8888_u128),
+        ];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let mut output_fields: [[Block128; 4]; N_OUTPUTS] = [[Block128::ZERO; 4]; N_OUTPUTS];
+        let mut output_leaf_hashes: [[Block128; 2]; N_OUTPUTS] =
+            [[Block128::ZERO; 2]; N_OUTPUTS];
+        for j in 0..N_OUTPUTS {
+            output_fields[j] = mk_output_fields(0x100u128 + j as u128);
+            output_leaf_hashes[j] = native_output_leaf_hash(output_fields[j]);
+        }
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            spend_with_owner(11, 0, addrs[0]),
+            spend_with_owner(22, 3, addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+
+        let mut t3 = [T3DstOverride { hi_col: 0, hi_row: 0, lo_col: 0, lo_row: 0 }; N_OUTPUTS];
+        for j in 0..N_OUTPUTS {
+            let (hi_col, lo_col) = leaf_hash_dst_cols(j);
+            t3[j] = T3DstOverride {
+                hi_col,
+                hi_row: leaf_hi_dst_row(j),
+                lo_col,
+                lo_row: leaf_lo_dst_row(j),
+            };
+        }
+
+        TxValidityCompositeLeaf::new_with_options(
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            output_fields,
+            output_leaf_hashes,
+            LeafConstructionOptions {
+                t3_dst_override: Some(t3),
+                t2a_dst_override: None,
+                t2b_dst_override: None,
+            },
+        )
+    }
+
+    #[test]
+    fn override_with_default_cells_accepts_honest() {
+        let comp = build_with_default_override();
+        let trace = comp.build_trace();
+        assert!(comp.air().check(&trace));
+    }
+
+    #[test]
+    fn override_t3_dst_tamper_rejects_via_bridge() {
+        // With the override path the per-output T3 PI-pin is omitted —
+        // tampering the dst cell breaks the bridge `cell == squeeze`
+        // tie (no longer the PI programme), but still rejects.
+        let comp = build_with_default_override();
+        let mut cols = comp.build_trace().columns;
+        let (hi_col, _) = leaf_hash_dst_cols(3);
+        let row = leaf_hi_dst_row(3);
+        cols[hi_col][row] = cols[hi_col][row] + Block128::ONE;
+        assert!(!comp.air().check(&Trace::new(cols)));
     }
 
     #[test]
