@@ -142,6 +142,9 @@ pub struct FriStateCombinerComposite {
     public_columns: Vec<PublicColumn>,
     prev_preimage: FriStateCombinerPreimage,
     new_preimage: FriStateCombinerPreimage,
+    // Stage 6 — expected digests exposed for the single PI surface.
+    expected_prev_state_root: [Block128; 2],
+    expected_new_state_root: [Block128; 2],
 }
 
 impl FriStateCombinerComposite {
@@ -207,7 +210,21 @@ impl FriStateCombinerComposite {
             public_columns,
             prev_preimage,
             new_preimage,
+            expected_prev_state_root: expected_prev_state_root_fields,
+            expected_new_state_root: expected_new_state_root_fields,
         }
+    }
+
+    /// Stage 6 — expected `prev_state_root` as the two-block pair
+    /// pinned into the prev-side combiner.
+    pub fn expected_prev_state_root_fields(&self) -> [Block128; 2] {
+        self.expected_prev_state_root
+    }
+
+    /// Stage 6 — expected `new_state_root` as the two-block pair
+    /// pinned into the new-side combiner.
+    pub fn expected_new_state_root_fields(&self) -> [Block128; 2] {
+        self.expected_new_state_root
     }
 
     /// Build an honest composite trace. Prev-side columns occupy

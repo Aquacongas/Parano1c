@@ -46,9 +46,13 @@
 //! (commit / transcript+sumcheck / ladder-sumcheck / multipoint+FRI)
 //! so optimisation work has a direct target.
 //!
-//! The critical number is `[P] TxBodySpineComposite` — the actual
-//! per-tx client prover path. Everything above it is a component
-//! bench kept for regression coverage and optimisation guidance.
+//! The headline row is `TxValidityCompositeWithSpine` — the full
+//! per-tx client prover path, proving balance, range, H_ADDR, H_AUTH,
+//! H_LEAF, the tx-body Merkle spine, and the FRI state opening /
+//! combiner under a single verifier-visible `PublicInputs` surface
+//! (`prev_state_root`, `new_state_root`, `tx_body_hash`, `fee`).
+//! Everything above it is a component bench kept for regression
+//! coverage and optimisation guidance.
 //!
 //! # What this report is not
 //!
@@ -371,8 +375,22 @@ fn bench_air<A: Air, F>(
 where
     F: FnOnce() -> String,
 {
+    bench_air_with_pi(label, extra, air, trace, mk_pi(), samples, check_msg)
+}
+
+fn bench_air_with_pi<A: Air, F>(
+    label: &str,
+    extra: Option<String>,
+    air: A,
+    trace: Trace,
+    pi: PublicInputs,
+    samples: usize,
+    check_msg: F,
+) -> AirRow
+where
+    F: FnOnce() -> String,
+{
     assert!(air.check(&trace), "{}", check_msg());
-    let pi = mk_pi();
 
     let prove_total = time(|| {
         let _ = prove_air(&air, &trace, &pi).unwrap();
@@ -435,6 +453,16 @@ fn print_row(tag: &str, r: &AirRow) {
         fmt_ms(r.prove_buckets.multipoint_fri),
         percent(r.prove_buckets.multipoint_fri, ptot),
     );
+    let mpt = r.prove_buckets.multipoint_fri;
+    println!(
+        "      mp-sub setup+pairs {} ({:>5.1}%) | mp-sumcheck {} ({:>5.1}%) | batched-FRI {} ({:>5.1}%)",
+        fmt_ms(r.prove_buckets.mp_setup_pairs),
+        percent(r.prove_buckets.mp_setup_pairs, mpt),
+        fmt_ms(r.prove_buckets.mp_sumcheck),
+        percent(r.prove_buckets.mp_sumcheck, mpt),
+        fmt_ms(r.prove_buckets.mp_fri),
+        percent(r.prove_buckets.mp_fri, mpt),
+    );
     let vtot = r.verify.total();
     println!(
         "    verify ts+sc  {} ({:>5.1}%) | comp  {} ({:>5.1}%) | ladsc {} ({:>5.1}%) | mp+fri {} ({:>5.1}%)",
@@ -451,7 +479,7 @@ fn print_row(tag: &str, r: &AirRow) {
 }
 
 // ---------------------------------------------------------------------------
-// [A] Primitive scaling — CarryRipple / Range / LinearCombination
+// Primitive scaling — CarryRipple / Range / LinearCombination
 // ---------------------------------------------------------------------------
 
 fn bench_carry(label: &'static str, log_rows: usize) -> AirRow {
@@ -502,7 +530,7 @@ fn bench_linear(log_rows: usize, n_cols: usize) -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// [B] BalanceGateAir — per-tx
+// BalanceGateAir — per-tx
 // ---------------------------------------------------------------------------
 
 fn balanced_tuple(seed: u64) -> ([u64; 4], [u64; 8], u64) {
@@ -549,7 +577,7 @@ fn bench_balance(label: &'static str, log_rows: usize) -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// [C] Poseidon2b primitives — Perm / HAddr / HAuth / HLeaf
+// Poseidon2b primitives — Perm / HAddr / HAuth / HLeaf
 // ---------------------------------------------------------------------------
 
 fn bench_poseidon_perm() -> AirRow {
@@ -651,7 +679,7 @@ fn bench_hleaf() -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// [D] Transaction validity — TxValidityAir (non-Poseidon half)
+// Transaction validity — TxValidityAir (non-Poseidon half)
 // ---------------------------------------------------------------------------
 
 fn bench_tx_validity() -> AirRow {
@@ -676,7 +704,7 @@ fn bench_tx_validity() -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// [E] TxBodyMerkleAir — prod path (with boundary pins)
+// TxBodyMerkleAir — boundary-pinned path
 // ---------------------------------------------------------------------------
 
 fn bench_tx_body_merkle() -> AirRow {
@@ -742,7 +770,7 @@ fn bench_tx_body_merkle_legacy() -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// [P] TxBodySpineComposite — full per-tx prover path
+// Tx-body spine composite — TxValidity + TxBodyMerkle with cross-AIR ties
 // ---------------------------------------------------------------------------
 
 fn bench_spine_composite() -> AirRow {
@@ -771,9 +799,9 @@ fn bench_spine_composite() -> AirRow {
     let trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &inputs);
 
     let row = bench_air(
-        "TxBodySpineComposite (PROD: TxValidity + TxBodyMerkle + cross-AIR ties)",
+        "TxBodySpineComposite (TxValidity + TxBodyMerkle, cross-AIR ties)",
         Some(
-            "    this is the per-tx client prover path"
+            "    tx-body-spine subset of the per-tx prover path (no hash-stack AIRs)"
                 .to_string(),
         ),
         spine,
@@ -783,6 +811,38 @@ fn bench_spine_composite() -> AirRow {
     );
     assert_eq!(row.log_rows, SPINE_LOG_ROWS);
     row
+}
+
+// ---------------------------------------------------------------------------
+// Per-tx prover path — TxValidityCompositeWithSpine
+//
+// Full unified composite proving balance, range, H_ADDR, H_AUTH,
+// H_LEAF, the tx-body Merkle spine, and the FRI state opening /
+// combiner under the verifier-visible PublicInputs surface
+// (prev_state_root, new_state_root, tx_body_hash, fee).
+// ---------------------------------------------------------------------------
+
+fn bench_per_tx_composite() -> AirRow {
+    use noid_air::composition::tx_validity_with_spine::fixture;
+
+    let comp = fixture::build_honest_realistic();
+    let pi = comp.public_inputs();
+    comp.assert_public_inputs_consistent(&pi);
+
+    let trace = comp.build_trace();
+    let air = comp.air;
+
+    bench_air_with_pi(
+        "TxValidityCompositeWithSpine (full per-tx prover path, PublicInputs-bound)",
+        Some(
+            "    fixture: 2 live in / 4 live out, fee 50, balance 150 = 100 + 50".to_string(),
+        ),
+        air,
+        trace,
+        pi,
+        SAMPLES.min(3),
+        || "TxValidityCompositeWithSpine native check failed".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -808,12 +868,13 @@ fn print_banner() {
     );
     println!();
     println!("  Sections:");
-    println!("    [A] Engine scaling primitives   (CarryRipple / Range / LinearCombination)");
-    println!("    [B] Balance gate                (BalanceGate, per-tx)");
-    println!("    [C] Poseidon2b hashes           (Perm / HAddr / HAuth / HLeaf)");
-    println!("    [D] Transaction validity        (TxValidity, non-Poseidon half)");
-    println!("    [E] Transaction-body Merkle     (TxBodyMerkle, with boundary pins)");
-    println!("    [P] PROD per-tx prover path     (TxBodySpineComposite)");
+    println!("    Engine scaling primitives   (CarryRipple / Range / LinearCombination)");
+    println!("    Balance gate                (BalanceGate, per-tx)");
+    println!("    Poseidon2b hashes           (Perm / HAddr / HAuth / HLeaf)");
+    println!("    Transaction validity        (TxValidity, non-Poseidon half)");
+    println!("    Transaction-body Merkle     (TxBodyMerkle, with boundary pins)");
+    println!("    Tx-body spine composite     (TxBodySpineComposite)");
+    println!("    Per-tx prover path          (TxValidityCompositeWithSpine, full PublicInputs)");
     println!();
 }
 
@@ -827,7 +888,7 @@ fn print_section(title: &str) {
 fn print_footer(prod: &AirRow) {
     print_section("Summary");
     println!(
-        "  PROD per-tx prover:  prove={}  verify={}  proof≈{}",
+        "  Per-tx prover path:  prove={}  verify={}  proof≈{}",
         fmt_ms(prod.prove_total),
         fmt_ms(prod.verify.total()),
         fmt_bytes(prod.proof_bytes),
@@ -864,7 +925,7 @@ fn main() {
     print_banner();
 
     // ---- Run all benches (eprintln progress so long sweeps are visible) ----
-    eprintln!("  [A] primitive scaling ...");
+    eprintln!("  primitive scaling ...");
     let mut carry_rows = Vec::with_capacity(CARRY_SHAPES.len());
     for (label, log_rows) in CARRY_SHAPES {
         eprintln!("        carry  ({label}, log_rows={log_rows}) ...");
@@ -881,54 +942,60 @@ fn main() {
         lin_rows.push(bench_linear(lr, nc));
     }
 
-    eprintln!("  [B] balance gate ...");
+    eprintln!("  balance gate ...");
     let mut bal_rows = Vec::with_capacity(BALANCE_SHAPES.len());
     for (label, log_rows) in BALANCE_SHAPES {
         eprintln!("        balance  ({label}, log_rows={log_rows}) ...");
         bal_rows.push(bench_balance(label, *log_rows));
     }
 
-    eprintln!("  [C] Poseidon2b ...");
+    eprintln!("  Poseidon2b ...");
     let perm_row = bench_poseidon_perm();
     let haddr_row = bench_haddr();
     let hauth_row = bench_hauth();
     let hleaf_row = bench_hleaf();
 
-    eprintln!("  [D] tx validity ...");
+    eprintln!("  tx validity ...");
     let txv_row = bench_tx_validity();
 
-    eprintln!("  [E] tx body merkle ...");
+    eprintln!("  tx body merkle ...");
     let merkle_legacy = bench_tx_body_merkle_legacy();
     let merkle_prod = bench_tx_body_merkle();
 
-    eprintln!("  [P] spine composite (prod) ...");
+    eprintln!("  tx-body spine composite ...");
     let spine_row = bench_spine_composite();
+
+    eprintln!("  per-tx prover path ...");
+    let l_row = bench_per_tx_composite();
     eprintln!();
 
     // ---- Render ----
-    print_section("[A] Engine scaling primitives");
-    for r in &carry_rows { print_row("A.carry  ", r); }
-    for r in &range_rows { print_row("A.range  ", r); }
-    for r in &lin_rows   { print_row("A.lincomb", r); }
+    print_section("Engine scaling primitives");
+    for r in &carry_rows { print_row("carry    ", r); }
+    for r in &range_rows { print_row("range    ", r); }
+    for r in &lin_rows   { print_row("lincomb  ", r); }
 
-    print_section("[B] Balance gate");
-    for r in &bal_rows   { print_row("B.bal    ", r); }
+    print_section("Balance gate");
+    for r in &bal_rows   { print_row("balance  ", r); }
 
-    print_section("[C] Poseidon2b hashes");
-    print_row("C.perm   ", &perm_row);
-    print_row("C.haddr  ", &haddr_row);
-    print_row("C.hauth  ", &hauth_row);
-    print_row("C.hleaf  ", &hleaf_row);
+    print_section("Poseidon2b hashes");
+    print_row("perm     ", &perm_row);
+    print_row("haddr    ", &haddr_row);
+    print_row("hauth    ", &hauth_row);
+    print_row("hleaf    ", &hleaf_row);
 
-    print_section("[D] Transaction validity");
-    print_row("D.txv    ", &txv_row);
+    print_section("Transaction validity");
+    print_row("txvalid  ", &txv_row);
 
-    print_section("[E] Transaction-body Merkle");
-    print_row("E.legacy ", &merkle_legacy);
-    print_row("E.prod   ", &merkle_prod);
+    print_section("Transaction-body Merkle");
+    print_row("interior ", &merkle_legacy);
+    print_row("boundary ", &merkle_prod);
 
-    print_section("[P] PROD — per-tx prover path");
-    print_row("P.spine  ", &spine_row);
+    print_section("Tx-body spine composite");
+    print_row("spine    ", &spine_row);
 
-    print_footer(&spine_row);
+    print_section("Per-tx prover path (full PublicInputs surface)");
+    print_row("per-tx   ", &l_row);
+
+    print_footer(&l_row);
 }

@@ -7,6 +7,7 @@
 //! using the FRI protocol with Poseidon2b Merkle trees.
 
 use noid_core::{AdditiveNTT, Block128, CanonicalSerialize, TowerField};
+use rayon::prelude::*;
 
 use crate::channel::{Channel, TAU};
 use crate::code::{Code, LOG_RATE};
@@ -449,16 +450,24 @@ pub fn prove(
         // Scale the query index into the current (smaller) domain.
         // Round 0 has domain size 2^(n_rounds+LOG_RATE); each subsequent round
         // halves the domain, so we right-shift by `round`.
-        let mut symbols_round: Vec<(Block128, Block128)> = Vec::new();
-        let mut paths_round: Vec<Vec<HashOutput>> = Vec::new();
-        for &qi in &query_indices {
-            let scaled = qi >> round; // descend into folded domain
-            let pair_idx = scaled >> 1; // pair of adjacent symbols
-            let s0 = code.idx(pair_idx * 2);
-            let s1 = code.idx(pair_idx * 2 + 1);
-            symbols_round.push((s0, s1));
-            paths_round.push(tree.get_merkle_path(pair_idx));
-        }
+        //
+        // Each query is independent: symbol reads and Merkle-path lookups are
+        // read-only against `code` and `tree`. Parallelizing across queries is
+        // deterministic because the output vectors are produced by an ordered
+        // `collect`, preserving `query_indices` order for the verifier.
+        let (symbols_round, paths_round): (
+            Vec<(Block128, Block128)>,
+            Vec<Vec<HashOutput>>,
+        ) = query_indices
+            .par_iter()
+            .map(|&qi| {
+                let scaled = qi >> round;
+                let pair_idx = scaled >> 1;
+                let s0 = code.idx(pair_idx * 2);
+                let s1 = code.idx(pair_idx * 2 + 1);
+                ((s0, s1), tree.get_merkle_path(pair_idx))
+            })
+            .unzip();
         fri_queried_symbols.push(symbols_round);
         fri_merkle_paths.push(paths_round);
     }

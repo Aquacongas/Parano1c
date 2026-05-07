@@ -452,6 +452,93 @@ impl TxValidityCompositeWithSpine {
     pub fn boundary_pins(&self) -> &TxBodyMerkleBoundaryPins {
         &self.boundary_pins
     }
+
+    /// Stage 6 — tx body hash the trace was built with.
+    pub fn tx_body_hash_fields(&self) -> [Block128; 2] {
+        self.tx_body_hash
+    }
+
+    /// Stage 6 — declared fee the balance block was pinned to.
+    pub fn balance_fee(&self) -> u64 {
+        self.balance_fee
+    }
+
+    /// Stage 6 — expected `prev_state_root` as pinned into the
+    /// combiner's prev-side.
+    pub fn expected_prev_state_root_fields(&self) -> [Block128; 2] {
+        self.combiner.expected_prev_state_root_fields()
+    }
+
+    /// Stage 6 — expected `new_state_root` as pinned into the
+    /// combiner's new-side.
+    pub fn expected_new_state_root_fields(&self) -> [Block128; 2] {
+        self.combiner.expected_new_state_root_fields()
+    }
+
+    /// Stage 6 — derive the canonical `PublicInputs` from the four
+    /// scalars already pinned into the composite's sub-AIRs. Each
+    /// scalar is read from its single source of truth; no fresh
+    /// pins introduced.
+    ///
+    /// - `prev_state_root` ← combiner prev-side expected digest.
+    /// - `new_state_root`  ← combiner new-side expected digest.
+    /// - `tx_body_hash`    ← `boundary_pins.tx_body_hash` (Stage 1 O2 tie).
+    /// - `fee`             ← `balance_fee` pinned via `emit_balance_value_public_columns`.
+    ///
+    /// The returned `PublicInputs` is the **only** verifier-visible
+    /// surface (Stage 6 (b)).
+    pub fn public_inputs(&self) -> noid_tx::PublicInputs {
+        use noid_poseidon2b::primitives::TxBodyHash;
+
+        // boundary_pins carries tx_body_hash as [Block128; 2]; the
+        // combiner carries prev/new state roots likewise. Pack them
+        // back into byte-digests for the PI wire format.
+        let pack = |fields: [Block128; 2]| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            out[..16].copy_from_slice(&fields[0].to_u128().to_le_bytes());
+            out[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
+            out
+        };
+
+        // Sanity: the trace was built with `self.tx_body_hash` and
+        // `boundary_pins.tx_body_hash` must match — both are the Stage 1
+        // O2 tie target.
+        assert_eq!(
+            self.boundary_pins.tx_body_hash, self.tx_body_hash,
+            "Stage 6: boundary_pins.tx_body_hash must equal composite tx_body_hash",
+        );
+
+        noid_tx::PublicInputs {
+            prev_state_root: pack(self.combiner.expected_prev_state_root_fields()),
+            new_state_root: pack(self.combiner.expected_new_state_root_fields()),
+            tx_body_hash: TxBodyHash(pack(self.tx_body_hash)),
+            fee: self.balance_fee as u128,
+        }
+    }
+
+    /// Stage 6 — assert that the caller-supplied `PublicInputs` is
+    /// byte-identical to the pins already written into the sub-AIRs.
+    /// Acceptance (c): every pin emitted exactly once, asserted at
+    /// composite construction time.
+    pub fn assert_public_inputs_consistent(&self, pi: &noid_tx::PublicInputs) {
+        let derived = self.public_inputs();
+        assert_eq!(
+            derived.prev_state_root, pi.prev_state_root,
+            "Stage 6: PublicInputs.prev_state_root disagrees with combiner pin",
+        );
+        assert_eq!(
+            derived.new_state_root, pi.new_state_root,
+            "Stage 6: PublicInputs.new_state_root disagrees with combiner pin",
+        );
+        assert_eq!(
+            derived.tx_body_hash, pi.tx_body_hash,
+            "Stage 6: PublicInputs.tx_body_hash disagrees with Merkle wrap-output pin",
+        );
+        assert_eq!(
+            derived.fee, pi.fee,
+            "Stage 6: PublicInputs.fee disagrees with balance-block pin",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

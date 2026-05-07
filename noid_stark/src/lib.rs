@@ -311,11 +311,6 @@ fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> V
 /// positions. Uses precomputed `compiled.betas_flat` and
 /// `Constraint::evaluate_flat` so that every inner product runs
 /// through flat-basis CLMUL rather than tower-basis Karatsuba.
-///
-/// The layout of `col_tables_at_s` is `[base cols..., rotated cols...]`
-/// where the rotated-column block is ordered by `shifted_slot`.
-/// `compiled.next_indices` has already been rewritten to absolute
-/// column indices (i.e. `n_base + slot` for each shifted read).
 fn accumulate_sum_flat(
     eq_at_s: &[u128],
     col_tables_at_s: &[Vec<u128>],
@@ -493,6 +488,11 @@ pub struct ProveTimings {
     pub transcript_sumcheck: std::time::Duration,
     pub ladder_sumcheck: std::time::Duration,
     pub multipoint_fri: std::time::Duration,
+    /// Under-bucket breakdown of `multipoint_fri`. The three fields sum
+    /// (up to measurement noise) to `multipoint_fri`.
+    pub mp_setup_pairs: std::time::Duration,
+    pub mp_sumcheck: std::time::Duration,
+    pub mp_fri: std::time::Duration,
 }
 
 impl ProveTimings {
@@ -597,7 +597,8 @@ pub fn prove_air_unchecked_timed<A: Air>(
     t.ladder_sumcheck = t2.elapsed();
 
     let t3 = Instant::now();
-    let (multipoint_rounds, multipoint_batch) = prove_multipoint_close(
+    let mut mp_sub = MpSubTimings::default();
+    let (multipoint_rounds, multipoint_batch) = prove_multipoint_close_inner(
         &padded_columns,
         &base_openings,
         &r_point,
@@ -607,8 +608,12 @@ pub fn prove_air_unchecked_timed<A: Air>(
         &ntt,
         &mut channel,
         &hasher,
+        Some(&mut mp_sub),
     );
     t.multipoint_fri = t3.elapsed();
+    t.mp_setup_pairs = mp_sub.setup_pairs;
+    t.mp_sumcheck = mp_sub.sumcheck;
+    t.mp_fri = mp_sub.fri;
 
     (
         StarkProof {
@@ -678,6 +683,13 @@ fn prove_base_and_ladder_partials(
 /// The terminal claim is closed by a single batched FRI opening of
 /// all base columns at `r''`. Verifier reconstructs `W_s(r'')` in
 /// closed form — it's just a small weighted sum of `eq(P_{s,k}, r'')`.
+#[derive(Debug, Clone, Copy, Default)]
+struct MpSubTimings {
+    setup_pairs: std::time::Duration,
+    sumcheck: std::time::Duration,
+    fri: std::time::Duration,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_multipoint_close(
     padded_columns: &[Vec<Block128>],
@@ -690,9 +702,38 @@ fn prove_multipoint_close(
     channel: &mut Channel,
     hasher: &Poseidon2bSponge,
 ) -> (Vec<RoundPoly>, BatchedEvalProof) {
+    prove_multipoint_close_inner(
+        padded_columns,
+        base_openings,
+        r_point,
+        shifted_indices,
+        shift_partials,
+        log_len,
+        ntt,
+        channel,
+        hasher,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_multipoint_close_inner(
+    padded_columns: &[Vec<Block128>],
+    base_openings: &[Block128],
+    r_point: &[Block128],
+    shifted_indices: &[usize],
+    shift_partials: &[Vec<Block128>],
+    log_len: usize,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &Poseidon2bSponge,
+    mut sub: Option<&mut MpSubTimings>,
+) -> (Vec<RoundPoly>, BatchedEvalProof) {
     use noid_core::mle::eq::eq_ind_partial_eval;
     use rayon::prelude::*;
+    use std::time::Instant;
 
+    let t_setup = Instant::now();
     let n = padded_columns.len();
     let s_count = shifted_indices.len();
 
@@ -740,20 +781,25 @@ fn prove_multipoint_close(
     // `eq(r_point, ·)` is independent of `i`, so materialize it once
     // and scale-clone per base column instead of recomputing inside
     // the parallel loop (O(2^n) × n ops saved).
+    //
+    // B-side of each pair is the already-materialised committed column
+    // (`padded_columns[col_id]`); we pass it as a borrowed slice so the
+    // sumcheck converts to flat-basis in place instead of cloning 16 B
+    // × 2^log_len × n_pairs (~287 MB on the per-tx fixture).
     let eq_base = eq_ind_partial_eval(r_point);
-    let base_pairs: Vec<(Vec<Block128>, Vec<Block128>)> = (0..n)
+    let base_pairs_a: Vec<Vec<Block128>> = (0..n)
         .into_par_iter()
         .map(|i| {
             let lam = lambdas[i];
-            let scaled: Vec<Block128> = eq_base.iter().map(|&v| v * lam).collect();
-            (scaled, padded_columns[i].clone())
+            eq_base.iter().map(|&v| v * lam).collect()
         })
         .collect();
+    let base_pairs_b: Vec<&[Block128]> =
+        (0..n).map(|i| padded_columns[i].as_slice()).collect();
 
-    let ladder_pairs: Vec<(Vec<Block128>, Vec<Block128>)> = (0..s_count)
+    let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
         .into_par_iter()
         .map(|slot| {
-            let col_id = shifted_indices[slot];
             let trails = weight_trails
                 .as_ref()
                 .expect("trails present when s_count > 0");
@@ -762,20 +808,37 @@ fn prove_multipoint_close(
             for v in w.iter_mut() {
                 *v = *v * eta;
             }
-            (w, padded_columns[col_id].clone())
+            w
         })
         .collect();
+    let ladder_pairs_b: Vec<&[Block128]> = (0..s_count)
+        .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
+        .collect();
 
-    let mut pairs = base_pairs;
-    pairs.extend(ladder_pairs);
+    let mut pairs_a = base_pairs_a;
+    pairs_a.extend(ladder_pairs_a);
+    let mut pairs_b = base_pairs_b;
+    pairs_b.extend(ladder_pairs_b);
+    let setup_elapsed = t_setup.elapsed();
 
+    let t_sc = Instant::now();
     let (rounds, challenges) =
-        crate::multipoint_batch::prove_multipoint_sumcheck(pairs, target, channel);
+        crate::multipoint_batch::prove_multipoint_sumcheck(pairs_a, pairs_b, target, channel);
     let r_pp: Vec<Block128> = challenges.iter().rev().cloned().collect();
     debug_assert_eq!(r_pp.len(), log_len);
+    let sc_elapsed = t_sc.elapsed();
 
+    let t_fri = Instant::now();
     let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
     let batch = prove_batched(&col_refs, &r_pp, ntt, channel, hasher);
+    let fri_elapsed = t_fri.elapsed();
+
+    if let Some(s) = sub.as_deref_mut() {
+        s.setup_pairs = setup_elapsed;
+        s.sumcheck = sc_elapsed;
+        s.fri = fri_elapsed;
+    }
+    let _ = &mut sub;
 
     (rounds, batch)
 }

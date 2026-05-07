@@ -43,65 +43,109 @@ pub const MULTIPOINT_TAG: u128 = 0xFFFC_0000_0000_0000;
 /// convention). The caller forms `r'' =
 /// challenges.iter().rev().collect()` for MLE opening.
 pub fn prove_multipoint_sumcheck(
-    mut pairs: Vec<(Vec<Block128>, Vec<Block128>)>,
+    pairs_a: Vec<Vec<Block128>>,
+    pairs_b: Vec<&[Block128]>,
     target: Block128,
     channel: &mut noid_fri::Channel,
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
-    assert!(!pairs.is_empty(), "multipoint: at least one pair required");
-    let n = pairs[0].0.len().trailing_zeros() as usize;
-    for (a, b) in &pairs {
+    assert!(!pairs_a.is_empty(), "multipoint: at least one pair required");
+    assert_eq!(pairs_a.len(), pairs_b.len(), "A and B pair counts must match");
+    let n = pairs_a[0].len().trailing_zeros() as usize;
+    for (a, b) in pairs_a.iter().zip(pairs_b.iter()) {
         debug_assert_eq!(a.len(), 1 << n);
         debug_assert_eq!(b.len(), 1 << n);
     }
 
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
     use rayon::prelude::*;
+
+    // Convert every pair table to flat basis once. All inner arithmetic
+    // (round-oracle accumulation + per-round fold) runs in flat basis
+    // via `clmul_gcm` — XOR is basis-agnostic. We convert back to tower
+    // only for the three round-oracle evals (observed on the transcript)
+    // and the final challenge scalar (which we need in tower to feed
+    // back into `lagrange_eval_at_pub`; the flat copy is used for the
+    // fold itself).
+    //
+    // `pairs_b` arrives as borrowed slices into the caller's committed
+    // column pool — they are not re-clonable data, so we allocate a
+    // single fresh flat buffer per B without an intermediate owned
+    // tower-basis copy.
+    let mut pairs_flat: Vec<(Vec<u128>, Vec<u128>)> = pairs_a
+        .into_par_iter()
+        .zip(pairs_b.into_par_iter())
+        .map(|(a, b)| {
+            let a_flat: Vec<u128> = a.into_iter().map(|v| tower_to_flat_u128(v.0)).collect();
+            let b_flat: Vec<u128> = b.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+            (a_flat, b_flat)
+        })
+        .collect();
+
+    let two_flat = tower_to_flat_u128(Block128::from(2u8).0);
 
     let mut rounds: Vec<RoundPoly> = Vec::with_capacity(n);
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
     let mut claim = target;
-    let two = Block128::from(2u8);
 
     for _ in 0..n {
-        let half = pairs[0].0.len() / 2;
-        let (p0, p1, p2) = pairs
+        let half = pairs_flat[0].0.len() / 2;
+
+        // Round-oracle: three XOR accumulators in flat basis. For each
+        // (A, B) pair and each j:
+        //   a_s = a0 ^ clmul(two_flat, a1 ^ a0)
+        //   b_s = b0 ^ clmul(two_flat, b1 ^ b0)
+        //   p0 ^= clmul(a0, b0)
+        //   p1 ^= clmul(a1, b1)
+        //   p2 ^= clmul(a_s, b_s)
+        // These match the tower-basis `a_s = a0 + 2·(a1+a0)` and the
+        // three point evaluations at X ∈ {0, 1, 2}. Soundness-neutral:
+        // conversion is isomorphism of GF(2^128), so the aggregate
+        // tower-basis sum equals `flat_to_tower(aggregate_flat)`.
+        let (p0_flat, p1_flat, p2_flat) = pairs_flat
             .par_iter()
             .map(|(a, b)| {
-                (0..half)
-                    .into_par_iter()
-                    .map(|j| {
-                        let a0 = a[j];
-                        let a1 = a[j + half];
-                        let b0 = b[j];
-                        let b1 = b[j + half];
-                        let as_ = a0 + two * (a1 + a0);
-                        let bs_ = b0 + two * (b1 + b0);
-                        (a0 * b0, a1 * b1, as_ * bs_)
-                    })
-                    .reduce(
-                        || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
-                        |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
-                    )
+                let mut s0: u128 = 0;
+                let mut s1: u128 = 0;
+                let mut s2: u128 = 0;
+                for j in 0..half {
+                    let a0 = a[j];
+                    let a1 = a[j + half];
+                    let b0 = b[j];
+                    let b1 = b[j + half];
+                    let a_s = a0 ^ clmul_gcm(two_flat, a1 ^ a0);
+                    let b_s = b0 ^ clmul_gcm(two_flat, b1 ^ b0);
+                    s0 ^= clmul_gcm(a0, b0);
+                    s1 ^= clmul_gcm(a1, b1);
+                    s2 ^= clmul_gcm(a_s, b_s);
+                }
+                (s0, s1, s2)
             })
             .reduce(
-                || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+                || (0u128, 0u128, 0u128),
+                |x, y| (x.0 ^ y.0, x.1 ^ y.1, x.2 ^ y.2),
             );
+        let p0 = Block128::from(flat_to_tower_u128(p0_flat));
+        let p1 = Block128::from(flat_to_tower_u128(p1_flat));
+        let p2 = Block128::from(flat_to_tower_u128(p2_flat));
         debug_assert_eq!(p0 + p1, claim, "multipoint sumcheck consistency failure");
 
         let rp = vec![p0, p1, p2];
         channel.observe_field_elems(&rp);
         let r = channel.get_random_point();
+        let r_flat = tower_to_flat_u128(r.0);
 
-        pairs.par_iter_mut().for_each(|(a, b)| {
+        // Fold in flat: lo = lo ^ clmul(r_flat, hi ^ lo).
+        pairs_flat.par_iter_mut().for_each(|(a, b)| {
+            let half = a.len() / 2;
             let (lo_a, hi_a) = a.split_at_mut(half);
-            lo_a.par_iter_mut()
-                .zip(hi_a.par_iter())
-                .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+            for i in 0..half {
+                lo_a[i] ^= clmul_gcm(r_flat, hi_a[i] ^ lo_a[i]);
+            }
             a.truncate(half);
             let (lo_b, hi_b) = b.split_at_mut(half);
-            lo_b.par_iter_mut()
-                .zip(hi_b.par_iter())
-                .for_each(|(lo, hi)| *lo = *lo + r * (*hi + *lo));
+            for i in 0..half {
+                lo_b[i] ^= clmul_gcm(r_flat, hi_b[i] ^ lo_b[i]);
+            }
             b.truncate(half);
         });
 
@@ -189,8 +233,10 @@ mod tests {
         let target = e0 + beta * e1;
 
         let scaled_col1: Vec<Block128> = col1.iter().map(|v| *v * beta).collect();
-        let pairs = vec![(eq_a.clone(), col0.clone()), (eq_b.clone(), scaled_col1)];
-        let (rounds, challenges) = prove_multipoint_sumcheck(pairs, target, &mut pch);
+        let pairs_a = vec![eq_a.clone(), eq_b.clone()];
+        let pairs_b: Vec<&[Block128]> = vec![col0.as_slice(), scaled_col1.as_slice()];
+        let (rounds, challenges) =
+            prove_multipoint_sumcheck(pairs_a, pairs_b, target, &mut pch);
 
         let mut vch = Channel::new();
         let beta_v = vch.get_random_point();
@@ -219,8 +265,9 @@ mod tests {
 
         let mut pch = Channel::new();
         let _ = pch.get_random_point();
-        let pairs = vec![(eq_r, col)];
-        let (rounds, _) = prove_multipoint_sumcheck(pairs, e, &mut pch);
+        let pairs_a = vec![eq_r];
+        let pairs_b: Vec<&[Block128]> = vec![col.as_slice()];
+        let (rounds, _) = prove_multipoint_sumcheck(pairs_a, pairs_b, e, &mut pch);
 
         let mut vch = Channel::new();
         let _ = vch.get_random_point();
