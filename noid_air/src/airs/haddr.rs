@@ -243,6 +243,21 @@ fn pad_constant(lane: usize) -> Block128 {
     }
 }
 
+/// Emit the permutation / boundary-carry gates of `HAddrAir` **without**
+/// the output-squeeze pin (tie 4).
+///
+/// Used by Stage 5 composite embeddings where the squeezed address is
+/// not a public input but a private witness cell that gets tied to
+/// another sub-AIR's column via a cross-row-equality bridge (T1).
+/// The interior Poseidon2b perm gates deterministically bind
+/// `s_B[0..2]@HADDR_OUTPUT_ROW` to the secret lanes at row 0 through
+/// the full sponge trace, so removing the PI pin leaves the address
+/// constrained to the unique sponge output — just not published.
+pub fn emit_haddr_no_output_pin(
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    emit_haddr_common()
+}
+
 /// Build the full `HAddrAir` constraint list and public-column set.
 ///
 /// `expected_addr = [addr_hi, addr_lo]` is the publicly-declared address
@@ -252,6 +267,26 @@ fn pad_constant(lane: usize) -> Block128 {
 pub fn emit_haddr(
     expected_addr: [Block128; 2],
 ) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    let (mut constraints, public_columns) = emit_haddr_common();
+
+    // Tie 4 — output squeeze at HADDR_OUTPUT_ROW. Pin s_B[0..2] to the
+    // declared address. Indicator already declared by the common body,
+    // so bypass `emit_public_cell` and wire SelectorGate directly.
+    for (lane, expected) in expected_addr.iter().enumerate() {
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
+            vec![(HADDR_LAYOUT_B.s + lane, Block128::ONE)],
+            *expected,
+        ));
+        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_OUTPUT, inner)));
+    }
+
+    (constraints, public_columns)
+}
+
+/// Internal: perm + carry + MDS gates shared between the PI-pinned and
+/// bridge-tied variants. Emits ties 1, 3a, 3b, 3c but **not** tie 4
+/// (output squeeze).
+fn emit_haddr_common() -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
     let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
     let mut public_columns: Vec<PublicColumn> = Vec::new();
 
@@ -329,17 +364,6 @@ pub fn emit_haddr(
         )));
     }
 
-    // Tie 4 — output squeeze at HADDR_OUTPUT_ROW. Pin s_B[0..2] to the
-    // declared address. Indicator already declared above, so bypass
-    // `emit_public_cell` and wire SelectorGate directly.
-    for (lane, expected) in expected_addr.iter().enumerate() {
-        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
-            vec![(HADDR_LAYOUT_B.s + lane, Block128::ONE)],
-            *expected,
-        ));
-        constraints.push(Box::new(SelectorGate::new(HADDR_IND_ROW_OUTPUT, inner)));
-    }
-
     (constraints, public_columns)
 }
 
@@ -366,8 +390,27 @@ impl HAddrAir {
         }
     }
 
+    /// Construct an `HAddrAir` **without** the output-squeeze PI pin.
+    /// Intended for Stage 5 composite embeddings where the squeezed
+    /// `(addr_hi, addr_lo)` is tied to a neighbouring sub-AIR's owner
+    /// lanes via a cross-row-equality bridge rather than pinned as a
+    /// public input.
+    pub fn new_no_output_pin() -> Self {
+        let (constraints, public_columns) = emit_haddr_no_output_pin();
+        Self {
+            constraints,
+            public_columns,
+        }
+    }
+
     pub fn build_trace(&self, secret: [Block128; 2]) -> Trace {
         Trace::new(build_haddr_trace(secret))
+    }
+
+    /// Destructure into wiring parts for Stage 5 composite embedding.
+    /// Returns `(inner_n_cols, constraints, public_columns)`.
+    pub fn into_parts(self) -> (usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (HADDR_N_COLS, self.constraints, self.public_columns)
     }
 }
 
@@ -592,6 +635,39 @@ mod tests {
         let mut cols = build_haddr_trace(secret);
         cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW] = Block128::ZERO;
         cols[HADDR_IND_ROW_OUTPUT][HADDR_OUTPUT_ROW - 1] = Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_no_output_pin_accepts_honest_trace() {
+        let secret = mk_secret(0xF00D);
+        let air = HAddrAir::new_no_output_pin();
+        let trace = air.build_trace(secret);
+        assert!(air.check(&trace));
+    }
+
+    #[test]
+    fn haddr_no_output_pin_still_rejects_interior_tamper() {
+        // Removing the output squeeze pin must not weaken the interior
+        // perm gates: a single `s` cell flip inside block A still rejects.
+        let secret = mk_secret(0xBA5E);
+        let air = HAddrAir::new_no_output_pin();
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_A.sout + 2][1] = cols[HADDR_LAYOUT_A.sout + 2][1] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn haddr_no_output_pin_rejects_output_cell_tamper() {
+        // The cell is no longer publicly pinned, but the sponge still
+        // deterministically derives it from `secret` through the last
+        // active round's shifted-next read inside the block-B perm
+        // gates, so flipping it still rejects.
+        let secret = mk_secret(0xC0DE);
+        let air = HAddrAir::new_no_output_pin();
+        let mut cols = build_haddr_trace(secret);
+        cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] =
+            cols[HADDR_LAYOUT_B.s][HADDR_OUTPUT_ROW] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 

@@ -1375,6 +1375,14 @@ impl FriStateOpenAir {
         }
     }
 
+    /// Destructure the AIR into its wiring parts, consuming `self`.
+    /// Used by the Stage 5 `TxValidityComposite` skeleton (Stage 5.3)
+    /// to embed this AIR into a larger outer trace without re-running
+    /// the construction-time setup.
+    pub fn into_parts(self) -> (usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (self.n_cols, self.constraints, self.public_columns)
+    }
+
     /// Build a valid trace for this AIR from a matching witness.
     pub fn build_trace(&self, witness: &FriStateOpenWitness) -> Vec<Vec<Block128>> {
         let mut cols = witness.build_columns(self.n_cols);

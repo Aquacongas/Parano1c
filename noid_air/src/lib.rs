@@ -31,6 +31,7 @@ use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
 
 pub mod airs;
+pub mod composition;
 pub mod gates;
 
 pub use airs::{
@@ -294,6 +295,21 @@ pub trait Air {
     fn log_rows(&self) -> usize;
     fn constraints(&self) -> &[Box<dyn Constraint>];
 
+    /// Whether the AIR has a constraint whose cyclic `next(last_row) =
+    /// first_row` wrap is load-bearing (a carry/accumulator chain that
+    /// must close at row 0, not a dead padding row). Default `false`:
+    /// every shipped AIR either uses no `shifted_columns` at all, or
+    /// gates cross-instance wraps behind an `is_reset` selector. New
+    /// AIRs whose last-row wrap is semantically required must override
+    /// this to `true`. The Stage 5 `RowWindowWrapper` asserts policy
+    /// compatibility against this flag: an AIR with
+    /// `REQUIRES_TRUE_CYCLIC_WRAP = true` cannot be embedded under the
+    /// default `MaskOff` policy and forces the caller to wire a
+    /// `TerminatorPin` instead.
+    fn requires_true_cyclic_wrap(&self) -> bool {
+        false
+    }
+
     /// Trace columns pinned to a publicly-known, verifier-side value
     /// sequence (Stage 3d-0.1). Default empty: AIRs without pinned
     /// columns keep legacy behaviour. Each declared column must be in
@@ -542,6 +558,17 @@ impl CompositeAir {
             constraints,
             public_columns,
         }
+    }
+
+    /// Consume the composite and return its `(log_rows, n_cols,
+    /// constraints, public_columns)`. Used by Stage 5.7 PR B.3 to
+    /// embed an already-built composite (e.g. `TxValidityCompositeLeaf`)
+    /// inside a larger outer composite without re-instantiating the
+    /// underlying sub-AIRs.
+    pub fn into_parts(
+        self,
+    ) -> (usize, usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (self.log_rows, self.n_cols, self.constraints, self.public_columns)
     }
 }
 

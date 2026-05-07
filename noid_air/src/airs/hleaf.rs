@@ -179,11 +179,12 @@ pub fn extract_hleaf_output(cols: &[Vec<Block128>]) -> [Block128; 2] {
 // Constraint / public-column emission
 // ---------------------------------------------------------------------------
 
-/// Build the full constraint list and public-column set. Both
-/// `fields` and `expected_leaf` are public.
-pub fn emit_hleaf(
+/// Build everything except the output-squeeze pin. Used by both
+/// [`emit_hleaf`] (which adds the pin) and [`emit_hleaf_no_output_pin`]
+/// (which keeps the squeezed cell as a free witness for Stage 5.6
+/// composite embeddings to tie via a cross-row equality bridge).
+fn emit_hleaf_common(
     fields: [Block128; 4],
-    expected_leaf: [Block128; 2],
 ) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
     let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
     let mut public_columns: Vec<PublicColumn> = Vec::new();
@@ -290,6 +291,17 @@ pub fn emit_hleaf(
         constraints.push(Box::new(SelectorGate::new(HLEAF_IND_ROW_2N_PLUS_1, inner)));
     }
 
+    (constraints, public_columns)
+}
+
+/// Build the full constraint list and public-column set. Both
+/// `fields` and `expected_leaf` are public.
+pub fn emit_hleaf(
+    fields: [Block128; 4],
+    expected_leaf: [Block128; 2],
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    let (mut constraints, public_columns) = emit_hleaf_common(fields);
+
     // Tie output squeeze: s_C[0..2]@HLEAF_OUTPUT_ROW == expected_leaf.
     for (lane, expected) in expected_leaf.iter().enumerate() {
         let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
@@ -300,6 +312,17 @@ pub fn emit_hleaf(
     }
 
     (constraints, public_columns)
+}
+
+/// Emit the `HLeafAir` constraints / public columns **without** the
+/// output-squeeze pin. Used by Stage 5.6 composite embeddings where the
+/// squeezed `(leaf_hi, leaf_lo)` is tied to a per-output destination
+/// cell pair via a T3 cross-row equality bridge instead of a public
+/// input.
+pub fn emit_hleaf_no_output_pin(
+    fields: [Block128; 4],
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    emit_hleaf_common(fields)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +341,24 @@ impl HLeafAir {
             constraints,
             public_columns,
         }
+    }
+
+    /// Construct an `HLeafAir` **without** the output-squeeze PI pin.
+    /// Intended for Stage 5.6 composite embeddings where the squeezed
+    /// `(leaf_hi, leaf_lo)` is tied to a per-output destination cell
+    /// pair via a T3 cross-row equality bridge.
+    pub fn new_no_output_pin(fields: [Block128; 4]) -> Self {
+        let (constraints, public_columns) = emit_hleaf_no_output_pin(fields);
+        Self {
+            constraints,
+            public_columns,
+        }
+    }
+
+    /// Destructure into wiring parts for Stage 5 composite embedding.
+    /// Returns `(inner_n_cols, constraints, public_columns)`.
+    pub fn into_parts(self) -> (usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (HLEAF_N_COLS, self.constraints, self.public_columns)
     }
 
     pub fn build_trace(&self, fields: [Block128; 4]) -> Trace {

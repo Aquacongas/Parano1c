@@ -188,11 +188,12 @@ pub fn extract_hauth_output(cols: &[Vec<Block128>]) -> [Block128; 2] {
 // Constraint / public-column emission
 // ---------------------------------------------------------------------------
 
-/// Build the full constraint list and public-column set. `tx_body` and
-/// `expected_tag` are public; the secret stays in the witness.
-pub fn emit_hauth(
+/// Build everything except the output-squeeze pin. Used by both
+/// [`emit_hauth`] (which adds the pin) and [`emit_hauth_no_output_pin`]
+/// (which keeps the squeezed cell as a free witness for Stage 5
+/// composite embeddings to tie via a cross-row bridge).
+fn emit_hauth_common(
     tx_body: [Block128; 2],
-    expected_tag: [Block128; 2],
 ) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
     let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
     let mut public_columns: Vec<PublicColumn> = Vec::new();
@@ -298,6 +299,18 @@ pub fn emit_hauth(
         constraints.push(Box::new(SelectorGate::new(HAUTH_IND_ROW_2N_PLUS_1, inner)));
     }
 
+    (constraints, public_columns)
+}
+
+/// Build the full constraint list and public-column set. `tx_body` and
+/// `expected_tag` are public; the secret stays in the witness. Stage 3d
+/// standalone variant.
+pub fn emit_hauth(
+    tx_body: [Block128; 2],
+    expected_tag: [Block128; 2],
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    let (mut constraints, public_columns) = emit_hauth_common(tx_body);
+
     // Tie output squeeze: s_C[0..2]@HAUTH_OUTPUT_ROW == expected_tag.
     for (lane, expected) in expected_tag.iter().enumerate() {
         let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
@@ -308,6 +321,23 @@ pub fn emit_hauth(
     }
 
     (constraints, public_columns)
+}
+
+/// Emit the `HAuthAir` constraints / public columns **without** the
+/// output-squeeze pin. Used by Stage 5.5 composite embeddings where
+/// `(tag_hi, tag_lo)` is tied to the TxValidity `AuthTag` lane cells
+/// via a cross-row equality bridge (T2a) instead of a public input.
+///
+/// The `tx_body` argument is still the public tx-body-hash: the absorb
+/// XOR at row `N_ROUNDS` pins the pre-MDS B seed to
+/// `A.s + [tx_body_hi, tx_body_lo, 0, 0]`, which is the soundness hook
+/// for the T2b bridge landing on `pre_s_B[0..2]@N_ROUNDS`. For 5.5 we
+/// still accept `tx_body` as a value here; Stage 5.7 will lift this pin
+/// to a composite-level tie against the Merkle wrap output.
+pub fn emit_hauth_no_output_pin(
+    tx_body: [Block128; 2],
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    emit_hauth_common(tx_body)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +356,24 @@ impl HAuthAir {
             constraints,
             public_columns,
         }
+    }
+
+    /// Construct an `HAuthAir` **without** the output-squeeze PI pin.
+    /// Intended for Stage 5.5 composite embeddings where the squeezed
+    /// `(tag_hi, tag_lo)` is tied to the TxValidity `AuthTag` lane
+    /// cells via a T2a cross-row equality bridge.
+    pub fn new_no_output_pin(tx_body: [Block128; 2]) -> Self {
+        let (constraints, public_columns) = emit_hauth_no_output_pin(tx_body);
+        Self {
+            constraints,
+            public_columns,
+        }
+    }
+
+    /// Destructure into wiring parts for Stage 5 composite embedding.
+    /// Returns `(inner_n_cols, constraints, public_columns)`.
+    pub fn into_parts(self) -> (usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (HAUTH_N_COLS, self.constraints, self.public_columns)
     }
 
     pub fn build_trace(

@@ -391,6 +391,31 @@ impl TxBodySpineComposite {
         &self.boundary_pins
     }
 
+    /// Consume the composite and surrender its constraints, public
+    /// columns, total column count, and boundary pins. Used by the
+    /// Stage 5.7 `TxValidityCompositeWithSpine` to embed the spine as
+    /// a column-block inside a wider outer composite — the outer
+    /// shifts each constraint and public column by the spine block's
+    /// outer offset and rebuilds its own [`crate::CompositeAir`].
+    /// `boundary_pins` are returned so the embedder can rebuild the
+    /// trace via [`Self::build_trace`] without having to keep the
+    /// composite alive.
+    pub fn into_parts(
+        self,
+    ) -> (
+        usize,
+        Vec<Box<dyn Constraint>>,
+        Vec<PublicColumn>,
+        TxBodyMerkleBoundaryPins,
+    ) {
+        (
+            self.n_cols,
+            self.constraints,
+            self.public_columns,
+            self.boundary_pins,
+        )
+    }
+
     /// Stitch a composite trace from the caller-supplied TxValidity
     /// witness triple (body + balance view) and the TxBodyMerkle input
     /// chain. No cross-AIR consistency pinning happens here — that is
@@ -760,6 +785,72 @@ mod tests {
         };
 
         (body, pins, merkle_inputs)
+    }
+
+    /// Stage 5.7 invariant guard: `AuthTagHi` / `AuthTagLo` (composite
+    /// cols 8 / 9) must remain witness-only on the spine side. They
+    /// participate in cross-AIR equality (HAuth → spine T2a bridge)
+    /// but must never be declared as a `PublicColumn` — doing so would
+    /// re-introduce the "third source of truth" the audit § 1 warns
+    /// about (PI vs Merkle vs bridge).
+    #[test]
+    fn stage_5_7_invariant_auth_tag_columns_are_not_pi_pinned() {
+        let (pins, _inputs) = build_honest_pins_and_inputs();
+        let spine = TxBodySpineComposite::new(pins);
+
+        let auth_hi = TXV_COL_OFFSET + TxValidityCol::AuthTagHi.index();
+        let auth_lo = TXV_COL_OFFSET + TxValidityCol::AuthTagLo.index();
+        assert_eq!(auth_hi, 8, "AuthTagHi composite col drifted from 8");
+        assert_eq!(auth_lo, 9, "AuthTagLo composite col drifted from 9");
+
+        for pc in spine.public_columns() {
+            assert_ne!(
+                pc.col, auth_hi,
+                "AuthTagHi (col 8) is PI-pinned — Stage 5.7 invariant broken"
+            );
+            assert_ne!(
+                pc.col, auth_lo,
+                "AuthTagLo (col 9) is PI-pinned — Stage 5.7 invariant broken"
+            );
+        }
+    }
+
+    /// Stage 5.7 invariant guard: `tx_body_hash` must remain
+    /// single-origin on the Merkle side (wrap-perm output) inside the
+    /// spine. The TxValidity block must not redundantly pin
+    /// `tx_body_hash` to any of its witness columns — Stage 5 wiring
+    /// reaches `tx_body_hash` only through the HAuth pre-S_B B-seed
+    /// equality bridge, never through a parallel PublicColumn.
+    #[test]
+    fn stage_5_7_invariant_tx_body_hash_single_origin() {
+        let (pins, _inputs) = build_honest_pins_and_inputs();
+        let spine = TxBodySpineComposite::new(pins);
+        let merkle_n_cols = *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS;
+        let merkle_lo = TX_BODY_MERKLE_COL_OFFSET;
+        let merkle_hi = TX_BODY_MERKLE_COL_OFFSET + merkle_n_cols;
+
+        let canonical_hi = pins.tx_body_hash[0];
+        let canonical_lo = pins.tx_body_hash[1];
+        for pc in spine.public_columns() {
+            if pc.col >= merkle_lo && pc.col < merkle_hi {
+                continue; // Merkle block — canonical origin
+            }
+            for v in &pc.values {
+                if *v == Block128::ZERO {
+                    continue; // ZERO collisions allowed on all-zero fixtures
+                }
+                assert_ne!(
+                    *v, canonical_hi,
+                    "tx_body_hash[0] leaked into non-Merkle PublicColumn at col {}",
+                    pc.col
+                );
+                assert_ne!(
+                    *v, canonical_lo,
+                    "tx_body_hash[1] leaked into non-Merkle PublicColumn at col {}",
+                    pc.col
+                );
+            }
+        }
     }
 
     #[test]

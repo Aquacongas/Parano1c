@@ -228,6 +228,14 @@ impl FriStateCombinerComposite {
     pub fn new_preimage(&self) -> &FriStateCombinerPreimage {
         &self.new_preimage
     }
+
+    /// Destructure the composite into its wiring parts, consuming
+    /// `self`. Used by the Stage 5 `TxValidityComposite` skeleton
+    /// (Stage 5.3) to embed this composite into a larger outer trace
+    /// without re-running the construction-time soundness setup.
+    pub fn into_parts(self) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+        (self.constraints, self.public_columns)
+    }
 }
 
 impl Air for FriStateCombinerComposite {
