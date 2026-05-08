@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 5.5 — [`TxValidityCompositeHAuth`].
+//! [`TxValidityCompositeHAuth`].
 //!
-//! Extends the 5.4 [`super::tx_validity_full::TxValidityCompositeFull`]
+//! Extends [`super::tx_validity_full::TxValidityCompositeFull`]
 //! with `FRI_STATE_OPEN_N_INPUTS` `HAuthAir` instances, one per tx
 //! input. Each HAuth block is embedded via [`super::hauth_block`] and
 //! wired through two bridge families:
@@ -14,38 +14,38 @@
 //!   declared auth tag. The destinations are pinned as `PublicColumn`
 //!   programmes, so the overall contract is
 //!   `HAuth.squeeze[i] == declared_auth_tag[i]` with the bridge
-//!   mediating the cross-row equality. Stage 5.7 re-points the
-//!   destination at `TxValidityCol::AuthTagHi/Lo @ row i` inside the
-//!   embedded `TxBodySpineComposite`; the bridge contract is unchanged.
+//!   mediating the cross-row equality. In the spine-embedded composite
+//!   the destination is re-pointed at
+//!   `TxValidityCol::AuthTagHi/Lo @ row i` inside
+//!   `TxBodySpineComposite`; the bridge contract is unchanged.
 //!
 //! - **T2b** — per-input pre-MDS B-seed anchor. The pair
 //!   `(pre_s_B[0], pre_s_B[1])@N_ROUNDS` of each HAuth block is bridged
 //!   to a pair of outer destination cells reserved per input. These
-//!   cells are unpinned at Stage 5.5 (the tx-body-hash consistency
-//!   across inputs is already enforced inside each block because the
-//!   B-carry gate bakes `tx_body_hash` into the `ABSORB_B` coefficients
-//!   at AIR construction time, and every block receives the same
-//!   `tx_body_hash`). The per-input T2b dst cells exist to stage the
-//!   wiring for Stage 5.7, which re-points them at `TxBodyMerkleAir`'s
-//!   wrap-output columns inside the embedded `TxBodySpineComposite` —
-//!   closing the absorb operand against the verifier-visible Merkle
-//!   root without changing the bridge contract.
+//!   cells are unpinned here (the tx-body-hash consistency across
+//!   inputs is already enforced inside each block because the B-carry
+//!   gate bakes `tx_body_hash` into the `ABSORB_B` coefficients at AIR
+//!   construction time, and every block receives the same
+//!   `tx_body_hash`). In the spine-embedded composite they are
+//!   re-pointed at `TxBodyMerkleAir`'s wrap-output columns, closing
+//!   the absorb operand against the verifier-visible Merkle root
+//!   without changing the bridge contract.
 //!
 //! # Note on shared vs per-input T2b
 //!
 //! Sharing one pair of T2b destination cells across all `N_INPUTS`
-//! blocks is not viable at this stage: `pre_s_B[lane] = A.s[lane] +
+//! blocks is not viable here: `pre_s_B[lane] = A.s[lane] +
 //! tx_body[lane]`, and `A.s` depends on the per-input secret, so the
 //! bridged source values differ per block. A shared destination is
 //! only consistent once T2b is re-pointed at a cell carrying
-//! `tx_body_hash` directly (Stage 5.7 Merkle wrap-output).
+//! `tx_body_hash` directly (Merkle wrap-output in the spine composite).
 //!
-//! # Layout (on top of 5.4)
+//! # Layout
 //!
-//! All new columns append to the right of the 5.4 composite:
+//! All new columns append to the right of the full composite:
 //!
 //! ```text
-//!   [0, TX_VALIDITY_FULL_N_COLS)         — inherited from 5.4
+//!   [0, TX_VALIDITY_FULL_N_COLS)         — inherited
 //!   [FULL_HAUTH_BLOCKS_BASE, +4·HAUTH_BLOCK_OUTER_COLS)  — HAuth blocks
 //!   [AUTH_TAG_DSTS…]                                     — per-input T2a dsts
 //!   [PRE_S_B_DSTS…]                                      — per-input T2b dsts
@@ -55,9 +55,8 @@
 //! 3 indicators); the block width is
 //! `HAUTH_N_COLS + 1 (window) + 4·4 (bridges) = HAUTH_N_COLS + 17`.
 //!
-//! Outer log-rows inherits from 5.4 (512 rows). HAuth's 256-row
-//! footprint fits. log_rows stays 9 — Stage 5.7 lifts it to 13 once
-//! `TxBodySpineComposite` joins.
+//! Outer log-rows stays at 9 here; the spine-embedded composite lifts
+//! it to 13.
 
 use crate::airs::fri_state_combiner::FRI_STATE_COMBINER_LOG_ROWS;
 use crate::airs::fri_state_combiner_composite::{
@@ -96,7 +95,7 @@ use noid_core::{Block128, TowerField};
 // Layout
 // ---------------------------------------------------------------------------
 
-/// Outer log-rows: inherited from 5.4.
+/// Outer log-rows: inherited from the full composite.
 pub const TX_VALIDITY_HAUTH_LOG_ROWS: usize = TX_VALIDITY_FULL_LOG_ROWS;
 
 /// Compile-time height sanity.
@@ -111,8 +110,8 @@ const _: () = {
 /// 4 lane bridges × 4 cols each.
 pub const HAUTH_BLOCK_OUTER_COLS: usize = HAUTH_N_COLS + 1 + 16;
 
-/// Outer col offset of the first HAuth block (right after the 5.4
-/// column band).
+/// Outer col offset of the first HAuth block (right after the
+/// inherited column band).
 pub const FULL_HAUTH_BLOCKS_BASE: usize = TX_VALIDITY_FULL_N_COLS;
 
 /// Per-input T2a destination column base. Each input reserves two
@@ -123,10 +122,10 @@ pub const AUTH_TAG_DST_BASE: usize =
     FULL_HAUTH_BLOCKS_BASE + FRI_STATE_OPEN_N_INPUTS * HAUTH_BLOCK_OUTER_COLS;
 
 /// Per-input T2b destination column base. Each input reserves two
-/// columns (pre_s_B_hi, pre_s_B_lo). At 5.5 these cells are unpinned
+/// columns (pre_s_B_hi, pre_s_B_lo). These cells are unpinned here
 /// — they just receive the honest `pre_s_B[lane]@N_ROUNDS` value and
-/// are bridged to the corresponding HAuth block. Stage 5.7 re-points
-/// them at `TxBodyMerkleAir`'s wrap-output columns.
+/// are bridged to the corresponding HAuth block. The spine composite
+/// re-points them at `TxBodyMerkleAir`'s wrap-output columns.
 pub const PRE_S_B_DST_BASE: usize = AUTH_TAG_DST_BASE + 2 * FRI_STATE_OPEN_N_INPUTS;
 
 /// Total outer column count.
@@ -285,7 +284,7 @@ fn haddr_block_params_for(input: usize, outer_n_cols: usize) -> HAddrBlockParams
 }
 
 // ---------------------------------------------------------------------------
-// Column-shift adapter (local copy; same pattern as 5.3/5.4)
+// Column-shift adapter (local copy; shared pattern across composites)
 // ---------------------------------------------------------------------------
 
 struct ShiftedColumnsConstraint {
@@ -338,7 +337,7 @@ fn shift_public_column(pc: PublicColumn, offset: usize) -> PublicColumn {
 // Composite
 // ---------------------------------------------------------------------------
 
-/// Stage 5.5 composite: combiner + FriStateOpen + N_INPUTS × HAddr
+/// HAuth composite: combiner + FriStateOpen + N_INPUTS × HAddr
 /// (T1) + N_INPUTS × HAuth (T2a per-input + T2b shared).
 pub struct TxValidityCompositeHAuth {
     pub air: CompositeAir,
@@ -408,6 +407,27 @@ impl TxValidityCompositeHAuth {
         constraints.extend(open_wiring.constraints);
         public_columns.extend(open_wiring.public_columns);
 
+        // Block B.out (E.2.b) — output-side FriStateOpenAir (all-EMPTY).
+        let (out_open_air, _) =
+            crate::composition::tx_validity_composite::build_empty_output_side();
+        let (out_open_wiring, _) =
+            crate::composition::tx_validity_composite::emit_output_open_wiring(
+                out_open_air,
+                outer_n_cols,
+                outer_log_rows,
+            );
+        constraints.extend(out_open_wiring.constraints);
+        public_columns.extend(out_open_wiring.public_columns);
+
+        // E.2.b.comp-4: slot-index bridge pins (all-zero programmes
+        // for the all-EMPTY output source used here).
+        public_columns.extend(
+            crate::composition::tx_validity_composite::emit_out_open_slot_index_publics(
+                &crate::composition::tx_validity_composite::OutputSideSource::Empty,
+                1usize << outer_log_rows,
+            ),
+        );
+
         // Block C — HAddr × N_INPUTS + T1 bridges.
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
             let params = haddr_block_params_for(input, outer_n_cols);
@@ -425,7 +445,7 @@ impl TxValidityCompositeHAuth {
         }
 
         // Pin per-input T2a destinations to declared auth tags.
-        // (T2b destinations are unpinned at 5.5 — see module doc.)
+        // (T2b destinations are unpinned here — see module doc.)
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
             let (hi_col, lo_col) = auth_tag_dst_cols(input);
             public_columns.push(PublicColumn::new(
@@ -481,6 +501,9 @@ impl TxValidityCompositeHAuth {
                 dst[r] = v;
             }
         }
+
+        // E.2.b: output-side open columns (all-EMPTY honest witness).
+        crate::composition::tx_validity_composite::write_empty_output_open_trace(&mut cols);
 
         // HAddr blocks.
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
@@ -572,7 +595,7 @@ pub fn native_auth_tag(
     extract_hauth_output(&build_hauth_trace(secret, tx_body_hash))
 }
 
-/// Native address computation — mirrors 5.4 test helper.
+/// Native address computation — test helper.
 pub fn native_address(secret: [Block128; 2]) -> [Block128; 2] {
     use crate::airs::haddr::{build_haddr_trace, extract_haddr_output};
     extract_haddr_output(&build_haddr_trace(secret))
@@ -829,8 +852,8 @@ mod tests {
 
     #[test]
     fn per_input_t2b_dsts_are_disjoint() {
-        // Sanity: at 5.5 each block's T2b dst is its own pair (per
-        // module doc). Sharing is deferred to 5.7.
+        // Sanity: each block's T2b dst is its own pair (per module
+        // doc). Sharing only becomes consistent in the spine composite.
         use std::collections::HashSet;
         let mut seen: HashSet<(usize, usize)> = HashSet::new();
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
@@ -842,7 +865,7 @@ mod tests {
 
     #[test]
     fn t1_still_active_owner_tamper_rejects() {
-        // Stage 5.4 T1 ties must still fire in the 5.5 composite.
+        // T1 ties must still fire.
         let comp = build();
         let mut cols = comp.build_trace().columns;
         cols[SKEL_OPEN_COL_OFFSET + COL_OWNER_HI][0] =

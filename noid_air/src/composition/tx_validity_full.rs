@@ -243,6 +243,28 @@ impl TxValidityCompositeFull {
         constraints.extend(open_wiring.constraints);
         public_columns.extend(open_wiring.public_columns);
 
+        // Block B.out (E.2.b) — output-side FriStateOpenAir. All-EMPTY
+        // witness today; downstream substages swap to a TxBody.outputs
+        // witness + slot-index bridge.
+        let (out_open_air, _) =
+            crate::composition::tx_validity_composite::build_empty_output_side();
+        let (out_open_wiring, _) =
+            crate::composition::tx_validity_composite::emit_output_open_wiring(
+                out_open_air,
+                outer_n_cols,
+                outer_log_rows,
+            );
+        constraints.extend(out_open_wiring.constraints);
+        public_columns.extend(out_open_wiring.public_columns);
+
+        // E.2.b.comp-4: slot-index bridge pins (all-zero for EMPTY).
+        public_columns.extend(
+            crate::composition::tx_validity_composite::emit_out_open_slot_index_publics(
+                &crate::composition::tx_validity_composite::OutputSideSource::Empty,
+                1usize << outer_log_rows,
+            ),
+        );
+
         // Block C — FRI_STATE_OPEN_N_INPUTS × HAddr, each tied via T1 to
         // the corresponding FriStateOpen owner lane row.
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
@@ -293,6 +315,9 @@ impl TxValidityCompositeFull {
                 dst[r] = v;
             }
         }
+
+        // E.2.b: output-side open columns (all-EMPTY honest witness).
+        crate::composition::tx_validity_composite::write_empty_output_open_trace(&mut cols);
 
         // HAddr blocks + T1 bridges. Write each block's sub-trace; the
         // helper plants the owner-lane destination cell (= native HAddr

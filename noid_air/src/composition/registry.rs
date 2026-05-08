@@ -24,7 +24,6 @@ use crate::airs::{
     fri_state_combiner::COMBINER_PERM_LAYOUT,
     haddr::{HADDR_LAYOUT_B, HADDR_OUTPUT_ROW},
     hauth::{HAUTH_LAYOUT_C, HAUTH_OUTPUT_ROW, HAUTH_PRE_S_B_BASE},
-    hleaf::{HLEAF_LAYOUT_C, HLEAF_OUTPUT_ROW},
     tx_body_merkle::{build_instance_layout, leaf_rate_payload_col, InstanceRole},
     tx_validity::TxValidityCol,
 };
@@ -106,31 +105,6 @@ impl Default for HAuthCols {
     }
 }
 
-/// `HLeafAir` — Poseidon sponge over the `(value, owner_hi, owner_lo)`
-/// output-leaf payload.
-///
-/// Stage 5 T3 destination: the squeeze lanes at `HLEAF_OUTPUT_ROW`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HLeafCols {
-    pub output_hi: Cell,
-    pub output_lo: Cell,
-}
-
-impl HLeafCols {
-    pub const fn new() -> Self {
-        Self {
-            output_hi: Cell::new(HLEAF_LAYOUT_C.s, HLEAF_OUTPUT_ROW),
-            output_lo: Cell::new(HLEAF_LAYOUT_C.s + 1, HLEAF_OUTPUT_ROW),
-        }
-    }
-}
-
-impl Default for HLeafCols {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// `TxValidityAir` (3a / 3b-4) — per-input AuthTag destinations for
 /// Stage 5 T2a. Input `i` lives on row `i` of the witness region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +170,7 @@ impl Default for TxValidityCols {
 ///
 /// Layout note: under E.4.c-1 collapse, `leaf_rate_payload_col(slot, lane)`
 /// does **not** depend on `slot` — all 16 leaf payloads share a single
-/// column per lane and are distinguished by *row*. The Stage 5.7
+/// column per lane and are distinguished by *row*. The
 /// silent-misalignment risk lives entirely in the row mapping
 /// `output_index j → slot_base_row`. This registry encodes both:
 ///
@@ -428,7 +402,6 @@ mod tests {
     use super::*;
     use crate::airs::haddr::{HADDR_LAYOUT_B, HADDR_OUTPUT_ROW};
     use crate::airs::hauth::{HAUTH_LAYOUT_C, HAUTH_OUTPUT_ROW, HAUTH_PRE_S_B_BASE};
-    use crate::airs::hleaf::{HLEAF_LAYOUT_C, HLEAF_OUTPUT_ROW};
 
     #[test]
     fn haddr_registry_matches_consts() {
@@ -444,13 +417,6 @@ mod tests {
         assert_eq!(r.auth_tag_lo, Cell::new(HAUTH_LAYOUT_C.s + 1, HAUTH_OUTPUT_ROW));
         assert_eq!(r.tx_body_hash_hi, Cell::new(HAUTH_PRE_S_B_BASE, N_ROUNDS));
         assert_eq!(r.tx_body_hash_lo, Cell::new(HAUTH_PRE_S_B_BASE + 1, N_ROUNDS));
-    }
-
-    #[test]
-    fn hleaf_registry_matches_consts() {
-        let r = HLeafCols::new();
-        assert_eq!(r.output_hi, Cell::new(HLEAF_LAYOUT_C.s, HLEAF_OUTPUT_ROW));
-        assert_eq!(r.output_lo, Cell::new(HLEAF_LAYOUT_C.s + 1, HLEAF_OUTPUT_ROW));
     }
 
     #[test]

@@ -98,6 +98,7 @@ pub fn apply_block(
             tx.body.fee,
             &tx.body.inputs,
             &tx.body.outputs,
+            tx.body.is_coinbase,
         );
         if tx.tx_body_hash != expected_hash {
             return Err(BlockApplyError::WrongTxBodyHash);
@@ -246,6 +247,7 @@ mod tests {
 
     fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
+            slot_index: seed as u32,
             value: (seed as u64) * 100,
             owner: Address([seed; 32]),
             valid: true,
@@ -275,10 +277,17 @@ mod tests {
             fee: 0,
             inputs,
             outputs,
+            is_coinbase: false,
         };
         let st = apply_tx(&mut probe, &body).expect("probe apply");
         body.new_state_root = st.new_state_root;
-        let tbh = hash_tx_body(&body.prev_state_root, body.fee, &body.inputs, &body.outputs);
+        let tbh = hash_tx_body(
+            &body.prev_state_root,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
         Transaction {
             body,
             tx_body_hash: tbh,
@@ -292,8 +301,9 @@ mod tests {
         let tx1 = build_tx(&mut state, vec![], vec![minted]);
         let mut probe = state.clone();
         apply_tx(&mut probe, &tx1.body).unwrap();
-        // tx2 spends the freshly-minted UTXO at slot 0.
-        let spend = mk_input_for(0, &minted);
+        // Stage E.1: the wallet chose the mint's slot, so tx2 spends
+        // at exactly `minted.slot_index`.
+        let spend = mk_input_for(minted.slot_index, &minted);
         let tx2 = build_tx(&mut probe, vec![spend], vec![mk_output(3)]);
 
         let txs = vec![tx1, tx2];
@@ -350,7 +360,8 @@ mod tests {
             apply_block(&mut state, &block),
             Err(BlockApplyError::HeaderTxRootMismatch)
         );
-        assert_eq!(state.next_slot_index, 0);
+        assert_eq!(state.active_slot_count, 0);
+        assert!(state.free_slots.is_empty());
     }
 
     #[test]

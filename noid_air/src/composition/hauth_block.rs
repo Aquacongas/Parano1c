@@ -110,8 +110,8 @@ pub struct HAuthBlockWiring {
     pub squeezed_tag_hi_cell: (usize, usize),
     pub squeezed_tag_lo_cell: (usize, usize),
     /// Absolute `(col, row)` of the pre-MDS B-seed cell, per lane.
-    /// Stage 5.7 replaces T2b with a direct tie from these cells into
-    /// the Merkle wrap output columns.
+    /// The spine composite ties these cells into the Merkle wrap
+    /// output columns via T2b.
     pub pre_s_b_hi_cell: (usize, usize),
     pub pre_s_b_lo_cell: (usize, usize),
 }

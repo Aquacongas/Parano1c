@@ -148,3 +148,34 @@ fn stage_6_consistency_assert_detects_pi_prev_state_root_mismatch() {
     pi.prev_state_root[0] ^= 0xFF;
     comp.assert_public_inputs_consistent(&pi);
 }
+
+/// Stage E.6 — `log_slots` is absorbed into the Fiat-Shamir channel
+/// alongside the roots, so swapping it on the verifier side must
+/// desync the replayed transcript and make `verify_air` fail.
+#[test]
+#[ignore = "stage_e6_pi_tamper: heavy; run with --ignored"]
+fn stage_e6_verify_rejects_tampered_log_slots() {
+    let comp = fixture::build_honest_realistic();
+    let trace = comp.build_trace();
+    let honest_pi = comp.public_inputs();
+    let proof = prove_air(comp.air(), &trace, &honest_pi).expect("prove");
+
+    let mut bad = honest_pi;
+    bad.log_slots = bad.log_slots.wrapping_add(1);
+    assert!(
+        verify_air(comp.air(), &bad, &proof).is_err(),
+        "verify_air must reject tampered log_slots",
+    );
+}
+
+/// Stage E.6 — caller-supplied PI must match the combiner preimage's
+/// `log_slots`; the consistency assert surfaces a mismatch at
+/// composite construction time.
+#[test]
+#[should_panic(expected = "PublicInputs.log_slots disagrees")]
+fn stage_e6_consistency_assert_detects_pi_log_slots_mismatch() {
+    let comp = fixture::build_honest_realistic();
+    let mut pi = comp.public_inputs();
+    pi.log_slots = pi.log_slots.wrapping_add(1);
+    comp.assert_public_inputs_consistent(&pi);
+}

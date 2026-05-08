@@ -1,27 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 5.7 — PR B.3: spine-embedded composite with verbatim leaf-band.
+//! Spine-embedded tx-validity composite with a verbatim leaf-band.
 //!
 //! Constructs a [`crate::CompositeAir`] at `outer_log_rows = 13` that
 //! embeds:
-//! - the full Stage 5.6
+//! - the full
 //!   [`super::tx_validity_leaf::TxValidityCompositeLeaf`] verbatim at
-//!   outer columns `[0, TX_VALIDITY_LEAF_N_COLS)` (now lifted to
-//!   `outer_log_rows = 13` by PR B.2 so it co-exists with the spine
-//!   without an outer-row mismatch); the leaf's bridges still point at
-//!   their PI-pinned dst families (T2a / T3) — PR B.4 will atomically
-//!   retarget those dsts to the spine's auth-tag and output-leaf cells
-//!   and delete the now-redundant `PublicColumn` programmes.
+//!   outer columns `[0, TX_VALIDITY_LEAF_N_COLS)`; the leaf's T2a bridge
+//!   is retargeted at the spine's `TxValidityCol::AuthTagHi/Lo` cells.
 //! - the [`crate::airs::tx_body_spine::TxBodySpineComposite`] block
 //!   immediately past the leaf-band, shifted by
 //!   [`SPINE_BLOCK_OUTER_BASE`] via [`ShiftedColumnsConstraint`].
-//!
-//! No new bridges are introduced in PR B.3; the leaf and spine remain
-//! independent sub-circuits sharing only the outer column space and the
-//! lifted `outer_log_rows = 13`. The spine layout
-//! [`super::spine_adapter::SpineEmbeddingLayout`] is exposed so the
-//! retarget in PR B.4 can resolve T2a / T3 dst cells against it.
 
 use crate::airs::fri_state_combiner_composite::FriStateCombinerComposite;
 use crate::airs::fri_state_open::{
@@ -31,11 +21,12 @@ use crate::airs::tx_body_merkle::{TxBodyMerkleBoundaryPins, TXBODY_MERKLE_N_PERM
 use crate::airs::tx_body_spine::{spine_n_cols, TxBodySpineComposite, SPINE_LOG_ROWS};
 use crate::composition::spine_adapter::SpineEmbeddingLayout;
 use crate::composition::tx_validity_leaf::{
-    native_output_leaf_hash, write_leaf_block_traces, LeafConstructionOptions, T2aDstOverride,
-    T3DstOverride, TxValidityCompositeLeaf, N_OUTPUTS,
-    TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
+    write_leaf_block_traces, LeafConstructionOptions, T2aDstOverride,
+    TxValidityCompositeLeaf, SKEL_IS_COINBASE_COL, TX_VALIDITY_LEAF_LOG_ROWS,
+    TX_VALIDITY_LEAF_N_COLS,
 };
 use crate::gates::const_column::PublicColumn;
+use crate::gates::selector::SelectorGate;
 use crate::{Air, CompositeAir, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{Block128, TowerField};
 use noid_tx::TxBody;
@@ -45,11 +36,11 @@ use noid_tx::TxBody;
 // ---------------------------------------------------------------------------
 
 /// Outer log-rows. The spine demands `≥ SPINE_LOG_ROWS = 13` and the
-/// PR-B.2 leaf composite is fixed at `13`; they coincide.
+/// leaf composite is fixed at `13`; they coincide.
 pub const TX_VALIDITY_WITH_SPINE_LOG_ROWS: usize = SPINE_LOG_ROWS;
 
 /// Width reserved for the embedded leaf-band — exactly matches the
-/// 5.6 leaf composite's column count.
+/// leaf composite's column count.
 pub const LEAF_BAND_RESERVED: usize = TX_VALIDITY_LEAF_N_COLS;
 
 const _: () = {
@@ -60,16 +51,26 @@ const _: () = {
 /// Outer column at which the embedded spine block begins.
 pub const SPINE_BLOCK_OUTER_BASE: usize = LEAF_BAND_RESERVED;
 
-/// Total outer column count.
-pub fn tx_validity_with_spine_n_cols() -> usize {
+/// E.5.f₄ — outer column index reserved for the coinbase-credit bit
+/// programme. On every row it carries bit `r mod 128` of
+/// `coinbase_credit` when `r < 64` (instance-0 band), zero elsewhere.
+/// Pinned via `PublicColumn`, tied to `B21.sum` on coinbase by the
+/// f₄ equality gate, and forced to zero on regular txs by
+/// `(1 + is_coinbase) · credit_bit == 0`.
+pub fn coinbase_credit_bit_col() -> usize {
     SPINE_BLOCK_OUTER_BASE + spine_n_cols()
 }
 
+/// Total outer column count.
+pub fn tx_validity_with_spine_n_cols() -> usize {
+    coinbase_credit_bit_col() + 1
+}
+
 // ---------------------------------------------------------------------------
-// Column-shift adapter (mirrors the per-composite adapter pattern from
-// the 5.3 / 5.4 / 5.5 / 5.6 composites). Used only for the spine block;
-// the leaf-band is embedded at outer offset 0 and its constraints carry
-// over without any column shift.
+// Column-shift adapter (mirrors the per-composite adapter pattern used
+// elsewhere). Used only for the spine block; the leaf-band is embedded
+// at outer offset 0 and its constraints carry over without any column
+// shift.
 // ---------------------------------------------------------------------------
 
 struct ShiftedColumnsConstraint {
@@ -118,9 +119,9 @@ impl Constraint for ShiftedColumnsConstraint {
 // Composite
 // ---------------------------------------------------------------------------
 
-/// Stage 5.7 PR B.3 composite: full leaf composite (verbatim) +
-/// `TxBodySpineComposite` block. Both sides remain independent;
-/// PR B.4 will retarget the leaf's T2a / T3 bridges to spine cells.
+/// Spine-embedded composite: full leaf composite (verbatim) +
+/// `TxBodySpineComposite` block. The leaf's T2a bridge is retargeted at
+/// the spine's `TxValidityCol::AuthTagHi/Lo` cells.
 pub struct TxValidityCompositeWithSpine {
     pub air: CompositeAir,
     spine_layout: SpineEmbeddingLayout,
@@ -136,22 +137,49 @@ pub struct TxValidityCompositeWithSpine {
     open_public_columns: Vec<PublicColumn>,
     secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
     tx_body_hash: [Block128; 2],
-    output_fields: [[Block128; 4]; N_OUTPUTS],
-    /// PR B.5: per-output T3 dst cells inside the embedded spine
-    /// block. The HLeaf-block bridge dst is retargeted here; the
-    /// leaf-band's per-output T3 `PublicColumn` programmes are
-    /// suppressed at construction.
-    t3_override: [T3DstOverride; N_OUTPUTS],
-    /// PR B.6: per-input T2a dst cells inside the embedded spine
-    /// block, pointing at `TxValidityCol::AuthTagHi/Lo[i]`. The
-    /// HAuth-block bridge dst is retargeted here; the leaf-band's
-    /// per-input T2a `PublicColumn` programmes are suppressed at
-    /// construction.
+    /// Per-input T2a dst cells inside the embedded spine block,
+    /// pointing at `TxValidityCol::AuthTagHi/Lo[i]`. The HAuth-block
+    /// bridge dst is retargeted here; the leaf-band's per-input T2a
+    /// `PublicColumn` programmes are suppressed at construction.
     t2a_override: [T2aDstOverride; FRI_STATE_OPEN_N_INPUTS],
-    /// Per-input declared auth tags. PR B.6 needs these at
-    /// `build_trace`-time to restore the spine `AuthTagHi/Lo` cells
-    /// after the spine inner trace clobbers the leaf-band's writes.
+    /// Per-input declared auth tags. Needed at `build_trace`-time to
+    /// restore the spine `AuthTagHi/Lo` cells after the spine inner
+    /// trace clobbers the leaf-band's writes.
     auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+    /// E.2.b.comp-3: output-side witness source used at construction.
+    /// Mirrored into `build_trace` so the embedded leaf-band honest
+    /// sub-trace matches the constraints emitted by the composite AIR.
+    output_side: crate::composition::tx_validity_composite::OutputSideSource,
+    /// E.5.d: tx-level coinbase marker threaded into the embedded
+    /// leaf-band and into the WithSpine-level `is_coinbase · fee = 0`
+    /// tie. Mirrored here so `build_trace` can assert the wiring
+    /// invariant `is_coinbase ⇒ balance_fee == 0` (data-safety sanity).
+    is_coinbase: bool,
+    /// E.5.f₄ — declared coinbase mint. Equal to `Σ outputs` on a
+    /// well-formed coinbase tx; zero on regular txs. Surfaced through
+    /// `public_inputs()` and pinned into the `credit_bit_col` programme.
+    coinbase_credit: u64,
+}
+
+/// E.5.d / E.5.f₄ — optional construction tweaks for
+/// [`TxValidityCompositeWithSpine`]. `Default` reproduces the canonical
+/// non-coinbase wiring.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WithSpineOptions {
+    /// Tx-level coinbase flag. When `true`, the embedded leaf enforces
+    /// `n_inputs = 0` (see `tx_validity_leaf.rs`) and WithSpine adds
+    /// `is_coinbase · fee_bit == 0` across all 64 bit-rows of the
+    /// balance `B21.b` (fee) column. Caller must supply
+    /// `balance_fee = 0` when `is_coinbase = true` — the constructor
+    /// asserts this to catch wiring mistakes early.
+    pub is_coinbase: bool,
+    /// E.5.f₄ — coinbase minted amount. When `is_coinbase = true`, the
+    /// sum of all outputs must equal this u64. Pinned into the verifier
+    /// surface via `PublicInputs.coinbase_credit` and enforced in-circuit
+    /// by a `PublicColumn` on `B21.sum` carrying the 64 bits of
+    /// `coinbase_credit`. Must be `0` when `is_coinbase = false` — the
+    /// constructor asserts this.
+    pub coinbase_credit: u64,
 }
 
 impl TxValidityCompositeWithSpine {
@@ -174,9 +202,62 @@ impl TxValidityCompositeWithSpine {
         secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
         tx_body_hash: [Block128; 2],
         auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        output_fields: [[Block128; 4]; N_OUTPUTS],
-        output_leaf_hashes: [[Block128; 2]; N_OUTPUTS],
     ) -> Self {
+        Self::new_with_options(
+            boundary_pins,
+            body,
+            balance_inputs,
+            balance_outputs,
+            balance_fee,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions::default(),
+        )
+    }
+
+    /// E.5.d — construct with caller-supplied [`WithSpineOptions`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        boundary_pins: TxBodyMerkleBoundaryPins,
+        body: TxBody,
+        balance_inputs: [u64; 4],
+        balance_outputs: [u64; 8],
+        balance_fee: u64,
+        merkle_inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]>,
+        combiner: FriStateCombinerComposite,
+        open_air: FriStateOpenAir,
+        open_witness: FriStateOpenWitness,
+        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+        tx_body_hash: [Block128; 2],
+        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+        options: WithSpineOptions,
+    ) -> Self {
+        if options.is_coinbase {
+            assert_eq!(
+                balance_fee, 0,
+                "Stage E.5.d: is_coinbase = true requires balance_fee == 0",
+            );
+            // E.5.f₄: `Σ outputs == coinbase_credit` on a well-formed
+            // coinbase tx. Asserted here (before any AIR is built) so
+            // callers get an immediate data-safety warning; the
+            // in-circuit `CreditEqualsB21SumGate` enforces the same
+            // binding against the B-chain tail.
+            let sum_out: u128 = balance_outputs.iter().map(|&x| x as u128).sum();
+            assert_eq!(
+                sum_out, options.coinbase_credit as u128,
+                "Stage E.5.f₄: Σ outputs must equal coinbase_credit on coinbase tx",
+            );
+        } else {
+            assert_eq!(
+                options.coinbase_credit, 0,
+                "Stage E.5.f₄: coinbase_credit must be 0 when is_coinbase = false",
+            );
+        }
         let outer_n_cols = tx_validity_with_spine_n_cols();
         let outer_log_rows = TX_VALIDITY_WITH_SPINE_LOG_ROWS;
 
@@ -184,34 +265,7 @@ impl TxValidityCompositeWithSpine {
             SpineEmbeddingLayout::new(SPINE_BLOCK_OUTER_BASE, outer_n_cols, outer_log_rows)
                 .expect("spine layout must fit by construction");
 
-        // PR B.5 — atomic T3 retarget. Compute per-output dst cells
-        // inside the embedded spine block and pass them to the leaf
-        // composite via `LeafConstructionOptions::t3_dst_override`.
-        // This (a) routes each HLeaf bridge's hi/lo dst at the spine's
-        // `OutputLeafPermA{leaf_idx=j}` rate-payload row (cols
-        // `output_leaf_a_outer_cell(j, 0/1)`), and (b) suppresses the
-        // 5.6-era per-output `PublicColumn::pinned_row_programme`
-        // emission inside the leaf composite. The spine's own air
-        // imposes no constraint on these payload cells at head rows
-        // (the E.4.c rate-absorb gate is gated by a single-hot
-        // selector at non-head row_0; head rows are masked off).
-        // `build_trace` writes `native_output_leaf_hash(output_fields[j])`
-        // into these cells after the spine inner copy so they carry
-        // the value the bridge ties HLeaf squeeze to.
-        let mut t3_override = [T3DstOverride { hi_col: 0, hi_row: 0, lo_col: 0, lo_row: 0 };
-            N_OUTPUTS];
-        for j in 0..N_OUTPUTS {
-            let hi = spine_layout.output_leaf_a_outer_cell(j, 0);
-            let lo = spine_layout.output_leaf_a_outer_cell(j, 1);
-            t3_override[j] = T3DstOverride {
-                hi_col: hi.col,
-                hi_row: hi.row,
-                lo_col: lo.col,
-                lo_row: lo.row,
-            };
-        }
-
-        // PR B.6 — atomic T2a retarget. Compute per-input dst cells
+        // Atomic T2a retarget. Compute per-input dst cells
         // at the spine's `TxValidityCol::AuthTagHi/Lo[i]` (composite
         // cols 8/9, row i). With an empty `TxBody`, the spine's
         // TxValidityAir build-trace leaves these cells at zero and
@@ -234,21 +288,23 @@ impl TxValidityCompositeWithSpine {
             };
         }
 
-        // PR B.7 — reverted. HAuth's `pre_s_B[lane]@N_ROUNDS` bridge
-        // src carries `A.s[lane] + tx_body_hash[lane]` (per the
-        // B-absorb gate `A.s + pre_s_B + tx_body == 0`), not a bare
-        // `tx_body_hash`, so it cannot be tied to the spine's
-        // wrap-output cell (which carries `tx_body_hash`). The
-        // cross-AIR "same tx_body_hash everywhere" invariant is
-        // enforced by the B-absorb gate baking `tx_body_hash` in as
-        // a construction-time constant (HAuthAir) and by the Merkle
-        // wrap-output pinning the same scalar via boundary pins;
-        // no bridge required. T2b stays on the 5.6 per-input unpinned
-        // dst cells inside the leaf band.
-
         // Build the leaf composite and consume it for its constraints /
         // publics + witness pieces required to rebuild the leaf-band
         // sub-trace.
+        // E.2.b.comp-3: thread the body's outputs into the leaf's
+        // output-side `FriStateOpenAir` block as mint claims. The
+        // spine block already owns `self.body`, so every live
+        // `TxOutput` becomes a mint claim carrying its declared
+        // `slot_index`, `value` and owner lanes; inactive outputs stay
+        // `FriStateOpenClaim::EMPTY`. `prev_lane_openings` are the
+        // verifier-known FRI openings of `prev_state` at the
+        // output-side eval point — wired to zero here (honest
+        // shape-only path; Stage 6 PublicInputs will lift them into
+        // the verifier surface).
+        let output_side = crate::composition::tx_validity_composite::OutputSideSource::FromBody {
+            outputs: body.outputs.clone(),
+            prev_lane_openings: [Block128::ZERO; 3],
+        };
         let leaf = TxValidityCompositeLeaf::new_with_options(
             combiner,
             open_air,
@@ -256,12 +312,12 @@ impl TxValidityCompositeWithSpine {
             secrets,
             tx_body_hash,
             auth_tags,
-            output_fields,
-            output_leaf_hashes,
             LeafConstructionOptions {
-                t3_dst_override: Some(t3_override),
                 t2a_dst_override: Some(t2a_override),
                 t2b_dst_override: None,
+                output_side: output_side.clone(),
+                is_coinbase: options.is_coinbase,
+                ..LeafConstructionOptions::default()
             },
         );
         let (
@@ -272,8 +328,6 @@ impl TxValidityCompositeWithSpine {
             secrets,
             tx_body_hash,
             auth_tags,
-            output_fields,
-            _output_leaf_hashes,
         ) = leaf.into_parts();
         let (leaf_log_rows, leaf_n_cols, leaf_constraints, leaf_publics) = leaf_air.into_parts();
         assert_eq!(leaf_log_rows, outer_log_rows);
@@ -298,13 +352,268 @@ impl TxValidityCompositeWithSpine {
         }
 
         // Spine: shift by `SPINE_BLOCK_OUTER_BASE`.
+        //
+        // E.5.f₄ — cross-chain equality mux. The only balance constraints
+        // that encode UTXO conservation (`Σ inputs ≡ Σ outputs + fee`)
+        // are the two A2↔B21 final-equality gates. They touch columns in
+        // both the `A2` and `B21` `bit_adder` blocks and are wrapped in
+        // `SelectorGate::new_negated(SKEL_IS_COINBASE_COL, …)` so the
+        // identity is silenced on coinbase txs (replaced by
+        // `B21 ≡ coinbase_credit` emitted below). Every other balance
+        // constraint — per-block `bit_adder` internals, inter-block
+        // bridges, and the B-chain integer overflow gates — stays active
+        // on coinbase so the prover cannot use a silent chain wrap as an
+        // escape hatch.
         let block_base = spine_layout.block_base();
+        let balance_outer_lo = {
+            use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+            use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
+            block_base + TXV_COL_OFFSET + TX_VALIDITY_BALANCE_COL_OFFSET
+        };
+        let a2_block_lo = {
+            use crate::airs::bit_adder::BIT_ADDER_N_COLS;
+            balance_outer_lo + 2 * BIT_ADDER_N_COLS
+        };
+        let a2_block_hi = {
+            use crate::airs::bit_adder::BIT_ADDER_N_COLS;
+            a2_block_lo + BIT_ADDER_N_COLS
+        };
+        let b21_block_lo = {
+            use crate::airs::balance_gate::BALANCE_BLK_B21;
+            use crate::airs::bit_adder::BIT_ADDER_N_COLS;
+            balance_outer_lo + BALANCE_BLK_B21 * BIT_ADDER_N_COLS
+        };
+        let b21_block_hi = {
+            use crate::airs::bit_adder::BIT_ADDER_N_COLS;
+            b21_block_lo + BIT_ADDER_N_COLS
+        };
         for c in spine_constraints {
-            constraints.push(Box::new(ShiftedColumnsConstraint::new(c, block_base, spine_n)));
+            let shifted = ShiftedColumnsConstraint::new(c, block_base, spine_n);
+            let touches_a2 = shifted
+                .columns()
+                .iter()
+                .chain(shifted.shifted_columns().iter())
+                .any(|&col| col >= a2_block_lo && col < a2_block_hi);
+            let touches_b21 = shifted
+                .columns()
+                .iter()
+                .chain(shifted.shifted_columns().iter())
+                .any(|&col| col >= b21_block_lo && col < b21_block_hi);
+            if touches_a2 && touches_b21 {
+                constraints.push(Box::new(SelectorGate::new_negated(
+                    SKEL_IS_COINBASE_COL,
+                    Box::new(shifted),
+                )));
+            } else {
+                constraints.push(Box::new(shifted));
+            }
         }
         for pc in spine_publics {
             assert!(pc.col < spine_n);
             public_columns.push(PublicColumn::new(pc.col + block_base, pc.values));
+        }
+
+        // E.5.d.2 — `is_coinbase · fee_bit == 0` on every row.
+        //
+        // `fee_bit_col` is the `B21.b` bit-column of the balance block
+        // embedded inside the spine. Its programme (pinned via
+        // `emit_balance_value_public_columns` at Stage 3d-0.10.5) carries
+        // bit `r` of `balance_fee` on rows `[0, 64)` of instance 0 and
+        // zero everywhere else. With `is_coinbase` also pinned as a
+        // row-constant public column on the leaf side, the identity
+        //     is_coinbase · fee_bit == 0
+        // holds iff `is_coinbase = 0` (any fee permitted) or every bit
+        // of `balance_fee` is zero (i.e. `balance_fee == 0`). Degree 2,
+        // no row gating needed.
+        {
+            use crate::airs::balance_gate::BALANCE_N_BLOCKS;
+            use crate::airs::bit_adder::{BIT_ADDER_COL_B, BIT_ADDER_N_COLS};
+            use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
+            use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+            // `B21` is balance block ordinal 10 — the last block. Derive
+            // via `BALANCE_N_BLOCKS - 1` to keep this pin free of the
+            // private `BLK_B21` constant.
+            const BLK_B21: usize = BALANCE_N_BLOCKS - 1;
+            let fee_bit_col = block_base
+                + TXV_COL_OFFSET
+                + TX_VALIDITY_BALANCE_COL_OFFSET
+                + BLK_B21 * BIT_ADDER_N_COLS
+                + BIT_ADDER_COL_B;
+
+            struct CoinbaseNoFeeGate {
+                cols: [usize; 2],
+            }
+            impl Constraint for CoinbaseNoFeeGate {
+                fn degree(&self) -> usize { 2 }
+                fn columns(&self) -> &[usize] { &self.cols }
+                fn evaluate(&self, frame: EvalFrame) -> Block128 {
+                    frame.local[0] * frame.local[1]
+                }
+                fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+                    noid_core::hardware::clmul_gcm(frame.local[0], frame.local[1])
+                }
+            }
+            constraints.push(Box::new(CoinbaseNoFeeGate {
+                cols: [SKEL_IS_COINBASE_COL, fee_bit_col],
+            }));
+        }
+
+        // E.5.f₃ — SKEL_IS_COINBASE_COL ↔ tx-body L14 bridge.
+        //
+        // The native `hash_tx_body` encodes `is_coinbase` into leaf 14 as
+        // `[is_coinbase as u128, 0]`, and the Merkle AIR pins that word
+        // onto `pre_s[0]` at instance-42 row-0 via O3.b
+        // (`pins.is_coinbase_leaf[0]`). Independently, the leaf band
+        // exposes the scalar `is_coinbase` on every row of
+        // `SKEL_IS_COINBASE_COL` (Stage E.5.d).
+        //
+        // This gate ties the two sources so a prover cannot publish
+        // inconsistent `is_coinbase` values to the spine-side mux and to
+        // the tx-body-hash L14 leaf: at the single hot row where the
+        // Merkle pin indicator `pin_base + 1` is ONE, force
+        //     pre_s[0] + SKEL_IS_COINBASE_COL == 0
+        // (addition is XOR over GF(2^128); for {0, 1} scalars this is
+        // equality). Everywhere else the gate is silenced by the
+        // single-hot indicator.
+        //
+        // Requires `options.is_coinbase` to agree with the supplied
+        // `boundary_pins.is_coinbase_leaf` and with `body.is_coinbase`;
+        // any disagreement is caught at construction time below.
+        {
+            use crate::airs::tx_body_merkle::air::TXBODY_MERKLE_BOUNDARY_PIN_BASE;
+            use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
+            use crate::gates::linear::WeightedLinearGate;
+
+            assert_eq!(
+                body.is_coinbase, options.is_coinbase,
+                "Stage E.5.f₃: body.is_coinbase must agree with options.is_coinbase",
+            );
+            let declared_word = Block128::from(options.is_coinbase as u128);
+            assert_eq!(
+                boundary_pins.is_coinbase_leaf[0], declared_word,
+                "Stage E.5.f₃: boundary_pins.is_coinbase_leaf[0] must equal is_coinbase",
+            );
+            assert_eq!(
+                boundary_pins.is_coinbase_leaf[1], Block128::ZERO,
+                "Stage E.5.f₃: boundary_pins.is_coinbase_leaf[1] must be zero (native L14 shape)",
+            );
+
+            let merkle_offset = spine_layout.merkle_block_outer_offset();
+            let pre_s_0_col = merkle_offset + TXBODY_MERKLE_PRE_S_BASE;
+            let pin_ind_col = merkle_offset + *TXBODY_MERKLE_BOUNDARY_PIN_BASE + 1;
+
+            let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
+                vec![
+                    (pre_s_0_col, Block128::ONE),
+                    (SKEL_IS_COINBASE_COL, Block128::ONE),
+                ],
+                Block128::ZERO,
+            ));
+            constraints.push(Box::new(SelectorGate::new(pin_ind_col, inner)));
+        }
+
+        // E.5.f₄ — coinbase-credit bit programme + equality gates.
+        //
+        // A single dedicated outer column `credit_bit_col` holds the
+        // 64-bit decomposition of `options.coinbase_credit`: bit `r` on
+        // row `r` for `r ∈ 0..64` of instance 0, zero everywhere else.
+        // Pinned via `PublicColumn` so its contents are part of the
+        // verifier-visible public data.
+        //
+        // Two degree-2 constraints close the mux:
+        //
+        // 1. `(1 + is_coinbase) · credit_bit == 0` on every row.
+        //    Forces `coinbase_credit == 0` on regular txs — the only
+        //    value a `PublicInputs.coinbase_credit` can carry consistent
+        //    with the witness is zero.
+        //
+        // 2. `is_coinbase · is_input_B21 · (B21.sum + credit_bit) == 0`
+        //    on every row. On coinbase txs, equates the low 67 bits of
+        //    `B21.sum` (active rows of the B21 bit-adder) with
+        //    `credit_bit`. Since the programme zeroes all bits beyond
+        //    bit 63, this forces sum-bits 64..66 to zero too, tying
+        //    `Σ outputs + fee == coinbase_credit` at the bit level.
+        //    Combined with the existing `is_coinbase · fee_bit == 0`
+        //    gate (which pins `fee == 0` on coinbase), the identity
+        //    reduces to `Σ outputs == coinbase_credit`.
+        //
+        // Silent-wrap escape is blocked because the B-chain overflow
+        // gates (`BalanceZeroAtTransitionGate` on `B21.sum[66]` and
+        // `B21.carry[67]`) stay active on coinbase: the mux at the top
+        // of this function only silences the two cross-chain equality
+        // gates, not the overflow guards.
+        {
+            use crate::airs::balance_gate::BALANCE_BLK_B21;
+            use crate::airs::bit_adder::{
+                bit_adder_operand_programme, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_SUM,
+                BIT_ADDER_N_COLS,
+            };
+            use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+            use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
+
+            let credit_bit_col = coinbase_credit_bit_col();
+            let b21_block_base = block_base
+                + TXV_COL_OFFSET
+                + TX_VALIDITY_BALANCE_COL_OFFSET
+                + BALANCE_BLK_B21 * BIT_ADDER_N_COLS;
+            let b21_sum_col = b21_block_base + BIT_ADDER_COL_SUM;
+            let b21_is_input_col = b21_block_base + BIT_ADDER_COL_IS_INPUT;
+
+            // Pin the 64-bit credit programme.
+            public_columns.push(PublicColumn::new(
+                credit_bit_col,
+                bit_adder_operand_programme(64, options.coinbase_credit, outer_log_rows),
+            ));
+
+            // Gate 1: (1 + is_coinbase) · credit_bit == 0.
+            struct CreditZeroOnRegularGate {
+                cols: [usize; 2],
+            }
+            impl Constraint for CreditZeroOnRegularGate {
+                fn degree(&self) -> usize { 2 }
+                fn columns(&self) -> &[usize] { &self.cols }
+                fn evaluate(&self, frame: EvalFrame) -> Block128 {
+                    (Block128::ONE + frame.local[0]) * frame.local[1]
+                }
+                fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+                    noid_core::hardware::clmul_gcm(
+                        frame.local[0] ^ 1u128,
+                        frame.local[1],
+                    )
+                }
+            }
+            constraints.push(Box::new(CreditZeroOnRegularGate {
+                cols: [SKEL_IS_COINBASE_COL, credit_bit_col],
+            }));
+
+            // Gate 2: is_coinbase · is_input_B21 · (B21.sum + credit_bit) == 0.
+            struct CreditEqualsB21SumGate {
+                cols: [usize; 4],
+            }
+            impl Constraint for CreditEqualsB21SumGate {
+                fn degree(&self) -> usize { 3 }
+                fn columns(&self) -> &[usize] { &self.cols }
+                fn evaluate(&self, frame: EvalFrame) -> Block128 {
+                    let is_coinbase = frame.local[0];
+                    let is_input_b21 = frame.local[1];
+                    let b21_sum = frame.local[2];
+                    let credit_bit = frame.local[3];
+                    is_coinbase * is_input_b21 * (b21_sum + credit_bit)
+                }
+                fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+                    use noid_core::hardware::clmul_gcm;
+                    let t = frame.local[2] ^ frame.local[3];
+                    clmul_gcm(frame.local[0], clmul_gcm(frame.local[1], t))
+                }
+            }
+            constraints.push(Box::new(CreditEqualsB21SumGate {
+                cols: [
+                    SKEL_IS_COINBASE_COL,
+                    b21_is_input_col,
+                    b21_sum_col,
+                    credit_bit_col,
+                ],
+            }));
         }
 
         let air = CompositeAir::from_parts_with_publics(
@@ -328,10 +637,11 @@ impl TxValidityCompositeWithSpine {
             open_public_columns,
             secrets,
             tx_body_hash,
-            output_fields,
-            t3_override,
             t2a_override,
             auth_tags,
+            output_side,
+            is_coinbase: options.is_coinbase,
+            coinbase_credit: options.coinbase_credit,
         }
     }
 
@@ -346,11 +656,7 @@ impl TxValidityCompositeWithSpine {
             .map(|_| vec![Block128::ZERO; outer_n_rows])
             .collect();
 
-        // Leaf-band. The leaf composite was built with
-        // `t3_dst_override = Some(self.t3_override)`, so the inner
-        // HLeaf-block trace writer also routes its dst writes there.
-        // These writes will be clobbered by the spine inner copy below
-        // and then restored explicitly.
+        // Leaf-band.
         write_leaf_block_traces(
             &mut cols,
             &self.combiner,
@@ -358,12 +664,15 @@ impl TxValidityCompositeWithSpine {
             &self.open_public_columns,
             &self.secrets,
             self.tx_body_hash,
-            &self.output_fields,
             outer_n_cols,
             TX_VALIDITY_WITH_SPINE_LOG_ROWS,
-            Some(self.t3_override),
             Some(self.t2a_override),
             None,
+            &self.output_side,
+            self.open_witness.eval_point,
+            self.open_witness.gamma,
+            &crate::composition::tx_validity_composite::NewStateInputSource::Empty,
+            &crate::composition::tx_validity_composite::NewStateOutputSource::Empty,
         );
 
         // Spine block.
@@ -384,24 +693,7 @@ impl TxValidityCompositeWithSpine {
             cols[block_base + i] = src;
         }
 
-        // PR B.5 — restore the per-output T3 dst cells inside the spine
-        // block. These cells live on `leaf_rate_payload_col` columns at
-        // `OutputLeafPermA{leaf_idx=j}` rows; the spine's E.4.c
-        // rate-absorb gate is gated by a single-hot selector that
-        // fires only at non-head row_0s, so writing
-        // `native_output_leaf_hash(output_fields[j])` into these
-        // (head-row) cells does not violate any spine constraint.
-        // The HLeaf bridge ties each cell to the HLeaf squeeze; the
-        // squeeze carries the same `native_output_leaf_hash(...)`,
-        // closing audit § 6.1's T3 retarget contract.
-        for j in 0..N_OUTPUTS {
-            let leaf_hash = native_output_leaf_hash(self.output_fields[j]);
-            let dst = &self.t3_override[j];
-            cols[dst.hi_col][dst.hi_row] = leaf_hash[0];
-            cols[dst.lo_col][dst.lo_row] = leaf_hash[1];
-        }
-
-        // PR B.6 / PR D.2a — restore the per-input T2a dst cells.
+        // Restore the per-input T2a dst cells.
         // Dummy slot: spine left cell at zero and the
         // `InputValid[i] * (auth_tag - MAC) == 0` gate is vacuous, so
         // we overwrite with the declared MAC.
@@ -451,6 +743,13 @@ impl TxValidityCompositeWithSpine {
 
     pub fn boundary_pins(&self) -> &TxBodyMerkleBoundaryPins {
         &self.boundary_pins
+    }
+
+    /// E.5.d: mirror of the tx-level coinbase flag this composite was
+    /// constructed with. Consumed by f₃ (SKEL_IS_COINBASE_COL bridge)
+    /// and by debug asserts in `build_trace`.
+    pub fn is_coinbase(&self) -> bool {
+        self.is_coinbase
     }
 
     /// Stage 6 — tx body hash the trace was built with.
@@ -508,11 +807,76 @@ impl TxValidityCompositeWithSpine {
             "Stage 6: boundary_pins.tx_body_hash must equal composite tx_body_hash",
         );
 
+        // A1a — count live slots from the TxBody the trace was built
+        // with. Matches the `is_live` logic used for T2a overrides and
+        // the per-input/output valid-selector gates. `n_live_*` fits in
+        // u8 because MAX_INPUTS / MAX_OUTPUTS are both < 256.
+        let n_live_inputs = self
+            .body
+            .inputs
+            .iter()
+            .filter(|inp| inp.valid)
+            .count() as u8;
+        let n_live_outputs = self
+            .body
+            .outputs
+            .iter()
+            .filter(|out| out.valid)
+            .count() as u8;
+
+        // Stage E.6 — both combiner sides carry `log_slots` in their
+        // preimages and the absorb-block AIR enforces that the declared
+        // value matches the absorbed bytes. For a non-expansion block
+        // the two sides agree by construction; the composite construction
+        // path asserts it so the PublicInputs surface is unambiguous.
+        let prev_log_slots = self.combiner.prev_preimage().log_slots;
+        let new_log_slots = self.combiner.new_preimage().log_slots;
+        assert_eq!(
+            prev_log_slots, new_log_slots,
+            "Stage E.6: prev/new combiner log_slots disagree \
+             (expansion blocks are not yet supported in this composite)",
+        );
+
+        // Stage E.4 — activation / deactivation booleans. Mirror the
+        // in-circuit `SKEL_IS_ACTIVATION_COL` / `SKEL_IS_DEACTIVATION_COL`
+        // public-column programmes built by the leaf composite: an
+        // input deactivates iff it is a live spend (`valid == true`);
+        // an output activates iff it is a live mint (`valid == true`).
+        // Dummy slots carry `false`. The in-circuit tie (to
+        // `col_is_spend` / `col_is_mint` on opener rows) guarantees
+        // the AIR rejects any prover who tries to flip a bit.
+        let mut is_activation = [false; noid_tx::types::MAX_OUTPUTS];
+        for (j, out) in self.body.outputs.iter().enumerate() {
+            if j >= noid_tx::types::MAX_OUTPUTS {
+                break;
+            }
+            is_activation[j] = out.valid;
+        }
+        let mut is_deactivation = [false; noid_tx::types::MAX_INPUTS];
+        for (i, inp) in self.body.inputs.iter().enumerate() {
+            if i >= noid_tx::types::MAX_INPUTS {
+                break;
+            }
+            is_deactivation[i] = inp.valid;
+        }
+
         noid_tx::PublicInputs {
             prev_state_root: pack(self.combiner.expected_prev_state_root_fields()),
             new_state_root: pack(self.combiner.expected_new_state_root_fields()),
             tx_body_hash: TxBodyHash(pack(self.tx_body_hash)),
             fee: self.balance_fee as u128,
+            n_live_inputs,
+            n_live_outputs,
+            // Stage E.5.f₄ — mirror of the f₄-pinned outer column. Zero
+            // for regular txs (enforced by the `CreditZeroOnRegularGate`);
+            // equal to `Σ outputs` on coinbase txs (enforced by the
+            // `CreditEqualsB21SumGate`).
+            coinbase_credit: self.coinbase_credit,
+            // Stage E.6 — mirrored into the transcript so a prover
+            // cannot silently resize the slot-space Merkle structure.
+            log_slots: prev_log_slots,
+            is_activation,
+            is_deactivation,
         }
     }
 
@@ -538,6 +902,22 @@ impl TxValidityCompositeWithSpine {
             derived.fee, pi.fee,
             "Stage 6: PublicInputs.fee disagrees with balance-block pin",
         );
+        assert_eq!(
+            derived.coinbase_credit, pi.coinbase_credit,
+            "Stage E.5.f₄: PublicInputs.coinbase_credit disagrees with credit-bit pin",
+        );
+        assert_eq!(
+            derived.log_slots, pi.log_slots,
+            "Stage E.6: PublicInputs.log_slots disagrees with combiner preimage",
+        );
+        assert_eq!(
+            derived.is_activation, pi.is_activation,
+            "Stage E.4: PublicInputs.is_activation disagrees with TxBody-derived live-mint vector",
+        );
+        assert_eq!(
+            derived.is_deactivation, pi.is_deactivation,
+            "Stage E.4: PublicInputs.is_deactivation disagrees with TxBody-derived live-spend vector",
+        );
     }
 }
 
@@ -545,7 +925,7 @@ impl TxValidityCompositeWithSpine {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Stage 5.7 honest fixture — exposed for the `noid_stark`
+/// Honest fixture — exposed for the `noid_stark`
 /// `prove_air`/`verify_air` round-trip integration test. The
 /// fixture is identical to the in-module `build_honest()` used by
 /// unit tests below. Not part of the public surface; marked
@@ -568,7 +948,6 @@ pub mod fixture {
         N_ROUNDS, TXBODY_MERKLE_LAYOUT,
     };
     use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
-    use crate::composition::tx_validity_leaf::native_output_leaf_hash;
 
     pub fn empty_tx_body() -> TxBody {
         TxBody {
@@ -577,7 +956,49 @@ pub mod fixture {
             fee: 0,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            is_coinbase: false,
         }
+    }
+
+    /// E.5.f₃ — coinbase counterpart of [`empty_tx_body`].
+    pub fn empty_coinbase_tx_body() -> TxBody {
+        TxBody {
+            is_coinbase: true,
+            ..empty_tx_body()
+        }
+    }
+
+    /// E.5.f₃ — honest pins with `is_coinbase_leaf = [1, 0]`, for the
+    /// coinbase test fixtures. Tx-body-hash is re-derived so the L14
+    /// branch flips the wrap output correctly.
+    pub fn honest_coinbase_pins_and_inputs() -> (
+        TxBodyMerkleBoundaryPins,
+        Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]>,
+    ) {
+        let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
+            Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
+        let placeholder = TxBodyMerkleBoundaryPins {
+            is_coinbase_leaf: [Block128::ONE, Block128::ZERO],
+            ..TxBodyMerkleBoundaryPins::default()
+        };
+        let merkle_cols =
+            build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
+
+        let layout = build_instance_layout();
+        let wrap_meta = layout
+            .iter()
+            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
+            .expect("wrap instance present");
+        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
+        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
+        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
+
+        let pins = TxBodyMerkleBoundaryPins {
+            tx_body_hash: [s0, s1],
+            is_coinbase_leaf: [Block128::ONE, Block128::ZERO],
+            ..TxBodyMerkleBoundaryPins::default()
+        };
+        (pins, inputs)
     }
 
     pub fn honest_pins_and_inputs() -> (
@@ -627,16 +1048,6 @@ pub mod fixture {
         [
             Block128::from(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xA5A5_A5A5_A5A5_A5A5),
             Block128::from(seed.wrapping_mul(0xBF58476D1CE4E5B9) ^ 0x5A5A_5A5A_5A5A_5A5A),
-        ]
-    }
-
-    pub fn mk_output_fields(seed: u128) -> [Block128; 4] {
-        let s = seed.wrapping_mul(0xD6E8FEB86659FD93);
-        [
-            Block128::from(s ^ 0x1111_1111_1111_1111),
-            Block128::from(s.wrapping_add(1) ^ 0x2222_2222_2222_2222),
-            Block128::from(s.wrapping_add(2) ^ 0x3333_3333_3333_3333),
-            Block128::from(s.wrapping_add(3) ^ 0x4444_4444_4444_4444),
         ]
     }
 
@@ -723,14 +1134,6 @@ pub mod fixture {
             native_auth_tag(secrets[3], tx_body_hash),
         ];
 
-        let mut output_fields: [[Block128; 4]; N_OUTPUTS] = [[Block128::ZERO; 4]; N_OUTPUTS];
-        let mut output_leaf_hashes: [[Block128; 2]; N_OUTPUTS] =
-            [[Block128::ZERO; 2]; N_OUTPUTS];
-        for j in 0..N_OUTPUTS {
-            output_fields[j] = mk_output_fields(0x100u128 + j as u128);
-            output_leaf_hashes[j] = native_output_leaf_hash(output_fields[j]);
-        }
-
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
             spend_with_owner(22, 3, addrs[1]),
@@ -769,8 +1172,6 @@ pub mod fixture {
             secrets,
             tx_body_hash,
             auth_tags,
-            output_fields,
-            output_leaf_hashes,
         )
     }
 
@@ -801,6 +1202,12 @@ pub mod fixture {
     fn fill_absorb_pins_from_body(pins: &mut TxBodyMerkleBoundaryPins, body: &TxBody) {
         pins.prev_state_root = digest_to_block128_pair(&body.prev_state_root);
         pins.fee_leaf = digest_to_block128_pair(&native_fee_leaf(body.fee));
+        // E.5.f₂: L14 = [is_coinbase_as_u128, 0], matching
+        // `noid_poseidon2b::primitives::is_coinbase_leaf`.
+        pins.is_coinbase_leaf = [
+            Block128::from(body.is_coinbase as u128),
+            Block128::ZERO,
+        ];
         for i in 0..TX_MAX_INPUTS {
             let input = body.inputs.get(i).copied().unwrap_or_else(TxInput::dummy);
             let [owner_hi, owner_lo] = input.owner.as_fields();
@@ -815,6 +1222,7 @@ pub mod fixture {
             let out = body.outputs.get(j).copied().unwrap_or_else(TxOutput::dummy);
             let [owner_hi, owner_lo] = out.owner.as_fields();
             pins.output_leaf_absorb[j] = [
+                Block128::from(out.slot_index as u128),
                 Block128::from(out.value as u128),
                 owner_hi,
                 owner_lo,
@@ -855,7 +1263,7 @@ pub mod fixture {
         Address(block128_pair_to_digest(fields))
     }
 
-    /// Stage 5.7 (b) realistic non-empty TxBody honest composite.
+    /// Realistic non-empty TxBody honest composite.
     /// 2 live inputs (slots 0,3; values 100,50), 4 live outputs
     /// (40,30,20,10), fee 50. Balance: 150 == 100 + 50.
     pub fn build_honest_realistic() -> TxValidityCompositeWithSpine {
@@ -904,10 +1312,15 @@ pub mod fixture {
                 }
             })
             .collect();
-        let outputs: Vec<TxOutput> = (0..N_OUTPUTS)
+        // Stage E.1: output slot_index is bound by the body hash and
+        // lowered into `pins.output_leaf_absorb[j][0]`. Pick distinct
+        // slots that don't collide with the live input slots.
+        let out_slots: [u32; 4] = [1, 2, 4, 5];
+        let outputs: Vec<TxOutput> = (0..8)
             .map(|j| {
                 if j < 4 {
                     TxOutput {
+                        slot_index: out_slots[j],
                         value: out_values[j],
                         owner: address_from_fields(out_owners[j]),
                         valid: true,
@@ -924,6 +1337,7 @@ pub mod fixture {
             fee: fee as u128,
             inputs,
             outputs,
+            is_coinbase: false,
         };
 
         let (pins, merkle_inputs) = lower_tx_body_to_pins(&body);
@@ -937,14 +1351,6 @@ pub mod fixture {
         ];
         for i in 0..2 {
             body.inputs[i].auth_tag = AuthTag(block128_pair_to_digest(auth_tags[i]));
-        }
-
-        let mut output_fields: [[Block128; 4]; N_OUTPUTS] = [[Block128::ZERO; 4]; N_OUTPUTS];
-        let mut output_leaf_hashes: [[Block128; 2]; N_OUTPUTS] =
-            [[Block128::ZERO; 2]; N_OUTPUTS];
-        for j in 0..N_OUTPUTS {
-            output_fields[j] = mk_output_fields(0x300u128 + j as u128);
-            output_leaf_hashes[j] = native_output_leaf_hash(output_fields[j]);
         }
 
         let prev_preimage = mk_combiner_preimage(0x7E);
@@ -1008,8 +1414,6 @@ pub mod fixture {
             secrets,
             tx_body_hash,
             auth_tags,
-            output_fields,
-            output_leaf_hashes,
         )
     }
 }
@@ -1018,16 +1422,16 @@ pub mod fixture {
 mod tests {
     use super::*;
     use super::fixture::{
-        build_honest, build_honest_realistic, empty_tx_body, honest_pins_and_inputs,
-        mk_combiner_preimage, mk_eval_point, mk_gamma, mk_output_fields, mk_secret,
-        spend_with_owner,
+        build_honest, build_honest_realistic, empty_coinbase_tx_body, empty_tx_body,
+        honest_coinbase_pins_and_inputs, honest_pins_and_inputs,
+        mk_combiner_preimage, mk_eval_point, mk_gamma,
+        mk_secret, spend_with_owner,
     };
     use crate::airs::fri_state_combiner::{
         build_combiner_side_trace, extract_combiner_digest_fields, COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
     use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
-    use crate::composition::tx_validity_leaf::native_output_leaf_hash;
 
     fn build_honest_all_active() -> TxValidityCompositeWithSpine {
         // 4-active-spend / 8-output honest composite. Exercises every
@@ -1076,14 +1480,6 @@ mod tests {
             native_auth_tag(secrets[3], tx_body_hash),
         ];
 
-        let mut output_fields: [[Block128; 4]; N_OUTPUTS] = [[Block128::ZERO; 4]; N_OUTPUTS];
-        let mut output_leaf_hashes: [[Block128; 2]; N_OUTPUTS] =
-            [[Block128::ZERO; 2]; N_OUTPUTS];
-        for j in 0..N_OUTPUTS {
-            output_fields[j] = mk_output_fields(0x200u128 + j as u128);
-            output_leaf_hashes[j] = native_output_leaf_hash(output_fields[j]);
-        }
-
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(101, 0, addrs[0]),
             spend_with_owner(202, 3, addrs[1]),
@@ -1122,8 +1518,6 @@ mod tests {
             secrets,
             tx_body_hash,
             auth_tags,
-            output_fields,
-            output_leaf_hashes,
         )
     }
 
@@ -1134,7 +1528,7 @@ mod tests {
         assert!(comp.air().check(&trace));
     }
 
-    /// Stage 5.7 (b) — realistic non-empty TxBody honest trace.
+    /// Realistic non-empty TxBody honest trace.
     #[test]
     fn honest_trace_accepts_realistic_tx_body() {
         let comp = build_honest_realistic();
@@ -1162,10 +1556,13 @@ mod tests {
     fn layout_constants_agree() {
         assert_eq!(LEAF_BAND_RESERVED, TX_VALIDITY_LEAF_N_COLS);
         assert_eq!(SPINE_BLOCK_OUTER_BASE, LEAF_BAND_RESERVED);
+        // E.5.f₄: one extra outer column for the coinbase-credit bit
+        // programme, appended past the spine block.
         assert_eq!(
             tx_validity_with_spine_n_cols(),
-            LEAF_BAND_RESERVED + spine_n_cols()
+            LEAF_BAND_RESERVED + spine_n_cols() + 1
         );
+        assert_eq!(coinbase_credit_bit_col(), LEAF_BAND_RESERVED + spine_n_cols());
         assert_eq!(TX_VALIDITY_WITH_SPINE_LOG_ROWS, SPINE_LOG_ROWS);
         assert_eq!(TX_VALIDITY_WITH_SPINE_LOG_ROWS, TX_VALIDITY_LEAF_LOG_ROWS);
     }
@@ -1175,18 +1572,12 @@ mod tests {
         let comp = build_honest();
         let layout = comp.spine_layout();
         assert_eq!(layout.block_base(), SPINE_BLOCK_OUTER_BASE);
-        assert_eq!(layout.block_end(), tx_validity_with_spine_n_cols());
+        assert_eq!(layout.block_end(), coinbase_credit_bit_col());
         for input in 0..4 {
             let hi = layout.auth_tag_hi_outer_cell(input);
             let lo = layout.auth_tag_lo_outer_cell(input);
             assert!(hi.col >= layout.block_base() && hi.col < layout.block_end());
             assert!(lo.col >= layout.block_base() && lo.col < layout.block_end());
-        }
-        for output in 0..8 {
-            for lane in 0..2 {
-                let cell = layout.output_leaf_a_outer_cell(output, lane);
-                assert!(cell.col >= layout.block_base() && cell.col < layout.block_end());
-            }
         }
         for lane in 0..2 {
             let cell = layout.wrap_output_outer_cell(lane);
@@ -1227,7 +1618,7 @@ mod tests {
 
     #[test]
     fn t2a_retarget_dst_hi_tamper_rejects_per_input() {
-        // PR B.6: per-input T2a-hi dst is now the spine's
+        // Per-input T2a-hi dst is the spine's
         // `auth_tag_hi_outer_cell(i)` (= `TxValidityCol::AuthTagHi`
         // at row i). Tampering it after `build_trace`'s final pass
         // breaks the HAuth bridge tie (`spine cell == HAuth squeeze
@@ -1278,7 +1669,7 @@ mod tests {
 
     #[test]
     fn leaf_band_t2a_pi_pin_columns_are_no_longer_emitted() {
-        // PR B.6: with T2a retarget the leaf composite no longer
+        // With T2a retarget the leaf composite no longer
         // emits `PublicColumn::pinned_row_programme` programmes for
         // T2a dsts at the old leaf-band cols. Verify the legacy-dst
         // column is NOT a declared public column.
@@ -1294,80 +1685,6 @@ mod tests {
             assert!(
                 publics.iter().all(|pc| pc.col != lo_col),
                 "T2a lo dst col {lo_col} (input {i}) must not be a PublicColumn after retarget"
-            );
-        }
-    }
-
-    #[test]
-    fn t3_retarget_dst_hi_tamper_rejects_per_output() {
-        // PR B.5: per-output T3 dst lives at the spine's
-        // `output_leaf_a_outer_cell(j, 0)`. Tampering it after
-        // `build_trace`'s final pass breaks the HLeaf bridge tie
-        // (`spine cell == HLeaf squeeze == native_output_leaf_hash`).
-        for j in 0..N_OUTPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let cell = comp.spine_layout().output_leaf_a_outer_cell(j, 0);
-            trace.columns[cell.col][cell.row] =
-                trace.columns[cell.col][cell.row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T3-hi tamper at output {j} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t3_retarget_dst_lo_tamper_rejects_per_output() {
-        for j in 0..N_OUTPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let cell = comp.spine_layout().output_leaf_a_outer_cell(j, 1);
-            trace.columns[cell.col][cell.row] =
-                trace.columns[cell.col][cell.row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T3-lo tamper at output {j} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t3_retarget_cells_carry_native_leaf_hashes() {
-        // Sanity: after honest `build_trace`, each spine T3 dst
-        // carries `native_output_leaf_hash(output_fields[j])`. This
-        // is the value the bridge ties HLeaf squeeze to.
-        let comp = build_honest();
-        let trace = comp.build_trace();
-        for j in 0..N_OUTPUTS {
-            let expected = native_output_leaf_hash(comp.output_fields[j]);
-            let hi = comp.spine_layout().output_leaf_a_outer_cell(j, 0);
-            let lo = comp.spine_layout().output_leaf_a_outer_cell(j, 1);
-            assert_eq!(trace.columns[hi.col][hi.row], expected[0], "output {j} hi");
-            assert_eq!(trace.columns[lo.col][lo.row], expected[1], "output {j} lo");
-        }
-    }
-
-    #[test]
-    fn leaf_band_t3_pi_pin_columns_are_no_longer_emitted() {
-        // PR B.5: with T3 retarget the leaf composite no longer
-        // emits `PublicColumn::pinned_row_programme` programmes for
-        // T3 dsts. Verify by checking that the legacy-dst column is
-        // NOT a declared public column of the composite air.
-        use crate::composition::tx_validity_leaf::{
-            leaf_hash_dst_cols,
-        };
-        let comp = build_honest();
-        let publics = comp.air().public_columns();
-        for j in 0..N_OUTPUTS {
-            let (hi_col, lo_col) = leaf_hash_dst_cols(j);
-            assert!(
-                publics.iter().all(|pc| pc.col != hi_col),
-                "T3 hi dst col {hi_col} (output {j}) must not be a PublicColumn after retarget"
-            );
-            assert!(
-                publics.iter().all(|pc| pc.col != lo_col),
-                "T3 lo dst col {lo_col} (output {j}) must not be a PublicColumn after retarget"
             );
         }
     }
@@ -1459,6 +1776,781 @@ mod tests {
         // constraints off past row 511 but they remain active inside.
         trace.columns[SKEL_COMBINER_COL_OFFSET][1] =
             trace.columns[SKEL_COMBINER_COL_OFFSET][1] + Block128::ONE;
+        assert!(!comp.air().check(&trace));
+    }
+
+    /// Stage B.4 canonical regression: binding chain for output leaf payloads.
+    ///
+    /// `TxBodyMerkleAir` emits, for each lane ∈ {0,1}, a `PublicColumn` at
+    /// `o1_base + TXBODY_MERKLE_O1_PROG_BASE_OFFSET + lane` whose programme
+    /// row `output_leaf_perm_a_row(j)` carries `pins.output_leaf_absorb[j][lane]`.
+    /// On that same row a `SelectorGate` (gated by `leaf_perm_a_row_0`)
+    /// enforces `pre_s[lane] == o1_prog[lane]`. Together the programme-pin
+    /// plus the selector-gate tie `pre_s[lane]` on output-leaf head rows to
+    /// the caller-supplied boundary pins.
+    ///
+    /// Tampering either end of the chain in an honest realistic trace must
+    /// reject: (a) the PublicColumn cell itself (pin fails) and (b) the
+    /// `pre_s` cell it pins (constraint fails).
+    #[test]
+    fn tamper_output_leaf_absorb_pin_rejects() {
+        use crate::airs::tx_body_merkle::air::{
+            TXBODY_MERKLE_O1_BASE, TXBODY_MERKLE_O1_PROG_BASE_OFFSET,
+        };
+        use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
+
+        let comp = build_honest_realistic();
+        let honest = comp.build_trace();
+        let layout = comp.spine_layout();
+        let merkle_offset = layout.merkle_block_outer_offset();
+
+        for lane in 0..2 {
+            let head_row = layout.output_leaf_a_outer_cell(0, lane).row;
+
+            // (a) PublicColumn pin carrying pins.output_leaf_absorb[0][lane].
+            let pc_col = merkle_offset + *TXBODY_MERKLE_O1_BASE
+                + TXBODY_MERKLE_O1_PROG_BASE_OFFSET
+                + lane;
+            let mut cols = honest.columns.clone();
+            cols[pc_col][head_row] = cols[pc_col][head_row] + Block128::ONE;
+            assert!(
+                !comp.air().check(&Trace::new(cols)),
+                "Stage B.4(a): tampering o1_payload_programme[lane={lane}] at output-leaf head row must REJECT",
+            );
+
+            // (b) pre_s[lane] head cell tied to the programme by the
+            // leaf_perm_a_row_0 SelectorGate.
+            let pre_s_col = merkle_offset + TXBODY_MERKLE_PRE_S_BASE + lane;
+            let mut cols = honest.columns.clone();
+            cols[pre_s_col][head_row] = cols[pre_s_col][head_row] + Block128::ONE;
+            assert!(
+                !comp.air().check(&Trace::new(cols)),
+                "Stage B.4(b): tampering pre_s[{lane}] on output-leaf head row must REJECT",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // E.2.b.comp-4 exit tests — slot-index bridge.
+    // -----------------------------------------------------------------
+    //
+    // Comp-3 threads live `TxOutput.slot_index/value/owner` into the
+    // out-open block as mint claims; comp-4 pins each per-output
+    // `col_idx_bit(k)` row directly to the declared slot-index bit.
+    // Honest acceptance plus two tamper rejections close the audit
+    // path: any deviation from the declared slot-index on the
+    // out-open side is caught by the new `PublicColumn` programmes.
+
+    /// E.2.b.comp-4 — honest realistic body-derived trace must accept.
+    /// Redundant with `honest_trace_accepts_realistic_tx_body`, but
+    /// named to document the comp-4 binding.
+    #[test]
+    fn comp4_honest_body_derived_trace_accepts() {
+        let comp = build_honest_realistic();
+        let trace = comp.build_trace();
+        assert!(
+            comp.air().check(&trace),
+            "comp-4: honest body-derived trace must accept",
+        );
+    }
+
+    /// E.2.b.comp-4 — flipping any out-open `col_idx_bit(k)` cell on
+    /// an active output row must reject. Covers every (output, bit)
+    /// pair to catch a silent no-op.
+    #[test]
+    fn comp4_out_open_slot_index_bit_tamper_rejects() {
+        use crate::airs::fri_state_open::{
+            FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_OUTPUT_LAYOUT,
+        };
+        use crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET;
+        for output in 0..4 {
+            for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
+                let comp = build_honest_realistic();
+                let mut trace = comp.build_trace();
+                let col = SKEL_OUT_OPEN_COL_OFFSET
+                    + FRI_STATE_OPEN_OUTPUT_LAYOUT.col_idx_bit(k);
+                trace.columns[col][output] =
+                    trace.columns[col][output] + Block128::ONE;
+                assert!(
+                    !comp.air().check(&trace),
+                    "comp-4: out-open idx_bit(k={k}) tamper at output {output} must REJECT",
+                );
+            }
+        }
+    }
+
+    /// E.2.b.comp-4 — flipping the spine-side
+    /// `TxValidityCol::SlotIndex[MAX_INPUTS + j]` cell must reject.
+    /// The spine's `emit_txv_tx_body_public_columns` pins this cell to
+    /// the declared `outputs[j].slot_index`; comp-4 pins the out-open
+    /// `col_idx_bit` columns to the bits of the same declared value.
+    /// Tampering either side breaks its own `PublicColumn` programme.
+    #[test]
+    fn comp4_spine_slot_index_tamper_rejects() {
+        use crate::airs::tx_validity::TxValidityCol;
+        use noid_tx::MAX_INPUTS;
+        let comp = build_honest_realistic();
+        let layout = comp.spine_layout();
+        let txv_col_base = layout.txv_block_outer_offset();
+        let slot_col = txv_col_base + TxValidityCol::SlotIndex.index();
+        for j in 0..4 {
+            let mut trace = comp.build_trace();
+            let row = MAX_INPUTS + j;
+            trace.columns[slot_col][row] =
+                trace.columns[slot_col][row] + Block128::ONE;
+            assert!(
+                !comp.air().check(&trace),
+                "comp-4: spine SlotIndex[MAX_INPUTS+{j}] tamper must REJECT",
+            );
+        }
+    }
+
+    // ---- E.5.d: coinbase WithSpine-level wiring ---------------------------
+
+    /// Build a WithSpine composite with `is_coinbase = true`,
+    /// `balance_fee = 0`, and every input slot empty — matches the
+    /// canonical coinbase tx shape at the composite boundary.
+    fn build_honest_coinbase() -> TxValidityCompositeWithSpine {
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_coinbase_pins_and_inputs();
+
+        let prev_preimage = mk_combiner_preimage(0x77);
+        let new_preimage = mk_combiner_preimage(0x88);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+
+        TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_coinbase_tx_body(),
+            [0u64; 4],
+            [0u64; 8],
+            0,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
+        )
+    }
+
+    #[test]
+    fn e5d_honest_coinbase_accepts() {
+        let comp = build_honest_coinbase();
+        let trace = comp.build_trace();
+        assert!(comp.air().check(&trace));
+        // is_coinbase public column = ONE on every row.
+        for row in 0..(1usize << TX_VALIDITY_WITH_SPINE_LOG_ROWS) {
+            assert_eq!(trace.columns[SKEL_IS_COINBASE_COL][row], Block128::ONE);
+        }
+    }
+
+    /// E.5.f₃ — tampering `pre_s[0]` at instance-42 row-0 (L14 seed)
+    /// must reject on a coinbase trace; the bridge gate ties it to
+    /// `SKEL_IS_COINBASE_COL = 1`, so flipping the pin side desynchs
+    /// the equality.
+    #[test]
+    fn e5f3_coinbase_l14_pre_s_tamper_rejects() {
+        use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
+        let comp = build_honest_coinbase();
+        let trace = comp.build_trace();
+        let layout = comp.spine_layout();
+        let merkle_offset = layout.merkle_block_outer_offset();
+        let pre_s_0 = merkle_offset + TXBODY_MERKLE_PRE_S_BASE;
+        // Instance 42 row-0 lives at `merkle_wrap_row_for_instance(42)`;
+        // read the honest value and flip it.
+        let layout_inst = crate::airs::tx_body_merkle::build_instance_layout();
+        let row = layout_inst[42].slot_base_row;
+        let mut cols = trace.columns.clone();
+        cols[pre_s_0][row] = cols[pre_s_0][row] + Block128::ONE;
+        assert!(!comp.air().check(&Trace::new(cols)));
+    }
+
+    /// E.5.f₃ — tampering the leaf-side `SKEL_IS_COINBASE_COL` scalar
+    /// on any single row must reject on an honest coinbase trace.
+    #[test]
+    fn e5f3_skel_is_coinbase_col_tamper_rejects() {
+        let comp = build_honest_coinbase();
+        let trace = comp.build_trace();
+        let mut cols = trace.columns.clone();
+        // Flip the row that the bridge gate reads (instance-42 row-0 on
+        // the Merkle side, but SKEL_IS_COINBASE_COL is row-constant so
+        // flipping any row trips its own programme pin — which also
+        // makes the bridge gate fire if we flip the same row).
+        let layout_inst = crate::airs::tx_body_merkle::build_instance_layout();
+        let row = layout_inst[42].slot_base_row;
+        cols[SKEL_IS_COINBASE_COL][row] =
+            cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
+        assert!(!comp.air().check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn e5d_non_coinbase_default_still_accepts() {
+        // Regression: default-path `new()` keeps is_coinbase = false
+        // and the fee-gate stays vacuous (fee bits · 0 == 0).
+        let comp = build_honest();
+        let trace = comp.build_trace();
+        assert!(comp.air().check(&trace));
+        for row in 0..(1usize << TX_VALIDITY_WITH_SPINE_LOG_ROWS) {
+            assert_eq!(trace.columns[SKEL_IS_COINBASE_COL][row], Block128::ZERO);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is_coinbase = true requires balance_fee == 0")]
+    fn e5d_coinbase_with_nonzero_fee_panics_at_construction() {
+        // Data-safety sanity check: constructor rejects the wiring
+        // mistake `is_coinbase = true` + `balance_fee != 0` before any
+        // AIR is built.
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_coinbase_pins_and_inputs();
+        let prev_preimage = mk_combiner_preimage(0x01);
+        let new_preimage = mk_combiner_preimage(0x02);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+        let _ = TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_coinbase_tx_body(),
+            [0u64; 4],
+            [0u64; 8],
+            7, // non-zero fee with is_coinbase=true → panic.
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
+        );
+    }
+
+    /// E.5.d.3 / E.5.f₄ — coinbase mint (inputs = 0, outputs > 0,
+    /// fee = 0) must accept even though `Σ in ≠ Σ out`. Only the
+    /// cross-chain A2↔B21 equality gates are silenced on coinbase; the
+    /// rest of the balance circuit (per-block `bit_adder` internals,
+    /// bridges, B-chain overflow guards) stays active. The fixture
+    /// declares `coinbase_credit = 100` so the f₄
+    /// `CreditEqualsB21SumGate` binds `B21.sum ≡ 100`.
+    fn build_coinbase_mint() -> TxValidityCompositeWithSpine {
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_coinbase_pins_and_inputs();
+        let prev_preimage = mk_combiner_preimage(0x5D);
+        let new_preimage = mk_combiner_preimage(0xD5);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+
+        // Mint 100 — `Σ in = 0 ≠ 100 = Σ out`. Non-coinbase would reject.
+        TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_coinbase_tx_body(),
+            [0u64; 4],
+            [100u64, 0, 0, 0, 0, 0, 0, 0],
+            0,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
+        )
+    }
+
+    #[test]
+    fn e5d3_coinbase_mint_accepts_despite_unbalanced_ledger() {
+        let comp = build_coinbase_mint();
+        let trace = comp.build_trace();
+        assert!(
+            comp.air().check(&trace),
+            "coinbase mint trace must accept even though Σin ≠ Σout (balance gates silenced)",
+        );
+    }
+
+    /// E.5.d.3 — regression: non-coinbase with the same unbalanced
+    /// shape must still reject. Confirms the negated-selector wrap
+    /// only silences on `is_coinbase = 1`.
+    #[test]
+    fn e5d3_non_coinbase_mint_shape_rejects() {
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_pins_and_inputs();
+        let prev_preimage = mk_combiner_preimage(0x6E);
+        let new_preimage = mk_combiner_preimage(0xE6);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(10), mk_secret(20), mk_secret(30), mk_secret(40),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+
+        // Same mint shape but with is_coinbase = false: balance circuit
+        // should reject Σin = 0 ≠ 100 = Σout.
+        let comp = TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_tx_body(),
+            [0u64; 4],
+            [100u64, 0, 0, 0, 0, 0, 0, 0],
+            0,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: false, coinbase_credit: 0 },
+        );
+        let trace = comp.build_trace();
+        assert!(
+            !comp.air().check(&trace),
+            "non-coinbase unbalanced trace must reject — negated selector must not leak",
+        );
+    }
+
+    // -------- E.5.f₄ — coinbase-credit balance mux regressions --------
+
+    /// (a) Honest coinbase with `Σ outputs == coinbase_credit` and
+    /// `is_coinbase = 1` must accept. The `build_coinbase_mint` fixture
+    /// declares `coinbase_credit = 100`, `outputs = [100, 0, ...]`.
+    #[test]
+    fn e5f4_honest_coinbase_with_credit_accepts() {
+        let comp = build_coinbase_mint();
+        let trace = comp.build_trace();
+        assert!(
+            comp.air().check(&trace),
+            "E.5.f₄(a): honest coinbase with Σ outputs = coinbase_credit must accept",
+        );
+        // `PublicInputs.coinbase_credit` surfaces the declared value.
+        assert_eq!(comp.public_inputs().coinbase_credit, 100);
+    }
+
+    /// (b) On a coinbase trace, tampering any bit of the pinned
+    /// `coinbase_credit_bit_col` public programme must reject. The
+    /// verifier-side `check_public_columns` rejects immediately; the
+    /// native `check` does the equivalent via the `PublicColumn`
+    /// programme equality.
+    #[test]
+    fn e5f4_coinbase_credit_bit_tamper_rejects() {
+        let comp = build_coinbase_mint();
+        let mut trace = comp.build_trace();
+        let credit_col = coinbase_credit_bit_col();
+        // 100 = 0b1100100 — bit 2 is ONE; flip it.
+        trace.columns[credit_col][2] = trace.columns[credit_col][2] + Block128::ONE;
+        assert!(!comp.air().check(&trace));
+    }
+
+    /// (c) Coinbase with `Σ outputs ≠ coinbase_credit` must reject —
+    /// the construction-time assert catches the wiring mistake before
+    /// any AIR is built. Constructing `coinbase_credit = 100` against
+    /// `outputs = [99, 0, ...]` must panic.
+    #[test]
+    #[should_panic(expected = "Σ outputs must equal coinbase_credit")]
+    fn e5f4_coinbase_sum_mismatch_panics_at_construction() {
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_coinbase_pins_and_inputs();
+        let prev_preimage = mk_combiner_preimage(0x31);
+        let new_preimage = mk_combiner_preimage(0x32);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(5), mk_secret(6), mk_secret(7), mk_secret(8),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+        let _ = TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_coinbase_tx_body(),
+            [0u64; 4],
+            [99u64, 0, 0, 0, 0, 0, 0, 0],
+            0,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
+        );
+    }
+
+    /// (c′) In-circuit: tampering `B21.sum` at an active row on an
+    /// otherwise honest coinbase trace must reject. Catches the case
+    /// where the prover honestly constructs the composite but then
+    /// clobbers the sum cell to feign a different output total.
+    #[test]
+    fn e5f4_coinbase_b21_sum_tamper_rejects() {
+        use crate::airs::balance_gate::BALANCE_BLK_B21;
+        use crate::airs::bit_adder::{BIT_ADDER_COL_SUM, BIT_ADDER_N_COLS};
+        use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+        use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
+
+        let comp = build_coinbase_mint();
+        let mut trace = comp.build_trace();
+        let block_base = comp.spine_layout().block_base();
+        let b21_sum_col = block_base
+            + TXV_COL_OFFSET
+            + TX_VALIDITY_BALANCE_COL_OFFSET
+            + BALANCE_BLK_B21 * BIT_ADDER_N_COLS
+            + BIT_ADDER_COL_SUM;
+        trace.columns[b21_sum_col][1] =
+            trace.columns[b21_sum_col][1] + Block128::ONE;
+        assert!(!comp.air().check(&trace));
+    }
+
+    /// (d) Regression: a regular (non-coinbase) honest tx must still
+    /// accept. Confirms the `CreditZeroOnRegularGate` holds when
+    /// `coinbase_credit = 0` and the `CreditEqualsB21SumGate` is
+    /// silenced by `is_coinbase = 0`.
+    #[test]
+    fn e5f4_regular_tx_still_accepts() {
+        let comp = build_honest_realistic();
+        let trace = comp.build_trace();
+        assert!(
+            comp.air().check(&trace),
+            "E.5.f₄(d): regular tx regression — honest realistic trace must still accept",
+        );
+        assert_eq!(comp.public_inputs().coinbase_credit, 0);
+    }
+
+    /// Constructor data-safety: passing `coinbase_credit != 0` with
+    /// `is_coinbase = false` must panic before any AIR is built.
+    #[test]
+    #[should_panic(expected = "coinbase_credit must be 0 when is_coinbase = false")]
+    fn e5f4_regular_with_nonzero_credit_panics_at_construction() {
+        use super::fixture::empty_with_owner;
+        let (pins, merkle_inputs) = honest_pins_and_inputs();
+        let prev_preimage = mk_combiner_preimage(0x11);
+        let new_preimage = mk_combiner_preimage(0x22);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage, prev_fields, new_preimage, new_fields,
+        );
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            empty_with_owner(addrs[0]),
+            empty_with_owner(addrs[1]),
+            empty_with_owner(addrs[2]),
+            empty_with_owner(addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xA5A5_1234_5678_9ABC_u128),
+            Block128::from(0xDEAD_BEEF_CAFE_F00D_u128),
+            Block128::from(0x1357_9BDF_2468_ACE0_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+        let _ = TxValidityCompositeWithSpine::new_with_options(
+            pins,
+            empty_tx_body(),
+            [0u64; 4],
+            [0u64; 8],
+            0,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+            secrets,
+            tx_body_hash,
+            auth_tags,
+            WithSpineOptions { is_coinbase: false, coinbase_credit: 42 },
+        );
+    }
+
+    #[test]
+    fn e5d_coinbase_with_tampered_fee_bit_rejects() {
+        // Honest coinbase trace carries `balance_fee = 0` — every bit
+        // of the B21.b fee-column is zero. Flip one bit: the new
+        // `CoinbaseNoFeeGate` sees `is_coinbase(=1) · fee_bit(=1) == 1`
+        // → reject. Picks bit 0 on row 0 (instance 0, bit 0 of fee).
+        use crate::airs::balance_gate::BALANCE_N_BLOCKS;
+        use crate::airs::bit_adder::{BIT_ADDER_COL_B, BIT_ADDER_N_COLS};
+        use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+        use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
+
+        let comp = build_honest_coinbase();
+        let mut trace = comp.build_trace();
+        let block_base = comp.spine_layout().block_base();
+        let blk_b21 = BALANCE_N_BLOCKS - 1;
+        let fee_bit_col = block_base
+            + TXV_COL_OFFSET
+            + TX_VALIDITY_BALANCE_COL_OFFSET
+            + blk_b21 * BIT_ADDER_N_COLS
+            + BIT_ADDER_COL_B;
+        trace.columns[fee_bit_col][0] = Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 }

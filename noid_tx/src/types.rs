@@ -60,11 +60,19 @@ impl TxInput {
     }
 }
 
-/// A fresh transparent UTXO. Both fields are public on-chain and any
-/// node can recompute the leaf via `hash_utxo_leaf`.
+/// A fresh transparent UTXO. All fields are public on-chain; any node
+/// can recompute the leaf via `hash_utxo_leaf` (which binds `(value,
+/// owner)`). The `slot_index` picks which `FriState` cell the chain
+/// allocator must occupy with this output; the AIR proves in-circuit
+/// that the prev-state cell at that slot was `(0,0,0)` (Stage E.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxOutput {
+    /// Index of the `FriState` slot this output activates. Must be
+    /// free (prev-state `(0,0,0)`) per `§GENERAL_DESIGN.md §15.1`.
+    pub slot_index: u32,
+    /// Transparent value (LE u64).
     pub value: u64,
+    /// 256-bit owner address.
     pub owner: Address,
     pub valid: bool,
 }
@@ -72,6 +80,7 @@ pub struct TxOutput {
 impl TxOutput {
     pub const fn dummy() -> Self {
         Self {
+            slot_index: 0,
             value: 0,
             owner: Address([0u8; 32]),
             valid: false,
@@ -92,6 +101,16 @@ pub struct TxBody {
     pub fee: u128,
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
+    /// Stage E.5.f₁ — tx-level coinbase marker. When `true`, the engine
+    /// relaxes the UTXO conservation law (`Σin − Σout − fee == 0`) and
+    /// replaces it with `Σout == coinbase_credit`; also requires
+    /// `fee == 0 ∧ n_live_inputs == 0`. Chain-layer policy enforces
+    /// `coinbase_credit == block_reward(height) + Σ fees`; engine only
+    /// proves per-tx arithmetic.
+    ///
+    /// Absorbed into `tx_body_hash` via the L14 tx-body Merkle slot
+    /// (previously zero-pad) starting at Stage E.5.f₂.
+    pub is_coinbase: bool,
 }
 
 impl TxBody {

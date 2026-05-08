@@ -15,8 +15,8 @@ pub use channel::Poseidon2bChannel;
 pub use hasher::*;
 pub use native::*;
 pub use primitives::{
-    derive_address, hash_auth_tag, hash_leaf, hash_tx_body, hash_utxo_leaf, Address, AuthTag,
-    Commitment, Digest, SpendSecret, TxBodyHash,
+    derive_address, hash_auth_tag, hash_leaf, hash_tx_body, hash_utxo_leaf, is_coinbase_leaf,
+    Address, AuthTag, Commitment, Digest, SpendSecret, TxBodyHash,
 };
 
 /// Bulk import surface for UTXO-layer callers.

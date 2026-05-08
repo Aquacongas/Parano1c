@@ -128,6 +128,43 @@ fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
     absorb_digest_as_pair(channel, &pi.new_state_root);
     absorb_digest_as_pair(channel, &pi.tx_body_hash.0);
     channel.observe_field_elem(Block128::from(pi.fee));
+    // A1a — live-count public inputs. Pack both u8 counts into a
+    // single field element so the wire-level struct ordering
+    // (n_live_inputs before n_live_outputs) round-trips through the
+    // transcript unambiguously. Soundness binding: any disagreement
+    // between prover and verifier on `n_live_*` forks the channel and
+    // every post-absorb challenge drifts — the FRI query set and
+    // zero-check betas in particular.
+    let live_packed: u128 = (pi.n_live_inputs as u128) | ((pi.n_live_outputs as u128) << 8);
+    channel.observe_field_elem(Block128::from(live_packed));
+    // Stage E.6 — absorb coinbase_credit alongside the live counts and
+    // log_slots alongside the roots. A disagreement on either forks
+    // the channel, preventing a prover from quietly reusing a
+    // different circuit sizing or mint credit than the one the
+    // verifier (and block header) sees.
+    channel.observe_field_elem(Block128::from(pi.coinbase_credit as u128));
+    channel.observe_field_elem(Block128::from(pi.log_slots as u128));
+    // Stage E.4 — activation / deactivation booleans. Packed into one
+    // field element each (MAX_OUTPUTS, MAX_INPUTS ≤ 8 bits, well under
+    // 128). Any disagreement between prover and verifier on these
+    // surfaces forks the Fiat-Shamir channel, so the chain/block
+    // aggregator can trust the verified `PublicInputs` to carry the
+    // same booleans the AIR pinned as `SKEL_IS_ACTIVATION_COL` and
+    // `SKEL_IS_DEACTIVATION_COL`.
+    let mut act_packed: u128 = 0;
+    for (j, b) in pi.is_activation.iter().enumerate() {
+        if *b {
+            act_packed |= 1u128 << j;
+        }
+    }
+    let mut deact_packed: u128 = 0;
+    for (i, b) in pi.is_deactivation.iter().enumerate() {
+        if *b {
+            deact_packed |= 1u128 << i;
+        }
+    }
+    channel.observe_field_elem(Block128::from(act_packed));
+    channel.observe_field_elem(Block128::from(deact_packed));
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,6 +1557,12 @@ mod tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -1534,6 +1577,7 @@ mod tests {
             fee: 0,
             inputs: vec![input, TxInput::dummy()],
             outputs: vec![output, TxOutput::dummy()],
+            is_coinbase: false,
         }
     }
 
@@ -2618,6 +2662,12 @@ mod tx_validity_3b4_tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -2642,6 +2692,7 @@ mod tx_validity_3b4_tests {
             ],
             outputs: vec![
                 TxOutput {
+                    slot_index: 0,
                     value: out_val,
                     owner: Address([0xD4; 32]),
                     valid: true,
@@ -2654,6 +2705,7 @@ mod tx_validity_3b4_tests {
                 TxOutput::dummy(),
                 TxOutput::dummy(),
             ],
+            is_coinbase: false,
         }
     }
 
@@ -2857,6 +2909,12 @@ mod poseidon_perm_stark_tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -2992,6 +3050,12 @@ mod haddr_stark_tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -3138,6 +3202,12 @@ mod hauth_stark_tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -3229,113 +3299,6 @@ mod hauth_stark_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3c-4.8 — HLeafAir STARK integration tests (interior-only)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod hleaf_stark_tests {
-    use super::*;
-    use noid_air::{
-        build_hleaf_trace, extract_hleaf_output, Air, HLeafAir, Trace, HLEAF_LAYOUT_A,
-        HLEAF_LAYOUT_B, HLEAF_LAYOUT_C, HLEAF_OUTPUT_ROW,
-    };
-    use noid_core::Block128;
-    use noid_poseidon2b::primitives::TxBodyHash;
-
-    fn mk_pi() -> PublicInputs {
-        PublicInputs {
-            prev_state_root: [0x11; 32],
-            new_state_root: [0x22; 32],
-            tx_body_hash: TxBodyHash([0x44; 32]),
-            fee: 7,
-        }
-    }
-
-    fn mk_fields4(seed: u128) -> [Block128; 4] {
-        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
-        [
-            Block128::from(s ^ 0x1111_1111_1111_1111),
-            Block128::from(s.wrapping_add(1) ^ 0x2222_2222_2222_2222),
-            Block128::from(s.wrapping_add(2) ^ 0x3333_3333_3333_3333),
-            Block128::from(s.wrapping_add(3) ^ 0x4444_4444_4444_4444),
-        ]
-    }
-
-    fn expected_leaf_for(fields: [Block128; 4]) -> [Block128; 2] {
-        extract_hleaf_output(&build_hleaf_trace(fields))
-    }
-
-    #[test]
-    fn hleaf_stark_honest_prove_verify() {
-        let fields = mk_fields4(0x1EAF);
-        let air = HLeafAir::new(fields, expected_leaf_for(fields));
-        let trace = air.build_trace(fields);
-        assert!(air.check(&trace));
-        let pi = mk_pi();
-        let proof = prove_air(&air, &trace, &pi).expect("prove");
-        verify_air(&air, &pi, &proof).expect("verify");
-    }
-
-    #[test]
-    fn hleaf_stark_perm_a_sout_tamper_rejected() {
-        let fields = mk_fields4(1);
-        let air = HLeafAir::new(fields, expected_leaf_for(fields));
-        let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_LAYOUT_A.sout + 2][1] = cols[HLEAF_LAYOUT_A.sout + 2][1] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn hleaf_stark_perm_b_mds_tamper_rejected() {
-        use noid_air::HLEAF_B_SEED_ROW;
-        let fields = mk_fields4(2);
-        let air = HLeafAir::new(fields, expected_leaf_for(fields));
-        let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_LAYOUT_B.s + 1][HLEAF_B_SEED_ROW + 3] =
-            cols[HLEAF_LAYOUT_B.s + 1][HLEAF_B_SEED_ROW + 3] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn hleaf_stark_perm_c_rc_tamper_rejected() {
-        use noid_air::HLEAF_C_SEED_ROW;
-        let fields = mk_fields4(3);
-        let air = HLeafAir::new(fields, expected_leaf_for(fields));
-        let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_LAYOUT_C.rc + 1][HLEAF_C_SEED_ROW + 1] =
-            cols[HLEAF_LAYOUT_C.rc + 1][HLEAF_C_SEED_ROW + 1] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    // -----------------------------------------------------------------
-    // Stage 3d-0.8 — output-squeeze boundary tie (STARK-level)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn hleaf_output_pin_stark_tampered_output_rejected() {
-        let fields = mk_fields4(0xCAFE_FEED);
-        let air = HLeafAir::new(fields, expected_leaf_for(fields));
-
-        let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_LAYOUT_C.s][HLEAF_OUTPUT_ROW] =
-            cols[HLEAF_LAYOUT_C.s][HLEAF_OUTPUT_ROW] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Stage 3c-5.8 — TxBodyMerkleAir STARK integration tests (homogeneous 68-stack)
 // ---------------------------------------------------------------------------
 
@@ -3356,6 +3319,12 @@ mod tx_body_merkle_stark_tests {
             new_state_root: [0x22; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; noid_tx::MAX_OUTPUTS],
+            is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
 
@@ -3753,26 +3722,6 @@ mod tx_body_merkle_stark_tests {
         let mut cols = build_tx_body_merkle_trace(&batch);
         let pad_row = instance_row_offset(5) + N_ROUNDS + 10;
         cols[TXBODY_MERKLE_LAYOUT.rc + 1][pad_row] = Block128::from(0xCAFE_BABE_u128);
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn hleaf_stark_padding_rc_tamper_rejected() {
-        use noid_air::{build_hleaf_trace, extract_hleaf_output, HLeafAir, HLEAF_LAYOUT_B};
-        use noid_poseidon2b::native::permutation::N_ROUNDS;
-        let fields = [
-            Block128::from(0x11u128),
-            Block128::from(0x22u128),
-            Block128::from(0x33u128),
-            Block128::from(0x44u128),
-        ];
-        let expected = extract_hleaf_output(&build_hleaf_trace(fields));
-        let air = HLeafAir::new(fields, expected);
-        let mut cols = build_hleaf_trace(fields);
-        cols[HLEAF_LAYOUT_B.rc + 3][N_ROUNDS + 7] = Block128::from(0xC0DE_FEEDu128);
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);

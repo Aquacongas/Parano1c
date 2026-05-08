@@ -103,7 +103,7 @@ impl Constraint for SquareGate {
 /// intermediate. Fusing to one degree-3 gate drops the intermediate
 /// column (one fewer FRI commitment per lane) at the cost of one
 /// more degree level, which the quotient machinery already
-/// absorbs (e.g. `HLeafAir` / MDS-blend constraints are degree-3).
+/// absorbs (e.g. MDS-blend constraints are degree-3).
 pub struct TripleProductGate {
     cols: [usize; 4],
 }

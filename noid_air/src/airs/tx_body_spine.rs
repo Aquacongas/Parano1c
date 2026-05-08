@@ -154,19 +154,18 @@ impl Constraint for ShiftedColumnsConstraint {
 /// places tx-body fields on rows `[0, MAX_INPUTS)` and
 /// `[MAX_INPUTS, MAX_INPUTS + MAX_OUTPUTS)`; dead tail is zero):
 ///
-/// - `SlotIndex`: input row `i` carries `input_leaf_absorb[i][0]`
-///   (= `slot_index` as a field). Non-input rows: zero.
+/// - `SlotIndex`: input row `i` carries `input_leaf_absorb[i][0]`;
+///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][0]`
+///   (Stage E.1: per-output `slot_index` bound by the body hash).
 /// - `Value`: input row `i` carries `input_leaf_absorb[i][1]`;
-///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][0]`.
-/// - `OwnerHi`: input row `i` carries `input_leaf_absorb[i][2]`;
 ///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][1]`.
-/// - `OwnerLo`: input row `i` carries `input_leaf_absorb[i][3]`;
+/// - `OwnerHi`: input row `i` carries `input_leaf_absorb[i][2]`;
 ///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][2]`.
+/// - `OwnerLo`: input row `i` carries `input_leaf_absorb[i][3]`;
+///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][3]`.
 ///
-/// Lane ordering matches `noid_poseidon2b::primitives::hash_input_leaf`
-/// (`[slot, value, owner_hi, owner_lo]`) and
-/// `hash_output_leaf` / `hash_utxo_leaf` (`[value, owner_hi,
-/// owner_lo]`).
+/// Lane ordering matches both `hash_input_leaf` and (Stage E.1)
+/// `hash_output_leaf`: `[slot_index, value, owner_hi, owner_lo]`.
 fn txv_tx_body_col_programme(
     col: TxValidityCol,
     pins: &TxBodyMerkleBoundaryPins,
@@ -178,13 +177,16 @@ fn txv_tx_body_col_programme(
             for i in 0..MAX_INPUTS {
                 out[i] = pins.input_leaf_absorb[i][0];
             }
+            for j in 0..MAX_OUTPUTS {
+                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][0];
+            }
         }
         TxValidityCol::Value => {
             for i in 0..MAX_INPUTS {
                 out[i] = pins.input_leaf_absorb[i][1];
             }
             for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][0];
+                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][1];
             }
         }
         TxValidityCol::OwnerHi => {
@@ -192,7 +194,7 @@ fn txv_tx_body_col_programme(
                 out[i] = pins.input_leaf_absorb[i][2];
             }
             for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][1];
+                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][2];
             }
         }
         TxValidityCol::OwnerLo => {
@@ -200,7 +202,7 @@ fn txv_tx_body_col_programme(
                 out[i] = pins.input_leaf_absorb[i][3];
             }
             for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][2];
+                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][3];
             }
         }
         _ => panic!(
@@ -494,6 +496,7 @@ mod tests {
             fee: 0,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            is_coinbase: false,
         }
     }
 
@@ -719,9 +722,11 @@ mod tests {
             in_owner_lo,
         ];
 
-        // Output leaf absorb matches hash_utxo_leaf([value, hi, lo]).
-        let mut output_leaf_absorb = [[Block128::ZERO; 3]; 8];
+        // Stage E.1: output leaf absorbs 4 fields symmetric with input.
+        let out_slot: u32 = 1;
+        let mut output_leaf_absorb = [[Block128::ZERO; 4]; 8];
         output_leaf_absorb[0] = [
+            Block128::from(out_slot as u128),
             Block128::from(value as u128),
             out_owner_hi,
             out_owner_lo,
@@ -773,7 +778,12 @@ mod tests {
                 TxInput::dummy(),
             ],
             outputs: vec![
-                TxOutput { value, owner: out_owner, valid: true },
+                TxOutput {
+                    slot_index: 1,
+                    value,
+                    owner: out_owner,
+                    valid: true,
+                },
                 TxOutput::dummy(),
                 TxOutput::dummy(),
                 TxOutput::dummy(),
@@ -782,6 +792,7 @@ mod tests {
                 TxOutput::dummy(),
                 TxOutput::dummy(),
             ],
+            is_coinbase: false,
         };
 
         (body, pins, merkle_inputs)
@@ -923,7 +934,7 @@ mod tests {
             0,
             &merkle_inputs,
         );
-        // Flip Value on output row 0 — pinned to output_leaf_absorb[0][0].
+        // Flip Value on output row 0 — pinned to output_leaf_absorb[0][1].
         let col = TXV_COL_OFFSET + TxValidityCol::Value.index();
         let row = MAX_INPUTS;
         trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;

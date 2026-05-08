@@ -91,7 +91,9 @@ pub enum TxValidityCol {
     InputValid = 0,
     /// Bit selector: `1` on rows that carry a real output.
     OutputValid = 1,
-    /// `TxInput.slot_index` as a field element (zero on non-input rows).
+    /// Slot index as a field element. Input rows carry
+    /// `TxInput.slot_index`; output rows (Stage E.1) carry
+    /// `TxOutput.slot_index`. Zero on padding rows.
     SlotIndex = 2,
     /// `value` (u64 → Block128). Set on both input and output rows.
     Value = 3,
@@ -444,6 +446,8 @@ fn build_witness_columns(
         }
         let row = MAX_INPUTS + i;
         cols[TxValidityCol::OutputValid.index()][row] = Block128::ONE;
+        cols[TxValidityCol::SlotIndex.index()][row] =
+            Block128::from(output.slot_index as u128);
         cols[TxValidityCol::Value.index()][row] = Block128::from(output.value as u128);
         write_owner(&mut cols, row, &output.owner.as_fields());
     }
@@ -497,6 +501,7 @@ mod tests {
 
     fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
+            slot_index: (seed as u32).wrapping_mul(3),
             value: (seed as u64) * 7,
             owner: Address([seed; 32]),
             valid: true,
@@ -519,6 +524,7 @@ mod tests {
                 TxOutput::dummy(),
                 TxOutput::dummy(),
             ],
+            is_coinbase: false,
         }
     }
 
@@ -571,8 +577,16 @@ mod tests {
 
         let slot = &trace.columns[TxValidityCol::SlotIndex.index()];
         assert_eq!(slot[0], Block128::from(body.inputs[0].slot_index as u128));
-        for row in MAX_INPUTS..TX_VALIDITY_ROWS {
-            assert_eq!(slot[row], Block128::ZERO, "slot index leaked onto output/pad row");
+        assert_eq!(
+            slot[MAX_INPUTS],
+            Block128::from(body.outputs[0].slot_index as u128)
+        );
+        assert_eq!(
+            slot[MAX_INPUTS + 1],
+            Block128::from(body.outputs[1].slot_index as u128)
+        );
+        for row in (MAX_INPUTS + 2)..TX_VALIDITY_ROWS {
+            assert_eq!(slot[row], Block128::ZERO, "slot index leaked onto dummy/pad row");
         }
 
         let auth_hi = &trace.columns[TxValidityCol::AuthTagHi.index()];
@@ -612,6 +626,7 @@ mod tests {
             fee: 0,
             inputs: vec![],
             outputs: vec![],
+            is_coinbase: false,
         };
         let trace = TxValidityAir::build_trace(&empty);
         assert!(air.check(&trace));
@@ -629,6 +644,7 @@ mod tests {
             fee: 0,
             inputs: vec![TxInput::dummy(); MAX_INPUTS],
             outputs: vec![TxOutput::dummy(); MAX_OUTPUTS],
+            is_coinbase: false,
         };
         let trace = TxValidityAir::build_trace(&body);
         assert!(air.check(&trace));
@@ -663,6 +679,7 @@ mod tests {
             ],
             outputs: vec![
                 TxOutput {
+                    slot_index: 0,
                     value: out_val,
                     owner: Address([0x44; 32]),
                     valid: true,
@@ -675,6 +692,7 @@ mod tests {
                 TxOutput::dummy(),
                 TxOutput::dummy(),
             ],
+            is_coinbase: false,
         }
     }
 

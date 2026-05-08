@@ -8,9 +8,9 @@
 //!
 //! - 4 input leaves × 3 permutations (two `absorb_pair` blocks + the
 //!   padding-flush in `finalize`) = 12 instances
-//! - 8 output leaves × 2 permutations (`hash_utxo_leaf` absorbs three
-//!   fields; the third `absorb` leaves 16 buffered bytes, so `finalize`
-//!   padding-flush triggers one permutation after one rate-flush) = 16
+//! - 8 output leaves × 2 permutations (`hash_output_leaf` absorbs four
+//!   fields `[slot, value, owner_hi, owner_lo]` as two rate blocks and
+//!   squeezes with no padding flush under IV `TAG_OUTLEAF`) = 16
 //! - 15 internal `compress` nodes × 2 permutations = 30
 //! - 1 wrap `compress(root, TXBODY_tag)` × 1 permutation = 1
 //!
@@ -32,8 +32,8 @@ pub const TXBODY_TREE_DEPTH: usize = 4;
 ///
 /// - Input leaf (`hash_leaf(&[slot, value, owner_hi, owner_lo])`): two
 ///   full `absorb_pair` blocks + `finalize` padding flush = **3**.
-/// - Output leaf (`hash_utxo_leaf`: three 16-byte `absorb`s, the second
-///   flushes the rate, `finalize` pads the third) = **2**.
+/// - Output leaf (`hash_output_leaf`: four fields as two `absorb_pair`
+///   blocks under IV `TAG_OUTLEAF`, `finalize_no_pad` squeeze) = **2**.
 /// - Internal `compress` (two permutations by construction) = **2**.
 /// - Wrap (single permutation after the depth-4 root) = **1**.
 pub const PERMS_PER_INPUT_LEAF: usize = 3;
@@ -74,10 +74,15 @@ pub enum InstanceRole {
     InputLeafPermB { leaf_idx: u8 },
     /// Input-leaf sponge, `finalize` padding-flush permutation.
     InputLeafPermC { leaf_idx: u8 },
-    /// Output-leaf sponge (`hash_utxo_leaf`), first permutation (head).
-    /// Fires after the second 16-byte absorb fills the rate buffer.
+    /// Output-leaf sponge (`hash_output_leaf`), first permutation
+    /// (head). Absorbs `[slot, value]` as one rate block under
+    /// capacity IV `TAG_OUTLEAF`.
     OutputLeafPermA { leaf_idx: u8 },
-    /// Output-leaf sponge, `finalize` padding-flush permutation.
+    /// Output-leaf sponge, second permutation. Absorbs
+    /// `[owner_hi, owner_lo]` as the second rate block. The sub-sponge
+    /// squeezes the digest directly from this permutation's output —
+    /// no padding-flush permutation (matches `finalize_no_pad` native
+    /// side).
     OutputLeafPermB { leaf_idx: u8 },
     /// Internal Merkle `compress`, first permutation (head); absorbs
     /// the left-child digest through the capacity IV seed.

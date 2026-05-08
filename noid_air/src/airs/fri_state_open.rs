@@ -324,6 +324,14 @@ pub const FRI_STATE_OPEN_LOG_SLOTS: usize = 4;
 pub const FRI_STATE_OPEN_LOG_ROWS: usize = 3;
 pub const FRI_STATE_OPEN_N_ROWS: usize = 1 << FRI_STATE_OPEN_LOG_ROWS;
 
+/// E.2.b: number of outputs the output-side opener proves per tx.
+/// Matches `noid_tx::MAX_OUTPUTS = 8`. The output-side instance of
+/// `FriStateOpenAir` is sized against this (tight: n_rows == n_inputs).
+pub const FRI_STATE_OPEN_N_OUTPUTS: usize = 8;
+/// E.2.b: log2 of the output-side trace height. `1 << 3 == 8 ==
+/// FRI_STATE_OPEN_N_OUTPUTS` — tight-fit, the Layout accepts it.
+pub const FRI_STATE_OPEN_OUTPUT_LOG_ROWS: usize = 3;
+
 // -- Column layout ---------------------------------------------------------
 // Per-input row carries:
 //   value, owner_hi, owner_lo         — pinned public via boundary ties
@@ -485,6 +493,144 @@ pub const COL_ROW_INDICATOR_BASE_OFFSET: usize = COL_ACC_VALUE_OFFSET + 3;
 /// indicator.
 pub const COL_ACC_STEP_INDICATOR_OFFSET: usize =
     COL_ROW_INDICATOR_BASE_OFFSET + FRI_STATE_OPEN_N_INPUTS;
+
+/// Parameterization of a `FriStateOpenAir` instance over
+/// `(n_inputs, log_slots)`. Added in Stage E.2.a.1 as the generic
+/// counterpart to the legacy module-level `pub const`s / `pub const
+/// fn col_*()` accessors. At `n_inputs = FRI_STATE_OPEN_N_INPUTS`
+/// and `log_slots = FRI_STATE_OPEN_LOG_SLOTS`, every method on this
+/// struct returns the same value as its legacy counterpart — proven
+/// by `layout_matches_legacy_consts` below. Behavior-preserving step:
+/// no internal AIR code has switched to the methods yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FriStateOpenLayout {
+    pub n_inputs: usize,
+    pub log_slots: usize,
+    pub log_rows: usize,
+}
+
+impl FriStateOpenLayout {
+    pub const DEFAULT: Self = Self {
+        n_inputs: FRI_STATE_OPEN_N_INPUTS,
+        log_slots: FRI_STATE_OPEN_LOG_SLOTS,
+        log_rows: FRI_STATE_OPEN_LOG_ROWS,
+    };
+
+    pub const fn new(n_inputs: usize, log_slots: usize, log_rows: usize) -> Self {
+        Self { n_inputs, log_slots, log_rows }
+    }
+
+    /// Number of trace rows: `1 << log_rows`. Must be ≥ `n_inputs`.
+    pub const fn n_rows(&self) -> usize { 1 << self.log_rows }
+
+    /// Terminal-accumulator row: last live claim row `n_inputs − 1`.
+    pub const fn acc_terminal_row(&self) -> usize {
+        self.n_inputs - 1
+    }
+
+    /// Width of the AIR's witness columns (not counting higher-level
+    /// composite reservations). Mirrors `FRI_STATE_OPEN_WITNESS_COLS`.
+    pub const fn witness_cols(&self) -> usize {
+        COL_IDX_BIT_BASE
+            + self.log_slots
+            + 16
+            + 2 * self.log_slots
+            + 1
+            + 3
+            + 3
+            + self.n_inputs
+            + 1
+    }
+
+    /// Pivot after the `L` idx-bit columns, shared by every post-bit
+    /// column accessor below.
+    const fn pivot(&self) -> usize {
+        COL_IDX_BIT_BASE + self.log_slots
+    }
+
+    pub const fn col_value(&self) -> usize { COL_VALUE }
+    pub const fn col_owner_hi(&self) -> usize { COL_OWNER_HI }
+    pub const fn col_owner_lo(&self) -> usize { COL_OWNER_LO }
+    pub const fn col_idx_bit(&self, k: usize) -> usize {
+        assert!(k < self.log_slots);
+        COL_IDX_BIT_BASE + k
+    }
+
+    pub const fn col_delta_value(&self) -> usize { self.pivot() + COL_DELTA_VALUE_OFFSET }
+    pub const fn col_delta_owner_hi(&self) -> usize { self.pivot() + COL_DELTA_OWNER_HI_OFFSET }
+    pub const fn col_delta_owner_lo(&self) -> usize { self.pivot() + COL_DELTA_OWNER_LO_OFFSET }
+    pub const fn col_proof_round_digest(&self) -> usize {
+        self.pivot() + COL_PROOF_ROUND_DIGEST_OFFSET
+    }
+    pub const fn col_live_mask(&self) -> usize { self.pivot() + COL_LIVE_MASK_OFFSET }
+    pub const fn col_is_spend(&self) -> usize { self.pivot() + COL_IS_SPEND_OFFSET }
+    pub const fn col_is_mint(&self) -> usize { self.pivot() + COL_IS_MINT_OFFSET }
+    pub const fn col_opened_pre_value(&self) -> usize {
+        self.pivot() + COL_OPENED_PRE_VALUE_OFFSET
+    }
+    pub const fn col_opened_pre_owner_hi(&self) -> usize {
+        self.pivot() + COL_OPENED_PRE_OWNER_HI_OFFSET
+    }
+    pub const fn col_opened_pre_owner_lo(&self) -> usize {
+        self.pivot() + COL_OPENED_PRE_OWNER_LO_OFFSET
+    }
+    pub const fn col_eq_delta_value(&self) -> usize {
+        self.pivot() + COL_EQ_DELTA_VALUE_OFFSET
+    }
+    pub const fn col_eq_delta_owner_hi(&self) -> usize {
+        self.pivot() + COL_EQ_DELTA_OWNER_HI_OFFSET
+    }
+    pub const fn col_eq_delta_owner_lo(&self) -> usize {
+        self.pivot() + COL_EQ_DELTA_OWNER_LO_OFFSET
+    }
+    pub const fn col_delta_acc_value(&self) -> usize {
+        self.pivot() + COL_DELTA_ACC_VALUE_OFFSET
+    }
+    pub const fn col_delta_acc_owner_hi(&self) -> usize {
+        self.pivot() + COL_DELTA_ACC_OWNER_HI_OFFSET
+    }
+    pub const fn col_delta_acc_owner_lo(&self) -> usize {
+        self.pivot() + COL_DELTA_ACC_OWNER_LO_OFFSET
+    }
+    pub const fn col_eval_point(&self, i: usize) -> usize {
+        assert!(i < self.log_slots);
+        self.pivot() + COL_EVAL_POINT_BASE_OFFSET + i
+    }
+    pub const fn col_eq_ladder(&self, k: usize) -> usize {
+        assert!(k < self.log_slots);
+        self.pivot() + COL_EVAL_POINT_BASE_OFFSET + self.log_slots + k
+    }
+    pub const fn col_gamma_powers(&self) -> usize {
+        self.pivot() + COL_EVAL_POINT_BASE_OFFSET + 2 * self.log_slots
+    }
+    pub const fn col_gp_value(&self) -> usize { self.col_gamma_powers() + 1 }
+    pub const fn col_gp_owner_hi(&self) -> usize { self.col_gamma_powers() + 2 }
+    pub const fn col_gp_owner_lo(&self) -> usize { self.col_gamma_powers() + 3 }
+    pub const fn col_acc_value(&self) -> usize { self.col_gamma_powers() + 4 }
+    pub const fn col_acc_owner_hi(&self) -> usize { self.col_gamma_powers() + 5 }
+    pub const fn col_acc_owner_lo(&self) -> usize { self.col_gamma_powers() + 6 }
+    pub const fn col_row_indicator(&self, r: usize) -> usize {
+        assert!(r < self.n_inputs);
+        self.col_gamma_powers() + 7 + r
+    }
+    pub const fn col_acc_step_indicator(&self) -> usize {
+        self.col_gamma_powers() + 7 + self.n_inputs
+    }
+}
+
+impl Default for FriStateOpenLayout {
+    fn default() -> Self { Self::DEFAULT }
+}
+
+/// E.2.b: layout of the output-side `FriStateOpenAir` instance,
+/// sized for `MAX_OUTPUTS = 8` live outputs at `log_slots = 4`.
+/// Shares the input-side log_slots so both instances reference
+/// the same `prev_state_root` depth.
+pub const FRI_STATE_OPEN_OUTPUT_LAYOUT: FriStateOpenLayout = FriStateOpenLayout::new(
+    FRI_STATE_OPEN_N_OUTPUTS,
+    FRI_STATE_OPEN_LOG_SLOTS,
+    FRI_STATE_OPEN_OUTPUT_LOG_ROWS,
+);
 
 pub const fn col_delta_value() -> usize {
     COL_IDX_BIT_BASE + FRI_STATE_OPEN_LOG_SLOTS + COL_DELTA_VALUE_OFFSET
@@ -696,7 +842,16 @@ impl FriStateOpenClaim {
 /// Witness view the Stage 4a/4c.1-bis/4b.2/4c.2 builder consumes.
 #[derive(Debug, Clone)]
 pub struct FriStateOpenWitness {
-    pub claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS],
+    /// Shape parameters the trace was built against. Defaults to
+    /// `FriStateOpenLayout::DEFAULT`; custom layouts go through
+    /// `from_claims_with_layout`. `claims.len() == layout.n_inputs`
+    /// is a construction-time invariant.
+    pub layout: FriStateOpenLayout,
+    /// Claim rows, lengths enforced to match `layout.n_inputs`.
+    /// Switched from `[_; FRI_STATE_OPEN_N_INPUTS]` to `Vec` in
+    /// Stage E.2.a.3 so a single `FriStateOpenWitness` type can back
+    /// multiple concurrent instances at different `n_inputs`.
+    pub claims: Vec<FriStateOpenClaim>,
     /// 4b.2.1: transcript-derived MLE eval point
     /// `r ∈ F^{FRI_STATE_OPEN_LOG_SLOTS}`. Pinned as one constant
     /// `PublicColumn` per coordinate.
@@ -716,8 +871,30 @@ pub struct FriStateOpenWitness {
 }
 
 impl FriStateOpenWitness {
-    pub fn from_claims(claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS]) -> Self {
+    /// Build a witness at the default `FriStateOpenLayout::DEFAULT`
+    /// shape. `claims` must contain exactly
+    /// `FRI_STATE_OPEN_N_INPUTS` rows; accepts `[_; N_INPUTS]`,
+    /// `Vec`, or any `Into<Vec<…>>`. For custom layouts use
+    /// `from_claims_with_layout`.
+    pub fn from_claims<C: Into<Vec<FriStateOpenClaim>>>(claims: C) -> Self {
+        Self::from_claims_with_layout(claims, FriStateOpenLayout::DEFAULT)
+    }
+
+    /// Build a witness at an explicit `FriStateOpenLayout`. `claims`
+    /// length must equal `layout.n_inputs`. Panics otherwise — the
+    /// AIR has no fallback shape to recover to.
+    pub fn from_claims_with_layout<C: Into<Vec<FriStateOpenClaim>>>(
+        claims: C,
+        layout: FriStateOpenLayout,
+    ) -> Self {
+        let claims: Vec<FriStateOpenClaim> = claims.into();
+        assert_eq!(
+            claims.len(),
+            layout.n_inputs,
+            "FriStateOpenWitness: claim count does not match layout.n_inputs"
+        );
         Self {
+            layout,
             claims,
             eval_point: [Block128::ZERO; FRI_STATE_OPEN_LOG_SLOTS],
             gamma: Block128::ZERO,
@@ -774,7 +951,7 @@ impl FriStateOpenWitness {
             // eq(r, slot_bits) = Π_k (1 + r_k + bit_k).
             let mut eq = Block128::ONE;
             let mut idx = claim.slot_index as usize;
-            for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
+            for k in 0..self.layout.log_slots {
                 let bit = Block128::from((idx & 1) as u128);
                 idx >>= 1;
                 eq = eq * (Block128::ONE + self.eval_point[k] + bit);
@@ -812,7 +989,7 @@ impl FriStateOpenWitness {
             // eq(r, slot_bits) = Π_k (1 + r_k + bit_k).
             let mut eq = Block128::ONE;
             let mut idx = claim.slot_index as usize;
-            for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
+            for k in 0..self.layout.log_slots {
                 let bit = Block128::from((idx & 1) as u128);
                 idx >>= 1;
                 eq = eq * (Block128::ONE + self.eval_point[k] + bit);
@@ -827,154 +1004,121 @@ impl FriStateOpenWitness {
     }
 
     /// Lay the witness out into the AIR's column matrix. Every column
-    /// has length `FRI_STATE_OPEN_N_ROWS`.
+    /// has length `self.layout.n_rows()`.
     pub fn build_columns(&self, n_cols: usize) -> Vec<Vec<Block128>> {
-        let mut cols: Vec<Vec<Block128>> =
-            vec![vec![Block128::ZERO; FRI_STATE_OPEN_N_ROWS]; n_cols];
+        let layout = self.layout;
+        let n_rows = layout.n_rows();
+        let n_inputs = layout.n_inputs;
+        let log_slots = layout.log_slots;
+        let mut cols: Vec<Vec<Block128>> = vec![vec![Block128::ZERO; n_rows]; n_cols];
 
         for (row, claim) in self.claims.iter().enumerate() {
             assert!(
                 !(claim.is_spend && claim.is_mint),
                 "FriStateOpenClaim: is_spend and is_mint are mutually exclusive"
             );
-            cols[COL_VALUE][row] = claim.value;
-            cols[COL_OWNER_HI][row] = claim.owner_hi;
-            cols[COL_OWNER_LO][row] = claim.owner_lo;
-            for b in 0..FRI_STATE_OPEN_LOG_SLOTS {
+            cols[layout.col_value()][row] = claim.value;
+            cols[layout.col_owner_hi()][row] = claim.owner_hi;
+            cols[layout.col_owner_lo()][row] = claim.owner_lo;
+            for b in 0..log_slots {
                 let bit = ((claim.slot_index >> b) & 1) as u128;
-                cols[COL_IDX_BIT_BASE + b][row] = Block128::from(bit);
+                cols[layout.col_idx_bit(b)][row] = Block128::from(bit);
             }
-            cols[col_delta_value()][row] = claim.delta_value;
-            cols[col_delta_owner_hi()][row] = claim.delta_owner_hi;
-            cols[col_delta_owner_lo()][row] = claim.delta_owner_lo;
-            cols[col_is_spend()][row] = bool_to_block(claim.is_spend);
-            cols[col_is_mint()][row] = bool_to_block(claim.is_mint);
-            cols[col_live_mask()][row] = bool_to_block(claim.live());
+            cols[layout.col_delta_value()][row] = claim.delta_value;
+            cols[layout.col_delta_owner_hi()][row] = claim.delta_owner_hi;
+            cols[layout.col_delta_owner_lo()][row] = claim.delta_owner_lo;
+            cols[layout.col_is_spend()][row] = bool_to_block(claim.is_spend);
+            cols[layout.col_is_mint()][row] = bool_to_block(claim.is_mint);
+            cols[layout.col_live_mask()][row] = bool_to_block(claim.live());
             let pre_factor = if claim.is_spend {
                 Block128::ONE
             } else {
                 Block128::ZERO
             };
-            cols[col_opened_pre_value()][row] = pre_factor * claim.value;
-            cols[col_opened_pre_owner_hi()][row] = pre_factor * claim.owner_hi;
-            cols[col_opened_pre_owner_lo()][row] = pre_factor * claim.owner_lo;
+            cols[layout.col_opened_pre_value()][row] = pre_factor * claim.value;
+            cols[layout.col_opened_pre_owner_hi()][row] = pre_factor * claim.owner_hi;
+            cols[layout.col_opened_pre_owner_lo()][row] = pre_factor * claim.owner_lo;
             // proof_round_digest left zero — Stage 4b.2 fills it.
         }
-        // 4b.2.1: fill every row of each eval-point column with the
-        // constant coordinate. The AIR declares these as
-        // `PublicColumn`s, so `build_trace` will overwrite any drift
-        // anyway, but filling here keeps the witness self-consistent.
-        for i in 0..FRI_STATE_OPEN_LOG_SLOTS {
+        for i in 0..log_slots {
             let r_i = self.eval_point[i];
-            for row in 0..FRI_STATE_OPEN_N_ROWS {
-                cols[col_eval_point(i)][row] = r_i;
+            for row in 0..n_rows {
+                cols[layout.col_eval_point(i)][row] = r_i;
             }
         }
-        // 4b.2.2: fill eq-ladder columns. Per row:
-        //   eq_0 = ONE + r_0 + b_0
-        //   eq_k = eq_{k-1} · (ONE + r_k + b_k), k ≥ 1
-        // On padding rows b_* = 0, so eq_k collapses to ∏ (ONE + r_j)
-        // — harmless arithmetic that downstream stages gate by
-        // `live_mask`.
-        for row in 0..FRI_STATE_OPEN_N_ROWS {
+        for row in 0..n_rows {
             let mut acc = Block128::ZERO;
-            for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
-                let r_k = cols[col_eval_point(k)][row];
-                let b_k = cols[COL_IDX_BIT_BASE + k][row];
+            for k in 0..log_slots {
+                let r_k = cols[layout.col_eval_point(k)][row];
+                let b_k = cols[layout.col_idx_bit(k)][row];
                 let factor = Block128::ONE + r_k + b_k;
                 acc = if k == 0 { factor } else { acc * factor };
-                cols[col_eq_ladder(k)][row] = acc;
+                cols[layout.col_eq_ladder(k)][row] = acc;
             }
         }
-        // 4b.2.3-β.1: γ-powers column. Row `i` holds `γ^i`, starting
-        // from `γ^0 = ONE`. The AIR will overwrite this column via
-        // its `PublicColumn` pin regardless; filling here keeps the
-        // pre-override trace self-consistent.
         let mut power = Block128::ONE;
-        for row in 0..FRI_STATE_OPEN_N_ROWS {
-            cols[col_gamma_powers()][row] = power;
+        for row in 0..n_rows {
+            cols[layout.col_gamma_powers()][row] = power;
             power = power * self.gamma;
         }
-        // 4b.2.3-β.2.a (fused α+β.2.a): per-lane γ-weighted MLE
-        // product, computed directly as the degree-3 triple:
-        //   gp_lane[i] = γ^i · eq_{L-1}(slot_bits_i, r) · opened_pre_lane_i.
-        // No intermediate committed `mle_prod_lane` column — the
-        // degree-3 `TripleProductGate` pins the output row-locally.
-        // Mint / dummy rows carry `opened_pre_lane = 0` ⇒
-        // `gp_lane = 0` by construction.
-        let tail = FRI_STATE_OPEN_LOG_SLOTS - 1;
-        for row in 0..FRI_STATE_OPEN_N_ROWS {
-            let g = cols[col_gamma_powers()][row];
-            let eq_tail = cols[col_eq_ladder(tail)][row];
+        let tail = log_slots - 1;
+        for row in 0..n_rows {
+            let g = cols[layout.col_gamma_powers()][row];
+            let eq_tail = cols[layout.col_eq_ladder(tail)][row];
             let w = g * eq_tail;
-            cols[col_gp_value()][row] = w * cols[col_opened_pre_value()][row];
-            cols[col_gp_owner_hi()][row] = w * cols[col_opened_pre_owner_hi()][row];
-            cols[col_gp_owner_lo()][row] = w * cols[col_opened_pre_owner_lo()][row];
+            cols[layout.col_gp_value()][row] = w * cols[layout.col_opened_pre_value()][row];
+            cols[layout.col_gp_owner_hi()][row] =
+                w * cols[layout.col_opened_pre_owner_hi()][row];
+            cols[layout.col_gp_owner_lo()][row] =
+                w * cols[layout.col_opened_pre_owner_lo()][row];
         }
-        // 4b.2.3-β.2.b: per-lane prefix-sum accumulator.
-        //   acc_lane[0]   = gp_lane[0]
-        //   acc_lane[i+1] = acc_lane[i] + gp_lane[i+1]  (char-2 XOR)
-        // Computed once over the live prefix [0, N_INPUTS), then held
-        // constant on the cyclic padding rows [N_INPUTS, N_ROWS).
-        // Tail rows don't participate in the recurrence — the
-        // step-indicator masks them — so filling with the terminal
-        // value keeps the trace self-consistent under `Trace::new`.
         for (acc_col, gp_col) in [
-            (col_acc_value(), col_gp_value()),
-            (col_acc_owner_hi(), col_gp_owner_hi()),
-            (col_acc_owner_lo(), col_gp_owner_lo()),
+            (layout.col_acc_value(), layout.col_gp_value()),
+            (layout.col_acc_owner_hi(), layout.col_gp_owner_hi()),
+            (layout.col_acc_owner_lo(), layout.col_gp_owner_lo()),
         ] {
             let mut running = cols[gp_col][0];
             cols[acc_col][0] = running;
-            for row in 1..FRI_STATE_OPEN_N_INPUTS {
+            for row in 1..n_inputs {
                 running = running + cols[gp_col][row];
                 cols[acc_col][row] = running;
             }
-            for row in FRI_STATE_OPEN_N_INPUTS..FRI_STATE_OPEN_N_ROWS {
+            for row in n_inputs..n_rows {
                 cols[acc_col][row] = running;
             }
         }
-        // 4c.2: `eq_delta_lane == eq_ladder(L-1) · live_mask ·
-        // delta_lane`, computed row-locally. `live_mask = 0` auto-
-        // zeroes dummy rows — no separate selector branch here.
-        let eq_tail_col = col_eq_ladder(FRI_STATE_OPEN_LOG_SLOTS - 1);
-        for row in 0..FRI_STATE_OPEN_N_ROWS {
+        let eq_tail_col = layout.col_eq_ladder(log_slots - 1);
+        for row in 0..n_rows {
             let eq_tail = cols[eq_tail_col][row];
-            let live = cols[col_live_mask()][row];
+            let live = cols[layout.col_live_mask()][row];
             let factor = eq_tail * live;
-            cols[col_eq_delta_value()][row] = factor * cols[col_delta_value()][row];
-            cols[col_eq_delta_owner_hi()][row] =
-                factor * cols[col_delta_owner_hi()][row];
-            cols[col_eq_delta_owner_lo()][row] =
-                factor * cols[col_delta_owner_lo()][row];
+            cols[layout.col_eq_delta_value()][row] = factor * cols[layout.col_delta_value()][row];
+            cols[layout.col_eq_delta_owner_hi()][row] =
+                factor * cols[layout.col_delta_owner_hi()][row];
+            cols[layout.col_eq_delta_owner_lo()][row] =
+                factor * cols[layout.col_delta_owner_lo()][row];
         }
-        // 4c.2: prefix-sum accumulator of eq_delta_lane. Same shape
-        // as β.2.b — row-0 pin + shifted recurrence over the live
-        // prefix, constant-held across padding rows.
         for (acc_col, src_col) in [
-            (col_delta_acc_value(), col_eq_delta_value()),
-            (col_delta_acc_owner_hi(), col_eq_delta_owner_hi()),
-            (col_delta_acc_owner_lo(), col_eq_delta_owner_lo()),
+            (layout.col_delta_acc_value(), layout.col_eq_delta_value()),
+            (layout.col_delta_acc_owner_hi(), layout.col_eq_delta_owner_hi()),
+            (layout.col_delta_acc_owner_lo(), layout.col_eq_delta_owner_lo()),
         ] {
             let mut running = cols[src_col][0];
             cols[acc_col][0] = running;
-            for row in 1..FRI_STATE_OPEN_N_INPUTS {
+            for row in 1..n_inputs {
                 running = running + cols[src_col][row];
                 cols[acc_col][row] = running;
             }
-            for row in FRI_STATE_OPEN_N_INPUTS..FRI_STATE_OPEN_N_ROWS {
+            for row in n_inputs..n_rows {
                 cols[acc_col][row] = running;
             }
         }
-        // Indicator columns: the AIR overrides these via PublicColumn
-        // pins regardless, but filling them from the same programme
-        // here keeps the pre-override trace self-consistent.
-        for r in 0..FRI_STATE_OPEN_N_INPUTS {
-            cols[col_row_indicator(r)] = row_indicator_programme(r, FRI_STATE_OPEN_N_ROWS);
+        for r in 0..n_inputs {
+            cols[layout.col_row_indicator(r)] = row_indicator_programme(r, n_rows);
         }
-        let step_rows: Vec<usize> = (0..FRI_STATE_OPEN_N_INPUTS - 1).collect();
-        cols[col_acc_step_indicator()] =
-            multi_row_indicator_programme(&step_rows, FRI_STATE_OPEN_N_ROWS);
+        let step_rows: Vec<usize> = (0..n_inputs - 1).collect();
+        cols[layout.col_acc_step_indicator()] =
+            multi_row_indicator_programme(&step_rows, n_rows);
         cols
     }
 }
@@ -989,6 +1133,7 @@ const fn bool_to_block(b: bool) -> Block128 {
 
 /// Stage 4a/4c.1/4c.1-bis AIR.
 pub struct FriStateOpenAir {
+    layout: FriStateOpenLayout,
     n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
     public_columns: Vec<PublicColumn>,
@@ -1009,229 +1154,208 @@ impl FriStateOpenAir {
     ///     each of `value`, `owner_hi`, `owner_lo`. Spend (post = 0,
     ///     pre = value) and mint (pre = 0, post = value) both give
     ///     `delta = value`.
+    /// Build an AIR at the default layout. Accepts any
+    /// `[FriStateOpenClaim]`-shaped thing — `&[_; N_INPUTS]` coerces
+    /// automatically, so legacy callers don't need to change. Panics
+    /// if the slice length doesn't equal `layout.n_inputs`. For
+    /// custom layouts use `new_with_layout`.
     pub fn new(
-        claim_pins: &[FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS],
+        claim_pins: &[FriStateOpenClaim],
         prev_lane_openings: [Block128; 3],
         new_lane_openings: [Block128; 3],
         eval_point: [Block128; FRI_STATE_OPEN_LOG_SLOTS],
         gamma: Block128,
         expected_batched_claims: [Block128; 3],
     ) -> Self {
+        Self::new_with_layout(
+            claim_pins,
+            prev_lane_openings,
+            new_lane_openings,
+            eval_point,
+            gamma,
+            expected_batched_claims,
+            FriStateOpenLayout::DEFAULT,
+        )
+    }
+
+    /// Build an AIR at an explicit layout. `claim_pins.len()` must
+    /// equal `layout.n_inputs`.
+    pub fn new_with_layout(
+        claim_pins: &[FriStateOpenClaim],
+        prev_lane_openings: [Block128; 3],
+        new_lane_openings: [Block128; 3],
+        eval_point: [Block128; FRI_STATE_OPEN_LOG_SLOTS],
+        gamma: Block128,
+        expected_batched_claims: [Block128; 3],
+        layout: FriStateOpenLayout,
+    ) -> Self {
+        assert_eq!(
+            claim_pins.len(),
+            layout.n_inputs,
+            "FriStateOpenAir::new: claim_pins length does not match layout.n_inputs"
+        );
+        let n_rows = layout.n_rows();
+        let log_slots = layout.log_slots;
+        let n_inputs = layout.n_inputs;
         let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
         let mut public_columns: Vec<PublicColumn> = Vec::new();
 
         // Boolean-ness of every slot-index bit column and the three
         // gate columns.
-        for b in 0..FRI_STATE_OPEN_LOG_SLOTS {
-            constraints.push(Box::new(BoolGate::new(COL_IDX_BIT_BASE + b)));
+        for b in 0..log_slots {
+            constraints.push(Box::new(BoolGate::new(layout.col_idx_bit(b))));
         }
-        constraints.push(Box::new(BoolGate::new(col_live_mask())));
-        constraints.push(Box::new(BoolGate::new(col_is_spend())));
-        constraints.push(Box::new(BoolGate::new(col_is_mint())));
+        constraints.push(Box::new(BoolGate::new(layout.col_live_mask())));
+        constraints.push(Box::new(BoolGate::new(layout.col_is_spend())));
+        constraints.push(Box::new(BoolGate::new(layout.col_is_mint())));
 
         // Mutual exclusivity: is_spend · is_mint == 0.
         constraints.push(Box::new(SelectorGate::new(
-            col_is_spend(),
+            layout.col_is_spend(),
             Box::new(WeightedLinearGate::new(
-                vec![(col_is_mint(), Block128::ONE)],
+                vec![(layout.col_is_mint(), Block128::ONE)],
                 Block128::ZERO,
             )),
         )));
 
         // Union: live_mask + is_spend + is_mint == 0 (char-2 XOR).
-        // Under mutual exclusivity this pins live_mask to the OR of
-        // the two action flags.
         constraints.push(Box::new(WeightedLinearGate::new(
             vec![
-                (col_live_mask(), Block128::ONE),
-                (col_is_spend(), Block128::ONE),
-                (col_is_mint(), Block128::ONE),
+                (layout.col_live_mask(), Block128::ONE),
+                (layout.col_is_spend(), Block128::ONE),
+                (layout.col_is_mint(), Block128::ONE),
             ],
             Block128::ZERO,
         )));
 
-        // 4c.1-ter opened-pre-state source columns:
-        // `opened_pre_{value, owner_hi, owner_lo} == is_spend · {value,
-        // owner_hi, owner_lo}`. Each collapses to 0 on mint / dummy
-        // rows, to the claim lane on spend rows — the full pre-state
-        // triple Stage 4b.2 opens against `prev_state_root`.
+        // 4c.1-ter opened-pre-state source columns.
         for (pre_col, claim_col) in [
-            (col_opened_pre_value(), COL_VALUE),
-            (col_opened_pre_owner_hi(), COL_OWNER_HI),
-            (col_opened_pre_owner_lo(), COL_OWNER_LO),
+            (layout.col_opened_pre_value(), layout.col_value()),
+            (layout.col_opened_pre_owner_hi(), layout.col_owner_hi()),
+            (layout.col_opened_pre_owner_lo(), layout.col_owner_lo()),
         ] {
-            constraints.push(Box::new(MulGate::new(pre_col, col_is_spend(), claim_col)));
+            constraints.push(Box::new(MulGate::new(
+                pre_col,
+                layout.col_is_spend(),
+                claim_col,
+            )));
         }
 
         // 4c.1-bis delta identity: on live rows, delta_* == claim_*.
         for (value_col, delta_col) in [
-            (COL_VALUE, col_delta_value()),
-            (COL_OWNER_HI, col_delta_owner_hi()),
-            (COL_OWNER_LO, col_delta_owner_lo()),
+            (layout.col_value(), layout.col_delta_value()),
+            (layout.col_owner_hi(), layout.col_delta_owner_hi()),
+            (layout.col_owner_lo(), layout.col_delta_owner_lo()),
         ] {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![(value_col, Block128::ONE), (delta_col, Block128::ONE)],
                 Block128::ZERO,
             ));
-            constraints.push(Box::new(SelectorGate::new(col_live_mask(), inner)));
+            constraints.push(Box::new(SelectorGate::new(layout.col_live_mask(), inner)));
         }
 
-        // Shared single-hot row indicators. One `PublicColumn` per
-        // input row `r ∈ 0..N_INPUTS`, programme `[0,…,0,1@r,0,…,0]`.
-        // Reused by every boundary single-row tie in this AIR: claim
-        // pins (three lanes per row), `new_state_root_{hi,lo}` (row
-        // 0), β.2.b acc row-0 ties (row 0), and γ-closure terminal
-        // ties (row N_INPUTS - 1). Previously each tie committed its
-        // own indicator → ~18 `PublicColumn`s; this consolidation
-        // cuts that to `N_INPUTS` + one multi-hot step indicator.
-        for r in 0..FRI_STATE_OPEN_N_INPUTS {
+        // Shared single-hot row indicators.
+        for r in 0..n_inputs {
             public_columns.push(PublicColumn::new(
-                col_row_indicator(r),
-                row_indicator_programme(r, FRI_STATE_OPEN_N_ROWS),
+                layout.col_row_indicator(r),
+                row_indicator_programme(r, n_rows),
             ));
         }
 
-        // Per-input boundary pins: every row's (value, owner_hi,
-        // owner_lo) is fixed to the verifier-known claim. Three
-        // pins on the same row share that row's `col_row_indicator`.
+        // Per-input boundary pins.
         for (row, claim) in claim_pins.iter().enumerate() {
             for (target, value) in [
-                (COL_VALUE, claim.value),
-                (COL_OWNER_HI, claim.owner_hi),
-                (COL_OWNER_LO, claim.owner_lo),
+                (layout.col_value(), claim.value),
+                (layout.col_owner_hi(), claim.owner_hi),
+                (layout.col_owner_lo(), claim.owner_lo),
             ] {
                 let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                     vec![(target, Block128::ONE)],
                     value,
                 ));
                 constraints.push(Box::new(SelectorGate::new(
-                    col_row_indicator(row),
+                    layout.col_row_indicator(row),
                     inner,
                 )));
             }
         }
 
-        // 4b.2.1: transcript-derived eval-point pins. Each coordinate
-        // `r_i` gets its own `PublicColumn` with a constant value on
-        // every row. The eq-ladder (4b.2.2) reads `r_i` row-locally
-        // from `col_eval_point(i)`; no boundary gate needed — the
-        // native check enforces column-wide equality to the verifier-
-        // known sequence.
-        for i in 0..FRI_STATE_OPEN_LOG_SLOTS {
+        // 4b.2.1: transcript-derived eval-point pins.
+        for i in 0..log_slots {
             public_columns.push(PublicColumn::new(
-                col_eval_point(i),
-                vec![eval_point[i]; FRI_STATE_OPEN_N_ROWS],
+                layout.col_eval_point(i),
+                vec![eval_point[i]; n_rows],
             ));
         }
 
-        // 4b.2.3-β.1: γ-powers PublicColumn. Row `i` holds `γ^i`,
-        // precomputed natively from the transcript-derived scalar.
-        // Verifier recomputes these `N_ROWS` powers from its own γ,
-        // so forging any row would desync this column from the
-        // verifier-side expected values → native PublicColumn check
-        // fires. No extra constraint gate needed.
-        let mut gamma_powers_vals = Vec::with_capacity(FRI_STATE_OPEN_N_ROWS);
+        // 4b.2.3-β.1: γ-powers PublicColumn.
+        let mut gamma_powers_vals = Vec::with_capacity(n_rows);
         let mut power = Block128::ONE;
-        for _ in 0..FRI_STATE_OPEN_N_ROWS {
+        for _ in 0..n_rows {
             gamma_powers_vals.push(power);
             power = power * gamma;
         }
-        public_columns.push(PublicColumn::new(col_gamma_powers(), gamma_powers_vals));
+        public_columns.push(PublicColumn::new(layout.col_gamma_powers(), gamma_powers_vals));
 
-        // 4b.2.2: eq-ladder recurrence. First step is degree-1
-        // (no `prev` factor), subsequent steps are degree-2 fused
-        // gates. `L` committed columns + `L` constraints; the
-        // naive 2L−1 decomposition (`lin_k = 1 + r_k + b_k` + mul)
-        // would double both counts for the same soundness.
-        //
-        // eq_0 + ONE + r_0 + b_0 == 0  (XOR of three columns + const).
+        // 4b.2.2: eq-ladder recurrence.
         constraints.push(Box::new(WeightedLinearGate::new(
             vec![
-                (col_eq_ladder(0), Block128::ONE),
-                (col_eval_point(0), Block128::ONE),
-                (COL_IDX_BIT_BASE, Block128::ONE),
+                (layout.col_eq_ladder(0), Block128::ONE),
+                (layout.col_eval_point(0), Block128::ONE),
+                (layout.col_idx_bit(0), Block128::ONE),
             ],
             Block128::ONE,
         )));
-        // eq_k + eq_{k-1} · (ONE + r_k + b_k) == 0 for k ≥ 1.
-        for k in 1..FRI_STATE_OPEN_LOG_SLOTS {
+        for k in 1..log_slots {
             constraints.push(Box::new(EqLadderStepGate::new(
-                col_eq_ladder(k),
-                col_eq_ladder(k - 1),
-                col_eval_point(k),
-                COL_IDX_BIT_BASE + k,
+                layout.col_eq_ladder(k),
+                layout.col_eq_ladder(k - 1),
+                layout.col_eval_point(k),
+                layout.col_idx_bit(k),
             )));
         }
 
-        // 4b.2.3-β.2.a (fused α+β.2.a): per-input γ-weighted MLE
-        // product lanes. One degree-3 `TripleProductGate` per lane
-        // pins `gp_lane == γ^i · eq_{L-1}(slot_bits_i, r) ·
-        // opened_pre_lane` directly — no intermediate committed
-        // `mle_prod_lane` column. Dropping the α-intermediate saves
-        // three FRI commitments and three `MulGate`s; quotient
-        // degree on these three constraints goes 2 → 3, already
-        // within the backend's budget (e.g. `poseidon_perm`
-        // MDS-blend). Three lanes kept separate (not merged under
-        // an extra challenge) because the downstream FRI opening's
-        // leaf layout is already three-lane.
-        //
-        // Mint / dummy rows: `opened_pre_lane = 0` ⇒ `gp_lane = 0`
-        // by construction, no selector gating needed.
-        let tail_col = col_eq_ladder(FRI_STATE_OPEN_LOG_SLOTS - 1);
+        // 4b.2.3-β.2.a: per-input γ-weighted MLE product lanes.
+        let tail_col = layout.col_eq_ladder(log_slots - 1);
         for (gp_col, pre_col) in [
-            (col_gp_value(), col_opened_pre_value()),
-            (col_gp_owner_hi(), col_opened_pre_owner_hi()),
-            (col_gp_owner_lo(), col_opened_pre_owner_lo()),
+            (layout.col_gp_value(), layout.col_opened_pre_value()),
+            (layout.col_gp_owner_hi(), layout.col_opened_pre_owner_hi()),
+            (layout.col_gp_owner_lo(), layout.col_opened_pre_owner_lo()),
         ] {
             constraints.push(Box::new(TripleProductGate::new(
                 gp_col,
-                col_gamma_powers(),
+                layout.col_gamma_powers(),
                 tail_col,
                 pre_col,
             )));
         }
 
-        // 4b.2.3-β.2.b: prefix-sum accumulator wiring.
-        //
-        //   acc_lane[0] == gp_lane[0]                         (row-0 pin)
-        //   acc_lane[i+1] == acc_lane[i] + gp_lane[i+1]
-        //     for i ∈ {0, …, N_INPUTS−2}                       (recurrence)
-        //
-        // Both shapes are expressed as XOR-linear gates over char-2
-        // and gated by shared public indicators.
-        //
-        // Row-0 pins: `acc_lane[0] == gp_lane[0]` on each of three
-        // lanes. Reuses the shared `col_row_indicator(0)` already
-        // declared above — no fresh indicator column emitted here.
+        // 4b.2.3-β.2.b: prefix-sum accumulator wiring. Row-0 pins.
         for (acc_col, gp_col) in [
-            (col_acc_value(), col_gp_value()),
-            (col_acc_owner_hi(), col_gp_owner_hi()),
-            (col_acc_owner_lo(), col_gp_owner_lo()),
+            (layout.col_acc_value(), layout.col_gp_value()),
+            (layout.col_acc_owner_hi(), layout.col_gp_owner_hi()),
+            (layout.col_acc_owner_lo(), layout.col_gp_owner_lo()),
         ] {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![(acc_col, Block128::ONE), (gp_col, Block128::ONE)],
                 Block128::ZERO,
             ));
-            constraints.push(Box::new(SelectorGate::new(col_row_indicator(0), inner)));
+            constraints.push(Box::new(SelectorGate::new(
+                layout.col_row_indicator(0),
+                inner,
+            )));
         }
 
-        // Step indicator: multi-hot on rows `0..N_INPUTS-1`. The
-        // shifted recurrence
-        //   acc_lane@row + acc_lane@(row+1) + gp_lane@(row+1) == 0
-        // fires on those rows and is silent at row `N_INPUTS-1` and
-        // on all cyclic-padding rows, which is critical — the
-        // `next(last) == first` wrap would otherwise pin
-        // `acc_lane[0] == acc_lane[N_ROWS-1] + gp_lane[0]`, an
-        // equation on the full γ-RLC rather than a prefix step.
-        let step_rows: Vec<usize> = (0..FRI_STATE_OPEN_N_INPUTS - 1).collect();
+        // Step indicator: multi-hot on rows `0..N_INPUTS-1`.
+        let step_rows: Vec<usize> = (0..n_inputs - 1).collect();
         public_columns.push(PublicColumn::new(
-            col_acc_step_indicator(),
-            multi_row_indicator_programme(&step_rows, FRI_STATE_OPEN_N_ROWS),
+            layout.col_acc_step_indicator(),
+            multi_row_indicator_programme(&step_rows, n_rows),
         ));
         for (acc_col, gp_col) in [
-            (col_acc_value(), col_gp_value()),
-            (col_acc_owner_hi(), col_gp_owner_hi()),
-            (col_acc_owner_lo(), col_gp_owner_lo()),
+            (layout.col_acc_value(), layout.col_gp_value()),
+            (layout.col_acc_owner_hi(), layout.col_gp_owner_hi()),
+            (layout.col_acc_owner_lo(), layout.col_gp_owner_lo()),
         ] {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGateShifted::new(
                 vec![(acc_col, Block128::ONE)],
@@ -1239,108 +1363,73 @@ impl FriStateOpenAir {
                 Block128::ZERO,
             ));
             constraints.push(Box::new(SelectorGate::new(
-                col_acc_step_indicator(),
+                layout.col_acc_step_indicator(),
                 inner,
             )));
         }
 
-        // 4b.2.3-γ — verifier-claim closure. Pin each terminal-row
-        // accumulator cell to the verifier-known batched γ-RLC
-        // claim for its lane:
-        //
-        //   acc_lane[N_INPUTS - 1] == expected_batched_claim_lane
-        //
-        // gated by the shared `col_row_indicator(N_INPUTS - 1)`
-        // declared above — no fresh indicator column emitted here.
-        //
-        // Soundness. `col_acc_lane[N_INPUTS - 1]` is by β.2
-        // construction equal to
-        //   Σ_i γ^i · eq(r, slot_bits_i) · pre_lane_i,
-        // i.e. the per-lane batched claim the FRI opening against
-        // `prev_state_root` is responsible for cross-checking. The
-        // three pins here are the AIR-internal half of that
-        // cross-check: they assert the accumulator landed on the
-        // same value the transcript / FRI opening expects. The
-        // FRI side is out-of-scope for this AIR.
+        // 4b.2.3-γ — verifier-claim closure.
+        let terminal_row = layout.acc_terminal_row();
         for (acc_col, expected) in [
-            (col_acc_value(), expected_batched_claims[0]),
-            (col_acc_owner_hi(), expected_batched_claims[1]),
-            (col_acc_owner_lo(), expected_batched_claims[2]),
+            (layout.col_acc_value(), expected_batched_claims[0]),
+            (layout.col_acc_owner_hi(), expected_batched_claims[1]),
+            (layout.col_acc_owner_lo(), expected_batched_claims[2]),
         ] {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![(acc_col, Block128::ONE)],
                 expected,
             ));
             constraints.push(Box::new(SelectorGate::new(
-                col_row_indicator(FRI_STATE_OPEN_ACC_TERMINAL_ROW),
+                layout.col_row_indicator(terminal_row),
                 inner,
             )));
         }
 
-        // 4c.2 — per-lane MLE update identity. Three-part wiring per
-        // lane: (i) a degree-3 fused `eq_delta_lane == eq_ladder(L-1)
-        // · live_mask · delta_lane` triple; (ii) a β.2.b-shape
-        // prefix-sum accumulator `delta_acc_lane` over `eq_delta_lane`
-        // with row-0 pin + shifted recurrence; (iii) a terminal
-        // update-closure pin `delta_acc_lane[N-1] == prev_f_L(r) +
-        // new_f_L(r)` — a single-lane `WeightedLinearGate` with the
-        // verifier-known XOR of the two PCS openings as its constant
-        // offset. All indicators reuse β.2.b's `col_row_indicator(0)`,
-        // `col_row_indicator(N_INPUTS-1)`, and `col_acc_step_indicator`
-        // — zero new indicator columns.
-        //
-        // The roadmap's straight-line form pinned `prev_f_L(r)` and
-        // `new_f_L(r)` as row-0-pinned witness columns and used a
-        // three-term terminal gate; here both scalars are
-        // verifier-known so they collapse into the terminal gate's
-        // constant offset, saving 6 committed columns + 6 row-0 pins.
+        // 4c.2 — per-lane MLE update identity.
         let lane_bundles: [(usize, usize, usize, Block128); 3] = [
             (
-                col_eq_delta_value(),
-                col_delta_acc_value(),
-                col_delta_value(),
+                layout.col_eq_delta_value(),
+                layout.col_delta_acc_value(),
+                layout.col_delta_value(),
                 prev_lane_openings[0] + new_lane_openings[0],
             ),
             (
-                col_eq_delta_owner_hi(),
-                col_delta_acc_owner_hi(),
-                col_delta_owner_hi(),
+                layout.col_eq_delta_owner_hi(),
+                layout.col_delta_acc_owner_hi(),
+                layout.col_delta_owner_hi(),
                 prev_lane_openings[1] + new_lane_openings[1],
             ),
             (
-                col_eq_delta_owner_lo(),
-                col_delta_acc_owner_lo(),
-                col_delta_owner_lo(),
+                layout.col_eq_delta_owner_lo(),
+                layout.col_delta_acc_owner_lo(),
+                layout.col_delta_owner_lo(),
                 prev_lane_openings[2] + new_lane_openings[2],
             ),
         ];
 
-        // (i) Degree-3 fused `eq_delta_lane == eq_ladder(L-1) ·
-        // live_mask · delta_lane`. `live_mask` factor auto-kills
-        // dummy rows; no separate selector wrap needed. Mirrors the
-        // β.2.a `gp_lane` fusion rationale.
+        // (i) Degree-3 fused eq_delta triple.
         for &(eq_delta_col, _, delta_col, _) in &lane_bundles {
             constraints.push(Box::new(TripleProductGate::new(
                 eq_delta_col,
                 tail_col,
-                col_live_mask(),
+                layout.col_live_mask(),
                 delta_col,
             )));
         }
 
-        // (ii-a) Row-0 prefix-sum pins: `delta_acc_lane[0] ==
-        // eq_delta_lane[0]`, shared `col_row_indicator(0)`.
+        // (ii-a) Row-0 prefix-sum pins.
         for &(eq_delta_col, acc_col, _, _) in &lane_bundles {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![(acc_col, Block128::ONE), (eq_delta_col, Block128::ONE)],
                 Block128::ZERO,
             ));
-            constraints.push(Box::new(SelectorGate::new(col_row_indicator(0), inner)));
+            constraints.push(Box::new(SelectorGate::new(
+                layout.col_row_indicator(0),
+                inner,
+            )));
         }
 
-        // (ii-b) Shifted recurrence `delta_acc[i] + delta_acc[i+1] +
-        // eq_delta[i+1] == 0`, gated by the shared
-        // `col_acc_step_indicator` multi-hot programme.
+        // (ii-b) Shifted recurrence.
         for &(eq_delta_col, acc_col, _, _) in &lane_bundles {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGateShifted::new(
                 vec![(acc_col, Block128::ONE)],
@@ -1348,31 +1437,34 @@ impl FriStateOpenAir {
                 Block128::ZERO,
             ));
             constraints.push(Box::new(SelectorGate::new(
-                col_acc_step_indicator(),
+                layout.col_acc_step_indicator(),
                 inner,
             )));
         }
 
-        // (iii) Terminal update-closure pin — `delta_acc_lane[N-1] ==
-        // prev_f_L(r) + new_f_L(r)`. Single-lane WeightedLinearGate
-        // with the verifier-known XOR as constant offset; reuses the
-        // consolidated terminal indicator already declared above.
+        // (iii) Terminal update-closure pin.
         for &(_, acc_col, _, expected_diff) in &lane_bundles {
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![(acc_col, Block128::ONE)],
                 expected_diff,
             ));
             constraints.push(Box::new(SelectorGate::new(
-                col_row_indicator(FRI_STATE_OPEN_ACC_TERMINAL_ROW),
+                layout.col_row_indicator(terminal_row),
                 inner,
             )));
         }
 
         Self {
-            n_cols: FRI_STATE_OPEN_WITNESS_COLS,
+            layout,
+            n_cols: layout.witness_cols(),
             constraints,
             public_columns,
         }
+    }
+
+    /// Read-only view of the layout this AIR was built against.
+    pub fn layout(&self) -> FriStateOpenLayout {
+        self.layout
     }
 
     /// Destructure the AIR into its wiring parts, consuming `self`.
@@ -1398,7 +1490,7 @@ impl Air for FriStateOpenAir {
         self.n_cols
     }
     fn log_rows(&self) -> usize {
-        FRI_STATE_OPEN_LOG_ROWS
+        self.layout.log_rows
     }
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
@@ -1412,6 +1504,55 @@ impl Air for FriStateOpenAir {
 mod tests {
     use super::*;
     use crate::Trace;
+
+    /// E.2.a.1 parity: `FriStateOpenLayout::DEFAULT` returns the same
+    /// column indices / widths as the legacy `pub const` / `pub const
+    /// fn col_*()` accessors. Guards against drift in either surface
+    /// while both exist.
+    #[test]
+    fn layout_matches_legacy_consts() {
+        let lay = FriStateOpenLayout::DEFAULT;
+        assert_eq!(lay.n_inputs, FRI_STATE_OPEN_N_INPUTS);
+        assert_eq!(lay.log_slots, FRI_STATE_OPEN_LOG_SLOTS);
+        assert_eq!(lay.n_rows(), FRI_STATE_OPEN_N_ROWS);
+        assert_eq!(lay.acc_terminal_row(), FRI_STATE_OPEN_ACC_TERMINAL_ROW);
+        assert_eq!(lay.witness_cols(), FRI_STATE_OPEN_WITNESS_COLS);
+        assert_eq!(lay.col_value(), COL_VALUE);
+        assert_eq!(lay.col_owner_hi(), COL_OWNER_HI);
+        assert_eq!(lay.col_owner_lo(), COL_OWNER_LO);
+        for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
+            assert_eq!(lay.col_idx_bit(k), COL_IDX_BIT_BASE + k);
+            assert_eq!(lay.col_eval_point(k), col_eval_point(k));
+            assert_eq!(lay.col_eq_ladder(k), col_eq_ladder(k));
+        }
+        assert_eq!(lay.col_delta_value(), col_delta_value());
+        assert_eq!(lay.col_delta_owner_hi(), col_delta_owner_hi());
+        assert_eq!(lay.col_delta_owner_lo(), col_delta_owner_lo());
+        assert_eq!(lay.col_proof_round_digest(), col_proof_round_digest());
+        assert_eq!(lay.col_live_mask(), col_live_mask());
+        assert_eq!(lay.col_is_spend(), col_is_spend());
+        assert_eq!(lay.col_is_mint(), col_is_mint());
+        assert_eq!(lay.col_opened_pre_value(), col_opened_pre_value());
+        assert_eq!(lay.col_opened_pre_owner_hi(), col_opened_pre_owner_hi());
+        assert_eq!(lay.col_opened_pre_owner_lo(), col_opened_pre_owner_lo());
+        assert_eq!(lay.col_eq_delta_value(), col_eq_delta_value());
+        assert_eq!(lay.col_eq_delta_owner_hi(), col_eq_delta_owner_hi());
+        assert_eq!(lay.col_eq_delta_owner_lo(), col_eq_delta_owner_lo());
+        assert_eq!(lay.col_delta_acc_value(), col_delta_acc_value());
+        assert_eq!(lay.col_delta_acc_owner_hi(), col_delta_acc_owner_hi());
+        assert_eq!(lay.col_delta_acc_owner_lo(), col_delta_acc_owner_lo());
+        assert_eq!(lay.col_gamma_powers(), col_gamma_powers());
+        assert_eq!(lay.col_gp_value(), col_gp_value());
+        assert_eq!(lay.col_gp_owner_hi(), col_gp_owner_hi());
+        assert_eq!(lay.col_gp_owner_lo(), col_gp_owner_lo());
+        assert_eq!(lay.col_acc_value(), col_acc_value());
+        assert_eq!(lay.col_acc_owner_hi(), col_acc_owner_hi());
+        assert_eq!(lay.col_acc_owner_lo(), col_acc_owner_lo());
+        for r in 0..FRI_STATE_OPEN_N_INPUTS {
+            assert_eq!(lay.col_row_indicator(r), col_row_indicator(r));
+        }
+        assert_eq!(lay.col_acc_step_indicator(), col_acc_step_indicator());
+    }
 
     /// Build a live-spend claim: delta equals the claim triple.
     fn mk_spend(seed: u128, slot: u32) -> FriStateOpenClaim {
@@ -2445,5 +2586,95 @@ mod tests {
         // spend-secret field.
         const SECRET_COLUMN_COUNT: usize = 0;
         assert_eq!(SECRET_COLUMN_COUNT, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // E.2.b — second instance at n_inputs=8. Exercises the Layout /
+    // new_with_layout / from_claims_with_layout surface end-to-end:
+    // the AIR must build, accept an honest trace, and reject a
+    // forged delta — all without touching the default-shape instance.
+    // ---------------------------------------------------------------
+
+    /// `Layout { n_inputs: 8, log_slots: 4, log_rows: 3 }` — n_rows=8
+    /// is the tight lower bound (n_rows ≥ n_inputs). All slot indices
+    /// fit in log_slots=4.
+    const LAYOUT_N8: FriStateOpenLayout = FriStateOpenLayout::new(8, 4, 3);
+
+    fn mk_claims_n8() -> [FriStateOpenClaim; 8] {
+        [
+            mk_spend(11, 0),
+            mk_spend(22, 3),
+            mk_mint(33, 5),
+            mk_spend(44, 9),
+            mk_mint(55, 12),
+            mk_spend(66, 15),
+            FriStateOpenClaim::EMPTY,
+            FriStateOpenClaim::EMPTY,
+        ]
+    }
+
+    fn mk_witness_n8(claims: [FriStateOpenClaim; 8]) -> FriStateOpenWitness {
+        let base = FriStateOpenWitness::from_claims_with_layout(claims, LAYOUT_N8)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev = mk_prev_lane_openings();
+        let new = base.expected_new_lane_openings(prev);
+        base.with_lane_openings(prev, new)
+    }
+
+    fn mk_air_n8(claims: [FriStateOpenClaim; 8]) -> FriStateOpenAir {
+        let w = mk_witness_n8(claims);
+        FriStateOpenAir::new_with_layout(
+            &claims,
+            w.prev_lane_openings,
+            w.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            w.expected_batched_claims(),
+            LAYOUT_N8,
+        )
+    }
+
+    #[test]
+    fn layout_n8_shape_is_consistent() {
+        let lay = LAYOUT_N8;
+        assert_eq!(lay.n_rows(), 8);
+        assert_eq!(lay.acc_terminal_row(), 7);
+        // witness_cols is n_inputs-dependent — must differ from DEFAULT.
+        assert!(lay.witness_cols() > FriStateOpenLayout::DEFAULT.witness_cols());
+    }
+
+    #[test]
+    fn n8_honest_trace_accepts() {
+        let claims = mk_claims_n8();
+        let air = mk_air_n8(claims);
+        assert_eq!(air.layout().n_inputs, 8);
+        assert_eq!(air.n_columns(), LAYOUT_N8.witness_cols());
+        assert_eq!(air.log_rows(), 3);
+        let trace = Trace::new(air.build_trace(&mk_witness_n8(claims)));
+        assert!(air.check(&trace));
+    }
+
+    #[test]
+    fn n8_rejects_forged_live_delta() {
+        // Sanity: the bigger instance is not trivially accepting.
+        // Tamper delta_value on a live spend row — the 4c.1-bis
+        // delta-identity SelectorGate must fire.
+        let claims = mk_claims_n8();
+        let air = mk_air_n8(claims);
+        let mut cols = air.build_trace(&mk_witness_n8(claims));
+        cols[LAYOUT_N8.col_delta_value()][0] =
+            cols[LAYOUT_N8.col_delta_value()][0] + Block128::ONE;
+        assert!(!air.check(&Trace::new(cols)));
+    }
+
+    #[test]
+    fn n8_default_instance_unaffected() {
+        // E.2.b invariant: spinning up an n_inputs=8 AIR must not
+        // disturb the default n_inputs=4 instance on the same process.
+        let _air_big = mk_air_n8(mk_claims_n8());
+        let air_small = mk_air();
+        let trace = Trace::new(air_small.build_trace(&mk_witness(mk_claims())));
+        assert!(air_small.check(&trace));
     }
 }

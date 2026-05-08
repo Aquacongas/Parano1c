@@ -100,6 +100,21 @@ impl Poseidon2bSponge {
         self.squeeze_32()
     }
 
+    /// Squeeze a 32-byte digest without applying a padding flush.
+    ///
+    /// Only sound for **fixed-length** absorb schedules where
+    /// `filled_bytes == 0` at squeeze time, i.e. the caller absorbed
+    /// a whole number of rate blocks. Domain separation between this
+    /// no-pad construction and the pad-flushed [`Self::finalize`] must
+    /// come from a distinct capacity IV (see `TAG_OUTLEAF`).
+    pub fn finalize_no_pad(self) -> [u8; 32] {
+        debug_assert_eq!(
+            self.filled_bytes, 0,
+            "finalize_no_pad requires a whole number of rate blocks"
+        );
+        self.squeeze_32()
+    }
+
     /// Squeeze two field elements without finalizing (for streaming).
     pub fn squeeze(&mut self) -> [Block128; 2] {
         let out = [self.state[0], self.state[1]];

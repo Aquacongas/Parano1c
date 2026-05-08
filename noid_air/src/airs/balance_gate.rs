@@ -63,6 +63,12 @@ pub const BALANCE_N_COLS: usize = BALANCE_N_BLOCKS * BIT_ADDER_N_COLS;
 /// `log_rows >= 8` floor forcing a second zero-filled instance.
 pub const BALANCE_MIN_LOG_ROWS: usize = 8;
 
+/// E.5.f₄ — public accessor for the `B21` block column offset. `B21`
+/// is the last block in the B chain (B20 + fee, 67-bit output). Used
+/// by `tx_validity_with_spine` to pin `coinbase_credit` against
+/// `B21.sum` on coinbase txs.
+pub const BALANCE_BLK_B21: usize = BALANCE_N_BLOCKS - 1;
+
 /// Block ordinals inside the composite column matrix. Each occupies 6
 /// contiguous columns starting at `ordinal * 6`.
 const BLK_A0: usize = 0;
@@ -328,12 +334,33 @@ fn src_sum_col(block: usize) -> usize {
 /// standalone layout. Used by Stage 3b-4 to embed this AIR as a
 /// sub-circuit of `TxValidityAir` at an arbitrary column offset.
 pub fn emit_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
-    let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
+    let (mut internal, cross) = emit_balance_constraints_split(base_col);
+    internal.extend(cross);
+    internal
+}
+
+/// E.5.f₄ — split variant for callers that need to mux the cross-chain
+/// equality gates (A2 ≡ B21) independently of the balance internals.
+///
+/// Returns `(internal, cross_chain_equality)`:
+/// - `internal`: per-block `bit_adder` gates, inter-block bridges and
+///   the B-chain overflow gates (`BalanceZeroAtTransitionGate` ×2).
+///   These always hold — both for regular and coinbase txs — because
+///   they express the integer-addition semantics of the chains, not
+///   the UTXO conservation law.
+/// - `cross_chain_equality`: the two A ≡ B equality gates
+///   (`BalanceFinalSumGate`, `BalanceFinalCarryGate`). These encode
+///   `Σ inputs ≡ Σ outputs + fee` — silenced by the WithSpine mux on
+///   coinbase txs where this identity does not apply.
+pub fn emit_balance_constraints_split(
+    base_col: usize,
+) -> (Vec<Box<dyn Constraint>>, Vec<Box<dyn Constraint>>) {
+    let mut internal: Vec<Box<dyn Constraint>> = Vec::new();
 
     // Per-block bit_adder constraints at shifted layouts.
     for blk in 0..BALANCE_N_BLOCKS {
         let layout = BitAdderLayout::shifted(base_col + blk * BIT_ADDER_N_COLS);
-        constraints.extend(emit_block_constraints(layout));
+        internal.extend(emit_block_constraints(layout));
     }
 
     // Bridges.
@@ -342,12 +369,12 @@ pub fn emit_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
         let src_sum = src_sum_col_at(b.src, base_col);
         let src_carry = src_carry_col_at(b.src, base_col);
         let src_is_input = src_is_input_col_at(b.src, base_col);
-        constraints.push(Box::new(BalanceBridgeBitsGate::new(
+        internal.push(Box::new(BalanceBridgeBitsGate::new(
             src_is_input,
             dst,
             src_sum,
         )));
-        constraints.push(Box::new(BalanceBridgeCarryGate::new(
+        internal.push(Box::new(BalanceBridgeCarryGate::new(
             src_is_input,
             dst,
             src_carry,
@@ -363,26 +390,21 @@ pub fn emit_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
     let b21_carry = src_carry_col_at(BLK_B21, base_col);
     let b21_is_input = src_is_input_col_at(BLK_B21, base_col);
 
-    constraints.push(Box::new(BalanceFinalSumGate::new(
-        a2_is_input,
-        a2_sum,
-        b21_sum,
-    )));
-    constraints.push(Box::new(BalanceFinalCarryGate::new(
-        a2_is_input,
-        a2_carry,
-        b21_sum,
-    )));
-    constraints.push(Box::new(BalanceZeroAtTransitionGate::new(
+    // B-chain integer overflow guards — stay active on coinbase.
+    internal.push(Box::new(BalanceZeroAtTransitionGate::new(
         b20_is_input,
         b21_sum,
     )));
-    constraints.push(Box::new(BalanceZeroAtTransitionGate::new(
+    internal.push(Box::new(BalanceZeroAtTransitionGate::new(
         b21_is_input,
         b21_carry,
     )));
 
-    constraints
+    let cross: Vec<Box<dyn Constraint>> = vec![
+        Box::new(BalanceFinalSumGate::new(a2_is_input, a2_sum, b21_sum)),
+        Box::new(BalanceFinalCarryGate::new(a2_is_input, a2_carry, b21_sum)),
+    ];
+    (internal, cross)
 }
 
 /// Build the 66-column balance sub-trace (operand bits, sums, carries,

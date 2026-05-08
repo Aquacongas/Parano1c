@@ -14,7 +14,7 @@ pub mod types;
 pub mod wire;
 
 pub use body_hash::hash_tx_body;
-pub use public::PublicInputs;
+pub use public::{PublicInputs, MAX_LOG_SLOTS, MIN_LOG_SLOTS};
 pub use types::{Transaction, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 pub use wire::{
     WireError, PUBLIC_INPUTS_WIRE_SIZE, TX_BODY_VERSION, TX_INPUT_WIRE_SIZE, TX_OUTPUT_WIRE_SIZE,

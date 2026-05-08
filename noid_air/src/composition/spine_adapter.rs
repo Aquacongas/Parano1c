@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 5.7 — PR A: spine-embedding adapter scaffold.
+//! Spine-embedding adapter — layout and typed-cell accessors.
 //!
-//! Pure-additive layout/typed-view module. Defines where a
-//! [`crate::airs::tx_body_spine::TxBodySpineComposite`] block will be
-//! placed inside the outer Stage 5 composite, and exposes typed
-//! `(col, row)` accessors for the cells PR B will use as bridge dsts:
+//! Defines where a
+//! [`crate::airs::tx_body_spine::TxBodySpineComposite`] block sits
+//! inside the outer tx-validity composite and exposes typed
+//! `(col, row)` accessors for the cells used as bridge dsts:
 //!
 //! - **T2a dst** (auth-tag tie, per input `i ∈ 0..MAX_INPUTS`):
 //!   [`SpineEmbeddingLayout::auth_tag_hi_outer_cell`] /
@@ -14,24 +14,23 @@
 //!   `TxValidityCol::AuthTagHi/Lo` (composite-internal cols 8/9, row
 //!   `i`) inside the embedded spine.
 //!
-//! - **T3 dst** (per output `j ∈ 0..MAX_OUTPUTS`):
+//! - **Output leaf absorb row** (per output `j ∈ 0..MAX_OUTPUTS`):
 //!   [`SpineEmbeddingLayout::output_leaf_a_outer_cell`] — points at
-//!   the `OutputLeafPermA` E.4.c rate-absorb payload row inside the
-//!   spine's `TxBodyMerkle` block, on the canonical payload column
-//!   shared across all leaf-rate slots.
+//!   the `OutputLeafPermA` rate-absorb payload row inside the spine's
+//!   `TxBodyMerkle` block, on the canonical payload column shared
+//!   across all leaf-rate slots. This cell is pinned directly by
+//!   `TxBodyMerkleAir`'s `o1_payload_programme` public column.
 //!
 //! - **T2b dst** (tx-body-hash tie, per input):
 //!   [`SpineEmbeddingLayout::wrap_output_outer_cell`] — points at the
 //!   wrap-perm output row `(s[0..1] @ wrap_slot_base_row + N_ROUNDS)`
 //!   inside the spine's `TxBodyMerkle` block. This is the canonical
 //!   single origin of `tx_body_hash` per the audit § 1 / § 6.2
-//!   invariants pinned in PR pre-5.7 hardening.
+//!   invariants.
 //!
-//! PR A does **not** modify any existing composite; it only adds
-//! these typed accessors so PR B can wire bridges without hardcoding
-//! offsets. All accessors derive their values from
-//! `build_instance_layout()` and the spine's public column-offset
-//! constants — they cannot drift out of sync silently.
+//! All accessors derive their values from `build_instance_layout()`
+//! and the spine's public column-offset constants — they cannot drift
+//! out of sync silently.
 
 use crate::airs::tx_body_merkle::{
     build_instance_layout, leaf_rate_payload_col, InstanceRole, N_ROUNDS,
@@ -181,17 +180,16 @@ impl SpineEmbeddingLayout {
     }
 
     // -----------------------------------------------------------------
-    // T3 dst — output leaf payload (output j)
+    // Output leaf absorb row — output leaf payload (output j)
     // -----------------------------------------------------------------
 
     /// Outer cell carrying the `OutputLeafPermA` lane-`lane` payload
     /// for output `j`. Row is the PermA `slot_base_row` derived from
     /// `build_instance_layout()`; column is the canonical leaf-rate
     /// payload column for `lane` (E.4.c-1: column does not depend on
-    /// slot).
-    ///
-    /// Used as the **T3 bridge dst** in PR B, replacing the 5.6-era
-    /// `pinned_row_programme(output_leaf_hash)` `PublicColumn`.
+    /// slot). This cell is pinned directly by
+    /// `TxBodyMerkleAir`'s `o1_payload_programme` public column,
+    /// closing the output-leaf-absorb binding.
     pub fn output_leaf_a_outer_cell(&self, output: usize, lane: usize) -> Cell {
         assert!(
             output < MAX_OUTPUTS,
@@ -380,7 +378,8 @@ mod tests {
         assert_eq!(lo.col, hi.col + 1);
         assert_eq!(hi.row, lo.row);
         // Wrap-output lives strictly past the leaf-payload rows for
-        // every output, so it cannot collide with a T3 dst row.
+        // every output, so it cannot collide with an output-leaf
+        // absorb row.
         for output in 0..MAX_OUTPUTS {
             let leaf_row = layout.output_leaf_a_outer_cell(output, 0).row;
             assert_ne!(hi.row, leaf_row, "wrap-output row collides with output {output} leaf-A row");

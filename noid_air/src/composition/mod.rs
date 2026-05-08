@@ -14,7 +14,6 @@
 pub mod bridge;
 pub mod haddr_block;
 pub mod hauth_block;
-pub mod hleaf_block;
 pub mod placement;
 pub mod registry;
 pub mod row_window;
@@ -31,7 +30,7 @@ pub use bridge::{
 };
 pub use placement::{validate_placements, CompositePlacement, PlacementError};
 pub use registry::{
-    CombinerCompositeCols, FriStateOpenCols, HAddrCols, HAuthCols, HLeafCols,
+    CombinerCompositeCols, FriStateOpenCols, HAddrCols, HAuthCols,
     TxBodyMerkleCols, TxValidityCols,
 };
 pub use spine_adapter::{SpineEmbeddingLayout, SpineLayoutError};
@@ -61,16 +60,11 @@ pub use tx_validity_hauth::{
     FULL_HAUTH_BLOCKS_BASE, HAUTH_BLOCK_OUTER_COLS, PRE_S_B_DST_BASE,
     TX_VALIDITY_HAUTH_LOG_ROWS, TX_VALIDITY_HAUTH_N_COLS,
 };
-pub use hleaf_block::{
-    emit_hleaf_block, write_hleaf_block_trace, HLeafBlockColumns, HLeafBlockParams,
-    HLeafBlockTargets, HLeafBlockTraceCells, HLeafBlockWiring,
-};
 pub use tx_validity_leaf::{
-    leaf_block_base, leaf_hash_dst_cols, native_output_leaf_hash, TxValidityCompositeLeaf,
-    HLEAF_BLOCK_OUTER_COLS, LEAF_BLOCKS_BASE, LEAF_HASH_DST_BASE, N_OUTPUTS,
-    TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
+    TxValidityCompositeLeaf, TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
 };
 pub use tx_validity_with_spine::{
-    build_stage_5_7_honest_fixture, tx_validity_with_spine_n_cols, TxValidityCompositeWithSpine,
-    LEAF_BAND_RESERVED, SPINE_BLOCK_OUTER_BASE, TX_VALIDITY_WITH_SPINE_LOG_ROWS,
+    build_stage_5_7_honest_fixture, coinbase_credit_bit_col, tx_validity_with_spine_n_cols,
+    TxValidityCompositeWithSpine, WithSpineOptions, LEAF_BAND_RESERVED, SPINE_BLOCK_OUTER_BASE,
+    TX_VALIDITY_WITH_SPINE_LOG_ROWS,
 };

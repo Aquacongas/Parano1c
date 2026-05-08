@@ -49,6 +49,14 @@ pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
 pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
+/// Fixed-length 4-field output-leaf sponge: `[slot, value, owner_hi,
+/// owner_lo]` absorbed as two rate blocks with no padding flush
+/// (total: 2 permutations). Symmetric twin of the AIR's
+/// `OutputLeafPermA + OutputLeafPermB` schedule in
+/// `noid_air::airs::tx_body_merkle`. Distinct from `TAG_LEAF` so the
+/// no-pad 4-field output-leaf construction cannot collide with the
+/// pad-flushed variable-length `hash_leaf` under the same IV.
+pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
 
 #[cfg(test)]
 mod tests {
@@ -68,6 +76,7 @@ mod tests {
             TAG_COMPRESS,
             TAG_DAWTNSS,
             TAG_FRISTATE,
+            TAG_OUTLEAF,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

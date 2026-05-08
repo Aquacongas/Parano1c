@@ -7,13 +7,19 @@
 
 use crate::{Constraint, EvalFrame, FlatEvalFrame};
 use noid_core::hardware::clmul_gcm;
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 
-/// `selector · inner == 0`. Degree is `1 + inner.degree()`. Rotation
-/// reads forward from `inner.shifted_columns()`; the selector column is
-/// local-only.
+/// `selector · inner == 0` (or `(1 + selector) · inner == 0` when
+/// constructed via [`SelectorGate::new_negated`]). Degree is
+/// `1 + inner.degree()`. Rotation reads forward from
+/// `inner.shifted_columns()`; the selector column is local-only.
 pub struct SelectorGate {
     selector_col: usize,
+    /// When `true`, evaluates as `(1 + selector) · inner`; i.e. fires
+    /// on `selector == 0`, suppressed on `selector == 1`. Used when a
+    /// row-constant marker (e.g. tx-level `is_coinbase`) must silence
+    /// a sub-circuit wholesale.
+    negated: bool,
     inner: Box<dyn Constraint>,
     cols: Vec<usize>,
     shifted: Vec<usize>,
@@ -23,6 +29,16 @@ pub struct SelectorGate {
 
 impl SelectorGate {
     pub fn new(selector_col: usize, inner: Box<dyn Constraint>) -> Self {
+        Self::build(selector_col, inner, false)
+    }
+
+    /// `(1 + selector) · inner == 0` — fires when `selector = 0`,
+    /// suppressed when `selector = 1`. The GF(2) complement pattern.
+    pub fn new_negated(selector_col: usize, inner: Box<dyn Constraint>) -> Self {
+        Self::build(selector_col, inner, true)
+    }
+
+    fn build(selector_col: usize, inner: Box<dyn Constraint>, negated: bool) -> Self {
         let inner_cols: Vec<usize> = inner.columns().to_vec();
         let mut cols = vec![selector_col];
         for &c in &inner_cols {
@@ -37,6 +53,7 @@ impl SelectorGate {
         let shifted = inner.shifted_columns().to_vec();
         Self {
             selector_col,
+            negated,
             inner,
             cols,
             shifted,
@@ -60,7 +77,8 @@ impl Constraint for SelectorGate {
         &self.shifted
     }
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
-        let selector = frame.local[0];
+        let raw = frame.local[0];
+        let selector = if self.negated { Block128::ONE + raw } else { raw };
         if self.inner_local_remap.is_empty() {
             return selector * self.inner.evaluate(EvalFrame {
                 local: &[],
@@ -83,7 +101,11 @@ impl Constraint for SelectorGate {
     /// the tower `selector * inner` becomes `clmul_gcm(selector,
     /// inner.evaluate_flat(...))`. The index-remap mirrors the tower path.
     fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
-        let selector = frame.local[0];
+        // Selector columns are GF(2)-valued, so their flat representation
+        // is the same integer (0 or 1). The `(1 + selector)` complement
+        // over char-2 is `selector ^ 1`.
+        let raw = frame.local[0];
+        let selector = if self.negated { raw ^ 1u128 } else { raw };
         if self.inner_local_remap.is_empty() {
             return clmul_gcm(
                 selector,
@@ -153,6 +175,75 @@ mod tests {
             (0u128, 0u128, 0u128),
             (1, 0xdeadbeef, 0xcafef00d),
             (0, 0xffff_ffff_ffff_ffff, 1),
+            (1, 0x1234_5678_90ab_cdef, 0xfedc_ba98_7654_3210),
+        ] {
+            let s = Block128::from(s_raw);
+            let a = Block128::from(a_raw);
+            let b = Block128::from(b_raw);
+            let tower_out = <SelectorGate as Constraint>::evaluate(
+                &sel,
+                EvalFrame { local: &[s, a, b], next: &[] },
+            );
+            let flat_out = <SelectorGate as Constraint>::evaluate_flat(
+                &sel,
+                FlatEvalFrame {
+                    local: &[
+                        tower_to_flat_u128(s.0),
+                        tower_to_flat_u128(a.0),
+                        tower_to_flat_u128(b.0),
+                    ],
+                    next: &[],
+                },
+            );
+            assert_eq!(flat_out, tower_to_flat_u128(tower_out.0));
+        }
+    }
+
+    /// `new_negated` — inner fires when selector = 0, is suppressed
+    /// when selector = 1. Dual of `selector_gate_suppresses_on_zero_selector`.
+    #[test]
+    fn selector_gate_negated_suppresses_on_one_selector() {
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let sel = SelectorGate::new_negated(0, inner);
+        let air = CompositeAir::from_parts(2, 3, vec![Box::new(sel)]);
+        let n = 1 << 2;
+        let col0 = vec![Block128::ONE; n];
+        let col1: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 + 1)).collect();
+        let col2 = vec![Block128::from(42u128); n];
+        let trace = Trace::new(vec![col0, col1, col2]);
+        assert!(air.check(&trace));
+    }
+
+    /// `new_negated` — inner fires when selector = 0: violating rows
+    /// must reject.
+    #[test]
+    fn selector_gate_negated_fires_on_zero_selector() {
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let sel = SelectorGate::new_negated(0, inner);
+        let air = CompositeAir::from_parts(2, 3, vec![Box::new(sel)]);
+        let n = 1 << 2;
+        let col0 = vec![Block128::ZERO; n];
+        let col1: Vec<Block128> = (0..n).map(|i| Block128::from(i as u128 + 1)).collect();
+        let col2 = vec![Block128::from(42u128); n];
+        let trace = Trace::new(vec![col0, col1, col2]);
+        assert!(!air.check(&trace));
+    }
+
+    /// Flat-vs-tower equivalence for the negated variant: selector = 0
+    /// (fire) and selector = 1 (suppress), each against honest and
+    /// adversarial inner payloads.
+    #[test]
+    fn selector_negated_flat_matches_tower() {
+        use noid_core::hardware::tower_to_flat_u128;
+        let inner: Box<dyn Constraint> =
+            Box::new(WeightedLinearGate::new_xor(vec![1, 2]));
+        let sel = SelectorGate::new_negated(0, inner);
+        for (s_raw, a_raw, b_raw) in [
+            (0u128, 0u128, 0u128),
+            (0, 0xdeadbeef, 0xcafef00d),
+            (1, 0xffff_ffff_ffff_ffff, 1),
             (1, 0x1234_5678_90ab_cdef, 0xfedc_ba98_7654_3210),
         ] {
             let s = Block128::from(s_raw);

@@ -222,21 +222,11 @@ mod tests {
             )
         });
         let hauth_end = haddr_end + 4 * 106;
-        let hleaf = (0..8).map(|j| {
-            CompositePlacement::new(
-                "HLeaf",
-                hauth_end + j * 106,
-                hauth_end + (j + 1) * 106,
-                j * 256,
-                (j + 1) * 256,
-            )
-        });
-        let hleaf_end = hauth_end + 8 * 106;
-        let fri_open = CompositePlacement::new("FriOpen", hleaf_end, hleaf_end + 70, 0, 8);
+        let fri_open = CompositePlacement::new("FriOpen", hauth_end, hauth_end + 70, 0, 8);
         let fri_comb = CompositePlacement::new(
             "FriCombiner",
-            hleaf_end + 70,
-            hleaf_end + 70 + 112,
+            hauth_end + 70,
+            hauth_end + 70 + 112,
             0,
             512,
         );
@@ -244,7 +234,6 @@ mod tests {
             vec![spine, fri_open, fri_comb];
         all.extend(haddr);
         all.extend(hauth);
-        all.extend(hleaf);
 
         // Placement fits inside a 2500-column × 2^13-row outer trace.
         assert!(validate_placements(&all, 2500, 13).is_ok());

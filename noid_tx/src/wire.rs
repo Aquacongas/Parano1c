@@ -123,23 +123,26 @@ impl TxInput {
 }
 
 // ---------------------------------------------------------------------------
-// TxOutput : value (8) + owner (32) + valid (1) = 41 bytes
+// TxOutput : slot_index (4) + value (8) + owner (32) + valid (1) = 45 bytes
 // ---------------------------------------------------------------------------
 
-pub const TX_OUTPUT_WIRE_SIZE: usize = 8 + 32 + 1;
+pub const TX_OUTPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 1;
 
 impl TxOutput {
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        put_u32(buf, self.slot_index);
         put_u64(buf, self.value);
         put_digest(buf, &self.owner.0);
         put_bool(buf, self.valid);
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
+        let slot_index = take_u32(src)?;
         let value = take_u64(src)?;
         let owner = Address(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
+            slot_index,
             value,
             owner,
             valid,
@@ -151,7 +154,10 @@ impl TxOutput {
 // TxBody
 // ---------------------------------------------------------------------------
 
-pub const TX_BODY_VERSION: u8 = 1;
+/// Wire-format version. Bumped:
+/// - `1 → 2` at Stage E.1: `TxOutput.slot_index: u32`.
+/// - `2 → 3` at Stage E.5.f₁: `TxBody.is_coinbase: bool`.
+pub const TX_BODY_VERSION: u8 = 3;
 
 impl TxBody {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -176,6 +182,7 @@ impl TxBody {
         for o in &self.outputs {
             o.encode(buf);
         }
+        put_bool(buf, self.is_coinbase);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -185,7 +192,8 @@ impl TxBody {
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
                 + 4
-                + self.outputs.len() * TX_OUTPUT_WIRE_SIZE,
+                + self.outputs.len() * TX_OUTPUT_WIRE_SIZE
+                + 1,
         );
         self.encode(&mut buf);
         buf
@@ -218,12 +226,15 @@ impl TxBody {
             outputs.push(TxOutput::decode(src)?);
         }
 
+        let is_coinbase = take_bool(src)?;
+
         Ok(Self {
             prev_state_root,
             new_state_root,
             fee,
             inputs,
             outputs,
+            is_coinbase,
         })
     }
 
@@ -271,9 +282,15 @@ impl Transaction {
 
 // ---------------------------------------------------------------------------
 // PublicInputs : prev_root (32) + new_root (32) + tx_body_hash (32) + fee (16)
+//              + n_live_inputs (1) + n_live_outputs (1)
+//              + coinbase_credit (8) + log_slots (4)
+//              + is_activation[MAX_OUTPUTS] (MAX_OUTPUTS bytes, 0/1)
+//              + is_deactivation[MAX_INPUTS] (MAX_INPUTS bytes, 0/1)
+//              = 142 + MAX_OUTPUTS + MAX_INPUTS bytes
 // ---------------------------------------------------------------------------
 
-pub const PUBLIC_INPUTS_WIRE_SIZE: usize = 3 * 32 + 16;
+pub const PUBLIC_INPUTS_WIRE_SIZE: usize =
+    3 * 32 + 16 + 1 + 1 + 8 + 4 + crate::types::MAX_OUTPUTS + crate::types::MAX_INPUTS;
 
 impl PublicInputs {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -281,6 +298,16 @@ impl PublicInputs {
         put_digest(buf, &self.new_state_root);
         put_digest(buf, &self.tx_body_hash.0);
         put_u128(buf, self.fee);
+        buf.push(self.n_live_inputs);
+        buf.push(self.n_live_outputs);
+        put_u64(buf, self.coinbase_credit);
+        put_u32(buf, self.log_slots);
+        for b in &self.is_activation {
+            put_bool(buf, *b);
+        }
+        for b in &self.is_deactivation {
+            put_bool(buf, *b);
+        }
     }
 
     pub fn to_bytes(&self) -> [u8; PUBLIC_INPUTS_WIRE_SIZE] {
@@ -293,6 +320,23 @@ impl PublicInputs {
         out[i..i + 32].copy_from_slice(&self.tx_body_hash.0);
         i += 32;
         out[i..i + 16].copy_from_slice(&self.fee.to_le_bytes());
+        i += 16;
+        out[i] = self.n_live_inputs;
+        i += 1;
+        out[i] = self.n_live_outputs;
+        i += 1;
+        out[i..i + 8].copy_from_slice(&self.coinbase_credit.to_le_bytes());
+        i += 8;
+        out[i..i + 4].copy_from_slice(&self.log_slots.to_le_bytes());
+        i += 4;
+        for b in &self.is_activation {
+            out[i] = if *b { 1 } else { 0 };
+            i += 1;
+        }
+        for b in &self.is_deactivation {
+            out[i] = if *b { 1 } else { 0 };
+            i += 1;
+        }
         out
     }
 
@@ -301,11 +345,39 @@ impl PublicInputs {
         let new_state_root = take_digest(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
         let fee = take_u128(src)?;
+        let n_live_inputs = take(src, 1)?[0];
+        let n_live_outputs = take(src, 1)?[0];
+        if (n_live_inputs as usize) > crate::types::MAX_INPUTS
+            || (n_live_outputs as usize) > crate::types::MAX_OUTPUTS
+        {
+            return Err(WireError::CountTooLarge);
+        }
+        let coinbase_credit = take_u64(src)?;
+        let log_slots = take_u32(src)?;
+        if log_slots < crate::public::MIN_LOG_SLOTS
+            || log_slots > crate::public::MAX_LOG_SLOTS
+        {
+            return Err(WireError::ShapeMismatch);
+        }
+        let mut is_activation = [false; crate::types::MAX_OUTPUTS];
+        for slot in is_activation.iter_mut() {
+            *slot = take_bool(src)?;
+        }
+        let mut is_deactivation = [false; crate::types::MAX_INPUTS];
+        for slot in is_deactivation.iter_mut() {
+            *slot = take_bool(src)?;
+        }
         Ok(Self {
             prev_state_root,
             new_state_root,
             tx_body_hash,
             fee,
+            n_live_inputs,
+            n_live_outputs,
+            coinbase_credit,
+            log_slots,
+            is_activation,
+            is_deactivation,
         })
     }
 
@@ -326,6 +398,7 @@ mod tests {
 
     fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
+            slot_index: (seed as u32).wrapping_mul(3),
             value: (seed as u64) * 7,
             owner: Address([seed; 32]),
             valid: true,
@@ -375,10 +448,48 @@ mod tests {
             fee: 42u128,
             inputs: vec![mk_input(1), mk_input(2), TxInput::dummy()],
             outputs: vec![mk_output(1), mk_output(2), TxOutput::dummy()],
+            is_coinbase: false,
         };
         let bytes = body.to_bytes();
         let back = TxBody::from_bytes(&bytes).unwrap();
         assert_eq!(back, body);
+    }
+
+    #[test]
+    fn tx_body_coinbase_roundtrip() {
+        let body = TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [1u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![mk_output(1)],
+            is_coinbase: true,
+        };
+        let bytes = body.to_bytes();
+        let back = TxBody::from_bytes(&bytes).unwrap();
+        assert_eq!(back, body);
+        assert!(back.is_coinbase);
+    }
+
+    #[test]
+    fn tx_body_is_coinbase_byte_is_bound() {
+        let body = TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![],
+            is_coinbase: false,
+        };
+        let mut bytes = body.to_bytes();
+        // Last byte is is_coinbase; flipping it must be observable.
+        let last = bytes.len() - 1;
+        bytes[last] = 1;
+        let back = TxBody::from_bytes(&bytes).unwrap();
+        assert!(back.is_coinbase);
+        // Invalid bool byte rejects.
+        bytes[last] = 0x42;
+        assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::InvalidBool));
     }
 
     #[test]
@@ -400,6 +511,7 @@ mod tests {
             fee: 0,
             inputs: vec![],
             outputs: vec![],
+            is_coinbase: false,
         };
         let mut bytes = body.to_bytes();
         bytes.push(0xFF);
@@ -414,6 +526,7 @@ mod tests {
             fee: 0,
             inputs: vec![],
             outputs: vec![],
+            is_coinbase: false,
         };
         let mut bytes = body.to_bytes();
         bytes[0] = 0xFF;
@@ -428,6 +541,7 @@ mod tests {
             fee: 7,
             inputs: vec![mk_input(3)],
             outputs: vec![mk_output(4)],
+            is_coinbase: false,
         };
         let tx = Transaction {
             tx_body_hash: TxBodyHash([0x99u8; 32]),
@@ -441,16 +555,61 @@ mod tests {
 
     #[test]
     fn public_inputs_roundtrip() {
+        let mut is_act = [false; crate::types::MAX_OUTPUTS];
+        is_act[0] = true;
+        is_act[3] = true;
+        let mut is_deact = [false; crate::types::MAX_INPUTS];
+        is_deact[1] = true;
         let p = PublicInputs {
             prev_state_root: [1u8; 32],
             new_state_root: [2u8; 32],
             tx_body_hash: TxBodyHash([4u8; 32]),
             fee: 0xFEED_FACE_CAFE_BEEFu128,
+            n_live_inputs: 2,
+            n_live_outputs: 4,
+            coinbase_credit: 0xDEAD_BEEF_1234_5678,
+            log_slots: 24,
+            is_activation: is_act,
+            is_deactivation: is_deact,
         };
         let bytes = p.to_bytes();
         assert_eq!(bytes.len(), PUBLIC_INPUTS_WIRE_SIZE);
         let back = PublicInputs::from_bytes(&bytes).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn public_inputs_rejects_live_count_over_max() {
+        let good = PublicInputs {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            tx_body_hash: TxBodyHash([0u8; 32]),
+            fee: 0,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            is_activation: [false; crate::types::MAX_OUTPUTS],
+            is_deactivation: [false; crate::types::MAX_INPUTS],
+        };
+        // Trailing layout is `... n_live_in (1) n_live_out (1) credit (8) log_slots (4)
+        // is_activation[MAX_OUTPUTS] is_deactivation[MAX_INPUTS]`.
+        // Offsets measured from the end (`size - tail_bytes`).
+        let tail = crate::types::MAX_OUTPUTS + crate::types::MAX_INPUTS + 4 + 8;
+        let n_in_off = PUBLIC_INPUTS_WIRE_SIZE - tail - 1 - 1;
+        let n_out_off = PUBLIC_INPUTS_WIRE_SIZE - tail - 1;
+        let mut bytes = good.to_bytes();
+        bytes[n_in_off] = (crate::types::MAX_INPUTS + 1) as u8;
+        assert_eq!(
+            PublicInputs::from_bytes(&bytes),
+            Err(WireError::CountTooLarge)
+        );
+        let mut bytes = good.to_bytes();
+        bytes[n_out_off] = (crate::types::MAX_OUTPUTS + 1) as u8;
+        assert_eq!(
+            PublicInputs::from_bytes(&bytes),
+            Err(WireError::CountTooLarge)
+        );
     }
 
     #[test]
@@ -461,6 +620,7 @@ mod tests {
             fee: 0,
             inputs: vec![mk_input(1)],
             outputs: vec![],
+            is_coinbase: false,
         };
         let bytes = body.to_bytes();
         for cut in 0..bytes.len() {
@@ -478,6 +638,7 @@ mod tests {
             fee: 0,
             inputs: vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
             outputs: vec![],
+            is_coinbase: false,
         };
         let mut buf = Vec::new();
         body.encode(&mut buf);
@@ -492,6 +653,7 @@ mod tests {
             fee: 0,
             inputs: vec![],
             outputs: vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],
+            is_coinbase: false,
         };
         let mut buf = Vec::new();
         body.encode(&mut buf);

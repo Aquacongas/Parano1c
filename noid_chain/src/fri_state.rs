@@ -31,9 +31,14 @@ use noid_fri::prover::{
 };
 use noid_fri::verifier::verify as fri_verify;
 
-/// Default state vector depth used by mainnet. 16 777 216 slots fits
-/// mainnet growth without reshaping. Tests override with smaller values
-/// through [`FriState::new_empty`].
+/// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not
+/// a circuit-wide constant — the AIR and STARK transcript are
+/// parameterised by the header-declared `log_slots` (Stage E.6, see
+/// `noid_tx::public::PublicInputs::log_slots` and `MAX_LOG_SLOTS`),
+/// which may grow to at most `32` via the `§15.3` expansion trigger.
+/// This value is used only as the seed depth when instantiating a
+/// fresh `ChainState` without an existing header. Tests override with
+/// smaller values through [`FriState::new_empty`].
 pub const STATE_LOG_SLOTS: usize = 24;
 
 /// Per-slot payload: `(value, owner)` where `owner` is 256 bits split

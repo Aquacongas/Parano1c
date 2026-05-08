@@ -55,7 +55,7 @@
 //! - `pre_s[2..3]@every_head_row_0` is pinned by a pair of head-gated
 //!   `WeightedLinearGate`s against the capacity-IV public columns
 //!   `iv_prog[0..1]` carrying the role's native-sponge IV
-//!   (`TAG_LEAF` / `TAG_COMMIT` / `TAG_COMPRESS` / `TAG_TXBODY`). The
+//!   (`TAG_LEAF` / `TAG_OUTLEAF` / `TAG_COMPRESS` / `TAG_TXBODY`). The
 //!   gate is `SelectorGate(head_row_0, pre_s[lane] + iv_prog[lane-2] == 0)`,
 //!   so on non-head row-0s `pre_s[2..3]` stays **free**; §3d-0.9.E.4
 //!   echoes the prior perm's capacity output into those cells.
@@ -95,7 +95,7 @@ use crate::gates::{
 use crate::{Air, ColumnDomain, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{
-    capacity_iv, TAG_COMMIT, TAG_COMPRESS, TAG_LEAF, TAG_TXBODY,
+    capacity_iv, TAG_COMPRESS, TAG_LEAF, TAG_OUTLEAF, TAG_TXBODY,
 };
 use noid_poseidon2b::native::permutation::{MDS_FULL, STATE_SIZE};
 
@@ -199,14 +199,6 @@ pub const TXBODY_MERKLE_O1_N_COLS: usize = 4;
 pub const O1_INPUT_LEAF_PAD_WORD_0: u128 = 0x80u128;
 pub const O1_INPUT_LEAF_PAD_WORD_1: u128 = 1u128 << 120;
 
-/// Stage 1b — expected padding word for the second rate lane of the
-/// output-leaf `finalize` permutation (PermB). After absorbing
-/// `owner_lo` into rate lane 0 the buffer has 16 bytes free in the
-/// upper half; `fill_padding` sets byte 0 = `0x80` and byte 15 =
-/// `0x01` of that slice, yielding the little-endian word
-/// `0x80 | (1 << 120)`.
-pub const O1_OUTPUT_LEAF_PAD_WORD: u128 = 0x80u128 | (1u128 << 120);
-
 /// Post-order instance ids of the four cells pinned by Stage 1. Asserted
 /// against the layout at AIR-construction time (see
 /// `emit_tx_body_merkle_constraints_with_boundary_pins`).
@@ -302,11 +294,20 @@ pub struct TxBodyMerkleBoundaryPins {
     /// canonical order. Word 0/1 are absorbed into PermA's
     /// `pre_s[0..1]`; word 2/3 appear at PermB's `payload[0..1]`.
     pub input_leaf_absorb: [[Block128; 4]; 4],
+    /// E.5.f₂ — L14 leaf digest `[is_coinbase_as_u128, 0]`, pinned at
+    /// instance-42 `pre_s[0..1]` (the pos=7 level-1 compress PermA).
+    /// `is_coinbase_leaf[0] = is_coinbase as u128`, `[1] = 0`.
+    /// Default is `[ZERO, ZERO]` (matches pre-E.5 all-zero L14).
+    pub is_coinbase_leaf: [Block128; 2],
     /// Stage 1b — declared absorbed payload for each of the 8 output
-    /// leaves (`hash_utxo_leaf(value, owner)`). Word 0 = value, word 1
-    /// = owner_hi (absorbed into PermA's `pre_s[0..1]`); word 2 =
-    /// owner_lo (appears at PermB's `payload[0]`).
-    pub output_leaf_absorb: [[Block128; 3]; 8],
+    /// leaves. Stage E.1 widened this from 3 to 4 lanes so the output
+    /// schema matches `input_leaf_absorb` exactly:
+    /// `hash_leaf([slot_index, value, owner_hi, owner_lo])`.
+    /// Word 0 = slot_index, word 1 = value (absorbed into PermA's
+    /// `pre_s[0..1]`); word 2 = owner_hi, word 3 = owner_lo
+    /// (appear at PermB's `payload[0..1]`). PermB now absorbs two
+    /// body-derived lanes like the input side.
+    pub output_leaf_absorb: [[Block128; 4]; 8],
 }
 
 /// Enumerate leaf non-head instances whose rate lanes 0..1 absorb a
@@ -644,15 +645,16 @@ fn build_tx_body_merkle_trace_inner(
                     }
                 }
                 InstanceRole::OutputLeafPermB { leaf_idx } => {
+                    // Stage E.1: symmetric with `InputLeafPermB`.
+                    // OutputLeafPermB absorbs `[owner_hi, owner_lo]`
+                    // from lanes 2..4 of `output_leaf_absorb` because
+                    // native `hash_output_leaf` is 4 fields wide.
                     let prev_row = (k - 1) * TXBODY_MERKLE_SLOT_ROWS + N_ROUNDS;
-                    let declared = [
-                        p.output_leaf_absorb[leaf_idx as usize][2],
-                        Block128::from(O1_OUTPUT_LEAF_PAD_WORD),
-                    ];
                     for lane in 0..2 {
                         let prev_out =
                             cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
-                        effective_input[lane] = prev_out + declared[lane];
+                        effective_input[lane] =
+                            prev_out + p.output_leaf_absorb[leaf_idx as usize][2 + lane];
                     }
                 }
                 _ => {}
@@ -838,7 +840,7 @@ pub fn build_tx_body_merkle_trace_with_boundary_pins(
     let mut inputs_pinned = *inputs;
     for lane in 0..2usize {
         inputs_pinned[BOUNDARY_INSTANCE_POS_0_PERM_A][lane] = pins.prev_state_root[lane];
-        inputs_pinned[BOUNDARY_INSTANCE_POS_7_PERM_A][lane] = Block128::ZERO;
+        inputs_pinned[BOUNDARY_INSTANCE_POS_7_PERM_A][lane] = pins.is_coinbase_leaf[lane];
     }
     let mut cols = build_tx_body_merkle_trace_inner(&inputs_pinned, Some(pins));
     cols.resize(
@@ -954,7 +956,7 @@ fn is_leaf_head(role: &InstanceRole) -> bool {
 /// | role                 | sub-sponge tag | pre_s[2..3] seed          |
 /// |----------------------|----------------|---------------------------|
 /// | `InputLeafPermA`     | `LEAF____`     | `capacity_iv(TAG_LEAF)`   |
-/// | `OutputLeafPermA`    | `COMMIT__`     | `capacity_iv(TAG_COMMIT)` |
+/// | `OutputLeafPermA`    | `OUTLEAF_`     | `capacity_iv(TAG_OUTLEAF)`|
 /// | `CompressPermA`      | `COMPRESS`     | `capacity_iv(TAG_COMPRESS)`|
 /// | `WrapPerm`           | `TXBODY__`     | `capacity_iv(TAG_TXBODY)` |
 ///
@@ -963,7 +965,7 @@ fn is_leaf_head(role: &InstanceRole) -> bool {
 fn head_capacity_iv(role: &InstanceRole) -> Option<[Block128; 2]> {
     let tag = match role {
         InstanceRole::InputLeafPermA { .. } => TAG_LEAF,
-        InstanceRole::OutputLeafPermA { .. } => TAG_COMMIT,
+        InstanceRole::OutputLeafPermA { .. } => TAG_OUTLEAF,
         InstanceRole::CompressPermA { .. } => TAG_COMPRESS,
         InstanceRole::WrapPerm => TAG_TXBODY,
         _ => return None,
@@ -1571,10 +1573,7 @@ fn o1_row_schedule(
             }
             InstanceRole::OutputLeafPermB { leaf_idx } => {
                 let words = &pins.output_leaf_absorb[leaf_idx as usize];
-                nonhead.push((
-                    meta.slot_base_row,
-                    [words[2], Block128::from(O1_OUTPUT_LEAF_PAD_WORD)],
-                ));
+                nonhead.push((meta.slot_base_row, [words[2], words[3]]));
             }
             _ => {}
         }
@@ -1678,11 +1677,7 @@ pub fn o1_payload_programme(pins: &TxBodyMerkleBoundaryPins, lane: usize) -> Vec
                 });
             }
             InstanceRole::OutputLeafPermB { leaf_idx } => {
-                out[row] = if lane == 0 {
-                    pins.output_leaf_absorb[leaf_idx as usize][2]
-                } else {
-                    Block128::from(O1_OUTPUT_LEAF_PAD_WORD)
-                };
+                out[row] = pins.output_leaf_absorb[leaf_idx as usize][2 + lane];
             }
             _ => {}
         }
@@ -1762,7 +1757,11 @@ pub fn emit_tx_body_merkle_constraints_with_boundary_pins(
         out.push(gate);
     }
 
-    // O3.b — instance 42 pre_s[0..1] = ZERO.
+    // O3.b — instance 42 pre_s[0..1] = is_coinbase_leaf (E.5.f₂).
+    // Pre-E.5 this was pinned to Block128::ZERO (the L14 zero-pad);
+    // the leaf now carries `[is_coinbase as u128, 0]`. With
+    // `is_coinbase=false` the pin lane reduces to `[ZERO, ZERO]`,
+    // matching the historical constraint byte-for-byte.
     let m_42 = &layout[BOUNDARY_INSTANCE_POS_7_PERM_A];
     debug_assert!(matches!(
         m_42.role,
@@ -1775,7 +1774,7 @@ pub fn emit_tx_body_merkle_constraints_with_boundary_pins(
             m_42.slot_base_row,
             total_rows,
             TXBODY_MERKLE_PRE_S_BASE + lane,
-            Block128::ZERO,
+            pins.is_coinbase_leaf[lane],
         );
         out.push(gate);
     }
@@ -2829,7 +2828,7 @@ mod tests {
     /// Run the pinned trace builder once against `inputs` + placeholder
     /// `tx_body_hash` and read the honest wrap output back out. Returns
     /// a self-consistent `TxBodyMerkleBoundaryPins`.
-    fn mk_stage1b_leaf_fixtures() -> ([[Block128; 4]; 4], [[Block128; 3]; 8]) {
+    fn mk_stage1b_leaf_fixtures() -> ([[Block128; 4]; 4], [[Block128; 4]; 8]) {
         let mut inputs = [[Block128::ZERO; 4]; 4];
         for leaf in 0..4 {
             for word in 0..4 {
@@ -2837,9 +2836,9 @@ mod tests {
                 inputs[leaf][word] = Block128::from(v);
             }
         }
-        let mut outputs = [[Block128::ZERO; 3]; 8];
+        let mut outputs = [[Block128::ZERO; 4]; 8];
         for leaf in 0..8 {
-            for word in 0..3 {
+            for word in 0..4 {
                 let v = ((leaf as u128) << 72) | (word as u128) << 24 | 0xDEAD_BEEFu128;
                 outputs[leaf][word] = Block128::from(v);
             }
@@ -2857,6 +2856,7 @@ mod tests {
             prev_state_root,
             fee_leaf,
             tx_body_hash: [Block128::ZERO; 2],
+            is_coinbase_leaf: [Block128::ZERO; 2],
             input_leaf_absorb,
             output_leaf_absorb,
         };
@@ -2866,6 +2866,7 @@ mod tests {
             prev_state_root,
             fee_leaf,
             tx_body_hash: [wrap_out[0], wrap_out[1]],
+            is_coinbase_leaf: [Block128::ZERO; 2],
             input_leaf_absorb,
             output_leaf_absorb,
         }
@@ -3088,7 +3089,7 @@ mod tests {
         let (inputs, honest_pins) = stage1_pins_fixture();
         let trace = honest_trace_with_pins(&inputs, &honest_pins);
         for leaf in 0..8 {
-            for word in 0..3 {
+            for word in 0..4 {
                 let mut bad_pins = honest_pins.clone();
                 bad_pins.output_leaf_absorb[leaf][word] += Block128::ONE;
                 let air = TxBodyMerkleAir::new_with_boundary_pins(bad_pins);

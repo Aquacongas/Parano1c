@@ -22,7 +22,7 @@
 //! FRI opening of all base columns at `r''`, replacing the per-slot
 //! ladder FRI of 3b-0.3.
 
-use noid_core::{Block128, TowerField};
+use noid_core::Block128;
 
 use crate::RoundPoly;
 
@@ -186,6 +186,7 @@ pub fn verify_multipoint_sumcheck(
 mod tests {
     use super::*;
     use noid_core::mle::eq::{eq_ind, eq_ind_partial_eval};
+    use noid_core::TowerField;
     use noid_fri::Channel;
 
     fn rand_vec(n: usize, seed: u128) -> Vec<Block128> {
