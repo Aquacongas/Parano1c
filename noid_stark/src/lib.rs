@@ -828,28 +828,39 @@ fn prove_multipoint_close_inner(
         None
     };
 
-    // Build `(A_k, B_k)` pairs. Ordering: `n` base pairs, then `s_count`
-    // ladder pairs. Base pairs scale `eq(r_point, ·)` by λ_i in place.
-    // Ladder pairs scale `W_s(·) = Σ_k γ_s^k eq(P_{s,k}, ·)` by η_s.
+    // Build `(A_k, B_k)` pairs. Every base pair shares the same A-side
+    // factor `eq(r_point, ·)`, so by bilinearity of the sumcheck's
+    // degree-2 product reduction
+    //   Σ_i (λ_i · eq_base(x)) · c_i(x)
+    //     ≡ eq_base(x) · (Σ_i λ_i · c_i(x))
+    // across every X ∈ {0, 1, 2} and every fold step. Collapsing the
+    // `n` base pairs into one fused pair `(eq_base, c_combined)` is
+    // transcript-byte-identical: the reduce-Σ over round oracles is
+    // identical (same bilinear form, same λ_i weights), and the
+    // terminal identity still reconstructs per-column via the
+    // verifier's `Σ_i λ_i · eq_base(r'') · m_i`. The committed FRI
+    // batch still opens every `padded_columns[i]` at `r''`; this
+    // collapse only lives inside the sumcheck pair list.
     //
-    // `eq(r_point, ·)` is independent of `i`, so materialize it once
-    // and scale-clone per base column instead of recomputing inside
-    // the parallel loop (O(2^n) × n ops saved).
-    //
-    // B-side of each pair is the already-materialised committed column
-    // (`padded_columns[col_id]`); we pass it as a borrowed slice so the
-    // sumcheck converts to flat-basis in place instead of cloning 16 B
-    // × 2^log_len × n_pairs (~287 MB on the per-tx fixture).
+    // Savings (per-tx fixture, n = 575, log_len = 13): ~600 pair-folds
+    // per round × 13 rounds + n-way allocation of `A_k` tables
+    // collapses to one. Ladder pairs are unchanged — they each carry
+    // a distinct `W_s(·)` on the A-side.
     let eq_base = eq_ind_partial_eval(r_point);
-    let base_pairs_a: Vec<Vec<Block128>> = (0..n)
+    let hyper_len = 1usize << log_len;
+
+    // Fold Σ_i λ_i · c_i into one combined B table. Parallel across the
+    // hypercube so the scaling is O((n · 2^log_len) / cores).
+    let combined_base_b: Vec<Block128> = (0..hyper_len)
         .into_par_iter()
-        .map(|i| {
-            let lam = lambdas[i];
-            eq_base.iter().map(|&v| v * lam).collect()
+        .map(|j| {
+            let mut acc = Block128::ZERO;
+            for i in 0..n {
+                acc += lambdas[i] * padded_columns[i][j];
+            }
+            acc
         })
         .collect();
-    let base_pairs_b: Vec<&[Block128]> =
-        (0..n).map(|i| padded_columns[i].as_slice()).collect();
 
     let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
         .into_par_iter()
@@ -869,9 +880,11 @@ fn prove_multipoint_close_inner(
         .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
         .collect();
 
-    let mut pairs_a = base_pairs_a;
+    let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count);
+    pairs_a.push(eq_base);
     pairs_a.extend(ladder_pairs_a);
-    let mut pairs_b = base_pairs_b;
+    let mut pairs_b: Vec<&[Block128]> = Vec::with_capacity(1 + s_count);
+    pairs_b.push(combined_base_b.as_slice());
     pairs_b.extend(ladder_pairs_b);
     let setup_elapsed = t_setup.elapsed();
 
@@ -1237,17 +1250,25 @@ fn prove_multipoint_close_mixed(
         target += lambdas[n + s_count + i] * e.value;
     }
 
-    // Build mixed pairs.
+    // Build mixed pairs. Base pairs share `eq_base` on the A-side, so
+    // we collapse them into a single fused pair
+    // `(eq_base, Σ_i λ_i · padded_columns[i])` — identical round-oracle
+    // accumulator by bilinearity of the sumcheck's degree-2 product,
+    // byte-identical transcript. See `prove_multipoint_close_inner` for
+    // the full soundness argument; the mixed/extras path picks up the
+    // same savings on the base slab.
     let eq_base = eq_ind_partial_eval(r_point);
-    let base_pairs_a: Vec<Vec<Block128>> = (0..n)
+    let hyper_len = 1usize << log_len;
+    let combined_base_b: Vec<Block128> = (0..hyper_len)
         .into_par_iter()
-        .map(|i| {
-            let lam = lambdas[i];
-            eq_base.iter().map(|&v| v * lam).collect()
+        .map(|j| {
+            let mut acc = Block128::ZERO;
+            for i in 0..n {
+                acc += lambdas[i] * padded_columns[i][j];
+            }
+            acc
         })
         .collect();
-    let base_pairs_b: Vec<&[Block128]> =
-        (0..n).map(|i| padded_columns[i].as_slice()).collect();
 
     let weight_trails = if s_count > 0 {
         Some(crate::ladder_batch::WeightTrails::new(r_point))
@@ -1283,17 +1304,20 @@ fn prove_multipoint_close_mixed(
     let extras_pairs_b: Vec<&[Block128]> =
         (0..n_extras).map(|i| extras[i].evals.as_slice()).collect();
 
-    let mut pairs_a = base_pairs_a;
+    let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count + n_extras);
+    pairs_a.push(eq_base);
     pairs_a.extend(ladder_pairs_a);
     pairs_a.extend(extras_pairs_a);
-    let mut pairs_b = base_pairs_b;
+    let mut pairs_b: Vec<&[Block128]> = Vec::with_capacity(1 + s_count + n_extras);
+    pairs_b.push(combined_base_b.as_slice());
     pairs_b.extend(ladder_pairs_b);
     pairs_b.extend(extras_pairs_b);
 
-    let mut n_vars: Vec<usize> = Vec::with_capacity(total_weights);
-    for _ in 0..n {
-        n_vars.push(log_len);
-    }
+    // n_vars ordering must match pairs ordering: one fused base pair
+    // at log_len, then s_count ladder pairs at log_len, then extras at
+    // their individual sizes.
+    let mut n_vars: Vec<usize> = Vec::with_capacity(1 + s_count + n_extras);
+    n_vars.push(log_len);
     for _ in 0..s_count {
         n_vars.push(log_len);
     }

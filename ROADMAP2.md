@@ -414,13 +414,12 @@ to the block-aggregation shape.
 Budgets (single-tx numbers are the Eπ.10 result; block numbers
 require Stage G to have landed for G.4 to report them):
 
-- **Proof size (single tx)**: ≤ 64 KiB on realistic body (4 inputs,
+- **Proof size (single tx)**: ≤ ≤ 250 KB on realistic body (4 inputs,
   4 outputs).
-- **Proof size (block, N=64 via IVC)**: ≤ 96 KiB.
-- **Prove time (single tx)**: ≤ 400 ms on one modern core.
-- **Verify time (single tx)**: ≤ 8 ms.
-- **Verify time (block, N=64)**: ≤ 32 ms.
+- **Prove time (single tx)**: ≤ 1.5 s.
+- **Verify time (single tx)**: ≤ 20 ms.
 - **Peak prover memory (single tx)**: ≤ 512 MiB.
+
 
 Stage I deliverables:
 - I.1. `bench_prover` exports these six numbers to `reports/perf_tip.md`

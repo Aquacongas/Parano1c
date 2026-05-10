@@ -21,7 +21,7 @@ use crate::airs::tx_body_merkle::{TxBodyMerkleBoundaryPins, TXBODY_MERKLE_N_PERM
 use crate::airs::tx_body_spine::{spine_n_cols, TxBodySpineComposite, SPINE_LOG_ROWS};
 use crate::composition::spine_adapter::SpineEmbeddingLayout;
 use crate::composition::tx_validity_leaf::{
-    write_leaf_block_traces, LeafConstructionOptions, T2aDstOverride,
+    write_leaf_block_traces, LeafConstructionOptions, T2aDstOverride, T2bDstOverride,
     TxValidityCompositeLeaf, SKEL_IS_COINBASE_COL, TX_VALIDITY_LEAF_LOG_ROWS,
     TX_VALIDITY_LEAF_N_COLS,
 };
@@ -142,6 +142,14 @@ pub struct TxValidityCompositeWithSpine {
     /// bridge dst is retargeted here; the leaf-band's per-input T2a
     /// `PublicColumn` programmes are suppressed at construction.
     t2a_override: [T2aDstOverride; FRI_STATE_OPEN_N_INPUTS],
+    /// Shared T2b dst cell inside the embedded spine block, pointing
+    /// at the canonical `wrap_output_outer_cell(lane)` origin of
+    /// `tx_body_hash`. The HAuth AIR's `tx_body_col[0..2]` constant
+    /// column is bridged here by a single pair of bridges; the
+    /// leaf-band's default T2b `PublicColumn` pin is suppressed at
+    /// construction so the wrap-output cell is the single source of
+    /// truth for `tx_body_hash`.
+    t2b_override: T2bDstOverride,
     /// Per-input declared auth tags. Needed at `build_trace`-time to
     /// restore the spine `AuthTagHi/Lo` cells after the spine inner
     /// trace clobbers the leaf-band's writes.
@@ -305,6 +313,20 @@ impl TxValidityCompositeWithSpine {
             outputs: body.outputs.clone(),
             prev_lane_openings: [Block128::ZERO; 3],
         };
+        // OP-1.δ.3: retarget the shared T2b onto the spine's
+        // wrap-output outer cell. With the HAuth AIR carrying
+        // `tx_body_col[0..2]` as a constant witness column, a single
+        // bridge suffices to bind it to the canonical
+        // `tx_body_hash = wrap_output_outer_cell(lane)` origin.
+        let wrap_hi = spine_layout.wrap_output_outer_cell(0);
+        let wrap_lo = spine_layout.wrap_output_outer_cell(1);
+        let t2b_override = T2bDstOverride {
+            hi_col: wrap_hi.col,
+            hi_row: wrap_hi.row,
+            lo_col: wrap_lo.col,
+            lo_row: wrap_lo.row,
+        };
+
         let leaf = TxValidityCompositeLeaf::new_with_options(
             combiner,
             open_air,
@@ -314,7 +336,7 @@ impl TxValidityCompositeWithSpine {
             auth_tags,
             LeafConstructionOptions {
                 t2a_dst_override: Some(t2a_override),
-                t2b_dst_override: None,
+                t2b_dst_override: Some(t2b_override),
                 output_side: output_side.clone(),
                 is_coinbase: options.is_coinbase,
                 ..LeafConstructionOptions::default()
@@ -648,6 +670,7 @@ impl TxValidityCompositeWithSpine {
             secrets,
             tx_body_hash,
             t2a_override,
+            t2b_override,
             auth_tags,
             output_side,
             is_coinbase: options.is_coinbase,
@@ -677,12 +700,10 @@ impl TxValidityCompositeWithSpine {
             outer_n_cols,
             TX_VALIDITY_WITH_SPINE_LOG_ROWS,
             Some(self.t2a_override),
-            None,
+            Some(self.t2b_override),
             &self.output_side,
             self.open_witness.eval_point,
             self.open_witness.gamma,
-            &crate::composition::tx_validity_composite::NewStateInputSource::Empty,
-            &crate::composition::tx_validity_composite::NewStateOutputSource::Empty,
         );
 
         // Spine block.
@@ -1742,44 +1763,27 @@ mod tests {
     }
 
     #[test]
-    fn t2b_leaf_band_dst_hi_tamper_rejects_per_input() {
-        // T2b stays on the leaf band's per-input unpinned dst cells
-        // (5.6 default path). Tampering `pre_s_b` hi at its leaf-band
-        // row breaks HAuth's pre-S_B bridge tie.
-        use crate::composition::tx_validity_hauth::{
-            pre_s_b_dst_cols, pre_s_b_hi_dst_row,
-        };
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let (hi_col, _) = pre_s_b_dst_cols(i);
-            let row = pre_s_b_hi_dst_row(i);
-            trace.columns[hi_col][row] =
-                trace.columns[hi_col][row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T2b-hi tamper at input {i} should reject"
-            );
-        }
+    fn t2b_wrap_output_dst_hi_tamper_rejects() {
+        // OP-1.δ.3: T2b is a single shared bridge targeting the
+        // spine's `wrap_output_outer_cell(lane)`, the canonical origin
+        // of `tx_body_hash`. Tampering the hi cell breaks the shared
+        // T2b bridge tie binding `tx_body_col[0]` to the origin.
+        let comp = build_honest();
+        let mut trace = comp.build_trace();
+        let cell = comp.spine_layout().wrap_output_outer_cell(0);
+        trace.columns[cell.col][cell.row] =
+            trace.columns[cell.col][cell.row] + Block128::ONE;
+        assert!(!comp.air().check(&trace));
     }
 
     #[test]
-    fn t2b_leaf_band_dst_lo_tamper_rejects_per_input() {
-        use crate::composition::tx_validity_hauth::{
-            pre_s_b_dst_cols, pre_s_b_lo_dst_row,
-        };
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let (_, lo_col) = pre_s_b_dst_cols(i);
-            let row = pre_s_b_lo_dst_row(i);
-            trace.columns[lo_col][row] =
-                trace.columns[lo_col][row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T2b-lo tamper at input {i} should reject"
-            );
-        }
+    fn t2b_wrap_output_dst_lo_tamper_rejects() {
+        let comp = build_honest();
+        let mut trace = comp.build_trace();
+        let cell = comp.spine_layout().wrap_output_outer_cell(1);
+        trace.columns[cell.col][cell.row] =
+            trace.columns[cell.col][cell.row] + Block128::ONE;
+        assert!(!comp.air().check(&trace));
     }
 
     #[test]

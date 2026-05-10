@@ -3,25 +3,19 @@
 
 //! Stage 5.4 — [`TxValidityCompositeFull`].
 //!
-//! Extends the 5.3 [`super::tx_validity_composite::TxValidityCompositeSkeleton`]
-//! with `FRI_STATE_OPEN_N_INPUTS` `HAddrAir` instances, one per tx input, each
-//! embedded via [`super::haddr_block`] and tied to the corresponding
-//! FriStateOpen owner-lane cell via a T1 bridge pair.
+//! OP-1.δ.1 — replaced the legacy per-input `emit_haddr_block` loop
+//! (4 × `HAddrAir` at `HADDR_LOG_ROWS`) with a single
+//! [`emit_shared_haddr_block`] call that packs N independent
+//! `derive_address` sponges into one [`HAddrMultiAir`] at
+//! `inner_log_rows = haddr_multi_min_log_rows(N_INPUTS)`. Column
+//! savings for N_INPUTS = 4: `4 · (HADDR_N_COLS + 9) = 320 outer cols`
+//! → `haddr_multi_n_cols(4) + 1 + 8·4 = 113 outer cols`.
 //!
-//! The skeleton already binds the state-root sponges (A) and the
-//! lane-opening consistency (B). This file adds block (C):
-//!
-//! ```text
-//!   C_i  (for i in 0..FRI_STATE_OPEN_N_INPUTS)
-//!     HAddr sub-AIR(i):   s_B[0..2]@OUTPUT_ROW  ==  derive_address(secret_i)
-//!     T1 bridges:
-//!       s_B[0]@OUTPUT_ROW  ==  FriStateOpen.owner_hi[row = i]
-//!       s_B[1]@OUTPUT_ROW  ==  FriStateOpen.owner_lo[row = i]
-//! ```
-//!
-//! Per-input column budget for block C_i: `HADDR_N_COLS` (sub-AIR) + 1
-//! (window indicator) + 2 × 4 (two T1 lane bridges) = `HADDR_N_COLS + 9`.
-//! Four inputs → 4 × `(HADDR_N_COLS + 9)` extra outer columns.
+//! Soundness: each input `i`'s squeeze cell
+//! `(s_B[0], s_B[1]) @ haddr_multi_row_output(i)` is bridged via a
+//! T1 lane pair to `FriStateOpen.owner_{hi,lo}[row = i]` — exactly
+//! the contract the legacy per-input path enforced (see
+//! `haddr_multi.rs::single_instance_output_matches_legacy_haddr`).
 
 use crate::airs::fri_state_combiner::FRI_STATE_COMBINER_LOG_ROWS;
 use crate::airs::fri_state_combiner_composite::{
@@ -32,155 +26,160 @@ use crate::airs::fri_state_open::{
     FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS,
     FRI_STATE_OPEN_WITNESS_COLS,
 };
-use crate::airs::haddr::{HADDR_LOG_ROWS, HADDR_N_COLS};
-use crate::composition::haddr_block::{
-    emit_haddr_block, write_haddr_block_trace, HAddrBlockColumns, HAddrBlockParams,
-    HAddrBlockT1Targets,
+use crate::airs::haddr_multi::{
+    haddr_multi_min_log_rows, haddr_multi_n_cols, haddr_multi_row_output,
+    HADDR_MULTI_LAYOUT_B,
 };
 use crate::composition::row_window::{
     InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy,
 };
+use crate::composition::shared_haddr_block::{
+    emit_shared_haddr_block, write_shared_haddr_block_trace, SharedHAddrBlockParams,
+    SharedHAddrInputBudget, SharedHAddrInputTargets,
+};
 use crate::composition::t1_owner_tie::T1LaneColumnBudget;
 use crate::composition::tx_validity_composite::{
-    SKEL_COMBINER_COL_OFFSET, SKEL_OPEN_COL_OFFSET, SKEL_OPEN_WINDOW_INDICATOR_COL,
-    TX_VALIDITY_SKELETON_LOG_ROWS, TX_VALIDITY_SKELETON_N_COLS,
+    SKEL_COMBINER_COL_OFFSET, SKEL_COMBINER_WINDOW_INDICATOR_COL, SKEL_OPEN_COL_OFFSET,
+    SKEL_OPEN_WINDOW_INDICATOR_COL, TX_VALIDITY_SKELETON_LOG_ROWS, TX_VALIDITY_SKELETON_N_COLS,
 };
 use crate::gates::const_column::PublicColumn;
-use crate::{Air, CompositeAir, Constraint, EvalFrame, FlatEvalFrame, Trace};
+use crate::{Air, CompositeAir, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
 
-/// Outer log-rows: inherited from the 5.3 skeleton (512 rows). HAddr's
-/// 256-row footprint fits comfortably inside a 512-row outer trace.
+/// Outer log-rows: inherited from the 5.3 skeleton (1024 rows after
+/// OP-1.δ.0).
 pub const TX_VALIDITY_FULL_LOG_ROWS: usize = TX_VALIDITY_SKELETON_LOG_ROWS;
+
+/// Number of columns in the shared `HAddrMultiAir` slab.
+pub const SHARED_HADDR_MULTI_N_COLS: usize = haddr_multi_n_cols(FRI_STATE_OPEN_N_INPUTS);
+
+/// Inner log-rows of the shared `HAddrMultiAir`.
+pub const SHARED_HADDR_MULTI_LOG_ROWS: usize =
+    haddr_multi_min_log_rows(FRI_STATE_OPEN_N_INPUTS);
 
 /// Compile-time height sanity.
 const _: () = {
-    assert!(HADDR_LOG_ROWS <= TX_VALIDITY_FULL_LOG_ROWS);
+    assert!(SHARED_HADDR_MULTI_LOG_ROWS <= TX_VALIDITY_FULL_LOG_ROWS);
     assert!(FRI_STATE_OPEN_LOG_ROWS <= TX_VALIDITY_FULL_LOG_ROWS);
     assert!(FRI_STATE_COMBINER_LOG_ROWS == COMBINER_COMPOSITE_LOG_ROWS);
 };
 
-/// Extra columns per embedded HAddr block: sub-AIR columns + window
-/// indicator + 4 bridge/indicator cols × 2 lanes.
-pub const HADDR_BLOCK_OUTER_COLS: usize = HADDR_N_COLS + 1 + 8;
-
-/// Outer col offset of the first HAddr block.
+/// Outer column offset of the shared HAddr slab.
 pub const FULL_HADDR_BLOCKS_BASE: usize = TX_VALIDITY_SKELETON_N_COLS;
+
+/// Outer column of the shared-HAddr window indicator.
+pub const FULL_HADDR_WINDOW_INDICATOR_COL: usize =
+    FULL_HADDR_BLOCKS_BASE + SHARED_HADDR_MULTI_N_COLS;
+
+/// Outer column offset of the per-input T1 bridge slab
+/// (8 cols/input: 4 hi + 4 lo).
+pub const FULL_HADDR_T1_BASE: usize = FULL_HADDR_WINDOW_INDICATOR_COL + 1;
+
+/// Outer columns consumed by the shared-HAddr block (multi-AIR slab +
+/// window indicator + per-input T1 bridges).
+pub const SHARED_HADDR_OUTER_COLS: usize =
+    SHARED_HADDR_MULTI_N_COLS + 1 + 8 * FRI_STATE_OPEN_N_INPUTS;
 
 /// Total outer column count.
 pub const TX_VALIDITY_FULL_N_COLS: usize =
-    FULL_HADDR_BLOCKS_BASE + FRI_STATE_OPEN_N_INPUTS * HADDR_BLOCK_OUTER_COLS;
+    FULL_HADDR_BLOCKS_BASE + SHARED_HADDR_OUTER_COLS;
 
-/// Per-input HAddr block column base.
-pub const fn full_haddr_block_base(input: usize) -> usize {
-    FULL_HADDR_BLOCKS_BASE + input * HADDR_BLOCK_OUTER_COLS
+/// Outer column of input `i`'s squeezed address hi lane inside the
+/// shared HAddr slab. Row = [`full_haddr_squeeze_row`]`(i)`.
+pub const fn full_haddr_squeeze_hi_col() -> usize {
+    FULL_HADDR_BLOCKS_BASE + HADDR_MULTI_LAYOUT_B.s
 }
 
-// Each HAddr block's internal sub-layout (relative to its base):
-const REL_HADDR_SUBAIR_COL: usize = 0; // [0, HADDR_N_COLS)
-const REL_WINDOW_INDICATOR_COL: usize = HADDR_N_COLS;
-const REL_T1_HI_BRIDGE_COL: usize = HADDR_N_COLS + 1;
-const REL_T1_HI_SRC_IND_COL: usize = HADDR_N_COLS + 2;
-const REL_T1_HI_DST_IND_COL: usize = HADDR_N_COLS + 3;
-const REL_T1_HI_TRANS_IND_COL: usize = HADDR_N_COLS + 4;
-const REL_T1_LO_BRIDGE_COL: usize = HADDR_N_COLS + 5;
-const REL_T1_LO_SRC_IND_COL: usize = HADDR_N_COLS + 6;
-const REL_T1_LO_DST_IND_COL: usize = HADDR_N_COLS + 7;
-const REL_T1_LO_TRANS_IND_COL: usize = HADDR_N_COLS + 8;
+/// Outer column of input `i`'s squeezed address lo lane.
+pub const fn full_haddr_squeeze_lo_col() -> usize {
+    FULL_HADDR_BLOCKS_BASE + HADDR_MULTI_LAYOUT_B.s + 1
+}
 
-fn haddr_block_params_for(input: usize, outer_n_cols: usize) -> HAddrBlockParams {
-    let base = full_haddr_block_base(input);
-    HAddrBlockParams {
-        cols: HAddrBlockColumns {
-            col_offset: base + REL_HADDR_SUBAIR_COL,
-            window_indicator_col: base + REL_WINDOW_INDICATOR_COL,
-            t1_hi_budget: T1LaneColumnBudget {
-                bridge_col: base + REL_T1_HI_BRIDGE_COL,
-                src_indicator_col: base + REL_T1_HI_SRC_IND_COL,
-                dst_indicator_col: base + REL_T1_HI_DST_IND_COL,
-                transition_indicator_col: base + REL_T1_HI_TRANS_IND_COL,
+/// Outer row of input `i`'s squeezed address inside the shared HAddr
+/// slab (the multi-AIR's per-input output row).
+pub fn full_haddr_squeeze_row(input: usize) -> usize {
+    haddr_multi_row_output(input)
+}
+
+/// Per-input T1 bridge column base `(hi_base, lo_base)`. Each lane
+/// owns a 4-col sub-budget (bridge + src/dst/transition indicators).
+pub const fn full_haddr_t1_bases(input: usize) -> (usize, usize) {
+    let base = FULL_HADDR_T1_BASE + 8 * input;
+    (base, base + 4)
+}
+
+fn shared_haddr_params(outer_n_cols: usize, outer_log_rows: usize) -> SharedHAddrBlockParams {
+    let mut inputs = Vec::with_capacity(FRI_STATE_OPEN_N_INPUTS);
+    for i in 0..FRI_STATE_OPEN_N_INPUTS {
+        let (hi_base, lo_base) = full_haddr_t1_bases(i);
+        inputs.push((
+            SharedHAddrInputBudget {
+                t1_hi_budget: T1LaneColumnBudget {
+                    bridge_col: hi_base,
+                    src_indicator_col: hi_base + 1,
+                    dst_indicator_col: hi_base + 2,
+                    transition_indicator_col: hi_base + 3,
+                },
+                t1_lo_budget: T1LaneColumnBudget {
+                    bridge_col: lo_base,
+                    src_indicator_col: lo_base + 1,
+                    dst_indicator_col: lo_base + 2,
+                    transition_indicator_col: lo_base + 3,
+                },
             },
-            t1_lo_budget: T1LaneColumnBudget {
-                bridge_col: base + REL_T1_LO_BRIDGE_COL,
-                src_indicator_col: base + REL_T1_LO_SRC_IND_COL,
-                dst_indicator_col: base + REL_T1_LO_DST_IND_COL,
-                transition_indicator_col: base + REL_T1_LO_TRANS_IND_COL,
+            SharedHAddrInputTargets {
+                owner_hi_dst_col: SKEL_OPEN_COL_OFFSET + COL_OWNER_HI,
+                owner_hi_dst_row: i,
+                owner_lo_dst_col: SKEL_OPEN_COL_OFFSET + COL_OWNER_LO,
+                owner_lo_dst_row: i,
             },
-        },
+        ));
+    }
+    SharedHAddrBlockParams {
+        n_inputs: FRI_STATE_OPEN_N_INPUTS,
+        col_offset: FULL_HADDR_BLOCKS_BASE,
+        window_indicator_col: FULL_HADDR_WINDOW_INDICATOR_COL,
         row_window_start: 0,
         outer_n_cols,
-        outer_log_rows: TX_VALIDITY_FULL_LOG_ROWS,
-        t1_targets: HAddrBlockT1Targets {
-            // FriStateOpen owner-lane cells: row = input index, cols =
-            // SKEL_OPEN_COL_OFFSET + {COL_OWNER_HI, COL_OWNER_LO}.
-            owner_hi_dst_col: SKEL_OPEN_COL_OFFSET + COL_OWNER_HI,
-            owner_hi_dst_row: input,
-            owner_lo_dst_col: SKEL_OPEN_COL_OFFSET + COL_OWNER_LO,
-            owner_lo_dst_row: input,
-        },
+        outer_log_rows,
+        inputs,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Column-shift adapter (local copy of the skeleton's; kept private)
-// ---------------------------------------------------------------------------
-
-struct ShiftedColumnsConstraint {
-    inner: Box<dyn Constraint>,
-    shifted_cols: Vec<usize>,
-    shifted_next: Vec<usize>,
+/// Shared entry-point so `tx_validity_hauth`, `tx_validity_leaf`, etc.
+/// don't have to re-derive the shared-HAddr wiring. Callers pass the
+/// enclosing composite's outer width + log_rows.
+pub fn emit_full_shared_haddr(
+    outer_n_cols: usize,
+    outer_log_rows: usize,
+) -> (Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {
+    let wiring = emit_shared_haddr_block(shared_haddr_params(outer_n_cols, outer_log_rows));
+    (wiring.constraints, wiring.public_columns)
 }
 
-impl ShiftedColumnsConstraint {
-    fn new(inner: Box<dyn Constraint>, offset: usize, inner_n_cols: usize) -> Self {
-        for &c in inner.columns() {
-            assert!(c < inner_n_cols);
-        }
-        for &c in inner.shifted_columns() {
-            assert!(c < inner_n_cols);
-        }
-        let shifted_cols = inner.columns().iter().map(|&c| c + offset).collect();
-        let shifted_next = inner.shifted_columns().iter().map(|&c| c + offset).collect();
-        Self {
-            inner,
-            shifted_cols,
-            shifted_next,
-        }
-    }
-}
-
-impl Constraint for ShiftedColumnsConstraint {
-    fn degree(&self) -> usize {
-        self.inner.degree()
-    }
-    fn columns(&self) -> &[usize] {
-        &self.shifted_cols
-    }
-    fn shifted_columns(&self) -> &[usize] {
-        &self.shifted_next
-    }
-    fn evaluate(&self, frame: EvalFrame) -> Block128 {
-        self.inner.evaluate(frame)
-    }
-    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
-        self.inner.evaluate_flat(frame)
-    }
-}
-
-fn shift_public_column(pc: PublicColumn, offset: usize) -> PublicColumn {
-    PublicColumn::new(pc.col + offset, pc.values)
+/// Honest-trace writer for the shared-HAddr block. Returns the per-
+/// input `[addr_hi, addr_lo]` squeeze pairs (same shape as the legacy
+/// `write_haddr_block_trace`).
+pub fn write_full_shared_haddr_trace(
+    cols: &mut [Vec<Block128>],
+    outer_n_cols: usize,
+    outer_log_rows: usize,
+    secrets: &[[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
+) -> Vec<[Block128; 2]> {
+    let params = shared_haddr_params(outer_n_cols, outer_log_rows);
+    write_shared_haddr_block_trace(cols, &params, secrets)
 }
 
 // ---------------------------------------------------------------------------
 // Full composite
 // ---------------------------------------------------------------------------
 
-/// Stage 5.4 full composite: combiner + FriStateOpen + N_INPUTS × HAddr
-/// (each tied to an owner lane via T1 bridges).
+/// Stage 5.4 full composite: combiner + FriStateOpen + shared HAddr
+/// (single `HAddrMultiAir` + N T1 bridge pairs).
 pub struct TxValidityCompositeFull {
     pub air: CompositeAir,
     combiner: FriStateCombinerComposite,
@@ -188,7 +187,8 @@ pub struct TxValidityCompositeFull {
     open_public_columns: Vec<PublicColumn>,
     /// Per-input spend secrets (hi, lo). One set per `FriStateOpenClaim`
     /// entry; inactive / mint / dummy inputs still need a placeholder
-    /// secret — the HAddr sub-AIR runs unconditionally on every block.
+    /// secret — the shared HAddr sub-AIR runs unconditionally on every
+    /// packed input row band.
     secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
 }
 
@@ -206,18 +206,28 @@ impl TxValidityCompositeFull {
         let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
         let mut public_columns: Vec<PublicColumn> = Vec::new();
 
-        // Block A — combiner, plain column shift (no row window).
+        // Block A — combiner via RowWindowWrapper(MaskOff).
         let (combiner_constraints, combiner_publics) = clone_combiner_parts(&combiner);
-        for c in combiner_constraints {
-            constraints.push(Box::new(ShiftedColumnsConstraint::new(
-                c,
-                SKEL_COMBINER_COL_OFFSET,
-                COMBINER_COMPOSITE_N_COLS,
-            )));
-        }
-        for pc in combiner_publics {
-            public_columns.push(shift_public_column(pc, SKEL_COMBINER_COL_OFFSET));
-        }
+        let combiner_view = InnerAirView {
+            inner_n_cols: COMBINER_COMPOSITE_N_COLS,
+            inner_log_rows: COMBINER_COMPOSITE_LOG_ROWS,
+            constraints: combiner_constraints,
+            public_columns: combiner_publics,
+            requires_true_cyclic_wrap: false,
+        };
+        let combiner_params = RowWindowParams {
+            col_offset: SKEL_COMBINER_COL_OFFSET,
+            outer_n_cols,
+            outer_log_rows,
+            row_window_start: 0,
+            row_window_end: 1usize << COMBINER_COMPOSITE_LOG_ROWS,
+            window_indicator_col: SKEL_COMBINER_WINDOW_INDICATOR_COL,
+            policy: WrapPolicy::MaskOff,
+            terminator_pin_cols: Vec::new(),
+        };
+        let combiner_wiring = RowWindowWrapper::wrap(combiner_view, combiner_params);
+        constraints.extend(combiner_wiring.constraints);
+        public_columns.extend(combiner_wiring.public_columns);
 
         // Block B — FriStateOpen via RowWindowWrapper.
         let (open_n_cols, open_constraints, open_publics) = open_air.into_parts();
@@ -243,9 +253,7 @@ impl TxValidityCompositeFull {
         constraints.extend(open_wiring.constraints);
         public_columns.extend(open_wiring.public_columns);
 
-        // Block B.out (E.2.b) — output-side FriStateOpenAir. All-EMPTY
-        // witness today; downstream substages swap to a TxBody.outputs
-        // witness + slot-index bridge.
+        // Block B.out (E.2.b) — output-side FriStateOpenAir (all-EMPTY).
         let (out_open_air, _) =
             crate::composition::tx_validity_composite::build_empty_output_side();
         let (out_open_wiring, _) =
@@ -265,14 +273,13 @@ impl TxValidityCompositeFull {
             ),
         );
 
-        // Block C — FRI_STATE_OPEN_N_INPUTS × HAddr, each tied via T1 to
-        // the corresponding FriStateOpen owner lane row.
-        for input in 0..FRI_STATE_OPEN_N_INPUTS {
-            let params = haddr_block_params_for(input, outer_n_cols);
-            let wiring = emit_haddr_block(params);
-            constraints.extend(wiring.constraints);
-            public_columns.extend(wiring.public_columns);
-        }
+        // Block C — shared HAddr: one `HAddrMultiAir` + N T1 bridge
+        // pairs tying each per-input squeeze cell to the corresponding
+        // `FriStateOpen.owner_{hi,lo}[row=i]`.
+        let (haddr_constraints, haddr_publics) =
+            emit_full_shared_haddr(outer_n_cols, outer_log_rows);
+        constraints.extend(haddr_constraints);
+        public_columns.extend(haddr_publics);
 
         let air = CompositeAir::from_parts_with_publics(
             outer_log_rows,
@@ -297,15 +304,20 @@ impl TxValidityCompositeFull {
             .map(|_| vec![Block128::ZERO; outer_n_rows])
             .collect();
 
-        // Combiner columns on rows 0..combiner_n_rows.
+        // Combiner columns — rows [0, 512); beyond silenced.
+        let combiner_inner_n_rows = 1usize << COMBINER_COMPOSITE_LOG_ROWS;
         let combiner_trace = self.combiner.build_trace();
         let combiner_cols = combiner_trace.columns;
         assert_eq!(combiner_cols.len(), COMBINER_COMPOSITE_N_COLS);
         for (i, src) in combiner_cols.into_iter().enumerate() {
-            cols[SKEL_COMBINER_COL_OFFSET + i] = src;
+            assert_eq!(src.len(), combiner_inner_n_rows);
+            let dst = &mut cols[SKEL_COMBINER_COL_OFFSET + i];
+            for (r, v) in src.into_iter().enumerate() {
+                dst[r] = v;
+            }
         }
 
-        // Open columns on rows 0..FRI_STATE_OPEN_N_ROWS.
+        // Open columns — rows [0, FRI_STATE_OPEN_N_ROWS).
         let open_inner =
             build_open_inner_cols(&self.open_witness, &self.open_public_columns);
         assert_eq!(open_inner.len(), FRI_STATE_OPEN_WITNESS_COLS);
@@ -319,20 +331,17 @@ impl TxValidityCompositeFull {
         // E.2.b: output-side open columns (all-EMPTY honest witness).
         crate::composition::tx_validity_composite::write_empty_output_open_trace(&mut cols);
 
-        // HAddr blocks + T1 bridges. Write each block's sub-trace; the
-        // helper plants the owner-lane destination cell (= native HAddr
-        // squeeze) back into the FriStateOpen column band we just wrote.
-        // This overwrite is deliberate: the honest FriStateOpen owner-
-        // lane value is exactly `derive_address(secret)` hi/lo, so the
-        // witness stays internally consistent.
-        for input in 0..FRI_STATE_OPEN_N_INPUTS {
-            let params = haddr_block_params_for(input, TX_VALIDITY_FULL_N_COLS);
-            let _ = write_haddr_block_trace(&mut cols, params, self.secrets[input]);
-        }
+        // Shared HAddr block: single multi-AIR sub-trace + per-input
+        // T1 bridges. The helper plants each squeeze value into the
+        // corresponding `FriStateOpen.owner_{hi,lo}[row=i]` dst cell.
+        let _ = write_full_shared_haddr_trace(
+            &mut cols,
+            TX_VALIDITY_FULL_N_COLS,
+            TX_VALIDITY_FULL_LOG_ROWS,
+            &self.secrets,
+        );
 
         // Final pass: overwrite every public column with its programme.
-        // Mirrors the skeleton's build_trace — `Air::check` enforces
-        // trace == programme on every declared public column.
         for pc in self.air.public_columns() {
             cols[pc.col] = pc.values.clone();
         }
@@ -350,7 +359,7 @@ impl TxValidityCompositeFull {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (ported from the skeleton; see `tx_validity_composite.rs`)
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn clone_combiner_parts(
@@ -391,7 +400,6 @@ mod tests {
         COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
-    use crate::airs::haddr::{HADDR_LAYOUT_B, HADDR_OUTPUT_ROW};
     use noid_core::{CanonicalSerialize, TowerField};
 
     fn mk_combiner_preimage(seed: u8) -> FriStateCombinerPreimage {
@@ -419,8 +427,6 @@ mod tests {
     }
 
     fn addr_for_secret(secret: [Block128; 2]) -> [Block128; 2] {
-        // Compute via the HAddr trace builder — canonical source of
-        // truth for the witness-visible address lanes.
         let cols = crate::airs::haddr::build_haddr_trace(secret);
         crate::airs::haddr::extract_haddr_output(&cols)
     }
@@ -451,9 +457,6 @@ mod tests {
             new_fields,
         );
 
-        // Per-input secrets; spend claims get honest HAddr-derived
-        // owners, dummy inputs still receive a placeholder secret so
-        // the HAddr sub-AIR has a well-defined trace.
         let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             mk_secret(11),
             mk_secret(22),
@@ -467,18 +470,6 @@ mod tests {
             addr_for_secret(secrets[3]),
         ];
 
-        // Two active spend claims whose owner cells match their
-        // HAddr-derived addresses; two dummy (empty) claims pin the
-        // owner lanes to zero. Dummy rows still get HAddr blocks
-        // tied — the T1 bridge forces the owner cells to zero, so the
-        // corresponding HAddr block's squeeze must ALSO be zero. To
-        // satisfy that without forging a preimage, we plant real
-        // HAddr-derived addresses in `FriStateOpenClaim`'s owner_hi /
-        // owner_lo fields for EVERY row (including "dummy" rows).
-        // Dummy rows stay `live = false` via `is_spend = false &&
-        // is_mint = false`, so the accumulator gates ignore their
-        // pre-values, but the column cells themselves are still pinned
-        // by the T1 bridge to HAddr's squeeze.
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
             spend_with_owner(22, 3, addrs[1]),
@@ -540,12 +531,13 @@ mod tests {
     fn layout_constants_agree() {
         assert_eq!(
             TX_VALIDITY_FULL_N_COLS,
-            TX_VALIDITY_SKELETON_N_COLS
-                + FRI_STATE_OPEN_N_INPUTS * HADDR_BLOCK_OUTER_COLS
+            TX_VALIDITY_SKELETON_N_COLS + SHARED_HADDR_OUTER_COLS
         );
         assert_eq!(TX_VALIDITY_FULL_LOG_ROWS, TX_VALIDITY_SKELETON_LOG_ROWS);
-        // Each block's relative layout is exactly HADDR_N_COLS + 9.
-        assert_eq!(HADDR_BLOCK_OUTER_COLS, HADDR_N_COLS + 9);
+        assert_eq!(
+            SHARED_HADDR_OUTER_COLS,
+            SHARED_HADDR_MULTI_N_COLS + 1 + 8 * FRI_STATE_OPEN_N_INPUTS
+        );
     }
 
     #[test]
@@ -561,12 +553,9 @@ mod tests {
         let comp = build_full();
         let cols = comp.build_trace().columns;
         for input in 0..FRI_STATE_OPEN_N_INPUTS {
-            let base = full_haddr_block_base(input);
-            let hi_col = base + HADDR_LAYOUT_B.s;
-            let lo_col = base + HADDR_LAYOUT_B.s + 1;
-            let row = HADDR_OUTPUT_ROW;
-            let addr_hi = cols[hi_col][row];
-            let addr_lo = cols[lo_col][row];
+            let row = full_haddr_squeeze_row(input);
+            let addr_hi = cols[full_haddr_squeeze_hi_col()][row];
+            let addr_lo = cols[full_haddr_squeeze_lo_col()][row];
 
             let sec = comp.secrets()[input];
             let hi_bytes = sec[0].to_bytes();
@@ -582,8 +571,6 @@ mod tests {
             out[16..].copy_from_slice(&al[..16]);
             assert_eq!(out, native.0, "input {input}");
 
-            // The matching FriStateOpen owner lane cell mirrors the
-            // HAddr squeeze (that's the T1 bridge contract).
             assert_eq!(cols[SKEL_OPEN_COL_OFFSET + COL_OWNER_HI][input], addr_hi);
             assert_eq!(cols[SKEL_OPEN_COL_OFFSET + COL_OWNER_LO][input], addr_lo);
         }
@@ -611,25 +598,24 @@ mod tests {
     fn haddr_squeeze_tamper_rejects_via_t1() {
         let comp = build_full();
         let mut cols = comp.build_trace().columns;
-        // Tamper input 1's HAddr squeeze hi. The sub-AIR constraints
-        // reject this directly (the permutation gates wouldn't be
-        // satisfied), but even if they didn't, the T1 bridge catches
-        // the src mismatch.
-        let base = full_haddr_block_base(1);
-        let col = base + HADDR_LAYOUT_B.s;
-        cols[col][HADDR_OUTPUT_ROW] = cols[col][HADDR_OUTPUT_ROW] + Block128::ONE;
+        // Tamper input 1's squeeze hi cell. The multi-AIR rejects
+        // directly; even if it didn't, the T1 bridge catches the
+        // src mismatch.
+        let row = full_haddr_squeeze_row(1);
+        let col = full_haddr_squeeze_hi_col();
+        cols[col][row] = cols[col][row] + Block128::ONE;
         assert!(!comp.air().check(&Trace::new(cols)));
     }
 
     #[test]
     fn haddr_interior_tamper_rejects() {
+        // Tamper an interior cell of the shared multi-AIR slab. Use
+        // any non-boundary row inside input 2's band.
         let comp = build_full();
         let mut cols = comp.build_trace().columns;
-        // Tamper an interior sbox-output cell in input 2's HAddr block.
-        let base = full_haddr_block_base(2);
-        use crate::airs::haddr::HADDR_LAYOUT_A;
-        let col = base + HADDR_LAYOUT_A.sout + 2;
-        cols[col][5] = cols[col][5] + Block128::ONE;
+        let col = FULL_HADDR_BLOCKS_BASE + HADDR_MULTI_LAYOUT_B.s + 2;
+        let row = full_haddr_squeeze_row(2).saturating_sub(1).max(1);
+        cols[col][row] = cols[col][row] + Block128::ONE;
         assert!(!comp.air().check(&Trace::new(cols)));
     }
 

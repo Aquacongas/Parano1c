@@ -12,9 +12,9 @@
 //! reshuffles its columns, only its registry accessor changes.
 
 pub mod bridge;
-pub mod haddr_block;
-pub mod hauth_block;
 pub mod placement;
+pub mod shared_haddr_block;
+pub mod shared_hauth_block;
 pub mod registry;
 pub mod row_window;
 pub mod spine_adapter;
@@ -42,22 +42,34 @@ pub use t1_owner_tie::{
     emit_t1_input, emit_t1_lane, write_t1_lane_bridge, LaneBridgeBudget, LaneBridgeTie,
     T1InputWiring, T1LaneColumnBudget, T1LaneTie,
 };
-pub use haddr_block::{
-    emit_haddr_block, write_haddr_block_trace, HAddrBlockColumns, HAddrBlockParams,
-    HAddrBlockT1Targets, HAddrBlockWiring,
+pub use shared_haddr_block::{
+    emit_shared_haddr_block, shared_haddr_outer_overhead_cols, write_shared_haddr_block_trace,
+    SharedHAddrBlockParams, SharedHAddrBlockWiring, SharedHAddrInputBudget,
+    SharedHAddrInputTargets,
 };
-pub use hauth_block::{
-    emit_hauth_block, write_hauth_block_trace, HAuthBlockColumns, HAuthBlockParams,
-    HAuthBlockTargets, HAuthBlockTraceCells, HAuthBlockWiring,
+pub use shared_hauth_block::{
+    emit_shared_hauth_block, shared_hauth_outer_overhead_cols, write_shared_hauth_block_trace,
+    InputCells as SharedHAuthInputWiringCells, SharedHAuthBlockParams, SharedHAuthBlockWiring,
+    SharedHAuthInputBudget, SharedHAuthInputCells, SharedHAuthInputTargets,
+    SharedHAuthTxBodyBinding, TxBodyCells as SharedHAuthTxBodyCells,
 };
 pub use tx_validity_full::{
-    full_haddr_block_base, TxValidityCompositeFull, HADDR_BLOCK_OUTER_COLS,
-    TX_VALIDITY_FULL_LOG_ROWS, TX_VALIDITY_FULL_N_COLS,
+    emit_full_shared_haddr, full_haddr_squeeze_hi_col, full_haddr_squeeze_lo_col,
+    full_haddr_squeeze_row, full_haddr_t1_bases, write_full_shared_haddr_trace,
+    TxValidityCompositeFull, FULL_HADDR_BLOCKS_BASE, FULL_HADDR_T1_BASE,
+    FULL_HADDR_WINDOW_INDICATOR_COL, SHARED_HADDR_MULTI_LOG_ROWS, SHARED_HADDR_MULTI_N_COLS,
+    SHARED_HADDR_OUTER_COLS, TX_VALIDITY_FULL_LOG_ROWS, TX_VALIDITY_FULL_N_COLS,
 };
 pub use tx_validity_hauth::{
-    auth_tag_dst_cols, full_hauth_block_base, native_address, native_auth_tag,
-    pre_s_b_dst_cols, TxValidityCompositeHAuth, AUTH_TAG_DST_BASE,
-    FULL_HAUTH_BLOCKS_BASE, HAUTH_BLOCK_OUTER_COLS, PRE_S_B_DST_BASE,
+    auth_tag_dst_cols, auth_tag_hi_dst_row, auth_tag_lo_dst_row, emit_full_shared_hauth,
+    full_hauth_squeeze_hi_col, full_hauth_squeeze_lo_col, full_hauth_squeeze_row,
+    full_hauth_t2a_bases, full_hauth_t2b_bases, full_hauth_tx_body_hi_col,
+    full_hauth_tx_body_lo_col, native_address, native_auth_tag, tx_body_dst_cols,
+    tx_body_hi_dst_row, tx_body_lo_dst_row, write_full_shared_hauth_trace,
+    FullSharedHAuthOptions, T2aDstOverride, T2bDstOverride, TxValidityCompositeHAuth,
+    AUTH_TAG_DST_BASE, FULL_HAUTH_BLOCK_BASE, FULL_HAUTH_T2A_BASE, FULL_HAUTH_T2B_BASE,
+    FULL_HAUTH_WINDOW_INDICATOR_COL, SHARED_HAUTH_MULTI_LOG_ROWS,
+    SHARED_HAUTH_MULTI_N_COLS, SHARED_HAUTH_OUTER_COLS, TX_BODY_DST_BASE,
     TX_VALIDITY_HAUTH_LOG_ROWS, TX_VALIDITY_HAUTH_N_COLS,
 };
 pub use tx_validity_leaf::{
