@@ -2327,25 +2327,66 @@ fn check_public_columns<A: Air>(
     r_point: &[Block128],
     log_len: usize,
 ) -> Result<(), VerifyError> {
+    // Naive per-column `mle_eval` is O(2^log_len) with a fresh allocation
+    // for every `PublicColumn`; on the composite AIR (log_len=13,
+    // ~500 pinned cols) that dominated verify time (~161 ms).
+    //
+    // Two structural observations let us avoid all of that work:
+    //
+    //   (1) Programme MLEs are evaluated at the *same* terminal point
+    //       `r_point` for every public column, so we only need one
+    //       equality tensor per distinct `pc.log_rows` (i.e. per distinct
+    //       programme hypercube size), shared across all pins at that
+    //       size.
+    //
+    //   (2) Zero-padding a length-`2^k` programme up to `2^log_len` only
+    //       contributes the scalar factor `∏_{i=k..log_len} (1 + r_i)`
+    //       — the high variables fold through a zero half in every step
+    //       and leave the low-variable MLE unchanged. So we evaluate the
+    //       programme at its *native* log_rows and multiply by this
+    //       precomputed factor, instead of allocating a padded buffer.
+    assert_eq!(r_point.len(), log_len);
     let expected_rows = 1usize << air.log_rows();
-    let target = 1usize << log_len;
-    for pc in air.public_columns() {
+    let publics = air.public_columns();
+    if publics.is_empty() {
+        return Ok(());
+    }
+    // Cumulative high-var factors: hi_factor[k] = ∏_{i=k..log_len} (1 + r_i).
+    // hi_factor[log_len] == 1 (empty product); every public column with
+    // log_rows = k uses hi_factor[k].
+    let mut hi_factor: Vec<Block128> = vec![Block128::ONE; log_len + 1];
+    for k in (0..log_len).rev() {
+        hi_factor[k] = hi_factor[k + 1] * (Block128::ONE + r_point[k]);
+    }
+    // One equality tensor per distinct log_rows; lazily built on first use.
+    let mut eq_tensors: Vec<Option<Vec<Block128>>> = (0..=log_len).map(|_| None).collect();
+    for pc in publics {
         if pc.col >= air.n_columns() || pc.values.len() != expected_rows {
             return Err(VerifyError::ShapeMismatch);
         }
-        // Zero-pad the programme MLE up to the commitment hypercube.
-        // Identical padding to `pad_column` used on witness columns in
-        // the prover so `base_openings[pc.col]` and this expected value
-        // live on the same hypercube.
-        let padded: Vec<Block128> = if pc.values.len() == target {
-            pc.values.clone()
-        } else {
-            let mut out = Vec::with_capacity(target);
-            out.extend_from_slice(&pc.values);
-            out.resize(target, Block128::ZERO);
-            out
-        };
-        let expected = mle_eval(&padded, r_point);
+        let k = pc.log_rows();
+        if k > log_len {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        let tensor = eq_tensors[k].get_or_insert_with(|| {
+            noid_core::mle::eq::eq_ind_partial_eval(&r_point[..k])
+        });
+        // Programme MLEs are overwhelmingly sparse in their native
+        // hypercube: `bit_adder_operand_programme(64, …)` pins 64 real
+        // bits followed by 8128 zeros; `emit_*_public_columns` similarly
+        // leaves long zero tails. Locate the last nonzero index once and
+        // truncate the dot product there — dominates the comp runtime of
+        // the composite AIR where ~500 pins share a 2^13 hypercube.
+        let vs = pc.values.as_slice();
+        let mut hi = vs.len();
+        while hi > 0 && vs[hi - 1] == Block128::ZERO {
+            hi -= 1;
+        }
+        let mut lo = Block128::ZERO;
+        for i in 0..hi {
+            lo += tensor[i] * vs[i];
+        }
+        let expected = hi_factor[k] * lo;
         if base_openings[pc.col] != expected {
             return Err(VerifyError::ConstraintViolated);
         }
