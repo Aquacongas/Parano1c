@@ -10,35 +10,32 @@
 //! This report is the performance surface for Stage Eopt. It measures
 //! the **per-tx client prover path** — `TxValidityCompositeWithSpine`
 //! — under its verifier-visible `PublicInputs` surface, plus the small
-//! set of component AIRs that dominate its prove-bucket profile:
+//! set of component AIRs that dominate its prove-bucket profile.
+//!
+//! The tx-body Poseidon spine no longer runs inside the STARK — GKR
+//! owns the 59-perm permutation soundness and the STARK keeps only the
+//! two `tx_body_hash` lanes. The composite headline therefore already
+//! charges for the spine through the GKR bridge; there is no separate
+//! AIR-Merkle entry to report.
 //!
 //!   - `TxValidityCompositeWithSpine` — headline: full per-tx composite
-//!     (balance, range, H_ADDR, H_AUTH, tx-body Merkle spine, FRI state
+//!     (balance, range, H_ADDR, H_AUTH, GKR tx-body spine, FRI state
 //!     opening, combiner).
-//!   - `TxBodyMerkleAir`  — 59 Poseidon2b permutations hashing the
-//!     tx body into `tx_body_hash`. Largest hash-chain component.
 //!   - `PoseidonPermAir`  — one Poseidon2b permutation in isolation
-//!     (micro-baseline for Merkle, HAddr, HAuth scaling).
+//!     (micro-baseline for HAddr / HAuth scaling).
 //!   - `HAddrAir`         — 2-field sponge, derive_address (2 perms).
 //!   - `HAuthAir`         — 4-field sponge, hash_auth_tag (3 perms).
 //!   - `RangeGateAir`     — u64 bit-decomposition sweep; raw engine
 //!                          scaling harness.
-//!
-//! All other pre-Eopt benches (LinearCombination scaling harness,
-//! CarryRipple sweep, standalone BalanceGate / TxValidity halves,
-//! TxBodySpineComposite subset, interior-only TxBodyMerkle regression
-//! baseline) have been retired: they were either subsumed by the full
-//! composite or not actionable for optimisation work.
 
 use std::time::{Duration, Instant};
 
 use noid_air::{
     build_perm_trace, emit_perm_all, Air, CompositeAir, HAddrAir, HAuthAir, RangeGateAir, Trace,
-    TxBodyMerkleAir, TxBodyMerkleBoundaryPins, HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS,
-    HAUTH_N_COLS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, TXBODY_MERKLE_LOG_ROWS,
-    TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
+    HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS,
 };
-use noid_core::{Block128, TowerField};
+use noid_core::Block128;
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::{NUM_QUERIES, TAU};
 use noid_stark::{
@@ -459,52 +456,13 @@ fn bench_hauth() -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// TxBodyMerkleAir — boundary-pinned (production path)
-// ---------------------------------------------------------------------------
-
-fn bench_tx_body_merkle() -> AirRow {
-    // Run the permutation chain once with a placeholder pin set and
-    // read back the wrap output, so the O2 pin is self-consistent
-    // with the honest trace.
-    let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
-        Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-    let placeholder = TxBodyMerkleBoundaryPins::default();
-    let seed_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
-    let layout = noid_air::build_instance_layout();
-    // Wrap instance id 58.
-    let wrap_out_row = layout[58].slot_base_row + 66; // N_ROUNDS = 66
-    let s_base = noid_air::TXBODY_MERKLE_LAYOUT.s;
-    let pins = TxBodyMerkleBoundaryPins {
-        tx_body_hash: [seed_cols[s_base][wrap_out_row], seed_cols[s_base + 1][wrap_out_row]],
-        ..TxBodyMerkleBoundaryPins::default()
-    };
-
-    let air = TxBodyMerkleAir::new_with_boundary_pins(pins);
-    let trace_cols = noid_air::build_tx_body_merkle_trace_with_boundary_pins(&inputs, &pins);
-    let domains = noid_air::airs::tx_body_merkle::tx_body_merkle_column_domains_with_boundary_pins();
-    let trace = Trace::new_with_domains(trace_cols, domains);
-
-    let row = bench_air(
-        "TxBodyMerkleAir (tx-body spine: 59 Poseidon2b perms + boundary pins)",
-        Some("    per-perm: {prove, verify, proof} / 59".to_string()),
-        air,
-        trace,
-        SAMPLES.min(3),
-        || "TxBodyMerkleAir native check failed".to_string(),
-    );
-    assert_eq!(row.log_rows, TXBODY_MERKLE_LOG_ROWS);
-    assert_eq!(row.n_cols, *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
-    row
-}
-
-// ---------------------------------------------------------------------------
 // Per-tx prover path — TxValidityCompositeWithSpine (headline)
 //
 // Full unified composite proving balance, range, H_ADDR, H_AUTH,
-// the tx-body Merkle spine, and the FRI state opening / combiner
-// under the verifier-visible PublicInputs surface
-// (prev_state_root, new_state_root, tx_body_hash, fee, coinbase_credit,
-// log_slots, is_activation[*], is_deactivation[*]).
+// the GKR tx-body spine, and the FRI state opening / combiner under
+// the verifier-visible PublicInputs surface (prev_state_root,
+// new_state_root, tx_body_hash, fee, coinbase_credit, log_slots,
+// is_activation[*], is_deactivation[*]).
 // ---------------------------------------------------------------------------
 
 fn bench_per_tx_composite() -> AirRow {
@@ -553,7 +511,6 @@ fn print_banner() {
     println!("  Sections:");
     println!("    Engine scaling              (RangeGate sweep)");
     println!("    Poseidon2b hashes           (Perm / HAddr / HAuth)");
-    println!("    Transaction-body Merkle     (TxBodyMerkle, boundary-pinned)");
     println!("    Per-tx prover path          (TxValidityCompositeWithSpine, headline)");
     println!();
 }
@@ -616,9 +573,6 @@ fn main() {
     let haddr_row = bench_haddr();
     let hauth_row = bench_hauth();
 
-    eprintln!("  tx body merkle ...");
-    let merkle_prod = bench_tx_body_merkle();
-
     eprintln!("  per-tx prover path ...");
     let l_row = bench_per_tx_composite();
     eprintln!();
@@ -632,9 +586,6 @@ fn main() {
     print_row("perm     ", &perm_row);
     print_row("haddr    ", &haddr_row);
     print_row("hauth    ", &hauth_row);
-
-    print_section("Transaction-body Merkle");
-    print_row("boundary ", &merkle_prod);
 
     print_section("Per-tx prover path (full PublicInputs surface)");
     print_row("per-tx   ", &l_row);

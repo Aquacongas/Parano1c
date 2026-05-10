@@ -30,10 +30,15 @@ pub mod ladder_batch;
 pub mod multipoint_batch;
 pub mod vshift;
 
+pub mod spine;
+
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{AdditiveNTT, Block128, TowerField};
-use noid_fri::batch::{prove_batched, verify_batched, BatchedEvalProof};
+use noid_fri::batch::{
+    prove_batched, prove_batched_mixed, verify_batched, verify_batched_mixed, BatchedEvalProof,
+    MixedBatchedEvalProof,
+};
 use noid_fri::channel::TAU;
 use noid_fri::prover::{commit_fast, FriCommitment};
 use noid_fri::Channel;
@@ -90,6 +95,17 @@ pub struct StarkProof {
     /// claim at `r_point` and every ladder claim (inlined in §12c'
     /// as weighted eq-sums over `ladder_points(r_point)`).
     pub multipoint_batch: BatchedEvalProof,
+    /// γ₃b mixed-length multipoint close. `None` for the default
+    /// path — in that case `multipoint_batch` is authoritative and
+    /// the proof is byte-identical to the pre-γ₃b layout. `Some` when
+    /// at least one [`ExtraColumn`] participated in the close; the
+    /// base columns still close at `r''` inside the mixed proof, and
+    /// extras close at their own `log_len`s in the same batched
+    /// opening. When `Some`, `multipoint_batch` is an *unused stub*
+    /// preserved only so the struct shape doesn't change across
+    /// paths (built via `BatchedEvalProof { column_openings: vec![],
+    /// batch_proof: stub }` with an empty column list).
+    pub multipoint_batch_mixed: Option<MixedBatchedEvalProof>,
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +677,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
             shift_partials,
             multipoint_rounds,
             multipoint_batch,
+            multipoint_batch_mixed: None,
         },
         t,
     )
@@ -880,12 +897,768 @@ fn prove_multipoint_close_inner(
     (rounds, batch)
 }
 
+// ---------------------------------------------------------------------------
+// γ₃b scaffolding — mixed-length extra columns
+// ---------------------------------------------------------------------------
+//
+// `ExtraColumn` packages a single externally-committed MLE that must
+// participate in the STARK's multipoint close. The canonical consumer
+// is the GKR spine's boundary MLE `B` at `log_len = 15`, opened at
+// `r_B` to value `v_B`. Extras may live on a different hypercube than
+// the trace columns — the mixed-length close (γ₃b) handles that via
+// [`crate::multipoint_batch::prove_multipoint_sumcheck_mixed`] +
+// [`noid_fri::batch::prove_batched_mixed`].
+//
+// **Invariants** enforced here and pinned by tests:
+//
+// * **A. Empty-extras ≡ default.** With `extras == &[]`, the new
+//   wrappers produce a byte-identical `StarkProof` to the legacy
+//   `prove_air_unchecked_with_extra`. This is tested by
+//   `invariant_a_empty_extras_byte_identical` and guards every later
+//   change to the mixed close.
+// * **B. Single-group mixed ≡ uniform semantics.** When every extra
+//   has the same `log_len` as the base trace, the mixed close
+//   accepts a proof byte-identical to the default close. Pinned in
+//   the follow-up that lands the real mixed path.
+// * **C. Extras order is canonical.** Extras are sorted inside the
+//   wrapper by `(log_len, commitment root bytes, eval_point bytes)`
+//   before transcript absorption / multipoint close, so the caller's
+//   argument order never leaks into the transcript.
+#[derive(Debug, Clone)]
+pub struct ExtraColumn {
+    pub evals: Vec<Block128>,
+    pub commitment: FriCommitment,
+    pub eval_point: Vec<Block128>,
+    pub value: Block128,
+}
+
+/// Canonical extras ordering: ascending `log_len`, then by commitment
+/// root bytes, then by the serialized eval_point. Pure function of
+/// extras contents — no transcript state.
+fn canonicalize_extras(extras: &[ExtraColumn]) -> Vec<ExtraColumn> {
+    let mut sorted: Vec<ExtraColumn> = extras.to_vec();
+    sorted.sort_by(|a, b| {
+        let la = a.commitment.log_len;
+        let lb = b.commitment.log_len;
+        la.cmp(&lb)
+            .then_with(|| a.commitment.vector_commitment.root.cmp(&b.commitment.vector_commitment.root))
+            .then_with(|| {
+                let sa: Vec<u128> = a.eval_point.iter().map(|v| v.0).collect();
+                let sb: Vec<u128> = b.eval_point.iter().map(|v| v.0).collect();
+                sa.cmp(&sb)
+            })
+    });
+    sorted
+}
+
 /// Prover variant that skips the native AIR self-check. Exposed for
 /// soundness testing: a malicious prover must be caught by the
 /// cryptographic layer (zero-check + FRI), not by the defense-in-depth
 /// native pre-check.
 #[doc(hidden)]
 pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) -> StarkProof {
+    prove_air_unchecked_with_extra(air, trace, pi, &[])
+}
+
+/// γ₃b opt-in wrapper around [`prove_air_unchecked_with_extra`] that
+/// threads additional externally-committed MLEs through the
+/// multipoint close. When `extras` is empty this is a direct
+/// delegation to `prove_air_unchecked_with_extra(extra_transcript)`
+/// and the output is byte-identical to the default path.
+///
+/// The non-empty branch (actual mixed-length close) is gated behind a
+/// follow-up that lands the wiring; attempting to use it now panics
+/// with a clear message. The scaffolding exists so callers (notably
+/// `noid_stark::spine`) can commit to the API shape before the
+/// wiring is in place.
+#[doc(hidden)]
+pub fn prove_air_unchecked_with_extra_columns<A: Air>(
+    air: &A,
+    trace: &Trace,
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+    extras: &[ExtraColumn],
+) -> StarkProof {
+    if extras.is_empty() {
+        // Invariant A: empty extras must reduce to the legacy path
+        // byte-for-byte. No canonicalization, no transcript change.
+        return prove_air_unchecked_with_extra(air, trace, pi, extra_transcript);
+    }
+    let extras = canonicalize_extras(extras);
+    prove_air_unchecked_with_extras_inner(air, trace, pi, extra_transcript, &extras)
+}
+
+/// Verifier mirror of [`prove_air_unchecked_with_extra_columns`].
+/// Empty `extras` delegates byte-identically to
+/// [`verify_air_with_extra`]. See that function's docstring for
+/// `extra_transcript` semantics.
+pub fn verify_air_with_extra_columns<A: Air>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &StarkProof,
+    extra_transcript: &[Block128],
+    extras: &[ExtraColumn],
+) -> Result<(), VerifyError> {
+    if extras.is_empty() {
+        return verify_air_with_extra(air, pi, proof, extra_transcript);
+    }
+    let extras = canonicalize_extras(extras);
+    verify_air_with_extras_inner(air, pi, proof, extra_transcript, &extras)
+}
+
+/// Domain tag separating the mixed-close extras commitment absorption
+/// from any other use of `observe_field_elem` on the parent channel.
+/// Binds the extras' commitment roots to the parent transcript at a
+/// position distinct from `extra_transcript`, so the two channels
+/// cannot be confused.
+const EXTRAS_ABSORB_TAG: u64 = 0xFFFA_4337_0000_0001;
+
+// ---------------------------------------------------------------------------
+// γ₃b mixed-length prove/verify
+// ---------------------------------------------------------------------------
+//
+// Shape of the mixed close (when `extras` is non-empty and already
+// canonicalized):
+//
+// Transcript (after zero-check + base_openings + ladder partials are
+// absorbed exactly as in the default path):
+//   • EXTRAS_ABSORB_TAG
+//   • For each extra in canonical order:
+//       - absorb the extra's FriCommitment
+//       - absorb `eval_point` elements
+//       - absorb `value`
+//   • Squeeze γ_s per slot (same as default).
+//   • MULTIPOINT_TAG + squeeze β (same as default).
+//     Horner weights extend past base+ladder to cover extras at
+//     indices `[n + s_count .. n + s_count + n_extras)` so every
+//     weight is `β^i` for a distinct `i` — the soundness bound
+//     (n + s_count + n_extras − 1)/|F| stays at ~2^{-128}.
+//   • Run `prove_multipoint_sumcheck_mixed` across base pairs
+//     (log_len), ladder pairs (log_len), and extra pairs
+//     (each extra's `log_len`). Challenges are length `n_max`
+//     where `n_max = max(log_len, extras_log_lens…)`. For γ₃b
+//     wiring B lives at log_len=15 and base at 13, so n_max=15.
+//   • `r''_base = last log_len` challenges (reversed); `r''_extra_k`
+//     = last `extra_k.log_len` challenges (reversed).
+//   • Single `prove_batched_mixed` closes every base column and
+//     every extra at its own hypercube.
+#[allow(clippy::too_many_arguments)]
+fn prove_air_unchecked_with_extras_inner<A: Air>(
+    air: &A,
+    trace: &Trace,
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+    extras: &[ExtraColumn],
+) -> StarkProof {
+    debug_assert!(
+        !extras.is_empty(),
+        "mixed inner called with empty extras — caller must delegate"
+    );
+
+    let log_rows = trace.log_rows;
+    let log_len = padded_log_len(log_rows);
+    let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+
+    let (commitments, padded_columns): (Vec<FriCommitment>, Vec<Vec<Block128>>) = {
+        use rayon::prelude::*;
+        trace
+            .columns
+            .par_iter()
+            .map(|col| {
+                let padded = pad_column(col, log_len);
+                let commitment = commit_fast(&padded, &ntt);
+                (commitment, padded)
+            })
+            .unzip()
+    };
+
+    let mut channel = Channel::new();
+    absorb_public_inputs(&mut channel, pi);
+    for c in &commitments {
+        channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
+    }
+
+    let z = channel.get_random_points(log_len);
+    let n_constraints = air.constraints().len();
+    let betas: Vec<Block128> = (0..n_constraints)
+        .map(|_| channel.get_random_point())
+        .collect();
+
+    let shifted_indices: Vec<usize> = air.shifted_column_indices();
+    assert!(
+        shifted_indices.is_empty() || log_rows == padded_log_len(log_rows),
+        "VSHIFT requires log_rows >= TAU+1; got log_rows={} padded={}",
+        log_rows,
+        padded_log_len(log_rows)
+    );
+    let n_base = padded_columns.len();
+    let mut shifted_slot: Vec<Option<usize>> = vec![None; n_base];
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        shifted_slot[col_id] = Some(slot);
+    }
+    let rotated_columns: Vec<Vec<Block128>> = shifted_indices
+        .iter()
+        .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
+        .collect();
+    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
+    sumcheck_cols.extend_from_slice(&padded_columns);
+    sumcheck_cols.extend(rotated_columns.into_iter());
+
+    let degree = round_poly_degree(air);
+    let (zero_check_rounds, r) = prove_zero_check(
+        &sumcheck_cols,
+        air.constraints(),
+        &betas,
+        &z,
+        &mut channel,
+        degree,
+        &shifted_slot,
+        n_base,
+    );
+
+    let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
+
+    let (base_openings, shift_partials) =
+        prove_base_and_ladder_partials(&padded_columns, &shifted_indices, &r_point, &mut channel);
+
+    // --- γ₃b: absorb extras into the parent channel ---
+    //
+    // Tag + per-extra (commitment, eval_point, value). Canonical
+    // ordering was fixed by `canonicalize_extras`; the verifier
+    // replays in the same order.
+    channel.observe_field_elem(Block128::from(EXTRAS_ABSORB_TAG as u128));
+    for e in extras {
+        channel.observe_fri_commitment(&e.commitment);
+        channel.observe_field_elems(&e.eval_point);
+        channel.observe_field_elem(e.value);
+    }
+
+    // --- Mixed multipoint close ---
+    let (multipoint_rounds, mixed_proof) = prove_multipoint_close_mixed(
+        &padded_columns,
+        &base_openings,
+        &r_point,
+        &shifted_indices,
+        &shift_partials,
+        extras,
+        log_len,
+        &mut channel,
+        &hasher,
+    );
+
+    // Stub BatchedEvalProof so the `multipoint_batch` field stays
+    // populated with something structural. The verifier never reads
+    // it when `multipoint_batch_mixed` is `Some`.
+    let stub = stub_batched_eval_proof();
+
+    StarkProof {
+        log_rows,
+        column_commitments: commitments,
+        base_openings,
+        zero_check_rounds,
+        shift_partials,
+        multipoint_rounds,
+        multipoint_batch: stub,
+        multipoint_batch_mixed: Some(mixed_proof),
+    }
+}
+
+fn stub_batched_eval_proof() -> BatchedEvalProof {
+    use noid_fri::prover::{EvalProof, Univariate};
+    BatchedEvalProof {
+        column_openings: Vec::new(),
+        batch_proof: EvalProof {
+            upper_partial_evals: Vec::new(),
+            sum_check_oracles: Vec::<Univariate>::new(),
+            fri_oracles: Vec::new(),
+            fri_queried_symbols: Vec::new(),
+            fri_merkle_paths: Vec::new(),
+            final_codeword: Vec::new(),
+        },
+    }
+}
+
+/// γ₃b mixed-length multipoint close. Mirrors
+/// `prove_multipoint_close_inner` but:
+///
+/// * Horner weights run over `n + s_count + n_extras` indices.
+/// * Uses `prove_multipoint_sumcheck_mixed` over pairs of differing
+///   hypercube sizes (base+ladder all share `log_len`; each extra
+///   carries its own `log_len`).
+/// * Closes with `prove_batched_mixed`, which groups columns by
+///   hypercube size and runs one FRI per group under a shared α.
+#[allow(clippy::too_many_arguments)]
+fn prove_multipoint_close_mixed(
+    padded_columns: &[Vec<Block128>],
+    base_openings: &[Block128],
+    r_point: &[Block128],
+    shifted_indices: &[usize],
+    shift_partials: &[Vec<Block128>],
+    extras: &[ExtraColumn],
+    log_len: usize,
+    channel: &mut Channel,
+    hasher: &Poseidon2bSponge,
+) -> (Vec<RoundPoly>, MixedBatchedEvalProof) {
+    use noid_core::mle::eq::eq_ind_partial_eval;
+    use rayon::prelude::*;
+
+    let n = padded_columns.len();
+    let s_count = shifted_indices.len();
+    let n_extras = extras.len();
+
+    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
+
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let total_weights = n + s_count + n_extras;
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(total_weights);
+    {
+        let mut cur = Block128::ONE;
+        for _ in 0..total_weights {
+            lambdas.push(cur);
+            cur = cur * beta;
+        }
+    }
+
+    // Target = base + inlined-ladder + extras.
+    let mut target = Block128::ZERO;
+    for i in 0..n {
+        target += lambdas[i] * base_openings[i];
+    }
+    for (slot, partials) in shift_partials.iter().enumerate() {
+        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
+        target += lambdas[n + slot] * t_s;
+    }
+    for (i, e) in extras.iter().enumerate() {
+        target += lambdas[n + s_count + i] * e.value;
+    }
+
+    // Build mixed pairs.
+    let eq_base = eq_ind_partial_eval(r_point);
+    let base_pairs_a: Vec<Vec<Block128>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let lam = lambdas[i];
+            eq_base.iter().map(|&v| v * lam).collect()
+        })
+        .collect();
+    let base_pairs_b: Vec<&[Block128]> =
+        (0..n).map(|i| padded_columns[i].as_slice()).collect();
+
+    let weight_trails = if s_count > 0 {
+        Some(crate::ladder_batch::WeightTrails::new(r_point))
+    } else {
+        None
+    };
+    let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
+        .into_par_iter()
+        .map(|slot| {
+            let trails = weight_trails
+                .as_ref()
+                .expect("trails present when s_count > 0");
+            let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
+            let eta = lambdas[n + slot];
+            for v in w.iter_mut() {
+                *v = *v * eta;
+            }
+            w
+        })
+        .collect();
+    let ladder_pairs_b: Vec<&[Block128]> = (0..s_count)
+        .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
+        .collect();
+
+    let extras_pairs_a: Vec<Vec<Block128>> = (0..n_extras)
+        .into_par_iter()
+        .map(|i| {
+            let lam = lambdas[n + s_count + i];
+            let eq_e = eq_ind_partial_eval(&extras[i].eval_point);
+            eq_e.into_iter().map(|v| v * lam).collect()
+        })
+        .collect();
+    let extras_pairs_b: Vec<&[Block128]> =
+        (0..n_extras).map(|i| extras[i].evals.as_slice()).collect();
+
+    let mut pairs_a = base_pairs_a;
+    pairs_a.extend(ladder_pairs_a);
+    pairs_a.extend(extras_pairs_a);
+    let mut pairs_b = base_pairs_b;
+    pairs_b.extend(ladder_pairs_b);
+    pairs_b.extend(extras_pairs_b);
+
+    let mut n_vars: Vec<usize> = Vec::with_capacity(total_weights);
+    for _ in 0..n {
+        n_vars.push(log_len);
+    }
+    for _ in 0..s_count {
+        n_vars.push(log_len);
+    }
+    for e in extras {
+        n_vars.push(e.commitment.log_len);
+    }
+
+    let (rounds, challenges) = crate::multipoint_batch::prove_multipoint_sumcheck_mixed(
+        pairs_a, pairs_b, &n_vars, target, channel,
+    );
+    let n_max = n_vars.iter().copied().max().unwrap();
+    debug_assert_eq!(challenges.len(), n_max);
+
+    // Low-var suffix of reversed challenges, per hypercube size.
+    // Convention: the uniform path defined `r_point_out = reversed(challenges)`;
+    // MLE(r_point_out) closes the column. For mixed, each pair of
+    // n_k vars has its low rounds at `round_idx ∈ [m_k, n_max)`
+    // where `m_k = n_max - n_k`; the low-var challenges in fold
+    // order are `challenges[m_k..]`, reversed for MLE input.
+    let reversed_full: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    // For base cols (n_vars = log_len): opening point is
+    // `reversed_full[..log_len]` — the first log_len entries of the
+    // fully-reversed challenge vector. This is the same derivation
+    // as `mixed_high_scalar(challenges, m)` — the low-var suffix of
+    // the forward challenges is the high-var prefix of the reversed
+    // challenges.
+    //
+    // When n_max == log_len (every extra also at log_len), this
+    // collapses to the uniform path's r'' == reversed(challenges).
+    let r_pp_base: Vec<Block128> = reversed_full[..log_len].to_vec();
+
+    // Assemble the flat column list for the mixed FRI close, in a
+    // fixed order: base columns first, then extras in canonical
+    // order. The verifier builds the same list from
+    // `proof.column_commitments` + the canonicalized extras.
+    let mut cols_for_fri: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
+    let mut col_log_lens: Vec<usize> = vec![log_len; n];
+    for e in extras {
+        cols_for_fri.push(e.evals.as_slice());
+        col_log_lens.push(e.commitment.log_len);
+    }
+
+    // Opening-point map per log_len. Every column at `log_len`
+    // opens at `r_pp_base` (length log_len). Every extra with a
+    // different log_len ℓ opens at `reversed_full[..ℓ]`. This is
+    // exactly what the mixed sumcheck's identity requires.
+    let mut eval_points: std::collections::BTreeMap<usize, Vec<Block128>> = Default::default();
+    eval_points.insert(log_len, r_pp_base);
+    for e in extras {
+        let ll = e.commitment.log_len;
+        eval_points
+            .entry(ll)
+            .or_insert_with(|| reversed_full[..ll].to_vec());
+    }
+
+    // One AdditiveNTT plan per distinct log_len.
+    let mut ntts: std::collections::BTreeMap<usize, AdditiveNTT<Block128>> = Default::default();
+    for &ll in eval_points.keys() {
+        ntts.entry(ll)
+            .or_insert_with(|| AdditiveNTT::<Block128>::new(ll + noid_fri::code::LOG_RATE));
+    }
+
+    let proof = prove_batched_mixed(
+        &cols_for_fri,
+        &col_log_lens,
+        &eval_points,
+        &ntts,
+        channel,
+        hasher,
+    );
+
+    (rounds, proof)
+}
+
+fn verify_air_with_extras_inner<A: Air>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &StarkProof,
+    extra_transcript: &[Block128],
+    extras: &[ExtraColumn],
+) -> Result<(), VerifyError> {
+    if proof.log_rows != air.log_rows() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    if proof.column_commitments.len() != air.n_columns()
+        || proof.base_openings.len() != air.n_columns()
+    {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    // Mixed path: multipoint_batch is a stub; the authoritative
+    // opening is in multipoint_batch_mixed.
+    let mixed = proof
+        .multipoint_batch_mixed
+        .as_ref()
+        .ok_or(VerifyError::ShapeMismatch)?;
+    if mixed.column_openings.len() != air.n_columns() + extras.len() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    let log_len = padded_log_len(proof.log_rows);
+    if proof.zero_check_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let degree = round_poly_degree(air);
+    let n_points = degree + 1;
+    for rp in &proof.zero_check_rounds {
+        if rp.len() != n_points {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+
+    let hasher = Poseidon2bSponge::new();
+
+    let mut channel = Channel::new();
+    absorb_public_inputs(&mut channel, pi);
+    for c in &proof.column_commitments {
+        channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
+    }
+
+    let z = channel.get_random_points(log_len);
+    let n_constraints = air.constraints().len();
+    let betas: Vec<Block128> = (0..n_constraints)
+        .map(|_| channel.get_random_point())
+        .collect();
+
+    let mut claim = Block128::ZERO;
+    let mut challenges: Vec<Block128> = Vec::with_capacity(log_len);
+    for rp in &proof.zero_check_rounds {
+        let sum01 = rp[0] + rp[1];
+        if sum01 != claim {
+            return Err(VerifyError::ZeroCheckFailed);
+        }
+        channel.observe_field_elems(rp);
+        let r_i = channel.get_random_point();
+        claim = lagrange_eval_at(rp, r_i);
+        challenges.push(r_i);
+    }
+
+    let r_point: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    let eq_zr = noid_core::mle::eq::eq_ind(&z, &r_point);
+
+    let shifted_indices: Vec<usize> = air.shifted_column_indices();
+    if proof.shift_partials.len() != shifted_indices.len() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let expected_ladder_len = log_len + 1;
+    for partials in &proof.shift_partials {
+        if partials.len() != expected_ladder_len {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    if proof.multipoint_rounds.len() != std::cmp::max(
+        log_len,
+        extras
+            .iter()
+            .map(|e| e.commitment.log_len)
+            .max()
+            .unwrap_or(0),
+    ) {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    for rp in &proof.multipoint_rounds {
+        if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    let mut shifted_slot: Vec<Option<usize>> = vec![None; air.n_columns()];
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        shifted_slot[col_id] = Some(slot);
+    }
+
+    let shifted_openings: Vec<Block128> = proof
+        .shift_partials
+        .iter()
+        .map(|partials| reconstruct_shifted_opening(&r_point, partials))
+        .collect();
+
+    check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
+
+    let column_openings = &proof.base_openings;
+    let mut composition = Block128::ZERO;
+    let mut local_scratch: Vec<Block128> = Vec::new();
+    let mut next_scratch: Vec<Block128> = Vec::new();
+    for (k, c) in air.constraints().iter().enumerate() {
+        local_scratch.clear();
+        for &j in c.columns() {
+            local_scratch.push(column_openings[j]);
+        }
+        next_scratch.clear();
+        for &j in c.shifted_columns() {
+            let slot = shifted_slot[j].ok_or(VerifyError::ShapeMismatch)?;
+            next_scratch.push(shifted_openings[slot]);
+        }
+        let frame = EvalFrame {
+            local: &local_scratch,
+            next: &next_scratch,
+        };
+        composition += betas[k] * c.evaluate(frame);
+    }
+    if eq_zr * composition != claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    // Replay ladder-partial absorptions (same as default).
+    channel.observe_field_elems(&proof.base_openings);
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+    }
+
+    // γ₃b: extras absorbed on the parent channel before γ_s / β.
+    channel.observe_field_elem(Block128::from(EXTRAS_ABSORB_TAG as u128));
+    for e in extras {
+        channel.observe_fri_commitment(&e.commitment);
+        channel.observe_field_elems(&e.eval_point);
+        channel.observe_field_elem(e.value);
+    }
+
+    let s_count = shifted_indices.len();
+    let n_extras = extras.len();
+    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
+
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let n = proof.base_openings.len();
+    let total_weights = n + s_count + n_extras;
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(total_weights);
+    {
+        let mut cur = Block128::ONE;
+        for _ in 0..total_weights {
+            lambdas.push(cur);
+            cur = cur * beta;
+        }
+    }
+
+    let mut target = Block128::ZERO;
+    for i in 0..n {
+        target += lambdas[i] * proof.base_openings[i];
+    }
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
+        target += lambdas[n + slot] * t_s;
+    }
+    for (i, e) in extras.iter().enumerate() {
+        target += lambdas[n + s_count + i] * e.value;
+    }
+
+    let (sc_challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck_mixed(
+        &proof.multipoint_rounds,
+        target,
+        &mut channel,
+    )?;
+    let reversed_full: Vec<Block128> = sc_challenges.iter().rev().cloned().collect();
+    let n_max = sc_challenges.len();
+    if n_max != std::cmp::max(
+        log_len,
+        extras
+            .iter()
+            .map(|e| e.commitment.log_len)
+            .max()
+            .unwrap_or(0),
+    ) {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let r_pp_base: Vec<Block128> = reversed_full[..log_len].to_vec();
+
+    // Reconstruct the mixed terminal. Flat column order is base then
+    // extras (canonical); openings come from
+    // `mixed.column_openings`. Each pair contributes
+    //   lambda_k · (A_k at its low-var suffix) · m_k
+    // where `A_k` was a scaled eq, plus the high-scalar prefix
+    // accumulated into `s_k^final`. Using `mixed_high_scalar` on the
+    // forward challenges' high prefix collapses both into a clean
+    // reconstruction (the mixed sumcheck identity).
+    let m_base = &mixed.column_openings[..n];
+    let m_extras = &mixed.column_openings[n..];
+    let eq_base = noid_core::mle::eq::eq_ind(&r_point, &r_pp_base);
+
+    // Per-pair high-round scalar. Base + ladder share `m_base_rounds
+    // = n_max - log_len`; each extra has its own. When n_max == log_len
+    // (extras at the base hypercube size), m_base_rounds = 0 and
+    // s_base_scalar = 1 — which reduces this reconstruction to the
+    // legacy uniform formula.
+    let m_base_rounds = n_max - log_len;
+    let s_base_scalar =
+        crate::multipoint_batch::mixed_high_scalar(&sc_challenges, m_base_rounds);
+
+    let mut expected = Block128::ZERO;
+    for k in 0..n {
+        expected += lambdas[k] * s_base_scalar * eq_base * m_base[k];
+    }
+    if s_count > 0 {
+        let axes = crate::ladder_batch::LadderWeightAxes::new(&r_point, &r_pp_base);
+        for (slot, &col_id) in shifted_indices.iter().enumerate() {
+            let w_s = crate::ladder_batch::weight_at_axes(gammas[slot], &axes);
+            expected += lambdas[n + slot] * s_base_scalar * w_s * m_base[col_id];
+        }
+    }
+    for (i, e) in extras.iter().enumerate() {
+        let ll = e.commitment.log_len;
+        let m_k = n_max - ll;
+        let s_k = crate::multipoint_batch::mixed_high_scalar(&sc_challenges, m_k);
+        let r_low: &[Block128] = &reversed_full[..ll];
+        let eq_e = noid_core::mle::eq::eq_ind(&e.eval_point, r_low);
+        expected += lambdas[n + s_count + i] * s_k * eq_e * m_extras[i];
+    }
+    if expected != final_claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    // Flat column list for mixed FRI verify: base (log_len) then
+    // extras in canonical order, each at its own log_len.
+    let mut flat_commits: Vec<FriCommitment> = proof.column_commitments.clone();
+    for e in extras {
+        flat_commits.push(e.commitment.clone());
+    }
+    let mut col_log_lens: Vec<usize> = vec![log_len; n];
+    for e in extras {
+        col_log_lens.push(e.commitment.log_len);
+    }
+
+    let mut eval_points: std::collections::BTreeMap<usize, Vec<Block128>> = Default::default();
+    eval_points.insert(log_len, r_pp_base);
+    for e in extras {
+        let ll = e.commitment.log_len;
+        eval_points
+            .entry(ll)
+            .or_insert_with(|| reversed_full[..ll].to_vec());
+    }
+    let mut ntts: std::collections::BTreeMap<usize, AdditiveNTT<Block128>> = Default::default();
+    for &ll in eval_points.keys() {
+        ntts.entry(ll)
+            .or_insert_with(|| AdditiveNTT::<Block128>::new(ll + noid_fri::code::LOG_RATE));
+    }
+
+    verify_batched_mixed(
+        &flat_commits,
+        &col_log_lens,
+        &eval_points,
+        &ntts,
+        mixed,
+        &mut channel,
+        &hasher,
+    )
+    .map_err(VerifyError::FriFailed)?;
+
+    Ok(())
+}
+
+/// Like [`prove_air_unchecked`], but absorbs `extra_transcript` into
+/// the parent Fiat-Shamir channel **between** the column-root
+/// absorption and the zero-check point draw. The default path absorbs
+/// an empty slice and is identical to `prove_air_unchecked`; the
+/// GKR-spine path threads a digest of the GKR `SpineProof` through
+/// this hook so any spine tamper forks every later STARK challenge.
+#[doc(hidden)]
+pub fn prove_air_unchecked_with_extra<A: Air>(
+    air: &A,
+    trace: &Trace,
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+) -> StarkProof {
     let log_rows = trace.log_rows;
     let log_len = padded_log_len(log_rows);
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
@@ -905,11 +1678,14 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
             .unzip()
     };
 
-    // --- Parent transcript: PI + column roots ---
+    // --- Parent transcript: PI + column roots + optional extras ---
     let mut channel = Channel::new();
     absorb_public_inputs(&mut channel, pi);
     for c in &commitments {
         channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
     }
 
     // --- Zero-check point `z` and constraint-batching scalars `β_j` ---
@@ -1004,6 +1780,7 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
         shift_partials,
         multipoint_rounds,
         multipoint_batch,
+        multipoint_batch_mixed: None,
     }
 }
 
@@ -1023,6 +1800,18 @@ pub fn verify_air<A: Air>(
     air: &A,
     pi: &PublicInputs,
     proof: &StarkProof,
+) -> Result<(), VerifyError> {
+    verify_air_with_extra(air, pi, proof, &[])
+}
+
+/// Mirror of [`prove_air_unchecked_with_extra`]: the verifier absorbs
+/// `extra_transcript` at the same transcript position. Empty-slice
+/// input matches the default [`verify_air`] path byte-for-byte.
+pub fn verify_air_with_extra<A: Air>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &StarkProof,
+    extra_transcript: &[Block128],
 ) -> Result<(), VerifyError> {
     if proof.log_rows != air.log_rows() {
         return Err(VerifyError::ShapeMismatch);
@@ -1054,6 +1843,9 @@ pub fn verify_air<A: Air>(
     absorb_public_inputs(&mut channel, pi);
     for c in &proof.column_commitments {
         channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
     }
     let z = channel.get_random_points(log_len);
     let n_constraints = air.constraints().len();
@@ -1750,6 +2542,128 @@ mod tests {
             verify_air(&air, &pi, &proof).is_err(),
             "verifier must reject a non-boolean witness for BoolGate"
         );
+    }
+
+    /// γ₃b invariant A. When `extras == &[]`, the new
+    /// `prove_air_unchecked_with_extra_columns` wrapper must produce a
+    /// proof structurally identical to the legacy
+    /// `prove_air_unchecked_with_extra` path — transcript draws,
+    /// commitments, round polynomials, openings, and FRI paths all
+    /// byte-identical. This test is the guardrail for every later
+    /// change to the mixed-length close: if the wrapper ever diverges
+    /// from the default path on empty extras, this test fails first.
+    #[test]
+    fn invariant_a_empty_extras_byte_identical() {
+        let air = TxValidityAir::new();
+        let trace = TxValidityAir::build_trace(&mk_body());
+        let pi = mk_pi();
+        let proof_legacy = prove_air_unchecked_with_extra(&air, &trace, &pi, &[]);
+        let proof_wrapped =
+            prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &[]);
+        assert_eq!(
+            format!("{:?}", proof_legacy),
+            format!("{:?}", proof_wrapped),
+            "empty-extras wrapper must reduce to legacy path byte-for-byte"
+        );
+        // Also pin the verify side: the legacy verifier and the
+        // wrapper verifier must both accept the wrapped-path proof.
+        verify_air(&air, &pi, &proof_wrapped).expect("default verify must accept");
+        verify_air_with_extra_columns(&air, &pi, &proof_wrapped, &[], &[])
+            .expect("wrapper verify must accept on empty extras");
+    }
+
+    /// γ₃b invariant C. Canonicalization is a pure function of its
+    /// input; caller order must never matter.
+    /// γ₃b invariant B. When every extra shares the base's
+    /// `log_len`, the mixed-length close must accept: the mixed
+    /// sumcheck collapses to `n_max = log_len` (no high rounds),
+    /// `s_base_scalar = s_extra_scalar = 1`, and the reconstruction
+    /// formula degenerates to the uniform one. This test commits to
+    /// an external MLE at the same `log_len` as the base trace, runs
+    /// the mixed path honestly, and verifies.
+    #[test]
+    fn invariant_b_single_log_len_mixed_roundtrip() {
+        use noid_fri::hasher::Blake3Hasher;
+        use noid_fri::prover::commit as fri_commit;
+
+        let air = TxValidityAir::new();
+        let trace = TxValidityAir::build_trace(&mk_body());
+        let pi = mk_pi();
+        let log_rows = trace.log_rows;
+        let log_len = padded_log_len(log_rows);
+
+        // Build a deterministic MLE at the base log_len and commit.
+        let extra_evals: Vec<Block128> = (0..1u128 << log_len)
+            .map(|i| Block128::from(i.wrapping_mul(0x9E3779B97F4A7C15)))
+            .collect();
+        let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let (commitment, _tree, _code) = fri_commit(&extra_evals, &ntt, &hasher);
+
+        // Pick an arbitrary eval_point and compute the true value so
+        // the extras claim is honest.
+        let eval_point: Vec<Block128> = (0..log_len)
+            .map(|i| Block128::from(0xC0FFEE01u128 + i as u128))
+            .collect();
+        let value = noid_core::mle::evaluate::evaluate_slice(&extra_evals, &eval_point);
+
+        let extras = vec![ExtraColumn {
+            evals: extra_evals,
+            commitment,
+            eval_point,
+            value,
+        }];
+
+        let proof =
+            prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &extras);
+        assert!(
+            proof.multipoint_batch_mixed.is_some(),
+            "non-empty extras must land in the mixed path"
+        );
+        verify_air_with_extra_columns(&air, &pi, &proof, &[], &extras)
+            .expect("invariant B: uniform-log_len mixed close must verify");
+    }
+
+    #[test]
+    fn invariant_c_extras_canonicalization_is_order_insensitive() {
+        // Build two fake extras with deterministic distinct
+        // commitment roots and eval points, then shuffle.
+        fn mk_extra(seed: u8, log_len: usize) -> ExtraColumn {
+            let evals = vec![Block128::from(seed as u128); 1 << log_len];
+            let mut root = [0u8; 32];
+            for (i, b) in root.iter_mut().enumerate() {
+                *b = seed.wrapping_add(i as u8);
+            }
+            let commitment = FriCommitment {
+                vector_commitment: noid_fri::merkle::VectorCommitment {
+                    root,
+                    depth: log_len + 1,
+                },
+                packing_factor: 1,
+                log_len,
+            };
+            let eval_point: Vec<Block128> =
+                (0..log_len).map(|i| Block128::from((seed as u128) + i as u128)).collect();
+            ExtraColumn {
+                evals,
+                commitment,
+                eval_point,
+                value: Block128::from(seed as u128),
+            }
+        }
+        let e1 = mk_extra(1, 4);
+        let e2 = mk_extra(2, 4);
+        let e3 = mk_extra(3, 5);
+        let a = canonicalize_extras(&[e1.clone(), e2.clone(), e3.clone()]);
+        let b = canonicalize_extras(&[e3.clone(), e1.clone(), e2.clone()]);
+        let c = canonicalize_extras(&[e2.clone(), e3.clone(), e1.clone()]);
+        assert_eq!(format!("{:?}", a), format!("{:?}", b));
+        assert_eq!(format!("{:?}", a), format!("{:?}", c));
+        // And the canonical order is ascending log_len (so e3 last
+        // among these; e1/e2 ordered by root bytes ⇒ e1 then e2).
+        assert_eq!(a[0].commitment.vector_commitment.root[0], 1);
+        assert_eq!(a[1].commitment.vector_commitment.root[0], 2);
+        assert_eq!(a[2].commitment.log_len, 5);
     }
 
     #[test]
@@ -3299,25 +4213,23 @@ mod hauth_stark_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3c-5.8 — TxBodyMerkleAir STARK integration tests (homogeneous 68-stack)
+// Stage 3d-0.2 — PublicColumn verifier-side binding tests.
+//
+// (The Stage 3c-5.8 TxBodyMerkleAir STARK integration block was retired
+// alongside the AIR-spine: GKR owns the 59-perm permutation soundness
+// and the STARK keeps only the two `tx_body_hash` lanes.)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tx_body_merkle_stark_tests {
     use super::*;
-    use noid_air::{
-        build_tx_body_merkle_trace, instance_row_offset, Air, Trace, TxBodyMerkleAir,
-        TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
-    };
     use noid_core::Block128;
-    use noid_poseidon2b::native::permutation::STATE_SIZE;
-    use noid_poseidon2b::primitives::TxBodyHash;
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
             prev_state_root: [0x11; 32],
             new_state_root: [0x22; 32],
-            tx_body_hash: TxBodyHash([0x44; 32]),
+            tx_body_hash: noid_poseidon2b::primitives::TxBodyHash([0x44; 32]),
             fee: 7,
             n_live_inputs: 0,
             n_live_outputs: 0,
@@ -3328,131 +4240,6 @@ mod tx_body_merkle_stark_tests {
         }
     }
 
-    fn mk_input(seed: u128) -> [Block128; STATE_SIZE] {
-        let s = seed.wrapping_mul(0x9E3779B97F4A7C15);
-        [
-            Block128::from(s ^ 0xA5A5_A5A5_A5A5_A5A5),
-            Block128::from(s.wrapping_add(1) ^ 0x5A5A_5A5A_5A5A_5A5A),
-            Block128::from(s.wrapping_add(2) ^ 0xFFFF_0000_FFFF_0000),
-            Block128::from(s.wrapping_add(3) ^ 0x0F0F_F0F0_0F0F_F0F0),
-        ]
-    }
-
-    fn mk_batch() -> [[Block128; STATE_SIZE]; TXBODY_MERKLE_N_PERMS] {
-        let mut out = [[Block128::ZERO; STATE_SIZE]; TXBODY_MERKLE_N_PERMS];
-        for k in 0..TXBODY_MERKLE_N_PERMS {
-            out[k] = mk_input(k as u128 + 1);
-        }
-        out
-    }
-
-    #[test]
-    fn tx_body_merkle_honest_prove_verify() {
-        let air = TxBodyMerkleAir::new();
-        let trace = air.build_trace(&mk_batch());
-        assert!(air.check(&trace));
-        let pi = mk_pi();
-        let proof = prove_air(&air, &trace, &pi).expect("prove");
-        verify_air(&air, &pi, &proof).expect("verify");
-    }
-
-    #[test]
-    fn tx_body_merkle_tamper_first_instance_rejected() {
-        let air = TxBodyMerkleAir::new();
-        let mut cols = build_tx_body_merkle_trace(&mk_batch());
-        let row = instance_row_offset(0) + 2;
-        cols[TXBODY_MERKLE_LAYOUT.sout + 1][row] =
-            cols[TXBODY_MERKLE_LAYOUT.sout + 1][row] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_body_merkle_tamper_last_instance_rejected() {
-        let air = TxBodyMerkleAir::new();
-        let mut cols = build_tx_body_merkle_trace(&mk_batch());
-        let row = instance_row_offset(TXBODY_MERKLE_N_PERMS - 1) + 3;
-        cols[TXBODY_MERKLE_LAYOUT.s + 2][row] =
-            cols[TXBODY_MERKLE_LAYOUT.s + 2][row] + Block128::ONE;
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    // =====================================================================
-    // §3d-0.9.F — STARK round-trip forgery tests for §3d-0.9.E.4.c
-    // leaf rate-lane absorb. The honest round-trip
-    // (`tx_body_merkle_honest_prove_verify`) already covers the +32 new
-    // gates and the payload witness block; these tamper tests exercise
-    // the verifier path via `prove_air_unchecked` so a bug in the absorb
-    // gate or the payload-column wiring cannot slip past STARK verify.
-    // =====================================================================
-
-    #[test]
-    fn tx_body_merkle_stark_rejects_leaf_rate_pre_s_tamper() {
-        // Flip pre_s[0] on every leaf non-head row-0. The 3-term absorb
-        // gate `pre_s + echo_prev_out + payload == 0` must make the
-        // STARK verifier reject every such forgery.
-        use noid_air::{
-            build_instance_layout, build_tx_body_merkle_trace, leaf_rate_absorb_instance_ids,
-            TxBodyMerkleAir, TXBODY_MERKLE_PRE_S_BASE,
-        };
-        let air = TxBodyMerkleAir::new();
-        let pi = mk_pi();
-        let layout = build_instance_layout();
-        let ids = leaf_rate_absorb_instance_ids(&layout);
-        assert_eq!(ids.len(), 16);
-        // Sample a representative: first input-leaf PermB, first output-
-        // leaf PermB, and the last id. Covering all 16 in a STARK round
-        // trip would blow test runtime; the native tamper matrix in
-        // noid_air already covers the full 16 × 2 fan-out.
-        let sample: [usize; 3] = [ids[0], ids[4], *ids.last().unwrap()];
-        for &id in &sample {
-            let mut cols = build_tx_body_merkle_trace(&mk_batch());
-            let row = instance_row_offset(id);
-            cols[TXBODY_MERKLE_PRE_S_BASE][row] =
-                cols[TXBODY_MERKLE_PRE_S_BASE][row] + Block128::ONE;
-            let trace = Trace::new(cols);
-            let proof = prove_air_unchecked(&air, &trace, &pi);
-            assert!(
-                verify_air(&air, &pi, &proof).is_err(),
-                "E.4.c pre_s tamper on leaf non-head instance {id} must be rejected by STARK",
-            );
-        }
-    }
-
-    #[test]
-    fn tx_body_merkle_stark_rejects_leaf_rate_payload_tamper() {
-        // Flipping a payload witness column on a leaf non-head row-0 is
-        // symmetric (same gate, other term). Covers the cross-check that
-        // payload columns are committed and bound by the E.4.c gate.
-        use noid_air::{
-            build_instance_layout, build_tx_body_merkle_trace, leaf_rate_absorb_instance_ids,
-            leaf_rate_payload_col, TxBodyMerkleAir,
-        };
-        let air = TxBodyMerkleAir::new();
-        let pi = mk_pi();
-        let layout = build_instance_layout();
-        let ids = leaf_rate_absorb_instance_ids(&layout);
-        // Sample slot 0, slot 7 (middle of output leaves), slot 15 (last).
-        for slot in [0usize, 7, 15] {
-            for lane in 0..2 {
-                let mut cols = build_tx_body_merkle_trace(&mk_batch());
-                let row = instance_row_offset(ids[slot]);
-                let col = leaf_rate_payload_col(slot, lane);
-                cols[col][row] = cols[col][row] + Block128::ONE;
-                let trace = Trace::new(cols);
-                let proof = prove_air_unchecked(&air, &trace, &pi);
-                assert!(
-                    verify_air(&air, &pi, &proof).is_err(),
-                    "E.4.c payload tamper slot {slot} lane {lane} must be rejected by STARK",
-                );
-            }
-        }
-    }
 
     // =====================================================================
     // Stage 3d-0.2 — PublicColumn verifier-side binding
@@ -3693,35 +4480,6 @@ mod tx_body_merkle_stark_tests {
         let air = HAuthAir::new(tx_body, expected);
         let mut cols = build_hauth_trace(secret, tx_body);
         cols[HAUTH_LAYOUT_C.rc + 0][N_ROUNDS + 5] = Block128::from(0xDEAD_BEEFu128);
-        let trace = Trace::new(cols);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_body_merkle_stark_inter_instance_rc_tamper_rejected() {
-        // Case B for TxBodyMerkleAir: tamper `rc` on an inter-instance
-        // padding row where every interior selector is zero. Caught
-        // only by the row-major public-column declaration.
-        use noid_air::{
-            build_tx_body_merkle_trace, instance_row_offset, TxBodyMerkleAir, TXBODY_MERKLE_LAYOUT,
-            TXBODY_MERKLE_N_PERMS,
-        };
-        use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
-        let air = TxBodyMerkleAir::new();
-        let mut batch = [[Block128::ZERO; STATE_SIZE]; TXBODY_MERKLE_N_PERMS];
-        for k in 0..TXBODY_MERKLE_N_PERMS {
-            batch[k] = [
-                Block128::from((k as u128 + 1) * 0x11),
-                Block128::from((k as u128 + 1) * 0x22),
-                Block128::from((k as u128 + 1) * 0x33),
-                Block128::from((k as u128 + 1) * 0x44),
-            ];
-        }
-        let mut cols = build_tx_body_merkle_trace(&batch);
-        let pad_row = instance_row_offset(5) + N_ROUNDS + 10;
-        cols[TXBODY_MERKLE_LAYOUT.rc + 1][pad_row] = Block128::from(0xCAFE_BABE_u128);
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);

@@ -17,9 +17,9 @@
 //!
 //! - `[0, TX_VALIDITY_3B4_PINNED_N_COLS)` → TxValidity block
 //!   (width 78, constraints reference these indices unchanged).
-//! - `[TX_BODY_MERKLE_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET + *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS)`
-//!   → TxBodyMerkle block, native constraint indices shifted by
-//!   `TX_BODY_MERKLE_COL_OFFSET`.
+//! - `[TX_BODY_MERKLE_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET + MERKLE_BAND_WIDTH)`
+//!   → TxBodyMerkle band (two `tx_body_hash` lanes only; GKR owns the
+//!   59-perm soundness).
 //! - tail column → `TxvLiveMask` `PublicColumn`.
 //!
 //! # Soundness
@@ -47,11 +47,7 @@
 //! by the programme itself).
 
 use crate::airs::tx_body_merkle::{
-    build_tx_body_merkle_trace_with_boundary_pins,
-    emit_tx_body_merkle_constraints_with_boundary_pins,
-    emit_tx_body_merkle_public_columns_with_boundary_pins,
-    tx_body_merkle_column_domains_with_boundary_pins, TxBodyMerkleBoundaryPins,
-    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
+    TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_PERMS,
 };
 use crate::airs::tx_validity::{TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_PINNED_N_COLS};
 use crate::gates::PublicColumn;
@@ -244,9 +240,25 @@ pub fn txv_live_mask_programme() -> Vec<Block128> {
     out
 }
 
+/// Width of the merkle sub-AIR band inside the spine composite:
+/// exactly the two `tx_body_hash` lanes on `TXBODY_MERKLE_LAYOUT.s` /
+/// `.s + 1`. The 59-perm trace is retired — GKR owns the permutation
+/// soundness and produces `tx_body_hash` as its wrap output. The STARK
+/// retains only the two PC lanes, which by construction resolve
+/// bit-for-bit to the same `(merkle_offset + lane, row)` cells that
+/// `wrap_output_outer_cell` expects.
+pub fn merkle_band_width() -> usize {
+    MERKLE_BAND_WIDTH
+}
+
+/// Retained merkle-band lane count. Exactly the two `tx_body_hash`
+/// lanes on `TXBODY_MERKLE_LAYOUT.s` / `.s + 1`; every other
+/// merkle-interior cell is physically removed from the trace.
+pub const MERKLE_BAND_WIDTH: usize = 2;
+
 /// Column index of `TxvLiveMask` inside the composite trace.
 pub fn txv_live_mask_col() -> usize {
-    TX_BODY_MERKLE_COL_OFFSET + *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS
+    TX_BODY_MERKLE_COL_OFFSET + merkle_band_width()
 }
 
 /// Total composite column count.
@@ -276,7 +288,7 @@ impl TxBodySpineComposite {
         assert_eq!(txv_air.log_rows(), SPINE_LOG_ROWS);
         let (txv_constraints, txv_publics) = txv_air.into_parts();
 
-        let merkle_n_cols = *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS;
+        let merkle_n_cols = merkle_band_width();
 
         // Composite isolation invariant: the TxValidity block
         // [0, TX_VALIDITY_3B4_PINNED_N_COLS) and the TxBodyMerkle block
@@ -323,27 +335,22 @@ impl TxBodySpineComposite {
             public_columns.push(PublicColumn::new(pc.col + TXV_COL_OFFSET, pc.values));
         }
 
-        // TxBodyMerkle block — shifted by TX_BODY_MERKLE_COL_OFFSET.
-        // Inner range bound: *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS.
-        let merkle_constraints = emit_tx_body_merkle_constraints_with_boundary_pins(&pins);
-        let merkle_publics = emit_tx_body_merkle_public_columns_with_boundary_pins(&pins);
-        for c in merkle_constraints {
-            constraints.push(Box::new(ShiftedColumnsConstraint::new(
-                c,
-                TX_BODY_MERKLE_COL_OFFSET,
-                merkle_n_cols,
-            )));
-        }
-        for pc in merkle_publics {
-            assert!(
-                pc.col < merkle_n_cols,
-                "TxBodyMerkle public column {} escapes inner range",
-                pc.col
-            );
-            public_columns.push(PublicColumn::new(
-                pc.col + TX_BODY_MERKLE_COL_OFFSET,
-                pc.values,
-            ));
+        // TxBodyMerkle band — the 59-perm trace is retired. GKR owns
+        // the full 59-perm soundness and produces `tx_body_hash` as its
+        // wrap output. The STARK keeps the binding as two row-wide
+        // `PublicColumn`s at `TXBODY_MERKLE_LAYOUT.s` / `.s + 1` so
+        // every consumer that reads `wrap_output_outer_cell(lane)` sees
+        // the verifier-known scalar on every row.
+        {
+            let _ = merkle_n_cols;
+            let total_rows = 1usize << SPINE_LOG_ROWS;
+            for lane in 0..2usize {
+                let col = TX_BODY_MERKLE_COL_OFFSET + TXBODY_MERKLE_LAYOUT.s + lane;
+                public_columns.push(PublicColumn::new(
+                    col,
+                    vec![pins.tx_body_hash[lane]; total_rows],
+                ));
+            }
         }
 
         // Stage 2(b) — cross-AIR tx-body payload tie. The four TxValidity
@@ -439,11 +446,27 @@ impl TxBodySpineComposite {
         );
         assert_eq!(txv_trace.columns.len(), TX_VALIDITY_3B4_PINNED_N_COLS);
 
-        let merkle_cols =
-            build_tx_body_merkle_trace_with_boundary_pins(merkle_inputs, &self.boundary_pins);
-        let merkle_domains = tx_body_merkle_column_domains_with_boundary_pins();
-        assert_eq!(merkle_cols.len(), *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
-        assert_eq!(merkle_domains.len(), *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS);
+        // G4: GKR owns the 59-perm permutation soundness. The STARK
+        // keeps only the two retained `tx_body_hash` lanes on
+        // `TXBODY_MERKLE_LAYOUT.s` / `.s + 1` (== merkle-band columns
+        // 0 / 1 by `PermLayout::at(0)` / `POSEIDON_COL_S = 0`),
+        // zero-filled except for the row-wide pins.
+        let _ = merkle_inputs;
+        let merkle_cols: Vec<Vec<Block128>> = {
+            let total_rows = 1usize << SPINE_LOG_ROWS;
+            let mut cols: Vec<Vec<Block128>> = (0..merkle_band_width())
+                .map(|_| vec![Block128::ZERO; total_rows])
+                .collect();
+            for lane in 0..2usize {
+                cols[TXBODY_MERKLE_LAYOUT.s + lane] =
+                    vec![self.boundary_pins.tx_body_hash[lane]; total_rows];
+            }
+            cols
+        };
+        let merkle_domains: Vec<ColumnDomain> =
+            vec![ColumnDomain::Block128; merkle_band_width()];
+        assert_eq!(merkle_cols.len(), merkle_band_width());
+        assert_eq!(merkle_domains.len(), merkle_band_width());
 
         let total_rows = 1usize << SPINE_LOG_ROWS;
         let mut cols = txv_trace.columns;
@@ -485,8 +508,10 @@ impl Air for TxBodySpineComposite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::airs::tx_body_merkle::{
-        build_instance_layout, InstanceRole, N_ROUNDS, TXBODY_MERKLE_LAYOUT,
+    use noid_poseidon2b::primitives::{
+        hash_input_leaf as native_hash_input_leaf,
+        hash_output_leaf as native_hash_output_leaf, hash_tx_body as native_hash_tx_body,
+        TXBODY_INPUTS as P_TXBODY_INPUTS, TXBODY_OUTPUTS as P_TXBODY_OUTPUTS,
     };
 
     fn empty_tx_body() -> TxBody {
@@ -500,33 +525,65 @@ mod tests {
         }
     }
 
+    fn owner_from_fields(hi: Block128, lo: Block128) -> noid_poseidon2b::primitives::Address {
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&hi.to_u128().to_le_bytes());
+        bytes[16..].copy_from_slice(&lo.to_u128().to_le_bytes());
+        noid_poseidon2b::primitives::Address(bytes)
+    }
+
+    /// Native oracle for the tx-body wrap digest. Mirrors the GKR spine
+    /// (production path) by calling
+    /// `noid_poseidon2b::primitives::hash_tx_body` on the absorb lanes
+    /// carried in `pins`. Byte-identical with the GKR reconstruction.
+    fn native_wrap_digest(pins: &TxBodyMerkleBoundaryPins) -> [Block128; 2] {
+        let mut prev_state_root = [0u8; 32];
+        prev_state_root[..16].copy_from_slice(&pins.prev_state_root[0].to_u128().to_le_bytes());
+        prev_state_root[16..].copy_from_slice(&pins.prev_state_root[1].to_u128().to_le_bytes());
+
+        let fee_u128 = pins.fee_leaf[0].to_u128();
+        let is_coinbase = pins.is_coinbase_leaf[0].to_u128() != 0;
+
+        let mut input_leaves = [[0u8; 32]; P_TXBODY_INPUTS];
+        for i in 0..P_TXBODY_INPUTS {
+            let [slot, value, owner_hi, owner_lo] = pins.input_leaf_absorb[i];
+            let owner = owner_from_fields(owner_hi, owner_lo);
+            input_leaves[i] =
+                native_hash_input_leaf(slot.to_u128() as u32, value.to_u128() as u64, &owner);
+        }
+        let mut output_leaves = [[0u8; 32]; P_TXBODY_OUTPUTS];
+        for j in 0..P_TXBODY_OUTPUTS {
+            let [slot, value, owner_hi, owner_lo] = pins.output_leaf_absorb[j];
+            let owner = owner_from_fields(owner_hi, owner_lo);
+            output_leaves[j] =
+                native_hash_output_leaf(slot.to_u128() as u32, value.to_u128() as u64, &owner);
+        }
+
+        let digest = native_hash_tx_body(
+            &prev_state_root,
+            fee_u128,
+            &input_leaves,
+            &output_leaves,
+            is_coinbase,
+        );
+        let lo = u128::from_le_bytes(digest.0[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(digest.0[16..].try_into().unwrap());
+        [Block128::from(lo), Block128::from(hi)]
+    }
+
     /// Derive an internally-consistent `(pins, merkle_inputs)` pair by
-    /// running the honest permutation chain with zero seeds (so
-    /// `prev_state_root = fee_leaf = ZERO`) and reading back the wrap
-    /// output as the `tx_body_hash`.
+    /// asking the native Poseidon2b oracle for the wrap digest. The
+    /// `merkle_inputs` array is legacy residue left for callers that
+    /// still thread it into `build_trace`; it is no longer consumed on
+    /// the AIR side once the 59-perm chain was handed to GKR.
     fn build_honest_pins_and_inputs() -> (
         TxBodyMerkleBoundaryPins,
         Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]>,
     ) {
         let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
             Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-
-        let placeholder = TxBodyMerkleBoundaryPins::default();
-        let merkle_cols = build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
-
-        let layout = build_instance_layout();
-        let wrap_meta = layout
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .expect("wrap instance present");
-        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
-        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
-        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
-
-        let pins = TxBodyMerkleBoundaryPins {
-            tx_body_hash: [s0, s1],
-            ..TxBodyMerkleBoundaryPins::default()
-        };
+        let mut pins = TxBodyMerkleBoundaryPins::default();
+        pins.tx_body_hash = native_wrap_digest(&pins);
         (pins, inputs)
     }
 
@@ -540,7 +597,7 @@ mod tests {
         let n = spine_n_cols();
         assert_eq!(
             n,
-            TX_VALIDITY_3B4_PINNED_N_COLS + *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS + 1
+            TX_VALIDITY_3B4_PINNED_N_COLS + merkle_band_width() + 1
         );
     }
 
@@ -576,14 +633,11 @@ mod tests {
         let body = empty_tx_body();
         let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &merkle_inputs);
 
-        let layout = build_instance_layout();
-        let wrap = layout
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .unwrap();
+        // Every row of the retained wrap-output lane is pinned to
+        // `pins.tx_body_hash[0]` by a PublicColumn, so any row-level
+        // tamper in that column must reject.
         let col = TX_BODY_MERKLE_COL_OFFSET + TXBODY_MERKLE_LAYOUT.s;
-        let row = wrap.slot_base_row + N_ROUNDS;
-        trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;
+        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
         assert!(
             !spine.check(&trace),
             "wrap-output tamper must reject at composite layer (Stage 1a regression)"
@@ -732,33 +786,17 @@ mod tests {
             out_owner_lo,
         ];
 
-        // Derive a self-consistent wrap output for the tx_body_hash pin
-        // by running the trace builder once with a placeholder hash.
+        // Derive the wrap digest via the native Poseidon2b oracle — the
+        // same kernel the GKR spine evaluates in circuit.
         let merkle_inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
             Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-        let placeholder = TxBodyMerkleBoundaryPins {
+        let mut pins = TxBodyMerkleBoundaryPins {
             tx_body_hash: [Block128::ZERO; 2],
             input_leaf_absorb,
             output_leaf_absorb,
             ..TxBodyMerkleBoundaryPins::default()
         };
-        let merkle_cols =
-            build_tx_body_merkle_trace_with_boundary_pins(&merkle_inputs, &placeholder);
-        let wrap_meta = build_instance_layout()
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .cloned()
-            .expect("wrap instance present");
-        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
-        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
-        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
-
-        let pins = TxBodyMerkleBoundaryPins {
-            tx_body_hash: [s0, s1],
-            input_leaf_absorb,
-            output_leaf_absorb,
-            ..TxBodyMerkleBoundaryPins::default()
-        };
+        pins.tx_body_hash = native_wrap_digest(&pins);
 
         let body = TxBody {
             prev_state_root: [0u8; 32],
@@ -836,7 +874,7 @@ mod tests {
     fn stage_5_7_invariant_tx_body_hash_single_origin() {
         let (pins, _inputs) = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
-        let merkle_n_cols = *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS;
+        let merkle_n_cols = merkle_band_width();
         let merkle_lo = TX_BODY_MERKLE_COL_OFFSET;
         let merkle_hi = TX_BODY_MERKLE_COL_OFFSET + merkle_n_cols;
 

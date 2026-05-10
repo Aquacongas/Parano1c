@@ -460,30 +460,48 @@ impl TxValidityCompositeWithSpine {
 
         // E.5.f₃ — SKEL_IS_COINBASE_COL ↔ tx-body L14 bridge.
         //
-        // The native `hash_tx_body` encodes `is_coinbase` into leaf 14 as
-        // `[is_coinbase as u128, 0]`, and the Merkle AIR pins that word
-        // onto `pre_s[0]` at instance-42 row-0 via O3.b
-        // (`pins.is_coinbase_leaf[0]`). Independently, the leaf band
-        // exposes the scalar `is_coinbase` on every row of
-        // `SKEL_IS_COINBASE_COL` (Stage E.5.d).
-        //
-        // This gate ties the two sources so a prover cannot publish
-        // inconsistent `is_coinbase` values to the spine-side mux and to
-        // the tx-body-hash L14 leaf: at the single hot row where the
-        // Merkle pin indicator `pin_base + 1` is ONE, force
+        // Under the AIR-spine path: the native `hash_tx_body` encodes
+        // `is_coinbase` into leaf 14 as `[is_coinbase as u128, 0]`, and
+        // `TxBodyMerkleAir` pins that word onto `pre_s[0]` at
+        // instance-42 row-0 via O3.b (`pins.is_coinbase_leaf[0]`).
+        // Independently, the leaf band exposes the scalar `is_coinbase`
+        // on every row of `SKEL_IS_COINBASE_COL` (Stage E.5.d). The
+        // inner gate below ties the two sources so a prover cannot
+        // publish inconsistent `is_coinbase` values to the spine-side
+        // mux and to the tx-body-hash L14 leaf: at the single hot row
+        // where the Merkle pin indicator `pin_base + 1` is ONE, force
         //     pre_s[0] + SKEL_IS_COINBASE_COL == 0
         // (addition is XOR over GF(2^128); for {0, 1} scalars this is
         // equality). Everywhere else the gate is silenced by the
         // single-hot indicator.
         //
-        // Requires `options.is_coinbase` to agree with the supplied
-        // `boundary_pins.is_coinbase_leaf` and with `body.is_coinbase`;
-        // any disagreement is caught at construction time below.
+        // # G4.a — merkle-interior cell retired
+        //
+        // The historical inner gate read `pre_s[0]` at instance-42
+        // row-0. That cell no longer exists — GKR owns the 59-perm
+        // block — so the inner gate is retired.
+        //
+        // Soundness is preserved without replacement:
+        //
+        //   1. The GKR spine absorbs `SpineInputs.is_coinbase_leaf` into
+        //      its wrap computation, producing `tx_body_hash`.
+        //   2. The wrap output is pinned at
+        //      `boundary_pins.tx_body_hash` — the same cell the STARK
+        //      sees via `TxBodyMerkleBoundaryAir`'s row-wide
+        //      `PublicColumn`.
+        //   3. The construction-time asserts below force
+        //      `boundary_pins.is_coinbase_leaf == [is_coinbase as u128, 0]`
+        //      and `body.is_coinbase == options.is_coinbase`, so the
+        //      public-input surface is consistent.
+        //   4. If the prover supplies a `SpineInputs` whose
+        //      `is_coinbase_leaf` disagrees with `SKEL_IS_COINBASE_COL`,
+        //      the GKR-produced `tx_body_hash` disagrees with the leaf-
+        //      pinned one, and the shared `tx_body_hash` pin fails.
+        //
+        // Net: the merkle-interior tie is redundant once GKR owns the
+        // L14 absorb. The asserts stay — they're cheap, catch config
+        // drift at construction time, and are not part of the proof.
         {
-            use crate::airs::tx_body_merkle::air::TXBODY_MERKLE_BOUNDARY_PIN_BASE;
-            use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
-            use crate::gates::linear::WeightedLinearGate;
-
             assert_eq!(
                 body.is_coinbase, options.is_coinbase,
                 "Stage E.5.f₃: body.is_coinbase must agree with options.is_coinbase",
@@ -498,18 +516,10 @@ impl TxValidityCompositeWithSpine {
                 "Stage E.5.f₃: boundary_pins.is_coinbase_leaf[1] must be zero (native L14 shape)",
             );
 
-            let merkle_offset = spine_layout.merkle_block_outer_offset();
-            let pre_s_0_col = merkle_offset + TXBODY_MERKLE_PRE_S_BASE;
-            let pin_ind_col = merkle_offset + *TXBODY_MERKLE_BOUNDARY_PIN_BASE + 1;
-
-            let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
-                vec![
-                    (pre_s_0_col, Block128::ONE),
-                    (SKEL_IS_COINBASE_COL, Block128::ONE),
-                ],
-                Block128::ZERO,
-            ));
-            constraints.push(Box::new(SelectorGate::new(pin_ind_col, inner)));
+            // E.5.f₃ merkle-interior gate (pre_s[0] + SKEL_IS_COINBASE_COL
+            // at instance-42) is retired — GKR owns the 59-perm
+            // soundness and the merkle band no longer carries the
+            // pre_s / pin-ind cells.
         }
 
         // E.5.f₄ — coinbase-credit bit programme + equality gates.
@@ -943,11 +953,60 @@ pub mod fixture {
         COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
-    use crate::airs::tx_body_merkle::{
-        build_instance_layout, build_tx_body_merkle_trace_with_boundary_pins, InstanceRole,
-        N_ROUNDS, TXBODY_MERKLE_LAYOUT,
-    };
     use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
+    use noid_poseidon2b::primitives::{
+        hash_input_leaf as native_hash_input_leaf,
+        hash_output_leaf as native_hash_output_leaf, hash_tx_body as native_hash_tx_body,
+        TXBODY_INPUTS as P_TXBODY_INPUTS, TXBODY_OUTPUTS as P_TXBODY_OUTPUTS,
+    };
+
+    fn owner_from_fields(hi: Block128, lo: Block128) -> noid_poseidon2b::primitives::Address {
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&hi.to_u128().to_le_bytes());
+        bytes[16..].copy_from_slice(&lo.to_u128().to_le_bytes());
+        noid_poseidon2b::primitives::Address(bytes)
+    }
+
+    /// Native oracle for the tx-body wrap digest. Mirrors the GKR spine
+    /// (which replaced the 59-perm AIR) by calling
+    /// `noid_poseidon2b::primitives::hash_tx_body` on the absorb lanes
+    /// carried in `pins`. `differential_vs_native` and
+    /// `tx_body_hash_air_matches_native` keep this byte-for-byte locked
+    /// with both the GKR reconstruction and the in-circuit wrap output.
+    fn native_wrap_digest(pins: &TxBodyMerkleBoundaryPins) -> [Block128; 2] {
+        let mut prev_state_root = [0u8; 32];
+        prev_state_root[..16].copy_from_slice(&pins.prev_state_root[0].to_u128().to_le_bytes());
+        prev_state_root[16..].copy_from_slice(&pins.prev_state_root[1].to_u128().to_le_bytes());
+
+        let fee_u128 = pins.fee_leaf[0].to_u128();
+        let is_coinbase = pins.is_coinbase_leaf[0].to_u128() != 0;
+
+        let mut input_leaves = [[0u8; 32]; P_TXBODY_INPUTS];
+        for i in 0..P_TXBODY_INPUTS {
+            let [slot, value, owner_hi, owner_lo] = pins.input_leaf_absorb[i];
+            let owner = owner_from_fields(owner_hi, owner_lo);
+            input_leaves[i] =
+                native_hash_input_leaf(slot.to_u128() as u32, value.to_u128() as u64, &owner);
+        }
+        let mut output_leaves = [[0u8; 32]; P_TXBODY_OUTPUTS];
+        for j in 0..P_TXBODY_OUTPUTS {
+            let [slot, value, owner_hi, owner_lo] = pins.output_leaf_absorb[j];
+            let owner = owner_from_fields(owner_hi, owner_lo);
+            output_leaves[j] =
+                native_hash_output_leaf(slot.to_u128() as u32, value.to_u128() as u64, &owner);
+        }
+
+        let digest = native_hash_tx_body(
+            &prev_state_root,
+            fee_u128,
+            &input_leaves,
+            &output_leaves,
+            is_coinbase,
+        );
+        let lo = u128::from_le_bytes(digest.0[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(digest.0[16..].try_into().unwrap());
+        [Block128::from(lo), Block128::from(hi)]
+    }
 
     pub fn empty_tx_body() -> TxBody {
         TxBody {
@@ -977,27 +1036,11 @@ pub mod fixture {
     ) {
         let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
             Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-        let placeholder = TxBodyMerkleBoundaryPins {
+        let mut pins = TxBodyMerkleBoundaryPins {
             is_coinbase_leaf: [Block128::ONE, Block128::ZERO],
             ..TxBodyMerkleBoundaryPins::default()
         };
-        let merkle_cols =
-            build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
-
-        let layout = build_instance_layout();
-        let wrap_meta = layout
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .expect("wrap instance present");
-        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
-        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
-        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
-
-        let pins = TxBodyMerkleBoundaryPins {
-            tx_body_hash: [s0, s1],
-            is_coinbase_leaf: [Block128::ONE, Block128::ZERO],
-            ..TxBodyMerkleBoundaryPins::default()
-        };
+        pins.tx_body_hash = native_wrap_digest(&pins);
         (pins, inputs)
     }
 
@@ -1007,23 +1050,8 @@ pub mod fixture {
     ) {
         let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
             Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-        let placeholder = TxBodyMerkleBoundaryPins::default();
-        let merkle_cols =
-            build_tx_body_merkle_trace_with_boundary_pins(&inputs, &placeholder);
-
-        let layout = build_instance_layout();
-        let wrap_meta = layout
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .expect("wrap instance present");
-        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
-        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
-        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
-
-        let pins = TxBodyMerkleBoundaryPins {
-            tx_body_hash: [s0, s1],
-            ..TxBodyMerkleBoundaryPins::default()
-        };
+        let mut pins = TxBodyMerkleBoundaryPins::default();
+        pins.tx_body_hash = native_wrap_digest(&pins);
         (pins, inputs)
     }
 
@@ -1241,21 +1269,9 @@ pub mod fixture {
     ) {
         let merkle_inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
             Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
-        let mut placeholder = TxBodyMerkleBoundaryPins::default();
-        fill_absorb_pins_from_body(&mut placeholder, body);
-        placeholder.tx_body_hash = [Block128::ZERO; 2];
-        let merkle_cols =
-            build_tx_body_merkle_trace_with_boundary_pins(&merkle_inputs, &placeholder);
-        let layout = build_instance_layout();
-        let wrap_meta = layout
-            .iter()
-            .find(|m| matches!(m.role, InstanceRole::WrapPerm))
-            .expect("wrap instance present");
-        let wrap_out_row = wrap_meta.slot_base_row + N_ROUNDS;
-        let s0 = merkle_cols[TXBODY_MERKLE_LAYOUT.s][wrap_out_row];
-        let s1 = merkle_cols[TXBODY_MERKLE_LAYOUT.s + 1][wrap_out_row];
-        let mut pins = placeholder;
-        pins.tx_body_hash = [s0, s1];
+        let mut pins = TxBodyMerkleBoundaryPins::default();
+        fill_absorb_pins_from_body(&mut pins, body);
+        pins.tx_body_hash = native_wrap_digest(&pins);
         (pins, merkle_inputs)
     }
 
@@ -1786,49 +1802,12 @@ mod tests {
     /// row `output_leaf_perm_a_row(j)` carries `pins.output_leaf_absorb[j][lane]`.
     /// On that same row a `SelectorGate` (gated by `leaf_perm_a_row_0`)
     /// enforces `pre_s[lane] == o1_prog[lane]`. Together the programme-pin
-    /// plus the selector-gate tie `pre_s[lane]` on output-leaf head rows to
-    /// the caller-supplied boundary pins.
-    ///
-    /// Tampering either end of the chain in an honest realistic trace must
-    /// reject: (a) the PublicColumn cell itself (pin fails) and (b) the
-    /// `pre_s` cell it pins (constraint fails).
-    #[test]
-    fn tamper_output_leaf_absorb_pin_rejects() {
-        use crate::airs::tx_body_merkle::air::{
-            TXBODY_MERKLE_O1_BASE, TXBODY_MERKLE_O1_PROG_BASE_OFFSET,
-        };
-        use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
-
-        let comp = build_honest_realistic();
-        let honest = comp.build_trace();
-        let layout = comp.spine_layout();
-        let merkle_offset = layout.merkle_block_outer_offset();
-
-        for lane in 0..2 {
-            let head_row = layout.output_leaf_a_outer_cell(0, lane).row;
-
-            // (a) PublicColumn pin carrying pins.output_leaf_absorb[0][lane].
-            let pc_col = merkle_offset + *TXBODY_MERKLE_O1_BASE
-                + TXBODY_MERKLE_O1_PROG_BASE_OFFSET
-                + lane;
-            let mut cols = honest.columns.clone();
-            cols[pc_col][head_row] = cols[pc_col][head_row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&Trace::new(cols)),
-                "Stage B.4(a): tampering o1_payload_programme[lane={lane}] at output-leaf head row must REJECT",
-            );
-
-            // (b) pre_s[lane] head cell tied to the programme by the
-            // leaf_perm_a_row_0 SelectorGate.
-            let pre_s_col = merkle_offset + TXBODY_MERKLE_PRE_S_BASE + lane;
-            let mut cols = honest.columns.clone();
-            cols[pre_s_col][head_row] = cols[pre_s_col][head_row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&Trace::new(cols)),
-                "Stage B.4(b): tampering pre_s[{lane}] on output-leaf head row must REJECT",
-            );
-        }
-    }
+    // `tamper_output_leaf_absorb_pin_rejects` was a regression for the
+    // AIR-spine merkle-interior cells (O1 head-pin + pre_s[lane]).
+    // Those cells no longer exist in the trace: GKR owns the
+    // permutation soundness and the equivalent pin is `tx_body_hash`
+    // at the wrap output. The cross-row leaf tamper coverage lives in
+    // `noid_air/tests/output_binding_end_to_end.rs`.
 
     // -----------------------------------------------------------------
     // E.2.b.comp-4 exit tests — slot-index bridge.
@@ -1998,25 +1977,13 @@ mod tests {
     }
 
     /// E.5.f₃ — tampering `pre_s[0]` at instance-42 row-0 (L14 seed)
-    /// must reject on a coinbase trace; the bridge gate ties it to
-    /// `SKEL_IS_COINBASE_COL = 1`, so flipping the pin side desynchs
-    /// the equality.
-    #[test]
-    fn e5f3_coinbase_l14_pre_s_tamper_rejects() {
-        use crate::airs::tx_body_merkle::TXBODY_MERKLE_PRE_S_BASE;
-        let comp = build_honest_coinbase();
-        let trace = comp.build_trace();
-        let layout = comp.spine_layout();
-        let merkle_offset = layout.merkle_block_outer_offset();
-        let pre_s_0 = merkle_offset + TXBODY_MERKLE_PRE_S_BASE;
-        // Instance 42 row-0 lives at `merkle_wrap_row_for_instance(42)`;
-        // read the honest value and flip it.
-        let layout_inst = crate::airs::tx_body_merkle::build_instance_layout();
-        let row = layout_inst[42].slot_base_row;
-        let mut cols = trace.columns.clone();
-        cols[pre_s_0][row] = cols[pre_s_0][row] + Block128::ONE;
-        assert!(!comp.air().check(&Trace::new(cols)));
-    }
+    /// must reject on a coinbase trace.
+    ///
+    // `e5f3_coinbase_l14_pre_s_tamper_rejects` was a regression for
+    // the AIR-spine O3.b pin on `pre_s[0..1]@instance-42`. GKR owns
+    // the 59-perm permutation now — `is_coinbase_leaf` flows through
+    // the spine into `tx_body_hash`, and the row-wide pin on
+    // `TXBODY_MERKLE_LAYOUT.s` lanes catches any disagreement.
 
     /// E.5.f₃ — tampering the leaf-side `SKEL_IS_COINBASE_COL` scalar
     /// on any single row must reject on an honest coinbase trace.

@@ -14,6 +14,7 @@ pub mod haddr;
 pub mod hauth;
 pub mod linear_combination;
 pub mod tx_body_merkle;
+pub mod tx_body_merkle_boundary;
 pub mod tx_body_spine;
 pub mod poseidon_mds;
 pub mod poseidon_perm;
@@ -126,8 +127,12 @@ pub use tx_validity::{
     TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
     TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
 };
+pub use tx_body_merkle_boundary::{
+    TxBodyMerkleBoundaryAir, TX_BODY_MERKLE_BOUNDARY_COL_LANE0, TX_BODY_MERKLE_BOUNDARY_COL_LANE1,
+    TX_BODY_MERKLE_BOUNDARY_LOG_ROWS, TX_BODY_MERKLE_BOUNDARY_N_COLS,
+};
 pub use tx_body_spine::{
-    emit_txv_tx_body_public_columns, spine_n_cols, txv_live_mask_col, txv_live_mask_programme,
-    TxBodySpineComposite, SPINE_LOG_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
+    emit_txv_tx_body_public_columns, merkle_band_width, spine_n_cols, txv_live_mask_col,
+    txv_live_mask_programme, TxBodySpineComposite, SPINE_LOG_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
     TX_BODY_MERKLE_COL_OFFSET,
 };

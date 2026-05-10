@@ -269,7 +269,7 @@ mod tests {
         SPINE_LOG_ROWS, TX_BODY_MERKLE_COL_OFFSET, TXV_COL_OFFSET,
     };
     use crate::airs::tx_validity::TX_VALIDITY_3B4_PINNED_N_COLS;
-    use crate::airs::tx_body_merkle::TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS;
+    use crate::airs::tx_body_spine::merkle_band_width;
 
     fn mk(base: usize) -> SpineEmbeddingLayout {
         SpineEmbeddingLayout::new(base, base + spine_n_cols(), SPINE_LOG_ROWS)
@@ -414,7 +414,7 @@ mod tests {
         // sum — TxValidity (cols 0..TX_VALIDITY_3B4_PINNED_N_COLS),
         // TxBodyMerkle (cols starting at TX_VALIDITY_3B4_PINNED_N_COLS),
         // plus a single TxvLiveMask column past the Merkle block.
-        let merkle_n = *TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS;
+        let merkle_n = merkle_band_width();
         assert_eq!(
             spine_n_cols(),
             TX_VALIDITY_3B4_PINNED_N_COLS + merkle_n + 1

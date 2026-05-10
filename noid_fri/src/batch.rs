@@ -76,6 +76,278 @@ pub struct BatchedEvalProof {
 }
 
 // ---------------------------------------------------------------------------
+// Mixed-length batched opening (γ₃b plan B)
+// ---------------------------------------------------------------------------
+//
+// `prove_batched` / `verify_batched` require every committed column to
+// share one hypercube size. `noid_stark::spine` γ₃b needs to open a
+// boundary MLE `B` (2^15) together with base-trace columns (2^log_len,
+// typically 2^13) in one batched proof so the standalone boundary
+// commitment and standalone FRI open can be retired.
+//
+// The design: group columns by `log_len`. All groups share one RLC
+// scalar `α` squeezed after absorbing every column's opening — the
+// soundness bound is `(n - 1) / |F|` across the flat column list, same
+// as the uniform path. Each group runs one `fri_prove` on its own
+// RLC'd codeword against its own evaluation point (the `eval_points`
+// map keys are `log_len`s). The resulting struct carries one
+// `EvalProof` per group along with the flat opening list.
+//
+// Uniform input (one group, one `log_len`) is handled here as the
+// degenerate single-group case. Byte-identity with `prove_batched` is
+// not attempted (the tag ordering is intentionally different — see the
+// `RLCOPEN_MIXED_TAG`) because the uniform path is still exposed
+// verbatim for callers that don't need mixed groups.
+
+/// Domain tag for the mixed-length batched opening sub-channel.
+/// Distinct from `RLCOPEN_TAG` so the two protocols can never be
+/// confused on-transcript.
+pub const RLCOPEN_MIXED_TAG: u64 = 0xFFFB_0000_0000_0000;
+
+/// One per distinct `log_len` in the mixed batch.
+#[derive(Clone, Debug)]
+pub struct MixedGroupProof {
+    /// Hypercube size of every column in this group.
+    pub log_len: usize,
+    /// Common opening point for the group, length `log_len`.
+    pub eval_point: Vec<Block128>,
+    /// Indices into the caller-side flat column list, in the order
+    /// this group's columns were passed to `prove_batched_mixed`.
+    pub column_indices: Vec<usize>,
+    /// Single FRI evaluation proof for the group's RLC'd codeword.
+    pub batch_proof: EvalProof,
+}
+
+/// Batched opening proof across columns of possibly-different
+/// `log_len`. Groups share one RLC scalar `α`; each group runs one
+/// `fri_prove` on its own hypercube.
+#[derive(Clone, Debug)]
+pub struct MixedBatchedEvalProof {
+    /// Per-column MLE openings `e_i`, in the caller's flat column
+    /// order. Absorbed into the parent transcript in that order
+    /// before `α` is squeezed.
+    pub column_openings: Vec<Block128>,
+    /// One FRI opening per distinct `log_len`. Sorted ascending by
+    /// `log_len` so the transcript order is canonical.
+    pub groups: Vec<MixedGroupProof>,
+}
+
+/// Prove opening of `n_cols` MLEs at their respective evaluation
+/// points, where columns are partitioned by hypercube size.
+///
+/// Inputs:
+/// * `evals_per_col` — per-column hypercube evaluations. Columns may
+///   have different lengths; each length must be a power of two.
+/// * `col_log_lens[i]` — `log_len` of `evals_per_col[i]`.
+/// * `eval_points[&log_len]` — the shared opening point for every
+///   column with that `log_len`.
+/// * `ntts[&log_len]` — an additive-NTT plan for `log_len + LOG_RATE`
+///   per group.
+///
+/// The parent `channel` must already bind every per-column commitment
+/// before this call; the uniform path's invariant carries over.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_batched_mixed(
+    evals_per_col: &[&[Block128]],
+    col_log_lens: &[usize],
+    eval_points: &std::collections::BTreeMap<usize, Vec<Block128>>,
+    ntts: &std::collections::BTreeMap<usize, AdditiveNTT<Block128>>,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+) -> MixedBatchedEvalProof {
+    assert!(
+        !evals_per_col.is_empty(),
+        "prove_batched_mixed: need at least one column"
+    );
+    assert_eq!(
+        evals_per_col.len(),
+        col_log_lens.len(),
+        "col_log_lens / evals_per_col length mismatch"
+    );
+    for (i, (c, &ll)) in evals_per_col.iter().zip(col_log_lens.iter()).enumerate() {
+        assert_eq!(
+            c.len(),
+            1usize << ll,
+            "prove_batched_mixed: column {i} length {} != 2^{ll}",
+            c.len()
+        );
+        assert!(
+            eval_points.contains_key(&ll),
+            "prove_batched_mixed: missing eval_point for log_len {ll}"
+        );
+        assert_eq!(
+            eval_points[&ll].len(),
+            ll,
+            "prove_batched_mixed: eval_point[{ll}] length != log_len"
+        );
+        assert!(
+            ntts.contains_key(&ll),
+            "prove_batched_mixed: missing NTT plan for log_len {ll}"
+        );
+    }
+
+    // Step 1: per-column opening `e_i = MLE_i(r_{log_len_i})`; absorb
+    // flat list in caller order.
+    let column_openings: Vec<Block128> = {
+        use rayon::prelude::*;
+        evals_per_col
+            .par_iter()
+            .zip(col_log_lens.par_iter())
+            .map(|(col, &ll)| noid_core::mle::evaluate::evaluate_slice(col, &eval_points[&ll]))
+            .collect()
+    };
+    channel.observe_field_elems(&column_openings);
+
+    // Domain separation — mixed tag keeps this protocol disjoint from
+    // the uniform `RLCOPEN_TAG`.
+    channel.observe_field_elem(Block128::from(RLCOPEN_MIXED_TAG as u128));
+
+    // Step 2: one `α` shared across every group. Weights run over the
+    // flat column list so each column's λ_i is its global position —
+    // groups don't renumber.
+    let alpha = channel.get_random_point();
+    let lambdas = horner_weights(alpha, evals_per_col.len());
+
+    // Step 3: group columns by log_len. BTreeMap keeps iteration
+    // order canonical (ascending `log_len`) for transcript stability.
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (i, &ll) in col_log_lens.iter().enumerate() {
+        groups.entry(ll).or_default().push(i);
+    }
+
+    // Step 4: per group, form the RLC'd codeword and run one
+    // `fri_prove` on the group's eval_point. The λ_i's preserve the
+    // flat column indexing — within a group we use λ_{column_indices[j]}.
+    let mut group_proofs: Vec<MixedGroupProof> = Vec::with_capacity(groups.len());
+    for (log_len, cols) in groups.into_iter() {
+        let group_lambdas: Vec<Block128> = cols.iter().map(|&i| lambdas[i]).collect();
+        let group_codewords: Vec<&[Block128]> = cols.iter().map(|&i| evals_per_col[i]).collect();
+        let evals_batch = rlc_codewords(&group_lambdas, &group_codewords);
+        let ep = &eval_points[&log_len];
+        let ntt = &ntts[&log_len];
+        let batch_proof = fri_prove(&evals_batch, ep, ntt, channel, hasher);
+        group_proofs.push(MixedGroupProof {
+            log_len,
+            eval_point: ep.clone(),
+            column_indices: cols,
+            batch_proof,
+        });
+    }
+
+    MixedBatchedEvalProof {
+        column_openings,
+        groups: group_proofs,
+    }
+}
+
+/// Verify a [`MixedBatchedEvalProof`] against externally committed
+/// per-column commitments. Returns the flat per-column opening list
+/// so callers can plug `e_i` back into their outer protocol.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_batched_mixed(
+    column_commitments: &[FriCommitment],
+    col_log_lens: &[usize],
+    eval_points: &std::collections::BTreeMap<usize, Vec<Block128>>,
+    ntts: &std::collections::BTreeMap<usize, AdditiveNTT<Block128>>,
+    proof: &MixedBatchedEvalProof,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+) -> Result<Vec<Block128>, String> {
+    if proof.column_openings.len() != column_commitments.len()
+        || proof.column_openings.len() != col_log_lens.len()
+    {
+        return Err(format!(
+            "verify_batched_mixed: opening/commitment/log_len count mismatch: {} / {} / {}",
+            proof.column_openings.len(),
+            column_commitments.len(),
+            col_log_lens.len(),
+        ));
+    }
+    for (i, (c, &ll)) in column_commitments.iter().zip(col_log_lens.iter()).enumerate() {
+        if c.log_len != ll {
+            return Err(format!(
+                "verify_batched_mixed: column {i} commitment log_len {} != declared {ll}",
+                c.log_len
+            ));
+        }
+        if !eval_points.contains_key(&ll) {
+            return Err(format!(
+                "verify_batched_mixed: missing eval_point for log_len {ll}"
+            ));
+        }
+        if eval_points[&ll].len() != ll {
+            return Err(format!(
+                "verify_batched_mixed: eval_point[{ll}] length != log_len"
+            ));
+        }
+        if !ntts.contains_key(&ll) {
+            return Err(format!(
+                "verify_batched_mixed: missing NTT plan for log_len {ll}"
+            ));
+        }
+    }
+
+    // Mirror prover transcript: openings → mixed tag → α.
+    channel.observe_field_elems(&proof.column_openings);
+    channel.observe_field_elem(Block128::from(RLCOPEN_MIXED_TAG as u128));
+    let alpha = channel.get_random_point();
+    let lambdas = horner_weights(alpha, proof.column_openings.len());
+
+    // Expect exactly one group per distinct log_len, in canonical
+    // ascending order.
+    let mut expected_groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for (i, &ll) in col_log_lens.iter().enumerate() {
+        expected_groups.entry(ll).or_default().push(i);
+    }
+    if proof.groups.len() != expected_groups.len() {
+        return Err(format!(
+            "verify_batched_mixed: group count {} != expected {}",
+            proof.groups.len(),
+            expected_groups.len()
+        ));
+    }
+    for (group_proof, (exp_ll, exp_cols)) in proof.groups.iter().zip(expected_groups.iter()) {
+        if group_proof.log_len != *exp_ll {
+            return Err(format!(
+                "verify_batched_mixed: group log_len {} != expected {} (groups must be ascending)",
+                group_proof.log_len, exp_ll
+            ));
+        }
+        if group_proof.column_indices != *exp_cols {
+            return Err(format!(
+                "verify_batched_mixed: group log_len {} column_indices mismatch",
+                group_proof.log_len
+            ));
+        }
+        if group_proof.eval_point != eval_points[exp_ll] {
+            return Err(format!(
+                "verify_batched_mixed: group log_len {} eval_point mismatch",
+                group_proof.log_len
+            ));
+        }
+
+        // Reconstruct the group's RLC'd opening from the per-column
+        // openings at the flat indices, then `fri_verify`.
+        let group_lambdas: Vec<Block128> = exp_cols.iter().map(|&i| lambdas[i]).collect();
+        let group_openings: Vec<Block128> =
+            exp_cols.iter().map(|&i| proof.column_openings[i]).collect();
+        let e_batch = rlc_openings(&group_lambdas, &group_openings);
+
+        fri_verify(
+            &group_proof.eval_point,
+            e_batch,
+            group_proof.batch_proof.clone(),
+            &ntts[exp_ll],
+            channel,
+            hasher,
+        )?;
+    }
+
+    Ok(proof.column_openings.clone())
+}
+
+// ---------------------------------------------------------------------------
 // prove_batched / verify_batched
 // ---------------------------------------------------------------------------
 
@@ -756,5 +1028,172 @@ mod tests {
             &hasher,
         )
         .expect("single-column batched verify must succeed");
+    }
+
+    // -------------------------------------------------------------------
+    // Mixed-log_len batched opening (γ₃b plan B)
+    // -------------------------------------------------------------------
+
+    fn mk_col(rng: &mut StdRng, log_len: usize) -> Vec<Block128> {
+        (0..1usize << log_len).map(|_| rand_block(rng)).collect()
+    }
+
+    #[test]
+    fn mixed_batched_roundtrip_two_log_lens() {
+        let mut r = rng();
+        let log_short = TAU + 1; // 8
+        let log_long = TAU + 3; // 10
+        let ntt_s = AdditiveNTT::<Block128>::new(log_short + LOG_RATE);
+        let ntt_l = AdditiveNTT::<Block128>::new(log_long + LOG_RATE);
+        let hasher = Poseidon2bSponge::new();
+
+        // 2 short cols, 3 long cols — deliberately interleaved in the
+        // flat order to exercise the group-index reconstruction.
+        let cs0 = mk_col(&mut r, log_short);
+        let cl0 = mk_col(&mut r, log_long);
+        let cs1 = mk_col(&mut r, log_short);
+        let cl1 = mk_col(&mut r, log_long);
+        let cl2 = mk_col(&mut r, log_long);
+
+        let cols: Vec<&[Block128]> = vec![
+            cs0.as_slice(),
+            cl0.as_slice(),
+            cs1.as_slice(),
+            cl1.as_slice(),
+            cl2.as_slice(),
+        ];
+        let col_log_lens = vec![log_short, log_long, log_short, log_long, log_long];
+
+        let cs: Vec<FriCommitment> = cols
+            .iter()
+            .zip(col_log_lens.iter())
+            .map(|(c, &ll)| {
+                let ntt = if ll == log_short { &ntt_s } else { &ntt_l };
+                commit(c, ntt, &hasher).0
+            })
+            .collect();
+
+        let ep_s = mk_eval_point(&mut r, log_short);
+        let ep_l = mk_eval_point(&mut r, log_long);
+
+        let mut eps: BTreeMap<usize, Vec<Block128>> = BTreeMap::new();
+        eps.insert(log_short, ep_s.clone());
+        eps.insert(log_long, ep_l.clone());
+        let mut ntts: BTreeMap<usize, AdditiveNTT<Block128>> = BTreeMap::new();
+        ntts.insert(log_short, AdditiveNTT::<Block128>::new(log_short + LOG_RATE));
+        ntts.insert(log_long, AdditiveNTT::<Block128>::new(log_long + LOG_RATE));
+
+        let mut pch = Channel::new();
+        for c in &cs {
+            pch.observe_fri_commitment(c);
+        }
+        let proof =
+            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+
+        assert_eq!(proof.column_openings.len(), 5);
+        assert_eq!(proof.groups.len(), 2);
+        // Canonical order: ascending log_len.
+        assert_eq!(proof.groups[0].log_len, log_short);
+        assert_eq!(proof.groups[1].log_len, log_long);
+        assert_eq!(proof.groups[0].column_indices, vec![0, 2]);
+        assert_eq!(proof.groups[1].column_indices, vec![1, 3, 4]);
+
+        let mut vch = Channel::new();
+        for c in &cs {
+            vch.observe_fri_commitment(c);
+        }
+        let openings =
+            verify_batched_mixed(&cs, &col_log_lens, &eps, &ntts, &proof, &mut vch, &hasher)
+                .expect("mixed verify must succeed");
+        // Per-column MLE evaluations must round-trip.
+        let expected: Vec<Block128> = cols
+            .iter()
+            .zip(col_log_lens.iter())
+            .map(|(c, &ll)| noid_core::mle::evaluate::evaluate_slice(c, &eps[&ll]))
+            .collect();
+        assert_eq!(openings, expected);
+    }
+
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn mixed_batched_rejects_tampered_opening() {
+        let mut r = rng();
+        let log_short = TAU + 1;
+        let log_long = TAU + 2;
+        let hasher = Poseidon2bSponge::new();
+
+        let cs0 = mk_col(&mut r, log_short);
+        let cl0 = mk_col(&mut r, log_long);
+        let cols: Vec<&[Block128]> = vec![cs0.as_slice(), cl0.as_slice()];
+        let col_log_lens = vec![log_short, log_long];
+        let ntt_s = AdditiveNTT::<Block128>::new(log_short + LOG_RATE);
+        let ntt_l = AdditiveNTT::<Block128>::new(log_long + LOG_RATE);
+        let cs: Vec<FriCommitment> = vec![
+            commit(&cs0, &ntt_s, &hasher).0,
+            commit(&cl0, &ntt_l, &hasher).0,
+        ];
+
+        let ep_s = mk_eval_point(&mut r, log_short);
+        let ep_l = mk_eval_point(&mut r, log_long);
+        let mut eps: BTreeMap<usize, Vec<Block128>> = BTreeMap::new();
+        eps.insert(log_short, ep_s);
+        eps.insert(log_long, ep_l);
+        let mut ntts: BTreeMap<usize, AdditiveNTT<Block128>> = BTreeMap::new();
+        ntts.insert(log_short, AdditiveNTT::<Block128>::new(log_short + LOG_RATE));
+        ntts.insert(log_long, AdditiveNTT::<Block128>::new(log_long + LOG_RATE));
+
+        let mut pch = Channel::new();
+        for c in &cs {
+            pch.observe_fri_commitment(c);
+        }
+        let mut proof =
+            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+
+        // Flip one per-column opening.
+        proof.column_openings[1] = proof.column_openings[1] + Block128::ONE;
+
+        let mut vch = Channel::new();
+        for c in &cs {
+            vch.observe_fri_commitment(c);
+        }
+        let res =
+            verify_batched_mixed(&cs, &col_log_lens, &eps, &ntts, &proof, &mut vch, &hasher);
+        assert!(res.is_err(), "tampered opening must be rejected");
+    }
+
+    #[test]
+    fn mixed_batched_single_group_matches_semantics() {
+        // Uniform input into the mixed path must still roundtrip — the
+        // BTreeMap degenerates to one group.
+        let mut r = rng();
+        let log_len = TAU + 2;
+        let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
+        let hasher = Poseidon2bSponge::new();
+        let cols_vec: Vec<Vec<Block128>> = (0..3).map(|_| mk_col(&mut r, log_len)).collect();
+        let cols: Vec<&[Block128]> = cols_vec.iter().map(|v| v.as_slice()).collect();
+        let col_log_lens = vec![log_len; 3];
+        let cs: Vec<FriCommitment> =
+            cols_vec.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
+        let ep = mk_eval_point(&mut r, log_len);
+        let mut eps: BTreeMap<usize, Vec<Block128>> = BTreeMap::new();
+        eps.insert(log_len, ep);
+        let mut ntts: BTreeMap<usize, AdditiveNTT<Block128>> = BTreeMap::new();
+        ntts.insert(log_len, AdditiveNTT::<Block128>::new(log_len + LOG_RATE));
+
+        let mut pch = Channel::new();
+        for c in &cs {
+            pch.observe_fri_commitment(c);
+        }
+        let proof =
+            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+        assert_eq!(proof.groups.len(), 1);
+
+        let mut vch = Channel::new();
+        for c in &cs {
+            vch.observe_fri_commitment(c);
+        }
+        verify_batched_mixed(&cs, &col_log_lens, &eps, &ntts, &proof, &mut vch, &hasher)
+            .expect("single-group mixed verify must succeed");
     }
 }

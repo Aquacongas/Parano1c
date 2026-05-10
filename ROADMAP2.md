@@ -34,7 +34,10 @@ results back into the canonical proof representation.
 
 The proving system uses Poseidon2b inside the AIR, a native
 GF(2^128) binary tower field for execution semantics, and
-Blake3-based FRI commitments.
+Poseidon2b-Merkle FRI commitments. The 59-permutation Poseidon2b
+spine that compresses the transaction body into `tx_body_hash` lives
+in a dedicated GKR sub-protocol (`noid_gkr`) rather than inside the
+STARK trace.
 
 The result is a transparent, post-quantum validity engine intended
 for integration into full blockchain protocols.
@@ -43,12 +46,13 @@ for integration into full blockchain protocols.
 
 **Engine track. The STARK validity engine.**
 
-`GENERAL_DESIGN.md` describes the blockchain — state model,
-transactions, consensus, blocks, wallets, mempool, fee market,
-reorg, and §15.4 philosophy. This ROADMAP2 scopes down to the
+`SPECIFICATION.md` describes the blockchain — state model,
+transactions, consensus, blocks, coinbase, activation bookkeeping,
+`log_slots` expansion — and `DESIGN_NOTES.md` carries the
+proof-native ledger philosophy. This ROADMAP2 scopes down to the
 **engine obligations** only: everything the STARK validity engine
 must provide so that, when a chain/node/wallet layer is later built
-on top, the design of `GENERAL_DESIGN.md` can be realized without
+on top, the design of `SPECIFICATION.md` can be realized without
 patching the engine.
 
 **Out of scope for this roadmap** (explicitly, so we stop drifting):
@@ -103,19 +107,24 @@ the engine proves:
    coinbase `Σ outputs.value == coinbase_credit`. `range_gate` on
    every u64.
 8. Body commitment: `tx_body_hash == Poseidon2bSponge(TAG_TXBODY, is_coinbase ∥ n_in ∥ n_out ∥ inputs ∥ outputs)`,
-   enforced by `tx_body_merkle` AIR. Exposed as a public column.
+   produced end-to-end by the GKR spine sub-proof (`noid_gkr`) over
+   the 59-permutation Poseidon2b chain. On the STARK side the two
+   lanes of `tx_body_hash` are row-pinned via `PublicColumn` through
+   `tx_body_merkle_boundary` / `tx_body_spine`; the STARK transcript
+   absorbs GKR's boundary MLE so that the pinned cell equals the
+   spine's wrap output.
 9. Activation bookkeeping: `is_activation[j]`, `is_deactivation[i]`
    boolean public columns (§I.5).
 
 **Architectural invariant — the new-state commitment is attested
 in-circuit, not recomputed natively by the chain.** This is what
-§4 of `GENERAL_DESIGN.md` ("resulting root = new_root") means when
-read strictly. This require two `fri_state_open` calls
+`SPECIFICATION.md §4` ("resulting root = new_root") means when
+read strictly. This requires two `fri_state_open` calls
 per slot touched against `new_state_root`, on top of the prev-state
 openings in 2 and 4 — roughly doubling state-opening work per tx
 vs. a prev-side-only circuit. The alternative ("chain recomputes
 natively, engine only proves prev-side") is rejected: it would make
-the engine's guarantee weaker than `GENERAL_DESIGN.md §4` promises,
+the engine's guarantee weaker than `SPECIFICATION.md §4` promises,
 and would force the chain layer into non-trivial cryptographic
 responsibility. The engine must be self-contained.
 
@@ -137,9 +146,10 @@ those rules. The engine does **not** itself apply the rules.
 | Commitment | What it commits to | Primitive | Module |
 |---|---|---|---|
 | `state_root` | `(value, owner_hi, owner_lo)` over `2^log_slots` slots | 3× FRI over GF(2^128), combined by `Poseidon2bSponge(TAG_FRISTATE, log_slots ∥ r_val ∥ r_owner_hi ∥ r_owner_lo)` | `noid_chain::fri_state`, `noid_air::airs::fri_state_combiner_composite` |
-| `tx_body_hash` | the tx body (inputs, outputs, flags) | `Poseidon2bSponge(TAG_TXBODY, …)` | `noid_tx::body_hash`, `noid_air::airs::tx_body_merkle` |
+| `tx_body_hash` | the tx body (inputs, outputs, flags) | `Poseidon2bSponge(TAG_TXBODY, …)` via the GKR 59-perm spine; STARK exposes the scalar via 2-lane `PublicColumn` pins | `noid_tx::body_hash`, `noid_gkr`, `noid_air::airs::{tx_body_spine, tx_body_merkle_boundary}` |
+| GKR spine boundary MLE | Poseidon2b trace of the 59-permutation spine (reduced to a boundary evaluation `v_B` at random point `r_B`) | sumcheck + FRI opening, absorbed into the STARK transcript as `extra_transcript` | `noid_gkr` |
 | `witness_root` (DA) | per-block packed witness columns (bit/byte domain) | `PackedCommit` over FRI, Poseidon2b Merkle | `noid_binius` |
-| per-tx proof `π` | satisfaction of the predicate in §I.1 | STARK over binary tower + FRI | `noid_stark` |
+| per-tx proof `π` | satisfaction of the predicate in §I.1 | STARK over binary tower + FRI (Poseidon2b Merkle) | `noid_stark` |
 | block-level proof `Π` | fold of N tx proofs | IVC linear folding accumulator | `noid_ivc` |
 | chain tip proof `Π*` | recursive cover `Π_n verifies Π_{n-1}` | IVC decider replayed in-circuit | `noid_air::airs::block_proof_verify` (Stage J) |
 
@@ -148,8 +158,10 @@ those rules. The engine does **not** itself apply the rules.
 ```
 noid_core         : GF(2^128) tower arithmetic, packed ops, MLE, sumcheck, AdditiveNTT, transcript.
 noid_poseidon2b   : native + AIR-side Poseidon2b (permutation, sponge, domain tags).
-noid_fri          : RS-code + Merkle (Blake3) + prover/verifier, batched PCS.
+noid_fri          : RS-code + Poseidon2b-Merkle + prover/verifier, batched PCS.
 noid_binius       : bit/byte packing into Block128, PackedCommit over FRI, DA root.
+noid_gkr          : GKR sub-protocol for the 59-permutation tx-body spine; emits a
+                    boundary MLE evaluation (`r_B`, `v_B`) absorbed by the STARK transcript.
 noid_air          : AIRs (gates, single-purpose AIRs, compositions).
 noid_stark        : STARK wrapper — multipoint + ladder batch, vshift, proof object.
 noid_ivc          : linear folding accumulator (block-level aggregation).
@@ -165,7 +177,7 @@ driver for tests. No mempool, no PoW, no difficulty, no networking.
 
 ### I.5 Activation accounting + `log_slots` versioning
 
-Per `GENERAL_DESIGN.md §15.3`. Engine exposes, as public columns of `tx_validity`:
+Per `SPECIFICATION.md §15.3`. Engine exposes, as public columns of `tx_validity`:
 - `is_activation[j] = (pre_value_j == 0) ∧ (post_value_j ≠ 0)` for each output slot.
 - `is_deactivation[i] = (pre_value_i ≠ 0) ∧ (post_value_i == 0)` for each input slot.
 
@@ -249,16 +261,28 @@ Implemented and gated by tests:
 - Single-purpose: `balance_gate`,
   `range_gate`, `bit_adder`, `carry_ripple`, `haddr`, `hauth`,
   `poseidon_perm`, `poseidon_sbox`, `poseidon_mds`, `linear_combination`,
-  `tx_body_spine`, `tx_body_merkle/*`, `fri_state_open`
+  `tx_body_spine`, `tx_body_merkle/*`, `tx_body_merkle_boundary`
+  (thin two-lane `tx_body_hash` pin under the GKR-spine path),
+  `fri_state_open`
   (input-side at `N=MAX_INPUTS` plus output-side at `N=MAX_OUTPUTS`
-  via `FriStateOpenLayout`,
+  via `FriStateOpenLayout`),
   `fri_state_combiner`, `fri_state_combiner_composite`, `tx_validity`.
 - Compositions: `bridge`, `placement`, `registry`, `row_window`,
   `t1_owner_tie`, `spine_adapter`, `tx_validity_composite`,
   `tx_validity_hauth`, `tx_validity_with_spine`, `tx_validity_full`,
   `haddr_block`, `hauth_block`, `tx_validity_leaf`
   (four-corner state openings wired; `is_activation` / `is_deactivation`
-  public columns emitted ).
+  public columns emitted).
+
+Note: the 59-permutation Poseidon2b spine that produces `tx_body_hash`
+is **no longer** materialised inside any STARK AIR. It lives in
+`noid_gkr` as the production — and only — path; the former in-AIR
+spine has been retired from the default build surface. The STARK
+side carries only the two `tx_body_hash` lanes, row-pinned by
+`tx_body_merkle_boundary` / `tx_body_spine` `PublicColumn`s, with
+the GKR boundary claim absorbed into the STARK transcript
+(`extra_transcript`). See `ARCHITECTURE.md §4.2` and
+`noid_gkr/SPEC.md` for the binding contract.
 
 ### I.10 Graphical picture
 
@@ -291,6 +315,11 @@ Implemented and gated by tests:
                                 │  │   × M        │  │   × M        │
                                 │  └──────────────┘  └──────────────┘
                                 │        (bound to tx_body_hash)
+                                │
+                                │   tx_body_hash pin is fed by
+                                │   `noid_gkr` (59-perm spine);
+                                │   the STARK transcript absorbs
+                                │   the GKR boundary MLE claim.
 ```
 
 ## Part II. Stage plan
@@ -470,8 +499,10 @@ a cross-block invariant.
 
 ### Stage K — Review contract & closure [OPEN]
 
-- K.1. Update `GENERAL_DESIGN.md §4 AIR-пакет` narrative to match
-  final AIR inventory.
+- K.1. Update `ARCHITECTURE.md §4` narrative and
+  `SPECIFICATION.md §4` public-input schema to match the final AIR
+  inventory (including the GKR-spine split and the
+  `tx_body_merkle_boundary` pin path).
 - K.2. One-page `noid_stark/docs/predicate.md` listing the nine
   predicates of §I.1 with file:line citations, plus §15.4 philosophy
   claims → file:line implementation citations.
@@ -479,8 +510,8 @@ a cross-block invariant.
   completeness, the coinbase mux, and the recursive chain binding
   (Stage J).
 
-Exit: engine is complete against the `GENERAL_DESIGN.md` obligations,
-including §15.4 recursive claims.
+Exit: engine is complete against the `SPECIFICATION.md` obligations
+(§0–§17) plus the `DESIGN_NOTES.md` recursive-chain claims.
 
 ---
 
@@ -500,7 +531,7 @@ including §15.4 recursive claims.
 
 ---
 
-## Part V. Coverage matrix — `GENERAL_DESIGN.md` vs engine
+## Part V. Coverage matrix — `SPECIFICATION.md` vs engine
 
 Reading: "engine contract" is what the engine must provide; everything
 else is out of scope by Part IV. Status reflects the code at ROADMAP tip.
@@ -511,7 +542,7 @@ else is out of scope by Part IV. Status reflects the code at ROADMAP tip.
 | §0 `state_root = Poseidon2bSponge(TAG_FRISTATE, log_slots ∥ 3 roots)` | `fri_state_combiner_composite` | done | — |
 | §1 genesis | `FriState::from_slots` | done | — |
 | §2 `Address = H_ADDR(secret)` | `haddr` AIR | done | — |
-| §3 tx body + body hash | `TxBody`, `hash_tx_body`, `tx_body_merkle` | done (3-lane leaf; 4-lane needed) | E.1 |
+| §3 tx body + body hash | `TxBody`, `hash_tx_body`, GKR spine (`noid_gkr`) with STARK-side `tx_body_merkle_boundary` / `tx_body_spine` pins | done (GKR-spine production path; 4-lane leaf path kept by boundary pins) | E.1 |
 | §4 ownership (haddr + hauth) | per-input composition, gated by `InputValid` | done | — |
 | §4 balance | `balance_gate` (regular only today) | partial | E.5 |
 | §4 range | `range_gate` | done | — |
@@ -535,12 +566,12 @@ else is out of scope by Part IV. Status reflects the code at ROADMAP tip.
 | §15.3 `log_slots` as AIR constant + FS-absorbed | AIR builder param | missing | E.6 |
 | §15.3 `ZERO_SUBTREE_ROOT[k]` table | constant table | missing | E.6 |
 | §15.3 occupancy / expansion trigger | chain | **OUT** | — |
-| §15.4 tx = self-contained state transition proof (4-corner) | `noid_stark::StarkProof` + E.2/E.3 | partial (1/4 corners done) | E.2, E.3 |
-| §15.4 block = aggregated recursive proof checkpoint | `noid_ivc::Accumulator` + block wiring | primitive done, wiring missing | G |
-| §15.4 recursive chain-of-proofs (`Proof_{n+1}` verifies `Proof_n`) | `noid_air::airs::block_proof_verify` | missing | J |
-| §15.4 full-chain verification O(1) via light client | `verify_light_client(tip)` | missing | J.5 |
-| §15.4 mempool, PoW, miner-as-aggregator claims | consensus layer | **OUT** | — |
-| §16–§20 UX / verdict | docs | — | — |
+| `SPECIFICATION.md §4` / §17 tx = self-contained state transition proof (4-corner) | `noid_stark::StarkProof` + E.2/E.3 | partial (1/4 corners done) | E.2, E.3 |
+| `DESIGN_NOTES.md §1.3` block = aggregated recursive proof checkpoint | `noid_ivc::Accumulator` + block wiring | primitive done, wiring missing | G |
+| `DESIGN_NOTES.md §1.4` recursive chain-of-proofs (`Proof_{n+1}` verifies `Proof_n`) | `noid_air::airs::block_proof_verify` | missing | J |
+| `DESIGN_NOTES.md §1.5` / §1.10 full-chain verification O(1) via light client | `verify_light_client(tip)` | missing | J.5 |
+| `DESIGN_NOTES.md §1.13` / §1.14 mempool, PoW, miner-as-aggregator claims | consensus layer | **OUT** | — |
+| `DESIGN_NOTES.md §2`–§4 UX / verdict | docs | — | — |
 | (engine deliverable) HLeaf output duplication | removed; `tamper_output_leaf_absorb_pin_rejects` gated | **done** | B [done] |
 | (engine deliverable) post-E perf baseline & optimization | `stark_report.rs` on production-shape predicate | missing | Eπ |
 | (engine deliverable) block-level proof aggregation | IVC fold over N tx proofs | primitive done, integration missing | G |

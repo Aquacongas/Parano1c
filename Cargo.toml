@@ -10,6 +10,7 @@ members = [
     "noid_stark",
     "noid_ivc",
     "noid_binius",
+    "noid_gkr",
 ]
 resolver = "2"
 
