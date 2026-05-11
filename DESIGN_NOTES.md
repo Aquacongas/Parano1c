@@ -215,6 +215,17 @@ This is radically friendlier to recursive accumulation than arbitrary
 VM execution: every shift / fold operates on a fixed algebraic
 structure rather than on opcode semantics.
 
+### 1.12.1 Node topology and state pruning (Data lifecycle)
+
+The proof-native architecture fundamentally changes the data retention requirements for network participants. History is not needed to validate the present.
+
+*   **Full Nodes (State-tracking):** Maintain the current state vector (`2^log_slots` cells) and validate new blocks. When a new block is applied, the node uses the DA payload (witness_root) to update its local state. Once the block is finalized and the state is updated, **the DA payload and the raw transaction data for that block can be safely discarded (pruned).** A Full Node does not need to store historical transaction data to validate future blocks or serve wallet queries for current balances. Its storage footprint is bounded by the state size, not the chain length.
+*   **Archive Nodes (History-tracking):** Opt-in nodes that choose to store the DA payload (witness data) for all historical blocks. These nodes are not required for network consensus or for wallets to spend funds. They exist solely to serve historical queries (e.g., block explorers, auditors, or indexers looking at past states). If all Archive nodes go offline, the network continues to process transactions and wallets remain fully functional.
+*   **Light Clients:** Download only block headers and the recursive `BlockProof`. They verify the entire chain history in O(1) time without downloading any DA data or state. They rely on Full Nodes for Merkle paths to construct new transactions.
+
+**Rationale:** In traditional blockchains, a node must execute historical transactions to verify the current `state_root`. In Paranoid, the cryptographic proof replaces execution. Therefore, retaining historical data is a convenience for data availability, not a consensus requirement. DA (Stage F) is the pipe that delivers state diffs, not the ledger itself.
+
+
 ### 1.13 Mempool = proof market
 
 The mempool stores **candidate proven transitions**, not intents to
