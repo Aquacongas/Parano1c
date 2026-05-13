@@ -47,14 +47,15 @@
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
+use rayon::prelude::*;
 
 use crate::batch_eval::{
     prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
 };
 use crate::circuit::{SpineCircuit, SpineInputs};
 use crate::layers::evaluate_permutation;
-use crate::mle_layout::{PermMle, N_PERM_CELLS, N_PERM_VARS};
-use crate::perm_sumcheck::{prove_perm, verify_perm, PermProof, PermStateClaim};
+use crate::mle_layout::{pack_sout, PermMle, N_PERM_CELLS, N_PERM_VARS};
+use crate::perm_sumcheck::{prove_perm_with_mle, verify_perm, PermProof, PermStateClaim};
 
 /// Number of slots in the tx-body spine.
 pub const N_SPINE_SLOTS: usize = 59;
@@ -107,6 +108,22 @@ pub fn build_boundary_mle(
         debug_assert_eq!(state_mle.len(), N_PERM_CELLS);
         let offset = s << N_PERM_VARS;
         b[offset..offset + N_PERM_CELLS].copy_from_slice(&state_mle);
+    }
+    b
+}
+
+/// Like [`build_boundary_mle`] but uses already-built per-slot
+/// [`PermMle`]s, skipping the `evaluate_permutation` +
+/// `PermMle::from_witness` redundant work. Called from the prover
+/// hot path where the MLEs were just computed for each slot's
+/// per-perm sumcheck.
+fn assemble_boundary_mle(mles: &[PermMle]) -> Vec<Block128> {
+    debug_assert_eq!(mles.len(), N_SPINE_SLOTS);
+    let mut b = vec![Block128::ZERO; N_BOUNDARY_CELLS];
+    for (s, m) in mles.iter().enumerate() {
+        debug_assert_eq!(m.state.len(), N_PERM_CELLS);
+        let offset = s << N_PERM_VARS;
+        b[offset..offset + N_PERM_CELLS].copy_from_slice(&m.state);
     }
     b
 }
@@ -188,10 +205,19 @@ pub fn prove_spine<T: FiatShamir<Block128>>(
 
     absorb_hash(channel, &claimed_tx_body_hash);
 
+    // Build each slot's layered witness once and reuse it for (a) the
+    // per-slot permutation sumcheck and (b) assembling the concatenated
+    // boundary MLE below. Slot witnesses are independent — run the
+    // 59 native permutations + MLE packings in parallel.
+    let mles: Vec<PermMle> = states
+        .par_iter()
+        .map(|(state_in, _)| PermMle::from_witness(&evaluate_permutation(*state_in)))
+        .collect();
+
     let mut slot_proofs = Vec::with_capacity(states.len());
     let mut batched: Vec<EvalClaim> = Vec::with_capacity(states.len() * 3);
-    for (s, (state_in, _state_out)) in states.iter().enumerate() {
-        let (p, _v0, slot_claims) = prove_perm(*state_in, channel);
+    for (s, mle) in mles.iter().enumerate() {
+        let (p, _r0, _v0, slot_claims) = prove_perm_with_mle(mle, channel);
         slot_proofs.push(p);
         for c in &slot_claims {
             batched.push(lift_claim(s, c));
@@ -201,7 +227,7 @@ pub fn prove_spine<T: FiatShamir<Block128>>(
     // γ₂: collapse all 59·3 per-slot claims into one `(r_B, v_B)` on
     // the concatenated boundary MLE `B`. The returned reduction is
     // what γ₃a discharges via a FRI opening on the boundary column.
-    let boundary_mle = build_boundary_mle(&states);
+    let boundary_mle = assemble_boundary_mle(&mles);
     let (boundary, reduction) = prove_batch_eval(&boundary_mle, &batched, channel);
 
     (
@@ -234,12 +260,22 @@ pub fn verify_spine<T: FiatShamir<Block128>>(
 
     absorb_hash(channel, &claimed_tx_body_hash);
 
+    // Pre-build every slot's `sout` MLE so the verifier-side closure
+    // can evaluate `v0 = sout(r0)` in log-time without re-running the
+    // native permutation inside each iteration. Independent across
+    // slots — execute in parallel.
     let states = reconstruct_slot_states(circuit, inputs);
+    let sout_mles: Vec<Vec<Block128>> = states
+        .par_iter()
+        .map(|(state_in, _)| pack_sout(&evaluate_permutation(*state_in)))
+        .collect();
+
     let mut batched: Vec<EvalClaim> = Vec::with_capacity(states.len() * 3);
-    for (s, ((state_in, _state_out), slot_proof)) in
-        states.iter().zip(proof.slots.iter()).enumerate()
-    {
-        let claims = verify_perm(slot_proof, *state_in, channel)?;
+    for (s, slot_proof) in proof.slots.iter().enumerate() {
+        let sout_mle = &sout_mles[s];
+        let claims = verify_perm(slot_proof, channel, |r0| {
+            noid_core::mle::evaluate::evaluate_slice(sout_mle, r0)
+        })?;
         for c in &claims {
             batched.push(lift_claim(s, c));
         }

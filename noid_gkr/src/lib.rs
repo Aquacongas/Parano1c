@@ -11,6 +11,9 @@
 //! the topology and the I/O boundary so later stages have a single
 //! source of truth.
 
+pub mod auth_circuit;
+pub mod auth_oracle;
+pub mod auth_sumcheck;
 pub mod batch_eval;
 pub mod binding;
 pub mod circuit;
@@ -19,8 +22,25 @@ pub mod mle_layout;
 pub mod oracle;
 pub mod perm_sumcheck;
 pub mod product_sumcheck;
+pub mod spine_degree7;
+pub mod spine_mle;
+pub mod spine_killshot;
+pub mod spine_shift;
 pub mod spine_sumcheck;
+pub mod spine_unified;
 
+pub use auth_circuit::{
+    AuthCircuit, AuthInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0, AUTH_PAD_1,
+    N_AUTH_INPUTS, N_AUTH_SLOTS, N_SLOTS_PER_INPUT,
+};
+pub use auth_oracle::{evaluate_auth, AuthSlotState, AuthWitness};
+pub use auth_sumcheck::{
+    auth_boundary_output_cell, build_auth_boundary_mle, compute_auth_boundary,
+    discharge_auth_boundary_native, point_for_auth_boundary_cell, prove_auth,
+    reconstruct_auth_slot_states, verify_auth, AuthBoundaryPins, AuthOutputPin, AuthProof,
+    AUTH_PIN_LANES, N_AUTH_BOUNDARY_CELLS, N_AUTH_BOUNDARY_VARS, N_AUTH_COL_VARS,
+    N_AUTH_SLOTS_PADDED, N_AUTH_SLOT_VARS,
+};
 pub use batch_eval::{
     prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, BatchEvalRound,
     EvalClaim,
@@ -31,11 +51,34 @@ pub use layers::{evaluate_permutation, round_kind, PermLayerWitness, RoundKind};
 pub use mle_layout::{pack_column, PermColumn, PermMle, N_PERM_CELLS, N_PERM_VARS};
 pub use oracle::{evaluate_spine, SpineWitness};
 pub use perm_sumcheck::{
-    build_active_mle, build_rc_mle, prove_perm, verify_perm, PermProof, PermStateClaim,
-    N_STATE_CLAIMS_PER_SLOT,
+    active_mle, build_active_mle, build_rc_mle, prove_perm, prove_perm_with_mle, rc_mle,
+    verify_perm, PermProof, PermStateClaim, N_STATE_CLAIMS_PER_SLOT,
 };
 pub use product_sumcheck::{
-    compute_product_claim, prove_product, verify_product, ProductProof, RoundEvals,
+    compute_product_claim, prove_product, prove_square, verify_product, ProductProof, RoundEvals,
+};
+pub use spine_degree7::{
+    prove_spine_degree7, verify_spine_degree7, SpineD7Proof, SpineD7Reduction,
+    SPINE_D7_ROUND_DEGREE,
+};
+pub use spine_mle::{
+    build_unified_mle, sigma_at, SpineUnifiedMle, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS,
+    N_SPINE_SLOT_VARS, N_SPINE_UNIFIED_CELLS, N_SPINE_UNIFIED_VARS,
+};
+pub use spine_shift::{
+    build_mds_lane_table, build_mu_table, build_rc_table, build_sigma_table, build_u_table,
+    dec_round_index, elem_of, inc_round_index, mds_coeff, mu_evaluate, pack_index, permute_by_dec,
+    project_lane, rc_evaluate, round_of, sigma_evaluate, slot_of,
+};
+pub use spine_killshot::{
+    build_unified_from_inputs, discharge_reductions_native, prove_spine_killshot,
+    verify_spine_killshot, SpineKillShotReductions, SpineProofKillShot,
+};
+pub use spine_unified::{
+    prove_spine_shift, prove_spine_unified, verify_spine_shift, verify_spine_unified,
+    SpineKillShotProof, SpineShiftProof, SpineShiftReduction, SpineUnifiedProof,
+    SpineUnifiedReduction, N_UNIFIED_WITNESS_CLAIMS, SPINE_SHIFT_ROUND_DEGREE,
+    SPINE_UNIFIED_ROUND_DEGREE,
 };
 pub use spine_sumcheck::{
     build_boundary_mle, compute_tx_body_hash, discharge_boundary_native, prove_spine,

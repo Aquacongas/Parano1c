@@ -22,12 +22,9 @@ use crate::airs::{
     },
     fri_state_open::{COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_N_INPUTS},
     fri_state_combiner::COMBINER_PERM_LAYOUT,
-    haddr::{HADDR_LAYOUT_B, HADDR_OUTPUT_ROW},
-    hauth::{HAUTH_LAYOUT_C, HAUTH_OUTPUT_ROW, HAUTH_PRE_S_B_BASE},
     tx_body_merkle::{build_instance_layout, leaf_rate_payload_col, InstanceRole},
     tx_validity::TxValidityCol,
 };
-use noid_poseidon2b::native::permutation::N_ROUNDS;
 use noid_tx::types::{MAX_INPUTS, MAX_OUTPUTS};
 
 /// Column + row of a single cell in a sub-AIR trace.
@@ -41,67 +38,6 @@ impl Cell {
     #[inline]
     pub const fn new(col: usize, row: usize) -> Self {
         Self { col, row }
-    }
-}
-
-/// `HAddrAir` — Poseidon sponge that derives the owner address.
-///
-/// Stage 5 T1 destinations: `owner_hi` / `owner_lo` at the squeeze
-/// row live on the B-block state columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HAddrCols {
-    /// `s_B[0]@HADDR_OUTPUT_ROW` — squeezed owner-hi lane.
-    pub owner_hi: Cell,
-    /// `s_B[1]@HADDR_OUTPUT_ROW` — squeezed owner-lo lane.
-    pub owner_lo: Cell,
-}
-
-impl HAddrCols {
-    pub const fn new() -> Self {
-        Self {
-            owner_hi: Cell::new(HADDR_LAYOUT_B.s, HADDR_OUTPUT_ROW),
-            owner_lo: Cell::new(HADDR_LAYOUT_B.s + 1, HADDR_OUTPUT_ROW),
-        }
-    }
-}
-
-impl Default for HAddrCols {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// `HAuthAir` — Poseidon sponge over `(secret || tx_body_hash)`
-/// producing an auth tag.
-///
-/// Stage 5 T2 destinations:
-/// - **T2a** (auth tag equals `TxValidityAir.AuthTag[i]`) reads the
-///   squeeze lanes at `HAUTH_OUTPUT_ROW`.
-/// - **T2b** (second absorb equals `tx_body_hash`) reads the
-///   pre-MDS secret lanes at the second absorb row
-///   (`row = N_ROUNDS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HAuthCols {
-    pub auth_tag_hi: Cell,
-    pub auth_tag_lo: Cell,
-    pub tx_body_hash_hi: Cell,
-    pub tx_body_hash_lo: Cell,
-}
-
-impl HAuthCols {
-    pub const fn new() -> Self {
-        Self {
-            auth_tag_hi: Cell::new(HAUTH_LAYOUT_C.s, HAUTH_OUTPUT_ROW),
-            auth_tag_lo: Cell::new(HAUTH_LAYOUT_C.s + 1, HAUTH_OUTPUT_ROW),
-            tx_body_hash_hi: Cell::new(HAUTH_PRE_S_B_BASE, N_ROUNDS),
-            tx_body_hash_lo: Cell::new(HAUTH_PRE_S_B_BASE + 1, N_ROUNDS),
-        }
-    }
-}
-
-impl Default for HAuthCols {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -400,24 +336,6 @@ impl Default for CombinerCompositeCols {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::airs::haddr::{HADDR_LAYOUT_B, HADDR_OUTPUT_ROW};
-    use crate::airs::hauth::{HAUTH_LAYOUT_C, HAUTH_OUTPUT_ROW, HAUTH_PRE_S_B_BASE};
-
-    #[test]
-    fn haddr_registry_matches_consts() {
-        let r = HAddrCols::new();
-        assert_eq!(r.owner_hi, Cell::new(HADDR_LAYOUT_B.s, HADDR_OUTPUT_ROW));
-        assert_eq!(r.owner_lo, Cell::new(HADDR_LAYOUT_B.s + 1, HADDR_OUTPUT_ROW));
-    }
-
-    #[test]
-    fn hauth_registry_matches_consts() {
-        let r = HAuthCols::new();
-        assert_eq!(r.auth_tag_hi, Cell::new(HAUTH_LAYOUT_C.s, HAUTH_OUTPUT_ROW));
-        assert_eq!(r.auth_tag_lo, Cell::new(HAUTH_LAYOUT_C.s + 1, HAUTH_OUTPUT_ROW));
-        assert_eq!(r.tx_body_hash_hi, Cell::new(HAUTH_PRE_S_B_BASE, N_ROUNDS));
-        assert_eq!(r.tx_body_hash_lo, Cell::new(HAUTH_PRE_S_B_BASE + 1, N_ROUNDS));
-    }
 
     #[test]
     fn tx_validity_registry_per_input_rows() {

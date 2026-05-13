@@ -838,10 +838,10 @@ mod tests {
 
     /// Stage 5.7 invariant guard: `AuthTagHi` / `AuthTagLo` (composite
     /// cols 8 / 9) must remain witness-only on the spine side. They
-    /// participate in cross-AIR equality (HAuth → spine T2a bridge)
-    /// but must never be declared as a `PublicColumn` — doing so would
+    /// are pinned through the external `AuthGKR` boundary and must
+    /// never be declared as a `PublicColumn` — doing so would
     /// re-introduce the "third source of truth" the audit § 1 warns
-    /// about (PI vs Merkle vs bridge).
+    /// about (PI vs Merkle vs GKR pin).
     #[test]
     fn stage_5_7_invariant_auth_tag_columns_are_not_pi_pinned() {
         let (pins, _inputs) = build_honest_pins_and_inputs();
@@ -867,9 +867,9 @@ mod tests {
     /// Stage 5.7 invariant guard: `tx_body_hash` must remain
     /// single-origin on the Merkle side (wrap-perm output) inside the
     /// spine. The TxValidity block must not redundantly pin
-    /// `tx_body_hash` to any of its witness columns — Stage 5 wiring
-    /// reaches `tx_body_hash` only through the HAuth pre-S_B B-seed
-    /// equality bridge, never through a parallel PublicColumn.
+    /// `tx_body_hash` to any of its witness columns — the hash is
+    /// consumed downstream only through the external `AuthGKR`
+    /// boundary, never through a parallel PublicColumn.
     #[test]
     fn stage_5_7_invariant_tx_body_hash_single_origin() {
         let (pins, _inputs) = build_honest_pins_and_inputs();

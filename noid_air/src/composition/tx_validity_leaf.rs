@@ -3,13 +3,12 @@
 
 //! [`TxValidityCompositeLeaf`].
 //!
-//! Inherits the [`super::tx_validity_hauth::TxValidityCompositeHAuth`]
-//! layout verbatim at `TX_VALIDITY_LEAF_LOG_ROWS = 13` so the composite
-//! can be embedded inside
-//! [`super::tx_validity_with_spine::TxValidityCompositeWithSpine`]
-//! without an outer-row-count mismatch. Output commitments are pinned
-//! by `TxBodyMerkleAir`'s `o1_payload_programme` on the Merkle side of
-//! the composite.
+//! Authentication-free leaf. Address and auth-tag derivation live
+//! entirely in the external `AuthGKR` proof; this composite stacks
+//! only the combiner, the prev/output FriStateOpen blocks, and the
+//! E.4/E.5 public columns. Outer log-rows are `13` so the composite
+//! embeds inside [`super::tx_validity_with_spine::TxValidityCompositeWithSpine`]
+//! without a row-count mismatch.
 
 use crate::airs::fri_state_combiner::FRI_STATE_COMBINER_LOG_ROWS;
 use crate::airs::fri_state_combiner_composite::{
@@ -17,27 +16,16 @@ use crate::airs::fri_state_combiner_composite::{
 };
 use crate::airs::fri_state_open::{
     FriStateOpenAir, FriStateOpenLayout, FriStateOpenWitness,
-    FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS,
+    FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_N_ROWS,
     FRI_STATE_OPEN_OUTPUT_LAYOUT, FRI_STATE_OPEN_WITNESS_COLS,
 };
-use crate::airs::haddr::HADDR_LOG_ROWS;
-use crate::airs::hauth::HAUTH_LOG_ROWS;
 use crate::composition::row_window::{
     InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy,
 };
 use crate::composition::tx_validity_composite::{
     OutputSideSource, SKEL_COMBINER_COL_OFFSET, SKEL_OPEN_COL_OFFSET,
-    SKEL_OPEN_WINDOW_INDICATOR_COL,
+    TX_VALIDITY_SKELETON_N_COLS, SKEL_OPEN_WINDOW_INDICATOR_COL,
 };
-use crate::composition::tx_validity_full::{
-    emit_full_shared_haddr, write_full_shared_haddr_trace,
-};
-use crate::composition::tx_validity_hauth::{
-    auth_tag_dst_cols, auth_tag_hi_dst_row, auth_tag_lo_dst_row, emit_full_shared_hauth,
-    tx_body_dst_cols, tx_body_hi_dst_row, tx_body_lo_dst_row, write_full_shared_hauth_trace,
-    FullSharedHAuthOptions, TX_VALIDITY_HAUTH_N_COLS,
-};
-pub use crate::composition::tx_validity_hauth::{T2aDstOverride, T2bDstOverride};
 use crate::gates::const_column::PublicColumn;
 use crate::{Air, CompositeAir, Constraint, Trace};
 use noid_core::{Block128, TowerField};
@@ -57,8 +45,6 @@ pub const TX_VALIDITY_LEAF_LOG_ROWS: usize = 13;
 
 /// Compile-time height sanity.
 const _: () = {
-    assert!(HAUTH_LOG_ROWS <= TX_VALIDITY_LEAF_LOG_ROWS);
-    assert!(HADDR_LOG_ROWS <= TX_VALIDITY_LEAF_LOG_ROWS);
     assert!(FRI_STATE_OPEN_LOG_ROWS <= TX_VALIDITY_LEAF_LOG_ROWS);
     assert!(COMBINER_COMPOSITE_LOG_ROWS <= TX_VALIDITY_LEAF_LOG_ROWS);
     assert!(FRI_STATE_COMBINER_LOG_ROWS == COMBINER_COMPOSITE_LOG_ROWS);
@@ -69,7 +55,7 @@ const _: () = {
 /// `WrapPolicy::MaskOff` so its row-9-scoped constraints are silenced
 /// past row `2^COMBINER_COMPOSITE_LOG_ROWS = 512` on the
 /// 8192-row outer trace.
-pub const SKEL_COMBINER_WINDOW_INDICATOR_COL: usize = TX_VALIDITY_HAUTH_N_COLS;
+pub const SKEL_COMBINER_WINDOW_INDICATOR_COL: usize = TX_VALIDITY_SKELETON_N_COLS;
 
 // ---------------------------------------------------------------------
 // E.4 — Activation / deactivation public columns.
@@ -136,20 +122,6 @@ pub const TX_VALIDITY_LEAF_N_COLS: usize = SKEL_IS_COINBASE_COL + 1;
 /// `Default` applies no overrides (canonical wiring).
 #[derive(Debug, Clone, Default)]
 pub struct LeafConstructionOptions {
-    /// When `Some`, override every HAuth block's bridge dst cells
-    /// (auth-tag hi/lo) and skip the T2a PI-pin emission. Caller
-    /// must guarantee each override cell lies inside the outer
-    /// composite and (in honest traces) carries the corresponding
-    /// `native_auth_tag(secrets[i], tx_body_hash)`.
-    pub t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
-    /// When `Some`, override the shared HAuth T2b bridge dst cells
-    /// that bind the per-AIR `tx_body_col[0..2]` constant column to an
-    /// external `tx_body_hash` origin. Caller must guarantee the
-    /// override cell lies inside the outer composite and (in honest
-    /// traces) carries `tx_body_hash[lane]`. When supplied, the
-    /// default tx-body dst PublicColumn pin is also omitted so the
-    /// caller's origin owns the pinning.
-    pub t2b_dst_override: Option<T2bDstOverride>,
     /// E.2.b.comp-3: how the output-side `FriStateOpenAir` block is
     /// populated. `Empty` (default) keeps the deterministic all-EMPTY
     /// witness; `FromBody` binds the `TxOutput` list as mint claims
@@ -168,24 +140,15 @@ pub struct LeafConstructionOptions {
 // Composite
 // ---------------------------------------------------------------------------
 
-/// Leaf composite: combiner + FriStateOpen + N_INPUTS × HAddr (T1)
-/// + N_INPUTS × HAuth (T2a per-input + T2b per-input).
+/// Leaf composite: combiner + input-side FriStateOpen + output-side
+/// FriStateOpen + the E.4/E.5 public-column tie block. Address and
+/// auth-tag derivation live entirely in the external `AuthGKR` proof,
+/// so the leaf carries no spend-secret witness.
 pub struct TxValidityCompositeLeaf {
     pub air: CompositeAir,
     combiner: FriStateCombinerComposite,
     open_witness: FriStateOpenWitness,
     open_public_columns: Vec<PublicColumn>,
-    secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-    tx_body_hash: [Block128; 2],
-    auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-    /// Optional per-input T2a dst override. When `Some`, the
-    /// HAuth bridge dst cells are routed at these `(col, row)` pairs
-    /// and the T2a PI-pin loop is skipped at construction.
-    t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
-    /// Optional shared T2b (`tx_body_col == tx_body_hash`) dst override.
-    /// When `Some`, the HAuth tx-body bridge dst cells are routed at
-    /// this `(col, row)` pair.
-    t2b_dst_override: Option<T2bDstOverride>,
     /// E.2.b.comp-3: output-side witness source. Captured so
     /// `build_trace` can rebuild the honest sub-trace without requiring
     /// callers to hand it in again.
@@ -203,31 +166,21 @@ impl TxValidityCompositeLeaf {
         combiner: FriStateCombinerComposite,
         open_air: FriStateOpenAir,
         open_witness: FriStateOpenWitness,
-        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        tx_body_hash: [Block128; 2],
-        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
     ) -> Self {
         Self::new_with_options(
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             LeafConstructionOptions::default(),
         )
     }
 
     /// Construct a [`TxValidityCompositeLeaf`] with caller-controlled
     /// option overrides. See [`LeafConstructionOptions`].
-    #[allow(clippy::too_many_arguments)]
     pub fn new_with_options(
         combiner: FriStateCombinerComposite,
         open_air: FriStateOpenAir,
         open_witness: FriStateOpenWitness,
-        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        tx_body_hash: [Block128; 2],
-        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
         options: LeafConstructionOptions,
     ) -> Self {
         let outer_n_cols = TX_VALIDITY_LEAF_N_COLS;
@@ -472,69 +425,6 @@ impl TxValidityCompositeLeaf {
             constraints.push(Box::new(SelectorGate::new(row_ind, inner)));
         }
 
-        // Block C — shared HAddr (OP-1.δ.1): one `HAddrMultiAir` + N
-        // T1 bridge pairs, replacing the legacy per-input loop.
-        let (haddr_constraints, haddr_publics) =
-            emit_full_shared_haddr(outer_n_cols, outer_log_rows);
-        constraints.extend(haddr_constraints);
-        public_columns.extend(haddr_publics);
-
-        // Block D — shared HAuth (OP-1.δ.2).
-        let hauth_opts = FullSharedHAuthOptions {
-            t2a_dst_override: options.t2a_dst_override,
-            t2b_dst_override: options.t2b_dst_override,
-        };
-        let (hauth_constraints, hauth_publics) = emit_full_shared_hauth(
-            outer_n_cols,
-            outer_log_rows,
-            tx_body_hash,
-            &hauth_opts,
-        );
-        constraints.extend(hauth_constraints);
-        public_columns.extend(hauth_publics);
-
-        // Pin per-input T2a destinations to declared auth tags —
-        // skipped when the caller supplied a `t2a_dst_override` (PR
-        // B.6: the override cell is expected to carry the correct
-        // value via the spine's `TxValidityCol::AuthTagHi/Lo` cells).
-        if options.t2a_dst_override.is_none() {
-            for input in 0..FRI_STATE_OPEN_N_INPUTS {
-                let (hi_col, lo_col) = auth_tag_dst_cols(input);
-                public_columns.push(PublicColumn::new(
-                    hi_col,
-                    pinned_row_programme(
-                        auth_tag_hi_dst_row(input),
-                        auth_tags[input][0],
-                        outer_n_rows,
-                    ),
-                ));
-                public_columns.push(PublicColumn::new(
-                    lo_col,
-                    pinned_row_programme(
-                        auth_tag_lo_dst_row(input),
-                        auth_tags[input][1],
-                        outer_n_rows,
-                    ),
-                ));
-            }
-        }
-
-        // OP-1.δ.3: pin the shared T2b dst to the declared
-        // `tx_body_hash` when no caller override retargets it (e.g.
-        // WithSpine binds the cell directly against the spine's
-        // wrap-output origin).
-        if options.t2b_dst_override.is_none() {
-            let (txb_hi_col, txb_lo_col) = tx_body_dst_cols();
-            public_columns.push(PublicColumn::new(
-                txb_hi_col,
-                pinned_row_programme(tx_body_hi_dst_row(), tx_body_hash[0], outer_n_rows),
-            ));
-            public_columns.push(PublicColumn::new(
-                txb_lo_col,
-                pinned_row_programme(tx_body_lo_dst_row(), tx_body_hash[1], outer_n_rows),
-            ));
-        }
-
         let air = CompositeAir::from_parts_with_publics(
             outer_log_rows,
             outer_n_cols,
@@ -547,11 +437,6 @@ impl TxValidityCompositeLeaf {
             combiner,
             open_witness,
             open_public_columns: open_publics,
-            secrets,
-            tx_body_hash,
-            auth_tags,
-            t2a_dst_override: options.t2a_dst_override,
-            t2b_dst_override: options.t2b_dst_override,
             output_side: options.output_side,
             output_side_eval_point,
             output_side_gamma,
@@ -569,12 +454,8 @@ impl TxValidityCompositeLeaf {
             &self.combiner,
             &self.open_witness,
             &self.open_public_columns,
-            &self.secrets,
-            self.tx_body_hash,
             TX_VALIDITY_LEAF_N_COLS,
             TX_VALIDITY_LEAF_LOG_ROWS,
-            self.t2a_dst_override,
-            self.t2b_dst_override,
             &self.output_side,
             self.output_side_eval_point,
             self.output_side_gamma,
@@ -589,11 +470,9 @@ impl TxValidityCompositeLeaf {
     }
 
     /// Decompose the composite into `(air, combiner, open_witness,
-    /// open_public_columns, secrets, tx_body_hash, auth_tags)`. Used
-    /// to embed a fully-built leaf composite inside
-    /// [`super::tx_validity_with_spine::TxValidityCompositeWithSpine`]
+    /// open_public_columns)`. Used to embed a fully-built leaf composite
+    /// inside [`super::tx_validity_with_spine::TxValidityCompositeWithSpine`]
     /// without re-instantiating its sub-AIRs.
-    #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
     ) -> (
@@ -601,47 +480,23 @@ impl TxValidityCompositeLeaf {
         FriStateCombinerComposite,
         FriStateOpenWitness,
         Vec<PublicColumn>,
-        [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        [Block128; 2],
-        [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
     ) {
         (
             self.air,
             self.combiner,
             self.open_witness,
             self.open_public_columns,
-            self.secrets,
-            self.tx_body_hash,
-            self.auth_tags,
         )
     }
 
     pub fn air(&self) -> &CompositeAir {
         &self.air
     }
-
-    pub fn secrets(&self) -> &[[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] {
-        &self.secrets
-    }
-
-    pub fn tx_body_hash(&self) -> [Block128; 2] {
-        self.tx_body_hash
-    }
-
-    pub fn auth_tags(&self) -> &[[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] {
-        &self.auth_tags
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn pinned_row_programme(row: usize, value: Block128, total_rows: usize) -> Vec<Block128> {
-    let mut out = vec![Block128::ZERO; total_rows];
-    out[row] = value;
-    out
-}
 
 fn clone_combiner_parts(
     c: &FriStateCombinerComposite,
@@ -669,8 +524,8 @@ fn build_open_inner_cols(
     cols
 }
 
-/// Stitch the leaf-band sub-traces (combiner, open, haddr×N_INPUTS,
-/// hauth×N_INPUTS) into `cols`. Caller pre-allocates `cols` with
+/// Stitch the leaf-band sub-traces (combiner + input/output `FriStateOpen`)
+/// into `cols`. Caller pre-allocates `cols` with
 /// `outer_n_cols >= TX_VALIDITY_LEAF_N_COLS` columns and
 /// `2^outer_log_rows` rows. Public-column overwrites are NOT performed
 /// here — caller does the final pass against its own composite air.
@@ -684,12 +539,8 @@ pub fn write_leaf_block_traces(
     combiner: &FriStateCombinerComposite,
     open_witness: &FriStateOpenWitness,
     open_public_columns: &[PublicColumn],
-    secrets: &[[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-    tx_body_hash: [Block128; 2],
     outer_n_cols: usize,
     outer_log_rows: usize,
-    t2a_dst_override: Option<[T2aDstOverride; FRI_STATE_OPEN_N_INPUTS]>,
-    t2b_dst_override: Option<T2bDstOverride>,
     output_side: &OutputSideSource,
     output_side_eval_point: [Block128; crate::airs::fri_state_open::FRI_STATE_OPEN_LOG_SLOTS],
     output_side_gamma: Block128,
@@ -730,25 +581,6 @@ pub fn write_leaf_block_traces(
         output_side_gamma,
     );
 
-    // OP-1.φ.1b: E.3.b new-state opener trace writes removed. The
-    // columns no longer exist in the leaf-band.
-
-    // Shared HAddr block (OP-1.δ.1).
-    let _ = write_full_shared_haddr_trace(cols, outer_n_cols, outer_log_rows, secrets);
-
-    // Shared HAuth block (OP-1.δ.2).
-    let hauth_opts = FullSharedHAuthOptions {
-        t2a_dst_override,
-        t2b_dst_override,
-    };
-    write_full_shared_hauth_trace(
-        cols,
-        outer_n_cols,
-        outer_log_rows,
-        secrets,
-        tx_body_hash,
-        &hauth_opts,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -762,8 +594,18 @@ mod tests {
         build_combiner_side_trace, extract_combiner_digest_fields, FriStateCombinerPreimage,
         COMBINER_PERM_LAYOUT,
     };
-    use crate::airs::fri_state_open::{FriStateOpenClaim, COL_OWNER_HI};
-    use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
+    use crate::airs::fri_state_open::{FriStateOpenClaim, FRI_STATE_OPEN_N_INPUTS};
+
+    /// Deterministic pseudo-address for opener fixtures. Address values
+    /// enter the leaf only through the `FriStateOpenClaim.owner_*`
+    /// fields; the AIR does not constrain them to be secret-derived.
+    /// (Address/auth-tag derivation lives in the external AuthGKR proof.)
+    fn mk_addr(seed: u128) -> [Block128; 2] {
+        [
+            Block128::from(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            Block128::from(seed.wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+        ]
+    }
 
     fn mk_combiner_preimage(seed: u8) -> FriStateCombinerPreimage {
         let mut r_val = [0u8; 32];
@@ -780,13 +622,6 @@ mod tests {
             r_owner_hi: r_hi,
             r_owner_lo: r_lo,
         }
-    }
-
-    fn mk_secret(seed: u128) -> [Block128; 2] {
-        [
-            Block128::from(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xA5A5_A5A5_A5A5_A5A5),
-            Block128::from(seed.wrapping_mul(0xBF58476D1CE4E5B9) ^ 0x5A5A_5A5A_5A5A_5A5A),
-        ]
     }
 
     fn mk_eval_point() -> [Block128; 4] {
@@ -848,29 +683,11 @@ mod tests {
             new_fields,
         );
 
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(11),
-            mk_secret(22),
-            mk_secret(33),
-            mk_secret(44),
-        ];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_address(secrets[0]),
-            native_address(secrets[1]),
-            native_address(secrets[2]),
-            native_address(secrets[3]),
-        ];
-
-        let tx_body_hash: [Block128; 2] = [
-            Block128::from(0x1111_2222_3333_4444_u128),
-            Block128::from(0x5555_6666_7777_8888_u128),
-        ];
-
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
+            mk_addr(11),
+            mk_addr(22),
+            mk_addr(33),
+            mk_addr(44),
         ];
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
@@ -898,21 +715,14 @@ mod tests {
             open_witness.expected_batched_claims(),
         );
 
-        TxValidityCompositeLeaf::new(
-            combiner,
-            open_air,
-            open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
-        )
+        TxValidityCompositeLeaf::new(combiner, open_air, open_witness)
     }
 
     #[test]
     fn layout_constants_agree() {
         // OP-1.φ.1b: E.3.b new-state opener bands removed. E.4's
         // booleans follow the combiner window indicator directly.
-        assert_eq!(SKEL_COMBINER_WINDOW_INDICATOR_COL, TX_VALIDITY_HAUTH_N_COLS);
+        assert_eq!(SKEL_COMBINER_WINDOW_INDICATOR_COL, TX_VALIDITY_SKELETON_N_COLS);
         assert_eq!(SKEL_IS_DEACTIVATION_COL, SKEL_COMBINER_WINDOW_INDICATOR_COL + 1);
         assert_eq!(SKEL_IS_ACTIVATION_COL, SKEL_IS_DEACTIVATION_COL + 1);
         // E.5 appends the `is_coinbase` public column.
@@ -927,27 +737,6 @@ mod tests {
         let comp = build();
         let trace = comp.build_trace();
         assert!(comp.air().check(&trace));
-    }
-
-    #[test]
-    fn t1_still_active_owner_tamper_rejects() {
-        // T1 ties must still fire.
-        let comp = build();
-        let mut cols = comp.build_trace().columns;
-        cols[SKEL_OPEN_COL_OFFSET + COL_OWNER_HI][0] =
-            cols[SKEL_OPEN_COL_OFFSET + COL_OWNER_HI][0] + Block128::ONE;
-        assert!(!comp.air().check(&Trace::new(cols)));
-    }
-
-    #[test]
-    fn t2a_still_active_auth_tag_tamper_rejects() {
-        // T2a ties must still fire.
-        let comp = build();
-        let mut cols = comp.build_trace().columns;
-        let (hi_col, _) = crate::composition::tx_validity_hauth::auth_tag_dst_cols(1);
-        cols[hi_col][auth_tag_hi_dst_row(1)] =
-            cols[hi_col][auth_tag_hi_dst_row(1)] + Block128::ONE;
-        assert!(!comp.air().check(&Trace::new(cols)));
     }
 
     // ---- E.4: activation / deactivation public columns ------------------
@@ -973,24 +762,8 @@ mod tests {
             prev_preimage, prev_fields, new_preimage, new_fields,
         );
 
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44),
-        ];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_address(secrets[0]),
-            native_address(secrets[1]),
-            native_address(secrets[2]),
-            native_address(secrets[3]),
-        ];
-        let tx_body_hash: [Block128; 2] = [
-            Block128::from(0x1111_2222_3333_4444_u128),
-            Block128::from(0x5555_6666_7777_8888_u128),
-        ];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
+            mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44),
         ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
@@ -1024,9 +797,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             LeafConstructionOptions {
                 output_side: OutputSideSource::FromBody {
                     outputs,
@@ -1112,24 +882,8 @@ mod tests {
             prev_preimage, prev_fields, new_preimage, new_fields,
         );
 
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44),
-        ];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_address(secrets[0]),
-            native_address(secrets[1]),
-            native_address(secrets[2]),
-            native_address(secrets[3]),
-        ];
-        let tx_body_hash: [Block128; 2] = [
-            Block128::from(0x1111_2222_3333_4444_u128),
-            Block128::from(0x5555_6666_7777_8888_u128),
-        ];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
+            mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44),
         ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = if has_spends {
             [
@@ -1169,9 +923,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             LeafConstructionOptions {
                 is_coinbase: true,
                 ..LeafConstructionOptions::default()

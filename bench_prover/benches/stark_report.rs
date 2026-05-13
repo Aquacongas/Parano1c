@@ -12,32 +12,42 @@
 //! — under its verifier-visible `PublicInputs` surface, plus the small
 //! set of component AIRs that dominate its prove-bucket profile.
 //!
-//! The tx-body Poseidon spine no longer runs inside the STARK — GKR
-//! owns the 59-perm permutation soundness and the STARK keeps only the
-//! two `tx_body_hash` lanes. The composite headline therefore already
-//! charges for the spine through the GKR bridge; there is no separate
-//! AIR-Merkle entry to report.
+//! The tx-body Poseidon spine and the per-input H_ADDR / H_AUTH
+//! sponges no longer run inside the STARK — GKR owns the 59-perm
+//! tx-body spine and the 20-perm AuthGKR (4 inputs × 5 slots), and the
+//! STARK keeps only the two `tx_body_hash` lanes plus the boundary MLE
+//! openings. The headline here measures the **full Phase 1 production
+//! path** for a single transaction: STARK + SpineGKR + AuthGKR, all
+//! stapled through one shared FRI boundary commitment and the
+//! `(r_B, v_B)` reduction per sub-protocol absorbed into the STARK's
+//! extras-transcript hook.
 //!
 //!   - `TxValidityCompositeWithSpine` — headline: full per-tx composite
-//!     (balance, range, H_ADDR, H_AUTH, GKR tx-body spine, FRI state
-//!     opening, combiner).
+//!     (balance, range, FRI state opening, combiner) wired through
+//!     **both** GKR sub-protocols (SpineGKR + AuthGKR). The bench
+//!     reports STARK-only baseline, STARK+SpineGKR, STARK+AuthGKR,
+//!     their GKR deltas, and the full production total.
 //!   - `PoseidonPermAir`  — one Poseidon2b permutation in isolation
-//!     (micro-baseline for HAddr / HAuth scaling).
-//!   - `HAddrAir`         — 2-field sponge, derive_address (2 perms).
-//!   - `HAuthAir`         — 4-field sponge, hash_auth_tag (3 perms).
+//!     (micro-baseline for residual Poseidon scaling).
 //!   - `RangeGateAir`     — u64 bit-decomposition sweep; raw engine
 //!                          scaling harness.
 
 use std::time::{Duration, Instant};
 
 use noid_air::{
-    build_perm_trace, emit_perm_all, Air, CompositeAir, HAddrAir, HAuthAir, RangeGateAir, Trace,
-    HADDR_LOG_ROWS, HADDR_N_COLS, HAUTH_LOG_ROWS, HAUTH_N_COLS, POSEIDON_PERM_LOG_ROWS,
-    POSEIDON_PERM_N_COLS,
+    build_perm_trace, emit_perm_all, Air, CompositeAir, RangeGateAir, Trace,
+    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
 };
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::{NUM_QUERIES, TAU};
+use noid_gkr::{
+    compute_auth_boundary, compute_tx_body_hash, prove_spine_killshot, verify_spine_killshot,
+    AuthCircuit, AuthInputs, SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_INPUTS,
+};
+use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_stark::auth::{prove_air_with_auth, verify_air_with_auth, StarkProofWithAuth};
+use noid_stark::spine::{prove_air_with_spine, verify_air_with_spine, StarkProofWithSpine};
 use noid_stark::{
     padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings, StarkProof,
     VerifyTimings,
@@ -378,7 +388,7 @@ fn bench_range(label: &'static str, log_rows: usize) -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// Poseidon2b primitives — Perm / HAddr / HAuth
+// Poseidon2b primitives — Perm (HAddr / HAuth evacuated to GKR)
 // ---------------------------------------------------------------------------
 
 fn bench_poseidon_perm() -> AirRow {
@@ -407,65 +417,81 @@ fn bench_poseidon_perm() -> AirRow {
     row
 }
 
-fn bench_haddr() -> AirRow {
-    use noid_air::{build_haddr_trace, extract_haddr_output};
-    let secret = [
-        Block128::from(0xDECAF_CAFE_BABEu128 ^ 0xA5A5_A5A5_A5A5_A5A5),
-        Block128::from(0xDECAF_CAFE_BABFu128 ^ 0x5A5A_5A5A_5A5A_5A5A),
-    ];
-    let expected = extract_haddr_output(&build_haddr_trace(secret));
-    let air = HAddrAir::new(expected);
-    let trace = air.build_trace(secret);
-    let row = bench_air(
-        "HAddrAir (2-field sponge, derive_address, 2 perms)",
-        Some("    secret is witness-only; all boundary ties closed".to_string()),
-        air,
-        trace,
-        SAMPLES,
-        || "HAddrAir native check failed".to_string(),
-    );
-    assert_eq!(row.n_cols, HADDR_N_COLS);
-    assert_eq!(row.log_rows, HADDR_LOG_ROWS);
-    row
-}
-
-fn bench_hauth() -> AirRow {
-    use noid_air::{build_hauth_trace, extract_hauth_output};
-    let secret = [
-        Block128::from(0xA07_5EED_DEAD_BEEFu128),
-        Block128::from(0xFACE_FEED_CAFE_F00Du128),
-    ];
-    let txbody = [
-        Block128::from(0x5C0FF_B0D_F00D_FACEu128),
-        Block128::from(0xBEEF_DEAD_BABE_CAFEu128),
-    ];
-    let expected = extract_hauth_output(&build_hauth_trace(secret, txbody));
-    let air = HAuthAir::new(txbody, expected);
-    let trace = air.build_trace(secret, txbody);
-    let row = bench_air(
-        "HAuthAir (4-field sponge, hash_auth_tag, 3 perms)",
-        Some("    interior-only; capacity IV pinned via PublicColumn".to_string()),
-        air,
-        trace,
-        SAMPLES,
-        || "HAuthAir native check failed".to_string(),
-    );
-    assert_eq!(row.n_cols, HAUTH_N_COLS);
-    assert_eq!(row.log_rows, HAUTH_LOG_ROWS);
-    row
-}
-
 // ---------------------------------------------------------------------------
-// Per-tx prover path — TxValidityCompositeWithSpine (headline)
+// Per-tx prover path — TxValidityCompositeWithSpine + SpineGKR + AuthGKR
 //
-// Full unified composite proving balance, range, H_ADDR, H_AUTH,
-// the GKR tx-body spine, and the FRI state opening / combiner under
-// the verifier-visible PublicInputs surface (prev_state_root,
-// new_state_root, tx_body_hash, fee, coinbase_credit, log_slots,
-// is_activation[*], is_deactivation[*]).
+// Full Phase 1/1 production path for a single transaction:
+//   STARK   : balance, range, boundary pins, FRI state opening, combiner
+//   SpineGKR: 59-perm tx-body spine Merkle (evacuated from AIR)
+//   AuthGKR : 4 × 5 Poseidon2b sponge slots (H_ADDR + H_AUTH per input)
+//
+// All three are stapled through the shared FRI boundary commitment
+// channel + the `(r_B, v_B)` reduction absorbed into the STARK's
+// extras-transcript hook. We measure three buckets so the Phase 1/1 GKR
+// win is visible:
+//
+//   - STARK-only              : baseline `prove_air` / `verify_air`
+//   - STARK + SpineGKR        : `prove_air_with_spine` + verify
+//   - STARK + AuthGKR         : `prove_air_with_auth`  + verify
+//
+// GKR-only deltas are derived by subtraction (with-GKR − baseline).
 // ---------------------------------------------------------------------------
 
-fn bench_per_tx_composite() -> AirRow {
+struct CompositePhase1Row {
+    log_rows: usize,
+    n_cols: usize,
+    n_shifted: usize,
+
+    // STARK-only baseline.
+    prove_stark: Duration,
+    verify_stark: Duration,
+    stark_proof_bytes: usize,
+
+    // STARK + SpineGKR.
+    prove_with_spine: Duration,
+    verify_with_spine: Duration,
+
+    // STARK + AuthGKR.
+    prove_with_auth: Duration,
+    verify_with_auth: Duration,
+}
+
+fn spine_inputs_from_composite(
+    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+) -> SpineInputs {
+    let pins = comp.boundary_pins();
+    SpineInputs {
+        prev_state_root: pins.prev_state_root,
+        fee_leaf: pins.fee_leaf,
+        input_leaves: pins.input_leaf_absorb,
+        output_leaves: pins.output_leaf_absorb,
+        is_coinbase_leaf: pins.is_coinbase_leaf,
+        pad_leaf: [Block128::ZERO; 2],
+    }
+}
+
+fn auth_inputs_from_composite(
+    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+) -> AuthInputs {
+    let circuit = AuthCircuit::build();
+    let spend_secret: [[Block128; 2]; N_AUTH_INPUTS] = [
+        [Block128::from(0xA1u128), Block128::from(0xA2u128)],
+        [Block128::from(0xB1u128), Block128::from(0xB2u128)],
+        [Block128::from(0xC1u128), Block128::from(0xC2u128)],
+        [Block128::from(0xD1u128), Block128::from(0xD2u128)],
+    ];
+    let tx_body_hash = comp.tx_body_hash_fields();
+    let (expected_address, expected_auth_tag) =
+        compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
+    AuthInputs {
+        spend_secret,
+        tx_body_hash,
+        expected_address,
+        expected_auth_tag,
+    }
+}
+
+fn bench_per_tx_composite_phase1() -> CompositePhase1Row {
     use noid_air::composition::tx_validity_with_spine::fixture;
 
     let comp = fixture::build_honest_realistic();
@@ -473,17 +499,184 @@ fn bench_per_tx_composite() -> AirRow {
     comp.assert_public_inputs_consistent(&pi);
 
     let trace = comp.build_trace();
-    let air = comp.air;
+    let spine_inputs = spine_inputs_from_composite(&comp);
+    let auth_inputs = auth_inputs_from_composite(&comp);
+    let air = comp.air();
 
-    bench_air_with_pi(
-        "TxValidityCompositeWithSpine (full per-tx prover path, PublicInputs-bound)",
-        Some("    fixture: 2 live in / 4 live out, fee 50, balance 150 = 100 + 50".to_string()),
-        air,
-        trace,
-        pi,
-        SAMPLES.min(3),
-        || "TxValidityCompositeWithSpine native check failed".to_string(),
-    )
+    assert!(
+        air.check(&trace),
+        "TxValidityCompositeWithSpine native check failed"
+    );
+
+    // STARK-only baseline.
+    let prove_stark = time(|| {
+        let _ = prove_air(air, &trace, &pi).unwrap();
+    });
+    let stark_proof = prove_air(air, &trace, &pi).unwrap();
+    let verify_buckets = collect_verify_buckets(air, &pi, &stark_proof, SAMPLES);
+    let verify_stark = verify_buckets.total();
+
+    let log_len = padded_log_len(air.log_rows());
+    let n_shifted = air.shifted_column_indices().len();
+    let stark_proof_bytes =
+        estimate_stark_proof_bytes(&stark_proof, log_len, air.n_columns(), n_shifted);
+
+    // STARK + SpineGKR.
+    let prove_with_spine = time(|| {
+        let _: StarkProofWithSpine =
+            prove_air_with_spine(air, &trace, &pi, &spine_inputs).unwrap();
+    });
+    let with_spine_proof =
+        prove_air_with_spine(air, &trace, &pi, &spine_inputs).unwrap();
+    let verify_with_spine = time(|| {
+        verify_air_with_spine(air, &pi, &spine_inputs, &with_spine_proof)
+            .expect("verify spine");
+    });
+
+    // STARK + AuthGKR.
+    let prove_with_auth = time(|| {
+        let _: StarkProofWithAuth =
+            prove_air_with_auth(air, &trace, &pi, &auth_inputs).unwrap();
+    });
+    let with_auth_proof =
+        prove_air_with_auth(air, &trace, &pi, &auth_inputs).unwrap();
+    let verify_with_auth = time(|| {
+        verify_air_with_auth(air, &pi, &auth_inputs, &with_auth_proof)
+            .expect("verify auth");
+    });
+
+    let log_rows = air.log_rows();
+    let n_cols = air.n_columns();
+    CompositePhase1Row {
+        log_rows,
+        n_cols,
+        n_shifted,
+        prove_stark,
+        verify_stark,
+        stark_proof_bytes,
+        prove_with_spine,
+        verify_with_spine,
+        prove_with_auth,
+        verify_with_auth,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kill-Shot spine — standalone bench (pure GKR, no STARK bridge yet).
+//
+// Stage 1.5.7 gates:
+//   - Spine prove  ≤  50 ms
+//   - Spine verify ≤   2 ms
+//   - Spine bytes  ≤  5 KB
+//
+// Targets are reported beside the measured values so a regression is
+// visible at a glance. We don't `panic!` on miss: cold dev hardware
+// is slower than CI; call sites that need a hard gate should grep
+// the printed line and fail externally.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct KillShotRow {
+    prove: Duration,
+    verify: Duration,
+    bytes: usize,
+}
+
+fn bench_spine_killshot(
+    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+) -> KillShotRow {
+    let circuit = SpineCircuit::build();
+    let inputs = spine_inputs_from_composite(comp);
+    let claimed = compute_tx_body_hash(&circuit, &inputs);
+
+    let prove = time(|| {
+        let mut ch = Poseidon2bChannel::new();
+        let _: (SpineProofKillShot, _) =
+            prove_spine_killshot(&circuit, &inputs, claimed, &mut ch);
+    });
+
+    let mut ch_p = Poseidon2bChannel::new();
+    let (proof, _) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
+    let bytes = proof.byte_len();
+
+    let verify = time(|| {
+        let mut ch_v = Poseidon2bChannel::new();
+        let _ = verify_spine_killshot(&proof, &circuit, &inputs, claimed, &mut ch_v)
+            .expect("kill-shot verify");
+    });
+
+    KillShotRow {
+        prove,
+        verify,
+        bytes,
+    }
+}
+
+fn print_killshot_row(r: &KillShotRow) {
+    println!("  [phase1k] SpineGKR Kill-Shot — pure GKR (no STARK bridge yet)");
+    println!("  +------------------------------------------------------------------------------+");
+    println!(
+        "    Spine prove  {}   gate ≤   50 ms",
+        fmt_ms(r.prove),
+    );
+    println!(
+        "    Spine verify {}   gate ≤    2 ms",
+        fmt_ms(r.verify),
+    );
+    println!(
+        "    Spine bytes  {}     gate ≤    5 KB",
+        fmt_bytes(r.bytes),
+    );
+    println!();
+}
+
+fn print_phase1_row(r: &CompositePhase1Row) {
+    println!("  [phase1 ] TxValidityCompositeWithSpine + SpineGKR + AuthGKR (full per-tx production path)");
+    println!("  +------------------------------------------------------------------------------+");
+    println!(
+        "  | log_rows={:>3}  n_cols={:>4}  shifted={:>2}  STARK proof(estimated)={} |",
+        r.log_rows,
+        r.n_cols,
+        r.n_shifted,
+        fmt_bytes(r.stark_proof_bytes),
+    );
+    println!("  |   fixture: 2 live in / 4 live out, fee 50, balance 150 = 100 + 50           |");
+    println!("  +------------------------------------------------------------------------------+");
+
+    let spine_prove_delta = r.prove_with_spine.saturating_sub(r.prove_stark);
+    let auth_prove_delta = r.prove_with_auth.saturating_sub(r.prove_stark);
+    let spine_verify_delta = r.verify_with_spine.saturating_sub(r.verify_stark);
+    let auth_verify_delta = r.verify_with_auth.saturating_sub(r.verify_stark);
+    // Full production path total: STARK is shared between the two
+    // with-GKR runs — it's paid once. GKR-only deltas add linearly.
+    let prove_full = r.prove_stark + spine_prove_delta + auth_prove_delta;
+    let verify_full = r.verify_stark + spine_verify_delta + auth_verify_delta;
+
+    println!(
+        "    STARK only         prove {}  verify {}",
+        fmt_ms(r.prove_stark),
+        fmt_ms(r.verify_stark),
+    );
+    println!(
+        "    STARK + SpineGKR   prove {}  verify {}   (spine delta: prove {} / verify {})",
+        fmt_ms(r.prove_with_spine),
+        fmt_ms(r.verify_with_spine),
+        fmt_ms(spine_prove_delta),
+        fmt_ms(spine_verify_delta),
+    );
+    println!(
+        "    STARK + AuthGKR    prove {}  verify {}   (auth  delta: prove {} / verify {})",
+        fmt_ms(r.prove_with_auth),
+        fmt_ms(r.verify_with_auth),
+        fmt_ms(auth_prove_delta),
+        fmt_ms(auth_verify_delta),
+    );
+    println!(
+        "    Phase 1/1 TOTAL      prove {}  verify {}   (STARK + SpineGKR + AuthGKR)",
+        fmt_ms(prove_full),
+        fmt_ms(verify_full),
+    );
+    println!();
 }
 
 // ---------------------------------------------------------------------------
@@ -510,8 +703,8 @@ fn print_banner() {
     println!();
     println!("  Sections:");
     println!("    Engine scaling              (RangeGate sweep)");
-    println!("    Poseidon2b hashes           (Perm / HAddr / HAuth)");
-    println!("    Per-tx prover path          (TxValidityCompositeWithSpine, headline)");
+    println!("    Poseidon2b hashes           (Perm)");
+    println!("    Per-tx prover path          (STARK + SpineGKR + AuthGKR, Phase 1/1)");
     println!();
 }
 
@@ -522,33 +715,41 @@ fn print_section(title: &str) {
     println!();
 }
 
-fn print_footer(prod: &AirRow) {
+fn print_footer(prod: &CompositePhase1Row) {
     print_section("Summary");
+
+    let spine_prove_delta = prod.prove_with_spine.saturating_sub(prod.prove_stark);
+    let auth_prove_delta = prod.prove_with_auth.saturating_sub(prod.prove_stark);
+    let spine_verify_delta = prod.verify_with_spine.saturating_sub(prod.verify_stark);
+    let auth_verify_delta = prod.verify_with_auth.saturating_sub(prod.verify_stark);
+    let prove_full = prod.prove_stark + spine_prove_delta + auth_prove_delta;
+    let verify_full = prod.verify_stark + spine_verify_delta + auth_verify_delta;
+
     println!(
-        "  Per-tx prover path:  prove={}  verify={}  proof≈{}",
-        fmt_ms(prod.prove_total),
-        fmt_ms(prod.verify.total()),
-        fmt_bytes(prod.proof_bytes),
+        "  Phase 1/1 per-tx prover (full production path):  prove={}  verify={}",
+        fmt_ms(prove_full),
+        fmt_ms(verify_full),
     );
-    println!("  composite log_rows = {}  |  n_cols = {}", prod.log_rows, prod.n_cols);
-    println!();
-    println!("  Optimisation targets (by share of prove wall-clock):");
-    let p = &prod.prove_buckets;
-    let mut buckets = [
-        ("commit          ", p.commit),
-        ("transcript + sc ", p.transcript_sumcheck),
-        ("ladder sumcheck ", p.ladder_sumcheck),
-        ("multipoint + FRI", p.multipoint_fri),
-    ];
-    buckets.sort_by(|a, b| b.1.cmp(&a.1));
-    let total = p.total();
-    for (name, dur) in &buckets {
-        println!(
-            "    {name}  {:>10}  ({:>5.1}%)",
-            fmt_ms(*dur),
-            percent(*dur, total)
-        );
-    }
+    println!(
+        "    STARK proper           prove={}  verify={}  proof(STARK only)≈{}",
+        fmt_ms(prod.prove_stark),
+        fmt_ms(prod.verify_stark),
+        fmt_bytes(prod.stark_proof_bytes),
+    );
+    println!(
+        "    SpineGKR (59 perms)    prove={}  verify={}",
+        fmt_ms(spine_prove_delta),
+        fmt_ms(spine_verify_delta),
+    );
+    println!(
+        "    AuthGKR  (4×5 perms)   prove={}  verify={}",
+        fmt_ms(auth_prove_delta),
+        fmt_ms(auth_verify_delta),
+    );
+    println!(
+        "  composite log_rows = {}  |  n_cols = {}",
+        prod.log_rows, prod.n_cols
+    );
     println!();
     println!("  Reproduce: cargo bench --bench stark_report");
     println!();
@@ -570,11 +771,16 @@ fn main() {
 
     eprintln!("  Poseidon2b ...");
     let perm_row = bench_poseidon_perm();
-    let haddr_row = bench_haddr();
-    let hauth_row = bench_hauth();
 
-    eprintln!("  per-tx prover path ...");
-    let l_row = bench_per_tx_composite();
+    eprintln!("  per-tx prover path (STARK + SpineGKR + AuthGKR) ...");
+    let l_row = bench_per_tx_composite_phase1();
+
+    eprintln!("  spine kill-shot (pure GKR) ...");
+    let killshot_row = {
+        use noid_air::composition::tx_validity_with_spine::fixture;
+        let comp = fixture::build_honest_realistic();
+        bench_spine_killshot(&comp)
+    };
     eprintln!();
 
     print_section("Engine scaling");
@@ -584,11 +790,12 @@ fn main() {
 
     print_section("Poseidon2b hashes");
     print_row("perm     ", &perm_row);
-    print_row("haddr    ", &haddr_row);
-    print_row("hauth    ", &hauth_row);
 
-    print_section("Per-tx prover path (full PublicInputs surface)");
-    print_row("per-tx   ", &l_row);
+    print_section("Per-tx prover path ( Phase 1/1 production path)");
+    print_phase1_row(&l_row);
+
+    print_section("SpineGKR Kill-Shot (pure GKR, Stage 1.5.7 gates; current multiplier — see 1.5.8)");
+    print_killshot_row(&killshot_row);
 
     print_footer(&l_row);
 }

@@ -21,9 +21,8 @@ use crate::airs::tx_body_merkle::{TxBodyMerkleBoundaryPins, TXBODY_MERKLE_N_PERM
 use crate::airs::tx_body_spine::{spine_n_cols, TxBodySpineComposite, SPINE_LOG_ROWS};
 use crate::composition::spine_adapter::SpineEmbeddingLayout;
 use crate::composition::tx_validity_leaf::{
-    write_leaf_block_traces, LeafConstructionOptions, T2aDstOverride, T2bDstOverride,
-    TxValidityCompositeLeaf, SKEL_IS_COINBASE_COL, TX_VALIDITY_LEAF_LOG_ROWS,
-    TX_VALIDITY_LEAF_N_COLS,
+    write_leaf_block_traces, LeafConstructionOptions, TxValidityCompositeLeaf,
+    SKEL_IS_COINBASE_COL, TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
 };
 use crate::gates::const_column::PublicColumn;
 use crate::gates::selector::SelectorGate;
@@ -135,25 +134,6 @@ pub struct TxValidityCompositeWithSpine {
     combiner: FriStateCombinerComposite,
     open_witness: FriStateOpenWitness,
     open_public_columns: Vec<PublicColumn>,
-    secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-    tx_body_hash: [Block128; 2],
-    /// Per-input T2a dst cells inside the embedded spine block,
-    /// pointing at `TxValidityCol::AuthTagHi/Lo[i]`. The HAuth-block
-    /// bridge dst is retargeted here; the leaf-band's per-input T2a
-    /// `PublicColumn` programmes are suppressed at construction.
-    t2a_override: [T2aDstOverride; FRI_STATE_OPEN_N_INPUTS],
-    /// Shared T2b dst cell inside the embedded spine block, pointing
-    /// at the canonical `wrap_output_outer_cell(lane)` origin of
-    /// `tx_body_hash`. The HAuth AIR's `tx_body_col[0..2]` constant
-    /// column is bridged here by a single pair of bridges; the
-    /// leaf-band's default T2b `PublicColumn` pin is suppressed at
-    /// construction so the wrap-output cell is the single source of
-    /// truth for `tx_body_hash`.
-    t2b_override: T2bDstOverride,
-    /// Per-input declared auth tags. Needed at `build_trace`-time to
-    /// restore the spine `AuthTagHi/Lo` cells after the spine inner
-    /// trace clobbers the leaf-band's writes.
-    auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
     /// E.2.b.comp-3: output-side witness source used at construction.
     /// Mirrored into `build_trace` so the embedded leaf-band honest
     /// sub-trace matches the constraints emitted by the composite AIR.
@@ -207,9 +187,6 @@ impl TxValidityCompositeWithSpine {
         combiner: FriStateCombinerComposite,
         open_air: FriStateOpenAir,
         open_witness: FriStateOpenWitness,
-        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        tx_body_hash: [Block128; 2],
-        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
     ) -> Self {
         Self::new_with_options(
             boundary_pins,
@@ -221,9 +198,6 @@ impl TxValidityCompositeWithSpine {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions::default(),
         )
     }
@@ -240,9 +214,6 @@ impl TxValidityCompositeWithSpine {
         combiner: FriStateCombinerComposite,
         open_air: FriStateOpenAir,
         open_witness: FriStateOpenWitness,
-        secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
-        tx_body_hash: [Block128; 2],
-        auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS],
         options: WithSpineOptions,
     ) -> Self {
         if options.is_coinbase {
@@ -273,28 +244,8 @@ impl TxValidityCompositeWithSpine {
             SpineEmbeddingLayout::new(SPINE_BLOCK_OUTER_BASE, outer_n_cols, outer_log_rows)
                 .expect("spine layout must fit by construction");
 
-        // Atomic T2a retarget. Compute per-input dst cells
-        // at the spine's `TxValidityCol::AuthTagHi/Lo[i]` (composite
-        // cols 8/9, row i). With an empty `TxBody`, the spine's
-        // TxValidityAir build-trace leaves these cells at zero and
-        // imposes no constraint on them when `InputValid[i] = 0`,
-        // so `build_trace` can restore them to
-        // `native_auth_tag(secrets[i], tx_body_hash)` after the
-        // spine inner copy. The HAuth bridge ties each cell to the
-        // HAuth squeeze; both sides equal the same MAC.
-        let mut t2a_override =
-            [T2aDstOverride { hi_col: 0, hi_row: 0, lo_col: 0, lo_row: 0 };
-                FRI_STATE_OPEN_N_INPUTS];
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let hi = spine_layout.auth_tag_hi_outer_cell(i);
-            let lo = spine_layout.auth_tag_lo_outer_cell(i);
-            t2a_override[i] = T2aDstOverride {
-                hi_col: hi.col,
-                hi_row: hi.row,
-                lo_col: lo.col,
-                lo_row: lo.row,
-            };
-        }
+        // The spine's `AuthTagHi/Lo[i]` cells are bound solely by the
+        // spine's own MAC gate against the external AuthGKR pins.
 
         // Build the leaf composite and consume it for its constraints /
         // publics + witness pieces required to rebuild the leaf-band
@@ -313,44 +264,17 @@ impl TxValidityCompositeWithSpine {
             outputs: body.outputs.clone(),
             prev_lane_openings: [Block128::ZERO; 3],
         };
-        // OP-1.δ.3: retarget the shared T2b onto the spine's
-        // wrap-output outer cell. With the HAuth AIR carrying
-        // `tx_body_col[0..2]` as a constant witness column, a single
-        // bridge suffices to bind it to the canonical
-        // `tx_body_hash = wrap_output_outer_cell(lane)` origin.
-        let wrap_hi = spine_layout.wrap_output_outer_cell(0);
-        let wrap_lo = spine_layout.wrap_output_outer_cell(1);
-        let t2b_override = T2bDstOverride {
-            hi_col: wrap_hi.col,
-            hi_row: wrap_hi.row,
-            lo_col: wrap_lo.col,
-            lo_row: wrap_lo.row,
-        };
-
         let leaf = TxValidityCompositeLeaf::new_with_options(
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             LeafConstructionOptions {
-                t2a_dst_override: Some(t2a_override),
-                t2b_dst_override: Some(t2b_override),
                 output_side: output_side.clone(),
                 is_coinbase: options.is_coinbase,
                 ..LeafConstructionOptions::default()
             },
         );
-        let (
-            leaf_air,
-            combiner,
-            open_witness,
-            open_public_columns,
-            secrets,
-            tx_body_hash,
-            auth_tags,
-        ) = leaf.into_parts();
+        let (leaf_air, combiner, open_witness, open_public_columns) = leaf.into_parts();
         let (leaf_log_rows, leaf_n_cols, leaf_constraints, leaf_publics) = leaf_air.into_parts();
         assert_eq!(leaf_log_rows, outer_log_rows);
         assert_eq!(leaf_n_cols, LEAF_BAND_RESERVED);
@@ -667,11 +591,6 @@ impl TxValidityCompositeWithSpine {
             combiner,
             open_witness,
             open_public_columns,
-            secrets,
-            tx_body_hash,
-            t2a_override,
-            t2b_override,
-            auth_tags,
             output_side,
             is_coinbase: options.is_coinbase,
             coinbase_credit: options.coinbase_credit,
@@ -695,12 +614,8 @@ impl TxValidityCompositeWithSpine {
             &self.combiner,
             &self.open_witness,
             &self.open_public_columns,
-            &self.secrets,
-            self.tx_body_hash,
             outer_n_cols,
             TX_VALIDITY_WITH_SPINE_LOG_ROWS,
-            Some(self.t2a_override),
-            Some(self.t2b_override),
             &self.output_side,
             self.open_witness.eval_point,
             self.open_witness.gamma,
@@ -722,37 +637,6 @@ impl TxValidityCompositeWithSpine {
         let block_base = self.spine_layout.block_base();
         for (i, src) in inner_cols.into_iter().enumerate() {
             cols[block_base + i] = src;
-        }
-
-        // Restore the per-input T2a dst cells.
-        // Dummy slot: spine left cell at zero and the
-        // `InputValid[i] * (auth_tag - MAC) == 0` gate is vacuous, so
-        // we overwrite with the declared MAC.
-        // Live slot: spine already wrote `input.auth_tag.as_fields()`
-        // and its MAC gate enforces the cell equals
-        // `native_auth_tag(secret_i, tx_body_hash) == self.auth_tags[i]`.
-        // We assert coincidence instead of blindly overwriting —
-        // defence-in-depth: both gates see the same honest cell.
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let dst = &self.t2a_override[i];
-            let is_live = self
-                .body
-                .inputs
-                .get(i)
-                .map_or(false, |inp| inp.valid);
-            if is_live {
-                assert_eq!(
-                    cols[dst.hi_col][dst.hi_row], self.auth_tags[i][0],
-                    "input {i}: spine-written AuthTagHi must equal native MAC",
-                );
-                assert_eq!(
-                    cols[dst.lo_col][dst.lo_row], self.auth_tags[i][1],
-                    "input {i}: spine-written AuthTagLo must equal native MAC",
-                );
-            } else {
-                cols[dst.hi_col][dst.hi_row] = self.auth_tags[i][0];
-                cols[dst.lo_col][dst.lo_row] = self.auth_tags[i][1];
-            }
         }
 
         // Final pass: overwrite every declared public column with its
@@ -785,7 +669,7 @@ impl TxValidityCompositeWithSpine {
 
     /// Stage 6 — tx body hash the trace was built with.
     pub fn tx_body_hash_fields(&self) -> [Block128; 2] {
-        self.tx_body_hash
+        self.boundary_pins.tx_body_hash
     }
 
     /// Stage 6 — declared fee the balance block was pinned to.
@@ -829,14 +713,6 @@ impl TxValidityCompositeWithSpine {
             out[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
             out
         };
-
-        // Sanity: the trace was built with `self.tx_body_hash` and
-        // `boundary_pins.tx_body_hash` must match — both are the Stage 1
-        // O2 tie target.
-        assert_eq!(
-            self.boundary_pins.tx_body_hash, self.tx_body_hash,
-            "Stage 6: boundary_pins.tx_body_hash must equal composite tx_body_hash",
-        );
 
         // A1a — count live slots from the TxBody the trace was built
         // with. Matches the `is_live` logic used for T2a overrides and
@@ -894,7 +770,7 @@ impl TxValidityCompositeWithSpine {
         noid_tx::PublicInputs {
             prev_state_root: pack(self.combiner.expected_prev_state_root_fields()),
             new_state_root: pack(self.combiner.expected_new_state_root_fields()),
-            tx_body_hash: TxBodyHash(pack(self.tx_body_hash)),
+            tx_body_hash: TxBodyHash(pack(self.boundary_pins.tx_body_hash)),
             fee: self.balance_fee as u128,
             n_live_inputs,
             n_live_outputs,
@@ -974,12 +850,34 @@ pub mod fixture {
         COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
-    use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
     use noid_poseidon2b::primitives::{
-        hash_input_leaf as native_hash_input_leaf,
+        derive_address, hash_auth_tag, hash_input_leaf as native_hash_input_leaf,
         hash_output_leaf as native_hash_output_leaf, hash_tx_body as native_hash_tx_body,
-        TXBODY_INPUTS as P_TXBODY_INPUTS, TXBODY_OUTPUTS as P_TXBODY_OUTPUTS,
+        SpendSecret, TxBodyHash as PrimTxBodyHash, TXBODY_INPUTS as P_TXBODY_INPUTS,
+        TXBODY_OUTPUTS as P_TXBODY_OUTPUTS,
     };
+
+    fn fields_to_bytes(fields: [Block128; 2]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&fields[0].to_u128().to_le_bytes());
+        out[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
+        out
+    }
+
+    pub(super) fn native_address(secret: [Block128; 2]) -> [Block128; 2] {
+        derive_address(&SpendSecret(fields_to_bytes(secret))).as_fields()
+    }
+
+    pub(super) fn native_auth_tag(
+        secret: [Block128; 2],
+        tx_body_hash: [Block128; 2],
+    ) -> [Block128; 2] {
+        hash_auth_tag(
+            &SpendSecret(fields_to_bytes(secret)),
+            &PrimTxBodyHash(fields_to_bytes(tx_body_hash)),
+        )
+        .as_fields()
+    }
 
     fn owner_from_fields(hi: Block128, lo: Block128) -> noid_poseidon2b::primitives::Address {
         let mut bytes = [0u8; 32];
@@ -1174,14 +1072,6 @@ pub mod fixture {
             native_address(secrets[3]),
         ];
 
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
@@ -1218,9 +1108,6 @@ pub mod fixture {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
         )
     }
 
@@ -1448,9 +1335,6 @@ pub mod fixture {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
         )
     }
 }
@@ -1468,7 +1352,7 @@ mod tests {
         build_combiner_side_trace, extract_combiner_digest_fields, COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
-    use crate::composition::tx_validity_hauth::{native_address, native_auth_tag};
+    use super::fixture::native_address;
 
     fn build_honest_all_active() -> TxValidityCompositeWithSpine {
         // 4-active-spend / 8-output honest composite. Exercises every
@@ -1508,14 +1392,6 @@ mod tests {
             native_address(secrets[3]),
         ];
 
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(101, 0, addrs[0]),
@@ -1552,9 +1428,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
         )
     }
 
@@ -1574,19 +1447,6 @@ mod tests {
             comp.air().check(&trace),
             "realistic non-empty TxBody honest trace must accept",
         );
-    }
-
-    /// D.2a — tampering a live `TxInput.auth_tag` off its native MAC
-    /// must be caught by the restore-loop's `debug_assert_eq!`.
-    #[test]
-    #[should_panic(expected = "input 0: spine-written AuthTagHi must equal native MAC")]
-    fn d2a_restore_guard_detects_live_auth_tag_mismatch() {
-        use noid_poseidon2b::primitives::AuthTag;
-        let mut comp = build_honest_realistic();
-        let mut bad = comp.body.inputs[0].auth_tag.0;
-        bad[0] ^= 0xFF;
-        comp.body.inputs[0].auth_tag = AuthTag(bad);
-        let _ = comp.build_trace();
     }
 
     #[test]
@@ -1650,139 +1510,6 @@ mod tests {
         let mut trace = comp.build_trace();
         let mask_col = comp.spine_layout().txv_live_mask_outer_col();
         trace.columns[mask_col][0] = trace.columns[mask_col][0] + Block128::ONE;
-        assert!(!comp.air().check(&trace));
-    }
-
-    #[test]
-    fn t2a_retarget_dst_hi_tamper_rejects_per_input() {
-        // Per-input T2a-hi dst is the spine's
-        // `auth_tag_hi_outer_cell(i)` (= `TxValidityCol::AuthTagHi`
-        // at row i). Tampering it after `build_trace`'s final pass
-        // breaks the HAuth bridge tie (`spine cell == HAuth squeeze
-        // == native_auth_tag(secrets[i], tx_body_hash)`).
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let cell = comp.spine_layout().auth_tag_hi_outer_cell(i);
-            trace.columns[cell.col][cell.row] =
-                trace.columns[cell.col][cell.row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T2a-hi tamper at input {i} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t2a_retarget_dst_lo_tamper_rejects_per_input() {
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let cell = comp.spine_layout().auth_tag_lo_outer_cell(i);
-            trace.columns[cell.col][cell.row] =
-                trace.columns[cell.col][cell.row] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T2a-lo tamper at input {i} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t2a_retarget_cells_carry_native_auth_tags() {
-        // Sanity: after honest `build_trace`, each spine T2a dst
-        // carries `native_auth_tag(secrets[i], tx_body_hash)`. This
-        // is the value the bridge ties HAuth squeeze to.
-        let comp = build_honest();
-        let trace = comp.build_trace();
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let expected = native_auth_tag(comp.secrets[i], comp.tx_body_hash);
-            let hi = comp.spine_layout().auth_tag_hi_outer_cell(i);
-            let lo = comp.spine_layout().auth_tag_lo_outer_cell(i);
-            assert_eq!(trace.columns[hi.col][hi.row], expected[0], "input {i} hi");
-            assert_eq!(trace.columns[lo.col][lo.row], expected[1], "input {i} lo");
-        }
-    }
-
-    #[test]
-    fn leaf_band_t2a_pi_pin_columns_are_no_longer_emitted() {
-        // With T2a retarget the leaf composite no longer
-        // emits `PublicColumn::pinned_row_programme` programmes for
-        // T2a dsts at the old leaf-band cols. Verify the legacy-dst
-        // column is NOT a declared public column.
-        use crate::composition::tx_validity_hauth::auth_tag_dst_cols;
-        let comp = build_honest();
-        let publics = comp.air().public_columns();
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let (hi_col, lo_col) = auth_tag_dst_cols(i);
-            assert!(
-                publics.iter().all(|pc| pc.col != hi_col),
-                "T2a hi dst col {hi_col} (input {i}) must not be a PublicColumn after retarget"
-            );
-            assert!(
-                publics.iter().all(|pc| pc.col != lo_col),
-                "T2a lo dst col {lo_col} (input {i}) must not be a PublicColumn after retarget"
-            );
-        }
-    }
-
-    #[test]
-    fn t1_retarget_owner_hi_tamper_rejects_per_input() {
-        // T1 ties HAddr squeeze → FriStateOpen owner columns in the
-        // leaf band. Row `i` of `SKEL_OPEN_COL_OFFSET + COL_OWNER_HI`
-        // is the per-input T1-hi dst; tampering breaks the HAddr
-        // bridge.
-        use crate::airs::fri_state_open::COL_OWNER_HI;
-        use crate::composition::tx_validity_composite::SKEL_OPEN_COL_OFFSET;
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let col = SKEL_OPEN_COL_OFFSET + COL_OWNER_HI;
-            trace.columns[col][i] = trace.columns[col][i] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T1-hi tamper at input {i} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t1_retarget_owner_lo_tamper_rejects_per_input() {
-        use crate::airs::fri_state_open::COL_OWNER_LO;
-        use crate::composition::tx_validity_composite::SKEL_OPEN_COL_OFFSET;
-        for i in 0..FRI_STATE_OPEN_N_INPUTS {
-            let comp = build_honest();
-            let mut trace = comp.build_trace();
-            let col = SKEL_OPEN_COL_OFFSET + COL_OWNER_LO;
-            trace.columns[col][i] = trace.columns[col][i] + Block128::ONE;
-            assert!(
-                !comp.air().check(&trace),
-                "T1-lo tamper at input {i} should reject"
-            );
-        }
-    }
-
-    #[test]
-    fn t2b_wrap_output_dst_hi_tamper_rejects() {
-        // OP-1.δ.3: T2b is a single shared bridge targeting the
-        // spine's `wrap_output_outer_cell(lane)`, the canonical origin
-        // of `tx_body_hash`. Tampering the hi cell breaks the shared
-        // T2b bridge tie binding `tx_body_col[0]` to the origin.
-        let comp = build_honest();
-        let mut trace = comp.build_trace();
-        let cell = comp.spine_layout().wrap_output_outer_cell(0);
-        trace.columns[cell.col][cell.row] =
-            trace.columns[cell.col][cell.row] + Block128::ONE;
-        assert!(!comp.air().check(&trace));
-    }
-
-    #[test]
-    fn t2b_wrap_output_dst_lo_tamper_rejects() {
-        let comp = build_honest();
-        let mut trace = comp.build_trace();
-        let cell = comp.spine_layout().wrap_output_outer_cell(1);
-        trace.columns[cell.col][cell.row] =
-            trace.columns[cell.col][cell.row] + Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -1920,13 +1647,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
             empty_with_owner(addrs[1]),
@@ -1962,9 +1682,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
         )
     }
@@ -2049,13 +1766,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
             empty_with_owner(addrs[1]),
@@ -2090,9 +1800,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
         );
     }
@@ -2128,13 +1835,6 @@ mod tests {
             native_address(secrets[1]),
             native_address(secrets[2]),
             native_address(secrets[3]),
-        ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
         ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
@@ -2172,9 +1872,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
         )
     }
@@ -2218,13 +1915,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
             empty_with_owner(addrs[1]),
@@ -2262,9 +1952,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: false, coinbase_credit: 0 },
         );
         let trace = comp.build_trace();
@@ -2337,13 +2024,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
             empty_with_owner(addrs[1]),
@@ -2378,9 +2058,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
         );
     }
@@ -2453,13 +2130,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-        let tx_body_hash: [Block128; 2] = [pins.tx_body_hash[0], pins.tx_body_hash[1]];
-        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            native_auth_tag(secrets[0], tx_body_hash),
-            native_auth_tag(secrets[1], tx_body_hash),
-            native_auth_tag(secrets[2], tx_body_hash),
-            native_auth_tag(secrets[3], tx_body_hash),
-        ];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             empty_with_owner(addrs[0]),
             empty_with_owner(addrs[1]),
@@ -2494,9 +2164,6 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            secrets,
-            tx_body_hash,
-            auth_tags,
             WithSpineOptions { is_coinbase: false, coinbase_credit: 42 },
         );
     }

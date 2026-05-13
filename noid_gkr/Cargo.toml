@@ -8,6 +8,8 @@ license = "Apache-2.0"
 noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_air = { path = "../noid_air" }
+noid_tx = { path = "../noid_tx" }
+rayon = "1.10"
 
 [dev-dependencies]
 rand = "0.8"

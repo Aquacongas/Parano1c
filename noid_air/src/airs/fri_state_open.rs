@@ -17,7 +17,7 @@
 //! The opening API exposes **only** `(slot_index, value, owner_hi,
 //! owner_lo)` per input. The `spend_secret` is **not** read, not
 //! witnessed, and not pinned anywhere in this AIR — that binding lives
-//! in `HAddrAir` / `HAuthAir`, where the secret is deliberately
+//! in the external `AuthGKR` sub-proof, where the secret is
 //! witness-only with no public pin.
 //!
 //! ## Stage 4 split

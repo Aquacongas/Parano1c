@@ -30,10 +30,36 @@
 //! `H = W · B` is degree 2 per variable, one less round polynomial
 //! coefficient per round.
 
-use noid_core::mle::eq::{eq_ind, eq_ind_partial_eval};
+use std::sync::OnceLock;
+
+use noid_core::mle::eq::eq_ind;
 use noid_core::mle::fold::fold_highest_var_inplace;
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
+use rayon::prelude::*;
+
+/// Inverse Lagrange denominators at `{0,1,2}`. Cached so per-round
+/// `evaluate` is invert-free in the hot path.
+fn denom_inv_3() -> &'static [Block128; 3] {
+    static CACHE: OnceLock<[Block128; 3]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out = [Block128::ZERO; 3];
+        for k in 0..3 {
+            let xk = Block128::from(k as u128);
+            let mut d = Block128::ONE;
+            for j in 0..3 {
+                if j == k {
+                    continue;
+                }
+                d *= xk + Block128::from(j as u128);
+            }
+            out[k] = d.invert();
+        }
+        out
+    })
+}
+
+const PAR_THRESHOLD: usize = 64;
 
 /// One round of the degree-2 batch-eval sumcheck, stored as its
 /// evaluations at `X = 0, 1, 2`.
@@ -54,41 +80,21 @@ impl BatchEvalRound {
     }
 }
 
-/// Lagrange evaluation at a single point from evals at `{0,1,2}`.
+/// Lagrange evaluation at a single point from evals at `{0,1,2}`. Uses
+/// the cached denominator inverses in `denom_inv_3()` so the hot path
+/// is invert-free.
 #[inline]
 pub fn lagrange_at_0_1_2(evals: &[Block128; 3], r: Block128) -> Block128 {
-    let f0 = Block128::from(0u128);
-    let f1 = Block128::from(1u128);
-    let f2 = Block128::from(2u128);
-    let _ = (f0, f1);
-
-    let denom = |k: usize| -> Block128 {
-        let xk = Block128::from(k as u128);
-        let mut d = Block128::ONE;
-        for j in 0..3 {
-            if j == k {
-                continue;
-            }
-            d *= xk + Block128::from(j as u128);
-        }
-        d
-    };
-    let numer = |k: usize| -> Block128 {
-        let mut p = Block128::ONE;
-        for j in 0..3 {
-            if j == k {
-                continue;
-            }
-            p *= r + Block128::from(j as u128);
-        }
-        p
-    };
-    let _ = f2;
-    let mut acc = Block128::ZERO;
-    for k in 0..3 {
-        acc += evals[k] * numer(k) * denom(k).invert();
-    }
-    acc
+    let denom_inv = denom_inv_3();
+    let r0 = r + Block128::from(0u128);
+    let r1 = r + Block128::from(1u128);
+    let r2 = r + Block128::from(2u128);
+    let n0 = r1 * r2;
+    let n1 = r0 * r2;
+    let n2 = r0 * r1;
+    evals[0] * n0 * denom_inv[0]
+        + evals[1] * n1 * denom_inv[1]
+        + evals[2] * n2 * denom_inv[2]
 }
 
 /// One `(r, v)` MLE-evaluation claim on the shared target MLE `B`.
@@ -132,19 +138,45 @@ fn fold_inplace(tbl: &mut Vec<Block128>, r: Block128) {
     fold_highest_var_inplace(tbl, r);
 }
 
-/// Build `W(x) = Σ_i α_i · eq(r_i, x)` as a length-`2^n` table.
+/// Build `W(x) = Σ_i α_i · eq(r_i, x)` as a length-`2^n` table. We
+/// unfold each claim's eq tensor directly into `w` without
+/// materialising the full `eq_ind_partial_eval` as a separate buffer
+/// — the hot loop otherwise allocates `M · 2^n` temporaries.
 fn build_w_table(claims: &[EvalClaim], alphas: &[Block128], n: usize) -> Vec<Block128> {
     debug_assert_eq!(claims.len(), alphas.len());
     let len = 1usize << n;
-    let mut w = vec![Block128::ZERO; len];
-    for (claim, &alpha) in claims.iter().zip(alphas.iter()) {
-        debug_assert_eq!(claim.point.len(), n);
-        let eq_tbl = eq_ind_partial_eval(&claim.point);
-        for j in 0..len {
-            w[j] += alpha * eq_tbl[j];
-        }
-    }
-    w
+
+    // Build each claim's `α_i · eq(r_i, ·)` tensor independently in
+    // parallel, then reduce-sum. The independent-claim work is what
+    // dominates setup (`M · 2^n` muls); the reduction is `M-1` linear
+    // passes over `2^n` cells which parallelises trivially.
+    claims
+        .par_iter()
+        .zip(alphas.par_iter())
+        .map(|(claim, &alpha)| {
+            debug_assert_eq!(claim.point.len(), n);
+            let mut eq: Vec<Block128> = Vec::with_capacity(len);
+            eq.push(alpha);
+            for &r_i in &claim.point {
+                let cur = eq.len();
+                for j in 0..cur {
+                    let prod = eq[j] * r_i;
+                    eq[j] -= prod;
+                    eq.push(prod);
+                }
+            }
+            debug_assert_eq!(eq.len(), len);
+            eq
+        })
+        .reduce(
+            || vec![Block128::ZERO; len],
+            |mut a, b| {
+                for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                    *ai += *bi;
+                }
+                a
+            },
+        )
 }
 
 /// Evaluate `W(r) = Σ_i α_i · eq(r_i, r)` without materialising the table.
@@ -308,31 +340,37 @@ pub fn verify_batch_eval<T: FiatShamir<Block128>>(
 
 /// Round-poly evaluator: `p(X) = Σ_j W(X,j) · B(X,j)` where the per-index
 /// linear extensions are `t(X) = t_lo + X · (t_lo + t_hi)` (char-2).
+/// Parallel over the `half` entries above `PAR_THRESHOLD` (large enough
+/// to amortise rayon join overhead but covers the heavy early rounds at
+/// 2^14 / 2^13 entries).
 fn eval_round_at_0_1_2(w: &[Block128], b: &[Block128], half: usize) -> [Block128; 3] {
-    let mut e0 = Block128::ZERO;
-    let mut e1 = Block128::ZERO;
-    let mut e2 = Block128::ZERO;
     let f2 = Block128::from(2u128);
-
-    for j in 0..half {
+    let per_entry = |j: usize| -> [Block128; 3] {
         let w_lo = w[j];
         let w_hi = w[j + half];
         let b_lo = b[j];
         let b_hi = b[j + half];
-
         let d_w = w_lo + w_hi;
         let d_b = b_lo + b_hi;
-
-        // p(0) = w_lo * b_lo
-        e0 += w_lo * b_lo;
-        // p(1) = w_hi * b_hi
-        e1 += w_hi * b_hi;
-        // p(2) = (w_lo + 2·d_w) · (b_lo + 2·d_b)
         let w2 = w_lo + f2 * d_w;
         let b2 = b_lo + f2 * d_b;
-        e2 += w2 * b2;
+        [w_lo * b_lo, w_hi * b_hi, w2 * b2]
+    };
+    if half >= PAR_THRESHOLD {
+        (0..half).into_par_iter().map(per_entry).reduce(
+            || [Block128::ZERO; 3],
+            |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+        )
+    } else {
+        let mut acc = [Block128::ZERO; 3];
+        for j in 0..half {
+            let p = per_entry(j);
+            acc[0] += p[0];
+            acc[1] += p[1];
+            acc[2] += p[2];
+        }
+        acc
     }
-    [e0, e1, e2]
 }
 
 #[cfg(test)]

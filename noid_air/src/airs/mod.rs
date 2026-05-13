@@ -10,10 +10,6 @@ pub mod carry_ripple;
 pub mod fri_state_combiner;
 pub mod fri_state_combiner_composite;
 pub mod fri_state_open;
-pub mod haddr;
-pub mod haddr_multi;
-pub mod hauth;
-pub mod hauth_multi;
 pub mod linear_combination;
 pub mod tx_body_merkle;
 pub mod tx_body_merkle_boundary;
@@ -66,19 +62,6 @@ pub use fri_state_open::{
     COL_IDX_BIT_BASE, COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_LOG_ROWS,
     FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS,
     FRI_STATE_OPEN_WITNESS_COLS,
-};
-pub use haddr::{
-    build_haddr_trace, emit_haddr, extract_haddr_output, HAddrAir, HADDR_B_SEED_ROW,
-    HADDR_IND_ROW_0, HADDR_IND_ROW_N_ROUNDS, HADDR_IND_ROW_OUTPUT, HADDR_LAYOUT_A, HADDR_LAYOUT_B,
-    HADDR_LOG_ROWS, HADDR_N_COLS, HADDR_N_ROWS, HADDR_OUTPUT_ROW, HADDR_PAD_0, HADDR_PAD_1,
-    HADDR_PERM_A_BASE, HADDR_PERM_B_BASE, HADDR_PRE_S_A_BASE, HADDR_PRE_S_B_BASE,
-};
-pub use hauth::{
-    build_hauth_trace, emit_hauth, extract_hauth_output, HAuthAir, HAUTH_B_SEED_ROW,
-    HAUTH_C_SEED_ROW, HAUTH_IND_ROW_0, HAUTH_IND_ROW_2N_PLUS_1, HAUTH_IND_ROW_N_ROUNDS,
-    HAUTH_IND_ROW_OUTPUT, HAUTH_LAYOUT_A, HAUTH_LAYOUT_B, HAUTH_LAYOUT_C, HAUTH_LOG_ROWS,
-    HAUTH_N_COLS, HAUTH_N_ROWS, HAUTH_OUTPUT_ROW, HAUTH_PERM_A_BASE, HAUTH_PERM_B_BASE,
-    HAUTH_PERM_C_BASE, HAUTH_PRE_S_A_BASE, HAUTH_PRE_S_B_BASE, HAUTH_PRE_S_C_BASE,
 };
 pub use tx_body_merkle::{
     build_instance_layout, build_tx_body_merkle_trace,

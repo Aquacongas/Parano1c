@@ -48,6 +48,20 @@ pub enum PermColumn {
     Sout,
 }
 
+/// Fast path: pack only the `sout` column. Verifier uses this to
+/// evaluate `sout(r0)` without materialising the other five columns.
+pub fn pack_sout(witness: &PermLayerWitness) -> Vec<Block128> {
+    let mut out = vec![Block128::from(0u128); N_PERM_CELLS];
+    let rows = witness.sout.len();
+    debug_assert!(rows <= N_ROWS_PADDED);
+    for row in 0..rows {
+        for lane in 0..STATE_SIZE {
+            out[(row << 2) | lane] = witness.sout[row][lane];
+        }
+    }
+    out
+}
+
 /// Pack one column of a layered permutation witness as an MLE over
 /// `N_PERM_VARS = 9` variables. Index layout: `(row << 2) | lane`.
 pub fn pack_column(witness: &PermLayerWitness, col: PermColumn) -> Vec<Block128> {

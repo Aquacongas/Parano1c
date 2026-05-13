@@ -34,6 +34,17 @@ fn fresh_channel(seed: u64) -> Poseidon2bChannel {
     ch
 }
 
+/// γ₂-lift helper: reconstruct `v0 = sout_mle(r0)` from a claimed
+/// `state_in`. Mirrors what the prod spine wrapper does: the caller of
+/// `verify_perm` is now responsible for supplying `v0`.
+fn v0_from_state(state_in: [Block128; STATE_SIZE]) -> impl FnOnce(&[Block128]) -> Block128 {
+    move |r0: &[Block128]| {
+        let witness = evaluate_permutation(state_in);
+        let sout_mle = PermMle::from_witness(&witness).sout;
+        evaluate_slice(&sout_mle, r0)
+    }
+}
+
 #[test]
 fn honest_roundtrip() {
     let mut rng = StdRng::seed_from_u64(0xA1);
@@ -41,10 +52,10 @@ fn honest_roundtrip() {
         let st = rand_state(&mut rng);
 
         let mut p_ch = fresh_channel(1);
-        let (proof, _v0, _claims) = prove_perm(st, &mut p_ch);
+        let (proof, _r0, _v0, _claims) = prove_perm(st, &mut p_ch);
 
         let mut v_ch = fresh_channel(1);
-        assert!(verify_perm(&proof, st, &mut v_ch).is_some());
+        assert!(verify_perm(&proof, &mut v_ch, v0_from_state(st)).is_some());
     }
 }
 
@@ -57,7 +68,7 @@ fn prover_output_claim_matches_native_sout_mle() {
         let st = rand_state(&mut rng);
 
         let mut p_ch = fresh_channel(2);
-        let (_proof, v0, _claims) = prove_perm(st, &mut p_ch);
+        let (_proof, _r0_prover, v0, _claims) = prove_perm(st, &mut p_ch);
 
         // γ₄: `absorb_boundary` was deleted — prover and verifier no
         // longer absorb `state_in` before the first squeeze. Mirror
@@ -86,13 +97,13 @@ fn mutation_a_flipped_output_claim_rejects() {
     let st = rand_state(&mut rng);
 
     let mut p_ch = fresh_channel(3);
-    let (proof, _, _) = prove_perm(st, &mut p_ch);
+    let (proof, _, _, _) = prove_perm(st, &mut p_ch);
 
     let mut bad_state = st;
     bad_state[0] += Block128::from(1u128);
 
     let mut v_ch = fresh_channel(3);
-    assert!(verify_perm(&proof, bad_state, &mut v_ch).is_none());
+    assert!(verify_perm(&proof, &mut v_ch, v0_from_state(bad_state)).is_none());
 }
 
 #[test]
@@ -103,7 +114,7 @@ fn mutation_b_tampered_round_polynomial_rejects() {
     let st = rand_state(&mut rng);
 
     let mut p_ch = fresh_channel(4);
-    let (mut proof, _, _) = prove_perm(st, &mut p_ch);
+    let (mut proof, _, _, _) = prove_perm(st, &mut p_ch);
 
     let mid = proof.sout_x4x3.rounds.len() / 2;
     let mut re = proof.sout_x4x3.rounds[mid];
@@ -111,7 +122,7 @@ fn mutation_b_tampered_round_polynomial_rejects() {
     proof.sout_x4x3.rounds[mid] = re;
 
     let mut v_ch = fresh_channel(4);
-    assert!(verify_perm(&proof, st, &mut v_ch).is_none());
+    assert!(verify_perm(&proof, &mut v_ch, v0_from_state(st)).is_none());
 }
 
 #[test]
@@ -128,12 +139,12 @@ fn mutation_c_tampered_final_ab_rejects() {
     let st = rand_state(&mut rng);
 
     let mut p_ch = fresh_channel(5);
-    let (mut proof, _, _) = prove_perm(st, &mut p_ch);
+    let (mut proof, _, _, _) = prove_perm(st, &mut p_ch);
 
     proof.sout_x4x3.a_final += Block128::from(1u128);
 
     let mut v_ch = fresh_channel(5);
-    assert!(verify_perm(&proof, st, &mut v_ch).is_none());
+    assert!(verify_perm(&proof, &mut v_ch, v0_from_state(st)).is_none());
 }
 
 #[test]
@@ -148,12 +159,12 @@ fn mutation_d_forged_sin_claim_rejects() {
     let st = rand_state(&mut rng);
 
     let mut p_ch = fresh_channel(6);
-    let (mut proof, _, _) = prove_perm(st, &mut p_ch);
+    let (mut proof, _, _, _) = prove_perm(st, &mut p_ch);
 
     proof.sin_r3_check.a_final += Block128::from(1u128);
 
     let mut v_ch = fresh_channel(6);
-    assert!(verify_perm(&proof, st, &mut v_ch).is_none());
+    assert!(verify_perm(&proof, &mut v_ch, v0_from_state(st)).is_none());
 }
 
 #[test]
@@ -163,12 +174,12 @@ fn mutation_e_bad_x4_diagonal_rejects() {
     let st = rand_state(&mut rng);
 
     let mut p_ch = fresh_channel(7);
-    let (mut proof, _, _) = prove_perm(st, &mut p_ch);
+    let (mut proof, _, _, _) = prove_perm(st, &mut p_ch);
 
     proof.x4_x2x2.b_final += Block128::from(1u128);
 
     let mut v_ch = fresh_channel(7);
-    assert!(verify_perm(&proof, st, &mut v_ch).is_none());
+    assert!(verify_perm(&proof, &mut v_ch, v0_from_state(st)).is_none());
 }
 
 #[test]
@@ -177,11 +188,12 @@ fn transcript_determinism() {
     let st = rand_state(&mut rng);
 
     let mut c1 = fresh_channel(100);
-    let (p1, v1, c1_claims) = prove_perm(st, &mut c1);
+    let (p1, r0_1, v1, c1_claims) = prove_perm(st, &mut c1);
     let mut c2 = fresh_channel(100);
-    let (p2, v2, c2_claims) = prove_perm(st, &mut c2);
+    let (p2, r0_2, v2, c2_claims) = prove_perm(st, &mut c2);
 
     assert_eq!(p1, p2);
+    assert_eq!(r0_1, r0_2);
     assert_eq!(v1, v2);
     assert_eq!(c1_claims, c2_claims);
 }

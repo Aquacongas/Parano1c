@@ -4,14 +4,49 @@
 //! Sum-Check Verifier for binary tower fields.
 
 use super::prove::RoundPolynomial;
+use crate::transcript::FiatShamir;
 use crate::TowerField;
 
-/// Verify a Sum-Check proof.
+/// Verify a sumcheck proof, replaying the prover's Fiat-Shamir channel.
 ///
-/// For each round polynomial u_i(X) checks: u_i(0) + u_i(1) == current_claim,
-/// then advances claim = u_i(r_i).
+/// `round_polys`    — the per-round univariate polynomials.
+/// `channel`        — fresh FS channel, seeded identically to the
+///                    prover's; coefficients are absorbed in order and
+///                    one challenge is squeezed per round.
+/// `initial_claim`  — the value the prover claims for the sum.
 ///
-/// Returns `Some(final_claim)` on success, `None` on any failure.
+/// Returns `Some((final_claim, challenges))` on success, `None` on any
+/// telescope-check failure. The caller validates `final_claim`
+/// externally against the multilinear opening (or the next sumcheck in
+/// a chain).
+pub fn verify_with_channel<F: TowerField, T: FiatShamir<F>>(
+    round_polys: &[RoundPolynomial<F>],
+    initial_claim: F,
+    channel: &mut T,
+) -> Option<(F, Vec<F>)> {
+    let mut claim = initial_claim;
+    let mut challenges = Vec::with_capacity(round_polys.len());
+
+    for poly in round_polys {
+        let sum01 = poly.evaluate(F::ZERO) + poly.evaluate(F::ONE);
+        if sum01 != claim {
+            return None;
+        }
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let r = channel.squeeze();
+        claim = poly.evaluate(r);
+        challenges.push(r);
+    }
+
+    Some((claim, challenges))
+}
+
+/// Legacy verifier that takes pre-derived challenges. Kept for
+/// callsites that synthesize the challenge vector themselves (e.g. when
+/// stitching multiple sumchecks together and the FS state is owned
+/// elsewhere).
 pub fn verify<F: TowerField>(
     round_polys: &[RoundPolynomial<F>],
     challenges: &[F],
@@ -36,60 +71,62 @@ pub fn verify<F: TowerField>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::prove::prove_single;
+    use super::super::prove::{prove_single, prove_single_d};
     use super::*;
+    use crate::transcript::FiatShamir;
     use crate::Block128;
 
     type F = Block128;
 
-    /// Replay the prover's deterministic challenge derivation.
-    fn replay_challenges(round_polys: &[RoundPolynomial<F>]) -> Vec<F> {
-        let mut transcript: Vec<F> = Vec::new();
-        let mut challenges = Vec::new();
-        for poly in round_polys {
-            for &c in &poly.coeffs {
-                transcript.push(c);
-            }
-            let challenge = transcript.iter().fold(F::ZERO, |acc, &x| acc + x);
-            challenges.push(challenge);
+    /// Same insecure XOR mock as the prover module — both sides use it
+    /// in lockstep so the challenge stream matches.
+    #[derive(Default)]
+    struct XorChannel {
+        state: F,
+    }
+
+    impl FiatShamir<F> for XorChannel {
+        fn absorb(&mut self, elem: F) {
+            self.state += elem;
         }
-        challenges
+        fn squeeze(&mut self) -> F {
+            self.state += F::ONE;
+            self.state
+        }
     }
 
     #[test]
     fn test_verify_accepts_valid_proof() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, final_eval) = prove_single(&evals, claimed_sum, &mut transcript);
-        let challenges = replay_challenges(&round_polys);
 
-        let result = verify(&round_polys, &challenges, claimed_sum);
-        assert!(result.is_some(), "valid proof must be accepted");
-        assert_eq!(result.unwrap(), final_eval);
+        let mut prover_ch = XorChannel::default();
+        let (round_polys, final_eval, _) = prove_single(&evals, &mut prover_ch);
+
+        let mut verifier_ch = XorChannel::default();
+        let res = verify_with_channel(&round_polys, claimed_sum, &mut verifier_ch);
+        let (claim, _) = res.expect("valid proof must be accepted");
+        assert_eq!(claim, final_eval);
     }
 
     #[test]
     fn test_verify_rejects_wrong_initial_claim() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
-        let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, _) = prove_single(&evals, claimed_sum, &mut transcript);
-        let challenges = replay_challenges(&round_polys);
+        let mut prover_ch = XorChannel::default();
+        let (round_polys, _, _) = prove_single(&evals, &mut prover_ch);
 
-        let result = verify(&round_polys, &challenges, F::ONE);
-        assert!(result.is_none(), "wrong claim must be rejected");
+        let mut verifier_ch = XorChannel::default();
+        assert!(verify_with_channel(&round_polys, F::ONE, &mut verifier_ch).is_none());
     }
 
     #[test]
     fn test_verify_rejects_wrong_challenge_length() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, _) = prove_single(&evals, claimed_sum, &mut transcript);
+        let mut prover_ch = XorChannel::default();
+        let (round_polys, _, _) = prove_single(&evals, &mut prover_ch);
 
-        let result = verify(&round_polys, &[F::ONE], claimed_sum);
-        assert!(result.is_none());
+        assert!(verify(&round_polys, &[F::ONE], claimed_sum).is_none());
     }
 
     #[test]
@@ -99,12 +136,31 @@ mod tests {
         let n = 6;
         let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, final_eval) = prove_single(&evals, claimed_sum, &mut transcript);
-        let challenges = replay_challenges(&round_polys);
 
-        let result = verify(&round_polys, &challenges, claimed_sum);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), final_eval);
+        let mut prover_ch = XorChannel::default();
+        let (round_polys, final_eval, _) = prove_single(&evals, &mut prover_ch);
+
+        let mut verifier_ch = XorChannel::default();
+        let (claim, _) = verify_with_channel(&round_polys, claimed_sum, &mut verifier_ch).unwrap();
+        assert_eq!(claim, final_eval);
+    }
+
+    #[test]
+    fn test_verify_degree_7_round_polys() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let n = 5;
+        let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
+        let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
+
+        let mut prover_ch = XorChannel::default();
+        let (round_polys, final_eval, _) = prove_single_d(&evals, 7, &mut prover_ch);
+
+        let mut verifier_ch = XorChannel::default();
+        let (claim, _) = verify_with_channel(&round_polys, claimed_sum, &mut verifier_ch).unwrap();
+        assert_eq!(claim, final_eval);
+        for poly in &round_polys {
+            assert_eq!(poly.degree(), 7);
+        }
     }
 }

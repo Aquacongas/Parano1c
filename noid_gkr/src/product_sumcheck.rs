@@ -31,9 +31,39 @@
 //! The transcript is whatever `FiatShamir<Block128>` implementer the
 //! caller supplies; the inner STARK uses `Poseidon2bChannel`.
 
+use std::sync::OnceLock;
+
 use noid_core::mle::eq::{eq_ind, eq_ind_partial_eval};
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
+use rayon::prelude::*;
+
+/// Inverse of the Lagrange denominators at the fixed evaluation points
+/// `{0,1,2,3}` over GF(2^128). Cached once per process to avoid 4
+/// `Block128::invert()` calls inside every per-round `evaluate`.
+fn denom_inv_4() -> &'static [Block128; 4] {
+    static CACHE: OnceLock<[Block128; 4]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out = [Block128::ZERO; 4];
+        for k in 0..4 {
+            let xk = Block128::from(k as u128);
+            let mut d = Block128::ONE;
+            for j in 0..4 {
+                if j == k {
+                    continue;
+                }
+                d *= xk + Block128::from(j as u128);
+            }
+            out[k] = d.invert();
+        }
+        out
+    })
+}
+
+/// Per-round work in `eval_round_at_*` is `O(half)` independent muls
+/// over 9-variable MLEs (`half` ≤ 256). Switch to parallel iteration
+/// only when there's enough work to amortise rayon's join overhead.
+const PAR_THRESHOLD: usize = 64;
 
 /// Round polynomial stored as its evaluations at `X = 0, 1, 2, 3`.
 ///
@@ -59,42 +89,24 @@ impl RoundEvals {
 
 /// Lagrange evaluation: given `e_k = p(k)` for `k ∈ {0,1,2,3}`,
 /// return `p(r)`. Uses the standard Lagrange basis in GF(2^128).
+/// Denominator inverses are cached in `denom_inv_4()` so the hot path
+/// performs zero field inversions.
 #[inline]
 pub fn lagrange_at_0_1_2_3(evals: &[Block128; 4], r: Block128) -> Block128 {
-    let f0 = Block128::from(0u128);
-    let f1 = Block128::from(1u128);
-    let f2 = Block128::from(2u128);
-    let f3 = Block128::from(3u128);
-
-    // L_k(r) = Π_{j≠k} (r + x_j) / (x_k + x_j) — char-2 subtraction == addition.
-    let denom = |k: usize| -> Block128 {
-        let xk = Block128::from(k as u128);
-        let mut d = Block128::ONE;
-        for j in 0..4 {
-            if j == k {
-                continue;
-            }
-            d *= xk + Block128::from(j as u128);
-        }
-        d
-    };
-    let numer = |k: usize| -> Block128 {
-        let mut p = Block128::ONE;
-        for j in 0..4 {
-            if j == k {
-                continue;
-            }
-            p *= r + Block128::from(j as u128);
-        }
-        p
-    };
-
-    let _ = (f0, f1, f2, f3); // silence unused; used implicitly
-    let mut acc = Block128::ZERO;
-    for k in 0..4 {
-        acc += evals[k] * numer(k) * denom(k).invert();
-    }
-    acc
+    let denom_inv = denom_inv_4();
+    let r0 = r + Block128::from(0u128);
+    let r1 = r + Block128::from(1u128);
+    let r2 = r + Block128::from(2u128);
+    let r3 = r + Block128::from(3u128);
+    // L_k(r) = Π_{j≠k} (r + x_j) · denom_inv[k].
+    let n0 = r1 * r2 * r3;
+    let n1 = r0 * r2 * r3;
+    let n2 = r0 * r1 * r3;
+    let n3 = r0 * r1 * r2;
+    evals[0] * n0 * denom_inv[0]
+        + evals[1] * n1 * denom_inv[1]
+        + evals[2] * n2 * denom_inv[2]
+        + evals[3] * n3 * denom_inv[3]
 }
 
 /// Full product-sumcheck proof: the per-round evaluations plus the
@@ -138,7 +150,6 @@ pub fn prove_product<T: FiatShamir<Block128>>(
     assert_eq!(a.len(), 1 << n);
     assert_eq!(b.len(), 1 << n);
 
-    // Sanity (debug only): claim matches witness.
     debug_assert_eq!(compute_product_claim(a, b, r), v, "claim mismatches witness");
 
     let mut eq_tbl = eq_ind_partial_eval(r);
@@ -152,26 +163,16 @@ pub fn prove_product<T: FiatShamir<Block128>>(
     let _ = claim;
     for _round in 0..n {
         let half = a_tbl.len() / 2;
-
-        // Compute p(0), p(1), p(2), p(3) where
-        // p(X) = Σ_x ((1-X)eq_lo[x] + X*eq_hi[x])
-        //          * ((1-X)A_lo[x] + X*A_hi[x])
-        //          * ((1-X)B_lo[x] + X*B_hi[x])
-        // over the remaining `half` index positions. In char 2:
-        //   t(k) = t_lo + k * (t_lo + t_hi) for each of eq, A, B.
         let evals = eval_round_at_0_1_2_3(&eq_tbl, &a_tbl, &b_tbl, half);
         let re = RoundEvals { evals };
 
-        // Telescope check on prover side (debug): e0 + e1 == claim.
         debug_assert_eq!(re.sum_at_0_plus_1(), claim);
 
-        // Absorb the 4 evals into transcript, squeeze challenge.
         for e in &re.evals {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
 
-        // Advance claim and fold all three tables.
         claim = re.evaluate(r_i);
         fold_inplace(&mut eq_tbl, r_i);
         fold_inplace(&mut a_tbl, r_i);
@@ -186,14 +187,76 @@ pub fn prove_product<T: FiatShamir<Block128>>(
     debug_assert_eq!(eq_tbl.len(), 1);
     debug_assert_eq!(claim, eq_tbl[0] * a_tbl[0] * b_tbl[0]);
 
-    // Challenges were pushed in highest-var-first order; the caller
-    // expects `r'` in variable order (same indexing as `r`).
     challenges.reverse();
 
     let proof = ProductProof {
         rounds,
         a_final: a_tbl[0],
         b_final: b_tbl[0],
+    };
+    (proof, challenges)
+}
+
+/// Specialised version of [`prove_product`] for the case `A == B`. The
+/// per-entry inner product `A(x) · B(x)` reduces to `A(x)^2`, and
+/// `Block128::square()` is ~20× faster than general multiplication
+/// (see `noid_core::tower::block128`). Three of the eight per-perm
+/// sumchecks (`x4 = x2·x2`, two copies of `x2 = sin·sin`) are A=B in
+/// every slot, so this fast path covers ~38% of perm-sumcheck arithmetic.
+///
+/// Wire format is identical: returns the same [`ProductProof`] /
+/// `b_final == a_final` claim that the verifier already cross-checks via
+/// `proof.x4_x2x2.a_final == proof.x4_x2x2.b_final` (see
+/// `perm_sumcheck::verify_perm`). No protocol change.
+pub fn prove_square<T: FiatShamir<Block128>>(
+    a: &[Block128],
+    r: &[Block128],
+    v: Block128,
+    channel: &mut T,
+) -> (ProductProof, Vec<Block128>) {
+    let n = r.len();
+    assert_eq!(a.len(), 1 << n);
+
+    debug_assert_eq!(compute_product_claim(a, a, r), v, "claim mismatches witness");
+
+    let mut eq_tbl = eq_ind_partial_eval(r);
+    let mut a_tbl = a.to_vec();
+
+    let mut rounds = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    let mut claim = v;
+    let _ = claim;
+    for _round in 0..n {
+        let half = a_tbl.len() / 2;
+        let evals = eval_round_at_0_1_2_3_square(&eq_tbl, &a_tbl, half);
+        let re = RoundEvals { evals };
+
+        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
+
+        for e in &re.evals {
+            channel.absorb(*e);
+        }
+        let r_i = channel.squeeze();
+
+        claim = re.evaluate(r_i);
+        fold_inplace(&mut eq_tbl, r_i);
+        fold_inplace(&mut a_tbl, r_i);
+
+        rounds.push(re);
+        challenges.push(r_i);
+    }
+
+    debug_assert_eq!(a_tbl.len(), 1);
+    debug_assert_eq!(eq_tbl.len(), 1);
+    debug_assert_eq!(claim, eq_tbl[0] * a_tbl[0] * a_tbl[0]);
+
+    challenges.reverse();
+
+    let proof = ProductProof {
+        rounds,
+        a_final: a_tbl[0],
+        b_final: a_tbl[0],
     };
     (proof, challenges)
 }
@@ -272,51 +335,93 @@ fn eval_round_at_0_1_2_3(
     b: &[Block128],
     half: usize,
 ) -> [Block128; 4] {
-    let f0 = Block128::from(0u128);
-    let f1 = Block128::from(1u128);
     let f2 = Block128::from(2u128);
     let f3 = Block128::from(3u128);
 
-    let mut e0 = Block128::ZERO;
-    let mut e1 = Block128::ZERO;
-    let mut e2 = Block128::ZERO;
-    let mut e3 = Block128::ZERO;
-
-    for j in 0..half {
+    let per_entry = |j: usize| -> [Block128; 4] {
         let eq_lo = eq[j];
         let eq_hi = eq[j + half];
         let a_lo = a[j];
         let a_hi = a[j + half];
         let b_lo = b[j];
         let b_hi = b[j + half];
-
-        // Differences
         let d_eq = eq_lo + eq_hi;
         let d_a = a_lo + a_hi;
         let d_b = b_lo + b_hi;
+        let e0 = eq_lo * a_lo * b_lo;
+        let e1 = eq_hi * a_hi * b_hi;
+        let eq_2 = eq_lo + f2 * d_eq;
+        let a_2 = a_lo + f2 * d_a;
+        let b_2 = b_lo + f2 * d_b;
+        let eq_3 = eq_lo + f3 * d_eq;
+        let a_3 = a_lo + f3 * d_a;
+        let b_3 = b_lo + f3 * d_b;
+        [e0, e1, eq_2 * a_2 * b_2, eq_3 * a_3 * b_3]
+    };
 
-        // p(0) = eq_lo * a_lo * b_lo
-        e0 += eq_lo * a_lo * b_lo;
-
-        // p(1) = eq_hi * a_hi * b_hi
-        e1 += eq_hi * a_hi * b_hi;
-
-        // Helper to evaluate one entry at X = k.
-        let eval_at = |k: Block128| -> Block128 {
-            let eq_k = eq_lo + k * d_eq;
-            let a_k = a_lo + k * d_a;
-            let b_k = b_lo + k * d_b;
-            eq_k * a_k * b_k
-        };
-
-        e2 += eval_at(f2);
-        e3 += eval_at(f3);
-
-        // keep f0/f1 referenced for clarity on what indexing means
-        let _ = (f0, f1);
+    if half >= PAR_THRESHOLD {
+        (0..half)
+            .into_par_iter()
+            .map(per_entry)
+            .reduce(
+                || [Block128::ZERO; 4],
+                |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
+            )
+    } else {
+        let mut acc = [Block128::ZERO; 4];
+        for j in 0..half {
+            let p = per_entry(j);
+            acc[0] += p[0];
+            acc[1] += p[1];
+            acc[2] += p[2];
+            acc[3] += p[3];
+        }
+        acc
     }
+}
 
-    [e0, e1, e2, e3]
+/// Round-poly evaluator for the `A == B` (square) special case. The
+/// per-entry inner term `A(X)·A(X)` is one `Block128::square()` per
+/// X value, ~20× faster than the general two-operand multiplication.
+fn eval_round_at_0_1_2_3_square(eq: &[Block128], a: &[Block128], half: usize) -> [Block128; 4] {
+    let f2 = Block128::from(2u128);
+    let f3 = Block128::from(3u128);
+
+    let per_entry = |j: usize| -> [Block128; 4] {
+        let eq_lo = eq[j];
+        let eq_hi = eq[j + half];
+        let a_lo = a[j];
+        let a_hi = a[j + half];
+        let d_eq = eq_lo + eq_hi;
+        let d_a = a_lo + a_hi;
+        let e0 = eq_lo * a_lo.square();
+        let e1 = eq_hi * a_hi.square();
+        let eq_2 = eq_lo + f2 * d_eq;
+        let a_2 = a_lo + f2 * d_a;
+        let eq_3 = eq_lo + f3 * d_eq;
+        let a_3 = a_lo + f3 * d_a;
+        [e0, e1, eq_2 * a_2.square(), eq_3 * a_3.square()]
+    };
+
+    if half >= PAR_THRESHOLD {
+        (0..half)
+            .into_par_iter()
+            .map(per_entry)
+            .reduce(
+                || [Block128::ZERO; 4],
+                |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
+            )
+    } else {
+        let mut acc = [Block128::ZERO; 4];
+        for j in 0..half {
+            let p = per_entry(j);
+            acc[0] += p[0];
+            acc[1] += p[1];
+            acc[2] += p[2];
+            acc[3] += p[3];
+        }
+        acc
+    }
 }
 
 /// Fold the highest-indexed variable in-place by challenge `r`.

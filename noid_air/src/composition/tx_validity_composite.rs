@@ -32,13 +32,11 @@
 //!
 //! # What this does *not* do
 //!
-//! - No Stage 5 ties: T1 (`HAddr.owner ↔ FriStateOpen.owner`) et al.
-//!   land in Stage 5.4+.
 //! - No Stage 6 `PublicInputs` surface: the combiner's
 //!   `expected_{prev,new}_state_root_fields` are still inner pins.
-//! - No `TxBodyMerkleAir` / `HAddr` / `HAuth` — those widen
-//!   the column budget and require `log_rows = 13`, deferred to
-//!   later substages.
+//! - No `TxBodyMerkleAir` band — that widens the column budget and
+//!   requires `log_rows = 13`, landed in the leaf / with-spine
+//!   composites that consume this skeleton.
 
 use crate::airs::fri_state_combiner::FRI_STATE_COMBINER_LOG_ROWS;
 use crate::airs::fri_state_combiner_composite::{
@@ -59,10 +57,8 @@ use noid_core::{Block128, TowerField};
 // Layout
 // ---------------------------------------------------------------------------
 
-/// Outer `log_rows` of the skeleton. OP-1.δ.0 raised this from 9 to
-/// 10 so downstream composites (`Full`, `HAuth`) have enough rows to
-/// host a 4-input `HAddrMultiAir` (whose `min_log_rows(4) = 10`).
-/// The combiner sub-composite has `inner_log_rows = 9` and is now
+/// Outer `log_rows` of the skeleton: `COMBINER_COMPOSITE_LOG_ROWS + 1
+/// = 10`. The combiner sub-composite has `inner_log_rows = 9` and is
 /// wrapped via `RowWindowWrapper(MaskOff)` — its constraints are
 /// silenced on rows `[512, 1024)`. The leaf / with-spine composites
 /// lift further to `log_rows = 13`; they consume the same skeleton
@@ -92,8 +88,8 @@ pub const SKEL_OUT_OPEN_WITNESS_COLS: usize = FRI_STATE_OPEN_OUTPUT_LAYOUT.witne
 
 /// E.2.b: column offset of the output-side FRI-state-open block.
 /// Sits immediately after the input-side open block's window-indicator
-/// column so downstream composites' `FULL_HADDR_BLOCKS_BASE =
-/// TX_VALIDITY_SKELETON_N_COLS` still picks up the next free slot.
+/// column so downstream composites continue allocating at
+/// `TX_VALIDITY_SKELETON_N_COLS`.
 pub const SKEL_OUT_OPEN_COL_OFFSET: usize = SKEL_OPEN_WINDOW_INDICATOR_COL + 1;
 
 /// E.2.b: window indicator column for the output-side open block.
@@ -210,11 +206,9 @@ impl TxValidityCompositeSkeleton {
         public_columns.extend(out_open_wiring.public_columns);
         // NOTE: the skeleton intentionally does not emit comp-4
         // slot-index bridge pins — it accepts caller-constructed
-        // `out_open_air` instances of arbitrary origin (EMPTY in
-        // `build_skeleton`, body-derived in
-        // `out_open_body_derived_honest_trace_accepts`). Comp-4 pins
-        // live in Leaf / Full / HAuth where the source is encoded in
-        // the composite type.
+        // `out_open_air` instances of arbitrary origin. Comp-4 pins
+        // live in the leaf / with-spine composites where the source
+        // is encoded in the composite type.
 
         let air = CompositeAir::from_parts_with_publics(
             outer_log_rows,
@@ -347,8 +341,8 @@ fn build_open_inner_cols_sized(
 /// E.2.b: shared helper — wrap a configured output-side
 /// `FriStateOpenAir` into an outer composite via `RowWindowWrapper`,
 /// reusing the skeleton's `SKEL_OUT_OPEN_*` offsets. Used from both
-/// the skeleton and downstream composites (`Full`, `HAuth`, `Leaf`,
-/// `WithSpine`) so the output-side wiring is authored exactly once.
+/// the skeleton and the downstream `Leaf` / `WithSpine` composites so
+/// the output-side wiring is authored exactly once.
 pub(crate) fn emit_output_open_wiring(
     out_open_air: FriStateOpenAir,
     outer_n_cols: usize,
@@ -397,21 +391,6 @@ pub(crate) fn write_output_open_trace(
             dst[r] = v;
         }
     }
-}
-
-/// E.2.b: convenience wrapper — build the all-EMPTY output-side witness
-/// on the fly and write its honest sub-trace into `cols`. Used by
-/// composites (`Full`, `HAuth`, `Leaf`, `WithSpine`) that don't need
-/// to retain the witness between `new` and `build_trace` because every
-/// call recreates the same deterministic all-zero witness.
-pub(crate) fn write_empty_output_open_trace(cols: &mut [Vec<Block128>]) {
-    // We need the publics the AIR would own. `build_empty_output_side`
-    // returns them via the air; we extract them by building a fresh
-    // instance once per trace. Cheap because the inner construction is
-    // O(witness_cols) work only.
-    let (air, witness) = build_empty_output_side();
-    let (_, _, publics) = air.into_parts();
-    write_output_open_trace(cols, &witness, &publics);
 }
 
 /// E.2.b.comp-3: how the output-side `FriStateOpenAir` block is

@@ -780,19 +780,6 @@ mod tests {
         assert!(!air.check(&trace));
     }
 
-    /// Attack 5 — **overlapping-window detection at the placement
-    /// level**. This isn't a run-time attack on the wrapper; it's a
-    /// construction-time defense handled by `validate_placements`
-    /// inside `composition::placement`. Re-asserted here to close
-    /// the loop.
-    #[test]
-    fn attack_overlapping_windows_rejected_at_placement() {
-        use crate::composition::placement::{validate_placements, CompositePlacement};
-        let a = CompositePlacement::new("A", 0, 10, 0, 16);
-        let b = CompositePlacement::new("B", 5, 20, 0, 16);
-        assert!(validate_placements(&[a, b], 32, 4).is_err());
-    }
-
     // -----------------------------------------------------------------------
     // Bounds / argument validation panics
     // -----------------------------------------------------------------------

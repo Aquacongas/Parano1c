@@ -102,8 +102,9 @@ pub fn is_full_round(r: usize) -> bool {
 
 /// Column layout for one Poseidon permutation block inside a larger
 /// trace. The default layout (`PermLayout::at(0)`) reproduces the
-/// single-instance column constants used by 3c-1. `HAddrAir` (3c-2)
-/// stacks two perm blocks side-by-side by passing different bases.
+/// single-instance column constants used by the standalone AIR.
+/// Host AIRs (e.g. `FriStateCombinerAir`) stack multiple perm blocks
+/// side-by-side by passing different bases.
 ///
 /// Within a block, columns are contiguous in the same order the
 /// `POSEIDON_COL_*` constants describe: `s (4) | sin (4) | x2 (4) |
@@ -720,8 +721,8 @@ pub fn emit_perm_all() -> Vec<Box<dyn Constraint>> {
     emit_perm_all_at(DEFAULT_PERM_LAYOUT)
 }
 
-/// Layout-parameterized version of [`emit_perm_all`]. Used by HAddrAir
-/// (3c-2) to stack two permutation blocks side-by-side.
+/// Layout-parameterized version of [`emit_perm_all`]. Used by host
+/// AIRs that stack multiple permutation blocks side-by-side.
 pub fn emit_perm_all_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out = Vec::new();
     out.extend(emit_perm_sbox_chain_at(layout));

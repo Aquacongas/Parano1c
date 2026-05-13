@@ -17,9 +17,58 @@ use noid_air::{
     composition::{build_stage_5_7_honest_fixture, tx_validity_with_spine::fixture},
     Air,
 };
+use noid_core::{Block128, TowerField};
+use noid_gkr::{
+    compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS,
+};
 use noid_poseidon2b::primitives::TxBodyHash;
+use noid_stark::auth::{prove_air_with_auth, verify_air_with_auth};
+use noid_stark::spine::{prove_air_with_spine, verify_air_with_spine};
 use noid_stark::{prove_air, verify_air};
 use noid_tx::PublicInputs;
+
+/// Lower the composite's boundary pins to the `SpineInputs` shape the
+/// GKR spine consumes. Mirrors the pin semantics documented on
+/// `TxBodyMerkleBoundaryPins`: the tree-leaf ordering is
+/// `[L0, L1, L2..L5, L6..L13, L14, L15]`.
+fn spine_inputs_from_composite(
+    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+) -> SpineInputs {
+    let pins = comp.boundary_pins();
+    SpineInputs {
+        prev_state_root: pins.prev_state_root,
+        fee_leaf: pins.fee_leaf,
+        input_leaves: pins.input_leaf_absorb,
+        output_leaves: pins.output_leaf_absorb,
+        is_coinbase_leaf: pins.is_coinbase_leaf,
+        pad_leaf: [Block128::ZERO; 2],
+    }
+}
+
+/// Build an honest `AuthInputs` anchored to the composite's tx-body
+/// hash. The auth boundary is orthogonal to the STARK's own input-owner
+/// pins — this test picks four arbitrary non-zero secrets and pins the
+/// claimed `(address, auth_tag)` pair to the circuit's native output.
+fn honest_auth_inputs(
+    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+) -> AuthInputs {
+    let circuit = AuthCircuit::build();
+    let spend_secret: [[Block128; 2]; N_AUTH_INPUTS] = [
+        [Block128::from(0xA1u128), Block128::from(0xA2u128)],
+        [Block128::from(0xB1u128), Block128::from(0xB2u128)],
+        [Block128::from(0xC1u128), Block128::from(0xC2u128)],
+        [Block128::from(0xD1u128), Block128::from(0xD2u128)],
+    ];
+    let tx_body_hash = comp.tx_body_hash_fields();
+    let (expected_address, expected_auth_tag) =
+        compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
+    AuthInputs {
+        spend_secret,
+        tx_body_hash,
+        expected_address,
+        expected_auth_tag,
+    }
+}
 
 #[test]
 #[ignore = "stage_5_7_roundtrip: heavy (2^13 rows × ~2100 cols); run with --ignored"]
@@ -178,4 +227,44 @@ fn stage_e6_consistency_assert_detects_pi_log_slots_mismatch() {
     let mut pi = comp.public_inputs();
     pi.log_slots = pi.log_slots.wrapping_add(1);
     comp.assert_public_inputs_consistent(&pi);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 Step 1 — Skinny STARK / Fat GKR round-trips.
+//
+// The 59-perm tx-body spine and the per-input Address/AuthTag sponges
+// have been evacuated from the STARK. Verification now staples two
+// independent Fiat-Shamir runs (STARK + SpineGKR, STARK + AuthGKR)
+// through one shared FRI boundary commitment and one shared
+// `(r_B, v_B)` reduction per sub-protocol.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "phase1_step1_spine_roundtrip: heavy; run with --ignored"]
+fn phase1_step1_prove_verify_with_spine_roundtrip() {
+    let comp = fixture::build_honest_realistic();
+    let trace = comp.build_trace();
+    assert!(comp.air().check(&trace));
+
+    let pi = comp.public_inputs();
+    comp.assert_public_inputs_consistent(&pi);
+
+    let spine_inputs = spine_inputs_from_composite(&comp);
+    let proof = prove_air_with_spine(comp.air(), &trace, &pi, &spine_inputs).expect("prove");
+    verify_air_with_spine(comp.air(), &pi, &spine_inputs, &proof).expect("verify");
+}
+
+#[test]
+#[ignore = "phase1_step1_auth_roundtrip: heavy; run with --ignored"]
+fn phase1_step1_prove_verify_with_auth_roundtrip() {
+    let comp = fixture::build_honest_realistic();
+    let trace = comp.build_trace();
+    assert!(comp.air().check(&trace));
+
+    let pi = comp.public_inputs();
+    comp.assert_public_inputs_consistent(&pi);
+
+    let auth_inputs = honest_auth_inputs(&comp);
+    let proof = prove_air_with_auth(comp.air(), &trace, &pi, &auth_inputs).expect("prove");
+    verify_air_with_auth(comp.air(), &pi, &auth_inputs, &proof).expect("verify");
 }

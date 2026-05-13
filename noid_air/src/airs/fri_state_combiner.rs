@@ -25,9 +25,8 @@
 //! # Column layout
 //!
 //! Five Poseidon permutation blocks stacked **back-to-back** at stride
-//! `SLOT = N_ROUNDS + 1 = 67` rows (same pattern as `HAddrAir`'s block-A /
-//! block-B chain, just generalised to five blocks). Perm `i` occupies
-//! rows `67 * i ..= 67 * i + N_ROUNDS`.
+//! `SLOT = N_ROUNDS + 1 = 67` rows. Perm `i` occupies rows
+//! `67 * i ..= 67 * i + N_ROUNDS`.
 //!
 //! | range      | semantics                                          |
 //! |------------|----------------------------------------------------|
@@ -108,9 +107,8 @@ pub const FRI_STATE_COMBINER_N_PERMS_PER_SIDE: usize =
     FRI_STATE_COMBINER_N_ABSORB_BLOCKS + 1;
 
 /// Rows per permutation slot. Perms sit back-to-back at stride
-/// `N_ROUNDS + 1`, mirroring the two-perm chain in `HAddrAir`. Each
-/// slot holds the `N_ROUNDS` transition rows plus one trailing post-MDS
-/// output row.
+/// `N_ROUNDS + 1`. Each slot holds the `N_ROUNDS` transition rows plus
+/// one trailing post-MDS output row.
 pub const FRI_STATE_COMBINER_SLOT_ROWS: usize = N_ROUNDS + 1;
 
 /// Total trace height per side: `5 * 67 = 335` live rows rounded up to

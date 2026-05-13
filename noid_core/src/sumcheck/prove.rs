@@ -3,96 +3,171 @@
 
 //! Sum-Check Prover for binary tower fields.
 //!
-//! For each of `n_vars` rounds:
-//!   1. Compute the degree-2 univariate round polynomial.
-//!   2. Emit coefficients to the transcript.
-//!   3. Derive a challenge and fold the MLE in-place.
+//! Architecture
+//! ------------
+//!
+//! For each of `n_vars` rounds the prover emits a univariate round
+//! polynomial of degree `round_degree`, absorbs its coefficients into
+//! the Fiat-Shamir channel, draws one challenge, and folds the table
+//! along the highest variable.
+//!
+//! `round_degree` is a parameter, not a constant. The legacy spine /
+//! Auth / Merkle sumchecks pin `round_degree = 2`; the Spine Kill-Shot
+//! degree-7 sumcheck (Stage 1.5.4) uses `round_degree = 8` (`d+1` for
+//! degree-7 `g` under an `eq(r, x)` factor). For an honest *multilinear*
+//! `f` the round poly is intrinsically linear, so `round_degree >= 1`
+//! is always correct — higher degrees just record extra zero
+//! coefficients.
+//!
+//! Fiat-Shamir
+//! -----------
+//!
+//! Challenges are drawn from a `FiatShamir<F>` channel. The old XOR-sum
+//! transcript placeholder is gone — any callsite that still ran on it
+//! is migrated in this commit. Tests in this crate use the in-module
+//! `XorChannel` mock, which is *insecure* but deterministic and
+//! sufficient for prove ↔ verify round-trip tests where the only
+//! requirement is that both sides agree on the challenge stream.
 
 use super::super::mle::fold::fold_highest_var_inplace;
+use crate::transcript::FiatShamir;
 use crate::{Block128, TowerField};
 
-/// A degree-2 univariate polynomial stored as [c0, c1, c2]: c0 + c1*X + c2*X^2.
-#[derive(Debug, Clone, PartialEq)]
+/// Univariate polynomial in coefficient form: `coeffs[i]` is the
+/// coefficient of `X^i`. `degree() = coeffs.len() - 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundPolynomial<F> {
-    pub coeffs: [F; 3],
+    pub coeffs: Vec<F>,
 }
 
 impl<F: TowerField> RoundPolynomial<F> {
-    /// Evaluate using Horner's method: c0 + x*(c1 + x*c2).
-    pub fn evaluate(&self, x: F) -> F {
-        self.coeffs[0] + x * (self.coeffs[1] + x * self.coeffs[2])
+    pub fn from_coeffs(coeffs: Vec<F>) -> Self {
+        Self { coeffs }
     }
 
-    /// Full Lagrange interpolation through (0, e0), (1, e1), (field(2), e2).
-    ///
-    /// Solving the 3x3 system in the field:
-    ///   c0 = e0
-    ///   c1 + c2 = e0 + e1
-    ///   c2*(f2 + f4) = e2 + e0 + (e0+e1)*f2    where f2=field(2), f4=f2*f2
-    pub fn from_three_evals_field(e0: F, e1: F, e2: F) -> Self {
-        let f2 = F::from(2u8);
-        let f4 = f2 * f2;
-        let c0 = e0;
-        let lhs = e0 + e1; // c1 + c2
-        let rhs = e2 + e0 + lhs * f2;
-        let c2 = rhs * (f2 + f4).invert();
-        let c1 = lhs + c2;
-        Self {
-            coeffs: [c0, c1, c2],
+    pub fn degree(&self) -> usize {
+        self.coeffs.len().saturating_sub(1)
+    }
+
+    /// Horner evaluation: `c0 + x*(c1 + x*(c2 + ...))`.
+    pub fn evaluate(&self, x: F) -> F {
+        let mut acc = F::ZERO;
+        for &c in self.coeffs.iter().rev() {
+            acc = acc * x + c;
         }
+        acc
+    }
+
+    /// Lagrange-interpolate from `(0, e0), (1, e1), …, (d, e_d)` with
+    /// `d = evals.len() - 1`. Points are `F::from(k as u8)`, so this
+    /// supports `evals.len() <= 256` — far beyond any sumcheck degree
+    /// we will ever run.
+    pub fn from_evals(evals: &[F]) -> Self {
+        let n = evals.len();
+        assert!(n > 0, "need at least one evaluation");
+        assert!(n <= 256, "Lagrange X-axis indexes u8");
+        let mut out = vec![F::ZERO; n];
+        let mut tmp = vec![F::ZERO; n];
+        for k in 0..n {
+            let xk = F::from(k as u8);
+            let mut num = vec![F::ZERO; n];
+            num[0] = F::ONE;
+            let mut deg = 0usize;
+            let mut denom = F::ONE;
+            for j in 0..n {
+                if j == k {
+                    continue;
+                }
+                let xj = F::from(j as u8);
+                for slot in tmp.iter_mut().take(deg + 2) {
+                    *slot = F::ZERO;
+                }
+                for i in 0..=deg {
+                    tmp[i] += num[i] * xj;
+                    tmp[i + 1] += num[i];
+                }
+                num.copy_from_slice(&tmp);
+                deg += 1;
+                denom *= xk + xj;
+            }
+            let scale = evals[k] * denom.invert();
+            for i in 0..n {
+                out[i] += num[i] * scale;
+            }
+        }
+        Self { coeffs: out }
+    }
+
+    /// Legacy three-point constructor kept for callsites that still
+    /// hand in `(p(0), p(1), p(2))` for a degree-2 round poly.
+    pub fn from_three_evals_field(e0: F, e1: F, e2: F) -> Self {
+        Self::from_evals(&[e0, e1, e2])
     }
 }
 
 /// Run the sumcheck prover for a single multilinear polynomial.
 ///
-/// `evals`       — evaluations over the boolean hypercube {0,1}^n, length 2^n.
-/// `claimed_sum` — alleged sum of all evaluations.
-/// `transcript`  — round poly coefficients are appended here; challenges are
-///                 derived as the running field-sum of all transcript elements.
+/// `evals`        — evaluations over `{0,1}^n`, length `2^n`.
+/// `round_degree` — degree of the round polynomial recorded each round
+///                  (≥ 1; the natural value for multilinear `f` is 1).
+/// `channel`      — Fiat-Shamir channel; coefficients are absorbed and
+///                  one challenge is squeezed per round.
 ///
-/// Returns `(round_polys, final_eval)`.
-pub fn prove_single<F: TowerField>(
+/// Returns `(round_polys, final_eval, challenges)`.
+pub fn prove_single_d<F: TowerField, T: FiatShamir<F>>(
     evals: &[F],
-    claimed_sum: F,
-    transcript: &mut Vec<F>,
-) -> (Vec<RoundPolynomial<F>>, F) {
+    round_degree: usize,
+    channel: &mut T,
+) -> (Vec<RoundPolynomial<F>>, F, Vec<F>) {
     let n = evals.len().trailing_zeros() as usize;
     assert_eq!(evals.len(), 1 << n, "evals length must be a power of 2");
     assert!(n > 0, "need at least 1 variable");
+    assert!(round_degree >= 1, "round polynomial must be at least linear");
 
-    let mut current_evals = evals.to_vec();
-    let mut round_polys = Vec::with_capacity(n);
-    let _claim = claimed_sum;
+    let mut current = evals.to_vec();
+    let mut polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
 
     for _round in 0..n {
-        let half = current_evals.len() / 2;
-        let f2 = F::from(2u8);
-
+        let half = current.len() / 2;
+        // For multilinear f the round poly is linear in α:
+        //   u(α) = Σ_x f_α(x), f_α(x) = (1+α) f_lo(x) + α f_hi(x)
+        // ⇒ u(α) = U0 + α · (U0 + U1), with U0=Σf_lo, U1=Σf_hi.
         let mut u0 = F::ZERO;
         let mut u1 = F::ZERO;
-        let mut u2 = F::ZERO;
         for j in 0..half {
-            let v_lo = current_evals[j];
-            let v_hi = current_evals[j + half];
-            u0 += v_lo;
-            u1 += v_hi;
-            u2 += v_lo * (F::ONE - f2) + v_hi * f2;
+            u0 += current[j];
+            u1 += current[j + half];
         }
-
-        let round_poly = RoundPolynomial::from_three_evals_field(u0, u1, u2);
-        round_polys.push(round_poly.clone());
-
-        for &c in &round_poly.coeffs {
-            transcript.push(c);
+        let sum = u0 + u1;
+        let mut evals_round = Vec::with_capacity(round_degree + 1);
+        for k in 0..=round_degree {
+            evals_round.push(u0 + F::from(k as u8) * sum);
         }
+        let poly = RoundPolynomial::from_evals(&evals_round);
 
-        let challenge = transcript.iter().fold(F::ZERO, |acc, &x| acc + x);
-        let _claim = round_poly.evaluate(challenge);
-        fold_highest_var_inplace(&mut current_evals, challenge);
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
+
+        fold_highest_var_inplace(&mut current, challenge);
+        polys.push(poly);
+        challenges.push(challenge);
     }
 
-    assert_eq!(current_evals.len(), 1);
-    (round_polys, current_evals[0])
+    debug_assert_eq!(current.len(), 1);
+    (polys, current[0], challenges)
+}
+
+/// Degree-2 wrapper for the historical `prove_single` callsites
+/// (internal noid_core tests). New code should call `prove_single_d`
+/// directly with an explicit `round_degree`.
+pub fn prove_single<F: TowerField, T: FiatShamir<F>>(
+    evals: &[F],
+    channel: &mut T,
+) -> (Vec<RoundPolynomial<F>>, F, Vec<F>) {
+    prove_single_d(evals, 2, channel)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,107 +181,92 @@ use rayon::prelude::*;
 /// Minimum number of packed elements to justify Rayon overhead.
 const PARALLEL_THRESHOLD_PACKED: usize = 256;
 
-/// Packed sumcheck prover for Block128.
-///
-/// Identical API to `prove_single`, but uses packed XOR / scalar-mul
-/// for the per-round fold when the polynomial is large enough.
-pub fn prove_single_packed(
+/// Packed sumcheck prover for `Block128`. Identical API to
+/// `prove_single_d`, but uses packed XOR for the per-round fold once
+/// the table is large enough to amortise the lane setup.
+pub fn prove_single_packed_d<T: FiatShamir<Block128>>(
     evals: &[Block128],
-    claimed_sum: Block128,
-    transcript: &mut Vec<Block128>,
-) -> (Vec<RoundPolynomial<Block128>>, Block128) {
+    round_degree: usize,
+    channel: &mut T,
+) -> (Vec<RoundPolynomial<Block128>>, Block128, Vec<Block128>) {
     let n = evals.len().trailing_zeros() as usize;
     assert_eq!(evals.len(), 1 << n, "evals length must be a power of 2");
     assert!(n > 0, "need at least 1 variable");
+    assert!(round_degree >= 1, "round polynomial must be at least linear");
 
-    let mut current_evals = evals.to_vec();
-    let mut round_polys = Vec::with_capacity(n);
-    let _claim = claimed_sum;
+    let mut current = evals.to_vec();
+    let mut polys = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
 
-    use crate::hardware::{clmul_gcm, flat_to_tower_u128};
-    // Minimum `half` to justify rayon parallelism on the round-poly
-    // accumulator. Below this the fold/reduce overhead dominates.
+    use crate::hardware::flat_to_tower_u128;
     const SUMCHECK_PAR_THRESHOLD: usize = 1 << 12;
-    for _round in 0..n {
-        let half = current_evals.len() / 2;
-        let f2 = Block128::from(2u8);
-        // Flat-basis constants used inside the u2 accumulator.
-        let c_lo_flat = tower_to_flat_u128((Block128::ONE - f2).0);
-        let c_hi_flat = tower_to_flat_u128(f2.0);
 
-        // XOR sums and the flat-basis CLMUL share the same input, so only
-        // convert each element to flat once and accumulate both sums (u0,
-        // u1) and u2 (via CLMUL) in flat. Convert u0, u1, u2 back at the
-        // end — three matrix applies per round instead of `half` tower muls.
-        let (lo_half, hi_half) = current_evals.split_at(half);
-        let (u0_flat, u1_flat, u2_flat) = if half >= SUMCHECK_PAR_THRESHOLD {
-            lo_half
-                .par_iter()
-                .zip(hi_half.par_iter())
+    for _round in 0..n {
+        let half = current.len() / 2;
+        let (lo, hi) = current.split_at(half);
+        let (u0_flat, u1_flat) = if half >= SUMCHECK_PAR_THRESHOLD {
+            lo.par_iter()
+                .zip(hi.par_iter())
                 .fold(
-                    || (0u128, 0u128, 0u128),
-                    |(a0, a1, a2), (v_lo, v_hi)| {
-                        let v_lo_flat = tower_to_flat_u128(v_lo.0);
-                        let v_hi_flat = tower_to_flat_u128(v_hi.0);
+                    || (0u128, 0u128),
+                    |(a0, a1), (v_lo, v_hi)| {
                         (
-                            a0 ^ v_lo_flat,
-                            a1 ^ v_hi_flat,
-                            a2 ^ clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat),
+                            a0 ^ tower_to_flat_u128(v_lo.0),
+                            a1 ^ tower_to_flat_u128(v_hi.0),
                         )
                     },
                 )
-                .reduce(
-                    || (0u128, 0u128, 0u128),
-                    |(a0, a1, a2), (b0, b1, b2)| (a0 ^ b0, a1 ^ b1, a2 ^ b2),
-                )
+                .reduce(|| (0u128, 0u128), |(a0, a1), (b0, b1)| (a0 ^ b0, a1 ^ b1))
         } else {
             let mut u0_flat: u128 = 0;
             let mut u1_flat: u128 = 0;
-            let mut u2_flat: u128 = 0;
             for j in 0..half {
-                let v_lo_flat = tower_to_flat_u128(lo_half[j].0);
-                let v_hi_flat = tower_to_flat_u128(hi_half[j].0);
-                u0_flat ^= v_lo_flat;
-                u1_flat ^= v_hi_flat;
-                u2_flat ^= clmul_gcm(v_lo_flat, c_lo_flat) ^ clmul_gcm(v_hi_flat, c_hi_flat);
+                u0_flat ^= tower_to_flat_u128(lo[j].0);
+                u1_flat ^= tower_to_flat_u128(hi[j].0);
             }
-            (u0_flat, u1_flat, u2_flat)
+            (u0_flat, u1_flat)
         };
         let u0 = Block128(flat_to_tower_u128(u0_flat));
         let u1 = Block128(flat_to_tower_u128(u1_flat));
-        let u2 = Block128(flat_to_tower_u128(u2_flat));
-
-        let round_poly = RoundPolynomial::from_three_evals_field(u0, u1, u2);
-        round_polys.push(round_poly.clone());
-
-        for &c in &round_poly.coeffs {
-            transcript.push(c);
+        let sum = u0 + u1;
+        let mut evals_round = Vec::with_capacity(round_degree + 1);
+        for k in 0..=round_degree {
+            evals_round.push(u0 + Block128::from(k as u8) * sum);
         }
+        let poly = RoundPolynomial::from_evals(&evals_round);
 
-        let challenge = transcript.iter().fold(Block128::ZERO, |acc, &x| acc + x);
-        let _claim = round_poly.evaluate(challenge);
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
 
-        // Packed fold
         let can_use_packed = if PACKED_LANES == 1 {
             true
         } else {
             half.is_multiple_of(PACKED_LANES) && half >= PACKED_LANES
         };
         if can_use_packed {
-            fold_highest_var_packed_inplace(&mut current_evals, challenge, half);
+            fold_highest_var_packed_inplace(&mut current, challenge, half);
         } else {
-            fold_highest_var_inplace(&mut current_evals, challenge);
+            fold_highest_var_inplace(&mut current, challenge);
         }
+        polys.push(poly);
+        challenges.push(challenge);
     }
 
-    assert_eq!(current_evals.len(), 1);
-    (round_polys, current_evals[0])
+    debug_assert_eq!(current.len(), 1);
+    (polys, current[0], challenges)
+}
+
+/// Degree-2 packed wrapper for legacy callers.
+pub fn prove_single_packed<T: FiatShamir<Block128>>(
+    evals: &[Block128],
+    channel: &mut T,
+) -> (Vec<RoundPolynomial<Block128>>, Block128, Vec<Block128>) {
+    prove_single_packed_d(evals, 2, channel)
 }
 
 /// Fold the highest variable in-place using packed operations.
-///
-/// `half` is current_evals.len() / 2.  The lower `half` elements are
-/// updated in packed form; the vector is then truncated.
 pub fn fold_highest_var_packed_inplace(
     current_evals: &mut Vec<Block128>,
     challenge: Block128,
@@ -216,9 +276,6 @@ pub fn fold_highest_var_packed_inplace(
     let packed_half = packed.len() / 2;
     let challenge_flat = tower_to_flat_u128(challenge.0);
 
-    // XOR is basis-agnostic, so we can convert each packed lane to flat
-    // basis once per fold iteration (instead of once per CLMUL inside
-    // scalar_mul) and convert back after the linear combination.
     let fold_one = |lo: &mut PackedBlock128, hi: PackedBlock128| {
         let lo_flat = lo.to_flat();
         let hi_flat = hi.to_flat();
@@ -250,23 +307,64 @@ mod tests {
 
     type F = Block128;
 
+    /// Insecure deterministic FS mock for noid_core internal tests.
+    /// Mirrors the legacy XOR-sum behaviour just enough that prover and
+    /// verifier agree on the challenge stream when wired in lockstep.
+    #[derive(Default)]
+    struct XorChannel {
+        state: F,
+    }
+
+    impl FiatShamir<F> for XorChannel {
+        fn absorb(&mut self, elem: F) {
+            self.state += elem;
+        }
+        fn squeeze(&mut self) -> F {
+            self.state += F::ONE;
+            self.state
+        }
+    }
+
     #[test]
-    fn test_from_three_evals_field_roundtrip() {
+    fn test_from_evals_roundtrip_degree_2() {
         let e0 = F::from(5u8);
         let e1 = F::from(9u8);
         let e2 = F::from(3u8);
-        let poly = RoundPolynomial::from_three_evals_field(e0, e1, e2);
+        let poly = RoundPolynomial::from_evals(&[e0, e1, e2]);
+        assert_eq!(poly.degree(), 2);
         assert_eq!(poly.evaluate(F::ZERO), e0);
         assert_eq!(poly.evaluate(F::ONE), e1);
         assert_eq!(poly.evaluate(F::from(2u8)), e2);
     }
 
     #[test]
+    fn test_from_evals_roundtrip_degree_8() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let evals: Vec<F> = (0..9).map(|_| F::from(rng.gen::<u128>())).collect();
+        let poly = RoundPolynomial::from_evals(&evals);
+        assert_eq!(poly.degree(), 8);
+        for (k, &e) in evals.iter().enumerate() {
+            assert_eq!(poly.evaluate(F::from(k as u8)), e);
+        }
+    }
+
+    #[test]
+    fn test_legacy_three_evals_alias() {
+        let e0 = F::from(11u8);
+        let e1 = F::from(22u8);
+        let e2 = F::from(33u8);
+        let a = RoundPolynomial::from_three_evals_field(e0, e1, e2);
+        let b = RoundPolynomial::from_evals(&[e0, e1, e2]);
+        assert_eq!(a.coeffs, b.coeffs);
+    }
+
+    #[test]
     fn test_prove_single_sum_consistency() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, _) = prove_single(&evals, claimed_sum, &mut transcript);
+        let mut channel = XorChannel::default();
+        let (round_polys, _, _) = prove_single(&evals, &mut channel);
         assert_eq!(round_polys.len(), 2);
         let rp0 = &round_polys[0];
         assert_eq!(rp0.evaluate(F::ZERO) + rp0.evaluate(F::ONE), claimed_sum);
@@ -279,8 +377,8 @@ mod tests {
         let n = 4;
         let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut transcript = Vec::new();
-        let (round_polys, _) = prove_single(&evals, claimed_sum, &mut transcript);
+        let mut channel = XorChannel::default();
+        let (round_polys, _, _) = prove_single(&evals, &mut channel);
         assert_eq!(round_polys.len(), n);
         assert_eq!(
             round_polys[0].evaluate(F::ZERO) + round_polys[0].evaluate(F::ONE),
@@ -292,23 +390,39 @@ mod tests {
     fn test_prove_single_packed_matches_scalar() {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let n = 6; // 64 elements, fits nicely in packed lanes
+        let n = 6;
         let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
-        let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
 
-        let mut transcript_scalar = Vec::new();
-        let (scalar_polys, scalar_final) =
-            prove_single(&evals, claimed_sum, &mut transcript_scalar);
+        let mut ch_s = XorChannel::default();
+        let (scalar_polys, scalar_final, scalar_ch) = prove_single(&evals, &mut ch_s);
 
-        let mut transcript_packed = Vec::new();
-        let (packed_polys, packed_final) =
-            prove_single_packed(&evals, claimed_sum, &mut transcript_packed);
+        let mut ch_p = XorChannel::default();
+        let (packed_polys, packed_final, packed_ch) = prove_single_packed(&evals, &mut ch_p);
 
         assert_eq!(scalar_final, packed_final);
         assert_eq!(scalar_polys.len(), packed_polys.len());
         for (s, p) in scalar_polys.iter().zip(packed_polys.iter()) {
             assert_eq!(s.coeffs, p.coeffs);
         }
-        assert_eq!(transcript_scalar, transcript_packed);
+        assert_eq!(scalar_ch, packed_ch);
+    }
+
+    #[test]
+    fn test_prove_single_d_higher_degree_records_zeros() {
+        // For multilinear f, the round poly is linear: higher
+        // `round_degree` just zero-pads the high coefficients.
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let evals: Vec<F> = (0..16).map(|_| F::from(rng.gen::<u128>())).collect();
+
+        let mut ch_a = XorChannel::default();
+        let (polys_d7, _, _) = prove_single_d(&evals, 7, &mut ch_a);
+
+        for poly in &polys_d7 {
+            assert_eq!(poly.degree(), 7);
+            for k in 2..=7 {
+                assert_eq!(poly.coeffs[k], F::ZERO);
+            }
+        }
     }
 }
