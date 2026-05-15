@@ -551,10 +551,9 @@ pub fn rlc_openings(lambdas: &[Block128], openings: &[Block128]) -> Block128 {
 
 /// Pointwise batched codeword `C_batch[j] = Σ λ_i · C_i[j]` (§12b.2 step 3).
 ///
-/// All inputs must be the same length. Parallelises across symbol
-/// positions when the codeword is long enough for the overhead to pay
-/// off, and stays deterministic in its reduction order (per-index
-/// accumulation over columns in ascending `i`).
+/// All inputs must be the same length. Column-major accumulation for
+/// cache locality: each codeword is read sequentially, the output buffer
+/// is written sequentially. Parallelised via fold/reduce over columns.
 pub fn rlc_codewords(lambdas: &[Block128], codewords: &[&[Block128]]) -> Vec<Block128> {
     assert_eq!(
         lambdas.len(),
@@ -577,26 +576,29 @@ pub fn rlc_codewords(lambdas: &[Block128], codewords: &[&[Block128]]) -> Vec<Blo
     }
 
     use rayon::prelude::*;
-    if len >= 1024 {
-        (0..len)
-            .into_par_iter()
-            .map(|j| {
-                let mut acc = Block128::ZERO;
-                for (i, &lam) in lambdas.iter().enumerate() {
-                    acc += lam * codewords[i][j];
+    let n_cols = lambdas.len();
+    (0..n_cols)
+        .into_par_iter()
+        .fold(
+            || vec![Block128::ZERO; len],
+            |mut acc, i| {
+                let lam = lambdas[i];
+                let cw = codewords[i];
+                for j in 0..len {
+                    acc[j] += lam * cw[j];
                 }
                 acc
-            })
-            .collect()
-    } else {
-        let mut out = vec![Block128::ZERO; len];
-        for (i, &lam) in lambdas.iter().enumerate() {
-            for (j, &v) in codewords[i].iter().enumerate() {
-                out[j] += lam * v;
-            }
-        }
-        out
-    }
+            },
+        )
+        .reduce(
+            || vec![Block128::ZERO; len],
+            |mut a, b| {
+                for j in 0..len {
+                    a[j] += b[j];
+                }
+                a
+            },
+        )
 }
 
 /// Query-phase batched symbol pair `(Σ λ_i · s_{i,0}, Σ λ_i · s_{i,1})`

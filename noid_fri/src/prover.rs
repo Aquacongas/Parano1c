@@ -6,7 +6,7 @@
 //! Implements a PCS (Polynomial Commitment Scheme) over binary tower fields
 //! using the FRI protocol with Poseidon2b Merkle trees.
 
-use noid_core::{AdditiveNTT, Block128, CanonicalSerialize, TowerField};
+use noid_core::{AdditiveNTT, Block128, TowerField};
 use rayon::prelude::*;
 
 use crate::channel::{Channel, TAU};
@@ -224,14 +224,30 @@ pub fn commit_fast(evals: &[Block128], ntt: &AdditiveNTT<Block128>) -> FriCommit
 
     // Batch-serialise codeword into a byte buffer so Blake3's SIMD path
     // fires on large chunks instead of one 16-byte update per element.
-    const CHUNK_ELEMS: usize = 4096;
-    let mut buf = vec![0u8; CHUNK_ELEMS * 16];
-    for chunk in code.encoding.chunks(CHUNK_ELEMS) {
-        for (i, sym) in chunk.iter().enumerate() {
-            sym.serialize(&mut buf[i * 16..(i + 1) * 16])
-                .expect("Block128 serializes into 16 bytes");
+    // Block128 is #[repr(transparent)] wrapping u128; on little-endian
+    // the in-memory layout is identical to to_le_bytes(), so we can
+    // cast the entire slice directly without per-element overhead.
+    #[cfg(target_endian = "little")]
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                code.encoding.as_ptr() as *const u8,
+                code.encoding.len() * 16,
+            )
+        };
+        hasher_blake.update(bytes);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        const CHUNK_ELEMS: usize = 4096;
+        let mut buf = vec![0u8; CHUNK_ELEMS * 16];
+        for chunk in code.encoding.chunks(CHUNK_ELEMS) {
+            for (i, sym) in chunk.iter().enumerate() {
+                sym.serialize(&mut buf[i * 16..(i + 1) * 16])
+                    .expect("Block128 serializes into 16 bytes");
+            }
+            hasher_blake.update(&buf[..chunk.len() * 16]);
         }
-        hasher_blake.update(&buf[..chunk.len() * 16]);
     }
     let root: HashOutput = *hasher_blake.finalize().as_bytes();
 

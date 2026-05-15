@@ -66,22 +66,26 @@ impl Code {
     /// Encode a message with rate-4 RS code using parallel NTT (Block128 only).
     ///
     /// Allocates the `RATE * len` output once and transforms each coset in
-    /// place. Avoids the per-round `to_vec` + `append` used in `new_parallel`'s
-    /// original form (roughly 5x memcpy amortisation per round at log_n=20).
+    /// place. All four coset NTTs run in parallel via rayon, saturating
+    /// available cores even for moderate NTT sizes.
     pub fn new_parallel(message: &[Block128], ntt: &AdditiveNTT<Block128>) -> Self {
         use rayon::prelude::*;
         let n = message.len();
         let mut encoding = vec![Block128::ZERO; n * RATE];
 
-        // Fill the four coset input buffers in parallel, then run the NTTs
-        // serially (each NTT already saturates the rayon pool).
+        // Fill the four coset input buffers in parallel.
         encoding
             .par_chunks_exact_mut(n)
             .for_each(|slot| slot.copy_from_slice(message));
 
-        for (round, slot) in encoding.chunks_exact_mut(n).enumerate() {
-            ntt.forward_transform_parallel(slot, round as u32, 0);
-        }
+        // Run all RATE NTT transforms in parallel — each slot is
+        // independent and `forward_transform_parallel` only borrows `&self`.
+        encoding
+            .par_chunks_exact_mut(n)
+            .enumerate()
+            .for_each(|(round, slot)| {
+                ntt.forward_transform_parallel(slot, round as u32, 0);
+            });
 
         Code { encoding }
     }

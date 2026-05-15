@@ -341,48 +341,39 @@ fn fold_highest_flat(table: &mut Vec<u128>, r_flat: u128) {
     table.truncate(half);
 }
 
-/// Partial evaluation at sample-integer `s_idx ∈ {0, 1, ..., degree}`
-/// on the highest variable of a flat-basis multilinear table. For
-/// `s_idx == 0` / `s_idx == 1` we return a borrowed half-slice (no
-/// allocation): those sample points live in GF(2) ⊂ GF(2^128), and
-/// their `u128` bit patterns are identical in tower and flat basis.
-/// For `s_idx >= 2` the caller passes the already-flat-converted
-/// scalar `s_flat` and we allocate the result.
-#[inline]
-fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> std::borrow::Cow<'_, [u128]> {
-    use noid_core::hardware::clmul_gcm;
-    use std::borrow::Cow;
-    let half = table.len() / 2;
-    if s_idx == 0 {
-        return Cow::Borrowed(&table[..half]);
-    }
-    if s_idx == 1 {
-        return Cow::Borrowed(&table[half..]);
-    }
-    let mut out = Vec::with_capacity(half);
-    for j in 0..half {
-        out.push(table[j] ^ clmul_gcm(s_flat, table[j + half] ^ table[j]));
-    }
-    Cow::Owned(out)
-}
-
 /// Evaluate the per-row composition `eq · Σ β_k · C_k` in flat basis,
-/// given partial tables at some value `s` of the current round
-/// variable, accumulated over the remaining `half` hypercube
-/// positions. Uses precomputed `compiled.betas_flat` and
-/// `Constraint::evaluate_flat` so that every inner product runs
-/// through flat-basis CLMUL rather than tower-basis Karatsuba.
-fn accumulate_sum_flat(
-    eq_at_s: &[u128],
-    col_tables_at_s: &[std::borrow::Cow<'_, [u128]>],
+/// fusing partial-evaluation of `eq` and every column with the constraint
+/// accumulation. Computes `partial[j] = table[j] ⊕ s_flat·(table[j+half]⊕table[j])`
+/// on-the-fly per hypercube position `j`, eliminating the `Vec<Cow>`
+/// allocations that the legacy two-step pipeline incurred for every
+/// sample point ≥ 2.
+fn accumulate_sum_flat_fused(
+    cur_eq: &[u128],
+    cur_cols: &[Vec<u128>],
     compiled: &CompiledGates<'_>,
+    s_idx: usize,
+    s_flat: u128,
 ) -> u128 {
     use noid_core::hardware::clmul_gcm;
     use rayon::prelude::*;
-    let half = eq_at_s.len();
+    let half = cur_eq.len() / 2;
     let n_constraints = compiled.constraints.len();
     let local_cap = compiled.max_local_arity;
     let next_cap = compiled.max_next_arity;
+    let n_cols = cur_cols.len();
+
+    // Inline partial-eval helper — avoids function call overhead in the hot loop.
+    #[inline(always)]
+    fn pe(table: &[u128], j: usize, half: usize, s_idx: usize, s_flat: u128) -> u128 {
+        if s_idx == 0 {
+            table[j]
+        } else if s_idx == 1 {
+            table[j + half]
+        } else {
+            table[j] ^ clmul_gcm(s_flat, table[j + half] ^ table[j])
+        }
+    }
+
     (0..half)
         .into_par_iter()
         .map_init(
@@ -390,22 +381,29 @@ fn accumulate_sum_flat(
                 (
                     Vec::<u128>::with_capacity(local_cap),
                     Vec::<u128>::with_capacity(next_cap),
+                    vec![0u128; n_cols],
                 )
             },
-            |(local_scratch, next_scratch), j| {
+            |(local_scratch, next_scratch, col_partials), j| {
+                let eq_val = pe(cur_eq, j, half, s_idx, s_flat);
+
+                for (col_idx, col) in cur_cols.iter().enumerate() {
+                    col_partials[col_idx] = pe(col, j, half, s_idx, s_flat);
+                }
+
                 let mut composition: u128 = 0;
                 for k in 0..n_constraints {
                     let lo_s = compiled.col_index_starts[k] as usize;
                     let lo_e = compiled.col_index_starts[k + 1] as usize;
                     local_scratch.clear();
                     for &idx in &compiled.col_indices[lo_s..lo_e] {
-                        local_scratch.push(col_tables_at_s[idx as usize][j]);
+                        local_scratch.push(col_partials[idx as usize]);
                     }
                     let ne_s = compiled.next_index_starts[k] as usize;
                     let ne_e = compiled.next_index_starts[k + 1] as usize;
                     next_scratch.clear();
                     for &idx in &compiled.next_indices[ne_s..ne_e] {
-                        next_scratch.push(col_tables_at_s[idx as usize][j]);
+                        next_scratch.push(col_partials[idx as usize]);
                     }
                     let frame = FlatEvalFrame {
                         local: local_scratch.as_slice(),
@@ -414,7 +412,7 @@ fn accumulate_sum_flat(
                     let ck = compiled.constraints[k].evaluate_flat(frame);
                     composition ^= clmul_gcm(compiled.betas_flat[k], ck);
                 }
-                clmul_gcm(eq_at_s[j], composition)
+                clmul_gcm(eq_val, composition)
             },
         )
         .reduce(|| 0u128, |a, b| a ^ b)
@@ -485,12 +483,8 @@ fn prove_zero_check(
                 .into_par_iter()
                 .map(|s_idx| {
                     let s_flat = s_flat_table[s_idx];
-                    let eq_at_s = partial_eval_highest_flat_at(&cur_eq, s_idx, s_flat);
-                    let cols_at_s: Vec<std::borrow::Cow<'_, [u128]>> = cur_cols
-                        .iter()
-                        .map(|c| partial_eval_highest_flat_at(c, s_idx, s_flat))
-                        .collect();
-                    let acc_flat = accumulate_sum_flat(&*eq_at_s, &cols_at_s, &compiled);
+                    let acc_flat =
+                        accumulate_sum_flat_fused(&cur_eq, &cur_cols, &compiled, s_idx, s_flat);
                     Block128::from(flat_to_tower_u128(acc_flat))
                 })
                 .collect()
@@ -859,18 +853,32 @@ fn prove_multipoint_close_inner(
     let eq_base = eq_ind_partial_eval(r_point);
     let hyper_len = 1usize << log_len;
 
-    // Fold Σ_i λ_i · c_i into one combined B table. Parallel across the
-    // hypercube so the scaling is O((n · 2^log_len) / cores).
-    let combined_base_b: Vec<Block128> = (0..hyper_len)
+    // Fold Σ_i λ_i · c_i into one combined B table. Column-major order
+    // for cache locality: each column is read sequentially, the output
+    // buffer is written sequentially. Parallelised via fold/reduce — one
+    // partial buffer per rayon task, then summed.
+    let combined_base_b: Vec<Block128> = (0..n)
         .into_par_iter()
-        .map(|j| {
-            let mut acc = Block128::ZERO;
-            for i in 0..n {
-                acc += lambdas[i] * padded_columns[i][j];
-            }
-            acc
-        })
-        .collect();
+        .fold(
+            || vec![Block128::ZERO; hyper_len],
+            |mut acc, i| {
+                let lambda = lambdas[i];
+                let col = &padded_columns[i];
+                for j in 0..hyper_len {
+                    acc[j] += lambda * col[j];
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![Block128::ZERO; hyper_len],
+            |mut a, b| {
+                for j in 0..hyper_len {
+                    a[j] += b[j];
+                }
+                a
+            },
+        );
 
     let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
         .into_par_iter()
@@ -1287,16 +1295,28 @@ fn prove_multipoint_close_mixed(
     // same savings on the base slab.
     let eq_base = eq_ind_partial_eval(r_point);
     let hyper_len = 1usize << log_len;
-    let combined_base_b: Vec<Block128> = (0..hyper_len)
+    let combined_base_b: Vec<Block128> = (0..n)
         .into_par_iter()
-        .map(|j| {
-            let mut acc = Block128::ZERO;
-            for i in 0..n {
-                acc += lambdas[i] * padded_columns[i][j];
-            }
-            acc
-        })
-        .collect();
+        .fold(
+            || vec![Block128::ZERO; hyper_len],
+            |mut acc, i| {
+                let lambda = lambdas[i];
+                let col = &padded_columns[i];
+                for j in 0..hyper_len {
+                    acc[j] += lambda * col[j];
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![Block128::ZERO; hyper_len],
+            |mut a, b| {
+                for j in 0..hyper_len {
+                    a[j] += b[j];
+                }
+                a
+            },
+        );
 
     let weight_trails = if s_count > 0 {
         Some(crate::ladder_batch::WeightTrails::new(r_point))
