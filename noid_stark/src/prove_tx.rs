@@ -85,6 +85,7 @@ pub enum ProveTxError {
 pub enum VerifyTxError {
     SpineKillShot,
     AuthKillShot,
+    AuthSpineBridge,
     SliceReconstruction,
     Stark(VerifyError),
 }
@@ -348,6 +349,26 @@ pub fn verify_tx(
         &mut auth_channel,
     )
     .ok_or(VerifyTxError::AuthKillShot)?;
+
+    // =========================================================================
+    // Stage 1b: Auth <-> Spine bridge
+    //   Verify that auth GKR's claimed addresses match the owner fields
+    //   committed in the spine's input leaves (live inputs only), and that
+    //   auth GKR binds to the same tx_body_hash the spine proved.
+    //   Dummy inputs use zeroed owners in the spine but H_ADDR([0,0]) in
+    //   the auth circuit, so only live inputs are bridged.
+    // =========================================================================
+    if auth_inputs.tx_body_hash != claimed {
+        return Err(VerifyTxError::AuthSpineBridge);
+    }
+    let n_live = pi.n_live_inputs as usize;
+    for i in 0..n_live {
+        let owner_hi = spine_inputs.input_leaves[i][2];
+        let owner_lo = spine_inputs.input_leaves[i][3];
+        if auth_inputs.expected_address[i] != [owner_hi, owner_lo] {
+            return Err(VerifyTxError::AuthSpineBridge);
+        }
+    }
 
     // =========================================================================
     // Stage 2: Verify STARK (with slice claims)

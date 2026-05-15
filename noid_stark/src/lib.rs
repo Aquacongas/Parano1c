@@ -123,7 +123,7 @@ pub fn padded_log_len(log_rows: usize) -> usize {
     (TAU + 1).max(log_rows)
 }
 
-pub(crate) fn pad_column(column: &[Block128], target_log: usize) -> Vec<Block128> {
+pub fn pad_column(column: &[Block128], target_log: usize) -> Vec<Block128> {
     let target = 1usize << target_log;
     if column.len() == target {
         return column.to_vec();

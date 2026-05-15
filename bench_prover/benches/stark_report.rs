@@ -14,17 +14,23 @@ use noid_air::{
     build_perm_trace, emit_perm_all, Air, CompositeAir, RangeGateAir, Trace,
     POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
 };
-use noid_core::{Block128, TowerField};
+use noid_core::mle::evaluate::evaluate_slice;
+use noid_core::mle::split::split_mle_into_slices;
+use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
+use noid_fri::prover::commit_fast;
 use noid_fri::{NUM_QUERIES, TAU};
 use noid_gkr::{
-    compute_auth_boundary, compute_tx_body_hash, prove_auth_killshot, prove_spine_killshot,
-    verify_auth_killshot, verify_spine_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
-    SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_INPUTS,
+    build_auth_unified_from_inputs, build_boundary_mle, compute_auth_boundary,
+    compute_tx_body_hash, prove_auth_killshot, prove_spine_killshot,
+    reconstruct_slot_states, verify_auth_killshot, verify_spine_killshot, AuthCircuit,
+    AuthInputs, AuthProofKillShot, SpineCircuit, SpineInputs, SpineProofKillShot,
+    N_AUTH_INPUTS, N_AUTH_UNIFIED_VARS, N_BOUNDARY_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_stark::{
-    padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings, StarkProof,
+    pad_column, padded_log_len, prove_air, prove_air_timed, prove_air_with_slices,
+    verify_air_timed, verify_air_with_slices, ProveTimings, SliceClaim, StarkProof,
     VerifyTimings,
 };
 use noid_tx::{PublicInputs, MAX_INPUTS, MAX_OUTPUTS};
@@ -417,13 +423,16 @@ fn spine_inputs_from_composite(
 fn auth_inputs_from_composite(
     comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
 ) -> AuthInputs {
+    use noid_air::composition::tx_validity_with_spine::fixture::mk_secret;
+
     let circuit = AuthCircuit::build();
-    let spend_secret: [[Block128; 2]; N_AUTH_INPUTS] = [
-        [Block128::from(0xA1u128), Block128::from(0xA2u128)],
-        [Block128::from(0xB1u128), Block128::from(0xB2u128)],
-        [Block128::from(0xC1u128), Block128::from(0xC2u128)],
-        [Block128::from(0xD1u128), Block128::from(0xD2u128)],
-    ];
+    let pi = comp.public_inputs();
+    let n_live = pi.n_live_inputs as usize;
+    let all_secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let mut spend_secret = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
+    for i in 0..n_live {
+        spend_secret[i] = all_secrets[i];
+    }
     let tx_body_hash = comp.tx_body_hash_fields();
     let (expected_address, expected_auth_tag) =
         compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
@@ -553,18 +562,105 @@ fn bench_production() -> ProdRow {
     });
 
     // -----------------------------------------------------------------------
-    // Isolated: STARK (with bucket breakdown)
-    //   log_rows=13, 291 columns, 75 shifted
+    // Isolated: STARK with slice columns (production 297-col path)
+    //   log_rows=13, 291 AIR columns + 6 boundary slices = 297 total
     //   Proves: BalanceGate (UTXO conservation), RangeGate (u64 decomp),
     //           FriStateCombiner, FriStateOpen (input/output),
-    //           TxBodyHash boundary pins, coinbase gate
+    //           TxBodyHash boundary pins, coinbase gate,
+    //           + 6 slice column openings at GKR reduction points
     // -----------------------------------------------------------------------
-    let stark_prove_buckets = collect_prove_buckets(air, &trace, &pi, SAMPLES);
-    let stark_prove = stark_prove_buckets.total();
+    let log_len = padded_log_len(air.log_rows());
+    let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
 
-    let stark_proof = prove_air(air, &trace, &pi).unwrap();
-    let stark_verify_buckets = collect_verify_buckets(air, &pi, &stark_proof, SAMPLES);
-    let stark_verify = stark_verify_buckets.total();
+    // Build slice columns (mirrors prove_tx Stage 1)
+    let spine_states = reconstruct_slot_states(&spine_circuit, &spine_inputs);
+    let spine_boundary_mle = build_boundary_mle(&spine_states);
+    let spine_slices = split_mle_into_slices(&spine_boundary_mle, N_BOUNDARY_VARS, log_len);
+    let auth_unified_mle = build_auth_unified_from_inputs(&auth_circuit, &auth_inputs);
+    let auth_slices = split_mle_into_slices(&auth_unified_mle.state, N_AUTH_UNIFIED_VARS, log_len);
+
+    let n_air_cols = trace.columns.len();
+    let n_boundary_slices = spine_slices.len() + auth_slices.len();
+
+    let mut all_columns: Vec<Vec<Block128>> = Vec::with_capacity(n_air_cols + n_boundary_slices);
+    for col in &trace.columns {
+        all_columns.push(pad_column(col, log_len));
+    }
+    for s in &spine_slices {
+        all_columns.push(s.clone());
+    }
+    for s in &auth_slices {
+        all_columns.push(s.clone());
+    }
+
+    let commitments: Vec<_> = {
+        use rayon::prelude::*;
+        all_columns
+            .par_iter()
+            .map(|col| commit_fast(col, &ntt))
+            .collect()
+    };
+
+    // Build slice claims (mirrors prove_tx Stage 4)
+    let spine_r_low: Vec<Block128> = (0..log_len)
+        .map(|b| Block128::from(((b * 7 + 3) % 128) as u128))
+        .collect();
+    let auth_r_low: Vec<Block128> = (0..log_len)
+        .map(|b| Block128::from(((b * 11 + 5) % 128) as u128))
+        .collect();
+    let spine_slice_values: Vec<Block128> = spine_slices
+        .iter()
+        .map(|s| evaluate_slice(s, &spine_r_low))
+        .collect();
+    let auth_slice_values: Vec<Block128> = auth_slices
+        .iter()
+        .map(|s| evaluate_slice(s, &auth_r_low))
+        .collect();
+
+    let mut slice_claims: Vec<SliceClaim> = Vec::with_capacity(n_boundary_slices);
+    for (i, &val) in spine_slice_values.iter().enumerate() {
+        slice_claims.push(SliceClaim {
+            col_index: n_air_cols + i,
+            eval_point: spine_r_low.clone(),
+            value: val,
+        });
+    }
+    for (i, &val) in auth_slice_values.iter().enumerate() {
+        slice_claims.push(SliceClaim {
+            col_index: n_air_cols + spine_slices.len() + i,
+            eval_point: auth_r_low.clone(),
+            value: val,
+        });
+    }
+
+    // Measure STARK with slices (total time, including commit)
+    let stark_prove = time(|| {
+        let ntt_inner = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
+        let commits: Vec<_> = {
+            use rayon::prelude::*;
+            all_columns
+                .par_iter()
+                .map(|col| commit_fast(col, &ntt_inner))
+                .collect()
+        };
+        let _ = prove_air_with_slices(
+            air, &all_columns, &commits, &pi, &[], &slice_claims, log_len,
+        );
+    });
+    let stark_proof = prove_air_with_slices(
+        air, &all_columns, &commitments, &pi, &[], &slice_claims, log_len,
+    );
+
+    let stark_verify = time(|| {
+        verify_air_with_slices(air, &pi, &stark_proof, &[], &slice_claims)
+            .expect("STARK verify with slices");
+    });
+
+    // Bucket breakdown (approximation via 291-col timed path)
+    let stark_prove_buckets = collect_prove_buckets(air, &trace, &pi, SAMPLES);
+    let stark_verify_buckets = collect_verify_buckets(air, &pi, &{
+        prove_air(air, &trace, &pi).unwrap()
+    }, SAMPLES);
 
     let n_shifted = air.shifted_column_indices().len();
 
@@ -573,7 +669,7 @@ fn bench_production() -> ProdRow {
         verify,
         proof_bytes,
         log_rows: air.log_rows(),
-        n_cols: air.n_columns(),
+        n_cols: n_air_cols + n_boundary_slices,
         n_shifted,
         spine_proof_bytes,
         auth_proof_bytes,
@@ -620,10 +716,11 @@ fn print_prod_row(r: &ProdRow) {
     println!();
 
     // --- STARK ---
-    println!("  [1] STARK — Binius-style over GF(2^128)");
+    println!("  [1] STARK — Binius-style over GF(2^128), production 297-col path");
     println!("      Constraints: BalanceGate (UTXO conservation), RangeGate (u64 bit-decomp),");
     println!("                   FriStateCombiner, FriStateOpen (in/out), TxBodyHash pins,");
-    println!("                   coinbase gate, activation/deactivation selectors");
+    println!("                   coinbase gate, activation/deactivation selectors,");
+    println!("                   + 6 boundary-slice columns (4 spine + 2 auth)");
     println!(
         "      Parameters:  log_rows={}  columns={}  shifted={}",
         r.log_rows, r.n_cols, r.n_shifted,
@@ -646,9 +743,9 @@ fn print_prod_row(r: &ProdRow) {
     );
     println!();
 
-    // STARK prover buckets
+    // STARK prover buckets (291-col approximation for sub-bucket breakdown)
     let ptot = r.stark_prove_buckets.total();
-    println!("      prover buckets:");
+    println!("      prover buckets (approx, 291-col breakdown):");
     println!(
         "        commit (Merkle)        {}  ({:>5.1}%)",
         fmt_ms(r.stark_prove_buckets.commit),
@@ -690,7 +787,7 @@ fn print_prod_row(r: &ProdRow) {
 
     // STARK verifier buckets
     let vtot = r.stark_verify_buckets.total();
-    println!("      verifier buckets:");
+    println!("      verifier buckets (approx, 291-col breakdown):");
     println!(
         "        transcript sumcheck    {}  ({:>5.1}%)",
         fmt_ms(r.stark_verify_buckets.transcript_sumcheck),
