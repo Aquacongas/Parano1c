@@ -222,19 +222,29 @@ feature, and the former in-AIR spine has been retired from the default
 build surface.
 
 GKR (Goldwasser–Kalai–Rothblum) is a **separate sumcheck protocol**
-optimised for repetitive arithmetic circuits. Here it proves the
-entire 59-hash tx-body spine in a single bottom-up traversal:
+optimised for repetitive arithmetic circuits. It proves both:
+
+- the **59-permutation tx-body spine** (tx_body_hash derivation);
+- the **20-slot auth circuit** (4 inputs × 5 Poseidon2b sponges each:
+  HAddr + HAuth per input).
+
+Both use the **Kill-Shot** protocol: a single unified degree-7
+sumcheck over ALL slots simultaneously, followed by a shift argument
+that links the cross-slot state→s_in transitions. This replaces the
+former per-slot PermProof chain with two compact proof objects:
+`SpineProofKillShot` and `AuthProofKillShot`.
 
 ```
-    spine output (tx_body_hash)
-              ▲
-              │   folded by sumcheck
-              │
-       ┌──────┴──────┐
-       │   66 layers │   ← one per permutation round
-       └──────┬──────┘
-              │
-    spine inputs (tx-body leaves)
+    spine output (tx_body_hash)         auth outputs (Address, AuthTag)
+              ▲                                   ▲
+              │   unified sumcheck + shift         │   unified sumcheck + shift
+              │                                   │
+       ┌──────┴──────┐                     ┌──────┴──────┐
+       │  59 slots   │                     │  20 slots   │
+       │  15-var MLE │                     │  14-var MLE │
+       └──────┬──────┘                     └──────┬──────┘
+              │                                   │
+    spine inputs (tx-body leaves)     auth inputs (secret, tx_body_hash)
 ```
 
 The payoff:
@@ -255,36 +265,31 @@ The payoff:
   every subsequent STARK challenge.
 
 Internal structure of the implementation (detailed specification:
-`gkr.md` and `noid_gkr/AUDIT.md`):
+`noid_gkr/SPEC.md` and `noid_gkr/AUDIT.md`):
 
 ```
-  circuit.rs          Static 59-slot topology, read from
-                      noid_air::airs::tx_body_merkle::layout
-                      (no duplication).
-  oracle.rs           Reference execution via
-                      noid_poseidon2b::native — source of truth for
-                      differential tests.
-  layers.rs           Layered witness of a single permutation:
-                      columns state / sin / x2 / x3 / x4 / sout.
-                      The S-box x^7 is decomposed into four degree-2
-                      identities (x2=sin·sin, x4=x2·x2, x3=x2·sin,
-                      sout=x4·x3).
-  mle_layout.rs       Multilinear-extension packing of the layered
-                      witness: 9 variables, 2^9 = 512 cells per slot.
-  product_sumcheck.rs Primitive: Σ eq·A·B sumcheck, round-polynomial
-                      degree 3, four evaluations per round.
-  perm_sumcheck.rs    Per-slot reduction: 5 product sumchecks for the
-                      S-box chain + 3 sin-expansion sumchecks →
-                      three claims on the slot's state MLE.
-  batch_eval.rs       γ₂ primitive: RLC + degree-2 sumcheck,
-                      collapses M point-value claims into one
-                      (r_B, v_B).
-  spine_sumcheck.rs   Orchestrator: drives all 59 slots plus the
-                      batch-eval into a single SpineProof; cross-
-                      checks wrap.state_out[0..1] ==
-                      claimed_tx_body_hash.
-  binding.rs          In-code contract for the STARK ↔ GKR cut
-                      (BindingCut).
+  circuit.rs            Static 59-slot spine topology, read from
+                        noid_air::airs::tx_body_merkle::layout.
+  auth_circuit.rs       Static 20-slot auth topology (4 inputs ×
+                        5 sponges: HAddr + HAuth per input).
+  oracle.rs             Reference execution via noid_poseidon2b::native.
+  auth_oracle.rs        Auth-side reference execution.
+  layers.rs             Layered witness of a single permutation:
+                        columns state / sin / x2 / x3 / x4 / sout.
+  mle_layout.rs         MLE packing: 9 variables (spine), 512 cells/slot.
+  spine_unified_v2.rs   Unified degree-7 sumcheck over all 59 spine
+                        slots simultaneously (replaces per-slot PermProof).
+  spine_shift.rs        Shift argument: proves state(x)→s_in(x⊕1)
+                        linking across slots.
+  spine_killshot.rs     Kill-Shot orchestrator (spine): unified + shift
+                        + 3× batch-eval → SpineProofKillShot.
+  auth_unified_v2.rs    Unified degree-7 sumcheck over all 20 auth slots.
+  auth_shift.rs         Auth-side shift argument.
+  auth_killshot.rs      Kill-Shot orchestrator (auth): unified + shift
+                        + 3× batch-eval → AuthProofKillShot.
+  batch_eval.rs         γ₂ primitive: RLC + degree-2 sumcheck,
+                        collapses M point-value claims into (r_B, v_B).
+  binding.rs            In-code contract for the STARK ↔ GKR cut.
 ```
 
 ### 4.3 STARK + FRI — the "final seal"
@@ -467,22 +472,23 @@ but also that
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 3 — WITNESS GENERATION (local to the wallet)          │
-  │   AIR traces: balance, range, haddr, hauth, fri_state_open, │
+  │   AIR traces: balance, range, fri_state_open,               │
   │               tx_body_spine (2-lane pin), tx_validity       │
-  │   GKR witness: 59 × layered Poseidon2b permutations         │
-  │   boundary MLE: concat 59 × state_in (2^15 cells)           │
+  │   GKR witness: 59 × spine perms + 20 × auth perms          │
+  │   boundary MLEs: spine (2^15 cells) + auth (2^14 padded→2^15)│
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │ LEVEL 4 — PROVING                                           │
-  │   GKR:   per-slot sumcheck × 59 + γ₂ batch-eval on boundary │
-  │          → (SpineProof, (r_B, v_B))                         │
-  │   STARK: AIR constraints → polynomial → FRI (including the  │
-  │          boundary-MLE opening at r_B); spine bytes feed the │
-  │          STARK extra_transcript hook before the zero-check  │
-  │          draw                                               │
-  │   FS:    one shared Poseidon2b transcript for STARK + GKR   │
-  │   → per-tx proof                                            │
+  │ LEVEL 4 — PROVING  (noid_stark::prove_tx)                   │
+  │   SpineGKR Kill-Shot: unified sumcheck + shift over 59 slots│
+  │          → (SpineProofKillShot, (r_B, v_B))                 │
+  │   AuthGKR Kill-Shot:  unified sumcheck + shift over 20 slots│
+  │          → (AuthProofKillShot, (r_B, v_B))                  │
+  │   STARK: AIR constraints → polynomial → FRI; both boundary  │
+  │          MLEs ride as ExtraColumns in multipoint-close;      │
+  │          both KS bytes feed extra_transcript before the      │
+  │          zero-check draw (spine first, auth second)         │
+  │   → per-tx TxProof                                          │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
@@ -526,11 +532,11 @@ but also that
 | `noid_fri` | polynomial over a domain | FRI proof, Merkle openings | Low-degree proximity test. |
 | `noid_binius` | bit / byte columns | packed commitment | 128× DA savings via bit-packing. |
 | `noid_air` | semantic inputs | tables + constraints | Per-`tx` logic encoded as AIRs. |
-| `noid_gkr` | 59 × perm witness + boundary MLE | `SpineProof` + `(r_B, v_B)` reduction | Proves the 59-permutation tx-body spine outside the STARK trace. |
-| `noid_stark` | AIR traces | per-`tx` STARK proof | Final non-interactive seal. |
+| `noid_gkr` | 59 × perm witness (spine) + 20 × perm witness (auth) | `SpineProofKillShot` + `AuthProofKillShot` + `(r_B, v_B)` reductions | Kill-Shot GKR: proves spine + auth outside the STARK trace. |
+| `noid_stark` | AIR traces + GKR reductions | per-`tx` `TxProof` | Engine: STARK seal + `prove_tx` / `verify_tx` orchestrator. |
 | `noid_ivc` | per-`tx` proofs | `BlockProof` | Recursive block accumulator. |
 | `noid_tx` | high-level tx | `tx_body`, `tx_body_hash` | Transaction serialisation. |
-| `noid_chain` | blocks + txs | state transitions | Chain state machine. |
+| `noid_chain` | blocks + state | state transitions, DA, wire | Chain layer (state, blocks, DA). Does NOT depend on `noid_stark`. |
 
 ---
 
@@ -597,13 +603,16 @@ Seven properties follow directly from the design:
 - FRI over GF(2^128) with Poseidon2b Merkle commitments.
 - STARK per-`tx` proof (stages 5–7 end-to-end roundtrip).
 - IVC fold accumulator (3-step fold test passes).
-- GKR sub-protocol (production path): G0 (topology + oracle), G1a
-  (layered witness), G1b.α (MLE packing + product sumcheck), G1b.β
-  (per-slot chained reduction), G2 (batching all 59 slots into a
-  single `SpineProof`), G3 (boundary MLE commitment + FRI opening +
-  `extra_transcript` hook into the STARK transcript). Byte-exact
-  differential tests against `hash_tx_body` native and in-circuit
-  `tx_body_hash`.
+- GKR spine Kill-Shot (production path): unified degree-7 sumcheck
+  over all 59 slots + shift argument + 3× batch-eval →
+  `SpineProofKillShot`. Bound to STARK via `extra_transcript` +
+  boundary MLE FRI opening.
+- GKR auth Kill-Shot: unified degree-7 sumcheck over all 20 auth
+  slots (4 inputs × 5 sponges) + shift + 3× batch-eval →
+  `AuthProofKillShot`. Same STARK binding pattern.
+- Production orchestrator (`noid_stark::prove_tx`): single-transcript
+  flow SpineGKR KS → AuthGKR KS → STARK with both boundary MLEs
+  as `ExtraColumn`s in the mixed multipoint close.
 
 **Ahead:**
 
@@ -722,14 +731,17 @@ different sub-AIRs must contain the same value.
   │     prev_state_root, fee_leaf, 4 input-leaf payloads,      │
   │     8 output-leaf payloads, is_coinbase_leaf, pad_leaf     │
   │                                                            │
-  │   Protocol:                                                │
-  │     per-slot PermProof  : 5 product sumchecks (x^7 chain)  │
-  │                         + 3 sin-expansion sumchecks →      │
-  │                           3 claims on the slot's state MLE │
-  │     γ₂ batch-eval       : 177 claims → one (r_B, v_B) on   │
-  │                           the boundary MLE (2^15 cells)    │
-  │     wrap pin            : wrap.state_out[0..1] ==          │
-  │                           claimed_tx_body_hash             │
+  │   Protocol (Kill-Shot):                                     │
+  │     unified sumcheck  : one degree-7 sumcheck over ALL 59  │
+  │                         slots simultaneously (15-var MLE). │
+  │                         Squeezes ρ, β, γ; produces 12      │
+  │                         final witness scalars.             │
+  │     shift argument    : proves state(x) == s_in(x⊕1)      │
+  │                         across slot boundaries (15 rounds).│
+  │     3× batch-eval     : state claims, s_in claims,         │
+  │                         s_out claims → (r_B, v_B) per col. │
+  │     wrap pin          : wrap.state_out[0..1] ==            │
+  │                         claimed_tx_body_hash               │
   │                                                            │
   │   Binding to the STARK (the only interface):               │
   │     • two lanes of tx_body_hash → `PublicColumn` in the    │
@@ -738,7 +750,7 @@ different sub-AIRs must contain the same value.
   │     • boundary MLE committed by the STARK via FRI; its     │
   │       root is absorbed into the spine channel before the   │
   │       draw of r_B                                          │
-  │     • flattened SpineProof bytes feed the STARK            │
+  │     • flattened SpineProofKillShot bytes feed the STARK    │
   │       `extra_transcript` hook between column-root          │
   │       absorption and the zero-check point draw             │
   │     • the opening (r_B, v_B) is discharged by a FRI        │
@@ -746,21 +758,34 @@ different sub-AIRs must contain the same value.
   └───────────────────┬────────────────────────────────────────┘
                       │ tx_body_hash
                       ▼
-             ┌────────────────────┐
-             │       HAUTH        │
-             │                    │
-             │ in:                │
-             │  secret_i          │
-             │  tx_body_hash      │
-             │                    │
-             │ Poseidon2b sponge: │
-             │  absorb(secret),   │
-             │  absorb(tx_hash),  │
-             │  squeeze → AuthTag │
-             └──────────┬─────────┘
-                        │ AuthTag_i
-                        ▼
-                 back to TX_VALIDITY (T2a)
+  ┌────────────────────────────────────────────────────────────┐
+  │              AUTH GKR (Kill-Shot sub-proof)                 │
+  │                                                            │
+  │   Structure (noid_gkr::auth_circuit::AuthCircuit):         │
+  │     4 inputs × 5 Poseidon2b sponges each = 20 slots:      │
+  │       HAddr: absorb(secret) → squeeze → Address            │
+  │       HAuth: absorb(secret, tx_body_hash) → squeeze →      │
+  │              AuthTag                                        │
+  │                                                            │
+  │   AuthInputs:                                              │
+  │     spend_secret[i], tx_body_hash,                         │
+  │     expected_address[i], expected_auth_tag[i]              │
+  │                                                            │
+  │   Protocol (Kill-Shot, same as spine):                     │
+  │     unified sumcheck over ALL 20 slots (14-var MLE)        │
+  │     + shift argument + 3× batch-eval                       │
+  │     → AuthProofKillShot + (r_B, v_B)                       │
+  │                                                            │
+  │   Privacy: spend_secret is witness-only, never absorbed    │
+  │   into the transcript. Verifier sees only the public       │
+  │   expected_address and expected_auth_tag values.           │
+  │                                                            │
+  │   Binding: same pattern as spine — boundary MLE committed  │
+  │   via FRI, (r_B, v_B) discharged by STARK multipoint-close │
+  └──────────┬─────────────────────────────────────────────────┘
+             │ Address_i, AuthTag_i
+             ▼
+       back to TX_VALIDITY (T1a: addr==owner, T2a: AuthTag)
 ```
 
 ## A.4 State commitments and final roots
@@ -843,8 +868,11 @@ different sub-AIRs must contain the same value.
 ## A.7 Where things live in the code
 
 ```
-  HADDR                 noid_air::airs::haddr
-  HAUTH                 noid_air::airs::hauth
+  HADDR                 noid_air::airs::haddr  (in-AIR only for
+                        the PublicColumn pin; actual hash proven
+                        by auth GKR Kill-Shot)
+  HAUTH                 (proven by auth GKR Kill-Shot; no longer
+                        a separate in-AIR sponge)
   BALANCE_GATE          noid_air::airs::balance_gate
   RANGE_GATE            noid_air::airs::range_gate
   FRI_STATE_OPEN        noid_air::airs::fri_state_open
@@ -859,14 +887,21 @@ different sub-AIRs must contain the same value.
                         + noid_air::composition::
                           tx_validity_with_spine
   POSEIDON (SBOX/MDS)   noid_air::airs::poseidon_{sbox,mds,perm}
-  GKR spine sub-proof   noid_gkr (circuit, oracle, layers,
-                        mle_layout, product_sumcheck,
-                        perm_sumcheck, batch_eval,
-                        spine_sumcheck, binding)
-  STARK wrapper         noid_stark
+  GKR spine Kill-Shot   noid_gkr::spine_killshot
+                        (spine_unified_v2, spine_shift,
+                         batch_eval, circuit, layers, mle_layout)
+  GKR auth Kill-Shot    noid_gkr::auth_killshot
+                        (auth_unified_v2, auth_shift,
+                         auth_circuit, auth_oracle)
+  prove_tx / verify_tx  noid_stark::prove_tx  (production
+                        orchestrator: spine KS → auth KS → STARK)
+  STARK engine          noid_stark  (prove_air, spine bridge,
+                        auth bridge, multipoint close)
   FRI                   noid_fri
   Packing / DA          noid_binius
   IVC                   noid_ivc
+  Chain state machine   noid_chain  (blocks, state, DA, wire;
+                        does NOT depend on noid_stark or noid_gkr)
 ```
 
 The registry of pinned columns through which the composition is held

@@ -32,6 +32,7 @@ pub mod vshift;
 
 pub mod spine;
 pub mod auth;
+pub mod prove_tx;
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -107,6 +108,11 @@ pub struct StarkProof {
     /// paths (built via `BatchedEvalProof { column_openings: vec![],
     /// batch_proof: stub }` with an empty column list).
     pub multipoint_batch_mixed: Option<MixedBatchedEvalProof>,
+    /// Stage 0 MLE Splitting: claimed values of boundary-slice columns
+    /// at their respective GKR reduction points (r_B_low). The verifier
+    /// uses these with `reconstruct_from_slices` to recover the original
+    /// MLE evaluation. Empty when the legacy mixed path is used.
+    pub slice_claimed_values: Vec<Block128>,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +123,7 @@ pub fn padded_log_len(log_rows: usize) -> usize {
     (TAU + 1).max(log_rows)
 }
 
-fn pad_column(column: &[Block128], target_log: usize) -> Vec<Block128> {
+pub(crate) fn pad_column(column: &[Block128], target_log: usize) -> Vec<Block128> {
     let target = 1usize << target_log;
     if column.len() == target {
         return column.to_vec();
@@ -193,7 +199,7 @@ fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
 /// multilinear `eq(z, ·)` contributes +1. Round polynomials therefore
 /// carry `max_c + 2` evaluations — enough to pin down a degree-`(max_c
 /// + 1)` univariate exactly.
-fn round_poly_degree(air: &dyn Air) -> usize {
+fn round_poly_degree(air: &(impl Air + ?Sized)) -> usize {
     let max_c = air
         .constraints()
         .iter()
@@ -337,26 +343,27 @@ fn fold_highest_flat(table: &mut Vec<u128>, r_flat: u128) {
 
 /// Partial evaluation at sample-integer `s_idx ∈ {0, 1, ..., degree}`
 /// on the highest variable of a flat-basis multilinear table. For
-/// `s_idx == 0` / `s_idx == 1` we short-circuit to a half-slice copy:
-/// those sample points live in GF(2) ⊂ GF(2^128), and their `u128`
-/// bit patterns (0 and 1) are identical in tower and flat basis. For
-/// `s_idx >= 2` the caller passes the already-flat-converted scalar
-/// `s_flat`.
+/// `s_idx == 0` / `s_idx == 1` we return a borrowed half-slice (no
+/// allocation): those sample points live in GF(2) ⊂ GF(2^128), and
+/// their `u128` bit patterns are identical in tower and flat basis.
+/// For `s_idx >= 2` the caller passes the already-flat-converted
+/// scalar `s_flat` and we allocate the result.
 #[inline]
-fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> Vec<u128> {
+fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> std::borrow::Cow<'_, [u128]> {
     use noid_core::hardware::clmul_gcm;
+    use std::borrow::Cow;
     let half = table.len() / 2;
     if s_idx == 0 {
-        return table[..half].to_vec();
+        return Cow::Borrowed(&table[..half]);
     }
     if s_idx == 1 {
-        return table[half..].to_vec();
+        return Cow::Borrowed(&table[half..]);
     }
     let mut out = Vec::with_capacity(half);
     for j in 0..half {
         out.push(table[j] ^ clmul_gcm(s_flat, table[j + half] ^ table[j]));
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Evaluate the per-row composition `eq · Σ β_k · C_k` in flat basis,
@@ -367,7 +374,7 @@ fn partial_eval_highest_flat_at(table: &[u128], s_idx: usize, s_flat: u128) -> V
 /// through flat-basis CLMUL rather than tower-basis Karatsuba.
 fn accumulate_sum_flat(
     eq_at_s: &[u128],
-    col_tables_at_s: &[Vec<u128>],
+    col_tables_at_s: &[std::borrow::Cow<'_, [u128]>],
     compiled: &CompiledGates<'_>,
 ) -> u128 {
     use noid_core::hardware::clmul_gcm;
@@ -412,6 +419,7 @@ fn accumulate_sum_flat(
         )
         .reduce(|| 0u128, |a, b| a ^ b)
 }
+
 
 /// Prover for the batched zero-check sumcheck. Holds the folded
 /// column tables + eq table in flat basis (GCM polynomial basis)
@@ -478,11 +486,11 @@ fn prove_zero_check(
                 .map(|s_idx| {
                     let s_flat = s_flat_table[s_idx];
                     let eq_at_s = partial_eval_highest_flat_at(&cur_eq, s_idx, s_flat);
-                    let cols_at_s: Vec<Vec<u128>> = cur_cols
+                    let cols_at_s: Vec<std::borrow::Cow<'_, [u128]>> = cur_cols
                         .iter()
                         .map(|c| partial_eval_highest_flat_at(c, s_idx, s_flat))
                         .collect();
-                    let acc_flat = accumulate_sum_flat(&eq_at_s, &cols_at_s, &compiled);
+                    let acc_flat = accumulate_sum_flat(&*eq_at_s, &cols_at_s, &compiled);
                     Block128::from(flat_to_tower_u128(acc_flat))
                 })
                 .collect()
@@ -679,6 +687,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
             multipoint_rounds,
             multipoint_batch,
             multipoint_batch_mixed: None,
+            slice_claimed_values: Vec::new(),
         },
         t,
     )
@@ -946,6 +955,23 @@ pub struct ExtraColumn {
     pub value: Block128,
 }
 
+// ---------------------------------------------------------------------------
+// Stage 0: MLE Splitting — SliceClaim for uniform FRI path
+// ---------------------------------------------------------------------------
+
+/// A claim that a boundary-slice column (appended after the AIR columns)
+/// evaluates to `value` at `eval_point`. The multipoint sumcheck proves
+/// this alongside the base and ladder claims.
+#[derive(Debug, Clone)]
+pub struct SliceClaim {
+    /// Column index in the extended trace (>= n_air_cols).
+    pub col_index: usize,
+    /// The evaluation point (length = log_len = BASE_LOG = 13).
+    pub eval_point: Vec<Block128>,
+    /// The claimed evaluation value of the slice MLE at eval_point.
+    pub value: Block128,
+}
+
 /// Canonical extras ordering: ascending `log_len`, then by commitment
 /// root bytes, then by the serialized eval_point. Pure function of
 /// extras contents — no transcript state.
@@ -986,7 +1012,7 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
 /// `noid_stark::spine`) can commit to the API shape before the
 /// wiring is in place.
 #[doc(hidden)]
-pub fn prove_air_unchecked_with_extra_columns<A: Air>(
+pub fn prove_air_unchecked_with_extra_columns<A: Air + ?Sized>(
     air: &A,
     trace: &Trace,
     pi: &PublicInputs,
@@ -1006,7 +1032,7 @@ pub fn prove_air_unchecked_with_extra_columns<A: Air>(
 /// Empty `extras` delegates byte-identically to
 /// [`verify_air_with_extra`]. See that function's docstring for
 /// `extra_transcript` semantics.
-pub fn verify_air_with_extra_columns<A: Air>(
+pub fn verify_air_with_extra_columns<A: Air + ?Sized>(
     air: &A,
     pi: &PublicInputs,
     proof: &StarkProof,
@@ -1057,7 +1083,7 @@ const EXTRAS_ABSORB_TAG: u64 = 0xFFFA_4337_0000_0001;
 //   • Single `prove_batched_mixed` closes every base column and
 //     every extra at its own hypercube.
 #[allow(clippy::too_many_arguments)]
-fn prove_air_unchecked_with_extras_inner<A: Air>(
+fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
     air: &A,
     trace: &Trace,
     pi: &PublicInputs,
@@ -1178,6 +1204,7 @@ fn prove_air_unchecked_with_extras_inner<A: Air>(
         multipoint_rounds,
         multipoint_batch: stub,
         multipoint_batch_mixed: Some(mixed_proof),
+        slice_claimed_values: Vec::new(),
     }
 }
 
@@ -1393,7 +1420,7 @@ fn prove_multipoint_close_mixed(
     (rounds, proof)
 }
 
-fn verify_air_with_extras_inner<A: Air>(
+fn verify_air_with_extras_inner<A: Air + ?Sized>(
     air: &A,
     pi: &PublicInputs,
     proof: &StarkProof,
@@ -1671,6 +1698,471 @@ fn verify_air_with_extras_inner<A: Air>(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Stage 0: MLE Splitting — uniform FRI path with slice claims
+// ---------------------------------------------------------------------------
+
+/// Prove a STARK where the trace has been extended with boundary-slice
+/// columns. All columns (AIR + slices) share the same log_len and are
+/// committed uniformly. Slice claims are injected into the multipoint
+/// sumcheck as additional `(eq(r_B_low, x), slice_col(x))` pairs.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_air_with_slices<A: Air + ?Sized>(
+    air: &A,
+    padded_columns: &[Vec<Block128>],
+    commitments: &[FriCommitment],
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    log_len: usize,
+) -> StarkProof {
+    let log_rows = air.log_rows();
+    let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+
+    let n_air_cols = air.n_columns();
+
+    let mut channel = Channel::new();
+    absorb_public_inputs(&mut channel, pi);
+    for c in commitments {
+        channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
+    }
+
+    let z = channel.get_random_points(log_len);
+    let n_constraints = air.constraints().len();
+    let betas: Vec<Block128> = (0..n_constraints)
+        .map(|_| channel.get_random_point())
+        .collect();
+
+    let shifted_indices: Vec<usize> = air.shifted_column_indices();
+    assert!(
+        shifted_indices.is_empty() || log_rows == padded_log_len(log_rows),
+        "VSHIFT requires log_rows >= TAU+1"
+    );
+    let mut shifted_slot: Vec<Option<usize>> = vec![None; n_air_cols];
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        shifted_slot[col_id] = Some(slot);
+    }
+    let rotated_columns: Vec<Vec<Block128>> = shifted_indices
+        .iter()
+        .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
+        .collect();
+    // Zero-check only runs over the AIR columns (not slices).
+    let mut sumcheck_cols: Vec<Vec<Block128>> =
+        Vec::with_capacity(n_air_cols + rotated_columns.len());
+    sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
+    sumcheck_cols.extend(rotated_columns.into_iter());
+
+    let degree = round_poly_degree(air);
+    let (zero_check_rounds, r) = prove_zero_check(
+        &sumcheck_cols,
+        air.constraints(),
+        &betas,
+        &z,
+        &mut channel,
+        degree,
+        &shifted_slot,
+        n_air_cols,
+    );
+
+    let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
+
+    // Base openings only for AIR columns (not slices). Slice columns
+    // are not part of the zero-check; their claims live in
+    // slice_claimed_values at r_B_low, not r_zero.
+    let base_openings: Vec<Block128> = {
+        use rayon::prelude::*;
+        padded_columns[..n_air_cols]
+            .par_iter()
+            .map(|col| mle_eval(col, &r_point))
+            .collect()
+    };
+    channel.observe_field_elems(&base_openings);
+
+    let partials_per_slot: Vec<Vec<Block128>> = {
+        use rayon::prelude::*;
+        shifted_indices
+            .par_iter()
+            .map(|&col_id| crate::vshift::ladder_partials(&padded_columns[col_id], &r_point))
+            .collect()
+    };
+    for (slot, partials) in partials_per_slot.iter().enumerate() {
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+    }
+
+    // Absorb slice claimed values on the transcript so they are bound
+    // to the Fiat-Shamir state.
+    let slice_values: Vec<Block128> = slice_claims.iter().map(|sc| sc.value).collect();
+    channel.observe_field_elems(&slice_values);
+
+    // --- Multipoint close with slice claims ---
+    let (multipoint_rounds, multipoint_batch) = prove_multipoint_close_with_slices(
+        padded_columns,
+        &base_openings,
+        &r_point,
+        &shifted_indices,
+        &partials_per_slot,
+        slice_claims,
+        n_air_cols,
+        log_len,
+        &ntt,
+        &mut channel,
+        &hasher,
+    );
+
+    StarkProof {
+        log_rows,
+        column_commitments: commitments.to_vec(),
+        base_openings,
+        zero_check_rounds,
+        shift_partials: partials_per_slot,
+        multipoint_rounds,
+        multipoint_batch,
+        multipoint_batch_mixed: None,
+        slice_claimed_values: slice_values,
+    }
+}
+
+/// Multipoint close for the Stage 0 uniform path. Extends the standard
+/// base+ladder multipoint sumcheck with additional slice-claim pairs.
+#[allow(clippy::too_many_arguments)]
+fn prove_multipoint_close_with_slices(
+    padded_columns: &[Vec<Block128>],
+    base_openings: &[Block128],
+    r_point: &[Block128],
+    shifted_indices: &[usize],
+    shift_partials: &[Vec<Block128>],
+    slice_claims: &[SliceClaim],
+    n_air_cols: usize,
+    log_len: usize,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &Poseidon2bSponge,
+) -> (Vec<RoundPoly>, BatchedEvalProof) {
+    use noid_core::mle::eq::eq_ind_partial_eval;
+    use rayon::prelude::*;
+
+    let s_count = shifted_indices.len();
+    let n_slices = slice_claims.len();
+
+    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
+
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+
+    // Horner weights: n_air_cols base + s_count ladder + n_slices slice claims.
+    let total_weights = n_air_cols + s_count + n_slices;
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(total_weights);
+    {
+        let mut cur = Block128::ONE;
+        for _ in 0..total_weights {
+            lambdas.push(cur);
+            cur = cur * beta;
+        }
+    }
+
+    // Target = base claims (AIR cols at r_zero) + ladder + slice claims (at r_B_low).
+    let mut target = Block128::ZERO;
+    for i in 0..n_air_cols {
+        target += lambdas[i] * base_openings[i];
+    }
+    for (slot, partials) in shift_partials.iter().enumerate() {
+        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
+        target += lambdas[n_air_cols + slot] * t_s;
+    }
+    for (i, sc) in slice_claims.iter().enumerate() {
+        target += lambdas[n_air_cols + s_count + i] * sc.value;
+    }
+
+    // Fused base pair: (eq(r_point, x), sum_i lambda_i * AIR_col_i(x)).
+    // Only AIR columns (0..n_air_cols) participate here.
+    let eq_base = eq_ind_partial_eval(r_point);
+    let hyper_len = 1usize << log_len;
+    let combined_base_b: Vec<Block128> = (0..hyper_len)
+        .into_par_iter()
+        .map(|j| {
+            let mut acc = Block128::ZERO;
+            for i in 0..n_air_cols {
+                acc += lambdas[i] * padded_columns[i][j];
+            }
+            acc
+        })
+        .collect();
+
+    let weight_trails = if s_count > 0 {
+        Some(crate::ladder_batch::WeightTrails::new(r_point))
+    } else {
+        None
+    };
+    let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
+        .into_par_iter()
+        .map(|slot| {
+            let trails = weight_trails
+                .as_ref()
+                .expect("trails present when s_count > 0");
+            let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
+            let eta = lambdas[n_air_cols + slot];
+            for v in w.iter_mut() {
+                *v = *v * eta;
+            }
+            w
+        })
+        .collect();
+    let ladder_pairs_b: Vec<&[Block128]> = (0..s_count)
+        .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
+        .collect();
+
+    // Slice-claim pairs: A-side = lambda * eq(r_B_low, x), B-side = slice_col(x).
+    let slice_pairs_a: Vec<Vec<Block128>> = (0..n_slices)
+        .into_par_iter()
+        .map(|i| {
+            let lam = lambdas[n_air_cols + s_count + i];
+            let eq_s = eq_ind_partial_eval(&slice_claims[i].eval_point);
+            eq_s.into_iter().map(|v| v * lam).collect()
+        })
+        .collect();
+    let slice_pairs_b: Vec<&[Block128]> = (0..n_slices)
+        .map(|i| padded_columns[slice_claims[i].col_index].as_slice())
+        .collect();
+
+    // Assemble all pairs: [fused_base, ladder_0..s, slice_0..n_slices]
+    let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count + n_slices);
+    pairs_a.push(eq_base);
+    pairs_a.extend(ladder_pairs_a);
+    pairs_a.extend(slice_pairs_a);
+    let mut pairs_b: Vec<&[Block128]> = Vec::with_capacity(1 + s_count + n_slices);
+    pairs_b.push(combined_base_b.as_slice());
+    pairs_b.extend(ladder_pairs_b);
+    pairs_b.extend(slice_pairs_b);
+
+    let (rounds, challenges) =
+        crate::multipoint_batch::prove_multipoint_sumcheck(pairs_a, pairs_b, target, channel);
+    let r_pp: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    debug_assert_eq!(r_pp.len(), log_len);
+
+    // FRI opens ALL committed columns (AIR + slices) at r_pp.
+    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|v| v.as_slice()).collect();
+    let batch = prove_batched(&col_refs, &r_pp, ntt, channel, hasher);
+
+    (rounds, batch)
+}
+
+/// Verify a STARK proof produced by [`prove_air_with_slices`].
+pub fn verify_air_with_slices<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &StarkProof,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+) -> Result<(), VerifyError> {
+    let n_air_cols = air.n_columns();
+    let n_slices = slice_claims.len();
+    let n_total = n_air_cols + n_slices;
+
+    if proof.log_rows != air.log_rows() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    if proof.column_commitments.len() != n_total
+        || proof.base_openings.len() != n_air_cols
+        || proof.multipoint_batch.column_openings.len() != n_total
+    {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    let log_len = padded_log_len(proof.log_rows);
+    if proof.zero_check_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let degree = round_poly_degree(air);
+    let n_points = degree + 1;
+    for rp in &proof.zero_check_rounds {
+        if rp.len() != n_points {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    if proof.multipoint_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    for rp in &proof.multipoint_rounds {
+        if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+
+    let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+
+    // --- Replay parent transcript ---
+    let mut channel = Channel::new();
+    absorb_public_inputs(&mut channel, pi);
+    for c in &proof.column_commitments {
+        channel.observe_fri_commitment(c);
+    }
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
+    }
+    let z = channel.get_random_points(log_len);
+    let n_constraints = air.constraints().len();
+    let betas: Vec<Block128> = (0..n_constraints)
+        .map(|_| channel.get_random_point())
+        .collect();
+
+    // --- Zero-check replay ---
+    let mut claim = Block128::ZERO;
+    let mut challenges: Vec<Block128> = Vec::with_capacity(log_len);
+    for rp in &proof.zero_check_rounds {
+        let sum01 = rp[0] + rp[1];
+        if sum01 != claim {
+            return Err(VerifyError::ZeroCheckFailed);
+        }
+        channel.observe_field_elems(rp);
+        let r_i = channel.get_random_point();
+        claim = lagrange_eval_at(rp, r_i);
+        challenges.push(r_i);
+    }
+
+    let r_point: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    let eq_zr = noid_core::mle::eq::eq_ind(&z, &r_point);
+
+    // --- Constraint composition check (AIR columns only) ---
+    let shifted_indices: Vec<usize> = air.shifted_column_indices();
+    if proof.shift_partials.len() != shifted_indices.len() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let expected_ladder_len = log_len + 1;
+    for partials in &proof.shift_partials {
+        if partials.len() != expected_ladder_len {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    let mut shifted_slot: Vec<Option<usize>> = vec![None; n_air_cols];
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        shifted_slot[col_id] = Some(slot);
+    }
+    let shifted_openings: Vec<Block128> = proof
+        .shift_partials
+        .iter()
+        .map(|partials| reconstruct_shifted_opening(&r_point, partials))
+        .collect();
+
+    check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
+
+    let column_openings = &proof.base_openings;
+    let mut composition = Block128::ZERO;
+    let mut local_scratch: Vec<Block128> = Vec::new();
+    let mut next_scratch: Vec<Block128> = Vec::new();
+    for (k, c) in air.constraints().iter().enumerate() {
+        local_scratch.clear();
+        for &j in c.columns() {
+            local_scratch.push(column_openings[j]);
+        }
+        next_scratch.clear();
+        for &j in c.shifted_columns() {
+            let slot = shifted_slot[j].ok_or(VerifyError::ShapeMismatch)?;
+            next_scratch.push(shifted_openings[slot]);
+        }
+        let frame = EvalFrame {
+            local: &local_scratch,
+            next: &next_scratch,
+        };
+        composition += betas[k] * c.evaluate(frame);
+    }
+    if eq_zr * composition != claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    // --- Absorb base openings + ladder partials on channel ---
+    channel.observe_field_elems(&proof.base_openings);
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+    }
+
+    // Absorb slice claimed values.
+    channel.observe_field_elems(&proof.slice_claimed_values);
+
+    // --- Multipoint sumcheck verify with slice claims ---
+    let s_count = shifted_indices.len();
+    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
+
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+    let total_weights = n_air_cols + s_count + n_slices;
+    let mut lambdas: Vec<Block128> = Vec::with_capacity(total_weights);
+    {
+        let mut cur = Block128::ONE;
+        for _ in 0..total_weights {
+            lambdas.push(cur);
+            cur = cur * beta;
+        }
+    }
+
+    // Target = base (AIR cols at r_zero) + ladder + slice claims (at r_B_low).
+    let mut target = Block128::ZERO;
+    for i in 0..n_air_cols {
+        target += lambdas[i] * proof.base_openings[i];
+    }
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
+        target += lambdas[n_air_cols + slot] * t_s;
+    }
+    for (i, sc) in slice_claims.iter().enumerate() {
+        target += lambdas[n_air_cols + s_count + i] * sc.value;
+    }
+
+    let (sc_challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck(
+        &proof.multipoint_rounds,
+        target,
+        &mut channel,
+    )?;
+    let r_pp: Vec<Block128> = sc_challenges.iter().rev().cloned().collect();
+    if r_pp.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    // Reconstruct terminal claim from FRI openings at r_pp.
+    let m = &proof.multipoint_batch.column_openings;
+    let eq_base = noid_core::mle::eq::eq_ind(&r_point, &r_pp);
+    let mut expected = Block128::ZERO;
+    // Base contribution: AIR columns with eq(r_point, r'').
+    for k in 0..n_air_cols {
+        expected += lambdas[k] * eq_base * m[k];
+    }
+    // Ladder contribution.
+    if s_count > 0 {
+        let axes = crate::ladder_batch::LadderWeightAxes::new(&r_point, &r_pp);
+        for (slot, &col_id) in shifted_indices.iter().enumerate() {
+            let w_s = crate::ladder_batch::weight_at_axes(gammas[slot], &axes);
+            expected += lambdas[n_air_cols + slot] * w_s * m[col_id];
+        }
+    }
+    // Slice-claim contribution: eq(r_B_low, r'') * slice_col_opening.
+    for (i, sc) in slice_claims.iter().enumerate() {
+        let eq_s = noid_core::mle::eq::eq_ind(&sc.eval_point, &r_pp);
+        expected += lambdas[n_air_cols + s_count + i] * eq_s * m[sc.col_index];
+    }
+    if expected != final_claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    // --- FRI verify (uniform, all n_total columns) ---
+    verify_batched(
+        &proof.column_commitments,
+        &r_pp,
+        &proof.multipoint_batch,
+        &ntt,
+        &mut channel,
+        &hasher,
+    )
+    .map_err(VerifyError::FriFailed)?;
+
+    Ok(())
+}
+
 /// Like [`prove_air_unchecked`], but absorbs `extra_transcript` into
 /// the parent Fiat-Shamir channel **between** the column-root
 /// absorption and the zero-check point draw. The default path absorbs
@@ -1678,7 +2170,7 @@ fn verify_air_with_extras_inner<A: Air>(
 /// GKR-spine path threads a digest of the GKR `SpineProof` through
 /// this hook so any spine tamper forks every later STARK challenge.
 #[doc(hidden)]
-pub fn prove_air_unchecked_with_extra<A: Air>(
+pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
     air: &A,
     trace: &Trace,
     pi: &PublicInputs,
@@ -1806,6 +2298,7 @@ pub fn prove_air_unchecked_with_extra<A: Air>(
         multipoint_rounds,
         multipoint_batch,
         multipoint_batch_mixed: None,
+        slice_claimed_values: Vec::new(),
     }
 }
 
@@ -1832,7 +2325,7 @@ pub fn verify_air<A: Air>(
 /// Mirror of [`prove_air_unchecked_with_extra`]: the verifier absorbs
 /// `extra_transcript` at the same transcript position. Empty-slice
 /// input matches the default [`verify_air`] path byte-for-byte.
-pub fn verify_air_with_extra<A: Air>(
+pub fn verify_air_with_extra<A: Air + ?Sized>(
     air: &A,
     pi: &PublicInputs,
     proof: &StarkProof,
@@ -2322,7 +2815,7 @@ fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
 /// `base_openings[col]`. The base opening is itself bound to the
 /// committed column by the §12c' multipoint FRI, so any programme
 /// deviation surfaces here with overwhelming probability.
-fn check_public_columns<A: Air>(
+fn check_public_columns<A: Air + ?Sized>(
     air: &A,
     base_openings: &[Block128],
     r_point: &[Block128],

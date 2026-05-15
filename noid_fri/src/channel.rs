@@ -18,18 +18,16 @@ use crate::prover::FriCommitment;
 /// Number of FRI queries. With code rate R = 4 each query contributes
 /// `log2(R) = 2` bits of proven soundness (JACM FRI bound). We target
 /// **128-bit proven soundness**, which requires `ceil(128 / 2) = 64`
-/// queries.
+/// queries. This exceeds the sumcheck bottleneck (~120 bits) while
+/// cutting proof size and verifier work by 33% vs the former 96.
 ///
-/// Previous values (96, 144) were sized for 192/288-bit conjectured
-/// soundness — over-provisioned for any realistic threat model and
-/// costing unnecessary prover/verifier work. See CRYPTO.md §8.
-///
-/// In test/debug builds we use a much smaller count so the test suite
-/// runs in seconds rather than minutes — the protocol is still exercised
-/// fully end-to-end.
-#[cfg(not(any(test, debug_assertions)))]
-pub const NUM_QUERIES: usize = 96;
-#[cfg(any(test, debug_assertions))]
+/// In debug builds (cargo test, cargo run without --release) we use a
+/// smaller count so the test suite runs quickly — the protocol is still
+/// exercised fully end-to-end. Benchmarks (release profile) use the
+/// production value.
+#[cfg(not(debug_assertions))]
+pub const NUM_QUERIES: usize = 64;
+#[cfg(debug_assertions)]
 pub const NUM_QUERIES: usize = 10;
 
 /// Base-2 log of the extension degree used for soundness amplification.
@@ -131,9 +129,9 @@ impl Channel {
 
     /// Generate query indices for the query phase.
     ///
-    /// For 96-bit security with R = 4 we draw 144 random field elements
-    /// and reduce each modulo the domain size. If the domain is smaller
-    /// than 144 we query every index once.
+    /// Draws `NUM_QUERIES` random field elements and reduces each modulo
+    /// the domain size. If the domain is smaller than NUM_QUERIES we
+    /// query every index once.
     pub fn gen_queries(&mut self, log_max_len: usize) -> Vec<usize> {
         let Some(domain_size) = 1usize.checked_shl(log_max_len as u32) else {
             // Out-of-range log size (malformed input): return no queries so

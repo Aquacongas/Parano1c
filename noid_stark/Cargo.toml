@@ -17,4 +17,3 @@ rayon = "1.10"
 default = []
 
 [dev-dependencies]
-noid_chain = { path = "../noid_chain" }

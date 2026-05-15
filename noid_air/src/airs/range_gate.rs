@@ -32,8 +32,15 @@
 //! Block128::from(1u128 << i)` explicitly.
 
 use crate::gates::BoolGate;
-use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
+use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
+use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
+
+fn two_flat() -> u128 {
+    use std::sync::OnceLock;
+    static VAL: OnceLock<u128> = OnceLock::new();
+    *VAL.get_or_init(|| tower_to_flat_u128(Block128::from(2u128).0))
+}
 
 /// Bit-width of one range-check instance (u64).
 pub const RANGE_GATE_WORD_BITS: usize = 64;
@@ -84,6 +91,13 @@ impl Constraint for AccInitGate {
         let bit = frame.local[2];
         let weight = frame.local[3];
         is_reset * (acc + bit * weight)
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_reset = frame.local[0];
+        let acc = frame.local[1];
+        let bit = frame.local[2];
+        let weight = frame.local[3];
+        clmul_gcm(is_reset, acc ^ clmul_gcm(bit, weight))
     }
 }
 
@@ -136,6 +150,15 @@ impl Constraint for AccNextGate {
         let weight_next = frame.next[3];
         (Block128::ONE + is_reset_next) * (acc_next + acc + bit_next * weight_next)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let acc = frame.local[0];
+        let is_reset_next = frame.next[0];
+        let acc_next = frame.next[1];
+        let bit_next = frame.next[2];
+        let weight_next = frame.next[3];
+        let inner = acc_next ^ acc ^ clmul_gcm(bit_next, weight_next);
+        clmul_gcm(1 ^ is_reset_next, inner)
+    }
 }
 
 /// `is_reset · (weight + 1) == 0` — at every reset row, `weight == 1`.
@@ -169,6 +192,11 @@ impl Constraint for WeightInitGate {
         let is_reset = frame.local[0];
         let weight = frame.local[1];
         is_reset * (weight + Block128::ONE)
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_reset = frame.local[0];
+        let weight = frame.local[1];
+        clmul_gcm(is_reset, weight ^ 1)
     }
 }
 
@@ -213,6 +241,12 @@ impl Constraint for WeightNextGate {
         let weight_next = frame.next[1];
         let two = Block128::from(2u128);
         (Block128::ONE + is_reset_next) * (weight_next + weight * two)
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let weight = frame.local[0];
+        let is_reset_next = frame.next[0];
+        let weight_next = frame.next[1];
+        clmul_gcm(1 ^ is_reset_next, weight_next ^ clmul_gcm(weight, two_flat()))
     }
 }
 

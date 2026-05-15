@@ -13,7 +13,6 @@ noid_stark = { path = "../noid_stark" }
 noid_gkr = { path = "../noid_gkr" }
 noid_tx = { path = "../noid_tx" }
 noid_binius = { path = "../noid_binius" }
-noid_chain = { path = "../noid_chain" }
 
 [[bench]]
 name = "stark_report"

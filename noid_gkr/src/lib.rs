@@ -12,6 +12,10 @@
 //! source of truth.
 
 pub mod auth_circuit;
+pub mod auth_killshot;
+pub mod auth_mle_v2;
+pub mod auth_shift;
+pub mod auth_unified_v2;
 pub mod auth_oracle;
 pub mod auth_sumcheck;
 pub mod batch_eval;
@@ -36,8 +40,8 @@ pub use auth_circuit::{
 pub use auth_oracle::{evaluate_auth, AuthSlotState, AuthWitness};
 pub use auth_sumcheck::{
     auth_boundary_output_cell, build_auth_boundary_mle, compute_auth_boundary,
-    discharge_auth_boundary_native, point_for_auth_boundary_cell, prove_auth,
-    reconstruct_auth_slot_states, verify_auth, AuthBoundaryPins, AuthOutputPin, AuthProof,
+    discharge_auth_boundary_native, point_for_auth_boundary_cell,
+    reconstruct_auth_slot_states, AuthBoundaryPins, AuthOutputPin,
     AUTH_PIN_LANES, N_AUTH_BOUNDARY_CELLS, N_AUTH_BOUNDARY_VARS, N_AUTH_COL_VARS,
     N_AUTH_SLOTS_PADDED, N_AUTH_SLOT_VARS,
 };
@@ -71,14 +75,33 @@ pub use spine_shift::{
     project_lane, rc_evaluate, round_of, sigma_evaluate, slot_of,
 };
 pub use spine_killshot::{
-    build_unified_from_inputs, discharge_reductions_native, prove_spine_killshot,
-    verify_spine_killshot, SpineKillShotReductions, SpineProofKillShot,
+    build_unified_from_inputs, build_unified_from_states, discharge_reductions_native,
+    prove_spine_killshot, prove_spine_killshot_with_states, verify_spine_killshot,
+    SpineKillShotReductions, SpineProofKillShot,
 };
 pub use spine_unified::{
-    prove_spine_shift, prove_spine_unified, verify_spine_shift, verify_spine_unified,
+    prove_spine_shift, prove_spine_unified, prove_spine_unified_for_live_slots,
+    verify_spine_shift, verify_spine_unified, verify_spine_unified_for_live_slots,
     SpineKillShotProof, SpineShiftProof, SpineShiftReduction, SpineUnifiedProof,
     SpineUnifiedReduction, N_UNIFIED_WITNESS_CLAIMS, SPINE_SHIFT_ROUND_DEGREE,
     SPINE_UNIFIED_ROUND_DEGREE,
+};
+pub use auth_mle_v2::{
+    build_auth_unified_mle_v2, AuthUnifiedMle, N_AUTH_LIVE_SLOTS, N_AUTH_UNIFIED_CELLS,
+    N_AUTH_UNIFIED_VARS,
+};
+pub use auth_unified_v2::{
+    prove_auth_shift, prove_auth_unified, verify_auth_shift, verify_auth_unified,
+    AuthKillShotProof, AuthShiftProof, AuthShiftReduction, AuthUnifiedProof,
+    AuthUnifiedReduction, AUTH_SHIFT_ROUND_DEGREE, AUTH_UNIFIED_ROUND_DEGREE,
+};
+pub use auth_killshot::{
+    build_auth_unified_from_inputs, discharge_auth_reductions_native, prove_auth_killshot,
+    verify_auth_killshot, AuthKillShotReductions, AuthProofKillShot,
+};
+pub use spine_shift::{
+    build_mds_lane_table_for_live_slots, build_mu_table_for_live_slots,
+    build_rc_table_for_live_slots, build_sigma_table_for_live_slots, build_u_table_for_live_slots,
 };
 pub use spine_sumcheck::{
     build_boundary_mle, compute_tx_body_hash, discharge_boundary_native, prove_spine,

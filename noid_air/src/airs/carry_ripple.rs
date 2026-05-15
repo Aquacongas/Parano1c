@@ -6,7 +6,8 @@
 //! `WORD_BITS` rows.
 
 use crate::gates::{BoolGate, WeightedLinearGate};
-use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
+use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
+use noid_core::hardware::clmul_gcm;
 use noid_core::{Block128, TowerField};
 
 /// Word width of one 64-bit ripple-carry adder instance laid out along
@@ -70,6 +71,15 @@ impl Constraint for CarryNextGate {
         let is_reset_next = frame.next[1];
         (Block128::ONE + is_reset_next) * (next_carry + a * b + a * carry + b * carry)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let a = frame.local[0];
+        let b = frame.local[1];
+        let carry = frame.local[2];
+        let next_carry = frame.next[0];
+        let is_reset_next = frame.next[1];
+        let inner = next_carry ^ clmul_gcm(a, b) ^ clmul_gcm(a, carry) ^ clmul_gcm(b, carry);
+        clmul_gcm(1 ^ is_reset_next, inner)
+    }
 }
 
 /// `is_reset · carry == 0` — at every reset row the carry-in must be zero.
@@ -100,6 +110,9 @@ impl Constraint for CarryInitGate {
     }
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         frame.local[0] * frame.local[1]
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        clmul_gcm(frame.local[0], frame.local[1])
     }
 }
 

@@ -35,7 +35,8 @@
 //! `CarryRippleAir` and `RangeGateAir`).
 
 use crate::gates::BoolGate;
-use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
+use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
+use noid_core::hardware::clmul_gcm;
 use noid_core::{Block128, TowerField};
 
 /// Word width of one adder instance (rows per instance). `W ≤ 127`
@@ -133,6 +134,11 @@ impl Constraint for PadZeroGate {
         let v = frame.local[1];
         (Block128::ONE + is_input) * v
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input = frame.local[0];
+        let v = frame.local[1];
+        clmul_gcm(1 ^ is_input, v)
+    }
 }
 
 /// `is_input · (sum + a + b + carry) == 0` — full-adder sum relation
@@ -177,6 +183,14 @@ impl Constraint for FaSumGate {
         let carry = frame.local[4];
         is_input * (sum + a + b + carry)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input = frame.local[0];
+        let sum = frame.local[1];
+        let a = frame.local[2];
+        let b = frame.local[3];
+        let carry = frame.local[4];
+        clmul_gcm(is_input, sum ^ a ^ b ^ carry)
+    }
 }
 
 /// `is_reset · carry == 0` — carry-in is zero at every instance start.
@@ -213,6 +227,9 @@ impl Constraint for BitAdderCarryInitGate {
     }
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         frame.local[0] * frame.local[1]
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        clmul_gcm(frame.local[0], frame.local[1])
     }
 }
 
@@ -269,6 +286,16 @@ impl Constraint for BitAdderCarryNextGate {
         is_input
             * (Block128::ONE + is_reset_next)
             * (next_carry + a * b + a * carry + b * carry)
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input = frame.local[0];
+        let a = frame.local[1];
+        let b = frame.local[2];
+        let carry = frame.local[3];
+        let next_carry = frame.next[0];
+        let is_reset_next = frame.next[1];
+        let maj = next_carry ^ clmul_gcm(a, b) ^ clmul_gcm(a, carry) ^ clmul_gcm(b, carry);
+        clmul_gcm(clmul_gcm(is_input, 1 ^ is_reset_next), maj)
     }
 }
 

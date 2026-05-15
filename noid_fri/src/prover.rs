@@ -77,6 +77,22 @@ pub struct EvalProof {
     pub final_codeword: Vec<Block128>,
 }
 
+impl EvalProof {
+    pub fn byte_len(&self) -> usize {
+        let upper = self.upper_partial_evals.len() * 16;
+        let sc: usize = self.sum_check_oracles.iter().map(|u| u.coeffs.len() * 16).sum();
+        let oracles = self.fri_oracles.len() * 32;
+        let symbols: usize = self.fri_queried_symbols.iter().map(|v| v.len() * 2 * 16).sum();
+        let paths: usize = self
+            .fri_merkle_paths
+            .iter()
+            .map(|round| round.iter().map(|p| p.len() * 32).sum::<usize>())
+            .sum();
+        let final_cw = self.final_codeword.len() * 16;
+        upper + sc + oracles + symbols + paths + final_cw
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Optimized evaluation helpers (Block128 packed paths)
 // ---------------------------------------------------------------------------

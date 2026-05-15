@@ -108,6 +108,19 @@ fn absorb_hash<T: FiatShamir<Block128>>(channel: &mut T, hash: &[Block128; 2]) {
     channel.absorb(hash[1]);
 }
 
+/// Materialise the unified MLE bundle from pre-computed slot states.
+/// Avoids redundant `reconstruct_slot_states` when the caller already
+/// has them (e.g. `prove_tx` which needs them for `build_boundary_mle`).
+pub fn build_unified_from_states(
+    states: &[([Block128; STATE_SIZE], [Block128; STATE_SIZE])],
+) -> SpineUnifiedMle {
+    debug_assert_eq!(states.len(), N_SPINE_SLOTS);
+    let state_ins: Vec<[Block128; STATE_SIZE]> =
+        states.iter().map(|(s_in, _)| *s_in).collect();
+    let (mle, _witnesses) = build_unified_mle(&state_ins);
+    mle
+}
+
 /// Materialise the unified MLE bundle from `SpineInputs`. Native
 /// path; both prover (full witness) and verifier (test harness) use
 /// it. In production the verifier never reconstructs this — the FRI
@@ -117,11 +130,7 @@ pub fn build_unified_from_inputs(
     inputs: &SpineInputs,
 ) -> SpineUnifiedMle {
     let states = reconstruct_slot_states(circuit, inputs);
-    debug_assert_eq!(states.len(), N_SPINE_SLOTS);
-    let state_ins: Vec<[Block128; STATE_SIZE]> =
-        states.iter().map(|(s_in, _)| *s_in).collect();
-    let (mle, _witnesses) = build_unified_mle(&state_ins);
-    mle
+    build_unified_from_states(&states)
 }
 
 /// Honest prover.
@@ -136,10 +145,21 @@ pub fn prove_spine_killshot<T: FiatShamir<Block128>>(
         actual, claimed_tx_body_hash,
         "prover asked to claim a tx_body_hash inconsistent with its own inputs",
     );
+    let states = reconstruct_slot_states(circuit, inputs);
+    prove_spine_killshot_with_states(&states, claimed_tx_body_hash, channel)
+}
 
+/// Honest prover — variant that accepts pre-computed slot states,
+/// avoiding redundant `reconstruct_slot_states` when the caller
+/// already has them (e.g. `prove_tx`).
+pub fn prove_spine_killshot_with_states<T: FiatShamir<Block128>>(
+    states: &[([Block128; STATE_SIZE], [Block128; STATE_SIZE])],
+    claimed_tx_body_hash: [Block128; 2],
+    channel: &mut T,
+) -> (SpineProofKillShot, SpineKillShotReductions) {
     absorb_hash(channel, &claimed_tx_body_hash);
 
-    let mle = build_unified_from_inputs(circuit, inputs);
+    let mle = build_unified_from_states(states);
 
     // (1) Main unified sumcheck.
     let (main, r_prime) = prove_spine_unified(&mle, channel);

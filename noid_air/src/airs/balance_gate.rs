@@ -52,7 +52,8 @@ use crate::airs::bit_adder::{
     BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_N_COLS,
 };
 use crate::gates::PublicColumn;
-use crate::{Air, ColumnDomain, Constraint, EvalFrame, Trace};
+use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
+use noid_core::hardware::clmul_gcm;
 use noid_core::{Block128, TowerField};
 
 /// Number of `bit_adder` blocks stitched together.
@@ -126,6 +127,12 @@ impl Constraint for BalanceBridgeBitsGate {
         let sum_src = frame.local[2];
         is_input_src * (dst + sum_src)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input_src = frame.local[0];
+        let dst = frame.local[1];
+        let sum_src = frame.local[2];
+        clmul_gcm(is_input_src, dst ^ sum_src)
+    }
 }
 
 /// `is_input_src · (1 + is_input_src_next) · (dst_next + carry_src_next) == 0`.
@@ -167,6 +174,13 @@ impl Constraint for BalanceBridgeCarryGate {
         let carry_src_next = frame.next[2];
         is_input_src * (Block128::ONE + is_input_src_next) * (dst_next + carry_src_next)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input_src = frame.local[0];
+        let is_input_src_next = frame.next[0];
+        let dst_next = frame.next[1];
+        let carry_src_next = frame.next[2];
+        clmul_gcm(clmul_gcm(is_input_src, 1 ^ is_input_src_next), dst_next ^ carry_src_next)
+    }
 }
 
 /// `is_input_{A2} · (A2.sum + B21.sum) == 0` — bitwise equality of bits
@@ -192,6 +206,9 @@ impl Constraint for BalanceFinalSumGate {
     }
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         frame.local[0] * (frame.local[1] + frame.local[2])
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        clmul_gcm(frame.local[0], frame.local[1] ^ frame.local[2])
     }
 }
 
@@ -231,6 +248,13 @@ impl Constraint for BalanceFinalCarryGate {
             * (Block128::ONE + is_input_a2_next)
             * (a2_carry_next + b21_sum_next)
     }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let is_input_a2 = frame.local[0];
+        let is_input_a2_next = frame.next[0];
+        let a2_carry_next = frame.next[1];
+        let b21_sum_next = frame.next[2];
+        clmul_gcm(clmul_gcm(is_input_a2, 1 ^ is_input_a2_next), a2_carry_next ^ b21_sum_next)
+    }
 }
 
 /// `is_input_sel · (1 + is_input_sel_next) · target_next == 0` — degree-3
@@ -268,6 +292,12 @@ impl Constraint for BalanceZeroAtTransitionGate {
         let sel_next = frame.next[0];
         let target_next = frame.next[1];
         sel * (Block128::ONE + sel_next) * target_next
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let sel = frame.local[0];
+        let sel_next = frame.next[0];
+        let target_next = frame.next[1];
+        clmul_gcm(clmul_gcm(sel, 1 ^ sel_next), target_next)
     }
 }
 

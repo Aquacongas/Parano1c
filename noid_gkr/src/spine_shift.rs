@@ -107,12 +107,15 @@ pub fn inc_round_index(idx: u16) -> u16 {
 // μ schedule
 // ---------------------------------------------------------------------------
 
-/// `μ_table[idx] == ONE` iff `slot(idx) < N_SPINE_SLOTS` and
+/// `μ_table[idx] == ONE` iff `slot(idx) < live_slots` and
 /// `round(idx) < N_ROUNDS` (the "live witness cell" mask). Otherwise
-/// `ZERO`. Length `2^15`.
-pub fn build_mu_table() -> Vec<Block128> {
+/// `ZERO`. Length `2^15`. Parameterised by `live_slots` so the same
+/// schedule machinery serves Spine (`N_SPINE_SLOTS = 59`) and AuthGKR
+/// (`N_AUTH_LIVE_SLOTS = 20`).
+pub fn build_mu_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
+    debug_assert!(live_slots <= (1 << SLOT_BITS));
     let mut tab = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
-    for slot in 0..N_SPINE_SLOTS {
+    for slot in 0..live_slots {
         for round in 0..N_ROUNDS {
             for elem in 0..STATE_SIZE {
                 let idx = pack_index(slot, round, elem);
@@ -121,6 +124,11 @@ pub fn build_mu_table() -> Vec<Block128> {
         }
     }
     tab
+}
+
+/// Spine default — `live_slots = N_SPINE_SLOTS`.
+pub fn build_mu_table() -> Vec<Block128> {
+    build_mu_table_for_live_slots(N_SPINE_SLOTS)
 }
 
 /// Evaluate the multilinear extension of μ at an arbitrary point.
@@ -134,10 +142,11 @@ pub fn mu_evaluate(point: &[Block128]) -> Block128 {
 // ---------------------------------------------------------------------------
 
 /// `σ_table[idx] == ONE` iff the cell goes through the x^7 S-box on the
-/// active topology. Length `2^15`.
-pub fn build_sigma_table() -> Vec<Block128> {
+/// active topology. Length `2^15`. Parameterised by `live_slots`.
+pub fn build_sigma_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
+    debug_assert!(live_slots <= (1 << SLOT_BITS));
     let mut tab = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
-    for slot in 0..N_SPINE_SLOTS {
+    for slot in 0..live_slots {
         for round in 0..N_ROUNDS {
             for elem in 0..STATE_SIZE {
                 let idx = pack_index(slot, round, elem);
@@ -146,6 +155,11 @@ pub fn build_sigma_table() -> Vec<Block128> {
         }
     }
     tab
+}
+
+/// Spine default — `live_slots = N_SPINE_SLOTS`.
+pub fn build_sigma_table() -> Vec<Block128> {
+    build_sigma_table_for_live_slots(N_SPINE_SLOTS)
 }
 
 /// Evaluate the multilinear extension of σ at an arbitrary point.
@@ -163,9 +177,11 @@ pub fn sigma_evaluate(point: &[Block128]) -> Block128 {
 /// RC table indexed by `(slot, round, elem)`. Pads zero outside the
 /// live topology. The constant for partial rounds is stored only at
 /// `elem == 0` to mirror the native permutation semantics.
-pub fn build_rc_table() -> Vec<Block128> {
+/// Parameterised by `live_slots`.
+pub fn build_rc_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
+    debug_assert!(live_slots <= (1 << SLOT_BITS));
     let mut tab = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
-    for slot in 0..N_SPINE_SLOTS {
+    for slot in 0..live_slots {
         for round in 0..N_ROUNDS {
             let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
             for elem in 0..STATE_SIZE {
@@ -178,6 +194,11 @@ pub fn build_rc_table() -> Vec<Block128> {
         }
     }
     tab
+}
+
+/// Spine default — `live_slots = N_SPINE_SLOTS`.
+pub fn build_rc_table() -> Vec<Block128> {
+    build_rc_table_for_live_slots(N_SPINE_SLOTS)
 }
 
 /// Evaluate the public RC MLE at an arbitrary point.
@@ -233,17 +254,22 @@ pub fn permute_by_dec(src: &[Block128]) -> Vec<Block128> {
 /// Build the unified mask `U[y] = eq(ρ, dec(y)) · μ(dec(y))` for the
 /// main sumcheck. `ρ` has length `N_SPINE_UNIFIED_VARS`. This is the
 /// only `dec`-twisted public schedule the verifier rebuilds natively
-/// at the start of the protocol.
-pub fn build_u_table(rho: &[Block128]) -> Vec<Block128> {
+/// at the start of the protocol. Parameterised by `live_slots`.
+pub fn build_u_table_for_live_slots(rho: &[Block128], live_slots: usize) -> Vec<Block128> {
     debug_assert_eq!(rho.len(), N_SPINE_UNIFIED_VARS);
-    let eq_tab = eq_ind_partial_eval::<Block128>(rho); // eq(ρ, ·) at the point as full hypercube
-    let mu_tab = build_mu_table();
+    let eq_tab = eq_ind_partial_eval::<Block128>(rho);
+    let mu_tab = build_mu_table_for_live_slots(live_slots);
     let mut out = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
     for y in 0..N_SPINE_UNIFIED_CELLS {
         let x = dec_round_index(y as u16) as usize;
         out[y] = eq_tab[x] * mu_tab[x];
     }
     out
+}
+
+/// Spine default — `live_slots = N_SPINE_SLOTS`.
+pub fn build_u_table(rho: &[Block128]) -> Vec<Block128> {
+    build_u_table_for_live_slots(rho, N_SPINE_SLOTS)
 }
 
 /// Build `lane[y] = src[ (slot(y), round(y), e=lane) ]`. Independent of
@@ -266,13 +292,14 @@ pub fn project_lane(src: &[Block128], lane: usize) -> Vec<Block128> {
 /// `0..STATE_SIZE`. Padded cells (slot ≥ N_SPINE_SLOTS or
 /// round(dec(y)) outside `0..N_ROUNDS`) get coefficient `ZERO` so the
 /// C2 contribution there vanishes.
-pub fn build_mds_lane_table(lane: usize) -> Vec<Block128> {
+pub fn build_mds_lane_table_for_live_slots(lane: usize, live_slots: usize) -> Vec<Block128> {
     debug_assert!(lane < STATE_SIZE);
+    debug_assert!(live_slots <= (1 << SLOT_BITS));
     let mut out = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
     for y in 0..N_SPINE_UNIFIED_CELLS {
         let yb = y as u16;
         let slot = slot_of(yb);
-        if slot >= N_SPINE_SLOTS {
+        if slot >= live_slots {
             continue;
         }
         let dec_round = round_of(dec_round_index(yb));
@@ -283,6 +310,11 @@ pub fn build_mds_lane_table(lane: usize) -> Vec<Block128> {
         out[y] = mds_coeff(dec_round, elem, lane);
     }
     out
+}
+
+/// Spine default — `live_slots = N_SPINE_SLOTS`.
+pub fn build_mds_lane_table(lane: usize) -> Vec<Block128> {
+    build_mds_lane_table_for_live_slots(lane, N_SPINE_SLOTS)
 }
 
 // ---------------------------------------------------------------------------

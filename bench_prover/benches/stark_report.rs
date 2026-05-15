@@ -5,32 +5,8 @@
 //!
 //!   cargo bench --bench stark_report
 //!
-//! # Scope (Stage Eopt baseline)
-//!
-//! This report is the performance surface for Stage Eopt. It measures
-//! the **per-tx client prover path** — `TxValidityCompositeWithSpine`
-//! — under its verifier-visible `PublicInputs` surface, plus the small
-//! set of component AIRs that dominate its prove-bucket profile.
-//!
-//! The tx-body Poseidon spine and the per-input H_ADDR / H_AUTH
-//! sponges no longer run inside the STARK — GKR owns the 59-perm
-//! tx-body spine and the 20-perm AuthGKR (4 inputs × 5 slots), and the
-//! STARK keeps only the two `tx_body_hash` lanes plus the boundary MLE
-//! openings. The headline here measures the **full Phase 1 production
-//! path** for a single transaction: STARK + SpineGKR + AuthGKR, all
-//! stapled through one shared FRI boundary commitment and the
-//! `(r_B, v_B)` reduction per sub-protocol absorbed into the STARK's
-//! extras-transcript hook.
-//!
-//!   - `TxValidityCompositeWithSpine` — headline: full per-tx composite
-//!     (balance, range, FRI state opening, combiner) wired through
-//!     **both** GKR sub-protocols (SpineGKR + AuthGKR). The bench
-//!     reports STARK-only baseline, STARK+SpineGKR, STARK+AuthGKR,
-//!     their GKR deltas, and the full production total.
-//!   - `PoseidonPermAir`  — one Poseidon2b permutation in isolation
-//!     (micro-baseline for residual Poseidon scaling).
-//!   - `RangeGateAir`     — u64 bit-decomposition sweep; raw engine
-//!                          scaling harness.
+//! Measures the per-tx client prover path: full `prove_tx` / `verify_tx`
+//! production pipeline with component breakdown for optimization.
 
 use std::time::{Duration, Instant};
 
@@ -42,17 +18,17 @@ use noid_core::{Block128, TowerField};
 use noid_fri::code::{LOG_RATE, RATE};
 use noid_fri::{NUM_QUERIES, TAU};
 use noid_gkr::{
-    compute_auth_boundary, compute_tx_body_hash, prove_spine_killshot, verify_spine_killshot,
-    AuthCircuit, AuthInputs, SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_INPUTS,
+    compute_auth_boundary, compute_tx_body_hash, prove_auth_killshot, prove_spine_killshot,
+    verify_auth_killshot, verify_spine_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
+    SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_stark::auth::{prove_air_with_auth, verify_air_with_auth, StarkProofWithAuth};
-use noid_stark::spine::{prove_air_with_spine, verify_air_with_spine, StarkProofWithSpine};
 use noid_stark::{
     padded_log_len, prove_air, prove_air_timed, verify_air_timed, ProveTimings, StarkProof,
     VerifyTimings,
 };
 use noid_tx::{PublicInputs, MAX_INPUTS, MAX_OUTPUTS};
+use noid_stark::prove_tx::{prove_tx, verify_tx, TxWitness};
 
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -60,10 +36,6 @@ use noid_poseidon2b::primitives::TxBodyHash;
 // Config
 // ---------------------------------------------------------------------------
 
-/// RangeGateAir sweep — raw engine scaling harness over a single-column
-/// bit-decomposition AIR. `small / mid / prod` mirror the three
-/// production-relevant log_rows so prove-bucket percentages remain
-/// comparable as the trace grows.
 const RANGE_SHAPES: &[(&str, usize)] = &[("small", 8), ("mid", 12), ("prod", 16)];
 
 const WARMUP: usize = 1;
@@ -239,7 +211,7 @@ fn collect_verify_buckets<A: Air>(
 }
 
 // ---------------------------------------------------------------------------
-// Common row / metrics struct used for every AIR
+// Component AIR metrics (engine scaling / Poseidon perm)
 // ---------------------------------------------------------------------------
 
 struct AirRow {
@@ -388,7 +360,7 @@ fn bench_range(label: &'static str, log_rows: usize) -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// Poseidon2b primitives — Perm (HAddr / HAuth evacuated to GKR)
+// Poseidon2b — single permutation micro-baseline
 // ---------------------------------------------------------------------------
 
 fn bench_poseidon_perm() -> AirRow {
@@ -418,43 +390,15 @@ fn bench_poseidon_perm() -> AirRow {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tx prover path — TxValidityCompositeWithSpine + SpineGKR + AuthGKR
+// Production: prove_tx / verify_tx — with full component breakdown
 //
-// Full Phase 1/1 production path for a single transaction:
-//   STARK   : balance, range, boundary pins, FRI state opening, combiner
-//   SpineGKR: 59-perm tx-body spine Merkle (evacuated from AIR)
-//   AuthGKR : 4 × 5 Poseidon2b sponge slots (H_ADDR + H_AUTH per input)
+// prove_tx orchestrates three components in a single transcript:
+//   1. SpineGKR Kill-Shot  — 59 Poseidon2b perms, tx-body Merkle spine
+//   2. AuthGKR Kill-Shot   — 4 inputs x 5 perms (H_ADDR + H_AUTH)
+//   3. STARK               — balance, range, FRI state, boundary bridges
 //
-// All three are stapled through the shared FRI boundary commitment
-// channel + the `(r_B, v_B)` reduction absorbed into the STARK's
-// extras-transcript hook. We measure three buckets so the Phase 1/1 GKR
-// win is visible:
-//
-//   - STARK-only              : baseline `prove_air` / `verify_air`
-//   - STARK + SpineGKR        : `prove_air_with_spine` + verify
-//   - STARK + AuthGKR         : `prove_air_with_auth`  + verify
-//
-// GKR-only deltas are derived by subtraction (with-GKR − baseline).
+// The bench isolates each component so time/size attribution is precise.
 // ---------------------------------------------------------------------------
-
-struct CompositePhase1Row {
-    log_rows: usize,
-    n_cols: usize,
-    n_shifted: usize,
-
-    // STARK-only baseline.
-    prove_stark: Duration,
-    verify_stark: Duration,
-    stark_proof_bytes: usize,
-
-    // STARK + SpineGKR.
-    prove_with_spine: Duration,
-    verify_with_spine: Duration,
-
-    // STARK + AuthGKR.
-    prove_with_auth: Duration,
-    verify_with_auth: Duration,
-}
 
 fn spine_inputs_from_composite(
     comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
@@ -491,196 +435,358 @@ fn auth_inputs_from_composite(
     }
 }
 
-fn bench_per_tx_composite_phase1() -> CompositePhase1Row {
+struct ProdRow {
+    // End-to-end totals
+    prove: Duration,
+    verify: Duration,
+    proof_bytes: usize,
+    // Trace parameters
+    log_rows: usize,
+    n_cols: usize,
+    n_shifted: usize,
+    // Proof size per component
+    spine_proof_bytes: usize,
+    auth_proof_bytes: usize,
+    stark_proof_bytes: usize,
+    // SpineGKR Kill-Shot (isolated)
+    spine_prove: Duration,
+    spine_verify: Duration,
+    // AuthGKR Kill-Shot (isolated)
+    auth_prove: Duration,
+    auth_verify: Duration,
+    // STARK (isolated, with bucket breakdown)
+    stark_prove: Duration,
+    stark_verify: Duration,
+    stark_prove_buckets: ProveTimings,
+    stark_verify_buckets: VerifyTimings,
+}
+
+fn bench_production() -> ProdRow {
     use noid_air::composition::tx_validity_with_spine::fixture;
 
     let comp = fixture::build_honest_realistic();
     let pi = comp.public_inputs();
     comp.assert_public_inputs_consistent(&pi);
-
     let trace = comp.build_trace();
+    let air = comp.air();
     let spine_inputs = spine_inputs_from_composite(&comp);
     let auth_inputs = auth_inputs_from_composite(&comp);
-    let air = comp.air();
 
-    assert!(
-        air.check(&trace),
-        "TxValidityCompositeWithSpine native check failed"
-    );
+    assert!(air.check(&trace), "production fixture native check failed");
 
-    // STARK-only baseline.
-    let prove_stark = time(|| {
-        let _ = prove_air(air, &trace, &pi).unwrap();
-    });
-    let stark_proof = prove_air(air, &trace, &pi).unwrap();
-    let verify_buckets = collect_verify_buckets(air, &pi, &stark_proof, SAMPLES);
-    let verify_stark = verify_buckets.total();
-
-    let log_len = padded_log_len(air.log_rows());
-    let n_shifted = air.shifted_column_indices().len();
-    let stark_proof_bytes =
-        estimate_stark_proof_bytes(&stark_proof, log_len, air.n_columns(), n_shifted);
-
-    // STARK + SpineGKR.
-    let prove_with_spine = time(|| {
-        let _: StarkProofWithSpine =
-            prove_air_with_spine(air, &trace, &pi, &spine_inputs).unwrap();
-    });
-    let with_spine_proof =
-        prove_air_with_spine(air, &trace, &pi, &spine_inputs).unwrap();
-    let verify_with_spine = time(|| {
-        verify_air_with_spine(air, &pi, &spine_inputs, &with_spine_proof)
-            .expect("verify spine");
-    });
-
-    // STARK + AuthGKR.
-    let prove_with_auth = time(|| {
-        let _: StarkProofWithAuth =
-            prove_air_with_auth(air, &trace, &pi, &auth_inputs).unwrap();
-    });
-    let with_auth_proof =
-        prove_air_with_auth(air, &trace, &pi, &auth_inputs).unwrap();
-    let verify_with_auth = time(|| {
-        verify_air_with_auth(air, &pi, &auth_inputs, &with_auth_proof)
-            .expect("verify auth");
-    });
-
-    let log_rows = air.log_rows();
-    let n_cols = air.n_columns();
-    CompositePhase1Row {
-        log_rows,
-        n_cols,
-        n_shifted,
-        prove_stark,
-        verify_stark,
-        stark_proof_bytes,
-        prove_with_spine,
-        verify_with_spine,
-        prove_with_auth,
-        verify_with_auth,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Kill-Shot spine — standalone bench (pure GKR, no STARK bridge yet).
-//
-// Stage 1.5.7 gates:
-//   - Spine prove  ≤  50 ms
-//   - Spine verify ≤   2 ms
-//   - Spine bytes  ≤  5 KB
-//
-// Targets are reported beside the measured values so a regression is
-// visible at a glance. We don't `panic!` on miss: cold dev hardware
-// is slower than CI; call sites that need a hard gate should grep
-// the printed line and fail externally.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct KillShotRow {
-    prove: Duration,
-    verify: Duration,
-    bytes: usize,
-}
-
-fn bench_spine_killshot(
-    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
-) -> KillShotRow {
-    let circuit = SpineCircuit::build();
-    let inputs = spine_inputs_from_composite(comp);
-    let claimed = compute_tx_body_hash(&circuit, &inputs);
+    // -----------------------------------------------------------------------
+    // End-to-end: prove_tx / verify_tx
+    // -----------------------------------------------------------------------
+    let witness = TxWitness {
+        air,
+        trace: &trace,
+        pi: &pi,
+        spine_inputs: &spine_inputs,
+        auth_inputs: &auth_inputs,
+    };
 
     let prove = time(|| {
+        let w = TxWitness {
+            air,
+            trace: &trace,
+            pi: &pi,
+            spine_inputs: &spine_inputs,
+            auth_inputs: &auth_inputs,
+        };
+        let _ = prove_tx(&w).expect("prove_tx");
+    });
+
+    let tx_proof = prove_tx(&witness).expect("prove_tx for verify");
+    let proof_bytes = tx_proof.estimated_byte_len();
+    let spine_proof_bytes = tx_proof.spine.byte_len();
+    let auth_proof_bytes = tx_proof.auth.byte_len();
+    let stark_proof_bytes = proof_bytes - spine_proof_bytes - auth_proof_bytes;
+
+    let verify = time(|| {
+        verify_tx(air, &pi, &spine_inputs, &auth_inputs, &tx_proof)
+            .expect("verify_tx");
+    });
+
+    // -----------------------------------------------------------------------
+    // Isolated: SpineGKR Kill-Shot
+    //   59 Poseidon2b permutations, hypercube dim=15, cells=32768
+    //   Computes: tx_body_hash = Merkle(leaves) via GKR sumcheck
+    // -----------------------------------------------------------------------
+    let spine_circuit = SpineCircuit::build();
+    let claimed = compute_tx_body_hash(&spine_circuit, &spine_inputs);
+
+    let spine_prove = time(|| {
         let mut ch = Poseidon2bChannel::new();
         let _: (SpineProofKillShot, _) =
-            prove_spine_killshot(&circuit, &inputs, claimed, &mut ch);
+            prove_spine_killshot(&spine_circuit, &spine_inputs, claimed, &mut ch);
     });
 
     let mut ch_p = Poseidon2bChannel::new();
-    let (proof, _) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
-    let bytes = proof.byte_len();
+    let (spine_proof, _) = prove_spine_killshot(&spine_circuit, &spine_inputs, claimed, &mut ch_p);
 
-    let verify = time(|| {
+    let spine_verify = time(|| {
         let mut ch_v = Poseidon2bChannel::new();
-        let _ = verify_spine_killshot(&proof, &circuit, &inputs, claimed, &mut ch_v)
-            .expect("kill-shot verify");
+        let _ = verify_spine_killshot(&spine_proof, &spine_circuit, &spine_inputs, claimed, &mut ch_v)
+            .expect("spine kill-shot verify");
     });
 
-    KillShotRow {
+    // -----------------------------------------------------------------------
+    // Isolated: AuthGKR Kill-Shot
+    //   4 inputs x 5 perms = 20 Poseidon2b permutations
+    //   Hypercube dim=14, cells=16384
+    //   Per input: H_ADDR(secret) -> address, H_AUTH(secret, tx_body_hash) -> auth_tag
+    // -----------------------------------------------------------------------
+    let auth_circuit = AuthCircuit::build();
+
+    let auth_prove = time(|| {
+        let mut ch = Poseidon2bChannel::new();
+        let _: (AuthProofKillShot, _) = prove_auth_killshot(&auth_circuit, &auth_inputs, &mut ch);
+    });
+
+    let mut ch_a = Poseidon2bChannel::new();
+    let (auth_proof_standalone, _) = prove_auth_killshot(&auth_circuit, &auth_inputs, &mut ch_a);
+
+    let auth_verify = time(|| {
+        let mut ch_v = Poseidon2bChannel::new();
+        let _ = verify_auth_killshot(&auth_proof_standalone, &auth_circuit, &auth_inputs, &mut ch_v)
+            .expect("auth kill-shot verify");
+    });
+
+    // -----------------------------------------------------------------------
+    // Isolated: STARK (with bucket breakdown)
+    //   log_rows=13, 291 columns, 75 shifted
+    //   Proves: BalanceGate (UTXO conservation), RangeGate (u64 decomp),
+    //           FriStateCombiner, FriStateOpen (input/output),
+    //           TxBodyHash boundary pins, coinbase gate
+    // -----------------------------------------------------------------------
+    let stark_prove_buckets = collect_prove_buckets(air, &trace, &pi, SAMPLES);
+    let stark_prove = stark_prove_buckets.total();
+
+    let stark_proof = prove_air(air, &trace, &pi).unwrap();
+    let stark_verify_buckets = collect_verify_buckets(air, &pi, &stark_proof, SAMPLES);
+    let stark_verify = stark_verify_buckets.total();
+
+    let n_shifted = air.shifted_column_indices().len();
+
+    ProdRow {
         prove,
         verify,
-        bytes,
+        proof_bytes,
+        log_rows: air.log_rows(),
+        n_cols: air.n_columns(),
+        n_shifted,
+        spine_proof_bytes,
+        auth_proof_bytes,
+        stark_proof_bytes,
+        spine_prove,
+        spine_verify,
+        auth_prove,
+        auth_verify,
+        stark_prove,
+        stark_verify,
+        stark_prove_buckets,
+        stark_verify_buckets,
     }
 }
 
-fn print_killshot_row(r: &KillShotRow) {
-    println!("  [phase1k] SpineGKR Kill-Shot — pure GKR (no STARK bridge yet)");
+fn print_prod_row(r: &ProdRow) {
+    // --- Headline: end-to-end totals ---
+    println!("  prove_tx / verify_tx  (single-transcript orchestrator)");
     println!("  +------------------------------------------------------------------------------+");
     println!(
-        "    Spine prove  {}   gate ≤   50 ms",
-        fmt_ms(r.prove),
+        "  | trace: log_rows={:>3}  columns={:>4}  shifted={:>2}                              |",
+        r.log_rows, r.n_cols, r.n_shifted,
     );
     println!(
-        "    Spine verify {}   gate ≤    2 ms",
-        fmt_ms(r.verify),
+        "  | fixture: 2 live inputs, 4 live outputs, fee=50, balance=150                   |",
     );
+    println!("  +------------------------------------------------------------------------------+");
+    println!();
+    println!("    TOTAL prove      {}    (end-to-end prove_tx)", fmt_ms(r.prove));
+    println!("    TOTAL verify     {}    (end-to-end verify_tx)", fmt_ms(r.verify));
+    println!("    TOTAL proof      {}    (wire size)", fmt_bytes(r.proof_bytes));
+    println!();
+    println!("    Targets:  prove < 300 ms  |  verify < 30 ms  |  proof < 250 KB");
+    println!();
+
+    // --- Component breakdown ---
+    let sum_prove = r.stark_prove + r.spine_prove + r.auth_prove;
+    let sum_verify = r.stark_verify + r.spine_verify + r.auth_verify;
+    let sum_bytes = r.stark_proof_bytes + r.spine_proof_bytes + r.auth_proof_bytes;
+
+    println!("  ============================================================================");
+    println!("  Component breakdown (isolated measurements, sum -> end-to-end)");
+    println!("  ============================================================================");
+    println!();
+
+    // --- STARK ---
+    println!("  [1] STARK — Binius-style over GF(2^128)");
+    println!("      Constraints: BalanceGate (UTXO conservation), RangeGate (u64 bit-decomp),");
+    println!("                   FriStateCombiner, FriStateOpen (in/out), TxBodyHash pins,");
+    println!("                   coinbase gate, activation/deactivation selectors");
     println!(
-        "    Spine bytes  {}     gate ≤    5 KB",
-        fmt_bytes(r.bytes),
+        "      Parameters:  log_rows={}  columns={}  shifted={}",
+        r.log_rows, r.n_cols, r.n_shifted,
     );
     println!();
-}
-
-fn print_phase1_row(r: &CompositePhase1Row) {
-    println!("  [phase1 ] TxValidityCompositeWithSpine + SpineGKR + AuthGKR (full per-tx production path)");
-    println!("  +------------------------------------------------------------------------------+");
     println!(
-        "  | log_rows={:>3}  n_cols={:>4}  shifted={:>2}  STARK proof(estimated)={} |",
-        r.log_rows,
-        r.n_cols,
-        r.n_shifted,
+        "      prove     {}  ({:>5.1}% of sum)",
+        fmt_ms(r.stark_prove),
+        percent(r.stark_prove, sum_prove),
+    );
+    println!(
+        "      verify    {}  ({:>5.1}% of sum)",
+        fmt_ms(r.stark_verify),
+        percent(r.stark_verify, sum_verify),
+    );
+    println!(
+        "      size      {}  ({:>5.1}% of sum)",
         fmt_bytes(r.stark_proof_bytes),
+        100.0 * r.stark_proof_bytes as f64 / sum_bytes as f64,
     );
-    println!("  |   fixture: 2 live in / 4 live out, fee 50, balance 150 = 100 + 50           |");
-    println!("  +------------------------------------------------------------------------------+");
+    println!();
 
-    let spine_prove_delta = r.prove_with_spine.saturating_sub(r.prove_stark);
-    let auth_prove_delta = r.prove_with_auth.saturating_sub(r.prove_stark);
-    let spine_verify_delta = r.verify_with_spine.saturating_sub(r.verify_stark);
-    let auth_verify_delta = r.verify_with_auth.saturating_sub(r.verify_stark);
-    // Full production path total: STARK is shared between the two
-    // with-GKR runs — it's paid once. GKR-only deltas add linearly.
-    let prove_full = r.prove_stark + spine_prove_delta + auth_prove_delta;
-    let verify_full = r.verify_stark + spine_verify_delta + auth_verify_delta;
+    // STARK prover buckets
+    let ptot = r.stark_prove_buckets.total();
+    println!("      prover buckets:");
+    println!(
+        "        commit (Merkle)        {}  ({:>5.1}%)",
+        fmt_ms(r.stark_prove_buckets.commit),
+        percent(r.stark_prove_buckets.commit, ptot),
+    );
+    println!(
+        "        zero-check sumcheck    {}  ({:>5.1}%)",
+        fmt_ms(r.stark_prove_buckets.transcript_sumcheck),
+        percent(r.stark_prove_buckets.transcript_sumcheck, ptot),
+    );
+    println!(
+        "        shift ladder sumcheck  {}  ({:>5.1}%)",
+        fmt_ms(r.stark_prove_buckets.ladder_sumcheck),
+        percent(r.stark_prove_buckets.ladder_sumcheck, ptot),
+    );
+    println!(
+        "        multipoint + FRI       {}  ({:>5.1}%)",
+        fmt_ms(r.stark_prove_buckets.multipoint_fri),
+        percent(r.stark_prove_buckets.multipoint_fri, ptot),
+    );
+    let mpt = r.stark_prove_buckets.multipoint_fri;
+    println!("          multipoint sub-buckets:");
+    println!(
+        "            setup + pairs      {}  ({:>5.1}% of mp)",
+        fmt_ms(r.stark_prove_buckets.mp_setup_pairs),
+        percent(r.stark_prove_buckets.mp_setup_pairs, mpt),
+    );
+    println!(
+        "            mp sumcheck        {}  ({:>5.1}% of mp)",
+        fmt_ms(r.stark_prove_buckets.mp_sumcheck),
+        percent(r.stark_prove_buckets.mp_sumcheck, mpt),
+    );
+    println!(
+        "            batched FRI        {}  ({:>5.1}% of mp)",
+        fmt_ms(r.stark_prove_buckets.mp_fri),
+        percent(r.stark_prove_buckets.mp_fri, mpt),
+    );
+    println!();
 
+    // STARK verifier buckets
+    let vtot = r.stark_verify_buckets.total();
+    println!("      verifier buckets:");
     println!(
-        "    STARK only         prove {}  verify {}",
-        fmt_ms(r.prove_stark),
-        fmt_ms(r.verify_stark),
+        "        transcript sumcheck    {}  ({:>5.1}%)",
+        fmt_ms(r.stark_verify_buckets.transcript_sumcheck),
+        percent(r.stark_verify_buckets.transcript_sumcheck, vtot),
     );
     println!(
-        "    STARK + SpineGKR   prove {}  verify {}   (spine delta: prove {} / verify {})",
-        fmt_ms(r.prove_with_spine),
-        fmt_ms(r.verify_with_spine),
-        fmt_ms(spine_prove_delta),
-        fmt_ms(spine_verify_delta),
+        "        composition check      {}  ({:>5.1}%)",
+        fmt_ms(r.stark_verify_buckets.composition),
+        percent(r.stark_verify_buckets.composition, vtot),
     );
     println!(
-        "    STARK + AuthGKR    prove {}  verify {}   (auth  delta: prove {} / verify {})",
-        fmt_ms(r.prove_with_auth),
-        fmt_ms(r.verify_with_auth),
-        fmt_ms(auth_prove_delta),
-        fmt_ms(auth_verify_delta),
+        "        shift ladder sumcheck  {}  ({:>5.1}%)",
+        fmt_ms(r.stark_verify_buckets.ladder_sumcheck),
+        percent(r.stark_verify_buckets.ladder_sumcheck, vtot),
     );
     println!(
-        "    Phase 1/1 TOTAL      prove {}  verify {}   (STARK + SpineGKR + AuthGKR)",
-        fmt_ms(prove_full),
-        fmt_ms(verify_full),
+        "        multipoint + FRI       {}  ({:>5.1}%)",
+        fmt_ms(r.stark_verify_buckets.multipoint_fri),
+        percent(r.stark_verify_buckets.multipoint_fri, vtot),
+    );
+    println!();
+
+    // --- SpineGKR Kill-Shot ---
+    println!("  [2] SpineGKR Kill-Shot — tx-body Merkle spine via GKR");
+    println!("      Circuit: 59 Poseidon2b permutations (66 rounds each)");
+    println!("      Hypercube: dim=15, cells=32768, layout=[elem:2|round:7|slot:6]");
+    println!("      Proves: tx_body_hash = Poseidon2b-Merkle(input_leaves, output_leaves, fee, ...)");
+    println!("      Protocol: unified sumcheck -> shift gadget -> 3x batch_eval reductions");
+    println!();
+    println!(
+        "      prove     {}  ({:>5.1}% of sum)",
+        fmt_ms(r.spine_prove),
+        percent(r.spine_prove, sum_prove),
+    );
+    println!(
+        "      verify    {}  ({:>5.1}% of sum)",
+        fmt_ms(r.spine_verify),
+        percent(r.spine_verify, sum_verify),
+    );
+    println!(
+        "      size      {}  ({:>5.1}% of sum)",
+        fmt_bytes(r.spine_proof_bytes),
+        100.0 * r.spine_proof_bytes as f64 / sum_bytes as f64,
+    );
+    println!();
+
+    // --- AuthGKR Kill-Shot ---
+    println!("  [3] AuthGKR Kill-Shot — spend authorization via GKR");
+    println!("      Circuit: {} inputs x 5 perms = {} Poseidon2b permutations (66 rounds each)", N_AUTH_INPUTS, N_AUTH_INPUTS * 5);
+    println!("      Hypercube: dim=14, cells=16384, layout=[elem:2|round:7|slot:5]");
+    println!("      Per input: H_ADDR(secret)->address, H_AUTH(secret,tx_body_hash)->auth_tag");
+    println!("      Protocol: unified sumcheck -> shift gadget -> 3x batch_eval reductions");
+    println!();
+    println!(
+        "      prove     {}  ({:>5.1}% of sum)",
+        fmt_ms(r.auth_prove),
+        percent(r.auth_prove, sum_prove),
+    );
+    println!(
+        "      verify    {}  ({:>5.1}% of sum)",
+        fmt_ms(r.auth_verify),
+        percent(r.auth_verify, sum_verify),
+    );
+    println!(
+        "      size      {}  ({:>5.1}% of sum)",
+        fmt_bytes(r.auth_proof_bytes),
+        100.0 * r.auth_proof_bytes as f64 / sum_bytes as f64,
+    );
+    println!();
+
+    // --- Sum check ---
+    println!("  ----------------------------------------------------------------------------");
+    println!(
+        "  SUM (isolated)   prove {}   verify {}   size {}",
+        fmt_ms(sum_prove),
+        fmt_ms(sum_verify),
+        fmt_bytes(sum_bytes),
+    );
+    println!(
+        "  END-TO-END       prove {}   verify {}   size {}",
+        fmt_ms(r.prove),
+        fmt_ms(r.verify),
+        fmt_bytes(r.proof_bytes),
+    );
+    let overhead_prove = r.prove.saturating_sub(sum_prove);
+    let overhead_verify = r.verify.saturating_sub(sum_verify);
+    println!(
+        "  OVERHEAD         prove {}   verify {}   (transcript glue, boundary commits)",
+        fmt_ms(overhead_prove),
+        fmt_ms(overhead_verify),
     );
     println!();
 }
 
 // ---------------------------------------------------------------------------
-// Banner / footer
+// Banner
 // ---------------------------------------------------------------------------
 
 const BANNER: &str = r#"
@@ -690,8 +796,8 @@ const BANNER: &str = r#"
   |  __/ ___ \|  _ <  / ___ \| |\  | |_| | || |_| |
   |_| /_/   \_\_| \_\/_/   \_\_| \_|\___/___|____/
 
-  PARANOID  --  Transparent UTXO Validity Engine (STARK-based)
-  Binius-style STARK over GF(2^128). Per-tx client-side proof.
+  PARANOID  --  Transparent UTXO Validity Engine
+  Binius-style STARK over GF(2^128) + GKR Kill-Shot. Per-tx client-side proof.
 "#;
 
 fn print_banner() {
@@ -701,57 +807,12 @@ fn print_banner() {
         WARMUP, SAMPLES
     );
     println!();
-    println!("  Sections:");
-    println!("    Engine scaling              (RangeGate sweep)");
-    println!("    Poseidon2b hashes           (Perm)");
-    println!("    Per-tx prover path          (STARK + SpineGKR + AuthGKR, Phase 1/1)");
-    println!();
 }
 
 fn print_section(title: &str) {
     println!("==========================================================================");
     println!("  {title}");
     println!("==========================================================================");
-    println!();
-}
-
-fn print_footer(prod: &CompositePhase1Row) {
-    print_section("Summary");
-
-    let spine_prove_delta = prod.prove_with_spine.saturating_sub(prod.prove_stark);
-    let auth_prove_delta = prod.prove_with_auth.saturating_sub(prod.prove_stark);
-    let spine_verify_delta = prod.verify_with_spine.saturating_sub(prod.verify_stark);
-    let auth_verify_delta = prod.verify_with_auth.saturating_sub(prod.verify_stark);
-    let prove_full = prod.prove_stark + spine_prove_delta + auth_prove_delta;
-    let verify_full = prod.verify_stark + spine_verify_delta + auth_verify_delta;
-
-    println!(
-        "  Phase 1/1 per-tx prover (full production path):  prove={}  verify={}",
-        fmt_ms(prove_full),
-        fmt_ms(verify_full),
-    );
-    println!(
-        "    STARK proper           prove={}  verify={}  proof(STARK only)≈{}",
-        fmt_ms(prod.prove_stark),
-        fmt_ms(prod.verify_stark),
-        fmt_bytes(prod.stark_proof_bytes),
-    );
-    println!(
-        "    SpineGKR (59 perms)    prove={}  verify={}",
-        fmt_ms(spine_prove_delta),
-        fmt_ms(spine_verify_delta),
-    );
-    println!(
-        "    AuthGKR  (4×5 perms)   prove={}  verify={}",
-        fmt_ms(auth_prove_delta),
-        fmt_ms(auth_verify_delta),
-    );
-    println!(
-        "  composite log_rows = {}  |  n_cols = {}",
-        prod.log_rows, prod.n_cols
-    );
-    println!();
-    println!("  Reproduce: cargo bench --bench stark_report");
     println!();
 }
 
@@ -769,33 +830,24 @@ fn main() {
         range_rows.push(bench_range(label, *log_rows));
     }
 
-    eprintln!("  Poseidon2b ...");
+    eprintln!("  Poseidon2b perm ...");
     let perm_row = bench_poseidon_perm();
 
-    eprintln!("  per-tx prover path (STARK + SpineGKR + AuthGKR) ...");
-    let l_row = bench_per_tx_composite_phase1();
-
-    eprintln!("  spine kill-shot (pure GKR) ...");
-    let killshot_row = {
-        use noid_air::composition::tx_validity_with_spine::fixture;
-        let comp = fixture::build_honest_realistic();
-        bench_spine_killshot(&comp)
-    };
+    eprintln!("  production prove_tx / verify_tx (+ component breakdown) ...");
+    let prod_row = bench_production();
     eprintln!();
 
-    print_section("Engine scaling");
+    print_section("Engine scaling (RangeGateAir — u64 bit-decomposition)");
     for r in &range_rows {
-        print_row("range    ", r);
+        print_row("range", r);
     }
 
-    print_section("Poseidon2b hashes");
-    print_row("perm     ", &perm_row);
+    print_section("Poseidon2b single-permutation (66 rounds, micro-baseline)");
+    print_row("perm ", &perm_row);
 
-    print_section("Per-tx prover path ( Phase 1/1 production path)");
-    print_phase1_row(&l_row);
+    print_section("PRODUCTION: prove_tx / verify_tx (per-tx mainnet path)");
+    print_prod_row(&prod_row);
 
-    print_section("SpineGKR Kill-Shot (pure GKR, Stage 1.5.7 gates; current multiplier — see 1.5.8)");
-    print_killshot_row(&killshot_row);
-
-    print_footer(&l_row);
+    println!("  Reproduce: cargo bench --bench stark_report");
+    println!();
 }

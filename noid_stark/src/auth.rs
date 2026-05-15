@@ -13,7 +13,7 @@
 //! `(Address, AuthTag)` was produced by honest `HAddr`/`HAuth` chains
 //! driven by the spender's secret, **without exposing the secret to the
 //! verifier**. The secret is witness-only; the verifier sees only the
-//! committed 2^15-cell auth boundary MLE (state + sout halves) and the
+//! committed 2^14-cell unified state MLE and the
 //! `(r_B, v_B)` reduction scalars.
 //!
 //! # Binding
@@ -36,8 +36,9 @@ use noid_fri::code::LOG_RATE;
 use noid_fri::hasher::Blake3Hasher;
 use noid_fri::prover::{commit as fri_commit, FriCommitment};
 use noid_gkr::{
-    build_auth_boundary_mle, prove_auth, reconstruct_auth_slot_states, verify_auth, AuthCircuit,
-    AuthInputs, AuthProof, BatchEvalReduction, N_AUTH_BOUNDARY_VARS,
+    build_auth_unified_from_inputs, prove_auth_killshot,
+    verify_auth_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
+    N_AUTH_UNIFIED_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_tx::PublicInputs;
@@ -47,13 +48,17 @@ use crate::{
     ProveError, StarkProof, VerifyError,
 };
 
-/// Composite proof: a normal STARK proof plus an independent AuthGKR
+/// Composite proof: a normal STARK proof plus the AuthGKR Kill-Shot
 /// proof, both written against the same `PublicInputs`. Byte layout
 /// mirrors [`crate::spine::StarkProofWithSpine`].
+///
+/// Step 3 Phase 1 flip: the legacy per-perm `AuthProof` is replaced by
+/// `AuthProofKillShot` (unified sumcheck + shift). The STARK bridge now
+/// uses the kill-shot entry point exclusively.
 #[derive(Debug, Clone)]
 pub struct StarkProofWithAuth {
     pub stark: StarkProof,
-    pub auth: AuthProof,
+    pub auth: AuthProofKillShot,
     pub boundary_commitment: FriCommitment,
 }
 
@@ -111,11 +116,15 @@ fn absorb_fri_commitment_into_auth_channel(
     channel.absorb(Block128::from(commitment.log_len as u128));
 }
 
-/// Commit the 2^15-cell auth boundary MLE, run the auth GKR against a
-/// channel seeded with the commitment root, and fold the reduction
-/// `(r_B, v_B)` into the STARK parent via the extras-transcript hook.
-/// The boundary MLE rides along as an [`ExtraColumn`] so the STARK's
-/// mixed-close FRI opening discharges `B_auth(r_B) = v_B`.
+/// Commit the 2^14-cell unified state MLE, run the AuthGKR Kill-Shot
+/// against a channel seeded with the commitment root, and fold the
+/// reduction `(r_B, v_B)` into the STARK parent via the
+/// extras-transcript hook. The state MLE rides along as an
+/// [`ExtraColumn`] so the STARK's mixed-close FRI opening discharges
+/// `state(r_B) = v_B`.
+///
+/// Step 3 Phase 1: uses `prove_auth_killshot` (unified sumcheck +
+/// shift) instead of the legacy per-perm `prove_auth`.
 pub fn prove_air_with_auth<A: Air>(
     air: &A,
     trace: &Trace,
@@ -128,22 +137,21 @@ pub fn prove_air_with_auth<A: Air>(
 
     let circuit = AuthCircuit::build();
 
-    // Build and commit the auth boundary MLE `B_auth` before opening
-    // the auth transcript. Same γ₃a seeding pattern as the spine:
-    // every auth challenge (including the per-slot `r0` feeding each
-    // `prove_perm`) depends on the commitment root.
-    let states = reconstruct_auth_slot_states(&circuit, auth_inputs);
-    let boundary_mle = build_auth_boundary_mle(&states);
-    let ntt = AdditiveNTT::<Block128>::new(N_AUTH_BOUNDARY_VARS + LOG_RATE);
+    // Build and commit the unified state MLE (14 vars).
+    let unified_mle = build_auth_unified_from_inputs(&circuit, auth_inputs);
+    let state_mle = unified_mle.state;
+    let ntt = AdditiveNTT::<Block128>::new(N_AUTH_UNIFIED_VARS + LOG_RATE);
     let hasher = Blake3Hasher::new();
-    let (boundary_commitment, _tree, _code) = fri_commit(&boundary_mle, &ntt, &hasher);
+    let (boundary_commitment, _tree, _code) = fri_commit(&state_mle, &ntt, &hasher);
 
+    // Seed auth channel with boundary commitment, run Kill-Shot.
     let mut auth_channel = Poseidon2bChannel::new();
     absorb_fri_commitment_into_auth_channel(&mut auth_channel, &boundary_commitment);
-    let (auth, reduction) = prove_auth(&circuit, auth_inputs, &mut auth_channel);
+    let (auth_proof, reductions) = prove_auth_killshot(&circuit, auth_inputs, &mut auth_channel);
 
+    let reduction = &reductions.state;
     let extras = vec![ExtraColumn {
-        evals: boundary_mle,
+        evals: state_mle,
         commitment: boundary_commitment.clone(),
         eval_point: reduction.point.clone(),
         value: reduction.value,
@@ -159,14 +167,16 @@ pub fn prove_air_with_auth<A: Air>(
 
     Ok(StarkProofWithAuth {
         stark,
-        auth,
+        auth: auth_proof,
         boundary_commitment,
     })
 }
 
-/// Verify the AuthGKR first (so we know it's well-formed before its
-/// reduction is absorbed into the STARK transcript), then replay the
-/// STARK with the same extras-transcript and boundary commitment.
+/// Verify the AuthGKR Kill-Shot first, then replay the STARK with the
+/// same extras-transcript and boundary commitment.
+///
+/// Step 3 Phase 1: uses `verify_auth_killshot` instead of the legacy
+/// per-perm `verify_auth`.
 pub fn verify_air_with_auth<A: Air>(
     air: &A,
     pi: &PublicInputs,
@@ -175,16 +185,17 @@ pub fn verify_air_with_auth<A: Air>(
 ) -> Result<(), VerifyWithAuthError> {
     let circuit = AuthCircuit::build();
 
-    if proof.boundary_commitment.log_len != N_AUTH_BOUNDARY_VARS {
+    if proof.boundary_commitment.log_len != N_AUTH_UNIFIED_VARS {
         return Err(VerifyWithAuthError::Auth);
     }
 
     let mut auth_channel = Poseidon2bChannel::new();
     absorb_fri_commitment_into_auth_channel(&mut auth_channel, &proof.boundary_commitment);
-    let reduction: BatchEvalReduction =
-        verify_auth(&proof.auth, &circuit, auth_inputs, &mut auth_channel)
+    let reductions =
+        verify_auth_killshot(&proof.auth, &circuit, auth_inputs, &mut auth_channel)
             .ok_or(VerifyWithAuthError::Auth)?;
 
+    let reduction = &reductions.state;
     let extras = vec![ExtraColumn {
         evals: Vec::new(),
         commitment: proof.boundary_commitment.clone(),
@@ -294,30 +305,31 @@ mod tests {
     }
 
     #[test]
-    fn tampered_slot_v0_rejected() {
-        // γ₂-lift regression at STARK boundary: the per-slot `v0` the
-        // prover ships is bound twice — by the per-slot sumcheck and by
-        // the batch-eval against the committed boundary. A tamper must
-        // be caught by verify_auth before we ever reach the STARK.
+    fn tampered_state_batch_rejected() {
+        // Kill-Shot equivalent of the legacy `tampered_slot_v0` test:
+        // flip a scalar in the state batch-eval proof. The kill-shot
+        // verifier must reject before we reach the STARK.
         let inputs = demo_auth_inputs();
         let pi = demo_pi();
         let air = tiny_air();
         let trace = demo_trace();
         let mut proof = prove_air_with_auth(&air, &trace, &pi, &inputs).unwrap();
-        proof.auth.slot_v0[5] = proof.auth.slot_v0[5] + Block128::from(1u128);
+        proof.auth.state_batch.b_final =
+            proof.auth.state_batch.b_final + Block128::from(1u128);
         let err = verify_air_with_auth(&air, &pi, &inputs, &proof);
         assert!(matches!(err, Err(VerifyWithAuthError::Auth)));
     }
 
     #[test]
-    fn tampered_auth_scalar_rejected() {
+    fn tampered_auth_killshot_scalar_rejected() {
+        // Flip a scalar in the unified proof's round polys.
         let inputs = demo_auth_inputs();
         let pi = demo_pi();
         let air = tiny_air();
         let trace = demo_trace();
         let mut proof = prove_air_with_auth(&air, &trace, &pi, &inputs).unwrap();
-        proof.auth.slots[0].sout_x4x3.a_final =
-            proof.auth.slots[0].sout_x4x3.a_final + Block128::from(1u128);
+        proof.auth.kill_shot.main.state_at_r =
+            proof.auth.kill_shot.main.state_at_r + Block128::from(1u128);
         let err = verify_air_with_auth(&air, &pi, &inputs, &proof);
         assert!(err.is_err());
     }
@@ -336,9 +348,9 @@ mod tests {
 
     #[test]
     fn auth_extras_actually_fork_transcript() {
-        // Mirror of spine's `stark_extras_actually_fork_transcript`:
-        // bypass verify_auth, rebuild the extras the STARK verifier
-        // sees, and confirm a perturbed extras-transcript is rejected.
+        // Bypass verify_auth_killshot, rebuild the extras the STARK
+        // verifier sees, and confirm a perturbed extras-transcript
+        // is rejected.
         let inputs = demo_auth_inputs();
         let pi = demo_pi();
         let air = tiny_air();
@@ -348,8 +360,10 @@ mod tests {
         let circuit = AuthCircuit::build();
         let mut auth_channel = Poseidon2bChannel::new();
         absorb_fri_commitment_into_auth_channel(&mut auth_channel, &proof.boundary_commitment);
-        let reduction = verify_auth(&proof.auth, &circuit, &inputs, &mut auth_channel)
-            .expect("honest auth must verify here");
+        let reductions =
+            verify_auth_killshot(&proof.auth, &circuit, &inputs, &mut auth_channel)
+                .expect("honest auth must verify here");
+        let reduction = &reductions.state;
         let honest = auth_reduction_transcript(&reduction.point, reduction.value);
         let extras = vec![ExtraColumn {
             evals: Vec::new(),

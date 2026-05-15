@@ -48,9 +48,10 @@ use crate::spine_mle::{
     SpineUnifiedMle, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS, N_SPINE_SLOT_VARS,
     N_SPINE_UNIFIED_CELLS, N_SPINE_UNIFIED_VARS,
 };
+use crate::spine_mle::N_SPINE_SLOTS;
 use crate::spine_shift::{
-    build_mds_lane_table, build_rc_table, build_sigma_table, build_u_table, permute_by_dec,
-    project_lane,
+    build_mds_lane_table_for_live_slots, build_rc_table_for_live_slots,
+    build_sigma_table_for_live_slots, build_u_table_for_live_slots, permute_by_dec, project_lane,
 };
 
 // Bit layout: `elem:2 | round:7 | slot:6` (low → high). Slices over
@@ -114,6 +115,16 @@ pub fn prove_spine_unified<T: FiatShamir<Block128>>(
     mle: &SpineUnifiedMle,
     channel: &mut T,
 ) -> (SpineUnifiedProof, Vec<Block128>) {
+    prove_spine_unified_for_live_slots(mle, N_SPINE_SLOTS, channel)
+}
+
+/// Live-slot-parameterised variant for AuthGKR (`live_slots = 20`)
+/// and any other topology that reuses the unified hypercube.
+pub fn prove_spine_unified_for_live_slots<T: FiatShamir<Block128>>(
+    mle: &SpineUnifiedMle,
+    live_slots: usize,
+    channel: &mut T,
+) -> (SpineUnifiedProof, Vec<Block128>) {
     assert_eq!(mle.s_in.len(), N_SPINE_UNIFIED_CELLS);
     assert_eq!(mle.s_out.len(), N_SPINE_UNIFIED_CELLS);
     assert_eq!(mle.sigma.len(), N_SPINE_UNIFIED_CELLS);
@@ -134,7 +145,7 @@ pub fn prove_spine_unified<T: FiatShamir<Block128>>(
     // `square_flat_u128` directly; folds run in flat too. Only the
     // round-poly coefficients (absorbed into the channel) and the
     // final witness claims are converted back to tower.
-    let tabs = build_unified_tables(mle, &rho);
+    let tabs = build_unified_tables(mle, &rho, live_slots);
     let mut tabs = UnifiedFlatTables::from_tower(tabs);
     let beta_flat = tower_to_flat_u128(beta.to_u128());
     let gamma_flat = tower_to_flat_u128(gamma.to_u128());
@@ -184,6 +195,16 @@ pub fn verify_spine_unified<T: FiatShamir<Block128>>(
     proof: &SpineUnifiedProof,
     channel: &mut T,
 ) -> Option<SpineUnifiedReduction> {
+    verify_spine_unified_for_live_slots(proof, N_SPINE_SLOTS, channel)
+}
+
+/// Live-slot-parameterised variant of `verify_spine_unified`. Must be
+/// called with the same `live_slots` value the prover used.
+pub fn verify_spine_unified_for_live_slots<T: FiatShamir<Block128>>(
+    proof: &SpineUnifiedProof,
+    live_slots: usize,
+    channel: &mut T,
+) -> Option<SpineUnifiedReduction> {
     if proof.round_polys.len() != N_SPINE_UNIFIED_VARS {
         return None;
     }
@@ -223,14 +244,20 @@ pub fn verify_spine_unified<T: FiatShamir<Block128>>(
     // Recompute public schedules at r' natively. `dec_round_index`
     // leaves the elem bits untouched, so we can build the σ_dec
     // table once and project it for the four lane evaluations.
-    let u_at_r = evaluate_slice(&build_u_table(&rho), &r_prime);
-    let sigma_dec_full = permute_by_dec(&build_sigma_table());
+    let u_at_r = evaluate_slice(&build_u_table_for_live_slots(&rho, live_slots), &r_prime);
+    let sigma_dec_full = permute_by_dec(&build_sigma_table_for_live_slots(live_slots));
     let sigma_dec_at_r = evaluate_slice(&sigma_dec_full, &r_prime);
-    let rc_dec_at_r = evaluate_slice(&permute_by_dec(&build_rc_table()), &r_prime);
+    let rc_dec_at_r = evaluate_slice(
+        &permute_by_dec(&build_rc_table_for_live_slots(live_slots)),
+        &r_prime,
+    );
     let mut mds_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
     let mut sigma_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
     for j in 0..STATE_SIZE {
-        mds_lane_dec_at_r[j] = evaluate_slice(&build_mds_lane_table(j), &r_prime);
+        mds_lane_dec_at_r[j] = evaluate_slice(
+            &build_mds_lane_table_for_live_slots(j, live_slots),
+            &r_prime,
+        );
         sigma_lane_dec_at_r[j] = evaluate_slice(&project_lane(&sigma_dec_full, j), &r_prime);
     }
 
@@ -310,16 +337,20 @@ struct UnifiedFinalClaims {
     state_lane_dec: [Block128; STATE_SIZE],
 }
 
-fn build_unified_tables(mle: &SpineUnifiedMle, rho: &[Block128]) -> UnifiedTables {
-    let sigma_full = build_sigma_table();
+fn build_unified_tables(
+    mle: &SpineUnifiedMle,
+    rho: &[Block128],
+    live_slots: usize,
+) -> UnifiedTables {
+    let sigma_full = build_sigma_table_for_live_slots(live_slots);
     let sigma_dec = permute_by_dec(&sigma_full);
-    let rc_dec = permute_by_dec(&build_rc_table());
+    let rc_dec = permute_by_dec(&build_rc_table_for_live_slots(live_slots));
     let s_in_dec = permute_by_dec(&mle.s_in);
     let s_out_dec = permute_by_dec(&mle.s_out);
     let state_dec = permute_by_dec(&mle.state);
 
     let mds_lane_dec: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(build_mds_lane_table);
+        std::array::from_fn(|j| build_mds_lane_table_for_live_slots(j, live_slots));
     let sigma_lane_dec: [Vec<Block128>; STATE_SIZE] =
         std::array::from_fn(|j| project_lane(&sigma_dec, j));
     let s_out_lane_dec: [Vec<Block128>; STATE_SIZE] =
@@ -328,7 +359,7 @@ fn build_unified_tables(mle: &SpineUnifiedMle, rho: &[Block128]) -> UnifiedTable
         std::array::from_fn(|j| project_lane(&state_dec, j));
 
     UnifiedTables {
-        u: build_u_table(rho),
+        u: build_u_table_for_live_slots(rho, live_slots),
         sigma_dec,
         rc_dec,
         mds_lane_dec,
@@ -1455,8 +1486,9 @@ mod tests {
         let beta = Block128::from(0xC0FFEE_BAADu128);
         let gamma = Block128::from(0xFEEDFACE_CAFEBABEu128);
 
-        let mut tow = build_unified_tables(&mle, &rho);
-        let mut flt = UnifiedFlatTables::from_tower(build_unified_tables(&mle, &rho));
+        let mut tow = build_unified_tables(&mle, &rho, N_SPINE_SLOTS);
+        let mut flt =
+            UnifiedFlatTables::from_tower(build_unified_tables(&mle, &rho, N_SPINE_SLOTS));
         let beta_flat = tower_to_flat_u128(beta.to_u128());
         let gamma_flat = tower_to_flat_u128(gamma.to_u128());
 

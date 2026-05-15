@@ -75,6 +75,13 @@ pub struct BatchedEvalProof {
     pub batch_proof: EvalProof,
 }
 
+impl BatchedEvalProof {
+    pub fn byte_len(&self) -> usize {
+        let openings = self.column_openings.len() * 16;
+        openings + self.batch_proof.byte_len()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mixed-length batched opening (γ₃b plan B)
 // ---------------------------------------------------------------------------
@@ -116,6 +123,22 @@ pub struct MixedGroupProof {
     pub column_indices: Vec<usize>,
     /// Single FRI evaluation proof for the group's RLC'd codeword.
     pub batch_proof: EvalProof,
+}
+
+impl MixedGroupProof {
+    pub fn byte_len(&self) -> usize {
+        let point = self.eval_point.len() * 16;
+        let indices = self.column_indices.len() * 8;
+        point + indices + self.batch_proof.byte_len()
+    }
+}
+
+impl MixedBatchedEvalProof {
+    pub fn byte_len(&self) -> usize {
+        let openings = self.column_openings.len() * 16;
+        let groups: usize = self.groups.iter().map(|g| g.byte_len()).sum();
+        openings + groups
+    }
 }
 
 /// Batched opening proof across columns of possibly-different

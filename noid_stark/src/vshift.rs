@@ -109,17 +109,10 @@ pub fn ladder_partials(col: &[Block128], r: &[Block128]) -> Vec<Block128> {
         return partials;
     }
 
-    // Each fold step consumes the current MSB coord of `buf`. Start
-    // with all `n` coords live (`buf.len() = 2^n`) and fold coord
-    // `n-1`, then `n-2`, …, until only coords `0..=k` remain. At that
-    // point the table has length `2^{k+1}` and equals `S_k(x_0,…,x_k)`;
-    // read `v_k = buf[2^k]` before folding coord `k` away.
     let mut buf: Vec<Block128> = col.to_vec();
     for k in (0..n).rev() {
         let half = 1usize << k;
-        // v_k sits at flat index 2^k in the current length-2·half table.
         partials[k] = buf[half];
-        // Consume coord `k` (current MSB) with `r[k]`.
         let rk = r[k];
         for i in 0..half {
             buf[i] = buf[i] + rk * (buf[i + half] + buf[i]);
