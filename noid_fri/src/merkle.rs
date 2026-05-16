@@ -141,6 +141,14 @@ impl MerkleTree {
         self.layer_lens[depth]
     }
 
+    /// Get the hash of a node at a given depth and index.
+    /// Depth 0 = root, depth `num_layers()-1` = leaves.
+    pub fn get_node_at_depth(&self, depth: usize, index: usize) -> HashOutput {
+        assert!(depth < self.layer_offsets.len());
+        assert!(index < self.layer_lens[depth]);
+        self.nodes[self.layer_offsets[depth] + index]
+    }
+
     pub fn get_merkle_path(&self, leaf_index: usize) -> Vec<HashOutput> {
         let leaf_depth = self.num_layers() - 1;
         assert!(

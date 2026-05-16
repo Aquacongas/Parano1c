@@ -3,18 +3,18 @@
 
 //! Production orchestrator: `prove_tx` / `verify_tx`.
 //!
-//! Stage 0 "MLE Splitting" path. Single-transcript, single FRI group:
+//! FRI-Binius interleaved PCS path. Single-transcript, single Merkle tree:
 //!
 //! 1. Seed one `Poseidon2bChannel` with `PublicInputs`.
 //! 2. Build Spine boundary MLE (2^15); slice into 4 columns of 2^13.
 //! 3. Build Auth boundary MLE (2^14); slice into 2 columns of 2^13.
 //! 4. Append all 6 slice columns to the trace. Commit all columns
-//!    uniformly at log_len=13.
-//! 5. Absorb slice commitments (indices 291..297) into GKR channels.
+//!    into ONE interleaved Merkle tree (FRI-Binius PCS).
+//! 5. Absorb interleaved Merkle cap into GKR channels.
 //! 6. Run SpineGKR Kill-Shot, then AuthGKR Kill-Shot.
 //! 7. Thread both `(r_B, v_B)` reductions into STARK `extra_transcript`.
-//! 8. STARK prove: zero-check + uniform multipoint close (with slice
-//!    claims injected) + single batched FRI opening for all 297 columns.
+//! 8. STARK prove: zero-check + multipoint close (with slice claims) +
+//!    single FRI-Binius mixed opening for all 297 columns.
 //!
 //! The verifier replays in the same order, reconstructs the original
 //! MLE values from slice openings via `reconstruct_from_slices`, and
@@ -23,9 +23,8 @@
 use noid_air::{Air, Trace};
 use noid_core::mle::split::{reconstruct_from_slices, split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
-use noid_core::{AdditiveNTT, Block128};
-use noid_fri::code::LOG_RATE;
-use noid_fri::prover::{commit_fast, FriCommitment};
+use noid_core::Block128;
+use noid_fri_binius::MerkleCap;
 use noid_gkr::{
     build_auth_unified_from_inputs, build_boundary_mle, prove_auth_killshot,
     prove_spine_killshot_with_states, reconstruct_slot_states, verify_auth_killshot,
@@ -35,9 +34,10 @@ use noid_gkr::{
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_tx::PublicInputs;
 
-use crate::{
-    prove_air_with_slices, verify_air_with_slices, SliceClaim, StarkProof, VerifyError,
+use crate::interleaved::{
+    prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof,
 };
+use crate::{SliceClaim, VerifyError};
 
 /// Base log-length for all columns (trace + slices). The AIR operates
 /// at log_rows=13 and slices are cut to match.
@@ -52,7 +52,7 @@ const BASE_LOG: usize = 13;
 #[derive(Debug, Clone)]
 pub struct TxProof {
     /// STARK seal over the extended trace (base AIR columns + 6 slice columns).
-    pub stark: StarkProof,
+    pub stark: InterleavedStarkProof,
     /// SpineGKR Kill-Shot proof (59-perm tx-body Merkle spine).
     pub spine: SpineProofKillShot,
     /// AuthGKR Kill-Shot proof (4x5 auth sponges).
@@ -111,13 +111,13 @@ fn hash_to_fields(h: &[u8; 32]) -> [Block128; 2] {
     ]
 }
 
-fn absorb_fri_commitment(channel: &mut Poseidon2bChannel, commitment: &FriCommitment) {
-    let [h0, h1] = hash_to_fields(&commitment.vector_commitment.root);
-    channel.absorb(h0);
-    channel.absorb(h1);
-    channel.absorb(Block128::from(commitment.vector_commitment.depth as u128));
-    channel.absorb(Block128::from(commitment.packing_factor as u128));
-    channel.absorb(Block128::from(commitment.log_len as u128));
+/// Absorb the interleaved Merkle cap into a GKR Poseidon2b channel.
+fn absorb_merkle_cap(channel: &mut Poseidon2bChannel, cap: &MerkleCap) {
+    for hash in &cap.hashes {
+        let [h0, h1] = hash_to_fields(hash);
+        channel.absorb(h0);
+        channel.absorb(h1);
+    }
 }
 
 fn reduction_to_transcript(point: &[Block128], value: Block128) -> Vec<Block128> {
@@ -132,15 +132,15 @@ fn tx_body_hash_as_lanes(pi: &PublicInputs) -> [Block128; 2] {
 }
 
 // ---------------------------------------------------------------------------
-// prove_tx — production prover orchestrator (Stage 0: MLE Splitting)
+// prove_tx — production prover orchestrator (FRI-Binius Interleaved PCS)
 // ---------------------------------------------------------------------------
 
 /// Produce a `TxProof` for a validated transaction.
 ///
-/// Single-transcript flow with uniform FRI: slices spine/auth MLEs into
-/// base-length columns, commits everything at log_len=13, runs GKR,
-/// then proves the STARK with slice claims injected into the multipoint
-/// sumcheck.
+/// Single-transcript flow with FRI-Binius interleaved commitment:
+/// slices spine/auth MLEs into base-length columns, commits everything
+/// into ONE interleaved Merkle tree, runs GKR, then proves the STARK
+/// with slice claims injected into the multipoint sumcheck.
 pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
     let air = witness.air;
     let trace = witness.trace;
@@ -180,13 +180,10 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
     let n_boundary_slices = spine_slices.len() + auth_slices.len();
 
     // =========================================================================
-    // Stage 2: Commit extended trace (AIR columns + 6 slice columns)
+    // Stage 2: Build extended column set (AIR + 6 slices)
     // =========================================================================
-    // Pad and commit all columns at the same log_len. The slice columns
-    // are already 2^13 = 2^BASE_LOG, matching the trace.
     let log_len = crate::padded_log_len(trace.log_rows);
     debug_assert_eq!(log_len, BASE_LOG);
-    let ntt = AdditiveNTT::<Block128>::new(log_len + LOG_RATE);
 
     let mut all_columns: Vec<Vec<Block128>> = Vec::with_capacity(n_air_cols + n_boundary_slices);
     for col in &trace.columns {
@@ -199,33 +196,31 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
         all_columns.push(s.clone());
     }
 
-    let commitments: Vec<FriCommitment> = {
-        use rayon::prelude::*;
-        all_columns
-            .par_iter()
-            .map(|col| commit_fast(col, &ntt))
-            .collect()
-    };
+    // =========================================================================
+    // Stage 3: Interleaved commit + GKR (absorb cap into GKR channels)
+    // =========================================================================
+    // Commit once and reuse: the prover state is passed to
+    // prove_air_interleaved so it skips the redundant second commit.
+    let ntt = noid_core::AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+    let hasher = noid_fri::hasher::Blake3Hasher::new();
+    let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
+    let (pre_commitment, pre_state) =
+        noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
+    let cap = &pre_commitment.cap;
 
-    // =========================================================================
-    // Stage 3: Seed GKR channels with slice commitments, run GKR
-    // =========================================================================
+    // Seed GKR channels with the Merkle cap (binds all columns including slices).
     let mut spine_channel = Poseidon2bChannel::new();
-    for i in 0..4 {
-        absorb_fri_commitment(&mut spine_channel, &commitments[n_air_cols + i]);
-    }
+    absorb_merkle_cap(&mut spine_channel, cap);
     let (spine_proof, spine_reductions) =
         prove_spine_killshot_with_states(&spine_states, claimed, &mut spine_channel);
 
     let mut auth_channel = Poseidon2bChannel::new();
-    for i in 0..2 {
-        absorb_fri_commitment(&mut auth_channel, &commitments[n_air_cols + 4 + i]);
-    }
+    absorb_merkle_cap(&mut auth_channel, cap);
     let (auth_proof, auth_reductions) =
         prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel);
 
     // =========================================================================
-    // Stage 4: STARK with slice claims
+    // Stage 4: STARK with slice claims (FRI-Binius interleaved path)
     // =========================================================================
     let spine_transcript =
         reduction_to_transcript(&spine_reductions.state.point, spine_reductions.state.value);
@@ -271,14 +266,14 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
         });
     }
 
-    let stark = prove_air_with_slices(
+    let stark = prove_air_interleaved(
         air,
         &all_columns,
-        &commitments,
         pi,
         &extras_transcript,
         &slice_claims,
         log_len,
+        Some((pre_commitment, pre_state)),
     );
 
     Ok(TxProof {
@@ -290,12 +285,12 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
 }
 
 // ---------------------------------------------------------------------------
-// verify_tx — production verifier (Stage 0: MLE Splitting)
+// verify_tx — production verifier (FRI-Binius Interleaved PCS)
 // ---------------------------------------------------------------------------
 
 /// Verify a `TxProof` against `PublicInputs`.
 ///
-/// Replays the single-transcript flow: commit absorption -> GKR -> STARK.
+/// Replays the single-transcript flow: cap absorption -> GKR -> STARK.
 /// Reconstructs original MLE values from slice openings and checks
 /// against GKR reduction values.
 pub fn verify_tx(
@@ -316,16 +311,15 @@ pub fn verify_tx(
     }
 
     // =========================================================================
-    // Stage 1: Verify GKR Kill-Shots (seed channels with slice commitments)
+    // Stage 1: Verify GKR Kill-Shots (seed channels with Merkle cap)
     // =========================================================================
-    if proof.stark.column_commitments.len() != n_air_cols + n_slices {
+    if proof.stark.commitment.n_cols != n_air_cols + n_slices {
         return Err(VerifyTxError::Stark(VerifyError::ShapeMismatch));
     }
+    let cap = &proof.stark.commitment.cap;
 
     let mut spine_channel = Poseidon2bChannel::new();
-    for i in 0..4 {
-        absorb_fri_commitment(&mut spine_channel, &proof.stark.column_commitments[n_air_cols + i]);
-    }
+    absorb_merkle_cap(&mut spine_channel, cap);
     let spine_reductions = verify_spine_killshot(
         &proof.spine,
         &spine_circuit,
@@ -336,12 +330,7 @@ pub fn verify_tx(
     .ok_or(VerifyTxError::SpineKillShot)?;
 
     let mut auth_channel = Poseidon2bChannel::new();
-    for i in 0..2 {
-        absorb_fri_commitment(
-            &mut auth_channel,
-            &proof.stark.column_commitments[n_air_cols + 4 + i],
-        );
-    }
+    absorb_merkle_cap(&mut auth_channel, cap);
     let auth_reductions = verify_auth_killshot(
         &proof.auth,
         &auth_circuit,
@@ -352,11 +341,6 @@ pub fn verify_tx(
 
     // =========================================================================
     // Stage 1b: Auth <-> Spine bridge
-    //   Verify that auth GKR's claimed addresses match the owner fields
-    //   committed in the spine's input leaves (live inputs only), and that
-    //   auth GKR binds to the same tx_body_hash the spine proved.
-    //   Dummy inputs use zeroed owners in the spine but H_ADDR([0,0]) in
-    //   the auth circuit, so only live inputs are bridged.
     // =========================================================================
     if auth_inputs.tx_body_hash != claimed {
         return Err(VerifyTxError::AuthSpineBridge);
@@ -389,15 +373,10 @@ pub fn verify_tx(
     let auth_r_low = r_auth[..BASE_LOG].to_vec();
     let auth_r_high = r_auth[BASE_LOG..].to_vec();
 
-    // Retrieve slice openings from the STARK proof's multipoint batch.
-    // These are the values of the slice columns at the multipoint
-    // challenge point r''. The sumcheck + FRI guarantees their
-    // correctness. We also need the claimed_values from the sumcheck
-    // to reconstruct the original MLE values.
-    //
-    // The slice claims are embedded in the STARK verification flow.
-    // After STARK verify succeeds, we reconstruct the original MLE
-    // values from the slice_claimed_values and check against GKR.
+    // Retrieve slice openings from the mixed opening proof.
+    // The first n_total entries in all_openings are column evaluations at r''.
+    // But we need the slice_claimed_values for reconstruction, which are
+    // stored separately in the proof.
     let spine_slice_values = &proof.stark.slice_claimed_values[..4];
     let auth_slice_values = &proof.stark.slice_claimed_values[4..6];
 
@@ -429,7 +408,7 @@ pub fn verify_tx(
         });
     }
 
-    verify_air_with_slices(
+    verify_air_interleaved(
         air,
         pi,
         &proof.stark,
@@ -446,18 +425,6 @@ pub fn verify_tx(
 
 impl TxProof {
     pub fn estimated_byte_len(&self) -> usize {
-        self.spine.byte_len() + self.auth.byte_len() + self.stark_estimated_bytes()
-    }
-
-    fn stark_estimated_bytes(&self) -> usize {
-        let s = &self.stark;
-        let n_cols = s.column_commitments.len();
-        let column_roots = n_cols * 32;
-        let base_openings = s.base_openings.len() * 16;
-        let sumcheck: usize = s.zero_check_rounds.iter().map(|r| r.len() * 16).sum();
-        let shift_partials: usize = s.shift_partials.iter().map(|p| p.len() * 16).sum();
-        let multipoint: usize = s.multipoint_rounds.iter().map(|r| r.len() * 16).sum();
-        let fri = s.multipoint_batch.byte_len();
-        column_roots + base_openings + sumcheck + shift_partials + multipoint + fri
+        self.spine.byte_len() + self.auth.byte_len() + self.stark.byte_len()
     }
 }

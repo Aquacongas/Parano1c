@@ -1,5 +1,5 @@
 [package]
-name = "noid_stark"
+name = "noid_fri_binius"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -7,11 +7,9 @@ license = "Apache-2.0"
 [dependencies]
 noid_core = { path = "../noid_core" }
 noid_fri = { path = "../noid_fri" }
-noid_fri_binius = { path = "../noid_fri_binius" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
-noid_tx = { path = "../noid_tx" }
-noid_air = { path = "../noid_air" }
-noid_gkr = { path = "../noid_gkr" }
+blake3 = "1"
 rayon = "1.10"
 
 [dev-dependencies]
+rand = "0.8"

@@ -32,7 +32,9 @@ pub mod vshift;
 
 pub mod spine;
 pub mod auth;
+pub mod interleaved;
 pub mod prove_tx;
+
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -146,7 +148,7 @@ fn absorb_digest_as_pair(channel: &mut Channel, digest: &[u8; 32]) {
     channel.observe_field_elem(Block128::from(lo));
 }
 
-fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
+pub fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
     absorb_digest_as_pair(channel, &pi.prev_state_root);
     absorb_digest_as_pair(channel, &pi.new_state_root);
     absorb_digest_as_pair(channel, &pi.tx_body_hash.0);
@@ -199,7 +201,7 @@ fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
 /// multilinear `eq(z, ·)` contributes +1. Round polynomials therefore
 /// carry `max_c + 2` evaluations — enough to pin down a degree-`(max_c
 /// + 1)` univariate exactly.
-fn round_poly_degree(air: &(impl Air + ?Sized)) -> usize {
+pub fn round_poly_degree(air: &(impl Air + ?Sized)) -> usize {
     let max_c = air
         .constraints()
         .iter()
@@ -217,7 +219,7 @@ pub fn lagrange_eval_at_pub(p: &[Block128], target: Block128) -> Block128 {
     lagrange_eval_at(p, target)
 }
 
-fn lagrange_eval_at(p: &[Block128], target: Block128) -> Block128 {
+pub fn lagrange_eval_at(p: &[Block128], target: Block128) -> Block128 {
     let d_plus_one = p.len();
     let mut acc = Block128::ZERO;
     for (k, pk) in p.iter().enumerate() {
@@ -435,7 +437,7 @@ fn accumulate_sum_flat_fused(
 /// Returns `(round_polys, challenges)` in tower basis — transcript
 /// bytes are identical to a naive tower-basis prover run on the same
 /// inputs.
-fn prove_zero_check(
+pub fn prove_zero_check(
     cols: &[Vec<Block128>],
     constraints: &[Box<dyn Constraint>],
     betas: &[Block128],
@@ -694,7 +696,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
 /// routine does **not** run a per-slot product sumcheck: ladder claims
 /// are inlined directly into the §12c' multipoint sumcheck that
 /// follows.
-fn prove_base_and_ladder_partials(
+pub(crate) fn prove_base_and_ladder_partials(
     padded_columns: &[Vec<Block128>],
     shifted_indices: &[usize],
     r_point: &[Block128],
@@ -2812,7 +2814,7 @@ pub fn verify_air_timed<A: Air>(
 // MLE eval helper
 // ---------------------------------------------------------------------------
 
-fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
+pub fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
     let mut buf = evals.to_vec();
     for &r in point.iter().rev() {
         let half = buf.len() / 2;
@@ -2835,7 +2837,7 @@ fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
 /// `base_openings[col]`. The base opening is itself bound to the
 /// committed column by the §12c' multipoint FRI, so any programme
 /// deviation surfaces here with overwhelming probability.
-fn check_public_columns<A: Air + ?Sized>(
+pub(crate) fn check_public_columns<A: Air + ?Sized>(
     air: &A,
     base_openings: &[Block128],
     r_point: &[Block128],

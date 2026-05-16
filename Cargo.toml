@@ -3,6 +3,7 @@ members = [
     "bench_prover",
     "noid_core",
     "noid_fri",
+    "noid_fri_binius",
     "noid_poseidon2b",
     "noid_tx",
     "noid_chain",

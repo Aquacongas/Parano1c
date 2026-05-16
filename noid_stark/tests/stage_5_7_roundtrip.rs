@@ -383,7 +383,7 @@ fn verify_tx_rejects_forged_address_via_bridge() {
 #[ignore = "bridge_soundness: heavy (full prove_tx); run with --ignored"]
 fn verify_tx_rejects_mismatched_tx_body_hash_in_auth() {
     use noid_air::composition::tx_validity_with_spine::fixture::mk_secret;
-    use noid_stark::prove_tx::{prove_tx, verify_tx, TxWitness, VerifyTxError};
+    use noid_stark::prove_tx::{prove_tx, verify_tx, TxWitness};
 
     let comp = fixture::build_honest_realistic();
     let trace = comp.build_trace();
