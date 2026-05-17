@@ -108,6 +108,9 @@ static MU_TABLE: OnceLock<Vec<Block128>> = OnceLock::new();
 static SIGMA_TABLE: OnceLock<Vec<Block128>> = OnceLock::new();
 static RC_TABLE: OnceLock<Vec<Block128>> = OnceLock::new();
 static MDS_LANE_TABLES: OnceLock<[Vec<Block128>; STATE_SIZE]> = OnceLock::new();
+static SIGMA_DEC_TABLE: OnceLock<Vec<Block128>> = OnceLock::new();
+static RC_DEC_TABLE: OnceLock<Vec<Block128>> = OnceLock::new();
+static SIGMA_DEC_LANE_TABLES: OnceLock<[Vec<Block128>; STATE_SIZE]> = OnceLock::new();
 
 fn build_mu_table_uncached() -> Vec<Block128> {
     let mut tab = vec![Block128::ZERO; N_AUTH_UNIFIED_CELLS];
@@ -196,6 +199,64 @@ pub fn auth_mds_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
 /// Convenience wrapper to fetch a single lane table.
 pub fn auth_mds_lane_table(lane: usize) -> &'static [Block128] {
     &auth_mds_lane_tables()[lane]
+}
+
+/// `permute_by_dec(sigma_table)` — cached.
+pub fn auth_sigma_dec_table() -> &'static [Block128] {
+    SIGMA_DEC_TABLE.get_or_init(|| auth_permute_by_dec(auth_sigma_table()))
+}
+
+/// `permute_by_dec(rc_table)` — cached.
+pub fn auth_rc_dec_table() -> &'static [Block128] {
+    RC_DEC_TABLE.get_or_init(|| auth_permute_by_dec(auth_rc_table()))
+}
+
+/// `project_lane(sigma_dec, j)` for each lane — cached.
+pub fn auth_sigma_dec_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
+    SIGMA_DEC_LANE_TABLES.get_or_init(|| {
+        let sigma_dec = auth_permute_by_dec(auth_sigma_table());
+        std::array::from_fn(|j| auth_project_lane(&sigma_dec, j))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flat cached tables: stored as Vec<u128> already in GCM basis.
+// Eliminates ~180K tower_to_flat conversions per auth verify (16384 × 11 tables).
+// ---------------------------------------------------------------------------
+
+fn to_flat_vec(tower: &[Block128]) -> Vec<u128> {
+    use noid_core::hardware::tower_to_flat_u128;
+    tower.iter().map(|v| tower_to_flat_u128(v.0)).collect()
+}
+
+/// Cached pre-flat auth sigma-dec table.
+pub fn auth_sigma_dec_table_flat() -> &'static Vec<u128> {
+    static CACHE: OnceLock<Vec<u128>> = OnceLock::new();
+    CACHE.get_or_init(|| to_flat_vec(auth_sigma_dec_table()))
+}
+
+/// Cached pre-flat auth RC-dec table.
+pub fn auth_rc_dec_table_flat() -> &'static Vec<u128> {
+    static CACHE: OnceLock<Vec<u128>> = OnceLock::new();
+    CACHE.get_or_init(|| to_flat_vec(auth_rc_dec_table()))
+}
+
+/// Cached pre-flat auth MDS lane table for a given lane.
+pub fn auth_mds_lane_tables_flat() -> &'static [Vec<u128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<u128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let tower = auth_mds_lane_tables();
+        std::array::from_fn(|j| to_flat_vec(&tower[j]))
+    })
+}
+
+/// Cached pre-flat auth sigma-dec lane tables, one per lane.
+pub fn auth_sigma_dec_lane_tables_flat() -> &'static [Vec<u128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<u128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let tower = auth_sigma_dec_lane_tables();
+        std::array::from_fn(|j| to_flat_vec(&tower[j]))
+    })
 }
 
 // ---------------------------------------------------------------------------

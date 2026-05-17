@@ -36,7 +36,7 @@ use noid_core::hardware::{
     clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128,
 };
 use noid_core::mle::eq::eq_ind;
-use noid_core::mle::evaluate::evaluate_slice;
+use noid_core::mle::evaluate::{evaluate_flat, evaluate_preflat, evaluate_slice};
 use noid_core::mle::fold::fold_highest_var_inplace;
 use noid_core::packed::pow7::{pow7_block128, pow7_flat_block128};
 use noid_core::sumcheck::RoundPolynomial;
@@ -52,6 +52,8 @@ use crate::spine_mle::N_SPINE_SLOTS;
 use crate::spine_shift::{
     build_mds_lane_table_for_live_slots, build_rc_table_for_live_slots,
     build_sigma_table_for_live_slots, build_u_table_for_live_slots, permute_by_dec, project_lane,
+    spine_mds_lane_tables_flat, spine_rc_dec_table_flat, spine_sigma_dec_lane_tables_flat,
+    spine_sigma_dec_table_flat,
 };
 
 // Bit layout: `elem:2 | round:7 | slot:6` (low → high). Slices over
@@ -241,25 +243,49 @@ pub fn verify_spine_unified_for_live_slots<T: FiatShamir<Block128>>(
         r_prime[N_SPINE_UNIFIED_VARS - 1 - round] = challenge;
     }
 
-    // Recompute public schedules at r' natively. `dec_round_index`
-    // leaves the elem bits untouched, so we can build the σ_dec
-    // table once and project it for the four lane evaluations.
-    let u_at_r = evaluate_slice(&build_u_table_for_live_slots(&rho, live_slots), &r_prime);
-    let sigma_dec_full = permute_by_dec(&build_sigma_table_for_live_slots(live_slots));
-    let sigma_dec_at_r = evaluate_slice(&sigma_dec_full, &r_prime);
-    let rc_dec_at_r = evaluate_slice(
-        &permute_by_dec(&build_rc_table_for_live_slots(live_slots)),
-        &r_prime,
-    );
-    let mut mds_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
-    let mut sigma_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
-    for j in 0..STATE_SIZE {
-        mds_lane_dec_at_r[j] = evaluate_slice(
-            &build_mds_lane_table_for_live_slots(j, live_slots),
-            &r_prime,
-        );
-        sigma_lane_dec_at_r[j] = evaluate_slice(&project_lane(&sigma_dec_full, j), &r_prime);
-    }
+    // Recompute public schedules at r' natively. Use cached static tables for
+    // sigma, RC, and MDS lanes — these are deterministic functions of
+    // live_slots only, so they never change across calls in the same process.
+    // Only the U mask depends on ρ (a per-proof challenge) and cannot be cached.
+    //
+    // When live_slots == N_SPINE_SLOTS (production path), we use the `OnceLock`
+    // getters from spine_shift. For other values we fall back to building
+    // the tables on demand (test / non-standard topologies only).
+    let u_at_r = evaluate_flat(&build_u_table_for_live_slots(&rho, live_slots), &r_prime);
+
+    let (sigma_dec_at_r, rc_dec_at_r, mds_lane_dec_at_r, sigma_lane_dec_at_r) =
+        if live_slots == N_SPINE_SLOTS {
+            // Hot path: use pre-flat tables to skip per-element tower_to_flat conversion.
+            let sigma_dec_at_r = evaluate_preflat(spine_sigma_dec_table_flat(), &r_prime);
+            let rc_dec_at_r = evaluate_preflat(spine_rc_dec_table_flat(), &r_prime);
+            let mut mds_lane = [Block128::ZERO; STATE_SIZE];
+            let mut sigma_lane = [Block128::ZERO; STATE_SIZE];
+            let mds_tables = spine_mds_lane_tables_flat();
+            let sigma_lane_tables = spine_sigma_dec_lane_tables_flat();
+            for j in 0..STATE_SIZE {
+                mds_lane[j] = evaluate_preflat(&mds_tables[j], &r_prime);
+                sigma_lane[j] = evaluate_preflat(&sigma_lane_tables[j], &r_prime);
+            }
+            (sigma_dec_at_r, rc_dec_at_r, mds_lane, sigma_lane)
+        } else {
+            // Non-production path: build on demand.
+            let sigma_dec_full = permute_by_dec(&build_sigma_table_for_live_slots(live_slots));
+            let sigma_dec_at_r = evaluate_flat(&sigma_dec_full, &r_prime);
+            let rc_dec_at_r = evaluate_flat(
+                &permute_by_dec(&build_rc_table_for_live_slots(live_slots)),
+                &r_prime,
+            );
+            let mut mds_lane = [Block128::ZERO; STATE_SIZE];
+            let mut sigma_lane = [Block128::ZERO; STATE_SIZE];
+            for j in 0..STATE_SIZE {
+                mds_lane[j] = evaluate_flat(
+                    &build_mds_lane_table_for_live_slots(j, live_slots),
+                    &r_prime,
+                );
+                sigma_lane[j] = evaluate_flat(&project_lane(&sigma_dec_full, j), &r_prime);
+            }
+            (sigma_dec_at_r, rc_dec_at_r, mds_lane, sigma_lane)
+        };
 
     // Reassemble the constraint at r' from the prover's claims.
     let q_c1 = sigma_dec_at_r * pow7_block128(proof.s_in_dec_at_r)

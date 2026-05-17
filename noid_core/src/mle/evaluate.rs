@@ -31,6 +31,68 @@ pub fn evaluate_slice<F: TowerField>(evals: &[F], point: &[F]) -> F {
     evaluate_inplace_scalars(evals.to_vec(), point)
 }
 
+/// Evaluate an MLE in flat (GCM) basis for ~20x speedup over tower-basis mul.
+///
+/// Converts the table to flat basis, folds using `clmul_gcm`, and returns
+/// the result converted back to tower. Ideal for verifier hot paths where
+/// the table is large and the point is in tower basis.
+pub fn evaluate_flat(poly: &[Block128], point: &[Block128]) -> Block128 {
+    use crate::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+
+    let n = point.len();
+    assert_eq!(poly.len(), 1 << n, "poly length must be 2^n");
+
+    if n == 0 {
+        return poly[0];
+    }
+
+    let mut buf: Vec<u128> = poly.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+    let point_flat: Vec<u128> = point.iter().rev().map(|v| tower_to_flat_u128(v.0)).collect();
+
+    for &r_flat in &point_flat {
+        let half = buf.len() / 2;
+        for j in 0..half {
+            let lo = buf[j];
+            let hi = buf[j + half];
+            buf[j] = lo ^ clmul_gcm(r_flat, hi ^ lo);
+        }
+        buf.truncate(half);
+    }
+
+    Block128::from(flat_to_tower_u128(buf[0]))
+}
+
+/// Evaluate an MLE whose table is already stored in flat (GCM) basis as `Vec<u128>`.
+///
+/// Skips the per-element `tower_to_flat_u128` conversion that `evaluate_flat` performs,
+/// saving ~1 ns × table_size per call. The evaluation point is still in tower basis
+/// and is converted internally. Result is returned in tower basis.
+pub fn evaluate_preflat(poly_flat: &[u128], point: &[Block128]) -> Block128 {
+    use crate::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+
+    let n = point.len();
+    assert_eq!(poly_flat.len(), 1 << n, "poly length must be 2^n");
+
+    if n == 0 {
+        return Block128::from(flat_to_tower_u128(poly_flat[0]));
+    }
+
+    let mut buf: Vec<u128> = poly_flat.to_vec();
+    let point_flat: Vec<u128> = point.iter().rev().map(|v| tower_to_flat_u128(v.0)).collect();
+
+    for &r_flat in &point_flat {
+        let half = buf.len() / 2;
+        for j in 0..half {
+            let lo = buf[j];
+            let hi = buf[j + half];
+            buf[j] = lo ^ clmul_gcm(r_flat, hi ^ lo);
+        }
+        buf.truncate(half);
+    }
+
+    Block128::from(flat_to_tower_u128(buf[0]))
+}
+
 /// Evaluate an MLE using packed fold operations.
 pub fn evaluate_packed(poly: &[Block128], point: &[Block128]) -> Block128 {
     use crate::packed::{pack_slice, PackedBlock128};

@@ -33,6 +33,7 @@ use noid_gkr::{
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_tx::PublicInputs;
+use rayon;
 
 use crate::interleaved::{
     prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof,
@@ -323,26 +324,23 @@ pub fn verify_tx(
     }
     let cap = &proof.stark.commitment.cap;
 
-    let mut spine_channel = Poseidon2bChannel::new();
-    absorb_merkle_cap(&mut spine_channel, cap);
-    let spine_reductions = verify_spine_killshot(
-        &proof.spine,
-        &spine_circuit,
-        spine_inputs,
-        claimed,
-        &mut spine_channel,
-    )
-    .ok_or(VerifyTxError::SpineKillShot)?;
-
-    let mut auth_channel = Poseidon2bChannel::new();
-    absorb_merkle_cap(&mut auth_channel, cap);
-    let auth_reductions = verify_auth_killshot(
-        &proof.auth,
-        &auth_circuit,
-        auth_inputs,
-        &mut auth_channel,
-    )
-    .ok_or(VerifyTxError::AuthKillShot)?;
+    // SpineGKR and AuthGKR verification are independent: each creates its
+    // own Poseidon2bChannel seeded from the same cap, with disjoint inputs
+    // and no shared mutable state. Run them in parallel to match the prover.
+    let (spine_result, auth_result) = rayon::join(
+        || {
+            let mut ch = Poseidon2bChannel::new();
+            absorb_merkle_cap(&mut ch, cap);
+            verify_spine_killshot(&proof.spine, &spine_circuit, spine_inputs, claimed, &mut ch)
+        },
+        || {
+            let mut ch = Poseidon2bChannel::new();
+            absorb_merkle_cap(&mut ch, cap);
+            verify_auth_killshot(&proof.auth, &auth_circuit, auth_inputs, &mut ch)
+        },
+    );
+    let spine_reductions = spine_result.ok_or(VerifyTxError::SpineKillShot)?;
+    let auth_reductions = auth_result.ok_or(VerifyTxError::AuthKillShot)?;
 
     // =========================================================================
     // Stage 1b: Auth <-> Spine bridge

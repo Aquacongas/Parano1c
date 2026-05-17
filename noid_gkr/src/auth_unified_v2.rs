@@ -24,7 +24,7 @@ use noid_core::hardware::{
     clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128,
 };
 use noid_core::mle::eq::eq_ind;
-use noid_core::mle::evaluate::evaluate_slice;
+use noid_core::mle::evaluate::{evaluate_flat, evaluate_preflat, evaluate_slice};
 use noid_core::packed::pow7::pow7_block128;
 use noid_core::sumcheck::RoundPolynomial;
 use noid_core::transcript::FiatShamir;
@@ -36,8 +36,9 @@ use crate::auth_mle_v2::{
     N_AUTH_UNIFIED_CELLS, N_AUTH_UNIFIED_VARS,
 };
 use crate::auth_shift::{
-    auth_build_u_table, auth_mds_lane_table, auth_mds_lane_tables, auth_permute_by_dec,
-    auth_project_lane, auth_rc_table, auth_sigma_table,
+    auth_build_u_table, auth_mds_lane_tables, auth_mds_lane_tables_flat, auth_permute_by_dec,
+    auth_project_lane, auth_rc_dec_table_flat, auth_rc_table, auth_sigma_dec_lane_tables_flat,
+    auth_sigma_dec_table_flat, auth_sigma_table,
 };
 
 const ELEM_LO: usize = 0;
@@ -200,15 +201,16 @@ pub fn verify_auth_unified<T: FiatShamir<Block128>>(
         r_prime[N_AUTH_UNIFIED_VARS - 1 - round] = challenge;
     }
 
-    let u_at_r = evaluate_slice(&auth_build_u_table(&rho), &r_prime);
-    let sigma_dec_full = auth_permute_by_dec(auth_sigma_table());
-    let sigma_dec_at_r = evaluate_slice(&sigma_dec_full, &r_prime);
-    let rc_dec_at_r = evaluate_slice(&auth_permute_by_dec(auth_rc_table()), &r_prime);
+    let u_at_r = evaluate_flat(&auth_build_u_table(&rho), &r_prime);
+    let sigma_dec_at_r = evaluate_preflat(auth_sigma_dec_table_flat(), &r_prime);
+    let rc_dec_at_r = evaluate_preflat(auth_rc_dec_table_flat(), &r_prime);
     let mut mds_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
     let mut sigma_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
+    let mds_lane_flat = auth_mds_lane_tables_flat();
+    let sigma_lane_flat = auth_sigma_dec_lane_tables_flat();
     for j in 0..STATE_SIZE {
-        mds_lane_dec_at_r[j] = evaluate_slice(auth_mds_lane_table(j), &r_prime);
-        sigma_lane_dec_at_r[j] = evaluate_slice(&auth_project_lane(&sigma_dec_full, j), &r_prime);
+        mds_lane_dec_at_r[j] = evaluate_preflat(&mds_lane_flat[j], &r_prime);
+        sigma_lane_dec_at_r[j] = evaluate_preflat(&sigma_lane_flat[j], &r_prime);
     }
 
     let q_c1 = sigma_dec_at_r * pow7_block128(proof.s_in_dec_at_r)

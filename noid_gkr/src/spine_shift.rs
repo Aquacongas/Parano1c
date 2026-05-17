@@ -37,6 +37,8 @@
 //! and for prover sanity tests; the prover itself does not call them
 //! in the hot path.
 
+use std::sync::OnceLock;
+
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{
@@ -160,6 +162,74 @@ pub fn build_sigma_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
 /// Spine default — `live_slots = N_SPINE_SLOTS`.
 pub fn build_sigma_table() -> Vec<Block128> {
     build_sigma_table_for_live_slots(N_SPINE_SLOTS)
+}
+
+/// Cached spine sigma-dec table: `permute_by_dec(sigma_table)` (`OnceLock`).
+/// Use this in the verifier hot path instead of building + permuting every call.
+pub fn spine_sigma_dec_table() -> &'static Vec<Block128> {
+    static CACHE: OnceLock<Vec<Block128>> = OnceLock::new();
+    CACHE.get_or_init(|| permute_by_dec(&build_sigma_table_for_live_slots(N_SPINE_SLOTS)))
+}
+
+/// Cached spine RC-dec table: `permute_by_dec(rc_table)` (`OnceLock`).
+pub fn spine_rc_dec_table() -> &'static Vec<Block128> {
+    static CACHE: OnceLock<Vec<Block128>> = OnceLock::new();
+    CACHE.get_or_init(|| permute_by_dec(&build_rc_table_for_live_slots(N_SPINE_SLOTS)))
+}
+
+/// Cached spine MDS lane tables (`OnceLock`), one per lane.
+pub fn spine_mds_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<Block128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| std::array::from_fn(|j| build_mds_lane_table_for_live_slots(j, N_SPINE_SLOTS)))
+}
+
+/// Cached `project_lane(spine_sigma_dec, j)` for each lane j (`OnceLock`).
+pub fn spine_sigma_dec_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<Block128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let sigma_dec = permute_by_dec(&build_sigma_table_for_live_slots(N_SPINE_SLOTS));
+        std::array::from_fn(|j| project_lane(&sigma_dec, j))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flat cached tables: stored as Vec<u128> already in GCM basis.
+// Eliminates ~360K tower_to_flat conversions per verify (32768 × 11 tables).
+// ---------------------------------------------------------------------------
+
+fn to_flat_vec(tower: &[Block128]) -> Vec<u128> {
+    use noid_core::hardware::tower_to_flat_u128;
+    tower.iter().map(|v| tower_to_flat_u128(v.0)).collect()
+}
+
+/// Cached pre-flat spine sigma-dec table.
+pub fn spine_sigma_dec_table_flat() -> &'static Vec<u128> {
+    static CACHE: OnceLock<Vec<u128>> = OnceLock::new();
+    CACHE.get_or_init(|| to_flat_vec(spine_sigma_dec_table()))
+}
+
+/// Cached pre-flat spine RC-dec table.
+pub fn spine_rc_dec_table_flat() -> &'static Vec<u128> {
+    static CACHE: OnceLock<Vec<u128>> = OnceLock::new();
+    CACHE.get_or_init(|| to_flat_vec(spine_rc_dec_table()))
+}
+
+/// Cached pre-flat spine MDS lane tables, one per lane.
+pub fn spine_mds_lane_tables_flat() -> &'static [Vec<u128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<u128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let tower = spine_mds_lane_tables();
+        std::array::from_fn(|j| to_flat_vec(&tower[j]))
+    })
+}
+
+/// Cached pre-flat spine sigma-dec lane tables, one per lane.
+pub fn spine_sigma_dec_lane_tables_flat() -> &'static [Vec<u128>; STATE_SIZE] {
+    static CACHE: OnceLock<[Vec<u128>; STATE_SIZE]> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let tower = spine_sigma_dec_lane_tables();
+        std::array::from_fn(|j| to_flat_vec(&tower[j]))
+    })
 }
 
 /// Evaluate the multilinear extension of σ at an arbitrary point.
