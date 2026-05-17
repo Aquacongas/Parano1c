@@ -209,15 +209,20 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
     let cap = &pre_commitment.cap;
 
     // Seed GKR channels with the Merkle cap (binds all columns including slices).
-    let mut spine_channel = Poseidon2bChannel::new();
-    absorb_merkle_cap(&mut spine_channel, cap);
-    let (spine_proof, spine_reductions) =
-        prove_spine_killshot_with_states(&spine_states, claimed, &mut spine_channel);
-
-    let mut auth_channel = Poseidon2bChannel::new();
-    absorb_merkle_cap(&mut auth_channel, cap);
-    let (auth_proof, auth_reductions) =
-        prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel);
+    // SpineGKR and AuthGKR use independent Fiat-Shamir channels and disjoint
+    // data — run them in parallel for ~100ms wall-clock savings.
+    let ((spine_proof, spine_reductions), (auth_proof, auth_reductions)) = rayon::join(
+        || {
+            let mut spine_channel = Poseidon2bChannel::new();
+            absorb_merkle_cap(&mut spine_channel, cap);
+            prove_spine_killshot_with_states(&spine_states, claimed, &mut spine_channel)
+        },
+        || {
+            let mut auth_channel = Poseidon2bChannel::new();
+            absorb_merkle_cap(&mut auth_channel, cap);
+            prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel)
+        },
+    );
 
     // =========================================================================
     // Stage 4: STARK with slice claims (FRI-Binius interleaved path)

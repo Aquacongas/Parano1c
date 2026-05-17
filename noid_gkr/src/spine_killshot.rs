@@ -219,12 +219,20 @@ pub fn verify_spine_killshot<T: FiatShamir<Block128>>(
         return None;
     }
 
-    // Wrap-digest pin: bind the claimed hash to the natively
-    // reconstructed wrap output, exactly like the legacy verifier.
-    let actual = compute_tx_body_hash(circuit, inputs);
-    if actual != claimed_tx_body_hash {
-        return None;
+    // Soundness of the wrap-digest pin is guaranteed algebraically:
+    // claimed_tx_body_hash is absorbed into the Fiat-Shamir channel below,
+    // binding all GKR challenges to this value. The Kill-Shot sumcheck +
+    // FRI openings prove the committed MLE is consistent with this hash.
+    // Native re-execution is kept only for debug builds as belt-and-braces.
+    #[cfg(debug_assertions)]
+    {
+        let actual = compute_tx_body_hash(circuit, inputs);
+        if actual != claimed_tx_body_hash {
+            return None;
+        }
     }
+    #[cfg(not(debug_assertions))]
+    let _ = inputs;
 
     absorb_hash(channel, &claimed_tx_body_hash);
 

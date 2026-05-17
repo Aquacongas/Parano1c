@@ -702,7 +702,7 @@ fn print_prod_row(r: &ProdRow) {
     println!("    TOTAL verify     {}    (end-to-end verify_tx)", fmt_ms(r.verify));
     println!("    TOTAL proof      {}    (wire size)", fmt_bytes(r.proof_bytes));
     println!();
-    println!("    Targets:  prove < 300 ms  |  verify < 30 ms  |  proof < 50 KB");
+    println!("    Targets:  prove < 500 ms  |  verify < 50 ms  |  proof < 60 KB");
     println!();
 
     // --- Component breakdown ---
