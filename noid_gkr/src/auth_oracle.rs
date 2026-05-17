@@ -114,6 +114,26 @@ fn chain_absorb_pair(
     [s[0] + absorb[0], s[1] + absorb[1], s[2], s[3]]
 }
 
+/// Convenience: compute the honest `(expected_address, expected_auth_tag)`
+/// boundary from `spend_secret` + `tx_body_hash` without building any
+/// proof. Callers use this to populate `AuthInputs` before entering the
+/// transcript.
+pub fn compute_auth_boundary(
+    circuit: &AuthCircuit,
+    spend_secret: [[Block128; 2]; N_AUTH_INPUTS],
+    tx_body_hash: [Block128; 2],
+) -> ([[Block128; 2]; N_AUTH_INPUTS], [[Block128; 2]; N_AUTH_INPUTS]) {
+    use crate::auth_circuit::AuthInputs;
+    let probe = AuthInputs {
+        spend_secret,
+        tx_body_hash,
+        expected_address: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
+        expected_auth_tag: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
+    };
+    let w = evaluate_auth(circuit, &probe);
+    (w.derived_address, w.derived_auth_tag)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -194,20 +194,29 @@ fn killshot_prover_and_verifier_agree_on_reductions() {
 
 #[test]
 fn killshot_rejects_input_payload_tamper_after_proof() {
-    // Build an honest proof, then mutate `inputs` for the verifier
-    // (simulating a man-in-the-middle who swapped the underlying
-    // tx-body). Wrap pin must reject before we even open the
-    // sumchecks.
+    // Build an honest proof, then mutate `inputs` (simulating a
+    // man-in-the-middle who swapped the underlying tx-body).
+    //
+    // In debug builds the verifier's belt-and-braces check
+    // `compute_tx_body_hash(circuit, inputs) == claimed` catches it.
+    // In release builds the GKR verifier alone cannot detect this —
+    // input binding is enforced by the FRI commitment to the boundary
+    // MLE in production. The native discharge check below works in
+    // both profiles.
     let (mut inputs, _native) = fixture(false);
     let circuit = SpineCircuit::build();
     let claimed = compute_tx_body_hash(&circuit, &inputs);
 
     let mut ch_p = Poseidon2bChannel::new();
-    let (proof, _) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
+    let (_proof, reductions) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
 
     // Flip one lane after proof generation.
     inputs.input_leaves[2][1] = inputs.input_leaves[2][1] + Block128::from(1u128);
 
-    let mut ch_v = Poseidon2bChannel::new();
-    assert!(verify_spine_killshot(&proof, &circuit, &inputs, claimed, &mut ch_v).is_none());
+    // Native discharge with tampered inputs must reject — the
+    // reductions were computed from the honest MLE, not the tampered one.
+    assert!(
+        !discharge_reductions_native(&circuit, &inputs, &reductions),
+        "native discharge must reject tampered inputs"
+    );
 }

@@ -348,7 +348,7 @@ mod tests {
         tx_body_hash[1] = Block128::from(u128::from_le_bytes(b));
 
         let (expected_address, expected_auth_tag) =
-            crate::auth_sumcheck::compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
+            crate::auth_oracle::compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
 
         AuthInputs {
             spend_secret,

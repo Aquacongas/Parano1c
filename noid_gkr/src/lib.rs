@@ -17,7 +17,6 @@ pub mod auth_mle_v2;
 pub mod auth_shift;
 pub mod auth_unified_v2;
 pub mod auth_oracle;
-pub mod auth_sumcheck;
 pub mod batch_eval;
 pub mod binding;
 pub mod circuit;
@@ -37,14 +36,7 @@ pub use auth_circuit::{
     AuthCircuit, AuthInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0, AUTH_PAD_1,
     N_AUTH_INPUTS, N_AUTH_SLOTS, N_SLOTS_PER_INPUT,
 };
-pub use auth_oracle::{evaluate_auth, AuthSlotState, AuthWitness};
-pub use auth_sumcheck::{
-    auth_boundary_output_cell, build_auth_boundary_mle, compute_auth_boundary,
-    discharge_auth_boundary_native, point_for_auth_boundary_cell,
-    reconstruct_auth_slot_states, AuthBoundaryPins, AuthOutputPin,
-    AUTH_PIN_LANES, N_AUTH_BOUNDARY_CELLS, N_AUTH_BOUNDARY_VARS, N_AUTH_COL_VARS,
-    N_AUTH_SLOTS_PADDED, N_AUTH_SLOT_VARS,
-};
+pub use auth_oracle::{compute_auth_boundary, evaluate_auth, AuthSlotState, AuthWitness};
 pub use batch_eval::{
     prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, BatchEvalRound,
     EvalClaim,
@@ -104,6 +96,7 @@ pub use spine_shift::{
     build_rc_table_for_live_slots, build_sigma_table_for_live_slots, build_u_table_for_live_slots,
 };
 pub use spine_sumcheck::{
-    build_boundary_mle, compute_tx_body_hash, discharge_boundary_native, prove_spine,
-    reconstruct_slot_states, verify_spine, SpineProof, N_BOUNDARY_CELLS, N_BOUNDARY_VARS,
+    build_boundary_mle, compute_tx_body_hash, discharge_boundary_native,
+    reconstruct_slot_states, N_BOUNDARY_CELLS, N_BOUNDARY_VARS, N_SLOT_VARS,
+    N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED,
 };
