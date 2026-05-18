@@ -1337,6 +1337,153 @@ pub mod fixture {
             open_witness,
         )
     }
+
+    /// Max-capacity transaction: 4 live inputs, 8 live outputs.
+    /// Inputs: slots 0,3,5,7 values 1000,500,250,125 (total 1875).
+    /// Outputs: 8 recipients, values 400,300,200,150,100,75,50,25 (total 1300).
+    /// Fee: 575. Balance: 1875 == 1300 + 575.
+    pub fn build_honest_realistic_max() -> TxValidityCompositeWithSpine {
+        use noid_poseidon2b::primitives::{AuthTag, SpendSecret};
+
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            mk_secret(0xA1),
+            mk_secret(0xB2),
+            mk_secret(0xC3),
+            mk_secret(0xD4),
+        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_address(secrets[0]),
+            native_address(secrets[1]),
+            native_address(secrets[2]),
+            native_address(secrets[3]),
+        ];
+
+        let live_values: [u64; 4] = [1000, 500, 250, 125];
+        let live_slots: [u32; 4] = [0, 3, 5, 7];
+        let fee: u64 = 575;
+        let out_values: [u64; 8] = [400, 300, 200, 150, 100, 75, 50, 25];
+
+        let out_secrets: [[Block128; 2]; 8] = [
+            mk_secret(0x10),
+            mk_secret(0x20),
+            mk_secret(0x30),
+            mk_secret(0x40),
+            mk_secret(0x50),
+            mk_secret(0x60),
+            mk_secret(0x70),
+            mk_secret(0x80),
+        ];
+        let out_owners: [[Block128; 2]; 8] = [
+            native_address(out_secrets[0]),
+            native_address(out_secrets[1]),
+            native_address(out_secrets[2]),
+            native_address(out_secrets[3]),
+            native_address(out_secrets[4]),
+            native_address(out_secrets[5]),
+            native_address(out_secrets[6]),
+            native_address(out_secrets[7]),
+        ];
+
+        let inputs: Vec<TxInput> = (0..FRI_STATE_OPEN_N_INPUTS)
+            .map(|i| TxInput {
+                slot_index: live_slots[i],
+                value: live_values[i],
+                owner: address_from_fields(addrs[i]),
+                spend_secret: SpendSecret(block128_pair_to_digest(secrets[i])),
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
+            })
+            .collect();
+
+        let out_slots: [u32; 8] = [1, 2, 4, 6, 8, 9, 10, 11];
+        let outputs: Vec<TxOutput> = (0..8)
+            .map(|j| TxOutput {
+                slot_index: out_slots[j],
+                value: out_values[j],
+                owner: address_from_fields(out_owners[j]),
+                valid: true,
+            })
+            .collect();
+
+        let mut body = TxBody {
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            fee: fee as u128,
+            inputs,
+            outputs,
+            is_coinbase: false,
+        };
+
+        let (pins, merkle_inputs) = lower_tx_body_to_pins(&body);
+        let tx_body_hash = pins.tx_body_hash;
+
+        let auth_tags: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
+            native_auth_tag(secrets[0], tx_body_hash),
+            native_auth_tag(secrets[1], tx_body_hash),
+            native_auth_tag(secrets[2], tx_body_hash),
+            native_auth_tag(secrets[3], tx_body_hash),
+        ];
+        for i in 0..4 {
+            body.inputs[i].auth_tag = AuthTag(block128_pair_to_digest(auth_tags[i]));
+        }
+
+        let prev_preimage = mk_combiner_preimage(0xAB);
+        let new_preimage = mk_combiner_preimage(0xBA);
+        let prev_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&prev_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let new_fields = extract_combiner_digest_fields(
+            &build_combiner_side_trace(&new_preimage),
+            COMBINER_PERM_LAYOUT,
+        );
+        let combiner = FriStateCombinerComposite::new(
+            prev_preimage,
+            prev_fields,
+            new_preimage,
+            new_fields,
+        );
+
+        let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
+            spend_with_owner(live_values[0] as u128, live_slots[0], addrs[0]),
+            spend_with_owner(live_values[1] as u128, live_slots[1], addrs[1]),
+            spend_with_owner(live_values[2] as u128, live_slots[2], addrs[2]),
+            spend_with_owner(live_values[3] as u128, live_slots[3], addrs[3]),
+        ];
+        let base = FriStateOpenWitness::from_claims(claims)
+            .with_eval_point(mk_eval_point())
+            .with_gamma(mk_gamma());
+        let prev_lane_openings = [
+            Block128::from(0xAAAA_BBBB_CCCC_DDDD_u128),
+            Block128::from(0x1111_2222_3333_4444_u128),
+            Block128::from(0x5555_6666_7777_8888_u128),
+        ];
+        let new_lane_openings = base.expected_new_lane_openings(prev_lane_openings);
+        let open_witness = base.with_lane_openings(prev_lane_openings, new_lane_openings);
+        let open_air = FriStateOpenAir::new(
+            &claims,
+            open_witness.prev_lane_openings,
+            open_witness.new_lane_openings,
+            mk_eval_point(),
+            mk_gamma(),
+            open_witness.expected_batched_claims(),
+        );
+
+        let balance_inputs: [u64; 4] = live_values;
+        let balance_outputs: [u64; 8] = out_values;
+
+        TxValidityCompositeWithSpine::new(
+            pins,
+            body,
+            balance_inputs,
+            balance_outputs,
+            fee,
+            merkle_inputs,
+            combiner,
+            open_air,
+            open_witness,
+        )
+    }
 }
 
 #[cfg(test)]
