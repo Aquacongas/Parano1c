@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Adapted from binius64. Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Sum-Check Prover for binary tower fields.
 //!
 //! Architecture

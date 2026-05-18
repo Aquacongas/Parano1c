@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::doc_lazy_continuation)]
+
 //! Arithmetization layer for the Paranoid transaction STARK.
 //!
 //! Defines witness traces and the polynomial constraints they must
@@ -649,7 +651,7 @@ mod tests {
                     let mut c1 = col1_honest.clone();
                     {
                         let cell = if col == 0 { &mut c0[row] } else { &mut c1[row] };
-                        *cell = *cell + Block128::ONE;
+                        *cell += Block128::ONE;
                     }
                     let tampered = Trace::new(vec![c0, c1]);
                     assert_eq!(

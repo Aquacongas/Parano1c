@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage 2.1 — AuthGKR dedicated 14-variable unified MLE.
 //!
 //! Architecture

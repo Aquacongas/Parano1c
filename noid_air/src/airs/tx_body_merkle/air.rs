@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::manual_memcpy)]
+
 //! Stage 3d-0.9 — `TxBodyMerkleAir` (59-instance Poseidon2b stack with
 //! pre-MDS binding).
 //!
@@ -593,7 +595,7 @@ fn build_tx_body_merkle_trace_inner(
         if let Some(p) = pins {
             if k == BOUNDARY_INSTANCE_POS_0_PERM_B {
                 for lane in 0..2 {
-                    effective_input[lane] = effective_input[lane] + p.fee_leaf[lane];
+                    effective_input[lane] += p.fee_leaf[lane];
                 }
             }
             // Stage 1b — O1 leaf head rate-lane override. Force the
@@ -988,7 +990,7 @@ fn effective_perm_input(
                 let mut val = cols[TXBODY_MERKLE_LAYOUT.s + lane][prev_row];
                 if let Some(rid) = right_id {
                     let r_row = rid * TXBODY_MERKLE_SLOT_ROWS + N_ROUNDS;
-                    val = val + cols[TXBODY_MERKLE_LAYOUT.s + lane][r_row];
+                    val += cols[TXBODY_MERKLE_LAYOUT.s + lane][r_row];
                 }
                 out[lane] = val;
             }

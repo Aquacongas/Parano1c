@@ -402,18 +402,14 @@ pub(crate) fn write_output_open_trace(
 /// accumulator together with the honest prev-side lane openings. See
 /// `build_output_side_from_body`.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum OutputSideSource {
+    #[default]
     Empty,
     FromBody {
         outputs: Vec<noid_tx::TxOutput>,
         prev_lane_openings: [Block128; 3],
     },
-}
-
-impl Default for OutputSideSource {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 /// E.2.b.comp-3: dispatch `build_empty_output_side` vs
@@ -766,8 +762,8 @@ mod tests {
         );
         // Output-side is strictly wider than input-side (more rows → more
         // row-indicator columns) and lives at a strictly later offset.
-        assert!(SKEL_OUT_OPEN_WITNESS_COLS > FRI_STATE_OPEN_WITNESS_COLS);
-        assert!(SKEL_OUT_OPEN_COL_OFFSET > SKEL_OPEN_COL_OFFSET);
+        const { assert!(SKEL_OUT_OPEN_WITNESS_COLS > FRI_STATE_OPEN_WITNESS_COLS) };
+        const { assert!(SKEL_OUT_OPEN_COL_OFFSET > SKEL_OPEN_COL_OFFSET) };
         assert_eq!(TX_VALIDITY_SKELETON_LOG_ROWS, 10);
         let _ = COMBINER_COMPOSITE_PREV_OFFSET;
         let _ = COMBINER_COMPOSITE_NEW_OFFSET;
@@ -797,7 +793,7 @@ mod tests {
         let mut cols = skel.build_trace().columns;
         let _layout: FriStateOpenLayout = FRI_STATE_OPEN_OUTPUT_LAYOUT;
         let col = SKEL_OUT_OPEN_COL_OFFSET + COL_VALUE;
-        cols[col][0] = cols[col][0] + Block128::ONE;
+        cols[col][0] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!skel.air().check(&trace));
     }
@@ -915,7 +911,7 @@ mod tests {
         // Flip the prev-side digest-hi cell one byte.
         let reg = crate::composition::registry::CombinerCompositeCols::new();
         let row = crate::airs::fri_state_combiner::combiner_digest_row();
-        cols[reg.prev_digest_hi][row] = cols[reg.prev_digest_hi][row] + Block128::ONE;
+        cols[reg.prev_digest_hi][row] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!skel.air().check(&trace));
     }
@@ -925,7 +921,7 @@ mod tests {
         let skel = build_skeleton();
         let mut cols = skel.build_trace().columns;
         let col = SKEL_OPEN_COL_OFFSET + COL_VALUE;
-        cols[col][0] = cols[col][0] + Block128::ONE;
+        cols[col][0] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!skel.air().check(&trace));
     }
@@ -935,7 +931,7 @@ mod tests {
         let skel = build_skeleton();
         let mut cols = skel.build_trace().columns;
         let col = SKEL_OPEN_COL_OFFSET + COL_OWNER_HI;
-        cols[col][1] = cols[col][1] + Block128::ONE;
+        cols[col][1] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!skel.air().check(&trace));
     }
@@ -945,7 +941,7 @@ mod tests {
         let skel = build_skeleton();
         let mut cols = skel.build_trace().columns;
         let col = SKEL_OPEN_COL_OFFSET + COL_OWNER_LO;
-        cols[col][0] = cols[col][0] + Block128::ONE;
+        cols[col][0] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!skel.air().check(&trace));
     }

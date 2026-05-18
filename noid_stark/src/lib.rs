@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::doc_lazy_continuation,
+    clippy::too_many_arguments,
+    clippy::manual_memcpy
+)]
+
 //! STARK wrapper for the Paranoid transaction AIRs.
 //!
 //! Given an [`Air`] + [`Trace`] and a [`PublicInputs`] tuple (CRYPTO.md
@@ -628,7 +635,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
         .collect();
     let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns.into_iter());
+    sumcheck_cols.extend(rotated_columns);
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = prove_zero_check(
@@ -806,7 +813,7 @@ fn prove_multipoint_close_inner(
     let mut cur = Block128::ONE;
     for _ in 0..(n + s_count) {
         lambdas.push(cur);
-        cur = cur * beta;
+        cur *= beta;
     }
 
     // Target:
@@ -887,7 +894,7 @@ fn prove_multipoint_close_inner(
             let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
             let eta = lambdas[n + slot];
             for v in w.iter_mut() {
-                *v = *v * eta;
+                *v *= eta;
             }
             w
         })
@@ -1157,7 +1164,7 @@ fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
         .collect();
     let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns.into_iter());
+    sumcheck_cols.extend(rotated_columns);
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = prove_zero_check(
@@ -1272,7 +1279,7 @@ fn prove_multipoint_close_mixed(
         let mut cur = Block128::ONE;
         for _ in 0..total_weights {
             lambdas.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
     }
 
@@ -1335,7 +1342,7 @@ fn prove_multipoint_close_mixed(
             let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
             let eta = lambdas[n + slot];
             for v in w.iter_mut() {
-                *v = *v * eta;
+                *v *= eta;
             }
             w
         })
@@ -1605,7 +1612,7 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
         let mut cur = Block128::ONE;
         for _ in 0..total_weights {
             lambdas.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
     }
 
@@ -1811,7 +1818,7 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
         .collect();
     let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns.into_iter());
+    sumcheck_cols.extend(rotated_columns);
 
     // --- Batched zero-check sumcheck ---
     let degree = round_poly_degree(air);
@@ -2062,7 +2069,7 @@ fn verify_multipoint_close(
         let mut cur = Block128::ONE;
         for _ in 0..(n + s_count) {
             lambdas.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
     }
 
@@ -2293,7 +2300,7 @@ pub fn verify_air_timed<A: Air>(
         let mut cur = Block128::ONE;
         for _ in 0..(n + s_count) {
             lambdas.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
     }
     let mut mp_target = Block128::ZERO;
@@ -3324,7 +3331,7 @@ mod tests {
     fn range_gate_bit_flip_rejected() {
         let log_rows = 8;
         let air = RangeGateAir::new(log_rows);
-        let values = random_u64s(air.n_instances(), 0xC0FFEE_BEEF);
+        let values = random_u64s(air.n_instances(), 0x00C0_FFEE_BEEF);
         let mut trace = air.build_trace(&values);
         // Flip one bit without fixing up the accumulator column —
         // acc_recurrence must fire on the transition into the next row.
@@ -3406,9 +3413,9 @@ mod tests {
             let mut weight = Block128::ONE;
             for i in 0..RANGE_GATE_WORD_BITS {
                 if (x >> i) & 1 == 1 {
-                    expected = expected + weight;
+                    expected += weight;
                 }
-                weight = weight * two;
+                weight *= two;
             }
             let last = inst * RANGE_GATE_WORD_BITS + RANGE_GATE_WORD_BITS - 1;
             assert_eq!(
@@ -3465,7 +3472,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_sum_bit_flip_rejected() {
         let air = BitAdderAir::new(65, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 65, 0xC0FFEE_01);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 65, 0xC0FF_EE01);
         let mut trace = air.build_trace(&pairs);
         trace.columns[BIT_ADDER_COL_SUM][5] += Block128::ONE;
         let pi = mk_pi();
@@ -3476,7 +3483,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_final_carry_flip_rejected() {
         let air = BitAdderAir::new(67, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 67, 0xC0FFEE_02);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 67, 0xC0FF_EE02);
         let mut trace = air.build_trace(&pairs);
         // Final carry-out of instance 0 lives at row `width` = 67.
         trace.columns[BIT_ADDER_COL_CARRY][67] += Block128::ONE;
@@ -3488,7 +3495,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_mid_chain_carry_flip_rejected() {
         let air = BitAdderAir::new(66, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 66, 0xC0FFEE_03);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 66, 0xC0FF_EE03);
         let mut trace = air.build_trace(&pairs);
         trace.columns[BIT_ADDER_COL_CARRY][10] += Block128::ONE;
         let pi = mk_pi();
@@ -3499,7 +3506,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_pad_tamper_rejected() {
         let air = BitAdderAir::new(64, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 64, 0xC0FFEE_04);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 64, 0xC0FF_EE04);
         let mut trace = air.build_trace(&pairs);
         // Write `a = 1` into a padding row (past the active region).
         trace.columns[BIT_ADDER_COL_A][70] = Block128::ONE;
@@ -3511,7 +3518,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_is_input_tamper_rejected() {
         let air = BitAdderAir::new(64, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 64, 0xC0FFEE_05);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 64, 0xC0FF_EE05);
         let mut trace = air.build_trace(&pairs);
         // Turn off the is_input selector on an active row — the FA-sum
         // gate folds to 0, but this row must keep `sum = a + b + c`,
@@ -3535,7 +3542,7 @@ mod tests {
     #[test]
     fn bit_adder_stark_ladder_tampering_rejected() {
         let air = BitAdderAir::new(65, 8);
-        let pairs = random_bit_adder_pairs(air.n_instances(), 65, 0xC0FFEE_06);
+        let pairs = random_bit_adder_pairs(air.n_instances(), 65, 0xC0FF_EE06);
         let trace = air.build_trace(&pairs);
         let pi = mk_pi();
         let mut proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -3608,7 +3615,7 @@ mod tests {
         use noid_air::{BIT_ADDER_COL_B, BIT_ADDER_N_COLS};
         let log_rows = 8usize;
         let air = BalanceGateAir::new(log_rows);
-        let (ins, outs, fee) = balanced_tuple(0xC0FFEE_BA1);
+        let (ins, outs, fee) = balanced_tuple(0x000C_0FFE_EBA1);
         let mut trace = air.build_trace(ins, outs, fee);
         // BLK_B21 is the last block (ordinal 10). Column layout: block
         // base = 10 * BIT_ADDER_N_COLS, `b` slot = base + BIT_ADDER_COL_B.
@@ -3626,7 +3633,7 @@ mod tests {
         use noid_air::{BIT_ADDER_COL_A, BIT_ADDER_N_COLS};
         let log_rows = 8usize;
         let air = BalanceGateAir::new(log_rows);
-        let (ins, outs, fee) = balanced_tuple(0xC0FFEE_BA2);
+        let (ins, outs, fee) = balanced_tuple(0x000C_0FFE_EBA2);
         let mut trace = air.build_trace(ins, outs, fee);
         // BLK_A2 is ordinal 2.
         let a2_a = 2 * BIT_ADDER_N_COLS + BIT_ADDER_COL_A;
@@ -3664,7 +3671,7 @@ mod tests {
         // corresponding ladder point.
         let log_rows = 8usize;
         let air = BalanceGateAir::new(log_rows);
-        let (ins, outs, fee) = balanced_tuple(0xC0FFEE_BA3);
+        let (ins, outs, fee) = balanced_tuple(0x000C_0FFE_EBA3);
         let trace = air.build_trace(ins, outs, fee);
         let pi = mk_pi();
         let mut proof = prove_air(&air, &trace, &pi).expect("prove");
@@ -3833,14 +3840,14 @@ mod tx_validity_3b4_tests {
         // / bridge gate observes (e.g. an is_input padding row). The
         // native selector-column pinning rejects, and the STARK
         // verifier's `check_public_columns` MLE re-eval rejects too.
-        use noid_air::{BIT_ADDER_COL_IS_INPUT, BIT_ADDER_N_COLS};
+        use noid_air::BIT_ADDER_COL_IS_INPUT;
         let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = balanced_1in1out(42, 42, 0);
         let ins = [42u64, 0, 0, 0];
         let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
         let mut trace =
             TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
-        let col = TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET + BIT_ADDER_COL_IS_INPUT;
         // Row 100 is inside block A0's padding region (width 64).
         trace.columns[col][100] = Block128::ONE;
         let pi = mk_pi();
@@ -3983,7 +3990,7 @@ mod poseidon_perm_stark_tests {
     fn poseidon_perm_stark_sout_tamper_rejected() {
         let air = mk_air();
         let mut cols = build_perm_trace(mk_input(0xABCD));
-        cols[POSEIDON_COL_SOUT + 2][1] = cols[POSEIDON_COL_SOUT + 2][1] + Block128::ONE;
+        cols[POSEIDON_COL_SOUT + 2][1] += Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -3994,7 +4001,7 @@ mod poseidon_perm_stark_tests {
     fn poseidon_perm_stark_rc_tamper_rejected() {
         let air = mk_air();
         let mut cols = build_perm_trace(mk_input(0xBEEF));
-        cols[POSEIDON_COL_RC + 0][0] = cols[POSEIDON_COL_RC + 0][0] + Block128::ONE;
+        cols[POSEIDON_COL_RC][0] += Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -4039,7 +4046,7 @@ mod poseidon_perm_stark_tests {
     fn poseidon_perm_stark_x2_tamper_rejected() {
         let air = mk_air();
         let mut cols = build_perm_trace(mk_input(0x1234));
-        cols[POSEIDON_COL_X2 + 0][2] = cols[POSEIDON_COL_X2 + 0][2] + Block128::ONE;
+        cols[POSEIDON_COL_X2][2] += Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -4052,7 +4059,7 @@ mod poseidon_perm_stark_tests {
         // next-row state on a full round must break the proof.
         let air = mk_air();
         let mut cols = build_perm_trace(mk_input(0x5EED));
-        cols[POSEIDON_COL_S + 1][1] = cols[POSEIDON_COL_S + 1][1] + Block128::ONE;
+        cols[POSEIDON_COL_S + 1][1] += Block128::ONE;
         let trace = Trace::new(cols);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -4169,7 +4176,7 @@ mod tx_body_merkle_stark_tests {
         };
         let col0 = pubcol_bool_col(log_rows, 0xfade);
         let mut bad_programme = programme;
-        bad_programme[7] = bad_programme[7] + Block128::ONE;
+        bad_programme[7] += Block128::ONE;
         let trace = Trace::new(vec![col0, bad_programme]);
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -4263,7 +4270,7 @@ mod tx_body_merkle_stark_tests {
         // also tripped, but so is the 3d-0.2 public-column check.
         {
             let mut cols = build_perm_trace(input);
-            cols[POSEIDON_COL_RC + 1][3] = cols[POSEIDON_COL_RC + 1][3] + Block128::ONE;
+            cols[POSEIDON_COL_RC + 1][3] += Block128::ONE;
             let trace = Trace::new(cols);
             let pi = mk_pi();
             let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -4280,7 +4287,7 @@ mod tx_body_merkle_stark_tests {
             use noid_air::POSEIDON_PERM_N_ROWS;
             use noid_poseidon2b::native::permutation::N_ROUNDS;
             let mut cols = build_perm_trace(input);
-            assert!(N_ROUNDS + 3 < POSEIDON_PERM_N_ROWS);
+            const { assert!(N_ROUNDS + 3 < POSEIDON_PERM_N_ROWS) };
             cols[POSEIDON_COL_RC + 2][N_ROUNDS + 3] = Block128::from(0x1234_5678u128);
             let trace = Trace::new(cols);
             let pi = mk_pi();
@@ -4318,7 +4325,7 @@ mod tx_body_merkle_stark_tests {
         // Tamper prog_b, use unchecked prover, verifier rejects.
         {
             let mut bad_b = prog_b;
-            bad_b[0] = bad_b[0] + Block128::ONE;
+            bad_b[0] += Block128::ONE;
             let trace = Trace::new(vec![col0, prog_a, bad_b]);
             let pi = mk_pi();
             let proof = prove_air_unchecked(&air, &trace, &pi);

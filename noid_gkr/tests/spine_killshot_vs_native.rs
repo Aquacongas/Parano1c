@@ -211,7 +211,7 @@ fn killshot_rejects_input_payload_tamper_after_proof() {
     let (_proof, reductions) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
 
     // Flip one lane after proof generation.
-    inputs.input_leaves[2][1] = inputs.input_leaves[2][1] + Block128::from(1u128);
+    inputs.input_leaves[2][1] += Block128::from(1u128);
 
     // Native discharge with tampered inputs must reject — the
     // reductions were computed from the honest MLE, not the tampered one.

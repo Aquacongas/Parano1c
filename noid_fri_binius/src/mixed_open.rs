@@ -99,7 +99,7 @@ pub fn prove_mixed_opening(
         .map(|i| {
             let mut acc = Block128::ZERO;
             for (k, col) in state.raw_cols.iter().enumerate() {
-                acc = acc + weights[k] * col[i];
+                acc += weights[k] * col[i];
             }
             acc
         })
@@ -167,7 +167,7 @@ fn compute_horner_weights(gamma: Block128, n: usize) -> Vec<Block128> {
     let mut w = Block128::ONE;
     for _ in 0..n {
         weights.push(w);
-        w = w * gamma;
+        w *= gamma;
     }
     weights
 }

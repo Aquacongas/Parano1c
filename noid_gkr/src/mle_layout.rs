@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage G1b.α — packing the G1a layered witness as multilinear
 //! extensions.
 //!
@@ -32,7 +34,7 @@ pub const N_PERM_VARS: usize = 9;
 pub const N_PERM_CELLS: usize = 1 << N_PERM_VARS; // 512
 
 // Compile-time invariants (hand-rolled const asserts).
-const _: [(); 1] = [(); (N_ROWS_PADDED >= N_ROUNDS + 1) as usize];
+const _: [(); 1] = [(); (N_ROWS_PADDED > N_ROUNDS) as usize];
 const _: [(); 1] = [(); N_ROWS_PADDED.is_power_of_two() as usize];
 const _: [(); 1] = [(); (STATE_SIZE == 4) as usize];
 const _: [(); 1] = [(); (N_ROWS_PADDED * STATE_SIZE == N_PERM_CELLS) as usize];

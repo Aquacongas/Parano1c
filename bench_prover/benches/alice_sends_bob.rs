@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::manual_memcpy)]
+
 //! Real-world bench: Alice sends to Bob.
 //!
 //!   cargo bench --bench alice_sends_bob

@@ -67,7 +67,7 @@ impl Constraint for WeightedLinearGate {
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         let mut acc = self.constant;
         for (i, &(_, w)) in self.terms.iter().enumerate() {
-            acc = acc + w * frame.local[i];
+            acc += w * frame.local[i];
         }
         acc
     }
@@ -182,10 +182,10 @@ impl Constraint for WeightedLinearGateShifted {
     fn evaluate(&self, frame: EvalFrame) -> Block128 {
         let mut acc = self.constant;
         for (i, &(_, w)) in self.local_terms.iter().enumerate() {
-            acc = acc + w * frame.local[i];
+            acc += w * frame.local[i];
         }
         for (i, &(_, w)) in self.next_terms.iter().enumerate() {
-            acc = acc + w * frame.next[i];
+            acc += w * frame.next[i];
         }
         acc
     }

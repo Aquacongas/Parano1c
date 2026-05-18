@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::identity_op)]
+
 //! Stage 4c.3 — `FriStateCombinerAir`: Poseidon2b meta-root combiner for
 //! one side (prev or new) of the state-root identity.
 //!
@@ -284,8 +286,8 @@ pub fn combiner_pre_seeds(
     for i in 1..FRI_STATE_COMBINER_N_PERMS_PER_SIDE {
         let mut next_state = state;
         perm.permute_mut(&mut next_state);
-        next_state[0] = next_state[0] + absorb[i][0];
-        next_state[1] = next_state[1] + absorb[i][1];
+        next_state[0] += absorb[i][0];
+        next_state[1] += absorb[i][1];
         seeds[i] = next_state;
         state = next_state;
     }
@@ -653,10 +655,12 @@ mod tests {
         for c in &cols {
             assert_eq!(c.len(), FRI_STATE_COMBINER_N_ROWS);
         }
-        assert!(
-            FRI_STATE_COMBINER_N_PERMS_PER_SIDE * FRI_STATE_COMBINER_SLOT_ROWS
-                <= FRI_STATE_COMBINER_N_ROWS,
-        );
+        const {
+            assert!(
+                FRI_STATE_COMBINER_N_PERMS_PER_SIDE * FRI_STATE_COMBINER_SLOT_ROWS
+                    <= FRI_STATE_COMBINER_N_ROWS,
+            );
+        }
     }
 
     #[test]
@@ -735,7 +739,7 @@ mod tests {
         // Flip a cell inside perm 2's S-box chain.
         use crate::airs::poseidon_perm::POSEIDON_COL_SOUT;
         let row = combiner_instance_row_offset(2) + 5;
-        cols[POSEIDON_COL_SOUT + 1][row] = cols[POSEIDON_COL_SOUT + 1][row] + Block128::ONE;
+        cols[POSEIDON_COL_SOUT + 1][row] += Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -748,8 +752,7 @@ mod tests {
         let air = FriStateCombinerAir::new(&pre, expected);
         let mut cols = build_combiner_side_trace(&pre);
         let row = combiner_digest_row();
-        cols[COMBINER_PERM_LAYOUT.s + 0][row] =
-            cols[COMBINER_PERM_LAYOUT.s + 0][row] + Block128::ONE;
+        cols[COMBINER_PERM_LAYOUT.s + 0][row] += Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 

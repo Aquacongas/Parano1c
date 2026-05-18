@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage G1a — Poseidon2b permutation as a layered arithmetic witness.
 //!
 //! One `permute_mut` call is re-expressed as:

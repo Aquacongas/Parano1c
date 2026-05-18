@@ -187,7 +187,7 @@ mod tests {
         let a = mk_cols(8, 0xABCD);
         let b = mk_cols(8, 0x1234);
         let mut out: Vec<Block128> = a.iter().zip(b.iter()).map(|(x, y)| *x * *y).collect();
-        out[3] = out[3] + Block128::ONE;
+        out[3] += Block128::ONE;
         let air = CompositeAir::from_parts(3, 3, vec![Box::new(MulGate::new(0, 1, 2))]);
         let trace = Trace::new(vec![out, a, b]);
         assert!(!air.check(&trace));
@@ -212,7 +212,7 @@ mod tests {
     fn square_gate_rejects_wrong_square() {
         let a = mk_cols(8, 0xBEEF);
         let mut out: Vec<Block128> = a.iter().map(|x| *x * *x).collect();
-        out[1] = out[1] + Block128::ONE;
+        out[1] += Block128::ONE;
         let air = CompositeAir::from_parts(3, 2, vec![Box::new(SquareGate::new(0, 1))]);
         let trace = Trace::new(vec![out, a]);
         assert!(!air.check(&trace));

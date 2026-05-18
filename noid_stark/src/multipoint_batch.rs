@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::unnecessary_cast)]
+
 //! Stage 3b-0.4 — multipoint-to-single-point reduction (CRYPTO.md §12c).
 //!
 //! After the zero-check sumcheck we hold `N` base claims
@@ -251,7 +253,7 @@ pub fn mixed_high_scalar(challenges: &[Block128], m: usize) -> Block128 {
     debug_assert!(m <= challenges.len());
     let mut acc = Block128::ONE;
     for r in &challenges[..m] {
-        acc = acc * (Block128::ONE + *r);
+        acc *= Block128::ONE + *r;
     }
     acc
 }

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::identity_op,
+    clippy::manual_memcpy
+)]
+
 //! Stage 3c-1.4a — `PoseidonPermAir` witness layout + trace builder.
 //!
 //! One Poseidon2b permutation rendered as a witness trace on the
@@ -152,9 +158,9 @@ fn mds_full(state: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
         for j in 0..STATE_SIZE {
             let w = MDS_FULL[i][j];
             if w == 1 {
-                acc = acc + state[j];
+                acc += state[j];
             } else if w != 0 {
-                acc = acc + Block128::from(w) * state[j];
+                acc += Block128::from(w) * state[j];
             }
         }
         out[i] = acc;
@@ -170,9 +176,9 @@ fn mds_partial(state: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
         for j in 0..STATE_SIZE {
             let w = MDS_PARTIAL[i][j];
             if w == 1 {
-                acc = acc + state[j];
+                acc += state[j];
             } else if w != 0 {
-                acc = acc + Block128::from(w) * state[j];
+                acc += Block128::from(w) * state[j];
             }
         }
         out[i] = acc;
@@ -618,9 +624,9 @@ impl PermMdsBlendGate {
         for j in 0..STATE_SIZE {
             let w = mat[lane][j];
             if w == 1 {
-                acc = acc + vals[j];
+                acc += vals[j];
             } else if w != 0 {
-                acc = acc + Block128::from(w) * vals[j];
+                acc += Block128::from(w) * vals[j];
             }
         }
         acc
@@ -785,7 +791,7 @@ impl PartialSboxKillGate {
 
     /// Layout-parameterized constructor.
     pub fn with_layout(lane: usize, layout: PermLayout) -> Self {
-        assert!(lane >= 1 && lane < STATE_SIZE);
+        assert!((1..STATE_SIZE).contains(&lane));
         Self {
             locals: [layout.is_full, layout.sin + lane],
         }
@@ -896,7 +902,7 @@ pub fn perm_is_full_values_row_major(
     total_rows: usize,
 ) -> Vec<Block128> {
     assert!(total_rows.is_power_of_two() && total_rows > 0);
-    assert!(stride >= N_ROUNDS + 1);
+    assert!(stride > N_ROUNDS);
     assert!(n_instances * stride <= total_rows);
     let mut out = vec![Block128::ZERO; total_rows];
     for k in 0..n_instances {
@@ -917,7 +923,7 @@ pub fn perm_is_round_values_row_major(
     total_rows: usize,
 ) -> Vec<Block128> {
     assert!(total_rows.is_power_of_two() && total_rows > 0);
-    assert!(stride >= N_ROUNDS + 1);
+    assert!(stride > N_ROUNDS);
     assert!(n_instances * stride <= total_rows);
     let mut out = vec![Block128::ZERO; total_rows];
     for k in 0..n_instances {
@@ -941,7 +947,7 @@ pub fn perm_rc_values_row_major(
 ) -> Vec<Block128> {
     assert!(lane < STATE_SIZE);
     assert!(total_rows.is_power_of_two() && total_rows > 0);
-    assert!(stride >= N_ROUNDS + 1);
+    assert!(stride > N_ROUNDS);
     assert!(n_instances * stride <= total_rows);
     let mut out = vec![Block128::ZERO; total_rows];
     for k in 0..n_instances {
@@ -1092,7 +1098,7 @@ mod tests {
         let input = mk_input(0xABCD);
         let mut cols = build_perm_trace(input);
         // Flip one byte of sout[2] at an arbitrary active row.
-        cols[POSEIDON_COL_SOUT + 2][10] = cols[POSEIDON_COL_SOUT + 2][10] + Block128::ONE;
+        cols[POSEIDON_COL_SOUT + 2][10] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1109,8 +1115,7 @@ mod tests {
         let input = mk_input(0x5555);
         let mut cols = build_perm_trace(input);
         let partial_row = F_ROUNDS / 2 + 3;
-        cols[POSEIDON_COL_X2 + 0][partial_row] =
-            cols[POSEIDON_COL_X2 + 0][partial_row] + Block128::ONE;
+        cols[POSEIDON_COL_X2 + 0][partial_row] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1149,7 +1154,7 @@ mod tests {
         let mut cols = build_perm_trace(input);
         // Row 2 is a full round — lane-1..3 RC binding is live there.
         assert!(is_full_round(2));
-        cols[POSEIDON_COL_SIN + 1][2] = cols[POSEIDON_COL_SIN + 1][2] + Block128::ONE;
+        cols[POSEIDON_COL_SIN + 1][2] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1163,7 +1168,7 @@ mod tests {
         use crate::{Air, CompositeAir, Trace};
         let input = mk_input(0xFACE);
         let mut cols = build_perm_trace(input);
-        cols[POSEIDON_COL_RC + 0][0] = cols[POSEIDON_COL_RC + 0][0] + Block128::ONE;
+        cols[POSEIDON_COL_RC + 0][0] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1243,7 +1248,7 @@ mod tests {
         let mut cols = build_perm_trace(input);
         // row 0 is a full round, so s_next lives at row 1.
         assert!(is_full_round(0));
-        cols[POSEIDON_COL_S + 2][1] = cols[POSEIDON_COL_S + 2][1] + Block128::ONE;
+        cols[POSEIDON_COL_S + 2][1] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1260,8 +1265,7 @@ mod tests {
         let partial_row = F_ROUNDS / 2 + 5;
         assert!(!is_full_round(partial_row));
         // s_next for this row sits at partial_row + 1.
-        cols[POSEIDON_COL_S + 3][partial_row + 1] =
-            cols[POSEIDON_COL_S + 3][partial_row + 1] + Block128::ONE;
+        cols[POSEIDON_COL_S + 3][partial_row + 1] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1276,7 +1280,7 @@ mod tests {
         let input = mk_input(0x44);
         let mut cols = build_perm_trace(input);
         assert!(is_full_round(1));
-        cols[POSEIDON_COL_SOUT + 1][1] = cols[POSEIDON_COL_SOUT + 1][1] + Block128::ONE;
+        cols[POSEIDON_COL_SOUT + 1][1] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1294,8 +1298,7 @@ mod tests {
         let mut cols = build_perm_trace(input);
         let partial_row = F_ROUNDS / 2 + 2;
         assert!(!is_full_round(partial_row));
-        cols[POSEIDON_COL_S + 2][partial_row] =
-            cols[POSEIDON_COL_S + 2][partial_row] + Block128::ONE;
+        cols[POSEIDON_COL_S + 2][partial_row] += Block128::ONE;
         let air = CompositeAir::from_parts(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,
@@ -1441,7 +1444,7 @@ mod tests {
 
         for &(col, row, label) in sites {
             let mut cols = build_perm_trace(input);
-            cols[col][row] = cols[col][row] + Block128::from(0xDEADBEEFu128);
+            cols[col][row] += Block128::from(0xDEADBEEFu128);
             assert!(
                 !air.check(&Trace::new(cols)),
                 "forgery at ({col}, {row}) = {label} slipped through",
@@ -1508,7 +1511,7 @@ mod tests {
         use crate::{Air, CompositeAir, Trace};
         let input = mk_input(0xBEEF);
         let mut cols = build_perm_trace(input);
-        cols[POSEIDON_COL_RC + 2][5] = cols[POSEIDON_COL_RC + 2][5] + Block128::ONE;
+        cols[POSEIDON_COL_RC + 2][5] += Block128::ONE;
         let air = CompositeAir::from_parts_with_publics(
             POSEIDON_PERM_LOG_ROWS,
             POSEIDON_PERM_N_COLS,

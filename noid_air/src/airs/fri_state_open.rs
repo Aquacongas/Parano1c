@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::identity_op,
+    clippy::manual_memcpy,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation
+)]
+
 //! `FriStateOpenAir` — Stage 4a + 4c.1-bis + 4b.2 + 4c.2.
 //!
 //! Purpose: make `prev_state_root` and `new_state_root` in
@@ -976,11 +984,11 @@ impl FriStateOpenWitness {
             for k in 0..self.layout.log_slots {
                 let bit = Block128::from((idx & 1) as u128);
                 idx >>= 1;
-                eq = eq * (Block128::ONE + self.eval_point[k] + bit);
+                eq *= Block128::ONE + self.eval_point[k] + bit;
             }
-            acc[0] = acc[0] + eq * claim.delta_value;
-            acc[1] = acc[1] + eq * claim.delta_owner_hi;
-            acc[2] = acc[2] + eq * claim.delta_owner_lo;
+            acc[0] += eq * claim.delta_value;
+            acc[1] += eq * claim.delta_owner_hi;
+            acc[2] += eq * claim.delta_owner_lo;
         }
         [prev[0] + acc[0], prev[1] + acc[1], prev[2] + acc[2]]
     }
@@ -1014,13 +1022,13 @@ impl FriStateOpenWitness {
             for k in 0..self.layout.log_slots {
                 let bit = Block128::from((idx & 1) as u128);
                 idx >>= 1;
-                eq = eq * (Block128::ONE + self.eval_point[k] + bit);
+                eq *= Block128::ONE + self.eval_point[k] + bit;
             }
             let weight = gamma_pow * eq;
-            acc[0] = acc[0] + weight * pre_value;
-            acc[1] = acc[1] + weight * pre_hi;
-            acc[2] = acc[2] + weight * pre_lo;
-            gamma_pow = gamma_pow * self.gamma;
+            acc[0] += weight * pre_value;
+            acc[1] += weight * pre_hi;
+            acc[2] += weight * pre_lo;
+            gamma_pow *= self.gamma;
         }
         acc
     }
@@ -1081,7 +1089,7 @@ impl FriStateOpenWitness {
         let mut power = Block128::ONE;
         for row in 0..n_rows {
             cols[layout.col_gamma_powers()][row] = power;
-            power = power * self.gamma;
+            power *= self.gamma;
         }
         let tail = log_slots - 1;
         for row in 0..n_rows {
@@ -1100,7 +1108,7 @@ impl FriStateOpenWitness {
             let mut running = cols[gp_col][0];
             cols[acc_col][0] = running;
             for row in 1..n_inputs {
-                running = running + cols[gp_col][row];
+                running += cols[gp_col][row];
                 cols[acc_col][row] = running;
             }
             for row in n_inputs..n_rows {
@@ -1132,7 +1140,7 @@ impl FriStateOpenWitness {
             let mut running = cols[src_col][0];
             cols[acc_col][0] = running;
             for row in 1..n_inputs {
-                running = running + cols[src_col][row];
+                running += cols[src_col][row];
                 cols[acc_col][row] = running;
             }
             for row in n_inputs..n_rows {
@@ -1318,7 +1326,7 @@ impl FriStateOpenAir {
         let mut power = Block128::ONE;
         for _ in 0..n_rows {
             gamma_powers_vals.push(power);
-            power = power * gamma;
+            power *= gamma;
         }
         public_columns.push(PublicColumn::new(
             layout.col_gamma_powers(),
@@ -1697,7 +1705,7 @@ mod tests {
     fn tampered_value_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[COL_VALUE][0] = cols[COL_VALUE][0] + Block128::ONE;
+        cols[COL_VALUE][0] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1706,7 +1714,7 @@ mod tests {
     fn tampered_owner_hi_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[COL_OWNER_HI][1] = cols[COL_OWNER_HI][1] + Block128::ONE;
+        cols[COL_OWNER_HI][1] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1715,7 +1723,7 @@ mod tests {
     fn tampered_owner_lo_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[COL_OWNER_LO][0] = cols[COL_OWNER_LO][0] + Block128::ONE;
+        cols[COL_OWNER_LO][0] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1971,7 +1979,7 @@ mod tests {
         // owns the pins, not the witness.
         let air = mk_air();
         let mut bogus = mk_witness(mk_claims());
-        bogus.eval_point[0] = bogus.eval_point[0] + Block128::ONE;
+        bogus.eval_point[0] += Block128::ONE;
         let cols = bogus.build_columns(air.n_columns());
         // `build_columns` fills eval-point columns from the witness
         // (bogus). We do NOT apply the AIR's public overrides here —
@@ -2016,7 +2024,7 @@ mod tests {
         assert_eq!(r.len(), bits.len());
         let mut acc = Block128::ONE;
         for (ri, bi) in r.iter().zip(bits.iter()) {
-            acc = acc * (Block128::ONE + *ri + *bi);
+            acc *= Block128::ONE + *ri + *bi;
         }
         acc
     }
@@ -2034,7 +2042,7 @@ mod tests {
     #[test]
     fn tampered_eq_ladder_mid_rejects() {
         // Flipping eq_k for k ≥ 1 breaks the EqLadderStep recurrence.
-        assert!(FRI_STATE_OPEN_LOG_SLOTS >= 2);
+        const { assert!(FRI_STATE_OPEN_LOG_SLOTS >= 2) };
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
         cols[col_eq_ladder(1)][0] = cols[col_eq_ladder(1)][0] + Block128::ONE;
@@ -2058,7 +2066,7 @@ mod tests {
         // reject — the step-0 linear gate reads both.
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[COL_IDX_BIT_BASE][1] = cols[COL_IDX_BIT_BASE][1] + Block128::ONE;
+        cols[COL_IDX_BIT_BASE][1] += Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -2200,7 +2208,7 @@ mod tests {
                 expected,
                 "γ-powers row {row} mismatch"
             );
-            expected = expected * gamma;
+            expected *= gamma;
         }
     }
 
@@ -2228,7 +2236,7 @@ mod tests {
         // witness. Mirrors the eval_point drift test.
         let air = mk_air();
         let mut bogus = mk_witness(mk_claims());
-        bogus.gamma = bogus.gamma + Block128::ONE;
+        bogus.gamma += Block128::ONE;
         let cols = bogus.build_columns(air.n_columns());
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
@@ -2251,7 +2259,7 @@ mod tests {
         ] {
             let mut expected = Block128::ZERO;
             for i in 0..FRI_STATE_OPEN_N_INPUTS {
-                expected = expected + cols[gp_col][i];
+                expected += cols[gp_col][i];
                 assert_eq!(
                     cols[acc_col][i], expected,
                     "acc prefix mismatch at lane {acc_col} row {i}"
@@ -2324,7 +2332,7 @@ mod tests {
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
         // Ensure at least one padding row exists; scaffold has
         // N_ROWS = 8 > N_INPUTS = 4.
-        assert!(FRI_STATE_OPEN_N_ROWS > FRI_STATE_OPEN_N_INPUTS);
+        const { assert!(FRI_STATE_OPEN_N_ROWS > FRI_STATE_OPEN_N_INPUTS) };
         for row in FRI_STATE_OPEN_N_INPUTS..FRI_STATE_OPEN_N_ROWS {
             cols[col_acc_value()][row] = Block128::from(0xCAFE_u128 + row as u128);
             cols[col_acc_owner_hi()][row] = Block128::from(0xBEEF_u128 + row as u128);
@@ -2390,7 +2398,7 @@ mod tests {
         // the un-flipped value, closure pin fires.
         let claims = mk_claims();
         let mut expected = mk_expected_claims(claims);
-        expected[0] = expected[0] + Block128::ONE;
+        expected[0] += Block128::ONE;
         let air = FriStateOpenAir::new(
             &claims,
             mk_witness(claims).prev_lane_openings,
@@ -2407,7 +2415,7 @@ mod tests {
     fn gamma_closure_rejects_wrong_expected_owner_hi() {
         let claims = mk_claims();
         let mut expected = mk_expected_claims(claims);
-        expected[1] = expected[1] + Block128::ONE;
+        expected[1] += Block128::ONE;
         let air = FriStateOpenAir::new(
             &claims,
             mk_witness(claims).prev_lane_openings,
@@ -2424,7 +2432,7 @@ mod tests {
     fn gamma_closure_rejects_wrong_expected_owner_lo() {
         let claims = mk_claims();
         let mut expected = mk_expected_claims(claims);
-        expected[2] = expected[2] + Block128::ONE;
+        expected[2] += Block128::ONE;
         let air = FriStateOpenAir::new(
             &claims,
             mk_witness(claims).prev_lane_openings,
@@ -2534,7 +2542,7 @@ mod tests {
         let claims = mk_claims();
         let honest = mk_witness(claims);
         let mut bogus_new = honest.new_lane_openings;
-        bogus_new[0] = bogus_new[0] + Block128::ONE;
+        bogus_new[0] += Block128::ONE;
         let air = FriStateOpenAir::new(
             &claims,
             honest.prev_lane_openings,

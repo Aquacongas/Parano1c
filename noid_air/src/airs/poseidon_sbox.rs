@@ -127,7 +127,7 @@ mod tests {
     fn sbox_x7_air_rejects_x2_tamper() {
         let sin = mk_input(16, 0x1234_5678);
         let [mut x2, x4, x3, sout] = build_sbox_x7_columns(&sin);
-        x2[3] = x2[3] + Block128::ONE;
+        x2[3] += Block128::ONE;
         let air = CompositeAir::from_parts(
             4,
             SBOX_X7_N_COLS,
@@ -140,7 +140,7 @@ mod tests {
     fn sbox_x7_air_rejects_x4_tamper() {
         let sin = mk_input(16, 0x1234_5678);
         let [x2, mut x4, x3, sout] = build_sbox_x7_columns(&sin);
-        x4[0] = x4[0] + Block128::ONE;
+        x4[0] += Block128::ONE;
         let air = CompositeAir::from_parts(
             4,
             SBOX_X7_N_COLS,
@@ -153,7 +153,7 @@ mod tests {
     fn sbox_x7_air_rejects_x3_tamper() {
         let sin = mk_input(16, 0x1234_5678);
         let [x2, x4, mut x3, sout] = build_sbox_x7_columns(&sin);
-        x3[5] = x3[5] + Block128::ONE;
+        x3[5] += Block128::ONE;
         let air = CompositeAir::from_parts(
             4,
             SBOX_X7_N_COLS,
@@ -166,7 +166,7 @@ mod tests {
     fn sbox_x7_air_rejects_sout_tamper() {
         let sin = mk_input(16, 0x1234_5678);
         let [x2, x4, x3, mut sout] = build_sbox_x7_columns(&sin);
-        sout[9] = sout[9] + Block128::ONE;
+        sout[9] += Block128::ONE;
         let air = CompositeAir::from_parts(
             4,
             SBOX_X7_N_COLS,

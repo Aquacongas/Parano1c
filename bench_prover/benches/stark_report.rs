@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::manual_memcpy)]
+
 //! Paranoid STARK report — **Transparent UTXO Validity Engine**.
 //!
 //!   cargo bench --bench stark_report

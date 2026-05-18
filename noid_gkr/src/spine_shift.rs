@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::doc_overindented_list_items)]
+
 //! Stage 1.5.4-A — round-shift index helpers and public MLE evaluators
 //! for the unified Spine Kill-Shot sumcheck.
 //!

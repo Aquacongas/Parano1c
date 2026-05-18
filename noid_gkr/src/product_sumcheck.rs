@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage G1b.α — product sumcheck primitive.
 //!
 //! Reduces a claim `v = Σ_x eq(r, x) · A(x) · B(x)` over the boolean

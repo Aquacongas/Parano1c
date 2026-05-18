@@ -118,9 +118,9 @@ impl Constraint for MdsRowGate {
         for j in 0..STATE_SIZE {
             let w = self.row_coeffs[j];
             if w == 1 {
-                acc = acc + frame.local[j];
+                acc += frame.local[j];
             } else if w != 0 {
-                acc = acc + Block128::from(w) * frame.local[j];
+                acc += Block128::from(w) * frame.local[j];
             }
         }
         acc
@@ -162,9 +162,9 @@ pub fn apply_mds_row(kind: MdsKind, sout: [Block128; STATE_SIZE]) -> [Block128; 
         for j in 0..STATE_SIZE {
             let w = m[i][j];
             if w == 1 {
-                acc = acc + sout[j];
+                acc += sout[j];
             } else if w != 0 {
-                acc = acc + Block128::from(w) * sout[j];
+                acc += Block128::from(w) * sout[j];
             }
         }
         out[i] = acc;
@@ -253,7 +253,7 @@ mod tests {
     fn mds_full_row_rejects_s_next_tamper() {
         let n = 8;
         let (mut s_cols, sout_cols) = build_trace(MdsKind::Full, n, 0xBEEF);
-        s_cols[2][5] = s_cols[2][5] + Block128::ONE;
+        s_cols[2][5] += Block128::ONE;
         let layout = MdsLayout::new(4, 0);
         let constraints = emit_mds_row_constraints(MdsKind::Full, layout);
         let air = CompositeAir::from_parts(3, 8, constraints);
@@ -266,7 +266,7 @@ mod tests {
     fn mds_full_row_rejects_sout_tamper() {
         let n = 8;
         let (s_cols, mut sout_cols) = build_trace(MdsKind::Full, n, 0xBEEF);
-        sout_cols[1][0] = sout_cols[1][0] + Block128::ONE;
+        sout_cols[1][0] += Block128::ONE;
         let layout = MdsLayout::new(4, 0);
         let constraints = emit_mds_row_constraints(MdsKind::Full, layout);
         let air = CompositeAir::from_parts(3, 8, constraints);

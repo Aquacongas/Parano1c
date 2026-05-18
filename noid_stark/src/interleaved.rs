@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! FRI-Binius interleaved PCS integration for the STARK.
 //!
 //! Replaces per-column FRI commitments with a single interleaved Merkle
@@ -134,7 +136,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     let mut sumcheck_cols: Vec<Vec<Block128>> =
         Vec::with_capacity(n_air_cols + rotated_columns.len());
     sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
-    sumcheck_cols.extend(rotated_columns.into_iter());
+    sumcheck_cols.extend(rotated_columns);
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = crate::prove_zero_check(
@@ -191,7 +193,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         let mut cur = Block128::ONE;
         for _ in 0..total_weights {
             v.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
         v
     };
@@ -237,7 +239,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
             let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
             let eta = lambdas[n_air_cols + slot];
             for v in w.iter_mut() {
-                *v = *v * eta;
+                *v *= eta;
             }
             w
         })
@@ -459,7 +461,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
         let mut cur = Block128::ONE;
         for _ in 0..total_weights {
             v.push(cur);
-            cur = cur * beta;
+            cur *= beta;
         }
         v
     };

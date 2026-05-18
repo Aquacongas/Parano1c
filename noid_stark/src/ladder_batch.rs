@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage 3b-0.6 — shared helpers for the ladder-merge protocol.
 //!
 //! See CRYPTO.md §12c' for the protocol and soundness argument. The
@@ -275,7 +277,7 @@ mod tests {
         let points = ladder_points(&r);
         let honest: Vec<Block128> = points.iter().map(|p| mle_eval_at(&col, p)).collect();
         let mut forged = honest.clone();
-        forged[1] = forged[1] + Block128::ONE;
+        forged[1] += Block128::ONE;
         let gamma = Block128::from(0x123u128);
         assert_ne!(target_claim(gamma, &honest), target_claim(gamma, &forged));
     }

@@ -135,7 +135,7 @@ mod tests {
         };
         let col0 = vec![Block128::ZERO, Block128::ONE, Block128::ZERO, Block128::ONE];
         let mut bad = programme.clone();
-        bad[2] = bad[2] + Block128::ONE;
+        bad[2] += Block128::ONE;
         let trace = Trace::new(vec![col0, bad]);
         assert!(!air.check(&trace));
     }
@@ -198,7 +198,7 @@ mod tests {
 
         // Tamper the second programme column — check must reject.
         let mut bad_b = prog_b;
-        bad_b[0] = bad_b[0] + Block128::ONE;
+        bad_b[0] += Block128::ONE;
         let bad_trace = Trace::new(vec![col0, prog_a, bad_b]);
         assert!(!air.check(&bad_trace));
     }

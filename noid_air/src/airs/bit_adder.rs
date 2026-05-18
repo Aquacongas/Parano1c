@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! `BitAdderAir` — Stage 3b-3a width-parameterised ripple-carry adder.
 //!
 //! Generalises `CarryRippleAir` to arbitrary input width `W ≤ 127`.
@@ -308,7 +310,7 @@ impl Constraint for BitAdderCarryNextGate {
 /// `inst*128` of every instance. Used by §3d-0.10 to pin the block's
 /// selector columns via `PublicColumn` declarations.
 pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block128> {
-    assert!(width >= 1 && width <= BIT_ADDER_MAX_WIDTH);
+    assert!((1..=BIT_ADDER_MAX_WIDTH).contains(&width));
     assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
     let n_rows = 1usize << log_rows;
     let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
@@ -334,7 +336,7 @@ pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block1
 /// declaration, closing the "witness `Value` ↔ balance-operand bits"
 /// binding gap from §3b-4 without any new gate types or widened trace.
 pub fn bit_adder_operand_programme(width: usize, value: u64, log_rows: usize) -> Vec<Block128> {
-    assert!(width >= 1 && width <= 64);
+    assert!((1..=64).contains(&width));
     assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
     if width < 64 {
         assert!(
@@ -403,7 +405,7 @@ pub struct BitAdderAir {
 impl BitAdderAir {
     pub fn new(width: usize, log_rows: usize) -> Self {
         assert!(
-            width >= 1 && width <= BIT_ADDER_MAX_WIDTH,
+            (1..=BIT_ADDER_MAX_WIDTH).contains(&width),
             "BitAdderAir width {} must be in 1..={}",
             width,
             BIT_ADDER_MAX_WIDTH

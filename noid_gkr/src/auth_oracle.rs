@@ -142,6 +142,7 @@ pub fn compute_auth_boundary(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_range_loop)]
     use super::*;
     use noid_core::CanonicalSerialize;
     use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, SpendSecret, TxBodyHash};

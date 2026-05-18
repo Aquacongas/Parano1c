@@ -479,7 +479,7 @@ mod tests {
         state.set_slot(1, sv(1)).unwrap();
         let root = state.root();
         let mut op = state.open(1).expect("open");
-        op.values.value = op.values.value + Block128::ONE;
+        op.values.value += Block128::ONE;
         assert_eq!(verify_opening(&root, &op), Err(StateError::OpeningFailed));
     }
 

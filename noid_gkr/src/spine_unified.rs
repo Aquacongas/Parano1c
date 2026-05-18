@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage 1.5.4-B — unified Kill-Shot sumcheck (main half).
 //!
 //! Discharges the full Spine algebraic surface (C1 + β·C1' + γ·C2)
@@ -1512,7 +1514,7 @@ mod tests {
         let rho: Vec<Block128> = (0..N_SPINE_UNIFIED_VARS)
             .map(|k| Block128::from(0xA5A5_DEAD_BEEFu128.wrapping_mul((k as u128) + 1)))
             .collect();
-        let beta = Block128::from(0xC0FFEE_BAADu128);
+        let beta = Block128::from(0x00C0_FFEE_BAAD_u128);
         let gamma = Block128::from(0xFEEDFACE_CAFEBABEu128);
 
         let mut tow = build_unified_tables(&mle, &rho, N_SPINE_SLOTS);

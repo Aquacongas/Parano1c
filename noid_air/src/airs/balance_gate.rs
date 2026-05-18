@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::type_complexity)]
+
 //! `BalanceGateAir` — Stage 3b-3 UTXO conservation law AIR.
 //!
 //! Enforces `Σ inputs == Σ outputs + fee` (standard UTXO accounting) for
@@ -564,8 +566,8 @@ pub fn build_balance_trace_parts(
     for &(width, a, b) in per_block.iter() {
         let air = BitAdderAir::new(width, log_rows);
         let sub = air.build_trace(&first_pair(n_instances, a, b));
-        cols.extend(sub.columns.into_iter());
-        domains.extend(sub.domains.into_iter());
+        cols.extend(sub.columns);
+        domains.extend(sub.domains);
     }
     (cols, domains)
 }

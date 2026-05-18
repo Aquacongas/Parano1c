@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Paranoid.
 //
 // Auth <-> Spine bridge soundness tests.
+#![allow(clippy::manual_memcpy)]
+
 //
 // Attack vector: an attacker knows their own spend_secret but wants to
 // steal a victim's UTXO. They construct:
@@ -14,10 +16,9 @@
 // commits to the victim's address, but nothing ties the two together.
 // The bridge ensures `auth.expected_address[i] == spine.input_leaves[i].owner`.
 
-use noid_air::{composition::tx_validity_with_spine::fixture, Air};
+use noid_air::composition::tx_validity_with_spine::fixture;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS};
-use noid_tx::PublicInputs;
 
 /// Lower the composite's boundary pins to the `SpineInputs` shape the
 /// GKR spine consumes. Mirrors the pin semantics documented on
@@ -182,7 +183,7 @@ fn verify_tx_rejects_mismatched_tx_body_hash_in_auth() {
 
     // Tamper auth_inputs.tx_body_hash (replay attack vector)
     let mut bad_hash = tx_body_hash;
-    bad_hash[0] = bad_hash[0] + Block128::ONE;
+    bad_hash[0] += Block128::ONE;
     let tampered_auth = AuthInputs {
         spend_secret,
         tx_body_hash: bad_hash,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::manual_memcpy)]
+
 //! Spine-embedded tx-validity composite with a verbatim leaf-band.
 //!
 //! Constructs a [`crate::CompositeAir`] at `outer_log_rows = 13` that
@@ -279,7 +281,6 @@ impl TxValidityCompositeWithSpine {
             LeafConstructionOptions {
                 output_side: output_side.clone(),
                 is_coinbase: options.is_coinbase,
-                ..LeafConstructionOptions::default()
             },
         );
         let (leaf_air, combiner, open_witness, open_public_columns) = leaf.into_parts();
@@ -1629,7 +1630,7 @@ mod tests {
         let comp = build_honest();
         let mut trace = comp.build_trace();
         let wrap = comp.spine_layout().wrap_output_outer_cell(0);
-        trace.columns[wrap.col][wrap.row] = trace.columns[wrap.col][wrap.row] + Block128::ONE;
+        trace.columns[wrap.col][wrap.row] += Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -1638,7 +1639,7 @@ mod tests {
         let comp = build_honest();
         let mut trace = comp.build_trace();
         let mask_col = comp.spine_layout().txv_live_mask_outer_col();
-        trace.columns[mask_col][0] = trace.columns[mask_col][0] + Block128::ONE;
+        trace.columns[mask_col][0] += Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -1650,18 +1651,17 @@ mod tests {
         // Tamper a combiner sub-AIR column inside the combiner window
         // (rows < 2^9 = 512). The row-window wrapper masks combiner
         // constraints off past row 511 but they remain active inside.
-        trace.columns[SKEL_COMBINER_COL_OFFSET][1] =
-            trace.columns[SKEL_COMBINER_COL_OFFSET][1] + Block128::ONE;
+        trace.columns[SKEL_COMBINER_COL_OFFSET][1] += Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
-    /// Stage B.4 canonical regression: binding chain for output leaf payloads.
-    ///
-    /// `TxBodyMerkleAir` emits, for each lane ∈ {0,1}, a `PublicColumn` at
-    /// `o1_base + TXBODY_MERKLE_O1_PROG_BASE_OFFSET + lane` whose programme
-    /// row `output_leaf_perm_a_row(j)` carries `pins.output_leaf_absorb[j][lane]`.
-    /// On that same row a `SelectorGate` (gated by `leaf_perm_a_row_0`)
-    /// enforces `pre_s[lane] == o1_prog[lane]`. Together the programme-pin
+    // Stage B.4 canonical regression: binding chain for output leaf payloads.
+    //
+    // `TxBodyMerkleAir` emits, for each lane ∈ {0,1}, a `PublicColumn` at
+    // `o1_base + TXBODY_MERKLE_O1_PROG_BASE_OFFSET + lane` whose programme
+    // row `output_leaf_perm_a_row(j)` carries `pins.output_leaf_absorb[j][lane]`.
+    // On that same row a `SelectorGate` (gated by `leaf_perm_a_row_0`)
+    // enforces `pre_s[lane] == o1_prog[lane]`. Together the programme-pin
     // `tamper_output_leaf_absorb_pin_rejects` was a regression for the
     // AIR-spine merkle-interior cells (O1 head-pin + pre_s[lane]).
     // Those cells no longer exist in the trace: GKR owns the
@@ -1705,7 +1705,7 @@ mod tests {
                 let comp = build_honest_realistic();
                 let mut trace = comp.build_trace();
                 let col = SKEL_OUT_OPEN_COL_OFFSET + FRI_STATE_OPEN_OUTPUT_LAYOUT.col_idx_bit(k);
-                trace.columns[col][output] = trace.columns[col][output] + Block128::ONE;
+                trace.columns[col][output] += Block128::ONE;
                 assert!(
                     !comp.air().check(&trace),
                     "comp-4: out-open idx_bit(k={k}) tamper at output {output} must REJECT",
@@ -1731,7 +1731,7 @@ mod tests {
         for j in 0..4 {
             let mut trace = comp.build_trace();
             let row = MAX_INPUTS + j;
-            trace.columns[slot_col][row] = trace.columns[slot_col][row] + Block128::ONE;
+            trace.columns[slot_col][row] += Block128::ONE;
             assert!(
                 !comp.air().check(&trace),
                 "comp-4: spine SlotIndex[MAX_INPUTS+{j}] tamper must REJECT",
@@ -1822,14 +1822,8 @@ mod tests {
         }
     }
 
-    /// E.5.f₃ — tampering `pre_s[0]` at instance-42 row-0 (L14 seed)
-    /// must reject on a coinbase trace.
-    ///
-    // `e5f3_coinbase_l14_pre_s_tamper_rejects` was a regression for
-    // the AIR-spine O3.b pin on `pre_s[0..1]@instance-42`. GKR owns
-    // the 59-perm permutation now — `is_coinbase_leaf` flows through
-    // the spine into `tx_body_hash`, and the row-wide pin on
-    // `TXBODY_MERKLE_LAYOUT.s` lanes catches any disagreement.
+    // E.5.f₃ — tampering `pre_s[0]` at instance-42 row-0 (L14 seed)
+    // must reject on a coinbase trace.
 
     /// E.5.f₃ — tampering the leaf-side `SKEL_IS_COINBASE_COL` scalar
     /// on any single row must reject on an honest coinbase trace.
@@ -1844,7 +1838,7 @@ mod tests {
         // makes the bridge gate fire if we flip the same row).
         let layout_inst = crate::airs::tx_body_merkle::build_instance_layout();
         let row = layout_inst[42].slot_base_row;
-        cols[SKEL_IS_COINBASE_COL][row] = cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
+        cols[SKEL_IS_COINBASE_COL][row] += Block128::ONE;
         assert!(!comp.air().check(&Trace::new(cols)));
     }
 
@@ -2116,7 +2110,7 @@ mod tests {
         let mut trace = comp.build_trace();
         let credit_col = coinbase_credit_bit_col();
         // 100 = 0b1100100 — bit 2 is ONE; flip it.
-        trace.columns[credit_col][2] = trace.columns[credit_col][2] + Block128::ONE;
+        trace.columns[credit_col][2] += Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -2209,7 +2203,7 @@ mod tests {
             + TX_VALIDITY_BALANCE_COL_OFFSET
             + BALANCE_BLK_B21 * BIT_ADDER_N_COLS
             + BIT_ADDER_COL_SUM;
-        trace.columns[b21_sum_col][1] = trace.columns[b21_sum_col][1] + Block128::ONE;
+        trace.columns[b21_sum_col][1] += Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! `TxValidityAir` — transaction-validity AIR.
 //!
 //! Two entry points coexist in this module:
@@ -390,8 +392,8 @@ impl TxValidityAir {
         let (mut cols, mut domains) = build_witness_columns(body, log_rows);
         let (balance_cols, balance_domains) =
             build_balance_columns(balance_inputs, balance_outputs, balance_fee, log_rows);
-        cols.extend(balance_cols.into_iter());
-        domains.extend(balance_domains.into_iter());
+        cols.extend(balance_cols);
+        domains.extend(balance_domains);
         Trace::new_with_domains(cols, domains)
     }
 
@@ -774,7 +776,7 @@ mod tests {
 
     #[test]
     fn validity_3b4_with_balance_selector_pins_rejects_selector_tamper() {
-        use crate::airs::bit_adder::{BIT_ADDER_COL_IS_INPUT, BIT_ADDER_N_COLS};
+        use crate::airs::bit_adder::BIT_ADDER_COL_IS_INPUT;
         let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
         let body = mk_body_balanced_1in1out(1000, 1000, 0);
         let ins = [1000u64, 0, 0, 0];
@@ -785,7 +787,7 @@ mod tests {
         // row of instance 0. Without the selector pin the FA gates stay
         // silent (no active data there); the `PublicColumn` check is
         // what fires.
-        let col = TX_VALIDITY_BALANCE_COL_OFFSET + 0 * BIT_ADDER_N_COLS + BIT_ADDER_COL_IS_INPUT;
+        let col = TX_VALIDITY_BALANCE_COL_OFFSET + BIT_ADDER_COL_IS_INPUT;
         trace.columns[col][100] = Block128::ONE;
         assert!(!air.check(&trace));
     }

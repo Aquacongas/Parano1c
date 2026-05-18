@@ -47,8 +47,8 @@ pub fn verify_batched_opening(
     let mut batched_claim = Block128::ZERO;
     let mut gamma_pow = Block128::ONE;
     for &e in &proof.column_openings {
-        batched_claim = batched_claim + gamma_pow * e;
-        gamma_pow = gamma_pow * gamma;
+        batched_claim += gamma_pow * e;
+        gamma_pow *= gamma;
     }
 
     // Step 2: Verify sumcheck rounds

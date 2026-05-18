@@ -532,7 +532,7 @@ pub fn horner_weights(alpha: Block128, n: usize) -> Vec<Block128> {
     let mut cur = Block128::ONE;
     for _ in 0..n {
         out.push(cur);
-        cur = cur * alpha;
+        cur *= alpha;
     }
     out
 }
@@ -755,7 +755,7 @@ mod tests {
         let good: Vec<Block128> = (0..4).map(|_| rand_block(&mut r)).collect();
         let mut bad = good.clone();
         // Perturb column 2 — the only δ ≠ 0 is at index 2.
-        bad[2] = bad[2] + Block128::ONE;
+        bad[2] += Block128::ONE;
 
         let e_good = rlc_openings(&lambdas, &good);
         let e_bad = rlc_openings(&lambdas, &bad);
@@ -861,7 +861,7 @@ mod tests {
         let mut proof = prove_batched(&col_refs, &eval_point, &ntt, &mut prover_ch, &hasher);
 
         // Flip one bit in column 1's opening.
-        proof.column_openings[1] = proof.column_openings[1] + Block128::ONE;
+        proof.column_openings[1] += Block128::ONE;
 
         let mut verifier_ch = Channel::new();
         for c in &commitments {
@@ -1002,7 +1002,7 @@ mod tests {
         let proof = prove_batched(&col_refs, &eval_point, &ntt, &mut prover_ch, &hasher);
 
         let mut bad_point = eval_point.clone();
-        bad_point[0] = bad_point[0] + Block128::ONE;
+        bad_point[0] += Block128::ONE;
 
         let mut verifier_ch = Channel::new();
         for c in &commitments {
@@ -1184,7 +1184,7 @@ mod tests {
         let mut proof = prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
 
         // Flip one per-column opening.
-        proof.column_openings[1] = proof.column_openings[1] + Block128::ONE;
+        proof.column_openings[1] += Block128::ONE;
 
         let mut vch = Channel::new();
         for c in &cs {

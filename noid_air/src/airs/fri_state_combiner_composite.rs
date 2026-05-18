@@ -343,7 +343,7 @@ mod tests {
         let mut trace = composite.build_trace();
         let row = combiner_digest_row();
         let col = COMBINER_COMPOSITE_PREV_OFFSET + COMBINER_PERM_LAYOUT.s;
-        trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;
+        trace.columns[col][row] += Block128::ONE;
         assert!(!composite.check(&trace));
     }
 
@@ -353,7 +353,7 @@ mod tests {
         let mut trace = composite.build_trace();
         let row = combiner_digest_row();
         let col = COMBINER_COMPOSITE_NEW_OFFSET + COMBINER_PERM_LAYOUT.s;
-        trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;
+        trace.columns[col][row] += Block128::ONE;
         assert!(!composite.check(&trace));
     }
 
@@ -362,7 +362,7 @@ mod tests {
         let composite = honest_composite();
         let mut trace = composite.build_trace();
         let col = COMBINER_COMPOSITE_PREV_OFFSET + combiner_pre_s_base(0);
-        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
+        trace.columns[col][0] += Block128::ONE;
         assert!(!composite.check(&trace));
     }
 
@@ -371,7 +371,7 @@ mod tests {
         let composite = honest_composite();
         let mut trace = composite.build_trace();
         let col = COMBINER_COMPOSITE_NEW_OFFSET + combiner_pre_s_base(0);
-        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
+        trace.columns[col][0] += Block128::ONE;
         assert!(!composite.check(&trace));
     }
 
@@ -429,7 +429,7 @@ mod tests {
         let mut trace = baseline.clone();
         let new_digest_col = COMBINER_COMPOSITE_NEW_OFFSET + COMBINER_PERM_LAYOUT.s;
         let row = combiner_digest_row();
-        trace.columns[new_digest_col][row] = trace.columns[new_digest_col][row] + Block128::ONE;
+        trace.columns[new_digest_col][row] += Block128::ONE;
         // Prev-side digest cell is untouched.
         let prev_digest_col = COMBINER_COMPOSITE_PREV_OFFSET + COMBINER_PERM_LAYOUT.s;
         assert_eq!(

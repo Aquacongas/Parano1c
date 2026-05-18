@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(SKEL_IS_COINBASE_COL, SKEL_IS_ACTIVATION_COL + 1);
         assert_eq!(SKEL_IS_COINBASE_COL, TX_VALIDITY_LEAF_N_COLS - 1);
         assert_eq!(TX_VALIDITY_LEAF_LOG_ROWS, 13);
-        assert!(TX_VALIDITY_LEAF_LOG_ROWS >= COMBINER_COMPOSITE_LOG_ROWS);
+        const { assert!(TX_VALIDITY_LEAF_LOG_ROWS >= COMBINER_COMPOSITE_LOG_ROWS) };
     }
 
     #[test]
@@ -861,8 +861,7 @@ mod tests {
         let comp = build_with_activation_sources();
         for row in 0..FRI_STATE_OPEN_N_INPUTS {
             let mut cols = comp.build_trace().columns;
-            cols[SKEL_IS_DEACTIVATION_COL][row] =
-                cols[SKEL_IS_DEACTIVATION_COL][row] + Block128::ONE;
+            cols[SKEL_IS_DEACTIVATION_COL][row] += Block128::ONE;
             assert!(
                 !comp.air().check(&Trace::new(cols)),
                 "E.4: is_deactivation[{row}] tamper must REJECT",
@@ -875,7 +874,7 @@ mod tests {
         let comp = build_with_activation_sources();
         for row in 0..FRI_STATE_OPEN_OUTPUT_LAYOUT.n_inputs {
             let mut cols = comp.build_trace().columns;
-            cols[SKEL_IS_ACTIVATION_COL][row] = cols[SKEL_IS_ACTIVATION_COL][row] + Block128::ONE;
+            cols[SKEL_IS_ACTIVATION_COL][row] += Block128::ONE;
             assert!(
                 !comp.air().check(&Trace::new(cols)),
                 "E.4: is_activation[{row}] tamper must REJECT",
@@ -994,7 +993,7 @@ mod tests {
         let comp = build();
         for row in [0usize, 1, 5, 100, 1 << 12] {
             let mut cols = comp.build_trace().columns;
-            cols[SKEL_IS_COINBASE_COL][row] = cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
+            cols[SKEL_IS_COINBASE_COL][row] += Block128::ONE;
             assert!(
                 !comp.air().check(&Trace::new(cols)),
                 "E.5: is_coinbase row {row} tamper must REJECT",

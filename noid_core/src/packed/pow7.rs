@@ -68,7 +68,7 @@ mod tests {
         // x · x · x · x · x · x · x
         let mut acc = Block128::ONE;
         for _ in 0..7 {
-            acc = acc * x;
+            acc *= x;
         }
         acc
     }

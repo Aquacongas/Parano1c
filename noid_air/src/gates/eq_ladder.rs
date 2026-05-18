@@ -137,7 +137,7 @@ mod tests {
         let mut out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
-        out[2] = out[2] + Block128::ONE;
+        out[2] += Block128::ONE;
         let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b]);
         assert!(!air.check(&trace));
@@ -160,7 +160,7 @@ mod tests {
         let out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
-        r[1] = r[1] + Block128::ONE;
+        r[1] += Block128::ONE;
         let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b]);
         assert!(!air.check(&trace));
@@ -184,7 +184,7 @@ mod tests {
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
         let mut b_bad = b.clone();
-        b_bad[0] = b_bad[0] + Block128::ONE;
+        b_bad[0] += Block128::ONE;
         let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b_bad]);
         assert!(!air.check(&trace));

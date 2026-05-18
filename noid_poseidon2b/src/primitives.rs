@@ -266,6 +266,7 @@ pub fn hash_tx_body(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::needless_range_loop)]
     use super::*;
 
     const SS: SpendSecret = SpendSecret([7u8; 32]);

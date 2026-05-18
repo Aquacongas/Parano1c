@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage 5.1 — cross-row equality bridge primitive.
 //!
 //! `emit_cross_row_eq` pins `trace[src_col][src_row] ==
@@ -463,19 +465,19 @@ mod tests {
         // Flip src cell.
         {
             let mut t = honest.clone();
-            t[p.src_col][p.src_row] = t[p.src_col][p.src_row] + flip;
+            t[p.src_col][p.src_row] += flip;
             assert!(!air.check(&Trace::new(t)), "src cell tamper undetected");
         }
         // Flip dst cell.
         {
             let mut t = honest.clone();
-            t[p.dst_col][p.dst_row] = t[p.dst_col][p.dst_row] + flip;
+            t[p.dst_col][p.dst_row] += flip;
             assert!(!air.check(&Trace::new(t)), "dst cell tamper undetected");
         }
         // Flip each bridge cell inside [src_row, dst_row].
         for r in p.src_row..=p.dst_row {
             let mut t = honest.clone();
-            t[p.bridge_col][r] = t[p.bridge_col][r] + flip;
+            t[p.bridge_col][r] += flip;
             assert!(
                 !air.check(&Trace::new(t)),
                 "bridge cell tamper at row {r} undetected"
@@ -485,7 +487,7 @@ mod tests {
         // row, turning off the hot row).
         for r in 0..p.total_rows {
             let mut t = honest.clone();
-            t[p.src_indicator_col][r] = t[p.src_indicator_col][r] + flip;
+            t[p.src_indicator_col][r] += flip;
             assert!(
                 !air.check(&Trace::new(t)),
                 "src indicator row {r} tamper undetected"
@@ -493,7 +495,7 @@ mod tests {
         }
         for r in 0..p.total_rows {
             let mut t = honest.clone();
-            t[p.dst_indicator_col][r] = t[p.dst_indicator_col][r] + flip;
+            t[p.dst_indicator_col][r] += flip;
             assert!(
                 !air.check(&Trace::new(t)),
                 "dst indicator row {r} tamper undetected"
@@ -501,7 +503,7 @@ mod tests {
         }
         for r in 0..p.total_rows {
             let mut t = honest.clone();
-            t[p.transition_indicator_col][r] = t[p.transition_indicator_col][r] + flip;
+            t[p.transition_indicator_col][r] += flip;
             assert!(
                 !air.check(&Trace::new(t)),
                 "transition indicator row {r} tamper undetected"

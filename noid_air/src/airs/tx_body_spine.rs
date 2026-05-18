@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! `TxBodySpineComposite` — Stage 1.5 composite trace stub.
 //!
 //! Stitches `TxValidityAir::new_3b4_with_skeleton_selector_pins(13)`
@@ -467,8 +469,8 @@ impl TxBodySpineComposite {
         let total_rows = 1usize << SPINE_LOG_ROWS;
         let mut cols = txv_trace.columns;
         let mut domains = txv_trace.domains;
-        cols.extend(merkle_cols.into_iter());
-        domains.extend(merkle_domains.into_iter());
+        cols.extend(merkle_cols);
+        domains.extend(merkle_domains);
 
         cols.push(txv_live_mask_programme());
         domains.push(ColumnDomain::Bit);
@@ -630,7 +632,7 @@ mod tests {
         // `pins.tx_body_hash[0]` by a PublicColumn, so any row-level
         // tamper in that column must reject.
         let col = TX_BODY_MERKLE_COL_OFFSET + TXBODY_MERKLE_LAYOUT.s;
-        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
+        trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
             "wrap-output tamper must reject at composite layer (Stage 1a regression)"
@@ -943,7 +945,7 @@ mod tests {
         );
         // Flip SlotIndex on input row 0 — pinned to input_leaf_absorb[0][0].
         let col = TXV_COL_OFFSET + TxValidityCol::SlotIndex.index();
-        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
+        trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
             "Stage 2(b) must reject SlotIndex tamper on an input row"
@@ -966,7 +968,7 @@ mod tests {
         // Flip Value on output row 0 — pinned to output_leaf_absorb[0][1].
         let col = TXV_COL_OFFSET + TxValidityCol::Value.index();
         let row = MAX_INPUTS;
-        trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;
+        trace.columns[col][row] += Block128::ONE;
         assert!(
             !spine.check(&trace),
             "Stage 2(b) must reject Value tamper on an output row"
@@ -987,7 +989,7 @@ mod tests {
             &merkle_inputs,
         );
         let col = TXV_COL_OFFSET + TxValidityCol::OwnerHi.index();
-        trace.columns[col][0] = trace.columns[col][0] + Block128::ONE;
+        trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
             "Stage 2(b) must reject OwnerHi tamper on an input row"
@@ -1009,7 +1011,7 @@ mod tests {
         );
         let col = TXV_COL_OFFSET + TxValidityCol::OwnerLo.index();
         let row = MAX_INPUTS;
-        trace.columns[col][row] = trace.columns[col][row] + Block128::ONE;
+        trace.columns[col][row] += Block128::ONE;
         assert!(
             !spine.check(&trace),
             "Stage 2(b) must reject OwnerLo tamper on an output row"

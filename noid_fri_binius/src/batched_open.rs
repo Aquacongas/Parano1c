@@ -40,7 +40,7 @@ fn horner_weights(gamma: Block128, n: usize) -> Vec<Block128> {
     let mut w = Block128::ONE;
     for _ in 0..n {
         weights.push(w);
-        w = w * gamma;
+        w *= gamma;
     }
     weights
 }
@@ -137,7 +137,7 @@ pub fn prove_batched_opening(
         .map(|i| {
             let mut acc = Block128::ZERO;
             for (k, col) in state.raw_cols.iter().enumerate() {
-                acc = acc + weights[k] * col[i];
+                acc += weights[k] * col[i];
             }
             acc
         })
@@ -180,15 +180,15 @@ fn compute_round_poly_batched(
         let mut b_lo = Block128::ZERO;
         let mut b_hi = Block128::ZERO;
         for k in 0..n_cols {
-            b_lo = b_lo + weights[k] * col_folds[k][j];
-            b_hi = b_hi + weights[k] * col_folds[k][j + half];
+            b_lo += weights[k] * col_folds[k][j];
+            b_hi += weights[k] * col_folds[k][j + half];
         }
         // B at x_i=2: B(2) = B_lo + 2*(B_hi - B_lo) = B_lo + 2*(B_hi + B_lo) (char 2)
         let b_at_2 = b_lo + two * (b_hi + b_lo);
 
-        p0 = p0 + b_lo * eq_lo;
-        p1 = p1 + b_hi * eq_hi;
-        p2 = p2 + b_at_2 * eq_at_2;
+        p0 += b_lo * eq_lo;
+        p1 += b_hi * eq_hi;
+        p2 += b_at_2 * eq_at_2;
     }
 
     (p0, p1, p2)
@@ -199,7 +199,7 @@ fn fold_inplace(v: &mut Vec<Block128>, r: Block128) {
     let half = v.len() / 2;
     for j in 0..half {
         let delta = v[j + half] + v[j];
-        v[j] = v[j] + r * delta;
+        v[j] += r * delta;
     }
     v.truncate(half);
 }

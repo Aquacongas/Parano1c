@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Compact FRI prover/verifier optimized for the interleaved PCS.
 //!
 //! Key differences from the generic `noid_fri::prover`:

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::doc_overindented_list_items)]
+
 //! Stage 1.5.4 — degree-7 sumcheck on the unified spine MLE.
 //!
 //! Discharge of the S-box identity over the 15-variable hypercube:

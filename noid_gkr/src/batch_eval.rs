@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop)]
+
 //! Stage G3.γ₂ — batch-evaluation sumcheck.
 //!
 //! Reduces `M` MLE-evaluation claims `(r_i, v_i)` on a **single**

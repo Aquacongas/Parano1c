@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
+#![allow(clippy::needless_range_loop, clippy::doc_overindented_list_items)]
+
 //! Stage 1.5.3 — unified 15-variable MLE layout for the Spine Kill Shot.
 //!
 //! Architecture

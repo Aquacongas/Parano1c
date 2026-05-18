@@ -321,10 +321,10 @@ impl RangeGateAir {
                     is_reset_col[row] = Block128::ONE;
                     acc = b_block * weight;
                 } else {
-                    acc = acc + b_block * weight;
+                    acc += b_block * weight;
                 }
                 acc_col[row] = acc;
-                weight = weight * two;
+                weight *= two;
             }
         }
 
@@ -445,9 +445,9 @@ mod tests {
             let mut weight = Block128::ONE;
             for i in 0..RANGE_GATE_WORD_BITS {
                 if (x >> i) & 1 == 1 {
-                    expected = expected + weight;
+                    expected += weight;
                 }
-                weight = weight * two;
+                weight *= two;
             }
             let last = inst * RANGE_GATE_WORD_BITS + RANGE_GATE_WORD_BITS - 1;
             assert_eq!(trace.columns[RANGE_GATE_COL_ACC][last], expected);
