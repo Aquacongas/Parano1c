@@ -292,7 +292,7 @@ Internal structure of the implementation (detailed specification:
   binding.rs            In-code contract for the STARK ↔ GKR cut.
 ```
 
-### 4.3 STARK + FRI — the "final seal"
+### 4.3 STARK + FRI-Binius — the "final seal"
 
 Once the AIR traces are filled and GKR has folded the 59-hash spine
 into a single claim on its boundary MLE, the STARK performs the final
@@ -300,14 +300,22 @@ step:
 
 1. Rolls all AIR constraints into one large polynomial.
 2. Reed–Solomon-encodes it (oversampled on an extended domain).
-3. Proves via **FRI** that the result really is a low-degree polynomial
-   (which in turn guarantees that every constraint is satisfied).
+3. Proves via **FRI-Binius** that the result really is a low-degree
+   polynomial (which in turn guarantees that every constraint is
+   satisfied).
 4. Fiat–Shamir (Poseidon2b transcript) turns the entire interaction
    into a non-interactive proof.
 
-FRI in Paranoid runs on top of the **binary tower GF(2^128)**, with
+FRI-Binius runs on top of the **binary tower GF(2^128)**, with
 CLMUL-accelerated multiplication and AVX2-SIMD squaring. Commitments
-are Poseidon2b Merkle trees over packed columns (128× bits, 16× bytes).
+are Poseidon2b Merkle trees over interleaved packed columns. The PCS
+supports mixed-length columns (log_len=13 for the AIR trace, log_len=15
+for boundary MLEs) batched into a single multipoint-close opening.
+
+**Measured performance (per-tx, 2in/4out, single-thread):**
+- Prove: ~725 ms
+- Verify: ~145 ms
+- Proof size: ~55 KB
 
 ### 4.4 IVC — the "recursive block accumulator"
 
@@ -594,14 +602,17 @@ Seven properties follow directly from the design:
 
 ## 8. What is done, what is ahead
 
-**Done:**
+**Done (Phase 1 — per-tx proof complete):**
 
 - Poseidon2b native + AIR encoding.
 - AIRs: `balance_gate`, `range_gate`, `haddr`, `hauth`,
   `fri_state_open`, `tx_body_spine` (carrying only the 2-lane
   `tx_body_hash` pin), `tx_validity`, plus the composition layer.
-- FRI over GF(2^128) with Poseidon2b Merkle commitments.
+- FRI-Binius over GF(2^128) with Poseidon2b Merkle commitments,
+  interleaved packing (`noid_fri_binius`), and mixed-length
+  multipoint-close for batching columns of different log_len.
 - STARK per-`tx` proof (stages 5–7 end-to-end roundtrip).
+  Measured: prove ~725 ms, verify ~145 ms, proof ~55 KB.
 - IVC fold accumulator (3-step fold test passes).
 - GKR spine Kill-Shot (production path): unified degree-7 sumcheck
   over all 59 slots + shift argument + 3× batch-eval →
@@ -614,11 +625,18 @@ Seven properties follow directly from the design:
   flow SpineGKR KS → AuthGKR KS → STARK with both boundary MLEs
   as `ExtraColumn`s in the mixed multipoint close.
 
-**Ahead:**
+**Ahead (Phase 3 — recursive chain):**
 
-- `BlockProof` pipeline (IVC composition over per-`tx` proofs).
-- Recursive chain-of-proofs (`proof_{n+1}` verifies `proof_n`).
+- Stage G: `BlockProof` pipeline (deferred-opening accumulator over
+  N per-tx proofs, single FRI opening per block).
+- Stage H: Recursive chain-of-proofs with deferred-FRI strategy
+  (algebraic verification in-circuit, Merkle binding deferred to tip).
+- Stage K: Kill-Shot for in-circuit Poseidon2b, reduced inner queries,
+  parallel recursive prover.
 - Fee market and the final mempool conflict-resolution rules.
+
+See `ROADMAP2.md` Part II for the detailed plan and performance
+targets derived from measured data.
 
 ---
 

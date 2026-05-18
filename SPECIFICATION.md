@@ -942,6 +942,19 @@ Consequently a `BlockProof` certifies both:
   (b)  all tx proofs form one coherent global state evolution
 ```
 
+### 17.1 Recursive chain validity (overview)
+
+When the recursive chain is active (Stage H), each `BlockProof_{n+1}`
+additionally certifies the algebraic validity of `BlockProof_n`.
+The recursive circuit verifies the prior block's sumcheck, GKR, and
+composition claims in-circuit, while deferring FRI Merkle-path
+verification to a running hash commitment checked natively at the tip.
+
+A fresh node verifies the tip's recursive STARK proof plus one native
+FRI Merkle check to gain cryptographic certainty over the entire chain
+from genesis. Full specification of the recursive protocol will be
+added after implementation (see `ROADMAP2.md` Part II).
+
 ---
 
 ## 18. Conformance

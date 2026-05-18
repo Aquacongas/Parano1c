@@ -337,9 +337,12 @@ Both items are tracked in `ROADMAP2.md`.
 
 ## 6. Honest status line
 
-Fully delivered: the design is realistic. If the remaining stages
-(block-level IVC composition, recursive chain of proofs, fee market,
-mempool rules) are carried through, the resulting system is a
+Phase 1 is complete: a single transaction proof end-to-end, measured
+at ~725 ms prove, ~145 ms verify, ~55 KB proof (2in/4out). The
+per-tx proof stack (STARK + FRI-Binius + dual Kill-Shot GKR) is
+production-ready and benchmarked. If the remaining stages (block-level
+deferred-opening accumulator, recursive chain with deferred-FRI, fee
+market, mempool rules) are carried through, the resulting system is a
 plausible **more-proof-efficient backend** for the classical Bitcoin
 UTXO model. The interesting half is not the ledger shape — which is
 deliberately conservative — but the proof stack underneath it.
@@ -356,8 +359,8 @@ current revision. For the authoritative per-stage breakdown see
 |-----------------------------------------------|-----------------------------------------------------------|
 | 1.1 Transaction as state-transition proof     | Implemented (`noid_air`, `noid_stark`, `noid_tx`).        |
 | 1.2 Miners do not execute                     | Implemented (the engine has no VM by construction).       |
-| 1.3 Block = aggregated proof checkpoint       | IVC primitive ready (`noid_ivc::Accumulator`: `fold_step_prove` + `decide`); BlockProof pipeline pending (Stage G). |
-| 1.4 Recursive chain of proofs                 | Future deliverable (Stage J).                             |
+| 1.3 Block = aggregated proof checkpoint       | IVC primitive ready (`noid_ivc::Accumulator`: `fold_step_prove` + `decide`); BlockProof pipeline pending (Stage G: deferred-opening accumulator). |
+| 1.4 Recursive chain of proofs                 | Future deliverable (Stage H: deferred-FRI recursion).     |
 | 1.5 O(1) historical verification              | Follows from 1.4 once delivered.                          |
 | 1.6 Consensus / execution decoupled           | Implemented by architecture.                              |
 | 1.7 Proof-native ledger                       | Implemented (slot-based state in `noid_chain`).           |
@@ -372,10 +375,12 @@ current revision. For the authoritative per-stage breakdown see
 Items 1.1–1.2, 1.6–1.7, 1.12 are already reflected by the engine
 architecture (`noid_air`, `noid_stark`, `noid_tx`, `noid_chain` with
 slot-based state). Item 1.3 has its IVC primitive in place; the
-remaining integration into a `BlockProof` is Stage G. Items 1.4, 1.5,
-1.8–1.11, 1.13, 1.14 are future deliverables — Stage J for recursive
-chain plus out-of-scope consensus-layer work. This is a roadmap, not
-vapourware: every consequence is anchored in a concrete stage.
+remaining integration into a `BlockProof` is Stage G (deferred-opening
+accumulator). Items 1.4, 1.5, 1.8–1.11 are Stage H (deferred-FRI
+recursion) + Stage K (optimizations). Items 1.13, 1.14 are
+consensus-layer work (fee market, mempool policy). This is a roadmap,
+not vapourware: every consequence is anchored in a concrete stage with
+performance targets derived from measured Phase 1 data.
 
 ---
 

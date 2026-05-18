@@ -1,13 +1,14 @@
 # Paranoid Production API Specification
 
-Version: 1.0.0-phase1
-Last Updated: 2026-05-14
+Last Updated: 2026-05-18
 
 ## Overview
 
 This document specifies the production APIs consumed by wallets, full nodes,
 miners, and light clients on the Paranoid mainnet. All APIs operate over the
-Paranoid binary tower field GF(2^128) with Poseidon2b hash commitments.
+Paranoid binary tower field GF(2^128) with Poseidon2b hash commitments and
+FRI-Binius polynomial commitment scheme (interleaved packing, mixed-length
+multipoint close).
 
 ---
 
@@ -41,7 +42,7 @@ Constructs a `TxBody` from semantic user intent.
 |-------|------|-------------|
 | `inputs` | `[TxInput; 0..4]` | UTXOs to spend |
 | `outputs` | `[TxOutput; 0..8]` | New UTXOs to create |
-| `fee` | `u64` | Transaction fee (lamports) |
+| `fee` | `u128` | Transaction fee |
 | `prev_state_root` | `[u8; 32]` | Current chain state root |
 
 **Output:** `Transaction { body: TxBody, tx_body_hash: TxBodyHash }`
@@ -93,7 +94,10 @@ AuthTag = H_AUTH(spend_secret, tx_body_hash)
 **Output:** `auth_tag: AuthTag` (32 bytes)
 
 **Security:** The auth tag binds the spender's identity to this specific
-transaction body, preventing signature replay.
+transaction body, preventing proof replay. Without this binding, a valid
+proof for one tx_body could be re-attached to a different tx_body. There
+are no signatures in Paranoid — ownership is proven via zero-knowledge
+proof of the spend_secret preimage.
 
 ---
 
@@ -213,6 +217,9 @@ BlockHeader {
   nonce: u64,
   proof_transcript_hash: [u8; 32],
   witness_root: [u8; 32],
+  log_slots: u32,                    // consensus-significant (24..=32)
+  active_slot_count: u64,            // live UTXOs after this block
+  alloc_counter: u64,                // monotonic PRNG seed for allocator
 }
 ```
 
@@ -246,8 +253,9 @@ Returns current chain parameters.
 ChainInfo {
   height: u64,
   state_root: [u8; 32],
-  log_slots: u8,                    // 24..=32
+  log_slots: u32,                   // 24..=32
   active_slot_count: u64,
+  alloc_counter: u64,
   tip_block_hash: [u8; 32],
   tip_timestamp: u64,
 }
@@ -365,13 +373,14 @@ pub struct TxProof {
 7. Both boundary MLEs ride as `ExtraColumn`s in the STARK mixed-length multipoint close
 8. STARK prove: zero-check + FRI over the skinny AIR
 
-**Performance targets (Phase 1):**
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Total prove | < 300 ms | Client-side, single thread |
-| SpineGKR | <= 50 ms | 59 Poseidon2b perms |
-| AuthGKR | <= 60 ms | 20 Poseidon2b perms |
-| STARK | remainder | Balance + Range + State opening |
+**Measured performance (Phase 1, 2in/4out, single thread):**
+| Metric | Measured | Notes |
+|--------|----------|-------|
+| Total prove | ~725 ms | Client-side, single thread |
+| SpineGKR | ~45 ms | 59 Poseidon2b perms (Kill-Shot) |
+| AuthGKR | ~55 ms | 20 Poseidon2b perms (Kill-Shot) |
+| STARK + FRI-Binius | ~625 ms | Commit + zero-check + FRI |
+| Proof size | ~55 KB | FRI-Binius multipoint close |
 
 ---
 
@@ -489,29 +498,23 @@ StarkProof {
 
 ---
 
-### 3.5 STARK + GKR Bridge
+### 3.5 STARK + GKR Bridge (internal to `prove_tx`)
 
-#### `prove_air_with_spine`
+The production path (`prove_tx`) integrates both GKR sub-proofs into a
+single STARK transcript. The binding mechanism:
 
-STARK proof with SpineGKR boundary commitment integrated.
+1. Spine boundary MLE (2^15 cells) is FRI-committed; its root seeds the
+   spine GKR Fiat-Shamir channel.
+2. Auth boundary MLE (2^15 cells, zero-padded from 14 vars) is
+   FRI-committed; its root seeds the auth GKR channel.
+3. Both `(r_B, v_B)` reductions from Kill-Shot batch-eval are absorbed
+   into the STARK `extras_transcript` (spine first, auth second).
+4. Both boundary MLEs ride as `ExtraColumn`s in the STARK's FRI-Binius
+   mixed-length multipoint close.
 
-**Input:** `air, trace, pi, spine_inputs`
-**Output:** `StarkProofWithSpine { stark, spine, boundary_commitment }`
-
-The boundary commitment (FRI of the spine's unified MLE at log_len=15)
-seeds the GKR Poseidon2b channel, and the reduction (r_B, v_B) is
-absorbed into the STARK's extras-transcript, binding GKR to STARK.
-
----
-
-#### `prove_air_with_auth`
-
-STARK proof with AuthGKR boundary commitment integrated.
-
-**Input:** `air, trace, pi, auth_inputs`
-**Output:** `StarkProofWithAuth { stark, auth, boundary_commitment }`
-
-Same binding mechanism as spine bridge.
+There is no separate `prove_air_with_spine` / `prove_air_with_auth`
+entry point in production. The unified `prove_tx` orchestrator handles
+the full pipeline.
 
 ---
 
@@ -556,13 +559,13 @@ pub enum VerifyTxError {
 5. Rebuild `extras_transcript` (spine reduction + auth reduction)
 6. Verify STARK with extra columns (both boundary MLEs as ExtraColumns)
 
-**Performance targets (Phase 1):**
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Total verify | < 30 ms | Single thread |
-| SpineGKR verify | <= 2 ms | Replay sumcheck transcript |
-| AuthGKR verify | <= 25 ms | Replay sumcheck transcript |
-| STARK verify | remainder | FRI query verification |
+**Measured performance (Phase 1, single thread):**
+| Metric | Measured | Notes |
+|--------|----------|-------|
+| Total verify | ~145 ms | Single thread |
+| SpineGKR verify | ~2 ms | Replay sumcheck transcript |
+| AuthGKR verify | ~3 ms | Replay sumcheck transcript |
+| STARK + FRI verify | ~140 ms | FRI query verification dominates |
 
 ---
 
@@ -753,14 +756,15 @@ SyncRequest {
 ```
 SyncResponse {
   tip_header: BlockHeader,
-  block_proof: Accumulator,    // single recursive proof from genesis
+  block_proof: BlockProof,     // recursive proof covering genesis to tip
   state_root: [u8; 32],
 }
 ```
 
-**Verification:** Call `decide()` on the received `Accumulator`. One
-FRI verification proves the entire chain from genesis to tip. Proof
-size is independent of chain length.
+**Verification:** Verify the recursive STARK proof (~200 ms) plus one
+native FRI Merkle check for the tip block (~80 ms). Total ~280 ms
+proves the entire chain from genesis to tip. Proof size (~55 KB) is
+independent of chain length.
 
 ---
 
@@ -841,14 +845,20 @@ Verifies witness data matches the `witness_root` in block header.
 
 ### 8.1 Transaction Wire Format
 
+The network payload MUST NOT contain spend_secret. The prover-side
+struct includes it for proof generation, but the broadcast wire format
+carries only public data.
+
 ```
-TxInput (109 bytes):
+TxInput (network wire, 77 bytes):
   slot_index:    u32  (4 bytes, LE)
   value:         u64  (8 bytes, LE)
   owner:         [u8; 32]
-  spend_secret:  [u8; 32]
   auth_tag:      [u8; 32]
   valid:         u8   (1 byte, 0 or 1)
+
+  NOTE: spend_secret is NEVER transmitted. It exists only in the
+  prover-side TxInput struct for proof generation.
 
 TxOutput (45 bytes):
   slot_index:    u32  (4 bytes, LE)
@@ -874,15 +884,15 @@ Transaction:
 ### 8.2 PublicInputs Wire Format
 
 ```
-PublicInputs (variable, ~154 bytes):
+PublicInputs (fixed, 142 bytes):
   prev_state_root:    [u8; 32]
   new_state_root:     [u8; 32]
   tx_body_hash:       [u8; 32]
-  fee:                u64 (8 bytes, LE)
+  fee:                u128 (16 bytes, LE)
   n_live_inputs:      u8
   n_live_outputs:     u8
   coinbase_credit:    u64 (8 bytes, LE)
-  log_slots:          u8
+  log_slots:          u32 (4 bytes, LE)
   is_activation:      [u8; MAX_OUTPUTS]   (8 booleans)
   is_deactivation:    [u8; MAX_INPUTS]    (4 booleans)
 ```
@@ -890,7 +900,7 @@ PublicInputs (variable, ~154 bytes):
 ### 8.3 Block Header Wire Format
 
 ```
-BlockHeader (228 bytes):
+BlockHeader (248 bytes):
   prev_block_hash:        [u8; 32]
   state_root:             [u8; 32]
   tx_root:                [u8; 32]
@@ -899,6 +909,9 @@ BlockHeader (228 bytes):
   nonce:                  u64 (8 bytes, LE)
   proof_transcript_hash:  [u8; 32]
   witness_root:           [u8; 32]
+  log_slots:              u32 (4 bytes, LE)
+  active_slot_count:      u64 (8 bytes, LE)
+  alloc_counter:          u64 (8 bytes, LE)
 ```
 
 ### 8.4 Proof Wire Formats
@@ -924,17 +937,22 @@ AuthProofKillShot:
   sout_batch:       14 rounds x 3 x 16 bytes          =  672 B
   TOTAL: ~5.2 KB
 
-StarkProof (estimated for log_rows=13, 291 cols, 75 shifted, NUM_QUERIES=64):
-  column_roots:     291 x 32 bytes                    =  9.3 KB
-  base_openings:    291 x 16 bytes                    =  4.7 KB
-  zero_check:       13 rounds x 5 x 16 bytes          =  1.0 KB
-  shift_partials:   75 x 14 x 16 bytes                = 16.8 KB
-  multipoint:       15 rounds x 3 x 16 bytes (n_max=15) =  0.7 KB
-  mixed FRI (2 groups, 64 queries each, TAU=7):
-    group log_len=13 (291 base cols):        64*(27*32 + 12*16) + 2.5 KB =  69 KB
-    group log_len=15 (spine + auth padded):  64*(44*32 + 16*16) + 2.7 KB = 107 KB
-    column_openings (293 x 16) + group metadata                          =   8 KB
-  TOTAL: ~213 KB (estimated)
+StarkProof + FRI-Binius (measured for log_rows=13, 297 cols, NUM_QUERIES=64):
+  FRI-Binius uses interleaved commitments: all columns of the same
+  log_len share a single Merkle tree. This collapses per-column roots
+  into per-group roots, and query responses are packed interleaved
+  leaves rather than individual column openings.
+
+  Interleaved commitment roots:   2 x 32 bytes         =   64 B
+  Zero-check round polys:         13 rounds x ~144 B   =  1.9 KB
+  Multipoint round polys:         13 rounds x ~48 B    =  0.6 KB
+  FRI round commitments + polys:  6 rounds x ~100 B    =  0.6 KB
+  FRI query responses:            64 queries x ~700 B   = 44.8 KB
+  SpineGKR Kill-Shot:                                   =  5.5 KB
+  AuthGKR Kill-Shot:                                    =  5.2 KB
+  Metadata + misc:                                      =  ~2 KB
+  ─────────────────────────────────────────────────────────────
+  TOTAL (measured): ~55 KB
 ```
 
 ---
@@ -1077,7 +1095,7 @@ Wallet                          Node                           Miner
 |-------|-----------|------------|
 | Malicious prover | Forge proof for invalid tx | Soundness: STARK + GKR (Schwartz-Zippel over 2^128) |
 | Double-spender | Spend same UTXO twice | Slot-based state: input must be non-empty |
-| Replay attacker | Reuse old auth_tag | auth_tag binds to specific tx_body_hash |
+| Replay attacker | Reuse proof for different tx | auth_tag binds proof to specific tx_body_hash |
 | Address forger | Claim ownership without secret | H_ADDR is one-way (Poseidon2b preimage) |
 | Miner censor | Exclude valid transactions | PoW decentralization (no execution = fast blocks) |
 | State corruptor | Tamper with state between txs | FRI-committed state root in every block header |
