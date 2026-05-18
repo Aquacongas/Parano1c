@@ -88,7 +88,12 @@ mod tests {
 
     fn mk_rows(n: usize, seed: u128) -> Vec<Block128> {
         (0..n)
-            .map(|i| Block128::from(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(i as u128)))
+            .map(|i| {
+                Block128::from(
+                    seed.wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(i as u128),
+                )
+            })
             .collect()
     }
 
@@ -99,16 +104,18 @@ mod tests {
         let r = mk_rows(n, 0x1234);
         // b is a bit column (0 / 1).
         let b: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
         let out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
-        let air = CompositeAir::from_parts(
-            3,
-            4,
-            vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))],
-        );
+        let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b]);
         assert!(air.check(&trace));
     }
@@ -119,17 +126,19 @@ mod tests {
         let prev = mk_rows(n, 0xABCD);
         let r = mk_rows(n, 0x1234);
         let b: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
         let mut out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
         out[2] = out[2] + Block128::ONE;
-        let air = CompositeAir::from_parts(
-            3,
-            4,
-            vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))],
-        );
+        let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b]);
         assert!(!air.check(&trace));
     }
@@ -140,17 +149,19 @@ mod tests {
         let prev = mk_rows(n, 0xABCD);
         let mut r = mk_rows(n, 0x1234);
         let b: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
         let out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
         r[1] = r[1] + Block128::ONE;
-        let air = CompositeAir::from_parts(
-            3,
-            4,
-            vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))],
-        );
+        let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b]);
         assert!(!air.check(&trace));
     }
@@ -161,18 +172,20 @@ mod tests {
         let prev = mk_rows(n, 0xABCD);
         let r = mk_rows(n, 0x1234);
         let b: Vec<Block128> = (0..n)
-            .map(|i| if i & 1 == 0 { Block128::ZERO } else { Block128::ONE })
+            .map(|i| {
+                if i & 1 == 0 {
+                    Block128::ZERO
+                } else {
+                    Block128::ONE
+                }
+            })
             .collect();
         let out: Vec<Block128> = (0..n)
             .map(|i| prev[i] * (Block128::ONE + r[i] + b[i]))
             .collect();
         let mut b_bad = b.clone();
         b_bad[0] = b_bad[0] + Block128::ONE;
-        let air = CompositeAir::from_parts(
-            3,
-            4,
-            vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))],
-        );
+        let air = CompositeAir::from_parts(3, 4, vec![Box::new(EqLadderStepGate::new(0, 1, 2, 3))]);
         let trace = Trace::new(vec![out, prev, r, b_bad]);
         assert!(!air.check(&trace));
     }

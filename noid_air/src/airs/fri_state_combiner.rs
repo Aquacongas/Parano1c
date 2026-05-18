@@ -87,9 +87,7 @@ use crate::gates::{PublicColumn, SelectorGate, WeightedLinearGate, WeightedLinea
 use crate::{Air, Constraint, Trace};
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRISTATE};
-use noid_poseidon2b::native::permutation::{
-    MDS_FULL, N_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
-};
+use noid_poseidon2b::native::permutation::{MDS_FULL, N_ROUNDS, ROUND_CONSTANTS, STATE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Sponge shape
@@ -103,8 +101,7 @@ pub const FRI_STATE_COMBINER_N_ABSORB_BLOCKS: usize = 4;
 
 /// Poseidon2b permutations per side: four absorb rounds + one padded
 /// finalize.
-pub const FRI_STATE_COMBINER_N_PERMS_PER_SIDE: usize =
-    FRI_STATE_COMBINER_N_ABSORB_BLOCKS + 1;
+pub const FRI_STATE_COMBINER_N_PERMS_PER_SIDE: usize = FRI_STATE_COMBINER_N_ABSORB_BLOCKS + 1;
 
 /// Rows per permutation slot. Perms sit back-to-back at stride
 /// `N_ROUNDS + 1`. Each slot holds the `N_ROUNDS` transition rows plus
@@ -135,8 +132,7 @@ pub const COMBINER_PERM_BASE: usize = 0;
 pub const COMBINER_PRE_S_BASE: usize = POSEIDON_PERM_N_COLS;
 
 /// Total number of `pre_s` columns across the 5 perms (4 lanes each).
-pub const COMBINER_PRE_S_N_COLS: usize =
-    STATE_SIZE * FRI_STATE_COMBINER_N_PERMS_PER_SIDE;
+pub const COMBINER_PRE_S_N_COLS: usize = STATE_SIZE * FRI_STATE_COMBINER_N_PERMS_PER_SIDE;
 
 /// Indicator column hot on perm 0's row 0 (IV + block-0 absorb pin +
 /// perm 0 MDS binding).
@@ -303,9 +299,7 @@ pub fn combiner_pre_seeds(
 /// Build an honest witness trace for one side's sponge run. Produces
 /// the full `FRI_STATE_COMBINER_N_COLS`-wide trace with `pre_s` and
 /// indicator tails populated.
-pub fn build_combiner_side_trace(
-    preimage: &FriStateCombinerPreimage,
-) -> Vec<Vec<Block128>> {
+pub fn build_combiner_side_trace(preimage: &FriStateCombinerPreimage) -> Vec<Vec<Block128>> {
     let mut cols: Vec<Vec<Block128>> = (0..FRI_STATE_COMBINER_N_COLS)
         .map(|_| vec![Block128::ZERO; FRI_STATE_COMBINER_N_ROWS])
         .collect();
@@ -333,10 +327,7 @@ pub fn build_combiner_side_trace(
 
 /// Read the 32-byte digest from a side trace: state[0..2] at perm 4's
 /// output row, serialised little-endian lane-first.
-pub fn extract_combiner_digest(
-    cols: &[Vec<Block128>],
-    layout: PermLayout,
-) -> [u8; 32] {
+pub fn extract_combiner_digest(cols: &[Vec<Block128>], layout: PermLayout) -> [u8; 32] {
     use noid_core::CanonicalSerialize;
     let row = combiner_digest_row();
     let mut out = [0u8; 32];
@@ -347,10 +338,7 @@ pub fn extract_combiner_digest(
 
 /// Extract `(digest_hi, digest_lo)` as field elements — the form used
 /// for pinning to `expected_state_root`.
-pub fn extract_combiner_digest_fields(
-    cols: &[Vec<Block128>],
-    layout: PermLayout,
-) -> [Block128; 2] {
+pub fn extract_combiner_digest_fields(cols: &[Vec<Block128>], layout: PermLayout) -> [Block128; 2] {
     let row = combiner_digest_row();
     [cols[layout.s][row], cols[layout.s + 1][row]]
 }
@@ -397,9 +385,15 @@ fn combiner_rc_values(lane: usize) -> Vec<Block128> {
 fn emit_combiner_perm_publics(layout: PermLayout) -> Vec<PublicColumn> {
     let mut out = Vec::with_capacity(STATE_SIZE + 2);
     out.push(PublicColumn::new(layout.is_full, combiner_is_full_values()));
-    out.push(PublicColumn::new(layout.is_round, combiner_is_round_values()));
+    out.push(PublicColumn::new(
+        layout.is_round,
+        combiner_is_round_values(),
+    ));
     for lane in 0..STATE_SIZE {
-        out.push(PublicColumn::new(layout.rc + lane, combiner_rc_values(lane)));
+        out.push(PublicColumn::new(
+            layout.rc + lane,
+            combiner_rc_values(lane),
+        ));
     }
     out
 }
@@ -459,21 +453,31 @@ pub fn emit_fri_state_combiner(
     // (C) Perm 0 IV + block-0 absorb pin on pre_s_block_0@row 0.
     let pre_s_0 = combiner_pre_s_base(0);
     let block_0 = absorb[0];
-    for (lane, v) in [(0usize, block_0[0]), (1, block_0[1]), (2, iv_hi), (3, iv_lo)] {
+    for (lane, v) in [
+        (0usize, block_0[0]),
+        (1, block_0[1]),
+        (2, iv_hi),
+        (3, iv_lo),
+    ] {
         let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
             vec![(pre_s_0 + lane, Block128::ONE)],
             v,
         ));
-        constraints.push(Box::new(SelectorGate::new(COMBINER_IND_PERM_0_ROW_0, inner)));
+        constraints.push(Box::new(SelectorGate::new(
+            COMBINER_IND_PERM_0_ROW_0,
+            inner,
+        )));
     }
 
     // (D) Perm 0 MDS binding at row 0: `s[lane]@0 + Σ MDS · pre_s_0[j]@0 == 0`.
     for lane in 0..STATE_SIZE {
         let mut terms = vec![(COMBINER_PERM_LAYOUT.s + lane, Block128::ONE)];
         terms.extend(mds_full_row_terms(lane, pre_s_0));
-        let inner: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
-        constraints.push(Box::new(SelectorGate::new(COMBINER_IND_PERM_0_ROW_0, inner)));
+        let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(terms, Block128::ZERO));
+        constraints.push(Box::new(SelectorGate::new(
+            COMBINER_IND_PERM_0_ROW_0,
+            inner,
+        )));
     }
 
     // (E) Inter-perm absorb XOR + (F) Perm-i MDS binding for i ∈ 1..5.
@@ -492,7 +496,11 @@ pub fn emit_fri_state_combiner(
 
         // (E) absorb XOR
         for lane in 0..STATE_SIZE {
-            let constant = if lane < 2 { absorb_i[lane] } else { Block128::ZERO };
+            let constant = if lane < 2 {
+                absorb_i[lane]
+            } else {
+                Block128::ZERO
+            };
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![
                     (COMBINER_PERM_LAYOUT.s + lane, Block128::ONE),
@@ -631,12 +639,8 @@ mod tests {
             let pre = mk_preimage(seed);
             let cols = build_combiner_side_trace(&pre);
             let trace_digest = extract_combiner_digest(&cols, COMBINER_PERM_LAYOUT);
-            let expected = native_combine_roots(
-                pre.log_slots,
-                &pre.r_val,
-                &pre.r_owner_hi,
-                &pre.r_owner_lo,
-            );
+            let expected =
+                native_combine_roots(pre.log_slots, &pre.r_val, &pre.r_owner_hi, &pre.r_owner_lo);
             assert_eq!(trace_digest, expected, "seed {seed:#04x}");
         }
     }
@@ -706,8 +710,7 @@ mod tests {
         let expected = expected_fields_for(&pre);
         let air = FriStateCombinerAir::new(&pre, expected);
         let mut cols = build_combiner_side_trace(&pre);
-        cols[combiner_pre_s_base(0) + 2][0] =
-            cols[combiner_pre_s_base(0) + 2][0] + Block128::ONE;
+        cols[combiner_pre_s_base(0) + 2][0] = cols[combiner_pre_s_base(0) + 2][0] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -719,8 +722,7 @@ mod tests {
         let mut cols = build_combiner_side_trace(&pre);
         // Flip block-0 rate-lane-0 absorb (pre_s_0[0]@row 0). This
         // contradicts the public-input absorb pin.
-        cols[combiner_pre_s_base(0) + 0][0] =
-            cols[combiner_pre_s_base(0) + 0][0] + Block128::ONE;
+        cols[combiner_pre_s_base(0) + 0][0] = cols[combiner_pre_s_base(0) + 0][0] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -733,8 +735,7 @@ mod tests {
         // Flip a cell inside perm 2's S-box chain.
         use crate::airs::poseidon_perm::POSEIDON_COL_SOUT;
         let row = combiner_instance_row_offset(2) + 5;
-        cols[POSEIDON_COL_SOUT + 1][row] =
-            cols[POSEIDON_COL_SOUT + 1][row] + Block128::ONE;
+        cols[POSEIDON_COL_SOUT + 1][row] = cols[POSEIDON_COL_SOUT + 1][row] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 
@@ -778,8 +779,7 @@ mod tests {
         let air = FriStateCombinerAir::new(&pre, expected);
         let mut cols = build_combiner_side_trace(&pre);
         let row = combiner_pre_s_row(2);
-        cols[combiner_pre_s_base(2)][row] =
-            cols[combiner_pre_s_base(2)][row] + Block128::ONE;
+        cols[combiner_pre_s_base(2)][row] = cols[combiner_pre_s_base(2)][row] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 

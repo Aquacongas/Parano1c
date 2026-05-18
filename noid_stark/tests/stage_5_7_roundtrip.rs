@@ -14,14 +14,9 @@
 // commits to the victim's address, but nothing ties the two together.
 // The bridge ensures `auth.expected_address[i] == spine.input_leaves[i].owner`.
 
-use noid_air::{
-    composition::tx_validity_with_spine::fixture,
-    Air,
-};
+use noid_air::{composition::tx_validity_with_spine::fixture, Air};
 use noid_core::{Block128, TowerField};
-use noid_gkr::{
-    compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS,
-};
+use noid_gkr::{compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS};
 use noid_tx::PublicInputs;
 
 /// Lower the composite's boundary pins to the `SpineInputs` shape the
@@ -56,7 +51,12 @@ fn verify_tx_rejects_forged_address_via_bridge() {
     // Honest auth: secrets match fixture owners (mk_secret(0xA1), mk_secret(0xB2))
     let circuit = AuthCircuit::build();
     let n_live = pi.n_live_inputs as usize;
-    let honest_secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let honest_secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let mut spend_secret_honest = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
     for i in 0..n_live {
         spend_secret_honest[i] = honest_secrets[i];
@@ -85,7 +85,12 @@ fn verify_tx_rejects_forged_address_via_bridge() {
 
     // --- Attack: use attacker's secrets instead of victim's ---
     // Attacker secret differs from fixture's mk_secret(0xA1)
-    let attacker_secrets = [mk_secret(0xFF), mk_secret(0xEE), mk_secret(0xDD), mk_secret(0xCC)];
+    let attacker_secrets = [
+        mk_secret(0xFF),
+        mk_secret(0xEE),
+        mk_secret(0xDD),
+        mk_secret(0xCC),
+    ];
     let mut spend_secret_attack = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
     for i in 0..n_live {
         spend_secret_attack[i] = attacker_secrets[i];
@@ -118,15 +123,12 @@ fn verify_tx_rejects_forged_address_via_bridge() {
         spine_inputs: &spine_inputs,
         auth_inputs: &forged_auth,
     };
-    let forged_proof = prove_tx(&forged_witness)
-        .expect("forged prove_tx succeeds (prover is malicious)");
+    let forged_proof =
+        prove_tx(&forged_witness).expect("forged prove_tx succeeds (prover is malicious)");
 
     // verify_tx MUST reject: bridge detects address mismatch
     let result = verify_tx(comp.air(), &pi, &spine_inputs, &forged_auth, &forged_proof);
-    assert!(
-        result.is_err(),
-        "verify_tx must reject forged address"
-    );
+    assert!(result.is_err(), "verify_tx must reject forged address");
     match result.unwrap_err() {
         VerifyTxError::AuthSpineBridge => {}
         other => panic!(
@@ -149,7 +151,12 @@ fn verify_tx_rejects_mismatched_tx_body_hash_in_auth() {
 
     let circuit = AuthCircuit::build();
     let n_live = pi.n_live_inputs as usize;
-    let secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let mut spend_secret = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
     for i in 0..n_live {
         spend_secret[i] = secrets[i];

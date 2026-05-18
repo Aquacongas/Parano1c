@@ -26,7 +26,10 @@ pub struct MulGate {
 impl MulGate {
     /// New `MulGate` asserting `col[out] == col[a] · col[b]` on every row.
     pub fn new(out: usize, a: usize, b: usize) -> Self {
-        assert!(out != a && out != b && a != b, "MulGate: columns must be distinct");
+        assert!(
+            out != a && out != b && a != b,
+            "MulGate: columns must be distinct"
+        );
         Self { cols: [out, a, b] }
     }
 }
@@ -160,7 +163,12 @@ mod tests {
 
     fn mk_cols(n_rows: usize, seed: u128) -> Vec<Block128> {
         (0..n_rows)
-            .map(|i| Block128::from(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(i as u128)))
+            .map(|i| {
+                Block128::from(
+                    seed.wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(i as u128),
+                )
+            })
             .collect()
     }
 

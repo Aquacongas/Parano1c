@@ -75,13 +75,21 @@ pub fn evaluate_spine(circuit: &SpineCircuit, inputs: &SpineInputs) -> SpineWitn
         let state_in = build_state_in(slot, inputs, &slots);
         let mut state_out = state_in;
         perm.permute_mut(&mut state_out);
-        slots.push(SlotState { state_in, state_out });
+        slots.push(SlotState {
+            state_in,
+            state_out,
+        });
     }
 
-    let wrap = slots.last().expect("spine must have at least the wrap slot");
+    let wrap = slots
+        .last()
+        .expect("spine must have at least the wrap slot");
     let tx_body_hash = wrap.digest();
 
-    SpineWitness { slots, tx_body_hash }
+    SpineWitness {
+        slots,
+        tx_body_hash,
+    }
 }
 
 /// Build a slot's pre-MDS state from the layout + previous slots'

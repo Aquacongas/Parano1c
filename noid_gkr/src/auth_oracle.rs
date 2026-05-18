@@ -56,7 +56,10 @@ pub fn evaluate_auth(circuit: &AuthCircuit, inputs: &AuthInputs) -> AuthWitness 
         let state_in = build_state_in(slot, inputs, &slots);
         let mut state_out = state_in;
         perm.permute_mut(&mut state_out);
-        slots.push(AuthSlotState { state_in, state_out });
+        slots.push(AuthSlotState {
+            state_in,
+            state_out,
+        });
     }
 
     let mut derived_address = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
@@ -122,7 +125,10 @@ pub fn compute_auth_boundary(
     circuit: &AuthCircuit,
     spend_secret: [[Block128; 2]; N_AUTH_INPUTS],
     tx_body_hash: [Block128; 2],
-) -> ([[Block128; 2]; N_AUTH_INPUTS], [[Block128; 2]; N_AUTH_INPUTS]) {
+) -> (
+    [[Block128; 2]; N_AUTH_INPUTS],
+    [[Block128; 2]; N_AUTH_INPUTS],
+) {
     use crate::auth_circuit::AuthInputs;
     let probe = AuthInputs {
         spend_secret,
@@ -138,9 +144,7 @@ pub fn compute_auth_boundary(
 mod tests {
     use super::*;
     use noid_core::CanonicalSerialize;
-    use noid_poseidon2b::primitives::{
-        derive_address, hash_auth_tag, SpendSecret, TxBodyHash,
-    };
+    use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, SpendSecret, TxBodyHash};
 
     fn fields_to_digest(f: [Block128; 2]) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -230,8 +234,14 @@ mod tests {
         let expected_addr = derive_address(&zero_secret);
         let expected_tag = hash_auth_tag(&zero_secret, &zero_tbh);
         for i in 0..N_AUTH_INPUTS {
-            assert_eq!(fields_to_digest(w.derived_address[i]), expected_addr.into_bytes());
-            assert_eq!(fields_to_digest(w.derived_auth_tag[i]), expected_tag.into_bytes());
+            assert_eq!(
+                fields_to_digest(w.derived_address[i]),
+                expected_addr.into_bytes()
+            );
+            assert_eq!(
+                fields_to_digest(w.derived_auth_tag[i]),
+                expected_tag.into_bytes()
+            );
         }
     }
 }

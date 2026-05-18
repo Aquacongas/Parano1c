@@ -122,7 +122,10 @@ pub fn prove_single_d<F: TowerField, T: FiatShamir<F>>(
     let n = evals.len().trailing_zeros() as usize;
     assert_eq!(evals.len(), 1 << n, "evals length must be a power of 2");
     assert!(n > 0, "need at least 1 variable");
-    assert!(round_degree >= 1, "round polynomial must be at least linear");
+    assert!(
+        round_degree >= 1,
+        "round polynomial must be at least linear"
+    );
 
     let mut current = evals.to_vec();
     let mut polys = Vec::with_capacity(n);
@@ -192,7 +195,10 @@ pub fn prove_single_packed_d<T: FiatShamir<Block128>>(
     let n = evals.len().trailing_zeros() as usize;
     assert_eq!(evals.len(), 1 << n, "evals length must be a power of 2");
     assert!(n > 0, "need at least 1 variable");
-    assert!(round_degree >= 1, "round polynomial must be at least linear");
+    assert!(
+        round_degree >= 1,
+        "round polynomial must be at least linear"
+    );
 
     let mut current = evals.to_vec();
     let mut polys = Vec::with_capacity(n);

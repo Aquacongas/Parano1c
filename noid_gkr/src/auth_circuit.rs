@@ -308,10 +308,14 @@ mod tests {
         let c = AuthCircuit::build();
         for i in 0..N_AUTH_INPUTS {
             let addr_slot = &c.slots[AuthCircuit::haddr_output_slot(i)];
-            assert!(matches!(addr_slot.role, AuthSlotRole::HAddrPermB { input_idx } if input_idx as usize == i));
+            assert!(
+                matches!(addr_slot.role, AuthSlotRole::HAddrPermB { input_idx } if input_idx as usize == i)
+            );
 
             let auth_slot = &c.slots[AuthCircuit::hauth_output_slot(i)];
-            assert!(matches!(auth_slot.role, AuthSlotRole::HAuthPermC { input_idx } if input_idx as usize == i));
+            assert!(
+                matches!(auth_slot.role, AuthSlotRole::HAuthPermC { input_idx } if input_idx as usize == i)
+            );
         }
     }
 }

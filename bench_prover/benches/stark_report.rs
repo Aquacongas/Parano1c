@@ -17,19 +17,18 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::code::LOG_RATE;
 use noid_gkr::{
     build_auth_unified_from_inputs, build_boundary_mle, compute_auth_boundary,
-    compute_tx_body_hash, prove_auth_killshot, prove_spine_killshot,
-    reconstruct_slot_states, verify_auth_killshot, verify_spine_killshot, AuthCircuit,
-    AuthInputs, AuthProofKillShot, SpineCircuit, SpineInputs, SpineProofKillShot,
-    N_AUTH_INPUTS, N_AUTH_UNIFIED_VARS, N_BOUNDARY_VARS,
+    compute_tx_body_hash, prove_auth_killshot, prove_spine_killshot, reconstruct_slot_states,
+    verify_auth_killshot, verify_spine_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
+    SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_INPUTS, N_AUTH_UNIFIED_VARS,
+    N_BOUNDARY_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_stark::{
-    pad_column, padded_log_len, prove_air_timed, verify_air_timed,
-    ProveTimings, VerifyTimings,
-};
 use noid_stark::interleaved::{prove_air_interleaved, verify_air_interleaved};
-use noid_tx::PublicInputs;
 use noid_stark::prove_tx::{prove_tx, verify_tx, TxWitness};
+use noid_stark::{
+    pad_column, padded_log_len, prove_air_timed, verify_air_timed, ProveTimings, VerifyTimings,
+};
+use noid_tx::PublicInputs;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -115,7 +114,12 @@ fn auth_inputs_from_composite(
     let circuit = AuthCircuit::build();
     let pi = comp.public_inputs();
     let n_live = pi.n_live_inputs as usize;
-    let all_secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let all_secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let mut spend_secret = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
     for i in 0..n_live {
         spend_secret[i] = all_secrets[i];
@@ -204,8 +208,7 @@ fn bench_production() -> ProdRow {
     let stark_proof_bytes = proof_bytes - spine_proof_bytes - auth_proof_bytes;
 
     let verify = time(|| {
-        verify_tx(air, &pi, &spine_inputs, &auth_inputs, &tx_proof)
-            .expect("verify_tx");
+        verify_tx(air, &pi, &spine_inputs, &auth_inputs, &tx_proof).expect("verify_tx");
     });
 
     // -----------------------------------------------------------------------
@@ -225,8 +228,14 @@ fn bench_production() -> ProdRow {
 
     let spine_verify = time(|| {
         let mut ch_v = Poseidon2bChannel::new();
-        let _ = verify_spine_killshot(&spine_proof, &spine_circuit, &spine_inputs, claimed, &mut ch_v)
-            .expect("spine kill-shot verify");
+        let _ = verify_spine_killshot(
+            &spine_proof,
+            &spine_circuit,
+            &spine_inputs,
+            claimed,
+            &mut ch_v,
+        )
+        .expect("spine kill-shot verify");
     });
 
     // -----------------------------------------------------------------------
@@ -244,8 +253,13 @@ fn bench_production() -> ProdRow {
 
     let auth_verify = time(|| {
         let mut ch_v = Poseidon2bChannel::new();
-        let _ = verify_auth_killshot(&auth_proof_standalone, &auth_circuit, &auth_inputs, &mut ch_v)
-            .expect("auth kill-shot verify");
+        let _ = verify_auth_killshot(
+            &auth_proof_standalone,
+            &auth_circuit,
+            &auth_inputs,
+            &mut ch_v,
+        )
+        .expect("auth kill-shot verify");
     });
 
     // -----------------------------------------------------------------------
@@ -275,8 +289,11 @@ fn bench_production() -> ProdRow {
     }
 
     let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
-    let (pre_commitment, pre_state) =
-        noid_fri_binius::interleaved_commit(&col_refs, &ntt, &noid_fri::hasher::Blake3Hasher::new());
+    let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(
+        &col_refs,
+        &ntt,
+        &noid_fri::hasher::Blake3Hasher::new(),
+    );
 
     let spine_r_low: Vec<Block128> = (0..log_len)
         .map(|b| Block128::from(((b * 7 + 3) % 128) as u128))
@@ -316,14 +333,24 @@ fn bench_production() -> ProdRow {
 
     let stark_prove = time(|| {
         let _ = prove_air_interleaved(
-            air, &all_columns, &pi, &extras_transcript, &slice_claims, log_len,
+            air,
+            &all_columns,
+            &pi,
+            &extras_transcript,
+            &slice_claims,
+            log_len,
             None,
         );
     });
 
     let stark_proof = {
         prove_air_interleaved(
-            air, &all_columns, &pi, &extras_transcript, &slice_claims, log_len,
+            air,
+            &all_columns,
+            &pi,
+            &extras_transcript,
+            &slice_claims,
+            log_len,
             Some((pre_commitment, pre_state)),
         )
     };
@@ -335,10 +362,15 @@ fn bench_production() -> ProdRow {
 
     // Bucket breakdown (approximation via 291-col timed path)
     let stark_prove_buckets = collect_prove_buckets(air, &trace, &pi, SAMPLES);
-    let stark_verify_buckets = collect_verify_buckets(air, &pi, &{
-        let _ = prove_air_timed(air, &trace, &pi).unwrap();
-        prove_air_timed(air, &trace, &pi).unwrap().0
-    }, SAMPLES);
+    let stark_verify_buckets = collect_verify_buckets(
+        air,
+        &pi,
+        &{
+            let _ = prove_air_timed(air, &trace, &pi).unwrap();
+            prove_air_timed(air, &trace, &pi).unwrap().0
+        },
+        SAMPLES,
+    );
 
     let n_shifted = air.shifted_column_indices().len();
 
@@ -408,14 +440,21 @@ fn print_prod_row(r: &ProdRow) {
         "  | trace: log_rows={:>3}  columns={:>4}  shifted={:>2}                              |",
         r.log_rows, r.n_cols, r.n_shifted,
     );
-    println!(
-        "  | fixture: 2 live inputs, 4 live outputs, fee=50, balance=150                   |",
-    );
+    println!("  | fixture: 2 live inputs, 4 live outputs, fee=50, balance=150                   |",);
     println!("  +------------------------------------------------------------------------------+");
     println!();
-    println!("    TOTAL prove      {}    (end-to-end prove_tx)", fmt_ms(r.prove));
-    println!("    TOTAL verify     {}    (end-to-end verify_tx)", fmt_ms(r.verify));
-    println!("    TOTAL proof      {}    (wire size)", fmt_bytes(r.proof_bytes));
+    println!(
+        "    TOTAL prove      {}    (end-to-end prove_tx)",
+        fmt_ms(r.prove)
+    );
+    println!(
+        "    TOTAL verify     {}    (end-to-end verify_tx)",
+        fmt_ms(r.verify)
+    );
+    println!(
+        "    TOTAL proof      {}    (wire size)",
+        fmt_bytes(r.proof_bytes)
+    );
     println!();
     println!("    Targets:  prove < 500 ms  |  verify < 50 ms  |  proof < 60 KB");
     println!();
@@ -526,7 +565,9 @@ fn print_prod_row(r: &ProdRow) {
     println!("  [2] SpineGKR Kill-Shot — tx-body Merkle spine via GKR");
     println!("      Circuit: 59 Poseidon2b permutations (66 rounds each)");
     println!("      Hypercube: dim=15, cells=32768, layout=[elem:2|round:7|slot:6]");
-    println!("      Proves: tx_body_hash = Poseidon2b-Merkle(input_leaves, output_leaves, fee, ...)");
+    println!(
+        "      Proves: tx_body_hash = Poseidon2b-Merkle(input_leaves, output_leaves, fee, ...)"
+    );
     println!("      Protocol: unified sumcheck -> shift gadget -> 3x batch_eval reductions");
     println!();
     println!(
@@ -548,7 +589,11 @@ fn print_prod_row(r: &ProdRow) {
 
     // --- AuthGKR Kill-Shot ---
     println!("  [3] AuthGKR Kill-Shot — spend authorization via GKR");
-    println!("      Circuit: {} inputs x 5 perms = {} Poseidon2b permutations (66 rounds each)", N_AUTH_INPUTS, N_AUTH_INPUTS * 5);
+    println!(
+        "      Circuit: {} inputs x 5 perms = {} Poseidon2b permutations (66 rounds each)",
+        N_AUTH_INPUTS,
+        N_AUTH_INPUTS * 5
+    );
     println!("      Hypercube: dim=14, cells=16384, layout=[elem:2|round:7|slot:5]");
     println!("      Per input: H_ADDR(secret)->address, H_AUTH(secret,tx_body_hash)->auth_tag");
     println!("      Protocol: unified sumcheck -> shift gadget -> 3x batch_eval reductions");

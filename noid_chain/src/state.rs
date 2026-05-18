@@ -380,7 +380,11 @@ mod tests {
         assert_eq!(state.active_slot_count, 1);
 
         let prev = state.state_root();
-        apply_tx(&mut state, &body_with(prev, 0, vec![mk_input_for(7, &a)], vec![])).unwrap();
+        apply_tx(
+            &mut state,
+            &body_with(prev, 0, vec![mk_input_for(7, &a)], vec![]),
+        )
+        .unwrap();
         assert_eq!(state.active_slot_count, 0);
         assert_eq!(state.free_slots.len(), 1);
 
@@ -398,7 +402,11 @@ mod tests {
         let mut state = fresh();
         let prev = state.state_root();
         // First mint lands at slot 1.
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![mk_output_at(1, 1)])).unwrap();
+        apply_tx(
+            &mut state,
+            &body_with(prev, 0, vec![], vec![mk_output_at(1, 1)]),
+        )
+        .unwrap();
 
         // Second mint targeting the same slot must reject.
         let prev = state.state_root();

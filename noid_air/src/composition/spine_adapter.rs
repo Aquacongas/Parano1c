@@ -33,12 +33,10 @@
 //! out of sync silently.
 
 use crate::airs::tx_body_merkle::{
-    build_instance_layout, leaf_rate_payload_col, InstanceRole, N_ROUNDS,
-    TXBODY_MERKLE_LAYOUT,
+    build_instance_layout, leaf_rate_payload_col, InstanceRole, N_ROUNDS, TXBODY_MERKLE_LAYOUT,
 };
 use crate::airs::tx_body_spine::{
-    spine_n_cols, txv_live_mask_col, SPINE_LOG_ROWS, TX_BODY_MERKLE_COL_OFFSET,
-    TXV_COL_OFFSET,
+    spine_n_cols, txv_live_mask_col, SPINE_LOG_ROWS, TXV_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET,
 };
 use crate::airs::tx_validity::TxValidityCol;
 use crate::composition::registry::Cell;
@@ -163,7 +161,10 @@ impl SpineEmbeddingLayout {
     /// Used as the **T2a high-lane bridge dst** in PR B, replacing the
     /// 5.5-era `pinned_row_programme(auth_tag_hi)` `PublicColumn`.
     pub fn auth_tag_hi_outer_cell(&self, input: usize) -> Cell {
-        assert!(input < MAX_INPUTS, "input {input} out of range [0, {MAX_INPUTS})");
+        assert!(
+            input < MAX_INPUTS,
+            "input {input} out of range [0, {MAX_INPUTS})"
+        );
         Cell::new(
             self.txv_block_outer_offset() + TxValidityCol::AuthTagHi.index(),
             input,
@@ -172,7 +173,10 @@ impl SpineEmbeddingLayout {
 
     /// Outer cell carrying `TxValidityCol::AuthTagLo[row = input]`.
     pub fn auth_tag_lo_outer_cell(&self, input: usize) -> Cell {
-        assert!(input < MAX_INPUTS, "input {input} out of range [0, {MAX_INPUTS})");
+        assert!(
+            input < MAX_INPUTS,
+            "input {input} out of range [0, {MAX_INPUTS})"
+        );
         Cell::new(
             self.txv_block_outer_offset() + TxValidityCol::AuthTagLo.index(),
             input,
@@ -265,11 +269,9 @@ fn merkle_wrap_output_row() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::airs::tx_body_spine::{
-        SPINE_LOG_ROWS, TX_BODY_MERKLE_COL_OFFSET, TXV_COL_OFFSET,
-    };
-    use crate::airs::tx_validity::TX_VALIDITY_3B4_PINNED_N_COLS;
     use crate::airs::tx_body_spine::merkle_band_width;
+    use crate::airs::tx_body_spine::{SPINE_LOG_ROWS, TXV_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET};
+    use crate::airs::tx_validity::TX_VALIDITY_3B4_PINNED_N_COLS;
 
     fn mk(base: usize) -> SpineEmbeddingLayout {
         SpineEmbeddingLayout::new(base, base + spine_n_cols(), SPINE_LOG_ROWS)
@@ -278,15 +280,13 @@ mod tests {
 
     #[test]
     fn new_rejects_outer_too_narrow() {
-        let err = SpineEmbeddingLayout::new(0, spine_n_cols() - 1, SPINE_LOG_ROWS)
-            .unwrap_err();
+        let err = SpineEmbeddingLayout::new(0, spine_n_cols() - 1, SPINE_LOG_ROWS).unwrap_err();
         assert!(matches!(err, SpineLayoutError::OuterTooNarrow { .. }));
     }
 
     #[test]
     fn new_rejects_outer_too_short() {
-        let err =
-            SpineEmbeddingLayout::new(0, spine_n_cols(), SPINE_LOG_ROWS - 1).unwrap_err();
+        let err = SpineEmbeddingLayout::new(0, spine_n_cols(), SPINE_LOG_ROWS - 1).unwrap_err();
         assert!(matches!(err, SpineLayoutError::OuterTooShort { .. }));
     }
 
@@ -382,7 +382,10 @@ mod tests {
         // absorb row.
         for output in 0..MAX_OUTPUTS {
             let leaf_row = layout.output_leaf_a_outer_cell(output, 0).row;
-            assert_ne!(hi.row, leaf_row, "wrap-output row collides with output {output} leaf-A row");
+            assert_ne!(
+                hi.row, leaf_row,
+                "wrap-output row collides with output {output} leaf-A row"
+            );
         }
     }
 
@@ -392,8 +395,14 @@ mod tests {
         let b = mk(13);
         assert_eq!(a, b);
         for input in 0..MAX_INPUTS {
-            assert_eq!(a.auth_tag_hi_outer_cell(input), b.auth_tag_hi_outer_cell(input));
-            assert_eq!(a.auth_tag_lo_outer_cell(input), b.auth_tag_lo_outer_cell(input));
+            assert_eq!(
+                a.auth_tag_hi_outer_cell(input),
+                b.auth_tag_hi_outer_cell(input)
+            );
+            assert_eq!(
+                a.auth_tag_lo_outer_cell(input),
+                b.auth_tag_lo_outer_cell(input)
+            );
         }
         for output in 0..MAX_OUTPUTS {
             for lane in 0..2 {
@@ -404,7 +413,10 @@ mod tests {
             }
         }
         for lane in 0..2 {
-            assert_eq!(a.wrap_output_outer_cell(lane), b.wrap_output_outer_cell(lane));
+            assert_eq!(
+                a.wrap_output_outer_cell(lane),
+                b.wrap_output_outer_cell(lane)
+            );
         }
     }
 
@@ -415,9 +427,6 @@ mod tests {
         // TxBodyMerkle (cols starting at TX_VALIDITY_3B4_PINNED_N_COLS),
         // plus a single TxvLiveMask column past the Merkle block.
         let merkle_n = merkle_band_width();
-        assert_eq!(
-            spine_n_cols(),
-            TX_VALIDITY_3B4_PINNED_N_COLS + merkle_n + 1
-        );
+        assert_eq!(spine_n_cols(), TX_VALIDITY_3B4_PINNED_N_COLS + merkle_n + 1);
     }
 }

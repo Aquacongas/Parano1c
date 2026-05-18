@@ -43,12 +43,10 @@ use crate::airs::fri_state_combiner_composite::{
     FriStateCombinerComposite, COMBINER_COMPOSITE_LOG_ROWS, COMBINER_COMPOSITE_N_COLS,
 };
 use crate::airs::fri_state_open::{
-    FriStateOpenAir, FriStateOpenWitness, FRI_STATE_OPEN_LOG_ROWS,
-    FRI_STATE_OPEN_N_ROWS, FRI_STATE_OPEN_OUTPUT_LAYOUT, FRI_STATE_OPEN_WITNESS_COLS,
+    FriStateOpenAir, FriStateOpenWitness, FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_N_ROWS,
+    FRI_STATE_OPEN_OUTPUT_LAYOUT, FRI_STATE_OPEN_WITNESS_COLS,
 };
-use crate::composition::row_window::{
-    InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy,
-};
+use crate::composition::row_window::{InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy};
 use crate::gates::const_column::PublicColumn;
 use crate::{Air, CompositeAir, Constraint, Trace};
 use noid_core::{Block128, TowerField};
@@ -231,8 +229,9 @@ impl TxValidityCompositeSkeleton {
     /// sub-trace into its assigned column block.
     pub fn build_trace(&self) -> Trace {
         let outer_n_rows = 1usize << TX_VALIDITY_SKELETON_LOG_ROWS;
-        let mut cols: Vec<Vec<Block128>> =
-            (0..TX_VALIDITY_SKELETON_N_COLS).map(|_| vec![Block128::ZERO; outer_n_rows]).collect();
+        let mut cols: Vec<Vec<Block128>> = (0..TX_VALIDITY_SKELETON_N_COLS)
+            .map(|_| vec![Block128::ZERO; outer_n_rows])
+            .collect();
 
         // --- Combiner side -------------------------------------------------
         // Combiner inner trace has `1 << COMBINER_COMPOSITE_LOG_ROWS`
@@ -256,8 +255,7 @@ impl TxValidityCompositeSkeleton {
         // [0, FRI_STATE_OPEN_N_ROWS) in the outer trace. Outer rows beyond
         // the window stay at ZERO for Open-owned columns; the Open AIR's
         // constraints are silenced on those rows by the window selector.
-        let inner_cols =
-            build_open_inner_cols(&self.open_witness, &self.open_public_columns);
+        let inner_cols = build_open_inner_cols(&self.open_witness, &self.open_public_columns);
         assert_eq!(inner_cols.len(), FRI_STATE_OPEN_WITNESS_COLS);
         for (i, src) in inner_cols.into_iter().enumerate() {
             assert_eq!(src.len(), FRI_STATE_OPEN_N_ROWS);
@@ -347,7 +345,10 @@ pub(crate) fn emit_output_open_wiring(
     out_open_air: FriStateOpenAir,
     outer_n_cols: usize,
     outer_log_rows: usize,
-) -> (crate::composition::row_window::RowWindowWiring, Vec<PublicColumn>) {
+) -> (
+    crate::composition::row_window::RowWindowWiring,
+    Vec<PublicColumn>,
+) {
     let out_layout = out_open_air.layout();
     assert_eq!(out_layout, FRI_STATE_OPEN_OUTPUT_LAYOUT);
     let (out_open_n_cols, out_open_constraints, out_open_publics) = out_open_air.into_parts();
@@ -381,8 +382,7 @@ pub(crate) fn write_output_open_trace(
     witness: &FriStateOpenWitness,
     publics: &[PublicColumn],
 ) {
-    let inner =
-        build_open_inner_cols_sized(witness, publics, SKEL_OUT_OPEN_WITNESS_COLS);
+    let inner = build_open_inner_cols_sized(witness, publics, SKEL_OUT_OPEN_WITNESS_COLS);
     let out_n_rows = witness.layout.n_rows();
     for (i, src) in inner.into_iter().enumerate() {
         assert_eq!(src.len(), out_n_rows);
@@ -428,9 +428,10 @@ pub fn build_output_side_from_source(
 ) -> (FriStateOpenAir, FriStateOpenWitness) {
     match source {
         OutputSideSource::Empty => build_empty_output_side(),
-        OutputSideSource::FromBody { outputs, prev_lane_openings } => {
-            build_output_side_from_body(outputs, eval_point, gamma, *prev_lane_openings)
-        }
+        OutputSideSource::FromBody {
+            outputs,
+            prev_lane_openings,
+        } => build_output_side_from_body(outputs, eval_point, gamma, *prev_lane_openings),
     }
 }
 
@@ -484,7 +485,11 @@ pub(crate) fn emit_out_open_slot_index_publics(
                     .get(j)
                     .copied()
                     .unwrap_or_else(noid_tx::TxOutput::dummy);
-                if out.valid { out.slot_index } else { 0 }
+                if out.valid {
+                    out.slot_index
+                } else {
+                    0
+                }
             })
             .collect(),
     };
@@ -508,12 +513,10 @@ pub(crate) fn emit_out_open_slot_index_publics(
 /// update identity holds trivially (prev + new == 0 in char 2). Later
 /// substages replace this with a `TxBody.outputs`-derived witness plus
 /// a slot-index bridge to `TxValidityCol::SlotIndex[MAX_INPUTS..]`.
-pub fn build_empty_output_side()
--> (FriStateOpenAir, FriStateOpenWitness) {
+pub fn build_empty_output_side() -> (FriStateOpenAir, FriStateOpenWitness) {
     use crate::airs::fri_state_open::FriStateOpenClaim;
     let layout = FRI_STATE_OPEN_OUTPUT_LAYOUT;
-    let claims: Vec<FriStateOpenClaim> =
-        vec![FriStateOpenClaim::EMPTY; layout.n_inputs];
+    let claims: Vec<FriStateOpenClaim> = vec![FriStateOpenClaim::EMPTY; layout.n_inputs];
     let eval_point = [Block128::ZERO; crate::airs::fri_state_open::FRI_STATE_OPEN_LOG_SLOTS];
     let gamma = Block128::ZERO;
     let prev_lane_openings = [Block128::ZERO; 3];
@@ -584,10 +587,12 @@ pub fn build_output_side_from_body(
     use crate::airs::fri_state_open::FriStateOpenClaim;
     use noid_poseidon2b::primitives::Address;
     let layout = FRI_STATE_OPEN_OUTPUT_LAYOUT;
-    let mut claims: Vec<FriStateOpenClaim> =
-        vec![FriStateOpenClaim::EMPTY; layout.n_inputs];
+    let mut claims: Vec<FriStateOpenClaim> = vec![FriStateOpenClaim::EMPTY; layout.n_inputs];
     for (j, slot) in claims.iter_mut().enumerate() {
-        let out = outputs.get(j).copied().unwrap_or_else(noid_tx::TxOutput::dummy);
+        let out = outputs
+            .get(j)
+            .copied()
+            .unwrap_or_else(noid_tx::TxOutput::dummy);
         if !out.valid {
             continue;
         }
@@ -700,12 +705,8 @@ mod tests {
             &new_trace,
             crate::airs::fri_state_combiner::COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             mk_spend_claim(11, 0),
@@ -745,7 +746,10 @@ mod tests {
     #[test]
     fn layout_constants_agree() {
         assert_eq!(SKEL_COMBINER_COL_OFFSET, 0);
-        assert_eq!(SKEL_COMBINER_WINDOW_INDICATOR_COL, COMBINER_COMPOSITE_N_COLS);
+        assert_eq!(
+            SKEL_COMBINER_WINDOW_INDICATOR_COL,
+            COMBINER_COMPOSITE_N_COLS
+        );
         assert_eq!(SKEL_OPEN_COL_OFFSET, COMBINER_COMPOSITE_N_COLS + 1);
         assert_eq!(
             SKEL_OUT_OPEN_COL_OFFSET,
@@ -830,12 +834,8 @@ mod tests {
         ];
         let gamma = Block128::from(0xABCD_1234_5678_9ABCu128);
         let prev_lane_openings = [Block128::ZERO; 3];
-        let (out_air, out_witness) = build_output_side_from_body(
-            &outputs,
-            eval_point,
-            gamma,
-            prev_lane_openings,
-        );
+        let (out_air, out_witness) =
+            build_output_side_from_body(&outputs, eval_point, gamma, prev_lane_openings);
 
         // Re-use the skeleton builder but swap the output-side pair.
         let prev_preimage = mk_combiner_preimage(0x5A);
@@ -848,12 +848,8 @@ mod tests {
             &crate::airs::fri_state_combiner::build_combiner_side_trace(&new_preimage),
             crate::airs::fri_state_combiner::COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             mk_spend_claim(11, 0),
             mk_spend_claim(22, 3),

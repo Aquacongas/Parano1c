@@ -15,16 +15,13 @@ use crate::airs::fri_state_combiner_composite::{
     FriStateCombinerComposite, COMBINER_COMPOSITE_LOG_ROWS, COMBINER_COMPOSITE_N_COLS,
 };
 use crate::airs::fri_state_open::{
-    FriStateOpenAir, FriStateOpenLayout, FriStateOpenWitness,
-    FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_N_ROWS,
-    FRI_STATE_OPEN_OUTPUT_LAYOUT, FRI_STATE_OPEN_WITNESS_COLS,
+    FriStateOpenAir, FriStateOpenLayout, FriStateOpenWitness, FRI_STATE_OPEN_LOG_ROWS,
+    FRI_STATE_OPEN_N_ROWS, FRI_STATE_OPEN_OUTPUT_LAYOUT, FRI_STATE_OPEN_WITNESS_COLS,
 };
-use crate::composition::row_window::{
-    InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy,
-};
+use crate::composition::row_window::{InnerAirView, RowWindowParams, RowWindowWrapper, WrapPolicy};
 use crate::composition::tx_validity_composite::{
     OutputSideSource, SKEL_COMBINER_COL_OFFSET, SKEL_OPEN_COL_OFFSET,
-    TX_VALIDITY_SKELETON_N_COLS, SKEL_OPEN_WINDOW_INDICATOR_COL,
+    SKEL_OPEN_WINDOW_INDICATOR_COL, TX_VALIDITY_SKELETON_N_COLS,
 };
 use crate::gates::const_column::PublicColumn;
 use crate::{Air, CompositeAir, Constraint, Trace};
@@ -316,8 +313,14 @@ impl TxValidityCompositeLeaf {
             // `open_witness` → `claims`. We stash those claims on the
             // witness; read them back here.
             for (row, claim) in open_witness.claims.iter().enumerate() {
-                if row >= in_layout.n_inputs { break; }
-                p[row] = if claim.is_spend { Block128::ONE } else { Block128::ZERO };
+                if row >= in_layout.n_inputs {
+                    break;
+                }
+                p[row] = if claim.is_spend {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                };
             }
             p
         };
@@ -327,13 +330,22 @@ impl TxValidityCompositeLeaf {
             // opener's `is_mint` flags — one-to-one with `options.output_side`.
             if let OutputSideSource::FromBody { outputs, .. } = &options.output_side {
                 for (j, out) in outputs.iter().enumerate() {
-                    if j >= out_layout.n_inputs { break; }
-                    p[j] = if out.valid { Block128::ONE } else { Block128::ZERO };
+                    if j >= out_layout.n_inputs {
+                        break;
+                    }
+                    p[j] = if out.valid {
+                        Block128::ONE
+                    } else {
+                        Block128::ZERO
+                    };
                 }
             }
             p
         };
-        public_columns.push(PublicColumn::new(SKEL_IS_DEACTIVATION_COL, is_deact_programme));
+        public_columns.push(PublicColumn::new(
+            SKEL_IS_DEACTIVATION_COL,
+            is_deact_programme,
+        ));
         public_columns.push(PublicColumn::new(SKEL_IS_ACTIVATION_COL, is_act_programme));
 
         // Binding: for every opener row, the public column equals the
@@ -359,13 +371,11 @@ impl TxValidityCompositeLeaf {
             ));
             constraints.push(Box::new(SelectorGate::new(row_ind, inner)));
         }
-        let out_is_mint_col =
-            crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET
-                + out_layout.col_is_mint();
+        let out_is_mint_col = crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET
+            + out_layout.col_is_mint();
         for j in 0..out_layout.n_inputs {
-            let row_ind =
-                crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET
-                    + out_layout.col_row_indicator(j);
+            let row_ind = crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET
+                + out_layout.col_row_indicator(j);
             let inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new(
                 vec![
                     (SKEL_IS_ACTIVATION_COL, Block128::ONE),
@@ -392,7 +402,11 @@ impl TxValidityCompositeLeaf {
         // input `i` of a coinbase tx activates a live-spend row, makes
         // `row_indicator_i = 1` (single-hot) and `is_coinbase = 1`, so
         // the product is `1 · 1 · 1 = 1` ≠ 0 → reject.
-        let is_coinbase_val = if options.is_coinbase { Block128::ONE } else { Block128::ZERO };
+        let is_coinbase_val = if options.is_coinbase {
+            Block128::ONE
+        } else {
+            Block128::ZERO
+        };
         public_columns.push(PublicColumn::new(
             SKEL_IS_COINBASE_COL,
             vec![is_coinbase_val; outer_n_rows],
@@ -407,8 +421,12 @@ impl TxValidityCompositeLeaf {
             cols: [usize; 2],
         }
         impl Constraint for CoinbaseNoSpendGate {
-            fn degree(&self) -> usize { 2 }
-            fn columns(&self) -> &[usize] { &self.cols }
+            fn degree(&self) -> usize {
+                2
+            }
+            fn columns(&self) -> &[usize] {
+                &self.cols
+            }
             fn evaluate(&self, frame: crate::EvalFrame) -> Block128 {
                 frame.local[0] * frame.local[1]
             }
@@ -580,7 +598,6 @@ pub fn write_leaf_block_traces(
         output_side_eval_point,
         output_side_gamma,
     );
-
 }
 
 // ---------------------------------------------------------------------------
@@ -676,19 +693,11 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
-        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_addr(11),
-            mk_addr(22),
-            mk_addr(33),
-            mk_addr(44),
-        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44)];
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
@@ -722,8 +731,14 @@ mod tests {
     fn layout_constants_agree() {
         // OP-1.φ.1b: E.3.b new-state opener bands removed. E.4's
         // booleans follow the combiner window indicator directly.
-        assert_eq!(SKEL_COMBINER_WINDOW_INDICATOR_COL, TX_VALIDITY_SKELETON_N_COLS);
-        assert_eq!(SKEL_IS_DEACTIVATION_COL, SKEL_COMBINER_WINDOW_INDICATOR_COL + 1);
+        assert_eq!(
+            SKEL_COMBINER_WINDOW_INDICATOR_COL,
+            TX_VALIDITY_SKELETON_N_COLS
+        );
+        assert_eq!(
+            SKEL_IS_DEACTIVATION_COL,
+            SKEL_COMBINER_WINDOW_INDICATOR_COL + 1
+        );
         assert_eq!(SKEL_IS_ACTIVATION_COL, SKEL_IS_DEACTIVATION_COL + 1);
         // E.5 appends the `is_coinbase` public column.
         assert_eq!(SKEL_IS_COINBASE_COL, SKEL_IS_ACTIVATION_COL + 1);
@@ -758,13 +773,11 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
-        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44),
-        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44)];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
             spend_with_owner(22, 3, addrs[1]),
@@ -790,8 +803,18 @@ mod tests {
             open_witness.expected_batched_claims(),
         );
         let outputs = vec![
-            TxOutput { slot_index: 5, value: 7, owner: Address([0x33u8; 32]), valid: true },
-            TxOutput { slot_index: 9, value: 11, owner: Address([0x44u8; 32]), valid: true },
+            TxOutput {
+                slot_index: 5,
+                value: 7,
+                owner: Address([0x33u8; 32]),
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 9,
+                value: 11,
+                owner: Address([0x44u8; 32]),
+                valid: true,
+            },
         ];
         TxValidityCompositeLeaf::new_with_options(
             combiner,
@@ -852,8 +875,7 @@ mod tests {
         let comp = build_with_activation_sources();
         for row in 0..FRI_STATE_OPEN_OUTPUT_LAYOUT.n_inputs {
             let mut cols = comp.build_trace().columns;
-            cols[SKEL_IS_ACTIVATION_COL][row] =
-                cols[SKEL_IS_ACTIVATION_COL][row] + Block128::ONE;
+            cols[SKEL_IS_ACTIVATION_COL][row] = cols[SKEL_IS_ACTIVATION_COL][row] + Block128::ONE;
             assert!(
                 !comp.air().check(&Trace::new(cols)),
                 "E.4: is_activation[{row}] tamper must REJECT",
@@ -878,13 +900,11 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
-        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44),
-        ];
+        let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_addr(11), mk_addr(22), mk_addr(33), mk_addr(44)];
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = if has_spends {
             [
                 spend_with_owner(11, 0, addrs[0]),
@@ -974,8 +994,7 @@ mod tests {
         let comp = build();
         for row in [0usize, 1, 5, 100, 1 << 12] {
             let mut cols = comp.build_trace().columns;
-            cols[SKEL_IS_COINBASE_COL][row] =
-                cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
+            cols[SKEL_IS_COINBASE_COL][row] = cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
             assert!(
                 !comp.air().check(&Trace::new(cols)),
                 "E.5: is_coinbase row {row} tamper must REJECT",

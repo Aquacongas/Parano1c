@@ -80,9 +80,17 @@ pub struct EvalProof {
 impl EvalProof {
     pub fn byte_len(&self) -> usize {
         let upper = self.upper_partial_evals.len() * 16;
-        let sc: usize = self.sum_check_oracles.iter().map(|u| u.coeffs.len() * 16).sum();
+        let sc: usize = self
+            .sum_check_oracles
+            .iter()
+            .map(|u| u.coeffs.len() * 16)
+            .sum();
         let oracles = self.fri_oracles.len() * 32;
-        let symbols: usize = self.fri_queried_symbols.iter().map(|v| v.len() * 2 * 16).sum();
+        let symbols: usize = self
+            .fri_queried_symbols
+            .iter()
+            .map(|v| v.len() * 2 * 16)
+            .sum();
         let paths: usize = self
             .fri_merkle_paths
             .iter()
@@ -487,19 +495,17 @@ pub fn prove(
         // read-only against `code` and `tree`. Parallelizing across queries is
         // deterministic because the output vectors are produced by an ordered
         // `collect`, preserving `query_indices` order for the verifier.
-        let (symbols_round, paths_round): (
-            Vec<(Block128, Block128)>,
-            Vec<Vec<HashOutput>>,
-        ) = query_indices
-            .par_iter()
-            .map(|&qi| {
-                let scaled = qi >> round;
-                let pair_idx = scaled >> 1;
-                let s0 = code.idx(pair_idx * 2);
-                let s1 = code.idx(pair_idx * 2 + 1);
-                ((s0, s1), tree.get_merkle_path(pair_idx))
-            })
-            .unzip();
+        let (symbols_round, paths_round): (Vec<(Block128, Block128)>, Vec<Vec<HashOutput>>) =
+            query_indices
+                .par_iter()
+                .map(|&qi| {
+                    let scaled = qi >> round;
+                    let pair_idx = scaled >> 1;
+                    let s0 = code.idx(pair_idx * 2);
+                    let s1 = code.idx(pair_idx * 2 + 1);
+                    ((s0, s1), tree.get_merkle_path(pair_idx))
+                })
+                .unzip();
         fri_queried_symbols.push(symbols_round);
         fri_merkle_paths.push(paths_round);
     }

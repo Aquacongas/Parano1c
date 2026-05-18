@@ -14,9 +14,8 @@
 //! as `[absorb_block, capacity_iv]` for the slot's role.
 
 use noid_air::airs::tx_body_merkle::layout::{
-    build_instance_layout, InstanceMeta, InstanceRole, N_INSTANCES,
-    TREE_LEAF_INPUT_BASE, TREE_LEAF_OUTPUT_BASE, TXBODY_N_INPUT_LEAVES,
-    TXBODY_N_OUTPUT_LEAVES,
+    build_instance_layout, InstanceMeta, InstanceRole, N_INSTANCES, TREE_LEAF_INPUT_BASE,
+    TREE_LEAF_OUTPUT_BASE, TXBODY_N_INPUT_LEAVES, TXBODY_N_OUTPUT_LEAVES,
 };
 use noid_core::Block128;
 use noid_poseidon2b::native::domain::{
@@ -101,10 +100,12 @@ impl SpineCircuit {
                     InstanceRole::InputLeafPermA { .. }
                     | InstanceRole::InputLeafPermB { .. }
                     | InstanceRole::InputLeafPermC { .. } => iv_leaf,
-                    InstanceRole::OutputLeafPermA { .. }
-                    | InstanceRole::OutputLeafPermB { .. } => iv_outleaf,
-                    InstanceRole::CompressPermA { .. }
-                    | InstanceRole::CompressPermB { .. } => iv_compress,
+                    InstanceRole::OutputLeafPermA { .. } | InstanceRole::OutputLeafPermB { .. } => {
+                        iv_outleaf
+                    }
+                    InstanceRole::CompressPermA { .. } | InstanceRole::CompressPermB { .. } => {
+                        iv_compress
+                    }
                     InstanceRole::WrapPerm => iv_txbody,
                 };
 
@@ -158,7 +159,10 @@ mod tests {
         let c = SpineCircuit::build();
         assert_eq!(c.slots.len(), N_INSTANCES);
         assert_eq!(c.wrap_id(), N_INSTANCES - 1);
-        assert!(matches!(c.slots.last().unwrap().role, InstanceRole::WrapPerm));
+        assert!(matches!(
+            c.slots.last().unwrap().role,
+            InstanceRole::WrapPerm
+        ));
     }
 
     #[test]

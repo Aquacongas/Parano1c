@@ -23,8 +23,8 @@ use noid_tx::PublicInputs;
 use rayon::prelude::*;
 
 use crate::{
-    absorb_public_inputs, lagrange_eval_at, mle_eval, padded_log_len, round_poly_degree,
-    RoundPoly, SliceClaim, VerifyError,
+    absorb_public_inputs, lagrange_eval_at, mle_eval, padded_log_len, round_poly_degree, RoundPoly,
+    SliceClaim, VerifyError,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +77,10 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
     log_len: usize,
-    pre_committed: Option<(InterleavedCommitment, noid_fri_binius::InterleavedProverState)>,
+    pre_committed: Option<(
+        InterleavedCommitment,
+        noid_fri_binius::InterleavedProverState,
+    )>,
 ) -> InterleavedStarkProof {
     let log_rows = air.log_rows();
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
@@ -91,8 +94,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     let (commitment, prover_state) = match pre_committed {
         Some(pre) => pre,
         None => {
-            let col_refs: Vec<&[Block128]> =
-                padded_columns.iter().map(|c| c.as_slice()).collect();
+            let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
             interleaved_commit(&col_refs, &ntt, &hasher)
         }
     };

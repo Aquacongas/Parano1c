@@ -43,8 +43,7 @@ pub const N_AUTH_ROUND_VARS: usize = 7;
 /// `log2(4) = 2` element-within-state variables.
 pub const N_AUTH_ELEM_VARS: usize = 2;
 /// Total variable count of the AuthGKR unified MLE.
-pub const N_AUTH_UNIFIED_VARS: usize =
-    N_AUTH_SLOT_BITS + N_AUTH_ROUND_VARS + N_AUTH_ELEM_VARS;
+pub const N_AUTH_UNIFIED_VARS: usize = N_AUTH_SLOT_BITS + N_AUTH_ROUND_VARS + N_AUTH_ELEM_VARS;
 /// `2^14 = 16 384` cells.
 pub const N_AUTH_UNIFIED_CELLS: usize = 1 << N_AUTH_UNIFIED_VARS;
 
@@ -89,9 +88,7 @@ impl AuthUnifiedMle {
         debug_assert!(slot < 1 << N_AUTH_SLOT_BITS);
         debug_assert!(round < 1 << N_AUTH_ROUND_VARS);
         debug_assert!(elem < 1 << N_AUTH_ELEM_VARS);
-        (slot << (N_AUTH_ROUND_VARS + N_AUTH_ELEM_VARS))
-            | (round << N_AUTH_ELEM_VARS)
-            | elem
+        (slot << (N_AUTH_ROUND_VARS + N_AUTH_ELEM_VARS)) | (round << N_AUTH_ELEM_VARS) | elem
     }
 
     /// Fill in one slot's cells from an instrumented `PermLayerWitness`.
@@ -214,7 +211,11 @@ mod tests {
                         }
                     }
                 };
-                assert_eq!(auth_sigma_at(round, elem), expected, "round {round} elem {elem}");
+                assert_eq!(
+                    auth_sigma_at(round, elem),
+                    expected,
+                    "round {round} elem {elem}"
+                );
             }
         }
     }

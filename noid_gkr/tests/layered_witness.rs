@@ -14,8 +14,8 @@ use noid_poseidon2b::native::permutation::{
     sbox_x7, Poseidon2bPermutation, F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS,
     ROUND_CONSTANTS, STATE_SIZE,
 };
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 const ZERO: Block128 = Block128(0u128);
 
@@ -118,12 +118,7 @@ fn mds_blend_matches_schedule() {
             RoundKind::Partial => {
                 // Partial-round MDS input: lane 0 is sout[0], lanes
                 // 1..3 are the raw state (not the zeroed S-box cells).
-                let input = [
-                    w.sout[r][0],
-                    w.state[r][1],
-                    w.state[r][2],
-                    w.state[r][3],
-                ];
+                let input = [w.sout[r][0], w.state[r][1], w.state[r][2], w.state[r][3]];
                 apply_mds_partial(input)
             }
         };
@@ -149,7 +144,9 @@ fn partial_round_sbox_kill() {
 
 #[test]
 fn round_kind_schedule_is_4_58_4() {
-    let full_head = (0..F_ROUNDS / 2).filter(|&r| round_kind(r) == RoundKind::Full).count();
+    let full_head = (0..F_ROUNDS / 2)
+        .filter(|&r| round_kind(r) == RoundKind::Full)
+        .count();
     let partial_mid = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS)
         .filter(|&r| round_kind(r) == RoundKind::Partial)
         .count();

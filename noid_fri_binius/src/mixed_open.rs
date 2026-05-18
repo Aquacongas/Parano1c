@@ -149,7 +149,14 @@ pub fn verify_mixed_opening(
         .fold(Block128::ZERO, |acc, x| acc + x);
 
     // Step 3: Verify compact FRI proof: C(primary_point) == batched_claim
-    compact_fri_verify(primary_point, batched_claim, &proof.fri_proof, ntt, channel, hasher)?;
+    compact_fri_verify(
+        primary_point,
+        batched_claim,
+        &proof.fri_proof,
+        ntt,
+        channel,
+        hasher,
+    )?;
 
     // Return primary openings (first n_cols entries)
     Ok(proof.all_openings[..n_cols].to_vec())

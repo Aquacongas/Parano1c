@@ -33,7 +33,6 @@ pub mod vshift;
 pub mod interleaved;
 pub mod prove_tx;
 
-
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{AdditiveNTT, Block128, TowerField};
@@ -417,7 +416,6 @@ fn accumulate_sum_flat_fused(
         )
         .reduce(|| 0u128, |a, b| a ^ b)
 }
-
 
 /// Prover for the batched zero-check sumcheck. Holds the folded
 /// column tables + eq table in flat basis (GCM polynomial basis)
@@ -989,7 +987,12 @@ fn canonicalize_extras(extras: &[ExtraColumn]) -> Vec<ExtraColumn> {
         let la = a.commitment.log_len;
         let lb = b.commitment.log_len;
         la.cmp(&lb)
-            .then_with(|| a.commitment.vector_commitment.root.cmp(&b.commitment.vector_commitment.root))
+            .then_with(|| {
+                a.commitment
+                    .vector_commitment
+                    .root
+                    .cmp(&b.commitment.vector_commitment.root)
+            })
             .then_with(|| {
                 let sa: Vec<u128> = a.eval_point.iter().map(|v| v.0).collect();
                 let sb: Vec<u128> = b.eval_point.iter().map(|v| v.0).collect();
@@ -1520,14 +1523,16 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
             return Err(VerifyError::ShapeMismatch);
         }
     }
-    if proof.multipoint_rounds.len() != std::cmp::max(
-        log_len,
-        extras
-            .iter()
-            .map(|e| e.commitment.log_len)
-            .max()
-            .unwrap_or(0),
-    ) {
+    if proof.multipoint_rounds.len()
+        != std::cmp::max(
+            log_len,
+            extras
+                .iter()
+                .map(|e| e.commitment.log_len)
+                .max()
+                .unwrap_or(0),
+        )
+    {
         return Err(VerifyError::ShapeMismatch);
     }
     for rp in &proof.multipoint_rounds {
@@ -1623,14 +1628,16 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
     )?;
     let reversed_full: Vec<Block128> = sc_challenges.iter().rev().cloned().collect();
     let n_max = sc_challenges.len();
-    if n_max != std::cmp::max(
-        log_len,
-        extras
-            .iter()
-            .map(|e| e.commitment.log_len)
-            .max()
-            .unwrap_or(0),
-    ) {
+    if n_max
+        != std::cmp::max(
+            log_len,
+            extras
+                .iter()
+                .map(|e| e.commitment.log_len)
+                .max()
+                .unwrap_or(0),
+        )
+    {
         return Err(VerifyError::ShapeMismatch);
     }
     let r_pp_base: Vec<Block128> = reversed_full[..log_len].to_vec();
@@ -1653,8 +1660,7 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
     // s_base_scalar = 1 — which reduces this reconstruction to the
     // legacy uniform formula.
     let m_base_rounds = n_max - log_len;
-    let s_base_scalar =
-        crate::multipoint_batch::mixed_high_scalar(&sc_challenges, m_base_rounds);
+    let s_base_scalar = crate::multipoint_batch::mixed_high_scalar(&sc_challenges, m_base_rounds);
 
     let mut expected = Block128::ZERO;
     for k in 0..n {
@@ -1717,7 +1723,6 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
 
     Ok(())
 }
-
 
 /// Like [`prove_air_unchecked`], but absorbs `extra_transcript` into
 /// the parent Fiat-Shamir channel **between** the column-root
@@ -2418,9 +2423,8 @@ pub(crate) fn check_public_columns<A: Air + ?Sized>(
         if k > log_len {
             return Err(VerifyError::ShapeMismatch);
         }
-        let tensor = eq_tensors[k].get_or_insert_with(|| {
-            noid_core::mle::eq::eq_ind_partial_eval(&r_point[..k])
-        });
+        let tensor = eq_tensors[k]
+            .get_or_insert_with(|| noid_core::mle::eq::eq_ind_partial_eval(&r_point[..k]));
         // Programme MLEs are overwhelmingly sparse in their native
         // hypercube: `bit_adder_operand_programme(64, …)` pins 64 real
         // bits followed by 8128 zeros; `emit_*_public_columns` similarly
@@ -2673,8 +2677,7 @@ mod tests {
         let trace = TxValidityAir::build_trace(&mk_body());
         let pi = mk_pi();
         let proof_legacy = prove_air_unchecked_with_extra(&air, &trace, &pi, &[]);
-        let proof_wrapped =
-            prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &[]);
+        let proof_wrapped = prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &[]);
         assert_eq!(
             format!("{:?}", proof_legacy),
             format!("{:?}", proof_wrapped),
@@ -2729,8 +2732,7 @@ mod tests {
             value,
         }];
 
-        let proof =
-            prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &extras);
+        let proof = prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &extras);
         assert!(
             proof.multipoint_batch_mixed.is_some(),
             "non-empty extras must land in the mixed path"
@@ -2757,8 +2759,9 @@ mod tests {
                 packing_factor: 1,
                 log_len,
             };
-            let eval_point: Vec<Block128> =
-                (0..log_len).map(|i| Block128::from((seed as u128) + i as u128)).collect();
+            let eval_point: Vec<Block128> = (0..log_len)
+                .map(|i| Block128::from((seed as u128) + i as u128))
+                .collect();
             ExtraColumn {
                 evals,
                 commitment,
@@ -4080,7 +4083,6 @@ mod tx_body_merkle_stark_tests {
             is_deactivation: [false; noid_tx::MAX_INPUTS],
         }
     }
-
 
     // =====================================================================
     // Stage 3d-0.2 — PublicColumn verifier-side binding

@@ -38,8 +38,7 @@ fn build_inputs(seed: u8) -> AuthInputs {
     let secrets: [SpendSecret; N_AUTH_INPUTS] = std::array::from_fn(|i| {
         let mut bytes = [0u8; 32];
         for (j, b) in bytes.iter_mut().enumerate() {
-            *b = seed
-                .wrapping_add(((i + 1) as u8).wrapping_mul((j + 7) as u8));
+            *b = seed.wrapping_add(((i + 1) as u8).wrapping_mul((j + 7) as u8));
         }
         SpendSecret(bytes)
     });
@@ -70,7 +69,11 @@ fn auth_killshot_reductions_consistent_with_native_mle() {
     let mut ch = Poseidon2bChannel::new();
     let (_proof, reductions) = prove_auth_killshot(&circuit, &inputs, &mut ch);
 
-    assert!(discharge_auth_reductions_native(&circuit, &inputs, &reductions));
+    assert!(discharge_auth_reductions_native(
+        &circuit,
+        &inputs,
+        &reductions
+    ));
 
     let mle = build_auth_unified_from_inputs(&circuit, &inputs);
     assert_eq!(
@@ -96,8 +99,7 @@ fn auth_killshot_prover_and_verifier_agree_on_reductions() {
     let (proof, prover_red) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
     let mut ch_v = Poseidon2bChannel::new();
-    let verifier_red =
-        verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).expect("verify");
+    let verifier_red = verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).expect("verify");
 
     assert_eq!(prover_red, verifier_red);
 }

@@ -191,9 +191,7 @@ pub fn auth_rc_table() -> &'static [Block128] {
 
 /// MDS lane tables (one per lane in `0..STATE_SIZE`) — cached.
 pub fn auth_mds_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
-    MDS_LANE_TABLES.get_or_init(|| {
-        std::array::from_fn(build_mds_lane_table_uncached)
-    })
+    MDS_LANE_TABLES.get_or_init(|| std::array::from_fn(build_mds_lane_table_uncached))
 }
 
 /// Convenience wrapper to fetch a single lane table.
@@ -435,7 +433,11 @@ mod tests {
                     } else {
                         Block128::from(ROUND_CONSTANTS[elem][round])
                     };
-                    assert_eq!(auth_rc_evaluate(&pt), want, "slot={slot} round={round} elem={elem}");
+                    assert_eq!(
+                        auth_rc_evaluate(&pt),
+                        want,
+                        "slot={slot} round={round} elem={elem}"
+                    );
                 }
             }
         }

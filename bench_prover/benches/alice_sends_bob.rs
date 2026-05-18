@@ -37,9 +37,7 @@ struct BenchResult {
     auth_bytes: usize,
 }
 
-fn build_inputs(
-    comp: &TxValidityCompositeWithSpine,
-) -> (SpineInputs, AuthInputs) {
+fn build_inputs(comp: &TxValidityCompositeWithSpine) -> (SpineInputs, AuthInputs) {
     let pins = comp.boundary_pins();
     let spine_inputs = SpineInputs {
         prev_state_root: pins.prev_state_root,
@@ -76,16 +74,17 @@ fn build_inputs(
     (spine_inputs, auth_inputs)
 }
 
-fn run_scenario(
-    label: &str,
-    comp: &TxValidityCompositeWithSpine,
-) -> BenchResult {
+fn run_scenario(label: &str, comp: &TxValidityCompositeWithSpine) -> BenchResult {
     let pi = comp.public_inputs();
     let trace = comp.build_trace();
     let air = comp.air();
     let (spine_inputs, auth_inputs) = build_inputs(comp);
 
-    assert!(air.check(&trace), "FATAL: trace rejected by AIR for {}", label);
+    assert!(
+        air.check(&trace),
+        "FATAL: trace rejected by AIR for {}",
+        label
+    );
 
     let witness = TxWitness {
         air,

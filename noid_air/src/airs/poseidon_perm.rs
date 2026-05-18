@@ -207,7 +207,11 @@ pub fn build_perm_trace(input: [Block128; STATE_SIZE]) -> PoseidonPermColumns {
 
     for r in 0..N_ROUNDS {
         let is_full = is_full_round(r);
-        cols[POSEIDON_COL_IS_FULL][r] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[POSEIDON_COL_IS_FULL][r] = if is_full {
+            Block128::ONE
+        } else {
+            Block128::ZERO
+        };
         cols[POSEIDON_COL_IS_ROUND][r] = Block128::ONE;
         for lane in 0..STATE_SIZE {
             cols[POSEIDON_COL_RC + lane][r] = Block128::from(ROUND_CONSTANTS[lane][r]);
@@ -299,7 +303,11 @@ pub fn write_perm_trace_at(
 
     for r in 0..N_ROUNDS {
         let is_full = is_full_round(r);
-        cols[layout.is_full][r] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[layout.is_full][r] = if is_full {
+            Block128::ONE
+        } else {
+            Block128::ZERO
+        };
         cols[layout.is_round][r] = Block128::ONE;
         for lane in 0..STATE_SIZE {
             cols[layout.rc + lane][r] = Block128::from(ROUND_CONSTANTS[lane][r]);
@@ -374,7 +382,11 @@ pub fn write_perm_trace_at_offset(
     for r in 0..N_ROUNDS {
         let row = row_offset + r;
         let is_full = is_full_round(r);
-        cols[layout.is_full][row] = if is_full { Block128::ONE } else { Block128::ZERO };
+        cols[layout.is_full][row] = if is_full {
+            Block128::ONE
+        } else {
+            Block128::ZERO
+        };
         cols[layout.is_round][row] = Block128::ONE;
         for lane in 0..STATE_SIZE {
             cols[layout.rc + lane][row] = Block128::from(ROUND_CONSTANTS[lane][r]);
@@ -480,9 +492,7 @@ pub fn emit_perm_rc_binding_at(layout: PermLayout) -> Vec<Box<dyn Constraint>> {
     let mut out: Vec<Box<dyn Constraint>> = Vec::with_capacity(STATE_SIZE + 2);
 
     let lane0_inner: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![
-        layout.sin,
-        layout.s,
-        layout.rc,
+        layout.sin, layout.s, layout.rc,
     ]));
     out.push(Box::new(SelectorGate::new(layout.is_round, lane0_inner)));
 
@@ -599,7 +609,11 @@ impl PermMdsBlendGate {
     }
 
     #[inline]
-    fn apply_row(mat: &[[u128; STATE_SIZE]; STATE_SIZE], lane: usize, vals: [Block128; STATE_SIZE]) -> Block128 {
+    fn apply_row(
+        mat: &[[u128; STATE_SIZE]; STATE_SIZE],
+        lane: usize,
+        vals: [Block128; STATE_SIZE],
+    ) -> Block128 {
         let mut acc = Block128::ZERO;
         for j in 0..STATE_SIZE {
             let w = mat[lane][j];
@@ -1031,7 +1045,11 @@ mod tests {
         let input = mk_input(42);
         let cols = build_perm_trace(input);
         for r in 0..N_ROUNDS {
-            let expected = if is_full_round(r) { Block128::ONE } else { Block128::ZERO };
+            let expected = if is_full_round(r) {
+                Block128::ONE
+            } else {
+                Block128::ZERO
+            };
             assert_eq!(cols[POSEIDON_COL_IS_FULL][r], expected, "row {r}");
         }
         // Padding rows 67..128: is_full stays zero.
@@ -1405,7 +1423,11 @@ mod tests {
             (POSEIDON_COL_X2 + 0, F_ROUNDS / 2 + 1, "x2 lane0 partial"),
             (POSEIDON_COL_X4 + 3, 1, "x4 lane3 full"),
             (POSEIDON_COL_X3 + 2, 62, "x3 lane2 final full"),
-            (POSEIDON_COL_SOUT + 0, F_ROUNDS / 2 + 7, "sout lane0 partial"),
+            (
+                POSEIDON_COL_SOUT + 0,
+                F_ROUNDS / 2 + 7,
+                "sout lane0 partial",
+            ),
             (POSEIDON_COL_SOUT + 2, 63, "sout lane2 final full"),
             (POSEIDON_COL_RC + 1, 0, "rc lane1 row0"),
             (POSEIDON_COL_IS_FULL, 0, "is_full row0"),
@@ -1550,8 +1572,7 @@ mod tests {
     fn perm_public_columns_row_major_declaration_shape() {
         const LOG_ROWS: usize = 14;
         const TOTAL: usize = 1 << LOG_ROWS;
-        let publics =
-            emit_perm_public_columns_row_major_at(DEFAULT_PERM_LAYOUT, 68, 128, TOTAL);
+        let publics = emit_perm_public_columns_row_major_at(DEFAULT_PERM_LAYOUT, 68, 128, TOTAL);
         assert_eq!(publics.len(), STATE_SIZE + 2);
         for p in &publics {
             assert_eq!(p.values.len(), TOTAL);

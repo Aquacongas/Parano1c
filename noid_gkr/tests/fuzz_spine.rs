@@ -82,7 +82,9 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
         let fee: u128 = rng.gen();
         let is_coinbase: bool = rng.gen();
 
-        let owners: Vec<Address> = (0..8).map(|_| derive_address(&rand_secret(&mut rng))).collect();
+        let owners: Vec<Address> = (0..8)
+            .map(|_| derive_address(&rand_secret(&mut rng)))
+            .collect();
 
         let mut in_slots = [0u32; TXBODY_INPUTS];
         let mut in_values = [0u64; TXBODY_INPUTS];

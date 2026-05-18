@@ -70,9 +70,7 @@ pub fn emit_sbox_x7_constraints(layout: SboxX7Layout) -> Vec<Box<dyn Constraint>
 
 /// Fill one lane's aux/output columns given the already-populated
 /// `sin` column. Matches the native `sbox_x7` chain bit-for-bit.
-pub fn build_sbox_x7_columns(
-    sin: &[noid_core::Block128],
-) -> [Vec<noid_core::Block128>; 4] {
+pub fn build_sbox_x7_columns(sin: &[noid_core::Block128]) -> [Vec<noid_core::Block128>; 4] {
     use noid_core::Block128;
     let n = sin.len();
     let mut x2 = vec![Block128::from(0u128); n];
@@ -99,7 +97,8 @@ mod tests {
         (0..n)
             .map(|i| {
                 Block128::from(
-                    seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(i as u128 ^ 0xA5A5),
+                    seed.wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(i as u128 ^ 0xA5A5),
                 )
             })
             .collect()
@@ -119,11 +118,7 @@ mod tests {
         let sin = mk_input(16, 0xFEEDFACE);
         let [x2, x4, x3, sout] = build_sbox_x7_columns(&sin);
         let layout = SboxX7Layout::contiguous(0);
-        let air = CompositeAir::from_parts(
-            4,
-            SBOX_X7_N_COLS,
-            emit_sbox_x7_constraints(layout),
-        );
+        let air = CompositeAir::from_parts(4, SBOX_X7_N_COLS, emit_sbox_x7_constraints(layout));
         let trace = Trace::new(vec![sin, x2, x4, x3, sout]);
         assert!(air.check(&trace));
     }
@@ -190,11 +185,7 @@ mod tests {
         let pad0 = vec![Block128::from(0u128); 16];
         let pad1 = vec![Block128::from(0u128); 16];
         let layout = SboxX7Layout::contiguous(2);
-        let air = CompositeAir::from_parts(
-            4,
-            2 + SBOX_X7_N_COLS,
-            emit_sbox_x7_constraints(layout),
-        );
+        let air = CompositeAir::from_parts(4, 2 + SBOX_X7_N_COLS, emit_sbox_x7_constraints(layout));
         let trace = Trace::new(vec![pad0, pad1, sin, x2, x4, x3, sout]);
         assert!(air.check(&trace));
     }

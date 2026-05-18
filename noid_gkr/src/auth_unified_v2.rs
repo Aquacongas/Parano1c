@@ -20,9 +20,7 @@
 //!     getters — no per-proof rebuild.
 //!   * Live-slot count fixed at `N_AUTH_LIVE_SLOTS = 20`.
 
-use noid_core::hardware::{
-    clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128,
-};
+use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128};
 use noid_core::mle::eq::eq_ind;
 use noid_core::mle::evaluate::{evaluate_flat, evaluate_preflat, evaluate_slice};
 use noid_core::packed::pow7::pow7_block128;
@@ -32,8 +30,8 @@ use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 use crate::auth_mle_v2::{
-    AuthUnifiedMle, N_AUTH_ELEM_VARS, N_AUTH_ROUND_VARS, N_AUTH_SLOT_BITS,
-    N_AUTH_UNIFIED_CELLS, N_AUTH_UNIFIED_VARS,
+    AuthUnifiedMle, N_AUTH_ELEM_VARS, N_AUTH_ROUND_VARS, N_AUTH_SLOT_BITS, N_AUTH_UNIFIED_CELLS,
+    N_AUTH_UNIFIED_VARS,
 };
 use crate::auth_shift::{
     auth_build_u_table, auth_mds_lane_tables, auth_mds_lane_tables_flat, auth_permute_by_dec,
@@ -335,7 +333,9 @@ struct UnifiedFlatTables {
 
 #[inline]
 fn vec_tower_to_flat(v: Vec<Block128>) -> Vec<u128> {
-    v.into_iter().map(|b| tower_to_flat_u128(b.to_u128())).collect()
+    v.into_iter()
+        .map(|b| tower_to_flat_u128(b.to_u128()))
+        .collect()
 }
 
 impl UnifiedFlatTables {
@@ -459,11 +459,20 @@ fn compute_round_polynomial_flat(
 
     for i in 0..half {
         let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-        let sg_p: [u128; 2] = [tabs.sigma_dec[i], tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half]];
+        let sg_p: [u128; 2] = [
+            tabs.sigma_dec[i],
+            tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
+        ];
         let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
         let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-        let so_p: [u128; 2] = [tabs.s_out_dec[i], tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half]];
-        let st_p: [u128; 2] = [tabs.state_dec[i], tabs.state_dec[i] ^ tabs.state_dec[i + half]];
+        let so_p: [u128; 2] = [
+            tabs.s_out_dec[i],
+            tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
+        ];
+        let st_p: [u128; 2] = [
+            tabs.state_dec[i],
+            tabs.state_dec[i] ^ tabs.state_dec[i + half],
+        ];
         let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
 
         let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
@@ -475,10 +484,7 @@ fn compute_round_polynomial_flat(
         q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
         q1_p[2] ^= sg_si_p[2];
 
-        let inner_p: [u128; 2] = [
-            si_p[0] ^ st_p[0] ^ rc_p[0],
-            si_p[1] ^ st_p[1] ^ rc_p[1],
-        ];
+        let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
         let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
 
         let mut q2_p = [0u128; 4];
@@ -563,9 +569,8 @@ pub fn prove_auth_shift<T: FiatShamir<Block128>>(
     let mut round_polys = Vec::with_capacity(N_AUTH_UNIFIED_VARS);
     let mut r_double_prime = vec![Block128::ZERO; N_AUTH_UNIFIED_VARS];
     for round in 0..N_AUTH_UNIFIED_VARS {
-        let poly = compute_shift_round_polynomial_flat(
-            &s_in, &s_out, &state, &w_sin, &w_sout, &w_state,
-        );
+        let poly =
+            compute_shift_round_polynomial_flat(&s_in, &s_out, &state, &w_sin, &w_sout, &w_state);
         for &c in &poly.coeffs {
             channel.absorb(c);
         }
@@ -631,9 +636,8 @@ pub fn verify_auth_shift<T: FiatShamir<Block128>>(
     }
 
     let w = combined_weights_at_point(&main_red.r_prime, delta, &r_double_prime);
-    let claimed = w.w_sin * proof.s_in_at_r2
-        + w.w_sout * proof.s_out_at_r2
-        + w.w_state * proof.state_at_r2;
+    let claimed =
+        w.w_sin * proof.s_in_at_r2 + w.w_sout * proof.s_out_at_r2 + w.w_state * proof.state_at_r2;
     if expected != claimed {
         return None;
     }
@@ -864,8 +868,7 @@ fn compute_shift_round_polynomial_flat(
             let wsin = wsin0 ^ clmul_gcm(t, dwsin);
             let wsout = wsout0 ^ clmul_gcm(t, dwsout);
             let wst = wst0 ^ clmul_gcm(t, dwst);
-            evals[k] ^=
-                clmul_gcm(wsin, sin) ^ clmul_gcm(wsout, sout) ^ clmul_gcm(wst, st);
+            evals[k] ^= clmul_gcm(wsin, sin) ^ clmul_gcm(wsout, sout) ^ clmul_gcm(wst, st);
         }
     }
 
@@ -1003,8 +1006,7 @@ mod tests {
 
         let mut ch = Poseidon2bChannel::new();
         let main_red = verify_auth_unified(&proof.main, &mut ch).expect("main verify");
-        let shift_red = verify_auth_shift(&proof.shift, &main_red, &mut ch)
-            .expect("shift verify");
+        let shift_red = verify_auth_shift(&proof.shift, &main_red, &mut ch).expect("shift verify");
         assert_eq!(shift_red.r_double_prime.len(), N_AUTH_UNIFIED_VARS);
     }
 
@@ -1053,6 +1055,9 @@ mod tests {
         let delta = ch_v.squeeze();
         let target = combined_target(&main_red, delta);
         let first = &shift.round_polys[0];
-        assert_eq!(first.evaluate(Block128::ZERO) + first.evaluate(Block128::ONE), target);
+        assert_eq!(
+            first.evaluate(Block128::ZERO) + first.evaluate(Block128::ONE),
+            target
+        );
     }
 }

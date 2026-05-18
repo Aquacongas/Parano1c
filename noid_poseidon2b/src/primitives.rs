@@ -178,7 +178,10 @@ pub fn hash_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
 pub fn hash_output_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
     let [owner_hi, owner_lo] = owner.as_fields();
     let mut s = sponge(TAG_OUTLEAF);
-    s.absorb_pair(Block128::from(slot_index as u128), Block128::from(value as u128));
+    s.absorb_pair(
+        Block128::from(slot_index as u128),
+        Block128::from(value as u128),
+    );
     s.absorb_pair(owner_hi, owner_lo);
     s.finalize_no_pad()
 }

@@ -151,8 +151,7 @@ pub fn emit_cross_row_eq(p: BridgeParams) -> BridgeWiring {
         BridgeHold::Interval => (lo..hi).collect(),
         BridgeHold::FullTrace => (0..p.total_rows).collect(),
     };
-    let transition_programme =
-        multi_row_indicator_programme(&transition_rows, p.total_rows);
+    let transition_programme = multi_row_indicator_programme(&transition_rows, p.total_rows);
 
     let public_columns = vec![
         PublicColumn::new(p.src_indicator_col, src_programme),
@@ -164,23 +163,25 @@ pub fn emit_cross_row_eq(p: BridgeParams) -> BridgeWiring {
     // Src pin: bridge[src_row] + src_col[src_row] == 0 (XOR).
     let src_inner: Box<dyn Constraint> =
         Box::new(WeightedLinearGate::new_xor(vec![p.bridge_col, p.src_col]));
-    let src_gate: Box<dyn Constraint> =
-        Box::new(SelectorGate::new(p.src_indicator_col, src_inner));
+    let src_gate: Box<dyn Constraint> = Box::new(SelectorGate::new(p.src_indicator_col, src_inner));
 
     // Dst pin: bridge[dst_row] + dst_col[dst_row] == 0 (XOR).
     let dst_inner: Box<dyn Constraint> =
         Box::new(WeightedLinearGate::new_xor(vec![p.bridge_col, p.dst_col]));
-    let dst_gate: Box<dyn Constraint> =
-        Box::new(SelectorGate::new(p.dst_indicator_col, dst_inner));
+    let dst_gate: Box<dyn Constraint> = Box::new(SelectorGate::new(p.dst_indicator_col, dst_inner));
 
     // Transition: bridge[r] + bridge[r+1] == 0 on every row where
     // transition indicator is hot. `new_xor_next(col, col)` aliases
     // the two sides onto the same column — legitimate per
     // `WeightedLinearGateShifted` construction rules.
-    let transition_inner: Box<dyn Constraint> =
-        Box::new(WeightedLinearGateShifted::new_xor_next(p.bridge_col, p.bridge_col));
-    let transition_gate: Box<dyn Constraint> =
-        Box::new(SelectorGate::new(p.transition_indicator_col, transition_inner));
+    let transition_inner: Box<dyn Constraint> = Box::new(WeightedLinearGateShifted::new_xor_next(
+        p.bridge_col,
+        p.bridge_col,
+    ));
+    let transition_gate: Box<dyn Constraint> = Box::new(SelectorGate::new(
+        p.transition_indicator_col,
+        transition_inner,
+    ));
 
     BridgeWiring {
         public_columns,
@@ -194,11 +195,7 @@ pub fn emit_cross_row_eq(p: BridgeParams) -> BridgeWiring {
 ///
 /// Out-of-interval rows of an `Interval` bridge are left at
 /// whatever the caller pre-initialised them to (typically `ZERO`).
-pub fn write_bridge_column(
-    cols: &mut [Vec<Block128>],
-    p: &BridgeParams,
-    value: Block128,
-) {
+pub fn write_bridge_column(cols: &mut [Vec<Block128>], p: &BridgeParams, value: Block128) {
     let (lo, hi) = if p.src_row < p.dst_row {
         (p.src_row, p.dst_row)
     } else {
@@ -253,12 +250,8 @@ mod tests {
         };
         let w = emit_cross_row_eq(p);
         let log_rows = total_rows.trailing_zeros() as usize;
-        let air = CompositeAir::from_parts_with_publics(
-            log_rows,
-            6,
-            w.constraints,
-            w.public_columns,
-        );
+        let air =
+            CompositeAir::from_parts_with_publics(log_rows, 6, w.constraints, w.public_columns);
         (p, air)
     }
 
@@ -413,12 +406,7 @@ mod tests {
             transition_indicator_col: 4,
         };
         let w = emit_cross_row_eq(p);
-        let air = CompositeAir::from_parts_with_publics(
-            4,
-            5,
-            w.constraints,
-            w.public_columns,
-        );
+        let air = CompositeAir::from_parts_with_publics(4, 5, w.constraints, w.public_columns);
         let v = Block128::from(0x88u128);
         let mut cols: Vec<Vec<Block128>> = (0..5).map(|_| vec![Block128::ZERO; 16]).collect();
         cols[0][2] = v;
@@ -433,8 +421,7 @@ mod tests {
         assert!(air.check(&trace));
 
         // And rejects when col 0 disagrees at row 7.
-        let mut cols_bad: Vec<Vec<Block128>> =
-            (0..5).map(|_| vec![Block128::ZERO; 16]).collect();
+        let mut cols_bad: Vec<Vec<Block128>> = (0..5).map(|_| vec![Block128::ZERO; 16]).collect();
         cols_bad[0][2] = v;
         cols_bad[0][7] = v + Block128::ONE;
         write_bridge_column(&mut cols_bad, &p, v);
@@ -460,8 +447,7 @@ mod tests {
 
         // Build one honest trace column vector; each tamper clones it,
         // flips one cell, checks reject.
-        let mut honest: Vec<Vec<Block128>> =
-            (0..6).map(|_| vec![Block128::ZERO; 16]).collect();
+        let mut honest: Vec<Vec<Block128>> = (0..6).map(|_| vec![Block128::ZERO; 16]).collect();
         honest[p.src_col][p.src_row] = v;
         honest[p.dst_col][p.dst_row] = v;
         write_bridge_column(&mut honest, &p, v);
@@ -515,8 +501,7 @@ mod tests {
         }
         for r in 0..p.total_rows {
             let mut t = honest.clone();
-            t[p.transition_indicator_col][r] =
-                t[p.transition_indicator_col][r] + flip;
+            t[p.transition_indicator_col][r] = t[p.transition_indicator_col][r] + flip;
             assert!(
                 !air.check(&Trace::new(t)),
                 "transition indicator row {r} tamper undetected"

@@ -179,7 +179,10 @@ impl Constraint for BalanceBridgeCarryGate {
         let is_input_src_next = frame.next[0];
         let dst_next = frame.next[1];
         let carry_src_next = frame.next[2];
-        clmul_gcm(clmul_gcm(is_input_src, 1 ^ is_input_src_next), dst_next ^ carry_src_next)
+        clmul_gcm(
+            clmul_gcm(is_input_src, 1 ^ is_input_src_next),
+            dst_next ^ carry_src_next,
+        )
     }
 }
 
@@ -244,16 +247,17 @@ impl Constraint for BalanceFinalCarryGate {
         let is_input_a2_next = frame.next[0];
         let a2_carry_next = frame.next[1];
         let b21_sum_next = frame.next[2];
-        is_input_a2
-            * (Block128::ONE + is_input_a2_next)
-            * (a2_carry_next + b21_sum_next)
+        is_input_a2 * (Block128::ONE + is_input_a2_next) * (a2_carry_next + b21_sum_next)
     }
     fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
         let is_input_a2 = frame.local[0];
         let is_input_a2_next = frame.next[0];
         let a2_carry_next = frame.next[1];
         let b21_sum_next = frame.next[2];
-        clmul_gcm(clmul_gcm(is_input_a2, 1 ^ is_input_a2_next), a2_carry_next ^ b21_sum_next)
+        clmul_gcm(
+            clmul_gcm(is_input_a2, 1 ^ is_input_a2_next),
+            a2_carry_next ^ b21_sum_next,
+        )
     }
 }
 
@@ -318,18 +322,54 @@ struct BridgeSpec {
 
 const BRIDGES: [BridgeSpec; 9] = [
     // Chain A
-    BridgeSpec { src: BLK_A0, dst: BLK_A2, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_A1, dst: BLK_A2, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_A0,
+        dst: BLK_A2,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_A1,
+        dst: BLK_A2,
+        slot: OperandSlot::B,
+    },
     // Chain B — level 1 → 2
-    BridgeSpec { src: BLK_B00, dst: BLK_B10, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B01, dst: BLK_B10, slot: OperandSlot::B },
-    BridgeSpec { src: BLK_B02, dst: BLK_B11, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B03, dst: BLK_B11, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_B00,
+        dst: BLK_B10,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B01,
+        dst: BLK_B10,
+        slot: OperandSlot::B,
+    },
+    BridgeSpec {
+        src: BLK_B02,
+        dst: BLK_B11,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B03,
+        dst: BLK_B11,
+        slot: OperandSlot::B,
+    },
     // Chain B — level 2 → 3
-    BridgeSpec { src: BLK_B10, dst: BLK_B20, slot: OperandSlot::A },
-    BridgeSpec { src: BLK_B11, dst: BLK_B20, slot: OperandSlot::B },
+    BridgeSpec {
+        src: BLK_B10,
+        dst: BLK_B20,
+        slot: OperandSlot::A,
+    },
+    BridgeSpec {
+        src: BLK_B11,
+        dst: BLK_B20,
+        slot: OperandSlot::B,
+    },
     // Chain B — fee tail
-    BridgeSpec { src: BLK_B20, dst: BLK_B21, slot: OperandSlot::A },
+    BridgeSpec {
+        src: BLK_B20,
+        dst: BLK_B21,
+        slot: OperandSlot::A,
+    },
 ];
 
 fn dst_col_at(block: usize, slot: OperandSlot, base_col: usize) -> usize {
@@ -537,10 +577,7 @@ pub fn build_balance_trace_parts(
 /// used to be free witnesses. `base_col` is the column offset of the
 /// balance block inside the composite trace; pass `0` for the
 /// standalone `BalanceGateAir`.
-pub fn emit_balance_selector_public_columns(
-    base_col: usize,
-    log_rows: usize,
-) -> Vec<PublicColumn> {
+pub fn emit_balance_selector_public_columns(base_col: usize, log_rows: usize) -> Vec<PublicColumn> {
     assert!(
         log_rows >= BALANCE_MIN_LOG_ROWS,
         "balance selector publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
@@ -609,10 +646,8 @@ pub fn emit_balance_value_public_columns(
         "balance value publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
     );
     let values: [u64; 13] = [
-        inputs[0], inputs[1], inputs[2], inputs[3],
-        outputs[0], outputs[1], outputs[2], outputs[3],
-        outputs[4], outputs[5], outputs[6], outputs[7],
-        fee,
+        inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1], outputs[2], outputs[3],
+        outputs[4], outputs[5], outputs[6], outputs[7], fee,
     ];
     let mut out = Vec::with_capacity(13);
     for (i, &(blk, slot)) in PRIMARY_OPERAND_PINS.iter().enumerate() {
@@ -704,8 +739,7 @@ impl BalanceGateAir {
     /// the actual tx, instances `1..n_instances` are zero-filled
     /// padding (operands `(0, 0)` trivially satisfy every constraint).
     pub fn build_trace(&self, inputs: [u64; 4], outputs: [u64; 8], fee: u64) -> Trace {
-        let (cols, domains) =
-            build_balance_trace_parts(self.log_rows, inputs, outputs, fee);
+        let (cols, domains) = build_balance_trace_parts(self.log_rows, inputs, outputs, fee);
         Trace::new_with_domains(cols, domains)
     }
 }
@@ -954,8 +988,7 @@ mod tests {
         );
         assert_eq!(publics.len(), 13);
         // The fee pin must land on BLK_B21.b.
-        let expected_fee_col =
-            BLK_B21 * BIT_ADDER_N_COLS + BIT_ADDER_COL_B;
+        let expected_fee_col = BLK_B21 * BIT_ADDER_N_COLS + BIT_ADDER_COL_B;
         assert_eq!(publics[12].col, expected_fee_col);
         assert_eq!(publics[12].values.len(), 1 << LOG_ROWS);
         // Fee value is 13 = 0b1101 → bits 0, 2, 3 should be ONE.

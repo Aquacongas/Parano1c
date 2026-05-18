@@ -81,8 +81,7 @@ pub const N_SPINE_ROUND_VARS: usize = 7;
 /// `log2(4) = 2` element-within-state variables.
 pub const N_SPINE_ELEM_VARS: usize = 2;
 /// Total variable count of the unified MLE.
-pub const N_SPINE_UNIFIED_VARS: usize =
-    N_SPINE_SLOT_VARS + N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS;
+pub const N_SPINE_UNIFIED_VARS: usize = N_SPINE_SLOT_VARS + N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS;
 /// `2^15 = 32 768` cells.
 pub const N_SPINE_UNIFIED_CELLS: usize = 1 << N_SPINE_UNIFIED_VARS;
 
@@ -126,9 +125,7 @@ impl SpineUnifiedMle {
         debug_assert!(slot < 1 << N_SPINE_SLOT_VARS);
         debug_assert!(round < 1 << N_SPINE_ROUND_VARS);
         debug_assert!(elem < 1 << N_SPINE_ELEM_VARS);
-        (slot << (N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS))
-            | (round << N_SPINE_ELEM_VARS)
-            | elem
+        (slot << (N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS)) | (round << N_SPINE_ELEM_VARS) | elem
     }
 
     /// Fill in one slot's cells from an instrumented `PermLayerWitness`.
@@ -227,7 +224,11 @@ impl SpineUnifiedMle {
                 acc += mds_coeff(r, e, j) * pi[j];
             }
             let c2 = self.state[idx_y] + acc;
-            assert_eq!(c2, Block128::ZERO, "C2 violated at idx_y {idx_y} (dec={dec})");
+            assert_eq!(
+                c2,
+                Block128::ZERO,
+                "C2 violated at idx_y {idx_y} (dec={dec})"
+            );
         }
     }
 }
@@ -364,14 +365,18 @@ mod tests {
 
     #[test]
     fn unified_mle_satisfies_sbox_identity() {
-        let state_ins: Vec<_> = (0..N_SPINE_SLOTS).map(|i| random_state(i as u128 + 1)).collect();
+        let state_ins: Vec<_> = (0..N_SPINE_SLOTS)
+            .map(|i| random_state(i as u128 + 1))
+            .collect();
         let (mle, _) = build_unified_mle(&state_ins);
         mle.debug_check_identity();
     }
 
     #[test]
     fn padded_cells_are_zero() {
-        let state_ins: Vec<_> = (0..N_SPINE_SLOTS).map(|i| random_state(i as u128 + 1)).collect();
+        let state_ins: Vec<_> = (0..N_SPINE_SLOTS)
+            .map(|i| random_state(i as u128 + 1))
+            .collect();
         let (mle, _) = build_unified_mle(&state_ins);
         // Slots 59..63 must be fully zero.
         for slot in N_SPINE_SLOTS..(1 << N_SPINE_SLOT_VARS) {

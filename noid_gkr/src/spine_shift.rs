@@ -180,7 +180,9 @@ pub fn spine_rc_dec_table() -> &'static Vec<Block128> {
 /// Cached spine MDS lane tables (`OnceLock`), one per lane.
 pub fn spine_mds_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
     static CACHE: OnceLock<[Vec<Block128>; STATE_SIZE]> = OnceLock::new();
-    CACHE.get_or_init(|| std::array::from_fn(|j| build_mds_lane_table_for_live_slots(j, N_SPINE_SLOTS)))
+    CACHE.get_or_init(|| {
+        std::array::from_fn(|j| build_mds_lane_table_for_live_slots(j, N_SPINE_SLOTS))
+    })
 }
 
 /// Cached `project_lane(spine_sigma_dec, j)` for each lane j (`OnceLock`).
@@ -474,9 +476,7 @@ mod tests {
     fn mu_table_matches_definition() {
         let tab = build_mu_table();
         for idx in 0..N_SPINE_UNIFIED_CELLS {
-            let want = if slot_of(idx as u16) < N_SPINE_SLOTS
-                && round_of(idx as u16) < N_ROUNDS
-            {
+            let want = if slot_of(idx as u16) < N_SPINE_SLOTS && round_of(idx as u16) < N_ROUNDS {
                 Block128::ONE
             } else {
                 Block128::ZERO
@@ -521,7 +521,11 @@ mod tests {
                     } else {
                         Block128::from(ROUND_CONSTANTS[elem][round])
                     };
-                    assert_eq!(rc_evaluate(&pt), want, "slot={slot} round={round} elem={elem}");
+                    assert_eq!(
+                        rc_evaluate(&pt),
+                        want,
+                        "slot={slot} round={round} elem={elem}"
+                    );
                 }
             }
         }

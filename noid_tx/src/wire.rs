@@ -354,9 +354,7 @@ impl PublicInputs {
         }
         let coinbase_credit = take_u64(src)?;
         let log_slots = take_u32(src)?;
-        if log_slots < crate::public::MIN_LOG_SLOTS
-            || log_slots > crate::public::MAX_LOG_SLOTS
-        {
+        if log_slots < crate::public::MIN_LOG_SLOTS || log_slots > crate::public::MAX_LOG_SLOTS {
             return Err(WireError::ShapeMismatch);
         }
         let mut is_activation = [false; crate::types::MAX_OUTPUTS];

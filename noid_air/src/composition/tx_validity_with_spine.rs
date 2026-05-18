@@ -14,9 +14,7 @@
 //!   [`SPINE_BLOCK_OUTER_BASE`] via [`ShiftedColumnsConstraint`].
 
 use crate::airs::fri_state_combiner_composite::FriStateCombinerComposite;
-use crate::airs::fri_state_open::{
-    FriStateOpenAir, FriStateOpenWitness, FRI_STATE_OPEN_N_INPUTS,
-};
+use crate::airs::fri_state_open::{FriStateOpenAir, FriStateOpenWitness, FRI_STATE_OPEN_N_INPUTS};
 use crate::airs::tx_body_merkle::{TxBodyMerkleBoundaryPins, TXBODY_MERKLE_N_PERMS};
 use crate::airs::tx_body_spine::{spine_n_cols, TxBodySpineComposite, SPINE_LOG_ROWS};
 use crate::composition::spine_adapter::SpineEmbeddingLayout;
@@ -81,13 +79,23 @@ struct ShiftedColumnsConstraint {
 impl ShiftedColumnsConstraint {
     fn new(inner: Box<dyn Constraint>, offset: usize, inner_n_cols: usize) -> Self {
         for &c in inner.columns() {
-            assert!(c < inner_n_cols, "constraint col {c} >= inner range {inner_n_cols}");
+            assert!(
+                c < inner_n_cols,
+                "constraint col {c} >= inner range {inner_n_cols}"
+            );
         }
         for &c in inner.shifted_columns() {
-            assert!(c < inner_n_cols, "constraint shifted col {c} >= inner range {inner_n_cols}");
+            assert!(
+                c < inner_n_cols,
+                "constraint shifted col {c} >= inner range {inner_n_cols}"
+            );
         }
         let shifted_cols = inner.columns().iter().map(|&c| c + offset).collect();
-        let shifted_next = inner.shifted_columns().iter().map(|&c| c + offset).collect();
+        let shifted_next = inner
+            .shifted_columns()
+            .iter()
+            .map(|&c| c + offset)
+            .collect();
         Self {
             inner,
             shifted_cols,
@@ -374,8 +382,8 @@ impl TxValidityCompositeWithSpine {
         {
             use crate::airs::balance_gate::BALANCE_N_BLOCKS;
             use crate::airs::bit_adder::{BIT_ADDER_COL_B, BIT_ADDER_N_COLS};
-            use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
             use crate::airs::tx_body_spine::TXV_COL_OFFSET;
+            use crate::airs::tx_validity::TX_VALIDITY_BALANCE_COL_OFFSET;
             // `B21` is balance block ordinal 10 — the last block. Derive
             // via `BALANCE_N_BLOCKS - 1` to keep this pin free of the
             // private `BLK_B21` constant.
@@ -390,8 +398,12 @@ impl TxValidityCompositeWithSpine {
                 cols: [usize; 2],
             }
             impl Constraint for CoinbaseNoFeeGate {
-                fn degree(&self) -> usize { 2 }
-                fn columns(&self) -> &[usize] { &self.cols }
+                fn degree(&self) -> usize {
+                    2
+                }
+                fn columns(&self) -> &[usize] {
+                    &self.cols
+                }
                 fn evaluate(&self, frame: EvalFrame) -> Block128 {
                     frame.local[0] * frame.local[1]
                 }
@@ -458,7 +470,8 @@ impl TxValidityCompositeWithSpine {
                 "Stage E.5.f₃: boundary_pins.is_coinbase_leaf[0] must equal is_coinbase",
             );
             assert_eq!(
-                boundary_pins.is_coinbase_leaf[1], Block128::ZERO,
+                boundary_pins.is_coinbase_leaf[1],
+                Block128::ZERO,
                 "Stage E.5.f₃: boundary_pins.is_coinbase_leaf[1] must be zero (native L14 shape)",
             );
 
@@ -526,16 +539,17 @@ impl TxValidityCompositeWithSpine {
                 cols: [usize; 2],
             }
             impl Constraint for CreditZeroOnRegularGate {
-                fn degree(&self) -> usize { 2 }
-                fn columns(&self) -> &[usize] { &self.cols }
+                fn degree(&self) -> usize {
+                    2
+                }
+                fn columns(&self) -> &[usize] {
+                    &self.cols
+                }
                 fn evaluate(&self, frame: EvalFrame) -> Block128 {
                     (Block128::ONE + frame.local[0]) * frame.local[1]
                 }
                 fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
-                    noid_core::hardware::clmul_gcm(
-                        frame.local[0] ^ 1u128,
-                        frame.local[1],
-                    )
+                    noid_core::hardware::clmul_gcm(frame.local[0] ^ 1u128, frame.local[1])
                 }
             }
             constraints.push(Box::new(CreditZeroOnRegularGate {
@@ -547,8 +561,12 @@ impl TxValidityCompositeWithSpine {
                 cols: [usize; 4],
             }
             impl Constraint for CreditEqualsB21SumGate {
-                fn degree(&self) -> usize { 3 }
-                fn columns(&self) -> &[usize] { &self.cols }
+                fn degree(&self) -> usize {
+                    3
+                }
+                fn columns(&self) -> &[usize] {
+                    &self.cols
+                }
                 fn evaluate(&self, frame: EvalFrame) -> Block128 {
                     let is_coinbase = frame.local[0];
                     let is_input_b21 = frame.local[1];
@@ -718,18 +736,8 @@ impl TxValidityCompositeWithSpine {
         // with. Matches the `is_live` logic used for T2a overrides and
         // the per-input/output valid-selector gates. `n_live_*` fits in
         // u8 because MAX_INPUTS / MAX_OUTPUTS are both < 256.
-        let n_live_inputs = self
-            .body
-            .inputs
-            .iter()
-            .filter(|inp| inp.valid)
-            .count() as u8;
-        let n_live_outputs = self
-            .body
-            .outputs
-            .iter()
-            .filter(|out| out.valid)
-            .count() as u8;
+        let n_live_inputs = self.body.inputs.iter().filter(|inp| inp.valid).count() as u8;
+        let n_live_outputs = self.body.outputs.iter().filter(|out| out.valid).count() as u8;
 
         // Stage E.6 — both combiner sides carry `log_slots` in their
         // preimages and the absorb-block AIR enforces that the declared
@@ -1052,26 +1060,17 @@ pub mod fixture {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(11),
-            mk_secret(22),
-            mk_secret(33),
-            mk_secret(44),
-        ];
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(11, 0, addrs[0]),
@@ -1113,9 +1112,7 @@ pub mod fixture {
 
     // D.1 — TxBody → boundary pins lowering.
     use noid_poseidon2b::primitives::{fee_leaf as native_fee_leaf, Address};
-    use noid_tx::{
-        MAX_INPUTS as TX_MAX_INPUTS, MAX_OUTPUTS as TX_MAX_OUTPUTS, TxInput, TxOutput,
-    };
+    use noid_tx::{TxInput, TxOutput, MAX_INPUTS as TX_MAX_INPUTS, MAX_OUTPUTS as TX_MAX_OUTPUTS};
 
     pub fn digest_to_block128_pair(bytes: &[u8; 32]) -> [Block128; 2] {
         let mut lo = [0u8; 16];
@@ -1140,10 +1137,7 @@ pub mod fixture {
         pins.fee_leaf = digest_to_block128_pair(&native_fee_leaf(body.fee));
         // E.5.f₂: L14 = [is_coinbase_as_u128, 0], matching
         // `noid_poseidon2b::primitives::is_coinbase_leaf`.
-        pins.is_coinbase_leaf = [
-            Block128::from(body.is_coinbase as u128),
-            Block128::ZERO,
-        ];
+        pins.is_coinbase_leaf = [Block128::from(body.is_coinbase as u128), Block128::ZERO];
         for i in 0..TX_MAX_INPUTS {
             let input = body.inputs.get(i).copied().unwrap_or_else(TxInput::dummy);
             let [owner_hi, owner_lo] = input.owner.as_fields();
@@ -1287,12 +1281,8 @@ pub mod fixture {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(live_values[0] as u128, live_slots[0], addrs[0]),
@@ -1437,12 +1427,8 @@ pub mod fixture {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(live_values[0] as u128, live_slots[0], addrs[0]),
@@ -1488,18 +1474,17 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::fixture::native_address;
     use super::fixture::{
         build_honest, build_honest_realistic, empty_coinbase_tx_body, empty_tx_body,
-        honest_coinbase_pins_and_inputs, honest_pins_and_inputs,
-        mk_combiner_preimage, mk_eval_point, mk_gamma,
-        mk_secret, spend_with_owner,
+        honest_coinbase_pins_and_inputs, honest_pins_and_inputs, mk_combiner_preimage,
+        mk_eval_point, mk_gamma, mk_secret, spend_with_owner,
     };
+    use super::*;
     use crate::airs::fri_state_combiner::{
         build_combiner_side_trace, extract_combiner_digest_fields, COMBINER_PERM_LAYOUT,
     };
     use crate::airs::fri_state_open::FriStateOpenClaim;
-    use super::fixture::native_address;
 
     fn build_honest_all_active() -> TxValidityCompositeWithSpine {
         // 4-active-spend / 8-output honest composite. Exercises every
@@ -1519,12 +1504,8 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage,
-            prev_fields,
-            new_preimage,
-            new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
         let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             mk_secret(101),
@@ -1538,7 +1519,6 @@ mod tests {
             native_address(secrets[2]),
             native_address(secrets[3]),
         ];
-
 
         let claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS] = [
             spend_with_owner(101, 0, addrs[0]),
@@ -1606,7 +1586,10 @@ mod tests {
             tx_validity_with_spine_n_cols(),
             LEAF_BAND_RESERVED + spine_n_cols() + 1
         );
-        assert_eq!(coinbase_credit_bit_col(), LEAF_BAND_RESERVED + spine_n_cols());
+        assert_eq!(
+            coinbase_credit_bit_col(),
+            LEAF_BAND_RESERVED + spine_n_cols()
+        );
         assert_eq!(TX_VALIDITY_WITH_SPINE_LOG_ROWS, SPINE_LOG_ROWS);
         assert_eq!(TX_VALIDITY_WITH_SPINE_LOG_ROWS, TX_VALIDITY_LEAF_LOG_ROWS);
     }
@@ -1646,8 +1629,7 @@ mod tests {
         let comp = build_honest();
         let mut trace = comp.build_trace();
         let wrap = comp.spine_layout().wrap_output_outer_cell(0);
-        trace.columns[wrap.col][wrap.row] =
-            trace.columns[wrap.col][wrap.row] + Block128::ONE;
+        trace.columns[wrap.col][wrap.row] = trace.columns[wrap.col][wrap.row] + Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -1716,18 +1698,14 @@ mod tests {
     /// pair to catch a silent no-op.
     #[test]
     fn comp4_out_open_slot_index_bit_tamper_rejects() {
-        use crate::airs::fri_state_open::{
-            FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_OUTPUT_LAYOUT,
-        };
+        use crate::airs::fri_state_open::{FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_OUTPUT_LAYOUT};
         use crate::composition::tx_validity_composite::SKEL_OUT_OPEN_COL_OFFSET;
         for output in 0..4 {
             for k in 0..FRI_STATE_OPEN_LOG_SLOTS {
                 let comp = build_honest_realistic();
                 let mut trace = comp.build_trace();
-                let col = SKEL_OUT_OPEN_COL_OFFSET
-                    + FRI_STATE_OPEN_OUTPUT_LAYOUT.col_idx_bit(k);
-                trace.columns[col][output] =
-                    trace.columns[col][output] + Block128::ONE;
+                let col = SKEL_OUT_OPEN_COL_OFFSET + FRI_STATE_OPEN_OUTPUT_LAYOUT.col_idx_bit(k);
+                trace.columns[col][output] = trace.columns[col][output] + Block128::ONE;
                 assert!(
                     !comp.air().check(&trace),
                     "comp-4: out-open idx_bit(k={k}) tamper at output {output} must REJECT",
@@ -1753,8 +1731,7 @@ mod tests {
         for j in 0..4 {
             let mut trace = comp.build_trace();
             let row = MAX_INPUTS + j;
-            trace.columns[slot_col][row] =
-                trace.columns[slot_col][row] + Block128::ONE;
+            trace.columns[slot_col][row] = trace.columns[slot_col][row] + Block128::ONE;
             assert!(
                 !comp.air().check(&trace),
                 "comp-4: spine SlotIndex[MAX_INPUTS+{j}] tamper must REJECT",
@@ -1781,13 +1758,11 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
 
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44),
-        ];
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(11), mk_secret(22), mk_secret(33), mk_secret(44)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -1829,7 +1804,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
+            WithSpineOptions {
+                is_coinbase: true,
+                coinbase_credit: 0,
+            },
         )
     }
 
@@ -1866,8 +1844,7 @@ mod tests {
         // makes the bridge gate fire if we flip the same row).
         let layout_inst = crate::airs::tx_body_merkle::build_instance_layout();
         let row = layout_inst[42].slot_base_row;
-        cols[SKEL_IS_COINBASE_COL][row] =
-            cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
+        cols[SKEL_IS_COINBASE_COL][row] = cols[SKEL_IS_COINBASE_COL][row] + Block128::ONE;
         assert!(!comp.air().check(&Trace::new(cols)));
     }
 
@@ -1901,12 +1878,10 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
-        ];
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -1947,7 +1922,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: true, coinbase_credit: 0 },
+            WithSpineOptions {
+                is_coinbase: true,
+                coinbase_credit: 0,
+            },
         );
     }
 
@@ -1971,12 +1949,10 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
-        ];
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -2019,7 +1995,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
+            WithSpineOptions {
+                is_coinbase: true,
+                coinbase_credit: 100,
+            },
         )
     }
 
@@ -2050,12 +2029,10 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(10), mk_secret(20), mk_secret(30), mk_secret(40),
-        ];
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(10), mk_secret(20), mk_secret(30), mk_secret(40)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -2099,7 +2076,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: false, coinbase_credit: 0 },
+            WithSpineOptions {
+                is_coinbase: false,
+                coinbase_credit: 0,
+            },
         );
         let trace = comp.build_trace();
         assert!(
@@ -2159,12 +2139,10 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(5), mk_secret(6), mk_secret(7), mk_secret(8),
-        ];
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(5), mk_secret(6), mk_secret(7), mk_secret(8)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -2205,7 +2183,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: true, coinbase_credit: 100 },
+            WithSpineOptions {
+                is_coinbase: true,
+                coinbase_credit: 100,
+            },
         );
     }
 
@@ -2228,8 +2209,7 @@ mod tests {
             + TX_VALIDITY_BALANCE_COL_OFFSET
             + BALANCE_BLK_B21 * BIT_ADDER_N_COLS
             + BIT_ADDER_COL_SUM;
-        trace.columns[b21_sum_col][1] =
-            trace.columns[b21_sum_col][1] + Block128::ONE;
+        trace.columns[b21_sum_col][1] = trace.columns[b21_sum_col][1] + Block128::ONE;
         assert!(!comp.air().check(&trace));
     }
 
@@ -2265,12 +2245,10 @@ mod tests {
             &build_combiner_side_trace(&new_preimage),
             COMBINER_PERM_LAYOUT,
         );
-        let combiner = FriStateCombinerComposite::new(
-            prev_preimage, prev_fields, new_preimage, new_fields,
-        );
-        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
-            mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4),
-        ];
+        let combiner =
+            FriStateCombinerComposite::new(prev_preimage, prev_fields, new_preimage, new_fields);
+        let secrets: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] =
+            [mk_secret(1), mk_secret(2), mk_secret(3), mk_secret(4)];
         let addrs: [[Block128; 2]; FRI_STATE_OPEN_N_INPUTS] = [
             native_address(secrets[0]),
             native_address(secrets[1]),
@@ -2311,7 +2289,10 @@ mod tests {
             combiner,
             open_air,
             open_witness,
-            WithSpineOptions { is_coinbase: false, coinbase_credit: 42 },
+            WithSpineOptions {
+                is_coinbase: false,
+                coinbase_credit: 42,
+            },
         );
     }
 

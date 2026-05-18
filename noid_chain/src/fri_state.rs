@@ -25,11 +25,11 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::channel::Channel;
 use noid_fri::hasher::Blake3Hasher;
-use noid_poseidon2b::native::{capacity_iv, Poseidon2bSponge, TAG_FRISTATE};
 use noid_fri::prover::{
     commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment,
 };
 use noid_fri::verifier::verify as fri_verify;
+use noid_poseidon2b::native::{capacity_iv, Poseidon2bSponge, TAG_FRISTATE};
 
 /// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not
 /// a circuit-wide constant — the AIR and STARK transcript are
@@ -537,20 +537,36 @@ mod tests {
         let mk = |seed: u8| FriStateCombinerPreimage {
             log_slots: 24,
             r_val: std::array::from_fn(|i| seed ^ (i as u8)),
-            r_owner_hi: std::array::from_fn(|i| seed.wrapping_add(0x11) ^ (i as u8).wrapping_mul(3)),
-            r_owner_lo: std::array::from_fn(|i| seed.wrapping_add(0x22) ^ (i as u8).wrapping_mul(5)),
+            r_owner_hi: std::array::from_fn(|i| {
+                seed.wrapping_add(0x11) ^ (i as u8).wrapping_mul(3)
+            }),
+            r_owner_lo: std::array::from_fn(|i| {
+                seed.wrapping_add(0x22) ^ (i as u8).wrapping_mul(5)
+            }),
         };
 
         let prev = mk(0x11);
         let new = mk(0x77);
 
         // Native digest through `combine_roots`.
-        let native_prev = combine_roots(prev.log_slots as usize, &prev.r_val, &prev.r_owner_hi, &prev.r_owner_lo);
-        let native_new = combine_roots(new.log_slots as usize, &new.r_val, &new.r_owner_hi, &new.r_owner_lo);
+        let native_prev = combine_roots(
+            prev.log_slots as usize,
+            &prev.r_val,
+            &prev.r_owner_hi,
+            &prev.r_owner_lo,
+        );
+        let native_new = combine_roots(
+            new.log_slots as usize,
+            &new.r_val,
+            &new.r_owner_hi,
+            &new.r_owner_lo,
+        );
 
         // Digest extracted from an honest AIR trace.
-        let air_prev = extract_combiner_digest(&build_combiner_side_trace(&prev), COMBINER_PERM_LAYOUT);
-        let air_new = extract_combiner_digest(&build_combiner_side_trace(&new), COMBINER_PERM_LAYOUT);
+        let air_prev =
+            extract_combiner_digest(&build_combiner_side_trace(&prev), COMBINER_PERM_LAYOUT);
+        let air_new =
+            extract_combiner_digest(&build_combiner_side_trace(&new), COMBINER_PERM_LAYOUT);
 
         assert_eq!(
             native_prev, air_prev,

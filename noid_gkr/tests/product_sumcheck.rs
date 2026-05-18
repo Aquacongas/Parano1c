@@ -21,7 +21,9 @@ fn rand_vec(rng: &mut StdRng, n: usize) -> Vec<Block128> {
 }
 
 fn rand_point(rng: &mut StdRng, n_vars: usize) -> Vec<Block128> {
-    (0..n_vars).map(|_| Block128::from(rng.gen::<u128>())).collect()
+    (0..n_vars)
+        .map(|_| Block128::from(rng.gen::<u128>()))
+        .collect()
 }
 
 fn fresh_channel(seed: u64) -> Poseidon2bChannel {

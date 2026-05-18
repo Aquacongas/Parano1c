@@ -160,7 +160,13 @@ impl CarryRippleAir {
     /// Expects `adders.len() == 2^(log_rows - 6)`.
     pub fn build_trace(&self, adders: &[(u64, u64)]) -> Trace {
         let n = self.n_instances();
-        assert_eq!(adders.len(), n, "expected {} adders, got {}", n, adders.len());
+        assert_eq!(
+            adders.len(),
+            n,
+            "expected {} adders, got {}",
+            n,
+            adders.len()
+        );
         let n_rows = 1usize << self.log_rows;
         let w = CARRY_RIPPLE_WORD_BITS;
         let mut a_col = vec![Block128::ZERO; n_rows];

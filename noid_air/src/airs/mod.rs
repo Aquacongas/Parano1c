@@ -11,57 +11,81 @@ pub mod fri_state_combiner;
 pub mod fri_state_combiner_composite;
 pub mod fri_state_open;
 pub mod linear_combination;
-pub mod tx_body_merkle;
-pub mod tx_body_merkle_boundary;
-pub mod tx_body_spine;
 pub mod poseidon_mds;
 pub mod poseidon_perm;
 pub mod poseidon_sbox;
 pub mod range_gate;
+pub mod tx_body_merkle;
+pub mod tx_body_merkle_boundary;
+pub mod tx_body_spine;
 pub mod tx_validity;
 
 pub use balance_gate::{
     build_balance_columns, build_balance_trace_parts, emit_balance_constraints,
-    emit_balance_selector_public_columns, emit_balance_value_public_columns,
-    BalanceBridgeBitsGate, BalanceBridgeCarryGate, BalanceFinalCarryGate, BalanceFinalSumGate,
-    BalanceGateAir, BalanceZeroAtTransitionGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
-    BALANCE_N_COLS,
+    emit_balance_selector_public_columns, emit_balance_value_public_columns, BalanceBridgeBitsGate,
+    BalanceBridgeCarryGate, BalanceFinalCarryGate, BalanceFinalSumGate, BalanceGateAir,
+    BalanceZeroAtTransitionGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS,
 };
 pub use bit_adder::{
     bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
-    emit_block_constraints,
-    BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, FaSumGate,
-    PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
-    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
-    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
+    emit_block_constraints, BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate,
+    BitAdderLayout, FaSumGate, PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY,
+    BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS,
+    BIT_ADDER_MAX_WIDTH, BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
+};
+pub use carry_ripple::{
+    CarryInitGate, CarryNextGate, CarryRippleAir, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
+    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
+    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS,
 };
 pub use fri_state_combiner::{
     build_combiner_side_trace, combiner_digest_row, combiner_ind_prev_out,
     combiner_instance_output_row, combiner_instance_row_offset, combiner_pre_s_base,
-    combiner_pre_s_row, combiner_pre_seeds, emit_fri_state_combiner,
-    extract_combiner_digest, extract_combiner_digest_fields, rate_block_to_lanes,
-    FriStateCombinerAir, FriStateCombinerPreimage, COMBINER_IND_DIGEST,
-    COMBINER_IND_PERM_0_ROW_0, COMBINER_IND_PREV_OUT_BASE, COMBINER_PERM_BASE,
-    COMBINER_PERM_LAYOUT, COMBINER_PRE_S_BASE, COMBINER_PRE_S_N_COLS,
-    FRI_STATE_COMBINER_LOG_ROWS, FRI_STATE_COMBINER_N_ABSORB_BLOCKS,
-    FRI_STATE_COMBINER_N_COLS, FRI_STATE_COMBINER_N_PERMS_PER_SIDE,
-    FRI_STATE_COMBINER_N_ROWS, FRI_STATE_COMBINER_PAD_LANE_0,
-    FRI_STATE_COMBINER_PAD_LANE_1, FRI_STATE_COMBINER_PREIMAGE_BYTES,
-    FRI_STATE_COMBINER_SCAFFOLD_N_COLS, FRI_STATE_COMBINER_SLOT_ROWS,
+    combiner_pre_s_row, combiner_pre_seeds, emit_fri_state_combiner, extract_combiner_digest,
+    extract_combiner_digest_fields, rate_block_to_lanes, FriStateCombinerAir,
+    FriStateCombinerPreimage, COMBINER_IND_DIGEST, COMBINER_IND_PERM_0_ROW_0,
+    COMBINER_IND_PREV_OUT_BASE, COMBINER_PERM_BASE, COMBINER_PERM_LAYOUT, COMBINER_PRE_S_BASE,
+    COMBINER_PRE_S_N_COLS, FRI_STATE_COMBINER_LOG_ROWS, FRI_STATE_COMBINER_N_ABSORB_BLOCKS,
+    FRI_STATE_COMBINER_N_COLS, FRI_STATE_COMBINER_N_PERMS_PER_SIDE, FRI_STATE_COMBINER_N_ROWS,
+    FRI_STATE_COMBINER_PAD_LANE_0, FRI_STATE_COMBINER_PAD_LANE_1,
+    FRI_STATE_COMBINER_PREIMAGE_BYTES, FRI_STATE_COMBINER_SCAFFOLD_N_COLS,
+    FRI_STATE_COMBINER_SLOT_ROWS,
 };
 pub use fri_state_combiner_composite::{
-    FriStateCombinerComposite, COMBINER_COMPOSITE_LOG_ROWS, COMBINER_COMPOSITE_N_COLS,
-    COMBINER_COMPOSITE_N_ROWS, COMBINER_COMPOSITE_NEW_OFFSET, COMBINER_COMPOSITE_PREV_OFFSET,
+    FriStateCombinerComposite, COMBINER_COMPOSITE_LOG_ROWS, COMBINER_COMPOSITE_NEW_OFFSET,
+    COMBINER_COMPOSITE_N_COLS, COMBINER_COMPOSITE_N_ROWS, COMBINER_COMPOSITE_PREV_OFFSET,
 };
 pub use fri_state_open::{
     col_delta_acc_owner_hi, col_delta_acc_owner_lo, col_delta_acc_value, col_delta_owner_hi,
     col_delta_owner_lo, col_delta_value, col_eq_delta_owner_hi, col_eq_delta_owner_lo,
     col_eq_delta_value, col_eq_ladder, col_eval_point, col_is_mint, col_is_spend, col_live_mask,
-    col_opened_pre_owner_hi, col_opened_pre_owner_lo, col_opened_pre_value,
-    col_proof_round_digest, FriStateOpenAir, FriStateOpenClaim, FriStateOpenWitness,
-    COL_IDX_BIT_BASE, COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_LOG_ROWS,
-    FRI_STATE_OPEN_LOG_SLOTS, FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS,
-    FRI_STATE_OPEN_WITNESS_COLS,
+    col_opened_pre_owner_hi, col_opened_pre_owner_lo, col_opened_pre_value, col_proof_round_digest,
+    FriStateOpenAir, FriStateOpenClaim, FriStateOpenWitness, COL_IDX_BIT_BASE, COL_OWNER_HI,
+    COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_LOG_ROWS, FRI_STATE_OPEN_LOG_SLOTS,
+    FRI_STATE_OPEN_N_INPUTS, FRI_STATE_OPEN_N_ROWS, FRI_STATE_OPEN_WITNESS_COLS,
+};
+pub use linear_combination::LinearCombinationAir;
+pub use poseidon_mds::{apply_mds_row, emit_mds_row_constraints, MdsKind, MdsLayout, MdsRowGate};
+pub use poseidon_perm::{
+    build_perm_trace, emit_perm_all, emit_perm_all_at, emit_perm_mds_blend, emit_perm_mds_blend_at,
+    emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at, emit_perm_public_columns,
+    emit_perm_public_columns_at, emit_perm_public_columns_row_major_at, emit_perm_rc_binding,
+    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at, extract_perm_output,
+    is_full_round, perm_is_full_values, perm_is_full_values_row_major, perm_is_round_values,
+    perm_is_round_values_row_major, perm_rc_values, perm_rc_values_row_major, write_perm_trace_at,
+    write_perm_trace_at_offset, PartialSboxKillGate, PermLayout, PermMdsBlendGate,
+    PoseidonPermColumns, DEFAULT_PERM_LAYOUT, POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND,
+    POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT, POSEIDON_COL_X2,
+    POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS, POSEIDON_PERM_LOG_ROWS,
+    POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
+};
+pub use poseidon_sbox::{
+    build_sbox_x7_columns, emit_sbox_x7_constraints, SboxX7Layout, SBOX_X7_N_COLS,
+};
+pub use range_gate::{
+    AccInitGate, AccNextGate, RangeGateAir, WeightInitGate, WeightNextGate, RANGE_GATE_COL_ACC,
+    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
+    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS,
 };
 pub use tx_body_merkle::{
     build_instance_layout, build_tx_body_merkle_trace,
@@ -75,43 +99,6 @@ pub use tx_body_merkle::{
     TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE,
     TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS,
 };
-pub use carry_ripple::{
-    CarryInitGate, CarryNextGate, CarryRippleAir, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
-    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
-    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS,
-};
-pub use linear_combination::LinearCombinationAir;
-pub use poseidon_mds::{
-    apply_mds_row, emit_mds_row_constraints, MdsKind, MdsLayout, MdsRowGate,
-};
-pub use poseidon_perm::{
-    build_perm_trace, emit_perm_all, emit_perm_all_at, emit_perm_mds_blend,
-    emit_perm_mds_blend_at, emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at,
-    emit_perm_public_columns, emit_perm_public_columns_at, emit_perm_public_columns_row_major_at,
-    emit_perm_rc_binding, emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
-    extract_perm_output, is_full_round, perm_is_full_values, perm_is_full_values_row_major,
-    perm_is_round_values, perm_is_round_values_row_major, perm_rc_values,
-    perm_rc_values_row_major, write_perm_trace_at, write_perm_trace_at_offset,
-    PartialSboxKillGate, PermLayout,
-    PermMdsBlendGate, PoseidonPermColumns, DEFAULT_PERM_LAYOUT, POSEIDON_COL_IS_FULL,
-    POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
-    POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
-    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS,
-};
-pub use poseidon_sbox::{
-    build_sbox_x7_columns, emit_sbox_x7_constraints, SboxX7Layout, SBOX_X7_N_COLS,
-};
-pub use range_gate::{
-    AccInitGate, AccNextGate, RangeGateAir, WeightInitGate, WeightNextGate, RANGE_GATE_COL_ACC,
-    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
-    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS,
-};
-pub use tx_validity::{
-    TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
-    TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
-    TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
-    TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
-};
 pub use tx_body_merkle_boundary::{
     TxBodyMerkleBoundaryAir, TX_BODY_MERKLE_BOUNDARY_COL_LANE0, TX_BODY_MERKLE_BOUNDARY_COL_LANE1,
     TX_BODY_MERKLE_BOUNDARY_LOG_ROWS, TX_BODY_MERKLE_BOUNDARY_N_COLS,
@@ -120,4 +107,10 @@ pub use tx_body_spine::{
     emit_txv_tx_body_public_columns, merkle_band_width, spine_n_cols, txv_live_mask_col,
     txv_live_mask_programme, TxBodySpineComposite, SPINE_LOG_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
     TX_BODY_MERKLE_COL_OFFSET,
+};
+pub use tx_validity::{
+    TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
+    TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
+    TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS, TX_VALIDITY_N_COLS,
+    TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
 };

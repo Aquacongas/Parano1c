@@ -92,9 +92,7 @@ pub fn lagrange_at_0_1_2(evals: &[Block128; 3], r: Block128) -> Block128 {
     let n0 = r1 * r2;
     let n1 = r0 * r2;
     let n2 = r0 * r1;
-    evals[0] * n0 * denom_inv[0]
-        + evals[1] * n1 * denom_inv[1]
-        + evals[2] * n2 * denom_inv[2]
+    evals[0] * n0 * denom_inv[0] + evals[1] * n1 * denom_inv[1] + evals[2] * n2 * denom_inv[2]
 }
 
 /// One `(r, v)` MLE-evaluation claim on the shared target MLE `B`.
@@ -398,7 +396,10 @@ mod tests {
         let b = rand_vec(&mut rng, 1 << n);
         let r0 = rand_vec(&mut rng, n);
         let v0 = evaluate_slice(&b, &r0);
-        let claims = vec![EvalClaim { point: r0, value: v0 }];
+        let claims = vec![EvalClaim {
+            point: r0,
+            value: v0,
+        }];
 
         let mut cp = fresh_channel(7);
         let (proof, red_p) = prove_batch_eval(&b, &claims, &mut cp);
@@ -465,7 +466,10 @@ mod tests {
         let b = rand_vec(&mut rng, 1 << n);
         let r0 = rand_vec(&mut rng, n);
         let v0 = evaluate_slice(&b, &r0);
-        let claims = vec![EvalClaim { point: r0, value: v0 }];
+        let claims = vec![EvalClaim {
+            point: r0,
+            value: v0,
+        }];
 
         let mut cp = fresh_channel(17);
         let (mut proof, _) = prove_batch_eval(&b, &claims, &mut cp);
@@ -482,7 +486,10 @@ mod tests {
         let b = rand_vec(&mut rng, 1 << n);
         let r0 = rand_vec(&mut rng, n);
         let v0 = evaluate_slice(&b, &r0);
-        let claims = vec![EvalClaim { point: r0, value: v0 }];
+        let claims = vec![EvalClaim {
+            point: r0,
+            value: v0,
+        }];
 
         let mut c1 = fresh_channel(21);
         let (p1, _) = prove_batch_eval(&b, &claims, &mut c1);

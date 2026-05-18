@@ -19,17 +19,12 @@ pub mod tx_validity_composite;
 pub mod tx_validity_leaf;
 pub mod tx_validity_with_spine;
 
-pub use bridge::{
-    emit_cross_row_eq, write_bridge_column, BridgeHold, BridgeParams, BridgeWiring,
-};
-pub use registry::{
-    CombinerCompositeCols, FriStateOpenCols, TxBodyMerkleCols, TxValidityCols,
+pub use bridge::{emit_cross_row_eq, write_bridge_column, BridgeHold, BridgeParams, BridgeWiring};
+pub use registry::{CombinerCompositeCols, FriStateOpenCols, TxBodyMerkleCols, TxValidityCols};
+pub use row_window::{
+    InnerAirView, RowWindowParams, RowWindowWiring, RowWindowWrapper, TerminatorPinCols, WrapPolicy,
 };
 pub use spine_adapter::{SpineEmbeddingLayout, SpineLayoutError};
-pub use row_window::{
-    InnerAirView, RowWindowParams, RowWindowWiring, RowWindowWrapper, TerminatorPinCols,
-    WrapPolicy,
-};
 pub use tx_validity_leaf::{
     TxValidityCompositeLeaf, TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
 };

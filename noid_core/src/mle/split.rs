@@ -65,10 +65,8 @@ mod tests {
         assert_eq!(slices.len(), 1 << (full_log - base_log));
         assert_eq!(slices[0].len(), 1 << base_log);
 
-        let slice_values: Vec<Block128> = slices
-            .iter()
-            .map(|s| evaluate_slice(s, &r_low))
-            .collect();
+        let slice_values: Vec<Block128> =
+            slices.iter().map(|s| evaluate_slice(s, &r_low)).collect();
 
         let reconstructed = reconstruct_from_slices(&slice_values, &r_high);
 

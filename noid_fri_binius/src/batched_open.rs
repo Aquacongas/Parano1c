@@ -98,9 +98,7 @@ pub fn prove_batched_opening(
         // Compute round polynomial p(X) at X=0, X=1, X=2
         // p(alpha) = sum_j B(alpha, j) * eq(alpha, j)
         // where B(alpha, j) = sum_k gamma^k * col_k(alpha, j)
-        let (p0, p1, p2) = compute_round_poly_batched(
-            &col_folds, &eq_table, &weights, half,
-        );
+        let (p0, p1, p2) = compute_round_poly_batched(&col_folds, &eq_table, &weights, half);
 
         debug_assert_eq!(p0 + p1, claim, "Sumcheck invariant violated");
 

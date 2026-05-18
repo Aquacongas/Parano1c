@@ -48,8 +48,15 @@ pub fn prove_multipoint_sumcheck(
     target: Block128,
     channel: &mut noid_fri::Channel,
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
-    assert!(!pairs_a.is_empty(), "multipoint: at least one pair required");
-    assert_eq!(pairs_a.len(), pairs_b.len(), "A and B pair counts must match");
+    assert!(
+        !pairs_a.is_empty(),
+        "multipoint: at least one pair required"
+    );
+    assert_eq!(
+        pairs_a.len(),
+        pairs_b.len(),
+        "A and B pair counts must match"
+    );
     let n = pairs_a[0].len().trailing_zeros() as usize;
     for (a, b) in pairs_a.iter().zip(pairs_b.iter()) {
         debug_assert_eq!(a.len(), 1 << n);
@@ -264,8 +271,15 @@ pub fn prove_multipoint_sumcheck_mixed(
     target: Block128,
     channel: &mut noid_fri::Channel,
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
-    assert!(!pairs_a.is_empty(), "multipoint-mixed: at least one pair required");
-    assert_eq!(pairs_a.len(), pairs_b.len(), "A and B pair counts must match");
+    assert!(
+        !pairs_a.is_empty(),
+        "multipoint-mixed: at least one pair required"
+    );
+    assert_eq!(
+        pairs_a.len(),
+        pairs_b.len(),
+        "A and B pair counts must match"
+    );
     assert_eq!(
         pairs_a.len(),
         n_vars.len(),
@@ -376,11 +390,7 @@ pub fn prove_multipoint_sumcheck_mixed(
                         s2 ^= clmul_gcm(a_s, b_s);
                     }
                     let sk = s_flat[k];
-                    (
-                        clmul_gcm(sk, s0),
-                        clmul_gcm(sk, s1),
-                        clmul_gcm(sk, s2),
-                    )
+                    (clmul_gcm(sk, s0), clmul_gcm(sk, s1), clmul_gcm(sk, s2))
                 }
             })
             .reduce(
@@ -510,8 +520,7 @@ mod tests {
         let scaled_col1: Vec<Block128> = col1.iter().map(|v| *v * beta).collect();
         let pairs_a = vec![eq_a.clone(), eq_b.clone()];
         let pairs_b: Vec<&[Block128]> = vec![col0.as_slice(), scaled_col1.as_slice()];
-        let (rounds, challenges) =
-            prove_multipoint_sumcheck(pairs_a, pairs_b, target, &mut pch);
+        let (rounds, challenges) = prove_multipoint_sumcheck(pairs_a, pairs_b, target, &mut pch);
 
         let mut vch = Channel::new();
         let beta_v = vch.get_random_point();
@@ -634,8 +643,7 @@ mod tests {
         let scaled_col1b: Vec<Block128> = col1.iter().map(|v| *v * beta2).collect();
         let pairs_a2 = vec![eq_a.clone(), eq_b.clone()];
         let pairs_b2: Vec<&[Block128]> = vec![col0.as_slice(), scaled_col1b.as_slice()];
-        let (rounds_ref, ch_ref) =
-            prove_multipoint_sumcheck(pairs_a2, pairs_b2, target, &mut pch2);
+        let (rounds_ref, ch_ref) = prove_multipoint_sumcheck(pairs_a2, pairs_b2, target, &mut pch2);
 
         assert_eq!(rounds_mixed, rounds_ref);
         assert_eq!(ch_mixed, ch_ref);
@@ -663,11 +671,7 @@ mod tests {
             prove_multipoint_sumcheck_mixed(pairs_a, pairs_b, &n_vars, target, &mut pch);
 
         let mut vch = Channel::new();
-        let res = verify_multipoint_sumcheck_mixed(
-            &rounds,
-            target + Block128::ONE,
-            &mut vch,
-        );
+        let res = verify_multipoint_sumcheck_mixed(&rounds, target + Block128::ONE, &mut vch);
         assert!(res.is_err(), "mixed: divergent target must be rejected");
     }
 

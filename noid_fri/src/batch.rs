@@ -287,7 +287,11 @@ pub fn verify_batched_mixed(
             col_log_lens.len(),
         ));
     }
-    for (i, (c, &ll)) in column_commitments.iter().zip(col_log_lens.iter()).enumerate() {
+    for (i, (c, &ll)) in column_commitments
+        .iter()
+        .zip(col_log_lens.iter())
+        .enumerate()
+    {
         if c.log_len != ll {
             return Err(format!(
                 "verify_batched_mixed: column {i} commitment log_len {} != declared {ll}",
@@ -1105,15 +1109,17 @@ mod tests {
         eps.insert(log_short, ep_s.clone());
         eps.insert(log_long, ep_l.clone());
         let mut ntts: BTreeMap<usize, AdditiveNTT<Block128>> = BTreeMap::new();
-        ntts.insert(log_short, AdditiveNTT::<Block128>::new(log_short + LOG_RATE));
+        ntts.insert(
+            log_short,
+            AdditiveNTT::<Block128>::new(log_short + LOG_RATE),
+        );
         ntts.insert(log_long, AdditiveNTT::<Block128>::new(log_long + LOG_RATE));
 
         let mut pch = Channel::new();
         for c in &cs {
             pch.observe_fri_commitment(c);
         }
-        let proof =
-            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+        let proof = prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
 
         assert_eq!(proof.column_openings.len(), 5);
         assert_eq!(proof.groups.len(), 2);
@@ -1165,15 +1171,17 @@ mod tests {
         eps.insert(log_short, ep_s);
         eps.insert(log_long, ep_l);
         let mut ntts: BTreeMap<usize, AdditiveNTT<Block128>> = BTreeMap::new();
-        ntts.insert(log_short, AdditiveNTT::<Block128>::new(log_short + LOG_RATE));
+        ntts.insert(
+            log_short,
+            AdditiveNTT::<Block128>::new(log_short + LOG_RATE),
+        );
         ntts.insert(log_long, AdditiveNTT::<Block128>::new(log_long + LOG_RATE));
 
         let mut pch = Channel::new();
         for c in &cs {
             pch.observe_fri_commitment(c);
         }
-        let mut proof =
-            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+        let mut proof = prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
 
         // Flip one per-column opening.
         proof.column_openings[1] = proof.column_openings[1] + Block128::ONE;
@@ -1182,8 +1190,7 @@ mod tests {
         for c in &cs {
             vch.observe_fri_commitment(c);
         }
-        let res =
-            verify_batched_mixed(&cs, &col_log_lens, &eps, &ntts, &proof, &mut vch, &hasher);
+        let res = verify_batched_mixed(&cs, &col_log_lens, &eps, &ntts, &proof, &mut vch, &hasher);
         assert!(res.is_err(), "tampered opening must be rejected");
     }
 
@@ -1198,8 +1205,10 @@ mod tests {
         let cols_vec: Vec<Vec<Block128>> = (0..3).map(|_| mk_col(&mut r, log_len)).collect();
         let cols: Vec<&[Block128]> = cols_vec.iter().map(|v| v.as_slice()).collect();
         let col_log_lens = vec![log_len; 3];
-        let cs: Vec<FriCommitment> =
-            cols_vec.iter().map(|c| commit(c, &ntt, &hasher).0).collect();
+        let cs: Vec<FriCommitment> = cols_vec
+            .iter()
+            .map(|c| commit(c, &ntt, &hasher).0)
+            .collect();
         let ep = mk_eval_point(&mut r, log_len);
         let mut eps: BTreeMap<usize, Vec<Block128>> = BTreeMap::new();
         eps.insert(log_len, ep);
@@ -1210,8 +1219,7 @@ mod tests {
         for c in &cs {
             pch.observe_fri_commitment(c);
         }
-        let proof =
-            prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
+        let proof = prove_batched_mixed(&cols, &col_log_lens, &eps, &ntts, &mut pch, &hasher);
         assert_eq!(proof.groups.len(), 1);
 
         let mut vch = Channel::new();

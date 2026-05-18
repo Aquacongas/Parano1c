@@ -17,11 +17,9 @@
 //! row by accident.
 
 use crate::airs::{
-    fri_state_combiner_composite::{
-        COMBINER_COMPOSITE_NEW_OFFSET, COMBINER_COMPOSITE_PREV_OFFSET,
-    },
-    fri_state_open::{COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_N_INPUTS},
     fri_state_combiner::COMBINER_PERM_LAYOUT,
+    fri_state_combiner_composite::{COMBINER_COMPOSITE_NEW_OFFSET, COMBINER_COMPOSITE_PREV_OFFSET},
+    fri_state_open::{COL_OWNER_HI, COL_OWNER_LO, COL_VALUE, FRI_STATE_OPEN_N_INPUTS},
     tx_body_merkle::{build_instance_layout, leaf_rate_payload_col, InstanceRole},
     tx_validity::TxValidityCol,
 };
@@ -180,12 +178,10 @@ impl TxBodyMerkleCols {
         let mut output_leaf_a_row = [0usize; MAX_OUTPUTS];
         let mut output_leaf_b_row = [0usize; MAX_OUTPUTS];
         for j in 0..MAX_OUTPUTS {
-            output_leaf_a_row[j] = a_row[j].unwrap_or_else(|| {
-                panic!("missing OutputLeafPermA for leaf_idx {j}")
-            });
-            output_leaf_b_row[j] = b_row[j].unwrap_or_else(|| {
-                panic!("missing OutputLeafPermB for leaf_idx {j}")
-            });
+            output_leaf_a_row[j] =
+                a_row[j].unwrap_or_else(|| panic!("missing OutputLeafPermA for leaf_idx {j}"));
+            output_leaf_b_row[j] =
+                b_row[j].unwrap_or_else(|| panic!("missing OutputLeafPermB for leaf_idx {j}"));
         }
         // Row-side bijection guard: A-rows distinct, B-rows distinct,
         // A-set and B-set disjoint.

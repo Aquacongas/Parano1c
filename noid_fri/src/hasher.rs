@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
- 
+
 //! Cryptographic hasher trait + concrete implementations used by the FRI
 //! Merkle layer.
 //!

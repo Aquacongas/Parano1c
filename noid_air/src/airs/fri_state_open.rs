@@ -431,14 +431,12 @@ pub const COL_EVAL_POINT_BASE_OFFSET: usize = 16;
 /// claim-reduction. Fused `EqLadderStepGate` keeps this to `L`
 /// committed columns + `L` constraints instead of the naive
 /// `2L−1`-column / `2L−1`-constraint layout.
-pub const COL_EQ_LADDER_BASE_OFFSET: usize =
-    COL_EVAL_POINT_BASE_OFFSET + FRI_STATE_OPEN_LOG_SLOTS;
+pub const COL_EQ_LADDER_BASE_OFFSET: usize = COL_EVAL_POINT_BASE_OFFSET + FRI_STATE_OPEN_LOG_SLOTS;
 /// 4b.2.3-β.1: γ-powers public column offset. One committed column
 /// `col_gamma_powers`, row `i` holds `γ^i`, pinned via `PublicColumn`.
 /// Consumed row-locally by the β.2.a γ-weighted lanes and the β.2.b
 /// batched-claim accumulator.
-pub const COL_GAMMA_POWERS_OFFSET: usize =
-    COL_EQ_LADDER_BASE_OFFSET + FRI_STATE_OPEN_LOG_SLOTS;
+pub const COL_GAMMA_POWERS_OFFSET: usize = COL_EQ_LADDER_BASE_OFFSET + FRI_STATE_OPEN_LOG_SLOTS;
 /// 4b.2.3-β.2.a (fused α+β.2.a): per-input γ-weighted MLE product
 /// lanes. Three committed columns, row `i` holds
 ///   `gp_lane[i] = γ^i · eq_{L-1}(slot_bits_i, r) · opened_pre_lane_i`,
@@ -517,11 +515,17 @@ impl FriStateOpenLayout {
     };
 
     pub const fn new(n_inputs: usize, log_slots: usize, log_rows: usize) -> Self {
-        Self { n_inputs, log_slots, log_rows }
+        Self {
+            n_inputs,
+            log_slots,
+            log_rows,
+        }
     }
 
     /// Number of trace rows: `1 << log_rows`. Must be ≥ `n_inputs`.
-    pub const fn n_rows(&self) -> usize { 1 << self.log_rows }
+    pub const fn n_rows(&self) -> usize {
+        1 << self.log_rows
+    }
 
     /// Terminal-accumulator row: last live claim row `n_inputs − 1`.
     pub const fn acc_terminal_row(&self) -> usize {
@@ -531,15 +535,7 @@ impl FriStateOpenLayout {
     /// Width of the AIR's witness columns (not counting higher-level
     /// composite reservations). Mirrors `FRI_STATE_OPEN_WITNESS_COLS`.
     pub const fn witness_cols(&self) -> usize {
-        COL_IDX_BIT_BASE
-            + self.log_slots
-            + 16
-            + 2 * self.log_slots
-            + 1
-            + 3
-            + 3
-            + self.n_inputs
-            + 1
+        COL_IDX_BIT_BASE + self.log_slots + 16 + 2 * self.log_slots + 1 + 3 + 3 + self.n_inputs + 1
     }
 
     /// Pivot after the `L` idx-bit columns, shared by every post-bit
@@ -548,23 +544,41 @@ impl FriStateOpenLayout {
         COL_IDX_BIT_BASE + self.log_slots
     }
 
-    pub const fn col_value(&self) -> usize { COL_VALUE }
-    pub const fn col_owner_hi(&self) -> usize { COL_OWNER_HI }
-    pub const fn col_owner_lo(&self) -> usize { COL_OWNER_LO }
+    pub const fn col_value(&self) -> usize {
+        COL_VALUE
+    }
+    pub const fn col_owner_hi(&self) -> usize {
+        COL_OWNER_HI
+    }
+    pub const fn col_owner_lo(&self) -> usize {
+        COL_OWNER_LO
+    }
     pub const fn col_idx_bit(&self, k: usize) -> usize {
         assert!(k < self.log_slots);
         COL_IDX_BIT_BASE + k
     }
 
-    pub const fn col_delta_value(&self) -> usize { self.pivot() + COL_DELTA_VALUE_OFFSET }
-    pub const fn col_delta_owner_hi(&self) -> usize { self.pivot() + COL_DELTA_OWNER_HI_OFFSET }
-    pub const fn col_delta_owner_lo(&self) -> usize { self.pivot() + COL_DELTA_OWNER_LO_OFFSET }
+    pub const fn col_delta_value(&self) -> usize {
+        self.pivot() + COL_DELTA_VALUE_OFFSET
+    }
+    pub const fn col_delta_owner_hi(&self) -> usize {
+        self.pivot() + COL_DELTA_OWNER_HI_OFFSET
+    }
+    pub const fn col_delta_owner_lo(&self) -> usize {
+        self.pivot() + COL_DELTA_OWNER_LO_OFFSET
+    }
     pub const fn col_proof_round_digest(&self) -> usize {
         self.pivot() + COL_PROOF_ROUND_DIGEST_OFFSET
     }
-    pub const fn col_live_mask(&self) -> usize { self.pivot() + COL_LIVE_MASK_OFFSET }
-    pub const fn col_is_spend(&self) -> usize { self.pivot() + COL_IS_SPEND_OFFSET }
-    pub const fn col_is_mint(&self) -> usize { self.pivot() + COL_IS_MINT_OFFSET }
+    pub const fn col_live_mask(&self) -> usize {
+        self.pivot() + COL_LIVE_MASK_OFFSET
+    }
+    pub const fn col_is_spend(&self) -> usize {
+        self.pivot() + COL_IS_SPEND_OFFSET
+    }
+    pub const fn col_is_mint(&self) -> usize {
+        self.pivot() + COL_IS_MINT_OFFSET
+    }
     pub const fn col_opened_pre_value(&self) -> usize {
         self.pivot() + COL_OPENED_PRE_VALUE_OFFSET
     }
@@ -603,12 +617,24 @@ impl FriStateOpenLayout {
     pub const fn col_gamma_powers(&self) -> usize {
         self.pivot() + COL_EVAL_POINT_BASE_OFFSET + 2 * self.log_slots
     }
-    pub const fn col_gp_value(&self) -> usize { self.col_gamma_powers() + 1 }
-    pub const fn col_gp_owner_hi(&self) -> usize { self.col_gamma_powers() + 2 }
-    pub const fn col_gp_owner_lo(&self) -> usize { self.col_gamma_powers() + 3 }
-    pub const fn col_acc_value(&self) -> usize { self.col_gamma_powers() + 4 }
-    pub const fn col_acc_owner_hi(&self) -> usize { self.col_gamma_powers() + 5 }
-    pub const fn col_acc_owner_lo(&self) -> usize { self.col_gamma_powers() + 6 }
+    pub const fn col_gp_value(&self) -> usize {
+        self.col_gamma_powers() + 1
+    }
+    pub const fn col_gp_owner_hi(&self) -> usize {
+        self.col_gamma_powers() + 2
+    }
+    pub const fn col_gp_owner_lo(&self) -> usize {
+        self.col_gamma_powers() + 3
+    }
+    pub const fn col_acc_value(&self) -> usize {
+        self.col_gamma_powers() + 4
+    }
+    pub const fn col_acc_owner_hi(&self) -> usize {
+        self.col_gamma_powers() + 5
+    }
+    pub const fn col_acc_owner_lo(&self) -> usize {
+        self.col_gamma_powers() + 6
+    }
     pub const fn col_row_indicator(&self, r: usize) -> usize {
         assert!(r < self.n_inputs);
         self.col_gamma_powers() + 7 + r
@@ -619,7 +645,9 @@ impl FriStateOpenLayout {
 }
 
 impl Default for FriStateOpenLayout {
-    fn default() -> Self { Self::DEFAULT }
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// E.2.b: layout of the output-side `FriStateOpenAir` instance,
@@ -779,11 +807,15 @@ pub const FRI_STATE_OPEN_ACC_TERMINAL_ROW: usize = FRI_STATE_OPEN_N_INPUTS - 1;
 /// Number of witness columns before indicator columns for public pins
 /// are reserved. Each public-cell pin reserves one extra indicator
 /// column; see `FriStateOpenAir::new` for the accounting.
-pub const FRI_STATE_OPEN_WITNESS_COLS: usize =
-    COL_IDX_BIT_BASE + FRI_STATE_OPEN_LOG_SLOTS
-        + 16
-        + 2 * FRI_STATE_OPEN_LOG_SLOTS
-        + 1 + 3 + 3 + FRI_STATE_OPEN_N_INPUTS + 1;
+pub const FRI_STATE_OPEN_WITNESS_COLS: usize = COL_IDX_BIT_BASE
+    + FRI_STATE_OPEN_LOG_SLOTS
+    + 16
+    + 2 * FRI_STATE_OPEN_LOG_SLOTS
+    + 1
+    + 3
+    + 3
+    + FRI_STATE_OPEN_N_INPUTS
+    + 1;
 // delta_{value,hi,lo}, proof_round_digest, live_mask, is_spend,
 // is_mint, opened_pre_{value,owner_hi,owner_lo}, eq_delta_*×3,
 // delta_acc_*×3 (= 16 columns before the eval-point block), then
@@ -903,10 +935,7 @@ impl FriStateOpenWitness {
         }
     }
 
-    pub fn with_eval_point(
-        mut self,
-        eval_point: [Block128; FRI_STATE_OPEN_LOG_SLOTS],
-    ) -> Self {
+    pub fn with_eval_point(mut self, eval_point: [Block128; FRI_STATE_OPEN_LOG_SLOTS]) -> Self {
         self.eval_point = eval_point;
         self
     }
@@ -918,11 +947,7 @@ impl FriStateOpenWitness {
 
     /// 4c.2: install both prev- and new-lane PCS openings at once.
     /// Lane order is `[value, owner_hi, owner_lo]`.
-    pub fn with_lane_openings(
-        mut self,
-        prev: [Block128; 3],
-        new: [Block128; 3],
-    ) -> Self {
+    pub fn with_lane_openings(mut self, prev: [Block128; 3], new: [Block128; 3]) -> Self {
         self.prev_lane_openings = prev;
         self.new_lane_openings = new;
         self
@@ -939,10 +964,7 @@ impl FriStateOpenWitness {
     /// Exposed for trace builders / transcript callers that want to
     /// drive the 4c.3 combiner with honest sub-root openings without
     /// first materialising a full trace.
-    pub fn expected_new_lane_openings(
-        &self,
-        prev: [Block128; 3],
-    ) -> [Block128; 3] {
+    pub fn expected_new_lane_openings(&self, prev: [Block128; 3]) -> [Block128; 3] {
         let mut acc = [Block128::ZERO; 3];
         for claim in &self.claims {
             if !claim.live() {
@@ -1067,10 +1089,8 @@ impl FriStateOpenWitness {
             let eq_tail = cols[layout.col_eq_ladder(tail)][row];
             let w = g * eq_tail;
             cols[layout.col_gp_value()][row] = w * cols[layout.col_opened_pre_value()][row];
-            cols[layout.col_gp_owner_hi()][row] =
-                w * cols[layout.col_opened_pre_owner_hi()][row];
-            cols[layout.col_gp_owner_lo()][row] =
-                w * cols[layout.col_opened_pre_owner_lo()][row];
+            cols[layout.col_gp_owner_hi()][row] = w * cols[layout.col_opened_pre_owner_hi()][row];
+            cols[layout.col_gp_owner_lo()][row] = w * cols[layout.col_opened_pre_owner_lo()][row];
         }
         for (acc_col, gp_col) in [
             (layout.col_acc_value(), layout.col_gp_value()),
@@ -1100,8 +1120,14 @@ impl FriStateOpenWitness {
         }
         for (acc_col, src_col) in [
             (layout.col_delta_acc_value(), layout.col_eq_delta_value()),
-            (layout.col_delta_acc_owner_hi(), layout.col_eq_delta_owner_hi()),
-            (layout.col_delta_acc_owner_lo(), layout.col_eq_delta_owner_lo()),
+            (
+                layout.col_delta_acc_owner_hi(),
+                layout.col_eq_delta_owner_hi(),
+            ),
+            (
+                layout.col_delta_acc_owner_lo(),
+                layout.col_eq_delta_owner_lo(),
+            ),
         ] {
             let mut running = cols[src_col][0];
             cols[acc_col][0] = running;
@@ -1117,8 +1143,7 @@ impl FriStateOpenWitness {
             cols[layout.col_row_indicator(r)] = row_indicator_programme(r, n_rows);
         }
         let step_rows: Vec<usize> = (0..n_inputs - 1).collect();
-        cols[layout.col_acc_step_indicator()] =
-            multi_row_indicator_programme(&step_rows, n_rows);
+        cols[layout.col_acc_step_indicator()] = multi_row_indicator_programme(&step_rows, n_rows);
         cols
     }
 }
@@ -1295,7 +1320,10 @@ impl FriStateOpenAir {
             gamma_powers_vals.push(power);
             power = power * gamma;
         }
-        public_columns.push(PublicColumn::new(layout.col_gamma_powers(), gamma_powers_vals));
+        public_columns.push(PublicColumn::new(
+            layout.col_gamma_powers(),
+            gamma_powers_vals,
+        ));
 
         // 4b.2.2: eq-ladder recurrence.
         constraints.push(Box::new(WeightedLinearGate::new(
@@ -1623,9 +1651,7 @@ mod tests {
         base.with_lane_openings(prev, new)
     }
 
-    fn mk_expected_claims(
-        claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS],
-    ) -> [Block128; 3] {
+    fn mk_expected_claims(claims: [FriStateOpenClaim; FRI_STATE_OPEN_N_INPUTS]) -> [Block128; 3] {
         mk_witness(claims).expected_batched_claims()
     }
 
@@ -1718,8 +1744,7 @@ mod tests {
     fn live_row_with_wrong_delta_owner_hi_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_delta_owner_hi()][0] =
-            cols[col_delta_owner_hi()][0] + Block128::ONE;
+        cols[col_delta_owner_hi()][0] = cols[col_delta_owner_hi()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1728,8 +1753,7 @@ mod tests {
     fn live_row_with_wrong_delta_owner_lo_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_delta_owner_lo()][0] =
-            cols[col_delta_owner_lo()][0] + Block128::ONE;
+        cols[col_delta_owner_lo()][0] = cols[col_delta_owner_lo()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1838,8 +1862,7 @@ mod tests {
     fn tampered_opened_pre_value_on_spend_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_opened_pre_value()][0] =
-            cols[col_opened_pre_value()][0] + Block128::ONE;
+        cols[col_opened_pre_value()][0] = cols[col_opened_pre_value()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1848,8 +1871,7 @@ mod tests {
     fn tampered_opened_pre_owner_hi_on_spend_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_opened_pre_owner_hi()][0] =
-            cols[col_opened_pre_owner_hi()][0] + Block128::ONE;
+        cols[col_opened_pre_owner_hi()][0] = cols[col_opened_pre_owner_hi()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1858,8 +1880,7 @@ mod tests {
     fn tampered_opened_pre_owner_lo_on_spend_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_opened_pre_owner_lo()][0] =
-            cols[col_opened_pre_owner_lo()][0] + Block128::ONE;
+        cols[col_opened_pre_owner_lo()][0] = cols[col_opened_pre_owner_lo()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -1933,8 +1954,7 @@ mod tests {
             for row in 0..FRI_STATE_OPEN_N_ROWS {
                 let air = mk_air();
                 let mut cols = air.build_trace(&mk_witness(mk_claims()));
-                cols[col_eval_point(i)][row] =
-                    cols[col_eval_point(i)][row] + Block128::ONE;
+                cols[col_eval_point(i)][row] = cols[col_eval_point(i)][row] + Block128::ONE;
                 let trace = Trace::new(cols);
                 assert!(
                     !air.check(&trace),
@@ -1969,8 +1989,9 @@ mod tests {
         let r = mk_eval_point();
 
         // Row 0 is a spend on slot_index = 0 → bits all zero.
-        let bits_row0: Vec<Block128> =
-            (0..FRI_STATE_OPEN_LOG_SLOTS).map(|_| Block128::ZERO).collect();
+        let bits_row0: Vec<Block128> = (0..FRI_STATE_OPEN_LOG_SLOTS)
+            .map(|_| Block128::ZERO)
+            .collect();
         let eq_expected_row0 = eq_ind_char2(&r, &bits_row0);
         assert_eq!(
             cols[col_eq_ladder(FRI_STATE_OPEN_LOG_SLOTS - 1)][0],
@@ -2110,8 +2131,7 @@ mod tests {
     fn tampered_gp_owner_hi_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_gp_owner_hi()][1] =
-            cols[col_gp_owner_hi()][1] + Block128::ONE;
+        cols[col_gp_owner_hi()][1] = cols[col_gp_owner_hi()][1] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -2120,8 +2140,7 @@ mod tests {
     fn tampered_gp_owner_lo_rejects() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_gp_owner_lo()][0] =
-            cols[col_gp_owner_lo()][0] + Block128::ONE;
+        cols[col_gp_owner_lo()][0] = cols[col_gp_owner_lo()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -2193,8 +2212,7 @@ mod tests {
         for row in 0..FRI_STATE_OPEN_N_ROWS {
             let air = mk_air();
             let mut cols = air.build_trace(&mk_witness(mk_claims()));
-            cols[col_gamma_powers()][row] =
-                cols[col_gamma_powers()][row] + Block128::ONE;
+            cols[col_gamma_powers()][row] = cols[col_gamma_powers()][row] + Block128::ONE;
             let trace = Trace::new(cols);
             assert!(
                 !air.check(&trace),
@@ -2321,12 +2339,7 @@ mod tests {
         // Mint rows carry opened_pre_* = 0, so gp_* = 0 for every
         // input → acc_lane[i] = 0 for all i. Honest trace passes
         // and terminal row is zero on every lane.
-        let claims = [
-            mk_mint(1, 0),
-            mk_mint(2, 1),
-            mk_mint(3, 2),
-            mk_mint(4, 3),
-        ];
+        let claims = [mk_mint(1, 0), mk_mint(2, 1), mk_mint(3, 2), mk_mint(4, 3)];
         let air = mk_air_for(claims);
         let cols = air.build_trace(&mk_witness(claims));
         let term = FRI_STATE_OPEN_ACC_TERMINAL_ROW;
@@ -2538,8 +2551,7 @@ mod tests {
     fn update_closure_rejects_tampered_eq_delta() {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
-        cols[col_eq_delta_value()][0] =
-            cols[col_eq_delta_value()][0] + Block128::ONE;
+        cols[col_eq_delta_value()][0] = cols[col_eq_delta_value()][0] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -2549,8 +2561,7 @@ mod tests {
         let air = mk_air();
         let mut cols = air.build_trace(&mk_witness(mk_claims()));
         let term = FRI_STATE_OPEN_ACC_TERMINAL_ROW;
-        cols[col_delta_acc_owner_lo()][term] =
-            cols[col_delta_acc_owner_lo()][term] + Block128::ONE;
+        cols[col_delta_acc_owner_lo()][term] = cols[col_delta_acc_owner_lo()][term] + Block128::ONE;
         let trace = Trace::new(cols);
         assert!(!air.check(&trace));
     }
@@ -2559,12 +2570,7 @@ mod tests {
     fn update_closure_accepts_all_mint_inputs() {
         // All mints: δ = value on live rows, so `new - prev = Σ eq·δ`
         // on all three lanes. Honest trace must accept.
-        let claims = [
-            mk_mint(1, 0),
-            mk_mint(2, 1),
-            mk_mint(3, 2),
-            mk_mint(4, 3),
-        ];
+        let claims = [mk_mint(1, 0), mk_mint(2, 1), mk_mint(3, 2), mk_mint(4, 3)];
         let air = mk_air_for(claims);
         let trace = Trace::new(air.build_trace(&mk_witness(claims)));
         assert!(air.check(&trace));
@@ -2575,8 +2581,7 @@ mod tests {
         // The pure helper must agree with the row-local trace on every
         // lane — loadbearing for the update-closure gate.
         let witness = mk_witness(mk_claims());
-        let expected_new =
-            witness.expected_new_lane_openings(witness.prev_lane_openings);
+        let expected_new = witness.expected_new_lane_openings(witness.prev_lane_openings);
         assert_eq!(expected_new, witness.new_lane_openings);
     }
 
@@ -2663,8 +2668,7 @@ mod tests {
         let claims = mk_claims_n8();
         let air = mk_air_n8(claims);
         let mut cols = air.build_trace(&mk_witness_n8(claims));
-        cols[LAYOUT_N8.col_delta_value()][0] =
-            cols[LAYOUT_N8.col_delta_value()][0] + Block128::ONE;
+        cols[LAYOUT_N8.col_delta_value()][0] = cols[LAYOUT_N8.col_delta_value()][0] + Block128::ONE;
         assert!(!air.check(&Trace::new(cols)));
     }
 

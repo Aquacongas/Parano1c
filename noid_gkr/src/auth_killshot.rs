@@ -166,8 +166,7 @@ pub fn build_auth_unified_from_inputs(
 ) -> AuthUnifiedMle {
     let w = evaluate_auth(circuit, inputs);
     debug_assert_eq!(w.slots.len(), N_AUTH_LIVE_SLOTS);
-    let state_ins: Vec<[Block128; STATE_SIZE]> =
-        w.slots.iter().map(|s| s.state_in).collect();
+    let state_ins: Vec<[Block128; STATE_SIZE]> = w.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_auth_unified_mle_v2(&state_ins);
     mle
 }
@@ -192,8 +191,7 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
 
     absorb_public_boundary(channel, inputs);
 
-    let state_ins: Vec<[Block128; STATE_SIZE]> =
-        witness.slots.iter().map(|s| s.state_in).collect();
+    let state_ins: Vec<[Block128; STATE_SIZE]> = witness.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_auth_unified_mle_v2(&state_ins);
 
     let (main, r_prime) = prove_auth_unified(&mle, channel);
@@ -278,12 +276,7 @@ pub fn verify_auth_killshot<T: FiatShamir<Block128>>(
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(
-        &proof.sin_batch,
-        &sin_claims,
-        N_AUTH_UNIFIED_VARS,
-        channel,
-    )?;
+    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, N_AUTH_UNIFIED_VARS, channel)?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,

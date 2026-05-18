@@ -148,7 +148,11 @@ impl ShiftedColumnsConstraint {
             );
         }
         let shifted_cols = inner.columns().iter().map(|&c| c + offset).collect();
-        let shifted_next = inner.shifted_columns().iter().map(|&c| c + offset).collect();
+        let shifted_next = inner
+            .shifted_columns()
+            .iter()
+            .map(|&c| c + offset)
+            .collect();
         Self {
             inner,
             shifted_cols,
@@ -281,8 +285,7 @@ impl RowWindowWrapper {
         }
 
         // ---- Build the window indicator ------------------------------------
-        let window_rows: Vec<usize> =
-            (params.row_window_start..params.row_window_end).collect();
+        let window_rows: Vec<usize> = (params.row_window_start..params.row_window_end).collect();
         let window_programme = multi_row_indicator_programme(&window_rows, outer_n_rows);
         let window_pc = PublicColumn::new(params.window_indicator_col, window_programme);
 
@@ -302,7 +305,8 @@ impl RowWindowWrapper {
 
         // ---- Lift inner public columns --------------------------------------
         let mut public_columns: Vec<PublicColumn> = Vec::with_capacity(
-            inner.public_columns.len() + 1
+            inner.public_columns.len()
+                + 1
                 + if matches!(params.policy, WrapPolicy::TerminatorPin) {
                     3 * params.terminator_pin_cols.len()
                 } else {
@@ -404,8 +408,7 @@ mod tests {
     /// over a 4-row inner shape, no public columns. Useful for
     /// isolating wrapper behavior from real AIR complexity.
     fn make_inner_xor() -> InnerAirView {
-        let gate: Box<dyn Constraint> =
-            Box::new(WeightedLinearGate::new_xor(vec![0, 1]));
+        let gate: Box<dyn Constraint> = Box::new(WeightedLinearGate::new_xor(vec![0, 1]));
         InnerAirView {
             inner_n_cols: 2,
             inner_log_rows: 2,
@@ -437,12 +440,7 @@ mod tests {
             terminator_pin_cols: vec![],
         };
         let w = RowWindowWrapper::wrap(inner, params);
-        let air = CompositeAir::from_parts_with_publics(
-            4,
-            8,
-            w.constraints,
-            w.public_columns,
-        );
+        let air = CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
         let cols = vec![vec![Block128::ZERO; 16]; 8];
         (air, cols)
     }
@@ -532,7 +530,11 @@ mod tests {
             .find(|pc| pc.col == 3)
             .expect("lifted public column missing");
         for (row, &v) in lifted.values.iter().enumerate() {
-            let want = if row == 10 { Block128::ONE } else { Block128::ZERO };
+            let want = if row == 10 {
+                Block128::ONE
+            } else {
+                Block128::ZERO
+            };
             assert_eq!(v, want, "row {row}");
         }
     }
@@ -548,8 +550,7 @@ mod tests {
 
     fn make_inner_constant_col() -> InnerAirView {
         // col0[r] + col0[r+1] == 0 on every row.
-        let gate: Box<dyn Constraint> =
-            Box::new(WeightedLinearGateShifted::new_xor_next(0, 0));
+        let gate: Box<dyn Constraint> = Box::new(WeightedLinearGateShifted::new_xor_next(0, 0));
         InnerAirView {
             inner_n_cols: 1,
             inner_log_rows: 2,
@@ -598,8 +599,7 @@ mod tests {
             }],
         };
         let w = RowWindowWrapper::wrap(inner, params);
-        let air =
-            CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
+        let air = CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
 
         // Honest trace: col 0 constant = 0xAA on rows 4..8, bridge
         // interval covers [row_start, row_end-1] = [4, 7]. Wait — src
@@ -652,8 +652,7 @@ mod tests {
             }],
         };
         let w = RowWindowWrapper::wrap(inner, params);
-        let air =
-            CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
+        let air = CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
 
         // Break: col0[row_window_end] != col0[row_window_start]. The
         // bridge's dst pin catches the boundary mismatch.
@@ -754,8 +753,7 @@ mod tests {
             }],
         };
         let w = RowWindowWrapper::wrap(inner, params);
-        let air =
-            CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
+        let air = CompositeAir::from_parts_with_publics(4, 8, w.constraints, w.public_columns);
 
         let v = Block128::from(0xAAu128);
         let mut cols: Vec<Vec<Block128>> = (0..8).map(|_| vec![Block128::ZERO; 16]).collect();

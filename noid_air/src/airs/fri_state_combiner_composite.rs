@@ -101,7 +101,11 @@ impl ShiftedColumnsConstraint {
             );
         }
         let shifted_cols = inner.columns().iter().map(|&c| c + offset).collect();
-        let shifted_next = inner.shifted_columns().iter().map(|&c| c + offset).collect();
+        let shifted_next = inner
+            .shifted_columns()
+            .iter()
+            .map(|&c| c + offset)
+            .collect();
         Self {
             inner,
             shifted_cols,
@@ -194,7 +198,10 @@ impl FriStateCombinerComposite {
                 assert!(j < COMBINER_COMPOSITE_N_COLS, "composite local col {j} oob");
             }
             for &j in c.shifted_columns() {
-                assert!(j < COMBINER_COMPOSITE_N_COLS, "composite shifted col {j} oob");
+                assert!(
+                    j < COMBINER_COMPOSITE_N_COLS,
+                    "composite shifted col {j} oob"
+                );
             }
         }
         for pc in &public_columns {
@@ -316,14 +323,8 @@ mod tests {
     #[test]
     fn composite_layout_constants() {
         assert_eq!(COMBINER_COMPOSITE_PREV_OFFSET, 0);
-        assert_eq!(
-            COMBINER_COMPOSITE_NEW_OFFSET,
-            FRI_STATE_COMBINER_N_COLS
-        );
-        assert_eq!(
-            COMBINER_COMPOSITE_N_COLS,
-            2 * FRI_STATE_COMBINER_N_COLS
-        );
+        assert_eq!(COMBINER_COMPOSITE_NEW_OFFSET, FRI_STATE_COMBINER_N_COLS);
+        assert_eq!(COMBINER_COMPOSITE_N_COLS, 2 * FRI_STATE_COMBINER_N_COLS);
         assert_eq!(COMBINER_COMPOSITE_LOG_ROWS, FRI_STATE_COMBINER_LOG_ROWS);
     }
 

@@ -53,9 +53,7 @@ use crate::batch_eval::{
 };
 use crate::circuit::{SpineCircuit, SpineInputs};
 use crate::spine_mle::{build_unified_mle, SpineUnifiedMle, N_SPINE_UNIFIED_VARS};
-use crate::spine_sumcheck::{
-    compute_tx_body_hash, reconstruct_slot_states, N_SPINE_SLOTS,
-};
+use crate::spine_sumcheck::{compute_tx_body_hash, reconstruct_slot_states, N_SPINE_SLOTS};
 use crate::spine_unified::{
     prove_spine_shift, prove_spine_unified, verify_spine_shift, verify_spine_unified,
     SpineKillShotProof,
@@ -115,8 +113,7 @@ pub fn build_unified_from_states(
     states: &[([Block128; STATE_SIZE], [Block128; STATE_SIZE])],
 ) -> SpineUnifiedMle {
     debug_assert_eq!(states.len(), N_SPINE_SLOTS);
-    let state_ins: Vec<[Block128; STATE_SIZE]> =
-        states.iter().map(|(s_in, _)| *s_in).collect();
+    let state_ins: Vec<[Block128; STATE_SIZE]> = states.iter().map(|(s_in, _)| *s_in).collect();
     let (mle, _witnesses) = build_unified_mle(&state_ins);
     mle
 }
@@ -125,10 +122,7 @@ pub fn build_unified_from_states(
 /// path; both prover (full witness) and verifier (test harness) use
 /// it. In production the verifier never reconstructs this — the FRI
 /// commitments answer all opening queries.
-pub fn build_unified_from_inputs(
-    circuit: &SpineCircuit,
-    inputs: &SpineInputs,
-) -> SpineUnifiedMle {
+pub fn build_unified_from_inputs(circuit: &SpineCircuit, inputs: &SpineInputs) -> SpineUnifiedMle {
     let states = reconstruct_slot_states(circuit, inputs);
     build_unified_from_states(&states)
 }
@@ -249,22 +243,29 @@ pub fn verify_spine_killshot<T: FiatShamir<Block128>>(
             value: shift_red.state_at_r2,
         },
     ];
-    let state_red =
-        verify_batch_eval(&proof.state_batch, &state_claims, N_SPINE_UNIFIED_VARS, channel)?;
+    let state_red = verify_batch_eval(
+        &proof.state_batch,
+        &state_claims,
+        N_SPINE_UNIFIED_VARS,
+        channel,
+    )?;
 
     let sin_claims = vec![EvalClaim {
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red =
-        verify_batch_eval(&proof.sin_batch, &sin_claims, N_SPINE_UNIFIED_VARS, channel)?;
+    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, N_SPINE_UNIFIED_VARS, channel)?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
         value: shift_red.s_out_at_r2,
     }];
-    let sout_red =
-        verify_batch_eval(&proof.sout_batch, &sout_claims, N_SPINE_UNIFIED_VARS, channel)?;
+    let sout_red = verify_batch_eval(
+        &proof.sout_batch,
+        &sout_claims,
+        N_SPINE_UNIFIED_VARS,
+        channel,
+    )?;
 
     Some(SpineKillShotReductions {
         state: state_red,
@@ -314,8 +315,7 @@ mod tests {
         let claimed = compute_tx_body_hash(&circuit, &inputs);
 
         let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) =
-            prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
+        let (proof, reductions) = prove_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
 
         let mut ch_v = Poseidon2bChannel::new();
         let v_red = verify_spine_killshot(&proof, &circuit, &inputs, claimed, &mut ch_v)

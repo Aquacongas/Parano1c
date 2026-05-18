@@ -150,7 +150,11 @@ pub fn prove_product<T: FiatShamir<Block128>>(
     assert_eq!(a.len(), 1 << n);
     assert_eq!(b.len(), 1 << n);
 
-    debug_assert_eq!(compute_product_claim(a, b, r), v, "claim mismatches witness");
+    debug_assert_eq!(
+        compute_product_claim(a, b, r),
+        v,
+        "claim mismatches witness"
+    );
 
     let mut eq_tbl = eq_ind_partial_eval(r);
     let mut a_tbl = a.to_vec();
@@ -217,7 +221,11 @@ pub fn prove_square<T: FiatShamir<Block128>>(
     let n = r.len();
     assert_eq!(a.len(), 1 << n);
 
-    debug_assert_eq!(compute_product_claim(a, a, r), v, "claim mismatches witness");
+    debug_assert_eq!(
+        compute_product_claim(a, a, r),
+        v,
+        "claim mismatches witness"
+    );
 
     let mut eq_tbl = eq_ind_partial_eval(r);
     let mut a_tbl = a.to_vec();
@@ -360,13 +368,10 @@ fn eval_round_at_0_1_2_3(
     };
 
     if half >= PAR_THRESHOLD {
-        (0..half)
-            .into_par_iter()
-            .map(per_entry)
-            .reduce(
-                || [Block128::ZERO; 4],
-                |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
-            )
+        (0..half).into_par_iter().map(per_entry).reduce(
+            || [Block128::ZERO; 4],
+            |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
+        )
     } else {
         let mut acc = [Block128::ZERO; 4];
         for j in 0..half {
@@ -404,13 +409,10 @@ fn eval_round_at_0_1_2_3_square(eq: &[Block128], a: &[Block128], half: usize) ->
     };
 
     if half >= PAR_THRESHOLD {
-        (0..half)
-            .into_par_iter()
-            .map(per_entry)
-            .reduce(
-                || [Block128::ZERO; 4],
-                |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
-            )
+        (0..half).into_par_iter().map(per_entry).reduce(
+            || [Block128::ZERO; 4],
+            |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]],
+        )
     } else {
         let mut acc = [Block128::ZERO; 4];
         for j in 0..half {

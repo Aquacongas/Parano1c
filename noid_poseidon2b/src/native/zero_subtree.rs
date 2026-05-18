@@ -89,7 +89,14 @@ mod tests {
         let table = zero_subtree_root_table();
         for i in 1..ZERO_SUBTREE_TABLE_LEN {
             let expect = compress(&table[i - 1], &table[i - 1]);
-            assert_eq!(table[i], expect, "Z[{}] != compress(Z[{}], Z[{}])", i, i - 1, i - 1);
+            assert_eq!(
+                table[i],
+                expect,
+                "Z[{}] != compress(Z[{}], Z[{}])",
+                i,
+                i - 1,
+                i - 1
+            );
         }
     }
 

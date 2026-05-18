@@ -260,9 +260,18 @@ pub fn prove_perm_with_mle<T: FiatShamir<Block128>>(
         sin_r5_check: p_sin_r5,
     };
     let claims = [
-        PermStateClaim { point: rs3, value: state_at_rs3 },
-        PermStateClaim { point: rs4, value: state_at_rs4 },
-        PermStateClaim { point: rs5, value: state_at_rs5 },
+        PermStateClaim {
+            point: rs3,
+            value: state_at_rs3,
+        },
+        PermStateClaim {
+            point: rs4,
+            value: state_at_rs4,
+        },
+        PermStateClaim {
+            point: rs5,
+            value: state_at_rs5,
+        },
     ];
     (proof, r0, v0, claims)
 }

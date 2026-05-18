@@ -47,7 +47,11 @@ pub fn evaluate_flat(poly: &[Block128], point: &[Block128]) -> Block128 {
     }
 
     let mut buf: Vec<u128> = poly.iter().map(|v| tower_to_flat_u128(v.0)).collect();
-    let point_flat: Vec<u128> = point.iter().rev().map(|v| tower_to_flat_u128(v.0)).collect();
+    let point_flat: Vec<u128> = point
+        .iter()
+        .rev()
+        .map(|v| tower_to_flat_u128(v.0))
+        .collect();
 
     for &r_flat in &point_flat {
         let half = buf.len() / 2;
@@ -78,7 +82,11 @@ pub fn evaluate_preflat(poly_flat: &[u128], point: &[Block128]) -> Block128 {
     }
 
     let mut buf: Vec<u128> = poly_flat.to_vec();
-    let point_flat: Vec<u128> = point.iter().rev().map(|v| tower_to_flat_u128(v.0)).collect();
+    let point_flat: Vec<u128> = point
+        .iter()
+        .rev()
+        .map(|v| tower_to_flat_u128(v.0))
+        .collect();
 
     for &r_flat in &point_flat {
         let half = buf.len() / 2;

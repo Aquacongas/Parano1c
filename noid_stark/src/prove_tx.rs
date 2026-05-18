@@ -35,9 +35,7 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_tx::PublicInputs;
 use rayon;
 
-use crate::interleaved::{
-    prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof,
-};
+use crate::interleaved::{prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof};
 use crate::{SliceClaim, VerifyError};
 
 /// Base log-length for all columns (trace + slices). The AIR operates
@@ -205,8 +203,7 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
     let ntt = noid_core::AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = noid_fri::hasher::Blake3Hasher::new();
     let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
-    let (pre_commitment, pre_state) =
-        noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
+    let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
     let cap = &pre_commitment.cap;
 
     // Seed GKR channels with the Merkle cap (binds all columns including slices).
@@ -411,13 +408,7 @@ pub fn verify_tx(
         });
     }
 
-    verify_air_interleaved(
-        air,
-        pi,
-        &proof.stark,
-        &extras_transcript,
-        &slice_claims,
-    )?;
+    verify_air_interleaved(air, pi, &proof.stark, &extras_transcript, &slice_claims)?;
 
     Ok(())
 }

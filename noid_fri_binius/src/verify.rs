@@ -60,7 +60,10 @@ pub fn verify_batched_opening(
 
         // Check: p(0) + p(1) == claim
         if p0 + p1 != claim {
-            return Err(format!("Sumcheck check failed at round {}", challenges.len()));
+            return Err(format!(
+                "Sumcheck check failed at round {}",
+                challenges.len()
+            ));
         }
 
         // Absorb, draw challenge
@@ -81,7 +84,14 @@ pub fn verify_batched_opening(
 
     // Step 4: Verify FRI proof
     // The FRI proof shows B(eval_point) = b_at_eval_point
-    fri_verify(eval_point, b_at_eval_point, proof.fri_proof.clone(), ntt, channel, hasher)?;
+    fri_verify(
+        eval_point,
+        b_at_eval_point,
+        proof.fri_proof.clone(),
+        ntt,
+        channel,
+        hasher,
+    )?;
 
     Ok(proof.column_openings.clone())
 }

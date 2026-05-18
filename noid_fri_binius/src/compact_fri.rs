@@ -382,18 +382,13 @@ pub fn compact_fri_verify(
                 let (s0, s1) = symbols[i];
                 let expected = if parity == 1 { s1 } else { s0 };
                 if folded_symbols[i] != Some(expected) {
-                    return Err(format!(
-                        "symbol inconsistency at query {i} round {round}"
-                    ));
+                    return Err(format!("symbol inconsistency at query {i} round {round}"));
                 }
             }
         }
 
         // Verify batched Merkle proof
-        let pair_indices: Vec<usize> = query_indices
-            .iter()
-            .map(|&qi| (qi >> round) >> 1)
-            .collect();
+        let pair_indices: Vec<usize> = query_indices.iter().map(|&qi| (qi >> round) >> 1).collect();
 
         let leaf_hashes: Vec<HashOutput> = symbols
             .iter()
@@ -487,14 +482,12 @@ fn build_batched_merkle_proof(
                 known_at_layer[d + 1].insert(parent);
             } else if left_known {
                 // Need right sibling
-                let sibling_hash =
-                    tree.get_node_at_depth(depth - d, right_child);
+                let sibling_hash = tree.get_node_at_depth(depth - d, right_child);
                 siblings.push(sibling_hash);
                 known_at_layer[d + 1].insert(parent);
             } else if right_known {
                 // Need left sibling
-                let sibling_hash =
-                    tree.get_node_at_depth(depth - d, left_child);
+                let sibling_hash = tree.get_node_at_depth(depth - d, left_child);
                 siblings.push(sibling_hash);
                 known_at_layer[d + 1].insert(parent);
             }
@@ -533,9 +526,7 @@ fn verify_batched_merkle_proof(
     for (i, &idx) in leaf_indices.iter().enumerate() {
         if let Some(&existing) = known.get(&(0, idx)) {
             if existing != leaf_hashes[i] {
-                return Err(format!(
-                    "inconsistent leaf hashes for index {idx}"
-                ));
+                return Err(format!("inconsistent leaf hashes for index {idx}"));
             }
         } else {
             known.insert((0, idx), leaf_hashes[i]);

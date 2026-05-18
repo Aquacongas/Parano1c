@@ -203,10 +203,8 @@ pub fn verify_spine_degree7<T: FiatShamir<Block128>>(
     let sigma_at_r = proof.sigma_at_r;
     let sin_at_r = proof.sin_at_r;
     let sout_at_r = proof.sout_at_r;
-    let q_at_r = sigma_at_r * pow7_block128(sin_at_r)
-        + sout_at_r
-        + sin_at_r
-        + sigma_at_r * sin_at_r;
+    let q_at_r =
+        sigma_at_r * pow7_block128(sin_at_r) + sout_at_r + sin_at_r + sigma_at_r * sin_at_r;
     if expected != eq_at_r * q_at_r {
         return None;
     }

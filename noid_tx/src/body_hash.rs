@@ -50,7 +50,13 @@ pub fn hash_tx_body(
         output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
     }
 
-    hash_tx_body_core(prev_state_root, fee, &input_leaves, &output_leaves, is_coinbase)
+    hash_tx_body_core(
+        prev_state_root,
+        fee,
+        &input_leaves,
+        &output_leaves,
+        is_coinbase,
+    )
 }
 
 #[cfg(test)]
@@ -147,7 +153,13 @@ mod tests {
         let prev = [0u8; 32];
         let real = mk_input(1);
         let h1 = hash_tx_body(&prev, 0, &[real], &[], false);
-        let h2 = hash_tx_body(&prev, 0, &[real, TxInput::dummy(), TxInput::dummy()], &[], false);
+        let h2 = hash_tx_body(
+            &prev,
+            0,
+            &[real, TxInput::dummy(), TxInput::dummy()],
+            &[],
+            false,
+        );
         assert_eq!(h1, h2);
     }
 
