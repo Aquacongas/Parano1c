@@ -52,6 +52,8 @@ use noid_fri::prover::{commit_fast, FriCommitment};
 use noid_fri::Channel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_tx::PublicInputs;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 // ---------------------------------------------------------------------------
 // Proof
@@ -239,6 +241,62 @@ pub fn lagrange_eval_at(p: &[Block128], target: Block128) -> Block128 {
             den *= xk + xm;
         }
         acc += *pk * num * den.invert();
+    }
+    acc
+}
+
+/// Cached precomputed Lagrange basis denominators for degree `d_plus_one`.
+///
+/// For a fixed set of nodes `x_k = k` (k = 0..d_plus_one), the denominator
+/// `Π_{m≠k}(x_k + x_m)` depends only on `d_plus_one` and `k`, never on the
+/// target point. This cache computes them once per unique `d_plus_one` and
+/// reuses across all verifier rounds, eliminating `d_plus_one` field inversions
+/// per sumcheck round.
+static LAGRANGE_DENOM_CACHE: OnceLock<RwLock<HashMap<usize, Vec<Block128>>>> = OnceLock::new();
+
+fn lagrange_denoms(d_plus_one: usize) -> Vec<Block128> {
+    let cache = LAGRANGE_DENOM_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    {
+        let r = cache.read().unwrap();
+        if let Some(v) = r.get(&d_plus_one) {
+            return v.clone();
+        }
+    }
+
+    let denoms: Vec<Block128> = (0..d_plus_one)
+        .map(|k| {
+            let xk = Block128::from(k as u8);
+            let mut den = Block128::ONE;
+            for m in 0..d_plus_one {
+                if m != k {
+                    let xm = Block128::from(m as u8);
+                    den *= xk + xm;
+                }
+            }
+            den.invert()
+        })
+        .collect();
+
+    cache.write().unwrap().insert(d_plus_one, denoms.clone());
+    denoms
+}
+
+/// Lagrange interpolation using precomputed denominators from [`lagrange_denoms`].
+/// Equivalent to [`lagrange_eval_at`] but avoids per-call field inversions.
+pub fn lagrange_eval_at_cached(p: &[Block128], target: Block128) -> Block128 {
+    let d_plus_one = p.len();
+    let inv_denoms = lagrange_denoms(d_plus_one);
+    let mut acc = Block128::ZERO;
+    for (k, pk) in p.iter().enumerate() {
+        let mut num = Block128::ONE;
+        for m in 0..d_plus_one {
+            if m != k {
+                let xm = Block128::from(m as u8);
+                num *= target + xm;
+            }
+        }
+        acc += *pk * num * inv_denoms[k];
     }
     acc
 }
@@ -598,6 +656,12 @@ pub fn prove_air_unchecked_timed<A: Air>(
             .par_iter()
             .map(|col| {
                 let padded = pad_column(col, log_len);
+                // SAFETY-INVARIANT: commit_fast uses Blake3 instead of Poseidon2b.
+                // This is sound because the round-0 Merkle tree is NEVER opened by
+                // FRI queries — only its 32-byte root is absorbed into the Fiat-Shamir
+                // channel. Soundness rests on Blake3 collision-resistance over the
+                // full RS-encoded codeword (RATE · 2^log_len · 16 bytes).
+                // See noid_fri::prover::commit_fast for full rationale.
                 let commitment = commit_fast(&padded, &ntt);
                 (commitment, padded)
             })
@@ -1125,6 +1189,9 @@ fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
             .par_iter()
             .map(|col| {
                 let padded = pad_column(col, log_len);
+                // SAFETY-INVARIANT: commit_fast uses Blake3 instead of Poseidon2b.
+                // The round-0 tree is never opened; only its root is absorbed into
+                // the Fiat-Shamir channel. See noid_fri::prover::commit_fast.
                 let commitment = commit_fast(&padded, &ntt);
                 (commitment, padded)
             })
@@ -1513,7 +1580,7 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
         }
         channel.observe_field_elems(rp);
         let r_i = channel.get_random_point();
-        claim = lagrange_eval_at(rp, r_i);
+        claim = lagrange_eval_at_cached(rp, r_i);
         challenges.push(r_i);
     }
 
@@ -1757,6 +1824,9 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
             .par_iter()
             .map(|col| {
                 let padded = pad_column(col, log_len);
+                // SAFETY-INVARIANT: commit_fast uses Blake3 instead of Poseidon2b.
+                // The round-0 tree is never opened; only its root is absorbed into
+                // the Fiat-Shamir channel. See noid_fri::prover::commit_fast.
                 let commitment = commit_fast(&padded, &ntt);
                 (commitment, padded)
             })
@@ -1950,7 +2020,7 @@ pub fn verify_air_with_extra<A: Air + ?Sized>(
         }
         channel.observe_field_elems(rp);
         let r_i = channel.get_random_point();
-        claim = lagrange_eval_at(rp, r_i);
+        claim = lagrange_eval_at_cached(rp, r_i);
         challenges.push(r_i);
     }
 
@@ -2206,7 +2276,7 @@ pub fn verify_air_timed<A: Air>(
         }
         channel.observe_field_elems(rp);
         let r_i = channel.get_random_point();
-        claim = lagrange_eval_at(rp, r_i);
+        claim = lagrange_eval_at_cached(rp, r_i);
         challenges.push(r_i);
     }
     t.transcript_sumcheck = t0.elapsed();
@@ -2997,6 +3067,51 @@ mod tests {
             let t = Block128::from(target_i);
             assert_eq!(lagrange_eval_at(&e5, t), p5(t));
         }
+    }
+
+    #[test]
+    fn lagrange_eval_cached_matches_reference() {
+        // Verify that lagrange_eval_at_cached produces identical results to
+        // the reference lagrange_eval_at for all degrees d in 2..=8 and a
+        // range of target points, confirming the OnceLock denominator cache
+        // is correct.
+        let a8 = [
+            Block128::from(3u8),
+            Block128::from(5u8),
+            Block128::from(7u8),
+            Block128::from(11u8),
+            Block128::from(13u8),
+            Block128::from(17u8),
+            Block128::from(19u8),
+            Block128::from(23u8),
+        ];
+        for d_plus_one in 2usize..=8 {
+            let evals: Vec<Block128> = a8[..d_plus_one].to_vec();
+            let targets: Vec<Block128> = (0..16u8)
+                .map(Block128::from)
+                .chain([
+                    Block128::from(0xabcdef01_23456789u128),
+                    Block128::from(0xdeadbeef_cafebabeu128),
+                ])
+                .collect();
+            for target in targets {
+                assert_eq!(
+                    lagrange_eval_at(&evals, target),
+                    lagrange_eval_at_cached(&evals, target),
+                    "mismatch at d_plus_one={d_plus_one} target={target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lagrange_eval_cached_is_idempotent_across_calls() {
+        // Second call with same d_plus_one must hit the cache and return same result.
+        let evals: Vec<Block128> = (0..4).map(|i| Block128::from(i as u8 + 1)).collect();
+        let target = Block128::from(99u8);
+        let r1 = lagrange_eval_at_cached(&evals, target);
+        let r2 = lagrange_eval_at_cached(&evals, target);
+        assert_eq!(r1, r2);
     }
 
     #[test]

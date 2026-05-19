@@ -238,6 +238,12 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
 
 /// Verifier. Accepts the public `AuthInputs`; never reads
 /// `spend_secret`.
+///
+/// `inputs` is used in full here (unlike `verify_spine_killshot`) because
+/// `absorb_public_boundary` reads `expected_address` and `expected_auth_tag`
+/// from it to seed the Fiat-Shamir channel. Those fields are public; the
+/// private `spend_secret` is structurally absent from `AuthInputs` at the
+/// type level and is therefore never reachable by the verifier.
 pub fn verify_auth_killshot<T: FiatShamir<Block128>>(
     proof: &AuthProofKillShot,
     circuit: &AuthCircuit,

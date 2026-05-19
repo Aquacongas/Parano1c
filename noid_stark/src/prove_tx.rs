@@ -342,6 +342,16 @@ pub fn verify_tx(
     // =========================================================================
     // Stage 1b: Auth <-> Spine bridge
     // =========================================================================
+    // This bridge checks two things explicitly:
+    //   1. tx_body_hash: both GKR instances must have seen the same hash.
+    //   2. expected_address: the ownership data in the spine leaf must match
+    //      what the auth GKR used as its public address pin.
+    //
+    // AuthTag binding is NOT checked explicitly here — it is enforced inside
+    // `verify_auth_killshot` via the public pin-claim on the auth-output slot
+    // (see `public_pin_claims` in auth_killshot.rs). The bridge covers only
+    // the address-derivation link between spine and auth; any auth-tag
+    // deviation would have caused `verify_auth_killshot` to return None above.
     if auth_inputs.tx_body_hash != claimed {
         return Err(VerifyTxError::AuthSpineBridge);
     }

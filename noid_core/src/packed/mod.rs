@@ -63,6 +63,16 @@ pub struct PackedBlock128 {
     lanes: [u128; 1],
 }
 
+const _: () = assert!(
+    core::mem::size_of::<PackedBlock128>()
+        == PACKED_LANES * core::mem::size_of::<Block128>(),
+    "PackedBlock128 must be exactly PACKED_LANES * sizeof(Block128)"
+);
+const _: () = assert!(
+    core::mem::align_of::<PackedBlock128>() >= core::mem::align_of::<Block128>(),
+    "PackedBlock128 alignment must be >= Block128 alignment for safe aliasing in pack_slice"
+);
+
 impl PackedBlock128 {
     /// Zero constant.
     pub const ZERO: Self = Self {
@@ -159,7 +169,13 @@ impl std::ops::BitXorAssign for PackedBlock128 {
 /// and properly aligned.
 ///
 /// # Safety
-/// The input slice must be aligned to at least 16 bytes.
+/// This is safe because:
+/// - `Block128` is `#[repr(transparent)]` over `u128`.
+/// - `PackedBlock128` is `#[repr(C)]` over `[u128; PACKED_LANES]`, so its
+///   in-memory layout is identical to `[Block128; PACKED_LANES]`.
+/// - The compile-time asserts above guarantee `size_of::<PackedBlock128>()`
+///   and `align_of::<PackedBlock128>()` are consistent with this aliasing.
+/// - Lifetimes are preserved: the returned slice borrows from `slice`.
 #[inline(always)]
 pub fn pack_slice(slice: &[Block128]) -> &[PackedBlock128] {
     if PACKED_LANES > 1 {
@@ -173,6 +189,10 @@ pub fn pack_slice(slice: &[Block128]) -> &[PackedBlock128] {
 /// Convert a mutable slice of Block128 to mutable PackedBlock128 slice.
 ///
 /// # Safety
+/// Same layout guarantee as [`pack_slice`]: `Block128` and `PackedBlock128`
+/// share identical memory representation. The compile-time asserts above
+/// confirm size and alignment compatibility. No aliasing hazard: the input
+/// `&mut [Block128]` is exclusively borrowed for the lifetime of the result.
 #[inline(always)]
 pub fn pack_slice_mut(slice: &mut [Block128]) -> &mut [PackedBlock128] {
     assert_eq!(slice.len() % PACKED_LANES, 0);
@@ -182,6 +202,10 @@ pub fn pack_slice_mut(slice: &mut [Block128]) -> &mut [PackedBlock128] {
 }
 
 /// Convert PackedBlock128 slice back to Block128 slice.
+///
+/// # Safety
+/// Inverse of [`pack_slice`]: same layout guarantee applies in the other
+/// direction. Size and alignment are verified by the compile-time asserts.
 #[inline(always)]
 pub fn unpack_slice(packed: &[PackedBlock128]) -> &[Block128] {
     let ptr = packed.as_ptr() as *const Block128;
@@ -190,6 +214,10 @@ pub fn unpack_slice(packed: &[PackedBlock128]) -> &[Block128] {
 }
 
 /// Convert mutable PackedBlock128 slice back to mutable Block128 slice.
+///
+/// # Safety
+/// Inverse of [`pack_slice_mut`]: same layout guarantee applies. The
+/// compile-time asserts above confirm size/align compatibility.
 #[inline(always)]
 pub fn unpack_slice_mut(packed: &mut [PackedBlock128]) -> &mut [Block128] {
     let ptr = packed.as_mut_ptr() as *mut Block128;

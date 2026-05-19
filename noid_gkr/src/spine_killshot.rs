@@ -202,6 +202,16 @@ pub fn prove_spine_killshot_with_states<T: FiatShamir<Block128>>(
 }
 
 /// Verifier.
+///
+/// `inputs` is used only in debug builds as a belt-and-braces native
+/// re-execution check (`compute_tx_body_hash`). In release builds the
+/// parameter is intentionally unused: soundness is guaranteed algebraically
+/// because `claimed_tx_body_hash` is absorbed into the Fiat-Shamir channel
+/// (see `absorb_hash` below), binding all GKR challenges to this value.
+/// The Kill-Shot sumcheck + FRI openings then prove that the committed MLE
+/// is consistent with this hash. There is no soundness gap from skipping
+/// native re-execution in release.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub fn verify_spine_killshot<T: FiatShamir<Block128>>(
     proof: &SpineProofKillShot,
     circuit: &SpineCircuit,

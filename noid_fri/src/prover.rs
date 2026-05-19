@@ -817,4 +817,104 @@ mod tests {
         );
         assert!(result.is_ok(), "1-fold minimal failed: {:?}", result);
     }
+
+    // =========================================================================
+    // §9.1 — commit_fast invariant tests
+    // =========================================================================
+
+    /// Tamper test: mutating any byte of the codeword must change the root.
+    /// Guards the SAFETY-INVARIANT: Blake3 collision-resistance over the full
+    /// RS-encoded codeword is what soundness rests on.
+    #[test]
+    fn commit_fast_tamper_changes_root() {
+        let log_len = 4usize;
+        let ntt = AdditiveNTT::<Block128>::new(log_len + crate::code::LOG_RATE);
+        let mut rng = rand::thread_rng();
+        let evals: Vec<Block128> = (0..1 << log_len)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
+
+        let original = commit_fast(&evals, &ntt);
+
+        // Flip one element in evals.
+        let mut tampered = evals.clone();
+        tampered[3] = tampered[3] + Block128::ONE;
+        let after_tamper = commit_fast(&tampered, &ntt);
+
+        assert_ne!(
+            original.vector_commitment.root,
+            after_tamper.vector_commitment.root,
+            "commit_fast root must change when codeword is tampered"
+        );
+    }
+
+    /// Determinism test: same evals → same root across two calls.
+    #[test]
+    fn commit_fast_is_deterministic() {
+        let log_len = 4usize;
+        let ntt = AdditiveNTT::<Block128>::new(log_len + crate::code::LOG_RATE);
+        let mut rng = rand::thread_rng();
+        let evals: Vec<Block128> = (0..1 << log_len)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
+
+        let c1 = commit_fast(&evals, &ntt);
+        let c2 = commit_fast(&evals, &ntt);
+        assert_eq!(
+            c1.vector_commitment.root, c2.vector_commitment.root,
+            "commit_fast must be deterministic"
+        );
+    }
+
+    /// Transcript-equivalence test: prover and verifier absorb identical
+    /// bytes (same root + same depth) when both call commit_fast on the
+    /// same codeword. Verified by checking that two independent Channel
+    /// instances produce the same state after absorbing the commitment.
+    #[test]
+    fn commit_fast_transcript_equivalence() {
+        let log_len = 4usize;
+        let ntt = AdditiveNTT::<Block128>::new(log_len + crate::code::LOG_RATE);
+        let mut rng = rand::thread_rng();
+        let evals: Vec<Block128> = (0..1 << log_len)
+            .map(|_| Block128::from(rng.gen::<u128>()))
+            .collect();
+
+        let commitment = commit_fast(&evals, &ntt);
+
+        // Prover side: absorb into channel.
+        let mut prover_ch = Channel::new();
+        prover_ch.observe_fri_commitment(&commitment);
+        let prover_challenge = prover_ch.get_random_point();
+
+        // Verifier side: reconstruct commitment independently from the
+        // same evals (simulates the verifier replaying via the same root),
+        // absorb the same commitment struct.
+        let commitment_v = commit_fast(&evals, &ntt);
+        let mut verifier_ch = Channel::new();
+        verifier_ch.observe_fri_commitment(&commitment_v);
+        let verifier_challenge = verifier_ch.get_random_point();
+
+        assert_eq!(
+            prover_challenge, verifier_challenge,
+            "prover and verifier channels must produce identical challenge after absorbing commit_fast commitment"
+        );
+    }
+
+    /// depth field consistency: commit_fast must set depth to
+    /// log_len + LOG_RATE - 1, matching the value a Poseidon2b tree
+    /// over the same codeword would have. The verifier relies on depth
+    /// for transcript absorption byte-pattern (observed as u32).
+    #[test]
+    fn commit_fast_depth_matches_expected() {
+        for log_len in [3usize, 4, 7] {
+            let ntt = AdditiveNTT::<Block128>::new(log_len + crate::code::LOG_RATE);
+            let evals: Vec<Block128> = vec![Block128::ZERO; 1 << log_len];
+            let c = commit_fast(&evals, &ntt);
+            let expected_depth = log_len + crate::code::LOG_RATE - 1;
+            assert_eq!(
+                c.vector_commitment.depth, expected_depth,
+                "commit_fast depth mismatch for log_len={log_len}"
+            );
+        }
+    }
 }
