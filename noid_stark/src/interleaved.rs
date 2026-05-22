@@ -5,12 +5,24 @@
 
 //! FRI-Binius interleaved PCS integration for the STARK.
 //!
-//! Replaces per-column FRI commitments with a single interleaved Merkle
-//! tree. All columns (AIR + boundary slices) are committed together;
-//! openings happen via a mixed-point sumcheck + single FRI proof.
+//! # Algebraic split (Stage G)
 //!
-//! The zero-check sumcheck and constraint composition logic are unchanged
-//! from `lib.rs`; only the commitment and opening phases differ.
+//! `prove_air_interleaved_algebraic` / `verify_air_interleaved_algebraic`
+//! run every algebraic step (zero-check, base openings, ladder partials,
+//! multipoint sumcheck) on a **caller-supplied** shared `Channel`,
+//! stopping just before the FRI mixed opening.  The caller is responsible
+//! for:
+//!
+//! 1. Absorbing the interleaved Merkle cap into `channel` **before** the
+//!    call (so the Fiat-Shamir transcript is correctly bound to the
+//!    commitment).
+//! 2. Issuing the FRI mixed opening after the call, using the returned
+//!    `r_pp` as the primary opening point and `final_claim` as the
+//!    value that must be matched.
+//!
+//! `prove_air_interleaved` / `verify_air_interleaved` are byte-identical
+//! to their pre-split form; they construct the channel internally and
+//! delegate to the algebraic variants.
 
 use noid_air::Air;
 use noid_core::mle::eq::eq_ind_partial_eval;
@@ -30,83 +42,87 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Proof structure (replaces StarkProof for the interleaved path)
+// Proof structures
 // ---------------------------------------------------------------------------
 
-/// STARK proof using the FRI-Binius interleaved PCS.
-///
-/// Smaller and faster than the per-column approach: one Merkle cap
-/// replaces N column roots, and one mixed opening proof replaces the
-/// batched FRI.
+/// Full STARK proof using the FRI-Binius interleaved PCS.
 #[derive(Debug, Clone)]
 pub struct InterleavedStarkProof {
     pub log_rows: usize,
-    /// Single interleaved commitment for ALL columns (AIR + slices).
     pub commitment: InterleavedCommitment,
-    /// Per-column base openings e_i = MLE_i(r_point) at the zero-check's
-    /// challenge point (AIR columns only; slices open at r_B_low).
     pub base_openings: Vec<Block128>,
-    /// Batched zero-check sumcheck rounds.
     pub zero_check_rounds: Vec<RoundPoly>,
-    /// VSHIFT ladders for each rotated column.
     pub shift_partials: Vec<Vec<Block128>>,
-    /// Multipoint sumcheck rounds (base + ladder + slice claims -> r'').
     pub multipoint_rounds: Vec<RoundPoly>,
-    /// Mixed opening proof: opens all columns at r'' (primary) with
-    /// slice claims as secondary eval points.
     pub mixed_opening: MixedOpeningProof,
-    /// Stage 0 MLE Splitting: claimed values of boundary-slice columns
-    /// at their respective GKR reduction points (r_B_low).
     pub slice_claimed_values: Vec<Block128>,
 }
 
+/// Algebraic-only per-tx proof — no commitment header, no FRI opening.
+/// Used by `noid_block` (Stage G) to accumulate N algebraic transcripts
+/// before issuing one block-level FRI.
+#[derive(Debug, Clone)]
+pub struct AlgebraicStarkProof {
+    pub log_rows: usize,
+    pub base_openings: Vec<Block128>,
+    pub zero_check_rounds: Vec<RoundPoly>,
+    pub shift_partials: Vec<Vec<Block128>>,
+    pub multipoint_rounds: Vec<RoundPoly>,
+    pub slice_claimed_values: Vec<Block128>,
+}
+
+impl AlgebraicStarkProof {
+    pub fn byte_len(&self) -> usize {
+        self.base_openings.len() * 16
+            + self.zero_check_rounds.iter().map(|r| r.len() * 16).sum::<usize>()
+            + self.shift_partials.iter().map(|p| p.len() * 16).sum::<usize>()
+            + self.multipoint_rounds.iter().map(|r| r.len() * 16).sum::<usize>()
+            + self.slice_claimed_values.len() * 16
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Prover
+// Internal helper: algebraic verifier extended output
 // ---------------------------------------------------------------------------
 
-/// Prove a STARK using the FRI-Binius interleaved PCS.
+/// Everything the full verifier needs to finish after the algebraic replay.
+struct AlgebraicVerifyOut {
+    r_pp: Vec<Block128>,
+    final_claim: Block128,
+    r_point: Vec<Block128>,
+    gammas: Vec<Block128>,
+    lambdas: Vec<Block128>,
+    shifted_indices: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Algebraic prover core
+// ---------------------------------------------------------------------------
+
+/// Run all algebraic STARK steps (zero-check, base openings, VSHIFT
+/// ladder partials, multipoint sumcheck) into the provided `channel`.
 ///
-/// Same logic as `prove_air_with_slices` but commits all columns into
-/// one interleaved Merkle tree and opens via mixed-point FRI-Binius.
+/// **Pre-condition:** caller has already called `absorb_cap(channel, cap)`
+/// before this function.  `absorb_public_inputs` is called here first,
+/// then the rest of the algebraic transcript follows.
 ///
-/// If `pre_committed` is `Some`, reuses the pre-computed commitment and
-/// prover state (avoids re-running NTT + tree build for all columns).
+/// Returns `(proof, r_pp, final_claim)`:
+/// - `r_pp`        – multipoint terminal challenge (length `log_len`).
+/// - `final_claim` – value that the FRI opening at `r_pp` must satisfy.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_air_interleaved<A: Air + ?Sized>(
+pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     air: &A,
     padded_columns: &[Vec<Block128>],
     pi: &PublicInputs,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
     log_len: usize,
-    pre_committed: Option<(
-        InterleavedCommitment,
-        noid_fri_binius::InterleavedProverState,
-    )>,
-) -> InterleavedStarkProof {
+    channel: &mut Channel,
+) -> (AlgebraicStarkProof, Vec<Block128>, Block128, Vec<Block128>) {
     let log_rows = air.log_rows();
-    let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
-
     let n_air_cols = air.n_columns();
 
-    // =========================================================================
-    // Stage 1: Interleaved commitment (single Merkle tree for ALL columns)
-    // =========================================================================
-    let (commitment, prover_state) = match pre_committed {
-        Some(pre) => pre,
-        None => {
-            let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
-            interleaved_commit(&col_refs, &ntt, &hasher)
-        }
-    };
-
-    // =========================================================================
-    // Stage 2: Fiat-Shamir channel setup
-    // =========================================================================
-    let mut channel = Channel::new();
-    absorb_public_inputs(&mut channel, pi);
-    absorb_cap(&mut channel, &commitment.cap);
+    absorb_public_inputs(channel, pi);
     if !extra_transcript.is_empty() {
         channel.observe_field_elems(extra_transcript);
     }
@@ -117,9 +133,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         .map(|_| channel.get_random_point())
         .collect();
 
-    // =========================================================================
-    // Stage 3: Zero-check sumcheck (same as non-interleaved path)
-    // =========================================================================
+    // Zero-check sumcheck.
     let shifted_indices: Vec<usize> = air.shifted_column_indices();
     assert!(
         shifted_indices.is_empty() || log_rows == padded_log_len(log_rows),
@@ -144,26 +158,21 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         air.constraints(),
         &betas,
         &z,
-        &mut channel,
+        channel,
         degree,
         &shifted_slot,
         n_air_cols,
     );
-
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
-    // =========================================================================
-    // Stage 4: Base openings (AIR columns only at r_point)
-    // =========================================================================
+    // Base openings.
     let base_openings: Vec<Block128> = padded_columns[..n_air_cols]
         .par_iter()
         .map(|col| mle_eval(col, &r_point))
         .collect();
     channel.observe_field_elems(&base_openings);
 
-    // =========================================================================
-    // Stage 5: VSHIFT ladder partials
-    // =========================================================================
+    // VSHIFT ladder partials.
     let partials_per_slot: Vec<Vec<Block128>> = shifted_indices
         .par_iter()
         .map(|&col_id| crate::vshift::ladder_partials(&padded_columns[col_id], &r_point))
@@ -173,17 +182,13 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         channel.observe_field_elems(partials);
     }
 
-    // Absorb slice claimed values.
     let slice_values: Vec<Block128> = slice_claims.iter().map(|sc| sc.value).collect();
     channel.observe_field_elems(&slice_values);
 
-    // =========================================================================
-    // Stage 6: Multipoint sumcheck (base + ladder + slices -> common r'')
-    // =========================================================================
+    // Multipoint sumcheck.
     let s_count = shifted_indices.len();
     let n_slices = slice_claims.len();
     let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
-
     channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
     let beta = channel.get_random_point();
 
@@ -198,7 +203,6 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         v
     };
 
-    // Target = base + ladder + slice claims.
     let mut target = Block128::ZERO;
     for i in 0..n_air_cols {
         target += lambdas[i] * base_openings[i];
@@ -211,7 +215,6 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         target += lambdas[n_air_cols + s_count + i] * sc.value;
     }
 
-    // Fused base pair: (eq(r_point, x), sum_i lambda_i * AIR_col_i(x)).
     let eq_base = eq_ind_partial_eval(&r_point);
     let hyper_len = 1usize << log_len;
     let combined_base_b: Vec<Block128> = (0..hyper_len)
@@ -233,9 +236,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     let ladder_pairs_a: Vec<Vec<Block128>> = (0..s_count)
         .into_par_iter()
         .map(|slot| {
-            let trails = weight_trails
-                .as_ref()
-                .expect("trails present when s_count > 0");
+            let trails = weight_trails.as_ref().expect("trails present");
             let mut w = crate::ladder_batch::build_weight_table_from_trails(gammas[slot], trails);
             let eta = lambdas[n_air_cols + slot];
             for v in w.iter_mut() {
@@ -248,7 +249,6 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
         .collect();
 
-    // Slice-claim pairs.
     let slice_pairs_a: Vec<Vec<Block128>> = (0..n_slices)
         .into_par_iter()
         .map(|i| {
@@ -261,7 +261,6 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         .map(|i| padded_columns[slice_claims[i].col_index].as_slice())
         .collect();
 
-    // Assemble all pairs: [fused_base, ladder_0..s, slice_0..n_slices]
     let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count + n_slices);
     pairs_a.push(eq_base);
     pairs_a.extend(ladder_pairs_a);
@@ -271,15 +270,265 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     pairs_b.extend(ladder_pairs_b);
     pairs_b.extend(slice_pairs_b);
 
-    let (multipoint_rounds, challenges) =
-        crate::multipoint_batch::prove_multipoint_sumcheck(pairs_a, pairs_b, target, &mut channel);
-    let r_pp: Vec<Block128> = challenges.iter().rev().cloned().collect();
+    let (multipoint_rounds, mp_challenges) =
+        crate::multipoint_batch::prove_multipoint_sumcheck(pairs_a, pairs_b, target, channel);
+    let r_pp: Vec<Block128> = mp_challenges.iter().rev().cloned().collect();
     debug_assert_eq!(r_pp.len(), log_len);
 
-    // =========================================================================
-    // Stage 7: FRI-Binius mixed opening at r'' (primary) + slice points (secondary)
-    // =========================================================================
-    // Build secondary claims: slice columns opened at their own points.
+    // Derive final_claim. The sumcheck terminal claim is the value of the
+    // last round polynomial at the last challenge (or `target` when there
+    // are zero rounds, i.e. log_len == 0). This matches
+    // `verify_multipoint_sumcheck`'s post-loop return value bit-for-bit.
+    let final_claim = match (multipoint_rounds.last(), mp_challenges.last()) {
+        (Some(last_rp), Some(&last_ch)) => crate::lagrange_eval_at_pub(last_rp, last_ch),
+        _ => target,
+    };
+
+    let proof = AlgebraicStarkProof {
+        log_rows,
+        base_openings,
+        zero_check_rounds,
+        shift_partials: partials_per_slot,
+        multipoint_rounds,
+        slice_claimed_values: slice_values,
+    };
+    (proof, r_pp, final_claim, lambdas)
+}
+
+// ---------------------------------------------------------------------------
+// Algebraic verifier core
+// ---------------------------------------------------------------------------
+
+/// Replay all algebraic steps on the provided `channel`.
+///
+/// **Pre-condition:** caller has already called `absorb_cap(channel, cap)`.
+///
+/// Returns `(r_pp, final_claim)` on success.  The caller must then verify
+/// the FRI mixed opening for `r_pp` / `final_claim` and check the terminal
+/// identity `expected == final_claim` using the FRI-supplied openings.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &AlgebraicStarkProof,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    channel: &mut Channel,
+) -> Result<(Vec<Block128>, Block128), VerifyError> {
+    let out = verify_algebraic_inner(air, pi, proof, extra_transcript, slice_claims, channel)?;
+    Ok((out.r_pp, out.final_claim))
+}
+
+/// Internal variant that also returns the data needed by the full verifier
+/// to reconstruct the terminal identity.
+fn verify_algebraic_inner<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &AlgebraicStarkProof,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    channel: &mut Channel,
+) -> Result<AlgebraicVerifyOut, VerifyError> {
+    let n_air_cols = air.n_columns();
+    let n_slices = slice_claims.len();
+
+    if proof.log_rows != air.log_rows() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    if proof.base_openings.len() != n_air_cols {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    let log_len = padded_log_len(proof.log_rows);
+    if proof.zero_check_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let degree = round_poly_degree(air);
+    let n_points = degree + 1;
+    for rp in &proof.zero_check_rounds {
+        if rp.len() != n_points {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    if proof.multipoint_rounds.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    for rp in &proof.multipoint_rounds {
+        if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+
+    absorb_public_inputs(channel, pi);
+    if !extra_transcript.is_empty() {
+        channel.observe_field_elems(extra_transcript);
+    }
+    let z = channel.get_random_points(log_len);
+    let n_constraints = air.constraints().len();
+    let betas: Vec<Block128> = (0..n_constraints)
+        .map(|_| channel.get_random_point())
+        .collect();
+
+    // Zero-check replay.
+    let mut zc_claim = Block128::ZERO;
+    let mut zc_challenges: Vec<Block128> = Vec::with_capacity(log_len);
+    for rp in &proof.zero_check_rounds {
+        if rp[0] + rp[1] != zc_claim {
+            return Err(VerifyError::ZeroCheckFailed);
+        }
+        channel.observe_field_elems(rp);
+        let r_i = channel.get_random_point();
+        zc_claim = lagrange_eval_at(rp, r_i);
+        zc_challenges.push(r_i);
+    }
+
+    let r_point: Vec<Block128> = zc_challenges.iter().rev().cloned().collect();
+    let eq_zr = noid_core::mle::eq::eq_ind(&z, &r_point);
+
+    // Constraint composition check.
+    let shifted_indices: Vec<usize> = air.shifted_column_indices();
+    if proof.shift_partials.len() != shifted_indices.len() {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let expected_ladder_len = log_len + 1;
+    for partials in &proof.shift_partials {
+        if partials.len() != expected_ladder_len {
+            return Err(VerifyError::ShapeMismatch);
+        }
+    }
+    let mut shifted_slot: Vec<Option<usize>> = vec![None; n_air_cols];
+    for (slot, &col_id) in shifted_indices.iter().enumerate() {
+        shifted_slot[col_id] = Some(slot);
+    }
+    let shifted_openings: Vec<Block128> = proof
+        .shift_partials
+        .iter()
+        .map(|p| crate::vshift::reconstruct_shifted_opening(&r_point, p))
+        .collect();
+
+    crate::check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
+
+    let mut composition = Block128::ZERO;
+    let mut local_scratch: Vec<Block128> = Vec::new();
+    let mut next_scratch: Vec<Block128> = Vec::new();
+    for (k, c) in air.constraints().iter().enumerate() {
+        local_scratch.clear();
+        for &j in c.columns() {
+            local_scratch.push(proof.base_openings[j]);
+        }
+        next_scratch.clear();
+        for &j in c.shifted_columns() {
+            let slot = shifted_slot[j].ok_or(VerifyError::ShapeMismatch)?;
+            next_scratch.push(shifted_openings[slot]);
+        }
+        let frame = noid_air::EvalFrame {
+            local: &local_scratch,
+            next: &next_scratch,
+        };
+        composition += betas[k] * c.evaluate(frame);
+    }
+    if eq_zr * composition != zc_claim {
+        return Err(VerifyError::ConstraintViolated);
+    }
+
+    // Absorb base openings + ladder partials + slice values.
+    channel.observe_field_elems(&proof.base_openings);
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
+        channel.observe_field_elems(partials);
+    }
+    channel.observe_field_elems(&proof.slice_claimed_values);
+
+    // Multipoint sumcheck replay.
+    let s_count = shifted_indices.len();
+    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
+    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
+    let beta = channel.get_random_point();
+
+    let total_weights = n_air_cols + s_count + n_slices;
+    let lambdas: Vec<Block128> = {
+        let mut v = Vec::with_capacity(total_weights);
+        let mut cur = Block128::ONE;
+        for _ in 0..total_weights {
+            v.push(cur);
+            cur *= beta;
+        }
+        v
+    };
+
+    let mut mp_target = Block128::ZERO;
+    for i in 0..n_air_cols {
+        mp_target += lambdas[i] * proof.base_openings[i];
+    }
+    for (slot, partials) in proof.shift_partials.iter().enumerate() {
+        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
+        mp_target += lambdas[n_air_cols + slot] * t_s;
+    }
+    for (i, sc) in slice_claims.iter().enumerate() {
+        mp_target += lambdas[n_air_cols + s_count + i] * sc.value;
+    }
+
+    let (sc_challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck(
+        &proof.multipoint_rounds,
+        mp_target,
+        channel,
+    )?;
+    let r_pp: Vec<Block128> = sc_challenges.iter().rev().cloned().collect();
+    if r_pp.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+
+    Ok(AlgebraicVerifyOut {
+        r_pp,
+        final_claim,
+        r_point,
+        gammas,
+        lambdas,
+        shifted_indices,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Full prover (byte-identical to pre-split)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_air_interleaved<A: Air + ?Sized>(
+    air: &A,
+    padded_columns: &[Vec<Block128>],
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    log_len: usize,
+    pre_committed: Option<(
+        InterleavedCommitment,
+        noid_fri_binius::InterleavedProverState,
+    )>,
+) -> InterleavedStarkProof {
+    let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
+    let hasher = Blake3Hasher::new();
+
+    let (commitment, prover_state) = match pre_committed {
+        Some(pre) => pre,
+        None => {
+            let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
+            interleaved_commit(&col_refs, &ntt, &hasher)
+        }
+    };
+
+    let mut channel = Channel::new();
+    absorb_cap(&mut channel, &commitment.cap);
+
+    let (alg, r_pp, _final_claim, _lambdas) = prove_air_interleaved_algebraic(
+        air,
+        padded_columns,
+        pi,
+        extra_transcript,
+        slice_claims,
+        log_len,
+        &mut channel,
+    );
+
     let secondary_claims: Vec<EvalClaim> = slice_claims
         .iter()
         .map(|sc| EvalClaim {
@@ -299,22 +548,21 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
     );
 
     InterleavedStarkProof {
-        log_rows,
+        log_rows: alg.log_rows,
         commitment,
-        base_openings,
-        zero_check_rounds,
-        shift_partials: partials_per_slot,
-        multipoint_rounds,
+        base_openings: alg.base_openings,
+        zero_check_rounds: alg.zero_check_rounds,
+        shift_partials: alg.shift_partials,
+        multipoint_rounds: alg.multipoint_rounds,
         mixed_opening,
-        slice_claimed_values: slice_values,
+        slice_claimed_values: alg.slice_claimed_values,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Verifier
+// Full verifier (byte-identical to pre-split)
 // ---------------------------------------------------------------------------
 
-/// Verify an [`InterleavedStarkProof`].
 pub fn verify_air_interleaved<A: Air + ?Sized>(
     air: &A,
     pi: &PublicInputs,
@@ -362,147 +610,45 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
 
-    // --- Replay parent transcript ---
-    let mut channel = Channel::new();
-    absorb_public_inputs(&mut channel, pi);
-    absorb_cap(&mut channel, &proof.commitment.cap);
-    if !extra_transcript.is_empty() {
-        channel.observe_field_elems(extra_transcript);
-    }
-    let z = channel.get_random_points(log_len);
-    let n_constraints = air.constraints().len();
-    let betas: Vec<Block128> = (0..n_constraints)
-        .map(|_| channel.get_random_point())
-        .collect();
-
-    // --- Zero-check replay ---
-    let mut claim = Block128::ZERO;
-    let mut challenges: Vec<Block128> = Vec::with_capacity(log_len);
-    for rp in &proof.zero_check_rounds {
-        let sum01 = rp[0] + rp[1];
-        if sum01 != claim {
-            return Err(VerifyError::ZeroCheckFailed);
-        }
-        channel.observe_field_elems(rp);
-        let r_i = channel.get_random_point();
-        claim = lagrange_eval_at(rp, r_i);
-        challenges.push(r_i);
-    }
-
-    let r_point: Vec<Block128> = challenges.iter().rev().cloned().collect();
-    let eq_zr = noid_core::mle::eq::eq_ind(&z, &r_point);
-
-    // --- Constraint composition check (AIR columns only) ---
-    let shifted_indices: Vec<usize> = air.shifted_column_indices();
-    if proof.shift_partials.len() != shifted_indices.len() {
-        return Err(VerifyError::ShapeMismatch);
-    }
-    let expected_ladder_len = log_len + 1;
-    for partials in &proof.shift_partials {
-        if partials.len() != expected_ladder_len {
-            return Err(VerifyError::ShapeMismatch);
-        }
-    }
-    let mut shifted_slot: Vec<Option<usize>> = vec![None; n_air_cols];
-    for (slot, &col_id) in shifted_indices.iter().enumerate() {
-        shifted_slot[col_id] = Some(slot);
-    }
-    let shifted_openings: Vec<Block128> = proof
-        .shift_partials
-        .iter()
-        .map(|partials| crate::vshift::reconstruct_shifted_opening(&r_point, partials))
-        .collect();
-
-    crate::check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
-
-    let column_openings = &proof.base_openings;
-    let mut composition = Block128::ZERO;
-    let mut local_scratch: Vec<Block128> = Vec::new();
-    let mut next_scratch: Vec<Block128> = Vec::new();
-    for (k, c) in air.constraints().iter().enumerate() {
-        local_scratch.clear();
-        for &j in c.columns() {
-            local_scratch.push(column_openings[j]);
-        }
-        next_scratch.clear();
-        for &j in c.shifted_columns() {
-            let slot = shifted_slot[j].ok_or(VerifyError::ShapeMismatch)?;
-            next_scratch.push(shifted_openings[slot]);
-        }
-        let frame = noid_air::EvalFrame {
-            local: &local_scratch,
-            next: &next_scratch,
-        };
-        composition += betas[k] * c.evaluate(frame);
-    }
-    if eq_zr * composition != claim {
-        return Err(VerifyError::ConstraintViolated);
-    }
-
-    // --- Absorb base openings + ladder partials on channel ---
-    channel.observe_field_elems(&proof.base_openings);
-    for (slot, partials) in proof.shift_partials.iter().enumerate() {
-        channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
-        channel.observe_field_elems(partials);
-    }
-
-    // Absorb slice claimed values.
-    channel.observe_field_elems(&proof.slice_claimed_values);
-
-    // --- Multipoint sumcheck verify ---
-    let s_count = shifted_indices.len();
-    let gammas: Vec<Block128> = (0..s_count).map(|_| channel.get_random_point()).collect();
-
-    channel.observe_field_elem(Block128::from(crate::multipoint_batch::MULTIPOINT_TAG));
-    let beta = channel.get_random_point();
-    let total_weights = n_air_cols + s_count + n_slices;
-    let lambdas: Vec<Block128> = {
-        let mut v = Vec::with_capacity(total_weights);
-        let mut cur = Block128::ONE;
-        for _ in 0..total_weights {
-            v.push(cur);
-            cur *= beta;
-        }
-        v
+    // Reconstruct AlgebraicStarkProof view (borrows values from full proof).
+    let alg = AlgebraicStarkProof {
+        log_rows: proof.log_rows,
+        base_openings: proof.base_openings.clone(),
+        zero_check_rounds: proof.zero_check_rounds.clone(),
+        shift_partials: proof.shift_partials.clone(),
+        multipoint_rounds: proof.multipoint_rounds.clone(),
+        slice_claimed_values: proof.slice_claimed_values.clone(),
     };
 
-    // Target = base + ladder + slice claims.
-    let mut target = Block128::ZERO;
-    for i in 0..n_air_cols {
-        target += lambdas[i] * proof.base_openings[i];
-    }
-    for (slot, partials) in proof.shift_partials.iter().enumerate() {
-        let t_s = crate::ladder_batch::target_claim(gammas[slot], partials);
-        target += lambdas[n_air_cols + slot] * t_s;
-    }
-    for (i, sc) in slice_claims.iter().enumerate() {
-        target += lambdas[n_air_cols + s_count + i] * sc.value;
-    }
+    let mut channel = Channel::new();
+    absorb_cap(&mut channel, &proof.commitment.cap);
 
-    let (sc_challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck(
-        &proof.multipoint_rounds,
-        target,
-        &mut channel,
-    )?;
-    let r_pp: Vec<Block128> = sc_challenges.iter().rev().cloned().collect();
-    if r_pp.len() != log_len {
-        return Err(VerifyError::ShapeMismatch);
-    }
+    // Run the algebraic verifier; it advances channel to just before FRI.
+    let out =
+        verify_algebraic_inner(air, pi, &alg, extra_transcript, slice_claims, &mut channel)?;
 
-    // Reconstruct terminal claim from mixed opening at r''.
-    // The mixed opening proof provides all_openings: first n_total values
-    // are column evaluations at r'' (the primary point).
+    let AlgebraicVerifyOut {
+        r_pp,
+        final_claim,
+        r_point,
+        gammas,
+        lambdas,
+        shifted_indices,
+    } = out;
+
+    let s_count = shifted_indices.len();
+
+    // Verify terminal identity against FRI-supplied openings.
     let m = &proof.mixed_opening.all_openings;
     if m.len() < n_total {
         return Err(VerifyError::ShapeMismatch);
     }
+
     let eq_base = noid_core::mle::eq::eq_ind(&r_point, &r_pp);
     let mut expected = Block128::ZERO;
-    // Base contribution: AIR columns with eq(r_point, r'').
     for k in 0..n_air_cols {
         expected += lambdas[k] * eq_base * m[k];
     }
-    // Ladder contribution.
     if s_count > 0 {
         let axes = crate::ladder_batch::LadderWeightAxes::new(&r_point, &r_pp);
         for (slot, &col_id) in shifted_indices.iter().enumerate() {
@@ -510,7 +656,6 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
             expected += lambdas[n_air_cols + slot] * w_s * m[col_id];
         }
     }
-    // Slice-claim contribution: eq(r_B_low, r'') * slice_col_opening.
     for (i, sc) in slice_claims.iter().enumerate() {
         let eq_s = noid_core::mle::eq::eq_ind(&sc.eval_point, &r_pp);
         expected += lambdas[n_air_cols + s_count + i] * eq_s * m[sc.col_index];
@@ -519,7 +664,6 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
         return Err(VerifyError::ConstraintViolated);
     }
 
-    // --- FRI-Binius mixed opening verify ---
     let secondary_claims: Vec<EvalClaim> = slice_claims
         .iter()
         .map(|sc| EvalClaim {
@@ -544,7 +688,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
-// Proof size estimation
+// Proof size
 // ---------------------------------------------------------------------------
 
 impl InterleavedStarkProof {

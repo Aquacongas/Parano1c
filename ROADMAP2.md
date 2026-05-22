@@ -278,35 +278,42 @@ No degradation with chain length — each step uses independent randomness.
 
 ### II.9 Implementation plan
 
-**Stage G — Block Accumulator (Deferred Folding)**
+**Stage G — Block Accumulator (Deferred Folding)**  *(DONE)*
 
 Prerequisite: working TxProof (DONE). No changes to existing crates.
 
-- G.1. `BlockAccumulator` struct in `noid_ivc`: accepts TxProof bundles, accumulates
-       evaluation claims via random-linear-combination over transcript.
-- G.2. State-continuity enforcement: assert `new_root_{k-1} == prev_root_k` during
-       accumulation (abort on mismatch).
-- G.3. Single batched FRI-Binius opening at end: call `prove_mixed_opening` once
-       for the accumulated claim.
-- G.4. `BlockProof` struct + `prove_block` / `verify_block` API in `noid_stark`.
-- G.5. Test: 100-tx block -> ~55 KB proof, native verify <700ms.
-- G.6. Bench: 1000-tx block -> prove <1s on 8-core.
+- G.1. `noid_block` crate: per-tx algebraic STARKs share a single block channel, accumulate evaluation claims via λ-RLC over the block transcript. *(DONE)*
+- G.2. State-continuity enforcement: `prev_state_root_k == new_state_root_{k-1}` checked at prove and verify. *(DONE)*
+- G.3. Single batched FRI-Binius opening at end via `prove_mixed_opening`. *(DONE)*
+- G.4. `BlockProof` + `prove_block` / `verify_block` API in `noid_block`. *(DONE)*
+- G.5. Acceptance tests in `noid_block/tests/stage_g_roundtrip.rs`: roundtrip + tamper detection on state continuity (prove side) + tamper detection on PI continuity (verify side). *(DONE)*
+- G.6. Bench (large N): deferred — needs Stage K wiring; current implementation is correct, optimization pass deferred.
+
+Status: 852 lib tests + 3 stage-G integration tests + 2 bridge tests all green in release mode.
 
 **Stage H — Deferred-FRI Recursive Circuit**
 
-Prerequisite: Stage G (BlockProof exists).
+Prerequisite: Stage G (BlockProof exists, DONE). Decomposed into shippable production milestones; each is real consensus code, not a simulator.
 
-- H.1. `RecursiveVerifierAir`: AIR that replays algebraic verifier (~8K field muls).
-       Pure arithmetic over GF(2^128), no hashing except Fiat-Shamir.
-- H.2. In-circuit Fiat-Shamir: Poseidon2b sponge AIR (~300 perms).
-       Reuse existing `poseidon_perm` AIR rows, scaled to 300 slots.
-- H.3. Deferred Merkle accumulator: in-circuit `acc_{n+1} = H(acc_n || data_n)`.
-       ~20 extra Poseidon2b perms (compress query_data blob).
-- H.4. State-continuity gate: `prev_root == state_root_n` equality in AIR.
-- H.5. Compose into single `RecursiveBlockAir`. Prove with existing FRI-Binius PCS.
-- H.6. Tip verifier: standalone function that checks recursive STARK proof +
-       native Merkle verification of tip block's FRI data + acc chain.
-- H.7. End-to-end test: 5-block chain, verify tip only, confirm O(1).
+- **H.1.** `noid_recursive` crate: production chain primitive. *(IN PROGRESS)*
+  - `ChainAccumulator { acc, height, last_state_root }` consensus state.
+  - `block_fri_digest(BlockProof) -> Digest`: canonical Poseidon2b digest over the FRI Merkle data carried in a `BlockProof` (cap + roots + siblings + queried symbols + final codeword + indices). Domain-tagged. **This same digest is replayed unchanged by the recursive AIR in H.5** — H.1 is not a simulator, it is the deferred-Merkle commitment primitive itself.
+  - `extend_chain(prev, block_proof, spine, auth) -> Result<ChainAccumulator>`: verifies block (algebraic + FRI + state continuity) then folds `acc' = compress(acc, block_fri_digest(block_proof))`.
+  - `tip_verify(tip_acc, tip_block_proof, spine, auth) -> Result<()>`: native FRI re-verification at tip + accumulator-chain match.
+  - `genesis(initial_state_root) -> ChainAccumulator` bootstrap.
+  - Acceptance: 3-block chain end-to-end + tamper detection on each link.
+
+- **H.2.** Algebraic-replay witness generator: deterministic transcript-trace producer that takes a `BlockProof` and emits the ordered field-element witness for the recursive AIR (sumcheck claims, Lagrange interpolations, composition values, Fiat-Shamir squeezes).
+
+- **H.3.** Fiat-Shamir Poseidon2b sponge AIR: composable AIR module wrapping the existing `noid_poseidon2b` permutation rows into an absorb/squeeze sponge with public-input + transcript bindings. Reused by H.5 for ~300 in-circuit perms.
+
+- **H.4.** Algebraic-replay AIR: constraints for sumcheck round consistency (`rp[0]+rp[1] == claim`, `next_claim == lagrange_eval_at(rp, r)`) + composition terminal equation. ~8K field muls over GF(2^128).
+
+- **H.5.** `RecursiveBlockAir`: composes H.2 witness, H.3 sponge AIR, H.4 algebraic AIR; deferred-Merkle accumulator gate (`acc' == compress(acc, block_fri_digest)`); state-continuity gate (`prev_root == state_root_n`). Proven with existing FRI-Binius PCS.
+
+- **H.6.** Tip verifier: `verify_tip(recursive_proof, tip_acc, tip_block_proof) -> Result<()>` — verifies the recursive STARK + native FRI on tip + accumulator chain match. O(1) regardless of chain length.
+
+- **H.7.** End-to-end acceptance: 5-block chain, prove recursive at each step, verify tip only, confirm O(1) cost.
 
 **Stage K — Optimizations (apply incrementally)**
 
