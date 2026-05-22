@@ -18,11 +18,12 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR};
 use noid_poseidon2b::primitives::{Address, Digest};
 
-/// Canonical block header. Mirrors the seven fields of `H_BLOCK`.
+/// Canonical block header.
 ///
-/// `timestamp` is seconds since Unix epoch; `nonce` is the PoW nonce.
-/// Both are absorbed as 128-bit field elements (zero-extended), which
-/// matches the binary-tower convention used for every other scalar in
+/// `timestamp` is seconds since Unix epoch. `nonce` is a 128-bit PoW
+/// nonce (Blake3). `difficulty_target` is the 256-bit ASERT target.
+/// Scalars are absorbed as 128-bit field elements (zero-extended),
+/// matching the binary-tower convention used for every other scalar in
 /// the spec (fee, value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -30,8 +31,14 @@ pub struct BlockHeader {
     pub state_root: Digest,
     pub tx_root: Digest,
     pub timestamp: u64,
+    pub height: u64,
     pub miner_address: Address,
-    pub nonce: u64,
+    /// 128-bit PoW nonce. Provides effectively unlimited search space
+    /// for any foreseeable hashrate.
+    pub nonce: u128,
+    /// 256-bit ASERT difficulty target. Block is valid iff
+    /// `Blake3(header_bytes) < difficulty_target` (LE comparison).
+    pub difficulty_target: [u8; 32],
     pub proof_transcript_hash: Digest,
     /// Canonical digest of the Binius-packed witness shipped on DA
     /// (`noid_chain::da::packed_witness_root`). Binds the 128x / 16x
@@ -49,8 +56,11 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     absorb_digest(&mut s, &hdr.state_root);
     absorb_digest(&mut s, &hdr.tx_root);
     s.absorb(Block128::from(hdr.timestamp as u128));
+    s.absorb(Block128::from(hdr.height as u128));
     absorb_digest(&mut s, hdr.miner_address.as_bytes());
-    s.absorb(Block128::from(hdr.nonce as u128));
+    // 128-bit nonce absorbed as a single Block128 element.
+    s.absorb(Block128::from(hdr.nonce));
+    absorb_digest(&mut s, &hdr.difficulty_target);
     absorb_digest(&mut s, &hdr.proof_transcript_hash);
     absorb_digest(&mut s, &hdr.witness_root);
 
@@ -74,8 +84,10 @@ mod tests {
             state_root: [0x22u8; 32],
             tx_root: [0x33u8; 32],
             timestamp: 1_700_000_000,
+            height: 100,
             miner_address: Address([0x44u8; 32]),
-            nonce: 0xDEAD_BEEFu64,
+            nonce: 0xDEAD_BEEF_CAFE_BABEu128,
+            difficulty_target: [0x77u8; 32],
             proof_transcript_hash: [0x55u8; 32],
             witness_root: [0x66u8; 32],
         }
@@ -109,11 +121,19 @@ mod tests {
         assert_ne!(hash_block_header(&h), baseline);
 
         let mut h = base;
+        h.height += 1;
+        assert_ne!(hash_block_header(&h), baseline);
+
+        let mut h = base;
         h.miner_address = Address([0xAAu8; 32]);
         assert_ne!(hash_block_header(&h), baseline);
 
         let mut h = base;
         h.nonce ^= 1;
+        assert_ne!(hash_block_header(&h), baseline);
+
+        let mut h = base;
+        h.difficulty_target = [0xAAu8; 32];
         assert_ne!(hash_block_header(&h), baseline);
 
         let mut h = base;
@@ -127,10 +147,9 @@ mod tests {
 
     #[test]
     fn domain_disjoint_from_txbody() {
-        // Feeding the same seven-word rate schedule into the TXBODY wrap
-        // would produce a different digest — the IV is the only thing
-        // that differs between the two constructions with matching
-        // input shapes, so this is the minimal cross-domain check.
+        // Feeding the same rate schedule into the TXBODY wrap would
+        // produce a different digest — the IV is the only thing that
+        // differs, so this is the minimal cross-domain check.
         use noid_poseidon2b::native::domain::{capacity_iv, TAG_TXBODY};
 
         let h = header_fixture();
@@ -141,8 +160,10 @@ mod tests {
         absorb_digest(&mut s, &h.state_root);
         absorb_digest(&mut s, &h.tx_root);
         s.absorb(Block128::from(h.timestamp as u128));
+        s.absorb(Block128::from(h.height as u128));
         absorb_digest(&mut s, h.miner_address.as_bytes());
-        s.absorb(Block128::from(h.nonce as u128));
+        s.absorb(Block128::from(h.nonce));
+        absorb_digest(&mut s, &h.difficulty_target);
         absorb_digest(&mut s, &h.proof_transcript_hash);
         absorb_digest(&mut s, &h.witness_root);
         let txbody_flavor = s.finalize();

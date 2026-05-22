@@ -102,10 +102,14 @@ participate in consensus:
 - `alloc_counter` — the monotonic PRNG seed for the allocator (§15.1);
 - `block_proof_root` — commitment to the aggregated recursive proof
   for this block;
-- PoW nonce and difficulty parameters.
+- `nonce` — 128-bit (16 bytes) PoW nonce (§18.2);
+- `difficulty_target` — 256-bit target threshold for Blake3 PoW
+  (§18.3);
+- `height` — block height (used for epoch anchor and difficulty
+  calculations).
 
 `log_slots` is protocol versioning: AIR arithmetisation (state
-commitment size, slot-index bit-decomposition in `FriStateOpenAir`,
+commitment size, slot-index bit-decomposition in `BlockStateBindingAir`,
 MLE eq-table size) is parameterised by `log_slots`. Every AIR builder
 MUST read `log_slots` from the header of the block being verified.
 There is no "off-header" configuration.
@@ -118,9 +122,11 @@ The global state commitment is the single Poseidon2b digest:
   state_root
 ```
 
-computed over the `2^log_slots`-element slot vector using the fixed
-domain-separated leaf hash and Poseidon2b Merkle compression with
-`ZERO_SUBTREE_ROOT[k]` constants at empty sub-trees.
+computed as the root of a Poseidon2b Merkle tree over segment FRI
+roots (§19). The state is divided into `2^(log_slots - 16)` segments
+of `2^16` slots each. Each segment is independently FRI-committed
+(three columns: value, owner_hi, owner_lo), and the segment roots
+feed into a shallow Poseidon2b tree under `TAG_SEGMENTTREE`.
 
 ---
 
@@ -174,10 +180,10 @@ secret under `DomainTag::TAG_ADDRESS` (see
 
 ## 3. Transaction construction
 
-A transaction `tx` has the form:
+A transaction intent `tx_intent` has the form:
 
 ```
-  tx = (tx_body, proof, prev_root, new_root)
+  tx_intent = (tx_body, logic_proof, claims_commitment, claimed_slots)
 ```
 
 ### 3.1 Selection of inputs
@@ -190,14 +196,14 @@ The wallet selects live slots owned by the spender (e.g., `slot 101 =
 The wallet obtains slot hints from a node:
 
 ```
-  wallet → node:  request free slot hints
-  node   → wallet: e.g., [200, 500, ...]
+  wallet → node:  request free slot indices
+  node   → wallet: e.g., [200, 500]   (indices only, no Merkle paths)
 ```
 
 The hint is **non-authoritative** — it matches the native allocator
-(§15.1) but the authoritative correctness check is in-circuit via
-`is_mint ⇒ pre = 0`. A node cannot force the wallet to overwrite a
-live slot; a proof that attempts to do so simply fails to build.
+(§15.1) but the authoritative correctness check is performed by the
+miner in BlockStateBinding: the miner opens each output slot and
+verifies it is EMPTY before including the transaction.
 
 ### 3.3 Outputs
 
@@ -213,118 +219,217 @@ Each output binds a chosen slot index to a `(value, owner)` pair:
 `tx_body` contains:
 
 ```
-  inputs:     list of slot indices (consumed slots)
-  outputs:   list of (slot_index, value, owner_hi, owner_lo)
-  fee:       non-negative amount (may be 0)
+  inputs:        list of (slot_index, claimed_value, claimed_owner)
+  outputs:       list of (slot_index, value, owner_hi, owner_lo)
+  fee:           non-negative amount (may be 0)
+  epoch_anchor:  hash of block header at (current_height - ANCHOR_DEPTH)
+  is_coinbase:   boolean
 ```
 
 `tx_body_hash` is the Poseidon2b spine hash of `tx_body` (§A.3 of
 `ARCHITECTURE.md`): 59 Poseidon2b permutations (4 input-leaf + 8
 output-leaf + 15 compress + 1 wrap) under `DomainTag::TAG_TXBODY`.
 
----
+### 3.5 Epoch anchor
 
-## 4. Proof contents
-
-The wallet builds **one** cryptographic proof locally that
-simultaneously attests:
-
-### 4.1 Ownership
-
-For every input slot `i`, the prover knows `SpendSecret_i` such that
-`derive_address(SpendSecret_i) == owner_i`. Enforced by `haddr` +
-`hauth` + constraint `T1a` of `tx_validity` (see §A.2 of
-`ARCHITECTURE.md`).
-
-### 4.2 Balance and range
+The `epoch_anchor` replaces the former `prev_state_root` as the
+time-binding field in `tx_body_hash`. It is defined as:
 
 ```
-  Σ inputs.value == Σ outputs.value + fee
+  epoch_anchor = H_BLOCK(block_header[height - ANCHOR_DEPTH])
+```
+
+where `ANCHOR_DEPTH = 6`. This provides:
+
+- **Anti-replay across forks:** Different forks produce different
+  headers at height-6, yielding different epoch_anchors and thus
+  different tx_body_hashes.
+- **Stability:** The epoch_anchor does not change when new blocks
+  arrive (it refers to a header that is already 6-deep).
+- **Expiry:** Consensus MUST reject transactions whose epoch_anchor
+  does not match any header in the window
+  `[current_height - ANCHOR_DEPTH, current_height]`.
+
+### 3.6 Claims commitment
+
+The wallet computes a binding commitment to all claimed slot values:
+
+```
+  C_claimed = Poseidon2b_sponge(
+    for each input:  (slot_index, value, owner_hi, owner_lo)
+    for each output: (slot_index, value, owner_hi, owner_lo)
+  )
+```
+
+`C_claimed` is absorbed into the LogicProof Fiat-Shamir channel,
+cryptographically binding the proof to these specific slot claims.
+The miner's BlockStateBinding separately opens the same slots and
+verifies equality with `C_claimed`.
+
+---
+
+## 4. Proof contents (Two-Layer Architecture)
+
+The system uses a **two-layer proof architecture**:
+
+- **Layer 1 — LogicProof** (wallet-side): proves transaction logic
+  without any state dependency.
+- **Layer 2 — BlockStateBinding** (miner-side): proves that claimed
+  slot values match the actual Merkle-committed state.
+
+### 4.1 LogicProof (wallet builds locally)
+
+The wallet builds **one** cryptographic proof that attests:
+
+#### 4.1.1 Ownership
+
+For every input slot `i`, the prover knows `SpendSecret_i` such that
+`derive_address(SpendSecret_i) == claimed_owner_i`. Enforced by
+AuthGKR Kill-Shot (HAddr + HAuth sub-circuits).
+
+#### 4.1.2 Balance and range
+
+```
+  Σ inputs.claimed_value == Σ outputs.value + fee
   ∀ v ∈ values:  v < 2^64
 ```
 
-Enforced by `balance_gate` and `range_gate`.
+Enforced by `balance_gate` and `range_gate` within `TxLogicAir`.
 
-### 4.3 Pre-state correctness
+#### 4.1.3 Transaction-body binding
 
-Under `prev_root`:
+`tx_body_hash` is computed by the SpineGKR Kill-Shot (59-perm Merkle
+spine). Its two lanes are pinned into the AIR via `PublicColumn`.
+`hauth` absorbs `tx_body_hash` so that the auth-tag is bound to this
+specific body.
 
-- Every input slot `i` opens to the claimed `(value_i, owner_i)`.
-- Every mint output slot `j` opens to `EMPTY`.
+#### 4.1.4 Claims binding
 
-Enforced by `fri_state_open` on the prev side plus the mint rule
-`is_mint ⇒ pre == 0` (constraint `T3` of `tx_validity`).
+`C_claimed` (§3.6) is absorbed into the Fiat-Shamir channel of the
+LogicProof. The proof is therefore bound to the specific set of
+claimed slot values. Any change to claimed slots forks the transcript
+and invalidates the proof.
 
-### 4.4 Post-state correctness
+#### 4.1.5 What LogicProof does NOT prove
 
-Under `new_root`:
+LogicProof does NOT prove:
+- That claimed input values actually exist in the state tree.
+- That claimed output slots are actually empty.
+- Any Merkle-path opening against state_root.
+
+These are deferred to BlockStateBinding (§4.2).
+
+A LogicProof is **stateless**: it does not depend on `state_root` and
+remains valid across new blocks, as long as the epoch_anchor is within
+the ANCHOR_DEPTH window and the claimed slots have not been consumed.
+
+### 4.2 BlockStateBinding (miner builds at block assembly)
+
+The miner builds a block-level proof that attests, for all
+transactions in the block:
+
+#### 4.2.1 Pre-state correctness
+
+Under `prev_block_state_root`:
+
+- Every input slot `i` opens to its claimed `(value_i, owner_i)`.
+- Every output slot `j` opens to `EMPTY`.
+
+#### 4.2.2 Post-state correctness
+
+Under `new_block_state_root`:
 
 - Every input slot is `EMPTY`.
 - Every output slot holds the claimed `(value, owner)` pair.
 
-Enforced by `fri_state_open` on the new side.
+#### 4.2.3 Root consistency
 
-### 4.5 Root consistency
+`new_block_state_root` is computed correctly from the post-state
+vector via Poseidon2b Merkle compression.
 
-`new_root` is the Poseidon2b state commitment of the post-state, and
-it equals the value carried in the transaction and in the block
-header. Enforced by the `FRI_STATE_COMBINER` compositions on both
-sides (§A.4 of `ARCHITECTURE.md`).
+#### 4.2.4 Bridge to LogicProof
 
-### 4.6 Transaction-body binding
+For each transaction `k`, the opened slot values MUST equal the
+values committed in `C_claimed_k`. This is verified by the
+block verifier checking `C_claimed` equality between the LogicProof
+public inputs and the BlockStateBinding opened values.
 
-`tx_body_hash` is computed by the GKR spine sub-proof (§4.2 of
-`ARCHITECTURE.md`); its two lanes are pinned into the AIR via
-`PublicColumn`; `hauth` absorbs `tx_body_hash` so that the auth-tag
-is bound to this specific body. Enforced by constraints `T2a` / `T2b`
-of `tx_validity`.
+### 4.3 Combined validity
 
-A transaction is **cryptographically valid** iff all of the above
-hold. Validity is a local property of the single object
-`(prev_root, tx_body, new_root, proof)`.
+A transaction is **cryptographically valid** within a block iff:
+
+1. Its LogicProof verifies (balance, range, ownership, body binding).
+2. The block's BlockStateBinding verifies (state openings, bridge).
+3. `C_claimed` in the LogicProof equals `C_claimed` derived from
+   BlockStateBinding openings.
+
+Validity of a transaction within a block is a property of the combined
+`(LogicProof, BlockStateBinding, C_claimed_match)` tuple.
 
 ---
 
 ## 5. Broadcast payload
 
-The network payload is:
+The network payload (TxIntent) is:
 
 ```
-  (prev_root, tx_body, new_root, proof)
+  (tx_body, logic_proof, claims_commitment, claimed_slots)
 ```
 
 The `SpendSecret` MUST NOT appear in the payload and MUST NOT be
-recoverable from it.
+recoverable from it. Neither `prev_state_root` nor `new_state_root`
+appear in the per-tx broadcast — state binding is performed at block
+level by the miner.
 
 ---
 
-## 6. Node-side validation (per-tx)
+## 6. Node-side validation (per-tx, mempool admission)
 
-On receiving a transaction a node MUST check:
+On receiving a TxIntent a node MUST check:
 
 ```
-  1. proof verifies under (prev_root, new_root, tx_body_hash);
-  2. prev_root matches the current chain tip that the node is
-     building on (or an explicitly allowed alternative tip during
-     mempool handling — see §14);
-  3. no conflicting slot usage versus the mempool-admitted set:
+  1. logic_proof verifies (STARK + SpineGKR + AuthGKR);
+  2. epoch_anchor is within the valid window:
+     epoch_anchor ∈ {H_BLOCK(header[h]) : h ∈ [tip - ANCHOR_DEPTH, tip]};
+  3. claimed_slots match the node's current state natively:
+        • each claimed input slot has the claimed (value, owner);
+        • each claimed output slot is EMPTY;
+  4. tx_body_hash is not in the nullifier set (§6.1);
+  5. no conflicting slot usage versus the mempool-admitted set:
         • no input slot is spent twice,
         • no output slot is minted twice;
-  4. fee is acceptable under the node's local policy (non-consensus).
+  6. fee is acceptable under the node's local policy (non-consensus).
 ```
 
-Only if all four hold is the transaction admitted to the mempool.
-Checks (1)–(3) are consensus-significant; check (4) is a local
-policy.
+Checks (1)–(5) are consensus-significant; check (6) is local policy.
+Check (3) is a native pre-filter — the authoritative state proof is
+generated by the miner in BlockStateBinding.
+
+### 6.1 Nullifier set
+
+A conforming node MUST maintain a rolling nullifier set containing
+all `tx_body_hash` values from the last `ANCHOR_DEPTH` blocks.
+
+A TxIntent is rejected if its `tx_body_hash` already appears in the
+nullifier set. This prevents double-inclusion of the same transaction.
+
+After a block exits the `ANCHOR_DEPTH` window, its nullifiers MAY be
+pruned (the epoch_anchor will have expired anyway).
 
 ---
 
-## 7. Block assembly (miner)
+## 7. Block assembly (Full Node)
 
-A miner aggregates a batch of admitted transactions:
+NOTE: Throughout this section, "the miner" refers to the block
+assembly function of the Full Node. Mining (PoW search) may be
+performed by a built-in miner or an external GPU/ASIC connected via
+the Block Template API. The protocol has two node types: Light Node
+(wallet) and Full Node (everything else). See `ARCHITECTURE.md` §8.
+
+The Full Node aggregates a batch of admitted TxIntents:
 
 ```
-  tx_1, tx_2, ..., tx_n
+  intent_1, intent_2, ..., intent_n
 ```
 
 and MUST enforce:
@@ -332,23 +437,66 @@ and MUST enforce:
 - no input slot is consumed by more than one transaction in the
   block;
 - no output slot is minted by more than one transaction in the block;
+- no tx_body_hash appears in the nullifier set;
 - conflicts between candidate transactions are resolved by the
   deterministic tie-break rule of §15.2.
 
-The miner then:
+The Full Node then:
 
 1. orders the surviving transactions (deterministic order sealed by
    PoW; §15.2 tie-break fixes any remaining ambiguity);
-2. recursively folds every per-tx proof into the block's IVC
-   accumulator (`noid_ivc::Accumulator`), producing one `BlockProof`;
-3. computes the resulting `state_root_next` and updates
+2. generates **BlockStateBinding**: a STARK proving that all claimed
+   slot values match the current state tree (Merkle openings against
+   `prev_block_state_root`), that output slots are EMPTY, and that
+   the post-state `new_block_state_root` is correctly computed;
+3. aggregates all LogicProofs + BlockStateBinding into one
+   `BlockProof` via deferred-opening (Stage G / Stage S architecture);
+4. computes the resulting `state_root_next` and updates
    `active_slot_count`, `alloc_counter`, and (if the §15.3 trigger
    fires) `log_slots`;
-4. seals the block with PoW.
+5. forms the block header (including `da_root`, `block_proof_hash`,
+   `coinbase_address`) and pushes it to the miner (built-in or
+   external via Block Template API);
+6. seals the block when a valid nonce is returned.
 
-A block is **well-formed** iff every admitted transaction satisfies
-§6, no conflicts remain after §15.2, the aggregated `BlockProof`
-verifies, and the header fields are updated consistently with §8.
+A block is **well-formed** iff every admitted transaction's LogicProof
+verifies, no conflicts remain after §15.2, the aggregated `BlockProof`
+(including BlockStateBinding) verifies, all C_claimed bridges match,
+and the header fields are updated consistently with §8.
+
+### 7.1 Mining pipeline (PoW integration)
+
+The Full Node operates an asynchronous two-process pipeline:
+
+- **Process 1 (Full Node CPU):** Collects TxIntents, generates
+  BlockProof (1-3s on 8 cores), forms block header. On completion,
+  pushes the 248-byte header to Process 2.
+- **Process 2 (miner — built-in or external):** Continuously
+  brute-forces nonce against `Blake3(header) < difficulty_target`.
+  On valid nonce, returns it to Process 1 for block publication.
+
+External miners connect via the Block Template API (analogous to
+Bitcoin's getblocktemplate / Stratum). They receive only the 248-byte
+header — no transaction data, no state, no proofs.
+
+On finding a new block (own or received from network):
+1. Immediately generate an empty-block template (coinbase only,
+   trivial BlockStateBinding). Push to miner. No hash-rate downtime.
+2. In background, build full template with transactions (1-3s).
+3. When ready, push updated header to miner, replacing the empty
+   template.
+
+### 7.2 Block withholding protection
+
+The coinbase address is embedded in the DA Payload, which determines
+`da_root`, which is committed in the header, which is proven by the
+BlockProof. An external miner receiving only the 248-byte header
+CANNOT change the coinbase address without regenerating the entire
+BlockProof — a CPU-intensive operation they do not perform.
+
+This provides **cryptographic protection** against block withholding
+attacks: external miners cannot steal blocks from the Full Node that
+generated the proof.
 
 ---
 
@@ -425,11 +573,13 @@ The `reward_amount` is fixed by the protocol emission schedule. The
 coinbase transaction:
 
 - MUST be the first transaction of the block;
-- MUST satisfy `is_mint ⇒ pre = 0` for its output slot(s), proven in
-  the usual way via `tx_validity` and `fri_state_open`;
+- MUST satisfy `is_mint ⇒ pre = 0` for its output slot(s), proven by
+  BlockStateBinding (miner opens the coinbase slot and verifies EMPTY);
+- does NOT require a LogicProof from a wallet (miner constructs it
+  directly within BlockStateBinding);
 - does NOT balance `Σ inputs == Σ outputs + fee`; instead it carries
-  an explicit `is_coinbase` flag that is consumed by the balance gate
-  as a protocol-recognised mint.
+  an explicit `is_coinbase` flag with `value = block_reward + sum(fees)`,
+  enforced by consensus.
 
 Example:
 
@@ -868,7 +1018,7 @@ no off-band coordination.
 
 `log_slots` is not merely a state parameter. AIR arithmetisation
 depends on it: the state commitment size, the bit-width of slot-index
-decomposition in `FriStateOpenAir`, and the size of MLE eq-tables are
+decomposition in `BlockStateBindingAir`, and the size of MLE eq-tables are
 all functions of `log_slots`. Expansion changes the interpretation of
 the execution environment while preserving soundness (old
 `slot_index` remain valid as msb = 0; new mints gain msb = 1 access).
@@ -889,57 +1039,71 @@ There is no off-header configuration.
 A conforming verifier MUST reject a block if any of the following
 fails:
 
-1. Every transaction's proof verifies against
-   `(prev_root, tx_body_hash, new_root)`.
-2. `prev_root` of each transaction matches the state root on which
-   that transaction is applied in serialised order.
-3. No input slot is consumed twice in the block.
-4. No output slot is minted twice after tie-break resolution
+1. Every transaction's LogicProof verifies (STARK + SpineGKR +
+   AuthGKR).
+2. Every transaction's epoch_anchor is within the ANCHOR_DEPTH
+   window.
+3. No tx_body_hash appears in the nullifier set.
+4. No input slot is consumed twice in the block.
+5. No output slot is minted twice after tie-break resolution
    (§15.2).
-5. Balance holds per transaction: `Σ inputs = Σ outputs + fee`
-   (coinbase excepted, §12).
-6. Range holds per value: `value < 2^64`.
-7. `is_mint ⇒ pre = 0` for every mint slot.
-8. `is_activation` / `is_deactivation` sums equal
-   `header.active_slot_count` delta (§15.3.5).
-9. `log_slots` is incremented iff the §15.3.6 trigger condition
-   holds.
-10. The aggregated `BlockProof` verifies.
-11. PoW satisfies the declared difficulty.
+6. Balance holds per transaction: `Σ inputs = Σ outputs + fee`
+   (coinbase excepted, §12). (Proven in LogicProof.)
+7. Range holds per value: `value < 2^64`. (Proven in LogicProof.)
+8. BlockStateBinding verifies: all claimed slots match actual state,
+   output slots were EMPTY, post-state root correctly computed.
+9. Bridge: `C_claimed` from each LogicProof matches the values opened
+   in BlockStateBinding.
+10. `is_activation` / `is_deactivation` sums equal
+    `header.active_slot_count` delta (§15.3.5).
+11. `log_slots` is incremented iff the §15.3.6 trigger condition
+    holds.
+12. The aggregated `BlockProof` (LogicProofs + BlockStateBinding +
+    deferred-opening FRI) verifies.
+13. PoW satisfies the declared difficulty.
+14. `header.da_root` matches the computed DA Payload root.
+15. `header.state_root` matches `new_block_state_root` from
+    BlockStateBinding.
 
 ---
 
 ## 17. Transaction validity vs chain validity (normative)
 
-Per-tx proof establishes **local correctness** of one state
-transition:
+Per-tx LogicProof establishes **local correctness** of transaction
+logic:
 
 ```
-  (prev_root_i, tx_i) → new_root_i
+  (epoch_anchor, tx_body, C_claimed) → proof that balance, range,
+  ownership, and body commitment are correct
 ```
 
-covering ownership, balance, state openings, post-state, and the
-computation of `new_root_i`.
+covering ownership, balance, range, spine binding, and claims
+commitment — without any state dependency.
 
-`BlockProof` establishes **chain correctness**, i.e. continuity of
-the ordered transition sequence within the block:
-
-```
-  new_root_i == prev_root_{i+1}
-```
-
-The IVC fold additionally checks, at every step:
-
-- validity of the next tx proof;
-- continuity of state roots;
-- absence of conflicting transitions;
-- correctness of the accumulator state.
-
-Consequently a `BlockProof` certifies both:
+BlockStateBinding establishes **state correctness**, i.e. that all
+claimed slot values match the actual Merkle-committed state:
 
 ```
-  (a)  all tx proofs are valid
-  (b)  all tx proofs form one coherent global state evolution
+  (prev_block_state_root, claimed_slots, C_claimed) →
+      proof that state matches claims, outputs empty, post-state correct
+```
+
+`BlockProof` establishes **chain correctness** by combining both
+layers:
+
+1. All LogicProofs are valid (algebraic).
+2. BlockStateBinding is valid (state openings + bridge).
+3. C_claimed equality holds for each transaction.
+4. State transition is coherent: prev_block_state_root →
+   (apply all txs) → new_block_state_root.
+
+Consequently a `BlockProof` certifies:
+
+```
+  (a)  all transaction logic is valid (LogicProofs)
+  (b)  all state claims are correct (BlockStateBinding)
+  (c)  the bridge between (a) and (b) is sound (C_claimed match)
+  (d)  the global state evolution is coherent
 ```
 
 ### 17.1 Recursive chain validity (overview)
@@ -957,17 +1121,449 @@ added after implementation (see `ROADMAP2.md` Part II).
 
 ---
 
-## 18. Conformance
+## 18. Proof-of-Work and difficulty adjustment
+
+### 18.1 PoW algorithm
+
+The block hash for proof-of-work purposes is:
+
+```
+  pow_hash = Blake3(block_header_bytes)
+```
+
+where `block_header_bytes` is the canonical serialisation of the full
+block header (§0.4, §8.4 of `ARCHITECTURE.md`) as a contiguous byte
+sequence in field order, little-endian.
+
+Blake3 was chosen for PoW because:
+
+- The protocol does not rely on PoW for execution security (proofs
+  handle that). PoW only provides ordering and Sybil resistance.
+- Blake3 is CPU-friendly; any laptop can mine on a young network.
+- Verification is nanoseconds, adding zero overhead to block validation.
+- If ASIC dominance becomes problematic, the hash function can be
+  changed via hard fork without affecting the proof system.
+
+### 18.2 Nonce and header fields for PoW
+
+The block header includes:
+
+```
+  nonce                [16B]  — 128-bit PoW nonce
+  difficulty_target    [32B]  — 256-bit target threshold
+  height              [ 8B]  — block height (used for anchor calculations)
+```
+
+A block satisfies PoW iff:
+
+```
+  Blake3(block_header_bytes) < difficulty_target
+```
+
+interpreted as a 256-bit unsigned little-endian integer.
+
+### 18.3 ASERT difficulty adjustment
+
+The protocol uses **ASERT** (Absolutely Scheduled Exponentially Rising
+Targets), an exponential moving average that adjusts difficulty
+continuously relative to a fixed anchor block.
+
+#### 18.3.1 Parameters
+
+```
+  BLOCK_TIME     = 60 seconds      (target inter-block interval)
+  EPOCH_LENGTH   = 6 blocks        (anchor update period)
+  HALFLIFE       = 360 seconds     (= EPOCH_LENGTH × BLOCK_TIME)
+```
+
+The halflife means: if the last epoch took half the ideal time (miners
+found 6 blocks in 180s instead of 360s), difficulty doubles. If it took
+twice the ideal time (720s), difficulty halves.
+
+#### 18.3.2 Anchor
+
+The anchor is updated every `EPOCH_LENGTH` blocks at epoch boundaries:
+
+```
+  anchor_height    = largest h ≤ current_height where h % EPOCH_LENGTH == 0
+  anchor_timestamp = block_header[anchor_height].timestamp
+  anchor_target    = block_header[anchor_height].difficulty_target
+```
+
+At genesis, `anchor_height = 0`, `anchor_timestamp = genesis_timestamp`,
+`anchor_target = GENESIS_TARGET`.
+
+#### 18.3.3 Target calculation
+
+For a block at height `H` with timestamp `T`:
+
+```
+  ideal_elapsed   = (H - anchor_height) × BLOCK_TIME
+  actual_elapsed  = T - anchor_timestamp
+  exponent        = (actual_elapsed - ideal_elapsed) / HALFLIFE
+
+  new_target = anchor_target × 2^exponent
+```
+
+The exponential is computed using fixed-point arithmetic with sufficient
+precision (at least 64 fractional bits) to avoid rounding-induced forks.
+All nodes MUST use the same fixed-point implementation to produce
+byte-identical targets.
+
+The target is clamped:
+
+```
+  MIN_TARGET = 1          (maximum difficulty; hash must be < 1 is theoretical only)
+  MAX_TARGET = 2^255 - 1  (minimum difficulty; trivially satisfied)
+```
+
+#### 18.3.4 Properties
+
+- **Stateless calculation:** The target for any block depends only on
+  the anchor block's fields plus the current block's height and
+  timestamp. No scanning of intermediate blocks is required.
+- **Fast adaptation:** 6-block epoch means the network adapts to
+  hashrate changes within ~6 minutes.
+- **No oscillation:** The exponential function is smooth — no DAA
+  gaming via timestamp manipulation beyond clamping rules (§18.4).
+- **Deterministic:** Given the same anchor + (height, timestamp), every
+  node computes the identical target.
+
+#### 18.3.5 Epoch anchor update rule (consensus)
+
+When `height % EPOCH_LENGTH == 0`:
+
+```
+  anchor_height    ← height
+  anchor_timestamp ← timestamp
+  anchor_target    ← difficulty_target (as calculated for this block)
+```
+
+The anchor fields are NOT stored separately — they are read from the
+block header at the relevant epoch boundary height. A node performing
+a reorg recalculates the anchor from the new chain's epoch boundary.
+
+### 18.4 Timestamp validation
+
+A conforming node MUST reject a block if:
+
+```
+  block.timestamp ≤ median_time_past(last 11 blocks)
+  block.timestamp > local_time + MAX_FUTURE_DRIFT
+```
+
+where:
+
+```
+  MAX_FUTURE_DRIFT = 120 seconds
+```
+
+This prevents timestamp manipulation that could game difficulty:
+- Cannot go backwards (median-time-past rule).
+- Cannot jump far forward (drift cap limits exponent depression).
+
+### 18.5 Genesis difficulty
+
+```
+  GENESIS_TARGET = 2^240
+```
+
+This yields approximately 2^16 = 65536 expected hashes to find a block
+at genesis. On a modern CPU doing ~1 GH/s Blake3, this takes ~65
+microseconds — intentionally trivial so that the first miner can
+bootstrap the chain immediately. Difficulty rises exponentially as
+hashrate grows.
+
+---
+
+## 19. Segmented state commitment
+
+### 19.1 Motivation
+
+The original state commitment (a single FRI polynomial over all
+`2^log_slots` elements) requires O(N) NTT recomputation per block.
+At `log_slots = 24` this takes seconds; at `log_slots = 28` it becomes
+impractical; at `log_slots = 32` it is impossible.
+
+The segmented design splits the state into fixed-size segments, each
+independently FRI-committed. Only segments modified by a block are
+recomputed. The global `state_root` is a Poseidon2b Merkle tree over
+segment roots.
+
+### 19.2 Segment parameters
+
+```
+  LOG_SEGMENT_SIZE = 16                    (65 536 slots per segment)
+  num_segments     = 2^(log_slots - LOG_SEGMENT_SIZE)
+  segment_depth    = log_slots - LOG_SEGMENT_SIZE
+```
+
+At genesis (`log_slots = 24`): 256 segments, tree depth 8.
+At maximum (`log_slots = 32`): 65 536 segments, tree depth 16.
+
+`LOG_SEGMENT_SIZE` is a protocol constant. It does NOT change when
+`log_slots` grows — expansion adds new segments, existing segments
+retain their size.
+
+### 19.3 Segment root
+
+Each segment `s` is a FRI-committed vector of `2^LOG_SEGMENT_SIZE`
+slots across three columns (value, owner_hi, owner_lo):
+
+```
+  seg_root[s] = combine_roots(
+      LOG_SEGMENT_SIZE,
+      fri_root(segment_s.values),
+      fri_root(segment_s.owners_hi),
+      fri_root(segment_s.owners_lo)
+  )
+```
+
+This is the same `combine_roots` function (Poseidon2b sponge under
+`TAG_FRISTATE`) used today, but scoped to `LOG_SEGMENT_SIZE` instead
+of `log_slots`. The per-column FRI Merkle internals use Blake3.
+
+### 19.4 Global state root
+
+```
+  state_root = poseidon2b_merkle_tree(
+      seg_root[0], seg_root[1], ..., seg_root[num_segments - 1]
+  )
+```
+
+The Merkle tree uses Poseidon2b compression with domain tag
+`TAG_SEGMENTTREE`. Empty (all-zero) segments use pre-computed constants
+`ZERO_SEGMENT_ROOT` (the FRI commitment of 2^16 zero-slots).
+
+The tree has depth `segment_depth` (8 at genesis, grows with
+`log_slots`). Internal nodes at depth `d` with two zero children use
+`ZERO_SEGTREE_NODE[d]`.
+
+### 19.5 Slot addressing
+
+A slot at global index `idx` maps to:
+
+```
+  segment_id = idx >> LOG_SEGMENT_SIZE
+  local_idx  = idx & ((1 << LOG_SEGMENT_SIZE) - 1)
+```
+
+### 19.6 Block production (state update)
+
+Upon applying a block:
+
+1. For each mutation `(idx, new_value)`: mark `segment_id` as dirty.
+2. For each dirty segment:
+   a. Apply mutations to the segment's column vectors.
+   b. Recompute the segment's three FRI column roots (NTT over
+      `2^LOG_SEGMENT_SIZE` elements — fixed-cost, independent of total
+      state size).
+   c. Compute `seg_root[s]` via `combine_roots`.
+3. Update the Poseidon2b Merkle tree: for each dirty segment, update
+   its leaf and propagate `segment_depth` hash compressions upward.
+4. `state_root` = tree root.
+
+Cost per block:
+
+```
+  FRI recomputation: K × O(2^LOG_SEGMENT_SIZE)  where K = # dirty segments
+  Tree update:       K × segment_depth × O(1)   (Poseidon2b compressions)
+```
+
+Typical block with 100 transactions touching ~50 segments:
+  - 50 × NTT(2^16) = 50 × ~0.5ms = ~25ms FRI work
+  - 50 × 8 Poseidon2b = negligible
+
+### 19.7 In-circuit proof (BlockStateBinding)
+
+To prove `slot[idx] = V` against `state_root`:
+
+```
+  1. FRI opening of local_idx within segment_id:
+     - Sumcheck over LOG_SEGMENT_SIZE variables (16 rounds)
+     - Proves V against seg_root[segment_id]
+     - This is the existing FRI opening mechanism, unchanged
+
+  2. Segment Merkle path: seg_root[segment_id] → state_root
+     - segment_depth Poseidon2b compressions (8 at genesis, up to 16)
+     - Proved in-circuit within BlockStateBinding AIR
+```
+
+In-circuit cost breakdown:
+
+```
+  FRI opening (sumcheck):  16 rounds (was 24 with monolithic FRI)
+  Merkle path (Poseidon):  8-16 permutations per unique segment
+
+  Batching: slots in the same segment share the Merkle path.
+  For 200 slots across 50 segments: 50 × 8 = 400 Poseidon2b perms.
+```
+
+Compared to monolithic FRI (24-round sumcheck, 0 Poseidon):
+- Save 8 sumcheck rounds per slot (cheap binary field ops).
+- Add 8 Poseidon perms per unique segment (moderate cost).
+- Net with in-AIR Poseidon: ~+7-15% BlockProof overhead.
+
+### 19.7.1 Merkle Kill-Shot optimisation
+
+The segment Merkle path Poseidon2b permutations are NOT materialised in
+the STARK AIR trace. Instead, they are proven via a dedicated
+**Merkle Kill-Shot GKR** sub-protocol (`noid_gkr::merkle_killshot`),
+using the same unified sumcheck + shift architecture as SpineGKR and
+AuthGKR.
+
+Structure: up to `MAX_MERKLE_DEPTH = 16` chained compressions (32
+permutation slots) in a single 14-variable hypercube (2^14 = 16 384
+cells). The Kill-Shot proves all Poseidon2b constraints simultaneously
+via one degree-9 unified sumcheck (14 rounds) + one shift gadget
+(14 rounds) + 3 batch-eval reductions.
+
+When multiple segment paths are batched into a single block proof:
+
+```
+  50 unique segments × 8 compressions = 400 permutations
+  → batched into a single Merkle Kill-Shot (18-var hypercube)
+  → ~36 FS rounds, ~8 KB proof
+  → ZERO additional STARK AIR rows
+```
+
+Compared to in-AIR materialisation:
+
+| Approach | Trace overhead | Proof overhead | Net BlockProof impact |
+|----------|---------------|---------------|-----------------------|
+| In-AIR Poseidon | +107K rows | +10-15 KB | +15% |
+| **Merkle Kill-Shot** | **0 rows** | **~8 KB sub-proof** | **+2-3%** |
+
+The Merkle Kill-Shot is bound to the STARK via the same mechanism as
+SpineGKR/AuthGKR: boundary MLE committed by FRI, `extra_transcript`
+hook, and a single-point opening `(r_B, v_B)` discharged in the
+multipoint-close.
+
+Net impact on BlockProof with Kill-Shot: **+2-3%** (effectively zero).
+Net impact on LogicProof: **still zero** (Merkle paths are block-only).
+
+### 19.8 Expansion under segmentation (§15.3 interaction)
+
+When `log_slots` increments by 1:
+
+- `num_segments` doubles.
+- The new upper half is all-zero segments (`ZERO_SEGMENT_ROOT`).
+- The Merkle tree gains one level: new root = Poseidon2b(old_root,
+  ZERO_SEGTREE_NODE[old_depth]).
+- Existing segment indices remain valid (high bit = 0).
+- New mints into the upper half create dirty segments in the new region.
+- `LOG_SEGMENT_SIZE` remains 16 — segments never change size.
+
+Cost of expansion: one Poseidon2b compression (same as before).
+
+### 19.9 Segment root caching
+
+Nodes MUST cache all `num_segments` segment roots (32 bytes each).
+At `log_slots = 24`: 256 × 32 = 8 KB. At `log_slots = 32`: 65536 ×
+32 = 2 MB. This is trivial.
+
+The full Merkle tree of segment roots is also cached (internal nodes):
+at most `2 × num_segments × 32` bytes = 4 MB at maximum scale.
+
+---
+
+## 20. State storage backends
+
+### 20.1 Storage abstraction
+
+The state layer MUST support two backend modes selectable at node
+startup:
+
+```
+  --storage=ram    (default; entire state in process memory)
+  --storage=disk   (MDBX-backed; mmap'd file on disk)
+```
+
+Both backends present the same interface to the chain layer:
+
+```
+  get_slot(segment_id, local_idx) → SlotValue
+  set_slot(segment_id, local_idx, SlotValue)
+  load_segment_columns(segment_id) → (Vec<Block128> × 3)
+  flush()
+```
+
+The `load_segment_columns` method is used by the block producer to
+obtain the full column vectors needed for FRI NTT recomputation of a
+dirty segment. The disk backend loads (or maps) only the requested
+segment into memory.
+
+### 20.2 RAM backend (default)
+
+All segments as contiguous `Vec<Block128>` arrays in process memory.
+Optimal for development, testing, and nodes with sufficient RAM.
+
+Memory budget:
+
+```
+  log_slots=24: 256 segments × 2^16 × 3 × 16B = 768 MB
+  log_slots=26: 1024 segments × 2^16 × 3 × 16B = 3 GB
+  log_slots=28: 4096 segments × 2^16 × 3 × 16B = 12 GB
+```
+
+Recommended for `log_slots ≤ 26` (up to ~3 GB).
+
+### 20.3 Disk backend (MDBX)
+
+Uses MDBX (libmdbx) as the storage engine. Each segment is a sub-range
+within a single MDBX database, keyed by `(segment_id, local_idx)`.
+
+MDBX properties relevant to our workload:
+
+- **Memory-mapped reads:** Random slot lookups are mmap pointer
+  dereferences — no deserialization overhead.
+- **Copy-on-write:** Crash-safe by construction. No WAL replay needed.
+- **Dynamic geometry:** Database file grows/shrinks automatically.
+- **Proven at scale:** Used by Reth (Ethereum execution client) at
+  multi-TB state sizes.
+
+The disk backend loads dirty segment columns into a temporary RAM buffer
+for NTT computation during block production, then releases the buffer
+after computing the segment's FRI root.
+
+Memory budget with disk backend:
+
+```
+  Hot buffer: K × 2^16 × 3 × 16B where K = dirty segments per block
+  Typical (K=50): 50 × 64K × 48B = 150 MB temporary
+  Segment root cache: ≤ 4 MB
+  MDBX mmap: OS-managed, backed by file
+```
+
+### 20.4 Mandatory disk mode
+
+A conforming node MUST use the disk backend when `log_slots > 26`.
+Attempting to run in RAM mode at `log_slots > 26` requires > 12 GB
+of state memory and is unsafe for typical hardware.
+
+### 20.5 Backend selection is non-consensus
+
+The storage backend is an implementation detail. Both backends produce
+byte-identical `state_root` values and identical state transitions.
+A node MAY switch backends between restarts (by importing a snapshot).
+No on-chain state or proof depends on which backend is active.
+
+---
+
+## 21. Conformance
 
 An implementation is **conforming** iff:
 
 - it produces byte-identical `state_root`, `active_slot_count`,
   `alloc_counter`, and `log_slots` updates for every finalised block
-  against the reference semantics of §0 through §17;
+  against the reference semantics of §0 through §20;
 - it rejects every block that fails any invariant of §16;
 - it uses the Fiat–Shamir transcript schedule specified by
   `ARCHITECTURE.md` §4.2 and `noid_gkr/SPEC.md` for the GKR boundary
-  binding.
+  binding;
+- it uses the ASERT difficulty calculation of §18.3 to validate PoW;
+- it uses the segmented state commitment of §19 to compute
+  `state_root`.
 
 All other choices (mempool prioritisation, local fee policy, probe
-caching, bitmap layout) are implementation-defined.
+caching, bitmap layout, storage backend) are implementation-defined.

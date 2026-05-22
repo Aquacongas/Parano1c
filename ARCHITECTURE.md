@@ -11,16 +11,18 @@ are presented top-down — from UX down to the underlying mathematics.
 ## 1. One-line picture
 
 ```
-  wallet  ──►  proof  ──►  mempool  ──►  miner  ──►  block proof  ──►  chain
-                  ▲                        │
-                  │                        ▼
-              (GKR + STARK + FRI)     aggregated proof (IVC)
+  wallet  ──►  LogicProof  ──►  mempool  ──►  miner  ──►  BlockProof  ──►  chain
+                   ▲                            │
+                   │                            ├── BlockStateBinding (Merkle proofs)
+               (GKR + STARK)                    ├── deferred-FRI aggregation
+                                                └── PoW seal
 ```
 
-The user builds **a single cryptographic proof** locally that asserts
-the transaction is correct. The network only **verifies** that proof —
-it never "executes" the transaction. A miner aggregates many such
-proofs into one recursive proof and seals it with a PoW block.
+The user builds a **LogicProof** locally that asserts the transaction's
+math is correct (balance, ownership, range). The miner adds a
+**BlockStateBinding** proving that claimed slot values exist in the
+state tree. Together they form the **BlockProof**. The network never
+"executes" transactions — it verifies mathematics.
 
 ---
 
@@ -34,8 +36,8 @@ Each cell stores a triple:
 ```
 
 An empty cell is the canonical zero `(0, 0, 0)`. The root of all cells
-is `state_root`, a single Poseidon2b commitment. It is written into
-the block header.
+is `state_root` — a Poseidon2b Merkle tree over segment FRI roots
+(§11). It is written into the block header.
 
 ```
 ┌─────────────────── state (2^24 cells) ───────────────────┐
@@ -71,79 +73,93 @@ deterministically. The wallet:
   fee:      0
 ```
 
-### 3.2 The wallet builds the proof
+### 3.2 The wallet builds the LogicProof
 
-This is the heart of the system. The wallet assembles **one** proof
-locally that simultaneously attests:
+This is the heart of the system. The wallet assembles a **LogicProof**
+locally that attests only to the MATHEMATICAL correctness of the
+transaction:
 
 ```
   ownership        │ Alice knows the secret for owner of slot 101
   balance          │ Σ inputs == Σ outputs + fee
-  pre-state        │ slot 101 in prev_root really was (100, Alice);
-                   │ slots 200 and 500 were empty
-  post-state       │ slot 101 is now zero; slots 200 and 500 are full
-  new_root         │ the resulting root is computed correctly
+  range            │ all values < 2^64
+  body binding     │ tx_body_hash correctly computed (SpineGKR)
+  claims binding   │ C_claimed commits to specific slot values
 ```
+
+The LogicProof does NOT prove:
+- That slot 101 actually contains (100, Alice) in the state tree.
+- That slots 200 and 500 are actually empty.
+- Any Merkle-path computation.
+
+This separation means the LogicProof is **stateless**: it remains valid
+across new blocks as long as the epoch_anchor hasn't expired and
+nobody has spent the same input slots.
 
 ### 3.3 Broadcasting
 
 ```
-  (prev_root, tx_body, new_root, proof)
+  (tx_body, logic_proof, claims_commitment, claimed_slots)
 ```
 
-**Without the secret.** The node verifies the proof → admits it to the
-mempool.
+**Without the secret. Without state roots.** The node verifies the
+LogicProof and checks claimed slots against native state → admits to
+the mempool. State binding is done by the miner at block assembly.
 
-### 3.4 The miner assembles a block
+### 3.4 The Full Node assembles a block
 
-A miner in Paranoid is, simultaneously:
+Block assembly is a core function of the Full Node (not a separate
+actor). The Full Node performs three sub-roles during block production:
 
-- block producer;
-- recursive proof aggregator;
-- PoW finalizer.
+- **state prover** (generates BlockStateBinding);
+- **proof aggregator** (combines LogicProofs + state binding);
+- **PoW coordinator** (pushes header to built-in or external miner).
 
-The network does not distinguish the separate roles of builder,
-sequencer, prover, or aggregator. This is deliberate: every
-transaction already carries a complete cryptographic proof of its
-correctness, so the network does not need "executors". Execution
-happens locally at the wallet/prover, well before `tx` is broadcast.
+The Full Node:
 
-The miner's job is to construct the next **canonical recursive
-validity checkpoint** for the network.
-
-The miner:
-
-- pulls tx proofs from the mempool;
-- verifies each tx proof;
-- resolves conflicts between competing transitions;
+- pulls TxIntents (LogicProofs) from the mempool;
+- verifies each LogicProof;
+- resolves conflicts between competing slot claims;
 - orders the transactions;
-- recursively folds all proofs into one `BlockProof`;
-- computes the resulting `state_root`;
-- seals the outcome with PoW.
+- generates BlockStateBinding (proves Merkle openings for all slots);
+- aggregates LogicProofs + BlockStateBinding into one `BlockProof`;
+- computes the resulting `state_root` and `da_root`;
+- forms the 248-byte header and pushes it to the miner (built-in or
+  external via Block Template API).
 
 ```
-  tx proofs
+  TxIntents (LogicProofs)
       │
       ▼
-  validation
+  validation + conflict resolution
       │
       ▼
-  ordering + conflict resolution
+  ordering (deterministic)
       │
       ▼
-  recursive folding (IVC)
+  BlockStateBinding (Full Node proves state)
       │
       ▼
-  BlockProof + state_root
+  aggregation (deferred-FRI)
       │
       ▼
-  PoW finalization
+  BlockProof + state_root + da_root
       │
       ▼
-  canonical block
+  form header (248 bytes)
+      │
+      ├──► built-in miner (CPU/GPU)
+      │         OR
+      └──► Block Template API → external miner (GPU/ASIC)
+              │
+              ▼
+         valid nonce returned
+              │
+              ▼
+         seal + broadcast block
 ```
 
-Observe: PoW in Paranoid does not protect execution of transactions.
+PoW in Paranoid does not protect execution of transactions.
 The correctness of execution is already established cryptographically.
 
 PoW solves a different problem:
@@ -153,9 +169,12 @@ PoW solves a different problem:
 - it produces an objective history of the network;
 - it anchors the recursive proof chain.
 
-So the role of a Paranoid miner is not "transaction executor" but:
+The Full Node is: **state prover + proof aggregator + PoW coordinator.**
 
-> recursive proof aggregator and PoW finalizer
+The mining pipeline is asynchronous: CPU generates BlockProof (1-3s),
+then pushes the header to the miner (built-in or external) who
+brute-forces the nonce. The external miner cannot modify block content
+(coinbase is locked in the proof). See `SPECIFICATION.md` §7.1-7.2.
 
 ---
 
@@ -196,9 +215,9 @@ In Paranoid, AIRs are built for:
 - deriving an address from a secret (`haddr`);
 - binding a signature to the tx body (`hauth`);
 - opening state-tree cells out of the state Merkle tree
-  (`fri_state_open`);
+  (`fri_state_open` — block-level in the new design);
 - S-box and MDS steps of Poseidon2b used by the remaining in-AIR
-  hashes: HAddr, HAuth, FRI-state-combiner.
+  hashes.
 
 The 59-permutation Poseidon2b **spine** that compresses the tx body
 into `tx_body_hash` is no materialised inside any STARK AIR.
@@ -389,76 +408,52 @@ proof.
 
 It matters to distinguish two levels of correctness in Paranoid.
 
-#### Transaction validity
+#### Transaction validity (LogicProof)
 
-A per-`tx` proof guarantees the local correctness of one state
-transition:
+A per-tx LogicProof guarantees the local correctness of transaction
+logic:
 
 ```
-  (prev_root_i, tx_i) → new_root_i
+  (epoch_anchor, tx_body, C_claimed) → proof that math is correct
 ```
 
 The proof establishes:
 
-- ownership;
+- ownership (AuthGKR);
 - balance conservation;
-- correctness of state openings;
-- correctness of the post-state;
-- correctness of the computation of `new_root_i`.
+- range validity;
+- body commitment (SpineGKR);
+- claims binding (C_claimed in Fiat-Shamir).
 
-In short: an individual transaction is mathematically correct in
-isolation.
+A LogicProof does NOT establish state correctness — that is deferred
+to BlockStateBinding.
 
-#### Chain validity
+#### State validity (BlockStateBinding)
 
-Chain correctness, however, demands more.
-
-It is not enough that every `tx` be individually valid. The
-transitions must also form one continuous evolution of state.
-
-A `BlockProof` guarantees, across the ordered transition sequence of
-the block:
+The miner's BlockStateBinding proves:
 
 ```
-  new_root_i == prev_root_{i+1}
+  (prev_block_state_root, claimed_slots, C_claimed) →
+      all openings match, outputs empty, post-state correct
 ```
 
-That is:
+#### Chain validity (BlockProof)
+
+A `BlockProof` combines both layers plus IVC accumulation:
+
+1. All LogicProofs are valid (algebraic correctness).
+2. BlockStateBinding is valid (state correctness).
+3. C_claimed bridge holds (LogicProof claims == state openings).
+4. Global state evolution is coherent:
+   `prev_block_state_root → apply txs → new_block_state_root`.
+
+Consequently a `BlockProof` certifies:
 
 ```
-  root_0 --tx1--> root_1
-  root_1 --tx2--> root_2
-  root_2 --tx3--> root_3
-```
-
-forms one continuous state-evolution graph.
-
-#### Stateful recursive accumulation
-
-IVC in Paranoid does not merely aggregate a list of proofs. The
-recursion operates over:
-
-```
-  validated state transitions
-```
-
-Each `fold_step` checks:
-
-- correctness of the next `tx` proof;
-- continuity of state roots;
-- absence of conflicting transitions;
-- correctness of the accumulator state.
-
-Consequently a `BlockProof` certifies not only that
-
-```
-  all tx proofs are valid
-```
-
-but also that
-
-```
-  all tx proofs form one coherent global state evolution
+  (a)  all transaction logic is valid
+  (b)  all state claims are correct
+  (c)  the bridge between (a) and (b) is sound
+  (d)  the global state evolution is coherent
 ```
 
 ---
@@ -470,62 +465,72 @@ but also that
   │ LEVEL 1 — USER                                              │
   │   "Send 10 to Bob"                                          │
   │   wallet picks slot 101; asks node for free slots 200, 500  │
+  │   wallet gets epoch_anchor from node (hash of block at h-6) │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 2 — TX ASSEMBLY                                       │
-  │   tx_body = { inputs, outputs, fee }                        │
+  │   tx_body = { inputs, outputs, fee, epoch_anchor }          │
   │   tx_body_hash = Poseidon2b spine(tx_body)  (59 hashes)     │
+  │   C_claimed = Poseidon2b_sponge(all claimed slot data)      │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 3 — WITNESS GENERATION (local to the wallet)          │
-  │   AIR traces: balance, range, fri_state_open,               │
-  │               tx_body_spine (2-lane pin), tx_validity       │
+  │   AIR traces: balance, range, tx_body_spine (2-lane pin),   │
+  │               tx_logic (no fri_state_open!)                 │
   │   GKR witness: 59 × spine perms + 20 × auth perms          │
-  │   boundary MLEs: spine (2^15 cells) + auth (2^14 padded→2^15)│
+  │   boundary MLEs: spine (2^15) + auth (2^14 padded→2^15)     │
+  │   C_claimed absorbed into Fiat-Shamir channel               │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │ LEVEL 4 — PROVING  (noid_stark::prove_tx)                   │
+  │ LEVEL 4 — PROVING  (noid_stark::prove_logic)                │
   │   SpineGKR Kill-Shot: unified sumcheck + shift over 59 slots│
   │          → (SpineProofKillShot, (r_B, v_B))                 │
   │   AuthGKR Kill-Shot:  unified sumcheck + shift over 20 slots│
   │          → (AuthProofKillShot, (r_B, v_B))                  │
-  │   STARK: AIR constraints → polynomial → FRI; both boundary  │
-  │          MLEs ride as ExtraColumns in multipoint-close;      │
-  │          both KS bytes feed extra_transcript before the      │
-  │          zero-check draw (spine first, auth second)         │
-  │   → per-tx TxProof                                          │
+  │   STARK: TxLogicAir → polynomial → FRI; both boundary       │
+  │          MLEs ride as ExtraColumns in multipoint-close       │
+  │   → per-tx LogicProof (~300-400ms, ~45 KB)                  │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 5 — NETWORK                                           │
-  │   (prev_root, tx_body, new_root, proof) → mempool           │
-  │   node validates; resolves conflicts by tx_body_hash        │
+  │   TxIntent = (tx_body, logic_proof, C_claimed, claimed_slots)│
+  │   NO state roots in broadcast payload                        │
+  │   node validates: verify LogicProof (~3ms), check           │
+  │   epoch_anchor, check nullifier, native slot verify         │
+  │   → admit to mempool                                        │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
-  │ LEVEL 6 — BLOCK ASSEMBLY                                    │
-  │   stateful IVC fold:                                        │
+  │ LEVEL 6 — BLOCK ASSEMBLY (miner, CPU, 1-3s)                 │
   │                                                             │
-  │     (R0→R1), (R1→R2), ..., (Rn-1→Rn)                        │
-  │                  ↓                                          │
-  │               BlockProof                                    │
+  │   BlockStateBinding: miner opens Merkle paths for all       │
+  │   touched slots, proves pre-state + post-state + bridge     │
   │                                                             │
-  │   continuity checks:                                        │
-  │     new_root_i == prev_root_{i+1}                           │
+  │   Aggregation: LogicProofs + BlockStateBinding via           │
+  │   deferred-FRI → single opening → BlockProof                │
   │                                                             │
-  │   PoW: header + nonce                                       │
-  │   broadcast block                                           │
+  │   State: prev_block_state_root → apply all → new_state_root │
+  │   DA: coinbase + tx_bodies → da_root                        │
+  │                                                             │
+  │   PoW: push 248-byte header to GPU/ASIC                     │
+  │   On valid nonce: broadcast block                           │
   └────────────────────────┬────────────────────────────────────┘
                            ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 7 — VERIFICATION                                      │
   │   any node checks:                                          │
-  │     • PoW                                                   │
-  │     • BlockProof (one recursive verify)                     │
-  │     • state_root_next matches the result of the transitions │
+  │     • PoW valid                                             │
+  │     • All LogicProofs verify                                │
+  │     • BlockStateBinding verifies                            │
+  │     • C_claimed bridge matches (per tx)                     │
+  │     • Epoch anchors within window                           │
+  │     • No nullifier conflicts                                │
+  │     • state_root matches, da_root matches                   │
+  │     • BlockProof (IVC decide)                               │
   └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -541,10 +546,11 @@ but also that
 | `noid_binius` | bit / byte columns | packed commitment | 128× DA savings via bit-packing. |
 | `noid_air` | semantic inputs | tables + constraints | Per-`tx` logic encoded as AIRs. |
 | `noid_gkr` | 59 × perm witness (spine) + 20 × perm witness (auth) | `SpineProofKillShot` + `AuthProofKillShot` + `(r_B, v_B)` reductions | Kill-Shot GKR: proves spine + auth outside the STARK trace. |
-| `noid_stark` | AIR traces + GKR reductions | per-`tx` `TxProof` | Engine: STARK seal + `prove_tx` / `verify_tx` orchestrator. |
-| `noid_ivc` | per-`tx` proofs | `BlockProof` | Recursive block accumulator. |
-| `noid_tx` | high-level tx | `tx_body`, `tx_body_hash` | Transaction serialisation. |
-| `noid_chain` | blocks + state | state transitions, DA, wire | Chain layer (state, blocks, DA). Does NOT depend on `noid_stark`. |
+| `noid_stark` | AIR traces + GKR reductions | per-tx `LogicProof` | Engine: STARK seal + `prove_logic` / `verify_logic` orchestrator. |
+| `noid_block` | N LogicProofs + state witness | `BlockProof` | Block assembly: BlockStateBinding + deferred-FRI aggregation. |
+| `noid_ivc` | per-proof columns | folded accumulator | Linear folding accumulator (primitive). |
+| `noid_tx` | high-level tx | `tx_body`, `tx_body_hash`, `C_claimed` | Transaction serialisation + claims commitment. |
+| `noid_chain` | blocks + state | state transitions, DA, wire, nullifier | Chain layer (state, blocks, DA, nullifier set). Does NOT depend on `noid_stark`. |
 
 ---
 
@@ -600,14 +606,114 @@ Seven properties follow directly from the design:
 
 ---
 
-## 8. What is done, what is ahead
+## 8. Node types
 
-**Done (Phase 1 — per-tx proof complete):**
+Two node types exist in the network (same model as Bitcoin):
+
+### 8.1 Light Node (Wallet)
+
+The minimal client. Runs on a phone, IoT device, or browser.
+
+```
+  Stores:  last block header + recursive proof (~55 KB) + own keys + receipts
+  Does:    verifies chain in ~230ms (recursive proof)
+           generates LogicProof (~300-400ms)
+           queries full node for slot indices and epoch_anchor
+  Does NOT: store state, compute Merkle paths, validate blocks from scratch
+```
+
+### 8.2 Full Node (Everything)
+
+The backbone. Stores state, validates, assembles blocks, and mines.
+
+```
+  Stores:  segmented state (256 segments × 2^16 slots × 48B = ~768 MB at log_slots=24)
+           segment root cache (8 KB) + Merkle tree cache (8 KB)
+           all block headers (~180 MB/year)
+           DA payload (prunable after application)
+           nullifier set (rolling ~20 KB)
+           mempool of pending TxIntents
+           Storage backend: RAM (default) or MDBX disk (§12)
+
+  Does:
+    [Wallet]        can generate LogicProofs (built-in wallet, optional)
+    [Validation]    validates incoming LogicProofs (~3ms each)
+                    validates incoming blocks (PoW + BlockProof + state)
+    [State]         maintains full state vector + nullifier set
+                    serves slot hints (free indices, epoch_anchor)
+    [Block Assembly]
+                    collects TxIntents from mempool
+                    resolves slot conflicts
+                    generates BlockStateBinding (Merkle openings)
+                    aggregates LogicProofs + BlockStateBinding -> BlockProof
+                    computes da_root, forms 248-byte block header
+    [Mining]
+                    built-in miner (CPU/GPU, optional)
+                    OR exposes Block Template API for external miners
+                    accepts valid nonce from miner, seals + broadcasts block
+    [P2P]           propagates blocks and TxIntents to peers
+
+  Mining modes:
+    • Solo (built-in):  Full Node mines with local CPU/GPU.
+    • Solo (external):  Full Node exposes Block Template; user connects
+                        separate GPU/ASIC process.
+    • Pool:             Full Node is the pool operator. Pushes headers to
+                        N connected external miners. Distributes reward
+                        offchain. Protocol does not know about pools.
+```
+
+### 8.3 External Miner (3rd-party process, NOT a node)
+
+Not a node type — it is a dumb hash device that connects to a Full
+Node via the Block Template API (analogous to Stratum in Bitcoin).
+
+```
+  Receives: 248-byte block header from Full Node
+  Does:     brute-forces nonce: Blake3(header) < difficulty_target
+  Returns:  valid nonce
+  Cannot:   modify block content, change coinbase, see transactions
+```
+
+Block withholding protection: coinbase is locked inside da_root which
+is locked inside the header which is locked inside BlockProof.
+Changing coinbase requires regenerating BlockProof (1-3s CPU). The
+external miner has no CPU proof capability — it cannot steal blocks.
+
+### 8.4 Block structure
+
+```
+  BlockHeader (328 bytes):
+    prev_block_hash         [32B]
+    state_root              [32B]   -- Poseidon2b Merkle over segment FRI roots
+    tx_root                 [32B]   -- Merkle of tx_body_hashes in block
+    da_root                 [32B]   -- Merkle of DA payload (binds coinbase)
+    timestamp               [8B]
+    height                  [8B]
+    miner_address           [32B]
+    nonce                   [16B]   -- 128-bit PoW nonce (Blake3)
+    difficulty_target       [32B]   -- 256-bit ASERT target
+    proof_transcript_hash   [32B]
+    witness_root            [32B]   -- Binius-packed witness on DA
+    log_slots               [4B]
+    active_slot_count       [8B]
+    alloc_counter           [8B]
+```
+
+`da_root` is the Poseidon2b Merkle root of the Data Availability
+payload (ordered tx_bodies + coinbase_address + coinbase_slot). It
+provides cryptographic protection against block withholding: changing
+the coinbase requires regenerating `da_root` → header → BlockProof.
+
+---
+
+## 9. What is done, what is ahead
+
+**Done (Phase 1 — per-tx proof engine, pre-Stage-S baseline):**
 
 - Poseidon2b native + AIR encoding.
 - AIRs: `balance_gate`, `range_gate`, `haddr`, `hauth`,
-  `fri_state_open`, `tx_body_spine` (carrying only the 2-lane
-  `tx_body_hash` pin), `tx_validity`, plus the composition layer.
+  `fri_state_open` (moves to block scope in Stage S), `tx_body_spine`
+  (2-lane `tx_body_hash` pin), `tx_validity`, plus composition layer.
 - FRI-Binius over GF(2^128) with Poseidon2b Merkle commitments,
   interleaved packing (`noid_fri_binius`), and mixed-length
   multipoint-close for batching columns of different log_len.
@@ -625,106 +731,343 @@ Seven properties follow directly from the design:
   flow SpineGKR KS → AuthGKR KS → STARK with both boundary MLEs
   as `ExtraColumn`s in the mixed multipoint close.
 
-**Ahead (Phase 3 — recursive chain):**
+**Done (Stage G — block folding, deferred-opening):**
 
-- Stage G: `BlockProof` pipeline (deferred-opening accumulator over
-  N per-tx proofs, single FRI opening per block).
+- `noid_block` crate: N per-tx algebraic STARKs on shared block
+  channel + block-level multipoint sumcheck + single FRI opening.
+- State continuity enforcement (root chaining).
+- 852 lib tests + 3 integration tests pass.
+
+**Next (Stage S — Stateless LogicProof + BlockStateBinding):**
+
+- Epoch anchor replaces prev_state_root in tx_body_hash (anti-replay).
+- TxLogicAir: extract pure-logic constraints (no FriStateOpen).
+- LogicProof pipeline (prove_logic / verify_logic).
+- BlockStateBinding: block-level Merkle opening AIR.
+- C_claimed bridge between LogicProof and BlockStateBinding.
+- Nullifier set for anti-double-inclusion.
+- Updated wallet API (slot indices only, no Merkle paths).
+
+**After Stage S:**
+
 - Stage H: Recursive chain-of-proofs with deferred-FRI strategy
   (algebraic verification in-circuit, Merkle binding deferred to tip).
 - Stage K: Kill-Shot for in-circuit Poseidon2b, reduced inner queries,
   parallel recursive prover.
-- Fee market and the final mempool conflict-resolution rules.
 
 See `ROADMAP2.md` Part II for the detailed plan and performance
 targets derived from measured data.
 
 ---
 
-## 9. In one sentence
+## 10. Proof-of-Work subsystem
 
-> Paranoid is a proof-native PoW chain in which every transaction
-> arrives already proven. The network does not execute code — it
-> verifies mathematics. Miners aggregate recursive proofs, PoW sets the
-> canonical ordering, and recursion compresses the entire history of
-> the network into one proof.
+### 10.1 Algorithm
+
+PoW uses Blake3 over the serialised block header. The miner searches
+for a 128-bit nonce such that `Blake3(header) < difficulty_target`
+(interpreted as a 256-bit LE integer).
+
+Blake3 is chosen because PoW in Paranoid does not protect execution
+correctness (proofs do that). PoW only orders blocks and provides Sybil
+resistance. A CPU-friendly hash ensures any laptop can mine on a young
+network.
+
+### 10.2 ASERT difficulty
+
+Difficulty adjusts every 6 blocks (epoch) using ASERT:
+
+```
+  target = anchor_target × 2^((actual - ideal) / halflife)
+
+  BLOCK_TIME = 60s
+  EPOCH      = 6 blocks
+  HALFLIFE   = 360s (one epoch)
+```
+
+If the last epoch ran 2x fast, difficulty doubles. If 2x slow, it
+halves. The exponential is smooth — no oscillation, no DAA gaming.
+
+The anchor updates at every epoch boundary. The calculation is
+stateless: only the anchor block's (height, timestamp, target) plus
+the current block's (height, timestamp) are needed.
+
+### 10.3 Timestamp rules
+
+```
+  block.timestamp > median_time_past(last 11 blocks)
+  block.timestamp ≤ local_time + 120 seconds
+```
+
+Prevents both backward manipulation (median-time-past) and forward
+leaps (drift cap limits how much an attacker can depress difficulty).
+
+### 10.4 Implementation location
+
+```
+  noid_chain/src/difficulty.rs    (ASERT calculation, to be created)
+  noid_chain/src/pow.rs           (Blake3 PoW check, to be created)
+  noid_chain/src/block_header.rs  (header with nonce/target fields)
+```
 
 ---
 
-# Appendix A — AIR and GKR data flow
+## 11. Segmented state commitment
+
+### 11.1 Why segmentation
+
+The original design commits the entire state via a single FRI
+polynomial. This is O(N) per block — impractical at scale. Segmentation
+splits state into 2^16-slot segments, each independently FRI-committed.
+Only dirty segments are recomputed per block.
+
+### 11.2 Structure
+
+```
+  ┌────────────────── State (2^24 slots at genesis) ──────────────────┐
+  │                                                                    │
+  │  Segment 0          Segment 1          ...        Segment 255      │
+  │  [slot 0..65535]    [slot 65536..131071]           [slot ...]      │
+  │       │                  │                             │           │
+  │  FRI commit          FRI commit                    FRI commit      │
+  │       │                  │                             │           │
+  │  seg_root[0]         seg_root[1]        ...       seg_root[255]   │
+  └───────┬──────────────────┬──────────────────────────────┬─────────┘
+          │                  │                              │
+          └──────────────────┼──────────────────────────────┘
+                             │
+                    Poseidon2b Merkle tree (depth 8)
+                             │
+                        state_root
+```
+
+### 11.3 Cost model
+
+| Operation | Monolithic FRI | Segmented FRI |
+|-----------|---------------|---------------|
+| NTT per block | O(2^24) | K × O(2^16) |
+| Merkle update | 0 | K × 8 hashes |
+| In-circuit per slot | 24-round sumcheck | 16-round sumcheck + 8 Poseidon |
+| LogicProof impact | — | ZERO |
+| BlockProof overhead | — | +7-15% |
+
+K = number of dirty segments per block (typically 30-80 for 100 txs).
+
+### 11.4 In-circuit integration
+
+BlockStateBinding proves a slot opening in two steps:
+
+1. **FRI opening** (sumcheck, 16 rounds) — proves slot value against
+   the segment's FRI root. Same mechanism as today, over a smaller
+   polynomial.
+
+2. **Segment Merkle path** (Merkle Kill-Shot GKR) — proves
+   the segment root is a leaf of `state_root`. Uses the same unified
+   sumcheck + shift architecture as SpineGKR/AuthGKR. The Poseidon2b
+   compressions are NOT materialised in the STARK trace — they live
+   entirely in a GKR sub-proof (~8 KB for 50 paths).
+
+Slots in the same segment share the Merkle path (batching optimisation).
+
+### 11.5 Merkle Kill-Shot GKR
+
+```
+  noid_gkr/src/merkle_circuit.rs      32-slot linear chain topology
+  noid_gkr/src/merkle_oracle.rs       Native reference execution
+  noid_gkr/src/merkle_mle.rs          14-var hypercube MLE layout
+  noid_gkr/src/merkle_shift.rs        Shift helpers + schedule tables
+  noid_gkr/src/merkle_killshot.rs     Kill-Shot orchestrator (prove/verify)
+```
+
+The Merkle Kill-Shot proves up to 16 chained Poseidon2b compressions
+(a segment-to-root Merkle path) in a single 14-variable unified
+sumcheck. Architecture:
+
+```
+  1. Unified sumcheck (14 rounds, degree 9)
+     → proves all S-box + MDS constraints across 32 perm slots
+  2. Shift gadget (14 rounds, degree 2)
+     → proves round-to-round state consistency
+  3. Batch-eval (3 × ~14 rounds)
+     → reduces witness claims to (r_B, v_B) openings
+
+  Output pin: state[(last_PermB, N_ROUNDS, lane)] == expected_root
+  Binding: boundary MLE → FRI commitment → STARK multipoint-close
+```
+
+Proof size: ~5.9 KB per individual path. When batched (multiple
+paths in a larger hypercube): ~8 KB total for typical blocks.
+
+---
+
+## 12. State storage backends
+
+### 12.1 Architecture
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │              Chain Layer (noid_chain)            │
+  │                                                 │
+  │  ChainState { segments, seg_roots, tree_cache } │
+  │         │                                       │
+  │         ▼                                       │
+  │  ┌─────────────────────────────────────┐        │
+  │  │        StateBackend (trait)          │        │
+  │  │                                     │        │
+  │  │  get_slot(seg, idx) → SlotValue     │        │
+  │  │  set_slot(seg, idx, val)            │        │
+  │  │  load_segment(seg) → columns        │        │
+  │  │  flush()                            │        │
+  │  └────────────┬────────────────┬───────┘        │
+  │               │                │                │
+  │    ┌──────────┴──┐    ┌───────┴────────┐       │
+  │    │  InMemory   │    │   MdbxBackend  │       │
+  │    │ Vec<Block128>│    │  libmdbx mmap │       │
+  │    │ (default)   │    │ (--storage=disk)│       │
+  │    └─────────────┘    └────────────────┘       │
+  └─────────────────────────────────────────────────┘
+```
+
+### 12.2 RAM backend (default)
+
+All segment columns in `Vec<Block128>`. Maximum performance. Suitable
+when the full state fits in available RAM (up to ~3 GB at log_slots=26).
+
+### 12.3 Disk backend (MDBX)
+
+Uses libmdbx (the same engine as Reth/Erigon). Key-value store where:
+- Key: `(segment_id: u16, column: u8, local_idx: u16)` — 5 bytes
+- Value: `Block128` — 16 bytes
+
+Properties:
+- Memory-mapped reads: slot lookups are pointer dereferences
+- Copy-on-write: crash-safe without WAL
+- OS manages page cache: hot segments stay in memory
+- Scales to terabytes (proven by Ethereum archive nodes)
+
+During block production, dirty segment columns are loaded into a
+temporary buffer for NTT. The buffer is released after computing
+the segment FRI root.
+
+### 12.4 When to use which
+
+```
+  log_slots ≤ 26  (~3 GB):    RAM recommended, disk optional
+  log_slots  = 27  (~6 GB):    Disk recommended
+  log_slots  > 27  (12+ GB):   Disk mandatory
+```
+
+### 12.5 Snapshot format
+
+Both backends can export/import state as a flat binary snapshot:
+- Header: magic, version, log_slots, active_slot_count, alloc_counter
+- Body: all segment columns in order (segment 0 values, segment 0
+  owners_hi, segment 0 owners_lo, segment 1 values, ...)
+- Footer: state_root for integrity check
+
+A node can switch backends by exporting a snapshot and re-importing.
+
+### 12.6 Implementation location
+
+```
+  noid_chain/src/storage/mod.rs        StateBackend trait
+  noid_chain/src/storage/memory.rs     InMemory backend
+  noid_chain/src/storage/mdbx.rs       MDBX backend
+  noid_chain/src/segmented_state.rs    SegmentedFriState (replaces FriState)
+```
+
+---
+
+## 13. In one sentence
+
+> Paranoid is a proof-native PoW chain where wallets prove logic and
+> miners prove state. The network does not execute code — it verifies
+> mathematics. Blake3 PoW with ASERT difficulty sets the canonical
+> ordering, segmented FRI state scales to billions of slots, and
+> recursion compresses the entire history of the network into one proof.
+
+---
+
+# Appendix A — AIR and GKR data flow (Stateless Design)
 
 This appendix expands "LEVEL 3 — WITNESS GENERATION" from §5. It shows
-how the **semantic inputs** of a transaction fan out through the
-sub-AIRs, where the GKR spine sub-proof branches off, where the
-intermediate witnesses arise, and how everything converges on the
-final public inputs (`prev_root`, `new_root`, `tx_body_hash`, and
-balance-OK).
+how the semantic inputs of a transaction fan out through the sub-AIRs
+and GKR sub-proofs. In the stateless design, the wallet proves only
+LOGIC (no Merkle paths); state binding is done at block level by the
+miner.
 
 Arrows represent flows of typed witness values (columns / cells).
-"pin" edges are **boundary equality constraints**: two cells in
-different sub-AIRs must contain the same value.
+"pin" edges are boundary equality constraints.
 
-## A.1 Transaction inputs
+## A.1 LogicProof inputs (wallet-side)
 
 ```
                          ┌──────────────────────────────────┐
-                         │         TX SEMANTIC INPUTS       │
+                         │     LOGICPROOF SEMANTIC INPUTS   │
                          │                                  │
-                         │  prev_root       (public)        │
-                         │  new_root        (public)        │
+                         │  epoch_anchor     (public)       │
+                         │  tx_body_hash     (public)       │
+                         │  C_claimed        (public)       │
                          │  per-input:                      │
-                         │     secret_i                     │
-                         │     slot_index_i                 │
-                         │     value_i, owner_hi/lo_i       │
-                         │     merkle_path_i (prev)         │
+                         │     secret_i      (witness only) │
+                         │     slot_index_i  (claimed)      │
+                         │     value_i       (claimed)      │
+                         │     owner_hi/lo_i (claimed)      │
                          │  per-output:                     │
-                         │     slot_index_j                 │
-                         │     value_j, owner_hi/lo_j       │
-                         │     merkle_path_j (new)          │
+                         │     slot_index_j  (claimed)      │
+                         │     value_j       (claimed)      │
+                         │     owner_hi/lo_j (claimed)      │
                          │  fee                             │
+                         │                                  │
+                         │  NO merkle_paths!                │
+                         │  NO prev_state_root!             │
+                         │  NO new_state_root!              │
                          └──────────────┬───────────────────┘
                                         │
-              ┌─────────────────────────┼─────────────────────────┐
-              ▼                         ▼                         ▼
-        (ownership)              (state opening)             (balance)
+              ┌─────────────────────────┼──────────────────┐
+              ▼                         ▼                   ▼
+        (ownership)              (body binding)        (balance)
 ```
 
-## A.2 Fan-out across sub-AIRs
+## A.2 Fan-out across sub-AIRs (LogicProof)
 
 ```
-  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐
-  │   HADDR      │    │   FRI_STATE_OPEN │    │   BALANCE_GATE   │
-  │              │    │                  │    │                  │
-  │ in:          │    │ in:              │    │ in:              │
-  │  secret_i    │    │  prev_root       │    │  value_i (ins)   │
-  │              │    │  slot_index_i    │    │  value_j (outs) │
-  │ Poseidon2b   │    │  merkle_path_i   │    │  fee             │
-  │ sponge →     │    │                  │    │                  │
-  │  addr_i =    │    │ per-level hash   │    │ Σ ins ==         │
-  │  (oh_i,ol_i) │    │ reconstruction → │    │ Σ outs + fee     │
-  │              │    │  (value, oh, ol) │    │                  │
-  │              │    │  at slot         │    │ + range gate     │
-  │ also checks  │    │                  │    │ (value < 2^64)   │
-  │ addr==owner_i│    │                  │    │                  │
-  └──────┬───────┘    └────────┬─────────┘    └────────┬─────────┘
-         │                     │                       │
-         │ owner_hi/lo         │ (value, oh, ol)       │ balance_ok
-         │ per input           │ per input             │
-         ▼                     ▼                       ▼
+  ┌──────────────┐                          ┌──────────────────┐
+  │   AUTH GKR   │                          │   BALANCE_GATE   │
+  │  Kill-Shot   │                          │                  │
+  │              │                          │ in:              │
+  │ in:          │                          │  value_i (ins)   │
+  │  secret_i    │                          │  value_j (outs) │
+  │  tx_body_hash│                          │  fee             │
+  │              │                          │                  │
+  │ proves:      │                          │ Σ ins ==         │
+  │  addr_i =   │                          │ Σ outs + fee     │
+  │  H(secret_i)│                          │                  │
+  │  auth_tag_i =│                          │ + range gate     │
+  │  H(secret_i,│                          │ (value < 2^64)   │
+  │   tx_body_h)│                          │                  │
+  └──────┬───────┘                          └────────┬─────────┘
+         │                                           │
+         │ Address_i, AuthTag_i                      │ balance_ok
+         ▼                                           ▼
    ┌────────────────────────────────────────────────────────────┐
-   │                    TX_VALIDITY  (composite)                │
+   │                    TX_LOGIC_AIR  (composite)               │
    │                                                            │
    │   per-input row i:                                         │
    │     AuthTag_i, Value_i, OwnerHi_i, OwnerLo_i, SlotIndex_i  │
    │   per-output row k:                                        │
-   │     Value_k, OwnerHi_k, OwnerLo_k                          │
+   │     Value_k, OwnerHi_k, OwnerLo_k, SlotIndex_k             │
    │                                                            │
    │   enforces:                                                │
-   │     T1a  HADDR.addr    == TxValidity.owner  (per input)    │
-   │     T1b  FriOpen.row   == TxValidity.row    (per input)    │
-   │     T2a  HAUTH.tag     == TxValidity.AuthTag               │
-   │     T2b  HAUTH.absorb2 == tx_body_hash                     │
-   │     T3   is_mint ⇒ pre == 0                                │
-   │     T4   balance_gate holds                                │
+   │     T1   AuthGKR.addr  == claimed owner  (per input)       │
+   │     T2   AuthGKR.tag   == expected auth_tag                │
+   │     T3   balance_gate holds                                │
+   │     T4   range_gate holds for all values                   │
+   │     T5   C_claimed absorbed into FS channel                │
+   │                                                            │
+   │   does NOT contain:                                         │
+   │     FRI_STATE_OPEN (moved to BlockStateBinding)            │
+   │     FRI_STATE_COMBINER (moved to BlockStateBinding)        │
    └───────────────────────────┬────────────────────────────────┘
                                │
                                │  needs tx_body_hash
@@ -746,7 +1089,7 @@ different sub-AIRs must contain the same value.
   │    59 Poseidon2b permutations total                        │
   │                                                            │
   │   SpineInputs (the cut's boundary):                        │
-  │     prev_state_root, fee_leaf, 4 input-leaf payloads,      │
+  │     epoch_anchor, fee_leaf, 4 input-leaf payloads,         │
   │     8 output-leaf payloads, is_coinbase_leaf, pad_leaf     │
   │                                                            │
   │   Protocol (Kill-Shot):                                     │
@@ -806,127 +1149,133 @@ different sub-AIRs must contain the same value.
        back to TX_VALIDITY (T1a: addr==owner, T2a: AuthTag)
 ```
 
-## A.4 State commitments and final roots
+## A.4 BlockStateBinding (miner-side, block-level)
 
 ```
-       FRI_STATE_OPEN (prev)                 FRI_STATE_OPEN (new)
-              │                                      │
-              │ opened subtrees                      │ opened subtrees
-              ▼                                      ▼
-       ┌────────────────┐                    ┌────────────────┐
-       │ FRI_STATE_     │                    │ FRI_STATE_     │
-       │ COMBINER_COMP  │                    │ COMBINER_COMP  │
-       │  (prev side)   │                    │  (new side)    │
-       │                │                    │                │
-       │ recombines     │                    │ recombines     │
-       │ opened cells   │                    │ opened cells   │
-       │ into digest →  │                    │ into digest →  │
-       │ prev_root*     │                    │ new_root*      │
-       └───────┬────────┘                    └───────┬────────┘
-               │                                     │
-               │  pin: prev_root* == prev_root       │
-               │                                     │  pin: new_root* == new_root
-               ▼                                     ▼
-         PUBLIC INPUT                          PUBLIC INPUT
-          prev_root                              new_root
+  ┌────────────────────────────────────────────────────────────┐
+  │            BLOCK STATE BINDING AIR (miner generates)        │
+  │                                                            │
+  │   For ALL slots from ALL txs in the block:                 │
+  │                                                            │
+  │   FRI_STATE_OPEN (block scope):                            │
+  │     prev_block_state_root                                  │
+  │     slot_index_k (for each touched slot)                   │
+  │     merkle_path_k (miner has these)                        │
+  │     → gamma-RLC accumulator over all openings              │
+  │                                                            │
+  │   Constraints:                                             │
+  │     • input slots open to claimed (value, owner)           │
+  │     • output slots open to EMPTY (0, 0, 0)                 │
+  │     • post-state: inputs zeroed, outputs filled            │
+  │     • new_block_state_root correctly computed              │
+  │     • C_claimed per tx matches opened values (bridge)      │
+  │                                                            │
+  │   Public outputs:                                          │
+  │     prev_block_state_root                                  │
+  │     new_block_state_root                                   │
+  │     C_claimed[0..N] (one per tx, for bridge verification)  │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-## A.5 End-to-end path of one transaction (collapse view)
+## A.5 End-to-end path of one transaction (collapse view, new design)
 
 ```
-  semantic tx
+  semantic tx (wallet)
       │
-      ├──► HADDR ───────────────► owner pin ──┐
-      │                                        │
-      ├──► FRI_STATE_OPEN(prev) ─► value/owner ┤
-      │                            / slot pins │
-      │                                        ▼
-      ├──► BALANCE_GATE ─────────► TX_VALIDITY ◄── AuthTag ──┐
-      │                                 │                     │
-      ├──► GKR spine sub-proof          │                     │
-      │        │                        │                     │
-      │        │ tx_body_hash (via the  │                     │
-      │        │ PublicColumn pin in    │                     │
-      │        │ the AIR)               │                     │
-      │        │                        │                     │
-      │        └──► HAUTH ──────────────┘─────────────────────┘
+      ├──► SpineGKR Kill-Shot ──► tx_body_hash (PublicColumn pin)
+      │       (59 perms, epoch_anchor at L0)
       │
-      ├──► FRI_STATE_OPEN(new) ─► post-state cells
-      │                                │
-      │                                ▼
-      │                    FRI_STATE_COMBINER(new) ──► new_root pin
+      ├──► AuthGKR Kill-Shot ──► Address_i, AuthTag_i
+      │       (20 perms, secret never in transcript)
       │
-      └──► (all of the above folded into one STARK polynomial,
-            committed via FRI over GF(2^128), Fiat–Shamir'd)
+      ├──► BALANCE_GATE ──┐
+      │                    ├──► TX_LOGIC_AIR
+      ├──► RANGE_GATE ────┘       │
+      │                           │ C_claimed in FS channel
+      │                           ▼
+      └──► STARK over TxLogicAir (FRI-Binius, no state columns)
                                  │
                                  ▼
-                           per-tx PROOF
+                           LogicProof (~45 KB)
+                                 │
+                                 ▼  (broadcast as TxIntent)
+                           mempool admission
+                                 │
+                                 ▼  (miner collects N TxIntents)
+      ┌──────────────────────────┴──────────────────────────┐
+      │  BLOCK ASSEMBLY (miner)                             │
+      │                                                     │
+      │  BlockStateBinding: FRI_STATE_OPEN at block scope   │
+      │  + Bridge check: C_claimed matches opened values    │
+      │  + Aggregation: LogicProofs + BlockStateBinding      │
+      │  + Single FRI opening (deferred-FRI)                │
+      │  + IVC fold → BlockProof                            │
+      │  + PoW seal                                         │
+      └──────────────────────────┬──────────────────────────┘
                                  │
                                  ▼
-                    IVC fold  →  BlockProof  →  PoW  →  CHAIN
+                               CHAIN
 ```
 
 ## A.6 Legend
 
 - **A named rectangle** — a sub-AIR (a table plus its constraints).
 - **`→` arrow** — a flow of witness values (a column or a cell).
-- **`pin: X == Y`** — a boundary equality constraint between two
-  sub-AIRs; the composition `tx_validity_full` closes all such pins.
 - **GKR sub-proof** — a separate sumcheck prover that does not live in
   the STARK trace. Its **only** outgoing surface is the two lanes of
   `tx_body_hash`, row-pinned as a `PublicColumn` in
   `noid_air::airs::tx_body_spine`. Its input boundary (59 ×
   `state_in`) is committed by the STARK as a boundary MLE and
-  discharged by a FRI opening at a single point `(r_B, v_B)`. The
-  flattened bytes of the sub-proof feed the STARK transcript via
-  `extra_transcript`.
-- **public input** — a value the verifier sees directly, without a
-  witness.
+  discharged by a FRI opening at a single point `(r_B, v_B)`.
+- **public input** — a value the verifier sees directly.
+- **C_claimed** — the bridge commitment (Poseidon2b sponge over all
+  claimed slot data) that links LogicProof to BlockStateBinding.
 
 ## A.7 Where things live in the code
 
 ```
-  HADDR                 noid_air::airs::haddr  (in-AIR only for
-                        the PublicColumn pin; actual hash proven
-                        by auth GKR Kill-Shot)
-  HAUTH                 (proven by auth GKR Kill-Shot; no longer
-                        a separate in-AIR sponge)
+  --- WALLET (LogicProof) ---
+
   BALANCE_GATE          noid_air::airs::balance_gate
   RANGE_GATE            noid_air::airs::range_gate
-  FRI_STATE_OPEN        noid_air::airs::fri_state_open
-  FRI_STATE_COMBINER    noid_air::airs::fri_state_combiner[_composite]
   TX-BODY SPINE pin     noid_air::airs::tx_body_spine
-                        (the two PublicColumn lanes of tx_body_hash;
-                         the topology layout lives in
-                         noid_air::airs::tx_body_merkle::layout
-                         and is consumed by the GKR crate)
-  TX_VALIDITY           noid_air::airs::tx_validity
-                        + noid_air::composition::tx_validity_full
-                        + noid_air::composition::
-                          tx_validity_with_spine
-  POSEIDON (SBOX/MDS)   noid_air::airs::poseidon_{sbox,mds,perm}
+                        (two PublicColumn lanes of tx_body_hash;
+                         layout: noid_air::airs::tx_body_merkle::layout)
+  TX_LOGIC_AIR          noid_air::composition::tx_logic (Stage S)
+                        (balance + range + auth pins; NO state columns)
   GKR spine Kill-Shot   noid_gkr::spine_killshot
                         (spine_unified_v2, spine_shift,
                          batch_eval, circuit, layers, mle_layout)
   GKR auth Kill-Shot    noid_gkr::auth_killshot
                         (auth_unified_v2, auth_shift,
                          auth_circuit, auth_oracle)
-  prove_tx / verify_tx  noid_stark::prove_tx  (production
-                        orchestrator: spine KS → auth KS → STARK)
+  prove_logic           noid_stark::prove_tx (will become prove_logic
+                        in Stage S; spine KS → auth KS → STARK)
   STARK engine          noid_stark  (prove_air, spine bridge,
                         auth bridge, multipoint close)
-  FRI                   noid_fri
+
+  --- MINER (BlockStateBinding) ---
+
+  FRI_STATE_OPEN        noid_air::airs::fri_state_open
+                        (moved to block scope in Stage S)
+  FRI_STATE_COMBINER    noid_air::airs::fri_state_combiner[_composite]
+  BLOCK_STATE_AIR       (Stage S.5: block-level state opening AIR)
+  prove_block           noid_block  (Stage G: deferred-FRI aggregation;
+                        Stage S: + BlockStateBinding)
+
+  --- SHARED ---
+
+  FRI                   noid_fri / noid_fri_binius
   Packing / DA          noid_binius
   IVC                   noid_ivc
-  Chain state machine   noid_chain  (blocks, state, DA, wire;
+  Chain state machine   noid_chain  (blocks, state, DA, wire, nullifier;
                         does NOT depend on noid_stark or noid_gkr)
+  POSEIDON (native)     noid_poseidon2b
 ```
 
-The registry of pinned columns through which the composition is held
-together lives in `noid_air::composition::registry`: `HAddrCols`,
-`HAuthCols`, `TxValidityCols`, `FriStateOpenCols`, `TxBodyMerkleCols`
-(the map of the 2-lane `tx_body_hash` pin), and
-`CombinerCompositeCols`.
+The registry of pinned columns lives in `noid_air::composition::registry`.
+In Stage S, `FriStateOpenCols` and `CombinerCompositeCols` move from
+the per-tx composition to the block-level `BlockStateBindingAir`.
 
 ---
 

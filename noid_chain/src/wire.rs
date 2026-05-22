@@ -45,8 +45,23 @@ fn take_u64(src: &mut &[u8]) -> Result<u64, WireError> {
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-/// Wire size of a [`BlockHeader`]: 6 digests + timestamp + nonce.
-pub const BLOCK_HEADER_WIRE_SIZE: usize = 6 * 32 + 8 + 8;
+/// Wire size of a [`BlockHeader`]:
+/// 7 digests (prev_block_hash, state_root, tx_root, difficulty_target,
+///   proof_transcript_hash, witness_root, miner_address=32B)
+/// + timestamp(8) + height(8) + nonce(16)
+/// = 7×32 + 8 + 8 + 16 = 256 bytes.
+pub const BLOCK_HEADER_WIRE_SIZE: usize = 7 * 32 + 8 + 8 + 16;
+
+#[inline]
+fn put_u128(buf: &mut Vec<u8>, v: u128) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn take_u128(src: &mut &[u8]) -> Result<u128, WireError> {
+    let bytes = take(src, 16)?;
+    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
+}
 
 impl BlockHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -54,8 +69,10 @@ impl BlockHeader {
         put_digest(buf, &self.state_root);
         put_digest(buf, &self.tx_root);
         put_u64(buf, self.timestamp);
+        put_u64(buf, self.height);
         put_digest(buf, self.miner_address.as_bytes());
-        put_u64(buf, self.nonce);
+        put_u128(buf, self.nonce);
+        put_digest(buf, &self.difficulty_target);
         put_digest(buf, &self.proof_transcript_hash);
         put_digest(buf, &self.witness_root);
     }
@@ -73,8 +90,10 @@ impl BlockHeader {
         let state_root = take_digest(src)?;
         let tx_root = take_digest(src)?;
         let timestamp = take_u64(src)?;
+        let height = take_u64(src)?;
         let miner_address = Address(take_digest(src)?);
-        let nonce = take_u64(src)?;
+        let nonce = take_u128(src)?;
+        let difficulty_target = take_digest(src)?;
         let proof_transcript_hash = take_digest(src)?;
         let witness_root = take_digest(src)?;
         Ok(Self {
@@ -82,8 +101,10 @@ impl BlockHeader {
             state_root,
             tx_root,
             timestamp,
+            height,
             miner_address,
             nonce,
+            difficulty_target,
             proof_transcript_hash,
             witness_root,
         })
@@ -109,8 +130,10 @@ mod tests {
             state_root: [0x22u8; 32],
             tx_root: [0x33u8; 32],
             timestamp: 1_700_000_000,
+            height: 42,
             miner_address: Address([0x44u8; 32]),
-            nonce: 0xDEAD_BEEFu64,
+            nonce: 0xDEAD_BEEF_CAFE_BABEu128,
+            difficulty_target: [0x77u8; 32],
             proof_transcript_hash: [0x55u8; 32],
             witness_root: [0x66u8; 32],
         }

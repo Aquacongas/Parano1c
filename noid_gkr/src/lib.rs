@@ -21,6 +21,12 @@ pub mod batch_eval;
 pub mod binding;
 pub mod circuit;
 pub mod layers;
+pub mod merkle_circuit;
+pub mod merkle_killshot;
+pub mod merkle_mle;
+pub mod merkle_oracle;
+pub mod merkle_shift;
+pub mod merkle_unified;
 pub mod mle_layout;
 pub mod oracle;
 pub mod perm_sumcheck;
@@ -97,4 +103,20 @@ pub use spine_unified::{
     verify_spine_unified, verify_spine_unified_for_live_slots, SpineKillShotProof, SpineShiftProof,
     SpineShiftReduction, SpineUnifiedProof, SpineUnifiedReduction, N_UNIFIED_WITNESS_CLAIMS,
     SPINE_SHIFT_ROUND_DEGREE, SPINE_UNIFIED_ROUND_DEGREE,
+};
+pub use merkle_circuit::{
+    MerkleCircuit, MerklePathInputs, MerkleSlotDescriptor, MerkleSlotRole, MAX_MERKLE_DEPTH,
+    N_MERKLE_SLOTS, N_PERMS_PER_COMPRESS,
+};
+pub use merkle_killshot::{
+    build_merkle_unified_from_inputs, discharge_merkle_reductions_native, prove_merkle_killshot,
+    verify_merkle_killshot, MerkleKillShotReductions, MerkleProofKillShot,
+};
+pub use merkle_mle::{
+    build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_MAX_LIVE_SLOTS, N_MERKLE_UNIFIED_CELLS,
+    N_MERKLE_UNIFIED_VARS,
+};
+pub use merkle_oracle::{compute_merkle_root, evaluate_merkle, MerkleSlotState, MerkleWitness};
+pub use merkle_unified::{
+    prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
 };

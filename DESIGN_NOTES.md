@@ -1,395 +1,566 @@
-# Paranoid Design Notes
+# Paranoid Design Notes — Stateless Architecture (v2)
 
 This document collects the **non-normative** rationale, philosophy,
-UX outlook, and open questions that back the Paranoid protocol. It is
+UX outlook, and design decisions that back the Paranoid protocol. It is
 not a specification. The authoritative rules live in
 `SPECIFICATION.md`; the implementation overview lives in
 `ARCHITECTURE.md`.
 
-Everything below is descriptive: design intent, trade-offs, future
-deliverables, and commentary. Where a statement describes a
-consensus-significant rule, this document defers to
-`SPECIFICATION.md`.
-
-Contents:
-
-1. The proof-native ledger (philosophy).
-2. What "O(1) history verification" really means.
-3. User-facing UX outlook.
-4. The ideal-form summary.
-5. Architectural verdict.
-6. Open questions for future specification work.
-7. Honest status line.
-8. Implementation status — what is in code today.
+This document was rewritten to reflect the **Stateless LogicProof +
+BlockStateBinding** architecture. The old design (wallet proves Merkle
+paths) is superseded.
 
 ---
 
-## 1. The proof-native ledger
+## 1. Problem Statement (Why the old design burns proofs)
 
-This section is a **conceptual frame**, not a specification. It
-describes the kind of system that falls out of the layers defined in
-`SPECIFICATION.md` §0–§15, and how it differs from a classical UTXO
-chain or an account-based chain. Some of the properties below are
-already realised in the code; others are architectural future
-deliverables. See §8 for the line-by-line status.
-
-### 1.1 Transaction = self-contained state-transition proof
-
-Each transaction is the tuple
+In the original architecture, the wallet STARK includes `FriStateOpenAir` — an in-circuit
+Merkle opening of every touched slot against `prev_state_root`. This creates a fatal
+coupling:
 
 ```
-  (prev_root, tx_body, new_root, proof)
+  New block arrives -> state_root changes -> Merkle paths to YOUR slots change
+  -> YOUR trace changes -> YOUR STARK proof is invalidated -> Re-Prove required
 ```
 
-that proves **everything** about the transition in a single
-cryptographic object:
+Even if nobody touched your slots, the sibling hashes in the Merkle tree change because
+someone else modified a neighboring slot. The wallet must re-prove ~632ms on every new
+block, regardless of whether the transaction is still valid.
 
-- ownership (`tx_validity_hauth` → secret-to-owner);
-- balance (`balance_gate`: Σ inputs = Σ outputs + fee);
-- pre-state correctness (`fri_state_open` on `prev`: inputs exist,
-  mint slots are empty);
-- post-state correctness (`fri_state_open` on `new`: inputs zeroed,
-  outputs materialised);
-- the resulting `new_root`.
-
-A transaction is a **completed cryptographic state-transition
-object**. The network does not execute it — the network verifies it.
-
-### 1.2 Miners do not execute transactions
-
-This is an explicit design principle, not a consequence of
-optimisation. A miner:
-
-- does NOT execute a VM;
-- does NOT recompute state;
-- does NOT simulate transactions.
-
-A miner:
-
-- verifies per-tx proofs;
-- resolves conflicts (§15.2 of `SPECIFICATION.md`);
-- aggregates proofs into the block proof;
-- produces canonical ordering;
-- anchors history via PoW.
-
-```
-  PoW secures ordering, NOT execution.
-```
-
-### 1.3 Block = aggregated proof checkpoint
-
-Raw inclusion of per-tx proofs (≈ hundreds of KB each) does not
-scale. The block producer MUST:
-
-- recursively fold tx proofs through IVC
-  (`noid_ivc::Accumulator`);
-- build **one** block proof.
-
-A block contains:
-
-- the ordered tx list;
-- `tx_body_root`;
-- `witness_root`;
-- the **aggregated recursive proof**;
-- the resulting `state_root`;
-- the PoW header.
-
-The folded block proof attests:
-
-- all tx proofs are valid;
-- the ordering is fixed;
-- the composition of state transitions is correct;
-- the final `state_root` is the result of that composition.
-
-### 1.4 Recursive chain of proofs
-
-The next step is where the design acquires its distinguishing
-property:
-
-```
-  Proof_{n+1}  verifies  Proof_n
-```
-
-`BlockProof_{n+1}` includes, in its verification portion, a check of
-`BlockProof_n`. The chain becomes not a sequence of blocks but a
-recursive chain of proofs.
-
-Consequence: to synchronise, a fresh node needs only to
-
-1. download the latest header,
-2. download the latest recursive proof,
-3. verify **one** proof.
-
-After that the node knows the correctness of every state transition
-from genesis to tip.
-
-### 1.5 Full-chain verification collapses to O(1)
-
-It is not "verify all N historical blocks" but "verify the latest
-recursive accumulator". Historical verification complexity:
-
-```
-  O(chain_length)  →  O(1)
-```
-
-The proof size does not depend on the length of the history. This is
-a fundamental property, not a micro-optimisation.
-
-**Caveat.** "O(1)" is about proof verification, not about state
-storage. To *spend* a UTXO a wallet still needs Merkle witnesses for
-its own slots (a tree kept locally by a wallet indexer) and sync up
-to the tip. The claim here is about **history verification**, not
-about ledger state maintenance.
-
-### 1.6 Consensus and execution are fully decoupled
-
-| Layer     | Where it runs               | What it does                       |
-|-----------|-----------------------------|------------------------------------|
-| Execution | Prover-side, off-chain      | Building proofs                    |
-| Consensus | On-chain (PoW + ordering)   | Ordering, anti-conflict, finality  |
-
-There is no VM in the consensus layer. There is no Sybil resistance
-in the execution layer. A clean separation.
-
-### 1.7 Proof-native ledger
-
-The ledger stores not **executable intents** (as an EVM or Bitcoin
-Script chain does) but **cryptographically proven state
-transitions**. This is a different class of system: the validity of
-every ledger element is established before inclusion.
-
-### 1.8 Thin PoW blockchain
-
-Because execution is externalised:
-
-- blocks are not bounded by VM execution time;
-- verification is tiny (one recursive proof);
-- state replay is not required for verification.
-
-The PoW layer becomes thin, deterministic, and almost purely a
-data-ordering system.
-
-### 1.9 Canonical global state = cryptographic accumulation
-
-The network does not "trust miners". The network verifies a recursive
-validity object accumulated over the entire history. Trust moves out
-of execution and into cryptographic recursion.
-
-### 1.10 Stateless (or near-stateless) sync
-
-Because the latest proof attests the entire chain:
-
-- archival replay is not required for verification;
-- historical execution is not required;
-- bootstrap is radically simplified: header + latest proof.
-
-A full node that wants to **actively participate** (wallet, mining)
-still needs state, but a **light client** can verify everything with
-a single proof.
-
-### 1.11 PoW retains its role
-
-PoW is not decorative. It:
-
-- secures ordering (which chain is canonical on a fork);
-- makes reorgs economically costly;
-- provides Sybil resistance;
-- defines canonical history.
-
-What has been removed from PoW is the **execution trace**. What is
-retained is its intrinsic role: ordering + finality + anti-Sybil.
-
-### 1.12 Fixed-slot state makes recursion tractable
-
-Slot architecture (§0, §15.1 of `SPECIFICATION.md`) is not an
-arbitrary choice. It yields:
-
-- deterministic addressing (`slot_index` is an explicit field of each
-  tx);
-- an explicit "touched set" (inputs/outputs per tx are known up front);
-- simple conflict detection (intersection of sets);
-- algebraically clean transitions (an update is a pointwise write,
-  not a walk over a Patricia trie).
-
-This is radically friendlier to recursive accumulation than arbitrary
-VM execution: every shift / fold operates on a fixed algebraic
-structure rather than on opcode semantics.
-
-### 1.12.1 Node topology and state pruning (Data lifecycle)
-
-The proof-native architecture fundamentally changes the data retention requirements for network participants. History is not needed to validate the present.
-
-*   **Full Nodes (State-tracking):** Maintain the current state vector (`2^log_slots` cells) and validate new blocks. When a new block is applied, the node uses the DA payload (witness_root) to update its local state. Once the block is finalized and the state is updated, **the DA payload and the raw transaction data for that block can be safely discarded (pruned).** A Full Node does not need to store historical transaction data to validate future blocks or serve wallet queries for current balances. Its storage footprint is bounded by the state size, not the chain length.
-*   **Archive Nodes (History-tracking):** Opt-in nodes that choose to store the DA payload (witness data) for all historical blocks. These nodes are not required for network consensus or for wallets to spend funds. They exist solely to serve historical queries (e.g., block explorers, auditors, or indexers looking at past states). If all Archive nodes go offline, the network continues to process transactions and wallets remain fully functional.
-*   **Light Clients:** Download only block headers and the recursive `BlockProof`. They verify the entire chain history in O(1) time without downloading any DA data or state. They rely on Full Nodes for Merkle paths to construct new transactions.
-
-**Rationale:** In traditional blockchains, a node must execute historical transactions to verify the current `state_root`. In Paranoid, the cryptographic proof replaces execution. Therefore, retaining historical data is a convenience for data availability, not a consensus requirement. DA (Stage F) is the pipe that delivers state diffs, not the ledger itself.
-
-
-### 1.13 Mempool = proof market
-
-The mempool stores **candidate proven transitions**, not intents to
-execute. A miner does not pick "which transactions to profitably
-execute"; a miner picks "which already-proven transitions to include
-in a batch". The semantics differ in kind, and a fee market built on
-top of this operates on a different primitive — proof producers pay
-for inclusion of ready transitions.
-
-### 1.14 Miners = proof aggregators
-
-The miner's role is:
-
-```
-  sequencer + aggregator + recursive prover + PoW finalizer
-```
-
-— not an execution worker. Fees pay for (a) inclusion,
-(b) aggregation work, (c) PoW security — not for compute.
+This makes mobile UX impossible and wastes battery/compute on work that is objectively
+unnecessary.
 
 ---
 
-## 2. End-user UX outlook
+## 2. Key Insight: Separate Logic from State
 
-From the user's vantage point the system collapses to a single
-action:
+The wallet should prove only what it OWNS: balance, ownership, range, body commitment.
+The state binding (proving slots exist in the Merkle tree) should be done by whoever
+has fresh state — the Full Node (during block assembly).
 
 ```
-  Send 10 to Bob
+  Wallet proves:    "Given these slot values, my math is correct."
+  Full Node proves: "These slot values actually exist in the current state tree."
 ```
-
-Everything else is hidden:
-
-- proof generation;
-- slot allocation;
-- retry on conflict (rebuild proof with a fresh slot hint);
-- state update.
-
-The wallet handles proof building, hinting, and rebroadcast. The
-protocol never demands human intervention for algorithmic
-bookkeeping.
 
 ---
 
-## 3. The ideal-form summary
+## 3. Architecture: LogicProof + BlockStateBinding
 
-In a single formula:
+### 3.1 LogicProof (Wallet-side, ~300-400ms)
+
+The wallet generates a STARK that proves:
+
+1. **Balance:** sum(inputs.value) == sum(outputs.value) + fee
+2. **Range:** all values < 2^64
+3. **Ownership (AuthGKR):** HAddr(spend_secret) == claimed_owner for each input
+4. **Body commitment (SpineGKR):** 59-perm Merkle spine computes tx_body_hash correctly
+5. **Claims commitment:** C_claimed = Poseidon2b(all_claimed_slot_data), absorbed into FS channel
+
+The LogicProof does NOT contain:
+- Merkle paths to prev_state_root
+- FriStateOpenAir constraints
+- Any dependency on the global state tree structure
+
+**Public inputs of LogicProof:**
+- `epoch_anchor` (replaces prev_state_root, see section 4)
+- `tx_body_hash`
+- `fee`
+- `claimed_slots`: [(slot_index, value, owner_hi, owner_lo)] for all inputs/outputs
+- `C_claimed`: commitment to claimed slot data (bridge to BlockStateBinding)
+- `n_live_inputs`, `n_live_outputs`
+- `is_coinbase`
+
+### 3.2 BlockStateBinding (Full Node block assembly, part of BlockProof)
+
+The Full Node generates a STARK (or extends the block AIR) that proves:
+
+1. For every input slot claimed by any tx in the block:
+   - The slot opens to the claimed (value, owner) in `prev_block_state_root`
+2. For every output slot claimed by any tx in the block:
+   - The slot opens to EMPTY (0,0,0) in `prev_block_state_root`
+3. Post-state:
+   - Input slots are zeroed, output slots are written
+   - `new_block_state_root` is correctly computed
+4. Bridge:
+   - `C_claimed` from each LogicProof matches the opened values
+
+The Full Node uses the existing `FriStateOpenAir` + gamma-RLC accumulator pattern,
+but at BLOCK scope (all slots from all txs batched together) rather than per-tx.
+
+### 3.3 Bridge Commitment (C_claimed)
+
+The bridge between LogicProof and BlockStateBinding is a single Poseidon2b digest:
 
 ```
-  inputs consume occupied slots
-  outputs occupy empty slots
-  spent slots become zero
-  proof guarantees correctness
+C_claimed = Poseidon2b_sponge(
+    for each input:  slot_index || value || owner_hi || owner_lo
+    for each output: slot_index || value_claimed || owner_hi_claimed || owner_lo_claimed
+)
 ```
 
-This is the entire ledger semantics. Everything else — Poseidon2b
-hashing, GKR, FRI, STARK, IVC — is the machinery that makes the
-single word "proof" meaningful.
+- LogicProof absorbs C_claimed into its Fiat-Shamir channel (any change forks challenges)
+- BlockStateBinding also absorbs C_claimed and constrains opened values to match
+- Verifier checks: C_claimed(LogicProof) == C_claimed(BlockStateBinding)
+
+This is a 32-byte bridge. Simple, sound, cheap.
 
 ---
 
-## 4. Architectural verdict
+## 4. Epoch Anchor (Replaces prev_state_root in tx_body_hash)
 
-The model is a tight composition of four well-known ingredients:
+### 4.1 Problem
+
+If `prev_state_root` is leaf L0 in the spine Merkle tree (as currently implemented),
+then `tx_body_hash` depends on the state root. This makes LogicProof non-stateless.
+
+### 4.2 Solution
+
+Replace `prev_state_root` with `epoch_anchor`:
 
 ```
-  Bitcoin-style UTXO
-  + fixed indexed state
-  + zk validity engine
-  + transparent balances
+epoch_anchor = block_header_hash(height - ANCHOR_DEPTH)
 ```
 
-Each ingredient is chosen for a specific reason:
+where `ANCHOR_DEPTH = 6` (6 blocks at 60s = 6 minutes).
 
-- **UTXO over accounts.** Input/output is an explicit set of slot
-  indices; conflicts are set intersections; the transition function
-  is pointwise.
-- **Fixed indexed state.** Addressing by slot index eliminates a
-  hash-map UTXO set and makes state proofs constant-depth Merkle
-  paths.
-- **zk validity engine.** Execution moves off-chain; the network
-  verifies proofs rather than replaying them.
-- **Transparent balances.** No hidden state — observers can read
-  balances and owners directly. Privacy is not the goal; succinct
-  verifiability is.
+### 4.3 Properties
 
----
+- **Anti-replay:** Different forks have different block headers at height-6, so different
+  epoch_anchors, so different tx_body_hashes. A LogicProof valid on fork A is invalid on fork B.
+- **Stability:** epoch_anchor does not change when new blocks arrive (it refers to a block
+  that is already 6-deep). LogicProof remains valid across new blocks.
+- **Expiry:** Consensus rejects transactions with epoch_anchor older than ANCHOR_DEPTH blocks.
+  This provides a natural TTL (~6 minutes) without explicit timestamps.
+- **Simplicity:** Wallet knows epoch_anchor from the last header it synced. No Merkle paths needed.
 
-## 5. Open questions (for future specification work)
+### 4.4 Leaf L0 change
 
-Two large questions remain outside the current specification:
+```
+Before: SpineInputs.prev_state_root = state_root of prev block
+After:  SpineInputs.epoch_anchor    = hash(block_header[current_height - ANCHOR_DEPTH])
+```
 
-1. **Fee market.** How fee bids are expressed, how the miner
-   prioritises inclusion, and how fee dynamics respond to
-   mempool pressure. This is a consensus-adjacent question and will
-   become normative in a future revision of `SPECIFICATION.md`.
-
-2. **Mempool conflict resolution at scale.** The tie-break rule of
-   §15.2 resolves mint collisions inside a single block. The
-   cross-node mempool policy — how nodes propagate, deduplicate, and
-   prioritise competing proven transitions — is still a local-policy
-   matter. A future revision should tighten this into a protocol
-   rule so that different clients do not interpret conflicts
-   differently.
-
-Both items are tracked in `ROADMAP2.md`.
+The spine Merkle tree layout becomes:
+- L0: epoch_anchor [2 lanes]
+- L1: fee_leaf [2 lanes]
+- L2-L5: input_leaves [4 x 4 lanes]
+- L6-L13: output_leaves [8 x 4 lanes]
+- L14: is_coinbase_leaf [2 lanes]
+- L15: pad_leaf [2 lanes]
 
 ---
 
-## 6. Honest status line
+## 5. Nullifier Set (Anti-Double-Inclusion)
 
-Phase 1 is complete: a single transaction proof end-to-end, measured
-at ~725 ms prove, ~145 ms verify, ~55 KB proof (2in/4out). The
-per-tx proof stack (STARK + FRI-Binius + dual Kill-Shot GKR) is
-production-ready and benchmarked. If the remaining stages (block-level
-deferred-opening accumulator, recursive chain with deferred-FRI, fee
-market, mempool rules) are carried through, the resulting system is a
-plausible **more-proof-efficient backend** for the classical Bitcoin
-UTXO model. The interesting half is not the ledger shape — which is
-deliberately conservative — but the proof stack underneath it.
+Even with epoch_anchor, the same LogicProof could be included twice within the
+ANCHOR_DEPTH window. Solution: nullifier = tx_body_hash.
+
+- Full nodes maintain a rolling nullifier set covering the last ANCHOR_DEPTH blocks.
+- A transaction is rejected if its tx_body_hash already appears in the nullifier set.
+- Storage cost: 32 bytes * max_txs_per_block * ANCHOR_DEPTH = trivial (~20 KB).
+- After ANCHOR_DEPTH blocks, the epoch_anchor has expired anyway; no need to keep older nullifiers.
 
 ---
 
-## 7. Implementation status
+## 6. Coinbase Transaction
 
-This is a snapshot of what is realised in the codebase as of the
-current revision. For the authoritative per-stage breakdown see
-`ROADMAP2.md`.
+Coinbase is special: it has no inputs, no spend_secret, no LogicProof from a wallet.
 
-| Design principle (§1)                         | Status                                                    |
-|-----------------------------------------------|-----------------------------------------------------------|
-| 1.1 Transaction as state-transition proof     | Implemented (`noid_air`, `noid_stark`, `noid_tx`).        |
-| 1.2 Miners do not execute                     | Implemented (the engine has no VM by construction).       |
-| 1.3 Block = aggregated proof checkpoint       | IVC primitive ready (`noid_ivc::Accumulator`: `fold_step_prove` + `decide`); BlockProof pipeline pending (Stage G: deferred-opening accumulator). |
-| 1.4 Recursive chain of proofs                 | Future deliverable (Stage H: deferred-FRI recursion).     |
-| 1.5 O(1) historical verification              | Follows from 1.4 once delivered.                          |
-| 1.6 Consensus / execution decoupled           | Implemented by architecture.                              |
-| 1.7 Proof-native ledger                       | Implemented (slot-based state in `noid_chain`).           |
-| 1.8 Thin PoW blockchain                       | Follows from 1.3 + 1.4.                                   |
-| 1.9 Canonical state = cryptographic accumulation | Follows from 1.4.                                       |
-| 1.10 Stateless / near-stateless sync          | Follows from 1.4.                                         |
-| 1.11 PoW retains ordering/Sybil role          | By design; PoW wiring is out-of-scope for the proof stack.|
-| 1.12 Fixed-slot state                         | Implemented (§0 of `SPECIFICATION.md`).                   |
-| 1.13 Mempool as proof market                  | Future deliverable (§5 above).                            |
-| 1.14 Miners as proof aggregators              | Follows from 1.3 + fee market.                            |
-
-Items 1.1–1.2, 1.6–1.7, 1.12 are already reflected by the engine
-architecture (`noid_air`, `noid_stark`, `noid_tx`, `noid_chain` with
-slot-based state). Item 1.3 has its IVC primitive in place; the
-remaining integration into a `BlockProof` is Stage G (deferred-opening
-accumulator). Items 1.4, 1.5, 1.8–1.11 are Stage H (deferred-FRI
-recursion) + Stage K (optimizations). Items 1.13, 1.14 are
-consensus-layer work (fee market, mempool policy). This is a roadmap,
-not vapourware: every consequence is anchored in a concrete stage with
-performance targets derived from measured Phase 1 data.
+- The miner constructs coinbase directly.
+- Coinbase is proven entirely within BlockStateBinding (no external LogicProof needed).
+- Consensus rule: exactly 1 coinbase per block, must be first, fee=0, n_inputs=0.
+- The coinbase slot must be empty in prev_state (proven by BlockStateBinding).
+- Value = block_reward (protocol schedule, consensus-enforced).
 
 ---
 
-## 8. Cross-references
+## 7. Transaction Lifecycle (New Design)
 
-- `SPECIFICATION.md` — normative rules. Read this first if you care
-  about what a conforming node MUST do.
-- `ARCHITECTURE.md` — implementation overview, crate map, proof
-  layering, data flow.
-- `noid_gkr/SPEC.md`, `noid_gkr/AUDIT.md` — GKR sub-protocol spec and
-  audit notes.
-- `ROADMAP2.md` — stage-by-stage delivery tracker.
+```
+1. Wallet queries Full Node: "Give me 2 empty slot indices"
+   Node responds: [14352, 16100]  (just indices, no Merkle paths)
+
+2. Wallet builds TxBody:
+   - inputs: [(slot=100, value=80, owner=Alice)]
+   - outputs: [(slot=14352, value=50, owner=Bob), (slot=16100, value=30, owner=Alice)]
+   - fee: 0
+   - epoch_anchor: hash(block_header[height-6])
+
+3. Wallet computes tx_body_hash via SpineGKR (59 perms)
+4. Wallet computes C_claimed = Poseidon2b(slot_data...)
+5. Wallet generates LogicProof (~300-400ms):
+   - Balance OK, Range OK, Auth OK, Spine OK, C_claimed absorbed
+
+6. Wallet sends TxIntent = {tx_body, logic_proof, C_claimed, claimed_slots} to P2P
+
+7. Full Node receives TxIntent:
+   - Verify LogicProof (~3ms STARK verify)
+   - Check epoch_anchor is in valid window
+   - Check claimed slots match native state (slot 100 = (80, Alice)? yes)
+   - Check nullifier set (tx_body_hash not seen? yes)
+   - Admit to mempool
+
+8. Full Node assembles block:
+   - Take N TxIntents from mempool (no slot conflicts)
+   - Native collision check on slot indices
+   - Compute state transition (zero inputs, fill outputs)
+   - Generate BlockStateBinding (Merkle openings for all touched slots)
+   - Aggregate into BlockProof (deferred-FRI, Stage G pattern)
+   - Compute new_state_root, da_root
+   - Form header, push to miner (built-in or external)
+
+9. PoW found (miner returns valid nonce):
+   - Full Node seals block, publishes: header + BlockProof + DA Payload
+
+10. Verifiers:
+    - Check PoW
+    - Verify BlockProof (includes all LogicProofs + BlockStateBinding)
+    - Apply state diff
+```
+
+---
+
+## 8. Node Topology
+
+Two node types (same model as Bitcoin):
+
+### Light Node (Wallet)
+- **Stores:** Last block header + recursive proof (~55 KB) + own keys + own receipts
+- **Does:** Verifies chain in ~230ms (recursive proof). Generates LogicProof (~300-400ms).
+  Queries Full Node for slot hints and epoch_anchor.
+- **Does NOT:** Store state. Compute Merkle paths. Re-prove on new blocks.
+
+### Full Node (Everything)
+- **Stores:** Flat state vector (~6 GB) + all block headers (130 MB/year) + DA payload
+  (prunable after application) + mempool + nullifier set (~20 KB rolling)
+- **Does:**
+  - Wallet functions (optional built-in wallet, generates LogicProofs)
+  - Validation: validates LogicProofs (~3ms), validates blocks (PoW + BlockProof)
+  - State: maintains full state, serves slot hints, epoch_anchor
+  - Block assembly: collects TxIntents, resolves conflicts, generates BlockStateBinding,
+    aggregates into BlockProof, forms header
+  - Mining: built-in miner OR exposes Block Template API for external miners
+  - P2P: propagates blocks and TxIntents
+- **Does NOT:** Store transaction history after applying blocks (prunes DA).
+
+External miners (GPU/ASIC) are NOT nodes. They connect to a Full Node via the Block
+Template API, receive only the 248-byte header, brute-force nonce, and return it.
+They cannot see or modify transactions. Protocol does not distinguish solo mining
+from pool mining — pools are offchain market infrastructure.
+
+---
+
+## 9. Mining Pipeline
+
+### Separation of Concerns
+
+```
+  Full Node (CPU, block assembly):          External Miner (GPU/ASIC, PoW only):
+  - Collect TxIntents from mempool          - Receive 248-byte header via
+  - Validate LogicProofs                      Block Template API
+  - Generate BlockProof (1-3 sec)           - Brute-force nonce (Blake3)
+  - Form header                             - Return valid nonce
+  - Push header to miner (built-in          - Cannot modify block content
+    or external)                            - Cannot steal block (coinbase is
+  - On valid nonce: publish block             locked in proof)
+```
+
+### Block Template Pipeline (Empty Block Fallback)
+
+When a new block is found:
+1. T=0: Immediately generate empty-block template (coinbase only, trivial proof, ~ms)
+2. T=0..3s: Push empty template to ASIC. ASIC mines empty block (no fees, but no downtime).
+3. T=3s: Full template ready (with transactions). Push new header to ASIC.
+4. T=3s..60s: ASIC mines full block. CPU idle.
+5. If ASIC finds nonce at any point: publish and restart cycle.
+
+### Block Withholding Protection (vs Bitcoin)
+
+In Bitcoin, a pool miner can steal a found block by publishing it themselves with
+a different coinbase. In Paranoid this is IMPOSSIBLE:
+
+- Coinbase address is embedded in DA Payload -> da_root -> header -> BlockProof
+- Changing coinbase requires regenerating BlockProof (1-3 sec CPU work)
+- The ASIC miner has no CPU resources for proof generation
+- Therefore: ASIC cannot modify the block. Can only find nonce and return it.
+
+This solves the block withholding attack cryptographically.
+
+---
+
+## 10. Checks (Receipt Verification After 10 Years)
+
+A "check" (payment receipt) = {version, tx_body, logic_proof, inclusion_receipt}
+
+- `inclusion_receipt` = Merkle path from tx_body_hash to tx_root in block header
+- Verification:
+  1. Verify logic_proof (STARK). Math is eternal.
+  2. Verify inclusion: path from tx_body_hash -> tx_root == header.tx_root
+  3. Verify header is in canonical chain (request from any full node, 248 bytes)
+- Works forever as long as the verifier knows the AIR version.
+- Version field enables forward-compatible verification after hard forks.
+
+---
+
+## 11. What Changes from Current Implementation
+
+| Component | Before | After |
+|-----------|--------|-------|
+| `noid_tx::body_hash` | L0 = prev_state_root | L0 = epoch_anchor |
+| `noid_air::airs::fri_state_open` | In per-tx AIR | Moved to block-level AIR |
+| `noid_air::composition::tx_validity_*` | Includes FriStateOpen | LogicAir only (balance, range, auth, spine) |
+| `noid_stark::prove_tx` | Full proof with state | LogicProof only (no state binding) |
+| `noid_block` | Aggregates full TxProofs | Aggregates LogicProofs + BlockStateBinding |
+| `PublicInputs` | prev_state_root, new_state_root | epoch_anchor, C_claimed, claimed_slots |
+| `SpineInputs.prev_state_root` | state root [2 lanes] | epoch_anchor [2 lanes] |
+| Wallet API | Request slot + Merkle path | Request slot index only |
+| Re-prove frequency | Every block (~100%) | Only on slot conflict (~0.01%) |
+
+---
+
+## 12. Security Summary
+
+| Attack | Defense |
+|--------|---------|
+| Lie about slot values | C_claimed bridge: LogicProof claims must match BlockStateBinding openings |
+| Replay on fork | epoch_anchor differs per fork |
+| Double-inclusion | Nullifier set (rolling window of tx_body_hashes) |
+| Double-spend | BlockStateBinding: second spend sees zeroed slot |
+| Double-mint | Consensus rule: unique output slot indices per block |
+| Fake state | BlockStateBinding proves against prev_block_state_root (fixed in prior header) |
+| Block theft | Coinbase locked in BlockProof via da_root -> header binding |
+| DoS (spam LogicProofs) | Verify costs ~3ms; rate-limit at P2P layer |
+| Grinding epoch_anchor | epoch_anchor is 6 blocks deep, determined by history, not current block |
+
+---
+
+## 13. Allocator Simplification
+
+With the new design, the allocator interaction becomes:
+
+**Old flow:**
+1. Wallet requests slot + Merkle path from node
+2. Node returns index + path (hundreds of hashes)
+3. Wallet builds FriStateOpen witness with the path
+4. Any state change invalidates the path -> re-prove
+
+**New flow:**
+1. Wallet requests empty slot index from node
+2. Node returns index (4 bytes)
+3. Wallet uses index in TxBody, proves only logic
+4. Full Node verifies slot is empty when building block
+
+The allocator logic (splitmix64, free_slots heap) remains consensus-significant
+for deterministic state evolution, but the wallet no longer needs to know anything
+about Merkle tree structure.
+
+---
+
+## 14. Performance Estimates (New Design)
+
+### Wallet (LogicProof generation)
+- No Merkle path hashing (saves ~200ms from old design)
+- SpineGKR: ~45ms (unchanged)
+- AuthGKR: ~55ms (unchanged)
+- STARK over reduced AIR (no FriStateOpen columns): ~200-300ms
+- **Total: ~300-400ms** (down from 632ms)
+
+### Full Node — Block Assembly (BlockProof generation, N=100 txs, 8 cores)
+- BlockStateBinding AIR (1200 slots, gamma-RLC): ~200-400ms
+- Batch-FRI aggregation of N LogicProofs: ~300-500ms
+- Single FRI opening: ~300ms
+- **Total: ~1-2s** on 8 cores
+
+### Full Node (verification)
+- Per-tx LogicProof verify: ~3ms (mempool admission)
+- Block verify: ~600ms (same as current Stage G)
+
+---
+
+## 15. Philosophical Identity
+
+Paranoid is:
+
+```
+  a recursively accumulated proof-native PoW ledger
+  where:
+
+    execution is local (wallet proves logic)
+    state binding is server-side (full node proves Merkle)
+    validity is global (BlockProof certifies everything)
+    ordering is PoW
+    history is recursive (O(1) verification)
+```
+
+The wallet proves mathematics. The full node proves reality. PoW orders time.
+Recursion compresses history. No VM. No replay. No re-execution.
+
+---
+
+## 16. PoW Design Rationale (Blake3 + ASERT)
+
+### Why Blake3 (not memory-hard, not Poseidon)
+
+PoW in Paranoid does NOT protect execution — proofs handle that. PoW only provides:
+- Canonical ordering of state transitions
+- Sybil resistance for block proposal
+- Objective cost to reorg (chain selection = most cumulative work)
+
+Since PoW is purely an ordering mechanism:
+- 51% hashpower = you choose tx ordering, but CANNOT fake state transitions
+- ASIC dominance is less dangerous than in Bitcoin (no double-spend vector from hashpower alone)
+- CPU-friendliness matters more for initial adoption than ASIC resistance
+
+Blake3 gives:
+- Any laptop mines at ~1 GH/s — the network bootstraps instantly
+- Block verification adds zero overhead (nanosecond hash check)
+- Simple implementation, no tuning parameters
+- If ASIC dominance later becomes problematic, the hash is a soft dependency — swap via hard fork without touching the proof system
+
+### Why ASERT (not Bitcoin's DAA, not per-block)
+
+Bitcoin's 2016-block retarget (~2 weeks) is too slow for a young network. If hashrate
+doubles on day 2, blocks come every 30s for two weeks. If hashrate halves, blocks stop
+for hours. This kills UX.
+
+ASERT with 6-block epoch (360s halflife):
+- Adapts within ~6 minutes to any hashrate change
+- Exponential (smooth, no oscillation)
+- Stateless calculation (only needs anchor block + current height/time)
+- Proven in production (Bitcoin Cash adopted ASERT in 2020, aserti3-2d)
+
+6-block epoch was chosen to match `ANCHOR_DEPTH = 6` — same window as epoch_anchor
+for transaction anti-replay. This aligns the two concepts: both difficulty and
+transaction validity operate on the same temporal granularity.
+
+### 128-bit nonce
+
+64-bit nonce limits search space to 2^64 hashes. At 10 TH/s network hashrate,
+that's exhausted in ~30 minutes — dangerous for high difficulties. 128-bit nonce
+provides effectively unlimited search space for any foreseeable hashrate.
+
+---
+
+## 17. Segmented State — Design Rationale
+
+### The scaling wall
+
+The original `FriState` holds the entire state as three `Vec<Block128>` columns and
+computes `state_root` by running NTT + Merkle over ALL elements:
+
+```
+  log_slots=24:  NTT over 16M elements — ~2 seconds per block
+  log_slots=28:  NTT over 256M elements — ~30 seconds (unacceptable)
+  log_slots=32:  NTT over 4B elements — impossible (192 GB RAM, hours of CPU)
+```
+
+FRI commitments are fundamentally non-incremental: changing one coefficient of the
+polynomial changes EVERY evaluation in the codeword. There is no "patch one leaf"
+operation on an FRI commitment.
+
+### Why not Poseidon Merkle tree over individual slots?
+
+This was the original design (before FRI-state). The problem is **in-circuit cost**:
+
+```
+  Poseidon Merkle opening at depth 24 = 24 Poseidon2b permutations per slot
+  With 200 slots per block: 200 × 24 = 4800 permutations in BlockStateBinding
+```
+
+For comparison, the entire SpineGKR is 59 permutations. BlockStateBinding would
+dominate the proof by 80x. Unacceptable.
+
+### Why not Verkle / IPA?
+
+IPA (Inner Product Arguments) uses elliptic curve groups. Verifying IPA openings
+in a binary-field STARK requires simulating EC arithmetic in GF(2^128) — hundreds
+of thousands of constraints per scalar multiplication. Worse than Poseidon Merkle.
+
+### The solution: Segmented FRI
+
+Split the monolithic polynomial into fixed-size segments:
+
+```
+  LOG_SEGMENT_SIZE = 16 (65536 slots)
+  num_segments = 2^(log_slots - 16)
+```
+
+Each segment is independently FRI-committed (same mechanism as today, just smaller).
+The global `state_root` is a Poseidon2b Merkle tree over segment roots (depth 8-16).
+
+In-circuit proof of a slot:
+1. FRI opening within the segment: 16-round sumcheck (CHEAPER than current 24-round)
+2. Merkle path from segment root to state_root: 8 Poseidon2b perms (MUCH cheaper than 24)
+
+```
+  Total in-circuit: 16 sumcheck rounds + 8 Poseidon perms per unique segment
+  vs old Poseidon-only: 24 Poseidon perms per slot (no batching possible)
+```
+
+The key insight: sumcheck rounds in binary fields are near-free (XOR operations),
+while Poseidon perms are expensive. We trade 8 expensive Poseidon-only rounds
+for 16 cheap sumcheck rounds + 8 Poseidon rounds. Net savings.
+
+And with batching (multiple slots in same segment share path): even cheaper.
+
+### Why LOG_SEGMENT_SIZE = 16?
+
+- 2^16 = 65536 slots per segment = ~3 MB per segment (3 columns × 64K × 16B)
+- NTT over 2^16 takes ~0.5ms — instantaneous per segment
+- At log_slots=24: 256 segments fits in 768 MB total (RAM-friendly)
+- At log_slots=32: 65536 segments, but only dirty ones loaded per block
+- In-circuit: 16-round sumcheck is a good sweet spot (not too deep, not too shallow)
+- Segment depth (8 at genesis → 16 at max): Poseidon overhead stays bounded
+
+Making segments smaller (e.g., 2^12) would reduce NTT cost per segment but increase
+the Merkle tree depth (12 → 20 Poseidon perms in-circuit). Making them larger
+(e.g., 2^20) would make per-segment NTT expensive again. 2^16 is the Goldilocks zone.
+
+### Storage backend motivation
+
+At log_slots=24, the full state is ~768 MB — fits in RAM. But:
+- At log_slots=28: 12 GB (doesn't fit on most machines)
+- At log_slots=32: 192 GB (definitely doesn't fit)
+
+Segmentation naturally enables disk-backed storage: only load dirty segments into
+RAM for NTT computation. MDBX (used by Reth/Erigon for Ethereum state) provides
+memory-mapped reads (slot lookups are pointer dereferences) and crash-safe writes
+(copy-on-write, no WAL). A typical block loads ~50 segments × 3 MB = 150 MB
+temporarily into RAM — feasible on any machine.
+
+### Expansion under segmentation
+
+When `log_slots` increments (§15.3), the number of segments doubles. New segments
+are all-zero (committed as a constant `ZERO_SEGMENT_ROOT`). The Merkle tree gains
+one level: `new_root = Poseidon2b(old_root, ZERO_SEGTREE_NODE[old_depth])`. Cost:
+one hash. Identical to the old expansion cost but now over a segment tree rather
+than a state tree.
+
+---
+
+## 18. Node Storage Modes
+
+```
+  ┌────────────────────────────────────────────────────────┐
+  │  paranoid-node --storage=ram                            │
+  │                                                        │
+  │  All 256 segments live as Vec<Block128> in process heap │
+  │  Total: ~768 MB at log_slots=24                        │
+  │  Best: development, testing, early mainnet              │
+  │  Limit: log_slots ≤ 26 (up to ~3 GB)                  │
+  └────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────┐
+  │  paranoid-node --storage=disk --data-dir=/path         │
+  │                                                        │
+  │  MDBX database file (mmap'd by OS)                     │
+  │  Hot segments: in page cache (OS decision)             │
+  │  Cold segments: on SSD, loaded on demand               │
+  │  Block production: load dirty segments → NTT → release │
+  │  Scales: log_slots=32 (192 GB on disk, ~150 MB RAM)   │
+  └────────────────────────────────────────────────────────┘
+```
+
+The choice is non-consensus: both modes produce identical state_roots.
+Nodes can switch modes via snapshot export/import.
