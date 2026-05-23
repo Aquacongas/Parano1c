@@ -18,7 +18,9 @@
 
 use noid_air::composition::tx_validity_with_spine::fixture;
 use noid_core::{Block128, TowerField};
-use noid_gkr::{compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS};
+use noid_gkr::{
+    compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS,
+};
 
 /// Lower the composite's boundary pins to the `SpineInputs` shape the
 /// GKR spine consumes. Mirrors the pin semantics documented on
@@ -29,7 +31,7 @@ fn spine_inputs_from_composite(
 ) -> SpineInputs {
     let pins = comp.boundary_pins();
     SpineInputs {
-        prev_state_root: pins.prev_state_root,
+        epoch_anchor: pins.epoch_anchor,
         fee_leaf: pins.fee_leaf,
         input_leaves: pins.input_leaf_absorb,
         output_leaves: pins.output_leaf_absorb,
@@ -81,7 +83,8 @@ fn verify_tx_rejects_forged_address_via_bridge() {
         auth_inputs: &honest_auth,
     };
     let proof = prove_tx(&witness).expect("honest prove_tx must succeed");
-    verify_tx(comp.air(), &pi, &spine_inputs, &honest_auth, &proof)
+    let honest_public = honest_auth.to_public();
+    verify_tx(comp.air(), &pi, &spine_inputs, &honest_public, &proof)
         .expect("honest verify_tx must succeed");
 
     // --- Attack: use attacker's secrets instead of victim's ---
@@ -128,7 +131,8 @@ fn verify_tx_rejects_forged_address_via_bridge() {
         prove_tx(&forged_witness).expect("forged prove_tx succeeds (prover is malicious)");
 
     // verify_tx MUST reject: bridge detects address mismatch
-    let result = verify_tx(comp.air(), &pi, &spine_inputs, &forged_auth, &forged_proof);
+    let forged_public = forged_auth.to_public();
+    let result = verify_tx(comp.air(), &pi, &spine_inputs, &forged_public, &forged_proof);
     assert!(result.is_err(), "verify_tx must reject forged address");
     match result.unwrap_err() {
         VerifyTxError::AuthSpineBridge => {}
@@ -194,7 +198,8 @@ fn verify_tx_rejects_mismatched_tx_body_hash_in_auth() {
     // verify_tx must reject — either AuthKillShot (channel diverges)
     // or AuthSpineBridge (tx_body_hash mismatch). Both are acceptable
     // since the system rejects the forgery.
-    let result = verify_tx(comp.air(), &pi, &spine_inputs, &tampered_auth, &proof);
+    let tampered_public = tampered_auth.to_public();
+    let result = verify_tx(comp.air(), &pi, &spine_inputs, &tampered_public, &proof);
     assert!(
         result.is_err(),
         "verify_tx must reject tampered tx_body_hash in auth_inputs"

@@ -26,10 +26,10 @@ use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 use noid_fri_binius::MerkleCap;
 use noid_gkr::{
-    build_auth_unified_from_inputs, build_boundary_mle, prove_auth_killshot,
+    auth_gkr_channel, build_auth_unified_from_inputs, build_boundary_mle, prove_auth_killshot,
     prove_spine_killshot_with_states, reconstruct_slot_states, verify_auth_killshot,
-    verify_spine_killshot, AuthCircuit, AuthInputs, AuthProofKillShot, SpineCircuit, SpineInputs,
-    SpineProofKillShot, N_AUTH_UNIFIED_VARS, N_BOUNDARY_VARS,
+    verify_spine_killshot, AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs,
+    SpineCircuit, SpineInputs, SpineProofKillShot, N_AUTH_UNIFIED_VARS, N_BOUNDARY_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_tx::PublicInputs;
@@ -206,9 +206,9 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
     let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
     let cap = &pre_commitment.cap;
 
-    // Seed GKR channels with the Merkle cap (binds all columns including slices).
-    // SpineGKR and AuthGKR use independent Fiat-Shamir channels and disjoint
-    // data — run them in parallel for ~100ms wall-clock savings.
+    // SpineGKR seeds from Merkle cap (binds to committed columns).
+    // AuthGKR uses a deterministic self-seeded channel (no cap dependency)
+    // so the same proof can be reused in block context without re-proving.
     let ((spine_proof, spine_reductions), (auth_proof, auth_reductions)) = rayon::join(
         || {
             let mut spine_channel = Poseidon2bChannel::new();
@@ -216,8 +216,7 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
             prove_spine_killshot_with_states(&spine_states, claimed, &mut spine_channel)
         },
         || {
-            let mut auth_channel = Poseidon2bChannel::new();
-            absorb_merkle_cap(&mut auth_channel, cap);
+            let mut auth_channel = auth_gkr_channel();
             prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel)
         },
     );
@@ -277,6 +276,7 @@ pub fn prove_tx(witness: &TxWitness) -> Result<TxProof, ProveTxError> {
         &slice_claims,
         log_len,
         Some((pre_commitment, pre_state)),
+        noid_fri_binius::COMPACT_NUM_QUERIES,
     );
 
     Ok(TxProof {
@@ -300,7 +300,7 @@ pub fn verify_tx(
     air: &dyn Air,
     pi: &PublicInputs,
     spine_inputs: &SpineInputs,
-    auth_inputs: &AuthInputs,
+    auth_public: &AuthPublicInputs,
     proof: &TxProof,
 ) -> Result<(), VerifyTxError> {
     let claimed = tx_body_hash_as_lanes(pi);
@@ -321,9 +321,6 @@ pub fn verify_tx(
     }
     let cap = &proof.stark.commitment.cap;
 
-    // SpineGKR and AuthGKR verification are independent: each creates its
-    // own Poseidon2bChannel seeded from the same cap, with disjoint inputs
-    // and no shared mutable state. Run them in parallel to match the prover.
     let (spine_result, auth_result) = rayon::join(
         || {
             let mut ch = Poseidon2bChannel::new();
@@ -331,9 +328,8 @@ pub fn verify_tx(
             verify_spine_killshot(&proof.spine, &spine_circuit, spine_inputs, claimed, &mut ch)
         },
         || {
-            let mut ch = Poseidon2bChannel::new();
-            absorb_merkle_cap(&mut ch, cap);
-            verify_auth_killshot(&proof.auth, &auth_circuit, auth_inputs, &mut ch)
+            let mut ch = auth_gkr_channel();
+            verify_auth_killshot(&proof.auth, &auth_circuit, auth_public, &mut ch)
         },
     );
     let spine_reductions = spine_result.ok_or(VerifyTxError::SpineKillShot)?;
@@ -342,24 +338,14 @@ pub fn verify_tx(
     // =========================================================================
     // Stage 1b: Auth <-> Spine bridge
     // =========================================================================
-    // This bridge checks two things explicitly:
-    //   1. tx_body_hash: both GKR instances must have seen the same hash.
-    //   2. expected_address: the ownership data in the spine leaf must match
-    //      what the auth GKR used as its public address pin.
-    //
-    // AuthTag binding is NOT checked explicitly here — it is enforced inside
-    // `verify_auth_killshot` via the public pin-claim on the auth-output slot
-    // (see `public_pin_claims` in auth_killshot.rs). The bridge covers only
-    // the address-derivation link between spine and auth; any auth-tag
-    // deviation would have caused `verify_auth_killshot` to return None above.
-    if auth_inputs.tx_body_hash != claimed {
+    if auth_public.tx_body_hash != claimed {
         return Err(VerifyTxError::AuthSpineBridge);
     }
     let n_live = pi.n_live_inputs as usize;
     for i in 0..n_live {
         let owner_hi = spine_inputs.input_leaves[i][2];
         let owner_lo = spine_inputs.input_leaves[i][3];
-        if auth_inputs.expected_address[i] != [owner_hi, owner_lo] {
+        if auth_public.expected_address[i] != [owner_hi, owner_lo] {
             return Err(VerifyTxError::AuthSpineBridge);
         }
     }
@@ -418,7 +404,7 @@ pub fn verify_tx(
         });
     }
 
-    verify_air_interleaved(air, pi, &proof.stark, &extras_transcript, &slice_claims)?;
+    verify_air_interleaved(air, pi, &proof.stark, &extras_transcript, &slice_claims, noid_fri_binius::COMPACT_NUM_QUERIES)?;
 
     Ok(())
 }

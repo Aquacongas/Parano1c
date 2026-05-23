@@ -157,7 +157,8 @@ impl TxOutput {
 /// Wire-format version. Bumped:
 /// - `1 → 2` at Stage E.1: `TxOutput.slot_index: u32`.
 /// - `2 → 3` at Stage E.5.f₁: `TxBody.is_coinbase: bool`.
-pub const TX_BODY_VERSION: u8 = 3;
+/// - `3 → 4` at Stage S.1: `prev/new_state_root` → `epoch_anchor`.
+pub const TX_BODY_VERSION: u8 = 4;
 
 impl TxBody {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -171,8 +172,7 @@ impl TxBody {
         );
 
         buf.push(TX_BODY_VERSION);
-        put_digest(buf, &self.prev_state_root);
-        put_digest(buf, &self.new_state_root);
+        put_digest(buf, &self.epoch_anchor);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
         for i in &self.inputs {
@@ -187,7 +187,7 @@ impl TxBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 2 * 32
+            1 + 32
                 + 16
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
@@ -204,8 +204,7 @@ impl TxBody {
         if v != TX_BODY_VERSION {
             return Err(WireError::UnknownVersion);
         }
-        let prev_state_root = take_digest(src)?;
-        let new_state_root = take_digest(src)?;
+        let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
 
         let n_in = take_u32(src)? as usize;
@@ -229,8 +228,7 @@ impl TxBody {
         let is_coinbase = take_bool(src)?;
 
         Ok(Self {
-            prev_state_root,
-            new_state_root,
+            epoch_anchor,
             fee,
             inputs,
             outputs,
@@ -281,12 +279,12 @@ impl Transaction {
 }
 
 // ---------------------------------------------------------------------------
-// PublicInputs : prev_root (32) + new_root (32) + tx_body_hash (32) + fee (16)
+// PublicInputs : epoch_anchor (32) + tx_body_hash (32) + fee (16)
 //              + n_live_inputs (1) + n_live_outputs (1)
 //              + coinbase_credit (8) + log_slots (4)
+//              + claims_commitment (32)
 //              + is_activation[MAX_OUTPUTS] (MAX_OUTPUTS bytes, 0/1)
 //              + is_deactivation[MAX_INPUTS] (MAX_INPUTS bytes, 0/1)
-//              = 142 + MAX_OUTPUTS + MAX_INPUTS bytes
 // ---------------------------------------------------------------------------
 
 pub const PUBLIC_INPUTS_WIRE_SIZE: usize =
@@ -294,14 +292,14 @@ pub const PUBLIC_INPUTS_WIRE_SIZE: usize =
 
 impl PublicInputs {
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        put_digest(buf, &self.prev_state_root);
-        put_digest(buf, &self.new_state_root);
+        put_digest(buf, &self.epoch_anchor);
         put_digest(buf, &self.tx_body_hash.0);
         put_u128(buf, self.fee);
         buf.push(self.n_live_inputs);
         buf.push(self.n_live_outputs);
         put_u64(buf, self.coinbase_credit);
         put_u32(buf, self.log_slots);
+        put_digest(buf, &self.claims_commitment);
         for b in &self.is_activation {
             put_bool(buf, *b);
         }
@@ -313,9 +311,7 @@ impl PublicInputs {
     pub fn to_bytes(&self) -> [u8; PUBLIC_INPUTS_WIRE_SIZE] {
         let mut out = [0u8; PUBLIC_INPUTS_WIRE_SIZE];
         let mut i = 0;
-        out[i..i + 32].copy_from_slice(&self.prev_state_root);
-        i += 32;
-        out[i..i + 32].copy_from_slice(&self.new_state_root);
+        out[i..i + 32].copy_from_slice(&self.epoch_anchor);
         i += 32;
         out[i..i + 32].copy_from_slice(&self.tx_body_hash.0);
         i += 32;
@@ -329,6 +325,8 @@ impl PublicInputs {
         i += 8;
         out[i..i + 4].copy_from_slice(&self.log_slots.to_le_bytes());
         i += 4;
+        out[i..i + 32].copy_from_slice(&self.claims_commitment);
+        i += 32;
         for b in &self.is_activation {
             out[i] = if *b { 1 } else { 0 };
             i += 1;
@@ -341,8 +339,7 @@ impl PublicInputs {
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
-        let prev_state_root = take_digest(src)?;
-        let new_state_root = take_digest(src)?;
+        let epoch_anchor = take_digest(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
         let fee = take_u128(src)?;
         let n_live_inputs = take(src, 1)?[0];
@@ -357,6 +354,7 @@ impl PublicInputs {
         if !(crate::public::MIN_LOG_SLOTS..=crate::public::MAX_LOG_SLOTS).contains(&log_slots) {
             return Err(WireError::ShapeMismatch);
         }
+        let claims_commitment = take_digest(src)?;
         let mut is_activation = [false; crate::types::MAX_OUTPUTS];
         for slot in is_activation.iter_mut() {
             *slot = take_bool(src)?;
@@ -366,14 +364,14 @@ impl PublicInputs {
             *slot = take_bool(src)?;
         }
         Ok(Self {
-            prev_state_root,
-            new_state_root,
+            epoch_anchor,
             tx_body_hash,
             fee,
             n_live_inputs,
             n_live_outputs,
             coinbase_credit,
             log_slots,
+            claims_commitment,
             is_activation,
             is_deactivation,
         })
@@ -441,8 +439,7 @@ mod tests {
     #[test]
     fn tx_body_roundtrip() {
         let body = TxBody {
-            prev_state_root: [0x11u8; 32],
-            new_state_root: [0x22u8; 32],
+            epoch_anchor: [0x11u8; 32],
             fee: 42u128,
             inputs: vec![mk_input(1), mk_input(2), TxInput::dummy()],
             outputs: vec![mk_output(1), mk_output(2), TxOutput::dummy()],
@@ -456,8 +453,7 @@ mod tests {
     #[test]
     fn tx_body_coinbase_roundtrip() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [1u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![mk_output(1)],
@@ -472,20 +468,17 @@ mod tests {
     #[test]
     fn tx_body_is_coinbase_byte_is_bound() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
             is_coinbase: false,
         };
         let mut bytes = body.to_bytes();
-        // Last byte is is_coinbase; flipping it must be observable.
         let last = bytes.len() - 1;
         bytes[last] = 1;
         let back = TxBody::from_bytes(&bytes).unwrap();
         assert!(back.is_coinbase);
-        // Invalid bool byte rejects.
         bytes[last] = 0x42;
         assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::InvalidBool));
     }
@@ -494,9 +487,8 @@ mod tests {
     fn tx_body_rejects_too_many_inputs() {
         let mut buf = Vec::new();
         buf.push(TX_BODY_VERSION);
-        buf.extend_from_slice(&[0u8; 32]);
-        buf.extend_from_slice(&[0u8; 32]);
-        buf.extend_from_slice(&[0u8; 16]);
+        buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
+        buf.extend_from_slice(&[0u8; 16]); // fee
         put_u32(&mut buf, (crate::types::MAX_INPUTS + 1) as u32);
         assert_eq!(TxBody::from_bytes(&buf), Err(WireError::CountTooLarge));
     }
@@ -504,8 +496,7 @@ mod tests {
     #[test]
     fn tx_body_rejects_trailing_bytes() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
@@ -519,8 +510,7 @@ mod tests {
     #[test]
     fn tx_body_rejects_wrong_version() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
@@ -534,8 +524,7 @@ mod tests {
     #[test]
     fn transaction_roundtrip() {
         let body = TxBody {
-            prev_state_root: [0xAAu8; 32],
-            new_state_root: [0xBBu8; 32],
+            epoch_anchor: [0xAAu8; 32],
             fee: 7,
             inputs: vec![mk_input(3)],
             outputs: vec![mk_output(4)],
@@ -559,14 +548,14 @@ mod tests {
         let mut is_deact = [false; crate::types::MAX_INPUTS];
         is_deact[1] = true;
         let p = PublicInputs {
-            prev_state_root: [1u8; 32],
-            new_state_root: [2u8; 32],
+            epoch_anchor: [1u8; 32],
             tx_body_hash: TxBodyHash([4u8; 32]),
             fee: 0xFEED_FACE_CAFE_BEEFu128,
             n_live_inputs: 2,
             n_live_outputs: 4,
             coinbase_credit: 0xDEAD_BEEF_1234_5678,
             log_slots: 24,
+            claims_commitment: [0xCCu8; 32],
             is_activation: is_act,
             is_deactivation: is_deact,
         };
@@ -579,23 +568,20 @@ mod tests {
     #[test]
     fn public_inputs_rejects_live_count_over_max() {
         let good = PublicInputs {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             tx_body_hash: TxBodyHash([0u8; 32]),
             fee: 0,
             n_live_inputs: 0,
             n_live_outputs: 0,
             coinbase_credit: 0,
             log_slots: 24,
+            claims_commitment: [0u8; 32],
             is_activation: [false; crate::types::MAX_OUTPUTS],
             is_deactivation: [false; crate::types::MAX_INPUTS],
         };
-        // Trailing layout is `... n_live_in (1) n_live_out (1) credit (8) log_slots (4)
-        // is_activation[MAX_OUTPUTS] is_deactivation[MAX_INPUTS]`.
-        // Offsets measured from the end (`size - tail_bytes`).
-        let tail = crate::types::MAX_OUTPUTS + crate::types::MAX_INPUTS + 4 + 8;
-        let n_in_off = PUBLIC_INPUTS_WIRE_SIZE - tail - 1 - 1;
-        let n_out_off = PUBLIC_INPUTS_WIRE_SIZE - tail - 1;
+        // Layout: epoch_anchor(32) + tx_body_hash(32) + fee(16) + n_live_in(1) + n_live_out(1) ...
+        let n_in_off = 32 + 32 + 16; // offset of n_live_inputs
+        let n_out_off = n_in_off + 1; // offset of n_live_outputs
         let mut bytes = good.to_bytes();
         bytes[n_in_off] = (crate::types::MAX_INPUTS + 1) as u8;
         assert_eq!(
@@ -613,8 +599,7 @@ mod tests {
     #[test]
     fn truncated_decode_errors_cleanly() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![mk_input(1)],
             outputs: vec![],
@@ -631,8 +616,7 @@ mod tests {
     #[should_panic(expected = "inputs exceed MAX_INPUTS")]
     fn tx_body_encode_panics_when_inputs_exceed_bound() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
             outputs: vec![],
@@ -646,8 +630,7 @@ mod tests {
     #[should_panic(expected = "outputs exceed MAX_OUTPUTS")]
     fn tx_body_encode_panics_when_outputs_exceed_bound() {
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],

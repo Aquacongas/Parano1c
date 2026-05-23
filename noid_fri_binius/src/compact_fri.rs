@@ -30,7 +30,7 @@ use rayon::prelude::*;
 /// TAU=8 means 2^8=256 upper partial evaluations and log_len-8 FRI rounds.
 pub const COMPACT_TAU: usize = 8;
 
-/// Number of FRI queries. 64 queries with rate-4 code gives:
+/// Number of FRI queries for full security. 64 queries with rate-4 code gives:
 /// - Proven soundness: 64 * log2(4) = 128 bits
 /// Uses batched Merkle proofs to compress shared ancestors,
 /// yielding ~40% path savings vs independent per-query paths.
@@ -38,6 +38,7 @@ pub const COMPACT_TAU: usize = 8;
 pub const COMPACT_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
 pub const COMPACT_NUM_QUERIES: usize = 8;
+
 
 // ---------------------------------------------------------------------------
 // Proof structures
@@ -106,13 +107,15 @@ impl CompactEvalProof {
 /// Produce a compact FRI evaluation proof.
 ///
 /// Same protocol as `noid_fri::prover::prove` but with COMPACT_TAU and
-/// COMPACT_NUM_QUERIES, plus batched Merkle compression.
+/// batched Merkle compression. `num_queries` controls the query count
+/// (use `COMPACT_NUM_QUERIES` for full security).
 pub fn compact_fri_prove(
     evals: &[Block128],
     eval_point: &[Block128],
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
+    num_queries: usize,
 ) -> CompactEvalProof {
     channel.observe_field_elems(eval_point);
 
@@ -236,7 +239,7 @@ pub fn compact_fri_prove(
 
     // Step 4: Query phase with batched Merkle compression.
     let log_domain = n_rounds + LOG_RATE;
-    let query_indices = gen_compact_queries(channel, log_domain);
+    let query_indices = gen_compact_queries(channel, log_domain, num_queries);
 
     let mut fri_queried_symbols: Vec<Vec<(Block128, Block128)>> = Vec::with_capacity(n_rounds);
     let mut fri_merkle_batch: Vec<BatchedMerkleProof> = Vec::with_capacity(n_rounds);
@@ -285,6 +288,7 @@ pub fn compact_fri_verify(
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
+    num_queries: usize,
 ) -> Result<(), String> {
     channel.observe_field_elems(eval_point);
 
@@ -361,7 +365,7 @@ pub fn compact_fri_verify(
 
     // Generate query indices (must match prover)
     let log_domain = n_rounds + LOG_RATE;
-    let query_indices = gen_compact_queries(channel, log_domain);
+    let query_indices = gen_compact_queries(channel, log_domain, num_queries);
     let n_queries = query_indices.len();
 
     // Verify each round
@@ -600,13 +604,13 @@ fn verify_batched_merkle_proof(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate compact query indices (fewer queries than standard FRI).
-fn gen_compact_queries(channel: &mut Channel, log_max_len: usize) -> Vec<usize> {
+/// Generate compact query indices.
+fn gen_compact_queries(channel: &mut Channel, log_max_len: usize, num_queries: usize) -> Vec<usize> {
     let domain_size = 1usize << log_max_len;
     if domain_size == 0 {
         return vec![];
     }
-    let n_queries = COMPACT_NUM_QUERIES.min(domain_size);
+    let n_queries = num_queries.min(domain_size);
     let bit_mask = (domain_size - 1) as u128;
     let random_elems = channel.get_random_points(n_queries);
     random_elems

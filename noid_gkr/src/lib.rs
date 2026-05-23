@@ -39,12 +39,12 @@ pub mod spine_sumcheck;
 pub mod spine_unified;
 
 pub use auth_circuit::{
-    AuthCircuit, AuthInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0, AUTH_PAD_1,
-    N_AUTH_INPUTS, N_AUTH_SLOTS, N_SLOTS_PER_INPUT,
+    AuthCircuit, AuthInputs, AuthPublicInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0,
+    AUTH_PAD_1, N_AUTH_INPUTS, N_AUTH_SLOTS, N_SLOTS_PER_INPUT,
 };
 pub use auth_killshot::{
-    build_auth_unified_from_inputs, discharge_auth_reductions_native, prove_auth_killshot,
-    verify_auth_killshot, AuthKillShotReductions, AuthProofKillShot,
+    auth_gkr_channel, build_auth_unified_from_inputs, discharge_auth_reductions_native,
+    prove_auth_killshot, verify_auth_killshot, AuthKillShotReductions, AuthProofKillShot,
 };
 pub use auth_mle_v2::{
     build_auth_unified_mle_v2, AuthUnifiedMle, N_AUTH_LIVE_SLOTS, N_AUTH_UNIFIED_CELLS,

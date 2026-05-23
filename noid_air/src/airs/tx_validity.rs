@@ -507,8 +507,7 @@ mod tests {
 
     fn mk_body() -> TxBody {
         TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![
                 mk_input(1),
@@ -626,8 +625,7 @@ mod tests {
     fn validity_air_accepts_empty_body() {
         let air = TxValidityAir::new();
         let empty = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
             outputs: vec![],
@@ -644,8 +642,7 @@ mod tests {
     fn validity_air_dummy_inputs_keep_selector_zero() {
         let air = TxValidityAir::new();
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![TxInput::dummy(); MAX_INPUTS],
             outputs: vec![TxOutput::dummy(); MAX_OUTPUTS],
@@ -666,8 +663,7 @@ mod tests {
     fn mk_body_balanced_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
         assert_eq!(in_val, out_val + fee, "mk_body must be balanced");
         TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: fee as u128,
             inputs: vec![
                 TxInput {

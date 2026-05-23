@@ -27,7 +27,7 @@ pub struct TxBodyHashCell {
 ///
 /// - `boundary_inputs` is the small MLE the GKR verifier reduces to
 ///   after its sumcheck. These values are either (a) already committed
-///   by the STARK as public cells (leaf payloads, prev_state_root,
+///   by the STARK as public cells (leaf payloads, epoch_anchor,
 ///   fee, is_coinbase), or (b) deterministic constants (capacity IVs,
 ///   pad leaf). There is no new committed trace data introduced.
 /// - `claimed_output` is the GKR prover's claim about `tx_body_hash`.

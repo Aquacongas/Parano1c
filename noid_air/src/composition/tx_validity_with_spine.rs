@@ -696,16 +696,16 @@ impl TxValidityCompositeWithSpine {
         self.balance_fee
     }
 
-    /// Stage 6 — expected `prev_state_root` as pinned into the
+    /// Stage 6 — expected `epoch_anchor` as pinned into the
     /// combiner's prev-side.
-    pub fn expected_prev_state_root_fields(&self) -> [Block128; 2] {
-        self.combiner.expected_prev_state_root_fields()
+    pub fn expected_epoch_anchor_fields(&self) -> [Block128; 2] {
+        self.combiner.expected_epoch_anchor_fields()
     }
 
-    /// Stage 6 — expected `new_state_root` as pinned into the
+    /// Stage 6 — expected `claims_commitment` as pinned into the
     /// combiner's new-side.
-    pub fn expected_new_state_root_fields(&self) -> [Block128; 2] {
-        self.combiner.expected_new_state_root_fields()
+    pub fn expected_claims_commitment_fields(&self) -> [Block128; 2] {
+        self.combiner.expected_claims_commitment_fields()
     }
 
     /// Stage 6 — derive the canonical `PublicInputs` from the four
@@ -713,10 +713,10 @@ impl TxValidityCompositeWithSpine {
     /// scalar is read from its single source of truth; no fresh
     /// pins introduced.
     ///
-    /// - `prev_state_root` ← combiner prev-side expected digest.
-    /// - `new_state_root`  ← combiner new-side expected digest.
-    /// - `tx_body_hash`    ← `boundary_pins.tx_body_hash` (Stage 1 O2 tie).
-    /// - `fee`             ← `balance_fee` pinned via `emit_balance_value_public_columns`.
+    /// - `epoch_anchor`       ← combiner prev-side expected digest.
+    /// - `claims_commitment`  ← combiner new-side expected digest.
+    /// - `tx_body_hash`       ← `boundary_pins.tx_body_hash` (Stage 1 O2 tie).
+    /// - `fee`                ← `balance_fee` pinned via `emit_balance_value_public_columns`.
     ///
     /// The returned `PublicInputs` is the **only** verifier-visible
     /// surface (Stage 6 (b)).
@@ -777,8 +777,8 @@ impl TxValidityCompositeWithSpine {
         }
 
         noid_tx::PublicInputs {
-            prev_state_root: pack(self.combiner.expected_prev_state_root_fields()),
-            new_state_root: pack(self.combiner.expected_new_state_root_fields()),
+            epoch_anchor: pack(self.combiner.expected_epoch_anchor_fields()),
+            claims_commitment: pack(self.combiner.expected_claims_commitment_fields()),
             tx_body_hash: TxBodyHash(pack(self.boundary_pins.tx_body_hash)),
             fee: self.balance_fee as u128,
             n_live_inputs,
@@ -803,12 +803,12 @@ impl TxValidityCompositeWithSpine {
     pub fn assert_public_inputs_consistent(&self, pi: &noid_tx::PublicInputs) {
         let derived = self.public_inputs();
         assert_eq!(
-            derived.prev_state_root, pi.prev_state_root,
-            "Stage 6: PublicInputs.prev_state_root disagrees with combiner pin",
+            derived.epoch_anchor, pi.epoch_anchor,
+            "Stage 6: PublicInputs.epoch_anchor disagrees with combiner pin",
         );
         assert_eq!(
-            derived.new_state_root, pi.new_state_root,
-            "Stage 6: PublicInputs.new_state_root disagrees with combiner pin",
+            derived.claims_commitment, pi.claims_commitment,
+            "Stage 6: PublicInputs.claims_commitment disagrees with combiner pin",
         );
         assert_eq!(
             derived.tx_body_hash, pi.tx_body_hash,
@@ -902,9 +902,9 @@ pub mod fixture {
     /// `tx_body_hash_air_matches_native` keep this byte-for-byte locked
     /// with both the GKR reconstruction and the in-circuit wrap output.
     fn native_wrap_digest(pins: &TxBodyMerkleBoundaryPins) -> [Block128; 2] {
-        let mut prev_state_root = [0u8; 32];
-        prev_state_root[..16].copy_from_slice(&pins.prev_state_root[0].to_u128().to_le_bytes());
-        prev_state_root[16..].copy_from_slice(&pins.prev_state_root[1].to_u128().to_le_bytes());
+        let mut epoch_anchor = [0u8; 32];
+        epoch_anchor[..16].copy_from_slice(&pins.epoch_anchor[0].to_u128().to_le_bytes());
+        epoch_anchor[16..].copy_from_slice(&pins.epoch_anchor[1].to_u128().to_le_bytes());
 
         let fee_u128 = pins.fee_leaf[0].to_u128();
         let is_coinbase = pins.is_coinbase_leaf[0].to_u128() != 0;
@@ -925,7 +925,7 @@ pub mod fixture {
         }
 
         let digest = native_hash_tx_body(
-            &prev_state_root,
+            &epoch_anchor,
             fee_u128,
             &input_leaves,
             &output_leaves,
@@ -938,8 +938,7 @@ pub mod fixture {
 
     pub fn empty_tx_body() -> TxBody {
         TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -1134,7 +1133,7 @@ pub mod fixture {
     }
 
     fn fill_absorb_pins_from_body(pins: &mut TxBodyMerkleBoundaryPins, body: &TxBody) {
-        pins.prev_state_root = digest_to_block128_pair(&body.prev_state_root);
+        pins.epoch_anchor = digest_to_block128_pair(&body.epoch_anchor);
         pins.fee_leaf = digest_to_block128_pair(&native_fee_leaf(body.fee));
         // E.5.f₂: L14 = [is_coinbase_as_u128, 0], matching
         // `noid_poseidon2b::primitives::is_coinbase_leaf`.
@@ -1251,8 +1250,7 @@ pub mod fixture {
             .collect();
 
         let mut body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: fee as u128,
             inputs,
             outputs,
@@ -1397,8 +1395,7 @@ pub mod fixture {
             .collect();
 
         let mut body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: fee as u128,
             inputs,
             outputs,

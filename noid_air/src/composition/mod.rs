@@ -15,6 +15,7 @@ pub mod bridge;
 pub mod registry;
 pub mod row_window;
 pub mod spine_adapter;
+pub mod tx_logic;
 pub mod tx_validity_composite;
 pub mod tx_validity_leaf;
 pub mod tx_validity_with_spine;
@@ -27,6 +28,10 @@ pub use row_window::{
 pub use spine_adapter::{SpineEmbeddingLayout, SpineLayoutError};
 pub use tx_validity_leaf::{
     TxValidityCompositeLeaf, TX_VALIDITY_LEAF_LOG_ROWS, TX_VALIDITY_LEAF_N_COLS,
+};
+pub use tx_logic::{
+    boundary_pins_from_body, witness_from_body, TxLogicAir, TxLogicWitness, TX_LOGIC_LOG_ROWS,
+    TX_LOGIC_N_COLS,
 };
 pub use tx_validity_with_spine::{
     build_stage_5_7_honest_fixture, coinbase_credit_bit_col, tx_validity_with_spine_n_cols,

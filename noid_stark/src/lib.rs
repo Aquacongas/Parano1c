@@ -38,6 +38,7 @@ pub mod multipoint_batch;
 pub mod vshift;
 
 pub mod interleaved;
+pub mod prove_logic;
 pub mod prove_tx;
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
@@ -155,8 +156,8 @@ fn absorb_digest_as_pair(channel: &mut Channel, digest: &[u8; 32]) {
 }
 
 pub fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
-    absorb_digest_as_pair(channel, &pi.prev_state_root);
-    absorb_digest_as_pair(channel, &pi.new_state_root);
+    absorb_digest_as_pair(channel, &pi.epoch_anchor);
+    absorb_digest_as_pair(channel, &pi.claims_commitment);
     absorb_digest_as_pair(channel, &pi.tx_body_hash.0);
     channel.observe_field_elem(Block128::from(pi.fee));
     // A1a — live-count public inputs. Pack both u8 counts into a
@@ -2541,8 +2542,8 @@ mod tests {
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
-            prev_state_root: [0x11; 32],
-            new_state_root: [0x22; 32],
+            epoch_anchor: [0x11; 32],
+            claims_commitment: [0u8; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
             n_live_inputs: 0,
@@ -2560,8 +2561,7 @@ mod tests {
         let mut output = TxOutput::dummy();
         output.valid = true;
         noid_tx::TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![input, TxInput::dummy()],
             outputs: vec![output, TxOutput::dummy()],
@@ -3812,8 +3812,8 @@ mod tx_validity_3b4_tests {
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
-            prev_state_root: [0x11; 32],
-            new_state_root: [0x22; 32],
+            epoch_anchor: [0x11; 32],
+            claims_commitment: [0u8; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
             n_live_inputs: 0,
@@ -3828,8 +3828,7 @@ mod tx_validity_3b4_tests {
     fn balanced_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
         assert_eq!(in_val, out_val + fee);
         TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: fee as u128,
             inputs: vec![
                 TxInput {
@@ -4059,8 +4058,8 @@ mod poseidon_perm_stark_tests {
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
-            prev_state_root: [0x11; 32],
-            new_state_root: [0x22; 32],
+            epoch_anchor: [0x11; 32],
+            claims_commitment: [0u8; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
             fee: 7,
             n_live_inputs: 0,
@@ -4193,8 +4192,8 @@ mod tx_body_merkle_stark_tests {
 
     fn mk_pi() -> PublicInputs {
         PublicInputs {
-            prev_state_root: [0x11; 32],
-            new_state_root: [0x22; 32],
+            epoch_anchor: [0x11; 32],
+            claims_commitment: [0u8; 32],
             tx_body_hash: noid_poseidon2b::primitives::TxBodyHash([0x44; 32]),
             fee: 7,
             n_live_inputs: 0,

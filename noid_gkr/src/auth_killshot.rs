@@ -44,9 +44,10 @@
 
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
+use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
-use crate::auth_circuit::{AuthCircuit, AuthInputs, N_AUTH_INPUTS};
+use crate::auth_circuit::{AuthCircuit, AuthInputs, AuthPublicInputs, N_AUTH_INPUTS};
 use crate::auth_mle_v2::{
     build_auth_unified_mle_v2, AuthUnifiedMle, N_AUTH_LIVE_SLOTS, N_AUTH_UNIFIED_VARS,
 };
@@ -100,6 +101,10 @@ pub struct AuthKillShotReductions {
     pub sout: BatchEvalReduction,
 }
 
+/// Domain separator for the self-seeded auth GKR channel. Ensures no
+/// collision with other protocol sub-channels.
+const AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_6B12_0000_0000;
+
 #[inline]
 fn absorb_pair<T: FiatShamir<Block128>>(channel: &mut T, pair: &[Block128; 2]) {
     channel.absorb(pair[0]);
@@ -108,12 +113,29 @@ fn absorb_pair<T: FiatShamir<Block128>>(channel: &mut T, pair: &[Block128; 2]) {
 
 /// Absorb the public boundary into the channel — never touches
 /// `spend_secret`.
-fn absorb_public_boundary<T: FiatShamir<Block128>>(channel: &mut T, inputs: &AuthInputs) {
+fn absorb_public_boundary<T: FiatShamir<Block128>>(channel: &mut T, inputs: &AuthPublicInputs) {
     absorb_pair(channel, &inputs.tx_body_hash);
     for i in 0..N_AUTH_INPUTS {
         absorb_pair(channel, &inputs.expected_address[i]);
         absorb_pair(channel, &inputs.expected_auth_tag[i]);
     }
+}
+
+/// Create a deterministically-seeded Poseidon2b channel for AuthGKR.
+///
+/// Seeded with a domain tag only. The prove/verify functions absorb the
+/// public boundary internally. This makes the auth proof portable: it
+/// does NOT depend on any commitment cap, so the same proof works in
+/// both LogicProof and BlockProof contexts.
+///
+/// PRIVACY: By decoupling the auth channel from the Merkle commitment
+/// cap, the wallet can generate the auth proof locally (with
+/// `spend_secret`) and the block prover can include it as-is without
+/// re-proving.
+pub fn auth_gkr_channel() -> Poseidon2bChannel {
+    let mut ch = Poseidon2bChannel::new();
+    ch.absorb(Block128::from(AUTH_GKR_DOMAIN_TAG));
+    ch
 }
 
 /// Hypercube coords of the `state` cell that holds output lane
@@ -136,7 +158,7 @@ fn state_output_point(slot: usize, lane: usize) -> Vec<Block128> {
 
 /// Build the public-pin claim list — Address inputs 0..N then AuthTag
 /// inputs 0..N, two lanes each. Identical order on prover and verifier.
-fn public_pin_claims(_circuit: &AuthCircuit, inputs: &AuthInputs) -> Vec<EvalClaim> {
+fn public_pin_claims(_circuit: &AuthCircuit, inputs: &AuthPublicInputs) -> Vec<EvalClaim> {
     let mut out = Vec::with_capacity(2 * AUTH_PIN_LANES * N_AUTH_INPUTS);
     for i in 0..N_AUTH_INPUTS {
         let slot = AuthCircuit::haddr_output_slot(i);
@@ -189,7 +211,8 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
         );
     }
 
-    absorb_public_boundary(channel, inputs);
+    let public = inputs.to_public();
+    absorb_public_boundary(channel, &public);
 
     let state_ins: Vec<[Block128; STATE_SIZE]> = witness.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_auth_unified_mle_v2(&state_ins);
@@ -207,7 +230,7 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
             value: shift.state_at_r2,
         },
     ];
-    state_claims.extend(public_pin_claims(circuit, inputs));
+    state_claims.extend(public_pin_claims(circuit, &public));
     let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
 
     let sin_claims = vec![EvalClaim {
@@ -236,18 +259,12 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
     (proof, reductions)
 }
 
-/// Verifier. Accepts the public `AuthInputs`; never reads
-/// `spend_secret`.
-///
-/// `inputs` is used in full here (unlike `verify_spine_killshot`) because
-/// `absorb_public_boundary` reads `expected_address` and `expected_auth_tag`
-/// from it to seed the Fiat-Shamir channel. Those fields are public; the
-/// private `spend_secret` is structurally absent from `AuthInputs` at the
-/// type level and is therefore never reachable by the verifier.
+/// Verifier. Accepts only the public fields; `spend_secret` is
+/// structurally excluded at the type level.
 pub fn verify_auth_killshot<T: FiatShamir<Block128>>(
     proof: &AuthProofKillShot,
     circuit: &AuthCircuit,
-    inputs: &AuthInputs,
+    inputs: &AuthPublicInputs,
     channel: &mut T,
 ) -> Option<AuthKillShotReductions> {
     if circuit.slots.len() != N_AUTH_LIVE_SLOTS {
@@ -319,7 +336,6 @@ pub fn discharge_auth_reductions_native(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::channel::Poseidon2bChannel;
     use noid_poseidon2b::primitives::{SpendSecret, TxBodyHash};
 
     fn fixture_inputs() -> AuthInputs {
@@ -361,12 +377,13 @@ mod tests {
     fn auth_killshot_round_trip_native_discharge() {
         let circuit = AuthCircuit::build();
         let inputs = fixture_inputs();
+        let public = inputs.to_public();
 
-        let mut ch_p = Poseidon2bChannel::new();
+        let mut ch_p = auth_gkr_channel();
         let (proof, reductions) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-        let mut ch_v = Poseidon2bChannel::new();
-        let v_red = verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v)
+        let mut ch_v = auth_gkr_channel();
+        let v_red = verify_auth_killshot(&proof, &circuit, &public, &mut ch_v)
             .expect("verifier accepts honest proof");
 
         assert_eq!(v_red, reductions);
@@ -377,51 +394,55 @@ mod tests {
     fn auth_killshot_rejects_tampered_state_at_r() {
         let circuit = AuthCircuit::build();
         let inputs = fixture_inputs();
+        let public = inputs.to_public();
 
-        let mut ch_p = Poseidon2bChannel::new();
+        let mut ch_p = auth_gkr_channel();
         let (mut proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
         proof.kill_shot.main.state_at_r += Block128::ONE;
 
-        let mut ch_v = Poseidon2bChannel::new();
-        assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+        let mut ch_v = auth_gkr_channel();
+        assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
     }
 
     #[test]
     fn auth_killshot_rejects_tampered_shift_claim() {
         let circuit = AuthCircuit::build();
         let inputs = fixture_inputs();
+        let public = inputs.to_public();
 
-        let mut ch_p = Poseidon2bChannel::new();
+        let mut ch_p = auth_gkr_channel();
         let (mut proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
         proof.kill_shot.shift.s_in_at_r2 += Block128::ONE;
 
-        let mut ch_v = Poseidon2bChannel::new();
-        assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+        let mut ch_v = auth_gkr_channel();
+        assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
     }
 
     #[test]
     fn auth_killshot_rejects_wrong_expected_address() {
         let circuit = AuthCircuit::build();
-        let mut inputs = fixture_inputs();
+        let inputs = fixture_inputs();
+        let mut public = inputs.to_public();
 
-        let mut ch_p = Poseidon2bChannel::new();
+        let mut ch_p = auth_gkr_channel();
         let (proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-        inputs.expected_address[0][0] += Block128::ONE;
-        let mut ch_v = Poseidon2bChannel::new();
-        assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+        public.expected_address[0][0] += Block128::ONE;
+        let mut ch_v = auth_gkr_channel();
+        assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
     }
 
     #[test]
     fn auth_killshot_rejects_tampered_state_batch() {
         let circuit = AuthCircuit::build();
         let inputs = fixture_inputs();
+        let public = inputs.to_public();
 
-        let mut ch_p = Poseidon2bChannel::new();
+        let mut ch_p = auth_gkr_channel();
         let (mut proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
         proof.state_batch.b_final += Block128::ONE;
 
-        let mut ch_v = Poseidon2bChannel::new();
-        assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+        let mut ch_v = auth_gkr_channel();
+        assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
     }
 }

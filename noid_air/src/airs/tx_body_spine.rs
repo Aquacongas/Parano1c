@@ -514,8 +514,7 @@ mod tests {
 
     fn empty_tx_body() -> TxBody {
         TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -535,9 +534,9 @@ mod tests {
     /// `noid_poseidon2b::primitives::hash_tx_body` on the absorb lanes
     /// carried in `pins`. Byte-identical with the GKR reconstruction.
     fn native_wrap_digest(pins: &TxBodyMerkleBoundaryPins) -> [Block128; 2] {
-        let mut prev_state_root = [0u8; 32];
-        prev_state_root[..16].copy_from_slice(&pins.prev_state_root[0].to_u128().to_le_bytes());
-        prev_state_root[16..].copy_from_slice(&pins.prev_state_root[1].to_u128().to_le_bytes());
+        let mut epoch_anchor = [0u8; 32];
+        epoch_anchor[..16].copy_from_slice(&pins.epoch_anchor[0].to_u128().to_le_bytes());
+        epoch_anchor[16..].copy_from_slice(&pins.epoch_anchor[1].to_u128().to_le_bytes());
 
         let fee_u128 = pins.fee_leaf[0].to_u128();
         let is_coinbase = pins.is_coinbase_leaf[0].to_u128() != 0;
@@ -558,7 +557,7 @@ mod tests {
         }
 
         let digest = native_hash_tx_body(
-            &prev_state_root,
+            &epoch_anchor,
             fee_u128,
             &input_leaves,
             &output_leaves,
@@ -792,8 +791,7 @@ mod tests {
         pins.tx_body_hash = native_wrap_digest(&pins);
 
         let body = TxBody {
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![
                 TxInput {

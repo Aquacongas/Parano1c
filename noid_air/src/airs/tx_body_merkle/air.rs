@@ -279,7 +279,7 @@ pub const TXBODY_MERKLE_O1_LEAF_NON_HEAD_ROW_0_OFFSET: usize = 3;
 pub struct TxBodyMerkleBoundaryPins {
     /// L0 of the tx-body Merkle tree, pinned into
     /// `pre_s[0..1] @ slot_base_row(28)`.
-    pub prev_state_root: [Block128; 2],
+    pub epoch_anchor: [Block128; 2],
     /// L1 of the tx-body Merkle tree. Injected as the constant term of
     /// the existing pos=0 PermB rate-absorb gate (instance 29).
     pub fee_leaf: [Block128; 2],
@@ -822,7 +822,7 @@ pub fn build_tx_body_merkle_trace_with_boundary_pins(
 ) -> Vec<Vec<Block128>> {
     let mut inputs_pinned = *inputs;
     for lane in 0..2usize {
-        inputs_pinned[BOUNDARY_INSTANCE_POS_0_PERM_A][lane] = pins.prev_state_root[lane];
+        inputs_pinned[BOUNDARY_INSTANCE_POS_0_PERM_A][lane] = pins.epoch_anchor[lane];
         inputs_pinned[BOUNDARY_INSTANCE_POS_7_PERM_A][lane] = pins.is_coinbase_leaf[lane];
     }
     let mut cols = build_tx_body_merkle_trace_inner(&inputs_pinned, Some(pins));
@@ -1025,7 +1025,7 @@ fn effective_perm_input(
 ///   future sub-step) — here we only collect the Perm-A left-child
 ///   echoes.
 ///
-/// Ties whose child is a non-AIR tree leaf (`prev_state_root`, `fee`,
+/// Ties whose child is a non-AIR tree leaf (`epoch_anchor`, `fee`,
 /// zero-pad) are skipped here — those will be pinned as public-column
 /// constants in 3d-0.9.H rather than echoed from another instance.
 ///
@@ -1400,7 +1400,7 @@ fn emit_tx_body_merkle_constraints_inner(
                 terms.push((echo_rc, Block128::ONE));
             }
             // O3.c: under boundary-pin construction, instance 29
-            // (pos=0 PermB, dead-pair parent of L0=prev_state_root and
+            // (pos=0 PermB, dead-pair parent of L0=epoch_anchor and
             // L1=fee_leaf) absorbs `fee_leaf[lane]` as the verifier-
             // known constant term. Every other CompressPermB keeps
             // constant = ZERO (live pairs already add echo_rc; the
@@ -1739,7 +1739,7 @@ pub fn emit_tx_body_merkle_boundary_pin_gates(
     let pin_base = *TXBODY_MERKLE_BOUNDARY_PIN_BASE;
     let total_rows = TXBODY_MERKLE_N_ROWS;
 
-    // O3.a — instance 28 pre_s[0..1] = prev_state_root.
+    // O3.a — instance 28 pre_s[0..1] = epoch_anchor.
     let m_28 = &layout[BOUNDARY_INSTANCE_POS_0_PERM_A];
     debug_assert!(matches!(
         m_28.role,
@@ -1752,7 +1752,7 @@ pub fn emit_tx_body_merkle_boundary_pin_gates(
             m_28.slot_base_row,
             total_rows,
             TXBODY_MERKLE_PRE_S_BASE + lane,
-            pins.prev_state_root[lane],
+            pins.epoch_anchor[lane],
         );
         out.push(gate);
     }
@@ -1919,7 +1919,7 @@ impl TxBodyMerkleAir {
 
     /// Stage 1 constructor — attach caller-supplied boundary pins for
     /// O2 (wrap output → `tx_body_hash`) and O3 (dead-pair level-1
-    /// compress heads → `prev_state_root` / `fee_leaf` / `ZERO`). See
+    /// compress heads → `epoch_anchor` / `fee_leaf` / `ZERO`). See
     /// `CRYPTO.md §Stage 1` for the soundness argument and the pinned
     /// cell inventory.
     pub fn new_with_boundary_pins(pins: TxBodyMerkleBoundaryPins) -> Self {

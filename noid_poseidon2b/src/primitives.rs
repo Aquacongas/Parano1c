@@ -216,7 +216,7 @@ pub fn is_coinbase_leaf(is_coinbase: bool) -> Digest {
 /// a single `TXBODY__` permutation. Layout:
 ///
 /// ```text
-/// L0         = prev_state_root
+/// L0         = epoch_anchor (fork-binding digest)
 /// L1         = fee_leaf(fee)
 /// L2..L5     = input_leaves[0..4]        // hash_input_leaf
 /// L6..L13    = output_leaves[0..8]       // hash_output_leaf
@@ -228,14 +228,14 @@ pub fn is_coinbase_leaf(is_coinbase: bool) -> Digest {
 /// zero digest for dummy slots so the shape is constant across every
 /// transaction.
 pub fn hash_tx_body(
-    prev_state_root: &Digest,
+    epoch_anchor: &Digest,
     fee: u128,
     input_leaves: &[Digest; TXBODY_INPUTS],
     output_leaves: &[Digest; TXBODY_OUTPUTS],
     is_coinbase: bool,
 ) -> TxBodyHash {
     let mut leaves: [Digest; TXBODY_LEAVES] = [[0u8; 32]; TXBODY_LEAVES];
-    leaves[0] = *prev_state_root;
+    leaves[0] = *epoch_anchor;
     leaves[1] = fee_leaf(fee);
     leaves[2..2 + TXBODY_INPUTS].copy_from_slice(input_leaves);
     leaves[2 + TXBODY_INPUTS..2 + TXBODY_INPUTS + TXBODY_OUTPUTS].copy_from_slice(output_leaves);

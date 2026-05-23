@@ -57,6 +57,9 @@ pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
 /// no-pad 4-field output-leaf construction cannot collide with the
 /// pad-flushed variable-length `hash_leaf` under the same IV.
 pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
+/// Claims commitment: Poseidon2b sponge over all claimed slot data
+/// (inputs + outputs). Bridges LogicProof to BlockStateBinding.
+pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
 
 #[cfg(test)]
 mod tests {
@@ -77,6 +80,7 @@ mod tests {
             TAG_DAWTNSS,
             TAG_FRISTATE,
             TAG_OUTLEAF,
+            TAG_CLAIMS,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

@@ -28,8 +28,11 @@ use crate::types::{TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 /// missing slots are filled with `TxInput::dummy` / `TxOutput::dummy`
 /// so the leaf tree is always depth-4. Every slot — including
 /// `valid=false` ones — is hashed into its leaf.
+///
+/// `epoch_anchor` occupies leaf L0 (replacing the former
+/// `prev_state_root`), providing fork-binding and natural TTL.
 pub fn hash_tx_body(
-    prev_state_root: &Digest,
+    epoch_anchor: &Digest,
     fee: u128,
     inputs: &[TxInput],
     outputs: &[TxOutput],
@@ -52,13 +55,7 @@ pub fn hash_tx_body(
         output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
     }
 
-    hash_tx_body_core(
-        prev_state_root,
-        fee,
-        &input_leaves,
-        &output_leaves,
-        is_coinbase,
-    )
+    hash_tx_body_core(epoch_anchor, fee, &input_leaves, &output_leaves, is_coinbase)
 }
 
 #[cfg(test)]
@@ -88,75 +85,68 @@ mod tests {
 
     #[test]
     fn determinism() {
-        let prev = [0xABu8; 32];
+        let anchor = [0xABu8; 32];
         let i = [mk_input(1)];
         let o = [mk_output(2), mk_output(3)];
         assert_eq!(
-            hash_tx_body(&prev, 5, &i, &o, false),
-            hash_tx_body(&prev, 5, &i, &o, false)
+            hash_tx_body(&anchor, 5, &i, &o, false),
+            hash_tx_body(&anchor, 5, &i, &o, false)
         );
     }
 
     #[test]
     fn output_value_flip_changes_body_hash() {
-        let prev = [0u8; 32];
+        let anchor = [0u8; 32];
         let o1 = mk_output(1);
         let mut o2 = o1;
         o2.value ^= 0xFF;
-        let h1 = hash_tx_body(&prev, 0, &[], &[o1], false);
-        let h2 = hash_tx_body(&prev, 0, &[], &[o2], false);
+        let h1 = hash_tx_body(&anchor, 0, &[], &[o1], false);
+        let h2 = hash_tx_body(&anchor, 0, &[], &[o2], false);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn output_slot_index_is_bound() {
-        // Stage E.1: body hash must bind the output slot_index so a
-        // forger can't reroute the minted output to a different state
-        // cell without changing tx_body_hash.
-        let prev = [0u8; 32];
+        let anchor = [0u8; 32];
         let o1 = mk_output(1);
         let mut o2 = o1;
         o2.slot_index ^= 0x33;
-        let h1 = hash_tx_body(&prev, 0, &[], &[o1], false);
-        let h2 = hash_tx_body(&prev, 0, &[], &[o2], false);
+        let h1 = hash_tx_body(&anchor, 0, &[], &[o1], false);
+        let h2 = hash_tx_body(&anchor, 0, &[], &[o2], false);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn input_slot_index_is_bound() {
-        // Body hash must bind the slot index, since the AIR checks
-        // state openings at that index.
-        let prev = [0u8; 32];
+        let anchor = [0u8; 32];
         let mut i1 = mk_input(1);
         let mut i2 = i1;
         i2.slot_index ^= 0x55;
         i1.valid = true;
-        let h1 = hash_tx_body(&prev, 0, &[i1], &[], false);
-        let h2 = hash_tx_body(&prev, 0, &[i2], &[], false);
+        let h1 = hash_tx_body(&anchor, 0, &[i1], &[], false);
+        let h2 = hash_tx_body(&anchor, 0, &[i2], &[], false);
         assert_ne!(h1, h2);
     }
 
     #[test]
     fn ordering_and_fee_sensitive() {
-        let prev = [0u8; 32];
+        let anchor = [0u8; 32];
         let i1 = mk_input(1);
         let i2 = mk_input(2);
-        let h_a = hash_tx_body(&prev, 10, &[i1, i2], &[], false);
-        let h_b = hash_tx_body(&prev, 10, &[i2, i1], &[], false);
-        let h_c = hash_tx_body(&prev, 11, &[i1, i2], &[], false);
+        let h_a = hash_tx_body(&anchor, 10, &[i1, i2], &[], false);
+        let h_b = hash_tx_body(&anchor, 10, &[i2, i1], &[], false);
+        let h_c = hash_tx_body(&anchor, 11, &[i1, i2], &[], false);
         assert_ne!(h_a, h_b);
         assert_ne!(h_a, h_c);
     }
 
     #[test]
     fn dummy_input_equals_zero_leaf() {
-        // A body with `valid=false` inputs must hash the same as a body
-        // missing those inputs outright.
-        let prev = [0u8; 32];
+        let anchor = [0u8; 32];
         let real = mk_input(1);
-        let h1 = hash_tx_body(&prev, 0, &[real], &[], false);
+        let h1 = hash_tx_body(&anchor, 0, &[real], &[], false);
         let h2 = hash_tx_body(
-            &prev,
+            &anchor,
             0,
             &[real, TxInput::dummy(), TxInput::dummy()],
             &[],
@@ -167,10 +157,18 @@ mod tests {
 
     #[test]
     fn is_coinbase_flips_hash() {
-        // E.5.f₂ adapter-level: is_coinbase must reach the core hash.
-        let prev = [0u8; 32];
-        let h0 = hash_tx_body(&prev, 0, &[], &[], false);
-        let h1 = hash_tx_body(&prev, 0, &[], &[], true);
+        let anchor = [0u8; 32];
+        let h0 = hash_tx_body(&anchor, 0, &[], &[], false);
+        let h1 = hash_tx_body(&anchor, 0, &[], &[], true);
         assert_ne!(h0, h1);
+    }
+
+    #[test]
+    fn epoch_anchor_flip_changes_body_hash() {
+        let a1 = [0x11u8; 32];
+        let a2 = [0x22u8; 32];
+        let h1 = hash_tx_body(&a1, 0, &[], &[], false);
+        let h2 = hash_tx_body(&a2, 0, &[], &[], false);
+        assert_ne!(h1, h2);
     }
 }

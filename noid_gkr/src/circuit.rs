@@ -53,12 +53,14 @@ pub struct SlotDescriptor {
 
 /// Per-transaction witness inputs the GKR boundary must carry. These
 /// are the values the STARK either already binds via public cells
-/// (leaf payloads, fee, prev_state_root, is_coinbase) or derives from
+/// (leaf payloads, fee, epoch_anchor, is_coinbase) or derives from
 /// deterministic structure (capacity IVs).
 #[derive(Debug, Clone)]
 pub struct SpineInputs {
-    /// `prev_state_root` as two field lanes (tree leaf L0).
-    pub prev_state_root: [Block128; 2],
+    /// `epoch_anchor` as two field lanes (tree leaf L0). Replaces the
+    /// former `prev_state_root` — provides fork-binding without state
+    /// coupling.
+    pub epoch_anchor: [Block128; 2],
     /// `fee_leaf(fee)` as two field lanes (tree leaf L1).
     pub fee_leaf: [Block128; 2],
     /// Four input-leaf payloads, each `[slot, value, owner_hi,

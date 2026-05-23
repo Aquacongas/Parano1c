@@ -43,7 +43,7 @@ fn mk_output(seed: u8) -> TxOutput {
 
 fn native_tx_body_hash_bytes(body: &TxBody) -> [u8; 32] {
     hash_tx_body(
-        &body.prev_state_root,
+        &body.epoch_anchor,
         body.fee,
         &body.inputs,
         &body.outputs,
@@ -73,8 +73,7 @@ fn assert_air_native_parity(body: &TxBody, label: &str) {
 #[test]
 fn empty_body_matches_native() {
     let body = TxBody {
-        prev_state_root: [0u8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0u8; 32],
         fee: 0,
         inputs: vec![],
         outputs: vec![],
@@ -86,8 +85,7 @@ fn empty_body_matches_native() {
 #[test]
 fn live_outputs_match_native() {
     let body = TxBody {
-        prev_state_root: [0x11u8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0x11u8; 32],
         fee: 42,
         inputs: vec![mk_input(7), mk_input(9)],
         outputs: vec![mk_output(1), mk_output(2), mk_output(3)],
@@ -99,8 +97,7 @@ fn live_outputs_match_native() {
 #[test]
 fn fully_populated_body_matches_native() {
     let body = TxBody {
-        prev_state_root: [0xABu8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0xABu8; 32],
         fee: 123_456_789,
         inputs: (0..4).map(|i| mk_input(10 + i)).collect(),
         outputs: (0..8).map(|j| mk_output(20 + j)).collect(),
@@ -112,8 +109,7 @@ fn fully_populated_body_matches_native() {
 #[test]
 fn dummy_outputs_match_native() {
     let body = TxBody {
-        prev_state_root: [0x55u8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0x55u8; 32],
         fee: 1,
         inputs: vec![mk_input(1)],
         outputs: vec![mk_output(2), TxOutput::dummy(), TxOutput::dummy()],
@@ -127,8 +123,7 @@ fn coinbase_body_matches_native() {
     // E.5.f₂: is_coinbase=true must flow through the AIR's L14 pin
     // and produce the same digest as the native hasher.
     let body = TxBody {
-        prev_state_root: [0x22u8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0x22u8; 32],
         fee: 0,
         inputs: vec![],
         outputs: vec![mk_output(9), mk_output(10)],
@@ -140,8 +135,7 @@ fn coinbase_body_matches_native() {
 #[test]
 fn coinbase_flag_flips_air_digest() {
     let body_regular = TxBody {
-        prev_state_root: [0x22u8; 32],
-        new_state_root: [0u8; 32],
+        epoch_anchor: [0x22u8; 32],
         fee: 0,
         inputs: vec![],
         outputs: vec![mk_output(9)],

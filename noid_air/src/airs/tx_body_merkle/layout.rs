@@ -132,7 +132,7 @@ impl InstanceRole {
 /// child via capacity IV absorb, right child via inter-perm XOR
 /// between Perm A and Perm B).
 ///
-/// For non-AIR tree leaves (L0 / L1 / L14 / L15 — `prev_state_root`,
+/// For non-AIR tree leaves (L0 / L1 / L14 / L15 — `epoch_anchor`,
 /// `fee_leaf`, zero-pad), `children` still references an instance id
 /// when such a child exists; for non-AIR children the caller pins the
 /// pre-MDS seed via `emit_public_cell` rather than an echo column.
@@ -144,7 +144,7 @@ pub struct InstanceMeta {
     pub is_head: bool,
     pub parent: Option<usize>,
     /// Optional left / right child instance ids. `None` inside a slot
-    /// means the child is a non-AIR leaf (`prev_state_root`, `fee`,
+    /// means the child is a non-AIR leaf (`epoch_anchor`, `fee`,
     /// zero-pad) and must be pinned via a verifier-known constant.
     pub children: Option<[Option<usize>; 2]>,
 }

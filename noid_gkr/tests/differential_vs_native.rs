@@ -64,7 +64,7 @@ fn make_full_inputs(
     is_coinbase: bool,
 ) -> SpineInputs {
     SpineInputs {
-        prev_state_root: digest_to_fields(prev),
+        epoch_anchor: digest_to_fields(prev),
         fee_leaf: digest_to_fields(&fee_leaf(fee)),
         input_leaves: [
             payload_to_lanes(inputs_leaf_payload[0]),

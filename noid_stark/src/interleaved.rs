@@ -504,6 +504,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         InterleavedCommitment,
         noid_fri_binius::InterleavedProverState,
     )>,
+    num_queries: usize,
 ) -> InterleavedStarkProof {
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
@@ -545,6 +546,7 @@ pub fn prove_air_interleaved<A: Air + ?Sized>(
         &ntt,
         &mut channel,
         &hasher,
+        num_queries,
     );
 
     InterleavedStarkProof {
@@ -569,6 +571,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
     proof: &InterleavedStarkProof,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
+    num_queries: usize,
 ) -> Result<(), VerifyError> {
     let n_air_cols = air.n_columns();
     let n_slices = slice_claims.len();
@@ -681,6 +684,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
         &ntt,
         &mut channel,
         &hasher,
+        num_queries,
     )
     .map_err(VerifyError::FriFailed)?;
 

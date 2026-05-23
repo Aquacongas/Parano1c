@@ -140,9 +140,34 @@ pub struct AuthSlotDescriptor {
     pub prev_output_src: Option<usize>,
 }
 
+/// Public-only subset of the auth boundary. Used by verifiers and block
+/// provers who must never see `spend_secret`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthPublicInputs {
+    /// `tx_body_hash = [hi, lo]`. Pinned on the STARK side via the spine bridge.
+    pub tx_body_hash: [Block128; 2],
+    /// Claimed `Address[i] = [hi, lo]`.
+    pub expected_address: [[Block128; 2]; N_AUTH_INPUTS],
+    /// Claimed `AuthTag[i] = [hi, lo]`.
+    pub expected_auth_tag: [[Block128; 2]; N_AUTH_INPUTS],
+}
+
+impl AuthPublicInputs {
+    pub fn zero() -> Self {
+        Self {
+            tx_body_hash: [Block128::ZERO; 2],
+            expected_address: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
+            expected_auth_tag: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
+        }
+    }
+}
+
 /// Per-transaction private + public witness inputs the GKR boundary
 /// carries. Public fields are the same cells the STARK's `PublicColumn`
 /// pins consume (landed in Step 1b); private fields are witness-only.
+///
+/// PRIVACY: This struct must NEVER leave the wallet. The block prover
+/// receives only `AuthPublicInputs` + a pre-built `AuthProofKillShot`.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthInputs {
     /// Per-input `SpendSecret = [secret_hi, secret_lo]`. **Private.**
@@ -159,6 +184,17 @@ pub struct AuthInputs {
 }
 
 impl AuthInputs {
+    /// Extract the public-only subset, discarding `spend_secret`.
+    pub fn to_public(&self) -> AuthPublicInputs {
+        AuthPublicInputs {
+            tx_body_hash: self.tx_body_hash,
+            expected_address: self.expected_address,
+            expected_auth_tag: self.expected_auth_tag,
+        }
+    }
+}
+
+impl AuthInputs {
     /// Zeroed fixture (every secret / claim lane is `Block128::ZERO`).
     /// Useful as a building block in tests; the oracle will override
     /// the `expected_*` fields by re-executing the sponge natively.
@@ -168,6 +204,16 @@ impl AuthInputs {
             tx_body_hash: [Block128::ZERO; 2],
             expected_address: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
             expected_auth_tag: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
+        }
+    }
+
+    /// Construct from public inputs + private secret.
+    pub fn from_parts(public: &AuthPublicInputs, spend_secret: [[Block128; 2]; N_AUTH_INPUTS]) -> Self {
+        Self {
+            spend_secret,
+            tx_body_hash: public.tx_body_hash,
+            expected_address: public.expected_address,
+            expected_auth_tag: public.expected_auth_tag,
         }
     }
 }

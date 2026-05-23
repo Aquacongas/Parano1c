@@ -15,7 +15,7 @@
 //! 3. Compact FRI proves: C(primary_point) = sum_k gamma^k * col_k(primary_point)
 //!    where C(x) = sum_k gamma^k * col_k(x) is multilinear
 //!
-//! Uses the compact FRI (TAU=8, 32 queries, batched Merkle paths) for ~28KB
+//! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
 use noid_core::mle::evaluate::evaluate_slice;
@@ -53,6 +53,7 @@ pub struct MixedOpeningProof {
 /// `primary_point`: the common opening point (r_pp from multipoint sumcheck)
 /// `secondary_claims`: additional claims at different points (absorbed for
 ///   transcript binding but proven via the outer multipoint sumcheck)
+/// `num_queries`: FRI query count (use `COMPACT_NUM_QUERIES` for full security)
 pub fn prove_mixed_opening(
     state: &InterleavedProverState,
     primary_point: &[Block128],
@@ -60,6 +61,7 @@ pub fn prove_mixed_opening(
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
+    num_queries: usize,
 ) -> MixedOpeningProof {
     let n_cols = state.n_cols;
     let log_n = state.log_rows;
@@ -105,8 +107,8 @@ pub fn prove_mixed_opening(
         })
         .collect();
 
-    // Step 5: Prove C(primary_point) via compact FRI (TAU=8, 32 queries, batched paths)
-    let fri_proof = compact_fri_prove(&c_evals, primary_point, ntt, channel, hasher);
+    // Step 5: Prove C(primary_point) via compact FRI
+    let fri_proof = compact_fri_prove(&c_evals, primary_point, ntt, channel, hasher, num_queries);
 
     MixedOpeningProof {
         all_openings,
@@ -123,6 +125,7 @@ pub fn verify_mixed_opening(
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
     hasher: &dyn CryptographicHasher,
+    num_queries: usize,
 ) -> Result<Vec<Block128>, String> {
     let n_cols = commitment.n_cols;
     let log_n = commitment.log_rows;
@@ -156,6 +159,7 @@ pub fn verify_mixed_opening(
         ntt,
         channel,
         hasher,
+        num_queries,
     )?;
 
     // Return primary openings (first n_cols entries)

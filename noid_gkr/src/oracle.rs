@@ -184,7 +184,7 @@ fn resolve_child_digest(
     // canonical layout (L0/L1 under pair 0; L14/L15 under pair 7).
     debug_assert_eq!(level, 1, "non-AIR child appeared outside level-1 compress");
     match (pos, is_left) {
-        (0, true) => inputs.prev_state_root,
+        (0, true) => inputs.epoch_anchor,
         (0, false) => inputs.fee_leaf,
         (7, true) => inputs.is_coinbase_leaf,
         (7, false) => inputs.pad_leaf,

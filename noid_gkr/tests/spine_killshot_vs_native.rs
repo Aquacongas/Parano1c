@@ -104,7 +104,7 @@ fn fixture(is_coinbase: bool) -> (SpineInputs, TxBodyHash) {
     let native = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase);
 
     let inputs = SpineInputs {
-        prev_state_root: digest_to_fields(&prev),
+        epoch_anchor: digest_to_fields(&prev),
         fee_leaf: digest_to_fields(&fee_leaf(fee)),
         input_leaves: [
             payload_to_lanes(inputs_payload[0]),

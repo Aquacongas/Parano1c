@@ -103,8 +103,6 @@ pub struct StateTransition {
 /// level (independent of balance / range, which the circuit checks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyError {
-    /// `body.prev_state_root` does not match the current chain state.
-    StaleState,
     /// `input.slot_index` or `output.slot_index` is outside the state
     /// vector.
     SlotOutOfRange,
@@ -123,12 +121,12 @@ pub enum ApplyError {
 /// Apply a `TxBody` to `state` in place, returning the post-transition
 /// root on success. Dummy slots (`valid = false`) are skipped entirely.
 ///
+/// State root validation (epoch_anchor freshness) happens at block level
+/// via BlockStateBinding — this function purely executes the UTXO
+/// state transition without checking anchors.
+///
 /// On `Err`, `state` is left untouched.
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
-    if body.prev_state_root != state.state_root() {
-        return Err(ApplyError::StaleState);
-    }
-
     let mut snapshot = state.clone();
 
     for input in &body.inputs {
@@ -261,10 +259,9 @@ mod tests {
         }
     }
 
-    fn body_with(prev: Digest, fee: u128, inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> TxBody {
+    fn body_with(fee: u128, inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> TxBody {
         TxBody {
-            prev_state_root: prev,
-            new_state_root: [0u8; 32],
+            epoch_anchor: [0u8; 32],
             fee,
             inputs,
             outputs,
@@ -283,8 +280,7 @@ mod tests {
     #[test]
     fn fresh_state_accepts_mint_only_body() {
         let mut state = fresh();
-        let prev = state.state_root();
-        let body = body_with(prev, 0, vec![], vec![mk_output(1), mk_output(2)]);
+        let body = body_with(0, vec![], vec![mk_output(1), mk_output(2)]);
         let out = apply_tx(&mut state, &body).expect("apply");
         assert_eq!(out.new_state_root, state.state_root());
         assert!(state.free_slots.is_empty());
@@ -293,30 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_prev_root_rejects() {
-        let mut state = fresh();
-        let body = body_with([0xFFu8; 32], 0, vec![], vec![mk_output(1)]);
-        assert_eq!(apply_tx(&mut state, &body), Err(ApplyError::StaleState));
-        assert!(state.free_slots.is_empty());
-        assert_eq!(state.active_slot_count, 0);
-        assert_eq!(state.alloc_counter, 0);
-    }
-
-    #[test]
     fn spend_known_utxo_then_double_spend_rejects() {
         let mut state = fresh();
-        let prev = state.state_root();
         let out = mk_output(7);
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![out])).unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![out])).unwrap();
         let slot = find_slot(&state, &out);
 
-        let prev = state.state_root();
         let input = mk_input_for(slot, &out);
-        apply_tx(&mut state, &body_with(prev, 0, vec![input], vec![])).expect("first spend");
+        apply_tx(&mut state, &body_with(0, vec![input], vec![])).expect("first spend");
 
-        let prev = state.state_root();
         assert_eq!(
-            apply_tx(&mut state, &body_with(prev, 0, vec![input], vec![])),
+            apply_tx(&mut state, &body_with(0, vec![input], vec![])),
             Err(ApplyError::UnknownOrSpentInput)
         );
     }
@@ -324,10 +307,8 @@ mod tests {
     #[test]
     fn dummy_slots_ignored() {
         let mut state = fresh();
-        let prev = state.state_root();
         let valid_out = mk_output(1);
         let body = body_with(
-            prev,
             0,
             vec![TxInput::dummy()],
             vec![valid_out, TxOutput::dummy()],
@@ -340,11 +321,10 @@ mod tests {
     #[test]
     fn post_root_flows_into_next_tx() {
         let mut state = fresh();
-        let prev = state.state_root();
-        let body1 = body_with(prev, 0, vec![], vec![mk_output(1)]);
+        let body1 = body_with(0, vec![], vec![mk_output(1)]);
         let st1 = apply_tx(&mut state, &body1).expect("apply 1");
 
-        let body2 = body_with(st1.new_state_root, 0, vec![], vec![mk_output(2)]);
+        let body2 = body_with(0, vec![], vec![mk_output(2)]);
         let st2 = apply_tx(&mut state, &body2).expect("apply 2");
         assert_ne!(st1.new_state_root, st2.new_state_root);
     }
@@ -352,14 +332,14 @@ mod tests {
     #[test]
     fn err_leaves_state_untouched() {
         let mut state = fresh();
-        let prev = state.state_root();
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![mk_output(1)])).unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![mk_output(1)])).unwrap();
         let snap_root = state.state_root();
         let snap_active = state.active_slot_count;
         let snap_counter = state.alloc_counter;
         let snap_free = state.free_slots.len();
 
-        let bad = body_with([0u8; 32], 0, vec![], vec![mk_output(2)]);
+        // Try to mint into the same slot (already occupied) — must fail.
+        let bad = body_with(0, vec![], vec![mk_output(1)]);
         assert!(apply_tx(&mut state, &bad).is_err());
         assert_eq!(state.state_root(), snap_root);
         assert_eq!(state.active_slot_count, snap_active);
@@ -374,24 +354,21 @@ mod tests {
         // in a later mint.
         let mut state = fresh();
 
-        let prev = state.state_root();
         let a = mk_output_at(7, 1);
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![a])).unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![a])).unwrap();
         assert_eq!(state.active_slot_count, 1);
 
-        let prev = state.state_root();
         apply_tx(
             &mut state,
-            &body_with(prev, 0, vec![mk_input_for(7, &a)], vec![]),
+            &body_with(0, vec![mk_input_for(7, &a)], vec![]),
         )
         .unwrap();
         assert_eq!(state.active_slot_count, 0);
         assert_eq!(state.free_slots.len(), 1);
 
         // Wallet reuses slot 7.
-        let prev = state.state_root();
         let c = mk_output_at(7, 3);
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![c])).unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![c])).unwrap();
         assert_eq!(state.active_slot_count, 1);
         // Free-list entry for slot 7 consumed by the mint.
         assert!(state.free_slots.is_empty());
@@ -400,20 +377,18 @@ mod tests {
     #[test]
     fn mint_to_occupied_slot_rejects() {
         let mut state = fresh();
-        let prev = state.state_root();
         // First mint lands at slot 1.
         apply_tx(
             &mut state,
-            &body_with(prev, 0, vec![], vec![mk_output_at(1, 1)]),
+            &body_with(0, vec![], vec![mk_output_at(1, 1)]),
         )
         .unwrap();
 
         // Second mint targeting the same slot must reject.
-        let prev = state.state_root();
         assert_eq!(
             apply_tx(
                 &mut state,
-                &body_with(prev, 0, vec![], vec![mk_output_at(1, 2)]),
+                &body_with(0, vec![], vec![mk_output_at(1, 2)]),
             ),
             Err(ApplyError::OutputSlotNotEmpty),
         );
@@ -421,14 +396,13 @@ mod tests {
 
     #[test]
     fn mint_to_out_of_range_slot_rejects() {
-        // Depth 1 state: valid slots ∈ {0,1}. Targeting slot 2 must
+        // Depth 1 state: valid slots in {0,1}. Targeting slot 2 must
         // reject with `SlotOutOfRange`.
         let mut state = ChainState::with_log_slots(1);
-        let prev = state.state_root();
         assert_eq!(
             apply_tx(
                 &mut state,
-                &body_with(prev, 0, vec![], vec![mk_output_at(2, 3)]),
+                &body_with(0, vec![], vec![mk_output_at(2, 3)]),
             ),
             Err(ApplyError::SlotOutOfRange),
         );
@@ -437,13 +411,12 @@ mod tests {
     #[test]
     fn duplicate_output_slot_in_tx_rejects() {
         let mut state = fresh();
-        let prev = state.state_root();
         // Two outputs targeting the same slot within one tx must fail
         // before any write hits the state.
         let a = mk_output_at(5, 1);
         let b = mk_output_at(5, 2);
         assert_eq!(
-            apply_tx(&mut state, &body_with(prev, 0, vec![], vec![a, b])),
+            apply_tx(&mut state, &body_with(0, vec![], vec![a, b])),
             Err(ApplyError::DuplicateOutputSlot),
         );
         assert_eq!(state.active_slot_count, 0);
@@ -459,11 +432,8 @@ mod tests {
         for seed in 1u8..6 {
             let o = mk_output(seed);
 
-            let prev1 = s1.state_root();
-            apply_tx(&mut s1, &body_with(prev1, 0, vec![], vec![o])).unwrap();
-
-            let prev2 = s2.state_root();
-            apply_tx(&mut s2, &body_with(prev2, 0, vec![], vec![o])).unwrap();
+            apply_tx(&mut s1, &body_with(0, vec![], vec![o])).unwrap();
+            apply_tx(&mut s2, &body_with(0, vec![], vec![o])).unwrap();
         }
 
         assert_eq!(s1.state_root(), s2.state_root());
@@ -473,16 +443,14 @@ mod tests {
     #[test]
     fn input_with_wrong_owner_rejects() {
         let mut state = fresh();
-        let prev = state.state_root();
         let real = mk_output(5);
-        apply_tx(&mut state, &body_with(prev, 0, vec![], vec![real])).unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![real])).unwrap();
 
         let slot = find_slot(&state, &real);
-        let prev = state.state_root();
         let mut bogus = mk_input_for(slot, &real);
         bogus.owner = Address([0xDE; 32]);
         assert_eq!(
-            apply_tx(&mut state, &body_with(prev, 0, vec![bogus], vec![])),
+            apply_tx(&mut state, &body_with(0, vec![bogus], vec![])),
             Err(ApplyError::UnknownOrSpentInput)
         );
     }

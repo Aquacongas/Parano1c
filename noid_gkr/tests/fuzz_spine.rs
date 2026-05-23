@@ -4,7 +4,7 @@
 //! Stage G5 fuzz — topology-preserving random inputs compared
 //! native vs GKR oracle.
 //!
-//! Each iteration rolls fresh: prev_state_root, fee, is_coinbase, 4
+//! Each iteration rolls fresh: epoch_anchor, fee, is_coinbase, 4
 //! input leaves (slot/value/owner), 8 output leaves (slot/value/owner).
 //! The GKR oracle re-executes the 59-slot spine via the native
 //! Poseidon2b implementation; we assert byte-equality against
@@ -136,7 +136,7 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
         let native: TxBodyHash = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase);
 
         let inputs = SpineInputs {
-            prev_state_root: digest_to_fields(&prev),
+            epoch_anchor: digest_to_fields(&prev),
             fee_leaf: digest_to_fields(&fee_leaf(fee)),
             input_leaves: input_leaves_payload,
             output_leaves: output_leaves_payload,

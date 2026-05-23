@@ -5,10 +5,10 @@
 //! proofs into block headers.
 //!
 //! A `Block` is a header plus an ordered list of transactions. Applying
-//! a block runs `apply_tx` sequentially with root chaining: each tx's
-//! `prev_state_root` must equal the previous tx's `new_state_root`. The
-//! block header's `state_root` must equal the final post-root and
-//! `tx_root` must equal the Merkle reduction over the transactions'
+//! a block runs `apply_tx` sequentially. Per-tx state-root chaining is
+//! obsolete; block-level state validation ensures `header.state_root`
+//! matches the final computed post-root after all txs are applied, and
+//! `tx_root` equals the Merkle reduction over the transactions'
 //! `tx_body_hash`es (COMPRESS domain, zero-padded to a power of two).
 
 use noid_poseidon2b::native::compress;
@@ -43,8 +43,6 @@ pub struct Block {
 pub enum BlockApplyError {
     /// A transaction failed the native state transition.
     Tx(ApplyError),
-    /// `tx.body.prev_state_root` does not match the running chain root.
-    UnchainedPrevRoot,
     /// Block carries more transactions than the hard wire/DoS cap.
     TooManyTransactions,
     /// Header does not bind a non-zero proof transcript digest.
@@ -53,8 +51,6 @@ pub enum BlockApplyError {
     MissingWitnessRoot,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
     WrongTxBodyHash,
-    /// `tx.body.new_state_root` disagrees with what `apply_tx` computed.
-    WrongNewStateRoot,
     /// `header.state_root` disagrees with the post-apply chain root.
     HeaderStateRootMismatch,
     /// `header.tx_root` disagrees with the computed tx-root.
@@ -89,12 +85,8 @@ pub fn apply_block(
     };
 
     for tx in &block.transactions {
-        if tx.body.prev_state_root != snap.state_root() {
-            return Err(BlockApplyError::UnchainedPrevRoot);
-        }
-
         let expected_hash = hash_tx_body(
-            &tx.body.prev_state_root,
+            &tx.body.epoch_anchor,
             tx.body.fee,
             &tx.body.inputs,
             &tx.body.outputs,
@@ -105,9 +97,6 @@ pub fn apply_block(
         }
 
         let st = apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
-        if tx.body.new_state_root != st.new_state_root {
-            return Err(BlockApplyError::WrongNewStateRoot);
-        }
         last = st;
     }
 
@@ -271,18 +260,16 @@ mod tests {
         outputs: Vec<TxOutput>,
     ) -> Transaction {
         let mut probe = state.clone();
-        let mut body = TxBody {
-            prev_state_root: state.state_root(),
-            new_state_root: [0u8; 32],
+        let body = TxBody {
+            epoch_anchor: [0u8; 32],
             fee: 0,
             inputs,
             outputs,
             is_coinbase: false,
         };
-        let st = apply_tx(&mut probe, &body).expect("probe apply");
-        body.new_state_root = st.new_state_root;
+        apply_tx(&mut probe, &body).expect("probe apply");
         let tbh = hash_tx_body(
-            &body.prev_state_root,
+            &body.epoch_anchor,
             body.fee,
             &body.inputs,
             &body.outputs,
@@ -398,15 +385,25 @@ mod tests {
     }
 
     #[test]
-    fn apply_block_rejects_broken_chain() {
+    fn apply_block_accepts_independent_txs() {
+        // Two txs that both use the same epoch_anchor (not chained by
+        // state root) are valid as long as they don't conflict at the
+        // UTXO level.
         let mut state = fresh_state();
         let tx1 = build_tx(&mut state.clone(), vec![], vec![mk_output(1)]);
-        // Second tx also uses the pre-tx1 root — not chained.
         let tx2 = build_tx(&mut state.clone(), vec![], vec![mk_output(2)]);
         let txs = vec![tx1, tx2];
+
+        // Compute the actual final state root by replaying.
+        let mut dry = state.clone();
+        for tx in &txs {
+            apply_tx(&mut dry, &tx.body).unwrap();
+        }
+        let final_root = dry.state_root();
+
         let header = BlockHeader {
             prev_block_hash: [0u8; 32],
-            state_root: [0u8; 32],
+            state_root: final_root,
             tx_root: compute_tx_root(&txs),
             timestamp: 1,
             height: 1,
@@ -420,10 +417,7 @@ mod tests {
             header,
             transactions: txs,
         };
-        assert_eq!(
-            apply_block(&mut state, &block),
-            Err(BlockApplyError::UnchainedPrevRoot)
-        );
+        apply_block(&mut state, &block).expect("apply");
     }
 
     #[test]

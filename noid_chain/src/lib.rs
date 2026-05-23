@@ -19,7 +19,9 @@ pub mod block;
 pub mod block_header;
 pub mod da;
 pub mod fri_state;
+pub mod nullifier;
 pub mod state;
+pub mod state_binding;
 pub mod wire;
 
 pub use fri_state::{
@@ -37,5 +39,7 @@ pub use block::{
     BLOCK_VERSION,
 };
 pub use block_header::{hash_block_header, BlockHeader};
+pub use nullifier::NullifierSet;
 pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
+pub use state_binding::{BlockStateBinding, StateBindingError, TxStateOpening};
 pub use wire::BLOCK_HEADER_WIRE_SIZE;

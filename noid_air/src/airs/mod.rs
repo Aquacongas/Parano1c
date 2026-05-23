@@ -6,6 +6,7 @@
 
 pub mod balance_gate;
 pub mod bit_adder;
+pub mod block_state_binding;
 pub mod carry_ripple;
 pub mod fri_state_combiner;
 pub mod fri_state_combiner_composite;
@@ -20,6 +21,11 @@ pub mod tx_body_merkle_boundary;
 pub mod tx_body_spine;
 pub mod tx_validity;
 
+pub use block_state_binding::{
+    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
+    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
+    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
+};
 pub use balance_gate::{
     build_balance_columns, build_balance_trace_parts, emit_balance_constraints,
     emit_balance_selector_public_columns, emit_balance_value_public_columns, BalanceBridgeBitsGate,

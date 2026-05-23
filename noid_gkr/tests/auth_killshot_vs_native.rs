@@ -16,10 +16,10 @@
 
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    build_auth_unified_from_inputs, compute_auth_boundary, discharge_auth_reductions_native,
-    prove_auth_killshot, verify_auth_killshot, AuthCircuit, AuthInputs, N_AUTH_INPUTS,
+    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary,
+    discharge_auth_reductions_native, prove_auth_killshot, verify_auth_killshot, AuthCircuit,
+    AuthInputs, N_AUTH_INPUTS,
 };
-use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::primitives::{SpendSecret, TxBodyHash};
 
 fn digest_to_fields(d: &[u8; 32]) -> [Block128; 2] {
@@ -66,7 +66,7 @@ fn auth_killshot_reductions_consistent_with_native_mle() {
     let circuit = AuthCircuit::build();
     let inputs = build_inputs(0x11);
 
-    let mut ch = Poseidon2bChannel::new();
+    let mut ch = auth_gkr_channel();
     let (_proof, reductions) = prove_auth_killshot(&circuit, &inputs, &mut ch);
 
     assert!(discharge_auth_reductions_native(
@@ -94,12 +94,13 @@ fn auth_killshot_reductions_consistent_with_native_mle() {
 fn auth_killshot_prover_and_verifier_agree_on_reductions() {
     let circuit = AuthCircuit::build();
     let inputs = build_inputs(0x22);
+    let public = inputs.to_public();
 
-    let mut ch_p = Poseidon2bChannel::new();
+    let mut ch_p = auth_gkr_channel();
     let (proof, prover_red) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-    let mut ch_v = Poseidon2bChannel::new();
-    let verifier_red = verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).expect("verify");
+    let mut ch_v = auth_gkr_channel();
+    let verifier_red = verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).expect("verify");
 
     assert_eq!(prover_red, verifier_red);
 }
@@ -107,41 +108,44 @@ fn auth_killshot_prover_and_verifier_agree_on_reductions() {
 #[test]
 fn auth_killshot_rejects_address_tamper_after_proof() {
     let circuit = AuthCircuit::build();
-    let mut inputs = build_inputs(0x33);
+    let inputs = build_inputs(0x33);
 
-    let mut ch_p = Poseidon2bChannel::new();
+    let mut ch_p = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-    inputs.expected_address[1][0] += Block128::ONE;
+    let mut public = inputs.to_public();
+    public.expected_address[1][0] += Block128::ONE;
 
-    let mut ch_v = Poseidon2bChannel::new();
-    assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+    let mut ch_v = auth_gkr_channel();
+    assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
 }
 
 #[test]
 fn auth_killshot_rejects_auth_tag_tamper_after_proof() {
     let circuit = AuthCircuit::build();
-    let mut inputs = build_inputs(0x44);
+    let inputs = build_inputs(0x44);
 
-    let mut ch_p = Poseidon2bChannel::new();
+    let mut ch_p = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-    inputs.expected_auth_tag[3][1] += Block128::ONE;
+    let mut public = inputs.to_public();
+    public.expected_auth_tag[3][1] += Block128::ONE;
 
-    let mut ch_v = Poseidon2bChannel::new();
-    assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+    let mut ch_v = auth_gkr_channel();
+    assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
 }
 
 #[test]
 fn auth_killshot_rejects_tx_body_hash_tamper_after_proof() {
     let circuit = AuthCircuit::build();
-    let mut inputs = build_inputs(0x55);
+    let inputs = build_inputs(0x55);
 
-    let mut ch_p = Poseidon2bChannel::new();
+    let mut ch_p = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &inputs, &mut ch_p);
 
-    inputs.tx_body_hash[0] += Block128::ONE;
+    let mut public = inputs.to_public();
+    public.tx_body_hash[0] += Block128::ONE;
 
-    let mut ch_v = Poseidon2bChannel::new();
-    assert!(verify_auth_killshot(&proof, &circuit, &inputs, &mut ch_v).is_none());
+    let mut ch_v = auth_gkr_channel();
+    assert!(verify_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());
 }

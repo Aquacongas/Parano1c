@@ -37,6 +37,11 @@ pub mod composition;
 pub mod gates;
 
 pub use airs::{
+    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
+    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
+    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
+};
+pub use airs::{
     apply_mds_row, bit_adder_is_input_programme, bit_adder_is_reset_programme,
     bit_adder_operand_programme, build_balance_columns, build_instance_layout, build_perm_trace,
     build_sbox_x7_columns, build_tx_body_merkle_trace,

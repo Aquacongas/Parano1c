@@ -92,12 +92,14 @@ impl TxOutput {
     }
 }
 
-/// Canonical transaction body. Covers exactly the fields bound by the
-/// body hash plus the state-root pair exposed as public inputs.
+/// Canonical transaction body. Covers the fields bound by the body
+/// hash. State roots are NOT part of per-tx data (they live at block
+/// level in BlockStateBinding).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxBody {
-    pub prev_state_root: Digest,
-    pub new_state_root: Digest,
+    /// Hash of block header at `height - ANCHOR_DEPTH`. Provides
+    /// anti-replay across forks and natural TTL (~6 minutes).
+    pub epoch_anchor: Digest,
     pub fee: u128,
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
@@ -107,11 +109,11 @@ pub struct TxBody {
     /// `fee == 0 ∧ n_live_inputs == 0`. Chain-layer policy enforces
     /// `coinbase_credit == block_reward(height) + Σ fees`; engine only
     /// proves per-tx arithmetic.
-    ///
-    /// Absorbed into `tx_body_hash` via the L14 tx-body Merkle slot
-    /// (previously zero-pad) starting at Stage E.5.f₂.
     pub is_coinbase: bool,
 }
+
+/// Depth of the epoch anchor window in blocks.
+pub const ANCHOR_DEPTH: u64 = 6;
 
 impl TxBody {
     /// Number of real spend inputs (`valid = true`).

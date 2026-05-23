@@ -11,16 +11,21 @@
 #![allow(clippy::needless_range_loop)]
 
 use noid_air::composition::tx_validity_with_spine::fixture;
-use noid_block::{prove_block, verify_block, TxBlockWitness, VerifyBlockError};
+use noid_block::{prove_block, verify_block, TxBlockWitness};
 use noid_core::{Block128, TowerField};
-use noid_gkr::{compute_auth_boundary, AuthCircuit, AuthInputs, SpineInputs, N_AUTH_INPUTS};
+use noid_core::mle::split::split_mle_into_slices;
+use noid_gkr::{
+    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
+    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
+    N_AUTH_UNIFIED_VARS,
+};
 
 fn spine_inputs_from_composite(
     comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
 ) -> SpineInputs {
     let pins = comp.boundary_pins();
     SpineInputs {
-        prev_state_root: pins.prev_state_root,
+        epoch_anchor: pins.epoch_anchor,
         fee_leaf: pins.fee_leaf,
         input_leaves: pins.input_leaf_absorb,
         output_leaves: pins.output_leaf_absorb,
@@ -29,9 +34,11 @@ fn spine_inputs_from_composite(
     }
 }
 
-fn auth_inputs_for_composite(
+/// Simulates what the wallet does: generates auth proof locally with secrets,
+/// then returns only public data + proof + slices (no secrets leak).
+fn wallet_auth_for_composite(
     comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
-) -> AuthInputs {
+) -> (AuthPublicInputs, AuthProofKillShot, Vec<Vec<Block128>>) {
     use fixture::mk_secret;
     let circuit = AuthCircuit::build();
     let pi = comp.public_inputs();
@@ -48,12 +55,23 @@ fn auth_inputs_for_composite(
     }
     let tx_body_hash = comp.tx_body_hash_fields();
     let (addr, tag) = compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
-    AuthInputs {
+    let auth_inputs = AuthInputs {
         spend_secret,
         tx_body_hash,
         expected_address: addr,
         expected_auth_tag: tag,
-    }
+    };
+
+    // Wallet generates auth proof locally (uses spend_secret internally).
+    let mut ch = auth_gkr_channel();
+    let (proof, _reductions) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
+
+    // Wallet builds auth MLE slices (needs secret for MLE construction).
+    let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
+    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+
+    // Only public data + proof + slices leave the wallet.
+    (auth_inputs.to_public(), proof, auth_slices)
 }
 
 #[test]
@@ -63,18 +81,20 @@ fn block_one_tx_roundtrip() {
     let trace = comp.build_trace();
     let pi = comp.public_inputs();
     let spine_inputs = spine_inputs_from_composite(&comp);
-    let auth_inputs = auth_inputs_for_composite(&comp);
+    let (auth_public, auth_proof, auth_slices) = wallet_auth_for_composite(&comp);
 
     let witness = TxBlockWitness {
         air: comp.air(),
         trace: &trace,
         pi: &pi,
         spine_inputs: &spine_inputs,
-        auth_inputs: &auth_inputs,
+        auth_public: &auth_public,
+        auth_proof: &auth_proof,
+        auth_slices: &auth_slices,
     };
 
-    let prev_state_root = pi.prev_state_root;
-    let proof = prove_block(prev_state_root, std::slice::from_ref(&witness))
+    let prev_state_root = pi.epoch_anchor;
+    let proof = prove_block(prev_state_root, std::slice::from_ref(&witness), None)
         .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
@@ -82,81 +102,52 @@ fn block_one_tx_roundtrip() {
     assert_eq!(proof.tx_pis.len(), 1);
     assert_eq!(proof.tx_algebraic.len(), 1);
 
+    let air_ref: &dyn noid_air::Air = comp.air();
     verify_block(
-        comp.air(),
+        &[air_ref],
         &proof,
         std::slice::from_ref(&spine_inputs),
-        std::slice::from_ref(&auth_inputs),
+        std::slice::from_ref(&auth_public),
+        None,
     )
     .expect("verify_block must succeed on an honest block proof");
 }
 
 #[test]
 #[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
-fn block_rejects_tampered_state_continuity() {
+fn block_verify_rejects_tampered_epoch_anchor() {
     let comp = fixture::build_honest_realistic();
     let trace = comp.build_trace();
     let pi = comp.public_inputs();
     let spine_inputs = spine_inputs_from_composite(&comp);
-    let auth_inputs = auth_inputs_for_composite(&comp);
+    let (auth_public, auth_proof, auth_slices) = wallet_auth_for_composite(&comp);
 
     let witness = TxBlockWitness {
         air: comp.air(),
         trace: &trace,
         pi: &pi,
         spine_inputs: &spine_inputs,
-        auth_inputs: &auth_inputs,
+        auth_public: &auth_public,
+        auth_proof: &auth_proof,
+        auth_slices: &auth_slices,
     };
 
-    // Wrong prev_block_state_root: prove_block must reject up-front.
-    let mut wrong_prev = pi.prev_state_root;
-    wrong_prev[0] ^= 0xFF;
-    let result = prove_block(wrong_prev, std::slice::from_ref(&witness));
-    assert!(
-        matches!(
-            result,
-            Err(noid_block::ProveBlockError::TxContinuityViolation(0))
-        ),
-        "prove_block must reject mismatched prev_block_state_root, got {:?}",
-        result.as_ref().map(|_| "ok").unwrap_or("err")
-    );
-}
-
-#[test]
-#[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
-fn block_verify_rejects_tampered_pi_continuity() {
-    let comp = fixture::build_honest_realistic();
-    let trace = comp.build_trace();
-    let pi = comp.public_inputs();
-    let spine_inputs = spine_inputs_from_composite(&comp);
-    let auth_inputs = auth_inputs_for_composite(&comp);
-
-    let witness = TxBlockWitness {
-        air: comp.air(),
-        trace: &trace,
-        pi: &pi,
-        spine_inputs: &spine_inputs,
-        auth_inputs: &auth_inputs,
-    };
-
-    let prev_state_root = pi.prev_state_root;
-    let mut proof = prove_block(prev_state_root, std::slice::from_ref(&witness))
+    let prev_block_state_root = pi.epoch_anchor;
+    let mut proof = prove_block(prev_block_state_root, std::slice::from_ref(&witness), None)
         .expect("honest prove_block must succeed");
 
-    // Tamper with the first tx's prev_state_root in the public inputs:
-    // the verifier's state-continuity check must reject before the
-    // algebraic STARK replay even starts.
-    proof.tx_pis[0].prev_state_root[0] ^= 0x01;
+    proof.tx_pis[0].epoch_anchor[0] ^= 0x01;
 
+    let air_ref: &dyn noid_air::Air = comp.air();
     let result = verify_block(
-        comp.air(),
+        &[air_ref],
         &proof,
         std::slice::from_ref(&spine_inputs),
-        std::slice::from_ref(&auth_inputs),
+        std::slice::from_ref(&auth_public),
+        None,
     );
     assert!(
-        matches!(result, Err(VerifyBlockError::ContinuityViolation(0))),
-        "verify_block must reject tampered continuity, got {:?}",
-        result
+        result.is_err(),
+        "verify_block must reject tampered epoch_anchor, got Ok(())"
     );
 }

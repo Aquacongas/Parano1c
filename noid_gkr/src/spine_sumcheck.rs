@@ -97,7 +97,7 @@ mod unit {
         use crate::oracle::evaluate_spine;
         let circuit = SpineCircuit::build();
         let inputs = SpineInputs {
-            prev_state_root: [Block128::from(11u128), Block128::from(22u128)],
+            epoch_anchor: [Block128::from(11u128), Block128::from(22u128)],
             fee_leaf: [Block128::from(33u128), Block128::from(44u128)],
             input_leaves: [[Block128::from(1u128); 4]; 4],
             output_leaves: [[Block128::from(2u128); 4]; 8],

@@ -36,7 +36,7 @@
 //! const-offset gate in 4c.2), and the same FRI commitments yield the
 //! 32-byte sub-roots pinned here as absorb-block public inputs to
 //! `FriStateCombinerAir`. The composite just exposes both digests so
-//! the outer stitch can wire them to `PublicInputs.{prev,new}_state_root`.
+//! the outer stitch can wire them to `PublicInputs.{epoch_anchor,claims_commitment}`.
 
 use crate::airs::fri_state_combiner::{
     build_combiner_side_trace, emit_fri_state_combiner, FriStateCombinerPreimage,
@@ -139,7 +139,7 @@ impl Constraint for ShiftedColumnsConstraint {
 /// Two-side Poseidon2b meta-root combiner: one sponge run for `prev`,
 /// one for `new`, stacked into a single AIR. Each side binds its
 /// `log_slots + 3 × 32-byte sub-roots` preimage to the declared
-/// `expected_*_state_root_fields` via the sub-AIR's internal absorb
+/// `expected_*_fields` via the sub-AIR's internal absorb
 /// pins + digest pin.
 pub struct FriStateCombinerComposite {
     constraints: Vec<Box<dyn Constraint>>,
@@ -147,16 +147,16 @@ pub struct FriStateCombinerComposite {
     prev_preimage: FriStateCombinerPreimage,
     new_preimage: FriStateCombinerPreimage,
     // Stage 6 — expected digests exposed for the single PI surface.
-    expected_prev_state_root: [Block128; 2],
-    expected_new_state_root: [Block128; 2],
+    expected_epoch_anchor: [Block128; 2],
+    expected_claims_commitment: [Block128; 2],
 }
 
 impl FriStateCombinerComposite {
     pub fn new(
         prev_preimage: FriStateCombinerPreimage,
-        expected_prev_state_root_fields: [Block128; 2],
+        expected_epoch_anchor_fields: [Block128; 2],
         new_preimage: FriStateCombinerPreimage,
-        expected_new_state_root_fields: [Block128; 2],
+        expected_claims_commitment_fields: [Block128; 2],
     ) -> Self {
         let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
         let mut public_columns: Vec<PublicColumn> = Vec::new();
@@ -165,12 +165,12 @@ impl FriStateCombinerComposite {
             (
                 COMBINER_COMPOSITE_PREV_OFFSET,
                 &prev_preimage,
-                expected_prev_state_root_fields,
+                expected_epoch_anchor_fields,
             ),
             (
                 COMBINER_COMPOSITE_NEW_OFFSET,
                 &new_preimage,
-                expected_new_state_root_fields,
+                expected_claims_commitment_fields,
             ),
         ] {
             let (side_constraints, side_publics) = emit_fri_state_combiner(preimage, expected);
@@ -217,21 +217,21 @@ impl FriStateCombinerComposite {
             public_columns,
             prev_preimage,
             new_preimage,
-            expected_prev_state_root: expected_prev_state_root_fields,
-            expected_new_state_root: expected_new_state_root_fields,
+            expected_epoch_anchor: expected_epoch_anchor_fields,
+            expected_claims_commitment: expected_claims_commitment_fields,
         }
     }
 
-    /// Stage 6 — expected `prev_state_root` as the two-block pair
+    /// Stage 6 — expected `epoch_anchor` as the two-block pair
     /// pinned into the prev-side combiner.
-    pub fn expected_prev_state_root_fields(&self) -> [Block128; 2] {
-        self.expected_prev_state_root
+    pub fn expected_epoch_anchor_fields(&self) -> [Block128; 2] {
+        self.expected_epoch_anchor
     }
 
-    /// Stage 6 — expected `new_state_root` as the two-block pair
+    /// Stage 6 — expected `claims_commitment` as the two-block pair
     /// pinned into the new-side combiner.
-    pub fn expected_new_state_root_fields(&self) -> [Block128; 2] {
-        self.expected_new_state_root
+    pub fn expected_claims_commitment_fields(&self) -> [Block128; 2] {
+        self.expected_claims_commitment
     }
 
     /// Build an honest composite trace. Prev-side columns occupy
