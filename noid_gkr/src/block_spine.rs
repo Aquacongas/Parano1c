@@ -1,0 +1,1393 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid.
+
+//! Unified Block SpineGKR — single Kill-Shot over N*59 slots.
+//!
+//! Instead of N independent per-tx SpineGKR proofs (each 5 KB, each
+//! requiring a separate sumcheck replay at verification), this module
+//! packs all N transactions' 59-slot spines into a single dynamically-
+//! sized MLE and runs one unified Kill-Shot.
+//!
+//! Result: proof size and verification cost grow logarithmically (not
+//! linearly) in N. For N=1024 txs, this saves ~5.5 MB of spine proofs
+//! and reduces verifier time from 25s to ~35ms.
+//!
+//! # Layout
+//!
+//! The bit layout mirrors the per-tx `SpineUnifiedMle` but with more
+//! slot bits:
+//!
+//! ```text
+//!   elem:2 | round:7 | slot:S
+//! ```
+//!
+//! where `S = ceil(log2(N * 59))` (padded to next power of two).
+//!
+//! The constraints (C1, C1', C2) are identical per-slot — the same
+//! Poseidon2b round structure applies regardless of which transaction
+//! owns the slot.
+
+use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128};
+use noid_core::mle::eq::{eq_ind, eq_ind_partial_eval};
+use noid_core::mle::evaluate::evaluate_slice;
+use noid_core::packed::pow7::pow7_block128;
+use noid_core::transcript::FiatShamir;
+use noid_core::{Block128, TowerField};
+use noid_poseidon2b::native::permutation::{
+    F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
+};
+
+use crate::batch_eval::{
+    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
+};
+use crate::layers::evaluate_permutation;
+use crate::spine_mle::{sigma_at, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS};
+use crate::spine_sumcheck::N_SPINE_SLOTS;
+use noid_core::sumcheck::RoundPolynomial;
+
+const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
+const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
+const ROUND_LIMIT: usize = 1 << ROUND_BITS; // 128
+
+/// Per-variable degree of the unified block sumcheck (same as per-tx).
+pub const BLOCK_SPINE_ROUND_DEGREE: usize = 9;
+
+/// Compute the number of slot variables needed for `total_live_slots`.
+fn slot_vars_for(total_live_slots: usize) -> usize {
+    assert!(total_live_slots > 0);
+    let bits = (usize::BITS - (total_live_slots - 1).leading_zeros()) as usize;
+    bits.max(1)
+}
+
+/// Total number of MLE variables for a given number of live slots.
+fn num_vars_for(total_live_slots: usize) -> usize {
+    slot_vars_for(total_live_slots) + ROUND_BITS + ELEM_BITS
+}
+
+/// Pack (slot, round, elem) into the dynamic-width index.
+#[inline]
+fn pack_index_dyn(slot: usize, round: usize, elem: usize) -> usize {
+    (slot << (ROUND_BITS + ELEM_BITS)) | (round << ELEM_BITS) | elem
+}
+
+/// Extract round from a dynamic-width index.
+#[inline]
+fn round_of_dyn(idx: usize) -> usize {
+    (idx >> ELEM_BITS) & ((1 << ROUND_BITS) - 1)
+}
+
+/// Extract slot from a dynamic-width index given slot_vars.
+#[inline]
+fn slot_of_dyn(idx: usize) -> usize {
+    idx >> (ROUND_BITS + ELEM_BITS)
+}
+
+/// Extract elem from a dynamic-width index.
+#[inline]
+fn elem_of_dyn(idx: usize) -> usize {
+    idx & ((1 << ELEM_BITS) - 1)
+}
+
+/// Decrement the round component by 1 (mod 128) in a dynamic-width index.
+#[inline]
+fn dec_round_dyn(idx: usize) -> usize {
+    let round = round_of_dyn(idx);
+    let prev = (round + ROUND_LIMIT - 1) & (ROUND_LIMIT - 1);
+    let round_mask = ((1 << ROUND_BITS) - 1) << ELEM_BITS;
+    (idx & !round_mask) | (prev << ELEM_BITS)
+}
+
+/// Dynamically-sized unified MLE for the block spine.
+#[derive(Debug, Clone)]
+pub struct BlockSpineMle {
+    pub s_in: Vec<Block128>,
+    pub s_out: Vec<Block128>,
+    pub sigma: Vec<Block128>,
+    pub state: Vec<Block128>,
+    pub num_vars: usize,
+    pub live_slots: usize,
+}
+
+impl BlockSpineMle {
+    /// Build the unified block MLE from N transactions' slot state_in vectors.
+    /// Each transaction contributes exactly `N_SPINE_SLOTS` (59) slots.
+    pub fn build(
+        n_instances: usize,
+        slot_state_ins: &[[Block128; STATE_SIZE]],
+    ) -> Self {
+        let total_live = n_instances * N_SPINE_SLOTS;
+        assert_eq!(slot_state_ins.len(), total_live);
+        let num_vars = num_vars_for(total_live);
+        let n_cells = 1usize << num_vars;
+
+        let mut mle = BlockSpineMle {
+            s_in: vec![Block128::ZERO; n_cells],
+            s_out: vec![Block128::ZERO; n_cells],
+            sigma: vec![Block128::ZERO; n_cells],
+            state: vec![Block128::ZERO; n_cells],
+            num_vars,
+            live_slots: total_live,
+        };
+
+        for (slot, state_in) in slot_state_ins.iter().enumerate() {
+            let witness = evaluate_permutation(*state_in);
+            mle.populate_slot(slot, &witness);
+        }
+        mle
+    }
+
+
+    fn populate_slot(&mut self, slot: usize, witness: &crate::layers::PermLayerWitness) {
+        for r in 0..N_ROUNDS {
+            let active_mask = match witness.kind[r] {
+                crate::layers::RoundKind::Full => [true; STATE_SIZE],
+                crate::layers::RoundKind::Partial => {
+                    let mut m = [false; STATE_SIZE];
+                    m[0] = true;
+                    m
+                }
+            };
+            for elem in 0..STATE_SIZE {
+                let idx = pack_index_dyn(slot, r, elem);
+                self.s_in[idx] = witness.sin[r][elem];
+                self.s_out[idx] = witness.sout[r][elem];
+                self.sigma[idx] = if active_mask[elem] {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                };
+            }
+        }
+        debug_assert_eq!(witness.state.len(), N_ROUNDS + 1);
+        for r in 0..=N_ROUNDS {
+            for elem in 0..STATE_SIZE {
+                let idx = pack_index_dyn(slot, r, elem);
+                self.state[idx] = witness.state[r][elem];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public schedule tables (dynamic size)
+// ---------------------------------------------------------------------------
+
+fn build_mu_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot in 0..live_slots {
+        for round in 0..N_ROUNDS {
+            for elem in 0..STATE_SIZE {
+                tab[pack_index_dyn(slot, round, elem)] = Block128::ONE;
+            }
+        }
+    }
+    tab
+}
+
+fn build_sigma_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot in 0..live_slots {
+        for round in 0..N_ROUNDS {
+            for elem in 0..STATE_SIZE {
+                tab[pack_index_dyn(slot, round, elem)] = sigma_at(round, elem);
+            }
+        }
+    }
+    tab
+}
+
+fn build_rc_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot in 0..live_slots {
+        for round in 0..N_ROUNDS {
+            let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
+            for elem in 0..STATE_SIZE {
+                if is_partial && elem != 0 {
+                    continue;
+                }
+                tab[pack_index_dyn(slot, round, elem)] =
+                    Block128::from(ROUND_CONSTANTS[elem][round]);
+            }
+        }
+    }
+    tab
+}
+
+fn mds_coeff_dyn(round: usize, i: usize, j: usize) -> Block128 {
+    let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
+    let raw = if is_partial {
+        MDS_PARTIAL[i][j]
+    } else {
+        MDS_FULL[i][j]
+    };
+    Block128::from(raw)
+}
+
+fn build_mds_lane_table_dyn(lane: usize, live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    let mut out = vec![Block128::ZERO; n_cells];
+    for y in 0..n_cells {
+        let slot = slot_of_dyn(y);
+        if slot >= live_slots {
+            continue;
+        }
+        let dec_round = round_of_dyn(dec_round_dyn(y));
+        if dec_round >= N_ROUNDS {
+            continue;
+        }
+        let elem = elem_of_dyn(y);
+        out[y] = mds_coeff_dyn(dec_round, elem, lane);
+    }
+    out
+}
+
+fn permute_by_dec_dyn(src: &[Block128]) -> Vec<Block128> {
+    let n = src.len();
+    let mut out = vec![Block128::ZERO; n];
+    for y in 0..n {
+        out[y] = src[dec_round_dyn(y)];
+    }
+    out
+}
+
+fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
+    let n = src.len();
+    let elem_mask = (1 << ELEM_BITS) - 1;
+    let mut out = vec![Block128::ZERO; n];
+    for y in 0..n {
+        let row_base = y & !elem_mask;
+        out[y] = src[row_base | lane];
+    }
+    out
+}
+
+fn build_u_table_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    let eq_tab = eq_ind_partial_eval::<Block128>(rho);
+    let mu_tab = build_mu_table_dyn(live_slots, n_cells);
+    let mut out = vec![Block128::ZERO; n_cells];
+    for y in 0..n_cells {
+        let x = dec_round_dyn(y);
+        out[y] = eq_tab[x] * mu_tab[x];
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Unified sumcheck (dynamic-size variant)
+// ---------------------------------------------------------------------------
+
+/// Output of the block-level unified spine sumcheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineUnifiedProof {
+    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub s_in_dec_at_r: Block128,
+    pub s_out_dec_at_r: Block128,
+    pub state_dec_at_r: Block128,
+    pub state_at_r: Block128,
+    pub s_out_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub state_lane_dec_at_r: [Block128; STATE_SIZE],
+}
+
+/// Verifier reduction from the block spine unified sumcheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineUnifiedReduction {
+    pub r_prime: Vec<Block128>,
+    pub s_in_dec_at_r: Block128,
+    pub s_out_dec_at_r: Block128,
+    pub state_dec_at_r: Block128,
+    pub state_at_r: Block128,
+    pub s_out_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub state_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub beta: Block128,
+    pub gamma: Block128,
+}
+
+/// Internal table bundle for the block-level sumcheck (flat basis for hw acceleration).
+struct BlockUnifiedFlatTables {
+    u: Vec<u128>,
+    sigma_dec: Vec<u128>,
+    rc_dec: Vec<u128>,
+    mds_lane_dec: [Vec<u128>; STATE_SIZE],
+    sigma_lane_dec: [Vec<u128>; STATE_SIZE],
+    s_in_dec: Vec<u128>,
+    s_out_dec: Vec<u128>,
+    state_dec: Vec<u128>,
+    state: Vec<u128>,
+    s_out_lane_dec: [Vec<u128>; STATE_SIZE],
+    state_lane_dec: [Vec<u128>; STATE_SIZE],
+}
+
+#[inline]
+fn vec_to_flat(v: &[Block128]) -> Vec<u128> {
+    v.iter().map(|b| tower_to_flat_u128(b.to_u128())).collect()
+}
+
+fn build_block_unified_flat_tables(
+    mle: &BlockSpineMle,
+    rho: &[Block128],
+) -> BlockUnifiedFlatTables {
+    let n_cells = 1 << mle.num_vars;
+    let live = mle.live_slots;
+    let sigma_full = build_sigma_table_dyn(live, n_cells);
+    let sigma_dec = permute_by_dec_dyn(&sigma_full);
+    let rc_dec = permute_by_dec_dyn(&build_rc_table_dyn(live, n_cells));
+    let s_in_dec = permute_by_dec_dyn(&mle.s_in);
+    let s_out_dec = permute_by_dec_dyn(&mle.s_out);
+    let state_dec = permute_by_dec_dyn(&mle.state);
+
+    let mds_lane_dec: [Vec<Block128>; STATE_SIZE] =
+        std::array::from_fn(|j| build_mds_lane_table_dyn(j, live, n_cells));
+    let sigma_lane_dec: [Vec<Block128>; STATE_SIZE] =
+        std::array::from_fn(|j| project_lane_dyn(&sigma_dec, j));
+    let s_out_lane_dec: [Vec<Block128>; STATE_SIZE] =
+        std::array::from_fn(|j| project_lane_dyn(&s_out_dec, j));
+    let state_lane_dec: [Vec<Block128>; STATE_SIZE] =
+        std::array::from_fn(|j| project_lane_dyn(&state_dec, j));
+
+    BlockUnifiedFlatTables {
+        u: vec_to_flat(&build_u_table_dyn(rho, live, n_cells)),
+        sigma_dec: vec_to_flat(&sigma_dec),
+        rc_dec: vec_to_flat(&rc_dec),
+        mds_lane_dec: mds_lane_dec.map(|v| vec_to_flat(&v)),
+        sigma_lane_dec: sigma_lane_dec.map(|v| vec_to_flat(&v)),
+        s_in_dec: vec_to_flat(&s_in_dec),
+        s_out_dec: vec_to_flat(&s_out_dec),
+        state_dec: vec_to_flat(&state_dec),
+        state: vec_to_flat(&mle.state),
+        s_out_lane_dec: s_out_lane_dec.map(|v| vec_to_flat(&v)),
+        state_lane_dec: state_lane_dec.map(|v| vec_to_flat(&v)),
+    }
+}
+
+#[inline(always)]
+fn fold_flat_inplace(evals: &mut Vec<u128>, r_flat: u128) {
+    let half = evals.len() / 2;
+    for j in 0..half {
+        let delta = evals[j] ^ evals[j + half];
+        evals[j] ^= clmul_gcm(r_flat, delta);
+    }
+    evals.truncate(half);
+}
+
+impl BlockUnifiedFlatTables {
+    fn fold(&mut self, r_flat: u128) {
+        fold_flat_inplace(&mut self.u, r_flat);
+        fold_flat_inplace(&mut self.sigma_dec, r_flat);
+        fold_flat_inplace(&mut self.rc_dec, r_flat);
+        fold_flat_inplace(&mut self.s_in_dec, r_flat);
+        fold_flat_inplace(&mut self.s_out_dec, r_flat);
+        fold_flat_inplace(&mut self.state_dec, r_flat);
+        fold_flat_inplace(&mut self.state, r_flat);
+        for j in 0..STATE_SIZE {
+            fold_flat_inplace(&mut self.mds_lane_dec[j], r_flat);
+            fold_flat_inplace(&mut self.sigma_lane_dec[j], r_flat);
+            fold_flat_inplace(&mut self.s_out_lane_dec[j], r_flat);
+            fold_flat_inplace(&mut self.state_lane_dec[j], r_flat);
+        }
+    }
+
+    fn final_claims_tower(&self) -> BlockFinalClaims {
+        debug_assert_eq!(self.u.len(), 1);
+        let f = |x: u128| Block128::from(flat_to_tower_u128(x));
+        BlockFinalClaims {
+            s_in_dec: f(self.s_in_dec[0]),
+            s_out_dec: f(self.s_out_dec[0]),
+            state_dec: f(self.state_dec[0]),
+            state: f(self.state[0]),
+            s_out_lane_dec: std::array::from_fn(|j| f(self.s_out_lane_dec[j][0])),
+            state_lane_dec: std::array::from_fn(|j| f(self.state_lane_dec[j][0])),
+        }
+    }
+}
+
+struct BlockFinalClaims {
+    s_in_dec: Block128,
+    s_out_dec: Block128,
+    state_dec: Block128,
+    state: Block128,
+    s_out_lane_dec: [Block128; STATE_SIZE],
+    state_lane_dec: [Block128; STATE_SIZE],
+}
+
+// ---------------------------------------------------------------------------
+// Flat-basis monomial helpers (same as spine_unified.rs)
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn poly_mul_t<const NA: usize, const NB: usize, const NR: usize>(
+    a: &[u128; NA],
+    b: &[u128; NB],
+) -> [u128; NR] {
+    debug_assert_eq!(NR, NA + NB - 1);
+    let mut out = [0u128; NR];
+    for i in 0..NA {
+        for j in 0..NB {
+            out[i + j] ^= clmul_gcm(a[i], b[j]);
+        }
+    }
+    out
+}
+
+#[inline(always)]
+fn poly_scalar_mul_t<const N: usize>(p: &[u128; N], s: u128) -> [u128; N] {
+    let mut out = [0u128; N];
+    for k in 0..N {
+        out[k] = clmul_gcm(s, p[k]);
+    }
+    out
+}
+
+#[inline(always)]
+fn pow7_poly_t(a: u128, b: u128) -> [u128; 8] {
+    let a2 = square_flat_u128(a);
+    let a3 = clmul_gcm(a2, a);
+    let a4 = square_flat_u128(a2);
+    let a5 = clmul_gcm(a4, a);
+    let a6 = clmul_gcm(a4, a2);
+    let a7 = clmul_gcm(a4, a3);
+
+    let b2 = square_flat_u128(b);
+    let b3 = clmul_gcm(b2, b);
+    let b4 = square_flat_u128(b2);
+    let b5 = clmul_gcm(b4, b);
+    let b6 = clmul_gcm(b4, b2);
+    let b7 = clmul_gcm(b4, b3);
+
+    [
+        a7,
+        clmul_gcm(a6, b),
+        clmul_gcm(a5, b2),
+        clmul_gcm(a4, b3),
+        clmul_gcm(a3, b4),
+        clmul_gcm(a2, b5),
+        clmul_gcm(a, b6),
+        b7,
+    ]
+}
+
+/// Flat-basis monomial-form round polynomial for the block spine.
+fn compute_block_round_polynomial_flat(
+    tabs: &BlockUnifiedFlatTables,
+    beta_flat: u128,
+    gamma_flat: u128,
+) -> RoundPolynomial<Block128> {
+    let half = tabs.u.len() / 2;
+    let mut acc = [0u128; BLOCK_SPINE_ROUND_DEGREE + 1];
+    const ONE_FLAT: u128 = 1u128;
+
+    for i in 0..half {
+        let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
+        let sg_p: [u128; 2] = [tabs.sigma_dec[i], tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half]];
+        let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
+        let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
+        let so_p: [u128; 2] = [tabs.s_out_dec[i], tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half]];
+        let st_p: [u128; 2] = [tabs.state_dec[i], tabs.state_dec[i] ^ tabs.state_dec[i + half]];
+        let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+
+        // Q1(t) = sg(t) * si(t)^7 + so(t) + si(t) + sg(t) * si(t)
+        let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
+        let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
+        let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
+        let mut q1_p = [0u128; 9];
+        q1_p.copy_from_slice(&sg_si7_p);
+        q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
+        q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
+        q1_p[2] ^= sg_si_p[2];
+
+        // Q1'(t) = sg(t) * (si(t) + st_dec(t) + rc(t))
+        let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
+        let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
+
+        // Q2(t) = st_main(t) + sum_j m_j(t) * pi_j(t)
+        let mut q2_p = [0u128; 4];
+        q2_p[0] ^= stmain_p[0];
+        q2_p[1] ^= stmain_p[1];
+        for j in 0..STATE_SIZE {
+            let m_p: [u128; 2] = [
+                tabs.mds_lane_dec[j][i],
+                tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+            ];
+            let sgl_p: [u128; 2] = [
+                tabs.sigma_lane_dec[j][i],
+                tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+            ];
+            let sol_p: [u128; 2] = [
+                tabs.s_out_lane_dec[j][i],
+                tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+            ];
+            let stl_p: [u128; 2] = [
+                tabs.state_lane_dec[j][i],
+                tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
+            ];
+            let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
+            let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
+            let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
+            let pi_p: [u128; 3] = [
+                sgl_sol_p[0] ^ onep_stl_p[0],
+                sgl_sol_p[1] ^ onep_stl_p[1],
+                sgl_sol_p[2] ^ onep_stl_p[2],
+            ];
+            let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+            for k in 0..4 {
+                q2_p[k] ^= m_pi_p[k];
+            }
+        }
+
+        // q(t) = Q1(t) + beta * Q1'(t) + gamma * Q2(t)
+        let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
+        let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
+        let mut q_p = [0u128; 9];
+        q_p.copy_from_slice(&q1_p);
+        for k in 0..3 {
+            q_p[k] ^= beta_q1p_p[k];
+        }
+        for k in 0..4 {
+            q_p[k] ^= gamma_q2_p[k];
+        }
+
+        // F_i(t) = u(t) * q(t) -> deg-9
+        let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
+        for k in 0..=BLOCK_SPINE_ROUND_DEGREE {
+            acc[k] ^= f_p[k];
+        }
+    }
+
+    let coeffs_tower: Vec<Block128> = acc
+        .iter()
+        .map(|&c| Block128::from(flat_to_tower_u128(c)))
+        .collect();
+    RoundPolynomial::from_coeffs(coeffs_tower)
+}
+
+/// Prove the unified block spine sumcheck (flat-basis hot path).
+pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
+    mle: &BlockSpineMle,
+    channel: &mut T,
+) -> (BlockSpineUnifiedProof, Vec<Block128>) {
+    let num_vars = mle.num_vars;
+
+    let rho: Vec<Block128> = (0..num_vars).map(|_| channel.squeeze()).collect();
+    let beta = channel.squeeze();
+    let gamma = channel.squeeze();
+
+    let mut tabs = build_block_unified_flat_tables(mle, &rho);
+    let beta_flat = tower_to_flat_u128(beta.to_u128());
+    let gamma_flat = tower_to_flat_u128(gamma.to_u128());
+
+    let mut round_polys = Vec::with_capacity(num_vars);
+    let mut r_prime = vec![Block128::ZERO; num_vars];
+
+    for round in 0..num_vars {
+        let poly = compute_block_round_polynomial_flat(&tabs, beta_flat, gamma_flat);
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
+        let challenge_flat = tower_to_flat_u128(challenge.to_u128());
+        tabs.fold(challenge_flat);
+        r_prime[num_vars - 1 - round] = challenge;
+        round_polys.push(poly);
+    }
+
+    let claims = tabs.final_claims_tower();
+
+    channel.absorb(claims.s_in_dec);
+    channel.absorb(claims.s_out_dec);
+    channel.absorb(claims.state_dec);
+    channel.absorb(claims.state);
+    for v in &claims.s_out_lane_dec {
+        channel.absorb(*v);
+    }
+    for v in &claims.state_lane_dec {
+        channel.absorb(*v);
+    }
+
+    let proof = BlockSpineUnifiedProof {
+        round_polys,
+        s_in_dec_at_r: claims.s_in_dec,
+        s_out_dec_at_r: claims.s_out_dec,
+        state_dec_at_r: claims.state_dec,
+        state_at_r: claims.state,
+        s_out_lane_dec_at_r: claims.s_out_lane_dec,
+        state_lane_dec_at_r: claims.state_lane_dec,
+    };
+    (proof, r_prime)
+}
+
+/// Verify the unified block spine sumcheck.
+pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
+    proof: &BlockSpineUnifiedProof,
+    num_vars: usize,
+    live_slots: usize,
+    channel: &mut T,
+) -> Option<BlockSpineUnifiedReduction> {
+    if proof.round_polys.len() != num_vars {
+        return None;
+    }
+    for p in &proof.round_polys {
+        if p.degree() > BLOCK_SPINE_ROUND_DEGREE {
+            return None;
+        }
+    }
+
+    let rho: Vec<Block128> = (0..num_vars).map(|_| channel.squeeze()).collect();
+    let beta = channel.squeeze();
+    let gamma = channel.squeeze();
+
+    let mut expected = Block128::ZERO;
+    let mut r_prime = vec![Block128::ZERO; num_vars];
+
+    for (round, poly) in proof.round_polys.iter().enumerate() {
+        let s = poly.evaluate(Block128::ZERO) + poly.evaluate(Block128::ONE);
+        if s != expected {
+            return None;
+        }
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
+        expected = poly.evaluate(challenge);
+        r_prime[num_vars - 1 - round] = challenge;
+    }
+
+    // Recompute public schedules at r'.
+    let n_cells = 1 << num_vars;
+    let u_at_r = evaluate_slice(&build_u_table_dyn(&rho, live_slots, n_cells), &r_prime);
+    let sigma_dec_full = permute_by_dec_dyn(&build_sigma_table_dyn(live_slots, n_cells));
+    let sigma_dec_at_r = evaluate_slice(&sigma_dec_full, &r_prime);
+    let rc_dec_at_r = evaluate_slice(
+        &permute_by_dec_dyn(&build_rc_table_dyn(live_slots, n_cells)),
+        &r_prime,
+    );
+    let mut mds_lane_at_r = [Block128::ZERO; STATE_SIZE];
+    let mut sigma_lane_at_r = [Block128::ZERO; STATE_SIZE];
+    for j in 0..STATE_SIZE {
+        mds_lane_at_r[j] = evaluate_slice(
+            &build_mds_lane_table_dyn(j, live_slots, n_cells),
+            &r_prime,
+        );
+        sigma_lane_at_r[j] = evaluate_slice(&project_lane_dyn(&sigma_dec_full, j), &r_prime);
+    }
+
+    // Reassemble constraint at r'.
+    let q_c1 = sigma_dec_at_r * pow7_block128(proof.s_in_dec_at_r)
+        + proof.s_out_dec_at_r
+        + proof.s_in_dec_at_r
+        + sigma_dec_at_r * proof.s_in_dec_at_r;
+    let q_c1p = sigma_dec_at_r * (proof.s_in_dec_at_r + proof.state_dec_at_r + rc_dec_at_r);
+    let mut c2_sum = proof.state_at_r;
+    for j in 0..STATE_SIZE {
+        let pi_j = sigma_lane_at_r[j] * proof.s_out_lane_dec_at_r[j]
+            + (Block128::ONE + sigma_lane_at_r[j]) * proof.state_lane_dec_at_r[j];
+        c2_sum += mds_lane_at_r[j] * pi_j;
+    }
+    let q_at_r = q_c1 + beta * q_c1p + gamma * c2_sum;
+
+    if expected != u_at_r * q_at_r {
+        return None;
+    }
+
+    channel.absorb(proof.s_in_dec_at_r);
+    channel.absorb(proof.s_out_dec_at_r);
+    channel.absorb(proof.state_dec_at_r);
+    channel.absorb(proof.state_at_r);
+    for v in &proof.s_out_lane_dec_at_r {
+        channel.absorb(*v);
+    }
+    for v in &proof.state_lane_dec_at_r {
+        channel.absorb(*v);
+    }
+
+    Some(BlockSpineUnifiedReduction {
+        r_prime,
+        s_in_dec_at_r: proof.s_in_dec_at_r,
+        s_out_dec_at_r: proof.s_out_dec_at_r,
+        state_dec_at_r: proof.state_dec_at_r,
+        state_at_r: proof.state_at_r,
+        s_out_lane_dec_at_r: proof.s_out_lane_dec_at_r,
+        state_lane_dec_at_r: proof.state_lane_dec_at_r,
+        beta,
+        gamma,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Shift gadget (dynamic-size variant)
+// ---------------------------------------------------------------------------
+
+/// Shift gadget degree.
+pub const BLOCK_SPINE_SHIFT_DEGREE: usize = 2;
+
+/// Shift proof for the block spine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineShiftProof {
+    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub s_in_at_r2: Block128,
+    pub s_out_at_r2: Block128,
+    pub state_at_r2: Block128,
+}
+
+/// Shift reduction output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineShiftReduction {
+    pub r_double_prime: Vec<Block128>,
+    pub s_in_at_r2: Block128,
+    pub s_out_at_r2: Block128,
+    pub state_at_r2: Block128,
+}
+
+/// Combined Kill-Shot proof for block spine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineKillShotProof {
+    pub main: BlockSpineUnifiedProof,
+    pub shift: BlockSpineShiftProof,
+}
+
+struct BlockCombinedWeights {
+    w_sin: Vec<Block128>,
+    w_sout: Vec<Block128>,
+    w_state: Vec<Block128>,
+}
+
+struct BlockWeightsAtPoint {
+    w_sin: Block128,
+    w_sout: Block128,
+    w_state: Block128,
+}
+
+fn build_block_combined_weights(
+    r_prime: &[Block128],
+    delta: Block128,
+    num_vars: usize,
+) -> BlockCombinedWeights {
+    let n_cells = 1usize << num_vars;
+    let slot_vars = num_vars - ROUND_BITS - ELEM_BITS;
+
+    let rp_elem = &r_prime[0..ELEM_BITS];
+    let rp_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let rp_slot = &r_prime[ELEM_BITS + ROUND_BITS..num_vars];
+
+    let eq_slot_tab = eq_ind_partial_eval::<Block128>(rp_slot);
+    let eq_elem_tab = eq_ind_partial_eval::<Block128>(rp_elem);
+
+    let n_slots = 1usize << slot_vars;
+    let n_rounds = 1usize << ROUND_BITS;
+    let n_elems = 1usize << ELEM_BITS;
+
+    let eq_round_tab = eq_ind_partial_eval::<Block128>(rp_round);
+    let mut eq_round_at_inc = vec![Block128::ZERO; n_rounds];
+    for round_x in 0..n_rounds {
+        let inc = (round_x + 1) & (n_rounds - 1);
+        eq_round_at_inc[round_x] = eq_round_tab[inc];
+    }
+
+    let mut w_dec = vec![Block128::ZERO; n_cells];
+    let mut w_lane: [Vec<Block128>; STATE_SIZE] =
+        std::array::from_fn(|_| vec![Block128::ZERO; n_cells]);
+
+    for slot in 0..n_slots {
+        let es = eq_slot_tab[slot];
+        for round_x in 0..n_rounds {
+            let er = eq_round_at_inc[round_x];
+            let es_er = es * er;
+            for elem in 0..n_elems {
+                let idx = pack_index_dyn(slot, round_x, elem);
+                let ee = eq_elem_tab[elem];
+                w_dec[idx] = es_er * ee;
+                w_lane[elem][idx] = es_er;
+            }
+        }
+    }
+
+    let d0 = Block128::ONE;
+    let d1 = delta;
+    let d2 = d1 * delta;
+    let d3 = d2 * delta;
+    let d4 = d3 * delta;
+    let d5 = d4 * delta;
+    let d6 = d5 * delta;
+    let d7 = d6 * delta;
+    let d8 = d7 * delta;
+    let d9 = d8 * delta;
+    let d10 = d9 * delta;
+
+    let lane_sout = [d3, d4, d5, d6];
+    let lane_state = [d7, d8, d9, d10];
+
+    let mut w_sin = vec![Block128::ZERO; n_cells];
+    let mut w_sout = vec![Block128::ZERO; n_cells];
+    let mut w_state = vec![Block128::ZERO; n_cells];
+
+    for x in 0..n_cells {
+        let dec = w_dec[x];
+        w_sin[x] = d0 * dec;
+        w_sout[x] = d1 * dec;
+        w_state[x] = d2 * dec;
+        let elem = elem_of_dyn(x);
+        w_sout[x] += lane_sout[elem] * w_lane[elem][x];
+        w_state[x] += lane_state[elem] * w_lane[elem][x];
+    }
+
+    BlockCombinedWeights { w_sin, w_sout, w_state }
+}
+
+fn block_combined_target(red: &BlockSpineUnifiedReduction, delta: Block128) -> Block128 {
+    let d0 = Block128::ONE;
+    let d1 = delta;
+    let d2 = d1 * delta;
+    let mut acc = d0 * red.s_in_dec_at_r + d1 * red.s_out_dec_at_r + d2 * red.state_dec_at_r;
+    let mut p = d2 * delta;
+    for j in 0..STATE_SIZE {
+        acc += p * red.s_out_lane_dec_at_r[j];
+        p *= delta;
+    }
+    for j in 0..STATE_SIZE {
+        acc += p * red.state_lane_dec_at_r[j];
+        p *= delta;
+    }
+    acc
+}
+
+fn block_combined_weights_at_point(
+    r_prime: &[Block128],
+    delta: Block128,
+    r2: &[Block128],
+    num_vars: usize,
+) -> BlockWeightsAtPoint {
+    let rp_elem = &r_prime[0..ELEM_BITS];
+    let rp_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let rp_slot = &r_prime[ELEM_BITS + ROUND_BITS..num_vars];
+    let r2_elem = &r2[0..ELEM_BITS];
+    let r2_round = &r2[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let r2_slot = &r2[ELEM_BITS + ROUND_BITS..num_vars];
+
+    let eq_slot = eq_ind(rp_slot, r2_slot);
+    let eq_elem = eq_ind(rp_elem, r2_elem);
+
+    let n_rounds = 1usize << ROUND_BITS;
+    let eq_rp_round_tab = eq_ind_partial_eval::<Block128>(rp_round);
+    let mut tab = vec![Block128::ZERO; n_rounds];
+    for round_x in 0..n_rounds {
+        let inc = (round_x + 1) & (n_rounds - 1);
+        tab[round_x] = eq_rp_round_tab[inc];
+    }
+    let g_round = evaluate_slice(&tab, r2_round);
+
+    let mut ind_j_at_r2 = [Block128::ZERO; STATE_SIZE];
+    for (j, slot) in ind_j_at_r2.iter_mut().enumerate() {
+        let mut acc = Block128::ONE;
+        for (b, &r) in r2_elem.iter().enumerate() {
+            if (j >> b) & 1 == 1 {
+                acc *= r;
+            } else {
+                acc *= Block128::ONE + r;
+            }
+        }
+        *slot = acc;
+    }
+
+    let w_dec_r2 = eq_slot * g_round * eq_elem;
+    let lane_base = eq_slot * g_round;
+
+    let d0 = Block128::ONE;
+    let d1 = delta;
+    let d2 = d1 * delta;
+    let mut p = d2;
+    let mut lane_sout = [Block128::ZERO; STATE_SIZE];
+    for slot in lane_sout.iter_mut() {
+        p *= delta;
+        *slot = p;
+    }
+    let mut lane_state = [Block128::ZERO; STATE_SIZE];
+    for slot in lane_state.iter_mut() {
+        p *= delta;
+        *slot = p;
+    }
+
+    let w_sin = d0 * w_dec_r2;
+    let mut w_sout = d1 * w_dec_r2;
+    let mut w_state = d2 * w_dec_r2;
+    for j in 0..STATE_SIZE {
+        let lane_w = lane_base * ind_j_at_r2[j];
+        w_sout += lane_sout[j] * lane_w;
+        w_state += lane_state[j] * lane_w;
+    }
+
+    BlockWeightsAtPoint { w_sin, w_sout, w_state }
+}
+
+/// Prove the shift gadget: reduces 11 dec-permuted claims to 3 direct
+/// claims on the original columns using combined weight tables.
+pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
+    mle: &BlockSpineMle,
+    r_prime: &[Block128],
+    _main_reduction: &BlockSpineUnifiedReduction,
+    channel: &mut T,
+) -> (BlockSpineShiftProof, Vec<Block128>) {
+    let num_vars = mle.num_vars;
+    debug_assert_eq!(r_prime.len(), num_vars);
+
+    let delta = channel.squeeze();
+    let weights = build_block_combined_weights(r_prime, delta, num_vars);
+
+    // Degree-2 sumcheck in flat basis for hw acceleration.
+    let mut f_sin: Vec<u128> = vec_to_flat(&mle.s_in);
+    let mut f_sout: Vec<u128> = vec_to_flat(&mle.s_out);
+    let mut f_state: Vec<u128> = vec_to_flat(&mle.state);
+    let mut f_wsin: Vec<u128> = vec_to_flat(&weights.w_sin);
+    let mut f_wsout: Vec<u128> = vec_to_flat(&weights.w_sout);
+    let mut f_wstate: Vec<u128> = vec_to_flat(&weights.w_state);
+
+    let mut round_polys = Vec::with_capacity(num_vars);
+    let mut r_double_prime = vec![Block128::ZERO; num_vars];
+
+    for round in 0..num_vars {
+        let half = f_sin.len() / 2;
+        let mut acc = [0u128; BLOCK_SPINE_SHIFT_DEGREE + 1];
+        for i in 0..half {
+            let sin_p: [u128; 2] = [f_sin[i], f_sin[i] ^ f_sin[i + half]];
+            let sout_p: [u128; 2] = [f_sout[i], f_sout[i] ^ f_sout[i + half]];
+            let st_p: [u128; 2] = [f_state[i], f_state[i] ^ f_state[i + half]];
+            let wsin_p: [u128; 2] = [f_wsin[i], f_wsin[i] ^ f_wsin[i + half]];
+            let wsout_p: [u128; 2] = [f_wsout[i], f_wsout[i] ^ f_wsout[i + half]];
+            let wst_p: [u128; 2] = [f_wstate[i], f_wstate[i] ^ f_wstate[i + half]];
+
+            let t1: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsin_p, &sin_p);
+            let t2: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsout_p, &sout_p);
+            let t3: [u128; 3] = poly_mul_t::<2, 2, 3>(&wst_p, &st_p);
+            acc[0] ^= t1[0] ^ t2[0] ^ t3[0];
+            acc[1] ^= t1[1] ^ t2[1] ^ t3[1];
+            acc[2] ^= t1[2] ^ t2[2] ^ t3[2];
+        }
+        let coeffs_tower: Vec<Block128> = acc
+            .iter()
+            .map(|&c| Block128::from(flat_to_tower_u128(c)))
+            .collect();
+        let poly = RoundPolynomial::from_coeffs(coeffs_tower);
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
+        let challenge_flat = tower_to_flat_u128(challenge.to_u128());
+        fold_flat_inplace(&mut f_sin, challenge_flat);
+        fold_flat_inplace(&mut f_sout, challenge_flat);
+        fold_flat_inplace(&mut f_state, challenge_flat);
+        fold_flat_inplace(&mut f_wsin, challenge_flat);
+        fold_flat_inplace(&mut f_wsout, challenge_flat);
+        fold_flat_inplace(&mut f_wstate, challenge_flat);
+        r_double_prime[num_vars - 1 - round] = challenge;
+        round_polys.push(poly);
+    }
+
+    debug_assert_eq!(f_sin.len(), 1);
+    let s_in_at_r2 = Block128::from(flat_to_tower_u128(f_sin[0]));
+    let s_out_at_r2 = Block128::from(flat_to_tower_u128(f_sout[0]));
+    let state_at_r2 = Block128::from(flat_to_tower_u128(f_state[0]));
+
+    channel.absorb(s_in_at_r2);
+    channel.absorb(s_out_at_r2);
+    channel.absorb(state_at_r2);
+
+    let proof = BlockSpineShiftProof {
+        round_polys,
+        s_in_at_r2,
+        s_out_at_r2,
+        state_at_r2,
+    };
+    (proof, r_double_prime)
+}
+
+/// Verify the shift gadget for block spine.
+pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
+    proof: &BlockSpineShiftProof,
+    main_reduction: &BlockSpineUnifiedReduction,
+    num_vars: usize,
+    channel: &mut T,
+) -> Option<BlockSpineShiftReduction> {
+    if proof.round_polys.len() != num_vars {
+        return None;
+    }
+    for p in &proof.round_polys {
+        if p.degree() > BLOCK_SPINE_SHIFT_DEGREE {
+            return None;
+        }
+    }
+
+    let delta = channel.squeeze();
+    let expected_target = block_combined_target(main_reduction, delta);
+
+    let mut expected = expected_target;
+    let mut r_double_prime = vec![Block128::ZERO; num_vars];
+
+    for (round, poly) in proof.round_polys.iter().enumerate() {
+        let s = poly.evaluate(Block128::ZERO) + poly.evaluate(Block128::ONE);
+        if s != expected {
+            return None;
+        }
+        for &c in &poly.coeffs {
+            channel.absorb(c);
+        }
+        let challenge = channel.squeeze();
+        expected = poly.evaluate(challenge);
+        r_double_prime[num_vars - 1 - round] = challenge;
+    }
+
+    let w = block_combined_weights_at_point(
+        &main_reduction.r_prime,
+        delta,
+        &r_double_prime,
+        num_vars,
+    );
+    let claimed =
+        w.w_sin * proof.s_in_at_r2 + w.w_sout * proof.s_out_at_r2 + w.w_state * proof.state_at_r2;
+    if expected != claimed {
+        return None;
+    }
+
+    channel.absorb(proof.s_in_at_r2);
+    channel.absorb(proof.s_out_at_r2);
+    channel.absorb(proof.state_at_r2);
+
+    Some(BlockSpineShiftReduction {
+        r_double_prime,
+        s_in_at_r2: proof.s_in_at_r2,
+        s_out_at_r2: proof.s_out_at_r2,
+        state_at_r2: proof.state_at_r2,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Full block spine Kill-Shot orchestration
+// ---------------------------------------------------------------------------
+
+/// Complete proof for the unified block spine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineProof {
+    pub kill_shot: BlockSpineKillShotProof,
+    pub state_batch: BatchEvalProof,
+    pub sin_batch: BatchEvalProof,
+    pub sout_batch: BatchEvalProof,
+    pub num_vars: usize,
+    pub live_slots: usize,
+}
+
+impl BlockSpineProof {
+    pub fn byte_len(&self) -> usize {
+        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
+        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_finals = 12 * 16;
+        let shift_finals = 3 * 16;
+        main_polys
+            + shift_polys
+            + main_finals
+            + shift_finals
+            + self.state_batch.byte_len()
+            + self.sin_batch.byte_len()
+            + self.sout_batch.byte_len()
+    }
+}
+
+/// Reductions delivered to the FRI/STARK bridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSpineReductions {
+    pub state: BatchEvalReduction,
+    pub sin: BatchEvalReduction,
+    pub sout: BatchEvalReduction,
+}
+
+/// Prove the unified block spine Kill-Shot over N*59 slots.
+///
+/// `all_slot_state_ins` must have length `n_instances * N_SPINE_SLOTS`,
+/// ordered as: tx0_slot0, tx0_slot1, ..., tx0_slot58, tx1_slot0, ...
+pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
+    n_instances: usize,
+    all_slot_state_ins: &[[Block128; STATE_SIZE]],
+    all_tx_body_hashes: &[[Block128; 2]],
+    channel: &mut T,
+) -> (BlockSpineProof, BlockSpineReductions) {
+    assert_eq!(all_slot_state_ins.len(), n_instances * N_SPINE_SLOTS);
+    assert_eq!(all_tx_body_hashes.len(), n_instances);
+
+    // Absorb all tx_body_hashes into the channel (binds block contents).
+    for hash in all_tx_body_hashes {
+        channel.absorb(hash[0]);
+        channel.absorb(hash[1]);
+    }
+
+    let mle = BlockSpineMle::build(n_instances, all_slot_state_ins);
+
+    // (1) Main unified sumcheck.
+    let (main, r_prime) = prove_block_spine_unified(&mle, channel);
+
+    let main_red = BlockSpineUnifiedReduction {
+        r_prime: r_prime.clone(),
+        s_in_dec_at_r: main.s_in_dec_at_r,
+        s_out_dec_at_r: main.s_out_dec_at_r,
+        state_dec_at_r: main.state_dec_at_r,
+        state_at_r: main.state_at_r,
+        s_out_lane_dec_at_r: main.s_out_lane_dec_at_r,
+        state_lane_dec_at_r: main.state_lane_dec_at_r,
+        beta: Block128::ZERO, // filled by verifier
+        gamma: Block128::ZERO,
+    };
+
+    // (2) Shift gadget.
+    let (shift, r_double_prime) =
+        prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
+
+    // (3) Batch eval on state column.
+    let state_claims = vec![
+        EvalClaim { point: r_prime.clone(), value: main.state_at_r },
+        EvalClaim { point: r_double_prime.clone(), value: shift.state_at_r2 },
+    ];
+    let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
+
+    // (4) Batch eval on s_in column.
+    let sin_claims = vec![
+        EvalClaim { point: r_double_prime.clone(), value: shift.s_in_at_r2 },
+    ];
+    let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
+
+    // (5) Batch eval on s_out column.
+    let sout_claims = vec![
+        EvalClaim { point: r_double_prime, value: shift.s_out_at_r2 },
+    ];
+    let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
+
+    let proof = BlockSpineProof {
+        kill_shot: BlockSpineKillShotProof { main, shift },
+        state_batch,
+        sin_batch,
+        sout_batch,
+        num_vars: mle.num_vars,
+        live_slots: mle.live_slots,
+    };
+    let reductions = BlockSpineReductions {
+        state: state_red,
+        sin: sin_red,
+        sout: sout_red,
+    };
+    (proof, reductions)
+}
+
+/// Verify the unified block spine Kill-Shot.
+pub fn verify_block_spine_killshot<T: FiatShamir<Block128>>(
+    proof: &BlockSpineProof,
+    n_instances: usize,
+    all_tx_body_hashes: &[[Block128; 2]],
+    channel: &mut T,
+) -> Option<BlockSpineReductions> {
+    let expected_live = n_instances * N_SPINE_SLOTS;
+    if proof.live_slots != expected_live {
+        return None;
+    }
+    let expected_num_vars = num_vars_for(expected_live);
+    if proof.num_vars != expected_num_vars {
+        return None;
+    }
+    if all_tx_body_hashes.len() != n_instances {
+        return None;
+    }
+
+    // Absorb all tx_body_hashes.
+    for hash in all_tx_body_hashes {
+        channel.absorb(hash[0]);
+        channel.absorb(hash[1]);
+    }
+
+    // (1) Verify main unified sumcheck.
+    let main_red = verify_block_spine_unified(
+        &proof.kill_shot.main,
+        proof.num_vars,
+        proof.live_slots,
+        channel,
+    )?;
+
+    // (2) Verify shift gadget.
+    let shift_red = verify_block_spine_shift(
+        &proof.kill_shot.shift,
+        &main_red,
+        proof.num_vars,
+        channel,
+    )?;
+
+    // (3) Verify batch eval on state.
+    let state_claims = vec![
+        EvalClaim { point: main_red.r_prime.clone(), value: main_red.state_at_r },
+        EvalClaim { point: shift_red.r_double_prime.clone(), value: shift_red.state_at_r2 },
+    ];
+    let state_red = verify_batch_eval(
+        &proof.state_batch,
+        &state_claims,
+        proof.num_vars,
+        channel,
+    )?;
+
+    // (4) Verify batch eval on s_in.
+    let sin_claims = vec![
+        EvalClaim { point: shift_red.r_double_prime.clone(), value: shift_red.s_in_at_r2 },
+    ];
+    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, proof.num_vars, channel)?;
+
+    // (5) Verify batch eval on s_out.
+    let sout_claims = vec![
+        EvalClaim { point: shift_red.r_double_prime, value: shift_red.s_out_at_r2 },
+    ];
+    let sout_red = verify_batch_eval(&proof.sout_batch, &sout_claims, proof.num_vars, channel)?;
+
+    Some(BlockSpineReductions {
+        state: state_red,
+        sin: sin_red,
+        sout: sout_red,
+    })
+}
+
+/// Discharge all reductions against natively-reconstructed MLE. Test helper.
+pub fn discharge_block_spine_reductions_native(
+    n_instances: usize,
+    all_slot_state_ins: &[[Block128; STATE_SIZE]],
+    reductions: &BlockSpineReductions,
+) -> bool {
+    let mle = BlockSpineMle::build(n_instances, all_slot_state_ins);
+    evaluate_slice(&mle.state, &reductions.state.point) == reductions.state.value
+        && evaluate_slice(&mle.s_in, &reductions.sin.point) == reductions.sin.value
+        && evaluate_slice(&mle.s_out, &reductions.sout.point) == reductions.sout.value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit::{SpineCircuit, SpineInputs};
+    use crate::spine_sumcheck::reconstruct_slot_states;
+    use noid_poseidon2b::channel::Poseidon2bChannel;
+
+    fn fixture_inputs(seed: u128) -> SpineInputs {
+        SpineInputs {
+            epoch_anchor: [Block128::from(seed + 11), Block128::from(seed + 22)],
+            fee_leaf: [Block128::from(seed + 33), Block128::from(seed + 44)],
+            input_leaves: [[Block128::from(seed + 1); 4]; 4],
+            output_leaves: [[Block128::from(seed + 2); 4]; 8],
+            is_coinbase_leaf: [Block128::from(seed + 55), Block128::from(seed + 66)],
+            pad_leaf: [Block128::from(0u128), Block128::from(0u128)],
+        }
+    }
+
+    fn collect_slot_state_ins(
+        circuit: &SpineCircuit,
+        inputs_list: &[SpineInputs],
+    ) -> Vec<[Block128; STATE_SIZE]> {
+        let mut all = Vec::new();
+        for inputs in inputs_list {
+            let states = reconstruct_slot_states(circuit, inputs);
+            for (s_in, _) in &states {
+                all.push(*s_in);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn slot_vars_computation() {
+        assert_eq!(slot_vars_for(59), 6);       // 1 tx
+        assert_eq!(slot_vars_for(118), 7);      // 2 txs
+        assert_eq!(slot_vars_for(4 * 59), 8);   // 4 txs: 236 slots
+        assert_eq!(slot_vars_for(1024 * 59), 16); // 1024 txs: 60416 slots
+    }
+
+    #[test]
+    fn num_vars_computation() {
+        assert_eq!(num_vars_for(59), 6 + 7 + 2);   // 15 (same as per-tx)
+        assert_eq!(num_vars_for(118), 7 + 7 + 2);  // 16
+        assert_eq!(num_vars_for(4 * 59), 8 + 7 + 2); // 17
+    }
+
+    #[test]
+    fn block_spine_killshot_1tx_roundtrip() {
+        let circuit = SpineCircuit::build();
+        let inputs = fixture_inputs(42);
+        let inputs_list = vec![inputs];
+        let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
+
+        let states = reconstruct_slot_states(&circuit, &inputs_list[0]);
+        let wrap = states.last().unwrap();
+        let tx_body_hash = [wrap.1[0], wrap.1[1]];
+
+        let mut ch_p = Poseidon2bChannel::new();
+        let (proof, reductions) = prove_block_spine_killshot(
+            1,
+            &all_state_ins,
+            &[tx_body_hash],
+            &mut ch_p,
+        );
+
+        let mut ch_v = Poseidon2bChannel::new();
+        let v_red = verify_block_spine_killshot(
+            &proof,
+            1,
+            &[tx_body_hash],
+            &mut ch_v,
+        ).expect("verifier accepts honest proof");
+
+        assert_eq!(v_red, reductions);
+        assert!(discharge_block_spine_reductions_native(1, &all_state_ins, &v_red));
+    }
+
+    #[test]
+    fn block_spine_killshot_4tx_roundtrip() {
+        let circuit = SpineCircuit::build();
+        let inputs_list: Vec<SpineInputs> = (0..4).map(|i| fixture_inputs(i as u128 * 100)).collect();
+        let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
+
+        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list.iter().map(|inp| {
+            let states = reconstruct_slot_states(&circuit, inp);
+            let wrap = states.last().unwrap();
+            [wrap.1[0], wrap.1[1]]
+        }).collect();
+
+        let mut ch_p = Poseidon2bChannel::new();
+        let (proof, reductions) = prove_block_spine_killshot(
+            4,
+            &all_state_ins,
+            &tx_body_hashes,
+            &mut ch_p,
+        );
+
+        assert_eq!(proof.num_vars, 8 + 7 + 2); // 17 vars for 236 slots
+        assert_eq!(proof.live_slots, 4 * 59);
+
+        let mut ch_v = Poseidon2bChannel::new();
+        let v_red = verify_block_spine_killshot(
+            &proof,
+            4,
+            &tx_body_hashes,
+            &mut ch_v,
+        ).expect("verifier accepts 4-tx block");
+
+        assert_eq!(v_red, reductions);
+        assert!(discharge_block_spine_reductions_native(4, &all_state_ins, &v_red));
+    }
+
+    #[test]
+    fn block_spine_rejects_tampered_main_claim() {
+        let circuit = SpineCircuit::build();
+        let inputs_list: Vec<SpineInputs> = (0..2).map(|i| fixture_inputs(i as u128 * 50)).collect();
+        let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
+
+        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list.iter().map(|inp| {
+            let states = reconstruct_slot_states(&circuit, inp);
+            let wrap = states.last().unwrap();
+            [wrap.1[0], wrap.1[1]]
+        }).collect();
+
+        let mut ch_p = Poseidon2bChannel::new();
+        let (mut proof, _) = prove_block_spine_killshot(
+            2,
+            &all_state_ins,
+            &tx_body_hashes,
+            &mut ch_p,
+        );
+        proof.kill_shot.main.state_at_r += Block128::ONE;
+
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_block_spine_killshot(&proof, 2, &tx_body_hashes, &mut ch_v).is_none());
+    }
+}

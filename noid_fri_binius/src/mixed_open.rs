@@ -55,7 +55,7 @@ pub struct MixedOpeningProof {
 ///   transcript binding but proven via the outer multipoint sumcheck)
 /// `num_queries`: FRI query count (use `COMPACT_NUM_QUERIES` for full security)
 pub fn prove_mixed_opening(
-    state: &InterleavedProverState,
+    state: &InterleavedProverState<'_>,
     primary_point: &[Block128],
     secondary_claims: &[EvalClaim],
     ntt: &AdditiveNTT<Block128>,

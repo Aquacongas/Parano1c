@@ -18,6 +18,7 @@ pub mod auth_oracle;
 pub mod auth_shift;
 pub mod auth_unified_v2;
 pub mod batch_eval;
+pub mod block_spine;
 pub mod binding;
 pub mod circuit;
 pub mod layers;
@@ -119,4 +120,11 @@ pub use merkle_mle::{
 pub use merkle_oracle::{compute_merkle_root, evaluate_merkle, MerkleSlotState, MerkleWitness};
 pub use merkle_unified::{
     prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
+};
+pub use block_spine::{
+    prove_block_spine_killshot, verify_block_spine_killshot,
+    discharge_block_spine_reductions_native, BlockSpineMle, BlockSpineProof,
+    BlockSpineReductions, BlockSpineKillShotProof, BlockSpineUnifiedProof,
+    BlockSpineShiftProof, BlockSpineShiftReduction, BlockSpineUnifiedReduction,
+    BLOCK_SPINE_ROUND_DEGREE, BLOCK_SPINE_SHIFT_DEGREE,
 };

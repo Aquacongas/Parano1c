@@ -493,28 +493,26 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn prove_air_interleaved<A: Air + ?Sized>(
+pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
     air: &A,
-    padded_columns: &[Vec<Block128>],
+    padded_columns: &'cols [Vec<Block128>],
     pi: &PublicInputs,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
     log_len: usize,
     pre_committed: Option<(
         InterleavedCommitment,
-        noid_fri_binius::InterleavedProverState,
+        noid_fri_binius::InterleavedProverState<'cols>,
     )>,
     num_queries: usize,
 ) -> InterleavedStarkProof {
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
 
+    let col_refs: Vec<&'cols [Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
     let (commitment, prover_state) = match pre_committed {
         Some(pre) => pre,
-        None => {
-            let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
-            interleaved_commit(&col_refs, &ntt, &hasher)
-        }
+        None => interleaved_commit(&col_refs, &ntt, &hasher),
     };
 
     let mut channel = Channel::new();

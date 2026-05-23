@@ -166,6 +166,100 @@ pub fn prove_multipoint_sumcheck(
     (rounds, challenges)
 }
 
+/// Like [`prove_multipoint_sumcheck`] but accepts pre-flattened B-side
+/// tables (already in flat GCM basis). Saves the O(N * hyper_len)
+/// tower-to-flat conversion when the caller can build B tables directly
+/// in flat basis.
+pub fn prove_multipoint_sumcheck_flat_b(
+    pairs_a: Vec<Vec<Block128>>,
+    pairs_b_flat: Vec<Vec<u128>>,
+    target: Block128,
+    channel: &mut noid_fri::Channel,
+) -> (Vec<RoundPoly>, Vec<Block128>) {
+    assert!(!pairs_a.is_empty());
+    assert_eq!(pairs_a.len(), pairs_b_flat.len());
+    let n = pairs_a[0].len().trailing_zeros() as usize;
+    for (a, b) in pairs_a.iter().zip(pairs_b_flat.iter()) {
+        debug_assert_eq!(a.len(), 1 << n);
+        debug_assert_eq!(b.len(), 1 << n);
+    }
+
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+    use rayon::prelude::*;
+
+    let mut pairs_flat: Vec<(Vec<u128>, Vec<u128>)> = pairs_a
+        .into_par_iter()
+        .zip(pairs_b_flat.into_par_iter())
+        .map(|(a, b_flat)| {
+            let a_flat: Vec<u128> = a.into_iter().map(|v| tower_to_flat_u128(v.0)).collect();
+            (a_flat, b_flat)
+        })
+        .collect();
+
+    let two_flat = tower_to_flat_u128(Block128::from(2u8).0);
+
+    let mut rounds: Vec<RoundPoly> = Vec::with_capacity(n);
+    let mut challenges: Vec<Block128> = Vec::with_capacity(n);
+    let mut claim = target;
+
+    for _ in 0..n {
+        let half = pairs_flat[0].0.len() / 2;
+
+        let (p0_flat, p1_flat, p2_flat) = pairs_flat
+            .par_iter()
+            .map(|(a, b)| {
+                let mut s0: u128 = 0;
+                let mut s1: u128 = 0;
+                let mut s2: u128 = 0;
+                for j in 0..half {
+                    let a0 = a[j];
+                    let a1 = a[j + half];
+                    let b0 = b[j];
+                    let b1 = b[j + half];
+                    let a_s = a0 ^ clmul_gcm(two_flat, a1 ^ a0);
+                    let b_s = b0 ^ clmul_gcm(two_flat, b1 ^ b0);
+                    s0 ^= clmul_gcm(a0, b0);
+                    s1 ^= clmul_gcm(a1, b1);
+                    s2 ^= clmul_gcm(a_s, b_s);
+                }
+                (s0, s1, s2)
+            })
+            .reduce(
+                || (0u128, 0u128, 0u128),
+                |x, y| (x.0 ^ y.0, x.1 ^ y.1, x.2 ^ y.2),
+            );
+        let p0 = Block128::from(flat_to_tower_u128(p0_flat));
+        let p1 = Block128::from(flat_to_tower_u128(p1_flat));
+        let p2 = Block128::from(flat_to_tower_u128(p2_flat));
+        debug_assert_eq!(p0 + p1, claim, "multipoint sumcheck consistency failure");
+
+        let rp = vec![p0, p1, p2];
+        channel.observe_field_elems(&rp);
+        let r = channel.get_random_point();
+        let r_flat = tower_to_flat_u128(r.0);
+
+        pairs_flat.par_iter_mut().for_each(|(a, b)| {
+            let half = a.len() / 2;
+            let (lo_a, hi_a) = a.split_at_mut(half);
+            for i in 0..half {
+                lo_a[i] ^= clmul_gcm(r_flat, hi_a[i] ^ lo_a[i]);
+            }
+            a.truncate(half);
+            let (lo_b, hi_b) = b.split_at_mut(half);
+            for i in 0..half {
+                lo_b[i] ^= clmul_gcm(r_flat, hi_b[i] ^ lo_b[i]);
+            }
+            b.truncate(half);
+        });
+
+        claim = crate::lagrange_eval_at_pub(&rp, r);
+        rounds.push(rp);
+        challenges.push(r);
+    }
+
+    (rounds, challenges)
+}
+
 /// Verify-side replay. Returns challenge vector (highest-var-first)
 /// and the terminal claim the caller must match against
 /// `Σ_k A_k(r'') · B_k(r'')`.

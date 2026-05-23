@@ -122,6 +122,360 @@ Network payload for stateless transactions.
 
 ---
 
+## Phase 1.5 — Parallel Per-Tx Algebraic STARK (Stage Q)
+
+**Goal:** Reduce `prove_block` from 61s to ~8s at 100 tx (8 cores) by parallelizing
+the per-tx algebraic STARK phase. Currently the main bottleneck preventing 100-tx blocks
+from fitting within the 60-second block time budget.
+
+### Problem Statement
+
+Stage 5 of `prove_block` (`noid_block/src/lib.rs:416-439`) runs per-tx algebraic STARKs
+sequentially on a shared Fiat-Shamir channel. Each tx takes ~615ms. For N=100:
+`100 * 615ms = 61.5s` — exceeds the 60s block time.
+
+The sequential channel works by chaining: challenge for tx[k+1] depends on proof[k].
+This prevents parallel execution.
+
+### Solution: Independent Per-Tx Channels
+
+Replace the sequential block channel in Stage 5 with independent per-tx channels, each
+deterministically seeded from `(prev_state_root, commitment_cap, tx_index)`.
+
+**Security argument:** After Stage 3 (interleaved commit), the Merkle cap cryptographically
+binds ALL witness columns. The prover cannot change the witness after commit.
+Zero-check challenges derived from `seed_k = H(state_root || cap || k)` are:
+- Unpredictable before commit (cap depends on columns)
+- Deterministic after commit (same seed → same challenges)
+- Bound to the specific transaction (tx_index prevents cross-tx confusion)
+
+This is non-adaptive soundness for committed witnesses — equivalent in strength to
+adaptive (sequential) soundness because the witness is immutable post-commit.
+
+Stage 6 (block-level multipoint sumcheck) remains sequential and provides the global
+binding across all per-tx results. FRI opening (Stage 7) is unchanged.
+
+### What Does NOT Change
+
+- Privacy: `spend_secret` stays on wallet. `auth_gkr_channel()` is already independent.
+- Auth GKR: Self-seeded, not affected.
+- Unified Block SpineGKR: Seeded from `(cap)`, not affected.
+- Block-level multipoint sumcheck (Stage 6): Remains sequential, binds all openings.
+- FRI mixed opening (Stage 7): Unchanged.
+- Verifier logic: Same as prover — uses `seed(state_root, cap, k)` per tx.
+- Proof format: `BlockProof` struct unchanged (same fields, same sizes).
+- Soundness level: 128-bit (Schwartz-Zippel over GF(2^128), challenges from cap).
+
+### Performance Projection
+
+| Metric (100 tx) | Before | After Q.2-Q.4 (8c) | After Q.5 (8c) | After Q.5 (16c) |
+|-----------------|--------|---------------------|----------------|-----------------|
+| prove_block     | 61.5s  | ~8s                 | ~8s            | ~4s             |
+| verify_block    | 16.3s  | 16.3s               | ~3.6s          | ~2.7s           |
+| proof size      | 2.02 MB| 2.02 MB             | 2.02 MB        | 2.02 MB         |
+
+### Implementation Plan
+
+#### Q.1 Per-Tx Channel Factory
+
+Create a deterministic channel constructor for per-tx algebraic STARKs.
+
+- Add `fn per_tx_algebraic_channel(prev_state_root, cap, tx_index) -> Channel` to `noid_block`
+- Full domain-separated seed sequence:
+  1. `observe(DOMAIN_TAG_TX_ALGEBRAIC)` — fixed 128-bit constant, unique to this sub-protocol
+  2. `observe(PROTOCOL_VERSION)` — `Block128::from(1u128)`, bumped on protocol changes
+  3. `observe(state_root_hi)`, `observe(state_root_lo)` — block context binding
+  4. `absorb_cap(cap)` — commitment binding (all columns)
+  5. `observe(Block128::from(tx_index as u128))` — per-tx uniqueness
+- Constants in `noid_block/src/lib.rs`:
+  - `DOMAIN_TAG_TX_ALGEBRAIC: u128 = 0x5458_414C_4745_4252_4149_4332_3032_3600`
+  - `PROTOCOL_VERSION_Q: u128 = 1`
+- Stage 5b (BlockStateBindingAir) uses `tx_index = n_tx` as its domain separator
+- **Done when:** factory produces deterministic channel; same inputs → same output; different tx_index → different challenges
+
+#### Q.2 Parallelize prove_block Stage 5
+
+Replace the sequential loop with `rayon::par_iter`.
+
+```rust
+// BEFORE (sequential, shared channel):
+for (k, w) in witnesses.iter().enumerate() {
+    let (alg, r_pp, claim, lambdas) = prove_air_interleaved_algebraic(
+        ..., &mut block_channel,
+    );
+}
+
+// AFTER (parallel, per-tx channels):
+let tx_results: Vec<_> = (0..n_tx).into_par_iter().map(|k| {
+    let mut ch = per_tx_algebraic_channel(&prev_state_root, cap, k);
+    let (alg, r_pp, claim, lambdas) = prove_air_interleaved_algebraic(
+        ..., &mut ch,
+    );
+    (alg, r_pp, claim, lambdas)
+}).collect();
+```
+
+- Move `build_auth_slice_claims` inside the parallel closure (it's per-tx, no shared state)
+- Collect results into `tx_algebraic`, `tx_r_pp`, `tx_claims`, `tx_lambdas` vectors
+- **Done when:** `prove_block` produces valid proof with parallel Stage 5
+
+#### Q.3 Update verify_block Stage 2b
+
+Mirror the prover change in the verifier.
+
+```rust
+// BEFORE (sequential, shared channel):
+for k in 0..n_tx {
+    let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
+        ..., &mut block_channel,
+    )?;
+}
+
+// AFTER (per-tx channels, still sequential for now):
+for k in 0..n_tx {
+    let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k);
+    let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
+        ..., &mut ch,
+    )?;
+}
+```
+
+Note: Verifier loop can remain sequential (correctness first, parallel verify is Q.5).
+The critical change is using `per_tx_algebraic_channel` instead of shared `block_channel`.
+
+- **Done when:** `verify_block` accepts proofs generated by parallel prover
+
+#### Q.4 Reconnect Block Channel for Stage 6
+
+After per-tx algebraic STARKs complete (parallel), Stage 6 (multipoint sumcheck) still
+needs a deterministic shared channel for the block-level reduction.
+
+- Block channel for Stage 6 is seeded from: `(prev_state_root, cap, BLOCK_MULTIPOINT_TAG)`
+- It absorbs `block_col_openings` (all per-tx openings concatenated) and derives `mu`, `beta_block`
+- This is already the current design — just ensure the block channel is NOT polluted by
+  per-tx STARK data (it currently is because per-tx STARKs absorbed into it)
+- Fix: create fresh block channel AFTER Stage 5, seed with `(state_root, cap, MULTIPOINT_TAG)`,
+  absorb all `block_col_openings`, proceed to multipoint sumcheck
+
+Stage 5b (BlockStateBindingAir) also gets its own channel: `per_tx_algebraic_channel(..., n_tx)`
+(uses tx_index = n_tx as the "state binding slot").
+
+- **Done when:** Stage 6 multipoint sumcheck produces valid block-level reduction
+
+#### Q.5 Parallel Verifier
+
+Parallelize verify_block Stage 2b (`noid_block/src/lib.rs:785-842`).
+
+The per-tx verification loop does 4 things per tx, ALL of which become independent
+after Q.3:
+
+1. `verify_auth_killshot` — already self-seeded via `auth_gkr_channel()` (no shared state)
+2. Auth/Spine bridge checks — pure field comparisons (no channel)
+3. Slice reconstruction — pure MLE math (no channel)
+4. `verify_air_interleaved_algebraic` — after Q.3, uses `per_tx_algebraic_channel(cap, k)`
+
+Implementation:
+
+```rust
+// BEFORE (sequential):
+for k in 0..n_tx {
+    let auth_reductions = verify_auth_killshot(..., &mut auth_gkr_channel())?;
+    // ... bridge checks, slice reconstruction ...
+    let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(
+        ..., &mut block_channel)?;
+    tx_r_pp.push(r_pp_k);
+    tx_final_claims.push(claim_k);
+}
+
+// AFTER (parallel):
+let tx_results: Vec<Result<(Vec<Block128>, Block128), VerifyBlockError>> =
+    (0..n_tx).into_par_iter().map(|k| {
+        // Auth Kill-Shot (self-seeded, independent)
+        let auth_reductions = {
+            let mut ch = auth_gkr_channel();
+            verify_auth_killshot(&proof.tx_auth_proofs[k], &auth_circuit,
+                &auth_public_list[k], &mut ch)
+                .ok_or(VerifyBlockError::AuthKillShot(k))?
+        };
+        // Bridge checks...
+        // Slice reconstruction...
+        // Algebraic STARK (per-tx channel, independent)
+        let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k);
+        let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(
+            airs[k], pi, alg, &extras, &slice_claims, &mut ch)
+            .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
+        Ok((r_pp_k, claim_k))
+    }).collect();
+// Unpack results, propagate first error.
+```
+
+What remains sequential after Q.5:
+- Block SpineGKR Kill-Shot verification (one call, ~3ms)
+- Stage 6: Block multipoint sumcheck verification (cheap, O(log_len * n_participants))
+- Stage 7: FRI mixed opening verification (one call, ~15ms for 64 queries)
+
+These three are fast and inherently sequential (global binding).
+
+Timing breakdown (100 tx, current):
+- Per-tx auth Kill-Shot verify: ~45ms each → 4.5s total sequential
+- Per-tx algebraic STARK verify: ~100ms each → 10s total sequential
+- Stages 6+7: ~1.8s (already fast)
+- Total: ~16.3s
+
+After parallelization (8 cores):
+- Per-tx (auth + algebraic): max(100 tx / 8) * 145ms = ~1.8s
+- Stages 6+7: ~1.8s (unchanged)
+- Total: ~3.6s
+
+After parallelization (16 cores):
+- Per-tx: max(100 tx / 16) * 145ms = ~0.9s
+- Stages 6+7: ~1.8s
+- Total: ~2.7s
+
+- **Done when:** `verify_block` runs in <4s for 100 tx on 8 cores
+
+#### Q.6 Update Benchmarks
+
+- Update `bench_prover/benches/block_scaling.rs` to reflect new timing
+- Update `bench_prover/benches/stark_report.rs` pipeline description
+- Verify: 100-tx block prove < 10s on 8 cores
+- **Done when:** benchmarks confirm target performance
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `noid_block/src/lib.rs` | `per_tx_algebraic_channel()`, parallel Stage 5, fresh Stage 6 channel |
+| `noid_block/src/lib.rs` | verify_block: per-tx channels in Stage 2b |
+| `noid_block/src/full_node.rs` | Update `prove_block_full`/`verify_block_full` if affected |
+| `noid_block/tests/stage_g_roundtrip.rs` | Update test to use new protocol |
+| `bench_prover/benches/block_scaling.rs` | Update notes, verify performance |
+| `bench_prover/benches/stark_report.rs` | Update architecture description |
+
+### Soundness Proof Sketch
+
+1. **Commitment binding:** `cap = MerkleRoot(NTT(all_columns))`. After commit, prover
+   cannot alter any column without changing cap. cap is collision-resistant (Blake3, 128-bit).
+
+2. **Challenge derivation:** `z_k = H(state_root || cap || k || "TX_ALG")`. Since cap
+   encodes all columns, and H is a random oracle (Poseidon2b sponge), z_k is uniformly
+   random from prover's perspective at commit time.
+
+3. **Zero-check soundness:** If AIR polynomial P != 0 on the evaluation domain, then
+   `sum_x eq(z_k, x) * P(x) = 0` with probability at most `degree / |F|` = negligible.
+   The proof is a standard sum-check argument; only requires z_k to be random with
+   respect to the committed polynomial — which it is (derived from cap).
+
+4. **Cross-tx binding:** Stage 6 multipoint sumcheck verifies that ALL per-tx opening
+   claims `M_k[i](r_pp_k)` are consistent with the committed columns. A cheating prover
+   must fool Stage 6 which uses a fresh challenge `mu` derived from ALL openings.
+
+5. **Reordering attack:** tx_index `k` is absorbed into the seed. Reordering transactions
+   changes seeds, changes challenges, invalidates proofs. Verifier reconstructs same seeds
+   from proof metadata → reordering detected.
+
+6. **No new assumptions:** Same field (GF(2^128)), same hash (Poseidon2b), same PCS
+   (FRI-Binius). Only change: sequential Fiat-Shamir → parallel Fiat-Shamir with
+   commitment-derived seeds. This is a standard technique used in Plonky2, Boojum,
+   and other production systems.
+
+### Risk Analysis
+
+Three potential risks were identified and analyzed against the codebase:
+
+#### Risk 1: Cross-Tx Algebraic Coupling (Correlation Attacks)
+
+**Concern:** If per-tx polynomials share structure (e.g., `P_total = sum P_k` or shared
+composition batching), simultaneous challenge knowledge might enable coordinated cheating.
+
+**Verdict: SAFE.** Verified in code (`noid_stark/src/interleaved.rs:125-296`): each per-tx
+algebraic STARK operates exclusively on `preps[k].columns`. There is:
+- No shared polynomial across tx within Stage 5
+- No cross-tx composition batching
+- No shared `alpha` or `beta` between different tx proofs
+- `betas` and `z` are sampled per-tx from own channel
+
+The only cross-tx coupling is in Stage 6 (block multipoint sumcheck), which uses a FRESH
+channel seeded AFTER all per-tx results are committed. This is the global binding layer.
+
+#### Risk 2: Self-Referential Cap (FS Soundness)
+
+**Concern:** `r_k = H(cap, k)` where prover controls `cap` indirectly via witness choice.
+Could prover iteratively choose witness to get favorable challenges?
+
+**Verdict: SAFE.** Verified in code (`noid_block/src/lib.rs:315`): `interleaved_commit()`
+finalizes the Merkle cap ONCE from the NTT of ALL columns. After commit:
+- Columns are immutable (stored in `prover_state`)
+- Cap is a Blake3 Merkle root — collision-resistant
+- No partial cap computation; no witness modification after cap
+
+This is standard commit-then-challenge Fiat-Shamir. Prover would need to break Blake3
+collision resistance to find witness that produces a favorable cap — computationally
+infeasible at 128-bit security.
+
+#### Risk 3: Domain Separation / Entropy Collapse
+
+**Concern:** Bare `H(cap, k)` is insufficient. Future protocol upgrades, cross-stage
+channel reuse, or transcript collisions could cause soundness issues.
+
+**Mitigation:** Q.1 specifies full domain separation in channel seed:
+
+```
+per_tx_algebraic_channel(prev_state_root, cap, tx_index):
+    ch = Channel::new()
+    ch.observe(DOMAIN_TAG_TX_ALGEBRAIC)    // fixed 128-bit constant
+    ch.observe(PROTOCOL_VERSION)           // versioned protocol binding
+    ch.observe(state_root_hi)              // block context
+    ch.observe(state_root_lo)
+    absorb_cap(ch, cap)                    // commitment binding
+    ch.observe(Block128::from(tx_index))   // per-tx uniqueness
+    return ch
+```
+
+Where:
+- `DOMAIN_TAG_TX_ALGEBRAIC = 0x5458_414C_4745_4252_4149_4332_3032_3600` ("TXALGEBR AIC2026")
+- `PROTOCOL_VERSION = Block128::from(1u128)` (bumped on protocol changes)
+
+This ensures:
+- No collision with SpineGKR channel (uses Poseidon2bChannel, different type)
+- No collision with Stage 6 channel (uses BLOCK_MULTIPOINT_TAG)
+- No collision with per-tx STARK in standalone `prove_tx` (different domain tag)
+- Protocol version prevents cross-version transcript reuse
+- Future stages cannot accidentally reuse the same channel state
+
+### Formal Proof Obligation
+
+The protocol change requires proving:
+
+1. **Commitment binding:** `cap = Blake3_Merkle(NTT(columns))` is binding —
+   prover cannot open committed columns to different values.
+
+2. **No post-challenge witness adaptation:** All columns are fixed at commit time
+   (Stage 3, line 315). Per-tx challenges derived from cap + tx_index cannot influence
+   witness because witness is already committed.
+
+3. **Stage 6 global binding:** Block-level multipoint sumcheck (Stage 6) verifies that
+   `M_k[i](r_pp_k) == block_col_openings[k*n + i]` for ALL tx. Challenge `mu` is derived
+   from ALL openings simultaneously. A prover faking any single tx would need to
+   fool Stage 6 which has full visibility over all claims.
+
+4. **No cross-instance adaptive dependency:** Per-tx STARK[k] produces `(r_pp_k, claim_k)`
+   using only: (a) committed columns of tx k, (b) challenges from channel_k. Since
+   channel_k = H(state_root, cap, k), and cap commits ALL columns, knowledge of channel_j
+   (for j != k) provides no advantage — the prover already knew both channels at commit time.
+
+5. **Reordering resistance:** tx_index is absorbed into the seed. Permuting transactions
+   changes all per-tx channels, invalidating all proofs. Verifier deterministically
+   reconstructs seeds from proof order.
+
+### Dependency
+
+- Requires: Phase 1 complete (Stage S — Split GKR, privacy fix, all current code)
+- Blocks: Nothing (this is a prover optimization, proof format unchanged)
+- Enables: 100-tx blocks within 60s budget, path to 1024-tx blocks with SIMD (Stage K)
+
+---
+
 ## Phase 2 — Consensus & PoW (Stage P)
 
 **Goal:** Implement block validity rules so nodes can reach consensus.
@@ -423,8 +777,9 @@ Full consensus validation combining all rules.
 ### T.3 Performance Validation
 
 - Block time targeting ~60s at genesis difficulty
-- prove_block() < 3s for 100 txs
-- verify_block() < 600ms
+- prove_block() < 10s for 100 txs (Phase 1.5: parallel per-tx STARK)
+- prove_block() < 3s for 100 txs (Phase 8: + SIMD zero-check)
+- verify_block() < 3s for 100 txs (Phase 1.5 Q.5: parallel verifier)
 - P2P propagation < 2s
 - **Done when:** sustained block production for 1 hour
 
@@ -580,6 +935,10 @@ Phase 1 (Stateless)
     S.7 (parallel to S.1-S.6)
     S.8 (after S.6)
 
+Phase 1.5 (Parallel STARK) [after Phase 1, before Phase 4]
+    Q.1 → Q.2 → Q.3 → Q.4 → Q.6
+    Q.5 (optional, after Q.4)
+
 Phase 2 (Consensus)
     P.1 → P.2 → P.4
     P.3 → P.4
@@ -613,7 +972,8 @@ Phase 9 (GUI) [after T.5]
     G.1 → G.2 → G.3 → G.4
 ```
 
-Critical path to testnet: **S → P → N/W → T** (Phases 1-2-4/5-6).
+Critical path to testnet: **S → Q → P → N/W → T** (Phases 1-1.5-2-4/5-6).
+Phase 1.5 is on the critical path — without it, block assembly exceeds 60s at 100 tx.
 Phases 3 (Segmented) and 7 (Recursive) are parallel tracks — valuable but not blocking testnet.
 Phase 9 (GUI) comes after testnet launch.
 
@@ -624,11 +984,12 @@ Phase 9 (GUI) comes after testnet launch.
 | Phase | Duration | Cumulative | Notes |
 |-------|----------|------------|-------|
 | Phase 1 (Stateless) | 4-6 weeks | 4-6 wk | Pure Rust, no external deps |
-| Phase 2 (Consensus) | 2-3 weeks | 7-9 wk | Deterministic math + tests |
+| Phase 1.5 (Parallel STARK) | 3-5 days | 5-7 wk | Critical path; unlocks 100-tx blocks |
+| Phase 2 (Consensus) | 2-3 weeks | 7-10 wk | Deterministic math + tests |
 | Phase 3 (Segmented) | 3-4 weeks | parallel | Can overlap with Phase 4 |
-| Phase 4 (Node) | 6-8 weeks | 13-17 wk | Networking is the long pole |
-| Phase 5 (Wallet) | 2-3 weeks | 15-20 wk | Built into Full Node + Light CLI |
-| Phase 6 (Testnet) | 3-4 weeks | 18-24 wk | Integration + hardening |
+| Phase 4 (Node) | 6-8 weeks | 13-18 wk | Networking is the long pole |
+| Phase 5 (Wallet) | 2-3 weeks | 15-21 wk | Built into Full Node + Light CLI |
+| Phase 6 (Testnet) | 3-4 weeks | 18-25 wk | Integration + hardening |
 | Phase 7 (Recursive) | 8-12 weeks | post-testnet | Research-grade; ships as upgrade |
 | Phase 8 (Optimizations) | ongoing | post-testnet | Incremental improvements |
 | Phase 9 (GUI) | 4-6 weeks | post-testnet | Desktop app, last priority |
@@ -667,7 +1028,7 @@ Phase 9 (GUI) comes after testnet launch.
   └──────────────────────────────────────────┘
            │ TxIntent (to own mempool or via RPC)
            ▼
-  Full Node — Block Assembly (1-3s CPU)
+  Full Node — Block Assembly (~8s CPU on 8 cores for 100 tx)
   ┌──────────────────────────────────────────┐
   │  Collect TxIntents from mempool          │
   │  Verify N LogicProofs                    │
@@ -676,7 +1037,10 @@ Phase 9 (GUI) comes after testnet launch.
   │    - Segment Merkle paths                │
   │    - MerkleGKR Kill-Shot (32-slot, 14v)  │
   │    - Bridge check (C_claimed match)      │
-  │  Deferred-opening aggregation            │
+  │  Parallel per-tx algebraic STARKs        │
+  │    - Independent channels: H(root,cap,k) │
+  │    - N zero-checks on N cores (rayon)    │
+  │  Block-level multipoint sumcheck         │
   │  Single FRI-Binius opening               │
   │  Output: BlockProof + 248-byte header    │
   └──────────────────────────────────────────┘
@@ -732,6 +1096,7 @@ Phase 9 (GUI) comes after testnet launch.
 | MerkleGKR | 128-bit | Schwartz-Zippel, 14-var |
 | Batch-eval | 128-bit | degree-2 sumcheck + RLC |
 | Fiat-Shamir | collision-resistant | Poseidon2b sponge |
+| Parallel per-tx STARK | 128-bit | non-adaptive: cap-derived seeds, committed witness |
 | PoW | ordering-only | Blake3 + ASERT DAA |
 | Recursion | 128-bit | native field (no foreign-field penalty) |
 

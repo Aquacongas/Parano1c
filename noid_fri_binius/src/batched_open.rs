@@ -51,7 +51,7 @@ fn horner_weights(gamma: Block128, n: usize) -> Vec<Block128> {
 /// draws a gamma challenge, then proves sum_x B(x)*eq(x,z) = V
 /// via a degree-2 sumcheck (B and eq are both multilinear).
 pub fn prove_batched_opening(
-    state: &InterleavedProverState,
+    state: &InterleavedProverState<'_>,
     eval_point: &[Block128],
     ntt: &AdditiveNTT<Block128>,
     channel: &mut Channel,
@@ -86,7 +86,7 @@ pub fn prove_batched_opening(
     // where B(x) = sum_k gamma^k * col_k(x)
     //
     // We maintain folded column states and eq table simultaneously.
-    let mut col_folds: Vec<Vec<Block128>> = state.raw_cols.clone();
+    let mut col_folds: Vec<Vec<Block128>> = state.raw_cols.iter().map(|s| s.to_vec()).collect();
     let mut eq_table = eq_ind_partial_eval(eval_point);
 
     let mut rounds = Vec::with_capacity(log_n);

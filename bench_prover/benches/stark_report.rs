@@ -303,6 +303,7 @@ struct BlockResult {
     verify_block_time: Duration,
     block_proof_bytes: usize,
     per_tx_algebraic_bytes: usize,
+    unified_spine_bytes: usize,
 }
 
 fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockResult {
@@ -350,6 +351,7 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     } else {
         0
     };
+    let unified_spine_bytes = block_proof.block_spine_proof.byte_len();
 
     // Step 3: Verifier verifies the block proof (only public auth data)
     let spine_inputs_list: Vec<SpineInputs> =
@@ -370,6 +372,7 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
         verify_block_time,
         block_proof_bytes,
         per_tx_algebraic_bytes,
+        unified_spine_bytes,
     }
 }
 
@@ -507,9 +510,9 @@ fn main() {
     println!("    Input:       N wallet LogicProofs + mempool transaction bodies");
     println!("    Pipeline:");
     println!("      1. Verify each LogicProof (verify_logic) — reject invalid txs");
-    println!("      2. Build single interleaved Merkle tree over ALL N*{} columns", TX_LOGIC_N_COLS + 6);
-    println!("      3. Per-tx GKR Kill-Shots seeded with shared Merkle cap");
-    println!("      4. Per-tx algebraic STARK (no FRI per tx — deferred)");
+    println!("      2. Build single interleaved Merkle tree over ALL columns");
+    println!("      3. Unified Block SpineGKR: ONE Kill-Shot over N*59 perms");
+    println!("      4. Per-tx Auth Kill-Shots + algebraic STARK (no FRI per tx)");
     println!("      5. Block-level multipoint sumcheck -> single r_block");
     println!("      6. ONE FRI-Binius mixed opening at r_block (amortized over N)");
     println!("    State binding: BlockStateBinding (slot opens, pre/post root, C_claimed bridge)");
@@ -557,14 +560,16 @@ fn main() {
     println!("    prove_block (N=1):        {}", fmt_ms(block_1tx.prove_block_time));
     println!("    verify_block (N=1):       {}", fmt_ms(block_1tx.verify_block_time));
     println!("    block proof size:         {}", fmt_bytes(block_1tx.block_proof_bytes));
+    println!("    unified spine (1*59):     {}", fmt_bytes(block_1tx.unified_spine_bytes));
     println!("    per-tx algebraic STARK:   {}", fmt_bytes(block_1tx.per_tx_algebraic_bytes));
     println!();
 
-    println!("  [4-tx Block] (deferred-opening aggregation)");
+    println!("  [4-tx Block] (Unified Block SpineGKR)");
     println!("    verify_logic (N=4):       {}", fmt_ms(block_4tx.verify_logic_time));
     println!("    prove_block (N=4):        {}", fmt_ms(block_4tx.prove_block_time));
     println!("    verify_block (N=4):       {}", fmt_ms(block_4tx.verify_block_time));
     println!("    block proof size:         {}", fmt_bytes(block_4tx.block_proof_bytes));
+    println!("    unified spine (4*59):     {}", fmt_bytes(block_4tx.unified_spine_bytes));
     println!("    per-tx algebraic STARK:   {}", fmt_bytes(block_4tx.per_tx_algebraic_bytes));
     println!();
 
@@ -596,11 +601,9 @@ fn main() {
     println!("       Rejects: tampered body-hash, invalid balance, bad auth");
     println!();
     println!("    5. Miner collects N valid TxIntents into a block");
-    println!("       Computes SpineGKR per-tx + deferred-opening aggregation");
-    println!("       N=4 time: {} (single FRI over 4*{} = {} columns)",
+    println!("       Unified Block SpineGKR (1 proof for all N*59 perms)");
+    println!("       N=4 time: {} (unified spine + deferred-opening FRI)",
         fmt_ms(block_4tx.prove_block_time),
-        TX_LOGIC_N_COLS + 6,
-        4 * (TX_LOGIC_N_COLS + 6),
     );
     println!();
     println!("    6. Block verifier checks the block proof");

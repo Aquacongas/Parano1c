@@ -29,9 +29,9 @@ pub struct InterleavedCommitment {
 }
 
 /// Prover-side state retained after commitment (not sent to verifier).
-pub struct InterleavedProverState {
+pub struct InterleavedProverState<'a> {
     pub encoded_cols: Vec<Vec<Block128>>,
-    pub raw_cols: Vec<Vec<Block128>>,
+    pub raw_cols: Vec<&'a [Block128]>,
     pub log_rows: usize,
     pub n_cols: usize,
 }
@@ -41,11 +41,11 @@ pub struct InterleavedProverState {
 /// Uses parallel Blake3 hashing over column data segments. Each of the
 /// 2^CAP_DEPTH segments covers `n / 2^CAP_DEPTH` rows and all columns.
 /// This provides collision-resistant binding without NTT or full tree.
-pub fn interleaved_commit(
-    cols: &[&[Block128]],
+pub fn interleaved_commit<'a>(
+    cols: &[&'a [Block128]],
     _ntt: &AdditiveNTT<Block128>,
     _hasher: &dyn CryptographicHasher,
-) -> (InterleavedCommitment, InterleavedProverState) {
+) -> (InterleavedCommitment, InterleavedProverState<'a>) {
     assert!(!cols.is_empty());
     let n = cols[0].len();
     assert!(n.is_power_of_two());
@@ -87,11 +87,9 @@ pub fn interleaved_commit(
         n_cols,
     };
 
-    let raw_cols = cols.iter().map(|c| c.to_vec()).collect();
-
     let state = InterleavedProverState {
         encoded_cols: Vec::new(),
-        raw_cols,
+        raw_cols: cols.to_vec(),
         log_rows,
         n_cols,
     };

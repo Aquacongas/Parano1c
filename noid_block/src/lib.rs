@@ -31,10 +31,10 @@ use noid_fri_binius::{
     InterleavedCommitment, MixedOpeningProof, COMPACT_NUM_QUERIES,
 };
 use noid_gkr::{
-    auth_gkr_channel, build_boundary_mle, prove_spine_killshot_with_states,
-    reconstruct_slot_states, verify_auth_killshot, verify_spine_killshot, AuthCircuit,
-    AuthProofKillShot, AuthPublicInputs, SpineCircuit, SpineInputs, SpineProofKillShot,
-    N_BOUNDARY_VARS,
+    auth_gkr_channel, prove_block_spine_killshot, verify_block_spine_killshot,
+    reconstruct_slot_states, verify_auth_killshot, AuthCircuit,
+    AuthProofKillShot, AuthPublicInputs, BlockSpineProof,
+    SpineCircuit, SpineInputs,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_stark::interleaved::{
@@ -59,8 +59,10 @@ pub struct BlockPublicMeta {
     pub prev_block_state_root: [u8; 32],
     pub n_tx: u32,
     pub n_air_per_tx: u32,
-    pub n_slice_per_tx: u32,
+    pub n_auth_slices_per_tx: u32,
     pub log_rows: u32,
+    /// Number of block-level spine state slices committed to FRI.
+    pub n_block_spine_slices: u32,
     /// Number of state binding AIR columns (0 if no state binding).
     pub state_binding_n_cols: u32,
     /// Log-rows of the state binding AIR (may differ from per-tx log_rows).
@@ -74,12 +76,12 @@ pub struct BlockPublicMeta {
 #[derive(Debug, Clone)]
 pub struct BlockProof {
     pub meta: BlockPublicMeta,
-    /// Single interleaved commitment covering all columns (per-tx + state binding).
+    /// Single interleaved commitment covering all columns (per-tx + block spine + state binding).
     pub commitment: InterleavedCommitment,
     /// Public inputs for every transaction in order.
     pub tx_pis: Vec<PublicInputs>,
-    /// SpineGKR Kill-Shot proofs (one per tx).
-    pub tx_spine_proofs: Vec<SpineProofKillShot>,
+    /// Unified block spine Kill-Shot proof (covers all txs in one shot).
+    pub block_spine_proof: BlockSpineProof,
     /// AuthGKR Kill-Shot proofs (one per tx).
     pub tx_auth_proofs: Vec<AuthProofKillShot>,
     /// Algebraic STARK transcripts — no FRI, one per tx.
@@ -90,7 +92,7 @@ pub struct BlockProof {
     pub state_binding_n_cols: u32,
     /// Per-tx column openings at the per-tx terminal points r''_k.
     /// Flat layout: `block_col_openings[k*n_per_tx .. (k+1)*n_per_tx]`.
-    /// If state binding present, appended at the end: `[n_tx*n_per_tx .. n_tx*n_per_tx + sb_n_cols]`.
+    /// Block spine slices follow, then state binding.
     pub block_col_openings: Vec<Block128>,
     /// Block-level degree-2 multipoint sumcheck rounds (log_rows of them).
     pub block_multipoint_rounds: Vec<Vec<Block128>>,
@@ -102,7 +104,7 @@ impl BlockProof {
     pub fn byte_len(&self) -> usize {
         let cap = self.commitment.cap.hashes.len() * 32;
         let alg: usize = self.tx_algebraic.iter().map(|a| a.byte_len()).sum();
-        let spine: usize = self.tx_spine_proofs.iter().map(|s| s.byte_len()).sum();
+        let spine = self.block_spine_proof.byte_len();
         let auth: usize = self.tx_auth_proofs.iter().map(|a| a.byte_len()).sum();
         let col_open = self.block_col_openings.len() * 16;
         let mp: usize = self.block_multipoint_rounds.iter().map(|r| r.len() * 16).sum();
@@ -123,10 +125,11 @@ pub enum ProveBlockError {
 #[derive(Debug)]
 pub enum VerifyBlockError {
     ShapeMismatch,
-    SpineKillShot(usize),
+    BlockSpineKillShot,
+    BlockSpineSliceReconstruction,
     AuthKillShot(usize),
     AuthSpineBridge(usize),
-    SliceReconstruction(usize),
+    AuthSliceReconstruction(usize),
     AlgebraicStark(usize, VerifyError),
     BlockMultipoint,
     FriFailed(String),
@@ -189,24 +192,15 @@ fn reduction_to_transcript(point: &[Block128], value: Block128) -> Vec<Block128>
     out
 }
 
-fn build_slice_claims(
+fn build_auth_slice_claims(
     n_air_cols: usize,
-    spine_r_low: &[Block128],
-    spine_vals: &[Block128],
     auth_r_low: &[Block128],
     auth_vals: &[Block128],
 ) -> Vec<SliceClaim> {
-    let mut claims = Vec::with_capacity(6);
-    for (i, &val) in spine_vals.iter().enumerate() {
-        claims.push(SliceClaim {
-            col_index: n_air_cols + i,
-            eval_point: spine_r_low.to_vec(),
-            value: val,
-        });
-    }
+    let mut claims = Vec::with_capacity(2);
     for (i, &val) in auth_vals.iter().enumerate() {
         claims.push(SliceClaim {
-            col_index: n_air_cols + 4 + i,
+            col_index: n_air_cols + i,
             eval_point: auth_r_low.to_vec(),
             value: val,
         });
@@ -230,8 +224,8 @@ pub fn prove_block(
     let auth_circuit = AuthCircuit::build();
 
     let n_air_cols = witnesses[0].air.n_columns();
-    let n_slice_per_tx: usize = 6; // 4 spine + 2 auth
-    let n_per_tx = n_air_cols + n_slice_per_tx;
+    let n_auth_slices: usize = 2;
+    let n_per_tx = n_air_cols + n_auth_slices;
     let log_len = noid_stark::padded_log_len(witnesses[0].trace.log_rows);
 
     // -------------------------------------------------------------------------
@@ -239,71 +233,57 @@ pub fn prove_block(
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
-    // Stage 2: Build per-tx extended column pools.
+    // Stage 2: Build per-tx column pools + block spine MLE.
     // -------------------------------------------------------------------------
-    // For each tx: AIR columns (padded) + 4 spine slices + 2 auth slices.
-    // All columns for all txs are laid out flat for the single block-wide commit.
+    // Per-tx: AIR columns (padded) + 2 auth slices.
+    // Block-level: unified spine state MLE split into slices.
 
     struct TxPrep {
-        columns: Vec<Vec<Block128>>,           // length n_per_tx
-        spine_slices: Vec<Vec<Block128>>,      // length 4
-        auth_slices: Vec<Vec<Block128>>,       // length 2
-        spine_r_low: Vec<Block128>,
-        spine_r_high: Vec<Block128>,
-        auth_r_low: Vec<Block128>,
-        auth_r_high: Vec<Block128>,
-        spine_slice_vals: Vec<Block128>,
-        auth_slice_vals: Vec<Block128>,
-        extras_transcript: Vec<Block128>,
-        spine_proof: Option<SpineProofKillShot>,
-        auth_proof: Option<AuthProofKillShot>,
+        columns: Vec<Vec<Block128>>,
+        auth_slices: Vec<Vec<Block128>>,
     }
 
-    // Pre-build boundary MLEs (needed before commit for slice derivation).
+    // Collect all slot_state_ins for the unified block spine.
+    let mut all_slot_state_ins: Vec<[Block128; 4]> = Vec::with_capacity(n_tx * 59);
     let mut preps: Vec<TxPrep> = Vec::with_capacity(n_tx);
 
     for w in witnesses.iter() {
         let spine_states = reconstruct_slot_states(&spine_circuit, w.spine_inputs);
-        let spine_boundary = build_boundary_mle(&spine_states);
-
-        let spine_slices = split_mle_into_slices(&spine_boundary, N_BOUNDARY_VARS, BASE_LOG);
+        for (s_in, _) in &spine_states {
+            all_slot_state_ins.push(*s_in);
+        }
 
         let mut columns: Vec<Vec<Block128>> = Vec::with_capacity(n_per_tx);
         for col in &w.trace.columns {
             columns.push(noid_stark::pad_column(col, log_len));
         }
-        for s in &spine_slices {
-            columns.push(s.clone());
-        }
-        // Auth slices are pre-built by the wallet (no secret needed).
         for s in w.auth_slices {
             columns.push(s.clone());
         }
 
         preps.push(TxPrep {
             columns,
-            spine_slices,
             auth_slices: w.auth_slices.to_vec(),
-            spine_r_low: Vec::new(),
-            spine_r_high: Vec::new(),
-            auth_r_low: Vec::new(),
-            auth_r_high: Vec::new(),
-            spine_slice_vals: Vec::new(),
-            auth_slice_vals: Vec::new(),
-            extras_transcript: Vec::new(),
-            spine_proof: None,
-            auth_proof: None,
         });
     }
 
+    // Build unified block spine MLE and split state column into FRI slices.
+    let block_spine_mle = noid_gkr::BlockSpineMle::build(n_tx, &all_slot_state_ins);
+    let block_spine_num_vars = block_spine_mle.num_vars;
+    let block_spine_slices = split_mle_into_slices(
+        &block_spine_mle.state,
+        block_spine_num_vars,
+        BASE_LOG,
+    );
+    let n_block_spine_slices = block_spine_slices.len();
+
     // -------------------------------------------------------------------------
     // Stage 3: Single block-wide interleaved commit.
-    // Includes per-tx columns AND (optionally) state binding columns.
+    // Layout: [per-tx columns | block spine slices | state binding columns].
     // -------------------------------------------------------------------------
     let sb_n_cols = state_binding.map_or(0, |sb| sb.air.n_columns());
     let sb_log_rows = state_binding.map_or(0, |sb| sb.air.log_rows());
 
-    // Pad state binding columns to log_len if present and shorter.
     let sb_padded_columns: Vec<Vec<Block128>> = if let Some(sb) = state_binding {
         sb.columns
             .iter()
@@ -313,10 +293,19 @@ pub fn prove_block(
         Vec::new()
     };
 
+    // Pad block spine slices to log_len (they may be shorter if num_vars < BASE_LOG).
+    let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
+        .iter()
+        .map(|s| noid_stark::pad_column(s, log_len))
+        .collect();
+
     let mut flat_refs: Vec<&[Block128]> = preps
         .iter()
         .flat_map(|p| p.columns.iter().map(|c| c.as_slice()))
         .collect();
+    for s in &spine_padded_slices {
+        flat_refs.push(s.as_slice());
+    }
     for c in &sb_padded_columns {
         flat_refs.push(c.as_slice());
     }
@@ -327,28 +316,13 @@ pub fn prove_block(
     let cap = &commitment.cap;
 
     // -------------------------------------------------------------------------
-    // Stage 4: Per-tx GKR Kill-Shots (seeded with the block-wide cap).
-    // Fully parallel: each tx has independent channels seeded from cap.
+    // Stage 4: GKR Kill-Shots.
+    //   (a) Unified block spine Kill-Shot (all txs in one shot).
+    //   (b) Per-tx auth Kill-Shots (wallet pre-built, replayed for reductions).
     // -------------------------------------------------------------------------
-    struct GkrResult {
-        spine_r_low: Vec<Block128>,
-        spine_r_high: Vec<Block128>,
-        auth_r_low: Vec<Block128>,
-        auth_r_high: Vec<Block128>,
-        spine_slice_vals: Vec<Block128>,
-        auth_slice_vals: Vec<Block128>,
-        extras_transcript: Vec<Block128>,
-        spine_proof: SpineProofKillShot,
-        auth_proof: AuthProofKillShot,
-    }
-
     let tx_body_hashes: Vec<[Block128; 2]> = witnesses
         .iter()
         .map(|w| w.pi.tx_body_hash.as_fields())
-        .collect();
-    let spine_inputs_refs: Vec<&SpineInputs> = witnesses
-        .iter()
-        .map(|w| w.spine_inputs)
         .collect();
     let auth_public_refs: Vec<&AuthPublicInputs> = witnesses
         .iter()
@@ -359,83 +333,71 @@ pub fn prove_block(
         .map(|w| w.auth_proof)
         .collect();
 
-    let gkr_results: Vec<GkrResult> = (0..n_tx)
+    // (a) Unified block spine.
+    let mut spine_channel = Poseidon2bChannel::new();
+    absorb_cap_into_p2b(&mut spine_channel, cap);
+    let (block_spine_proof, block_spine_reductions) = prove_block_spine_killshot(
+        n_tx,
+        &all_slot_state_ins,
+        &tx_body_hashes,
+        &mut spine_channel,
+    );
+
+    // Spine reduction -> slice bridge.
+    // spine_r_low is the BASE_LOG-dimensional opening point for the spine slices.
+    // For the multipoint sumcheck, all participants must share the same hypercube
+    // dimension (log_len). When log_len > BASE_LOG, extend with zeros — the
+    // zero-padded slices evaluate identically at (r_low, 0..0) as at r_low.
+    let spine_r = &block_spine_reductions.state.point;
+    let spine_r_low_base = &spine_r[..BASE_LOG];
+    let spine_r_low: Vec<Block128> = {
+        let mut v = spine_r_low_base.to_vec();
+        v.resize(log_len, Block128::ZERO);
+        v
+    };
+    let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
+
+    // (b) Per-tx auth Kill-Shots (parallel).
+    struct AuthResult {
+        auth_r_low: Vec<Block128>,
+        auth_slice_vals: Vec<Block128>,
+        extras_transcript: Vec<Block128>,
+    }
+
+    let auth_results: Vec<AuthResult> = (0..n_tx)
         .into_par_iter()
         .map(|k| {
-            let claimed = tx_body_hashes[k];
             let prep = &preps[k];
-            let spine_states = reconstruct_slot_states(&spine_circuit, spine_inputs_refs[k]);
+            let mut ch = auth_gkr_channel();
+            let auth_reductions = verify_auth_killshot(
+                auth_proof_refs[k],
+                &auth_circuit,
+                auth_public_refs[k],
+                &mut ch,
+            )
+            .expect("wallet-supplied auth proof must verify");
 
-            // Spine: block prover generates fresh (only needs public SpineInputs).
-            // Auth: wallet pre-built; block prover replays verify to get reductions.
-            let ((spine_proof, spine_reductions), auth_reductions) = rayon::join(
-                || {
-                    let mut ch = Poseidon2bChannel::new();
-                    absorb_cap_into_p2b(&mut ch, cap);
-                    prove_spine_killshot_with_states(&spine_states, claimed, &mut ch)
-                },
-                || {
-                    let mut ch = auth_gkr_channel();
-                    verify_auth_killshot(
-                        auth_proof_refs[k],
-                        &auth_circuit,
-                        auth_public_refs[k],
-                        &mut ch,
-                    )
-                    .expect("wallet-supplied auth proof must verify")
-                },
-            );
-
-            let r_spine = spine_reductions.state.point.clone();
             let r_auth = auth_reductions.state.point.clone();
-            let spine_r_low = r_spine[..BASE_LOG].to_vec();
-            let spine_r_high = r_spine[BASE_LOG..].to_vec();
             let auth_r_low = r_auth[..BASE_LOG].to_vec();
-            let auth_r_high = r_auth[BASE_LOG..].to_vec();
 
-            let spine_slice_vals: Vec<Block128> = prep
-                .spine_slices
-                .iter()
-                .map(|s| noid_core::mle::evaluate::evaluate_slice(s, &spine_r_low))
-                .collect();
             let auth_slice_vals: Vec<Block128> = prep
                 .auth_slices
                 .iter()
                 .map(|s| noid_core::mle::evaluate::evaluate_slice(s, &auth_r_low))
                 .collect();
 
-            let spine_tr = reduction_to_transcript(&r_spine, spine_reductions.state.value);
             let auth_tr = reduction_to_transcript(&r_auth, auth_reductions.state.value);
-            let mut extras = Vec::with_capacity(spine_tr.len() + auth_tr.len());
-            extras.extend_from_slice(&spine_tr);
+            let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
+            extras.extend_from_slice(&spine_extras);
             extras.extend_from_slice(&auth_tr);
 
-            GkrResult {
-                spine_r_low,
-                spine_r_high,
+            AuthResult {
                 auth_r_low,
-                auth_r_high,
-                spine_slice_vals,
                 auth_slice_vals,
                 extras_transcript: extras,
-                spine_proof,
-                auth_proof: auth_proof_refs[k].clone(),
             }
         })
         .collect();
-
-    for (k, res) in gkr_results.into_iter().enumerate() {
-        let prep = &mut preps[k];
-        prep.spine_r_low = res.spine_r_low;
-        prep.spine_r_high = res.spine_r_high;
-        prep.auth_r_low = res.auth_r_low;
-        prep.auth_r_high = res.auth_r_high;
-        prep.spine_slice_vals = res.spine_slice_vals;
-        prep.auth_slice_vals = res.auth_slice_vals;
-        prep.extras_transcript = res.extras_transcript;
-        prep.spine_proof = Some(res.spine_proof);
-        prep.auth_proof = Some(res.auth_proof);
-    }
 
     // -------------------------------------------------------------------------
     // Stage 5: Per-tx algebraic STARK proofs on shared block channel.
@@ -453,19 +415,18 @@ pub fn prove_block(
 
     for (k, w) in witnesses.iter().enumerate() {
         let prep = &preps[k];
-        let slice_claims = build_slice_claims(
+        let auth_res = &auth_results[k];
+        let slice_claims = build_auth_slice_claims(
             n_air_cols,
-            &prep.spine_r_low,
-            &prep.spine_slice_vals,
-            &prep.auth_r_low,
-            &prep.auth_slice_vals,
+            &auth_res.auth_r_low,
+            &auth_res.auth_slice_vals,
         );
 
         let (alg, r_pp_k, claim_k, lambdas_k) = prove_air_interleaved_algebraic(
             w.air,
             &prep.columns,
             w.pi,
-            &prep.extras_transcript,
+            &auth_res.extras_transcript,
             &slice_claims,
             log_len,
             &mut block_channel,
@@ -512,25 +473,30 @@ pub fn prove_block(
     // -------------------------------------------------------------------------
     // Stage 6 (§6): Block-level multipoint sumcheck.
     //
-    // Absorb BLOCK_MULTIPOINT_TAG + flat(M_k[i]) then squeeze mu.
-    // Build pairs:
-    //   A_k(x) = mu^k * eq_ind(r''_k, x)
-    //   B_k(x) = sum_i beta^i * BLOCK_COLS[k*n_per_tx + i](x)
-    // Run degree-2 sumcheck to get r_block.
-    //
-    // If state binding present: it participates as participant index n_tx
-    // with its own r_pp and column openings.
+    // Participants:
+    //   0..n_tx: per-tx (AIR + auth slices), each with n_per_tx columns
+    //   n_tx: block spine slices participant (opened at spine_r_low)
+    //   n_tx+1: state binding (if present)
     // -------------------------------------------------------------------------
-    // Total participants: n_tx per-tx + (1 if state binding)
-    let n_participants = n_tx + if state_binding.is_some() { 1 } else { 0 };
+    let has_spine_participant = true; // always
+    let n_participants = n_tx
+        + if has_spine_participant { 1 } else { 0 }
+        + if state_binding.is_some() { 1 } else { 0 };
+    let spine_participant_idx = n_tx;
+    let sb_participant_idx = n_tx + 1;
 
     // Collect per-tx column openings M_k[i] = MLE(col)(r''_k).
-    let mut block_col_openings: Vec<Block128> = Vec::with_capacity(n_tx * n_per_tx + sb_n_cols);
+    let total_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
+    let mut block_col_openings: Vec<Block128> = Vec::with_capacity(total_cols);
     for k in 0..n_tx {
         let r_pp_k = &tx_r_pp[k];
         for i in 0..n_per_tx {
             block_col_openings.push(noid_stark::mle_eval(&preps[k].columns[i], r_pp_k));
         }
+    }
+    // Block spine slice openings at spine_r_low.
+    for s in &spine_padded_slices {
+        block_col_openings.push(noid_stark::mle_eval(s, &spine_r_low));
     }
     // State binding column openings at sb_r_pp.
     if state_binding.is_some() {
@@ -544,7 +510,6 @@ pub fn prove_block(
     let mu = block_channel.get_random_point();
     let beta_block = block_channel.get_random_point();
 
-    // Horner weights mu^k for all participants (n_tx + optional state binding).
     let mu_powers: Vec<Block128> = {
         let mut v = Vec::with_capacity(n_participants);
         let mut cur = Block128::ONE;
@@ -555,43 +520,47 @@ pub fn prove_block(
         v
     };
 
-    // Inner Horner weights beta_block^i. We need enough for the widest
-    // participant (max of n_per_tx and sb_n_cols).
-    let max_cols_per_participant = n_per_tx.max(sb_n_cols);
+    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols);
     let beta_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(max_cols_per_participant);
+        let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
-        for _ in 0..max_cols_per_participant {
+        for _ in 0..max_cols {
             v.push(cur);
             cur *= beta_block;
         }
         v
     };
 
-    // Block sumcheck target = sum_k mu^k * sum_i beta^i * M_k[i].
+    // Block sumcheck target = sum over all participants.
     let block_target: Block128 = {
         let mut target = Block128::ZERO;
-        // Per-tx participants
         for k in 0..n_tx {
             let inner: Block128 = (0..n_per_tx)
                 .map(|i| beta_powers[i] * block_col_openings[k * n_per_tx + i])
                 .fold(Block128::ZERO, |a, b| a + b);
             target += mu_powers[k] * inner;
         }
+        // Block spine participant
+        let spine_offset = n_tx * n_per_tx;
+        let inner_spine: Block128 = (0..n_block_spine_slices)
+            .map(|i| beta_powers[i] * block_col_openings[spine_offset + i])
+            .fold(Block128::ZERO, |a, b| a + b);
+        target += mu_powers[spine_participant_idx] * inner_spine;
         // State binding participant
         if sb_n_cols > 0 {
-            let sb_offset = n_tx * n_per_tx;
+            let sb_offset = spine_offset + n_block_spine_slices;
             let inner: Block128 = (0..sb_n_cols)
                 .map(|i| beta_powers[i] * block_col_openings[sb_offset + i])
                 .fold(Block128::ZERO, |a, b| a + b);
-            target += mu_powers[n_tx] * inner;
+            target += mu_powers[sb_participant_idx] * inner;
         }
         target
     };
 
-    // Collect all r_pp points: per-tx plus optional state binding.
+    // Collect all r_pp points for all participants.
     let all_r_pp: Vec<&[Block128]> = {
         let mut v: Vec<&[Block128]> = tx_r_pp.iter().map(|r| r.as_slice()).collect();
+        v.push(&spine_r_low); // block spine participant
         if sb_n_cols > 0 {
             v.push(&sb_r_pp);
         }
@@ -609,11 +578,11 @@ pub fn prove_block(
 
     // B-side: B_k[j] = sum_i beta^i * cols_k[i][j].
     let hyper_len = 1usize << log_len;
-    let pairs_b: Vec<Vec<Block128>> = (0..n_participants)
+
+    let pairs_b_owned: Vec<Vec<Block128>> = (0..n_participants)
         .into_par_iter()
         .map(|k| {
             if k < n_tx {
-                // Per-tx participant
                 (0..hyper_len)
                     .map(|j| {
                         let mut acc = Block128::ZERO;
@@ -623,8 +592,17 @@ pub fn prove_block(
                         acc
                     })
                     .collect()
+            } else if k == spine_participant_idx {
+                (0..hyper_len)
+                    .map(|j| {
+                        let mut acc = Block128::ZERO;
+                        for i in 0..n_block_spine_slices {
+                            acc += beta_powers[i] * spine_padded_slices[i][j];
+                        }
+                        acc
+                    })
+                    .collect()
             } else {
-                // State binding participant
                 (0..hyper_len)
                     .map(|j| {
                         let mut acc = Block128::ZERO;
@@ -637,16 +615,15 @@ pub fn prove_block(
             }
         })
         .collect();
+    let pairs_b: Vec<&[Block128]> = pairs_b_owned.iter().map(|v| v.as_slice()).collect();
 
-    let _ = &tx_lambdas; // unused now; kept for future stage K refinements
+    let _ = &tx_lambdas;
     let _ = &tx_claims;
-
-    let pairs_b_refs: Vec<&[Block128]> = pairs_b.iter().map(|v| v.as_slice()).collect();
 
     let (block_mp_rounds, block_mp_challenges) =
         noid_stark::multipoint_batch::prove_multipoint_sumcheck(
             pairs_a,
-            pairs_b_refs,
+            pairs_b,
             block_target,
             &mut block_channel,
         );
@@ -667,24 +644,23 @@ pub fn prove_block(
     );
 
     let tx_pis: Vec<PublicInputs> = witnesses.iter().map(|w| w.pi.clone()).collect();
-    let tx_spine_proofs: Vec<SpineProofKillShot> =
-        preps.iter_mut().map(|p| p.spine_proof.take().expect("spine_proof set")).collect();
     let tx_auth_proofs: Vec<AuthProofKillShot> =
-        preps.iter_mut().map(|p| p.auth_proof.take().expect("auth_proof set")).collect();
+        witnesses.iter().map(|w| w.auth_proof.clone()).collect();
 
     Ok(BlockProof {
         meta: BlockPublicMeta {
             prev_block_state_root,
             n_tx: n_tx as u32,
             n_air_per_tx: n_air_cols as u32,
-            n_slice_per_tx: n_slice_per_tx as u32,
+            n_auth_slices_per_tx: n_auth_slices as u32,
             log_rows: witnesses[0].trace.log_rows as u32,
+            n_block_spine_slices: n_block_spine_slices as u32,
             state_binding_n_cols: sb_n_cols as u32,
             state_binding_log_rows: sb_log_rows as u32,
         },
         commitment,
         tx_pis,
-        tx_spine_proofs,
+        block_spine_proof,
         tx_auth_proofs,
         tx_algebraic,
         state_binding_algebraic: sb_algebraic,
@@ -700,21 +676,6 @@ pub fn prove_block(
 // ---------------------------------------------------------------------------
 
 /// Verify a `BlockProof`.
-///
-/// `airs` must contain one AIR per transaction, each instantiated with the
-/// correct boundary pins for that transaction. All AIRs must share the same
-/// `n_columns()` and `log_rows()`.
-///
-/// The caller must supply `spine_inputs` and `auth_public_list` slices
-/// (length N) corresponding to the N transactions; these are needed to
-/// re-verify the GKR Kill-Shots and to reconstruct the `extras_transcript`
-/// for the algebraic STARK replay.
-///
-/// PRIVACY: `auth_public_list` contains only public fields (address, tag,
-/// tx_body_hash). The verifier never sees `spend_secret`.
-///
-/// `state_binding_air` is required if the proof contains a state binding
-/// algebraic transcript (i.e. `proof.state_binding_n_cols > 0`).
 pub fn verify_block(
     airs: &[&dyn Air],
     proof: &BlockProof,
@@ -725,13 +686,16 @@ pub fn verify_block(
     let meta = &proof.meta;
     let n_tx = meta.n_tx as usize;
     let n_air_cols = meta.n_air_per_tx as usize;
-    let n_slice_per_tx = meta.n_slice_per_tx as usize;
-    let n_per_tx = n_air_cols + n_slice_per_tx;
+    let n_auth_slices = meta.n_auth_slices_per_tx as usize;
+    let n_per_tx = n_air_cols + n_auth_slices;
+    let n_block_spine_slices = meta.n_block_spine_slices as usize;
     let sb_n_cols = meta.state_binding_n_cols as usize;
     let log_len = noid_stark::padded_log_len(meta.log_rows as usize);
     let has_state_binding = sb_n_cols > 0;
-    let n_participants = n_tx + if has_state_binding { 1 } else { 0 };
-    let total_committed_cols = n_tx * n_per_tx + sb_n_cols;
+    let n_participants = n_tx + 1 + if has_state_binding { 1 } else { 0 };
+    let spine_participant_idx = n_tx;
+    let sb_participant_idx = n_tx + 1;
+    let total_committed_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
 
     if airs.len() != n_tx {
         return Err(VerifyBlockError::ShapeMismatch);
@@ -740,7 +704,6 @@ pub fn verify_block(
         return Err(VerifyBlockError::ShapeMismatch);
     }
     if proof.tx_pis.len() != n_tx
-        || proof.tx_spine_proofs.len() != n_tx
         || proof.tx_auth_proofs.len() != n_tx
         || proof.tx_algebraic.len() != n_tx
         || proof.block_col_openings.len() != total_committed_cols
@@ -764,16 +727,11 @@ pub fn verify_block(
         }
     }
 
-    let spine_circuit = SpineCircuit::build();
     let auth_circuit = AuthCircuit::build();
     let cap = &proof.commitment.cap;
 
     // -------------------------------------------------------------------------
-    // Stage 1: State continuity is now enforced by BlockStateBinding (S.5).
-    // -------------------------------------------------------------------------
-
-    // -------------------------------------------------------------------------
-    // Stage 2: Per-tx GKR Kill-Shots + slice reconstruction + algebraic STARK.
+    // Stage 2: Unified block spine + per-tx auth Kill-Shots + algebraic STARK.
     // -------------------------------------------------------------------------
     let mut block_channel = Channel::new();
     let [sr0, sr1] = hash_to_fields(&meta.prev_block_state_root);
@@ -781,6 +739,46 @@ pub fn verify_block(
     block_channel.observe_field_elem(sr1);
     absorb_cap(&mut block_channel, cap);
 
+    // (a) Unified block spine Kill-Shot verification.
+    let tx_body_hashes: Vec<[Block128; 2]> = proof
+        .tx_pis
+        .iter()
+        .map(|pi| pi.tx_body_hash.as_fields())
+        .collect();
+
+    let block_spine_reductions = {
+        let mut ch = Poseidon2bChannel::new();
+        absorb_cap_into_p2b(&mut ch, cap);
+        verify_block_spine_killshot(
+            &proof.block_spine_proof,
+            n_tx,
+            &tx_body_hashes,
+            &mut ch,
+        )
+        .ok_or(VerifyBlockError::BlockSpineKillShot)?
+    };
+
+    // Block spine slice reconstruction.
+    // Extend spine_r_low to log_len for consistency with the multipoint hypercube.
+    let spine_r = &block_spine_reductions.state.point;
+    let spine_r_low: Vec<Block128> = {
+        let mut v = spine_r[..BASE_LOG].to_vec();
+        v.resize(log_len, Block128::ZERO);
+        v
+    };
+    let spine_r_high = &spine_r[BASE_LOG..];
+    let spine_offset = n_tx * n_per_tx;
+    let spine_slice_vals: Vec<Block128> = (0..n_block_spine_slices)
+        .map(|i| proof.block_col_openings[spine_offset + i])
+        .collect();
+    let recon_spine =
+        noid_core::mle::split::reconstruct_from_slices(&spine_slice_vals, spine_r_high);
+    if recon_spine != block_spine_reductions.state.value {
+        return Err(VerifyBlockError::BlockSpineSliceReconstruction);
+    }
+    let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
+
+    // (b) Per-tx auth Kill-Shots + algebraic STARK.
     let mut tx_r_pp: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
     let mut tx_final_claims: Vec<Block128> = Vec::with_capacity(n_tx);
 
@@ -791,19 +789,6 @@ pub fn verify_block(
         let auth_public = &auth_public_list[k];
         let claimed = pi.tx_body_hash.as_fields();
 
-        // GKR Kill-Shots.
-        let spine_reductions = {
-            let mut ch = Poseidon2bChannel::new();
-            absorb_cap_into_p2b(&mut ch, cap);
-            verify_spine_killshot(
-                &proof.tx_spine_proofs[k],
-                &spine_circuit,
-                spine_inputs,
-                claimed,
-                &mut ch,
-            )
-            .ok_or(VerifyBlockError::SpineKillShot(k))?
-        };
         let auth_reductions = {
             let mut ch = auth_gkr_channel();
             verify_auth_killshot(
@@ -815,14 +800,10 @@ pub fn verify_block(
             .ok_or(VerifyBlockError::AuthKillShot(k))?
         };
 
-        // Auth/Spine bridge: tx_body_hash must agree unconditionally.
+        // Auth/Spine bridge: tx_body_hash must agree.
         if auth_public.tx_body_hash != claimed {
             return Err(VerifyBlockError::AuthSpineBridge(k));
         }
-        // Address check: only live inputs. Dummy inputs carry zero-address
-        // in spine but derive_address(zero_secret) in auth — intentionally
-        // different. Dummy slots have is_deactivation=false so they cannot
-        // authorize any spend.
         let n_live = pi.n_live_inputs as usize;
         for i in 0..n_live {
             let owner_hi = spine_inputs.input_leaves[i][2];
@@ -832,44 +813,26 @@ pub fn verify_block(
             }
         }
 
-        // Slice reconstruction.
-        let r_spine = &spine_reductions.state.point;
+        // Auth slice reconstruction.
         let r_auth = &auth_reductions.state.point;
-        let spine_r_low = &r_spine[..BASE_LOG];
-        let spine_r_high = &r_spine[BASE_LOG..];
         let auth_r_low = &r_auth[..BASE_LOG];
         let auth_r_high = &r_auth[BASE_LOG..];
+        let auth_slice_vals = &alg.slice_claimed_values[..n_auth_slices];
 
-        let spine_slice_vals = &alg.slice_claimed_values[..4];
-        let auth_slice_vals = &alg.slice_claimed_values[4..6];
-
-        let recon_spine =
-            noid_core::mle::split::reconstruct_from_slices(spine_slice_vals, spine_r_high);
-        if recon_spine != spine_reductions.state.value {
-            return Err(VerifyBlockError::SliceReconstruction(k));
-        }
         let recon_auth =
             noid_core::mle::split::reconstruct_from_slices(auth_slice_vals, auth_r_high);
         if recon_auth != auth_reductions.state.value {
-            return Err(VerifyBlockError::SliceReconstruction(k));
+            return Err(VerifyBlockError::AuthSliceReconstruction(k));
         }
 
         // Rebuild extras_transcript and slice_claims.
-        let spine_tr = reduction_to_transcript(r_spine, spine_reductions.state.value);
         let auth_tr = reduction_to_transcript(r_auth, auth_reductions.state.value);
-        let mut extras = Vec::with_capacity(spine_tr.len() + auth_tr.len());
-        extras.extend_from_slice(&spine_tr);
+        let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
+        extras.extend_from_slice(&spine_extras);
         extras.extend_from_slice(&auth_tr);
 
-        let slice_claims = build_slice_claims(
-            n_air_cols,
-            spine_r_low,
-            spine_slice_vals,
-            auth_r_low,
-            auth_slice_vals,
-        );
+        let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
 
-        // Algebraic STARK replay on the shared block channel.
         let (r_pp_k, final_claim_k) =
             verify_air_interleaved_algebraic(airs[k], pi, alg, &extras, &slice_claims, &mut block_channel)
                 .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
@@ -930,18 +893,17 @@ pub fn verify_block(
         v
     };
 
-    let max_cols_per_participant = n_per_tx.max(sb_n_cols);
+    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols);
     let beta_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(max_cols_per_participant);
+        let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
-        for _ in 0..max_cols_per_participant {
+        for _ in 0..max_cols {
             v.push(cur);
             cur *= beta_block;
         }
         v
     };
 
-    // target = sum_k mu^k * sum_i beta^i * M_k[i].
     let block_target: Block128 = {
         let mut target = Block128::ZERO;
         for k in 0..n_tx {
@@ -950,17 +912,21 @@ pub fn verify_block(
                 .fold(Block128::ZERO, |a, b| a + b);
             target += mu_powers[k] * inner;
         }
+        let inner_spine: Block128 = (0..n_block_spine_slices)
+            .map(|i| beta_powers[i] * proof.block_col_openings[spine_offset + i])
+            .fold(Block128::ZERO, |a, b| a + b);
+        target += mu_powers[spine_participant_idx] * inner_spine;
         if has_state_binding {
-            let sb_offset = n_tx * n_per_tx;
+            let sb_off = spine_offset + n_block_spine_slices;
             let inner: Block128 = (0..sb_n_cols)
-                .map(|i| beta_powers[i] * proof.block_col_openings[sb_offset + i])
+                .map(|i| beta_powers[i] * proof.block_col_openings[sb_off + i])
                 .fold(Block128::ZERO, |a, b| a + b);
-            target += mu_powers[n_tx] * inner;
+            target += mu_powers[sb_participant_idx] * inner;
         }
         target
     };
 
-    let _ = &tx_final_claims; // not used in target — block_col_openings is authoritative
+    let _ = &tx_final_claims;
 
     let (block_sc_challenges, block_final_claim) =
         noid_stark::multipoint_batch::verify_multipoint_sumcheck(
@@ -995,13 +961,6 @@ pub fn verify_block(
 
     // -------------------------------------------------------------------------
     // Stage 5: Block sumcheck terminal identity.
-    //
-    //   block_final_claim == Σ_k mu^k · eq(r''_k, r_block) ·
-    //                         Σ_i beta^i · m[k*n_per_tx + i]
-    //
-    // where m[..] = proof.mixed_opening.all_openings (FRI openings at r_block).
-    // Binds the FRI-supplied openings to the block sumcheck's randomness.
-    // Includes state binding participant (index n_tx) if present.
     // -------------------------------------------------------------------------
     let m = &proof.mixed_opening.all_openings;
     if m.len() < total_committed_cols {
@@ -1016,14 +975,22 @@ pub fn verify_block(
         }
         expected += mu_powers[k] * eq_k * inner;
     }
+    // Block spine participant
+    let eq_spine = noid_core::mle::eq::eq_ind(&spine_r_low, &r_block);
+    let mut inner_spine = Block128::ZERO;
+    for i in 0..n_block_spine_slices {
+        inner_spine += beta_powers[i] * m[spine_offset + i];
+    }
+    expected += mu_powers[spine_participant_idx] * eq_spine * inner_spine;
+    // State binding participant
     if has_state_binding {
         let eq_sb = noid_core::mle::eq::eq_ind(&sb_r_pp, &r_block);
-        let sb_offset = n_tx * n_per_tx;
+        let sb_off = spine_offset + n_block_spine_slices;
         let mut inner = Block128::ZERO;
         for i in 0..sb_n_cols {
-            inner += beta_powers[i] * m[sb_offset + i];
+            inner += beta_powers[i] * m[sb_off + i];
         }
-        expected += mu_powers[n_tx] * eq_sb * inner;
+        expected += mu_powers[sb_participant_idx] * eq_sb * inner;
     }
     if expected != block_final_claim {
         return Err(VerifyBlockError::BlockMultipoint);

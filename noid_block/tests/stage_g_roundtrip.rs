@@ -98,7 +98,7 @@ fn block_one_tx_roundtrip() {
         .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
-    assert_eq!(proof.meta.n_slice_per_tx, 6);
+    assert_eq!(proof.meta.n_auth_slices_per_tx, 2);
     assert_eq!(proof.tx_pis.len(), 1);
     assert_eq!(proof.tx_algebraic.len(), 1);
 

@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "alice_sends_bob"
 harness = false
+
+[[bench]]
+name = "block_scaling"
+harness = false
