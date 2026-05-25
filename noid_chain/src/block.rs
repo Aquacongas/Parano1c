@@ -22,7 +22,7 @@ use crate::block_header::BlockHeader;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 
 /// Block version on the wire.
-pub const BLOCK_VERSION: u8 = 1;
+// REMOVED: no network yet, no backwards compatibility needed.
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 /// The economic / consensus limit is enforced elsewhere; this just keeps
@@ -195,7 +195,6 @@ impl Block {
             "transactions exceed BLOCK_MAX_TXS"
         );
 
-        buf.push(BLOCK_VERSION);
         self.header.encode(buf);
         put_u32(buf, self.transactions.len() as u32);
         for tx in &self.transactions {
@@ -210,10 +209,6 @@ impl Block {
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
-        let v = take(src, 1)?[0];
-        if v != BLOCK_VERSION {
-            return Err(WireError::UnknownVersion);
-        }
         let header = BlockHeader::decode(src)?;
         let n = take_u32(src)? as usize;
         if n > BLOCK_MAX_TXS {
@@ -555,25 +550,4 @@ mod tests {
         assert_eq!(Block::from_bytes(&bytes), Err(WireError::TrailingBytes));
     }
 
-    #[test]
-    fn block_rejects_wrong_version() {
-        let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: [0u8; 32],
-                tx_root: [0u8; 32],
-                timestamp: 0,
-                height: 0,
-                miner_address: Address([0u8; 32]),
-                nonce: 0,
-                difficulty_target: [0xFFu8; 32],
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [2u8; 32],
-            },
-            transactions: vec![],
-        };
-        let mut bytes = block.to_bytes();
-        bytes[0] = 0xFF;
-        assert_eq!(Block::from_bytes(&bytes), Err(WireError::UnknownVersion));
-    }
 }

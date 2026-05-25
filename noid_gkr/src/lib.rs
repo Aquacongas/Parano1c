@@ -30,8 +30,6 @@ pub mod merkle_shift;
 pub mod merkle_unified;
 pub mod mle_layout;
 pub mod oracle;
-pub mod perm_sumcheck;
-pub mod product_sumcheck;
 pub mod spine_degree7;
 pub mod spine_killshot;
 pub mod spine_mle;
@@ -66,13 +64,6 @@ pub use circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
 pub use layers::{evaluate_permutation, round_kind, PermLayerWitness, RoundKind};
 pub use mle_layout::{pack_column, PermColumn, PermMle, N_PERM_CELLS, N_PERM_VARS};
 pub use oracle::{evaluate_spine, SpineWitness};
-pub use perm_sumcheck::{
-    active_mle, build_active_mle, build_rc_mle, prove_perm, prove_perm_with_mle, rc_mle,
-    verify_perm, PermProof, PermStateClaim, N_STATE_CLAIMS_PER_SLOT,
-};
-pub use product_sumcheck::{
-    compute_product_claim, prove_product, prove_square, verify_product, ProductProof, RoundEvals,
-};
 pub use spine_degree7::{
     prove_spine_degree7, verify_spine_degree7, SpineD7Proof, SpineD7Reduction,
     SPINE_D7_ROUND_DEGREE,

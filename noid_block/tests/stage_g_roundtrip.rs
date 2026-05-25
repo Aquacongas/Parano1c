@@ -3,88 +3,183 @@
 
 //! Stage G acceptance tests for `noid_block`.
 //!
-//! These are heavy integration tests that run a full block prove/verify
-//! roundtrip with realistic fixtures.  Marked `#[ignore]` to keep
-//! ordinary `cargo test` runs quick; run with `--ignored` or via the
-//! release-mode bench harness.
+//! Full block prove/verify roundtrip using the production TxLogicAir path.
+//! Marked `#[ignore]` to keep ordinary `cargo test` runs quick.
 
-#![allow(clippy::needless_range_loop)]
-
-use noid_air::composition::tx_validity_with_spine::fixture;
+use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
+use noid_air::Air;
 use noid_block::{prove_block, verify_block, TxBlockWitness};
-use noid_core::{Block128, TowerField};
 use noid_core::mle::split::split_mle_into_slices;
+use noid_core::{Block128, TowerField};
 use noid_gkr::{
     auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
+    AuthCircuit, AuthInputs, AuthPublicInputs, AuthProofKillShot, SpineInputs, N_AUTH_INPUTS,
     N_AUTH_UNIFIED_VARS,
 };
+use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, SpendSecret, TxBodyHash};
+use noid_tx::{PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
-fn spine_inputs_from_composite(
-    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
-) -> SpineInputs {
-    let pins = comp.boundary_pins();
-    SpineInputs {
+fn mk_secret(seed: u128) -> [Block128; 2] {
+    [
+        Block128::from(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xA5A5_A5A5_A5A5_A5A5),
+        Block128::from(seed.wrapping_mul(0xBF58476D1CE4E5B9) ^ 0x5A5A_5A5A_5A5A_5A5A),
+    ]
+}
+
+fn fields_to_bytes(f: [Block128; 2]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&f[0].to_u128().to_le_bytes());
+    out[16..].copy_from_slice(&f[1].to_u128().to_le_bytes());
+    out
+}
+
+/// Build a minimal balanced TxBody for test purposes.
+fn mk_test_body() -> TxBody {
+    let secrets = [mk_secret(0xA1), mk_secret(0xB2)];
+    let addrs: Vec<_> = secrets
+        .iter()
+        .map(|s| derive_address(&SpendSecret(fields_to_bytes(*s))))
+        .collect();
+
+    let mut inputs = vec![
+        TxInput {
+            slot_index: 0,
+            value: 100,
+            owner: addrs[0],
+            spend_secret: SpendSecret(fields_to_bytes(secrets[0])),
+            auth_tag: noid_poseidon2b::primitives::AuthTag([0u8; 32]),
+            valid: true,
+        },
+        TxInput {
+            slot_index: 1,
+            value: 50,
+            owner: addrs[1],
+            spend_secret: SpendSecret(fields_to_bytes(secrets[1])),
+            auth_tag: noid_poseidon2b::primitives::AuthTag([0u8; 32]),
+            valid: true,
+        },
+    ];
+    while inputs.len() < MAX_INPUTS {
+        inputs.push(TxInput::dummy());
+    }
+
+    let mut outputs = vec![
+        TxOutput { slot_index: 10, value: 80, owner: addrs[0], valid: true },
+        TxOutput { slot_index: 11, value: 60, owner: addrs[1], valid: true },
+    ];
+    while outputs.len() < MAX_OUTPUTS {
+        outputs.push(TxOutput::dummy());
+    }
+
+    let mut body = TxBody {
+        epoch_anchor: [0xAA; 32],
+        fee: 10,
+        inputs,
+        outputs,
+        is_coinbase: false,
+    };
+
+    // Fill in auth_tags now that we have the body hash.
+    let pins = boundary_pins_from_body(&body);
+    let tx_body_hash = pins.tx_body_hash;
+    for i in 0..2 {
+        let tag = hash_auth_tag(
+            &SpendSecret(fields_to_bytes(secrets[i])),
+            &TxBodyHash(fields_to_bytes(tx_body_hash)),
+        );
+        body.inputs[i].auth_tag = tag;
+    }
+    body
+}
+
+/// Build TxLogicAir + trace + PublicInputs + SpineInputs from a body.
+fn build_fixture(body: &TxBody) -> (TxLogicAir, noid_air::Trace, PublicInputs, SpineInputs) {
+    use noid_tx::compute_claims_commitment;
+
+    let pins = boundary_pins_from_body(body);
+    let air = TxLogicAir::new(pins);
+    let witness = witness_from_body(body);
+    let trace = air.build_trace(&witness);
+
+    let n_live_inputs = body.inputs.iter().filter(|i| i.valid).count() as u8;
+    let n_live_outputs = body.outputs.iter().filter(|o| o.valid).count() as u8;
+    let claims = compute_claims_commitment(&body.inputs, &body.outputs);
+
+    let mut is_activation = [false; MAX_OUTPUTS];
+    for (j, o) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+        is_activation[j] = o.valid;
+    }
+    let mut is_deactivation = [false; MAX_INPUTS];
+    for (i, inp) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
+        is_deactivation[i] = inp.valid;
+    }
+
+    let pi = PublicInputs {
+        epoch_anchor: body.epoch_anchor,
+        tx_body_hash: TxBodyHash(fields_to_bytes(pins.tx_body_hash)),
+        fee: body.fee,
+        n_live_inputs,
+        n_live_outputs,
+        coinbase_credit: 0,
+        log_slots: 24,
+        claims_commitment: claims,
+        is_activation,
+        is_deactivation,
+    };
+
+    let spine_inputs = SpineInputs {
         epoch_anchor: pins.epoch_anchor,
         fee_leaf: pins.fee_leaf,
         input_leaves: pins.input_leaf_absorb,
         output_leaves: pins.output_leaf_absorb,
         is_coinbase_leaf: pins.is_coinbase_leaf,
         pad_leaf: [Block128::ZERO; 2],
-    }
+    };
+
+    (air, trace, pi, spine_inputs)
 }
 
-/// Simulates what the wallet does: generates auth proof locally with secrets,
-/// then returns only public data + proof + slices (no secrets leak).
-fn wallet_auth_for_composite(
-    comp: &noid_air::composition::tx_validity_with_spine::TxValidityCompositeWithSpine,
+/// Wallet-side: generate auth proof + slices from the body secrets.
+fn wallet_auth(
+    body: &TxBody,
+    tx_body_hash: [Block128; 2],
 ) -> (AuthPublicInputs, AuthProofKillShot, Vec<Vec<Block128>>) {
-    use fixture::mk_secret;
+    let secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
     let circuit = AuthCircuit::build();
-    let pi = comp.public_inputs();
-    let n_live = pi.n_live_inputs as usize;
-    let secrets = [
-        mk_secret(0xA1),
-        mk_secret(0xB2),
-        mk_secret(0xC3),
-        mk_secret(0xD4),
-    ];
+    let n_live = body.inputs.iter().filter(|i| i.valid).count();
+
     let mut spend_secret = [[Block128::ZERO; 2]; N_AUTH_INPUTS];
     for i in 0..n_live {
         spend_secret[i] = secrets[i];
     }
-    let tx_body_hash = comp.tx_body_hash_fields();
-    let (addr, tag) = compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
+
+    let (expected_address, expected_auth_tag) =
+        compute_auth_boundary(&circuit, spend_secret, tx_body_hash);
     let auth_inputs = AuthInputs {
         spend_secret,
         tx_body_hash,
-        expected_address: addr,
-        expected_auth_tag: tag,
+        expected_address,
+        expected_auth_tag,
     };
 
-    // Wallet generates auth proof locally (uses spend_secret internally).
     let mut ch = auth_gkr_channel();
-    let (proof, _reductions) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
-
-    // Wallet builds auth MLE slices (needs secret for MLE construction).
+    let (proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
     let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
 
-    // Only public data + proof + slices leave the wallet.
-    (auth_inputs.to_public(), proof, auth_slices)
+    (auth_inputs.to_public(), proof, slices)
 }
 
 #[test]
 #[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
 fn block_one_tx_roundtrip() {
-    let comp = fixture::build_honest_realistic();
-    let trace = comp.build_trace();
-    let pi = comp.public_inputs();
-    let spine_inputs = spine_inputs_from_composite(&comp);
-    let (auth_public, auth_proof, auth_slices) = wallet_auth_for_composite(&comp);
+    let body = mk_test_body();
+    let (air, trace, pi, spine_inputs) = build_fixture(&body);
+    let tx_body_hash = pi.tx_body_hash.as_fields();
+    let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
-        air: comp.air(),
+        air: &air as &dyn Air,
         trace: &trace,
         pi: &pi,
         spine_inputs: &spine_inputs,
@@ -99,10 +194,8 @@ fn block_one_tx_roundtrip() {
 
     assert_eq!(proof.meta.n_tx, 1);
     assert_eq!(proof.meta.n_auth_slices_per_tx, 2);
-    assert_eq!(proof.tx_pis.len(), 1);
-    assert_eq!(proof.tx_algebraic.len(), 1);
 
-    let air_ref: &dyn noid_air::Air = comp.air();
+    let air_ref: &dyn Air = &air;
     verify_block(
         &[air_ref],
         &proof,
@@ -116,14 +209,13 @@ fn block_one_tx_roundtrip() {
 #[test]
 #[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
 fn block_verify_rejects_tampered_epoch_anchor() {
-    let comp = fixture::build_honest_realistic();
-    let trace = comp.build_trace();
-    let pi = comp.public_inputs();
-    let spine_inputs = spine_inputs_from_composite(&comp);
-    let (auth_public, auth_proof, auth_slices) = wallet_auth_for_composite(&comp);
+    let body = mk_test_body();
+    let (air, trace, pi, spine_inputs) = build_fixture(&body);
+    let tx_body_hash = pi.tx_body_hash.as_fields();
+    let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
-        air: comp.air(),
+        air: &air as &dyn Air,
         trace: &trace,
         pi: &pi,
         spine_inputs: &spine_inputs,
@@ -132,13 +224,13 @@ fn block_verify_rejects_tampered_epoch_anchor() {
         auth_slices: &auth_slices,
     };
 
-    let prev_block_state_root = pi.epoch_anchor;
-    let mut proof = prove_block(prev_block_state_root, std::slice::from_ref(&witness), None)
+    let prev_state_root = pi.epoch_anchor;
+    let mut proof = prove_block(prev_state_root, std::slice::from_ref(&witness), None)
         .expect("honest prove_block must succeed");
 
     proof.tx_pis[0].epoch_anchor[0] ^= 0x01;
 
-    let air_ref: &dyn noid_air::Air = comp.air();
+    let air_ref: &dyn Air = &air;
     let result = verify_block(
         &[air_ref],
         &proof,
@@ -148,6 +240,6 @@ fn block_verify_rejects_tampered_epoch_anchor() {
     );
     assert!(
         result.is_err(),
-        "verify_block must reject tampered epoch_anchor, got Ok(())"
+        "verify_block must reject tampered epoch_anchor"
     );
 }

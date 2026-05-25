@@ -24,7 +24,6 @@ pub enum WireError {
     ShapeMismatch,
     InvalidBool,
     TrailingBytes,
-    UnknownVersion,
 }
 
 #[inline]
@@ -204,12 +203,6 @@ impl TxOutput {
 // TxBody
 // ---------------------------------------------------------------------------
 
-/// Wire-format version. Bumped:
-/// - `1 → 2` at Stage E.1: `TxOutput.slot_index: u32`.
-/// - `2 → 3` at Stage E.5.f₁: `TxBody.is_coinbase: bool`.
-/// - `3 → 4` at Stage S.1: `prev/new_state_root` → `epoch_anchor`.
-pub const TX_BODY_VERSION: u8 = 4;
-
 impl TxBody {
     /// Encode with spend_secret in each input. **Local wallet storage only.**
     /// MUST NOT be used for network payloads — use `encode_public` instead.
@@ -228,7 +221,6 @@ impl TxBody {
             self.fee,
         );
 
-        buf.push(TX_BODY_VERSION);
         put_digest(buf, &self.epoch_anchor);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
@@ -259,7 +251,6 @@ impl TxBody {
             self.fee,
         );
 
-        buf.push(TX_BODY_VERSION);
         put_digest(buf, &self.epoch_anchor);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
@@ -275,7 +266,7 @@ impl TxBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 32
+            32
                 + 16
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
@@ -289,10 +280,6 @@ impl TxBody {
 
     /// Decode full format (includes spend_secret). Local storage only.
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
-        let v = take(src, 1)?[0];
-        if v != TX_BODY_VERSION {
-            return Err(WireError::UnknownVersion);
-        }
         let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
         if fee > u64::MAX as u128 {
@@ -339,10 +326,6 @@ impl TxBody {
 
     /// Decode public network format (spend_secret absent in inputs → zeroed).
     pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
-        let v = take(src, 1)?[0];
-        if v != TX_BODY_VERSION {
-            return Err(WireError::UnknownVersion);
-        }
         let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
         if fee > u64::MAX as u128 {
@@ -628,7 +611,6 @@ mod tests {
     #[test]
     fn tx_body_rejects_too_many_inputs() {
         let mut buf = Vec::new();
-        buf.push(TX_BODY_VERSION);
         buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
         buf.extend_from_slice(&[0u8; 16]); // fee
         put_u32(&mut buf, (crate::types::MAX_INPUTS + 1) as u32);
@@ -641,7 +623,6 @@ mod tests {
         // circuit uses 64-bit operands; u128 fee above this range cannot
         // be faithfully represented.
         let mut buf = Vec::new();
-        buf.push(TX_BODY_VERSION);
         buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
         // fee = u64::MAX + 1 as little-endian u128
         let fee_too_large: u128 = u64::MAX as u128 + 1;
@@ -665,20 +646,6 @@ mod tests {
         let mut bytes = body.to_bytes();
         bytes.push(0xFF);
         assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::TrailingBytes));
-    }
-
-    #[test]
-    fn tx_body_rejects_wrong_version() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![],
-            is_coinbase: false,
-        };
-        let mut bytes = body.to_bytes();
-        bytes[0] = 0xFF;
-        assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::UnknownVersion));
     }
 
     #[test]

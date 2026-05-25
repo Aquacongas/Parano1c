@@ -11,126 +11,144 @@ The cryptographic engine is complete and tested:
 ```
 noid_core         GF(2^128) tower, CLMUL/AVX2, MLE, sumcheck, NTT, transcript.
 noid_poseidon2b   Poseidon2b native + AIR (perm, sponge, domain tags, compress).
-noid_fri          Generic FRI (legacy, used by IVC).
+noid_fri          Generic FRI (foundational dep: Channel, Blake3, NTT, code).
 noid_fri_binius   Production PCS: interleaved commit, compact FRI, mixed opening.
 noid_binius       Bit/byte packing for DA bandwidth reduction.
 noid_gkr          Kill-Shot GKR: Spine (59-slot), Auth (20-slot), Merkle (32-slot).
-noid_air          AIRs + gates + compositions. Production: tx_validity_with_spine.
-noid_stark        STARK engine: prove_tx / verify_tx (Spine→Auth→STARK).
-noid_ivc          Linear folding accumulator.
-noid_tx           TxBody, PublicInputs, wire serialization.
-noid_chain        State (FriState), block header, blocks, DA packing, wire encoding.
+noid_air          AIRs + gates + compositions. Production: TxLogicAir (Stage S).
+noid_stark        STARK engine: prove_logic / verify_logic (Split GKR, Stage S).
+noid_tx           TxBody, TxIntent, PublicInputs, C_claimed, wire serialization.
+noid_chain        State (FriState), block header, blocks, DA packing, nullifier set.
 noid_block        Block aggregation via deferred-opening (prove_block / verify_block).
 bench_prover      Performance harness.
 ```
 
-Performance (per-tx, 8 thread, measured):
-- Prove: 725 ms | Verify: 145 ms | Size: 55.5 KB
+**Phase 1 (Stage S) — DONE:**
+- Stateless architecture: TxLogicAir (no state columns), prove_logic / verify_logic.
+- Epoch anchor replaces prev_state_root in tx_body_hash.
+- C_claimed bridge (claims commitment) linking LogicProof to BlockStateBinding.
+- BlockStateBinding native verification (noid_chain).
+- NullifierSet rolling window.
+- TxIntent wire format (spend_secret stripped from network payload).
 
-What exists: proof math, state machine, block aggregation, IVC, wire formats.
-What does NOT exist: networking, mempool, RPC, wallet CLI, mining, difficulty adjustment, consensus validation, node binary.
+**Phase 1.5 (Stage Q) — NOT YET DONE:**
+- Per-tx algebraic STARK still sequential (shared block channel).
+- Measured at 100 tx: prove_block ~43s (target: <8s on 8 cores).
+- Blocking issue: Stage 5 of prove_block uses shared Fiat-Shamir channel.
+- See Phase 1.5 section for the implementation plan.
+
+Performance (per-tx, 8 thread, Stage S, measured):
+- LogicProof (wallet): ~102 ms
+- Block prove (100 tx): ~43 s (sequential; target after Q: <8 s)
+- verify_block (100 tx): ~15 s (sequential; target after Q.5: <4 s)
+
+What exists: proof math, state machine, block aggregation, wire formats,
+  stateless wallet proof (LogicProof), block-level state binding.
+What does NOT exist: networking, mempool, RPC, wallet CLI, mining,
+  difficulty adjustment, consensus validation, node binary.
 
 ---
 
-## Phase 1 — Stateless Architecture (Stage S)
+## Phase 1 — Stateless Architecture (Stage S) — **DONE**
 
 **Goal:** Separate wallet-side logic proof from full-node-side state binding.
 Light Node (wallet) proves only math (balance, auth, body).
 Full Node proves state (Merkle openings, BlockStateBinding) and assembles BlockProof.
 External Miner receives 248-byte block template header and brute-forces nonce.
 
-### S.1 Epoch Anchor
+### S.1 Epoch Anchor — ✅ DONE
 
 Replace `prev_state_root` with `epoch_anchor` in tx body hash.
 
-- Change `noid_tx::TxBody.prev_state_root` → `epoch_anchor: Digest`
-- Change `hash_tx_body()` first arg to `epoch_anchor`
-- Define `ANCHOR_DEPTH = 6`; `epoch_anchor = H_BLOCK(header[height - 6])`
-- Update `SpineInputs` in `noid_gkr`
-- Update all downstream tests
-- **Done when:** Spine GKR roundtrip passes with epoch_anchor
+- `noid_tx::TxBody.epoch_anchor: Digest` ✅
+- `hash_tx_body()` takes `epoch_anchor` as first arg ✅
+- `ANCHOR_DEPTH = 6` defined in `noid_tx::types` ✅
+- `SpineInputs` in `noid_gkr` updated ✅
+- Wire format bumped (version history removed — no network yet) ✅
 
-### S.2 Claims Commitment (C_claimed)
+### S.2 Claims Commitment (C_claimed) — ✅ DONE
 
 Wallet commits to claimed slot values without proving state.
 
-- `compute_claims_commitment(inputs, outputs) -> Digest` in `noid_tx`
-- Poseidon2b sponge over `(slot_index, value, owner_hi, owner_lo)` for each claim
-- Add `claims_commitment: Digest` to `PublicInputs`
-- LogicProof absorbs C_claimed into channel
-- **Done when:** tamper any slot value → proof fails
+- `compute_claims_commitment(inputs, outputs) -> Digest` in `noid_tx::claims` ✅
+- Poseidon2b sponge under `TAG_CLAIMS` over `(slot_index, value, owner_hi, owner_lo)` ✅
+- `claims_commitment: Digest` in `PublicInputs` ✅
+- LogicProof absorbs C_claimed into Fiat-Shamir channel ✅
+- Tamper any slot value → proof fails ✅ (tested)
 
-### S.3 TxLogicAir
+### S.3 TxLogicAir — ✅ DONE
 
-Extract pure-logic AIR (no FriStateOpen, no Merkle).
+Pure-logic AIR (no FriStateOpen, no state columns).
 
-- Create `noid_air::composition::tx_logic` module
-- Contains: balance_gate, range_gate, tx_body_spine pin, selector gates
-- Does NOT contain: FriStateOpenAir, FriStateCombinerComposite
-- Reduced `log_rows` (10-11 instead of 13)
-- **Done when:** `air.check(trace)` passes for balance/range/auth/spine
+- `noid_air::composition::tx_logic::TxLogicAir` ✅
+- Contains: balance_gate, range_gate, tx_body_spine pin, selector gates ✅
+- Does NOT contain: FriStateOpenAir, FriStateCombinerComposite ✅
+- Note: `log_rows` stays at 13 (same as SPINE_LOG_ROWS); reducing to
+  10-11 deferred — spine boundary pins require log_rows=13.
 
-### S.4 LogicProof Pipeline
+### S.4 LogicProof Pipeline — ✅ DONE
 
-New `prove_logic` / `verify_logic` in `noid_stark`.
+`prove_logic` / `verify_logic` in `noid_stark`.
 
-- `prove_logic(LogicWitness) -> LogicProof`
-- LogicWitness: TxLogicAir trace, SpineInputs (epoch_anchor), AuthInputs, C_claimed
-- Same pipeline: SpineGKR → AuthGKR → STARK over TxLogicAir
-- `verify_logic(proof, pi) -> Result<()>`
-- **Done when:** end-to-end roundtrip with verify_logic
+- **Split GKR:** wallet proves AuthGKR only (needs spend_secret).
+  SpineGKR is deferred to block-prover who has public SpineInputs. ✅
+- `prove_logic(LogicWitness) -> LogicProof` ✅
+- `verify_logic(air, pi, spine_inputs, auth_public, proof) -> Result<()>` ✅
+- Auth/Spine bridge enforced: `auth_public.tx_body_hash == pi.tx_body_hash`,
+  `expected_address[i] == spine_inputs.input_leaves[i][2..3]` ✅
+- End-to-end roundtrip tested ✅
 
-### S.5 BlockStateBindingAir
+### S.5 BlockStateBinding — ✅ DONE
 
-Block-level state opening AIR.
+Block-level state binding (native, non-circuit).
 
-- Reuse FriStateOpenAir pattern at block scope
-- All slots from all N txs (up to 12K)
-- gamma-RLC accumulator batches openings into one FRI claim
-- Bridge: opened slot values must match each tx's C_claimed
-- Proves pre-state (inputs exist, outputs empty) and post-state (inputs zeroed, outputs filled)
-- **Done when:** 3-tx block roundtrip, tamper detection on bridge
+- `noid_chain::state_binding::BlockStateBinding` ✅
+- Opens all input/output slots, verifies pre-conditions ✅
+- C_claimed bridge: recomputes from opened slots, checks equality ✅
+- `BlockStateBindingAir` in `noid_air::airs::block_state_binding` ✅
+- Integrated into `prove_block` via `StateBindingBlockWitness` ✅
 
-### S.6 Integrated BlockProof
+### S.6 Integrated BlockProof — ✅ DONE
 
-Combine LogicProofs + BlockStateBinding.
+LogicProofs + BlockStateBinding aggregated in `prove_block`.
 
-- Modify `prove_block()` to accept `Vec<LogicProof>` + full state
-- Full Node: verify LogicProofs → build BlockStateBinding → aggregate via deferred-opening
-- State continuity: prev_block_state_root → apply all txs → new_block_state_root
-- After BlockProof ready: form header, push to external miner via Block Template API
-- **Done when:** 3-tx block roundtrip; each component tamper-tested
+- `prove_block(prev_state_root, witnesses, state_binding)` ✅
+- Full Node: verifies auth Kill-Shots → unified block spine Kill-Shot →
+  algebraic STARK per tx → multipoint sumcheck → single FRI opening ✅
+- State continuity: prev_block_state_root tracked in `BlockPublicMeta` ✅
+- `noid_block::full_node::prove_block_full` for full-node use ✅
 
-### S.7 Nullifier Set
+### S.7 Nullifier Set — ✅ DONE
 
-Anti-double-inclusion rolling window.
+- `noid_chain::nullifier::NullifierSet` ✅
+- Rolling window of ANCHOR_DEPTH=6 blocks of tx_body_hashes ✅
+- O(1) lookup, O(1) amortised insertion ✅
+- Pruning on oldest block exit ✅
 
-- `NullifierSet` in `noid_chain::ChainState`
-- Window = ANCHOR_DEPTH blocks of tx_body_hashes
-- Reject at mempool if duplicate within window
-- Prune on oldest block exit
-- **Done when:** double-inclusion rejected at validation
+### S.8 TxIntent Wire Format — ✅ DONE
 
-### S.8 TxIntent Wire Format
-
-Network payload for stateless transactions.
-
-- `TxIntent { tx_body, logic_proof, claims_commitment, claimed_slots }`
-- Wire serialization in `noid_tx::wire`
-- No prev/new state_root in per-tx wire
-- **Done when:** serialize/deserialize roundtrip
+- `noid_tx::intent::TxIntent` ✅
+- `encode()` uses `encode_public()` — spend_secret stripped from wire ✅
+- `decode()` uses `decode_public()` — spend_secret → zero on received side ✅
+- `spend_secret_absent_from_wire` test verifies bytes do not contain secret ✅
+- Version byte removed (no network yet, no backward compat needed) ✅
 
 ---
 
-## Phase 1.5 — Parallel Per-Tx Algebraic STARK (Stage Q)
+## Phase 1.5 — Parallel Per-Tx Algebraic STARK (Stage Q) — **NOT YET DONE**
 
-**Goal:** Reduce `prove_block` from 61s to ~8s at 100 tx (8 cores) by parallelizing
+**Goal:** Reduce `prove_block` from ~43s to <8s at 100 tx (8 cores) by parallelizing
 the per-tx algebraic STARK phase. Currently the main bottleneck preventing 100-tx blocks
 from fitting within the 60-second block time budget.
 
+**Current measured baseline (Stage S, after Phase 1):**
+- 100-tx block prove: ~43 s (sequential Stage 5)
+- 100-tx block verify: ~15 s (sequential Stage 2b)
+- Per-tx amortised prove: ~434 ms
+
 ### Problem Statement
 
-Stage 5 of `prove_block` (`noid_block/src/lib.rs:416-439`) runs per-tx algebraic STARKs
+Stage 5 of `prove_block` (`noid_block/src/lib.rs`) runs per-tx algebraic STARKs
 sequentially on a shared Fiat-Shamir channel. Each tx takes ~615ms. For N=100:
 `100 * 615ms = 61.5s` — exceeds the 60s block time.
 
@@ -439,7 +457,7 @@ Where:
 This ensures:
 - No collision with SpineGKR channel (uses Poseidon2bChannel, different type)
 - No collision with Stage 6 channel (uses BLOCK_MULTIPOINT_TAG)
-- No collision with per-tx STARK in standalone `prove_tx` (different domain tag)
+- No collision with existing `prove_logic` STARK (different domain tag)
 - Protocol version prevents cross-version transcript reuse
 - Future stages cannot accidentally reuse the same channel state
 

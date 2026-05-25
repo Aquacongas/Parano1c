@@ -64,8 +64,8 @@ pub use airs::{
     BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, CarryInitGate, CarryNextGate,
     CarryRippleAir, FaSumGate, LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate,
     PartialSboxKillGate, PermLayout, PermMdsBlendGate, PoseidonPermColumns, RangeGateAir,
-    SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins, TxBodySpineComposite, TxValidityAir,
-    TxValidityCol, WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
+    SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins, TxBodySpineComposite,
+    WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
     BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
     BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
     BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
@@ -80,9 +80,6 @@ pub use airs::{
     TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
     TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE, TXBODY_MERKLE_SLOT_LOG_ROWS,
     TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS, TX_BODY_MERKLE_COL_OFFSET,
-    TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS, TX_VALIDITY_3B4_PINNED_N_COLS,
-    TX_VALIDITY_BALANCE_COL_OFFSET, TX_VALIDITY_INPUT_VALID_MASK_COL, TX_VALIDITY_LOG_ROWS,
-    TX_VALIDITY_N_COLS, TX_VALIDITY_OUTPUT_VALID_MASK_COL, TX_VALIDITY_ROWS, TX_VALIDITY_SLOTS,
 };
 pub use gates::{
     emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector, emit_public_cell,

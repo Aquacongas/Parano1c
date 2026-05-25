@@ -84,8 +84,6 @@ impl TxIntent {
 
 use crate::wire::WireError;
 
-const TX_INTENT_VERSION: u8 = 1;
-
 impl ClaimedSlot {
     pub const WIRE_SIZE: usize = 4 + 8 + 16 + 16; // 44 bytes
 
@@ -118,7 +116,6 @@ impl ClaimedSlot {
 
 impl TxIntent {
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        buf.push(TX_INTENT_VERSION);
         // Network wire: encode TxBody WITHOUT spend_secret in inputs.
         self.tx_body.encode_public(buf);
         buf.extend_from_slice(&self.tx_body_hash.0);
@@ -145,11 +142,6 @@ impl TxIntent {
         if src.is_empty() {
             return Err(WireError::Truncated);
         }
-        let version = src[0];
-        if version != TX_INTENT_VERSION {
-            return Err(WireError::UnknownVersion);
-        }
-        *src = &src[1..];
 
         // Network wire: decode TxBody WITHOUT spend_secret (spend_secret → zero).
         let tx_body = TxBody::decode_public(src)?;
@@ -308,20 +300,6 @@ mod tests {
         let mut bytes = intent.to_bytes();
         bytes.push(0xFF);
         assert_eq!(TxIntent::from_bytes(&bytes), Err(WireError::TrailingBytes));
-    }
-
-    #[test]
-    fn rejects_wrong_version() {
-        let intent = TxIntent {
-            tx_body: mk_body(),
-            tx_body_hash: TxBodyHash([0; 32]),
-            claims_commitment: [0; 32],
-            claimed_slots: vec![],
-            logic_proof_bytes: vec![],
-        };
-        let mut bytes = intent.to_bytes();
-        bytes[0] = 0xFF;
-        assert_eq!(TxIntent::from_bytes(&bytes), Err(WireError::UnknownVersion));
     }
 
     #[test]

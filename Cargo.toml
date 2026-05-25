@@ -9,7 +9,6 @@ members = [
     "noid_chain",
     "noid_air",
     "noid_stark",
-    "noid_ivc",
     "noid_binius",
     "noid_gkr",
     "noid_block",

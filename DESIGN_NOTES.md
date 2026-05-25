@@ -303,19 +303,26 @@ A "check" (payment receipt) = {version, tx_body, logic_proof, inclusion_receipt}
 
 ---
 
-## 11. What Changes from Current Implementation
+## 11. What Changed from Original Implementation — ✅ DONE
 
-| Component | Before | After |
+The stateless architecture (Stage S) has been fully implemented.
+This table reflects the transformation from the original per-tx state-bound
+design to the current two-layer LogicProof + BlockStateBinding architecture.
+
+| Component | Before | After (current) |
 |-----------|--------|-------|
-| `noid_tx::body_hash` | L0 = prev_state_root | L0 = epoch_anchor |
-| `noid_air::airs::fri_state_open` | In per-tx AIR | Moved to block-level AIR |
-| `noid_air::composition::tx_validity_*` | Includes FriStateOpen | LogicAir only (balance, range, auth, spine) |
-| `noid_stark::prove_tx` | Full proof with state | LogicProof only (no state binding) |
-| `noid_block` | Aggregates full TxProofs | Aggregates LogicProofs + BlockStateBinding |
-| `PublicInputs` | prev_state_root, new_state_root | epoch_anchor, C_claimed, claimed_slots |
-| `SpineInputs.prev_state_root` | state root [2 lanes] | epoch_anchor [2 lanes] |
+| `noid_tx::body_hash` | L0 = prev_state_root | L0 = epoch_anchor ✅ |
+| `noid_air::airs::fri_state_open` | In per-tx AIR | Removed entirely; replaced by `BlockStateBindingAir` at block scope ✅ |
+| `noid_air::airs::fri_state_combiner` | In per-tx AIR | Removed entirely ✅ |
+| Per-tx AIR | `TxValidityCompositeWithSpine` (state + balance + spine) | `TxLogicAir` (balance + range + spine pin; NO state columns) ✅ |
+| `noid_stark::prove_tx` | Full proof with Spine+Auth GKR | Removed; replaced by `prove_logic` (wallet: AuthGKR only) + `prove_block` (block-prover: SpineGKR + aggregation) ✅ |
+| `noid_block` | Aggregates full `TxProof`s | Aggregates `LogicProof`s + unified block SpineGKR + BlockStateBinding ✅ |
+| `PublicInputs` | prev_state_root, new_state_root | epoch_anchor, C_claimed, claimed_slots ✅ |
+| `SpineInputs` | prev_state_root [2 lanes] | epoch_anchor [2 lanes] ✅ |
+| `TxIntent` wire | spend_secret included | spend_secret stripped (encode_public) ✅ |
 | Wallet API | Request slot + Merkle path | Request slot index only |
 | Re-prove frequency | Every block (~100%) | Only on slot conflict (~0.01%) |
+| Wire version byte | `TX_BODY_VERSION=4`, `BLOCK_VERSION=1` | Removed (no network yet) ✅ |
 
 ---
 

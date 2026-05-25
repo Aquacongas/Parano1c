@@ -673,23 +673,17 @@ packed into 1024 `Block128` words with opening at a random point
 - AdditiveNTT on the binary tower.
 - Poseidon2b Fiat–Shamir transcript.
 
-### 15.0.3 IVC (`noid_ivc`)
+### 15.0.3 Block Aggregation (`noid_block`)
 
-Linear folding accumulator with state
+Stage G deferred-opening aggregation: single interleaved Merkle tree
+over all N per-tx columns + block-level SpineGKR Kill-Shot + N algebraic
+per-tx STARKs (no FRI per tx) + block-level multipoint sumcheck + one
+FRI-Binius mixed opening. This is the current (Phase 1 / Stage S)
+implementation.
 
-```
-  { log_len, z, y_acc, column_commitments,
-    per_step_openings, per_step_proofs }
-```
-
-- `fold_step_prove` — commits the next column, opens it at the
-  shared point `z`, absorbs a Fiat–Shamir challenge `α`, updates
-  `y_acc += α · y`.
-- `decide` — replays the transcript, verifies every FRI opening, and
-  checks `y_acc == Σ α_k · y_k`.
-
-Soundness: characteristic-2 XOR linearity plus Schwartz–Zippel in
-`α`. The test `fold_three_decide_ok` exercises a three-step fold.
+IVC linear folding (`noid_ivc`) was a prototype that has been
+removed. A recursive chain accumulator (`noid_recursive`) is planned
+for Phase 7 (Stage H) to achieve O(1) historical verification.
 
 ---
 

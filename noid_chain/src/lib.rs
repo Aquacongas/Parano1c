@@ -36,7 +36,6 @@ pub use da::{
 
 pub use block::{
     apply_block, compute_tx_root, proof_transcript_hash, Block, BlockApplyError, BLOCK_MAX_TXS,
-    BLOCK_VERSION,
 };
 pub use block_header::{hash_block_header, BlockHeader};
 pub use nullifier::NullifierSet;

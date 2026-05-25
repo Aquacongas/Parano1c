@@ -1,79 +1,65 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
-
-#![allow(clippy::needless_range_loop)]
-
-//! `TxBodySpineComposite` — Stage 1.5 composite trace stub.
+//! `TxBodySpineComposite` — composite trace for wallet-side proving.
 //!
-//! Stitches `TxValidityAir::new_3b4_with_skeleton_selector_pins(13)`
-//! (log_rows lifted 8 → 13, variant B2 block-then-mask per
-//! `CRYPTO.md §Stage 1.5`) with
-//! `TxBodyMerkleAir::new_with_boundary_pins(pins)` into a single AIR at
-//! `log_rows = 13`. Stage 1.5 is design-freeze only: this module
-//! delivers the column layout, the trace builder, and the declared
-//! `TxvLiveMask` public column, but introduces zero new cross-AIR
-//! constraints. Stage 1b consumes `TxvLiveMask` to gate O1 leaf-payload
-//! pins.
+//! Stitches the witness/balance block (width `TXV_BLOCK_N_COLS = 78`)
+//! with `TxBodyMerkleAir::new_with_boundary_pins(pins)` into a single
+//! AIR at `log_rows = 13`.
 //!
 //! # Column layout
 //!
-//! - `[0, TX_VALIDITY_3B4_PINNED_N_COLS)` → TxValidity block
-//!   (width 78, constraints reference these indices unchanged).
+//! - `[0, TXV_BLOCK_N_COLS)` → witness + balance block (width 78).
 //! - `[TX_BODY_MERKLE_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET + MERKLE_BAND_WIDTH)`
-//!   → TxBodyMerkle band (two `tx_body_hash` lanes only; GKR owns the
+//!   → TxBodyMerkle band (two `tx_body_hash` lanes; GKR owns the
 //!   59-perm soundness).
 //! - tail column → `TxvLiveMask` `PublicColumn`.
-//!
-//! # Soundness
-//!
-//! Each sub-AIR's constraint set is sound at `log_rows = 13` without
-//! modification:
-//!
-//! - TxValidity: every constraint is parametrized by `log_rows`, and
-//!   its balance-selector / skeleton-selector programmes already
-//!   zero-extend past row 12. Dead rows carry zero witness values and
-//!   every constraint self-zeroes there.
-//! - TxBodyMerkle: its native `log_rows = 13`, so the column-shift is
-//!   the only transformation.
-//!
-//! Stage 2(b) implements the cross-AIR tx-body payload tie via four
-//! additional `PublicColumn` declarations on TxValidity's tx-body
-//! witness columns (`SlotIndex`, `Value`, `OwnerHi`, `OwnerLo`). The
-//! programmes are derived from the same
-//! `TxBodyMerkleBoundaryPins.{input,output}_leaf_absorb` scalars that
-//! Stage 1b already binds into the Merkle side. Because both sides
-//! reduce to the same verifier-known programmes, the cross-AIR
-//! consistency is closed by defence-in-depth rather than a cross-row
-//! indicator: no new gates, no new witness columns, and `TxvLiveMask`
-//! is not needed as a gate selector (the dead tail is pinned to zero
-//! by the programme itself).
 
 use crate::airs::tx_body_merkle::{
     TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_PERMS,
 };
-use crate::airs::tx_validity::{TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_PINNED_N_COLS};
 use crate::gates::PublicColumn;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{Block128, TowerField};
 use noid_tx::types::TxBody;
 use noid_tx::{MAX_INPUTS, MAX_OUTPUTS};
 
-/// Column offset of the TxValidity block inside the composite. Zero by
-/// convention so TxValidity's native column indices round-trip.
+/// Column offset of the witness/balance block. Zero by convention.
 pub const TXV_COL_OFFSET: usize = 0;
 
-/// Column offset of the TxBodyMerkle block inside the composite.
-/// TxValidity occupies `[0, TX_VALIDITY_3B4_PINNED_N_COLS)`.
-pub const TX_BODY_MERKLE_COL_OFFSET: usize = TX_VALIDITY_3B4_PINNED_N_COLS;
+/// Width of the witness + balance block inside the composite.
+/// = TX_VALIDITY_N_COLS(10) + BALANCE_N_COLS(66) + 2 mask cols = 78.
+/// Previously `TXV_BLOCK_N_COLS` from the legacy AIR.
+pub const TXV_BLOCK_N_COLS: usize = 78;
 
-/// Native rows count for `TxValidityAir` at its Stage-3b-4 floor
-/// (`log_rows = 8`). Composite rows `[0, TXV_LIVE_ROWS)` carry live
-/// TxValidity witness; rows `[TXV_LIVE_ROWS, 2^13)` are the B2 dead
-/// tail.
+/// Column offset of the TxBodyMerkle block inside the composite.
+pub const TX_BODY_MERKLE_COL_OFFSET: usize = TXV_BLOCK_N_COLS;
+
+/// Witness region row count at the floor log_rows = 8: rows
+/// `[0, TXV_LIVE_ROWS)` carry live witness; rows `[TXV_LIVE_ROWS, 2^13)`
+/// are the dead tail.
 pub const TXV_LIVE_ROWS: usize = 1 << 8;
 
 /// Composite `log_rows`, fixed to the TxBodyMerkle native value.
 pub const SPINE_LOG_ROWS: usize = TXBODY_MERKLE_LOG_ROWS;
+
+// ---------------------------------------------------------------------------
+// Column indices for witness fields inside the composite trace.
+// These match the original TxValidityCol enum values.
+// ---------------------------------------------------------------------------
+
+const COL_SLOT_INDEX: usize = TXV_COL_OFFSET + 2;
+const COL_VALUE: usize = TXV_COL_OFFSET + 3;
+const COL_OWNER_HI: usize = TXV_COL_OFFSET + 4;
+const COL_OWNER_LO: usize = TXV_COL_OFFSET + 5;
+const COL_AUTH_TAG_HI: usize = TXV_COL_OFFSET + 8;
+const COL_AUTH_TAG_LO: usize = TXV_COL_OFFSET + 9;
+
+// Column indices for the two row-domain mask columns
+// (the "+2" in TXV_BLOCK_N_COLS = 10 + 66 + 2).
+const COL_INPUT_VALID: usize = TXV_COL_OFFSET + 0;
+const COL_OUTPUT_VALID: usize = TXV_COL_OFFSET + 1;
+const COL_INPUT_VALID_MASK: usize = TXV_COL_OFFSET + 76; // TX_VALIDITY_3B4_N_COLS = 76
+const COL_OUTPUT_VALID_MASK: usize = TXV_COL_OFFSET + 77;
+const TX_VALIDITY_N_COLS: usize = 10;
+const BALANCE_COL_OFFSET: usize = TX_VALIDITY_N_COLS; // = 10
 
 /// Wraps an existing `Constraint` with a uniform column offset applied
 /// to both `columns()` and `shifted_columns()`. `evaluate` forwards the
@@ -148,84 +134,36 @@ impl Constraint for ShiftedColumnsConstraint {
     }
 }
 
-/// Stage 2(b) — programme for one of the four TxValidity tx-body
-/// witness columns (`SlotIndex`, `Value`, `OwnerHi`, `OwnerLo`),
-/// derived from `TxBodyMerkleBoundaryPins.{input,output}_leaf_absorb`.
+/// Stage 2(b) — programme for one of the four tx-body witness columns
+/// (slot_index=2, value=3, owner_hi=4, owner_lo=3), derived from
+/// `TxBodyMerkleBoundaryPins.{input,output}_leaf_absorb`.
 ///
-/// Layout on composite rows (native `TxValidityAir::build_trace_3b4`
-/// places tx-body fields on rows `[0, MAX_INPUTS)` and
-/// `[MAX_INPUTS, MAX_INPUTS + MAX_OUTPUTS)`; dead tail is zero):
-///
-/// - `SlotIndex`: input row `i` carries `input_leaf_absorb[i][0]`;
-///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][0]`
-///   (Stage E.1: per-output `slot_index` bound by the body hash).
-/// - `Value`: input row `i` carries `input_leaf_absorb[i][1]`;
-///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][1]`.
-/// - `OwnerHi`: input row `i` carries `input_leaf_absorb[i][2]`;
-///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][2]`.
-/// - `OwnerLo`: input row `i` carries `input_leaf_absorb[i][3]`;
-///   output row `MAX_INPUTS + j` carries `output_leaf_absorb[j][3]`.
-///
-/// Lane ordering matches both `hash_input_leaf` and (Stage E.1)
-/// `hash_output_leaf`: `[slot_index, value, owner_hi, owner_lo]`.
-fn txv_tx_body_col_programme(col: TxValidityCol, pins: &TxBodyMerkleBoundaryPins) -> Vec<Block128> {
+/// `lane` is the index into each leaf_absorb tuple: 0=slot_index,
+/// 1=value, 2=owner_hi, 3=owner_lo.
+fn txv_tx_body_col_programme(lane: usize, pins: &TxBodyMerkleBoundaryPins) -> Vec<Block128> {
     let total = 1usize << SPINE_LOG_ROWS;
     let mut out = vec![Block128::ZERO; total];
-    match col {
-        TxValidityCol::SlotIndex => {
-            for i in 0..MAX_INPUTS {
-                out[i] = pins.input_leaf_absorb[i][0];
-            }
-            for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][0];
-            }
-        }
-        TxValidityCol::Value => {
-            for i in 0..MAX_INPUTS {
-                out[i] = pins.input_leaf_absorb[i][1];
-            }
-            for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][1];
-            }
-        }
-        TxValidityCol::OwnerHi => {
-            for i in 0..MAX_INPUTS {
-                out[i] = pins.input_leaf_absorb[i][2];
-            }
-            for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][2];
-            }
-        }
-        TxValidityCol::OwnerLo => {
-            for i in 0..MAX_INPUTS {
-                out[i] = pins.input_leaf_absorb[i][3];
-            }
-            for j in 0..MAX_OUTPUTS {
-                out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][3];
-            }
-        }
-        _ => panic!("txv_tx_body_col_programme: column {col:?} is not a tx-body payload column"),
+    for i in 0..MAX_INPUTS {
+        out[i] = pins.input_leaf_absorb[i][lane];
+    }
+    for j in 0..MAX_OUTPUTS {
+        out[MAX_INPUTS + j] = pins.output_leaf_absorb[j][lane];
     }
     out
 }
 
-/// Stage 2(b) — emit the four `PublicColumn`s that pin TxValidity's
-/// tx-body witness columns to the Stage-1b leaf-absorb pins.
+/// Stage 2(b) — emit the four `PublicColumn`s that pin tx-body
+/// witness columns to the Stage-1b leaf-absorb pins.
 pub fn emit_txv_tx_body_public_columns(pins: &TxBodyMerkleBoundaryPins) -> Vec<PublicColumn> {
-    [
-        TxValidityCol::SlotIndex,
-        TxValidityCol::Value,
-        TxValidityCol::OwnerHi,
-        TxValidityCol::OwnerLo,
-    ]
-    .into_iter()
-    .map(|col| {
-        PublicColumn::new(
-            TXV_COL_OFFSET + col.index(),
-            txv_tx_body_col_programme(col, pins),
-        )
-    })
-    .collect()
+    // col indices: slot_index=COL_SLOT_INDEX(2), value=COL_VALUE(3),
+    //              owner_hi=COL_OWNER_HI(4), owner_lo=COL_OWNER_LO(5).
+    [COL_SLOT_INDEX, COL_VALUE, COL_OWNER_HI, COL_OWNER_LO]
+        .into_iter()
+        .enumerate()
+        .map(|(lane, col)| {
+            PublicColumn::new(col, txv_tx_body_col_programme(lane, pins))
+        })
+        .collect()
 }
 
 /// `TxvLiveMask` programme: ONE on `[0, TXV_LIVE_ROWS)`, ZERO on the
@@ -275,62 +213,68 @@ pub struct TxBodySpineComposite {
 
 impl TxBodySpineComposite {
     /// Build the composite from the Stage-1 boundary pins.
-    /// `log_rows = 13` shared; TxValidity lifted to the same shape via
-    /// `new_3b4_with_skeleton_selector_pins(13)`.
     pub fn new(pins: TxBodyMerkleBoundaryPins) -> Self {
-        let txv_air = TxValidityAir::new_3b4_with_skeleton_selector_pins(SPINE_LOG_ROWS);
-        assert_eq!(
-            txv_air.n_columns(),
-            TX_VALIDITY_3B4_PINNED_N_COLS,
-            "TxValidityAir::new_3b4_with_skeleton_selector_pins width drifted from TX_VALIDITY_3B4_PINNED_N_COLS"
+        use crate::airs::balance_gate::{
+            emit_balance_constraints, emit_balance_selector_public_columns,
+        };
+        use crate::gates::{emit_rows_must_be_zero, BoolGate};
+
+        let log_rows = SPINE_LOG_ROWS;
+        let n_rows = 1usize << log_rows;
+
+        // --- Witness + balance constraints (replaces TxValidityAir) ---
+        let mut txv_constraints: Vec<Box<dyn Constraint>> = vec![
+            Box::new(BoolGate::new(COL_INPUT_VALID)),
+            Box::new(BoolGate::new(COL_OUTPUT_VALID)),
+        ];
+        txv_constraints.extend(emit_balance_constraints(BALANCE_COL_OFFSET));
+
+        let mut txv_publics: Vec<PublicColumn> =
+            emit_balance_selector_public_columns(BALANCE_COL_OFFSET, log_rows);
+
+        // Row-domain mask for InputValid: forbidden rows MAX_INPUTS..n_rows
+        let input_forbidden: Vec<usize> = (MAX_INPUTS..n_rows).collect();
+        let (pc_in, g_in) = emit_rows_must_be_zero(
+            COL_INPUT_VALID_MASK,
+            &input_forbidden,
+            n_rows,
+            COL_INPUT_VALID,
         );
-        assert_eq!(txv_air.log_rows(), SPINE_LOG_ROWS);
-        let (txv_constraints, txv_publics) = txv_air.into_parts();
+        txv_publics.push(pc_in);
+        txv_constraints.push(g_in);
+
+        // Row-domain mask for OutputValid: forbidden rows 0..MAX_INPUTS ∪ MAX_INPUTS+MAX_OUTPUTS..n_rows
+        let mut output_forbidden: Vec<usize> = (0..MAX_INPUTS).collect();
+        output_forbidden.extend((MAX_INPUTS + MAX_OUTPUTS)..n_rows);
+        let (pc_out, g_out) = emit_rows_must_be_zero(
+            COL_OUTPUT_VALID_MASK,
+            &output_forbidden,
+            n_rows,
+            COL_OUTPUT_VALID,
+        );
+        txv_publics.push(pc_out);
+        txv_constraints.push(g_out);
 
         let merkle_n_cols = merkle_band_width();
 
-        // Composite isolation invariant: the TxValidity block
-        // [0, TX_VALIDITY_3B4_PINNED_N_COLS) and the TxBodyMerkle block
-        // [TX_BODY_MERKLE_COL_OFFSET, TX_BODY_MERKLE_COL_OFFSET + merkle_n_cols)
-        // do not overlap, and the TxvLiveMask column sits strictly
-        // past the TxBodyMerkle block. Any future column added to
-        // either sub-AIR must preserve this layout or Stage 1b's
-        // cross-AIR pins lose their ground truth.
-        assert_eq!(
-            TXV_COL_OFFSET, 0,
-            "TxValidity block must start at composite column 0"
-        );
-        assert_eq!(
-            TX_BODY_MERKLE_COL_OFFSET, TX_VALIDITY_3B4_PINNED_N_COLS,
-            "TxBodyMerkle offset must equal TxValidity width (block disjointness)"
-        );
+        assert_eq!(TXV_COL_OFFSET, 0);
+        assert_eq!(TX_BODY_MERKLE_COL_OFFSET, TXV_BLOCK_N_COLS);
         let mask_col = txv_live_mask_col();
-        assert_eq!(
-            mask_col,
-            TX_BODY_MERKLE_COL_OFFSET + merkle_n_cols,
-            "TxvLiveMask must sit immediately after the TxBodyMerkle block"
-        );
+        assert_eq!(mask_col, TX_BODY_MERKLE_COL_OFFSET + merkle_n_cols);
 
         let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
         let mut public_columns: Vec<PublicColumn> = Vec::new();
 
-        // TxValidity block — TXV_COL_OFFSET = 0 so native indices pass
-        // through. Route through the wrapper for uniformity; at
-        // offset 0 the wrapper is bit-identical to a direct forward.
-        // Inner range bound: TX_VALIDITY_3B4_PINNED_N_COLS.
+        // TXV block at offset 0 — ShiftedColumnsConstraint is identity at offset 0.
         for c in txv_constraints {
             constraints.push(Box::new(ShiftedColumnsConstraint::new(
                 c,
                 TXV_COL_OFFSET,
-                TX_VALIDITY_3B4_PINNED_N_COLS,
+                TXV_BLOCK_N_COLS,
             )));
         }
         for pc in txv_publics {
-            assert!(
-                pc.col < TX_VALIDITY_3B4_PINNED_N_COLS,
-                "TxValidity public column {} escapes inner range",
-                pc.col
-            );
+            assert!(pc.col < TXV_BLOCK_N_COLS);
             public_columns.push(PublicColumn::new(pc.col + TXV_COL_OFFSET, pc.values));
         }
 
@@ -436,50 +380,83 @@ impl TxBodySpineComposite {
         balance_fee: u64,
         merkle_inputs: &[[Block128; 4]; TXBODY_MERKLE_N_PERMS],
     ) -> Trace {
-        let txv_trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
-            body,
-            balance_inputs,
-            balance_outputs,
-            balance_fee,
-            SPINE_LOG_ROWS,
-        );
-        assert_eq!(txv_trace.columns.len(), TX_VALIDITY_3B4_PINNED_N_COLS);
+        use crate::airs::balance_gate::build_balance_columns;
+        use crate::gates::multi_row_indicator_programme;
 
-        // G4: GKR owns the 59-perm permutation soundness. The STARK
-        // keeps only the two retained `tx_body_hash` lanes on
-        // `TXBODY_MERKLE_LAYOUT.s` / `.s + 1` (== merkle-band columns
-        // 0 / 1 by `PermLayout::at(0)` / `POSEIDON_COL_S = 0`),
-        // zero-filled except for the row-wide pins.
+        // --- Build witness + balance + mask trace (replaces TxValidityAir::build_trace_3b4_with_skeleton_pins) ---
+        let log_rows = SPINE_LOG_ROWS;
+        let n_rows = 1usize << log_rows;
+
+        // Witness columns [0, TX_VALIDITY_N_COLS)
+        let mut cols: Vec<Vec<Block128>> =
+            (0..TX_VALIDITY_N_COLS).map(|_| vec![Block128::ZERO; n_rows]).collect();
+        let mut domains = vec![ColumnDomain::Block128; TX_VALIDITY_N_COLS];
+        domains[COL_INPUT_VALID] = ColumnDomain::Bit;
+        domains[COL_OUTPUT_VALID] = ColumnDomain::Bit;
+
+        for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
+            if !input.valid { continue; }
+            cols[COL_INPUT_VALID][i] = Block128::ONE;
+            cols[COL_SLOT_INDEX - TXV_COL_OFFSET][i] = Block128::from(input.slot_index as u128);
+            cols[COL_VALUE - TXV_COL_OFFSET][i] = Block128::from(input.value as u128);
+            let [oh, ol] = input.owner.as_fields();
+            cols[COL_OWNER_HI - TXV_COL_OFFSET][i] = oh;
+            cols[COL_OWNER_LO - TXV_COL_OFFSET][i] = ol;
+            let [sh, sl] = input.spend_secret.as_fields();
+            cols[6][i] = sh; // SpendSecretHi
+            cols[7][i] = sl; // SpendSecretLo
+            let [th, tl] = input.auth_tag.as_fields();
+            cols[COL_AUTH_TAG_HI - TXV_COL_OFFSET][i] = th;
+            cols[COL_AUTH_TAG_LO - TXV_COL_OFFSET][i] = tl;
+        }
+        for (j, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+            if !output.valid { continue; }
+            let row = MAX_INPUTS + j;
+            cols[COL_OUTPUT_VALID][row] = Block128::ONE;
+            cols[COL_SLOT_INDEX - TXV_COL_OFFSET][row] = Block128::from(output.slot_index as u128);
+            cols[COL_VALUE - TXV_COL_OFFSET][row] = Block128::from(output.value as u128);
+            let [oh, ol] = output.owner.as_fields();
+            cols[COL_OWNER_HI - TXV_COL_OFFSET][row] = oh;
+            cols[COL_OWNER_LO - TXV_COL_OFFSET][row] = ol;
+        }
+
+        // Balance columns [TX_VALIDITY_N_COLS, TX_VALIDITY_N_COLS + BALANCE_N_COLS)
+        let (balance_cols, balance_domains) =
+            build_balance_columns(balance_inputs, balance_outputs, balance_fee, log_rows);
+        cols.extend(balance_cols);
+        domains.extend(balance_domains);
+
+        // Row-domain mask indicator columns (2 extra)
+        let input_forbidden: Vec<usize> = (MAX_INPUTS..n_rows).collect();
+        let mut output_forbidden: Vec<usize> = (0..MAX_INPUTS).collect();
+        output_forbidden.extend((MAX_INPUTS + MAX_OUTPUTS)..n_rows);
+        cols.push(multi_row_indicator_programme(&input_forbidden, n_rows));
+        cols.push(multi_row_indicator_programme(&output_forbidden, n_rows));
+        domains.push(ColumnDomain::Bit);
+        domains.push(ColumnDomain::Bit);
+
+        assert_eq!(cols.len(), TXV_BLOCK_N_COLS);
+
+        // G4: GKR owns the 59-perm soundness. STARK keeps only the two
+        // tx_body_hash lanes as row-wide PublicColumns.
         let _ = merkle_inputs;
-        let merkle_cols: Vec<Vec<Block128>> = {
-            let total_rows = 1usize << SPINE_LOG_ROWS;
-            let mut cols: Vec<Vec<Block128>> = (0..merkle_band_width())
-                .map(|_| vec![Block128::ZERO; total_rows])
-                .collect();
-            for lane in 0..2usize {
-                cols[TXBODY_MERKLE_LAYOUT.s + lane] =
-                    vec![self.boundary_pins.tx_body_hash[lane]; total_rows];
-            }
-            cols
-        };
-        let merkle_domains: Vec<ColumnDomain> = vec![ColumnDomain::Block128; merkle_band_width()];
-        assert_eq!(merkle_cols.len(), merkle_band_width());
-        assert_eq!(merkle_domains.len(), merkle_band_width());
-
         let total_rows = 1usize << SPINE_LOG_ROWS;
-        let mut cols = txv_trace.columns;
-        let mut domains = txv_trace.domains;
+        let mut merkle_cols: Vec<Vec<Block128>> = (0..merkle_band_width())
+            .map(|_| vec![Block128::ZERO; total_rows])
+            .collect();
+        for lane in 0..2usize {
+            merkle_cols[TXBODY_MERKLE_LAYOUT.s + lane] =
+                vec![self.boundary_pins.tx_body_hash[lane]; total_rows];
+        }
+        let merkle_domains = vec![ColumnDomain::Block128; merkle_band_width()];
+
         cols.extend(merkle_cols);
         domains.extend(merkle_domains);
-
         cols.push(txv_live_mask_programme());
         domains.push(ColumnDomain::Bit);
 
-        for col in &cols {
-            debug_assert_eq!(col.len(), total_rows);
-        }
+        for col in &cols { debug_assert_eq!(col.len(), total_rows); }
         assert_eq!(cols.len(), self.n_cols);
-
         Trace::new_with_domains(cols, domains)
     }
 }
@@ -587,12 +564,12 @@ mod tests {
     #[test]
     fn composite_layout_constants() {
         assert_eq!(TXV_COL_OFFSET, 0);
-        assert_eq!(TX_BODY_MERKLE_COL_OFFSET, TX_VALIDITY_3B4_PINNED_N_COLS);
+        assert_eq!(TX_BODY_MERKLE_COL_OFFSET, TXV_BLOCK_N_COLS);
         assert_eq!(TX_BODY_MERKLE_COL_OFFSET, 78);
         assert_eq!(SPINE_LOG_ROWS, 13);
         assert_eq!(TXV_LIVE_ROWS, 256);
         let n = spine_n_cols();
-        assert_eq!(n, TX_VALIDITY_3B4_PINNED_N_COLS + merkle_band_width() + 1);
+        assert_eq!(n, TXV_BLOCK_N_COLS + merkle_band_width() + 1);
     }
 
     #[test]
@@ -838,8 +815,8 @@ mod tests {
         let (pins, _inputs) = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
-        let auth_hi = TXV_COL_OFFSET + TxValidityCol::AuthTagHi.index();
-        let auth_lo = TXV_COL_OFFSET + TxValidityCol::AuthTagLo.index();
+        let auth_hi = COL_AUTH_TAG_HI;
+        let auth_lo = COL_AUTH_TAG_LO;
         assert_eq!(auth_hi, 8, "AuthTagHi composite col drifted from 8");
         assert_eq!(auth_lo, 9, "AuthTagLo composite col drifted from 9");
 
@@ -901,10 +878,10 @@ mod tests {
         // Every TxValidity tx-body column must be among the composite
         // public columns at the TxValidity offset.
         let expected_cols = [
-            TXV_COL_OFFSET + TxValidityCol::SlotIndex.index(),
-            TXV_COL_OFFSET + TxValidityCol::Value.index(),
-            TXV_COL_OFFSET + TxValidityCol::OwnerHi.index(),
-            TXV_COL_OFFSET + TxValidityCol::OwnerLo.index(),
+            COL_SLOT_INDEX,
+            COL_VALUE,
+            COL_OWNER_HI,
+            COL_OWNER_LO,
         ];
         for col in expected_cols {
             let hit = spine.public_columns().iter().any(|pc| pc.col == col);
@@ -942,7 +919,7 @@ mod tests {
             &merkle_inputs,
         );
         // Flip SlotIndex on input row 0 — pinned to input_leaf_absorb[0][0].
-        let col = TXV_COL_OFFSET + TxValidityCol::SlotIndex.index();
+        let col = COL_SLOT_INDEX;
         trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
@@ -964,7 +941,7 @@ mod tests {
             &merkle_inputs,
         );
         // Flip Value on output row 0 — pinned to output_leaf_absorb[0][1].
-        let col = TXV_COL_OFFSET + TxValidityCol::Value.index();
+        let col = COL_VALUE;
         let row = MAX_INPUTS;
         trace.columns[col][row] += Block128::ONE;
         assert!(
@@ -986,7 +963,7 @@ mod tests {
             0,
             &merkle_inputs,
         );
-        let col = TXV_COL_OFFSET + TxValidityCol::OwnerHi.index();
+        let col = COL_OWNER_HI;
         trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
@@ -1007,7 +984,7 @@ mod tests {
             0,
             &merkle_inputs,
         );
-        let col = TXV_COL_OFFSET + TxValidityCol::OwnerLo.index();
+        let col = COL_OWNER_LO;
         let row = MAX_INPUTS;
         trace.columns[col][row] += Block128::ONE;
         assert!(
@@ -1034,7 +1011,7 @@ mod tests {
             0,
             &merkle_inputs,
         );
-        let col = TXV_COL_OFFSET + TxValidityCol::Value.index();
+        let col = COL_VALUE;
         let row = TXV_LIVE_ROWS + 42; // deep in the dead tail
         trace.columns[col][row] = Block128::from(0xBADu128);
         assert!(

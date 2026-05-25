@@ -39,7 +39,6 @@ pub mod vshift;
 
 pub mod interleaved;
 pub mod prove_logic;
-pub mod prove_tx;
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -2534,9 +2533,10 @@ pub(crate) fn check_public_columns<A: Air + ?Sized>(
 mod tests {
     use super::*;
     use noid_air::{
-        Air, BoolGate, CompositeAir, Constraint, LinearCombinationAir, Trace, TxValidityAir,
+        Air, BoolGate, CompositeAir, Constraint, LinearCombinationAir, Trace,
         WeightedLinearGate,
     };
+    use noid_air::composition::tx_logic::{witness_from_body, TxLogicAir};
     use noid_poseidon2b::primitives::TxBodyHash;
     use noid_tx::{TxInput, TxOutput};
 
@@ -2556,17 +2556,37 @@ mod tests {
     }
 
     fn mk_body() -> noid_tx::TxBody {
-        let mut input = TxInput::dummy();
-        input.valid = true;
-        let mut output = TxOutput::dummy();
-        output.valid = true;
         noid_tx::TxBody {
             epoch_anchor: [0u8; 32],
             fee: 0,
-            inputs: vec![input, TxInput::dummy()],
-            outputs: vec![output, TxOutput::dummy()],
+            inputs: vec![
+                TxInput::dummy(),
+                TxInput::dummy(),
+                TxInput::dummy(),
+                TxInput::dummy(),
+            ],
+            outputs: vec![
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+                TxOutput::dummy(),
+            ],
             is_coinbase: false,
         }
+    }
+
+    /// Build a minimal honest TxLogicAir + trace for use as a STARK engine fixture.
+    /// All inputs/outputs are dummy (value=0), so balance holds trivially.
+    fn mk_logic_air_and_trace() -> (TxLogicAir, noid_air::Trace) {
+        let body = mk_body();
+        let witness = witness_from_body(&body);
+        let air = TxLogicAir::new(witness.boundary_pins);
+        let trace = air.build_trace(&witness);
+        (air, trace)
     }
 
     // -------- Degree-3 constraint: col0 · col1 · col2 == 0 --------
@@ -2643,8 +2663,7 @@ mod tests {
     #[test]
     fn honest_bool_degree_2() {
         // A real non-degenerate boolean witness for BoolGate (degree 2).
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
         verify_air(&air, &pi, &proof).expect("verify");
@@ -2729,8 +2748,7 @@ mod tests {
         // The prover tries to prove BoolGate on a non-boolean witness,
         // bypassing the native pre-check. The zero-check sumcheck
         // MUST reject it — this is the exact bug that was broken before.
-        let air = TxValidityAir::new();
-        let mut trace = TxValidityAir::build_trace(&mk_body());
+        let (air, mut trace) = mk_logic_air_and_trace();
         trace.columns[0][2] = Block128::from(3u128); // not 0 or 1
         let pi = mk_pi();
         let proof = prove_air_unchecked(&air, &trace, &pi);
@@ -2750,8 +2768,7 @@ mod tests {
     /// from the default path on empty extras, this test fails first.
     #[test]
     fn invariant_a_empty_extras_byte_identical() {
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let proof_legacy = prove_air_unchecked_with_extra(&air, &trace, &pi, &[]);
         let proof_wrapped = prove_air_unchecked_with_extra_columns(&air, &trace, &pi, &[], &[]);
@@ -2781,8 +2798,7 @@ mod tests {
         use noid_fri::hasher::Blake3Hasher;
         use noid_fri::prover::commit as fri_commit;
 
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let log_rows = trace.log_rows;
         let log_len = padded_log_len(log_rows);
@@ -2941,8 +2957,7 @@ mod tests {
 
     #[test]
     fn tampered_opening_rejected() {
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let mut proof = prove_air(&air, &trace, &pi).expect("prove");
         proof.base_openings[0] += Block128::ONE;
@@ -2951,8 +2966,7 @@ mod tests {
 
     #[test]
     fn tampered_round_poly_rejected() {
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let mut proof = prove_air(&air, &trace, &pi).expect("prove");
         proof.zero_check_rounds[0][0] += Block128::ONE;
@@ -2961,8 +2975,7 @@ mod tests {
 
     #[test]
     fn wrong_pi_rejected() {
-        let air = TxValidityAir::new();
-        let trace = TxValidityAir::build_trace(&mk_body());
+        let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
         let proof = prove_air(&air, &trace, &pi).expect("prove");
         let mut bad = pi;
@@ -2972,8 +2985,7 @@ mod tests {
 
     #[test]
     fn bad_trace_rejected_in_native_check() {
-        let air = TxValidityAir::new();
-        let mut trace: Trace = TxValidityAir::build_trace(&mk_body());
+        let (air, mut trace) = mk_logic_air_and_trace();
         trace.columns[0][0] = Block128::from(5u128);
         assert!(prove_air(&air, &trace, &mk_pi()).is_err());
     }
@@ -3794,252 +3806,6 @@ mod tests {
         assert!(verify_air(&air, &pi, &proof).is_err());
     }
 }
-
-// ---------------------------------------------------------------------------
-// Stage 3b-4 — TxValidityAir composition (witness + balance) integration tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tx_validity_3b4_tests {
-    use super::*;
-    use noid_air::{
-        Air, TxValidityAir, TxValidityCol, TX_VALIDITY_3B4_LOG_ROWS, TX_VALIDITY_3B4_N_COLS,
-        TX_VALIDITY_3B4_PINNED_N_COLS, TX_VALIDITY_BALANCE_COL_OFFSET,
-        TX_VALIDITY_INPUT_VALID_MASK_COL,
-    };
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret, TxBodyHash};
-    use noid_tx::{TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
-
-    fn mk_pi() -> PublicInputs {
-        PublicInputs {
-            epoch_anchor: [0x11; 32],
-            claims_commitment: [0u8; 32],
-            tx_body_hash: TxBodyHash([0x44; 32]),
-            fee: 7,
-            n_live_inputs: 0,
-            n_live_outputs: 0,
-            coinbase_credit: 0,
-            log_slots: 24,
-            is_activation: [false; noid_tx::MAX_OUTPUTS],
-            is_deactivation: [false; noid_tx::MAX_INPUTS],
-        }
-    }
-
-    fn balanced_1in1out(in_val: u64, out_val: u64, fee: u64) -> TxBody {
-        assert_eq!(in_val, out_val + fee);
-        TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: fee as u128,
-            inputs: vec![
-                TxInput {
-                    slot_index: 7,
-                    value: in_val,
-                    owner: Address([0xA1; 32]),
-                    spend_secret: SpendSecret([0xB2; 32]),
-                    auth_tag: AuthTag([0xC3; 32]),
-                    valid: true,
-                },
-                TxInput::dummy(),
-                TxInput::dummy(),
-                TxInput::dummy(),
-            ],
-            outputs: vec![
-                TxOutput {
-                    slot_index: 0,
-                    value: out_val,
-                    owner: Address([0xD4; 32]),
-                    valid: true,
-                },
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-                TxOutput::dummy(),
-            ],
-            is_coinbase: false,
-        }
-    }
-
-    #[test]
-    fn tx_validity_3b4_honest_prove_verify() {
-        // End-to-end acceptance test for Stage 3b-4: one real input
-        // (1_000_000), one real output (999_950) and a 50-unit fee.
-        // Witness region and balance circuit agree; STARK prove/verify
-        // must close cleanly.
-        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
-        assert_eq!(air.n_columns(), TX_VALIDITY_3B4_N_COLS);
-        let body = balanced_1in1out(1_000_000, 999_950, 50);
-        let ins = [1_000_000u64, 0, 0, 0];
-        let outs = [999_950u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 50, TX_VALIDITY_3B4_LOG_ROWS);
-        assert!(air.check(&trace));
-        let pi = mk_pi();
-        let proof = prove_air(&air, &trace, &pi).expect("prove");
-        verify_air(&air, &pi, &proof).expect("verify");
-    }
-
-    #[test]
-    fn tx_validity_3b4_unbalanced_tx_rejected() {
-        // Balance circuit carries Σ in ≠ Σ out + fee; the composite
-        // AIR must refuse. We go through `prove_air_unchecked` so the
-        // verifier check, not `air.check`, is what fails.
-        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(5000, 4999, 1);
-        let ins = [5000u64, 0, 0, 0];
-        // Off-by-one in the output — witness still looks OK, balance
-        // circuit disagrees.
-        let outs = [4998u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 1, TX_VALIDITY_3B4_LOG_ROWS);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_validity_3b4_tampered_witness_selector_rejected() {
-        // Break the InputValid `{0,1}` bool invariant; the composite
-        // AIR's selector gate must still fire inside the composition.
-        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(10_000, 10_000, 0);
-        let ins = [10_000u64, 0, 0, 0];
-        let outs = [10_000u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace =
-            TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
-        trace.columns[TxValidityCol::InputValid.index()][5] = Block128::from(9u128);
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_validity_3b4_tampered_balance_region_rejected() {
-        // Flip an A0.a bit inside the embedded balance region; bridge
-        // + fa-sum constraints must catch it via the STARK verifier.
-        let air = TxValidityAir::new_3b4(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(1234, 1230, 4);
-        let ins = [1234u64, 0, 0, 0];
-        let outs = [1230u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace =
-            TxValidityAir::build_trace_3b4(&body, ins, outs, 4, TX_VALIDITY_3B4_LOG_ROWS);
-        // Balance A0.a lives at column `TX_VALIDITY_BALANCE_COL_OFFSET + 0`.
-        trace.columns[TX_VALIDITY_BALANCE_COL_OFFSET][0] += Block128::ONE;
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_validity_3b4_with_balance_selector_pins_honest_prove_verify() {
-        // §3d-0.10 composite path: the 22 balance-block selector
-        // programmes are surfaced as `PublicColumn`s at
-        // `TX_VALIDITY_BALANCE_COL_OFFSET`. Honest trace closes prove /
-        // verify cleanly — no witness change is needed; the programmes
-        // match what `build_balance_trace_parts` already writes.
-        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(500_000, 499_900, 100);
-        let ins = [500_000u64, 0, 0, 0];
-        let outs = [499_900u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4(&body, ins, outs, 100, TX_VALIDITY_3B4_LOG_ROWS);
-        assert!(air.check(&trace));
-        let pi = mk_pi();
-        let proof = prove_air(&air, &trace, &pi).expect("prove");
-        verify_air(&air, &pi, &proof).expect("verify");
-    }
-
-    #[test]
-    fn tx_validity_3b4_with_balance_selector_pins_tamper_rejected() {
-        // Tampering a balance-block selector cell on a row that no FA
-        // / bridge gate observes (e.g. an is_input padding row). The
-        // native selector-column pinning rejects, and the STARK
-        // verifier's `check_public_columns` MLE re-eval rejects too.
-        use noid_air::BIT_ADDER_COL_IS_INPUT;
-        let air = TxValidityAir::new_3b4_with_balance_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(42, 42, 0);
-        let ins = [42u64, 0, 0, 0];
-        let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace =
-            TxValidityAir::build_trace_3b4(&body, ins, outs, 0, TX_VALIDITY_3B4_LOG_ROWS);
-        let col = TX_VALIDITY_BALANCE_COL_OFFSET + BIT_ADDER_COL_IS_INPUT;
-        // Row 100 is inside block A0's padding region (width 64).
-        trace.columns[col][100] = Block128::ONE;
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    // --------------------------------------------------------------------
-    // §3d-0.10 skeleton-selector row-domain pins (3d-0.5.1 primitive)
-    // --------------------------------------------------------------------
-
-    #[test]
-    fn tx_validity_3b4_with_skeleton_pins_honest_prove_verify() {
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
-        assert_eq!(air.n_columns(), TX_VALIDITY_3B4_PINNED_N_COLS);
-        let body = balanced_1in1out(250_000, 249_993, 7);
-        let ins = [250_000u64, 0, 0, 0];
-        let outs = [249_993u64, 0, 0, 0, 0, 0, 0, 0];
-        let trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
-            &body,
-            ins,
-            outs,
-            7,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
-        assert!(air.check(&trace));
-        let pi = mk_pi();
-        let proof = prove_air(&air, &trace, &pi).expect("prove");
-        verify_air(&air, &pi, &proof).expect("verify");
-    }
-
-    #[test]
-    fn tx_validity_3b4_skeleton_pin_rejects_selector_on_forbidden_row() {
-        // InputValid = 1 on the pad row beyond MAX_INPUTS + MAX_OUTPUTS —
-        // the bool gate still accepts but the multi-hot row-domain pin
-        // rejects, and the STARK verifier's `check_public_columns` MLE
-        // re-eval catches any attempt to also tamper the mask column.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(42, 42, 0);
-        let ins = [42u64, 0, 0, 0];
-        let outs = [42u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
-            &body,
-            ins,
-            outs,
-            0,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
-        let pad_row = MAX_INPUTS + MAX_OUTPUTS;
-        trace.columns[TxValidityCol::InputValid.index()][pad_row] = Block128::ONE;
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-
-    #[test]
-    fn tx_validity_3b4_skeleton_pin_rejects_mask_tamper() {
-        // Tamper only the mask column — the PublicColumn MLE re-eval at
-        // the verifier's r_point catches it.
-        let air = TxValidityAir::new_3b4_with_skeleton_selector_pins(TX_VALIDITY_3B4_LOG_ROWS);
-        let body = balanced_1in1out(100, 100, 0);
-        let ins = [100u64, 0, 0, 0];
-        let outs = [100u64, 0, 0, 0, 0, 0, 0, 0];
-        let mut trace = TxValidityAir::build_trace_3b4_with_skeleton_pins(
-            &body,
-            ins,
-            outs,
-            0,
-            TX_VALIDITY_3B4_LOG_ROWS,
-        );
-        // Flip mask on an allowed input row (0) — programme says ZERO.
-        trace.columns[TX_VALIDITY_INPUT_VALID_MASK_COL][0] = Block128::ONE;
-        let pi = mk_pi();
-        let proof = prove_air_unchecked(&air, &trace, &pi);
-        assert!(verify_air(&air, &pi, &proof).is_err());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stage 3c-1.5 — PoseidonPermAir STARK integration tests
 // ---------------------------------------------------------------------------

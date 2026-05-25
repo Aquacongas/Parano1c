@@ -809,10 +809,10 @@ ProveBlockRequest {
 **Output:**
 ```
 BlockProof {
-  logic_proofs: Vec<LogicProof>,              // from TxIntents (passed through)
-  block_state_binding: BlockStateBindingProof, // miner-generated
-  aggregated_fri: AggregatedFriProof,         // single FRI opening
-  accumulator: Accumulator,                    // IVC fold
+  logic_proofs: Vec<LogicProof>,                // from TxIntents (passed through)
+  block_state_binding: BlockStateBindingProof,  // miner-generated
+  aggregated_fri: AggregatedFriProof,           // single FRI opening (Stage G)
+  block_spine_proof: BlockSpineProof,           // unified block SpineGKR
 }
 ```
 
@@ -820,10 +820,9 @@ BlockProof {
 1. Validate all LogicProofs from TxIntents (parallel, ~3ms each)
 2. Compute native state transition (zero inputs, fill outputs)
 3. Generate BlockStateBinding witness (all Merkle paths)
-4. Prove BlockStateBinding AIR (~200-400ms)
-5. Aggregate all column commitments for single FRI opening (~300ms)
-6. IVC fold all proofs into Accumulator
-7. **Total: ~1-2s on 8 cores**
+4. Prove BlockStateBinding AIR + unified block SpineGKR
+5. Per-tx algebraic STARKs + block multipoint sumcheck + single FRI opening
+6. **Total: ~43s on 8 cores at 100 tx (sequential Stage 5 — see Phase 1.5)**
 
 ---
 
@@ -891,7 +890,7 @@ Full block validation for incoming blocks from peers.
 12. `header.state_root` matches computed final state
 13. `header.tx_root` matches computed Merkle root
 14. `header.da_root` matches DA payload commitment
-15. Block proof (IVC) verifies via `decide()`
+15. Block proof (deferred-FRI aggregation) verifies
 
 ---
 
@@ -1175,9 +1174,9 @@ BlockProof (full):
   N x LogicProof:                                     = N * 45 KB
   BlockStateBindingProof:                             = ~40 KB
   Aggregated FRI:                                     = ~10 KB
-  IVC Accumulator:                                    = ~5 KB
   ─────────────────────────────────────────────────────────────
-  After IVC folding (recursive): ~55 KB (independent of N)
+  After Stage G deferred-opening: ~2 MB at 100 tx
+  (Phase 7 recursive: ~55 KB independent of N)
 ```
 
 ---
@@ -1320,7 +1319,7 @@ Light Node (Wallet)             Full Node                 External Miner (GPU/AS
   |                               |   prove_block_state_binding  |
   |                               |   (Merkle openings, ~400ms)  |
   |                               |                              |
-  |                               |   aggregate + IVC fold       |
+  |                               |   deferred-FRI aggregation    |
   |                               |   (single FRI opening)       |
   |                               |                              |
   |                               |-- push header (248B) ------->|
@@ -1373,6 +1372,6 @@ remains valid (epoch_anchor is stable for ~6 minutes).
 | AuthGKR | ~121 | Degree-9 unified sumcheck, 14 rounds: 126/2^128 |
 | Poseidon2b (collision) | 128 | Birthday bound on 256-bit capacity |
 | Fiat-Shamir | 128 | Poseidon2b sponge in QROM |
-| IVC fold | ~128 | Schwartz-Zippel in mixing scalar alpha |
+| Stage G aggregation | ~128 | Schwartz-Zippel over GF(2^128) via μ + β_block |
 | C_claimed bridge | 128 | Poseidon2b sponge binding (preimage resistance) |
 | **System total** | **~120** | **min(all components); bottleneck = GKR sumcheck** |
