@@ -29,6 +29,20 @@ pub struct ClaimedSlot {
 /// Network payload for a stateless transaction. Full nodes validate
 /// the logic_proof, check the epoch_anchor window, verify claimed
 /// slots against native state, and admit to mempool.
+///
+/// # Phase 2 TODO (Security #6): tx_body_hash consistency check on decode
+///
+/// `TxIntent` carries `tx_body_hash` as a wire field alongside `tx_body`.
+/// Currently neither `decode` nor `from_bytes` verifies that
+/// `hash_tx_body(tx_body) == tx_body_hash`. A node that trusts the
+/// wire field without recomputing it could be fed a TxIntent where
+/// the body and hash are inconsistent — the LogicProof would then
+/// bind to a different hash than the body.
+///
+/// Fix: in Phase 2 mempool admission (`noid_chain::mempool::admit_tx`),
+/// recompute `hash_tx_body` from `tx_body` and reject if mismatch.
+/// Do NOT do this in `decode` itself (pure deserialization should not
+/// perform expensive hash computations), but in the admission gate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxIntent {
     pub tx_body: TxBody,
@@ -105,7 +119,8 @@ impl ClaimedSlot {
 impl TxIntent {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(TX_INTENT_VERSION);
-        self.tx_body.encode(buf);
+        // Network wire: encode TxBody WITHOUT spend_secret in inputs.
+        self.tx_body.encode_public(buf);
         buf.extend_from_slice(&self.tx_body_hash.0);
         buf.extend_from_slice(&self.claims_commitment);
         // claimed_slots
@@ -136,7 +151,8 @@ impl TxIntent {
         }
         *src = &src[1..];
 
-        let tx_body = TxBody::decode(src)?;
+        // Network wire: decode TxBody WITHOUT spend_secret (spend_secret → zero).
+        let tx_body = TxBody::decode_public(src)?;
 
         if src.len() < 32 {
             return Err(WireError::Truncated);
@@ -248,11 +264,36 @@ mod tests {
         };
         let bytes = intent.to_bytes();
         let back = TxIntent::from_bytes(&bytes).unwrap();
-        assert_eq!(back.tx_body, intent.tx_body);
+
+        // spend_secret is stripped on network wire — decoded value is zero.
+        // All other fields must round-trip exactly.
+        let mut expected_body = intent.tx_body.clone();
+        for inp in expected_body.inputs.iter_mut() {
+            inp.spend_secret = SpendSecret([0u8; 32]);
+        }
+        assert_eq!(back.tx_body, expected_body);
         assert_eq!(back.tx_body_hash, intent.tx_body_hash);
         assert_eq!(back.claims_commitment, intent.claims_commitment);
         assert_eq!(back.claimed_slots, intent.claimed_slots);
         assert_eq!(back.logic_proof_bytes, intent.logic_proof_bytes);
+    }
+
+    /// Verify spend_secret is NOT present in the serialized bytes.
+    #[test]
+    fn spend_secret_absent_from_wire() {
+        let body = mk_body();
+        let secret = body.inputs[0].spend_secret.0;
+        let intent = TxIntent {
+            tx_body: body,
+            tx_body_hash: TxBodyHash([0xBB; 32]),
+            claims_commitment: [0xCC; 32],
+            claimed_slots: vec![],
+            logic_proof_bytes: vec![],
+        };
+        let bytes = intent.to_bytes();
+        // The raw secret bytes must not appear anywhere in the wire payload.
+        let found = bytes.windows(32).any(|w| w == secret);
+        assert!(!found, "spend_secret leaked into TxIntent wire bytes");
     }
 
     #[test]

@@ -1139,7 +1139,7 @@ pub mod fixture {
         // `noid_poseidon2b::primitives::is_coinbase_leaf`.
         pins.is_coinbase_leaf = [Block128::from(body.is_coinbase as u128), Block128::ZERO];
         for i in 0..TX_MAX_INPUTS {
-            let input = body.inputs.get(i).copied().unwrap_or_else(TxInput::dummy);
+            let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
             let [owner_hi, owner_lo] = input.owner.as_fields();
             pins.input_leaf_absorb[i] = [
                 Block128::from(input.slot_index as u128),

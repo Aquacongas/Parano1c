@@ -156,7 +156,7 @@ mod tests {
         let dummy = TxInput::dummy();
         let outputs = [mk_output(2)];
 
-        let c1 = compute_claims_commitment(&[real], &outputs);
+        let c1 = compute_claims_commitment(&[real.clone()], &outputs);
         let c2 = compute_claims_commitment(&[real, dummy], &outputs);
         assert_eq!(c1, c2);
     }
@@ -177,7 +177,7 @@ mod tests {
         let i1 = mk_input(1);
         let i2 = mk_input(2);
         let outputs = [mk_output(3)];
-        let c1 = compute_claims_commitment(&[i1, i2], &outputs);
+        let c1 = compute_claims_commitment(&[i1.clone(), i2.clone()], &outputs);
         let c2 = compute_claims_commitment(&[i2, i1], &outputs);
         assert_ne!(c1, c2);
     }

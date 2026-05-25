@@ -15,6 +15,7 @@
 //! wrappers prevent cross-domain digest mix-ups at the type level.
 
 use noid_core::Block128;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::batch::compress_batch_interleaved_into;
 use crate::native::compression::Poseidon2bSponge;
@@ -78,11 +79,51 @@ newtype_digest!(
     /// Canonical transaction-body hash.
     TxBodyHash
 );
-newtype_digest!(
-    /// The 256-bit wallet spend secret. Preimage of `Address`. Stored
-    /// encrypted at rest.
-    SpendSecret
-);
+
+/// The 256-bit wallet spend secret. Preimage of `Address`. Stored
+/// encrypted at rest.
+///
+/// SECURITY: NOT `Copy` — prevents accidental bitwise copies that bypass
+/// the `ZeroizeOnDrop` destructor. NOT `Debug` — prevents printing in
+/// logs, panics, or test output. Use `derive_address` / `hash_auth_tag`
+/// to derive the public artifacts without exposing the raw bytes.
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
+pub struct SpendSecret(pub [u8; 32]);
+
+impl SpendSecret {
+    #[inline]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+    #[inline]
+    pub fn into_bytes(self) -> [u8; 32] {
+        let b = self.0;
+        // self drops here -> ZeroizeOnDrop fires on the moved-out copy too
+        // (the [u8;32] returned is a plain value; caller is responsible
+        // for clearing it if needed).
+        b
+    }
+    /// Interpret the 32-byte secret as two little-endian `Block128` words.
+    /// Used only inside GKR witness construction. Do NOT log the result.
+    #[inline]
+    pub fn as_fields(&self) -> [Block128; 2] {
+        let mut a = [0u8; 16];
+        let mut b = [0u8; 16];
+        a.copy_from_slice(&self.0[..16]);
+        b.copy_from_slice(&self.0[16..]);
+        [
+            Block128::from(u128::from_le_bytes(a)),
+            Block128::from(u128::from_le_bytes(b)),
+        ]
+    }
+}
+
+/// Redacted Debug: never print the raw secret bytes.
+impl std::fmt::Debug for SpendSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpendSecret([REDACTED])")
+    }
+}
 
 #[inline]
 fn sponge(tag: DomainTag) -> Poseidon2bSponge {

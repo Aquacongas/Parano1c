@@ -23,7 +23,10 @@ pub const MAX_OUTPUTS: usize = 8;
 /// A spending input. Dummy slots carry `valid = false`, `value = 0`,
 /// zero owner/secret/auth_tag and `slot_index = 0`; they contribute 0
 /// to balance and the AIR skips their constraints via a selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// SECURITY: `Debug` is intentionally NOT derived — the struct contains
+/// `spend_secret` which must never appear in logs or panic output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TxInput {
     /// Index of the spent UTXO inside the chain state vector
     /// (`FriState` slot).
@@ -140,5 +143,20 @@ impl Transaction {
             .filter(|i| i.valid)
             .map(|i| i.auth_tag)
             .collect()
+    }
+}
+
+/// Custom Debug for TxInput: spend_secret is redacted to prevent
+/// accidental exposure in logs, panic output, or test diagnostics.
+impl std::fmt::Debug for TxInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxInput")
+            .field("slot_index", &self.slot_index)
+            .field("value", &self.value)
+            .field("owner", &self.owner)
+            .field("spend_secret", &"[REDACTED]")
+            .field("auth_tag", &self.auth_tag)
+            .field("valid", &self.valid)
+            .finish()
     }
 }

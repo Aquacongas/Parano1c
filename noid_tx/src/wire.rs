@@ -18,6 +18,9 @@ use crate::types::{Transaction, TxBody, TxInput, TxOutput};
 pub enum WireError {
     Truncated,
     CountTooLarge,
+    /// fee field exceeds u64::MAX — cannot be represented in the
+    /// balance circuit (which uses 64-bit operands).
+    FeeTooLarge,
     ShapeMismatch,
     InvalidBool,
     TrailingBytes,
@@ -88,13 +91,32 @@ fn take_bool(src: &mut &[u8]) -> Result<bool, WireError> {
 
 // ---------------------------------------------------------------------------
 // TxInput
-//   slot_index (4) + value (8) + owner (32) + spend_secret (32)
-//   + auth_tag (32) + valid (1) = 109 bytes
+//
+// Two wire formats:
+//
+//   FULL  (local wallet storage only — NEVER sent over the network):
+//     slot_index (4) + value (8) + owner (32) + spend_secret (32)
+//     + auth_tag (32) + valid (1) = 109 bytes
+//
+//   PUBLIC (network wire format — spend_secret omitted):
+//     slot_index (4) + value (8) + owner (32) + auth_tag (32) + valid (1) = 77 bytes
+//
+// The full format is used internally by the wallet to persist its own
+// transaction records. The public format is what goes into TxIntent and
+// is broadcast to the mempool. Full nodes never need spend_secret —
+// they only read (slot_index, value, owner) for state binding and
+// (auth_tag) is already committed via the LogicProof.
 // ---------------------------------------------------------------------------
 
+/// Wire size of the FULL local format (includes spend_secret).
 pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 32 + 1;
 
+/// Wire size of the PUBLIC network format (spend_secret omitted).
+pub const TX_INPUT_PUBLIC_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 1;
+
 impl TxInput {
+    /// Encode with spend_secret included. **Local wallet storage only.**
+    /// MUST NOT be used for network payloads.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         put_u32(buf, self.slot_index);
         put_u64(buf, self.value);
@@ -104,6 +126,17 @@ impl TxInput {
         put_bool(buf, self.valid);
     }
 
+    /// Encode WITHOUT spend_secret. Used in `TxBody::encode_public` and
+    /// `TxIntent`. Safe to broadcast over the network.
+    pub fn encode_public(&self, buf: &mut Vec<u8>) {
+        put_u32(buf, self.slot_index);
+        put_u64(buf, self.value);
+        put_digest(buf, &self.owner.0);
+        put_digest(buf, &self.auth_tag.0);
+        put_bool(buf, self.valid);
+    }
+
+    /// Decode full format (includes spend_secret). Local storage only.
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let slot_index = take_u32(src)?;
         let value = take_u64(src)?;
@@ -116,6 +149,23 @@ impl TxInput {
             value,
             owner,
             spend_secret,
+            auth_tag,
+            valid,
+        })
+    }
+
+    /// Decode public network format (spend_secret absent → zeroed).
+    pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
+        let slot_index = take_u32(src)?;
+        let value = take_u64(src)?;
+        let owner = Address(take_digest(src)?);
+        let auth_tag = AuthTag(take_digest(src)?);
+        let valid = take_bool(src)?;
+        Ok(Self {
+            slot_index,
+            value,
+            owner,
+            spend_secret: SpendSecret([0u8; 32]),
             auth_tag,
             valid,
         })
@@ -161,6 +211,8 @@ impl TxOutput {
 pub const TX_BODY_VERSION: u8 = 4;
 
 impl TxBody {
+    /// Encode with spend_secret in each input. **Local wallet storage only.**
+    /// MUST NOT be used for network payloads — use `encode_public` instead.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         assert!(
             self.inputs.len() <= crate::types::MAX_INPUTS,
@@ -170,6 +222,11 @@ impl TxBody {
             self.outputs.len() <= crate::types::MAX_OUTPUTS,
             "outputs exceed MAX_OUTPUTS"
         );
+        assert!(
+            self.fee <= u64::MAX as u128,
+            "fee ({}) exceeds u64::MAX — balance circuit cannot represent it",
+            self.fee,
+        );
 
         buf.push(TX_BODY_VERSION);
         put_digest(buf, &self.epoch_anchor);
@@ -177,6 +234,37 @@ impl TxBody {
         put_u32(buf, self.inputs.len() as u32);
         for i in &self.inputs {
             i.encode(buf);
+        }
+        put_u32(buf, self.outputs.len() as u32);
+        for o in &self.outputs {
+            o.encode(buf);
+        }
+        put_bool(buf, self.is_coinbase);
+    }
+
+    /// Encode WITHOUT spend_secret in inputs. This is the network wire format
+    /// used inside `TxIntent`. Safe to broadcast to full nodes.
+    pub fn encode_public(&self, buf: &mut Vec<u8>) {
+        assert!(
+            self.inputs.len() <= crate::types::MAX_INPUTS,
+            "inputs exceed MAX_INPUTS"
+        );
+        assert!(
+            self.outputs.len() <= crate::types::MAX_OUTPUTS,
+            "outputs exceed MAX_OUTPUTS"
+        );
+        assert!(
+            self.fee <= u64::MAX as u128,
+            "fee ({}) exceeds u64::MAX — balance circuit cannot represent it",
+            self.fee,
+        );
+
+        buf.push(TX_BODY_VERSION);
+        put_digest(buf, &self.epoch_anchor);
+        put_u128(buf, self.fee);
+        put_u32(buf, self.inputs.len() as u32);
+        for i in &self.inputs {
+            i.encode_public(buf);
         }
         put_u32(buf, self.outputs.len() as u32);
         for o in &self.outputs {
@@ -199,6 +287,7 @@ impl TxBody {
         buf
     }
 
+    /// Decode full format (includes spend_secret). Local storage only.
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let v = take(src, 1)?[0];
         if v != TX_BODY_VERSION {
@@ -206,6 +295,9 @@ impl TxBody {
         }
         let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
+        if fee > u64::MAX as u128 {
+            return Err(WireError::FeeTooLarge);
+        }
 
         let n_in = take_u32(src)? as usize;
         if n_in > crate::types::MAX_INPUTS {
@@ -239,6 +331,56 @@ impl TxBody {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
         let mut src = bytes;
         let out = Self::decode(&mut src)?;
+        if !src.is_empty() {
+            return Err(WireError::TrailingBytes);
+        }
+        Ok(out)
+    }
+
+    /// Decode public network format (spend_secret absent in inputs → zeroed).
+    pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
+        let v = take(src, 1)?[0];
+        if v != TX_BODY_VERSION {
+            return Err(WireError::UnknownVersion);
+        }
+        let epoch_anchor = take_digest(src)?;
+        let fee = take_u128(src)?;
+        if fee > u64::MAX as u128 {
+            return Err(WireError::FeeTooLarge);
+        }
+
+        let n_in = take_u32(src)? as usize;
+        if n_in > crate::types::MAX_INPUTS {
+            return Err(WireError::CountTooLarge);
+        }
+        let mut inputs = Vec::with_capacity(n_in);
+        for _ in 0..n_in {
+            inputs.push(TxInput::decode_public(src)?);
+        }
+
+        let n_out = take_u32(src)? as usize;
+        if n_out > crate::types::MAX_OUTPUTS {
+            return Err(WireError::CountTooLarge);
+        }
+        let mut outputs = Vec::with_capacity(n_out);
+        for _ in 0..n_out {
+            outputs.push(TxOutput::decode(src)?);
+        }
+
+        let is_coinbase = take_bool(src)?;
+
+        Ok(Self {
+            epoch_anchor,
+            fee,
+            inputs,
+            outputs,
+            is_coinbase,
+        })
+    }
+
+    pub fn from_bytes_public(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut src = bytes;
+        let out = Self::decode_public(&mut src)?;
         if !src.is_empty() {
             return Err(WireError::TrailingBytes);
         }
@@ -491,6 +633,24 @@ mod tests {
         buf.extend_from_slice(&[0u8; 16]); // fee
         put_u32(&mut buf, (crate::types::MAX_INPUTS + 1) as u32);
         assert_eq!(TxBody::from_bytes(&buf), Err(WireError::CountTooLarge));
+    }
+
+    #[test]
+    fn tx_body_rejects_fee_too_large() {
+        // fee = u64::MAX + 1 = 2^64 must be rejected because the balance
+        // circuit uses 64-bit operands; u128 fee above this range cannot
+        // be faithfully represented.
+        let mut buf = Vec::new();
+        buf.push(TX_BODY_VERSION);
+        buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
+        // fee = u64::MAX + 1 as little-endian u128
+        let fee_too_large: u128 = u64::MAX as u128 + 1;
+        buf.extend_from_slice(&fee_too_large.to_le_bytes());
+        // rest can be truncated — error should fire on fee
+        put_u32(&mut buf, 0u32); // n_inputs = 0
+        put_u32(&mut buf, 0u32); // n_outputs = 0
+        buf.push(0u8);           // is_coinbase = false
+        assert_eq!(TxBody::from_bytes(&buf), Err(WireError::FeeTooLarge));
     }
 
     #[test]

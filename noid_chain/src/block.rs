@@ -65,6 +65,23 @@ impl From<ApplyError> for BlockApplyError {
 
 /// Apply a block in place. On error, `state` is left untouched (work
 /// happens on a snapshot and is swapped only on success).
+///
+/// # Phase 2 TODO (Security #7): coinbase_credit == block_reward(height) + Σ fees
+///
+/// The per-tx STARK circuit enforces `Σ outputs == coinbase_credit`
+/// when `is_coinbase = true`, but the AMOUNT of `coinbase_credit` is
+/// not constrained here. A miner can currently set an arbitrary
+/// `coinbase_credit` and mint unlimited coins.
+///
+/// Fix in Phase 2 (Stage P): before accepting the coinbase tx, verify:
+///
+///   1. Exactly one coinbase tx exists per block (index 0).
+///   2. `coinbase_pi.coinbase_credit == block_reward(height) + Σ fee_k`
+///      where `fee_k` is taken from `PublicInputs.fee` of each non-coinbase tx.
+///   3. The `block_reward(height)` schedule must be specified in SPECIFICATION.md.
+///
+/// Implementation location: this function, after `tx_body_hash` check,
+/// gated on `tx.body.is_coinbase`. Requires `height: u64` parameter.
 pub fn apply_block(
     state: &mut ChainState,
     block: &Block,

@@ -296,7 +296,7 @@ mod tests {
         let slot = find_slot(&state, &out);
 
         let input = mk_input_for(slot, &out);
-        apply_tx(&mut state, &body_with(0, vec![input], vec![])).expect("first spend");
+        apply_tx(&mut state, &body_with(0, vec![input.clone()], vec![])).expect("first spend");
 
         assert_eq!(
             apply_tx(&mut state, &body_with(0, vec![input], vec![])),

@@ -168,7 +168,12 @@ impl AuthPublicInputs {
 ///
 /// PRIVACY: This struct must NEVER leave the wallet. The block prover
 /// receives only `AuthPublicInputs` + a pre-built `AuthProofKillShot`.
-#[derive(Debug, Clone, Copy)]
+///
+/// SECURITY: `Debug` is intentionally NOT derived — the struct contains
+/// `spend_secret` which must never appear in logs, panic output, or
+/// test output. Use `auth_inputs.to_public()` for any diagnostic
+/// printing that is safe to expose.
+#[derive(Clone, Copy)]
 pub struct AuthInputs {
     /// Per-input `SpendSecret = [secret_hi, secret_lo]`. **Private.**
     /// Inactive rows MUST be filled with the zero secret — the circuit
@@ -215,6 +220,20 @@ impl AuthInputs {
             expected_address: public.expected_address,
             expected_auth_tag: public.expected_auth_tag,
         }
+    }
+}
+
+/// Custom Debug for AuthInputs: spend_secret is redacted to prevent
+/// accidental exposure in logs, panic output, or test diagnostics.
+/// Only the public fields are shown.
+impl std::fmt::Debug for AuthInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthInputs")
+            .field("spend_secret", &"[REDACTED]")
+            .field("tx_body_hash", &self.tx_body_hash)
+            .field("expected_address", &self.expected_address)
+            .field("expected_auth_tag", &self.expected_auth_tag)
+            .finish()
     }
 }
 

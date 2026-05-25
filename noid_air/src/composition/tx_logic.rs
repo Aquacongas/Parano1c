@@ -151,7 +151,7 @@ pub fn boundary_pins_from_body(body: &TxBody) -> TxBodyMerkleBoundaryPins {
         let inp = body
             .inputs
             .get(i)
-            .copied()
+            .cloned()
             .unwrap_or_else(noid_tx::TxInput::dummy);
         let [owner_hi, owner_lo] = inp.owner.as_fields();
         pins.input_leaf_absorb[i] = [
@@ -184,7 +184,7 @@ pub fn boundary_pins_from_body(body: &TxBody) -> TxBodyMerkleBoundaryPins {
         let inp = body
             .inputs
             .get(i)
-            .copied()
+            .cloned()
             .unwrap_or_else(noid_tx::TxInput::dummy);
         input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
     }
@@ -214,7 +214,19 @@ pub fn boundary_pins_from_body(body: &TxBody) -> TxBodyMerkleBoundaryPins {
 
 /// Construct a complete `TxLogicWitness` from a `TxBody`. Derives the
 /// boundary pins and balance operands automatically.
+///
+/// # Panics
+/// Panics if `body.fee > u64::MAX` — the balance circuit operates on
+/// u64 operands and a fee that exceeds this range cannot be represented
+/// faithfully. Well-formed transactions always have fee ≤ u64::MAX
+/// (the fee leaf in the Merkle tree is also limited to u128 but the
+/// balance circuit further constrains it to 64 bits).
 pub fn witness_from_body(body: &TxBody) -> TxLogicWitness {
+    assert!(
+        body.fee <= u64::MAX as u128,
+        "TxBody.fee ({}) exceeds u64::MAX — balance circuit cannot represent it",
+        body.fee,
+    );
     let mut balance_inputs = [0u64; 4];
     for (i, inp) in body.inputs.iter().enumerate().take(4) {
         if inp.valid {

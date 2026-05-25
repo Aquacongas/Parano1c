@@ -528,6 +528,66 @@ Full consensus validation combining all rules.
 - GENESIS_TARGET, height=0, timestamp=protocol-defined
 - **Done when:** two independent nodes produce identical genesis state_root
 
+### P.7 Security fixes (carried from Phase 1 audit)
+
+These three items were identified during the Phase 1/1.5 security audit
+and require the chain infrastructure built in Phase 2 to implement.
+TODOs are already present in the relevant source files.
+
+#### P.7.1 — epoch_anchor freshness validation (Security #5)
+
+- **File:** `noid_chain/src/state_binding.rs` (TODO comment in `BlockStateBinding::build`)
+- **Problem:** `TxIntent.tx_body.epoch_anchor` is absorbed into `tx_body_hash`
+  and bound into the Fiat–Shamir transcript, but no node verifies that the
+  anchor equals `hash_block_header(chain[height - ANCHOR_DEPTH])`.
+  Without this check the fork-binding and TTL properties of the epoch anchor
+  are not enforced at the consensus layer.
+- **Fix:** In `noid_chain::mempool::admit_tx` (to be created in P.4/P.5),
+  after decoding `TxIntent`, assert:
+  ```rust
+  body.epoch_anchor == chain_state.header_at(height - ANCHOR_DEPTH).hash()
+  ```
+  Reject with `MempoolError::AnchorStale` if the chain has no block at that
+  depth or if the hash does not match.
+- **Requires:** header ring in `ChainState` (P.5), mempool module (Phase 4).
+- **Done when:** a tx with a wrong epoch_anchor is rejected by mempool admission.
+
+#### P.7.2 — tx_body_hash consistency check on mempool admission (Security #6)
+
+- **File:** `noid_tx/src/intent.rs` (TODO comment on `TxIntent`)
+- **Problem:** `TxIntent` carries `tx_body_hash` as a wire field alongside
+  `tx_body`. Neither `decode` nor `from_bytes` verifies that
+  `hash_tx_body(tx_body) == tx_body_hash`. A malformed or adversarial intent
+  could carry mismatched body and hash; the LogicProof would bind to the
+  hash, not to the actual body fields.
+- **Fix:** In `noid_chain::mempool::admit_tx`, after deserialising:
+  ```rust
+  let recomputed = hash_tx_body(&body.epoch_anchor, body.fee,
+                                &body.inputs, &body.outputs, body.is_coinbase);
+  if recomputed != intent.tx_body_hash {
+      return Err(MempoolError::TxBodyHashMismatch);
+  }
+  ```
+- **Requires:** mempool module (Phase 4).
+- **Done when:** intent with tampered `tx_body_hash` field is rejected.
+
+#### P.7.3 — coinbase_credit == block_reward(height) + Σ fees (Security #7)
+
+- **File:** `noid_chain/src/block.rs` (TODO comment in `apply_block`)
+- **Problem:** The per-tx STARK proves `Σ outputs == coinbase_credit` for
+  coinbase txs, but the VALUE of `coinbase_credit` is unconstrained by
+  consensus. A miner can currently mint an arbitrary amount.
+- **Fix:** In `apply_block` (or the new `validate_block`), for the coinbase tx:
+  1. Confirm exactly one coinbase tx exists at index 0.
+  2. Compute `expected_credit = block_reward(height) + Σ pi.fee` for all
+     non-coinbase txs (fees taken from `PublicInputs.fee`).
+  3. Reject if `coinbase_pi.coinbase_credit != expected_credit`.
+- **Requires:** `block_reward(height)` schedule in SPECIFICATION.md and a
+  reward function in `noid_chain`; `PublicInputs` available from BlockProof.
+  Add `CoinbaseCreditMismatch` to `BlockApplyError`.
+- **Done when:** block with inflated coinbase is rejected; test mines a valid
+  block at height 1 and confirms the reward matches the schedule.
+
 ---
 
 ## Phase 3 — Segmented State (Stage F)

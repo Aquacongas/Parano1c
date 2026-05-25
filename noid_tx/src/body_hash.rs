@@ -45,7 +45,7 @@ pub fn hash_tx_body(
 
     let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
     for i in 0..TXBODY_INPUTS {
-        let inp = inputs.get(i).copied().unwrap_or_else(TxInput::dummy);
+        let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
         input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
     }
 
@@ -120,7 +120,7 @@ mod tests {
     fn input_slot_index_is_bound() {
         let anchor = [0u8; 32];
         let mut i1 = mk_input(1);
-        let mut i2 = i1;
+        let mut i2 = i1.clone();
         i2.slot_index ^= 0x55;
         i1.valid = true;
         let h1 = hash_tx_body(&anchor, 0, &[i1], &[], false);
@@ -133,8 +133,8 @@ mod tests {
         let anchor = [0u8; 32];
         let i1 = mk_input(1);
         let i2 = mk_input(2);
-        let h_a = hash_tx_body(&anchor, 10, &[i1, i2], &[], false);
-        let h_b = hash_tx_body(&anchor, 10, &[i2, i1], &[], false);
+        let h_a = hash_tx_body(&anchor, 10, &[i1.clone(), i2.clone()], &[], false);
+        let h_b = hash_tx_body(&anchor, 10, &[i2.clone(), i1.clone()], &[], false);
         let h_c = hash_tx_body(&anchor, 11, &[i1, i2], &[], false);
         assert_ne!(h_a, h_b);
         assert_ne!(h_a, h_c);
@@ -144,7 +144,7 @@ mod tests {
     fn dummy_input_equals_zero_leaf() {
         let anchor = [0u8; 32];
         let real = mk_input(1);
-        let h1 = hash_tx_body(&anchor, 0, &[real], &[], false);
+        let h1 = hash_tx_body(&anchor, 0, &[real.clone()], &[], false);
         let h2 = hash_tx_body(
             &anchor,
             0,
