@@ -83,7 +83,7 @@ transaction:
   ownership        │ Alice knows the secret for owner of slot 101
   balance          │ Σ inputs == Σ outputs + fee
   range            │ all values < 2^64
-  body binding     │ tx_body_hash correctly computed (SpineGKR)
+  body binding     │ tx_body_hash pinned via PublicColumn (SpineGKR deferred to block-prover)
   claims binding   │ C_claimed commits to specific slot values
 ```
 
@@ -412,7 +412,7 @@ The proof establishes:
 - ownership (AuthGKR);
 - balance conservation;
 - range validity;
-- body commitment (SpineGKR);
+- body binding (tx_body_hash pinned; SpineGKR proved at block level);
 - claims binding (C_claimed in Fiat-Shamir).
 
 A LogicProof does NOT establish state correctness — that is deferred
@@ -472,12 +472,13 @@ verify prior blocks recursively.
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 3 — WITNESS GENERATION (local to the wallet)          │
   │   AIR traces: balance, range, tx_body_spine (2-lane pin),   │
-  │               tx_logic (no fri_state_open!)                 │
-  │   GKR witness: 59 × spine perms + 20 × auth perms          │
-   │   boundary MLEs: spine (2^15) + auth (2^14 padded→2^15)     │
-   │   C_claimed absorbed into Fiat-Shamir channel               │
-   └────────────────────────┬────────────────────────────────────┘
-                            ▼
+  │               tx_logic (no state columns!)                   │
+  │   AuthGKR witness: 20 × auth perms (spend_secret needed)    │
+  │   boundary MLE: auth (2^14 padded to 2^13 slices)            │
+  │   Spine GKR witness: generated at block-prover (public data) │
+  │   C_claimed absorbed into Fiat-Shamir channel               │
+  └────────────────────────┬────────────────────────────────────┘
+                           ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ LEVEL 4 — PROVING  (noid_stark::prove_logic)                │
   │   Split GKR: wallet proves AuthGKR only (needs spend_secret)│
@@ -1181,8 +1182,10 @@ Arrows represent flows of typed witness values (columns / cells).
 ```
   semantic tx (wallet)
       │
-      ├──► SpineGKR Kill-Shot ──► tx_body_hash (PublicColumn pin)
-      │       (59 perms, epoch_anchor at L0)
+      ├──► Wallet computes tx_body_hash by running native Poseidon2b
+      │     spine (59 perms, epoch_anchor at L0) — NOT GKR-proven here.
+      │     The hash is pinned as PublicColumn in the STARK trace.
+      │     GKR proof of correct computation deferred to block-prover.
       │
       ├──► AuthGKR Kill-Shot ──► Address_i, AuthTag_i
       │       (20 perms, secret never in transcript)

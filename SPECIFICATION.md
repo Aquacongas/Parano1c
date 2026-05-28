@@ -388,7 +388,8 @@ level by the miner.
 On receiving a TxIntent a node MUST check:
 
 ```
-  1. logic_proof verifies (STARK + SpineGKR + AuthGKR);
+  1. logic_proof verifies (STARK + AuthGKR);
+     SpineGKR correctness of tx_body_hash is verified at block level.
   2. epoch_anchor is within the valid window:
      epoch_anchor ∈ {H_BLOCK(header[h]) : h ∈ [tip - ANCHOR_DEPTH, tip]};
   3. claimed_slots match the node's current state natively:

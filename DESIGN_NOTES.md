@@ -47,14 +47,16 @@ has fresh state — the Full Node (during block assembly).
 
 ## 3. Architecture: LogicProof + BlockStateBinding
 
-### 3.1 LogicProof (Wallet-side, ~300-400ms)
+### 3.1 LogicProof (Wallet-side, ~102ms measured)
 
 The wallet generates a STARK that proves:
 
 1. **Balance:** sum(inputs.value) == sum(outputs.value) + fee
 2. **Range:** all values < 2^64
 3. **Ownership (AuthGKR):** HAddr(spend_secret) == claimed_owner for each input
-4. **Body commitment (SpineGKR):** 59-perm Merkle spine computes tx_body_hash correctly
+4. **Body binding:** tx_body_hash pinned via PublicColumn in STARK trace.
+   Correctness of the 59-perm spine is deferred to block-prover (SpineGKR Kill-Shot
+   uses only public SpineInputs, no spend_secret needed).
 5. **Claims commitment:** C_claimed = Poseidon2b(all_claimed_slot_data), absorbed into FS channel
 
 The LogicProof does NOT contain:
@@ -187,10 +189,12 @@ Coinbase is special: it has no inputs, no spend_secret, no LogicProof from a wal
    - fee: 0
    - epoch_anchor: hash(block_header[height-6])
 
-3. Wallet computes tx_body_hash via SpineGKR (59 perms)
+3. Wallet computes tx_body_hash via native Poseidon2b spine (59 perms). 
+   GKR proof of correctness is deferred to block-prover.
 4. Wallet computes C_claimed = Poseidon2b(slot_data...)
-5. Wallet generates LogicProof (~300-400ms):
-   - Balance OK, Range OK, Auth OK, Spine OK, C_claimed absorbed
+5. Wallet generates LogicProof (~102ms measured):
+   - Balance OK, Range OK, AuthGKR OK, C_claimed absorbed
+   - SpineGKR NOT in LogicProof — block-prover proves body correctness
 
 6. Wallet sends TxIntent = {tx_body, logic_proof, C_claimed, claimed_slots} to P2P
 
@@ -364,20 +368,20 @@ about Merkle tree structure.
 
 ---
 
-## 14. Performance Estimates (New Design)
+## 14. Performance Estimates (Current Measured)
 
-### Wallet (LogicProof generation)
-- No Merkle path hashing (saves ~200ms from old design)
-- SpineGKR: ~45ms (unchanged)
-- AuthGKR: ~55ms (unchanged)
-- STARK over reduced AIR (no FriStateOpen columns): ~200-300ms
-- **Total: ~300-400ms** (down from 632ms)
+### Wallet (LogicProof generation) — measured at ~102ms
+- Native tx_body_hash computation (59 native Poseidon2b perms): ~2ms
+- AuthGKR Kill-Shot (20 slots): ~55ms
+- STARK over TxLogicAir (no state columns, reduced trace): ~45ms
+- **Total: ~102ms** (confirmed by benchmark)
 
 ### Full Node — Block Assembly (BlockProof generation, N=100 txs, 8 cores)
-- BlockStateBinding AIR (1200 slots, gamma-RLC): ~200-400ms
-- Batch-FRI aggregation of N LogicProofs: ~300-500ms
-- Single FRI opening: ~300ms
-- **Total: ~1-2s** on 8 cores
+- Still sequential (Stage Q not yet done). Current measured:
+  - Interleaved commit: ~5s
+  - Unified block SpineGKR + per-tx algebraic STARKs: ~35s (sequential)
+  - Block multipoint + FRI opening: ~3s
+  - **Total: ~43s** (target after Q: <8s on 8 cores)
 
 ### Full Node (verification)
 - Per-tx LogicProof verify: ~3ms (mempool admission)
