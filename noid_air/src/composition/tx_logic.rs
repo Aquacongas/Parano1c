@@ -114,8 +114,26 @@ impl Air for TxLogicAir {
     fn public_columns(&self) -> &[crate::gates::const_column::PublicColumn] {
         self.inner.public_columns()
     }
+
+    fn fixed_columns(&self) -> Vec<usize> {
+        // Fixed columns are identical across all transactions:
+        // - Column 0: COL_INPUT_VALID (selector for inputs)
+        // - Column 1: COL_OUTPUT_VALID (selector for outputs)
+        // - Column 76: COL_INPUT_VALID_MASK (mask for inputs)
+        // - Column 77: COL_OUTPUT_VALID_MASK (mask for outputs)
+        // - Column 80: TxvLiveMask (mask for live rows)
+        //
+        // Per-tx public columns (depend on tx_body_hash):
+        // - Columns 78-79: tx_body_hash lanes
+        //
+        // Witness columns (per-tx, mutable):
+        // - Columns 2-75: balance, range, carry chains, bit adders
+        vec![0, 1, 76, 77, 80]
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Construction helpers
 // ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------

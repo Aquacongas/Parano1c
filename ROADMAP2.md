@@ -580,6 +580,685 @@ The protocol change requires proving:
 - Blocks: Nothing (this is a prover optimization, proof format unchanged)
 - Enables: 100-tx blocks within 60s budget, path to 1024-tx blocks with SIMD (Stage K)
 
+### Implementation Stages
+
+#### Stage 1: Per-Tx Channel Factory (Q.1) — 1 day
+
+**Files:** `noid_block/src/channel.rs` (new)
+
+**Goal:** Create deterministic per-tx Fiat-Shamir channels with full domain separation.
+
+**Implementation:**
+```rust
+// Domain separation constants
+pub const DOMAIN_TAG_TX_ALGEBRAIC: u128 = 0x5458_414C_4745_4252_4149_4332_3032_3600;
+pub const DOMAIN_TAG_STATE_BINDING: u128 = 0x5354_4154_4542_494E_4449_4E47_3230_3236;
+pub const DOMAIN_TAG_BLOCK_MULTIPOINT: u128 = 0x424C_4F43_4B4D_554C_5449_504F_494E_5400;
+pub const PROTOCOL_VERSION_Q: u128 = 1;
+
+// Per-tx channel factory
+pub fn per_tx_algebraic_channel(
+    prev_state_root: &[u8; 32],
+    cap: &MerkleCap,
+    tx_index: u32,
+) -> Channel;
+
+// State binding channel (uses tx_index = n_tx)
+pub fn state_binding_channel(
+    prev_state_root: &[u8; 32],
+    cap: &MerkleCap,
+    n_tx: u32,
+) -> Channel;
+
+// Block multipoint channel (Stage 6)
+pub fn block_multipoint_channel(
+    prev_state_root: &[u8; 32],
+    cap: &MerkleCap,
+) -> Channel;
+```
+
+**Tests:**
+- `deterministic_channel`: same inputs → same challenges
+- `different_tx_index`: different tx_index → different challenges
+- `domain_separation`: algebraic vs multipoint vs state_binding → different channels
+- `protocol_version`: different version → different challenges
+
+**Done when:** Factory produces deterministic channels; same inputs → same output; different tx_index → different challenges; domain separation verified.
+
+---
+
+#### Stage 2: Trace Layout Separation (Q.2a) + Critical Memory Fixes — 5 days
+
+**Files:** `noid_air/src/lib.rs`, `noid_air/src/composition/tx_logic.rs`, `noid_stark/src/lib.rs`, `noid_stark/src/interleaved.rs`, `noid_core/src/mle/evaluate.rs`, `noid_fri_binius/src/mixed_open.rs`
+
+**Goal:** Split trace into fixed/witness columns, eliminate critical memory copies.
+
+**2.1 Column Classification Trait**
+
+Add to `noid_air/src/lib.rs`:
+```rust
+pub trait Air {
+    // ... existing methods ...
+    
+    /// Indices of columns that are fixed (identical across all valid traces).
+    /// Fixed columns are shared across all transactions via Arc.
+    fn fixed_columns(&self) -> Vec<usize> { vec![] }
+}
+```
+
+For TxLogicAir (81 columns):
+- Fixed (selectors, masks): columns 0..8
+- Per-tx public: columns 78..80 (tx_body_hash), column 80 (TxvLiveMask)
+- Witness: columns 8..78 (balance, range, carry chains)
+
+**2.2 FixedColumns Structure**
+
+```rust
+#[derive(Clone)]
+pub struct FixedColumns {
+    pub tower: Vec<Vec<Block128>>,   // tower basis (constraint eval)
+    pub flat: Vec<Vec<u128>>,        // flat basis (zero-check)
+    pub col_indices: Vec<usize>,     // original Trace column indices
+    pub log_len: usize,
+}
+```
+
+**2.3 Zero-Copy Padding**
+
+Replace `pad_column` with `pad_column_cow`:
+```rust
+pub fn pad_column_cow(column: &[Block128], target_log: usize) -> Cow<[Block128]> {
+    let target = 1usize << target_log;
+    if column.len() == target {
+        return Cow::Borrowed(column);  // NO ALLOC
+    }
+    // ... allocate and pad ...
+}
+```
+
+**2.4 Split Trace View**
+
+```rust
+pub struct SplitTraceView<'a> {
+    pub fixed: &'a FixedColumns,
+    pub witness: &'a [Vec<Block128>],
+    pub witness_flat: &'a [Vec<u128>],
+    pub log_rows: usize,
+}
+```
+
+**2.5 Fix M1: sumcheck_cols Cloning (752 MB savings)**
+
+In `noid_stark/src/interleaved.rs:150-153`:
+```rust
+// BEFORE: clones all columns
+let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(...);
+sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
+
+// AFTER: uses references
+let mut sumcheck_refs: Vec<&[Block128]> = Vec::with_capacity(...);
+for col in &padded_columns[..n_air_cols] {
+    sumcheck_refs.push(col.as_slice());
+}
+```
+
+Update `prove_zero_check` signature to accept `&[&[Block128]]`.
+
+**2.6 Fix M2: evaluate_slice Thread-Local Scratch (800 MB savings)**
+
+Add to `noid_core/src/mle/evaluate.rs`:
+```rust
+pub fn evaluate_slice_with_scratch<F: TowerField>(
+    evals: &[F],
+    point: &[F],
+    scratch: &mut Vec<F>,
+) -> F;
+```
+
+In `noid_fri_binius/src/mixed_open.rs`:
+```rust
+thread_local! {
+    static EVAL_SCRATCH: RefCell<Vec<Block128>> = RefCell::new(Vec::new());
+}
+
+let primary_openings: Vec<Block128> = prover_state.raw_cols
+    .par_iter()
+    .map(|col| {
+        EVAL_SCRATCH.with(|s| {
+            evaluate_slice_with_scratch(col, &r_pp, &mut s.borrow_mut())
+        })
+    })
+    .collect();
+```
+
+**Done when:**
+- FixedColumns built once per AIR, shared via Arc
+- Fixed columns pre-converted to flat basis
+- prove_zero_check_split accepts split trace
+- sumcheck_cols uses references (M1 fixed)
+- evaluate_slice uses thread-local scratch (M2 fixed)
+- pad_column_cow zero-copy for same-size columns (M4 fixed)
+
+---
+
+#### Stage 3: Witness Generation Parallelization (Q.2b) — 3 days
+
+**Files:** `noid_block/src/lib.rs`, `noid_block/src/full_node.rs`, `noid_air/src/airs/tx_body_spine.rs`, `noid_gkr/src/block_spine.rs`
+
+**Goal:** Parallelize all sequential witness construction bottlenecks.
+
+**3.1 Parallel Stage 2 Prep Loop**
+
+In `noid_block/src/lib.rs`:
+```rust
+// BEFORE: sequential
+for w in witnesses.iter() {
+    let spine_states = reconstruct_slot_states(...);
+    // ... pad columns ...
+}
+
+// AFTER: parallel
+let prep_results: Vec<_> = witnesses.par_iter().map(|w| {
+    let spine_states = reconstruct_slot_states(...);
+    // ... pad columns ...
+    (spine_states, columns, auth_slices)
+}).collect();
+```
+
+Note: `reconstruct_slot_states` internally sequential (hash chain), but **between tx** — independent.
+
+**3.2 Parallel BlockSpineMle::build (S3)**
+
+In `noid_gkr/src/block_spine.rs`:
+```rust
+// BEFORE: sequential loop over 5900 slots
+for (slot, state_in) in slot_state_ins.iter().enumerate() {
+    let witness = evaluate_permutation(*state_in);
+    mle.populate_slot(slot, &witness);
+}
+
+// AFTER: parallel (embarrassingly parallel, disjoint memory)
+slot_state_ins.par_iter().enumerate().for_each(|(slot, state_in)| {
+    let witness = evaluate_permutation(*state_in);
+    mle.populate_slot(slot, &witness);
+});
+```
+
+**Speedup:** 5900 perms / 8 cores = ~738 per core. Near-linear scaling.
+
+**3.3 Parallel build_balance_trace_parts (S5)**
+
+In `noid_air/src/airs/balance_gate.rs`:
+```rust
+let block_traces: Vec<_> = per_block.par_iter()
+    .map(|block| BitAdderAir::build_trace(block))
+    .collect();
+```
+
+**3.4 Parallel verify_logic in full_node (S6)**
+
+In `noid_block/src/full_node.rs`:
+```rust
+let verify_results: Vec<_> = (0..n_tx).into_par_iter()
+    .map(|k| verify_logic(...))
+    .collect();
+```
+
+**Done when:**
+- Stage 2 prep loop parallel
+- BlockSpineMle::build parallel
+- build_balance_trace_parts parallel
+- verify_logic in full_node parallel
+- No shared mutable state between threads
+
+---
+
+#### Stage 4: Fix Critical Memory Copies — 2 days
+
+**Files:** `noid_gkr/src/block_spine.rs`, `noid_fri_binius/src/interleaved_commit.rs`, `noid_stark/src/interleaved.rs`
+
+**4.1 Fix M3: BlockSpineMle mmap Optimization**
+
+For 100 tx: 4 × 2^22 × 16 bytes = 256 MB. Use mmap for lazy zero-fill:
+```rust
+fn alloc_zeroed_mle(n_cells: usize) -> Vec<Block128> {
+    #[cfg(target_os = "linux")]
+    {
+        let size = n_cells * std::mem::size_of::<Block128>();
+        let ptr = unsafe {
+            libc::mmap(ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        if ptr != libc::MAP_FAILED {
+            return unsafe { Vec::from_raw_parts(ptr as *mut Block128, n_cells, n_cells) };
+        }
+    }
+    vec![Block128::ZERO; n_cells]  // fallback
+}
+```
+
+**4.2 Fix M5: Remove encoded_cols Dead Field**
+
+In `noid_fri_binius/src/interleaved_commit.rs`:
+```rust
+pub struct InterleavedProverState<'a> {
+    // REMOVED: pub encoded_cols: Vec<Vec<Block128>>,
+    pub raw_cols: Vec<&'a [Block128]>,
+    pub log_rows: usize,
+    pub n_cols: usize,
+}
+```
+
+**4.3 Fix M6: Verifier Proof Clone**
+
+In `noid_stark/src/interleaved.rs`:
+```rust
+// BEFORE: clones entire AlgebraicStarkProof
+let alg = AlgebraicStarkProof {
+    base_openings: proof.base_openings.clone(),
+    // ...
+};
+
+// AFTER: restructure to borrow directly
+fn verify_algebraic_from_interleaved<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &InterleavedStarkProof,  // borrow directly
+    // ...
+) -> Result<AlgebraicVerifyOut, VerifyError>
+```
+
+**Done when:**
+- BlockSpineMle allocation optimized (M3)
+- encoded_cols removed (M5)
+- Verifier borrows proof directly (M6)
+
+---
+
+#### Stage 5: Parallel Stage 5 (Q.2c) — 1 day
+
+**Files:** `noid_block/src/lib.rs`
+
+**Goal:** Parallelize per-tx algebraic STARK proofs.
+
+```rust
+let tx_results: Vec<_> = (0..n_tx)
+    .into_par_iter()
+    .map(|k| {
+        let mut ch = per_tx_algebraic_channel(
+            &prev_block_state_root, cap, k as u32,
+        );
+        
+        let slice_claims = build_auth_slice_claims(...);
+        
+        let (alg, r_pp_k, claim_k, lambdas_k) = prove_air_interleaved_algebraic_split(
+            w.air, &fixed_cols, &prep.witness_columns,
+            w.pi, &auth_res.extras_transcript,
+            &slice_claims, log_len, &mut ch,
+        );
+        
+        (alg, r_pp_k, claim_k, lambdas_k)
+    })
+    .collect();
+```
+
+**Done when:**
+- Stage 5 uses rayon::par_iter
+- Each tx uses independent per_tx_algebraic_channel
+- build_auth_slice_claims inside parallel closure
+- prove_block produces valid proof
+
+---
+
+#### Stage 6: Update Verifier (Q.3, Q.5) — 1 day
+
+**Files:** `noid_block/src/lib.rs`
+
+**Goal:** Mirror prover changes in verifier, parallelize verification.
+
+```rust
+let tx_verify_results: Vec<Result<_, VerifyBlockError>> = (0..n_tx)
+    .into_par_iter()
+    .map(|k| {
+        // Auth Kill-Shot (self-seeded)
+        let auth_reductions = {
+            let mut ch = auth_gkr_channel();
+            verify_auth_killshot(...)?
+        };
+        
+        // Bridge checks, slice reconstruction
+        
+        // Algebraic STARK (per-tx channel)
+        let mut ch = per_tx_algebraic_channel(
+            &meta.prev_block_state_root, cap, k as u32,
+        );
+        let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(...)?;
+        
+        Ok((r_pp_k, claim_k))
+    })
+    .collect();
+```
+
+**Done when:**
+- verify_block uses per-tx channels
+- verify_block parallelizes Stage 2b
+- Accepts proofs from parallel prover
+
+---
+
+#### Stage 7: Reconnect Block Channel (Q.4) — 0.5 day
+
+**Files:** `noid_block/src/lib.rs`
+
+**Goal:** Create fresh channels for Stage 5b and Stage 6.
+
+```rust
+// Stage 5b: State binding
+if let Some(sb) = state_binding {
+    let mut sb_ch = state_binding_channel(
+        &prev_block_state_root, cap, n_tx as u32,
+    );
+    // ...
+}
+
+// Stage 6: Block multipoint
+let mut block_channel = block_multipoint_channel(
+    &prev_block_state_root, cap,
+);
+block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
+block_channel.observe_field_elems(&block_col_openings);
+```
+
+**Done when:**
+- Stage 5b uses state_binding_channel
+- Stage 6 uses fresh block_multipoint_channel
+- No shared channel state between Stage 5 and Stage 6
+
+---
+
+#### Stage 8: Segmented Transcript Absorption (Q.4a) — 4 days
+
+**Files:** `noid_block/src/lib.rs`, `noid_block/src/transcript.rs` (new)
+
+**Goal:** Replace linear transcript absorption with Merkle reduction.
+
+**8.1 Per-Entity Digest Construction**
+
+```rust
+pub fn compute_tx_transcript_digest(
+    tx_index: u32,
+    r_pp: &[Block128],
+    openings: &[Block128],
+    lambdas: &[Block128],
+    final_claim: Block128,
+) -> [u8; 32] {
+    let mut sponge = Poseidon2bSponge::new();
+    sponge.absorb(Block128::from(tx_index as u128));
+    sponge.absorb_slice(r_pp);
+    sponge.absorb_slice(openings);
+    sponge.absorb_slice(lambdas);
+    sponge.absorb(final_claim);
+    sponge.squeeze_digest()
+}
+```
+
+**8.2 Merkle Reduction**
+
+```rust
+pub fn merkle_reduce(digests: &[[u8; 32]]) -> [u8; 32] {
+    let n = digests.len().next_power_of_two();
+    let mut layer: Vec<[u8; 32]> = Vec::with_capacity(n);
+    layer.extend_from_slice(digests);
+    layer.resize(n, [0u8; 32]);
+    
+    while layer.len() > 1 {
+        layer = layer.par_chunks(2)
+            .map(|pair| compress(&pair[0], &pair[1]))
+            .collect();
+    }
+    layer[0]
+}
+```
+
+**8.3 Update Stage 6 Transcript**
+
+```rust
+// BEFORE: linear absorption
+block_channel.observe_field_elems(&block_col_openings);
+
+// AFTER: Merkle reduction
+let tx_digests: Vec<[u8; 32]> = (0..n_tx).into_par_iter().map(|k| {
+    compute_tx_transcript_digest(k as u32, &tx_r_pp[k], ...)
+}).collect();
+
+let transcript_root = merkle_reduce(&all_digests);
+let [root_hi, root_lo] = hash_to_fields(&transcript_root);
+block_channel.observe_field_elem(root_hi);
+block_channel.observe_field_elem(root_lo);
+```
+
+**Security Requirements:**
+- Per-entity digest MUST commit to tx_index (prevents reordering)
+- MUST commit to opening positions (prevents cross-segment replay)
+- MUST commit to lambda reductions (prevents transcript ambiguity)
+- MUST commit to evaluation claims (prevents claim substitution)
+
+**Done when:**
+- Stage 6 no longer linearly absorbs every field element
+- Entity digests used as transcript units
+- Multipoint reduction remains sound
+- Verifier reconstructs identical segmented transcript
+
+---
+
+#### Stage 9: Parallel Verifier (Q.5) — 1 day
+
+Already covered in Stage 6. Additional:
+
+**9.1 Parallel State Binding Verification**
+
+```rust
+if has_state_binding {
+    let mut sb_ch = state_binding_channel(...);
+    let (r_pp_sb, _) = verify_air_interleaved_algebraic(...)?;
+}
+```
+
+**What remains sequential:**
+- Block SpineGKR Kill-Shot verification (~3ms)
+- Stage 6: Block multipoint sumcheck (cheap)
+- Stage 7: FRI mixed opening (~15ms)
+
+**Done when:** verify_block <4s for 100 tx on 8 cores.
+
+---
+
+#### Stage 10: Benchmarks & Validation (Q.6) — 2 days
+
+**Files:** `bench_prover/benches/block_scaling.rs`, `noid_block/tests/`
+
+**10.1 Performance Benchmarks**
+
+```rust
+fn bench_block_prove(c: &mut Criterion) {
+    for n_tx in [10, 50, 100, 200, 500] {
+        group.bench_with_input(BenchmarkId::new("parallel", n_tx), &n_tx, |b, &n| {
+            let (witnesses, state_binding) = setup_block(n);
+            b.iter(|| prove_block([0; 32], &witnesses, Some(&state_binding)));
+        });
+    }
+}
+```
+
+**10.2 Determinism Tests**
+
+```rust
+#[test]
+fn sequential_vs_parallel_equivalence() {
+    let proof_seq = prove_block_sequential(...);
+    let proof_par = prove_block(...);
+    verify_block(&airs, &proof_par, ...).unwrap();
+}
+```
+
+**10.3 Memory Profiling**
+
+```rust
+#[test]
+fn memory_peak_under_2gb() {
+    let peak = measure_peak_memory(|| prove_block(...));
+    assert!(peak < 2 * 1024 * 1024 * 1024);
+}
+```
+
+**Validation Checklist:**
+- [ ] prove_block <15s on 8 cores (100 tx)
+- [ ] verify_block <5s on 8 cores (100 tx)
+- [ ] Memory peak <2 GB (100 tx)
+- [ ] Sequential vs parallel proof equivalence
+- [ ] Cross-platform determinism (CI: x86_64, ARM)
+- [ ] No regression in existing tests
+
+**Done when:** All benchmarks confirm targets, all validation tests pass.
+
+---
+
+#### Stage 11: Deterministic Parallel Execution (Q.8) — 2 days
+
+**11.1 Stable Reduction Ordering**
+
+```rust
+// INVARIANT: All parallel reductions use indexed par_iter (0..n)
+// with .collect() to guarantee deterministic ordering.
+```
+
+**11.2 Thread-Local Transcript Isolation**
+
+Each rayon worker gets its own Channel instance. No shared mutable transcript state.
+
+**11.3 Parallel Hash Consistency**
+
+- Blake3: deterministic across threads
+- Poseidon2b: deterministic (pure arithmetic)
+- No floating-point anywhere (GF(2^128) only)
+
+**11.4 Cross-Run Determinism Test**
+
+```rust
+#[test]
+fn deterministic_across_runs() {
+    let proof1 = prove_block(...);
+    let proof2 = prove_block(...);
+    assert_eq!(format!("{:?}", proof1), format!("{:?}", proof2));
+}
+```
+
+**Done when:**
+- Stable reduction ordering documented and enforced
+- Thread-local transcript isolation verified
+- Cross-run determinism test passes
+- No floating-point in any hot path
+
+---
+
+### Appendix A: Architectural Invariants
+
+**A.1 Streaming-First Invariant**
+
+```
+No protocol stage may require full materialization
+of all block openings simultaneously in RAM.
+```
+
+**A.2 Column Lifetime Ownership Model**
+
+```
+fixed columns:       global immutable (Arc<FixedColumns>)
+witness columns:     per-tx ephemeral (Vec<Vec<Block128>>)
+opening reductions:  stage-local ephemeral (dropped after Stage 6)
+recursive replay:    streaming-only (Phase 7)
+```
+
+**A.3 Pre-Allocation Over Arena**
+
+From Plonky2/Boojum reference analysis: **neither uses bumpalo**. Both use:
+- Pre-allocated `Vec::with_capacity`
+- Aligned allocation (`allocate_with_alignment_of::<F, P>()`)
+- Rayon chunked parallelism
+
+**Decision for Paranoid:** Pre-allocation + `pad_column_cow` (zero-copy for fixed) instead of bumpalo. Simpler, safer, same result.
+
+---
+
+### Implementation Timeline
+
+| Stage | Task | Days | Cumulative | Dependencies |
+|-------|------|------|------------|-------------|
+| 1 | Per-Tx Channel Factory (Q.1) | 1 | 1 | — |
+| 2 | Trace Layout Separation (Q.2a) + M1/M2/M4 | 5 | 6 | — |
+| 3 | Witness Generation Parallelization (Q.2b) | 3 | 9 | — |
+| 4 | Fix Critical Copies (M3/M5/M6) | 2 | 11 | Stage 2 |
+| 5 | Parallel Stage 5 (Q.2c) | 1 | 12 | Stage 1, 2 |
+| 6 | Update Verifier (Q.3, Q.5) | 1 | 13 | Stage 1, 5 |
+| 7 | Reconnect Block Channel (Q.4) | 0.5 | 13.5 | Stage 1 |
+| 8 | Segmented Transcript (Q.4a) | 4 | 17.5 | Stage 7 |
+| 9 | Parallel Verifier (Q.5) | 1 | 18.5 | Stage 6, 8 |
+| 10 | Benchmarks & Validation (Q.6) | 2 | 20.5 | All |
+| 11 | Deterministic Parallel (Q.8) | 2 | 22.5 | Stage 5, 9 |
+
+**Critical path:** 1 → 2 → 5 → 6 → 8 → 9 → 10
+
+---
+
+### Performance Projection
+
+| Metric | Before | After Stage 5 | After Stage 8 | After All |
+|--------|--------|--------------|--------------|-----------|
+| prove_block (100 tx, 8c) | 43s | ~12s | ~10s | **~8s** |
+| verify_block (100 tx, 8c) | 15s | ~5s | ~4s | **~3.5s** |
+| Memory peak (100 tx) | ~3 GB | ~1.5 GB | ~1.2 GB | **<1 GB** |
+| Proof size | 2.02 MB | 2.02 MB | 2.02 MB | 2.02 MB |
+
+**Breakdown (after all stages, 100 tx, 8 cores):**
+
+```
+prove_block: ~8s
+├── Stage 2 (prep): ~0.3s (parallel, fixed shared)
+├── Stage 2b (BlockSpineMle): ~0.5s (parallel 5900 perms)
+├── Stage 3 (commit): ~3s (parallel Blake3, unchanged)
+├── Stage 4 (GKR): ~0.5s (spine sequential + auth parallel)
+├── Stage 5 (algebraic): ~2.5s (100/8 × 200ms, per-tx channels)
+├── Stage 5b (state binding): ~0.2s
+├── Stage 6 (block multipoint): ~0.5s (Merkle reduction)
+└── Stage 7 (FRI): ~0.5s
+```
+
+---
+
+### Risk Register
+
+| Risk | Probability | Impact | Mitigation |
+|------|------------|--------|-----------|
+| Split trace API breaks existing callers | Medium | High | Incremental: add `_split` variants, don't replace |
+| Q.4a Merkle reduction changes proof format | High | Medium | Proof format unchanged (same BlockProof struct), only transcript internals change |
+| Parallel determinism failure | Low | Critical | Indexed par_iter + collect; determinism tests |
+| BlockSpineMle parallel write conflicts | None | — | Disjoint memory regions (pack_index_dyn guarantees) |
+| reconstruct_slot_states can't parallelize | Known | Medium | Accept sequential; it's ~2s of 43s total |
+
+---
+
+### What We Do NOT Do (Justified Defer)
+
+| Item | Reason for Defer |
+|------|-----------------|
+| `#[repr(align(64))]` for Block128 | Audit showed: AVX2 uses unaligned loads, CLMUL register-only. 64-byte alignment would break pack_slice. |
+| Column chunking (64-256KB) | Columns already 128KB (log_rows=13). Needed at log_rows≥16 (Phase 3). |
+| NUMA-awareness | 250 MB fits in L3. Needed at 1024 tx (Phase 8). |
+| KillShot batch scheduler | KillShot self-contained. Batch scheduling — Phase 7 concern. |
+| Streaming witness | Segmented state doesn't exist. YAGNI until Phase 3. |
+| Bumpalo arena | References (Plonky2, Boojum) do NOT use arena. Pre-allocation + Cow better. |
+
 ---
 
 ## Phase 3 — Segmented State & Merkle Kill-Shot (Stage F)

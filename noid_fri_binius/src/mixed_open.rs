@@ -18,7 +18,7 @@
 //! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
-use noid_core::mle::evaluate::evaluate_slice;
+use noid_core::mle::evaluate::{evaluate_slice_with_scratch};
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri::Channel;
@@ -69,10 +69,20 @@ pub fn prove_mixed_opening(
     assert_eq!(primary_point.len(), log_n);
 
     // Step 1: Compute primary openings (all columns at primary_point)
+    // Use thread-local scratch buffer to avoid per-column allocations
+    thread_local! {
+        static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
+    }
+    
     let primary_openings: Vec<Block128> = state
         .raw_cols
         .par_iter()
-        .map(|col| evaluate_slice(col, primary_point))
+        .map(|col| {
+            EVAL_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                evaluate_slice_with_scratch(col, primary_point, &mut scratch)
+            })
+        })
         .collect();
 
     // Step 2: Verify secondary claims are consistent

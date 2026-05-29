@@ -12,10 +12,11 @@
 //! 3. N per-tx *algebraic* STARK transcripts (no FRI per tx).
 //! 4. One block-level multipoint sumcheck reducing N per-tx terminal
 //!    claims to a single `(r_block, h_block)`.
-//! 5. One single FRI-Binius mixed opening at `r_block`.
+//! 5. One single FRI-Binius mixed opening at r_block.
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod channel;
 pub mod full_node;
 
 use noid_core::mle::{

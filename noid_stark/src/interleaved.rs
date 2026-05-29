@@ -147,10 +147,14 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         .iter()
         .map(|&col_id| crate::vshift::cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> =
+    let mut sumcheck_cols: Vec<&[Block128]> =
         Vec::with_capacity(n_air_cols + rotated_columns.len());
-    sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
-    sumcheck_cols.extend(rotated_columns);
+    for col in &padded_columns[..n_air_cols] {
+        sumcheck_cols.push(col.as_slice());
+    }
+    for col in &rotated_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = crate::prove_zero_check(

@@ -499,7 +499,7 @@ fn accumulate_sum_flat_fused(
 /// bytes are identical to a naive tower-basis prover run on the same
 /// inputs.
 pub fn prove_zero_check(
-    cols: &[Vec<Block128>],
+    cols: &[&[Block128]],
     constraints: &[Box<dyn Constraint>],
     betas: &[Block128],
     z: &[Block128],
@@ -697,9 +697,13 @@ pub fn prove_air_unchecked_timed<A: Air>(
         .iter()
         .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
-    sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns);
+    let mut sumcheck_cols: Vec<&[Block128]> = Vec::with_capacity(n_base + rotated_columns.len());
+    for col in &padded_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
+    for col in &rotated_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = prove_zero_check(
@@ -1229,9 +1233,13 @@ fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
         .iter()
         .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
-    sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns);
+    let mut sumcheck_cols: Vec<&[Block128]> = Vec::with_capacity(n_base + rotated_columns.len());
+    for col in &padded_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
+    for col in &rotated_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
 
     let degree = round_poly_degree(air);
     let (zero_check_rounds, r) = prove_zero_check(
@@ -1886,9 +1894,13 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
         .iter()
         .map(|&col_id| cyclic_rotate_left(&padded_columns[col_id]))
         .collect();
-    let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(n_base + rotated_columns.len());
-    sumcheck_cols.extend_from_slice(&padded_columns);
-    sumcheck_cols.extend(rotated_columns);
+    let mut sumcheck_cols: Vec<&[Block128]> = Vec::with_capacity(n_base + rotated_columns.len());
+    for col in &padded_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
+    for col in &rotated_columns {
+        sumcheck_cols.push(col.as_slice());
+    }
 
     // --- Batched zero-check sumcheck ---
     let degree = round_poly_degree(air);
