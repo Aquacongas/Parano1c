@@ -35,7 +35,7 @@
 use std::sync::OnceLock;
 
 use noid_core::mle::eq::eq_ind;
-use noid_core::mle::fold::fold_highest_var_inplace;
+use noid_core::mle::fold::fold_highest_var_par;
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use rayon::prelude::*;
@@ -135,7 +135,9 @@ pub struct BatchEvalReduction {
 }
 
 fn fold_inplace(tbl: &mut Vec<Block128>, r: Block128) {
-    fold_highest_var_inplace(tbl, r);
+    // Use parallel fold for large tables (dominant cost for 100-tx blocks
+    // where num_vars=22 → half up to 2M elements per round).
+    fold_highest_var_par(tbl, r);
 }
 
 /// Build `W(x) = Σ_i α_i · eq(r_i, x)` as a length-`2^n` table. We

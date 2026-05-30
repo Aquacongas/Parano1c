@@ -26,6 +26,31 @@ pub fn fold_highest_var_inplace<F: TowerField>(evals: &mut Vec<F>, r: F) {
     evals.truncate(half);
 }
 
+/// Parallel version of [`fold_highest_var_inplace`] for large tables.
+///
+/// Uses rayon when `half >= threshold` to saturate available cores.
+/// Semantically identical to the scalar version.
+pub fn fold_highest_var_par<F>(evals: &mut Vec<F>, r: F)
+where
+    F: TowerField + Send + Sync,
+{
+    use rayon::prelude::*;
+    let half = evals.len() / 2;
+    assert!(half > 0, "evals must have at least 2 elements");
+    if half >= 1024 {
+        let (lo, hi) = evals.split_at_mut(half);
+        lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, h)| {
+            *l += r * (*h - *l);
+        });
+    } else {
+        for j in 0..half {
+            let delta = evals[j + half] - evals[j];
+            evals[j] += r * delta;
+        }
+    }
+    evals.truncate(half);
+}
+
 /// Fold a specific variable index (not necessarily the highest).
 ///
 /// `var_index` specifies which variable to fold (0 = lowest, n-1 = highest).
