@@ -266,6 +266,7 @@ pub fn auth_sigma_dec_lane_tables_flat() -> &'static [Vec<u128>; STATE_SIZE] {
 /// `out[y] = src[auth_dec_round_index(y)]`.
 pub fn auth_permute_by_dec(src: &[Block128]) -> Vec<Block128> {
     debug_assert_eq!(src.len(), N_AUTH_UNIFIED_CELLS);
+    // Sequential: rayon overhead exceeds compute for N_AUTH_UNIFIED_CELLS = 16384.
     let mut out = vec![Block128::ZERO; N_AUTH_UNIFIED_CELLS];
     for y in 0..N_AUTH_UNIFIED_CELLS {
         out[y] = src[auth_dec_round_index(y as u16) as usize];

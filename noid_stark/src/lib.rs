@@ -545,6 +545,7 @@ pub fn prove_zero_check(
         // cores.  Running the outer n_points iterations (degree+1, typically
         // 2-5) serially eliminates nested-pool overhead and synchronisation
         // barriers while preserving full inner parallelism.
+    
         let evals: Vec<Block128> = (0..n_points)
             .map(|s_idx| {
                 let s_flat = s_flat_table[s_idx];
@@ -558,6 +559,7 @@ pub fn prove_zero_check(
         let r = channel.get_random_point();
         let r_flat = tower_to_flat_u128(r.0);
 
+    
         {
             use rayon::prelude::*;
             cur_cols

@@ -387,13 +387,21 @@ impl UnifiedFlatTables {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn fold_highest_var_inplace_flat(evals: &mut Vec<u128>, r_flat: u128) {
     let half = evals.len() / 2;
     debug_assert!(half > 0);
-    for j in 0..half {
-        let delta = evals[j] ^ evals[j + half];
-        evals[j] ^= clmul_gcm(r_flat, delta);
+    if half >= 1024 {
+        use rayon::prelude::*;
+        let (lo, hi) = evals.split_at_mut(half);
+        lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, &h)| {
+            *l ^= clmul_gcm(r_flat, *l ^ h);
+        });
+    } else {
+        for j in 0..half {
+            let delta = evals[j] ^ evals[j + half];
+            evals[j] ^= clmul_gcm(r_flat, delta);
+        }
     }
     evals.truncate(half);
 }
@@ -455,91 +463,191 @@ fn compute_round_polynomial_flat(
     beta_flat: u128,
     gamma_flat: u128,
 ) -> RoundPolynomial<Block128> {
+    use rayon::prelude::*;
     let half = tabs.u.len() / 2;
-    let mut acc = [0u128; AUTH_UNIFIED_ROUND_DEGREE + 1];
     const ONE_FLAT: u128 = 1u128;
 
-    for i in 0..half {
-        let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-        let sg_p: [u128; 2] = [
-            tabs.sigma_dec[i],
-            tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
-        ];
-        let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
-        let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-        let so_p: [u128; 2] = [
-            tabs.s_out_dec[i],
-            tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
-        ];
-        let st_p: [u128; 2] = [
-            tabs.state_dec[i],
-            tabs.state_dec[i] ^ tabs.state_dec[i + half],
-        ];
-        let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+    // Only parallelize for larger halves where rayon overhead is justified.
+    // For auth (N_AUTH_UNIFIED_CELLS=16384, half=8192 initially), rayon
+    // overhead (~100μs) is comparable to compute, so use threshold 4096.
+    let acc: [u128; AUTH_UNIFIED_ROUND_DEGREE + 1] = if half >= 4096 {
+        (0..half)
+            .into_par_iter()
+            .fold(
+                || [0u128; AUTH_UNIFIED_ROUND_DEGREE + 1],
+                |mut local_acc, i| {
+                    let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
+                    let sg_p: [u128; 2] = [
+                        tabs.sigma_dec[i],
+                        tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
+                    ];
+                    let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
+                    let si_p: [u128; 2] =
+                        [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
+                    let so_p: [u128; 2] = [
+                        tabs.s_out_dec[i],
+                        tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
+                    ];
+                    let st_p: [u128; 2] = [
+                        tabs.state_dec[i],
+                        tabs.state_dec[i] ^ tabs.state_dec[i + half],
+                    ];
+                    let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
 
-        let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
-        let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
-        let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
-        let mut q1_p = [0u128; 9];
-        q1_p.copy_from_slice(&sg_si7_p);
-        q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
-        q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
-        q1_p[2] ^= sg_si_p[2];
+                    let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
+                    let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
+                    let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
+                    let mut q1_p = [0u128; 9];
+                    q1_p.copy_from_slice(&sg_si7_p);
+                    q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
+                    q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
+                    q1_p[2] ^= sg_si_p[2];
 
-        let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
-        let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
+                    let inner_p: [u128; 2] =
+                        [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
+                    let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
 
-        let mut q2_p = [0u128; 4];
-        q2_p[0] ^= stmain_p[0];
-        q2_p[1] ^= stmain_p[1];
-        for j in 0..STATE_SIZE {
-            let m_p: [u128; 2] = [
-                tabs.mds_lane_dec[j][i],
-                tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
-            ];
-            let sgl_p: [u128; 2] = [
-                tabs.sigma_lane_dec[j][i],
-                tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
-            ];
-            let sol_p: [u128; 2] = [
-                tabs.s_out_lane_dec[j][i],
-                tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
-            ];
-            let stl_p: [u128; 2] = [
-                tabs.state_lane_dec[j][i],
-                tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
-            ];
-            let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
+                    let mut q2_p = [0u128; 4];
+                    q2_p[0] ^= stmain_p[0];
+                    q2_p[1] ^= stmain_p[1];
+                    for j in 0..STATE_SIZE {
+                        let m_p: [u128; 2] = [
+                            tabs.mds_lane_dec[j][i],
+                            tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+                        ];
+                        let sgl_p: [u128; 2] = [
+                            tabs.sigma_lane_dec[j][i],
+                            tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+                        ];
+                        let sol_p: [u128; 2] = [
+                            tabs.s_out_lane_dec[j][i],
+                            tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+                        ];
+                        let stl_p: [u128; 2] = [
+                            tabs.state_lane_dec[j][i],
+                            tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
+                        ];
+                        let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
 
-            let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
-            let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
-            let pi_p: [u128; 3] = [
-                sgl_sol_p[0] ^ onep_stl_p[0],
-                sgl_sol_p[1] ^ onep_stl_p[1],
-                sgl_sol_p[2] ^ onep_stl_p[2],
+                        let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
+                        let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
+                        let pi_p: [u128; 3] = [
+                            sgl_sol_p[0] ^ onep_stl_p[0],
+                            sgl_sol_p[1] ^ onep_stl_p[1],
+                            sgl_sol_p[2] ^ onep_stl_p[2],
+                        ];
+                        let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+                        for k in 0..4 {
+                            q2_p[k] ^= m_pi_p[k];
+                        }
+                    }
+
+                    let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
+                    let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
+                    let mut q_p = [0u128; 9];
+                    q_p.copy_from_slice(&q1_p);
+                    for k in 0..3 {
+                        q_p[k] ^= beta_q1p_p[k];
+                    }
+                    for k in 0..4 {
+                        q_p[k] ^= gamma_q2_p[k];
+                    }
+
+                    let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
+                    for k in 0..=AUTH_UNIFIED_ROUND_DEGREE {
+                        local_acc[k] ^= f_p[k];
+                    }
+                    local_acc
+                },
+            )
+            .reduce(
+                || [0u128; AUTH_UNIFIED_ROUND_DEGREE + 1],
+                |mut a, b| {
+                    for k in 0..=AUTH_UNIFIED_ROUND_DEGREE {
+                        a[k] ^= b[k];
+                    }
+                    a
+                },
+            )
+    } else {
+        let mut acc = [0u128; AUTH_UNIFIED_ROUND_DEGREE + 1];
+        for i in 0..half {
+            let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
+            let sg_p: [u128; 2] = [
+                tabs.sigma_dec[i],
+                tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
             ];
-            let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+            let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
+            let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
+            let so_p: [u128; 2] = [
+                tabs.s_out_dec[i],
+                tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
+            ];
+            let st_p: [u128; 2] = [
+                tabs.state_dec[i],
+                tabs.state_dec[i] ^ tabs.state_dec[i + half],
+            ];
+            let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+            let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
+            let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
+            let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
+            let mut q1_p = [0u128; 9];
+            q1_p.copy_from_slice(&sg_si7_p);
+            q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
+            q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
+            q1_p[2] ^= sg_si_p[2];
+            let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
+            let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
+            let mut q2_p = [0u128; 4];
+            q2_p[0] ^= stmain_p[0];
+            q2_p[1] ^= stmain_p[1];
+            for j in 0..STATE_SIZE {
+                let m_p: [u128; 2] = [
+                    tabs.mds_lane_dec[j][i],
+                    tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+                ];
+                let sgl_p: [u128; 2] = [
+                    tabs.sigma_lane_dec[j][i],
+                    tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+                ];
+                let sol_p: [u128; 2] = [
+                    tabs.s_out_lane_dec[j][i],
+                    tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+                ];
+                let stl_p: [u128; 2] = [
+                    tabs.state_lane_dec[j][i],
+                    tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
+                ];
+                let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
+                let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
+                let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
+                let pi_p: [u128; 3] = [
+                    sgl_sol_p[0] ^ onep_stl_p[0],
+                    sgl_sol_p[1] ^ onep_stl_p[1],
+                    sgl_sol_p[2] ^ onep_stl_p[2],
+                ];
+                let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+                for k in 0..4 {
+                    q2_p[k] ^= m_pi_p[k];
+                }
+            }
+            let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
+            let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
+            let mut q_p = [0u128; 9];
+            q_p.copy_from_slice(&q1_p);
+            for k in 0..3 {
+                q_p[k] ^= beta_q1p_p[k];
+            }
             for k in 0..4 {
-                q2_p[k] ^= m_pi_p[k];
+                q_p[k] ^= gamma_q2_p[k];
+            }
+            let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
+            for k in 0..=AUTH_UNIFIED_ROUND_DEGREE {
+                acc[k] ^= f_p[k];
             }
         }
-
-        let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
-        let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
-        let mut q_p = [0u128; 9];
-        q_p.copy_from_slice(&q1_p);
-        for k in 0..3 {
-            q_p[k] ^= beta_q1p_p[k];
-        }
-        for k in 0..4 {
-            q_p[k] ^= gamma_q2_p[k];
-        }
-
-        let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
-        for k in 0..=AUTH_UNIFIED_ROUND_DEGREE {
-            acc[k] ^= f_p[k];
-        }
-    }
+        acc
+    };
 
     let coeffs_tower: Vec<Block128> = acc
         .iter()
