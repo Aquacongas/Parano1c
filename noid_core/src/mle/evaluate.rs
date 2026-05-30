@@ -45,10 +45,18 @@ pub fn evaluate_slice_with_scratch<F: TowerField>(
     point: &[F],
     scratch: &mut Vec<F>,
 ) -> F {
+    // Reuse the caller's buffer: clear (keeps capacity) + refill.
+    // IMPORTANT: must NOT use std::mem::take — that would move the Vec out
+    // and destroy the reuse, allocating fresh on every call.
     scratch.clear();
-    scratch.reserve(evals.len());
     scratch.extend_from_slice(evals);
-    evaluate_inplace_scalars(std::mem::take(scratch), point)
+    // Fold in-place without consuming scratch, so the capacity is retained
+    // for the next call on this thread.
+    for &coord in point.iter().rev() {
+        fold_highest_var_inplace(scratch, coord);
+    }
+    debug_assert_eq!(scratch.len(), 1, "fold must reduce to a single element");
+    scratch[0]
 }
 
 /// Evaluate an MLE in flat (GCM) basis for ~20x speedup over tower-basis mul.

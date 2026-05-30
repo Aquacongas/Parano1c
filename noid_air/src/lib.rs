@@ -490,7 +490,7 @@ pub trait Constraint: Send + Sync {
 // Air trait
 // ---------------------------------------------------------------------------
 
-pub trait Air {
+pub trait Air: Send + Sync {
     fn n_columns(&self) -> usize;
     fn log_rows(&self) -> usize;
     fn constraints(&self) -> &[Box<dyn Constraint>];

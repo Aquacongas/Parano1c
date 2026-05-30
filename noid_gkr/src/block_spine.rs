@@ -111,10 +111,7 @@ pub struct BlockSpineMle {
 impl BlockSpineMle {
     /// Build the unified block MLE from N transactions' slot state_in vectors.
     /// Each transaction contributes exactly `N_SPINE_SLOTS` (59) slots.
-    pub fn build(
-        n_instances: usize,
-        slot_state_ins: &[[Block128; STATE_SIZE]],
-    ) -> Self {
+    pub fn build(n_instances: usize, slot_state_ins: &[[Block128; STATE_SIZE]]) -> Self {
         let total_live = n_instances * N_SPINE_SLOTS;
         assert_eq!(slot_state_ins.len(), total_live);
         let num_vars = num_vars_for(total_live);
@@ -129,13 +126,21 @@ impl BlockSpineMle {
             live_slots: total_live,
         };
 
-        for (slot, state_in) in slot_state_ins.iter().enumerate() {
-            let witness = evaluate_permutation(*state_in);
-            mle.populate_slot(slot, &witness);
+        // Parallel: evaluate_permutation (Poseidon2b chain) is the expensive part.
+        // Each slot's computation is fully independent.
+        use rayon::prelude::*;
+        let witnesses: Vec<crate::layers::PermLayerWitness> = slot_state_ins
+            .par_iter()
+            .map(|&state_in| evaluate_permutation(state_in))
+            .collect();
+
+        // Sequential fill: populate_slot takes &mut self but writes to disjoint
+        // indices; this pass is cheap compared to the permutation evaluations.
+        for (slot, witness) in witnesses.iter().enumerate() {
+            mle.populate_slot(slot, witness);
         }
         mle
     }
-
 
     fn populate_slot(&mut self, slot: usize, witness: &crate::layers::PermLayerWitness) {
         for r in 0..N_ROUNDS {
@@ -476,11 +481,20 @@ fn compute_block_round_polynomial_flat(
 
     for i in 0..half {
         let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-        let sg_p: [u128; 2] = [tabs.sigma_dec[i], tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half]];
+        let sg_p: [u128; 2] = [
+            tabs.sigma_dec[i],
+            tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
+        ];
         let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
         let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-        let so_p: [u128; 2] = [tabs.s_out_dec[i], tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half]];
-        let st_p: [u128; 2] = [tabs.state_dec[i], tabs.state_dec[i] ^ tabs.state_dec[i + half]];
+        let so_p: [u128; 2] = [
+            tabs.s_out_dec[i],
+            tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
+        ];
+        let st_p: [u128; 2] = [
+            tabs.state_dec[i],
+            tabs.state_dec[i] ^ tabs.state_dec[i + half],
+        ];
         let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
 
         // Q1(t) = sg(t) * si(t)^7 + so(t) + si(t) + sg(t) * si(t)
@@ -661,10 +675,8 @@ pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
     let mut mds_lane_at_r = [Block128::ZERO; STATE_SIZE];
     let mut sigma_lane_at_r = [Block128::ZERO; STATE_SIZE];
     for j in 0..STATE_SIZE {
-        mds_lane_at_r[j] = evaluate_slice(
-            &build_mds_lane_table_dyn(j, live_slots, n_cells),
-            &r_prime,
-        );
+        mds_lane_at_r[j] =
+            evaluate_slice(&build_mds_lane_table_dyn(j, live_slots, n_cells), &r_prime);
         sigma_lane_at_r[j] = evaluate_slice(&project_lane_dyn(&sigma_dec_full, j), &r_prime);
     }
 
@@ -827,7 +839,11 @@ fn build_block_combined_weights(
         w_state[x] += lane_state[elem] * w_lane[elem][x];
     }
 
-    BlockCombinedWeights { w_sin, w_sout, w_state }
+    BlockCombinedWeights {
+        w_sin,
+        w_sout,
+        w_state,
+    }
 }
 
 fn block_combined_target(red: &BlockSpineUnifiedReduction, delta: Block128) -> Block128 {
@@ -912,7 +928,11 @@ fn block_combined_weights_at_point(
         w_state += lane_state[j] * lane_w;
     }
 
-    BlockWeightsAtPoint { w_sin, w_sout, w_state }
+    BlockWeightsAtPoint {
+        w_sin,
+        w_sout,
+        w_state,
+    }
 }
 
 /// Prove the shift gadget: reduces 11 dec-permuted claims to 3 direct
@@ -1031,12 +1051,8 @@ pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
         r_double_prime[num_vars - 1 - round] = challenge;
     }
 
-    let w = block_combined_weights_at_point(
-        &main_reduction.r_prime,
-        delta,
-        &r_double_prime,
-        num_vars,
-    );
+    let w =
+        block_combined_weights_at_point(&main_reduction.r_prime, delta, &r_double_prime, num_vars);
     let claimed =
         w.w_sin * proof.s_in_at_r2 + w.w_sout * proof.s_out_at_r2 + w.w_state * proof.state_at_r2;
     if expected != claimed {
@@ -1131,26 +1147,33 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
     };
 
     // (2) Shift gadget.
-    let (shift, r_double_prime) =
-        prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
+    let (shift, r_double_prime) = prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
 
     // (3) Batch eval on state column.
     let state_claims = vec![
-        EvalClaim { point: r_prime.clone(), value: main.state_at_r },
-        EvalClaim { point: r_double_prime.clone(), value: shift.state_at_r2 },
+        EvalClaim {
+            point: r_prime.clone(),
+            value: main.state_at_r,
+        },
+        EvalClaim {
+            point: r_double_prime.clone(),
+            value: shift.state_at_r2,
+        },
     ];
     let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
 
     // (4) Batch eval on s_in column.
-    let sin_claims = vec![
-        EvalClaim { point: r_double_prime.clone(), value: shift.s_in_at_r2 },
-    ];
+    let sin_claims = vec![EvalClaim {
+        point: r_double_prime.clone(),
+        value: shift.s_in_at_r2,
+    }];
     let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
 
     // (5) Batch eval on s_out column.
-    let sout_claims = vec![
-        EvalClaim { point: r_double_prime, value: shift.s_out_at_r2 },
-    ];
+    let sout_claims = vec![EvalClaim {
+        point: r_double_prime,
+        value: shift.s_out_at_r2,
+    }];
     let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
 
     let proof = BlockSpineProof {
@@ -1203,35 +1226,34 @@ pub fn verify_block_spine_killshot<T: FiatShamir<Block128>>(
     )?;
 
     // (2) Verify shift gadget.
-    let shift_red = verify_block_spine_shift(
-        &proof.kill_shot.shift,
-        &main_red,
-        proof.num_vars,
-        channel,
-    )?;
+    let shift_red =
+        verify_block_spine_shift(&proof.kill_shot.shift, &main_red, proof.num_vars, channel)?;
 
     // (3) Verify batch eval on state.
     let state_claims = vec![
-        EvalClaim { point: main_red.r_prime.clone(), value: main_red.state_at_r },
-        EvalClaim { point: shift_red.r_double_prime.clone(), value: shift_red.state_at_r2 },
+        EvalClaim {
+            point: main_red.r_prime.clone(),
+            value: main_red.state_at_r,
+        },
+        EvalClaim {
+            point: shift_red.r_double_prime.clone(),
+            value: shift_red.state_at_r2,
+        },
     ];
-    let state_red = verify_batch_eval(
-        &proof.state_batch,
-        &state_claims,
-        proof.num_vars,
-        channel,
-    )?;
+    let state_red = verify_batch_eval(&proof.state_batch, &state_claims, proof.num_vars, channel)?;
 
     // (4) Verify batch eval on s_in.
-    let sin_claims = vec![
-        EvalClaim { point: shift_red.r_double_prime.clone(), value: shift_red.s_in_at_r2 },
-    ];
+    let sin_claims = vec![EvalClaim {
+        point: shift_red.r_double_prime.clone(),
+        value: shift_red.s_in_at_r2,
+    }];
     let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, proof.num_vars, channel)?;
 
     // (5) Verify batch eval on s_out.
-    let sout_claims = vec![
-        EvalClaim { point: shift_red.r_double_prime, value: shift_red.s_out_at_r2 },
-    ];
+    let sout_claims = vec![EvalClaim {
+        point: shift_red.r_double_prime,
+        value: shift_red.s_out_at_r2,
+    }];
     let sout_red = verify_batch_eval(&proof.sout_batch, &sout_claims, proof.num_vars, channel)?;
 
     Some(BlockSpineReductions {
@@ -1287,16 +1309,16 @@ mod tests {
 
     #[test]
     fn slot_vars_computation() {
-        assert_eq!(slot_vars_for(59), 6);       // 1 tx
-        assert_eq!(slot_vars_for(118), 7);      // 2 txs
-        assert_eq!(slot_vars_for(4 * 59), 8);   // 4 txs: 236 slots
+        assert_eq!(slot_vars_for(59), 6); // 1 tx
+        assert_eq!(slot_vars_for(118), 7); // 2 txs
+        assert_eq!(slot_vars_for(4 * 59), 8); // 4 txs: 236 slots
         assert_eq!(slot_vars_for(1024 * 59), 16); // 1024 txs: 60416 slots
     }
 
     #[test]
     fn num_vars_computation() {
-        assert_eq!(num_vars_for(59), 6 + 7 + 2);   // 15 (same as per-tx)
-        assert_eq!(num_vars_for(118), 7 + 7 + 2);  // 16
+        assert_eq!(num_vars_for(59), 6 + 7 + 2); // 15 (same as per-tx)
+        assert_eq!(num_vars_for(118), 7 + 7 + 2); // 16
         assert_eq!(num_vars_for(4 * 59), 8 + 7 + 2); // 17
     }
 
@@ -1312,79 +1334,75 @@ mod tests {
         let tx_body_hash = [wrap.1[0], wrap.1[1]];
 
         let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) = prove_block_spine_killshot(
-            1,
-            &all_state_ins,
-            &[tx_body_hash],
-            &mut ch_p,
-        );
+        let (proof, reductions) =
+            prove_block_spine_killshot(1, &all_state_ins, &[tx_body_hash], &mut ch_p);
 
         let mut ch_v = Poseidon2bChannel::new();
-        let v_red = verify_block_spine_killshot(
-            &proof,
-            1,
-            &[tx_body_hash],
-            &mut ch_v,
-        ).expect("verifier accepts honest proof");
+        let v_red = verify_block_spine_killshot(&proof, 1, &[tx_body_hash], &mut ch_v)
+            .expect("verifier accepts honest proof");
 
         assert_eq!(v_red, reductions);
-        assert!(discharge_block_spine_reductions_native(1, &all_state_ins, &v_red));
+        assert!(discharge_block_spine_reductions_native(
+            1,
+            &all_state_ins,
+            &v_red
+        ));
     }
 
     #[test]
     fn block_spine_killshot_4tx_roundtrip() {
         let circuit = SpineCircuit::build();
-        let inputs_list: Vec<SpineInputs> = (0..4).map(|i| fixture_inputs(i as u128 * 100)).collect();
+        let inputs_list: Vec<SpineInputs> =
+            (0..4).map(|i| fixture_inputs(i as u128 * 100)).collect();
         let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
 
-        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list.iter().map(|inp| {
-            let states = reconstruct_slot_states(&circuit, inp);
-            let wrap = states.last().unwrap();
-            [wrap.1[0], wrap.1[1]]
-        }).collect();
+        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list
+            .iter()
+            .map(|inp| {
+                let states = reconstruct_slot_states(&circuit, inp);
+                let wrap = states.last().unwrap();
+                [wrap.1[0], wrap.1[1]]
+            })
+            .collect();
 
         let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) = prove_block_spine_killshot(
-            4,
-            &all_state_ins,
-            &tx_body_hashes,
-            &mut ch_p,
-        );
+        let (proof, reductions) =
+            prove_block_spine_killshot(4, &all_state_ins, &tx_body_hashes, &mut ch_p);
 
         assert_eq!(proof.num_vars, 8 + 7 + 2); // 17 vars for 236 slots
         assert_eq!(proof.live_slots, 4 * 59);
 
         let mut ch_v = Poseidon2bChannel::new();
-        let v_red = verify_block_spine_killshot(
-            &proof,
-            4,
-            &tx_body_hashes,
-            &mut ch_v,
-        ).expect("verifier accepts 4-tx block");
+        let v_red = verify_block_spine_killshot(&proof, 4, &tx_body_hashes, &mut ch_v)
+            .expect("verifier accepts 4-tx block");
 
         assert_eq!(v_red, reductions);
-        assert!(discharge_block_spine_reductions_native(4, &all_state_ins, &v_red));
+        assert!(discharge_block_spine_reductions_native(
+            4,
+            &all_state_ins,
+            &v_red
+        ));
     }
 
     #[test]
     fn block_spine_rejects_tampered_main_claim() {
         let circuit = SpineCircuit::build();
-        let inputs_list: Vec<SpineInputs> = (0..2).map(|i| fixture_inputs(i as u128 * 50)).collect();
+        let inputs_list: Vec<SpineInputs> =
+            (0..2).map(|i| fixture_inputs(i as u128 * 50)).collect();
         let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
 
-        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list.iter().map(|inp| {
-            let states = reconstruct_slot_states(&circuit, inp);
-            let wrap = states.last().unwrap();
-            [wrap.1[0], wrap.1[1]]
-        }).collect();
+        let tx_body_hashes: Vec<[Block128; 2]> = inputs_list
+            .iter()
+            .map(|inp| {
+                let states = reconstruct_slot_states(&circuit, inp);
+                let wrap = states.last().unwrap();
+                [wrap.1[0], wrap.1[1]]
+            })
+            .collect();
 
         let mut ch_p = Poseidon2bChannel::new();
-        let (mut proof, _) = prove_block_spine_killshot(
-            2,
-            &all_state_ins,
-            &tx_body_hashes,
-            &mut ch_p,
-        );
+        let (mut proof, _) =
+            prove_block_spine_killshot(2, &all_state_ins, &tx_body_hashes, &mut ch_p);
         proof.kill_shot.main.state_at_r += Block128::ONE;
 
         let mut ch_v = Poseidon2bChannel::new();

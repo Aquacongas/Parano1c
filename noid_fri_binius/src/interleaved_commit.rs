@@ -29,8 +29,11 @@ pub struct InterleavedCommitment {
 }
 
 /// Prover-side state retained after commitment (not sent to verifier).
+///
+/// M5: `encoded_cols` removed — it was always `Vec::new()` and wasted
+/// layout space.  Only `raw_cols` (borrowed references to the actual
+/// column data) are kept.
 pub struct InterleavedProverState<'a> {
-    pub encoded_cols: Vec<Vec<Block128>>,
     pub raw_cols: Vec<&'a [Block128]>,
     pub log_rows: usize,
     pub n_cols: usize,
@@ -88,7 +91,6 @@ pub fn interleaved_commit<'a>(
     };
 
     let state = InterleavedProverState {
-        encoded_cols: Vec::new(),
         raw_cols: cols.to_vec(),
         log_rows,
         n_cols,

@@ -26,6 +26,7 @@
 
 use noid_air::Air;
 use noid_core::mle::eq::eq_ind_partial_eval;
+use noid_core::mle::evaluate::evaluate_slice_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::Blake3Hasher;
 use noid_fri::Channel;
@@ -37,7 +38,7 @@ use noid_tx::PublicInputs;
 use rayon::prelude::*;
 
 use crate::{
-    absorb_public_inputs, lagrange_eval_at, mle_eval, padded_log_len, round_poly_degree, RoundPoly,
+    absorb_public_inputs, lagrange_eval_at, padded_log_len, round_poly_degree, RoundPoly,
     SliceClaim, VerifyError,
 };
 
@@ -210,11 +211,19 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
-    // Base openings. `.copied()` converts `&&[Block128]` to `&[Block128]`.
+    // M2: Base openings with thread-local scratch — eliminates one 128 KB
+    // allocation per column per transaction.  Each rayon worker reuses its
+    // scratch buffer across all columns it processes in a given task batch.
+    thread_local! {
+        static BASE_SCRATCH: std::cell::RefCell<Vec<Block128>> =
+            std::cell::RefCell::new(Vec::new());
+    }
     let base_openings: Vec<Block128> = padded_columns[..n_air_cols]
         .par_iter()
         .copied()
-        .map(|col| mle_eval(col, &r_point))
+        .map(|col| {
+            BASE_SCRATCH.with(|s| evaluate_slice_with_scratch(col, &r_point, &mut s.borrow_mut()))
+        })
         .collect();
     channel.observe_field_elems(&base_openings);
 
@@ -263,16 +272,19 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
 
     let eq_base = eq_ind_partial_eval(&r_point);
     let hyper_len = 1usize << log_len;
-    let combined_base_b: Vec<Block128> = (0..hyper_len)
-        .into_par_iter()
-        .map(|j| {
-            let mut acc = Block128::ZERO;
-            for i in 0..n_air_cols {
-                acc += lambdas[i] * padded_columns[i][j];
-            }
-            acc
-        })
-        .collect();
+    // Cache-friendly column-outer accumulation for combined_base_b.
+    // Processing one column at a time (128 KB) keeps both combined_base_b
+    // and the current column in L2 cache, avoiding L3/DRAM thrashing that
+    // the previous row-outer layout caused (81 columns × random stride).
+    let mut combined_base_b: Vec<Block128> = vec![Block128::ZERO; hyper_len];
+    for i in 0..n_air_cols {
+        let lam = lambdas[i];
+        let col = padded_columns[i];
+        combined_base_b
+            .par_iter_mut()
+            .zip(col.par_iter())
+            .for_each(|(acc, &val)| *acc += lam * val);
+    }
 
     let weight_trails = if s_count > 0 {
         Some(crate::ladder_batch::WeightTrails::new(&r_point))
@@ -360,7 +372,7 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
     channel: &mut Channel,
-) -> Result<(Vec<Block128>, Block128), VerifyError> {
+) -> Result<(Vec<Block128>, Block128, Vec<Block128>), VerifyError> {
     let out = verify_algebraic_inner(
         air,
         pi,
@@ -369,7 +381,7 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
         slice_claims,
         channel,
     )?;
-    Ok((out.r_pp, out.final_claim))
+    Ok((out.r_pp, out.final_claim, out.lambdas))
 }
 
 /// Internal variant that also returns the data needed by the full verifier

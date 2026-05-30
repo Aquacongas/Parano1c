@@ -19,16 +19,19 @@
 pub mod channel;
 pub mod full_node;
 
+use crate::channel::{
+    block_multipoint_channel, compute_tx_transcript_digest, merkle_reduce,
+    per_tx_algebraic_channel, state_binding_channel,
+};
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_air::{Air, FixedColumns};
 use noid_core::mle::{eq::eq_ind_partial_eval, split::split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::Blake3Hasher;
-use noid_fri::Channel;
 use noid_fri_binius::{
-    absorb_cap, interleaved_commit, prove_mixed_opening, verify_mixed_opening,
-    InterleavedCommitment, MixedOpeningProof, COMPACT_NUM_QUERIES,
+    interleaved_commit, prove_mixed_opening, verify_mixed_opening, InterleavedCommitment,
+    MixedOpeningProof, COMPACT_NUM_QUERIES,
 };
 use noid_gkr::{
     auth_gkr_channel, prove_block_spine_killshot, reconstruct_slot_states, verify_auth_killshot,
@@ -252,31 +255,42 @@ pub fn prove_block(
         auth_slices: Vec<Vec<Block128>>,
     }
 
-    // Collect all slot_state_ins for the unified block spine.
+    // Q.2b: Parallel prep loop.
+    // Each tx's spine-state reconstruction and witness column padding are
+    // fully independent; parallelize across txs with rayon.
+    struct TxPrepBundle {
+        slot_state_ins: Vec<[Block128; 4]>,
+        prep: TxPrep,
+    }
+    let bundles: Vec<TxPrepBundle> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            let w = &witnesses[k];
+            let spine_states = reconstruct_slot_states(&spine_circuit, w.spine_inputs);
+            let slot_state_ins: Vec<[Block128; 4]> = spine_states.iter().map(|(s, _)| *s).collect();
+            let witness_cols: Vec<Vec<Block128>> = w
+                .trace
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !shared_fixed.is_fixed(*i))
+                .map(|(_, col)| noid_stark::pad_column(col, log_len))
+                .collect();
+            TxPrepBundle {
+                slot_state_ins,
+                prep: TxPrep {
+                    witness_cols,
+                    auth_slices: w.auth_slices.to_vec(),
+                },
+            }
+        })
+        .collect();
+
     let mut all_slot_state_ins: Vec<[Block128; 4]> = Vec::with_capacity(n_tx * 59);
     let mut preps: Vec<TxPrep> = Vec::with_capacity(n_tx);
-
-    for w in witnesses.iter() {
-        let spine_states = reconstruct_slot_states(&spine_circuit, w.spine_inputs);
-        for (s_in, _) in &spine_states {
-            all_slot_state_ins.push(*s_in);
-        }
-
-        // Only pad witness (non-fixed) columns; fixed columns are shared via
-        // `shared_fixed` and reused for every transaction zero-copy.
-        let witness_cols: Vec<Vec<Block128>> = w
-            .trace
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !shared_fixed.is_fixed(*i))
-            .map(|(_, col)| noid_stark::pad_column(col, log_len))
-            .collect();
-
-        preps.push(TxPrep {
-            witness_cols,
-            auth_slices: w.auth_slices.to_vec(),
-        });
+    for bundle in bundles {
+        all_slot_state_ins.extend_from_slice(&bundle.slot_state_ins);
+        preps.push(bundle.prep);
     }
 
     // Build unified block spine MLE and split state column into FRI slices.
@@ -411,49 +425,74 @@ pub fn prove_block(
         .collect();
 
     // -------------------------------------------------------------------------
-    // Stage 5: Per-tx algebraic STARK proofs on shared block channel.
+    // Stage 5: Q.2c — Parallel per-tx algebraic STARK proofs.
+    //
+    // Each tx uses an independent Fiat-Shamir channel seeded from:
+    //   DOMAIN_TAG_TX_ALGEBRAIC || PROTOCOL_VERSION || state_root || cap || tx_index
+    // This is safe because the cap already commits ALL columns (committed before
+    // any challenge is drawn). The block-level binding happens in Stage 6 via
+    // the Merkle reduction of all per-tx transcripts (Q.4a).
     // -------------------------------------------------------------------------
-    let mut block_channel = Channel::new();
-    let [sr0, sr1] = hash_to_fields(&prev_block_state_root);
-    block_channel.observe_field_elem(sr0);
-    block_channel.observe_field_elem(sr1);
-    absorb_cap(&mut block_channel, cap);
+    struct TxAlgResult {
+        alg: AlgebraicStarkProof,
+        r_pp: Vec<Block128>,
+        final_claim: Block128,
+        lambdas: Vec<Block128>,
+    }
+
+    let tx_alg_results: Vec<TxAlgResult> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            let w = &witnesses[k];
+            let prep = &preps[k];
+            let auth_res = &auth_results[k];
+
+            let slice_claims = build_auth_slice_claims(
+                n_air_cols,
+                &auth_res.auth_r_low,
+                &auth_res.auth_slice_vals,
+            );
+
+            // Per-tx independent Fiat-Shamir channel (Q.2c / Q.1).
+            let mut ch = per_tx_algebraic_channel(&prev_block_state_root, cap, k as u32);
+
+            // Build full ordered column refs (fixed zero-copy + witness).
+            let mut all_col_refs = shared_fixed.build_full_col_refs(n_air_cols, &prep.witness_cols);
+            for s in &prep.auth_slices {
+                all_col_refs.push(s.as_slice());
+            }
+
+            let (alg, r_pp, final_claim, lambdas) = prove_air_interleaved_algebraic(
+                w.air,
+                &all_col_refs,
+                w.pi,
+                &auth_res.extras_transcript,
+                &slice_claims,
+                log_len,
+                &mut ch,
+            );
+            TxAlgResult {
+                alg,
+                r_pp,
+                final_claim,
+                lambdas,
+            }
+        })
+        .collect();
 
     let mut tx_algebraic: Vec<AlgebraicStarkProof> = Vec::with_capacity(n_tx);
     let mut tx_r_pp: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
     let mut tx_claims: Vec<Block128> = Vec::with_capacity(n_tx);
     let mut tx_lambdas: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
-
-    for (k, w) in witnesses.iter().enumerate() {
-        let prep = &preps[k];
-        let auth_res = &auth_results[k];
-        let slice_claims =
-            build_auth_slice_claims(n_air_cols, &auth_res.auth_r_low, &auth_res.auth_slice_vals);
-
-        // Build full ordered column refs (fixed zero-copy + witness).
-        let mut all_col_refs: Vec<&[Block128]> =
-            shared_fixed.build_full_col_refs(n_air_cols, &prep.witness_cols);
-        for s in &prep.auth_slices {
-            all_col_refs.push(s.as_slice());
-        }
-        let (alg, r_pp_k, claim_k, lambdas_k) = prove_air_interleaved_algebraic(
-            w.air,
-            &all_col_refs,
-            w.pi,
-            &auth_res.extras_transcript,
-            &slice_claims,
-            log_len,
-            &mut block_channel,
-        );
-
-        tx_r_pp.push(r_pp_k);
-        tx_claims.push(claim_k);
-        tx_lambdas.push(lambdas_k);
-        tx_algebraic.push(alg);
+    for r in tx_alg_results {
+        tx_algebraic.push(r.alg);
+        tx_r_pp.push(r.r_pp);
+        tx_claims.push(r.final_claim);
+        tx_lambdas.push(r.lambdas);
     }
 
     // -------------------------------------------------------------------------
-    // Stage 5b: BlockStateBindingAir algebraic STARK on the shared channel.
+    // Stage 5b: BlockStateBindingAir algebraic STARK (Q.4 dedicated channel).
     // -------------------------------------------------------------------------
     let mut sb_algebraic: Option<AlgebraicStarkProof> = None;
     let mut sb_r_pp: Vec<Block128> = Vec::new();
@@ -471,6 +510,8 @@ pub fn prove_block(
             is_activation: [false; 8],
             is_deactivation: [false; 4],
         };
+        // Q.4: dedicated state-binding channel avoids sharing with per-tx channels.
+        let mut sb_ch = state_binding_channel(&prev_block_state_root, cap, n_tx as u32);
         let sb_col_refs: Vec<&[Block128]> =
             sb_padded_columns.iter().map(|c| c.as_slice()).collect();
         let (alg, r_pp_sb, _claim_sb, _lambdas_sb) = prove_air_interleaved_algebraic(
@@ -480,11 +521,41 @@ pub fn prove_block(
             &[], // no extras transcript for state binding
             &[], // no slice claims (Kill-Shots handle Merkle paths)
             log_len,
-            &mut block_channel,
+            &mut sb_ch,
         );
         sb_r_pp = r_pp_sb;
         sb_algebraic = Some(alg);
     }
+
+    // -------------------------------------------------------------------------
+    // Q.4a: Segmented Transcript Absorption.
+    //
+    // Each per-tx algebraic STARK produced an independent Fiat-Shamir transcript.
+    // We summarise all transcripts into a single 32-byte Merkle root that the
+    // block channel absorbs, providing soundness-equivalent binding to the
+    // sequential approach while enabling parallel proving.
+    // -------------------------------------------------------------------------
+    let tx_digests: Vec<[u8; 32]> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            compute_tx_transcript_digest(
+                k as u32,
+                &tx_r_pp[k],
+                &tx_algebraic[k].base_openings,
+                &tx_lambdas[k],
+                tx_claims[k],
+            )
+        })
+        .collect();
+    let transcript_root = merkle_reduce(&tx_digests);
+
+    // -------------------------------------------------------------------------
+    // Q.4: Block multipoint channel — fresh, domain-separated from per-tx channels.
+    // -------------------------------------------------------------------------
+    let mut block_channel = block_multipoint_channel(&prev_block_state_root, cap);
+    let [tr0, tr1] = hash_to_fields(&transcript_root);
+    block_channel.observe_field_elem(tr0);
+    block_channel.observe_field_elem(tr1);
 
     // -------------------------------------------------------------------------
     // Stage 6 (§6): Block-level multipoint sumcheck.
@@ -501,30 +572,59 @@ pub fn prove_block(
     let spine_participant_idx = n_tx;
     let sb_participant_idx = n_tx + 1;
 
-    // Collect per-tx column openings M_k[i] = MLE(col)(r''_k).
+    // M2: Parallel per-tx column openings with thread-local scratch.
+    // Eliminates ~n_tx * n_per_tx * 128 KB = ~1 GB of allocations for 100 txs.
     let total_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
+
+    thread_local! {
+        static OPEN_SCRATCH: std::cell::RefCell<Vec<Block128>> =
+            std::cell::RefCell::new(Vec::new());
+    }
+
+    let tx_openings: Vec<Vec<Block128>> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            let r_pp_k = &tx_r_pp[k];
+            let air_refs =
+                shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
+            let mut cols_k = Vec::with_capacity(n_per_tx);
+            OPEN_SCRATCH.with(|s| {
+                let mut scratch = s.borrow_mut();
+                for col in &air_refs {
+                    cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
+                        col, r_pp_k, &mut scratch,
+                    ));
+                }
+                for auth_s in &preps[k].auth_slices {
+                    cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
+                        auth_s, r_pp_k, &mut scratch,
+                    ));
+                }
+            });
+            cols_k
+        })
+        .collect();
+
     let mut block_col_openings: Vec<Block128> = Vec::with_capacity(total_cols);
-    for k in 0..n_tx {
-        let r_pp_k = &tx_r_pp[k];
-        // Reconstruct full ordered column refs for MLE evaluation.
-        let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
-        for col in &air_refs {
-            block_col_openings.push(noid_stark::mle_eval(col, r_pp_k));
-        }
-        for s in &preps[k].auth_slices {
-            block_col_openings.push(noid_stark::mle_eval(s, r_pp_k));
-        }
+    for openings_k in tx_openings {
+        block_col_openings.extend_from_slice(&openings_k);
     }
     // Block spine slice openings at spine_r_low.
-    for s in &spine_padded_slices {
-        block_col_openings.push(noid_stark::mle_eval(s, &spine_r_low));
-    }
-    // State binding column openings at sb_r_pp.
-    if state_binding.is_some() {
-        for i in 0..sb_n_cols {
-            block_col_openings.push(noid_stark::mle_eval(&sb_padded_columns[i], &sb_r_pp));
+    OPEN_SCRATCH.with(|s| {
+        let mut scratch = s.borrow_mut();
+        for sp in &spine_padded_slices {
+            block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
+                sp, &spine_r_low, &mut scratch,
+            ));
         }
-    }
+        if state_binding.is_some() {
+            for i in 0..sb_n_cols {
+                block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
+                    &sb_padded_columns[i], &sb_r_pp, &mut scratch,
+                ));
+            }
+        }
+    });
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
     block_channel.observe_field_elems(&block_col_openings);
@@ -757,15 +857,10 @@ pub fn verify_block(
     let cap = &proof.commitment.cap;
 
     // -------------------------------------------------------------------------
-    // Stage 2: Unified block spine + per-tx auth Kill-Shots + algebraic STARK.
+    // Stage 2: Unified block spine Kill-Shot + per-tx parallel verification.
     // -------------------------------------------------------------------------
-    let mut block_channel = Channel::new();
-    let [sr0, sr1] = hash_to_fields(&meta.prev_block_state_root);
-    block_channel.observe_field_elem(sr0);
-    block_channel.observe_field_elem(sr1);
-    absorb_cap(&mut block_channel, cap);
 
-    // (a) Unified block spine Kill-Shot verification.
+    // (a) Unified block spine Kill-Shot — self-seeded, independent of per-tx channels.
     let tx_body_hashes: Vec<[Block128; 2]> = proof
         .tx_pis
         .iter()
@@ -779,8 +874,6 @@ pub fn verify_block(
             .ok_or(VerifyBlockError::BlockSpineKillShot)?
     };
 
-    // Block spine slice reconstruction.
-    // Extend spine_r_low to log_len for consistency with the multipoint hypercube.
     let spine_r = &block_spine_reductions.state.point;
     let spine_r_low: Vec<Block128> = {
         let mut v = spine_r[..BASE_LOG].to_vec();
@@ -799,77 +892,94 @@ pub fn verify_block(
     }
     let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
 
-    // (b) Per-tx auth Kill-Shots + algebraic STARK.
-    let mut tx_r_pp: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
-    let mut tx_final_claims: Vec<Block128> = Vec::with_capacity(n_tx);
+    // (b) Q.3/Q.5 — Parallel per-tx auth Kill-Shots + algebraic STARK.
+    //
+    // Each tx uses an independent per_tx_algebraic_channel, mirroring the prover.
+    // Results are collected in order; any error short-circuits the whole block.
+    struct TxVerifyResult {
+        r_pp: Vec<Block128>,
+        final_claim: Block128,
+        lambdas: Vec<Block128>,
+    }
 
-    for k in 0..n_tx {
-        let pi = &proof.tx_pis[k];
-        let alg = &proof.tx_algebraic[k];
-        let spine_inputs = &spine_inputs_list[k];
-        let auth_public = &auth_public_list[k];
-        let claimed = pi.tx_body_hash.as_fields();
+    let tx_verify_results: Vec<Result<TxVerifyResult, VerifyBlockError>> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            let pi = &proof.tx_pis[k];
+            let alg = &proof.tx_algebraic[k];
+            let spine_inputs = &spine_inputs_list[k];
+            let auth_public = &auth_public_list[k];
+            let claimed = pi.tx_body_hash.as_fields();
 
-        let auth_reductions = {
-            let mut ch = auth_gkr_channel();
-            verify_auth_killshot(
-                &proof.tx_auth_proofs[k],
-                &auth_circuit,
-                auth_public,
-                &mut ch,
-            )
-            .ok_or(VerifyBlockError::AuthKillShot(k))?
-        };
+            // Auth Kill-Shot (self-seeded, parallel-safe).
+            let auth_reductions = {
+                let mut ch = auth_gkr_channel();
+                verify_auth_killshot(
+                    &proof.tx_auth_proofs[k],
+                    &auth_circuit,
+                    auth_public,
+                    &mut ch,
+                )
+                .ok_or(VerifyBlockError::AuthKillShot(k))?
+            };
 
-        // Auth/Spine bridge: tx_body_hash must agree.
-        if auth_public.tx_body_hash != claimed {
-            return Err(VerifyBlockError::AuthSpineBridge(k));
-        }
-        let n_live = pi.n_live_inputs as usize;
-        for i in 0..n_live {
-            let owner_hi = spine_inputs.input_leaves[i][2];
-            let owner_lo = spine_inputs.input_leaves[i][3];
-            if auth_public.expected_address[i] != [owner_hi, owner_lo] {
+            if auth_public.tx_body_hash != claimed {
                 return Err(VerifyBlockError::AuthSpineBridge(k));
             }
-        }
+            let n_live = pi.n_live_inputs as usize;
+            for i in 0..n_live {
+                let owner_hi = spine_inputs.input_leaves[i][2];
+                let owner_lo = spine_inputs.input_leaves[i][3];
+                if auth_public.expected_address[i] != [owner_hi, owner_lo] {
+                    return Err(VerifyBlockError::AuthSpineBridge(k));
+                }
+            }
 
-        // Auth slice reconstruction.
-        let r_auth = &auth_reductions.state.point;
-        let auth_r_low = &r_auth[..BASE_LOG];
-        let auth_r_high = &r_auth[BASE_LOG..];
-        let auth_slice_vals = &alg.slice_claimed_values[..n_auth_slices];
+            let r_auth = &auth_reductions.state.point;
+            let auth_r_low = &r_auth[..BASE_LOG];
+            let auth_r_high = &r_auth[BASE_LOG..];
+            let auth_slice_vals = &alg.slice_claimed_values[..n_auth_slices];
 
-        let recon_auth =
-            noid_core::mle::split::reconstruct_from_slices(auth_slice_vals, auth_r_high);
-        if recon_auth != auth_reductions.state.value {
-            return Err(VerifyBlockError::AuthSliceReconstruction(k));
-        }
+            let recon_auth =
+                noid_core::mle::split::reconstruct_from_slices(auth_slice_vals, auth_r_high);
+            if recon_auth != auth_reductions.state.value {
+                return Err(VerifyBlockError::AuthSliceReconstruction(k));
+            }
 
-        // Rebuild extras_transcript and slice_claims.
-        let auth_tr = reduction_to_transcript(r_auth, auth_reductions.state.value);
-        let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
-        extras.extend_from_slice(&spine_extras);
-        extras.extend_from_slice(&auth_tr);
+            let auth_tr = reduction_to_transcript(r_auth, auth_reductions.state.value);
+            let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
+            extras.extend_from_slice(&spine_extras);
+            extras.extend_from_slice(&auth_tr);
 
-        let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
+            let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
 
-        let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
-            airs[k],
-            pi,
-            alg,
-            &extras,
-            &slice_claims,
-            &mut block_channel,
-        )
-        .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
+            // Q.3: per-tx channel mirrors the prover's channel.
+            let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k as u32);
 
-        tx_r_pp.push(r_pp_k);
-        tx_final_claims.push(final_claim_k);
+            let (r_pp_k, final_claim_k, lambdas_k) =
+                verify_air_interleaved_algebraic(airs[k], pi, alg, &extras, &slice_claims, &mut ch)
+                    .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
+
+            Ok(TxVerifyResult {
+                r_pp: r_pp_k,
+                final_claim: final_claim_k,
+                lambdas: lambdas_k,
+            })
+        })
+        .collect();
+
+    let mut tx_r_pp: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
+    let mut tx_final_claims: Vec<Block128> = Vec::with_capacity(n_tx);
+    let mut tx_lambdas: Vec<Vec<Block128>> = Vec::with_capacity(n_tx);
+    for result in tx_verify_results {
+        let r = result?;
+        tx_r_pp.push(r.r_pp);
+        tx_final_claims.push(r.final_claim);
+        tx_lambdas.push(r.lambdas);
     }
 
     // -------------------------------------------------------------------------
-    // Stage 2b: State binding algebraic STARK replay on the shared channel.
+    // Stage 2b: State binding algebraic STARK (Q.4 dedicated channel).
     // -------------------------------------------------------------------------
     let mut sb_r_pp: Vec<Block128> = Vec::new();
 
@@ -888,23 +998,42 @@ pub fn verify_block(
             is_activation: [false; 8],
             is_deactivation: [false; 4],
         };
-
-        let (r_pp_sb, _final_claim_sb) = verify_air_interleaved_algebraic(
-            sb_air,
-            &empty_pi,
-            sb_alg,
-            &[],
-            &[],
-            &mut block_channel,
-        )
-        .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx, e))?;
-
+        // Q.4: mirror the prover's state_binding_channel.
+        let mut sb_ch = state_binding_channel(&meta.prev_block_state_root, cap, n_tx as u32);
+        let (r_pp_sb, _final_claim_sb, _lambdas_sb) =
+            verify_air_interleaved_algebraic(sb_air, &empty_pi, sb_alg, &[], &[], &mut sb_ch)
+                .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx, e))?;
         sb_r_pp = r_pp_sb;
     }
 
     // -------------------------------------------------------------------------
+    // Q.4a: Reconstruct Merkle root of per-tx transcript digests.
+    // The block channel absorbs this root instead of N sequential transcripts.
+    // -------------------------------------------------------------------------
+    let tx_digests: Vec<[u8; 32]> = (0..n_tx)
+        .into_par_iter()
+        .map(|k| {
+            compute_tx_transcript_digest(
+                k as u32,
+                &tx_r_pp[k],
+                &proof.tx_algebraic[k].base_openings,
+                &tx_lambdas[k],
+                tx_final_claims[k],
+            )
+        })
+        .collect();
+    let transcript_root = merkle_reduce(&tx_digests);
+
+    // Q.4: Block multipoint channel — mirrors the prover's block_multipoint_channel.
+    let mut block_channel = block_multipoint_channel(&meta.prev_block_state_root, cap);
+    let [tr0, tr1] = hash_to_fields(&transcript_root);
+    block_channel.observe_field_elem(tr0);
+    block_channel.observe_field_elem(tr1);
+
+    // -------------------------------------------------------------------------
     // Stage 3: Block-level multipoint sumcheck.
     // -------------------------------------------------------------------------
+
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
     block_channel.observe_field_elems(&proof.block_col_openings);
     let mu = block_channel.get_random_point();
