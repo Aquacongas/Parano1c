@@ -463,26 +463,45 @@ pub trait Constraint: Send + Sync {
     /// what enables the STARK zero-check to swap bases without
     /// changing transcript bytes or the accept/reject set.
     ///
-    /// Default-implementation: O(arity) basis conversions per
-    /// `evaluate_flat` call — same cost as a no-op switch. Hot AIRs
-    /// are expected to override once the STARK layer starts calling
-    /// this path (landing in [2.C.2+]).
+    /// Default-implementation uses **thread-local scratch buffers** to
+    /// eliminate the two `Vec<Block128>` allocations that the naive
+    /// version would do per call. The zero-check sumcheck invokes this
+    /// for 158 constraints × 4096 positions × 39 rounds per tx —
+    /// thread-local reuse cuts ~200 M allocations/tx to zero.
+    /// Rayon workers execute constraint closures sequentially (one at a
+    /// time per thread), so the RefCell borrow never conflicts.
     fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
-        let local_tower: Vec<Block128> = frame
-            .local
-            .iter()
-            .map(|&v| Block128::from(flat_to_tower_u128(v)))
-            .collect();
-        let next_tower: Vec<Block128> = frame
-            .next
-            .iter()
-            .map(|&v| Block128::from(flat_to_tower_u128(v)))
-            .collect();
-        let out = self.evaluate(EvalFrame {
-            local: &local_tower,
-            next: &next_tower,
-        });
-        tower_to_flat_u128(out.0)
+        thread_local! {
+            static LOCAL_TMP: std::cell::RefCell<Vec<Block128>> =
+                std::cell::RefCell::new(Vec::new());
+            static NEXT_TMP: std::cell::RefCell<Vec<Block128>> =
+                std::cell::RefCell::new(Vec::new());
+        }
+        LOCAL_TMP.with(|local_ref| {
+            NEXT_TMP.with(|next_ref| {
+                let mut local_tmp = local_ref.borrow_mut();
+                let mut next_tmp = next_ref.borrow_mut();
+                local_tmp.clear();
+                local_tmp.extend(
+                    frame
+                        .local
+                        .iter()
+                        .map(|&v| Block128::from(flat_to_tower_u128(v))),
+                );
+                next_tmp.clear();
+                next_tmp.extend(
+                    frame
+                        .next
+                        .iter()
+                        .map(|&v| Block128::from(flat_to_tower_u128(v))),
+                );
+                let out = self.evaluate(EvalFrame {
+                    local: &local_tmp,
+                    next: &next_tmp,
+                });
+                tower_to_flat_u128(out.0)
+            })
+        })
     }
 }
 

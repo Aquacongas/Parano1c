@@ -426,6 +426,7 @@ pub fn prove_block(
 
     // -------------------------------------------------------------------------
     // Stage 5: Q.2c — Parallel per-tx algebraic STARK proofs.
+
     //
     // Each tx uses an independent Fiat-Shamir channel seeded from:
     //   DOMAIN_TAG_TX_ALGEBRAIC || PROTOCOL_VERSION || state_root || cap || tx_index
@@ -585,19 +586,22 @@ pub fn prove_block(
         .into_par_iter()
         .map(|k| {
             let r_pp_k = &tx_r_pp[k];
-            let air_refs =
-                shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
+            let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
             let mut cols_k = Vec::with_capacity(n_per_tx);
             OPEN_SCRATCH.with(|s| {
                 let mut scratch = s.borrow_mut();
                 for col in &air_refs {
                     cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                        col, r_pp_k, &mut scratch,
+                        col,
+                        r_pp_k,
+                        &mut scratch,
                     ));
                 }
                 for auth_s in &preps[k].auth_slices {
                     cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                        auth_s, r_pp_k, &mut scratch,
+                        auth_s,
+                        r_pp_k,
+                        &mut scratch,
                     ));
                 }
             });
@@ -614,13 +618,17 @@ pub fn prove_block(
         let mut scratch = s.borrow_mut();
         for sp in &spine_padded_slices {
             block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                sp, &spine_r_low, &mut scratch,
+                sp,
+                &spine_r_low,
+                &mut scratch,
             ));
         }
         if state_binding.is_some() {
             for i in 0..sb_n_cols {
                 block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                    &sb_padded_columns[i], &sb_r_pp, &mut scratch,
+                    &sb_padded_columns[i],
+                    &sb_r_pp,
+                    &mut scratch,
                 ));
             }
         }

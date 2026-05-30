@@ -190,30 +190,46 @@ fn build_mu_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
 }
 
 fn build_sigma_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot in 0..live_slots {
-        for round in 0..N_ROUNDS {
-            for elem in 0..STATE_SIZE {
-                tab[pack_index_dyn(slot, round, elem)] = sigma_at(round, elem);
+    use rayon::prelude::*;
+    // Collect per-slot (index, value) pairs in parallel.
+    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
+            for round in 0..N_ROUNDS {
+                for elem in 0..STATE_SIZE {
+                    local.push((pack_index_dyn(slot, round, elem), sigma_at(round, elem)));
+                }
             }
-        }
+            local
+        })
+        .collect();
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot_p in slot_pairs {
+        for (idx, val) in slot_p { tab[idx] = val; }
     }
     tab
 }
 
 fn build_rc_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot in 0..live_slots {
-        for round in 0..N_ROUNDS {
-            let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
-            for elem in 0..STATE_SIZE {
-                if is_partial && elem != 0 {
-                    continue;
+    use rayon::prelude::*;
+    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
+            for round in 0..N_ROUNDS {
+                let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
+                for elem in 0..STATE_SIZE {
+                    if is_partial && elem != 0 { continue; }
+                    local.push((pack_index_dyn(slot, round, elem), Block128::from(ROUND_CONSTANTS[elem][round])));
                 }
-                tab[pack_index_dyn(slot, round, elem)] =
-                    Block128::from(ROUND_CONSTANTS[elem][round]);
             }
-        }
+            local
+        })
+        .collect();
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot_p in slot_pairs {
+        for (idx, val) in slot_p { tab[idx] = val; }
     }
     tab
 }
@@ -229,51 +245,57 @@ fn mds_coeff_dyn(round: usize, i: usize, j: usize) -> Block128 {
 }
 
 fn build_mds_lane_table_dyn(lane: usize, live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    let mut out = vec![Block128::ZERO; n_cells];
-    for y in 0..n_cells {
-        let slot = slot_of_dyn(y);
-        if slot >= live_slots {
-            continue;
-        }
-        let dec_round = round_of_dyn(dec_round_dyn(y));
-        if dec_round >= N_ROUNDS {
-            continue;
-        }
-        let elem = elem_of_dyn(y);
-        out[y] = mds_coeff_dyn(dec_round, elem, lane);
-    }
-    out
+    use rayon::prelude::*;
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| {
+            let slot = slot_of_dyn(y);
+            if slot >= live_slots {
+                return Block128::ZERO;
+            }
+            let dec_round = round_of_dyn(dec_round_dyn(y));
+            if dec_round >= N_ROUNDS {
+                return Block128::ZERO;
+            }
+            let elem = elem_of_dyn(y);
+            mds_coeff_dyn(dec_round, elem, lane)
+        })
+        .collect()
 }
 
 fn permute_by_dec_dyn(src: &[Block128]) -> Vec<Block128> {
+    use rayon::prelude::*;
     let n = src.len();
-    let mut out = vec![Block128::ZERO; n];
-    for y in 0..n {
-        out[y] = src[dec_round_dyn(y)];
-    }
-    out
+    (0..n)
+        .into_par_iter()
+        .map(|y| src[dec_round_dyn(y)])
+        .collect()
 }
 
 fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
+    use rayon::prelude::*;
     let n = src.len();
     let elem_mask = (1 << ELEM_BITS) - 1;
-    let mut out = vec![Block128::ZERO; n];
-    for y in 0..n {
-        let row_base = y & !elem_mask;
-        out[y] = src[row_base | lane];
-    }
-    out
+    (0..n)
+        .into_par_iter()
+        .map(|y| {
+            let row_base = y & !elem_mask;
+            src[row_base | lane]
+        })
+        .collect()
 }
 
 fn build_u_table_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    use rayon::prelude::*;
     let eq_tab = eq_ind_partial_eval::<Block128>(rho);
     let mu_tab = build_mu_table_dyn(live_slots, n_cells);
-    let mut out = vec![Block128::ZERO; n_cells];
-    for y in 0..n_cells {
-        let x = dec_round_dyn(y);
-        out[y] = eq_tab[x] * mu_tab[x];
-    }
-    out
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| {
+            let x = dec_round_dyn(y);
+            eq_tab[x] * mu_tab[x]
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -363,12 +385,21 @@ fn build_block_unified_flat_tables(
     }
 }
 
-#[inline(always)]
+#[inline]
 fn fold_flat_inplace(evals: &mut Vec<u128>, r_flat: u128) {
     let half = evals.len() / 2;
-    for j in 0..half {
-        let delta = evals[j] ^ evals[j + half];
-        evals[j] ^= clmul_gcm(r_flat, delta);
+    // Parallelize fold for large tables (dominant in later rounds for big blocks).
+    if half >= 1024 {
+        use rayon::prelude::*;
+        let (lo, hi) = evals.split_at_mut(half);
+        lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, &h)| {
+            *l ^= clmul_gcm(r_flat, *l ^ h);
+        });
+    } else {
+        for j in 0..half {
+            let delta = evals[j] ^ evals[j + half];
+            evals[j] ^= clmul_gcm(r_flat, delta);
+        }
     }
     evals.truncate(half);
 }
@@ -470,100 +501,202 @@ fn pow7_poly_t(a: u128, b: u128) -> [u128; 8] {
 }
 
 /// Flat-basis monomial-form round polynomial for the block spine.
+///
+/// Parallelized over the `half` positions via rayon for large tables
+/// (dominant cost when num_vars is high for many-tx blocks).
 fn compute_block_round_polynomial_flat(
     tabs: &BlockUnifiedFlatTables,
     beta_flat: u128,
     gamma_flat: u128,
 ) -> RoundPolynomial<Block128> {
+    use rayon::prelude::*;
     let half = tabs.u.len() / 2;
-    let mut acc = [0u128; BLOCK_SPINE_ROUND_DEGREE + 1];
     const ONE_FLAT: u128 = 1u128;
 
-    for i in 0..half {
-        let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-        let sg_p: [u128; 2] = [
-            tabs.sigma_dec[i],
-            tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
-        ];
-        let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
-        let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-        let so_p: [u128; 2] = [
-            tabs.s_out_dec[i],
-            tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
-        ];
-        let st_p: [u128; 2] = [
-            tabs.state_dec[i],
-            tabs.state_dec[i] ^ tabs.state_dec[i + half],
-        ];
-        let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+    // Parallel reduce: each position i contributes independently to acc via XOR.
+    let acc: [u128; BLOCK_SPINE_ROUND_DEGREE + 1] = if half >= 256 {
+        (0..half)
+            .into_par_iter()
+            .fold(
+                || [0u128; BLOCK_SPINE_ROUND_DEGREE + 1],
+                |mut local_acc, i| {
+                    let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
+                    let sg_p: [u128; 2] = [
+                        tabs.sigma_dec[i],
+                        tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
+                    ];
+                    let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
+                    let si_p: [u128; 2] =
+                        [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
+                    let so_p: [u128; 2] = [
+                        tabs.s_out_dec[i],
+                        tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
+                    ];
+                    let st_p: [u128; 2] = [
+                        tabs.state_dec[i],
+                        tabs.state_dec[i] ^ tabs.state_dec[i + half],
+                    ];
+                    let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
 
-        // Q1(t) = sg(t) * si(t)^7 + so(t) + si(t) + sg(t) * si(t)
-        let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
-        let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
-        let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
-        let mut q1_p = [0u128; 9];
-        q1_p.copy_from_slice(&sg_si7_p);
-        q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
-        q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
-        q1_p[2] ^= sg_si_p[2];
+                    // Q1(t) = sg(t) * si(t)^7 + so(t) + si(t) + sg(t) * si(t)
+                    let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
+                    let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
+                    let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
+                    let mut q1_p = [0u128; 9];
+                    q1_p.copy_from_slice(&sg_si7_p);
+                    q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
+                    q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
+                    q1_p[2] ^= sg_si_p[2];
 
-        // Q1'(t) = sg(t) * (si(t) + st_dec(t) + rc(t))
-        let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
-        let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
+                    // Q1'(t) = sg(t) * (si(t) + st_dec(t) + rc(t))
+                    let inner_p: [u128; 2] =
+                        [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
+                    let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
 
-        // Q2(t) = st_main(t) + sum_j m_j(t) * pi_j(t)
-        let mut q2_p = [0u128; 4];
-        q2_p[0] ^= stmain_p[0];
-        q2_p[1] ^= stmain_p[1];
-        for j in 0..STATE_SIZE {
-            let m_p: [u128; 2] = [
-                tabs.mds_lane_dec[j][i],
-                tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+                    // Q2(t) = st_main(t) + sum_j m_j(t) * pi_j(t)
+                    let mut q2_p = [0u128; 4];
+                    q2_p[0] ^= stmain_p[0];
+                    q2_p[1] ^= stmain_p[1];
+                    for j in 0..STATE_SIZE {
+                        let m_p: [u128; 2] = [
+                            tabs.mds_lane_dec[j][i],
+                            tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+                        ];
+                        let sgl_p: [u128; 2] = [
+                            tabs.sigma_lane_dec[j][i],
+                            tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+                        ];
+                        let sol_p: [u128; 2] = [
+                            tabs.s_out_lane_dec[j][i],
+                            tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+                        ];
+                        let stl_p: [u128; 2] = [
+                            tabs.state_lane_dec[j][i],
+                            tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
+                        ];
+                        let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
+                        let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
+                        let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
+                        let pi_p: [u128; 3] = [
+                            sgl_sol_p[0] ^ onep_stl_p[0],
+                            sgl_sol_p[1] ^ onep_stl_p[1],
+                            sgl_sol_p[2] ^ onep_stl_p[2],
+                        ];
+                        let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+                        for k in 0..4 {
+                            q2_p[k] ^= m_pi_p[k];
+                        }
+                    }
+
+                    // q(t) = Q1(t) + beta * Q1'(t) + gamma * Q2(t)
+                    let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
+                    let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
+                    let mut q_p = [0u128; 9];
+                    q_p.copy_from_slice(&q1_p);
+                    for k in 0..3 {
+                        q_p[k] ^= beta_q1p_p[k];
+                    }
+                    for k in 0..4 {
+                        q_p[k] ^= gamma_q2_p[k];
+                    }
+
+                    // F_i(t) = u(t) * q(t) -> deg-9
+                    let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
+                    for k in 0..=BLOCK_SPINE_ROUND_DEGREE {
+                        local_acc[k] ^= f_p[k];
+                    }
+                    local_acc
+                },
+            )
+            .reduce(
+                || [0u128; BLOCK_SPINE_ROUND_DEGREE + 1],
+                |mut a, b| {
+                    for k in 0..=BLOCK_SPINE_ROUND_DEGREE {
+                        a[k] ^= b[k];
+                    }
+                    a
+                },
+            )
+    } else {
+        // Small table: serial loop (no rayon overhead for tiny blocks).
+        let mut acc = [0u128; BLOCK_SPINE_ROUND_DEGREE + 1];
+        for i in 0..half {
+            let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
+            let sg_p: [u128; 2] = [
+                tabs.sigma_dec[i],
+                tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
             ];
-            let sgl_p: [u128; 2] = [
-                tabs.sigma_lane_dec[j][i],
-                tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+            let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
+            let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
+            let so_p: [u128; 2] = [
+                tabs.s_out_dec[i],
+                tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
             ];
-            let sol_p: [u128; 2] = [
-                tabs.s_out_lane_dec[j][i],
-                tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+            let st_p: [u128; 2] = [
+                tabs.state_dec[i],
+                tabs.state_dec[i] ^ tabs.state_dec[i + half],
             ];
-            let stl_p: [u128; 2] = [
-                tabs.state_lane_dec[j][i],
-                tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
-            ];
-            let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
-            let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
-            let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
-            let pi_p: [u128; 3] = [
-                sgl_sol_p[0] ^ onep_stl_p[0],
-                sgl_sol_p[1] ^ onep_stl_p[1],
-                sgl_sol_p[2] ^ onep_stl_p[2],
-            ];
-            let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+            let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+            let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
+            let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
+            let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
+            let mut q1_p = [0u128; 9];
+            q1_p.copy_from_slice(&sg_si7_p);
+            q1_p[0] ^= so_p[0] ^ si_p[0] ^ sg_si_p[0];
+            q1_p[1] ^= so_p[1] ^ si_p[1] ^ sg_si_p[1];
+            q1_p[2] ^= sg_si_p[2];
+            let inner_p: [u128; 2] = [si_p[0] ^ st_p[0] ^ rc_p[0], si_p[1] ^ st_p[1] ^ rc_p[1]];
+            let q1p_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &inner_p);
+            let mut q2_p = [0u128; 4];
+            q2_p[0] ^= stmain_p[0];
+            q2_p[1] ^= stmain_p[1];
+            for j in 0..STATE_SIZE {
+                let m_p: [u128; 2] = [
+                    tabs.mds_lane_dec[j][i],
+                    tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
+                ];
+                let sgl_p: [u128; 2] = [
+                    tabs.sigma_lane_dec[j][i],
+                    tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
+                ];
+                let sol_p: [u128; 2] = [
+                    tabs.s_out_lane_dec[j][i],
+                    tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
+                ];
+                let stl_p: [u128; 2] = [
+                    tabs.state_lane_dec[j][i],
+                    tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
+                ];
+                let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
+                let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
+                let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
+                let pi_p: [u128; 3] = [
+                    sgl_sol_p[0] ^ onep_stl_p[0],
+                    sgl_sol_p[1] ^ onep_stl_p[1],
+                    sgl_sol_p[2] ^ onep_stl_p[2],
+                ];
+                let m_pi_p: [u128; 4] = poly_mul_t::<2, 3, 4>(&m_p, &pi_p);
+                for k in 0..4 {
+                    q2_p[k] ^= m_pi_p[k];
+                }
+            }
+            let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
+            let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
+            let mut q_p = [0u128; 9];
+            q_p.copy_from_slice(&q1_p);
+            for k in 0..3 {
+                q_p[k] ^= beta_q1p_p[k];
+            }
             for k in 0..4 {
-                q2_p[k] ^= m_pi_p[k];
+                q_p[k] ^= gamma_q2_p[k];
+            }
+            let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
+            for k in 0..=BLOCK_SPINE_ROUND_DEGREE {
+                acc[k] ^= f_p[k];
             }
         }
-
-        // q(t) = Q1(t) + beta * Q1'(t) + gamma * Q2(t)
-        let beta_q1p_p: [u128; 3] = poly_scalar_mul_t::<3>(&q1p_p, beta_flat);
-        let gamma_q2_p: [u128; 4] = poly_scalar_mul_t::<4>(&q2_p, gamma_flat);
-        let mut q_p = [0u128; 9];
-        q_p.copy_from_slice(&q1_p);
-        for k in 0..3 {
-            q_p[k] ^= beta_q1p_p[k];
-        }
-        for k in 0..4 {
-            q_p[k] ^= gamma_q2_p[k];
-        }
-
-        // F_i(t) = u(t) * q(t) -> deg-9
-        let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
-        for k in 0..=BLOCK_SPINE_ROUND_DEGREE {
-            acc[k] ^= f_p[k];
-        }
-    }
+        acc
+    };
 
     let coeffs_tower: Vec<Block128> = acc
         .iter()
