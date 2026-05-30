@@ -540,18 +540,19 @@ pub fn prove_zero_check(
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
 
     for _ in 0..n {
-        let evals: Vec<Block128> = {
-            use rayon::prelude::*;
-            (0..n_points)
-                .into_par_iter()
-                .map(|s_idx| {
-                    let s_flat = s_flat_table[s_idx];
-                    let acc_flat =
-                        accumulate_sum_flat_fused(&cur_eq, &cur_cols, &compiled, s_idx, s_flat);
-                    Block128::from(flat_to_tower_u128(acc_flat))
-                })
-                .collect()
-        };
+        // accumulate_sum_flat_fused already parallelises over `half` positions
+        // (up to 2^(log_len-1) tasks) via rayon, fully saturating available
+        // cores.  Running the outer n_points iterations (degree+1, typically
+        // 2-5) serially eliminates nested-pool overhead and synchronisation
+        // barriers while preserving full inner parallelism.
+        let evals: Vec<Block128> = (0..n_points)
+            .map(|s_idx| {
+                let s_flat = s_flat_table[s_idx];
+                let acc_flat =
+                    accumulate_sum_flat_fused(&cur_eq, &cur_cols, &compiled, s_idx, s_flat);
+                Block128::from(flat_to_tower_u128(acc_flat))
+            })
+            .collect();
 
         channel.observe_field_elems(&evals);
         let r = channel.get_random_point();
@@ -2544,11 +2545,10 @@ pub(crate) fn check_public_columns<A: Air + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_air::{
-        Air, BoolGate, CompositeAir, Constraint, LinearCombinationAir, Trace,
-        WeightedLinearGate,
-    };
     use noid_air::composition::tx_logic::{witness_from_body, TxLogicAir};
+    use noid_air::{
+        Air, BoolGate, CompositeAir, Constraint, LinearCombinationAir, Trace, WeightedLinearGate,
+    };
     use noid_poseidon2b::primitives::TxBodyHash;
     use noid_tx::{TxInput, TxOutput};
 

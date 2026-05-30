@@ -19,10 +19,9 @@
 pub mod channel;
 pub mod full_node;
 
-use noid_core::mle::{
-    eq::eq_ind_partial_eval,
-    split::split_mle_into_slices,
-};
+use noid_air::airs::block_state_binding::BlockStateBindingAir;
+use noid_air::{Air, FixedColumns};
+use noid_core::mle::{eq::eq_ind_partial_eval, split::split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::Blake3Hasher;
@@ -32,20 +31,17 @@ use noid_fri_binius::{
     InterleavedCommitment, MixedOpeningProof, COMPACT_NUM_QUERIES,
 };
 use noid_gkr::{
-    auth_gkr_channel, prove_block_spine_killshot, verify_block_spine_killshot,
-    reconstruct_slot_states, verify_auth_killshot, AuthCircuit,
-    AuthProofKillShot, AuthPublicInputs, BlockSpineProof,
+    auth_gkr_channel, prove_block_spine_killshot, reconstruct_slot_states, verify_auth_killshot,
+    verify_block_spine_killshot, AuthCircuit, AuthProofKillShot, AuthPublicInputs, BlockSpineProof,
     SpineCircuit, SpineInputs,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::interleaved::{
     prove_air_interleaved_algebraic, verify_air_interleaved_algebraic, AlgebraicStarkProof,
 };
 use noid_stark::{SliceClaim, VerifyError};
-use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::PublicInputs;
-use noid_air::airs::block_state_binding::BlockStateBindingAir;
-use noid_air::Air;
 use rayon::prelude::*;
 
 const BASE_LOG: usize = 13;
@@ -108,7 +104,11 @@ impl BlockProof {
         let spine = self.block_spine_proof.byte_len();
         let auth: usize = self.tx_auth_proofs.iter().map(|a| a.byte_len()).sum();
         let col_open = self.block_col_openings.len() * 16;
-        let mp: usize = self.block_multipoint_rounds.iter().map(|r| r.len() * 16).sum();
+        let mp: usize = self
+            .block_multipoint_rounds
+            .iter()
+            .map(|r| r.len() * 16)
+            .sum();
         let mixed = self.mixed_opening.byte_len();
         cap + alg + spine + auth + col_open + mp + mixed
     }
@@ -239,8 +239,16 @@ pub fn prove_block(
     // Per-tx: AIR columns (padded) + 2 auth slices.
     // Block-level: unified spine state MLE split into slices.
 
+    // Build fixed columns once from the first witness AIR (all txs share the
+    // same AIR shape).  Fixed columns (selectors / masks) are padded once and
+    // reused across all N transactions via zero-copy refs, avoiding N-1 extra
+    // copies of ~65 MB of selector data per block.
+    let shared_fixed = FixedColumns::from_air(witnesses[0].air, witnesses[0].trace, log_len);
+
     struct TxPrep {
-        columns: Vec<Vec<Block128>>,
+        /// Non-fixed AIR witness columns in ascending original column-index order.
+        witness_cols: Vec<Vec<Block128>>,
+        /// Per-tx auth slices (2 slices of length 2^BASE_LOG).
         auth_slices: Vec<Vec<Block128>>,
     }
 
@@ -254,16 +262,19 @@ pub fn prove_block(
             all_slot_state_ins.push(*s_in);
         }
 
-        let mut columns: Vec<Vec<Block128>> = Vec::with_capacity(n_per_tx);
-        for col in &w.trace.columns {
-            columns.push(noid_stark::pad_column(col, log_len));
-        }
-        for s in w.auth_slices {
-            columns.push(s.clone());
-        }
+        // Only pad witness (non-fixed) columns; fixed columns are shared via
+        // `shared_fixed` and reused for every transaction zero-copy.
+        let witness_cols: Vec<Vec<Block128>> = w
+            .trace
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !shared_fixed.is_fixed(*i))
+            .map(|(_, col)| noid_stark::pad_column(col, log_len))
+            .collect();
 
         preps.push(TxPrep {
-            columns,
+            witness_cols,
             auth_slices: w.auth_slices.to_vec(),
         });
     }
@@ -271,11 +282,8 @@ pub fn prove_block(
     // Build unified block spine MLE and split state column into FRI slices.
     let block_spine_mle = noid_gkr::BlockSpineMle::build(n_tx, &all_slot_state_ins);
     let block_spine_num_vars = block_spine_mle.num_vars;
-    let block_spine_slices = split_mle_into_slices(
-        &block_spine_mle.state,
-        block_spine_num_vars,
-        BASE_LOG,
-    );
+    let block_spine_slices =
+        split_mle_into_slices(&block_spine_mle.state, block_spine_num_vars, BASE_LOG);
     let n_block_spine_slices = block_spine_slices.len();
 
     // -------------------------------------------------------------------------
@@ -300,10 +308,17 @@ pub fn prove_block(
         .map(|s| noid_stark::pad_column(s, log_len))
         .collect();
 
-    let mut flat_refs: Vec<&[Block128]> = preps
-        .iter()
-        .flat_map(|p| p.columns.iter().map(|c| c.as_slice()))
-        .collect();
+    // Build the flat column-ref list for the interleaved commitment.
+    // For each tx: fixed columns (zero-copy from shared_fixed) then witness then auth slices.
+    let mut flat_refs: Vec<&[Block128]> =
+        Vec::with_capacity(n_tx * n_per_tx + n_block_spine_slices + sb_n_cols);
+    for p in &preps {
+        let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &p.witness_cols);
+        flat_refs.extend_from_slice(&air_refs);
+        for s in &p.auth_slices {
+            flat_refs.push(s.as_slice());
+        }
+    }
     for s in &spine_padded_slices {
         flat_refs.push(s.as_slice());
     }
@@ -325,14 +340,9 @@ pub fn prove_block(
         .iter()
         .map(|w| w.pi.tx_body_hash.as_fields())
         .collect();
-    let auth_public_refs: Vec<&AuthPublicInputs> = witnesses
-        .iter()
-        .map(|w| w.auth_public)
-        .collect();
-    let auth_proof_refs: Vec<&AuthProofKillShot> = witnesses
-        .iter()
-        .map(|w| w.auth_proof)
-        .collect();
+    let auth_public_refs: Vec<&AuthPublicInputs> =
+        witnesses.iter().map(|w| w.auth_public).collect();
+    let auth_proof_refs: Vec<&AuthProofKillShot> = witnesses.iter().map(|w| w.auth_proof).collect();
 
     // (a) Unified block spine.
     let mut spine_channel = Poseidon2bChannel::new();
@@ -417,15 +427,18 @@ pub fn prove_block(
     for (k, w) in witnesses.iter().enumerate() {
         let prep = &preps[k];
         let auth_res = &auth_results[k];
-        let slice_claims = build_auth_slice_claims(
-            n_air_cols,
-            &auth_res.auth_r_low,
-            &auth_res.auth_slice_vals,
-        );
+        let slice_claims =
+            build_auth_slice_claims(n_air_cols, &auth_res.auth_r_low, &auth_res.auth_slice_vals);
 
+        // Build full ordered column refs (fixed zero-copy + witness).
+        let mut all_col_refs: Vec<&[Block128]> =
+            shared_fixed.build_full_col_refs(n_air_cols, &prep.witness_cols);
+        for s in &prep.auth_slices {
+            all_col_refs.push(s.as_slice());
+        }
         let (alg, r_pp_k, claim_k, lambdas_k) = prove_air_interleaved_algebraic(
             w.air,
-            &prep.columns,
+            &all_col_refs,
             w.pi,
             &auth_res.extras_transcript,
             &slice_claims,
@@ -458,12 +471,14 @@ pub fn prove_block(
             is_activation: [false; 8],
             is_deactivation: [false; 4],
         };
+        let sb_col_refs: Vec<&[Block128]> =
+            sb_padded_columns.iter().map(|c| c.as_slice()).collect();
         let (alg, r_pp_sb, _claim_sb, _lambdas_sb) = prove_air_interleaved_algebraic(
             sb.air,
-            &sb_padded_columns,
+            &sb_col_refs,
             &empty_pi,
-            &[],        // no extras transcript for state binding
-            &[],        // no slice claims (Kill-Shots handle Merkle paths)
+            &[], // no extras transcript for state binding
+            &[], // no slice claims (Kill-Shots handle Merkle paths)
             log_len,
             &mut block_channel,
         );
@@ -491,8 +506,13 @@ pub fn prove_block(
     let mut block_col_openings: Vec<Block128> = Vec::with_capacity(total_cols);
     for k in 0..n_tx {
         let r_pp_k = &tx_r_pp[k];
-        for i in 0..n_per_tx {
-            block_col_openings.push(noid_stark::mle_eval(&preps[k].columns[i], r_pp_k));
+        // Reconstruct full ordered column refs for MLE evaluation.
+        let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
+        for col in &air_refs {
+            block_col_openings.push(noid_stark::mle_eval(col, r_pp_k));
+        }
+        for s in &preps[k].auth_slices {
+            block_col_openings.push(noid_stark::mle_eval(s, r_pp_k));
         }
     }
     // Block spine slice openings at spine_r_low.
@@ -584,11 +604,16 @@ pub fn prove_block(
         .into_par_iter()
         .map(|k| {
             if k < n_tx {
+                // Reconstruct full ordered column refs; fixed cols are zero-copy.
+                let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
                 (0..hyper_len)
                     .map(|j| {
                         let mut acc = Block128::ZERO;
-                        for i in 0..n_per_tx {
-                            acc += beta_powers[i] * preps[k].columns[i][j];
+                        for i in 0..n_air_cols {
+                            acc += beta_powers[i] * air_refs[i][j];
+                        }
+                        for (offset, s) in preps[k].auth_slices.iter().enumerate() {
+                            acc += beta_powers[n_air_cols + offset] * s[j];
                         }
                         acc
                     })
@@ -750,13 +775,8 @@ pub fn verify_block(
     let block_spine_reductions = {
         let mut ch = Poseidon2bChannel::new();
         absorb_cap_into_p2b(&mut ch, cap);
-        verify_block_spine_killshot(
-            &proof.block_spine_proof,
-            n_tx,
-            &tx_body_hashes,
-            &mut ch,
-        )
-        .ok_or(VerifyBlockError::BlockSpineKillShot)?
+        verify_block_spine_killshot(&proof.block_spine_proof, n_tx, &tx_body_hashes, &mut ch)
+            .ok_or(VerifyBlockError::BlockSpineKillShot)?
     };
 
     // Block spine slice reconstruction.
@@ -834,9 +854,15 @@ pub fn verify_block(
 
         let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
 
-        let (r_pp_k, final_claim_k) =
-            verify_air_interleaved_algebraic(airs[k], pi, alg, &extras, &slice_claims, &mut block_channel)
-                .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
+        let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
+            airs[k],
+            pi,
+            alg,
+            &extras,
+            &slice_claims,
+            &mut block_channel,
+        )
+        .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
 
         tx_r_pp.push(r_pp_k);
         tx_final_claims.push(final_claim_k);

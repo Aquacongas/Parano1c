@@ -74,10 +74,52 @@ pub struct AlgebraicStarkProof {
 impl AlgebraicStarkProof {
     pub fn byte_len(&self) -> usize {
         self.base_openings.len() * 16
-            + self.zero_check_rounds.iter().map(|r| r.len() * 16).sum::<usize>()
-            + self.shift_partials.iter().map(|p| p.len() * 16).sum::<usize>()
-            + self.multipoint_rounds.iter().map(|r| r.len() * 16).sum::<usize>()
+            + self
+                .zero_check_rounds
+                .iter()
+                .map(|r| r.len() * 16)
+                .sum::<usize>()
+            + self
+                .shift_partials
+                .iter()
+                .map(|p| p.len() * 16)
+                .sum::<usize>()
+            + self
+                .multipoint_rounds
+                .iter()
+                .map(|r| r.len() * 16)
+                .sum::<usize>()
             + self.slice_claimed_values.len() * 16
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Algebraic verifier borrow-view (eliminates clone in verify_air_interleaved)
+// ---------------------------------------------------------------------------
+
+/// Zero-copy view of an [`AlgebraicStarkProof`] for [`verify_algebraic_inner`].
+/// Created via `proof.into()` — no heap allocation; all fields borrow from the
+/// original proof.  This avoids the ~4 KB clone that the wrapper previously
+/// performed just to satisfy `verify_algebraic_inner`'s type signature.
+struct AlgebraicStarkProofRef<'a> {
+    log_rows: usize,
+    base_openings: &'a [Block128],
+    zero_check_rounds: &'a [RoundPoly],
+    shift_partials: &'a [Vec<Block128>],
+    multipoint_rounds: &'a [RoundPoly],
+    slice_claimed_values: &'a [Block128],
+}
+
+impl<'a> From<&'a AlgebraicStarkProof> for AlgebraicStarkProofRef<'a> {
+    fn from(p: &'a AlgebraicStarkProof) -> Self {
+        Self {
+            log_rows: p.log_rows,
+            base_openings: &p.base_openings,
+            zero_check_rounds: &p.zero_check_rounds,
+            shift_partials: &p.shift_partials,
+            multipoint_rounds: &p.multipoint_rounds,
+            slice_claimed_values: &p.slice_claimed_values,
+        }
     }
 }
 
@@ -112,7 +154,7 @@ struct AlgebraicVerifyOut {
 #[allow(clippy::too_many_arguments)]
 pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     air: &A,
-    padded_columns: &[Vec<Block128>],
+    padded_columns: &[&[Block128]],
     pi: &PublicInputs,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
@@ -145,13 +187,12 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     }
     let rotated_columns: Vec<Vec<Block128>> = shifted_indices
         .iter()
-        .map(|&col_id| crate::vshift::cyclic_rotate_left(&padded_columns[col_id]))
+        .map(|&col_id| crate::vshift::cyclic_rotate_left(padded_columns[col_id]))
         .collect();
     let mut sumcheck_cols: Vec<&[Block128]> =
         Vec::with_capacity(n_air_cols + rotated_columns.len());
-    for col in &padded_columns[..n_air_cols] {
-        sumcheck_cols.push(col.as_slice());
-    }
+    // Zero-copy: extend with refs already in padded_columns.
+    sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
     for col in &rotated_columns {
         sumcheck_cols.push(col.as_slice());
     }
@@ -169,9 +210,10 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
-    // Base openings.
+    // Base openings. `.copied()` converts `&&[Block128]` to `&[Block128]`.
     let base_openings: Vec<Block128> = padded_columns[..n_air_cols]
         .par_iter()
+        .copied()
         .map(|col| mle_eval(col, &r_point))
         .collect();
     channel.observe_field_elems(&base_openings);
@@ -179,7 +221,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     // VSHIFT ladder partials.
     let partials_per_slot: Vec<Vec<Block128>> = shifted_indices
         .par_iter()
-        .map(|&col_id| crate::vshift::ladder_partials(&padded_columns[col_id], &r_point))
+        .map(|&col_id| crate::vshift::ladder_partials(padded_columns[col_id], &r_point))
         .collect();
     for (slot, partials) in partials_per_slot.iter().enumerate() {
         channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
@@ -250,7 +292,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         })
         .collect();
     let ladder_pairs_b: Vec<&[Block128]> = (0..s_count)
-        .map(|slot| padded_columns[shifted_indices[slot]].as_slice())
+        .map(|slot| padded_columns[shifted_indices[slot]])
         .collect();
 
     let slice_pairs_a: Vec<Vec<Block128>> = (0..n_slices)
@@ -262,7 +304,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         })
         .collect();
     let slice_pairs_b: Vec<&[Block128]> = (0..n_slices)
-        .map(|i| padded_columns[slice_claims[i].col_index].as_slice())
+        .map(|i| padded_columns[slice_claims[i].col_index])
         .collect();
 
     let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count + n_slices);
@@ -319,7 +361,14 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
     slice_claims: &[SliceClaim],
     channel: &mut Channel,
 ) -> Result<(Vec<Block128>, Block128), VerifyError> {
-    let out = verify_algebraic_inner(air, pi, proof, extra_transcript, slice_claims, channel)?;
+    let out = verify_algebraic_inner(
+        air,
+        pi,
+        proof.into(),
+        extra_transcript,
+        slice_claims,
+        channel,
+    )?;
     Ok((out.r_pp, out.final_claim))
 }
 
@@ -328,7 +377,7 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
 fn verify_algebraic_inner<A: Air + ?Sized>(
     air: &A,
     pi: &PublicInputs,
-    proof: &AlgebraicStarkProof,
+    proof: AlgebraicStarkProofRef<'_>,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
     channel: &mut Channel,
@@ -349,7 +398,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     }
     let degree = round_poly_degree(air);
     let n_points = degree + 1;
-    for rp in &proof.zero_check_rounds {
+    for rp in proof.zero_check_rounds {
         if rp.len() != n_points {
             return Err(VerifyError::ShapeMismatch);
         }
@@ -357,7 +406,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     if proof.multipoint_rounds.len() != log_len {
         return Err(VerifyError::ShapeMismatch);
     }
-    for rp in &proof.multipoint_rounds {
+    for rp in proof.multipoint_rounds {
         if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
             return Err(VerifyError::ShapeMismatch);
         }
@@ -376,7 +425,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     // Zero-check replay.
     let mut zc_claim = Block128::ZERO;
     let mut zc_challenges: Vec<Block128> = Vec::with_capacity(log_len);
-    for rp in &proof.zero_check_rounds {
+    for rp in proof.zero_check_rounds {
         if rp[0] + rp[1] != zc_claim {
             return Err(VerifyError::ZeroCheckFailed);
         }
@@ -395,7 +444,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
         return Err(VerifyError::ShapeMismatch);
     }
     let expected_ladder_len = log_len + 1;
-    for partials in &proof.shift_partials {
+    for partials in proof.shift_partials {
         if partials.len() != expected_ladder_len {
             return Err(VerifyError::ShapeMismatch);
         }
@@ -410,7 +459,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
         .map(|p| crate::vshift::reconstruct_shifted_opening(&r_point, p))
         .collect();
 
-    crate::check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
+    crate::check_public_columns(air, proof.base_openings, &r_point, log_len)?;
 
     let mut composition = Block128::ZERO;
     let mut local_scratch: Vec<Block128> = Vec::new();
@@ -436,12 +485,12 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     }
 
     // Absorb base openings + ladder partials + slice values.
-    channel.observe_field_elems(&proof.base_openings);
+    channel.observe_field_elems(proof.base_openings);
     for (slot, partials) in proof.shift_partials.iter().enumerate() {
         channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
         channel.observe_field_elems(partials);
     }
-    channel.observe_field_elems(&proof.slice_claimed_values);
+    channel.observe_field_elems(proof.slice_claimed_values);
 
     // Multipoint sumcheck replay.
     let s_count = shifted_indices.len();
@@ -473,7 +522,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     }
 
     let (sc_challenges, final_claim) = crate::multipoint_batch::verify_multipoint_sumcheck(
-        &proof.multipoint_rounds,
+        proof.multipoint_rounds,
         mp_target,
         channel,
     )?;
@@ -522,9 +571,11 @@ pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
     let mut channel = Channel::new();
     absorb_cap(&mut channel, &commitment.cap);
 
+    // Collect slice refs: prove_air_interleaved_algebraic takes &[&[Block128]].
+    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
     let (alg, r_pp, _final_claim, _lambdas) = prove_air_interleaved_algebraic(
         air,
-        padded_columns,
+        &col_refs,
         pi,
         extra_transcript,
         slice_claims,
@@ -615,22 +666,28 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Blake3Hasher::new();
 
-    // Reconstruct AlgebraicStarkProof view (borrows values from full proof).
-    let alg = AlgebraicStarkProof {
+    // Build a zero-copy borrow view — avoids cloning all proof vectors.
+    let alg_ref = AlgebraicStarkProofRef {
         log_rows: proof.log_rows,
-        base_openings: proof.base_openings.clone(),
-        zero_check_rounds: proof.zero_check_rounds.clone(),
-        shift_partials: proof.shift_partials.clone(),
-        multipoint_rounds: proof.multipoint_rounds.clone(),
-        slice_claimed_values: proof.slice_claimed_values.clone(),
+        base_openings: &proof.base_openings,
+        zero_check_rounds: &proof.zero_check_rounds,
+        shift_partials: &proof.shift_partials,
+        multipoint_rounds: &proof.multipoint_rounds,
+        slice_claimed_values: &proof.slice_claimed_values,
     };
 
     let mut channel = Channel::new();
     absorb_cap(&mut channel, &proof.commitment.cap);
 
     // Run the algebraic verifier; it advances channel to just before FRI.
-    let out =
-        verify_algebraic_inner(air, pi, &alg, extra_transcript, slice_claims, &mut channel)?;
+    let out = verify_algebraic_inner(
+        air,
+        pi,
+        alg_ref,
+        extra_transcript,
+        slice_claims,
+        &mut channel,
+    )?;
 
     let AlgebraicVerifyOut {
         r_pp,

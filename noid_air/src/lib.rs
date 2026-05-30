@@ -37,11 +37,6 @@ pub mod composition;
 pub mod gates;
 
 pub use airs::{
-    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
-    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
-    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
-};
-pub use airs::{
     apply_mds_row, bit_adder_is_input_programme, bit_adder_is_reset_programme,
     bit_adder_operand_programme, build_balance_columns, build_instance_layout, build_perm_trace,
     build_sbox_x7_columns, build_tx_body_merkle_trace,
@@ -64,22 +59,27 @@ pub use airs::{
     BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, CarryInitGate, CarryNextGate,
     CarryRippleAir, FaSumGate, LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate,
     PartialSboxKillGate, PermLayout, PermMdsBlendGate, PoseidonPermColumns, RangeGateAir,
-    SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins, TxBodySpineComposite,
-    WeightInitGate, WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
-    BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
-    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
-    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
-    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
-    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, DEFAULT_PERM_LAYOUT,
-    N_LEAF_RATE_PAYLOAD_COLS, POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC,
-    POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT, POSEIDON_COL_X2, POSEIDON_COL_X3,
-    POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS, POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS,
-    POSEIDON_PERM_N_ROWS, RANGE_GATE_COL_ACC, RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET,
-    RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS, RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS,
-    SBOX_X7_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS,
-    TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS, TXBODY_MERKLE_N_PERMS,
-    TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE, TXBODY_MERKLE_SLOT_LOG_ROWS,
-    TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS, TX_BODY_MERKLE_COL_OFFSET,
+    SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins, TxBodySpineComposite, WeightInitGate,
+    WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS, BIT_ADDER_COL_A,
+    BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET,
+    BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH, BIT_ADDER_N_COLS,
+    BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B, CARRY_RIPPLE_COL_CARRY,
+    CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM, CARRY_RIPPLE_LOG_WORD_BITS,
+    CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, DEFAULT_PERM_LAYOUT, N_LEAF_RATE_PAYLOAD_COLS,
+    POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN,
+    POSEIDON_COL_SOUT, POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
+    POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS, RANGE_GATE_COL_ACC,
+    RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
+    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS, SBOX_X7_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LAYOUT,
+    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS,
+    TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE,
+    TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
+    TX_BODY_MERKLE_COL_OFFSET,
+};
+pub use airs::{
+    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
+    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
+    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
 };
 pub use gates::{
     emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector, emit_public_cell,
@@ -216,82 +216,130 @@ impl Trace {
 // ---------------------------------------------------------------------------
 
 /// Fixed columns that are identical across all transactions in a block.
-/// These are shared via `Arc` to eliminate per-tx duplication.
+/// Built once per AIR and shared to eliminate per-tx duplication.
 ///
-/// Stores columns in both tower basis (for constraint evaluation) and
-/// flat basis (for zero-check hot path) to avoid repeated conversions.
+/// Stores columns in both tower basis (constraint evaluation) and flat
+/// basis (zero-check hot path) to avoid repeated conversions.
+///
+/// Column lookups are O(1) via `col_pos`, a dense position map indexed
+/// by the original column index. This replaces the former O(n_fixed)
+/// linear scan in `tower_column` / `flat_column` / `is_fixed`.
 #[derive(Clone)]
 pub struct FixedColumns {
-    /// Tower-basis columns for constraint evaluation
+    /// Tower-basis columns, one per entry in `col_indices`, in the same order.
     pub tower: Vec<Vec<Block128>>,
-    /// Flat-basis columns for zero-check (pre-converted via tower_to_flat_u128)
+    /// Flat-basis columns (tower_to_flat_u128 applied), same order.
     pub flat: Vec<Vec<u128>>,
-    /// Original Trace column indices
+    /// Original Trace column indices of the fixed columns.
     pub col_indices: Vec<usize>,
-    /// Padded log length
+    /// Padded log length.
     pub log_len: usize,
+    /// O(1) position map: `col_pos[original_col_idx]` = `Some(pos)` where
+    /// `pos` is the index into `tower` / `flat`, or `None` for non-fixed columns.
+    /// Length equals `air.n_columns()` at construction time.
+    col_pos: Vec<Option<usize>>,
 }
 
 impl FixedColumns {
-    /// Build FixedColumns from an AIR and Trace.
+    /// Build `FixedColumns` from an AIR and its trace, padded to `target_log`.
     ///
-    /// Extracts columns identified by `air.fixed_columns()`, pads them to
-    /// `target_log`, and pre-converts to flat basis for zero-check.
-    ///
-    /// # Arguments
-    /// * `air` - AIR that identifies fixed columns
-    /// * `trace` - Trace containing the column data
-    /// * `target_log` - Target log length for padding
-    ///
-    /// # Returns
-    /// FixedColumns with tower and flat representations
-    pub fn from_air<A: Air>(air: &A, trace: &Trace, target_log: usize) -> Self {
+    /// Fixed columns (identified by `air.fixed_columns()`) are padded,
+    /// converted to flat basis, and stored with an O(1) position map.
+    /// Padding and flat conversion run in parallel via rayon when there are
+    /// multiple fixed columns.
+    pub fn from_air<A: Air + ?Sized>(air: &A, trace: &Trace, target_log: usize) -> Self {
+        use rayon::prelude::*;
         let indices = air.fixed_columns();
-        let mut tower = Vec::with_capacity(indices.len());
-        let mut flat = Vec::with_capacity(indices.len());
-        
-        for &idx in &indices {
-            let padded = crate::pad_column_cow(&trace.columns[idx], target_log);
-            let flat_col: Vec<u128> = padded.iter()
-                .map(|v| noid_core::hardware::tower_to_flat_u128(v.0))
-                .collect();
-            tower.push(padded.into_owned());
-            flat.push(flat_col);
+        let n_air_cols = air.n_columns();
+        let target_len = 1usize << target_log;
+
+        // Pad and convert in parallel — each fixed column is independent.
+        let (tower, flat): (Vec<Vec<Block128>>, Vec<Vec<u128>>) = indices
+            .par_iter()
+            .map(|&idx| {
+                let col = &trace.columns[idx];
+                // Pad by extending (clone + resize); no intermediate Cow needed.
+                let mut tower_col = col.clone();
+                if tower_col.len() < target_len {
+                    tower_col.resize(target_len, Block128::ZERO);
+                }
+                debug_assert_eq!(tower_col.len(), target_len);
+                let flat_col: Vec<u128> = tower_col
+                    .iter()
+                    .map(|v| noid_core::hardware::tower_to_flat_u128(v.0))
+                    .collect();
+                (tower_col, flat_col)
+            })
+            .unzip();
+
+        // Build O(1) dense position map.
+        let mut col_pos = vec![None::<usize>; n_air_cols];
+        for (pos, &idx) in indices.iter().enumerate() {
+            if idx < n_air_cols {
+                col_pos[idx] = Some(pos);
+            }
         }
-        
+
         Self {
             tower,
             flat,
             col_indices: indices,
             log_len: target_log,
+            col_pos,
         }
     }
-    
-    /// Get tower-basis column by original Trace index.
+
+    /// Tower-basis column for original Trace index `idx`.  O(1).
     ///
     /// # Panics
-    /// Panics if `idx` is not a fixed column.
+    /// Panics if `idx` is not a fixed column (not in `air.fixed_columns()`).
+    #[inline]
     pub fn tower_column(&self, idx: usize) -> &[Block128] {
-        let pos = self.col_indices.iter()
-            .position(|&i| i == idx)
-            .expect("idx must be a fixed column");
+        let pos = self.col_pos[idx].expect("idx must be a fixed column");
         &self.tower[pos]
     }
-    
-    /// Get flat-basis column by original Trace index.
+
+    /// Flat-basis column for original Trace index `idx`.  O(1).
     ///
     /// # Panics
     /// Panics if `idx` is not a fixed column.
+    #[inline]
     pub fn flat_column(&self, idx: usize) -> &[u128] {
-        let pos = self.col_indices.iter()
-            .position(|&i| i == idx)
-            .expect("idx must be a fixed column");
+        let pos = self.col_pos[idx].expect("idx must be a fixed column");
         &self.flat[pos]
     }
-    
-    /// Check if an index is a fixed column.
+
+    /// Returns `true` iff `idx` is a fixed column.  O(1).
+    #[inline]
     pub fn is_fixed(&self, idx: usize) -> bool {
-        self.col_indices.contains(&idx)
+        idx < self.col_pos.len() && self.col_pos[idx].is_some()
+    }
+
+    /// Reconstruct a full ordered column reference slice from fixed and witness data.
+    ///
+    /// `n_cols_total` must equal `air.n_columns()`.  `witness` must contain
+    /// exactly the non-fixed columns in ascending original column-index order
+    /// (i.e., the result of filtering out fixed column indices from the trace).
+    ///
+    /// The returned `Vec` holds `n_cols_total` `&[Block128]` pointers — fixed
+    /// columns point into `self.tower`, witness columns point into `witness`.
+    /// No data is copied.
+    pub fn build_full_col_refs<'a>(
+        &'a self,
+        n_cols_total: usize,
+        witness: &'a [Vec<Block128>],
+    ) -> Vec<&'a [Block128]> {
+        let mut result = Vec::with_capacity(n_cols_total);
+        let mut w_idx = 0usize;
+        for col_idx in 0..n_cols_total {
+            if self.is_fixed(col_idx) {
+                result.push(self.tower_column(col_idx));
+            } else {
+                result.push(witness[w_idx].as_slice());
+                w_idx += 1;
+            }
+        }
+        result
     }
 }
 
@@ -330,7 +378,7 @@ impl<'a> SplitTraceView<'a> {
             &self.witness[witness_idx]
         }
     }
-    
+
     /// Get flat-basis column by original Trace index.
     ///
     /// Returns fixed column if `idx` is fixed, otherwise returns witness column.
@@ -342,15 +390,13 @@ impl<'a> SplitTraceView<'a> {
             &self.witness_flat[witness_idx]
         }
     }
-    
+
     /// Compute witness column index from original Trace index.
     ///
     /// Witness columns are numbered sequentially, skipping fixed columns.
     fn witness_index(&self, idx: usize) -> usize {
         // Count how many fixed columns come before idx
-        let fixed_before = self.fixed.col_indices.iter()
-            .filter(|&&i| i < idx)
-            .count();
+        let fixed_before = self.fixed.col_indices.iter().filter(|&&i| i < idx).count();
         idx - fixed_before
     }
 }
