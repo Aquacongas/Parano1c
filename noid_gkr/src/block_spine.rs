@@ -178,12 +178,23 @@ impl BlockSpineMle {
 // ---------------------------------------------------------------------------
 
 fn build_mu_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot in 0..live_slots {
-        for round in 0..N_ROUNDS {
-            for elem in 0..STATE_SIZE {
-                tab[pack_index_dyn(slot, round, elem)] = Block128::ONE;
+    use rayon::prelude::*;
+    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
+            for round in 0..N_ROUNDS {
+                for elem in 0..STATE_SIZE {
+                    local.push((pack_index_dyn(slot, round, elem), Block128::ONE));
+                }
             }
+            local
+        })
+        .collect();
+    let mut tab = vec![Block128::ZERO; n_cells];
+    for slot_p in slot_pairs {
+        for (idx, val) in slot_p {
+            tab[idx] = val;
         }
     }
     tab
@@ -1013,21 +1024,37 @@ fn build_block_combined_weights(
         eq_round_at_inc[round_x] = eq_round_tab[inc];
     }
 
+    use rayon::prelude::*;
+
+    // Phase 1: fill w_dec and w_lane in parallel over slots.
+    // Collect (idx, w_dec, es_er) tuples per slot, then scatter sequentially.
+    // Slots write to disjoint indices (guaranteed by pack_index_dyn).
+    let scatter_data: Vec<Vec<(usize, Block128, Block128)>> = (0..n_slots)
+        .into_par_iter()
+        .map(|slot| {
+            let es = eq_slot_tab[slot];
+            let mut local = Vec::with_capacity(n_rounds * n_elems);
+            for round_x in 0..n_rounds {
+                let er = eq_round_at_inc[round_x];
+                let es_er = es * er;
+                for elem in 0..n_elems {
+                    let idx = pack_index_dyn(slot, round_x, elem);
+                    let ee = eq_elem_tab[elem];
+                    local.push((idx, es_er * ee, es_er));
+                }
+            }
+            local
+        })
+        .collect();
+
     let mut w_dec = vec![Block128::ZERO; n_cells];
     let mut w_lane: [Vec<Block128>; STATE_SIZE] =
         std::array::from_fn(|_| vec![Block128::ZERO; n_cells]);
-
-    for slot in 0..n_slots {
-        let es = eq_slot_tab[slot];
-        for round_x in 0..n_rounds {
-            let er = eq_round_at_inc[round_x];
-            let es_er = es * er;
-            for elem in 0..n_elems {
-                let idx = pack_index_dyn(slot, round_x, elem);
-                let ee = eq_elem_tab[elem];
-                w_dec[idx] = es_er * ee;
-                w_lane[elem][idx] = es_er;
-            }
+    for slot_d in &scatter_data {
+        for &(idx, wd, es_er) in slot_d {
+            w_dec[idx] = wd;
+            let elem = elem_of_dyn(idx);
+            w_lane[elem][idx] = es_er;
         }
     }
 
@@ -1046,19 +1073,37 @@ fn build_block_combined_weights(
     let lane_sout = [d3, d4, d5, d6];
     let lane_state = [d7, d8, d9, d10];
 
-    let mut w_sin = vec![Block128::ZERO; n_cells];
-    let mut w_sout = vec![Block128::ZERO; n_cells];
-    let mut w_state = vec![Block128::ZERO; n_cells];
-
-    for x in 0..n_cells {
-        let dec = w_dec[x];
-        w_sin[x] = d0 * dec;
-        w_sout[x] = d1 * dec;
-        w_state[x] = d2 * dec;
-        let elem = elem_of_dyn(x);
-        w_sout[x] += lane_sout[elem] * w_lane[elem][x];
-        w_state[x] += lane_state[elem] * w_lane[elem][x];
-    }
+    // Phase 2: fill w_sin/w_sout/w_state in parallel over all cells.
+    let (w_sin, (w_sout, w_state)) = rayon::join(
+        || {
+            (0..n_cells)
+                .into_par_iter()
+                .map(|x| d0 * w_dec[x])
+                .collect::<Vec<_>>()
+        },
+        || {
+            rayon::join(
+                || {
+                    (0..n_cells)
+                        .into_par_iter()
+                        .map(|x| {
+                            let e = elem_of_dyn(x);
+                            d1 * w_dec[x] + lane_sout[e] * w_lane[e][x]
+                        })
+                        .collect::<Vec<_>>()
+                },
+                || {
+                    (0..n_cells)
+                        .into_par_iter()
+                        .map(|x| {
+                            let e = elem_of_dyn(x);
+                            d2 * w_dec[x] + lane_state[e] * w_lane[e][x]
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+        },
+    );
 
     BlockCombinedWeights {
         w_sin,
