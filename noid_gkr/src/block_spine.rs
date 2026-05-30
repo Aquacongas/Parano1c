@@ -206,7 +206,9 @@ fn build_sigma_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
         .collect();
     let mut tab = vec![Block128::ZERO; n_cells];
     for slot_p in slot_pairs {
-        for (idx, val) in slot_p { tab[idx] = val; }
+        for (idx, val) in slot_p {
+            tab[idx] = val;
+        }
     }
     tab
 }
@@ -220,8 +222,13 @@ fn build_rc_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
             for round in 0..N_ROUNDS {
                 let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
                 for elem in 0..STATE_SIZE {
-                    if is_partial && elem != 0 { continue; }
-                    local.push((pack_index_dyn(slot, round, elem), Block128::from(ROUND_CONSTANTS[elem][round])));
+                    if is_partial && elem != 0 {
+                        continue;
+                    }
+                    local.push((
+                        pack_index_dyn(slot, round, elem),
+                        Block128::from(ROUND_CONSTANTS[elem][round]),
+                    ));
                 }
             }
             local
@@ -229,7 +236,9 @@ fn build_rc_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
         .collect();
     let mut tab = vec![Block128::ZERO; n_cells];
     for slot_p in slot_pairs {
-        for (idx, val) in slot_p { tab[idx] = val; }
+        for (idx, val) in slot_p {
+            tab[idx] = val;
+        }
     }
     tab
 }
@@ -345,43 +354,122 @@ struct BlockUnifiedFlatTables {
 
 #[inline]
 fn vec_to_flat(v: &[Block128]) -> Vec<u128> {
-    v.iter().map(|b| tower_to_flat_u128(b.to_u128())).collect()
+    // Parallel conversion for large tables (dominant for 100-tx blocks: 4M elements).
+    use rayon::prelude::*;
+    if v.len() >= 4096 {
+        v.par_iter()
+            .map(|b| tower_to_flat_u128(b.to_u128()))
+            .collect()
+    } else {
+        v.iter().map(|b| tower_to_flat_u128(b.to_u128())).collect()
+    }
 }
 
 fn build_block_unified_flat_tables(
     mle: &BlockSpineMle,
     rho: &[Block128],
 ) -> BlockUnifiedFlatTables {
+    use rayon::prelude::*;
     let n_cells = 1 << mle.num_vars;
     let live = mle.live_slots;
-    let sigma_full = build_sigma_table_dyn(live, n_cells);
-    let sigma_dec = permute_by_dec_dyn(&sigma_full);
-    let rc_dec = permute_by_dec_dyn(&build_rc_table_dyn(live, n_cells));
-    let s_in_dec = permute_by_dec_dyn(&mle.s_in);
-    let s_out_dec = permute_by_dec_dyn(&mle.s_out);
-    let state_dec = permute_by_dec_dyn(&mle.state);
 
-    let mds_lane_dec: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|j| build_mds_lane_table_dyn(j, live, n_cells));
-    let sigma_lane_dec: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|j| project_lane_dyn(&sigma_dec, j));
-    let s_out_lane_dec: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|j| project_lane_dyn(&s_out_dec, j));
-    let state_lane_dec: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|j| project_lane_dyn(&state_dec, j));
+    // Phase 1: Build the shared permuted tables in parallel (each is independent).
+    let (
+        sigma_dec_b128,
+        (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_b128, state_dec_b128)))),
+    ) = rayon::join(
+        || permute_by_dec_dyn(&build_sigma_table_dyn(live, n_cells)),
+        || {
+            rayon::join(
+                || vec_to_flat(&permute_by_dec_dyn(&build_rc_table_dyn(live, n_cells))),
+                || {
+                    rayon::join(
+                        || vec_to_flat(&build_u_table_dyn(rho, live, n_cells)),
+                        || {
+                            rayon::join(
+                                || vec_to_flat(&permute_by_dec_dyn(&mle.s_in)),
+                                || {
+                                    rayon::join(
+                                        || permute_by_dec_dyn(&mle.s_out),
+                                        || permute_by_dec_dyn(&mle.state),
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+
+    // Phase 2: Convert sigma_dec/s_out_dec/state_dec to flat AND build their lane
+    // tables — all using the already-computed Block128 permuted tables.
+    let sigma_dec_flat = vec_to_flat(&sigma_dec_b128);
+    let s_out_dec_flat = vec_to_flat(&s_out_dec_b128);
+    let state_dec_flat = vec_to_flat(&state_dec_b128);
+    let state_flat = vec_to_flat(&mle.state);
+
+    // Phase 3: Parallel lane table construction (STATE_SIZE = 4 lanes each).
+    // mds_lane and sigma_lane/s_out_lane/state_lane are all independent.
+    let lane_idx: Vec<usize> = (0..STATE_SIZE).collect();
+    let (mds_vecs, sigma_lane_vecs, s_out_lane_vecs, state_lane_vecs) = {
+        let (mds, (sig, (sout, stt))) = rayon::join(
+            || {
+                lane_idx
+                    .par_iter()
+                    .map(|&j| vec_to_flat(&build_mds_lane_table_dyn(j, live, n_cells)))
+                    .collect::<Vec<_>>()
+            },
+            || {
+                rayon::join(
+                    || {
+                        lane_idx
+                            .par_iter()
+                            .map(|&j| vec_to_flat(&project_lane_dyn(&sigma_dec_b128, j)))
+                            .collect::<Vec<_>>()
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                lane_idx
+                                    .par_iter()
+                                    .map(|&j| vec_to_flat(&project_lane_dyn(&s_out_dec_b128, j)))
+                                    .collect::<Vec<_>>()
+                            },
+                            || {
+                                lane_idx
+                                    .par_iter()
+                                    .map(|&j| vec_to_flat(&project_lane_dyn(&state_dec_b128, j)))
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                    },
+                )
+            },
+        );
+        (mds, sig, sout, stt)
+    };
+
+    let mds_flat: [Vec<u128>; STATE_SIZE] = std::array::from_fn(|j| mds_vecs[j].clone());
+    let sigma_lane_flat: [Vec<u128>; STATE_SIZE] =
+        std::array::from_fn(|j| sigma_lane_vecs[j].clone());
+    let s_out_lane_flat: [Vec<u128>; STATE_SIZE] =
+        std::array::from_fn(|j| s_out_lane_vecs[j].clone());
+    let state_lane_flat: [Vec<u128>; STATE_SIZE] =
+        std::array::from_fn(|j| state_lane_vecs[j].clone());
 
     BlockUnifiedFlatTables {
-        u: vec_to_flat(&build_u_table_dyn(rho, live, n_cells)),
-        sigma_dec: vec_to_flat(&sigma_dec),
-        rc_dec: vec_to_flat(&rc_dec),
-        mds_lane_dec: mds_lane_dec.map(|v| vec_to_flat(&v)),
-        sigma_lane_dec: sigma_lane_dec.map(|v| vec_to_flat(&v)),
-        s_in_dec: vec_to_flat(&s_in_dec),
-        s_out_dec: vec_to_flat(&s_out_dec),
-        state_dec: vec_to_flat(&state_dec),
-        state: vec_to_flat(&mle.state),
-        s_out_lane_dec: s_out_lane_dec.map(|v| vec_to_flat(&v)),
-        state_lane_dec: state_lane_dec.map(|v| vec_to_flat(&v)),
+        u: u_flat,
+        sigma_dec: sigma_dec_flat,
+        rc_dec: rc_dec_flat,
+        mds_lane_dec: mds_flat,
+        sigma_lane_dec: sigma_lane_flat,
+        s_in_dec: s_in_dec_flat,
+        s_out_dec: s_out_dec_flat,
+        state_dec: state_dec_flat,
+        state: state_flat,
+        s_out_lane_dec: s_out_lane_flat,
+        state_lane_dec: state_lane_flat,
     }
 }
 
@@ -1083,34 +1171,83 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
     let weights = build_block_combined_weights(r_prime, delta, num_vars);
 
     // Degree-2 sumcheck in flat basis for hw acceleration.
-    let mut f_sin: Vec<u128> = vec_to_flat(&mle.s_in);
-    let mut f_sout: Vec<u128> = vec_to_flat(&mle.s_out);
-    let mut f_state: Vec<u128> = vec_to_flat(&mle.state);
-    let mut f_wsin: Vec<u128> = vec_to_flat(&weights.w_sin);
-    let mut f_wsout: Vec<u128> = vec_to_flat(&weights.w_sout);
-    let mut f_wstate: Vec<u128> = vec_to_flat(&weights.w_state);
+    // Convert all 6 tables to flat in parallel.
+    let ((mut f_sin, mut f_sout), (mut f_state, (mut f_wsin, (mut f_wsout, mut f_wstate)))) =
+        rayon::join(
+            || rayon::join(|| vec_to_flat(&mle.s_in), || vec_to_flat(&mle.s_out)),
+            || {
+                rayon::join(
+                    || vec_to_flat(&mle.state),
+                    || {
+                        rayon::join(
+                            || vec_to_flat(&weights.w_sin),
+                            || {
+                                rayon::join(
+                                    || vec_to_flat(&weights.w_sout),
+                                    || vec_to_flat(&weights.w_state),
+                                )
+                            },
+                        )
+                    },
+                )
+            },
+        );
 
     let mut round_polys = Vec::with_capacity(num_vars);
     let mut r_double_prime = vec![Block128::ZERO; num_vars];
 
     for round in 0..num_vars {
         let half = f_sin.len() / 2;
-        let mut acc = [0u128; BLOCK_SPINE_SHIFT_DEGREE + 1];
-        for i in 0..half {
-            let sin_p: [u128; 2] = [f_sin[i], f_sin[i] ^ f_sin[i + half]];
-            let sout_p: [u128; 2] = [f_sout[i], f_sout[i] ^ f_sout[i + half]];
-            let st_p: [u128; 2] = [f_state[i], f_state[i] ^ f_state[i + half]];
-            let wsin_p: [u128; 2] = [f_wsin[i], f_wsin[i] ^ f_wsin[i + half]];
-            let wsout_p: [u128; 2] = [f_wsout[i], f_wsout[i] ^ f_wsout[i + half]];
-            let wst_p: [u128; 2] = [f_wstate[i], f_wstate[i] ^ f_wstate[i + half]];
-
-            let t1: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsin_p, &sin_p);
-            let t2: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsout_p, &sout_p);
-            let t3: [u128; 3] = poly_mul_t::<2, 2, 3>(&wst_p, &st_p);
-            acc[0] ^= t1[0] ^ t2[0] ^ t3[0];
-            acc[1] ^= t1[1] ^ t2[1] ^ t3[1];
-            acc[2] ^= t1[2] ^ t2[2] ^ t3[2];
-        }
+        // Parallel reduction over positions (same pattern as compute_block_round_polynomial_flat).
+        let acc: [u128; BLOCK_SPINE_SHIFT_DEGREE + 1] = if half >= 256 {
+            use rayon::prelude::*;
+            (0..half)
+                .into_par_iter()
+                .fold(
+                    || [0u128; BLOCK_SPINE_SHIFT_DEGREE + 1],
+                    |mut local, i| {
+                        let sin_p: [u128; 2] = [f_sin[i], f_sin[i] ^ f_sin[i + half]];
+                        let sout_p: [u128; 2] = [f_sout[i], f_sout[i] ^ f_sout[i + half]];
+                        let st_p: [u128; 2] = [f_state[i], f_state[i] ^ f_state[i + half]];
+                        let wsin_p: [u128; 2] = [f_wsin[i], f_wsin[i] ^ f_wsin[i + half]];
+                        let wsout_p: [u128; 2] = [f_wsout[i], f_wsout[i] ^ f_wsout[i + half]];
+                        let wst_p: [u128; 2] = [f_wstate[i], f_wstate[i] ^ f_wstate[i + half]];
+                        let t1: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsin_p, &sin_p);
+                        let t2: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsout_p, &sout_p);
+                        let t3: [u128; 3] = poly_mul_t::<2, 2, 3>(&wst_p, &st_p);
+                        local[0] ^= t1[0] ^ t2[0] ^ t3[0];
+                        local[1] ^= t1[1] ^ t2[1] ^ t3[1];
+                        local[2] ^= t1[2] ^ t2[2] ^ t3[2];
+                        local
+                    },
+                )
+                .reduce(
+                    || [0u128; BLOCK_SPINE_SHIFT_DEGREE + 1],
+                    |mut a, b| {
+                        for k in 0..=BLOCK_SPINE_SHIFT_DEGREE {
+                            a[k] ^= b[k];
+                        }
+                        a
+                    },
+                )
+        } else {
+            let mut acc = [0u128; BLOCK_SPINE_SHIFT_DEGREE + 1];
+            for i in 0..half {
+                let sin_p: [u128; 2] = [f_sin[i], f_sin[i] ^ f_sin[i + half]];
+                let sout_p: [u128; 2] = [f_sout[i], f_sout[i] ^ f_sout[i + half]];
+                let st_p: [u128; 2] = [f_state[i], f_state[i] ^ f_state[i + half]];
+                let wsin_p: [u128; 2] = [f_wsin[i], f_wsin[i] ^ f_wsin[i + half]];
+                let wsout_p: [u128; 2] = [f_wsout[i], f_wsout[i] ^ f_wsout[i + half]];
+                let wst_p: [u128; 2] = [f_wstate[i], f_wstate[i] ^ f_wstate[i + half]];
+                let t1: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsin_p, &sin_p);
+                let t2: [u128; 3] = poly_mul_t::<2, 2, 3>(&wsout_p, &sout_p);
+                let t3: [u128; 3] = poly_mul_t::<2, 2, 3>(&wst_p, &st_p);
+                acc[0] ^= t1[0] ^ t2[0] ^ t3[0];
+                acc[1] ^= t1[1] ^ t2[1] ^ t3[1];
+                acc[2] ^= t1[2] ^ t2[2] ^ t3[2];
+            }
+            acc
+        };
         let coeffs_tower: Vec<Block128> = acc
             .iter()
             .map(|&c| Block128::from(flat_to_tower_u128(c)))

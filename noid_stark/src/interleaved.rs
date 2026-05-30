@@ -26,7 +26,7 @@
 
 use noid_air::Air;
 use noid_core::mle::eq::eq_ind_partial_eval;
-use noid_core::mle::evaluate::evaluate_slice_with_scratch;
+use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::Blake3Hasher;
 use noid_fri::Channel;
@@ -211,18 +211,28 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 
-    // M2: Base openings with thread-local scratch — eliminates one 128 KB
-    // allocation per column per transaction.  Each rayon worker reuses its
-    // scratch buffer across all columns it processes in a given task batch.
+    // M2 + flat-basis: clmul_gcm-based fold is ~7x faster than tower-basis mul.
+    // Thread-local u128 scratch avoids per-call allocation.
     thread_local! {
-        static BASE_SCRATCH: std::cell::RefCell<Vec<Block128>> =
+        static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            std::cell::RefCell::new(Vec::new());
+        static PT_FLAT: std::cell::RefCell<Vec<u128>> =
             std::cell::RefCell::new(Vec::new());
     }
     let base_openings: Vec<Block128> = padded_columns[..n_air_cols]
         .par_iter()
         .copied()
         .map(|col| {
-            BASE_SCRATCH.with(|s| evaluate_slice_with_scratch(col, &r_point, &mut s.borrow_mut()))
+            FLAT_SCRATCH.with(|fs| {
+                PT_FLAT.with(|pf| {
+                    evaluate_flat_with_scratch(
+                        col,
+                        &r_point,
+                        &mut fs.borrow_mut(),
+                        &mut pf.borrow_mut(),
+                    )
+                })
+            })
         })
         .collect();
     channel.observe_field_elems(&base_openings);

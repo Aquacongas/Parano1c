@@ -577,8 +577,12 @@ pub fn prove_block(
     // Eliminates ~n_tx * n_per_tx * 128 KB = ~1 GB of allocations for 100 txs.
     let total_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
 
+    // M2 + flat-basis: evaluate_flat_with_scratch uses clmul_gcm (~4 ns/mul)
+    // instead of tower-basis Karatsuba (~30 ns/mul) — 7-8x faster per column.
     thread_local! {
-        static OPEN_SCRATCH: std::cell::RefCell<Vec<Block128>> =
+        static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            std::cell::RefCell::new(Vec::new());
+        static PT_SCRATCH: std::cell::RefCell<Vec<u128>> =
             std::cell::RefCell::new(Vec::new());
     }
 
@@ -588,22 +592,21 @@ pub fn prove_block(
             let r_pp_k = &tx_r_pp[k];
             let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
             let mut cols_k = Vec::with_capacity(n_per_tx);
-            OPEN_SCRATCH.with(|s| {
-                let mut scratch = s.borrow_mut();
-                for col in &air_refs {
-                    cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                        col,
-                        r_pp_k,
-                        &mut scratch,
-                    ));
-                }
-                for auth_s in &preps[k].auth_slices {
-                    cols_k.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                        auth_s,
-                        r_pp_k,
-                        &mut scratch,
-                    ));
-                }
+            FLAT_SCRATCH.with(|fs| {
+                PT_SCRATCH.with(|ps| {
+                    let mut flat = fs.borrow_mut();
+                    let mut pt = ps.borrow_mut();
+                    for col in &air_refs {
+                        cols_k.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                            col, r_pp_k, &mut flat, &mut pt,
+                        ));
+                    }
+                    for auth_s in &preps[k].auth_slices {
+                        cols_k.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                            auth_s, r_pp_k, &mut flat, &mut pt,
+                        ));
+                    }
+                })
             });
             cols_k
         })
@@ -614,24 +617,29 @@ pub fn prove_block(
         block_col_openings.extend_from_slice(&openings_k);
     }
     // Block spine slice openings at spine_r_low.
-    OPEN_SCRATCH.with(|s| {
-        let mut scratch = s.borrow_mut();
-        for sp in &spine_padded_slices {
-            block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                sp,
-                &spine_r_low,
-                &mut scratch,
-            ));
-        }
-        if state_binding.is_some() {
-            for i in 0..sb_n_cols {
-                block_col_openings.push(noid_core::mle::evaluate::evaluate_slice_with_scratch(
-                    &sb_padded_columns[i],
-                    &sb_r_pp,
-                    &mut scratch,
+    FLAT_SCRATCH.with(|fs| {
+        PT_SCRATCH.with(|ps| {
+            let mut flat = fs.borrow_mut();
+            let mut pt = ps.borrow_mut();
+            for sp in &spine_padded_slices {
+                block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                    sp,
+                    &spine_r_low,
+                    &mut flat,
+                    &mut pt,
                 ));
             }
-        }
+            if state_binding.is_some() {
+                for i in 0..sb_n_cols {
+                    block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                        &sb_padded_columns[i],
+                        &sb_r_pp,
+                        &mut flat,
+                        &mut pt,
+                    ));
+                }
+            }
+        })
     });
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
@@ -708,44 +716,49 @@ pub fn prove_block(
     // B-side: B_k[j] = sum_i beta^i * cols_k[i][j].
     let hyper_len = 1usize << log_len;
 
+    // Column-outer accumulation: process one column at a time so both
+    // b_k (128 KB) and the current column (128 KB) stay in L2 cache.
+    // This avoids the L3/DRAM cache-miss storm of the row-outer layout.
     let pairs_b_owned: Vec<Vec<Block128>> = (0..n_participants)
         .into_par_iter()
         .map(|k| {
             if k < n_tx {
-                // Reconstruct full ordered column refs; fixed cols are zero-copy.
                 let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
-                (0..hyper_len)
-                    .map(|j| {
-                        let mut acc = Block128::ZERO;
-                        for i in 0..n_air_cols {
-                            acc += beta_powers[i] * air_refs[i][j];
-                        }
-                        for (offset, s) in preps[k].auth_slices.iter().enumerate() {
-                            acc += beta_powers[n_air_cols + offset] * s[j];
-                        }
-                        acc
-                    })
-                    .collect()
+                let mut b_k = vec![Block128::ZERO; hyper_len];
+                for i in 0..n_air_cols {
+                    let lam = beta_powers[i];
+                    let col = air_refs[i];
+                    b_k.iter_mut()
+                        .zip(col.iter())
+                        .for_each(|(acc, &v)| *acc += lam * v);
+                }
+                for (off, s) in preps[k].auth_slices.iter().enumerate() {
+                    let lam = beta_powers[n_air_cols + off];
+                    b_k.iter_mut()
+                        .zip(s.iter())
+                        .for_each(|(acc, &v)| *acc += lam * v);
+                }
+                b_k
             } else if k == spine_participant_idx {
-                (0..hyper_len)
-                    .map(|j| {
-                        let mut acc = Block128::ZERO;
-                        for i in 0..n_block_spine_slices {
-                            acc += beta_powers[i] * spine_padded_slices[i][j];
-                        }
-                        acc
-                    })
-                    .collect()
+                let mut b_k = vec![Block128::ZERO; hyper_len];
+                for i in 0..n_block_spine_slices {
+                    let lam = beta_powers[i];
+                    let col = spine_padded_slices[i].as_slice();
+                    b_k.iter_mut()
+                        .zip(col.iter())
+                        .for_each(|(acc, &v)| *acc += lam * v);
+                }
+                b_k
             } else {
-                (0..hyper_len)
-                    .map(|j| {
-                        let mut acc = Block128::ZERO;
-                        for i in 0..sb_n_cols {
-                            acc += beta_powers[i] * sb_padded_columns[i][j];
-                        }
-                        acc
-                    })
-                    .collect()
+                let mut b_k = vec![Block128::ZERO; hyper_len];
+                for i in 0..sb_n_cols {
+                    let lam = beta_powers[i];
+                    let col = sb_padded_columns[i].as_slice();
+                    b_k.iter_mut()
+                        .zip(col.iter())
+                        .for_each(|(acc, &v)| *acc += lam * v);
+                }
+                b_k
             }
         })
         .collect();

@@ -59,6 +59,42 @@ pub fn evaluate_slice_with_scratch<F: TowerField>(
     scratch[0]
 }
 
+/// Evaluate an MLE in flat (GCM) basis using a caller-supplied scratch buffer.
+///
+/// Same as [`evaluate_flat`] but reuses `scratch` to avoid per-call allocation.
+/// Thread-local usage eliminates all allocations across millions of calls.
+/// The fold uses `clmul_gcm` (flat basis) which is ~7-8x faster than the
+/// tower-basis Karatsuba multiply used by [`evaluate_slice_with_scratch`].
+pub fn evaluate_flat_with_scratch(
+    poly: &[Block128],
+    point: &[Block128],
+    scratch: &mut Vec<u128>,
+    point_flat_scratch: &mut Vec<u128>,
+) -> Block128 {
+    use crate::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+    let n = point.len();
+    if n == 0 {
+        return poly[0];
+    }
+    // Reuse scratch: convert tower → flat (fills scratch from poly).
+    scratch.clear();
+    scratch.extend(poly.iter().map(|v| tower_to_flat_u128(v.0)));
+    // Pre-convert eval point to flat.
+    point_flat_scratch.clear();
+    point_flat_scratch.extend(point.iter().rev().map(|v| tower_to_flat_u128(v.0)));
+    // Fold in flat basis using clmul_gcm (~4 ns/op vs ~30 ns for tower mul).
+    for &r_flat in point_flat_scratch.iter() {
+        let half = scratch.len() / 2;
+        for j in 0..half {
+            let lo = scratch[j];
+            let hi = scratch[j + half];
+            scratch[j] = lo ^ clmul_gcm(r_flat, hi ^ lo);
+        }
+        scratch.truncate(half);
+    }
+    Block128::from(flat_to_tower_u128(scratch[0]))
+}
+
 /// Evaluate an MLE in flat (GCM) basis for ~20x speedup over tower-basis mul.
 ///
 /// Converts the table to flat basis, folds using `clmul_gcm`, and returns
