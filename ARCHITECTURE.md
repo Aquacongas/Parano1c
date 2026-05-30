@@ -124,7 +124,7 @@ The Full Node:
 - generates BlockStateBinding (proves Merkle openings for all slots);
 - aggregates LogicProofs + BlockStateBinding into one `BlockProof`;
 - computes the resulting `state_root` and `da_root`;
-- forms the 248-byte header and pushes it to the miner (built-in or
+- forms the 276-byte header and pushes it to the miner (built-in or
   external via Block Template API).
 
 ```
@@ -146,7 +146,7 @@ The Full Node:
   BlockProof + state_root + da_root
       │
       ▼
-  form header (248 bytes)
+  form header (276 bytes)
       │
       ├──► built-in miner (CPU/GPU)
       │         OR
@@ -516,7 +516,7 @@ verify prior blocks recursively.
   │   State: prev_block_state_root → apply all → new_state_root │
   │   DA: coinbase + tx_bodies → da_root                        │
   │                                                             │
-  │   PoW: push 248-byte header to GPU/ASIC                     │
+  │   PoW: push 276-byte header to GPU/ASIC                     │
   │   On valid nonce: broadcast block                           │
   └────────────────────────┬────────────────────────────────────┘
                             ▼
@@ -646,7 +646,7 @@ The backbone. Stores state, validates, assembles blocks, and mines.
                     resolves slot conflicts
                     generates BlockStateBinding (Merkle openings)
                     aggregates LogicProofs + BlockStateBinding -> BlockProof
-                    computes da_root, forms 248-byte block header
+                    computes da_root, forms 276-byte block header
     [Mining]
                     built-in miner (CPU/GPU, optional)
                     OR exposes Block Template API for external miners
@@ -668,7 +668,7 @@ Not a node type — it is a dumb hash device that connects to a Full
 Node via the Block Template API (analogous to Stratum in Bitcoin).
 
 ```
-  Receives: 248-byte block header from Full Node
+  Receives: 276-byte block header from Full Node
   Does:     brute-forces nonce: Blake3(header) < difficulty_target
   Returns:  valid nonce
   Cannot:   modify block content, change coinbase, see transactions
@@ -682,27 +682,26 @@ external miner has no CPU proof capability — it cannot steal blocks.
 ### 8.4 Block structure
 
 ```
-  BlockHeader (328 bytes):
-    prev_block_hash         [32B]
+  BlockHeader (276 bytes, wire: noid_chain::wire::BLOCK_HEADER_WIRE_SIZE):
+    prev_block_hash         [32B]   -- H_BLOCK of previous header
     state_root              [32B]   -- Poseidon2b Merkle over segment FRI roots
     tx_root                 [32B]   -- Merkle of tx_body_hashes in block
-    da_root                 [32B]   -- Merkle of DA payload (binds coinbase)
     timestamp               [8B]
     height                  [8B]
     miner_address           [32B]
     nonce                   [16B]   -- 128-bit PoW nonce (Blake3)
     difficulty_target       [32B]   -- 256-bit ASERT target
-    proof_transcript_hash   [32B]
-    witness_root            [32B]   -- Binius-packed witness on DA
-    log_slots               [4B]
-    active_slot_count       [8B]
-    alloc_counter           [8B]
+    proof_transcript_hash   [32B]   -- Fiat-Shamir transcript digest of BlockProof
+    witness_root            [32B]   -- Binius-packed DA witness root
+    log_slots               [4B]    -- slot-space depth k ∈ [24, 32]
+    active_slot_count       [8B]    -- live UTXOs after this block
+    alloc_counter           [8B]    -- monotonic PRNG seed after this block
 ```
 
-`da_root` is the Poseidon2b Merkle root of the Data Availability
-payload (ordered tx_bodies + coinbase_address + coinbase_slot). It
-provides cryptographic protection against block withholding: changing
-the coinbase requires regenerating `da_root` → header → BlockProof.
+`witness_root` is the Binius-packed DA payload root
+(`noid_chain::da::packed_witness_root`). It binds the tx_bodies and
+coinbase to the header: changing the coinbase requires regenerating
+`witness_root` → header → BlockProof (block withholding protection).
 
 ---
 
@@ -729,29 +728,54 @@ the coinbase requires regenerating `da_root` → header → BlockProof.
   N algebraic per-tx STARKs + unified block SpineGKR Kill-Shot +
   block-level multipoint sumcheck + single FRI opening → `BlockProof`.
 - GKR Kill-Shot: Spine (59-slot, `SpineProofKillShot`),
-  Auth (20-slot, `AuthProofKillShot`), Merkle (32-slot).
+  Auth (20-slot, `AuthProofKillShot`), Merkle (32-slot, fully tested).
 - All unit and integration tests pass. Block prove/verify roundtrip confirmed.
 
-**Not yet done (Phase 1.5, Stage Q — Parallel per-tx STARK):**
+**Done (Phase 3, Stage F — Segmented State & Merkle Kill-Shot):**
 
-- Stage 5 of `prove_block` still uses sequential shared Fiat-Shamir channel.
-- 100-tx block: prove ~43 s, verify ~15 s (target: <8 s prove, <4 s verify on 8 cores).
-- Implementation plan: per-tx channel factory `per_tx_algebraic_channel(state_root, cap, k)`
-  + `rayon::par_iter` over Stage 5 prove + mirror change in verifier.
-- See Phase 1.5 in ROADMAP2.md for the detailed plan.
+- `SegmentedFriState` replacing monolithic `FriState` in `ChainState`.
+  - `log_slots = 24` → `256` independent segments of `2^16` slots each.
+  - Virtual zero segments: no allocation until first write (genesis ≈ 24 KB RAM).
+  - Poseidon2b Merkle tree over segment FRI roots as global `state_root`.
+  - Dirty tracking: only touched segments recomputed on block apply.
+  - `ZERO_SEGTREE_NODE[d]` precomputed constants for O(1) expansion.
+  - `expand()`: doubles segment count, new root in one `compress()` call.
+- `StateBackend` trait + `RamBackend` (F.0/F.1).
+- `BlockStateBinding` updated to `SegmentedFriState` (F.6 partial).
+- Per-segment `BlockStateBindingAir` in `prove_block_full`: one AIR per
+  touched segment, each with 16-bit local eval point (F.6).
+- `prove_block` / `verify_block` accept `&[StateBindingBlockWitness]`
+  (multiple segment AIRs as separate multipoint participants).
+- Merkle Kill-Shot wired in `prove_block_full` / `verify_block_full` (F.5):
+  `prove_merkle_killshot` called for each touched segment when
+  `tree_depth > 0` (production); no-op for single-segment test mode.
+- `BlockHeader` extended with `log_slots`, `active_slot_count`,
+  `alloc_counter`; `hash_block_header` absorbs all three; wire size = 276 B.
+- `apply_block` validates `header.active_slot_count`, `header.alloc_counter`,
+  `header.log_slots` against post-apply chain state.
+- 730 tests pass, clean build.
+
+**Done (Phase 1.5, Stage Q — Parallel Per-Tx STARK):**
+
+- `per_tx_algebraic_channel(state_root, cap, k)` — independent per-tx Fiat-Shamir (Q.1).
+- `FixedColumns::from_air` shared zero-copy across all N txs (Q.2a).
+- `rayon::par_iter` over witness prep, Stage 5 prove, Stage 5 verify (Q.2b/Q.2c/Q.5).
+- `merkle_reduce(&tx_digests)` in Stage 6 transcript absorption (Q.4a).
+- Per-segment `state_binding_channel` for dedicated domain separation (Q.4).
+- Auth Kill-Shot + algebraic STARK verification fully parallel in `verify_block` (Q.5).
+- Benchmarks pending re-run (were ~43 s prove / ~15 s verify at 100 tx, target <8 s / <4 s).
 
 **Next (Phase 2, Stage P — Consensus & PoW):**
 
-- ASERT difficulty adjustment.
-- PoW validation (Blake3 + nonce search).
-- Block validation pipeline (all 16 consensus invariants from SPECIFICATION.md §16).
-- Epoch anchor freshness check in mempool admission (Security audit finding #5).
-- tx_body_hash consistency check on mempool admission (#6).
-- coinbase_credit == block_reward(height) + Σ fees enforcement (#7).
+- ASERT difficulty adjustment (`noid_chain/src/difficulty.rs`).
+- PoW validation (`noid_chain/src/pow.rs`).
+- All 16 block-level consensus invariants from SPECIFICATION.md §16.
+- Epoch anchor freshness check in mempool (#5).
+- `coinbase_credit == block_reward(height) + Σ fees` enforcement (#7).
+- Expansion trigger: 7-day rolling occupancy > 90% → `log_slots += 1`.
 
 **After Phase 2:**
 
-- Phase 3: Segmented state (per-segment FRI, Merkle Kill-Shot for segment paths).
 - Phase 4: Node binary, mempool, P2P, block assembly pipeline, RPC.
 - Phase 5: Wallet CLI (key management, LogicProof generation).
 - Phase 7 (Stage H): Recursive chain — `noid_recursive` crate, O(1) historical verify.

@@ -49,6 +49,9 @@ pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
 pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
+/// Segment-level Merkle tree: Poseidon2b binary tree over per-segment
+/// FRI roots. The root is the global `state_root` when `num_segments > 1`.
+pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
 /// Fixed-length 4-field output-leaf sponge: `[slot, value, owner_hi,
 /// owner_lo]` absorbed as two rate blocks with no padding flush
 /// (total: 2 permutations). Symmetric twin of the AIR's
@@ -79,6 +82,7 @@ mod tests {
             TAG_COMPRESS,
             TAG_DAWTNSS,
             TAG_FRISTATE,
+            TAG_SEGMENTTREE,
             TAG_OUTLEAF,
             TAG_CLAIMS,
         ];

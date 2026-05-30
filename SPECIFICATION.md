@@ -90,23 +90,29 @@ it is closed by construction.
 
 ### 0.4 Block header fields (consensus-significant)
 
-Every block header MUST carry at minimum the following fields that
-participate in consensus:
+Every block header MUST carry all of the following fields. Their
+canonical wire representation is 276 bytes (little-endian, see
+`noid_chain::wire::BLOCK_HEADER_WIRE_SIZE`):
 
-- `prev_header_hash` — hash of the previous block header;
-- `state_root` — Poseidon2b commitment to the full slot vector, taken
-  after applying this block's transactions;
-- `log_slots` — the slot-space parameter in effect for this block;
-- `active_slot_count` — the number of live slots after this block
-  (§15.3);
-- `alloc_counter` — the monotonic PRNG seed for the allocator (§15.1);
-- `block_proof_root` — commitment to the aggregated recursive proof
-  for this block;
-- `nonce` — 128-bit (16 bytes) PoW nonce (§18.2);
-- `difficulty_target` — 256-bit target threshold for Blake3 PoW
-  (§18.3);
-- `height` — block height (used for epoch anchor and difficulty
-  calculations).
+| Field | Size | Description |
+|---|---|---|
+| `prev_block_hash` | 32 B | `H_BLOCK` of the previous header |
+| `state_root` | 32 B | Segment-Merkle root over all segment FRI roots (§19) |
+| `tx_root` | 32 B | COMPRESS Merkle root of `tx_body_hash`es |
+| `timestamp` | 8 B | Seconds since Unix epoch |
+| `height` | 8 B | Block height |
+| `miner_address` | 32 B | Coinbase recipient address |
+| `nonce` | 16 B | 128-bit Blake3 PoW nonce (§18.2) |
+| `difficulty_target` | 32 B | 256-bit ASERT target (§18.3) |
+| `proof_transcript_hash` | 32 B | Fiat-Shamir transcript digest of `BlockProof` |
+| `witness_root` | 32 B | Binius-packed DA witness root |
+| `log_slots` | 4 B | Slot-space depth `k ∈ [24, 32]` |
+| `active_slot_count` | 8 B | Live UTXO count after this block (§15.3) |
+| `alloc_counter` | 8 B | Monotonic PRNG seed after this block (§15.1) |
+| **Total** | **276 B** | |
+
+All fields participate in `H_BLOCK` (capacity IV = `TAG_BLOCKHDR`). New
+fields MUST be appended at the end — field order is locked.
 
 `log_slots` is protocol versioning: AIR arithmetisation (state
 commitment size, slot-index bit-decomposition in `BlockStateBindingAir`,
@@ -471,7 +477,7 @@ The Full Node operates an asynchronous two-process pipeline:
 
 - **Process 1 (Full Node CPU):** Collects TxIntents, generates
   BlockProof (1-3s on 8 cores), forms block header. On completion,
-  pushes the 248-byte header to Process 2.
+  pushes the 276-byte header to Process 2.
 - **Process 2 (miner — built-in or external):** Continuously
   brute-forces nonce against `Blake3(header) < difficulty_target`.
   On valid nonce, returns it to Process 1 for block publication.
@@ -491,7 +497,7 @@ On finding a new block (own or received from network):
 
 The coinbase address is embedded in the DA Payload, which determines
 `da_root`, which is committed in the header, which is proven by the
-BlockProof. An external miner receiving only the 248-byte header
+BlockProof. An external miner receiving only the 276-byte header
 CANNOT change the coinbase address without regenerating the entire
 BlockProof — a CPU-intensive operation they do not perform.
 
@@ -961,29 +967,46 @@ oscillation: a one-block spam spike does NOT trigger expansion.
 
 #### 15.3.7 Expansion procedure (trigger block producer)
 
-Expansion appends a zero sub-tree to the end of the state. The Merkle
-root of an all-zero sub-tree is a pre-computed constant
-`ZERO_SUBTREE_ROOT[k]` (one per depth `k`).
-
-The new state root is computed with one Poseidon2b compression:
+Expansion doubles `num_segments` in the segment-Merkle tree. The new
+upper half is entirely virtual zero (no allocation). The new global
+state root is computed with **one Poseidon2b compression**:
 
 ```
+  old_depth = old_log_slots - LOG_SEGMENT_SIZE
+
   new_state_root =
-      Poseidon2b( old_state_root,
-                  ZERO_SUBTREE_ROOT[old_log_slots] )
+      compress( old_state_root,
+                ZERO_SEGTREE_NODE[old_depth] )
 ```
 
-Plus `log_slots += 1` in the header. No state re-hashing.
+where `ZERO_SEGTREE_NODE[d]` is the Poseidon2b Merkle root of a
+perfectly balanced tree of depth `d` whose every leaf is the FRI
+combined root of an all-zero `2^LOG_SEGMENT_SIZE`-slot segment. These
+are precomputed constants:
+
+```
+  ZERO_SEGTREE_NODE[0] = FRI_combined_root(all_zero_segment)
+  ZERO_SEGTREE_NODE[d] = compress(ZERO_SEGTREE_NODE[d-1],
+                                   ZERO_SEGTREE_NODE[d-1])
+```
+
+Implementation: `noid_chain::segmented_state::zero_segtree_node(d)`.
+
+Plus `log_slots += 1` in the header. No state re-hashing. No segment
+column allocation for the new zero half.
+
+> **Note:** The pre-segmentation formula
+> `compress(old_root, ZERO_SUBTREE_ROOT[old_log_slots])` (where the
+> leaf was `[0u8; 32]`) is obsolete. `ZERO_SUBTREE_ROOT` in
+> `noid_poseidon2b` is retained for reference only.
 
 Effect on the allocator on expansion:
 
 ```
-  free_slots         -- unchanged (all existing freed slots remain
-                        valid and keep priority — lowest-first)
-  active_slot_count  -- unchanged (the new zero half adds no live
-                        UTXOs)
+  free_slots         -- unchanged (returned slots stay valid, priority kept)
+  active_slot_count  -- unchanged (new zero segments add no live UTXOs)
   alloc_counter      -- unchanged (monotonic seed continues)
-  fri.num_slots()    -- doubles to 2^new_log_slots; the probe mask
+  num_slots()        -- doubles to 2^new_log_slots; the probe mask
                         becomes (new_cap − 1), so the high bit of
                         splitmix64 is now live
 ```

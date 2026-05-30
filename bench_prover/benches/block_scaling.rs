@@ -240,7 +240,7 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
 
     // Block Prove (this is ONLY block-prover work; wallet proofs are pre-built)
     let t0 = Instant::now();
-    let block_proof = prove_block(prev_state_root, &witnesses, None).expect("prove_block");
+    let block_proof = prove_block(prev_state_root, &witnesses, &[]).expect("prove_block");
     let prove_time = t0.elapsed();
 
     // Block Verify
@@ -251,7 +251,7 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
     let air_refs: Vec<&dyn Air> = fixtures[..n_tx].iter().map(|f| &f.air as &dyn Air).collect();
 
     let t1 = Instant::now();
-    verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, None)
+    verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, &[])
         .expect("verify_block");
     let verify_time = t1.elapsed();
 

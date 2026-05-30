@@ -23,6 +23,12 @@
 //! of such updates in place and returns the new root.
 
 use noid_core::{AdditiveNTT, Block128, TowerField};
+
+/// Segment size used by `SegmentedFriState`.
+/// Each segment independently holds and commits `2^LOG_SEGMENT_SIZE` slots.
+/// When `log_slots <= LOG_SEGMENT_SIZE` (tests), the state is monolithic
+/// (one segment whose size is `2^log_slots`).
+pub const LOG_SEGMENT_SIZE: usize = 16;
 use noid_fri::channel::Channel;
 use noid_fri::hasher::Blake3Hasher;
 use noid_fri::prover::{
@@ -89,13 +95,33 @@ pub struct SlotColumnOpening {
 }
 
 /// A batched opening of a single slot across the three state columns.
+///
+/// With segmented state (`log_slots > LOG_SEGMENT_SIZE`), the FRI opening
+/// targets the segment column (2^LOG_SEGMENT_SIZE elements at `local_idx`).
+/// `merkle_siblings` carries the Poseidon2b path from `seg_root` to
+/// `state_root` for the Kill-Shot proof.
+///
+/// With monolithic state (`log_slots <= LOG_SEGMENT_SIZE`), `segment_id = 0`,
+/// `local_idx = slot_index`, `merkle_siblings` is empty, and
+/// `seg_root == state_root`.
 #[derive(Debug, Clone)]
 pub struct SlotOpening {
     pub slot_index: u32,
     pub log_slots: usize,
+    /// Which segment `slot_index` belongs to (= slot_index >> effective_log_seg).
+    pub segment_id: u16,
+    /// Local index within the segment (= slot_index & (segment_size - 1)).
+    pub local_idx: u16,
     pub values: SlotColumnOpening,
     pub owners_hi: SlotColumnOpening,
     pub owners_lo: SlotColumnOpening,
+    /// FRI combined root for this segment alone.
+    pub seg_root: StateRoot,
+    /// Poseidon2b Merkle siblings from seg_root up to state_root.
+    /// Empty when num_segments == 1 (single-segment / test mode).
+    pub merkle_siblings: Vec<StateRoot>,
+    /// Global state root at open time.
+    pub state_root: StateRoot,
 }
 
 impl SlotOpening {
@@ -106,6 +132,12 @@ impl SlotOpening {
             owner_hi: self.owners_hi.value,
             owner_lo: self.owners_lo.value,
         }
+    }
+
+    /// Effective log segment size (min of log_slots and LOG_SEGMENT_SIZE).
+    #[inline]
+    pub fn effective_log_seg(&self) -> usize {
+        self.log_slots.min(LOG_SEGMENT_SIZE)
     }
 }
 
@@ -222,9 +254,11 @@ impl FriState {
         (&self.values, &self.owners_hi, &self.owners_lo)
     }
 
-    /// Open a single slot. Produces a per-column FRI opening for each of
-    /// the three state columns, all at the same evaluation point
-    /// `eval_point_for_index(idx, log_slots)`.
+    /// Open a single slot.
+    ///
+    /// In the FriState (monolithic / single-segment) context, `segment_id = 0`,
+    /// `local_idx = idx`, and `merkle_siblings` is empty — the single-segment
+    /// degenerate case used by tests with small log_slots.
     pub fn open(&self, idx: u32) -> Result<SlotOpening, StateError> {
         if (idx as u64) >= self.num_slots() {
             return Err(StateError::SlotOutOfRange);
@@ -233,12 +267,23 @@ impl FriState {
         let values = open_column(self.log_slots, &self.values, &point);
         let owners_hi = open_column(self.log_slots, &self.owners_hi, &point);
         let owners_lo = open_column(self.log_slots, &self.owners_lo, &point);
+        let seg_root = combine_roots(
+            self.log_slots,
+            &values.commitment.vector_commitment.root,
+            &owners_hi.commitment.vector_commitment.root,
+            &owners_lo.commitment.vector_commitment.root,
+        );
         Ok(SlotOpening {
             slot_index: idx,
             log_slots: self.log_slots,
+            segment_id: 0,
+            local_idx: idx as u16,
             values,
             owners_hi,
             owners_lo,
+            seg_root,
+            merkle_siblings: vec![],
+            state_root: seg_root,
         })
     }
 
@@ -260,6 +305,21 @@ pub fn eval_point_for_index(idx: u32, log_slots: usize) -> Vec<Block128> {
     (0..log_slots)
         .map(|i| {
             if (idx >> i) & 1 == 1 {
+                Block128::ONE
+            } else {
+                Block128::ZERO
+            }
+        })
+        .collect()
+}
+
+/// Evaluation point for a segment-local index (`local_idx` within a 2^`log_size` segment).
+/// Identical logic to `eval_point_for_index` but operates on the local index only.
+/// Used by `SegmentedFriState` where each segment is a `2^log_size`-element column.
+pub fn eval_point_for_local_index(local_idx: u16, log_size: usize) -> Vec<Block128> {
+    (0..log_size)
+        .map(|i| {
+            if (local_idx >> i) & 1 == 1 {
                 Block128::ONE
             } else {
                 Block128::ZERO
@@ -295,36 +355,71 @@ fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
     buf[0]
 }
 
-/// Verify a single-slot opening against a claimed `StateRoot`. The
-/// verifier re-derives the combined root from the per-column FRI roots
-/// inside the opening and checks every column's FRI proof.
+/// Verify a single-slot opening against a claimed `StateRoot`.
+///
+/// Steps:
+/// 1. Verify three per-column FRI openings at the segment-local eval point.
+/// 2. Re-derive `seg_root` from the per-column FRI roots and check it.
+/// 3. If `merkle_siblings` is non-empty, verify the Poseidon2b Merkle path
+///    from `seg_root` to `state_root`. Otherwise, assert `seg_root == state_root`.
 pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotValue, StateError> {
     if (op.slot_index as u64) >= (1u64 << op.log_slots) {
         return Err(StateError::SlotOutOfRange);
     }
-    let point = eval_point_for_index(op.slot_index, op.log_slots);
+    let eff_log = op.effective_log_seg();
+    // Step 1: FRI column openings at the segment-local eval point.
+    let point = eval_point_for_local_index(op.local_idx, eff_log);
     for col in [&op.values, &op.owners_hi, &op.owners_lo] {
-        if col.commitment.log_len != op.log_slots {
+        if col.commitment.log_len != eff_log {
             return Err(StateError::OpeningFailed);
         }
-        let ntt = AdditiveNTT::<Block128>::new(op.log_slots + noid_fri::code::LOG_RATE);
+        let ntt = AdditiveNTT::<Block128>::new(eff_log + noid_fri::code::LOG_RATE);
         let hasher = Blake3Hasher::new();
         let mut ch = Channel::new();
         ch.observe_fri_commitment(&col.commitment);
         fri_verify(&point, col.value, col.proof.clone(), &ntt, &mut ch, &hasher)
             .map_err(|_| StateError::OpeningFailed)?;
     }
-
-    let combined: StateRoot = combine_roots(
-        op.log_slots,
+    // Step 2: Verify seg_root.
+    let derived_seg_root: StateRoot = combine_roots(
+        eff_log,
         &op.values.commitment.vector_commitment.root,
         &op.owners_hi.commitment.vector_commitment.root,
         &op.owners_lo.commitment.vector_commitment.root,
     );
-    if combined != *state_root {
+    if derived_seg_root != op.seg_root {
         return Err(StateError::OpeningFailed);
     }
+    // Step 3: Merkle path from seg_root to state_root.
+    if op.merkle_siblings.is_empty() {
+        // Single-segment: state_root IS the seg_root.
+        if op.seg_root != *state_root {
+            return Err(StateError::OpeningFailed);
+        }
+    } else {
+        let computed = merkle_root_from_leaf(&op.seg_root, op.segment_id, &op.merkle_siblings);
+        if computed != *state_root {
+            return Err(StateError::OpeningFailed);
+        }
+    }
     Ok(op.slot())
+}
+
+/// Walk a Poseidon2b Merkle path from `leaf` (at position `seg_id`) upward
+/// through `siblings` (bottom-up order) to compute the expected root.
+pub fn merkle_root_from_leaf(leaf: &StateRoot, seg_id: u16, siblings: &[StateRoot]) -> StateRoot {
+    use noid_poseidon2b::native::compress;
+    let mut current = *leaf;
+    let mut idx = seg_id as usize;
+    for sib in siblings {
+        current = if idx % 2 == 0 {
+            compress(&current, sib)
+        } else {
+            compress(sib, &current)
+        };
+        idx >>= 1;
+    }
+    current
 }
 
 // ---------------------------------------------------------------------------

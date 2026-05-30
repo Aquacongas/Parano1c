@@ -63,9 +63,11 @@ pub struct BlockPublicMeta {
     pub log_rows: u32,
     /// Number of block-level spine state slices committed to FRI.
     pub n_block_spine_slices: u32,
-    /// Number of state binding AIR columns (0 if no state binding).
+    /// Number of state binding AIR instances (one per touched segment; 0 = no state binding).
+    pub n_state_bindings: u32,
+    /// Number of columns per state binding AIR instance (0 if none).
     pub state_binding_n_cols: u32,
-    /// Log-rows of the state binding AIR (may differ from per-tx log_rows).
+    /// Log-rows of each state binding AIR instance.
     pub state_binding_log_rows: u32,
 }
 
@@ -86,10 +88,9 @@ pub struct BlockProof {
     pub tx_auth_proofs: Vec<AuthProofKillShot>,
     /// Algebraic STARK transcripts — no FRI, one per tx.
     pub tx_algebraic: Vec<AlgebraicStarkProof>,
-    /// Algebraic STARK transcript for BlockStateBindingAir (None if no state binding).
-    pub state_binding_algebraic: Option<AlgebraicStarkProof>,
-    /// Number of columns in the state binding AIR (0 if absent).
-    pub state_binding_n_cols: u32,
+    /// Algebraic STARK transcripts for state binding AIRs (one per touched segment).
+    /// Empty when there is no state binding.
+    pub state_binding_algebraics: Vec<AlgebraicStarkProof>,
     /// Per-tx column openings at the per-tx terminal points r''_k.
     /// Flat layout: `block_col_openings[k*n_per_tx .. (k+1)*n_per_tx]`.
     /// Block spine slices follow, then state binding.
@@ -104,6 +105,11 @@ impl BlockProof {
     pub fn byte_len(&self) -> usize {
         let cap = self.commitment.cap.hashes.len() * 32;
         let alg: usize = self.tx_algebraic.iter().map(|a| a.byte_len()).sum();
+        let sb_alg: usize = self
+            .state_binding_algebraics
+            .iter()
+            .map(|a| a.byte_len())
+            .sum();
         let spine = self.block_spine_proof.byte_len();
         let auth: usize = self.tx_auth_proofs.iter().map(|a| a.byte_len()).sum();
         let col_open = self.block_col_openings.len() * 16;
@@ -113,7 +119,7 @@ impl BlockProof {
             .map(|r| r.len() * 16)
             .sum();
         let mixed = self.mixed_opening.byte_len();
-        cap + alg + spine + auth + col_open + mp + mixed
+        cap + alg + sb_alg + spine + auth + col_open + mp + mixed
     }
 }
 
@@ -219,7 +225,7 @@ fn build_auth_slice_claims(
 pub fn prove_block(
     prev_block_state_root: [u8; 32],
     witnesses: &[TxBlockWitness<'_>],
-    state_binding: Option<&StateBindingBlockWitness<'_>>,
+    state_bindings: &[StateBindingBlockWitness<'_>],
 ) -> Result<BlockProof, ProveBlockError> {
     let n_tx = witnesses.len();
     assert!(n_tx >= 1, "block must have at least one transaction");
@@ -302,19 +308,25 @@ pub fn prove_block(
 
     // -------------------------------------------------------------------------
     // Stage 3: Single block-wide interleaved commit.
-    // Layout: [per-tx columns | block spine slices | state binding columns].
+    // Layout: [per-tx columns | block spine slices | state binding columns…].
+    // Multiple state binding AIRs (one per dirty segment) are flattened.
     // -------------------------------------------------------------------------
-    let sb_n_cols = state_binding.map_or(0, |sb| sb.air.n_columns());
-    let sb_log_rows = state_binding.map_or(0, |sb| sb.air.log_rows());
+    let n_state_bindings = state_bindings.len();
+    let sb_n_cols_per_seg = state_bindings.first().map_or(0, |sb| sb.air.n_columns());
+    let sb_log_rows = state_bindings.first().map_or(0, |sb| sb.air.log_rows());
+    let sb_n_cols_total = sb_n_cols_per_seg * n_state_bindings;
 
-    let sb_padded_columns: Vec<Vec<Block128>> = if let Some(sb) = state_binding {
-        sb.columns
-            .iter()
-            .map(|c| noid_stark::pad_column(c, log_len))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Pad all state binding columns (flat across all AIR instances).
+    let sb_padded_columns: Vec<Vec<Block128>> = state_bindings
+        .iter()
+        .flat_map(|sb| {
+            sb.columns
+                .iter()
+                .map(|c| noid_stark::pad_column(c, log_len))
+        })
+        .collect();
+    // Backward compat: use `sb_n_cols` as the total column count for existing calculations.
+    let sb_n_cols = sb_n_cols_total;
 
     // Pad block spine slices to log_len (they may be shorter if num_vars < BASE_LOG).
     let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
@@ -493,40 +505,58 @@ pub fn prove_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 5b: BlockStateBindingAir algebraic STARK (Q.4 dedicated channel).
+    // Stage 5b: BlockStateBindingAir algebraic STARKs — one per segment AIR.
+    //   Q.4: each gets a dedicated channel seeded with (prev_state_root, cap,
+    //   n_tx, segment_index) to avoid sharing with per-tx channels.
     // -------------------------------------------------------------------------
-    let mut sb_algebraic: Option<AlgebraicStarkProof> = None;
-    let mut sb_r_pp: Vec<Block128> = Vec::new();
+    let empty_pi = PublicInputs {
+        epoch_anchor: [0u8; 32],
+        tx_body_hash: TxBodyHash([0u8; 32]),
+        fee: 0,
+        n_live_inputs: 0,
+        n_live_outputs: 0,
+        coinbase_credit: 0,
+        log_slots: 0,
+        claims_commitment: [0u8; 32],
+        is_activation: [false; 8],
+        is_deactivation: [false; 4],
+    };
 
-    if let Some(sb) = state_binding {
-        let empty_pi = PublicInputs {
-            epoch_anchor: [0u8; 32],
-            tx_body_hash: TxBodyHash([0u8; 32]),
-            fee: 0,
-            n_live_inputs: 0,
-            n_live_outputs: 0,
-            coinbase_credit: 0,
-            log_slots: 0,
-            claims_commitment: [0u8; 32],
-            is_activation: [false; 8],
-            is_deactivation: [false; 4],
-        };
-        // Q.4: dedicated state-binding channel avoids sharing with per-tx channels.
-        let mut sb_ch = state_binding_channel(&prev_block_state_root, cap, n_tx as u32);
-        let sb_col_refs: Vec<&[Block128]> =
-            sb_padded_columns.iter().map(|c| c.as_slice()).collect();
-        let (alg, r_pp_sb, _claim_sb, _lambdas_sb) = prove_air_interleaved_algebraic(
-            sb.air,
-            &sb_col_refs,
-            &empty_pi,
-            &[], // no extras transcript for state binding
-            &[], // no slice claims (Kill-Shots handle Merkle paths)
-            log_len,
-            &mut sb_ch,
-        );
-        sb_r_pp = r_pp_sb;
-        sb_algebraic = Some(alg);
+    // One algebraic proof + r_pp per state-binding AIR.
+    struct SbResult {
+        alg: AlgebraicStarkProof,
+        r_pp: Vec<Block128>,
     }
+    let sb_results: Vec<SbResult> = state_bindings
+        .iter()
+        .enumerate()
+        .map(|(sb_idx, sb)| {
+            // Channel seed: n_tx + sb_idx distinguishes each segment's channel.
+            let mut sb_ch =
+                state_binding_channel(&prev_block_state_root, cap, (n_tx + sb_idx) as u32);
+            let col_offset = sb_idx * sb_n_cols_per_seg;
+            let sb_col_refs: Vec<&[Block128]> = sb_padded_columns
+                [col_offset..col_offset + sb_n_cols_per_seg]
+                .iter()
+                .map(|c| c.as_slice())
+                .collect();
+            let (alg, r_pp_sb, _, _) = prove_air_interleaved_algebraic(
+                sb.air,
+                &sb_col_refs,
+                &empty_pi,
+                &[],
+                &[],
+                log_len,
+                &mut sb_ch,
+            );
+            SbResult { alg, r_pp: r_pp_sb }
+        })
+        .collect();
+
+    let sb_algebraics: Vec<AlgebraicStarkProof> =
+        sb_results.iter().map(|r| r.alg.clone()).collect();
+    // r_pp per state-binding AIR — used in the multipoint sumcheck below.
+    let sb_r_pp_list: Vec<Vec<Block128>> = sb_results.into_iter().map(|r| r.r_pp).collect();
 
     // -------------------------------------------------------------------------
     // Q.4a: Segmented Transcript Absorption.
@@ -566,12 +596,11 @@ pub fn prove_block(
     //   n_tx: block spine slices participant (opened at spine_r_low)
     //   n_tx+1: state binding (if present)
     // -------------------------------------------------------------------------
-    let has_spine_participant = true; // always
-    let n_participants = n_tx
-        + if has_spine_participant { 1 } else { 0 }
-        + if state_binding.is_some() { 1 } else { 0 };
+    // One participant per state binding AIR (segment), plus spine and per-tx.
+    let n_participants = n_tx + 1 + n_state_bindings; // +1 for spine
     let spine_participant_idx = n_tx;
-    let sb_participant_idx = n_tx + 1;
+    // State binding participants are at indices n_tx+1 .. n_tx+1+n_state_bindings.
+    let sb_participant_base = n_tx + 1;
 
     // M2: Parallel per-tx column openings with thread-local scratch.
     // Eliminates ~n_tx * n_per_tx * 128 KB = ~1 GB of allocations for 100 txs.
@@ -629,11 +658,14 @@ pub fn prove_block(
                     &mut pt,
                 ));
             }
-            if state_binding.is_some() {
-                for i in 0..sb_n_cols {
+            // State binding columns: one block per AIR instance.
+            for sb_idx in 0..n_state_bindings {
+                let col_offset = sb_idx * sb_n_cols_per_seg;
+                let r_pp = &sb_r_pp_list[sb_idx];
+                for i in 0..sb_n_cols_per_seg {
                     block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
-                        &sb_padded_columns[i],
-                        &sb_r_pp,
+                        &sb_padded_columns[col_offset + i],
+                        r_pp,
                         &mut flat,
                         &mut pt,
                     ));
@@ -657,7 +689,7 @@ pub fn prove_block(
         v
     };
 
-    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols);
+    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols_per_seg);
     let beta_powers: Vec<Block128> = {
         let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
@@ -677,19 +709,22 @@ pub fn prove_block(
                 .fold(Block128::ZERO, |a, b| a + b);
             target += mu_powers[k] * inner;
         }
-        // Block spine participant
+        // Block spine participant.
         let spine_offset = n_tx * n_per_tx;
         let inner_spine: Block128 = (0..n_block_spine_slices)
             .map(|i| beta_powers[i] * block_col_openings[spine_offset + i])
             .fold(Block128::ZERO, |a, b| a + b);
         target += mu_powers[spine_participant_idx] * inner_spine;
-        // State binding participant
-        if sb_n_cols > 0 {
-            let sb_offset = spine_offset + n_block_spine_slices;
-            let inner: Block128 = (0..sb_n_cols)
-                .map(|i| beta_powers[i] * block_col_openings[sb_offset + i])
-                .fold(Block128::ZERO, |a, b| a + b);
-            target += mu_powers[sb_participant_idx] * inner;
+        // State binding participants (one per dirty segment).
+        if sb_n_cols_per_seg > 0 {
+            let sb_base_offset = spine_offset + n_block_spine_slices;
+            for sb_idx in 0..n_state_bindings {
+                let col_offset = sb_base_offset + sb_idx * sb_n_cols_per_seg;
+                let inner: Block128 = (0..sb_n_cols_per_seg)
+                    .map(|i| beta_powers[i] * block_col_openings[col_offset + i])
+                    .fold(Block128::ZERO, |a, b| a + b);
+                target += mu_powers[sb_participant_base + sb_idx] * inner;
+            }
         }
         target
     };
@@ -697,9 +732,9 @@ pub fn prove_block(
     // Collect all r_pp points for all participants.
     let all_r_pp: Vec<&[Block128]> = {
         let mut v: Vec<&[Block128]> = tx_r_pp.iter().map(|r| r.as_slice()).collect();
-        v.push(&spine_r_low); // block spine participant
-        if sb_n_cols > 0 {
-            v.push(&sb_r_pp);
+        v.push(&spine_r_low); // block spine
+        for r in &sb_r_pp_list {
+            v.push(r.as_slice()); // one per state binding AIR
         }
         v
     };
@@ -750,10 +785,13 @@ pub fn prove_block(
                 }
                 b_k
             } else {
+                // State binding participant k → segment index sb_idx.
+                let sb_idx = k - sb_participant_base;
+                let col_offset = sb_idx * sb_n_cols_per_seg;
                 let mut b_k = vec![Block128::ZERO; hyper_len];
-                for i in 0..sb_n_cols {
+                for i in 0..sb_n_cols_per_seg {
                     let lam = beta_powers[i];
-                    let col = sb_padded_columns[i].as_slice();
+                    let col = sb_padded_columns[col_offset + i].as_slice();
                     b_k.iter_mut()
                         .zip(col.iter())
                         .for_each(|(acc, &v)| *acc += lam * v);
@@ -802,7 +840,8 @@ pub fn prove_block(
             n_auth_slices_per_tx: n_auth_slices as u32,
             log_rows: witnesses[0].trace.log_rows as u32,
             n_block_spine_slices: n_block_spine_slices as u32,
-            state_binding_n_cols: sb_n_cols as u32,
+            n_state_bindings: n_state_bindings as u32,
+            state_binding_n_cols: sb_n_cols_per_seg as u32,
             state_binding_log_rows: sb_log_rows as u32,
         },
         commitment,
@@ -810,8 +849,7 @@ pub fn prove_block(
         block_spine_proof,
         tx_auth_proofs,
         tx_algebraic,
-        state_binding_algebraic: sb_algebraic,
-        state_binding_n_cols: sb_n_cols as u32,
+        state_binding_algebraics: sb_algebraics,
         block_col_openings,
         block_multipoint_rounds: block_mp_rounds,
         mixed_opening,
@@ -828,7 +866,7 @@ pub fn verify_block(
     proof: &BlockProof,
     spine_inputs_list: &[SpineInputs],
     auth_public_list: &[AuthPublicInputs],
-    state_binding_air: Option<&BlockStateBindingAir>,
+    state_binding_airs: &[&BlockStateBindingAir],
 ) -> Result<(), VerifyBlockError> {
     let meta = &proof.meta;
     let n_tx = meta.n_tx as usize;
@@ -836,13 +874,15 @@ pub fn verify_block(
     let n_auth_slices = meta.n_auth_slices_per_tx as usize;
     let n_per_tx = n_air_cols + n_auth_slices;
     let n_block_spine_slices = meta.n_block_spine_slices as usize;
-    let sb_n_cols = meta.state_binding_n_cols as usize;
+    let n_state_bindings = meta.n_state_bindings as usize;
+    let sb_n_cols_per_seg = meta.state_binding_n_cols as usize;
+    let sb_n_cols_total = sb_n_cols_per_seg * n_state_bindings;
     let log_len = noid_stark::padded_log_len(meta.log_rows as usize);
-    let has_state_binding = sb_n_cols > 0;
-    let n_participants = n_tx + 1 + if has_state_binding { 1 } else { 0 };
+    let has_state_binding = n_state_bindings > 0;
+    let n_participants = n_tx + 1 + n_state_bindings;
     let spine_participant_idx = n_tx;
-    let sb_participant_idx = n_tx + 1;
-    let total_committed_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
+    let sb_participant_base = n_tx + 1;
+    let total_committed_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols_total;
 
     if airs.len() != n_tx {
         return Err(VerifyBlockError::ShapeMismatch);
@@ -853,6 +893,7 @@ pub fn verify_block(
     if proof.tx_pis.len() != n_tx
         || proof.tx_auth_proofs.len() != n_tx
         || proof.tx_algebraic.len() != n_tx
+        || proof.state_binding_algebraics.len() != n_state_bindings
         || proof.block_col_openings.len() != total_committed_cols
         || spine_inputs_list.len() != n_tx
         || auth_public_list.len() != n_tx
@@ -862,15 +903,14 @@ pub fn verify_block(
     if proof.commitment.n_cols != total_committed_cols {
         return Err(VerifyBlockError::ShapeMismatch);
     }
-    if has_state_binding && state_binding_air.is_none() {
+    if has_state_binding && state_binding_airs.len() != n_state_bindings {
         return Err(VerifyBlockError::ShapeMismatch);
     }
     if has_state_binding {
-        if proof.state_binding_algebraic.is_none() {
-            return Err(VerifyBlockError::ShapeMismatch);
-        }
-        if state_binding_air.unwrap().n_columns() != sb_n_cols {
-            return Err(VerifyBlockError::ShapeMismatch);
+        for sb_air in state_binding_airs {
+            if sb_air.n_columns() != sb_n_cols_per_seg {
+                return Err(VerifyBlockError::ShapeMismatch);
+            }
         }
     }
 
@@ -1000,31 +1040,30 @@ pub fn verify_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 2b: State binding algebraic STARK (Q.4 dedicated channel).
+    // Stage 2b: State binding algebraic STARKs — one per segment AIR.
     // -------------------------------------------------------------------------
-    let mut sb_r_pp: Vec<Block128> = Vec::new();
-
-    if has_state_binding {
-        let sb_air = state_binding_air.unwrap();
-        let sb_alg = proof.state_binding_algebraic.as_ref().unwrap();
-        let empty_pi = PublicInputs {
-            epoch_anchor: [0u8; 32],
-            tx_body_hash: TxBodyHash([0u8; 32]),
-            fee: 0,
-            n_live_inputs: 0,
-            n_live_outputs: 0,
-            coinbase_credit: 0,
-            log_slots: 0,
-            claims_commitment: [0u8; 32],
-            is_activation: [false; 8],
-            is_deactivation: [false; 4],
-        };
-        // Q.4: mirror the prover's state_binding_channel.
-        let mut sb_ch = state_binding_channel(&meta.prev_block_state_root, cap, n_tx as u32);
-        let (r_pp_sb, _final_claim_sb, _lambdas_sb) =
-            verify_air_interleaved_algebraic(sb_air, &empty_pi, sb_alg, &[], &[], &mut sb_ch)
-                .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx, e))?;
-        sb_r_pp = r_pp_sb;
+    let empty_pi_sb = PublicInputs {
+        epoch_anchor: [0u8; 32],
+        tx_body_hash: TxBodyHash([0u8; 32]),
+        fee: 0,
+        n_live_inputs: 0,
+        n_live_outputs: 0,
+        coinbase_credit: 0,
+        log_slots: 0,
+        claims_commitment: [0u8; 32],
+        is_activation: [false; 8],
+        is_deactivation: [false; 4],
+    };
+    let mut sb_r_pp_list: Vec<Vec<Block128>> = Vec::with_capacity(n_state_bindings);
+    for sb_idx in 0..n_state_bindings {
+        let sb_air = state_binding_airs[sb_idx];
+        let sb_alg = &proof.state_binding_algebraics[sb_idx];
+        let mut sb_ch =
+            state_binding_channel(&meta.prev_block_state_root, cap, (n_tx + sb_idx) as u32);
+        let (r_pp_sb, _, _) =
+            verify_air_interleaved_algebraic(sb_air, &empty_pi_sb, sb_alg, &[], &[], &mut sb_ch)
+                .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx + sb_idx, e))?;
+        sb_r_pp_list.push(r_pp_sb);
     }
 
     // -------------------------------------------------------------------------
@@ -1070,7 +1109,7 @@ pub fn verify_block(
         v
     };
 
-    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols);
+    let max_cols = n_per_tx.max(n_block_spine_slices).max(sb_n_cols_per_seg);
     let beta_powers: Vec<Block128> = {
         let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
@@ -1094,11 +1133,14 @@ pub fn verify_block(
             .fold(Block128::ZERO, |a, b| a + b);
         target += mu_powers[spine_participant_idx] * inner_spine;
         if has_state_binding {
-            let sb_off = spine_offset + n_block_spine_slices;
-            let inner: Block128 = (0..sb_n_cols)
-                .map(|i| beta_powers[i] * proof.block_col_openings[sb_off + i])
-                .fold(Block128::ZERO, |a, b| a + b);
-            target += mu_powers[sb_participant_idx] * inner;
+            let sb_base_off = spine_offset + n_block_spine_slices;
+            for sb_idx in 0..n_state_bindings {
+                let col_off = sb_base_off + sb_idx * sb_n_cols_per_seg;
+                let inner: Block128 = (0..sb_n_cols_per_seg)
+                    .map(|i| beta_powers[i] * proof.block_col_openings[col_off + i])
+                    .fold(Block128::ZERO, |a, b| a + b);
+                target += mu_powers[sb_participant_base + sb_idx] * inner;
+            }
         }
         target
     };
@@ -1159,15 +1201,18 @@ pub fn verify_block(
         inner_spine += beta_powers[i] * m[spine_offset + i];
     }
     expected += mu_powers[spine_participant_idx] * eq_spine * inner_spine;
-    // State binding participant
+    // State binding participants (one per segment).
     if has_state_binding {
-        let eq_sb = noid_core::mle::eq::eq_ind(&sb_r_pp, &r_block);
-        let sb_off = spine_offset + n_block_spine_slices;
-        let mut inner = Block128::ZERO;
-        for i in 0..sb_n_cols {
-            inner += beta_powers[i] * m[sb_off + i];
+        let sb_base_off = spine_offset + n_block_spine_slices;
+        for sb_idx in 0..n_state_bindings {
+            let eq_sb = noid_core::mle::eq::eq_ind(&sb_r_pp_list[sb_idx], &r_block);
+            let col_off = sb_base_off + sb_idx * sb_n_cols_per_seg;
+            let mut inner = Block128::ZERO;
+            for i in 0..sb_n_cols_per_seg {
+                inner += beta_powers[i] * m[col_off + i];
+            }
+            expected += mu_powers[sb_participant_base + sb_idx] * eq_sb * inner;
         }
-        expected += mu_powers[sb_participant_idx] * eq_sb * inner;
     }
     if expected != block_final_claim {
         return Err(VerifyBlockError::BlockMultipoint);

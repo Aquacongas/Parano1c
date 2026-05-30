@@ -17,7 +17,17 @@ fn put_digest(buf: &mut Vec<u8>, d: &[u8; 32]) {
 }
 
 #[inline]
+fn put_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
 fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn put_u128(buf: &mut Vec<u8>, v: u128) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -40,21 +50,15 @@ fn take_digest(src: &mut &[u8]) -> Result<[u8; 32], WireError> {
 }
 
 #[inline]
+fn take_u32(src: &mut &[u8]) -> Result<u32, WireError> {
+    let bytes = take(src, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[inline]
 fn take_u64(src: &mut &[u8]) -> Result<u64, WireError> {
     let bytes = take(src, 8)?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-/// Wire size of a [`BlockHeader`]:
-/// 7 digests (prev_block_hash, state_root, tx_root, difficulty_target,
-///   proof_transcript_hash, witness_root, miner_address=32B)
-/// + timestamp(8) + height(8) + nonce(16)
-/// = 7×32 + 8 + 8 + 16 = 256 bytes.
-pub const BLOCK_HEADER_WIRE_SIZE: usize = 7 * 32 + 8 + 8 + 16;
-
-#[inline]
-fn put_u128(buf: &mut Vec<u8>, v: u128) {
-    buf.extend_from_slice(&v.to_le_bytes());
 }
 
 #[inline]
@@ -62,6 +66,42 @@ fn take_u128(src: &mut &[u8]) -> Result<u128, WireError> {
     let bytes = take(src, 16)?;
     Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
 }
+
+/// Wire size of a [`BlockHeader`] in bytes.
+///
+/// Field breakdown (all LE):
+/// ```text
+///   prev_block_hash       32B
+///   state_root            32B
+///   tx_root               32B
+///   timestamp              8B
+///   height                 8B
+///   miner_address         32B
+///   nonce                 16B
+///   difficulty_target     32B
+///   proof_transcript_hash 32B
+///   witness_root          32B
+///   log_slots              4B
+///   active_slot_count      8B
+///   alloc_counter          8B
+///   ─────────────────────────
+///   Total                276B
+/// ```
+pub const BLOCK_HEADER_WIRE_SIZE: usize =
+    32   // prev_block_hash
+    + 32 // state_root
+    + 32 // tx_root
+    + 8  // timestamp
+    + 8  // height
+    + 32 // miner_address
+    + 16 // nonce
+    + 32 // difficulty_target
+    + 32 // proof_transcript_hash
+    + 32 // witness_root
+    + 4  // log_slots
+    + 8  // active_slot_count
+    + 8  // alloc_counter
+    ; // = 276
 
 impl BlockHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -75,11 +115,15 @@ impl BlockHeader {
         put_digest(buf, &self.difficulty_target);
         put_digest(buf, &self.proof_transcript_hash);
         put_digest(buf, &self.witness_root);
+        put_u32(buf, self.log_slots);
+        put_u64(buf, self.active_slot_count);
+        put_u64(buf, self.alloc_counter);
     }
 
     pub fn to_bytes(&self) -> [u8; BLOCK_HEADER_WIRE_SIZE] {
         let mut buf = Vec::with_capacity(BLOCK_HEADER_WIRE_SIZE);
         self.encode(&mut buf);
+        debug_assert_eq!(buf.len(), BLOCK_HEADER_WIRE_SIZE);
         let mut out = [0u8; BLOCK_HEADER_WIRE_SIZE];
         out.copy_from_slice(&buf);
         out
@@ -96,6 +140,9 @@ impl BlockHeader {
         let difficulty_target = take_digest(src)?;
         let proof_transcript_hash = take_digest(src)?;
         let witness_root = take_digest(src)?;
+        let log_slots = take_u32(src)?;
+        let active_slot_count = take_u64(src)?;
+        let alloc_counter = take_u64(src)?;
         Ok(Self {
             prev_block_hash,
             state_root,
@@ -107,6 +154,9 @@ impl BlockHeader {
             difficulty_target,
             proof_transcript_hash,
             witness_root,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
         })
     }
 
@@ -136,7 +186,17 @@ mod tests {
             difficulty_target: [0x77u8; 32],
             proof_transcript_hash: [0x55u8; 32],
             witness_root: [0x66u8; 32],
+            log_slots: 24,
+            active_slot_count: 7_777,
+            alloc_counter: 8_888,
         }
+    }
+
+    #[test]
+    fn wire_size_constant_is_correct() {
+        assert_eq!(BLOCK_HEADER_WIRE_SIZE, 276);
+        let h = hdr();
+        assert_eq!(h.to_bytes().len(), BLOCK_HEADER_WIRE_SIZE);
     }
 
     #[test]
@@ -153,7 +213,10 @@ mod tests {
         let h = hdr();
         let bytes = h.to_bytes();
         for cut in 0..bytes.len() {
-            assert!(BlockHeader::from_bytes(&bytes[..cut]).is_err());
+            assert!(
+                BlockHeader::from_bytes(&bytes[..cut]).is_err(),
+                "truncation at {cut} should error"
+            );
         }
     }
 
@@ -163,5 +226,17 @@ mod tests {
         let mut v = h.to_bytes().to_vec();
         v.push(0);
         assert_eq!(BlockHeader::from_bytes(&v), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn new_fields_survive_roundtrip() {
+        let mut h = hdr();
+        h.log_slots = 27;
+        h.active_slot_count = u64::MAX;
+        h.alloc_counter = 123_456_789;
+        let back = BlockHeader::from_bytes(&h.to_bytes()).unwrap();
+        assert_eq!(back.log_slots, 27);
+        assert_eq!(back.active_slot_count, u64::MAX);
+        assert_eq!(back.alloc_counter, 123_456_789);
     }
 }

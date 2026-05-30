@@ -55,6 +55,13 @@ pub enum BlockApplyError {
     HeaderStateRootMismatch,
     /// `header.tx_root` disagrees with the computed tx-root.
     HeaderTxRootMismatch,
+    /// `header.active_slot_count` disagrees with the post-apply chain count.
+    /// (SPECIFICATION.md §15.3.3, §16 invariant 10)
+    HeaderActiveSlotCountMismatch,
+    /// `header.alloc_counter` disagrees with the post-apply allocator seed.
+    HeaderAllocCounterMismatch,
+    /// `header.log_slots` disagrees with the chain's current slot depth.
+    HeaderLogSlotsMismatch,
 }
 
 impl From<ApplyError> for BlockApplyError {
@@ -119,6 +126,15 @@ pub fn apply_block(
 
     if block.header.state_root != snap.state_root() {
         return Err(BlockApplyError::HeaderStateRootMismatch);
+    }
+    if block.header.active_slot_count != snap.active_slot_count {
+        return Err(BlockApplyError::HeaderActiveSlotCountMismatch);
+    }
+    if block.header.alloc_counter != snap.alloc_counter {
+        return Err(BlockApplyError::HeaderAllocCounterMismatch);
+    }
+    if block.header.log_slots != snap.state.log_slots() as u32 {
+        return Err(BlockApplyError::HeaderLogSlotsMismatch);
     }
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(BlockApplyError::HeaderTxRootMismatch);
@@ -242,6 +258,31 @@ mod tests {
 
     const TEST_LOG_SLOTS: usize = 6;
 
+    /// Build a `BlockHeader` with the correct consensus fields for `snap`
+    /// after applying `txs`. Sets a non-zero `proof_transcript_hash` and
+    /// `witness_root` to satisfy the non-zero guards in `apply_block`.
+    fn mk_header(snap: &ChainState, txs: &[Transaction]) -> BlockHeader {
+        let mut dry = snap.clone();
+        for tx in txs {
+            apply_tx(&mut dry, &tx.body).unwrap();
+        }
+        BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: dry.state_root(),
+            tx_root: compute_tx_root(txs),
+            timestamp: 1,
+            height: 1,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            difficulty_target: [0xFFu8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
+            log_slots: TEST_LOG_SLOTS as u32,
+            active_slot_count: dry.active_slot_count,
+            alloc_counter: dry.alloc_counter,
+        }
+    }
+
     fn fresh_state() -> ChainState {
         ChainState::with_log_slots(TEST_LOG_SLOTS)
     }
@@ -300,37 +341,12 @@ mod tests {
         let tx1 = build_tx(&mut state, vec![], vec![minted]);
         let mut probe = state.clone();
         apply_tx(&mut probe, &tx1.body).unwrap();
-        // Stage E.1: the wallet chose the mint's slot, so tx2 spends
-        // at exactly `minted.slot_index`.
         let spend = mk_input_for(minted.slot_index, &minted);
         let tx2 = build_tx(&mut probe, vec![spend], vec![mk_output(3)]);
-
         let txs = vec![tx1, tx2];
-        let tx_root = compute_tx_root(&txs);
 
-        let mut dry = state.clone();
-        let mut last = StateTransition {
-            new_state_root: dry.state_root(),
-        };
-        for tx in &txs {
-            last = apply_tx(&mut dry, &tx.body).unwrap();
-        }
-        let st_final = last;
-
-        let header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: st_final.new_state_root,
-            tx_root,
-            timestamp: 1,
-            height: 1,
-            miner_address: Address([9u8; 32]),
-            nonce: 0,
-            difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [2u8; 32],
-        };
         let block = Block {
-            header,
+            header: mk_header(&state, &txs),
             transactions: txs,
         };
         let out = apply_block(&mut state, &block).expect("apply");
@@ -341,23 +357,12 @@ mod tests {
     fn apply_block_rejects_wrong_tx_root() {
         let mut state = fresh_state();
         let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let mut probe = state.clone();
-        let st = apply_tx(&mut probe, &tx.body).unwrap();
-        let header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: st.new_state_root,
-            tx_root: [0xFFu8; 32],
-            timestamp: 1,
-            height: 1,
-            miner_address: Address([9u8; 32]),
-            nonce: 0,
-            difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [2u8; 32],
-        };
+        let txs = vec![tx];
+        let mut header = mk_header(&state, &txs);
+        header.tx_root = [0xFFu8; 32]; // deliberately wrong
         let block = Block {
             header,
-            transactions: vec![tx],
+            transactions: txs,
         };
         assert_eq!(
             apply_block(&mut state, &block),
@@ -371,25 +376,15 @@ mod tests {
     fn apply_block_rejects_wrong_tx_body_hash() {
         let mut state = fresh_state();
         let mut tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        tx.tx_body_hash.0[0] ^= 1;
-
-        let header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: [0u8; 32],
-            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-            timestamp: 1,
-            height: 1,
-            miner_address: Address([9u8; 32]),
-            nonce: 0,
-            difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [2u8; 32],
-        };
+        tx.tx_body_hash.0[0] ^= 1; // corrupt hash — fails before header checks
+                                   // Use mk_header on the valid tx list but with the tampered hash;
+                                   // state_root / active_slot_count don't matter since we fail earlier.
+        let txs = vec![tx];
+        let header = mk_header(&state, &txs);
         let block = Block {
             header,
-            transactions: vec![tx],
+            transactions: txs,
         };
-
         assert_eq!(
             apply_block(&mut state, &block),
             Err(BlockApplyError::WrongTxBodyHash)
@@ -398,35 +393,12 @@ mod tests {
 
     #[test]
     fn apply_block_accepts_independent_txs() {
-        // Two txs that both use the same epoch_anchor (not chained by
-        // state root) are valid as long as they don't conflict at the
-        // UTXO level.
         let mut state = fresh_state();
         let tx1 = build_tx(&mut state.clone(), vec![], vec![mk_output(1)]);
         let tx2 = build_tx(&mut state.clone(), vec![], vec![mk_output(2)]);
         let txs = vec![tx1, tx2];
-
-        // Compute the actual final state root by replaying.
-        let mut dry = state.clone();
-        for tx in &txs {
-            apply_tx(&mut dry, &tx.body).unwrap();
-        }
-        let final_root = dry.state_root();
-
-        let header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: final_root,
-            tx_root: compute_tx_root(&txs),
-            timestamp: 1,
-            height: 1,
-            miner_address: Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [2u8; 32],
-        };
         let block = Block {
-            header,
+            header: mk_header(&state, &txs),
             transactions: txs,
         };
         apply_block(&mut state, &block).expect("apply");
@@ -447,22 +419,12 @@ mod tests {
     fn apply_block_rejects_missing_proof_transcript_hash() {
         let mut state = fresh_state();
         let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let mut probe = state.clone();
-        let st = apply_tx(&mut probe, &tx.body).unwrap();
+        let txs = vec![tx];
+        let mut header = mk_header(&state, &txs);
+        header.proof_transcript_hash = [0u8; 32]; // zero → missing
         let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: st.new_state_root,
-                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-                timestamp: 42,
-                height: 1,
-                miner_address: Address([7u8; 32]),
-                nonce: 99,
-                difficulty_target: [0xFFu8; 32],
-                proof_transcript_hash: [0u8; 32],
-                witness_root: [2u8; 32],
-            },
-            transactions: vec![tx],
+            header,
+            transactions: txs,
         };
         assert_eq!(
             apply_block(&mut state, &block),
@@ -474,22 +436,12 @@ mod tests {
     fn apply_block_rejects_missing_witness_root() {
         let mut state = fresh_state();
         let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let mut probe = state.clone();
-        let st = apply_tx(&mut probe, &tx.body).unwrap();
+        let txs = vec![tx];
+        let mut header = mk_header(&state, &txs);
+        header.witness_root = [0u8; 32]; // zero → missing
         let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: st.new_state_root,
-                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-                timestamp: 42,
-                height: 1,
-                miner_address: Address([7u8; 32]),
-                nonce: 99,
-                difficulty_target: [0xFFu8; 32],
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [0u8; 32],
-            },
-            transactions: vec![tx],
+            header,
+            transactions: txs,
         };
         assert_eq!(
             apply_block(&mut state, &block),
@@ -501,26 +453,18 @@ mod tests {
     fn block_wire_roundtrip() {
         let mut state = fresh_state();
         let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let mut probe = state.clone();
-        let st = apply_tx(&mut probe, &tx.body).unwrap();
+        let txs = vec![tx];
+        let mut header = mk_header(&state, &txs);
+        header.proof_transcript_hash = proof_transcript_hash(b"hello");
+        header.witness_root = [0xAAu8; 32];
         let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: st.new_state_root,
-                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-                timestamp: 42,
-                height: 1,
-                miner_address: Address([7u8; 32]),
-                nonce: 99,
-                difficulty_target: [0xFFu8; 32],
-                proof_transcript_hash: proof_transcript_hash(b"hello"),
-                witness_root: [0xAAu8; 32],
-            },
-            transactions: vec![tx],
+            header,
+            transactions: txs,
         };
         let bytes = block.to_bytes();
         let back = Block::from_bytes(&bytes).expect("decode");
         assert_eq!(back.header, block.header);
+        assert_eq!(back.header.log_slots, TEST_LOG_SLOTS as u32);
         assert_eq!(back.transactions.len(), block.transactions.len());
         assert_eq!(
             back.transactions[0].tx_body_hash,
@@ -542,6 +486,9 @@ mod tests {
                 difficulty_target: [0xFFu8; 32],
                 proof_transcript_hash: [1u8; 32],
                 witness_root: [2u8; 32],
+                log_slots: 24,
+                active_slot_count: 0,
+                alloc_counter: 0,
             },
             transactions: vec![],
         };
@@ -549,5 +496,4 @@ mod tests {
         bytes.push(0);
         assert_eq!(Block::from_bytes(&bytes), Err(WireError::TrailingBytes));
     }
-
 }

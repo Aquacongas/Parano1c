@@ -341,10 +341,10 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     let prev_state_root = fixtures[0].pi.epoch_anchor;
 
     let prove_block_time = time_once(|| {
-        let _ = prove_block(prev_state_root, &witnesses, None).expect("prove_block");
+        let _ = prove_block(prev_state_root, &witnesses, &[]).expect("prove_block");
     });
 
-    let block_proof = prove_block(prev_state_root, &witnesses, None).expect("prove_block");
+    let block_proof = prove_block(prev_state_root, &witnesses, &[]).expect("prove_block");
     let block_proof_bytes = block_proof.byte_len();
     let per_tx_algebraic_bytes = if !block_proof.tx_algebraic.is_empty() {
         block_proof.tx_algebraic[0].byte_len()
@@ -361,7 +361,7 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     let air_refs: Vec<&dyn Air> = fixtures.iter().map(|f| &f.air as &dyn Air).collect();
 
     let verify_block_time = time_once(|| {
-        verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, None)
+        verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, &[])
             .expect("verify_block");
     });
 

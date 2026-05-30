@@ -35,7 +35,8 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{compute_claims_commitment, TxBody, TxInput, TxOutput};
 
-use crate::fri_state::{FriState, SlotValue, StateRoot};
+use crate::fri_state::{SlotValue, StateRoot};
+use crate::segmented_state::SegmentedFriState;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -47,7 +48,10 @@ pub enum StateBindingError {
     /// An input slot in the state does not contain the claimed value/owner.
     InputMismatch { tx_index: usize, input_index: usize },
     /// An output slot is not empty in the pre-state (occupied).
-    OutputSlotOccupied { tx_index: usize, output_index: usize },
+    OutputSlotOccupied {
+        tx_index: usize,
+        output_index: usize,
+    },
     /// The recomputed C_claimed from opened slots does not match the
     /// tx's PublicInputs.claims_commitment.
     ClaimsCommitmentMismatch { tx_index: usize },
@@ -91,9 +95,9 @@ pub struct BlockStateBinding {
 impl BlockStateBinding {
     /// Build and verify the state binding for a block of transactions.
     ///
-    /// Opens each tx's claimed slots against `state`, verifies the
-    /// pre-conditions, applies the state transition, and checks the
-    /// claims commitment bridge.
+    /// Opens each tx's claimed slots against `state` (a `SegmentedFriState`),
+    /// verifies the pre-conditions, applies the state transition, and checks
+    /// the claims commitment bridge.
     ///
     /// On success, `state` is mutated to reflect all applied txs and
     /// the returned binding contains the opening data.
@@ -119,13 +123,13 @@ impl BlockStateBinding {
     ///
     /// Implementation location: `noid_chain::mempool::admit_tx` (Phase 2).
     pub fn build(
-        state: &mut FriState,
+        state: &mut SegmentedFriState,
         bodies: &[TxBody],
         expected_commitments: &[Digest],
     ) -> Result<Self, StateBindingError> {
         assert_eq!(bodies.len(), expected_commitments.len());
 
-        let prev_state_root = state.root();
+        let prev_state_root = state.root(); // ensures all roots up to date
         let mut tx_openings = Vec::with_capacity(bodies.len());
 
         for (tx_idx, body) in bodies.iter().enumerate() {
@@ -160,13 +164,12 @@ impl BlockStateBinding {
 /// Verify pre-conditions for one tx, apply the state transition, and
 /// verify the claims commitment bridge.
 fn verify_and_apply_tx(
-    state: &mut FriState,
+    state: &mut SegmentedFriState,
     body: &TxBody,
     expected_commitment: Digest,
     tx_idx: usize,
 ) -> Result<TxStateOpening, StateBindingError> {
-    let log_slots = state.log_slots();
-    let n_slots = 1u64 << log_slots;
+    let n_slots = state.num_slots();
 
     // Check output slot uniqueness within this tx
     let mut seen_output_slots = std::collections::HashSet::new();
@@ -269,8 +272,8 @@ mod tests {
     use super::*;
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 
-    fn mk_state() -> FriState {
-        FriState::new_empty(4) // 16 slots for testing
+    fn mk_state() -> SegmentedFriState {
+        SegmentedFriState::new_empty(4) // 16 slots for testing
     }
 
     fn mk_input(slot: u32, value: u64, owner: Address) -> TxInput {
@@ -293,7 +296,7 @@ mod tests {
         }
     }
 
-    fn seed_slot(state: &mut FriState, slot: u32, value: u64, owner: &Address) {
+    fn seed_slot(state: &mut SegmentedFriState, slot: u32, value: u64, owner: &Address) {
         let [hi, lo] = owner.as_fields();
         state
             .set_slot(
@@ -408,8 +411,7 @@ mod tests {
         let c1 = compute_claims_commitment(&tx1.inputs, &tx1.outputs);
         let c2 = compute_claims_commitment(&tx2.inputs, &tx2.outputs);
 
-        let binding =
-            BlockStateBinding::build(&mut state, &[tx1, tx2], &[c1, c2]).unwrap();
+        let binding = BlockStateBinding::build(&mut state, &[tx1, tx2], &[c1, c2]).unwrap();
 
         assert_eq!(binding.tx_openings.len(), 2);
         // Slot 1, 2 now empty; 5, 6 filled
@@ -533,8 +535,7 @@ mod tests {
 
         // Pass a wrong commitment
         let wrong_commitment = [0xDE; 32];
-        let err =
-            BlockStateBinding::build(&mut state, &[body], &[wrong_commitment]).unwrap_err();
+        let err = BlockStateBinding::build(&mut state, &[body], &[wrong_commitment]).unwrap_err();
         assert_eq!(
             err,
             StateBindingError::ClaimsCommitmentMismatch { tx_index: 0 }
@@ -570,10 +571,7 @@ mod tests {
 
         let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
         let err = BlockStateBinding::build(&mut state, &[body], &[commitment]).unwrap_err();
-        assert_eq!(
-            err,
-            StateBindingError::DuplicateOutputSlot { tx_index: 0 }
-        );
+        assert_eq!(err, StateBindingError::DuplicateOutputSlot { tx_index: 0 });
     }
 
     #[test]
@@ -634,8 +632,7 @@ mod tests {
         let c2 = compute_claims_commitment(&tx2.inputs, &tx2.outputs);
 
         // This works because tx2 sees the intermediate state after tx1
-        let binding =
-            BlockStateBinding::build(&mut state, &[tx1, tx2], &[c1, c2]).unwrap();
+        let binding = BlockStateBinding::build(&mut state, &[tx1, tx2], &[c1, c2]).unwrap();
 
         assert_eq!(binding.tx_openings.len(), 2);
         assert_eq!(state.slot(1), SlotValue::EMPTY);

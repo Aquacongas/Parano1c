@@ -23,7 +23,8 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
-use crate::fri_state::{FriState, SlotValue, STATE_LOG_SLOTS};
+use crate::fri_state::{SlotValue, STATE_LOG_SLOTS};
+use crate::segmented_state::SegmentedFriState;
 
 /// Chain-level mutable state.
 ///
@@ -36,7 +37,8 @@ use crate::fri_state::{FriState, SlotValue, STATE_LOG_SLOTS};
 /// outcome of `apply_tx` beyond the free-list pop on a spend.
 #[derive(Debug, Clone)]
 pub struct ChainState {
-    pub fri: FriState,
+    /// Segmented FRI-committed UTXO state (replaces the old monolithic `FriState`).
+    pub state: SegmentedFriState,
     /// Previously-spent indices available for reuse. Min-heap so the
     /// lowest free index is allocated first (deterministic).
     pub free_slots: BinaryHeap<Reverse<u32>>,
@@ -61,29 +63,31 @@ impl ChainState {
     /// to keep the FRI commitment cheap.
     pub fn with_log_slots(log_slots: usize) -> Self {
         Self {
-            fri: FriState::new_empty(log_slots),
+            state: SegmentedFriState::new_empty(log_slots),
             free_slots: BinaryHeap::new(),
             active_slot_count: 0,
             alloc_counter: 0,
         }
     }
 
+    /// Total number of slots in the state vector.
+    pub fn num_slots(&self) -> u64 {
+        self.state.num_slots()
+    }
+
     /// Slots that can still be allocated without a `log_slots` bump.
-    /// Equals the number of empty slots in the FRI vector.
     pub fn available_slots(&self) -> u64 {
-        self.fri.num_slots() - self.active_slot_count
+        self.state.num_slots() - self.active_slot_count
     }
 
     /// Occupancy fraction used by the `log_slots` expansion trigger.
-    /// Uses `active_slot_count`, the number of live UTXOs, so
-    /// reclaimed slots correctly reduce occupancy.
     pub fn occupancy(&self) -> f64 {
-        (self.active_slot_count as f64) / (self.fri.num_slots() as f64)
+        (self.active_slot_count as f64) / (self.state.num_slots() as f64)
     }
 
     #[inline]
     pub fn state_root(&mut self) -> Digest {
-        self.fri.root()
+        self.state.root()
     }
 }
 
@@ -164,7 +168,7 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
 }
 
 fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError> {
-    if (input.slot_index as u64) >= state.fri.num_slots() {
+    if (input.slot_index as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
     let expected = SlotValue {
@@ -172,12 +176,12 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
         owner_hi: input.owner.as_fields()[0],
         owner_lo: input.owner.as_fields()[1],
     };
-    let current = state.fri.slot(input.slot_index);
+    let current = state.state.slot(input.slot_index);
     if current != expected {
         return Err(ApplyError::UnknownOrSpentInput);
     }
     state
-        .fri
+        .state
         .set_slot(input.slot_index, SlotValue::EMPTY)
         .expect("bounds checked above");
     state.free_slots.push(Reverse(input.slot_index));
@@ -190,13 +194,13 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
 
 fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyError> {
     let idx = out.slot_index;
-    if (idx as u64) >= state.fri.num_slots() {
+    if (idx as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
     // Stage E.1 four-corner invariant: the wallet-chosen destination
     // must be empty in prev-state. The STARK's §FriStateOpen proves
     // the same fact in-circuit (Stage E.2 `is_mint ⇒ prev == (0,0,0)`).
-    if state.fri.slot(idx) != SlotValue::EMPTY {
+    if state.state.slot(idx) != SlotValue::EMPTY {
         return Err(ApplyError::OutputSlotNotEmpty);
     }
     let slot = SlotValue {
@@ -204,7 +208,10 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
         owner_hi: out.owner.as_fields()[0],
         owner_lo: out.owner.as_fields()[1],
     };
-    state.fri.set_slot(idx, slot).expect("bounds checked above");
+    state
+        .state
+        .set_slot(idx, slot)
+        .expect("bounds checked above");
     // Bookkeeping: if the wallet picked a previously-spent slot, drop
     // the matching entry from `free_slots` so it is not re-offered as
     // a hint. The heap is small so a linear drain-and-rebuild is fine.
@@ -358,11 +365,7 @@ mod tests {
         apply_tx(&mut state, &body_with(0, vec![], vec![a])).unwrap();
         assert_eq!(state.active_slot_count, 1);
 
-        apply_tx(
-            &mut state,
-            &body_with(0, vec![mk_input_for(7, &a)], vec![]),
-        )
-        .unwrap();
+        apply_tx(&mut state, &body_with(0, vec![mk_input_for(7, &a)], vec![])).unwrap();
         assert_eq!(state.active_slot_count, 0);
         assert_eq!(state.free_slots.len(), 1);
 
@@ -378,18 +381,11 @@ mod tests {
     fn mint_to_occupied_slot_rejects() {
         let mut state = fresh();
         // First mint lands at slot 1.
-        apply_tx(
-            &mut state,
-            &body_with(0, vec![], vec![mk_output_at(1, 1)]),
-        )
-        .unwrap();
+        apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(1, 1)])).unwrap();
 
         // Second mint targeting the same slot must reject.
         assert_eq!(
-            apply_tx(
-                &mut state,
-                &body_with(0, vec![], vec![mk_output_at(1, 2)]),
-            ),
+            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(1, 2)]),),
             Err(ApplyError::OutputSlotNotEmpty),
         );
     }
@@ -400,10 +396,7 @@ mod tests {
         // reject with `SlotOutOfRange`.
         let mut state = ChainState::with_log_slots(1);
         assert_eq!(
-            apply_tx(
-                &mut state,
-                &body_with(0, vec![], vec![mk_output_at(2, 3)]),
-            ),
+            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(2, 3)]),),
             Err(ApplyError::SlotOutOfRange),
         );
     }

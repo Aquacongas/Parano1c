@@ -3,32 +3,36 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Precomputed Poseidon2b digests of all-zero subtrees.
+//! **Legacy table — superseded by Phase 3 segmented state.**
+//!
+//! Precomputed Poseidon2b digests of all-zero raw-byte subtrees.
+//!
+//! This table was designed for the **pre-segmentation monolithic FRI**
+//! architecture where `state_root` was a Poseidon2b tree over raw
+//! `[0u8; 32]` leaves. Under the segmented architecture (Phase 3,
+//! SPECIFICATION.md §19), the segment-tree leaves are FRI combined
+//! roots of all-zero segment columns — a different base value.
+//!
+//! **For the expansion procedure (SPECIFICATION.md §15.3.7), use
+//! `noid_chain::segmented_state::zero_segtree_node(d)` instead.**
+//!
+//! This module is retained for reference and tests that verify the
+//! raw-byte zero-subtree recurrence. No production code path calls it.
+//!
+//! ---
 //!
 //! `zero_subtree_root(k)` returns the root digest of a perfectly
 //! balanced binary Poseidon2b Merkle tree of depth `k` whose every
-//! leaf is `[0u8; 32]`. Defined by the recurrence
+//! leaf is `[0u8; 32]`. Defined by the recurrence:
 //!
 //! ```text
-//! Z[0]   = [0u8; 32]
+//! Z[0]   = [0u8; 32]           ← raw zero bytes (NOT an FRI root)
 //! Z[k+1] = compress(Z[k], Z[k])
 //! ```
 //!
-//! Per `GENERAL_DESIGN §15.3` the state expansion block computes
-//!
-//! ```text
-//! new_state_root = compress(old_state_root, Z[old_log_slots])
-//! ```
-//!
-//! to lift the slot-space Merkle root from depth `k` to `k + 1` in a
-//! single hash (the right half of the fresh level is an all-zero
-//! subtree). `LOG_SLOTS` starts at `24` and may grow to at most `32`,
-//! so the table carries `Z[k]` for `k ∈ [24, 32]`.
-//!
-//! The compression function is not `const`, so values are memoized in
-//! a `OnceLock`. The first call at program start pays the nine
-//! incremental recurrences (`Z[1]` through `Z[32]`); every subsequent
-//! call is a table lookup.
+//! `LOG_SLOTS` starts at 24 and may grow to at most 32, so the table
+//! covers `k ∈ [24, 32]`. The `OnceLock` pays the nine incremental
+//! recurrences on first access; subsequent calls are table lookups.
 
 use std::sync::OnceLock;
 
