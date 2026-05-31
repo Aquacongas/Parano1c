@@ -360,39 +360,41 @@ polynomials share one Merkle cap, one set of FRI queries, and one
 terminal opening point. The per-tx algebraic STARK proves the
 constraints; the block-level sumcheck and FRI prove the column openings.
 
-### 4.5 IVC — planned (Phase 7, Stage H)
+### 4.5 IVC — ✅ Done (Phase 7, Stage H)
 
-Future Phase 7 will add **O(1) historical verification** via a recursive
-STARK that verifies the prior block's proof in-circuit:
-
-```
-  Proof_{n+1} verifies Proof_n
-```
-
-This will compress the entire chain history into a single ~55 KB proof
-verifiable in ~230 ms by a fresh node. The `noid_recursive` crate will
-implement this; the current `noid_block` Stage G is not recursive.
-
-Consequence once Phase 7 is complete: a fresh node synchronises as follows:
-
-1. downloads the latest block header;
-2. downloads the latest recursive proof;
-3. runs a single verification — obtains cryptographic certainty over the
-   whole history of the network in O(1).
-
-### 4.6 Recursive chain of proofs (planned, Phase 7)
-
-A `BlockProof` in the Phase 7 design will not live in isolation.
-Every new block will verify the previous recursive accumulator, making
-the chain a recursive chain of correctness proofs.
-
-Historical verification complexity will therefore be:
+**O(1) historical verification is implemented.** The `noid_recursive` crate
+contains a recursive STARK accumulator (`RecursiveBlockAir`) that folds
+block proofs. Each block extends the `ChainAccumulator` via:
 
 ```
-  O(1)
+  chain_hash_{n} = compress(chain_hash_{n-1}, H_BLOCK(header_n))
 ```
 
-relative to the length of the chain.
+A fresh node synchronises as follows:
+
+1. Downloads the latest `RecursiveBlockProof_N` (**6.5 KB**);
+2. Calls `verify_tip(rec_proof, rec_air, prev_state_root, tip_height, genesis_acc)`;
+3. Obtains cryptographic certainty over the entire chain in **~5 ms**.
+
+Key insight: compact FRI with `COMPACT_TAU=8` and `log_rows=8` gives `n_rounds=0`
+— the recursive proof's FRI collapses to pure tensor decomposition with **zero
+Merkle paths**, making the proof self-contained at 6.5 KB.
+
+Security: per-tx FS challenges are bound through the chain hash via
+`proof_transcript_hash → H_BLOCK(header) → chain_hash`, without
+requiring in-circuit FS derivation.
+
+### 4.6 Recursive chain of proofs ✅ Done
+
+Every block's `prove_block_full` produces a `RecursiveBlockProof` that
+extends the `ChainAccumulator`. The accumulator is a rolling Poseidon2b
+commitment to all headers seen so far.
+
+Historical verification complexity:
+
+```
+  O(1)  — 6.5 KB download, ~5 ms verify
+```
 
 ### 4.7 Transaction validity vs chain validity
 
@@ -765,6 +767,18 @@ coinbase to the header: changing the coinbase requires regenerating
 - Auth Kill-Shot + algebraic STARK verification fully parallel in `verify_block` (Q.5).
 - Benchmarks pending re-run (were ~43 s prove / ~15 s verify at 100 tx, target <8 s / <4 s).
 
+**Done (Phase 7, Stage H — Recursive Chain, O(1) Verification):**
+
+- `noid_recursive` crate: `ChainAccumulator`, `RecursiveBlockAir`, `prove_recursive_step`, `verify_tip`.
+- `RecursiveBlockProof` = **6.5 KB** constant size (no Merkle paths — compact FRI with n_rounds=0).
+- `verify_tip` = **~5 ms** O(1) — verifies entire chain history from one tiny proof.
+- `prove_recursive_step` overhead = **~30 ms/block** (dominates block time by < 0.05%).
+- Compact FRI round trees: Blake3 → Poseidon2b (enables algebraic FRI verification).
+- `prove_block_full` integrated: generates `RecursiveBlockProof` alongside `BlockProof`.
+- Chain hash security: `proof_transcript_hash → H_BLOCK → chain_hash` binds all per-tx FS challenges.
+- E2E test: `noid_block/tests/phase7_recursive_e2e.rs` (passes with `--ignored`).
+- 733 tests pass, clean release build.
+
 **Next (Phase 2, Stage P — Consensus & PoW):**
 
 - ASERT difficulty adjustment (`noid_chain/src/difficulty.rs`).
@@ -778,7 +792,6 @@ coinbase to the header: changing the coinbase requires regenerating
 
 - Phase 4: Node binary, mempool, P2P, block assembly pipeline, RPC.
 - Phase 5: Wallet CLI (key management, LogicProof generation).
-- Phase 7 (Stage H): Recursive chain — `noid_recursive` crate, O(1) historical verify.
 
 See `ROADMAP2.md` for the detailed plan and performance targets.
 

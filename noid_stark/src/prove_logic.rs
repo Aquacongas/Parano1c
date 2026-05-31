@@ -33,8 +33,7 @@ use noid_core::mle::split::{reconstruct_from_slices, split_mle_into_slices};
 use noid_core::Block128;
 use noid_gkr::{
     auth_gkr_channel, build_auth_unified_from_inputs, prove_auth_killshot, verify_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs,
-    N_AUTH_UNIFIED_VARS,
+    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_UNIFIED_VARS,
 };
 use noid_tx::PublicInputs;
 
@@ -160,7 +159,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
 
     // Stage 3: Interleaved commit + AuthGKR
     let ntt = noid_core::AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = noid_fri::hasher::Blake3Hasher::new();
+    let hasher = noid_poseidon2b::native::compression::Poseidon2bSponge::new();
     let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
     let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
 
@@ -289,7 +288,14 @@ pub fn verify_logic(
         });
     }
 
-    verify_air_interleaved(air, pi, &proof.stark, &extras_transcript, &slice_claims, COMPACT_NUM_QUERIES)?;
+    verify_air_interleaved(
+        air,
+        pi,
+        &proof.stark,
+        &extras_transcript,
+        &slice_claims,
+        COMPACT_NUM_QUERIES,
+    )?;
 
     Ok(())
 }

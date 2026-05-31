@@ -12,6 +12,7 @@ members = [
     "noid_binius",
     "noid_gkr",
     "noid_block",
+    "noid_recursive",
 ]
 resolver = "2"
 

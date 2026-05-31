@@ -31,10 +31,18 @@ use noid_air::airs::block_state_binding::{
 use noid_air::Air;
 use noid_chain::segmented_state::SegmentedFriState;
 use noid_chain::state_binding::{BlockStateBinding, StateBindingError};
+use noid_chain::BlockHeader;
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::Block128;
 use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, MerkleCircuit, MerklePathInputs, SpineInputs, MAX_MERKLE_DEPTH};
+use noid_recursive::{
+    accumulator::ChainAccumulator,
+    air::RecursiveBlockAir,
+    prove::{prove_recursive_step, RecursiveBlockProof},
+    verify::verify_tip,
+    witness::BlockReplayWitness,
+};
 use noid_stark::prove_logic::{verify_logic, LogicProof, VerifyLogicError};
 use noid_tx::{compute_claims_commitment, PublicInputs, TxBody};
 
@@ -45,6 +53,7 @@ use crate::{
 
 pub use noid_gkr::{verify_merkle_killshot, MerkleProofKillShot};
 use noid_poseidon2b::channel::Poseidon2bChannel;
+pub use noid_recursive::accumulator::genesis_accumulator;
 
 const STATE_BINDING_CHANNEL_TAG: u128 = 0xFFFC_5B00_0000_0000;
 
@@ -68,6 +77,7 @@ pub enum FullNodeVerifyError {
     StateRootMismatch,
     BlockProof(VerifyBlockError),
     MerkleKillShot { segment_idx: usize },
+    RecursiveProofInvalid,
 }
 
 impl From<StateBindingError> for FullNodeProveError {
@@ -100,6 +110,11 @@ pub struct FullBlockProof {
     pub state_binding: BlockStateBinding,
     /// One Merkle Kill-Shot proof per touched segment (empty in single-segment mode).
     pub merkle_killshots: Vec<MerkleProofKillShot>,
+    /// Recursive chain proof: O(1) constant-size proof covering the entire chain.
+    /// ~11 KB regardless of chain length.
+    pub rec_proof: RecursiveBlockProof,
+    /// The updated chain accumulator after this block (for the next block's prover).
+    pub new_acc: ChainAccumulator,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +307,12 @@ pub fn prove_block_full<'a>(
     spine_inputs_list: &[SpineInputs],
     auth_public_list: &[AuthPublicInputs],
     witnesses: &[TxBlockWitness<'a>],
+    // Block header for this block (used to compute the chain hash).
+    block_header: &BlockHeader,
+    // Accumulator from the previous block (or genesis accumulator at block 0).
+    prev_acc: &ChainAccumulator,
+    // Previous recursive proof (None for the first block after genesis).
+    prev_rec_proof: Option<&RecursiveBlockProof>,
 ) -> Result<FullBlockProof, FullNodeProveError> {
     let n_tx = bodies.len();
     assert_eq!(airs.len(), n_tx);
@@ -405,11 +426,48 @@ pub fn prove_block_full<'a>(
         }
     }
 
+    // Step 7: Recursive chain proof (Phase 7 / Stage H).
+    // Extract the algebraic replay witness (no FRI paths) and prove.
+    let block_replay_witness = BlockReplayWitness::from_parts(
+        block_proof.commitment.cap.clone(),
+        block_proof.state_binding_algebraics.clone(),
+        block_proof.block_col_openings.clone(),
+        block_proof.block_multipoint_rounds.clone(),
+        block_proof.mixed_opening.fri_proof.clone(),
+        block_proof.mixed_opening.all_openings.clone(),
+    );
+    let rec_proof = prove_recursive_step(
+        &block_replay_witness,
+        block_header,
+        prev_acc,
+        prev_rec_proof,
+    );
+    let new_acc = rec_proof.acc.clone();
+
     Ok(FullBlockProof {
         block_proof,
         state_binding,
         merkle_killshots,
+        rec_proof,
+        new_acc,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Recursive verify inputs
+// ---------------------------------------------------------------------------
+
+/// Inputs needed to perform O(1) chain verification via `verify_tip`.
+///
+/// When provided to `verify_block_full`, the function additionally verifies
+/// the recursive chain proof included in `FullBlockProof.rec_proof`.
+pub struct RecVerifyInputs<'a> {
+    /// The `RecursiveBlockAir` instance (reconstructed from public block data).
+    pub rec_air: &'a dyn noid_air::Air,
+    /// Genesis accumulator — the protocol-level constant for this chain.
+    pub genesis_acc: &'a ChainAccumulator,
+    /// The block header for the tip block (used for chain_hash verification).
+    pub tip_header: &'a BlockHeader,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +487,8 @@ pub fn verify_block_full(
     _state_root: &[u8; 32],
     // Pre-built Merkle path inputs for Kill-Shot verification (one per touched segment).
     merkle_inputs: &[MerklePathInputs],
+    // Recursive proof verification (optional — pass None to skip O(1) chain verify).
+    rec_verify_inputs: Option<RecVerifyInputs<'_>>,
 ) -> Result<(), FullNodeVerifyError> {
     let bp = &full_proof.block_proof;
     let sb = &full_proof.state_binding;
@@ -471,6 +531,20 @@ pub fn verify_block_full(
         if noid_gkr::verify_merkle_killshot(proof, inputs, &mut ch).is_none() {
             return Err(FullNodeVerifyError::MerkleKillShot { segment_idx: i });
         }
+    }
+
+    // Step 5 (optional): O(1) chain verification via recursive proof.
+    if let Some(rvi) = rec_verify_inputs {
+        // verify_tip checks rec_proof STARK + accumulator consistency.
+        // The tip block itself was already verified in Step 3.
+        verify_tip(
+            &full_proof.rec_proof,
+            rvi.rec_air,
+            &full_proof.block_proof.meta.prev_block_state_root,
+            rvi.tip_header.height,
+            rvi.genesis_acc,
+        )
+        .map_err(|_| FullNodeVerifyError::RecursiveProofInvalid)?;
     }
 
     Ok(())

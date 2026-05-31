@@ -28,12 +28,12 @@ use noid_air::Air;
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
-use noid_fri::hasher::Blake3Hasher;
 use noid_fri::Channel;
 use noid_fri_binius::{
     absorb_cap, interleaved_commit, prove_mixed_opening, verify_mixed_opening, EvalClaim,
     InterleavedCommitment, MixedOpeningProof,
 };
+use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
 
@@ -582,7 +582,7 @@ pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
     num_queries: usize,
 ) -> InterleavedStarkProof {
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
+    let hasher = Poseidon2bSponge::new();
 
     let col_refs: Vec<&'cols [Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
     let (commitment, prover_state) = match pre_committed {
@@ -686,7 +686,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
     }
 
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
+    let hasher = Poseidon2bSponge::new();
 
     // Build a zero-copy borrow view — avoids cloning all proof vectors.
     let alg_ref = AlgebraicStarkProofRef {

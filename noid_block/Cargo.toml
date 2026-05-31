@@ -14,4 +14,5 @@ noid_air        = { path = "../noid_air" }
 noid_stark      = { path = "../noid_stark" }
 noid_gkr        = { path = "../noid_gkr" }
 noid_chain      = { path = "../noid_chain" }
+noid_recursive  = { path = "../noid_recursive" }
 rayon           = "1.10"

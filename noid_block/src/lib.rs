@@ -28,7 +28,6 @@ use noid_air::{Air, FixedColumns};
 use noid_core::mle::{eq::eq_ind_partial_eval, split::split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128, TowerField};
-use noid_fri::hasher::Blake3Hasher;
 use noid_fri_binius::{
     interleaved_commit, prove_mixed_opening, verify_mixed_opening, InterleavedCommitment,
     MixedOpeningProof, COMPACT_NUM_QUERIES,
@@ -39,6 +38,7 @@ use noid_gkr::{
     SpineCircuit, SpineInputs,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::interleaved::{
     prove_air_interleaved_algebraic, verify_air_interleaved_algebraic, AlgebraicStarkProof,
@@ -353,7 +353,7 @@ pub fn prove_block(
     }
 
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
+    let hasher = Poseidon2bSponge::new();
     let (commitment, prover_state) = interleaved_commit(&flat_refs, &ntt, &hasher);
     let cap = &commitment.cap;
 
@@ -1164,7 +1164,7 @@ pub fn verify_block(
     // Stage 4: FRI-Binius mixed opening verify.
     // -------------------------------------------------------------------------
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
+    let hasher = Poseidon2bSponge::new();
 
     verify_mixed_opening(
         &proof.commitment,

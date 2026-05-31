@@ -545,7 +545,7 @@ pub fn prove_zero_check(
         // cores.  Running the outer n_points iterations (degree+1, typically
         // 2-5) serially eliminates nested-pool overhead and synchronisation
         // barriers while preserving full inner parallelism.
-    
+
         let evals: Vec<Block128> = (0..n_points)
             .map(|s_idx| {
                 let s_flat = s_flat_table[s_idx];
@@ -559,7 +559,6 @@ pub fn prove_zero_check(
         let r = channel.get_random_point();
         let r_flat = tower_to_flat_u128(r.0);
 
-    
         {
             use rayon::prelude::*;
             cur_cols
@@ -2809,8 +2808,8 @@ mod tests {
     /// the mixed path honestly, and verifies.
     #[test]
     fn invariant_b_single_log_len_mixed_roundtrip() {
-        use noid_fri::hasher::Blake3Hasher;
         use noid_fri::prover::commit as fri_commit;
+        use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
         let (air, trace) = mk_logic_air_and_trace();
         let pi = mk_pi();
@@ -2822,7 +2821,7 @@ mod tests {
             .map(|i| Block128::from(i.wrapping_mul(0x9E3779B97F4A7C15)))
             .collect();
         let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let (commitment, _tree, _code) = fri_commit(&extra_evals, &ntt, &hasher);
 
         // Pick an arbitrary eval_point and compute the true value so
