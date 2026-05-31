@@ -12,7 +12,7 @@
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
-use noid_block::{prove_block, TxBlockWitness};
+use noid_block::{prove_block, TxBlockWitness, BLOCK_BASE_LOG};
 use noid_chain::{hash_block_header, BlockHeader};
 use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
@@ -26,10 +26,7 @@ use noid_poseidon2b::primitives::{
 };
 use noid_recursive::accumulator::genesis_accumulator;
 use noid_recursive::{
-    air::{RecursiveBlockWitness, BLOCK_SUMCHECK_ROUNDS, REC_SUMCHECK_ROUNDS},
-    prove::prove_recursive_step,
-    verify::verify_tip,
-    witness::BlockReplayWitness,
+    prove::prove_recursive_step, verify::verify_tip, witness::BlockReplayWitness,
 };
 use noid_tx::{PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
 
@@ -182,7 +179,7 @@ fn wallet_auth(
     let mut ch = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
     let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
     (auth_inputs.to_public(), proof, slices)
 }
 
@@ -272,8 +269,8 @@ fn phase7_recursive_step_and_verify_tip() {
     {
         use noid_air::ColumnDomain;
         use noid_recursive::air::{
-            build_recursive_trace, RecursiveBlockAir, RecursiveBlockWitness, BLOCK_SUMCHECK_ROUNDS,
-            LOG_ROWS, N_COLS, REC_SUMCHECK_ROUNDS,
+            build_recursive_trace, RecursiveBlockAir, RecursiveBlockWitness, LOG_ROWS, N_COLS,
+            REC_SUMCHECK_ROUNDS,
         };
 
         // Build a synthetic witness from the block proof's multipoint rounds.

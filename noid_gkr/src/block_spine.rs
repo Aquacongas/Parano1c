@@ -292,6 +292,151 @@ fn permute_by_dec_dyn(src: &[Block128]) -> Vec<Block128> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Fast direct MLE evaluation at a point — O(live_slots + N_ROUNDS) per table
+// ---------------------------------------------------------------------------
+//
+// All block-spine public-schedule tables (sigma, rc, mds, sigma_lane) share
+// the same slot-independent structure:
+//
+//   table(slot, round, elem) = f(prev_round, elem)   for slot < live_slots
+//                             = 0                      otherwise
+//
+// Their MLE at any point r' factors as:
+//
+//   table_MLE(r') = live_sum(r'_slot)  ×  inner(r'_round, r'_elem)
+//
+// where:
+//   live_sum = Σ_{s < live_slots} eq(r'_slot, s)   — O(live_slots)
+//   inner    = Σ_{round=1}^{N_ROUNDS} Σ_elem f(round-1, elem) × eq_round[round] × eq_elem[elem]
+//              — O(N_ROUNDS × STATE_SIZE) = O(264) — O(1)
+//
+// u_table additionally depends on rho (the Fiat-Shamir sumcheck challenge)
+// and factors into three independent terms (slot, round, elem).
+//
+// This replaces O(24 × 2^num_vars) table builds + evaluations with
+// O(live_slots + N_ROUNDS × STATE_SIZE), roughly a 512× speedup.
+
+/// Direct evaluation of all public-schedule MLEs at a single point `r_prime`.
+///
+/// Returns `(u_at_r, sigma_dec_at_r, rc_dec_at_r, mds_lane_at_r, sigma_lane_at_r)`.
+/// Correctness invariant: each returned value equals the result of the
+/// corresponding build-then-evaluate path in the prover.
+fn fast_eval_block_schedules(
+    rho: &[Block128],
+    r_prime: &[Block128],
+    live_slots: usize,
+) -> (
+    Block128,
+    Block128,
+    Block128,
+    [Block128; STATE_SIZE],
+    [Block128; STATE_SIZE],
+) {
+    let num_vars = r_prime.len();
+    debug_assert_eq!(rho.len(), num_vars);
+
+    // Split r' / rho into (elem, round, slot) sub-vectors.
+    // Bit layout: elem:ELEM_BITS | round:ROUND_BITS | slot:slot_vars
+    let r_elem = &r_prime[..ELEM_BITS];
+    let r_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let r_slot = &r_prime[ELEM_BITS + ROUND_BITS..];
+    let rho_elem = &rho[..ELEM_BITS];
+    let rho_round = &rho[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let rho_slot = &rho[ELEM_BITS + ROUND_BITS..];
+
+    // ---- Precompute small eq tensors (sizes: 4, 128, 2^slot_vars ≤ 2×live_slots) ----
+    let eq_elem: Vec<Block128> = eq_ind_partial_eval(r_elem); // size 2^ELEM_BITS = 4
+    let eq_round_r: Vec<Block128> = eq_ind_partial_eval(r_round); // size 2^ROUND_BITS = 128
+    let eq_r_slot: Vec<Block128> = eq_ind_partial_eval(r_slot); // size 2^slot_vars
+    let eq_rho_elem: Vec<Block128> = eq_ind_partial_eval(rho_elem); // size 4
+    let eq_rho_round: Vec<Block128> = eq_ind_partial_eval(rho_round); // size 128
+    let eq_rho_slot: Vec<Block128> = eq_ind_partial_eval(rho_slot); // size 2^slot_vars
+
+    // ---- live_sum_r = Σ_{s < live_slots} eq(r'_slot, s) ----
+    let live_sum_r: Block128 = eq_r_slot[..live_slots]
+        .iter()
+        .copied()
+        .fold(Block128::ZERO, |a, b| a + b);
+
+    // ---- Inner sums over (round, elem) for slot-independent tables ----
+    //
+    // dec_round(pack(slot, round, elem)) = pack(slot, round-1, elem) for round ≥ 1.
+    // For round = 0: prev_round = ROUND_LIMIT-1 ≥ N_ROUNDS → table = 0. Skip.
+    let mut sigma_dec_inner = Block128::ZERO;
+    let mut rc_dec_inner = Block128::ZERO;
+    let mut mds_inner = [Block128::ZERO; STATE_SIZE];
+    let mut sigma_round_sum = [Block128::ZERO; STATE_SIZE];
+
+    for round in 1..ROUND_LIMIT.min(N_ROUNDS + 1) {
+        let prev = round - 1; // prev_round(round) — always < N_ROUNDS
+        let eq_r = eq_round_r[round];
+
+        for elem in 0..STATE_SIZE {
+            let eq_re = eq_r * eq_elem[elem];
+
+            // sigma_dec: σ(prev, elem)
+            sigma_dec_inner += eq_re * sigma_at(prev, elem);
+
+            // rc_dec: RC[elem][prev] (zero on partial rounds, elem > 0)
+            let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&prev);
+            if !is_partial || elem == 0 {
+                rc_dec_inner += eq_re * Block128::from(ROUND_CONSTANTS[elem][prev]);
+            }
+
+            // mds_lane_dec[j]: mds_coeff(prev, elem, j) for each output lane j
+            for j in 0..STATE_SIZE {
+                mds_inner[j] += eq_re * mds_coeff_dyn(prev, elem, j);
+            }
+        }
+
+        // sigma_lane_dec[j]: σ(prev, j) × eq_round[round] × Σ_e eq_elem[e]
+        // Σ_e eq_elem[e] = 1 (sum over all 2^ELEM_BITS Boolean vertices = 1)
+        for j in 0..STATE_SIZE {
+            sigma_round_sum[j] += eq_r * sigma_at(prev, j);
+        }
+    }
+
+    let sigma_dec_at_r = live_sum_r * sigma_dec_inner;
+    let rc_dec_at_r = live_sum_r * rc_dec_inner;
+    let mds_lane_at_r = mds_inner.map(|v| live_sum_r * v);
+    let sigma_lane_at_r = sigma_round_sum.map(|v| live_sum_r * v);
+
+    // ---- u_MLE: factors into (slot) × (round) × (elem) ----
+    //
+    // u(y) = eq(rho, dec_round(y)) × 1[slot<live ∧ round≥1]
+    //       = eq_slot(rho_s, s) × eq_round(rho_r, round-1) × eq_elem(rho_e, elem)
+    //         × 1[slot<live ∧ round≥1]
+    //
+    // u_MLE(r') = slot_factor × round_factor × elem_factor
+    //
+    // slot_factor  = Σ_{s<live} eq(rho_slot, s) × eq(r'_slot, s)  — O(live_slots)
+    // round_factor = Σ_{r=1}^{N_ROUNDS} eq(rho_round, r-1) × eq(r'_round, r)  — O(N_ROUNDS)
+    // elem_factor  = Σ_{e<STATE_SIZE} eq(rho_elem, e) × eq(r'_elem, e)  — O(4)
+
+    let u_slot_factor: Block128 = (0..live_slots)
+        .map(|s| eq_rho_slot[s] * eq_r_slot[s])
+        .fold(Block128::ZERO, |a, b| a + b);
+
+    let u_round_factor: Block128 = (1..ROUND_LIMIT.min(N_ROUNDS + 1))
+        .map(|r| eq_rho_round[r - 1] * eq_round_r[r])
+        .fold(Block128::ZERO, |a, b| a + b);
+
+    let u_elem_factor: Block128 = (0..STATE_SIZE)
+        .map(|e| eq_rho_elem[e] * eq_elem[e])
+        .fold(Block128::ZERO, |a, b| a + b);
+
+    let u_at_r = u_slot_factor * u_round_factor * u_elem_factor;
+
+    (
+        u_at_r,
+        sigma_dec_at_r,
+        rc_dec_at_r,
+        mds_lane_at_r,
+        sigma_lane_at_r,
+    )
+}
+
 fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
     use rayon::prelude::*;
     let n = src.len();
@@ -895,22 +1040,10 @@ pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
         r_prime[num_vars - 1 - round] = challenge;
     }
 
-    // Recompute public schedules at r'.
-    let n_cells = 1 << num_vars;
-    let u_at_r = evaluate_slice(&build_u_table_dyn(&rho, live_slots, n_cells), &r_prime);
-    let sigma_dec_full = permute_by_dec_dyn(&build_sigma_table_dyn(live_slots, n_cells));
-    let sigma_dec_at_r = evaluate_slice(&sigma_dec_full, &r_prime);
-    let rc_dec_at_r = evaluate_slice(
-        &permute_by_dec_dyn(&build_rc_table_dyn(live_slots, n_cells)),
-        &r_prime,
-    );
-    let mut mds_lane_at_r = [Block128::ZERO; STATE_SIZE];
-    let mut sigma_lane_at_r = [Block128::ZERO; STATE_SIZE];
-    for j in 0..STATE_SIZE {
-        mds_lane_at_r[j] =
-            evaluate_slice(&build_mds_lane_table_dyn(j, live_slots, n_cells), &r_prime);
-        sigma_lane_at_r[j] = evaluate_slice(&project_lane_dyn(&sigma_dec_full, j), &r_prime);
-    }
+    // Recompute public schedules at r' using direct point evaluation.
+    // O(live_slots + N_ROUNDS × STATE_SIZE) instead of O(24 × 2^num_vars).
+    let (u_at_r, sigma_dec_at_r, rc_dec_at_r, mds_lane_at_r, sigma_lane_at_r) =
+        fast_eval_block_schedules(&rho, &r_prime, live_slots);
 
     // Reassemble constraint at r'.
     let q_c1 = sigma_dec_at_r * pow7_block128(proof.s_in_dec_at_r)

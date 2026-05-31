@@ -8,12 +8,12 @@
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
-use noid_block::{prove_block, verify_block, TxBlockWitness};
+use noid_block::{prove_block, verify_block, TxBlockWitness, BLOCK_BASE_LOG};
 use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthPublicInputs, AuthProofKillShot, SpineInputs, N_AUTH_INPUTS,
+    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
     N_AUTH_UNIFIED_VARS,
 };
 use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, SpendSecret, TxBodyHash};
@@ -64,8 +64,18 @@ fn mk_test_body() -> TxBody {
     }
 
     let mut outputs = vec![
-        TxOutput { slot_index: 10, value: 80, owner: addrs[0], valid: true },
-        TxOutput { slot_index: 11, value: 60, owner: addrs[1], valid: true },
+        TxOutput {
+            slot_index: 10,
+            value: 80,
+            owner: addrs[0],
+            valid: true,
+        },
+        TxOutput {
+            slot_index: 11,
+            value: 60,
+            owner: addrs[1],
+            valid: true,
+        },
     ];
     while outputs.len() < MAX_OUTPUTS {
         outputs.push(TxOutput::dummy());
@@ -144,7 +154,12 @@ fn wallet_auth(
     body: &TxBody,
     tx_body_hash: [Block128; 2],
 ) -> (AuthPublicInputs, AuthProofKillShot, Vec<Vec<Block128>>) {
-    let secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let circuit = AuthCircuit::build();
     let n_live = body.inputs.iter().filter(|i| i.valid).count();
 
@@ -165,7 +180,7 @@ fn wallet_auth(
     let mut ch = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
     let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
     (auth_inputs.to_public(), proof, slices)
 }
@@ -193,7 +208,10 @@ fn block_one_tx_roundtrip() {
         .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
-    assert_eq!(proof.meta.n_auth_slices_per_tx, 2);
+    assert_eq!(
+        proof.meta.n_auth_slices_per_tx as usize,
+        1 << (N_AUTH_UNIFIED_VARS - BLOCK_BASE_LOG)
+    );
 
     let air_ref: &dyn Air = &air;
     verify_block(

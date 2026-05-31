@@ -65,9 +65,13 @@ pub const PROTOCOL_VERSION_Q: u128 = 1;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// # use noid_block::channel::per_tx_algebraic_channel;
+/// # use noid_fri_binius::MerkleCap;
+/// # let prev_state_root = [0u8; 32];
+/// # let cap = MerkleCap { hashes: vec![[0u8; 32]; 32] };
 /// let mut channel = per_tx_algebraic_channel(&prev_state_root, &cap, 0);
-/// let challenge = channel.squeeze_challenge();
+/// let _challenge = channel.get_random_point();
 /// ```
 pub fn per_tx_algebraic_channel(
     prev_state_root: &[u8; 32],
@@ -107,7 +111,12 @@ pub fn per_tx_algebraic_channel(
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```rust
+/// # use noid_block::channel::state_binding_channel;
+/// # use noid_fri_binius::MerkleCap;
+/// # let prev_state_root = [0u8; 32];
+/// # let cap = MerkleCap { hashes: vec![[0u8; 32]; 32] };
+/// # let n_tx: u32 = 4;
 /// let mut channel = state_binding_channel(&prev_state_root, &cap, n_tx);
 /// ```
 pub fn state_binding_channel(prev_state_root: &[u8; 32], cap: &MerkleCap, n_tx: u32) -> Channel {
@@ -135,10 +144,12 @@ pub fn state_binding_channel(prev_state_root: &[u8; 32], cap: &MerkleCap, n_tx: 
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut channel = block_multipoint_channel(&prev_state_root, &cap);
-/// channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
-/// channel.observe_field_elems(&block_col_openings);
+/// ```rust
+/// # use noid_block::channel::block_multipoint_channel;
+/// # use noid_fri_binius::MerkleCap;
+/// # let prev_state_root = [0u8; 32];
+/// # let cap = MerkleCap { hashes: vec![[0u8; 32]; 32] };
+/// let mut _channel = block_multipoint_channel(&prev_state_root, &cap);
 /// ```
 pub fn block_multipoint_channel(prev_state_root: &[u8; 32], cap: &MerkleCap) -> Channel {
     let mut ch = Channel::new();
