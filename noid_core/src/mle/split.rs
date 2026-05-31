@@ -24,7 +24,7 @@ pub fn split_mle_into_slices(
 /// Reconstruct the value of the original MLE at point (r_low, r_high) from per-slice
 /// evaluations at r_low.
 ///
-/// Given slice_values[b] = f_b(r_low) for each b in {0,1}^k, computes:
+/// Given `slice_values[b]` = f_b(r_low) for each b in {0,1}^k, computes:
 ///   f(r_low, r_high) = sum_{b} eq(r_high, b) * f_b(r_low)
 pub fn reconstruct_from_slices(slice_values: &[Block128], r_high: &[Block128]) -> Block128 {
     let k = r_high.len();

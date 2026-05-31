@@ -5,11 +5,11 @@
 //! native `noid_poseidon2b::native::compress` and the proof verifies.
 
 use noid_core::{Block128, CanonicalSerialize, TowerField};
+use noid_gkr::merkle_circuit::MerklePathInputs;
 use noid_gkr::merkle_circuit::{MerkleCircuit, MAX_MERKLE_DEPTH};
 use noid_gkr::merkle_killshot::{
     discharge_merkle_reductions_native, prove_merkle_killshot, verify_merkle_killshot,
 };
-use noid_gkr::merkle_circuit::MerklePathInputs;
 use noid_gkr::merkle_oracle::compute_merkle_root;
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::compress;
@@ -81,7 +81,9 @@ fn killshot_prove_verify_depth_8() {
         verify_merkle_killshot(&proof, &inputs, &mut ch_v).expect("verifier accepts honest proof");
 
     assert_eq!(v_red, reductions);
-    assert!(discharge_merkle_reductions_native(&circuit, &inputs, &v_red));
+    assert!(discharge_merkle_reductions_native(
+        &circuit, &inputs, &v_red
+    ));
 }
 
 #[test]
@@ -99,7 +101,9 @@ fn killshot_prove_verify_depth_1() {
         verify_merkle_killshot(&proof, &inputs, &mut ch_v).expect("verifier accepts honest proof");
 
     assert_eq!(v_red, reductions);
-    assert!(discharge_merkle_reductions_native(&circuit, &inputs, &v_red));
+    assert!(discharge_merkle_reductions_native(
+        &circuit, &inputs, &v_red
+    ));
 }
 
 #[test]
@@ -117,7 +121,9 @@ fn killshot_prove_verify_depth_16() {
         verify_merkle_killshot(&proof, &inputs, &mut ch_v).expect("verifier accepts honest proof");
 
     assert_eq!(v_red, reductions);
-    assert!(discharge_merkle_reductions_native(&circuit, &inputs, &v_red));
+    assert!(discharge_merkle_reductions_native(
+        &circuit, &inputs, &v_red
+    ));
 }
 
 #[test]

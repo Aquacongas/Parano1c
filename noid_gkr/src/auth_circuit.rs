@@ -213,7 +213,10 @@ impl AuthInputs {
     }
 
     /// Construct from public inputs + private secret.
-    pub fn from_parts(public: &AuthPublicInputs, spend_secret: [[Block128; 2]; N_AUTH_INPUTS]) -> Self {
+    pub fn from_parts(
+        public: &AuthPublicInputs,
+        spend_secret: [[Block128; 2]; N_AUTH_INPUTS],
+    ) -> Self {
         Self {
             spend_secret,
             tx_body_hash: public.tx_body_hash,

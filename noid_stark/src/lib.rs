@@ -10,9 +10,11 @@
 
 //! STARK wrapper for the Paranoid transaction AIRs.
 //!
-//! Given an [`Air`] + [`Trace`] and a [`PublicInputs`] tuple (CRYPTO.md
-//! §7), this crate produces a non-interactive STARK proof that the
-//! trace satisfies every AIR constraint on the boolean hypercube.
+//! Given an [`Air`] + [`Trace`] and a [`PublicInputs`] tuple, this crate
+//! produces a non-interactive STARK proof that the trace satisfies every
+//! AIR constraint on the boolean hypercube. Soundness follows from the
+//! Schwartz–Zippel lemma over the zero-check sumcheck; column binding is
+//! provided by the FRI polynomial commitment scheme.
 //!
 //! # Pipeline
 //!
@@ -64,24 +66,20 @@ use std::sync::{OnceLock, RwLock};
 /// batched zero-check polynomial.
 pub type RoundPoly = Vec<Block128>;
 
-/// A STARK proof (Stage 3b-0.6, "Ladder Merge"). One FRI commitment
-/// per column, the zero-check sumcheck transcript, per-column base
-/// openings `e_i = MLE_i(r_point)`, the VSHIFT ladder partials for
-/// every shifted column, and finally the §12c' multipoint-batch
-/// sumcheck + a **single** batched FRI opening at the shared terminal
-/// point `r''`. The §12c' sumcheck inlines every ladder claim (each
-/// as a `Σ_k γ_s^k · eq(P_{s,k}, x) · MLE_{col_s}(x)` term) directly
-/// into the multipoint `H(x)`, so the per-slot product sumchecks of
-/// legacy §12a are gone — one sumcheck closes base + ladder together.
+/// A complete STARK proof.
+///
+/// Contains the FRI column commitments, the zero-check sumcheck transcript,
+/// per-column base openings at the sumcheck challenge point, VSHIFT ladder
+/// partials for rotated columns, and the multipoint sumcheck that reduces
+/// all opening claims to a **single** batched FRI opening at a shared
+/// terminal point.
 #[derive(Debug, Clone)]
 pub struct StarkProof {
     pub log_rows: usize,
     pub column_commitments: Vec<FriCommitment>,
-    /// Per-column base openings `e_i = MLE_i(r_point)` at the
-    /// zero-check's own challenge point. Absorbed into the parent
-    /// transcript before the §12c' multipoint-batch β is squeezed; no
-    /// FRI is attached at `r_point` — soundness comes from the single
-    /// multipoint FRI at `r''`.
+    /// Per-column MLE evaluations `e_i = MLE_i(r_point)` at the
+    /// zero-check challenge point. Soundness comes from the single
+    /// multipoint FRI opening at the terminal point.
     pub base_openings: Vec<Block128>,
     /// Batched zero-check sumcheck: one `RoundPoly` per variable
     /// (`log_len` total), each a length-`(D+1)` vector of field
@@ -90,20 +88,16 @@ pub struct StarkProof {
     /// VSHIFT ladders for each rotated column in
     /// `air.shifted_column_indices()` order. The k-th entry is a length
     /// `log_len + 1` vector of MLE evaluations of the base column at the
-    /// ladder points (see [`crate::vshift`]). Used by the verifier both
-    /// to reconstruct `C'(r)` in closed form for the zero-check
-    /// composition check and as the γ_s target-claim pre-image for the
-    /// §12c' multipoint sumcheck.
+    /// ladder points (see [`crate::vshift`]). Used by the verifier to
+    /// reconstruct the rotated-column opening `C'(r)` and to contribute
+    /// target claims to the multipoint sumcheck.
     pub shift_partials: Vec<Vec<Block128>>,
-    /// CRYPTO.md §12c' multipoint-batch sumcheck transcript. `log_len`
-    /// degree-2 round polynomials (3 field elements each) that reduce
-    /// the combined base + ladder multi-point claim to a single common
-    /// point `r''`.
+    /// Multipoint sumcheck transcript: `log_len` degree-2 round polynomials
+    /// (3 field elements each) that reduce all base and ladder opening claims
+    /// to a single common evaluation point.
     pub multipoint_rounds: Vec<RoundPoly>,
-    /// Batched FRI opening of all base columns at the multipoint
-    /// challenge `r''`. This single FRI opening closes every base
-    /// claim at `r_point` and every ladder claim (inlined in §12c'
-    /// as weighted eq-sums over `ladder_points(r_point)`).
+    /// Batched FRI opening of all base columns at the terminal multipoint
+    /// challenge. Closes all base and ladder claims in one opening.
     pub multipoint_batch: BatchedEvalProof,
     /// γ₃b mixed-length multipoint close. `None` for the default
     /// path — in that case `multipoint_batch` is authoritative and
@@ -116,10 +110,10 @@ pub struct StarkProof {
     /// paths (built via `BatchedEvalProof { column_openings: vec![],
     /// batch_proof: stub }` with an empty column list).
     pub multipoint_batch_mixed: Option<MixedBatchedEvalProof>,
-    /// Stage 0 MLE Splitting: claimed values of boundary-slice columns
-    /// at their respective GKR reduction points (r_B_low). The verifier
-    /// uses these with `reconstruct_from_slices` to recover the original
-    /// MLE evaluation. Empty when the legacy mixed path is used.
+    /// Claimed values of boundary-slice columns at their respective GKR
+    /// reduction points. The verifier uses these with
+    /// `reconstruct_from_slices` to recover the original MLE evaluation.
+    /// Empty when no slice claims are present.
     pub slice_claimed_values: Vec<Block128>,
 }
 
@@ -282,7 +276,7 @@ fn lagrange_denoms(d_plus_one: usize) -> Vec<Block128> {
     denoms
 }
 
-/// Lagrange interpolation using precomputed denominators from [`lagrange_denoms`].
+/// Lagrange interpolation using precomputed denominators (see `lagrange_denoms`).
 /// Equivalent to [`lagrange_eval_at`] but avoids per-call field inversions.
 pub fn lagrange_eval_at_cached(p: &[Block128], target: Block128) -> Block128 {
     let d_plus_one = p.len();
@@ -755,13 +749,11 @@ pub fn prove_air<A: Air>(
 
 /// Wall-clock breakdown of [`prove_air_timed`] for a single proof.
 ///
-/// Post-3b-0.4 bucket layout:
 /// * `commit` — column commitments.
 /// * `transcript_sumcheck` — parent transcript + zero-check sumcheck.
-/// * `ladder_sumcheck` — per-slot ladder product sumchecks (§12a).
-/// * `multipoint_fri` — §12c multipoint-batch sumcheck plus the single
-///   batched FRI opening at `r''`. This bucket replaces the old
-///   `base_fri` and `ladder_fri` buckets combined.
+/// * `ladder_sumcheck` — VSHIFT ladder partial computations.
+/// * `multipoint_fri` — multipoint sumcheck plus the single batched
+///   FRI opening.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProveTimings {
     pub commit: std::time::Duration,
@@ -782,8 +774,7 @@ impl ProveTimings {
 }
 
 /// Mirror of [`prove_air`] instrumented with per-bucket prover timers.
-/// All commitments / openings are identical to `prove_air`; this variant
-/// exists strictly to feed Stage 3b-0.4 decision benchmarks.
+/// All commitments and openings are identical to `prove_air`.
 pub fn prove_air_timed<A: Air>(
     air: &A,
     trace: &Trace,
@@ -2388,12 +2379,10 @@ fn verify_multipoint_close(
 
 /// Wall-clock breakdown of `verify_air_timed` for a single proof.
 ///
-/// Post-3b-0.4 bucket layout:
 /// * `transcript_sumcheck` — parent transcript + zero-check replay.
 /// * `composition` — zero-check terminal equation.
-/// * `ladder_sumcheck` — per-slot §12a ladder sumcheck replays.
-/// * `multipoint_fri` — §12c multipoint sumcheck replay + single batched
-///   FRI verify at `r''`. Replaces the old `base_fri` + `ladder_fri`.
+/// * `ladder_sumcheck` — VSHIFT ladder sumcheck replays.
+/// * `multipoint_fri` — multipoint sumcheck replay + single batched FRI verify.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VerifyTimings {
     pub transcript_sumcheck: std::time::Duration,
@@ -2637,7 +2626,7 @@ pub fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
 /// padded from the AIR's native `log_rows` up to the proof's `log_len`)
 /// at the sumcheck terminal `r_point`, and compare against
 /// `base_openings[col]`. The base opening is itself bound to the
-/// committed column by the §12c' multipoint FRI, so any programme
+/// committed column by the multipoint FRI, so any programme
 /// deviation surfaces here with overwhelming probability.
 pub(crate) fn check_public_columns<A: Air + ?Sized>(
     air: &A,

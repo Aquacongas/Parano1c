@@ -152,8 +152,7 @@ impl BlockStateBindingLayout {
         // 3 claim lanes + log_slots idx bits + 15 fixed columns
         // + log_slots eval_point + log_slots eq_ladder + 1 gamma_powers
         // + 3 gp lanes + 3 acc lanes + n_slots row indicators + 1 acc_step
-        3 + self.log_slots + 15 + self.log_slots + self.log_slots + 1 + 3 + 3
-            + self.n_rows() + 1
+        3 + self.log_slots + 15 + self.log_slots + self.log_slots + 1 + 3 + 3 + self.n_rows() + 1
     }
 
     // Column accessors
@@ -511,8 +510,7 @@ impl BlockStateBindingWitness {
 
             // Gamma-weighted MLE product: gp_lane = γ^i · eq_{L-1} · opened_pre_lane
             let gp_factor = gamma_powers[row] * eq_tail;
-            cols[layout.col_gp_value()][row] =
-                gp_factor * cols[layout.col_opened_pre_value()][row];
+            cols[layout.col_gp_value()][row] = gp_factor * cols[layout.col_opened_pre_value()][row];
             cols[layout.col_gp_owner_hi()][row] =
                 gp_factor * cols[layout.col_opened_pre_owner_hi()][row];
             cols[layout.col_gp_owner_lo()][row] =
@@ -906,10 +904,7 @@ impl BlockStateBindingAir {
                 step_col,
                 Box::new(WeightedLinearGateShifted::new(
                     vec![(delta_acc_c, Block128::ONE)],
-                    vec![
-                        (delta_acc_c, Block128::ONE),
-                        (eq_delta_c, Block128::ONE),
-                    ],
+                    vec![(delta_acc_c, Block128::ONE), (eq_delta_c, Block128::ONE)],
                     Block128::ZERO,
                 )),
             )));
@@ -1152,7 +1147,12 @@ mod tests {
     }
 
     fn mk_claims_single_tx() -> Vec<BlockStateBindingClaim> {
-        vec![mk_spend(11, 0), mk_spend(22, 3), mk_mint(33, 5), mk_mint(44, 9)]
+        vec![
+            mk_spend(11, 0),
+            mk_spend(22, 3),
+            mk_mint(33, 5),
+            mk_mint(44, 9),
+        ]
     }
 
     fn mk_claims_multi_tx() -> Vec<BlockStateBindingClaim> {
@@ -1188,7 +1188,10 @@ mod tests {
         w
     }
 
-    fn mk_air(claims: &[BlockStateBindingClaim], witness: &BlockStateBindingWitness) -> BlockStateBindingAir {
+    fn mk_air(
+        claims: &[BlockStateBindingClaim],
+        witness: &BlockStateBindingWitness,
+    ) -> BlockStateBindingAir {
         let expected_batched = witness.expected_batched_claims();
         BlockStateBindingAir::new(
             claims,
@@ -1236,7 +1239,12 @@ mod tests {
 
     #[test]
     fn all_spends_trace_passes() {
-        let claims = vec![mk_spend(1, 0), mk_spend(2, 5), mk_spend(3, 10), mk_spend(4, 15)];
+        let claims = vec![
+            mk_spend(1, 0),
+            mk_spend(2, 5),
+            mk_spend(3, 10),
+            mk_spend(4, 15),
+        ];
         let witness = mk_witness(claims.clone());
         let air = mk_air(&claims, &witness);
         let cols = air.build_trace(&witness);
@@ -1410,7 +1418,10 @@ mod tests {
         let cols = air.build_trace(&witness);
         // Row 0 is spend: opened_pre_value = claim.value
         assert_eq!(cols[layout.col_opened_pre_value()][0], cols[COL_VALUE][0]);
-        assert_eq!(cols[layout.col_opened_pre_owner_hi()][0], cols[COL_OWNER_HI][0]);
+        assert_eq!(
+            cols[layout.col_opened_pre_owner_hi()][0],
+            cols[COL_OWNER_HI][0]
+        );
     }
 
     #[test]
@@ -1558,7 +1569,11 @@ mod tests {
         ];
         for i in 0..cols.len() {
             for j in (i + 1)..cols.len() {
-                assert_ne!(cols[i], cols[j], "Columns {} and {} collide at index {}", i, j, cols[i]);
+                assert_ne!(
+                    cols[i], cols[j],
+                    "Columns {} and {} collide at index {}",
+                    i, j, cols[i]
+                );
             }
         }
     }

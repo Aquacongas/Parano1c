@@ -1,47 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! `RowSelectorGate`: Stage 3d-0.5 primitive for boundary ties.
+//! Row-selector helpers: pin a witness cell to a public constant on
+//! exactly one row, or enforce equality of two cells at a single row.
 //!
-//! Every "pin a witness cell to a public constant on one specific row"
-//! debt carried from §3b-4 / §3c-2 / §3c-3 / §3c-4 / §3c-5 needs a
-//! constraint that activates on exactly one row of the trace. The
-//! existing `PublicColumn` / `ConstColumnGate` pin entire columns;
-//! `SelectorGate` gates an inner constraint by a witness column. Combined
-//! — a `PublicColumn` that is `1` at `row` and `0` everywhere else,
-//! multiplied into an inner constraint via `SelectorGate` — they express
-//! a single-row constraint without adding any new STARK-layer machinery.
+//! A `PublicColumn` that is `1` at a target row and `0` everywhere else,
+//! combined with a `SelectorGate`, expresses a single-row constraint
+//! without adding any new STARK-layer machinery.
 //!
-//! This module only ships the glue:
+//! This module provides:
 //!
 //! - [`row_indicator_programme`] — builds the `2^log_rows` value vector
-//!   of an indicator column.
-//! - [`emit_row_selector`] — takes `(indicator_col, row, total_rows,
-//!   inner)` and returns the pair `(PublicColumn, SelectorGate)` that
-//!   the caller appends to its AIR's declarations + constraints.
-//! - [`emit_public_cell`] — specialisation of [`emit_row_selector`] for
-//!   the "pin one witness cell to a constant" case (`target_col@row ==
-//!   constant`).
-//! - [`emit_column_eq_at_row`] — specialisation for "pin two witness
-//!   cells of the same trace to be equal at a single row"
-//!   (`col_a@row == col_b@row`). This is the cross-column / single-row
-//!   variant that §3d-0.9's `TxBodyMerkleAir` inter-instance wiring and
-//!   §3d-0.6b's absorb XOR ties need — the constant form of
-//!   [`emit_public_cell`] can't express it because neither cell is a
-//!   public constant.
+//!   of a single-hot indicator column.
+//! - [`multi_row_indicator_programme`] — same for a multi-hot indicator.
+//! - [`emit_row_selector`] — returns a `(PublicColumn, SelectorGate)` pair
+//!   that pins an inner constraint to one row.
+//! - [`emit_public_cell`] — pins `target_col@row == constant`.
+//! - [`emit_column_eq_at_row`] — pins `col_a@row == col_b@row`.
+//! - [`emit_rows_must_be_zero`] — pins a column to zero on a set of
+//!   forbidden rows via a multi-hot indicator.
+//! - [`emit_column_eq_at_next_row`] — pins `col_a@row == col_b@(row+1)`
+//!   at a single row.
 //!
-//! Soundness. The indicator column is a `PublicColumn`, so the native
-//! `Air::check` rejects any trace whose indicator column deviates from
-//! the declared programme, and the verifier's `check_public_columns`
-//! re-evaluates the indicator MLE at the zero-check terminal `r_point`
-//! and asserts equality with the base opening. The inner constraint is
-//! multiplied by that indicator; on all non-target rows the product is
-//! zero by construction, and on the target row the selector is `1` so
-//! `inner.evaluate` must vanish. Extending to arbitrary sparse row sets
-//! only requires replacing the `programme[row] = ONE` line with a
-//! multi-hot programme — every downstream §3d-0.6..0.10 boundary tie is
-//! single-row, so that variant is deferred until something actually
-//! needs it.
+//! Soundness: the indicator column is a `PublicColumn`, so the STARK
+//! verifier re-evaluates its MLE at the sumcheck terminal and asserts
+//! equality with the committed column opening.
 
 use crate::gates::const_column::PublicColumn;
 use crate::gates::linear::{WeightedLinearGate, WeightedLinearGateShifted};

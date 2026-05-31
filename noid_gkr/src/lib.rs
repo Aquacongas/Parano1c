@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G0 — scaffolding for the GKR acceleration of the tx-body
-//! Merkle Poseidon2b spine. See `gkr.md` for the full plan.
+//! GKR-based proving for the Paranoid transaction system.
 //!
-//! At G0 this crate is **only** a typed description of the spine
-//! circuit plus a reference oracle that re-executes the 59-permutation
-//! stack through the native `noid_poseidon2b` implementation. No
-//! sumcheck, no prover, no verifier yet. Its purpose is to pin down
-//! the topology and the I/O boundary so later stages have a single
-//! source of truth.
+//! This crate implements the Kill-Shot GKR protocol for Poseidon2b
+//! permutation chains. It provides:
+//!
+//! - **Auth GKR**: proves spend-secret ownership via 20 Poseidon2b
+//!   permutations (4 inputs × 5 perms each).
+//! - **Block Spine GKR**: a single unified Kill-Shot for N×59 permutations
+//!   across all transactions in a block, with proof size and verification
+//!   cost growing O(log N) rather than O(N).
+//! - **Merkle GKR**: proves the tx-body Merkle tree hash (59-perm chain).
+//!
+//! See `SPEC.md` and `AUDIT.md` in this crate for the cryptographic
+//! specification and security analysis.
 
 pub mod auth_circuit;
 pub mod auth_killshot;
@@ -18,8 +23,8 @@ pub mod auth_oracle;
 pub mod auth_shift;
 pub mod auth_unified_v2;
 pub mod batch_eval;
-pub mod block_spine;
 pub mod binding;
+pub mod block_spine;
 pub mod circuit;
 pub mod layers;
 pub mod merkle_circuit;
@@ -60,8 +65,30 @@ pub use batch_eval::{
     EvalClaim,
 };
 pub use binding::BindingCut;
+pub use block_spine::{
+    discharge_block_spine_reductions_native, prove_block_spine_killshot,
+    verify_block_spine_killshot, BlockSpineKillShotProof, BlockSpineMle, BlockSpineProof,
+    BlockSpineReductions, BlockSpineShiftProof, BlockSpineShiftReduction, BlockSpineUnifiedProof,
+    BlockSpineUnifiedReduction, BLOCK_SPINE_ROUND_DEGREE, BLOCK_SPINE_SHIFT_DEGREE,
+};
 pub use circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
 pub use layers::{evaluate_permutation, round_kind, PermLayerWitness, RoundKind};
+pub use merkle_circuit::{
+    MerkleCircuit, MerklePathInputs, MerkleSlotDescriptor, MerkleSlotRole, MAX_MERKLE_DEPTH,
+    N_MERKLE_SLOTS, N_PERMS_PER_COMPRESS,
+};
+pub use merkle_killshot::{
+    build_merkle_unified_from_inputs, discharge_merkle_reductions_native, prove_merkle_killshot,
+    verify_merkle_killshot, MerkleKillShotReductions, MerkleProofKillShot,
+};
+pub use merkle_mle::{
+    build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_MAX_LIVE_SLOTS, N_MERKLE_UNIFIED_CELLS,
+    N_MERKLE_UNIFIED_VARS,
+};
+pub use merkle_oracle::{compute_merkle_root, evaluate_merkle, MerkleSlotState, MerkleWitness};
+pub use merkle_unified::{
+    prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
+};
 pub use mle_layout::{pack_column, PermColumn, PermMle, N_PERM_CELLS, N_PERM_VARS};
 pub use oracle::{evaluate_spine, SpineWitness};
 pub use spine_degree7::{
@@ -95,27 +122,4 @@ pub use spine_unified::{
     verify_spine_unified, verify_spine_unified_for_live_slots, SpineKillShotProof, SpineShiftProof,
     SpineShiftReduction, SpineUnifiedProof, SpineUnifiedReduction, N_UNIFIED_WITNESS_CLAIMS,
     SPINE_SHIFT_ROUND_DEGREE, SPINE_UNIFIED_ROUND_DEGREE,
-};
-pub use merkle_circuit::{
-    MerkleCircuit, MerklePathInputs, MerkleSlotDescriptor, MerkleSlotRole, MAX_MERKLE_DEPTH,
-    N_MERKLE_SLOTS, N_PERMS_PER_COMPRESS,
-};
-pub use merkle_killshot::{
-    build_merkle_unified_from_inputs, discharge_merkle_reductions_native, prove_merkle_killshot,
-    verify_merkle_killshot, MerkleKillShotReductions, MerkleProofKillShot,
-};
-pub use merkle_mle::{
-    build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_MAX_LIVE_SLOTS, N_MERKLE_UNIFIED_CELLS,
-    N_MERKLE_UNIFIED_VARS,
-};
-pub use merkle_oracle::{compute_merkle_root, evaluate_merkle, MerkleSlotState, MerkleWitness};
-pub use merkle_unified::{
-    prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
-};
-pub use block_spine::{
-    prove_block_spine_killshot, verify_block_spine_killshot,
-    discharge_block_spine_reductions_native, BlockSpineMle, BlockSpineProof,
-    BlockSpineReductions, BlockSpineKillShotProof, BlockSpineUnifiedProof,
-    BlockSpineShiftProof, BlockSpineShiftReduction, BlockSpineUnifiedReduction,
-    BLOCK_SPINE_ROUND_DEGREE, BLOCK_SPINE_SHIFT_DEGREE,
 };

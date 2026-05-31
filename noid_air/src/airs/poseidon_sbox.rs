@@ -20,7 +20,7 @@
 //! `PoseidonPermAir` (3c-1.4) passes concrete column indices via
 //! [`SboxX7Layout`] and stitches many S-box lanes + MDS + RC into one
 //! trace, the same way `BalanceGateAir` stitches many `BitAdderAir`
-//! instances via [`BitAdderLayout`].
+//! instances via `BitAdderLayout`.
 
 use crate::gates::{MulGate, SquareGate};
 use crate::Constraint;

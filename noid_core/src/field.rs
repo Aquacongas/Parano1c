@@ -21,7 +21,7 @@ impl core::fmt::Display for SerializationError {
 ///
 /// Each level `K` stores `EXTENSION_TAU` — the constant for the
 /// quadratic extension to the next level, satisfying:
-///   F_{2K} = F_K[X] / (X^2 + X + EXTENSION_TAU)
+///   F_{2K} = F_K\[X\] / (X^2 + X + EXTENSION_TAU)
 pub trait TowerField:
     Copy
     + Default

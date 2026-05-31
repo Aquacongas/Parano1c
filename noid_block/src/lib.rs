@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G — Block Folding (Deferred-Opening).
-//!
-//! See `DESIGN.md` in this crate for the full specification.
+//! Block Folding (Deferred-Opening).
 //!
 //! # Protocol summary
 //!
@@ -17,7 +15,6 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod channel;
-pub mod full_node;
 
 use crate::channel::{
     block_multipoint_channel, compute_tx_transcript_digest, merkle_reduce,

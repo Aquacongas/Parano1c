@@ -22,16 +22,12 @@ use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
-use crate::auth_unified_v2::{
-    AuthKillShotProof, AuthShiftReduction, AuthUnifiedReduction,
-};
+use crate::auth_unified_v2::{AuthKillShotProof, AuthShiftReduction, AuthUnifiedReduction};
 use crate::batch_eval::{
     prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
 };
 use crate::merkle_circuit::{MerkleCircuit, MerklePathInputs, MAX_MERKLE_DEPTH, N_MERKLE_SLOTS};
-use crate::merkle_mle::{
-    build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_UNIFIED_VARS,
-};
+use crate::merkle_mle::{build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_UNIFIED_VARS};
 use crate::merkle_oracle::evaluate_merkle;
 use crate::merkle_unified::{
     prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
@@ -125,10 +121,8 @@ pub fn build_merkle_unified_from_inputs(
 ) -> MerkleUnifiedMle {
     let live_slots = MerkleCircuit::live_slots(inputs.active_depth);
     let w = evaluate_merkle(circuit, inputs);
-    let state_ins: Vec<[Block128; STATE_SIZE]> = w.slots[..live_slots]
-        .iter()
-        .map(|s| s.state_in)
-        .collect();
+    let state_ins: Vec<[Block128; STATE_SIZE]> =
+        w.slots[..live_slots].iter().map(|s| s.state_in).collect();
     let (mle, _) = build_merkle_unified_mle(&state_ins, live_slots);
     mle
 }
@@ -239,7 +233,12 @@ pub fn verify_merkle_killshot<T: FiatShamir<Block128>>(
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, N_MERKLE_UNIFIED_VARS, channel)?;
+    let sin_red = verify_batch_eval(
+        &proof.sin_batch,
+        &sin_claims,
+        N_MERKLE_UNIFIED_VARS,
+        channel,
+    )?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
@@ -322,7 +321,9 @@ mod tests {
             .expect("verifier accepts honest proof");
 
         assert_eq!(v_red, reductions);
-        assert!(discharge_merkle_reductions_native(&circuit, &inputs, &v_red));
+        assert!(discharge_merkle_reductions_native(
+            &circuit, &inputs, &v_red
+        ));
     }
 
     #[test]
@@ -338,7 +339,9 @@ mod tests {
             .expect("verifier accepts honest proof");
 
         assert_eq!(v_red, reductions);
-        assert!(discharge_merkle_reductions_native(&circuit, &inputs, &v_red));
+        assert!(discharge_merkle_reductions_native(
+            &circuit, &inputs, &v_red
+        ));
     }
 
     #[test]

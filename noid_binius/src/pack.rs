@@ -16,7 +16,7 @@
 use noid_core::{Block128, TowerField};
 
 /// The basis used to re-expand a packed Block128 into 128 GF(2)-coordinates:
-///   BETA[k] = Block128::from(1u128 << k)
+///   `BETA[k]` = `Block128::from(1u128 << k)`
 ///
 /// For any packed word `p = Σ_k b_k · BETA[k]` with `b_k ∈ {0,1}`, the
 /// inner product `<p, BETA> == p` (in the canonical GF(2) embedding) —

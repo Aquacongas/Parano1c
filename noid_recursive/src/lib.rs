@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Phase 7 recursive chain proofs — O(1) historical verification.
+//! Recursive chain proofs for O(1) historical verification.
 //!
 //! Core components:
 //! - `ChainAccumulator`: rolling hash commitment to the entire chain history.

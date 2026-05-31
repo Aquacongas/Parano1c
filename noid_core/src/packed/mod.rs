@@ -64,8 +64,7 @@ pub struct PackedBlock128 {
 }
 
 const _: () = assert!(
-    core::mem::size_of::<PackedBlock128>()
-        == PACKED_LANES * core::mem::size_of::<Block128>(),
+    core::mem::size_of::<PackedBlock128>() == PACKED_LANES * core::mem::size_of::<Block128>(),
     "PackedBlock128 must be exactly PACKED_LANES * sizeof(Block128)"
 );
 const _: () = assert!(

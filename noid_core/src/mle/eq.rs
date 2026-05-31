@@ -26,7 +26,7 @@ pub fn eq_ind<F: TowerField>(x: &[F], y: &[F]) -> F {
 /// Compute the partial evaluation of the equality indicator polynomial.
 ///
 /// Returns the tensor product (1 - r_0, r_0) ⊗ ... ⊗ (1 - r_{n-1}, r_{n-1})
-/// as a Vec<F> of length 2^n.
+/// as a `Vec<F>` of length 2^n.
 pub fn eq_ind_partial_eval<F: TowerField>(point: &[F]) -> Vec<F> {
     if point.is_empty() {
         return vec![F::ONE];

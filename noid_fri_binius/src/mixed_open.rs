@@ -18,7 +18,7 @@
 //! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
-use noid_core::mle::evaluate::{evaluate_slice_with_scratch};
+use noid_core::mle::evaluate::evaluate_slice_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri::Channel;
@@ -73,7 +73,7 @@ pub fn prove_mixed_opening(
     thread_local! {
         static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
     }
-    
+
     let primary_openings: Vec<Block128> = state
         .raw_cols
         .par_iter()

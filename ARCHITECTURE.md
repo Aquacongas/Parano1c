@@ -196,8 +196,8 @@ doing what it does best.
   │          │                                               │
   │          └─► FRI  ── low-degree proximity test           │
   │                                                          │
-  │   Stage G ── deferred-opening block aggregation          │
-  │   Stage H ── recursive chain (Phase 7, planned)          │
+  │   deferred-opening block aggregation (FRI batching)      │
+  │   recursive chain accumulation (O(1) verification)       │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -328,19 +328,20 @@ step:
 
 FRI-Binius runs on top of the **binary tower GF(2^128)**, with
 CLMUL-accelerated multiplication and AVX2-SIMD squaring. Commitments
-are Poseidon2b Merkle trees over interleaved packed columns. The PCS
-supports mixed-length columns (log_len=13 for the AIR trace, log_len=15
-for boundary MLEs) batched into a single multipoint-close opening.
+use Blake3 for the interleaved column cap and Poseidon2b for the
+compact FRI Merkle trees. The PCS uses `log_len = 11` (2 048 rows)
+for the AIR trace, batching all column openings into a single
+multipoint-close FRI opening.
 
-**Measured performance (per-tx, 2in/4out, single-thread):**
-- Prove: ~725 ms
-- Verify: ~145 ms
-- Proof size: ~55 KB
+**Measured performance (per-tx, 2in/4out, parallel):**
+- Prove: ~156 ms
+- Verify: ~84 ms
+- Proof size: ~26 KB
 
-### 4.4 Block aggregation — current implementation (Stage G)
+### 4.4 Block aggregation — current implementation
 
 One `tx` produces one `LogicProof`. A block contains hundreds of them.
-The current block aggregation (Stage G, `noid_block`) folds them via
+The current block aggregation (`noid_block`) folds them via
 **deferred-opening**:
 
 ```
@@ -360,9 +361,9 @@ polynomials share one Merkle cap, one set of FRI queries, and one
 terminal opening point. The per-tx algebraic STARK proves the
 constraints; the block-level sumcheck and FRI prove the column openings.
 
-### 4.5 IVC — ✅ Done (Phase 7, Stage H)
+### 4.5 IVC — Incremental Verifiable Computation
 
-**O(1) historical verification is implemented.** The `noid_recursive` crate
+The chain uses incremental verifiable computation (IVC): each block proof embeds a compressed accumulator that lets any node verify the entire chain history in O(1) time (~6.5 KB proof, ~5 ms verify). The `noid_recursive` crate
 contains a recursive STARK accumulator (`RecursiveBlockAir`) that folds
 block proofs. Each block extends the `ChainAccumulator` via:
 
@@ -384,7 +385,7 @@ Security: per-tx FS challenges are bound through the chain hash via
 `proof_transcript_hash → H_BLOCK(header) → chain_hash`, without
 requiring in-circuit FS derivation.
 
-### 4.6 Recursive chain of proofs ✅ Done
+### 4.6 Recursive chain of proofs
 
 Every block's `prove_block_full` produces a `RecursiveBlockProof` that
 extends the `ChainAccumulator`. The accumulator is a rolling Poseidon2b
@@ -431,7 +432,7 @@ The miner's BlockStateBinding proves:
 
 #### Chain validity (BlockProof)
 
-A `BlockProof` (current Stage G implementation) combines:
+A `BlockProof` combines:
 
 1. All LogicProofs are valid (algebraic correctness).
 2. BlockStateBinding is valid (state correctness).
@@ -447,10 +448,6 @@ Consequently a `BlockProof` certifies:
   (c)  the bridge between (a) and (b) is sound
   (d)  the global state evolution is coherent
 ```
-
-Note: recursive chain accumulation (O(1) historical verification) is
-planned for Phase 7 (Stage H). The current `BlockProof` does not
-verify prior blocks recursively.
 
 ---
 
@@ -510,7 +507,7 @@ verify prior blocks recursively.
   │   BlockStateBinding: opens all touched slots, verifies      │
   │   pre-state, outputs empty, C_claimed bridge                │
   │                                                             │
-  │   Aggregation (Stage G deferred-opening):                   │
+  │   Aggregation (deferred-opening):                           │
   │     one Merkle cap for all columns + N algebraic STARKs     │
   │     + block multipoint sumcheck + single FRI opening        │
   │     → BlockProof                                            │
@@ -704,96 +701,6 @@ external miner has no CPU proof capability — it cannot steal blocks.
 (`noid_chain::da::packed_witness_root`). It binds the tx_bodies and
 coinbase to the header: changing the coinbase requires regenerating
 `witness_root` → header → BlockProof (block withholding protection).
-
----
-
-## 9. What is done, what is ahead
-
-**Done (Phase 1, Stage S — Stateless architecture):**
-
-- Poseidon2b native + AIR encoding.
-- AIRs: `balance_gate`, `range_gate`, `tx_body_spine` (2-lane `tx_body_hash` pin),
-  `block_state_binding` (block-level slot opening), plus composition layer.
-- `TxLogicAir` — stateless wallet-side AIR (no state columns).
-- `LogicProof` pipeline (`prove_logic` / `verify_logic`):
-  wallet proves AuthGKR + STARK; SpineGKR deferred to block-prover.
-- Split GKR architecture: AuthGKR at wallet, SpineGKR at block-prover.
-- Epoch anchor replaces `prev_state_root` in `tx_body_hash`.
-- C_claimed bridge: Poseidon2b sponge over claimed slot data links
-  LogicProof to BlockStateBinding.
-- `BlockStateBinding` (native): opens all touched slots, verifies bridge.
-- NullifierSet rolling window.
-- TxIntent wire format: spend_secret stripped from network payload.
-- FRI-Binius over GF(2^128) with interleaved packing and mixed-length
-  multipoint-close (`noid_fri_binius`).
-- Stage G deferred-opening block aggregation (`noid_block`):
-  N algebraic per-tx STARKs + unified block SpineGKR Kill-Shot +
-  block-level multipoint sumcheck + single FRI opening → `BlockProof`.
-- GKR Kill-Shot: Spine (59-slot, `SpineProofKillShot`),
-  Auth (20-slot, `AuthProofKillShot`), Merkle (32-slot, fully tested).
-- All unit and integration tests pass. Block prove/verify roundtrip confirmed.
-
-**Done (Phase 3, Stage F — Segmented State & Merkle Kill-Shot):**
-
-- `SegmentedFriState` replacing monolithic `FriState` in `ChainState`.
-  - `log_slots = 24` → `256` independent segments of `2^16` slots each.
-  - Virtual zero segments: no allocation until first write (genesis ≈ 24 KB RAM).
-  - Poseidon2b Merkle tree over segment FRI roots as global `state_root`.
-  - Dirty tracking: only touched segments recomputed on block apply.
-  - `ZERO_SEGTREE_NODE[d]` precomputed constants for O(1) expansion.
-  - `expand()`: doubles segment count, new root in one `compress()` call.
-- `StateBackend` trait + `RamBackend` (F.0/F.1).
-- `BlockStateBinding` updated to `SegmentedFriState` (F.6 partial).
-- Per-segment `BlockStateBindingAir` in `prove_block_full`: one AIR per
-  touched segment, each with 16-bit local eval point (F.6).
-- `prove_block` / `verify_block` accept `&[StateBindingBlockWitness]`
-  (multiple segment AIRs as separate multipoint participants).
-- Merkle Kill-Shot wired in `prove_block_full` / `verify_block_full` (F.5):
-  `prove_merkle_killshot` called for each touched segment when
-  `tree_depth > 0` (production); no-op for single-segment test mode.
-- `BlockHeader` extended with `log_slots`, `active_slot_count`,
-  `alloc_counter`; `hash_block_header` absorbs all three; wire size = 276 B.
-- `apply_block` validates `header.active_slot_count`, `header.alloc_counter`,
-  `header.log_slots` against post-apply chain state.
-- 730 tests pass, clean build.
-
-**Done (Phase 1.5, Stage Q — Parallel Per-Tx STARK):**
-
-- `per_tx_algebraic_channel(state_root, cap, k)` — independent per-tx Fiat-Shamir (Q.1).
-- `FixedColumns::from_air` shared zero-copy across all N txs (Q.2a).
-- `rayon::par_iter` over witness prep, Stage 5 prove, Stage 5 verify (Q.2b/Q.2c/Q.5).
-- `merkle_reduce(&tx_digests)` in Stage 6 transcript absorption (Q.4a).
-- Per-segment `state_binding_channel` for dedicated domain separation (Q.4).
-- Auth Kill-Shot + algebraic STARK verification fully parallel in `verify_block` (Q.5).
-- Benchmarks pending re-run (were ~43 s prove / ~15 s verify at 100 tx, target <8 s / <4 s).
-
-**Done (Phase 7, Stage H — Recursive Chain, O(1) Verification):**
-
-- `noid_recursive` crate: `ChainAccumulator`, `RecursiveBlockAir`, `prove_recursive_step`, `verify_tip`.
-- `RecursiveBlockProof` = **6.5 KB** constant size (no Merkle paths — compact FRI with n_rounds=0).
-- `verify_tip` = **~5 ms** O(1) — verifies entire chain history from one tiny proof.
-- `prove_recursive_step` overhead = **~30 ms/block** (dominates block time by < 0.05%).
-- Compact FRI round trees: Blake3 → Poseidon2b (enables algebraic FRI verification).
-- `prove_block_full` integrated: generates `RecursiveBlockProof` alongside `BlockProof`.
-- Chain hash security: `proof_transcript_hash → H_BLOCK → chain_hash` binds all per-tx FS challenges.
-- E2E test: `noid_block/tests/phase7_recursive_e2e.rs` (passes with `--ignored`).
-- 733 tests pass, clean release build.
-
-**Next (Phase 2, Stage P — Consensus & PoW):**
-
-- ASERT difficulty adjustment (`noid_chain/src/difficulty.rs`).
-- PoW validation (`noid_chain/src/pow.rs`).
-- All 16 block-level consensus invariants from SPECIFICATION.md §16.
-- Epoch anchor freshness check in mempool (#5).
-- `coinbase_credit == block_reward(height) + Σ fees` enforcement (#7).
-- Expansion trigger: 7-day rolling occupancy > 90% → `log_slots += 1`.
-
-**After Phase 2:**
-
-- Phase 4: Node binary, mempool, P2P, block assembly pipeline, RPC.
-- Phase 5: Wallet CLI (key management, LogicProof generation).
-
-See `ROADMAP2.md` for the detailed plan and performance targets.
 
 ---
 
@@ -1248,7 +1155,7 @@ Arrows represent flows of typed witness values (columns / cells).
       │  txs (public SpineInputs, no spend_secret needed)   │
       │  BlockStateBinding: opens all touched slots,        │
       │  verifies pre-state, outputs empty, C_claimed bridge│
-      │  Aggregation (Stage G deferred-FRI):                │
+      │  Aggregation (deferred-FRI):                         │
       │    one Merkle cap + N algebraic STARKs +            │
       │    multipoint sumcheck + single FRI opening         │
       │  → BlockProof                                       │
@@ -1300,12 +1207,12 @@ Arrows represent flows of typed witness values (columns / cells).
                         (unified block SpineGKR over all N×59 slots;
                          spine_unified_v2, spine_shift, batch_eval)
   GKR Merkle Kill-Shot  noid_gkr::merkle_killshot
-                        (segment Merkle path, Phase 3)
+                        (segment Merkle path)
   BLOCK_STATE_AIR       noid_air::airs::block_state_binding
                         (block-level slot opening AIR)
   BlockStateBinding     noid_chain::state_binding
                         (native: opens slots, verifies C_claimed bridge)
-  prove_block           noid_block  (Stage G: deferred-FRI aggregation +
+  prove_block           noid_block  (deferred-FRI aggregation +
                         unified block SpineGKR + algebraic per-tx STARKs
                         + multipoint sumcheck + single FRI opening)
 

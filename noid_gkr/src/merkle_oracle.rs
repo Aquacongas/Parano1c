@@ -97,9 +97,7 @@ fn build_state_in(
         }
         MerkleSlotRole::PermB { level } => {
             // Chains from PermA of same level: XOR sibling into rate.
-            let src_id = slot
-                .prev_output_src
-                .expect("PermB must chain from PermA");
+            let src_id = slot.prev_output_src.expect("PermB must chain from PermA");
             let s = prev[src_id].state_out;
             let [b0, b1] = inputs.siblings[level as usize];
             [s[0] + b0, s[1] + b1, s[2], s[3]]

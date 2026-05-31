@@ -485,7 +485,7 @@ pub fn emit_balance_constraints_split(
 /// without going through [`BalanceGateAir::build_trace`] (which wraps
 /// everything in a standalone [`Trace`]).
 ///
-/// Alias kept for [`TxValidityAir::build_trace_3b4`] compatibility.
+/// Alias kept for backward compatibility.
 pub fn build_balance_columns(
     inputs: [u64; 4],
     outputs: [u64; 8],

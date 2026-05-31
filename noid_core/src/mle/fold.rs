@@ -10,8 +10,10 @@ use crate::{Block128, TowerField};
 /// Given evaluations v[0..2^n] and a folding coordinate r, this computes
 /// evaluations of the (n-1)-variate polynomial f(X_0, ..., X_{n-2}, r).
 ///
-/// For each pair (v[j], v[j + half]), the new value is:
-///   v[j] += r * (v[j + half] - v[j])
+/// For each pair (`v[j]`, `v[j + half]`), the new value is:
+/// ```text
+/// v[j] += r * (v[j + half] - v[j])
+/// ```
 ///
 /// The vector is truncated to half its length. Runs in O(2^{n-1}) time.
 pub fn fold_highest_var_inplace<F: TowerField>(evals: &mut Vec<F>, r: F) {

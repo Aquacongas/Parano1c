@@ -842,8 +842,7 @@ mod tests {
         let after_tamper = commit_fast(&tampered, &ntt);
 
         assert_ne!(
-            original.vector_commitment.root,
-            after_tamper.vector_commitment.root,
+            original.vector_commitment.root, after_tamper.vector_commitment.root,
             "commit_fast root must change when codeword is tampered"
         );
     }

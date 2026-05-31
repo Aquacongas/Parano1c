@@ -11,7 +11,7 @@
 //! 4. FRI proof on batched polynomial B at the sumcheck's final point r
 
 use noid_core::mle::eq::eq_ind_partial_eval;
-use noid_core::mle::evaluate::{evaluate_slice_with_scratch};
+use noid_core::mle::evaluate::evaluate_slice_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri::prover::{prove as fri_prove, EvalProof};
@@ -67,7 +67,7 @@ pub fn prove_batched_opening(
     thread_local! {
         static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
     }
-    
+
     let column_openings: Vec<Block128> = state
         .raw_cols
         .par_iter()

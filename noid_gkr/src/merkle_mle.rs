@@ -27,7 +27,8 @@ pub const N_MERKLE_ROUND_VARS: usize = 7;
 /// `log2(4) = 2` element variables.
 pub const N_MERKLE_ELEM_VARS: usize = 2;
 /// Total variable count.
-pub const N_MERKLE_UNIFIED_VARS: usize = N_MERKLE_SLOT_BITS + N_MERKLE_ROUND_VARS + N_MERKLE_ELEM_VARS;
+pub const N_MERKLE_UNIFIED_VARS: usize =
+    N_MERKLE_SLOT_BITS + N_MERKLE_ROUND_VARS + N_MERKLE_ELEM_VARS;
 /// `2^14 = 16 384` cells.
 pub const N_MERKLE_UNIFIED_CELLS: usize = 1 << N_MERKLE_UNIFIED_VARS;
 

@@ -27,8 +27,10 @@
 //! `tree[1..=2N-1]` is a 1-indexed perfect binary tree over `N` segment
 //! roots. Leaves are at `tree[N..2N]`, root at `tree[1]`.
 //!
-//!   tree[k] = compress(tree[2k], tree[2k+1])   for k in 1..N
-//!   tree[N+i] = seg_roots[i]
+//! ```text
+//! tree[k] = compress(tree[2k], tree[2k+1])   for k in 1..N
+//! tree[N+i] = seg_roots[i]
+//! ```
 //!
 //! Dirty tracking (F.4): only the changed paths are updated (O(log N) per
 //! dirty segment). Clean segments never touch the Merkle tree.

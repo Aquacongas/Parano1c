@@ -28,7 +28,9 @@ use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
 use noid_stark::prove_logic::{prove_logic, verify_logic, LogicWitness};
-use noid_tx::{compute_claims_commitment, PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
+use noid_tx::{
+    compute_claims_commitment, PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -79,7 +81,12 @@ struct Scenario {
 }
 
 fn build_standard_scenario() -> Scenario {
-    let secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let addrs: [Address; 4] = [
         native_address(secrets[0]),
         native_address(secrets[1]),
@@ -119,10 +126,30 @@ fn build_standard_scenario() -> Scenario {
             TxInput::dummy(),
         ],
         outputs: vec![
-            TxOutput { slot_index: 1, value: 40, owner: out_owners[0], valid: true },
-            TxOutput { slot_index: 2, value: 30, owner: out_owners[1], valid: true },
-            TxOutput { slot_index: 4, value: 20, owner: out_owners[2], valid: true },
-            TxOutput { slot_index: 5, value: 10, owner: out_owners[3], valid: true },
+            TxOutput {
+                slot_index: 1,
+                value: 40,
+                owner: out_owners[0],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 2,
+                value: 30,
+                owner: out_owners[1],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 4,
+                value: 20,
+                owner: out_owners[2],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 5,
+                value: 10,
+                owner: out_owners[3],
+                valid: true,
+            },
             TxOutput::dummy(),
             TxOutput::dummy(),
             TxOutput::dummy(),
@@ -131,11 +158,20 @@ fn build_standard_scenario() -> Scenario {
         is_coinbase: false,
     };
 
-    Scenario { body, secrets, n_live: 2 }
+    Scenario {
+        body,
+        secrets,
+        n_live: 2,
+    }
 }
 
 fn build_max_scenario() -> Scenario {
-    let secrets = [mk_secret(0xA1), mk_secret(0xB2), mk_secret(0xC3), mk_secret(0xD4)];
+    let secrets = [
+        mk_secret(0xA1),
+        mk_secret(0xB2),
+        mk_secret(0xC3),
+        mk_secret(0xD4),
+    ];
     let addrs: [Address; 4] = [
         native_address(secrets[0]),
         native_address(secrets[1]),
@@ -144,8 +180,14 @@ fn build_max_scenario() -> Scenario {
     ];
 
     let out_secrets = [
-        mk_secret(0x10), mk_secret(0x20), mk_secret(0x30), mk_secret(0x40),
-        mk_secret(0x50), mk_secret(0x60), mk_secret(0x70), mk_secret(0x80),
+        mk_secret(0x10),
+        mk_secret(0x20),
+        mk_secret(0x30),
+        mk_secret(0x40),
+        mk_secret(0x50),
+        mk_secret(0x60),
+        mk_secret(0x70),
+        mk_secret(0x80),
     ];
     let out_owners: [Address; 8] = std::array::from_fn(|i| native_address(out_secrets[i]));
 
@@ -154,40 +196,96 @@ fn build_max_scenario() -> Scenario {
         fee: 575,
         inputs: vec![
             TxInput {
-                slot_index: 0, value: 1000, owner: addrs[0],
+                slot_index: 0,
+                value: 1000,
+                owner: addrs[0],
                 spend_secret: SpendSecret(fields_to_bytes(secrets[0])),
-                auth_tag: AuthTag([0u8; 32]), valid: true,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
             },
             TxInput {
-                slot_index: 3, value: 500, owner: addrs[1],
+                slot_index: 3,
+                value: 500,
+                owner: addrs[1],
                 spend_secret: SpendSecret(fields_to_bytes(secrets[1])),
-                auth_tag: AuthTag([0u8; 32]), valid: true,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
             },
             TxInput {
-                slot_index: 5, value: 250, owner: addrs[2],
+                slot_index: 5,
+                value: 250,
+                owner: addrs[2],
                 spend_secret: SpendSecret(fields_to_bytes(secrets[2])),
-                auth_tag: AuthTag([0u8; 32]), valid: true,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
             },
             TxInput {
-                slot_index: 7, value: 125, owner: addrs[3],
+                slot_index: 7,
+                value: 125,
+                owner: addrs[3],
                 spend_secret: SpendSecret(fields_to_bytes(secrets[3])),
-                auth_tag: AuthTag([0u8; 32]), valid: true,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
             },
         ],
         outputs: vec![
-            TxOutput { slot_index: 1, value: 400, owner: out_owners[0], valid: true },
-            TxOutput { slot_index: 2, value: 300, owner: out_owners[1], valid: true },
-            TxOutput { slot_index: 4, value: 200, owner: out_owners[2], valid: true },
-            TxOutput { slot_index: 6, value: 150, owner: out_owners[3], valid: true },
-            TxOutput { slot_index: 8, value: 100, owner: out_owners[4], valid: true },
-            TxOutput { slot_index: 9, value: 75, owner: out_owners[5], valid: true },
-            TxOutput { slot_index: 10, value: 50, owner: out_owners[6], valid: true },
-            TxOutput { slot_index: 11, value: 25, owner: out_owners[7], valid: true },
+            TxOutput {
+                slot_index: 1,
+                value: 400,
+                owner: out_owners[0],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 2,
+                value: 300,
+                owner: out_owners[1],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 4,
+                value: 200,
+                owner: out_owners[2],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 6,
+                value: 150,
+                owner: out_owners[3],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 8,
+                value: 100,
+                owner: out_owners[4],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 9,
+                value: 75,
+                owner: out_owners[5],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 10,
+                value: 50,
+                owner: out_owners[6],
+                valid: true,
+            },
+            TxOutput {
+                slot_index: 11,
+                value: 25,
+                owner: out_owners[7],
+                valid: true,
+            },
         ],
         is_coinbase: false,
     };
 
-    Scenario { body, secrets, n_live: 4 }
+    Scenario {
+        body,
+        secrets,
+        n_live: 4,
+    }
 }
 
 fn finalize_scenario(scenario: &mut Scenario) {
@@ -204,7 +302,13 @@ fn build_logic_inputs(
     body: &TxBody,
     secrets: &[[Block128; 2]; N_AUTH_INPUTS],
     n_live: usize,
-) -> (TxLogicAir, noid_air::Trace, PublicInputs, SpineInputs, AuthInputs) {
+) -> (
+    TxLogicAir,
+    noid_air::Trace,
+    PublicInputs,
+    SpineInputs,
+    AuthInputs,
+) {
     let pins = boundary_pins_from_body(body);
     let air = TxLogicAir::new(pins);
 

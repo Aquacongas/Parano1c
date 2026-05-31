@@ -126,8 +126,8 @@ impl PackedBlock128 {
         }
     }
 
-    /// Conditional select: for each lane, return a[i] if mask[i] is all-ones,
-    /// else b[i]. Used in constant-time operations.
+    /// Conditional select: for each lane, return `a[i]` if `mask[i]` is all-ones,
+    /// else `b[i]`. Used in constant-time operations.
     #[inline(always)]
     pub fn select(mask: Self, a: Self, b: Self) -> Self {
         let and_a = Self {

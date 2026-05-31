@@ -18,7 +18,7 @@ impl Block8 {
         Self(val)
     }
 
-    /// Precomputed GF(2^8) squaring table: SQR_TABLE[a] = a^2.
+    /// Precomputed GF(2^8) squaring table: `SQR_TABLE[a]` = a².
     /// Built at compile time from the multiplication table.
     pub const SQR_TABLE: [u8; 256] = {
         let mut table = [0u8; 256];

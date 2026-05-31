@@ -24,10 +24,12 @@
 //!
 //! Module layout:
 //!
-//! - [`gates`] — reusable Stage 3b-1 primitives (`BoolGate`,
-//!   `WeightedLinearGate`, `SelectorGate`).
-//! - [`airs`] — concrete AIRs (`TxValidityAir`, `CarryRippleAir`,
-//!   `LinearCombinationAir`).
+//! - [`gates`] — reusable gate primitives: `BoolGate`,
+//!   `WeightedLinearGate`, `SelectorGate`, `EqLadderStepGate`, etc.
+//! - [`airs`] — concrete AIRs: `TxBodySpineComposite`, `BalanceGateAir`,
+//!   `BitAdderAir`, `CarryRippleAir`, `PoseidonPermAir`, etc.
+//! - [`composition`] — composite AIRs for the full transaction logic
+//!   (`TxLogicAir`).
 
 use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::{Block128, TowerField};
@@ -37,43 +39,24 @@ pub mod composition;
 pub mod gates;
 
 pub use airs::{
-    apply_mds_row, bit_adder_is_input_programme, bit_adder_is_reset_programme,
-    bit_adder_operand_programme, build_balance_columns, build_instance_layout, build_perm_trace,
-    build_sbox_x7_columns, build_tx_body_merkle_trace,
-    build_tx_body_merkle_trace_with_boundary_pins, build_tx_body_merkle_typed_trace,
-    emit_balance_constraints, emit_balance_selector_public_columns,
-    emit_balance_value_public_columns, emit_block_constraints, emit_mds_row_constraints,
-    emit_perm_all, emit_perm_all_at, emit_perm_mds_blend, emit_perm_mds_blend_at,
-    emit_perm_partial_sbox_kill, emit_perm_partial_sbox_kill_at, emit_perm_public_columns,
-    emit_perm_public_columns_at, emit_perm_public_columns_row_major_at, emit_perm_rc_binding,
-    emit_perm_rc_binding_at, emit_perm_sbox_chain, emit_perm_sbox_chain_at,
-    emit_sbox_x7_constraints, emit_tx_body_merkle_constraints,
-    emit_tx_body_merkle_constraints_with_boundary_pins, emit_tx_body_merkle_public_columns,
-    emit_tx_body_merkle_public_columns_with_boundary_pins, extract_instance_output,
-    extract_perm_output, instance_row_offset, is_full_round, leaf_rate_absorb_instance_ids,
-    leaf_rate_payload_col, perm_is_full_values, perm_is_full_values_row_major,
-    perm_is_round_values, perm_is_round_values_row_major, perm_rc_values, perm_rc_values_row_major,
-    tx_body_merkle_column_domains, write_perm_trace_at, write_perm_trace_at_offset, AccInitGate,
-    AccNextGate, BalanceBridgeBitsGate, BalanceBridgeCarryGate, BalanceFinalCarryGate,
-    BalanceFinalSumGate, BalanceGateAir, BalanceZeroAtTransitionGate, BitAdderAir,
-    BitAdderCarryInitGate, BitAdderCarryNextGate, BitAdderLayout, CarryInitGate, CarryNextGate,
-    CarryRippleAir, FaSumGate, LinearCombinationAir, MdsKind, MdsLayout, MdsRowGate, PadZeroGate,
-    PartialSboxKillGate, PermLayout, PermMdsBlendGate, PoseidonPermColumns, RangeGateAir,
-    SboxX7Layout, TxBodyMerkleAir, TxBodyMerkleBoundaryPins, TxBodySpineComposite, WeightInitGate,
-    WeightNextGate, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS, BIT_ADDER_COL_A,
-    BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET,
-    BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH, BIT_ADDER_N_COLS,
-    BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B, CARRY_RIPPLE_COL_CARRY,
-    CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM, CARRY_RIPPLE_LOG_WORD_BITS,
-    CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, DEFAULT_PERM_LAYOUT, N_LEAF_RATE_PAYLOAD_COLS,
-    POSEIDON_COL_IS_FULL, POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN,
-    POSEIDON_COL_SOUT, POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
+    bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
+    build_balance_columns, build_instance_layout, build_perm_trace, emit_balance_constraints,
+    emit_balance_selector_public_columns, emit_block_constraints, emit_perm_all,
+    emit_perm_public_columns, extract_perm_output, instance_row_offset, is_full_round,
+    BalanceGateAir, BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate, CarryInitGate,
+    CarryNextGate, CarryRippleAir, FaSumGate, LinearCombinationAir, PadZeroGate, RangeGateAir,
+    TxBodyMerkleBoundaryPins, TxBodySpineComposite, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
+    BALANCE_N_COLS, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
+    BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
+    BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,
+    CARRY_RIPPLE_COL_CARRY, CARRY_RIPPLE_COL_IS_RESET, CARRY_RIPPLE_COL_SUM,
+    CARRY_RIPPLE_LOG_WORD_BITS, CARRY_RIPPLE_N_COLS, CARRY_RIPPLE_WORD_BITS, POSEIDON_COL_IS_FULL,
+    POSEIDON_COL_IS_ROUND, POSEIDON_COL_RC, POSEIDON_COL_S, POSEIDON_COL_SIN, POSEIDON_COL_SOUT,
+    POSEIDON_COL_X2, POSEIDON_COL_X3, POSEIDON_COL_X4, POSEIDON_N_ACTIVE_ROWS,
     POSEIDON_PERM_LOG_ROWS, POSEIDON_PERM_N_COLS, POSEIDON_PERM_N_ROWS, RANGE_GATE_COL_ACC,
     RANGE_GATE_COL_BIT, RANGE_GATE_COL_IS_RESET, RANGE_GATE_COL_WEIGHT, RANGE_GATE_LOG_WORD_BITS,
-    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS, SBOX_X7_N_COLS, SPINE_LOG_ROWS, TXBODY_MERKLE_LAYOUT,
-    TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_COLS, TXBODY_MERKLE_N_COLS_WITH_BOUNDARY_PINS,
-    TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_N_ROWS, TXBODY_MERKLE_PRE_S_BASE,
-    TXBODY_MERKLE_SLOT_LOG_ROWS, TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
+    RANGE_GATE_N_COLS, RANGE_GATE_WORD_BITS, SPINE_LOG_ROWS, TXBODY_MERKLE_LAYOUT,
+    TXBODY_MERKLE_N_PERMS, TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS,
     TX_BODY_MERKLE_COL_OFFSET,
 };
 pub use airs::{
@@ -451,7 +434,7 @@ pub trait Constraint: Send + Sync {
     fn evaluate(&self, frame: EvalFrame) -> Block128;
 
     /// [2.C.1] Flat-basis evaluator — default implementation converts
-    /// the flat inputs back to tower, delegates to [`evaluate`], and
+    /// the flat inputs back to tower, delegates to `evaluate`, and
     /// converts the result back to flat. Bit-identical to the
     /// tower-basis path by construction (every operation factors
     /// through the same `evaluate` routine).
@@ -520,7 +503,7 @@ pub trait Air: Send + Sync {
     /// every shipped AIR either uses no `shifted_columns` at all, or
     /// gates cross-instance wraps behind an `is_reset` selector. New
     /// AIRs whose last-row wrap is semantically required must override
-    /// this to `true`. The Stage 5 `RowWindowWrapper` asserts policy
+    /// this to `true`. The `RowWindowWrapper` asserts policy
     /// compatibility against this flag: an AIR with
     /// `REQUIRES_TRUE_CYCLIC_WRAP = true` cannot be embedded under the
     /// default `MaskOff` policy and forces the caller to wire a
@@ -530,11 +513,11 @@ pub trait Air: Send + Sync {
     }
 
     /// Trace columns pinned to a publicly-known, verifier-side value
-    /// sequence (Stage 3d-0.1). Default empty: AIRs without pinned
-    /// columns keep legacy behaviour. Each declared column must be in
-    /// `0..n_columns()` and carry `2^log_rows()` values; duplicates are
-    /// rejected by `Air::check`. STARK-layer verification of public
-    /// columns lands in Stage 3d-0.2.
+    /// sequence. Default empty: AIRs without pinned columns keep legacy
+    /// behaviour. Each declared column must be in `0..n_columns()` and
+    /// carry `2^log_rows()` values; duplicates are rejected by
+    /// `Air::check`. STARK-layer verification of public columns is
+    /// performed in `noid_stark`.
     fn public_columns(&self) -> &[PublicColumn] {
         &[]
     }
@@ -789,7 +772,7 @@ impl CompositeAir {
         }
     }
 
-    /// Like [`from_parts`] but also declares a set of AIR-pinned public
+    /// Like [`CompositeAir::from_parts`] but also declares a set of AIR-pinned public
     /// (programme) columns. Each declaration is native-checked by
     /// [`Air::check`] and bound at the STARK verifier via
     /// `check_public_columns` in `noid_stark`.

@@ -39,7 +39,6 @@ pub const COMPACT_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
 pub const COMPACT_NUM_QUERIES: usize = 8;
 
-
 // ---------------------------------------------------------------------------
 // Proof structures
 // ---------------------------------------------------------------------------
@@ -605,7 +604,11 @@ fn verify_batched_merkle_proof(
 // ---------------------------------------------------------------------------
 
 /// Generate compact query indices.
-fn gen_compact_queries(channel: &mut Channel, log_max_len: usize, num_queries: usize) -> Vec<usize> {
+fn gen_compact_queries(
+    channel: &mut Channel,
+    log_max_len: usize,
+    num_queries: usize,
+) -> Vec<usize> {
     let domain_size = 1usize << log_max_len;
     if domain_size == 0 {
         return vec![];

@@ -13,7 +13,6 @@ Companion documents:
 - `DESIGN_NOTES.md` — non-normative design rationale, philosophy, and
   open questions that are not yet part of the protocol.
 - `noid_gkr/SPEC.md`, `noid_gkr/AUDIT.md` — GKR sub-protocol details.
-- `ROADMAP2.md` — delivery status.
 
 Keyword conventions (RFC 2119): **MUST**, **MUST NOT**, **SHALL**,
 **SHOULD**, and **MAY** carry their usual normative meaning.
@@ -457,7 +456,7 @@ The Full Node then:
    `prev_block_state_root`), that output slots are EMPTY, and that
    the post-state `new_block_state_root` is correctly computed;
 3. aggregates all LogicProofs + BlockStateBinding into one
-   `BlockProof` via deferred-opening (Stage G / Stage S architecture);
+   `BlockProof` via deferred-opening aggregation;
 4. computes the resulting `state_root_next` and updates
    `active_slot_count`, `alloc_counter`, and (if the §15.3 trigger
    fires) `log_slots`;
@@ -682,15 +681,14 @@ packed into 1024 `Block128` words with opening at a random point
 
 ### 15.0.3 Block Aggregation (`noid_block`)
 
-Stage G deferred-opening aggregation: single interleaved Merkle tree
+Deferred-opening aggregation: single interleaved Merkle tree
 over all N per-tx columns + block-level SpineGKR Kill-Shot + N algebraic
 per-tx STARKs (no FRI per tx) + block-level multipoint sumcheck + one
-FRI-Binius mixed opening. This is the current (Phase 1 / Stage S)
-implementation.
+FRI-Binius mixed opening.
 
-IVC linear folding (`noid_ivc`) was a prototype that has been
-removed. A recursive chain accumulator (`noid_recursive`) is planned
-for Phase 7 (Stage H) to achieve O(1) historical verification.
+A recursive chain accumulator (`noid_recursive`) achieves O(1) historical
+verification: each block proof embeds a compressed accumulator, enabling
+chain verification via a single ~6.5 KB proof verifiable in ~5 ms.
 
 ---
 
@@ -1126,16 +1124,14 @@ Consequently a `BlockProof` certifies:
 
 ### 17.1 Recursive chain validity (overview)
 
-When the recursive chain is active (Stage H), each `BlockProof_{n+1}`
-additionally certifies the algebraic validity of `BlockProof_n`.
+Each `BlockProof_{n+1}` additionally certifies the algebraic validity of `BlockProof_n`.
 The recursive circuit verifies the prior block's sumcheck, GKR, and
 composition claims in-circuit, while deferring FRI Merkle-path
 verification to a running hash commitment checked natively at the tip.
 
 A fresh node verifies the tip's recursive STARK proof plus one native
 FRI Merkle check to gain cryptographic certainty over the entire chain
-from genesis. Full specification of the recursive protocol will be
-added after implementation (see `ROADMAP2.md` Part II).
+from genesis.
 
 ---
 

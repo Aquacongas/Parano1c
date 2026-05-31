@@ -18,7 +18,59 @@
 //! (same as 3c-5), laid out back-to-back in post-order tree traversal
 //! so every cross-instance echo interval is bounded by subtree size.
 
-use super::air::{instance_row_offset, TXBODY_MERKLE_SLOT_ROWS};
+use crate::airs::poseidon_perm::{PermLayout, DEFAULT_PERM_LAYOUT};
+use noid_core::Block128;
+
+/// Rows allotted to each permutation instance (128 = nearest power-of-2 ≥ N_ROUNDS+1).
+pub const TXBODY_MERKLE_SLOT_ROWS: usize = 128;
+
+/// Row offset of instance `k`'s first row.
+#[inline]
+pub const fn instance_row_offset(k: usize) -> usize {
+    k * TXBODY_MERKLE_SLOT_ROWS
+}
+
+/// The default Poseidon2b permutation column layout used by the tx-body
+/// Merkle stack. GKR reads this to locate the `s` output-state columns.
+pub const TXBODY_MERKLE_LAYOUT: PermLayout = DEFAULT_PERM_LAYOUT;
+
+/// Total number of Poseidon2b permutations the tx-body GKR circuit proves
+/// (mirrors `N_INSTANCES`). Named separately so callers need not import
+/// `layout::N_INSTANCES` directly.
+pub const TXBODY_MERKLE_N_PERMS: usize = N_INSTANCES;
+
+/// Stage 1 — verifier-known scalars binding the tx-body Merkle tree
+/// into the outer STARK. See `CRYPTO.md §Stage 1` for the full pin
+/// catalogue and soundness argument.
+///
+/// Fields store the little-endian `[Block128; 2]` representation of
+/// 32-byte digests (as produced by
+/// `noid_poseidon2b::primitives::{Address, TxBodyHash}::as_fields`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TxBodyMerkleBoundaryPins {
+    /// L0 of the tx-body Merkle tree, pinned into
+    /// `pre_s[0..1] @ slot_base_row(28)`.
+    pub epoch_anchor: [Block128; 2],
+    /// L1 of the tx-body Merkle tree. Injected as the constant term of
+    /// the existing pos=0 PermB rate-absorb gate (instance 29).
+    pub fee_leaf: [Block128; 2],
+    /// Canonical tx-body hash; pinned into `s[0..1]` at the wrap
+    /// instance's post-MDS output row (instance 58).
+    pub tx_body_hash: [Block128; 2],
+    /// Stage 1b — declared absorbed payload for each of the 4 input
+    /// leaves. `input_leaf_absorb[leaf][word]` holds the four
+    /// `hash_leaf([slot, value, owner_hi, owner_lo])` field inputs in
+    /// canonical order. Word 0/1 are absorbed into PermA's
+    /// `pre_s[0..1]`; word 2/3 appear at PermB's `payload[0..1]`.
+    pub input_leaf_absorb: [[Block128; 4]; 4],
+    /// E.5.f₂ — L14 leaf digest `[is_coinbase_as_u128, 0]`, pinned at
+    /// instance-42 `pre_s[0..1]` (the pos=7 level-1 compress PermA).
+    pub is_coinbase_leaf: [Block128; 2],
+    /// Stage 1b — declared absorbed payload for each of the 8 output
+    /// leaves. `output_leaf_absorb[leaf][word]` holds
+    /// `hash_leaf([slot_index, value, owner_hi, owner_lo])` field inputs.
+    pub output_leaf_absorb: [[Block128; 4]; 8],
+}
 
 /// Shape of the tx-body Merkle tree (mirrors
 /// [`noid_poseidon2b::primitives`] constants; re-stated here to keep
@@ -330,7 +382,7 @@ fn make_meta(
 /// `instance_row_offset` (same `SLOT = 128` stride).
 #[inline]
 pub fn layout_instance_row_offset(id: usize) -> usize {
-    instance_row_offset(id)
+    id * TXBODY_MERKLE_SLOT_ROWS
 }
 
 #[cfg(test)]

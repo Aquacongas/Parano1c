@@ -232,13 +232,12 @@ mod tests {
         let live = 16;
         let tab = build_merkle_mu_table(live);
         for idx in 0..N_MERKLE_UNIFIED_CELLS {
-            let want = if merkle_slot_of(idx as u16) < live
-                && merkle_round_of(idx as u16) < N_ROUNDS
-            {
-                Block128::ONE
-            } else {
-                Block128::ZERO
-            };
+            let want =
+                if merkle_slot_of(idx as u16) < live && merkle_round_of(idx as u16) < N_ROUNDS {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                };
             assert_eq!(tab[idx], want, "mu mismatch at idx {idx}");
         }
     }

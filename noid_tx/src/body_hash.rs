@@ -55,7 +55,13 @@ pub fn hash_tx_body(
         output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
     }
 
-    hash_tx_body_core(epoch_anchor, fee, &input_leaves, &output_leaves, is_coinbase)
+    hash_tx_body_core(
+        epoch_anchor,
+        fee,
+        &input_leaves,
+        &output_leaves,
+        is_coinbase,
+    )
 }
 
 #[cfg(test)]

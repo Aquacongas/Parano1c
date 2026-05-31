@@ -266,8 +266,7 @@ impl TxBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            32
-                + 16
+            32 + 16
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
                 + 4
@@ -624,13 +623,13 @@ mod tests {
         // be faithfully represented.
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
-        // fee = u64::MAX + 1 as little-endian u128
+                                           // fee = u64::MAX + 1 as little-endian u128
         let fee_too_large: u128 = u64::MAX as u128 + 1;
         buf.extend_from_slice(&fee_too_large.to_le_bytes());
         // rest can be truncated — error should fire on fee
         put_u32(&mut buf, 0u32); // n_inputs = 0
         put_u32(&mut buf, 0u32); // n_outputs = 0
-        buf.push(0u8);           // is_coinbase = false
+        buf.push(0u8); // is_coinbase = false
         assert_eq!(TxBody::from_bytes(&buf), Err(WireError::FeeTooLarge));
     }
 

@@ -4,17 +4,12 @@
 //! `PublicColumn`: an AIR-level declaration that trace column `col`
 //! must match a fixed, verifier-known sequence `values[0..2^log_rows]`.
 //!
-//! This is the Stage 3d-0.1 primitive that closes every "trusted-input"
-//! debt carried from §3c-1 (`rc` / `is_full` / `is_round`) and the
-//! §3c-2/3/4 sponge boundaries (IV, absorb XOR, inter-perm carry, output
-//! squeeze) — any cell that must equal a programme-defined constant
-//! rather than a witness-free variable.
-//!
-//! The native `Air::check` path enforces `trace[col][row] == values[row]`
-//! row-by-row. The STARK-layer integration (programme-MLE evaluation
-//! at the sumcheck terminal `r`, no FRI commitment required) lands as
-//! Stage 3d-0.2. Until then, `PublicColumn` is native-check only and
-//! is not referenced by any STARK-composed AIR.
+//! Any cell that must equal a programme-defined constant rather than a
+//! free witness variable is expressed as a `PublicColumn`. The native
+//! `Air::check` path enforces `trace[col][row] == values[row]` row-by-row.
+//! In the STARK layer, the verifier evaluates the programme MLE at the
+//! sumcheck terminal `r` and asserts equality with the column's base
+//! opening — no extra FRI commitment is required.
 //!
 //! Design note. `PublicColumn` is deliberately *not* a `Constraint`:
 //! row-local constraints are evaluated at an arbitrary field point `r`
