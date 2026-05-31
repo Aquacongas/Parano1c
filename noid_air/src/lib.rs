@@ -539,6 +539,20 @@ pub trait Air: Send + Sync {
         &[]
     }
 
+    /// Domain of each trace column for the Tower Sumcheck optimisation.
+    ///
+    /// Returns `ColumnDomain::Block128` for all columns by default (conservative;
+    /// no boolean fast-path). AIRs that have GF(2)-valued columns should override
+    /// this to return `ColumnDomain::Bit` for those columns, enabling the
+    /// Tower Sumcheck boolean fast-path which replaces `clmul_gcm` with a bitwise
+    /// AND instruction for the partial-evaluation of boolean columns.
+    ///
+    /// The returned slice length MUST equal `n_columns()`. Implementations that
+    /// override this method should assert this in their AIR constructor.
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        vec![ColumnDomain::Block128; self.n_columns()]
+    }
+
     /// Sorted, de-duplicated union of `Constraint::shifted_columns()`
     /// across all constraints. This is the set of columns the STARK
     /// layer must materialise cyclically-rotated tables for, and for

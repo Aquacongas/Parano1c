@@ -759,6 +759,10 @@ impl Air for BalanceGateAir {
     fn public_columns(&self) -> &[PublicColumn] {
         &self.public_columns
     }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        // BalanceGate is BALANCE_N_BLOCKS × BitAdder — all columns boolean.
+        vec![ColumnDomain::Bit; BALANCE_N_COLS]
+    }
 }
 
 #[cfg(test)]

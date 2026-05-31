@@ -1961,4 +1961,11 @@ impl Air for TxBodyMerkleAir {
     fn public_columns(&self) -> &[PublicColumn] {
         &self.public_columns
     }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        if self.boundary_pins.is_some() {
+            tx_body_merkle_column_domains_with_boundary_pins()
+        } else {
+            tx_body_merkle_column_domains()
+        }
+    }
 }

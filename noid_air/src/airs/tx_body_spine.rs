@@ -160,9 +160,7 @@ pub fn emit_txv_tx_body_public_columns(pins: &TxBodyMerkleBoundaryPins) -> Vec<P
     [COL_SLOT_INDEX, COL_VALUE, COL_OWNER_HI, COL_OWNER_LO]
         .into_iter()
         .enumerate()
-        .map(|(lane, col)| {
-            PublicColumn::new(col, txv_tx_body_col_programme(lane, pins))
-        })
+        .map(|(lane, col)| PublicColumn::new(col, txv_tx_body_col_programme(lane, pins)))
         .collect()
 }
 
@@ -388,14 +386,17 @@ impl TxBodySpineComposite {
         let n_rows = 1usize << log_rows;
 
         // Witness columns [0, TX_VALIDITY_N_COLS)
-        let mut cols: Vec<Vec<Block128>> =
-            (0..TX_VALIDITY_N_COLS).map(|_| vec![Block128::ZERO; n_rows]).collect();
+        let mut cols: Vec<Vec<Block128>> = (0..TX_VALIDITY_N_COLS)
+            .map(|_| vec![Block128::ZERO; n_rows])
+            .collect();
         let mut domains = vec![ColumnDomain::Block128; TX_VALIDITY_N_COLS];
         domains[COL_INPUT_VALID] = ColumnDomain::Bit;
         domains[COL_OUTPUT_VALID] = ColumnDomain::Bit;
 
         for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
-            if !input.valid { continue; }
+            if !input.valid {
+                continue;
+            }
             cols[COL_INPUT_VALID][i] = Block128::ONE;
             cols[COL_SLOT_INDEX - TXV_COL_OFFSET][i] = Block128::from(input.slot_index as u128);
             cols[COL_VALUE - TXV_COL_OFFSET][i] = Block128::from(input.value as u128);
@@ -410,7 +411,9 @@ impl TxBodySpineComposite {
             cols[COL_AUTH_TAG_LO - TXV_COL_OFFSET][i] = tl;
         }
         for (j, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-            if !output.valid { continue; }
+            if !output.valid {
+                continue;
+            }
             let row = MAX_INPUTS + j;
             cols[COL_OUTPUT_VALID][row] = Block128::ONE;
             cols[COL_SLOT_INDEX - TXV_COL_OFFSET][row] = Block128::from(output.slot_index as u128);
@@ -455,7 +458,9 @@ impl TxBodySpineComposite {
         cols.push(txv_live_mask_programme());
         domains.push(ColumnDomain::Bit);
 
-        for col in &cols { debug_assert_eq!(col.len(), total_rows); }
+        for col in &cols {
+            debug_assert_eq!(col.len(), total_rows);
+        }
         assert_eq!(cols.len(), self.n_cols);
         Trace::new_with_domains(cols, domains)
     }
@@ -473,6 +478,23 @@ impl Air for TxBodySpineComposite {
     }
     fn public_columns(&self) -> &[PublicColumn] {
         &self.public_columns
+    }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        use crate::airs::balance_gate::BALANCE_N_COLS;
+        let mut domains = vec![ColumnDomain::Block128; TX_VALIDITY_N_COLS];
+        domains[COL_INPUT_VALID] = ColumnDomain::Bit;
+        domains[COL_OUTPUT_VALID] = ColumnDomain::Bit;
+        // Balance block: all BitAdder → all Bit
+        domains.extend(vec![ColumnDomain::Bit; BALANCE_N_COLS]);
+        // Two row-domain mask columns
+        domains.push(ColumnDomain::Bit);
+        domains.push(ColumnDomain::Bit);
+        // Merkle band (tx_body_hash lanes)
+        domains.extend(vec![ColumnDomain::Block128; MERKLE_BAND_WIDTH]);
+        // TxvLiveMask
+        domains.push(ColumnDomain::Bit);
+        debug_assert_eq!(domains.len(), self.n_cols);
+        domains
     }
 }
 
@@ -877,12 +899,7 @@ mod tests {
 
         // Every TxValidity tx-body column must be among the composite
         // public columns at the TxValidity offset.
-        let expected_cols = [
-            COL_SLOT_INDEX,
-            COL_VALUE,
-            COL_OWNER_HI,
-            COL_OWNER_LO,
-        ];
+        let expected_cols = [COL_SLOT_INDEX, COL_VALUE, COL_OWNER_HI, COL_OWNER_LO];
         for col in expected_cols {
             let hit = spine.public_columns().iter().any(|pc| pc.col == col);
             assert!(hit, "no PublicColumn declared for tx-body col {col}");

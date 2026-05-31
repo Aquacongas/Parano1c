@@ -512,6 +512,9 @@ impl Air for BitAdderAir {
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
     }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        vec![ColumnDomain::Bit; BIT_ADDER_N_COLS]
+    }
 }
 
 #[cfg(test)]

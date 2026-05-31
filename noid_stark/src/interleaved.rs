@@ -198,8 +198,21 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         sumcheck_cols.push(col.as_slice());
     }
 
+    // Tower Sumcheck: get column domains for boolean fast-path.
+    // Base columns [0..n_air_cols] from the AIR, rotated columns inherit source domain.
+    let mut sumcheck_domains = air.column_domains();
+    // Rotated (shifted) columns share their source column's domain.
+    for &col_id in &shifted_indices {
+        let d = if col_id < sumcheck_domains.len() {
+            sumcheck_domains[col_id]
+        } else {
+            noid_air::ColumnDomain::Block128
+        };
+        sumcheck_domains.push(d);
+    }
+
     let degree = round_poly_degree(air);
-    let (zero_check_rounds, r) = crate::prove_zero_check(
+    let (zero_check_rounds, r) = crate::prove_zero_check_with_domains(
         &sumcheck_cols,
         air.constraints(),
         &betas,
@@ -208,6 +221,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         degree,
         &shifted_slot,
         n_air_cols,
+        &sumcheck_domains,
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
 

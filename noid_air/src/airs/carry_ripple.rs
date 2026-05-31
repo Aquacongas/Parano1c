@@ -211,4 +211,7 @@ impl Air for CarryRippleAir {
     fn constraints(&self) -> &[Box<dyn Constraint>] {
         &self.constraints
     }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        vec![ColumnDomain::Bit; CARRY_RIPPLE_N_COLS]
+    }
 }
