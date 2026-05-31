@@ -47,7 +47,14 @@ use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
 
-const BASE_LOG: usize = 13;
+/// Log2 of the FRI slice size for the block-level interleaved commitment.
+/// All per-tx columns (AIR + auth slices) and spine slices are padded
+/// to `2^BASE_LOG` elements so `log_len = padded_log_len(SPINE_LOG_ROWS)`
+/// matches this value.  Must satisfy:
+///   BASE_LOG == SPINE_LOG_ROWS (both 11 → log_len 11 → 4× smaller sumcheck).
+/// Public so wallet code can slice auth MLEs to the same granularity.
+pub const BLOCK_BASE_LOG: usize = 11;
+const BASE_LOG: usize = BLOCK_BASE_LOG;
 const BLOCK_MULTIPOINT_TAG: u128 = 0xFFFB_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
@@ -160,8 +167,9 @@ pub struct TxBlockWitness<'a> {
     /// Pre-built auth proof from the wallet. The block prover includes
     /// this as-is without re-proving.
     pub auth_proof: &'a AuthProofKillShot,
-    /// Pre-built auth MLE slices from the wallet (2 slices, each
-    /// length 2^BASE_LOG). Needed for the interleaved commitment.
+    /// Pre-built auth MLE slices from the wallet (`2^(N_AUTH_UNIFIED_VARS - BASE_LOG)`
+    /// slices, each of length `2^BASE_LOG`). With BASE_LOG=11 this is 8 slices
+    /// of 2048 elements.  Needed for the interleaved commitment.
     pub auth_slices: &'a [Vec<Block128>],
 }
 
@@ -234,7 +242,10 @@ pub fn prove_block(
     let auth_circuit = AuthCircuit::build();
 
     let n_air_cols = witnesses[0].air.n_columns();
-    let n_auth_slices: usize = 2;
+    // Number of auth slices per tx: inferred from the first witness so the
+    // block prover is forward-compatible with any BASE_LOG the wallet uses.
+    // Expected: 2^(N_AUTH_UNIFIED_VARS - BASE_LOG) = 2^(14-11) = 8.
+    let n_auth_slices: usize = witnesses[0].auth_slices.len();
     let n_per_tx = n_air_cols + n_auth_slices;
     let log_len = noid_stark::padded_log_len(witnesses[0].trace.log_rows);
 
@@ -245,7 +256,7 @@ pub fn prove_block(
     // -------------------------------------------------------------------------
     // Stage 2: Build per-tx column pools + block spine MLE.
     // -------------------------------------------------------------------------
-    // Per-tx: AIR columns (padded) + 2 auth slices.
+    // Per-tx: AIR columns (padded) + N_AUTH_SLICES auth slices.
     // Block-level: unified spine state MLE split into slices.
 
     // Build fixed columns once from the first witness AIR (all txs share the

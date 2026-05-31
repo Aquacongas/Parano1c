@@ -15,18 +15,18 @@
 //! |   2 | `COL_R`       | Fiat-Shamir challenge for this round       |
 //! |   3 | `COL_CLAIM_IN`  | sumcheck claim entering this round         |
 //! |   4 | `COL_CLAIM_OUT` | folded claim: `p0 + r*(p0+p1)`            |
-//! |   5 | `COL_SEL_BLOCK` | 1 on block_n sumcheck rows (0–12)         |
-//! |   6 | `COL_SEL_REC`   | 1 on rec_{n-1} sumcheck rows (13–25)      |
-//! |   7 | `COL_SEL_ACC`   | 1 on accumulator row (26)                 |
+//! |   5 | `COL_SEL_BLOCK` | 1 on block_n sumcheck rows (0–10)         |
+//! |   6 | `COL_SEL_REC`   | 1 on rec_{n-1} sumcheck rows (11–21)      |
+//! |   7 | `COL_SEL_ACC`   | 1 on accumulator row (22)                 |
 //!
 //! ## Row layout (256 rows = 2^8)
 //!
 //! | Rows    | Purpose                                         |
 //! |---------|-------------------------------------------------|
-//! | 0–12    | block_n multipoint sumcheck (13 rounds)         |
-//! | 13–25   | rec_{n-1} multipoint sumcheck (13 rounds)       |
-//! | 26      | accumulator / state-root continuity check       |
-//! | 27–255  | padding (all zero, no active selector)          |
+//! | 0–10    | block_n multipoint sumcheck (11 rounds)         |
+//! | 11–21   | rec_{n-1} multipoint sumcheck (11 rounds)       |
+//! | 22      | accumulator / state-root continuity check       |
+//! | 23–255  | padding (all zero, no active selector)          |
 //!
 //! ## Constraints
 //!
@@ -39,6 +39,7 @@
 //!   `PublicColumn`s, so the verifier checks them against the known
 //!   programme without additional FRI overhead.
 
+use noid_air::airs::tx_body_spine::SPINE_LOG_ROWS;
 use noid_air::gates::{SelectorGate, WeightedLinearGate};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, PublicColumn};
 use noid_core::hardware::clmul_gcm;
@@ -65,11 +66,14 @@ pub const COL_SEL_REC: usize = 6;
 pub const COL_SEL_ACC: usize = 7;
 
 pub const BLOCK_SUMCHECK_START: usize = 0;
-pub const BLOCK_SUMCHECK_ROUNDS: usize = 13;
-pub const REC_SUMCHECK_START: usize = 13;
-pub const REC_SUMCHECK_ROUNDS: usize = 13;
+/// Rounds in the block-level multipoint sumcheck = log_len = SPINE_LOG_ROWS = 11.
+pub const BLOCK_SUMCHECK_ROUNDS: usize = SPINE_LOG_ROWS;
+/// Recursive sumcheck starts immediately after the block sumcheck rows.
+pub const REC_SUMCHECK_START: usize = BLOCK_SUMCHECK_ROUNDS;
+/// Rounds in the previous recursive proof's sumcheck (same log_len).
+pub const REC_SUMCHECK_ROUNDS: usize = SPINE_LOG_ROWS;
 /// Single accumulator / state-continuity check row.
-pub const ACC_ROW: usize = 26;
+pub const ACC_ROW: usize = REC_SUMCHECK_START + REC_SUMCHECK_ROUNDS;
 
 // =============================================================================
 // FoldCheckGate — degree-2 sumcheck fold constraint
@@ -165,9 +169,9 @@ pub struct RecursiveBlockWitness {
 /// AIR for one recursive proof step.
 ///
 /// Proves:
-/// 1. Block-n multipoint sumcheck consistency (13 rounds, rows 0–12).
-/// 2. Previous recursive proof sumcheck consistency (13 rounds, rows 13–25).
-/// 3. Accumulator state-root continuity at row 26.
+/// 1. Block-n multipoint sumcheck consistency (11 rounds, rows 0–10).
+/// 2. Previous recursive proof sumcheck consistency (11 rounds, rows 11–21).
+/// 3. Accumulator state-root continuity at row 22.
 ///
 /// Selector columns (`COL_SEL_BLOCK`, `COL_SEL_REC`, `COL_SEL_ACC`) are
 /// declared as `PublicColumn`s — the verifier evaluates their MLEs

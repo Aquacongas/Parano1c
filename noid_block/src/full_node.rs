@@ -38,7 +38,6 @@ use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, MerkleCircuit, MerklePathInputs, SpineInputs, MAX_MERKLE_DEPTH};
 use noid_recursive::{
     accumulator::ChainAccumulator,
-    air::RecursiveBlockAir,
     prove::{prove_recursive_step, RecursiveBlockProof},
     verify::verify_tip,
     witness::BlockReplayWitness,

@@ -569,83 +569,6 @@ fn accumulate_sum_tower(
         .reduce(|| 0u128, |a, b| a ^ b)
 }
 
-/// Evaluate the per-row composition `eq · Σ β_k · C_k` in flat basis,
-/// fusing partial-evaluation of `eq` and every column with the constraint
-/// accumulation. Computes `partial[j] = table[j] ⊕ s_flat·(table[j+half]⊕table[j])`
-/// on-the-fly per hypercube position `j`, eliminating the `Vec<Cow>`
-/// allocations that the legacy two-step pipeline incurred for every
-/// sample point ≥ 2.
-fn accumulate_sum_flat_fused(
-    cur_eq: &[u128],
-    cur_cols: &[Vec<u128>],
-    compiled: &CompiledGates<'_>,
-    s_idx: usize,
-    s_flat: u128,
-) -> u128 {
-    use noid_core::hardware::clmul_gcm;
-    use rayon::prelude::*;
-    let half = cur_eq.len() / 2;
-    let n_constraints = compiled.constraints.len();
-    let local_cap = compiled.max_local_arity;
-    let next_cap = compiled.max_next_arity;
-    let n_cols = cur_cols.len();
-
-    // Inline partial-eval helper — avoids function call overhead in the hot loop.
-    #[inline(always)]
-    fn pe(table: &[u128], j: usize, half: usize, s_idx: usize, s_flat: u128) -> u128 {
-        if s_idx == 0 {
-            table[j]
-        } else if s_idx == 1 {
-            table[j + half]
-        } else {
-            table[j] ^ clmul_gcm(s_flat, table[j + half] ^ table[j])
-        }
-    }
-
-    (0..half)
-        .into_par_iter()
-        .map_init(
-            || {
-                (
-                    Vec::<u128>::with_capacity(local_cap),
-                    Vec::<u128>::with_capacity(next_cap),
-                    vec![0u128; n_cols],
-                )
-            },
-            |(local_scratch, next_scratch, col_partials), j| {
-                let eq_val = pe(cur_eq, j, half, s_idx, s_flat);
-
-                for (col_idx, col) in cur_cols.iter().enumerate() {
-                    col_partials[col_idx] = pe(col, j, half, s_idx, s_flat);
-                }
-
-                let mut composition: u128 = 0;
-                for k in 0..n_constraints {
-                    let lo_s = compiled.col_index_starts[k] as usize;
-                    let lo_e = compiled.col_index_starts[k + 1] as usize;
-                    local_scratch.clear();
-                    for &idx in &compiled.col_indices[lo_s..lo_e] {
-                        local_scratch.push(col_partials[idx as usize]);
-                    }
-                    let ne_s = compiled.next_index_starts[k] as usize;
-                    let ne_e = compiled.next_index_starts[k + 1] as usize;
-                    next_scratch.clear();
-                    for &idx in &compiled.next_indices[ne_s..ne_e] {
-                        next_scratch.push(col_partials[idx as usize]);
-                    }
-                    let frame = FlatEvalFrame {
-                        local: local_scratch.as_slice(),
-                        next: next_scratch.as_slice(),
-                    };
-                    let ck = compiled.constraints[k].evaluate_flat(frame);
-                    composition ^= clmul_gcm(compiled.betas_flat[k], ck);
-                }
-                clmul_gcm(eq_val, composition)
-            },
-        )
-        .reduce(|| 0u128, |a, b| a ^ b)
-}
-
 /// Prover for the batched zero-check sumcheck. Holds the folded
 /// column tables + eq table in flat basis (GCM polynomial basis)
 /// across every round; converts to/from tower only at four
@@ -1170,7 +1093,7 @@ fn prove_multipoint_close_inner(
     // batch still opens every `padded_columns[i]` at `r''`; this
     // collapse only lives inside the sumcheck pair list.
     //
-    // Savings (per-tx fixture, n = 575, log_len = 13): ~600 pair-folds
+    // Savings (per-tx fixture, n = 575, log_len = 11): ~600 pair-folds
     // per round × 13 rounds + n-way allocation of `A_k` tables
     // collapses to one. Ladder pairs are unchanged — they each carry
     // a distinct `W_s(·)` on the A-side.
@@ -1298,7 +1221,7 @@ pub struct ExtraColumn {
 pub struct SliceClaim {
     /// Column index in the extended trace (>= n_air_cols).
     pub col_index: usize,
-    /// The evaluation point (length = log_len = BASE_LOG = 13).
+    /// The evaluation point (length = log_len = BASE_LOG = 11).
     pub eval_point: Vec<Block128>,
     /// The claimed evaluation value of the slice MLE at eval_point.
     pub value: Block128,
@@ -2770,7 +2693,7 @@ pub(crate) fn check_public_columns<A: Air + ?Sized>(
         // bits followed by 8128 zeros; `emit_*_public_columns` similarly
         // leaves long zero tails. Locate the last nonzero index once and
         // truncate the dot product there — dominates the comp runtime of
-        // the composite AIR where ~500 pins share a 2^13 hypercube.
+        // the composite AIR where ~500 pins share a 2^11 hypercube.
         let vs = pc.values.as_slice();
         let mut hi = vs.len();
         while hi > 0 && vs[hi - 1] == Block128::ZERO {

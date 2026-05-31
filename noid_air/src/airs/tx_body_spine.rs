@@ -1,8 +1,8 @@
 //! `TxBodySpineComposite` — composite trace for wallet-side proving.
 //!
 //! Stitches the witness/balance block (width `TXV_BLOCK_N_COLS = 78`)
-//! with `TxBodyMerkleAir::new_with_boundary_pins(pins)` into a single
-//! AIR at `log_rows = 13`.
+//! with the retained GKR-spine body-hash band into a single
+//! AIR at `log_rows = 11`.
 //!
 //! # Column layout
 //!
@@ -13,7 +13,7 @@
 //! - tail column → `TxvLiveMask` `PublicColumn`.
 
 use crate::airs::tx_body_merkle::{
-    TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_LOG_ROWS, TXBODY_MERKLE_N_PERMS,
+    TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
 };
 use crate::gates::PublicColumn;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -33,12 +33,16 @@ pub const TXV_BLOCK_N_COLS: usize = 78;
 pub const TX_BODY_MERKLE_COL_OFFSET: usize = TXV_BLOCK_N_COLS;
 
 /// Witness region row count at the floor log_rows = 8: rows
-/// `[0, TXV_LIVE_ROWS)` carry live witness; rows `[TXV_LIVE_ROWS, 2^13)`
+/// `[0, TXV_LIVE_ROWS)` carry live witness; rows `[TXV_LIVE_ROWS, 2^11)`
 /// are the dead tail.
 pub const TXV_LIVE_ROWS: usize = 1 << 8;
 
-/// Composite `log_rows`, fixed to the TxBodyMerkle native value.
-pub const SPINE_LOG_ROWS: usize = TXBODY_MERKLE_LOG_ROWS;
+/// Composite `log_rows`. Set to 11 (2048 rows) — independent of
+/// `TXBODY_MERKLE_LOG_ROWS` (13) now that the 59-perm Merkle trace
+/// is retired from the STARK and owned entirely by GKR. The balance
+/// gate requires log_rows ≥ BALANCE_MIN_LOG_ROWS (8); 11 fits the
+/// live data in L3 cache (81 cols × 2048 rows × 16 B ≈ 2.6 MB).
+pub const SPINE_LOG_ROWS: usize = 11;
 
 // ---------------------------------------------------------------------------
 // Column indices for witness fields inside the composite trace.
@@ -588,7 +592,7 @@ mod tests {
         assert_eq!(TXV_COL_OFFSET, 0);
         assert_eq!(TX_BODY_MERKLE_COL_OFFSET, TXV_BLOCK_N_COLS);
         assert_eq!(TX_BODY_MERKLE_COL_OFFSET, 78);
-        assert_eq!(SPINE_LOG_ROWS, 13);
+        assert_eq!(SPINE_LOG_ROWS, 11);
         assert_eq!(TXV_LIVE_ROWS, 256);
         let n = spine_n_cols();
         assert_eq!(n, TXV_BLOCK_N_COLS + merkle_band_width() + 1);
@@ -656,7 +660,7 @@ mod tests {
     #[test]
     fn dead_tail_freedom_on_txv_block() {
         // Property: writing arbitrary junk into *any* TxValidity
-        // witness column on *any* dead row (TXV_LIVE_ROWS..2^13) does
+        // witness column on *any* dead row (TXV_LIVE_ROWS..2^11) does
         // not cause `Air::check` to reject. This is the formal
         // statement of the B2 soundness claim in CRYPTO.md §Stage 1.5.
         //
@@ -664,14 +668,14 @@ mod tests {
         // (`InputValid`, `OutputValid`) are excluded because the
         // skeleton-selector public column for them is *also* a pin on
         // the dead tail (forbidden-rows programme covers
-        // [MAX_INPUTS..2^13)), so writing `ONE` there would legitimately
+        // [MAX_INPUTS..2^11)), so writing `ONE` there would legitimately
         // reject. Writing ZERO passes trivially; we don't need a test
         // for that. Balance-block columns are excluded because their
         // is_input / is_reset selectors are pinned PublicColumns, so
         // junking them breaks the pin check (not the B2 claim).
         //
         // Coverage: 8 non-bool TxValidity witness columns × 64 random
-        // dead rows sampled from [TXV_LIVE_ROWS, 2^13) with a mix of
+        // dead rows sampled from [TXV_LIVE_ROWS, 2^11) with a mix of
         // junk values.
         let (pins, merkle_inputs) = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
@@ -695,7 +699,7 @@ mod tests {
             0xA5A5A5A5_5A5A5A5Au128,
         ];
         // Deterministic "random" dead rows — LCG sequence, no rand dep.
-        // Small sample: each check() sweeps 2^13 rows across all
+        // Small sample: each check() sweeps 2^11 rows across all
         // composite constraints, so we keep the matrix modest and
         // reuse a single baseline trace (restore cell after each poke).
         let mut rng_state: u64 = 0x9E3779B97F4A7C15;

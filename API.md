@@ -1284,7 +1284,7 @@ All use Poseidon2b over GF(2^128) with domain-separated capacity IVs.
 | FRI_TAU | 7 | FRI folding factor |
 | FRI_NUM_QUERIES | 64 | FRI query repetitions (prod) |
 | FRI_LOG_RATE | 2 | Reed-Solomon rate = 4 |
-| TX_LOGIC_LOG_ROWS | 13 | Logic AIR trace depth (8192 rows) |
+| TX_LOGIC_LOG_ROWS | 11 | Logic AIR trace depth (2048 rows) |
 
 ---
 

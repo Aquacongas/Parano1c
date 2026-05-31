@@ -21,18 +21,18 @@ use noid_air::composition::tx_logic::{
     boundary_pins_from_body, witness_from_body, TxLogicAir, TX_LOGIC_LOG_ROWS, TX_LOGIC_N_COLS,
 };
 use noid_air::Air;
-use noid_block::{prove_block, verify_block, TxBlockWitness};
+use noid_block::{prove_block, verify_block, TxBlockWitness, BLOCK_BASE_LOG};
+use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
+use noid_fri_binius::COMPACT_NUM_QUERIES;
 use noid_gkr::{
     auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
     AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
     N_AUTH_UNIFIED_VARS,
 };
-use noid_core::mle::split::split_mle_into_slices;
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
-use noid_fri_binius::COMPACT_NUM_QUERIES;
 use noid_stark::prove_logic::{prove_logic, verify_logic, LogicProof, LogicWitness};
 use noid_tx::{
     compute_claims_commitment, PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS,
@@ -94,7 +94,6 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Fixture construction
 // ---------------------------------------------------------------------------
@@ -145,7 +144,9 @@ fn build_tx_fixture(
 ) -> TxFixture {
     let n_inputs = input_values.len().min(MAX_INPUTS);
     let n_outputs = output_values.len().min(MAX_OUTPUTS);
-    let addrs: Vec<Address> = (0..N_AUTH_INPUTS).map(|i| native_address(secrets[i])).collect();
+    let addrs: Vec<Address> = (0..N_AUTH_INPUTS)
+        .map(|i| native_address(secrets[i]))
+        .collect();
 
     let mut inputs = Vec::with_capacity(MAX_INPUTS);
     for i in 0..n_inputs {
@@ -252,9 +253,18 @@ fn build_tx_fixture(
     let mut ch = auth_gkr_channel();
     let (auth_proof, _) = prove_auth_killshot(&auth_circuit, &auth_inputs, &mut ch);
     let auth_mle = build_auth_unified_from_inputs(&auth_circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
-    TxFixture { air, trace, pi, spine_inputs, auth_inputs, auth_public, auth_proof, auth_slices }
+    TxFixture {
+        air,
+        trace,
+        pi,
+        spine_inputs,
+        auth_inputs,
+        auth_public,
+        auth_proof,
+        auth_slices,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +302,11 @@ fn bench_wallet_prove(fixture: &TxFixture) -> WalletResult {
         .expect("verify_logic");
     });
 
-    WalletResult { prove_time, verify_time, proof }
+    WalletResult {
+        prove_time,
+        verify_time,
+        proof,
+    }
 }
 
 #[allow(dead_code)]
@@ -356,13 +370,18 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     // Step 3: Verifier verifies the block proof (only public auth data)
     let spine_inputs_list: Vec<SpineInputs> =
         fixtures.iter().map(|f| f.spine_inputs.clone()).collect();
-    let auth_public_list: Vec<AuthPublicInputs> =
-        fixtures.iter().map(|f| f.auth_public).collect();
+    let auth_public_list: Vec<AuthPublicInputs> = fixtures.iter().map(|f| f.auth_public).collect();
     let air_refs: Vec<&dyn Air> = fixtures.iter().map(|f| &f.air as &dyn Air).collect();
 
     let verify_block_time = time_once(|| {
-        verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, &[])
-            .expect("verify_block");
+        verify_block(
+            &air_refs,
+            &block_proof,
+            &spine_inputs_list,
+            &auth_public_list,
+            &[],
+        )
+        .expect("verify_block");
     });
 
     BlockResult {
@@ -437,9 +456,18 @@ fn main() {
     let fixture_1 = build_tx_fixture(0, &[100, 50], &[60, 40], 50, &secrets);
     let fixture_2 = build_tx_fixture(100, &[200, 100], &[150, 80, 50, 20], 0, &secrets);
     let fixture_3 = build_tx_fixture(200, &[500], &[300, 200], 0, &secrets);
-    let fixture_4 = build_tx_fixture(300, &[1000, 500, 250, 125], &[400, 300, 200, 150, 100, 75, 50, 25], 575, &secrets);
+    let fixture_4 = build_tx_fixture(
+        300,
+        &[1000, 500, 250, 125],
+        &[400, 300, 200, 150, 100, 75, 50, 25],
+        575,
+        &secrets,
+    );
 
-    for (i, f) in [&fixture_1, &fixture_2, &fixture_3, &fixture_4].iter().enumerate() {
+    for (i, f) in [&fixture_1, &fixture_2, &fixture_3, &fixture_4]
+        .iter()
+        .enumerate()
+    {
         assert!(
             f.air.check(&f.trace),
             "FATAL: fixture {} trace rejected by AIR",
@@ -453,10 +481,21 @@ fn main() {
     print_section("LAYER 1: WALLET — prove_logic (stateless, client-side)");
 
     println!("  Architecture (Split GKR):");
-    println!("    AIR:         TxLogicAir ({} columns, log_rows={})", TX_LOGIC_N_COLS, TX_LOGIC_LOG_ROWS);
-    println!("    GKR Auth:    {} inputs x 5 perms = {} Poseidon2b perms (spend auth)", N_AUTH_INPUTS, N_AUTH_INPUTS * 5);
+    println!(
+        "    AIR:         TxLogicAir ({} columns, log_rows={})",
+        TX_LOGIC_N_COLS, TX_LOGIC_LOG_ROWS
+    );
+    println!(
+        "    GKR Auth:    {} inputs x 5 perms = {} Poseidon2b perms (spend auth)",
+        N_AUTH_INPUTS,
+        N_AUTH_INPUTS * 5
+    );
     println!("    GKR Spine:   DEFERRED to block prover (59 Poseidon2b perms)");
-    println!("    PCS:         FRI-Binius interleaved ({} AIR cols + 2 auth slices)", TX_LOGIC_N_COLS);
+    println!(
+        "    PCS:         FRI-Binius interleaved ({} AIR cols + {} auth slices)",
+        TX_LOGIC_N_COLS,
+        1 << (N_AUTH_UNIFIED_VARS - BLOCK_BASE_LOG)
+    );
     println!("    FRI queries: {} (wallet & block)", COMPACT_NUM_QUERIES);
     println!("    Binding:     epoch_anchor (6-block TTL, no state root needed)");
     println!();
@@ -481,7 +520,11 @@ fn main() {
         let stark_bytes = proof_bytes - auth_bytes;
 
         println!("  [Tx {}] {}", i + 1, label);
-        println!("    prove_logic:    {}    verify_logic:    {}", fmt_ms(w.prove_time), fmt_ms(w.verify_time));
+        println!(
+            "    prove_logic:    {}    verify_logic:    {}",
+            fmt_ms(w.prove_time),
+            fmt_ms(w.verify_time)
+        );
         println!(
             "    proof size:     {} (STARK: {}, Auth: {})",
             fmt_bytes(proof_bytes),
@@ -491,14 +534,29 @@ fn main() {
         println!();
     }
 
-    let avg_prove: Duration = wallets.iter().map(|w| w.prove_time).sum::<Duration>() / wallets.len() as u32;
-    let avg_verify: Duration = wallets.iter().map(|w| w.verify_time).sum::<Duration>() / wallets.len() as u32;
-    let avg_bytes: usize = wallets.iter().map(|w| w.proof.estimated_byte_len()).sum::<usize>() / wallets.len();
+    let avg_prove: Duration =
+        wallets.iter().map(|w| w.prove_time).sum::<Duration>() / wallets.len() as u32;
+    let avg_verify: Duration =
+        wallets.iter().map(|w| w.verify_time).sum::<Duration>() / wallets.len() as u32;
+    let avg_bytes: usize = wallets
+        .iter()
+        .map(|w| w.proof.estimated_byte_len())
+        .sum::<usize>()
+        / wallets.len();
 
     print_subsection("Wallet Summary");
-    println!("    Average prove:   {}    (target < 500 ms)", fmt_ms(avg_prove));
-    println!("    Average verify:  {}    (target < 50 ms)", fmt_ms(avg_verify));
-    println!("    Average size:    {}    (target < 50 KB)", fmt_bytes(avg_bytes));
+    println!(
+        "    Average prove:   {}    (target < 500 ms)",
+        fmt_ms(avg_prove)
+    );
+    println!(
+        "    Average verify:  {}    (target < 50 ms)",
+        fmt_ms(avg_verify)
+    );
+    println!(
+        "    Average size:    {}    (target < 50 KB)",
+        fmt_bytes(avg_bytes)
+    );
     println!();
 
     // =========================================================================
@@ -520,14 +578,14 @@ fn main() {
 
     // --- Block with 1 tx ---
     eprintln!("  benchmarking block pipeline (1 tx)...");
-    let fixtures_1tx = vec![
-        build_tx_fixture(0, &[100, 50], &[60, 40], 50, &secrets),
-    ];
+    let fixtures_1tx = vec![build_tx_fixture(0, &[100, 50], &[60, 40], 50, &secrets)];
     let proofs_1tx: Vec<LogicProof> = fixtures_1tx
         .iter()
         .map(|f| {
             let w = LogicWitness {
-                air: &f.air, trace: &f.trace, pi: &f.pi,
+                air: &f.air,
+                trace: &f.trace,
+                pi: &f.pi,
                 auth_inputs: &f.auth_inputs,
             };
             prove_logic(&w).expect("prove_logic")
@@ -541,13 +599,21 @@ fn main() {
         build_tx_fixture(0, &[100, 50], &[60, 40], 50, &secrets),
         build_tx_fixture(100, &[200, 100], &[150, 80, 50, 20], 0, &secrets),
         build_tx_fixture(200, &[500], &[300, 200], 0, &secrets),
-        build_tx_fixture(300, &[1000, 500, 250, 125], &[400, 300, 200, 150, 100, 75, 50, 25], 575, &secrets),
+        build_tx_fixture(
+            300,
+            &[1000, 500, 250, 125],
+            &[400, 300, 200, 150, 100, 75, 50, 25],
+            575,
+            &secrets,
+        ),
     ];
     let owned_proofs: Vec<LogicProof> = owned_fixtures
         .iter()
         .map(|f| {
             let w = LogicWitness {
-                air: &f.air, trace: &f.trace, pi: &f.pi,
+                air: &f.air,
+                trace: &f.trace,
+                pi: &f.pi,
                 auth_inputs: &f.auth_inputs,
             };
             prove_logic(&w).expect("prove_logic")
@@ -556,28 +622,68 @@ fn main() {
     let block_4tx = bench_block_pipeline(&owned_fixtures, &owned_proofs);
 
     println!("  [1-tx Block]");
-    println!("    verify_logic (N=1):       {}", fmt_ms(block_1tx.verify_logic_time));
-    println!("    prove_block (N=1):        {}", fmt_ms(block_1tx.prove_block_time));
-    println!("    verify_block (N=1):       {}", fmt_ms(block_1tx.verify_block_time));
-    println!("    block proof size:         {}", fmt_bytes(block_1tx.block_proof_bytes));
-    println!("    unified spine (1*59):     {}", fmt_bytes(block_1tx.unified_spine_bytes));
-    println!("    per-tx algebraic STARK:   {}", fmt_bytes(block_1tx.per_tx_algebraic_bytes));
+    println!(
+        "    verify_logic (N=1):       {}",
+        fmt_ms(block_1tx.verify_logic_time)
+    );
+    println!(
+        "    prove_block (N=1):        {}",
+        fmt_ms(block_1tx.prove_block_time)
+    );
+    println!(
+        "    verify_block (N=1):       {}",
+        fmt_ms(block_1tx.verify_block_time)
+    );
+    println!(
+        "    block proof size:         {}",
+        fmt_bytes(block_1tx.block_proof_bytes)
+    );
+    println!(
+        "    unified spine (1*59):     {}",
+        fmt_bytes(block_1tx.unified_spine_bytes)
+    );
+    println!(
+        "    per-tx algebraic STARK:   {}",
+        fmt_bytes(block_1tx.per_tx_algebraic_bytes)
+    );
     println!();
 
     println!("  [4-tx Block] (Unified Block SpineGKR)");
-    println!("    verify_logic (N=4):       {}", fmt_ms(block_4tx.verify_logic_time));
-    println!("    prove_block (N=4):        {}", fmt_ms(block_4tx.prove_block_time));
-    println!("    verify_block (N=4):       {}", fmt_ms(block_4tx.verify_block_time));
-    println!("    block proof size:         {}", fmt_bytes(block_4tx.block_proof_bytes));
-    println!("    unified spine (4*59):     {}", fmt_bytes(block_4tx.unified_spine_bytes));
-    println!("    per-tx algebraic STARK:   {}", fmt_bytes(block_4tx.per_tx_algebraic_bytes));
+    println!(
+        "    verify_logic (N=4):       {}",
+        fmt_ms(block_4tx.verify_logic_time)
+    );
+    println!(
+        "    prove_block (N=4):        {}",
+        fmt_ms(block_4tx.prove_block_time)
+    );
+    println!(
+        "    verify_block (N=4):       {}",
+        fmt_ms(block_4tx.verify_block_time)
+    );
+    println!(
+        "    block proof size:         {}",
+        fmt_bytes(block_4tx.block_proof_bytes)
+    );
+    println!(
+        "    unified spine (4*59):     {}",
+        fmt_bytes(block_4tx.unified_spine_bytes)
+    );
+    println!(
+        "    per-tx algebraic STARK:   {}",
+        fmt_bytes(block_4tx.per_tx_algebraic_bytes)
+    );
     println!();
 
     let fri_amort_1 = block_1tx.block_proof_bytes;
     let fri_amort_4 = block_4tx.block_proof_bytes;
     let ratio = fri_amort_4 as f64 / fri_amort_1 as f64;
-    println!("    FRI amortization: 4 txs = {:.2}x the size of 1 tx (ideal: ~1.0x)", ratio);
-    println!("    Cost per tx (4-tx block): prove {} / verify {}",
+    println!(
+        "    FRI amortization: 4 txs = {:.2}x the size of 1 tx (ideal: ~1.0x)",
+        ratio
+    );
+    println!(
+        "    Cost per tx (4-tx block): prove {} / verify {}",
         fmt_ms(block_4tx.prove_block_time / 4),
         fmt_ms(block_4tx.verify_block_time / 4),
     );
@@ -591,7 +697,10 @@ fn main() {
     println!("  Flow: User -> Wallet -> Network -> Full Node -> Block -> Verifiers");
     println!();
     println!("    1. Wallet builds TxBody (inputs, outputs, fee, epoch_anchor)");
-    println!("    2. Wallet calls prove_logic() -> LogicProof ({} bytes)", avg_bytes);
+    println!(
+        "    2. Wallet calls prove_logic() -> LogicProof ({} bytes)",
+        avg_bytes
+    );
     println!("       Time: {} (user-facing latency)", fmt_ms(avg_prove));
     println!();
     println!("    3. Wallet broadcasts TxIntent (TxBody + LogicProof) over P2P");
@@ -602,27 +711,49 @@ fn main() {
     println!();
     println!("    5. Miner collects N valid TxIntents into a block");
     println!("       Unified Block SpineGKR (1 proof for all N*59 perms)");
-    println!("       N=4 time: {} (unified spine + deferred-opening FRI)",
+    println!(
+        "       N=4 time: {} (unified spine + deferred-opening FRI)",
         fmt_ms(block_4tx.prove_block_time),
     );
     println!();
     println!("    6. Block verifier checks the block proof");
-    println!("       N=4 time: {} (GKR + algebraic STARK + FRI)", fmt_ms(block_4tx.verify_block_time));
+    println!(
+        "       N=4 time: {} (GKR + algebraic STARK + FRI)",
+        fmt_ms(block_4tx.verify_block_time)
+    );
     println!();
 
     print_subsection("Total Latencies");
     let total_user = avg_prove;
     let total_node = avg_verify + block_4tx.prove_block_time / 4;
     let total_verifier = block_4tx.verify_block_time / 4;
-    println!("    User (wallet):      {}  (prove_logic)", fmt_ms(total_user));
-    println!("    Full node (per tx): {}  (verify_logic + prove_block/N)", fmt_ms(total_node));
-    println!("    Block verifier/tx:  {}  (verify_block/N)", fmt_ms(total_verifier));
+    println!(
+        "    User (wallet):      {}  (prove_logic)",
+        fmt_ms(total_user)
+    );
+    println!(
+        "    Full node (per tx): {}  (verify_logic + prove_block/N)",
+        fmt_ms(total_node)
+    );
+    println!(
+        "    Block verifier/tx:  {}  (verify_block/N)",
+        fmt_ms(total_verifier)
+    );
     println!();
 
     print_subsection("Proof Sizes");
-    println!("    LogicProof (wallet):   {}  (per-tx, carried over P2P)", fmt_bytes(avg_bytes));
-    println!("    BlockProof (4 txs):    {}  (amortized FRI)", fmt_bytes(block_4tx.block_proof_bytes));
-    println!("    BlockProof per tx:     {}  (= BlockProof / N)", fmt_bytes(block_4tx.block_proof_bytes / 4));
+    println!(
+        "    LogicProof (wallet):   {}  (per-tx, carried over P2P)",
+        fmt_bytes(avg_bytes)
+    );
+    println!(
+        "    BlockProof (4 txs):    {}  (amortized FRI)",
+        fmt_bytes(block_4tx.block_proof_bytes)
+    );
+    println!(
+        "    BlockProof per tx:     {}  (= BlockProof / N)",
+        fmt_bytes(block_4tx.block_proof_bytes / 4)
+    );
     println!();
 
     print_subsection("Security Properties");

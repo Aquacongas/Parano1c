@@ -12,7 +12,7 @@
 //! Structurally, `TxLogicAir` is the existing `TxBodySpineComposite`: it
 //! stitches `TxValidityAir` (balance + selectors) with the retained
 //! body-hash `PublicColumn` lanes and the `TxvLiveMask` column at
-//! `log_rows = 13`. GKR owns the 59-perm Poseidon2b Merkle spine; the
+//! `log_rows = 11`. GKR owns the 59-perm Poseidon2b Merkle spine; the
 //! STARK proves the balance/validity constraints and pins the body-hash
 //! output via public columns.
 //!
@@ -23,13 +23,13 @@
 //! - `[TX_BODY_MERKLE_COL_OFFSET, +2)` → retained body-hash lanes (PublicColumn)
 //! - tail column → `TxvLiveMask` PublicColumn
 //!
-//! # Why log_rows stays at 13
+//! # Why log_rows is 11 (not 13)
 //!
-//! GKR boundary pins (`TxBodyMerkleBoundaryPins`) are sized against the
-//! Merkle AIR's native `log_rows = 13`. The body-hash PublicColumn lanes
-//! span all 8192 rows. Reducing log_rows to 10-11 would require re-sizing
-//! these programmes; that optimization is deferred to a follow-up stage
-//! once the two-layer pipeline is proven end-to-end.
+//! The 59-perm Merkle trace was retired from the STARK (GKR owns it).
+//! `TxBodyMerkleBoundaryPins` fields are fixed-size arrays, not scaled
+//! by `log_rows`. The balance gate requires `log_rows ≥ 8`; setting
+//! `SPINE_LOG_ROWS = 11` (2048 rows) fits the entire composite working
+//! set in L3 cache and reduces FRI rounds from 5 → 3.
 
 use crate::airs::tx_body_merkle::TxBodyMerkleBoundaryPins;
 use crate::airs::tx_body_spine::{
@@ -41,7 +41,7 @@ use noid_tx::TxBody;
 
 use crate::airs::tx_body_merkle::TXBODY_MERKLE_N_PERMS;
 
-/// Log-rows of the TxLogicAir trace. Matches `SPINE_LOG_ROWS = 13`.
+/// Log-rows of the TxLogicAir trace. Matches `SPINE_LOG_ROWS = 11`.
 pub const TX_LOGIC_LOG_ROWS: usize = SPINE_LOG_ROWS;
 
 /// Total column count of the TxLogicAir trace.
@@ -159,10 +159,7 @@ pub fn boundary_pins_from_body(body: &TxBody) -> TxBodyMerkleBoundaryPins {
     pins.fee_leaf = [Block128::from(body.fee), Block128::ZERO];
 
     // Is-coinbase leaf
-    pins.is_coinbase_leaf = [
-        Block128::from(body.is_coinbase as u128),
-        Block128::ZERO,
-    ];
+    pins.is_coinbase_leaf = [Block128::from(body.is_coinbase as u128), Block128::ZERO];
 
     // Input leaf absorbs
     for i in 0..MAX_INPUTS.min(TXBODY_INPUTS) {
@@ -328,7 +325,7 @@ mod tests {
     #[test]
     fn logic_air_layout_matches_spine() {
         use crate::airs::tx_body_spine::spine_n_cols;
-        assert_eq!(TX_LOGIC_LOG_ROWS, 13);
+        assert_eq!(TX_LOGIC_LOG_ROWS, 11);
         assert_eq!(TX_LOGIC_N_COLS, spine_n_cols());
         let body = mk_balanced_body();
         let witness = witness_from_body(&body);

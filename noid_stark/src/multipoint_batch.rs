@@ -292,7 +292,7 @@ pub fn verify_multipoint_sumcheck(
 // Motivation. The uniform-length prover above assumes every pair lives on
 // the same 2^N hypercube. `noid_stark::spine` needs to inject a boundary
 // claim `(r_B, v_B)` on a 2^15 MLE alongside the base-trace columns on
-// 2^13 (or other log_rows < 15) without padding B into a bigger
+// 2^11 (or other log_rows < 15) without padding B into a bigger
 // commitment. The fix is a char-2-safe MLE lift, applied only inside the
 // sumcheck — the caller's tables keep their natural size.
 //

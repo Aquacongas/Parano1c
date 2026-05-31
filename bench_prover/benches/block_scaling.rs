@@ -17,24 +17,21 @@
 
 use std::time::{Duration, Instant};
 
-use noid_air::composition::tx_logic::{
-    boundary_pins_from_body, witness_from_body, TxLogicAir,
-};
+use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
-use noid_block::{prove_block, verify_block, TxBlockWitness};
-use noid_core::{Block128, TowerField};
+use noid_block::{prove_block, verify_block, TxBlockWitness, BLOCK_BASE_LOG};
 use noid_core::mle::split::split_mle_into_slices;
+use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary,
-    prove_auth_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
-    AuthPublicInputs, SpineInputs, N_AUTH_INPUTS, N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
+    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
+    N_AUTH_UNIFIED_VARS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
 use noid_tx::{
-    compute_claims_commitment, PublicInputs, TxBody, TxInput, TxOutput,
-    MAX_INPUTS, MAX_OUTPUTS,
+    compute_claims_commitment, PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,7 +104,9 @@ fn build_tx_fixture(slot_base: u32, secrets: &[[Block128; 2]; N_AUTH_INPUTS]) ->
     let input_values = [100u64, 50];
     let output_values = [80u64, 60];
 
-    let addrs: Vec<Address> = (0..N_AUTH_INPUTS).map(|i| native_address(secrets[i])).collect();
+    let addrs: Vec<Address> = (0..N_AUTH_INPUTS)
+        .map(|i| native_address(secrets[i]))
+        .collect();
 
     let mut inputs = Vec::with_capacity(MAX_INPUTS);
     for i in 0..n_inputs {
@@ -213,9 +212,17 @@ fn build_tx_fixture(slot_base: u32, secrets: &[[Block128; 2]; N_AUTH_INPUTS]) ->
     let mut ch = auth_gkr_channel();
     let (auth_proof, _) = prove_auth_killshot(&auth_circuit, &auth_inputs, &mut ch);
     let auth_mle = build_auth_unified_from_inputs(&auth_circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, 13);
+    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
-    TxFixture { air, trace, pi, spine_inputs, auth_public, auth_proof, auth_slices }
+    TxFixture {
+        air,
+        trace,
+        pi,
+        spine_inputs,
+        auth_public,
+        auth_proof,
+        auth_slices,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,15 +251,26 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
     let prove_time = t0.elapsed();
 
     // Block Verify
-    let spine_inputs_list: Vec<SpineInputs> =
-        fixtures[..n_tx].iter().map(|f| f.spine_inputs.clone()).collect();
+    let spine_inputs_list: Vec<SpineInputs> = fixtures[..n_tx]
+        .iter()
+        .map(|f| f.spine_inputs.clone())
+        .collect();
     let auth_public_list: Vec<AuthPublicInputs> =
         fixtures[..n_tx].iter().map(|f| f.auth_public).collect();
-    let air_refs: Vec<&dyn Air> = fixtures[..n_tx].iter().map(|f| &f.air as &dyn Air).collect();
+    let air_refs: Vec<&dyn Air> = fixtures[..n_tx]
+        .iter()
+        .map(|f| &f.air as &dyn Air)
+        .collect();
 
     let t1 = Instant::now();
-    verify_block(&air_refs, &block_proof, &spine_inputs_list, &auth_public_list, &[])
-        .expect("verify_block");
+    verify_block(
+        &air_refs,
+        &block_proof,
+        &spine_inputs_list,
+        &auth_public_list,
+        &[],
+    )
+    .expect("verify_block");
     let verify_time = t1.elapsed();
 
     let proof_bytes = block_proof.byte_len();
@@ -262,12 +280,24 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
     println!("  [{:>4}-tx Block]", n_tx);
     println!("    prove_block (full node):   {}", fmt_ms(prove_time));
     println!("    verify_block (any node):   {}", fmt_ms(verify_time));
-    println!("    prove per tx (amortized):  {}", fmt_ms(prove_time / n_tx as u32));
-    println!("    verify per tx (amortized): {}", fmt_ms(verify_time / n_tx as u32));
+    println!(
+        "    prove per tx (amortized):  {}",
+        fmt_ms(prove_time / n_tx as u32)
+    );
+    println!(
+        "    verify per tx (amortized): {}",
+        fmt_ms(verify_time / n_tx as u32)
+    );
     println!("    block proof size:          {}", fmt_bytes(proof_bytes));
-    println!("    proof per tx:              {}", fmt_bytes(proof_bytes / n_tx));
+    println!(
+        "    proof per tx:              {}",
+        fmt_bytes(proof_bytes / n_tx)
+    );
     println!("    unified spine:             {}", fmt_bytes(spine_bytes));
-    println!("    algebraic total:           {}", fmt_bytes(alg_bytes_total));
+    println!(
+        "    algebraic total:           {}",
+        fmt_bytes(alg_bytes_total)
+    );
     println!();
 }
 
@@ -310,7 +340,10 @@ fn main() {
 
     println!("  -------------------------------------------------------------------");
     println!("  WALLET-SIDE (offline, not in block-time budget):");
-    println!("    TxIntent prep (trace + AuthGKR):  {}", fmt_ms(wallet_time));
+    println!(
+        "    TxIntent prep (trace + AuthGKR):  {}",
+        fmt_ms(wallet_time)
+    );
     println!("    This happens on user's device before submitting to mempool.");
     println!("    The full node never re-does this work.");
     println!("  -------------------------------------------------------------------");
@@ -319,13 +352,19 @@ fn main() {
     // -------------------------------------------------------------------------
     // Build remaining fixtures (simulates mempool of pre-proven TxIntents)
     // -------------------------------------------------------------------------
-    eprintln!("  building {} TxIntent fixtures (simulating mempool)...", max_n);
+    eprintln!(
+        "  building {} TxIntent fixtures (simulating mempool)...",
+        max_n
+    );
     let t_build = Instant::now();
     let fixtures: Vec<TxFixture> = (0..max_n)
         .map(|i| build_tx_fixture(i as u32 * 20, &secrets))
         .collect();
-    eprintln!("  {} intents ready in {} (wallet-parallel, not block time)",
-        max_n, fmt_ms(t_build.elapsed()).trim());
+    eprintln!(
+        "  {} intents ready in {} (wallet-parallel, not block time)",
+        max_n,
+        fmt_ms(t_build.elapsed()).trim()
+    );
     eprintln!();
 
     // -------------------------------------------------------------------------

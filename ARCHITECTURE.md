@@ -476,7 +476,7 @@ verify prior blocks recursively.
   │   AIR traces: balance, range, tx_body_spine (2-lane pin),   │
   │               tx_logic (no state columns!)                   │
   │   AuthGKR witness: 20 × auth perms (spend_secret needed)    │
-  │   boundary MLE: auth (2^14 padded to 2^13 slices)            │
+  │   boundary MLE: auth (2^14 split into 2^11 slices, 8 slices) │
   │   Spine GKR witness: generated at block-prover (public data) │
   │   C_claimed absorbed into Fiat-Shamir channel               │
   └────────────────────────┬────────────────────────────────────┘

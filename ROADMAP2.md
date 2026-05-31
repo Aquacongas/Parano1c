@@ -85,8 +85,9 @@ Pure-logic AIR (no FriStateOpen, no state columns).
 - `noid_air::composition::tx_logic::TxLogicAir` ✅
 - Contains: balance_gate, range_gate, tx_body_spine pin, selector gates ✅
 - Does NOT contain: FriStateOpenAir, FriStateCombinerComposite ✅
-- Note: `log_rows` stays at 13 (same as SPINE_LOG_ROWS); reducing to
-  10-11 deferred — spine boundary pins require log_rows=13.
+- Note: `log_rows` reduced from 13 → **11** (SPINE_LOG_ROWS). The 59-perm
+  Merkle trace is retired (GKR owns it); spine composite now 81×2048 rows.
+  `BASE_LOG` in `noid_block` and `noid_stark::prove_logic` updated to match.
 
 ### S.4 LogicProof Pipeline — ✅ DONE
 
@@ -1256,7 +1257,7 @@ prove_block: ~8s
 | Item | Reason for Defer |
 |------|-----------------|
 | `#[repr(align(64))]` for Block128 | Audit showed: AVX2 uses unaligned loads, CLMUL register-only. 64-byte alignment would break pack_slice. |
-| Column chunking (64-256KB) | Columns already 128KB (log_rows=13). Needed at log_rows≥16 (Phase 3). |
+| Column chunking (64-256KB) | Columns now 32KB (log_rows=11). Needed at log_rows≥16 (Phase 3). |
 | NUMA-awareness | 250 MB fits in L3. Needed at 1024 tx (Phase 8). |
 | KillShot batch scheduler | KillShot self-contained. Batch scheduling — Phase 7 concern. |
 | Streaming witness | Segmented state doesn't exist. YAGNI until Phase 3. |

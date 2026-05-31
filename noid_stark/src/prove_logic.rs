@@ -23,7 +23,7 @@
 //! Pipeline:
 //! 1. Build `TxLogicAir` trace from `LogicWitness`
 //! 2. Slice auth boundary MLE into base-length columns
-//! 3. Interleaved commit (AIR cols + 2 auth slice cols, one Merkle tree)
+//! 3. Interleaved commit (AIR cols + N_AUTH_SLICES auth slice cols, one Merkle tree)
 //! 4. AuthGKR Kill-Shot (deterministic self-seeded channel)
 //! 5. STARK zero-check over `TxLogicAir` with auth slice claims
 
@@ -40,9 +40,18 @@ use noid_tx::PublicInputs;
 use crate::interleaved::{prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof};
 use crate::{SliceClaim, VerifyError};
 
+use noid_air::airs::tx_body_spine::SPINE_LOG_ROWS;
 use noid_fri_binius::COMPACT_NUM_QUERIES;
 
-const BASE_LOG: usize = 13;
+/// Auth-MLE slice granularity: must equal `SPINE_LOG_ROWS` so that
+/// every column in the interleaved commit has the same length
+/// `2^BASE_LOG`. With `SPINE_LOG_ROWS = 11` this gives
+/// `N_AUTH_UNIFIED_SLICES = 2^(14-11) = 8` slices per proof.
+const BASE_LOG: usize = SPINE_LOG_ROWS;
+
+/// Number of auth-MLE boundary slices committed per LogicProof.
+/// = 2^(N_AUTH_UNIFIED_VARS - BASE_LOG) = 2^(14 - 11) = 8.
+const N_AUTH_SLICES: usize = 1 << (N_AUTH_UNIFIED_VARS - BASE_LOG);
 
 // ---------------------------------------------------------------------------
 // LogicProof — the wallet-produced proof bundle
@@ -59,7 +68,8 @@ pub struct LogicProof {
     pub stark: InterleavedStarkProof,
     /// AuthGKR Kill-Shot proof (4x5 auth sponges).
     pub auth: AuthProofKillShot,
-    /// Number of boundary-slice columns (always 2: auth only).
+    /// Number of boundary-slice columns: `N_AUTH_SLICES` auth slices.
+    /// With BASE_LOG=11 this is 8 (was 2 at BASE_LOG=13).
     pub n_boundary_slices: usize,
 }
 
@@ -140,12 +150,12 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     debug_assert_eq!(auth_state_mle.len(), 1 << N_AUTH_UNIFIED_VARS);
 
     let auth_slices = split_mle_into_slices(&auth_state_mle, N_AUTH_UNIFIED_VARS, BASE_LOG);
-    debug_assert_eq!(auth_slices.len(), 2);
+    debug_assert_eq!(auth_slices.len(), N_AUTH_SLICES);
 
     let n_air_cols = trace.columns.len();
     let n_boundary_slices = auth_slices.len();
 
-    // Stage 2: Build extended column set (AIR + 2 auth slices)
+    // Stage 2: Build extended column set (AIR + N_AUTH_SLICES auth slices)
     let log_len = crate::padded_log_len(trace.log_rows);
     debug_assert_eq!(log_len, BASE_LOG);
 
@@ -237,7 +247,7 @@ pub fn verify_logic(
 
     let n_air_cols = air.n_columns();
     let n_slices = proof.n_boundary_slices;
-    if n_slices != 2 {
+    if n_slices != N_AUTH_SLICES {
         return Err(VerifyLogicError::Stark(VerifyError::ShapeMismatch));
     }
 
@@ -272,7 +282,7 @@ pub fn verify_logic(
     let auth_r_low = r_auth[..BASE_LOG].to_vec();
     let auth_r_high = r_auth[BASE_LOG..].to_vec();
 
-    let auth_slice_values = &proof.stark.slice_claimed_values[..2];
+    let auth_slice_values = &proof.stark.slice_claimed_values[..n_slices];
 
     let reconstructed_auth = reconstruct_from_slices(auth_slice_values, &auth_r_high);
     if reconstructed_auth != auth_reductions.state.value {
