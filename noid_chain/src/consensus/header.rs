@@ -247,12 +247,22 @@ mod tests {
 
     #[test]
     fn anchor_window_validation() {
-        // Block at height 10: valid anchors are [3, 9]
+        // With ANCHOR_DEPTH=144, for block at height 10:
+        // lo = 10 - 145 = 0 (saturated), hi = 9 → anchors [0, 9] all valid.
         assert!(is_anchor_height_valid(9, 10));
         assert!(is_anchor_height_valid(5, 10));
         assert!(is_anchor_height_valid(3, 10));
-        assert!(!is_anchor_height_valid(2, 10)); // too old
-        assert!(!is_anchor_height_valid(10, 10)); // same height not valid
+        assert!(is_anchor_height_valid(0, 10)); // genesis anchor valid (depth=144 >> 10)
+        assert!(!is_anchor_height_valid(10, 10)); // current height not valid (must be past block)
+
+        // Test at a height where the window actually truncates.
+        // For block at height = ANCHOR_DEPTH + 50:
+        let h = ANCHOR_DEPTH + 50; // e.g. height=194
+        let lo = h - ANCHOR_DEPTH - 1; // = 49
+        assert!(is_anchor_height_valid(lo, h)); // just inside
+        assert!(!is_anchor_height_valid(lo - 1, h)); // just outside
+        assert!(!is_anchor_height_valid(h, h)); // current height not valid
+        assert!(is_anchor_height_valid(h - 1, h)); // latest valid
     }
 
     #[test]

@@ -17,7 +17,12 @@
 //! - [`receipt`]     — ParanoidReceipt generation and verification.
 
 pub mod checks;
+pub mod conflict; // NEW
 pub mod da_prune;
+pub mod mempool_checks; // NEW
+pub mod ordering; // NEW
+pub mod reorg;
+pub mod template;
 pub mod validation;
 
 pub mod allocator;
@@ -34,18 +39,24 @@ pub mod timestamps;
 // Convenient re-exports.
 pub use allocator::{deduplicate_hints, generate_slot_hints, splitmix64};
 pub use checks::{validate_block_slot_conflicts, validate_tx_consensus};
+pub use conflict::resolve_slot_conflicts;
 pub use da_prune::{build_undo_log, prune_undo_logs, revert_block, BlockUndoLog};
 pub use difficulty::{le256_lt, next_target};
 pub use emission::{block_reward, format_noid, max_coinbase_value, total_fees};
 pub use fork_choice::{choose_chain, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};
+pub use mempool_checks::validate_tx_for_mempool;
+pub use ordering::order_block_txs;
 pub use params::*;
+pub use params::{min_fee, FEE_PER_OUTPUT, MIN_FEE_BASE};
 pub use pow::{full_block_hash, header_core_bytes, search_pow, validate_pow, BlockHash};
 pub use receipt::{
     generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
     ReceiptVerifyResult, TxSummary,
 };
+pub use reorg::{apply_reorg, find_common_ancestor, ReorgError, ReorgResult};
+pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
 pub use timestamps::{median_time_past, validate_timestamp};
 pub use validation::{validate_block_consensus, AnchorInfo};
 
@@ -83,6 +94,11 @@ pub enum ConsensusError {
     InvalidLogicProof { tx_index: usize },
     /// §16.15 — Coinbase value exceeds `block_reward + sum(fees)`.
     InflatedCoinbase,
+    /// Fee exceeds u64::MAX (values are 64-bit in this protocol).
+    BadFee,
+    /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,
+    /// and must not expand when occupancy < 75 %.
+    BadLogSlotsExpansion,
     /// §16.16 — `state_root` does not match post-block state.
     BadStateRoot,
     /// Generic shape / length mismatch.
@@ -95,6 +111,8 @@ impl std::fmt::Display for ConsensusError {
             Self::InvalidLogicProof { tx_index } => {
                 write!(f, "InvalidLogicProof at tx_index={tx_index}")
             }
+            Self::BadFee => write!(f, "BadFee"),
+            Self::BadLogSlotsExpansion => write!(f, "BadLogSlotsExpansion"),
             Self::ShapeMismatch(msg) => write!(f, "ShapeMismatch: {msg}"),
             other => write!(f, "{other:?}"),
         }

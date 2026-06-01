@@ -225,3 +225,91 @@ fn make_empty_pi() -> PublicInputs {
         is_deactivation: [false; 4],
     }
 }
+
+// =============================================================================
+// Genesis
+// =============================================================================
+
+/// Produce the `RecursiveBlockProof` for the genesis block (height = 0).
+///
+/// Genesis has no real `BlockProof` — it is a special chain anchor with a
+/// marker `proof_transcript_hash`. This function creates a null
+/// `BlockReplayWitness` (all-zero rounds) and calls `prove_recursive_step`
+/// with a "pre-genesis" accumulator so that the resulting proof carries:
+///
+/// ```text
+/// acc.chain_hash  = compress([0;32], H_BLOCK(genesis_header))
+///                 = genesis_accumulator(...).chain_hash
+/// acc.state_root  = genesis_header.state_root  (= GENESIS_STATE_ROOT)
+/// acc.height      = 0
+/// ```
+///
+/// This is the root of the recursive chain that `verify_tip` anchors against.
+pub fn prove_genesis_recursive() -> RecursiveBlockProof {
+    use noid_chain::consensus::genesis::genesis_header;
+    use noid_fri_binius::{CompactEvalProof, MerkleCap};
+
+    let genesis = genesis_header();
+
+    // "Pre-genesis" accumulator: all zeros, no blocks applied yet.
+    // prove_recursive_step computes:
+    //   acc_new.chain_hash = compress([0;32], H_BLOCK(genesis))
+    // which matches genesis_accumulator(genesis_state_root, genesis_hash).
+    let pre_genesis_acc = ChainAccumulator {
+        height: 0,
+        state_root: [0u8; 32],
+        chain_hash: [0u8; 32],
+    };
+
+    // Null replay witness: no real block data for genesis.
+    // Only block_multipoint_rounds is used inside prove_recursive_step;
+    // the remaining fields are unused during proving (they serve FRI Kill-Shot
+    // verification which is not relevant for the genesis stub).
+    let null_witness = BlockReplayWitness::from_parts(
+        MerkleCap { hashes: vec![] },
+        vec![], // no state_binding_algebraics
+        vec![], // no block_col_openings
+        // BLOCK_SUMCHECK_ROUNDS = 11; each round has 3 evaluations [p(0), p(1), p(2)]
+        vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        CompactEvalProof {
+            upper_partial_evals: vec![],
+            sum_check_oracles: vec![],
+            fri_roots: vec![],
+            fri_queried_symbols: vec![],
+            fri_merkle_batch: vec![],
+            final_codeword: vec![],
+        },
+        vec![], // no mixed_all_openings
+    );
+
+    // prev_rec_proof = None: genesis is the first step, uses zero rec rounds.
+    prove_recursive_step(&null_witness, &genesis, &pre_genesis_acc, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accumulator::genesis_accumulator;
+    use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
+    use noid_chain::hash_block_header;
+
+    #[test]
+    #[ignore = "heavy: proves a full recursive STARK (~2s)"]
+    fn genesis_recursive_proof_has_correct_accumulator() {
+        let proof = prove_genesis_recursive();
+
+        let genesis = genesis_header();
+        let genesis_hash = hash_block_header(&genesis);
+        let expected_acc = genesis_accumulator(genesis_state_root(), genesis_hash);
+
+        assert_eq!(proof.block_height, 0, "genesis proof must be at height 0");
+        assert_eq!(
+            proof.acc.chain_hash, expected_acc.chain_hash,
+            "genesis chain_hash must match genesis_accumulator"
+        );
+        assert_eq!(
+            proof.acc.state_root, genesis.state_root,
+            "genesis state_root must match header"
+        );
+    }
+}

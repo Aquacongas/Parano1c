@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn total_fees_sums_non_coinbase() {
-        use noid_tx::types::{TxBody, TxInput, TxOutput};
+        use noid_tx::types::TxBody;
         let coinbase = TxBody {
             fee: 0,
             is_coinbase: true,

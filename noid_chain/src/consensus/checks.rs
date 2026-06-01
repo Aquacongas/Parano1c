@@ -32,6 +32,12 @@ pub fn validate_tx_consensus(
     block_height: u64,
     nullifiers: &NullifierSet,
 ) -> Result<(), ConsensusError> {
+    // Fee must fit in u64. Values in this protocol are 64-bit; a fee > u64::MAX
+    // is malformed and must be rejected before any further processing.
+    if tx.body.fee > u64::MAX as u128 {
+        return Err(ConsensusError::BadFee);
+    }
+
     // 1. tx_body_hash binding.
     let expected_hash = hash_tx_body(
         &tx.body.epoch_anchor,
@@ -229,6 +235,34 @@ mod tests {
         assert_eq!(
             validate_block_slot_conflicts(&[tx1, tx2]),
             Err(ConsensusError::SlotConflict)
+        );
+    }
+
+    #[test]
+    fn fee_overflow_rejected() {
+        // Build a tx with fee > u64::MAX
+        let body = TxBody {
+            epoch_anchor: [1u8; 32],
+            fee: u128::MAX, // way over u64::MAX
+            inputs: vec![],
+            outputs: vec![dummy_output(1)],
+            is_coinbase: false,
+        };
+        let hash_bytes = hash_tx_body(
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        let tx = Transaction {
+            body,
+            tx_body_hash: hash_bytes,
+        };
+        let ns = NullifierSet::new();
+        assert_eq!(
+            validate_tx_consensus(&tx, 10, &ns),
+            Err(ConsensusError::BadFee)
         );
     }
 

@@ -13,6 +13,8 @@
 //! pruned (`prune_undo_logs`). Full block DA (BlockProof + PackedWitness)
 //! is deleted immediately after `apply_block`; see SPECIFICATION.md §20.
 
+use std::collections::HashMap;
+
 use crate::block::Block;
 use crate::consensus::params::UNDO_LOG_RETENTION;
 use crate::fri_state::SlotValue;
@@ -32,6 +34,16 @@ pub struct BlockUndoLog {
     /// this block, recorded in application order. Replaying these in
     /// *reverse* order restores the pre-block UTXO state.
     pub slot_changes: Vec<(u32, SlotValue)>,
+}
+
+impl BlockUndoLog {
+    /// Create an empty undo log for the given block height.
+    pub fn empty(block_height: u64) -> Self {
+        Self {
+            block_height,
+            slot_changes: vec![],
+        }
+    }
 }
 
 /// Produce an undo log by recording the pre-block value of every slot that
@@ -96,10 +108,10 @@ pub fn revert_block(state: &mut SegmentedFriState, undo: &BlockUndoLog) {
 
 /// Remove undo logs older than `UNDO_LOG_RETENTION` blocks from `logs`.
 /// After this call only logs for heights in
-/// `[current_height - UNDO_LOG_RETENTION + 1, current_height]` are retained.
-pub fn prune_undo_logs(logs: &mut Vec<BlockUndoLog>, current_height: u64) {
-    let cutoff = current_height.saturating_sub(UNDO_LOG_RETENTION.saturating_sub(1));
-    logs.retain(|log| log.block_height >= cutoff);
+/// `(current_height - UNDO_LOG_RETENTION, current_height]` are retained.
+pub fn prune_undo_logs(logs: &mut HashMap<u64, BlockUndoLog>, current_height: u64) {
+    let cutoff = current_height.saturating_sub(UNDO_LOG_RETENTION);
+    logs.retain(|&h, _| h > cutoff);
 }
 
 #[cfg(test)]
@@ -107,7 +119,7 @@ mod tests {
     use super::*;
     use crate::block::{compute_tx_root, Block};
     use crate::block_header::BlockHeader;
-    use crate::consensus::params::{GENESIS_TARGET, UNDO_LOG_RETENTION};
+    use crate::consensus::params::GENESIS_TARGET;
     use crate::state::{apply_tx, ChainState};
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{hash_tx_body, TxBody, TxOutput};
@@ -151,20 +163,27 @@ mod tests {
 
     #[test]
     fn prune_removes_old_logs() {
-        let mut logs: Vec<BlockUndoLog> = (1u64..=10)
-            .map(|h| BlockUndoLog {
-                block_height: h,
-                slot_changes: vec![],
-            })
-            .collect();
-        prune_undo_logs(&mut logs, 10);
-        let cutoff = 10u64.saturating_sub(UNDO_LOG_RETENTION.saturating_sub(1));
-        assert!(
-            logs.iter().all(|l| l.block_height >= cutoff),
-            "expected all remaining logs >= cutoff {cutoff}, got: {:?}",
-            logs.iter().map(|l| l.block_height).collect::<Vec<_>>()
-        );
-        assert_eq!(logs.len(), UNDO_LOG_RETENTION as usize);
+        use crate::consensus::params::UNDO_LOG_RETENTION;
+        let n = UNDO_LOG_RETENTION + 5; // 23 blocks
+        let mut logs: HashMap<u64, BlockUndoLog> = HashMap::new();
+        for h in 0..n {
+            logs.insert(h, BlockUndoLog::empty(h));
+        }
+        let current = n - 1;
+        prune_undo_logs(&mut logs, current);
+        // cutoff = current - UNDO_LOG_RETENTION; keep heights > cutoff
+        let cutoff = current.saturating_sub(UNDO_LOG_RETENTION);
+        for h in 0..=cutoff {
+            assert!(
+                !logs.contains_key(&h),
+                "height {} should be pruned (cutoff={})",
+                h,
+                cutoff
+            );
+        }
+        for h in (cutoff + 1)..n {
+            assert!(logs.contains_key(&h), "height {} should be kept", h);
+        }
     }
 
     #[test]

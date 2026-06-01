@@ -97,7 +97,6 @@ mod tests {
     #[test]
     fn future_drift_exactly_at_limit_accepts() {
         let prev = timestamps(5);
-        let mtp = median_time_past(&prev);
         let local = 2_000_000u64;
         let ts = local + MAX_FUTURE_DRIFT;
         assert!(validate_timestamp(ts, &prev, local).is_ok());
@@ -106,7 +105,6 @@ mod tests {
     #[test]
     fn future_drift_one_over_limit_rejects() {
         let prev = timestamps(5);
-        let mtp = median_time_past(&prev);
         let local = 2_000_000u64;
         let ts = local + MAX_FUTURE_DRIFT + 1;
         assert_eq!(
@@ -142,7 +140,7 @@ mod tests {
     #[test]
     fn uses_only_last_11_timestamps() {
         // Provide 20 timestamps; only last 11 matter for MTP.
-        let mut ts: Vec<u64> = (0..20u64).map(|i| 1000 + i * 60).collect();
+        let ts: Vec<u64> = (0..20u64).map(|i| 1000 + i * 60).collect();
         let mtp_20 = median_time_past(&ts);
         let last_11: Vec<u64> = ts[9..].to_vec();
         let mtp_11 = median_time_past(&last_11);

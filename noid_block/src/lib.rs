@@ -14,7 +14,12 @@
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod block_chain_context;
 pub mod channel;
+pub mod validate;
+
+pub use block_chain_context::{extract_replay_witness, BlockChainContext};
+pub use validate::{build_tx_airs, validate_block_full, FullValidationError};
 
 use crate::channel::{
     block_multipoint_channel, compute_tx_transcript_digest, merkle_reduce,

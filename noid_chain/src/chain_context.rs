@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid.
+
+//! `ChainContext` — the unified chain state required to validate and apply blocks.
+//!
+//! A full node needs more than just the current UTXO state to validate a new block:
+//! it needs recent block headers (for timestamp MTP and ASERT anchor), the nullifier
+//! set, undo logs (for reorg), and the running tip info.
+//!
+//! `ChainContext` bundles all of this into one struct. It is the authoritative
+//! in-memory representation of the chain. The Phase 2 MDBX backend will persist
+//! this data to disk; Phase 1 uses a pure-RAM implementation.
+//!
+//! # Usage
+//!
+//! ```text
+//! let mut ctx = ChainContext::init_from_genesis();
+//! for block in incoming_blocks {
+//!     ctx.apply_next_block(&block, local_time)?;
+//! }
+//! ```
+
+use std::collections::HashMap;
+
+use crate::block::Block;
+use crate::block_header::BlockHeader;
+use crate::consensus::{
+    da_prune::{build_undo_log, prune_undo_logs, BlockUndoLog},
+    genesis::genesis_header,
+    header::epoch_anchor_height,
+    params::MEDIAN_TIME_BLOCKS,
+    pow::full_block_hash,
+    validation::{validate_block_consensus, AnchorInfo},
+    ConsensusError,
+};
+use crate::nullifier::NullifierSet;
+use crate::state::ChainState;
+use noid_poseidon2b::primitives::TxBodyHash;
+
+/// Unified chain context for block validation and application.
+///
+/// All fields are derived deterministically from the block history.
+/// Two nodes applying the same sequence of valid blocks will have
+/// identical `ChainContext` state.
+pub struct ChainContext {
+    /// All block headers ever seen, indexed by height. Never pruned.
+    /// 276 bytes × N blocks (≈ 1.5 GB after 10 years at 1 block/min).
+    pub headers: HashMap<u64, BlockHeader>,
+
+    /// Rolling nullifier window covering the last `ANCHOR_DEPTH` blocks.
+    pub nullifiers: NullifierSet,
+
+    /// Current UTXO state (FRI-committed slot array).
+    pub state: ChainState,
+
+    /// Compact undo logs for the last `UNDO_LOG_RETENTION` blocks.
+    /// Enables state revert during reorg without replaying from genesis.
+    pub undo_logs: HashMap<u64, BlockUndoLog>,
+
+    /// Height of the current chain tip.
+    pub tip_height: u64,
+
+    /// `H_BLOCK` hash of the current tip header.
+    pub tip_hash: [u8; 32],
+}
+
+impl ChainContext {
+    /// Initialise a fresh chain context from the genesis block.
+    ///
+    /// This is the only valid starting state for a new node.
+    /// The genesis block is applied via the hardcoded genesis header
+    /// (no ZK proof required for genesis).
+    pub fn init_from_genesis() -> Self {
+        let genesis = genesis_header();
+        let state = ChainState::new();
+
+        let mut headers = HashMap::new();
+        let genesis_hash = full_block_hash(&genesis);
+        headers.insert(0u64, genesis.clone());
+
+        // Genesis: no txs, no undo log, no nullifiers.
+        Self {
+            headers,
+            nullifiers: NullifierSet::new(),
+            state,
+            undo_logs: HashMap::new(),
+            tip_height: 0,
+            tip_hash: genesis_hash,
+        }
+    }
+
+    /// Return the header at `height`, if known.
+    pub fn header(&self, height: u64) -> Option<&BlockHeader> {
+        self.headers.get(&height)
+    }
+
+    /// Return the tip header.
+    pub fn tip_header(&self) -> &BlockHeader {
+        self.headers
+            .get(&self.tip_height)
+            .expect("tip header must always be present")
+    }
+
+    /// Collect the last `MEDIAN_TIME_BLOCKS` timestamps for MTP calculation.
+    ///
+    /// Returns at most `MEDIAN_TIME_BLOCKS` timestamps, oldest first.
+    pub fn prev_timestamps(&self) -> Vec<u64> {
+        let tip = self.tip_height;
+        let start = tip.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
+        (start..=tip)
+            .filter_map(|h| self.headers.get(&h).map(|hdr| hdr.timestamp))
+            .collect()
+    }
+
+    /// Build the ASERT `AnchorInfo` for the next block's difficulty calculation.
+    ///
+    /// The anchor is the header at the most recent epoch boundary.
+    pub fn anchor_info(&self) -> AnchorInfo {
+        let anchor_height = epoch_anchor_height(self.tip_height);
+        let anchor_header = self
+            .headers
+            .get(&anchor_height)
+            .unwrap_or_else(|| self.tip_header());
+        AnchorInfo {
+            anchor_height,
+            anchor_timestamp: anchor_header.timestamp,
+            anchor_target: anchor_header.difficulty_target,
+        }
+    }
+
+    /// Validate and apply the next block on top of the current tip.
+    ///
+    /// On success:
+    /// - `state` is updated to the post-block UTXO state
+    /// - the block's header is stored in `headers`
+    /// - the nullifier set is updated
+    /// - a new undo log is appended
+    /// - old undo logs (> UNDO_LOG_RETENTION blocks old) are pruned
+    /// - `tip_height` and `tip_hash` are updated
+    ///
+    /// On failure, the context is left **unchanged**.
+    ///
+    /// Note: ZK proof verification (LogicProof + BlockProof) is NOT performed here.
+    /// Call `validate_block_full()` from `noid_block` for full validation.
+    pub fn apply_next_block(
+        &mut self,
+        block: &Block,
+        local_time: u64,
+    ) -> Result<[u8; 32], ConsensusError> {
+        let parent = self.tip_header().clone();
+        let prev_timestamps = self.prev_timestamps();
+        let anchor = self.anchor_info();
+
+        // Build undo log BEFORE applying (captures pre-state).
+        let undo = build_undo_log(&self.state, block);
+
+        // Run native consensus validation (no ZK).
+        // On success, self.state is updated to the post-block state.
+        // On failure, self.state is left unchanged.
+        let new_state_root = validate_block_consensus(
+            block,
+            &parent,
+            &prev_timestamps,
+            local_time,
+            &anchor,
+            &self.nullifiers,
+            &mut self.state,
+        )?;
+
+        // All checks passed — update context.
+        let block_hash = full_block_hash(&block.header);
+
+        // Store header (forever).
+        self.headers
+            .insert(block.header.height, block.header.clone());
+
+        // Update nullifier set.
+        let tx_hashes: Vec<TxBodyHash> =
+            block.transactions.iter().map(|t| t.tx_body_hash).collect();
+        self.nullifiers.insert_block(&tx_hashes);
+
+        // Store undo log keyed by height; prune old ones beyond UNDO_LOG_RETENTION.
+        self.undo_logs.insert(block.header.height, undo);
+        prune_undo_logs(&mut self.undo_logs, block.header.height);
+
+        // Advance tip.
+        self.tip_height = block.header.height;
+        self.tip_hash = block_hash;
+
+        Ok(new_state_root)
+    }
+
+    /// Number of headers stored (= tip_height + 1 for a linear chain).
+    pub fn header_count(&self) -> usize {
+        self.headers.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{compute_tx_root, Block};
+    use crate::block_header::BlockHeader;
+    use crate::consensus::{
+        genesis::GENESIS_TIMESTAMP,
+        params::{BLOCK_TIME, GENESIS_TARGET, MEDIAN_TIME_BLOCKS, UNDO_LOG_RETENTION},
+        pow::{full_block_hash, search_pow},
+    };
+    use noid_poseidon2b::primitives::Address;
+
+    fn build_empty_block_on(ctx: &mut ChainContext) -> Block {
+        let parent = ctx.tip_header().clone();
+        let mut state_snap = ctx.state.clone();
+        let new_root = state_snap.state_root();
+
+        let mut header = BlockHeader {
+            prev_block_hash: full_block_hash(&parent),
+            state_root: new_root,
+            tx_root: compute_tx_root(&[]),
+            timestamp: parent.timestamp + BLOCK_TIME,
+            height: parent.height + 1,
+            miner_address: Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: parent.log_slots,
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
+        };
+        let nonce =
+            search_pow(&header, 0, 100_000_000).expect("genesis target trivially satisfiable");
+        header.nonce = nonce;
+        Block {
+            header,
+            transactions: vec![],
+        }
+    }
+
+    #[test]
+    fn init_from_genesis_is_valid() {
+        let ctx = ChainContext::init_from_genesis();
+        assert_eq!(ctx.tip_height, 0);
+        assert_eq!(ctx.header_count(), 1);
+        assert_eq!(ctx.nullifiers.window_len(), 0);
+        assert_eq!(ctx.undo_logs.len(), 0);
+        // Tip hash must equal full_block_hash(genesis_header()).
+        let genesis = genesis_header();
+        assert_eq!(ctx.tip_hash, full_block_hash(&genesis));
+    }
+
+    #[test]
+    fn apply_next_block_advances_tip() {
+        let mut ctx = ChainContext::init_from_genesis();
+        let block = build_empty_block_on(&mut ctx);
+        let ts = block.header.timestamp + 1;
+        let result = ctx.apply_next_block(&block, ts);
+        assert!(result.is_ok(), "first block should apply: {:?}", result);
+        assert_eq!(ctx.tip_height, 1);
+        assert_eq!(ctx.header_count(), 2);
+    }
+
+    #[test]
+    fn three_consecutive_blocks_apply() {
+        let mut ctx = ChainContext::init_from_genesis();
+        for expected_height in 1..=3u64 {
+            let block = build_empty_block_on(&mut ctx);
+            let ts = block.header.timestamp + 1;
+            ctx.apply_next_block(&block, ts)
+                .unwrap_or_else(|e| panic!("block {} should apply: {:?}", expected_height, e));
+            assert_eq!(ctx.tip_height, expected_height);
+        }
+        assert_eq!(ctx.header_count(), 4); // genesis + 3
+    }
+
+    #[test]
+    fn undo_logs_pruned_after_retention() {
+        let mut ctx = ChainContext::init_from_genesis();
+        // Apply UNDO_LOG_RETENTION + 2 blocks.
+        for _ in 0..(UNDO_LOG_RETENTION + 2) {
+            let block = build_empty_block_on(&mut ctx);
+            let ts = block.header.timestamp + 1;
+            ctx.apply_next_block(&block, ts).expect("apply");
+        }
+        // Undo logs should cover at most UNDO_LOG_RETENTION blocks.
+        assert!(
+            ctx.undo_logs.len() <= UNDO_LOG_RETENTION as usize,
+            "undo logs exceeded retention: {} > {}",
+            ctx.undo_logs.len(),
+            UNDO_LOG_RETENTION
+        );
+    }
+
+    #[test]
+    fn bad_parent_hash_rejected() {
+        let mut ctx = ChainContext::init_from_genesis();
+        let mut block = build_empty_block_on(&mut ctx);
+        block.header.prev_block_hash = [0xAB; 32]; // wrong
+                                                   // Re-mine PoW with the tampered header.
+        block.header.nonce = search_pow(&block.header, 0, 100_000_000).unwrap();
+        let result = ctx.apply_next_block(&block, block.header.timestamp + 1);
+        assert_eq!(result, Err(ConsensusError::BadParentHash));
+    }
+
+    #[test]
+    fn prev_timestamps_covers_up_to_11_headers() {
+        let mut ctx = ChainContext::init_from_genesis();
+        for _ in 0..15 {
+            let block = build_empty_block_on(&mut ctx);
+            let ts = block.header.timestamp + 1;
+            ctx.apply_next_block(&block, ts).expect("apply");
+        }
+        let ts = ctx.prev_timestamps();
+        assert!(
+            ts.len() <= MEDIAN_TIME_BLOCKS,
+            "at most {} timestamps",
+            MEDIAN_TIME_BLOCKS
+        );
+        assert!(!ts.is_empty());
+    }
+
+    /// Ensure GENESIS_TIMESTAMP is a reasonable value (sanity check on the constant).
+    #[test]
+    fn genesis_timestamp_sanity() {
+        assert!(GENESIS_TIMESTAMP > 1_700_000_000);
+    }
+}

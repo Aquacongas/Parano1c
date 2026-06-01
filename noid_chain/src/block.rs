@@ -125,6 +125,17 @@ pub fn apply_block(
     }
 
     let mut snap = state.clone();
+
+    // Slot-space expansion: if the block declares a larger log_slots, expand BEFORE
+    // applying transactions. The expansion is triggered by the block producer when
+    // active_slot_count/2^log_slots ≥ 75% (SPEC §15.3.6). Both builder and validator
+    // must expand at the same point so state_root is deterministic.
+    //
+    // We loop defensively (spec allows only +1 per block, but be safe).
+    while block.header.log_slots as usize > snap.state.log_slots() {
+        snap.state.expand();
+    }
+
     let mut last = StateTransition {
         new_state_root: snap.state_root(),
     };
@@ -163,6 +174,43 @@ pub fn apply_block(
 
     *state = snap;
     Ok(last)
+}
+
+/// Apply the genesis block to `state` without requiring a ZK proof or witness root.
+///
+/// Genesis (height = 0) is a special case: it has no transactions to prove
+/// and uses marker values for `proof_transcript_hash` and `witness_root`.
+/// All other validation (state_root, tx_root, counters) still applies.
+///
+/// MUST only be called with `block.header.height == 0`. Use `apply_block`
+/// for all subsequent blocks.
+pub fn apply_genesis_block(
+    state: &mut ChainState,
+    block: &Block,
+) -> Result<StateTransition, BlockApplyError> {
+    assert_eq!(
+        block.header.height, 0,
+        "apply_genesis_block called with non-genesis block"
+    );
+    if block.transactions.len() > BLOCK_MAX_TXS {
+        return Err(BlockApplyError::TooManyTransactions);
+    }
+    // Genesis has no transactions (empty block, no coinbase).
+    // tx_root must be [0;32] (empty).
+    if block.header.tx_root != [0u8; 32] {
+        return Err(BlockApplyError::HeaderTxRootMismatch);
+    }
+    // State root must match the initial empty state.
+    if block.header.state_root != state.state_root() {
+        return Err(BlockApplyError::HeaderStateRootMismatch);
+    }
+    // Counters must be zero for genesis.
+    if block.header.active_slot_count != 0 || block.header.alloc_counter != 0 {
+        return Err(BlockApplyError::HeaderActiveSlotCountMismatch);
+    }
+    Ok(StateTransition {
+        new_state_root: block.header.state_root,
+    })
 }
 
 /// Compute the block's tx-root — a COMPRESS-domain Merkle reduction over
@@ -603,6 +651,391 @@ mod tests {
         assert_eq!(
             apply_block(&mut state, &block),
             Err(BlockApplyError::CoinbaseHasInputs)
+        );
+    }
+
+    #[test]
+    fn apply_genesis_block_works() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let header = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.state_root(),
+            tx_root: [0u8; 32],
+            timestamp: 0,
+            height: 0,
+            miner_address: Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: [0xFFu8; 32],
+            proof_transcript_hash: [0x01u8; 32], // genesis marker
+            witness_root: [0u8; 32],             // genesis marker
+            log_slots: TEST_LOG_SLOTS as u32,
+            active_slot_count: 0,
+            alloc_counter: 0,
+        };
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        let result = apply_genesis_block(&mut state, &block);
+        assert!(result.is_ok(), "genesis block must apply: {:?}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expansion tests (SPEC §15.3)
+    // -----------------------------------------------------------------------
+
+    /// Build a block header that correctly reflects applying `txs` to `state`
+    /// with a potential slot-space expansion to `new_log_slots`.
+    fn mk_header_with_expansion(
+        state: &ChainState,
+        txs: &[Transaction],
+        new_log_slots: usize,
+    ) -> BlockHeader {
+        let mut dry = state.clone();
+        // Expand first if needed (matching apply_block behaviour).
+        while new_log_slots > dry.state.log_slots() {
+            dry.state.expand();
+        }
+        for tx in txs {
+            apply_tx(&mut dry, &tx.body).unwrap();
+        }
+        BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: dry.state_root(),
+            tx_root: compute_tx_root(txs),
+            timestamp: 1,
+            height: 1,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            difficulty_target: [0xFFu8; 32],
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [2u8; 32],
+            log_slots: new_log_slots as u32,
+            active_slot_count: dry.active_slot_count,
+            alloc_counter: dry.alloc_counter,
+        }
+    }
+
+    /// Fill `state` with `n` UTXO mints, returning the updated state.
+    /// Uses slot indices 0..n. Applies directly (no blocks).
+    fn fill_slots(state: &mut ChainState, n: usize) {
+        use noid_tx::TxBody;
+        for i in 0..n {
+            let body = TxBody {
+                epoch_anchor: [0u8; 32],
+                fee: 0,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    slot_index: i as u32,
+                    value: 100,
+                    owner: Address([1u8; 32]),
+                    valid: true,
+                }],
+                is_coinbase: false,
+            };
+            apply_tx(state, &body).expect("fill slot");
+        }
+    }
+
+    #[test]
+    fn expansion_trigger_constants_are_correct() {
+        // EXPAND_NUM=3, EXPAND_DENOM=4 → trigger at 75%
+        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM};
+        assert_eq!(EXPAND_NUM * 100 / EXPAND_DENOM, 75, "trigger must be 75%");
+    }
+
+    #[test]
+    fn apply_block_expands_state_at_75_percent() {
+        // log_slots=4 → 16 slots. 75% = 12 slots trigger expansion.
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 12); // 12/16 = 75% exactly → trigger fires
+        assert_eq!(state.active_slot_count, 12);
+        assert_eq!(state.state.log_slots(), 4);
+
+        // Build an expansion block: empty (just header declaring new log_slots=5).
+        let header = mk_header_with_expansion(&state, &[], 5);
+        assert_eq!(
+            header.log_slots, 5,
+            "template must declare expanded log_slots"
+        );
+
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        apply_block(&mut state, &block).expect("expansion block must apply");
+
+        assert_eq!(
+            state.state.log_slots(),
+            5,
+            "state log_slots must be 5 after expansion"
+        );
+        assert_eq!(
+            state.active_slot_count, 12,
+            "active_slot_count unchanged by expansion"
+        );
+    }
+
+    #[test]
+    fn apply_block_no_expansion_below_threshold() {
+        // 11/16 = 68.75% < 75% → trigger must NOT fire.
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 11); // just below threshold
+        assert_eq!(state.state.log_slots(), 4);
+
+        // Block at same log_slots=4 (no expansion).
+        let header = mk_header_with_expansion(&state, &[], 4);
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        apply_block(&mut state, &block).expect("non-expansion block must apply");
+
+        assert_eq!(state.state.log_slots(), 4, "log_slots must stay 4");
+    }
+
+    #[test]
+    fn expanded_state_has_double_capacity() {
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 12); // trigger at 75%
+        let before_capacity = state.state.num_slots();
+
+        let header = mk_header_with_expansion(&state, &[], 5);
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        apply_block(&mut state, &block).expect("expansion");
+
+        let after_capacity = state.state.num_slots();
+        assert_eq!(
+            after_capacity,
+            before_capacity * 2,
+            "capacity must double after expansion"
+        );
+    }
+
+    #[test]
+    fn new_slots_are_empty_after_expansion() {
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 12);
+        let old_capacity = state.state.num_slots() as u32; // = 16
+
+        let header = mk_header_with_expansion(&state, &[], 5);
+        apply_block(
+            &mut state,
+            &Block {
+                header,
+                transactions: vec![],
+            },
+        )
+        .unwrap();
+
+        // All new slots [16..31] must be empty.
+        for slot in old_capacity..old_capacity * 2 {
+            assert_eq!(
+                state.state.slot(slot),
+                crate::fri_state::SlotValue::EMPTY,
+                "new slot {} must be empty",
+                slot
+            );
+        }
+    }
+
+    #[test]
+    fn can_mint_to_new_slots_after_expansion() {
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 12);
+
+        // Apply expansion block.
+        let exp_header = mk_header_with_expansion(&state, &[], 5);
+        apply_block(
+            &mut state,
+            &Block {
+                header: exp_header,
+                transactions: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(state.state.log_slots(), 5);
+
+        // Now mint into slot 16 (first slot in new range).
+        let new_slot_tx = {
+            use noid_tx::{hash_tx_body, TxBody};
+            let body = TxBody {
+                epoch_anchor: [0u8; 32],
+                fee: 0,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    slot_index: 16,
+                    value: 999,
+                    owner: Address([5u8; 32]),
+                    valid: true,
+                }],
+                is_coinbase: false,
+            };
+            let hash = hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            );
+            Transaction {
+                body,
+                tx_body_hash: hash,
+            }
+        };
+        let txs = vec![new_slot_tx];
+        let header = mk_header_with_expansion(&state, &txs, 5);
+        apply_block(
+            &mut state,
+            &Block {
+                header,
+                transactions: txs,
+            },
+        )
+        .unwrap();
+
+        // Slot 16 should now be live.
+        let sv = state.state.slot(16);
+        assert_ne!(
+            sv,
+            crate::fri_state::SlotValue::EMPTY,
+            "slot 16 must be live after mint"
+        );
+        assert_eq!(state.active_slot_count, 13);
+    }
+
+    #[test]
+    fn slot_hints_cover_expanded_range() {
+        use crate::consensus::allocator::generate_slot_hints;
+
+        // After expansion from 4 to 5: valid range is [0, 32).
+        // With enough hints, at least one should land in [16, 32).
+        let hints = generate_slot_hints(0, 5, 100);
+        let in_new_range: Vec<_> = hints.iter().filter(|&&s| s >= 16 && s < 32).collect();
+        assert!(
+            !in_new_range.is_empty(),
+            "splitmix64 with log_slots=5 must produce hints in the new range [16,32); got {:?}",
+            &hints[..10]
+        );
+    }
+
+    #[test]
+    fn expansion_state_root_is_deterministic() {
+        // Two independent paths to the same state must give the same root.
+        let mut s1 = ChainState::with_log_slots(4);
+        let mut s2 = ChainState::with_log_slots(4);
+        fill_slots(&mut s1, 12);
+        fill_slots(&mut s2, 12);
+
+        let h1 = mk_header_with_expansion(&s1, &[], 5);
+        let h2 = mk_header_with_expansion(&s2, &[], 5);
+        apply_block(
+            &mut s1,
+            &Block {
+                header: h1,
+                transactions: vec![],
+            },
+        )
+        .unwrap();
+        apply_block(
+            &mut s2,
+            &Block {
+                header: h2,
+                transactions: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            s1.state_root(),
+            s2.state_root(),
+            "identical state histories must yield identical roots after expansion"
+        );
+    }
+
+    #[test]
+    fn expansion_block_validates_with_consensus() {
+        use crate::consensus::{
+            genesis::GENESIS_TIMESTAMP,
+            params::{BLOCK_TIME, GENESIS_TARGET},
+            pow::{full_block_hash, search_pow},
+            validation::{validate_block_consensus, AnchorInfo},
+        };
+        use crate::nullifier::NullifierSet;
+
+        // Use log_slots=4 (tiny) so we can fill it fast.
+        let mut state = ChainState::with_log_slots(4);
+        fill_slots(&mut state, 12); // 12/16 = 75% → trigger
+
+        // Build the parent header (simulating genesis-like parent with log_slots=4).
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.state_root(), // lie: pretend this was the pre-state
+            tx_root: [0u8; 32],
+            timestamp: GENESIS_TIMESTAMP,
+            height: 0,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: 4,
+            active_slot_count: 12, // this is what triggers expansion in validator
+            alloc_counter: 12,
+        };
+
+        // Build the expansion block header.
+        let mut exp_state = state.clone();
+        exp_state.state.expand();
+        let mut expansion_header = BlockHeader {
+            prev_block_hash: full_block_hash(&parent),
+            state_root: exp_state.state_root(),
+            tx_root: compute_tx_root(&[]),
+            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
+            height: 1,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: 5,          // expanded!
+            active_slot_count: 12, // unchanged (no mints/spends)
+            alloc_counter: 12,
+        };
+        expansion_header.nonce = search_pow(&expansion_header, 0, 100_000_000)
+            .expect("genesis target trivially satisfiable");
+
+        let block = Block {
+            header: expansion_header,
+            transactions: vec![],
+        };
+        let anchor = AnchorInfo {
+            anchor_height: 0,
+            anchor_timestamp: GENESIS_TIMESTAMP,
+            anchor_target: GENESIS_TARGET,
+        };
+        let mut apply_state = state.clone();
+        let result = validate_block_consensus(
+            &block,
+            &parent,
+            &[parent.timestamp],
+            block.header.timestamp + 1,
+            &anchor,
+            &NullifierSet::new(),
+            &mut apply_state,
+        );
+        assert!(
+            result.is_ok(),
+            "expansion block must pass validate_block_consensus: {:?}",
+            result
+        );
+        assert_eq!(
+            apply_state.state.log_slots(),
+            5,
+            "state must be expanded after validation"
         );
     }
 }

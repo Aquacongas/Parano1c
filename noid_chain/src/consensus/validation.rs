@@ -87,6 +87,28 @@ pub fn validate_block_consensus(
         &anchor.anchor_target,
     )?;
 
+    // --- §15.3.6 log_slots expansion trigger ---
+    // When occupancy (active_slot_count / 2^log_slots) ≥ 75%, log_slots MUST
+    // increment by exactly 1. Otherwise it MUST stay the same.
+    // This is checked against the PARENT's active_slot_count (pre-block occupancy).
+    {
+        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM};
+        let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
+        let trigger = parent.active_slot_count.saturating_mul(EXPAND_DENOM)
+            >= prev_capacity.saturating_mul(EXPAND_NUM);
+        let expected_log_slots = if trigger {
+            parent
+                .log_slots
+                .saturating_add(1)
+                .min(crate::consensus::params::LOG_SLOTS_MAX)
+        } else {
+            parent.log_slots
+        };
+        if block.header.log_slots != expected_log_slots {
+            return Err(ConsensusError::BadLogSlotsExpansion);
+        }
+    }
+
     // --- Tx count limit ---
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
@@ -256,5 +278,75 @@ mod tests {
         // Either InvalidPoW (nonce doesn't satisfy target) or ok if we got unlucky
         // and it happens to work. Just exercise the path.
         let _ = result;
+    }
+
+    #[test]
+    fn expansion_trigger_enforced() {
+        // Build a parent that is at exactly 75% occupancy (should trigger expansion).
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let capacity = 1u64 << TEST_LOG_SLOTS as u64;
+        // Set active_slot_count to 75% of capacity.
+        let target_active = (capacity * 3) / 4;
+        state.active_slot_count = target_active;
+
+        let state_root = state.state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root,
+            tx_root: [0u8; 32],
+            timestamp: GENESIS_TIMESTAMP,
+            height: 0,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: TEST_LOG_SLOTS as u32,
+            active_slot_count: target_active,
+            alloc_counter: 0,
+        };
+
+        // Block claiming log_slots = TEST_LOG_SLOTS (no expansion) should be rejected.
+        let block_no_expand = {
+            use crate::block::compute_tx_root;
+            use crate::consensus::pow::{full_block_hash, search_pow};
+            let mut hdr = BlockHeader {
+                prev_block_hash: full_block_hash(&parent),
+                state_root,
+                tx_root: compute_tx_root(&[]),
+                timestamp: parent.timestamp + BLOCK_TIME,
+                height: 1,
+                miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: GENESIS_TARGET,
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [1u8; 32],
+                log_slots: TEST_LOG_SLOTS as u32, // should be TEST_LOG_SLOTS + 1
+                active_slot_count: target_active,
+                alloc_counter: 0,
+            };
+            hdr.nonce = search_pow(&hdr, 0, 100_000_000).unwrap();
+            crate::block::Block {
+                header: hdr,
+                transactions: vec![],
+            }
+        };
+
+        let mut apply_state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        apply_state.active_slot_count = target_active;
+        let result = validate_block_consensus(
+            &block_no_expand,
+            &parent,
+            &[parent.timestamp],
+            block_no_expand.header.timestamp + 1,
+            &genesis_anchor(&parent),
+            &NullifierSet::new(),
+            &mut apply_state,
+        );
+        assert_eq!(
+            result,
+            Err(ConsensusError::BadLogSlotsExpansion),
+            "block must fail when expansion trigger fires but log_slots not incremented"
+        );
     }
 }

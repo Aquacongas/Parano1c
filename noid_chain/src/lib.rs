@@ -16,9 +16,11 @@
 
 pub mod block;
 pub mod block_header;
+pub mod chain_context;
 pub mod consensus;
 pub mod da;
 pub mod fri_state;
+pub mod mempool;
 pub mod nullifier;
 pub mod segmented_state;
 pub mod state;
@@ -65,7 +67,8 @@ pub use da::{
 // ---------------------------------------------------------------------------
 
 pub use block::{
-    apply_block, compute_tx_root, proof_transcript_hash, Block, BlockApplyError, BLOCK_MAX_TXS,
+    apply_block, apply_genesis_block, compute_tx_root, proof_transcript_hash, Block,
+    BlockApplyError, BLOCK_MAX_TXS,
 };
 pub use block_header::{hash_block_header, BlockHeader};
 
@@ -73,6 +76,8 @@ pub use block_header::{hash_block_header, BlockHeader};
 // Chain state
 // ---------------------------------------------------------------------------
 
+pub use chain_context::ChainContext;
+pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use nullifier::NullifierSet;
 pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
 pub use state_binding::{BlockStateBinding, StateBindingError, TxStateOpening};

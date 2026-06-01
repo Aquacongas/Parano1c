@@ -83,7 +83,6 @@ pub fn find_genesis_nonce() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::pow::validate_pow;
 
     #[test]
     fn genesis_header_is_deterministic() {

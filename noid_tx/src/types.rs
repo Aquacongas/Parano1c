@@ -115,8 +115,12 @@ pub struct TxBody {
     pub is_coinbase: bool,
 }
 
-/// Depth of the epoch anchor window in blocks.
-pub const ANCHOR_DEPTH: u64 = 6;
+/// Epoch anchor validity window in blocks.
+/// A transaction's `epoch_anchor` must reference a block within the last
+/// `ANCHOR_DEPTH` blocks. Larger values allow txs to survive slow-block periods
+/// (e.g. 144 blocks × 30 min/block = 3 days of validity during a difficulty spike).
+/// Nullifier set window = ANCHOR_DEPTH (prevents replay within validity window).
+pub const ANCHOR_DEPTH: u64 = 144;
 
 impl TxBody {
     /// Number of real spend inputs (`valid = true`).

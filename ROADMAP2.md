@@ -56,10 +56,34 @@ What does NOT exist: networking, mempool, RPC, wallet CLI, mining, consensus val
 (`verify_logic` per tx + `verify_block` for BlockProof) is layered on top in
 `noid_block::validate_block_full()` — to be implemented in Phase 2 (see P.9 note below).
 
-**Remaining for Phase 1 full completion**:
-- ❌ P.12 `reorg.rs` — orchestration of reorg (find common ancestor, revert + reapply)
-- ❌ P.9 ZK layer — `noid_block::validate_block_full()` wrapping `validate_block_consensus` + `verify_block`
-- ❌ P.16–P.19 — fee market design, economic analysis, failure semantics (design items)
+- ✅ P.20 `chain_context.rs` — `ChainContext` struct, `init_from_genesis()`, `apply_next_block()`
+- ✅ P.21 `nullifier.rs` — `pop_latest_block()`, `rebuild_from_blocks()` for reorg support
+- ✅ P.22 `validation.rs` — §15.3.6 expansion trigger: `log_slots` must increment iff occupancy ≥ 75%
+- ✅ P.23 `checks.rs` + `params.rs` — fee overflow guard (`fee > u64::MAX` → `BadFee`); `MIN_FEE_BASE`, `FEE_PER_OUTPUT`, `min_fee()` constants
+- ✅ P.24 `block.rs` — `apply_genesis_block()` genesis bootstrap (bypasses witness/proof checks)
+- ✅ P.16 Fee market — designed (see P.16 section below)
+- ✅ P.17 Economic attack surface — analysed (see P.17 section below)
+- ✅ P.18 Failure & recovery semantics — designed (see P.18 section below)
+- ✅ P.19 Recursive failure domains — designed (see P.19 section below)
+
+- ✅ P.12 `reorg.rs` — `find_common_ancestor`, `apply_reorg` (full within-finality-window reorg)
+- ✅ P.13 `prove_genesis_recursive()` — genesis `RecursiveBlockProof` (null witness, zero rounds)
+- ✅ P.25 `ordering.rs` — `order_block_txs()`: coinbase first, descending fee, hash tie-break (miner policy)
+- ✅ P.26 `conflict.rs` — `resolve_slot_conflicts()`: winners by argmin(tx_body_hash) per contested slot
+- ✅ P.27 `mempool.rs` — `Mempool`, `MempoolEntry`, `MempoolError`: admit, evict_expired, select_for_block, on_block_confirmed
+- ✅ P.28 `mempool_checks.rs` — `validate_tx_for_mempool()`: anchor hash check, slot liveness, state emptiness
+- ✅ P.29 `template.rs` — `BlockTemplate`, `build_block_template()`: conflict resolution → state apply → coinbase → header_core for miner
+- ✅ P.30 `noid_block::validate.rs` — `validate_block_full()` (native + ZK), `build_tx_airs()`
+- ✅ P.31 `noid_block::block_chain_context.rs` — `BlockChainContext`: consensus + recursive proof in one struct
+- ✅ `noid_tx::ANCHOR_DEPTH = 144` — tx validity window 2.4h normal / 3 days @ 30min blocks
+
+**Phase 1 is COMPLETE.** All consensus logic, validation, mempool, template, reorg, and recursive chain are implemented as pure in-memory Rust with no I/O.
+
+**What Phase 2 adds** (storage + network layer on top of this logic):
+- MDBX: persist headers/state/undo-logs across restarts
+- P2P: block/tx propagation
+- Block Template API: external miner interface (248-byte header_core)
+- Mempool pre-proving loop (tokio async + rayon)
 
 ---
 
@@ -401,41 +425,61 @@ pub trait StateProvider { fn get_slot(&self, idx: u32) -> SlotValue; }
 pub enum ConsensusError { InvalidPoW, BadTimestamp, BadTxRoot, /* ... 16 variants */ }
 ```
 
-### P.1 Consensus Parameters (`params.rs`)
+### P.1 Consensus Parameters (`params.rs`) ✅
 
 ```rust
+// Timing
 pub const BLOCK_TIME:           u64   = 60;
 pub const EPOCH_LENGTH:         u64   = 6;
-pub const HALFLIFE:             u64   = 360;
+pub const HALFLIFE:             u64   = 360;           // EPOCH_LENGTH × BLOCK_TIME
 pub const MAX_FUTURE_DRIFT:     u64   = 120;
+pub const MEDIAN_TIME_BLOCKS:   usize = 11;
+// Block limits
 pub const BLOCK_MAX_TXS:        usize = 1024;
+pub const MAX_INPUTS:           usize = 4;
+pub const MAX_OUTPUTS:          usize = 8;
+// Epoch anchor / finality
 pub const ANCHOR_DEPTH:         u64   = 6;
-pub const FINALITY_DEPTH:       u64   = 18;  // 3 epochs
+pub const FINALITY_DEPTH:       u64   = 18;            // 3 × EPOCH_LENGTH
+pub const UNDO_LOG_RETENTION:   u64   = FINALITY_DEPTH; // must equal FINALITY_DEPTH
+// Slot state
 pub const LOG_SLOTS_GENESIS:    u32   = 24;
+pub const LOG_SLOTS_MAX:        u32   = 32;
 pub const LOG_SEGMENT_SIZE:     u32   = 16;
+pub const EXPAND_NUM:           u64   = 3;             // trigger at 75 %
+pub const EXPAND_DENOM:         u64   = 4;
+// PoW
 pub const GENESIS_TARGET:       [u8;32] = /* 2^252 */;
 // Emission
-pub const NOID_DECIMALS:        u32   = 6;
 pub const MICRONOID_PER_NOID:   u64   = 1_000_000;
-pub const BASE_REWARD:          u64   = 50 * 1_000_000;
-pub const FLOOR_REWARD:         u64   = 1 * 1_000_000;
-pub const USAGE_SCALE:          u64   = 1_000_000;
+pub const BASE_REWARD_MICRONOID: u64  = 50_000_000;   // 50 NOID
+pub const FLOOR_REWARD_MICRONOID: u64 = 1_000_000;    // 1 NOID
+// Fee policy (non-consensus, local node enforcement)
+pub const MIN_FEE_BASE:         u64   = 5_000;         // 0.005 NOID
+pub const FEE_PER_OUTPUT:       u64   = 2_000;         // 0.002 NOID/output
+pub const fn min_fee(n_outputs: u64) -> u64 { MIN_FEE_BASE + n_outputs * FEE_PER_OUTPUT }
+// PRNG
+// splitmix64 constants embedded in allocator.rs (no separate params)
+// Pre-proving channel
+pub const PRETX_CHANNEL_TAG: &[u8] = b"paranoid-pretx-v1";
 ```
 
-**Done when**: All constants match SPECIFICATION.md.
+**Done when**: All constants match SPECIFICATION.md. ✅ *Implemented and tested.*
 
-### P.2 Emission Schedule (`emission.rs`)
+### P.2 Emission Schedule (`emission.rs`) ✅
 
 ```rust
-pub fn block_reward(active_slot_count: u64) -> u64 {
-    let divisor = 1 + active_slot_count / USAGE_SCALE;
-    (BASE_REWARD / divisor).max(FLOOR_REWARD)
+// Halves once per log_slots expansion (not per active_slot_count).
+pub fn block_reward(log_slots: u32) -> u64 {
+    (BASE_REWARD_MICRONOID >> (log_slots - LOG_SLOTS_GENESIS)).max(FLOOR_REWARD_MICRONOID)
 }
 pub fn total_fees(txs: &[TxBody]) -> u64
-pub fn expected_coinbase_value(active_slot_count: u64, txs: &[TxBody]) -> u64
+pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u64
 ```
 
-**Done when**: Anti-spam property verified via property tests; floor enforced; coinbase over-claiming rejected.
+Halving table: 24→50, 25→25, 26→12.5, 27→6.25, 28→3.125, 29→1.5625, 30+→1 NOID (floor).
+
+**Done when**: Verified by property tests (floor, monotone, halving). ✅ *Implemented and tested.*
 
 ### P.3 ASERT Difficulty (`difficulty.rs`)
 
@@ -469,75 +513,98 @@ Full block hash = Blake3(header_core + proof_transcript_hash + other fields).
 
 **Done when**: Rejects backward and far-future timestamps.
 
-### P.6 Header Chain Validation (`header.rs`)
+### P.6 Header Chain Validation (`header.rs`) ✅
 
 Checks (in order):
 1. `prev_block_hash == Blake3(full parent header)`
 2. `height == parent.height + 1`
-3. `difficulty_target == expected_target(parent, anchor)`
-4. Timestamp rules (P.5)
-5. PoW validity (P.4)
+3. `difficulty_target == expected_target(parent, anchor)` (ASERT)
+4. Timestamp rules: MTP + future drift (P.5)
+5. PoW: `Blake3(header_core) < difficulty_target` (P.4)
 6. `proof_transcript_hash != [0u8;32]` (block must have proof)
-7. `log_slots >= parent.log_slots` (monotone)
+7. `log_slots >= parent.log_slots` (monotone sanity check)
 
-**Done when**: Full header chain validates from genesis.
+Precise `log_slots` expansion rule is enforced in P.9 `validate_block_consensus`.
 
-### P.7 Coinbase & Reward Rules (`reward.rs`)
+**Done when**: Full header chain validates from genesis. ✅ *Implemented and tested.*
 
-- Exactly one coinbase per block (first tx), `is_coinbase == true`, zero inputs
-- `coinbase.outputs[0].value <= block_reward(active_slot_count) + total_fees(other_txs)`
-- Over-claiming is consensus failure
+### P.7 Coinbase & Reward Rules (`block.rs` + `validation.rs`) ✅
 
-**Done when**: Inflated coinbase rejected.
+Structural checks in `apply_block()`:
+- At most one coinbase per block (first tx)
+- `is_coinbase == true` → zero valid inputs
+- Coinbase must be first tx
 
-### P.8 Per-Transaction Consensus Checks (`checks.rs`)
+Amount check in `validate_block_consensus()`:
+- `sum(coinbase.outputs[*].value) <= max_coinbase_value(header.log_slots, fees)`
+- `max_coinbase_value = block_reward(log_slots) + total_fees(non_coinbase_txs)`
+- Over-claiming → `ConsensusError::InflatedCoinbase`
+
+**Done when**: Inflated coinbase rejected. ✅ *Implemented and tested.*
+
+### P.8 Per-Transaction Consensus Checks (`checks.rs`) ✅
 
 Order (cheapest first):
-1. `epoch_anchor` freshness: in `[height-7, height-1]`
-2. `hash(tx.body) == pi.tx_body_hash`
-3. No nullifier collision (no double-spend)
-4. No slot conflict within block
-5. Input slots live in parent state
-6. Output slots empty in parent state
-7. `verify_logic(...)` — O(84ms), parallelized
-8. `fee >= 0`
+1. `fee <= u64::MAX` (overflow guard → `BadFee`)
+2. `hash(tx.body) == tx.tx_body_hash` (→ `BadTxBodyHash`)
+3. For non-coinbase: `epoch_anchor != [0;32]` (→ `BadEpochAnchor`)
+4. `tx_body_hash` not in nullifier set (→ `NullifierCollision`)
+5. Cross-tx slot conflicts via `validate_block_slot_conflicts()` (→ `SlotConflict`)
 
-**Done when**: All 8 checks enforced; double-spend impossible.
+Deferred to ZK layer (`validate_block_full`):
+- Epoch anchor hash against real headers (needs HeaderProvider)
+- Balance: `Σ inputs == Σ outputs + fee` (proven by LogicProof)
+- Ownership: spend_secret → owner (proven by AuthGKR)
+- Output slots empty: `is_mint ⇒ prev == 0` (proven by BlockStateBinding)
 
-### P.9 Block Validation Pipeline (`block.rs`)
+**Done when**: All native checks enforced; double-spend caught. ✅ *Implemented and tested.*
 
-Orchestrates all 16 invariants cheapest-first. Reference: Reth `crates/consensus/auto-seal`.
+### P.9 Block Validation Pipeline (`validation.rs`) ✅
 
-1–7: O(1) header and limit checks  
-8–11: O(txs) nullifier, slot, anchor checks  
-12: O(txs × 84ms) LogicProof verification — **parallelized**  
-13: BlockProof + BlockStateBinding  
-14: `proof_transcript_hash == Poseidon2b(proof_transcript_bytes)`  
-15: `state_root == post-state.root()`  
-16: `active_slot_count` and `alloc_counter` updated correctly  
+`validate_block_consensus()` orchestrates cheapest-first:
 
-**Done when**: All 16 invariants enforced; expensive checks last.
-
-### P.10 DA Pruning (`da_prune.rs`)
-
-```rust
-// Delete immediately after apply_block
-fn prune_block_da(db: &mut impl BlockStore, height: u64)
-
-// Compact undo log instead of full DA
-pub struct BlockUndoLog {
-    pub block_height: u64,
-    pub slot_changes: Vec<(u32, SlotValue)>,  // ~590 KB max per block
-}
-
-fn revert_block(state: &mut SegmentedFriState, undo: &BlockUndoLog)
+```
+1. validate_header()           — PoW, timestamps, difficulty, prev_hash, height    O(1)
+2. §15.3.6 expansion trigger  — log_slots must/must-not expand based on occupancy  O(1)
+3. BLOCK_MAX_TXS check        — hard DoS cap                                       O(1)
+4. validate_block_slot_conflicts() — cross-tx input/output uniqueness              O(txs)
+5. validate_tx_consensus() ×N — fee overflow, body_hash, anchor, nullifier         O(txs)
+6. Coinbase amount check      — value ≤ block_reward + fees                        O(txs)
+7. apply_block()              — state_root, active_count, alloc_counter            O(txs)
 ```
 
-- DA deleted immediately after `apply_block`
-- Undo logs kept for last `EPOCH_LENGTH = 6` blocks
-- After 6 confirmations: undo logs also deleted (finality)
+NOT checked here (ZK layer, to be added in `noid_block::validate_block_full`):
+- LogicProof verifies (STARK + AuthGKR)
+- BlockStateBinding verifies (Merkle openings)
+- C_claimed bridge
+- BlockProof aggregate
+- epoch_anchor hash vs actual headers
+- da_root / witness_root
 
-**Done when**: DA deleted immediately; reorgs work correctly using undo logs; node restarts without data.
+**Done when**: All native invariants enforced. ✅ *Implemented and tested.*
+
+### P.10 DA Pruning (`da_prune.rs`) ✅
+
+```rust
+pub struct BlockUndoLog {
+    pub block_height: u64,
+    pub slot_changes: Vec<(u32, SlotValue)>,  // pre-block values, ~590 KB max
+}
+
+// Call BEFORE apply_block; captures pre-state of all touched slots.
+pub fn build_undo_log(state: &ChainState, block: &Block, height: u64) -> BlockUndoLog
+
+// Restore state to pre-block. O(touched_slots).
+pub fn revert_block(state: &mut ChainState, undo: &BlockUndoLog)
+
+// Prune logs older than UNDO_LOG_RETENTION (= FINALITY_DEPTH = 18) blocks.
+pub fn prune_undo_logs(logs: &mut HashMap<u64, BlockUndoLog>, current_height: u64)
+```
+
+Key invariant: `UNDO_LOG_RETENTION == FINALITY_DEPTH == 18`. This ensures any reorg
+within the finality window can always be reverted. (Was `EPOCH_LENGTH = 6` — fixed.)
+
+**Done when**: DA pruned; reorgs within 18 blocks always revertable. ✅ *Implemented and tested.*
 
 ### P.11 Fork Choice (`fork_choice.rs`)
 
@@ -590,43 +657,270 @@ Topics:
 
 **Done when**: Same input → same bytes on ARM, x86, WASM, RISC-V.
 
-### P.16 Fee Market & Resource Accounting
+### P.16 Fee Market & Resource Accounting ✅ (designed)
 
-Topics to design:
-- Fee dimensions: algebraic proving cost, DA byte cost, state growth
-- Tx pricing model: fixed vs dynamic, congestion adjustment
-- Spam resistance: mempool occupancy pricing, low-fee eviction
-- State slot lifecycle: permanent allocation economics
-- Miner incentives: reward structure
+#### Cost model
 
-### P.17 Economic Attack Surface
+| Resource | Cost driver | Paid by |
+|---|---|---|
+| Proving (~84ms CPU/tx) | fixen per tx | miner bears, fee compensates |
+| DA bytes (Binius-packed) | ~200–500 B/tx | sender |
+| Permanent state slot | 1 slot per output, forever | sender |
+| Verification (~8ms/tx) | linear in block | miner bears |
 
-Topics to analyze:
-- Slot spam economics (partially addressed by anti-spam emission)
-- Prover centralization pressure
-- ASIC asymmetry under Blake3
-- DA flooding economics
-- State expansion griefing
-- Empty block incentives
-- Fee market manipulation
+PoW provides only ordering and Sybil resistance. Proving is the dominant cost.
 
-### P.18 Failure & Recovery Semantics
+#### Phase 1 — flat minimum fee (non-consensus, local policy)
 
-Topics to define:
-- Crash consistency: atomic MDBX commit per block
-- Interrupted block application rollback
-- `accumulator/state_root/header` roll forward atomically
-- Recovery invariant: restart must never produce divergent `state_root`
-- Partial DA prune race conditions
-- State snapshot corruption handling
+```rust
+// Enforced at mempool admission (not in ZK circuit, not in validate_block_consensus).
+pub const MIN_FEE_BASE:    u64 = 5_000;   // 0.005 NOID  (covers proving amortized)
+pub const FEE_PER_OUTPUT:  u64 = 2_000;   // 0.002 NOID per output (state allocation)
+pub const fn min_fee(n_outputs: u64) -> u64 { MIN_FEE_BASE + n_outputs * FEE_PER_OUTPUT }
+```
 
-### P.19 Recursive Failure Domains
+Examples: 1 output → 0.007 NOID; 8 outputs → 0.021 NOID; coinbase → exempt.
 
-Topics:
-- Recursive prover backlog thresholds
-- Accumulator corruption recovery
-- Fallback validation mode (skip recursive proof if prover is behind)
-- Delayed recursive finalization semantics
+#### Phase 3 — dynamic floor (with mempool)
+
+When mempool is congested, nodes raise the floor:
+```
+mempool_fee_floor = max(MIN_FEE_BASE,
+                        median(last 50 admitted fee_rates) × 0.9)
+```
+Floor resets to `MIN_FEE_BASE` when mempool drops below 50 % capacity.
+
+#### Miner incentives
+
+Block reward + fees form total miner income. Empty blocks collect reward but no fees.
+With Phase 1.5 pre-proving, full blocks take ~0 extra latency → no incentive to mine empty.
+Fee income from 1024 txs at minimum fee: 1024 × 0.005 = 5.12 NOID (10 % of genesis reward).
+
+**Done when**: `min_fee` enforced at mempool admission; fee constants in `params.rs`. ✅
+
+---
+
+### P.17 Economic Attack Surface ✅ (analysed)
+
+#### A1 — Slot spam (state-filling attack)
+
+Goal: fill 75 % of 2^24 slots to trigger expansion and halve miner reward.
+
+```
+Cost to fill 12.6M slots from empty state:
+  Txs needed: 12.6M / 8 outputs = 1.575M txs
+  Blocks:     1.575M / 1024 = 1538 blocks = 25.6 hours of chain time
+  Min fee:    1.575M × 0.005 NOID = 7875 NOID
+  Proving:    84ms × 1.575M = 36.75 CPU-hours (must produce valid proofs)
+  Loss:       reward halves from 50 → 25 NOID; during attack: 1538 × 50 = 76900 NOID forgone
+  Net attack cost: ≈46000 NOID minimum
+```
+
+After expansion: reward halves to 25 NOID — the attacker harms themselves as much as the network.
+
+#### A2 — Empty block mining
+
+Miner skips proving (0 txs) to start PoW earlier.
+With Phase 1.5 pre-proving: full blocks have ~0 extra latency → incentive eliminated.
+Without pre-proving: ~12s advantage at 1024 txs. ASERT auto-adjusts to slower intervals.
+
+#### A3 — Prover centralization
+
+A 2× faster prover gains ~10 % latency advantage (12s vs 6s proving / 60s PoW window).
+ZK proof security is independent of who proves — a centralized prover cannot forge proofs.
+ASIC risk: Blake3 is CPU/GPU-friendly now; fork-able hash function if ASICs dominate.
+
+#### A4 — Double-spend attack
+
+Requires reorg of ≥ FINALITY_DEPTH = 18 blocks. Needs 51 % hash power AND proving capacity.
+With 51 % hash power but no proving: blocks rejected (MissingProof / invalid BlockProof).
+With both: cost = honest miners’ accumulated work × 18 blocks. Equivalent to Bitcoin 51 % + ZK compute.
+
+#### A5 — Epoch anchor manipulation
+
+Wallet sends tx with anchor = arbitrary 32-byte hash (not from our chain).
+Native check: anchor non-zero. Full check (anchor ∈ chain): at mempool admission, full node
+verifies anchor against stored headers. If node doesn’t check this — tx included, ZK proof
+still binds the anchor in `tx_body_hash`, but state validity is unaffected.
+Conclusion: anchor check at mempool admission is important for UX (correct window), not security.
+
+#### A6 — DA flooding
+
+Attacker submits max-DA txs. Binius packing limits DA/tx. Hard cap `BLOCK_MAX_TXS = 1024`.
+Block DA maximum: 1024 txs × ~500 bytes = ~512 KB/block. At 1 block/min = ~30 MB/hour.
+DA is pruned immediately after `apply_block` — no long-term storage pressure.
+
+---
+
+### P.18 Failure & Recovery Semantics ✅ (designed)
+
+#### Phase 1 (RAM backend)
+
+All state in memory. On crash: state is lost. On restart: replay blocks from genesis.
+- `apply_block` is transactional on a snapshot — snapshot swapped only on success.
+- No partial state writes possible in Phase 1.
+- Recovery: restart always produces the same `state_root` by deterministic replay.
+
+#### Phase 2 (MDBX backend) — atomic commit protocol
+
+```
+BEGIN MDBX TXN
+  1. write dirty segment data (slot changes)
+  2. write new BlockHeader (height → bytes, stored forever)
+  3. write header_by_hash (hash → height)
+  4. update chain_tip (best height, best hash)
+  5. update state_root, active_slot_count, alloc_counter
+  6. write BlockUndoLog (height → undo, kept FINALITY_DEPTH blocks)
+  7. delete expired UndoLog (height ≤ current - UNDO_LOG_RETENTION)
+COMMIT
+
+AFTER COMMIT (best-effort, re-runnable on restart):
+  8. delete block DA (txs + BlockProof) — if crash here: DA survives one extra block, safe
+  9. update recursive proof (async, separate MDBX txn)
+```
+
+If COMMIT fails: node is at state `H-1`; apply block `H` again on receipt from peer.
+If crash after COMMIT but before step 8: safe, DA has an extra copy, deleted on next startup.
+
+**Recovery invariant**: After any restart, `chain_tip.height == H` implies `state_root` in DB
+matches the deterministic state root of block `H`. No replay needed.
+
+#### Disk full
+
+Segment data: 2^24 slots × 48 bytes = 805 MB at genesis, grows with active slots.
+Headers: 276 bytes × forever. At 1 block/min × 10 years ≈ 1.46 GB.
+DA: deleted immediately — 0 long-term growth.
+Recursive proof: 6.5 KB (single tip value).
+
+Mitigation: alert at 80 % disk usage; graceful shutdown before corruption.
+
+---
+
+### P.19 Recursive Failure Domains ✅ (designed)
+
+The recursive prover is independent of the consensus path. Full nodes always validate
+natively. Recursive proof exists only for O(1) light-client verification.
+
+#### Three operating modes
+
+```
+NORMAL   : rec_proof lag ≤ 3 blocks  — O(1) sync available, all light clients happy
+DEGRADED : lag 4–18 blocks           — warn light clients; full node operates normally
+FALLBACK : lag > 18 blocks = FINALITY_DEPTH — light clients verify last 18 headers natively
+```
+
+Thresholds: `REC_PROOF_LAG_WARNING = 3`, `REC_PROOF_LAG_FALLBACK = FINALITY_DEPTH = 18`.
+
+#### Crash recovery
+
+```
+Last proved height: K
+Chain tip:         K + N
+
+Recovery:
+  for h in (K+1)..=(K+N):
+    block      = storage.get_block(h)
+    block_proof = storage.get_block_proof(h)
+    acc        = accumulator.extend(block, block_proof)
+    rec_proof  = prove_recursive(acc, block_proof)  // ~2s each
+    storage.set_recursive_proof(h, rec_proof)
+
+Time: N × 2s. At N = FINALITY_DEPTH (18): ~36s recovery.
+```
+
+#### Accumulator corruption detection
+
+```rust
+// Recompute from stored headers (O(H) Poseidon2b ops, fast even for 10M blocks)
+fn verify_accumulator_integrity(acc: &ChainAccumulator, headers: &[(u64, BlockHeader)]) -> bool {
+    let mut expected = genesis_accumulator(...);
+    for (height, header) in headers {
+        expected = expected.extend(header.state_root, full_block_hash(header), *height);
+    }
+    expected == *acc
+}
+```
+
+Headers are stored forever — recomputation is always possible.
+
+#### Key invariant: recursive proof is NOT required for consensus finality
+
+A block is final after `FINALITY_DEPTH = 18` confirmations regardless of recursive prover status.
+Recursive proof is required only for O(1) new-node sync. The chain continues safely in FALLBACK mode.
+
+---
+
+### P.20 Chain Context (`chain_context.rs`) ✅
+
+```rust
+pub struct ChainContext {
+    pub headers:    HashMap<u64, BlockHeader>,  // all headers, forever
+    pub nullifiers: NullifierSet,               // last ANCHOR_DEPTH blocks
+    pub state:      ChainState,                 // current UTXO state
+    pub undo_logs:  HashMap<u64, BlockUndoLog>, // last FINALITY_DEPTH blocks
+    pub tip_height: u64,
+    pub tip_hash:   [u8; 32],
+}
+
+impl ChainContext {
+    pub fn init_from_genesis() -> Self;
+    pub fn apply_next_block(&mut self, block: &Block, local_time: u64) -> Result<[u8;32], ConsensusError>;
+    pub fn anchor_info(&self) -> AnchorInfo;
+    pub fn prev_timestamps(&self) -> Vec<u64>;
+}
+```
+
+This is the single source of truth for in-memory chain state. Phase 2 replaces the
+inner fields with MDBX-backed equivalents behind the same interface.
+
+**Done when**: Full node can be initialised from genesis and advance block-by-block. ✅
+
+### P.21 NullifierSet reorg support (`nullifier.rs`) ✅
+
+```rust
+pub fn pop_latest_block(&mut self) -> Option<Vec<TxBodyHash>>
+pub fn rebuild_from_blocks(blocks: impl IntoIterator<Item=Vec<TxBodyHash>>) -> Self
+```
+
+During reorg: call `pop_latest_block()` N times to revert N blocks, then rebuild from new chain.
+
+**Done when**: Reorg reverts nullifier window correctly. ✅
+
+### P.25 Canonical Transaction Ordering (consensus-significant) ❌
+
+Transaction order within a block determines `tx_root` which is in the header.
+Two nodes must produce identical tx ordering for the same set of admitted txs.
+
+**Proposed rule** (to be adopted into SPECIFICATION.md §7):
+```
+1. Coinbase tx first (if present)
+2. Remaining txs: descending fee_rate (fee / n_inputs_outputs)
+3. Ties: ascending tx_body_hash (lexicographic)
+```
+
+This is deterministic, fee-incentive-compatible, and easy to verify.
+
+**Done when**: Rule in SPECIFICATION §7; validator checks ordering; test with equal-fee txs.
+
+### P.26 Slot Conflict Resolution (`consensus/conflict.rs`) ❌
+
+When two txs in the block candidate set claim the same output slot (SPECIFICATION.md §15.2):
+
+```rust
+/// Returns (winners, losers). Losers’ wallets must rebuild with new hints.
+pub fn resolve_slot_conflicts(txs: Vec<Transaction>) -> (Vec<Transaction>, Vec<TxBodyHash>)
+```
+
+Algorithm:
+```
+for each conflicting (slot, [tx_a, tx_b, ...]):
+    winner = argmin(tx.tx_body_hash)   // lexicographic minimum
+    losers = rest
+```
+
+This is O(txs × max_outputs). Called before block assembly, not during validation.
+
+**Done when**: Conflict resolution deterministic; losers returned to mempool for rebuild.
 
 ---
 
@@ -736,6 +1030,10 @@ Reference: Reth `crates/storage/db` (MDBX), Erigon database layout.
 
 ### MDBX Backend (`noid_chain/src/storage/mdbx.rs`)
 
+Phase 1 uses `ChainContext` (in-memory `HashMap<u64, BlockHeader>` + `SegmentedFriState`). On restart: state is lost, must replay from genesis.
+
+Phase 2 replaces the inner stores with MDBX:
+
 **Database tables**:
 
 ```
@@ -743,17 +1041,34 @@ headers           : height:u64 → BlockHeader bytes (276B, FOREVER)
 header_by_hash    : [u8;32]    → height:u64
 chain_tips        : "best"     → (height, hash)
 state_segments    : (seg_id, local_idx) → SlotValue (48B, FOREVER)
-nullifiers        : TxBodyHash → block_height:u64
+nullifiers        : TxBodyHash → block_height:u64 (last ANCHOR_DEPTH=144 blocks)
 alloc_counter     : "current"  → u64
 active_slot_count : "current"  → u64
 recursive_proof   : "tip"      → RecursiveBlockProof bytes (6.5 KB, FOREVER)
-undo_logs         : height:u64 → BlockUndoLog (last 6 blocks, then delete)
-recent_blocks     : height:u64 → (Block bytes, BlockProof bytes)  [for peers, optional 18 blocks]
+undo_logs         : height:u64 → BlockUndoLog (last FINALITY_DEPTH=18 blocks, ~11.5 MB max)
+recent_blocks     : height:u64 → (Block bytes, BlockProof bytes) [last 18 blocks for peers]
+tx_index          : TxBodyHash → (height, tx_index) [optional: receipt lookup]
 ```
 
-Note: DA (full BlockProof + PackedWitness) deleted immediately after `apply_block`. `recent_blocks` kept for at most 18 blocks to help peers sync.
+DA (full BlockProof + PackedWitness) deleted immediately after `apply_block`.
+`recent_blocks` kept ≤ FINALITY_DEPTH blocks for peer sync. After that: only header persists.
+
+**Atomic commit protocol** (7 steps, see P.18 design above for details).
 
 **Done when**: Crash-safe; state survives SIGKILL; DA pruned immediately; headers always available.
+
+### BlockChainContext → MdbxChainContext
+
+`BlockChainContext` (Phase 1) uses in-memory `ChainContext` for consensus state and `Option<RecursiveBlockProof>` for the recursive chain. Phase 2 replaces this with an `MdbxChainContext` that implements the same interface but persists to MDBX:
+
+```rust
+pub struct MdbxChainContext {
+    db: mdbx::Environment,
+    // Same methods as BlockChainContext but crash-consistent
+}
+```
+
+The Phase 1 logic (validation, template, reorg, mempool) is already pure and can be reused unchanged.
 
 ### Storage Trait
 

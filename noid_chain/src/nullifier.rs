@@ -76,6 +76,35 @@ impl NullifierSet {
     pub fn total_nullifiers(&self) -> usize {
         self.all.len()
     }
+
+    /// Remove the most recently inserted block's nullifiers (used during reorg).
+    ///
+    /// Returns the hashes that were removed, or `None` if the set is empty.
+    /// Call this once per reverted block, starting from the tip.
+    pub fn pop_latest_block(&mut self) -> Option<Vec<TxBodyHash>> {
+        let latest = self.blocks.pop_back()?;
+        for h in &latest {
+            // Only remove from `all` if no other remaining block still holds this hash.
+            // In practice tx_body_hashes are unique across blocks, so this is
+            // unconditional, but we handle the edge case correctly.
+            if !self.blocks.iter().any(|b| b.contains(h)) {
+                self.all.remove(h);
+            }
+        }
+        Some(latest.into_iter().collect())
+    }
+
+    /// Rebuild the nullifier set from scratch given the last N blocks' tx hashes.
+    ///
+    /// `blocks` is ordered oldest-first. Used after a deep reorg to reconstruct
+    /// the nullifier window over the new canonical chain.
+    pub fn rebuild_from_blocks(block_hashes: impl IntoIterator<Item = Vec<TxBodyHash>>) -> Self {
+        let mut ns = Self::new();
+        for block in block_hashes {
+            ns.insert_block(&block);
+        }
+        ns
+    }
 }
 
 impl Default for NullifierSet {
@@ -148,6 +177,56 @@ mod tests {
             ns.insert_block(&[hash(i as u8)]);
         }
         assert!(!ns.contains(&hash(1)));
+    }
+
+    #[test]
+    fn pop_latest_block_removes_hashes() {
+        let mut ns = NullifierSet::new();
+        ns.insert_block(&[hash(1), hash(2)]);
+        ns.insert_block(&[hash(3)]);
+        assert!(ns.contains(&hash(3)));
+
+        let removed = ns.pop_latest_block().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!ns.contains(&hash(3)));
+        // Earlier block still present.
+        assert!(ns.contains(&hash(1)));
+        assert_eq!(ns.window_len(), 1);
+    }
+
+    #[test]
+    fn pop_latest_block_empty_returns_none() {
+        let mut ns = NullifierSet::new();
+        assert!(ns.pop_latest_block().is_none());
+    }
+
+    #[test]
+    fn rebuild_from_blocks_matches_insert() {
+        let blocks = vec![
+            vec![hash(1), hash(2)],
+            vec![hash(3)],
+            vec![hash(4), hash(5)],
+        ];
+        let mut ns1 = NullifierSet::new();
+        for b in &blocks {
+            ns1.insert_block(b);
+        }
+        let ns2 = NullifierSet::rebuild_from_blocks(blocks);
+        assert_eq!(ns1.total_nullifiers(), ns2.total_nullifiers());
+        for i in 1u8..=5 {
+            assert_eq!(ns1.contains(&hash(i)), ns2.contains(&hash(i)));
+        }
+    }
+
+    #[test]
+    fn pop_restores_window_len() {
+        let mut ns = NullifierSet::new();
+        for i in 0..6u8 {
+            ns.insert_block(&[hash(i)]);
+        }
+        assert_eq!(ns.window_len(), 6);
+        ns.pop_latest_block();
+        assert_eq!(ns.window_len(), 5);
     }
 
     #[test]

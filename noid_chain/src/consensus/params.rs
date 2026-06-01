@@ -40,9 +40,22 @@ pub const MAX_OUTPUTS: usize = 8;
 // Epoch anchor  (SPECIFICATION.md §2 / §17)
 // ---------------------------------------------------------------------------
 
-/// Depth of the epoch anchor window. A tx is valid only when its
-/// `epoch_anchor` is the hash of a header at `[height-ANCHOR_DEPTH-1, height-1]`.
-pub const ANCHOR_DEPTH: u64 = 6;
+/// Epoch anchor validity window (see also noid_tx::ANCHOR_DEPTH — must stay in sync).
+/// 144 blocks × 60s = 144 min normal; 144 × 30min = 3 days during difficulty spike.
+///
+/// This constant controls BOTH:
+/// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
+/// 2. How long nullifiers are retained (prevents double-spend within window).
+///
+/// NullifierSet max RAM: 144 blocks × 1024 txs × 32 bytes = ~4.7 MB (negligible).
+pub const ANCHOR_DEPTH: u64 = 144;
+
+// Compile-time assertion: ANCHOR_DEPTH must match noid_tx::ANCHOR_DEPTH.
+// If they drift, replay protection breaks.
+const _: () = assert!(
+    ANCHOR_DEPTH == noid_tx::ANCHOR_DEPTH,
+    "noid_chain ANCHOR_DEPTH must equal noid_tx::ANCHOR_DEPTH"
+);
 
 // ---------------------------------------------------------------------------
 // Finality
@@ -97,10 +110,10 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // DA retention  (SPECIFICATION.md §20)
 // ---------------------------------------------------------------------------
 
-/// Compact undo logs are kept for this many blocks (= FINALITY_DEPTH / 3).
-/// After this many confirmations, both undo logs and block DA are deleted.
-/// Full block DA (BlockProof + PackedWitness) is deleted IMMEDIATELY after apply_block.
-pub const UNDO_LOG_RETENTION: u64 = EPOCH_LENGTH; // 6 blocks = 1 epoch
+/// Compact undo logs kept for FINALITY_DEPTH blocks so reorgs can always
+/// be reverted. Must equal FINALITY_DEPTH; smaller values would leave
+/// deep reorgs unrevertable.
+pub const UNDO_LOG_RETENTION: u64 = FINALITY_DEPTH; // 18 blocks
 
 /// `recent_blocks` (kept for P2P sync of lagging peers) pruned after this depth.
 pub const RECENT_BLOCK_RETENTION: u64 = FINALITY_DEPTH; // 18 blocks
@@ -131,6 +144,22 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 /// Domain tag for the per-tx pre-proving channel.
 /// Seed = H(tx_body_hash || PRETX_TAG). Independent of prev_state_root or cap.
 pub const PRETX_CHANNEL_TAG: &[u8] = b"paranoid-pretx-v1";
+
+// ---------------------------------------------------------------------------
+// Fee policy  (non-consensus — local node enforcement only)
+// ---------------------------------------------------------------------------
+
+/// Minimum relay fee in μNOID per transaction (covers amortized proving cost).
+/// Nodes MAY raise this; they MUST NOT relay below this default.
+pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 NOID
+
+/// Additional relay fee per valid output slot (covers permanent state cost).
+pub const FEE_PER_OUTPUT: u64 = 2_000; // 0.002 NOID per output
+
+/// Compute the minimum acceptable fee for a tx with `n_outputs` valid outputs.
+pub const fn min_fee(n_outputs: u64) -> u64 {
+    MIN_FEE_BASE + n_outputs * FEE_PER_OUTPUT
+}
 
 #[cfg(test)]
 mod tests {
@@ -165,6 +194,15 @@ mod tests {
         assert!(FLOOR_REWARD_MICRONOID > 0);
         assert!(BASE_REWARD_MICRONOID > FLOOR_REWARD_MICRONOID);
         assert_eq!(BASE_REWARD_MICRONOID, 50 * MICRONOID_PER_NOID);
+    }
+
+    #[test]
+    fn min_fee_formula() {
+        assert_eq!(min_fee(0), MIN_FEE_BASE);
+        assert_eq!(min_fee(1), MIN_FEE_BASE + FEE_PER_OUTPUT);
+        assert_eq!(min_fee(8), MIN_FEE_BASE + 8 * FEE_PER_OUTPUT);
+        // Ensure non-zero floor even with zero outputs (coinbase).
+        assert!(min_fee(0) > 0);
     }
 
     #[test]

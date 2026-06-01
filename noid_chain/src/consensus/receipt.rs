@@ -295,7 +295,7 @@ mod tests {
         for (i, &tx) in hashes.iter().enumerate() {
             let r = generate_receipt(&header, tx, i, &hashes, dummy_summary(tx, 1), None);
             // Direction stored in dirs, not in path bytes.
-            for sibling in &r.merkle_path {
+            for _sibling in &r.merkle_path {
                 // The sibling is an actual Blake3 hash or zero — never modified.
                 // Just verify inclusion works correctly for all positions.
             }
