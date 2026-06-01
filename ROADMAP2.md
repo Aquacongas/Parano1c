@@ -52,38 +52,29 @@ What does NOT exist: networking, mempool, RPC, wallet CLI, mining, consensus val
 - ✅ P.14 `receipt.rs` — ParanoidReceipt with Blake3 Merkle + direction bitmask
 - ✅ `allocator.rs` — splitmix64-based slot hint generator (free_slots removed)
 
-**Architecture note**: `validate_block_consensus()` handles all native rules. ZK verification
-(`verify_logic` per tx + `verify_block` for BlockProof) is layered on top in
-`noid_block::validate_block_full()` — to be implemented in Phase 2 (see P.9 note below).
-
+- ✅ P.12 `reorg.rs` — `find_common_ancestor`, `apply_reorg` (full within-finality-window reorg)
+- ✅ P.13 `genesis.rs` — `genesis_header`, `genesis_state_root` (hardcoded), `GENESIS_NONCE=2`; `prove_genesis_recursive()`
 - ✅ P.20 `chain_context.rs` — `ChainContext` struct, `init_from_genesis()`, `apply_next_block()`
 - ✅ P.21 `nullifier.rs` — `pop_latest_block()`, `rebuild_from_blocks()` for reorg support
-- ✅ P.22 `validation.rs` — §15.3.6 expansion trigger: `log_slots` must increment iff occupancy ≥ 75%
-- ✅ P.23 `checks.rs` + `params.rs` — fee overflow guard (`fee > u64::MAX` → `BadFee`); `MIN_FEE_BASE`, `FEE_PER_OUTPUT`, `min_fee()` constants
-- ✅ P.24 `block.rs` — `apply_genesis_block()` genesis bootstrap (bypasses witness/proof checks)
-- ✅ P.16 Fee market — designed (see P.16 section below)
-- ✅ P.17 Economic attack surface — analysed (see P.17 section below)
-- ✅ P.18 Failure & recovery semantics — designed (see P.18 section below)
-- ✅ P.19 Recursive failure domains — designed (see P.19 section below)
+- ✅ P.22 `validation.rs` — §15.3.6 expansion trigger + `apply_block` expansion bug fix
+- ✅ P.23 `checks.rs` + `params.rs` — fee overflow guard + `MIN_FEE_BASE`, `FEE_PER_OUTPUT`, `min_fee()`
+- ✅ P.24 `block.rs` — `apply_genesis_block()` + 9 expansion tests (boundary, capacity, new slots)
+- ✅ P.25 `ordering.rs` — `order_block_txs()`: coinbase first, descending fee, hash tie-break
+- ✅ P.26 `conflict.rs` — `resolve_slot_conflicts()`: argmin(tx_body_hash) per contested slot
+- ✅ P.27 `mempool.rs` — `Mempool` + `MempoolEntry`: admit, evict_expired, select_for_block, on_block_confirmed
+- ✅ P.28 `mempool_checks.rs` — `validate_tx_for_mempool()`: min fee → anchor → slot liveness → state emptiness
+- ✅ P.29 `template.rs` — `BlockTemplate`, `build_block_template()`: expansion → conflict → apply → coinbase → header_core
+- ✅ P.30 `noid_block::validate.rs` — `validate_block_full()` (consensus + ZK), `build_tx_airs()`
+- ✅ P.31 `noid_block::block_chain_context.rs` — `BlockChainContext`: ChainContext + RecursiveBlockProof
+- ✅ P.16 `mempool_checks.rs` — min fee enforcement: `fee ≥ MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT`
+- ✅ `noid_tx::ANCHOR_DEPTH = 144` — tx validity: 2.4h normal / 3 days @ 30min blocks
 
-- ✅ P.12 `reorg.rs` — `find_common_ancestor`, `apply_reorg` (full within-finality-window reorg)
-- ✅ P.13 `prove_genesis_recursive()` — genesis `RecursiveBlockProof` (null witness, zero rounds)
-- ✅ P.25 `ordering.rs` — `order_block_txs()`: coinbase first, descending fee, hash tie-break (miner policy)
-- ✅ P.26 `conflict.rs` — `resolve_slot_conflicts()`: winners by argmin(tx_body_hash) per contested slot
-- ✅ P.27 `mempool.rs` — `Mempool`, `MempoolEntry`, `MempoolError`: admit, evict_expired, select_for_block, on_block_confirmed
-- ✅ P.28 `mempool_checks.rs` — `validate_tx_for_mempool()`: anchor hash check, slot liveness, state emptiness
-- ✅ P.29 `template.rs` — `BlockTemplate`, `build_block_template()`: conflict resolution → state apply → coinbase → header_core for miner
-- ✅ P.30 `noid_block::validate.rs` — `validate_block_full()` (native + ZK), `build_tx_airs()`
-- ✅ P.31 `noid_block::block_chain_context.rs` — `BlockChainContext`: consensus + recursive proof in one struct
-- ✅ `noid_tx::ANCHOR_DEPTH = 144` — tx validity window 2.4h normal / 3 days @ 30min blocks
+**Phase 1 is COMPLETE.** All consensus logic, block validation, mempool, block template, reorg,
+recursive proof, and fee enforcement are implemented as pure in-memory Rust. No I/O, no networking.
 
-**Phase 1 is COMPLETE.** All consensus logic, validation, mempool, template, reorg, and recursive chain are implemented as pure in-memory Rust with no I/O.
+Total: **224 tests, 0 warnings.**
 
-**What Phase 2 adds** (storage + network layer on top of this logic):
-- MDBX: persist headers/state/undo-logs across restarts
-- P2P: block/tx propagation
-- Block Template API: external miner interface (248-byte header_core)
-- Mempool pre-proving loop (tokio async + rayon)
+---
 
 ---
 
@@ -886,147 +877,108 @@ During reorg: call `pop_latest_block()` N times to revert N blocks, then rebuild
 
 **Done when**: Reorg reverts nullifier window correctly. ✅
 
-### P.25 Canonical Transaction Ordering (consensus-significant) ❌
+### P.25 Canonical Transaction Ordering ✅
 
-Transaction order within a block determines `tx_root` which is in the header.
-Two nodes must produce identical tx ordering for the same set of admitted txs.
+Transaction order within a block determines `tx_root` (in the header). Miner policy,
+not consensus — the validator checks only that `tx_root` matches the actual transactions.
 
-**Proposed rule** (to be adopted into SPECIFICATION.md §7):
+**Rule** (miner implements, non-consensus):
 ```
-1. Coinbase tx first (if present)
-2. Remaining txs: descending fee_rate (fee / n_inputs_outputs)
+1. Coinbase tx first
+2. Remaining: descending fee (largest first)
 3. Ties: ascending tx_body_hash (lexicographic)
 ```
 
-This is deterministic, fee-incentive-compatible, and easy to verify.
+**Implementation**: `noid_chain/src/consensus/ordering.rs` — `order_block_txs(txs: Vec<Transaction>) -> Vec<Transaction>`.
+Called by `build_block_template` before state simulation. Tested including equal-fee tie-break.
 
-**Done when**: Rule in SPECIFICATION §7; validator checks ordering; test with equal-fee txs.
-
-### P.26 Slot Conflict Resolution (`consensus/conflict.rs`) ❌
+### P.26 Slot Conflict Resolution ✅
 
 When two txs in the block candidate set claim the same output slot (SPECIFICATION.md §15.2):
 
 ```rust
-/// Returns (winners, losers). Losers’ wallets must rebuild with new hints.
+/// Returns (winners, losers). Losers' wallets must rebuild with new hints.
 pub fn resolve_slot_conflicts(txs: Vec<Transaction>) -> (Vec<Transaction>, Vec<TxBodyHash>)
 ```
 
-Algorithm:
-```
-for each conflicting (slot, [tx_a, tx_b, ...]):
-    winner = argmin(tx.tx_body_hash)   // lexicographic minimum
-    losers = rest
-```
+Algorithm: for each conflicting slot, `winner = argmin(tx.tx_body_hash)`. O(txs × max_outputs).
 
-This is O(txs × max_outputs). Called before block assembly, not during validation.
-
-**Done when**: Conflict resolution deterministic; losers returned to mempool for rebuild.
+**Implementation**: `noid_chain/src/consensus/conflict.rs`. Called by `build_block_template`.
+Tested: no conflicts passes through, conflict drops loser entirely, single conflict picks min hash.
 
 ---
 
-## Phase 1.5 — Pre-Proving Optimization (CORE — implement with mempool)
+## Phase 1.5 — Pre-Proving Optimization
 
-**Goal**: Reduce `prove_block` latency by pre-computing per-tx proofs as they arrive.
+**Status**: Design complete. Implementation happens inside Phase 3 (requires async mempool).
+This is NOT a separate phase — it's an optimization layer activated when the mempool goes async.
 
-**This is not optional** — it's the architecture that makes 1024-tx blocks viable without increasing block time.
+**Why it matters**: Without pre-proving, 1024-tx block takes ~44s to prove.
+With pre-proving: ~12s (individual proofs cached, only GKR+FRI remain). PoW bottleneck becomes dominant.
 
-### Protocol Change: New Seed Scheme
+### Key design decisions (locked)
 
-**Old** (current): `H(prev_state_root || cap || tx_index)` — depends on block-specific cap, can't pre-compute  
-**New**: `H(tx_body_hash || "paranoid-pretx-v1")` — depends only on tx content, pre-computable
+**Seed**: `H(tx_body_hash || "paranoid-pretx-v1")` — NOT `H(prev_state_root || ...)`.  
+This makes per-tx proofs independent of which block the tx ends up in.  
+Security: replay prevented by nullifier set + `cap` provides block-level binding.
 
-**Security argument**:
-- AlgebraicStarkProof proves tx logic only (balance, auth_tag, format) — not state transitions
-- Proof is bound to tx content via trace columns → `cap` provides block-level binding at Stage 6
-- Replay across blocks: impossible — different tx set → different `cap` → different block-level challenges
-- Replay across forks: nullifier set handles this at consensus level
-- `prev_state_root` in seed was redundant — `cap` already provides block-specificity
+**Orphan resilience**: When a foreign block takes 200 of our 1000 pre-proved txs,
+the remaining 800 proofs remain valid — no re-proving needed.
 
-### Orphan Block Handling
+### Phase 3 implementation targets
 
-When another node finds a block first:
-
-```
-MEMPOOL STATE: 1000 txs, all pre-proved
-
-Receive foreign block (contains 200 of our txs):
-  1. apply_block(): update state, add to nullifiers
-  2. mempool.on_block(confirmed_hashes):
-     a. Remove 200 confirmed txs from pool → their proofs discarded
-     b. 800 remaining txs: pre-proved proofs STILL VALID (no state_root dependency)
-     c. SpineMleAccumulator.remove_txs(200_confirmed)
-        → O(200 * 59) = O(11800) ops
-
-Build next block:
-  800 txs with ready proofs + new arrivals
-  Proving time: ~11s instead of ~44s
-  
-  Even if 100% orphan (0 overlap):
-  Next block: 1000 surviving txs with valid proofs → ~11s
-```
-
-### Implementation
-
-**MempoolEntry** stores cached proof:
 ```rust
+// MempoolEntry extended with pre-proof cache
 pub struct MempoolEntry {
-    pub intent:         TxIntent,
-    pub cached_proof:   Arc<RwLock<Option<CachedAlgebraicProof>>>,
-    pub spine_state_in: Vec<[Block128; 4]>,  // 59 slots for SpineMLE
-    pub fee_rate:       u64,
+    pub tx:           Transaction,
+    pub admitted_height: u64,
+    pub fee_rate:     u64,
+    // Phase 1.5 addition:
+    pub cached_proof: Option<AlgebraicStarkProof>,  // None = not yet proved
+    pub spine_slots:  Vec<[Block128; 4]>,            // 59 slots for SpineMLE
 }
-```
 
-**On admission** (after verify_logic passes):
-```rust
-// Spawn background pre-proving
-let handle = tokio::task::spawn_blocking(move || {
-    let ch = pre_tx_channel(&tx_body_hash);
-    prove_air_algebraic_with_channel(air, &trace, &pi, ch)
-});
-entry.cached_proof.set_pending(handle);
-```
+// On admission: spawn background verify_logic + pre_prove
+// tokio::task::spawn_blocking(|| prove_air_algebraic_pretx(&tx))
 
-**SpineMleAccumulator**:
-```rust
+// SpineMleAccumulator: maintain MLE over admitted txs for fast block assembly
 pub struct SpineMleAccumulator {
-    slots: Vec<[Block128; 4]>,  // collected slot_state_in vectors
-    index: HashMap<TxBodyHash, usize>,  // tx → slot range
+    slots: Vec<[Block128; 4]>,
+    index: HashMap<TxBodyHash, usize>,
 }
-
-impl SpineMleAccumulator {
-    pub fn add_tx(&mut self, hash: TxBodyHash, state_ins: &[[Block128; 4]; N_SPINE_SLOTS])
-    pub fn remove_txs(&mut self, hashes: &[TxBodyHash])  // on block confirmed
-    pub fn build_mle(&self, selected: &[TxBodyHash]) -> BlockSpineMle
-}
-```
-
-**prove_block modification**:
-```rust
-// For each tx: use cached proof if available, otherwise prove on-the-fly
-let tx_proofs: Vec<AlgebraicStarkProof> = selected_txs.par_iter().map(|tx| {
-    if let Some(proof) = tx.cached_proof.get_ready() {
-        proof  // O(0) — already done
-    } else {
-        prove_air_algebraic_pretx(tx)  // O(100ms) — rare, tx just arrived
-    }
-}).collect();
+// add_tx / remove_txs(confirmed) / build_mle(selected)
 ```
 
 **Estimated impact** for 1024 txs:
 ```
-SEQUENTIAL (current):    ~44s
-With pre-proving:        ~12s (GKR 10s + per-tx 0s + MLE 1s + FRI 1s)
-With parallel PoW:   max(12s, 60s) = 60s  ← PoW bottleneck, not proving
+No pre-proving (Phase 2):    ~44s total prove time
+With pre-proving (Phase 3):  ~12s (GKR 10s + per-tx ~0s + FRI 1s)
+With parallel PoW:       max(12s, 60s) = 60s  ← PoW becomes the bottleneck, not proving
 ```
 
-**Done when**: 1024-tx block prove < 15s; orphan block handling correct; no proof reuse across blocks.
+**Done when**: 1024-tx block proves in < 15s; orphan handling correct; no proof reuse across blocks.
 
 ---
 
 ## Phase 2 — Persistent Storage
 
+**Goal**: The consensus logic from Phase 1 survives process restarts. Replace in-memory maps with
+MDBX. P.18 crash-consistency protocol implemented. Full node can restart without replaying from genesis.
+
 Reference: Reth `crates/storage/db` (MDBX), Erigon database layout.
+
+### Phase 2 checklist
+
+- [ ] MDBX backend implementing `StateBackend` + `BlockStore` traits
+- [ ] `MdbxChainContext` replacing `ChainContext` inner maps with MDBX tables
+- [ ] P.18: 7-step atomic commit protocol per block
+- [ ] P.18: crash recovery — on restart, `chain_tip.height == H` ⇒ state is consistent
+- [ ] Tx hash tracking in `BlockUndoLog` — enables mempool recovery after reorg
+- [ ] P.19: recursive proof persisted to MDBX (6.5 KB, FOREVER)
+- [ ] P.19: background catch-up prover on restart if recursive proof lags
+- [ ] DA pruning: `recent_blocks` kept ≤ 18 blocks, then deleted
+- [ ] `tx_index` table: TxBodyHash → (height, tx_index) for receipt lookup
+- [ ] Cross-platform serialization tests (P.15): same bytes on ARM/x86/WASM
 
 ### MDBX Backend (`noid_chain/src/storage/mdbx.rs`)
 
@@ -1087,22 +1039,41 @@ pub trait BlockStore: HeaderProvider + StateProvider + NullifierProvider {
 
 ## Phase 3 — Node Infrastructure
 
+**Goal**: A running full node: P2P network, async mempool with pre-proving, block template API,
+RPC for wallets. Uses Phase 1 logic + Phase 2 storage. Phase 1.5 pre-proving activated here.
+
 **TODO Phase 3**: Extract consensus provider traits into a `noid_consensus` crate.
 Currently `validate_block_consensus()` and all consensus functions live in `noid_chain`.
 When P2P, mempool, and RPC all need to import consensus rules from different crates,
 create `noid_consensus` with `HeaderProvider`, `NullifierProvider`, `StateProvider` traits
 and move `noid_chain::consensus::*` there. `noid_chain` becomes a dependency of `noid_consensus`.
 
+### Phase 3 checklist
+
+- [ ] P.16: dynamic fee floor — `mempool_fee_floor = max(MIN_FEE, median(last 50 admitted) × 0.9)`
+- [ ] P.17: mempool eviction under slot-spam attack — raise fee floor, evict low-fee txs
+- [ ] P.17: epoch anchor freshness check at mempool admission (verify anchor ∈ our chain)
+- [ ] P.19: RPC signal to light clients when recursive proof is in DEGRADED/FALLBACK mode
+- [ ] P.19: async background recursive prover (tokio task, catch-up after restart)
+- [ ] Mempool periodic eviction of expired txs (call `evict_expired` on each new block)
+- [ ] Block Template API: external miner interface (212-byte header_core delivery)
+- [ ] Phase 1.5: pre-proving loop (spawn `verify_logic` per tx on mempool admission)
+- [ ] Phase 1.5: `SpineMleAccumulator` for fast block assembly from pre-proved txs
+- [ ] `noid_consensus` crate extraction (see TODO above)
+
 ### Mempool (`noid_mempool/`)
 
 Reference: Reth `crates/transaction-pool`.
 
-**Admission pipeline** (cheapest checks first):
-1. `tx_limits`: MAX_INPUTS, MAX_OUTPUTS, fee ≥ min_relay_fee
-2. `epoch_anchor` in valid window
-3. Nullifier check (no double-spend)
-4. Slot conflict check (no conflict within mempool)
-5. `verify_logic(...)` — O(84ms), ZK verification last
+Phase 1 `Mempool` struct is the logic core. Phase 3 wraps it in async:
+
+**Admission pipeline** (cheapest checks first, already in `validate_tx_for_mempool`):
+1. `min_fee`: `fee ≥ MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT` ✅
+2. `epoch_anchor` in valid window ✅
+3. Nullifier check (no double-spend) ✅
+4. Slot conflict check (no conflict within mempool) ✅
+5. Input slots live in state, output slots empty ✅
+6. `verify_logic(...)` — O(84ms), async background pre-proving (Phase 1.5)
 
 **Template refresh**: Every 15s OR 100+ new txs OR new P2P block.
 

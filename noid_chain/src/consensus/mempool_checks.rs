@@ -13,6 +13,7 @@
 //!
 //! # Check order (cheapest first)
 //!
+//! 0. P.16 min relay fee: `fee ≥ MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT` (coinbase exempt)
 //! 1. Basic consensus checks: fee overflow, body_hash, anchor non-zero, nullifier
 //! 2. epoch_anchor hash is a known block header within the ANCHOR_DEPTH window
 //! 3. No slot conflict with currently admitted mempool transactions
@@ -23,7 +24,10 @@ use std::collections::HashSet;
 
 use crate::chain_context::ChainContext;
 use crate::consensus::{
-    checks::validate_tx_consensus, params::ANCHOR_DEPTH, pow::full_block_hash, ConsensusError,
+    checks::validate_tx_consensus,
+    params::{min_fee, ANCHOR_DEPTH},
+    pow::full_block_hash,
+    ConsensusError,
 };
 use crate::fri_state::SlotValue;
 use noid_core::Block128;
@@ -42,6 +46,17 @@ pub fn validate_tx_for_mempool(
     ctx: &ChainContext,
     mempool_txs: &[Transaction],
 ) -> Result<(), ConsensusError> {
+    // --- Step 0: minimum relay fee (P.16, non-consensus local policy) ---
+    // Coinbase is exempt: it's built by the miner, not submitted by a wallet.
+    if !tx.body.is_coinbase {
+        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
+        let required = min_fee(n_outputs);
+        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        if actual < required {
+            return Err(ConsensusError::BelowMinFee { required, actual });
+        }
+    }
+
     // --- Step 1: basic consensus checks ---
     validate_tx_consensus(tx, ctx.tip_height + 1, &ctx.nullifiers)?;
 
@@ -161,6 +176,76 @@ mod tests {
             body,
             tx_body_hash: hash,
         }
+    }
+
+    fn make_mint_tx(slot: u32, fee: u128) -> Transaction {
+        let body = TxBody {
+            epoch_anchor: [1u8; 32], // non-zero anchor for non-coinbase
+            fee,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                slot_index: slot,
+                value: 1000,
+                owner: Address([1u8; 32]),
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        let hash = noid_tx::hash_tx_body(
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction {
+            body,
+            tx_body_hash: hash,
+        }
+    }
+
+    #[test]
+    fn min_fee_enforced_for_non_coinbase() {
+        use crate::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
+        let ctx = ChainContext::init_from_genesis();
+        // 1 output: required = MIN_FEE_BASE + 1 * FEE_PER_OUTPUT
+        let required = MIN_FEE_BASE + FEE_PER_OUTPUT;
+
+        // Below minimum.
+        let tx_low = make_mint_tx(5, (required - 1) as u128);
+        assert_eq!(
+            validate_tx_for_mempool(&tx_low, &ctx, &[]),
+            Err(ConsensusError::BelowMinFee {
+                required,
+                actual: required - 1
+            }),
+            "fee below minimum must be rejected"
+        );
+
+        // Exactly at minimum — note: also needs valid anchor in ctx.headers,
+        // but since ctx is fresh (genesis only), epoch_anchor=[1;32] won't
+        // match any known header. This tests fee check fires BEFORE anchor check.
+        let tx_exact = make_mint_tx(5, required as u128);
+        // Not BelowMinFee — it gets further to the anchor check.
+        let result = validate_tx_for_mempool(&tx_exact, &ctx, &[]);
+        assert!(
+            !matches!(result, Err(ConsensusError::BelowMinFee { .. })),
+            "fee at minimum must not fail BelowMinFee"
+        );
+    }
+
+    #[test]
+    fn coinbase_exempt_from_min_fee() {
+        let ctx = ChainContext::init_from_genesis();
+        // Coinbase with fee=0 must not fail BelowMinFee.
+        let cb = make_coinbase(100);
+        assert_eq!(cb.body.fee, 0);
+        let result = validate_tx_for_mempool(&cb, &ctx, &[]);
+        // Passes fee check; may fail other checks (anchor, state) — but NOT BelowMinFee.
+        assert!(
+            !matches!(result, Err(ConsensusError::BelowMinFee { .. })),
+            "coinbase must be exempt from min fee check"
+        );
     }
 
     #[test]

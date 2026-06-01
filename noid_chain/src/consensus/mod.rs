@@ -96,6 +96,9 @@ pub enum ConsensusError {
     InflatedCoinbase,
     /// Fee exceeds u64::MAX (values are 64-bit in this protocol).
     BadFee,
+    /// P.16 — transaction fee is below the node's minimum relay fee.
+    /// Non-consensus (local policy); enforced at mempool admission only.
+    BelowMinFee { required: u64, actual: u64 },
     /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,
     /// and must not expand when occupancy < 75 %.
     BadLogSlotsExpansion,
@@ -114,6 +117,9 @@ impl std::fmt::Display for ConsensusError {
             Self::BadFee => write!(f, "BadFee"),
             Self::BadLogSlotsExpansion => write!(f, "BadLogSlotsExpansion"),
             Self::ShapeMismatch(msg) => write!(f, "ShapeMismatch: {msg}"),
+            Self::BelowMinFee { required, actual } => {
+                write!(f, "BelowMinFee: required={required} actual={actual}")
+            }
             other => write!(f, "{other:?}"),
         }
     }
