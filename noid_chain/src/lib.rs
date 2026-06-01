@@ -16,6 +16,7 @@
 
 pub mod block;
 pub mod block_header;
+pub mod consensus;
 pub mod da;
 pub mod fri_state;
 pub mod nullifier;

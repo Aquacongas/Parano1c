@@ -571,26 +571,37 @@ inputs:
 
 ```
   inputs:   ∅
-  outputs:  slot 900 → ( reward_amount, Miner )
+  outputs:  slot S → ( reward_amount, Miner )   -- S is any empty slot
   fee:      0
 ```
 
-The `reward_amount` is fixed by the protocol emission schedule. The
-coinbase transaction:
+The output slot `S` is chosen by the miner from any currently empty
+slot (identical mechanism to regular wallet outputs). There is no
+reserved or fixed coinbase slot; using a fixed slot would create a
+Merkle tree hotspot and is explicitly forbidden.
 
-- MUST be the first transaction of the block;
+The `reward_amount` is fixed by the protocol emission schedule:
+`block_reward(header.log_slots) + total_fees(non_coinbase_txs)`.
+See `noid_chain::consensus::emission`.
+
+The coinbase transaction:
+
+- MUST be the first transaction of the block (index 0);
+- MUST have zero valid inputs (`is_coinbase = true`);
+- MUST have exactly one valid output slot;
 - MUST satisfy `is_mint ⇒ pre = 0` for its output slot(s), proven by
   BlockStateBinding (miner opens the coinbase slot and verifies EMPTY);
 - does NOT require a LogicProof from a wallet (miner constructs it
   directly within BlockStateBinding);
 - does NOT balance `Σ inputs == Σ outputs + fee`; instead it carries
-  an explicit `is_coinbase` flag with `value = block_reward + sum(fees)`,
-  enforced by consensus.
+  an explicit `is_coinbase` flag,
+  and `coinbase_value ≤ block_reward(log_slots) + Σ fees` is enforced
+  by consensus (`validate_block_consensus()`).
 
-Example:
+Example (illustrative only — slot number is arbitrary):
 
 ```
-  slot 900 = (3.125, Miner)
+  slot 7419283 = (50.000000 NOID, Miner)
 ```
 
 ---
@@ -731,73 +742,79 @@ only if that is empty probes the never-written region.
 
 #### 15.1.2 State variables
 
-Every node MUST maintain on `ChainState` three consensus-significant
+Every node MUST maintain on `ChainState` two consensus-significant
 quantities:
 
 ```
-  free_slots         -- min-heap of reusable (previously spent)
-                        indices
   active_slot_count  -- number of live UTXOs (non-empty slots)
-  alloc_counter      -- monotonic seed source for the PRNG
+  alloc_counter      -- monotonic seed source for splitmix64
 ```
 
 Invariants:
 
 ```
   0 ≤ active_slot_count ≤ 2^log_slots
-  |free_slots| == (# empty slots that were once written)
   alloc_counter is strictly increasing on every successful mint,
       and is never modified by spends.
 ```
 
-Nodes MAY also keep a local occupancy bitmap (≈ 2 MB at
-`log_slots = 24`) to serve wallet hints; the bitmap itself is NOT
+`free_slots` (a heap of previously-spent indices) is **not** a
+consensus-significant variable and MUST NOT be maintained. Freed slots
+are naturally rediscovered by the uniform random probe: with
+`active_slot_count ≪ 2^log_slots`, the expected number of probes before
+hitting an empty slot (freed or never written) is below 2. Tracking a
+separate free-list would create write hotspots in the Merkle tree
+(multiple wallets competing for the same low indices) and is explicitly
+forbidden.
+
+Nodes MAY keep a local occupancy bitmap (≈ 2 MB at `log_slots = 24`)
+to serve wallet hints efficiently; the bitmap itself is NOT
 consensus-significant.
 
-#### 15.1.3 Allocation policy (consensus-significant)
+#### 15.1.3 Allocation policy (hint generation, non-consensus)
 
-Upon a mint, the native allocator MUST execute:
+The allocation policy below describes how a node generates **hints**
+for wallets. It is non-authoritative: the wallet embeds the chosen
+slot in its `TxBody` and the chain verifies only `is_mint ⇒ pre = 0`.
 
-```
-  1. if free_slots is non-empty:
-         return free_slots.pop_min()          -- primary: reuse
-
-  2. if active_slot_count ≥ 2^log_slots:
-         return StateFull                      -- triggers §15.3
-
-  3. loop:
-         alloc_counter += 1
-         r   = splitmix64(alloc_counter)
-         idx = r mod 2^log_slots
-         if state[idx] == EMPTY: return idx    -- probe
-```
-
-The free-list is the primary tool; the random probe is the fallback
-once the free-list is exhausted. `splitmix64` is a fixed-constant
-deterministic mixer; the same seed yields the same output on every
-node. Expected probe count is below 2 while
-`active_slot_count < 0.5 · 2^log_slots`.
-
-On spend:
+Hint generation algorithm:
 
 ```
-  free_slots.push(input.slot_index)
-  active_slot_count -= 1
+  if active_slot_count ≥ 2^log_slots:
+      return StateFull                      -- triggers §15.3
+
+  loop:
+      alloc_counter += 1
+      r   = splitmix64(alloc_counter)
+      idx = r mod 2^log_slots
+      if state[idx] == EMPTY: return idx    -- probe
 ```
 
-`alloc_counter` MUST NOT be updated on spends: the deterministic seed
-depends only on the history of successful mints so that two nodes
-replaying the same transaction sequence obtain identical
-`new_state_root`.
+`splitmix64` is the standard bijective 64-bit mixer:
+
+```
+  splitmix64(state):
+      state += 0x9e3779b97f4a7c15
+      z = state
+      z = (z ^ z>>30) * 0xbf58476d1ce4e5b9
+      z = (z ^ z>>27) * 0x94d049bb133111eb
+      return z ^ z>>31
+```
+
+This is chosen over LCG because all output bits (including low-order
+bits used for `mod 2^k` masking) are uniformly distributed.
+
+On spend, `active_slot_count` is decremented; `alloc_counter` is NOT
+updated on spends. The probe naturally rediscovers freed slots via
+uniform random sampling — no explicit tracking required.
 
 #### 15.1.4 Wallet hints (non-authoritative)
 
 A wallet MAY request hints from a node:
 
 ```
-  lowest empty slot                -- if free-list is non-empty
-  next K empty slots
-  random empty slot                -- via the same splitmix64
+  next K empty slots               -- via splitmix64 probe on live state
+  random empty slot                -- same algorithm
 ```
 
 The hint matches the native allocator. The authoritative check is

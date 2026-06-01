@@ -62,6 +62,12 @@ pub enum BlockApplyError {
     HeaderAllocCounterMismatch,
     /// `header.log_slots` disagrees with the chain's current slot depth.
     HeaderLogSlotsMismatch,
+    /// Block contains more than one coinbase transaction.
+    MultipleCoinbase,
+    /// Coinbase transaction is not the first transaction in the block.
+    CoinbaseNotFirst,
+    /// Coinbase transaction has non-empty inputs (coinbase must have zero inputs).
+    CoinbaseHasInputs,
 }
 
 impl From<ApplyError> for BlockApplyError {
@@ -72,23 +78,6 @@ impl From<ApplyError> for BlockApplyError {
 
 /// Apply a block in place. On error, `state` is left untouched (work
 /// happens on a snapshot and is swapped only on success).
-///
-/// # Phase 2 TODO (Security #7): coinbase_credit == block_reward(height) + Σ fees
-///
-/// The per-tx STARK circuit enforces `Σ outputs == coinbase_credit`
-/// when `is_coinbase = true`, but the AMOUNT of `coinbase_credit` is
-/// not constrained here. A miner can currently set an arbitrary
-/// `coinbase_credit` and mint unlimited coins.
-///
-/// Fix in Phase 2 (Stage P): before accepting the coinbase tx, verify:
-///
-///   1. Exactly one coinbase tx exists per block (index 0).
-///   2. `coinbase_pi.coinbase_credit == block_reward(height) + Σ fee_k`
-///      where `fee_k` is taken from `PublicInputs.fee` of each non-coinbase tx.
-///   3. The `block_reward(height)` schedule must be specified in SPECIFICATION.md.
-///
-/// Implementation location: this function, after `tx_body_hash` check,
-/// gated on `tx.body.is_coinbase`. Requires `height: u64` parameter.
 pub fn apply_block(
     state: &mut ChainState,
     block: &Block,
@@ -101,6 +90,38 @@ pub fn apply_block(
     }
     if block.header.witness_root == [0u8; 32] {
         return Err(BlockApplyError::MissingWitnessRoot);
+    }
+
+    // Coinbase structure: at most one, must be first, zero inputs.
+    // Coinbase VALUE validation (≤ block_reward + fees) is in validate_block_consensus().
+    let coinbase_count = block
+        .transactions
+        .iter()
+        .filter(|tx| tx.body.is_coinbase)
+        .count();
+    if coinbase_count > 1 {
+        return Err(BlockApplyError::MultipleCoinbase);
+    }
+    if let Some(first_non_coinbase_pos) = block
+        .transactions
+        .iter()
+        .position(|tx| !tx.body.is_coinbase)
+    {
+        if block.transactions[first_non_coinbase_pos..]
+            .iter()
+            .any(|tx| tx.body.is_coinbase)
+        {
+            return Err(BlockApplyError::CoinbaseNotFirst);
+        }
+    }
+    // Coinbase tx (if present) must have zero inputs.
+    if let Some(cb) = block.transactions.first() {
+        if cb.body.is_coinbase {
+            let has_valid_inputs = cb.body.inputs.iter().any(|i| i.valid);
+            if has_valid_inputs {
+                return Err(BlockApplyError::CoinbaseHasInputs);
+            }
+        }
     }
 
     let mut snap = state.clone();
@@ -369,7 +390,6 @@ mod tests {
             Err(BlockApplyError::HeaderTxRootMismatch)
         );
         assert_eq!(state.active_slot_count, 0);
-        assert!(state.free_slots.is_empty());
     }
 
     #[test]
@@ -495,5 +515,94 @@ mod tests {
         let mut bytes = block.to_bytes();
         bytes.push(0);
         assert_eq!(Block::from_bytes(&bytes), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn apply_block_rejects_multiple_coinbase() {
+        let mut state = fresh_state();
+
+        // Build two distinct coinbase transactions (each mints to a different slot).
+        let make_cb = |slot: u8| {
+            let body = TxBody {
+                epoch_anchor: [0u8; 32],
+                fee: 0,
+                inputs: vec![],
+                outputs: vec![mk_output(slot)],
+                is_coinbase: true,
+            };
+            let tbh = hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            );
+            Transaction {
+                body,
+                tx_body_hash: tbh,
+            }
+        };
+
+        let txs = vec![make_cb(1), make_cb(2)];
+        let block = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::MultipleCoinbase)
+        );
+    }
+
+    #[test]
+    fn apply_block_rejects_coinbase_with_inputs() {
+        let mut state = fresh_state();
+
+        // First, mint a UTXO into slot 1 via a normal block.
+        let minted = mk_output(1);
+        let mint_tx = build_tx(&mut state, vec![], vec![minted]);
+        let mint_txs = vec![mint_tx.clone()];
+        let mint_header = mk_header(&state, &mint_txs);
+        apply_block(
+            &mut state,
+            &Block {
+                header: mint_header,
+                transactions: mint_txs,
+            },
+        )
+        .expect("mint block");
+
+        // Now create a coinbase tx that has a valid input (spending slot 1).
+        let input = mk_input_for(minted.slot_index, &minted);
+        let cb_body = TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![input],
+            outputs: vec![mk_output(3)],
+            is_coinbase: true,
+        };
+        let tbh = hash_tx_body(
+            &cb_body.epoch_anchor,
+            cb_body.fee,
+            &cb_body.inputs,
+            &cb_body.outputs,
+            cb_body.is_coinbase,
+        );
+        let cb_tx = Transaction {
+            body: cb_body,
+            tx_body_hash: tbh,
+        };
+
+        let txs = vec![cb_tx];
+        // mk_header applies the tx on a clone to compute the correct roots;
+        // apply_block will reject CoinbaseHasInputs before running state logic.
+        let block = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::CoinbaseHasInputs)
+        );
     }
 }

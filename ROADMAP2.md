@@ -1,12 +1,13 @@
-# PARANOID — ROADMAP
+# PARANOID — ROADMAP TO MAINNET
 
-From current implementation state to public testnet.
+**Architecture**: Proof-native UTXO chain on binary towers GF(2^128).  
+**Principle**: Every transaction is a mathematical theorem. No trust, no history, no archive nodes.
 
 ---
 
 ## Current State (Baseline)
 
-The cryptographic engine is complete and tested:
+The cryptographic engine is complete and battle-tested:
 
 ```
 noid_core         GF(2^128) tower, CLMUL/AVX2, MLE, sumcheck, NTT, transcript.
@@ -14,2039 +15,1255 @@ noid_poseidon2b   Poseidon2b native + AIR (perm, sponge, domain tags, compress).
 noid_fri          Generic FRI (foundational dep: Channel, Blake3, NTT, code).
 noid_fri_binius   Production PCS: interleaved commit, compact FRI, mixed opening.
 noid_binius       Bit/byte packing for DA bandwidth reduction.
-noid_gkr          Kill-Shot GKR: Spine (59-slot), Auth (20-slot), Merkle (32-slot).
-noid_air          AIRs + gates + compositions. Production: TxLogicAir (Stage S).
-noid_stark        STARK engine: prove_logic / verify_logic (Split GKR, Stage S).
+noid_gkr          Kill-Shot GKR: Spine (N×59), Auth (20-slot), Merkle (32-slot).
+noid_air          AIRs + gates + compositions. Production: TxLogicAir (81 cols, 2048 rows).
+noid_stark        STARK engine: prove_logic/verify_logic (Split GKR).
 noid_tx           TxBody, TxIntent, PublicInputs, C_claimed, wire serialization.
-noid_chain        State (FriState), block header, blocks, DA packing, nullifier set.
+noid_chain        BlockHeader, Block, SegmentedFriState, BlockStateBinding, NullifierSet.
 noid_block        Block aggregation via deferred-opening (prove_block / verify_block).
+noid_recursive    O(1) recursive chain: 6.5 KB proof, 5 ms verify.
 bench_prover      Performance harness.
 ```
 
-**Phase 1 (Stage S) — DONE:**
-- Stateless architecture: TxLogicAir (no state columns), prove_logic / verify_logic.
-- Epoch anchor replaces prev_state_root in tx_body_hash.
-- C_claimed bridge (claims commitment) linking LogicProof to BlockStateBinding.
-- BlockStateBinding native verification (noid_chain).
-- NullifierSet rolling window.
-- TxIntent wire format (spend_secret stripped from network payload).
+**Phase S (Stateless) — ✅ DONE**  
+**Phase Q (Parallel STARK) — ✅ DONE**  
+**Phase F (Segmented State) — ✅ DONE**  
+**Phase H (Recursive Chain) — ✅ DONE**
 
-**Phase 1.5 (Stage Q) — DONE:**
-- Per-tx algebraic STARK fully parallelised (`rayon::par_iter`, Q.2b/Q.2c/Q.5).
-- Per-tx independent Fiat-Shamir channels (`per_tx_algebraic_channel`, Q.1).
-- Fixed columns zero-copy shared via `FixedColumns` (Q.2a).
-- Merkle transcript reduction in Stage 6 (`merkle_reduce`, Q.4a).
-- Parallel verifier: auth Kill-Shot + algebraic STARK all `into_par_iter()` (Q.5).
-- Dedicated state-binding channel per segment (`state_binding_channel`, Q.4).
+What exists: ZK engine, state machine, block aggregation, wire formats, wallet logic, O(1) sync.  
+What does NOT exist: networking, mempool, RPC, wallet CLI, mining, consensus validation, node binary.
 
-Performance (per-tx, Stage Q, implementation complete — benchmark pending re-measure):
-- LogicProof (wallet): ~102 ms
-- Block prove (100 tx, 8 cores): target <8 s (was ~43 s sequential)
-- verify_block (100 tx, 8 cores): target <4 s (was ~15 s sequential)
+**NEXT TO IMPLEMENT**: Phase 1 (Consensus Core) — in progress.
 
-What exists: proof math, state machine, block aggregation, wire formats,
-  stateless wallet proof (LogicProof), block-level state binding.
-What does NOT exist: networking, mempool, RPC, wallet CLI, mining,
-  difficulty adjustment, consensus validation, node binary.
+### Phase 1 Progress
+- ✅ P.1 `params.rs` — all consensus constants
+- ✅ P.2 `emission.rs` — block reward (halves per log_slots expansion, floor 1 NOID)
+- ✅ P.3 `difficulty.rs` — BCH ASERT port with fixed-point [u64;4] arithmetic
+- ✅ P.4 `pow.rs` — Blake3 PoW over header_core (parallel-proving design)
+- ✅ P.5 `timestamps.rs` — MTP + future-drift rules
+- ✅ P.6 `header.rs` — header chain validation (prev_hash, height, difficulty, timestamp, PoW, proof, log_slots)
+- ✅ P.7 `block.rs` — coinbase structure (1 coinbase, first, zero inputs) + amount check in validation.rs
+- ✅ P.8 `checks.rs` — per-tx: body_hash binding, epoch_anchor non-zero, nullifier; cross-tx slot conflicts
+- ✅ P.9 `validation.rs` — `validate_block_consensus()`: header + coinbase amount + per-tx + apply_block orchestrator
+- ✅ P.10 `da_prune.rs` — `BlockUndoLog`, `build_undo_log`, `revert_block`, `prune_undo_logs`
+- ✅ P.11 `fork_choice.rs` — `choose_chain` (height → difficulty → hash tie-break), `reorg_allowed`
+- ❌ P.12 `reorg.rs` — full reorg orchestration (needs P2P, Phase 3)
+- ✅ P.13 `genesis.rs` — `genesis_header`, `genesis_state_root` (hardcoded), `GENESIS_NONCE = 2`
+- ✅ P.14 `receipt.rs` — ParanoidReceipt with Blake3 Merkle + direction bitmask
+- ✅ `allocator.rs` — splitmix64-based slot hint generator (free_slots removed)
 
----
+**Architecture note**: `validate_block_consensus()` handles all native rules. ZK verification
+(`verify_logic` per tx + `verify_block` for BlockProof) is layered on top in
+`noid_block::validate_block_full()` — to be implemented in Phase 2 (see P.9 note below).
 
-## Phase 1 — Stateless Architecture (Stage S) — **DONE**
-
-**Goal:** Separate wallet-side logic proof from full-node-side state binding.
-Light Node (wallet) proves only math (balance, auth, body).
-Full Node proves state (Merkle openings, BlockStateBinding) and assembles BlockProof.
-External Miner receives 248-byte block template header and brute-forces nonce.
-
-### S.1 Epoch Anchor — ✅ DONE
-
-Replace `prev_state_root` with `epoch_anchor` in tx body hash.
-
-- `noid_tx::TxBody.epoch_anchor: Digest` ✅
-- `hash_tx_body()` takes `epoch_anchor` as first arg ✅
-- `ANCHOR_DEPTH = 6` defined in `noid_tx::types` ✅
-- `SpineInputs` in `noid_gkr` updated ✅
-- Wire format bumped (version history removed — no network yet) ✅
-
-### S.2 Claims Commitment (C_claimed) — ✅ DONE
-
-Wallet commits to claimed slot values without proving state.
-
-- `compute_claims_commitment(inputs, outputs) -> Digest` in `noid_tx::claims` ✅
-- Poseidon2b sponge under `TAG_CLAIMS` over `(slot_index, value, owner_hi, owner_lo)` ✅
-- `claims_commitment: Digest` in `PublicInputs` ✅
-- LogicProof absorbs C_claimed into Fiat-Shamir channel ✅
-- Tamper any slot value → proof fails ✅ (tested)
-
-### S.3 TxLogicAir — ✅ DONE
-
-Pure-logic AIR (no FriStateOpen, no state columns).
-
-- `noid_air::composition::tx_logic::TxLogicAir` ✅
-- Contains: balance_gate, range_gate, tx_body_spine pin, selector gates ✅
-- Does NOT contain: FriStateOpenAir, FriStateCombinerComposite ✅
-- Note: `log_rows` reduced from 13 → **11** (SPINE_LOG_ROWS). The 59-perm
-  Merkle trace is retired (GKR owns it); spine composite now 81×2048 rows.
-  `BASE_LOG` in `noid_block` and `noid_stark::prove_logic` updated to match.
-
-### S.4 LogicProof Pipeline — ✅ DONE
-
-`prove_logic` / `verify_logic` in `noid_stark`.
-
-- **Split GKR:** wallet proves AuthGKR only (needs spend_secret).
-  SpineGKR is deferred to block-prover who has public SpineInputs. ✅
-- `prove_logic(LogicWitness) -> LogicProof` ✅
-- `verify_logic(air, pi, spine_inputs, auth_public, proof) -> Result<()>` ✅
-- Auth/Spine bridge enforced: `auth_public.tx_body_hash == pi.tx_body_hash`,
-  `expected_address[i] == spine_inputs.input_leaves[i][2..3]` ✅
-- End-to-end roundtrip tested ✅
-
-### S.5 BlockStateBinding — ✅ DONE
-
-Block-level state binding (native, non-circuit).
-
-- `noid_chain::state_binding::BlockStateBinding` ✅
-- Opens all input/output slots, verifies pre-conditions ✅
-- C_claimed bridge: recomputes from opened slots, checks equality ✅
-- `BlockStateBindingAir` in `noid_air::airs::block_state_binding` ✅
-- Integrated into `prove_block` via `StateBindingBlockWitness` ✅
-
-### S.6 Integrated BlockProof — ✅ DONE
-
-LogicProofs + BlockStateBinding aggregated in `prove_block`.
-
-- `prove_block(prev_state_root, witnesses, state_binding)` ✅
-- Full Node: verifies auth Kill-Shots → unified block spine Kill-Shot →
-  algebraic STARK per tx → multipoint sumcheck → single FRI opening ✅
-- State continuity: prev_block_state_root tracked in `BlockPublicMeta` ✅
-- `noid_block::full_node::prove_block_full` for full-node use ✅
-
-### S.7 Nullifier Set — ✅ DONE
-
-- `noid_chain::nullifier::NullifierSet` ✅
-- Rolling window of ANCHOR_DEPTH=6 blocks of tx_body_hashes ✅
-- O(1) lookup, O(1) amortised insertion ✅
-- Pruning on oldest block exit ✅
-
-### S.8 TxIntent Wire Format — ✅ DONE
-
-- `noid_tx::intent::TxIntent` ✅
-- `encode()` uses `encode_public()` — spend_secret stripped from wire ✅
-- `decode()` uses `decode_public()` — spend_secret → zero on received side ✅
-- `spend_secret_absent_from_wire` test verifies bytes do not contain secret ✅
-- Version byte removed (no network yet, no backward compat needed) ✅
+**Remaining for Phase 1 full completion**:
+- ❌ P.12 `reorg.rs` — orchestration of reorg (find common ancestor, revert + reapply)
+- ❌ P.9 ZK layer — `noid_block::validate_block_full()` wrapping `validate_block_consensus` + `verify_block`
+- ❌ P.16–P.19 — fee market design, economic analysis, failure semantics (design items)
 
 ---
 
-```markdown
-## Phase 1.5 — Parallel Per-Tx Algebraic STARK (Stage Q) — ✅ **DONE**
+## Fundamental Architecture Decisions
 
-**Goal:** Reduce `prove_block` from ~43s to <8s at 100 tx (8 cores) by parallelizing
-the per-tx algebraic STARK phase.
+### Block Production: Parallel PoW + Prove
 
-**Status:** All sub-tasks Q.1–Q.5 implemented. Benchmarks pending re-run on target hardware.
+**Problem solved**: `proof_transcript_hash` is in the block header → previously PoW needed proof first → sequential.
 
-**Baseline (Stage S, before Q):**
-- 100-tx block prove: ~43 s (sequential Stage 5)
-- 100-tx block verify: ~15 s (sequential Stage 2b)
-- Per-tx amortised prove: ~434 ms
+**Solution**: PoW runs over `header_core` WITHOUT `proof_transcript_hash`. Both proceed in parallel.
 
-### Problem Statement
-
-Stage 5 of `prove_block` (`noid_block/src/lib.rs`) runs per-tx algebraic STARKs
-sequentially on a shared Fiat-Shamir channel. Each tx takes ~615ms. For N=100:
-`100 * 615ms = 61.5s` — exceeds the 60s block time.
-
-The sequential channel works by chaining: challenge for tx[k+1] depends on proof[k].
-This prevents parallel execution.
-
-Furthermore, the underlying data structures (`Vec<Vec<Block128>>` for traces) cause 
-severe allocation churn, cache misses, and memory duplication at scale, which will 
-block scaling to 1024 tx even if parallelism is achieved.
-
-### Solution: Independent Per-Tx Channels + Memory Topology
-
-Replace the sequential block channel in Stage 5 with independent per-tx channels, each
-deterministically seeded from `(prev_state_root, commitment_cap, tx_index)`.
-
-Simultaneously, refactor the witness layout to eliminate per-tx duplication of fixed 
-columns and prevent memory bandwidth collapse during parallel execution.
-
-**Security argument:** After Stage 3 (interleaved commit), the Merkle cap cryptographically
-binds ALL witness columns. The prover cannot change the witness after commit.
-Zero-check challenges derived from `seed_k = H(state_root || cap || k)` are:
-- Unpredictable before commit (cap depends on columns)
-- Deterministic after commit (same seed → same challenges)
-- Bound to the specific transaction (tx_index prevents cross-tx confusion)
-
-This is non-adaptive soundness for committed witnesses — equivalent in strength to
-adaptive (sequential) soundness because the witness is immutable post-commit.
-
-Stage 6 (block-level multipoint sumcheck) remains sequential and provides the global
-binding across all per-tx results. FRI opening (Stage 7) is unchanged.
-
-### What Does NOT Change
-
-- Privacy: `spend_secret` stays on wallet. `auth_gkr_channel()` is already independent.
-- Auth GKR: Self-seeded, not affected.
-- Unified Block SpineGKR: Seeded from `(cap)`, not affected.
-- Block-level multipoint sumcheck (Stage 6): Remains sequential, binds all openings.
-- FRI mixed opening (Stage 7): Unchanged.
-- Verifier logic: Same as prover — uses `seed(state_root, cap, k)` per tx.
-- Proof format: `BlockProof` struct unchanged (same fields, same sizes).
-- Soundness level: 128-bit (Schwartz-Zippel over GF(2^128), challenges from cap).
-
-### Performance Projection
-
-| Metric (100 tx) | Before | After Q.2-Q.4 (8c) | After Q.5 (8c) | After Q.5 (16c) |
-|-----------------|--------|---------------------|----------------|-----------------|
-| prove_block     | 61.5s  | ~8s                 | ~8s            | ~4s             |
-| verify_block    | 16.3s  | 16.3s               | ~3.6s          | ~2.7s           |
-| proof size      | 2.02 MB| 2.02 MB             | 2.02 MB        | 2.02 MB         |
-
-### Implementation Plan
-
-#### Q.1 Per-Tx Channel Factory ✅ DONE
-
-Create a deterministic channel constructor for per-tx algebraic STARKs.
-
-- Add `fn per_tx_algebraic_channel(prev_state_root, cap, tx_index) -> Channel` to `noid_block`
-- Full domain-separated seed sequence:
-  1. `observe(DOMAIN_TAG_TX_ALGEBRAIC)` — fixed 128-bit constant, unique to this sub-protocol
-  2. `observe(PROTOCOL_VERSION)` — `Block128::from(1u128)`, bumped on protocol changes
-  3. `observe(state_root_hi)`, `observe(state_root_lo)` — block context binding
-  4. `absorb_cap(cap)` — commitment binding (all columns)
-  5. `observe(Block128::from(tx_index as u128))` — per-tx uniqueness
-- Constants in `noid_block/src/lib.rs`:
-  - `DOMAIN_TAG_TX_ALGEBRAIC: u128 = 0x5458_414C_4745_4252_4149_4332_3032_3600`
-  - `PROTOCOL_VERSION_Q: u128 = 1`
-- Stage 5b (BlockStateBindingAir) uses `tx_index = n_tx` as its domain separator
-- **Done when:** factory produces deterministic channel; same inputs → same output; different tx_index → different challenges
-
-#### Q.2a Trace Layout Separation ✅ DONE
-
-Refactor the monolithic trace representation before parallelizing execution.
-
-- **Problem:** Current implementation stores execution traces as `Vec<Vec<Block128>>`, mixing fixed columns (selectors, masks) and witness/runtime columns. This causes redundant duplication of fixed columns per tx, poor cache locality, and memory bandwidth collapse during parallel proving.
-- **Required Refactor:** Replace monolithic trace with split storage:
-  ```rust
-  pub struct Trace {
-      pub fixed_cols: Arc<Vec<Vec<Block128>>>, // Immutable, shared across all txs
-      pub witness_cols: Vec<Vec<Block128>>,     // Tx-local, mutable
-  }
-  ```
-  Alternative equivalent representation (e.g., `TraceView` with slices) is acceptable provided fixed columns are immutable/shared and witness columns are tx-local.
-- **API Changes:** `noid_stark` AIR evaluator must accept split trace; `noid_air` composition evaluators must distinguish fixed/witness domains; `noid_block` Stage 5 must pass witness-only slices into per-tx workers.
-- **Execution Rule:** Per-tx proving workers MUST only clone/access `witness_cols`. Fixed columns MUST be shared through `Arc`. No per-thread duplication allowed.
-- **Done when:** Fixed columns are physically separated; Stage 5 parallel proving allocates O(witness) memory per tx; Algebraic evaluator works without rebuilding merged traces.
-
-#### Q.2b Witness Generation Parallelization ✅ DONE
-
-Parallelize the witness construction phase itself, not just the algebraic prover.
-
-- **Problem:** Current roadmap only parallelizes algebraic proving. Witness assembly (`build_witness`) is still sequential, leaving a large CPU bottleneck before proving begins.
-- **Required Change:** Replace sequential witness construction with `rayon` parallelism:
-  ```rust
-  let witness_bundle: Vec<_> = txs.par_iter()
-      .map(build_tx_witness)
-      .collect();
-  ```
-  This includes selector evaluation, boundary row construction, AIR witness expansion, and composition preprocessing.
-- **Constraints:** Witness workers MUST NOT mutate shared transcript state. All per-tx preprocessing must be deterministic and isolated. Shared read-only state is allowed via `Arc<T>`.
-- **Done when:** Witness construction scales linearly with core count; Stage 5 no longer has a sequential preprocessing bottleneck; 100 tx witness generation fits within sub-second budget on 8 cores.
-
-#### Q.2c Parallelize prove_block Stage 5 ✅ DONE
-
-Replace the sequential algebraic proving loop with `rayon::par_iter`, operating on the separated traces from Q.2a/Q.2b.
-
-```rust
-// BEFORE (sequential, shared channel, monolithic trace):
-for (k, w) in witnesses.iter().enumerate() {
-    let (alg, r_pp, claim, lambdas) = prove_air_interleaved_algebraic(
-        ..., &mut block_channel,
-    );
+```
+header_core = {
+  prev_block_hash, state_root, tx_root, timestamp, height,
+  miner_address, nonce, difficulty_target,
+  log_slots, active_slot_count, alloc_counter
 }
 
-// AFTER (parallel, per-tx channels, separated traces):
-let tx_results: Vec<_> = (0..n_tx).into_par_iter().map(|k| {
-    let mut ch = per_tx_algebraic_channel(&prev_state_root, cap, k);
-    // Access only witness_cols locally; fixed_cols via Arc
-    let (alg, r_pp, claim, lambdas) = prove_air_interleaved_algebraic(
-        ..., &mut ch,
-    );
-    (alg, r_pp, claim, lambdas)
-}).collect();
+PoW   = Blake3(header_core || nonce) < difficulty_target   ← runs independently
+Proof = prove_block(txs) → BlockProof                      ← runs in parallel
+
+Block = header_core + proof_transcript_hash + txs + BlockProof
+
+Chain hash: next block's prev_block_hash = Blake3(FULL header including proof_transcript_hash)
+→ proof IS committed to chain, just not inside the PoW computation
 ```
 
-- Move `build_auth_slice_claims` inside the parallel closure (it's per-tx, no shared state)
-- Collect results into `tx_algebraic`, `tx_r_pp`, `tx_claims`, `tx_lambdas` vectors
-- **Done when:** `prove_block` produces valid proof with parallel Stage 5
+**Security**: `state_root` in `header_core` depends on all txs + `miner_address` (via coinbase output). Stealing another miner's proof is impossible — it commits to a different `state_root` (different miner gets coinbase → different post-state).
 
-#### Q.3 Update verify_block Stage 2b ✅ DONE
+**Result**:
+- PoW always targets 60s regardless of proving time (ASERT works independently) ✓
+- Weak prover: proves in 100s, publishes late — ASERT sees longer intervals, auto-adjusts ✓
+- Strong prover: proves in 5s, waits for PoW — publishes at ~60s ✓
+- Block always has valid proof before publication ✓
 
-Mirror the prover change in the verifier.
+**Template refresh triggers**:
+1. Every 15 seconds
+2. 100+ new txs in mempool
+3. New block received from P2P (prev_hash changes)
+
+### Emission: Anti-Spam Inverse Proportionality
+
+**No halving.** Pure inverse relationship with slot occupancy:
 
 ```rust
-// BEFORE (sequential, shared channel):
-for k in 0..n_tx {
-    let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
-        ..., &mut block_channel,
-    )?;
-}
+const BASE_REWARD: u64  = 50 * 1_000_000;  // 50 NOID in μNOID
+const USAGE_SCALE: u64  = 1_000_000;        // every 1M occupied slots halves the reward
+const FLOOR_REWARD: u64 = 1 * 1_000_000;   // 1 NOID minimum forever
 
-// AFTER (per-tx channels, still sequential for now):
-for k in 0..n_tx {
-    let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k);
-    let (r_pp_k, final_claim_k) = verify_air_interleaved_algebraic(
-        ..., &mut ch,
-    )?;
+fn block_reward(active_slot_count: u64) -> u64 {
+    let divisor = 1 + active_slot_count / USAGE_SCALE;
+    (BASE_REWARD / divisor).max(FLOOR_REWARD)
 }
 ```
 
-Note: Verifier loop can remain sequential (correctness first, parallel verify is Q.5).
-The critical change is using `per_tx_algebraic_channel` instead of shared `block_channel`.
+| Occupied slots | Reward |
+|----------------|--------|
+| 0 | 50 NOID |
+| 1M | 25 NOID |
+| 4M | 10 NOID |
+| 16M (2^24, genesis) | ~3 NOID |
+| Always | ≥ 1 NOID |
 
-- **Done when:** `verify_block` accepts proofs generated by parallel prover
+**Anti-spam property**: Filling slots to inflate reward reduces the reward for everyone including the spammer. Network health is incentivized.
 
-#### Q.4 Reconnect Block Channel for Stage 6 ✅ DONE
+### DA Policy: Delete Immediately
 
-After per-tx algebraic STARKs complete (parallel), Stage 6 (multipoint sumcheck) still
-needs a deterministic shared channel for the block-level reduction.
+**DA deleted right after `apply_block`.** No retention window.
 
-- Block channel for Stage 6 is seeded from: `(prev_state_root, cap, BLOCK_MULTIPOINT_TAG)`
-- Fix: create fresh block channel AFTER Stage 5, seed with `(state_root, cap, MULTIPOINT_TAG)`.
-- Stage 5b (BlockStateBindingAir) also gets its own channel: `per_tx_algebraic_channel(..., n_tx)`
+```
+AFTER apply_block(block):
+  ✅ Keep: BlockHeader (FOREVER — needed for receipt verification)
+  ✅ Keep: Current SegmentedFriState (FOREVER)
+  ✅ Keep: RecursiveBlockProof tip (FOREVER)
+  ✅ Keep: BlockUndoLog (last 6 blocks = 1 epoch, then delete)
+  ❌ Delete: BlockProof bytes
+  ❌ Delete: PackedWitness / DA trace
+  ❌ Delete: Raw tx list
+```
 
-#### Q.4a Segmented Transcript Absorption ✅ DONE
-
-Refactor Stage 6 transcript absorption to prevent serialization walls and support streaming.
-
-- **Problem:** Absorbing all `block_col_openings` linearly (`for x in openings { channel.observe(x) }`) creates huge sequential transcript bandwidth, poor cache locality, and future recursion bottlenecks.
-- **Required Change:** Replace linear opening absorption with Merkle reduction.
-  Instead of absorbing every field element, compute per-entity (per-tx or per-segment) digests in parallel:
-  ```rust
-  // Parallel digest computation
-  let digests: Vec<Digest> = (0..n_tx).into_par_iter().map(|k| {
-      H(tx_index || k || openings_k || lambdas_k || reductions_k || metadata_k)
-  }).collect();
-  // Sequential absorption of reduced data
-  let root = merkle_reduce(&digests);
-  channel.absorb(root);
-  ```
-- **Security Requirement:** The per-entity digest MUST commit to `tx_index` (or `segment_id`), opening positions, lambda reductions, and local evaluation claims to prevent reordering attacks, cross-segment replay, and transcript ambiguity.
-- **Benefits:** Unlocks streaming verification, segmented recursion, lower transcript memory pressure, and GPU batching compatibility.
-- **Done when:** Stage 6 no longer linearly absorbs every field element; entity digests are used as transcript units; Multipoint reduction remains sound; Verifier reconstructs identical segmented transcript.
-
-#### Q.5 Parallel Verifier ✅ DONE
-
-Parallelize verify_block Stage 2b.
-
-The per-tx verification loop does 4 things per tx, ALL of which become independent
-after Q.3:
-
-1. `verify_auth_killshot` — already self-seeded via `auth_gkr_channel()` (no shared state)
-2. Auth/Spine bridge checks — pure field comparisons (no channel)
-3. Slice reconstruction — pure MLE math (no channel)
-4. `verify_air_interleaved_algebraic` — after Q.3, uses `per_tx_algebraic_channel(cap, k)`
-
-Implementation:
-
+**Reorg handling without DA**: Keep compact undo logs (not full DA):
 ```rust
-// BEFORE (sequential):
-for k in 0..n_tx {
-    let auth_reductions = verify_auth_killshot(..., &mut auth_gkr_channel())?;
-    // ... bridge checks, slice reconstruction ...
-    let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(
-        ..., &mut block_channel)?;
-    tx_r_pp.push(r_pp_k);
-    tx_final_claims.push(claim_k);
+pub struct BlockUndoLog {
+    pub block_height: u64,
+    pub slot_changes: Vec<(u32, SlotValue)>,  // (slot_index, value_before)
 }
-
-// AFTER (parallel):
-let tx_results: Vec<Result<(Vec<Block128>, Block128), VerifyBlockError>> =
-    (0..n_tx).into_par_iter().map(|k| {
-        // Auth Kill-Shot (self-seeded, independent)
-        let auth_reductions = {
-            let mut ch = auth_gkr_channel();
-            verify_auth_killshot(&proof.tx_auth_proofs[k], &auth_circuit,
-                &auth_public_list[k], &mut ch)
-                .ok_or(VerifyBlockError::AuthKillShot(k))?
-        };
-        // Bridge checks...
-        // Slice reconstruction...
-        // Algebraic STARK (per-tx channel, independent)
-        let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k);
-        let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(
-            airs[k], pi, alg, &extras, &slice_claims, &mut ch)
-            .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
-        Ok((r_pp_k, claim_k))
-    }).collect();
-// Unpack results, propagate first error.
+// Max size: 48B/slot × 12 slots/tx × 1024 txs = ~590 KB per block
+// Keep last 6 blocks in memory. After 6 confirmations = finality → discard.
 ```
 
-What remains sequential after Q.5:
-- Block SpineGKR Kill-Shot verification (one call, ~3ms)
-- Stage 6: Block multipoint sumcheck verification (cheap, O(log_len * n_participants))
-- Stage 7: FRI mixed opening verification (one call, ~15ms for 64 queries)
+Reorg within 6 blocks: apply UndoLog entries in reverse (no network access needed).  
+Reorg deeper than 6: rejected by finality rule.
 
-These three are fast and inherently sequential (global binding).
+### Receipt Design (ParanoidReceipt)
 
-Timing breakdown (100 tx, current):
-- Per-tx auth Kill-Shot verify: ~45ms each → 4.5s total sequential
-- Per-tx algebraic STARK verify: ~100ms each → 10s total sequential
-- Stages 6+7: ~1.8s (already fast)
-- Total: ~16.3s
+A receipt is a **claim** about a transaction. **Verification uses the live network**.
 
-After parallelization (8 cores):
-- Per-tx (auth + algebraic): max(100 tx / 8) * 145ms = ~1.8s
-- Stages 6+7: ~1.8s (unchanged)
-- Total: ~3.6s
-
-After parallelization (16 cores):
-- Per-tx: max(100 tx / 16) * 145ms = ~0.9s
-- Stages 6+7: ~1.8s
-- Total: ~2.7s
-
-- **Done when:** `verify_block` runs in <4s for 100 tx on 8 cores
-
-#### Q.6 Update Benchmarks
-
-- Update `bench_prover/benches/block_scaling.rs` to reflect new timing
-- Update `bench_prover/benches/stark_report.rs` pipeline description
-- Verify: 100-tx block prove < 10s on 8 cores
-- **Done when:** benchmarks confirm target performance
-
-### Q.7 AIR Versioning & Proof Compatibility
-
-Goal: Define protocol evolution rules for AIR systems.
-
-Topics to Design
-- AIR version identifiers
-- Proof format compatibility
-- Recursive verifier upgrade policy
-- Constraint deprecation semantics
-- Hardfork boundaries
-- Mixed-version block handling
-
-Dependency
-
-Required before:
-- Phase 7 recursion
-
-### Q.8 Deterministic Parallel Execution
-
-Goal: Guarantee identical proofs across parallel execution environments.
-
-Topics to Design
-- Stable reduction ordering
-- Deterministic rayon scheduling assumptions
-- Parallel hash consistency
-- Floating nondeterminism avoidance
-- Thread-local transcript isolation
-- Parallel memory visibility rules
-
-Blocks:
-- Distributed proving
-- External prover implementations
-
-### Files Modified
-
-| File | Change |
-|------|--------|
-| `noid_air` (composition/airs) | Trace layout split (fixed vs witness), API changes |
-| `noid_stark` (interleaved/logic) | Accept split trace, distinguish fixed/witness domains |
-| `noid_block/src/lib.rs` | `per_tx_algebraic_channel()`, parallel Stage 5 (Q.2c), fresh Stage 6 channel, Merkle transcript reduction (Q.4a) |
-| `noid_block/src/lib.rs` | verify_block: per-tx channels in Stage 2b |
-| `noid_block/src/full_node.rs` | Update `prove_block_full`/`verify_block_full` if affected |
-| `noid_block/tests/stage_g_roundtrip.rs` | Update test to use new protocol |
-| `bench_prover/benches/block_scaling.rs` | Update notes, verify performance |
-| `bench_prover/benches/stark_report.rs` | Update architecture description |
-
-### Soundness Proof Sketch
-
-1. **Commitment binding:** `cap = MerkleRoot(NTT(all_columns))`. After commit, prover
-   cannot alter any column without changing cap. cap is collision-resistant (Blake3, 128-bit).
-
-2. **Challenge derivation:** `z_k = H(state_root || cap || k || "TX_ALG")`. Since cap
-   encodes all columns, and H is a random oracle (Poseidon2b sponge), z_k is uniformly
-   random from prover's perspective at commit time.
-
-3. **Zero-check soundness:** If AIR polynomial P != 0 on the evaluation domain, then
-   `sum_x eq(z_k, x) * P(x) = 0` with probability at most `degree / |F|` = negligible.
-   The proof is a standard sum-check argument; only requires z_k to be random with
-   respect to the committed polynomial — which it is (derived from cap).
-
-4. **Cross-tx binding:** Stage 6 multipoint sumcheck verifies that ALL per-tx opening
-   claims `M_k[i](r_pp_k)` are consistent with the committed columns. A cheating prover
-   must fool Stage 6 which uses a fresh challenge `mu` derived from ALL openings.
-
-5. **Reordering attack:** tx_index `k` is absorbed into the seed. Reordering transactions
-   changes seeds, changes challenges, invalidates proofs. Verifier reconstructs same seeds
-   from proof metadata → reordering detected.
-
-6. **No new assumptions:** Same field (GF(2^128)), same hash (Poseidon2b), same PCS
-   (FRI-Binius). Only change: sequential Fiat-Shamir → parallel Fiat-Shamir with
-   commitment-derived seeds. This is a standard technique used in Plonky2, Boojum,
-   and other production systems.
-
-### Risk Analysis
-
-Three potential risks were identified and analyzed against the codebase:
-
-#### Risk 1: Cross-Tx Algebraic Coupling (Correlation Attacks)
-
-**Concern:** If per-tx polynomials share structure (e.g., `P_total = sum P_k` or shared
-composition batching), simultaneous challenge knowledge might enable coordinated cheating.
-
-**Verdict: SAFE.** Verified in code (`noid_stark/src/interleaved.rs:125-296`): each per-tx
-algebraic STARK operates exclusively on `preps[k].columns`. There is:
-- No shared polynomial across tx within Stage 5
-- No cross-tx composition batching
-- No shared `alpha` or `beta` between different tx proofs
-- `betas` and `z` are sampled per-tx from own channel
-
-The only cross-tx coupling is in Stage 6 (block multipoint sumcheck), which uses a FRESH
-channel seeded AFTER all per-tx results are committed. This is the global binding layer.
-
-#### Risk 2: Self-Referential Cap (FS Soundness)
-
-**Concern:** `r_k = H(cap, k)` where prover controls `cap` indirectly via witness choice.
-Could prover iteratively choose witness to get favorable challenges?
-
-**Verdict: SAFE.** Verified in code (`noid_block/src/lib.rs:315`): `interleaved_commit()`
-finalizes the Merkle cap ONCE from the NTT of ALL columns. After commit:
-- Columns are immutable (stored in `prover_state`)
-- Cap is a Blake3 Merkle root — collision-resistant
-- No partial cap computation; no witness modification after cap
-
-This is standard commit-then-challenge Fiat-Shamir. Prover would need to break Blake3
-collision resistance to find witness that produces a favorable cap — computationally
-infeasible at 128-bit security.
-
-#### Risk 3: Domain Separation / Entropy Collapse
-
-**Concern:** Bare `H(cap, k)` is insufficient. Future protocol upgrades, cross-stage
-channel reuse, or transcript collisions could cause soundness issues.
-
-**Mitigation:** Q.1 specifies full domain separation in channel seed:
-
-```
-per_tx_algebraic_channel(prev_state_root, cap, tx_index):
-    ch = Channel::new()
-    ch.observe(DOMAIN_TAG_TX_ALGEBRAIC)    // fixed 128-bit constant
-    ch.observe(PROTOCOL_VERSION)           // versioned protocol binding
-    ch.observe(state_root_hi)              // block context
-    ch.observe(state_root_lo)
-    absorb_cap(ch, cap)                    // commitment binding
-    ch.observe(Block128::from(tx_index))   // per-tx uniqueness
-    return ch
-```
-
-Where:
-- `DOMAIN_TAG_TX_ALGEBRAIC = 0x5458_414C_4745_4252_4149_4332_3032_3600` ("TXALGEBR AIC2026")
-- `PROTOCOL_VERSION = Block128::from(1u128)` (bumped on protocol changes)
-
-This ensures:
-- No collision with SpineGKR channel (uses Poseidon2bChannel, different type)
-- No collision with Stage 6 channel (uses BLOCK_MULTIPOINT_TAG)
-- No collision with existing `prove_logic` STARK (different domain tag)
-- Protocol version prevents cross-version transcript reuse
-- Future stages cannot accidentally reuse the same channel state
-
-### Formal Proof Obligation
-
-The protocol change requires proving:
-
-1. **Commitment binding:** `cap = Blake3_Merkle(NTT(columns))` is binding —
-   prover cannot open committed columns to different values.
-
-2. **No post-challenge witness adaptation:** All columns are fixed at commit time
-   (Stage 3, line 315). Per-tx challenges derived from cap + tx_index cannot influence
-   witness because witness is already committed.
-
-3. **Stage 6 global binding:** Block-level multipoint sumcheck (Stage 6) verifies that
-   `M_k[i](r_pp_k) == block_col_openings[k*n + i]` for ALL tx. Challenge `mu` is derived
-   from ALL openings simultaneously. A prover faking any single tx would need to
-   fool Stage 6 which has full visibility over all claims.
-
-4. **No cross-instance adaptive dependency:** Per-tx STARK[k] produces `(r_pp_k, claim_k)`
-   using only: (a) committed columns of tx k, (b) challenges from channel_k. Since
-   channel_k = H(state_root, cap, k), and cap commits ALL columns, knowledge of channel_j
-   (for j != k) provides no advantage — the prover already knew both channels at commit time.
-
-5. **Reordering resistance:** tx_index is absorbed into the seed. Permuting transactions
-   changes all per-tx channels, invalidates all proofs. Verifier deterministically
-   reconstructs seeds from proof order.
-
-### Dependency
-
-- Requires: Phase 1 complete (Stage S — Split GKR, privacy fix, all current code)
-- Blocks: Nothing (this is a prover optimization, proof format unchanged)
-- Enables: 100-tx blocks within 60s budget, path to 1024-tx blocks with SIMD (Stage K)
-
-### Implementation Stages
-
-#### Stage 1: Per-Tx Channel Factory (Q.1) — 1 day
-
-**Files:** `noid_block/src/channel.rs` (new)
-
-**Goal:** Create deterministic per-tx Fiat-Shamir channels with full domain separation.
-
-**Implementation:**
 ```rust
-// Domain separation constants
-pub const DOMAIN_TAG_TX_ALGEBRAIC: u128 = 0x5458_414C_4745_4252_4149_4332_3032_3600;
-pub const DOMAIN_TAG_STATE_BINDING: u128 = 0x5354_4154_4542_494E_4449_4E47_3230_3236;
-pub const DOMAIN_TAG_BLOCK_MULTIPOINT: u128 = 0x424C_4F43_4B4D_554C_5449_504F_494E_5400;
-pub const PROTOCOL_VERSION_Q: u128 = 1;
-
-// Per-tx channel factory
-pub fn per_tx_algebraic_channel(
-    prev_state_root: &[u8; 32],
-    cap: &MerkleCap,
-    tx_index: u32,
-) -> Channel;
-
-// State binding channel (uses tx_index = n_tx)
-pub fn state_binding_channel(
-    prev_state_root: &[u8; 32],
-    cap: &MerkleCap,
-    n_tx: u32,
-) -> Channel;
-
-// Block multipoint channel (Stage 6)
-pub fn block_multipoint_channel(
-    prev_state_root: &[u8; 32],
-    cap: &MerkleCap,
-) -> Channel;
-```
-
-**Tests:**
-- `deterministic_channel`: same inputs → same challenges
-- `different_tx_index`: different tx_index → different challenges
-- `domain_separation`: algebraic vs multipoint vs state_binding → different channels
-- `protocol_version`: different version → different challenges
-
-**Done when:** Factory produces deterministic channels; same inputs → same output; different tx_index → different challenges; domain separation verified.
-
----
-
-#### Stage 2: Trace Layout Separation (Q.2a) + Critical Memory Fixes — 5 days
-
-**Files:** `noid_air/src/lib.rs`, `noid_air/src/composition/tx_logic.rs`, `noid_stark/src/lib.rs`, `noid_stark/src/interleaved.rs`, `noid_core/src/mle/evaluate.rs`, `noid_fri_binius/src/mixed_open.rs`
-
-**Goal:** Split trace into fixed/witness columns, eliminate critical memory copies.
-
-**2.1 Column Classification Trait**
-
-Add to `noid_air/src/lib.rs`:
-```rust
-pub trait Air {
-    // ... existing methods ...
-    
-    /// Indices of columns that are fixed (identical across all valid traces).
-    /// Fixed columns are shared across all transactions via Arc.
-    fn fixed_columns(&self) -> Vec<usize> { vec![] }
+pub struct ParanoidReceipt {
+    pub version:       u8,
+    pub tx_body_hash:  [u8; 32],
+    pub merkle_path:   Vec<[u8; 32]>,   // Merkle path from tx_body_hash to tx_root
+    pub claimed_root:  [u8; 32],        // the tx_root this tx is claimed to be in
+    pub claimed_height: u64,
+    pub summary:       TxSummary,       // from/to/amount/timestamp (human-readable)
+    // Optional: for air-gapped verification
+    pub chain_cert:    Option<RecursiveBlockProof>,
 }
 ```
 
-For TxLogicAir (81 columns):
-- Fixed (selectors, masks): columns 0..8
-- Per-tx public: columns 78..80 (tx_body_hash), column 80 (TxvLiveMask)
-- Witness: columns 8..78 (balance, range, carry chains)
+**Why this is unforgeable**:
+- Change `claimed_root` → Merkle path no longer matches → Step 1 fails
+- Change `merkle_path` → Merkle check fails → Step 1 fails
+- Change `tx_body_hash` → Merkle check fails AND network won't find it → Both steps fail
+- Change `claimed_height` → Network returns wrong `tx_root` → Step 2 mismatch
 
-**2.2 FixedColumns Structure**
+**Verification process**:
+```
+STEP 1 (offline, math):
+  MerkleVerify(tx_body_hash, merkle_path, claimed_root) == true
+  → Proves: tx_body_hash included in this Merkle root
 
-```rust
-#[derive(Clone)]
-pub struct FixedColumns {
-    pub tower: Vec<Vec<Block128>>,   // tower basis (constraint eval)
-    pub flat: Vec<Vec<u128>>,        // flat basis (zero-check)
-    pub col_indices: Vec<usize>,     // original Trace column indices
-    pub log_len: usize,
-}
+STEP 2 (online, canonical chain):
+  Ask any node: getHeaderByHeight(claimed_height)
+  received_header = canonical header at this height
+  
+  IF received_header.tx_root == claimed_root:
+    → CONFIRMED: tx is in canonical chain
+  IF received_header.tx_root != claimed_root:
+    → REORGED: this block was reorganized (tx invalid)
+  
+  PoW check: Blake3(received_header) < received_header.difficulty_target
+  → Proves: real computational work done (header is genuine)
+
+STEP 2 (offline with cert):
+  verify_tip(chain_cert, expected_hash = hash(header))
+  → RecursiveProof proves this block is in canonical chain
 ```
 
-**2.3 Zero-Copy Padding**
+**Why we keep headers forever**: exactly for Step 2. Even in 10 years, any node can check `getHeaderByHeight(12345)` and verify the tx_root.
 
-Replace `pad_column` with `pad_column_cow`:
-```rust
-pub fn pad_column_cow(column: &[Block128], target_log: usize) -> Cow<[Block128]> {
-    let target = 1usize << target_log;
-    if column.len() == target {
-        return Cow::Borrowed(column);  // NO ALLOC
-    }
-    // ... allocate and pad ...
-}
-```
-
-**2.4 Split Trace View**
-
-```rust
-pub struct SplitTraceView<'a> {
-    pub fixed: &'a FixedColumns,
-    pub witness: &'a [Vec<Block128>],
-    pub witness_flat: &'a [Vec<u128>],
-    pub log_rows: usize,
-}
-```
-
-**2.5 Fix M1: sumcheck_cols Cloning (752 MB savings)**
-
-In `noid_stark/src/interleaved.rs:150-153`:
-```rust
-// BEFORE: clones all columns
-let mut sumcheck_cols: Vec<Vec<Block128>> = Vec::with_capacity(...);
-sumcheck_cols.extend_from_slice(&padded_columns[..n_air_cols]);
-
-// AFTER: uses references
-let mut sumcheck_refs: Vec<&[Block128]> = Vec::with_capacity(...);
-for col in &padded_columns[..n_air_cols] {
-    sumcheck_refs.push(col.as_slice());
-}
-```
-
-Update `prove_zero_check` signature to accept `&[&[Block128]]`.
-
-**2.6 Fix M2: evaluate_slice Thread-Local Scratch (800 MB savings)**
-
-Add to `noid_core/src/mle/evaluate.rs`:
-```rust
-pub fn evaluate_slice_with_scratch<F: TowerField>(
-    evals: &[F],
-    point: &[F],
-    scratch: &mut Vec<F>,
-) -> F;
-```
-
-In `noid_fri_binius/src/mixed_open.rs`:
-```rust
-thread_local! {
-    static EVAL_SCRATCH: RefCell<Vec<Block128>> = RefCell::new(Vec::new());
-}
-
-let primary_openings: Vec<Block128> = prover_state.raw_cols
-    .par_iter()
-    .map(|col| {
-        EVAL_SCRATCH.with(|s| {
-            evaluate_slice_with_scratch(col, &r_pp, &mut s.borrow_mut())
-        })
-    })
-    .collect();
-```
-
-**Done when:**
-- FixedColumns built once per AIR, shared via Arc
-- Fixed columns pre-converted to flat basis
-- prove_zero_check_split accepts split trace
-- sumcheck_cols uses references (M1 fixed)
-- evaluate_slice uses thread-local scratch (M2 fixed)
-- pad_column_cow zero-copy for same-size columns (M4 fixed)
-
----
-
-#### Stage 3: Witness Generation Parallelization (Q.2b) — 3 days
-
-**Files:** `noid_block/src/lib.rs`, `noid_block/src/full_node.rs`, `noid_air/src/airs/tx_body_spine.rs`, `noid_gkr/src/block_spine.rs`
-
-**Goal:** Parallelize all sequential witness construction bottlenecks.
-
-**3.1 Parallel Stage 2 Prep Loop**
-
-In `noid_block/src/lib.rs`:
-```rust
-// BEFORE: sequential
-for w in witnesses.iter() {
-    let spine_states = reconstruct_slot_states(...);
-    // ... pad columns ...
-}
-
-// AFTER: parallel
-let prep_results: Vec<_> = witnesses.par_iter().map(|w| {
-    let spine_states = reconstruct_slot_states(...);
-    // ... pad columns ...
-    (spine_states, columns, auth_slices)
-}).collect();
-```
-
-Note: `reconstruct_slot_states` internally sequential (hash chain), but **between tx** — independent.
-
-**3.2 Parallel BlockSpineMle::build (S3)**
-
-In `noid_gkr/src/block_spine.rs`:
-```rust
-// BEFORE: sequential loop over 5900 slots
-for (slot, state_in) in slot_state_ins.iter().enumerate() {
-    let witness = evaluate_permutation(*state_in);
-    mle.populate_slot(slot, &witness);
-}
-
-// AFTER: parallel (embarrassingly parallel, disjoint memory)
-slot_state_ins.par_iter().enumerate().for_each(|(slot, state_in)| {
-    let witness = evaluate_permutation(*state_in);
-    mle.populate_slot(slot, &witness);
-});
-```
-
-**Speedup:** 5900 perms / 8 cores = ~738 per core. Near-linear scaling.
-
-**3.3 Parallel build_balance_trace_parts (S5)**
-
-In `noid_air/src/airs/balance_gate.rs`:
-```rust
-let block_traces: Vec<_> = per_block.par_iter()
-    .map(|block| BitAdderAir::build_trace(block))
-    .collect();
-```
-
-**3.4 Parallel verify_logic in full_node (S6)**
-
-In `noid_block/src/full_node.rs`:
-```rust
-let verify_results: Vec<_> = (0..n_tx).into_par_iter()
-    .map(|k| verify_logic(...))
-    .collect();
-```
-
-**Done when:**
-- Stage 2 prep loop parallel
-- BlockSpineMle::build parallel
-- build_balance_trace_parts parallel
-- verify_logic in full_node parallel
-- No shared mutable state between threads
-
----
-
-#### Stage 4: Fix Critical Memory Copies — 2 days
-
-**Files:** `noid_gkr/src/block_spine.rs`, `noid_fri_binius/src/interleaved_commit.rs`, `noid_stark/src/interleaved.rs`
-
-**4.1 Fix M3: BlockSpineMle mmap Optimization**
-
-For 100 tx: 4 × 2^22 × 16 bytes = 256 MB. Use mmap for lazy zero-fill:
-```rust
-fn alloc_zeroed_mle(n_cells: usize) -> Vec<Block128> {
-    #[cfg(target_os = "linux")]
-    {
-        let size = n_cells * std::mem::size_of::<Block128>();
-        let ptr = unsafe {
-            libc::mmap(ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
-        };
-        if ptr != libc::MAP_FAILED {
-            return unsafe { Vec::from_raw_parts(ptr as *mut Block128, n_cells, n_cells) };
-        }
-    }
-    vec![Block128::ZERO; n_cells]  // fallback
-}
-```
-
-**4.2 Fix M5: Remove encoded_cols Dead Field**
-
-In `noid_fri_binius/src/interleaved_commit.rs`:
-```rust
-pub struct InterleavedProverState<'a> {
-    // REMOVED: pub encoded_cols: Vec<Vec<Block128>>,
-    pub raw_cols: Vec<&'a [Block128]>,
-    pub log_rows: usize,
-    pub n_cols: usize,
-}
-```
-
-**4.3 Fix M6: Verifier Proof Clone**
-
-In `noid_stark/src/interleaved.rs`:
-```rust
-// BEFORE: clones entire AlgebraicStarkProof
-let alg = AlgebraicStarkProof {
-    base_openings: proof.base_openings.clone(),
-    // ...
-};
-
-// AFTER: restructure to borrow directly
-fn verify_algebraic_from_interleaved<A: Air + ?Sized>(
-    air: &A,
-    pi: &PublicInputs,
-    proof: &InterleavedStarkProof,  // borrow directly
-    // ...
-) -> Result<AlgebraicVerifyOut, VerifyError>
-```
-
-**Done when:**
-- BlockSpineMle allocation optimized (M3)
-- encoded_cols removed (M5)
-- Verifier borrows proof directly (M6)
-
----
-
-#### Stage 5: Parallel Stage 5 (Q.2c) — 1 day
-
-**Files:** `noid_block/src/lib.rs`
-
-**Goal:** Parallelize per-tx algebraic STARK proofs.
-
-```rust
-let tx_results: Vec<_> = (0..n_tx)
-    .into_par_iter()
-    .map(|k| {
-        let mut ch = per_tx_algebraic_channel(
-            &prev_block_state_root, cap, k as u32,
-        );
-        
-        let slice_claims = build_auth_slice_claims(...);
-        
-        let (alg, r_pp_k, claim_k, lambdas_k) = prove_air_interleaved_algebraic_split(
-            w.air, &fixed_cols, &prep.witness_columns,
-            w.pi, &auth_res.extras_transcript,
-            &slice_claims, log_len, &mut ch,
-        );
-        
-        (alg, r_pp_k, claim_k, lambdas_k)
-    })
-    .collect();
-```
-
-**Done when:**
-- Stage 5 uses rayon::par_iter
-- Each tx uses independent per_tx_algebraic_channel
-- build_auth_slice_claims inside parallel closure
-- prove_block produces valid proof
-
----
-
-#### Stage 6: Update Verifier (Q.3, Q.5) — 1 day
-
-**Files:** `noid_block/src/lib.rs`
-
-**Goal:** Mirror prover changes in verifier, parallelize verification.
-
-```rust
-let tx_verify_results: Vec<Result<_, VerifyBlockError>> = (0..n_tx)
-    .into_par_iter()
-    .map(|k| {
-        // Auth Kill-Shot (self-seeded)
-        let auth_reductions = {
-            let mut ch = auth_gkr_channel();
-            verify_auth_killshot(...)?
-        };
-        
-        // Bridge checks, slice reconstruction
-        
-        // Algebraic STARK (per-tx channel)
-        let mut ch = per_tx_algebraic_channel(
-            &meta.prev_block_state_root, cap, k as u32,
-        );
-        let (r_pp_k, claim_k) = verify_air_interleaved_algebraic(...)?;
-        
-        Ok((r_pp_k, claim_k))
-    })
-    .collect();
-```
-
-**Done when:**
-- verify_block uses per-tx channels
-- verify_block parallelizes Stage 2b
-- Accepts proofs from parallel prover
-
----
-
-#### Stage 7: Reconnect Block Channel (Q.4) — 0.5 day
-
-**Files:** `noid_block/src/lib.rs`
-
-**Goal:** Create fresh channels for Stage 5b and Stage 6.
-
-```rust
-// Stage 5b: State binding
-if let Some(sb) = state_binding {
-    let mut sb_ch = state_binding_channel(
-        &prev_block_state_root, cap, n_tx as u32,
-    );
-    // ...
-}
-
-// Stage 6: Block multipoint
-let mut block_channel = block_multipoint_channel(
-    &prev_block_state_root, cap,
-);
-block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
-block_channel.observe_field_elems(&block_col_openings);
-```
-
-**Done when:**
-- Stage 5b uses state_binding_channel
-- Stage 6 uses fresh block_multipoint_channel
-- No shared channel state between Stage 5 and Stage 6
-
----
-
-#### Stage 8: Segmented Transcript Absorption (Q.4a) — 4 days
-
-**Files:** `noid_block/src/lib.rs`, `noid_block/src/transcript.rs` (new)
-
-**Goal:** Replace linear transcript absorption with Merkle reduction.
-
-**8.1 Per-Entity Digest Construction**
-
-```rust
-pub fn compute_tx_transcript_digest(
-    tx_index: u32,
-    r_pp: &[Block128],
-    openings: &[Block128],
-    lambdas: &[Block128],
-    final_claim: Block128,
-) -> [u8; 32] {
-    let mut sponge = Poseidon2bSponge::new();
-    sponge.absorb(Block128::from(tx_index as u128));
-    sponge.absorb_slice(r_pp);
-    sponge.absorb_slice(openings);
-    sponge.absorb_slice(lambdas);
-    sponge.absorb(final_claim);
-    sponge.squeeze_digest()
-}
-```
-
-**8.2 Merkle Reduction**
-
-```rust
-pub fn merkle_reduce(digests: &[[u8; 32]]) -> [u8; 32] {
-    let n = digests.len().next_power_of_two();
-    let mut layer: Vec<[u8; 32]> = Vec::with_capacity(n);
-    layer.extend_from_slice(digests);
-    layer.resize(n, [0u8; 32]);
-    
-    while layer.len() > 1 {
-        layer = layer.par_chunks(2)
-            .map(|pair| compress(&pair[0], &pair[1]))
-            .collect();
-    }
-    layer[0]
-}
-```
-
-**8.3 Update Stage 6 Transcript**
-
-```rust
-// BEFORE: linear absorption
-block_channel.observe_field_elems(&block_col_openings);
-
-// AFTER: Merkle reduction
-let tx_digests: Vec<[u8; 32]> = (0..n_tx).into_par_iter().map(|k| {
-    compute_tx_transcript_digest(k as u32, &tx_r_pp[k], ...)
-}).collect();
-
-let transcript_root = merkle_reduce(&all_digests);
-let [root_hi, root_lo] = hash_to_fields(&transcript_root);
-block_channel.observe_field_elem(root_hi);
-block_channel.observe_field_elem(root_lo);
-```
-
-**Security Requirements:**
-- Per-entity digest MUST commit to tx_index (prevents reordering)
-- MUST commit to opening positions (prevents cross-segment replay)
-- MUST commit to lambda reductions (prevents transcript ambiguity)
-- MUST commit to evaluation claims (prevents claim substitution)
-
-**Done when:**
-- Stage 6 no longer linearly absorbs every field element
-- Entity digests used as transcript units
-- Multipoint reduction remains sound
-- Verifier reconstructs identical segmented transcript
-
----
-
-#### Stage 9: Parallel Verifier (Q.5) — 1 day
-
-Already covered in Stage 6. Additional:
-
-**9.1 Parallel State Binding Verification**
-
-```rust
-if has_state_binding {
-    let mut sb_ch = state_binding_channel(...);
-    let (r_pp_sb, _) = verify_air_interleaved_algebraic(...)?;
-}
-```
-
-**What remains sequential:**
-- Block SpineGKR Kill-Shot verification (~3ms)
-- Stage 6: Block multipoint sumcheck (cheap)
-- Stage 7: FRI mixed opening (~15ms)
-
-**Done when:** verify_block <4s for 100 tx on 8 cores.
-
----
-
-#### Stage 10: Benchmarks & Validation (Q.6) — 2 days
-
-**Files:** `bench_prover/benches/block_scaling.rs`, `noid_block/tests/`
-
-**10.1 Performance Benchmarks**
-
-```rust
-fn bench_block_prove(c: &mut Criterion) {
-    for n_tx in [10, 50, 100, 200, 500] {
-        group.bench_with_input(BenchmarkId::new("parallel", n_tx), &n_tx, |b, &n| {
-            let (witnesses, state_binding) = setup_block(n);
-            b.iter(|| prove_block([0; 32], &witnesses, Some(&state_binding)));
-        });
-    }
-}
-```
-
-**10.2 Determinism Tests**
-
-```rust
-#[test]
-fn sequential_vs_parallel_equivalence() {
-    let proof_seq = prove_block_sequential(...);
-    let proof_par = prove_block(...);
-    verify_block(&airs, &proof_par, ...).unwrap();
-}
-```
-
-**10.3 Memory Profiling**
-
-```rust
-#[test]
-fn memory_peak_under_2gb() {
-    let peak = measure_peak_memory(|| prove_block(...));
-    assert!(peak < 2 * 1024 * 1024 * 1024);
-}
-```
-
-**Validation Checklist:**
-- [ ] prove_block <15s on 8 cores (100 tx)
-- [ ] verify_block <5s on 8 cores (100 tx)
-- [ ] Memory peak <2 GB (100 tx)
-- [ ] Sequential vs parallel proof equivalence
-- [ ] Cross-platform determinism (CI: x86_64, ARM)
-- [ ] No regression in existing tests
-
-**Done when:** All benchmarks confirm targets, all validation tests pass.
-
----
-
-#### Stage 11: Deterministic Parallel Execution (Q.8) — 2 days
-
-**11.1 Stable Reduction Ordering**
-
-```rust
-// INVARIANT: All parallel reductions use indexed par_iter (0..n)
-// with .collect() to guarantee deterministic ordering.
-```
-
-**11.2 Thread-Local Transcript Isolation**
-
-Each rayon worker gets its own Channel instance. No shared mutable transcript state.
-
-**11.3 Parallel Hash Consistency**
-
-- Blake3: deterministic across threads
-- Poseidon2b: deterministic (pure arithmetic)
-- No floating-point anywhere (GF(2^128) only)
-
-**11.4 Cross-Run Determinism Test**
-
-```rust
-#[test]
-fn deterministic_across_runs() {
-    let proof1 = prove_block(...);
-    let proof2 = prove_block(...);
-    assert_eq!(format!("{:?}", proof1), format!("{:?}", proof2));
-}
-```
-
-**Done when:**
-- Stable reduction ordering documented and enforced
-- Thread-local transcript isolation verified
-- Cross-run determinism test passes
-- No floating-point in any hot path
-
----
-
-### Appendix A: Architectural Invariants
-
-**A.1 Streaming-First Invariant**
+### Units
 
 ```
-No protocol stage may require full materialization
-of all block openings simultaneously in RAM.
+1 NOID = 1_000_000 μNOID (microNOID)
+All values in wire format: u64 in μNOID
+Max single value: 2^64 - 1 μNOID ≈ 1.8 × 10^13 NOID (more than enough)
+Display: "10.500000 NOID" (6 decimal places)
 ```
 
-**A.2 Column Lifetime Ownership Model**
+### Slot Allocation
+
+Wallets need free slot indices for transaction outputs. Slots are allocated via a node-side deterministic PRNG:
 
 ```
-fixed columns:       global immutable (Arc<FixedColumns>)
-witness columns:     per-tx ephemeral (Vec<Vec<Block128>>)
-opening reductions:  stage-local ephemeral (dropped after Stage 6)
-recursive replay:    streaming-only (Phase 7)
+SLOT SPACE GROWTH:
+  Genesis:   log_slots = 24  →  2^24 = 16,777,216 slots
+  Auto-expansion: when active_slot_count ≥ ~75% capacity
+                  log_slots += 1, capacity doubles, new segments are virtual zeros
+  Maximum:   log_slots = 32  →  2^32 = 4,294,967,296 slots
+
+NATIVE ALLOCATOR (node-side):
+
+  alloc_counter = consensus-significant field in BlockHeader
+  Incremented by +1 for each new output created in the block.
+
+Wallet flow:
+  1. wallet → node: paranoid_getSlotHints(count = N)
+  2. node:  mask = 2^current_log_slots - 1  (grows with network!)
+            seed = current alloc_counter
+            for i in 0..N:
+              loop: candidate = PRNG(seed++) & mask
+              if state[candidate] == EMPTY: slots.push(candidate)
+            return slots: [201, 4503, 12877]
+  3. wallet: puts these in TxBody.outputs[i].slot_index
+  4. miner:  BlockStateBinding verifies each slot is EMPTY in current state
+
+HINTS ARE NON-AUTHORITATIVE:
+  Two wallets may receive the same hint.
+  Miner resolves conflicts: first tx in wins, second is dropped.
+  Dropped wallet: error → get new hints → rebuild tx (~156ms)
+  Conflict rate: very low (2^log_slots available slots, small fraction occupied).
+
+CONFLICT HANDLING IN MEMPOOL:
+  Track reserved_slots: HashSet<u32> (slots claimed by pending txs)
+  When issuing hints: exclude reserved_slots from candidates
+  When tx is confirmed or evicted: release its slots from reserved_slots
 ```
 
-**A.3 Pre-Allocation Over Arena**
-
-From Plonky2/Boojum reference analysis: **neither uses bumpalo**. Both use:
-- Pre-allocated `Vec::with_capacity`
-- Aligned allocation (`allocate_with_alignment_of::<F, P>()`)
-- Rayon chunked parallelism
-
-**Decision for Paranoid:** Pre-allocation + `pad_column_cow` (zero-copy for fixed) instead of bumpalo. Simpler, safer, same result.
-
----
-
-### Implementation Timeline
-
-| Stage | Task | Days | Cumulative | Dependencies |
-|-------|------|------|------------|-------------|
-| 1 | Per-Tx Channel Factory (Q.1) | 1 | 1 | — |
-| 2 | Trace Layout Separation (Q.2a) + M1/M2/M4 | 5 | 6 | — |
-| 3 | Witness Generation Parallelization (Q.2b) | 3 | 9 | — |
-| 4 | Fix Critical Copies (M3/M5/M6) | 2 | 11 | Stage 2 |
-| 5 | Parallel Stage 5 (Q.2c) | 1 | 12 | Stage 1, 2 |
-| 6 | Update Verifier (Q.3, Q.5) | 1 | 13 | Stage 1, 5 |
-| 7 | Reconnect Block Channel (Q.4) | 0.5 | 13.5 | Stage 1 |
-| 8 | Segmented Transcript (Q.4a) | 4 | 17.5 | Stage 7 |
-| 9 | Parallel Verifier (Q.5) | 1 | 18.5 | Stage 6, 8 |
-| 10 | Benchmarks & Validation (Q.6) | 2 | 20.5 | All |
-| 11 | Deterministic Parallel (Q.8) | 2 | 22.5 | Stage 5, 9 |
-
-**Critical path:** 1 → 2 → 5 → 6 → 8 → 9 → 10
-
----
-
-### Performance Projection
-
-| Metric | Before | After Stage 5 | After Stage 8 | After All |
-|--------|--------|--------------|--------------|-----------|
-| prove_block (100 tx, 8c) | 43s | ~12s | ~10s | **~8s** |
-| verify_block (100 tx, 8c) | 15s | ~5s | ~4s | **~3.5s** |
-| Memory peak (100 tx) | ~3 GB | ~1.5 GB | ~1.2 GB | **<1 GB** |
-| Proof size | 2.02 MB | 2.02 MB | 2.02 MB | 2.02 MB |
-
-**Breakdown (after all stages, 100 tx, 8 cores):**
+### Key Management (Mode 1 for launch)
 
 ```
-prove_block: ~8s
-├── Stage 2 (prep): ~0.3s (parallel, fixed shared)
-├── Stage 2b (BlockSpineMle): ~0.5s (parallel 5900 perms)
-├── Stage 3 (commit): ~3s (parallel Blake3, unchanged)
-├── Stage 4 (GKR): ~0.5s (spine sequential + auth parallel)
-├── Stage 5 (algebraic): ~2.5s (100/8 × 200ms, per-tx channels)
-├── Stage 5b (state binding): ~0.2s
-├── Stage 6 (block multipoint): ~0.5s (Merkle reduction)
-└── Stage 7 (FRI): ~0.5s
+On wallet init:
+  master_secret = random_bytes(32)
+  encrypted     = ChaCha20-Poly1305(master_secret, key=Argon2id(password))
+  save as ~/.paranoid/wallet.secret
+
+Address derivation:
+  address_n = derive_address(Poseidon2b(master_secret, n, "paranoid-derive-v1"))
+```
+
+Mode 2 (Object Secret) — designed, implemented later:
+```
+spend_secret = Poseidon2b(Blake3(file_bytes), user_salt, "paranoid-object-v1")
 ```
 
 ---
 
-### Risk Register
+## Phase S — Stateless Architecture ✅ DONE
 
-| Risk | Probability | Impact | Mitigation |
-|------|------------|--------|-----------|
-| Split trace API breaks existing callers | Medium | High | Incremental: add `_split` variants, don't replace |
-| Q.4a Merkle reduction changes proof format | High | Medium | Proof format unchanged (same BlockProof struct), only transcript internals change |
-| Parallel determinism failure | Low | Critical | Indexed par_iter + collect; determinism tests |
-| BlockSpineMle parallel write conflicts | None | — | Disjoint memory regions (pack_index_dyn guarantees) |
-| reconstruct_slot_states can't parallelize | Known | Medium | Accept sequential; it's ~2s of 43s total |
+### S.1 Epoch Anchor ✅
+`TxBody.epoch_anchor: Digest`, `ANCHOR_DEPTH = 6`. Anti-replay across forks.
 
----
+### S.2 Claims Commitment (C_claimed) ✅
+`compute_claims_commitment(inputs, outputs) -> Digest`. Poseidon2b sponge under `TAG_CLAIMS`.
 
-### What We Do NOT Do (Justified Defer)
+### S.3 TxLogicAir ✅
+81 columns, `log_rows = 11` (2048 rows). Balance, range, auth pin. No state columns.
 
-| Item | Reason for Defer |
-|------|-----------------|
-| `#[repr(align(64))]` for Block128 | Audit showed: AVX2 uses unaligned loads, CLMUL register-only. 64-byte alignment would break pack_slice. |
-| Column chunking (64-256KB) | Columns now 32KB (log_rows=11). Needed at log_rows≥16 (Phase 3). |
-| NUMA-awareness | 250 MB fits in L3. Needed at 1024 tx (Phase 8). |
-| KillShot batch scheduler | KillShot self-contained. Batch scheduling — Phase 7 concern. |
-| Streaming witness | Segmented state doesn't exist. YAGNI until Phase 3. |
-| Bumpalo arena | References (Plonky2, Boojum) do NOT use arena. Pre-allocation + Cow better. |
+### S.4 LogicProof Pipeline ✅
+`prove_logic` / `verify_logic`. Split GKR: wallet proves AuthGKR, block prover handles SpineGKR.  
+Measured: prove ~156ms, verify ~84ms, proof size ~26 KB.
 
----
+### S.5 BlockStateBinding ✅
+Opens all input/output slots, verifies pre-conditions, C_claimed bridge.
 
-## Phase 3 — Segmented State & Merkle Kill-Shot (Stage F)
+### S.6 Integrated BlockProof ✅
+`prove_block` + `verify_block`. N per-tx parallel algebraic STARKs + unified block SpineGKR + single FRI.  
+Measured (100 txs): prove ~10s, verify ~2.8s.
 
-**Goal:** Scale state beyond 2^16 slots per monolithic FRI by splitting it into fixed-size independently committed segments. 
+### S.7 Nullifier Set ✅
+Rolling 6-block window. O(1) lookup and insertion.
 
-**CRITICAL DEPENDENCY:** This phase MUST be completed before Recursion (Phase 7). Recursion commits the state format into the circuit. If we do Recursion before Segmented State, we will hardcode the monolithic FRI format and have to rewrite the recursive STARK later.
-
-**Architectural Philosophy — INCREMENTAL UPGRADE & MEMORY TOPOLOGY:**
-We do not rewrite `noid_chain` from scratch. We abstract storage via a `StateBackend` trait (Ref: Reth `revm` database traits), replace the monolithic `FriState` with `SegmentedFriState`, and inject the segment Merkle path into `BlockStateBindingAir` via GKR instead of AIR trace rows. 
-Memory discipline is a first-class concern: zero-copy views, opening deduplication, and virtualized empty segments are mandatory to prevent bandwidth collapse at scale.
-
-**Performance target:** Reduce per-block state commitment from O(2^log_slots) to O(K * 2^16) where K is the number of dirty (modified) segments. Target <50ms for state root update in a typical 100-tx block.
-
-### F.0 Crate Structure & Trait Architecture (Zero-Copy Mandate)
-Abstract state storage to prepare for disk backend and enable segment-level loading.
-- `noid_chain/src/storage/mod.rs` — `StateBackend` trait.
-- `noid_chain/src/segmented_state.rs` — `SegmentedFriState` replacing `FriState`.
-- **Reference:** Reth `crates/storage/db` and `crates/revm/database` trait patterns.
-
-**MANDATORY Trait Definition (Patch 3):**
-The `StateBackend` trait MUST include a strict contract for column loading that prevents full-state materialization and supports future MDBX mmap:
-```rust
-pub trait StateBackend {
-    fn get_slot(&self, segment_id: u32, local_idx: u32) -> SlotValue;
-    fn set_slot(&mut self, segment_id: u32, local_idx: u32, val: SlotValue);
-    fn load_segment_columns(&self, segment_id: u32) -> SegmentColumns;
-    fn flush(&mut self);
-}
-
-pub struct SegmentColumns {
-    pub value: Vec<Block128>,
-    pub owner_hi: Vec<Block128>,
-    pub owner_lo: Vec<Block128>,
-}
-```
-*Future K.3 requirement:* `MdbxBackend` MUST return zero-copy mmap slices (`SegmentView<'txn> -> &[Block128]`), NOT `Vec<Block128>`, to avoid `memcpy` bandwidth collapse.
-
-- **Done when:** `StateBackend` trait compiles with strict loading semantics; existing code compiles against it (using RAM backend).
-
-### F.1 RAM Backend, Zero-Constants & Virtual Zero Segments
-- `noid_chain/src/storage/memory.rs` — `RamBackend`: `Vec<Block128>` per segment.
-- `noid_chain/src/constants.rs` — Pre-compute `ZERO_SUBTREE_ROOT[k]`, `ZERO_SEGMENT_ROOT`, `ZERO_SEGTREE_NODE[d]` for empty subtrees/segments.
-- **F.1b Virtual Zero Segment:** Empty segments MUST NOT materialize columns. `load_segment_columns` for empty segments must return a static immutable slice `&[Block128]` (or a `SegmentColumns` struct backed by static `ZERO_COLUMN`) without allocation.
-- **Done when:** Backend implements full trait; zero-constants match Poseidon2b hashes; empty segments result in zero allocation.
-
-### F.2 Segmented FRI Commitment (Per-Segment)
-Split state into `2^(log_slots - 16)` segments of `2^16` slots (3 columns: value, owner_hi, owner_lo).
-- Each segment is independently FRI-committed via `noid_fri_binius`.
-- `SegmentedFriState` holds a cache of `seg_roots: Vec<Digest>`.
-- **Done when:** `state_root` computed from segmented FRI matches the monolithic FRI at `log_slots=16` (unit test parity).
-
-### F.3 Segment Merkle Tree (Global state_root)
-Implement the global state_root as a Poseidon2b Merkle tree over segment roots.
-- Domain tag: `TAG_SEGMENTTREE`.
-- Depth of the segment tree = `log_slots - 16` (8 at genesis, 16 at max scale).
-- Cache all internal nodes: `tree_cache: Vec<Vec<Digest>>` (max 4 MB at `log_slots=32`).
-- **Reference:** Standard binary Merkle tree patterns (e.g., winterfell Merkle tree, but with Poseidon2b).
-- **Done when:** `state_root` updates correctly on segment root change; empty state produces correct zero root.
-
-### F.4 Dirty Tracking & Block Production Pipeline
-The core performance optimization. During block production, only modified segments are recomputed.
-- Maintain a `DirtySegments: HashSet<u16>` during tx execution.
-- On `apply_block`: Mark dirty -> Load dirty columns -> Mutate -> Recompute FRI root -> Update Merkle tree.
-- **F.4b Opening Coalescer:** Before Stage 6, deduplicate FRI query openings. Use `HashMap<(segment_id, query_pos), SharedOpening>` to collapse `1024 × Q` openings into `dirty_segments × Q`. Prevents redundant Merkle path proofs and bandwidth waste.
-- **Done when:** Block production state update takes <50ms for 100 txs; clean segments are never touched; duplicate openings are collapsed.
-
-### F.5 Integrate Existing Merkle Kill-Shot GKR (Segment Paths)
-Prove the segment Merkle path (up to 16 levels) in-circuit WITHOUT materializing Poseidon2b in the STARK AIR trace.
-- **CRITICAL:** The `noid_gkr` crate ALREADY contains a fully implemented and tested Merkle Kill-Shot (`merkle_circuit`, `merkle_killshot`). You MUST reuse the existing `prove_merkle_killshot` / `verify_merkle_killshot` API and `MerklePathInputs` structure. Do NOT reimplement.
-- When building `MerklePathInputs`, `leaf` is the `seg_root`, `expected_root` is the global `state_root`, `siblings` are the path elements, and `active_depth` is the current segment tree depth.
-- **F.5b Merkle Sibling Cache:** Add `HashMap<(segment_id, tree_level), Digest>` to batch Merkle paths. Prevents recomputing shared siblings for adjacent segment leaves in Kill-Shot.
-- **Done when:** Existing Kill-Shot is successfully integrated into `BlockStateBindingAir`; proof size increases by ≤3%; shared siblings are cached.
-
-### F.6 BlockStateBinding Refactor (FRI + Merkle Path)
-Update `BlockStateBindingAir` and `prove_block_state_binding` for the two-tier state.
-- For each touched slot: 1) FRI Opening against `seg_root`, 2) Merkle Path to `state_root` via the integrated Kill-Shot.
-- Batch multiple slots in the same segment (share Merkle path and use coalesced openings from F.4b).
-- **Done when:** BlockStateBinding proves/verifies with segmented state; BlockProof size increases by ≤3%.
-
-### F.7 Automatic Expansion under Segmentation
-Handle `log_slots += 1` (Spec §15.3).
-- `num_segments` doubles. New upper half is all-zero segments (using `ZERO_SEGMENT_ROOT`). One Poseidon2b compression.
-- **Done when:** Expansion triggers correctly; node applies expansion block without re-hashing state.
-
+### S.8 TxIntent Wire Format ✅
+`spend_secret` never on wire. Deterministic encoding.
 
 ---
 
-## Phase 7 — Recursive Chain (Stage H) — ✅ **DONE**
+## Phase Q — Parallel Per-Tx STARK ✅ DONE
 
-**Goal:** O(1) historical verification. A new node downloads ONE ~6.5 KB proof and verifies the entire chain from genesis in ~5 ms.
+**Goal**: Reduce `prove_block` from ~43s to <10s at 100 txs (8 cores).
 
-**Achieved:** True O(1) — constant-size proof regardless of chain length. No archive nodes. No O(N) sync.
+**Key insight**: Replace sequential block Fiat-Shamir with independent per-tx channels seeded from `H(prev_state_root || cap || tx_index)`. The Merkle cap cryptographically binds all columns post-commit. Parallel execution is sound because the witness is immutable after commit.
 
-**Result:** `RecursiveBlockProof` = 6.5 KB, `verify_tip` = ~5 ms, `prove_recursive_step` overhead = ~30 ms/block.
+### Q.1 Per-Tx Channel Factory ✅
+`per_tx_algebraic_channel(prev_state_root, cap, tx_index)` with full domain separation.
 
-**Dependency:** Required Phase 1.5 (parallel BlockProof) and Phase 3 (Segmented State — to lock state_root format). Both done before Phase 7.
+### Q.2 Fixed Column Separation ✅
+`FixedColumns` struct: selectors shared across all txs via zero-copy refs. Saves ~65 MB per 100-tx block.
+
+### Q.3 Parallel Stage 5 (prove_block) ✅
+`(0..n_tx).into_par_iter()` over independent per-tx algebraic STARKs.
+
+### Q.4 Segmented Transcript Absorption ✅
+Merkle-reduce per-tx digests for Stage 6 channel seeding. Unlocks streaming verification.
+
+### Q.5 Parallel Verifier ✅
+`verify_block` Stage 2b: `into_par_iter()` over per-tx auth Kill-Shots + algebraic STARKs.
+
+**Performance (measured)**:
+
+| Metric | Before Q | After Q (8 cores) |
+|--------|---------|-------------------|
+| prove_block (100 tx) | ~43s | ~10s |
+| verify_block (100 tx) | ~15s | ~2.8s |
+| RecursiveProof size | 6.5 KB | 6.5 KB (unchanged) |
+
+**Soundness**: Non-adaptive soundness for committed witnesses. Cap is collision-resistant (Blake3). Per-tx challenges cannot be predicted before commit. Cross-tx binding enforced by Stage 6. See Soundness Summary.
+
+---
+
+## Phase F — Segmented State ✅ DONE
+
+**Goal**: Scale state beyond 2^16 slots. Segment state into independently FRI-committed chunks.
+
+### F.1 RAM Backend & Virtual Zero Segments ✅
+`RamBackend`, pre-computed zero subtree roots. Empty segments: zero allocation.
+
+### F.2 Segmented FRI Commitment ✅
+`2^(log_slots - 16)` segments of `2^16` slots each. Independent FRI roots per segment.
+
+### F.3 Segment Merkle Tree ✅
+Global `state_root` = Poseidon2b Merkle tree over segment roots. O(log N) dirty updates.
+
+### F.4 Dirty Tracking ✅
+Only modified segments recomputed. Target: <50ms for state root update in typical block.
+
+### F.5 Merkle Kill-Shot Integration ✅
+Reuses `noid_gkr` `prove_merkle_killshot` / `verify_merkle_killshot`. No AIR rows for Poseidon2b.
+
+### F.6 BlockStateBinding Refactor ✅
+Two-tier: FRI opening against `seg_root` + Merkle path to `state_root` via Kill-Shot.
+
+### F.7 Automatic Expansion ✅
+`log_slots += 1`: upper half becomes zero segments. One Poseidon2b compression.
+
+---
+
+## Phase H — Recursive Chain ✅ DONE
+
+**Goal**: O(1) chain verification. Any node verifies entire history with 6.5 KB + 5 ms.
+
+### Key Metrics (Measured)
+
+| Metric | Value |
+|--------|-------|
+| `RecursiveBlockProof` size | **6.5 KB** (constant regardless of chain length) |
+| `verify_tip` time | **~5 ms** (O(1)) |
+| `prove_recursive_step` overhead | **~30 ms/block** |
+| New node sync | **6.5 KB** download + state snapshot |
+| compact FRI rounds in rec proof | **0** (n_rounds = 0, pure tensor decomposition) |
 
 ### Implementation Summary
 
-All H.1–H.7 are implemented. H.8/H.9 are deferred (not needed for initial mainnet).
-
-#### H.1 Chain Accumulator ✅ DONE
-`noid_recursive::accumulator`: `ChainAccumulator { height, state_root, chain_hash }`, `genesis_accumulator`. Rolling Poseidon2b chain hash: `chain_hash_{n} = compress(chain_hash_{n-1}, H_BLOCK(header_n))`. Binds every block header (including `proof_transcript_hash`) into a 32-byte commitment. Security: per-tx FS challenges are bound through `proof_transcript_hash → H_BLOCK → chain_hash`.
-
-#### H.2 Algebraic-Replay Witness ✅ DONE
-`noid_recursive::witness::BlockReplayWitness::from_parts(...)`. Extracts `block_multipoint_rounds`, `compact_fri`, `block_col_openings` from `BlockProof` without re-importing `noid_block` (avoids cyclic dep). Used by `prove_recursive_step`.
-
-#### H.3 Fiat-Shamir Sponge AIR ✅ DONE (via STARKPack insight)
-Instead of a Sponge AIR, used compact FRI `COMPACT_TAU=8` with `log_rows=8` → `n_rounds=0` → **zero Merkle paths in FRI**. The recursive STARK's FRI collapses to pure tensor decomposition. No in-circuit hash verification needed.
-
-#### H.4 Algebraic-Replay AIR ✅ DONE
-`noid_recursive::air::RecursiveBlockAir` (8 columns, 256 rows, log_rows=8):
-- Constraints 0–1: multipoint sumcheck fold consistency for block_n and rec_{n-1}: `claim_out == p0 + r*(p0+p1)` (degree-2, FoldCheckGate via SelectorGate).
-- Constraints 2–3: state root pin at ACC_ROW (WeightedLinearGate).
-- Selectors declared as PublicColumns (no witness overhead).
-
-#### H.5 RecursiveBlockAir ✅ DONE
-`prove_recursive_step(witness, header, prev_acc, prev_rec)` → `RecursiveBlockProof`. Uses STARKPack: all algebraic data packed into ONE `InterleavedStarkProof`. Result: **6.5 KB constant-size** proof per block.
-
-#### H.6 Poseidon2b in compact FRI ✅ DONE (enabling change Phase A)
-Compact FRI round trees changed Blake3 → Poseidon2b (`noid_stark`, `noid_block`). With COMPACT_TAU=8 and log_rows=8, n_rounds=0 → no Merkle paths at all. Obsoletes the need for a dedicated Poseidon2b Kill-Shot for FRI.
-
-#### H.7 Tip Verifier ✅ DONE
-`noid_recursive::verify::verify_tip(rec_proof, rec_air, tip_prev_state_root, tip_height, genesis_acc)`: O(1), ~5 ms. Verifies the recursive STARK + accumulator consistency. Integrated into `noid_block::full_node::verify_block_full` via `Option<RecVerifyInputs>`.
-
-#### H.8/H.9 Deferred
-Witness streaming and aggregation topology are not needed for initial operation. Single-block recursive step RAM is O(1) in chain length (only current block data materialized).
-
-### Key metrics (measured)
-
-| Metric | Value |
-|---|---|
-| `RecursiveBlockProof` size | **6.5 KB** (constant) |
-| `verify_tip` time | **~5 ms** (O(1)) |
-| `prove_recursive_step` overhead | **~30 ms/block** |
-| New node sync download | **6.5 KB** (constant) |
-| compact FRI rounds in rec proof | **0** (n_rounds = 0) |
-| Test coverage | E2E test in `noid_block/tests/phase7_recursive_e2e.rs` |
+**H.1** Chain Accumulator: `ChainAccumulator { height, state_root, chain_hash }`. Rolling Poseidon2b: `chain_hash_n = compress(chain_hash_{n-1}, H_BLOCK(header_n))`. ✅  
+**H.2** Algebraic Replay Witness: extracts multipoint rounds + FRI data from BlockProof. ✅  
+**H.3** STARKPack insight: `COMPACT_TAU=8, log_rows=8 → n_rounds=0 → zero Merkle paths`. ✅  
+**H.4** `RecursiveBlockAir` (8 cols, 256 rows): FoldCheckGate for sumcheck consistency + state root pin. ✅  
+**H.5** `prove_recursive_step → RecursiveBlockProof` (6.5 KB). ✅  
+**H.6** Poseidon2b in compact FRI round trees (Phase A). ✅  
+**H.7** `verify_tip(rec_proof, ...) → ~5ms O(1)`. ✅  
 
 ---
 
-## Phase 2 — Consensus & State Machine (Stage P)
+## Phase 1 — Consensus Core
 
-**Goal:** Implement ALL block validity rules, state transitions, fork choice, and chain reorg logic so nodes can reach deterministic consensus.
+**Goal**: All block validity rules, emission, DA pruning, ASERT, fork choice. Pure logic, no I/O.
 
-**Architectural Philosophy — BORROW, DON'T INVENT:**
-Consensus code is a minefield. We adapt battle-tested patterns from production Rust clients. A new `noid_consensus` crate contains pure functions and trait bounds. `noid_chain` implements these traits.
-
-**Consensus with Recursion:** Because Phase 7 is done, consensus validation now supports **two paths**:
-1. **Full Block Validation:** For block producers. Validates raw BlockProofs.
-2. **O(1) Tip Validation:** For syncing nodes and Light Nodes. Validates RecursiveProofs against the ChainAccumulator.
+Reference: `noid_consensus` crate with provider traits (Reference: Reth `crates/consensus`).
 
 ### P.0 Crate Structure & Trait Architecture
-Create `noid_consensus` crate with strict separation of concerns (Reference: Reth `crates/consensus`).
-- Pure logic (no IO, no networking, no storage).
-- Provider traits (`HeaderProvider`, `NullifierProvider`, `StateProvider`) (Reference: Substrate `sp-consensus`).
-- `ConsensusError` enum covering all 16 invariants.
+
+```rust
+// noid_consensus/src/lib.rs
+pub trait HeaderProvider { fn get_header(&self, height: u64) -> Option<BlockHeader>; }
+pub trait NullifierProvider { fn contains(&self, hash: &TxBodyHash) -> bool; }
+pub trait StateProvider { fn get_slot(&self, idx: u32) -> SlotValue; }
+
+pub enum ConsensusError { InvalidPoW, BadTimestamp, BadTxRoot, /* ... 16 variants */ }
+```
 
 ### P.1 Consensus Parameters (`params.rs`)
-ALL constants in one place. Every constant MUST have a doc comment referencing SPECIFICATION.md.
-- Time, Limits, State, Rewards, PoW parameters.
-- **Done when:** All constants match SPECIFICATION.md.
 
-### P.2 ASERT Difficulty Adjustment (`difficulty.rs`)
-**Reference:** Grin `consensus/src/target.rs` & Bitcoin Cash ASERT.
-- Fixed-point 256-bit arithmetic. NO FLOATS.
-- **Done when:** Matches reference vectors, deterministic across architectures.
+```rust
+pub const BLOCK_TIME:           u64   = 60;
+pub const EPOCH_LENGTH:         u64   = 6;
+pub const HALFLIFE:             u64   = 360;
+pub const MAX_FUTURE_DRIFT:     u64   = 120;
+pub const BLOCK_MAX_TXS:        usize = 1024;
+pub const ANCHOR_DEPTH:         u64   = 6;
+pub const FINALITY_DEPTH:       u64   = 18;  // 3 epochs
+pub const LOG_SLOTS_GENESIS:    u32   = 24;
+pub const LOG_SEGMENT_SIZE:     u32   = 16;
+pub const GENESIS_TARGET:       [u8;32] = /* 2^252 */;
+// Emission
+pub const NOID_DECIMALS:        u32   = 6;
+pub const MICRONOID_PER_NOID:   u64   = 1_000_000;
+pub const BASE_REWARD:          u64   = 50 * 1_000_000;
+pub const FLOOR_REWARD:         u64   = 1 * 1_000_000;
+pub const USAGE_SCALE:          u64   = 1_000_000;
+```
 
-### P.3 PoW Validation (`pow.rs`)
-- `Blake3(header_bytes) < difficulty_target` (256-bit LE).
-- **Done when:** Rejects invalid nonces and wrong targets.
+**Done when**: All constants match SPECIFICATION.md.
 
-### P.4 Timestamp Rules (`timestamps.rs`)
-- Median-time-past over 11 blocks + future drift cap.
-- **Done when:** Rejects backward timestamps and far-future blocks.
+### P.2 Emission Schedule (`emission.rs`)
 
-### P.5 Header Chain Validation (`header.rs`)
-**Reference:** Reth `consensus/validation.rs`.
-- `prev_header_hash`, height, `log_slots`, epoch boundaries.
-- **Done when:** All header fields validated.
+```rust
+pub fn block_reward(active_slot_count: u64) -> u64 {
+    let divisor = 1 + active_slot_count / USAGE_SCALE;
+    (BASE_REWARD / divisor).max(FLOOR_REWARD)
+}
+pub fn total_fees(txs: &[TxBody]) -> u64
+pub fn expected_coinbase_value(active_slot_count: u64, txs: &[TxBody]) -> u64
+```
 
-### P.6 Block Reward Schedule & Coinbase (`reward.rs`)
-- **Security Fix P.7.3:** `coinbase_credit == reward + sum(fees)`.
-- **Done when:** Blocks with inflated coinbase are rejected.
+**Done when**: Anti-spam property verified via property tests; floor enforced; coinbase over-claiming rejected.
 
-### P.7 Block Limits (`limits.rs`)
-- `BLOCK_MAX_TXS`, `BLOCK_MAX_DA_SIZE`, coinbase structure.
-- **Done when:** Overlimits blocks rejected.
+### P.3 ASERT Difficulty (`difficulty.rs`)
 
-### P.8 Per-Tx Consensus Checks (`checks.rs`)
-**Reference:** Zcash `zcash_consensus` rules.
-- **Security Fix P.7.1:** `epoch_anchor` freshness.
-- **Security Fix P.7.2:** `tx_body_hash` consistency.
-- Nullifiers, slot conflicts, state checks.
-- **Done when:** All 8 checks enforced; security fixes active.
+Reference: Bitcoin Cash ASERT.
 
-### P.9 DA Payload Verification (`da.rs`)
-- `da_root` matching (block-withholding protection).
-- **Done when:** Tampered DA payload rejected.
+```rust
+pub fn next_target(anchor_height, anchor_timestamp, anchor_target, height, timestamp) -> [u8;32]
+```
 
-### P.10 State Transition Rules (`state_trans.rs`)
-- `active_slot_count` delta, `alloc_counter` increment, expansion trigger.
-- **Done when:** State accounting matches Spec §15.
+- Fixed-point 256-bit arithmetic — **NO FLOATS**
+- Clamp: `[MIN_TARGET, MAX_TARGET]`
+- Deterministic across all architectures
 
-### P.11 Fork Choice + Finality (`fork_choice.rs`)
-**Reference:** Reth `consensus/forkchoice.rs`.
-- Heaviest chain rule. 18-block finality.
-- **Done when:** Reorg beyond finality rejected; heaviest chain wins.
+**Done when**: 50+ test vectors pass; zero floating point in codebase.
 
-### P.12 Full Block Validation Pipeline (`block.rs`)
-**Reference:** Reth `consensus/validation.rs`.
-- Orchestrates all 16 invariants (cheapest first).
-- **Done when:** ALL 16 invariants enforced.
+### P.4 PoW Validation (`pow.rs`)
 
-### P.13 Reorg Logic (`reorg.rs`)
-**Reference:** Grin `chain/chain.rs`.
-- Unwind to common ancestor, apply fork, return txs to mempool.
-- **Done when:** Handles 1-3 block reorgs gracefully.
+```
+PoW = Blake3(header_core_bytes) < difficulty_target
 
-### P.14 Chain State Machine (`noid_chain` update)
-**Reference:** Substrate `sc-client-api`.
-- Apply validated blocks, maintain ring buffer, nullifiers, state counters.
-- **Done when:** Deterministic state evolution from genesis.
+header_core does NOT include proof_transcript_hash.
+Full block hash = Blake3(header_core + proof_transcript_hash + other fields).
+```
 
-### P.15 Genesis (`genesis.rs`)
-- Hardcoded initial distribution. Identical state_root on any node.
-- **Done when:** Byte-identical genesis state.
+**Done when**: Rejects wrong nonces, wrong targets, malformed headers.
 
-### P.16 Check Verification (`checks.rs`)
-- Offline payment receipts (LogicProof + InclusionReceipt).
-- **Done when:** Eternal proof of payment verified.
+### P.5 Timestamp Rules (`timestamps.rs`)
 
-### P.17 — Fee Market & Resource Accounting
+- `block_ts > median_time_past(last 11 headers)`
+- `block_ts <= local_time + MAX_FUTURE_DRIFT`
 
-Goal: Price prover work, DA bandwidth, state growth, and mempool occupancy to prevent asymmetric resource exhaustion attacks.
+**Done when**: Rejects backward and far-future timestamps.
 
-**Topics to Design**
+### P.6 Header Chain Validation (`header.rs`)
 
-Fee dimensions:
-- algebraic proving cost
-- DA byte cost
-- state growth cost
-- recursive accumulation cost
+Checks (in order):
+1. `prev_block_hash == Blake3(full parent header)`
+2. `height == parent.height + 1`
+3. `difficulty_target == expected_target(parent, anchor)`
+4. Timestamp rules (P.5)
+5. PoW validity (P.4)
+6. `proof_transcript_hash != [0u8;32]` (block must have proof)
+7. `log_slots >= parent.log_slots` (monotone)
 
-Tx pricing model:
-- fixed vs dynamic fee market
-- congestion adjustment
-- proof-size weighting
+**Done when**: Full header chain validates from genesis.
 
-Spam resistance:
-- mempool occupancy pricing
-- low-fee eviction policy
-- recursive prover saturation attacks
+### P.7 Coinbase & Reward Rules (`reward.rs`)
 
-State rent / slot lifecycle:
-- permanent slot allocation economics
-- dormant slot handling
-- expansion incentives
+- Exactly one coinbase per block (first tx), `is_coinbase == true`, zero inputs
+- `coinbase.outputs[0].value <= block_reward(active_slot_count) + total_fees(other_txs)`
+- Over-claiming is consensus failure
 
-Miner / prover incentives:
-- reward split between ordering and proving
-- external miner compatibility
+**Done when**: Inflated coinbase rejected.
 
-Dependency
+### P.8 Per-Transaction Consensus Checks (`checks.rs`)
 
-Requires:
+Order (cheapest first):
+1. `epoch_anchor` freshness: in `[height-7, height-1]`
+2. `hash(tx.body) == pi.tx_body_hash`
+3. No nullifier collision (no double-spend)
+4. No slot conflict within block
+5. Input slots live in parent state
+6. Output slots empty in parent state
+7. `verify_logic(...)` — O(84ms), parallelized
+8. `fee >= 0`
 
-Phase 1.5 performance model
-Phase 3 segmented state
-Phase 7 recursion timings
+**Done when**: All 8 checks enforced; double-spend impossible.
 
-### P.17b Economic Attack Surface
+### P.9 Block Validation Pipeline (`block.rs`)
 
-Goal: Analyze adversarial economics of proving and state growth.
+Orchestrates all 16 invariants cheapest-first. Reference: Reth `crates/consensus/auto-seal`.
 
-Topics to Design
-- Prover centralization pressure
-- ASIC asymmetry
-- Recursive proving monopolization
-- DA flooding economics
-- State expansion griefing
-- Fee market manipulation
-- Empty block incentives
+1–7: O(1) header and limit checks  
+8–11: O(txs) nullifier, slot, anchor checks  
+12: O(txs × 84ms) LogicProof verification — **parallelized**  
+13: BlockProof + BlockStateBinding  
+14: `proof_transcript_hash == Poseidon2b(proof_transcript_bytes)`  
+15: `state_root == post-state.root()`  
+16: `active_slot_count` and `alloc_counter` updated correctly  
 
-Blocks:
-- Mainnet economics
-- Token issuance finalization
+**Done when**: All 16 invariants enforced; expensive checks last.
 
-### P.18 — Failure & Recovery Semantics
+### P.10 DA Pruning (`da_prune.rs`)
 
-Goal: Define deterministic node behavior under partial failure, proof lag, corrupted state snapshots, recursive backlog, and interrupted block application.
+```rust
+// Delete immediately after apply_block
+fn prune_block_da(db: &mut impl BlockStore, height: u64)
 
-**Topics to Design**
-- Recursive prover lag handling:
-    - whether blocks may propagate before recursive folding completes
-    - max allowed recursion backlog
-    - fallback validation mode
-- Snapshot integrity:
-    - snapshot hash commitments
-    - partial snapshot corruption handling
-    - resumable state sync
-- Crash consistency:
-    - atomic MDBX commit semantics
-    - interrupted block application rollback
-    - accumulator/state_root consistency guarantees
-- DA pruning race conditions:
-    - minimum retention window
-    - snapshot-vs-DA dependency ordering
-    - late sync guarantees
-- Recovery invariants:
-    - node restart must never produce divergent state_root
-    - accumulator/state DB/header DB must roll forward atomically
+// Compact undo log instead of full DA
+pub struct BlockUndoLog {
+    pub block_height: u64,
+    pub slot_changes: Vec<(u32, SlotValue)>,  // ~590 KB max per block
+}
 
-**Dependency**
+fn revert_block(state: &mut SegmentedFriState, undo: &BlockUndoLog)
+```
 
-Requires:
+- DA deleted immediately after `apply_block`
+- Undo logs kept for last `EPOCH_LENGTH = 6` blocks
+- After 6 confirmations: undo logs also deleted (finality)
 
-Phase 2 (consensus rules)
-Phase 4.2 (MDBX storage)
+**Done when**: DA deleted immediately; reorgs work correctly using undo logs; node restarts without data.
 
-Blocks:
+### P.11 Fork Choice (`fork_choice.rs`)
 
-Production deployment
-Public testnet reliability
+1. Most cumulative PoW work (heaviest chain)
+2. Tie-break: lower block hash (lexicographic)
 
-### P.18b Recursive Failure Domains
+Finality: reorgs deeper than `FINALITY_DEPTH = 18` blocks rejected.
 
-Goal: Define deterministic behavior under recursive pipeline failure.
+**Done when**: Deterministic winner; deep reorgs rejected.
 
-Topics to Design
-- Recursive backlog thresholds
-- Accumulator corruption handling
-- Recursive prover crash recovery
-- Fallback block validation mode
-- Recursive desync recovery
-- Delayed recursive finalization semantics
+### P.12 Reorg Logic (`reorg.rs`)
 
-Dependency
+Reference: Grin `chain/chain.rs`.
 
-Requires:
-- Phase 7 recursion
+Steps: find common ancestor → reject if > FINALITY_DEPTH → revert state using UndoLogs → restore txs to mempool → apply new chain → update NullifierSet → update RecursiveProof.
 
-### P.19 Canonical Serialization Rules
+**Done when**: 1-3 block reorgs handled; state consistent after reorg.
 
-Goal: Ensure byte-identical encoding across all architectures.
+### P.13 Genesis Block (`genesis.rs`)
 
-Topics to Design
-- Endianness policy
-- Canonical integer encoding
-- Digest serialization
+```rust
+pub fn genesis_block() -> Block            // target = 2^252
+pub fn genesis_state() -> SegmentedFriState  // all slots empty
+pub fn genesis_recursive_proof() -> RecursiveBlockProof
+```
+
+Byte-identical on every node.
+
+### P.14 Receipt Generation (`receipt.rs`)
+
+```rust
+pub fn generate_receipt(block: &Block, tx_body_hash: TxBodyHash) -> ParanoidReceipt
+pub fn verify_receipt_online(receipt: &ParanoidReceipt, node: &RpcClient) -> ReceiptResult
+pub fn verify_receipt_offline(receipt: &ParanoidReceipt) -> ReceiptResult
+```
+
+**Done when**: Receipts generated; verified correctly; reorged tx detected; headers stored forever.
+
+### P.15 Canonical Serialization (`serial.rs`)
+
+Goal: Byte-identical encoding across all architectures.
+
+Topics:
+- Endianness policy (little-endian everywhere)
+- Canonical integer encoding (fixed-width, no varint for consensus fields)
+- Digest serialization order
 - Transcript byte encoding
 - Network framing rules
-- Snapshot encoding
-- Deterministic hashing order
+- Snapshot encoding format
 
-Blocks:
-- Networking
-- Snapshots
-- External integrations
+**Done when**: Same input → same bytes on ARM, x86, WASM, RISC-V.
 
----
+### P.16 Fee Market & Resource Accounting
 
-## Phase 4 — Node Infrastructure (Stage N)
+Topics to design:
+- Fee dimensions: algebraic proving cost, DA byte cost, state growth
+- Tx pricing model: fixed vs dynamic, congestion adjustment
+- Spam resistance: mempool occupancy pricing, low-fee eviction
+- State slot lifecycle: permanent allocation economics
+- Miner incentives: reward structure
 
-**Goal:** Working Full Node binary — validates, assembles blocks, mines, serves wallet requests, syncs O(1).
+### P.17 Economic Attack Surface
 
-**Architectural Philosophy — NO ARCHIVE NODES:**
-Because Recursion (Phase 7) is complete, we do NOT implement historical block download from genesis. All nodes sync by verifying a RecursiveProof and downloading a state snapshot. DA payload is pruned immediately after block application. History does not exist in the network. Borrow architectural patterns from Reth (services), libp2p (networking), and Bitcoin Core (mining/sync).
+Topics to analyze:
+- Slot spam economics (partially addressed by anti-spam emission)
+- Prover centralization pressure
+- ASIC asymmetry under Blake3
+- DA flooding economics
+- State expansion griefing
+- Empty block incentives
+- Fee market manipulation
 
-### N.1 Node Binary Skeleton & Async Runtime
-Create `noid-node` binary crate. 
-- **Reference:** Reth `bin/reth` and `crates/node-builder`.
-- Async runtime (Tokio). CLI arguments via `clap`. Modular service architecture.
-- **Done when:** Binary starts, loads genesis, initializes Tokio tasks, shuts down cleanly.
+### P.18 Failure & Recovery Semantics
 
-### N.2 Block Storage (MDBX)
-- **Reference:** Reth `crates/storage/db` (MDBX wrapper).
-- Persist headers, ChainAccumulator, state, recent blocks. Prune DA payload.
-- **Done when:** Node can store/retrieve 1000 blocks; state survives process restart.
+Topics to define:
+- Crash consistency: atomic MDBX commit per block
+- Interrupted block application rollback
+- `accumulator/state_root/header` roll forward atomically
+- Recovery invariant: restart must never produce divergent `state_root`
+- Partial DA prune race conditions
+- State snapshot corruption handling
 
-### N.3 Mempool
-- **Reference:** Reth `crates/transaction-pool`.
-- UTXO slot conflict tracking (`spent_slots`, `minted_slots`), fee priority, eviction.
-- **Done when:** Accepts valid, rejects invalid, handles conflicts, evicts expired.
+### P.19 Recursive Failure Domains
 
-### N.4 Block Assembly Pipeline
-- Select txs -> `prove_block` -> `extend_accumulator` (Phase 7) -> construct header.
-- **Done when:** Produces valid candidate block + recursive proof from mempool txs.
-
-### N.5 Built-in Miner
-- **Reference:** Bitcoin Core miner logic.
-- Multi-threaded Blake3 nonce search. Interrupt on new P2P block.
-- **Done when:** Finds valid nonce, Full Node assembles and propagates.
-
-### N.6 Block Template API
-- **Reference:** Bitcoin Core `getblocktemplate` & Stratum V2.
-- Push 248-byte header to external miners. Empty-block fallback.
-- **Done when:** External mock miner solves nonce, Full Node accepts and propagates.
-
-### N.7 RPC API
-- **Reference:** Reth RPC (`jsonrpsee`).
-- Wallet endpoints: `get_slot`, `get_epoch_anchor`, `submit_tx_intent`.
-- Explorer endpoints: `get_block`, `get_header`, `get_chain_info`.
-- **Done when:** External client can query state and submit transactions.
-
-### N.8 P2P Networking (libp2p)
-- **Reference:** `rust-libp2p` (Substrate/Filecoin standard).
-- Gossipsub for `NewBlock` (header + RecursiveProof) and `NewTxIntent`.
-- Kademlia for DHT. Noise for encryption.
-- **Done when:** Two Full Nodes gossip transactions and sync a chain of 10 blocks.
-
-### N.9 O(1) Chain Sync (State Sync)
-**CRITICAL:** No history download from genesis.
-- **Reference:** Mina Protocol state sync.
-- Request `TipHeader + RecursiveProof + StateSnapshot` from peers.
-- Verify RecursiveProof against TipHeader (~300ms).
-- If valid, accept StateSnapshot. Apply recent blocks to catch up to absolute tip.
-- **Done when:** Fresh Full Node syncs from peer to tip in <1 minute without archive nodes.
-
-### N.11 Data Availability Retention Policy
-
-Goal: Define deterministic DA retention and pruning semantics.
-
-Topics to Design
-- Minimum DA retention window
-- Snapshot dependency guarantees
-- DA pruning schedule
-- Late sync recovery rules
-- Temporary archival semantics
-- DA replay protection
-
-Blocks:
-- Public testnet
-- Production deployment
-
-### N.10 Snapshot Format & State Sync Semantics
-
-Goal: Define deterministic, authenticated, resumable state snapshot synchronization.
-
-Topics to Design
-Snapshot serialization format
-Segment-wise snapshot hashing
-Snapshot chunking and resume
-Snapshot authentication against recursive accumulator
-Incremental catch-up after snapshot load
-Compatibility across protocol versions
-Snapshot pruning policy
-Security Requirements
-Snapshot must deterministically reconstruct identical state_root
-Partial corruption must be detectable
-Snapshot replay attacks must be impossible
-Dependency
-
-Requires:
-
-Phase 3 segmented state
-Phase 7 recursive accumulator
-
-### N.10b Snapshot Commitment Format
-
-Goal: Define authenticated snapshot transport and verification.
-
-Topics to Design
-- Snapshot chunk commitments
-- Segment authentication
-- Incremental snapshot verification
-- Resumable sync proofs
-- Snapshot replay prevention
-- Version compatibility
-
-Dependency
-
-Requires:
-- Segmented state
-- Recursive accumulator
+Topics:
+- Recursive prover backlog thresholds
+- Accumulator corruption recovery
+- Fallback validation mode (skip recursive proof if prover is behind)
+- Delayed recursive finalization semantics
 
 ---
 
-## Phase 5 — Wallet Core (Stage W)
+## Phase 1.5 — Pre-Proving Optimization (CORE — implement with mempool)
 
-**Goal:** Wallet logic shared by Full Node (built-in) and Light Node (standalone CLI).
+**Goal**: Reduce `prove_block` latency by pre-computing per-tx proofs as they arrive.
 
-### W.1 Key Management
-- Generate SpendSecret, derive Address. Encrypted keystore (`argon2 + chacha20-poly1305`).
-- **Done when:** Generate, export, import keys.
+**This is not optional** — it's the architecture that makes 1024-tx blocks viable without increasing block time.
 
-### W.2 Slot Tracking
-- Full Node mode: scan own state directly. Light Node mode: subscribe via RPC.
-- **Done when:** Balance updates on new blocks in both modes.
+### Protocol Change: New Seed Scheme
 
-### W.3 Transaction Construction
-- Coin selection, TxBody, C_claimed.
-- **Done when:** Produces valid TxBody from wallet state.
+**Old** (current): `H(prev_state_root || cap || tx_index)` — depends on block-specific cap, can't pre-compute  
+**New**: `H(tx_body_hash || "paranoid-pretx-v1")` — depends only on tx content, pre-computable
 
-### W.4 LogicProof Generation
-- Build witness -> `prove_logic()` (~300-400ms) -> TxIntent.
-- **Done when:** Locally generated TxIntent verifies.
+**Security argument**:
+- AlgebraicStarkProof proves tx logic only (balance, auth_tag, format) — not state transitions
+- Proof is bound to tx content via trace columns → `cap` provides block-level binding at Stage 6
+- Replay across blocks: impossible — different tx set → different `cap` → different block-level challenges
+- Replay across forks: nullifier set handles this at consensus level
+- `prev_state_root` in seed was redundant — `cap` already provides block-specificity
 
-### W.5 Submit & Confirm
-- Full Node: inject directly. Light Node: submit via RPC.
-- **Done when:** End-to-end send from wallet A to wallet B.
+### Orphan Block Handling
 
-### W.6 Light Node CLI Binary
-- `noid-light` binary. O(1) sync via RecursiveProof.
-- Commands: `balance`, `send`, `receive`, `history`.
-- **Done when:** Light Node sends coins to Full Node and vice versa.
+When another node finds a block first:
+
+```
+MEMPOOL STATE: 1000 txs, all pre-proved
+
+Receive foreign block (contains 200 of our txs):
+  1. apply_block(): update state, add to nullifiers
+  2. mempool.on_block(confirmed_hashes):
+     a. Remove 200 confirmed txs from pool → their proofs discarded
+     b. 800 remaining txs: pre-proved proofs STILL VALID (no state_root dependency)
+     c. SpineMleAccumulator.remove_txs(200_confirmed)
+        → O(200 * 59) = O(11800) ops
+
+Build next block:
+  800 txs with ready proofs + new arrivals
+  Proving time: ~11s instead of ~44s
+  
+  Even if 100% orphan (0 overlap):
+  Next block: 1000 surviving txs with valid proofs → ~11s
+```
+
+### Implementation
+
+**MempoolEntry** stores cached proof:
+```rust
+pub struct MempoolEntry {
+    pub intent:         TxIntent,
+    pub cached_proof:   Arc<RwLock<Option<CachedAlgebraicProof>>>,
+    pub spine_state_in: Vec<[Block128; 4]>,  // 59 slots for SpineMLE
+    pub fee_rate:       u64,
+}
+```
+
+**On admission** (after verify_logic passes):
+```rust
+// Spawn background pre-proving
+let handle = tokio::task::spawn_blocking(move || {
+    let ch = pre_tx_channel(&tx_body_hash);
+    prove_air_algebraic_with_channel(air, &trace, &pi, ch)
+});
+entry.cached_proof.set_pending(handle);
+```
+
+**SpineMleAccumulator**:
+```rust
+pub struct SpineMleAccumulator {
+    slots: Vec<[Block128; 4]>,  // collected slot_state_in vectors
+    index: HashMap<TxBodyHash, usize>,  // tx → slot range
+}
+
+impl SpineMleAccumulator {
+    pub fn add_tx(&mut self, hash: TxBodyHash, state_ins: &[[Block128; 4]; N_SPINE_SLOTS])
+    pub fn remove_txs(&mut self, hashes: &[TxBodyHash])  // on block confirmed
+    pub fn build_mle(&self, selected: &[TxBodyHash]) -> BlockSpineMle
+}
+```
+
+**prove_block modification**:
+```rust
+// For each tx: use cached proof if available, otherwise prove on-the-fly
+let tx_proofs: Vec<AlgebraicStarkProof> = selected_txs.par_iter().map(|tx| {
+    if let Some(proof) = tx.cached_proof.get_ready() {
+        proof  // O(0) — already done
+    } else {
+        prove_air_algebraic_pretx(tx)  // O(100ms) — rare, tx just arrived
+    }
+}).collect();
+```
+
+**Estimated impact** for 1024 txs:
+```
+SEQUENTIAL (current):    ~44s
+With pre-proving:        ~12s (GKR 10s + per-tx 0s + MLE 1s + FRI 1s)
+With parallel PoW:   max(12s, 60s) = 60s  ← PoW bottleneck, not proving
+```
+
+**Done when**: 1024-tx block prove < 15s; orphan block handling correct; no proof reuse across blocks.
 
 ---
 
-## Phase 6 — Integration & Testnet (Stage T)
+## Phase 2 — Persistent Storage
 
-**Goal:** Multi-node network running real consensus with O(1) sync.
+Reference: Reth `crates/storage/db` (MDBX), Erigon database layout.
 
-### T.1 Multi-Node Test Harness
-- Spawn 3-5 nodes locally. Verify O(1) sync and block propagation.
-- **Done when:** 3 nodes agree on 50-block chain.
+### MDBX Backend (`noid_chain/src/storage/mdbx.rs`)
 
-### T.2 Adversarial Testing
-- Invalid PoW/Proofs, double-spends, forks, timestamp manipulation.
-- **Done when:** All attack vectors handled.
+**Database tables**:
 
-### T.3 Performance Validation
-- Block time ~60s. Prove <10s. Verify <3s. O(1) sync <300ms.
-- **Done when:** Sustained block production for 1 hour.
+```
+headers           : height:u64 → BlockHeader bytes (276B, FOREVER)
+header_by_hash    : [u8;32]    → height:u64
+chain_tips        : "best"     → (height, hash)
+state_segments    : (seg_id, local_idx) → SlotValue (48B, FOREVER)
+nullifiers        : TxBodyHash → block_height:u64
+alloc_counter     : "current"  → u64
+active_slot_count : "current"  → u64
+recursive_proof   : "tip"      → RecursiveBlockProof bytes (6.5 KB, FOREVER)
+undo_logs         : height:u64 → BlockUndoLog (last 6 blocks, then delete)
+recent_blocks     : height:u64 → (Block bytes, BlockProof bytes)  [for peers, optional 18 blocks]
+```
 
-### T.4 Reorg Handling
-- Fork resolution. Revert mempool.
-- **Done when:** Handles 1-3 block reorgs gracefully.
+Note: DA (full BlockProof + PackedWitness) deleted immediately after `apply_block`. `recent_blocks` kept for at most 18 blocks to help peers sync.
 
-### T.5 Public Testnet Launch
-- Docker image, seed nodes, faucet, explorer.
-- **Done when:** External parties can run nodes and send transactions.
+**Done when**: Crash-safe; state survives SIGKILL; DA pruned immediately; headers always available.
 
-### T.6 Audit Preparation & Formalization
+### Storage Trait
 
-Goal: Prepare the protocol for external cryptographic and consensus audits.
-
-Topics to Design
-- Formal invariant registry
-- Cryptographic assumption registry
-- Proof obligation index
-- Reproducible benchmark suite
-- Deterministic test vectors
-- Consensus failure taxonomy
-
-Dependency
-
-Requires:
-- Consensus complete
-- Recursive pipeline complete
+```rust
+pub trait BlockStore: HeaderProvider + StateProvider + NullifierProvider {
+    fn put_block(&mut self, block: &Block, proof: &BlockProof) -> Result<()>;
+    fn get_header(&self, height: u64) -> Option<BlockHeader>;     // ALWAYS available
+    fn get_recent_block(&self, height: u64) -> Option<Block>;     // None if pruned (>18 blocks)
+    fn best_tip(&self) -> (u64, [u8;32]);
+    fn get_state(&self) -> &SegmentedFriState;
+    fn get_recursive_proof(&self) -> Option<RecursiveBlockProof>;
+}
+```
 
 ---
 
-## Phase 8 — Optimizations (Stage K)
+## Phase 3 — Node Infrastructure
+
+**TODO Phase 3**: Extract consensus provider traits into a `noid_consensus` crate.
+Currently `validate_block_consensus()` and all consensus functions live in `noid_chain`.
+When P2P, mempool, and RPC all need to import consensus rules from different crates,
+create `noid_consensus` with `HeaderProvider`, `NullifierProvider`, `StateProvider` traits
+and move `noid_chain::consensus::*` there. `noid_chain` becomes a dependency of `noid_consensus`.
+
+### Mempool (`noid_mempool/`)
+
+Reference: Reth `crates/transaction-pool`.
+
+**Admission pipeline** (cheapest checks first):
+1. `tx_limits`: MAX_INPUTS, MAX_OUTPUTS, fee ≥ min_relay_fee
+2. `epoch_anchor` in valid window
+3. Nullifier check (no double-spend)
+4. Slot conflict check (no conflict within mempool)
+5. `verify_logic(...)` — O(84ms), ZK verification last
+
+**Template refresh**: Every 15s OR 100+ new txs OR new P2P block.
+
+**Pre-prove hook** (Phase 1.5): On tx admission, spawn background `pre_prove_tx` task.
+
+### Mining Engine (`noid_miner/`)
+
+**Pipeline (parallel proving + PoW)**:
+
+```rust
+loop {
+    let template = node.get_template();
+
+    // Spawn proving in background
+    let prove_handle = tokio::task::spawn_blocking(|| prove_block(&template.witnesses));
+
+    // Simultaneously search PoW over header_core (without proof_transcript_hash)
+    let pow_handle = spawn_pow_search(template.header_core.clone(), threads);
+
+    // Wait for BOTH to complete
+    let (proof, nonce) = tokio::join!(prove_handle, pow_handle);
+
+    // Assemble final block
+    let proof_hash = proof_transcript_hash(&proof);
+    let full_header = template.header_core.with_proof_hash(proof_hash).with_nonce(nonce);
+    let block = Block { header: full_header, /* ... */ };
+
+    node.submit_and_broadcast(block, proof).await;
+}
+```
+
+**PoW search**: Blake3 over `header_core || nonce`, parallel threads, interrupt on solution.
+
+**Done when**: Solo mining works; parallel proving + PoW verified; ASERT adapts correctly to prove time.
+
+### P2P Networking (`noid_p2p/`)
+
+Reference: `rust-libp2p`.
+
+**Protocol**: `/paranoid/1.0.0`
+
+```
+Requests:
+  GetHeaders { start: u64, count: u16 } → Vec<BlockHeader>   // headers forever
+  GetRecentBlock { height: u64 }        → Option<Block>       // only last 18 blocks
+  GetState {}                           → StateSnapshot        // current state
+  GetRecursiveProof {}                  → RecursiveBlockProof  // 6.5 KB
+
+GossipSub topics:
+  /paranoid/blocks/1  — New full blocks (header + proof)
+  /paranoid/txs/1     — New TxIntents
+```
+
+**O(1) sync (no history download)**:
+```
+1. Get RecursiveBlockProof (6.5 KB) + tip BlockHeader from peer
+2. verify_tip(proof, header) → 5 ms
+3. Get StateSnapshot from peer + verify state.root() == header.state_root
+4. Apply recent blocks (last 18) to catch up
+5. Done. Full node in < 60 seconds.
+```
+
+**Done when**: Two nodes sync and reach consensus; tx/block broadcast < 1s.
+
+### RPC API (`noid_rpc/`)
+
+Reference: `jsonrpsee`.
+
+```
+ALWAYS AVAILABLE:
+  paranoid_blockCount
+  paranoid_getHeaderByHeight(h)      → BlockHeader   (stored forever)
+  paranoid_getHeaderByHash(hash)     → BlockHeader
+  paranoid_getRecursiveProof         → RecursiveBlockProof (6.5 KB)
+  paranoid_getSlot(slot_index)       → { value, owner } | EMPTY
+  paranoid_getActiveSlotCount        → u64
+  paranoid_getChainInfo              → { height, best_hash, target, active_slots }
+
+ONLY WITHIN RECENT 18 BLOCKS:
+  paranoid_getBlock(height)          → Block | null
+
+WALLET SUPPORT:
+  paranoid_getSlotHints(count)       → Vec<u32>    (free slot indices)
+  paranoid_getEpochAnchor            → Digest
+  paranoid_submitTxIntent(hex)       → TxBodyHash | Error
+
+RECEIPT:
+  paranoid_verifyReceipt(receipt)    → ReceiptVerifyResult
+  // Checks: Merkle inclusion + header.tx_root matches claimed_root
+
+MINING:
+  paranoid_getBlockTemplate(addr)    → { header_core, witnesses }
+  paranoid_submitBlock(block_hex)    → BlockHash | Error
+
+WEBSOCKET:
+  paranoid_subscribe("newBlock")     → stream BlockHeader
+  paranoid_subscribe("txConfirmed", hash) → fires when tx in block
+```
+
+### Node Binary (`noid_node/`)
+
+```toml
+[network]
+listen = "/ip4/0.0.0.0/tcp/8333"
+seeds = ["seed1.paranoid.network"]
+max_peers = 50
+
+[storage]
+backend = "mdbx"
+path = "~/.paranoid/data"
+
+[rpc]
+listen = "127.0.0.1:8332"
+
+[mining]
+enabled = false
+threads = 0       # 0 = all cores
+miner_address = "..."
+```
+
+**Startup**: Load config → Open MDBX → Prune old UndoLogs → Start P2P → O(1) sync → Start mempool → Start RPC → (if --mine) Start miner → Background recursive proof updater.
+
+---
+
+## Phase 4 — Wallet Core
+
+### Key Management (`noid_wallet/`)
+
+```rust
+pub struct Keystore { master_secret: SpendSecret }
+
+impl Keystore {
+    pub fn generate(password: &str) -> (Self, PathBuf)
+    pub fn load(path: &Path, password: &str) -> Result<Self>
+    pub fn derive_address(&self, index: u32) -> (SpendSecret, Address)
+}
+```
+
+Encryption: `Argon2id(password)` → `ChaCha20-Poly1305(master_secret)`.
+
+### UTXO Scanner
+
+```rust
+impl Scanner {
+    pub fn process_block(&mut self, block: &Block) // Full node mode
+    pub async fn sync_from_rpc(&mut self, rpc: &RpcClient) // Light mode
+}
+```
+
+Generates `ParanoidReceipt` for each confirmed tx touching owned slots.
+
+### Transaction Builder
+
+```
+1. Coin selection (BnB algorithm reference: Bitcoin Core)
+2. GET paranoid_getSlotHints(n_outputs) → free slot indices
+3. Build TxBody + compute auth_tags
+4. prove_logic(witness) → LogicProof (~156ms)
+5. Submit via RPC or directly to mempool
+```
+
+### Receipt Management
+
+```rust
+pub fn export_receipt(history: &WalletHistory, tx_hash: TxBodyHash) -> Vec<u8>
+pub fn verify_receipt_online(receipt: &ParanoidReceipt, rpc: &RpcClient) -> ReceiptResult
+```
+
+### CLI (`noid_cli/`)
+
+```
+noid wallet init               — Generate wallet file
+noid wallet address [--index N]
+noid wallet balance
+noid wallet send <addr> <amount> [--fee N]
+noid wallet history
+noid wallet receipt <txhash>   — Export .paranoid-receipt file
+noid wallet verify <file>      — Verify receipt (online)
+
+noid node start [--mine]
+noid node status
+```
+
+---
+
+## Phase 5 — Integration Testing
+
+### Multi-Node Harness
+
+```rust
+let net = TestNetwork::new(5);
+net.mine_blocks(20);
+net.submit_tx(alice, bob, 10_NOID);
+net.mine_blocks(1);
+assert!(net.all_agree_on_state_root());
+assert_eq!(net.get_balance(bob), 10_NOID);
+```
+
+### Adversarial Scenarios
+
+- Invalid PoW → rejected
+- Invalid BlockProof → rejected  
+- Double-spend → rejected
+- Timestamp manipulation → rejected
+- Over-claimed coinbase → rejected
+- Slot spam to inflate reward → reward decreases → not profitable
+- Reorg 1-3 blocks → handled via UndoLogs
+- Fork at depth 19 → rejected (finality)
+- DA deletion: headers always available; blocks unavailable after 18 blocks ✓
+
+### Performance Targets
+
+```
+Block prove (100 txs, 8 cores):  < 60s total (prove ~10s + PoW ~50s)
+Block prove (1024 txs, 8 cores): < 120s total (prove ~100s + PoW ~1s)
+Block validate (100 txs):        < 5s
+O(1) sync (fresh node):          < 30s (state snapshot, ~3 GB at log_slots=26)
+Receipt verify (online):         < 200ms
+Wallet send:                     < 500ms (156ms proof + network)
+```
+
+### DA Pruning Correctness
+
+- Headers retrievable at any height ✓
+- State always current ✓
+- BlockProof and DA deleted immediately ✓
+- Reorg works via UndoLog ✓
+- Node restart: identical state_root ✓
+
+---
+
+## Phase 6 — Devnet
+
+### Genesis Configuration
+
+```rust
+DEVNET_TARGET = 2^252   // trivial PoW — instant mining
+DEVNET_LOG_SLOTS = 20   // 1M slots (smaller for devnet)
+```
+
+### Seed Infrastructure
+
+- 3 seed nodes, DNS: `devnet-seed.paranoid.network`
+- Faucet: `POST /faucet/{address}` → 100 NOID
+
+### Receipt Verifier Web App
+
+```
+URL: receipt.paranoid.network
+
+Upload: .paranoid-receipt file
+Result: 
+  ✅ CONFIRMED: Alice sent 10.500000 NOID to Bob
+     Block 12345 | 2026-05-31 14:32:05 UTC
+     Merkle: ✓  |  Canonical chain: ✓
+
+  ❌ REORGED: This block was reorganized. Transaction invalid.
+```
+
+No blockchain explorer. No address lookup. No surveillance.
+
+### Devnet Wallet App (Tauri)
+
+- Full node integrated (runs `noid_node` in background)
+- Wallet: generate, send, receive, history, export receipts
+- Mining button (--mine)
+- Node status panel
+
+---
+
+## Phase 7 — Testnet
+
+### Testnet Genesis
+
+```
+TESTNET_TARGET  = 2^240   // ~65K expected hashes
+BLOCK_TIME      = 60s
+INITIAL_REWARD  = 50 NOID (at 0 active slots)
+```
+
+### Security Hardening
+
+- External audit: ZK engine + consensus
+- Fuzzing: P2P messages, block deserialization, mempool admission
+- Dependency audit
+
+### Success Criteria
+
+- [ ] 10,000+ blocks without incident
+- [ ] 50+ independent nodes
+- [ ] Reorg recovery in production
+- [ ] O(1) sync: 0 → 10,000 blocks
+- [ ] Wallet send-receive-receipt end-to-end
+- [ ] DA deletion verified (no history accumulation)
+- [ ] Receipt verification tested (online + offline)
+- [ ] 30-day window with no consensus bugs
+
+---
+
+## Phase 8 — Mainnet
+
+### Genesis Ceremony
+
+- Parameters published 72h in advance
+- Any node can participate from block 1
+- `MAINNET_TARGET = 2^235`, `LOG_SLOTS = 24`
+
+---
+
+## Phase 9 — Optimizations (Stage K)
 
 ### K.1 Reduced Inner Queries
-- NUM_QUERIES=16 for block-internal proofs.
+
+Profile and reduce FRI inner query count for block-internal proofs (not wallet proofs). Target: `NUM_INNER_QUERIES = 16` for block prove path, `64` for LogicProof (wallet security unchanged).
 
 ### K.2 Parallel Recursive Prover
-- Partition trace across 8 cores.
 
-### K.3 MDBX Storage Backend
-- `MdbxBackend` for large states (log_slots > 26).
+Partition recursive AIR trace across cores. Target: `prove_recursive_step` < 10ms.
+
+### K.3 MDBX Zero-Copy Reads
+
+`MdbxBackend` returns `SegmentView<'txn>` (mmap slice) instead of `Vec<Block128>`. Eliminates memcpy for state reads. Critical for `log_slots > 26`.
 
 ### K.4 Proof Compression
-- Delta-encode FRI paths.
+
+Delta-encode FRI Merkle paths. Estimated 20-30% proof size reduction for BlockProof.
 
 ---
 
-## Phase 9 — GUI Wallet (Stage G)
+## Phase 10 — GUI Wallet (Stage G)
 
-**Goal:** Desktop application (Tauri/egui). Light or Full mode.
+### G.1 Framework: Tauri + Web UI
+Rust backend (`noid_node` + `noid_wallet`), HTML/CSS/JS frontend.
 
-### G.1 GUI Framework
-### G.2 Mode Selection
+### G.2 Modes
+- **Full Node** (default): integrated node + optional mining
+- **Light Mode**: connects to remote RPC
+
 ### G.3 Wallet UI
+- Balance display
+- Send / Receive
+- Transaction history
+- Receipt export (QR code + file)
+- Receipt verify
+
 ### G.4 Full Node Controls
+- Sync progress
+- Peer count
+- Mining toggle + hashrate
+- Block height + network stats
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 1 (Stateless) — DONE
+Phase S (Stateless)    ✅ DONE
     │
     ▼
-Phase 1.5 (Parallel STARK)
+Phase Q (Parallel STARK) ✅ DONE
     │
     ▼
-Phase 3 (Segmented State) ─── MUST lock state format before recursion
+Phase F (Segmented State) ✅ DONE ─── locked state format before recursion
     │
     ▼
-Phase 7 (Recursive Chain) ─── O(1) sync foundation, no archive nodes
+Phase H (Recursive Chain) ✅ DONE ─── O(1) sync foundation
     │
     ▼
-Phase 2 (Consensus) ────────── Uses RecursiveProofs for fast validation
+Phase 1 (Consensus)  ─────────────── uses RecursiveProofs for fast validation
+    │
+    ├── Phase 1.5 (Pre-Proving) ────── parallelizes mempool proving
     │
     ▼
-Phase 4 (Node) ─────────────── No O(N) sync, pure O(1) State Sync
+Phase 2 (Storage: MDBX)
     │
     ▼
-Phase 5 (Wallet) ───────────── Uses O(1) sync
+Phase 3 (Node: Mempool + Miner + P2P + RPC)
     │
     ▼
-Phase 6 (Testnet)
-
-Phase 8 (Optimizations) — Post-testnet
-Phase 9 (GUI) — Post-testnet
+Phase 4 (Wallet Core)
+    │
+    ▼
+Phase 5 (Integration Tests)
+    │
+    ▼
+Phase 6 (Devnet)
+    │
+    ▼
+Phase 7 (Testnet + Audits)
+    │
+    ▼
+Phase 8 (Mainnet)
+    │
+    ▼
+Phase 9 (Optimizations) — post-mainnet
+Phase 10 (GUI Wallet) — overlaps Testnet
 ```
 
-Critical path: **S → Q → F → H → P → N → T**.
+Critical path: **S → Q → F → H → P1 → P2 → P3 → Testnet → Mainnet**
 
 ---
 
-## Design Invariants (Non-Negotiable)
+## Design Invariants (Final)
 
-1. **No trusted setup.** No elliptic curves. Post-quantum.
-2. **Single algebraic universe.** Everything is GF(2^128) — from tx to recursion.
-3. **Proof-native.** Network does not execute code. It verifies mathematics.
-4. **Transparent.** All values on-chain. No zero-knowledge.
-5. **PoW for ordering only.** Blake3 determines canonical chain. Proofs determine validity.
-6. **Light Nodes prove logic, Full Nodes prove state.** External miners only provide PoW ordering.
-7. **O(1) history.** Recursive chain compresses unbounded history into one proof.
-8. **128-bit security.** Every component: FRI, GKR, Fiat-Shamir, PoW hash.
-9. **Deterministic consensus.** Byte-identical state_root across all honest nodes.
-10. **Fixed-slot UTXO.** No hash-map, no dynamic structures. Slots addressed by index.
+1. **No archive nodes.** History does not exist. DA deleted immediately.
+2. **No blockchain explorer.** Receipts prove specific transactions. Not surveillance tools.
+3. **Proof-native.** Block without valid ZK proof = INVALID. Period.
+4. **Parallel PoW + Prove.** PoW over `header_core` (no `proof_transcript_hash`). Prove in parallel. ASERT handles timing.
+5. **Transparent.** All values on-chain.
+6. **PoW = spam protection + ordering.** ZK proofs = correctness.
+7. **Post-quantum by architecture.** No signatures, no elliptic curves.
+8. **Full node scales with usage.** ~3 GB at genesis (log_slots=24), grows as network expands (max log_slots=32 → ~192 GB). Headers and recursive proof stay constant.
+9. **O(1) sync.** 6.5 KB + 5 ms = verified entire history.
+10. **Anti-spam emission.** More slots → lower reward. Spam hurts spammer.
+11. **Receipts replace explorers.** Prove your tx. Don't surveil others.
+12. **GF(2^128) everywhere.** One algebraic universe.
+13. **128-bit security** on all components.
+14. **Deterministic consensus.** Byte-identical `state_root` everywhere.
+15. **Atomic state updates.** One MDBX transaction per block. No partial state.
 
----
-
-## Proof Architecture (Current: Stage S, Target: Stage Q)
-
-### Current (Stage S — implemented)
-```
-  LogicProof generation (200-300ms, runs on any node with wallet)
-  ┌──────────────────────────────────────────┐
-  │  AuthGKR Kill-Shot (20 perms, 14-var)    │
-  │  STARK + FRI-Binius over TxLogicAir      │
-  │  Output: LogicProof (~36 KB)             │
-  │                                          │
-  │  SpineGKR is NOT in LogicProof.          │
-  │  tx_body_hash is native-computed and     │
-  │  pinned via PublicColumn in STARK trace. │
-  │  GKR proof of correctness is deferred    │
-  │  to block-prover (below).                │
-  │                                          │
-  │  Runs on: Full Node (built-in wallet)    │
-  │           Light Node (standalone wallet)  │
-  └──────────────────────────────────────────┘
-           │ TxIntent (to own mempool or via RPC)
-           ▼
-  Full Node — Block Assembly (current: ~43s sequential)
-  ┌──────────────────────────────────────────┐
-  │  Collect TxIntents from mempool          │
-  │  Verify N LogicProofs                    │
-  │  Unified block SpineGKR Kill-Shot        │
-  │    (N×59 perms, public SpineInputs only) │
-  │  Build BlockStateBinding                 │
-  │    - FRI state openings (gamma-RLC)      │
-  │    - Segment Merkle paths                │
-  │    - MerkleGKR Kill-Shot (32-slot, 14v)  │
-  │    - Bridge check (C_claimed match)      │
-  │  Per-tx algebraic STARKs (SEQUENTIAL —   │
-  │    shared block channel, ~43s at 100 tx) │
-  │  Block-level multipoint sumcheck         │
-  │  Single FRI-Binius opening               │
-  │  Output: BlockProof ~2 MB (100 tx)       │
-  └──────────────────────────────────────────┘
-           │ PoW (built-in miner OR Block Template API)
-           ▼
-```
-
-### Target (After Stage Q — parallel per-tx STARK)
-```
-
-  LogicProof generation: unchanged from Stage S (~200-300ms, ~36 KB)
-
-  Full Node — Block Assembly (target: <8s CPU on 8 cores for 100 tx)
-  ┌──────────────────────────────────────────┐
-  │  Collect TxIntents from mempool          │
-  │  Verify N LogicProofs                    │
-  │  Unified block SpineGKR Kill-Shot        │
-  │  Build BlockStateBinding                 │
-  │  Parallel per-tx algebraic STARKs        │
-  │    - Independent channels: H(root,cap,k) │
-  │    - N zero-checks on N cores (rayon)    │
-  │  Block-level multipoint sumcheck         │
-  │  Single FRI-Binius opening               │
-  │  Output: BlockProof ~2 MB (100 tx)       │
-  └──────────────────────────────────────────┘
-           │ PoW (built-in miner OR Block Template API)
-           ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │  Built-in miner          │  External Miner (3rd party)      │
-  │  - Multi-thread Blake3   │  - Receives 248-byte header      │
-  │  - Same process          │  - GPU/ASIC/pool                 │
-  │  - Config: mining=on     │  - Returns valid nonce           │
-  │                          │  - Cannot modify block content   │
-  └─────────────────────────────────────────────────────────────┘
-           │ Valid nonce found
-           ▼
-  Full Node — Propagation
-  ┌──────────────────────────────────────────┐
-  │  Attach nonce → complete block           │
-  │  Propagate to P2P network                │
-  │  Other Full Nodes validate + apply       │
-  └──────────────────────────────────────────┘
-           │ Block (P2P)
-           ▼
-  Recursive Accumulator (per-block, ~3-5s, Phase 7)
-  ┌──────────────────────────────────────────┐
-  │  Algebraic replay of BlockProof verify   │
-  │  Fiat-Shamir sponge in-circuit           │
-  │  FS Kill-Shot (300 perms, 18-var)        │
-  │  Deferred-FRI Merkle commitment          │
-  │  State continuity gate                   │
-  │  Output: RecursiveProof (~55 KB)         │
-  └──────────────────────────────────────────┘
-           │
-           ▼
-  Tip Verification (Light Node or any verifier, ~230ms, O(1))
-  ┌──────────────────────────────────────────┐
-  │  Verify RecursiveProof (STARK)           │
-  │  Check deferred Merkle at tip            │
-  │  Result: entire history correct           │
-  └──────────────────────────────────────────┘
-```
 ---
 
 ## Soundness Summary
 
 | Component | Security | Mechanism |
 |---|---|---|
-| FRI-Binius | 128-bit | 64 queries x 2-bit rate |
+| FRI-Binius | 128-bit | 64 queries × 2-bit rate |
 | Blake3 Merkle | 128-bit | collision resistance |
 | Gamma batching | 128-bit | Horner RLC over GF(2^128) |
-| SpineGKR | 128-bit | Schwartz-Zippel, 15-var |
-| AuthGKR | 128-bit | Schwartz-Zippel, 14-var |
-| MerkleGKR | 128-bit | Schwartz-Zippel, 14-var |
+| SpineGKR (N×59) | 128-bit | Schwartz-Zippel, dynamic-var |
+| AuthGKR (20 slots) | 128-bit | Schwartz-Zippel, 14-var |
+| MerkleGKR (32 slots) | 128-bit | Schwartz-Zippel, 14-var |
 | Batch-eval | 128-bit | degree-2 sumcheck + RLC |
 | Fiat-Shamir | collision-resistant | Poseidon2b sponge |
-| Parallel per-tx STARK | 128-bit | non-adaptive: cap-derived seeds, committed witness |
-| PoW | ordering-only | Blake3 + ASERT DAA |
-| Recursion | 128-bit | native field (no foreign-field penalty) |
+| Parallel per-tx STARK | 128-bit | non-adaptive: cap-derived seeds |
+| Parallel PoW | ordering-only | Blake3 + ASERT DAA |
+| Recursion | 128-bit | native GF(2^128) field |
+| Receipt (Merkle) | 128-bit | collision resistance on tx_root |
+| Receipt (canonical) | 128-bit | PoW + live header chain |
 
 No trusted setup. No elliptic curves. Post-quantum.
 
-### Appendix A — Transcript & Fiat-Shamir Architecture
+---
 
-Goal: Formalize all transcript domains, challenge derivation rules, domain separation constants, and transcript binding invariants.
+## Appendix A — Transcript & Fiat-Shamir Architecture
 
-Topics to Specify
-Global transcript hierarchy
-Per-stage domain separation
-Recursive transcript replay rules
-Commitment-before-challenge invariants
-Segment transcript reduction semantics
-Query ordering rules
-Versioning strategy
-Cross-protocol collision prevention
-Required Outputs
-Complete transcript state machine
-Domain tag registry
-Formal challenge derivation specification
-Recursive replay compatibility rules
-Dependency
+Goal: Formalize all transcript domains, challenge derivation, domain separation constants.
 
-Required before:
+**Domain tag registry**:
+```rust
+TAG_TX_ALGEBRAIC   = 0x5458_414C_4745_4252_4149_4332_3032_3600  // "TXALGEBR AIC2026"
+TAG_STATE_BINDING  = 0x5354_4154_4542_494E_4449_4E47_3230_3236  // "STATEBINDING2026"
+TAG_BLOCK_MULTIPT  = 0x424C_4F43_4B4D_554C_5449_504F_494E_5400  // "BLOCKMULTIPOINT\0"
+TAG_PRE_PROVE      = 0x5052455F50524F56455F563100000000000000  // "PRE_PROVE_V1"
+PROTOCOL_VERSION   = 1
+```
 
-Phase 7 recursion
+**Challenge derivation** (in order for per-tx STARK):
+```
+ch = Channel::new()
+ch.observe(TAG_TX_ALGEBRAIC)
+ch.observe(PROTOCOL_VERSION)
+ch.observe(prev_state_root_hi, prev_state_root_lo)
+absorb_cap(ch, cap)
+ch.observe(tx_index)
+```
 
+**Invariants**:
+- All channels start fresh (no inherited state from other channels)
+- `cap` absorbed AFTER all columns committed (Commit-then-Challenge)
+- `tx_index` prevents cross-tx reuse
+- Stage 6 channel seeded AFTER Stage 5 outputs committed (Merkle reduce)
+- Recursive replay uses deterministic transcript reconstruction
 
-### Appendix A.1 — Transcript State Machine
-
-Goal: Freeze the global Fiat-Shamir architecture before recursion.
-
-Topics to Design
-- Transcript ownership rules
-- Absorb/squeeze ordering invariants
-- Transcript serialization format
-- Cross-stage domain separation
-- Recursive replay transcript semantics
-- Streaming transcript reduction
+**Topics pending formal spec**:
+- Streaming transcript reduction semantics
+- Cross-protocol collision prevention proof
 - Version migration policy
-
-Blocks:
-- Phase 7 recursion
+- Recursive replay compatibility guarantees

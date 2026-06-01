@@ -16,8 +16,7 @@
 //! reference the prover uses to compute the post-root that the STARK
 //! then proves through §FriStateOpen.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 
 use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
@@ -31,17 +30,13 @@ use crate::segmented_state::SegmentedFriState;
 /// Stage E.1: the wallet picks each output's `slot_index` and binds
 /// it into the body hash. The chain is no longer an allocator — it
 /// only *verifies* that the chosen slot is currently empty and that
-/// the outputs of a single tx don't collide. `free_slots` and
-/// `alloc_counter` are retained for occupancy tracking and as hints
-/// the wallet can consult off-chain; they do not influence the
-/// outcome of `apply_tx` beyond the free-list pop on a spend.
+/// the outputs of a single tx don't collide. `alloc_counter` is
+/// retained as a seed for the splitmix64-based wallet hint generator
+/// (SPECIFICATION.md §15.1); it does not influence `apply_tx` outcomes.
 #[derive(Debug, Clone)]
 pub struct ChainState {
     /// Segmented FRI-committed UTXO state (replaces the old monolithic `FriState`).
     pub state: SegmentedFriState,
-    /// Previously-spent indices available for reuse. Min-heap so the
-    /// lowest free index is allocated first (deterministic).
-    pub free_slots: BinaryHeap<Reverse<u32>>,
     /// Number of live (non-empty) slots. Grows on activation, shrinks
     /// on deactivation. This is the consensus-significant occupancy
     /// signal for the `log_slots` expansion trigger (see
@@ -64,7 +59,6 @@ impl ChainState {
     pub fn with_log_slots(log_slots: usize) -> Self {
         Self {
             state: SegmentedFriState::new_empty(log_slots),
-            free_slots: BinaryHeap::new(),
             active_slot_count: 0,
             alloc_counter: 0,
         }
@@ -184,7 +178,6 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
         .state
         .set_slot(input.slot_index, SlotValue::EMPTY)
         .expect("bounds checked above");
-    state.free_slots.push(Reverse(input.slot_index));
     state.active_slot_count = state
         .active_slot_count
         .checked_sub(1)
@@ -212,17 +205,6 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
         .state
         .set_slot(idx, slot)
         .expect("bounds checked above");
-    // Bookkeeping: if the wallet picked a previously-spent slot, drop
-    // the matching entry from `free_slots` so it is not re-offered as
-    // a hint. The heap is small so a linear drain-and-rebuild is fine.
-    if state.free_slots.iter().any(|Reverse(s)| *s == idx) {
-        let remaining: Vec<Reverse<u32>> = state
-            .free_slots
-            .drain()
-            .filter(|Reverse(s)| *s != idx)
-            .collect();
-        state.free_slots = remaining.into_iter().collect();
-    }
     state.active_slot_count += 1;
     state.alloc_counter += 1;
     Ok(())
@@ -290,7 +272,6 @@ mod tests {
         let body = body_with(0, vec![], vec![mk_output(1), mk_output(2)]);
         let out = apply_tx(&mut state, &body).expect("apply");
         assert_eq!(out.new_state_root, state.state_root());
-        assert!(state.free_slots.is_empty());
         assert_eq!(state.active_slot_count, 2);
         assert_eq!(state.alloc_counter, 2);
     }
@@ -321,7 +302,6 @@ mod tests {
             vec![valid_out, TxOutput::dummy()],
         );
         apply_tx(&mut state, &body).expect("apply");
-        assert!(state.free_slots.is_empty());
         assert_eq!(state.active_slot_count, 1);
     }
 
@@ -343,7 +323,6 @@ mod tests {
         let snap_root = state.state_root();
         let snap_active = state.active_slot_count;
         let snap_counter = state.alloc_counter;
-        let snap_free = state.free_slots.len();
 
         // Try to mint into the same slot (already occupied) — must fail.
         let bad = body_with(0, vec![], vec![mk_output(1)]);
@@ -351,7 +330,6 @@ mod tests {
         assert_eq!(state.state_root(), snap_root);
         assert_eq!(state.active_slot_count, snap_active);
         assert_eq!(state.alloc_counter, snap_counter);
-        assert_eq!(state.free_slots.len(), snap_free);
     }
 
     #[test]
@@ -367,14 +345,11 @@ mod tests {
 
         apply_tx(&mut state, &body_with(0, vec![mk_input_for(7, &a)], vec![])).unwrap();
         assert_eq!(state.active_slot_count, 0);
-        assert_eq!(state.free_slots.len(), 1);
 
-        // Wallet reuses slot 7.
+        // Wallet reuses slot 7 — discovered via random probe.
         let c = mk_output_at(7, 3);
         apply_tx(&mut state, &body_with(0, vec![], vec![c])).unwrap();
         assert_eq!(state.active_slot_count, 1);
-        // Free-list entry for slot 7 consumed by the mint.
-        assert!(state.free_slots.is_empty());
     }
 
     #[test]
