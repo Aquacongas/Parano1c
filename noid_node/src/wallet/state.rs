@@ -137,6 +137,8 @@ impl WalletState {
     }
 
     /// Derive the next fresh address and advance next_index.
+    /// Used by GUI wallet (Phase 10) for address rotation.
+    #[allow(dead_code)]
     pub fn next_address(&mut self) -> (u32, Address) {
         let idx = self.next_index;
         let addr = self.secret.derive_address(idx);
@@ -165,6 +167,8 @@ impl WalletState {
     }
 
     /// Check if a given address is owned by this wallet.
+    /// Used by P2P address scanning and GUI wallet (Phase 10).
+    #[allow(dead_code)]
     pub fn owns_address(&self, addr: &Address) -> Option<u32> {
         self.known_addresses.get(&addr.0).copied()
     }
@@ -190,6 +194,8 @@ impl WalletState {
     }
 
     /// Store a receipt for a confirmed transaction.
+    /// Public API for external callers; scanner uses receipts map directly.
+    #[allow(dead_code)]
     pub fn store_receipt(&mut self, tx_hash: [u8; 32], receipt_bytes: Vec<u8>) {
         self.receipts.insert(tx_hash, receipt_bytes);
     }

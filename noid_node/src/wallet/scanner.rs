@@ -60,7 +60,9 @@ pub fn owner_bytes_from_slot(sv: &SlotValue) -> [u8; 32] {
 }
 
 /// Convert an Address to the two Block128 owner fields stored in state.
+/// Used by BlockStateBinding (Phase 5) to match slot owners in ZK proofs.
 #[inline]
+#[allow(dead_code)]
 pub fn address_to_owner_fields(addr: &Address) -> (Block128, Block128) {
     let hi = u128::from_le_bytes(addr.0[..16].try_into().unwrap());
     let lo = u128::from_le_bytes(addr.0[16..].try_into().unwrap());
