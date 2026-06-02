@@ -936,7 +936,75 @@ noid_chain/src/segmented_state.rs      SegmentedFriState (two-tier dirty trackin
 
 ---
 
-## 13. In one sentence
+## 13. Phase 3 — Node Infrastructure Layer
+
+```
+noid_mempool/   AsyncMempool: native checks + dynamic fee floor + event broadcast
+noid_miner/     BlockMiner: parallel PoW (rayon) + prove_block (spawn_blocking)
+noid_p2p/       P2PNetwork: libp2p gossipsub (blocks/txs) + request-response (sync)
+noid_rpc/       RpcServer: jsonrpsee JSON-RPC — all ROADMAP2.md §RPC API methods
+noid_node/      paranoid-node binary — orchestrates all components
+```
+
+### 13.1 WalletProofBundle
+
+The wallet sends `TxIntent.logic_proof_bytes` which encodes a `WalletProofBundle`:
+
+```rust
+pub struct WalletProofBundle {
+    pub logic_proof: LogicProof,          // STARK + AuthGKR Kill-Shot (for verify_logic)
+    pub auth_slices: Vec<Vec<Block128>>,  // AuthGKR MLE state (for prove_block)
+}
+```
+
+**Security invariant**: `SpendSecret` NEVER appears in the bundle.
+`auth_slices` are Poseidon2b outputs — one-way, cannot recover `SpendSecret`.
+
+The full node reconstruction path (no SpendSecret needed):
+
+```
+From tx_body (public):
+  boundary_pins_from_body(tx_body)  →  TxLogicAir, SpineInputs
+  witness_from_body(tx_body)        →  Trace (balance/range columns only)
+
+From bundle (proof artifacts):
+  bundle.logic_proof.auth           →  auth_proof (AuthProofKillShot)
+  bundle.auth_slices                →  MLE columns for unified block commitment
+```
+
+### 13.2 Parallel PoW + Prove
+
+```
+┌─────────────────┐   ┌─────────────────────┐
+│  PoW Search (rayon) │   │  prove_block (blocking)  │
+│  Blake3(core||n)    │   │  ~10s @ 100 txs, 8 cores │
+│  < difficulty_tgt   │   │  ASERT target via         │
+│                     │   │  next_target(anchor, h, t)│
+└────────┴────────┘   └──────────┴──────────┘
+         └─────────────┼─────────────┘
+                           │ both complete
+                           ▼
+                  seal(nonce, proof_hash, witness_root)
+                           │
+                           ▼
+               apply_next_block() → broadcast P2P
+```
+
+### 13.3 Startup sequence
+
+```
+1. MdbxChainContext::open_or_create(data_dir)   — genesis or restore from MDBX
+2. AsyncMempool::new(ChainView::from_mdbx(ctx)) — snapshot of chain state
+3. P2PNetwork::start(listen_addr, chain, pool)  — libp2p swarm + seed dials
+4. start_rpc_server(listen, chain, mempool)     — JSON-RPC all methods
+5. BlockMiner::new(...).run()                   — if --mine flag set
+6. run_recursive_proof_updater(chain)           — lag monitor (full catch-up Phase 5)
+7. Ctrl-C → rpc_handle.stop() + miner abort
+```
+
+---
+
+## 14. In one sentence
 
 > Paranoid is a proof-native PoW chain where wallets prove logic and
 > miners prove state. The network does not execute code — it verifies

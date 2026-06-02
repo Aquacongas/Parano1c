@@ -17,10 +17,11 @@
 //! - [`receipt`]     — ParanoidReceipt generation and verification.
 
 pub mod checks;
-pub mod conflict; // NEW
+pub mod conflict;
 pub mod da_prune;
-pub mod mempool_checks; // NEW
-pub mod ordering; // NEW
+pub mod mempool_checks;
+pub mod network;
+pub mod ordering;
 pub mod reorg;
 pub mod template;
 pub mod validation;
@@ -47,6 +48,7 @@ pub use fork_choice::{choose_chain, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};
 pub use mempool_checks::validate_tx_for_mempool;
+pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use params::*;
 pub use params::{min_fee, FEE_PER_OUTPUT, MIN_FEE_BASE};

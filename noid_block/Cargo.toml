@@ -16,3 +16,5 @@ noid_gkr        = { path = "../noid_gkr" }
 noid_chain      = { path = "../noid_chain" }
 noid_recursive  = { path = "../noid_recursive" }
 rayon           = "1.10"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"

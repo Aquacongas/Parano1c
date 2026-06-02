@@ -17,7 +17,7 @@ use crate::block_header::BlockHeader;
 use noid_poseidon2b::primitives::Address;
 
 /// Compact summary of a transaction (public on-chain data only).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TxSummary {
     pub tx_body_hash: [u8; 32],
     pub inputs: Vec<(u32, Address)>,
@@ -28,7 +28,7 @@ pub struct TxSummary {
 }
 
 /// Cryptographic proof that a transaction is in the canonical chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParanoidReceipt {
     pub version: u8,
     pub tx_body_hash: [u8; 32],
@@ -42,6 +42,18 @@ pub struct ParanoidReceipt {
     pub claimed_height: u64,
     pub summary: TxSummary,
     pub chain_cert: Option<Vec<u8>>,
+}
+
+impl ParanoidReceipt {
+    /// Serialize to compact bincode bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("ParanoidReceipt serialize")
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

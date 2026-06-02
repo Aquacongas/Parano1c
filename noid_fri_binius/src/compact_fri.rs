@@ -44,7 +44,7 @@ pub const COMPACT_NUM_QUERIES: usize = 8;
 // ---------------------------------------------------------------------------
 
 /// Compact FRI evaluation proof with batched Merkle paths.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompactEvalProof {
     /// Partial evaluations over the top COMPACT_TAU variables.
     pub upper_partial_evals: Vec<Block128>,
@@ -67,7 +67,7 @@ pub struct CompactEvalProof {
 /// Instead of storing full independent paths (which repeat shared ancestors),
 /// stores only the unique sibling nodes needed. The verifier reconstructs
 /// all paths from this compact representation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BatchedMerkleProof {
     /// Tree depth (number of layers from leaf to root, exclusive of root).
     pub depth: usize,

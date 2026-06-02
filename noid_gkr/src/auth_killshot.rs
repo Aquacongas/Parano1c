@@ -65,7 +65,7 @@ use crate::batch_eval::{
 pub const AUTH_PIN_LANES: usize = 2;
 
 /// Composite proof for an AuthGKR boundary in the Kill-Shot flow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthProofKillShot {
     pub kill_shot: AuthKillShotProof,
     /// Discharges `state(r')`, `state(r'')`, plus all output digest

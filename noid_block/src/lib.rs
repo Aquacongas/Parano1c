@@ -17,9 +17,13 @@
 pub mod block_chain_context;
 pub mod channel;
 pub mod validate;
+pub mod witness_builder;
 
 pub use block_chain_context::{extract_replay_witness, BlockChainContext};
 pub use validate::{build_tx_airs, validate_block_full, FullValidationError};
+pub use witness_builder::{
+    build_block_witnesses, build_empty_state_bindings, build_tx_witness, OwnedTxWitness,
+};
 
 use crate::channel::{
     block_multipoint_channel, compute_tx_transcript_digest, merkle_reduce,
@@ -63,7 +67,7 @@ const BLOCK_MULTIPOINT_TAG: u128 = 0xFFFB_0000_0000_0000;
 // Public metadata
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockPublicMeta {
     pub prev_block_state_root: [u8; 32],
     pub n_tx: u32,
@@ -84,7 +88,7 @@ pub struct BlockPublicMeta {
 // BlockProof
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockProof {
     pub meta: BlockPublicMeta,
     /// Single interleaved commitment covering all columns (per-tx + block spine + state binding).
@@ -139,6 +143,10 @@ impl BlockProof {
 #[derive(Debug)]
 pub enum ProveBlockError {
     EmptyBlock,
+    /// The wallet's auth proof for tx at index `k` failed verification.
+    /// This can happen if the proof was generated with wrong public inputs
+    /// or if the proof bytes are corrupted.
+    AuthProofInvalid(usize),
 }
 
 #[derive(Debug)]
@@ -152,6 +160,13 @@ pub enum VerifyBlockError {
     AlgebraicStark(usize, VerifyError),
     BlockMultipoint,
     FriFailed(String),
+    /// A transaction's PublicInputs.log_slots does not match BlockHeader.log_slots.
+    /// The STARK proof is bound to the wrong chain configuration.
+    LogSlotsInconsistent {
+        tx_index: usize,
+        pi_log_slots: u32,
+        header_log_slots: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +429,8 @@ pub fn prove_block(
         extras_transcript: Vec<Block128>,
     }
 
-    let auth_results: Vec<AuthResult> = (0..n_tx)
+    // Verify wallet auth proofs; collect per-tx results or surface the first failure.
+    let auth_results_raw: Vec<Option<AuthResult>> = (0..n_tx)
         .into_par_iter()
         .map(|k| {
             let prep = &preps[k];
@@ -424,8 +440,7 @@ pub fn prove_block(
                 &auth_circuit,
                 auth_public_refs[k],
                 &mut ch,
-            )
-            .expect("wallet-supplied auth proof must verify");
+            )?; // returns None on failure
 
             let r_auth = auth_reductions.state.point.clone();
             let auth_r_low = r_auth[..BASE_LOG].to_vec();
@@ -441,13 +456,20 @@ pub fn prove_block(
             extras.extend_from_slice(&spine_extras);
             extras.extend_from_slice(&auth_tr);
 
-            AuthResult {
+            Some(AuthResult {
                 auth_r_low,
                 auth_slice_vals,
                 extras_transcript: extras,
-            }
+            })
         })
         .collect();
+
+    // Surface the first auth failure as a ProveBlockError.
+    let auth_results: Vec<AuthResult> = auth_results_raw
+        .into_iter()
+        .enumerate()
+        .map(|(k, r)| r.ok_or(ProveBlockError::AuthProofInvalid(k)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // -------------------------------------------------------------------------
     // Stage 5: Q.2c — Parallel per-tx algebraic STARK proofs.

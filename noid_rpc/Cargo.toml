@@ -1,0 +1,24 @@
+[package]
+name = "noid_rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noid_chain      = { path = "../noid_chain" }
+noid_tx         = { path = "../noid_tx" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_mempool    = { path = "../noid_mempool" }
+noid_miner      = { path = "../noid_miner" }
+jsonrpsee    = { version = "0.24", features = ["server", "macros"] }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+futures      = "0.3"
+hex          = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }

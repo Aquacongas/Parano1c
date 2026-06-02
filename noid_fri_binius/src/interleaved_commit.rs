@@ -15,13 +15,13 @@ use rayon::prelude::*;
 use crate::MERKLE_CAP_DEPTH;
 
 /// Top levels of the commitment kept as a compact binding.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MerkleCap {
     pub hashes: Vec<HashOutput>,
 }
 
 /// Public commitment to all interleaved columns (sent to verifier).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InterleavedCommitment {
     pub cap: MerkleCap,
     pub log_rows: usize,

@@ -273,6 +273,15 @@ impl Mempool {
         self.entries.iter()
     }
 
+    /// Store cached proof bytes for an admitted transaction.
+    /// Called by the async mempool after admission to attach the wallet's
+    /// `WalletProofBundle` bytes (from `TxIntent.logic_proof_bytes`).
+    pub fn set_cached_proof(&mut self, hash: &TxBodyHash, proof_bytes: Vec<u8>) {
+        if let Some(entry) = self.entries.get_mut(hash) {
+            entry.cached_algebraic_proof = Some(proof_bytes);
+        }
+    }
+
     /// Total fees available in the pool (useful for coinbase computation).
     pub fn total_fees(&self) -> u64 {
         self.entries

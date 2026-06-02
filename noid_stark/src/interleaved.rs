@@ -47,7 +47,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Full STARK proof using the FRI-Binius interleaved PCS.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InterleavedStarkProof {
     pub log_rows: usize,
     pub commitment: InterleavedCommitment,
@@ -62,7 +62,7 @@ pub struct InterleavedStarkProof {
 /// Algebraic-only per-tx proof — no commitment header, no FRI opening.
 /// Used by `noid_block` (Stage G) to accumulate N algebraic transcripts
 /// before issuing one block-level FRI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlgebraicStarkProof {
     pub log_rows: usize,
     pub base_openings: Vec<Block128>,

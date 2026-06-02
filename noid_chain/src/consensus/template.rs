@@ -193,11 +193,23 @@ pub fn build_block_template(
         scratch.state.expand();
     }
 
+    // Apply txs one by one; exclude any that fail due to state conflicts
+    // (e.g. output slot occupied by a coinbase from a block mined between
+    // the wallet's proof and this template build). This is the standard
+    // "soft" tx exclusion used by all UTXO miners.
+    let mut applied_winners: Vec<Transaction> = Vec::new();
     let ordered_winners = order_block_txs(winners);
-    for tx in &ordered_winners {
-        apply_tx(&mut scratch, &tx.body)
-            .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    for tx in ordered_winners {
+        match apply_tx(&mut scratch, &tx.body) {
+            Ok(_) => applied_winners.push(tx),
+            Err(_e) => {
+                // Skip: output slot occupied by a recently confirmed block.
+                // The wallet must re-prove with fresh slot hints.
+                // (debug logging requires tracing crate — omitted from noid_chain)
+            }
+        }
     }
+    let ordered_winners = applied_winners;
 
     // 4. Build coinbase transaction.
     // Find an empty slot for coinbase output using the allocator.

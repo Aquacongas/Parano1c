@@ -37,7 +37,7 @@ use crate::{Block128, TowerField};
 
 /// Univariate polynomial in coefficient form: `coeffs[i]` is the
 /// coefficient of `X^i`. `degree() = coeffs.len() - 1`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RoundPolynomial<F> {
     pub coeffs: Vec<F>,
 }

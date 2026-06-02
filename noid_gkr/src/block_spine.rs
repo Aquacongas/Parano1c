@@ -468,7 +468,7 @@ fn build_u_table_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec
 // ---------------------------------------------------------------------------
 
 /// Output of the block-level unified spine sumcheck.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineUnifiedProof {
     pub round_polys: Vec<RoundPolynomial<Block128>>,
     pub s_in_dec_at_r: Block128,
@@ -1095,7 +1095,7 @@ pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
 pub const BLOCK_SPINE_SHIFT_DEGREE: usize = 2;
 
 /// Shift proof for the block spine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineShiftProof {
     pub round_polys: Vec<RoundPolynomial<Block128>>,
     pub s_in_at_r2: Block128,
@@ -1113,7 +1113,7 @@ pub struct BlockSpineShiftReduction {
 }
 
 /// Combined Kill-Shot proof for block spine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineKillShotProof {
     pub main: BlockSpineUnifiedProof,
     pub shift: BlockSpineShiftProof,
@@ -1524,7 +1524,7 @@ pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
 // ---------------------------------------------------------------------------
 
 /// Complete proof for the unified block spine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineProof {
     pub kill_shot: BlockSpineKillShotProof,
     pub state_batch: BatchEvalProof,

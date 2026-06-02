@@ -22,7 +22,7 @@ pub const MIN_LOG_SLOTS: u32 = 24;
 /// expansion trigger per `GENERAL_DESIGN §15.3`.
 pub const MAX_LOG_SLOTS: u32 = 32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublicInputs {
     /// Hash of block header at `height - ANCHOR_DEPTH`. Replaces
     /// prev_state_root; provides fork-binding without state coupling.

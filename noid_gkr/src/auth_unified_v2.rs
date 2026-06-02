@@ -57,7 +57,7 @@ pub const AUTH_SHIFT_ROUND_DEGREE: usize = 2;
 /// Number of witness-derived claims emitted by the main sumcheck.
 pub const N_AUTH_UNIFIED_WITNESS_CLAIMS: usize = 12;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthUnifiedProof {
     pub round_polys: Vec<RoundPolynomial<Block128>>,
     pub s_in_dec_at_r: Block128,
@@ -81,7 +81,7 @@ pub struct AuthUnifiedReduction {
     pub gamma: Block128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthShiftProof {
     pub round_polys: Vec<RoundPolynomial<Block128>>,
     pub s_in_at_r2: Block128,
@@ -97,7 +97,7 @@ pub struct AuthShiftReduction {
     pub state_at_r2: Block128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthKillShotProof {
     pub main: AuthUnifiedProof,
     pub shift: AuthShiftProof,

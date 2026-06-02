@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid.
+
+//! # noid_rpc — JSON-RPC Server for Paranoid Full Node
+
+pub mod api;
+pub mod server;
+pub mod types;
+pub mod wallet_ops;
+
+pub use server::start_rpc_server;
+pub use wallet_ops::WalletOps;

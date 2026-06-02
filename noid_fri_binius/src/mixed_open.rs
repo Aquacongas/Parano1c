@@ -39,7 +39,7 @@ pub struct EvalClaim {
 }
 
 /// Proof of mixed-point opening.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MixedOpeningProof {
     /// Per-column evaluations at primary_point (first n_cols entries),
     /// followed by secondary claim values.

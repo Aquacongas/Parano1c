@@ -123,6 +123,22 @@ pub fn validate_block_full(
         state,
     )?;
 
+    // Step 1b: verify pi.log_slots == header.log_slots for every non-coinbase tx.
+    // The STARK proof is cryptographically bound to log_slots via absorb_public_inputs;
+    // a mismatch means the proof was generated for a different chain configuration.
+    let header_log_slots = block.header.log_slots;
+    for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
+        if pi.log_slots != header_log_slots {
+            return Err(FullValidationError::ZkProof(
+                crate::VerifyBlockError::LogSlotsInconsistent {
+                    tx_index,
+                    pi_log_slots: pi.log_slots,
+                    header_log_slots,
+                },
+            ));
+        }
+    }
+
     // Step 2: ZK proof verification (expensive, ~N × 84ms).
     // Build TxLogicAirs from the transactions (coinbase skipped — no logic proof).
     let tx_airs: Vec<TxLogicAir> = block

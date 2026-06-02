@@ -41,6 +41,9 @@ pub mod vshift;
 
 pub mod interleaved;
 pub mod prove_logic;
+pub mod wallet_bundle;
+
+pub use wallet_bundle::{BundleDecodeError, WalletProofBundle};
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};

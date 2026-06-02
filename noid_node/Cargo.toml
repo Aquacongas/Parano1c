@@ -1,0 +1,60 @@
+[package]
+name = "noid_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# --- Daemon ---
+[[bin]]
+name = "paranoid"
+path = "src/main.rs"
+
+# --- CLI client ---
+[[bin]]
+name = "noid-cli"
+path = "src/bin/noid_cli.rs"
+
+[dependencies]
+noid_chain      = { path = "../noid_chain" }
+noid_block      = { path = "../noid_block" }
+noid_recursive  = { path = "../noid_recursive" }
+noid_tx         = { path = "../noid_tx" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_air        = { path = "../noid_air" }
+noid_stark      = { path = "../noid_stark" }
+noid_gkr        = { path = "../noid_gkr" }
+noid_core       = { path = "../noid_core" }
+noid_mempool    = { path = "../noid_mempool" }
+noid_miner      = { path = "../noid_miner" }
+noid_p2p        = { path = "../noid_p2p" }
+noid_rpc        = { path = "../noid_rpc" }
+
+# Async runtime
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+
+# Error handling
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+
+# CLI
+clap    = { version = "4", features = ["derive"] }
+toml    = "0.8"
+hex     = "0.4"
+
+# Networking
+libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Wallet security: key derivation + symmetric encryption
+rand             = "0.8"
+zeroize          = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+tempfile = "3"

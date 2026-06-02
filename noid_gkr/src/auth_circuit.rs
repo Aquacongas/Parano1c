@@ -142,7 +142,7 @@ pub struct AuthSlotDescriptor {
 
 /// Public-only subset of the auth boundary. Used by verifiers and block
 /// provers who must never see `spend_secret`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthPublicInputs {
     /// `tx_body_hash = [hi, lo]`. Pinned on the STARK side via the spine bridge.
     pub tx_body_hash: [Block128; 2],

@@ -10,6 +10,7 @@ noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_air = { path = "../noid_air" }
 noid_tx = { path = "../noid_tx" }
 rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8"

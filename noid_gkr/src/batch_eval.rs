@@ -65,7 +65,7 @@ const PAR_THRESHOLD: usize = 64;
 
 /// One round of the degree-2 batch-eval sumcheck, stored as its
 /// evaluations at `X = 0, 1, 2`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchEvalRound {
     pub evals: [Block128; 3],
 }
@@ -108,7 +108,7 @@ pub struct EvalClaim {
 /// reduced `(r_B, v_B)` is derived by the verifier from the transcript
 /// and the last round's final claim, so only the round polys and the
 /// prover's `b_final` need to ship.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchEvalProof {
     pub rounds: Vec<BatchEvalRound>,
     /// `b_final = B(r_B)`. Verifier cross-checks against

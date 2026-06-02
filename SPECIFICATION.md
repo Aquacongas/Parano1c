@@ -378,13 +378,28 @@ Validity of a transaction within a block is a property of the combined
 The network payload (TxIntent) is:
 
 ```
-  (tx_body, logic_proof, claims_commitment, claimed_slots)
+  (tx_body, logic_proof_bytes, claims_commitment, claimed_slots)
 ```
 
-The `SpendSecret` MUST NOT appear in the payload and MUST NOT be
-recoverable from it. Neither `prev_state_root` nor `new_state_root`
-appear in the per-tx broadcast — state binding is performed at block
-level by the miner.
+where `logic_proof_bytes` is a serialized `WalletProofBundle`:
+
+```rust
+pub struct WalletProofBundle {
+    pub logic_proof: LogicProof,          // STARK + AuthGKR Kill-Shot
+    pub auth_slices: Vec<Vec<Block128>>,  // AuthGKR MLE state (8 × 2^11 elements)
+}
+```
+
+`auth_slices` are Poseidon2b outputs derived from `SpendSecret` via a one-way
+function. They are required by the block prover to build the unified block-level
+Merkle commitment in `prove_block`. They CANNOT be reversed to recover `SpendSecret`.
+
+The `SpendSecret` MUST NOT appear in the payload and MUST NOT be recoverable from it.
+The `auth_slices` satisfy this invariant: they are irreversible Poseidon2b images of
+`(SpendSecret, tx_body_hash)`, bound to this specific transaction.
+
+Neither `prev_state_root` nor `new_state_root` appear in the per-tx broadcast —
+state binding is performed at block level by the miner.
 
 ---
 

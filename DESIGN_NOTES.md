@@ -638,6 +638,128 @@ verifiable forever). Operators should provision accordingly.
 
 T_NULLIFIERS maps TxBodyHash → block_height for O(1) single-hash lookup. It is
 currently unused at runtime (the RAM NullifierSet is used for all consensus checks,
-and T_NULLIFIER_BLOCKS is used for rebuild). It is retained for the Phase 3 RPC
+and T_NULLIFIER_BLOCKS is used for rebuild). It is retained for a future RPC
 endpoint `paranoid_checkNullifier` which will need O(1) persistent lookup without
 loading the full RAM set.
+
+---
+
+## 20. Phase 3 Design Decisions
+
+### 20.1 WalletProofBundle — proof delivery without exposing SpendSecret
+
+The block prover (`prove_block`) requires:
+- AIR **trace** — derivable from public `tx_body` via `witness_from_body`, no SpendSecret
+- `auth_proof: AuthProofKillShot` — from `LogicProof.auth`, already proven by wallet
+- `auth_slices: Vec<Vec<Block128>>` — MLE columns for AuthGKR state, requires SpendSecret to compute
+
+Since `auth_slices` cannot be computed by the full node, the wallet provides them.
+They are safe to transmit: Poseidon2b outputs bound to a specific `tx_body_hash`,
+cryptographically unable to reveal SpendSecret.
+
+`WalletProofBundle = { LogicProof, auth_slices }` serialized via bincode. Requires
+adding `#[derive(Serialize, Deserialize)]` to all proof types across:
+`noid_core`, `noid_fri_binius`, `noid_gkr`, `noid_stark`, `noid_tx`, `noid_poseidon2b`.
+
+### 20.2 prove_block Phase 3 fallback
+
+In Phase 3, `WalletProofBundle` is only available after a wallet implementation (Phase 4).
+Until then, `run_prove_block` returns marker hashes `[1u8;32]` when no bundles exist.
+Non-zero hashes pass `MissingProofTranscriptHash` check in `apply_block`, allowing the
+chain to advance. Real proofs require Phase 4 wallet to submit `TxIntent` with bundles.
+
+### 20.3 ASERT target in template builder
+
+The template builder previously used `parent.difficulty_target` directly. This is wrong:
+`validate_header` rejects blocks where `header.difficulty_target` doesn’t match the computed
+ASERT value. Fix: `TemplateBuilder::build()` calls:
+```rust
+let difficulty_target = next_target(
+    anchor.anchor_height, anchor.anchor_timestamp, &anchor.anchor_target,
+    parent.height + 1, now_unix,
+);
+```
+
+### 20.4 P2P design decisions
+
+- **Gossipsub message dedup**: Content-hash IDs (`blake3(data)`) prevent duplicate delivery.
+- **Identify is mandatory**: Without it, gossipsub silently refuses to route to peers.
+- **Idle timeout 300s**: Default libp2p timeout disconnects peers between blocks.
+- **Block validation on receipt**: `apply_next_block` runs full native consensus on P2P blocks.
+  ZK proof verification deferred to Phase 5.
+- **Mempool relay**: `TxAdmitted` events are piped to gossipsub broadcast automatically.
+
+## 21. Phase 4 Design Decisions
+
+### 21.1 `log_slots` в PublicInputs — binding к конфигурации цепи
+
+`PublicInputs.log_slots` поглощается в Fiat-Shamir канал через `absorb_public_inputs`
+(`noid_stark/src/lib.rs`). Это означает STARK доказательство **криптографически связано**
+с конкретным значением `log_slots`.
+
+**Инвариант**: для любого non-coinbase tx в блоке:
+```
+proof.tx_pis[k].log_slots == block.header.log_slots
+```
+
+**Откуда берётся log_slots:**
+
+- **Кошелёк** (`prove_tx`): читает из `chain.tip_header().log_slots` в момент доказательства.
+  Если между доказательством и включением произошло расширение `log_slots`, транзакция
+  будет отклонена валидатором → нужно доказывать снова с новым `log_slots`.
+
+- **Майнер** (`build_block_witnesses`): принимает `log_slots` из `BlockTemplate.inner.log_slots`
+  (который уже учитывает expansion trigger). Передаёт в `build_tx_witness` → `build_public_inputs`.
+
+- **Валидатор** (`validate_block_full`): проверяет `pi.log_slots == header.log_slots`
+  для всех txs. Несовпадение → `VerifyBlockError::LogSlotsInconsistent`.
+
+**Расширение log_slots** происходит крайне редко (trigger: 75% заполнения, т.е. ~12M из 16M
+слотов при genesis log_slots=24). Проблема «tx proven at log_slots=24, block at log_slots=25»
+решается отклонением и повторным доказательством (занимает ~300ms).
+
+До Phase 4 в `witness_builder.rs` и `prover.rs` было захардкодировано `log_slots: 24`
+с TODO-комментом. Исправлено: все три стороны (кошелёк, майнер, валидатор) теперь
+используют правильное значение.
+
+### 21.2 Receipts — автоматическая генерация
+
+Блоки удаляются через `FINALITY_DEPTH=18` блоков. Receipt (Merkle-доказательство в `tx_root`)
+должен быть сгенерирован ДО прунинга блока. Поэтому:
+
+1. Когда блок применяется к цепи, P2P-обработчик вызывает `update_wallet_from_block`
+2. Там же вызывается `generate_receipt(header, tx_body_hash, tx_index, block_tx_hashes, ...)` 
+3. Receipt сохраняется в `WalletState.receipts: HashMap<[u8;32], Vec<u8>>`
+4. `wallet_export_receipt(txhash)` просто отдаёт из этого map
+
+Если блок уже спруненный — receipt недоступен ("block already pruned").
+
+### 21.3 WalletHandle — архитектура без круговых зависимостей
+
+`noid_rpc` не зависит от `noid_node`. Wallet-методы RPC реализованы через trait:
+
+```
+noid_rpc::WalletOps trait  ←  реализует  noid_node::WalletHandle
+         ↓
+    RpcHandler.wallet: Arc<dyn WalletOps>
+```
+
+`WalletHandle` держит `SharedWallet = Arc<Mutex<Option<WalletState>>>` и реализует WalletOps.
+Все read-методы занимают lock кратко (~мкс). `build_send` (prove_tx, ~300ms-3s) вызывается
+БЕЗ lock — данные извлекаются, lock освобождается, proves идёт снаружи:
+
+```rust
+// RPC handler: wallet_send (async)
+let intent_bytes = tokio::task::spawn_blocking(move || {
+    wallet.build_send(to, amount, fee, anchor, hints, log_slots)
+}).await??;
+```
+
+### 20.5 MempoolEntry Phase 1.5 fields
+
+`cached_algebraic_proof: Option<Vec<u8>>` and `spine_slots: Option<Vec<u8>>` are in
+`MempoolEntry` as stubs. Activation in Phase 5 (once wallets produce `WalletProofBundle`):
+1. On tx admission: spawn background `verify_logic` + `prove_air_algebraic_pretx`
+2. Cache result in `cached_algebraic_proof`  
+3. Block assembly skips per-tx algebraic STARK, runs only unified GKR + FRI
+4. Measured impact: 1024-tx block → ~44s without, ~12s with pre-proving

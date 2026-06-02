@@ -31,7 +31,7 @@ pub type Digest = [u8; 32];
 macro_rules! newtype_digest {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
         pub struct $name(pub [u8; 32]);
 
         impl $name {

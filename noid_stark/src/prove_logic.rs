@@ -62,7 +62,7 @@ const N_AUTH_SLICES: usize = 1 << (N_AUTH_UNIFIED_VARS - BASE_LOG);
 ///
 /// Split GKR: only AuthGKR is included. SpineGKR is deferred to the
 /// block prover who generates it from public SpineInputs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicProof {
     /// STARK seal over the TxLogicAir trace + 2 auth boundary-slice columns.
     pub stark: InterleavedStarkProof,
