@@ -51,6 +51,13 @@ pub trait ParanoidApi {
     #[method(name = "submitTxIntent")]
     async fn submit_tx_intent(&self, hex: String) -> RpcResult<String>;
 
+    // --- Node control ---
+
+    /// Gracefully stop the daemon. Cancels the miner, closes the RPC server,
+    /// and flushes MDBX. Equivalent to Ctrl-C but callable via RPC or CLI.
+    #[method(name = "stop")]
+    fn stop(&self) -> RpcResult<String>;
+
     // --- Mempool ---
 
     /// Get summary of all pending transactions in the mempool.

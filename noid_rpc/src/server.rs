@@ -44,6 +44,10 @@ pub struct RpcHandler {
     pub chain: Arc<RwLock<MdbxChainContext>>,
     pub mempool: AsyncMempool,
     pub wallet: Arc<dyn WalletOps + Send + Sync>,
+    /// One-shot sender: firing this triggers graceful daemon shutdown
+    /// (same effect as Ctrl-C). Wrapped in Mutex so the RPC handler can
+    /// take ownership on first call.
+    pub stop_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 #[async_trait]
@@ -464,6 +468,25 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     // -----------------------------------------------------------------------
+    // Node control
+    // -----------------------------------------------------------------------
+
+    fn stop(&self) -> RpcResult<String> {
+        // Take the sender (one-shot: subsequent calls are no-ops).
+        let taken = tokio::task::block_in_place(|| {
+            futures::executor::block_on(async { self.stop_tx.lock().await.take() })
+        });
+        match taken {
+            Some(tx) => {
+                tracing::info!("RPC stop command received — initiating graceful shutdown");
+                let _ = tx.send(());
+                Ok("stopping".to_string())
+            }
+            None => Ok("already stopping".to_string()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Mempool inspection
     // -----------------------------------------------------------------------
 
@@ -528,19 +551,28 @@ fn parse_address_hex(hex_str: &str) -> RpcResult<noid_poseidon2b::primitives::Ad
 /// Start the JSON-RPC server and return a handle.
 ///
 /// The server runs until `handle.stop()` is called or it is dropped.
+/// Start the RPC server and return (handle, stop_rx).
+/// `stop_rx` fires when `paranoid_stop` is called via RPC.
 pub async fn start_rpc_server(
     listen: SocketAddr,
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
-) -> anyhow::Result<jsonrpsee::server::ServerHandle> {
+) -> anyhow::Result<(
+    jsonrpsee::server::ServerHandle,
+    tokio::sync::oneshot::Receiver<()>,
+)> {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stop_tx = Arc::new(tokio::sync::Mutex::new(Some(stop_tx)));
+
     let handler = RpcHandler {
         chain,
         mempool,
         wallet,
+        stop_tx,
     };
     let server = Server::builder().build(listen).await?;
     let handle = server.start(handler.into_rpc());
     tracing::info!(%listen, "RPC server started");
-    Ok(handle)
+    Ok((handle, stop_rx))
 }

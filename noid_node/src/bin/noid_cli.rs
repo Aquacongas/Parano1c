@@ -52,6 +52,8 @@ enum NodeCmd {
     Status,
     /// Print mempool state: pending transaction count, fee floor, and tx list.
     Mempool,
+    /// Gracefully stop the running paranoid daemon (cancels miner, flushes MDBX).
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -104,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Node { action } => match action {
             NodeCmd::Status => cmd_node_status(&client, &cli.rpc).await?,
             NodeCmd::Mempool => cmd_node_mempool(&client, &cli.rpc).await?,
+            NodeCmd::Stop => cmd_node_stop(&client, &cli.rpc).await?,
         },
         Command::Wallet { action } => match action {
             WalletCmd::Address { index } => cmd_wallet_address(&client, &cli.rpc, index).await?,
@@ -200,6 +203,23 @@ async fn cmd_node_mempool(client: &reqwest::Client, rpc_url: &str) -> anyhow::Re
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_node_stop(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
+    // Best-effort: the server shuts down as soon as the signal fires,
+    // so the response may or may not arrive before the connection closes.
+    match rpc_call(client, rpc_url, "paranoid_stop", serde_json::json!([])).await {
+        Ok(result) => {
+            let msg = result.as_str().unwrap_or("ok");
+            println!("node stop: {msg}");
+        }
+        Err(_) => {
+            // Connection closed before response — that means the daemon
+            // is already shutting down. This is expected.
+            println!("node stop: daemon is shutting down");
+        }
+    }
     Ok(())
 }
 

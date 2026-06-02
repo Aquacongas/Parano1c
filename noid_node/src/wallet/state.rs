@@ -10,7 +10,7 @@
 //! - UTXO state updated via state scan + incremental block updates
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use noid_poseidon2b::primitives::{Address, SpendSecret};
@@ -112,7 +112,7 @@ impl WalletState {
             known_addresses.insert(addr.0, i);
         }
 
-        Ok(Self {
+        let mut wallet = Self {
             keystore_path: key_path,
             secret,
             utxos: HashMap::new(),
@@ -120,7 +120,9 @@ impl WalletState {
             known_addresses,
             history: Vec::new(),
             receipts: HashMap::new(),
-        })
+        };
+        wallet.load_receipts();
+        Ok(wallet)
     }
 
     /// Primary address (index 0).
@@ -251,6 +253,58 @@ impl WalletState {
             }
         }
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Receipt persistence
+// ---------------------------------------------------------------------------
+
+/// Path for the receipts file (JSON format, next to wallet key).
+fn receipts_path(wallet_key_path: &Path) -> PathBuf {
+    wallet_key_path.with_extension("receipts")
+}
+
+impl WalletState {
+    /// Save receipts to disk. Called after each new receipt is generated.
+    pub fn save_receipts(&self) {
+        let path = receipts_path(&self.keystore_path);
+        // Serialize as a map of hex_hash → hex_bytes
+        let data: std::collections::HashMap<String, String> = self
+            .receipts
+            .iter()
+            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+            .collect();
+        if let Ok(json) = serde_json::to_string(&data) {
+            let tmp = path.with_extension("receipts.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Load receipts from disk. Called at startup after create_or_load.
+    pub fn load_receipts(&mut self) {
+        let path = receipts_path(&self.keystore_path);
+        if !path.exists() {
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Ok(data) = serde_json::from_str::<std::collections::HashMap<String, String>>(&text) {
+            for (k_hex, v_hex) in data {
+                if let (Ok(k), Ok(v)) = (hex::decode(&k_hex), hex::decode(&v_hex)) {
+                    if k.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&k);
+                        self.receipts.insert(key, v);
+                    }
+                }
+            }
+            tracing::info!(count = self.receipts.len(), "loaded receipts from disk");
+        }
     }
 }
 

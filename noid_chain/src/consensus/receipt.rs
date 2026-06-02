@@ -9,9 +9,14 @@
 //!
 //! # Verification algorithm
 //!
-//! **Step 1 (offline)**: Merkle inclusion using Blake3 binary tree.
+//! **Step 1 (offline)**: Merkle inclusion using Poseidon2b COMPRESS binary tree.
+//!   Must match `noid_chain::block::compute_tx_root` exactly.
+//!   Poseidon2b is used (not Blake3) because the tx_root feeds into the ZK
+//!   block spine — an in-circuit Poseidon2b Merkle proof is far cheaper than Blake3.
 //! **Step 2a (online)**: `getHeaderByHeight(claimed_height)` → check `tx_root`.
 //! **Step 2b (offline)**: `verify_tip(chain_cert, ...)` with embedded proof.
+
+use noid_poseidon2b::native::compress;
 
 use crate::block_header::BlockHeader;
 use noid_poseidon2b::primitives::Address;
@@ -92,14 +97,16 @@ pub fn generate_receipt(
 }
 
 /// Verify Merkle inclusion (offline). Returns true iff tx is in claimed_root.
+///
+/// Uses Poseidon2b COMPRESS to match `compute_tx_root` in `noid_chain::block`.
 pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
     let mut current = receipt.tx_body_hash;
     for (level, sibling) in receipt.merkle_path.iter().enumerate() {
         let sibling_on_left = (receipt.merkle_dirs >> level) & 1 == 1;
         current = if sibling_on_left {
-            blake3_pair(sibling, &current)
+            compress(sibling, &current)
         } else {
-            blake3_pair(&current, sibling)
+            compress(&current, sibling)
         };
     }
     current == receipt.claimed_root
@@ -111,16 +118,20 @@ pub fn verify_against_header(receipt: &ParanoidReceipt, canonical_header: &Block
         && canonical_header.tx_root == receipt.claimed_root
 }
 
-/// Build a Blake3 Merkle inclusion path.
+/// Build a Poseidon2b COMPRESS Merkle inclusion path.
+///
+/// Must match `compute_tx_root` in `noid_chain::block` exactly:
+/// - Pads to `next_power_of_two().max(2)` (at least 2 leaves).
+/// - Uses `compress(left, right)` (Poseidon2b) at each level.
 ///
 /// Returns `(siblings, dirs_bitmask)` where bit k of `dirs_bitmask` is 1 iff
-/// the sibling at level k is on the left side. This is the standard Bitcoin-style
-/// Merkle path representation, cleaned up with a separate direction field.
+/// the sibling at level k is on the left side.
 fn build_merkle_path(tx_hashes: &[[u8; 32]], tx_index: usize) -> (Vec<[u8; 32]>, u32) {
     if tx_hashes.is_empty() {
         return (vec![], 0);
     }
-    let n = tx_hashes.len().next_power_of_two();
+    // Match compute_tx_root: always pad to at least 2 leaves.
+    let n = tx_hashes.len().next_power_of_two().max(2);
     let mut layer: Vec<[u8; 32]> = tx_hashes.to_vec();
     layer.resize(n, [0u8; 32]);
 
@@ -130,16 +141,16 @@ fn build_merkle_path(tx_hashes: &[[u8; 32]], tx_index: usize) -> (Vec<[u8; 32]>,
     let mut level = 0u32;
 
     while layer.len() > 1 {
-        let sibling_idx = idx ^ 1; // XOR 1 flips the last bit: gives sibling index
+        let sibling_idx = idx ^ 1;
         path.push(layer[sibling_idx]);
         // If idx is ODD, sibling is to the LEFT (even index = left child).
         if idx % 2 == 1 {
             dirs |= 1 << level;
         }
-        // Build next layer.
+        // Build next layer using Poseidon2b COMPRESS (same as compute_tx_root).
         let next: Vec<[u8; 32]> = layer
             .chunks(2)
-            .map(|pair| blake3_pair(&pair[0], &pair[1]))
+            .map(|pair| compress(&pair[0], &pair[1]))
             .collect();
         idx /= 2;
         layer = next;
@@ -149,25 +160,18 @@ fn build_merkle_path(tx_hashes: &[[u8; 32]], tx_index: usize) -> (Vec<[u8; 32]>,
 }
 
 /// Compute the tx_root from a list of tx_body_hashes.
+/// Mirrors `compute_tx_root` in `noid_chain::block`.
 pub fn tx_root(tx_hashes: &[[u8; 32]]) -> [u8; 32] {
     if tx_hashes.is_empty() {
         return [0u8; 32];
     }
-    let n = tx_hashes.len().next_power_of_two();
+    let n = tx_hashes.len().next_power_of_two().max(2);
     let mut layer: Vec<[u8; 32]> = tx_hashes.to_vec();
     layer.resize(n, [0u8; 32]);
     while layer.len() > 1 {
-        layer = layer.chunks(2).map(|p| blake3_pair(&p[0], &p[1])).collect();
+        layer = layer.chunks(2).map(|p| compress(&p[0], &p[1])).collect();
     }
     layer[0]
-}
-
-#[inline]
-fn blake3_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(left);
-    buf[32..].copy_from_slice(right);
-    *blake3::hash(&buf).as_bytes()
 }
 
 #[cfg(test)]

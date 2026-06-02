@@ -30,19 +30,12 @@ pub struct ClaimedSlot {
 /// the logic_proof, check the epoch_anchor window, verify claimed
 /// slots against native state, and admit to mempool.
 ///
-/// # Phase 2 TODO (Security #6): tx_body_hash consistency check on decode
+/// # tx_body_hash consistency
 ///
-/// `TxIntent` carries `tx_body_hash` as a wire field alongside `tx_body`.
-/// Currently neither `decode` nor `from_bytes` verifies that
-/// `hash_tx_body(tx_body) == tx_body_hash`. A node that trusts the
-/// wire field without recomputing it could be fed a TxIntent where
-/// the body and hash are inconsistent — the LogicProof would then
-/// bind to a different hash than the body.
-///
-/// Fix: in Phase 2 mempool admission (`noid_chain::mempool::admit_tx`),
-/// recompute `hash_tx_body` from `tx_body` and reject if mismatch.
-/// Do NOT do this in `decode` itself (pure deserialization should not
-/// perform expensive hash computations), but in the admission gate.
+/// `TxIntent` carries `tx_body_hash` alongside `tx_body` on the wire.
+/// The mempool verifier recomputes `hash_tx_body(tx_body)` and rejects
+/// any TxIntent where the hash field doesn't match the body.
+/// See `noid_mempool::pool::submit` (Security #6 fix, Phase 5).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxIntent {
     pub tx_body: TxBody,

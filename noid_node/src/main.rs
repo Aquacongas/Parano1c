@@ -14,6 +14,20 @@
 //! 8. Start background recursive proof updater
 //! 9. Shutdown on Ctrl-C
 
+// ---------------------------------------------------------------------------
+// Global allocator: jemalloc
+//
+// glibc malloc retains freed pages from large ZK allocations (FRI/NTT Vecs,
+// often 10-100 MB each) indefinitely, causing 3-4 GB RSS fragmentation on
+// a full node even with only a few hundred active UTXOs.
+//
+// jemalloc with background_threads enabled returns dirty pages to the OS
+// within dirty_decay_ms (default 10 000 ms) via a background reclaim thread.
+// This keeps the node's RSS proportional to actual working set size.
+// ---------------------------------------------------------------------------
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -250,9 +264,10 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
-    let rpc_handle = start_rpc_server(rpc_listen, chain.clone(), mempool.clone(), wallet)
-        .await
-        .context("start RPC server")?;
+    let (rpc_handle, rpc_stop_rx) =
+        start_rpc_server(rpc_listen, chain.clone(), mempool.clone(), wallet)
+            .await
+            .context("start RPC server")?;
     tracing::info!(listen = %rpc_listen, "RPC ready");
 
     // --- Miner (optional) ---
@@ -275,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
         let (miner, mut miner_rx) = BlockMiner::new(miner_cfg, mempool.clone(), chain.clone());
+        let miner_stop = miner.stop_handle(); // Arc<AtomicBool> — set true to cancel Rayon threads
 
         let p2p_block_relay = p2p.cmd_tx.clone();
         let miner_wallet = shared_wallet.clone();
@@ -308,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
 
         let task = tokio::spawn(async move { miner.run().await });
         tracing::info!("miner started");
-        Some(task)
+        Some((task, miner_stop))
     } else {
         None
     };
@@ -327,13 +343,35 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- Shutdown ---
-    tokio::signal::ctrl_c().await.context("Ctrl-C")?;
-    tracing::info!("shutting down");
-    rpc_handle.stop()?;
-    if let Some(h) = miner_handle {
-        h.abort();
+    // Wait for either Ctrl-C or a `paranoid_stop` RPC call.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl-C received");
+        }
+        _ = rpc_stop_rx => {
+            tracing::info!("stop command received via RPC");
+        }
     }
-    tracing::info!("goodbye");
+
+    tracing::info!("shutting down — cancelling miner and closing connections");
+
+    // 1. Cancel Rayon PoW threads immediately (they check the flag every ~10M nonces).
+    if let Some((_, ref stop_flag)) = miner_handle {
+        stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("miner stop flag set");
+    }
+
+    // 2. Stop RPC server (no new requests accepted).
+    let _ = rpc_handle.stop();
+
+    // 3. Abort the miner tokio task (async loop, not the blocking thread).
+    if let Some((task, _)) = miner_handle {
+        task.abort();
+        // Give Rayon threads up to 500ms to finish their current nonce chunk.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    tracing::info!("goodbye — MDBX flushed on drop");
     Ok(())
 }
 
@@ -348,6 +386,13 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) {
+    // Orphan pool: blocks whose parent is not yet known.
+    // When the parent arrives, we re-apply the orphan.
+    // Keyed by parent_hash, limited to FINALITY_DEPTH entries.
+    use noid_chain::consensus::params::FINALITY_DEPTH;
+    use std::collections::HashMap;
+    let mut orphan_pool: HashMap<[u8; 32], noid_chain::block::Block> = HashMap::new();
+
     loop {
         match rx.recv().await {
             Ok(NetworkEvent::NewBlock { from, block_bytes }) => {
@@ -355,8 +400,15 @@ async fn handle_p2p_events(
                 match noid_chain::block::Block::from_bytes(&block_bytes) {
                     Ok(block) => {
                         let local_time = unix_now();
-                        let mut ctx = chain.write().await;
-                        match ctx.apply_next_block(&block, local_time) {
+                        let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+
+                        // Try to apply this block.
+                        let apply_result = {
+                            let mut ctx = chain.write().await;
+                            ctx.apply_next_block(&block, local_time)
+                        };
+
+                        match apply_result {
                             Ok(_) => {
                                 let height = block.header.height;
                                 let confirmed: Vec<_> = block
@@ -364,11 +416,72 @@ async fn handle_p2p_events(
                                     .iter()
                                     .map(|tx| tx.tx_body_hash)
                                     .collect();
-                                let new_view = ChainView::from_mdbx(&ctx);
-                                drop(ctx);
+                                let new_view = ChainView::from_mdbx(&*chain.read().await);
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
+
+                                // Check if any orphan was waiting for this block as parent.
+                                // Apply it now (chain of orphan resolution).
+                                if let Some(orphan) = orphan_pool.remove(&block_hash) {
+                                    tracing::info!(
+                                        height = orphan.header.height,
+                                        "applying buffered orphan block"
+                                    );
+                                    let orphan_bytes = orphan.to_bytes();
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::BroadcastBlock {
+                                            block_bytes: orphan_bytes,
+                                        })
+                                        .await;
+                                    // Re-inject into event stream by applying directly.
+                                    let local_t = unix_now();
+                                    let mut ctx = chain.write().await;
+                                    if let Ok(_) = ctx.apply_next_block(&orphan, local_t) {
+                                        let h = orphan.header.height;
+                                        let conf: Vec<_> = orphan
+                                            .transactions
+                                            .iter()
+                                            .map(|tx| tx.tx_body_hash)
+                                            .collect();
+                                        let nv = ChainView::from_mdbx(&ctx);
+                                        drop(ctx);
+                                        mempool.on_new_block(&conf, h, nv).await;
+                                        update_wallet_for_block(&wallet, &orphan);
+                                        tracing::info!(
+                                            height = h,
+                                            "applied orphan block after parent"
+                                        );
+                                    }
+                                }
+
+                                // Trim orphan pool to FINALITY_DEPTH
+                                if orphan_pool.len() > FINALITY_DEPTH as usize {
+                                    orphan_pool.clear();
+                                }
+                            }
+                            Err(noid_chain::storage::MdbxContextError::Consensus(
+                                noid_chain::consensus::ConsensusError::BadParentHash,
+                            )) => {
+                                // Orphan block: parent unknown.
+                                // Buffer it and request the parent from the peer.
+                                let parent_height = block.header.height.saturating_sub(1);
+                                let our_height = chain.read().await.tip_height();
+                                tracing::info!(
+                                    our_height,
+                                    block_height = block.header.height,
+                                    peer = %from,
+                                    "orphan block — requesting parent at height {parent_height}"
+                                );
+                                // Buffer the orphan (keyed by parent hash).
+                                orphan_pool.insert(block.header.prev_block_hash, block);
+                                // Request the parent.
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestBlock {
+                                        peer: from,
+                                        height: parent_height,
+                                    })
+                                    .await;
                             }
                             Err(e) => {
                                 tracing::warn!(peer = %from, err = %e, "P2P block rejected");
@@ -458,6 +571,10 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
         for tx in &block.transactions {
             w.confirm_pending_tx(&tx.tx_body_hash.0, height);
         }
+        // Save receipts to disk after updating.
+        if !w.receipts.is_empty() {
+            w.save_receipts();
+        }
     }
 }
 
@@ -465,18 +582,20 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 // Background recursive proof updater (P.19)
 // ---------------------------------------------------------------------------
 
-/// Catch up the recursive chain proof if it has fallen behind the tip.
+/// Monitors the recursive chain proof and logs its sync status.
 ///
 /// The recursive proof provides O(1) sync for new nodes. It is NOT required
 /// for consensus validity — this task runs in DEGRADED mode silently.
 ///
-/// In Phase 3, this is a stub that logs the lag. Full implementation in
-/// Phase 5 will call `prove_recursive_step` for each lagging block.
+/// The recursive proof can only advance when real ZK BlockProofs are generated
+/// (i.e. blocks containing ZK-proved transactions). Coinbase-only blocks use
+/// marker hashes and cannot advance the recursive proof. Full recursive proof
+/// advancement (Phase 7) requires: per-block ZK proofs → extract BlockReplayWitness
+/// → call prove_recursive_step → persist to MDBX.
 async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
     use noid_chain::consensus::params::FINALITY_DEPTH;
     use std::time::Duration;
 
-    const LAG_WARNING: u64 = 3;
     const POLL_INTERVAL_SECS: u64 = 30;
 
     loop {
@@ -485,15 +604,23 @@ async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
         let ctx = chain.read().await;
         let tip = ctx.tip_height();
 
-        // Check recursive proof lag.
+        // Parse the stored recursive proof to get its actual block_height.
         let rec_height = match ctx.store.get_recursive_proof() {
-            Ok(Some(_)) => {
-                // Proof exists — TODO Phase 5: parse and check block_height field.
-                // For now, assume it's at the genesis.
-                0u64
+            Ok(Some(bytes)) => {
+                // Try to decode as RecursiveBlockProof to get block_height.
+                match bincode::deserialize::<noid_recursive::prove::RecursiveBlockProof>(&bytes) {
+                    Ok(proof) => proof.block_height,
+                    Err(_) => {
+                        tracing::warn!("recursive proof in store is corrupt or incompatible");
+                        0u64
+                    }
+                }
             }
             Ok(None) => 0u64,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::error!(err = ?e, "failed to read recursive proof from store");
+                continue;
+            }
         };
         drop(ctx);
 
@@ -503,13 +630,18 @@ async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
                 lag,
                 tip,
                 rec_height,
-                "recursive proof FALLBACK mode — light clients cannot O(1) sync"
+                "recursive proof FALLBACK mode — lag exceeds FINALITY_DEPTH, light clients cannot O(1) sync"
             );
-        } else if lag > LAG_WARNING {
-            tracing::info!(lag, "recursive proof DEGRADED — catching up");
-            // Phase 5: call prove_recursive_step for each lagging block.
+        } else if lag > 0 {
+            tracing::debug!(
+                lag,
+                tip,
+                rec_height,
+                "recursive proof DEGRADED — {lag} blocks behind (needs ZK block proofs to advance)"
+            );
+        } else {
+            tracing::debug!("recursive proof NORMAL — fully caught up at height {rec_height}");
         }
-        // lag <= LAG_WARNING: NORMAL mode, no action needed.
     }
 }
 

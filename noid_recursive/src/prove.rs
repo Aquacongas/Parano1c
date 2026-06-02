@@ -39,6 +39,7 @@ use noid_tx::PublicInputs;
 /// The proof is self-contained: verifying it requires only the public
 /// genesis accumulator and the current `block_height`, both of which
 /// are embeddable in a block header.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecursiveBlockProof {
     /// The full interleaved STARK proof over the `RecursiveBlockAir`.
     /// Packs block-n algebraic data + prev recursive data into one proof.

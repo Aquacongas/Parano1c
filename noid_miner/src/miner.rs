@@ -151,8 +151,23 @@ impl BlockMiner {
         self.cancel_pow.store(true, Ordering::Relaxed);
     }
 
+    /// Signal the miner to stop after the current search iteration.
+    /// Call this before dropping/aborting the miner task to ensure
+    /// Rayon threads exit cleanly rather than running a full chunk.
+    pub fn stop(&self) {
+        self.cancel_pow.store(true, Ordering::SeqCst);
+        tracing::info!("miner stop signal sent — Rayon threads will exit at next iteration");
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MinerEvent> {
         self.events.subscribe()
+    }
+
+    /// Return a cloned handle to the PoW cancel flag.
+    /// Call `handle.store(true, Ordering::SeqCst)` to stop mining cleanly.
+    /// This must be called BEFORE `run()` consumes the miner.
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        self.cancel_pow.clone()
     }
 
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.

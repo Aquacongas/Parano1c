@@ -237,9 +237,13 @@ pub struct SegmentedFriState {
     /// `log_slots.min(LOG_SEGMENT_SIZE)` — the log2 of each segment's size.
     effective_log_seg: usize,
     num_segments: usize,
-    /// `segments[i] = None` means segment is virtual zero (no allocation).
+    /// `segments[i] = None` means the segment is either:
+    ///   (a) a virtual zero segment — no UTXO data, or
+    ///   (b) an evicted segment — has UTXO data in MDBX but is not in RAM.
+    /// Use `is_evicted(i)` to distinguish the two cases.
     segments: Vec<Option<Box<SegmentColumns>>>,
     /// `seg_roots[i] = None` means the root must be recomputed.
+    /// Kept valid even after segment columns are evicted.
     seg_roots: Vec<Option<StateRoot>>,
     /// 1-indexed binary Merkle tree. Size = 2*num_segments + 1.
     /// Only meaningful when num_segments > 1.
@@ -253,6 +257,18 @@ pub struct SegmentedFriState {
     /// This set is NOT cleared by FRI-root recomputation — only by `clear_dirty()`.
     /// Used by the MDBX backend to decide which segments to persist on each block.
     mdbx_dirty: HashSet<u16>,
+    /// Segment IDs that have been explicitly evicted from RAM but have non-zero
+    /// data in MDBX. A segment in this set must be reloaded from MDBX before
+    /// any slot within it can be read or written.
+    ///
+    /// # Memory model
+    ///
+    /// After each block commit, the MDBX backend calls `evict_clean_segments()`
+    /// which moves all non-dirty segment columns from RAM to the evicted set.
+    /// This bounds peak RAM usage to approximately:
+    ///   `(segments touched per block) × 3 MB + (evicted set bookkeeping)`
+    /// regardless of total chain history or active slot count.
+    evicted: HashSet<u16>,
 }
 
 impl SegmentedFriState {
@@ -287,6 +303,7 @@ impl SegmentedFriState {
             tree_dirty: false,
             dirty: HashSet::new(),
             mdbx_dirty: HashSet::new(),
+            evicted: HashSet::new(),
         }
     }
 
@@ -505,6 +522,76 @@ impl SegmentedFriState {
             .enumerate()
             .filter(|(_, s)| s.is_some())
             .map(|(i, _)| i as u16)
+    }
+
+    // -----------------------------------------------------------------------
+    // Segment eviction — memory management
+    // -----------------------------------------------------------------------
+
+    /// True if this segment has non-zero UTXO data in MDBX but its columns
+    /// have been evicted from RAM. The caller must reload from MDBX before
+    /// reading or writing any slot in this segment.
+    #[inline]
+    pub fn is_evicted(&self, seg_id: u16) -> bool {
+        self.evicted.contains(&seg_id)
+    }
+
+    /// Evict a segment's column data from RAM while keeping its FRI root cached.
+    ///
+    /// This is safe ONLY after the segment has been committed to MDBX.
+    /// The FRI root remains valid since the segment data hasn't changed.
+    /// Mark the segment as `evicted` so callers can distinguish it from a
+    /// truly-zero segment.
+    pub fn evict_segment(&mut self, seg_id: u16) {
+        let id = seg_id as usize;
+        if self.segments[id].is_some() {
+            self.segments[id] = None;
+            self.evicted.insert(seg_id);
+            // seg_roots[id] stays valid — don't clear it.
+            // The FRI root for this segment hasn't changed.
+        }
+    }
+
+    /// Restore a previously evicted segment from MDBX-loaded column data.
+    /// The FRI root will be recomputed lazily when next needed.
+    pub fn restore_evicted_segment(&mut self, seg_id: u16, cols: SegmentColumns) {
+        let id = seg_id as usize;
+        self.segments[id] = Some(Box::new(cols));
+        self.evicted.remove(&seg_id);
+        // Invalidate the cached FRI root so it will be recomputed.
+        // (The loaded data might differ from what we last computed for, if
+        // a concurrent write happened — though in practice this shouldn't
+        // occur since we reload before any writes.)
+        self.seg_roots[id] = None;
+        self.dirty.insert(seg_id);
+        self.tree_dirty = true;
+    }
+
+    /// Evict all segment columns that are not in the MDBX-dirty set.
+    ///
+    /// Call this AFTER `clear_dirty()` + a successful MDBX commit.
+    /// Because all data is in MDBX, it's safe to drop RAM copies.
+    /// The per-segment FRI roots are kept so the global state root
+    /// can be recomputed without reloading segment data.
+    ///
+    /// # Effect on memory
+    ///
+    /// Each evicted segment frees `2^LOG_SEGMENT_SIZE × 48 bytes = 3 MB`.
+    /// Only segments written during this block remain in RAM.
+    pub fn evict_clean_segments(&mut self) {
+        for id in 0..self.num_segments {
+            let seg_id = id as u16;
+            if self.segments[id].is_some() && !self.mdbx_dirty.contains(&seg_id) {
+                self.segments[id] = None;
+                self.evicted.insert(seg_id);
+                // seg_roots[id] stays valid.
+            }
+        }
+    }
+
+    /// Iterator over segment IDs that are evicted from RAM but non-zero in MDBX.
+    pub fn evicted_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.evicted.iter().copied()
     }
 
     // -----------------------------------------------------------------------

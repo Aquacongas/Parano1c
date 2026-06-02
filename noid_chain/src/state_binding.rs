@@ -105,23 +105,11 @@ impl BlockStateBinding {
     /// `expected_commitments[i]` is the `claims_commitment` from the
     /// i-th transaction's `PublicInputs` (carried inside the LogicProof).
     ///
-    /// # Phase 2 TODO (Security #5): epoch_anchor freshness validation
+    /// # epoch_anchor freshness
     ///
-    /// Currently `epoch_anchor` is absorbed into `tx_body_hash` inside
-    /// LogicProof but its freshness is never verified by the node.
-    /// A mempool node MUST reject any TxIntent where:
-    ///
-    ///   `body.epoch_anchor != hash_block_header(chain[height - ANCHOR_DEPTH])`
-    ///
-    /// This check requires access to the block history, which will be
-    /// available in Phase 2 (Stage P) once `ChainState` tracks the
-    /// canonical header ring. Until then, an attacker can replay an
-    /// epoch_anchor from an arbitrary block (including a deep fork)
-    /// within the anchor window. The cryptographic binding via
-    /// Fiat–Shamir is intact; only the anti-replay / fork-binding
-    /// property is weakened without this check.
-    ///
-    /// Implementation location: `noid_chain::mempool::admit_tx` (Phase 2).
+    /// `epoch_anchor` is verified at mempool admission in `noid_mempool::pool::submit`
+    /// (step 2): the anchor hash must be a known block header within the ANCHOR_DEPTH
+    /// window. Invalid anchors are rejected before the tx enters the pool.
     pub fn build(
         state: &mut SegmentedFriState,
         bodies: &[TxBody],

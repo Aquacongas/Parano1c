@@ -9,7 +9,10 @@
 //! obsolete; block-level state validation ensures `header.state_root`
 //! matches the final computed post-root after all txs are applied, and
 //! `tx_root` equals the Merkle reduction over the transactions'
-//! `tx_body_hash`es (COMPRESS domain, zero-padded to a power of two).
+//! `tx_body_hash`es (Poseidon2b COMPRESS domain, zero-padded to a power of two).
+//! The Poseidon2b-based Merkle tree is ZK-friendly: its internal nodes can be
+//! proved inside the GKR block spine and recursive circuits without expensive
+//! boolean decomposition. Blake3 is reserved for PoW and P2P deduplication.
 
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
@@ -217,22 +220,26 @@ pub fn apply_genesis_block(
 /// each transaction's `tx_body_hash`, zero-padded to the next power of
 /// two. An empty block reduces to `ZERO_DIGEST` so a zero-tx header is
 /// unambiguously representable.
+/// Compute the tx_root Merkle hash over a block's transaction hashes.
+///
+/// Uses a Poseidon2b COMPRESS binary Merkle tree, padded to the next power
+/// of two (minimum 2). Poseidon2b is chosen because this Merkle root feeds
+/// directly into the ZK block spine and recursive proof system — the internal
+/// nodes are proved in-circuit, which requires a ZK-native hash function.
+/// Blake3 is NOT ZK-friendly and would make in-circuit proofs prohibitively large.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
     if txs.is_empty() {
         return [0u8; 32];
     }
+    // Pad to at least 2 so the tree always has at least one internal node.
     let target = txs.len().next_power_of_two().max(2);
-    let mut level: Vec<Digest> = Vec::with_capacity(target);
-    for tx in txs {
-        level.push(tx.tx_body_hash.0);
-    }
+    let mut level: Vec<Digest> = txs.iter().map(|tx| tx.tx_body_hash.0).collect();
     level.resize(target, [0u8; 32]);
     while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
-            next.push(compress(&pair[0], &pair[1]));
-        }
-        level = next;
+        level = level
+            .chunks_exact(2)
+            .map(|pair| compress(&pair[0], &pair[1]))
+            .collect();
     }
     level[0]
 }

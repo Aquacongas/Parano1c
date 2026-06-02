@@ -44,6 +44,9 @@ pub enum NetworkCommand {
         from_height: u64,
         count: u16,
     },
+    /// Request a specific block by height from a peer (orphan resolution).
+    /// Emits `NetworkEvent::NewBlock` if the peer has the block.
+    RequestBlock { peer: PeerId, height: u64 },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -120,6 +123,14 @@ impl P2PNetwork {
                 from_height,
                 count,
             })
+            .await;
+    }
+
+    /// Request a specific block by height from a peer (orphan resolution).
+    pub async fn request_block(&self, peer: PeerId, height: u64) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::RequestBlock { peer, height })
             .await;
     }
 
@@ -206,8 +217,18 @@ async fn run_swarm(
                                 .block_sync
                                 .send_request(&peer, crate::protocol::GetRecentBlockRequest { height: h });
                             tracing::debug!(peer = %peer, height = h, "requesting block for sync");
-                            let _ = req_id; // OutboundRequestId, not needed
+                            let _ = req_id;
                         }
+                    }
+                    Some(NetworkCommand::RequestBlock { peer, height }) => {
+                        // Orphan resolution: request a specific block by height.
+                        // Used when we receive a block whose parent is unknown.
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .block_sync
+                            .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
+                        tracing::debug!(peer = %peer, height, "requesting block for orphan resolution");
+                        let _ = req_id;
                     }
                     None => break, // cmd_tx dropped
                 }

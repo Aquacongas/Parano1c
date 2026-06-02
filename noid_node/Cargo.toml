@@ -37,6 +37,7 @@ tracing-subscriber = { workspace = true }
 # Serialization
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+bincode            = "1"
 
 # Error handling
 anyhow             = { workspace = true }
@@ -55,6 +56,12 @@ reqwest = { version = "0.12", features = ["json"] }
 # Wallet security: key derivation + symmetric encryption
 rand             = "0.8"
 zeroize          = { version = "1", features = ["zeroize_derive"] }
+
+# Memory: jemalloc as global allocator.
+# glibc malloc retains freed pages from large ZK allocations (FRI/NTT Vecs)
+# indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
+# the OS aggressively via background threads (dirty_decay_ms=1000).
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 tempfile = "3"

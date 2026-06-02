@@ -87,11 +87,29 @@ impl MdbxStore {
     /// Open or create the MDBX database at `path`.
     /// Creates all tables on first run; subsequent opens reuse them.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        use libmdbx::{ReadWriteOptions, SyncMode};
+        // Set explicit MDBX geometry via ReadWriteOptions.
+        //
+        // Default libmdbx pre-allocates ~256 MB on first open regardless of actual data
+        // size. For a node with 160 active UTXOs this wastes disk and inflates VmSize.
+        //
+        // Sizing rationale:
+        //   min_size  = 4 MB  — enough for genesis + a few hundred blocks
+        //   max_size  = 16 GB — full state at log_slots=32: ~768 MB segments
+        //                        + headers + nullifiers + undo logs + margin
+        //   growth_step = 64 MB — incremental growth to avoid excessive resize churn
+        let rw = ReadWriteOptions {
+            sync_mode: SyncMode::Durable,
+            min_size: Some(4 * 1024 * 1024),         //  4 MB
+            max_size: Some(16 * 1024 * 1024 * 1024), // 16 GB
+            growth_step: Some(64 * 1024 * 1024),     // 64 MB steps
+            ..Default::default()
+        };
         let db = Database::<NoWriteMap>::open_with_options(
             path,
             DatabaseOptions {
                 max_tables: Some(N_TABLES),
-                mode: Mode::ReadWrite(Default::default()),
+                mode: Mode::ReadWrite(rw),
                 ..Default::default()
             },
         )?;

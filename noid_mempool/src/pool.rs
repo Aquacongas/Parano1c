@@ -148,6 +148,27 @@ impl AsyncMempool {
             verify_result.map_err(|e| SubmitError::InvalidProof(e))?;
         }
 
+        // --- Security: tx_body_hash consistency (fast, before lock) ---
+        // Verify the wire tx_body_hash matches the actual body.
+        // Defense-in-depth against hash-confusion attacks where a peer sends
+        // a TxIntent whose hash field doesn't match its body. The ZK proof
+        // already catches this, but only after CPU-heavy work.
+        if !intent.tx_body.is_coinbase {
+            use noid_tx::hash_tx_body;
+            let computed = hash_tx_body(
+                &intent.tx_body.epoch_anchor,
+                intent.tx_body.fee,
+                &intent.tx_body.inputs,
+                &intent.tx_body.outputs,
+                intent.tx_body.is_coinbase,
+            );
+            if computed != intent.tx_body_hash {
+                return Err(SubmitError::MalformedIntent(
+                    "tx_body_hash does not match body (hash confusion attack)".into(),
+                ));
+            }
+        }
+
         let mut st = self.state.lock().await;
 
         let tx = intent_to_transaction(&intent)?;
@@ -485,8 +506,16 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
         };
         let actual = view.slot(idx);
         if actual != expected {
+            // Log diagnostic: expected non-empty slot but got EMPTY.
+            // Common cause: the segment containing this slot was evicted from
+            // the ChainView's SegmentedFriState. Check preload_all_evicted_segments.
+            tracing::warn!(
+                slot_index = idx,
+                expected_value = inp.value,
+                actual_empty = actual.is_empty(),
+                "check_input_slots: slot mismatch — likely evicted segment in ChainView"
+            );
             return Err(SubmitError::Consensus(
-                // Use BadStateRoot as a proxy for "input slot mismatch"
                 noid_chain::consensus::ConsensusError::BadStateRoot,
             ));
         }

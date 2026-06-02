@@ -14,4 +14,5 @@ noid_stark = { path = "../noid_stark" }
 noid_chain = { path = "../noid_chain" }
 noid_tx = { path = "../noid_tx" }
 rayon = "1"
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"

@@ -10,7 +10,7 @@ use noid_poseidon2b::primitives::Digest;
 ///
 /// Each block extends this by one step; `verify_tip` checks
 /// that the accumulator reaches the expected genesis state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainAccumulator {
     /// Block height (number of blocks applied since genesis).
     pub height: u64,

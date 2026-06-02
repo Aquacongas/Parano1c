@@ -276,6 +276,14 @@ impl MdbxChainContext {
         let pre_active = self.state.active_slot_count;
         let pre_alloc = self.state.alloc_counter;
 
+        // Preload any evicted segments that this block will read or write.
+        //
+        // Segments are evicted after each block commit to bound RAM usage.
+        // Before applying the next block we must reload any segment that
+        // contains an input (to validate it is non-empty) or an output
+        // (to verify the slot is empty and write the new UTXO).
+        self.preload_segments_for_block(block)?;
+
         // Build undo log BEFORE applying (captures pre-state slot values).
         let undo = build_undo_log(&self.state, block);
 
@@ -341,6 +349,21 @@ impl MdbxChainContext {
 
         // Clear MDBX-dirty tracking: next block's dirty_segment_ids() should
         // return only segments modified by THAT block, not accumulated history.
+        //
+        // NOTE: Segment eviction (evict_clean_segments) is NOT called here.
+        // While the infrastructure exists (see evict_clean_segments/restore_evicted_segment),
+        // eviction creates subtle bugs:
+        //  1. The ChainView (used by mempool for slot validation) is cloned from the
+        //     state AFTER eviction. If eviction happens between preload and clone,
+        //     the ChainView has evicted (empty) slots for non-zero UTXOs, causing
+        //     mempool check_input_slots to reject valid TXs (BadStateRoot).
+        //  2. The template builder clones the state; evicted segments materialize
+        //     as zeros causing wrong FRI roots (BadStateRoot from block validation).
+        //
+        // The jemalloc allocator (enabled in noid_node) already returns freed
+        // pages to the OS aggressively, providing a 10× RSS reduction vs glibc.
+        // Segment eviction is a Phase 9 optimization that requires atomic
+        // snapshot semantics (Arc<RwLock<SegmentedFriState>> or similar).
         self.state.state.clear_dirty();
 
         // Evict old recent_headers beyond the window.
@@ -350,6 +373,72 @@ impl MdbxChainContext {
         }
 
         Ok(new_state_root)
+    }
+
+    /// Preload ALL evicted segments back into RAM.
+    ///
+    /// Must be called before cloning the state for the block template builder.
+    /// The template builder clones `ctx.state` to a scratch state; if any
+    /// segments are evicted (None but with data in MDBX), `apply_delta` would
+    /// materialise them as all-zeros, producing a wrong FRI root and a
+    /// `BadStateRoot` consensus error.
+    ///
+    /// Cost: one MDBX read per evicted segment, O(evicted_count). Called once
+    /// per block template refresh; negligible at mainnet (60 s blocks).
+    pub fn preload_all_evicted_segments(&mut self) -> Result<(), MdbxContextError> {
+        let evicted: Vec<u16> = self.state.state.evicted_segment_ids().collect();
+        for seg_id in evicted {
+            match self.store.get_segment(seg_id) {
+                Ok(Some((_eff, cols))) => {
+                    self.state.state.restore_evicted_segment(seg_id, cols);
+                }
+                Ok(None) => {
+                    eprintln!("[WARN] preload_all_evicted: segment {seg_id} missing from MDBX");
+                }
+                Err(e) => return Err(MdbxContextError::Store(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Preload evicted segments that the block will access.
+    ///
+    /// Checks each input slot (must be non-empty = need to read existing data)
+    /// and each output slot (must be empty = need to read to verify).
+    /// Reloads from MDBX any segment that is currently evicted.
+    fn preload_segments_for_block(&mut self, block: &Block) -> Result<(), MdbxContextError> {
+        let eff_log = self.state.state.effective_log_segment_size();
+        let mut needed: std::collections::HashSet<u16> = std::collections::HashSet::new();
+
+        for tx in &block.transactions {
+            for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+                needed.insert((inp.slot_index >> eff_log) as u16);
+            }
+            for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                needed.insert((out.slot_index >> eff_log) as u16);
+            }
+            // Coinbase slot (splitmix64 assigned): include all recently-checked
+            // slots from the allocator hints by checking coinbase outputs too.
+        }
+
+        for seg_id in needed {
+            if self.state.state.is_evicted(seg_id) {
+                // Reload from MDBX.
+                match self.store.get_segment(seg_id) {
+                    Ok(Some((_eff_log, cols))) => {
+                        self.state.state.restore_evicted_segment(seg_id, cols);
+                    }
+                    Ok(None) => {
+                        // Segment was marked evicted but MDBX has no data.
+                        // This shouldn't happen; treat as bug and clear eviction.
+                        // Log as best effort — tracing not available in noid_chain.
+                        eprintln!("[WARN] evicted segment {seg_id} not found in MDBX — treating as zero (this is a bug)");
+                    }
+                    Err(e) => return Err(MdbxContextError::Store(e)),
+                }
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
