@@ -29,13 +29,26 @@ use noid_tx::{hash_tx_body, Transaction};
 /// 3. `tx.tx_body_hash` is not in the nullifier set
 pub fn validate_tx_consensus(
     tx: &Transaction,
-    block_height: u64,
     nullifiers: &NullifierSet,
 ) -> Result<(), ConsensusError> {
-    // Fee must fit in u64. Values in this protocol are 64-bit; a fee > u64::MAX
-    // is malformed and must be rejected before any further processing.
+    // 0. Fee must fit in u64 (values are 64-bit in this protocol).
     if tx.body.fee > u64::MAX as u128 {
         return Err(ConsensusError::BadFee);
+    }
+
+    // 0b. Coinbase fee must be zero (SPECIFICATION.md §12: "fee: 0").
+    if tx.body.is_coinbase && tx.body.fee != 0 {
+        return Err(ConsensusError::BadFee);
+    }
+
+    // 0c. Coinbase must have exactly one valid output (SPECIFICATION.md §12).
+    if tx.body.is_coinbase {
+        let n_valid_outputs = tx.body.outputs.iter().filter(|o| o.valid).count();
+        if n_valid_outputs != 1 {
+            return Err(ConsensusError::ShapeMismatch(format!(
+                "coinbase must have exactly 1 valid output, got {n_valid_outputs}"
+            )));
+        }
     }
 
     // 1. tx_body_hash binding.
@@ -50,30 +63,14 @@ pub fn validate_tx_consensus(
         return Err(ConsensusError::BadTxBodyHash);
     }
 
-    // 2. epoch_anchor window check.
-    // The epoch_anchor is a 32-byte block hash. We validate the HEIGHT it refers
-    // to is within the window. The actual hash binding is proven by LogicProof
-    // (ZK layer); here we check the height embedded in the anchor.
-    //
-    // NOTE: For the native check, we cannot verify the anchor hash against actual
-    // headers without a HeaderProvider. We validate the structural window only.
-    // The full cryptographic anchor check is done in validate_block_full() (noid_block)
-    // when we have access to the header chain.
-    //
-    // For coinbase transactions, epoch_anchor is meaningless (no state dependency).
-    if !tx.body.is_coinbase {
-        // We can only do the height-based check if the public inputs carry the anchor height.
-        // Since TxIntent/Transaction carries epoch_anchor as a raw 32-byte hash (not height),
-        // the height check is deferred to the full validator.
-        // Here we just ensure the anchor is non-zero for non-coinbase txs.
-        if tx.body.epoch_anchor == [0u8; 32] {
-            return Err(ConsensusError::BadEpochAnchor);
-        }
+    // 2. epoch_anchor: non-zero for non-coinbase (structural check).
+    //    The full cryptographic check (anchor hash ∈ known headers within window)
+    //    is done at mempool admission (`mempool_checks.rs`) and at full block
+    //    validation in `noid_block::validate_block_full()` where a HeaderProvider
+    //    is available.
+    if !tx.body.is_coinbase && tx.body.epoch_anchor == [0u8; 32] {
+        return Err(ConsensusError::BadEpochAnchor);
     }
-
-    // Suppress unused variable warning for block_height; the full anchor-height
-    // check (using HeaderProvider) is deferred to noid_block::validate_block_full().
-    let _ = block_height;
 
     // 3. Nullifier collision.
     if nullifiers.contains(&tx.tx_body_hash) {
@@ -166,7 +163,7 @@ mod tests {
     fn valid_tx_passes() {
         let tx = make_tx(vec![], vec![dummy_output(1)], false);
         let ns = NullifierSet::new();
-        assert!(validate_tx_consensus(&tx, 10, &ns).is_ok());
+        assert!(validate_tx_consensus(&tx, &ns).is_ok());
     }
 
     #[test]
@@ -175,7 +172,7 @@ mod tests {
         tx.tx_body_hash = TxBodyHash([0xAB; 32]); // tamper
         let ns = NullifierSet::new();
         assert_eq!(
-            validate_tx_consensus(&tx, 10, &ns),
+            validate_tx_consensus(&tx, &ns),
             Err(ConsensusError::BadTxBodyHash)
         );
     }
@@ -186,7 +183,7 @@ mod tests {
         let mut ns = NullifierSet::new();
         ns.insert_block(&[tx.tx_body_hash]);
         assert_eq!(
-            validate_tx_consensus(&tx, 10, &ns),
+            validate_tx_consensus(&tx, &ns),
             Err(ConsensusError::NullifierCollision)
         );
     }
@@ -206,7 +203,7 @@ mod tests {
         tx.tx_body_hash = hash;
         let ns = NullifierSet::new();
         assert_eq!(
-            validate_tx_consensus(&tx, 10, &ns),
+            validate_tx_consensus(&tx, &ns),
             Err(ConsensusError::BadEpochAnchor)
         );
     }
@@ -215,7 +212,7 @@ mod tests {
     fn coinbase_zero_anchor_allowed() {
         let tx = make_tx(vec![], vec![dummy_output(1)], true); // is_coinbase=true, epoch_anchor=[0;32]
         let ns = NullifierSet::new();
-        assert!(validate_tx_consensus(&tx, 10, &ns).is_ok());
+        assert!(validate_tx_consensus(&tx, &ns).is_ok());
     }
 
     #[test]
@@ -260,9 +257,91 @@ mod tests {
             tx_body_hash: hash_bytes,
         };
         let ns = NullifierSet::new();
+        assert_eq!(validate_tx_consensus(&tx, &ns), Err(ConsensusError::BadFee));
+    }
+
+    #[test]
+    fn coinbase_must_have_exactly_one_output() {
+        // 0 outputs: rejected
+        let body_no_output = TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![],
+            is_coinbase: true,
+        };
+        let h0 = hash_tx_body(
+            &body_no_output.epoch_anchor,
+            body_no_output.fee,
+            &body_no_output.inputs,
+            &body_no_output.outputs,
+            body_no_output.is_coinbase,
+        );
+        let tx0 = Transaction {
+            body: body_no_output,
+            tx_body_hash: h0,
+        };
+        let ns = NullifierSet::new();
+        assert!(
+            matches!(
+                validate_tx_consensus(&tx0, &ns),
+                Err(ConsensusError::ShapeMismatch(_))
+            ),
+            "coinbase with 0 outputs must be rejected"
+        );
+
+        // 2 outputs: rejected
+        let body_two = TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![dummy_output(1), dummy_output(2)],
+            is_coinbase: true,
+        };
+        let h2 = hash_tx_body(
+            &body_two.epoch_anchor,
+            body_two.fee,
+            &body_two.inputs,
+            &body_two.outputs,
+            body_two.is_coinbase,
+        );
+        let tx2 = Transaction {
+            body: body_two,
+            tx_body_hash: h2,
+        };
+        assert!(
+            matches!(
+                validate_tx_consensus(&tx2, &ns),
+                Err(ConsensusError::ShapeMismatch(_))
+            ),
+            "coinbase with 2 outputs must be rejected"
+        );
+    }
+
+    #[test]
+    fn coinbase_nonzero_fee_rejected() {
+        let body = TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 1,
+            inputs: vec![],
+            outputs: vec![dummy_output(5)],
+            is_coinbase: true,
+        };
+        let h = hash_tx_body(
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        let tx = Transaction {
+            body,
+            tx_body_hash: h,
+        };
         assert_eq!(
-            validate_tx_consensus(&tx, 10, &ns),
-            Err(ConsensusError::BadFee)
+            validate_tx_consensus(&tx, &NullifierSet::new()),
+            Err(ConsensusError::BadFee),
+            "coinbase with non-zero fee must be rejected"
         );
     }
 

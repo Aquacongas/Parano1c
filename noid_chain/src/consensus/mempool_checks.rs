@@ -58,7 +58,7 @@ pub fn validate_tx_for_mempool(
     }
 
     // --- Step 1: basic consensus checks ---
-    validate_tx_consensus(tx, ctx.tip_height + 1, &ctx.nullifiers)?;
+    validate_tx_consensus(tx, &ctx.nullifiers)?;
 
     // --- Step 2: epoch_anchor hash must be a known header within window ---
     if !tx.body.is_coinbase {

@@ -119,7 +119,7 @@ pub fn validate_block_consensus(
 
     // --- Per-tx consensus checks (P.8) ---
     for tx in &block.transactions {
-        validate_tx_consensus(tx, block.header.height, nullifiers)?;
+        validate_tx_consensus(tx, nullifiers)?;
     }
 
     // --- Coinbase amount validation (P.7) ---

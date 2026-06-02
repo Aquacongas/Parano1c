@@ -194,9 +194,10 @@ pub fn build_block_template(
     // Find an empty slot for coinbase output using the allocator.
     // Use the scratch state's actual capacity so hints are always in range.
     let coinbase_slot = {
-        // scratch.state is SegmentedFriState; log_slots() gives the valid range.
         let state_log_slots = scratch.state.log_slots() as u32;
-        let hints = generate_slot_hints(scratch.alloc_counter, state_log_slots, 64);
+        // Use 256 hints to keep failure probability negligible even at high occupancy
+        // (p_all_occupied = occupancy^256; at 90% occupancy ≈ 2×10^{-12}).
+        let hints = generate_slot_hints(scratch.alloc_counter, state_log_slots, 256);
         hints
             .into_iter()
             .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY)
