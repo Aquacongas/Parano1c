@@ -552,3 +552,92 @@ than a state tree.
 
 The choice is non-consensus: both modes produce identical state_roots.
 Nodes can switch modes via snapshot export/import.
+
+---
+
+## 19. Phase 2 Design Decisions
+
+### 19.1 Two-tier dirty-segment tracking
+
+`SegmentedFriState` originally had one `dirty: HashSet<u16>` tracking which
+segments need FRI root recomputation. This set is cleared automatically when
+`flush_segment()` recomputes the FRI root — which happens on every `root()` call,
+which happens inside every `apply_delta` call.
+
+The MDBX backend needs to know *which segments changed since the last disk
+commit* — a different, longer-lived concept. The two needs are served by two
+independent sets:
+
+- `dirty` (FRI-root tracking): cleared automatically by `flush_segment`. Fast
+  NTT path.
+- `mdbx_dirty` (MDBX-commit tracking): cleared only by explicit `clear_dirty()`
+  after a successful `commit_block`. This correctly accumulates all mutations
+  within a block and is reset per-block.
+
+`dirty_segment_ids()` returns `mdbx_dirty`, making the API match the MDBX use
+case. The old FRI-dirty tracking is purely internal.
+
+### 19.2 set_segment_columns for O(1) restore
+
+Restoring state from MDBX used to call `set_slot` for each non-empty slot. For
+`log_slots=24` with many live slots, this would:
+- Trigger O(n) `apply_delta` calls, each calling `root()` and recomputing the
+  FRI NTT for the segment
+- Mark all restored segments as `mdbx_dirty`, causing them to be re-written to
+  MDBX on the first block after restart
+
+`set_segment_columns` directly installs column data in O(1) per segment, marks
+only `dirty` (FRI recomputation deferred to next `root()` call), and does NOT
+mark `mdbx_dirty` (data is already in MDBX).
+
+### 19.3 Nullifier set rebuild on restart
+
+The original `restore_from_mdbx` left the RAM `NullifierSet` empty after restart,
+with a TODO comment claiming "individual nullifiers are still in the DB". This was
+wrong: `validate_block_consensus` uses the RAM `NullifierSet`, not the MDBX
+T_NULLIFIERS table. An attacker could double-spend any transaction confirmed in
+the last 144 blocks by resubmitting it after a node restart.
+
+The fix: on startup, read the last ANCHOR_DEPTH block heights from T_NULLIFIER_BLOCKS
+and call `NullifierSet::rebuild_from_blocks`. The rebuild is conservative (blocks
+with no transactions are skipped in T_NULLIFIER_BLOCKS, slightly reducing the VecDeque
+window count vs. a running node, but `total_nullifiers()` is always correct).
+
+### 19.4 RAM rollback on MDBX commit failure
+
+`validate_block_consensus` mutates `self.state` (slot data, active_slot_count,
+alloc_counter) before the MDBX commit. If the commit fails:
+
+**Before fix:** RAM was at H+1, MDBX at H. The node was in a split state with no
+recovery path short of restart.
+
+**After fix:** On MDBX commit failure, `apply_next_block` calls `revert_block`
+with the pre-built undo log and restores the counters. Both RAM and MDBX are at H.
+The caller can retry or skip the block without restarting.
+
+### 19.5 Prune-failure non-propagation
+
+`prune_after_commit` (which deletes stale undo logs, recent blocks, and nullifiers)
+ran inside `commit_block` and propagated errors via `?`. A disk-full condition
+during pruning would cause `commit_block` to return `Err` even though the block
+was already durably committed to MDBX. The next call to `apply_next_block` would
+then fail consensus validation (block H+1 trying to apply on top of a state that
+already has H+1).
+
+The fix: prune failures are silently ignored. Stale entries accumulate until the
+next successful commit, but the chain state is always consistent.
+
+### 19.6 T_TX_INDEX: unbounded growth
+
+The `tx_index` table maps TxBodyHash → (height, tx_pos) and is never pruned. At
+BLOCK_MAX_TXS=1024 txs/block × 32B/hash ≈ 32 KB/block. At 1 block/minute for 10
+years ≈ 1.6 GB. This is acceptable and matches the design intent (receipts are
+verifiable forever). Operators should provision accordingly.
+
+### 19.7 T_NULLIFIERS: reserved for Phase 3
+
+T_NULLIFIERS maps TxBodyHash → block_height for O(1) single-hash lookup. It is
+currently unused at runtime (the RAM NullifierSet is used for all consensus checks,
+and T_NULLIFIER_BLOCKS is used for rebuild). It is retained for the Phase 3 RPC
+endpoint `paranoid_checkNullifier` which will need O(1) persistent lookup without
+loading the full RAM set.

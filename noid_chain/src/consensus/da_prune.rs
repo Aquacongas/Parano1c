@@ -20,6 +20,7 @@ use crate::consensus::params::UNDO_LOG_RETENTION;
 use crate::fri_state::SlotValue;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
+use noid_poseidon2b::primitives::TxBodyHash;
 
 /// Per-block undo log. Records the pre-image value of every UTXO slot
 /// mutated by the block, enabling reversion without the full block data.
@@ -34,6 +35,10 @@ pub struct BlockUndoLog {
     /// this block, recorded in application order. Replaying these in
     /// *reverse* order restores the pre-block UTXO state.
     pub slot_changes: Vec<(u32, SlotValue)>,
+    /// tx_body_hashes of all transactions in this block (coinbase first).
+    /// Used to restore the mempool after a reorg: txs that are no longer
+    /// on the canonical chain can be re-admitted.
+    pub tx_hashes: Vec<TxBodyHash>,
 }
 
 impl BlockUndoLog {
@@ -42,6 +47,7 @@ impl BlockUndoLog {
         Self {
             block_height,
             slot_changes: vec![],
+            tx_hashes: vec![],
         }
     }
 }
@@ -58,6 +64,7 @@ impl BlockUndoLog {
 /// skipped (the block pipeline will have already rejected them via
 /// `apply_block`).
 pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog {
+    let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|t| t.tx_body_hash).collect();
     let mut slot_changes = Vec::new();
 
     for tx in &block.transactions {
@@ -86,6 +93,7 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
     BlockUndoLog {
         block_height: block.header.height,
         slot_changes,
+        tx_hashes,
     }
 }
 

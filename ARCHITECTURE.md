@@ -848,76 +848,90 @@ paths in a larger hypercube): ~8 KB total for typical blocks.
 
 ### 12.1 Architecture
 
+```rust
+StateBackend (trait):
+  get_slot(seg_id, local_idx) → SlotValue
+  set_slot(seg_id, local_idx, val)
+  load_segment_columns(seg_id) → &SegmentColumns
+  flush()
+  state_root() → StateRoot
+
+Implementations: RamBackend (Vec<Block128>) | MdbxChainContext (libmdbx mmap)
 ```
-  ┌─────────────────────────────────────────────────┐
-  │              Chain Layer (noid_chain)            │
-  │                                                 │
-  │  ChainState { segments, seg_roots, tree_cache } │
-  │         │                                       │
-  │         ▼                                       │
-  │  ┌─────────────────────────────────────┐        │
-  │  │        StateBackend (trait)          │        │
-  │  │                                     │        │
-  │  │  get_slot(seg, idx) → SlotValue     │        │
-  │  │  set_slot(seg, idx, val)            │        │
-  │  │  load_segment(seg) → columns        │        │
-  │  │  flush()                            │        │
-  │  └────────────┬────────────────┬───────┘        │
-  │               │                │                │
-  │    ┌──────────┴──┐    ┌───────┴────────┐       │
-  │    │  InMemory   │    │   MdbxBackend  │       │
-  │    │ Vec<Block128>│    │  libmdbx mmap │       │
-  │    │ (default)   │    │ (--storage=disk)│       │
-  │    └─────────────┘    └────────────────┘       │
-  └─────────────────────────────────────────────────┘
-```
+
+Additional traits in `noid_chain::storage`:
+- `BlockStore` — unified durable chain access (headers, recent blocks, recursive proof, tx_index)
+- `HeaderProvider` — read-only header access
+- `NullifierProvider` — read-only nullifier lookup
 
 ### 12.2 RAM backend (default)
 
-All segment columns in `Vec<Block128>`. Maximum performance. Suitable
-when the full state fits in available RAM (up to ~3 GB at log_slots=26).
+All segment columns in `Vec<Block128>`. Max performance. Up to ~3 GB at log_slots=26.
 
-### 12.3 Disk backend (MDBX)
+### 12.3 Disk backend (MDBX) — `MdbxChainContext`
 
-Uses libmdbx (the same engine as Reth/Erigon). Key-value store where:
-- Key: `(segment_id: u16, column: u8, local_idx: u16)` — 5 bytes
-- Value: `Block128` — 16 bytes
+11 named MDBX tables (all in `noid_chain/src/storage/mdbx_store.rs`):
 
-Properties:
-- Memory-mapped reads: slot lookups are pointer dereferences
-- Copy-on-write: crash-safe without WAL
-- OS manages page cache: hot segments stay in memory
-- Scales to terabytes (proven by Ethereum archive nodes)
+| Table | Key | Value | Retention |
+|-------|-----|-------|-----------|
+| `headers` | height:u64 | BlockHeader (276B) | **FOREVER** |
+| `h2h` | [u8;32] hash | height:u64 | **FOREVER** |
+| `tip` | `[0]` | (height:u64, hash:[u8;32]) | latest |
+| `segments` | seg_id:u16 | column blob (values+owners_hi+lo) | **FOREVER** |
+| `state_meta` | `[0]` | (log_slots:u32, active:u64, alloc:u64) | latest |
+| `nullifiers` | TxBodyHash | block_height:u64 | ANCHOR_DEPTH = 144 blocks |
+| `nul_blk` | height:u64 | packed TxBodyHashes | ANCHOR_DEPTH = 144 blocks |
+| `undo` | height:u64 | BlockUndoLog | FINALITY_DEPTH = 18 blocks |
+| `recent` | height:u64 | Block bytes | FINALITY_DEPTH = 18 blocks |
+| `rec_proof` | `[0]` | RecursiveBlockProof (6.5 KB) | **FOREVER** |
+| `tx_index` | TxBodyHash | (height:u64, tx_pos:u32) | **FOREVER** |
 
-During block production, dirty segment columns are loaded into a
-temporary buffer for NTT. The buffer is released after computing
-the segment FRI root.
+**Atomic commit (P.18):** Steps 1–7.5 execute inside a single MDBX write transaction. Either the full block is committed or nothing changes. Post-commit pruning is separate and non-fatal — a prune failure only leaves stale old entries, the chain remains consistent.
 
-### 12.4 When to use which
+**Crash recovery:** On restart, `open_or_create` reads `chain_tip` and rebuilds:
+- Segment columns → `SegmentedFriState` (via `set_segment_columns`, no mdbx_dirty marking)
+- State root integrity check (restored root vs. stored tip header `state_root`)
+- Nullifier set → reconstructed from `nul_blk` table for last ANCHOR_DEPTH blocks
+- Recent headers → loaded for last `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` blocks
+
+**RAM rollback on MDBX failure:** If `commit_block` returns an error, `apply_next_block` immediately calls `revert_block(&undo)` and restores the pre-block counters. No restart needed.
+
+### 12.4 Dirty-segment tracking (two-tier)
+
+`SegmentedFriState` maintains two separate dirty sets:
+
+| Set | Purpose | Cleared by |
+|-----|---------|-----------|
+| `dirty: HashSet<u16>` | FRI root is stale, needs NTT recomputation | `flush_segment()` (automatic on `root()`) |
+| `mdbx_dirty: HashSet<u16>` | Segment needs writing to MDBX | `clear_dirty()` (explicit, after MDBX commit) |
+
+`dirty_segment_ids()` returns `mdbx_dirty`. `clear_dirty()` is called:
+- After each successful `commit_block` → next block only writes its own changes
+- NOT needed after restore (segments loaded via `set_segment_columns` bypass `mdbx_dirty`)
+
+### 12.5 When to use which
 
 ```
-  log_slots ≤ 26  (~3 GB):    RAM recommended, disk optional
-  log_slots  = 27  (~6 GB):    Disk recommended
-  log_slots  > 27  (12+ GB):   Disk mandatory
+log_slots ≤ 26  (~3 GB):    RAM recommended  (RamBackend)
+log_slots  = 27  (~6 GB):   Disk recommended  (MdbxChainContext)
+log_slots  > 27  (12+ GB):  Disk mandatory    (MdbxChainContext)
 ```
 
-### 12.5 Snapshot format
+### 12.6 Snapshot format
 
-Both backends can export/import state as a flat binary snapshot:
 - Header: magic, version, log_slots, active_slot_count, alloc_counter
-- Body: all segment columns in order (segment 0 values, segment 0
-  owners_hi, segment 0 owners_lo, segment 1 values, ...)
+- Body: all segment columns in order
 - Footer: state_root for integrity check
 
-A node can switch backends by exporting a snapshot and re-importing.
-
-### 12.6 Implementation location
+### 12.7 Implementation location
 
 ```
-  noid_chain/src/storage/mod.rs        StateBackend trait
-  noid_chain/src/storage/memory.rs     InMemory backend
-  noid_chain/src/storage/mdbx.rs       MDBX backend
-  noid_chain/src/segmented_state.rs    SegmentedFriState (replaces FriState)
+noid_chain/src/storage/mod.rs          StateBackend + BlockStore traits
+noid_chain/src/storage/memory.rs       RamBackend
+noid_chain/src/storage/mdbx_store.rs   MdbxStore (11 tables, commit_block, BlockStore impl)
+noid_chain/src/storage/mdbx_context.rs MdbxChainContext (crash-safe context)
+noid_chain/src/storage/serial.rs       LE serialization for all MDBX types
+noid_chain/src/segmented_state.rs      SegmentedFriState (two-tier dirty tracking)
 ```
 
 ---

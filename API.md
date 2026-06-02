@@ -29,6 +29,7 @@ external miner via Block Template API).
 7. [Data Availability API](#7-data-availability-api)
 8. [Wire Formats](#8-wire-formats)
 9. [Error Codes](#9-error-codes)
+10. [Storage & Persistence API](#10-storage--persistence-api)
 
 ---
 
@@ -1231,6 +1232,170 @@ BlockProof (full):
 | `B011` | `EpochAnchorOutOfWindow` | TxIntent uses expired epoch_anchor |
 | `B012` | `CoinbaseInvalid` | Coinbase violates rules (not first, wrong value, etc.) |
 | `B013` | `BlockWithholdingDetected` | da_root inconsistent with coinbase |
+
+---
+
+## 10. Storage & Persistence API
+
+The storage layer (Phase 2) provides crash-consistent persistence via MDBX.
+All chain data is read/written through traits defined in
+`noid_chain::storage`.
+
+### 10.1 Core Traits
+
+```rust
+/// Unified durable chain store. Implemented by `MdbxStore`.
+pub trait BlockStore: Send + Sync {
+    fn best_tip(&self) -> Option<(u64, [u8; 32])>;
+    fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError>;
+    fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
+    fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
+    fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError>;
+    fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError>;
+    fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError>;
+}
+
+/// Read-only header access.
+pub trait HeaderProvider {
+    fn get_header(&self, height: u64) -> Option<BlockHeader>;
+    fn get_header_by_hash(&self, hash: &[u8; 32]) -> Option<BlockHeader>;
+}
+
+/// Read-only nullifier check.
+pub trait NullifierProvider {
+    fn contains_nullifier(&self, hash: &TxBodyHash) -> bool;
+}
+```
+
+### 10.2 MdbxStore — Block-Level Methods
+
+```rust
+// Read
+get_chain_tip()  -> Result<Option<(u64, [u8;32])>>
+get_state_meta() -> Result<Option<(u32, u64, u64)>>   // (log_slots, active, alloc)
+get_header(height)             -> Result<Option<BlockHeader>>
+get_header_by_hash(hash)       -> Result<Option<BlockHeader>>
+get_undo_log(height)           -> Result<Option<BlockUndoLog>>
+get_segment(seg_id)            -> Result<Option<(u8, SegmentColumns)>>
+get_recent_block(height)       -> Result<Option<Vec<u8>>>
+get_recursive_proof()          -> Result<Option<Vec<u8>>>
+get_tx_index(hash)             -> Result<Option<(u64, u32)>>
+get_nullifier_blocks_range(from, to) -> Result<Vec<(u64, Vec<TxBodyHash>)>>
+all_segments()                 -> Result<Vec<(u16, u8, SegmentColumns)>>
+
+// Write
+put_recursive_proof(bytes)     -> Result<()>
+
+// Atomic block commit (P.18)
+commit_block(
+    header:          &BlockHeader,
+    hash:            &[u8;32],
+    undo_log:        &BlockUndoLog,
+    dirty_segments:  &[(u16, u8, &SegmentColumns)],
+    nullifier_hashes: &[TxBodyHash],
+    block_bytes:     Option<&[u8]>,
+) -> Result<()>
+```
+
+**Availability matrix:**
+
+| Method | Available | Notes |
+|--------|-----------|-------|
+| `get_header` | Always (all heights) | Stored forever |
+| `get_recent_block` | Last 18 blocks only | Deleted after FINALITY_DEPTH |
+| `get_undo_log` | Last 18 blocks only | Deleted after FINALITY_DEPTH |
+| `get_recursive_proof` | When prover is caught up | `None` in DEGRADED mode |
+| `get_tx_index` | Always (all txs ever) | Stored forever, ~1.6 GB/10yr |
+
+### 10.3 Serialization Format (`serial.rs`)
+
+All formats are little-endian fixed-width.
+
+| Type | Format | Size |
+|------|--------|------|
+| `BlockHeader` | Wire encode (see §8.3) | 276 B |
+| `SlotValue` | value(16B) + owner_hi(16B) + owner_lo(16B) | 48 B |
+| `BlockUndoLog` | height(8) + n_changes(4) + n_hashes(4) + changes(52×n) + hashes(32×n) | variable |
+| `SegmentColumns` | eff_log(1) + n_elems(4) + values(16×n) + hi(16×n) + lo(16×n) | variable |
+| `chain_tip` | height(8) + hash(32) | 40 B |
+| `state_meta` | log_slots(4) + active(8) + alloc(8) | 20 B |
+| `tx_index value` | height(8) + tx_pos(4) | 12 B |
+
+```rust
+// Helpers exported from noid_chain::storage
+encode_tx_index_value(height: u64, tx_pos: u32) -> [u8; 12]
+decode_tx_index_value(bytes: &[u8]) -> Option<(u64, u32)>
+encode_undo_log(u: &BlockUndoLog) -> Vec<u8>
+decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog>
+```
+
+### 10.4 MdbxChainContext — High-Level Context
+
+```rust
+/// Crash-consistent chain context. Replaces in-memory ChainContext for
+/// production nodes.
+pub struct MdbxChainContext {
+    pub store:          MdbxStore,
+    pub state:          ChainState,         // hot RAM state
+    pub nullifiers:     NullifierSet,       // hot RAM, rebuilt on restart
+    pub recent_headers: HashMap<u64, BlockHeader>,  // last 155 blocks
+    pub tip_height:     u64,
+    pub tip_hash:       [u8; 32],
+}
+
+impl MdbxChainContext {
+    /// Open existing DB or init from genesis.
+    pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError>
+    
+    /// Apply and persist one block. Atomic: either both RAM and MDBX advance
+    /// to H+1, or both remain at H (with RAM rollback on MDBX failure).
+    pub fn apply_next_block(
+        &mut self,
+        block: &Block,
+        local_time: u64,
+    ) -> Result<[u8; 32], MdbxContextError>
+    
+    pub fn tip_header(&self) -> &BlockHeader
+    pub fn prev_timestamps(&self) -> Vec<u64>
+    pub fn anchor_info(&self) -> AnchorInfo
+    pub fn get_header_from_store(&self, height: u64) -> Result<Option<BlockHeader>, StoreError>
+    pub fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError>
+    pub fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError>
+}
+```
+
+**Consistency guarantees:**
+
+| Scenario | RAM | MDBX | Recovery |
+|----------|-----|------|----------|
+| Consensus error | H | H | No action needed |
+| MDBX commit error | Rolled back to H | H | Retry or skip block |
+| Crash before commit | H | H | Restart reads H from MDBX |
+| Crash after commit, before prune | H+1 | H+1 | Restart reads H+1; prune runs next commit |
+| Normal success | H+1 | H+1 | — |
+
+### 10.5 Error Types
+
+```rust
+pub enum StoreError {
+    Mdbx(libmdbx::Error),
+    Decode(&'static str),
+}
+
+pub enum MdbxContextError {
+    Store(StoreError),
+    Consensus(ConsensusError),
+    /// Corrupt(msg): state root mismatch or missing required record.
+    /// Node must stop — manual recovery or resync required.
+    Corrupt(&'static str),
+}
+```
+
+`Corrupt` is returned when:
+- `chain_tip` or `state_meta` entries are missing from a non-empty database
+- The reloaded segment data produces a different `state_root` than the stored tip header
+
+A `Corrupt` error requires operator intervention (resync from a peer snapshot).
 
 ---
 

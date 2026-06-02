@@ -1553,6 +1553,21 @@ MDBX properties relevant to our workload:
 - **Proven at scale:** Used by Reth (Ethereum execution client) at
   multi-TB state sizes.
 
+**Atomic commit protocol (P.18):** Each block application executes a 7.5-step
+MDBX write transaction:
+1. Write dirty segment columns
+2. Write `BlockHeader` (height → bytes, stored forever)
+3. Write `header_by_hash` index (hash → height)
+4. Write `chain_tip` (current best height + hash)
+5. Write `state_meta` (log_slots, active_slot_count, alloc_counter)
+6. Write `BlockUndoLog` (slot pre-images + tx_body_hashes, kept FINALITY_DEPTH blocks)
+7. Write nullifier entries (TxBodyHash → height; packed list by height for rebuild)
+7.5. Write `tx_index` entries (TxBodyHash → (height, tx_pos), stored forever)
+
+Post-commit pruning (step 8) is non-atomic and non-fatal. A crash at any point
+before `COMMIT` leaves the database at the previous height. A crash after `COMMIT`
+is safe: the next startup reads the committed tip and rebuilds RAM state from MDBX.
+
 The disk backend loads dirty segment columns into a temporary RAM buffer
 for NTT computation during block production, then releases the buffer
 after computing the segment's FRI root.

@@ -51,7 +51,9 @@ pub use segmented_state::{
 // Storage backends
 // ---------------------------------------------------------------------------
 
-pub use storage::{RamBackend, StateBackend};
+pub use storage::{
+    MdbxChainContext, MdbxContextError, MdbxStore, RamBackend, StateBackend, StoreError,
+};
 
 // ---------------------------------------------------------------------------
 // DA layer

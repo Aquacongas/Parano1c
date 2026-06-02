@@ -12,10 +12,21 @@
 //! via `load_segment_view<'txn>(...) -> &'txn [Block128]` — NOT `Vec<Block128>`
 //! — to avoid memcpy bandwidth collapse at log_slots ≥ 28.
 
+pub mod mdbx_context;
+pub mod mdbx_store;
 pub mod memory;
+pub mod serial;
 
+pub use mdbx_context::{MdbxChainContext, MdbxContextError};
+pub use mdbx_store::{MdbxStore, StoreError};
 pub use memory::RamBackend;
+pub use serial::{
+    decode_chain_tip, decode_header, decode_segment, decode_state_meta, decode_tx_index_value,
+    decode_undo_log, encode_chain_tip, encode_header, encode_segment, encode_slot_value,
+    encode_state_meta, encode_tx_index_value, encode_undo_log, u64_key,
+};
 
+use crate::block_header::BlockHeader;
 use crate::fri_state::{SlotValue, StateRoot};
 use crate::segmented_state::SegmentColumns;
 
@@ -42,4 +53,55 @@ pub trait StateBackend {
 
     /// Compute (or return cached) global state root.
     fn state_root(&mut self) -> StateRoot;
+}
+
+// ---------------------------------------------------------------------------
+// Block-level store traits
+// ---------------------------------------------------------------------------
+
+/// Read-only access to block headers (stored forever).
+pub trait HeaderProvider {
+    /// Retrieve a header by height. Always `Some` for finalised blocks.
+    fn get_header(&self, height: u64) -> Option<BlockHeader>;
+    /// Retrieve a header by its `H_BLOCK` hash. O(1) via hash-to-height index.
+    fn get_header_by_hash(&self, hash: &[u8; 32]) -> Option<BlockHeader>;
+}
+
+/// Read-only access to the nullifier set (double-spend detection).
+pub trait NullifierProvider {
+    /// Return `true` if `hash` appears in the rolling nullifier window.
+    fn contains_nullifier(&self, hash: &noid_poseidon2b::primitives::TxBodyHash) -> bool;
+}
+
+/// Combined durable chain store.
+///
+/// Implementors provide unified access to headers, the recursive proof, the
+/// transaction index, and recent full blocks. The `MdbxStore` type implements
+/// this trait for the disk-backed node; a `RamBlockStore` (future) may
+/// implement it for testing.
+pub trait BlockStore: Send + Sync {
+    /// Current best tip: `(height, H_BLOCK hash)`.
+    fn best_tip(&self) -> Option<(u64, [u8; 32])>;
+
+    /// Retrieve a header by height. Returns `None` only if the height was
+    /// never committed (headers are stored forever once committed).
+    fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError>;
+
+    /// Retrieve a header by its `H_BLOCK` hash.
+    fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
+
+    /// Retrieve a recent block's raw bytes. Only available for the last
+    /// `RECENT_BLOCK_RETENTION` (= 18) blocks; returns `None` for older blocks.
+    fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Retrieve the persisted recursive chain proof (6.5 KB). `None` means
+    /// the prover has not yet caught up (DEGRADED / FALLBACK mode).
+    fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Persist a new recursive chain proof.
+    fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError>;
+
+    /// Look up a transaction by body hash. Returns `(block_height, tx_pos)`
+    /// for O(1) receipt lookup and Merkle path reconstruction.
+    fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError>;
 }

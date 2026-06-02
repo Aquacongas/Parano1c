@@ -12,3 +12,7 @@ noid_air = { path = "../noid_air" }
 noid_binius = { path = "../noid_binius" }
 noid_fri = { path = "../noid_fri" }
 blake3 = "1"
+libmdbx = "0.6"
+
+[dev-dependencies]
+tempfile = "3"

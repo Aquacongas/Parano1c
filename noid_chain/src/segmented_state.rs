@@ -247,7 +247,12 @@ pub struct SegmentedFriState {
     /// Whether any tree leaf changed since the last `flush_tree` call.
     tree_dirty: bool,
     /// Set of segment IDs whose column data has been mutated.
+    /// Cleared automatically when `flush_segment` recomputes the FRI root.
     dirty: HashSet<u16>,
+    /// Set of segment IDs modified since the last explicit `clear_dirty()` call.
+    /// This set is NOT cleared by FRI-root recomputation — only by `clear_dirty()`.
+    /// Used by the MDBX backend to decide which segments to persist on each block.
+    mdbx_dirty: HashSet<u16>,
 }
 
 impl SegmentedFriState {
@@ -281,6 +286,7 @@ impl SegmentedFriState {
             tree,
             tree_dirty: false,
             dirty: HashSet::new(),
+            mdbx_dirty: HashSet::new(),
         }
     }
 
@@ -365,9 +371,11 @@ impl SegmentedFriState {
             cols.values[loc] = v.value;
             cols.owners_hi[loc] = v.owner_hi;
             cols.owners_lo[loc] = v.owner_lo;
-            // Mark dirty.
+            // Mark FRI root stale (cleared by flush_segment) and MDBX-pending
+            // (cleared only by explicit clear_dirty()).
             self.seg_roots[seg_idx] = None;
             self.dirty.insert(seg);
+            self.mdbx_dirty.insert(seg);
             self.tree_dirty = true;
         }
         Ok(self.root())
@@ -442,9 +450,52 @@ impl SegmentedFriState {
     // Dirty tracking
     // -----------------------------------------------------------------------
 
-    /// Iterator over segment IDs that have been mutated since last flush.
+    /// Iterator over segment IDs modified since the last `clear_dirty()` call.
+    ///
+    /// Unlike the internal FRI-dirty set (which is cleared automatically when
+    /// `root()` recomputes segment FRI roots), this set persists until
+    /// `clear_dirty()` is explicitly called — typically after a successful
+    /// MDBX commit.
     pub fn dirty_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
-        self.dirty.iter().copied()
+        self.mdbx_dirty.iter().copied()
+    }
+
+    /// Clear the MDBX-dirty tracking set.
+    ///
+    /// Call this after a successful MDBX commit so that the next block's
+    /// `dirty_segment_ids()` returns only segments modified by *that* block.
+    ///
+    /// Also call after restoring segment columns from MDBX on startup so
+    /// that the restored segments are not needlessly re-written on the
+    /// first block commit.
+    pub fn clear_dirty(&mut self) {
+        self.mdbx_dirty.clear();
+    }
+
+    /// Directly install pre-loaded column data for a segment.
+    ///
+    /// Used exclusively by the MDBX restore path to reload persisted segment
+    /// data without triggering the slot-by-slot `set_slot` path and without
+    /// marking the segment as MDBX-dirty (the data is already in MDBX).
+    ///
+    /// The FRI root for this segment is invalidated and will be recomputed
+    /// lazily on the next `root()` call.
+    ///
+    /// Visibility is `pub(crate)` to prevent accidental misuse from outside
+    /// the storage layer — callers outside this crate must go through the
+    /// normal `set_slot` / `apply_delta` API.
+    pub(crate) fn set_segment_columns(&mut self, seg_id: u16, cols: SegmentColumns) {
+        let id = seg_id as usize;
+        if id >= self.num_segments {
+            return;
+        }
+        // Directly install the column data.
+        self.segments[id] = Some(Box::new(cols));
+        // Invalidate the FRI root so it is recomputed on next root() call.
+        self.seg_roots[id] = None;
+        self.tree_dirty = true;
+        // Mark FRI-dirty (NOT mdbx_dirty: data is already in MDBX).
+        self.dirty.insert(seg_id);
     }
 
     /// All segment IDs that have been materialised (non-None).
@@ -854,11 +905,66 @@ mod tests {
     }
 
     #[test]
+    fn clear_dirty_resets_tracking() {
+        let mut s = SegmentedFriState::new_empty(TS);
+        // Write a slot to mark segment dirty.
+        s.set_slot(0, sv(1)).unwrap();
+        assert!(
+            s.dirty_segment_ids().next().is_some(),
+            "should be dirty after write"
+        );
+        s.clear_dirty();
+        assert!(
+            s.dirty_segment_ids().next().is_none(),
+            "should be clean after clear_dirty"
+        );
+        // A subsequent write marks dirty again.
+        s.set_slot(1, sv(2)).unwrap();
+        assert!(
+            s.dirty_segment_ids().next().is_some(),
+            "should be dirty again after write"
+        );
+    }
+
+    #[test]
     fn dirty_segment_tracking() {
+        // `dirty_segment_ids()` now reflects MDBX-dirty (not FRI-dirty).
+        // After set_slot, the FRI-dirty set is cleared by root(), but
+        // mdbx_dirty persists until clear_dirty() is called explicitly.
         let mut s = SegmentedFriState::new_empty(TS);
         assert_eq!(s.dirty_segment_ids().count(), 0);
-        s.set_slot(3, sv(1)).unwrap(); // flushes immediately via root()
-                                       // After root() call inside set_slot, dirty set should be cleared.
-        assert_eq!(s.dirty_segment_ids().count(), 0);
+        s.set_slot(3, sv(1)).unwrap(); // FRI root is flushed; mdbx_dirty is NOT cleared.
+        assert_eq!(
+            s.dirty_segment_ids().count(),
+            1,
+            "mdbx_dirty persists after set_slot"
+        );
+        s.clear_dirty();
+        assert_eq!(
+            s.dirty_segment_ids().count(),
+            0,
+            "cleared after clear_dirty()"
+        );
+    }
+
+    #[test]
+    fn set_segment_columns_does_not_mark_mdbx_dirty() {
+        // Restoring segments from MDBX must NOT mark them as MDBX-dirty.
+        let mut s = SegmentedFriState::new_empty(TS);
+        let cols = SegmentColumns {
+            values: vec![Block128::from(42u128); 1 << TS],
+            owners_hi: vec![Block128::ZERO; 1 << TS],
+            owners_lo: vec![Block128::ZERO; 1 << TS],
+        };
+        s.set_segment_columns(0, cols);
+        // mdbx_dirty must remain empty (data came from MDBX).
+        assert_eq!(
+            s.dirty_segment_ids().count(),
+            0,
+            "set_segment_columns must not mark mdbx_dirty"
+        );
+        // But the slot value should be visible.
+        let sv = s.slot(0);
+        assert_eq!(sv.value, Block128::from(42u128));
     }
 }
