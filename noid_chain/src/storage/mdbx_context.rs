@@ -38,7 +38,7 @@ use crate::chain_context::ChainContext;
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
     header::epoch_anchor_height,
-    params::{ANCHOR_DEPTH, MEDIAN_TIME_BLOCKS},
+    params::{ANCHOR_DEPTH, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS},
     pow::full_block_hash,
     validation::{validate_block_consensus, AnchorInfo},
     ConsensusError,
@@ -269,6 +269,7 @@ impl MdbxChainContext {
     ) -> Result<[u8; 32], MdbxContextError> {
         let parent = self.tip_header().clone();
         let prev_timestamps = self.prev_timestamps();
+        let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
 
         // Snapshot mutable counters before apply so we can roll them back.
@@ -283,6 +284,7 @@ impl MdbxChainContext {
             block,
             &parent,
             &prev_timestamps,
+            &prev_active_counts,
             local_time,
             &anchor,
             &self.nullifiers,
@@ -378,6 +380,17 @@ impl MdbxChainContext {
         let start = tip.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
         (start..=tip)
             .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.timestamp))
+            .collect()
+    }
+
+    /// Collect the last `EXPANSION_WINDOW` `active_slot_count` values for the
+    /// median expansion trigger. Always available: `recent_headers` covers
+    /// `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` (≥ EXPANSION_WINDOW) blocks.
+    pub fn prev_active_counts(&self) -> Vec<u64> {
+        let tip = self.tip_height;
+        let start = tip.saturating_sub(EXPANSION_WINDOW);
+        (start..=tip)
+            .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.active_slot_count))
             .collect()
     }
 

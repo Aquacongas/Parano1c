@@ -57,7 +57,7 @@ pub use receipt::{
 };
 pub use reorg::{apply_reorg, find_common_ancestor, ReorgError, ReorgResult};
 pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
-pub use timestamps::{median_time_past, validate_timestamp};
+pub use timestamps::{median_time_past, median_u64, validate_timestamp};
 pub use validation::{validate_block_consensus, AnchorInfo};
 
 /// Consensus validation errors — one variant per block invariant.

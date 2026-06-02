@@ -55,6 +55,22 @@ pub fn median_time_past(prev_timestamps: &[u64]) -> u64 {
     recent[count / 2]
 }
 
+/// Compute the median of a slice of `u64` values.
+///
+/// Used for the slot-space expansion trigger: taking the median of
+/// `active_slot_count` over the last `EXPANSION_WINDOW` finalised headers
+/// makes the trigger immune to a single block-spam spike.
+///
+/// Returns `0` for an empty slice (matches the behaviour of `median_time_past`).
+pub fn median_u64(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +151,37 @@ mod tests {
         assert_eq!(mtp, 0);
         // Any positive timestamp > 0 should be valid at genesis.
         assert!(validate_timestamp(1, &[], 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn median_u64_empty_returns_zero() {
+        assert_eq!(median_u64(&[]), 0);
+    }
+
+    #[test]
+    fn median_u64_odd_count() {
+        assert_eq!(median_u64(&[10, 30, 20]), 20);
+    }
+
+    #[test]
+    fn median_u64_even_count_upper_middle() {
+        // With even count, picks the upper-middle element (index len/2).
+        assert_eq!(median_u64(&[10, 20, 30, 40]), 30);
+    }
+
+    #[test]
+    fn median_u64_single_element() {
+        assert_eq!(median_u64(&[42]), 42);
+    }
+
+    #[test]
+    fn median_u64_all_same() {
+        assert_eq!(median_u64(&[7, 7, 7, 7, 7]), 7);
+    }
+
+    #[test]
+    fn median_u64_large_values() {
+        assert_eq!(median_u64(&[u64::MAX, 0, u64::MAX / 2]), u64::MAX / 2);
     }
 
     #[test]

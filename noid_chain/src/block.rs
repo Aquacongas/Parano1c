@@ -1018,10 +1018,14 @@ mod tests {
             anchor_target: GENESIS_TARGET,
         };
         let mut apply_state = state.clone();
+        // Supply EXPANSION_WINDOW copies of the triggering occupancy so
+        // the median equals the parent's active_slot_count and fires.
+        let active_window = vec![parent.active_slot_count; 18];
         let result = validate_block_consensus(
             &block,
             &parent,
             &[parent.timestamp],
+            &active_window,
             block.header.timestamp + 1,
             &anchor,
             &NullifierSet::new(),

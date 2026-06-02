@@ -101,6 +101,9 @@ pub fn validate_block_full(
     state_binding_airs: &[&BlockStateBindingAir],
     parent: &BlockHeader,
     prev_timestamps: &[u64],
+    // active_slot_count values from the last EXPANSION_WINDOW finalised headers.
+    // Pass &[parent.active_slot_count] when the full window is not available.
+    prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
     nullifiers: &NullifierSet,
@@ -113,6 +116,7 @@ pub fn validate_block_full(
         block,
         parent,
         prev_timestamps,
+        prev_active_counts,
         local_time,
         anchor,
         nullifiers,

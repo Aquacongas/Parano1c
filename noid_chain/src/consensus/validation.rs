@@ -29,6 +29,7 @@
 use crate::block::apply_block;
 use crate::block::Block;
 use crate::block_header::BlockHeader;
+use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus},
     emission::max_coinbase_value,
@@ -58,6 +59,9 @@ pub struct AnchorInfo {
 /// - `block`: candidate block
 /// - `parent`: parent block header
 /// - `prev_timestamps`: timestamps of the last ≤11 ancestors (oldest first)
+/// - `prev_active_counts`: `active_slot_count` from the last ≤`EXPANSION_WINDOW`
+///   finalised headers (oldest first). Used for the median expansion trigger.
+///   Pass `&[parent.active_slot_count]` when only the parent is known.
 /// - `local_time`: current wall-clock seconds (for future-drift check)
 /// - `anchor`: ASERT epoch anchor for difficulty computation
 /// - `nullifiers`: rolling nullifier set (last ANCHOR_DEPTH blocks)
@@ -71,6 +75,7 @@ pub fn validate_block_consensus(
     block: &Block,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
     nullifiers: &NullifierSet,
@@ -87,20 +92,29 @@ pub fn validate_block_consensus(
         &anchor.anchor_target,
     )?;
 
-    // --- §15.3.6 log_slots expansion trigger ---
-    // When occupancy (active_slot_count / 2^log_slots) ≥ 75%, log_slots MUST
-    // increment by exactly 1. Otherwise it MUST stay the same.
-    // This is checked against the PARENT's active_slot_count (pre-block occupancy).
+    // --- §15.3.6 log_slots expansion trigger (median-based) ---
+    //
+    // Expansion fires when the MEDIAN active_slot_count over the last
+    // EXPANSION_WINDOW (= FINALITY_DEPTH = 18) finalised headers exceeds
+    // 75% of capacity.  Using the median prevents a single-block spam spike
+    // from forcing an expansion: an attacker would need to sustain > 75%
+    // occupancy across a majority of the window blocks.
+    //
+    // `prev_active_counts` is supplied by the caller (from stored headers);
+    // it falls back to `[parent.active_slot_count]` when the window is shallow.
     {
-        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM};
+        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
         let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-        let trigger = parent.active_slot_count.saturating_mul(EXPAND_DENOM)
-            >= prev_capacity.saturating_mul(EXPAND_NUM);
+        // Median of the supplied window; fall back to parent when window is empty.
+        let median_active = if prev_active_counts.is_empty() {
+            parent.active_slot_count
+        } else {
+            median_u64(prev_active_counts)
+        };
+        let trigger =
+            median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
         let expected_log_slots = if trigger {
-            parent
-                .log_slots
-                .saturating_add(1)
-                .min(crate::consensus::params::LOG_SLOTS_MAX)
+            parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
         } else {
             parent.log_slots
         };
@@ -249,6 +263,7 @@ mod tests {
             &block,
             &parent,
             &[parent.timestamp],
+            &[parent.active_slot_count],
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
             &NullifierSet::new(),
@@ -270,6 +285,7 @@ mod tests {
             &block,
             &parent,
             &[parent.timestamp],
+            &[parent.active_slot_count],
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
             &NullifierSet::new(),
@@ -334,10 +350,14 @@ mod tests {
 
         let mut apply_state = ChainState::with_log_slots(TEST_LOG_SLOTS);
         apply_state.active_slot_count = target_active;
+        // Pass a window where all EXPANSION_WINDOW values are at 75% —
+        // median will equal target_active and trigger expansion.
+        let active_window = vec![target_active; 18];
         let result = validate_block_consensus(
             &block_no_expand,
             &parent,
             &[parent.timestamp],
+            &active_window,
             block_no_expand.header.timestamp + 1,
             &genesis_anchor(&parent),
             &NullifierSet::new(),
@@ -347,6 +367,80 @@ mod tests {
             result,
             Err(ConsensusError::BadLogSlotsExpansion),
             "block must fail when expansion trigger fires but log_slots not incremented"
+        );
+    }
+
+    #[test]
+    fn expansion_not_triggered_by_single_spike() {
+        // Median-based trigger: even if parent is at 75%, a window where
+        // only the last value is high should NOT trigger (median stays low).
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let capacity = 1u64 << TEST_LOG_SLOTS as u64;
+        let low_active = capacity / 4; // 25% — most of the window
+        let spike_active = (capacity * 3) / 4; // 75% — only last value
+        state.active_slot_count = spike_active;
+
+        let state_root = state.state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root,
+            tx_root: [0u8; 32],
+            timestamp: GENESIS_TIMESTAMP,
+            height: 0,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: TEST_LOG_SLOTS as u32,
+            active_slot_count: spike_active,
+            alloc_counter: 0,
+        };
+
+        // Build a block that does NOT expand (log_slots unchanged).
+        use crate::block::compute_tx_root;
+        use crate::consensus::pow::{full_block_hash, search_pow};
+        let mut hdr = BlockHeader {
+            prev_block_hash: full_block_hash(&parent),
+            state_root,
+            tx_root: compute_tx_root(&[]),
+            timestamp: parent.timestamp + BLOCK_TIME,
+            height: 1,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [1u8; 32],
+            witness_root: [1u8; 32],
+            log_slots: TEST_LOG_SLOTS as u32, // no expansion
+            active_slot_count: spike_active,
+            alloc_counter: 0,
+        };
+        hdr.nonce = search_pow(&hdr, 0, 100_000_000).unwrap();
+        let block = crate::block::Block {
+            header: hdr,
+            transactions: vec![],
+        };
+
+        // Window: 17 values at 25%, 1 value at 75%. Median = 25% → no trigger.
+        let mut active_window = vec![low_active; 17];
+        active_window.push(spike_active);
+
+        let mut apply_state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        apply_state.active_slot_count = spike_active;
+        let result = validate_block_consensus(
+            &block,
+            &parent,
+            &[parent.timestamp],
+            &active_window,
+            block.header.timestamp + 1,
+            &genesis_anchor(&parent),
+            &NullifierSet::new(),
+            &mut apply_state,
+        );
+        assert!(
+            result.is_ok(),
+            "single spike must not trigger expansion via median: {:?}",
+            result
         );
     }
 }

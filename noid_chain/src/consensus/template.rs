@@ -153,12 +153,14 @@ pub enum TemplateBuildError {
 pub fn build_block_template(
     parent: &BlockHeader,
     state: &ChainState,
+    prev_active_counts: &[u64],
     candidate_txs: Vec<Transaction>,
     miner_address: Address,
     timestamp: u64,
     difficulty_target: Digest,
 ) -> Result<BlockTemplate, TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
+    use crate::consensus::timestamps::median_u64;
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
     use crate::state::apply_tx;
     use noid_tx::{hash_tx_body, TxBody, TxOutput};
@@ -166,11 +168,18 @@ pub fn build_block_template(
     // 1. Resolve slot conflicts among candidate txs.
     let (winners, _losers) = resolve_slot_conflicts(candidate_txs);
 
-    // 2. Determine expansion trigger.
+    // 2. Determine expansion trigger using median over prev_active_counts window.
+    //    Must match validate_block_consensus exactly so the block we produce passes
+    //    consensus validation.
     use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
     let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-    let should_expand = parent.active_slot_count.saturating_mul(EXPAND_DENOM)
-        >= prev_capacity.saturating_mul(EXPAND_NUM);
+    let median_active = if prev_active_counts.is_empty() {
+        parent.active_slot_count
+    } else {
+        median_u64(prev_active_counts)
+    };
+    let should_expand =
+        median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
     let new_log_slots = if should_expand {
         (parent.log_slots + 1).min(LOG_SLOTS_MAX)
     } else {
@@ -290,6 +299,7 @@ mod tests {
         let result = build_block_template(
             &parent,
             &state,
+            &[parent.active_slot_count],
             vec![],
             miner,
             GENESIS_TIMESTAMP + BLOCK_TIME,
@@ -313,6 +323,7 @@ mod tests {
         let tmpl = build_block_template(
             &parent,
             &state,
+            &[parent.active_slot_count],
             vec![],
             miner,
             GENESIS_TIMESTAMP + BLOCK_TIME,
@@ -339,6 +350,7 @@ mod tests {
         let tmpl = build_block_template(
             &parent,
             &state,
+            &[parent.active_slot_count],
             vec![],
             miner,
             GENESIS_TIMESTAMP + BLOCK_TIME,
@@ -359,6 +371,7 @@ mod tests {
         let tmpl = build_block_template(
             &parent,
             &state,
+            &[parent.active_slot_count],
             vec![],
             miner,
             GENESIS_TIMESTAMP + BLOCK_TIME,

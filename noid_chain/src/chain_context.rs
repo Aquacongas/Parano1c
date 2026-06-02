@@ -28,7 +28,7 @@ use crate::consensus::{
     da_prune::{build_undo_log, prune_undo_logs, BlockUndoLog},
     genesis::genesis_header,
     header::epoch_anchor_height,
-    params::MEDIAN_TIME_BLOCKS,
+    params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS},
     pow::full_block_hash,
     validation::{validate_block_consensus, AnchorInfo},
     ConsensusError,
@@ -112,6 +112,16 @@ impl ChainContext {
             .collect()
     }
 
+    /// Collect the last `EXPANSION_WINDOW` `active_slot_count` values for the
+    /// median expansion trigger. Returns oldest-first.
+    pub fn prev_active_counts(&self) -> Vec<u64> {
+        let tip = self.tip_height;
+        let start = tip.saturating_sub(EXPANSION_WINDOW);
+        (start..=tip)
+            .filter_map(|h| self.headers.get(&h).map(|hdr| hdr.active_slot_count))
+            .collect()
+    }
+
     /// Build the ASERT `AnchorInfo` for the next block's difficulty calculation.
     ///
     /// The anchor is the header at the most recent epoch boundary.
@@ -149,6 +159,7 @@ impl ChainContext {
     ) -> Result<[u8; 32], ConsensusError> {
         let parent = self.tip_header().clone();
         let prev_timestamps = self.prev_timestamps();
+        let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
 
         // Build undo log BEFORE applying (captures pre-state).
@@ -161,6 +172,7 @@ impl ChainContext {
             block,
             &parent,
             &prev_timestamps,
+            &prev_active_counts,
             local_time,
             &anchor,
             &self.nullifiers,

@@ -33,14 +33,36 @@ use crate::consensus::params::BLOCK_MAX_TXS;
 /// A transaction admitted to the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
-    /// The full transaction (body + tx_body_hash).
+    /// The admitted transaction.
     pub tx: Transaction,
-    /// Chain height at which this tx was admitted.
-    /// Used for anchor-expiry eviction: evict when `current_height > admitted_height + ANCHOR_DEPTH`.
+    /// Chain height at the time of admission (used for epoch_anchor expiry).
     pub admitted_height: u64,
-    /// Fee rate in μNOID (fee / max(1, n_inputs + n_outputs)).
-    /// Used for block template selection (highest fee_rate first).
+    /// Fee per slot-slot-unit (fee / max(1, n_inputs + n_outputs)).
+    /// Used for priority ordering in block template selection.
     pub fee_rate: u64,
+
+    // -----------------------------------------------------------------------
+    // Phase 1.5 — Pre-proving cache (populated by Phase 3 async prover).
+    //
+    // On mempool admission, Phase 3 spawns a background
+    // `prove_air_algebraic_pretx` task keyed by
+    // `H(tx_body_hash || PRETX_CHANNEL_TAG)`. The resulting algebraic
+    // STARK proof (no per-tx FRI, ~2 KB) is stored here.  When the block
+    // template is assembled, cached proofs skip the per-tx algebraic STARK
+    // step — only the unified block GKR + single FRI remain (~12s vs ~44s
+    // for 1024 txs on 8 cores).
+    //
+    // A `None` here means the tx has not yet been pre-proved; the block
+    // assembler must prove it inline (slower path).
+    // -----------------------------------------------------------------------
+    /// Cached algebraic STARK proof from pre-proving.
+    /// `None` while the background task is running or not yet started.
+    pub cached_algebraic_proof: Option<Vec<u8>>,
+
+    /// Spine MLE slot data needed to assemble the block-level SpineGKR
+    /// without re-running the per-tx Spine Kill-Shot.
+    /// `None` until pre-proving completes.
+    pub spine_slots: Option<Vec<u8>>,
 }
 
 impl MempoolEntry {
@@ -59,6 +81,8 @@ impl MempoolEntry {
             tx,
             admitted_height: current_height,
             fee_rate,
+            cached_algebraic_proof: None,
+            spine_slots: None,
         }
     }
 }

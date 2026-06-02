@@ -40,12 +40,20 @@ pub const MAX_OUTPUTS: usize = 8;
 // Epoch anchor  (SPECIFICATION.md §2 / §17)
 // ---------------------------------------------------------------------------
 
-/// Epoch anchor validity window (see also noid_tx::ANCHOR_DEPTH — must stay in sync).
-/// 144 blocks × 60s = 144 min normal; 144 × 30min = 3 days during difficulty spike.
+/// Epoch anchor validity depth.
 ///
-/// This constant controls BOTH:
+/// A non-coinbase tx's epoch_anchor must reference a header at height in
+/// `[block_height - ANCHOR_DEPTH - 1, block_height - 1]`.
+/// This gives a window of **ANCHOR_DEPTH + 1 = 145** possible anchor heights.
+///
+/// At 60s block time: ~144 minutes under normal conditions.
+///
+/// Controls:
 /// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
 /// 2. How long nullifiers are retained (prevents double-spend within window).
+///
+/// Note: the window *size* is ANCHOR_DEPTH+1 (inclusive on both ends).
+/// The constant name reflects maximum *depth*, not window size.
 ///
 /// NullifierSet max RAM: 144 blocks × 1024 txs × 32 bytes = ~4.7 MB (negligible).
 pub const ANCHOR_DEPTH: u64 = 144;
@@ -64,6 +72,11 @@ const _: () = assert!(
 /// After this many confirmations a block is considered final.
 /// Reorgs deeper than this are rejected by fork choice.
 pub const FINALITY_DEPTH: u64 = 18; // 3 × EPOCH_LENGTH
+
+/// Number of finalised block headers used for the expansion trigger median.
+/// Using median over this window makes the trigger immune to single-block spam.
+/// Must be ≤ FINALITY_DEPTH so the required headers are always available as undo logs.
+pub const EXPANSION_WINDOW: u64 = FINALITY_DEPTH; // 18 blocks
 
 // ---------------------------------------------------------------------------
 // Slot state  (SPECIFICATION.md §0 / §15)
@@ -141,8 +154,13 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 // Pre-proving channel tag  (ROADMAP2.md §Phase 1.5)
 // ---------------------------------------------------------------------------
 
-/// Domain tag for the per-tx pre-proving channel.
-/// Seed = H(tx_body_hash || PRETX_TAG). Independent of prev_state_root or cap.
+/// Domain tag for the per-tx pre-proving channel (Phase 1.5 / Phase 3).
+///
+/// Pre-proving: on mempool admission, spawn background `prove_air_algebraic_pretx`
+/// keyed by `H(tx_body_hash || PRETX_CHANNEL_TAG)`. Independent of prev_state_root
+/// or cap — proofs survive across blocks as long as the tx_body_hash is unchanged.
+///
+/// Implementation deferred to Phase 3 (requires async tokio mempool).
 pub const PRETX_CHANNEL_TAG: &[u8] = b"paranoid-pretx-v1";
 
 // ---------------------------------------------------------------------------
