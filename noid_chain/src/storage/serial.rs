@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Canonical byte serialization for MDBX-persisted chain data (Phase 2, P.18).
+//! Canonical byte serialization for MDBX-persisted chain data .
 //!
 //! All formats are little-endian, fixed-width where possible.
 //! These are NOT network formats — they are storage-internal and may evolve

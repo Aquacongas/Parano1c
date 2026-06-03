@@ -15,10 +15,9 @@
 //! `AuthPublicInputs` (per-tx auth GKR public inputs). These must be
 //! reconstructed from the block's public data.
 //!
-//! For Phase 2: full reconstruction from block + state will be implemented
-//! in `build_spine_inputs_from_block()` and `build_auth_public_inputs()`.
-//! In Phase 1 callers that already have these (e.g. from prove_block) can
-//! pass them directly.
+//! Callers that already have these (e.g. from `prove_block`) can pass them
+//! directly. Reconstruction helpers `build_spine_inputs_from_block()` and
+//! `build_auth_public_inputs()` can be added when needed.
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
 use noid_air::Air;
@@ -85,14 +84,11 @@ impl std::error::Error for FullValidationError {}
 ///
 /// - `spine_inputs_list`: block GKR slot-state inputs, one per transaction.
 ///   Build these from the block's transactions and current state.
-///   Phase 2 TODO: add `build_spine_inputs_from_block(block, state)` helper.
 ///
 /// - `auth_public_list`: auth GKR public inputs, one per transaction.
 ///   Derived from `proof.tx_pis` public inputs.
-///   Phase 2 TODO: add `build_auth_public_from_proof(proof)` helper.
 ///
 /// - `state_binding_airs`: BlockStateBinding AIRs for each dirty segment.
-///   Phase 2 TODO: add `build_state_binding_airs(block, state)` helper.
 pub fn validate_block_full(
     block: &Block,
     proof: &BlockProof,

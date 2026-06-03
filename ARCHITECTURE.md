@@ -936,14 +936,14 @@ noid_chain/src/segmented_state.rs      SegmentedFriState (two-tier dirty trackin
 
 ---
 
-## 13. Phase 3 — Node Infrastructure Layer
+## 13. Node Infrastructure Layer
 
 ```
-noid_mempool/   AsyncMempool: native checks + dynamic fee floor + event broadcast
+noid_mempool/   AsyncMempool: native checks + ZK verify (semaphore-bounded) + dynamic fee floor
 noid_miner/     BlockMiner: parallel PoW (rayon) + prove_block (spawn_blocking)
-noid_p2p/       P2PNetwork: libp2p gossipsub (blocks/txs) + request-response (sync)
-noid_rpc/       RpcServer: jsonrpsee JSON-RPC — all ROADMAP2.md §RPC API methods
-noid_node/      paranoid-node binary — orchestrates all components
+noid_p2p/       P2PNetwork: libp2p gossipsub (blocks/txs) + request-response (state snapshot sync)
+noid_rpc/       RpcServer: jsonrpsee JSON-RPC — see API.md for method reference
+noid_node/      paranoid binary — orchestrates all components; --genesis flag for bootstrap
 ```
 
 ### 13.1 WalletProofBundle
@@ -998,7 +998,7 @@ From bundle (proof artifacts):
 3. P2PNetwork::start(listen_addr, chain, pool)  — libp2p swarm + seed dials
 4. start_rpc_server(listen, chain, mempool)     — JSON-RPC all methods
 5. BlockMiner::new(...).run()                   — if --mine flag set
-6. run_recursive_proof_updater(chain)           — lag monitor (full catch-up Phase 5)
+6. run_recursive_proof_updater(chain)           — advances recursive proof for finalised blocks
 7. Ctrl-C → rpc_handle.stop() + miner abort
 ```
 

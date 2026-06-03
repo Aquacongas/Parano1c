@@ -209,32 +209,28 @@ fn build_public_inputs(tx_body: &TxBody, _proof: &LogicProof, log_slots: u32) ->
 // H(zero_secret) for padding, not [0;32].
 
 // ---------------------------------------------------------------------------
-// StateBindingBlockWitness — placeholder for Phase 5
+// StateBindingBlockWitness
 // ---------------------------------------------------------------------------
 
 /// Build `StateBindingBlockWitness` instances for `prove_block`.
 ///
-/// # Phase 3 status
+/// Returns an empty slice. Full ZK state binding (via `BlockStateBindingAir`)
+/// is not yet wired into block production — native `validate_block_consensus`
+/// already enforces state correctness for full nodes. The ZK state binding
+/// would provide an additional in-proof guarantee for light clients that
+/// cannot run native validation.
 ///
-/// Full ZK state binding (via `BlockStateBindingAir`) is targeted for
-/// Phase 5 (Integration Testing). In Phase 3, `prove_block` is called
-/// with an empty state binding slice (`&[]`), which is valid — the
-/// consensus layer already enforces state correctness via native
-/// `validate_block_consensus`. The ZK state binding provides an
-/// additional in-proof guarantee but is not required for Phase 3
-/// correctness.
-///
-/// Phase 5 will implement the full state binding by:
-/// 1. Running `BlockStateBinding::build(state, bodies, commitments)`
-/// 2. Building `BlockStateBindingAir` from the opened slot data
-/// 3. Building the trace columns from the opening proofs
-/// 4. Passing these to `prove_block` as `state_bindings`
+/// When implemented, the full path is:
+/// 1. `BlockStateBinding::build(state, bodies, commitments)` — open slots
+/// 2. Build `BlockStateBindingAir` from the opened slot data
+/// 3. Build the trace columns from the opening proofs
+/// 4. Pass these to `prove_block` as `state_bindings`
 pub fn build_empty_state_bindings() -> Vec<StateBindingBlockWitness<'static>> {
     vec![]
 }
 
 // ---------------------------------------------------------------------------
-// BlockProof → BlockReplayWitness extraction (Phase 7 recursive proof)
+// BlockProof → BlockReplayWitness extraction (recursive chain proof)
 // ---------------------------------------------------------------------------
 
 /// Extract a [`noid_recursive::BlockReplayWitness`] from a [`BlockProof`].

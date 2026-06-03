@@ -3,7 +3,7 @@
 
 //! # noid_miner — Block Production Engine
 //!
-//! Implements the parallel PoW + Prove pipeline from ROADMAP2.md §Mining Engine.
+//! Implements the parallel PoW + Prove pipeline. See ARCHITECTURE.md §13.2.
 //!
 //! ## Pipeline
 //!

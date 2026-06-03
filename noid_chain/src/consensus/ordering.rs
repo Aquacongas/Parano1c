@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Canonical transaction ordering for block assembly (ROADMAP Phase 1 P.25).
+//! Canonical transaction ordering for block assembly .
 //!
 //! This is **miner policy**, not consensus. The block validator only checks
 //! that `tx_root == compute_tx_root(block.transactions)` — it does NOT

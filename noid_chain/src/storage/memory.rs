@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! RAM state backend (Phase 3 / F.1).
+//! RAM state backend .
 //!
 //! `RamBackend` is a thin `StateBackend` wrapper around `SegmentedFriState`.
 //! Recommended for `log_slots ≤ 26` (≤ 3 GB peak usage). When

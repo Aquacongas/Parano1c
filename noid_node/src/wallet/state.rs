@@ -146,7 +146,7 @@ impl WalletState {
     }
 
     /// Derive the next fresh address and advance next_index.
-    /// Used by GUI wallet (Phase 10) for address rotation.
+    /// Used by GUI wallet for address rotation.
     #[allow(dead_code)]
     pub fn next_address(&mut self) -> (u32, Address) {
         let idx = self.next_index;
@@ -176,7 +176,7 @@ impl WalletState {
     }
 
     /// Check if a given address is owned by this wallet.
-    /// Used by P2P address scanning and GUI wallet (Phase 10).
+    /// Used by P2P address scanning and GUI wallet.
     #[allow(dead_code)]
     pub fn owns_address(&self, addr: &Address) -> Option<u32> {
         self.known_addresses.get(&addr.0).copied()

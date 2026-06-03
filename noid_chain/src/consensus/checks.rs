@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Per-transaction consensus checks (SPECIFICATION.md §6, ROADMAP Phase 1 P.8).
+//! Per-transaction consensus checks (SPECIFICATION.md §6).
 //!
 //! These checks are cheap (O(1) per tx) and run before ZK verification.
 //! Ordering: cheapest first to fail fast.

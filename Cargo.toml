@@ -13,7 +13,7 @@ members = [
     "noid_gkr",
     "noid_block",
     "noid_recursive",
-    # Phase 3 — Node Infrastructure
+    # Node Infrastructure
     "noid_mempool",
     "noid_miner",
     "noid_p2p",

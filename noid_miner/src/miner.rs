@@ -3,7 +3,7 @@
 
 //! `BlockMiner` — the parallel PoW + Prove orchestrator.
 //!
-//! ## Parallel proving design (ROADMAP2.md §Mining Engine)
+//! ## Parallel proving design
 //!
 //! ```text
 //! loop {
@@ -407,13 +407,13 @@ impl BlockMiner {
 /// # Correctness
 ///
 /// This uses the `WalletProofBundle` stored in each `MempoolEntry.cached_algebraic_proof`
-/// (once Phase 1.5 pre-proving is active). In Phase 3 base, the bundles are
+/// (when pre-proving cache is populated). When no bundles exist, the
 /// decoded from `logic_proof_bytes` at block assembly time.
 ///
-/// # Phase 3 note on state binding
+/// # State binding
 ///
-/// `state_bindings = &[]` is intentional. Phase 5 will add full ZK state
-/// binding via `BlockStateBindingAir`. In Phase 3, native consensus checks
+/// `state_bindings = &[]` is intentional. Full ZK state
+/// binding via `BlockStateBindingAir` is not yet wired in. Native consensus checks
 /// enforce state correctness; the proof proves LogicProof validity only.
 fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,

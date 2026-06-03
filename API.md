@@ -1237,7 +1237,7 @@ BlockProof (full):
 
 ## 10. Storage & Persistence API
 
-The storage layer (Phase 2) provides crash-consistent persistence via MDBX.
+The storage layer provides crash-consistent persistence via MDBX.
 All chain data is read/written through traits defined in
 `noid_chain::storage`.
 

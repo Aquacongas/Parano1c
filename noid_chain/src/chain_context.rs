@@ -8,8 +8,8 @@
 //! set, undo logs (for reorg), and the running tip info.
 //!
 //! `ChainContext` bundles all of this into one struct. It is the authoritative
-//! in-memory representation of the chain. The Phase 2 MDBX backend will persist
-//! this data to disk; Phase 1 uses a pure-RAM implementation.
+//! in-memory representation of the chain. The MDBX backend persists
+//! this data to disk; the RAM backend is used for tests and light contexts.
 //!
 //! # Usage
 //!

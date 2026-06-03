@@ -6,7 +6,7 @@
 //! PoW is computed over `header_core` (212 bytes, excludes `proof_transcript_hash`).
 //! This allows ZK proving and PoW search to run concurrently.
 //!
-//! Reference: ROADMAP2.md §PoW Design Rationale.
+//! Reference: DESIGN_NOTES.md §16 (PoW Design Rationale).
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::le256_lt;

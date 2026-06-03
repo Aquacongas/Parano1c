@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Segmented FRI-committed state (Phase 3 / Stage F).
+//! Segmented FRI-committed state .
 //!
 //! The chain state is split into `N = 2^(log_slots - LOG_SEGMENT_SIZE)`
 //! independent segments (each holding `2^LOG_SEGMENT_SIZE` slots). Each

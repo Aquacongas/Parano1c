@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Dynamic fee floor calculation (ROADMAP Phase 3 P.16).
+//! Dynamic fee floor: tracks recent admitted-tx fees and raises the minimum.
 //!
 //! The floor is computed from recent admitted fees:
 //!   `floor = max(MIN_FEE_BASE, median(last N fees) × 0.9)`

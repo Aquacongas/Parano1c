@@ -17,7 +17,7 @@
 //!  select_for_block() ──► fee-sorted list of MempoolEntry (verified txs only)
 //! ```
 //!
-//! ## Phase 1.5 pre-proving (background task)
+//! ## Pre-proving cache (background task)
 //!
 //! When `config.pre_prove_enabled = true`, each admitted tx is sent to a
 //! background worker that calls `prove_air_algebraic_pretx`.  The result is
@@ -448,7 +448,7 @@ impl AsyncMempool {
     /// wallet scan and resubmit.
     ///
     /// NOTE: We do not have the original ZK proof bytes after a reorg (they
-    /// are not persisted). Phase 7 may add durable TX storage to enable
+    /// are not persisted). Durable TX storage could enable
     /// automatic re-admission without wallet involvement.
     pub async fn readmit_after_reorg(&self, tx_hashes: Vec<TxBodyHash>) {
         if tx_hashes.is_empty() {

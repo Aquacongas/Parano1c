@@ -151,16 +151,14 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 // No separate params needed — the algorithm uses fixed Weyl/mixing constants.
 
 // ---------------------------------------------------------------------------
-// Pre-proving channel tag  (ROADMAP2.md §Phase 1.5)
+// Pre-proving channel tag
 // ---------------------------------------------------------------------------
 
-/// Domain tag for the per-tx pre-proving channel (Phase 1.5 / Phase 3).
+/// Domain tag for the per-tx pre-proving channel.
 ///
 /// Pre-proving: on mempool admission, spawn background `prove_air_algebraic_pretx`
 /// keyed by `H(tx_body_hash || PRETX_CHANNEL_TAG)`. Independent of prev_state_root
 /// or cap — proofs survive across blocks as long as the tx_body_hash is unchanged.
-///
-/// Implementation deferred to Phase 3 (requires async tokio mempool).
 pub const PRETX_CHANNEL_TAG: &[u8] = b"paranoid-pretx-v1";
 
 // ---------------------------------------------------------------------------

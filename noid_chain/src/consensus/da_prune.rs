@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! DA retention and undo-log management (ROADMAP Phase 1 P.10).
+//! DA retention and undo-log management .
 //!
 //! Compact per-block undo logs record the pre-image of every UTXO slot
 //! mutated by a block. This allows short-range reorgs (up to
@@ -26,7 +26,7 @@ use noid_poseidon2b::primitives::TxBodyHash;
 /// mutated by the block, enabling reversion without the full block data.
 ///
 /// Maximum size: `BLOCK_MAX_TXS × (MAX_INPUTS + MAX_OUTPUTS) × sizeof(SlotValue)`
-/// ≈ 590 KB at genesis parameters (ROADMAP2.md §DA Policy).
+/// ≈ 590 KB at genesis parameters .
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.

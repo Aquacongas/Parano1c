@@ -96,7 +96,7 @@ impl Keystore {
     }
 
     /// Returns the filesystem path of the wallet key file.
-    /// Used by GUI wallet (Phase 10) for display and backup prompts.
+    /// Used by GUI wallet for display and backup prompts.
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path

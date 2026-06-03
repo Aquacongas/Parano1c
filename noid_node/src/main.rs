@@ -3,7 +3,7 @@
 
 //! # paranoid — Paranoid Full Node Binary
 //!
-//! Startup sequence (ROADMAP2.md §Node Binary):
+//! Startup sequence:
 //! 1. Load config + init tracing
 //! 2. Open MDBX (open_or_create — genesis if first run)
 //! 3. Start mempool (ChainView snapshot from MDBX)
@@ -1011,7 +1011,7 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 // Background recursive proof updater (P.19)
 // ---------------------------------------------------------------------------
 
-/// Background recursive proof updater (Phase 7).
+/// Background recursive proof updater.
 ///
 /// Advances the chain's recursive ZK proof one block at a time, storing the
 /// result in MDBX. The recursive proof provides O(1) trustless sync for new

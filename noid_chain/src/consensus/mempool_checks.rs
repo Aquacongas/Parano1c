@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Mempool admission checks (SPECIFICATION.md §6, ROADMAP Phase 1 P.10).
+//! Mempool admission checks (SPECIFICATION.md §6).
 //!
 //! `validate_tx_for_mempool` enforces all native checks a node performs
 //! before admitting a transaction to the mempool. This is a SUPERSET of

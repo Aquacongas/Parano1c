@@ -555,7 +555,7 @@ Nodes can switch modes via snapshot export/import.
 
 ---
 
-## 19. Phase 2 Design Decisions
+## 19. Storage Layer Design Decisions
 
 ### 19.1 Two-tier dirty-segment tracking
 
@@ -593,7 +593,7 @@ mark `mdbx_dirty` (data is already in MDBX).
 ### 19.3 Nullifier set rebuild on restart
 
 The original `restore_from_mdbx` left the RAM `NullifierSet` empty after restart,
-with a TODO comment claiming "individual nullifiers are still in the DB". This was
+with a stale note claiming "individual nullifiers are still in the DB". This was
 wrong: `validate_block_consensus` uses the RAM `NullifierSet`, not the MDBX
 T_NULLIFIERS table. An attacker could double-spend any transaction confirmed in
 the last 144 blocks by resubmitting it after a node restart.
@@ -627,24 +627,27 @@ already has H+1).
 The fix: prune failures are silently ignored. Stale entries accumulate until the
 next successful commit, but the chain state is always consistent.
 
-### 19.6 T_TX_INDEX: unbounded growth
+### 19.6 T_TX_INDEX: bounded by ANCHOR_DEPTH
 
-The `tx_index` table maps TxBodyHash → (height, tx_pos) and is never pruned. At
-BLOCK_MAX_TXS=1024 txs/block × 32B/hash ≈ 32 KB/block. At 1 block/minute for 10
-years ≈ 1.6 GB. This is acceptable and matches the design intent (receipts are
-verifiable forever). Operators should provision accordingly.
+The `tx_index` table maps TxBodyHash → (height, tx_pos). It is pruned in
+`prune_after_commit` together with nullifiers: when a block exits the
+ANCHOR_DEPTH (144-block) window, all its TxBodyHash entries are removed from
+both `T_NULLIFIERS` and `T_TX_INDEX` in one atomic pass via `T_NULLIFIER_BLOCKS`.
 
-### 19.7 T_NULLIFIERS: reserved for Phase 3
+Receipts are therefore available for the last 144 blocks (~144 minutes at
+60 s/block). Older receipts must be exported by the wallet before that window
+closes. The T_TX_INDEX size is bounded: O(ANCHOR_DEPTH × avg_txs_per_block).
+
+### 19.7 T_NULLIFIERS: persistent O(1) lookup index
 
 T_NULLIFIERS maps TxBodyHash → block_height for O(1) single-hash lookup. It is
 currently unused at runtime (the RAM NullifierSet is used for all consensus checks,
-and T_NULLIFIER_BLOCKS is used for rebuild). It is retained for a future RPC
-endpoint `paranoid_checkNullifier` which will need O(1) persistent lookup without
-loading the full RAM set.
+and T_NULLIFIER_BLOCKS is used for rebuild). It is retained for the `paranoid_checkNullifier`
+RPC endpoint which requires O(1) persistent lookup without loading the full RAM set.
 
 ---
 
-## 20. Phase 3 Design Decisions
+## 20. Node Infrastructure Design Decisions
 
 ### 20.1 WalletProofBundle — proof delivery without exposing SpendSecret
 
@@ -661,12 +664,13 @@ cryptographically unable to reveal SpendSecret.
 adding `#[derive(Serialize, Deserialize)]` to all proof types across:
 `noid_core`, `noid_fri_binius`, `noid_gkr`, `noid_stark`, `noid_tx`, `noid_poseidon2b`.
 
-### 20.2 prove_block Phase 3 fallback
+### 20.2 prove_block: coinbase-only block handling
 
-In Phase 3, `WalletProofBundle` is only available after a wallet implementation (Phase 4).
-Until then, `run_prove_block` returns marker hashes `[1u8;32]` when no bundles exist.
-Non-zero hashes pass `MissingProofTranscriptHash` check in `apply_block`, allowing the
-chain to advance. Real proofs require Phase 4 wallet to submit `TxIntent` with bundles.
+`run_prove_block` returns marker hashes `[1u8;32]` when no `WalletProofBundle` is
+available (coinbase-only blocks with no non-coinbase transactions). Non-zero marker
+hashes pass the `MissingProofTranscriptHash` check in `apply_block` and allow the
+chain to advance. Blocks containing user transactions require a valid `WalletProofBundle`
+from the wallet (submitted as part of `TxIntent`).
 
 ### 20.3 ASERT target in template builder
 
@@ -686,10 +690,12 @@ let difficulty_target = next_target(
 - **Identify is mandatory**: Without it, gossipsub silently refuses to route to peers.
 - **Idle timeout 300s**: Default libp2p timeout disconnects peers between blocks.
 - **Block validation on receipt**: `apply_next_block` runs full native consensus on P2P blocks.
-  ZK proof verification deferred to Phase 5.
+  Full ZK block-proof verification (`validate_block_full`) is performed by the miner
+  before sealing. Mempool admission independently verifies each transaction's `LogicProof`
+  (~84 ms, bounded by a semaphore to prevent CPU DoS).
 - **Mempool relay**: `TxAdmitted` events are piped to gossipsub broadcast automatically.
 
-## 21. Phase 4 Design Decisions
+## 21. Wallet & ZK Integration Design Decisions
 
 ### 21.1 `log_slots` в PublicInputs — binding к конфигурации цепи
 
@@ -718,9 +724,10 @@ proof.tx_pis[k].log_slots == block.header.log_slots
 слотов при genesis log_slots=24). Проблема «tx proven at log_slots=24, block at log_slots=25»
 решается отклонением и повторным доказательством (занимает ~300ms).
 
-До Phase 4 в `witness_builder.rs` и `prover.rs` было захардкодировано `log_slots: 24`
-с TODO-комментом. Исправлено: все три стороны (кошелёк, майнер, валидатор) теперь
-используют правильное значение.
+All three parties — wallet (`prove_tx`), miner (`build_block_witnesses`), and
+validator (`validate_block_full`) — read `log_slots` from the live block header.
+Hardcoded values are rejected at compile time by the `_: () = assert!(...)` anchor
+in `params.rs`.
 
 ### 21.2 Receipts — автоматическая генерация
 
@@ -755,11 +762,13 @@ let intent_bytes = tokio::task::spawn_blocking(move || {
 }).await??;
 ```
 
-### 20.5 MempoolEntry Phase 1.5 fields
+### 21.4 MempoolEntry pre-proving fields
 
-`cached_algebraic_proof: Option<Vec<u8>>` and `spine_slots: Option<Vec<u8>>` are in
-`MempoolEntry` as stubs. Activation in Phase 5 (once wallets produce `WalletProofBundle`):
-1. On tx admission: spawn background `verify_logic` + `prove_air_algebraic_pretx`
-2. Cache result in `cached_algebraic_proof`  
-3. Block assembly skips per-tx algebraic STARK, runs only unified GKR + FRI
-4. Measured impact: 1024-tx block → ~44s without, ~12s with pre-proving
+`cached_algebraic_proof: Option<Vec<u8>>` in `MempoolEntry` holds the pre-computed
+algebraic STARK transcript for each admitted transaction. When populated, block
+assembly can skip the per-tx algebraic prove step and run only the unified GKR + FRI
+pass:
+1. On admission: the wallet's `LogicProof` bytes are stored in `cached_algebraic_proof`
+2. Block assembly deserializes `WalletProofBundle` from these bytes
+3. `prove_block` uses the pre-computed auth proof instead of re-proving
+4. Measured impact: 1024-tx block → ~44 s without caching, ~12 s with caching

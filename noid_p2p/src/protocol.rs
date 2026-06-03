@@ -56,7 +56,7 @@ pub struct GetRecursiveProofResponse {
 /// New nodes synchronise by downloading the CURRENT STATE from a peer,
 /// not by replaying blocks from genesis.
 ///
-/// The state is proven valid by the recursive chain proof (Phase 7).
+/// The state is proven valid by the recursive chain proof (see noid_recursive).
 /// For testnet, nodes accept snapshots from trusted peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSnapshotRequest {

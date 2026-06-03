@@ -15,7 +15,7 @@ pub struct MempoolConfig {
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
     pub fee_floor_window: usize,
 
-    /// Enable Phase 1.5 background ZK pre-proving on admission.
+    /// Enable background ZK pre-proving on admission.
     /// When true, each admitted tx spawns a `prove_air_algebraic_pretx` task.
     /// Cached proofs reduce block assembly from ~44s to ~12s at 1024 txs.
     pub pre_prove_enabled: bool,

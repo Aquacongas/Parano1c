@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Chain reorg logic (ROADMAP Phase 1 P.12).
+//! Chain reorg logic .
 //!
 //! Handles chain reorganisations within the finality window (≤ FINALITY_DEPTH blocks).
 //! Deeper reorgs are rejected — blocks beyond FINALITY_DEPTH are considered final.
@@ -59,7 +59,7 @@ pub struct ReorgResult {
     /// Heights of blocks that were applied (from new chain).
     pub applied_heights: Vec<u64>,
     /// Transaction hashes from reverted blocks whose state effects were undone.
-    /// The caller (Phase 3 mempool) should re-admit these if their epoch_anchor
+    /// The caller should re-admit these if their epoch_anchor
     /// is still within the valid window and the tx was not included in the new chain.
     pub reclaimed_tx_hashes: Vec<TxBodyHash>,
 }

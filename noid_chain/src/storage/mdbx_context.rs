@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! `MdbxChainContext` — crash-consistent chain context backed by MDBX (Phase 2, P.18).
+//! `MdbxChainContext` — crash-consistent chain context backed by MDBX.
 //!
 //! Replaces the in-memory `ChainContext` with a version that survives process
-//! restarts. The consensus logic (Phase 1) is reused unchanged; only the
+//! restarts. The consensus logic is reused unchanged; only the
 //! persistence layer differs.
 //!
 //! # Crash-consistency guarantee (P.18)
@@ -703,7 +703,7 @@ impl MdbxChainContext {
     ///
     /// Paranoid's designed sync method: new nodes download the CURRENT STATE
     /// (not block history, which is not stored after FINALITY_DEPTH blocks).
-    /// The state's validity is proven by the recursive chain proof (Phase 7).
+    /// The state's validity is proven by the recursive chain proof (see noid_recursive).
     /// For testnet, nodes accept snapshots from configured seed peers.
     ///
     /// After this call, the node is at the snapshot's tip height and can

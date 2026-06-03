@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! In-memory mempool for admitted transactions (ROADMAP Phase 1 / Phase 3).
+//! In-memory mempool for admitted transactions.
 //!
 //! `Mempool` is a pure data structure with no I/O, no async, no networking.
-//! Phase 3 wraps it in async admission/eviction tasks and connects it to the
+//! `AsyncMempool` in `noid_mempool` wraps this in async admission/eviction tasks and connects it to the
 //! P2P layer and the block template builder.
 //!
 //! # Design
 //!
 //! Admission pipeline (cheapest first):
 //!   1. `validate_tx_for_mempool()` — native checks (~0ms)
-//!   2. [background] `verify_logic()` — ZK verification (~84ms, Phase 1.5)
+//!   2. [async] `verify_logic()` — ZK verification (~84ms, semaphore-bounded)
 //!
 //! When a block is confirmed: `on_block_confirmed()` removes confirmed txs
 //! and returns reverted txs (from reorged blocks) to the pool.

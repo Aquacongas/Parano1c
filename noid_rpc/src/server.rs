@@ -3,7 +3,7 @@
 
 //! JSON-RPC server implementation.
 //!
-//! All methods from ROADMAP2.md §RPC API are implemented.
+//! All JSON-RPC methods are implemented. See API.md for the full method reference.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

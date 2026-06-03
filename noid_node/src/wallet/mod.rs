@@ -5,7 +5,7 @@
 //!
 //! The wallet lives inside the daemon process. `SpendSecret` is:
 //! 1. Generated randomly on first start
-//! 2. Stored on disk in plaintext format (Phase 4 — no password required)
+//! 2. Stored on disk in plaintext format (no password required for full nodes)
 //! 3. Decrypted into memory at startup
 //! 4. Zeroized from memory on daemon exit
 //! 5. **NEVER transmitted over the network** — not in RPC responses,

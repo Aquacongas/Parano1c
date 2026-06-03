@@ -14,7 +14,7 @@ fail() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 wait_rpc() {
   local url="$1" retries=20
   for i in $(seq 1 $retries); do
-    if "$CLI" --rpc "$url" node status >/dev/null 2>&1; then
+    if "$CLI" --rpc "$url" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.3
@@ -61,8 +61,8 @@ echo "  Node started (PID $T1_PID), mining for 4 seconds..."
 sleep 4
 
 # --- Capture pre-stop state ---
-STATUS_BEFORE=$("$CLI" --rpc "$T1_RPC" node status 2>/dev/null)
-BALANCE_BEFORE=$("$CLI" --rpc "$T1_RPC" wallet balance 2>/dev/null)
+STATUS_BEFORE=$("$CLI" --rpc "$T1_RPC" status 2>/dev/null)
+BALANCE_BEFORE=$("$CLI" --rpc "$T1_RPC" balance 2>/dev/null)
 
 HEIGHT_BEFORE=$(echo "$STATUS_BEFORE" | grep "Height:" | awk '{print $2}')
 HASH_BEFORE=$(echo "$STATUS_BEFORE" | grep "Best hash:" | awk '{print $3}')
@@ -80,7 +80,7 @@ fi
 
 # --- Stop gracefully ---
 echo "  Stopping node gracefully..."
-"$CLI" --rpc "$T1_RPC" node stop 2>/dev/null || true
+"$CLI" --rpc "$T1_RPC" stop 2>/dev/null || true
 sleep 2
 
 # Confirm process exited
@@ -121,11 +121,11 @@ sleep 2
 # Run wallet scan to rebuild UTXO state from persisted chain state.
 # The wallet UTXO set is not persisted to MDBX; it must be rebuilt after restart.
 echo "  Running wallet scan to rebuild UTXO state from chain..."
-"$CLI" --rpc "$T1_RPC" wallet scan 2>/dev/null || true
+"$CLI" --rpc "$T1_RPC" scan 2>/dev/null || true
 
 # --- Capture post-restart state ---
-STATUS_AFTER=$("$CLI" --rpc "$T1_RPC" node status 2>/dev/null)
-BALANCE_AFTER=$("$CLI" --rpc "$T1_RPC" wallet balance 2>/dev/null)
+STATUS_AFTER=$("$CLI" --rpc "$T1_RPC" status 2>/dev/null)
+BALANCE_AFTER=$("$CLI" --rpc "$T1_RPC" balance 2>/dev/null)
 
 HEIGHT_AFTER=$(echo "$STATUS_AFTER" | grep "Height:" | awk '{print $2}')
 HASH_AFTER=$(echo "$STATUS_AFTER" | grep "Best hash:" | awk '{print $3}')
@@ -167,7 +167,7 @@ fi
 echo "  Mining 3 more seconds to verify height increases after restart..."
 sleep 3
 
-STATUS_FINAL=$("$CLI" --rpc "$T1_RPC" node status 2>/dev/null)
+STATUS_FINAL=$("$CLI" --rpc "$T1_RPC" status 2>/dev/null)
 HEIGHT_FINAL=$(echo "$STATUS_FINAL" | grep "Height:" | awk '{print $2}')
 echo "  Final height: $HEIGHT_FINAL (was $HEIGHT_AFTER after restart)"
 
@@ -221,8 +221,8 @@ sleep 5
 
 # --- Check UTXO count before consolidation ---
 # Capture height and UTXO count together so HEIGHT_CONSOL_PRE is coherent with UTXO_PRE.
-STATUS_PRE=$("$CLI" --rpc "$T2_RPC" node status 2>/dev/null)
-BALANCE_PRE=$("$CLI" --rpc "$T2_RPC" wallet balance 2>/dev/null)
+STATUS_PRE=$("$CLI" --rpc "$T2_RPC" status 2>/dev/null)
+BALANCE_PRE=$("$CLI" --rpc "$T2_RPC" balance 2>/dev/null)
 BAL_MICRO_PRE=$(echo "$BALANCE_PRE" | grep "Balance:" | grep -oP '\d+ μNOID' | grep -oP '^\d+')
 UTXO_PRE=$(echo "$BALANCE_PRE" | grep "UTXOs:" | awk '{print $2}')
 HEIGHT_PRE=$(echo "$STATUS_PRE" | grep "Height:" | awk '{print $2}')
@@ -238,8 +238,8 @@ else
 fi
 
 # --- Run wallet consolidate --rounds 5 ---
-echo "  Running: noid-cli wallet consolidate --rounds 5 ..."
-CONSOLIDATE_OUT=$("$CLI" --rpc "$T2_RPC" wallet consolidate --rounds 5 2>/dev/null || true)
+echo "  Running: noid-cli consolidate --rounds 5 ..."
+CONSOLIDATE_OUT=$("$CLI" --rpc "$T2_RPC" consolidate --rounds 5 2>/dev/null || true)
 echo "  Consolidate output:"
 echo "$CONSOLIDATE_OUT" | sed 's/^/    /'
 
@@ -256,7 +256,7 @@ echo "  Rounds completed: $ROUNDS_DONE"
 echo "  Waiting for consolidation TXs to be mined (poll up to 20s)..."
 for _i in $(seq 1 20); do
   sleep 1
-  MEMPOOL_SIZE=$("$CLI" --rpc "$T2_RPC" node mempool 2>/dev/null | grep "Pending txs:" | awk '{print $3}')
+  MEMPOOL_SIZE=$("$CLI" --rpc "$T2_RPC" mempool 2>/dev/null | grep "Pending txs:" | awk '{print $3}')
   if [ "${MEMPOOL_SIZE:-1}" -eq 0 ]; then
     echo "  Mempool empty after ${_i}s — consolidation TXs confirmed."
     break
@@ -266,9 +266,9 @@ done
 sleep 1
 
 # --- Check UTXO count after consolidation ---
-STATUS_CONSOL_POST=$("$CLI" --rpc "$T2_RPC" node status 2>/dev/null)
+STATUS_CONSOL_POST=$("$CLI" --rpc "$T2_RPC" status 2>/dev/null)
 HEIGHT_CONSOL_POST=$(echo "$STATUS_CONSOL_POST" | grep "Height:" | awk '{print $2}')
-BALANCE_POST=$("$CLI" --rpc "$T2_RPC" wallet balance 2>/dev/null)
+BALANCE_POST=$("$CLI" --rpc "$T2_RPC" balance 2>/dev/null)
 BAL_MICRO_POST=$(echo "$BALANCE_POST" | grep "Balance:" | grep -oP '\d+ μNOID' | grep -oP '^\d+')
 UTXO_POST=$(echo "$BALANCE_POST" | grep "UTXOs:" | awk '{print $2}')
 

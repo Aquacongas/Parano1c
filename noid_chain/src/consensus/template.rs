@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Block template construction for the mining pipeline (ROADMAP Phase 1 / Phase 1.5).
+//! Block template construction for the mining pipeline .
 //!
 //! A `BlockTemplate` is a fully computed block ready for PoW search:
 //! - Transaction set selected and conflict-resolved

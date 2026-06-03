@@ -25,7 +25,7 @@
 //!         ├──► RPC WebSocket: notify subscribed wallets
 //!         └──► Block builder: wake up if 100+ new txs
 //!
-//!  Phase 1.5 (not yet active): background ZK verify + pre-prove
+//!  Background: ZK verify on admission + pre-prove cache
 //! ```
 //!
 //! ## Usage

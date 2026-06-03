@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! MDBX-backed persistent storage for the chain (Phase 2).
+//! MDBX-backed persistent storage for the chain .
 //!
 //! `MdbxStore` owns the MDBX `Database` and provides methods for
 //! all persistent chain data: headers, nullifiers, undo logs, segments,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! State storage backend abstraction (Phase 3 / F.0).
+//! State storage backend abstraction .
 //!
 //! `StateBackend` decouples the chain state from its physical storage.
 //! The RAM backend (`SegmentedFriState`) is the default and is used

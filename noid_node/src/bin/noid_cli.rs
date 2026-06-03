@@ -34,66 +34,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Node / chain commands.
-    Node {
-        #[command(subcommand)]
-        action: NodeCmd,
-    },
-    /// Wallet commands (all executed inside the daemon).
-    Wallet {
-        #[command(subcommand)]
-        action: WalletCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum NodeCmd {
-    /// Print chain info: height, best hash, difficulty, and slot counts.
+    // --- Chain ---
+    /// Chain info: height, best hash, difficulty, active slot count.
     Status,
-    /// Print mempool state: pending transaction count, fee floor, and tx list.
+    /// Mempool: pending TX count, fee floor, list of pending TXs.
     Mempool,
-    /// Gracefully stop the running paranoid daemon (cancels miner, flushes MDBX).
+    /// Gracefully stop the running paranoid daemon.
     Stop,
-}
 
-#[derive(Subcommand)]
-enum WalletCmd {
-    /// Print the wallet address at key index N.
+    // --- Wallet ---
+    /// Wallet address at key index N (default: 0).
     Address {
         #[arg(long, default_value_t = 0)]
         index: u32,
     },
-    /// Print wallet balance and UTXO count.
+    /// Confirmed balance and UTXO count.
     Balance,
-    /// Send μNOID to an address.
+    /// Send μNOID to a recipient address.
     Send {
         /// Recipient address (32-byte hex, 64 characters).
         to: String,
-        /// Amount to send in μNOID (1 NOID = 1,000,000 μNOID).
+        /// Amount in μNOID (1 NOID = 1,000,000 μNOID).
         amount: u64,
-        /// Transaction fee in μNOID. 0 = auto (uses current fee floor, min 9000).
+        /// Fee in μNOID. 0 = auto (minimum + current fee floor).
         #[arg(long, default_value_t = 0)]
         fee: u64,
     },
-    /// Print transaction history.
+    /// Transaction history.
     History,
-    /// List all confirmed UTXOs owned by the wallet.
+    /// List all confirmed UTXOs with slot indices and values.
     Utxos,
-    /// Rescan the full chain state for wallet UTXOs.
+    /// Rescan the full chain state to (re)discover owned UTXOs.
     Scan,
-    /// Export a receipt (hex) for a confirmed transaction and print to stdout.
+    /// Export a Merkle inclusion receipt for a confirmed transaction.
     Receipt {
         /// Transaction hash (hex).
         txhash: String,
     },
-    /// Consolidate multiple small UTXOs into a single larger UTXO.
-    /// Repeats until UTXO count stops decreasing (all UTXOs are large enough).
+    /// Merge small UTXOs into fewer larger ones (reduces UTXO count).
     Consolidate {
-        /// Transaction fee per consolidation round in μNOID.
-        /// 0 = auto (use current fee floor, never below 7000).
+        /// Fee per round in μNOID. 0 = auto.
         #[arg(long, default_value_t = 0)]
         fee: u64,
-        /// Maximum number of consolidation rounds (default: 100).
+        /// Maximum consolidation rounds.
         #[arg(long, default_value_t = 100)]
         rounds: u32,
     },
@@ -114,25 +97,21 @@ async fn main() -> anyhow::Result<()> {
         .context("build HTTP client")?;
 
     match cli.cmd {
-        Command::Node { action } => match action {
-            NodeCmd::Status => cmd_node_status(&client, &cli.rpc).await?,
-            NodeCmd::Mempool => cmd_node_mempool(&client, &cli.rpc).await?,
-            NodeCmd::Stop => cmd_node_stop(&client, &cli.rpc).await?,
-        },
-        Command::Wallet { action } => match action {
-            WalletCmd::Address { index } => cmd_wallet_address(&client, &cli.rpc, index).await?,
-            WalletCmd::Balance => cmd_wallet_balance(&client, &cli.rpc).await?,
-            WalletCmd::Send { to, amount, fee } => {
-                cmd_wallet_send(&client, &cli.rpc, &to, amount, fee).await?
-            }
-            WalletCmd::History => cmd_wallet_history(&client, &cli.rpc).await?,
-            WalletCmd::Utxos => cmd_wallet_utxos(&client, &cli.rpc).await?,
-            WalletCmd::Scan => cmd_wallet_scan(&client, &cli.rpc).await?,
-            WalletCmd::Receipt { txhash } => cmd_wallet_receipt(&client, &cli.rpc, &txhash).await?,
-            WalletCmd::Consolidate { fee, rounds } => {
-                cmd_wallet_consolidate(&client, &cli.rpc, fee, rounds).await?
-            }
-        },
+        Command::Status => cmd_node_status(&client, &cli.rpc).await?,
+        Command::Mempool => cmd_node_mempool(&client, &cli.rpc).await?,
+        Command::Stop => cmd_node_stop(&client, &cli.rpc).await?,
+        Command::Address { index } => cmd_wallet_address(&client, &cli.rpc, index).await?,
+        Command::Balance => cmd_wallet_balance(&client, &cli.rpc).await?,
+        Command::Send { to, amount, fee } => {
+            cmd_wallet_send(&client, &cli.rpc, &to, amount, fee).await?
+        }
+        Command::History => cmd_wallet_history(&client, &cli.rpc).await?,
+        Command::Utxos => cmd_wallet_utxos(&client, &cli.rpc).await?,
+        Command::Scan => cmd_wallet_scan(&client, &cli.rpc).await?,
+        Command::Receipt { txhash } => cmd_wallet_receipt(&client, &cli.rpc, &txhash).await?,
+        Command::Consolidate { fee, rounds } => {
+            cmd_wallet_consolidate(&client, &cli.rpc, fee, rounds).await?
+        }
     }
 
     Ok(())

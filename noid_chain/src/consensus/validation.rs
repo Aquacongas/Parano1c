@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Native block validation pipeline (SPECIFICATION.md §16, ROADMAP Phase 1 P.9).
+//! Native block validation pipeline (SPECIFICATION.md §16).
 //!
 //! `validate_block_consensus` enforces all consensus rules that do NOT require
 //! ZK proof verification. ZK verification (LogicProof + BlockProof) is layered

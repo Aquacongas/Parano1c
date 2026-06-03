@@ -10,7 +10,7 @@
 //! - Correct ASERT difficulty target computed
 //! - All header fields set except `nonce` and `proof_transcript_hash`
 //!
-//! ## Template refresh triggers (ROADMAP2.md §Template refresh triggers)
+//! ## Template refresh triggers
 //!
 //! 1. Every 15 seconds (wall clock)
 //! 2. ≥100 new txs admitted to mempool
