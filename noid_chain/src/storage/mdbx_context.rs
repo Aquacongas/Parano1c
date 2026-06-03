@@ -37,8 +37,9 @@ use crate::block_header::BlockHeader;
 use crate::chain_context::ChainContext;
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
+    difficulty::{add_work, block_work},
     header::epoch_anchor_height,
-    params::{ANCHOR_DEPTH, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS},
+    params::{ANCHOR_DEPTH, EXPANSION_WINDOW, FINALITY_DEPTH, GENESIS_TARGET, MEDIAN_TIME_BLOCKS},
     pow::full_block_hash,
     validation::{validate_block_consensus, AnchorInfo},
     ConsensusError,
@@ -112,6 +113,11 @@ pub struct MdbxChainContext {
 
     /// H_BLOCK of the current tip.
     pub tip_hash: [u8; 32],
+
+    /// Cumulative PoW work for the current tip chain.
+    /// Sum of block_work(difficulty_target) for all blocks from genesis to tip.
+    /// Used as the primary fork choice criterion (more work = canonical chain).
+    pub tip_chain_work: [u8; 32],
 }
 
 impl MdbxChainContext {
@@ -129,6 +135,8 @@ impl MdbxChainContext {
         if store.is_empty()? {
             // First run: initialise from genesis.
             let consensus = ChainContext::init_from_genesis();
+            // Genesis chainwork = work contributed by the genesis block alone.
+            let tip_chain_work = block_work(&GENESIS_TARGET);
             let ctx = Self {
                 store,
                 state: consensus.state,
@@ -136,6 +144,7 @@ impl MdbxChainContext {
                 recent_headers: consensus.headers,
                 tip_height: consensus.tip_height,
                 tip_hash: consensus.tip_hash,
+                tip_chain_work,
             };
             // Persist genesis state_meta and chain_tip so subsequent restarts work.
             ctx.persist_genesis()?;
@@ -236,6 +245,24 @@ impl MdbxChainContext {
         let nullifiers =
             NullifierSet::rebuild_from_blocks(null_blocks.into_iter().map(|(_, hashes)| hashes));
 
+        // 7. Reconstruct cumulative chainwork.
+        //
+        //    Headers are kept in MDBX forever, but reading them all on startup
+        //    would be slow for very long chains. We approximate blocks outside
+        //    the recent_headers window with GENESIS_TARGET (conservative), and
+        //    use precise targets for the recent window (already loaded above).
+        let mut tip_chain_work = [0u8; 32];
+        // Old blocks (before recent_headers window): approximate with genesis target.
+        for _ in 0..start_height {
+            tip_chain_work = add_work(&tip_chain_work, &block_work(&GENESIS_TARGET));
+        }
+        // Recent blocks: use precise difficulty targets.
+        for h in start_height..=tip_height {
+            if let Some(hdr) = recent_headers.get(&h) {
+                tip_chain_work = add_work(&tip_chain_work, &block_work(&hdr.difficulty_target));
+            }
+        }
+
         Ok(Self {
             store,
             state,
@@ -243,6 +270,7 @@ impl MdbxChainContext {
             recent_headers,
             tip_height,
             tip_hash,
+            tip_chain_work,
         })
     }
 
@@ -346,6 +374,11 @@ impl MdbxChainContext {
         self.nullifiers.insert_block(&tx_hashes);
         self.tip_height = block.header.height;
         self.tip_hash = block_hash;
+        // Accumulate PoW work for the newly applied block.
+        self.tip_chain_work = add_work(
+            &self.tip_chain_work,
+            &block_work(&block.header.difficulty_target),
+        );
 
         // Clear MDBX-dirty tracking: next block's dirty_segment_ids() should
         // return only segments modified by THAT block, not accumulated history.
@@ -373,6 +406,227 @@ impl MdbxChainContext {
         }
 
         Ok(new_state_root)
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain reorganization (MDBX-backed)
+    // -----------------------------------------------------------------------
+
+    /// Find the height of a block with the given hash in our chain.
+    ///
+    /// Searches `recent_headers` first (fast RAM lookup), then falls back to
+    /// the MDBX hash→height index. Returns `None` if the hash is not found
+    /// within the last `FINALITY_DEPTH` blocks.
+    pub fn find_ancestor_height(&self, hash: &[u8; 32]) -> Option<u64> {
+        // Search recent_headers first (fast path in RAM).
+        for (height, header) in &self.recent_headers {
+            if &full_block_hash(header) == hash {
+                return Some(*height);
+            }
+        }
+
+        // Fall back to MDBX hash→height index.
+        let oldest = self.tip_height.saturating_sub(FINALITY_DEPTH);
+        match self.store.get_header_by_hash(hash) {
+            Ok(Some(header)) if header.height >= oldest => Some(header.height),
+            _ => None,
+        }
+    }
+
+    /// Apply a chain reorganization backed by MDBX undo logs.
+    ///
+    /// 1. Reverts our chain from tip back to `ancestor_height` using MDBX undo logs.
+    /// 2. Rebuilds the nullifier set for the surviving chain.
+    /// 3. Persists the reverted state to MDBX atomically (crash-safe checkpoint).
+    /// 4. Applies `new_blocks` on top of `ancestor_height` via `apply_next_block`.
+    ///
+    /// Returns the hashes of reclaimed transactions for mempool re-admission.
+    ///
+    /// Fails if reorg depth > `FINALITY_DEPTH` or if an undo log is missing.
+    pub fn apply_reorg_mdbx(
+        &mut self,
+        ancestor_height: u64,
+        new_blocks: &[Block],
+        local_time: u64,
+    ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError> {
+        use crate::consensus::reorg::{revert_state_counters, ReorgResult};
+
+        let reorg_depth = self.tip_height.saturating_sub(ancestor_height);
+
+        if reorg_depth > FINALITY_DEPTH {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+        }
+
+        if reorg_depth == 0 {
+            return Ok(ReorgResult {
+                reverted_heights: vec![],
+                applied_heights: vec![],
+                reclaimed_tx_hashes: vec![],
+            });
+        }
+
+        eprintln!(
+            "[INFO] reorg: reverting from height {} to {} (depth {}), {} new block(s)",
+            self.tip_height,
+            ancestor_height,
+            reorg_depth,
+            new_blocks.len()
+        );
+
+        // -----------------------------------------------------------------------
+        // Phase 1: Revert blocks from tip to ancestor (RAM only).
+        // revert_block marks affected segments as mdbx_dirty for the MDBX write
+        // in Phase 4.
+        // -----------------------------------------------------------------------
+        let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
+        let mut reverted_heights: Vec<u64> = Vec::new();
+
+        for height in (ancestor_height + 1..=self.tip_height).rev() {
+            let undo = match self.store.get_undo_log(height) {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    eprintln!("[ERROR] reorg: undo log missing for height {height}");
+                    return Err(MdbxContextError::Corrupt("undo log missing during reorg"));
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // Collect tx hashes for mempool re-admission.
+            reclaimed_tx_hashes.extend_from_slice(&undo.tx_hashes);
+
+            // Revert UTXO slot data; marks affected segments as mdbx_dirty.
+            revert_block(&mut self.state.state, &undo);
+            // Revert active_slot_count and alloc_counter.
+            revert_state_counters(&mut self.state, &undo);
+
+            self.recent_headers.remove(&height);
+            reverted_heights.push(height);
+        }
+
+        // -----------------------------------------------------------------------
+        // Phase 2: Rebuild nullifier set from the surviving chain.
+        // Uses T_NULLIFIER_BLOCKS (kept for ANCHOR_DEPTH blocks), not undo logs
+        // (kept for only FINALITY_DEPTH blocks).
+        // -----------------------------------------------------------------------
+        {
+            let rebuild_start = ancestor_height.saturating_sub(ANCHOR_DEPTH - 1);
+            let null_blocks = self
+                .store
+                .get_nullifier_blocks_range(rebuild_start, ancestor_height)?;
+            self.nullifiers =
+                NullifierSet::rebuild_from_blocks(null_blocks.into_iter().map(|(_, h)| h));
+        }
+
+        // -----------------------------------------------------------------------
+        // Phase 3: Update tip pointers to the ancestor.
+        // -----------------------------------------------------------------------
+        let ancestor_header =
+            self.get_header_from_store(ancestor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "ancestor header missing from store",
+                ))?;
+
+        self.tip_height = ancestor_height;
+        self.tip_hash = full_block_hash(&ancestor_header);
+
+        // -----------------------------------------------------------------------
+        // Phase 4: Persist the reverted state to MDBX atomically.
+        // dirty segments (from Phase 1) are written before new blocks so crash
+        // recovery always sees a consistent ancestor checkpoint.
+        // -----------------------------------------------------------------------
+        self.persist_reorg_checkpoint(&ancestor_header)?;
+
+        // -----------------------------------------------------------------------
+        // Phase 5: Apply new blocks using the existing apply_next_block.
+        // -----------------------------------------------------------------------
+        let mut applied_heights: Vec<u64> = Vec::new();
+
+        for block in new_blocks {
+            match self.apply_next_block(block, local_time) {
+                Ok(_) => {
+                    applied_heights.push(block.header.height);
+                    eprintln!(
+                        "[INFO] reorg: applied new block at height {}",
+                        block.header.height
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ERROR] reorg: failed to apply block at height {}: {:?}",
+                        block.header.height, e
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        eprintln!(
+            "[INFO] reorg complete: reverted={}, applied={}, new_tip={}",
+            reverted_heights.len(),
+            applied_heights.len(),
+            self.tip_height
+        );
+
+        Ok(ReorgResult {
+            reverted_heights,
+            applied_heights,
+            reclaimed_tx_hashes,
+        })
+    }
+
+    /// Persist the reverted chain state to MDBX after the reorg revert phase.
+    ///
+    /// Writes all segments marked dirty by `revert_block`, updates `chain_tip`
+    /// and `state_meta`, and preserves the existing undo log at `ancestor_height`
+    /// — all in one atomic MDBX transaction.
+    fn persist_reorg_checkpoint(
+        &mut self,
+        ancestor_header: &BlockHeader,
+    ) -> Result<(), MdbxContextError> {
+        use crate::consensus::da_prune::BlockUndoLog;
+
+        // Collect all segments dirtied by the revert_block calls in Phase 1.
+        let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
+        let eff_log = self.state.state.effective_log_segment_size() as u8;
+        let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
+            .iter()
+            .map(|&seg_id| {
+                let cols = self.state.state.segment_columns(seg_id).clone();
+                (seg_id, eff_log, cols)
+            })
+            .collect();
+        let dirty_refs: Vec<(u16, u8, &_)> = dirty_segments
+            .iter()
+            .map(|(id, eff, cols)| (*id, *eff, cols))
+            .collect();
+
+        let ancestor_hash = full_block_hash(ancestor_header);
+
+        // Read the ancestor's existing undo log so we don't overwrite it with
+        // empty — it must remain intact for any future reorg within finality.
+        let existing_undo = self
+            .store
+            .get_undo_log(ancestor_header.height)?
+            .unwrap_or_else(|| BlockUndoLog::empty(ancestor_header.height));
+
+        // Atomic commit: dirty segments + updated chain_tip + state_meta.
+        // The ancestor's header and hash→height index are idempotently re-written.
+        // nullifier_hashes=[] avoids re-inserting entries already in MDBX.
+        self.store
+            .commit_block(
+                ancestor_header,
+                &ancestor_hash,
+                &existing_undo,
+                &dirty_refs,
+                &[],  // ancestor's nullifiers already stored; don't duplicate
+                None, // no block bytes (stored earlier or DA-pruned)
+            )
+            .map_err(MdbxContextError::Store)?;
+
+        // Clear dirty tracking so apply_next_block starts with a clean slate.
+        self.state.state.clear_dirty();
+
+        Ok(())
     }
 
     /// Preload ALL evicted segments back into RAM.
@@ -442,6 +696,122 @@ impl MdbxChainContext {
     }
 
     // -----------------------------------------------------------------------
+    // State snapshot sync
+    // -----------------------------------------------------------------------
+
+    /// Apply a full state snapshot received from a peer during initial sync.
+    ///
+    /// Paranoid's designed sync method: new nodes download the CURRENT STATE
+    /// (not block history, which is not stored after FINALITY_DEPTH blocks).
+    /// The state's validity is proven by the recursive chain proof (Phase 7).
+    /// For testnet, nodes accept snapshots from configured seed peers.
+    ///
+    /// After this call, the node is at the snapshot's tip height and can
+    /// immediately start receiving gossipsub blocks and mining.
+    pub fn apply_state_snapshot(
+        &mut self,
+        tip_height: u64,
+        tip_hash: [u8; 32],
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        segments: &[(u16, u8, crate::segmented_state::SegmentColumns)],
+        recent_headers_bytes: &[Vec<u8>],
+        nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
+    ) -> Result<(), MdbxContextError> {
+        use crate::block_header::BlockHeader;
+        use crate::consensus::difficulty::{add_work, block_work};
+        use crate::nullifier::NullifierSet;
+
+        // 1. Rebuild SegmentedFriState from snapshot segments.
+        let mut seg_state =
+            crate::segmented_state::SegmentedFriState::new_empty(log_slots as usize);
+        for (seg_id, _eff_log, cols) in segments {
+            seg_state.set_segment_columns(*seg_id, cols.clone());
+        }
+
+        // 2. Decode and index recent headers.
+        let mut new_recent: std::collections::HashMap<u64, BlockHeader> =
+            std::collections::HashMap::new();
+        let mut new_tip_header: Option<BlockHeader> = None;
+        for bytes in recent_headers_bytes {
+            if let Ok(hdr) = BlockHeader::from_bytes(bytes) {
+                if hdr.height == tip_height {
+                    new_tip_header = Some(hdr.clone());
+                }
+                new_recent.insert(hdr.height, hdr);
+            }
+        }
+
+        // 3. Rebuild NullifierSet from nullifier_blocks.
+        let null_vecs: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> =
+            nullifier_blocks.to_vec();
+        let new_nullifiers = NullifierSet::rebuild_from_blocks(null_vecs);
+
+        // 4. Compute approximate chainwork from recent headers.
+        let new_tip_chain_work = {
+            let mut w = [0u8; 32];
+            for hdr in new_recent.values() {
+                w = add_work(&w, &block_work(&hdr.difficulty_target));
+            }
+            w
+        };
+
+        // 5. Apply to in-memory state.
+        self.state.state = seg_state;
+        self.state.active_slot_count = active_slot_count;
+        self.state.alloc_counter = alloc_counter;
+        self.state.state.clear_dirty();
+        self.recent_headers = new_recent;
+        self.nullifiers = new_nullifiers;
+        self.tip_height = tip_height;
+        self.tip_hash = tip_hash;
+        self.tip_chain_work = new_tip_chain_work;
+
+        // 6. Persist the snapshot to MDBX so the node survives restarts.
+        // We persist all segments plus tip header (if we have it).
+        if let Some(tip_hdr) = new_tip_header {
+            // Collect all segments to write
+            let eff_log = self.state.state.effective_log_segment_size() as u8;
+            let seg_ids: Vec<u16> = self.state.state.active_segment_ids().collect();
+            let dirty_segments: Vec<(u16, u8, crate::segmented_state::SegmentColumns)> = seg_ids
+                .iter()
+                .map(|&id| (id, eff_log, self.state.state.segment_columns(id).clone()))
+                .collect();
+            let dirty_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> =
+                dirty_segments
+                    .iter()
+                    .map(|(id, eff, cols)| (*id, *eff, cols))
+                    .collect();
+
+            use crate::consensus::da_prune::BlockUndoLog;
+            let empty_undo = BlockUndoLog {
+                block_height: tip_height,
+                slot_changes: vec![],
+                tx_hashes: vec![],
+            };
+
+            self.store
+                .commit_block(
+                    &tip_hdr,
+                    &tip_hash,
+                    &empty_undo,
+                    &dirty_refs,
+                    &[],  // no new nullifier hashes (already rebuilt above)
+                    None, // no full block bytes (not stored for snapshot)
+                )
+                .map_err(MdbxContextError::Store)?;
+
+            self.state.state.clear_dirty();
+        }
+
+        // noid_chain has no tracing dep — log to stderr
+        eprintln!("[INFO] state snapshot applied: height={tip_height} segments={} active_slots={active_slot_count}", segments.len());
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // ChainContext-compatible accessors
     // -----------------------------------------------------------------------
 
@@ -501,6 +871,9 @@ impl MdbxChainContext {
     }
     pub fn tip_hash(&self) -> [u8; 32] {
         self.tip_hash
+    }
+    pub fn tip_chain_work(&self) -> &[u8; 32] {
+        &self.tip_chain_work
     }
 }
 

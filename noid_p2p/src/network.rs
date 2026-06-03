@@ -47,6 +47,20 @@ pub enum NetworkCommand {
     /// Request a specific block by height from a peer (orphan resolution).
     /// Emits `NetworkEvent::NewBlock` if the peer has the block.
     RequestBlock { peer: PeerId, height: u64 },
+    /// Fetch a range of headers from a peer for reorg ancestor search.
+    /// Emits `NetworkEvent::HeadersBatch` with the decoded headers.
+    /// Used to find the common ancestor efficiently in O(1) round-trips
+    /// instead of O(depth) hop-by-hop backwards traversal.
+    FetchHeaders {
+        peer: PeerId,
+        start_height: u64,
+        count: u16, // max 512
+    },
+    /// Request a full state snapshot from a peer.
+    /// Paranoid's primary initial-sync mechanism: new nodes download the
+    /// CURRENT STATE (not block history which is not stored).
+    /// Emits `NetworkEvent::StateSnapshot` when the response arrives.
+    RequestStateSnapshot { peer: PeerId },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -56,6 +70,17 @@ pub enum NetworkEvent {
     NewBlock { from: PeerId, block_bytes: Vec<u8> },
     /// A new TxIntent arrived from a peer.
     NewTx { from: PeerId, intent_bytes: Vec<u8> },
+    /// Response to FetchHeaders: decoded headers from the peer.
+    /// Used by reorg detection to find the common ancestor quickly.
+    HeadersBatch {
+        from: PeerId,
+        headers: Vec<noid_chain::block_header::BlockHeader>,
+    },
+    /// Full state snapshot received from a peer (response to RequestStateSnapshot).
+    StateSnapshot {
+        from: PeerId,
+        snapshot: Box<crate::protocol::GetStateSnapshotResponse>,
+    },
     /// A peer connected.
     PeerConnected(PeerId),
     /// A peer disconnected.
@@ -134,6 +159,14 @@ impl P2PNetwork {
             .await;
     }
 
+    /// Request a full state snapshot from a peer (initial sync).
+    pub async fn request_state_snapshot(&self, peer: PeerId) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::RequestStateSnapshot { peer })
+            .await;
+    }
+
     pub async fn peer_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
@@ -180,62 +213,97 @@ async fn run_swarm(
     swarm.listen_on(listen_addr)?;
 
     loop {
+        // Drain all pending commands first (priority: outgoing blocks must propagate
+        // immediately without waiting for swarm event processing).
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            handle_network_command(&mut swarm, cmd);
+        }
+
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
                 handle_swarm_event(&mut swarm, event, &event_tx, &chain).await;
             }
 
-            // Commands from the node.
+            // Commands from the node (when no swarm event pending).
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(NetworkCommand::BroadcastBlock { block_bytes }) => {
-                        let topic = gossipsub::IdentTopic::new(Topics::BLOCKS);
-                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
-                            tracing::warn!("gossipsub publish block: {e}");
-                        }
-                    }
-                    Some(NetworkCommand::BroadcastTx { intent_bytes }) => {
-                        let topic = gossipsub::IdentTopic::new(Topics::TXS);
-                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
-                            tracing::warn!("gossipsub publish tx: {e}");
-                        }
-                    }
-                    Some(NetworkCommand::Dial { addr }) => {
-                        if let Err(e) = swarm.dial(addr) {
-                            tracing::warn!("dial: {e}");
-                        }
-                    }
-                    Some(NetworkCommand::PeerCount { reply }) => {
-                        let count = swarm.connected_peers().count();
-                        let _ = reply.send(count);
-                    }
-                    Some(NetworkCommand::SyncBlocksFrom { peer, from_height, count }) => {
-                        for h in from_height..(from_height + count as u64) {
-                            let req_id = swarm
-                                .behaviour_mut()
-                                .block_sync
-                                .send_request(&peer, crate::protocol::GetRecentBlockRequest { height: h });
-                            tracing::debug!(peer = %peer, height = h, "requesting block for sync");
-                            let _ = req_id;
-                        }
-                    }
-                    Some(NetworkCommand::RequestBlock { peer, height }) => {
-                        // Orphan resolution: request a specific block by height.
-                        // Used when we receive a block whose parent is unknown.
-                        let req_id = swarm
-                            .behaviour_mut()
-                            .block_sync
-                            .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
-                        tracing::debug!(peer = %peer, height, "requesting block for orphan resolution");
-                        let _ = req_id;
-                    }
+                    Some(cmd) => handle_network_command(&mut swarm, cmd),
                     None => break, // cmd_tx dropped
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Process a single network command. Separated from the select! loop so that
+/// pending commands can be drained synchronously via `try_recv` before blocking.
+fn handle_network_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: NetworkCommand) {
+    match cmd {
+        NetworkCommand::BroadcastBlock { block_bytes } => {
+            let topic = gossipsub::IdentTopic::new(Topics::BLOCKS);
+            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
+                tracing::warn!("gossipsub publish block: {e}");
+            }
+        }
+        NetworkCommand::BroadcastTx { intent_bytes } => {
+            let topic = gossipsub::IdentTopic::new(Topics::TXS);
+            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
+                tracing::warn!("gossipsub publish tx: {e}");
+            }
+        }
+        NetworkCommand::Dial { addr } => {
+            if let Err(e) = swarm.dial(addr) {
+                tracing::warn!("dial: {e}");
+            }
+        }
+        NetworkCommand::PeerCount { reply } => {
+            let count = swarm.connected_peers().count();
+            let _ = reply.send(count);
+        }
+        NetworkCommand::SyncBlocksFrom {
+            peer,
+            from_height,
+            count,
+        } => {
+            for h in from_height..(from_height + count as u64) {
+                let _ = swarm
+                    .behaviour_mut()
+                    .block_sync
+                    .send_request(&peer, crate::protocol::GetRecentBlockRequest { height: h });
+            }
+        }
+        NetworkCommand::RequestBlock { peer, height } => {
+            let _ = swarm
+                .behaviour_mut()
+                .block_sync
+                .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
+        }
+        NetworkCommand::RequestStateSnapshot { peer } => {
+            let _ = swarm.behaviour_mut().snapshot_sync.send_request(
+                &peer,
+                crate::protocol::GetStateSnapshotRequest {
+                    requester_height: 0,
+                },
+            );
+            tracing::debug!(peer = %peer, "requesting state snapshot");
+        }
+        NetworkCommand::FetchHeaders {
+            peer,
+            start_height,
+            count,
+        } => {
+            let count = count.min(512);
+            let _ = swarm.behaviour_mut().chain_sync.send_request(
+                &peer,
+                crate::protocol::GetHeadersRequest {
+                    start_height,
+                    count,
+                },
+            );
+        }
+    }
 }
 
 async fn handle_swarm_event(
@@ -280,7 +348,29 @@ async fn handle_swarm_event(
             );
         }
 
-        // --- Request-Response: headers ---
+        // --- Request-Response: headers client side (response to our FetchHeaders) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            // Decode wire-format headers into BlockHeader structs.
+            let mut decoded = Vec::with_capacity(response.headers.len());
+            for bytes in &response.headers {
+                if let Ok(hdr) = noid_chain::block_header::BlockHeader::from_bytes(bytes) {
+                    decoded.push(hdr);
+                }
+            }
+            if !decoded.is_empty() {
+                let _ = event_tx.send(NetworkEvent::HeadersBatch {
+                    from: peer,
+                    headers: decoded,
+                });
+            }
+        }
+
+        // --- Request-Response: headers server side ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
             request_response::Event::Message {
                 message:
@@ -363,6 +453,124 @@ async fn handle_swarm_event(
                     tip_header_bytes: tip_bytes,
                 },
             );
+        }
+
+        // --- State snapshot: server side (peer requests full state from us) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            use crate::protocol::{GetStateSnapshotResponse, StateSegmentEntry};
+            use noid_chain::consensus::params::ANCHOR_DEPTH;
+            use noid_chain::storage::serial::encode_segment;
+
+            // Snapshot needs mutable access for segment_columns (lazy materialization)
+            let mut ctx = chain.write().await;
+            let tip_h = ctx.tip_height();
+
+            // Only serve if we have state to give
+            if tip_h == 0 || tip_h <= request.requester_height {
+                drop(ctx);
+                let _ = swarm
+                    .behaviour_mut()
+                    .snapshot_sync
+                    .send_response(channel, GetStateSnapshotResponse::default());
+                return;
+            }
+
+            tracing::info!(
+                requester_height = request.requester_height,
+                our_height = tip_h,
+                "serving state snapshot"
+            );
+
+            // Collect active state segments
+            let eff_log = ctx.state.state.effective_log_segment_size() as u8;
+            let seg_ids: Vec<u16> = ctx.state.state.active_segment_ids().collect();
+            let mut segments = Vec::new();
+            for seg_id in seg_ids {
+                let cols = ctx.state.state.segment_columns(seg_id).clone();
+                let data = encode_segment(&cols, eff_log);
+                segments.push(StateSegmentEntry {
+                    seg_id,
+                    eff_log,
+                    data,
+                });
+            }
+
+            // Collect recent headers (last 155 blocks)
+            let header_start = tip_h.saturating_sub(154);
+            let mut recent_headers = Vec::new();
+            for h in header_start..=tip_h {
+                let hdr_opt = ctx
+                    .recent_headers
+                    .get(&h)
+                    .cloned()
+                    .or_else(|| ctx.get_header_from_store(h).ok().flatten());
+                if let Some(hdr) = hdr_opt {
+                    let mut buf = Vec::new();
+                    hdr.encode(&mut buf);
+                    recent_headers.push(buf);
+                }
+            }
+
+            // Collect nullifier blocks (last ANCHOR_DEPTH blocks)
+            let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
+            let mut nullifier_blocks = Vec::new();
+            for h in null_start..=tip_h {
+                let hashes: Vec<[u8; 32]> = ctx
+                    .store
+                    .get_undo_log(h)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
+                    .unwrap_or_default();
+                nullifier_blocks.push(hashes);
+            }
+
+            let tip_hdr = ctx.tip_header().clone();
+            drop(ctx);
+
+            let response = GetStateSnapshotResponse {
+                tip_height: tip_h,
+                tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
+                log_slots: tip_hdr.log_slots,
+                active_slot_count: tip_hdr.active_slot_count,
+                alloc_counter: tip_hdr.alloc_counter,
+                segments,
+                recent_headers,
+                nullifier_blocks,
+            };
+            let _ = swarm
+                .behaviour_mut()
+                .snapshot_sync
+                .send_response(channel, response);
+        }
+
+        // --- State snapshot: client side (received snapshot we requested) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotSync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            if response.tip_height > 0 {
+                tracing::info!(
+                    from = %peer,
+                    tip = response.tip_height,
+                    segments = response.segments.len(),
+                    "received state snapshot"
+                );
+                let _ = event_tx.send(NetworkEvent::StateSnapshot {
+                    from: peer,
+                    snapshot: Box::new(response),
+                });
+            }
         }
 
         // --- Connection events ---

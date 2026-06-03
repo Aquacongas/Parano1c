@@ -377,6 +377,39 @@ impl AsyncMempool {
         );
     }
 
+    /// Re-admit transactions that were reclaimed by a chain reorg.
+    ///
+    /// These TXs were in reverted blocks. We log the count for observability
+    /// and evict any that happen to be sitting in the pool already (duplicate
+    /// re-submission race). Full re-admission with fresh ZK proofs is the
+    /// wallet's responsibility — wallets detect the unconfirmed state via
+    /// wallet scan and resubmit.
+    ///
+    /// NOTE: We do not have the original ZK proof bytes after a reorg (they
+    /// are not persisted). Phase 7 may add durable TX storage to enable
+    /// automatic re-admission without wallet involvement.
+    pub async fn readmit_after_reorg(&self, tx_hashes: Vec<TxBodyHash>) {
+        if tx_hashes.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            count = tx_hashes.len(),
+            "reorg: {} TX(s) reclaimed — wallets should resubmit if needed",
+            tx_hashes.len()
+        );
+
+        // Evict any entries with the same hash that may have been re-submitted
+        // concurrently (unlikely but keeps the pool clean).
+        let mut st = self.state.lock().await;
+        for hash in &tx_hashes {
+            if st.pool.contains(hash) {
+                st.pool.remove(hash);
+                tracing::debug!(?hash, "reorg: removed re-submitted duplicate from pool");
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------

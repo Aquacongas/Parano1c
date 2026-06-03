@@ -206,6 +206,60 @@ pub fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
     false
 }
 
+/// Compute the PoW work done for one block with the given difficulty target.
+///
+/// Returns 2^(256 - leading_zeros_of_target) as a 128-bit value stored in
+/// the first 16 bytes of a [u8; 32] (LE). This is the correct approximation
+/// for `2^256 / target`:
+///
+///   GENESIS_TARGET = 2^252  → 4 leading zeros → work = 2^4 = 16
+///   hard target    = 2^220  → 36 leading zeros → work = 2^36
+///
+/// Using leading-zeros-based work instead of `~target` avoids the critical
+/// overflow bug: `~GENESIS_TARGET` ≈ 2^256, so adding just TWO such values
+/// wraps around and produces a SMALLER result, making 1 block appear to have
+/// more work than 2 blocks. Using 2^(leading_zeros) gives values in the range
+/// [1, 2^128] that sum correctly for millions of blocks.
+pub fn block_work(target: &[u8; 32]) -> [u8; 32] {
+    // Count leading zero BITS in target.
+    // target is LE: the most-significant byte is target[31].
+    let mut leading_zeros: u32 = 0;
+    for i in (0..32).rev() {
+        if target[i] == 0 {
+            leading_zeros += 8;
+        } else {
+            leading_zeros += target[i].leading_zeros();
+            break;
+        }
+    }
+    // work = 2^leading_zeros, stored as LE u128 in bytes [0..16].
+    // Capped at 2^127 to prevent overflow when summing many blocks.
+    let shift = leading_zeros.min(127);
+    let work_u128: u128 = 1u128 << shift;
+    let mut result = [0u8; 32];
+    result[..16].copy_from_slice(&work_u128.to_le_bytes());
+    result
+}
+
+/// Add two chain work values (stored as LE u128 in first 16 bytes).
+/// Saturates on overflow to prevent wrap-around.
+pub fn add_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let va = u128::from_le_bytes(a[..16].try_into().unwrap());
+    let vb = u128::from_le_bytes(b[..16].try_into().unwrap());
+    let sum = va.saturating_add(vb);
+    let mut result = [0u8; 32];
+    result[..16].copy_from_slice(&sum.to_le_bytes());
+    result
+}
+
+/// Compare two chain work values (stored as LE u128 in first 16 bytes).
+/// Returns true if `a > b`.
+pub fn work_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let va = u128::from_le_bytes(a[..16].try_into().unwrap());
+    let vb = u128::from_le_bytes(b[..16].try_into().unwrap());
+    va > vb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

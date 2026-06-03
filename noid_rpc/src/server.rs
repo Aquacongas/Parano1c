@@ -378,28 +378,37 @@ impl ParanoidApiServer for RpcHandler {
         // 1. Parse recipient address.
         let to_address = parse_address_hex(&to_hex)?.0;
 
-        // Helper: snapshot slot hints seeded from tip state_root (not alloc_counter).
-        // Using the block hash as seed avoids collisions with the miner's coinbase
-        // allocator which runs on the alloc_counter sequence.
-        let get_hints =
-            |chain: &noid_chain::storage::MdbxChainContext| -> (u64, [u8; 32], Vec<u32>, u32) {
-                let tip = chain.tip_header();
-                let log_slots = tip.log_slots;
-                let epoch_anchor = full_block_hash(tip);
-                let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
-                let raw = generate_slot_hints(tip_seed, log_slots, 256);
-                let mut hints: Vec<u32> = raw
-                    .into_iter()
-                    .filter(|&idx| {
-                        (idx as u64) < (1u64 << log_slots)
-                            && chain.state.state.slot(idx)
-                                == noid_chain::fri_state::SlotValue::EMPTY
-                    })
-                    .collect();
-                hints.dedup();
-                hints.truncate(8);
-                (chain.tip_height(), epoch_anchor, hints, log_slots)
-            };
+        // Helper: snapshot slot hints.
+        // Each call uses a unique seed = tip_state_root XOR current_time_nanos
+        // so concurrent wallet_send calls never pick the same output slots.
+        let get_hints = |chain: &noid_chain::storage::MdbxChainContext,
+                         call_nonce: u64|
+         -> (u64, [u8; 32], Vec<u32>, u32) {
+            let tip = chain.tip_header();
+            let log_slots = tip.log_slots;
+            let epoch_anchor = full_block_hash(tip);
+            // Unique seed per call: XOR tip_seed with a nonce so concurrent
+            // sends on the same tip pick different output slots.
+            let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+            let unique_seed = tip_seed.wrapping_add(call_nonce.wrapping_mul(0x9e3779b97f4a7c15));
+            let raw = generate_slot_hints(unique_seed, log_slots, 256);
+            let mut hints: Vec<u32> = raw
+                .into_iter()
+                .filter(|&idx| {
+                    (idx as u64) < (1u64 << log_slots)
+                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
+                })
+                .collect();
+            hints.dedup();
+            hints.truncate(8);
+            (chain.tip_height(), epoch_anchor, hints, log_slots)
+        };
+        // Unique nonce for this request: high-resolution timestamp ensures
+        // even concurrent requests from the same client diverge.
+        let call_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
 
         // Retry loop: at genesis difficulty slots can be claimed between prove_tx
         // and mempool admission. Retry up to 3 times with fresh hints.
@@ -411,7 +420,8 @@ impl ParanoidApiServer for RpcHandler {
 
             let (_, epoch_anchor, slot_hints, log_slots) = {
                 let chain = self.chain.read().await;
-                get_hints(&chain)
+                // Pass nonce + attempt so each retry also gets unique slots
+                get_hints(&chain, call_nonce.wrapping_add(attempt as u64))
             };
 
             if slot_hints.len() < 2 {

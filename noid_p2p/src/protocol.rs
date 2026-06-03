@@ -47,6 +47,50 @@ pub struct GetRecursiveProofResponse {
 }
 
 // ---------------------------------------------------------------------------
+// State snapshot sync
+// ---------------------------------------------------------------------------
+
+/// Request a full state snapshot for initial sync.
+///
+/// Paranoid does NOT store block history (DA delete-immediately policy).
+/// New nodes synchronise by downloading the CURRENT STATE from a peer,
+/// not by replaying blocks from genesis.
+///
+/// The state is proven valid by the recursive chain proof (Phase 7).
+/// For testnet, nodes accept snapshots from trusted peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetStateSnapshotRequest {
+    /// Requester's current tip height (0 for fresh nodes).
+    pub requester_height: u64,
+}
+
+/// One serialised state segment (seg_id, effective_log, encoded columns).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSegmentEntry {
+    pub seg_id: u16,
+    pub eff_log: u8,
+    /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
+    pub data: Vec<u8>,
+}
+
+/// Full current state snapshot for a joining node.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GetStateSnapshotResponse {
+    /// Tip height at snapshot time. 0 = "use block sync instead".
+    pub tip_height: u64,
+    pub tip_hash: [u8; 32],
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+    /// Non-zero state segments (everything the peer's SegmentedFriState holds).
+    pub segments: Vec<StateSegmentEntry>,
+    /// Wire-encoded recent headers (last ~155 blocks) for validation.
+    pub recent_headers: Vec<Vec<u8>>,
+    /// TX hashes per block for nullifier-set rebuild (last ANCHOR_DEPTH blocks).
+    pub nullifier_blocks: Vec<Vec<[u8; 32]>>,
+}
+
+// ---------------------------------------------------------------------------
 // GossipSub topics
 // ---------------------------------------------------------------------------
 

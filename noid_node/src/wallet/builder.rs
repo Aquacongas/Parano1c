@@ -103,6 +103,7 @@ pub fn extract_build_data(
     epoch_anchor: [u8; 32],
     slot_hints: Vec<u32>,
     log_slots: u32,
+    pending_output_slots: &std::collections::HashSet<u32>,
 ) -> Result<TxBuildData, BuildError> {
     let total_needed = amount_micronoid.saturating_add(fee_micronoid);
 
@@ -121,6 +122,13 @@ pub fn extract_build_data(
             max: MAX_INPUTS,
         });
     }
+
+    // Filter out slots already claimed by in-flight (pending) txs to prevent
+    // SlotConflict when wallet_send is retried or called concurrently.
+    let slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|s| !pending_output_slots.contains(s))
+        .collect();
 
     // 1 slot for the payment output, +1 if there is change to return.
     let needed_slots: usize = if change_amount > 0 { 2 } else { 1 };

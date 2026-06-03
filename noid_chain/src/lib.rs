@@ -84,3 +84,10 @@ pub use nullifier::NullifierSet;
 pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
 pub use state_binding::{BlockStateBinding, StateBindingError, TxStateOpening};
 pub use wire::BLOCK_HEADER_WIRE_SIZE;
+
+// ---------------------------------------------------------------------------
+// Chainwork primitives (re-exported for external crates)
+// ---------------------------------------------------------------------------
+
+pub use consensus::difficulty::{add_work, block_work, work_gt};
+pub use consensus::fork_choice::choose_chain_by_work;

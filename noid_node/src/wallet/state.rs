@@ -87,6 +87,9 @@ pub struct WalletState {
     /// Cached receipts: tx_body_hash → bincode-serialized ParanoidReceipt bytes.
     /// Generated automatically when a block is applied, before pruning.
     pub receipts: HashMap<[u8; 32], Vec<u8>>,
+    /// Output slots claimed by pending (submitted but not yet confirmed) txs.
+    /// Used to avoid SlotConflict when retrying or sending multiple txs.
+    pub pending_output_slots: std::collections::HashSet<u32>,
 }
 
 impl WalletState {
@@ -120,6 +123,7 @@ impl WalletState {
             known_addresses,
             history: Vec::new(),
             receipts: HashMap::new(),
+            pending_output_slots: std::collections::HashSet::new(),
         };
         wallet.load_receipts();
         Ok(wallet)
@@ -239,6 +243,21 @@ impl WalletState {
                 entry.height = confirmed_height;
                 break;
             }
+        }
+    }
+
+    /// Register output slots as pending (tx submitted to mempool).
+    /// Used to avoid SlotConflict when retrying or calling wallet_send concurrently.
+    pub fn add_pending_outputs(&mut self, slot_indices: &[u32]) {
+        for &slot in slot_indices {
+            self.pending_output_slots.insert(slot);
+        }
+    }
+
+    /// Clear pending output slots for a confirmed or evicted tx.
+    pub fn remove_pending_outputs(&mut self, slot_indices: &[u32]) {
+        for slot in slot_indices {
+            self.pending_output_slots.remove(slot);
         }
     }
 

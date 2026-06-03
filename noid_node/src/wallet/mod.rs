@@ -202,11 +202,13 @@ impl WalletOps for WalletHandle {
         log_slots: u32,
     ) -> Result<Vec<u8>, String> {
         // Extract build data from wallet (brief lock).
+        // Also snapshot pending_output_slots so the prover can avoid re-using them.
         let build_data = {
             let guard = self.inner.lock().unwrap();
             let w = guard
                 .as_ref()
                 .ok_or_else(|| "wallet not initialized".to_string())?;
+            let pending_slots = w.pending_output_slots.clone();
             builder::extract_build_data(
                 w,
                 amount_micronoid,
@@ -214,6 +216,7 @@ impl WalletOps for WalletHandle {
                 epoch_anchor,
                 slot_hints,
                 log_slots,
+                &pending_slots,
             )
             .map_err(|e| e.to_string())?
         };
@@ -223,10 +226,21 @@ impl WalletOps for WalletHandle {
             builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
                 .map_err(|e| e.to_string())?;
 
-        // Record pending tx in history (brief lock).
+        // Register output slots as pending & record pending send (brief lock).
+        // Registering before returning ensures concurrent calls see claimed slots.
         {
+            let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
+                .map_err(|e| format!("decode: {e:?}"))?;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.slot_index)
+                .collect();
             let mut guard = self.inner.lock().unwrap();
             if let Some(w) = guard.as_mut() {
+                w.add_pending_outputs(&output_slots);
                 w.record_pending_send(tx_hash, amount_micronoid, to_address);
             }
         }

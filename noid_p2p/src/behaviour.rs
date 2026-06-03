@@ -15,7 +15,8 @@ use libp2p::{
 
 use crate::protocol::{
     GetHeadersRequest, GetHeadersResponse, GetRecentBlockRequest, GetRecentBlockResponse,
-    GetRecursiveProofRequest, GetRecursiveProofResponse,
+    GetRecursiveProofRequest, GetRecursiveProofResponse, GetStateSnapshotRequest,
+    GetStateSnapshotResponse,
 };
 
 /// All P2P behaviours composed via the derive macro.
@@ -43,6 +44,11 @@ pub struct NodeBehaviour {
 
     /// Liveness probing.
     pub ping: ping::Behaviour,
+
+    /// State snapshot sync — allows joining nodes to download the full current
+    /// state without block history (Paranoid's designed sync mechanism).
+    pub snapshot_sync:
+        request_response::cbor::Behaviour<GetStateSnapshotRequest, GetStateSnapshotResponse>,
 }
 
 impl NodeBehaviour {
@@ -116,6 +122,16 @@ impl NodeBehaviour {
 
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
 
+        let snapshot_sync = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new("/noid/sync/snapshot/1"),
+                ProtocolSupport::Full,
+            )],
+            // Generous timeout: full state transfer can be several hundred MB
+            // at high occupancy; 120 s is safe even on slow connections.
+            request_response::Config::default().with_request_timeout(Duration::from_secs(120)),
+        );
+
         Ok(Self {
             gossipsub,
             chain_sync,
@@ -123,6 +139,7 @@ impl NodeBehaviour {
             proof_sync,
             identify,
             ping,
+            snapshot_sync,
         })
     }
 }

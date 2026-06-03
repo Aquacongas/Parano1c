@@ -13,7 +13,7 @@
 //!
 //! Reference: Bitcoin Core `src/chain.h::CChainWork`, Grin `chain/src/chain.rs`.
 
-use crate::consensus::difficulty::le256_lt;
+use crate::consensus::difficulty::{le256_lt, work_gt};
 use crate::consensus::params::FINALITY_DEPTH;
 
 /// Compare two chain tips by cumulative PoW work.
@@ -40,7 +40,9 @@ pub enum ChainChoice {
 /// - `target_b`, `hash_b`: difficulty target and block hash of tip B
 /// - `height_a`, `height_b`: chain heights
 ///
-/// Shorter chains never win against longer chains of equal or greater work.
+/// Delegates to `choose_chain_by_work` with zero chainwork, which falls back
+/// to height-based comparison. Use `choose_chain_by_work` when cumulative
+/// chainwork is available.
 pub fn choose_chain(
     target_a: &[u8; 32],
     hash_a: &[u8; 32],
@@ -49,14 +51,57 @@ pub fn choose_chain(
     hash_b: &[u8; 32],
     height_b: u64,
 ) -> ChainChoice {
-    // For simplicity, treat cumulative work as inversely proportional to target.
-    // Chain with LOWER target = more work per block.
-    // At equal height, we compare tip targets; at different heights we need
-    // accumulated work. For MVP we use height × (1/target) approximation
-    // via comparing the single-block difficulty.
-    //
-    // Full implementation uses cumulative chain work stored in DB (future).
-    // For initial launch, height is the primary comparator (longest chain wins).
+    choose_chain_by_work(
+        &[0u8; 32], // chainwork unknown for this API - use height fallback
+        hash_a, height_a, target_a, &[0u8; 32], hash_b, height_b, target_b,
+    )
+}
+
+/// Full fork choice using cumulative chainwork.
+///
+/// This is the production API. The simple `choose_chain` is kept for
+/// compatibility with tests that don't track cumulative work.
+///
+/// # Arguments
+/// - `chainwork_a`: cumulative work for chain A (sum of block_work() for all blocks)
+/// - `chainwork_b`: cumulative work for chain B
+/// - `hash_a`, `hash_b`: tip hashes for tie-breaking
+/// - `target_a`, `target_b`: tip difficulty targets (used in height-fallback path)
+///
+/// If chainwork is unavailable (zeros), falls back to height comparison.
+pub fn choose_chain_by_work(
+    chainwork_a: &[u8; 32],
+    hash_a: &[u8; 32],
+    height_a: u64,
+    target_a: &[u8; 32],
+    chainwork_b: &[u8; 32],
+    hash_b: &[u8; 32],
+    height_b: u64,
+    target_b: &[u8; 32],
+) -> ChainChoice {
+    // If cumulative chainwork is available (non-zero), use it as primary.
+    let cw_a_nonzero = chainwork_a.iter().any(|&b| b != 0);
+    let cw_b_nonzero = chainwork_b.iter().any(|&b| b != 0);
+
+    if cw_a_nonzero || cw_b_nonzero {
+        // Use cumulative chainwork as primary criterion.
+        if work_gt(chainwork_a, chainwork_b) {
+            return ChainChoice::A;
+        }
+        if work_gt(chainwork_b, chainwork_a) {
+            return ChainChoice::B;
+        }
+        // Equal chainwork: tie-break by hash
+        return if hash_a < hash_b {
+            ChainChoice::A
+        } else if hash_b < hash_a {
+            ChainChoice::B
+        } else {
+            ChainChoice::Equal
+        };
+    }
+
+    // Fallback: height-based (for tests and genesis bootstrapping).
     if height_a > height_b {
         return ChainChoice::A;
     }
@@ -64,21 +109,20 @@ pub fn choose_chain(
         return ChainChoice::B;
     }
 
-    // Same height: chain with lower target (more work) wins.
+    // Same height: lower target = more work per block.
     if le256_lt(target_a, target_b) {
-        return ChainChoice::A; // A required more work
+        return ChainChoice::A;
     }
     if le256_lt(target_b, target_a) {
         return ChainChoice::B;
     }
 
-    // Identical target: lexicographic tie-break on block hash.
     if hash_a < hash_b {
         ChainChoice::A
     } else if hash_b < hash_a {
         ChainChoice::B
     } else {
-        ChainChoice::Equal // exactly the same block
+        ChainChoice::Equal
     }
 }
 
@@ -94,6 +138,7 @@ pub fn reorg_allowed(n_confirmations_to_undo: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::difficulty::{add_work, block_work};
     use crate::consensus::params::GENESIS_TARGET;
 
     #[test]
@@ -152,5 +197,44 @@ mod tests {
         assert!(reorg_allowed(17));
         assert!(!reorg_allowed(18)); // FINALITY_DEPTH = 18
         assert!(!reorg_allowed(100));
+    }
+
+    #[test]
+    fn more_work_wins_over_longer_chain() {
+        // Chain A: 10 blocks at hard difficulty (very small target)
+        let hard_target = {
+            let mut t = [0u8; 32];
+            t[31] = 0x01;
+            t
+        };
+        // Chain B: 100 blocks at easy difficulty
+        let easy_target = GENESIS_TARGET;
+
+        let mut work_a = [0u8; 32];
+        for _ in 0..10 {
+            work_a = add_work(&work_a, &block_work(&hard_target));
+        }
+        let mut work_b = [0u8; 32];
+        for _ in 0..100 {
+            work_b = add_work(&work_b, &block_work(&easy_target));
+        }
+
+        let h = [0u8; 32];
+        // With cumulative work, chain A should win even though it's shorter.
+        let result = choose_chain_by_work(
+            &work_a,
+            &h,
+            10,
+            &hard_target,
+            &work_b,
+            &h,
+            100,
+            &easy_target,
+        );
+        assert_eq!(
+            result,
+            ChainChoice::A,
+            "more work chain should win regardless of height"
+        );
     }
 }
