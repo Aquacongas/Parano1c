@@ -26,21 +26,24 @@ The term "blockchain" describes a data structure, not the underlying mechanism. 
 ## Architecture
 
 ```
-  wallet  ──►  LogicProof  ──►  mempool  ──►  miner  ──►  BlockProof  ──►  chain
-                (local, ~135ms)                          (block-level, ~9s/100tx)
+wallet ──► LogicProof ──► mempool ──► full node ──► BlockProof ──► RecursiveProof
+(local) (stateless) │ (6.5 KB, O(1) sync)
+├─ BlockStateBinding (state proofs)
+├─ deferred-FRI aggregation
+└─ PoW seal (ordering)
 ```
 
-The network never re-executes transactions. It verifies proofs of computation already correctly performed.
+The network never re-executes transactions. It verifies proofs of computation already correctly performed. Execution is local, state binding is server-side, and history is recursively compressed.
 
 ### Two-layer proof split
 
-**LogicProof** — built by the wallet, ~135 ms, ~26 KB
+**LogicProof** — built by the wallet, ~26 KB
 - Balance: `Σ inputs == Σ outputs + fee`
 - Ownership: `Poseidon2b(spend_secret) == address` for each input
 - Range: all values fit in 64 bits
 - Body binding: `tx_body_hash` pinned cryptographically
 
-The LogicProof is **stateless** — no Merkle paths, no dependency on the state root. Valid across block boundaries until the epoch anchor expires (~144 min).
+The LogicProof is **stateless** — no Merkle paths, no dependency on the state root. Valid across block boundaries until the epoch anchor expires.
 
 **BlockStateBinding** — built by the full node at block assembly
 - Proves all input slots match `prev_state_root`
@@ -49,6 +52,8 @@ The LogicProof is **stateless** — no Merkle paths, no dependency on the state 
 - Bridges LogicProof claims to actual state openings
 
 **BlockProof** = N×LogicProofs + BlockStateBinding + deferred-FRI aggregation
+
+**RecursiveProof** = Entire chain history compressed into a single 6.5 KB proof. New nodes sync by verifying this proof in ~5 ms. No history download. No archive nodes.
 
 ### FROST-GKR Kill-Shot
 
