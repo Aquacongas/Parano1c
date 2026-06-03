@@ -375,6 +375,19 @@ impl ParanoidApiServer for RpcHandler {
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
+        use noid_chain::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
+
+        // Auto-fee: when fee_micronoid == 0, compute the minimum acceptable fee.
+        // A send TX typically has 2 outputs (payment + change), so use
+        // MIN_FEE_BASE + 2 * FEE_PER_OUTPUT = 9 000 μNOID baseline.
+        // Also respect the current dynamic fee floor from the mempool.
+        let effective_fee = if fee_micronoid == 0 {
+            let floor = self.mempool.fee_floor().await;
+            (MIN_FEE_BASE + 2 * FEE_PER_OUTPUT).max(floor)
+        } else {
+            fee_micronoid
+        };
+
         // 1. Parse recipient address.
         let to_address = parse_address_hex(&to_hex)?.0;
 
@@ -434,7 +447,7 @@ impl ParanoidApiServer for RpcHandler {
                 wallet.build_send(
                     to_address,
                     amount_micronoid,
-                    fee_micronoid,
+                    effective_fee,
                     epoch_anchor,
                     slot_hints,
                     log_slots,
@@ -459,6 +472,7 @@ impl ParanoidApiServer for RpcHandler {
                     }
                     return Ok(WalletSendResult {
                         tx_hash: hex::encode(hash.0),
+                        fee_micronoid: effective_fee,
                     });
                 }
                 Err(e) => {
@@ -553,6 +567,7 @@ impl ParanoidApiServer for RpcHandler {
                 Ok(hash) => {
                     return Ok(WalletSendResult {
                         tx_hash: hex::encode(hash.0),
+                        fee_micronoid: effective_fee,
                     });
                 }
                 Err(e) => {

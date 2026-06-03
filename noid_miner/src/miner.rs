@@ -127,6 +127,8 @@ pub struct BlockMiner {
     events: broadcast::Sender<MinerEvent>,
     /// Cancel flag: set to abort current PoW search and restart.
     cancel_pow: Arc<AtomicBool>,
+    /// Notified when the chain is sufficiently synced to begin mining.
+    sync_ready: Arc<tokio::sync::Notify>,
 }
 
 impl BlockMiner {
@@ -134,6 +136,7 @@ impl BlockMiner {
         config: MinerConfig,
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
+        sync_ready: Arc<tokio::sync::Notify>,
     ) -> (Self, broadcast::Receiver<MinerEvent>) {
         let (events, rx) = broadcast::channel(32);
         let miner = Self {
@@ -142,6 +145,7 @@ impl BlockMiner {
             chain,
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
+            sync_ready,
         };
         (miner, rx)
     }
@@ -173,6 +177,56 @@ impl BlockMiner {
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.
     /// Never returns under normal operation.
     pub async fn run(self) {
+        // Sync guard: do not mine until chain is current.
+        {
+            use noid_chain::consensus::params::BLOCK_TIME;
+            let (height, tip_ts) = {
+                let ctx = self.chain.read().await;
+                (ctx.tip_height(), ctx.tip_header().timestamp)
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // "Fresh" = tip within 3 block-times of wall clock.
+            let is_fresh = tip_ts > 0 && now.saturating_sub(tip_ts) < BLOCK_TIME * 3;
+
+            if height > 0 && is_fresh {
+                tracing::info!(height, "miner: chain is current, starting immediately");
+            } else if height > 0 {
+                let age = now.saturating_sub(tip_ts);
+                tracing::info!(
+                    height,
+                    age_secs = age,
+                    "miner: chain may be stale, waiting for peer sync (max 30s)..."
+                );
+                tokio::select! {
+                    _ = self.sync_ready.notified() => {
+                        let h = self.chain.read().await.tip_height();
+                        tracing::info!(height = h, "miner: sync signal received, starting");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        let h = self.chain.read().await.tip_height();
+                        tracing::info!(height = h, "miner: sync wait timeout, starting");
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "miner: fresh node (height=0) — waiting for state snapshot from peers...\n\
+                     (will start solo mining from genesis after 60s if no peers)"
+                );
+                tokio::select! {
+                    _ = self.sync_ready.notified() => {
+                        let h = self.chain.read().await.tip_height();
+                        tracing::info!(height = h, "miner: state synced, starting mining");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        tracing::info!("miner: no peers after 60s, starting solo mining from genesis");
+                    }
+                }
+            }
+        }
+
         let builder = TemplateBuilder::new(self.mempool.clone());
         let addr = self.config.miner_address;
         let cancel = self.cancel_pow.clone();
@@ -260,7 +314,7 @@ impl BlockMiner {
 
                             // Apply the block to the chain and update mempool.
                             if let Err(e) = self.apply_found_block(&block, &block_bytes).await {
-                                tracing::error!("apply found block failed: {e}");
+                                tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
                             // Store block proof bytes for recursive proof advancement (Phase 7).

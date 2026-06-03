@@ -696,10 +696,17 @@ impl MdbxStore {
             }
         }
 
-        // --- Prune nullifiers older than ANCHOR_DEPTH ---
+        // --- Prune nullifiers + TX index older than ANCHOR_DEPTH ---
+        //
+        // T_NULLIFIER_BLOCKS maps height -> Vec<TxBodyHash>; we use it to
+        // drive deletion from BOTH T_NULLIFIERS and T_TX_INDEX.
+        // This keeps TX index size bounded: O(ANCHOR_DEPTH × avg_txs_per_block)
+        // instead of growing forever.  Receipts are available for the last
+        // ANCHOR_DEPTH (144) blocks — the same window as nullifier protection.
         if current_height > ANCHOR_DEPTH {
             let nul_tbl = txn.open_table(Some(T_NULLIFIERS))?;
             let nul_blk_tbl = txn.open_table(Some(T_NULLIFIER_BLOCKS))?;
+            let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
             let cutoff = current_height - ANCHOR_DEPTH;
             // Gather block heights that are beyond the anchor window.
             let heights: Vec<u64> = {
@@ -716,15 +723,15 @@ impl MdbxStore {
                 hs
             };
             for h in heights {
-                // Retrieve the packed hash list and delete each nullifier entry.
-                // Use `let _ =` on T_NULLIFIERS deletes: a partial-prune crash
-                // could have already removed some entries, and
-                // "key not found" must not abort the recovery run.
+                // Retrieve the packed hash list and delete each nullifier entry
+                // AND its corresponding TX index entry.
                 let hash_bytes: Option<Vec<u8>> = txn.get(&nul_blk_tbl, &u64_key(h))?;
                 if let Some(hashes) = hash_bytes {
                     for chunk in hashes.chunks_exact(32) {
-                        // Idempotent: ignore not-found (already pruned).
+                        // Nullifier (idempotent).
                         let _ = txn.del(&nul_tbl, chunk, None);
+                        // TX index entry for same TxBodyHash (idempotent).
+                        let _ = txn.del(&tx_idx_tbl, chunk, None);
                     }
                 }
                 txn.del(&nul_blk_tbl, &u64_key(h), None)?;

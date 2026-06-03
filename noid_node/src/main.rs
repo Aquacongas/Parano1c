@@ -72,6 +72,12 @@ struct Cli {
     #[arg(long)]
     mine: bool,
 
+    /// Bootstrap genesis mode: start mining immediately without waiting for peers.
+    /// Use ONLY for the very first node on a new network.
+    /// All other nodes sync automatically when they connect.
+    #[arg(long)]
+    genesis: bool,
+
     /// Miner reward address (32-byte hex).
     #[arg(long)]
     miner_address: Option<String>,
@@ -106,8 +112,17 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // --- Tracing ---
+    // Suppress noisy libp2p internals that are expected/normal:
+    //   - gossipsub GRAFT on direct peers: normal in <3 peer meshes
+    //   - gossipsub mesh size warnings: normal in small devnets
+    // Users can override with RUST_LOG=libp2p_gossipsub=debug if needed.
+    let log_filter = EnvFilter::new(&cli.log)
+        .add_directive("libp2p_gossipsub=error".parse().unwrap_or_default())
+        .add_directive("libp2p_request_response=warn".parse().unwrap_or_default())
+        .add_directive("libp2p_identify=warn".parse().unwrap_or_default())
+        .add_directive("libp2p_ping=warn".parse().unwrap_or_default());
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&cli.log))
+        .with_env_filter(log_filter)
         .with_target(true)
         .with_thread_ids(false)
         .init();
@@ -155,6 +170,22 @@ async fn main() -> anyhow::Result<()> {
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::info!(height = tip_height, state_root = %state_root, "chain loaded");
     let chain = Arc::new(RwLock::new(ctx));
+
+    // Sync-ready notifier: fires when the chain has caught up to peers.
+    let sync_ready = Arc::new(tokio::sync::Notify::new());
+    {
+        let ctx = chain.read().await;
+        let h = ctx.tip_height();
+        let ts = ctx.tip_header().timestamp;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if h > 0 && ts > 0 && now.saturating_sub(ts) < 60 * 3 {
+            sync_ready.notify_one();
+            tracing::info!(height = h, "chain state is current");
+        }
+    }
 
     // --- Mempool ---
     let view = ChainView::from_mdbx(&*chain.read().await);
@@ -225,12 +256,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --genesis flag: bootstrap mode for the very first node on a new network.
+    // Fires sync_ready immediately so the miner starts without waiting for peers.
+    // All other nodes sync automatically when they connect to a genesis node.
+    if cli.genesis {
+        tracing::info!("-- GENESIS MODE: starting miner immediately (bootstrap node) --");
+        sync_ready.notify_one();
+    }
+
     // Background P2P event handler.
     let p2p_chain = chain.clone();
     let p2p_mempool = mempool.clone();
     let p2p_wallet = shared_wallet.clone();
     let p2p_events = p2p.subscribe();
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
+    let p2p_sync_ready = Arc::clone(&sync_ready);
     tokio::spawn(async move {
         handle_p2p_events(
             p2p_events,
@@ -238,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_mempool,
             p2p_wallet,
             p2p_cmd_for_events,
+            p2p_sync_ready,
         )
         .await;
     });
@@ -289,7 +330,12 @@ async fn main() -> anyhow::Result<()> {
             pow_threads: cfg.mining.threads,
             ..Default::default()
         };
-        let (miner, mut miner_rx) = BlockMiner::new(miner_cfg, mempool.clone(), chain.clone());
+        let (miner, mut miner_rx) = BlockMiner::new(
+            miner_cfg,
+            mempool.clone(),
+            chain.clone(),
+            Arc::clone(&sync_ready),
+        );
         let miner_stop = miner.stop_handle(); // Arc<AtomicBool> — set true to cancel Rayon threads
 
         let p2p_block_relay = p2p.cmd_tx.clone();
@@ -343,8 +389,15 @@ async fn main() -> anyhow::Result<()> {
         network = %net.kind,
         p2p = %listen_addr,
         rpc = %rpc_listen,
-        "paranoid running — press Ctrl-C to stop"
+        height = tip_height,
+        "paranoid node running"
     );
+    if cfg.mining.enabled {
+        tracing::info!("mining: enabled — miner will start after chain sync");
+    } else {
+        tracing::info!("mining: disabled (use --mine to enable)");
+    }
+    tracing::info!("press Ctrl-C or use 'noid-cli node stop' to shutdown");
 
     // --- Shutdown ---
     // Wait for either Ctrl-C or a `paranoid_stop` RPC call.
@@ -389,6 +442,7 @@ async fn handle_p2p_events(
     mempool: AsyncMempool,
     wallet: SharedWallet,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    sync_ready: Arc<tokio::sync::Notify>,
 ) {
     // Orphan pool: blocks whose parent is not yet known.
     // When the parent arrives, we re-apply the orphan.
@@ -424,6 +478,7 @@ async fn handle_p2p_events(
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
+                                sync_ready.notify_one(); // safe: no-op after first waiter wakes
 
                                 // Apply the chain of orphans that build on the new block.
                                 let mut next_hash = block_hash;
@@ -877,9 +932,10 @@ async fn handle_p2p_events(
                         drop(ctx);
                         mempool.on_new_block(&[], new_height, new_view).await;
                         // Wallet scan will pick up any UTXOs on next call
+                        sync_ready.notify_one();
                         tracing::info!(
                             height = new_height,
-                            "state snapshot applied — requesting recent blocks to catch up"
+                            "chain snapshot applied — mining can begin"
                         );
                         // Request the most recent blocks to catch up from snapshot tip
                         let _ = p2p_cmd

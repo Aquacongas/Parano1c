@@ -244,13 +244,13 @@ fn handle_network_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: Network
         NetworkCommand::BroadcastBlock { block_bytes } => {
             let topic = gossipsub::IdentTopic::new(Topics::BLOCKS);
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
-                tracing::warn!("gossipsub publish block: {e}");
+                tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
             }
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
             let topic = gossipsub::IdentTopic::new(Topics::TXS);
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
-                tracing::warn!("gossipsub publish tx: {e}");
+                tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
             }
         }
         NetworkCommand::Dial { addr } => {

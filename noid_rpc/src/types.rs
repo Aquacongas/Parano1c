@@ -106,6 +106,8 @@ pub struct WalletScanResult {
 pub struct WalletSendResult {
     /// Transaction body hash (hex).
     pub tx_hash: String,
+    /// Actual fee paid in μNOID (useful when fee was computed automatically).
+    pub fee_micronoid: u64,
 }
 
 // ---------------------------------------------------------------------------

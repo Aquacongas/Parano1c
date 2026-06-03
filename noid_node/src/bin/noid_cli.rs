@@ -71,8 +71,8 @@ enum WalletCmd {
         to: String,
         /// Amount to send in μNOID (1 NOID = 1,000,000 μNOID).
         amount: u64,
-        /// Transaction fee in μNOID (default: 5000 = MIN_FEE_BASE).
-        #[arg(long, default_value_t = 5_000)]
+        /// Transaction fee in μNOID. 0 = auto (uses current fee floor, min 9000).
+        #[arg(long, default_value_t = 0)]
         fee: u64,
     },
     /// Print transaction history.
@@ -276,6 +276,9 @@ async fn cmd_wallet_balance(client: &reqwest::Client, rpc_url: &str) -> anyhow::
     println!("wallet balance:");
     println!("  Balance: {noid:.6} NOID ({micronoid} μNOID)");
     println!("  UTXOs:   {utxo_count}");
+    if micronoid == 0 && utxo_count == 0 {
+        println!("  Tip: run 'noid-cli wallet scan' to discover UTXOs from the chain state");
+    }
 
     Ok(())
 }
@@ -297,14 +300,17 @@ async fn cmd_wallet_send(
     .context("paranoid_walletSend")?;
 
     let tx_hash = result["tx_hash"].as_str().unwrap_or("?");
+    let actual_fee = result["fee_micronoid"].as_u64().unwrap_or(fee);
     let noid = amount as f64 / MICRONOID_PER_NOID;
-    let fee_noid = fee as f64 / MICRONOID_PER_NOID;
+    let fee_noid = actual_fee as f64 / MICRONOID_PER_NOID;
+    let auto_tag = if fee == 0 { " (auto)" } else { "" };
 
     println!("wallet send:");
     println!("  Submitted! tx_hash: 0x{tx_hash}");
     println!("  To:     {to}");
     println!("  Amount: {noid:.6} NOID ({amount} μNOID)");
-    println!("  Fee:    {fee_noid:.6} NOID ({fee} μNOID)");
+    println!("  Fee:    {fee_noid:.6} NOID ({actual_fee} μNOID){auto_tag}");
+    println!("  Note: TX is pending confirmation in the next block (~60s)");
 
     Ok(())
 }

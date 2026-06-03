@@ -104,7 +104,9 @@ impl NodeBehaviour {
                 StreamProtocol::new("/noid/sync/block/1"),
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(64),
         );
 
         let proof_sync = request_response::cbor::Behaviour::new(
@@ -129,7 +131,9 @@ impl NodeBehaviour {
             )],
             // Generous timeout: full state transfer can be several hundred MB
             // at high occupancy; 120 s is safe even on slow connections.
-            request_response::Config::default().with_request_timeout(Duration::from_secs(120)),
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(120))
+                .with_max_concurrent_streams(32),
         );
 
         Ok(Self {
