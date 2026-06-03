@@ -63,4 +63,21 @@ pub trait WalletOps: Send + Sync {
     /// Returns `Err` if the tx is unknown or receipt was not generated
     /// (block already pruned when it was confirmed).
     fn export_receipt(&self, txhash_hex: &str) -> Result<String, String>;
+
+    /// Consolidate small UTXOs into one larger UTXO.
+    ///
+    /// Selects the smallest UTXOs (up to `MAX_INPUTS=4`) and sends their
+    /// combined value minus fee to the wallet's own primary address.
+    ///
+    /// Returns raw `TxIntent` bytes on success, or an error string if there
+    /// is nothing to consolidate (e.g. only 1 UTXO, or insufficient funds).
+    ///
+    /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
+    fn build_consolidate(
+        &self,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<Vec<u8>, String>;
 }

@@ -36,7 +36,7 @@ use noid_gkr::{AuthPublicInputs, SpineInputs};
 use noid_stark::{prove_logic::LogicProof, WalletProofBundle};
 use noid_tx::{PublicInputs, Transaction, TxBody, MAX_INPUTS, MAX_OUTPUTS};
 
-use crate::{StateBindingBlockWitness, TxBlockWitness};
+use crate::{BlockProof, StateBindingBlockWitness, TxBlockWitness};
 
 // ---------------------------------------------------------------------------
 // Per-transaction witness from public data + bundle
@@ -231,4 +231,35 @@ fn build_public_inputs(tx_body: &TxBody, _proof: &LogicProof, log_slots: u32) ->
 /// 4. Passing these to `prove_block` as `state_bindings`
 pub fn build_empty_state_bindings() -> Vec<StateBindingBlockWitness<'static>> {
     vec![]
+}
+
+// ---------------------------------------------------------------------------
+// BlockProof → BlockReplayWitness extraction (Phase 7 recursive proof)
+// ---------------------------------------------------------------------------
+
+/// Extract a [`noid_recursive::BlockReplayWitness`] from a [`BlockProof`].
+///
+/// Used by the recursive proof updater in `noid_node` to advance the chain
+/// proof without requiring `noid_fri_binius` as a direct dependency of the
+/// node daemon.
+///
+/// # Field mapping
+///
+/// | BlockReplayWitness field      | BlockProof source                        |
+/// |-------------------------------|------------------------------------------|
+/// | `cap`                         | `proof.commitment.cap`                   |
+/// | `state_binding_algebraics`    | `proof.state_binding_algebraics`         |
+/// | `block_col_openings`          | `proof.block_col_openings`               |
+/// | `block_multipoint_rounds`     | `proof.block_multipoint_rounds`          |
+/// | `compact_fri`                 | `proof.mixed_opening.fri_proof`          |
+/// | `mixed_all_openings`          | `proof.mixed_opening.all_openings`       |
+pub fn block_proof_to_replay_witness(proof: &BlockProof) -> noid_recursive::BlockReplayWitness {
+    noid_recursive::BlockReplayWitness::from_parts(
+        proof.commitment.cap.clone(),
+        proof.state_binding_algebraics.clone(),
+        proof.block_col_openings.clone(),
+        proof.block_multipoint_rounds.clone(),
+        proof.mixed_opening.fri_proof.clone(),
+        proof.mixed_opening.all_openings.clone(),
+    )
 }

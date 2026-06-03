@@ -158,6 +158,92 @@ pub fn extract_build_data(
 }
 
 // ---------------------------------------------------------------------------
+// extract_consolidate_data
+// ---------------------------------------------------------------------------
+
+/// Build `TxBuildData` for a consolidation transaction.
+///
+/// Consolidation selects the **smallest** UTXOs (up to [`MAX_INPUTS`] = 4)
+/// and sends their total value minus fee back to the wallet's own address.
+/// This reduces the UTXO count by up to `MAX_INPUTS - 1` per call.
+///
+/// Unlike `extract_build_data` (which uses largest-first greedy selection to
+/// cover a target amount), this function explicitly selects the smallest UTXOs
+/// to maximise UTXO reduction.
+///
+/// Returns `(TxBuildData, consolidation_amount_micronoid)` on success, where
+/// `consolidation_amount_micronoid` is what the caller should pass as
+/// `amount_micronoid` to `build_and_prove_tx`.
+///
+/// # Errors
+///
+/// - `InsufficientFunds`: total of smallest UTXOs ≤ fee.
+/// - `NotEnoughSlots`: fewer than 1 empty slot hint available.
+pub fn extract_consolidate_data(
+    wallet: &WalletState,
+    fee_micronoid: u64,
+    epoch_anchor: [u8; 32],
+    slot_hints: Vec<u32>,
+    log_slots: u32,
+    pending_output_slots: &std::collections::HashSet<u32>,
+    pending_input_slots: &std::collections::HashSet<u32>,
+) -> Result<(TxBuildData, u64), BuildError> {
+    // Sort all UTXOs smallest-first, skipping any whose slot is already being
+    // spent by a pending (unconfirmed) TX. This prevents double-spend
+    // SlotConflict errors when multiple consolidation rounds are submitted
+    // before the first round is confirmed in a block.
+    let mut all_utxos: Vec<&WalletUtxo> = wallet
+        .utxos
+        .values()
+        .filter(|u| !pending_input_slots.contains(&u.slot_index))
+        .collect();
+    all_utxos.sort_by_key(|u| u.value);
+    let selected: Vec<WalletUtxo> = all_utxos.into_iter().take(MAX_INPUTS).cloned().collect();
+
+    if selected.is_empty() {
+        return Err(BuildError::InsufficientFunds {
+            need: fee_micronoid,
+            have: 0,
+        });
+    }
+
+    let total: u64 = selected.iter().map(|u| u.value).sum();
+    if total <= fee_micronoid {
+        return Err(BuildError::InsufficientFunds {
+            need: fee_micronoid.saturating_add(1),
+            have: total,
+        });
+    }
+    let consolidation_amount = total - fee_micronoid;
+
+    // Consolidation has no change: one output (to self).
+    let slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|s| !pending_output_slots.contains(s))
+        .collect();
+    if slot_hints.is_empty() {
+        return Err(BuildError::NotEnoughSlots { need: 1, got: 0 });
+    }
+
+    let spend_secrets: Vec<SpendSecret> = selected
+        .iter()
+        .map(|u| wallet.spend_secret_for(u.key_index))
+        .collect();
+
+    Ok((
+        TxBuildData {
+            selected_utxos: selected,
+            spend_secrets,
+            change_address: wallet.primary_address(),
+            epoch_anchor,
+            output_slot_hints: slot_hints,
+            log_slots,
+        },
+        consolidation_amount,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // build_and_prove_tx
 // ---------------------------------------------------------------------------
 

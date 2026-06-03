@@ -802,6 +802,16 @@ impl MdbxChainContext {
                 )
                 .map_err(MdbxContextError::Store)?;
 
+            // Rebuild the owner index from snapshot segments so wallet scan is O(1).
+            let snapshot_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> =
+                dirty_segments
+                    .iter()
+                    .map(|(id, eff, cols)| (*id, *eff, cols))
+                    .collect();
+            if let Err(e) = self.store.rebuild_owner_index_from_segments(&snapshot_refs) {
+                eprintln!("[WARN] rebuild_owner_index_from_segments failed: {e}");
+            }
+
             self.state.state.clear_dirty();
         }
 

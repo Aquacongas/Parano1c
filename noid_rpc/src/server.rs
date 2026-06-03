@@ -477,6 +477,96 @@ impl ParanoidApiServer for RpcHandler {
         self.wallet.export_receipt(&txhash_hex).map_err(rpc_err)
     }
 
+    async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
+        use noid_chain::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
+
+        // Consolidation always produces exactly 1 output (to self), so the
+        // minimum fee is MIN_FEE_BASE + 1 × FEE_PER_OUTPUT = 7 000 μNOID.
+        // When fee_micronoid == 0 (auto), also account for the current dynamic
+        // fee floor so the TX is never rejected as BelowMinFee.
+        let min_consolidate_fee = MIN_FEE_BASE + FEE_PER_OUTPUT;
+        let effective_fee = if fee_micronoid == 0 {
+            // Auto: use the higher of the protocol minimum and the current floor.
+            let floor = self.mempool.fee_floor().await;
+            min_consolidate_fee.max(floor)
+        } else {
+            fee_micronoid
+        };
+
+        let call_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+
+        let mut last_err = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            let (epoch_anchor, slot_hints, log_slots) = {
+                let chain = self.chain.read().await;
+                let tip = chain.tip_header();
+                let log_slots = tip.log_slots;
+                let epoch_anchor = full_block_hash(tip);
+                let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+                let unique_seed = tip_seed.wrapping_add(
+                    call_nonce
+                        .wrapping_add(attempt as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15),
+                );
+                let raw = generate_slot_hints(unique_seed, log_slots, 64);
+                let mut hints: Vec<u32> = raw
+                    .into_iter()
+                    .filter(|&idx| {
+                        (idx as u64) < (1u64 << log_slots)
+                            && chain.state.state.slot(idx)
+                                == noid_chain::fri_state::SlotValue::EMPTY
+                    })
+                    .collect();
+                hints.dedup();
+                hints.truncate(4);
+                (epoch_anchor, hints, log_slots)
+            };
+
+            if slot_hints.is_empty() {
+                return Err(rpc_err("no empty slot hints available"));
+            }
+
+            let wallet = Arc::clone(&self.wallet);
+            let intent_bytes = match tokio::task::spawn_blocking(move || {
+                wallet.build_consolidate(effective_fee, epoch_anchor, slot_hints, log_slots)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => return Err(rpc_err(e)),
+                Err(e) => return Err(rpc_err(format!("task: {e}"))),
+            };
+
+            let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                Ok(i) => i,
+                Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
+            };
+
+            match self.mempool.submit(intent, intent_bytes).await {
+                Ok(hash) => {
+                    return Ok(WalletSendResult {
+                        tx_hash: hex::encode(hash.0),
+                    });
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::debug!(attempt, err = %last_err, "wallet_consolidate: retrying");
+                }
+            }
+        }
+
+        Err(rpc_err(format!(
+            "consolidate failed after 3 attempts: {last_err}"
+        )))
+    }
+
     // -----------------------------------------------------------------------
     // Node control
     // -----------------------------------------------------------------------

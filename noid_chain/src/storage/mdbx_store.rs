@@ -41,7 +41,12 @@ const T_RECENT_BLOCKS: &str = "recent";
 const T_RECURSIVE_PROOF: &str = "rec_proof";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
-const N_TABLES: u64 = 11;
+/// Block ZK proofs (retention = FINALITY_DEPTH). Key: height (u64 LE). Value: bincode BlockProof bytes.
+const T_BLOCK_PROOFS: &str = "block_proofs";
+/// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
+/// Maintained incrementally in commit_block. Used for O(1) wallet scan.
+const T_OWNER_INDEX: &str = "owner_idx";
+const N_TABLES: u64 = 13;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -81,6 +86,43 @@ impl From<libmdbx::Error> for StoreError {
 
 pub struct MdbxStore {
     db: Database<NoWriteMap>,
+}
+
+// ---------------------------------------------------------------------------
+// Owner index helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the 32-byte owner key from a slot's owner fields.
+#[inline]
+fn owner_key_from_fields(owner_hi: noid_core::Block128, owner_lo: noid_core::Block128) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(&owner_hi.0.to_le_bytes());
+    key[16..].copy_from_slice(&owner_lo.0.to_le_bytes());
+    key
+}
+
+/// Encode a list of (slot_index, value) pairs for MDBX storage.
+#[inline]
+fn encode_owner_entries(entries: &[(u32, u64)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.len() * 12);
+    for &(slot, val) in entries {
+        buf.extend_from_slice(&slot.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+    buf
+}
+
+/// Decode a packed (slot_index, value) list from MDBX bytes.
+#[inline]
+fn decode_owner_entries(bytes: &[u8]) -> Vec<(u32, u64)> {
+    bytes
+        .chunks_exact(12)
+        .map(|c| {
+            let slot = u32::from_le_bytes(c[..4].try_into().unwrap());
+            let val = u64::from_le_bytes(c[4..12].try_into().unwrap());
+            (slot, val)
+        })
+        .collect()
 }
 
 impl MdbxStore {
@@ -127,6 +169,8 @@ impl MdbxStore {
             T_RECENT_BLOCKS,
             T_RECURSIVE_PROOF,
             T_TX_INDEX,
+            T_BLOCK_PROOFS,
+            T_OWNER_INDEX,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
@@ -231,6 +275,96 @@ impl MdbxStore {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
         txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Store a serialised `BlockProof` for `height`.
+    /// Automatically pruned after `FINALITY_DEPTH` blocks by `prune_after_commit`.
+    pub fn put_block_proof(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        txn.put(&tbl, &u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve the `BlockProof` bytes for `height`, or `None` if pruned / not yet stored.
+    pub fn get_block_proof(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw)
+    }
+
+    /// Look up all live UTXOs for a given owner address.
+    ///
+    /// Returns `Vec<(slot_index, value_micronoid)>` — all UTXOs currently
+    /// owned by `owner` according to the incremental owner index.
+    ///
+    /// Returns an empty vec if the owner has no UTXOs OR if the index has
+    /// not yet been populated (e.g. on first startup before any blocks).
+    pub fn get_utxos_by_owner(&self, owner: &[u8; 32]) -> Result<Vec<(u32, u64)>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, owner.as_slice())?;
+        Ok(raw.map(|b| decode_owner_entries(&b)).unwrap_or_default())
+    }
+
+    /// Rebuild the owner index from a set of segment columns (used after
+    /// applying a state snapshot when the index is empty).
+    ///
+    /// Clears the existing index and rebuilds it from scratch. O(active_slots).
+    pub fn rebuild_owner_index_from_segments(
+        &self,
+        segments: &[(u16, u8, &crate::segmented_state::SegmentColumns)],
+    ) -> Result<(), StoreError> {
+        use std::collections::HashMap;
+
+        // Build in-memory map: owner_key → Vec<(slot, value)>
+        let mut owner_map: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+        for &(seg_id, eff_log, cols) in segments {
+            let eff_log = eff_log as u32;
+            let seg_size = cols.values.len();
+            for local in 0..seg_size {
+                let v = cols.values[local];
+                if v.0 == 0 {
+                    continue; // empty slot
+                }
+                let oh = cols.owners_hi[local];
+                let ol = cols.owners_lo[local];
+                let owner_key = owner_key_from_fields(oh, ol);
+                let slot = ((seg_id as u32) << eff_log) | (local as u32);
+                let value = v.0 as u64;
+                owner_map.entry(owner_key).or_default().push((slot, value));
+            }
+        }
+
+        // Write to MDBX atomically.
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+
+        // Clear existing entries (cursor-based delete all).
+        {
+            let mut cur = txn.cursor(&tbl)?;
+            let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            while let Some((k, _)) = item {
+                keys.push(k);
+                item = cur.next()?;
+            }
+            drop(cur);
+            for k in keys {
+                let _ = txn.del(&tbl, &k, None);
+            }
+        }
+
+        // Write new entries.
+        for (owner_key, entries) in &owner_map {
+            let encoded = encode_owner_entries(entries);
+            txn.put(&tbl, owner_key.as_slice(), &encoded, WriteFlags::empty())?;
+        }
+
         txn.commit()?;
         Ok(())
     }
@@ -393,6 +527,87 @@ impl MdbxStore {
             )?;
         }
 
+        // --- 8. Owner index: update live-UTXO index incrementally ---
+        // Uses undo_log (which records pre-block slot values) and dirty_segments
+        // (which hold post-block slot values) to determine what changed.
+        {
+            use crate::fri_state::SlotValue;
+            let oidx_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+            // eff_log = log2(slots_per_segment) — same for every dirty segment.
+            let eff_log: u32 = dirty_segments
+                .first()
+                .map(|(_, e, _)| *e as u32)
+                .unwrap_or(crate::consensus::params::LOG_SEGMENT_SIZE);
+
+            for &(slot_index, ref prev_value) in &undo_log.slot_changes {
+                if *prev_value == SlotValue::EMPTY {
+                    // ----------------------------------------------------------
+                    // This slot was EMPTY before → a new UTXO was minted here.
+                    // Find its new value in the dirty segments.
+                    // ----------------------------------------------------------
+                    let seg_id = (slot_index >> eff_log) as u16;
+                    let local = (slot_index & ((1u32 << eff_log) - 1)) as usize;
+
+                    let new_val = dirty_segments
+                        .iter()
+                        .find(|(id, _, _)| *id == seg_id)
+                        .and_then(|(_, _, cols)| {
+                            (local < cols.values.len()).then(|| {
+                                (
+                                    cols.values[local],
+                                    cols.owners_hi[local],
+                                    cols.owners_lo[local],
+                                )
+                            })
+                        });
+
+                    if let Some((v, oh, ol)) = new_val {
+                        if v.0 != 0 {
+                            let owner_key = owner_key_from_fields(oh, ol);
+                            let value = v.0 as u64;
+                            // Append (slot, value) to this owner's list.
+                            let existing: Option<Vec<u8>> =
+                                txn.get(&oidx_tbl, owner_key.as_slice())?;
+                            let mut entries = existing
+                                .as_deref()
+                                .map(decode_owner_entries)
+                                .unwrap_or_default();
+                            entries.push((slot_index, value));
+                            txn.put(
+                                &oidx_tbl,
+                                owner_key.as_slice(),
+                                &encode_owner_entries(&entries),
+                                WriteFlags::empty(),
+                            )?;
+                        }
+                    }
+                } else {
+                    // ----------------------------------------------------------
+                    // This slot was LIVE before → a UTXO was spent (now EMPTY).
+                    // Remove slot_index from the old owner's list.
+                    // ----------------------------------------------------------
+                    let owner_key = owner_key_from_fields(prev_value.owner_hi, prev_value.owner_lo);
+                    let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, owner_key.as_slice())?;
+                    if let Some(raw) = existing {
+                        let entries: Vec<(u32, u64)> = decode_owner_entries(&raw)
+                            .into_iter()
+                            .filter(|(s, _)| *s != slot_index)
+                            .collect();
+                        if entries.is_empty() {
+                            let _ = txn.del(&oidx_tbl, owner_key.as_slice(), None);
+                        } else {
+                            txn.put(
+                                &oidx_tbl,
+                                owner_key.as_slice(),
+                                &encode_owner_entries(&entries),
+                                WriteFlags::empty(),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
         // Commit atomically — all seven steps or none.
         txn.commit()?;
 
@@ -456,6 +671,28 @@ impl MdbxStore {
             };
             for h in keys_to_del {
                 txn.del(&recent_tbl, &u64_key(h), None)?;
+            }
+        }
+
+        // --- Prune block_proofs older than FINALITY_DEPTH ---
+        if current_height > FINALITY_DEPTH {
+            let bp_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+            let cutoff = current_height - FINALITY_DEPTH;
+            let keys_to_del: Vec<u64> = {
+                let mut cur = txn.cursor(&bp_tbl)?;
+                let mut keys = Vec::new();
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                while let Some((k, _)) = item {
+                    match u64_from_key(&k) {
+                        Some(h) if h <= cutoff => keys.push(h),
+                        _ => break,
+                    }
+                    item = cur.next()?;
+                }
+                keys
+            };
+            for h in keys_to_del {
+                txn.del(&bp_tbl, &u64_key(h), None)?;
             }
         }
 

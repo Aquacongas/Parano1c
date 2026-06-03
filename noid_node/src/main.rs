@@ -926,6 +926,7 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
             &mut w.history,
             &mut w.receipts,
             &known,
+            &mut w.pending_input_slots,
             block,
         );
         // Confirm any pending (height=0) txs that appear in this block
@@ -954,65 +955,174 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 // Background recursive proof updater (P.19)
 // ---------------------------------------------------------------------------
 
-/// Monitors the recursive chain proof and logs its sync status.
+/// Background recursive proof updater (Phase 7).
 ///
-/// The recursive proof provides O(1) sync for new nodes. It is NOT required
-/// for consensus validity — this task runs in DEGRADED mode silently.
+/// Advances the chain's recursive ZK proof one block at a time, storing the
+/// result in MDBX. The recursive proof provides O(1) trustless sync for new
+/// nodes: instead of replaying all blocks, they verify one constant-size
+/// (~11 KB) STARK proof and trust the committed state root.
 ///
-/// The recursive proof can only advance when real ZK BlockProofs are generated
-/// (i.e. blocks containing ZK-proved transactions). Coinbase-only blocks use
-/// marker hashes and cannot advance the recursive proof. Full recursive proof
-/// advancement (Phase 7) requires: per-block ZK proofs → extract BlockReplayWitness
-/// → call prove_recursive_step → persist to MDBX.
+/// ## Design
+///
+/// - Advances only for **finalised** blocks (>= FINALITY_DEPTH behind tip)
+///   so reorgs never invalidate a stored proof.
+/// - Blocks with no real ZK proof (coinbase-only) use a null witness — the
+///   chain-hash accumulator still advances correctly.
+/// - Runs a tight loop when catching up; sleeps when at finality boundary.
+/// - `prove_recursive_step` is ~2s on 8 cores → run in `spawn_blocking`.
 async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
+    use noid_block::{witness_builder::block_proof_to_replay_witness, BlockProof};
     use noid_chain::consensus::params::FINALITY_DEPTH;
+    use noid_recursive::{
+        null_block_replay_witness, prove_genesis_recursive, prove_recursive_step,
+        RecursiveBlockProof,
+    };
     use std::time::Duration;
 
-    const POLL_INTERVAL_SECS: u64 = 30;
+    const POLL_INTERVAL_SECS: u64 = 5;
+
+    let mut just_advanced = false;
 
     loop {
-        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        // Only sleep when idle (caught up or waiting); skip sleep after advance
+        // so we catch up as fast as possible when lagging.
+        if !just_advanced {
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+        just_advanced = false;
 
-        let ctx = chain.read().await;
-        let tip = ctx.tip_height();
+        // --- Read current state ---
+        let (tip, rec_proof_opt) = {
+            let ctx = chain.read().await;
+            let tip = ctx.tip_height();
+            let rec = match ctx.store.get_recursive_proof() {
+                Ok(Some(b)) => bincode::deserialize::<RecursiveBlockProof>(&b).ok(),
+                _ => None,
+            };
+            (tip, rec)
+        };
 
-        // Parse the stored recursive proof to get its actual block_height.
-        let rec_height = match ctx.store.get_recursive_proof() {
-            Ok(Some(bytes)) => {
-                // Try to decode as RecursiveBlockProof to get block_height.
-                match bincode::deserialize::<noid_recursive::prove::RecursiveBlockProof>(&bytes) {
-                    Ok(proof) => proof.block_height,
-                    Err(_) => {
-                        tracing::warn!("recursive proof in store is corrupt or incompatible");
-                        0u64
+        let rec_height_opt = rec_proof_opt.as_ref().map(|p| p.block_height);
+
+        // Determine next height to prove.
+        // None → start with genesis (height 0).
+        let next_height: u64 = match rec_height_opt {
+            None => 0,
+            Some(h) => h + 1,
+        };
+
+        // Only prove blocks that are finalised (FINALITY_DEPTH behind tip).
+        // This guarantees a reorg can never invalidate the stored proof.
+        let finalized_tip = tip.saturating_sub(FINALITY_DEPTH);
+        if next_height > finalized_tip {
+            let lag = tip.saturating_sub(rec_height_opt.unwrap_or(0));
+            if lag > FINALITY_DEPTH {
+                tracing::warn!(
+                    lag,
+                    tip,
+                    rec_height = rec_height_opt.unwrap_or(0),
+                    "recursive proof DEGRADED — {lag} blocks behind finality boundary"
+                );
+            } else {
+                // Normal: tracking finality boundary (lag ≈ FINALITY_DEPTH)
+                tracing::debug!(
+                    lag,
+                    tip,
+                    rec_height = rec_height_opt.unwrap_or(0),
+                    "recursive proof NORMAL — at finality boundary"
+                );
+            }
+            continue;
+        }
+
+        // --- Prove genesis (special case) ---
+        if next_height == 0 {
+            tracing::debug!("recursive proof: proving genesis block");
+            let result = tokio::task::spawn_blocking(prove_genesis_recursive).await;
+            match result {
+                Ok(genesis_proof) => {
+                    let bytes = bincode::serialize(&genesis_proof).unwrap_or_default();
+                    let ctx = chain.read().await;
+                    if let Err(e) = ctx.store.put_recursive_proof(&bytes) {
+                        tracing::error!(err = ?e, "failed to store genesis recursive proof");
+                    } else {
+                        tracing::info!("recursive proof: genesis proved");
+                        just_advanced = true;
                     }
                 }
+                Err(e) => tracing::error!(err = ?e, "genesis recursive proof task panicked"),
             }
-            Ok(None) => 0u64,
-            Err(e) => {
-                tracing::error!(err = ?e, "failed to read recursive proof from store");
+            continue;
+        }
+
+        // --- Prove block at next_height ---
+        // Fetch the block header and any stored BlockProof bytes.
+        let (header_opt, block_proof_bytes_opt) = {
+            let ctx = chain.read().await;
+            let hdr = ctx.store.get_header(next_height).ok().flatten();
+            let bp = ctx.store.get_block_proof(next_height).ok().flatten();
+            (hdr, bp)
+        };
+
+        let header = match header_opt {
+            Some(h) => h,
+            None => {
+                tracing::debug!(next_height, "no header available yet, waiting");
                 continue;
             }
         };
-        drop(ctx);
 
-        let lag = tip.saturating_sub(rec_height);
-        if lag > FINALITY_DEPTH {
-            tracing::warn!(
-                lag,
-                tip,
-                rec_height,
-                "recursive proof FALLBACK mode — lag exceeds FINALITY_DEPTH, light clients cannot O(1) sync"
-            );
-        } else if lag > 0 {
-            tracing::debug!(
-                lag,
-                tip,
-                rec_height,
-                "recursive proof DEGRADED — {lag} blocks behind (needs ZK block proofs to advance)"
-            );
-        } else {
-            tracing::debug!("recursive proof NORMAL — fully caught up at height {rec_height}");
+        // Build the replay witness.
+        // Real proof available  → extract from BlockProof bytes.
+        // Coinbase-only block   → null witness (accumulator still advances correctly).
+        let witness = match block_proof_bytes_opt {
+            Some(ref bytes) if !bytes.is_empty() => {
+                match bincode::deserialize::<BlockProof>(bytes) {
+                    Ok(bp) => block_proof_to_replay_witness(&bp),
+                    Err(e) => {
+                        tracing::warn!(
+                            next_height,
+                            err = ?e,
+                            "block proof decode failed — using null witness"
+                        );
+                        null_block_replay_witness()
+                    }
+                }
+            }
+            _ => null_block_replay_witness(),
+        };
+
+        // prev_acc comes from the last proved block's accumulator.
+        // safe: we only reach here when next_height > 0 and rec_proof_opt is Some.
+        let prev_acc = rec_proof_opt.as_ref().unwrap().acc.clone();
+        // Move rec_proof_opt into the closure — RecursiveBlockProof is not Clone.
+        // prev_acc is already extracted above (ChainAccumulator: Clone).
+
+        tracing::debug!(next_height, "recursive proof: proving step");
+        let result = tokio::task::spawn_blocking(move || {
+            prove_recursive_step(&witness, &header, &prev_acc, rec_proof_opt.as_ref())
+        })
+        .await;
+
+        match result {
+            Ok(new_proof) => {
+                let h = new_proof.block_height;
+                let bytes = bincode::serialize(&new_proof).unwrap_or_default();
+                let ctx = chain.read().await;
+                if let Err(e) = ctx.store.put_recursive_proof(&bytes) {
+                    tracing::error!(err = ?e, "failed to store recursive proof at height {h}");
+                } else {
+                    tracing::info!(height = h, "recursive proof advanced");
+                    just_advanced = true;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    next_height,
+                    err = ?e,
+                    "recursive proof task panicked — skipping block"
+                );
+            }
         }
     }
 }

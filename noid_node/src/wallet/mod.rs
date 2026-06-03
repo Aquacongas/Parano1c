@@ -248,6 +248,83 @@ impl WalletOps for WalletHandle {
         Ok(intent_bytes)
     }
 
+    fn build_consolidate(
+        &self,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<Vec<u8>, String> {
+        // Extract consolidation build data from wallet (brief lock).
+        let (build_data, consolidation_amount) = {
+            let guard = self.inner.lock().unwrap();
+            let w = guard
+                .as_ref()
+                .ok_or_else(|| "wallet not initialized".to_string())?;
+            let pending_output_slots = w.pending_output_slots.clone();
+            let pending_input_slots = w.pending_input_slots.clone();
+            builder::extract_consolidate_data(
+                w,
+                fee_micronoid,
+                epoch_anchor,
+                slot_hints,
+                log_slots,
+                &pending_output_slots,
+                &pending_input_slots,
+            )
+            .map_err(|e| e.to_string())?
+        };
+
+        // Capture input slots before build_data is moved into the prover.
+        let input_slots: Vec<u32> = build_data
+            .selected_utxos
+            .iter()
+            .map(|u| u.slot_index)
+            .collect();
+
+        // Self-address: send consolidated amount to own primary address.
+        let self_address = {
+            let guard = self.inner.lock().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| "wallet not initialized".to_string())?
+                .primary_address()
+                .0
+        };
+
+        // Prove outside the lock (CPU-heavy).
+        let (_tx_hash, intent_bytes) = builder::build_and_prove_tx(
+            self_address,
+            consolidation_amount,
+            fee_micronoid,
+            build_data,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Register output and input slots as pending (brief lock).
+        // Output slots: prevents concurrent TXs from targeting the same empty slot.
+        // Input slots: prevents the next consolidation round from double-spending
+        //              the same UTXOs before this TX is confirmed.
+        {
+            let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
+                .map_err(|e| format!("decode: {e:?}"))?;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.slot_index)
+                .collect();
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(w) = guard.as_mut() {
+                w.add_pending_outputs(&output_slots);
+                w.add_pending_inputs(&input_slots);
+            }
+        }
+
+        Ok(intent_bytes)
+    }
+
     fn export_receipt(&self, txhash_hex: &str) -> Result<String, String> {
         let tx_hash: [u8; 32] = hex::decode(txhash_hex)
             .map_err(|e| format!("invalid hex: {e}"))?

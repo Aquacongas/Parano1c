@@ -237,7 +237,7 @@ impl BlockMiner {
                     (p, r)
                 } => {
                     match (pow_res, prove_res) {
-                        (Ok(Some(sol)), Ok(Ok((proof_hash, witness_root, _block_proof_bytes)))) => {
+                        (Ok(Some(sol)), Ok(Ok((proof_hash, witness_root, block_proof_bytes)))) => {
                             let block = tmpl.seal(sol.nonce, proof_hash, witness_root);
                             let block_bytes = block.to_bytes();
                             let hash = full_block_hash(&block.header);
@@ -261,6 +261,17 @@ impl BlockMiner {
                             // Apply the block to the chain and update mempool.
                             if let Err(e) = self.apply_found_block(&block, &block_bytes).await {
                                 tracing::error!("apply found block failed: {e}");
+                            }
+
+                            // Store block proof bytes for recursive proof advancement (Phase 7).
+                            // Only store if we have real proof bytes (not marker hashes from coinbase-only blocks).
+                            if !block_proof_bytes.is_empty() {
+                                let ctx = self.chain.read().await;
+                                if let Err(e) = ctx.store.put_block_proof(height, &block_proof_bytes) {
+                                    tracing::warn!(height, err = %e, "failed to store block proof bytes");
+                                } else {
+                                    tracing::debug!(height, bytes = block_proof_bytes.len(), "block proof stored");
+                                }
                             }
                         }
                         (Ok(Some(_sol)), Ok(Err(e))) => {

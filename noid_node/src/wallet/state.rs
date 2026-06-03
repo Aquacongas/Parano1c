@@ -90,6 +90,10 @@ pub struct WalletState {
     /// Output slots claimed by pending (submitted but not yet confirmed) txs.
     /// Used to avoid SlotConflict when retrying or sending multiple txs.
     pub pending_output_slots: std::collections::HashSet<u32>,
+    /// Input slots being spent by pending (submitted but not yet confirmed) txs.
+    /// Used to avoid double-spending the same UTXO in consecutive consolidation
+    /// or send rounds before the first TX is confirmed.
+    pub pending_input_slots: std::collections::HashSet<u32>,
 }
 
 impl WalletState {
@@ -124,6 +128,7 @@ impl WalletState {
             history: Vec::new(),
             receipts: HashMap::new(),
             pending_output_slots: std::collections::HashSet::new(),
+            pending_input_slots: std::collections::HashSet::new(),
         };
         wallet.load_receipts();
         Ok(wallet)
@@ -195,6 +200,10 @@ impl WalletState {
         if next_index > self.next_index {
             self.next_index = next_index;
         }
+        // Clear pending slot sets: the scan has replaced the UTXO set from
+        // chain state, so any in-flight tracking is now stale.
+        self.pending_output_slots.clear();
+        self.pending_input_slots.clear();
     }
 
     /// Store a receipt for a confirmed transaction.
@@ -258,6 +267,23 @@ impl WalletState {
     pub fn remove_pending_outputs(&mut self, slot_indices: &[u32]) {
         for slot in slot_indices {
             self.pending_output_slots.remove(slot);
+        }
+    }
+
+    /// Register input slots as pending (tx submitted to mempool).
+    /// Used to prevent a subsequent round from double-spending the same UTXOs
+    /// before the first TX is confirmed.
+    pub fn add_pending_inputs(&mut self, slot_indices: &[u32]) {
+        for &slot in slot_indices {
+            self.pending_input_slots.insert(slot);
+        }
+    }
+
+    /// Clear pending input slots for a confirmed or evicted tx.
+    #[allow(dead_code)]
+    pub fn remove_pending_inputs(&mut self, slot_indices: &[u32]) {
+        for slot in slot_indices {
+            self.pending_input_slots.remove(slot);
         }
     }
 

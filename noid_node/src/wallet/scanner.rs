@@ -184,11 +184,13 @@ pub fn scan_state_for_utxos(
 /// - Adds new UTXOs (outputs addressed to this wallet)
 /// - Appends to tx history
 /// - Generates and stores Merkle receipts for all wallet-relevant transactions
+/// - Clears confirmed input slots from `pending_input_slots`
 pub fn update_wallet_from_block(
     utxos: &mut HashMap<u32, WalletUtxo>,
     history: &mut Vec<TxHistoryEntry>,
     receipts: &mut HashMap<[u8; 32], Vec<u8>>,
     known_addresses: &HashMap<[u8; 32], u32>,
+    pending_input_slots: &mut std::collections::HashSet<u32>,
     block: &Block,
 ) {
     let height = block.header.height;
@@ -257,8 +259,9 @@ pub fn update_wallet_from_block(
         let mut sent_from_wallet: u64 = 0;
         let mut received_by_wallet: u64 = 0;
 
-        // Inputs: remove spent UTXOs
+        // Inputs: remove spent UTXOs and clear from pending_input_slots.
         for input in tx.body.inputs.iter().filter(|i| i.valid) {
+            pending_input_slots.remove(&input.slot_index);
             if let Some(spent) = utxos.remove(&input.slot_index) {
                 sent_from_wallet = sent_from_wallet.saturating_add(spent.value);
             }

@@ -86,6 +86,17 @@ enum WalletCmd {
         /// Transaction hash (hex).
         txhash: String,
     },
+    /// Consolidate multiple small UTXOs into a single larger UTXO.
+    /// Repeats until UTXO count stops decreasing (all UTXOs are large enough).
+    Consolidate {
+        /// Transaction fee per consolidation round in μNOID.
+        /// 0 = auto (use current fee floor, never below 7000).
+        #[arg(long, default_value_t = 0)]
+        fee: u64,
+        /// Maximum number of consolidation rounds (default: 100).
+        #[arg(long, default_value_t = 100)]
+        rounds: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
             WalletCmd::Utxos => cmd_wallet_utxos(&client, &cli.rpc).await?,
             WalletCmd::Scan => cmd_wallet_scan(&client, &cli.rpc).await?,
             WalletCmd::Receipt { txhash } => cmd_wallet_receipt(&client, &cli.rpc, &txhash).await?,
+            WalletCmd::Consolidate { fee, rounds } => {
+                cmd_wallet_consolidate(&client, &cli.rpc, fee, rounds).await?
+            }
         },
     }
 
@@ -416,6 +430,111 @@ async fn cmd_wallet_receipt(
 
     // Print raw hex to stdout — caller can redirect to a file.
     println!("{hex}");
+
+    Ok(())
+}
+
+async fn cmd_wallet_consolidate(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    fee: u64,
+    rounds: u32,
+) -> anyhow::Result<()> {
+    println!("wallet consolidate: merging small UTXOs (fee={fee} \u{03bc}NOID per round)...");
+
+    let mut total_rounds = 0u32;
+    loop {
+        if total_rounds >= rounds {
+            println!("  Reached maximum rounds ({rounds}). Run again to continue.");
+            break;
+        }
+
+        match rpc_call(
+            client,
+            rpc_url,
+            "paranoid_walletConsolidate",
+            serde_json::json!([fee]),
+        )
+        .await
+        {
+            Ok(result) => {
+                let tx_hash = result["tx_hash"].as_str().unwrap_or("?");
+                total_rounds += 1;
+                println!("  Round {total_rounds}: tx submitted 0x{tx_hash}");
+
+                // Wait for the TX to be mined and wallet state to update.
+                // 1. Poll mempool until empty (TX confirmed in a block).
+                // 2. Then do a wallet scan to rebuild from authoritative chain state,
+                //    which also clears any stale pending_input_slots.
+                for _wait in 0..60u32 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let mpool_size = rpc_call(
+                        client,
+                        rpc_url,
+                        "paranoid_getMempoolSize",
+                        serde_json::json!([]),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                    if mpool_size == 0 {
+                        break;
+                    }
+                }
+                // Scan to rebuild wallet from chain state (clears stale pending tracking).
+                let _ = rpc_call(
+                    client,
+                    rpc_url,
+                    "paranoid_walletScan",
+                    serde_json::json!([]),
+                )
+                .await;
+
+                match rpc_call(
+                    client,
+                    rpc_url,
+                    "paranoid_walletGetBalance",
+                    serde_json::json!([]),
+                )
+                .await
+                {
+                    Ok(bal) => {
+                        let utxo_count = bal["utxo_count"].as_u64().unwrap_or(0);
+                        if utxo_count <= 1 {
+                            println!("  Done! UTXO count reduced to {utxo_count}.");
+                            break;
+                        }
+                        println!("  UTXOs remaining: {utxo_count}");
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // "InsufficientFunds have=0" means no UTXOs outside pending set.
+                // This is normal when all UTXOs are confirmed in the previous round
+                // and the wallet has only 1-3 UTXOs left (fewer than MAX_INPUTS).
+                // The sleep above prevents this in most cases; if it still happens
+                // it means the wallet is sufficiently consolidated.
+                if msg.contains("InsufficientFunds") || msg.contains("nothing to consolidate") {
+                    if total_rounds == 0 {
+                        println!("  Nothing to consolidate — wallet has too few UTXOs.");
+                    } else {
+                        println!("  Consolidation complete after {total_rounds} round(s).");
+                    }
+                } else {
+                    println!("  Error: {msg}");
+                }
+                break;
+            }
+        }
+    }
+
+    if total_rounds > 0 {
+        println!("\nTotal rounds: {total_rounds}.");
+        println!("Note: submitted TXs are pending. Run 'wallet balance' after confirmation.");
+    }
 
     Ok(())
 }

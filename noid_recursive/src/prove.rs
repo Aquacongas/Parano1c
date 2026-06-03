@@ -23,7 +23,7 @@ use crate::witness::BlockReplayWitness;
 use noid_chain::BlockHeader;
 use noid_core::{Block128, TowerField};
 use noid_fri::Channel;
-use noid_fri_binius::COMPACT_NUM_QUERIES;
+use noid_fri_binius::{CompactEvalProof, MerkleCap, COMPACT_NUM_QUERIES};
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::interleaved::{prove_air_interleaved, InterleavedStarkProof};
 use noid_stark::{padded_log_len, SliceClaim};
@@ -248,7 +248,6 @@ fn make_empty_pi() -> PublicInputs {
 /// This is the root of the recursive chain that `verify_tip` anchors against.
 pub fn prove_genesis_recursive() -> RecursiveBlockProof {
     use noid_chain::consensus::genesis::genesis_header;
-    use noid_fri_binius::{CompactEvalProof, MerkleCap};
 
     let genesis = genesis_header();
 
@@ -285,6 +284,36 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
 
     // prev_rec_proof = None: genesis is the first step, uses zero rec rounds.
     prove_recursive_step(&null_witness, &genesis, &pre_genesis_acc, None)
+}
+
+// ---------------------------------------------------------------------------
+// Null witness (for coinbase-only blocks with no real ZK proof)
+// ---------------------------------------------------------------------------
+
+/// Build a null `BlockReplayWitness` — used for coinbase-only blocks that have
+/// no real `BlockProof`, and also for the genesis block itself.
+///
+/// A null witness has all-zero multipoint sumcheck rounds (trivially consistent
+/// with the recursive circuit) and empty state-binding and column data.
+/// The accumulator transition is still correctly computed from the block header.
+///
+/// `BLOCK_SUMCHECK_ROUNDS` must match `crate::air::BLOCK_SUMCHECK_ROUNDS`.
+pub fn null_block_replay_witness() -> BlockReplayWitness {
+    BlockReplayWitness::from_parts(
+        MerkleCap { hashes: vec![] },
+        vec![], // no state_binding_algebraics
+        vec![], // no block_col_openings
+        vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        CompactEvalProof {
+            upper_partial_evals: vec![],
+            sum_check_oracles: vec![],
+            fri_roots: vec![],
+            fri_queried_symbols: vec![],
+            fri_merkle_batch: vec![],
+            final_codeword: vec![],
+        },
+        vec![], // no mixed_all_openings
+    )
 }
 
 #[cfg(test)]

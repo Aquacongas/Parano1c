@@ -21,6 +21,8 @@ pub use air::{
     build_recursive_trace, RecursiveBlockAir, RecursiveBlockWitness, LOG_ROWS, N_COLS, N_ROWS,
 };
 pub use fri_verify::{extract_fri_query_inputs, FriQueryInputs};
-pub use prove::{prove_genesis_recursive, prove_recursive_step, RecursiveBlockProof};
+pub use prove::{
+    null_block_replay_witness, prove_genesis_recursive, prove_recursive_step, RecursiveBlockProof,
+};
 pub use verify::{verify_recursive_step, verify_tip, RecVerifyError};
 pub use witness::{extract_block_replay_witness_parts, BlockReplayWitness};

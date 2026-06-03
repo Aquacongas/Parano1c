@@ -32,7 +32,7 @@ impl Default for MempoolConfig {
             capacity: BLOCK_MAX_TXS * 8,
             fee_floor_window: 50,
             pre_prove_enabled: false, // activated in Phase 1.5
-            zk_verify_workers: 0,     // Phase 3 base: native checks only
+            zk_verify_workers: 4,     // 4 concurrent ZK verification workers (DoS bound)
         }
     }
 }

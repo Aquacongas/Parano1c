@@ -28,7 +28,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use noid_chain::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_TXS};
 use noid_chain::consensus::{checks::validate_tx_consensus, min_fee, pow::full_block_hash};
@@ -71,6 +71,10 @@ pub struct AsyncMempool {
     state: Arc<Mutex<MempoolState>>,
     events: broadcast::Sender<MempoolEvent>,
     config: Arc<MempoolConfig>,
+    /// Semaphore limiting concurrent ZK verification tasks.
+    /// Bounds CPU usage: at most `config.zk_verify_workers` ZK proofs in flight.
+    /// Set to 0 in config → semaphore with MAX permits (no limit).
+    zk_semaphore: Arc<Semaphore>,
 }
 
 impl AsyncMempool {
@@ -88,10 +92,18 @@ impl AsyncMempool {
             floor,
             new_since_refresh: 0,
         };
+        let max_permits = if config.zk_verify_workers == 0 {
+            // 0 = unlimited (native-only mode or testing)
+            usize::MAX / 2 // Semaphore::MAX_PERMITS
+        } else {
+            config.zk_verify_workers
+        };
+        let zk_semaphore = Arc::new(Semaphore::new(max_permits));
         Self {
             state: Arc::new(Mutex::new(state)),
             events,
             config: Arc::new(config),
+            zk_semaphore,
         }
     }
 
@@ -123,6 +135,15 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
+        // Fast path: if tx_body_hash already in pool, skip ZK verification entirely.
+        // This avoids redundant CPU work when the same valid TX arrives from multiple peers.
+        {
+            let st = self.state.lock().await;
+            if st.pool.contains(&intent.tx_body_hash) {
+                return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
+            }
+        }
+
         // Phase 5: ZK verify_logic before pool admission.
         // The wallet's LogicProof (STARK + AuthGKR Kill-Shot) is verified here so
         // invalid proofs are rejected at the mempool boundary, not silently stored.
@@ -139,12 +160,22 @@ impl AsyncMempool {
             let tx_body_clone = intent.tx_body.clone();
             let log_slots = view_snap.log_slots();
 
+            // Acquire a ZK verification permit — bounds concurrent CPU usage.
+            // If all workers are busy, this await yields until one finishes.
+            // Prevents DoS: attacker cannot saturate all CPU threads with invalid proofs.
+            let _permit = self
+                .zk_semaphore
+                .acquire()
+                .await
+                .map_err(|_| SubmitError::Internal("zk semaphore closed".into()))?;
+
             let verify_result = tokio::task::spawn_blocking(move || {
                 zk_verify_intent(&tx_body_clone, &proof_bytes, log_slots)
             })
             .await
             .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?;
 
+            // Permit released here (drop)
             verify_result.map_err(|e| SubmitError::InvalidProof(e))?;
         }
 
@@ -322,6 +353,37 @@ impl AsyncMempool {
                 hash,
                 block_height: new_height,
             });
+        }
+
+        // Detect state expansion: if log_slots changed, all non-coinbase TXs in the
+        // pool were proved with the old log_slots and cannot be included in future
+        // blocks (their ZK proofs are bound to log_slots via PublicInputs).
+        // Evict them now so the miner doesn't waste time on stale proofs.
+        let old_log_slots = st.view.log_slots();
+        let new_log_slots = new_view.log_slots();
+        if old_log_slots != new_log_slots {
+            let stale: Vec<TxBodyHash> = st
+                .pool
+                .iter()
+                .filter(|(_, e)| !e.tx.body.is_coinbase)
+                .map(|(h, _)| *h)
+                .collect();
+            let stale_count = stale.len();
+            for hash in stale {
+                st.pool.remove(&hash);
+                let _ = self.events.send(MempoolEvent::TxEvicted {
+                    hash,
+                    reason: EvictReason::LogSlotsChanged,
+                });
+            }
+            if stale_count > 0 {
+                tracing::info!(
+                    old_log_slots,
+                    new_log_slots,
+                    evicted = stale_count,
+                    "state expanded: evicted stale-proof TXs from mempool (wallets must re-prove)"
+                );
+            }
         }
 
         // Update chain view BEFORE eviction so anchor check uses new state.
