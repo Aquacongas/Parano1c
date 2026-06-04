@@ -55,52 +55,96 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 #[derive(Parser, Debug)]
 #[command(
     name = "paranoid",
-    about = "Paranoid full node daemon — proof-native transparent UTXO chain",
+    about = "Paranoid full node daemon — proof-native UTXO blockchain",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = None,
+    long_about = "Run a Paranoid full node.\n\nExample:\n  paranoid --mine --data-dir ~/.paranoid\n  paranoid --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
 )]
 struct Cli {
-    /// Network to connect to: mainnet or testnet.
+    /// Network: mainnet (port 9301/9401) or testnet (port 19301/19401).
     #[arg(long, default_value = "mainnet")]
     network: NetworkKind,
 
-    /// Path to the TOML config file.
-    #[arg(short, long)]
+    /// Path to TOML config file (optional).
+    #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Enable built-in PoW mining.
+    /// Enable built-in PoW miner.
     #[arg(long)]
     mine: bool,
 
-    /// Bootstrap genesis mode: start mining immediately without waiting for peers.
-    /// Use ONLY for the very first node on a new network.
-    /// All other nodes sync automatically when they connect.
+    /// Bootstrap a new network: start mining immediately without waiting for peers.
+    /// Use ONLY for the very first node on a fresh network.
     #[arg(long)]
     genesis: bool,
 
-    /// Miner reward address (32-byte hex).
-    #[arg(long)]
+    /// Miner coinbase address (32-byte hex). Defaults to built-in wallet address.
+    #[arg(long, value_name = "HEX")]
     miner_address: Option<String>,
 
-    /// Override data directory.
-    #[arg(long)]
+    /// Data directory for the MDBX database and wallet key.
+    /// Default: ~/.paranoid/data
+    #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
-    /// P2P listen address (libp2p multiaddr).
-    #[arg(long)]
+    /// P2P listen address in HOST:PORT format.
+    /// Default: 0.0.0.0:9301 (mainnet) / 0.0.0.0:19301 (testnet)
+    #[arg(long, value_name = "HOST:PORT")]
     p2p_listen: Option<String>,
 
-    /// RPC listen address.
-    #[arg(long)]
+    /// JSON-RPC listen address in HOST:PORT format.
+    /// Default: 127.0.0.1:9401 (mainnet) / 127.0.0.1:19401 (testnet)
+    #[arg(long, value_name = "HOST:PORT")]
     rpc_listen: Option<String>,
 
-    /// Seed peer multiaddrs (comma-separated).
-    #[arg(long, value_delimiter = ',')]
-    seeds: Vec<String>,
+    /// Seed peer address (HOST:PORT). Repeat for multiple seeds.
+    /// Example: --seed 1.2.3.4:9301 --seed 5.6.7.8:9301
+    #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
+    seed: Vec<String>,
 
-    /// Log level filter.
-    #[arg(long, default_value = "info")]
+    /// Log level filter. Examples: debug, info, warn, error.
+    #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
+
+    /// PoW mining threads. 0 = all physical cores.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    threads: usize,
+}
+
+/// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
+///
+/// Users type:  `127.0.0.1:9301`  or  `0.0.0.0:9301`
+/// libp2p needs: `/ip4/127.0.0.1/tcp/9301`
+///
+/// This conversion is purely internal — users never see multiaddrs.
+fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
+    // Already a multiaddr? Pass through for backward-compat.
+    if addr.starts_with('/') {
+        return addr
+            .parse()
+            .with_context(|| format!("parse multiaddr: {addr}"));
+    }
+
+    // Parse HOST:PORT
+    let (host, port_str) = addr.rsplit_once(':').with_context(|| {
+        format!(
+            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9301)",
+            addr
+        )
+    })?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid port in {:?}", addr))?;
+
+    // Build /ip4/<host>/tcp/<port> or /ip6/<host>/tcp/<port>
+    let ma_str = if host.contains(':') {
+        // IPv6
+        format!("/ip6/{host}/tcp/{port}")
+    } else {
+        format!("/ip4/{host}/tcp/{port}")
+    };
+    ma_str
+        .parse()
+        .with_context(|| format!("build multiaddr from {:?}", addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +194,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(addr) = cli.miner_address {
         cfg.mining.miner_address = addr;
     }
-    for seed in cli.seeds {
-        cfg.network.seeds.push(seed);
+    if cli.threads > 0 {
+        cfg.mining.threads = cli.threads;
+    }
+    // --seed accepts HOST:PORT; convert to multiaddr strings for internal use
+    for raw_seed in cli.seed {
+        let ma = ip_port_to_multiaddr(&raw_seed).with_context(|| format!("--seed {raw_seed}"))?;
+        cfg.network.seeds.push(ma.to_string());
     }
 
     // --- Data directory: ~/.paranoid/data by default (no network subdir) ---
@@ -196,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     let wallet_path = data_dir.join("wallet.key");
     let wallet_state = match WalletState::create_or_load(wallet_path) {
         Ok(w) => {
-            tracing::info!(address = %hex::encode(w.primary_address().0), "wallet ready");
+            tracing::info!(address = %w.primary_address(), "wallet ready");
             w
         }
         Err(e) => {
@@ -215,8 +264,10 @@ async fn main() -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| net.default_p2p_listen())
     });
+    // Convert HOST:PORT to libp2p Multiaddr transparently.
+    // Users specify --p2p-listen 0.0.0.0:9301; libp2p gets /ip4/0.0.0.0/tcp/9301.
     let listen_addr: libp2p::Multiaddr =
-        p2p_listen_str.parse().context("parse P2P listen address")?;
+        ip_port_to_multiaddr(&p2p_listen_str).context("--p2p-listen")?;
 
     let topics = noid_p2p::protocol::NetworkTopics::for_network_cfg(&net);
     let (p2p, _p2p_task) =
@@ -232,28 +283,24 @@ async fn main() -> anyhow::Result<()> {
         .chain(net.dns_seeds.iter().map(|s| s.to_string()))
         .collect();
     for seed_addr in &all_seeds {
-        // Try to parse the full multiaddr (may include /p2p/<peer-id>).
-        // Fallback: strip the /p2p/ suffix and dial TCP-only (local testing).
-        let addr = seed_addr.parse::<libp2p::Multiaddr>().or_else(|_| {
-            // If parsing fails (e.g. multiaddr crate can't parse /p2p/<id>),
-            // strip the peer ID and dial the transport address only.
+        // Accept either HOST:PORT (user-friendly) or /ip4/…/tcp/… (multiaddr).
+        // ip_port_to_multiaddr handles both formats transparently.
+        let ma = ip_port_to_multiaddr(seed_addr).or_else(|_| {
+            // Last resort: try stripping a trailing /p2p/<peer-id> and re-parsing.
             seed_addr
                 .split("/p2p/")
                 .next()
                 .filter(|s| !s.is_empty())
-                .and_then(|s| s.parse::<libp2p::Multiaddr>().ok())
-                .ok_or(())
+                .and_then(|s| ip_port_to_multiaddr(s).ok())
+                .ok_or_else(|| anyhow::anyhow!("unrecognised seed address"))
         });
-        match addr {
+        match ma {
             Ok(addr) => {
                 tracing::info!(addr = %addr, "dialing seed");
                 p2p.dial(addr).await;
             }
-            Err(_) => {
-                if seed_addr.starts_with('/') {
-                    tracing::warn!(addr = %seed_addr, "could not parse seed multiaddr, skipping");
-                }
-                // DNS names (seed1.noid.network) are silently skipped.
+            Err(e) => {
+                tracing::warn!(addr = %seed_addr, err = %e, "cannot parse seed address, skipping");
             }
         }
     }
@@ -326,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             parse_address(&cfg.mining.miner_address)?
         };
-        tracing::info!(address = %hex::encode(miner_addr.0), "miner coinbase address");
+        tracing::info!(address = %miner_addr, "miner coinbase address");
         let miner_cfg = MinerConfig {
             miner_address: miner_addr,
             pow_threads: cfg.mining.threads,
@@ -1585,15 +1632,13 @@ fn expand_tilde(p: &PathBuf) -> PathBuf {
     }
 }
 
-fn parse_address(hex_str: &str) -> anyhow::Result<noid_poseidon2b::primitives::Address> {
-    if hex_str.is_empty() {
+/// Parse a miner/wallet address from bech32m (`noid1…`) or legacy 64-char hex.
+fn parse_address(s: &str) -> anyhow::Result<noid_poseidon2b::primitives::Address> {
+    if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));
     }
-    let bytes: [u8; 32] = hex::decode(hex_str)
-        .context("decode miner_address hex")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("miner_address must be exactly 32 bytes (64 hex chars)"))?;
-    Ok(noid_poseidon2b::primitives::Address(bytes))
+    noid_poseidon2b::primitives::Address::from_str(s)
+        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))
 }
 
 fn unix_now() -> u64 {

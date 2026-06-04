@@ -65,6 +65,104 @@ newtype_digest!(
     /// `spend_secret` via `H_ADDR = Poseidon2b(ADDRESS_, secret)`.
     Address
 );
+
+// ---------------------------------------------------------------------------
+// Bech32m encoding for Address
+// ---------------------------------------------------------------------------
+
+/// Human-readable part for Paranoid bech32m addresses.
+/// Produces addresses of the form `noid1q...` (~63 chars).
+pub const ADDRESS_HRP: &str = "noid";
+
+/// Error returned when decoding a bech32m address fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressError {
+    /// String is neither valid bech32m nor 64-char hex.
+    InvalidFormat,
+    /// Bech32m decoded OK but HRP is not `noid`.
+    WrongHrp(String),
+    /// Decoded payload is not exactly 32 bytes.
+    WrongLength(usize),
+    /// Hex decode failed (wrong chars or odd length).
+    InvalidHex,
+}
+
+impl std::fmt::Display for AddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat => write!(
+                f,
+                "invalid address format (expected bech32m noid1… or 64-char hex)"
+            ),
+            Self::WrongHrp(h) => write!(f, "wrong address network: got '{h}', expected 'noid'"),
+            Self::WrongLength(n) => write!(f, "wrong address length: got {n} bytes, expected 32"),
+            Self::InvalidHex => write!(
+                f,
+                "invalid hex in address (expected 64 lowercase hex chars)"
+            ),
+        }
+    }
+}
+impl std::error::Error for AddressError {}
+
+impl Address {
+    /// Encode this address as a bech32m string (`noid1…`).
+    ///
+    /// This is the canonical display format. All user-facing output should
+    /// call this or use the `Display` impl.
+    pub fn to_bech32(&self) -> String {
+        use bech32::{Bech32m, Hrp};
+        let hrp = Hrp::parse(ADDRESS_HRP).expect("noid is a valid HRP");
+        bech32::encode::<Bech32m>(hrp, &self.0).expect("32 bytes always encodes")
+    }
+
+    /// Decode an address from bech32m (`noid1…`) or legacy 64-char hex.
+    ///
+    /// Accepts both formats so tooling can transition gracefully.
+    /// New code should always produce bech32m; hex input is accepted for
+    /// backward-compatibility only.
+    pub fn from_str(s: &str) -> Result<Self, AddressError> {
+        let s = s.trim();
+
+        // Try to determine format:
+        // - 64-char pure hex (legacy) → hex path
+        // - anything else → try bech32m first
+        let clean = s.trim_start_matches("0x");
+        let looks_like_hex = clean.len() == 64 && clean.chars().all(|c| c.is_ascii_hexdigit());
+
+        if looks_like_hex {
+            // Legacy hex path — accepted for backward compatibility.
+            let bytes: [u8; 32] = hex::decode(clean)
+                .map_err(|_| AddressError::InvalidHex)?
+                .try_into()
+                .map_err(|_| AddressError::WrongLength(0))?;
+            return Ok(Self(bytes));
+        }
+
+        // Bech32m path — the canonical format going forward.
+        let (hrp, data) = bech32::decode(s).map_err(|_| AddressError::InvalidFormat)?;
+        // HRP comparison is case-insensitive (bech32 spec: HRP is lowercased).
+        if hrp.as_str().to_ascii_lowercase() != ADDRESS_HRP {
+            return Err(AddressError::WrongHrp(hrp.as_str().to_ascii_lowercase()));
+        }
+        if data.len() != 32 {
+            return Err(AddressError::WrongLength(data.len()));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data);
+        Ok(Self(bytes))
+    }
+}
+
+/// Display an `Address` as a bech32m string.
+/// This means `tracing::info!(addr = %my_addr, …)` and `format!("{}", addr)`
+/// both produce the human-readable form automatically.
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_bech32())
+    }
+}
+
 newtype_digest!(
     /// A coin / UTXO leaf digest binding `(value, owner)`. The leaf is
     /// also the payload stored in the on-chain state tree.
@@ -500,5 +598,86 @@ mod tests {
         let s1 = SpendSecret([1u8; 32]);
         let s2 = SpendSecret([2u8; 32]);
         assert_ne!(derive_address(&s1), derive_address(&s2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bech32m address encoding tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bech32_roundtrip() {
+        let addr = Address([
+            0xec, 0x7c, 0x7a, 0x9a, 0x4d, 0xff, 0xf0, 0x2d, 0xf4, 0x27, 0x5b, 0x1d, 0xeb, 0xf5,
+            0xd8, 0xfd, 0xc3, 0x36, 0x30, 0x7d, 0x8e, 0x89, 0x51, 0x08, 0xb7, 0x3f, 0x05, 0x99,
+            0x23, 0xaf, 0xcd, 0xb2,
+        ]);
+        let encoded = addr.to_bech32();
+        // Must start with noid1
+        assert!(
+            encoded.starts_with("noid1"),
+            "expected noid1 prefix, got {encoded}"
+        );
+        // Must be exactly 63 chars (5 HRP + 52 data + 6 checksum)
+        assert_eq!(
+            encoded.len(),
+            63,
+            "expected 63 chars, got {}",
+            encoded.len()
+        );
+        // Round-trip
+        let decoded = Address::from_str(&encoded).expect("decode own bech32");
+        assert_eq!(decoded, addr, "round-trip failed");
+    }
+
+    #[test]
+    fn bech32_display_matches_to_bech32() {
+        let addr = Address([0xab; 32]);
+        assert_eq!(format!("{}", addr), addr.to_bech32());
+    }
+
+    #[test]
+    fn bech32_case_insensitive() {
+        let addr = Address([
+            0x52, 0x39, 0x3e, 0x22, 0x79, 0x08, 0xb1, 0xbb, 0x10, 0x3a, 0xa8, 0xd9, 0x28, 0x93,
+            0x63, 0x86, 0xc8, 0x7c, 0xd9, 0x4f, 0x94, 0x6f, 0xdd, 0xd6, 0xd0, 0xc8, 0xb9, 0x1f,
+            0xe9, 0x34, 0xee, 0x43,
+        ]);
+        let lower = addr.to_bech32();
+        let upper = lower.to_uppercase();
+        let from_upper = Address::from_str(&upper).expect("uppercase bech32 must parse");
+        assert_eq!(from_upper, addr);
+    }
+
+    #[test]
+    fn hex_still_accepted_for_compat() {
+        let addr = Address([
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c,
+        ]);
+        let hex = hex::encode(addr.0);
+        let from_hex = Address::from_str(&hex).expect("64-char hex must parse");
+        assert_eq!(from_hex, addr);
+    }
+
+    #[test]
+    fn wrong_hrp_rejected() {
+        // Build a valid bech32m but with hrp "btc" instead of "noid"
+        use bech32::{Bech32m, Hrp};
+        let hrp = Hrp::parse("btc").unwrap();
+        let fake = bech32::encode::<Bech32m>(hrp, &[0u8; 32]).unwrap();
+        assert!(matches!(
+            Address::from_str(&fake),
+            Err(AddressError::WrongHrp(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_format_rejected() {
+        assert!(Address::from_str("notanaddress").is_err());
+        assert!(Address::from_str("").is_err());
+        assert!(Address::from_str("noid1").is_err());
+        // 62-char hex (too short)
+        assert!(Address::from_str(&"ab".repeat(31)).is_err());
     }
 }

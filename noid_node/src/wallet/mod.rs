@@ -77,7 +77,7 @@ impl WalletOps for WalletHandle {
                 let balance = w.balance();
                 WalletStatus {
                     exists: true,
-                    address: hex::encode(w.primary_address().0),
+                    address: w.primary_address().to_bech32(),
                     balance_micronoid: balance,
                     balance_noid: micronoid_to_noid(balance),
                     utxo_count: w.utxos.len(),
@@ -89,12 +89,12 @@ impl WalletOps for WalletHandle {
 
     fn get_address(&self, index: u32) -> Option<String> {
         let guard = self.inner.lock().unwrap();
-        guard.as_ref().map(|w| hex::encode(w.address_at(index).0))
+        guard.as_ref().map(|w| w.address_at(index).to_bech32())
     }
 
     fn primary_address(&self) -> Option<String> {
         let guard = self.inner.lock().unwrap();
-        guard.as_ref().map(|w| hex::encode(w.primary_address().0))
+        guard.as_ref().map(|w| w.primary_address().to_bech32())
     }
 
     fn get_balance(&self) -> WalletBalance {
@@ -127,7 +127,7 @@ impl WalletOps for WalletHandle {
                     slot_index: u.slot_index,
                     value_micronoid: u.value,
                     value_noid: micronoid_to_noid(u.value),
-                    address: hex::encode(u.address.0),
+                    address: u.address.to_bech32(),
                     key_index: u.key_index,
                     confirmed_height: u.confirmed_height,
                 })
@@ -151,7 +151,9 @@ impl WalletOps for WalletHandle {
                     },
                     amount_micronoid: h.amount_micronoid,
                     amount_noid: micronoid_to_noid(h.amount_micronoid),
-                    peer_address: h.peer_address.map(hex::encode),
+                    peer_address: h
+                        .peer_address
+                        .map(|a| noid_poseidon2b::primitives::Address(a).to_bech32()),
                     timestamp: h.timestamp,
                 })
                 .collect(),

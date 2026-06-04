@@ -16,12 +16,16 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
-    /// libp2p listen multiaddr.
-    /// Defaults to network-specific port (9400 mainnet, 19400 testnet).
+    /// P2P listen address.
+    /// Config file: HOST:PORT or libp2p multiaddr ("/ip4/...").
+    /// CLI flag: --p2p-listen HOST:PORT  (e.g. 0.0.0.0:9301)
+    /// Defaults to network-specific port (9301 mainnet, 19301 testnet).
     pub listen: Option<String>,
-    /// Bootstrap seed nodes (in addition to DNS seeds).
+    /// Bootstrap seed peers.
+    /// Config file: list of HOST:PORT strings (e.g. ["1.2.3.4:9301"]).
+    /// CLI flag: --seed HOST:PORT  (repeat for multiple seeds).
     pub seeds: Vec<String>,
-    /// Maximum peers. Default: 50.
+    /// Maximum connected peers. Default: 50.
     pub max_peers: usize,
 }
 

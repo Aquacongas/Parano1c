@@ -1,16 +1,78 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
-//! noid-cli — Paranoid thin client.
+//! noid-cli — Paranoid full node CLI client.
 //!
-//! Connects to a running `paranoid` daemon via JSON-RPC.
-//! No keys, no crypto — all operations happen in the daemon.
+//! Connects to a running `paranoid` daemon via JSON-RPC (no local keys, no crypto).
+//! All operations happen inside the daemon; the CLI is a thin terminal UI.
+//!
+//! Quick start:
+//!   noid-cli status            — node health at a glance
+//!   noid-cli balance           — wallet balance
+//!   noid-cli send <addr> 10.5  — send 10.5 NOID
+//!   noid-cli help              — full command list
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
+use std::io::{self, Write};
 
-/// μNOID per 1 NOID (6 decimal places).
-const MICRONOID_PER_NOID: f64 = 1_000_000.0;
+// ---------------------------------------------------------------------------
+// ANSI terminal colours (no external crate needed)
+// ---------------------------------------------------------------------------
+
+const RST: &str = "\x1b[0m"; // reset
+const BOLD: &str = "\x1b[1m"; // bold
+const DIM: &str = "\x1b[2m"; // dim
+const RED: &str = "\x1b[31m"; // error
+const GRN: &str = "\x1b[32m"; // success / positive
+const YLW: &str = "\x1b[33m"; // warning
+const CYN: &str = "\x1b[36m"; // label / key
+const WHT: &str = "\x1b[97m"; // bright white value
+
+/// Check whether stdout is a real terminal (disable colours when piped).
+fn is_tty() -> bool {
+    // Simple heuristic: if TERM is set and it's not "dumb", we're likely in a TTY.
+    // This avoids adding libc/isatty dep.
+    std::env::var("TERM").map_or(false, |t| t != "dumb")
+        && !std::env::var("NO_COLOR").is_ok()
+        && !std::env::var("CI").is_ok()
+}
+
+/// Return coloured string only when outputting to a terminal.
+macro_rules! c {
+    ($colour:expr, $text:expr) => {{
+        if is_tty() {
+            format!("{}{}{}", $colour, $text, RST)
+        } else {
+            $text.to_string()
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Units
+// ---------------------------------------------------------------------------
+
+const MICRO_PER_NOID: f64 = 1_000_000.0;
+
+/// Parse a human amount like "10.5" or "0.000001" as NOID → μNOID.
+fn parse_noid_amount(s: &str) -> anyhow::Result<u64> {
+    let noid: f64 = s.parse().with_context(|| {
+        format!("invalid amount {s:?}: expected a number like 10.5 or 0.000001 (in NOID)")
+    })?;
+    if noid < 0.0 {
+        bail!("amount cannot be negative");
+    }
+    Ok((noid * MICRO_PER_NOID).round() as u64)
+}
+
+fn noid_str(micronoid: u64) -> String {
+    format!("{:.6}", micronoid as f64 / MICRO_PER_NOID)
+}
+
+fn fmt_hash(h: &str) -> &str {
+    h.trim_start_matches("0x")
+}
 
 // ---------------------------------------------------------------------------
 // CLI structure
@@ -19,14 +81,41 @@ const MICRONOID_PER_NOID: f64 = 1_000_000.0;
 #[derive(Parser)]
 #[command(
     name = "noid-cli",
-    about = "Paranoid thin client — connects to a running paranoid daemon via JSON-RPC",
+    about = "Paranoid thin client — control a running paranoid daemon",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = None,
+    long_about = "\
+Paranoid thin client. Connects to a running paranoid daemon via JSON-RPC.
+
+QUICK START:
+  noid-cli status              Node info (height, hash, slots)
+  noid-cli balance             Wallet balance
+  noid-cli send <addr> 10.5   Send 10.5 NOID to address
+  noid-cli history             Transaction history
+  noid-cli mempool             Pending transactions
+  noid-cli help                All commands
+
+AMOUNT FORMAT:
+  Amounts are in NOID (e.g. 10.5, 0.000001).
+  1 NOID = 1,000,000 μNOID — the CLI converts automatically.
+
+DAEMON:
+  The daemon must be running: paranoid --mine --data-dir ~/.paranoid",
 )]
 struct Cli {
-    /// JSON-RPC endpoint URL.
-    #[arg(long, default_value = "http://127.0.0.1:9401")]
+    /// JSON-RPC endpoint of the running paranoid daemon.
+    #[arg(
+        long,
+        short = 'r',
+        default_value = "http://127.0.0.1:9401",
+        env = "NOID_RPC",
+        value_name = "URL",
+        global = true
+    )]
     rpc: String,
+
+    /// Output raw JSON (for scripting / piping to jq).
+    #[arg(long, short = 'j', global = true)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Command,
@@ -34,51 +123,132 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    // --- Chain ---
-    /// Chain info: height, best hash, difficulty, active slot count.
+    // ---- Chain ----------------------------------------------------------------
+    /// Node status: height, best hash, difficulty, active UTXOs.
     Status,
-    /// Mempool: pending TX count, fee floor, list of pending TXs.
-    Mempool,
-    /// Gracefully stop the running paranoid daemon.
-    Stop,
 
-    // --- Wallet ---
-    /// Wallet address at key index N (default: 0).
-    Address {
-        #[arg(long, default_value_t = 0)]
+    /// Block details at a given height (hash, time, transactions, miner).
+    #[command(alias = "blk")]
+    Block {
+        /// Block height to query.
+        height: u64,
+    },
+
+    /// Raw block header hex at a given height (for developers / block explorers).
+    Header {
+        /// Block height to query.
+        height: u64,
+    },
+
+    /// Recursive chain proof: height covered, proof size, hash.
+    #[command(alias = "rec")]
+    Proof,
+
+    /// UTXO slot contents: value and owner address.
+    Slot {
+        /// Slot index (0-based).
         index: u32,
     },
-    /// Confirmed balance and UTXO count.
+
+    /// Current epoch anchor hash (needed by wallets to build transactions).
+    #[command(alias = "anchor")]
+    Epoch,
+
+    /// Pending transactions in the mempool (count, fee floor, TX list).
+    Mempool,
+
+    // ---- Wallet ---------------------------------------------------------------
+    /// Show your wallet address (default: key index 0).
+    #[command(alias = "addr")]
+    Address {
+        /// Key derivation index (0 = primary).
+        #[arg(default_value_t = 0)]
+        index: u32,
+    },
+
+    /// Confirmed wallet balance (NOID and μNOID).
+    #[command(alias = "bal")]
     Balance,
-    /// Send μNOID to a recipient address.
+
+    /// List all confirmed UTXOs with slot index, value, and height.
+    #[command(alias = "ls")]
+    Utxos,
+
+    /// Send NOID to a recipient address.
+    ///
+    /// Amount is in NOID (e.g. 10.5 → 10,500,000 μNOID).
+    /// Fee is auto-computed if not specified (recommended).
+    ///
+    /// Examples:
+    ///   noid-cli send f784...b61e 10.5
+    ///   noid-cli send f784...b61e 10.5 --fee 0.01
     Send {
         /// Recipient address (32-byte hex, 64 characters).
+        #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount in μNOID (1 NOID = 1,000,000 μNOID).
-        amount: u64,
-        /// Fee in μNOID. 0 = auto (minimum + current fee floor).
-        #[arg(long, default_value_t = 0)]
-        fee: u64,
+        /// Amount to send in NOID (e.g. 10.5 or 0.000001).
+        #[arg(value_name = "AMOUNT_NOID")]
+        amount: String,
+        /// Transaction fee in NOID. Omit for automatic minimum fee.
+        #[arg(long, value_name = "FEE_NOID")]
+        fee: Option<String>,
     },
-    /// Transaction history.
+
+    /// Transaction history: received and sent transactions.
+    #[command(alias = "hist", alias = "txs")]
     History,
-    /// List all confirmed UTXOs with slot indices and values.
-    Utxos,
-    /// Rescan the full chain state to (re)discover owned UTXOs.
+
+    /// Rescan chain state to (re)discover owned UTXOs.
+    /// Run this if your balance seems wrong or after importing a wallet.
     Scan,
-    /// Export a Merkle inclusion receipt for a confirmed transaction.
+
+    /// Merge small UTXOs into fewer larger ones (lowers future fees).
+    #[command(alias = "merge")]
+    Consolidate {
+        /// Fee per consolidation transaction in NOID. Omit for auto.
+        #[arg(long, value_name = "FEE_NOID")]
+        fee: Option<String>,
+        /// Maximum consolidation rounds (each round = one TX).
+        #[arg(long, default_value_t = 100, value_name = "N")]
+        rounds: u32,
+    },
+
+    /// Export a Merkle payment receipt for a confirmed transaction.
+    /// Redirect output to a file: noid-cli receipt <hash> > receipt.hex
     Receipt {
-        /// Transaction hash (hex).
+        /// Transaction hash (64-char hex).
+        #[arg(value_name = "TX_HASH")]
         txhash: String,
     },
-    /// Merge small UTXOs into fewer larger ones (reduces UTXO count).
-    Consolidate {
-        /// Fee per round in μNOID. 0 = auto.
-        #[arg(long, default_value_t = 0)]
-        fee: u64,
-        /// Maximum consolidation rounds.
-        #[arg(long, default_value_t = 100)]
-        rounds: u32,
+
+    /// Verify a Merkle payment receipt against the canonical chain.
+    #[command(alias = "check")]
+    Verify {
+        /// Receipt bytes as hex string (from 'receipt' command).
+        #[arg(value_name = "RECEIPT_HEX")]
+        receipt: String,
+    },
+
+    // ---- Node control ---------------------------------------------------------
+    /// Gracefully stop the paranoid daemon.
+    Stop,
+
+    // ---- Mining (external miner API) ------------------------------------------
+    /// Get a block template for an external PoW miner.
+    /// Returns the 212-byte header_core as hex — the input to Blake3 PoW.
+    #[command(name = "block-template", alias = "template")]
+    BlockTemplate {
+        /// Coinbase address for this template (hex). Defaults to wallet address.
+        #[arg(long, value_name = "HEX", default_value = "")]
+        miner_addr: String,
+    },
+
+    /// Submit a solved block from an external miner.
+    #[command(name = "submit-block", alias = "submit")]
+    SubmitBlock {
+        /// Solved block as hex (full block bytes with valid nonce).
+        #[arg(value_name = "BLOCK_HEX")]
+        block_hex: String,
     },
 }
 
@@ -87,429 +257,924 @@ enum Command {
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    // Suppress broken-pipe panics: happen when stdout is piped to `head`, etc.
+    // Without this, `noid-cli utxos | head -5` prints a Rust panic traceback.
+    // The payload can be either &str or String depending on the panic site.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg_str = info.payload().downcast_ref::<&str>().copied().unwrap_or("");
+        let msg_string = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if msg_str.contains("Broken pipe") || msg_string.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
 
-    // Reuse a single HTTP client for connection pooling.
+    if let Err(e) = run(cli).await {
+        // Use {:#} to get the full error chain (context: cause: ...)
+        // so print_error can detect "Node is not responding" in any layer.
+        print_error(&format!("{e:#}"));
+        std::process::exit(1);
+    }
+
+    // Flush stdout before exit (avoids broken-pipe on some platforms).
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("noid-cli/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build HTTP client")?;
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
 
-    match cli.cmd {
-        Command::Status => cmd_node_status(&client, &cli.rpc).await?,
-        Command::Mempool => cmd_node_mempool(&client, &cli.rpc).await?,
-        Command::Stop => cmd_node_stop(&client, &cli.rpc).await?,
-        Command::Address { index } => cmd_wallet_address(&client, &cli.rpc, index).await?,
-        Command::Balance => cmd_wallet_balance(&client, &cli.rpc).await?,
-        Command::Send { to, amount, fee } => {
-            cmd_wallet_send(&client, &cli.rpc, &to, amount, fee).await?
-        }
-        Command::History => cmd_wallet_history(&client, &cli.rpc).await?,
-        Command::Utxos => cmd_wallet_utxos(&client, &cli.rpc).await?,
-        Command::Scan => cmd_wallet_scan(&client, &cli.rpc).await?,
-        Command::Receipt { txhash } => cmd_wallet_receipt(&client, &cli.rpc, &txhash).await?,
+    let ctx = Ctx {
+        client: &client,
+        rpc: &cli.rpc,
+        json: cli.json,
+    };
+
+    match &cli.cmd {
+        Command::Status => cmd_status(&ctx).await,
+        Command::Block { height } => cmd_block(&ctx, *height).await,
+        Command::Header { height } => cmd_header(&ctx, *height).await,
+        Command::Proof => cmd_proof(&ctx).await,
+        Command::Slot { index } => cmd_slot(&ctx, *index).await,
+        Command::Epoch => cmd_epoch(&ctx).await,
+        Command::Mempool => cmd_mempool(&ctx).await,
+        Command::Address { index } => cmd_address(&ctx, *index).await,
+        Command::Balance => cmd_balance(&ctx).await,
+        Command::Utxos => cmd_utxos(&ctx).await,
+        Command::Send { to, amount, fee } => cmd_send(&ctx, to, amount, fee.as_deref()).await,
+        Command::History => cmd_history(&ctx).await,
+        Command::Scan => cmd_scan(&ctx).await,
         Command::Consolidate { fee, rounds } => {
-            cmd_wallet_consolidate(&client, &cli.rpc, fee, rounds).await?
+            cmd_consolidate(&ctx, fee.as_deref(), *rounds).await
+        }
+        Command::Receipt { txhash } => cmd_receipt(&ctx, txhash).await,
+        Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
+        Command::Stop => cmd_stop(&ctx).await,
+        Command::BlockTemplate { miner_addr } => cmd_block_template(&ctx, miner_addr).await,
+        Command::SubmitBlock { block_hex } => cmd_submit_block(&ctx, block_hex).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context
+// ---------------------------------------------------------------------------
+
+struct Ctx<'a> {
+    client: &'a reqwest::Client,
+    rpc: &'a str,
+    json: bool,
+}
+
+impl<'a> Ctx<'a> {
+    fn h<'h>(&self, hash: &'h str) -> &'h str {
+        fmt_hash(hash)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+fn print_error(msg: &str) {
+    // Check for common connection errors
+    let human = if msg.contains("Connection refused")
+        || msg.contains("connection refused")
+        || msg.contains("ConnectError")
+        || msg.contains("Node is not responding")
+    {
+        format!(
+            "Node is not responding.\n\
+             Is the paranoid daemon running?  Try: paranoid --mine\n\
+             Default RPC: http://127.0.0.1:9401  (override with --rpc)"
+        )
+    } else if msg.contains("Insufficient") || msg.contains("insufficient") {
+        // Extract amounts from error if possible
+        msg.replace("InsufficientFunds", "Insufficient funds")
+            .replace("_", " ")
+    } else if msg.contains("Bad address")
+        || msg.contains("bad address")
+        || msg.contains("invalid address")
+        || msg.contains("WrongHrp")
+    {
+        format!("Invalid address.\nUse a bech32m address (noid1…) or 64-char hex.\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5")
+    } else {
+        msg.to_string()
+    };
+
+    eprintln!("{} {}", c!(RED, "Error:"), human);
+}
+
+fn section(title: &str) {
+    if is_tty() {
+        println!("{}{}{}", BOLD, title, RST);
+    } else {
+        println!("{title}");
+    }
+}
+
+fn kv(key: &str, val: &str) {
+    if is_tty() {
+        println!("  {}{:<18}{} {}{}{}", CYN, key, RST, WHT, val, RST);
+    } else {
+        println!("  {key:<18} {val}");
+    }
+}
+
+fn kv2(key: &str, main: &str, sub: &str) {
+    if is_tty() {
+        println!(
+            "  {}{:<18}{} {}{}{} {}{}{}",
+            CYN, key, RST, WHT, main, RST, DIM, sub, RST
+        );
+    } else {
+        println!("  {key:<18} {main}  {sub}");
+    }
+}
+
+fn ok_msg(msg: &str) {
+    println!("{} {}", c!(GRN, "✓"), msg);
+}
+
+fn warn_msg(msg: &str) {
+    println!("{} {}", c!(YLW, "⚠"), msg);
+}
+
+fn separator(width: usize) {
+    println!("  {}", c!(DIM, &"─".repeat(width)));
+}
+
+// ---------------------------------------------------------------------------
+// Chain commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let info = rpc(ctx, "getChainInfo", &[])
+        .await
+        .context("getChainInfo")?;
+
+    if ctx.json {
+        return print_json(&info);
+    }
+
+    let height = info["height"].as_u64().unwrap_or(0);
+    let best_hash = info["best_hash"].as_str().unwrap_or("?");
+    let diff = info["difficulty_target"].as_str().unwrap_or("?");
+    let slots = info["active_slot_count"].as_u64().unwrap_or(0);
+    let log_slots = info["log_slots"].as_u64().unwrap_or(0);
+    let capacity = 1u64 << log_slots.min(63);
+    let fill_pct = if capacity > 0 {
+        slots * 100 / capacity
+    } else {
+        0
+    };
+
+    // Count leading zeroes in difficulty target for human difficulty reading.
+    let diff_bits = diff.chars().take_while(|&c| c == '0').count() * 4; // each hex '0' = 4 zero bits
+
+    section("Paranoid node status");
+    kv("Height", &height.to_string());
+    kv("Best hash", &ctx.h(best_hash));
+    kv2(
+        "Difficulty",
+        &format!("{diff_bits} leading zeros"),
+        &format!("(0x{})", &diff[..diff.len().min(16)]),
+    );
+    kv2(
+        "Active UTXOs",
+        &format!("{slots}"),
+        &format!("({fill_pct}% of {capacity} slots, log={log_slots})"),
+    );
+
+    // Also fetch mempool size for quick overview
+    if let Ok(mp) = rpc(ctx, "getMempoolSize", &[]).await {
+        let n = mp.as_u64().unwrap_or(0);
+        kv("Mempool", &format!("{n} pending tx(s)"));
+    }
+
+    Ok(())
+}
+
+async fn cmd_block(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getBlock", &[height.into()])
+        .await
+        .context("getBlock")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    if result.is_null() {
+        warn_msg(&format!(
+            "Block {height} not available (only last 18 blocks are stored)."
+        ));
+        return Ok(());
+    }
+
+    // The block is raw hex — show basic info
+    let hex = result.as_str().unwrap_or("");
+    section(&format!("Block #{height}"));
+    kv(
+        "Hex length",
+        &format!("{} bytes ({} hex chars)", hex.len() / 2, hex.len()),
+    );
+    kv2(
+        "Header (first 276B)",
+        &ctx.h(&hex[..hex.len().min(64)]),
+        "(raw hex)",
+    );
+    println!();
+    println!("  {} Use --json to get the full raw hex.", c!(DIM, "Tip:"));
+
+    Ok(())
+}
+
+async fn cmd_header(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getHeaderByHeight", &[height.into()])
+        .await
+        .context("getHeaderByHeight")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    if result.is_null() {
+        warn_msg(&format!("No header found at height {height}."));
+        return Ok(());
+    }
+
+    // For developers: print the raw hex
+    let hex = result.as_str().unwrap_or("");
+    section(&format!("Block header #{height}"));
+    kv("Size", &format!("{} bytes (276)", hex.len() / 2));
+    println!();
+    // Print in 80-char rows for readability
+    let hex_out = hex;
+    for (i, chunk) in hex_out.as_bytes().chunks(80).enumerate() {
+        let row = std::str::from_utf8(chunk).unwrap_or("");
+        if i == 0 {
+            println!("  {}", row);
+        } else {
+            println!("  {}{}{}", DIM, row, RST);
         }
     }
 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Subcommand handlers
-// ---------------------------------------------------------------------------
+async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getRecursiveProof", &[])
+        .await
+        .context("getRecursiveProof")?;
 
-async fn cmd_node_status(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_getChainInfo",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_getChainInfo")?;
+    if ctx.json {
+        return print_json(&result);
+    }
 
-    let height = result["height"].as_u64().unwrap_or(0);
-    let best_hash = result["best_hash"].as_str().unwrap_or("?");
-    let difficulty = result["difficulty_target"].as_str().unwrap_or("?");
-    let active_slots = result["active_slot_count"].as_u64().unwrap_or(0);
-    let log_slots = result["log_slots"].as_u64().unwrap_or(0);
+    if result.is_null() {
+        warn_msg("No recursive proof available yet. The node is still building it.");
+        println!("  The recursive proof updates every finalized block (~18 blocks behind tip).");
+        return Ok(());
+    }
 
-    println!("node status:");
-    println!("  Height:       {height}");
-    println!("  Best hash:    0x{best_hash}");
-    println!("  Difficulty:   0x{difficulty}");
-    println!("  Active slots: {active_slots}");
-    println!("  Log slots:    {log_slots}");
+    let hex = result.as_str().unwrap_or("");
+    let bytes = hex.len() / 2;
+    let kb = bytes as f64 / 1024.0;
+
+    // Simple fingerprint: first 16 + last 16 chars of the hex
+    let proof_hash = if hex.len() >= 32 {
+        format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
+    } else {
+        hex[..hex.len().min(16)].to_string()
+    };
+
+    section("Recursive chain proof  (O(1) sync)");
+    kv2(
+        "Size",
+        &format!("{bytes} bytes ({kb:.1} KB)"),
+        "(full chain history in one tiny proof)",
+    );
+    kv("Fingerprint", &proof_hash);
+    println!();
+    println!(
+        "  {} Any node can verify the ENTIRE chain history in ~5 ms using this proof.",
+        c!(DIM, "Note:")
+    );
 
     Ok(())
 }
 
-async fn cmd_node_mempool(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_getMempoolInfo",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_getMempoolInfo")?;
+async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getSlot", &[index.into()])
+        .await
+        .context("getSlot")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let empty = result["empty"].as_bool().unwrap_or(true);
+    let value = result["value"].as_u64().unwrap_or(0);
+    let owner = result["owner"].as_str().unwrap_or("?");
+
+    section(&format!("Slot #{index}"));
+    if empty {
+        kv("Status", &c!(DIM, "empty (unspent / available)"));
+    } else {
+        kv("Status", &c!(GRN, "live UTXO"));
+        kv2(
+            "Value",
+            &format!("{} NOID", noid_str(value)),
+            &format!("({value} μNOID)"),
+        );
+        kv("Owner", &ctx.h(owner));
+    }
+
+    Ok(())
+}
+
+async fn cmd_epoch(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getEpochAnchor", &[])
+        .await
+        .context("getEpochAnchor")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let hash = result.as_str().unwrap_or("?");
+    section("Epoch anchor");
+    kv("Hash", &ctx.h(hash));
+    println!();
+    println!(
+        "  {} Wallets use this hash as epoch_anchor when building transaction proofs.",
+        c!(DIM, "Note:")
+    );
+
+    Ok(())
+}
+
+async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getMempoolInfo", &[])
+        .await
+        .context("getMempoolInfo")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
 
     let size = result["size"].as_u64().unwrap_or(0);
     let fee_floor = result["fee_floor"].as_u64().unwrap_or(0);
     let txs = result["txs"].as_array().cloned().unwrap_or_default();
 
-    println!("mempool:");
-    println!("  Pending txs:  {size}");
-    println!(
-        "  Fee floor:    {} NOID ({fee_floor} \u{03bc}NOID)",
-        fee_floor as f64 / MICRONOID_PER_NOID
+    section("Mempool");
+    kv2("Pending", &size.to_string(), "transactions");
+    kv2(
+        "Fee floor",
+        &format!("{} NOID", noid_str(fee_floor)),
+        &format!("({fee_floor} μNOID minimum)"),
     );
+
     if txs.is_empty() {
-        println!("  (empty)");
+        println!();
+        println!("  {}", c!(DIM, "(mempool is empty)"));
+        return Ok(());
+    }
+
+    println!();
+    separator(90);
+    if is_tty() {
+        println!(
+            "  {}{:<20}  {:>12}  {:>3}→{:<3}  {}{}",
+            BOLD, "tx hash", "fee (μNOID)", "in", "out", "ZK", RST
+        );
     } else {
         println!(
-            "  {:<66}  {:>12}  {:>4}  {:>4}  {}",
-            "tx_hash", "fee (\u{03bc}NOID)", "in", "out", "proof"
+            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
+            "tx hash", "fee (μNOID)", "in", "out", "ZK"
         );
-        println!("  {}", "-".repeat(100));
-        for tx in &txs {
-            let hash = tx["tx_hash"].as_str().unwrap_or("?");
-            let fee = tx["fee_micronoid"].as_u64().unwrap_or(0);
-            let nin = tx["n_inputs"].as_u64().unwrap_or(0);
-            let nout = tx["n_outputs"].as_u64().unwrap_or(0);
-            let proof = if tx["has_proof"].as_bool().unwrap_or(false) {
-                "\u{2713}"
-            } else {
-                "\u{00b7}"
-            };
+    }
+    separator(90);
+
+    let show = txs.len().min(20);
+    for tx in txs.iter().take(show) {
+        let hash = tx["tx_hash"].as_str().unwrap_or("?");
+        let fee = tx["fee_micronoid"].as_u64().unwrap_or(0);
+        let nin = tx["n_inputs"].as_u64().unwrap_or(0);
+        let nout = tx["n_outputs"].as_u64().unwrap_or(0);
+        let proof = if tx["has_proof"].as_bool().unwrap_or(false) {
+            c!(GRN, "✓")
+        } else {
+            c!(DIM, "·")
+        };
+        println!(
+            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
+            ctx.h(hash),
+            fee,
+            nin,
+            nout,
+            proof
+        );
+    }
+
+    if txs.len() > show {
+        println!("  {} {} more…", c!(DIM, "...and"), txs.len() - show);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Wallet commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_address(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
+    let result = rpc(ctx, "walletGetAddress", &[index.into()])
+        .await
+        .context("walletGetAddress")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let addr = result.as_str().unwrap_or("?");
+    section(&format!("Wallet address [index={index}]"));
+    // Show full address always (it IS the address — no abbreviation here)
+    if is_tty() {
+        println!("  {}{}{}", BOLD, addr, RST);
+    } else {
+        println!("  {addr}");
+    }
+
+    if index == 0 {
+        println!();
+        println!(
+            "  {} This is your primary receiving address. Share it to receive NOID.",
+            c!(DIM, "↑")
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "walletGetBalance", &[])
+        .await
+        .context("walletGetBalance")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let micro = result["total_micronoid"].as_u64().unwrap_or(0);
+    let utxos = result["utxo_count"].as_u64().unwrap_or(0);
+
+    section("Wallet balance");
+    if is_tty() {
+        println!(
+            "  {}Balance:{} {}{} NOID{} {}({} μNOID){}",
+            CYN,
+            RST,
+            BOLD,
+            noid_str(micro),
+            RST,
+            DIM,
+            micro,
+            RST
+        );
+    } else {
+        println!(
+            "  Balance:           {} NOID  ({micro} μNOID)",
+            noid_str(micro)
+        );
+    }
+    kv("UTXOs", &utxos.to_string());
+
+    if micro == 0 && utxos == 0 {
+        println!();
+        warn_msg("No UTXOs found in wallet cache.");
+        println!(
+            "       Run {} to discover UTXOs from chain state.",
+            c!(BOLD, "'noid-cli scan'")
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "walletListUtxos", &[])
+        .await
+        .context("walletListUtxos")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let utxos = result.as_array().cloned().unwrap_or_default();
+
+    section("Wallet UTXOs");
+
+    if utxos.is_empty() {
+        println!(
+            "  {}",
+            c!(DIM, "(no UTXOs — run 'noid-cli scan' to discover)")
+        );
+        return Ok(());
+    }
+
+    // Compute total
+    let total: u64 = utxos
+        .iter()
+        .map(|u| u["value_micronoid"].as_u64().unwrap_or(0))
+        .sum();
+
+    separator(72);
+    if is_tty() {
+        println!(
+            "  {}{:<8}  {:>14}  {:>7}  {:>9}  {}{}",
+            BOLD, "slot", "NOID", "key", "at block", "address", RST
+        );
+    } else {
+        println!(
+            "  {:<8}  {:>14}  {:>7}  {:>9}  {}",
+            "slot", "NOID", "key", "at block", "address"
+        );
+    }
+    separator(72);
+
+    for u in &utxos {
+        let slot = u["slot_index"].as_u64().unwrap_or(0);
+        let micro = u["value_micronoid"].as_u64().unwrap_or(0);
+        let key = u["key_index"].as_u64().unwrap_or(0);
+        let height = u["confirmed_height"].as_u64().unwrap_or(0);
+        let addr = u["address"].as_str().unwrap_or("?");
+        println!(
+            "  {:<8}  {:>14}  {:>7}  {:>9}  {}",
+            slot,
+            noid_str(micro),
+            key,
+            height,
+            ctx.h(addr)
+        );
+    }
+
+    separator(72);
+    if is_tty() {
+        println!("  {}{:<8}  {:>14}{}", BOLD, "TOTAL", noid_str(total), RST);
+    } else {
+        println!("  {:<8}  {:>14}", "TOTAL", noid_str(total));
+    }
+
+    Ok(())
+}
+
+async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> anyhow::Result<()> {
+    // --- Parse and validate inputs ---
+    let amount_micro =
+        parse_noid_amount(amount).with_context(|| format!("invalid amount {amount:?}"))?;
+
+    if amount_micro == 0 {
+        bail!("Amount cannot be zero.");
+    }
+
+    let fee_micro = match fee {
+        Some(f) => parse_noid_amount(f).with_context(|| format!("invalid fee {f:?}"))?,
+        None => 0, // auto
+    };
+
+    // Validate address — accept bech32m (noid1…) or legacy 64-char hex.
+    // Actual parsing/validation happens in the daemon; we just do a basic
+    // sanity check to catch obvious typos before sending to RPC.
+    let to_clean = to.trim();
+    let looks_like_bech32 = to_clean.to_ascii_lowercase().starts_with("noid1");
+    let looks_like_hex = to_clean.len() == 64 && to_clean.chars().all(|c| c.is_ascii_hexdigit());
+    if !looks_like_bech32 && !looks_like_hex {
+        bail!(
+            "Invalid address format.\n\
+             \tExpected: bech32m address (noid1…) or 64-char hex\n\
+             \tGot:      {:?}\n\
+             \tExample:  noid1q9gnyj0z… or ec7c7a9a4dfff02d… (64 hex chars)",
+            &to_clean[..to_clean.len().min(30)]
+        );
+    }
+
+    // --- Confirm interactively for large amounts ---
+    if amount_micro >= 1_000_000_000 /* 1000 NOID */ && is_tty() {
+        print!(
+            "  {} Send {}{} NOID{} to {}{}{}? [y/N] ",
+            c!(YLW, "⚠"),
+            BOLD,
+            noid_str(amount_micro),
+            RST,
+            CYN,
+            to_clean,
+            RST,
+        );
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("  {}", c!(DIM, "Cancelled."));
+            return Ok(());
+        }
+    }
+
+    // --- Send ---
+    let result = rpc(
+        ctx,
+        "walletSend",
+        &[to_clean.into(), amount_micro.into(), fee_micro.into()],
+    )
+    .await;
+
+    match result {
+        Ok(r) if ctx.json => return print_json(&r),
+        Ok(r) => {
+            let tx_hash = r["tx_hash"].as_str().unwrap_or("?");
+            let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
+            let auto_tag = if fee.is_none() { " (auto)" } else { "" };
+
+            section("Transaction submitted");
+            ok_msg(&format!("TX {}", ctx.h(tx_hash)));
+            println!();
+            kv("To", to_clean);
+            kv2(
+                "Amount",
+                &format!("{} NOID", noid_str(amount_micro)),
+                &format!("({amount_micro} μNOID)"),
+            );
+            kv2(
+                "Fee",
+                &format!("{} NOID", noid_str(actual_fee)),
+                &format!("({actual_fee} μNOID){auto_tag}"),
+            );
+            kv("TX hash", &ctx.h(tx_hash));
+            println!();
             println!(
-                "  0x{:<64}  {:>12}  {:>4}  {:>4}  {}",
-                &hash[..hash.len().min(64)],
-                fee,
-                nin,
-                nout,
-                proof
+                "  {} The transaction is pending. It will confirm in the next block (~60s).",
+                c!(DIM, "⏳")
+            );
+            println!(
+                "  {} Use {} to check your balance after confirmation.",
+                c!(DIM, "Tip:"),
+                c!(BOLD, "'noid-cli balance'")
+            );
+        }
+        Err(e) => {
+            // Re-format common wallet errors into human language
+            let msg = e.to_string();
+            let human = if msg.contains("Insufficient") || msg.contains("insufficient") {
+                // Try to extract amounts
+                format!(
+                    "Insufficient funds.\n\
+                     \t  Requested: {} NOID  ({amount_micro} μNOID)\n\
+                     \t  Run 'noid-cli balance' to check your current balance.",
+                    noid_str(amount_micro)
+                )
+            } else if msg.contains("no UTXO") || msg.contains("no utxo") {
+                "No UTXOs available. Run 'noid-cli scan' to discover your coins.".into()
+            } else if msg.contains("output slot") || msg.contains("SlotConflict") {
+                "Slot conflict: the output slot is occupied. This is transient — retry in a moment."
+                    .into()
+            } else {
+                msg
+            };
+            bail!("{human}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_history(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "walletHistory", &[])
+        .await
+        .context("walletHistory")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let entries = result.as_array().cloned().unwrap_or_default();
+
+    section("Transaction history");
+
+    if entries.is_empty() {
+        println!("  {}", c!(DIM, "(no transactions yet)"));
+        return Ok(());
+    }
+
+    separator(80);
+    if is_tty() {
+        println!(
+            "  {}  {:<7}  {:<8}  {:>14}  {:<20}{}",
+            BOLD, "#", "block", "NOID", "tx hash", RST
+        );
+    } else {
+        println!(
+            "  {:<7}  {:<8}  {:>14}  {:<20}",
+            "#", "block", "NOID", "tx hash"
+        );
+    }
+    separator(80);
+
+    // Compute totals
+    let mut sent: u64 = 0;
+    let mut received: u64 = 0;
+
+    for (i, e) in entries.iter().enumerate() {
+        let height = e["height"].as_u64().unwrap_or(0);
+        let dir = e["direction"].as_str().unwrap_or("?");
+        let micro = e["amount_micronoid"].as_u64().unwrap_or(0);
+        let tx_hash = e["tx_hash"].as_str().unwrap_or("?");
+
+        let (sign, colour) = if dir == "received" {
+            ("+ ", GRN)
+        } else {
+            ("- ", RED)
+        };
+
+        if dir == "sent" {
+            sent += micro;
+        } else {
+            received += micro;
+        }
+
+        let amount_str = format!("{}{} NOID", sign, noid_str(micro));
+
+        if is_tty() {
+            println!(
+                "  {:<7}  {:<8}  {}{:>14}{}  {:<20}",
+                format!("#{}", i + 1),
+                height,
+                colour,
+                amount_str,
+                RST,
+                ctx.h(tx_hash)
+            );
+        } else {
+            println!(
+                "  {:<7}  {:<8}  {:>14}  {:<20}",
+                format!("#{}", i + 1),
+                height,
+                amount_str,
+                ctx.h(tx_hash)
             );
         }
     }
 
-    Ok(())
-}
-
-async fn cmd_node_stop(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    // Best-effort: the server shuts down as soon as the signal fires,
-    // so the response may or may not arrive before the connection closes.
-    match rpc_call(client, rpc_url, "paranoid_stop", serde_json::json!([])).await {
-        Ok(result) => {
-            let msg = result.as_str().unwrap_or("ok");
-            println!("node stop: {msg}");
-        }
-        Err(_) => {
-            // Connection closed before response — that means the daemon
-            // is already shutting down. This is expected.
-            println!("node stop: daemon is shutting down");
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_wallet_address(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    index: u32,
-) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletGetAddress",
-        serde_json::json!([index]),
-    )
-    .await
-    .context("paranoid_walletGetAddress")?;
-
-    let addr = result.as_str().unwrap_or("?");
-
-    println!("wallet address [index={index}]:");
-    println!("  {addr}");
-
-    Ok(())
-}
-
-async fn cmd_wallet_balance(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletGetBalance",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_walletGetBalance")?;
-
-    let micronoid = result["total_micronoid"].as_u64().unwrap_or(0);
-    let utxo_count = result["utxo_count"].as_u64().unwrap_or(0);
-    let noid = micronoid as f64 / MICRONOID_PER_NOID;
-
-    println!("wallet balance:");
-    println!("  Balance: {noid:.6} NOID ({micronoid} μNOID)");
-    println!("  UTXOs:   {utxo_count}");
-    if micronoid == 0 && utxo_count == 0 {
-        println!("  Tip: run 'noid-cli wallet scan' to discover UTXOs from the chain state");
-    }
-
-    Ok(())
-}
-
-async fn cmd_wallet_send(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    to: &str,
-    amount: u64,
-    fee: u64,
-) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletSend",
-        serde_json::json!([to, amount, fee]),
-    )
-    .await
-    .context("paranoid_walletSend")?;
-
-    let tx_hash = result["tx_hash"].as_str().unwrap_or("?");
-    let actual_fee = result["fee_micronoid"].as_u64().unwrap_or(fee);
-    let noid = amount as f64 / MICRONOID_PER_NOID;
-    let fee_noid = actual_fee as f64 / MICRONOID_PER_NOID;
-    let auto_tag = if fee == 0 { " (auto)" } else { "" };
-
-    println!("wallet send:");
-    println!("  Submitted! tx_hash: 0x{tx_hash}");
-    println!("  To:     {to}");
-    println!("  Amount: {noid:.6} NOID ({amount} μNOID)");
-    println!("  Fee:    {fee_noid:.6} NOID ({actual_fee} μNOID){auto_tag}");
-    println!("  Note: TX is pending confirmation in the next block (~60s)");
-
-    Ok(())
-}
-
-async fn cmd_wallet_history(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletHistory",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_walletHistory")?;
-
-    let entries = result.as_array().cloned().unwrap_or_default();
-
-    println!("wallet history:");
-
-    if entries.is_empty() {
-        println!("  (no transactions)");
-        return Ok(());
-    }
-
-    for (i, entry) in entries.iter().enumerate() {
-        let n = i + 1;
-        let height = entry["height"].as_u64().unwrap_or(0);
-        let direction = entry["direction"].as_str().unwrap_or("?");
-        let micronoid = entry["amount_micronoid"].as_u64().unwrap_or(0);
-        let tx_hash = entry["tx_hash"].as_str().unwrap_or("?");
-        let noid = micronoid as f64 / MICRONOID_PER_NOID;
-        let sign = if direction == "sent" { "-" } else { "+" };
-
+    separator(80);
+    if is_tty() {
         println!(
-            "  #{n:<3} height={height:<6} {direction:<8} {sign}{noid:.6} NOID  (tx: 0x{tx_hash})"
+            "  {}  {:<7}  {:<8}  {}{}  {}{}{}",
+            BOLD,
+            "",
+            "",
+            GRN,
+            format!("+ {} NOID received", noid_str(received)),
+            RED,
+            format!("- {} NOID sent", noid_str(sent)),
+            RST
+        );
+    } else {
+        println!(
+            "  total: +{} received  -{} sent",
+            noid_str(received),
+            noid_str(sent)
         );
     }
 
     Ok(())
 }
 
-async fn cmd_wallet_utxos(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletListUtxos",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_walletListUtxos")?;
-
-    let utxos = result.as_array().cloned().unwrap_or_default();
-
-    println!("wallet utxos:");
-
-    if utxos.is_empty() {
-        println!("  (no UTXOs)");
-        return Ok(());
+async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    if is_tty() {
+        eprint!("  Scanning chain state for your UTXOs");
+        io::stderr().flush()?;
     }
 
-    // Header
-    println!(
-        "  {:<6}  {:<14}  {:<7}  {:<8}  {}",
-        "slot", "value (NOID)", "key idx", "height", "address"
-    );
-    println!("  {}", "-".repeat(74));
+    let result = rpc(ctx, "walletScan", &[]).await.context("walletScan")?;
 
-    for utxo in &utxos {
-        let slot = utxo["slot_index"].as_u64().unwrap_or(0);
-        let micronoid = utxo["value_micronoid"].as_u64().unwrap_or(0);
-        let noid = micronoid as f64 / MICRONOID_PER_NOID;
-        let key_index = utxo["key_index"].as_u64().unwrap_or(0);
-        let height = utxo["confirmed_height"].as_u64().unwrap_or(0);
-        let address = utxo["address"].as_str().unwrap_or("?");
-
-        println!("  {slot:<6}  {noid:<14.6}  {key_index:<7}  {height:<8}  {address}");
+    if is_tty() {
+        eprintln!(" done.");
     }
 
-    Ok(())
-}
-
-async fn cmd_wallet_scan(client: &reqwest::Client, rpc_url: &str) -> anyhow::Result<()> {
-    eprintln!("wallet scan: rescanning chain state (this may take a moment)...");
-
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletScan",
-        serde_json::json!([]),
-    )
-    .await
-    .context("paranoid_walletScan")?;
+    if ctx.json {
+        return print_json(&result);
+    }
 
     let found = result["found_utxos"].as_u64().unwrap_or(0);
-    let micronoid = result["balance_micronoid"].as_u64().unwrap_or(0);
-    let noid = micronoid as f64 / MICRONOID_PER_NOID;
+    let micro = result["balance_micronoid"].as_u64().unwrap_or(0);
 
-    println!("wallet scan:");
-    println!("  Found UTXOs: {found}");
-    println!("  Balance:     {noid:.6} NOID ({micronoid} μNOID)");
+    section("Wallet scan complete");
+    ok_msg(&format!("Found {found} UTXO(s)"));
+    kv2(
+        "Balance",
+        &format!("{} NOID", noid_str(micro)),
+        &format!("({micro} μNOID)"),
+    );
 
-    Ok(())
-}
-
-/// Export a receipt for a confirmed transaction and write hex to stdout.
-/// Pipe or redirect to a file as needed: `noid-cli wallet receipt <hash> > receipt.hex`
-async fn cmd_wallet_receipt(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    txhash: &str,
-) -> anyhow::Result<()> {
-    let result = rpc_call(
-        client,
-        rpc_url,
-        "paranoid_walletExportReceipt",
-        serde_json::json!([txhash]),
-    )
-    .await
-    .context("paranoid_walletExportReceipt")?;
-
-    let hex = result
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("daemon returned non-string receipt"))?;
-
-    // Print raw hex to stdout — caller can redirect to a file.
-    println!("{hex}");
+    if found == 0 {
+        println!();
+        warn_msg("No UTXOs found. If you expect a balance, check that you're using the right data directory.");
+    }
 
     Ok(())
 }
 
-async fn cmd_wallet_consolidate(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    fee: u64,
-    rounds: u32,
-) -> anyhow::Result<()> {
-    println!("wallet consolidate: merging small UTXOs (fee={fee} \u{03bc}NOID per round)...");
+async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyhow::Result<()> {
+    let fee_micro = match fee {
+        Some(f) => parse_noid_amount(f).with_context(|| format!("invalid fee {f:?}"))?,
+        None => 0,
+    };
+
+    section("Wallet consolidate");
+    println!("  Merging small UTXOs to reduce UTXO count and lower future fees.");
+    if fee_micro > 0 {
+        println!(
+            "  Fee per round: {} NOID ({fee_micro} μNOID)",
+            noid_str(fee_micro)
+        );
+    } else {
+        println!("  Fee: auto (minimum per round)");
+    }
+    println!();
 
     let mut total_rounds = 0u32;
+
     loop {
         if total_rounds >= rounds {
             println!("  Reached maximum rounds ({rounds}). Run again to continue.");
             break;
         }
 
-        match rpc_call(
-            client,
-            rpc_url,
-            "paranoid_walletConsolidate",
-            serde_json::json!([fee]),
-        )
-        .await
-        {
-            Ok(result) => {
-                let tx_hash = result["tx_hash"].as_str().unwrap_or("?");
+        match rpc(ctx, "walletConsolidate", &[fee_micro.into()]).await {
+            Ok(r) => {
+                let tx_hash = r["tx_hash"].as_str().unwrap_or("?");
                 total_rounds += 1;
-                println!("  Round {total_rounds}: tx submitted 0x{tx_hash}");
+                ok_msg(&format!("Round {total_rounds}: TX {}", ctx.h(tx_hash)));
 
-                // Wait for the TX to be mined and wallet state to update.
-                // 1. Poll mempool until empty (TX confirmed in a block).
-                // 2. Then do a wallet scan to rebuild from authoritative chain state,
-                //    which also clears any stale pending_input_slots.
-                for _wait in 0..60u32 {
+                // Wait for confirmation
+                eprint!("  Waiting for confirmation");
+                io::stderr().flush()?;
+                for _ in 0..120u32 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let mpool_size = rpc_call(
-                        client,
-                        rpc_url,
-                        "paranoid_getMempoolSize",
-                        serde_json::json!([]),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
-                    if mpool_size == 0 {
+                    let mp = rpc(ctx, "getMempoolSize", &[])
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1);
+                    eprint!(".");
+                    io::stderr().flush()?;
+                    if mp == 0 {
                         break;
                     }
                 }
-                // Scan to rebuild wallet from chain state (clears stale pending tracking).
-                let _ = rpc_call(
-                    client,
-                    rpc_url,
-                    "paranoid_walletScan",
-                    serde_json::json!([]),
-                )
-                .await;
+                eprintln!(" confirmed.");
 
-                match rpc_call(
-                    client,
-                    rpc_url,
-                    "paranoid_walletGetBalance",
-                    serde_json::json!([]),
-                )
-                .await
-                {
+                let _ = rpc(ctx, "walletScan", &[]).await;
+
+                match rpc(ctx, "walletGetBalance", &[]).await {
                     Ok(bal) => {
                         let utxo_count = bal["utxo_count"].as_u64().unwrap_or(0);
+                        let micro = bal["total_micronoid"].as_u64().unwrap_or(0);
+                        println!(
+                            "  UTXOs remaining: {utxo_count}  Balance: {} NOID",
+                            noid_str(micro)
+                        );
                         if utxo_count <= 1 {
-                            println!("  Done! UTXO count reduced to {utxo_count}.");
+                            ok_msg("Consolidation complete — wallet has 1 UTXO.");
                             break;
                         }
-                        println!("  UTXOs remaining: {utxo_count}");
                     }
                     Err(_) => {}
                 }
             }
             Err(e) => {
                 let msg = e.to_string();
-                // "InsufficientFunds have=0" means no UTXOs outside pending set.
-                // This is normal when all UTXOs are confirmed in the previous round
-                // and the wallet has only 1-3 UTXOs left (fewer than MAX_INPUTS).
-                // The sleep above prevents this in most cases; if it still happens
-                // it means the wallet is sufficiently consolidated.
-                if msg.contains("InsufficientFunds") || msg.contains("nothing to consolidate") {
+                if msg.contains("InsufficientFunds")
+                    || msg.contains("nothing to consolidate")
+                    || msg.contains("1 or fewer")
+                {
                     if total_rounds == 0 {
-                        println!("  Nothing to consolidate — wallet has too few UTXOs.");
+                        warn_msg("Nothing to consolidate — wallet already has 1 UTXO or no UTXOs.");
                     } else {
-                        println!("  Consolidation complete after {total_rounds} round(s).");
+                        ok_msg(&format!(
+                            "Consolidation complete after {total_rounds} round(s)."
+                        ));
                     }
                 } else {
-                    println!("  Error: {msg}");
+                    bail!("{msg}");
                 }
                 break;
             }
@@ -517,47 +1182,223 @@ async fn cmd_wallet_consolidate(
     }
 
     if total_rounds > 0 {
-        println!("\nTotal rounds: {total_rounds}.");
-        println!("Note: submitted TXs are pending. Run 'wallet balance' after confirmation.");
+        println!();
+        println!(
+            "  {} {} round(s) completed. TXs may still be pending.",
+            c!(DIM, "Total:"),
+            total_rounds
+        );
+        println!(
+            "  {} Run {} after confirmation.",
+            c!(DIM, "Next:"),
+            c!(BOLD, "'noid-cli balance'")
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_receipt(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "walletExportReceipt", &[txhash.into()])
+        .await
+        .context("walletExportReceipt")?;
+
+    let hex = result
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned non-string receipt"))?;
+
+    // Raw hex to stdout so it can be redirected
+    println!("{hex}");
+
+    if is_tty() {
+        // If outputting to terminal, also show a tip
+        eprintln!();
+        eprintln!(
+            "  {} Redirect to a file: noid-cli receipt {} > receipt.hex",
+            c!(DIM, "Tip:"),
+            txhash
+        );
+        eprintln!(
+            "  {} Verify:              noid-cli verify $(cat receipt.hex)",
+            c!(DIM, "Tip:")
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "verifyReceipt", &[receipt.into()])
+        .await
+        .context("verifyReceipt")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let merkle_valid = result["merkle_valid"].as_bool().unwrap_or(false);
+    let canonical = result["canonical"].as_bool().unwrap_or(false);
+    let confirmed = result["confirmed"].as_bool().unwrap_or(false);
+    let error = result["error"].as_str();
+
+    section("Receipt verification");
+
+    if confirmed {
+        ok_msg("Receipt is VALID and canonical.");
+        kv(
+            "Merkle proof",
+            if merkle_valid {
+                "✓ valid"
+            } else {
+                "✗ invalid"
+            },
+        );
+        kv(
+            "On canonical chain",
+            if canonical { "✓ yes" } else { "✗ no" },
+        );
+    } else {
+        let reason = error.unwrap_or("receipt is not confirmed on the canonical chain");
+        print_error(&format!("Receipt INVALID: {reason}"));
+        kv(
+            "Merkle proof",
+            if merkle_valid {
+                "✓ valid"
+            } else {
+                "✗ invalid"
+            },
+        );
+        kv(
+            "On canonical chain",
+            if canonical {
+                "✓ yes"
+            } else {
+                "✗ no (block may have been reorged)"
+            },
+        );
+        bail!("Receipt verification failed");
     }
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// JSON-RPC 2.0 helper
+// Node control
 // ---------------------------------------------------------------------------
 
-/// Send a JSON-RPC 2.0 request and return the `result` field.
-///
-/// Returns an error if the HTTP request fails, the response body cannot be
-/// decoded as JSON, or the response contains a JSON-RPC `error` object.
-async fn rpc_call(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<Value> {
+async fn cmd_stop(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    match rpc(ctx, "stop", &[]).await {
+        Ok(r) => {
+            let msg = r.as_str().unwrap_or("shutting down");
+            ok_msg(&format!("Daemon is {msg}."));
+        }
+        Err(_) => {
+            // Connection dropped = daemon already shutting down (expected)
+            ok_msg("Daemon is shutting down.");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mining commands (external miner API)
+// ---------------------------------------------------------------------------
+
+async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getBlockTemplate", &[miner_addr.into()])
+        .await
+        .context("getBlockTemplate")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let height = result["height"].as_u64().unwrap_or(0);
+    let n_txs = result["n_txs"].as_u64().unwrap_or(0);
+    let header_core = result["header_core_hex"].as_str().unwrap_or("");
+
+    section("Block template");
+    kv("Height", &height.to_string());
+    kv("Txs in block", &n_txs.to_string());
+    kv2(
+        "Header core",
+        &format!("{}…", &header_core[..header_core.len().min(32)]),
+        "(212 bytes, PoW input)",
+    );
+    println!();
+    println!(
+        "  {} Compute Blake3(header_core || nonce) < difficulty_target, then submit.",
+        c!(DIM, "PoW:")
+    );
+    println!("  {} {}", c!(DIM, "Full hex:"), header_core);
+
+    Ok(())
+}
+
+async fn cmd_submit_block(ctx: &Ctx<'_>, block_hex: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "submitBlock", &[block_hex.into()])
+        .await
+        .context("submitBlock")?;
+
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let hash = result.as_str().unwrap_or("?");
+    ok_msg(&format!("Block accepted: {}", ctx.h(hash)));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC transport
+// ---------------------------------------------------------------------------
+
+async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Value> {
+    let method_full = format!("paranoid_{method}");
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id":      1,
-        "method":  method,
+        "method":  method_full,
         "params":  params,
     });
 
-    let resp: Value = client
-        .post(rpc_url)
+    let resp: Value = ctx
+        .client
+        .post(ctx.rpc)
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("HTTP POST {rpc_url} ({method})"))?
+        .map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                anyhow::anyhow!(
+                    "Node is not responding.\n\
+                     \tIs the paranoid daemon running?  Try: paranoid --mine\n\
+                     \tRPC endpoint: {}\n\
+                     \tOverride with --rpc <URL> or NOID_RPC env var",
+                    ctx.rpc
+                )
+            } else {
+                anyhow::anyhow!("HTTP error: {e}")
+            }
+        })?
         .json()
         .await
         .with_context(|| format!("decode JSON-RPC response for {method}"))?;
 
     if let Some(err) = resp.get("error") {
-        anyhow::bail!("RPC error: {err}");
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        bail!("RPC error ({code}): {message}");
     }
 
     Ok(resp["result"].clone())
+}
+
+fn print_json(v: &Value) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
 }

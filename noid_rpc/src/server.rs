@@ -641,15 +641,20 @@ impl ParanoidApiServer for RpcHandler {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_address_hex(hex_str: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
-    if hex_str.is_empty() {
+/// Parse an address from bech32m (`noid1…`) or legacy 64-char hex.
+/// Empty string → zero address (used when no miner address is configured).
+fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
+    if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));
     }
-    let bytes: [u8; 32] = hex::decode(hex_str)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| rpc_err("miner_address must be 32-byte hex or empty"))?;
-    Ok(noid_poseidon2b::primitives::Address(bytes))
+    noid_poseidon2b::primitives::Address::from_str(s)
+        .map_err(|e| rpc_err(format!("invalid address: {e}")))
+}
+
+// Keep old name as alias so existing callers compile unchanged.
+#[inline]
+fn parse_address_hex(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
+    parse_address(s)
 }
 
 // ---------------------------------------------------------------------------

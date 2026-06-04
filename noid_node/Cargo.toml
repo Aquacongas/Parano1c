@@ -44,7 +44,7 @@ anyhow             = { workspace = true }
 thiserror          = { workspace = true }
 
 # CLI
-clap    = { version = "4", features = ["derive"] }
+clap    = { version = "4", features = ["derive", "env"] }
 toml    = "0.8"
 hex     = "0.4"
 
