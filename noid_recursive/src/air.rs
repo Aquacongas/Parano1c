@@ -182,6 +182,29 @@ pub struct RecursiveBlockAir {
 }
 
 impl RecursiveBlockAir {
+    /// Construct the AIR from just the previous accumulator state root.
+    ///
+    /// This is the verifier-side constructor: the verifier only needs the
+    /// `acc_prev_state_root` to pin the accumulator constraint.
+    /// All other `RecursiveBlockWitness` fields are used only for trace
+    /// generation (prover side) and are not needed here.
+    ///
+    /// Use this when verifying a `RecursiveBlockProof` without having the
+    /// full prover witness (e.g. snapshot verification in a light client).
+    pub fn from_prev_state_root(acc_prev_state_root: &[u8; 32]) -> Self {
+        let dummy_witness = RecursiveBlockWitness {
+            block_multipoint_rounds: Vec::new(),
+            block_initial_claim: Block128::ZERO,
+            block_challenges: Vec::new(),
+            rec_multipoint_rounds: Vec::new(),
+            rec_initial_claim: Block128::ZERO,
+            rec_challenges: Vec::new(),
+            acc_prev_state_root: *acc_prev_state_root,
+            acc_new_state_root: [0u8; 32],
+        };
+        Self::new(&dummy_witness)
+    }
+
     /// Construct the AIR from a witness.
     ///
     /// The witness supplies the accumulator state root used to pin

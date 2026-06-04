@@ -71,6 +71,11 @@ pub enum BlockApplyError {
     CoinbaseNotFirst,
     /// Coinbase transaction has non-empty inputs (coinbase must have zero inputs).
     CoinbaseHasInputs,
+    /// Block contains non-coinbase transactions but `proof_transcript_hash` is the
+    /// development stub marker `[1u8; 32]`. Such blocks are produced only by the
+    /// local miner as a fallback when ZK proving fails; they must never be accepted
+    /// from the network. Any block with user transactions MUST carry a real proof hash.
+    StubProofWithUserTxs,
 }
 
 impl From<ApplyError> for BlockApplyError {
@@ -93,6 +98,22 @@ pub fn apply_block(
     }
     if block.header.witness_root == [0u8; 32] {
         return Err(BlockApplyError::MissingWitnessRoot);
+    }
+
+    // SECURITY: Reject blocks that carry user transactions but use the development
+    // stub marker [1u8;32] as proof_transcript_hash.
+    //
+    // The marker is only legal for coinbase-only blocks where there is nothing to
+    // prove. A block with user transactions MUST reference a real ZK transcript
+    // digest. Accepting stub-proof blocks with user transactions would let any node
+    // craft arbitrary UTXOs without a valid proof.
+    //
+    // The stub value [1u8;32] is intentionally distinct from the zero sentinel
+    // [0u8;32] (which is rejected above) so both are caught deterministically.
+    const STUB_MARKER: [u8; 32] = [1u8; 32];
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if has_user_txs && block.header.proof_transcript_hash == STUB_MARKER {
+        return Err(BlockApplyError::StubProofWithUserTxs);
     }
 
     // Coinbase structure: at most one, must be first, zero inputs.
@@ -337,11 +358,22 @@ mod tests {
     /// Build a `BlockHeader` with the correct consensus fields for `snap`
     /// after applying `txs`. Sets a non-zero `proof_transcript_hash` and
     /// `witness_root` to satisfy the non-zero guards in `apply_block`.
+    ///
+    /// NOTE: Uses [0xAA;32] for `proof_transcript_hash` to distinguish from
+    /// the stub marker [1u8;32] (which is now rejected for blocks with user txs).
     fn mk_header(snap: &ChainState, txs: &[Transaction]) -> BlockHeader {
         let mut dry = snap.clone();
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
+        // Check if this block has user transactions
+        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
+        // Use a non-stub hash for user-tx blocks; stub [1u8;32] only for coinbase-only.
+        let proof_transcript_hash = if has_user_txs {
+            [0xAAu8; 32]
+        } else {
+            [1u8; 32]
+        };
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
@@ -351,7 +383,7 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
+            proof_transcript_hash,
             witness_root: [2u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: dry.active_slot_count,
@@ -505,6 +537,57 @@ mod tests {
             apply_block(&mut state, &block),
             Err(BlockApplyError::MissingProofTranscriptHash)
         );
+    }
+
+    #[test]
+    fn apply_block_rejects_stub_proof_with_user_txs() {
+        // SECURITY: Blocks with user transactions MUST NOT use the stub marker [1u8;32].
+        // The stub is only valid for coinbase-only blocks.
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
+        let txs = vec![tx];
+        let mut header = mk_header(&state, &txs);
+        // Force the stub marker (apply_block must reject this)
+        header.proof_transcript_hash = [1u8; 32];
+        let block = Block {
+            header,
+            transactions: txs,
+        };
+        assert_eq!(
+            apply_block(&mut state, &block),
+            Err(BlockApplyError::StubProofWithUserTxs),
+            "block with user txs and stub proof_transcript_hash must be rejected"
+        );
+        // Sanity: state must not be modified on rejection
+        assert_eq!(state.active_slot_count, 0);
+    }
+
+    #[test]
+    fn apply_block_allows_stub_proof_coinbase_only() {
+        // Stub [1u8;32] is valid for coinbase-only blocks (nothing to prove).
+        let mut state = fresh_state();
+        let txs: Vec<Transaction> = vec![]; // empty block (no coinbase in this test)
+        let header = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.state_root(),
+            tx_root: compute_tx_root(&txs),
+            timestamp: 1,
+            height: 1,
+            miner_address: Address([9u8; 32]),
+            nonce: 0,
+            difficulty_target: [0xFFu8; 32],
+            proof_transcript_hash: [1u8; 32], // stub OK for empty/coinbase-only block
+            witness_root: [2u8; 32],
+            log_slots: TEST_LOG_SLOTS as u32,
+            active_slot_count: 0,
+            alloc_counter: 0,
+        };
+        let block = Block {
+            header,
+            transactions: txs,
+        };
+        // Should succeed (no user txs → stub marker is acceptable)
+        apply_block(&mut state, &block).expect("empty block with stub proof should be accepted");
     }
 
     #[test]
@@ -706,6 +789,12 @@ mod tests {
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
+        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
+        let proof_transcript_hash = if has_user_txs {
+            [0xAAu8; 32]
+        } else {
+            [1u8; 32]
+        };
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
@@ -715,7 +804,7 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32],
+            proof_transcript_hash,
             witness_root: [2u8; 32],
             log_slots: new_log_slots as u32,
             active_slot_count: dry.active_slot_count,

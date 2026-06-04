@@ -173,6 +173,7 @@ pub fn validate_block_consensus(
             BlockApplyError::HeaderStateRootMismatch => ConsensusError::BadStateRoot,
             BlockApplyError::HeaderTxRootMismatch => ConsensusError::BadTxRoot,
             BlockApplyError::MissingProofTranscriptHash => ConsensusError::MissingProof,
+            BlockApplyError::StubProofWithUserTxs => ConsensusError::StubProof,
             _ => ConsensusError::ShapeMismatch(format!("{:?}", e)),
         }
     })?;

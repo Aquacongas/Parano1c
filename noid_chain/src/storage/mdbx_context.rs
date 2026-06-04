@@ -743,6 +743,25 @@ impl MdbxChainContext {
             }
         }
 
+        // SECURITY: Verify that the snapshot's segment data matches the tip header's
+        // state_root BEFORE touching in-memory or MDBX state.
+        //
+        // Without this check a malicious peer can send fabricated slot values while
+        // providing valid-looking block headers, completely replacing our state
+        // (Eclipse attack). This mirrors the identical check in restore_from_mdbx().
+        {
+            let tip_hdr = new_tip_header.as_ref().ok_or(MdbxContextError::Corrupt(
+                "snapshot missing tip header in recent_headers: cannot verify state_root",
+            ))?;
+            let computed_root = seg_state.root();
+            if computed_root != tip_hdr.state_root {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot state_root mismatch: segment data does not match \
+                     tip header state_root (possible Eclipse / fabricated-snapshot attack)",
+                ));
+            }
+        }
+
         // 3. Rebuild NullifierSet from nullifier_blocks.
         let null_vecs: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> =
             nullifier_blocks.to_vec();

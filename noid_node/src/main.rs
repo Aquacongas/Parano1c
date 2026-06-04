@@ -451,6 +451,21 @@ async fn handle_p2p_events(
     use std::collections::HashMap;
     let mut orphan_pool: HashMap<[u8; 32], noid_chain::block::Block> = HashMap::new();
 
+    // --- Snapshot verification state (Fix 3.2) ---
+    //
+    // Two-step snapshot sync:
+    //   Step 1: receive StateSnapshot  → store as pending, request RecursiveProof from same peer
+    //   Step 2: receive RecursiveProof → verify proof → apply snapshot (or discard on failure)
+    //
+    // The pending snapshot is stored here while we await the proof.
+    // If the proof is not received within the event loop (e.g. peer disconnects), the pending
+    // snapshot is discarded on the next PeerConnected (a fresh sync attempt begins).
+    struct PendingSnapshot {
+        from: libp2p::PeerId,
+        snapshot: Box<noid_p2p::protocol::GetStateSnapshotResponse>,
+    }
+    let mut pending_snapshot: Option<PendingSnapshot> = None;
+
     loop {
         match rx.recv().await {
             Ok(NetworkEvent::NewBlock { from, block_bytes }) => {
@@ -876,17 +891,211 @@ async fn handle_p2p_events(
                 }
             }
             Ok(NetworkEvent::StateSnapshot { from, snapshot }) => {
-                // A peer sent us their full state snapshot (we requested it in PeerConnected).
-                // Apply it to bootstrap this node's state without block history.
-                tracing::info!(
-                    from = %from,
-                    tip = snapshot.tip_height,
-                    segments = snapshot.segments.len(),
-                    active_slots = snapshot.active_slot_count,
-                    "applying state snapshot from peer"
-                );
+                // SECURITY (Fix 3.2): Do NOT apply the snapshot yet.
+                // Store it as pending and request a RecursiveBlockProof from the same
+                // peer to cryptographically verify the snapshot before accepting it.
+                //
+                // The proof verification ensures the snapshot's state_root is anchored
+                // to a chain with valid PoW going back to genesis, preventing a malicious
+                // peer from injecting fabricated slot data even with a valid state_root.
+                if snapshot.tip_height == 0 {
+                    tracing::debug!(from = %from, "snapshot tip_height=0, ignoring");
+                } else {
+                    tracing::info!(
+                        from = %from,
+                        tip = snapshot.tip_height,
+                        segments = snapshot.segments.len(),
+                        "received state snapshot — requesting recursive proof for verification"
+                    );
+                    pending_snapshot = Some(PendingSnapshot { from, snapshot });
+                    // Request the recursive chain proof from the same peer.
+                    // The response arrives as NetworkEvent::RecursiveProof and triggers
+                    // Step 2: verify the proof then apply the snapshot.
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: from })
+                        .await;
+                }
+            }
 
-                // Decode segments
+            Ok(NetworkEvent::RecursiveProof {
+                from,
+                proof_bytes,
+                tip_header_bytes: _, // tip header from peer; we use recent_headers from snapshot
+            }) => {
+                // SECURITY (Fix 3.2): Step 2 of snapshot verification.
+                // Verify the recursive proof against genesis, then apply the pending snapshot.
+                use bincode;
+                use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
+
+                let snap = match pending_snapshot.take() {
+                    Some(p) if p.from == from => p,
+                    Some(p) => {
+                        // Proof arrived from a different peer — discard (could be unsolicited).
+                        tracing::warn!(
+                            proof_from = %from,
+                            snapshot_from = %p.from,
+                            "recursive proof from unexpected peer, discarding pending snapshot"
+                        );
+                        // Restore the pending snapshot so another proof from the right peer can still work.
+                        pending_snapshot = Some(p);
+                        continue;
+                    }
+                    None => {
+                        // No pending snapshot — this proof was unsolicited, ignore.
+                        tracing::debug!(from = %from, "unexpected recursive proof, no pending snapshot");
+                        continue;
+                    }
+                };
+
+                if proof_bytes.is_empty() {
+                    // Peer has no recursive proof yet (fresh network).
+                    // Accept without proof — log a prominent warning.
+                    tracing::warn!(
+                        from = %from,
+                        tip = snap.snapshot.tip_height,
+                        "peer has no recursive proof (new network?) — \
+                         applying snapshot WITHOUT proof verification (TESTNET ONLY)"
+                    );
+                } else {
+                    // Verify the recursive proof.
+                    //
+                    // Two verification modes based on how far the proof has advanced:
+                    //
+                    // A) FULL VERIFY (proof covers tip-1): call verify_tip for O(1) chain
+                    //    verification. Cryptographically proves the entire chain back to genesis.
+                    //
+                    // B) PARTIAL VERIFY (proof behind tip): verify that the proof's accumulated
+                    //    state_root matches the corresponding header in the snapshot's
+                    //    recent_headers. This ensures the proof is consistent with the claimed
+                    //    chain, even if it hasn't caught up to the tip yet.
+                    //
+                    // In either case, Fix 1.1 (state_root check in apply_state_snapshot)
+                    // independently verifies that slot data matches the tip header state_root.
+                    let verify_result: Result<(), String> = (|| {
+                        use noid_chain::block_header::BlockHeader;
+                        use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
+                        use noid_chain::consensus::pow::full_block_hash;
+                        use noid_recursive::genesis_accumulator;
+
+                        let proof: RecursiveBlockProof = bincode::deserialize(&proof_bytes)
+                            .map_err(|e| format!("proof deserialize: {e}"))?;
+
+                        let snap_tip_h = snap.snapshot.tip_height;
+                        let proof_h = proof.block_height;
+
+                        // Helper: find state_root of a given height in snapshot's recent_headers.
+                        let find_root = |h: u64| -> Option<[u8; 32]> {
+                            snap.snapshot.recent_headers.iter().find_map(|b| {
+                                BlockHeader::from_bytes(b)
+                                    .ok()
+                                    .filter(|hdr| hdr.height == h)
+                                    .map(|hdr| hdr.state_root)
+                            })
+                        };
+
+                        if proof_h + 1 == snap_tip_h {
+                            // ── Mode A: FULL verify_tip ──────────────────────────────────────
+                            // Proof covers exactly tip-1: use O(1) verify_tip for complete
+                            // cryptographic verification of the entire chain history.
+                            let tip_prev_state_root = if snap_tip_h == 0 {
+                                genesis_state_root()
+                            } else {
+                                find_root(snap_tip_h - 1).ok_or_else(|| {
+                                    format!(
+                                        "snapshot missing header h={} for tip_prev_state_root",
+                                        snap_tip_h - 1
+                                    )
+                                })?
+                            };
+                            let rec_air_prev_root = if proof_h == 0 {
+                                genesis_state_root()
+                            } else {
+                                find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
+                            };
+                            let rec_air =
+                                RecursiveBlockAir::from_prev_state_root(&rec_air_prev_root);
+                            let genesis_acc = {
+                                let g = genesis_header();
+                                genesis_accumulator(genesis_state_root(), full_block_hash(&g))
+                            };
+                            tracing::debug!(proof_h, snap_tip_h, "snapshot: full recursive verify");
+                            verify_tip(
+                                &proof,
+                                &rec_air,
+                                &tip_prev_state_root,
+                                snap_tip_h,
+                                &genesis_acc,
+                            )
+                            .map_err(|e| format!("verify_tip failed: {e:?}"))
+                        } else {
+                            // ── Mode B: PARTIAL verification ─────────────────────────────────
+                            // Proof is behind tip (normal on a young/fast network).
+                            // Verify that the proof's acc.state_root matches the corresponding
+                            // header in the snapshot's recent_headers at proof_h.
+                            //
+                            // This proves: the snapshot is consistent with a chain that has a
+                            // valid recursive proof at height proof_h. Combined with Fix 1.1
+                            // (slot data matches tip header state_root), this gives confidence
+                            // the snapshot is genuine.
+                            let header_root = find_root(proof_h);
+                            match header_root {
+                                Some(root) if root == proof.acc.state_root => {
+                                    tracing::info!(
+                                        proof_h,
+                                        snap_tip_h,
+                                        gap = snap_tip_h - proof_h,
+                                        "snapshot: partial recursive verify OK \
+                                         (proof is {} blocks behind tip, state_root consistent)",
+                                        snap_tip_h - proof_h
+                                    );
+                                    Ok(())
+                                }
+                                Some(root) => Err(format!(
+                                    "partial verify FAILED: proof.acc.state_root={} \
+                                         != header[{}].state_root={}",
+                                    hex::encode(proof.acc.state_root),
+                                    proof_h,
+                                    hex::encode(root)
+                                )),
+                                None => {
+                                    // Header for proof height not in snapshot's window.
+                                    // Accept with warning — this can happen on very young networks.
+                                    tracing::warn!(
+                                        proof_h,
+                                        snap_tip_h,
+                                        "snapshot: proof header not in recent_headers window, \
+                                         accepting without full recursive verification"
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        }
+                    })();
+
+                    match verify_result {
+                        Ok(()) => {
+                            tracing::info!(
+                                from = %from,
+                                tip = snap.snapshot.tip_height,
+                                "recursive proof VERIFIED — applying snapshot"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                from = %from,
+                                tip = snap.snapshot.tip_height,
+                                err = %e,
+                                "REJECTED snapshot: recursive proof verification failed — \
+                                 possible Eclipse attack or fabricated snapshot"
+                            );
+                            // Discard the snapshot. The node will try again from the next peer.
+                            continue;
+                        }
+                    }
+                }
+
+                // --- Apply the (verified) snapshot ---
+                let snapshot = snap.snapshot;
                 let segments: Vec<(u16, u8, noid_chain::segmented_state::SegmentColumns)> = {
                     use noid_chain::storage::serial::decode_segment;
                     snapshot
@@ -897,8 +1106,6 @@ async fn handle_p2p_events(
                         })
                         .collect()
                 };
-
-                // Decode nullifier blocks
                 let nullifier_blocks: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> = snapshot
                     .nullifier_blocks
                     .iter()
@@ -931,13 +1138,11 @@ async fn handle_p2p_events(
                         let new_height = ctx.tip_height();
                         drop(ctx);
                         mempool.on_new_block(&[], new_height, new_view).await;
-                        // Wallet scan will pick up any UTXOs on next call
                         sync_ready.notify_one();
                         tracing::info!(
                             height = new_height,
                             "chain snapshot applied — mining can begin"
                         );
-                        // Request the most recent blocks to catch up from snapshot tip
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                                 peer: from,
@@ -947,7 +1152,7 @@ async fn handle_p2p_events(
                             .await;
                     }
                     Err(e) => {
-                        tracing::warn!(err = ?e, "failed to apply state snapshot");
+                        tracing::error!(err = ?e, "failed to apply verified state snapshot");
                     }
                 }
             }

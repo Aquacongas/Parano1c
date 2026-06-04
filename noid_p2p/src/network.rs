@@ -61,6 +61,10 @@ pub enum NetworkCommand {
     /// CURRENT STATE (not block history which is not stored).
     /// Emits `NetworkEvent::StateSnapshot` when the response arrives.
     RequestStateSnapshot { peer: PeerId },
+    /// Request the latest recursive chain proof from a peer.
+    /// Used to cryptographically verify a state snapshot before applying it.
+    /// Emits `NetworkEvent::RecursiveProof` when the response arrives.
+    RequestRecursiveProof { peer: PeerId },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -80,6 +84,16 @@ pub enum NetworkEvent {
     StateSnapshot {
         from: PeerId,
         snapshot: Box<crate::protocol::GetStateSnapshotResponse>,
+    },
+    /// Recursive chain proof received from a peer (response to RequestRecursiveProof).
+    /// Contains serialized `RecursiveBlockProof` bytes and the peer's tip header bytes.
+    /// Used to cryptographically verify a state snapshot before applying it.
+    RecursiveProof {
+        from: PeerId,
+        /// Serialized `RecursiveBlockProof` bytes, or empty if peer has no proof yet.
+        proof_bytes: Vec<u8>,
+        /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
+        tip_header_bytes: Vec<u8>,
     },
     /// A peer connected.
     PeerConnected(PeerId),
@@ -164,6 +178,15 @@ impl P2PNetwork {
         let _ = self
             .cmd_tx
             .send(NetworkCommand::RequestStateSnapshot { peer })
+            .await;
+    }
+
+    /// Request the latest recursive chain proof from a peer.
+    /// The response arrives as `NetworkEvent::RecursiveProof`.
+    pub async fn request_recursive_proof(&self, peer: PeerId) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::RequestRecursiveProof { peer })
             .await;
     }
 
@@ -288,6 +311,13 @@ fn handle_network_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: Network
                 },
             );
             tracing::debug!(peer = %peer, "requesting state snapshot");
+        }
+        NetworkCommand::RequestRecursiveProof { peer } => {
+            let _ = swarm
+                .behaviour_mut()
+                .proof_sync
+                .send_request(&peer, crate::protocol::GetRecursiveProofRequest);
+            tracing::debug!(peer = %peer, "requesting recursive proof for snapshot verification");
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -453,6 +483,27 @@ async fn handle_swarm_event(
                     tip_header_bytes: tip_bytes,
                 },
             );
+        }
+
+        // --- Request-Response: recursive proof client side (our proof request answered) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            let proof_bytes = response.proof_bytes.unwrap_or_default();
+            let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
+            tracing::debug!(
+                from = %peer,
+                proof_len = proof_bytes.len(),
+                "received recursive proof from peer"
+            );
+            let _ = event_tx.send(NetworkEvent::RecursiveProof {
+                from: peer,
+                proof_bytes,
+                tip_header_bytes,
+            });
         }
 
         // --- State snapshot: server side (peer requests full state from us) ---

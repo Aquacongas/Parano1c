@@ -437,16 +437,26 @@ fn run_prove_block(
         })
         .collect();
 
-    // Coinbase-only block or missing bundles: use marker hashes.
-    // prove_block requires at least one non-coinbase witness.
-    if non_cb_count == 0 || bundles.len() != non_cb_count {
+    // Coinbase-only block: no user transactions to prove → marker hashes are legal.
+    // The marker [1u8;32] is accepted by apply_block ONLY when there are no user txs.
+    if non_cb_count == 0 {
         tracing::debug!(
             height = tmpl.inner.height,
-            have = bundles.len(),
-            need = non_cb_count,
-            "skipping ZK prove — using marker proof hashes (native consensus only)"
+            "coinbase-only block — marker proof OK"
         );
         return Ok(([1u8; 32], [1u8; 32], vec![]));
+    }
+
+    // User transactions present but wallet bundles are incomplete.
+    // We CANNOT produce a stub proof for user-tx blocks (rejected by consensus).
+    // Return an error so the miner rebuilds with a coinbase-only template.
+    if bundles.len() != non_cb_count {
+        return Err(format!(
+            "missing WalletProofBundles: have {}, need {} — \
+             cannot produce user-tx block without ZK proofs; will retry coinbase-only",
+            bundles.len(),
+            non_cb_count,
+        ));
     }
 
     // Build witnesses from public tx data + wallet bundles (no SpendSecret).
@@ -472,14 +482,14 @@ fn run_prove_block(
             Ok((transcript_hash, witness_root, proof_bytes))
         }
         Err(noid_block::ProveBlockError::AuthProofInvalid(k)) => {
-            tracing::warn!(
-                tx_index = k,
-                "wallet auth proof invalid — falling back to marker hashes"
-            );
-            // Auth proof mismatch. This can happen if the wallet proved with
-            // a different epoch_anchor or log_slots than the block expects.
-            // Fallback to marker hashes (block still valid via native consensus).
-            Ok(([1u8; 32], [1u8; 32], vec![]))
+            // Auth proof mismatch: wallet proved with a different epoch_anchor or
+            // log_slots. We CANNOT produce a stub proof for user-tx blocks (consensus
+            // rejects [1u8;32] when user txs are present). Return an error so the
+            // miner discards this template and rebuilds coinbase-only.
+            Err(format!(
+                "AuthProofInvalid at tx_index={k}: epoch_anchor or log_slots mismatch — \
+                 discarding template, will rebuild coinbase-only"
+            ))
         }
         Err(e) => Err(format!("{e:?}")),
     }

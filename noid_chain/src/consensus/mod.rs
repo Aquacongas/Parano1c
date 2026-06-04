@@ -106,6 +106,9 @@ pub enum ConsensusError {
     BadLogSlotsExpansion,
     /// §16.16 — `state_root` does not match post-block state.
     BadStateRoot,
+    /// Block carries user transactions with the development stub proof marker [1u8;32].
+    /// User-tx blocks must reference a real ZK transcript digest.
+    StubProof,
     /// Generic shape / length mismatch.
     ShapeMismatch(String),
 }
