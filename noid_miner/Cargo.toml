@@ -13,6 +13,7 @@ noid_tx       = { path = "../noid_tx" }
 noid_stark    = { path = "../noid_stark" }
 noid_mempool  = { path = "../noid_mempool" }
 blake3        = "1"
+hex           = "0.4"
 rayon         = "1"
 tokio         = { workspace = true }
 tracing       = { workspace = true }

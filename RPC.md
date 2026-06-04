@@ -245,9 +245,44 @@ noid-cli status
 noid-cli --json balance | jq .total_noid
 ```
 
-### 3.2 Chain Commands
+### 3.2 All Commands — Quick Reference
+
+| Command | Alias | Description | RPC method |
+|---|---|---|---|
+| `status` | | Chain tip: height, hash, difficulty | `getChainInfo` |
+| `block-hash <H>` | `bh` | Block hash at height H | `getBlockHash` |
+| `block-header <H>` | `bhead` | Decoded block header at height H | `getBlockHeader` |
+| `block <H>` | `blk` | Raw block bytes at H (last 18 only) | `getBlock` |
+| `header <H>` | | Raw 276-byte header hex (for devs) | `getHeaderByHeight` |
+| `proof` | `rec` | Recursive chain proof info | `getRecursiveProof` |
+| `slot <N>` | | UTXO slot by index | `getSlot` |
+| `utxos-of <ADDR>` | | All UTXOs owned by address | `getSlotsByOwner` |
+| `tx <HASH>` | | Confirmed tx info | `getTx` |
+| `is-nullifier <HASH>` | | Check if tx is spent | `isNullifier` |
+| `state` | | State dimensions, fill %, disk size | `getStateInfo` |
+| `mining` | | Difficulty, reward, proof height | `getMiningInfo` |
+| `peers` | | Connected peer count | `getPeerCount` |
+| `estimate-fee [N]` | | Min fee for N outputs (default: 2) | `estimateFee` |
+| `validate <ADDR>` | | Validate & normalise address | `validateAddress` |
+| `epoch` | `anchor` | Epoch anchor hash | `getEpochAnchor` |
+| `mempool` | | Pending txs list | `getMempoolInfo` |
+| `mempool-tx <HASH>` | | Single pending tx | `getMempoolEntry` |
+| `address [N]` | `addr` | Wallet address at key index N | `walletGetAddress` |
+| `balance` | `bal` | Confirmed balance | `walletGetBalance` |
+| `utxos` | `ls` | Own UTXO list | `walletListUtxos` |
+| `send <ADDR> <NOID>` | | Send NOID | `walletSend` |
+| `history` | `hist` `txs` | Tx history | `walletHistory` |
+| `scan` | | Rescan chain state | `walletScan` |
+| `consolidate` | `merge` | Merge small UTXOs | `walletConsolidate` |
+| `receipt <HASH>` | | Export payment receipt | `walletExportReceipt` |
+| `verify <HEX>` | `check` | Verify payment receipt | `verifyReceipt` |
+| `block-template` | `template` | PoW template for external miner | `getBlockTemplate` |
+| `submit-block <HEX>` | `submit` | Submit solved block | `submitBlock` |
+| `stop` | | Stop the daemon | `stop` |
 
 ---
+
+### 3.3 Chain Commands
 
 #### `status`
 Node health at a glance: height, best hash, difficulty, active UTXOs, mempool.
@@ -361,6 +396,214 @@ Empty slot:
 ```
 Slot #9999
   Status             empty (unspent / available)
+```
+
+---
+
+#### `block-hash <HEIGHT>`
+Block hash at a given height. Stored forever.
+
+**Aliases:** `bh`
+
+```bash
+noid-cli block-hash 100
+noid-cli bh 1
+```
+
+```
+Block #100 hash
+  Hash               6e0ba7fbcce8f545468e0397e5cdd49178f62a33818c1d2a3ec1124f4bf93a50
+```
+
+---
+
+#### `block-header <HEIGHT>`
+Decoded block header at a given height — all fields as structured data. Stored forever.
+
+**Aliases:** `bhead`
+
+```bash
+noid-cli block-header 1
+noid-cli --json block-header 1
+```
+
+```
+Block header #1
+  hash               61ffb6fd9eaf7768531e61bda509dad589377d4b87634e5ec61e0cbf56e5aa6e
+  prev_hash          a9919470fdea88430a733a81162a1e41a00c0e084dac890f8e4b1202a3ff9e70
+  height             1
+  timestamp          1780595891
+  miner              noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp
+  state_root         2f4cef857cda723eafd5a5db69e733d3d46868998fe9f36872b051394eafd479
+  tx_root            7b625c2ec238a9f4eeee2db4cd90a1eef0fecb47d10a77544bab6a07105bb15b
+  difficulty_target  ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  active_slot_count  1
+  log_slots          24
+  alloc_counter      1
+```
+
+---
+
+#### `utxos-of <ADDRESS>`
+All live UTXO slots owned by an address. Uses the persistent owner index — O(1) lookup.
+
+```bash
+noid-cli utxos-of noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp
+noid-cli --json utxos-of noid18krueyqyq8um...
+```
+
+```
+UTXOs of noid18krueyqyq8um2f...
+  ──────────────────────────────────────────────────
+  slot                    NOID
+  ──────────────────────────────────────────────────
+  11468800           50.000000
+  11468801           50.000000
+  ──────────────────────────────────────────────────
+  TOTAL             100.000000  (2 UTXOs)
+```
+
+---
+
+#### `tx <TX_HASH>`
+Confirmed transaction info by hash. Uses the permanent tx index (stored forever).
+
+```bash
+noid-cli tx c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+```
+
+```
+Transaction
+  tx_hash    c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+  height     100
+  block_hash f7845242ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+  position   2
+```
+
+If not found: suggests checking `noid-cli mempool-tx <hash>` for pending txs.
+
+---
+
+#### `is-nullifier <TX_HASH>`
+Returns whether a transaction is in the nullifier set (i.e., already spent and cannot be re-submitted).
+
+```bash
+noid-cli is-nullifier c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+```
+
+```
+Nullifier check
+  tx_hash    c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+  status     not spent
+```
+
+---
+
+#### `state`
+UTXO state dimensions: slot space capacity, fill percentage, disk size, headroom until auto-expansion.
+
+```bash
+noid-cli state
+noid-cli --json state
+```
+
+```
+UTXO state
+  Slot space       2^24 = 16777216 slots  (max 2^32)
+  Active UTXOs     239  (0.00% full)
+  Fill             [░░░░░░░░░░░░░░░░░░░░░░|░░░░░░] 0.00%  (| = expand at 75%)
+  Until expand     12582913 slots  (74.99% headroom)
+  State size       768.0 MB
+```
+
+At mainnet scale (log_slots=24, 16M slots): state is **768 MB** on disk.  
+When `fill_pct ≥ 75%` the node automatically doubles the slot space (log_slots → 25).
+
+---
+
+#### `mining`
+Mining and network state: difficulty, block reward, recursive proof height.
+
+```bash
+noid-cli mining
+```
+
+```
+Mining info
+  Height             239
+  Difficulty         24 leading zeros  target: ffffff0000000000...
+  Block reward       50.000000 NOID  (50000000 μNOID)
+  Active UTXOs       239
+  Recursive proof    height 221
+```
+
+---
+
+#### `peers`
+Number of currently connected P2P peers.
+
+```bash
+noid-cli peers
+```
+
+```
+Connected peers
+  Count              3
+```
+
+---
+
+#### `estimate-fee [N_OUTPUTS]`
+Minimum relay fee for a transaction with N outputs (default: 2).
+Formula: `MIN_FEE_BASE(5000) + N × FEE_PER_OUTPUT(2000)` μNOID.
+
+```bash
+noid-cli estimate-fee      # default: 2 outputs
+noid-cli estimate-fee 4   # 4 outputs
+```
+
+```
+Fee estimate (2 outputs)
+  Min fee            0.009000 NOID  (9000 μNOID)
+
+  Formula: MIN_FEE_BASE(5000) + n_outputs × FEE_PER_OUTPUT(2000) μNOID
+```
+
+---
+
+#### `validate <ADDRESS>`
+Validate and normalise an address. Returns the canonical bech32m form.
+Accepts both `noid1...` (bech32m) and 64-char hex.
+
+```bash
+noid-cli validate noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp
+noid-cli validate 3d87cc900401f9b52559be3a7f5e62f87b61f84f7f9c2f95894367a4768e5ebb
+```
+
+```
+Address validation
+✓ Valid address
+  bech32m  noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp
+  hex      3d87cc900401f9b52559be3a7f5e62f87b61f84f7f9c2f95894367a4768e5ebb
+```
+
+---
+
+#### `mempool-tx <TX_HASH>`
+Single pending transaction in the mempool by hash.
+
+```bash
+noid-cli mempool-tx c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+```
+
+```
+Mempool transaction
+  tx_hash            c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1
+  Fee                0.009000 NOID  (9000 μNOID)
+  Inputs             1
+  Outputs            2
+  Admitted at height 237
+  ZK proof           attached
 ```
 
 ---
@@ -921,6 +1164,219 @@ Returns the number of live (non-zero) UTXOs.
 ```json
 {"method": "paranoid_getActiveSlotCount", "params": []}
 // → 1042
+```
+
+---
+
+#### `paranoid_getBlockHash`
+H_BLOCK hash of the block at `height`. Stored forever, fast O(1) lookup.
+
+```json
+{"method": "paranoid_getBlockHash", "params": [100]}
+// → "6e0ba7fbcce8f545468e0397e5cdd49178f62a33818c1d2a3ec1124f4bf93a50"
+// → null  (if height > tip)
+```
+
+---
+
+#### `paranoid_getBlockHeader`
+Decoded block header at `height`. All fields as typed values. Stored forever.
+
+```json
+{"method": "paranoid_getBlockHeader", "params": [1]}
+```
+
+```json
+{
+  "height": 1,
+  "hash": "61ffb6fd9eaf7768531e61bda509dad589377d4b87634e5ec61e0cbf56e5aa6e",
+  "prev_hash": "a9919470fdea88430a733a81162a1e41a00c0e084dac890f8e4b1202a3ff9e70",
+  "state_root": "2f4cef857cda723eafd5a5db69e733d3d46868998fe9f36872b051394eafd479",
+  "tx_root": "7b625c2ec238a9f4eeee2db4cd90a1eef0fecb47d10a77544bab6a07105bb15b",
+  "timestamp": 1780595891,
+  "miner": "noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp",
+  "difficulty_target": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "proof_transcript_hash": "0101010101010101010101010101010101010101010101010101010101010101",
+  "log_slots": 24,
+  "active_slot_count": 1,
+  "alloc_counter": 1
+}
+```
+
+---
+
+#### `paranoid_getSlotsByOwner`
+All live UTXO slots owned by `address` (bech32m or 64-char hex).
+Uses the persistent `T_OWNER_INDEX` table — O(1) lookup.
+
+```json
+{
+  "method": "paranoid_getSlotsByOwner",
+  "params": ["noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp"]
+}
+```
+
+```json
+[
+  { "slot_index": 11468800, "value": 50000000, "owner": "noid18krueyqyq8um...", "empty": false },
+  { "slot_index": 11468801, "value": 50000000, "owner": "noid18krueyqyq8um...", "empty": false }
+]
+```
+
+---
+
+#### `paranoid_getTx`
+Confirmed transaction info by `tx_body_hash`. Uses the permanent `T_TX_INDEX` table.
+Returns `null` if the hash is unknown (not confirmed or never submitted).
+
+```json
+{"method": "paranoid_getTx", "params": ["c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1"]}
+```
+
+```json
+{
+  "tx_hash": "c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1",
+  "height": 100,
+  "block_hash": "f7845242ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1",
+  "tx_position": 2
+}
+```
+
+---
+
+#### `paranoid_isNullifier`
+Returns `true` if `txhash` is in the nullifier set (tx was already spent and cannot be re-submitted).
+
+```json
+{"method": "paranoid_isNullifier", "params": ["c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1"]}
+// → false
+```
+
+---
+
+#### `paranoid_getStateInfo`
+Full UTXO state dimensions, fill metrics, and disk size.
+
+```json
+{"method": "paranoid_getStateInfo", "params": []}
+```
+
+```json
+{
+  "log_slots": 24,
+  "capacity": 16777216,
+  "active_slots": 239,
+  "fill_pct": 0.0,
+  "slots_until_expand": 12582913,
+  "expand_trigger_pct": 75,
+  "log_slots_max": 32,
+  "state_bytes": 805306368,
+  "state_size_human": "768.0 MB"
+}
+```
+
+| Field | Description |
+|---|---|
+| `log_slots` | log₂ of current slot space capacity |
+| `capacity` | total UTXO slots = 2^log_slots |
+| `active_slots` | live (non-empty) UTXO count |
+| `fill_pct` | active / capacity × 100, rounded to 2dp |
+| `slots_until_expand` | slots remaining before 75% trigger fires (negative = already fired) |
+| `expand_trigger_pct` | always 75 (EXPAND_NUM/EXPAND_DENOM × 100) |
+| `log_slots_max` | always 32 (max allowed slot depth) |
+| `state_bytes` | capacity × 48 bytes/slot (value 16B + owner_hi 16B + owner_lo 16B) |
+| `state_size_human` | human-readable size string (e.g. "768.0 MB") |
+
+---
+
+#### `paranoid_getMiningInfo`
+Mining and network state.
+
+```json
+{"method": "paranoid_getMiningInfo", "params": []}
+```
+
+```json
+{
+  "height": 239,
+  "difficulty_bits": 24,
+  "difficulty_target": "ffffff0000000000000000000000000000000000000000000000000000000000",
+  "block_reward_micronoid": 50000000,
+  "block_reward_noid": 50.0,
+  "active_slot_count": 239,
+  "recursive_proof_height": 221
+}
+```
+
+---
+
+#### `paranoid_getPeerCount`
+Number of currently connected P2P peers.
+
+```json
+{"method": "paranoid_getPeerCount", "params": []}
+// → 3
+```
+
+---
+
+#### `paranoid_estimateFee`
+Minimum relay fee in μNOID for a transaction with `n_outputs` outputs.
+Formula: `MIN_FEE_BASE(5000) + n_outputs × FEE_PER_OUTPUT(2000)` μNOID.
+
+```json
+{"method": "paranoid_estimateFee", "params": [2]}
+// → 9000  (= 5000 + 2×2000 μNOID = 0.009 NOID)
+```
+
+---
+
+#### `paranoid_validateAddress`
+Validate and normalise an address. Accepts bech32m (`noid1…`) or 64-char hex.
+
+```json
+{
+  "method": "paranoid_validateAddress",
+  "params": ["noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp"]
+}
+```
+
+```json
+{
+  "valid": true,
+  "bech32": "noid18krueyqyq8um2f2ehca87hnzlpakr7z007wzl9vfgdn6ga5wt6asjkldtp",
+  "hex": "3d87cc900401f9b52559be3a7f5e62f87b61f84f7f9c2f95894367a4768e5ebb",
+  "error": null
+}
+```
+
+Invalid address:
+```json
+{ "valid": false, "bech32": null, "hex": null, "error": "invalid address format (...)" }
+```
+
+---
+
+#### `paranoid_getMempoolEntry`
+Single pending transaction by hash. Returns `null` if not in mempool.
+
+```json
+{
+  "method": "paranoid_getMempoolEntry",
+  "params": ["c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1"]
+}
+```
+
+```json
+{
+  "tx_hash": "c6278428ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1",
+  "fee_micronoid": 9000,
+  "fee_rate": 3000,
+  "n_inputs": 1,
+  "n_outputs": 2,
+  "admitted_height": 237,
+  "has_proof": true
+}
 ```
 
 ---

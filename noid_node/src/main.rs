@@ -110,6 +110,41 @@ struct Cli {
     threads: usize,
 }
 
+/// Resolve a seed string to a libp2p Multiaddr.
+///
+/// Handles three formats:
+///
+/// 1. `HOST:PORT`          — IP or hostname with explicit port  → `/ip4/H/tcp/P` or `/dns4/H/tcp/P`
+/// 2. `hostname`           — bare DNS name (no port)            → `/dns4/hostname/tcp/{default_port}`
+/// 3. `/ip4/.../tcp/...`   — legacy multiaddr, passed through
+///
+/// Format 2 is how DNS seeds work: libp2p resolves the hostname at dial time.
+/// When the seed server goes live the node connects automatically without restart.
+fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
+    // Strip /p2p/<peer-id> suffix if present
+    let base = s.split("/p2p/").next().unwrap_or(s).trim();
+
+    // Already a multiaddr?
+    if base.starts_with('/') {
+        return base
+            .parse()
+            .with_context(|| format!("parse multiaddr: {base}"));
+    }
+
+    // HOST:PORT format
+    if base.contains(':') {
+        return ip_port_to_multiaddr(base);
+    }
+
+    // Bare hostname (DNS seed) — use default network port.
+    // /dns4/ triggers libp2p DNS resolution at dial time, so the node
+    // will connect as soon as the seed goes live.
+    let ma_str = format!("/dns4/{base}/tcp/{default_port}");
+    ma_str
+        .parse()
+        .with_context(|| format!("build dns4 multiaddr for {base:?}"))
+}
+
 /// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
 ///
 /// Users type:  `127.0.0.1:9301`  or  `0.0.0.0:9301`
@@ -156,24 +191,33 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // --- Tracing ---
-    // Suppress noisy libp2p internals that are expected/normal:
-    //   - gossipsub GRAFT on direct peers: normal in <3 peer meshes
-    //   - gossipsub mesh size warnings: normal in small devnets
-    // Users can override with RUST_LOG=libp2p_gossipsub=debug if needed.
+    // Log format: HH:MM:SS LEVEL target: message
+    //
+    // libp2p internal chatter is suppressed by default. Pass --log debug
+    // or RUST_LOG=libp2p=debug to see everything.
     let log_filter = EnvFilter::new(&cli.log)
+        // libp2p internals — suppress unless user asks for debug
+        .add_directive("libp2p_swarm=warn".parse().unwrap_or_default())
+        .add_directive("libp2p_tcp=warn".parse().unwrap_or_default())
+        .add_directive("libp2p_noise=warn".parse().unwrap_or_default())
+        .add_directive("libp2p_yamux=warn".parse().unwrap_or_default())
         .add_directive("libp2p_gossipsub=error".parse().unwrap_or_default())
         .add_directive("libp2p_request_response=warn".parse().unwrap_or_default())
         .add_directive("libp2p_identify=warn".parse().unwrap_or_default())
-        .add_directive("libp2p_ping=warn".parse().unwrap_or_default());
+        .add_directive("libp2p_ping=warn".parse().unwrap_or_default())
+        .add_directive("multiaddr=warn".parse().unwrap_or_default());
+
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
-        .with_target(true)
+        .with_timer(UtcHms) // HH:MM:SS instead of full ISO timestamp
+        .with_target(false) // no module path clutter
         .with_thread_ids(false)
+        .compact() // single-line events
         .init();
 
     // --- Network ---
     let net = NetworkConfig::for_kind(cli.network);
-    tracing::info!(network = %net.kind, "Paranoid node daemon starting");
+    tracing::debug!(network = %net.kind, "daemon starting");
 
     // --- Config file (optional) ---
     let config_path = cli
@@ -213,11 +257,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
 
     // --- Storage ---
-    tracing::info!(path = %data_dir.display(), network = %net.kind, "opening MDBX");
+    tracing::debug!(path = %data_dir.display(), "opening MDBX");
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
     let tip_height = ctx.tip_height();
     let state_root = hex::encode(ctx.tip_header().state_root);
-    tracing::info!(height = tip_height, state_root = %state_root, "chain loaded");
+    tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
     let chain = Arc::new(RwLock::new(ctx));
 
     // Sync-ready notifier: fires when the chain has caught up to peers.
@@ -239,13 +283,13 @@ async fn main() -> anyhow::Result<()> {
     // --- Mempool ---
     let view = ChainView::from_mdbx(&*chain.read().await);
     let mempool = AsyncMempool::new(view, MempoolConfig::default());
-    tracing::info!("mempool ready");
+    tracing::debug!("mempool ready");
 
     // --- Wallet ---
     let wallet_path = data_dir.join("wallet.key");
     let wallet_state = match WalletState::create_or_load(wallet_path) {
         Ok(w) => {
-            tracing::info!(address = %w.primary_address(), "wallet ready");
+            tracing::debug!(address = %w.primary_address(), "wallet ready");
             w
         }
         Err(e) => {
@@ -272,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
     let topics = noid_p2p::protocol::NetworkTopics::for_network_cfg(&net);
     let (p2p, _p2p_task) =
         P2PNetwork::start(listen_addr.clone(), chain.clone(), mempool.clone(), topics);
-    tracing::info!(listen = %listen_addr, network = %net.kind, "P2P started");
+    tracing::debug!(listen = %listen_addr, "P2P started");
 
     // Dial seeds: CLI seeds + config seeds + DNS seeds.
     let all_seeds: Vec<String> = cfg
@@ -283,24 +327,14 @@ async fn main() -> anyhow::Result<()> {
         .chain(net.dns_seeds.iter().map(|s| s.to_string()))
         .collect();
     for seed_addr in &all_seeds {
-        // Accept either HOST:PORT (user-friendly) or /ip4/…/tcp/… (multiaddr).
-        // ip_port_to_multiaddr handles both formats transparently.
-        let ma = ip_port_to_multiaddr(seed_addr).or_else(|_| {
-            // Last resort: try stripping a trailing /p2p/<peer-id> and re-parsing.
-            seed_addr
-                .split("/p2p/")
-                .next()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| ip_port_to_multiaddr(s).ok())
-                .ok_or_else(|| anyhow::anyhow!("unrecognised seed address"))
-        });
+        let ma = seed_to_multiaddr(seed_addr, net.default_p2p_port);
         match ma {
             Ok(addr) => {
-                tracing::info!(addr = %addr, "dialing seed");
+                tracing::debug!(addr = %addr, "dialing seed");
                 p2p.dial(addr).await;
             }
             Err(e) => {
-                tracing::warn!(addr = %seed_addr, err = %e, "cannot parse seed address, skipping");
+                tracing::warn!(addr = %seed_addr, err = %e, "cannot parse seed address");
             }
         }
     }
@@ -309,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
     // Fires sync_ready immediately so the miner starts without waiting for peers.
     // All other nodes sync automatically when they connect to a genesis node.
     if cli.genesis {
-        tracing::info!("-- GENESIS MODE: starting miner immediately (bootstrap node) --");
+        tracing::debug!("genesis mode: firing sync_ready immediately");
         sync_ready.notify_one();
     }
 
@@ -354,11 +388,16 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
-    let (rpc_handle, rpc_stop_rx) =
-        start_rpc_server(rpc_listen, chain.clone(), mempool.clone(), wallet)
-            .await
-            .context("start RPC server")?;
-    tracing::info!(listen = %rpc_listen, "RPC ready");
+    let (rpc_handle, rpc_stop_rx) = start_rpc_server(
+        rpc_listen,
+        chain.clone(),
+        mempool.clone(),
+        wallet,
+        p2p.cmd_tx.clone(),
+    )
+    .await
+    .context("start RPC server")?;
+    tracing::debug!(listen = %rpc_listen, "RPC ready");
 
     // --- Miner (optional) ---
     let miner_handle = if cfg.mining.enabled {
@@ -373,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             parse_address(&cfg.mining.miner_address)?
         };
-        tracing::info!(address = %miner_addr, "miner coinbase address");
+        tracing::debug!(address = %miner_addr, "miner coinbase address");
         let miner_cfg = MinerConfig {
             miner_address: miner_addr,
             pow_threads: cfg.mining.threads,
@@ -396,9 +435,16 @@ async fn main() -> anyhow::Result<()> {
                     Ok(noid_miner::MinerEvent::BlockFound {
                         block_bytes,
                         height,
+                        hash,
+                        n_txs,
                         ..
                     }) => {
-                        tracing::info!(height, "broadcasting found block");
+                        tracing::info!(
+                            height,
+                            hash = %hex::encode(hash),
+                            txs = n_txs,
+                            "broadcast block"
+                        );
                         // Broadcast FIRST — minimises propagation delay to peers.
                         // Wallet update is secondary and must not delay P2P delivery.
                         // This matches Bitcoin's compact-block relay approach:
@@ -423,7 +469,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
         let task = tokio::spawn(async move { miner.run().await });
-        tracing::info!("miner started");
+        tracing::debug!("miner started");
         Some((task, miner_stop, miner_stopped))
     } else {
         None
@@ -435,19 +481,69 @@ async fn main() -> anyhow::Result<()> {
         run_recursive_proof_updater(rec_chain).await;
     });
 
-    tracing::info!(
-        network = %net.kind,
-        p2p = %listen_addr,
-        rpc = %rpc_listen,
-        height = tip_height,
-        "paranoid node running"
-    );
-    if cfg.mining.enabled {
-        tracing::info!("mining: enabled — miner will start after chain sync");
-    } else {
-        tracing::info!("mining: disabled (use --mine to enable)");
+    // --- Startup Banner ---
+    {
+        use noid_chain::consensus::emission::block_reward;
+        use noid_chain::fri_state::LOG_SEGMENT_SIZE;
+
+        let wallet_bech32 = {
+            let g = shared_wallet.lock().unwrap();
+            g.as_ref().map(|w| w.primary_address().to_bech32())
+        };
+        let miner_bech32 = if cfg.mining.enabled {
+            let g = shared_wallet.lock().unwrap();
+            g.as_ref().map(|w| w.primary_address().to_bech32())
+        } else {
+            None
+        };
+        let ctx = chain.read().await;
+        let tip_hdr = ctx.tip_header().clone();
+
+        let log_slots = tip_hdr.log_slots;
+        let active = tip_hdr.active_slot_count;
+        let num_segs = if log_slots as usize > LOG_SEGMENT_SIZE {
+            1usize << (log_slots as usize - LOG_SEGMENT_SIZE)
+        } else {
+            1
+        };
+        let mat_segs = ctx.state.state.active_segment_ids().count();
+        let reward = block_reward(log_slots) as f64 / 1_000_000.0;
+
+        // Get recursive proof height from store
+        let rec_h = ctx
+            .store
+            .get_recursive_proof()
+            .ok()
+            .flatten()
+            .and_then(|b| bincode::deserialize::<noid_recursive::RecursiveBlockProof>(&b).ok())
+            .map(|p| p.block_height);
+        drop(ctx);
+
+        let p2p_display = listen_addr
+            .to_string()
+            .replace("/ip4/", "")
+            .replace("/ip6/", "")
+            .replace("/tcp/", ":");
+
+        print_startup_banner(
+            net.kind.as_str(),
+            cli.genesis,
+            &p2p_display,
+            &rpc_listen.to_string(),
+            tip_height,
+            &tip_hdr.state_root,
+            active,
+            log_slots,
+            mat_segs,
+            num_segs,
+            reward,
+            rec_h,
+            wallet_bech32.as_deref(),
+            cfg.mining.enabled,
+            miner_bech32.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
     }
-    tracing::info!("press Ctrl-C or use 'noid-cli node stop' to shutdown");
 
     // --- Shutdown ---
     // Wait for either Ctrl-C or a `paranoid_stop` RPC call.
@@ -1615,6 +1711,206 @@ async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// HH:MM:SS timer for tracing (UTC, no new deps)
+// ---------------------------------------------------------------------------
+
+/// Compact UTC time formatter: `HH:MM:SS`.
+/// Implements `tracing_subscriber::fmt::time::FormatTime` without the `time`
+/// crate dep by reading `SystemTime` directly.
+struct UtcHms;
+
+impl tracing_subscriber::fmt::time::FormatTime for UtcHms {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        let s = secs % 60;
+        write!(w, "{h:02}:{m:02}:{s:02}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup banner
+// ---------------------------------------------------------------------------
+
+/// Print a startup banner after all components are initialised.
+///
+/// Professional, dense, information-rich. Everything an operator needs
+/// at a glance without being verbose. Uses println! so it is always
+/// visible regardless of --log level.
+#[allow(clippy::too_many_arguments)]
+fn print_startup_banner(
+    net_kind: &str,
+    genesis: bool,
+    p2p_listen: &str,
+    rpc_listen: &str,
+    tip_height: u64,
+    state_root: &[u8; 32],
+    active_slots: u64,
+    log_slots: u32,
+    materialized_segs: usize,
+    total_segs: usize,
+    block_reward_noid: f64,
+    rec_proof_height: Option<u64>,
+    wallet_addr: Option<&str>,
+    mining: bool,
+    coinbase: Option<&str>,
+    version: &str,
+) {
+    // ANSI helpers
+    let is_tty =
+        std::env::var("TERM").map_or(false, |t| t != "dumb") && std::env::var("NO_COLOR").is_err();
+    macro_rules! col {
+        ($c:expr, $s:expr) => {
+            if is_tty {
+                format!("{}{}{}", $c, $s, "\x1b[0m")
+            } else {
+                $s.to_string()
+            }
+        };
+    }
+    let b = |s: &str| col!("\x1b[1m", s);
+    let dim = |s: &str| col!("\x1b[2m", s);
+    let ylw = |s: &str| col!("\x1b[33m", s);
+    let cyn = |s: &str| col!("\x1b[36m", s);
+
+    let w = 76usize;
+    let line = if is_tty {
+        format!("\x1b[2m{}\x1b[0m", "─".repeat(w))
+    } else {
+        "─".repeat(w)
+    };
+
+    // Row helper: left-pad key to 14 chars
+    let row = |key: &str, val: &str| {
+        println!("  {}  {}", cyn(&format!("{key:<13}")), val);
+    };
+
+    // Fill bar for state
+    let capacity = 1u64.checked_shl(log_slots).unwrap_or(u64::MAX);
+    let fill_pct = if capacity > 0 {
+        active_slots as f64 / capacity as f64 * 100.0
+    } else {
+        0.0
+    };
+    let bar_w = 24usize;
+    let filled = ((fill_pct / 100.0) * bar_w as f64).round() as usize;
+    let trigger = ((0.75_f64) * bar_w as f64).round() as usize;
+    let bar: String = (0..bar_w)
+        .map(|i| {
+            if i < filled {
+                '\u{2588}'
+            } else if i == trigger.min(bar_w - 1) {
+                '|'
+            } else {
+                '\u{2591}'
+            }
+        })
+        .collect();
+    let seg_size_bytes = 3u64 * 65536 * 16;
+    let disk_bytes = materialized_segs as u64 * seg_size_bytes;
+    let max_bytes = total_segs as u64 * seg_size_bytes;
+    let hb = |n: u64| -> String {
+        if n >= 1 << 30 {
+            format!("{:.1}GB", n as f64 / (1 << 30) as f64)
+        } else if n >= 1 << 20 {
+            format!("{:.0}MB", n as f64 / (1 << 20) as f64)
+        } else {
+            format!("{:.0}KB", n as f64 / 1024.0)
+        }
+    };
+
+    // Recursive proof lag
+    let rec_str = match rec_proof_height {
+        Some(h) if tip_height > h => format!("h={}  ({} behind)", h, tip_height - h),
+        Some(h) => format!("h={h}  current"),
+        None => "building...".to_string(),
+    };
+
+    println!();
+    println!("{line}");
+    // Title line: name + version + network
+    let title = format!(
+        "PARANOID  {}   {}",
+        b(&format!("v{version}")),
+        dim(&format!(
+            "·  {net_kind}{}",
+            if genesis { "  (genesis mode)" } else { "" }
+        ))
+    );
+    println!("  {}", title);
+    println!("{line}");
+
+    // Network
+    row(
+        "p2p / rpc",
+        &format!("{p2p_listen}   {}", dim(&format!("rpc  {rpc_listen}"))),
+    );
+
+    // Chain
+    row(
+        "chain",
+        &format!(
+            "h={}   state  {}",
+            b(&tip_height.to_string()),
+            dim(&hex::encode(state_root))
+        ),
+    );
+
+    // State
+    row(
+        "state",
+        &format!(
+            "{}/{} slots  {:.2}%  [{}]  {} seg  {} disk  {} max",
+            active_slots,
+            capacity,
+            fill_pct,
+            bar,
+            dim(&format!("{}/{}", materialized_segs, total_segs)),
+            dim(&hb(disk_bytes)),
+            dim(&hb(max_bytes))
+        ),
+    );
+
+    // Wallet
+    if let Some(addr) = wallet_addr {
+        row("wallet", &b(addr));
+    }
+
+    // Mining
+    if mining {
+        let cb = coinbase.unwrap_or_else(|| wallet_addr.unwrap_or("(none)"));
+        row(
+            "mining",
+            &format!(
+                "{reward:.2} NOID/block   coinbase  {cb}",
+                reward = block_reward_noid
+            ),
+        );
+    } else {
+        row("mining", &ylw("disabled"));
+    }
+
+    // Recursive proof
+    row("rec proof", &dim(&rec_str));
+
+    println!("{line}");
+    println!();
+
+    // If state is near expansion threshold, warn the operator
+    if fill_pct >= 70.0 {
+        println!(
+            "  {} state is {fill_pct:.1}% full \u{2014} expansion at 75%",
+            ylw("WARN")
+        );
+        println!();
+    }
+}
 
 fn load_config(path: &PathBuf) -> Option<NodeConfig> {
     let expanded = expand_tilde(path);

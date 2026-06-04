@@ -110,6 +110,104 @@ pub struct WalletSendResult {
     pub fee_micronoid: u64,
 }
 
+/// Decoded block header (structured, not raw bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeaderInfo {
+    pub height: u64,
+    /// H_BLOCK hash of this header (64-char hex).
+    pub hash: String,
+    /// H_BLOCK hash of the parent header.
+    pub prev_hash: String,
+    /// Poseidon2b Merkle root of UTXO state after this block.
+    pub state_root: String,
+    /// Poseidon2b Merkle root of transactions in this block.
+    pub tx_root: String,
+    /// Unix timestamp (seconds).
+    pub timestamp: u64,
+    /// Coinbase recipient address (bech32m).
+    pub miner: String,
+    /// Blake3 PoW difficulty target (64-char hex, LE).
+    pub difficulty_target: String,
+    /// Fiat-Shamir transcript digest of the ZK BlockProof.
+    pub proof_transcript_hash: String,
+    /// log₂ of total UTXO slot space capacity.
+    pub log_slots: u32,
+    /// Live UTXO count after this block.
+    pub active_slot_count: u64,
+    /// Monotonic PRNG seed for coinbase slot allocation.
+    pub alloc_counter: u64,
+}
+
+/// Transaction location info (from the permanent tx index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxInfo {
+    /// Transaction body hash (64-char hex).
+    pub tx_hash: String,
+    /// Block height where this tx was confirmed.
+    pub height: u64,
+    /// H_BLOCK of the confirming block.
+    pub block_hash: String,
+    /// Zero-based position of the tx within the block.
+    pub tx_position: u32,
+}
+
+/// Mining / network status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiningInfo {
+    /// Current tip height.
+    pub height: u64,
+    /// Number of leading zero bits in the current difficulty target.
+    pub difficulty_bits: u32,
+    /// Difficulty target as 64-char hex (LE 256-bit).
+    pub difficulty_target: String,
+    /// Block reward for the next block in μNOID.
+    pub block_reward_micronoid: u64,
+    /// Block reward in NOID.
+    pub block_reward_noid: f64,
+    /// Number of live UTXOs (determines reward via occupancy formula).
+    pub active_slot_count: u64,
+    /// Height covered by the latest recursive chain proof, if available.
+    pub recursive_proof_height: Option<u64>,
+}
+
+/// Current UTXO state dimensions and fill metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateInfo {
+    /// log₂ of total slot capacity. Capacity = 2^log_slots.
+    pub log_slots: u32,
+    /// Total slot space capacity (2^log_slots).
+    pub capacity: u64,
+    /// Live (non-zero) UTXOs.
+    pub active_slots: u64,
+    /// Fill percentage (active / capacity × 100), rounded to 2 decimal places.
+    pub fill_pct: f64,
+    /// Slots remaining before the 75% expansion trigger fires.
+    /// Negative means the trigger has already fired (expansion pending).
+    pub slots_until_expand: i64,
+    /// Expansion trigger threshold in percent (always 75).
+    pub expand_trigger_pct: u8,
+    /// Maximum allowed log_slots (slot space cannot grow beyond 2^log_slots_max).
+    pub log_slots_max: u32,
+    /// Total on-disk segment size for the current state in bytes.
+    /// Formula: capacity × 48 bytes/slot (value 16B + owner_hi 16B + owner_lo 16B).
+    pub state_bytes: u64,
+    /// Human-readable state size (e.g. "768.0 MB").
+    pub state_size_human: String,
+}
+
+/// Result of `validateAddress`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressInfo {
+    /// Whether the address is valid.
+    pub valid: bool,
+    /// Canonical bech32m form (`noid1…`).
+    pub bech32: Option<String>,
+    /// Raw 32-byte payload as hex.
+    pub hex: Option<String>,
+    /// Error message if invalid.
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Conversion helpers
 // ---------------------------------------------------------------------------

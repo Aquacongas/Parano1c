@@ -211,36 +211,29 @@ impl BlockMiner {
             let is_fresh = tip_ts > 0 && now.saturating_sub(tip_ts) < BLOCK_TIME * 3;
 
             if height > 0 && is_fresh {
-                tracing::info!(height, "miner: chain is current, starting immediately");
+                tracing::debug!(height, "miner: chain current, starting");
             } else if height > 0 {
                 let age = now.saturating_sub(tip_ts);
-                tracing::info!(
-                    height,
-                    age_secs = age,
-                    "miner: chain may be stale, waiting for peer sync (max 30s)..."
-                );
+                tracing::info!(height, age_secs = age, "waiting for peer sync (max 30s)");
                 tokio::select! {
                     _ = self.sync_ready.notified() => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::info!(height = h, "miner: sync signal received, starting");
+                        tracing::debug!(height = h, "miner: sync ready, starting");
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::info!(height = h, "miner: sync wait timeout, starting");
+                        tracing::info!(height = h, "miner: sync timeout, starting anyway");
                     }
                 }
             } else {
-                tracing::info!(
-                    "miner: fresh node (height=0) — waiting for state snapshot from peers...\n\
-                     (will start solo mining from genesis after 60s if no peers)"
-                );
+                tracing::info!("waiting for state snapshot from peers (60s max)");
                 tokio::select! {
                     _ = self.sync_ready.notified() => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::info!(height = h, "miner: state synced, starting mining");
+                        tracing::debug!(height = h, "miner: snapshot received, starting");
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        tracing::info!("miner: no peers after 60s, starting solo mining from genesis");
+                        tracing::info!("miner: no peers after 60s, starting from genesis");
                     }
                 }
             }
@@ -252,7 +245,7 @@ impl BlockMiner {
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
 
-        tracing::info!(address = ?addr, "BlockMiner started");
+        tracing::debug!(address = %addr, "BlockMiner started");
 
         loop {
             // Clean shutdown: stop() sets `stopped` permanently; break before
@@ -290,7 +283,10 @@ impl BlockMiner {
                 n_txs,
                 trigger: TemplateRefreshTrigger::Startup,
             });
-            tracing::info!(height, n_txs, "mining template ready");
+            tracing::debug!(height, n_txs, "mining template ready");
+
+            // Track when PoW search started so we can report solve time.
+            let pow_start = std::time::Instant::now();
 
             cancel.store(false, Ordering::Relaxed);
 
@@ -351,13 +347,15 @@ impl BlockMiner {
                             let block = tmpl.seal(sol.nonce, proof_hash, witness_root);
                             let block_bytes = block.to_bytes();
                             let hash = full_block_hash(&block.header);
+                            let elapsed = pow_start.elapsed();
+                            let elapsed_s = elapsed.as_secs_f64();
 
                             tracing::info!(
                                 height,
-                                nonce = sol.nonce,
-                                hash = ?hash,
+                                hash = %hex::encode(hash),
                                 n_txs,
-                                "block found!"
+                                time = %format!("{elapsed_s:.2}s"),
+                                "block found"
                             );
 
                             let _ = self.events.send(MinerEvent::BlockFound {

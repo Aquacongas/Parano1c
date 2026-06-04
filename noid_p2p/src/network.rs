@@ -194,6 +194,13 @@ impl P2PNetwork {
             .await;
     }
 
+    /// Get peer count via an existing command channel (for RPC handler).
+    pub async fn peer_count_via(cmd: &tokio::sync::mpsc::Sender<NetworkCommand>) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = cmd.send(NetworkCommand::PeerCount { reply: tx }).await;
+        rx.await.unwrap_or(0)
+    }
+
     pub async fn peer_count(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
@@ -665,7 +672,8 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::NewListenAddr { address, .. } => {
-            tracing::info!(%address, "P2P listening");
+            // Logged at debug — the startup banner already shows the configured listen address.
+            tracing::debug!(%address, "P2P listening");
         }
 
         _ => {}

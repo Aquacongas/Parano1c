@@ -22,9 +22,9 @@ use noid_miner::template::TemplateBuilder;
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
-    BlockTemplateResponse, ChainInfo, MempoolInfo, MempoolTxInfo, ReceiptVerifyResult, SlotInfo,
-    WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus,
-    WalletUtxoInfo,
+    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MempoolTxInfo,
+    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletBalance,
+    WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 use crate::wallet_ops::WalletOps;
 
@@ -44,6 +44,8 @@ pub struct RpcHandler {
     pub chain: Arc<RwLock<MdbxChainContext>>,
     pub mempool: AsyncMempool,
     pub wallet: Arc<dyn WalletOps + Send + Sync>,
+    /// Channel to the P2P layer for queries (peer count, etc.).
+    pub p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     /// One-shot sender: firing this triggers graceful daemon shutdown
     /// (same effect as Ctrl-C). Wrapped in Mutex so the RPC handler can
     /// take ownership on first call.
@@ -132,10 +134,16 @@ impl ParanoidApiServer for RpcHandler {
             b[16..].copy_from_slice(&sv.owner_lo.0.to_le_bytes());
             b
         };
+        use noid_poseidon2b::primitives::Address;
+        let owner = if empty {
+            String::new()
+        } else {
+            Address(owner_bytes).to_bech32()
+        };
         Ok(SlotInfo {
             slot_index,
             value,
-            owner: hex::encode(owner_bytes),
+            owner,
             empty,
         })
     }
@@ -145,9 +153,173 @@ impl ParanoidApiServer for RpcHandler {
         Ok(chain.state.active_slot_count)
     }
 
+    async fn get_state_info(&self) -> RpcResult<StateInfo> {
+        use noid_chain::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
+        use noid_chain::fri_state::LOG_SEGMENT_SIZE;
+        let chain = self.chain.read().await;
+        let tip = chain.tip_header();
+        let log_slots = tip.log_slots;
+        let active = tip.active_slot_count;
+
+        let capacity = 1u64.checked_shl(log_slots).unwrap_or(u64::MAX);
+
+        // Total number of segments = 2^(log_slots - LOG_SEGMENT_SIZE)
+        // At genesis (log_slots=24, LOG_SEGMENT_SIZE=16): 256 segments.
+        let num_segments = if log_slots as usize > LOG_SEGMENT_SIZE {
+            1usize << (log_slots as usize - LOG_SEGMENT_SIZE)
+        } else {
+            1
+        };
+
+        // Materialized = segments with actual data in RAM (Some(Box<SegmentColumns>)).
+        // Virtual-zero segments (None) hold 0 bytes — they are lazily allocated on first write.
+        // Evicted = materialized on disk (MDBX) but currently paged out of RAM.
+        let materialized_in_ram = chain.state.state.active_segment_ids().count();
+        let evicted_in_mdbx = chain.state.state.evicted_segment_ids().count();
+        // Segments that have any data at all (RAM + disk):
+        // materialized covers active RAM segments; evicted covers paged-out ones.
+        // Together they are the segments with non-zero UTXO data.
+        let nonempty_segments = materialized_in_ram + evicted_in_mdbx;
+
+        // Per-segment on-disk size:
+        //   3 columns (values, owners_hi, owners_lo)
+        //   × 2^LOG_SEGMENT_SIZE slots
+        //   × 16 bytes per Block128
+        // = 3 × 65536 × 16 = 3,145,728 bytes = 3 MB
+        let seg_size_bytes: u64 = 3 * (1u64 << LOG_SEGMENT_SIZE) * 16;
+
+        // Actual current footprint = only segments that have been written.
+        // Virtual-zero segments cost nothing until their first UTXO lands.
+        let state_bytes_ram = (materialized_in_ram as u64).saturating_mul(seg_size_bytes);
+        let state_bytes_disk = (nonempty_segments as u64).saturating_mul(seg_size_bytes);
+        // Theoretical maximum if all slots were filled:
+        let state_bytes_max = (num_segments as u64).saturating_mul(seg_size_bytes);
+
+        let fill_pct = if capacity > 0 {
+            (active as f64 / capacity as f64 * 10000.0).round() / 100.0
+        } else {
+            0.0
+        };
+
+        let trigger_slots = capacity
+            .saturating_mul(EXPAND_NUM)
+            .checked_div(EXPAND_DENOM)
+            .unwrap_or(0);
+        let slots_until_expand = trigger_slots as i64 - active as i64;
+
+        Ok(StateInfo {
+            log_slots,
+            capacity,
+            active_slots: active,
+            fill_pct,
+            slots_until_expand,
+            expand_trigger_pct: (EXPAND_NUM * 100 / EXPAND_DENOM) as u8,
+            log_slots_max: LOG_SLOTS_MAX,
+            // Real current size (non-zero segments only)
+            state_bytes: state_bytes_disk,
+            state_size_human: format!(
+                "{} RAM  /  {} disk  /  {} max",
+                human_bytes(state_bytes_ram),
+                human_bytes(state_bytes_disk),
+                human_bytes(state_bytes_max),
+            ),
+        })
+    }
+
     // -----------------------------------------------------------------------
-    // Recent blocks (last 18 only)
+    // New chain methods
     // -----------------------------------------------------------------------
+
+    async fn get_block_hash(&self, height: u64) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
+        match chain.get_header_from_store(height) {
+            Ok(Some(hdr)) => Ok(Some(hex::encode(full_block_hash(&hdr)))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    async fn get_block_header(&self, height: u64) -> RpcResult<Option<BlockHeaderInfo>> {
+        use noid_poseidon2b::primitives::Address;
+        let chain = self.chain.read().await;
+        match chain.get_header_from_store(height) {
+            Ok(Some(hdr)) => {
+                let hash = full_block_hash(&hdr);
+                Ok(Some(BlockHeaderInfo {
+                    height: hdr.height,
+                    hash: hex::encode(hash),
+                    prev_hash: hex::encode(hdr.prev_block_hash),
+                    state_root: hex::encode(hdr.state_root),
+                    tx_root: hex::encode(hdr.tx_root),
+                    timestamp: hdr.timestamp,
+                    miner: Address(hdr.miner_address.0).to_bech32(),
+                    difficulty_target: hex::encode(hdr.difficulty_target),
+                    proof_transcript_hash: hex::encode(hdr.proof_transcript_hash),
+                    log_slots: hdr.log_slots,
+                    active_slot_count: hdr.active_slot_count,
+                    alloc_counter: hdr.alloc_counter,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    async fn get_slots_by_owner(&self, address: String) -> RpcResult<Vec<SlotInfo>> {
+        use noid_poseidon2b::primitives::Address;
+        let addr =
+            Address::from_str(&address).map_err(|e| rpc_err(format!("invalid address: {e}")))?;
+        let chain = self.chain.read().await;
+        let utxos = chain
+            .store
+            .get_utxos_by_owner(&addr.0)
+            .map_err(|e| rpc_err(e.to_string()))?;
+        Ok(utxos
+            .into_iter()
+            .map(|(slot_index, value)| SlotInfo {
+                slot_index,
+                value,
+                owner: address.clone(),
+                empty: false,
+            })
+            .collect())
+    }
+
+    async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>> {
+        let hash_bytes: [u8; 32] = hex::decode(&txhash)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let chain = self.chain.read().await;
+        match chain.store.get_tx_index(&hash_bytes) {
+            Ok(Some((height, tx_position))) => {
+                let block_hash = chain
+                    .get_header_from_store(height)
+                    .ok()
+                    .flatten()
+                    .map(|h| hex::encode(full_block_hash(&h)))
+                    .unwrap_or_default();
+                Ok(Some(TxInfo {
+                    tx_hash: txhash,
+                    height,
+                    block_hash,
+                    tx_position,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    async fn is_nullifier(&self, txhash: String) -> RpcResult<bool> {
+        use noid_poseidon2b::primitives::TxBodyHash;
+        let hash_bytes: [u8; 32] = hex::decode(&txhash)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let chain = self.chain.read().await;
+        Ok(chain.nullifiers.contains(&TxBodyHash(hash_bytes)))
+    }
 
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
@@ -155,6 +327,73 @@ impl ParanoidApiServer for RpcHandler {
             Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
             Ok(None) => Ok(None),
             Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mining / network info
+    // -----------------------------------------------------------------------
+
+    async fn get_mining_info(&self) -> RpcResult<MiningInfo> {
+        use noid_chain::consensus::emission::block_reward;
+        let chain = self.chain.read().await;
+        let tip = chain.tip_header();
+        let height = chain.tip_height();
+        let diff = tip.difficulty_target;
+        // Count leading zero bits (each leading hex '0' = 4 bits).
+        let diff_bits = diff.iter().rev().fold(0u32, |zeros, &b| {
+            if zeros % 8 == 0 && b == 0 {
+                zeros + 8
+            } else if zeros % 8 == 0 {
+                zeros + b.leading_zeros()
+            } else {
+                zeros
+            }
+        });
+        let reward = block_reward(tip.log_slots);
+        let rec_height = chain
+            .store
+            .get_recursive_proof()
+            .ok()
+            .flatten()
+            .and_then(|b| bincode::deserialize::<noid_recursive::RecursiveBlockProof>(&b).ok())
+            .map(|p| p.block_height);
+        Ok(MiningInfo {
+            height,
+            difficulty_bits: diff_bits,
+            difficulty_target: hex::encode(diff),
+            block_reward_micronoid: reward,
+            block_reward_noid: reward as f64 / 1_000_000.0,
+            active_slot_count: tip.active_slot_count,
+            recursive_proof_height: rec_height,
+        })
+    }
+
+    async fn get_peer_count(&self) -> RpcResult<usize> {
+        let count = noid_p2p::P2PNetwork::peer_count_via(&self.p2p_cmd).await;
+        Ok(count)
+    }
+
+    async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
+        use noid_chain::consensus::params::min_fee;
+        Ok(min_fee(n_outputs as u64))
+    }
+
+    async fn validate_address(&self, address: String) -> RpcResult<AddressInfo> {
+        use noid_poseidon2b::primitives::Address;
+        match Address::from_str(&address) {
+            Ok(addr) => Ok(AddressInfo {
+                valid: true,
+                bech32: Some(addr.to_bech32()),
+                hex: Some(hex::encode(addr.0)),
+                error: None,
+            }),
+            Err(e) => Ok(AddressInfo {
+                valid: false,
+                bech32: None,
+                hex: None,
+                error: Some(e.to_string()),
+            }),
         }
     }
 
@@ -209,6 +448,31 @@ impl ParanoidApiServer for RpcHandler {
             .await
             .map_err(|e| rpc_err(e.to_string()))?;
         Ok(hex::encode(hash.0))
+    }
+
+    async fn get_mempool_size(&self) -> RpcResult<usize> {
+        Ok(self.mempool.len().await)
+    }
+
+    async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
+        let entries = self.mempool.get_all_entries().await;
+        let found = entries
+            .into_iter()
+            .find(|e| hex::encode(e.tx.tx_body_hash.0) == txhash);
+        Ok(found.map(|e| MempoolTxInfo {
+            tx_hash: hex::encode(e.tx.tx_body_hash.0),
+            fee_micronoid: e.tx.body.fee.min(u64::MAX as u128) as u64,
+            fee_rate: {
+                let slots = (e.tx.body.inputs.iter().filter(|i| i.valid).count()
+                    + e.tx.body.outputs.iter().filter(|o| o.valid).count())
+                .max(1);
+                (e.tx.body.fee as u64) / slots as u64
+            },
+            n_inputs: e.tx.body.inputs.iter().filter(|i| i.valid).count(),
+            n_outputs: e.tx.body.outputs.iter().filter(|o| o.valid).count(),
+            admitted_height: e.admitted_height,
+            has_proof: e.cached_algebraic_proof.is_some(),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -630,16 +894,26 @@ impl ParanoidApiServer for RpcHandler {
             txs,
         })
     }
-
-    async fn get_mempool_size(&self) -> RpcResult<usize> {
-        let size = self.mempool.len().await;
-        Ok(size)
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 /// Parse an address from bech32m (`noid1…`) or legacy 64-char hex.
 /// Empty string → zero address (used when no miner address is configured).
@@ -671,6 +945,7 @@ pub async fn start_rpc_server(
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
+    p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -682,10 +957,11 @@ pub async fn start_rpc_server(
         chain,
         mempool,
         wallet,
+        p2p_cmd,
         stop_tx,
     };
     let server = Server::builder().build(listen).await?;
     let handle = server.start(handler.into_rpc());
-    tracing::info!(%listen, "RPC server started");
+    tracing::debug!(%listen, "RPC server started");
     Ok((handle, stop_rx))
 }

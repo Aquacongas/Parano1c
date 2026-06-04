@@ -127,35 +127,104 @@ enum Command {
     /// Node status: height, best hash, difficulty, active UTXOs.
     Status,
 
-    /// Block details at a given height (hash, time, transactions, miner).
+    /// Block hash at a given height.
+    #[command(name = "block-hash", alias = "bh")]
+    BlockHash {
+        /// Block height.
+        height: u64,
+    },
+
+    /// Decoded block header at a given height (all fields as structured data).
+    #[command(name = "block-header", alias = "bhead")]
+    BlockHeader {
+        /// Block height.
+        height: u64,
+    },
+
+    /// Full raw block at a given height (last 18 blocks only).
     #[command(alias = "blk")]
     Block {
         /// Block height to query.
         height: u64,
     },
 
-    /// Raw block header hex at a given height (for developers / block explorers).
+    /// Raw 276-byte block header hex (for developers).
     Header {
         /// Block height to query.
         height: u64,
     },
 
-    /// Recursive chain proof: height covered, proof size, hash.
+    /// Recursive chain proof: height covered, proof size.
     #[command(alias = "rec")]
     Proof,
 
-    /// UTXO slot contents: value and owner address.
+    /// UTXO slot by index: value and owner.
     Slot {
         /// Slot index (0-based).
         index: u32,
+    },
+
+    /// All UTXOs owned by an address (bech32m or hex).
+    #[command(name = "utxos-of")]
+    UtxosOf {
+        /// Owner address (bech32m noid1… or 64-char hex).
+        #[arg(value_name = "ADDRESS")]
+        address: String,
+    },
+
+    /// Confirmed transaction info by hash.
+    Tx {
+        /// Transaction body hash (64-char hex).
+        #[arg(value_name = "TX_HASH")]
+        txhash: String,
+    },
+
+    /// Check if a transaction hash is in the nullifier set (i.e. spent).
+    #[command(name = "is-nullifier")]
+    IsNullifier {
+        /// Transaction body hash (64-char hex).
+        #[arg(value_name = "TX_HASH")]
+        txhash: String,
+    },
+
+    /// UTXO state dimensions: capacity, fill %, size on disk, expansion headroom.
+    State,
+
+    /// Mining info: difficulty, block reward, recursive proof height.
+    Mining,
+
+    /// Number of connected peers.
+    Peers,
+
+    /// Estimate minimum relay fee for N outputs.
+    #[command(name = "estimate-fee")]
+    EstimateFee {
+        /// Number of outputs in the transaction (default: 2).
+        #[arg(default_value_t = 2)]
+        n_outputs: u32,
+    },
+
+    /// Validate an address and show its canonical bech32m form.
+    Validate {
+        /// Address to validate (bech32m or hex).
+        #[arg(value_name = "ADDRESS")]
+        address: String,
     },
 
     /// Current epoch anchor hash (needed by wallets to build transactions).
     #[command(alias = "anchor")]
     Epoch,
 
-    /// Pending transactions in the mempool (count, fee floor, TX list).
+    /// Pending transactions in the mempool.
     Mempool,
+
+    /// Single pending transaction by hash.
+    #[command(name = "mempool-tx")]
+    MempoolTx {
+        /// Transaction body hash (64-char hex).
+        #[arg(value_name = "TX_HASH")]
+        txhash: String,
+    },
 
     // ---- Wallet ---------------------------------------------------------------
     /// Show your wallet address (default: key index 0).
@@ -302,12 +371,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match &cli.cmd {
         Command::Status => cmd_status(&ctx).await,
+        Command::BlockHash { height } => cmd_block_hash(&ctx, *height).await,
+        Command::BlockHeader { height } => cmd_block_header(&ctx, *height).await,
         Command::Block { height } => cmd_block(&ctx, *height).await,
         Command::Header { height } => cmd_header(&ctx, *height).await,
         Command::Proof => cmd_proof(&ctx).await,
         Command::Slot { index } => cmd_slot(&ctx, *index).await,
+        Command::UtxosOf { address } => cmd_utxos_of(&ctx, address).await,
+        Command::Tx { txhash } => cmd_tx(&ctx, txhash).await,
+        Command::IsNullifier { txhash } => cmd_is_nullifier(&ctx, txhash).await,
+        Command::State => cmd_state(&ctx).await,
+        Command::Mining => cmd_mining(&ctx).await,
+        Command::Peers => cmd_peers(&ctx).await,
+        Command::EstimateFee { n_outputs } => cmd_estimate_fee(&ctx, *n_outputs).await,
+        Command::Validate { address } => cmd_validate(&ctx, address).await,
         Command::Epoch => cmd_epoch(&ctx).await,
         Command::Mempool => cmd_mempool(&ctx).await,
+        Command::MempoolTx { txhash } => cmd_mempool_tx(&ctx, txhash).await,
         Command::Address { index } => cmd_address(&ctx, *index).await,
         Command::Balance => cmd_balance(&ctx).await,
         Command::Utxos => cmd_utxos(&ctx).await,
@@ -599,6 +679,361 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
         kv("Owner", &ctx.h(owner));
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// New chain commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_block_hash(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getBlockHash", &[height.into()])
+        .await
+        .context("getBlockHash")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    match result.as_str() {
+        Some(hash) => {
+            section(&format!("Block #{height} hash"));
+            kv("Hash", hash);
+        }
+        None => warn_msg(&format!("Block {height} not found")),
+    }
+    Ok(())
+}
+
+async fn cmd_block_header(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getBlockHeader", &[height.into()])
+        .await
+        .context("getBlockHeader")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    if result.is_null() {
+        warn_msg(&format!("Block {height} not found"));
+        return Ok(());
+    }
+    section(&format!("Block header #{height}"));
+    kv("hash", result["hash"].as_str().unwrap_or("?"));
+    kv("prev_hash", result["prev_hash"].as_str().unwrap_or("?"));
+    kv(
+        "height",
+        &result["height"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv(
+        "timestamp",
+        &result["timestamp"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv("miner", result["miner"].as_str().unwrap_or("?"));
+    kv("state_root", result["state_root"].as_str().unwrap_or("?"));
+    kv("tx_root", result["tx_root"].as_str().unwrap_or("?"));
+    kv(
+        "difficulty_target",
+        result["difficulty_target"].as_str().unwrap_or("?"),
+    );
+    kv(
+        "active_slot_count",
+        &result["active_slot_count"]
+            .as_u64()
+            .unwrap_or(0)
+            .to_string(),
+    );
+    kv(
+        "log_slots",
+        &result["log_slots"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv(
+        "alloc_counter",
+        &result["alloc_counter"].as_u64().unwrap_or(0).to_string(),
+    );
+    Ok(())
+}
+
+async fn cmd_utxos_of(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getSlotsByOwner", &[address.into()])
+        .await
+        .context("getSlotsByOwner")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let slots = result.as_array().cloned().unwrap_or_default();
+    section(&format!("UTXOs of {address}"));
+    if slots.is_empty() {
+        println!("  {}", c!(DIM, "(no UTXOs found for this address)"));
+        return Ok(());
+    }
+    let total: u64 = slots.iter().map(|s| s["value"].as_u64().unwrap_or(0)).sum();
+    separator(50);
+    println!("  {:<12}  {:>14}", "slot", "NOID");
+    separator(50);
+    for s in &slots {
+        let slot = s["slot_index"].as_u64().unwrap_or(0);
+        let value = s["value"].as_u64().unwrap_or(0);
+        println!("  {:<12}  {:>14}", slot, noid_str(value));
+    }
+    separator(50);
+    println!(
+        "  {:<12}  {:>14}  ({} UTXOs)",
+        "TOTAL",
+        noid_str(total),
+        slots.len()
+    );
+    Ok(())
+}
+
+async fn cmd_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getTx", &[txhash.into()]).await.context("getTx")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    if result.is_null() {
+        warn_msg(&format!("Transaction {txhash} not found (not confirmed)"));
+        println!("  Use 'noid-cli mempool-tx {txhash}' to check if it is pending.");
+        return Ok(());
+    }
+    section("Transaction");
+    kv("tx_hash", result["tx_hash"].as_str().unwrap_or("?"));
+    kv(
+        "height",
+        &result["height"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv("block_hash", result["block_hash"].as_str().unwrap_or("?"));
+    kv(
+        "position",
+        &result["tx_position"].as_u64().unwrap_or(0).to_string(),
+    );
+    Ok(())
+}
+
+async fn cmd_is_nullifier(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "isNullifier", &[txhash.into()])
+        .await
+        .context("isNullifier")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let spent = result.as_bool().unwrap_or(false);
+    section("Nullifier check");
+    kv("tx_hash", txhash);
+    if spent {
+        kv("status", &c!(YLW, "spent (in nullifier set)"));
+    } else {
+        kv("status", &c!(GRN, "not spent"));
+    }
+    Ok(())
+}
+
+async fn cmd_state(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getStateInfo", &[])
+        .await
+        .context("getStateInfo")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+
+    let log_slots = result["log_slots"].as_u64().unwrap_or(0);
+    let capacity = result["capacity"].as_u64().unwrap_or(0);
+    let active = result["active_slots"].as_u64().unwrap_or(0);
+    let fill_pct = result["fill_pct"].as_f64().unwrap_or(0.0);
+    let headroom = result["slots_until_expand"].as_i64().unwrap_or(0);
+    let trigger_pct = result["expand_trigger_pct"].as_u64().unwrap_or(75);
+    let log_max = result["log_slots_max"].as_u64().unwrap_or(32);
+    let size_human = result["state_size_human"].as_str().unwrap_or("?");
+
+    section("UTXO state");
+    kv2(
+        "Slot space",
+        &format!("2^{log_slots} = {capacity} slots"),
+        &format!("(max 2^{log_max})"),
+    );
+    kv2(
+        "Active UTXOs",
+        &format!("{active}"),
+        &format!("({fill_pct:.2}% full)"),
+    );
+
+    // Visual fill bar  [████████░░░░░░░░░░░░]  12.50%
+    let bar_width = 30usize;
+    let filled = ((fill_pct / 100.0) * bar_width as f64).round() as usize;
+    let trigger_pos = ((trigger_pct as f64 / 100.0) * bar_width as f64).round() as usize;
+    let bar: String = (0..bar_width)
+        .map(|i| {
+            if i < filled {
+                '█'
+            } else if i == trigger_pos.min(bar_width - 1) {
+                '|'
+            }
+            // expansion marker
+            else {
+                '░'
+            }
+        })
+        .collect();
+    if is_tty() {
+        println!(
+            "  {CYN}{:<14}{RST} [{bar}] {fill_pct:.2}%  {DIM}(| = expand at {trigger_pct}%){RST}",
+            "Fill",
+            CYN = "\x1b[36m",
+            RST = "\x1b[0m",
+            DIM = "\x1b[2m"
+        );
+    } else {
+        println!(
+            "  {:<14} [{bar}] {fill_pct:.2}%  (| = expand at {trigger_pct}%)",
+            "Fill"
+        );
+    }
+
+    if headroom >= 0 {
+        kv2(
+            "Until expand",
+            &format!("{headroom} slots"),
+            &format!(
+                "({:.2}% headroom)",
+                headroom as f64 / capacity as f64 * 100.0
+            ),
+        );
+    } else {
+        kv(
+            "Until expand",
+            &c!(YLW, "EXPANSION PENDING (trigger has fired)"),
+        );
+    }
+    kv("State size", size_human);
+    Ok(())
+}
+
+async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getMiningInfo", &[])
+        .await
+        .context("getMiningInfo")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let height = result["height"].as_u64().unwrap_or(0);
+    let diff_bits = result["difficulty_bits"].as_u64().unwrap_or(0);
+    let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
+    let reward_micro = result["block_reward_micronoid"].as_u64().unwrap_or(0);
+    let active = result["active_slot_count"].as_u64().unwrap_or(0);
+    let rec_h = result["recursive_proof_height"].as_u64();
+    section("Mining info");
+    kv("Height", &height.to_string());
+    kv2(
+        "Difficulty",
+        &format!("{diff_bits} leading zeros"),
+        &format!("target: {diff_target}"),
+    );
+    kv2(
+        "Block reward",
+        &format!("{} NOID", noid_str(reward_micro)),
+        &format!("({reward_micro} \u{03bc}NOID)"),
+    );
+    kv("Active UTXOs", &active.to_string());
+    kv(
+        "Recursive proof",
+        &rec_h.map_or("not yet".into(), |h| format!("height {h}")),
+    );
+    Ok(())
+}
+
+async fn cmd_peers(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getPeerCount", &[])
+        .await
+        .context("getPeerCount")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let n = result.as_u64().unwrap_or(0);
+    section("Connected peers");
+    kv("Count", &n.to_string());
+    Ok(())
+}
+
+async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_outputs: u32) -> anyhow::Result<()> {
+    let result = rpc(ctx, "estimateFee", &[n_outputs.into()])
+        .await
+        .context("estimateFee")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let fee_micro = result.as_u64().unwrap_or(0);
+    section(&format!("Fee estimate ({n_outputs} outputs)"));
+    kv2(
+        "Min fee",
+        &format!("{} NOID", noid_str(fee_micro)),
+        &format!("({fee_micro} \u{03bc}NOID)"),
+    );
+    println!();
+    println!(
+        "  {} MIN_FEE_BASE(5000) + n_outputs × FEE_PER_OUTPUT(2000) \u{03bc}NOID",
+        c!(DIM, "Formula:")
+    );
+    Ok(())
+}
+
+async fn cmd_validate(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "validateAddress", &[address.into()])
+        .await
+        .context("validateAddress")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let valid = result["valid"].as_bool().unwrap_or(false);
+    section("Address validation");
+    if valid {
+        ok_msg("Valid address");
+        kv("bech32m", result["bech32"].as_str().unwrap_or("?"));
+        kv("hex", result["hex"].as_str().unwrap_or("?"));
+    } else {
+        let err = result["error"].as_str().unwrap_or("invalid");
+        print_error(&format!("Invalid address: {err}"));
+        bail!("invalid address");
+    }
+    Ok(())
+}
+
+async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getMempoolEntry", &[txhash.into()])
+        .await
+        .context("getMempoolEntry")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    if result.is_null() {
+        warn_msg(&format!("Transaction {txhash} is not in the mempool."));
+        println!("  It may have been confirmed. Use 'noid-cli tx {txhash}' to check.");
+        return Ok(());
+    }
+    section("Mempool transaction");
+    kv("tx_hash", result["tx_hash"].as_str().unwrap_or("?"));
+    let fee = result["fee_micronoid"].as_u64().unwrap_or(0);
+    kv2(
+        "Fee",
+        &format!("{} NOID", noid_str(fee)),
+        &format!("({fee} \u{03bc}NOID)"),
+    );
+    kv(
+        "Inputs",
+        &result["n_inputs"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv(
+        "Outputs",
+        &result["n_outputs"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv(
+        "Admitted at height",
+        &result["admitted_height"].as_u64().unwrap_or(0).to_string(),
+    );
+    let has_proof = result["has_proof"].as_bool().unwrap_or(false);
+    kv(
+        "ZK proof",
+        if has_proof {
+            "attached"
+        } else {
+            "not attached"
+        },
+    );
     Ok(())
 }
 

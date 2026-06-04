@@ -6,80 +6,163 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
-    BlockTemplateResponse, ChainInfo, MempoolInfo, ReceiptVerifyResult, SlotInfo, WalletBalance,
-    WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MiningInfo,
+    ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletBalance, WalletHistoryEntry,
+    WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
 pub trait ParanoidApi {
-    // --- Chain state (always available) ---
+    // =========================================================================
+    // Chain
+    // =========================================================================
 
+    /// Current tip height.
     #[method(name = "blockCount")]
     async fn block_count(&self) -> RpcResult<u64>;
 
+    /// Chain tip summary: height, hash, difficulty, active UTXOs.
     #[method(name = "getChainInfo")]
     async fn get_chain_info(&self) -> RpcResult<ChainInfo>;
 
+    /// H_BLOCK hash of the block at `height` (hex, no 0x prefix).
+    /// Stored forever. Returns null if height > tip.
+    #[method(name = "getBlockHash")]
+    async fn get_block_hash(&self, height: u64) -> RpcResult<Option<String>>;
+
+    /// Decoded block header at `height`. All fields as typed values.
+    /// Stored forever.
+    #[method(name = "getBlockHeader")]
+    async fn get_block_header(&self, height: u64) -> RpcResult<Option<BlockHeaderInfo>>;
+
+    /// Raw 276-byte block header hex at `height` (for developers).
     #[method(name = "getHeaderByHeight")]
     async fn get_header_by_height(&self, height: u64) -> RpcResult<Option<String>>;
 
+    /// Raw 276-byte block header hex by H_BLOCK hash.
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
+    /// Latest recursive chain proof (~6.5 KB hex). Covers the entire history in O(1).
     #[method(name = "getRecursiveProof")]
     async fn get_recursive_proof(&self) -> RpcResult<Option<String>>;
 
+    /// UTXO slot contents by index.
     #[method(name = "getSlot")]
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo>;
 
+    /// All live UTXO slots owned by `address` (bech32m or 64-char hex).
+    /// Uses the persistent owner index — O(1) lookup.
+    #[method(name = "getSlotsByOwner")]
+    async fn get_slots_by_owner(&self, address: String) -> RpcResult<Vec<SlotInfo>>;
+
+    /// Total live UTXO count.
     #[method(name = "getActiveSlotCount")]
     async fn get_active_slot_count(&self) -> RpcResult<u64>;
 
-    // --- Recent blocks (last 18 only) ---
+    /// Full state dimensions: capacity, fill %, bytes on disk, expansion headroom.
+    #[method(name = "getStateInfo")]
+    async fn get_state_info(&self) -> RpcResult<StateInfo>;
 
+    /// Confirmed transaction info by tx_body_hash. Uses the permanent tx index.
+    /// Returns null if hash is unknown (not yet confirmed or never submitted).
+    #[method(name = "getTx")]
+    async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>>;
+
+    /// Returns true if `txhash` is in the nullifier set (i.e., the tx has been spent
+    /// and cannot be re-submitted within the anchor window).
+    #[method(name = "isNullifier")]
+    async fn is_nullifier(&self, txhash: String) -> RpcResult<bool>;
+
+    /// Full block (header + transactions) at `height`, as hex.
+    /// Only the last 18 blocks are retained; older blocks are pruned.
     #[method(name = "getBlock")]
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>>;
 
-    // --- Wallet support ---
+    // =========================================================================
+    // Network / mining
+    // =========================================================================
 
+    /// Mining and network state: difficulty, block reward, recursive proof height.
+    #[method(name = "getMiningInfo")]
+    async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
+
+    /// Number of currently connected P2P peers.
+    #[method(name = "getPeerCount")]
+    async fn get_peer_count(&self) -> RpcResult<usize>;
+
+    /// Minimum relay fee in μNOID for a transaction with `n_outputs` outputs.
+    /// Formula: MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT.
+    #[method(name = "estimateFee")]
+    async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
+
+    // =========================================================================
+    // Utilities
+    // =========================================================================
+
+    /// Validate and normalise an address (bech32m or hex).
+    /// Returns the canonical bech32m form on success.
+    #[method(name = "validateAddress")]
+    async fn validate_address(&self, address: String) -> RpcResult<AddressInfo>;
+
+    /// Candidate empty slot indices for transaction outputs.
     #[method(name = "getSlotHints")]
     async fn get_slot_hints(&self, count: u32) -> RpcResult<Vec<u32>>;
 
+    /// Current epoch anchor hash (use as `epoch_anchor` when building transactions).
     #[method(name = "getEpochAnchor")]
     async fn get_epoch_anchor(&self) -> RpcResult<String>;
 
+    /// Submit a raw `TxIntent` (transaction + ZK proof) to the mempool.
     #[method(name = "submitTxIntent")]
     async fn submit_tx_intent(&self, hex: String) -> RpcResult<String>;
 
-    // --- Node control ---
+    // =========================================================================
+    // Mempool
+    // =========================================================================
 
-    /// Gracefully stop the daemon. Cancels the miner, closes the RPC server,
-    /// and flushes MDBX. Equivalent to Ctrl-C but callable via RPC or CLI.
-    #[method(name = "stop")]
-    async fn stop(&self) -> RpcResult<String>;
-
-    // --- Mempool ---
-
-    /// Get summary of all pending transactions in the mempool.
+    /// Full mempool state: count, fee floor, list of pending transactions.
     #[method(name = "getMempoolInfo")]
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo>;
 
-    /// Get count of pending transactions.
+    /// Pending transaction count (lighter than getMempoolInfo).
     #[method(name = "getMempoolSize")]
     async fn get_mempool_size(&self) -> RpcResult<usize>;
 
-    // --- Receipt ---
+    /// Single pending transaction by hash. Returns null if not in mempool.
+    #[method(name = "getMempoolEntry")]
+    async fn get_mempool_entry(
+        &self,
+        txhash: String,
+    ) -> RpcResult<Option<crate::types::MempoolTxInfo>>;
 
+    // =========================================================================
+    // Receipt
+    // =========================================================================
+
+    /// Verify a Merkle payment receipt against the canonical chain.
     #[method(name = "verifyReceipt")]
     async fn verify_receipt(&self, receipt_hex: String) -> RpcResult<ReceiptVerifyResult>;
 
-    // --- Mining ---
+    // =========================================================================
+    // Mining (external miner API)
+    // =========================================================================
 
+    /// Get a PoW block template for an external miner.
     #[method(name = "getBlockTemplate")]
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse>;
 
+    /// Submit a solved block from an external miner.
     #[method(name = "submitBlock")]
     async fn submit_block(&self, block_hex: String) -> RpcResult<String>;
+
+    // =========================================================================
+    // Node control
+    // =========================================================================
+
+    /// Gracefully stop the paranoid daemon.
+    #[method(name = "stop")]
+    async fn stop(&self) -> RpcResult<String>;
 
     // =========================================================================
     // Wallet RPC methods (noid_walletXxx namespace preserved via method name)
