@@ -218,7 +218,9 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr: libp2p::Multiaddr =
         p2p_listen_str.parse().context("parse P2P listen address")?;
 
-    let (p2p, _p2p_task) = P2PNetwork::start(listen_addr.clone(), chain.clone(), mempool.clone());
+    let topics = noid_p2p::protocol::NetworkTopics::for_network_cfg(&net);
+    let (p2p, _p2p_task) =
+        P2PNetwork::start(listen_addr.clone(), chain.clone(), mempool.clone(), topics);
     tracing::info!(listen = %listen_addr, network = %net.kind, "P2P started");
 
     // Dial seeds: CLI seeds + config seeds + DNS seeds.
@@ -336,7 +338,8 @@ async fn main() -> anyhow::Result<()> {
             chain.clone(),
             Arc::clone(&sync_ready),
         );
-        let miner_stop = miner.stop_handle(); // Arc<AtomicBool> — set true to cancel Rayon threads
+        let miner_stop = miner.stop_handle(); // cancel_pow — aborts current PoW chunk
+        let miner_stopped = miner.stopped_handle(); // permanent stop — breaks the loop
 
         let p2p_block_relay = p2p.cmd_tx.clone();
         let miner_wallet = shared_wallet.clone();
@@ -374,7 +377,7 @@ async fn main() -> anyhow::Result<()> {
 
         let task = tokio::spawn(async move { miner.run().await });
         tracing::info!("miner started");
-        Some((task, miner_stop))
+        Some((task, miner_stop, miner_stopped))
     } else {
         None
     };
@@ -412,20 +415,31 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down — cancelling miner and closing connections");
 
-    // 1. Cancel Rayon PoW threads immediately (they check the flag every ~10M nonces).
-    if let Some((_, ref stop_flag)) = miner_handle {
+    // 1. Signal the miner to stop: set `stopped` (breaks the loop) then
+    //    `cancel_pow` (aborts the current PoW chunk so the loop reaches the
+    //    top-of-loop check quickly).
+    if let Some((_, ref stop_flag, ref stopped_flag)) = miner_handle {
+        stopped_flag.store(true, std::sync::atomic::Ordering::Release);
         stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!("miner stop flag set");
+        tracing::info!("miner stop flags set");
     }
 
     // 2. Stop RPC server (no new requests accepted).
     let _ = rpc_handle.stop();
 
-    // 3. Abort the miner tokio task (async loop, not the blocking thread).
-    if let Some((task, _)) = miner_handle {
-        task.abort();
-        // Give Rayon threads up to 500ms to finish their current nonce chunk.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // 3. Wait for the miner task to exit cleanly. The miner checks `stopped`
+    //    at the top of each loop iteration; `cancel_pow` ensures the current
+    //    PoW chunk finishes quickly (~100ms at genesis difficulty). We give
+    //    2 seconds before giving up — MDBX is crash-safe regardless.
+    if let Some((task, _, _)) = miner_handle {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
+            Ok(Ok(_)) => tracing::info!("miner task exited cleanly"),
+            Ok(Err(e)) if e.is_cancelled() => tracing::debug!("miner task cancelled"),
+            Ok(Err(e)) => tracing::warn!("miner task error: {e}"),
+            Err(_) => tracing::warn!(
+                "miner task did not exit in 2s — MDBX is crash-safe, continuing shutdown"
+            ),
+        }
     }
 
     tracing::info!("goodbye — MDBX flushed on drop");
@@ -488,6 +502,15 @@ async fn handle_p2p_events(
     const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
     const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
     let mut tx_event_count: u32 = 0;
+
+    // --- FetchHeaders recursion depth limiter (Fix 3.4) ---
+    //
+    // Caps how many times we fetch further-back headers without finding a common
+    // ancestor.  Each step covers 512 blocks, so 4 steps = 2048 blocks, well
+    // beyond FINALITY_DEPTH=18.  If the limit is hit we request a full state
+    // snapshot instead (the designed deep-sync mechanism).
+    let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
+    const MAX_FETCH_DEPTH: u32 = 4;
 
     loop {
         match rx.recv().await {
@@ -857,6 +880,8 @@ async fn handle_p2p_events(
                 };
 
                 if let Some((ancestor_height, _ancestor_hash)) = ancestor_opt {
+                    // Found a common ancestor — reset the depth counter for this peer.
+                    *fetch_depth.entry(from).or_insert(0) = 0;
                     // Found common ancestor. The competing chain:
                     // headers with height > ancestor_height, ordered ascending.
                     let mut competing: Vec<_> = headers
@@ -920,21 +945,36 @@ async fn handle_p2p_events(
                     }
                 } else {
                     // Common ancestor not in our recent chain — request more headers
-                    // going further back
+                    // going further back, subject to a recursion depth limit.
                     let oldest = headers.first().map(|h| h.height).unwrap_or(0);
                     if oldest > 0 {
-                        let fetch_from = oldest.saturating_sub(512);
-                        tracing::debug!(
-                            fetch_from,
-                            "batch headers: ancestor not found, fetching further back"
-                        );
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::FetchHeaders {
-                                peer: from,
-                                start_height: fetch_from,
-                                count: 512,
-                            })
-                            .await;
+                        let depth = fetch_depth.entry(from).or_insert(0);
+                        if *depth >= MAX_FETCH_DEPTH {
+                            tracing::warn!(
+                                peer = %from,
+                                depth = *depth,
+                                "FetchHeaders depth limit reached — requesting state snapshot instead"
+                            );
+                            *depth = 0; // reset for next time
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
+                                .await;
+                        } else {
+                            *depth += 1;
+                            let fetch_from = oldest.saturating_sub(512);
+                            tracing::debug!(
+                                fetch_from,
+                                depth = *depth,
+                                "batch headers: ancestor not found, fetching further back"
+                            );
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                    peer: from,
+                                    start_height: fetch_from,
+                                    count: 512,
+                                })
+                                .await;
+                        }
                     }
                 }
             }
@@ -1201,6 +1241,12 @@ async fn handle_p2p_events(
                         })
                         .collect()
                 };
+                tracing::info!(
+                    segments = segments.len(),
+                    tip = snapshot.tip_height,
+                    "snapshot: decoded {} segments, writing to MDBX...",
+                    segments.len()
+                );
                 let nullifier_blocks: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> = snapshot
                     .nullifier_blocks
                     .iter()
@@ -1234,6 +1280,10 @@ async fn handle_p2p_events(
                         drop(ctx);
                         mempool.on_new_block(&[], new_height, new_view).await;
                         sync_ready.notify_one();
+                        tracing::info!(
+                            height = new_height,
+                            "snapshot: fully applied and persisted to disk"
+                        );
                         tracing::info!(
                             height = new_height,
                             "chain snapshot applied — mining can begin"

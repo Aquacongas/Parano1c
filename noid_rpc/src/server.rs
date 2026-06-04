@@ -56,13 +56,13 @@ impl ParanoidApiServer for RpcHandler {
     // Chain state (always available)
     // -----------------------------------------------------------------------
 
-    fn block_count(&self) -> RpcResult<u64> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn block_count(&self) -> RpcResult<u64> {
+        let chain = self.chain.read().await;
         Ok(chain.tip_height())
     }
 
-    fn get_chain_info(&self) -> RpcResult<ChainInfo> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_chain_info(&self) -> RpcResult<ChainInfo> {
+        let chain = self.chain.read().await;
         let tip = chain.tip_header();
         Ok(ChainInfo {
             height: chain.tip_height(),
@@ -73,8 +73,8 @@ impl ParanoidApiServer for RpcHandler {
         })
     }
 
-    fn get_header_by_height(&self, height: u64) -> RpcResult<Option<String>> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_header_by_height(&self, height: u64) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
         match chain.get_header_from_store(height) {
             Ok(Some(hdr)) => {
                 let mut buf = Vec::new();
@@ -86,12 +86,12 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
-    fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>> {
+    async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>> {
         let hash_bytes: [u8; 32] = hex::decode(&hash)
             .ok()
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| rpc_err("invalid hash hex (expected 32-byte hex)"))?;
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+        let chain = self.chain.read().await;
         match chain.store.get_header_by_hash(&hash_bytes) {
             Ok(Some(hdr)) => {
                 let mut buf = Vec::new();
@@ -103,8 +103,8 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
-    fn get_recursive_proof(&self) -> RpcResult<Option<String>> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_recursive_proof(&self) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
         match chain.store.get_recursive_proof() {
             Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
             Ok(None) => Ok(None),
@@ -112,8 +112,8 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
-    fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo> {
+        let chain = self.chain.read().await;
         let tip = chain.tip_header();
         let log_slots = tip.log_slots;
         if (slot_index as u64) >= (1u64 << log_slots) {
@@ -140,8 +140,8 @@ impl ParanoidApiServer for RpcHandler {
         })
     }
 
-    fn get_active_slot_count(&self) -> RpcResult<u64> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_active_slot_count(&self) -> RpcResult<u64> {
+        let chain = self.chain.read().await;
         Ok(chain.state.active_slot_count)
     }
 
@@ -149,8 +149,8 @@ impl ParanoidApiServer for RpcHandler {
     // Recent blocks (last 18 only)
     // -----------------------------------------------------------------------
 
-    fn get_block(&self, height: u64) -> RpcResult<Option<String>> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_block(&self, height: u64) -> RpcResult<Option<String>> {
+        let chain = self.chain.read().await;
         match chain.store.get_recent_block(height) {
             Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
             Ok(None) => Ok(None),
@@ -162,9 +162,9 @@ impl ParanoidApiServer for RpcHandler {
     // Wallet support
     // -----------------------------------------------------------------------
 
-    fn get_slot_hints(&self, count: u32) -> RpcResult<Vec<u32>> {
+    async fn get_slot_hints(&self, count: u32) -> RpcResult<Vec<u32>> {
         let count = (count as usize).min(256);
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+        let chain = self.chain.read().await;
         let tip = chain.tip_header();
         let log_slots = tip.log_slots;
         let num_slots = 1u32 << log_slots;
@@ -192,8 +192,8 @@ impl ParanoidApiServer for RpcHandler {
         Ok(hints)
     }
 
-    fn get_epoch_anchor(&self) -> RpcResult<String> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn get_epoch_anchor(&self) -> RpcResult<String> {
+        let chain = self.chain.read().await;
         let tip = chain.tip_header();
         let hash = full_block_hash(tip);
         Ok(hex::encode(hash))
@@ -215,7 +215,7 @@ impl ParanoidApiServer for RpcHandler {
     // Receipt verification
     // -----------------------------------------------------------------------
 
-    fn verify_receipt(&self, receipt_hex: String) -> RpcResult<ReceiptVerifyResult> {
+    async fn verify_receipt(&self, receipt_hex: String) -> RpcResult<ReceiptVerifyResult> {
         use noid_chain::consensus::receipt::{verify_against_header, verify_merkle_inclusion};
 
         let bytes = hex::decode(&receipt_hex).map_err(|e| rpc_err(format!("hex: {e}")))?;
@@ -227,7 +227,7 @@ impl ParanoidApiServer for RpcHandler {
         let merkle_valid = verify_merkle_inclusion(&receipt);
 
         // Step 2: verify against canonical chain (look up header by height).
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+        let chain = self.chain.read().await;
         let canonical = match chain.get_header_from_store(receipt.claimed_height) {
             Ok(Some(hdr)) => Some(verify_against_header(&receipt, &hdr)),
             Ok(None) => None,
@@ -341,30 +341,30 @@ impl ParanoidApiServer for RpcHandler {
     // Wallet RPC methods
     // -----------------------------------------------------------------------
 
-    fn wallet_status(&self) -> RpcResult<WalletStatus> {
+    async fn wallet_status(&self) -> RpcResult<WalletStatus> {
         Ok(self.wallet.status())
     }
 
-    fn wallet_get_address(&self, index: u32) -> RpcResult<String> {
+    async fn wallet_get_address(&self, index: u32) -> RpcResult<String> {
         self.wallet
             .get_address(index)
             .ok_or_else(|| rpc_err("wallet not initialized"))
     }
 
-    fn wallet_get_balance(&self) -> RpcResult<WalletBalance> {
+    async fn wallet_get_balance(&self) -> RpcResult<WalletBalance> {
         Ok(self.wallet.get_balance())
     }
 
-    fn wallet_list_utxos(&self) -> RpcResult<Vec<WalletUtxoInfo>> {
+    async fn wallet_list_utxos(&self) -> RpcResult<Vec<WalletUtxoInfo>> {
         Ok(self.wallet.list_utxos())
     }
 
-    fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>> {
+    async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>> {
         Ok(self.wallet.history())
     }
 
-    fn wallet_scan(&self) -> RpcResult<WalletScanResult> {
-        let chain = tokio::task::block_in_place(|| futures::executor::block_on(self.chain.read()));
+    async fn wallet_scan(&self) -> RpcResult<WalletScanResult> {
+        let chain = self.chain.read().await;
         let height = chain.tip_height();
         Ok(self.wallet.scan_state(&chain.state.state, height))
     }
@@ -487,7 +487,7 @@ impl ParanoidApiServer for RpcHandler {
         )))
     }
 
-    fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String> {
+    async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String> {
         self.wallet.export_receipt(&txhash_hex).map_err(rpc_err)
     }
 
@@ -586,11 +586,9 @@ impl ParanoidApiServer for RpcHandler {
     // Node control
     // -----------------------------------------------------------------------
 
-    fn stop(&self) -> RpcResult<String> {
+    async fn stop(&self) -> RpcResult<String> {
         // Take the sender (one-shot: subsequent calls are no-ops).
-        let taken = tokio::task::block_in_place(|| {
-            futures::executor::block_on(async { self.stop_tx.lock().await.take() })
-        });
+        let taken = self.stop_tx.lock().await.take();
         match taken {
             Some(tx) => {
                 tracing::info!("RPC stop command received — initiating graceful shutdown");
@@ -605,14 +603,9 @@ impl ParanoidApiServer for RpcHandler {
     // Mempool inspection
     // -----------------------------------------------------------------------
 
-    fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
-        let (entries, fee_floor) = tokio::task::block_in_place(|| {
-            futures::executor::block_on(async {
-                let entries = self.mempool.get_all_entries().await;
-                let fee_floor = self.mempool.fee_floor().await;
-                (entries, fee_floor)
-            })
-        });
+    async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
+        let entries = self.mempool.get_all_entries().await;
+        let fee_floor = self.mempool.fee_floor().await;
 
         let txs: Vec<MempoolTxInfo> = entries
             .iter()
@@ -638,8 +631,8 @@ impl ParanoidApiServer for RpcHandler {
         })
     }
 
-    fn get_mempool_size(&self) -> RpcResult<usize> {
-        let size = tokio::task::block_in_place(|| futures::executor::block_on(self.mempool.len()));
+    async fn get_mempool_size(&self) -> RpcResult<usize> {
+        let size = self.mempool.len().await;
         Ok(size)
     }
 }

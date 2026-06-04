@@ -53,8 +53,13 @@ pub struct NodeBehaviour {
 
 impl NodeBehaviour {
     /// Build the combined behaviour from a libp2p keypair.
+    ///
+    /// `protocol_id` is the network-specific prefix used for all sync stream
+    /// protocols (e.g. `/noid/mainnet/1.0.0`).  This ensures mainnet and
+    /// testnet nodes can never accidentally sync with each other.
     pub fn new(
         key: &libp2p::identity::Keypair,
+        protocol_id: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -90,10 +95,12 @@ impl NodeBehaviour {
                 .map_err(|e| format!("gossipsub: {e}"))?;
 
         // Network-aware protocol IDs — use the network's protocol_id prefix.
-        // This ensures mainnet and testnet sync protocols are also isolated.
+        // This ensures mainnet and testnet sync protocols are fully isolated:
+        // a mainnet node and a testnet node will never negotiate a shared
+        // stream protocol and therefore can never accidentally sync.
         let chain_sync = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::new("/noid/sync/headers/1"),
+                StreamProtocol::try_from_owned(format!("{}/sync/headers/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
@@ -101,7 +108,7 @@ impl NodeBehaviour {
 
         let block_sync = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::new("/noid/sync/block/1"),
+                StreamProtocol::try_from_owned(format!("{}/sync/block/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -111,7 +118,7 @@ impl NodeBehaviour {
 
         let proof_sync = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::new("/noid/sync/proof/1"),
+                StreamProtocol::try_from_owned(format!("{}/sync/proof/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
@@ -126,7 +133,7 @@ impl NodeBehaviour {
 
         let snapshot_sync = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::new("/noid/sync/snapshot/1"),
+                StreamProtocol::try_from_owned(format!("{}/sync/snapshot/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             // Generous timeout: full state transfer can be several hundred MB

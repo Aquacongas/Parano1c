@@ -20,7 +20,7 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::protocol::{
-    GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse, Topics,
+    GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse, NetworkTopics,
 };
 
 /// Commands sent to the P2P network event loop.
@@ -112,19 +112,23 @@ pub struct P2PNetwork {
 impl P2PNetwork {
     /// Build and start the P2P network.
     ///
-    /// `topics` controls which gossipsub topics to subscribe to — use
+    /// `topics` controls which gossipsub topics to subscribe to and which
+    /// stream protocol IDs to use for sync — use
     /// `NetworkTopics::for_network_cfg(cfg)` to get the right network.
     pub fn start(
         listen_addr: Multiaddr,
         chain: Arc<RwLock<MdbxChainContext>>,
         mempool: AsyncMempool,
+        topics: NetworkTopics,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
 
         let event_tx_clone = event_tx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_swarm(listen_addr, cmd_rx, event_tx_clone, chain, mempool).await {
+            if let Err(e) =
+                run_swarm(listen_addr, cmd_rx, event_tx_clone, chain, mempool, topics).await
+            {
                 tracing::error!("P2P network error: {e}");
             }
         });
@@ -210,9 +214,11 @@ async fn run_swarm(
     event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
     chain: Arc<RwLock<MdbxChainContext>>,
     _mempool: AsyncMempool,
+    topics: NetworkTopics,
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
+    let protocol_id = topics.protocol_id.clone();
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -220,16 +226,16 @@ async fn run_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(|key| NodeBehaviour::new(key))?
+        .with_behaviour(move |key| NodeBehaviour::new(key, &protocol_id))?
         .with_swarm_config(|cfg| {
             // Keep connections alive for 5 minutes — essential for blockchain peers.
             cfg.with_idle_connection_timeout(std::time::Duration::from_secs(300))
         })
         .build();
 
-    // Subscribe to gossip topics.
-    let blocks_topic = gossipsub::IdentTopic::new(Topics::BLOCKS);
-    let txs_topic = gossipsub::IdentTopic::new(Topics::TXS);
+    // Subscribe to network-specific gossip topics.
+    let blocks_topic = gossipsub::IdentTopic::new(topics.blocks.clone());
+    let txs_topic = gossipsub::IdentTopic::new(topics.txs.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
 
@@ -239,19 +245,19 @@ async fn run_swarm(
         // Drain all pending commands first (priority: outgoing blocks must propagate
         // immediately without waiting for swarm event processing).
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_network_command(&mut swarm, cmd);
+            handle_network_command(&mut swarm, cmd, &topics);
         }
 
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &event_tx, &chain).await;
+                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &topics).await;
             }
 
             // Commands from the node (when no swarm event pending).
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(cmd) => handle_network_command(&mut swarm, cmd),
+                    Some(cmd) => handle_network_command(&mut swarm, cmd, &topics),
                     None => break, // cmd_tx dropped
                 }
             }
@@ -262,16 +268,20 @@ async fn run_swarm(
 
 /// Process a single network command. Separated from the select! loop so that
 /// pending commands can be drained synchronously via `try_recv` before blocking.
-fn handle_network_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: NetworkCommand) {
+fn handle_network_command(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    cmd: NetworkCommand,
+    topics: &NetworkTopics,
+) {
     match cmd {
         NetworkCommand::BroadcastBlock { block_bytes } => {
-            let topic = gossipsub::IdentTopic::new(Topics::BLOCKS);
+            let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
                 tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
             }
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
-            let topic = gossipsub::IdentTopic::new(Topics::TXS);
+            let topic = gossipsub::IdentTopic::new(topics.txs.clone());
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
                 tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
             }
@@ -290,7 +300,11 @@ fn handle_network_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: Network
             from_height,
             count,
         } => {
-            for h in from_height..(from_height + count as u64) {
+            // Only send the first SYNC_WINDOW requests simultaneously.
+            // Remaining blocks are requested as responses arrive, preventing
+            // a burst of N parallel requests to a single peer.
+            const SYNC_WINDOW: u64 = 4;
+            for h in from_height..(from_height + (count as u64).min(SYNC_WINDOW)) {
                 let _ = swarm
                     .behaviour_mut()
                     .block_sync
@@ -341,6 +355,7 @@ async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
     chain: &Arc<RwLock<MdbxChainContext>>,
+    topics: &NetworkTopics,
 ) {
     match event {
         // --- GossipSub: received broadcast ---
@@ -350,12 +365,12 @@ async fn handle_swarm_event(
             ..
         })) => {
             let topic = message.topic.as_str();
-            if topic == Topics::BLOCKS {
+            if topic == topics.blocks.as_str() {
                 let _ = event_tx.send(NetworkEvent::NewBlock {
                     from: propagation_source,
                     block_bytes: message.data,
                 });
-            } else if topic == Topics::TXS {
+            } else if topic == topics.txs.as_str() {
                 let _ = event_tx.send(NetworkEvent::NewTx {
                     from: propagation_source,
                     intent_bytes: message.data,
@@ -611,6 +626,21 @@ async fn handle_swarm_event(
             },
         )) => {
             if response.tip_height > 0 {
+                // Sanity check: reject absurdly large snapshots before forwarding to
+                // node.  A valid snapshot for log_slots=32 has at most 65536 segments.
+                const MAX_SNAPSHOT_SEGMENTS: usize = 65536;
+                const MAX_RECENT_HEADERS: usize = 512;
+                if response.segments.len() > MAX_SNAPSHOT_SEGMENTS
+                    || response.recent_headers.len() > MAX_RECENT_HEADERS
+                {
+                    tracing::warn!(
+                        from = %peer,
+                        segments = response.segments.len(),
+                        "snapshot too large — dropping (possible OOM attack)"
+                    );
+                    return; // don't emit the event
+                }
+
                 tracing::info!(
                     from = %peer,
                     tip = response.tip_height,

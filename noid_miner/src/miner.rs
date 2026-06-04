@@ -127,6 +127,9 @@ pub struct BlockMiner {
     events: broadcast::Sender<MinerEvent>,
     /// Cancel flag: set to abort current PoW search and restart.
     cancel_pow: Arc<AtomicBool>,
+    /// Permanent stop flag: set only by stop(), never reset. The main loop
+    /// checks this at the top of each iteration and breaks cleanly.
+    stopped: Arc<AtomicBool>,
     /// Notified when the chain is sufficiently synced to begin mining.
     sync_ready: Arc<tokio::sync::Notify>,
     /// Semaphore (1 permit) preventing concurrent ZK prove tasks from accumulating.
@@ -149,6 +152,7 @@ impl BlockMiner {
             chain,
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -161,9 +165,10 @@ impl BlockMiner {
     }
 
     /// Signal the miner to stop after the current search iteration.
-    /// Call this before dropping/aborting the miner task to ensure
-    /// Rayon threads exit cleanly rather than running a full chunk.
+    /// Sets both the permanent `stopped` flag (causes the loop to break) and
+    /// `cancel_pow` (causes the current PoW chunk to abort quickly).
     pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
         self.cancel_pow.store(true, Ordering::SeqCst);
         tracing::info!("miner stop signal sent — Rayon threads will exit at next iteration");
     }
@@ -177,6 +182,15 @@ impl BlockMiner {
     /// This must be called BEFORE `run()` consumes the miner.
     pub fn stop_handle(&self) -> Arc<AtomicBool> {
         self.cancel_pow.clone()
+    }
+
+    /// Return a cloned handle to the permanent shutdown flag.
+    /// Set to `true` (with `Ordering::Release`) to signal the miner loop to
+    /// exit after the current PoW chunk finishes. Combine with `stop_handle()`
+    /// to also abort the current PoW immediately.
+    /// This must be called BEFORE `run()` consumes the miner.
+    pub fn stopped_handle(&self) -> Arc<AtomicBool> {
+        self.stopped.clone()
     }
 
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.
@@ -241,6 +255,13 @@ impl BlockMiner {
         tracing::info!(address = ?addr, "BlockMiner started");
 
         loop {
+            // Clean shutdown: stop() sets `stopped` permanently; break before
+            // starting a new template build so the task exits promptly.
+            if self.stopped.load(Ordering::Acquire) {
+                tracing::info!("miner: shutdown flag set, exiting loop");
+                break;
+            }
+
             // --- Build template ---
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

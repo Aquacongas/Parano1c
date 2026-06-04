@@ -465,8 +465,8 @@ impl MdbxChainContext {
             });
         }
 
-        eprintln!(
-            "[INFO] reorg: reverting from height {} to {} (depth {}), {} new block(s)",
+        tracing::info!(
+            "reorg: reverting height {}..{} depth={} new_blocks={}",
             self.tip_height,
             ancestor_height,
             reorg_depth,
@@ -485,7 +485,7 @@ impl MdbxChainContext {
             let undo = match self.store.get_undo_log(height) {
                 Ok(Some(u)) => u,
                 Ok(None) => {
-                    eprintln!("[ERROR] reorg: undo log missing for height {height}");
+                    tracing::error!(height, "reorg: undo log missing");
                     return Err(MdbxContextError::Corrupt("undo log missing during reorg"));
                 }
                 Err(e) => return Err(e.into()),
@@ -545,26 +545,20 @@ impl MdbxChainContext {
             match self.apply_next_block(block, local_time) {
                 Ok(_) => {
                     applied_heights.push(block.header.height);
-                    eprintln!(
-                        "[INFO] reorg: applied new block at height {}",
-                        block.header.height
-                    );
+                    tracing::info!(height = block.header.height, "reorg: applied new block");
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[ERROR] reorg: failed to apply block at height {}: {:?}",
-                        block.header.height, e
-                    );
+                    tracing::error!(height = block.header.height, err = ?e, "reorg: failed to apply block");
                     return Err(e);
                 }
             }
         }
 
-        eprintln!(
-            "[INFO] reorg complete: reverted={}, applied={}, new_tip={}",
-            reverted_heights.len(),
-            applied_heights.len(),
-            self.tip_height
+        tracing::info!(
+            reverted = reverted_heights.len(),
+            applied = applied_heights.len(),
+            new_tip = self.tip_height,
+            "reorg complete"
         );
 
         Ok(ReorgResult {
@@ -647,7 +641,7 @@ impl MdbxChainContext {
                     self.state.state.restore_evicted_segment(seg_id, cols);
                 }
                 Ok(None) => {
-                    eprintln!("[WARN] preload_all_evicted: segment {seg_id} missing from MDBX");
+                    tracing::warn!(seg_id, "preload_all_evicted: segment missing from MDBX");
                 }
                 Err(e) => return Err(MdbxContextError::Store(e)),
             }
@@ -685,8 +679,10 @@ impl MdbxChainContext {
                     Ok(None) => {
                         // Segment was marked evicted but MDBX has no data.
                         // This shouldn't happen; treat as bug and clear eviction.
-                        // Log as best effort — tracing not available in noid_chain.
-                        eprintln!("[WARN] evicted segment {seg_id} not found in MDBX — treating as zero (this is a bug)");
+                        tracing::warn!(
+                            seg_id,
+                            "evicted segment not found in MDBX — treating as zero (this is a bug)"
+                        );
                     }
                     Err(e) => return Err(MdbxContextError::Store(e)),
                 }
@@ -793,6 +789,7 @@ impl MdbxChainContext {
             // Collect all segments to write
             let eff_log = self.state.state.effective_log_segment_size() as u8;
             let seg_ids: Vec<u16> = self.state.state.active_segment_ids().collect();
+            let total = seg_ids.len();
             let dirty_segments: Vec<(u16, u8, crate::segmented_state::SegmentColumns)> = seg_ids
                 .iter()
                 .map(|&id| (id, eff_log, self.state.state.segment_columns(id).clone()))
@@ -810,6 +807,12 @@ impl MdbxChainContext {
                 tx_hashes: vec![],
             };
 
+            tracing::info!(
+                height = tip_height,
+                segments = total,
+                "snapshot: writing {} segments to MDBX...",
+                total
+            );
             self.store
                 .commit_block(
                     &tip_hdr,
@@ -820,6 +823,11 @@ impl MdbxChainContext {
                     None, // no full block bytes (not stored for snapshot)
                 )
                 .map_err(MdbxContextError::Store)?;
+            tracing::info!(
+                height = tip_height,
+                segments = total,
+                "snapshot: MDBX write complete"
+            );
 
             // Rebuild the owner index from snapshot segments so wallet scan is O(1).
             let snapshot_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> =
@@ -828,14 +836,18 @@ impl MdbxChainContext {
                     .map(|(id, eff, cols)| (*id, *eff, cols))
                     .collect();
             if let Err(e) = self.store.rebuild_owner_index_from_segments(&snapshot_refs) {
-                eprintln!("[WARN] rebuild_owner_index_from_segments failed: {e}");
+                tracing::warn!(err = %e, "rebuild_owner_index_from_segments failed");
             }
 
             self.state.state.clear_dirty();
         }
 
-        // noid_chain has no tracing dep — log to stderr
-        eprintln!("[INFO] state snapshot applied: height={tip_height} segments={} active_slots={active_slot_count}", segments.len());
+        tracing::info!(
+            height = tip_height,
+            segments = segments.len(),
+            active_slots = active_slot_count,
+            "state snapshot applied"
+        );
 
         Ok(())
     }
