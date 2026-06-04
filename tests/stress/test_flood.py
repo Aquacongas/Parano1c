@@ -72,13 +72,17 @@ def get_mempool_size(url):
 def submit_tx(url, hex_str):
     return rpc(url, "submitTxIntent", [hex_str])
 
-def wallet_send(url, amount=1, fee=5000):
-    """Send amount μNOID to self (gets own address first)."""
+def wallet_send(url, amount_micronoid=1, fee_micronoid=5000):
+    """Send amount_micronoid μNOID to self.
+    NOTE: walletSend RPC takes μNOID directly (1 NOID = 1_000_000 μNOID).
+    The noid-cli send command accepts NOID and converts; here we call RPC directly.
+    Address is now bech32m (noid1…) returned by walletGetAddress.
+    """
     addr_r = rpc(url, "walletGetAddress", [0])
     if "error" in addr_r or "result" not in addr_r:
         return {"error": "could not get address"}
-    addr = addr_r["result"]
-    return rpc(url, "walletSend", [addr, amount, fee], timeout=30)
+    addr = addr_r["result"]  # bech32m: noid1…
+    return rpc(url, "walletSend", [addr, amount_micronoid, fee_micronoid], timeout=30)
 
 def wallet_balance(url):
     r = rpc(url, "walletGetBalance")
@@ -231,11 +235,7 @@ def phase_c(url: str):
     print(f"  {N} concurrent wallet_send in {total:.2f}s total")
     print(f"  Individual times (sorted): {[f'{t:.2f}s' for t in times]}")
 
-    successes = 0
-    for dt, r in zip(sorted(times), [do_send(i) for i in range(1)]):
-        pass
-
-    # Re-run serially to count successes
+    # Count successes from first run
     with concurrent.futures.ThreadPoolExecutor(max_workers=N) as ex:
         results2 = list(ex.map(lambda _: wallet_send(url), range(N)))
     successes = sum(1 for r in results2

@@ -226,7 +226,7 @@ for cycle in $(seq 1 "$NUM_CYCLES"); do
     # Wait for the NEXT block to start (watching log for the block apply)
     # Kill right after a "block found" message → catches mid-mempool-update state
     echo "  Watching for next block apply, then kill -9..."
-    WATCH_START=$(wc -l < "$LOGFILE" 2>/dev/null || echo 0)
+    WATCH_START=$(wc -l < "$LOGFILE" 2>/dev/null | tr -d ' ' || echo 0)
     for i in $(seq 1 30); do
         NEW_LINES=$(tail -n +"$WATCH_START" "$LOGFILE" 2>/dev/null | grep -c "block found\|applied P2P block" || echo 0)
         if [ "$NEW_LINES" -gt 0 ]; then

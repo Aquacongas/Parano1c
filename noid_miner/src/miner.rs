@@ -120,6 +120,13 @@ pub enum MinerEvent {
 // ---------------------------------------------------------------------------
 
 /// The main block production orchestrator.
+/// Callback invoked synchronously inside `apply_found_block`, before the mempool
+/// is updated. Enables the built-in wallet to capture receipts race-free:
+/// by the time `getMempoolSize` drops to 0, the receipt is already stored.
+///
+/// Light-node wallets subscribe via the P2P block event instead.
+pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>;
+
 pub struct BlockMiner {
     config: MinerConfig,
     mempool: AsyncMempool,
@@ -136,6 +143,10 @@ pub struct BlockMiner {
     /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
     /// without this guard N × 10s prove tasks pile up and saturate all CPU.
     prove_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Optional hook called synchronously after block is applied to chain, before
+    /// the mempool is updated. Used by the built-in wallet to generate receipts
+    /// race-free (receipt ready before getMempoolSize → 0 is observable).
+    on_block_applied: Option<BlockAppliedHook>,
 }
 
 impl BlockMiner {
@@ -155,8 +166,16 @@ impl BlockMiner {
             stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            on_block_applied: None,
         };
         (miner, rx)
+    }
+
+    /// Register a callback to be called synchronously after each block is applied
+    /// to the chain, before the mempool is updated. The built-in wallet uses this
+    /// to generate payment receipts race-free at any mining speed.
+    pub fn set_block_applied_hook(&mut self, hook: BlockAppliedHook) {
+        self.on_block_applied = Some(hook);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -432,6 +451,13 @@ impl BlockMiner {
         // Apply to MDBX chain context.
         let mut ctx = self.chain.write().await;
         ctx.apply_next_block(block, local_time)?;
+
+        // Fire wallet hook BEFORE mempool update so receipt is stored
+        // before getMempoolSize can return 0. Works at any mining speed —
+        // no channel, no race, no capacity limit.
+        if let Some(hook) = &self.on_block_applied {
+            hook(block);
+        }
 
         // Update mempool: remove confirmed txs, update chain view.
         let confirmed: Vec<_> = block

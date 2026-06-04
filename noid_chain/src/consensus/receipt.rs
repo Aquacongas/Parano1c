@@ -46,6 +46,9 @@ pub struct ParanoidReceipt {
     pub claimed_root: [u8; 32],
     pub claimed_height: u64,
     pub summary: TxSummary,
+    /// Blake3(bincode(summary)). Prevents forging payment data (amounts, addresses)
+    /// while keeping the Merkle proof valid — summary is not in the Merkle tree.
+    pub summary_hash: [u8; 32],
     pub chain_cert: Option<Vec<u8>>,
 }
 
@@ -84,6 +87,8 @@ pub fn generate_receipt(
     chain_cert: Option<Vec<u8>>,
 ) -> ParanoidReceipt {
     let (merkle_path, merkle_dirs) = build_merkle_path(block_tx_hashes, tx_index);
+    let summary_bytes = bincode::serialize(&summary).expect("TxSummary bincode");
+    let summary_hash = *blake3::hash(&summary_bytes).as_bytes();
     ParanoidReceipt {
         version: 1,
         tx_body_hash,
@@ -92,14 +97,25 @@ pub fn generate_receipt(
         claimed_root: header.tx_root,
         claimed_height: header.height,
         summary,
+        summary_hash,
         chain_cert,
     }
 }
 
 /// Verify Merkle inclusion (offline). Returns true iff tx is in claimed_root.
 ///
+/// Also checks summary_hash so an attacker cannot forge payment data
+/// (amounts, addresses) while keeping the Merkle proof valid.
+///
 /// Uses Poseidon2b COMPRESS to match `compute_tx_root` in `noid_chain::block`.
 pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
+    // 1. TxSummary integrity: Blake3(bincode(summary)) must match.
+    let summary_bytes = bincode::serialize(&receipt.summary).expect("TxSummary bincode");
+    if *blake3::hash(&summary_bytes).as_bytes() != receipt.summary_hash {
+        return false;
+    }
+
+    // 2. Merkle path: tx_body_hash → claimed_root.
     let mut current = receipt.tx_body_hash;
     for (level, sibling) in receipt.merkle_path.iter().enumerate() {
         let sibling_on_left = (receipt.merkle_dirs >> level) & 1 == 1;

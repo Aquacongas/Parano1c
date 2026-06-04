@@ -418,17 +418,28 @@ async fn main() -> anyhow::Result<()> {
             pow_threads: cfg.mining.threads,
             ..Default::default()
         };
-        let (miner, mut miner_rx) = BlockMiner::new(
+        let (mut miner, mut miner_rx) = BlockMiner::new(
             miner_cfg,
             mempool.clone(),
             chain.clone(),
             Arc::clone(&sync_ready),
         );
+
+        // Register wallet hook: called synchronously in apply_found_block BEFORE
+        // on_new_block. Guarantees receipt is stored before getMempoolSize drops to 0.
+        // Works at any mining speed — no channel, no capacity limit, no race.
+        // Light-node wallets use P2P block subscription independently.
+        {
+            let hook_wallet = shared_wallet.clone();
+            miner.set_block_applied_hook(std::sync::Arc::new(move |block| {
+                update_wallet_for_block(&hook_wallet, block);
+            }));
+        }
+
         let miner_stop = miner.stop_handle(); // cancel_pow — aborts current PoW chunk
         let miner_stopped = miner.stopped_handle(); // permanent stop — breaks the loop
 
         let p2p_block_relay = p2p.cmd_tx.clone();
-        let miner_wallet = shared_wallet.clone();
         tokio::spawn(async move {
             loop {
                 match miner_rx.recv().await {
@@ -445,24 +456,23 @@ async fn main() -> anyhow::Result<()> {
                             txs = n_txs,
                             "broadcast block"
                         );
-                        // Broadcast FIRST — minimises propagation delay to peers.
-                        // Wallet update is secondary and must not delay P2P delivery.
-                        // This matches Bitcoin's compact-block relay approach:
-                        // announce the block immediately, handle local bookkeeping after.
+                        // Wallet update already done in apply_found_block via hook.
+                        // Here we only need to broadcast to peers.
                         let _ = p2p_block_relay
                             .send(noid_p2p::NetworkCommand::BroadcastBlock {
                                 block_bytes: block_bytes.clone(),
                             })
                             .await;
-                        // Update wallet state AFTER broadcast so P2P is not delayed.
-                        if let Ok(block) = noid_chain::block::Block::from_bytes(&block_bytes) {
-                            update_wallet_for_block(&miner_wallet, &block);
-                        }
                     }
                     Ok(noid_miner::MinerEvent::ProveFailed { height, error }) => {
                         tracing::warn!(height, err = %error, "block prove failed");
                     }
                     Ok(_) => {} // TemplateRefreshed, MiningCancelled — no action needed
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Channel lagged (fast mining at genesis difficulty).
+                        // Wallet updates are unaffected — they go through the hook, not here.
+                        tracing::warn!(skipped = n, "miner event channel lagged (broadcast only)");
+                    }
                     Err(_) => break, // channel closed (miner stopped)
                 }
             }
@@ -683,6 +693,19 @@ async fn handle_p2p_events(
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
+
+                                // Auto-continue sync: immediately request the next batch from
+                                // the same peer. This pulls the chain all the way to the peer's
+                                // tip without waiting for gossip mesh to propagate each block.
+                                // SyncBlocksFrom for heights beyond peer's recent_blocks returns
+                                // None and stops automatically — no infinite loop.
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                        peer: from,
+                                        from_height: height + 1,
+                                        count: 18,
+                                    })
+                                    .await;
 
                                 // Apply the chain of orphans that build on the new block.
                                 let mut next_hash = block_hash;

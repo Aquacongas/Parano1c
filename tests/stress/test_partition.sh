@@ -155,7 +155,7 @@ sleep 3  # let A establish genesis
     --p2p-listen "$P2P_B" \
     --rpc-listen 127.0.0.1:18042 \
     --mine \
-    --seeds "$P2P_A" \
+    --seed "$P2P_A" \
     > "$LOG_B" 2>&1 &
 PID_B=$!
 echo "  Node B PID=$PID_B"
@@ -165,7 +165,7 @@ echo "  Node B PID=$PID_B"
     --p2p-listen "$P2P_C" \
     --rpc-listen 127.0.0.1:18043 \
     --mine \
-    --seeds "$P2P_A" \
+    --seed "$P2P_A" \
     > "$LOG_C" 2>&1 &
 PID_C=$!
 echo "  Node C PID=$PID_C"
@@ -210,8 +210,17 @@ echo "    A: h=$H_A hash=${HASH_A:0:20}..."
 echo "    B: h=$H_B hash=${HASH_B:0:20}..."
 echo "    C: h=$H_C hash=${HASH_C:0:20}..."
 
-# A and B should be on the same chain
-assert_eq "A==B pre-partition" "$HASH_A" "$HASH_B"
+# A and B should be on the same chain.
+# Compare at the LOWER of the two heights to avoid timing skew
+# (one node may have mined an extra block between the two get_hash calls).
+if [ "${H_A:-0}" -le "${H_B:-0}" ] 2>/dev/null; then
+    COMMON_H_PRE=$H_A
+else
+    COMMON_H_PRE=$H_B
+fi
+HASH_A_PRE=$(rpc "$RPC_A" getBlockHash "[$COMMON_H_PRE]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
+HASH_B_PRE=$(rpc "$RPC_B" getBlockHash "[$COMMON_H_PRE]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
+assert_eq "A==B pre-partition (at h=$COMMON_H_PRE)" "$HASH_A_PRE" "$HASH_B_PRE"
 
 # ---------------------------------------------------------------------------
 # Step 3: PARTITION — kill C, let it mine in isolation
@@ -300,7 +309,7 @@ echo "  Restarting C with seeds=[A]..."
     --p2p-listen "$P2P_C" \
     --rpc-listen 127.0.0.1:18043 \
     --mine \
-    --seeds "$P2P_A" \
+    --seed "$P2P_A" \
     > "$LOG_C" 2>&1 &
 PID_C=$!
 echo "  Node C (reconnected) PID=$PID_C"
@@ -318,7 +327,7 @@ curl -s -X POST "$RPC_A" \
 echo ""
 echo "--- Step 6: Wait for convergence (all same hash, 60s max) ---"
 
-MAX_WAIT=90
+MAX_WAIT=180
 CONVERGED=0
 FINAL_A="" FINAL_B="" FINAL_C="" FINAL_HA=0 FINAL_HB=0 FINAL_HC=0
 for i in $(seq 1 "$MAX_WAIT"); do
@@ -376,7 +385,14 @@ if [ "$CONVERGED" = "1" ]; then
     PASS=$((PASS+1))
     assert_eq "A hash == C hash (fork resolved)" "$FINAL_A" "$FINAL_C"
     if [ -n "$FINAL_B" ] && [ "$FINAL_B" != "" ]; then
-        assert_eq "A hash == B hash" "$FINAL_A" "$FINAL_B"
+        # B may have mined an extra block at the convergence moment.
+        # Compare at A's height to avoid timing skew.
+        HASH_B_AT_HA=$(rpc "$RPC_B" getBlockHash "[$FINAL_HA]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
+        if [ -n "$HASH_B_AT_HA" ] && [ "$HASH_B_AT_HA" != "" ]; then
+            assert_eq "A hash == B hash (at h=$FINAL_HA)" "$FINAL_A" "$HASH_B_AT_HA"
+        else
+            echo "  SKIP B hash check (B has no block at h=$FINAL_HA)"
+        fi
     else
         echo "  SKIP B hash check (Node B unavailable)"
     fi

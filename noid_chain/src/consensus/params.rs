@@ -100,12 +100,12 @@ pub const EXPAND_DENOM: u64 = 4;
 // PoW  (SPECIFICATION.md §18)
 // ---------------------------------------------------------------------------
 
-/// Genesis difficulty target = 2^252. Intentionally trivial so the first
-/// miner can bootstrap the chain in microseconds (SPECIFICATION.md §18.5).
+/// Genesis difficulty target = 2^248. Low enough to bootstrap in milliseconds,
+/// high enough that ASERT has a real anchor to adjust from.
+/// 2^248 in little-endian: byte 31 = 0x01 (bit 248 = bit 0 of byte 31).
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    // 2^252 in little-endian: byte 31 = 0x10 (bit 252 = bit 4 of byte 31)
-    t[31] = 0x10;
+    t[31] = 0x01;
     t
 };
 

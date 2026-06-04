@@ -204,8 +204,8 @@ pub fn update_wallet_from_block(
 
     for (tx_index, tx) in block.transactions.iter().enumerate() {
         if tx.body.is_coinbase {
-            // Coinbase: just check outputs for our addresses
-            let mut coinbase_received: u64 = 0;
+            // Coinbase: track UTXOs for our addresses, record history.
+            // No receipt — receipts are proof-of-payment for OUTGOING txs only.
             for output in tx.body.outputs.iter().filter(|o| o.valid) {
                 if let Some(&key_idx) = known_addresses.get(&output.owner.0) {
                     let utxo = WalletUtxo {
@@ -216,7 +216,6 @@ pub fn update_wallet_from_block(
                         confirmed_height: height,
                     };
                     utxos.insert(output.slot_index, utxo);
-                    coinbase_received = coinbase_received.saturating_add(output.value);
                     history.push(TxHistoryEntry {
                         tx_hash: tx.tx_body_hash.0,
                         height,
@@ -226,31 +225,6 @@ pub fn update_wallet_from_block(
                         timestamp,
                     });
                 }
-            }
-            if coinbase_received > 0 {
-                let summary = TxSummary {
-                    tx_body_hash: tx.tx_body_hash.0,
-                    inputs: vec![],
-                    outputs: tx
-                        .body
-                        .outputs
-                        .iter()
-                        .filter(|o| o.valid)
-                        .map(|o| (o.slot_index, o.value, o.owner))
-                        .collect(),
-                    fee_micronoid: tx.body.fee as u64,
-                    confirmed_height: height,
-                    confirmed_unix: timestamp,
-                };
-                let receipt = generate_receipt(
-                    &block.header,
-                    tx.tx_body_hash.0,
-                    tx_index,
-                    &block_tx_hashes,
-                    summary,
-                    None,
-                );
-                receipts.insert(tx.tx_body_hash.0, receipt.to_bytes());
             }
             continue;
         }
@@ -312,7 +286,9 @@ pub fn update_wallet_from_block(
             }
         }
 
-        if sent_from_wallet > 0 || received_by_wallet > 0 {
+        // Receipt = proof of payment. Only generate when WE sent funds.
+        // Incoming-only txs need no receipt — the sender holds the proof.
+        if sent_from_wallet > 0 {
             let summary = TxSummary {
                 tx_body_hash: tx.tx_body_hash.0,
                 inputs: tx

@@ -926,7 +926,7 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     );
     kv2(
         "Block reward",
-        &format!("{} NOID", noid_str(reward_micro)),
+        &format!("{} NOID/block", noid_str(reward_micro)),
         &format!("({reward_micro} \u{03bc}NOID)"),
     );
     kv("Active UTXOs", &active.to_string());

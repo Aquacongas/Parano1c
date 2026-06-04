@@ -876,6 +876,17 @@ impl MdbxChainContext {
             self.state.state.clear_dirty();
         }
 
+        // Populate T_TX_INDEX from nullifier_blocks so getTx works on snapshot nodes.
+        // nullifier_blocks[i] = tx hashes in order for block (null_start + i).
+        use crate::consensus::params::ANCHOR_DEPTH;
+        let null_start = tip_height.saturating_sub(ANCHOR_DEPTH.saturating_sub(1));
+        if let Err(e) = self
+            .store
+            .rebuild_tx_index_from_nullifier_blocks(nullifier_blocks, null_start)
+        {
+            tracing::warn!(err = %e, "rebuild_tx_index_from_nullifier_blocks failed (non-fatal)");
+        }
+
         tracing::info!(
             height = tip_height,
             segments = segments.len(),

@@ -369,6 +369,39 @@ impl MdbxStore {
         Ok(())
     }
 
+    /// Populate T_TX_INDEX from snapshot nullifier_blocks.
+    ///
+    /// Called after `apply_state_snapshot` so that `getTx` works for the blocks
+    /// covered by the snapshot (ANCHOR_DEPTH window). Without this, T_TX_INDEX is
+    /// empty on freshly-snapshotted nodes and `getTx` returns null for recent history.
+    ///
+    /// `start_height`: the block height of `nullifier_blocks[0]`.
+    /// `nullifier_blocks[i][j]`: tx_body_hash at position j in block start_height+i.
+    pub fn rebuild_tx_index_from_nullifier_blocks(
+        &self,
+        nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
+        start_height: u64,
+    ) -> Result<(), StoreError> {
+        if nullifier_blocks.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_TX_INDEX))?;
+        for (i, block_hashes) in nullifier_blocks.iter().enumerate() {
+            let height = start_height + i as u64;
+            for (pos, hash) in block_hashes.iter().enumerate() {
+                txn.put(
+                    &tbl,
+                    hash.0.as_slice(),
+                    &encode_tx_index_value(height, pos as u32),
+                    libmdbx::WriteFlags::empty(),
+                )?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Look up a transaction by its body hash. Returns `(block_height, tx_pos_in_block)`.
     pub fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError> {
         let txn = self.db.begin_ro_txn()?;

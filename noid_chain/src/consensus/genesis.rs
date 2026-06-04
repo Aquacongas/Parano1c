@@ -19,8 +19,8 @@ use crate::consensus::{
 };
 use noid_poseidon2b::primitives::Address;
 
-/// Fixed genesis timestamp (2026-01-01 00:00:00 UTC).
-pub const GENESIS_TIMESTAMP: u64 = 1_767_225_600;
+/// Fixed genesis timestamp (2026-06-04 20:22:39 UTC).
+pub const GENESIS_TIMESTAMP: u64 = 1_780_604_559;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -70,7 +70,7 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 /// Pre-mined genesis nonce.
 /// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
 /// Found by searching nonces sequentially; nonce=2 is the first valid value.
-const GENESIS_NONCE: u128 = 2;
+const GENESIS_NONCE: u128 = 984;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -130,7 +130,6 @@ mod tests {
 
     #[test]
     fn genesis_timestamp_is_reasonable() {
-        // Must be after 2026-01-01
         assert!(GENESIS_TIMESTAMP > 1_700_000_000);
     }
 }
