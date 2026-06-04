@@ -465,6 +465,12 @@ impl MdbxChainContext {
             });
         }
 
+        // Populated by Phase 0/1 below (declared here so they're in scope for Phase 5).
+        #[allow(unused_assignments)]
+        let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
+        #[allow(unused_assignments)]
+        let mut reverted_heights: Vec<u64> = Vec::new();
+
         tracing::info!(
             "reorg: reverting height {}..{} depth={} new_blocks={}",
             self.tip_height,
@@ -474,33 +480,61 @@ impl MdbxChainContext {
         );
 
         // -----------------------------------------------------------------------
-        // Phase 1: Revert blocks from tip to ancestor (RAM only).
-        // revert_block marks affected segments as mdbx_dirty for the MDBX write
-        // in Phase 4.
+        // Phase 0: Validate ALL undo logs before modifying any state.
+        //
+        // This is critical for safety: if we start reverting and then discover a
+        // missing undo log mid-loop, we leave the node in an inconsistent state:
+        //   - Some headers removed from recent_headers
+        //   - tip_height still pointing to the OLD tip (not in recent_headers)
+        //   → tip_header().expect() PANICS across all RPC threads
+        //
+        // By validating upfront, we either succeed fully or fail before touching
+        // any in-memory state.
         // -----------------------------------------------------------------------
-        let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
-        let mut reverted_heights: Vec<u64> = Vec::new();
-
-        for height in (ancestor_height + 1..=self.tip_height).rev() {
-            let undo = match self.store.get_undo_log(height) {
-                Ok(Some(u)) => u,
-                Ok(None) => {
-                    tracing::error!(height, "reorg: undo log missing");
-                    return Err(MdbxContextError::Corrupt("undo log missing during reorg"));
+        {
+            let range = ancestor_height + 1..=self.tip_height;
+            let total = self.tip_height.saturating_sub(ancestor_height) as usize;
+            let mut loaded = Vec::with_capacity(total);
+            for height in range.rev() {
+                match self.store.get_undo_log(height) {
+                    Ok(Some(u)) => loaded.push((height, u)),
+                    Ok(None) => {
+                        tracing::error!(
+                            height,
+                            tip = self.tip_height,
+                            ancestor = ancestor_height,
+                            "reorg: undo log missing — cannot safely revert"
+                        );
+                        return Err(MdbxContextError::Corrupt(
+                            "undo log missing: reorg aborted before any state modification",
+                        ));
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
-            };
+            }
+            // All undo logs present — store them for Phase 1.
+            // (We traverse in reverse above to fail-fast on missing entries, so
+            // re-sort to descending order for the revert loop below.)
+            loaded.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
 
-            // Collect tx hashes for mempool re-admission.
-            reclaimed_tx_hashes.extend_from_slice(&undo.tx_hashes);
+            // -----------------------------------------------------------------------
+            // Phase 1: Revert blocks from tip to ancestor (RAM only).
+            // Safe to execute: all undo logs validated.
+            // -----------------------------------------------------------------------
+            let mut reclaimed_tx_hashes_inner: Vec<TxBodyHash> = Vec::new();
+            let mut reverted_heights_inner: Vec<u64> = Vec::new();
 
-            // Revert UTXO slot data; marks affected segments as mdbx_dirty.
-            revert_block(&mut self.state.state, &undo);
-            // Revert active_slot_count and alloc_counter.
-            revert_state_counters(&mut self.state, &undo);
+            for (height, undo) in &loaded {
+                reclaimed_tx_hashes_inner.extend_from_slice(&undo.tx_hashes);
+                revert_block(&mut self.state.state, undo);
+                revert_state_counters(&mut self.state, undo);
+                self.recent_headers.remove(height);
+                reverted_heights_inner.push(*height);
+            }
 
-            self.recent_headers.remove(&height);
-            reverted_heights.push(height);
+            // Move into outer scope variables.
+            reclaimed_tx_hashes = reclaimed_tx_hashes_inner;
+            reverted_heights = reverted_heights_inner;
         }
 
         // -----------------------------------------------------------------------
