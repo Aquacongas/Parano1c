@@ -129,6 +129,10 @@ pub struct BlockMiner {
     cancel_pow: Arc<AtomicBool>,
     /// Notified when the chain is sufficiently synced to begin mining.
     sync_ready: Arc<tokio::sync::Notify>,
+    /// Semaphore (1 permit) preventing concurrent ZK prove tasks from accumulating.
+    /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
+    /// without this guard N × 10s prove tasks pile up and saturate all CPU.
+    prove_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl BlockMiner {
@@ -146,6 +150,7 @@ impl BlockMiner {
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
             sync_ready,
+            prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         (miner, rx)
     }
@@ -252,8 +257,8 @@ impl BlockMiner {
                         continue;
                     }
                 };
-                let root = ctx.state.state.clone().root();
-                (t, root)
+                let prev_state_root = ctx.tip_header().state_root; // O(1) — no clone
+                (t, prev_state_root)
             };
 
             let height = tmpl.inner.height;
@@ -273,15 +278,45 @@ impl BlockMiner {
             let tmpl_prove = tmpl.clone();
             let cancel_pow = cancel.clone();
 
+            // Try to acquire the single-permit prove semaphore.
+            // spawn_blocking tasks are NOT cancelled when JoinHandles are dropped;
+            // without this guard each 15s heartbeat can accumulate another ~10s prove
+            // task, eventually saturating all CPU cores.
+            let prove_permit = self.prove_semaphore.clone().try_acquire_owned();
+
+            // If the semaphore is already held and the template has user txs we
+            // cannot legally use a stub proof — skip this iteration and wait for
+            // the running prove to release the permit.
+            if prove_permit.is_err() && tmpl.n_user_txs() > 0 {
+                tracing::warn!(
+                    height,
+                    "prove task busy and block has user txs — skipping this template iteration"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
             // PoW: Blake3 over header_core, CPU-bound via rayon.
             let pow_handle = tokio::task::spawn_blocking(move || {
                 crate::pow::search_pow_parallel(&tmpl_pow.header_for_pow(0), &cancel_pow)
             });
 
-            // ZK Prove: prove_block with real witnesses.
-            // Runs in spawn_blocking to avoid blocking the tokio runtime.
-            let prove_handle =
-                tokio::task::spawn_blocking(move || run_prove_block(&tmpl_prove, prev_state_root));
+            // ZK Prove: run for real (permit held until done) or return a consensus-legal
+            // stub for coinbase-only blocks when the prove slot is already occupied.
+            let prove_handle = match prove_permit {
+                Ok(permit) => tokio::task::spawn_blocking(move || {
+                    let _permit = permit; // holds the semaphore for the duration of the proof
+                    run_prove_block(&tmpl_prove, prev_state_root)
+                }),
+                Err(_) => {
+                    // Semaphore busy, but coinbase-only block — stub is consensus-legal.
+                    tracing::warn!(
+                        height,
+                        "prove task busy, will use stub proof (coinbase-only this round)"
+                    );
+                    tokio::task::spawn_blocking(move || Ok(([1u8; 32], [1u8; 32], vec![])))
+                }
+            };
 
             // Wait for both (or cancel from heartbeat/mempool).
             tokio::select! {

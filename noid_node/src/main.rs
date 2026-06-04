@@ -466,6 +466,29 @@ async fn handle_p2p_events(
     }
     let mut pending_snapshot: Option<PendingSnapshot> = None;
 
+    // Fix 1.4: Eclipse attack mitigation — collect snapshots from multiple peers
+    // before selecting the best one, requiring an attacker to control ALL first N
+    // peers instead of just the first one.
+    //
+    // snapshot_candidates: buffered snapshots awaiting selection.
+    // snapshot_requested_peers: tracks which peers we already asked, prevents duplicates.
+    let mut snapshot_candidates: Vec<(
+        libp2p::PeerId,
+        Box<noid_p2p::protocol::GetStateSnapshotResponse>,
+    )> = Vec::new();
+    let mut snapshot_requested_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+
+    // --- Per-peer tx rate limiter (Fix 3.1) ---
+    //
+    // Sliding-window rate limiter: tracks (tx_count_in_window, window_start) per peer.
+    // Prevents a single peer from flooding the ZK semaphore queue.
+    use std::time::{Duration, Instant};
+    let mut peer_tx_rate: HashMap<libp2p::PeerId, (u32, Instant)> = HashMap::new();
+    const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
+    const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
+    let mut tx_event_count: u32 = 0;
+
     loop {
         match rx.recv().await {
             Ok(NetworkEvent::NewBlock { from, block_bytes }) => {
@@ -524,11 +547,6 @@ async fn handle_p2p_events(
                                             break;
                                         }
                                     }
-                                }
-
-                                // Trim orphan pool to FINALITY_DEPTH
-                                if orphan_pool.len() > FINALITY_DEPTH as usize {
-                                    orphan_pool.clear();
                                 }
                             }
                             Err(noid_chain::storage::MdbxContextError::Consensus(
@@ -678,7 +696,7 @@ async fn handle_p2p_events(
                                                 "reorg: competing chain not longer, keeping current chain"
                                             );
                                             // Still buffer in case more blocks arrive from this fork.
-                                            orphan_pool.insert(block.header.prev_block_hash, block);
+                                            insert_orphan(&mut orphan_pool, block);
                                         }
                                     }
                                     Some(_) => {
@@ -709,7 +727,7 @@ async fn handle_p2p_events(
                                         );
 
                                         // Buffer the orphan
-                                        orphan_pool.insert(block.header.prev_block_hash, block);
+                                        insert_orphan(&mut orphan_pool, block);
 
                                         // Request batch headers to find ancestor in O(1) round-trip
                                         let _ = p2p_cmd
@@ -734,6 +752,30 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
                 tracing::debug!(peer = %from, "received tx from P2P");
+
+                // Per-peer rate limiting: enforce sliding-window cap before any
+                // further processing (including ZK proof verification).
+                {
+                    let now = Instant::now();
+                    let entry = peer_tx_rate.entry(from.clone()).or_insert((0, now));
+                    if now.duration_since(entry.1) > TX_RATE_WINDOW {
+                        // Window expired — reset counter for new window.
+                        *entry = (1, now);
+                    } else if entry.0 >= TX_RATE_MAX {
+                        tracing::debug!(peer = %from, "tx rate limit exceeded, dropping");
+                        continue;
+                    } else {
+                        entry.0 += 1;
+                    }
+                }
+
+                // Periodic cleanup of stale entries (peers silent for >60 s).
+                tx_event_count += 1;
+                if tx_event_count % 100 == 0 {
+                    let cutoff = Instant::now() - Duration::from_secs(60);
+                    peer_tx_rate.retain(|_, (_, window_start)| *window_start >= cutoff);
+                }
+
                 match noid_tx::TxIntent::from_bytes(&intent_bytes) {
                     Ok(intent) => {
                         match mempool.submit(intent, intent_bytes).await {
@@ -765,11 +807,17 @@ async fn handle_p2p_events(
                     // Paranoid does NOT store block history (DA delete-immediately
                     // policy). New nodes sync via the current state, not block replay.
                     // The state is proven valid by the recursive chain proof (Phase 7).
-                    tracing::info!(peer = %peer, "fresh node — requesting state snapshot (Paranoid sync)");
-                    p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer })
-                        .await
-                        .ok();
+                    //
+                    // Fix 1.4: request from up to 3 distinct peers; we'll pick the
+                    // snapshot with the highest tip_height after collecting >= 2.
+                    if snapshot_candidates.len() < 3 && !snapshot_requested_peers.contains(&peer) {
+                        tracing::info!(peer = %peer, "fresh node — requesting state snapshot (Paranoid sync)");
+                        snapshot_requested_peers.insert(peer);
+                        p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer })
+                            .await
+                            .ok();
+                    }
                 } else {
                     // Already have state — just catch up on recent blocks.
                     let from = our_height + 1;
@@ -891,29 +939,76 @@ async fn handle_p2p_events(
                 }
             }
             Ok(NetworkEvent::StateSnapshot { from, snapshot }) => {
-                // SECURITY (Fix 3.2): Do NOT apply the snapshot yet.
-                // Store it as pending and request a RecursiveBlockProof from the same
-                // peer to cryptographically verify the snapshot before accepting it.
+                // SECURITY (Fix 3.2 + Fix 1.4): Do NOT apply the snapshot yet.
                 //
-                // The proof verification ensures the snapshot's state_root is anchored
-                // to a chain with valid PoW going back to genesis, preventing a malicious
-                // peer from injecting fabricated slot data even with a valid state_root.
+                // Fix 1.4: collect snapshots from multiple peers and pick the one with
+                // the highest tip_height before entering the 2-step verification flow.
+                // This prevents a single malicious first peer from providing a fabricated
+                // snapshot (Eclipse attack), since an attacker must now control ALL first
+                // N peers.
+                //
+                // Fix 3.2: once a candidate is selected, request a RecursiveBlockProof
+                // to cryptographically verify the snapshot before accepting it.
                 if snapshot.tip_height == 0 {
                     tracing::debug!(from = %from, "snapshot tip_height=0, ignoring");
+                } else if pending_snapshot.is_some() {
+                    // Already in the 2-step verification flow — do not override.
+                    // Buffer this snapshot in case we need it later (e.g. current
+                    // proof fails and we want to retry with a different candidate).
+                    if snapshot_candidates.len() < 3 {
+                        tracing::debug!(
+                            from = %from,
+                            tip = snapshot.tip_height,
+                            "already verifying a snapshot; storing as late candidate"
+                        );
+                        snapshot_candidates.push((from, snapshot));
+                    }
                 } else {
-                    tracing::info!(
-                        from = %from,
-                        tip = snapshot.tip_height,
-                        segments = snapshot.segments.len(),
-                        "received state snapshot — requesting recursive proof for verification"
-                    );
-                    pending_snapshot = Some(PendingSnapshot { from, snapshot });
-                    // Request the recursive chain proof from the same peer.
-                    // The response arrives as NetworkEvent::RecursiveProof and triggers
-                    // Step 2: verify the proof then apply the snapshot.
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: from })
-                        .await;
+                    // Collect into candidates (cap at 3).
+                    let tip_h = snapshot.tip_height;
+                    if snapshot_candidates.len() < 3 {
+                        snapshot_candidates.push((from, snapshot));
+                    }
+
+                    // Proceed when we have >= 2 candidates (Eclipse-resistant selection),
+                    // or immediately when only 1 peer is reachable (single-peer fallback).
+                    let should_proceed =
+                        snapshot_candidates.len() >= 2 || snapshot_requested_peers.len() <= 1;
+
+                    if should_proceed {
+                        // Pick the snapshot with the highest tip_height (most chainwork).
+                        let (best_peer, best_snapshot) = snapshot_candidates
+                            .drain(..)
+                            .max_by_key(|(_, s)| s.tip_height)
+                            .expect("snapshot_candidates is non-empty");
+
+                        tracing::info!(
+                            from = %best_peer,
+                            tip = best_snapshot.tip_height,
+                            segments = best_snapshot.segments.len(),
+                            "selected best snapshot — requesting recursive proof for verification"
+                        );
+                        pending_snapshot = Some(PendingSnapshot {
+                            from: best_peer,
+                            snapshot: best_snapshot,
+                        });
+                        // Request the recursive chain proof from the selected peer.
+                        // The response arrives as NetworkEvent::RecursiveProof and
+                        // triggers Step 2: verify proof then apply snapshot.
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestRecursiveProof {
+                                peer: best_peer,
+                            })
+                            .await;
+                    } else {
+                        tracing::info!(
+                            from = %from,
+                            tip = tip_h,
+                            candidates = snapshot_candidates.len(),
+                            "received snapshot — waiting for more candidates before selecting \
+                             (Eclipse attack protection)"
+                        );
+                    }
                 }
             }
 
@@ -1168,6 +1263,38 @@ async fn handle_p2p_events(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Orphan pool helper (Fix 1.5)
+// ---------------------------------------------------------------------------
+
+/// Insert a block into the orphan pool, evicting the lowest-height entry when
+/// the pool is at capacity.
+///
+/// Keyed by `block.header.prev_block_hash` so that when the missing parent
+/// arrives, `orphan_pool.remove(&parent_hash)` instantly finds the child.
+///
+/// Eviction policy: remove the orphan with the **lowest block height** first.
+/// This mimics LRU by height — stale orphans from a long-dead fork are
+/// discarded before newer ones that are more likely to be resolved.
+fn insert_orphan(
+    pool: &mut std::collections::HashMap<[u8; 32], noid_chain::block::Block>,
+    block: noid_chain::block::Block,
+) {
+    use noid_chain::consensus::params::FINALITY_DEPTH;
+    const MAX_ORPHAN_POOL: usize = FINALITY_DEPTH as usize * 2; // 36
+    if pool.len() >= MAX_ORPHAN_POOL {
+        // Find and evict the orphan with the lowest block height.
+        if let Some(key) = pool
+            .iter()
+            .min_by_key(|(_, b)| b.header.height)
+            .map(|(k, _)| *k)
+        {
+            pool.remove(&key);
+        }
+    }
+    pool.insert(block.header.prev_block_hash, block);
 }
 
 // ---------------------------------------------------------------------------
