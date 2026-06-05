@@ -466,10 +466,7 @@ The Full Node then:
 
 1. orders the surviving transactions (deterministic order sealed by
    PoW; §15.2 tie-break fixes any remaining ambiguity);
-2. generates **BlockStateBinding**: a STARK proving that all claimed
-   slot values match the current state tree (Merkle openings against
-   `prev_block_state_root`), that output slots are EMPTY, and that
-   the post-state `new_block_state_root` is correctly computed;
+2. enforces **BlockStateBinding** natively via `validate_block_consensus`: verifies that all claimed slot values match the current state (input slots non-empty with correct owner, output slots empty), and that `new_block_state_root` is correctly computed and committed to `block.header.state_root`. The `BlockStateBindingAir` ZK circuit is fully implemented; in-proof wiring is a future upgrade that will allow light clients to verify state correctness without running native validation. Full nodes already enforce the same guarantees natively today.
 3. aggregates all LogicProofs + BlockStateBinding into one
    `BlockProof` via deferred-opening aggregation;
 4. computes the resulting `state_root_next` and updates
@@ -1217,14 +1214,14 @@ continuously relative to a fixed anchor block.
 #### 18.3.1 Parameters
 
 ```
-  BLOCK_TIME     = 60 seconds      (target inter-block interval)
+  BLOCK_TIME     = 12 seconds      (target inter-block interval)
   EPOCH_LENGTH   = 6 blocks        (anchor update period)
-  HALFLIFE       = 360 seconds     (= EPOCH_LENGTH × BLOCK_TIME)
+  HALFLIFE       = 72 seconds      (= EPOCH_LENGTH × BLOCK_TIME = 6 × 12)
 ```
 
 The halflife means: if the last epoch took half the ideal time (miners
-found 6 blocks in 180s instead of 360s), difficulty doubles. If it took
-twice the ideal time (720s), difficulty halves.
+found 6 blocks in 36s instead of 72s), difficulty doubles. If it took
+twice the ideal time (144s), difficulty halves.
 
 #### 18.3.2 Anchor
 
@@ -1421,6 +1418,8 @@ Typical block with 100 transactions touching ~50 segments:
   - 50 × 8 Poseidon2b = negligible
 
 ### 19.7 In-circuit proof (BlockStateBinding)
+
+> **Implementation status**: The `BlockStateBindingAir` and its constraints are fully implemented. Currently, state correctness is enforced natively by `validate_block_consensus` (which verifies all slot openings and computes `new_block_state_root`). The `state_root` is committed in `block.header`, which is in turn committed in `proof_transcript_hash` and the recursive chain accumulator. In-proof ZK wiring of `BlockStateBindingAir` into `prove_block` is a future upgrade; security invariants are maintained by native checks today.
 
 To prove `slot[idx] = V` against `state_root`:
 

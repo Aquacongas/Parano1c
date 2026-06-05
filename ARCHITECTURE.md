@@ -724,9 +724,9 @@ Difficulty adjusts every 6 blocks (epoch) using ASERT:
 ```
   target = anchor_target × 2^((actual - ideal) / halflife)
 
-  BLOCK_TIME = 60s
+  BLOCK_TIME = 12s
   EPOCH      = 6 blocks
-  HALFLIFE   = 360s (one epoch)
+  HALFLIFE   = 72s  (= 6 blocks × 12s)
 ```
 
 If the last epoch ran 2x fast, difficulty doubles. If 2x slow, it

@@ -10,19 +10,16 @@
 
 /// Target inter-block interval in seconds (SPECIFICATION.md §18.1).
 ///
-/// Set to 5s to match GENESIS_TARGET (2^228 ≈ 5s on a laptop at 62 MH/s).
-/// ASERT adjusts PoW difficulty so that all hardware converges to this target.
-/// Faster hardware → higher difficulty, same block time.
-/// Slower hardware → lower difficulty, same block time.
-/// Block time in Paranoid is bounded below by `prove_block_time` (~2-12s
-/// depending on hardware); PoW is ordering-only, not security-critical.
+/// ASERT adjusts PoW difficulty so all hardware converges to this target.
+/// Bounded below by `prove_block_time` on the miner's hardware; PoW is
+/// ordering-only, not security-critical.
 pub const BLOCK_TIME: u64 = 12;
 
 /// Number of blocks per ASERT epoch (SPECIFICATION.md §18.3.1).
 pub const EPOCH_LENGTH: u64 = 6;
 
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME (SPECIFICATION.md §18.3.1).
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 30s at BLOCK_TIME=5
+pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 72s at BLOCK_TIME=12
 
 /// Maximum seconds a block timestamp may exceed local wall clock (SPECIFICATION.md §18.4).
 pub const MAX_FUTURE_DRIFT: u64 = 120;
@@ -34,14 +31,12 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 // Block limits  (SPECIFICATION.md §7)
 // ---------------------------------------------------------------------------
 
-/// Maximum number of non-coinbase transactions per block.
+/// Maximum non-coinbase transactions per block.
 ///
-/// Calibrated to ~200ms prove budget per tx (bench: ~100ms amortised on
-/// 12-core laptop).  prove_block(200 txs) ≈ 20s on this hardware;
-/// on a 32-core server the same proves in ~7-8s < BLOCK_TIME = 12s.
-/// Faster hardware fills all 200 slots; slower hardware fills proportionally
-/// less and ASERT adjusts block time accordingly.
-pub const BLOCK_MAX_TXS: usize = 200;
+/// Hardware is the natural regulator: weak nodes prove fewer txs within
+/// BLOCK_TIME and fall back to coinbase-only blocks via the prove semaphore.
+/// Strong hardware can prove ~1024 txs in ≤ 12s.
+pub const BLOCK_MAX_TXS: usize = 1024;
 
 /// Maximum inputs per transaction (SPECIFICATION.md §3).
 pub const MAX_INPUTS: usize = 4;

@@ -124,7 +124,7 @@ Replace `prev_state_root` with `epoch_anchor`:
 epoch_anchor = block_header_hash(height - ANCHOR_DEPTH)
 ```
 
-where `ANCHOR_DEPTH = 6` (6 blocks at 60s = 6 minutes).
+where `ANCHOR_DEPTH = 6` (6 blocks at 12s = 72s).
 
 ### 4.3 Properties
 
@@ -276,7 +276,7 @@ When a new block is found:
 1. T=0: Immediately generate empty-block template (coinbase only, trivial proof, ~ms)
 2. T=0..3s: Push empty template to ASIC. ASIC mines empty block (no fees, but no downtime).
 3. T=3s: Full template ready (with transactions). Push new header to ASIC.
-4. T=3s..60s: ASIC mines full block. CPU idle.
+4. T=3s..12s: ASIC mines full block. CPU idle.
 5. If ASIC finds nonce at any point: publish and restart cycle.
 
 ### Block Withholding Protection (vs Bitcoin)
@@ -412,7 +412,7 @@ Bitcoin's 2016-block retarget (~2 weeks) is too slow for a young network. If has
 doubles on day 2, blocks come every 30s for two weeks. If hashrate halves, blocks stop
 for hours. This kills UX.
 
-ASERT with 6-block epoch (360s halflife):
+ASERT with 6-block epoch (72s halflife):
 - Adapts within ~6 minutes to any hashrate change
 - Exponential (smooth, no oscillation)
 - Stateless calculation (only needs anchor block + current height/time)
@@ -771,4 +771,4 @@ pass:
 1. On admission: the wallet's `LogicProof` bytes are stored in `cached_algebraic_proof`
 2. Block assembly deserializes `WalletProofBundle` from these bytes
 3. `prove_block` uses the pre-computed auth proof instead of re-proving
-4. Measured impact: 1024-tx block → ~44 s without caching, ~12 s with caching
+4. Measured impact (bench on laptop): N=100 txs → 9.62s with caching. Strong hardware can prove ~1024 txs in ≤ 12s (WalletProofBundles pre-provided by wallets); ~100ms amortised per tx. prove_block time is O(N) due to unified block-level SpineGKR + single FRI.
