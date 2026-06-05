@@ -50,6 +50,18 @@ pub struct RpcHandler {
     /// (same effect as Ctrl-C). Wrapped in Mutex so the RPC handler can
     /// take ownership on first call.
     pub stop_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Address that receives block rewards in getBlockTemplate.
+    /// Always the node operator's address — external callers cannot override this.
+    pub mining_payout_address: noid_poseidon2b::primitives::Address,
+    /// Optional bearer token for external mining API access.
+    /// If None, only localhost callers may use getBlockTemplate / submitBlock
+    /// (enforced by binding RPC to 127.0.0.1 by default).
+    /// If Some(token), callers must include `Authorization: Bearer <token>`.
+    pub mining_key: Option<String>,
+    /// When true (requires mining_key to be set), external miners may specify
+    /// any valid address as `miner_address` in getBlockTemplate and receive
+    /// block rewards directly. The node operator earns via off-chain service fees.
+    pub allow_custom_coinbase: bool,
 }
 
 #[async_trait]
@@ -529,8 +541,33 @@ impl ParanoidApiServer for RpcHandler {
     /// ZK BlockProof which the full node generates. Changing the coinbase
     /// would require regenerating the entire proof.
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse> {
-        // Parse miner address (32-byte hex or empty for default).
-        let addr = parse_address_hex(&miner_address)?;
+        // Security: always use the node operator's payout address for the ZK proof.
+        // The coinbase is committed inside the proof — external callers cannot redirect
+        // rewards to themselves. The `miner_address` param is accepted for API
+        // compatibility but ONLY used when it equals the node's payout address or is empty.
+        // This prevents unauthorised coinbase hijacking via the template API.
+        let addr = if miner_address.is_empty() {
+            // Empty = use node's configured payout address (always allowed).
+            self.mining_payout_address
+        } else if self.allow_custom_coinbase {
+            // --allow-custom-coinbase is active (requires --mining-key):
+            // accept any valid address. The bearer token is already validated
+            // by the HTTP middleware before we reach this point.
+            parse_address_hex(&miner_address)?
+        } else {
+            // Default: coinbase is locked to the node's payout address.
+            // External callers cannot redirect rewards.
+            let requested = parse_address_hex(&miner_address)?;
+            if requested.0 != self.mining_payout_address.0 {
+                return Err(rpc_err(
+                    "miner_address must match the node's configured payout address. \
+                     Use empty string \"\" to use the node's address, or start the \
+                     node with --allow-custom-coinbase (requires --mining-key) to \
+                     allow miners to specify their own payout address.",
+                ));
+            }
+            requested
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -539,18 +576,44 @@ impl ParanoidApiServer for RpcHandler {
 
         let builder = TemplateBuilder::new(self.mempool.clone());
         let ctx = self.chain.read().await;
+        let prev_state_root = ctx.tip_header().state_root;
         let tmpl = builder
             .build(&ctx, addr, now)
             .await
             .ok_or_else(|| rpc_err("template build failed"))?;
+        drop(ctx);
 
-        // Serialize the header_core (212 bytes) as hex for external PoW.
-        let header_core = noid_chain::consensus::pow::header_core_bytes(&tmpl.header_for_pow(0));
+        let height = tmpl.inner.height;
         let n_txs = tmpl.inner.n_txs();
+        let pow_header = tmpl.header_for_pow(0);
+        let header_core = noid_chain::consensus::pow::header_core_bytes(&pow_header);
+        let diff_target = pow_header.difficulty_target;
+
+        // Run ZK prove so the full block (including proof fields) is ready.
+        // External miner only needs to patch the nonce — no other computation required.
+        // Coinbase-only blocks prove instantly; user-tx blocks take ~1-3 s.
+        let tmpl_for_prove = tmpl.clone();
+        let (proof_transcript_hash, witness_root, _proof_bytes) =
+            tokio::task::spawn_blocking(move || {
+                noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
+            })
+            .await
+            .map_err(|e| rpc_err(format!("prove task: {e}")))?;
+
+        // Seal block with nonce = 0. External miner patches bytes [144..160].
+        let sealed = tmpl.seal(0, proof_transcript_hash, witness_root);
+        let block_bytes = sealed.to_bytes();
+
+        // nonce_offset inside block bytes = header starts at byte 0,
+        // nonce is at NONCE_OFFSET (144) inside the header.
+        let nonce_offset = noid_chain::consensus::pow::NONCE_OFFSET;
 
         Ok(BlockTemplateResponse {
             header_core_hex: hex::encode(header_core),
-            height: tmpl.inner.height,
+            block_hex: hex::encode(block_bytes),
+            nonce_offset,
+            difficulty_target_hex: hex::encode(diff_target),
+            height,
             n_txs,
         })
     }
@@ -946,6 +1009,9 @@ pub async fn start_rpc_server(
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    mining_payout_address: noid_poseidon2b::primitives::Address,
+    mining_key: Option<String>,
+    allow_custom_coinbase: bool,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
@@ -959,9 +1025,104 @@ pub async fn start_rpc_server(
         wallet,
         p2p_cmd,
         stop_tx,
+        mining_payout_address,
+        mining_key: mining_key.clone(),
+        allow_custom_coinbase,
     };
-    let server = Server::builder().build(listen).await?;
+
+    // Always add the Bearer-auth middleware layer.
+    // When mining_key is None it is a transparent pass-through.
+    // When Some(key), all requests must carry `Authorization: Bearer <key>`.
+    //
+    // Pool operators:  paranoid --rpc-listen 0.0.0.0:9401 --mining-key <secret>
+    // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
+    let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
+    let server = Server::builder()
+        .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
+            expected: expected_bearer,
+        }))
+        .build(listen)
+        .await
+        .map_err(|e| anyhow::anyhow!("build RPC server: {e}"))?;
     let handle = server.start(handler.into_rpc());
     tracing::debug!(%listen, "RPC server started");
     Ok((handle, stop_rx))
+}
+
+// ---------------------------------------------------------------------------
+// Simple Bearer-token HTTP middleware
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct BearerAuthLayer {
+    /// `None` = pass-through (no auth required). `Some(s)` = require `Authorization: <s>`.
+    expected: Option<String>,
+}
+
+impl<S> tower::Layer<S> for BearerAuthLayer {
+    type Service = BearerAuthService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        BearerAuthService {
+            inner,
+            expected: self.expected.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BearerAuthService<S> {
+    inner: S,
+    expected: Option<String>,
+}
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+impl<S, B> tower::Service<http::Request<B>> for BearerAuthService<S>
+where
+    S: tower::Service<http::Request<B>, Response = http::Response<jsonrpsee::server::HttpBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<jsonrpsee::server::HttpBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        // No key configured — pass through unconditionally.
+        let Some(ref expected) = self.expected else {
+            let fut = self.inner.call(req);
+            return Box::pin(async move { fut.await });
+        };
+
+        let auth = req
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if auth == expected {
+            let fut = self.inner.call(req);
+            Box::pin(async move { fut.await })
+        } else {
+            Box::pin(async {
+                Ok(http::Response::builder()
+                    .status(http::StatusCode::UNAUTHORIZED)
+                    .header(
+                        http::header::WWW_AUTHENTICATE,
+                        "Bearer realm=\"paranoid-rpc\"",
+                    )
+                    .body(jsonrpsee::server::HttpBody::empty())
+                    .expect("static 401 response"))
+            })
+        }
+    }
 }

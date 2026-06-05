@@ -303,12 +303,11 @@ echo "--- Step 5: RECONNECT — kill C, restart with seeds=A ---"
 kill "$PID_C" 2>/dev/null || true
 wait "$PID_C" 2>/dev/null || true
 
-echo "  Restarting C with seeds=[A]..."
+echo "  Restarting C with seeds=[A] (sync only, no mine)..."
 "$BIN" \
     --data-dir "$TMPDIR_C" \
     --p2p-listen "$P2P_C" \
     --rpc-listen 127.0.0.1:18043 \
-    --mine \
     --seed "$P2P_A" \
     > "$LOG_C" 2>&1 &
 PID_C=$!

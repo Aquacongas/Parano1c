@@ -117,8 +117,10 @@ pub fn is_final(block_height: u64, tip_height: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
+    use crate::consensus::params::BLOCK_TIME;
     use noid_poseidon2b::primitives::Address;
+    // Any hash satisfies this target — nonce=0 always works, no search needed.
+    const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
     fn make_header(height: u64, timestamp: u64, parent: Option<&BlockHeader>) -> BlockHeader {
         let prev_hash = parent.map(full_block_hash).unwrap_or([0u8; 32]);
@@ -130,7 +132,7 @@ mod tests {
             height,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32], // non-zero
             witness_root: [0u8; 32],
             log_slots: 24,
@@ -140,9 +142,9 @@ mod tests {
     }
 
     fn mine(header: &mut BlockHeader) {
-        use crate::consensus::pow::search_pow;
-        let nonce = search_pow(header, 0, 10_000_000).expect("should find nonce");
-        header.nonce = nonce;
+        // TEST_TARGET: nonce=0 trivially satisfies any target of [0xFF;32].
+        // search_pow(header, 0, 1) would always return Some(0).
+        header.nonce = 0;
     }
 
     #[test]

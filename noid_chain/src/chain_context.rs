@@ -64,6 +64,11 @@ pub struct ChainContext {
     pub tip_hash: [u8; 32],
 }
 
+/// PoW target that is trivially satisfiable for any nonce.
+/// Used exclusively in tests — any Blake3 hash is < `[0xFF; 32]`.
+#[cfg(test)]
+pub(crate) const TEST_TARGET: [u8; 32] = [0xFF; 32];
+
 impl ChainContext {
     /// Initialise a fresh chain context from the genesis block.
     ///
@@ -206,6 +211,34 @@ impl ChainContext {
     pub fn header_count(&self) -> usize {
         self.headers.len()
     }
+
+    /// Test-only: initialise a chain from a fake genesis with a trivially-satisfiable
+    /// PoW target (`[0xFF; 32]`). Any nonce satisfies this target, so all subsequent
+    /// blocks can use `nonce = 0`.  ASERT with perfect `BLOCK_TIME` timing always
+    /// returns the same easy target, so all chained blocks are consistent.
+    #[cfg(test)]
+    pub fn init_from_easy_genesis() -> Self {
+        // Override difficulty_target only; keep all other genesis fields identical
+        // so the rest of the consensus logic is exercised normally.
+        let mut genesis = crate::consensus::genesis::genesis_header();
+        genesis.difficulty_target = TEST_TARGET;
+        // nonce = 0 trivially satisfies TEST_TARGET (any Blake3 hash < 0xFF..FF).
+        genesis.nonce = 0;
+
+        let state = crate::state::ChainState::new();
+        let mut headers = std::collections::HashMap::new();
+        let genesis_hash = crate::consensus::pow::full_block_hash(&genesis);
+        headers.insert(0u64, genesis);
+
+        Self {
+            headers,
+            nullifiers: crate::nullifier::NullifierSet::new(),
+            state,
+            undo_logs: std::collections::HashMap::new(),
+            tip_height: 0,
+            tip_hash: genesis_hash,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,9 +252,13 @@ mod tests {
     use crate::block_header::BlockHeader;
     use crate::consensus::{
         genesis::GENESIS_TIMESTAMP,
-        params::{BLOCK_TIME, GENESIS_TARGET, MEDIAN_TIME_BLOCKS, UNDO_LOG_RETENTION},
-        pow::{full_block_hash, search_pow},
+        params::{BLOCK_TIME, MEDIAN_TIME_BLOCKS, UNDO_LOG_RETENTION},
+        pow::full_block_hash,
     };
+    // Easy target for test blocks: any Blake3 hash satisfies hash < 0xFF..FF.
+    // ASERT with perfect BLOCK_TIME timing returns this same target for every
+    // subsequent block, so all chained test blocks can use nonce = 0.
+    use crate::chain_context::TEST_TARGET;
     use noid_poseidon2b::primitives::Address;
 
     fn build_empty_block_on(ctx: &mut ChainContext) -> Block {
@@ -237,16 +274,15 @@ mod tests {
             height: parent.height + 1,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        let nonce =
-            search_pow(&header, 0, 100_000_000).expect("genesis target trivially satisfiable");
-        header.nonce = nonce;
+        // TEST_TARGET: nonce = 0 always satisfies the target — no search needed.
+        header.nonce = 0;
         Block {
             header,
             transactions: vec![],
@@ -267,7 +303,7 @@ mod tests {
 
     #[test]
     fn apply_next_block_advances_tip() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         let block = build_empty_block_on(&mut ctx);
         let ts = block.header.timestamp + 1;
         let result = ctx.apply_next_block(&block, ts);
@@ -278,7 +314,7 @@ mod tests {
 
     #[test]
     fn three_consecutive_blocks_apply() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         for expected_height in 1..=3u64 {
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
@@ -291,7 +327,7 @@ mod tests {
 
     #[test]
     fn undo_logs_pruned_after_retention() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         // Apply UNDO_LOG_RETENTION + 2 blocks.
         for _ in 0..(UNDO_LOG_RETENTION + 2) {
             let block = build_empty_block_on(&mut ctx);
@@ -309,18 +345,18 @@ mod tests {
 
     #[test]
     fn bad_parent_hash_rejected() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         let mut block = build_empty_block_on(&mut ctx);
         block.header.prev_block_hash = [0xAB; 32]; // wrong
-                                                   // Re-mine PoW with the tampered header.
-        block.header.nonce = search_pow(&block.header, 0, 100_000_000).unwrap();
+        // TEST_TARGET: nonce = 0 always satisfies the target after tampering.
+        block.header.nonce = 0;
         let result = ctx.apply_next_block(&block, block.header.timestamp + 1);
         assert_eq!(result, Err(ConsensusError::BadParentHash));
     }
 
     #[test]
     fn prev_timestamps_covers_up_to_11_headers() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..15 {
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;

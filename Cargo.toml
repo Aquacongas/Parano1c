@@ -19,6 +19,8 @@ members = [
     "noid_p2p",
     "noid_rpc",
     "noid_node",
+    # External tools
+    "noid_extminer",
 ]
 resolver = "2"
 

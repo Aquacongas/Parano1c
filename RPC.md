@@ -73,9 +73,11 @@ paranoid [OPTIONS]
 | `--genesis` | flag | off | **Bootstrap only.** Start mining immediately without waiting for peers. Use only for the very first node on a new network. |
 | `--data-dir <PATH>` | path | `~/.paranoid/data` | MDBX database directory and wallet key location. |
 | `--p2p-listen <HOST:PORT>` | string | `0.0.0.0:9400` | P2P TCP listener. Converted to libp2p multiaddr internally. |
-| `--rpc-listen <HOST:PORT>` | string | `127.0.0.1:9401` | JSON-RPC HTTP listener. |
+| `--rpc-listen <HOST:PORT>` | string | `127.0.0.1:9401` | JSON-RPC HTTP listener. Default binds to localhost only — safe for solo mining. |
 | `--seed <HOST:PORT>` | string (repeatable) | — | Bootstrap peer. Repeat for multiple seeds: `--seed a:9400 --seed b:9400` |
-| `--miner-address <HEX>` | 64-char hex | wallet address | Coinbase recipient. Defaults to built-in wallet primary address. |
+| `--miner-address <HEX>` | bech32m or hex | wallet address | Coinbase payout address. Defaults to built-in wallet primary address. Also used as the only permitted address in `getBlockTemplate`. |
+| `--mining-key <TOKEN>` | string | — | **Pool/external miner auth.** When set, all RPC requests must include `Authorization: Bearer <TOKEN>`. Required when exposing `--rpc-listen` to external networks. Min 16 chars recommended. |
+| `--allow-custom-coinbase` | flag | off | Allow external miners to specify their own payout address in `getBlockTemplate`. **Requires `--mining-key`** — will not start without it. See [MINING.md](MINING.md) for the infrastructure pool model. |
 | `--threads <N>` | integer | `0` | PoW rayon threads. `0` = all physical cores. |
 | `--log <LEVEL>` | string | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace`. |
 
@@ -106,8 +108,8 @@ paranoid --data-dir /var/lib/paranoid --seed 1.2.3.4:9400
 # Testnet with easy PoW
 paranoid --network testnet --mine --genesis --data-dir ~/.paranoid-testnet
 
-# RPC accessible from LAN (for external miners, monitoring)
-paranoid --mine --rpc-listen 0.0.0.0:9401
+# Pool operator: expose RPC with bearer token auth
+paranoid --mine --rpc-listen 0.0.0.0:9401 --mining-key "$(openssl rand -hex 32)"
 ```
 
 ### 2.2 TOML Config File
@@ -172,7 +174,7 @@ enabled = true
 | P2P protocol | `/noid/mainnet/1.0.0` | `/noid/testnet/1.0.0` |
 | Magic bytes | `0x4E4F4944` ("NOID") | `0x544E4F49` ("TNOI") |
 | DNS seeds | `seed1.noid.network`, `seed2.noid.network` | `testnet-seed.noid.network` |
-| Genesis PoW target | `2^235` (~65K hashes) | `2^252` (trivial) |
+| Genesis PoW target | `2^248` (~256 hashes avg) | `2^248` (trivial) |
 | Block time | 60 s | 60 s |
 | Block reward | 50 NOID | 50 NOID |
 
@@ -198,14 +200,26 @@ The node requests a state snapshot from the first peer it connects to (O(1) sync
 paranoid --seed seed1.noid.network:9400 --data-dir ~/.paranoid
 ```
 
-**Scenario D — Pool operator (expose RPC to miners)**
+**Scenario D — Pool operator (expose RPC to authorised miners)**
 ```bash
+MINING_KEY="$(openssl rand -hex 32)"
+
+# Managed pool: node gets all rewards, distributes off-chain
 paranoid \
-  --mine \
+  --mine --rpc-listen 0.0.0.0:9401 \
+  --mining-key "$MINING_KEY" \
+  --seed seed1.noid.network:9400 \
+  --data-dir /var/lib/paranoid
+
+# Infrastructure pool: each miner gets rewards to their own address
+paranoid \
   --rpc-listen 0.0.0.0:9401 \
+  --mining-key "$MINING_KEY" \
+  --allow-custom-coinbase \
   --seed seed1.noid.network:9400 \
   --data-dir /var/lib/paranoid
 ```
+See [MINING.md](MINING.md) for a full explanation of all mining models.
 
 **Scenario E — Testnet development**
 ```bash
@@ -1739,51 +1753,90 @@ For external miners connecting via the Block Template API (Stratum-equivalent).
 #### `paranoid_getBlockTemplate`
 Returns the current PoW template for an external miner.
 
+> **Authentication required** when `--mining-key` is set on the daemon:
+> ```
+> Authorization: Bearer <token>
+> ```
+> Without a valid token the server returns `401 Unauthorized`.
+
 ```json
 {
   "method": "paranoid_getBlockTemplate",
-  "params": ["f7845242ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1"]
+  "params": [""]   ← empty string to use the node’s configured payout address
 }
 ```
 
 | Param | Type | Description |
 |---|---|---|
-| `miner_address` | `hex` | Coinbase reward address (64-char hex). Empty string = wallet address. |
+| `miner_address` | bech32m \| hex \| `""` | Must be empty (`""`) **or** exactly match the node’s configured payout address (`--miner-address`). Any other value is rejected with an error. This prevents coinbase hijacking: only the node operator controls where rewards go. |
 
 ```json
 {
-  "header_core_hex": "f7845242ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1...",
+  "header_core_hex": "a3f9...",
+  "block_hex": "a3f9...00000000000000000000000000000000...",
+  "nonce_offset": 144,
+  "difficulty_target_hex": "000000...ff",
   "height": 1338,
   "n_txs": 5
 }
 ```
 
-**PoW specification:**
+| Field | Description |
+|---|---|
+| `header_core_hex` | 212-byte PoW input (hex). Hash this with patched nonce. |
+| `block_hex` | Full sealed block bytes (hex) with `nonce = 0`. Patch the nonce here and submit directly. |
+| `nonce_offset` | Byte offset of the nonce inside `block_hex`. Always 144. |
+| `difficulty_target_hex` | 256-bit LE target (hex). Valid when `Blake3(header_core) < target`. |
+| `height` | Block height this template builds on. |
+| `n_txs` | Total transaction count including coinbase. |
+
+**Complete external miner algorithm:**
 ```
-header_core = first 212 bytes of the 276-byte block header
-             (excludes proof_transcript_hash and witness_root)
-
-valid nonce N satisfies:
-  Blake3(header_core || N_as_16_byte_LE) ≤ difficulty_target
-  where N ∈ [0, 2^128)
-
-difficulty_target = 256-bit little-endian integer
+1. recv  ← getBlockTemplate("")
+2. buf   ← copy(header_core_hex decoded, 212 bytes)
+3. loop  nonce = 0, 1, 2, ...:
+     buf[144..160] = nonce.to_le_bytes()   # patch nonce in header_core
+     hash = Blake3(buf)
+     if hash < difficulty_target_hex decoded:
+         break
+4. block ← copy(block_hex decoded)
+   block[nonce_offset : nonce_offset+16] = nonce.to_le_bytes()
+5. submitBlock(block.hex())
 ```
 
-**Block-withholding protection:** The `state_root` and `miner_address` are committed inside `header_core`. Changing the coinbase requires regenerating the ZK BlockProof (1–3 CPU seconds). External miners cannot steal blocks.
+**Note:** `getBlockTemplate` runs ZK block proving internally (~instant for coinbase-only, ~1-3s for user-tx blocks). The returned `block_hex` is fully proved; only the nonce needs to be found.
+
+**Security model:**
+- **Coinbase lock:** The reward address is fixed to the node’s `--miner-address` (or wallet primary). External miners cannot redirect rewards to themselves.
+- **Block-withholding protection:** `state_root` and coinbase address are committed inside `header_core` which is the PoW input. A miner cannot change the coinbase after receiving the template without invalidating the PoW.
+- **ZK proof stays with the node:** The full node generates the ZK BlockProof internally. External miners only do Blake3 PoW search.
+
+**Pool workflow:**
+```
+1. Pool node: paranoid --mine --rpc-listen 0.0.0.0:9401 --mining-key SECRET
+2. Miner:     GET /  {getBlockTemplate, params:[""]}  Authorization: Bearer SECRET
+3. Miner:     brute-forces nonce N such that Blake3(patched_header_core) < target
+4. Miner:     POST / {submitBlock, params:[full_block_hex]}  Authorization: Bearer SECRET
+5. Pool node: validates block, applies to chain, broadcasts to P2P
+6. Reward:    goes to pool node’s address (configured at startup)
+```
 
 ---
 
 #### `paranoid_submitBlock`
 Submit a solved block (full block bytes with valid nonce).
 
+> **Authentication required** when `--mining-key` is set (same `Authorization: Bearer` header as `getBlockTemplate`).
+
 ```json
 {
   "method": "paranoid_submitBlock",
-  "params": ["f7845242ea6c2b610a7d0c08f08ef16a..."]
+  "params": ["<full_block_hex>"]
 }
 // → "f7845242ea6c2b610a7d0c08f08ef16a2ff366148bd07541ec15a6f3e2b4c9d1"  (block hash)
 ```
+
+The block bytes must contain the solved nonce in the header. The node runs full consensus validation (PoW, state root, ZK proof if present) before accepting.
 
 ---
 
@@ -1929,6 +1982,12 @@ Gracefully stop the daemon.
 | `-32602` | `InvalidParams` | Invalid parameters (wrong types or count). |
 | `-32000` | `ServerError` | Application-level error (see `message` field). |
 
+### HTTP Errors (mining API with `--mining-key`)
+
+| HTTP Status | When | Action |
+|---|---|---|
+| `401 Unauthorized` | Request missing or has wrong `Authorization: Bearer` header | Add `Authorization: Bearer <token>` header matching `--mining-key`. |
+
 ### Common Application Errors (`code: -32000`)
 
 | Message | When | Action |
@@ -1943,6 +2002,7 @@ Gracefully stop the daemon.
 | `MalformedIntent` | TxIntent bytes corrupt or wrong format | Check encoding. |
 | `NullifierCollision` | TX attempts double-spend | Input UTXO already spent. |
 | `nothing to consolidate` | `walletConsolidate` with ≤ 1 UTXO | Nothing to do; wallet already consolidated. |
+| `miner_address must match the node’s configured payout address` | `getBlockTemplate` called with a different address and `--allow-custom-coinbase` not set | Pass `""` (empty string) to use the node’s address, or ask the operator to start with `--allow-custom-coinbase`. |
 
 ### CLI Exit Codes
 

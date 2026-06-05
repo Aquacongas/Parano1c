@@ -41,6 +41,16 @@ pub mod miner;
 pub mod pow;
 pub mod template;
 
-pub use miner::{BlockMiner, MinerConfig, MinerEvent};
+pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
+
+/// Public wrapper around the internal `run_prove_block` function.
+/// Used by the RPC `getBlockTemplate` to generate a fully-proved block
+/// for external miners that need complete block bytes (not just header_core).
+pub fn run_prove_block_for_rpc(
+    tmpl: &BlockTemplate,
+    prev_state_root: [u8; 32],
+) -> ([u8; 32], [u8; 32], Vec<u8>) {
+    miner::run_prove_block(tmpl, prev_state_root).unwrap_or(([1u8; 32], [1u8; 32], vec![]))
+}

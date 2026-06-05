@@ -28,12 +28,10 @@
 //!   Prove: ~10s (parallel algebraic STARK + unified GKR + FRI)
 //!   → PoW is the bottleneck; no block time wasted on proving.
 //!
-//! ## Empty-block fallback
-//!
-//! When a new P2P block arrives while proving is in progress:
-//! 1. Cancel the current PoW search immediately.
-//! 2. The prove task is allowed to complete (async, non-blocking).
-//! 3. Start fresh with a new template on the new chain tip.
+//! Template refresh triggers (see run loop):
+//!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
+//!   2. First `TxAdmitted` while prove is done (Sealed state — semaphore free, PoW running)
+//!   3. New chain tip from P2P (block received or snapshot applied)
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -65,8 +63,6 @@ pub struct MinerConfig {
     pub pow_threads: usize,
     /// Template refresh heartbeat interval (seconds). Default: 15.
     pub refresh_interval_secs: u64,
-    /// Refresh template when this many new txs are admitted. Default: 100.
-    pub refresh_on_new_txs: usize,
 }
 
 impl Default for MinerConfig {
@@ -75,7 +71,6 @@ impl Default for MinerConfig {
             miner_address: Address([0u8; 32]),
             pow_threads: 0,
             refresh_interval_secs: 15,
-            refresh_on_new_txs: 100,
         }
     }
 }
@@ -309,6 +304,12 @@ impl BlockMiner {
 
             cancel.store(false, Ordering::Relaxed);
 
+            // Track when prove completes so the TxAdmitted arm can detect "Sealed" state:
+            // prove_done=true means the semaphore has been released and PoW is still running —
+            // safe to cancel PoW and rebuild with newly admitted txs at zero prove-work cost.
+            let prove_done = Arc::new(AtomicBool::new(false));
+            let prove_done_clone = prove_done.clone();
+
             // --- Parallel: PoW + ZK prove ---
             // Extract only the PoW header — avoids cloning the full BlockTemplate
             // (which includes all transaction and proof bytes) just for PoW.
@@ -343,8 +344,16 @@ impl BlockMiner {
             // stub for coinbase-only blocks when the prove slot is already occupied.
             let prove_handle = match prove_permit {
                 Ok(permit) => tokio::task::spawn_blocking(move || {
-                    let _permit = permit; // holds the semaphore for the duration of the proof
-                    run_prove_block(&tmpl_prove, prev_state_root)
+                    // Run prove inside a scope so the semaphore permit is released
+                    // BEFORE we set prove_done. This guarantees: when the miner loop
+                    // sees prove_done=true, the semaphore is already free for the next
+                    // template rebuild.
+                    let result = {
+                        let _permit = permit;
+                        run_prove_block(&tmpl_prove, prev_state_root)
+                    };
+                    prove_done_clone.store(true, Ordering::Release);
+                    result
                 }),
                 Err(_) => {
                     // Semaphore busy, but coinbase-only block — stub is consensus-legal.
@@ -352,7 +361,11 @@ impl BlockMiner {
                         height,
                         "prove task busy, will use stub proof (coinbase-only this round)"
                     );
-                    tokio::task::spawn_blocking(move || Ok(([1u8; 32], [1u8; 32], vec![])))
+                    tokio::task::spawn_blocking(move || {
+                        // Stub is instant; mark prove_done so TxAdmitted can trigger rebuild.
+                        prove_done_clone.store(true, Ordering::Release);
+                        Ok(([1u8; 32], [1u8; 32], vec![]))
+                    })
                 }
             };
 
@@ -425,17 +438,29 @@ impl BlockMiner {
 
                 _ = heartbeat.tick() => {
                     cancel.store(true, Ordering::Relaxed);
-                    tracing::debug!("heartbeat: refreshing template");
+                    tracing::debug!("heartbeat: refreshing template (safety net)");
                 }
 
                 event = mempool_events.recv() => {
                     if let Ok(noid_mempool::MempoolEvent::TxAdmitted { .. }) = event {
-                        if self.mempool.new_since_refresh().await >= self.config.refresh_on_new_txs {
+                        if prove_done.load(Ordering::Acquire) {
+                            // Sealed state: prove is done (semaphore free) and PoW is still
+                            // running. We can cancel PoW and rebuild immediately at zero
+                            // prove-work cost — the new template will include this tx.
                             cancel.store(true, Ordering::Relaxed);
-                            self.mempool.reset_refresh_counter().await;
-                            tracing::debug!("mempool growth: refreshing template");
+                            tracing::debug!("sealed-state: new tx admitted, cancelling PoW for immediate inclusion");
                         }
+                        // Proving state: don't cancel — the in-flight prove work would be
+                        // wasted. The tx sits in mempool and is picked up when prove finishes
+                        // and the next template is built.
                     }
+                }
+
+                _ = self.sync_ready.notified() => {
+                    // A new chain tip is available (P2P block applied or snapshot synced).
+                    // Cancel current PoW so the next iteration mines on the correct tip.
+                    cancel.store(true, Ordering::Relaxed);
+                    tracing::debug!("sync_ready: new chain tip, cancelling PoW to rebuild");
                 }
             }
         }
@@ -497,7 +522,7 @@ impl BlockMiner {
 /// `state_bindings = &[]` is intentional. Full ZK state
 /// binding via `BlockStateBindingAir` is not yet wired in. Native consensus checks
 /// enforce state correctness; the proof proves LogicProof validity only.
-fn run_prove_block(
+pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
 ) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {

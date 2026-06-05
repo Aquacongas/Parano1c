@@ -35,8 +35,20 @@ pub struct ReceiptVerifyResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockTemplateResponse {
-    /// 212-byte header_core as hex (PoW input for external miner).
+    /// 212-byte header_core as hex — the exact 212-byte buffer to hash.
+    /// Patch bytes [144..160] (the nonce field, 16 bytes LE u128) to try each nonce.
+    /// Valid nonce N satisfies: Blake3(patched_header_core) < difficulty_target.
     pub header_core_hex: String,
+    /// Full sealed block bytes (hex) with nonce = 0.
+    /// External miner: patch bytes at nonce_offset (144..160) with the found nonce
+    /// and submit the result directly to `submitBlock`.
+    /// No other fields need to change — the ZK proof is already embedded.
+    pub block_hex: String,
+    /// Byte offset of the nonce field inside `block_hex` (NOT inside `header_core_hex`).
+    /// Always 144 bytes from the start of the block header (= start of block bytes).
+    pub nonce_offset: usize,
+    /// Difficulty target as 64-char little-endian hex. Find N such that Blake3(patched_header_core) < target.
+    pub difficulty_target_hex: String,
     pub height: u64,
     pub n_txs: usize,
 }

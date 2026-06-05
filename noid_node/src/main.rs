@@ -108,6 +108,33 @@ struct Cli {
     /// PoW mining threads. 0 = all physical cores.
     #[arg(long, value_name = "N", default_value_t = 0)]
     threads: usize,
+
+    /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
+    ///
+    /// When set, external callers must include `Authorization: Bearer <TOKEN>` in
+    /// HTTP requests to use the mining methods. Without this flag the mining API
+    /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
+    ///
+    /// Pool example:
+    ///   paranoid --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t
+    ///   # External miner: Authorization: Bearer s3cr3t
+    #[arg(long, value_name = "TOKEN")]
+    mining_key: Option<String>,
+
+    /// Allow external miners to specify their own coinbase address in getBlockTemplate.
+    ///
+    /// REQUIRES --mining-key to be set. Without --mining-key this flag is rejected
+    /// at startup to prevent unauthenticated access to custom-coinbase templates.
+    ///
+    /// Use case: infrastructure pool where the node provides ZK-proving and P2P
+    /// relay, but each miner receives block rewards directly to their own address.
+    /// The node operator earns via an off-chain service fee, not via coinbase.
+    ///
+    /// Example:
+    ///   paranoid --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t --allow-custom-coinbase
+    ///   # Miner: getBlockTemplate("noid1their_own_address")
+    #[arg(long, requires = "mining_key")]
+    allow_custom_coinbase: bool,
 }
 
 /// Resolve a seed string to a libp2p Multiaddr.
@@ -388,12 +415,42 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
+    // Payout address for the mining template API: --miner-address flag or wallet primary.
+    let mining_payout_address = if cfg.mining.miner_address.is_empty() {
+        let guard = shared_wallet.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.primary_address())
+            .unwrap_or(noid_poseidon2b::primitives::Address([0u8; 32]))
+    } else {
+        parse_address(&cfg.mining.miner_address)?
+    };
+    if let Some(ref key) = cli.mining_key {
+        if key.len() < 16 {
+            tracing::warn!(
+                "--mining-key is short (<16 chars) — use a longer random token in production"
+            );
+        }
+        tracing::info!(
+            allow_custom_coinbase = cli.allow_custom_coinbase,
+            "mining API: external access enabled with bearer token authentication"
+        );
+        if cli.allow_custom_coinbase {
+            tracing::info!(
+                "mining API: --allow-custom-coinbase active — \
+                 authenticated miners may specify their own payout address"
+            );
+        }
+    }
     let (rpc_handle, rpc_stop_rx) = start_rpc_server(
         rpc_listen,
         chain.clone(),
         mempool.clone(),
         wallet,
         p2p.cmd_tx.clone(),
+        mining_payout_address,
+        cli.mining_key,
+        cli.allow_custom_coinbase,
     )
     .await
     .context("start RPC server")?;
@@ -897,38 +954,51 @@ async fn handle_p2p_events(
                                     }
                                     None => {
                                         // Parent NOT in our chain.
-                                        // ALWAYS use batch headers to find the common ancestor efficiently.
-                                        // This resolves ANY fork depth in O(1) round-trips:
-                                        //   1. Fetch the peer's headers for the last FINALITY_DEPTH*2 blocks
-                                        //   2. Find common ancestor by comparing with our stored headers
-                                        //   3. Request only the blocks we're missing
                                         //
-                                        // We do NOT fall back to single-hop (one parent at a time) because:
-                                        //   - At mainnet, a large pool joining makes blocks sub-second temporarily
-                                        //   - Single-hop traversal can't keep up when chains diverge by 50+ blocks
-                                        //   - Batch headers always resolves in O(1) regardless of fork depth
-                                        let fetch_from =
-                                            our_tip_height.saturating_sub(FINALITY_DEPTH);
+                                        // Heuristic: if the competing block is clearly deeper than our finality
+                                        // window, skip FetchHeaders entirely and request a snapshot directly.
+                                        // Paranoid's O(1) snapshot sync (snapshot + RecursiveProof) is correct
+                                        // regardless of fork depth, and is faster than N round-trips of block
+                                        // fetching for deep forks where peers may no longer have the old blocks.
+                                        //
+                                        // FetchHeaders is only worth doing for shallow forks (within FINALITY_DEPTH)
+                                        // where block-by-block reorg is possible.
+                                        let block_height = block.header.height;
+                                        let is_deep_fork = block_height > our_tip_height
+                                            && (block_height - our_tip_height) > FINALITY_DEPTH;
 
-                                        tracing::info!(
-                                            our_height = our_tip_height,
-                                            block_height = block.header.height,
-                                            peer = %from,
-                                            fetch_from,
-                                            "orphan block — fetching batch headers to find common ancestor"
-                                        );
-
-                                        // Buffer the orphan
                                         insert_orphan(&mut orphan_pool, block);
 
-                                        // Request batch headers to find ancestor in O(1) round-trip
-                                        let _ = p2p_cmd
-                                            .send(noid_p2p::NetworkCommand::FetchHeaders {
-                                                peer: from,
-                                                start_height: fetch_from,
-                                                count: (FINALITY_DEPTH as u16 * 2).min(512),
-                                            })
-                                            .await;
+                                        if is_deep_fork {
+                                            tracing::info!(
+                                                our_tip = our_tip_height,
+                                                their_tip = block_height,
+                                                gap = block_height - our_tip_height,
+                                                peer = %from,
+                                                "deep fork (gap > FINALITY_DEPTH) — requesting snapshot directly"
+                                            );
+                                            let _ = p2p_cmd
+                                                .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
+                                                .await;
+                                        } else {
+                                            // Shallow fork: fetch batch headers to find the common ancestor.
+                                            let fetch_from =
+                                                our_tip_height.saturating_sub(FINALITY_DEPTH);
+                                            tracing::info!(
+                                                our_height = our_tip_height,
+                                                block_height,
+                                                peer = %from,
+                                                fetch_from,
+                                                "shallow orphan — fetching batch headers to find common ancestor"
+                                            );
+                                            let _ = p2p_cmd
+                                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                                    peer: from,
+                                                    start_height: fetch_from,
+                                                    count: (FINALITY_DEPTH as u16 * 2).min(512),
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -945,13 +1015,13 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
                 tracing::debug!(peer = %from, "received tx from P2P");
 
-                // Per-peer rate limiting: enforce sliding-window cap before any
-                // further processing (including ZK proof verification).
+                // Per-peer rate limiting: enforce before any further processing.
+                // This check is synchronous (O(1) HashMap lookup) so the event loop
+                // is not blocked; the heavy ZK verify is spawned below.
                 {
                     let now = Instant::now();
                     let entry = peer_tx_rate.entry(from.clone()).or_insert((0, now));
                     if now.duration_since(entry.1) > TX_RATE_WINDOW {
-                        // Window expired — reset counter for new window.
                         *entry = (1, now);
                     } else if entry.0 >= TX_RATE_MAX {
                         tracing::debug!(peer = %from, "tx rate limit exceeded, dropping");
@@ -961,29 +1031,42 @@ async fn handle_p2p_events(
                     }
                 }
 
-                // Periodic cleanup of stale entries (peers silent for >60 s).
+                // Periodic cleanup of stale rate-limit entries.
                 tx_event_count += 1;
                 if tx_event_count % 100 == 0 {
                     let cutoff = Instant::now() - Duration::from_secs(60);
                     peer_tx_rate.retain(|_, (_, window_start)| *window_start >= cutoff);
                 }
 
-                match noid_tx::TxIntent::from_bytes(&intent_bytes) {
-                    Ok(intent) => {
-                        match mempool.submit(intent, intent_bytes).await {
-                            Ok(hash) => {
-                                tracing::debug!(hash = ?hash, "P2P tx admitted");
-                            }
-                            Err(e) if e.is_soft() => {
-                                // Soft reject — normal (duplicate, slot conflict). Ignore.
-                            }
-                            Err(e) => {
-                                tracing::debug!(err = %e, "P2P tx rejected");
+                // Spawn ZK verify + mempool admit as a background task.
+                //
+                // WHY: `mempool.submit()` runs a ZK proof verify (~84ms, CPU-bound via
+                // spawn_blocking) under an async semaphore. If we await it here, the
+                // entire P2P event loop stalls for 84ms — delaying block propagation.
+                //
+                // SAFETY: `mempool.submit()` never touches the chain (Arc<RwLock<...>>),
+                // only the mempool's internal Arc<Mutex<MempoolState>>. Concurrent task
+                // access is safe. P2P relay of admitted txs is handled by the dedicated
+                // relay task spawned in main() — no extra work needed here.
+                let mempool_task = mempool.clone();
+                tokio::spawn(async move {
+                    match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                        Ok(intent) => {
+                            match mempool_task.submit(intent, intent_bytes).await {
+                                Ok(hash) => {
+                                    tracing::debug!(hash = ?hash, "P2P tx admitted");
+                                }
+                                Err(e) if e.is_soft() => {
+                                    // Soft reject (duplicate, slot conflict) — normal, ignore.
+                                }
+                                Err(e) => {
+                                    tracing::debug!(err = %e, "P2P tx rejected");
+                                }
                             }
                         }
+                        Err(_) => {} // malformed intent, ignore
                     }
-                    Err(_) => {} // malformed intent, ignore
-                }
+                });
             }
             Ok(NetworkEvent::PeerConnected(peer)) => {
                 tracing::info!(peer = %peer, "peer connected");
@@ -1011,18 +1094,23 @@ async fn handle_p2p_events(
                             .ok();
                     }
                 } else {
-                    // Already have state — just catch up on recent blocks.
-                    let from = our_height + 1;
-                    let count = 18u16;
+                    // Already have state — catch up on recent blocks.
+                    // Auto-continue (applied in NewBlock handler) iterates
+                    // until the peer has no more blocks to serve.
+                    let count = noid_chain::consensus::params::FINALITY_DEPTH as u16;
                     p2p_cmd
                         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                             peer,
-                            from_height: from,
+                            from_height: our_height + 1,
                             count,
                         })
                         .await
                         .ok();
-                    tracing::debug!(from_height = from, count, "triggered recent-block sync");
+                    tracing::debug!(
+                        from_height = our_height + 1,
+                        count,
+                        "triggered recent-block sync"
+                    );
                 }
             }
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
@@ -1457,11 +1545,15 @@ async fn handle_p2p_events(
                             height = new_height,
                             "chain snapshot applied — mining can begin"
                         );
+                        // Kick off post-snapshot catch-up.
+                        // We request FINALITY_DEPTH blocks at a time; auto-continue
+                        // (triggered on each applied block) iterates until the peer
+                        // has no more blocks to serve.
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                                 peer: from,
                                 from_height: new_height + 1,
-                                count: 18,
+                                count: noid_chain::consensus::params::FINALITY_DEPTH as u16,
                             })
                             .await;
                     }

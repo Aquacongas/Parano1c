@@ -186,15 +186,12 @@ mod tests {
     use super::*;
     use crate::block::Block;
     use crate::block_header::BlockHeader;
-    use crate::consensus::{
-        genesis::GENESIS_TIMESTAMP,
-        params::{BLOCK_TIME, GENESIS_TARGET},
-        pow::search_pow,
-    };
+    use crate::consensus::{genesis::GENESIS_TIMESTAMP, params::BLOCK_TIME};
     use crate::nullifier::NullifierSet;
     use crate::state::ChainState;
     use noid_poseidon2b::primitives::Address;
 
+    const TEST_TARGET: [u8; 32] = [0xFF; 32];
     const TEST_LOG_SLOTS: usize = 6;
 
     fn mk_parent(height: u64, ts: u64, prev_hash: [u8; 32], state_root: [u8; 32]) -> BlockHeader {
@@ -206,7 +203,7 @@ mod tests {
             height,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
@@ -228,16 +225,14 @@ mod tests {
             height: parent.height + 1,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: state.state.log_slots() as u32,
             active_slot_count: state.active_slot_count,
             alloc_counter: state.alloc_counter,
         };
-        let nonce =
-            search_pow(&header, 0, 100_000_000).expect("genesis target trivially satisfiable");
-        header.nonce = nonce;
+        header.nonce = 0; // TEST_TARGET: any nonce works
         Block {
             header,
             transactions: vec![],
@@ -315,7 +310,7 @@ mod tests {
             height: 0,
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
@@ -326,7 +321,7 @@ mod tests {
         // Block claiming log_slots = TEST_LOG_SLOTS (no expansion) should be rejected.
         let block_no_expand = {
             use crate::block::compute_tx_root;
-            use crate::consensus::pow::{full_block_hash, search_pow};
+            use crate::consensus::pow::full_block_hash;
             let mut hdr = BlockHeader {
                 prev_block_hash: full_block_hash(&parent),
                 state_root,
@@ -335,14 +330,14 @@ mod tests {
                 height: 1,
                 miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
                 nonce: 0,
-                difficulty_target: GENESIS_TARGET,
+                difficulty_target: TEST_TARGET,
                 proof_transcript_hash: [1u8; 32],
                 witness_root: [1u8; 32],
                 log_slots: TEST_LOG_SLOTS as u32, // should be TEST_LOG_SLOTS + 1
                 active_slot_count: target_active,
                 alloc_counter: 0,
             };
-            hdr.nonce = search_pow(&hdr, 0, 100_000_000).unwrap();
+            hdr.nonce = 0; // TEST_TARGET: any nonce works
             crate::block::Block {
                 header: hdr,
                 transactions: vec![],
@@ -390,7 +385,7 @@ mod tests {
             height: 0,
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
@@ -400,7 +395,7 @@ mod tests {
 
         // Build a block that does NOT expand (log_slots unchanged).
         use crate::block::compute_tx_root;
-        use crate::consensus::pow::{full_block_hash, search_pow};
+        use crate::consensus::pow::full_block_hash;
         let mut hdr = BlockHeader {
             prev_block_hash: full_block_hash(&parent),
             state_root,
@@ -409,14 +404,14 @@ mod tests {
             height: 1,
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32, // no expansion
             active_slot_count: spike_active,
             alloc_counter: 0,
         };
-        hdr.nonce = search_pow(&hdr, 0, 100_000_000).unwrap();
+        hdr.nonce = 0; // TEST_TARGET: any nonce works
         let block = crate::block::Block {
             header: hdr,
             transactions: vec![],

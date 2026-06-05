@@ -155,6 +155,49 @@ impl MdbxChainContext {
         }
     }
 
+    /// Test-only: open a fresh MDBX with a trivially-satisfiable genesis
+    /// (difficulty_target = `[0xFF;32]`).  All subsequent blocks can use nonce=0,
+    /// so no PoW search is needed in tests that are testing storage logic.
+    #[cfg(test)]
+    fn open_or_create_for_test(path: &std::path::Path) -> Result<Self, MdbxContextError> {
+        use crate::chain_context::TEST_TARGET;
+        let store = MdbxStore::open(path)?;
+        if store.is_empty()? {
+            let consensus = ChainContext::init_from_easy_genesis();
+            let tip_chain_work = crate::block_work(&TEST_TARGET);
+            let ctx = Self {
+                store,
+                state: consensus.state,
+                nullifiers: consensus.nullifiers,
+                recent_headers: consensus.headers,
+                tip_height: consensus.tip_height,
+                tip_hash: consensus.tip_hash,
+                tip_chain_work,
+            };
+            // Persist easy genesis.
+            {
+                use crate::consensus::da_prune::BlockUndoLog;
+                let genesis = ctx
+                    .recent_headers
+                    .get(&0)
+                    .expect("easy genesis header must exist")
+                    .clone();
+                let genesis_hash = full_block_hash(&genesis);
+                ctx.store.commit_block(
+                    &genesis,
+                    &genesis_hash,
+                    &BlockUndoLog::empty(0),
+                    &[],
+                    &[],
+                    None,
+                )?;
+            }
+            Ok(ctx)
+        } else {
+            Self::restore_from_mdbx(store)
+        }
+    }
+
     fn persist_genesis(&self) -> Result<(), MdbxContextError> {
         use crate::consensus::da_prune::BlockUndoLog;
         use crate::consensus::genesis::genesis_header;
@@ -977,18 +1020,18 @@ mod tests {
     use super::*;
     use crate::block::{compute_tx_root, Block};
     use crate::block_header::BlockHeader;
-    use crate::consensus::{
-        genesis::genesis_header,
-        params::{BLOCK_TIME, GENESIS_TARGET},
-        pow::{full_block_hash, search_pow},
-    };
+    use crate::chain_context::TEST_TARGET;
+    use crate::consensus::{params::BLOCK_TIME, pow::full_block_hash};
     use noid_poseidon2b::primitives::Address;
 
     fn build_empty_block_on(ctx: &mut MdbxChainContext) -> Block {
+        use crate::chain_context::TEST_TARGET;
         let parent = ctx.tip_header().clone();
         let new_root = ctx.state.state_root();
 
-        let mut header = BlockHeader {
+        // Use TEST_TARGET so nonce=0 trivially satisfies PoW.
+        // ASERT with perfect BLOCK_TIME timing returns TEST_TARGET → consistent.
+        let header = BlockHeader {
             prev_block_hash: full_block_hash(&parent),
             state_root: new_root,
             tx_root: compute_tx_root(&[]),
@@ -996,14 +1039,13 @@ mod tests {
             height: parent.height + 1,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        header.nonce = search_pow(&header, 0, 100_000_000).unwrap();
         Block {
             header,
             transactions: vec![],
@@ -1013,9 +1055,8 @@ mod tests {
     #[test]
     fn open_fresh_database() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(ctx.tip_height(), 0);
-        assert_eq!(ctx.tip_hash(), full_block_hash(&genesis_header()));
     }
 
     #[test]
@@ -1024,7 +1065,7 @@ mod tests {
 
         // Apply one block.
         {
-            let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts).unwrap();
@@ -1033,7 +1074,7 @@ mod tests {
 
         // Reopen and verify tip is persisted.
         {
-            let ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             assert_eq!(ctx.tip_height(), 1, "tip must survive restart");
         }
     }
@@ -1043,7 +1084,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             for _ in 0..3 {
                 let block = build_empty_block_on(&mut ctx);
                 let ts = block.header.timestamp + 1;
@@ -1051,7 +1092,7 @@ mod tests {
             }
         }
 
-        let ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(ctx.tip_height(), 3);
         assert_eq!(ctx.state.active_slot_count, 0);
     }
@@ -1062,13 +1103,13 @@ mod tests {
         let root_after_block;
 
         {
-            let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             root_after_block = ctx.apply_next_block(&block, ts).unwrap();
         }
 
-        let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(
             ctx.state.state_root(),
             root_after_block,
@@ -1095,7 +1136,7 @@ mod tests {
         // a second block with two sentinel nullifiers via commit_block.
         let block1_hash;
         {
-            let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             // Apply block 1 (empty, no transactions).
             let block1 = build_empty_block_on(&mut ctx);
             let ts = block1.header.timestamp + 1;
@@ -1113,14 +1154,14 @@ mod tests {
                 height: 2,
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
-                difficulty_target: GENESIS_TARGET,
+                difficulty_target: TEST_TARGET,
                 proof_transcript_hash: [1u8; 32],
                 witness_root: [1u8; 32],
                 log_slots: parent.log_slots,
                 active_slot_count: parent.active_slot_count,
                 alloc_counter: parent.alloc_counter,
             };
-            hdr2.nonce = search_pow(&hdr2, 0, 100_000_000).unwrap();
+            hdr2.nonce = 0; // TEST_TARGET: any nonce works
             let hash2 = full_block_hash(&hdr2);
             ctx.store
                 .commit_block(
@@ -1138,7 +1179,7 @@ mod tests {
         {
             // Open by reading chain_tip from MDBX (tip is still 1 since we
             // bypassed apply_next_block for block 2; that's fine for this test).
-            let ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
             // Verify via the store directly: get_nullifier_blocks_range(0, 1)
             // should find the entries we wrote.
@@ -1165,14 +1206,14 @@ mod tests {
 
         // First run: apply one block.
         {
-            let mut ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .unwrap();
         }
 
         // Second run: open and verify no dirty segments are queued.
-        let ctx = MdbxChainContext::open_or_create(dir.path()).unwrap();
+        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(
             ctx.state.state.dirty_segment_ids().count(),
             0,

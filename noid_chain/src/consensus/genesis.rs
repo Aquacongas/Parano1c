@@ -19,8 +19,8 @@ use crate::consensus::{
 };
 use noid_poseidon2b::primitives::Address;
 
-/// Fixed genesis timestamp (2026-06-04 20:22:39 UTC).
-pub const GENESIS_TIMESTAMP: u64 = 1_780_604_559;
+/// Fixed genesis timestamp (2026-06-05 09:37:02 UTC).
+pub const GENESIS_TIMESTAMP: u64 = 1_780_652_222;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -70,7 +70,7 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 /// Pre-mined genesis nonce.
 /// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
 /// Found by searching nonces sequentially; nonce=2 is the first valid value.
-const GENESIS_NONCE: u128 = 984;
+const GENESIS_NONCE: u128 = 53_490_382;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).

@@ -12,9 +12,9 @@
 //!
 //! ## Template refresh triggers
 //!
-//! 1. Every 15 seconds (wall clock)
-//! 2. ≥100 new txs admitted to mempool
-//! 3. New block received from P2P — prev_hash changes
+//! 1. Heartbeat every `refresh_interval_secs` seconds (safety net)
+//! 2. First `TxAdmitted` while prove is done (Sealed state — semaphore free, PoW still running)
+//! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
 
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
@@ -24,16 +24,17 @@ use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
-/// Why the template was refreshed.
+/// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateRefreshTrigger {
-    /// Regular 15-second heartbeat.
+    /// Regular heartbeat (safety net — fires every `refresh_interval_secs`).
     Heartbeat,
-    /// ≥100 new txs admitted since last refresh.
-    MempoolGrowth,
-    /// New block received from P2P — prev_hash changed.
-    NewBlock,
-    /// Node startup — generate first template.
+    /// First `TxAdmitted` event while prove was already done (Sealed state).
+    /// The miner immediately rebuilds to include the new tx in the current block.
+    TxAdmitted,
+    /// New chain tip available: P2P block applied or state snapshot synced.
+    SyncReady,
+    /// Node startup — generate the very first template.
     Startup,
 }
 

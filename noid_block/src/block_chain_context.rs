@@ -255,9 +255,10 @@ mod tests {
         use noid_chain::block_header::BlockHeader;
         use noid_chain::consensus::{
             params::{BLOCK_TIME, GENESIS_TARGET},
-            pow::{full_block_hash, search_pow},
+            pow::full_block_hash,
         };
         use noid_poseidon2b::primitives::Address;
+        use rayon::prelude::*;
 
         let mut ctx = BlockChainContext::init_from_genesis_no_proof();
 
@@ -280,7 +281,20 @@ mod tests {
             active_slot_count: 0,
             alloc_counter: 0,
         };
-        header.nonce = search_pow(&header, 0, 100_000_000).unwrap();
+
+        // GENESIS_TARGET = 2^228 requires avg 2^28 ≈ 268 M hash attempts.
+        // This is the only PoW-mining test in this binary, so rayon gets
+        // full use of all CPU cores without contention from other tests.
+        // Expected wall time: ~1 s on a multi-core machine.
+        {
+            use noid_chain::consensus::pow::search_pow;
+            let chunk = 10_000_000u128;
+            header.nonce = (0u64..300)
+                .into_par_iter()
+                .find_map_any(|i| search_pow(&header, i as u128 * chunk, chunk))
+                .expect("mine: no nonce found in 3 B attempts (GENESIS_TARGET=2^228)");
+        }
+
         let block = Block {
             header,
             transactions: vec![],

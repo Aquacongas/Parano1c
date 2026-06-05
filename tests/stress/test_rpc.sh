@@ -227,9 +227,9 @@ MP_HASH=$(f "getMempoolEntry" "[\"$TX\"]" "tx_hash")
 chk "getMempoolEntry finds tx"      "$MP_HASH" "$TX"
 chk "isNullifier(pending)=false"    "$(r "isNullifier" "[\"$TX\"]")" "false"
 
-# Wait for confirmation
+# Wait for confirmation — up to 60s (accommodates 5-second genesis blocks)
 echo -n "  confirming tx "
-for i in $(seq 1 30); do
+for i in $(seq 1 120); do
     SZ=$(n "getMempoolSize"); [ "$SZ" = "0" ] && echo " confirmed (${i}s)" && break
     echo -n "."; sleep 0.5
 done

@@ -1056,11 +1056,12 @@ mod tests {
     fn expansion_block_validates_with_consensus() {
         use crate::consensus::{
             genesis::GENESIS_TIMESTAMP,
-            params::{BLOCK_TIME, GENESIS_TARGET},
-            pow::{full_block_hash, search_pow},
+            params::BLOCK_TIME,
+            pow::full_block_hash,
             validation::{validate_block_consensus, AnchorInfo},
         };
         use crate::nullifier::NullifierSet;
+        const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
         // Use log_slots=4 (tiny) so we can fill it fast.
         let mut state = ChainState::with_log_slots(4);
@@ -1075,7 +1076,7 @@ mod tests {
             height: 0,
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: 4,
@@ -1094,15 +1095,14 @@ mod tests {
             height: 1,
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: 5,          // expanded!
             active_slot_count: 12, // unchanged (no mints/spends)
             alloc_counter: 12,
         };
-        expansion_header.nonce = search_pow(&expansion_header, 0, 100_000_000)
-            .expect("genesis target trivially satisfiable");
+        expansion_header.nonce = 0; // TEST_TARGET: any nonce works
 
         let block = Block {
             header: expansion_header,
@@ -1111,7 +1111,7 @@ mod tests {
         let anchor = AnchorInfo {
             anchor_height: 0,
             anchor_timestamp: GENESIS_TIMESTAMP,
-            anchor_target: GENESIS_TARGET,
+            anchor_target: TEST_TARGET,
         };
         let mut apply_state = state.clone();
         // Supply EXPANSION_WINDOW copies of the triggering occupancy so

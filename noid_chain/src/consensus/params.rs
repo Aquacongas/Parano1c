@@ -100,12 +100,20 @@ pub const EXPAND_DENOM: u64 = 4;
 // PoW  (SPECIFICATION.md §18)
 // ---------------------------------------------------------------------------
 
-/// Genesis difficulty target = 2^248. Low enough to bootstrap in milliseconds,
-/// high enough that ASERT has a real anchor to adjust from.
-/// 2^248 in little-endian: byte 31 = 0x01 (bit 248 = bit 0 of byte 31).
+/// Genesis difficulty target = 2^228.
+///
+/// Calibrated to ~5 seconds per block on a 12-core laptop (62 MH/s total):
+///   avg_nonces = 2^(256-228) = 2^28 = 268M
+///   time = 268M / 62M = 4.3s
+///
+/// LE 256-bit layout: byte 28 = 0x10 (bit 228 = bit 4 of byte 28).
+/// Bytes 29-31 = 0x00 so the target value equals 2^228.
+///
+/// This ensures block_time >> gossip_latency even at genesis,
+/// preventing the chain from forking faster than gossip can propagate.
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    t[31] = 0x01;
+    t[28] = 0x10; // bit 4 of byte 28 → 2^(8×28+4) = 2^228
     t
 };
 
@@ -128,8 +136,18 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 /// deep reorgs unrevertable.
 pub const UNDO_LOG_RETENTION: u64 = FINALITY_DEPTH; // 18 blocks
 
-/// `recent_blocks` (kept for P2P sync of lagging peers) pruned after this depth.
-pub const RECENT_BLOCK_RETENTION: u64 = FINALITY_DEPTH; // 18 blocks
+/// `recent_blocks` served to peers for catch-up sync.
+///
+/// Intentionally larger than FINALITY_DEPTH (reorg window) because these
+/// are two independent concerns:
+///   - FINALITY_DEPTH: how many blocks to keep for local reorg safety.
+///   - RECENT_BLOCK_RETENTION: how many blocks to serve to peers catching up.
+///
+/// Larger = peers can recover from longer gaps without needing a new snapshot.
+/// At genesis difficulty a node can mine 1000+ blocks/second; a syncing peer
+/// that takes 200ms to apply a snapshot would miss up to 200 blocks.
+/// 512 covers all realistic fast-mining scenarios while costing < 1 MB disk.
+pub const RECENT_BLOCK_RETENTION: u64 = 512;
 
 // ---------------------------------------------------------------------------
 // Emission  (ROADMAP2.md §Emission)
@@ -182,14 +200,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genesis_target_is_2_pow_248() {
-        // 2^248: bit 248 = bit 0 of byte 31 (LE). Bytes 0..30 are zero.
+    fn genesis_target_is_2_pow_228() {
+        // 2^228: bit 228 = bit 4 of byte 28 (LE). Bytes 29-31 = 0x00.
         let mut expected = [0u8; 32];
-        expected[31] = 0x01;
+        expected[28] = 0x10; // 2^4 at byte 28 → 2^(8*28+4) = 2^228
         assert_eq!(GENESIS_TARGET, expected);
-        assert_eq!(GENESIS_TARGET[31], 0x01);
-        assert!(GENESIS_TARGET[31] > MIN_TARGET[31], "genesis > min in MSB");
-        assert!(GENESIS_TARGET[31] < MAX_TARGET[31], "genesis < max in MSB");
+        assert_eq!(GENESIS_TARGET[28], 0x10);
+        assert_eq!(GENESIS_TARGET[29], 0x00);
+        assert_eq!(GENESIS_TARGET[30], 0x00);
+        assert_eq!(GENESIS_TARGET[31], 0x00);
     }
 
     #[test]

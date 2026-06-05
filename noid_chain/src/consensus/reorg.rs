@@ -243,9 +243,10 @@ mod tests {
     use crate::chain_context::ChainContext;
     use crate::consensus::{
         params::{BLOCK_TIME, GENESIS_TARGET},
-        pow::{full_block_hash, search_pow},
+        pow::full_block_hash,
     };
     use noid_poseidon2b::primitives::Address;
+    const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
     fn build_empty_block(ctx: &mut ChainContext) -> Block {
         let parent = ctx.tip_header().clone();
@@ -258,14 +259,14 @@ mod tests {
             height: parent.height + 1,
             miner_address: Address([0u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [1u8; 32],
             witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        header.nonce = search_pow(&header, 0, 100_000_000).unwrap();
+        header.nonce = 0; // TEST_TARGET: any nonce works
         Block {
             header,
             transactions: vec![],
@@ -305,7 +306,7 @@ mod tests {
 
     #[test]
     fn apply_reorg_exceeds_finality_rejects() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..(FINALITY_DEPTH + 1) {
             let block = build_empty_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
@@ -317,7 +318,7 @@ mod tests {
 
     #[test]
     fn apply_reorg_within_finality_reverts() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..3 {
             let block = build_empty_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
@@ -374,7 +375,7 @@ mod tests {
 
     #[test]
     fn reorg_preserves_state_root_after_revert() {
-        let mut ctx = ChainContext::init_from_genesis();
+        let mut ctx = ChainContext::init_from_easy_genesis();
         let root_at_genesis = ctx.state.state_root();
 
         // Apply 3 blocks.

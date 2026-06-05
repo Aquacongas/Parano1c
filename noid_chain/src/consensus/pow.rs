@@ -119,13 +119,17 @@ pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
 ///
 /// Returns `Some(nonce)` if a valid nonce is found, `None` otherwise.
 /// This is called by the mining engine in parallel across thread ranges.
+///
+/// Uses a pre-allocated 212-byte stack buffer and patches only the 16 nonce
+/// bytes per iteration — no heap allocation in the inner loop.
 pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128) -> Option<u128> {
-    let mut h = header_template.clone();
+    let mut buf = [0u8; 212];
+    header_core_bytes_into(header_template, &mut buf);
+    let target = &header_template.difficulty_target;
     for nonce in start_nonce..start_nonce.saturating_add(range) {
-        h.nonce = nonce;
-        let core = header_core_bytes(&h);
-        let hash = *blake3::hash(&core).as_bytes();
-        if le256_lt(&hash, &h.difficulty_target) {
+        buf[NONCE_OFFSET..NONCE_OFFSET + 16].copy_from_slice(&nonce.to_le_bytes());
+        let hash = *blake3::hash(&buf).as_bytes();
+        if le256_lt(&hash, target) {
             return Some(nonce);
         }
     }
@@ -136,8 +140,9 @@ pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128)
 mod tests {
     use super::*;
     use crate::block_header::BlockHeader;
-    use crate::consensus::params::GENESIS_TARGET;
     use noid_poseidon2b::primitives::Address;
+    // Trivially-satisfiable test target: any Blake3 hash < [0xFF;32].
+    const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
     fn dummy_header() -> BlockHeader {
         BlockHeader {
@@ -148,7 +153,7 @@ mod tests {
             height: 1,
             miner_address: Address([3u8; 32]),
             nonce: 0,
-            difficulty_target: GENESIS_TARGET,
+            difficulty_target: TEST_TARGET,
             proof_transcript_hash: [4u8; 32],
             witness_root: [5u8; 32],
             log_slots: 24,
@@ -186,14 +191,20 @@ mod tests {
 
     #[test]
     fn genesis_target_trivially_satisfiable() {
-        // GENESIS_TARGET = 2^252. Blake3 hash has 50% chance of being < 2^255,
-        // so < 2^252 should still be easy. For a test we just find any valid nonce.
-        let h = dummy_header();
-        let result = search_pow(&h, 0, 10_000_000);
-        assert!(
-            result.is_some(),
-            "genesis target should be trivially findable"
-        );
+        // GENESIS_TARGET = 2^228: avg 2^28 ≈ 268 M attempts.
+        // Use a header with the real GENESIS_TARGET (dummy_header uses TEST_TARGET now).
+        use crate::consensus::params::GENESIS_TARGET;
+        use rayon::prelude::*;
+        let mut h = dummy_header();
+        h.difficulty_target = GENESIS_TARGET;
+        // Parallel search: 12 cores × 19 MH/s ≈ 228 MH/s → avg ~1.2 s.
+        let chunk = 10_000_000u128;
+        let nonce = (0u64..300)
+            .into_par_iter()
+            .find_map_any(|i| search_pow(&h, i as u128 * chunk, chunk))
+            .expect("genesis_target_trivially_satisfiable: no nonce in 3 B attempts");
+        h.nonce = nonce;
+        assert!(validate_pow(&h).is_ok());
     }
 
     #[test]
@@ -206,10 +217,9 @@ mod tests {
 
     #[test]
     fn validate_pow_accepts_valid_nonce() {
+        // dummy_header uses TEST_TARGET = [0xFF;32]: nonce=0 trivially satisfies it.
         let mut h = dummy_header();
-        // Find a valid nonce first.
-        let nonce = search_pow(&h, 0, 10_000_000).expect("genesis target trivially satisfiable");
-        h.nonce = nonce;
+        h.nonce = 0;
         assert!(validate_pow(&h).is_ok());
     }
 

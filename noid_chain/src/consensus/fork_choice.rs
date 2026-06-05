@@ -151,10 +151,10 @@ mod tests {
 
     #[test]
     fn lower_target_wins_at_equal_height() {
-        // harder = smaller value (2^247) < easier (GENESIS_TARGET = 2^248)
+        // harder = smaller value (2^220) < easier (GENESIS_TARGET = 2^228)
         let harder = {
             let mut t = [0u8; 32];
-            t[30] = 0x80;
+            t[27] = 0x10; // 2^(8*27+4) = 2^220 < 2^228 = GENESIS_TARGET
             t
         };
         let easier = GENESIS_TARGET;

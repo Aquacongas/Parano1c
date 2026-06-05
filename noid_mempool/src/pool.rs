@@ -55,8 +55,6 @@ pub(crate) struct MempoolState {
     pub view: ChainView,
     /// Dynamic fee floor.
     pub floor: FeeFloor,
-    /// Count of admitted txs since last template refresh trigger.
-    pub new_since_refresh: usize,
     /// Input slot indices currently held by admitted txs. O(1) conflict check.
     pub admitted_input_slots: HashSet<u32>,
     /// Output slot indices currently held by admitted txs. O(1) conflict check.
@@ -94,7 +92,6 @@ impl AsyncMempool {
             pool: Mempool::new(config.capacity),
             view,
             floor,
-            new_since_refresh: 0,
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
         };
@@ -292,8 +289,6 @@ impl AsyncMempool {
         if !is_coinbase {
             st.floor.record(fee);
         }
-        st.new_since_refresh += 1;
-
         // Broadcast (non-blocking: drop if no subscribers).
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
@@ -437,9 +432,6 @@ impl AsyncMempool {
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
 
-        // Reset new-since-refresh counter (block was found — template is stale anyway).
-        st.new_since_refresh = 0;
-
         tracing::debug!(
             height = new_height,
             confirmed = confirmed_hashes.len(),
@@ -498,17 +490,6 @@ impl AsyncMempool {
     /// Current dynamic fee floor (μNOID).
     pub async fn fee_floor(&self) -> u64 {
         self.state.lock().await.floor.current()
-    }
-
-    /// Number of txs admitted since the last template refresh trigger.
-    /// The block builder should refresh the template when this ≥ 100.
-    pub async fn new_since_refresh(&self) -> usize {
-        self.state.lock().await.new_since_refresh
-    }
-
-    /// Reset the new-since-refresh counter (called by block builder after refresh).
-    pub async fn reset_refresh_counter(&self) {
-        self.state.lock().await.new_since_refresh = 0;
     }
 
     /// Snapshot all current mempool entries (for RPC inspection).
