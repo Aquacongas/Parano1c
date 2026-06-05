@@ -17,7 +17,7 @@ use noid_poseidon2b::primitives::TxBodyHash;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
-use crate::consensus::params::{ANCHOR_DEPTH, FINALITY_DEPTH, RECENT_BLOCK_RETENTION};
+use crate::consensus::params::{ANCHOR_DEPTH, FINALITY_DEPTH};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::serial::{
     decode_chain_tip, decode_header, decode_segment, decode_state_meta, decode_tx_index_value,
@@ -685,10 +685,12 @@ impl MdbxStore {
             }
         }
 
-        // --- Prune recent_blocks older than RECENT_BLOCK_RETENTION ---
-        if current_height > RECENT_BLOCK_RETENTION {
+        // --- Prune recent_blocks older than FINALITY_DEPTH ---
+        // Peers only need blocks within the shallow-fork window (≤ FINALITY_DEPTH);
+        // deeper forks use O(1) snapshot sync. One constant, two purposes.
+        if current_height > FINALITY_DEPTH {
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
-            let cutoff = current_height - RECENT_BLOCK_RETENTION;
+            let cutoff = current_height - FINALITY_DEPTH;
             let keys_to_del: Vec<u64> = {
                 let mut cur = txn.cursor(&recent_tbl)?;
                 let mut keys = Vec::new();

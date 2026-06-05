@@ -41,27 +41,16 @@ pub struct MempoolEntry {
     /// Used for priority ordering in block template selection.
     pub fee_rate: u64,
 
-    // -----------------------------------------------------------------------
-    // Phase 1.5 — Pre-proving cache (populated by Phase 3 async prover).
-    //
-    // On mempool admission, Phase 3 spawns a background
-    // `prove_air_algebraic_pretx` task keyed by
-    // `H(tx_body_hash || PRETX_CHANNEL_TAG)`. The resulting algebraic
-    // STARK proof (no per-tx FRI, ~2 KB) is stored here.  When the block
-    // template is assembled, cached proofs skip the per-tx algebraic STARK
-    // step — only the unified block GKR + single FRI remain (~12s vs ~44s
-    // for 1024 txs on 8 cores).
-    //
-    // A `None` here means the tx has not yet been pre-proved; the block
-    // assembler must prove it inline (slower path).
-    // -----------------------------------------------------------------------
-    /// Cached algebraic STARK proof from pre-proving.
-    /// `None` while the background task is running or not yet started.
+    /// Cached `WalletProofBundle` bytes (LogicProof + auth_slices) provided
+    /// by the wallet at submission time.  Populated immediately on admission;
+    /// `None` only for coinbase or txs submitted without a proof bundle.
+    ///
+    /// The block assembler uses this to build `TxBlockWitness` without
+    /// re-doing any per-tx work.  `prove_block` then only runs the unified
+    /// block-level SpineGKR + single FRI opening.
     pub cached_algebraic_proof: Option<Vec<u8>>,
 
-    /// Spine MLE slot data needed to assemble the block-level SpineGKR
-    /// without re-running the per-tx Spine Kill-Shot.
-    /// `None` until pre-proving completes.
+    /// Spine MLE slot data (future optimisation: pre-computed from WalletProofBundle).
     pub spine_slots: Option<Vec<u8>>,
 }
 

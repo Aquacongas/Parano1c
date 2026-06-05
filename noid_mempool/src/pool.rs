@@ -17,13 +17,14 @@
 //!  select_for_block() ──► fee-sorted list of MempoolEntry (verified txs only)
 //! ```
 //!
-//! ## Pre-proving cache (background task)
+//! ## Pre-proving cache
 //!
-//! When `config.pre_prove_enabled = true`, each admitted tx is sent to a
-//! background worker that calls `prove_air_algebraic_pretx`.  The result is
-//! stored in `MempoolEntry.cached_algebraic_proof` and broadcast as
-//! `MempoolEvent::TxPreProved`.  The block assembler can then skip the
-//! per-tx proving step and run only the unified block GKR + single FRI.
+//! When a wallet submits a `TxIntent`, it includes a `WalletProofBundle`
+//! (LogicProof + auth_slices). The pool stores this bundle in
+//! `MempoolEntry.cached_algebraic_proof` immediately at admission.
+//! The block assembler uses cached bundles so that `prove_block` only
+//! needs to run the unified block-level SpineGKR + single FRI — the
+//! per-tx wallet work is already done.
 
 use std::collections::HashSet;
 use std::sync::Arc;

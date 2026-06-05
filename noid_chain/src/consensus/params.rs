@@ -9,13 +9,20 @@
 // ---------------------------------------------------------------------------
 
 /// Target inter-block interval in seconds (SPECIFICATION.md §18.1).
-pub const BLOCK_TIME: u64 = 60;
+///
+/// Set to 5s to match GENESIS_TARGET (2^228 ≈ 5s on a laptop at 62 MH/s).
+/// ASERT adjusts PoW difficulty so that all hardware converges to this target.
+/// Faster hardware → higher difficulty, same block time.
+/// Slower hardware → lower difficulty, same block time.
+/// Block time in Paranoid is bounded below by `prove_block_time` (~2-12s
+/// depending on hardware); PoW is ordering-only, not security-critical.
+pub const BLOCK_TIME: u64 = 12;
 
 /// Number of blocks per ASERT epoch (SPECIFICATION.md §18.3.1).
 pub const EPOCH_LENGTH: u64 = 6;
 
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME (SPECIFICATION.md §18.3.1).
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 360
+pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 30s at BLOCK_TIME=5
 
 /// Maximum seconds a block timestamp may exceed local wall clock (SPECIFICATION.md §18.4).
 pub const MAX_FUTURE_DRIFT: u64 = 120;
@@ -28,7 +35,13 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of non-coinbase transactions per block.
-pub const BLOCK_MAX_TXS: usize = 1024;
+///
+/// Calibrated to ~200ms prove budget per tx (bench: ~100ms amortised on
+/// 12-core laptop).  prove_block(200 txs) ≈ 20s on this hardware;
+/// on a 32-core server the same proves in ~7-8s < BLOCK_TIME = 12s.
+/// Faster hardware fills all 200 slots; slower hardware fills proportionally
+/// less and ASERT adjusts block time accordingly.
+pub const BLOCK_MAX_TXS: usize = 200;
 
 /// Maximum inputs per transaction (SPECIFICATION.md §3).
 pub const MAX_INPUTS: usize = 4;
@@ -131,23 +144,13 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // DA retention  (SPECIFICATION.md §20)
 // ---------------------------------------------------------------------------
 
-/// Compact undo logs kept for FINALITY_DEPTH blocks so reorgs can always
-/// be reverted. Must equal FINALITY_DEPTH; smaller values would leave
-/// deep reorgs unrevertable.
-pub const UNDO_LOG_RETENTION: u64 = FINALITY_DEPTH; // 18 blocks
-
-/// `recent_blocks` served to peers for catch-up sync.
+/// How many blocks to keep for undo logs (local reorg) AND for serving to peers
+/// (shallow fork resolution).
 ///
-/// Intentionally larger than FINALITY_DEPTH (reorg window) because these
-/// are two independent concerns:
-///   - FINALITY_DEPTH: how many blocks to keep for local reorg safety.
-///   - RECENT_BLOCK_RETENTION: how many blocks to serve to peers catching up.
-///
-/// Larger = peers can recover from longer gaps without needing a new snapshot.
-/// At genesis difficulty a node can mine 1000+ blocks/second; a syncing peer
-/// that takes 200ms to apply a snapshot would miss up to 200 blocks.
-/// 512 covers all realistic fast-mining scenarios while costing < 1 MB disk.
-pub const RECENT_BLOCK_RETENTION: u64 = 512;
+/// Both needs are identical: you can only reorg up to FINALITY_DEPTH blocks,
+/// and peers only need blocks within that window (deeper forks use O(1) snapshot
+/// sync instead). A single constant avoids the confusion of two separate values.
+pub const UNDO_LOG_RETENTION: u64 = FINALITY_DEPTH;
 
 // ---------------------------------------------------------------------------
 // Emission  (ROADMAP2.md §Emission)
@@ -174,11 +177,6 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 
 /// Domain tag for the per-tx pre-proving channel.
 ///
-/// Pre-proving: on mempool admission, spawn background `prove_air_algebraic_pretx`
-/// keyed by `H(tx_body_hash || PRETX_CHANNEL_TAG)`. Independent of prev_state_root
-/// or cap — proofs survive across blocks as long as the tx_body_hash is unchanged.
-pub const PRETX_CHANNEL_TAG: &[u8] = b"paranoid-pretx-v1";
-
 // ---------------------------------------------------------------------------
 // Fee policy  (non-consensus — local node enforcement only)
 // ---------------------------------------------------------------------------
@@ -214,7 +212,7 @@ mod tests {
     #[test]
     fn epoch_timing_is_consistent() {
         assert_eq!(HALFLIFE, EPOCH_LENGTH * BLOCK_TIME);
-        assert_eq!(HALFLIFE, 360);
+        assert_eq!(HALFLIFE, 72, "HALFLIFE = 6 epochs × 12s");
         assert_eq!(FINALITY_DEPTH, 3 * EPOCH_LENGTH);
     }
 

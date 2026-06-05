@@ -1,433 +1,319 @@
 #!/usr/bin/env bash
-# test_partition.sh — Network Partition / Chain Reorg Test
-# =========================================================
+# test_partition.sh — Chain fork + reconnect test
+# =================================================
 #
-# Scenario:
-#   1. Start nodes A, B, C; wait until all three mine to height ~50.
-#   2. PARTITION: stop C (simulates network split A+B vs C).
-#   3. A+B keep mining together → they reach height ~60 (+10 blocks).
-#   4. C mines ALONE from its height-50 state → reaches height ~75 (+25 blocks).
-#      C has more cumulative work because it mines the same number of blocks
-#      with lower difficulty (or at same difficulty for more blocks).
-#   5. RECONNECT: start C back and seed it to A+B.
-#   6. A and B should reorg to follow C's longer chain.
+# Core invariant: any node (mining or not) that connects to a peer
+# with more chainwork MUST converge to that peer's chain.
+# In Paranoid, snapshot sync is O(1) — convergence must happen in seconds.
 #
-# Success criteria:
-#   - All three nodes converge to the same best_hash after reconnect
-#   - No node crashes or produces a bad state_root
-#   - apply_reorg_mdbx executes correctly (shown in logs)
+# TWO SCENARIOS:
+#
+#  S1: C has more work, A syncs to C  (C reconnects without --mine)
+#  S2: A has more work, C syncs to A  (C reconnects WITH --mine)
+#      This specifically tests that mining during reconnect doesn't block sync.
+#
+# Two nodes only (A and C). No three-way race conditions.
+# B is not used — two nodes is all we need to test fork resolution.
 #
 # Usage:
-#   cd /path/to/paranoid
-#   bash tests/stress/test_partition.sh
-#
-# Nodes use ports 19041/18041 (A), 19042/18042 (B), 19043/18043 (C).
+#   cd /path/to/paranoid && bash tests/stress/test_partition.sh
 
-set -euo pipefail
-
+set -uo pipefail
 BIN="./target/release/paranoid"
-TMPDIR_A="/tmp/ptest-A"
-TMPDIR_B="/tmp/ptest-B"
-TMPDIR_C="/tmp/ptest-C"
-
 RPC_A="http://127.0.0.1:18041"
-RPC_B="http://127.0.0.1:18042"
 RPC_C="http://127.0.0.1:18043"
-
-P2P_A="/ip4/127.0.0.1/tcp/19041"
-P2P_B="/ip4/127.0.0.1/tcp/19042"
-P2P_C="/ip4/127.0.0.1/tcp/19043"
-
-LOG_A="/tmp/ptest-A.log"
-LOG_B="/tmp/ptest-B.log"
-LOG_C="/tmp/ptest-C.log"
-
-PASS=0
-FAIL=0
+PASS=0; FAIL=0
+ALL_PIDS=()
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+rpc()      { curl -s -X POST "$1" -H 'Content-Type: application/json' \
+               -d "{\"jsonrpc\":\"2.0\",\"method\":\"paranoid_$2\",\"params\":${3:-[]},\"id\":1}"; }
+height()   { rpc "$1" getChainInfo | python3 -c \
+               "import sys,json; print(json.load(sys.stdin).get('result',{}).get('height',-1))" 2>/dev/null || echo -1; }
+best_hash(){ rpc "$1" getChainInfo | python3 -c \
+               "import sys,json; print(json.load(sys.stdin).get('result',{}).get('best_hash',''))" 2>/dev/null || echo ''; }
+hash_at()  { rpc "$1" getBlockHash "[${2}]" | python3 -c \
+               "import sys,json; print(json.load(sys.stdin).get('result','') or '')" 2>/dev/null || echo ''; }
+# count_log: awk always exits 0; avoid grep -c which exits 1 on no match.
+# Use two separate awk calls for OR-patterns (\| is not portable in awk regex).
+count_log()  { awk "/$1/{c++} END{print c+0}" "$2" 2>/dev/null; }
+count_log2() { echo $(( $(awk "/$1/{c++} END{print c+0}" "$3" 2>/dev/null) + $(awk "/$2/{c++} END{print c+0}" "$3" 2>/dev/null) )); }
 
-rpc() {
-    local url=$1 method=$2
-    curl -s -X POST "$url" \
-        -H 'Content-Type: application/json' \
-        -d "{\"jsonrpc\":\"2.0\",\"method\":\"paranoid_${method}\",\"params\":[],\"id\":1}"
+ok()   { echo "  PASS ✓ $*"; PASS=$((PASS+1)); }
+fail() { echo "  FAIL ✗ $*"; FAIL=$((FAIL+1)); }
+
+wait_alive() {
+    for i in $(seq 1 30); do
+        h=$(height "$1"); [ "$h" -ge 0 ] 2>/dev/null && return 0; sleep 0.5
+    done; echo "  WARN: $2 RPC not alive after 15s"; return 1
 }
-
-get_height() { rpc "$1" getChainInfo 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['height'] if 'result' in d else -1)" 2>/dev/null || echo -1; }
-get_hash()   { rpc "$1" getChainInfo 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['best_hash'] if 'result' in d else '')" 2>/dev/null || echo ''; }
 
 wait_height() {
-    local url=$1 target=$2 label=$3
-    echo -n "  Waiting for $label to reach h>=$target ."
+    echo -n "  $3 → h>=$2 ."
     for i in $(seq 1 120); do
-        h=$(get_height "$url")
-        if [ "$h" -ge "$target" ] 2>/dev/null; then
-            echo " done (h=$h)"
-            return 0
+        h=$(height "$1"); [ "$h" -ge "$2" ] 2>/dev/null && echo " h=$h" && return 0
+        echo -n "."; sleep 1
+    done; echo " TIMEOUT"; return 1
+}
+
+# Wait until two nodes share the same hash (compare at the lower height to
+# avoid timing skew — one node may have found an extra block since last check).
+wait_converge() {
+    local url1=$1 url2=$2 label=$3 max=${4:-60}
+    echo -n "  $label converge ."
+    for i in $(seq 1 "$max"); do
+        h1=$(height "$url1"); h2=$(height "$url2")
+        if [ "$h1" -ge 2 ] 2>/dev/null && [ "$h2" -ge 2 ] 2>/dev/null; then
+            common=$(( h1 < h2 ? h1 : h2 ))
+            ha=$(hash_at "$url1" "$common"); hb=$(hash_at "$url2" "$common")
+            if [ -n "$ha" ] && [ "$ha" = "$hb" ]; then
+                echo " ✓ h=$common in ${i}s  ${ha:0:16}..."
+                return 0
+            fi
         fi
-        echo -n "."
-        sleep 1
-    done
-    echo " TIMEOUT (h=$h)"
-    return 1
+        echo -n "."; sleep 1
+    done; echo " TIMEOUT (${max}s)"; return 1
 }
 
-assert_eq() {
-    local label=$1 got=$2 want=$3
-    if [ "$got" = "$want" ]; then
-        echo "  PASS ✓ $label: $got"
-        PASS=$((PASS+1))
-    else
-        echo "  FAIL ✗ $label: got='$got' want='$want'"
-        FAIL=$((FAIL+1))
-    fi
-}
-
-assert_ne() {
-    local label=$1 a=$2 b=$3
-    if [ "$a" != "$b" ]; then
-        echo "  PASS ✓ $label: values differ as expected"
-        PASS=$((PASS+1))
-    else
-        echo "  FAIL ✗ $label: values should differ but both='$a'"
-        FAIL=$((FAIL+1))
-    fi
+check_no_panic() {
+    grep -q "panicked\|PANIC\|stack overflow" "$2" 2>/dev/null \
+        && { fail "Node $1 panicked"; tail -3 "$2"; } \
+        || ok "Node $1 no panics"
 }
 
 cleanup() {
-    echo ""
-    echo "--- Cleanup ---"
-    # Save logs if any node panicked (before rm)
-    for node in A B C; do
-        log_var="LOG_$node"
-        log="${!log_var}"
-        if grep -q "panicked\|PANIC\|stack overflow" "$log" 2>/dev/null; then
-            SAVED="/tmp/ptest-PANIC-${node}.log"
-            cp "$log" "$SAVED" 2>/dev/null
-            echo "  !! Node $node panicked — log saved to $SAVED"
-        fi
-    done
-    pkill -f "ptest" 2>/dev/null || true
-    sleep 1
-    rm -rf "$TMPDIR_A" "$TMPDIR_B" "$TMPDIR_C"
-    echo "Done."
+    echo ""; echo "--- Cleanup ---"
+    for pid in "${ALL_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    sleep 1; rm -rf /tmp/ptest-{s1,s2}-{A,C}
 }
-
 trap cleanup EXIT
 
-# ---------------------------------------------------------------------------
-# Step 0: Build check
-# ---------------------------------------------------------------------------
-echo "======================================================"
-echo " Paranoid Network Partition / Reorg Test"
-echo "======================================================"
+[ -f "$BIN" ] || { echo "ERROR: $BIN not found — cargo build --release"; exit 1; }
 
-if [ ! -f "$BIN" ]; then
-    echo "ERROR: Binary not found at $BIN. Run 'cargo build --release' first."
-    exit 1
-fi
+echo "======================================================================"
+echo " Paranoid Fork/Reconnect Test  (~5s blocks at genesis difficulty)"
+echo " Core invariant: any node MUST converge to the heavier chain fast."
+echo "======================================================================"
 
-rm -rf "$TMPDIR_A" "$TMPDIR_B" "$TMPDIR_C"
-mkdir -p "$TMPDIR_A" "$TMPDIR_B" "$TMPDIR_C"
-
-# ---------------------------------------------------------------------------
-# Step 1: Start A (genesis, mining), B and C seed from A
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SCENARIO 1: C has more work → A syncs to C's chain
+# =============================================================================
 echo ""
-echo "--- Step 1: Start A (genesis+mine), B, C ---"
+echo "══════════════════════════════════════════════════════════════════════"
+echo " S1: C gets head start → C has more work → A must sync to C"
+echo "══════════════════════════════════════════════════════════════════════"
 
-"$BIN" \
-    --data-dir "$TMPDIR_A" \
-    --p2p-listen "$P2P_A" \
-    --rpc-listen 127.0.0.1:18041 \
-    --mine --genesis \
-    > "$LOG_A" 2>&1 &
-PID_A=$!
-echo "  Node A PID=$PID_A"
+S1A=/tmp/ptest-s1-A; S1C=/tmp/ptest-s1-C
+L1A=/tmp/ptest-s1-A.log; L1C=/tmp/ptest-s1-C.log
+rm -rf "$S1A" "$S1C"; mkdir -p "$S1A" "$S1C"
 
-sleep 3  # let A establish genesis
+# Start A with genesis, mine 6 blocks to establish chain
+"$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine --genesis >"$L1A" 2>&1 &
+P1A=$!; ALL_PIDS+=($P1A); echo "  A pid=$P1A (genesis)"
+wait_alive "$RPC_A" A
+wait_height "$RPC_A" 6 A
 
-"$BIN" \
-    --data-dir "$TMPDIR_B" \
-    --p2p-listen "$P2P_B" \
-    --rpc-listen 127.0.0.1:18042 \
-    --mine \
-    --seed "$P2P_A" \
-    > "$LOG_B" 2>&1 &
-PID_B=$!
-echo "  Node B PID=$PID_B"
-
-"$BIN" \
-    --data-dir "$TMPDIR_C" \
-    --p2p-listen "$P2P_C" \
-    --rpc-listen 127.0.0.1:18043 \
-    --mine \
-    --seed "$P2P_A" \
-    > "$LOG_C" 2>&1 &
-PID_C=$!
-echo "  Node C PID=$PID_C"
-
-# ---------------------------------------------------------------------------
-# Step 2: Wait for all nodes to reach height >= 50
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 2: Wait for all nodes to reach h >= 50 ---"
-
-wait_height "$RPC_A" 50 "Node A" || { echo "FATAL: Node A stuck"; exit 1; }
-wait_height "$RPC_B" 50 "Node B" || { echo "FATAL: Node B stuck"; exit 1; }
-wait_height "$RPC_C" 50 "Node C" || { echo "FATAL: Node C stuck"; exit 1; }
-
-# Wait for A and B to agree on the same chain tip.
-# First wait until B reaches A's height, then wait for same hash.
-# Allow up to 60s total for sync in case B is far behind.
-echo -n "  Waiting for A+B to agree ."
-for i in $(seq 1 120); do
-    HASH_A=$(get_hash "$RPC_A")
-    HASH_B=$(get_hash "$RPC_B")
-    H_A_NOW=$(get_height "$RPC_A")
-    H_B_NOW=$(get_height "$RPC_B")
-    if [ -n "$HASH_A" ] && [ "$HASH_A" = "$HASH_B" ]; then
-        echo " done (h=$H_A_NOW)"
-        break
-    fi
-    echo -n "."
-    sleep 0.5
-done
-
-H_A=$(get_height "$RPC_A")
-H_B=$(get_height "$RPC_B")
-H_C=$(get_height "$RPC_C")
-HASH_A=$(get_hash "$RPC_A")
-HASH_B=$(get_hash "$RPC_B")
-HASH_C=$(get_hash "$RPC_C")
-
-echo ""
-echo "  Pre-partition state:"
-echo "    A: h=$H_A hash=${HASH_A:0:20}..."
-echo "    B: h=$H_B hash=${HASH_B:0:20}..."
-echo "    C: h=$H_C hash=${HASH_C:0:20}..."
-
-# A and B should be on the same chain.
-# Compare at the LOWER of the two heights to avoid timing skew
-# (one node may have mined an extra block between the two get_hash calls).
-if [ "${H_A:-0}" -le "${H_B:-0}" ] 2>/dev/null; then
-    COMMON_H_PRE=$H_A
-else
-    COMMON_H_PRE=$H_B
-fi
-HASH_A_PRE=$(rpc "$RPC_A" getBlockHash "[$COMMON_H_PRE]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
-HASH_B_PRE=$(rpc "$RPC_B" getBlockHash "[$COMMON_H_PRE]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
-assert_eq "A==B pre-partition (at h=$COMMON_H_PRE)" "$HASH_A_PRE" "$HASH_B_PRE"
-
-# ---------------------------------------------------------------------------
-# Step 3: PARTITION — kill C, let it mine in isolation
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 3: PARTITION — stop C ---"
-kill "$PID_C" 2>/dev/null || true
-wait "$PID_C" 2>/dev/null || true
-echo "  Node C stopped (PID=$PID_C)"
-
-# Restart C WITHOUT seeds → mines in isolation from height it was at
-echo "  Restarting C in isolation (no seeds, --mine)..."
-"$BIN" \
-    --data-dir "$TMPDIR_C" \
-    --p2p-listen "$P2P_C" \
-    --rpc-listen 127.0.0.1:18043 \
-    --mine \
-    > "$LOG_C" 2>&1 &
-PID_C=$!
-echo "  Node C (isolated) PID=$PID_C"
-
-# ---------------------------------------------------------------------------
-# Step 4: Let A+B mine 10 more blocks, let C mine 25 more blocks
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 4: A+B mine 10 more blocks; C mines 25 more blocks ---"
-
-# During partition we:
-#   - Let C mine 25 blocks alone
-#   - Wait for A+B only 5 blocks (so C gets clearly ahead)
-# Then reconnect: C's longer chain (from fork point) triggers reorg on A+B.
-TARGET_AB=$((H_A + 5))
-TARGET_C=$((H_C + 25))
-echo "  Targets: A+B → h>=$TARGET_AB (+5), C → h>=$TARGET_C (+25)"
-
-# Let C mine first so it builds its chain
-wait_height "$RPC_C" "$TARGET_C"  "Node C (+25)" || true
-
-# Snapshot C's height/hash immediately (before more mining)
-H_C2=$(get_height "$RPC_C")
-HASH_C2=$(get_hash "$RPC_C")
-
-# A+B just need a few blocks to confirm they're on a different fork
-wait_height "$RPC_A" "$TARGET_AB" "Node A (+5)" || true
-wait_height "$RPC_B" "$TARGET_AB" "Node B (+5)" || true
-
-# Wait for A and B to agree
-for i in $(seq 1 20); do
-    HASH_A2=$(get_hash "$RPC_A")
-    HASH_B2=$(get_hash "$RPC_B")
-    [ "$HASH_A2" = "$HASH_B2" ] && [ -n "$HASH_A2" ] && break
-    sleep 0.5
-done
-H_A2=$(get_height "$RPC_A")
-H_B2=$(get_height "$RPC_B")
-
-echo ""
-echo "  Post-partition state:"
-echo "    A: h=$H_A2 hash=${HASH_A2:0:20}..."
-echo "    B: h=$H_B2 hash=${HASH_B2:0:20}..."
-echo "    C: h=$H_C2 hash=${HASH_C2:0:20}..."
-
-# C should have diverged from A and B
-assert_ne "C diverged from A" "$HASH_C2" "$HASH_A2"
-assert_eq "A==B during partition" "$HASH_A2" "$HASH_B2"
-
-# C should be taller (more blocks from fork point = more work at genesis difficulty)
-if [ "$H_C2" -gt "$H_A2" ] 2>/dev/null; then
-    echo "  PASS ✓ C (h=$H_C2) has more blocks than A (h=$H_A2) — reorg WILL trigger"
-    PASS=$((PASS+1))
-else
-    echo "  WARN: C (h=$H_C2) not taller than A (h=$H_A2) — reorg may not trigger (fork choice: same work)"
-fi
-
-# ---------------------------------------------------------------------------
-# Step 5: RECONNECT — connect C back to A and B
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 5: RECONNECT — kill C, restart with seeds=A ---"
-kill "$PID_C" 2>/dev/null || true
-wait "$PID_C" 2>/dev/null || true
-
-echo "  Restarting C with seeds=[A] (sync only, no mine)..."
-"$BIN" \
-    --data-dir "$TMPDIR_C" \
-    --p2p-listen "$P2P_C" \
-    --rpc-listen 127.0.0.1:18043 \
-    --seed "$P2P_A" \
-    > "$LOG_C" 2>&1 &
-PID_C=$!
-echo "  Node C (reconnected) PID=$PID_C"
+# Start C, let it sync to A then stop both — so they share the same fork point
+"$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --mine --seed 127.0.0.1:19041 >"$L1C" 2>&1 &
+P1C=$!; ALL_PIDS+=($P1C); echo "  C pid=$P1C (syncs to A)"
+wait_alive "$RPC_C" C
+wait_height "$RPC_C" 6 C
+# Give them a moment to agree
 sleep 3
+H1_FORK=$(height "$RPC_A")  # common fork point height
 
-# Also connect B to C for full mesh
-echo "  Connecting A to C..."
-curl -s -X POST "$RPC_A" \
-    -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","method":"paranoid_getChainInfo","params":[],"id":1}' > /dev/null || true
+# Stop BOTH — C will get a clean head start
+kill "$P1A" 2>/dev/null; wait "$P1A" 2>/dev/null || true
+kill "$P1C" 2>/dev/null; wait "$P1C" 2>/dev/null || true
+sleep 1
+echo "  Fork point: h=$H1_FORK. Both stopped."
 
-# ---------------------------------------------------------------------------
-# Step 6: Wait for convergence
-# ---------------------------------------------------------------------------
+# C mines ALONE (+6 blocks) — A is frozen
+"$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --mine >"$L1C" 2>&1 &
+P1C=$!; ALL_PIDS+=($P1C)
+wait_alive "$RPC_C" C
+
+C_TARGET=$((H1_FORK + 6))
+echo "  C mines alone to h>=$C_TARGET (+6 head start, A frozen)"
+wait_height "$RPC_C" "$C_TARGET" "C"
+H1_C=$(height "$RPC_C")
+echo "  C at h=$H1_C. Stopping C."
+kill "$P1C" 2>/dev/null; wait "$P1C" 2>/dev/null || true; sleep 1
+
+# A mines 3 blocks alone on its fork, then STOPS so we know its exact height.
+# (A keeps mining past wait_height if we don't stop it — must kill before check.)
+"$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine >"$L1A" 2>&1 &
+P1A=$!; ALL_PIDS+=($P1A)
+wait_alive "$RPC_A" A
+
+A_TARGET=$((H1_FORK + 3))
+wait_height "$RPC_A" "$A_TARGET" "A"
+kill "$P1A" 2>/dev/null; wait "$P1A" 2>/dev/null || true
+H1_A=$(height "$RPC_A")     # capture height NOW while A is stopped
+sleep 1
+
+echo "  Fork snapshot: A h=$H1_A (stopped)  C h=$H1_C (stopped)"
+[ "$H1_C" -gt "$H1_A" ] 2>/dev/null \
+    && ok "S1 C taller than A by $(( H1_C - H1_A )) blocks" \
+    || fail "S1 C not taller (h_C=$H1_C h_A=$H1_A)"
+
+# Reconnect: restart A (will mine from its fork), then connect C to A.
+# C detects A has less work → A detects C has more work → A adopts C's chain.
+T_CONN=$(date +%s)
 echo ""
-echo "--- Step 6: Wait for convergence (all same hash, 60s max) ---"
+echo "  Restarting A, reconnecting C (no --mine) → expect A to adopt C's chain..."
+"$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine >"$L1A" 2>&1 &
+P1A=$!; ALL_PIDS+=($P1A)
+wait_alive "$RPC_A" A
 
-MAX_WAIT=180
-CONVERGED=0
-FINAL_A="" FINAL_B="" FINAL_C="" FINAL_HA=0 FINAL_HB=0 FINAL_HC=0
-for i in $(seq 1 "$MAX_WAIT"); do
-    HA=$(get_hash "$RPC_A")
-    HB=$(get_hash "$RPC_B")
-    HC=$(get_hash "$RPC_C")
-    echo -n "  t=${i}s A=${HA:0:12}... B=${HB:0:12}... C=${HC:0:12}... "
-    # Convergence: A and C must agree. B is optional (may have crashed).
-    AC_AGREE=$([ -n "$HA" ] && [ -n "$HC" ] && [ "$HA" = "$HC" ] && echo 1 || echo 0)
-    ALL_AGREE=$([ "$AC_AGREE" = "1" ] && [ -n "$HB" ] && [ "$HA" = "$HB" ] && echo 1 || echo 0)
-    if [ "$AC_AGREE" = "1" ]; then
-        # Capture the CONVERGED state immediately (before more mining diverges them)
-        FINAL_A=$HA
-        FINAL_B=$HB
-        FINAL_C=$HC
-        FINAL_HA=$(get_height "$RPC_A")
-        FINAL_HB=$(get_height "$RPC_B")
-        FINAL_HC=$(get_height "$RPC_C")
-        if [ "$ALL_AGREE" = "1" ]; then
-            echo "CONVERGED (all 3) ✓"
-        else
-            echo "CONVERGED (A+C, B unavailable) ✓"
-        fi
-        CONVERGED=1
-        break
-    fi
-    echo ""
-    sleep 1
-done
+"$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --seed 127.0.0.1:19041 >"$L1C" 2>&1 &
+P1C=$!; ALL_PIDS+=($P1C)
+wait_alive "$RPC_C" C
 
-echo ""
-echo "--- Final state at convergence moment ---"
-echo "  A: h=$FINAL_HA hash=$FINAL_A"
-echo "  B: h=$FINAL_HB hash=$FINAL_B"
-echo "  C: h=$FINAL_HC hash=$FINAL_C"
-
-# ---------------------------------------------------------------------------
-# Step 7: Verify state_root consistency
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 7: Verify state_root consistency ---"
-
-SR_A=$(rpc "$RPC_A" getChainInfo | python3 -c "import sys,json; d=json.load(sys.stdin); sr=d.get('result',{}).get('best_hash',''); print(sr)" 2>/dev/null || echo "")
-SR_B=$(rpc "$RPC_B" getChainInfo | python3 -c "import sys,json; d=json.load(sys.stdin); sr=d.get('result',{}).get('best_hash',''); print(sr)" 2>/dev/null || echo "")
-SR_C=$(rpc "$RPC_C" getChainInfo | python3 -c "import sys,json; d=json.load(sys.stdin); sr=d.get('result',{}).get('best_hash',''); print(sr)" 2>/dev/null || echo "")
-
-# Check reorg happened (look in logs)
-REORG_A=$(grep -c "reorg" "$LOG_A" 2>/dev/null || echo 0)
-REORG_B=$(grep -c "reorg" "$LOG_B" 2>/dev/null || echo 0)
-REORG_C=$(grep -c "reorg" "$LOG_C" 2>/dev/null || echo 0)
-echo "  Reorg log entries: A=$REORG_A B=$REORG_B C=$REORG_C"
-
-if [ "$CONVERGED" = "1" ]; then
-    echo "  PASS ✓ A+C converged: ${FINAL_A:0:20}..."
-    PASS=$((PASS+1))
-    assert_eq "A hash == C hash (fork resolved)" "$FINAL_A" "$FINAL_C"
-    if [ -n "$FINAL_B" ] && [ "$FINAL_B" != "" ]; then
-        # B may have mined an extra block at the convergence moment.
-        # Compare at A's height to avoid timing skew.
-        HASH_B_AT_HA=$(rpc "$RPC_B" getBlockHash "[$FINAL_HA]" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
-        if [ -n "$HASH_B_AT_HA" ] && [ "$HASH_B_AT_HA" != "" ]; then
-            assert_eq "A hash == B hash (at h=$FINAL_HA)" "$FINAL_A" "$HASH_B_AT_HA"
-        else
-            echo "  SKIP B hash check (B has no block at h=$FINAL_HA)"
-        fi
-    else
-        echo "  SKIP B hash check (Node B unavailable)"
-    fi
+if wait_converge "$RPC_A" "$RPC_C" "S1 A+C" 60; then
+    SECS=$(( $(date +%s) - T_CONN ))
+    ok "S1 A+C converged in ${SECS}s"
+    [ "$SECS" -le 30 ] && ok "S1 fast convergence (≤30s, got ${SECS}s)" \
+                       || fail "S1 slow convergence (>30s, got ${SECS}s)"
+    # Verify A reorged (adopted C's chain which is taller)
+    FA=$(height "$RPC_A"); FC=$(height "$RPC_C")
+    [ "$FA" -ge "$H1_C" ] 2>/dev/null \
+        && ok "S1 A adopted C's chain (A h=$FA ≥ C-before-reconnect h=$H1_C)" \
+        || fail "S1 A not at C's level (A h=$FA C h=$H1_C)"
+    R=$(count_log2 "reorg" "snapshot" "$L1A")
+    echo "  Reorg/snapshot log entries in A: $R"
+    [ "$R" -gt 0 ] 2>/dev/null && ok "S1 A shows chain-switch in logs" \
+                                || fail "S1 no chain-switch in A logs"
 else
-    echo "  FAIL ✗ A+C did not converge in ${MAX_WAIT}s"
-    FAIL=$((FAIL+1))
+    fail "S1 no convergence in 60s"
+    echo "  A=$(best_hash "$RPC_A" | cut -c1-20)"
+    echo "  C=$(best_hash "$RPC_C" | cut -c1-20)"
 fi
 
-# Verify no crash in logs
-for label in A B C; do
-    log_var="LOG_$label"
-    log="${!log_var}"
-    if grep -q "panicked\|PANIC\|stack overflow\|thread.*panicked" "$log" 2>/dev/null; then
-        echo "  FAIL ✗ Node $label shows panic in logs!"
-        FAIL=$((FAIL+1))
-    else
-        echo "  PASS ✓ Node $label: no panics in logs"
-        PASS=$((PASS+1))
-    fi
-done
+check_no_panic "S1-A" "$L1A"
+check_no_panic "S1-C" "$L1C"
+kill "$P1A" "$P1C" 2>/dev/null || true
+wait "$P1A" "$P1C" 2>/dev/null || true
+sleep 2
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SCENARIO 2: A has more work → C (WITH --mine) syncs to A
+# =============================================================================
 echo ""
-echo "======================================================"
-echo " SUMMARY"
-echo "======================================================"
-echo "  PASS: $PASS"
-echo "  FAIL: $FAIL"
-echo "======================================================"
+echo "══════════════════════════════════════════════════════════════════════"
+echo " S2: A has more work → C (reconnects WITH --mine) must sync to A"
+echo "  Tests: sync_ready arm cancels miner PoW, deep-fork → snapshot"
+echo "══════════════════════════════════════════════════════════════════════"
 
-if [ "$FAIL" -eq 0 ]; then
-    echo "  Overall: ALL PASSED ✓"
-    exit 0
+S2A=/tmp/ptest-s2-A; S2C=/tmp/ptest-s2-C
+L2A=/tmp/ptest-s2-A.log; L2C=/tmp/ptest-s2-C.log
+rm -rf "$S2A" "$S2C"; mkdir -p "$S2A" "$S2C"
+
+"$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine --genesis >"$L2A" 2>&1 &
+P2A=$!; ALL_PIDS+=($P2A); echo "  A pid=$P2A (genesis)"
+wait_alive "$RPC_A" A
+wait_height "$RPC_A" 6 A
+
+"$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --mine --seed 127.0.0.1:19041 >"$L2C" 2>&1 &
+P2C=$!; ALL_PIDS+=($P2C); echo "  C pid=$P2C (syncs to A)"
+wait_alive "$RPC_C" C
+wait_height "$RPC_C" 6 C
+sleep 3
+H2_FORK=$(height "$RPC_A")
+
+# Stop BOTH — A will get the head start this time
+kill "$P2A" 2>/dev/null; wait "$P2A" 2>/dev/null || true
+kill "$P2C" 2>/dev/null; wait "$P2C" 2>/dev/null || true
+sleep 1
+echo "  Fork point: h=$H2_FORK. Both stopped."
+
+# A mines ALONE (+6) — C is frozen
+"$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine >"$L2A" 2>&1 &
+P2A=$!; ALL_PIDS+=($P2A)
+wait_alive "$RPC_A" A
+
+A_TARGET2=$((H2_FORK + 6))
+echo "  A mines alone to h>=$A_TARGET2 (+6 head start, C frozen)"
+wait_height "$RPC_A" "$A_TARGET2" "A"
+H2_A=$(height "$RPC_A")
+echo "  A at h=$H2_A. Stopping A."
+kill "$P2A" 2>/dev/null; wait "$P2A" 2>/dev/null || true; sleep 1
+
+# C mines alone (+3) — A is stopped
+"$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --mine >"$L2C" 2>&1 &
+P2C=$!; ALL_PIDS+=($P2C)
+wait_alive "$RPC_C" C
+
+C_TARGET2=$((H2_FORK + 3))
+wait_height "$RPC_C" "$C_TARGET2" "C"
+H2_C=$(height "$RPC_C")
+kill "$P2C" 2>/dev/null; wait "$P2C" 2>/dev/null || true; sleep 1
+
+echo "  Before reconnect: A h=$H2_A (fork+6)  C h=$H2_C (fork+3)"
+[ "$H2_A" -gt "$H2_C" ] 2>/dev/null \
+    && ok "S2 A taller than C by $(( H2_A - H2_C )) blocks" \
+    || fail "S2 A not taller (h_A=$H2_A h_C=$H2_C)"
+
+# Restart BOTH — C reconnects WITH --mine
+# C must detect A has more work and switch chains even while mining
+T_CONN2=$(date +%s)
+echo ""
+echo "  Restarting A and C (WITH --mine) — C must adopt A's chain while mining..."
+
+"$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
+    --mine >"$L2A" 2>&1 &
+P2A=$!; ALL_PIDS+=($P2A)
+wait_alive "$RPC_A" A
+
+"$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
+    --mine --seed 127.0.0.1:19041 >"$L2C" 2>&1 &
+P2C=$!; ALL_PIDS+=($P2C)
+wait_alive "$RPC_C" C
+
+if wait_converge "$RPC_A" "$RPC_C" "S2 A+C" 60; then
+    SECS2=$(( $(date +%s) - T_CONN2 ))
+    ok "S2 A+C converged in ${SECS2}s"
+    [ "$SECS2" -le 30 ] && ok "S2 fast convergence (≤30s, got ${SECS2}s)" \
+                        || fail "S2 slow convergence (>30s, got ${SECS2}s)"
+    FA2=$(height "$RPC_A"); FC2=$(height "$RPC_C")
+    FH=$(( FA2 < FC2 ? FA2 : FC2 ))
+    SAME=$([ "$(hash_at "$RPC_A" "$FH")" = "$(hash_at "$RPC_C" "$FH")" ] && echo yes || echo no)
+    [ "$SAME" = "yes" ] \
+        && ok "S2 same block at h=$FH" \
+        || fail "S2 different blocks at h=$FH"
+    [ "$FC2" -ge "$H2_A" ] 2>/dev/null \
+        && ok "S2 C adopted A's chain (C h=$FC2 ≥ A-before-reconnect h=$H2_A)" \
+        || fail "S2 C not at A's level (C h=$FC2 vs A h=$H2_A)"
+    SR=$(count_log "sync_ready.*new chain tip\|sealed-state" "$L2C")
+    DF=$(count_log "deep fork\|requesting snapshot directly\|O(1) Paranoid sync" "$L2C")
+    echo "  sync_ready/sealed-state in C: $SR"
+    echo "  snapshot sync (deep fork) in C: $DF"
+    [ "$DF" -gt 0 ] 2>/dev/null && ok "S2 C used O(1) snapshot sync" \
+                                  || echo "  INFO: shallow fork used block-by-block reorg"
 else
-    echo "  Overall: SOME FAILED ✗"
-    exit 1
+    fail "S2 no convergence in 60s"
+    echo "  A=$(best_hash "$RPC_A" | cut -c1-20)"
+    echo "  C=$(best_hash "$RPC_C" | cut -c1-20)"
 fi
+
+check_no_panic "S2-A" "$L2A"
+check_no_panic "S2-C" "$L2C"
+kill "$P2A" "$P2C" 2>/dev/null || true
+wait "$P2A" "$P2C" 2>/dev/null || true
+
+# =============================================================================
+echo ""
+echo "======================================================================"
+printf "  PASS: %d   FAIL: %d\n" "$PASS" "$FAIL"
+echo "======================================================================"
+[ "$FAIL" -eq 0 ] && echo "  ALL PASSED ✓" && exit 0 || echo "  SOME FAILED ✗" && exit 1

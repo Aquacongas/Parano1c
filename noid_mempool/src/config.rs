@@ -15,11 +15,6 @@ pub struct MempoolConfig {
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
     pub fee_floor_window: usize,
 
-    /// Enable background ZK pre-proving on admission.
-    /// When true, each admitted tx spawns a `prove_air_algebraic_pretx` task.
-    /// Cached proofs reduce block assembly from ~44s to ~12s at 1024 txs.
-    pub pre_prove_enabled: bool,
-
     /// Number of concurrent ZK verification workers (tokio::spawn_blocking slots).
     /// 0 = skip ZK verification at admission (native checks only).
     /// Recommended: number of physical cores.
@@ -31,8 +26,7 @@ impl Default for MempoolConfig {
         Self {
             capacity: BLOCK_MAX_TXS * 8,
             fee_floor_window: 50,
-            pre_prove_enabled: false, // activated in Phase 1.5
-            zk_verify_workers: 4,     // 4 concurrent ZK verification workers (DoS bound)
+            zk_verify_workers: 4,
         }
     }
 }
@@ -40,11 +34,6 @@ impl Default for MempoolConfig {
 impl MempoolConfig {
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
-        self
-    }
-
-    pub fn with_pre_prove(mut self, enabled: bool) -> Self {
-        self.pre_prove_enabled = enabled;
         self
     }
 

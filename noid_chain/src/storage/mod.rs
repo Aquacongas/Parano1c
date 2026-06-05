@@ -91,7 +91,7 @@ pub trait BlockStore: Send + Sync {
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
 
     /// Retrieve a recent block's raw bytes. Only available for the last
-    /// `RECENT_BLOCK_RETENTION` (= 18) blocks; returns `None` for older blocks.
+    /// `FINALITY_DEPTH` blocks; returns `None` for older blocks.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     /// Retrieve the persisted recursive chain proof (6.5 KB). `None` means

@@ -295,10 +295,14 @@ mod tests {
 
     #[test]
     fn fast_blocks_raise_difficulty() {
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, 180); // 2× fast
+        // 6 blocks in half the ideal time → difficulty doubles (target halves).
+        // Use BLOCK_TIME-relative values so the test stays correct regardless of
+        // what BLOCK_TIME is set to.
+        let ideal = 6 * BLOCK_TIME; // ideal elapsed for 6 blocks
+        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal / 2); // 2× fast
         assert!(
             le256_lt(&new, &GENESIS_TARGET),
-            "fast: target must decrease"
+            "fast: target must decrease (got >= genesis)"
         );
         // Must be within 2% of orig/2.
         let orig = as_u128(&GENESIS_TARGET);
@@ -313,10 +317,12 @@ mod tests {
 
     #[test]
     fn slow_blocks_lower_difficulty() {
-        let new = next_target(0, 0, &GENESIS_TARGET, 6, 720); // 2× slow
+        // 6 blocks in 2× the ideal time → difficulty halves (target doubles).
+        let ideal = 6 * BLOCK_TIME;
+        let new = next_target(0, 0, &GENESIS_TARGET, 6, ideal * 2); // 2× slow
         assert!(
             le256_lt(&GENESIS_TARGET, &new),
-            "slow: target must increase"
+            "slow: target must increase (got <= genesis)"
         );
         let orig = as_u128(&GENESIS_TARGET);
         let got = as_u128(&new);

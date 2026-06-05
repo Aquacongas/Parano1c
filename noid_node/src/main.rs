@@ -711,7 +711,21 @@ async fn handle_p2p_events(
     const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
     let mut tx_event_count: u32 = 0;
 
-    // --- FetchHeaders recursion depth limiter (Fix 3.4) ---
+    // --- Per-peer BLOCK rate limiter ---
+    //
+    // Txs have a rate limit (50/10s). Blocks need one too: a malicious or
+    // buggy peer can flood us with blocks, each requiring chain.write() and
+    // full PoW/header validation.
+    //
+    // Limit: BLOCK_RATE_MAX blocks per peer per BLOCK_RATE_WINDOW.
+    // During ASERT convergence (sudden 100x hashrate) blocks can come 20x
+    // faster than normal for ~300s, so we allow up to 4/s (4 × BLOCK_TIME).
+    let mut peer_block_rate: HashMap<libp2p::PeerId, (u32, Instant)> = HashMap::new();
+    const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
+    const BLOCK_RATE_MAX: u32 = 40; // 40 blocks per 10s = 4/s max per peer
+    let mut block_event_count: u32 = 0;
+
+    // --- FetchHeaders recursion depth limiter ---
     //
     // Caps how many times we fetch further-back headers without finding a common
     // ancestor.  Each step covers 512 blocks, so 4 steps = 2048 blocks, well
@@ -723,6 +737,27 @@ async fn handle_p2p_events(
     loop {
         match rx.recv().await {
             Ok(NetworkEvent::NewBlock { from, block_bytes }) => {
+                // Per-peer block rate limit: prevents flood DoS.
+                // Each block requires chain.write() + PoW validation.
+                {
+                    let now = Instant::now();
+                    let entry = peer_block_rate.entry(from).or_insert((0, now));
+                    if now.duration_since(entry.1) > BLOCK_RATE_WINDOW {
+                        *entry = (1, now);
+                    } else if entry.0 >= BLOCK_RATE_MAX {
+                        tracing::debug!(peer = %from, "block rate limit exceeded, dropping");
+                        continue;
+                    } else {
+                        entry.0 += 1;
+                    }
+                }
+                // Periodic cleanup of stale entries.
+                block_event_count += 1;
+                if block_event_count % 200 == 0 {
+                    let cutoff = Instant::now() - Duration::from_secs(60);
+                    peer_block_rate.retain(|_, (_, t)| *t >= cutoff);
+                }
+
                 tracing::debug!(peer = %from, "received block from P2P");
                 match noid_chain::block::Block::from_bytes(&block_bytes) {
                     Ok(block) => {
@@ -1153,35 +1188,48 @@ async fn handle_p2p_events(
                         .unwrap_or(ancestor_height);
 
                     if new_tip_height > our_tip {
-                        use noid_chain::consensus::params::RECENT_BLOCK_RETENTION;
+                        use noid_chain::consensus::params::FINALITY_DEPTH;
 
-                        if competing.len() > RECENT_BLOCK_RETENTION as usize {
-                            // The competing chain is longer than what peers store.
-                            // Individual block requests would fail (blocks not available).
-                            // Request a full state snapshot instead — this is the
-                            // designed sync mechanism for Paranoid.
+                        if competing.len() > FINALITY_DEPTH as usize {
+                            // Competing fork is deeper than FINALITY_DEPTH.
+                            //
+                            // WHY SNAPSHOT, NOT BLOCK-BY-BLOCK:
+                            // apply_reorg_mdbx enforces reorg_depth ≤ FINALITY_DEPTH, so
+                            // block-by-block is structurally impossible here anyway.
+                            //
+                            // More importantly: blocks arrive as individual NewBlock events.
+                            // When the first competing block arrives alone its chainwork is
+                            // tiny vs our full chain — the reorg comparison fires prematurely
+                            // and always says "keep our chain". Subsequent blocks hit the
+                            // None branch (parent not found) → FetchHeaders again → cycle.
+                            //
+                            // In Paranoid, snapshot sync is O(1) regardless of chain length.
+                            // It is always correct and always faster than N round-trips of
+                            // block fetching for forks this deep.
                             tracing::info!(
                                 ancestor = ancestor_height,
                                 our_tip,
                                 competing_tip = new_tip_height,
                                 blocks_needed = competing.len(),
-                                max_stored = RECENT_BLOCK_RETENTION,
                                 peer = %from,
-                                "deep reorg: requesting state snapshot (blocks not available)"
+                                "fork >{} blocks deep — requesting snapshot (O(1) Paranoid sync)",
+                                FINALITY_DEPTH
                             );
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
                                 .await;
                         } else {
+                            // Shallow fork (≤ FINALITY_DEPTH): apply_reorg_mdbx can handle it.
+                            // Fetch individual blocks; they arrive quickly and the orphan
+                            // pool assembles them into a chain for the reorg comparison.
                             tracing::info!(
                                 ancestor = ancestor_height,
                                 our_tip,
                                 competing_tip = new_tip_height,
                                 peer = %from,
-                                "reorg via batch headers: fetching {} competing blocks",
+                                "shallow fork: fetching {} competing blocks for reorg",
                                 competing.len()
                             );
-                            // Request all competing blocks from peer
                             for hdr in &competing {
                                 let _ = p2p_cmd
                                     .send(noid_p2p::NetworkCommand::RequestBlock {
@@ -1190,8 +1238,6 @@ async fn handle_p2p_events(
                                     })
                                     .await;
                             }
-                            // Blocks will arrive as NewBlock events and trigger
-                            // the reorg through the normal BadParentHash path.
                         }
                     } else {
                         tracing::debug!(

@@ -228,9 +228,16 @@ chk "getMempoolEntry finds tx"      "$MP_HASH" "$TX"
 chk "isNullifier(pending)=false"    "$(r "isNullifier" "[\"$TX\"]")" "false"
 
 # Wait for confirmation — up to 60s (accommodates 5-second genesis blocks)
+CONFIRM_START_MS=$(date +%s%3N)
 echo -n "  confirming tx "
 for i in $(seq 1 120); do
-    SZ=$(n "getMempoolSize"); [ "$SZ" = "0" ] && echo " confirmed (${i}s)" && break
+    SZ=$(n "getMempoolSize")
+    if [ "$SZ" = "0" ]; then
+        CONFIRM_END_MS=$(date +%s%3N)
+        CONFIRM_MS=$((CONFIRM_END_MS - CONFIRM_START_MS))
+        echo " confirmed (${CONFIRM_MS}ms)"
+        break
+    fi
     echo -n "."; sleep 0.5
 done
 
@@ -262,6 +269,58 @@ if [ "$RECEIPT" != "null" ] && [ "${#RECEIPT}" -gt 20 ]; then
 else
     ko "verifyReceipt (skipped — no receipt)"
     ko "verifyReceipt tamper (skipped)"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- tx latency ---"
+
+# Send 500 μNOID from ADDR0 to ADDR1, fee=0 (auto)
+LAT_SEND=$(j "walletSend" "[\"$ADDR1\", 500, 0]")
+LAT_TX=$(echo "$LAT_SEND" | jq -r '.result.tx_hash // ""')
+chk "latency send → tx_hash"        "$LAT_TX"
+
+# Block height at the moment of submission
+BLOCK_AT_SEND=$(n "blockCount")
+
+# Precise start timestamp immediately after submission
+LAT_START_MS=$(date +%s%3N)
+
+# Poll getMempoolSize every 100ms until 0 (confirmed), up to 30s
+LAT_CONFIRMED=0
+for i in $(seq 1 300); do
+    SZ=$(n "getMempoolSize")
+    if [ "$SZ" = "0" ]; then
+        LAT_CONFIRMED=1
+        break
+    fi
+    sleep 0.1
+done
+
+LAT_END_MS=$(date +%s%3N)
+LATENCY_MS=$((LAT_END_MS - LAT_START_MS))
+LATENCY_BLOCKS=$((LATENCY_MS / 5000))
+
+echo "  tx confirmed in ${LATENCY_MS}ms (~${LATENCY_BLOCKS} blocks)"
+
+# Check: latency ≤ 2 block times (≤ 10000ms)
+if [ "$LAT_CONFIRMED" = "1" ] && [ "$LATENCY_MS" -le 10000 ]; then
+    ok "tx latency: ${LATENCY_MS}ms (≤10000ms)"
+else
+    ko "tx latency: ${LATENCY_MS}ms (>10000ms or timed out)"
+fi
+
+# Check block-level inclusion: tx should land within 2 blocks of submission
+BLOCK_AT_CONFIRM=$(f "getTx" "[\"$LAT_TX\"]" "height")
+if [[ "$BLOCK_AT_CONFIRM" =~ ^[0-9]+$ ]] && [[ "$BLOCK_AT_SEND" =~ ^[0-9]+$ ]]; then
+    BLOCKS_TO_CONFIRM=$((BLOCK_AT_CONFIRM - BLOCK_AT_SEND))
+    if [ "$BLOCKS_TO_CONFIRM" -le 2 ]; then
+        ok "tx in ≤2 blocks (got ${BLOCKS_TO_CONFIRM} blocks)"
+    else
+        ko "tx in ≤2 blocks (got ${BLOCKS_TO_CONFIRM} blocks)"
+    fi
+else
+    ko "tx in ≤2 blocks (could not read heights: send=$BLOCK_AT_SEND confirm=$BLOCK_AT_CONFIRM)"
 fi
 
 # ---------------------------------------------------------------------------
