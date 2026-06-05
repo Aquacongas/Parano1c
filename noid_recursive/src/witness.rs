@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Algebraic replay witness for Phase 7 recursive proofs.
+//! Algebraic replay witness for recursive proofs.
 //!
 //! `BlockReplayWitness` holds everything needed for in-circuit algebraic
 //! verification — zero-check transcripts, multipoint sumcheck rounds,

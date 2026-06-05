@@ -30,7 +30,6 @@
 //! - **Merkle paths** from column FRI roots to `state_root`: verified by
 //!   Merkle Kill-Shot GKR (14-var unified sumcheck).
 //!
-//! ## Optimizations applied (Phase 7/8)
 //!
 //! - Fused `TripleProductGate` (degree-3) for `gp_lane = γ^i · eq_{L-1} ·
 //!   opened_pre_lane` — eliminates 3 intermediate columns.

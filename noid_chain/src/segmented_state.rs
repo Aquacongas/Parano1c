@@ -269,6 +269,10 @@ pub struct SegmentedFriState {
     ///   `(segments touched per block) × 3 MB + (evicted set bookkeeping)`
     /// regardless of total chain history or active slot count.
     evicted: HashSet<u16>,
+    /// Segment IDs whose leaves in `tree` were updated since the last
+    /// `flush_tree` call. Used by the incremental Merkle updater to recompute
+    /// only the O(dirty_count × depth) ancestor nodes instead of the full O(N).
+    dirty_tree_leaves: HashSet<u16>,
 }
 
 impl SegmentedFriState {
@@ -304,6 +308,7 @@ impl SegmentedFriState {
             dirty: HashSet::new(),
             mdbx_dirty: HashSet::new(),
             evicted: HashSet::new(),
+            dirty_tree_leaves: HashSet::new(),
         }
     }
 
@@ -786,25 +791,71 @@ impl SegmentedFriState {
         self.seg_roots[id] = Some(seg_root);
         self.dirty.remove(&seg_id);
 
-        // Update the Merkle leaf (and mark tree dirty).
+        // Update the Merkle leaf and record which leaf changed.
         if self.num_segments > 1 {
             self.tree[self.num_segments + id] = seg_root;
             self.tree_dirty = true;
+            self.dirty_tree_leaves.insert(seg_id);
         }
     }
 
     /// Propagate changed leaves upward through the Merkle tree.
-    /// O(num_segments) in the worst case; incremental when only a few
-    /// segments changed (the changed-leaf paths are a tiny fraction).
+    ///
+    /// **Incremental**: only recomputes the O(dirty × depth) ancestor nodes
+    /// on the paths from dirty leaves to the root, instead of rebuilding
+    /// all O(num_segments) internal nodes unconditionally.
+    ///
+    /// Worst case (all N segments dirty): O(N) — same as the old full rebuild,
+    /// because all paths overlap at higher levels. Best case (1 dirty segment):
+    /// O(log N) — 8 compresses at genesis (256 segments, depth 8) vs 255.
     fn flush_tree(&mut self) {
         if !self.tree_dirty || self.num_segments <= 1 {
             self.tree_dirty = false;
+            self.dirty_tree_leaves.clear();
             return;
         }
-        // Rebuild all internal nodes bottom-up.
-        for k in (1..self.num_segments).rev() {
+
+        if self.dirty_tree_leaves.is_empty() {
+            // tree_dirty was set without tracking specific leaves (e.g. expand).
+            // Fall back to full rebuild.
+            for k in (1..self.num_segments).rev() {
+                self.tree[k] = compress(&self.tree[2 * k], &self.tree[2 * k + 1]);
+            }
+            self.tree_dirty = false;
+            return;
+        }
+
+        // Collect all internal nodes that need recomputing.
+        // Walk from each dirty leaf up to the root, collecting parent indices.
+        // Use a Vec<usize> sorted descending (leaves before parents) so we
+        // always recompute children before their parents.
+        let mut to_update: Vec<usize> = Vec::with_capacity(self.dirty_tree_leaves.len() * 9);
+        for &seg_id in &self.dirty_tree_leaves {
+            // Leaf index in the 1-indexed tree.
+            let mut k = self.num_segments + seg_id as usize;
+            // Walk up to root (k=1 is root, stop after processing it).
+            loop {
+                k /= 2; // parent
+                if k == 0 {
+                    break;
+                }
+                to_update.push(k);
+                if k == 1 {
+                    break; // reached root
+                }
+            }
+        }
+
+        // Deduplicate. Sort ascending so we process parents after children
+        // (higher index = closer to leaves, lower index = closer to root).
+        to_update.sort_unstable();
+        to_update.dedup();
+        // Process largest indices first (closest to leaves).
+        for &k in to_update.iter().rev() {
             self.tree[k] = compress(&self.tree[2 * k], &self.tree[2 * k + 1]);
         }
+
+        self.dirty_tree_leaves.clear();
         self.tree_dirty = false;
     }
 }

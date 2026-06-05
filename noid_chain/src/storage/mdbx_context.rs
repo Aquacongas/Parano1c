@@ -438,7 +438,7 @@ impl MdbxChainContext {
         //
         // The jemalloc allocator (enabled in noid_node) already returns freed
         // pages to the OS aggressively, providing a 10× RSS reduction vs glibc.
-        // Segment eviction is a Phase 9 optimization that requires atomic
+        // Segment eviction is an optimization that requires atomic
         // snapshot semantics (Arc<RwLock<SegmentedFriState>> or similar).
         self.state.state.clear_dirty();
 
@@ -508,7 +508,6 @@ impl MdbxChainContext {
             });
         }
 
-        // Populated by Phase 0/1 below (declared here so they're in scope for Phase 5).
         #[allow(unused_assignments)]
         let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
         #[allow(unused_assignments)]
@@ -523,7 +522,7 @@ impl MdbxChainContext {
         );
 
         // -----------------------------------------------------------------------
-        // Phase 0: Validate ALL undo logs before modifying any state.
+        // Validate ALL undo logs before modifying any state.
         //
         // This is critical for safety: if we start reverting and then discover a
         // missing undo log mid-loop, we leave the node in an inconsistent state:
@@ -555,13 +554,13 @@ impl MdbxChainContext {
                     Err(e) => return Err(e.into()),
                 }
             }
-            // All undo logs present — store them for Phase 1.
+            // All undo logs present — store them.
             // (We traverse in reverse above to fail-fast on missing entries, so
             // re-sort to descending order for the revert loop below.)
             loaded.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
 
             // -----------------------------------------------------------------------
-            // Phase 1: Revert blocks from tip to ancestor (RAM only).
+            // Revert blocks from tip to ancestor (RAM only).
             // Safe to execute: all undo logs validated.
             // -----------------------------------------------------------------------
             let mut reclaimed_tx_hashes_inner: Vec<TxBodyHash> = Vec::new();
@@ -581,7 +580,7 @@ impl MdbxChainContext {
         }
 
         // -----------------------------------------------------------------------
-        // Phase 2: Rebuild nullifier set from the surviving chain.
+        // Rebuild nullifier set from the surviving chain.
         // Uses T_NULLIFIER_BLOCKS (kept for ANCHOR_DEPTH blocks), not undo logs
         // (kept for only FINALITY_DEPTH blocks).
         // -----------------------------------------------------------------------
@@ -595,7 +594,7 @@ impl MdbxChainContext {
         }
 
         // -----------------------------------------------------------------------
-        // Phase 3: Update tip pointers to the ancestor.
+        // Update tip pointers to the ancestor.
         // -----------------------------------------------------------------------
         let ancestor_header =
             self.get_header_from_store(ancestor_height)?
@@ -607,14 +606,14 @@ impl MdbxChainContext {
         self.tip_hash = full_block_hash(&ancestor_header);
 
         // -----------------------------------------------------------------------
-        // Phase 4: Persist the reverted state to MDBX atomically.
-        // dirty segments (from Phase 1) are written before new blocks so crash
+        // Persist the reverted state to MDBX atomically.
+        // dirty segments are written before new blocks so crash
         // recovery always sees a consistent ancestor checkpoint.
         // -----------------------------------------------------------------------
         self.persist_reorg_checkpoint(&ancestor_header)?;
 
         // -----------------------------------------------------------------------
-        // Phase 5: Apply new blocks using the existing apply_next_block.
+        // Apply new blocks using the existing apply_next_block.
         // -----------------------------------------------------------------------
         let mut applied_heights: Vec<u64> = Vec::new();
 
@@ -656,7 +655,7 @@ impl MdbxChainContext {
     ) -> Result<(), MdbxContextError> {
         use crate::consensus::da_prune::BlockUndoLog;
 
-        // Collect all segments dirtied by the revert_block calls in Phase 1.
+        // Collect all segments dirtied by the revert_block calls.
         let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
         let eff_log = self.state.state.effective_log_segment_size() as u8;
         let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
@@ -1132,7 +1131,7 @@ mod tests {
         let sentinel_a = TxBodyHash([0xAAu8; 32]);
         let sentinel_b = TxBodyHash([0xBBu8; 32]);
 
-        // Phase 1: open fresh DB, apply one empty block, then directly write
+        // open fresh DB, apply one empty block, then directly write
         // a second block with two sentinel nullifiers via commit_block.
         let block1_hash;
         {
@@ -1175,7 +1174,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Phase 2: reopen. The rebuilt nullifier set must contain both sentinels.
+        // reopen. The rebuilt nullifier set must contain both sentinels.
         {
             // Open by reading chain_tip from MDBX (tip is still 1 since we
             // bypassed apply_next_block for block 2; that's fine for this test).

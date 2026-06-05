@@ -19,17 +19,43 @@ use crate::consensus::ConsensusError;
 use crate::nullifier::NullifierSet;
 use noid_tx::{hash_tx_body, Transaction};
 
-/// Validate the per-tx consensus rules for a transaction being included in a block.
-///
-/// `block_height` is the height of the block being built/validated.
+/// Validate the per-tx consensus rules for a transaction.
 ///
 /// Checks (ordered cheapest first):
+/// 0. Fee fits in u64; coinbase fee == 0; coinbase output count == 1.
 /// 1. `tx.tx_body_hash == hash(tx.body)` — binding check
-/// 2. `epoch_anchor` is non-zero for non-coinbase txs (height window deferred to ZK layer)
-/// 3. `tx.tx_body_hash` is not in the nullifier set
+///    (skip when called from `validate_block_consensus` because `apply_block`
+///    already verifies this, avoiding double Poseidon2b computation per tx).
+/// 2. `epoch_anchor` is non-zero for non-coinbase txs.
+/// 3. `tx.tx_body_hash` is not in the nullifier set.
+///
+/// `check_body_hash = false` skips check 1, reducing Poseidon2b work by
+/// ~59 permutations per tx (used by `validate_block_consensus`).
 pub fn validate_tx_consensus(
     tx: &Transaction,
     nullifiers: &NullifierSet,
+) -> Result<(), ConsensusError> {
+    validate_tx_consensus_inner(tx, nullifiers, true)
+}
+
+/// Same as `validate_tx_consensus` but skips the tx_body_hash recomputation.
+///
+/// Called by `validate_block_consensus` because `apply_block` already
+/// verifies tx_body_hash for every transaction in the block, making the
+/// recomputation here redundant.
+/// At 1024 txs × 59-perm Poseidon2b, this saves ~60 ms per block application.
+#[inline]
+pub(crate) fn validate_tx_consensus_skip_hash(
+    tx: &Transaction,
+    nullifiers: &NullifierSet,
+) -> Result<(), ConsensusError> {
+    validate_tx_consensus_inner(tx, nullifiers, false)
+}
+
+fn validate_tx_consensus_inner(
+    tx: &Transaction,
+    nullifiers: &NullifierSet,
+    check_body_hash: bool,
 ) -> Result<(), ConsensusError> {
     // 0. Fee must fit in u64 (values are 64-bit in this protocol).
     if tx.body.fee > u64::MAX as u128 {
@@ -51,16 +77,19 @@ pub fn validate_tx_consensus(
         }
     }
 
-    // 1. tx_body_hash binding.
-    let expected_hash = hash_tx_body(
-        &tx.body.epoch_anchor,
-        tx.body.fee,
-        &tx.body.inputs,
-        &tx.body.outputs,
-        tx.body.is_coinbase,
-    );
-    if tx.tx_body_hash != expected_hash {
-        return Err(ConsensusError::BadTxBodyHash);
+    // 1. tx_body_hash binding (skipped when called from validate_block_consensus
+    //    because apply_block already verifies this for every tx in the block).
+    if check_body_hash {
+        let expected_hash = hash_tx_body(
+            &tx.body.epoch_anchor,
+            tx.body.fee,
+            &tx.body.inputs,
+            &tx.body.outputs,
+            tx.body.is_coinbase,
+        );
+        if tx.tx_body_hash != expected_hash {
+            return Err(ConsensusError::BadTxBodyHash);
+        }
     }
 
     // 2. epoch_anchor: non-zero for non-coinbase (structural check).

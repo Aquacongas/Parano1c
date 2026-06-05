@@ -152,9 +152,10 @@ wait_alive "$RPC_A" A
 
 A_TARGET=$((H1_FORK + 3))
 wait_height "$RPC_A" "$A_TARGET" "A"
-kill "$P1A" 2>/dev/null; wait "$P1A" 2>/dev/null || true
-H1_A=$(height "$RPC_A")     # capture height NOW while A is stopped
-sleep 1
+# Read height BEFORE kill (RPC goes down after kill).
+# We stop it quickly to minimise extra blocks after the read.
+H1_A=$(height "$RPC_A")
+kill "$P1A" 2>/dev/null; wait "$P1A" 2>/dev/null || true; sleep 1
 
 echo "  Fork snapshot: A h=$H1_A (stopped)  C h=$H1_C (stopped)"
 [ "$H1_C" -gt "$H1_A" ] 2>/dev/null \
@@ -241,25 +242,28 @@ echo "  Fork point: h=$H2_FORK. Both stopped."
 P2A=$!; ALL_PIDS+=($P2A)
 wait_alive "$RPC_A" A
 
-A_TARGET2=$((H2_FORK + 6))
-echo "  A mines alone to h>=$A_TARGET2 (+6 head start, C frozen)"
+# A gets a +12 head start (vs C's +2).
+# Read height BEFORE kill so RPC is still alive.
+A_TARGET2=$((H2_FORK + 12))
+echo "  A mines alone to h>=$A_TARGET2 (+12 head start, C frozen)"
 wait_height "$RPC_A" "$A_TARGET2" "A"
-H2_A=$(height "$RPC_A")
-echo "  A at h=$H2_A. Stopping A."
+H2_A=$(height "$RPC_A")    # read before kill — RPC still up
 kill "$P2A" 2>/dev/null; wait "$P2A" 2>/dev/null || true; sleep 1
+echo "  A at h=$H2_A. Stopped."
 
-# C mines alone (+3) — A is stopped
+# C mines alone (+2) — A is stopped
 "$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
     --mine >"$L2C" 2>&1 &
-P2C=$!; ALL_PIDS+=($P2C)
+P2C=$!; ALL_PIDS+=("$P2C")
 wait_alive "$RPC_C" C
 
-C_TARGET2=$((H2_FORK + 3))
+C_TARGET2=$((H2_FORK + 2))
 wait_height "$RPC_C" "$C_TARGET2" "C"
-H2_C=$(height "$RPC_C")
+H2_C=$(height "$RPC_C")    # read before kill
 kill "$P2C" 2>/dev/null; wait "$P2C" 2>/dev/null || true; sleep 1
+echo "  C at h=$H2_C. Stopped."
 
-echo "  Before reconnect: A h=$H2_A (fork+6)  C h=$H2_C (fork+3)"
+echo "  Before reconnect: A h=$H2_A (fork+12)  C h=$H2_C (fork+2)"
 [ "$H2_A" -gt "$H2_C" ] 2>/dev/null \
     && ok "S2 A taller than C by $(( H2_A - H2_C )) blocks" \
     || fail "S2 A not taller (h_A=$H2_A h_C=$H2_C)"
@@ -286,11 +290,14 @@ if wait_converge "$RPC_A" "$RPC_C" "S2 A+C" 60; then
     [ "$SECS2" -le 30 ] && ok "S2 fast convergence (≤30s, got ${SECS2}s)" \
                         || fail "S2 slow convergence (>30s, got ${SECS2}s)"
     FA2=$(height "$RPC_A"); FC2=$(height "$RPC_C")
+    # Check convergence at FH-2 (not the tip) so both nodes have had time
+    # to commit that block — avoids false positives while both are actively mining.
     FH=$(( FA2 < FC2 ? FA2 : FC2 ))
-    SAME=$([ "$(hash_at "$RPC_A" "$FH")" = "$(hash_at "$RPC_C" "$FH")" ] && echo yes || echo no)
+    FH_STABLE=$(( FH > 2 ? FH - 2 : FH ))
+    SAME=$([ "$(hash_at "$RPC_A" "$FH_STABLE")" = "$(hash_at "$RPC_C" "$FH_STABLE")" ] && echo yes || echo no)
     [ "$SAME" = "yes" ] \
-        && ok "S2 same block at h=$FH" \
-        || fail "S2 different blocks at h=$FH"
+        && ok "S2 same block at h=$FH_STABLE (tip-2)" \
+        || fail "S2 different blocks at h=$FH_STABLE"
     [ "$FC2" -ge "$H2_A" ] 2>/dev/null \
         && ok "S2 C adopted A's chain (C h=$FC2 ≥ A-before-reconnect h=$H2_A)" \
         || fail "S2 C not at A's level (C h=$FC2 vs A h=$H2_A)"

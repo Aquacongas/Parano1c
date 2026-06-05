@@ -7,7 +7,6 @@
 //!
 //!   cargo bench --bench stark_report
 //!
-//! Measures the complete Phase 1 pipeline:
 //!   Layer 1 (Wallet):    prove_logic / verify_logic (81-col TxLogicAir)
 //!   Layer 2 (Full Node): verify_logic + prove_block (deferred-opening aggregation)
 //!   Block Verifier:      verify_block (GKR + algebraic STARK + FRI)

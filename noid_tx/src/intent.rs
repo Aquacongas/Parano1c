@@ -35,7 +35,7 @@ pub struct ClaimedSlot {
 /// `TxIntent` carries `tx_body_hash` alongside `tx_body` on the wire.
 /// The mempool verifier recomputes `hash_tx_body(tx_body)` and rejects
 /// any TxIntent where the hash field doesn't match the body.
-/// See `noid_mempool::pool::submit` (Security #6 fix, Phase 5).
+/// See `noid_mempool::pool::submit`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TxIntent {
     pub tx_body: TxBody,

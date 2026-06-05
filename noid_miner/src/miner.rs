@@ -61,7 +61,15 @@ pub struct MinerConfig {
     pub miner_address: Address,
     /// Number of rayon threads for PoW search. 0 = all physical cores.
     pub pow_threads: usize,
-    /// Template refresh heartbeat interval (seconds). Default: 15.
+    /// Safety-net heartbeat interval (seconds).
+    ///
+    /// Fires only if the miner has been stuck without a block for this long.
+    /// Normal template refreshes happen immediately via `sync_ready` (P2P
+    /// block received) and `TxAdmitted` (Sealed state: prove done, PoW
+    /// running).  This timer exists only for edge cases where both are silent.
+    ///
+    /// Must be > BLOCK_TIME to avoid firing during active proving and
+    /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 60s.
     pub refresh_interval_secs: u64,
 }
 
@@ -70,7 +78,7 @@ impl Default for MinerConfig {
         Self {
             miner_address: Address([0u8; 32]),
             pow_threads: 0,
-            refresh_interval_secs: 15,
+            refresh_interval_secs: 60, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
         }
     }
 }
@@ -405,7 +413,7 @@ impl BlockMiner {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
-                            // Store block proof bytes for recursive proof advancement (Phase 7).
+                            // Store block proof bytes for recursive proof advancement.
                             // Only store if we have real proof bytes (not marker hashes from coinbase-only blocks).
                             if !block_proof_bytes.is_empty() {
                                 let ctx = self.chain.read().await;
@@ -467,6 +475,18 @@ impl BlockMiner {
     }
 
     /// Apply a found block to the chain and update the mempool.
+    ///
+    /// # Lock strategy
+    ///
+    /// Write lock is held ONLY for the MDBX commit + wallet hook.
+    /// `ChainView::from_mdbx` (which clones SegmentedFriState) runs under a
+    /// READ lock so it does not block incoming P2P blocks or RPC queries.
+    ///
+    /// Between write unlock and read lock, another block could arrive and be
+    /// applied. In that case `ChainView` reflects height H+2 while we notify
+    /// the mempool about confirmed txs at height H+1. This is safe:
+    /// - Confirmed tx removal uses the hash list (always correct).
+    /// - ChainView slot checks use the newest available state (safe to be ahead).
     async fn apply_found_block(&self, block: &Block, _block_bytes: &[u8]) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
@@ -475,26 +495,30 @@ impl BlockMiner {
             .unwrap_or_default()
             .as_secs();
 
-        // Apply to MDBX chain context.
-        let mut ctx = self.chain.write().await;
-        ctx.apply_next_block(block, local_time)?;
+        // --- Phase 1: MDBX commit under write lock (minimal hold time) ---
+        {
+            let mut ctx = self.chain.write().await;
+            ctx.apply_next_block(block, local_time)?;
 
-        // Fire wallet hook BEFORE mempool update so receipt is stored
-        // before getMempoolSize can return 0. Works at any mining speed —
-        // no channel, no race, no capacity limit.
-        if let Some(hook) = &self.on_block_applied {
-            hook(block);
-        }
+            // Fire wallet hook BEFORE mempool update so receipt is stored
+            // before getMempoolSize can return 0. Works at any mining speed.
+            if let Some(hook) = &self.on_block_applied {
+                hook(block);
+            }
+        } // write lock released HERE — P2P handlers can now acquire chain lock
 
-        // Update mempool: remove confirmed txs, update chain view.
+        // --- Phase 2: build ChainView under read lock (shared, non-blocking) ---
         let confirmed: Vec<_> = block
             .transactions
             .iter()
             .map(|tx| tx.tx_body_hash)
             .collect();
-        let new_view = ChainView::from_mdbx(&ctx);
-        drop(ctx);
+        let new_view = {
+            let ctx = self.chain.read().await;
+            ChainView::from_mdbx(&ctx)
+        }; // read lock released
 
+        // --- Phase 3: update mempool (no chain lock held) ---
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;

@@ -24,5 +24,5 @@ pub use fri_verify::{extract_fri_query_inputs, FriQueryInputs};
 pub use prove::{
     null_block_replay_witness, prove_genesis_recursive, prove_recursive_step, RecursiveBlockProof,
 };
-pub use verify::{verify_recursive_step, verify_tip, RecVerifyError};
+pub use verify::{verify_recursive_step, verify_step_stark_only, verify_tip, RecVerifyError};
 pub use witness::{extract_block_replay_witness_parts, BlockReplayWitness};

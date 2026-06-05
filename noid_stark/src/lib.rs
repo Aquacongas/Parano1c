@@ -413,7 +413,7 @@ fn fold_highest_flat(table: &mut Vec<u128>, r_flat: u128) {
 // Tower Sumcheck (2025/594 + 2024/1038) — Row-major accumulation
 // ---------------------------------------------------------------------------
 //
-// Phase 7 / Stage Q optimisation: transpose the column-major storage to
+// Ptranspose the column-major storage to
 // row-major before each zero-check accumulation step.
 //
 // ROOT CAUSE of the bottleneck

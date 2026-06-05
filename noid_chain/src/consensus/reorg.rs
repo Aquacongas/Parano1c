@@ -134,7 +134,7 @@ pub fn apply_reorg(
         return Err(ReorgError::ExceedsFinality { depth: reorg_depth });
     }
 
-    // Snapshot for rollback on Phase 2 failure.
+    // Snapshot for rollback on failure.
     let state_snapshot = ctx.state.clone();
     let headers_snapshot = ctx.headers.clone();
     let tip_height_snapshot = ctx.tip_height;
@@ -142,7 +142,7 @@ pub fn apply_reorg(
     let undo_logs_snapshot = ctx.undo_logs.clone();
 
     // -----------------------------------------------------------------------
-    // Phase 1: Revert blocks from current tip to common ancestor.
+    // Revert blocks from current tip to common ancestor.
     // -----------------------------------------------------------------------
     let mut reverted_heights = Vec::new();
     let mut reclaimed_hashes: Vec<TxBodyHash> = Vec::new();
@@ -172,7 +172,7 @@ pub fn apply_reorg(
 
     // Rebuild nullifier set from the surviving chain.
     //
-    // tx_hashes are stored in undo logs (added in Phase 2).  Undo logs are kept
+    // tx_hashes are stored in undo logs.  Undo logs are kept
     // for FINALITY_DEPTH = 18 blocks; blocks older than that in the surviving
     // chain produce empty entries.  This is safe: those older blocks' txs are
     // protected by the UTXO state itself — their input slots are already EMPTY
@@ -200,7 +200,7 @@ pub fn apply_reorg(
         .unwrap_or([0u8; 32]);
 
     // -----------------------------------------------------------------------
-    // Phase 2: Apply new blocks.
+    // Apply new blocks.
     // -----------------------------------------------------------------------
     let mut applied_heights = Vec::new();
 

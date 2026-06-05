@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Phase 7 recursive chain verifier — O(1) historical verification.
+//! recursive chain verifier — O(1) historical verification.
 //!
 //! `verify_recursive_step` verifies one `RecursiveBlockProof` algebraically
 //! and checks the accumulator transition is consistent with the block header.
@@ -149,6 +149,60 @@ pub fn verify_tip(
     // covers no previous block — chain_hash must equal genesis.
     if rec_proof_n.block_height == 0 && rec_proof_n.acc.chain_hash != genesis_acc.chain_hash {
         return Err(RecVerifyError::ChainHashMismatch);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify_step_stark_only — for Mode B snapshot verification
+// ---------------------------------------------------------------------------
+
+/// Verify the STARK portion of a `RecursiveBlockProof` without a full
+/// accumulator chain.
+///
+/// Used for **Mode B snapshot verification**: the recursive proof is behind
+/// the snapshot tip, so we cannot call `verify_tip` (which expects the proof
+/// to be exactly one step before the tip). Instead we:
+///
+/// 1. Verify the STARK over `RecursiveBlockAir(acc_prev_state_root)` — the
+///    same check `verify_tip` performs internally.
+/// 2. Assert `proof.acc.state_root == expected_new_state_root` from the
+///    snapshot's `recent_headers`.
+///
+/// This prevents accepting a fabricated `RecursiveBlockProof` whose
+/// `acc.state_root` field was crafted to match the snapshot header without
+/// a valid STARK backing it.
+///
+/// # Arguments
+/// * `proof` — the `RecursiveBlockProof` at height `proof_h`.
+/// * `acc_prev_state_root` — `state_root` from `recent_headers[proof_h - 1]`
+///   (or `genesis_state_root()` when `proof_h == 0`).
+/// * `expected_new_state_root` — `state_root` from `recent_headers[proof_h]`.
+pub fn verify_step_stark_only(
+    proof: &RecursiveBlockProof,
+    acc_prev_state_root: &[u8; 32],
+    expected_new_state_root: &[u8; 32],
+) -> Result<(), RecVerifyError> {
+    // Step 1: verify the STARK proof over the RecursiveBlockAir.
+    // RecursiveBlockAir is parameterised by `acc_prev_state_root`, which pins
+    // the accumulator row constraint. Any proof whose acc_row witness deviates
+    // from this root fails the STARK here.
+    let rec_air = crate::air::RecursiveBlockAir::from_prev_state_root(acc_prev_state_root);
+    let empty_pi = make_empty_pi();
+    verify_air_interleaved(
+        &rec_air,
+        &empty_pi,
+        &proof.stark,
+        &[],
+        &[],
+        COMPACT_NUM_QUERIES,
+    )
+    .map_err(|_| RecVerifyError::StarkInvalid)?;
+
+    // Step 2: the proof's committed state_root must match the header we have.
+    if proof.acc.state_root != *expected_new_state_root {
+        return Err(RecVerifyError::NewStateRootMismatch);
     }
 
     Ok(())

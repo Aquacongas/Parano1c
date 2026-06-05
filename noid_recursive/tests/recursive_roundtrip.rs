@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Integration tests for the Phase 7 recursive proof pipeline.
+//! Integration tests for the recursive proof pipeline.
 //!
 //! Tests are marked `#[ignore]` where they require full STARK proving (slow).
 //! The lightweight unit tests (AIR check, accumulator, verify errors) run always.

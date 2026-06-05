@@ -31,8 +31,8 @@ use crate::block::Block;
 use crate::block_header::BlockHeader;
 use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
-    checks::{validate_block_slot_conflicts, validate_tx_consensus},
-    emission::max_coinbase_value,
+    checks::{validate_block_slot_conflicts, validate_tx_consensus_skip_hash},
+    emission::max_coinbase_value_from_fee_sum,
     header::validate_header,
     params::BLOCK_MAX_TXS,
     ConsensusError,
@@ -132,22 +132,19 @@ pub fn validate_block_consensus(
     validate_block_slot_conflicts(&block.transactions)?;
 
     // --- Per-tx consensus checks (P.8) ---
+    // Use skip_hash variant: apply_block (called below) already verifies
+    // tx_body_hash for every tx, so recomputing 59-perm Poseidon2b here
+    // would be pure redundant work (~60 ms at 1024 txs).
     for tx in &block.transactions {
-        validate_tx_consensus(tx, nullifiers)?;
+        validate_tx_consensus_skip_hash(tx, nullifiers)?;
     }
 
     // --- Coinbase amount validation (P.7) ---
-    // block_reward() uses log_slots from the block header (consensus-significant).
-    let non_coinbase_bodies: Vec<_> = block
-        .transactions
-        .iter()
-        .filter(|tx| !tx.body.is_coinbase)
-        .map(|tx| tx.body.clone())
-        .collect();
-
+    // Sum fees directly from &Transaction references — no TxBody cloning.
+    // Previously this cloned all non-coinbase TxBody objects into a Vec just to
+    // pass to max_coinbase_value(); at 1024 txs that is ~1024 allocs + memcpys.
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
-            // Sum coinbase output values.
             let cb_value: u64 = cb
                 .body
                 .outputs
@@ -156,7 +153,14 @@ pub fn validate_block_consensus(
                 .map(|o| o.value)
                 .fold(0u64, |acc, v| acc.saturating_add(v));
 
-            let max_allowed = max_coinbase_value(block.header.log_slots, &non_coinbase_bodies);
+            let fee_sum: u64 = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.body.is_coinbase)
+                .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
+                .fold(0u64, |acc, f| acc.saturating_add(f));
+
+            let max_allowed = max_coinbase_value_from_fee_sum(block.header.log_slots, fee_sum);
             if cb_value > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }

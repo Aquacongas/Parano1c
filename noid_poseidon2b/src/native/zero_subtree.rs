@@ -3,14 +3,13 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! **Legacy table — superseded by Phase 3 segmented state.**
+//! **Legacy table — superseded by segmented state.**
 //!
 //! Precomputed Poseidon2b digests of all-zero raw-byte subtrees.
 //!
 //! This table was designed for the **pre-segmentation monolithic FRI**
 //! architecture where `state_root` was a Poseidon2b tree over raw
-//! `[0u8; 32]` leaves. Under the segmented architecture (Phase 3,
-//! SPECIFICATION.md §19), the segment-tree leaves are FRI combined
+//! `[0u8; 32]` leaves. Under the segmented architecture, the segment-tree leaves are FRI combined
 //! roots of all-zero segment columns — a different base value.
 //!
 //! **For the expansion procedure (SPECIFICATION.md §15.3.7), use

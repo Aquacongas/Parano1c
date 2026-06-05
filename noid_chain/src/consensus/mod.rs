@@ -43,7 +43,9 @@ pub use checks::{validate_block_slot_conflicts, validate_tx_consensus};
 pub use conflict::resolve_slot_conflicts;
 pub use da_prune::{build_undo_log, prune_undo_logs, revert_block, BlockUndoLog};
 pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
-pub use emission::{block_reward, format_noid, max_coinbase_value, total_fees};
+pub use emission::{
+    block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_fee_sum, total_fees,
+};
 pub use fork_choice::{choose_chain, choose_chain_by_work, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};

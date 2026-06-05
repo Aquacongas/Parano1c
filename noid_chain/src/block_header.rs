@@ -91,7 +91,6 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     absorb_digest(&mut s, &hdr.difficulty_target);
     absorb_digest(&mut s, &hdr.proof_transcript_hash);
     absorb_digest(&mut s, &hdr.witness_root);
-    // Fields appended in Phase 3 — MUST come after all prior fields.
     s.absorb(Block128::from(hdr.log_slots as u128));
     s.absorb(Block128::from(hdr.active_slot_count as u128));
     s.absorb(Block128::from(hdr.alloc_counter as u128));

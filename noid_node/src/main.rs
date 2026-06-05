@@ -764,17 +764,19 @@ async fn handle_p2p_events(
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
 
-                        // Try to apply this block. Build ChainView under the same
-                        // write lock to avoid a second lock acquisition immediately after.
-                        let (apply_result, maybe_view) = {
+                        // Phase 1: Apply block under write lock (minimal hold time).
+                        // Phase 2: Build ChainView under read lock (shared, non-blocking).
+                        // This avoids holding the write lock during SegmentedFriState clone
+                        // (~50ms at 256 segments), which was blocking all RPC/miner operations.
+                        let apply_result = {
                             let mut ctx = chain.write().await;
-                            let result = ctx.apply_next_block(&block, local_time);
-                            let view = if result.is_ok() {
-                                Some(ChainView::from_mdbx(&ctx))
-                            } else {
-                                None
-                            };
-                            (result, view)
+                            ctx.apply_next_block(&block, local_time)
+                        }; // write lock released
+                        let maybe_view = if apply_result.is_ok() {
+                            let ctx = chain.read().await;
+                            Some(ChainView::from_mdbx(&ctx))
+                        } else {
+                            None
                         };
 
                         match apply_result {
@@ -810,8 +812,12 @@ async fn handle_p2p_events(
                                     let orphan_local_time = unix_now();
                                     next_hash =
                                         noid_chain::consensus::pow::full_block_hash(&orphan.header);
-                                    let mut ctx = chain.write().await;
-                                    match ctx.apply_next_block(&orphan, orphan_local_time) {
+                                    // Write lock: apply only. Read lock: build view.
+                                    let orphan_result = {
+                                        let mut ctx = chain.write().await;
+                                        ctx.apply_next_block(&orphan, orphan_local_time)
+                                    };
+                                    match orphan_result {
                                         Ok(_) => {
                                             let h = orphan.header.height;
                                             let conf: Vec<_> = orphan
@@ -819,8 +825,10 @@ async fn handle_p2p_events(
                                                 .iter()
                                                 .map(|tx| tx.tx_body_hash)
                                                 .collect();
-                                            let nv = ChainView::from_mdbx(&ctx);
-                                            drop(ctx);
+                                            let nv = {
+                                                let ctx = chain.read().await;
+                                                ChainView::from_mdbx(&ctx)
+                                            };
                                             mempool.on_new_block(&conf, h, nv).await;
                                             update_wallet_for_block(&wallet, &orphan);
                                             tracing::info!(
@@ -917,19 +925,20 @@ async fn handle_p2p_events(
                                             );
 
                                             let local_time = unix_now();
-                                            let (reorg_result, maybe_reorg_view) = {
+                                            // Write lock: reorg only. Read lock: build view.
+                                            let reorg_result = {
                                                 let mut ctx = chain.write().await;
-                                                let r = ctx.apply_reorg_mdbx(
+                                                ctx.apply_reorg_mdbx(
                                                     ancestor_height,
                                                     &new_chain,
                                                     local_time,
-                                                );
-                                                let v = if r.is_ok() {
-                                                    Some(ChainView::from_mdbx(&ctx))
-                                                } else {
-                                                    None
-                                                };
-                                                (r, v)
+                                                )
+                                            }; // write lock released
+                                            let maybe_reorg_view = if reorg_result.is_ok() {
+                                                let ctx = chain.read().await;
+                                                Some(ChainView::from_mdbx(&ctx))
+                                            } else {
+                                                None
                                             };
 
                                             match reorg_result {
@@ -1116,7 +1125,7 @@ async fn handle_p2p_events(
                     //
                     // Paranoid does NOT store block history (DA delete-immediately
                     // policy). New nodes sync via the current state, not block replay.
-                    // The state is proven valid by the recursive chain proof (Phase 7).
+                    // The state is proven valid by the recursive chain proof.
                     //
                     // Fix 1.4: request from up to 3 distinct peers; we'll pick the
                     // snapshot with the highest tip_height after collecting >= 2.
@@ -1466,43 +1475,69 @@ async fn handle_p2p_events(
                             )
                             .map_err(|e| format!("verify_tip failed: {e:?}"))
                         } else {
-                            // ── Mode B: PARTIAL verification ─────────────────────────────────
-                            // Proof is behind tip (normal on a young/fast network).
-                            // Verify that the proof's acc.state_root matches the corresponding
-                            // header in the snapshot's recent_headers at proof_h.
+                            // ── Mode B: PARTIAL verification (STARK + state_root) ────────────
                             //
-                            // This proves: the snapshot is consistent with a chain that has a
-                            // valid recursive proof at height proof_h. Combined with Fix 1.1
-                            // (slot data matches tip header state_root), this gives confidence
-                            // the snapshot is genuine.
-                            let header_root = find_root(proof_h);
-                            match header_root {
-                                Some(root) if root == proof.acc.state_root => {
-                                    tracing::info!(
-                                        proof_h,
-                                        snap_tip_h,
-                                        gap = snap_tip_h - proof_h,
-                                        "snapshot: partial recursive verify OK \
-                                         (proof is {} blocks behind tip, state_root consistent)",
-                                        snap_tip_h - proof_h
-                                    );
-                                    Ok(())
+                            // Proof is behind tip (normal on a young/fast network).
+                            //
+                            // SECURITY FIX: previously this mode only compared
+                            // `proof.acc.state_root` against `recent_headers` WITHOUT
+                            // verifying the underlying STARK. An attacker could fabricate
+                            // a `RecursiveBlockProof` struct with a matching `acc.state_root`
+                            // field (copied from the snapshot header) backed by a garbage
+                            // STARK, and the node would accept the snapshot.
+                            //
+                            // Now we call `verify_step_stark_only` which:
+                            //   1. Verifies the STARK over `RecursiveBlockAir(prev_root)`,
+                            //   2. Checks `proof.acc.state_root == header[proof_h].state_root`.
+                            //
+                            // This is the same STARK check that `verify_tip` (Mode A) does,
+                            // just without the full chain-continuity check (which requires
+                            // the proof to cover tip-1).
+                            use noid_recursive::verify_step_stark_only;
+
+                            // prev_state_root at proof_h - 1 (or genesis if proof_h == 0).
+                            let prev_root = if proof_h == 0 {
+                                genesis_state_root()
+                            } else {
+                                find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
+                            };
+
+                            // expected new state_root from the snapshot's headers.
+                            match find_root(proof_h) {
+                                Some(expected_new_root) => {
+                                    match verify_step_stark_only(
+                                        &proof,
+                                        &prev_root,
+                                        &expected_new_root,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                proof_h,
+                                                snap_tip_h,
+                                                gap = snap_tip_h - proof_h,
+                                                "snapshot: Mode B STARK verified \
+                                                 (proof {} blocks behind tip)",
+                                                snap_tip_h - proof_h
+                                            );
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(format!(
+                                            "Mode B STARK verify FAILED at h={proof_h}: {e:?}"
+                                        )),
+                                    }
                                 }
-                                Some(root) => Err(format!(
-                                    "partial verify FAILED: proof.acc.state_root={} \
-                                         != header[{}].state_root={}",
-                                    hex::encode(proof.acc.state_root),
-                                    proof_h,
-                                    hex::encode(root)
-                                )),
                                 None => {
-                                    // Header for proof height not in snapshot's window.
-                                    // Accept with warning — this can happen on very young networks.
+                                    // Header for proof_h not in recent_headers window.
+                                    // Can happen on very young networks where
+                                    // recent_headers doesn't reach back to proof_h.
+                                    // Accept with warning — snapshot state_root check
+                                    // (Fix 1.1 in apply_state_snapshot) still runs.
                                     tracing::warn!(
                                         proof_h,
                                         snap_tip_h,
-                                        "snapshot: proof header not in recent_headers window, \
-                                         accepting without full recursive verification"
+                                        "snapshot: Mode B — header[{proof_h}] not in \
+                                         recent_headers window, skipping STARK verify \
+                                         (young network)"
                                     );
                                     Ok(())
                                 }

@@ -152,7 +152,7 @@ impl AsyncMempool {
             }
         };
 
-        // Phase 5: ZK verify_logic before pool admission (CPU-heavy, outside lock).
+        // ZK verify_logic before pool admission (CPU-heavy, outside lock).
         if let Some(view_snap) = view_snap_opt {
             let proof_bytes = intent.logic_proof_bytes.clone();
             let tx_body_clone = intent.tx_body.clone();
@@ -224,23 +224,31 @@ impl AsyncMempool {
         validate_tx_consensus(&tx, &st.view.nullifiers)?;
 
         // --- Step 2: epoch_anchor hash must be a known header within ANCHOR_DEPTH window ---
-        if !tx.body.is_coinbase {
+        // Capture the anchor_height here so we can store it in MempoolEntry for precise expiry.
+        let anchor_height: u64 = if !tx.body.is_coinbase {
             let anchor_hash = tx.body.epoch_anchor;
             let tip = st.view.tip_height;
             let lo = tip.saturating_sub(ANCHOR_DEPTH);
-            let anchor_ok = (lo..=tip).any(|h| {
+            // find() returns the height whose header hash matches epoch_anchor.
+            let found = (lo..=tip).find(|&h| {
                 st.view
                     .recent_headers
                     .get(&h)
                     .map(|hdr| full_block_hash(hdr) == anchor_hash)
                     .unwrap_or(false)
             });
-            if !anchor_ok {
-                return Err(SubmitError::Consensus(
-                    noid_chain::consensus::ConsensusError::BadEpochAnchor,
-                ));
+            match found {
+                Some(h) => h,
+                None => {
+                    return Err(SubmitError::Consensus(
+                        noid_chain::consensus::ConsensusError::BadEpochAnchor,
+                    ));
+                }
             }
-        }
+        } else {
+            // Coinbase: no anchor, never expires via anchor_height mechanism.
+            u64::MAX
+        };
 
         // --- Step 3: no slot conflict with admitted pool txs (O(1) via persistent sets) ---
         check_slot_conflicts_with_pool(&tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
@@ -256,7 +264,7 @@ impl AsyncMempool {
         let is_coinbase = tx.body.is_coinbase; // capture before move
         let has_zk_proof = !intent.logic_proof_bytes.is_empty() && !is_coinbase;
         let tip_height = st.view.tip_height;
-        match st.pool.admit(tx.clone(), tip_height) {
+        match st.pool.admit(tx.clone(), tip_height, anchor_height) {
             Ok(()) => {
                 // Maintain persistent slot sets so future checks are O(1).
                 for inp in tx.body.inputs.iter().filter(|i| i.valid) {
@@ -426,8 +434,65 @@ impl AsyncMempool {
             tracing::debug!(?hash, "tx evicted: output slot occupied by confirmed block");
             let _ = self.events.send(MempoolEvent::TxEvicted {
                 hash,
-                reason: EvictReason::InputConsumed, // slot conflict
+                reason: EvictReason::InputConsumed, // output slot conflict
             });
+        }
+
+        // Evict txs whose INPUT slots are no longer live in the new state.
+        //
+        // After a block is applied, some input slots of pool txs may have been
+        // spent by other confirmed txs (not the same tx). Those pool txs are now
+        // invalid: their input slot is EMPTY (was moved elsewhere by the block).
+        //
+        // Without this eviction, stale txs occupy pool capacity for up to
+        // ANCHOR_DEPTH blocks (~28 min at 12s/block) before anchor_expiry.
+        // They also fail silently in build_block_template (apply_tx returns Err)
+        // wasting template-build cycles.
+        let input_consumed: Vec<TxBodyHash> = st
+            .pool
+            .iter()
+            .filter_map(|(hash, entry)| {
+                if entry.tx.body.is_coinbase {
+                    return None;
+                }
+                let stale = entry.tx.body.inputs.iter().any(|inp| {
+                    if !inp.valid {
+                        return false;
+                    }
+                    // Input must still hold exactly (value, owner) for this tx to
+                    // be includable. If the slot is EMPTY or has different content,
+                    // the tx cannot be included in any future block.
+                    let expected = SlotValue {
+                        value: noid_core::Block128::from(inp.value as u128),
+                        owner_hi: inp.owner.as_fields()[0],
+                        owner_lo: inp.owner.as_fields()[1],
+                    };
+                    st.view.slot(inp.slot_index) != expected
+                });
+                if stale {
+                    Some(*hash)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let input_evict_count = input_consumed.len();
+        for hash in input_consumed {
+            st.pool.remove(&hash);
+            tracing::debug!(
+                ?hash,
+                "tx evicted: input slot consumed or changed by confirmed block"
+            );
+            let _ = self.events.send(MempoolEvent::TxEvicted {
+                hash,
+                reason: EvictReason::InputConsumed,
+            });
+        }
+        if input_evict_count > 0 {
+            tracing::debug!(
+                evicted = input_evict_count,
+                "evicted stale txs with consumed input slots"
+            );
         }
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
@@ -629,7 +694,7 @@ fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitEr
 }
 
 // ---------------------------------------------------------------------------
-// Helper: ZK verify_logic (Phase 5)
+// Helper: ZK verify_logic
 // ---------------------------------------------------------------------------
 
 /// Verify the wallet's LogicProof for a non-coinbase tx.

@@ -4,7 +4,7 @@
 #![allow(clippy::needless_range_loop)]
 
 //! `RecursiveBlockAir` — proves multipoint sumcheck consistency and
-//! accumulator transitions for Phase 7 recursive proofs.
+//! accumulator transitions for recursive proofs.
 //!
 //! ## Column layout (N_COLS = 8)
 //!
