@@ -143,12 +143,11 @@ impl TemplateBuilder {
             .mempool
             .select_for_block(noid_chain::consensus::params::BLOCK_MAX_TXS - 1)
             .await;
-        // Extract proof bytes before consuming entries.
-        let proof_bytes: Vec<Option<Vec<u8>>> = entries
-            .iter()
-            .map(|e| e.cached_algebraic_proof.clone())
-            .collect();
-        let txs: Vec<_> = entries.into_iter().map(|e| e.tx).collect();
+        // Single-pass: move proof bytes and transactions together (no clone).
+        let (proof_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
+            .into_iter()
+            .map(|e| (e.cached_algebraic_proof, e.tx))
+            .unzip();
 
         let state = &ctx.state;
         match build_block_template(

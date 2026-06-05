@@ -202,6 +202,13 @@ pub fn update_wallet_from_block(
         .map(|t| t.tx_body_hash.0)
         .collect();
 
+    // Build once before the loop: O(history) instead of O(history × txs).
+    let pending_hashes: std::collections::HashSet<[u8; 32]> = history
+        .iter()
+        .filter(|e| e.height == 0)
+        .map(|e| e.tx_hash)
+        .collect();
+
     for (tx_index, tx) in block.transactions.iter().enumerate() {
         if tx.body.is_coinbase {
             // Coinbase: track UTXOs for our addresses, record history.
@@ -259,9 +266,7 @@ pub fn update_wallet_from_block(
         // Record history entry.
         // Skip if this tx_hash is already in history as a pending (height=0) entry
         // from record_pending_send — confirm_pending_tx will update the height.
-        let already_pending = history
-            .iter()
-            .any(|e| e.tx_hash == tx.tx_body_hash.0 && e.height == 0);
+        let already_pending = pending_hashes.contains(&tx.tx_body_hash.0);
 
         if !already_pending {
             if sent_from_wallet > 0 {

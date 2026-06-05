@@ -151,12 +151,13 @@ mod tests {
 
     #[test]
     fn lower_target_wins_at_equal_height() {
+        // harder = smaller value (2^247) < easier (GENESIS_TARGET = 2^248)
         let harder = {
-            let mut t = GENESIS_TARGET;
-            t[31] = 0x08;
+            let mut t = [0u8; 32];
+            t[30] = 0x80;
             t
-        }; // harder
-        let easier = GENESIS_TARGET; // easier
+        };
+        let easier = GENESIS_TARGET;
         let h = [0u8; 32];
         // harder target (smaller value) = more work = should win
         assert_eq!(
@@ -201,14 +202,17 @@ mod tests {
 
     #[test]
     fn more_work_wins_over_longer_chain() {
-        // Chain A: 10 blocks at hard difficulty (very small target)
+        // hard = 2^224, easy = 2^252 (old genesis); work_a(10 blocks) >> work_b(100 blocks)
         let hard_target = {
             let mut t = [0u8; 32];
-            t[31] = 0x01;
+            t[28] = 0x01;
             t
         };
-        // Chain B: 100 blocks at easy difficulty
-        let easy_target = GENESIS_TARGET;
+        let easy_target = {
+            let mut t = [0u8; 32];
+            t[31] = 0x10;
+            t
+        };
 
         let mut work_a = [0u8; 32];
         for _ in 0..10 {

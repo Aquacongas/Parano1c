@@ -34,6 +34,29 @@ use crate::consensus::{difficulty::le256_lt, ConsensusError};
 /// Does NOT include `proof_transcript_hash` or `witness_root`.
 pub type HeaderCoreBytes = Vec<u8>;
 
+/// Byte offset of the `nonce` field in the 212-byte `header_core` buffer.
+/// Layout: prev_block_hash(32) + state_root(32) + tx_root(32)
+///        + timestamp(8) + height(8) + miner_address(32) = 144 bytes before nonce.
+pub const NONCE_OFFSET: usize = 144;
+
+/// Write `header_core` into a pre-allocated 212-byte stack buffer (zero allocation).
+/// Call once per thread before the nonce loop, then patch only
+/// `buf[NONCE_OFFSET..NONCE_OFFSET+16]` on each iteration.
+pub fn header_core_bytes_into(h: &BlockHeader, buf: &mut [u8; 212]) {
+    buf[0..32].copy_from_slice(&h.prev_block_hash);
+    buf[32..64].copy_from_slice(&h.state_root);
+    buf[64..96].copy_from_slice(&h.tx_root);
+    buf[96..104].copy_from_slice(&h.timestamp.to_le_bytes());
+    buf[104..112].copy_from_slice(&h.height.to_le_bytes());
+    buf[112..144].copy_from_slice(h.miner_address.as_bytes());
+    buf[144..160].copy_from_slice(&h.nonce.to_le_bytes());
+    buf[160..192].copy_from_slice(&h.difficulty_target);
+    buf[192..196].copy_from_slice(&h.log_slots.to_le_bytes());
+    buf[196..204].copy_from_slice(&h.active_slot_count.to_le_bytes());
+    buf[204..212].copy_from_slice(&h.alloc_counter.to_le_bytes());
+    debug_assert_eq!(buf.len(), 212);
+}
+
 /// Full block hash (Blake3 of the complete block header, including proof fields).
 pub type BlockHash = [u8; 32];
 

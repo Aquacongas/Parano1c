@@ -310,7 +310,9 @@ impl BlockMiner {
             cancel.store(false, Ordering::Relaxed);
 
             // --- Parallel: PoW + ZK prove ---
-            let tmpl_pow = tmpl.clone();
+            // Extract only the PoW header — avoids cloning the full BlockTemplate
+            // (which includes all transaction and proof bytes) just for PoW.
+            let pow_header = tmpl.header_for_pow(0);
             let tmpl_prove = tmpl.clone();
             let cancel_pow = cancel.clone();
 
@@ -334,7 +336,7 @@ impl BlockMiner {
 
             // PoW: Blake3 over header_core, CPU-bound via rayon.
             let pow_handle = tokio::task::spawn_blocking(move || {
-                crate::pow::search_pow_parallel(&tmpl_pow.header_for_pow(0), &cancel_pow)
+                crate::pow::search_pow_parallel(&pow_header, &cancel_pow)
             });
 
             // ZK Prove: run for real (permit held until done) or return a consensus-legal
@@ -503,8 +505,19 @@ fn run_prove_block(
     use noid_chain::block::proof_transcript_hash;
     use noid_stark::WalletProofBundle;
 
+    // Coinbase-only: O(1) check, avoids cloning all txs just to count them.
+    // Marker [1u8;32] is consensus-legal when there are no user txs.
+    let non_cb_count = tmpl.n_user_txs();
+    if non_cb_count == 0 {
+        tracing::debug!(
+            height = tmpl.inner.height,
+            "coinbase-only block — marker proof OK"
+        );
+        return Ok(([1u8; 32], [1u8; 32], vec![]));
+    }
+
+    // User txs present: clone tx list and deserialize proof bundles.
     let all_txs = tmpl.inner.all_txs();
-    let non_cb_count = all_txs.iter().filter(|tx| !tx.body.is_coinbase).count();
 
     // Deserialize WalletProofBundles from cached bytes stored in the template.
     // proof_bytes[k] corresponds to inner.txs[k] (non-coinbase txs in order).
@@ -516,16 +529,6 @@ fn run_prove_block(
                 .and_then(|bytes| WalletProofBundle::from_bytes(bytes).ok())
         })
         .collect();
-
-    // Coinbase-only block: no user transactions to prove → marker hashes are legal.
-    // The marker [1u8;32] is accepted by apply_block ONLY when there are no user txs.
-    if non_cb_count == 0 {
-        tracing::debug!(
-            height = tmpl.inner.height,
-            "coinbase-only block — marker proof OK"
-        );
-        return Ok(([1u8; 32], [1u8; 32], vec![]));
-    }
 
     // User transactions present but wallet bundles are incomplete.
     // We CANNOT produce a stub proof for user-tx blocks (rejected by consensus).

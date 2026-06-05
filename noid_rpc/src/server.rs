@@ -570,12 +570,14 @@ impl ParanoidApiServer for RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
-        // Apply to chain (runs full native consensus validation).
-        let hash = {
+        // Apply to chain and build ChainView under the same write lock.
+        let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
             ctx.apply_next_block(&block, local_time)
                 .map_err(|e| rpc_err(format!("consensus: {e}")))?;
-            full_block_hash(&block.header)
+            let hash = full_block_hash(&block.header);
+            let view = noid_mempool::ChainView::from_mdbx(&ctx);
+            (hash, view)
         };
 
         // Update mempool after confirmed block.
@@ -584,10 +586,6 @@ impl ParanoidApiServer for RpcHandler {
             .iter()
             .map(|tx| tx.tx_body_hash)
             .collect();
-        let new_view = {
-            let ctx = self.chain.read().await;
-            noid_mempool::ChainView::from_mdbx(&ctx)
-        };
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
@@ -658,30 +656,6 @@ impl ParanoidApiServer for RpcHandler {
         // Helper: snapshot slot hints.
         // Each call uses a unique seed = tip_state_root XOR current_time_nanos
         // so concurrent wallet_send calls never pick the same output slots.
-        let get_hints = |chain: &noid_chain::storage::MdbxChainContext,
-                         call_nonce: u64|
-         -> (u64, [u8; 32], Vec<u32>, u32) {
-            let tip = chain.tip_header();
-            let log_slots = tip.log_slots;
-            let epoch_anchor = full_block_hash(tip);
-            // Unique seed per call: XOR tip_seed with a nonce so concurrent
-            // sends on the same tip pick different output slots.
-            let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
-            let unique_seed = tip_seed.wrapping_add(call_nonce.wrapping_mul(0x9e3779b97f4a7c15));
-            let raw = generate_slot_hints(unique_seed, log_slots, 256);
-            let mut hints: Vec<u32> = raw
-                .into_iter()
-                .filter(|&idx| {
-                    (idx as u64) < (1u64 << log_slots)
-                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
-                })
-                .collect();
-            hints.dedup();
-            hints.truncate(8);
-            (chain.tip_height(), epoch_anchor, hints, log_slots)
-        };
-        // Unique nonce for this request: high-resolution timestamp ensures
-        // even concurrent requests from the same client diverge.
         let call_nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -695,10 +669,36 @@ impl ParanoidApiServer for RpcHandler {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
 
-            let (_, epoch_anchor, slot_hints, log_slots) = {
+            // Lock 1: extract tip data only (no PRNG or heavy work under lock).
+            let (epoch_anchor, log_slots, unique_seed) = {
                 let chain = self.chain.read().await;
-                // Pass nonce + attempt so each retry also gets unique slots
-                get_hints(&chain, call_nonce.wrapping_add(attempt as u64))
+                let tip = chain.tip_header();
+                let log_slots = tip.log_slots;
+                let epoch_anchor = full_block_hash(tip);
+                let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+                let unique_seed = tip_seed.wrapping_add(
+                    call_nonce
+                        .wrapping_add(attempt as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15),
+                );
+                (epoch_anchor, log_slots, unique_seed)
+            };
+            // PRNG runs without holding the lock.
+            let raw = generate_slot_hints(unique_seed, log_slots, 256);
+            // Lock 2: filter empty slots only.
+            let slot_hints = {
+                let chain = self.chain.read().await;
+                let mut hints: Vec<u32> = raw
+                    .into_iter()
+                    .filter(|&idx| {
+                        (idx as u64) < (1u64 << log_slots)
+                            && chain.state.state.slot(idx)
+                                == noid_chain::fri_state::SlotValue::EMPTY
+                    })
+                    .collect();
+                hints.dedup();
+                hints.truncate(8);
+                hints
             };
 
             if slot_hints.len() < 2 {

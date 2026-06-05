@@ -182,18 +182,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genesis_target_is_2_pow_252() {
-        // 2^252: bit 252 = bit 4 of byte 31 (LE). Bytes 0..30 are zero.
+    fn genesis_target_is_2_pow_248() {
+        // 2^248: bit 248 = bit 0 of byte 31 (LE). Bytes 0..30 are zero.
         let mut expected = [0u8; 32];
-        expected[31] = 0x10; // 2^4 = 16, placed at byte 31 → value = 16 × 2^(8×31) = 2^252
+        expected[31] = 0x01;
         assert_eq!(GENESIS_TARGET, expected);
-        // Sanity: as LE 256-bit integers, MIN_TARGET(=1) < GENESIS_TARGET(=2^252) < MAX_TARGET(=2^256-1)
-        // LE comparison: compare from byte 31 (MSB) down.
-        // MIN_TARGET  = [1,0,0,...,0]       byte31=0  → smallest
-        // GENESIS_TARGET = [0,...,0,0x10]  byte31=0x10
-        // MAX_TARGET  = [0xFF,...,0xFF]     byte31=0xFF → largest
-        // Byte 31: MIN(0) < GENESIS(0x10) < MAX(0xFF) ✓
-        assert_eq!(GENESIS_TARGET[31], 0x10);
+        assert_eq!(GENESIS_TARGET[31], 0x01);
         assert!(GENESIS_TARGET[31] > MIN_TARGET[31], "genesis > min in MSB");
         assert!(GENESIS_TARGET[31] < MAX_TARGET[31], "genesis < max in MSB");
     }

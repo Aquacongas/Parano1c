@@ -10,7 +10,7 @@
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::le256_lt;
-use noid_chain::consensus::pow::header_core_bytes;
+use noid_chain::consensus::pow::{header_core_bytes_into, NONCE_OFFSET};
 
 /// Result of a successful PoW search.
 #[derive(Debug, Clone)]
@@ -53,27 +53,31 @@ pub fn search_pow_parallel(
 
     let mut start_nonce: u128 = random_start;
 
+    // Hoist thread count — it never changes during a chunk.
+    let num_threads = rayon::current_num_threads();
+    let per_thread = CHUNK_SIZE / num_threads as u128;
+
     loop {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
 
-        // Search this chunk in parallel across all cores.
-        let solution: Option<PowSolution> = (0..rayon::current_num_threads())
-            .into_par_iter()
-            .find_map_any(|thread_id| {
-                let thread_start = start_nonce
-                    + (thread_id as u128) * (CHUNK_SIZE / rayon::current_num_threads() as u128);
-                let thread_end = thread_start + CHUNK_SIZE / rayon::current_num_threads() as u128;
+        // Search this chunk in parallel. Each thread gets a stack buffer
+        // (no heap allocation), patches only the 16 nonce bytes per iteration.
+        let solution: Option<PowSolution> =
+            (0..num_threads).into_par_iter().find_map_any(|thread_id| {
+                let thread_start = start_nonce + (thread_id as u128) * per_thread;
+                let thread_end = thread_start + per_thread;
 
-                let mut h = header_template.clone();
+                let mut buf = [0u8; 212];
+                header_core_bytes_into(header_template, &mut buf);
+
                 for nonce in thread_start..thread_end {
                     if cancel.load(Ordering::Relaxed) {
                         return None;
                     }
-                    h.nonce = nonce;
-                    let core = header_core_bytes(&h);
-                    let hash = *blake3::hash(&core).as_bytes();
+                    buf[NONCE_OFFSET..NONCE_OFFSET + 16].copy_from_slice(&nonce.to_le_bytes());
+                    let hash = *blake3::hash(&buf).as_bytes();
                     if le256_lt(&hash, &target) {
                         return Some(PowSolution {
                             nonce,

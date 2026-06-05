@@ -71,10 +71,16 @@ pub fn next_target(
     // BCH: net_shift = shifts − 16 (compensate for the 65536 = 2^16 in factor).
     let net: i64 = shifts - 16;
 
-    // Short-circuit extreme shifts to avoid shl320/shr320 overflow.
-    // A left shift ≥256 bits always exceeds 256-bit range → MAX_TARGET.
+    // Short-circuit extreme shifts.
+    //
+    // `wide` after mul_limbs_u64 is at most 256+17 = 273 bits
+    // (256 for a max target + 17 for max factor ≈2^17).
+    // A left shift of (320-273) = 47 bits or more shifts ALL bits out of the
+    // 320-bit wide representation → target would be ≥ 2^256 → MAX_TARGET.
+    // Using 47 as the threshold is tight; use 46 for a 1-bit safety margin.
+    //
     // A right shift ≥320 bits always gives zero → MIN_TARGET.
-    if net >= 256 {
+    if net >= 46 {
         return MAX_TARGET;
     }
     if net <= -320 {
@@ -82,6 +88,11 @@ pub fn next_target(
     }
 
     wide = shift_wide(wide, net);
+
+    // Overflow safety net (should be unreachable given the guards above).
+    if net > 0 && wide == [0u64; 5] {
+        return MAX_TARGET;
+    }
 
     // Extract low 256 bits, clamp.
     let result = limbs_to_bytes([wide[0], wide[1], wide[2], wide[3]]);

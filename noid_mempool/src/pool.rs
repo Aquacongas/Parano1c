@@ -57,6 +57,10 @@ pub(crate) struct MempoolState {
     pub floor: FeeFloor,
     /// Count of admitted txs since last template refresh trigger.
     pub new_since_refresh: usize,
+    /// Input slot indices currently held by admitted txs. O(1) conflict check.
+    pub admitted_input_slots: HashSet<u32>,
+    /// Output slot indices currently held by admitted txs. O(1) conflict check.
+    pub admitted_output_slots: HashSet<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +95,8 @@ impl AsyncMempool {
             view,
             floor,
             new_since_refresh: 0,
+            admitted_input_slots: HashSet::new(),
+            admitted_output_slots: HashSet::new(),
         };
         let max_permits = if config.zk_verify_workers == 0 {
             // 0 = unlimited (native-only mode or testing)
@@ -135,27 +141,21 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
-        // Fast path: if tx_body_hash already in pool, skip ZK verification entirely.
-        // This avoids redundant CPU work when the same valid TX arrives from multiple peers.
-        {
+        // Fast path + ZK view snapshot in a single lock acquisition.
+        let view_snap_opt = {
             let st = self.state.lock().await;
             if st.pool.contains(&intent.tx_body_hash) {
                 return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
             }
-        }
+            if !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase {
+                Some(st.view.clone())
+            } else {
+                None
+            }
+        };
 
-        // Phase 5: ZK verify_logic before pool admission.
-        // The wallet's LogicProof (STARK + AuthGKR Kill-Shot) is verified here so
-        // invalid proofs are rejected at the mempool boundary, not silently stored.
-        // This is CPU-heavy (~84ms); we run it in spawn_blocking BEFORE acquiring
-        // the pool mutex to avoid holding the lock during computation.
-        if !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase {
-            // Snapshot the chain view (O(1) clone) before the blocking call.
-            let view_snap = {
-                let st = self.state.lock().await;
-                st.view.clone()
-            };
-
+        // Phase 5: ZK verify_logic before pool admission (CPU-heavy, outside lock).
+        if let Some(view_snap) = view_snap_opt {
             let proof_bytes = intent.logic_proof_bytes.clone();
             let tx_body_clone = intent.tx_body.clone();
             let log_slots = view_snap.log_slots();
@@ -244,9 +244,8 @@ impl AsyncMempool {
             }
         }
 
-        // --- Step 3: no slot conflict with admitted pool txs ---
-        let admitted_txs: Vec<Transaction> = st.pool.iter().map(|(_, e)| e.tx.clone()).collect();
-        check_slot_conflicts_with_pool(&tx, &admitted_txs)?;
+        // --- Step 3: no slot conflict with admitted pool txs (O(1) via persistent sets) ---
+        check_slot_conflicts_with_pool(&tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
 
         // --- Step 4: input slots live in state ---
         check_input_slots(&tx, &st.view)?;
@@ -259,8 +258,16 @@ impl AsyncMempool {
         let is_coinbase = tx.body.is_coinbase; // capture before move
         let has_zk_proof = !intent.logic_proof_bytes.is_empty() && !is_coinbase;
         let tip_height = st.view.tip_height;
-        match st.pool.admit(tx, tip_height) {
-            Ok(()) => {}
+        match st.pool.admit(tx.clone(), tip_height) {
+            Ok(()) => {
+                // Maintain persistent slot sets so future checks are O(1).
+                for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+                    st.admitted_input_slots.insert(inp.slot_index);
+                }
+                for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                    st.admitted_output_slots.insert(out.slot_index);
+                }
+            }
             Err(noid_chain::mempool::MempoolError::Full) => {
                 return Err(SubmitError::Full {
                     capacity: self.config.capacity,
@@ -427,6 +434,9 @@ impl AsyncMempool {
             });
         }
 
+        // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
+        rebuild_slot_sets(&mut st);
+
         // Reset new-since-refresh counter (block was found — template is stale anyway).
         st.new_since_refresh = 0;
 
@@ -519,19 +529,7 @@ impl AsyncMempool {
 // ---------------------------------------------------------------------------
 
 fn intent_to_transaction(intent: &TxIntent) -> Result<Transaction, SubmitError> {
-    use noid_tx::hash_tx_body;
-    let expected = hash_tx_body(
-        &intent.tx_body.epoch_anchor,
-        intent.tx_body.fee,
-        &intent.tx_body.inputs,
-        &intent.tx_body.outputs,
-        intent.tx_body.is_coinbase,
-    );
-    if expected != intent.tx_body_hash {
-        return Err(SubmitError::MalformedIntent(
-            "tx_body_hash does not match body".into(),
-        ));
-    }
+    // submit() already verified tx_body_hash matches the body before calling this.
     Ok(Transaction {
         body: intent.tx_body.clone(),
         tx_body_hash: intent.tx_body_hash,
@@ -539,36 +537,40 @@ fn intent_to_transaction(intent: &TxIntent) -> Result<Transaction, SubmitError> 
 }
 
 // ---------------------------------------------------------------------------
-// Helper: slot conflict with admitted pool
+// Helper: rebuild admitted slot sets from current pool (O(pool), after eviction)
+// ---------------------------------------------------------------------------
+
+fn rebuild_slot_sets(st: &mut MempoolState) {
+    st.admitted_input_slots.clear();
+    st.admitted_output_slots.clear();
+    for (_, entry) in st.pool.iter() {
+        for inp in entry.tx.body.inputs.iter().filter(|i| i.valid) {
+            st.admitted_input_slots.insert(inp.slot_index);
+        }
+        for out in entry.tx.body.outputs.iter().filter(|o| o.valid) {
+            st.admitted_output_slots.insert(out.slot_index);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: slot conflict with admitted pool — O(MAX_INPUTS + MAX_OUTPUTS)
 // ---------------------------------------------------------------------------
 
 fn check_slot_conflicts_with_pool(
     tx: &Transaction,
-    admitted: &[Transaction],
+    pool_inputs: &HashSet<u32>,
+    pool_outputs: &HashSet<u32>,
 ) -> Result<(), SubmitError> {
-    let mut pool_inputs: HashSet<u32> = HashSet::new();
-    let mut pool_outputs: HashSet<u32> = HashSet::new();
-    for t in admitted {
-        for inp in &t.body.inputs {
-            if inp.valid {
-                pool_inputs.insert(inp.slot_index);
-            }
-        }
-        for out in &t.body.outputs {
-            if out.valid {
-                pool_outputs.insert(out.slot_index);
-            }
-        }
-    }
-    for inp in &tx.body.inputs {
-        if inp.valid && pool_inputs.contains(&inp.slot_index) {
+    for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+        if pool_inputs.contains(&inp.slot_index) {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::SlotConflict,
             ));
         }
     }
-    for out in &tx.body.outputs {
-        if out.valid && pool_outputs.contains(&out.slot_index) {
+    for out in tx.body.outputs.iter().filter(|o| o.valid) {
+        if pool_outputs.contains(&out.slot_index) {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::SlotConflict,
             ));

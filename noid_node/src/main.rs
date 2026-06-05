@@ -459,9 +459,7 @@ async fn main() -> anyhow::Result<()> {
                         // Wallet update already done in apply_found_block via hook.
                         // Here we only need to broadcast to peers.
                         let _ = p2p_block_relay
-                            .send(noid_p2p::NetworkCommand::BroadcastBlock {
-                                block_bytes: block_bytes.clone(),
-                            })
+                            .send(noid_p2p::NetworkCommand::BroadcastBlock { block_bytes })
                             .await;
                     }
                     Ok(noid_miner::MinerEvent::ProveFailed { height, error }) => {
@@ -674,10 +672,17 @@ async fn handle_p2p_events(
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
 
-                        // Try to apply this block.
-                        let apply_result = {
+                        // Try to apply this block. Build ChainView under the same
+                        // write lock to avoid a second lock acquisition immediately after.
+                        let (apply_result, maybe_view) = {
                             let mut ctx = chain.write().await;
-                            ctx.apply_next_block(&block, local_time)
+                            let result = ctx.apply_next_block(&block, local_time);
+                            let view = if result.is_ok() {
+                                Some(ChainView::from_mdbx(&ctx))
+                            } else {
+                                None
+                            };
+                            (result, view)
                         };
 
                         match apply_result {
@@ -688,7 +693,7 @@ async fn handle_p2p_events(
                                     .iter()
                                     .map(|tx| tx.tx_body_hash)
                                     .collect();
-                                let new_view = ChainView::from_mdbx(&*chain.read().await);
+                                let new_view = maybe_view.unwrap();
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
@@ -775,13 +780,6 @@ async fn handle_p2p_events(
                                         // Compute chainwork of the competing chain from ancestor.
                                         let competing_work = {
                                             use noid_chain::{add_work, block_work};
-                                            // Start from ancestor's chainwork (fetch from our chain)
-                                            // Fetch ancestor chainwork for context (not used in comparison
-                                            // because we compare extra-work from ancestor, not absolute work).
-                                            let _ancestor_work = {
-                                                let ctx = chain.read().await;
-                                                ctx.tip_chain_work
-                                            };
                                             // Add work for each block in the competing chain
                                             let mut w = [0u8; 32];
                                             for b in &new_chain {
@@ -827,19 +825,24 @@ async fn handle_p2p_events(
                                             );
 
                                             let local_time = unix_now();
-                                            let reorg_result = {
+                                            let (reorg_result, maybe_reorg_view) = {
                                                 let mut ctx = chain.write().await;
-                                                ctx.apply_reorg_mdbx(
+                                                let r = ctx.apply_reorg_mdbx(
                                                     ancestor_height,
                                                     &new_chain,
                                                     local_time,
-                                                )
+                                                );
+                                                let v = if r.is_ok() {
+                                                    Some(ChainView::from_mdbx(&ctx))
+                                                } else {
+                                                    None
+                                                };
+                                                (r, v)
                                             };
 
                                             match reorg_result {
                                                 Ok(result) => {
-                                                    let new_view =
-                                                        ChainView::from_mdbx(&*chain.read().await);
+                                                    let new_view = maybe_reorg_view.unwrap();
                                                     let confirmed_in_new: Vec<_> = new_chain
                                                         .iter()
                                                         .flat_map(|b| {
@@ -866,7 +869,7 @@ async fn handle_p2p_events(
                                                         )
                                                         .await;
 
-                                                    let new_tip = chain.read().await.tip_height();
+                                                    let new_tip = new_tip_height;
                                                     tracing::info!(
                                                         new_tip,
                                                         reverted = result.reverted_heights.len(),
@@ -1524,12 +1527,12 @@ fn insert_orphan(
 fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Block) {
     let mut guard = wallet.lock().unwrap();
     if let Some(w) = guard.as_mut() {
-        let known = w.known_addresses.clone();
+        // Borrow distinct fields directly — no HashMap clone needed.
         wallet::scanner::update_wallet_from_block(
             &mut w.utxos,
             &mut w.history,
             &mut w.receipts,
-            &known,
+            &w.known_addresses,
             &mut w.pending_input_slots,
             block,
         );

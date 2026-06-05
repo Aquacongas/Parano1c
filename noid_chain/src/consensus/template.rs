@@ -21,9 +21,8 @@
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_tx::Transaction;
 
-use crate::block::compute_tx_root;
 use crate::block_header::BlockHeader;
-use crate::consensus::{emission::max_coinbase_value, pow::full_block_hash};
+use crate::consensus::pow::full_block_hash;
 use crate::state::ChainState;
 
 // ---------------------------------------------------------------------------
@@ -160,6 +159,7 @@ pub fn build_block_template(
     difficulty_target: Digest,
 ) -> Result<BlockTemplate, TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
+    use crate::consensus::emission::block_reward;
     use crate::consensus::timestamps::median_u64;
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
     use crate::state::apply_tx;
@@ -225,8 +225,13 @@ pub fn build_block_template(
             .ok_or(TemplateBuildError::NoCoinbaseSlot)?
     };
 
-    let non_cb_bodies: Vec<_> = ordered_winners.iter().map(|tx| tx.body.clone()).collect();
-    let coinbase_value = max_coinbase_value(new_log_slots, &non_cb_bodies);
+    // Sum fees directly — avoids cloning every TxBody just to pass to max_coinbase_value.
+    let fee_sum: u64 = ordered_winners
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
+        .fold(0u64, |acc, f| acc.saturating_add(f));
+    let coinbase_value = block_reward(new_log_slots).saturating_add(fee_sum);
 
     let cb_body = TxBody {
         epoch_anchor: [0u8; 32],
@@ -258,12 +263,28 @@ pub fn build_block_template(
 
     // 5. Compute final header fields.
     let state_root = scratch.state_root();
-    let all_txs_for_root = {
-        let mut v = vec![coinbase.clone()];
-        v.extend(ordered_winners.iter().cloned());
-        v
+    // Collect only tx_body_hashes to avoid cloning full Transaction objects.
+    let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.tx_body_hash.0)
+        .chain(ordered_winners.iter().map(|tx| tx.tx_body_hash.0))
+        .collect();
+    let tx_root = {
+        use noid_poseidon2b::native::compress;
+        if tx_hashes_for_root.is_empty() {
+            [0u8; 32]
+        } else {
+            let n = tx_hashes_for_root.len().next_power_of_two().max(2);
+            let mut layer = Vec::with_capacity(n);
+            layer.extend_from_slice(&tx_hashes_for_root);
+            layer.resize(n, [0u8; 32]);
+            while layer.len() > 1 {
+                layer = layer
+                    .chunks_exact(2)
+                    .map(|p| compress(&p[0], &p[1]))
+                    .collect();
+            }
+            layer[0]
+        }
     };
-    let tx_root = compute_tx_root(&all_txs_for_root);
     let prev_block_hash = full_block_hash(parent);
 
     Ok(BlockTemplate {
@@ -370,7 +391,7 @@ mod tests {
         )
         .unwrap();
 
-        let expected_tx_root = compute_tx_root(&tmpl.all_txs());
+        let expected_tx_root = crate::block::compute_tx_root(&tmpl.all_txs());
         assert_eq!(tmpl.tx_root, expected_tx_root);
     }
 
