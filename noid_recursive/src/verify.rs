@@ -58,13 +58,16 @@ pub fn verify_recursive_step(
     block_header: &BlockHeader,
     rec_air: &dyn noid_air::Air,
 ) -> Result<ChainAccumulator, RecVerifyError> {
+    // Reconstruct extra_transcript from proof fields (same as prover).
+    let extra_transcript = [proof.block_initial_claim, proof.rec_initial_claim];
+
     // 1. Verify the STARK proof.
     let empty_pi = make_empty_pi();
     verify_air_interleaved(
         rec_air,
         &empty_pi,
         &proof.stark,
-        &[],
+        &extra_transcript,
         &[],
         COMPACT_NUM_QUERIES,
     )
@@ -93,42 +96,35 @@ pub fn verify_recursive_step(
 
 /// Verify the entire chain history in O(1).
 ///
-/// Checks:
-/// 1. `rec_proof_n` (the latest recursive proof) is a valid STARK proof.
-/// 2. The chain hash in `rec_proof_n.acc` is consistent with the genesis
-///    accumulator (verified via the recursive chain itself).
-/// 3. The tip block's `prev_state_root` matches `rec_proof_n.acc.state_root`.
-/// 4. The tip block height is `rec_proof_n.acc.height + 1`.
-///
-/// The tip block proof itself is verified SEPARATELY by the caller
-/// (`noid_block::full_node::verify_block_full`), which avoids a circular
-/// dependency between `noid_block` and `noid_recursive`.
-///
-/// # Arguments
-///
-/// * `rec_proof_n` — the latest recursive proof (constant ~11 KB).
-/// * `rec_air` — the `RecursiveBlockAir` reconstructed from public data.
-/// * `tip_prev_state_root` — `prev_block_state_root` from the tip `BlockProof`.
-/// * `tip_height` — height of the tip block.
-/// * `genesis_acc` — protocol-level genesis accumulator constant.
-///
-/// # Complexity
-///
-/// O(1): verifies one constant-size STARK proof in ~5 ms.
+/// `expected_chain_hash`: when `Some`, `rec_proof_n.acc.chain_hash` is checked
+/// against this value. Pass `Some` only when all block headers from genesis are
+/// available in the snapshot (so the caller can independently compute the full
+/// chain hash by replaying `ChainAccumulator::extend`). When the snapshot covers
+/// only recent headers, pass `None` — PoW + chainwork validation is the primary
+/// guard. Once C2 is fully wired (BlockStateBindingAir), the STARK itself will
+/// prove chain-hash continuity and this will become unconditionally mandatory.
 pub fn verify_tip(
     rec_proof_n: &RecursiveBlockProof,
     rec_air: &dyn noid_air::Air,
     tip_prev_state_root: &[u8; 32],
     tip_height: u64,
-    genesis_acc: &ChainAccumulator,
+    _genesis_acc: &ChainAccumulator,
+    expected_chain_hash: Option<&[u8; 32]>,
 ) -> Result<(), RecVerifyError> {
+    // Reconstruct extra_transcript from proof-stored initial claims.
+    // Must match what the prover supplied to prove_air_interleaved.
+    let extra_transcript = [
+        rec_proof_n.block_initial_claim,
+        rec_proof_n.rec_initial_claim,
+    ];
+
     // Step 1: Verify the recursive STARK proof (tiny, O(1)).
     let empty_pi = make_empty_pi();
     verify_air_interleaved(
         rec_air,
         &empty_pi,
         &rec_proof_n.stark,
-        &[],
+        &extra_transcript,
         &[],
         COMPACT_NUM_QUERIES,
     )
@@ -144,11 +140,19 @@ pub fn verify_tip(
         return Err(RecVerifyError::HeightMismatch);
     }
 
-    // Step 3: Genesis anchor.
-    // At block height 0 (first block after genesis), the recursive proof
-    // covers no previous block — chain_hash must equal genesis.
-    if rec_proof_n.block_height == 0 && rec_proof_n.acc.chain_hash != genesis_acc.chain_hash {
-        return Err(RecVerifyError::ChainHashMismatch);
+    // Step 3: chain_hash verification.
+    //
+    // When the caller has all block headers from genesis, it computes the full
+    // expected chain_hash by replaying ChainAccumulator::extend and passes
+    // Some(expected). This covers the genesis-anchor case (height 0) and any
+    // chain where the snapshot window includes the genesis block.
+    //
+    // When only recent headers are available (gap from genesis), None is passed
+    // and PoW + chainwork validation of snapshot headers is the primary guard.
+    if let Some(expected) = expected_chain_hash {
+        if rec_proof_n.acc.chain_hash != *expected {
+            return Err(RecVerifyError::ChainHashMismatch);
+        }
     }
 
     Ok(())
@@ -184,17 +188,17 @@ pub fn verify_step_stark_only(
     acc_prev_state_root: &[u8; 32],
     expected_new_state_root: &[u8; 32],
 ) -> Result<(), RecVerifyError> {
+    // Reconstruct extra_transcript from proof fields (same as prover).
+    let extra_transcript = [proof.block_initial_claim, proof.rec_initial_claim];
+
     // Step 1: verify the STARK proof over the RecursiveBlockAir.
-    // RecursiveBlockAir is parameterised by `acc_prev_state_root`, which pins
-    // the accumulator row constraint. Any proof whose acc_row witness deviates
-    // from this root fails the STARK here.
     let rec_air = crate::air::RecursiveBlockAir::from_prev_state_root(acc_prev_state_root);
     let empty_pi = make_empty_pi();
     verify_air_interleaved(
         &rec_air,
         &empty_pi,
         &proof.stark,
-        &[],
+        &extra_transcript,
         &[],
         COMPACT_NUM_QUERIES,
     )

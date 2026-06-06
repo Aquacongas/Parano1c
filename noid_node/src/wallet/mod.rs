@@ -204,23 +204,28 @@ impl WalletOps for WalletHandle {
         log_slots: u32,
     ) -> Result<Vec<u8>, String> {
         // Extract build data from wallet (brief lock).
-        // Also snapshot pending_output_slots so the prover can avoid re-using them.
-        let build_data = {
+        // Snapshot both pending_output_slots (avoid output reuse) AND
+        // pending_input_slots (select_utxos already filters these, but we
+        // capture the selected slots here so we can mark them pending below).
+        let (build_data, input_slots) = {
             let guard = self.inner.lock().unwrap();
             let w = guard
                 .as_ref()
                 .ok_or_else(|| "wallet not initialized".to_string())?;
-            let pending_slots = w.pending_output_slots.clone();
-            builder::extract_build_data(
+            let pending_outputs = w.pending_output_slots.clone();
+            let data = builder::extract_build_data(
                 w,
                 amount_micronoid,
                 fee_micronoid,
                 epoch_anchor,
                 slot_hints,
                 log_slots,
-                &pending_slots,
+                &pending_outputs,
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            // Capture input slots BEFORE build_data is moved into the prover.
+            let inputs: Vec<u32> = data.selected_utxos.iter().map(|u| u.slot_index).collect();
+            (data, inputs)
         };
 
         // Prove outside the lock (CPU-heavy, ~0.3–3 s).
@@ -228,8 +233,10 @@ impl WalletOps for WalletHandle {
             builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
                 .map_err(|e| e.to_string())?;
 
-        // Register output slots as pending & record pending send (brief lock).
-        // Registering before returning ensures concurrent calls see claimed slots.
+        // Register input AND output slots as pending, record the send.
+        // Registering before returning ensures concurrent wallet_send calls
+        // see claimed slots immediately — preventing SlotConflict on rapid
+        // back-to-back sends even before any tx is confirmed.
         {
             let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
                 .map_err(|e| format!("decode: {e:?}"))?;
@@ -242,6 +249,9 @@ impl WalletOps for WalletHandle {
                 .collect();
             let mut guard = self.inner.lock().unwrap();
             if let Some(w) = guard.as_mut() {
+                // Mark input slots as pending so the next wallet_send call's
+                // select_utxos skips them (same fix as build_consolidate).
+                w.add_pending_inputs(&input_slots);
                 w.add_pending_outputs(&output_slots);
                 w.record_pending_send(tx_hash, amount_micronoid, to_address);
             }

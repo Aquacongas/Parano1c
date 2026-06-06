@@ -340,10 +340,9 @@ BAL=$(wallet_balance "$RPC_A")
 info "T2 addr=${ADDR:0:16}...  balance=$BAL μNOID"
 
 if [ "$BAL" -gt 100000 ] 2>/dev/null && [ -n "$ADDR" ]; then
-    # build_send does NOT add spent UTXOs to pending_input_slots.
-    # Rapid back-to-back sends all pick the same UTXO → only first hits mempool.
-    # Fix: confirm each tx before the next send (trivial at genesis difficulty).
-    # Each round tests: BTreeMap insert, correct fee_rate storage, and removal.
+    # All 3 sends issued without delay. After the select_utxos + pending_inputs
+    # fix, each send immediately marks its input UTXO as pending, so the next
+    # call picks a different UTXO. This is the real-world usage pattern.
 
     T2_PASS=0; T2_FAIL=0
 
@@ -352,8 +351,7 @@ if [ "$BAL" -gt 100000 ] 2>/dev/null && [ -n "$ADDR" ]; then
         FEE=$(echo "$ROUND" | cut -d: -f2)
         EXPECTED_RATE=$(( FEE / 2 ))   # 2 outputs (payment + change) → fee_rate = fee/2
 
-        # Refresh wallet so it knows about the latest change UTXO
-        wallet_scan_refresh "$RPC_A"
+        wallet_scan_refresh "$RPC_A"   # keep wallet state fresh
         BAL_NOW=$(wallet_balance "$RPC_A")
         if [ "$BAL_NOW" -lt "$FEE" ] 2>/dev/null; then
             info "T2 $LABEL skipped: balance too low ($BAL_NOW < $FEE)"
@@ -391,10 +389,9 @@ print('ok' if ok else 'MISS fee={} got_rates={}'.format(fee, rates))")
         [ "$RATE_FOUND" = "ok" ] \
             && ok "T2 $LABEL fee_rate consistent with fee=$FEE in BTreeMap" \
             || fail "T2 $LABEL fee_rate mismatch: $RATE_FOUND"
-
-        # Confirm this tx before the next send
-        wait_mempool_empty "$RPC_A" "T2-$LABEL" || true
     done
+    # Wait for all to confirm at the end (all 3 may be in pool simultaneously)
+    wait_mempool_empty "$RPC_A" T2-all || true
 
     # Final pool should be empty
     SZ_END=$(mempool_size "$RPC_A")
@@ -435,23 +432,20 @@ BAL=$(wallet_balance "$RPC_A")
 if [ "$BAL" -gt 50000 ] 2>/dev/null && [ -n "$ADDR" ]; then
     SZ0=$(mempool_size "$RPC_A")
 
-    # build_send does not track pending inputs → rapid sends reuse same UTXO.
-    # Confirm TX1 first so wallet gets a fresh change UTXO for TX2.
+    # After the pending_inputs fix, rapid back-to-back sends each pick a
+    # different UTXO — both should be admitted without waiting for confirmation.
     TX1=$(wallet_send "$RPC_A" "$ADDR" 1000 0)
-    wait_mempool_empty "$RPC_A" T3-tx1 || true   # TX1 confirmed, change UTXO now available
-    wallet_scan_refresh "$RPC_A"
     TX2=$(wallet_send "$RPC_A" "$ADDR" 1000 0)
     sleep 0.5
 
     SZ1=$(mempool_size "$RPC_A")
     DELTA=$(( SZ1 - SZ0 ))
-    info "T3 pool: before=$SZ0  after_send_2=$SZ1  delta=$DELTA"
+    info "T3 pool: before=$SZ0  after_send=$SZ1  delta=$DELTA"
     info "T3 TX1=${TX1:0:12}  TX2=${TX2:0:12}"
 
-    # TX2 should be in the pool now
-    [ "$DELTA" -ge 1 ] 2>/dev/null \
-        && ok "T3 TX2 in pool (size_delta=$DELTA)" \
-        || fail "T3 TX2 not in pool (delta=$DELTA) — wallet_send rejected?"
+    [ "$DELTA" -ge 2 ] 2>/dev/null \
+        && ok "T3 both txs admitted (delta=$DELTA) — pending_inputs fix works" \
+        || fail "T3 only $DELTA txs admitted (expected 2) — pending_inputs fix broken?"
 
     wait_mempool_empty "$RPC_A" T3 \
         && ok "T3 pool emptied — both txs confirmed" \

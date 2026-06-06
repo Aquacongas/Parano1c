@@ -199,6 +199,7 @@ pub fn extract_replay_witness(proof: &BlockProof) -> BlockReplayWitness {
         proof.block_multipoint_rounds.clone(),
         proof.mixed_opening.fri_proof.clone(),
         proof.mixed_opening.all_openings.clone(),
+        proof.block_initial_claim,
     )
 }
 

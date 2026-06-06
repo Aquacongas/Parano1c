@@ -125,6 +125,36 @@ pub const GENESIS_TARGET: [u8; 32] = {
     t
 };
 
+/// Minimum cumulative PoW work required to accept a state snapshot.
+///
+/// Stored as LE u128 in bytes [0..16], matching `add_work`/`block_work` layout.
+///
+/// # Derivation from the difficulty floor
+///
+/// Since `next_target` enforces `target ≤ GENESIS_TARGET` (difficulty can
+/// never fall below genesis), every block in the chain contributes:
+///
+///   block_work(block.difficulty_target) ≥ block_work(GENESIS_TARGET) = 2^27
+///
+/// where 2^27 comes from GENESIS_TARGET’s 27 leading zeros:
+///   GENESIS_TARGET (byte 28=0x10, bytes 29-31=0) → lz = 3×8 + lz(0x10) = 27
+///
+/// Therefore:
+///   • 1 real block   → chainwork ≥ 2^27 = 134,217,728  → PASSES
+///   • 155 fake blocks with trivial target ([0xFF;32], work=1/block)
+///              → chainwork = 155                        → FAILS (155 ≪ 2^27)
+///
+/// Setting `MIN_SNAPSHOT_CHAINWORK = 2^27` is the mathematically tight bound:
+/// exactly one genuine mainnet block is sufficient; no fake chain fitting in
+/// the 155-header snapshot window can pass.
+pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
+    let mut w = [0u8; 32];
+    // 2^27 = 134,217,728 = 0x0800_0000 in LE u128
+    // = block_work(GENESIS_TARGET), the minimum work any real block contributes.
+    w[3] = 0x08; // byte[3] holds bits 24-31; 0x08 = 2^3, so position = 24+3 = 27 ✓
+    w
+};
+
 /// Minimum allowed target (maximum difficulty). Theoretical floor.
 pub const MIN_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];

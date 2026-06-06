@@ -252,6 +252,7 @@ fn phase7_recursive_step_and_verify_tip() {
         block_proof.block_multipoint_rounds.clone(),
         block_proof.mixed_opening.fri_proof.clone(),
         block_proof.mixed_opening.all_openings.clone(),
+        block_proof.block_initial_claim,
     );
 
     // ----- prove_recursive_step -----
@@ -336,6 +337,7 @@ fn phase7_recursive_step_and_verify_tip() {
             &tip_prev_state_root,
             tip_height,
             &genesis_acc,
+            None, // no expected_chain_hash: test doesn't have full header chain
         );
         assert!(result.is_ok(), "verify_tip must succeed: {result:?}");
         eprintln!("[phase7] verify_tip: PASS — O(1) chain verification works!");

@@ -112,6 +112,11 @@ pub struct BlockProof {
     pub block_multipoint_rounds: Vec<Vec<Block128>>,
     /// Single FRI-Binius mixed opening at r_block.
     pub mixed_opening: MixedOpeningProof,
+    /// Initial claim for the block-level multipoint sumcheck.
+    /// = block_target = Σ_k μ^k × Σ_i β^i × col_openings_k[i].
+    /// Stored here so the recursive prover can bind the fold-check to the
+    /// real value via `extra_transcript` instead of the placeholder ZERO.
+    pub block_initial_claim: Block128,
 }
 
 impl BlockProof {
@@ -888,6 +893,7 @@ pub fn prove_block(
         block_col_openings,
         block_multipoint_rounds: block_mp_rounds,
         mixed_opening,
+        block_initial_claim: block_target, // real initial claim for recursive prover
     })
 }
 

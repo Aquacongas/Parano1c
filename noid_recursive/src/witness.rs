@@ -43,6 +43,11 @@ pub struct BlockReplayWitness {
     pub compact_fri: CompactEvalProof,
     /// Per-column evaluations at `r_block` plus secondary claim values.
     pub mixed_all_openings: Vec<Block128>,
+    /// Initial claim for the block-level multipoint sumcheck
+    /// (= `block_target` from `prove_block`). ZERO for null/genesis witnesses.
+    /// Passed into the recursive STARK via `extra_transcript` to bind the
+    /// fold-check to the real value rather than the placeholder ZERO.
+    pub block_initial_claim: Block128,
 }
 
 impl BlockReplayWitness {
@@ -58,6 +63,7 @@ impl BlockReplayWitness {
         block_multipoint_rounds: Vec<Vec<Block128>>,
         compact_fri: CompactEvalProof,
         mixed_all_openings: Vec<Block128>,
+        block_initial_claim: Block128,
     ) -> Self {
         Self {
             cap,
@@ -66,6 +72,7 @@ impl BlockReplayWitness {
             block_multipoint_rounds,
             compact_fri,
             mixed_all_openings,
+            block_initial_claim,
         }
     }
 }
@@ -78,6 +85,7 @@ pub fn extract_block_replay_witness_parts(
     block_multipoint_rounds: Vec<Vec<Block128>>,
     compact_fri: CompactEvalProof,
     mixed_all_openings: Vec<Block128>,
+    block_initial_claim: Block128,
 ) -> BlockReplayWitness {
     BlockReplayWitness::from_parts(
         cap,
@@ -86,5 +94,6 @@ pub fn extract_block_replay_witness_parts(
         block_multipoint_rounds,
         compact_fri,
         mixed_all_openings,
+        block_initial_claim,
     )
 }

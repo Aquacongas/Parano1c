@@ -289,9 +289,20 @@ impl WalletState {
 
     /// Simple largest-first coin selection.
     /// Returns `(selected UTXOs, change_amount)` or `None` if insufficient funds.
+    ///
+    /// **Excludes UTXOs whose slots are already in `pending_input_slots`.**
+    /// This prevents a second rapid `wallet_send` from trying to spend the same
+    /// UTXO as a first send that is still waiting for mempool admission or
+    /// block confirmation. Without this filter the second send hits a
+    /// `SlotConflict` error in the mempool even though the wallet has balance.
     pub fn select_utxos(&self, target: u64, fee: u64) -> Option<(Vec<&WalletUtxo>, u64)> {
         let needed = target.saturating_add(fee);
-        let mut available: Vec<&WalletUtxo> = self.utxos.values().collect();
+        // Filter out UTXOs that are already being spent by a pending tx.
+        let mut available: Vec<&WalletUtxo> = self
+            .utxos
+            .values()
+            .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
+            .collect();
         available.sort_by(|a, b| b.value.cmp(&a.value));
 
         let mut selected = Vec::new();

@@ -257,5 +257,6 @@ pub fn block_proof_to_replay_witness(proof: &BlockProof) -> noid_recursive::Bloc
         proof.block_multipoint_rounds.clone(),
         proof.mixed_opening.fri_proof.clone(),
         proof.mixed_opening.all_openings.clone(),
+        proof.block_initial_claim,
     )
 }

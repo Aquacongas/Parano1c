@@ -182,6 +182,11 @@ pub struct RecursiveBlockAir {
 }
 
 impl RecursiveBlockAir {
+    /// Number of AIR constraints:
+    /// 2 × FoldCheckGate (block + rec sumcheck) + 2 × WeightedLinearGate (acc hi/lo).
+    /// Used by `derive_rec_initial_claim` to replay the FS channel correctly.
+    pub const N_CONSTRAINTS: usize = 4;
+
     /// Construct the AIR from just the previous accumulator state root.
     ///
     /// This is the verifier-side constructor: the verifier only needs the
