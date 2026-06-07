@@ -109,14 +109,14 @@ rm -rf "$S1A" "$S1C"; mkdir -p "$S1A" "$S1C"
 
 # Start A with genesis, mine 6 blocks to establish chain
 "$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine --genesis >"$L1A" 2>&1 &
+    --mine --testnet --genesis >"$L1A" 2>&1 &
 P1A=$!; ALL_PIDS+=($P1A); echo "  A pid=$P1A (genesis)"
 wait_alive "$RPC_A" A
 wait_height "$RPC_A" 6 A
 
 # Start C, let it sync to A then stop both — so they share the same fork point
 "$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --mine --seed 127.0.0.1:19041 >"$L1C" 2>&1 &
+    --mine --testnet --seed 127.0.0.1:19041 --testnet >"$L1C" 2>&1 &
 P1C=$!; ALL_PIDS+=($P1C); echo "  C pid=$P1C (syncs to A)"
 wait_alive "$RPC_C" C
 wait_height "$RPC_C" 6 C
@@ -132,7 +132,7 @@ echo "  Fork point: h=$H1_FORK. Both stopped."
 
 # C mines ALONE (+6 blocks) — A is frozen
 "$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --mine >"$L1C" 2>&1 &
+    --mine --testnet >"$L1C" 2>&1 &
 P1C=$!; ALL_PIDS+=($P1C)
 wait_alive "$RPC_C" C
 
@@ -146,7 +146,7 @@ kill "$P1C" 2>/dev/null; wait "$P1C" 2>/dev/null || true; sleep 1
 # A mines 3 blocks alone on its fork, then STOPS so we know its exact height.
 # (A keeps mining past wait_height if we don't stop it — must kill before check.)
 "$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine >"$L1A" 2>&1 &
+    --mine --testnet >"$L1A" 2>&1 &
 P1A=$!; ALL_PIDS+=($P1A)
 wait_alive "$RPC_A" A
 
@@ -168,12 +168,12 @@ T_CONN=$(date +%s)
 echo ""
 echo "  Restarting A, reconnecting C (no --mine) → expect A to adopt C's chain..."
 "$BIN" --data-dir "$S1A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine >"$L1A" 2>&1 &
+    --mine --testnet >"$L1A" 2>&1 &
 P1A=$!; ALL_PIDS+=($P1A)
 wait_alive "$RPC_A" A
 
 "$BIN" --data-dir "$S1C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --seed 127.0.0.1:19041 >"$L1C" 2>&1 &
+    --seed 127.0.0.1:19041 --testnet >"$L1C" 2>&1 &
 P1C=$!; ALL_PIDS+=($P1C)
 wait_alive "$RPC_C" C
 
@@ -217,13 +217,13 @@ L2A=/tmp/ptest-s2-A.log; L2C=/tmp/ptest-s2-C.log
 rm -rf "$S2A" "$S2C"; mkdir -p "$S2A" "$S2C"
 
 "$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine --genesis >"$L2A" 2>&1 &
+    --mine --testnet --genesis >"$L2A" 2>&1 &
 P2A=$!; ALL_PIDS+=($P2A); echo "  A pid=$P2A (genesis)"
 wait_alive "$RPC_A" A
 wait_height "$RPC_A" 6 A
 
 "$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --mine --seed 127.0.0.1:19041 >"$L2C" 2>&1 &
+    --mine --testnet --seed 127.0.0.1:19041 --testnet >"$L2C" 2>&1 &
 P2C=$!; ALL_PIDS+=($P2C); echo "  C pid=$P2C (syncs to A)"
 wait_alive "$RPC_C" C
 wait_height "$RPC_C" 6 C
@@ -238,7 +238,7 @@ echo "  Fork point: h=$H2_FORK. Both stopped."
 
 # A mines ALONE (+6) — C is frozen
 "$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine >"$L2A" 2>&1 &
+    --mine --testnet >"$L2A" 2>&1 &
 P2A=$!; ALL_PIDS+=($P2A)
 wait_alive "$RPC_A" A
 
@@ -253,7 +253,7 @@ echo "  A at h=$H2_A. Stopped."
 
 # C mines alone (+2) — A is stopped
 "$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --mine >"$L2C" 2>&1 &
+    --mine --testnet >"$L2C" 2>&1 &
 P2C=$!; ALL_PIDS+=("$P2C")
 wait_alive "$RPC_C" C
 
@@ -275,12 +275,12 @@ echo ""
 echo "  Restarting A and C (WITH --mine) — C must adopt A's chain while mining..."
 
 "$BIN" --data-dir "$S2A" --p2p-listen 0.0.0.0:19041 --rpc-listen 127.0.0.1:18041 \
-    --mine >"$L2A" 2>&1 &
+    --mine --testnet >"$L2A" 2>&1 &
 P2A=$!; ALL_PIDS+=($P2A)
 wait_alive "$RPC_A" A
 
 "$BIN" --data-dir "$S2C" --p2p-listen 0.0.0.0:19043 --rpc-listen 127.0.0.1:18043 \
-    --mine --seed 127.0.0.1:19041 >"$L2C" 2>&1 &
+    --mine --testnet --seed 127.0.0.1:19041 --testnet >"$L2C" 2>&1 &
 P2C=$!; ALL_PIDS+=($P2C)
 wait_alive "$RPC_C" C
 

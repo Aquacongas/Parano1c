@@ -129,6 +129,15 @@ struct Cli {
     ///   # Miner: getBlockTemplate("noid1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
+
+    /// Disable the difficulty floor for fast local testing.
+    ///
+    /// Without this flag ASERT cannot ease below GENESIS_TARGET (mainnet behaviour).
+    /// With this flag ASERT eases freely to MAX_TARGET: with yesterday's genesis
+    /// timestamp blocks arrive in under a millisecond, making stress tests fast.
+    /// Also lowers the snapshot chainwork threshold to match testnet block work.
+    #[arg(long)]
+    testnet: bool,
 }
 
 /// Resolve a seed string to a libp2p Multiaddr.
@@ -235,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
         .with_thread_ids(false)
         .compact() // single-line events
         .init();
+
+    // --- Testnet mode: disable difficulty floor for fast local testing ---
+    if cli.testnet {
+        noid_chain::consensus::difficulty::set_testnet_mode();
+        tracing::warn!("--testnet: difficulty floor disabled (blocks ease to MAX_TARGET)");
+    }
 
     // --- Network ---
     let net = NetworkConfig::mainnet();
@@ -717,18 +732,26 @@ fn validate_snapshot_headers(
         }
     }
 
-    // Compute cumulative chainwork as a sanity bound: reject snapshots where
-    // every header has trivially-easy PoW (e.g. target=[0xFF;32], work=1/block).
-    // At mainnet genesis difficulty (GENESIS_TARGET, 27 leading zeros per block),
-    // block_work = 2^27 = 134M. MIN_SNAPSHOT_CHAINWORK = 2^20 requires only
-    // ~8 real mainnet-difficulty-equivalent blocks, which is impossible to fake
-    // cheaply: an attacker would need 2^20/155 ≈ 6764 hashes *per header* minimum,
-    // comparable to real mining work.
+    // Cumulative chainwork check.
+    //
+    // Mainnet: MIN_SNAPSHOT_CHAINWORK = 2^27 = block_work(GENESIS_TARGET).
+    //   Every real block contributes ≥2^27 (floor enforced by next_target).
+    //   155 fake blocks at trivial difficulty → work=155 ≪ 2^27 → FAILS.
+    //
+    // Testnet (--testnet, floor disabled): ASERT eases to MAX_TARGET so
+    //   block_work(MAX_TARGET) = 1. Use threshold = 0 so any snapshot passes.
+    //   Security still comes from PoW-per-header and genesis-hash checks above;
+    //   the chainwork number is just not meaningful for trivial-difficulty chains.
+    let min_chainwork: [u8; 32] = if noid_chain::consensus::difficulty::is_testnet_mode() {
+        [0u8; 32] // zero threshold: any chainwork > 0 passes (testnet)
+    } else {
+        MIN_SNAPSHOT_CHAINWORK
+    };
     let mut work = [0u8; 32];
     for hdr in &hdrs {
         work = add_work(&work, &block_work(&hdr.difficulty_target));
     }
-    if !work_gt(&work, &MIN_SNAPSHOT_CHAINWORK) {
+    if min_chainwork != [0u8; 32] && !work_gt(&work, &min_chainwork) {
         return Err(format!(
             "snapshot has insufficient cumulative chainwork \
              ({} headers validated; work must exceed MIN_SNAPSHOT_CHAINWORK)",

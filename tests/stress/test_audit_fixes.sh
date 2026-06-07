@@ -265,7 +265,7 @@ LA=/tmp/paudit-t1-A.log; LB=/tmp/paudit-t1-B.log
 rm -rf "$DA" "$DB"; mkdir -p "$DA" "$DB"
 
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T1-A
 wait_height "$RPC_A" 15 T1-A
@@ -276,7 +276,7 @@ SR_A15=$(header_state_root "$RPC_A" 15)
 info "A: h5=${SR_A5:0:16}...  h10=${SR_A10:0:16}...  h15=${SR_A15:0:16}..."
 
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --mine --seed "127.0.0.1:$P2P_A" >"$LB" 2>&1 &
+    --mine --testnet --seed "127.0.0.1:$P2P_A" --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_B" T1-B
 wait_height "$RPC_B" 15 T1-B
@@ -329,7 +329,7 @@ LA=/tmp/paudit-t2-A.log
 rm -rf "$DA"; mkdir -p "$DA"
 
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T2-A
 wait_height "$RPC_A" 8 T2-A
@@ -420,7 +420,7 @@ LA=/tmp/paudit-t3-A.log
 rm -rf "$DA"; mkdir -p "$DA"
 
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T3-A
 wait_height "$RPC_A" 8 T3-A
@@ -479,13 +479,13 @@ rm -rf "$DA" "$DB"; mkdir -p "$DA" "$DB"
 
 # ── Phase 1: establish common fork point ──────────────────────────────────
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T4-A
 wait_height "$RPC_A" 8 T4-A
 
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --mine --seed "127.0.0.1:$P2P_A" >"$LB" 2>&1 &
+    --mine --testnet --seed "127.0.0.1:$P2P_A" --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_B" T4-B
 wait_height "$RPC_B" 8 T4-B
@@ -500,7 +500,7 @@ kill "$PA" "$PB" 2>/dev/null; wait "$PA" "$PB" 2>/dev/null || true; sleep 1
 # ── Phase 2: diverge ──────────────────────────────────────────────────────
 # A mines +3 with wallet txs (lighter fork)
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine >"$LA" 2>&1 &
+    --mine --testnet >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T4-A
 wait_height "$RPC_A" "$((FORK_H + 3))" T4-A
@@ -518,7 +518,7 @@ kill "$PA" 2>/dev/null; wait "$PA" 2>/dev/null || true; sleep 1
 
 # B mines +10 (heavier fork, no txs)
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --mine >"$LB" 2>&1 &
+    --mine --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_B" T4-B
 wait_height "$RPC_B" "$((FORK_H + 15))" T4-B
@@ -535,12 +535,12 @@ info "T4 before reconnect: A h=$H_A (+3)  B h=$H_B (+15)"
 
 # ── Phase 3: reconnect, expect A to adopt B's chain ──────────────────────
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine >"$LA" 2>&1 &
+    --mine --testnet >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T4-A
 
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --seed "127.0.0.1:$P2P_A" >"$LB" 2>&1 &
+    --seed "127.0.0.1:$P2P_A" --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_B" T4-B
 
@@ -599,7 +599,7 @@ LA=/tmp/paudit-t5-A.log; LC=/tmp/paudit-t5-C.log
 rm -rf "$DA" "$DC"; mkdir -p "$DA" "$DC"
 
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T5-A
 
@@ -621,7 +621,7 @@ info "T5 A: h=$HA  SR@10=${SR_A10:0:16}...  SR@20=${SR_A20:0:16}..."
 
 # C starts fresh, connects only to A — gets state via snapshot
 "$BIN" --data-dir "$DC" --p2p-listen "0.0.0.0:$P2P_C" --rpc-listen "127.0.0.1:18953" \
-    --seed "127.0.0.1:$P2P_A" >"$LC" 2>&1 &
+    --seed "127.0.0.1:$P2P_A" --testnet >"$LC" 2>&1 &
 PC=$!; ALL_PIDS+=($PC)
 wait_alive "$RPC_C" T5-C
 
@@ -673,13 +673,13 @@ LA=/tmp/paudit-t6-A.log; LB=/tmp/paudit-t6-B.log
 rm -rf "$DA" "$DB"; mkdir -p "$DA" "$DB"
 
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --mine --genesis >"$LA" 2>&1 &
+    --mine --testnet --genesis >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 wait_alive "$RPC_A" T6-A
 wait_height "$RPC_A" 5 T6-A
 
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --mine --seed "127.0.0.1:$P2P_A" >"$LB" 2>&1 &
+    --mine --testnet --seed "127.0.0.1:$P2P_A" --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_B" T6-B
 wait_height "$RPC_B" 5 T6-B
@@ -719,16 +719,16 @@ info "T6 after load: A h=$H_A  B h=$H_B"
 
 # At genesis difficulty both nodes mine ~4-5 blocks/second.
 # P2P gossip can't keep up while both are mining → they diverge rapidly.
-# Stop both miners, then restart WITHOUT --mine for pure P2P convergence.
+# Stop both miners, then restart WITHOUT --mine --testnet for pure P2P convergence.
 # MDBX state is persistent: restart reads from disk, no data lost.
 kill "$PA" "$PB" 2>/dev/null; wait "$PA" "$PB" 2>/dev/null || true; sleep 1
 
 info "T6 miners stopped, restarting as sync-only nodes..."
 "$BIN" --data-dir "$DA" --p2p-listen "0.0.0.0:$P2P_A" --rpc-listen "127.0.0.1:18951" \
-    --seed "127.0.0.1:$P2P_B" >"$LA" 2>&1 &
+    --seed "127.0.0.1:$P2P_B" --testnet >"$LA" 2>&1 &
 PA=$!; ALL_PIDS+=($PA)
 "$BIN" --data-dir "$DB" --p2p-listen "0.0.0.0:$P2P_B" --rpc-listen "127.0.0.1:18952" \
-    --seed "127.0.0.1:$P2P_A" >"$LB" 2>&1 &
+    --seed "127.0.0.1:$P2P_A" --testnet >"$LB" 2>&1 &
 PB=$!; ALL_PIDS+=($PB)
 wait_alive "$RPC_A" T6-A-sync
 wait_alive "$RPC_B" T6-B-sync

@@ -21,7 +21,25 @@
 //!
 //! All arithmetic uses u64/u128 integers. NO FLOATS.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET};
+
+/// When true, the difficulty floor is disabled: ASERT can ease the target all
+/// the way to MAX_TARGET (trivially satisfiable). Intended for `--testnet` only.
+/// Set once at startup before any mining. Remove before final mainnet launch.
+static TESTNET_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Disable the difficulty floor so ASERT can ease difficulty below GENESIS_TARGET.
+/// Call at startup when `--testnet` is passed. Not safe for mainnet use.
+pub fn set_testnet_mode() {
+    TESTNET_MODE.store(true, Ordering::Relaxed);
+}
+
+/// Returns true if the difficulty floor is disabled (`--testnet` was passed).
+pub fn is_testnet_mode() -> bool {
+    TESTNET_MODE.load(Ordering::Relaxed)
+}
 
 /// Compute the next difficulty target. Direct port of BCH `CalculateASERT`.
 ///
@@ -87,12 +105,23 @@ pub fn next_target(
     // Using 47 as the threshold is tight; use 46 for a 1-bit safety margin.
     //
     // A right shift ≥320 bits always gives zero → MIN_TARGET.
+    // Difficulty floor active when: production build AND --testnet NOT passed.
+    //
+    // #[cfg(test)] turns the floor OFF in noid_chain unit tests so they can
+    // use trivially-easy targets ([0xFF;32]) without triggering the floor.
+    // The floor IS active in the binary and noid_node integration tests
+    // (noid_chain compiled as a regular dep, not in test mode).
+    #[cfg(not(test))]
+    let floor_active = !TESTNET_MODE.load(Ordering::Relaxed);
+    #[cfg(test)]
+    let floor_active = false;
+
     if net >= 46 {
-        // Target would overflow 256 bits → clamp to easiest allowed.
-        #[cfg(not(test))]
-        return GENESIS_TARGET; // production: floor at genesis difficulty
-        #[cfg(test)]
-        return MAX_TARGET; // tests: allow trivial targets ([0xFF;32] etc.)
+        return if floor_active {
+            GENESIS_TARGET
+        } else {
+            MAX_TARGET
+        };
     }
     if net <= -320 {
         return MIN_TARGET;
@@ -100,24 +129,18 @@ pub fn next_target(
 
     wide = shift_wide(wide, net);
 
-    // Overflow safety net (should be unreachable given the guards above).
     if net > 0 && wide == [0u64; 5] {
-        #[cfg(not(test))]
-        return GENESIS_TARGET;
-        #[cfg(test)]
-        return MAX_TARGET;
+        return if floor_active {
+            GENESIS_TARGET
+        } else {
+            MAX_TARGET
+        };
     }
 
-    // Extract low 256 bits, clamp to [MIN_TARGET, MAX_TARGET].
     let result = limbs_to_bytes([wide[0], wide[1], wide[2], wide[3]]);
     let clamped = clamp(result, wide[4]);
 
-    // Difficulty floor (production only): target must not exceed GENESIS_TARGET.
-    // This prevents blocks from becoming easier than genesis, even if the chain
-    // has long downtime or a stale genesis timestamp.
-    // Tests bypass this so they can use trivially-easy targets for fast block building.
-    #[cfg(not(test))]
-    if le256_lt(&GENESIS_TARGET, &clamped) {
+    if floor_active && le256_lt(&GENESIS_TARGET, &clamped) {
         return GENESIS_TARGET;
     }
 
@@ -447,13 +470,14 @@ mod tests {
         let val = u128::from_le_bytes(w[..16].try_into().unwrap());
         assert_eq!(val, 1u128 << 27, "GENESIS_TARGET work = 2^27");
 
-        // Cross-check: MIN_SNAPSHOT_CHAINWORK == block_work(GENESIS_TARGET)
-        use crate::consensus::params::MIN_SNAPSHOT_CHAINWORK;
+        // Cross-check: MIN_SNAPSHOT_CHAINWORK = FINALITY_DEPTH × block_work(GENESIS_TARGET)
+        use crate::consensus::params::{FINALITY_DEPTH, MIN_SNAPSHOT_CHAINWORK};
         let min_work = u128::from_le_bytes(MIN_SNAPSHOT_CHAINWORK[..16].try_into().unwrap());
+        let genesis_block_work = 1u128 << 27;
         assert_eq!(
             min_work,
-            1u128 << 27,
-            "MIN_SNAPSHOT_CHAINWORK must equal block_work(GENESIS_TARGET) = 2^27"
+            FINALITY_DEPTH as u128 * genesis_block_work,
+            "MIN_SNAPSHOT_CHAINWORK must equal FINALITY_DEPTH({FINALITY_DEPTH}) × block_work(GENESIS_TARGET)"
         );
     }
 

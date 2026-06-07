@@ -79,9 +79,11 @@ print(d.get('$field','') if isinstance(d,dict) else '')" 2>/dev/null || echo ""
 start_node() {
     local dir=$1 p2p=$2 rpc_addr=$3 extra=${4:-""}
     mkdir -p "$dir"
+    # --testnet: disables difficulty floor so ASERT eases to MAX_TARGET with
+    # yesterday's genesis timestamp — gives sub-second blocks for fast testing.
     # shellcheck disable=SC2086
     "$BIN" --data-dir "$dir" --p2p-listen "0.0.0.0:$p2p" \
-           --rpc-listen "127.0.0.1:$rpc_addr" --mine $extra \
+           --rpc-listen "127.0.0.1:$rpc_addr" --mine --testnet $extra \
            > "$dir/node.log" 2>&1 &
     local pid=$!
     pids+=("$pid")
@@ -267,7 +269,7 @@ scenario4() {
     mkdir -p "$dir_b"
     "$BIN" --data-dir "$dir_b" --p2p-listen "0.0.0.0:29005" \
            --rpc-listen "127.0.0.1:29105" \
-           --seed "127.0.0.1:29004" \
+           --seed "127.0.0.1:29004" --testnet \
            > "$dir_b/node.log" 2>&1 &
     pids+=("$!")
 
@@ -402,7 +404,7 @@ scenario7() {
     # B is a relay-only node (no --mine): test is about P2P propagation, not mining competition
     "$BIN" --data-dir "$dir_b" --p2p-listen "0.0.0.0:29009" \
            --rpc-listen "127.0.0.1:29109" \
-           --seed "127.0.0.1:29008" \
+           --seed "127.0.0.1:29008" --testnet \
            > "$dir_b/node.log" 2>&1 &
     pids+=("$!")
     # Wait for B to sync to A's current chain height

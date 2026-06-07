@@ -129,29 +129,42 @@ pub const GENESIS_TARGET: [u8; 32] = {
 ///
 /// Stored as LE u128 in bytes [0..16], matching `add_work`/`block_work` layout.
 ///
-/// # Derivation from the difficulty floor
+/// # Derivation
 ///
-/// Since `next_target` enforces `target ≤ GENESIS_TARGET` (difficulty can
-/// never fall below genesis), every block in the chain contributes:
+/// The difficulty floor ensures every mainnet block contributes at least:
+///   block_work(GENESIS_TARGET) = 2^27 = 134,217,728  (27 leading zeros)
 ///
-///   block_work(block.difficulty_target) ≥ block_work(GENESIS_TARGET) = 2^27
+/// We require FINALITY_DEPTH (18) blocks’ worth of work:
 ///
-/// where 2^27 comes from GENESIS_TARGET’s 27 leading zeros:
-///   GENESIS_TARGET (byte 28=0x10, bytes 29-31=0) → lz = 3×8 + lz(0x10) = 27
+///   MIN_SNAPSHOT_CHAINWORK = FINALITY_DEPTH × block_work(GENESIS_TARGET)
+///                          = 18 × 2^27 = 2,415,919,104 = 0x9000_0000
 ///
-/// Therefore:
-///   • 1 real block   → chainwork ≥ 2^27 = 134,217,728  → PASSES
-///   • 155 fake blocks with trivial target ([0xFF;32], work=1/block)
-///              → chainwork = 155                        → FAILS (155 ≪ 2^27)
+/// # Why FINALITY_DEPTH?
 ///
-/// Setting `MIN_SNAPSHOT_CHAINWORK = 2^27` is the mathematically tight bound:
-/// exactly one genuine mainnet block is sufficient; no fake chain fitting in
-/// the 155-header snapshot window can pass.
+/// The recursive proof updater only builds proofs for blocks that are
+/// FINALITY_DEPTH behind tip. Until a peer has 18+ finalized blocks it has
+/// NO recursive proof. Requiring 18 blocks of chainwork aligns these two:
+///
+///   tip < 18  → no recursive proof AND chainwork < threshold → B cannot sync
+///   tip ≥ 18  → recursive proof exists AND chainwork ≥ threshold → B can sync
+///
+/// This means B only syncs from a peer that already has a meaningful chain
+/// history and a real recursive proof, not from a peer that just started.
+///
+/// # Security vs fake snapshots
+///
+///   • 155 fake MAX_TARGET blocks (work=1/block) → chainwork = 155 ≪ 2.4B → FAILS
+///   • 18 real mainnet blocks + genesis  → chainwork = 19 × 2^27 > 18 × 2^27 → PASSES
+///
+/// Only applies in mainnet mode. With `--testnet` the difficulty floor is
+/// disabled (blocks ease to MAX_TARGET, work=1); `validate_snapshot_headers`
+/// uses threshold=0 so the check is a no-op for trivial-difficulty chains.
 pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
     let mut w = [0u8; 32];
-    // 2^27 = 134,217,728 = 0x0800_0000 in LE u128
-    // = block_work(GENESIS_TARGET), the minimum work any real block contributes.
-    w[3] = 0x08; // byte[3] holds bits 24-31; 0x08 = 2^3, so position = 24+3 = 27 ✓
+    // 18 × 2^27 = 0x12 × 0x800_0000 = 0x9000_0000 = 2,415,919,104
+    // In LE u128: byte[3] = 0x90 (bits 24-31)
+    // Verify: 0x90 × 2^24 = 144 × 16,777,216 = 2,415,919,104 = 18 × 134,217,728 ✓
+    w[3] = 0x90; // = FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
     w
 };
 

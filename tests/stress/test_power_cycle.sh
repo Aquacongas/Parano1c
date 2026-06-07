@@ -117,7 +117,7 @@ start_node() {
         --data-dir "$DATADIR" \
         --p2p-listen "$P2P" \
         --rpc-listen 127.0.0.1:18051 \
-        --mine --genesis \
+        --mine --testnet --genesis \
         >> "$LOGFILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "  Node started PID=$(cat $PID_FILE)"
@@ -256,7 +256,7 @@ for cycle in $(seq 1 "$NUM_CYCLES"); do
         --data-dir "$DATADIR" \
         --p2p-listen "$P2P" \
         --rpc-listen 127.0.0.1:18051 \
-        --mine --genesis \
+        --mine --testnet --genesis \
         > "$RECOVERY_LOG" 2>&1 &
     echo $! > "$PID_FILE"
     echo "  Node restarted PID=$(cat $PID_FILE)"

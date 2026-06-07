@@ -392,11 +392,26 @@ impl BlockMiner {
                             let elapsed = pow_start.elapsed();
                             let elapsed_s = elapsed.as_secs_f64();
 
+                            // Count leading zeros of the difficulty target (MSB-first, LE).
+                            // Matches block_work() in difficulty.rs — higher = harder.
+                            // Genesis = 27lz. ASERT raises this when blocks arrive faster
+                            // than BLOCK_TIME (12s) and lowers it when they're slower.
+                            let diff_lz: u32 = {
+                                let t = &block.header.difficulty_target;
+                                let mut lz = 0u32;
+                                for i in (0..32).rev() {
+                                    if t[i] == 0 { lz += 8; }
+                                    else { lz += t[i].leading_zeros(); break; }
+                                }
+                                lz
+                            };
+
                             tracing::info!(
                                 height,
                                 hash = %hex::encode(hash),
                                 n_txs,
                                 time = %format!("{elapsed_s:.2}s"),
+                                diff = %format!("lz{diff_lz}"),
                                 "block found"
                             );
 

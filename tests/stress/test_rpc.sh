@@ -70,7 +70,7 @@ if [ "$OWN_NODE" = "1" ]; then
     [ -f "$BIN" ] || { echo "ERROR: $BIN not found — run cargo build --release"; exit 1; }
     mkdir -p "$DATA"
     "$BIN" --data-dir "$DATA" --p2p-listen 0.0.0.0:29400 \
-           --rpc-listen 127.0.0.1:29401 --mine --genesis \
+           --rpc-listen 127.0.0.1:29401 --mine --testnet --genesis \
            >"$DATA/node.log" 2>&1 &
     NODE_PID=$!
     echo "node PID=$NODE_PID"
