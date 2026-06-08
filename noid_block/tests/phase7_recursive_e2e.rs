@@ -213,8 +213,13 @@ fn phase7_recursive_step_and_verify_tip() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let block_proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
-        .expect("prove_block must succeed");
+    let block_proof = prove_block(
+        prev_state_root,
+        [0u8; 32],
+        std::slice::from_ref(&witness),
+        &[],
+    )
+    .expect("prove_block must succeed");
 
     // ----- Build a minimal block header -----
     let block_header = BlockHeader {
@@ -347,22 +352,33 @@ fn phase7_recursive_step_and_verify_tip() {
 /// Fast accumulator-only test (no STARK proving — always runs).
 #[test]
 fn phase7_accumulator_chain_e2e() {
+    use noid_poseidon2b::native::compress;
     let genesis = genesis_accumulator([0x00u8; 32], [0xAAu8; 32]);
     let block1_hash = [0x11u8; 32];
-    let acc1 = genesis.extend([0x22u8; 32], block1_hash, 1);
+    // Coinbase-only test blocks — block_initial_claim = ZERO.
+    let acc1 = genesis.extend([0x22u8; 32], block1_hash, 1, Block128::ZERO);
     let block2_hash = [0x33u8; 32];
-    let acc2 = acc1.extend([0x44u8; 32], block2_hash, 2);
+    let acc2 = acc1.extend([0x44u8; 32], block2_hash, 2, Block128::ZERO);
 
-    // chain_hash is deterministic
-    let expected_1 = noid_poseidon2b::native::compress(&genesis.chain_hash, &block1_hash);
+    // Reproduce the new formula: compress(prev, compress(H_BLOCK, claim_bytes))
+    let claim_bytes = [0u8; 32]; // ZERO claim
+    let expected_1 = compress(&genesis.chain_hash, &compress(&block1_hash, &claim_bytes));
     assert_eq!(acc1.chain_hash, expected_1);
 
-    let expected_2 = noid_poseidon2b::native::compress(&acc1.chain_hash, &block2_hash);
+    let expected_2 = compress(&acc1.chain_hash, &compress(&block2_hash, &claim_bytes));
     assert_eq!(acc2.chain_hash, expected_2);
 
     // Different block hashes → different chain hashes
-    let acc_alt = genesis.extend([0x22u8; 32], [0xFF_u8; 32], 1);
+    let acc_alt = genesis.extend([0x22u8; 32], [0xFF_u8; 32], 1, Block128::ZERO);
     assert_ne!(acc1.chain_hash, acc_alt.chain_hash);
+
+    // Different initial claims → different chain hashes (S-2 fix)
+    let real_claim = Block128::from(0xDEAD_BEEF_u128);
+    let acc_real = genesis.extend([0x22u8; 32], block1_hash, 1, real_claim);
+    assert_ne!(
+        acc1.chain_hash, acc_real.chain_hash,
+        "null-witness substitution detectable via chain_hash"
+    );
 
     eprintln!("[phase7] 3-step accumulator chain: genesis → block1 → block2, all consistent");
 }

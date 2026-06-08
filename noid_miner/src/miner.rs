@@ -516,17 +516,28 @@ impl BlockMiner {
             .unwrap_or_default()
             .as_secs();
 
-        // --- Phase 1: MDBX commit under write lock (minimal hold time) ---
+        // --- Phase 1: MDBX commit off the async executor ---
+        //
+        // SyncMode::Durable means commit_block issues fsync before returning —
+        // a blocking syscall.  spawn_blocking keeps it off the tokio worker.
+        // The wallet hook fires inside the closure while the write lock is
+        // still held, preserving the original "hook before mempool" ordering.
         {
-            let mut ctx = self.chain.write().await;
-            ctx.apply_next_block(block, local_time)?;
-
-            // Fire wallet hook BEFORE mempool update so receipt is stored
-            // before getMempoolSize can return 0. Works at any mining speed.
-            if let Some(hook) = &self.on_block_applied {
-                hook(block);
-            }
-        } // write lock released HERE — P2P handlers can now acquire chain lock
+            let chain_clone = self.chain.clone();
+            let block_owned = block.clone();
+            let hook = self.on_block_applied.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut ctx = chain_clone.blocking_write();
+                ctx.apply_next_block(&block_owned, local_time)?;
+                if let Some(h) = &hook {
+                    h(&block_owned);
+                }
+                Ok::<(), noid_chain::storage::MdbxContextError>(())
+            })
+            .await
+            .expect("apply_next_block panicked in spawn_blocking")
+            .map_err(anyhow::Error::from)?
+        } // write lock released here
 
         // --- Phase 2: build ChainView under read lock (shared, non-blocking) ---
         let confirmed: Vec<_> = block

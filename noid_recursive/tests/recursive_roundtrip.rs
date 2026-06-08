@@ -79,19 +79,35 @@ fn accumulator_genesis_deterministic() {
 #[test]
 fn accumulator_chain_hash_binds_header() {
     let genesis = genesis_accumulator([0u8; 32], [0u8; 32]);
-    let a = genesis.extend([1u8; 32], [10u8; 32], 1);
-    let b = genesis.extend([1u8; 32], [11u8; 32], 1);
+    let a = genesis.extend([1u8; 32], [10u8; 32], 1, Block128::ZERO);
+    let b = genesis.extend([1u8; 32], [11u8; 32], 1, Block128::ZERO);
     assert_ne!(a.chain_hash, b.chain_hash);
     assert_eq!(a.height, 1);
 }
 
 #[test]
+fn accumulator_chain_hash_binds_initial_claim() {
+    // Forging block_initial_claim = ZERO for a block with a real claim must
+    // produce a different chain_hash — the core S-2 fix.
+    let genesis = genesis_accumulator([0u8; 32], [0u8; 32]);
+    let real_claim = Block128::from(0xDEAD_BEEF_CAFE_1234u128);
+    let real = genesis.extend([1u8; 32], [10u8; 32], 1, real_claim);
+    let forged = genesis.extend([1u8; 32], [10u8; 32], 1, Block128::ZERO);
+    assert_ne!(
+        real.chain_hash, forged.chain_hash,
+        "null-witness substitution must be detectable via chain_hash divergence"
+    );
+    assert_eq!(real.height, forged.height);
+    assert_eq!(real.state_root, forged.state_root);
+}
+
+#[test]
 fn accumulator_state_root_binds() {
     let genesis = genesis_accumulator([0u8; 32], [0u8; 32]);
-    let a = genesis.extend([1u8; 32], [10u8; 32], 1);
-    let b = genesis.extend([2u8; 32], [10u8; 32], 1);
+    let a = genesis.extend([1u8; 32], [10u8; 32], 1, Block128::ZERO);
+    let b = genesis.extend([2u8; 32], [10u8; 32], 1, Block128::ZERO);
     assert_ne!(a.state_root, b.state_root);
-    assert_eq!(a.chain_hash, b.chain_hash); // same block_hash
+    assert_eq!(a.chain_hash, b.chain_hash); // same block_hash + same claim
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +204,8 @@ fn recursive_prove_verify_roundtrip_accumulator() {
         alloc_counter: 0,
     };
     let block_hash = hash_block_header(&block_header);
-    let new_acc = genesis.extend(block_header.state_root, block_hash, 1);
+    // Coinbase-only test block — block_initial_claim = ZERO.
+    let new_acc = genesis.extend(block_header.state_root, block_hash, 1, Block128::ZERO);
     assert_eq!(new_acc.height, 1);
     assert_eq!(new_acc.state_root, [0x42u8; 32]);
 }

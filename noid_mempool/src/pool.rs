@@ -6,6 +6,24 @@
 //! ## Architecture
 //!
 //! ```text
+//!  submit(TxIntent)
+//!    │
+//!    ├─ Phase 0 (no lock):  tx_body_hash consistency — O(1) hash, rejects garbage immediately
+//!    │
+//!    ├─ Phase 1 (lock, brief): all cheap checks on current view
+//!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
+//!    │   Extracts log_slots: u32 only — NO ChainView clone.
+//!    │   DoS guard: invalid txs rejected here, never reach ZK verify.
+//!    │
+//!    ├─ Phase 2 (no lock): ZK verify ~84ms, semaphore-bounded
+//!    │
+//!    └─ Phase 3 (lock): re-run all checks against current state (TOCTOU guard)
+//!                        anchor_height derived here → pool.admit
+//!
+//!  on_new_block() ──► [remove confirmed] ──► [evict expired] ──► [update chain view]
+//!
+//!  select_for_block() ──► fee-sorted list of MempoolEntry (verified txs only)
+//!
 //!  submit(TxIntent) ──► [fast native checks] ──► [admit] ──► [broadcast TxAdmitted]
 //!                                │                               │
 //!                                └── rejected → SubmitError     └── P2P gossip
@@ -139,49 +157,10 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
-        // Fast path + ZK view snapshot in a single lock acquisition.
-        let view_snap_opt = {
-            let st = self.state.lock().await;
-            if st.pool.contains(&intent.tx_body_hash) {
-                return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
-            }
-            if !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase {
-                Some(st.view.clone())
-            } else {
-                None
-            }
-        };
-
-        // ZK verify_logic before pool admission (CPU-heavy, outside lock).
-        if let Some(view_snap) = view_snap_opt {
-            let proof_bytes = intent.logic_proof_bytes.clone();
-            let tx_body_clone = intent.tx_body.clone();
-            let log_slots = view_snap.log_slots();
-
-            // Acquire a ZK verification permit — bounds concurrent CPU usage.
-            // If all workers are busy, this await yields until one finishes.
-            // Prevents DoS: attacker cannot saturate all CPU threads with invalid proofs.
-            let _permit = self
-                .zk_semaphore
-                .acquire()
-                .await
-                .map_err(|_| SubmitError::Internal("zk semaphore closed".into()))?;
-
-            let verify_result = tokio::task::spawn_blocking(move || {
-                zk_verify_intent(&tx_body_clone, &proof_bytes, log_slots)
-            })
-            .await
-            .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?;
-
-            // Permit released here (drop)
-            verify_result.map_err(|e| SubmitError::InvalidProof(e))?;
-        }
-
-        // --- Security: tx_body_hash consistency (fast, before lock) ---
-        // Verify the wire tx_body_hash matches the actual body.
-        // Defense-in-depth against hash-confusion attacks where a peer sends
-        // a TxIntent whose hash field doesn't match its body. The ZK proof
-        // already catches this, but only after CPU-heavy work.
+        // ── Phase 0: stateless sanity (no lock, no IO) ────────────────────
+        // One hash computation rejects malformed intents before touching any
+        // shared state.  Previously this ran after ZK verify — moved here so
+        // hash-confusion spam is free to reject.
         if !intent.tx_body.is_coinbase {
             use noid_tx::hash_tx_body;
             let computed = hash_tx_body(
@@ -198,71 +177,67 @@ impl AsyncMempool {
             }
         }
 
+        let needs_zk = !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase;
+
+        // ── Phase 1: cheap pre-filter (lock held briefly) ─────────────────
+        // Runs all O(1)–O(ANCHOR_DEPTH) checks on current state.
+        // Rejects invalid txs BEFORE ZK verify — the DoS guard.
+        // Extracts only `log_slots: u32`; avoids cloning ChainView
+        // (which carries SegmentedFriState + ~28 KB of recent headers).
+        let log_slots: u32 = {
+            let st = self.state.lock().await;
+            if st.pool.contains(&intent.tx_body_hash) {
+                return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
+            }
+            let tx = intent_to_transaction(&intent)?;
+            // All cheap checks. anchor_height is discarded here — re-derived
+            // under lock in Phase 3 against current state (TOCTOU safety).
+            let _ = run_admission_checks(&tx, &st)?;
+            st.view.log_slots()
+        }; // lock released — no ChainView clone
+
+        // ── Phase 2: ZK verify (CPU-heavy, outside lock, semaphore-bounded) ─
+        // Runs only when Phase 1 passed — invalid fee/anchor/slot txs are
+        // already gone.  Semaphore caps concurrent CPU threads.
+        if needs_zk {
+            let proof_bytes = intent.logic_proof_bytes.clone();
+            let tx_body_clone = intent.tx_body.clone();
+
+            let _permit = self
+                .zk_semaphore
+                .acquire()
+                .await
+                .map_err(|_| SubmitError::Internal("zk semaphore closed".into()))?;
+
+            tokio::task::spawn_blocking(move || {
+                zk_verify_intent(&tx_body_clone, &proof_bytes, log_slots)
+            })
+            .await
+            .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
+            .map_err(|e| SubmitError::InvalidProof(e))?;
+        }
+
+        // ── Phase 3: final admission under lock ───────────────────────────
+        // Re-run all cheap checks against CURRENT state: the chain may have
+        // advanced during the ~84 ms ZK verify window (new block → new
+        // nullifiers, spent slots, changed fee floor).  This is the
+        // authoritative check; Phase 1 was the DoS guard.
         let mut st = self.state.lock().await;
 
         let tx = intent_to_transaction(&intent)?;
         let hash = tx.tx_body_hash;
 
-        // --- Idempotent: already admitted ---
         if st.pool.contains(&hash) {
             return Err(SubmitError::AlreadyAdmitted(hash));
         }
 
-        // --- Step 0: dynamic fee floor ---
-        if !tx.body.is_coinbase {
-            let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
-            let required = st.floor.current().max(min_fee(n_outputs));
-            let actual = tx.body.fee.min(u64::MAX as u128) as u64;
-            if actual < required {
-                return Err(SubmitError::Consensus(
-                    noid_chain::consensus::ConsensusError::BelowMinFee { required, actual },
-                ));
-            }
-        }
-
-        // --- Step 1: basic consensus (fee overflow, body hash, anchor non-zero, nullifier) ---
-        validate_tx_consensus(&tx, &st.view.nullifiers)?;
-
-        // --- Step 2: epoch_anchor hash must be a known header within ANCHOR_DEPTH window ---
-        // Capture the anchor_height here so we can store it in MempoolEntry for precise expiry.
-        let anchor_height: u64 = if !tx.body.is_coinbase {
-            let anchor_hash = tx.body.epoch_anchor;
-            let tip = st.view.tip_height;
-            let lo = tip.saturating_sub(ANCHOR_DEPTH);
-            // find() returns the height whose header hash matches epoch_anchor.
-            let found = (lo..=tip).find(|&h| {
-                st.view
-                    .recent_headers
-                    .get(&h)
-                    .map(|hdr| full_block_hash(hdr) == anchor_hash)
-                    .unwrap_or(false)
-            });
-            match found {
-                Some(h) => h,
-                None => {
-                    return Err(SubmitError::Consensus(
-                        noid_chain::consensus::ConsensusError::BadEpochAnchor,
-                    ));
-                }
-            }
-        } else {
-            // Coinbase: no anchor, never expires via anchor_height mechanism.
-            u64::MAX
-        };
-
-        // --- Step 3: no slot conflict with admitted pool txs (O(1) via persistent sets) ---
-        check_slot_conflicts_with_pool(&tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
-
-        // --- Step 4: input slots live in state ---
-        check_input_slots(&tx, &st.view)?;
-
-        // --- Step 5: output slots empty in state ---
-        check_output_slots(&tx, &st.view)?;
+        // Re-derive anchor_height from current state (needed by pool.admit).
+        let anchor_height = run_admission_checks(&tx, &st)?;
 
         // --- Admit ---
         let fee = tx.body.fee.min(u64::MAX as u128) as u64;
-        let is_coinbase = tx.body.is_coinbase; // capture before move
-        let has_zk_proof = !intent.logic_proof_bytes.is_empty() && !is_coinbase;
+        let is_coinbase = tx.body.is_coinbase;
+        let has_zk_proof = needs_zk;
         let tip_height = st.view.tip_height;
         match st.pool.admit(tx.clone(), tip_height, anchor_height) {
             Ok(()) => {
@@ -288,24 +263,18 @@ impl AsyncMempool {
         }
 
         // Store wallet proof bundle bytes for miner block assembly.
-        // logic_proof_bytes = serialized WalletProofBundle (LogicProof + auth_slices).
-        // The miner deserializes these when building the ZK block proof.
         if !intent.logic_proof_bytes.is_empty() {
             st.pool.set_cached_proof(&hash, intent.logic_proof_bytes);
         }
 
-        // Update fee floor (coinbase exempt) and refresh counter.
         if !is_coinbase {
             st.floor.record(fee);
         }
-        // Broadcast (non-blocking: drop if no subscribers).
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
             fee,
             intent_bytes,
         });
-
-        // Broadcast pre-proved event (ZK verified at admission).
         if has_zk_proof {
             let _ = self.events.send(MempoolEvent::TxPreProved { hash });
         }
@@ -569,6 +538,71 @@ impl AsyncMempool {
     pub async fn update_chain_view(&self, view: ChainView) {
         self.state.lock().await.view = view;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: all cheap admission checks
+// ---------------------------------------------------------------------------
+
+/// Run every O(1)–O(ANCHOR_DEPTH) admission check against `st`.
+///
+/// Called **twice** per `submit`:
+/// - Phase 1 (pre-ZK DoS guard): rejects invalid txs before CPU-heavy work.
+/// - Phase 3 (post-ZK TOCTOU guard): final authority against current state.
+///
+/// Returns `anchor_height` (needed by `pool.admit` for expiry tracking).
+/// Phase 1 discards it; Phase 3 uses it.
+fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, SubmitError> {
+    // Step 0: dynamic fee floor.
+    if !tx.body.is_coinbase {
+        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
+        let required = st.floor.current().max(min_fee(n_outputs));
+        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        if actual < required {
+            return Err(SubmitError::Consensus(
+                noid_chain::consensus::ConsensusError::BelowMinFee { required, actual },
+            ));
+        }
+    }
+
+    // Step 1: basic consensus (fee overflow, body hash non-zero, anchor non-zero, nullifier).
+    validate_tx_consensus(tx, &st.view.nullifiers)?;
+
+    // Step 2: epoch_anchor must be a known header within ANCHOR_DEPTH window.
+    // Returns anchor_height for pool.admit expiry tracking.
+    let anchor_height: u64 = if !tx.body.is_coinbase {
+        let anchor_hash = tx.body.epoch_anchor;
+        let tip = st.view.tip_height;
+        let lo = tip.saturating_sub(ANCHOR_DEPTH);
+        let found = (lo..=tip).find(|&h| {
+            st.view
+                .recent_headers
+                .get(&h)
+                .map(|hdr| full_block_hash(hdr) == anchor_hash)
+                .unwrap_or(false)
+        });
+        match found {
+            Some(h) => h,
+            None => {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::BadEpochAnchor,
+                ));
+            }
+        }
+    } else {
+        u64::MAX
+    };
+
+    // Step 3: no slot conflict with currently admitted txs (O(inputs + outputs)).
+    check_slot_conflicts_with_pool(tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
+
+    // Step 4: input slots must be live in state.
+    check_input_slots(tx, &st.view)?;
+
+    // Step 5: output slots must be empty in state.
+    check_output_slots(tx, &st.view)?;
+
+    Ok(anchor_height)
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 //! **Complexity**: O(1) — the recursive proof is ~11 KB regardless of chain length.
 
 use noid_chain::{hash_block_header, BlockHeader};
+
 use noid_fri_binius::COMPACT_NUM_QUERIES;
 use noid_poseidon2b::native::compress;
 use noid_stark::interleaved::verify_air_interleaved;
@@ -74,8 +75,16 @@ pub fn verify_recursive_step(
     .map_err(|_| RecVerifyError::StarkInvalid)?;
 
     // 2. Verify accumulator transition.
+    //
+    // chain_hash = compress(prev, compress(H_BLOCK, claim_bytes))
+    // where claim_bytes = block_initial_claim as LE u128, zero-padded to 32 bytes.
+    // This binds `block_initial_claim` into the chain hash: a forger using a
+    // null-witness (ZERO) for a real-proof block would compute a different
+    // chain_hash than honest nodes, making the forgery detectable here.
     let block_hash = hash_block_header(block_header);
-    let expected_chain_hash = compress(&prev_acc.chain_hash, &block_hash);
+    let mut claim_bytes = [0u8; 32];
+    claim_bytes[..16].copy_from_slice(&proof.block_initial_claim.to_u128().to_le_bytes());
+    let expected_chain_hash = compress(&prev_acc.chain_hash, &compress(&block_hash, &claim_bytes));
 
     if proof.acc.chain_hash != expected_chain_hash {
         return Err(RecVerifyError::ChainHashMismatch);
@@ -97,12 +106,11 @@ pub fn verify_recursive_step(
 /// Verify the entire chain history in O(1).
 ///
 /// `expected_chain_hash`: when `Some`, `rec_proof_n.acc.chain_hash` is checked
-/// against this value. Pass `Some` only when all block headers from genesis are
-/// available in the snapshot (so the caller can independently compute the full
-/// chain hash by replaying `ChainAccumulator::extend`). When the snapshot covers
-/// only recent headers, pass `None` — PoW + chainwork validation is the primary
-/// guard. Once C2 is fully wired (BlockStateBindingAir), the STARK itself will
-/// prove chain-hash continuity and this will become unconditionally mandatory.
+/// against this value.  Because `chain_hash` now folds `block_initial_claim` into
+/// every step (see `ChainAccumulator::extend`), the caller must have computed
+/// `expected_chain_hash` via the same formula — including the real claim per block.
+/// Snapshot paths that lack historical `BlockProof` data pass `None`; the STARK
+/// itself and PoW validation are the primary guards in that case.
 pub fn verify_tip(
     rec_proof_n: &RecursiveBlockProof,
     rec_air: &dyn noid_air::Air,
@@ -251,10 +259,15 @@ mod tests {
 
     #[test]
     fn chain_hash_compress_matches_accumulator() {
+        use noid_core::Block128;
         let genesis = genesis_accumulator([0x11u8; 32], [0x22u8; 32]);
         let block_hash = [0x33u8; 32];
-        let extended = genesis.extend([0x44u8; 32], block_hash, 1);
-        let expected = compress(&genesis.chain_hash, &block_hash);
+        let claim = Block128::from(0xDEAD_BEEFu128);
+        let extended = genesis.extend([0x44u8; 32], block_hash, 1, claim);
+        // Reproduce the formula: compress(prev, compress(H_BLOCK, claim_bytes))
+        let mut claim_bytes = [0u8; 32];
+        claim_bytes[..16].copy_from_slice(&claim.to_u128().to_le_bytes());
+        let expected = compress(&genesis.chain_hash, &compress(&block_hash, &claim_bytes));
         assert_eq!(extended.chain_hash, expected);
     }
 }

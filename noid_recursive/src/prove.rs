@@ -106,24 +106,31 @@ pub fn prove_recursive_step(
     prev_acc: &ChainAccumulator,
     prev_rec_proof: Option<&RecursiveBlockProof>,
 ) -> RecursiveBlockProof {
-    // 1. Extend the rolling accumulator.
-    let block_hash = noid_chain::hash_block_header(block_header);
-    let acc_new = prev_acc.extend(block_header.state_root, block_hash, block_header.height);
-
-    // 2. Compute initial claims for extra_transcript FS binding.
+    // 1. Compute initial claims (needed for both accumulator extension and STARK proving).
     //
     // `block_initial_claim` = the real multipoint sumcheck target from `prove_block`.
-    // `rec_initial_claim`   = the multipoint target of the *previous* recursive STARK,
-    //                         derived by replaying its FS channel (zero at genesis).
+    // `rec_initial_claim`   = the multipoint target of the *previous* recursive STARK.
     //
     // Both are absorbed into the recursive STARK via `extra_transcript` before any
     // FS challenges are squeezed.  An attacker cannot forge a proof with different
     // values because the STARK's challenges would differ — binding the proof to
     // these specific initial claims (Fiat-Shamir security).
+    //
+    // `block_initial_claim` is also folded into `acc_new.chain_hash` so that the
+    // verifier can detect null-witness substitutions without accessing the BlockProof.
     let block_initial_claim = block_witness.block_initial_claim;
     let rec_initial_claim = prev_rec_proof
         .map(|p| derive_rec_initial_claim(p))
         .unwrap_or(Block128::ZERO);
+
+    // 2. Extend the rolling accumulator — now includes block_initial_claim.
+    let block_hash = noid_chain::hash_block_header(block_header);
+    let acc_new = prev_acc.extend(
+        block_header.state_root,
+        block_hash,
+        block_header.height,
+        block_initial_claim,
+    );
 
     // 3. Build the RecursiveBlockWitness from the pre-extracted block replay data.
     let rec_witness = build_recursive_block_witness(

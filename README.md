@@ -287,17 +287,29 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 
 ## No Block History
 
-Paranoid does not store block history. Blocks older than 18 are deleted after finalization. Only block **headers** (276 bytes each) are kept permanently — sufficient for the chain accumulator and PoW chain verification. The last 18 full blocks are kept for reorg resolution.
+Paranoid does not store block history. After FINALITY_DEPTH (18 blocks), full block data
+and BlockProofs are pruned. Only block **headers** (276 bytes each) are kept permanently.
 
-**Storage (1 block/12s, moderate volume):**
+**Permanent storage:**
 | Data | Size |
 |---|---|
-| Headers (permanent) | ~145 MB/year |
-| UTXO set (disk) | ~3 MB per 65,536 UTXOs (only populated segments stored) |
-| Recent blocks (last 18) | ~18 KB (constant) |
-| Nullifier window | ~few KB |
-| Recursive proof | 6.5 KB (single entry, overwrites) |
-| RAM | ~60–120 MB (jemalloc, small-state) |
+| Headers | ~145 MB/year (276 bytes × every block, forever) |
+| UTXO set | ~3 MB per 65,536 unspent outputs (populated segments only) |
+| Recursive proof | 6.5 KB (single entry, overwritten on each advance) |
+
+**Temporary storage (pruned after 18 blocks):**
+| Data | Size |
+|---|---|
+| Block bytes | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~750 KB (1024 txs) |
+| BlockProofs | 0 (coinbase-only) – ~19 MB per block at max capacity (1024 txs) |
+| Undo logs | ~few KB per block |
+| Nullifier window | ~few KB (last 144 blocks) |
+
+At any given time the node holds at most 18 blocks’ worth of block data + BlockProofs.
+A network at full capacity (1024 txs/block) peaks at ~18 × 20 MB ≈ 360 MB of temporary
+storage before pruning (750 KB block + ~19 MB BlockProof per block).
+
+| RAM | ~60–120 MB (jemalloc, small-state node) |
 
 ---
 

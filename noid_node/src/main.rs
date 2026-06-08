@@ -707,14 +707,13 @@ async fn main() -> anyhow::Result<()> {
 /// network to pass this check, making Eclipse attacks computationally infeasible.
 fn validate_snapshot_headers(
     recent_headers_bytes: &[Vec<u8>],
-    genesis_acc: &noid_recursive::ChainAccumulator,
-    proof_h: u64,
+    _genesis_acc: &noid_recursive::ChainAccumulator,
+    _proof_h: u64,
 ) -> Result<(Vec<noid_chain::block_header::BlockHeader>, Option<[u8; 32]>), String> {
     use noid_chain::block_header::BlockHeader;
     use noid_chain::consensus::difficulty::{add_work, block_work, work_gt};
     use noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK;
     use noid_chain::consensus::pow::{full_block_hash, validate_pow};
-    use noid_recursive::ChainAccumulator;
 
     // Parse and sort by height.
     let mut hdrs: Vec<BlockHeader> = recent_headers_bytes
@@ -779,23 +778,62 @@ fn validate_snapshot_headers(
         ));
     }
 
-    // If the oldest header is at height 0 we have a complete view from genesis
-    // and can compute the expected chain_hash by replaying the accumulator.
-    // Otherwise we cannot compute it (gap from genesis) and return None;
-    // the PoW + chainwork check above is the primary Eclipse protection.
-    let oldest_height = hdrs.first().map(|h| h.height).unwrap_or(u64::MAX);
-    let expected_chain_hash: Option<[u8; 32]> = if oldest_height == 0 {
-        let mut acc: ChainAccumulator = genesis_acc.clone();
-        for hdr in hdrs.iter().filter(|h| h.height <= proof_h) {
-            let bhash = full_block_hash(hdr);
-            acc = acc.extend(hdr.state_root, bhash, hdr.height);
-        }
-        Some(acc.chain_hash)
-    } else {
-        None
-    };
+    // The chain_hash formula now folds block_initial_claim into each step:
+    //   chain_hash_n = compress(prev, compress(H_BLOCK, claim_bytes_n))
+    //
+    // Replaying this from headers-only is no longer possible because
+    // block_initial_claim is part of the BlockProof (pruned after FINALITY_DEPTH
+    // and unavailable here).  We return None; the STARK in verify_tip provides
+    // the authoritative chain-validity guarantee.  The hardcoded genesis hash
+    // check above is still the primary Eclipse anchor.
+    Ok((hdrs, None))
+}
 
-    Ok((hdrs, expected_chain_hash))
+// ---------------------------------------------------------------------------
+// Blocking-I/O helpers
+// ---------------------------------------------------------------------------
+
+/// Apply a single block off the tokio executor.
+///
+/// `MdbxStore` is opened with `SyncMode::Durable` — every `commit_block`
+/// issues `fsync` before returning, a real blocking syscall.  Running it
+/// directly on a tokio worker stalls async scheduling for 1–100 ms;
+/// `spawn_blocking` offloads it to the dedicated blocking thread pool.
+async fn apply_block_offthread(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    block: noid_chain::block::Block,
+    local_time: u64,
+) -> Result<[u8; 32], noid_chain::storage::MdbxContextError> {
+    let chain = chain.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut ctx = chain.blocking_write();
+        ctx.apply_next_block(&block, local_time)
+    })
+    .await
+    .expect("apply_next_block panicked in spawn_blocking")
+}
+
+/// Apply a chain reorg off the tokio executor.  Same `fsync` rationale.
+///
+/// Returns `(result, new_blocks)` so the caller can iterate `new_blocks`
+/// in the success path without an extra clone.
+async fn apply_reorg_offthread(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    ancestor_height: u64,
+    new_blocks: Vec<noid_chain::block::Block>,
+    local_time: u64,
+) -> (
+    Result<noid_chain::consensus::ReorgResult, noid_chain::storage::MdbxContextError>,
+    Vec<noid_chain::block::Block>,
+) {
+    let chain = chain.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut ctx = chain.blocking_write();
+        let result = ctx.apply_reorg_mdbx(ancestor_height, &new_blocks, local_time);
+        (result, new_blocks) // return new_blocks so the caller can use them
+    })
+    .await
+    .expect("apply_reorg_mdbx panicked in spawn_blocking")
 }
 
 async fn handle_p2p_events(
@@ -968,14 +1006,12 @@ async fn handle_p2p_events(
                             continue;
                         }
 
-                        // Phase 1: Apply block under write lock (minimal hold time).
+                        // Phase 1: apply block off the async executor (MDBX fsync is blocking).
                         // Phase 2: Build ChainView under read lock (shared, non-blocking).
                         // This avoids holding the write lock during SegmentedFriState clone
                         // (~50ms at 256 segments), which was blocking all RPC/miner operations.
-                        let apply_result = {
-                            let mut ctx = chain.write().await;
-                            ctx.apply_next_block(&block, local_time)
-                        }; // write lock released
+                        let apply_result =
+                            apply_block_offthread(&chain, block.clone(), local_time).await;
                         let maybe_view = if apply_result.is_ok() {
                             let ctx = chain.read().await;
                             Some(ChainView::from_mdbx(&ctx))
@@ -1032,10 +1068,12 @@ async fn handle_p2p_events(
                                     next_hash =
                                         noid_chain::consensus::pow::full_block_hash(&orphan.header);
                                     // Write lock: apply only. Read lock: build view.
-                                    let orphan_result = {
-                                        let mut ctx = chain.write().await;
-                                        ctx.apply_next_block(&orphan, orphan_local_time)
-                                    };
+                                    let orphan_result = apply_block_offthread(
+                                        &chain,
+                                        orphan.clone(),
+                                        orphan_local_time,
+                                    )
+                                    .await;
                                     match orphan_result {
                                         Ok(_) => {
                                             let h = orphan.header.height;
@@ -1144,15 +1182,16 @@ async fn handle_p2p_events(
                                             );
 
                                             let local_time = unix_now();
-                                            // Write lock: reorg only. Read lock: build view.
-                                            let reorg_result = {
-                                                let mut ctx = chain.write().await;
-                                                ctx.apply_reorg_mdbx(
-                                                    ancestor_height,
-                                                    &new_chain,
-                                                    local_time,
-                                                )
-                                            }; // write lock released
+                                            // Reorg off the async executor (MDBX fsync is blocking).
+                                            // `new_chain` is returned from spawn_blocking to avoid
+                                            // an extra clone (used in the success path below).
+                                            let (reorg_result, new_chain) = apply_reorg_offthread(
+                                                &chain,
+                                                ancestor_height,
+                                                new_chain,
+                                                local_time,
+                                            )
+                                            .await;
                                             let maybe_reorg_view = if reorg_result.is_ok() {
                                                 let ctx = chain.read().await;
                                                 Some(ChainView::from_mdbx(&ctx))
