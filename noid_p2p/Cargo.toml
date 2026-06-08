@@ -13,6 +13,7 @@ libp2p       = { version = "0.54", features = [
     "gossipsub", "request-response", "cbor", "identify",
     "ping", "macros",
 ] }
+bincode  = "1"
 blake3   = "1"
 futures  = "0.3"
 tokio      = { workspace = true }

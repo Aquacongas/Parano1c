@@ -150,7 +150,9 @@ impl BlockStateBindingLayout {
     pub const fn n_cols(&self) -> usize {
         // 3 claim lanes + log_slots idx bits + 15 fixed columns
         // + log_slots eval_point + log_slots eq_ladder + 1 gamma_powers
-        // + 3 gp lanes + 3 acc lanes + n_slots row indicators + 1 acc_step
+        // + 3 gp lanes + 3 acc lanes + n_rows row indicators + 1 acc_step
+        // n_rows is FIXED per block (same log_rows for all segments),
+        // ensuring all state binding AIRs have identical n_cols.
         3 + self.log_slots + 15 + self.log_slots + self.log_slots + 1 + 3 + 3 + self.n_rows() + 1
     }
 
@@ -344,7 +346,13 @@ impl BlockStateBindingWitness {
     ) -> Self {
         let n_slots = claims.len();
         let log_slots = eval_point.len();
-        let log_rows = ceil_log2(n_slots.max(2));
+        // Minimum log_rows = TAU+1 = 9 (required by VSHIFT in the algebraic STARK).
+        // Using actual ceil_log2(n_slots) ensures the circuit is as small as possible
+        // while satisfying the constraint.  BLOCK_STATE_BINDING_LOG_ROWS=11 is the
+        // capacity limit, not the floor — using it for small claim counts wastes
+        // 2^11 row-indicator columns (64 MB trace) instead of ~2^9 (4 MB).
+        const VSHIFT_MIN_LOG_ROWS: usize = 9; // TAU+1 where TAU=8
+        let log_rows = ceil_log2(n_slots.max(2)).max(VSHIFT_MIN_LOG_ROWS);
         let layout = BlockStateBindingLayout {
             n_slots,
             log_rows,
@@ -566,7 +574,7 @@ impl BlockStateBindingWitness {
             cols[gp_col][row] = gamma_powers[row];
         }
 
-        // Row indicators (single-hot)
+        // Row indicators (single-hot) — one column per row in the trace.
         for r in 0..n_rows {
             let col = layout.col_row_indicator(r);
             let prog = row_indicator_programme(r, n_rows);
@@ -596,6 +604,10 @@ pub struct BlockStateBindingAir {
     n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
     public_columns: Vec<PublicColumn>,
+    /// Stored for FRI opening cross-check (Step 2).
+    pub eval_point: Vec<Block128>,
+    pub prev_lane_openings: [Block128; 3],
+    pub new_lane_openings: [Block128; 3],
 }
 
 impl BlockStateBindingAir {
@@ -609,7 +621,9 @@ impl BlockStateBindingAir {
     ) -> Self {
         let n_slots = claims.len();
         let log_slots = eval_point.len();
-        let log_rows = ceil_log2(n_slots.max(2));
+        // Minimum log_rows = TAU+1 = 9 (VSHIFT constraint). Use actual size.
+        const VSHIFT_MIN_LOG_ROWS: usize = 9;
+        let log_rows = ceil_log2(n_slots.max(2)).max(VSHIFT_MIN_LOG_ROWS);
         let layout = BlockStateBindingLayout {
             n_slots,
             log_rows,
@@ -1032,6 +1046,9 @@ impl BlockStateBindingAir {
             n_cols,
             constraints,
             public_columns,
+            eval_point: eval_point.to_vec(),
+            prev_lane_openings,
+            new_lane_openings,
         }
     }
 

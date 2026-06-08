@@ -22,7 +22,7 @@
 //! minting into `slot_j` is `slot_j ← new`. `apply_delta` applies a batch
 //! of such updates in place and returns the new root.
 
-use noid_core::{AdditiveNTT, Block128, TowerField};
+use noid_core::{Block128, TowerField};
 
 /// Segment size used by `SegmentedFriState`.
 /// Each segment independently holds and commits `2^LOG_SEGMENT_SIZE` slots.
@@ -30,12 +30,12 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 /// (one segment whose size is `2^log_slots`).
 pub const LOG_SEGMENT_SIZE: usize = 16;
 use noid_fri::channel::Channel;
-use noid_fri::hasher::Blake3Hasher;
-use noid_fri::prover::{
-    commit_fast as fri_commit_fast, prove as fri_prove, EvalProof, FriCommitment,
+use noid_fri_binius::{
+    absorb_cap, interleaved_commit, prove_mixed_opening, verify_mixed_opening,
+    InterleavedCommitment, MixedOpeningProof, COMPACT_NUM_QUERIES,
 };
-use noid_fri::verifier::verify as fri_verify;
-use noid_poseidon2b::native::{capacity_iv, Poseidon2bSponge, TAG_FRISTATE};
+use noid_poseidon2b::native::compress;
+use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
 /// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not
 /// a circuit-wide constant — the AIR and STARK transcript are
@@ -80,45 +80,34 @@ pub enum StateError {
     OpeningFailed,
 }
 
-/// A per-column FRI opening for a single slot.
+/// Batched FRI opening of all three state columns for one segment at an arbitrary eval point.
 ///
-/// `commitment.vector_commitment.root` re-derives the column's FRI root
-/// that also feeds into the combined `StateRoot`; the verifier checks
-/// that the claimed `value` is the evaluation of the committed MLE at
-/// the slot-index bit-decomposition, and that the combined
-/// `StateRoot` matches.
-#[derive(Debug, Clone)]
-pub struct SlotColumnOpening {
-    pub commitment: FriCommitment,
-    pub value: Block128,
-    pub proof: EvalProof,
-}
-
-/// A batched opening of a single slot across the three state columns.
+/// Uses the compact `noid_fri_binius` interleaved commitment scheme — the SAME scheme
+/// as the block-level FRI proof, enabling efficient Steps 2+3 of full proof-native.
 ///
-/// With segmented state (`log_slots > LOG_SEGMENT_SIZE`), the FRI opening
-/// targets the segment column (2^LOG_SEGMENT_SIZE elements at `local_idx`).
-/// `merkle_siblings` carries the Poseidon2b path from `seg_root` to
-/// `state_root` for the Kill-Shot proof.
-///
-/// With monolithic state (`log_slots <= LOG_SEGMENT_SIZE`), `segment_id = 0`,
-/// `local_idx = slot_index`, `merkle_siblings` is empty, and
-/// `seg_root == state_root`.
+/// For **slot openings** (`local_idx`-based), `eval_point` is the boolean hypercube
+/// encoding of `local_idx`; `slot_vals` are the actual slot values.
+/// For **MLE openings** (`eval_point` from `BlockStateBindingAir`), `slot_vals` are
+/// the batched MLE evaluations used in `prev/new_lane_openings`.
 #[derive(Debug, Clone)]
 pub struct SlotOpening {
     pub slot_index: u32,
     pub log_slots: usize,
-    /// Which segment `slot_index` belongs to (= slot_index >> effective_log_seg).
+    /// Segment `slot_index` belongs to (= slot_index >> effective_log_seg).
     pub segment_id: u16,
     /// Local index within the segment (= slot_index & (segment_size - 1)).
     pub local_idx: u16,
-    pub values: SlotColumnOpening,
-    pub owners_hi: SlotColumnOpening,
-    pub owners_lo: SlotColumnOpening,
-    /// FRI combined root for this segment alone.
+    /// Interleaved commitment to [values, owners_hi, owners_lo] columns.
+    /// `cap_to_seg_root_with_depth(commitment.cap, eff_log) == seg_root`.
+    pub commitment: InterleavedCommitment,
+    /// MLE evaluations `[value, owner_hi, owner_lo]` at `eval_point`.
+    pub slot_vals: [Block128; 3],
+    /// Mixed opening proof for the 3 columns at `eval_point`.
+    pub proof: MixedOpeningProof,
+    /// Compact FRI segment root: `cap_to_seg_root_with_depth(commitment.cap, eff_log)`.
     pub seg_root: StateRoot,
-    /// Poseidon2b Merkle siblings from seg_root up to state_root.
-    /// Empty when num_segments == 1 (single-segment / test mode).
+    /// Poseidon2b Merkle siblings from `seg_root` up to `state_root` (bottom-up).
+    /// Empty when `num_segments == 1` (single-segment / test mode).
     pub merkle_siblings: Vec<StateRoot>,
     /// Global state root at open time.
     pub state_root: StateRoot,
@@ -128,9 +117,9 @@ impl SlotOpening {
     /// Reconstruct the `SlotValue` that the opening claims.
     pub fn slot(&self) -> SlotValue {
         SlotValue {
-            value: self.values.value,
-            owner_hi: self.owners_hi.value,
-            owner_lo: self.owners_lo.value,
+            value: self.slot_vals[0],
+            owner_hi: self.slot_vals[1],
+            owner_lo: self.slot_vals[2],
         }
     }
 
@@ -215,25 +204,18 @@ impl FriState {
         self.apply_delta(&[(idx, v)])
     }
 
-    /// Compute (or return cached) state root. The root is
+    /// Compute (or return cached) state root.
     ///
-    /// ```text
-    /// Poseidon2bSponge::with_iv(capacity_iv(TAG_FRISTATE))
-    ///     .absorb( log_slots (LE u32, zero-padded to 32 bytes) )
-    ///     .absorb( fri_root(values) )
-    ///     .absorb( fri_root(owners_hi) )
-    ///     .absorb( fri_root(owners_lo) )
-    ///     .finalize()
-    /// ```
-    ///
-    /// Each column root is the FRI Merkle commitment of the column's
-    /// MLE evaluation vector over the hypercube — the same object the
-    /// transaction AIR will open (via sumcheck) during Stage 3.
+    /// Uses `noid_fri_binius::interleaved_commit` over the three columns,
+    /// then reduces the cap to a single 32-byte root via
+    /// `cap_to_seg_root`. This is the SAME scheme as `SegmentedFriState`
+    /// and as the block-level FRI proof, ensuring all commitments are
+    /// cryptographically consistent.
     pub fn root(&mut self) -> StateRoot {
         if let Some(r) = self.cached_root {
             return r;
         }
-        let r = combined_root(
+        let r = compute_segment_root(
             self.log_slots,
             &self.values,
             &self.owners_hi,
@@ -254,33 +236,30 @@ impl FriState {
         (&self.values, &self.owners_hi, &self.owners_lo)
     }
 
-    /// Open a single slot.
+    /// Open a single slot using compact FRI (same scheme as SegmentedFriState).
     ///
-    /// In the FriState (monolithic / single-segment) context, `segment_id = 0`,
-    /// `local_idx = idx`, and `merkle_siblings` is empty — the single-segment
-    /// degenerate case used by tests with small log_slots.
+    /// Monolithic / single-segment: `segment_id = 0`, `merkle_siblings = []`,
+    /// `seg_root == state_root`.
     pub fn open(&self, idx: u32) -> Result<SlotOpening, StateError> {
         if (idx as u64) >= self.num_slots() {
             return Err(StateError::SlotOutOfRange);
         }
         let point = eval_point_for_index(idx, self.log_slots);
-        let values = open_column(self.log_slots, &self.values, &point);
-        let owners_hi = open_column(self.log_slots, &self.owners_hi, &point);
-        let owners_lo = open_column(self.log_slots, &self.owners_lo, &point);
-        let seg_root = combine_roots(
+        let (commitment, slot_vals, proof, seg_root) = open_segment_at_point(
             self.log_slots,
-            &values.commitment.vector_commitment.root,
-            &owners_hi.commitment.vector_commitment.root,
-            &owners_lo.commitment.vector_commitment.root,
+            &self.values,
+            &self.owners_hi,
+            &self.owners_lo,
+            &point,
         );
         Ok(SlotOpening {
             slot_index: idx,
             log_slots: self.log_slots,
             segment_id: 0,
             local_idx: idx as u16,
-            values,
-            owners_hi,
-            owners_lo,
+            commitment,
+            slot_vals,
+            proof,
             seg_root,
             merkle_siblings: vec![],
             state_root: seg_root,
@@ -328,21 +307,6 @@ pub fn eval_point_for_local_index(local_idx: u16, log_size: usize) -> Vec<Block1
         .collect()
 }
 
-fn open_column(log_slots: usize, evals: &[Block128], point: &[Block128]) -> SlotColumnOpening {
-    let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
-    let commitment = fri_commit_fast(evals, &ntt);
-    let mut ch = Channel::new();
-    ch.observe_fri_commitment(&commitment);
-    let proof = fri_prove(evals, point, &ntt, &mut ch, &hasher);
-    let value = mle_eval_native(evals, point);
-    SlotColumnOpening {
-        commitment,
-        value,
-        proof,
-    }
-}
-
 fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
     let mut buf = evals.to_vec();
     for &r in point.iter().rev() {
@@ -355,44 +319,130 @@ fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
     buf[0]
 }
 
+/// Open all three segment columns at `point` using compact interleaved FRI.
+/// Returns `(commitment, slot_vals, proof, seg_root)`.
+///
+/// Used by both `FriState::open()` (boolean eval point = slot index) and
+/// `SegmentedFriState::open()` (same), and by Steps 2+3 of full proof-native
+/// (random eval point from `BlockStateBindingAir`).
+pub fn open_segment_at_point(
+    eff_log: usize,
+    values: &[Block128],
+    owners_hi: &[Block128],
+    owners_lo: &[Block128],
+    point: &[Block128],
+) -> (
+    InterleavedCommitment,
+    [Block128; 3],
+    MixedOpeningProof,
+    StateRoot,
+) {
+    // Use same padding as compute_segment_root for consistency.
+    let commit_log = eff_log.max(MIN_COMMIT_LOG);
+    let commit_n = 1usize << commit_log;
+    let pad = |col: &[Block128]| -> Vec<Block128> {
+        if col.len() < commit_n {
+            let mut v = col.to_vec();
+            v.resize(commit_n, Block128::ZERO);
+            v
+        } else {
+            col.to_vec()
+        }
+    };
+    let v = pad(values);
+    let h = pad(owners_hi);
+    let l = pad(owners_lo);
+
+    // Eval point must have commit_log dimensions (extend with zeros for padded columns).
+    // MLE(padded, [original_bits..., 0...]) == MLE(original, original_bits) because
+    // zero-padding means the upper half has all-zero values.
+    let padded_point: Vec<Block128> = {
+        let mut p = point.to_vec();
+        p.resize(commit_log, Block128::ZERO);
+        p
+    };
+
+    let ntt = noid_core::AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+    let cols: [&[Block128]; 3] = [&v, &h, &l];
+    let (commitment, prover_state) = interleaved_commit(&cols, &ntt, &hasher);
+    let seg_root = cap_to_seg_root_with_depth(&commitment.cap, eff_log);
+    let mut ch = Channel::new();
+    absorb_cap(&mut ch, &commitment.cap);
+    let proof = prove_mixed_opening(
+        &prover_state,
+        &padded_point,
+        &[],
+        &ntt,
+        &mut ch,
+        &hasher,
+        COMPACT_NUM_QUERIES,
+    );
+    // MLE values at the ORIGINAL point (not padded) — these are the actual slot values.
+    let slot_vals = [
+        mle_eval_native(values, point),
+        mle_eval_native(owners_hi, point),
+        mle_eval_native(owners_lo, point),
+    ];
+    (commitment, slot_vals, proof, seg_root)
+}
+
 /// Verify a single-slot opening against a claimed `StateRoot`.
 ///
 /// Steps:
-/// 1. Verify three per-column FRI openings at the segment-local eval point.
-/// 2. Re-derive `seg_root` from the per-column FRI roots and check it.
-/// 3. If `merkle_siblings` is non-empty, verify the Poseidon2b Merkle path
-///    from `seg_root` to `state_root`. Otherwise, assert `seg_root == state_root`.
+/// 1. Verify compact FRI batched opening of the 3 columns at the slot eval point.
+/// 2. Re-derive `seg_root = cap_to_seg_root(commitment.cap)` and check.
+/// 3. Verify Poseidon2b Merkle path `seg_root → state_root`.
 pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotValue, StateError> {
     if (op.slot_index as u64) >= (1u64 << op.log_slots) {
         return Err(StateError::SlotOutOfRange);
     }
     let eff_log = op.effective_log_seg();
-    // Step 1: FRI column openings at the segment-local eval point.
     let point = eval_point_for_local_index(op.local_idx, eff_log);
-    for col in [&op.values, &op.owners_hi, &op.owners_lo] {
-        if col.commitment.log_len != eff_log {
-            return Err(StateError::OpeningFailed);
-        }
-        let ntt = AdditiveNTT::<Block128>::new(eff_log + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
-        let mut ch = Channel::new();
-        ch.observe_fri_commitment(&col.commitment);
-        fri_verify(&point, col.value, col.proof.clone(), &ntt, &mut ch, &hasher)
-            .map_err(|_| StateError::OpeningFailed)?;
-    }
-    // Step 2: Verify seg_root.
-    let derived_seg_root: StateRoot = combine_roots(
-        eff_log,
-        &op.values.commitment.vector_commitment.root,
-        &op.owners_hi.commitment.vector_commitment.root,
-        &op.owners_lo.commitment.vector_commitment.root,
-    );
-    if derived_seg_root != op.seg_root {
+
+    // Step 1: Verify compact FRI batched opening.
+    // Use same padding/point extension as open_segment_at_point.
+    let commit_log = eff_log.max(MIN_COMMIT_LOG);
+    let padded_point: Vec<Block128> = {
+        let mut p = point.clone();
+        p.resize(commit_log, Block128::ZERO);
+        p
+    };
+    let ntt = noid_core::AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+    let mut ch = Channel::new();
+    absorb_cap(&mut ch, &op.commitment.cap);
+    let col_evals = verify_mixed_opening(
+        &op.commitment,
+        &padded_point,
+        &[],
+        &op.proof,
+        &ntt,
+        &mut ch,
+        &hasher,
+        COMPACT_NUM_QUERIES,
+    )
+    .map_err(|_| StateError::OpeningFailed)?;
+
+    // col_evals are at padded_point; slot_vals are at original point.
+    // For slot openings they're equal (MLE preserves values at lower hypercube).
+    // For MLE openings at random eval_point they're also equal by construction.
+    if col_evals.len() < 3
+        || col_evals[0] != op.slot_vals[0]
+        || col_evals[1] != op.slot_vals[1]
+        || col_evals[2] != op.slot_vals[2]
+    {
         return Err(StateError::OpeningFailed);
     }
-    // Step 3: Merkle path from seg_root to state_root.
+
+    // Step 2: seg_root must match commitment cap + eff_log.
+    let derived = cap_to_seg_root_with_depth(&op.commitment.cap, eff_log);
+    if derived != op.seg_root {
+        return Err(StateError::OpeningFailed);
+    }
+
+    // Step 3: Merkle path seg_root → state_root.
     if op.merkle_siblings.is_empty() {
-        // Single-segment: state_root IS the seg_root.
         if op.seg_root != *state_root {
             return Err(StateError::OpeningFailed);
         }
@@ -423,47 +473,76 @@ pub fn merkle_root_from_leaf(leaf: &StateRoot, seg_id: u16, siblings: &[StateRoo
 }
 
 // ---------------------------------------------------------------------------
-// Root computation
+// Root computation (compact FRI scheme)
 // ---------------------------------------------------------------------------
 
-fn column_root(log_slots: usize, evals: &[Block128]) -> [u8; 32] {
-    debug_assert_eq!(evals.len(), 1usize << log_slots);
-    let ntt = AdditiveNTT::<Block128>::new(log_slots + noid_fri::code::LOG_RATE);
-    let commitment = fri_commit_fast(evals, &ntt);
-    commitment.vector_commitment.root
-}
+/// Minimum log2(n) for `interleaved_commit` to be data-sensitive
+/// (cap_size = 2^MERKLE_CAP_DEPTH = 32 requires n >= 32).
+const MIN_COMMIT_LOG: usize = noid_fri_binius::MERKLE_CAP_DEPTH;
 
-/// Domain-separated Poseidon2b sponge over `log_slots` and the three
-/// per-lane FRI roots. Matches the in-circuit Stage 4c.3 combiner AIR
-/// (`noid_air::airs::fri_state_combiner`): both absorb the same
-/// `log_slots ‖ r_val ‖ r_hi ‖ r_lo` preimage under `TAG_FRISTATE` and
-/// must yield bit-identical 32-byte digests.
-pub fn combine_roots(
-    log_slots: usize,
-    r_val: &[u8; 32],
-    r_hi: &[u8; 32],
-    r_lo: &[u8; 32],
-) -> StateRoot {
-    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_FRISTATE));
-    let mut depth = [0u8; 32];
-    depth[..4].copy_from_slice(&(log_slots as u32).to_le_bytes());
-    sponge.update(&depth);
-    sponge.update(r_val);
-    sponge.update(r_hi);
-    sponge.update(r_lo);
-    sponge.finalize()
-}
-
-fn combined_root(
-    log_slots: usize,
+/// Compute the segment root from three column vectors using compact interleaved FRI.
+///
+/// `seg_root = cap_to_seg_root(interleaved_commit(padded_cols).cap)` where
+/// padding to `2^max(eff_log, MIN_COMMIT_LOG)` ensures the cap captures all data.
+/// For production (`eff_log=16`): no padding needed. For small test segments
+/// (`eff_log < 5`): zero-padded to 32 elements before commitment.
+pub fn compute_segment_root(
+    eff_log: usize,
     values: &[Block128],
     owners_hi: &[Block128],
     owners_lo: &[Block128],
 ) -> StateRoot {
-    let r_val = column_root(log_slots, values);
-    let r_hi = column_root(log_slots, owners_hi);
-    let r_lo = column_root(log_slots, owners_lo);
-    combine_roots(log_slots, &r_val, &r_hi, &r_lo)
+    let commit_log = eff_log.max(MIN_COMMIT_LOG);
+    let commit_n = 1usize << commit_log;
+    // Pad to commit_n if needed (zero-extends, preserves MLE on lower hypercube)
+    let pad = |col: &[Block128]| -> Vec<Block128> {
+        if col.len() < commit_n {
+            let mut v = col.to_vec();
+            v.resize(commit_n, Block128::ZERO);
+            v
+        } else {
+            col.to_vec()
+        }
+    };
+    let v = pad(values);
+    let h = pad(owners_hi);
+    let l = pad(owners_lo);
+    let ntt = noid_core::AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+    let cols: [&[Block128]; 3] = [&v, &h, &l];
+    let (commitment, _) = interleaved_commit(&cols, &ntt, &hasher);
+    cap_to_seg_root_with_depth(&commitment.cap, eff_log)
+}
+
+/// Reduce a compact FRI Merkle cap (always 2^`MERKLE_CAP_DEPTH` = 32 hashes)
+/// to a single 32-byte state root via pairwise Poseidon2b compression,
+/// then mix in `eff_log` for domain separation across segment sizes.
+///
+/// Including `eff_log` ensures states with different `log_slots` produce
+/// distinct roots even when all data is zero.
+pub fn cap_to_seg_root(cap: &noid_fri_binius::MerkleCap) -> StateRoot {
+    let mut layer: Vec<[u8; 32]> = cap.hashes.clone();
+    debug_assert!(!layer.is_empty() && layer.len().is_power_of_two());
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        for chunk in layer.chunks_exact(2) {
+            next.push(compress(&chunk[0], &chunk[1]));
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+/// Like `cap_to_seg_root` but mixes in the ORIGINAL `eff_log` so that
+/// empty segments of different depths produce distinct roots.
+///
+/// Use this everywhere a segment root is computed or verified.
+pub fn cap_to_seg_root_with_depth(cap: &noid_fri_binius::MerkleCap, eff_log: usize) -> StateRoot {
+    let base = cap_to_seg_root(cap);
+    // Mix eff_log into the root via one Poseidon2b compression.
+    let mut depth = [0u8; 32];
+    depth[..8].copy_from_slice(&(eff_log as u64).to_le_bytes());
+    compress(&base, &depth)
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +653,8 @@ mod tests {
         state.set_slot(1, sv(1)).unwrap();
         let root = state.root();
         let mut op = state.open(1).expect("open");
-        op.values.value += Block128::ONE;
+        // Tamper with the first slot_val — proof should no longer match.
+        op.slot_vals[0] += Block128::ONE;
         assert_eq!(verify_opening(&root, &op), Err(StateError::OpeningFailed));
     }
 

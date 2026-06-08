@@ -18,12 +18,16 @@
 //! `state_root` → different `header_core` → must redo PoW from scratch.
 //! This is Paranoid's block-withholding protection.
 
+use std::collections::HashSet;
+
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::pow::full_block_hash;
+use crate::fri_state::SlotValue;
 use crate::state::ChainState;
+use crate::state_binding::{BlockStateBinding, TxStateOpening};
 
 // ---------------------------------------------------------------------------
 // BlockTemplate
@@ -59,6 +63,9 @@ pub struct BlockTemplate {
     pub difficulty_target: Digest,
     /// Hash of parent block header.
     pub prev_block_hash: Digest,
+    /// Block-level state binding: pre-state slot openings + Merkle siblings.
+    /// `None` for coinbase-only blocks (no user transactions).
+    pub state_binding: Option<BlockStateBinding>,
 }
 
 impl BlockTemplate {
@@ -189,27 +196,55 @@ pub fn build_block_template(
     // 3. Apply non-coinbase txs to scratch state.
     let mut scratch = state.clone();
     if should_expand {
-        // expand() does not return a Result; it panics on invalid state.
         scratch.state.expand();
     }
 
-    // Apply txs one by one; exclude any that fail due to state conflicts
-    // (e.g. output slot occupied by a coinbase from a block mined between
-    // the wallet's proof and this template build). This is the standard
-    // "soft" tx exclusion used by all UTXO miners.
     let mut applied_winners: Vec<Transaction> = Vec::new();
     let ordered_winners = order_block_txs(winners);
     for tx in ordered_winners {
         match apply_tx(&mut scratch, &tx.body) {
             Ok(_) => applied_winners.push(tx),
-            Err(_e) => {
-                // Skip: output slot occupied by a recently confirmed block.
-                // The wallet must re-prove with fresh slot hints.
-                // (debug logging requires tracing crate — omitted from noid_chain)
-            }
+            Err(_e) => {}
         }
     }
     let ordered_winners = applied_winners;
+
+    // 3b. Build BlockStateBinding from pre-state slot values (Step 1).
+    // Read slot values from `state.state` (original, untouched by scratch).
+    let state_binding: Option<BlockStateBinding> = if ordered_winners.is_empty() {
+        None
+    } else {
+        let prev_state_root = parent.state_root;
+        let mut tx_openings = Vec::with_capacity(ordered_winners.len());
+        for tx in &ordered_winners {
+            let input_openings: Vec<SlotValue> = tx
+                .body
+                .inputs
+                .iter()
+                .filter(|i| i.valid)
+                .map(|i| state.state.slot(i.slot_index))
+                .collect();
+            let output_openings: Vec<SlotValue> = tx
+                .body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|_| SlotValue::EMPTY)
+                .collect();
+            tx_openings.push(TxStateOpening {
+                input_openings,
+                output_openings,
+            });
+        }
+        Some(BlockStateBinding {
+            tx_openings,
+            prev_state_root,
+            new_state_root: [0u8; 32], // patched below after coinbase
+            pre_seg_siblings: std::collections::HashMap::new(), // patched below
+            post_seg_siblings: std::collections::HashMap::new(), // patched below
+            tree_depth: 0,             // patched below
+        })
+    };
 
     // 4. Build coinbase transaction.
     // Find an empty slot for coinbase output using the allocator.
@@ -263,6 +298,38 @@ pub fn build_block_template(
 
     // 5. Compute final header fields.
     let state_root = scratch.state_root();
+    // Patch new_state_root + Merkle siblings into the binding (Step 1 + Step 3 data).
+    // scratch.state_root() flushes the tree, so merkle_siblings is valid now.
+    let state_binding = state_binding.map(|mut b| {
+        b.new_state_root = state_root;
+        let tree_depth = scratch.state.tree_depth();
+        b.tree_depth = tree_depth;
+        if tree_depth > 0 {
+            // Collect all touched segments from user txs and coinbase.
+            let eff = state.state.effective_log_segment_size();
+            let mut segs: HashSet<u16> = HashSet::new();
+            for tx in &ordered_winners {
+                for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+                    segs.insert((inp.slot_index >> eff) as u16);
+                }
+                for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                    segs.insert((out.slot_index >> eff) as u16);
+                }
+            }
+            for out in coinbase.body.outputs.iter().filter(|o| o.valid) {
+                segs.insert((out.slot_index >> eff) as u16);
+            }
+            for seg_id in segs {
+                // Pre-state: from original committed state (tree is flushed between blocks).
+                b.pre_seg_siblings
+                    .insert(seg_id, state.state.merkle_siblings(seg_id));
+                // Post-state: from scratch (tree flushed by state_root() above).
+                b.post_seg_siblings
+                    .insert(seg_id, scratch.state.merkle_siblings(seg_id));
+            }
+        }
+        b
+    });
     // Collect only tx_body_hashes to avoid cloning full Transaction objects.
     let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.tx_body_hash.0)
         .chain(ordered_winners.iter().map(|tx| tx.tx_body_hash.0))
@@ -300,6 +367,7 @@ pub fn build_block_template(
         miner_address,
         difficulty_target,
         prev_block_hash,
+        state_binding,
     })
 }
 

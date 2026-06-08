@@ -204,7 +204,7 @@ fn block_one_tx_roundtrip() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let proof = prove_block(prev_state_root, std::slice::from_ref(&witness), &[])
+    let proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
         .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
@@ -243,7 +243,7 @@ fn block_verify_rejects_tampered_epoch_anchor() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let mut proof = prove_block(prev_state_root, std::slice::from_ref(&witness), &[])
+    let mut proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
         .expect("honest prove_block must succeed");
 
     proof.tx_pis[0].epoch_anchor[0] ^= 0x01;

@@ -40,17 +40,14 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use noid_core::{AdditiveNTT, Block128, TowerField};
-use noid_fri::channel::Channel;
-use noid_fri::hasher::Blake3Hasher;
-use noid_fri::prover::{commit_fast as fri_commit_fast, prove as fri_prove};
+use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::compress;
 
 #[cfg(test)]
 use crate::fri_state::merkle_root_from_leaf;
 use crate::fri_state::{
-    combine_roots, eval_point_for_local_index, SlotColumnOpening, SlotOpening, SlotValue,
-    StateError, StateRoot, LOG_SEGMENT_SIZE,
+    compute_segment_root, eval_point_for_local_index, open_segment_at_point,
+    SlotOpening, SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -156,71 +153,26 @@ fn zero_segtree_table() -> &'static [[u8; 32]; MAX_SEGTREE_DEPTH + 1] {
 // Per-segment FRI root computation
 // ---------------------------------------------------------------------------
 
-/// Compute the FRI combined root of one segment.
+/// Compute the compact FRI segment root from three column vectors.
+/// Delegates to `compute_segment_root` in `fri_state.rs` — single source of truth.
 pub(crate) fn compute_seg_root(
     log_size: usize,
     values: &[Block128],
     owners_hi: &[Block128],
     owners_lo: &[Block128],
 ) -> StateRoot {
-    let r_val = column_fri_root(log_size, values);
-    let r_hi = column_fri_root(log_size, owners_hi);
-    let r_lo = column_fri_root(log_size, owners_lo);
-    combine_roots(log_size, &r_val, &r_hi, &r_lo)
+    compute_segment_root(log_size, values, owners_hi, owners_lo)
 }
 
-fn column_fri_root(log_size: usize, evals: &[Block128]) -> [u8; 32] {
-    debug_assert_eq!(evals.len(), 1 << log_size);
-    let ntt = AdditiveNTT::<Block128>::new(log_size + noid_fri::code::LOG_RATE);
-    let commitment = fri_commit_fast(evals, &ntt);
-    commitment.vector_commitment.root
-}
-
-/// FRI combined root for a zero segment of given log size (tests use small sizes).
+/// Compact FRI segment root for an all-zero segment of given log size.
 fn zero_seg_root_for(log_size: usize) -> StateRoot {
     if log_size == LOG_SEGMENT_SIZE {
         zero_segment_root_16()
     } else {
-        // Compute on-the-fly for non-standard sizes (only called from test paths).
         let n = 1 << log_size;
         let zeros = vec![Block128::ZERO; n];
         compute_seg_root(log_size, &zeros, &zeros, &zeros)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Open one segment column with a FRI proof
-// ---------------------------------------------------------------------------
-
-pub(crate) fn open_segment_column(
-    log_size: usize,
-    evals: &[Block128],
-    point: &[Block128],
-) -> SlotColumnOpening {
-    let ntt = AdditiveNTT::<Block128>::new(log_size + noid_fri::code::LOG_RATE);
-    let hasher = Blake3Hasher::new();
-    let commitment = fri_commit_fast(evals, &ntt);
-    let mut ch = Channel::new();
-    ch.observe_fri_commitment(&commitment);
-    let proof = fri_prove(evals, point, &ntt, &mut ch, &hasher);
-    let value = mle_eval_native(evals, point);
-    SlotColumnOpening {
-        commitment,
-        value,
-        proof,
-    }
-}
-
-fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
-    let mut buf = evals.to_vec();
-    for &r in point.iter().rev() {
-        let half = buf.len() / 2;
-        for i in 0..half {
-            buf[i] = buf[i] + r * (buf[i + half] + buf[i]);
-        }
-        buf.truncate(half);
-    }
-    buf[0]
 }
 
 // ---------------------------------------------------------------------------
@@ -637,9 +589,8 @@ impl SegmentedFriState {
     // FRI opening
     // -----------------------------------------------------------------------
 
-    /// Open one slot. The returned `SlotOpening` contains:
-    /// - FRI proofs for the three segment columns at the local eval point.
-    /// - Poseidon2b Merkle siblings for the Kill-Shot Merkle path.
+    /// Open one slot using compact interleaved FRI (all 3 columns in one proof).
+    /// The returned `SlotOpening` includes the Merkle path from seg_root to state_root.
     pub fn open(&mut self, idx: u32) -> Result<SlotOpening, StateError> {
         if (idx as u64) >= self.num_slots() {
             return Err(StateError::SlotOutOfRange);
@@ -647,16 +598,15 @@ impl SegmentedFriState {
         let seg_id = self.seg_id_of(idx);
         let local = self.local_idx_of(idx);
 
-        // Ensure seg_root is up to date before opening.
+        // Flush and snapshot segment root + siblings + state root.
         self.flush_segment(seg_id);
-        let sr = self.seg_roots[seg_id as usize].unwrap();
+        let seg_root_cached = self.seg_roots[seg_id as usize].unwrap();
         let siblings = self.merkle_siblings(seg_id);
-        let state_rt = self.root(); // also flushes tree if needed
+        let state_rt = self.root();
 
         let eff = self.effective_log_seg;
         let point = eval_point_for_local_index(local, eff);
 
-        // Clone the columns we need before borrowing self mutably again.
         let (vals_col, hi_col, lo_col) = {
             let cols = self.segment_columns(seg_id);
             (
@@ -666,19 +616,20 @@ impl SegmentedFriState {
             )
         };
 
-        let values = open_segment_column(eff, &vals_col, &point);
-        let owners_hi = open_segment_column(eff, &hi_col, &point);
-        let owners_lo = open_segment_column(eff, &lo_col, &point);
+        let (commitment, slot_vals, proof, seg_root) =
+            open_segment_at_point(eff, &vals_col, &hi_col, &lo_col, &point);
+        // seg_root from open_segment_at_point == seg_root_cached (same columns, same scheme)
+        debug_assert_eq!(seg_root, seg_root_cached);
 
         Ok(SlotOpening {
             slot_index: idx,
             log_slots: self.log_slots,
             segment_id: seg_id,
             local_idx: local,
-            values,
-            owners_hi,
-            owners_lo,
-            seg_root: sr,
+            commitment,
+            slot_vals,
+            proof,
+            seg_root,
             merkle_siblings: siblings,
             state_root: state_rt,
         })

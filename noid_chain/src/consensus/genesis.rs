@@ -62,15 +62,16 @@ pub fn genesis_state_root() -> [u8; 32] {
 }
 
 /// Pre-computed genesis state root. All 2^24 slots are zero.
+/// Computed via compact interleaved FRI (`noid_fri_binius`).
 const GENESIS_STATE_ROOT: [u8; 32] = [
-    0x11, 0x34, 0x93, 0x89, 0x2a, 0x05, 0x33, 0x28, 0x9a, 0x8c, 0xda, 0x0c, 0xac, 0xea, 0xc6, 0xff,
-    0xde, 0x9f, 0x1f, 0x18, 0x18, 0x71, 0xfc, 0x89, 0x92, 0x19, 0xa2, 0x75, 0x96, 0x12, 0x10, 0xcc,
+    0x75, 0x23, 0x23, 0x33, 0xe5, 0xd8, 0x1a, 0x01, 0x2a, 0xd1, 0xed, 0x0d, 0x08, 0x83, 0x09, 0x19,
+    0xf9, 0x2a, 0x1a, 0x73, 0x77, 0xc6, 0x09, 0x49, 0x90, 0xc9, 0x3e, 0xbf, 0xce, 0xa2, 0x60, 0x03,
 ];
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
-/// Found by searching nonces sequentially; nonce=2 is the first valid value.
-const GENESIS_NONCE: u128 = 53_490_382;
+/// Recomputed after GENESIS_TARGET changed to 2^229 (halved difficulty).
+const GENESIS_NONCE: u128 = 47_741_201;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -115,6 +116,48 @@ mod tests {
             genesis_state_root(),
             "hardcoded GENESIS_STATE_ROOT must match SegmentedFriState::new_empty(24).root()"
         );
+    }
+
+    /// Print the new genesis state root and a valid nonce for it.
+    /// Run with: cargo test -p noid_chain --lib -- consensus::genesis::tests::print_new_genesis --nocapture
+    #[test]
+    fn print_new_genesis() {
+        use crate::segmented_state::SegmentedFriState;
+        let mut state = SegmentedFriState::new_empty(24);
+        let new_root = state.root();
+        println!("\nNew GENESIS_STATE_ROOT:");
+        print!("const GENESIS_STATE_ROOT: [u8; 32] = [");
+        for (i, b) in new_root.iter().enumerate() {
+            if i % 16 == 0 {
+                print!("\n    ");
+            }
+            print!("0x{:02x}, ", b);
+        }
+        println!("\n];");
+        let new_nonce = find_genesis_nonce_for(&new_root);
+        println!("New GENESIS_NONCE: {}", new_nonce);
+    }
+
+    fn find_genesis_nonce_for(state_root: &[u8; 32]) -> u128 {
+        use crate::block_header::BlockHeader;
+        use crate::consensus::params::{GENESIS_TARGET, LOG_SLOTS_GENESIS};
+        use crate::consensus::pow::search_pow;
+        let h = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: *state_root,
+            tx_root: [0u8; 32],
+            timestamp: GENESIS_TIMESTAMP,
+            height: 0,
+            miner_address: GENESIS_BURN_ADDRESS,
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            proof_transcript_hash: [0x01u8; 32],
+            witness_root: [0u8; 32],
+            log_slots: LOG_SLOTS_GENESIS,
+            active_slot_count: 0,
+            alloc_counter: 0,
+        };
+        search_pow(&h, 0, 200_000_000).expect("genesis target is trivially satisfiable")
     }
 
     #[test]

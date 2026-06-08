@@ -247,7 +247,7 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
 
     // Block Prove (this is ONLY block-prover work; wallet proofs are pre-built)
     let t0 = Instant::now();
-    let block_proof = prove_block(prev_state_root, &witnesses, &[]).expect("prove_block");
+    let block_proof = prove_block(prev_state_root, [0u8; 32], &witnesses, &[]).expect("prove_block");
     let prove_time = t0.elapsed();
 
     // Block Verify

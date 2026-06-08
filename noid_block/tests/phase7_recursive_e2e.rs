@@ -213,7 +213,7 @@ fn phase7_recursive_step_and_verify_tip() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let block_proof = prove_block(prev_state_root, std::slice::from_ref(&witness), &[])
+    let block_proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
         .expect("prove_block must succeed");
 
     // ----- Build a minimal block header -----

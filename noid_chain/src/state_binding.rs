@@ -31,6 +31,8 @@
 //! After all txs are processed, the final state root must equal the
 //! block header's declared `new_state_root`.
 
+use std::collections::HashMap;
+
 use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{compute_claims_commitment, TxBody, TxInput, TxOutput};
@@ -90,6 +92,13 @@ pub struct BlockStateBinding {
     pub prev_state_root: StateRoot,
     /// State root after all txs are applied.
     pub new_state_root: StateRoot,
+    /// Poseidon2b Merkle siblings for each dirty segment at PRE-state (Step 3).
+    /// Key = seg_id. Empty when `num_segments == 1` (single-segment / test mode).
+    pub pre_seg_siblings: HashMap<u16, Vec<StateRoot>>,
+    /// Poseidon2b Merkle siblings for each dirty segment at POST-state (Step 3).
+    pub post_seg_siblings: HashMap<u16, Vec<StateRoot>>,
+    /// Depth of the segment Merkle tree (= log2(num_segments)). 0 = single-segment.
+    pub tree_depth: usize,
 }
 
 impl BlockStateBinding {
@@ -127,10 +136,15 @@ impl BlockStateBinding {
 
         let new_state_root = state.root();
 
+        // Merkle siblings require access to the pre-state tree (before mutation).
+        // build_block_template() populates them after coinbase apply.
         Ok(Self {
             tx_openings,
             prev_state_root,
             new_state_root,
+            pre_seg_siblings: HashMap::new(),
+            post_seg_siblings: HashMap::new(),
+            tree_depth: 0,
         })
     }
 

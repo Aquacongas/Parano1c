@@ -26,8 +26,8 @@
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
 //!  ❌  da_root / witness_root binding (needs packed DA data)
 
-use crate::block::apply_block;
 use crate::block::Block;
+use crate::block::apply_block;
 use crate::block_header::BlockHeader;
 use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
@@ -50,27 +50,89 @@ pub struct AnchorInfo {
     pub anchor_target: [u8; 32],
 }
 
+/// Run all native consensus checks WITHOUT applying the state transition.
+///
+/// Use this as the first step of the full-proof-native validation path:
+///   1. `validate_block_checks()` — header + tx checks (no MDBX reads)
+///   2. `verify_block(BlockProof)` — ZK proof verification
+///   3. `apply_state_delta()` — write delta to MDBX (no pre-state reads)
+///
+/// Note: does NOT check `state_root` (that’s done by ZK Step 2+3).
+/// Does NOT check `active_slot_count` / `alloc_counter` (done by `apply_state_delta`).
+pub fn validate_block_checks(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: u64,
+    anchor: &AnchorInfo,
+    nullifiers: &NullifierSet,
+) -> Result<(), ConsensusError> {
+    validate_header(
+        &block.header,
+        parent,
+        prev_timestamps,
+        local_time,
+        anchor.anchor_height,
+        anchor.anchor_timestamp,
+        &anchor.anchor_target,
+    )?;
+    {
+        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
+        let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
+        let median_active = if prev_active_counts.is_empty() {
+            parent.active_slot_count
+        } else {
+            median_u64(prev_active_counts)
+        };
+        let trigger =
+            median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
+        let expected = if trigger {
+            parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
+        } else {
+            parent.log_slots
+        };
+        if block.header.log_slots != expected {
+            return Err(ConsensusError::BadLogSlotsExpansion);
+        }
+    }
+    if block.transactions.len() > BLOCK_MAX_TXS {
+        return Err(ConsensusError::TooManyTxs);
+    }
+    validate_block_slot_conflicts(&block.transactions)?;
+    for tx in &block.transactions {
+        validate_tx_consensus_skip_hash(tx, nullifiers)?;
+    }
+    if let Some(cb) = block.transactions.first() {
+        if cb.body.is_coinbase {
+            let cb_value: u64 = cb
+                .body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.value)
+                .fold(0u64, |a, v| a.saturating_add(v));
+            let fee_sum: u64 = block
+                .transactions
+                .iter()
+                .filter(|tx| !tx.body.is_coinbase)
+                .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
+                .fold(0u64, |a, f| a.saturating_add(f));
+            let max_allowed = max_coinbase_value_from_fee_sum(block.header.log_slots, fee_sum);
+            if cb_value > max_allowed {
+                return Err(ConsensusError::InflatedCoinbase);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate all native consensus rules for a block and apply it to `state`.
 ///
-/// On success, `state` is updated to the post-block state and the function
-/// returns the post-state root. On failure, `state` is left **unchanged**.
+/// **Legacy / non-ZK path.** For the ZK-verified path, use:
+///   `validate_block_checks` + `verify_block(BlockProof)` + `apply_state_delta`.
 ///
-/// # Arguments
-/// - `block`: candidate block
-/// - `parent`: parent block header
-/// - `prev_timestamps`: timestamps of the last ≤11 ancestors (oldest first)
-/// - `prev_active_counts`: `active_slot_count` from the last ≤`EXPANSION_WINDOW`
-///   finalised headers (oldest first). Used for the median expansion trigger.
-///   Pass `&[parent.active_slot_count]` when only the parent is known.
-/// - `local_time`: current wall-clock seconds (for future-drift check)
-/// - `anchor`: ASERT epoch anchor for difficulty computation
-/// - `nullifiers`: rolling nullifier set (last ANCHOR_DEPTH blocks)
-/// - `state`: chain state to apply to (modified on success)
-///
-/// # What this does NOT check
-///
-/// ZK proofs (LogicProof, BlockStateBinding, BlockProof) are verified by
-/// `noid_block::validate_block_full()` which calls this function internally.
+/// On success, `state` is updated. On failure, `state` is left unchanged.
 pub fn validate_block_consensus(
     block: &Block,
     parent: &BlockHeader,

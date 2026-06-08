@@ -16,10 +16,13 @@
 //! 2. First `TxAdmitted` while prove is done (Sealed state — semaphore free, PoW still running)
 //! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
 
+use std::collections::HashMap;
+
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::next_target;
 use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
+use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
@@ -56,9 +59,11 @@ pub struct BlockTemplate {
     /// Parent header.
     pub parent: BlockHeader,
     /// Cached WalletProofBundle bytes for each non-coinbase tx (same order as inner.txs).
-    /// `None` when a tx was admitted without a proof (e.g. external miner submission).
-    /// Used by the ZK block prover; blocks without bundles fall back to marker hashes.
     pub proof_bytes: Vec<Option<Vec<u8>>>,
+    /// Pre-state segment columns for every segment touched by this block's transactions.
+    /// Captured at template-build time (before `apply_block`), keyed by seg_id.
+    /// Used by the ZK block prover for FRI state openings (Step 2).
+    pub pre_segs: HashMap<u16, SegmentColumns>,
 }
 
 impl BlockTemplate {
@@ -160,14 +165,37 @@ impl TemplateBuilder {
             timestamp,
             difficulty_target,
         ) {
-            Ok(inner) => Some(BlockTemplate {
-                inner,
-                difficulty_target,
-                miner_address,
-                timestamp,
-                parent,
-                proof_bytes,
-            }),
+            Ok(inner) => {
+                // Capture pre-state columns for Step 2 FRI openings.
+                let eff_log = ctx.state.state.effective_log_segment_size();
+                let mut touched_segs = std::collections::HashSet::new();
+                for tx in inner.txs.iter().chain(std::iter::once(&inner.coinbase)) {
+                    for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+                        touched_segs.insert((inp.slot_index >> eff_log) as u16);
+                    }
+                    for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                        touched_segs.insert((out.slot_index >> eff_log) as u16);
+                    }
+                }
+                let mut pre_segs: HashMap<u16, SegmentColumns> =
+                    HashMap::with_capacity(touched_segs.len());
+                for seg_id in touched_segs {
+                    let cols = match ctx.store.get_segment(seg_id) {
+                        Ok(Some((_eff, c))) => c,
+                        _ => SegmentColumns::new_zero(1usize << eff_log),
+                    };
+                    pre_segs.insert(seg_id, cols);
+                }
+                Some(BlockTemplate {
+                    inner,
+                    difficulty_target,
+                    miner_address,
+                    timestamp,
+                    parent,
+                    proof_bytes,
+                    pre_segs,
+                })
+            }
             Err(e) => {
                 tracing::warn!("template build failed: {:?}", e);
                 None

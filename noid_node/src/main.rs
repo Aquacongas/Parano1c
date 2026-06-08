@@ -52,21 +52,45 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 // CLI
 // ---------------------------------------------------------------------------
 
+/// Operating mode for the full node.
+///
+/// Exactly one mode must be active. The default is `relay`.
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum NodeMode {
+    /// Relay node (default). No mining, no block-template serving.
+    /// Verifies all blocks (ZK + PoW), serves state snapshots and
+    /// recursive proofs to peers. Suitable for exchanges, explorers,
+    /// and infrastructure operators.
+    #[default]
+    Relay,
+    /// Internal miner. Runs built-in PoW + ZK proving in parallel.
+    /// Blocks external miner (extminer) access to the block-template API.
+    Miner,
+    /// External miner mode. Serves `getBlockTemplate` / `submitBlock`
+    /// to `noid-extminer` clients. Requires `--mining-key`. Internal
+    /// PoW miner is disabled.
+    Extminer,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "paranoid",
     about = "Paranoid full node daemon — proof-native UTXO blockchain",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a Paranoid full node.\n\nExample:\n  paranoid --mine --data-dir ~/.paranoid\n  paranoid --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
+    long_about = "Run a Paranoid full node.\n\nExample:\n  paranoid --mode miner --data-dir ~/.paranoid\n  paranoid --mode relay --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
 )]
 struct Cli {
     /// Path to TOML config file (optional).
     #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// Enable built-in PoW miner.
-    #[arg(long)]
-    mine: bool,
+    /// Node operating mode.
+    ///
+    /// relay    — full node, no mining (default)
+    /// miner    — internal PoW + ZK prover; blocks extminer access
+    /// extminer — serves block templates to noid-extminer; requires --mining-key
+    #[arg(long, value_enum, default_value_t = NodeMode::Relay)]
+    mode: NodeMode,
 
     /// Bootstrap a new network: start mining immediately without waiting for peers.
     /// Use ONLY for the very first node on a fresh network.
@@ -129,15 +153,6 @@ struct Cli {
     ///   # Miner: getBlockTemplate("noid1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
-
-    /// Disable the difficulty floor for fast local testing.
-    ///
-    /// Without this flag ASERT cannot ease below GENESIS_TARGET (mainnet behaviour).
-    /// With this flag ASERT eases freely to MAX_TARGET: with yesterday's genesis
-    /// timestamp blocks arrive in under a millisecond, making stress tests fast.
-    /// Also lowers the snapshot chainwork threshold to match testnet block work.
-    #[arg(long)]
-    testnet: bool,
 }
 
 /// Resolve a seed string to a libp2p Multiaddr.
@@ -245,10 +260,18 @@ async fn main() -> anyhow::Result<()> {
         .compact() // single-line events
         .init();
 
-    // --- Testnet mode: disable difficulty floor for fast local testing ---
-    if cli.testnet {
-        noid_chain::consensus::difficulty::set_testnet_mode();
-        tracing::warn!("--testnet: difficulty floor disabled (blocks ease to MAX_TARGET)");
+    // --- Mode validation ---
+    if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
+        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+    }
+    if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
+        tracing::warn!(
+            "--mining-key is ignored in --mode miner (internal miner needs no bearer token)"
+        );
+    }
+    // allow_custom_coinbase only makes sense with extminer mode
+    if cli.allow_custom_coinbase && cli.mode != NodeMode::Extminer {
+        anyhow::bail!("--allow-custom-coinbase requires --mode extminer");
     }
 
     // --- Network ---
@@ -268,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.data_dir {
         cfg.storage.path = dir;
     }
-    if cli.mine {
+    if cli.mode == NodeMode::Miner {
         cfg.mining.enabled = true;
     }
     if let Some(addr) = cli.miner_address {
@@ -511,6 +534,7 @@ async fn main() -> anyhow::Result<()> {
                 match miner_rx.recv().await {
                     Ok(noid_miner::MinerEvent::BlockFound {
                         block_bytes,
+                        block_proof_bytes,
                         height,
                         hash,
                         n_txs,
@@ -523,9 +547,12 @@ async fn main() -> anyhow::Result<()> {
                             "broadcast block"
                         );
                         // Wallet update already done in apply_found_block via hook.
-                        // Here we only need to broadcast to peers.
+                        // Broadcast block + proof so all peers can verify ZK.
                         let _ = p2p_block_relay
-                            .send(noid_p2p::NetworkCommand::BroadcastBlock { block_bytes })
+                            .send(noid_p2p::NetworkCommand::BroadcastBlock {
+                                block_bytes,
+                                block_proof_bytes,
+                            })
                             .await;
                     }
                     Ok(noid_miner::MinerEvent::ProveFailed { height, error }) => {
@@ -551,8 +578,9 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Background Recursive Proof Updater (P.19) ---
     let rec_chain = chain.clone();
+    let rec_p2p_cmd = p2p.cmd_tx.clone();
     tokio::spawn(async move {
-        run_recursive_proof_updater(rec_chain).await;
+        run_recursive_proof_updater(rec_chain, rec_p2p_cmd).await;
     });
 
     // --- Startup Banner ---
@@ -734,19 +762,11 @@ fn validate_snapshot_headers(
 
     // Cumulative chainwork check.
     //
-    // Mainnet: MIN_SNAPSHOT_CHAINWORK = 2^27 = block_work(GENESIS_TARGET).
-    //   Every real block contributes ≥2^27 (floor enforced by next_target).
-    //   155 fake blocks at trivial difficulty → work=155 ≪ 2^27 → FAILS.
-    //
-    // Testnet (--testnet, floor disabled): ASERT eases to MAX_TARGET so
-    //   block_work(MAX_TARGET) = 1. Use threshold = 0 so any snapshot passes.
-    //   Security still comes from PoW-per-header and genesis-hash checks above;
-    //   the chainwork number is just not meaningful for trivial-difficulty chains.
-    let min_chainwork: [u8; 32] = if noid_chain::consensus::difficulty::is_testnet_mode() {
-        [0u8; 32] // zero threshold: any chainwork > 0 passes (testnet)
-    } else {
-        MIN_SNAPSHOT_CHAINWORK
-    };
+    // Every real block contributes ≥ block_work(GENESIS_TARGET) because the
+    // difficulty floor is always active (ASERT never eases below GENESIS_TARGET).
+    // An attacker serving a fake snapshot with trivial-difficulty headers cannot
+    // accumulate enough chainwork to pass this threshold.
+    let min_chainwork: [u8; 32] = MIN_SNAPSHOT_CHAINWORK;
     let mut work = [0u8; 32];
     for hdr in &hdrs {
         work = add_work(&work, &block_work(&hdr.difficulty_target));
@@ -856,7 +876,11 @@ async fn handle_p2p_events(
 
     loop {
         match rx.recv().await {
-            Ok(NetworkEvent::NewBlock { from, block_bytes }) => {
+            Ok(NetworkEvent::NewBlock {
+                from,
+                block_bytes,
+                block_proof_bytes,
+            }) => {
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
                 {
@@ -883,6 +907,66 @@ async fn handle_p2p_events(
                     Ok(block) => {
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+
+                        // ZK proof verification (when proof bytes are present).
+                        //
+                        // For coinbase-only blocks (empty proof) this is skipped entirely.
+                        // For user-tx blocks: verify_block checks ZK correctness before
+                        // we commit to the chain. The spend_secret is NOT needed — all
+                        // inputs are reconstructed from public wire data (owner, auth_tag).
+                        //
+                        // Important: verify_block is called under a READ lock so it does
+                        // NOT modify the chain state. apply_next_block (below) then applies
+                        // the block under a WRITE lock once ZK is confirmed valid.
+                        let zk_reject = if !block_proof_bytes.is_empty() {
+                            match bincode::deserialize::<noid_block::BlockProof>(&block_proof_bytes)
+                            {
+                                Ok(proof) => {
+                                    let ctx = chain.read().await;
+                                    let spine = noid_block::build_spine_inputs_list(&block);
+                                    let auth = noid_block::build_auth_public_list(&block, &proof);
+                                    let sb_airs = noid_block::build_state_binding_airs(
+                                        &block,
+                                        &proof,
+                                        &ctx.state.state,
+                                    );
+                                    drop(ctx);
+                                    let tx_airs = noid_block::build_tx_airs(&block);
+                                    let air_refs: Vec<&dyn noid_air::Air> =
+                                        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
+                                    let sb_refs: Vec<
+                                        &noid_air::airs::block_state_binding::BlockStateBindingAir,
+                                    > = sb_airs.iter().collect();
+                                    match noid_block::verify_block(
+                                        &air_refs, &proof, &spine, &auth, &sb_refs,
+                                    ) {
+                                        Ok(()) => None,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                peer = %from,
+                                                height = block.header.height,
+                                                err = ?e,
+                                                "P2P block ZK proof invalid — rejected"
+                                            );
+                                            Some(())
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %from,
+                                        err = ?e,
+                                        "P2P block proof deserialize failed"
+                                    );
+                                    Some(())
+                                }
+                            }
+                        } else {
+                            None // no proof bytes — coinbase-only, skip ZK check
+                        };
+                        if zk_reject.is_some() {
+                            continue;
+                        }
 
                         // Phase 1: Apply block under write lock (minimal hold time).
                         // Phase 2: Build ChainView under read lock (shared, non-blocking).
@@ -912,6 +996,21 @@ async fn handle_p2p_events(
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
+
+                                // Store the BlockProof bytes so run_recursive_proof_updater
+                                // can build a real (non-null) recursive witness for this block.
+                                if !block_proof_bytes.is_empty() {
+                                    let ctx = chain.read().await;
+                                    if let Err(e) =
+                                        ctx.store.put_block_proof(height, &block_proof_bytes)
+                                    {
+                                        tracing::warn!(
+                                            height,
+                                            err = %e,
+                                            "failed to store received block proof"
+                                        );
+                                    }
+                                }
 
                                 // Auto-continue sync: immediately request the next batch from
                                 // the same peer. This pulls the chain all the way to the peer's
@@ -1611,9 +1710,10 @@ async fn handle_p2p_events(
                         };
 
                         if proof_h + 1 == snap_tip_h {
-                            // ── Mode A: FULL verify_tip ──────────────────────────────────────
-                            // Proof covers exactly tip-1: use O(1) verify_tip for complete
-                            // cryptographic verification of the entire chain history.
+                            // ── ChainProof: recursive proof covers full chain to tip-1 ─────
+                            // The stored RecursiveProof is exactly one step behind the
+                            // snapshot tip.  `verify_tip` performs O(1) cryptographic
+                            // verification of the entire chain history from genesis.
                             let tip_prev_state_root = if snap_tip_h == 0 {
                                 genesis_state_root()
                             } else {
@@ -1624,14 +1724,21 @@ async fn handle_p2p_events(
                                     )
                                 })?
                             };
+                            // Genesis edge-case (shared with StepProof path below):
+                            // the genesis proof was built with the *pre-genesis*
+                            // accumulator whose state_root is [0u8;32], not genesis_state_root().
                             let rec_air_prev_root = if proof_h == 0 {
-                                genesis_state_root()
+                                [0u8; 32] // pre-genesis accumulator state_root
                             } else {
                                 find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
                             };
                             let rec_air =
                                 RecursiveBlockAir::from_prev_state_root(&rec_air_prev_root);
-                            tracing::debug!(proof_h, snap_tip_h, "snapshot: full recursive verify");
+                            tracing::debug!(
+                                proof_h,
+                                snap_tip_h,
+                                "snapshot: chain-proof verify (proof covers tip)"
+                            );
                             verify_tip(
                                 &proof,
                                 &rec_air,
@@ -1640,31 +1747,29 @@ async fn handle_p2p_events(
                                 &genesis_acc,
                                 expected_chain_hash.as_ref().map(|h| h as &[u8; 32]),
                             )
-                            .map_err(|e| format!("verify_tip failed: {e:?}"))
+                            .map_err(|e| format!("chain-proof verify failed: {e:?}"))
                         } else {
-                            // ── Mode B: PARTIAL verification (STARK + state_root) ────────────
+                            // ── StepProof: recursive proof is behind snapshot tip ─────────
                             //
-                            // Proof is behind tip (normal on a young/fast network).
+                            // Normal operating mode: the RecursiveProof lags FINALITY_DEPTH
+                            // (18) blocks behind tip to protect against reorg invalidation.
                             //
-                            // SECURITY FIX: previously this mode only compared
-                            // `proof.acc.state_root` against `recent_headers` WITHOUT
-                            // verifying the underlying STARK. An attacker could fabricate
-                            // a `RecursiveBlockProof` struct with a matching `acc.state_root`
-                            // field (copied from the snapshot header) backed by a garbage
-                            // STARK, and the node would accept the snapshot.
-                            //
-                            // Now we call `verify_step_stark_only` which:
-                            //   1. Verifies the STARK over `RecursiveBlockAir(prev_root)`,
-                            //   2. Checks `proof.acc.state_root == header[proof_h].state_root`.
-                            //
-                            // This is the same STARK check that `verify_tip` (Mode A) does,
-                            // just without the full chain-continuity check (which requires
-                            // the proof to cover tip-1).
+                            // We call `verify_step_stark_only` which:
+                            //   1. Verifies the STARK over `RecursiveBlockAir(prev_root)` —
+                            //      same underlying check as chain-proof.
+                            //   2. Checks `proof.acc.state_root == header[proof_h].state_root`
+                            //      against the PoW-committed header in recent_headers.
+                            // This cryptographically links the proof to real mining work
+                            // without requiring the proof to cover the full tip distance.
                             use noid_recursive::verify_step_stark_only;
 
-                            // prev_state_root at proof_h - 1 (or genesis if proof_h == 0).
+                            // prev_state_root at proof_h - 1.
+                            // When proof_h == 0 (genesis proof), the STARK was proved with
+                            // the *pre-genesis* accumulator whose state_root is [0u8;32] —
+                            // NOT genesis_state_root().  Using genesis_state_root() here
+                            // would pin a different value in the AIR and cause StarkInvalid.
                             let prev_root = if proof_h == 0 {
-                                genesis_state_root()
+                                [0u8; 32] // pre-genesis accumulator state_root
                             } else {
                                 find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
                             };
@@ -1682,27 +1787,24 @@ async fn handle_p2p_events(
                                                 proof_h,
                                                 snap_tip_h,
                                                 gap = snap_tip_h - proof_h,
-                                                "snapshot: Mode B STARK verified \
-                                                 (proof {} blocks behind tip)",
+                                                "snapshot: step-proof verified \
+                                                 (proof {} blocks before tip)",
                                                 snap_tip_h - proof_h
                                             );
                                             Ok(())
                                         }
                                         Err(e) => Err(format!(
-                                            "Mode B STARK verify FAILED at h={proof_h}: {e:?}"
+                                            "step-proof STARK failed at h={proof_h}: {e:?}"
                                         )),
                                     }
                                 }
                                 None => {
-                                    // Header for proof_h not in recent_headers window.
-                                    // This means the snapshot is missing the header that
-                                    // the recursive proof was built on — reject it.
-                                    // A well-formed snapshot always includes enough headers
-                                    // to verify the recursive proof it accompanies.
+                                    // Header for proof_h not in the recent_headers window.
+                                    // A well-formed snapshot always includes sufficient
+                                    // headers for step-proof verification.
                                     Err(format!(
-                                        "snapshot: Mode B — header[{proof_h}] not in \
-                                         recent_headers; snapshot is malformed \
-                                         (expected headers covering proof height {proof_h})"
+                                        "step-proof: header[{proof_h}] not in recent_headers \
+                                         (snapshot malformed)"
                                     ))
                                 }
                             }
@@ -1716,6 +1818,18 @@ async fn handle_p2p_events(
                                 tip = snap.snapshot.tip_height,
                                 "recursive proof VERIFIED — applying snapshot"
                             );
+                            // Persist the verified proof so the local recursive-proof
+                            // updater can resume from this height instead of
+                            // re-proving the entire chain from genesis.
+                            {
+                                let ctx = chain.read().await;
+                                if let Err(e) = ctx.store.put_recursive_proof(&proof_bytes) {
+                                    tracing::warn!(
+                                        err = ?e,
+                                        "failed to persist received recursive proof"
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(
@@ -1804,6 +1918,117 @@ async fn handle_p2p_events(
                     }
                     Err(e) => {
                         tracing::error!(err = ?e, "failed to apply verified state snapshot");
+                    }
+                }
+            }
+            Ok(NetworkEvent::RecursiveProofUpdate {
+                from,
+                height,
+                tip_hash: _,
+                proof_bytes,
+            }) => {
+                use noid_recursive::{verify_step_stark_only, RecursiveBlockProof};
+
+                // Only process if this proof is ahead of what we have.
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.store
+                        .get_recursive_proof()
+                        .ok()
+                        .flatten()
+                        .and_then(|b| bincode::deserialize::<RecursiveBlockProof>(&b).ok())
+                        .map(|p| p.block_height)
+                };
+                let already_have = our_height.map_or(false, |h| h >= height);
+                if already_have {
+                    tracing::debug!(
+                        from = %from,
+                        height,
+                        our = our_height.unwrap_or(0),
+                        "RecursiveProofUpdate: stale, ignoring"
+                    );
+                } else {
+                    // Lightweight STARK verify before storing.
+                    // We need the prev state_root from our recent headers.
+                    let prev_root_opt = {
+                        let ctx = chain.read().await;
+                        if height == 0 {
+                            Some([0u8; 32]) // pre-genesis accumulator
+                        } else {
+                            ctx.recent_headers
+                                .get(&(height - 1))
+                                .map(|h| h.state_root)
+                                .or_else(|| {
+                                    ctx.store
+                                        .get_header(height - 1)
+                                        .ok()
+                                        .flatten()
+                                        .map(|h| h.state_root)
+                                })
+                        }
+                    };
+                    let expected_root_opt = {
+                        let ctx = chain.read().await;
+                        ctx.recent_headers
+                            .get(&height)
+                            .map(|h| h.state_root)
+                            .or_else(|| {
+                                ctx.store
+                                    .get_header(height)
+                                    .ok()
+                                    .flatten()
+                                    .map(|h| h.state_root)
+                            })
+                    };
+
+                    match (prev_root_opt, expected_root_opt) {
+                        (Some(prev_root), Some(expected_root)) => {
+                            match bincode::deserialize::<RecursiveBlockProof>(&proof_bytes) {
+                                Ok(proof) => {
+                                    match verify_step_stark_only(&proof, &prev_root, &expected_root)
+                                    {
+                                        Ok(()) => {
+                                            let ctx = chain.read().await;
+                                            if let Err(e) =
+                                                ctx.store.put_recursive_proof(&proof_bytes)
+                                            {
+                                                tracing::warn!(
+                                                    err = ?e,
+                                                    "failed to store RecursiveProofUpdate"
+                                                );
+                                            } else {
+                                                tracing::debug!(
+                                                    from = %from,
+                                                    height,
+                                                    "RecursiveProofUpdate: stored"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                from = %from,
+                                                height,
+                                                err = ?e,
+                                                "RecursiveProofUpdate: STARK verify failed, ignoring"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::debug!(
+                                    from = %from,
+                                    "RecursiveProofUpdate: deserialize failed: {e}"
+                                ),
+                            }
+                        }
+                        _ => {
+                            // Headers for this height not in our window — can't verify yet.
+                            // The local updater will produce its own proof when it catches up.
+                            tracing::debug!(
+                                from = %from,
+                                height,
+                                "RecursiveProofUpdate: missing headers for STARK verify, skipping"
+                            );
+                        }
                     }
                 }
             }
@@ -1914,7 +2139,10 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 ///   chain-hash accumulator still advances correctly.
 /// - Runs a tight loop when catching up; sleeps when at finality boundary.
 /// - `prove_recursive_step` is ~2s on 8 cores → run in `spawn_blocking`.
-async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
+async fn run_recursive_proof_updater(
+    chain: Arc<RwLock<MdbxChainContext>>,
+    p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+) {
     use noid_block::{witness_builder::block_proof_to_replay_witness, BlockProof};
     use noid_chain::consensus::params::FINALITY_DEPTH;
     use noid_recursive::{
@@ -1986,12 +2214,24 @@ async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
             match result {
                 Ok(genesis_proof) => {
                     let bytes = bincode::serialize(&genesis_proof).unwrap_or_default();
-                    let ctx = chain.read().await;
-                    if let Err(e) = ctx.store.put_recursive_proof(&bytes) {
-                        tracing::error!(err = ?e, "failed to store genesis recursive proof");
-                    } else {
+                    let (stored, tip_hash) = {
+                        let ctx = chain.read().await;
+                        let tip_hash = ctx.tip_hash();
+                        let ok = ctx.store.put_recursive_proof(&bytes).is_ok();
+                        (ok, tip_hash)
+                    };
+                    if stored {
                         tracing::info!("recursive proof: genesis proved");
                         just_advanced = true;
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {
+                                height: 0,
+                                tip_hash,
+                                proof_bytes: bytes,
+                            })
+                            .await;
+                    } else {
+                        tracing::error!("failed to store genesis recursive proof");
                     }
                 }
                 Err(e) => tracing::error!(err = ?e, "genesis recursive proof task panicked"),
@@ -2052,12 +2292,27 @@ async fn run_recursive_proof_updater(chain: Arc<RwLock<MdbxChainContext>>) {
             Ok(new_proof) => {
                 let h = new_proof.block_height;
                 let bytes = bincode::serialize(&new_proof).unwrap_or_default();
-                let ctx = chain.read().await;
-                if let Err(e) = ctx.store.put_recursive_proof(&bytes) {
-                    tracing::error!(err = ?e, "failed to store recursive proof at height {h}");
-                } else {
+                let (stored, tip_hash) = {
+                    let ctx = chain.read().await;
+                    let tip_hash = ctx.tip_hash();
+                    let ok = ctx.store.put_recursive_proof(&bytes).is_ok();
+                    (ok, tip_hash)
+                };
+                if stored {
                     tracing::info!(height = h, "recursive proof advanced");
                     just_advanced = true;
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {
+                            height: h,
+                            tip_hash,
+                            proof_bytes: bytes,
+                        })
+                        .await;
+                } else {
+                    tracing::error!(
+                        err = "store failed",
+                        "failed to store recursive proof at height {h}"
+                    );
                 }
             }
             Err(e) => {

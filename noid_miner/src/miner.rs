@@ -105,6 +105,9 @@ pub enum MinerEvent {
         pow_nonce: u128,
         /// Serialized Block bytes for P2P broadcast.
         block_bytes: Vec<u8>,
+        /// Serialized BlockProof bytes for P2P broadcast.
+        /// Empty for coinbase-only blocks (stub proof).
+        block_proof_bytes: Vec<u8>,
     },
     /// Template refreshed.
     TemplateRefreshed {
@@ -248,11 +251,13 @@ impl BlockMiner {
                     }
                 }
             } else {
-                tracing::info!("waiting for state snapshot from peers (60s max)");
+                // Fresh chain (height == 0): wait for either a peer snapshot or
+                // the sync_ready signal (fired immediately when --genesis is set).
+                tracing::debug!("miner: height=0, waiting for sync_ready or 60s timeout");
                 tokio::select! {
                     _ = self.sync_ready.notified() => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::debug!(height = h, "miner: snapshot received, starting");
+                        tracing::debug!(height = h, "miner: ready, starting");
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                         tracing::info!("miner: no peers after 60s, starting from genesis");
@@ -421,6 +426,7 @@ impl BlockMiner {
                                 n_txs,
                                 pow_nonce: sol.nonce,
                                 block_bytes: block_bytes.clone(),
+                                block_proof_bytes: block_proof_bytes.clone(),
                             });
 
                             // Apply the block to the chain and update mempool.
@@ -565,12 +571,14 @@ pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
 ) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
-    use noid_block::{build_block_witnesses, build_empty_state_bindings, prove_block};
+    use noid_block::{
+        build_block_witnesses, build_empty_state_bindings, build_state_bindings_from_binding,
+        prove_block,
+    };
     use noid_chain::block::proof_transcript_hash;
     use noid_stark::WalletProofBundle;
 
-    // Coinbase-only: O(1) check, avoids cloning all txs just to count them.
-    // Marker [1u8;32] is consensus-legal when there are no user txs.
+    // Coinbase-only: marker proof, no ZK proving needed.
     let non_cb_count = tmpl.n_user_txs();
     if non_cb_count == 0 {
         tracing::debug!(
@@ -580,44 +588,61 @@ pub(crate) fn run_prove_block(
         return Ok(([1u8; 32], [1u8; 32], vec![]));
     }
 
-    // User txs present: clone tx list and deserialize proof bundles.
     let all_txs = tmpl.inner.all_txs();
-
-    // Deserialize WalletProofBundles from cached bytes stored in the template.
-    // proof_bytes[k] corresponds to inner.txs[k] (non-coinbase txs in order).
     let bundles: Vec<WalletProofBundle> = tmpl
         .proof_bytes
         .iter()
         .filter_map(|opt| {
             opt.as_ref()
-                .and_then(|bytes| WalletProofBundle::from_bytes(bytes).ok())
+                .and_then(|b| WalletProofBundle::from_bytes(b).ok())
         })
         .collect();
-
-    // User transactions present but wallet bundles are incomplete.
-    // We CANNOT produce a stub proof for user-tx blocks (rejected by consensus).
-    // Return an error so the miner rebuilds with a coinbase-only template.
     if bundles.len() != non_cb_count {
         return Err(format!(
-            "missing WalletProofBundles: have {}, need {} — \
-             cannot produce user-tx block without ZK proofs; will retry coinbase-only",
+            "missing WalletProofBundles: have {}, need {} — will retry coinbase-only",
             bundles.len(),
             non_cb_count,
         ));
     }
 
-    // Build witnesses from public tx data + wallet bundles (no SpendSecret).
-    // Pass log_slots from the block template so pi.log_slots == header.log_slots.
     let log_slots = tmpl.inner.log_slots;
     let owned_witnesses = build_block_witnesses(&all_txs, &bundles, log_slots);
     let witnesses: Vec<_> = owned_witnesses
         .iter()
         .map(|w| w.as_block_witness())
         .collect();
-    let state_bindings = build_empty_state_bindings();
+
+    // Build state bindings (Steps 1+2+3 data) if binding is available.
+    let n_tx = tmpl.n_user_txs() as u32;
+    let non_cb_bodies: Vec<noid_tx::TxBody> =
+        tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();
+    let owned_bindings = match &tmpl.inner.state_binding {
+        Some(binding) if !non_cb_bodies.is_empty() => build_state_bindings_from_binding(
+            binding,
+            &non_cb_bodies,
+            &tmpl.pre_segs,
+            prev_state_root,
+            n_tx,
+            log_slots,
+        ),
+        _ => vec![],
+    };
+    let empty_bindings = build_empty_state_bindings();
+    let state_bindings_owned: Vec<_> = owned_bindings.iter().map(|b| b.as_witness()).collect();
+    let state_bindings: &[_] = if state_bindings_owned.is_empty() {
+        &empty_bindings
+    } else {
+        &state_bindings_owned
+    };
+    let new_state_root = tmpl
+        .inner
+        .state_binding
+        .as_ref()
+        .map(|b| b.new_state_root)
+        .unwrap_or([0u8; 32]);
 
     // Run prove_block (CPU-intensive: ~10s at 100 txs on 8 cores).
-    match prove_block(prev_state_root, &witnesses, &state_bindings) {
+    match prove_block(prev_state_root, new_state_root, &witnesses, state_bindings) {
         Ok(block_proof) => {
             let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
             let transcript_hash = proof_transcript_hash(&proof_bytes);

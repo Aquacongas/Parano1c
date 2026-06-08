@@ -20,9 +20,13 @@ pub mod validate;
 pub mod witness_builder;
 
 pub use block_chain_context::{extract_replay_witness, BlockChainContext};
-pub use validate::{build_tx_airs, validate_block_full, FullValidationError};
+pub use validate::{
+    build_auth_public_list, build_spine_inputs_list, build_state_binding_airs, build_tx_airs,
+    validate_block_from_network, validate_block_full, FullValidationError,
+};
 pub use witness_builder::{
-    build_block_witnesses, build_empty_state_bindings, build_tx_witness, OwnedTxWitness,
+    build_block_witnesses, build_empty_state_bindings, build_state_bindings_from_binding,
+    build_tx_witness, OwnedStateBindingWitness, OwnedTxWitness,
 };
 
 use crate::channel::{
@@ -31,6 +35,10 @@ use crate::channel::{
 };
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_air::{Air, FixedColumns};
+use noid_chain::fri_state::{
+    cap_to_seg_root_with_depth, merkle_root_from_leaf, open_segment_at_point,
+};
+use noid_chain::segmented_state::SegmentColumns;
 use noid_core::mle::{eq::eq_ind_partial_eval, split::split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128, TowerField};
@@ -64,12 +72,57 @@ const BASE_LOG: usize = BLOCK_BASE_LOG;
 const BLOCK_MULTIPOINT_TAG: u128 = 0xFFFB_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
+// Segment MLE opening (Steps 2+3)
+// ---------------------------------------------------------------------------
+
+/// FRI opening proof for one segment's three-column MLE + Merkle path binding.
+///
+/// **Step 2**: `opening` proves `MLE([values, owners_hi, owners_lo], eval_point) = lane_values`
+/// via compact interleaved FRI (same scheme as `SegmentedFriState`).
+///
+/// **Step 3**: `merkle_siblings` proves `seg_root → state_root` via O(depth)
+/// native Poseidon2b Merkle path verification.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SegmentMleOpening {
+    pub seg_id: u16,
+    /// MLE eval point (= `BlockStateBindingAir.eval_point` for this segment).
+    pub eval_point: Vec<Block128>,
+    /// Proved MLE evaluations `[values, owners_hi, owners_lo]` at `eval_point`.
+    pub lane_values: [Block128; 3],
+    /// Compact FRI interleaved commitment to the 3 segment columns.
+    pub commitment: InterleavedCommitment,
+    /// Mixed opening proof for the 3 columns at `eval_point`.
+    pub opening: MixedOpeningProof,
+    /// `seg_root = cap_to_seg_root_with_depth(commitment.cap, eff_log)` —
+    /// matches what `SegmentedFriState` stores as the Merkle leaf.
+    pub seg_root: [u8; 32],
+    /// Poseidon2b Merkle siblings `seg_root → state_root` (bottom-up).
+    /// Empty when `num_segments == 1` (single-segment / test mode).
+    pub merkle_siblings: Vec<[u8; 32]>,
+}
+
+impl SegmentMleOpening {
+    pub fn byte_len(&self) -> usize {
+        let commit = self.commitment.cap.hashes.len() * 32;
+        let opening = self.opening.byte_len();
+        let eval = self.eval_point.len() * 16;
+        let vals = 3 * 16;
+        let seg = 32;
+        let sibs = self.merkle_siblings.len() * 32;
+        commit + opening + eval + vals + seg + sibs
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public metadata
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockPublicMeta {
     pub prev_block_state_root: [u8; 32],
+    /// New state root (= block header's `state_root`). Used in `verify_block`
+    /// to check post-state Merkle paths (Step 3).
+    pub new_state_root: [u8; 32],
     pub n_tx: u32,
     pub n_air_per_tx: u32,
     pub n_auth_slices_per_tx: u32,
@@ -117,6 +170,12 @@ pub struct BlockProof {
     /// Stored here so the recursive prover can bind the fold-check to the
     /// real value via `extra_transcript` instead of the placeholder ZERO.
     pub block_initial_claim: Block128,
+    /// FRI+Merkle opening proofs for pre-state segment MLEs (Steps 2+3).
+    /// One per dirty segment. Proves `BlockStateBindingAir.prev_lane_openings` are real.
+    pub pre_state_openings: Vec<SegmentMleOpening>,
+    /// FRI+Merkle opening proofs for post-state segment MLEs (Steps 2+3).
+    /// One per dirty segment. Proves `BlockStateBindingAir.new_lane_openings` are real.
+    pub post_state_openings: Vec<SegmentMleOpening>,
 }
 
 impl BlockProof {
@@ -137,7 +196,9 @@ impl BlockProof {
             .map(|r| r.len() * 16)
             .sum();
         let mixed = self.mixed_opening.byte_len();
-        cap + alg + sb_alg + spine + auth + col_open + mp + mixed
+        let pre: usize = self.pre_state_openings.iter().map(|o| o.byte_len()).sum();
+        let post: usize = self.post_state_openings.iter().map(|o| o.byte_len()).sum();
+        cap + alg + sb_alg + spine + auth + col_open + mp + mixed + pre + post
     }
 }
 
@@ -165,6 +226,8 @@ pub enum VerifyBlockError {
     AlgebraicStark(usize, VerifyError),
     BlockMultipoint,
     FriFailed(String),
+    /// FRI/Merkle opening for a segment MLE failed (Step 2 or Step 3).
+    StateMleOpeningFailed(usize),
     /// A transaction's PublicInputs.log_slots does not match BlockHeader.log_slots.
     /// The STARK proof is bound to the wrong chain configuration.
     LogSlotsInconsistent {
@@ -205,6 +268,20 @@ pub struct TxBlockWitness<'a> {
 pub struct StateBindingBlockWitness<'a> {
     pub air: &'a BlockStateBindingAir,
     pub columns: Vec<Vec<Block128>>,
+    /// Segment ID for this binding. Used for FRI opening channel seeding (Step 2).
+    pub seg_id: u16,
+    /// Pre-state segment columns for FRI opening (Step 2). `None` = bench/legacy mode.
+    pub pre_cols: Option<&'a SegmentColumns>,
+    /// Claims used to derive post-state columns on demand.
+    pub claims: &'a [noid_air::airs::block_state_binding::BlockStateBindingClaim],
+    /// Merkle siblings for pre-state seg_root → prev_state_root (Step 3).
+    pub pre_siblings: &'a [[u8; 32]],
+    /// Merkle siblings for post-state seg_root → new_state_root (Step 3).
+    pub post_siblings: &'a [[u8; 32]],
+    /// Merkle tree depth. 0 = single-segment.
+    pub tree_depth: usize,
+    /// Block's new state root for post-state Merkle check.
+    pub new_state_root: [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +309,29 @@ fn reduction_to_transcript(point: &[Block128], value: Block128) -> Vec<Block128>
     out
 }
 
+/// Derive post-state columns from pre-state by applying spend/mint claims.
+/// Clone is O(2^eff_log) — callers should drop the result immediately.
+fn apply_claims_to_cols(
+    pre: &SegmentColumns,
+    claims: &[noid_air::airs::block_state_binding::BlockStateBindingClaim],
+) -> SegmentColumns {
+    let mut post = pre.clone();
+    for c in claims {
+        let i = c.slot_index as usize;
+        debug_assert!(i < post.values.len());
+        if c.is_spend {
+            post.values[i] = Block128::ZERO;
+            post.owners_hi[i] = Block128::ZERO;
+            post.owners_lo[i] = Block128::ZERO;
+        } else if c.is_mint {
+            post.values[i] = c.value;
+            post.owners_hi[i] = c.owner_hi;
+            post.owners_lo[i] = c.owner_lo;
+        }
+    }
+    post
+}
+
 fn build_auth_slice_claims(
     n_air_cols: usize,
     auth_r_low: &[Block128],
@@ -252,8 +352,12 @@ fn build_auth_slice_claims(
 // prove_block
 // ---------------------------------------------------------------------------
 
+/// `new_block_state_root` = block header's `state_root`; used in `BlockPublicMeta`
+/// for post-state Merkle path verification (Step 3). Pass `[0u8;32]` when there
+/// are no state bindings (bench / coinbase-only mode).
 pub fn prove_block(
     prev_block_state_root: [u8; 32],
+    new_block_state_root: [u8; 32],
     witnesses: &[TxBlockWitness<'_>],
     state_bindings: &[StateBindingBlockWitness<'_>],
 ) -> Result<BlockProof, ProveBlockError> {
@@ -595,8 +699,62 @@ pub fn prove_block(
 
     let sb_algebraics: Vec<AlgebraicStarkProof> =
         sb_results.iter().map(|r| r.alg.clone()).collect();
-    // r_pp per state-binding AIR — used in the multipoint sumcheck below.
     let sb_r_pp_list: Vec<Vec<Block128>> = sb_results.into_iter().map(|r| r.r_pp).collect();
+
+    // -------------------------------------------------------------------------
+    // Stage 5c: Per-segment FRI MLE openings + Merkle path (Steps 2 + 3).
+    //
+    // For each dirty segment, open the 3 pre-state and 3 post-state columns at
+    // eval_point using compact interleaved FRI (same scheme as SegmentedFriState).
+    // The resulting seg_root matches the Merkle tree leaf exactly.
+    // post_cols is derived from pre_cols + claims and dropped immediately after.
+    // -------------------------------------------------------------------------
+    let mut pre_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(n_state_bindings);
+    let mut post_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(n_state_bindings);
+    for sb in state_bindings {
+        if let Some(pre_cols) = sb.pre_cols {
+            let seg_id = sb.seg_id;
+            let eff_log = sb.air.eval_point.len();
+
+            // Pre-state: zero-copy (borrows pre_cols).
+            let (pre_commit, pre_vals, pre_proof, pre_seg_root) = open_segment_at_point(
+                eff_log,
+                &pre_cols.values,
+                &pre_cols.owners_hi,
+                &pre_cols.owners_lo,
+                &sb.air.eval_point,
+            );
+            pre_state_openings.push(SegmentMleOpening {
+                seg_id,
+                eval_point: sb.air.eval_point.clone(),
+                lane_values: pre_vals,
+                commitment: pre_commit,
+                opening: pre_proof,
+                seg_root: pre_seg_root,
+                merkle_siblings: sb.pre_siblings.to_vec(),
+            });
+
+            // Post-state: derive columns, open, then drop immediately.
+            let post_cols = apply_claims_to_cols(pre_cols, sb.claims);
+            let (post_commit, post_vals, post_proof, post_seg_root) = open_segment_at_point(
+                eff_log,
+                &post_cols.values,
+                &post_cols.owners_hi,
+                &post_cols.owners_lo,
+                &sb.air.eval_point,
+            );
+            // post_cols dropped here — frees memory immediately.
+            post_state_openings.push(SegmentMleOpening {
+                seg_id,
+                eval_point: sb.air.eval_point.clone(),
+                lane_values: post_vals,
+                commitment: post_commit,
+                opening: post_proof,
+                seg_root: post_seg_root,
+                merkle_siblings: sb.post_siblings.to_vec(),
+            });
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Q.4a: Segmented Transcript Absorption.
@@ -875,6 +1033,7 @@ pub fn prove_block(
     Ok(BlockProof {
         meta: BlockPublicMeta {
             prev_block_state_root,
+            new_state_root: new_block_state_root,
             n_tx: n_tx as u32,
             n_air_per_tx: n_air_cols as u32,
             n_auth_slices_per_tx: n_auth_slices as u32,
@@ -893,7 +1052,9 @@ pub fn prove_block(
         block_col_openings,
         block_multipoint_rounds: block_mp_rounds,
         mixed_opening,
-        block_initial_claim: block_target, // real initial claim for recursive prover
+        block_initial_claim: block_target,
+        pre_state_openings,
+        post_state_openings,
     })
 }
 
@@ -1105,6 +1266,100 @@ pub fn verify_block(
             verify_air_interleaved_algebraic(sb_air, &empty_pi_sb, sb_alg, &[], &[], &mut sb_ch)
                 .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx + sb_idx, e))?;
         sb_r_pp_list.push(r_pp_sb);
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 2c: Verify segment MLE openings (Steps 2 + 3).
+    //
+    // For each dirty segment:
+    //   Step 2: verify compact FRI opening proves lane_values == MLE(cols, eval_point)
+    //           and seg_root == cap_to_seg_root_with_depth(cap, eff_log).
+    //   Step 3: verify Merkle path seg_root → prev/new_state_root natively.
+    //
+    // Full chain: AIR constraints → lane_values → FRI cols → seg_root → state_root.
+    // -------------------------------------------------------------------------
+    if proof.pre_state_openings.len() != n_state_bindings
+        || proof.post_state_openings.len() != n_state_bindings
+    {
+        return Err(VerifyBlockError::ShapeMismatch);
+    }
+    if has_state_binding {
+        let frib_hasher = Poseidon2bSponge::new();
+        for sb_idx in 0..n_state_bindings {
+            let sb_air = state_binding_airs[sb_idx];
+            let pre = &proof.pre_state_openings[sb_idx];
+            let post = &proof.post_state_openings[sb_idx];
+
+            // eval_points must match the AIR.
+            if pre.eval_point != sb_air.eval_point || post.eval_point != sb_air.eval_point {
+                return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+            }
+            let eff_log = pre.eval_point.len();
+
+            // Helper: verify one opening and check its cap-derived seg_root.
+            let verify_one = |op: &SegmentMleOpening,
+                              expected_lane: &[Block128; 3]|
+             -> Result<(), VerifyBlockError> {
+                // Step 2a: verify compact FRI opening.
+                let commit_log = eff_log.max(noid_fri_binius::MERKLE_CAP_DEPTH);
+                let ntt = AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
+                let padded_pt = {
+                    let mut p = op.eval_point.clone();
+                    p.resize(commit_log, Block128::ZERO);
+                    p
+                };
+                let mut ch = noid_fri::channel::Channel::new();
+                noid_fri_binius::absorb_cap(&mut ch, &op.commitment.cap);
+                let col_evals = verify_mixed_opening(
+                    &op.commitment,
+                    &padded_pt,
+                    &[],
+                    &op.opening,
+                    &ntt,
+                    &mut ch,
+                    &frib_hasher,
+                    COMPACT_NUM_QUERIES,
+                )
+                .map_err(|_| VerifyBlockError::StateMleOpeningFailed(sb_idx))?;
+
+                // Proved values must match lane_values AND AIR's expected values.
+                if col_evals.len() < 3
+                    || [col_evals[0], col_evals[1], col_evals[2]] != op.lane_values
+                    || &op.lane_values != expected_lane
+                {
+                    return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+                }
+                // Step 2b: seg_root = cap_to_seg_root_with_depth(cap, eff_log).
+                let derived = cap_to_seg_root_with_depth(&op.commitment.cap, eff_log);
+                if derived != op.seg_root {
+                    return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+                }
+                Ok(())
+            };
+
+            verify_one(pre, &sb_air.prev_lane_openings)?;
+            verify_one(post, &sb_air.new_lane_openings)?;
+
+            // Step 3: Merkle path seg_root → state_root (O(depth) native).
+            let check_merkle = |op: &SegmentMleOpening,
+                                expected_root: &[u8; 32]|
+             -> Result<(), VerifyBlockError> {
+                if op.merkle_siblings.is_empty() {
+                    if op.seg_root != *expected_root {
+                        return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+                    }
+                } else {
+                    let computed =
+                        merkle_root_from_leaf(&op.seg_root, op.seg_id, &op.merkle_siblings);
+                    if computed != *expected_root {
+                        return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+                    }
+                }
+                Ok(())
+            };
+            check_merkle(pre, &meta.prev_block_state_root)?;
+            check_merkle(post, &meta.new_state_root)?;
+        }
     }
 
     // -------------------------------------------------------------------------

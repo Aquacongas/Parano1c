@@ -28,10 +28,19 @@
 //! The trace only uses `inp.value`, `out.value`, `fee` from the body — no
 //! secret material. `witness_from_body` is a public function in `noid_air`.
 
+use std::collections::HashMap;
+
+use noid_air::airs::block_state_binding::{
+    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingWitness,
+};
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::{Air, Trace};
-
+use noid_chain::consensus::params::LOG_SEGMENT_SIZE;
+use noid_chain::segmented_state::SegmentColumns;
+use noid_chain::state_binding::BlockStateBinding;
+use noid_core::mle::evaluate_slice;
 use noid_core::{Block128, TowerField};
+use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, SpineInputs};
 use noid_stark::{prove_logic::LogicProof, WalletProofBundle};
 use noid_tx::{PublicInputs, Transaction, TxBody, MAX_INPUTS, MAX_OUTPUTS};
@@ -212,19 +221,181 @@ fn build_public_inputs(tx_body: &TxBody, _proof: &LogicProof, log_slots: u32) ->
 // StateBindingBlockWitness
 // ---------------------------------------------------------------------------
 
-/// Build `StateBindingBlockWitness` instances for `prove_block`.
+/// Owned state binding witness for one dirty segment.
+pub struct OwnedStateBindingWitness {
+    pub air: BlockStateBindingAir,
+    pub columns: Vec<Vec<Block128>>,
+    pub seg_id: u16,
+    /// Pre-state segment columns (owned; for FRI opening in prove_block Stage 5c).
+    pub pre_cols: SegmentColumns,
+    /// Claims (spend/mint) for this segment; used to derive post-state columns.
+    pub claims: Vec<BlockStateBindingClaim>,
+    /// Merkle siblings for pre-state seg_root → prev_state_root.
+    pub pre_siblings: Vec<[u8; 32]>,
+    /// Merkle siblings for post-state seg_root → new_state_root.
+    pub post_siblings: Vec<[u8; 32]>,
+    /// Merkle tree depth. 0 = single-segment (no path needed).
+    pub tree_depth: usize,
+    /// Block's new state root (from binding.new_state_root).
+    pub new_state_root: [u8; 32],
+}
+
+impl OwnedStateBindingWitness {
+    pub fn as_witness(&self) -> StateBindingBlockWitness<'_> {
+        StateBindingBlockWitness {
+            air: &self.air,
+            columns: self.columns.clone(),
+            seg_id: self.seg_id,
+            pre_cols: Some(&self.pre_cols),
+            claims: &self.claims,
+            pre_siblings: &self.pre_siblings,
+            post_siblings: &self.post_siblings,
+            tree_depth: self.tree_depth,
+            new_state_root: self.new_state_root,
+        }
+    }
+}
+
+/// Evaluate MLE of `vals` at `point`.
+#[inline]
+fn mle_eval(vals: &[Block128], point: &[Block128]) -> Block128 {
+    evaluate_slice(vals, point)
+}
+
+/// Build one `OwnedStateBindingWitness` per dirty segment.
 ///
-/// Returns an empty slice. Full ZK state binding (via `BlockStateBindingAir`)
-/// is not yet wired into block production — native `validate_block_consensus`
-/// already enforces state correctness for full nodes. The ZK state binding
-/// would provide an additional in-proof guarantee for light clients that
-/// cannot run native validation.
-///
-/// When implemented, the full path is:
-/// 1. `BlockStateBinding::build(state, bodies, commitments)` — open slots
-/// 2. Build `BlockStateBindingAir` from the opened slot data
-/// 3. Build the trace columns from the opening proofs
-/// 4. Pass these to `prove_block` as `state_bindings`
+/// # Parameters
+/// - `binding` — slot openings from `BlockStateBinding` (built in `build_block_template`)
+/// - `bodies` — non-coinbase tx bodies in block order
+/// - `pre_segs` — pre-state segment columns keyed by seg_id
+/// - `prev_state_root` — for Fiat-Shamir channel seeding
+/// - `n_tx` — number of non-coinbase txs
+/// - `log_slots` — chain log_slots value
+pub fn build_state_bindings_from_binding(
+    binding: &BlockStateBinding,
+    bodies: &[noid_tx::TxBody],
+    pre_segs: &HashMap<u16, SegmentColumns>,
+    prev_state_root: [u8; 32],
+    n_tx: u32,
+    log_slots: u32,
+) -> Vec<OwnedStateBindingWitness> {
+    let eff_log = (log_slots as usize).min(LOG_SEGMENT_SIZE as usize);
+    let seg_mask = (1u32 << eff_log) - 1;
+
+    // Group claims by segment.
+    let mut seg_claims: HashMap<u16, Vec<BlockStateBindingClaim>> = HashMap::new();
+    for (body, opening) in bodies.iter().zip(binding.tx_openings.iter()) {
+        let mut inp_iter = opening.input_openings.iter();
+        for inp in body.inputs.iter().filter(|i| i.valid) {
+            let sv = inp_iter.next().expect("input opening mismatch");
+            let seg_id = (inp.slot_index >> eff_log) as u16;
+            let local = inp.slot_index & seg_mask;
+            seg_claims
+                .entry(seg_id)
+                .or_default()
+                .push(BlockStateBindingClaim::spend(
+                    local,
+                    sv.value,
+                    sv.owner_hi,
+                    sv.owner_lo,
+                ));
+        }
+        let mut out_iter = opening.output_openings.iter();
+        for out in body.outputs.iter().filter(|o| o.valid) {
+            let _pre = out_iter.next();
+            let seg_id = (out.slot_index >> eff_log) as u16;
+            let local = out.slot_index & seg_mask;
+            let [owner_hi, owner_lo] = out.owner.as_fields();
+            seg_claims
+                .entry(seg_id)
+                .or_default()
+                .push(BlockStateBindingClaim::mint(
+                    local,
+                    Block128::from(out.value as u128),
+                    owner_hi,
+                    owner_lo,
+                ));
+        }
+    }
+
+    // Sort by seg_id for deterministic eval_point derivation.
+    let mut sorted: Vec<(u16, Vec<BlockStateBindingClaim>)> = seg_claims.into_iter().collect();
+    sorted.sort_unstable_by_key(|(sid, _)| *sid);
+
+    let seg_size = 1usize << eff_log;
+    let mut result = Vec::with_capacity(sorted.len());
+
+    for (sb_idx, (seg_id, claims)) in sorted.into_iter().enumerate() {
+        // Derive eval_point and gamma from deterministic channel.
+        let mut ch = Channel::new();
+        let lo = u128::from_le_bytes(prev_state_root[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(prev_state_root[16..].try_into().unwrap());
+        ch.observe_field_elem(Block128::from(lo));
+        ch.observe_field_elem(Block128::from(hi));
+        ch.observe_field_elem(Block128::from((n_tx as u128) + sb_idx as u128));
+        let eval_point: Vec<Block128> = (0..eff_log).map(|_| ch.get_random_point()).collect();
+        let gamma = ch.get_random_point();
+
+        // Pre-state MLE evaluation.
+        let zero_cols = SegmentColumns::new_zero(seg_size);
+        let pre_ref = pre_segs.get(&seg_id).unwrap_or(&zero_cols);
+        let pre_cols_owned = pre_ref.clone();
+        let prev_lane_openings = [
+            mle_eval(&pre_ref.values, &eval_point),
+            mle_eval(&pre_ref.owners_hi, &eval_point),
+            mle_eval(&pre_ref.owners_lo, &eval_point),
+        ];
+
+        // Build witness and compute new_lane_openings.
+        let mut witness = BlockStateBindingWitness::new(
+            claims.clone(),
+            eval_point.clone(),
+            gamma,
+            prev_lane_openings,
+            [Block128::ZERO; 3],
+        );
+        let new_lane_openings = witness.expected_new_lane_openings(prev_lane_openings);
+        witness.new_lane_openings = new_lane_openings;
+
+        let expected_batched = witness.expected_batched_claims();
+        let air = BlockStateBindingAir::new(
+            &claims,
+            prev_lane_openings,
+            new_lane_openings,
+            &eval_point,
+            gamma,
+            expected_batched,
+        );
+        let columns = air.build_trace(&witness);
+
+        // Extract siblings for this segment from the binding.
+        let pre_siblings = binding
+            .pre_seg_siblings
+            .get(&seg_id)
+            .cloned()
+            .unwrap_or_default();
+        let post_siblings = binding
+            .post_seg_siblings
+            .get(&seg_id)
+            .cloned()
+            .unwrap_or_default();
+
+        result.push(OwnedStateBindingWitness {
+            air,
+            columns,
+            seg_id,
+            pre_cols: pre_cols_owned,
+            claims,
+            pre_siblings,
+            post_siblings,
+            tree_depth: binding.tree_depth,
+            new_state_root: binding.new_state_root,
+        });
+    }
+    result
+}
+
+/// Build empty state bindings (coinbase-only or bench mode).
 pub fn build_empty_state_bindings() -> Vec<StateBindingBlockWitness<'static>> {
     vec![]
 }

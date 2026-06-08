@@ -108,20 +108,19 @@ pub const EXPAND_DENOM: u64 = 4;
 // PoW  (SPECIFICATION.md §18)
 // ---------------------------------------------------------------------------
 
-/// Genesis difficulty target = 2^228.
+/// Genesis difficulty target = 2^229.
 ///
-/// Calibrated to ~5 seconds per block on a 12-core laptop (62 MH/s total):
-///   avg_nonces = 2^(256-228) = 2^28 = 268M
-///   time = 268M / 62M = 4.3s
+/// Calibrated to ~2 seconds per block on a 12-core laptop (62 MH/s total):
+///   avg_nonces = 2^(256-229) = 2^27 = 134M
+///   time = 134M / 62M ≈ 2.2s
 ///
-/// LE 256-bit layout: byte 28 = 0x10 (bit 228 = bit 4 of byte 28).
-/// Bytes 29-31 = 0x00 so the target value equals 2^228.
+/// LE 256-bit layout: byte 28 = 0x20 (bit 229 = bit 5 of byte 28).
+/// Bytes 29-31 = 0x00 so the target value equals 2^229.
 ///
-/// This ensures block_time >> gossip_latency even at genesis,
-/// preventing the chain from forking faster than gossip can propagate.
+/// This is the minimum allowed difficulty floor. ASERT may only move harder.
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    t[28] = 0x10; // bit 4 of byte 28 → 2^(8×28+4) = 2^228
+    t[28] = 0x20; // bit 5 of byte 28 → 2^(8×28+5) = 2^229
     t
 };
 
@@ -131,13 +130,13 @@ pub const GENESIS_TARGET: [u8; 32] = {
 ///
 /// # Derivation
 ///
-/// The difficulty floor ensures every mainnet block contributes at least:
-///   block_work(GENESIS_TARGET) = 2^27 = 134,217,728  (27 leading zeros)
+/// The difficulty floor ensures every block contributes at least:
+///   block_work(GENESIS_TARGET) = 2^26 = 67,108,864  (26 leading zeros)
 ///
-/// We require FINALITY_DEPTH (18) blocks’ worth of work:
+/// We require FINALITY_DEPTH (18) blocks' worth of work:
 ///
 ///   MIN_SNAPSHOT_CHAINWORK = FINALITY_DEPTH × block_work(GENESIS_TARGET)
-///                          = 18 × 2^27 = 2,415,919,104 = 0x9000_0000
+///                          = 18 × 2^26 = 1,207,959,552 = 0x4800_0000
 ///
 /// # Why FINALITY_DEPTH?
 ///
@@ -145,26 +144,19 @@ pub const GENESIS_TARGET: [u8; 32] = {
 /// FINALITY_DEPTH behind tip. Until a peer has 18+ finalized blocks it has
 /// NO recursive proof. Requiring 18 blocks of chainwork aligns these two:
 ///
-///   tip < 18  → no recursive proof AND chainwork < threshold → B cannot sync
-///   tip ≥ 18  → recursive proof exists AND chainwork ≥ threshold → B can sync
-///
-/// This means B only syncs from a peer that already has a meaningful chain
-/// history and a real recursive proof, not from a peer that just started.
+///   tip < 18  → no recursive proof AND chainwork < threshold → peer cannot serve sync
+///   tip ≥ 18  → recursive proof exists AND chainwork ≥ threshold → peer can serve sync
 ///
 /// # Security vs fake snapshots
 ///
-///   • 155 fake MAX_TARGET blocks (work=1/block) → chainwork = 155 ≪ 2.4B → FAILS
-///   • 18 real mainnet blocks + genesis  → chainwork = 19 × 2^27 > 18 × 2^27 → PASSES
-///
-/// Only applies in mainnet mode. With `--testnet` the difficulty floor is
-/// disabled (blocks ease to MAX_TARGET, work=1); `validate_snapshot_headers`
-/// uses threshold=0 so the check is a no-op for trivial-difficulty chains.
+///   • 155 fake MAX_TARGET blocks (work=1/block) → chainwork = 155 ≪ 1.2B → FAILS
+///   • 18 real blocks + genesis  → chainwork ≥ 18 × 2^26 → PASSES
 pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
     let mut w = [0u8; 32];
-    // 18 × 2^27 = 0x12 × 0x800_0000 = 0x9000_0000 = 2,415,919,104
-    // In LE u128: byte[3] = 0x90 (bits 24-31)
-    // Verify: 0x90 × 2^24 = 144 × 16,777,216 = 2,415,919,104 = 18 × 134,217,728 ✓
-    w[3] = 0x90; // = FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
+    // 18 × 2^26 = 0x12 × 0x400_0000 = 0x4800_0000 = 1,207,959,552
+    // In LE bytes: byte[3] = 0x48 (bits 24-31)
+    // Verify: 0x48 × 2^24 = 72 × 16,777,216 = 1,207,959,552 = 18 × 67,108,864 ✓
+    w[3] = 0x48; // = FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
     w
 };
 
@@ -236,12 +228,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genesis_target_is_2_pow_228() {
-        // 2^228: bit 228 = bit 4 of byte 28 (LE). Bytes 29-31 = 0x00.
+    fn genesis_target_is_2_pow_229() {
+        // 2^229: bit 229 = bit 5 of byte 28 (LE). Bytes 29-31 = 0x00.
         let mut expected = [0u8; 32];
-        expected[28] = 0x10; // 2^4 at byte 28 → 2^(8*28+4) = 2^228
+        expected[28] = 0x20; // 2^5 at byte 28 → 2^(8*28+5) = 2^229
         assert_eq!(GENESIS_TARGET, expected);
-        assert_eq!(GENESIS_TARGET[28], 0x10);
+        assert_eq!(GENESIS_TARGET[28], 0x20);
         assert_eq!(GENESIS_TARGET[29], 0x00);
         assert_eq!(GENESIS_TARGET[30], 0x00);
         assert_eq!(GENESIS_TARGET[31], 0x00);

@@ -91,6 +91,46 @@ pub struct GetStateSnapshotResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Block gossip wire message
+// ---------------------------------------------------------------------------
+
+/// Gossipsub message for block announcements.
+///
+/// Replaces the previous bare `block_bytes` format. The `block_proof_bytes`
+/// field carries the `BlockProof` (bincode-encoded) alongside the block.
+///
+/// For coinbase-only blocks (no user transactions) `block_proof_bytes` is
+/// empty — those blocks are validated by native consensus only (PoW +
+/// state_root). The `STUB_MARKER [1u8;32]` in the header guards against
+/// fake "no proof" blocks that contain user transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockGossipMsg {
+    /// `Block::to_bytes()` — header + transactions.
+    pub block_bytes: Vec<u8>,
+    /// `BlockProof` bincode bytes; empty for coinbase-only blocks.
+    pub block_proof_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Recursive proof gossip message
+// ---------------------------------------------------------------------------
+
+/// Gossipsub message broadcast when the recursive chain proof advances.
+///
+/// Sent by any node (miner or relay) ~2s after a block is committed, once
+/// `prove_recursive_step` completes. Receiving nodes verify via
+/// `verify_step_stark_only` before storing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecursiveProofGossipMsg {
+    /// Height of the block this proof covers.
+    pub height: u64,
+    /// Hash of the tip block at proof time (for staleness checks).
+    pub tip_hash: [u8; 32],
+    /// `RecursiveBlockProof` bincode bytes (~6.5 KB).
+    pub proof_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
 // GossipSub topics
 // ---------------------------------------------------------------------------
 
@@ -104,6 +144,7 @@ impl Topics {
     /// Devnet defaults (used when no network is specified).
     pub const BLOCKS: &'static str = "/noid/devnet/blocks/1";
     pub const TXS: &'static str = "/noid/devnet/txs/1";
+    pub const REC_PROOFS: &'static str = "/noid/devnet/recproofs/1";
 }
 
 /// Per-network topic configuration.
@@ -111,6 +152,8 @@ impl Topics {
 pub struct NetworkTopics {
     pub blocks: String,
     pub txs: String,
+    /// Topic for `RecursiveProofGossipMsg` broadcasts.
+    pub rec_proofs: String,
     pub protocol_id: String,
 }
 
@@ -119,6 +162,7 @@ impl NetworkTopics {
         Self {
             blocks: cfg.topic_blocks.to_string(),
             txs: cfg.topic_txs.to_string(),
+            rec_proofs: cfg.topic_rec_proofs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
         }
     }

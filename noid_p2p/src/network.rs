@@ -20,14 +20,27 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::protocol::{
-    GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse, NetworkTopics,
+    BlockGossipMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
+    NetworkTopics, RecursiveProofGossipMsg,
 };
 
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
-    /// Broadcast a new block to all peers.
-    BroadcastBlock { block_bytes: Vec<u8> },
+    /// Broadcast a new block (with optional ZK proof) to all peers.
+    ///
+    /// `block_proof_bytes` is the bincode-serialised `BlockProof`. Pass an
+    /// empty `Vec` for coinbase-only blocks that have no user transactions.
+    BroadcastBlock {
+        block_bytes: Vec<u8>,
+        block_proof_bytes: Vec<u8>,
+    },
+    /// Broadcast a new recursive proof update to all peers.
+    BroadcastRecursiveProof {
+        height: u64,
+        tip_hash: [u8; 32],
+        proof_bytes: Vec<u8>,
+    },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Vec<u8> },
     /// Connect to a seed peer.
@@ -71,7 +84,19 @@ pub enum NetworkCommand {
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
     /// A new block arrived from a peer.
-    NewBlock { from: PeerId, block_bytes: Vec<u8> },
+    NewBlock {
+        from: PeerId,
+        block_bytes: Vec<u8>,
+        /// `BlockProof` bincode bytes. Empty for coinbase-only blocks.
+        block_proof_bytes: Vec<u8>,
+    },
+    /// A recursive proof update arrived from a peer.
+    RecursiveProofUpdate {
+        from: PeerId,
+        height: u64,
+        tip_hash: [u8; 32],
+        proof_bytes: Vec<u8>,
+    },
     /// A new TxIntent arrived from a peer.
     NewTx { from: PeerId, intent_bytes: Vec<u8> },
     /// Response to FetchHeaders: decoded headers from the peer.
@@ -140,10 +165,29 @@ impl P2PNetwork {
         self.event_tx.subscribe()
     }
 
-    pub async fn broadcast_block(&self, block_bytes: Vec<u8>) {
+    pub async fn broadcast_block(&self, block_bytes: Vec<u8>, block_proof_bytes: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::BroadcastBlock { block_bytes })
+            .send(NetworkCommand::BroadcastBlock {
+                block_bytes,
+                block_proof_bytes,
+            })
+            .await;
+    }
+
+    pub async fn broadcast_recursive_proof(
+        &self,
+        height: u64,
+        tip_hash: [u8; 32],
+        proof_bytes: Vec<u8>,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::BroadcastRecursiveProof {
+                height,
+                tip_hash,
+                proof_bytes,
+            })
             .await;
     }
 
@@ -243,8 +287,13 @@ async fn run_swarm(
     // Subscribe to network-specific gossip topics.
     let blocks_topic = gossipsub::IdentTopic::new(topics.blocks.clone());
     let txs_topic = gossipsub::IdentTopic::new(topics.txs.clone());
+    let rec_proofs_topic = gossipsub::IdentTopic::new(topics.rec_proofs.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&rec_proofs_topic)?;
 
     swarm.listen_on(listen_addr)?;
 
@@ -281,10 +330,44 @@ fn handle_network_command(
     topics: &NetworkTopics,
 ) {
     match cmd {
-        NetworkCommand::BroadcastBlock { block_bytes } => {
-            let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
-            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
-                tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
+        NetworkCommand::BroadcastBlock {
+            block_bytes,
+            block_proof_bytes,
+        } => {
+            let msg = BlockGossipMsg {
+                block_bytes,
+                block_proof_bytes,
+            };
+            match bincode::serialize(&msg) {
+                Ok(encoded) => {
+                    let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
+                        tracing::debug!(
+                            "gossipsub: {e} (block delivered via direct peer connections)"
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("BlockGossipMsg serialize: {e}"),
+            }
+        }
+        NetworkCommand::BroadcastRecursiveProof {
+            height,
+            tip_hash,
+            proof_bytes,
+        } => {
+            let msg = RecursiveProofGossipMsg {
+                height,
+                tip_hash,
+                proof_bytes,
+            };
+            match bincode::serialize(&msg) {
+                Ok(encoded) => {
+                    let topic = gossipsub::IdentTopic::new(topics.rec_proofs.clone());
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
+                        tracing::debug!("gossipsub rec_proof: {e}");
+                    }
+                }
+                Err(e) => tracing::error!("RecursiveProofGossipMsg serialize: {e}"),
             }
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
@@ -373,15 +456,42 @@ async fn handle_swarm_event(
         })) => {
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
+                // Decode BlockGossipMsg (new format: block + proof bytes).
+                // Fall back to treating the raw bytes as a bare block for
+                // backward compatibility during the transition period.
+                let (block_bytes, block_proof_bytes) =
+                    match bincode::deserialize::<crate::protocol::BlockGossipMsg>(&message.data) {
+                        Ok(msg) => (msg.block_bytes, msg.block_proof_bytes),
+                        Err(_) => {
+                            // Legacy format: bare block bytes, no proof.
+                            tracing::debug!("received legacy bare-block gossip (no proof)");
+                            (message.data, vec![])
+                        }
+                    };
                 let _ = event_tx.send(NetworkEvent::NewBlock {
                     from: propagation_source,
-                    block_bytes: message.data,
+                    block_bytes,
+                    block_proof_bytes,
                 });
             } else if topic == topics.txs.as_str() {
                 let _ = event_tx.send(NetworkEvent::NewTx {
                     from: propagation_source,
                     intent_bytes: message.data,
                 });
+            } else if topic == topics.rec_proofs.as_str() {
+                match bincode::deserialize::<crate::protocol::RecursiveProofGossipMsg>(
+                    &message.data,
+                ) {
+                    Ok(msg) => {
+                        let _ = event_tx.send(NetworkEvent::RecursiveProofUpdate {
+                            from: propagation_source,
+                            height: msg.height,
+                            tip_hash: msg.tip_hash,
+                            proof_bytes: msg.proof_bytes,
+                        });
+                    }
+                    Err(e) => tracing::debug!("RecursiveProofGossipMsg decode: {e}"),
+                }
             }
         }
 
@@ -457,9 +567,13 @@ async fn handle_swarm_event(
         )) => {
             if let Some(block_bytes) = response.block_bytes {
                 tracing::debug!(peer = %peer, "received block via sync");
+                // Request-response sync does not carry proof bytes;
+                // the block will be applied consensus-only and the
+                // RecursiveProofUpdate arrives separately via gossip.
                 let _ = event_tx.send(NetworkEvent::NewBlock {
                     from: peer,
                     block_bytes,
+                    block_proof_bytes: vec![],
                 });
             }
         }

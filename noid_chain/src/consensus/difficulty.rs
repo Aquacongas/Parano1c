@@ -21,37 +21,18 @@
 //!
 //! All arithmetic uses u64/u128 integers. NO FLOATS.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::consensus::params::{BLOCK_TIME, GENESIS_TARGET, HALFLIFE, MAX_TARGET, MIN_TARGET};
-
-/// When true, the difficulty floor is disabled: ASERT can ease the target all
-/// the way to MAX_TARGET (trivially satisfiable). Intended for `--testnet` only.
-/// Set once at startup before any mining. Remove before final mainnet launch.
-static TESTNET_MODE: AtomicBool = AtomicBool::new(false);
-
-/// Disable the difficulty floor so ASERT can ease difficulty below GENESIS_TARGET.
-/// Call at startup when `--testnet` is passed. Not safe for mainnet use.
-pub fn set_testnet_mode() {
-    TESTNET_MODE.store(true, Ordering::Relaxed);
-}
-
-/// Returns true if the difficulty floor is disabled (`--testnet` was passed).
-pub fn is_testnet_mode() -> bool {
-    TESTNET_MODE.load(Ordering::Relaxed)
-}
 
 /// Compute the next difficulty target. Direct port of BCH `CalculateASERT`.
 ///
 /// Inputs and output are 32-byte little-endian 256-bit targets.
 /// Result clamped to `[MIN_TARGET, GENESIS_TARGET]`:
-///   - Never easier than genesis (target ≤ GENESIS_TARGET).
+///   - Never easier than genesis (target ≤ GENESIS_TARGET). Floor always active.
 ///   - Never harder than the absolute minimum (target ≥ MIN_TARGET).
 ///
-/// The genesis difficulty floor prevents timestamp drift (e.g. a stale genesis
-/// timestamp from yesterday) from pushing blocks to trivially-easy difficulty.
-/// GENESIS_TARGET is calibrated for a laptop (~5-6 s/block at launch); all
-/// future difficulty adjustments can only go harder, never easier.
+/// The difficulty floor is unconditional: ASERT can only ever make blocks harder
+/// than genesis, never easier. GENESIS_TARGET is calibrated to ~2–3 s/block on
+/// a 12-core laptop at launch.
 pub fn next_target(
     anchor_height: u64,
     anchor_timestamp: u64,
@@ -98,21 +79,15 @@ pub fn next_target(
 
     // Short-circuit extreme shifts.
     //
-    // `wide` after mul_limbs_u64 is at most 256+17 = 273 bits
-    // (256 for a max target + 17 for max factor ≈2^17).
-    // A left shift of (320-273) = 47 bits or more shifts ALL bits out of the
-    // 320-bit wide representation → target would be ≥ 2^256 → floor at GENESIS_TARGET.
-    // Using 47 as the threshold is tight; use 46 for a 1-bit safety margin.
+    // `wide` after mul_limbs_u64 is at most 256+17 = 273 bits.
+    // A left shift ≥46 bits shifts all bits out → target ≥2^256 → clamp to GENESIS_TARGET.
+    // A right shift ≥320 bits gives zero → MIN_TARGET.
     //
-    // A right shift ≥320 bits always gives zero → MIN_TARGET.
-    // Difficulty floor active when: production build AND --testnet NOT passed.
-    //
-    // #[cfg(test)] turns the floor OFF in noid_chain unit tests so they can
-    // use trivially-easy targets ([0xFF;32]) without triggering the floor.
-    // The floor IS active in the binary and noid_node integration tests
-    // (noid_chain compiled as a regular dep, not in test mode).
+    // The difficulty floor (GENESIS_TARGET) is ALWAYS active: ASERT may never
+    // produce a target easier than genesis.  #[cfg(test)] disables the floor
+    // in noid_chain unit tests so they can use [0xFF;32] trivial targets.
     #[cfg(not(test))]
-    let floor_active = !TESTNET_MODE.load(Ordering::Relaxed);
+    let floor_active = true;
     #[cfg(test)]
     let floor_active = false;
 
@@ -460,20 +435,20 @@ mod tests {
 
     #[test]
     fn block_work_genesis_target() {
-        // GENESIS_TARGET = 2^228 (byte 28 = 0x10, bytes 29-31 = 0).
+        // GENESIS_TARGET = 2^229 (byte 28 = 0x20, bytes 29-31 = 0).
         // Leading zeros (from MSB, i.e. byte 31 down):
         //   bytes 31,30,29 = 0    → 24 leading zeros
-        //   byte 28 = 0x10 = 0b00010000 → lz(0x10) = 3 more
-        //   total = 27 → work = 2^27 = 134,217,728
+        //   byte 28 = 0x20 = 0b00100000 → lz(0x20) = 2 more
+        //   total = 26 → work = 2^26 = 67,108,864
         use crate::consensus::params::GENESIS_TARGET;
         let w = block_work(&GENESIS_TARGET);
         let val = u128::from_le_bytes(w[..16].try_into().unwrap());
-        assert_eq!(val, 1u128 << 27, "GENESIS_TARGET work = 2^27");
+        assert_eq!(val, 1u128 << 26, "GENESIS_TARGET work = 2^26");
 
         // Cross-check: MIN_SNAPSHOT_CHAINWORK = FINALITY_DEPTH × block_work(GENESIS_TARGET)
         use crate::consensus::params::{FINALITY_DEPTH, MIN_SNAPSHOT_CHAINWORK};
         let min_work = u128::from_le_bytes(MIN_SNAPSHOT_CHAINWORK[..16].try_into().unwrap());
-        let genesis_block_work = 1u128 << 27;
+        let genesis_block_work = 1u128 << 26;
         assert_eq!(
             min_work,
             FINALITY_DEPTH as u128 * genesis_block_work,

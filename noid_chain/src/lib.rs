@@ -33,8 +33,8 @@ pub mod wire;
 // ---------------------------------------------------------------------------
 
 pub use fri_state::{
-    combine_roots, eval_point_for_index, eval_point_for_local_index, merkle_root_from_leaf,
-    verify_opening, FriState, SlotColumnOpening, SlotOpening, SlotValue, StateError, StateRoot,
+    cap_to_seg_root, eval_point_for_index, eval_point_for_local_index, merkle_root_from_leaf,
+    open_segment_at_point, verify_opening, FriState, SlotOpening, SlotValue, StateError, StateRoot,
     LOG_SEGMENT_SIZE, STATE_LOG_SLOTS,
 };
 
@@ -69,8 +69,8 @@ pub use da::{
 // ---------------------------------------------------------------------------
 
 pub use block::{
-    apply_block, apply_genesis_block, compute_tx_root, proof_transcript_hash, Block,
-    BlockApplyError, BLOCK_MAX_TXS,
+    apply_block, apply_genesis_block, apply_state_delta, compute_tx_root, proof_transcript_hash,
+    Block, BlockApplyError, BLOCK_MAX_TXS,
 };
 pub use block_header::{hash_block_header, BlockHeader};
 
