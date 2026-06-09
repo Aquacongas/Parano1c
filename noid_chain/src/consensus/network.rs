@@ -109,7 +109,25 @@ impl NetworkConfig {
             topic_blocks: "/noid/mainnet/blocks/1",
             topic_txs: "/noid/mainnet/txs/1",
             topic_rec_proofs: "/noid/mainnet/recproofs/1",
-            dns_seeds: &["seed1.noid.network", "seed2.noid.network"],
+            // DNS seeds — two formats supported:
+            //
+            // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9400
+            //    Simple A-record setup.  Works immediately once the domain
+            //    points to a live node.  No PeerID verification.
+            //
+            // 2. "dnsaddr:<hostname>" → dialled as /dnsaddr/<hostname>
+            //    Resolves _dnsaddr.<hostname> TXT records.  Each TXT entry
+            //    encodes a full multiaddr including PeerID, e.g.:
+            //      _dnsaddr.noid.network TXT
+            //        "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
+            //    Connection is cryptographically verified against PeerID.
+            //    This is the libp2p standard (used by IPFS, Filecoin).
+            //    Add one TXT record per seed node; DNS round-robins them.
+            dns_seeds: &[
+                "dnsaddr:noid.network", // _dnsaddr.noid.network TXT (primary)
+                "seed1.noid.network",   // A record fallback
+                "seed2.noid.network",   // A record fallback
+            ],
         }
     }
 

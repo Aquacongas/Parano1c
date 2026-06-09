@@ -9,9 +9,9 @@ noid_chain    = { path = "../noid_chain" }
 noid_tx       = { path = "../noid_tx" }
 noid_mempool = { path = "../noid_mempool" }
 libp2p       = { version = "0.54", features = [
-    "tokio", "tcp", "noise", "yamux",
+    "tokio", "tcp", "noise", "yamux", "dns",
     "gossipsub", "request-response", "cbor", "identify",
-    "ping", "macros",
+    "ping", "macros", "kad", "mdns",
 ] }
 bincode  = "1"
 blake3   = "1"

@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use libp2p::{gossipsub, identify, request_response, swarm::SwarmEvent, Multiaddr, PeerId};
+use libp2p::{
+    gossipsub, identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId,
+};
 use tokio::sync::{mpsc, RwLock};
 
 use noid_chain::storage::MdbxChainContext;
@@ -277,10 +279,20 @@ async fn run_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_dns()?
         .with_behaviour(move |key| NodeBehaviour::new(key, &protocol_id))?
         .with_swarm_config(|cfg| {
-            // Keep connections alive for 5 minutes — essential for blockchain peers.
-            cfg.with_idle_connection_timeout(std::time::Duration::from_secs(300))
+            cfg
+                // Keep connections alive for 5 minutes — essential for
+                // blockchain peers that have infrequent block intervals.
+                .with_idle_connection_timeout(std::time::Duration::from_secs(300))
+                // Hard cap on total connections.  Prevents resource exhaustion
+                // from connection floods on large networks.
+                // 128 inbound + 64 outbound = 192 max total.
+                // Substrate uses 100 in/25 out; Ethereum clients use 50/25.
+                // We set higher defaults since Paranoid is a full-ZK node
+                // and peers actively push block proofs to each other.
+                .with_max_negotiating_inbound_streams(128)
         })
         .build();
 
@@ -296,6 +308,26 @@ async fn run_swarm(
         .subscribe(&rec_proofs_topic)?;
 
     swarm.listen_on(listen_addr)?;
+
+    // After subscribing and listening, kick off Kademlia bootstrap.
+    // This triggers FIND_NODE walks starting from any peers already in the
+    // routing table (populated when seeds connect and identify fires).
+    // The bootstrap is a no-op if the routing table is empty; it will be
+    // re-triggered automatically when the first peer is added via identify.
+    if let Err(e) = swarm.behaviour_mut().kad.bootstrap() {
+        tracing::debug!("kad bootstrap deferred (no peers yet): {e}");
+    }
+
+    // Periodic Kademlia random walk timer.
+    //
+    // Every 5 minutes we issue a FIND_NODE for a random key.  This spreads
+    // knowledge of our node through the DHT and refreshes stale k-buckets.
+    // Substrate does the same; Ethereum's discv5 equivalent is the random
+    // lookup triggered by the routing table refresh timer.
+    let mut kad_walk_interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+    kad_walk_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the first immediate tick so we don't walk before any peers exist.
+    kad_walk_interval.tick().await;
 
     loop {
         // Drain all pending commands first (priority: outgoing blocks must propagate
@@ -316,6 +348,14 @@ async fn run_swarm(
                     Some(cmd) => handle_network_command(&mut swarm, cmd, &topics),
                     None => break, // cmd_tx dropped
                 }
+            }
+
+            // Periodic Kademlia random walk for topology health.
+            _ = kad_walk_interval.tick() => {
+                // Random PeerId as target to explore different parts of the DHT.
+                let random_peer = libp2p::PeerId::random();
+                swarm.behaviour_mut().kad.get_closest_peers(random_peer);
+                tracing::debug!("kad: periodic random walk");
             }
         }
     }
@@ -494,20 +534,98 @@ async fn handle_swarm_event(
             }
         }
 
-        // --- Identify: update peer routing ---
+        // --- Identify: populate Kademlia routing table + address book ---
+        //
+        // This is the critical integration point that all libp2p chains must
+        // implement.  Without it, Kademlia only knows bootstrap nodes and
+        // discovery stops there.
+        //
+        // Reference: libp2p docs — "Peer Discovery with Identify:
+        //   the Identify protocol must be manually hooked up to Kademlia
+        //   through calls to Behaviour::add_address."
         SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
             ..
         })) => {
-            // After identify, add the peer to gossipsub routing.
+            // 1. Add every advertised listen address to the Kademlia routing
+            //    table.  This is what makes the DHT actually work: Kademlia
+            //    can now answer FIND_NODE queries with this peer's address.
+            for addr in &info.listen_addrs {
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(&peer_id, addr.clone());
+                // Also populate the swarm's address book so GossipSub PX
+                // can build signed PeerInfo records for this peer.
+                swarm.add_peer_address(peer_id, addr.clone());
+            }
+
+            // 2. Add to gossipsub explicit peers so the mesh can form even
+            //    with fewer than mesh_n connections.
             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+
+            // 3. If this was the first peer added to an empty routing table,
+            //    kick off the bootstrap walk now.
+            let _ = swarm.behaviour_mut().kad.bootstrap();
+
             tracing::debug!(
                 peer = %peer_id,
                 protocols = ?info.protocols,
+                addrs = info.listen_addrs.len(),
                 "peer identified"
             );
         }
+
+        // --- mDNS: dial LAN peers immediately ---
+        //
+        // Discovered peers are on the same LAN — dial them directly.
+        // On the public internet mDNS never fires (UDP broadcast is LAN-scoped).
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+            for (peer_id, addr) in peers {
+                tracing::debug!(peer = %peer_id, addr = %addr, "mDNS: discovered LAN peer");
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(&peer_id, addr.clone());
+                if let Err(e) = swarm.dial(addr) {
+                    tracing::debug!("mDNS dial: {e}");
+                }
+            }
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
+            for (peer_id, addr) in peers {
+                tracing::debug!(peer = %peer_id, addr = %addr, "mDNS: LAN peer expired");
+                swarm.behaviour_mut().kad.remove_address(&peer_id, &addr);
+            }
+        }
+
+        // --- Kademlia: log routing table events ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Kad(ev)) => match ev {
+            kad::Event::RoutingUpdated {
+                peer, is_new_peer, ..
+            } => {
+                if is_new_peer {
+                    tracing::debug!(peer = %peer, "kad: new peer in routing table");
+                }
+            }
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })),
+                ..
+            } => {
+                if num_remaining == 0 {
+                    tracing::debug!("kad: bootstrap complete");
+                }
+            }
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })),
+                ..
+            } => {
+                tracing::debug!(found = peers.len(), "kad: FIND_NODE returned peers");
+            }
+            _ => {}
+        },
 
         // --- Request-Response: headers client side (response to our FetchHeaders) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(

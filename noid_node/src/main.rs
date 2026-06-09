@@ -157,33 +157,48 @@ struct Cli {
 
 /// Resolve a seed string to a libp2p Multiaddr.
 ///
-/// Handles three formats:
+/// Handles four formats:
 ///
-/// 1. `HOST:PORT`          — IP or hostname with explicit port  → `/ip4/H/tcp/P` or `/dns4/H/tcp/P`
-/// 2. `hostname`           — bare DNS name (no port)            → `/dns4/hostname/tcp/{default_port}`
-/// 3. `/ip4/.../tcp/...`   — legacy multiaddr, passed through
+/// 1. `HOST:PORT`            — IP or hostname + port  → `/ip4/H/tcp/P` or `/dns4/H/tcp/P`
+/// 2. `hostname`             — bare DNS name           → `/dns4/hostname/tcp/{default_port}`
+/// 3. `/ip4/.../tcp/...`     — libp2p multiaddr, passed through unchanged
+/// 4. `dnsaddr:hostname`     — _dnsaddr TXT lookup     → `/dnsaddr/hostname`
 ///
-/// Format 2 is how DNS seeds work: libp2p resolves the hostname at dial time.
-/// When the seed server goes live the node connects automatically without restart.
+/// Format 4 is the production DNS seed mechanism.  libp2p resolves
+/// `_dnsaddr.<hostname>` TXT records at dial time, each encoding a full
+/// multiaddr with PeerID.  This gives cryptographic peer verification and
+/// easy multi-node seed rotation via DNS.
+///
+/// DNS setup for format 4:
+///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
+///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9400/p2p/12D3KooW..."
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
-    // Strip /p2p/<peer-id> suffix if present
+    // Format 4: "dnsaddr:<hostname>" → /dnsaddr/<hostname>
+    // Resolves _dnsaddr.<hostname> TXT records (libp2p standard).
+    if let Some(host) = s.strip_prefix("dnsaddr:") {
+        let ma_str = format!("/dnsaddr/{}", host.trim());
+        return ma_str
+            .parse()
+            .with_context(|| format!("build dnsaddr multiaddr for {host:?}"));
+    }
+
+    // Strip /p2p/<peer-id> suffix if present (format 3 variant)
     let base = s.split("/p2p/").next().unwrap_or(s).trim();
 
-    // Already a multiaddr?
+    // Format 3: already a multiaddr?
     if base.starts_with('/') {
         return base
             .parse()
             .with_context(|| format!("parse multiaddr: {base}"));
     }
 
-    // HOST:PORT format
+    // Format 1: HOST:PORT
     if base.contains(':') {
         return ip_port_to_multiaddr(base);
     }
 
-    // Bare hostname (DNS seed) — use default network port.
-    // /dns4/ triggers libp2p DNS resolution at dial time, so the node
-    // will connect as soon as the seed goes live.
+    // Format 2: bare hostname — use default network port.
+    // /dns4/ triggers libp2p DNS resolution at dial time.
     let ma_str = format!("/dns4/{base}/tcp/{default_port}");
     ma_str
         .parse()
