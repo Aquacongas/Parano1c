@@ -7,13 +7,13 @@
     clippy::manual_memcpy
 )]
 
-//! Stage 3c-1.4a — `PoseidonPermAir` witness layout + trace builder.
+//! `PoseidonPermAir` witness layout + trace builder.
 //!
 //! One Poseidon2b permutation rendered as a witness trace on the
 //! boolean hypercube. This module pins the column layout and supplies
 //! a `build_trace(input)` helper that produces a witness bit-for-bit
 //! equivalent to `noid_poseidon2b::native::permutation::permute_mut`.
-//! The STARK constraint emitter lands in 3c-1.4b; shipping the builder
+//! The STARK constraint emitter is in `poseidon_constraints`; shipping the builder
 //! first gives us a golden reference to validate gates against.
 //!
 //! # Row programme
@@ -53,10 +53,11 @@
 //! | 29       | `is_round`   | `1` on rows `0..N_ROUNDS`, `0` on      |
 //! |          |              | output row + padding                   |
 //!
-//! The `rc[..]` columns carry the round-constant programme verbatim on
-//! active rows `0..N_ROUNDS` and zero on the output/padding rows. At
-//! this stage they are trusted public input; §3d's `ConstColumnGate`
-//! will pin them to the literal constants.
+//! The `rc[..]` columns, along with `is_full` and `is_round`, carry
+//! fixed programmes and are declared as `PublicColumn`s via
+//! [`emit_perm_public_columns`]. The native `Air::check` path and the
+//! STARK verifier both enforce that the committed trace matches these
+//! programmes cell-by-cell.
 //!
 //! Partial-round rows zero out lanes 1..3 of `sin`, `x2`, `x4`, `x3`,
 //! `sout` — the MDS_PARTIAL gate then reads `sout[0]` as the only live
@@ -821,7 +822,7 @@ impl Constraint for PartialSboxKillGate {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3d-0.3 — Public-column programmes for the perm selectors + RC
+// Public-column programmes for the perm selectors + RC
 // ---------------------------------------------------------------------------
 
 /// Build the `is_full` programme column as a length-`POSEIDON_PERM_N_ROWS`
@@ -886,7 +887,7 @@ pub fn emit_perm_public_columns() -> Vec<PublicColumn> {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3d-0.4 — Row-major public-column programmes for stacked permutations
+// Row-major public-column programmes for stacked permutations
 // ---------------------------------------------------------------------------
 
 /// Build the `is_full` programme column for a row-major stack of
@@ -1463,7 +1464,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Stage 3d-0.3 — PublicColumn programmes for rc / is_full / is_round
+    // PublicColumn programmes for rc / is_full / is_round
     // ---------------------------------------------------------------------
 
     #[test]

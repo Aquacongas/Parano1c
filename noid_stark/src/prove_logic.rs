@@ -144,7 +144,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
 
     let auth_circuit = AuthCircuit::build();
 
-    // Stage 1: Build auth boundary MLE and slice it
+    // Build auth boundary MLE and slice it
     let auth_unified_mle = build_auth_unified_from_inputs(&auth_circuit, auth_inputs);
     let auth_state_mle = auth_unified_mle.state;
     debug_assert_eq!(auth_state_mle.len(), 1 << N_AUTH_UNIFIED_VARS);
@@ -155,7 +155,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     let n_air_cols = trace.columns.len();
     let n_boundary_slices = auth_slices.len();
 
-    // Stage 2: Build extended column set (AIR + N_AUTH_SLICES auth slices)
+    // Build extended column set (AIR + N_AUTH_SLICES auth slices)
     let log_len = crate::padded_log_len(trace.log_rows);
     debug_assert_eq!(log_len, BASE_LOG);
 
@@ -167,7 +167,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
         all_columns.push(s.clone());
     }
 
-    // Stage 3: Interleaved commit + AuthGKR
+    // Interleaved commit + AuthGKR
     let ntt = noid_core::AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = noid_poseidon2b::native::compression::Poseidon2bSponge::new();
     let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
@@ -177,7 +177,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     let (auth_proof, auth_reductions) =
         prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel);
 
-    // Stage 4: STARK with auth slice claims only
+    // STARK with auth slice claims only
     let extras_transcript =
         reduction_to_transcript(&auth_reductions.state.point, auth_reductions.state.value);
 
@@ -251,7 +251,7 @@ pub fn verify_logic(
         return Err(VerifyLogicError::Stark(VerifyError::ShapeMismatch));
     }
 
-    // Stage 1: Verify AuthGKR Kill-Shot
+    // Verify AuthGKR Kill-Shot
     if proof.stark.commitment.n_cols != n_air_cols + n_slices {
         return Err(VerifyLogicError::Stark(VerifyError::ShapeMismatch));
     }
@@ -274,7 +274,7 @@ pub fn verify_logic(
         }
     }
 
-    // Stage 2: Verify STARK with auth slice claims
+    // Verify STARK with auth slice claims
     let extras_transcript =
         reduction_to_transcript(&auth_reductions.state.point, auth_reductions.state.value);
 

@@ -3,10 +3,10 @@
 
 #![allow(clippy::needless_range_loop, clippy::doc_overindented_list_items)]
 
-//! Stage 1.5.4-A — round-shift index helpers and public MLE evaluators
+//! Round-shift index helpers and public MLE evaluators
 //! for the unified Spine Kill-Shot sumcheck.
 //!
-//! The unified sumcheck (Stage 1.5.4) proves
+//! The unified Kill-Shot sumcheck proves
 //!
 //! ```text
 //!   Σ_y  U(y) · [ C1(dec(y)) + β · C2(y) ] = 0
@@ -304,7 +304,7 @@ pub fn mds_coeff(round: usize, i: usize, j: usize) -> Block128 {
 }
 
 // ---------------------------------------------------------------------------
-// Permutation helpers (Stage 1.5.4-B Variant I).
+// Permutation helpers (unified sumcheck Variant I).
 //
 // All "_dec" tables are pure permutations of their source by
 // `dec_round_index`. They let the unified sumcheck treat all factors

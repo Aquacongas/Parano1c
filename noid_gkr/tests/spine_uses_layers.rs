@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G1a cross-check — running the 59-slot spine via the layered
+//! Spine cross-check — running the 59-slot spine via the layered
 //! evaluator instead of `Poseidon2bPermutation::permute_mut` must
-//! produce the same `tx_body_hash`. This guards against drift between
+//! produce the same `tx_body_hash`. Guards against drift between
 //! the layered witness and the native reference.
 
 use noid_core::Block128;
@@ -51,7 +51,7 @@ fn payload_to_lanes(p: [u128; 4]) -> [Block128; 4] {
 
 #[test]
 fn oracle_output_equals_native_with_layered_cross_check() {
-    // Build the same full-tx fixture as the G0 differential test.
+    // Build the same full-tx fixture as the spine oracle differential test.
     let addrs: Vec<Address> = (0..4)
         .map(|i| derive_address(&SpendSecret([i as u8 + 1; 32])))
         .collect();
@@ -120,9 +120,9 @@ fn oracle_output_equals_native_with_layered_cross_check() {
     let circuit = SpineCircuit::build();
     let wit = evaluate_spine(&circuit, &inputs);
 
-    // Spine oracle (G0) must still match native after G1a lands — the
-    // oracle uses Poseidon2bPermutation directly, not the layered
-    // evaluator, so this is the invariance we keep.
+    // The spine oracle must match native — it uses Poseidon2bPermutation
+    // directly, not the layered evaluator, so this is the invariance
+    // we keep.
     assert_eq!(wit.tx_body_hash_bytes(), native.0);
 
     // Cross-check: re-run one slot's permutation through the layered

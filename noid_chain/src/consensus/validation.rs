@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Native block validation pipeline (SPECIFICATION.md §16).
+//! Native block validation pipeline.
 //!
 //! `validate_block_consensus` enforces all consensus rules that do NOT require
 //! ZK proof verification. ZK verification (LogicProof + BlockProof) is layered
@@ -26,8 +26,8 @@
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
 //!  ❌  da_root / witness_root binding (needs packed DA data)
 
-use crate::block::Block;
 use crate::block::apply_block;
+use crate::block::Block;
 use crate::block_header::BlockHeader;
 use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
@@ -57,7 +57,7 @@ pub struct AnchorInfo {
 ///   2. `verify_block(BlockProof)` — ZK proof verification
 ///   3. `apply_state_delta()` — write delta to MDBX (no pre-state reads)
 ///
-/// Note: does NOT check `state_root` (that’s done by ZK Step 2+3).
+/// Note: does NOT check `state_root` (that's done by ZK proof verification).
 /// Does NOT check `active_slot_count` / `alloc_counter` (done by `apply_state_delta`).
 pub fn validate_block_checks(
     block: &Block,
@@ -129,7 +129,9 @@ pub fn validate_block_checks(
 
 /// Validate all native consensus rules for a block and apply it to `state`.
 ///
-/// **Legacy / non-ZK path.** For the ZK-verified path, use:
+/// **Non-ZK path.** Validates all native consensus rules and applies the
+/// state transition without ZK proof verification.
+/// For the full ZK-verified path, use:
 ///   `validate_block_checks` + `verify_block(BlockProof)` + `apply_state_delta`.
 ///
 /// On success, `state` is updated. On failure, `state` is left unchanged.
@@ -203,8 +205,6 @@ pub fn validate_block_consensus(
 
     // --- Coinbase amount validation (P.7) ---
     // Sum fees directly from &Transaction references — no TxBody cloning.
-    // Previously this cloned all non-coinbase TxBody objects into a Vec just to
-    // pass to max_coinbase_value(); at 1024 txs that is ~1024 allocs + memcpys.
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
             let cb_value: u64 = cb

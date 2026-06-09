@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage G1b.α — packing the G1a layered witness as multilinear
+//! Packing the layered Poseidon2b permutation witness as multilinear
 //! extensions.
 //!
 //! A single permutation's witness has `N_ROWS = N_ROUNDS + 1 = 67`
@@ -48,20 +48,6 @@ pub enum PermColumn {
     X3,
     X4,
     Sout,
-}
-
-/// Fast path: pack only the `sout` column. Verifier uses this to
-/// evaluate `sout(r0)` without materialising the other five columns.
-pub fn pack_sout(witness: &PermLayerWitness) -> Vec<Block128> {
-    let mut out = vec![Block128::from(0u128); N_PERM_CELLS];
-    let rows = witness.sout.len();
-    debug_assert!(rows <= N_ROWS_PADDED);
-    for row in 0..rows {
-        for lane in 0..STATE_SIZE {
-            out[(row << 2) | lane] = witness.sout[row][lane];
-        }
-    }
-    out
 }
 
 /// Pack one column of a layered permutation witness as an MLE over

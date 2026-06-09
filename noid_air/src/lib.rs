@@ -791,8 +791,8 @@ impl CompositeAir {
     }
 
     /// Consume the composite and return its `(log_rows, n_cols,
-    /// constraints, public_columns)`. Used by Stage 5.7 PR B.3 to
-    /// embed an already-built composite (e.g. `TxValidityCompositeLeaf`)
+    /// constraints, public_columns)`. Used by `TxValidityCompositeWithSpine`
+    /// to embed an already-built composite (e.g. `TxValidityCompositeLeaf`)
     /// inside a larger outer composite without re-instantiating the
     /// underlying sub-AIRs.
     pub fn into_parts(self) -> (usize, usize, Vec<Box<dyn Constraint>>, Vec<PublicColumn>) {

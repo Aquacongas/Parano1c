@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage 3b-0.6 — shared helpers for the ladder-merge protocol.
+//! Shared helpers for the ladder-merge protocol.
 //!
 //! See CRYPTO.md §12c' for the protocol and soundness argument. The
 //! legacy per-slot product sumcheck (old §12a) is gone: ladder claims

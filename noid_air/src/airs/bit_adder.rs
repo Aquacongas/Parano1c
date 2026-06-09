@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! `BitAdderAir` — Stage 3b-3a width-parameterised ripple-carry adder.
+//! `BitAdderAir` — width-parameterised ripple-carry adder.
 //!
 //! Generalises `CarryRippleAir` to arbitrary input width `W ≤ 127`.
 //! Each adder instance occupies `WORD_BITS = 128` consecutive rows of
@@ -330,11 +330,11 @@ pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block1
 /// the tower-of-adders composition in §3b-3 only populates instance 0
 /// with the real tx and pads the rest.
 ///
-/// Stage 2(a) / §3d-0.10.5 primitive. Used by the balance AIR to pin
+/// PublicColumn pinning primitive. Used by the balance AIR to pin
 /// each primary operand column (4 inputs + 8 outputs + fee = 13 slots)
 /// to the public `TxBody` u64 value via a single `PublicColumn`
 /// declaration, closing the "witness `Value` ↔ balance-operand bits"
-/// binding gap from §3b-4 without any new gate types or widened trace.
+/// binding gap without any new gate types or widened trace.
 pub fn bit_adder_operand_programme(width: usize, value: u64, log_rows: usize) -> Vec<Block128> {
     assert!((1..=64).contains(&width));
     assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);

@@ -83,9 +83,6 @@ pub struct MempoolEntry {
     /// re-doing any per-tx work.  `prove_block` then only runs the unified
     /// block-level SpineGKR + single FRI opening.
     pub cached_algebraic_proof: Option<Vec<u8>>,
-
-    /// Spine MLE slot data (future optimisation: pre-computed from WalletProofBundle).
-    pub spine_slots: Option<Vec<u8>>,
 }
 
 impl MempoolEntry {
@@ -110,7 +107,6 @@ impl MempoolEntry {
             anchor_height,
             fee_rate,
             cached_algebraic_proof: None,
-            spine_slots: None,
         }
     }
 }

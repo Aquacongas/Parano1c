@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage 1.5.4-B — unified Kill-Shot sumcheck (main half).
+//! Unified Kill-Shot sumcheck — main half.
 //!
 //! Discharges the full Spine algebraic surface (C1 + β·C1' + γ·C2)
 //! in a single degree-9 sumcheck of length `N_SPINE_UNIFIED_VARS = 15`.
@@ -25,7 +25,7 @@
 //!
 //! Eleven of these (everything except `state(r')`) live on permuted
 //! columns and are reduced to claims on the original committed
-//! columns by the shift gadget in Stage 1.5.4-C. `state(r')` is
+//! columns by the shift gadget in `spine_shift`. `state(r')` is
 //! already a direct opening and goes straight to `batch_eval`.
 //!
 //! The verifier recomputes the four public schedules `U`, `σ_dec`,
@@ -138,7 +138,7 @@ pub fn prove_spine_unified_for_live_slots<T: FiatShamir<Block128>>(
     let beta = channel.squeeze();
     let gamma = channel.squeeze();
 
-    // Stage 1.5.8.A: flat-basis prover hot path.
+    // Flat-basis prover hot path.
     //
     // The 23-table bundle is materialised once in tower basis (so the
     // public-schedule constructors stay reusable elsewhere), then
@@ -450,7 +450,7 @@ impl UnifiedTables {
 
 /// Tower-basis reference implementation of the round polynomial. The
 /// prover hot path now goes through `compute_round_polynomial_flat`
-/// (Stage 1.5.8.A); this version is kept as a parity oracle for the
+/// (flat-basis hot path); this version is kept as a parity oracle for the
 /// `flat_round_poly_matches_tower_round_poly` unit test below.
 #[allow(dead_code)]
 fn compute_round_polynomial(
@@ -531,7 +531,7 @@ fn compute_round_polynomial(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1.5.8.A — flat-basis prover hot path.
+// Flat-basis prover hot path.
 //
 // The 23-table bundle is materialised once in tower basis (so the
 // public-schedule constructors keep reusable elsewhere), then hoisted
@@ -635,10 +635,10 @@ fn t_flat_table() -> [u128; SPINE_UNIFIED_ROUND_DEGREE + 1] {
     std::array::from_fn(|k| tower_to_flat_u128(k as u128))
 }
 
-/// Per-evaluation-point flat-basis prover (Stage 1.5.8.A baseline).
+/// Per-evaluation-point flat-basis prover (baseline).
 ///
 /// Kept as a parity oracle for the monomial-form prover
-/// `compute_round_polynomial_flat` (Stage 1.5.8.B). Production callers
+/// `compute_round_polynomial_flat` (monomial form). Production callers
 /// go through the monomial form.
 #[allow(dead_code)]
 fn compute_round_polynomial_flat_per_eval(
@@ -737,7 +737,7 @@ fn compute_round_polynomial_flat_per_eval(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1.5.8.B — monomial-form prover (Lagrange/DP amortisation).
+// Monomial-form prover (Lagrange/DP amortisation).
 //
 // Reformulation. Inside one cell, every witness factor is affine in
 // the round variable `t`: `x(t) = x0 + t · dx`. So the round-poly
@@ -944,7 +944,7 @@ fn compute_round_polynomial_flat(
 }
 
 // ===========================================================================
-// Stage 1.5.4-C — Shift Gadget.
+// Shift Gadget.
 //
 // Reduces the eleven `_dec` / `_lane_dec` claims emitted by the main
 // sumcheck to three claims on the *original* committed columns
@@ -1036,7 +1036,7 @@ pub fn prove_spine_shift<T: FiatShamir<Block128>>(
     // The prover does NOT need to assert it explicitly — the
     // sumcheck protocol will reject if the prover lies about C.
 
-    // Stage 1.5.8.A.2: flat-basis prover hot path for the shift gadget.
+    // Flat-basis prover hot path for the shift gadget.
     // Same shape as the main sumcheck — convert the six tables to flat
     // basis once, run all 15 folds + round-poly computes in flat, lift
     // back to tower at the boundary.
@@ -1356,7 +1356,7 @@ fn boolean_tensor(point: &[Block128]) -> Vec<Block128> {
 
 /// Tower-basis reference implementation of the shift-gadget round
 /// polynomial. Kept as a parity oracle for
-/// `flat_shift_round_poly_matches_tower` (Stage 1.5.8.A.2). Production
+/// `flat_shift_round_poly_matches_tower`. Production
 /// callers go through `compute_shift_round_polynomial_flat`.
 #[allow(dead_code)]
 fn compute_shift_round_polynomial(
@@ -1478,7 +1478,7 @@ mod tests {
 
     #[test]
     fn pow7_poly_t_matches_naive() {
-        // Stage 1.5.8.B.1: the 8-coefficient build of (a + t·b)^7 must
+        // Monomial-form parity check: the 8-coefficient build of (a + t·b)^7 must
         // agree with `pow7_flat_block128(a ^ clmul_gcm(t, b))` for
         // every flat-basis t, evaluated as a degree-7 polynomial in t.
         use rand::Rng;
@@ -1506,10 +1506,10 @@ mod tests {
 
     #[test]
     fn flat_round_poly_matches_tower_round_poly() {
-        // Stages 1.5.8.A & 1.5.8.B parity test: the flat-basis prover
-        // hot path (monomial form) must compute the bit-identical
-        // round polynomial as the tower-basis reference, AND as the
-        // per-evaluation flat-basis baseline, in every round.
+        // Parity test: the flat-basis prover hot path (monomial form)
+        // must compute the bit-identical round polynomial as both the
+        // tower-basis reference and the per-evaluation flat-basis
+        // baseline, in every round.
         let mle = random_mle(424242);
         let rho: Vec<Block128> = (0..N_SPINE_UNIFIED_VARS)
             .map(|k| Block128::from(0xA5A5_DEAD_BEEFu128.wrapping_mul((k as u128) + 1)))
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn flat_shift_round_poly_matches_tower() {
-        // Stage 1.5.8.A.2 parity: the flat-basis shift gadget round
+        // Flat-basis shift gadget parity: the round
         // polynomial is bit-identical to the tower-basis reference.
         use rand::Rng;
         let mut rng = rand::thread_rng();

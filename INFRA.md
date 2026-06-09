@@ -357,9 +357,7 @@ valid RecursiveProof without solving the underlying ZK hardness assumption.
 
 ### Why Miners Are Not Trusted Authorities
 
-In the current (pre-change) architecture, non-mining full nodes used
-`null_block_replay_witness`, producing RecursiveProofs that proved only chain
-linkage, not ZK validity. After the architecture change:
+Every node independently enforces full ZK validity:
 
 - Every node receives real `BlockProof` bytes in gossip
 - Every node verifies `BlockProof` before applying a block

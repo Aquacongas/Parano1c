@@ -248,7 +248,7 @@ impl RecursiveBlockAir {
 
         // ---- Accumulator state-root pins at ACC_ROW ----
         // The 32-byte state root is split into two 16-byte Block128 halves.
-        // At row 26 (where sel_acc == 1):
+        // At row 22 (where sel_acc == 1):
         //   COL_P0 must equal sr_hi (first 16 bytes)
         //   COL_P1 must equal sr_lo (last  16 bytes)
         let sr = &witness.acc_prev_state_root;
@@ -386,7 +386,7 @@ pub fn build_recursive_trace(witness: &RecursiveBlockWitness) -> Vec<Vec<Block12
         rec_claim = claim_out;
     }
 
-    // ---- Accumulator row (26) ----
+    // ---- Accumulator row (22) ----
     // COL_P0 and COL_P1 carry the two halves of the previous state root.
     // These must match the constants pinned by RecursiveBlockAir::new.
     let sr = &witness.acc_prev_state_root;

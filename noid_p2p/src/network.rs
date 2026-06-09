@@ -456,23 +456,22 @@ async fn handle_swarm_event(
         })) => {
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
-                // Decode BlockGossipMsg (new format: block + proof bytes).
-                // Fall back to treating the raw bytes as a bare block for
-                // backward compatibility during the transition period.
-                let (block_bytes, block_proof_bytes) =
-                    match bincode::deserialize::<crate::protocol::BlockGossipMsg>(&message.data) {
-                        Ok(msg) => (msg.block_bytes, msg.block_proof_bytes),
-                        Err(_) => {
-                            // Legacy format: bare block bytes, no proof.
-                            tracing::debug!("received legacy bare-block gossip (no proof)");
-                            (message.data, vec![])
-                        }
-                    };
-                let _ = event_tx.send(NetworkEvent::NewBlock {
-                    from: propagation_source,
-                    block_bytes,
-                    block_proof_bytes,
-                });
+                match bincode::deserialize::<crate::protocol::BlockGossipMsg>(&message.data) {
+                    Ok(msg) => {
+                        let _ = event_tx.send(NetworkEvent::NewBlock {
+                            from: propagation_source,
+                            block_bytes: msg.block_bytes,
+                            block_proof_bytes: msg.block_proof_bytes,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            peer = %propagation_source,
+                            err = %e,
+                            "block gossip deserialize failed, dropping"
+                        );
+                    }
+                }
             } else if topic == topics.txs.as_str() {
                 let _ = event_tx.send(NetworkEvent::NewTx {
                     from: propagation_source,

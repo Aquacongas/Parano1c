@@ -60,10 +60,11 @@ The full node never re-runs the wallet logic. It verifies the proof that the wal
 Every block extends a rolling accumulator:
 
 ```
-chain_hash_n = Poseidon2b_compress(chain_hash_{n-1}, H_BLOCK(header_n))
+inner_n       = Poseidon2b_compress(H_BLOCK(header_n), block_initial_claim_n)
+chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 ```
 
-The recursive proof proves that this accumulator was correctly computed from genesis, and that the current `state_root` is the result. It is a single STARK over a 256-row trace — constant size regardless of chain length.
+`block_initial_claim` encodes the MLE evaluation of the block’s slot-state transitions and is folded into every step, binding the chain hash to both the block header and the block’s state-transition proof. The recursive proof proves that this accumulator was correctly computed from genesis, and that the current `state_root` is the result. It is a single STARK over a 256-row trace — constant size regardless of chain length.
 
 **Result:** A new node downloads:
 1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
@@ -98,8 +99,8 @@ The PCS is **FRI-Binius** — Reed-Solomon over binary towers with compact inter
 This is Paranoid's core cryptographic innovation. Poseidon2b proving is the bottleneck in every ZK system using it. The standard approach decomposes S-box constraints into degree-2 layers:
 
 ```
-Standard: 8 sumcheck rounds per permutation × (59 + 20) permutations = 632 rounds
-          → 4,248 Fiat-Shamir challenges, >280 KB proof per transaction
+Standard (spine only): 59 permutations × 8 sumchecks × 9 rounds = 4,248 FS challenges
+                       per-tx proof hash component: >280 KB
 ```
 
 FROST-GKR exploits the Frobenius endomorphism in GF(2^128):
@@ -110,7 +111,7 @@ x^7 = x · x² · x⁴
      1 mult  free  free   (squaring is linear over GF(2))
 ```
 
-S-box evaluation requires only **3 multiplications** (+ 2 free squarings). This makes it natively degree-7, eliminating all degree decomposition. A single **unified degree-7 sumcheck** runs over all 59 (or 20) permutations simultaneously. The MDS matrix transition is handled by a **Shift Gadget** — a bounded-degree polynomial over the permutation state that folds into the same sumcheck.
+S-box evaluation requires only **3 multiplications** (+ 2 free squarings). This makes the S-box natively degree-7 — no auxiliary columns, no degree-2 decomposition needed. A single **unified sumcheck** (round polynomial degree 9: eq × selector × s_in⁷) runs over all 59 (or 20) permutations simultaneously. The MDS matrix transition is handled by a **Shift Gadget** — a bounded-degree polynomial over the permutation state that folds into the same sumcheck.
 
 The result is a single Kill-Shot proof per GKR instance:
 
@@ -218,10 +219,10 @@ The entire stack is hash-based and algebraic:
 | Component | Classical | Post-Quantum | Notes |
 |---|---|---|---|
 | FRI-Binius PCS | 128 bits | **128 bits** | Information-theoretic (64q × log₂(rate-4)); quantum-invariant by proof |
-| STARK / GKR sumcheck | ~128 bits | **~128 bits** | Schwartz–Zippel over GF(2¹²⁸); quantum-invariant by proof |
+| STARK / GKR sumcheck | ~120 bits | **~120 bits** | Schwartz–Zippel over GF(2¹²⁸); quantum-invariant by proof; bottleneck is FROST-GKR (345/2¹²⁸) |
 | Poseidon2b preimage | 256 bits | **128 bits** | Grover: O(√2²⁵⁶); **PQ < classical** |
 | Blake3 / Poseidon2b collision | 128 bits | **~128 bits** | Grover on 2nd-preimage; BHT collision is O(2⁸⁵) but requires O(2⁸⁵) QRAM (impractical) |
-| **System min** | **128 bits** | **128 bits** | |
+| **System min** | **~120 bits** | **~120 bits** | Bottleneck: FROST-GKR unified sumcheck |
 
 The algebraic layers (FRI proximity, sumcheck, GKR) are **information-theoretic** — their
 soundness bound holds against any prover, classical or quantum, by the Schwartz–Zippel lemma.
@@ -261,12 +262,16 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 
 ## Security Model
 
-**What ZK proofs guarantee:**
-- Spender knows the Poseidon2b preimage of the input address (128-bit soundness, Schwartz–Zippel over GF(2¹²⁸))
+**Soundness guarantees** (what the proof system makes cryptographically infeasible to fake):
+- Ownership: spender knows the Poseidon2b preimage of the input address — ~120-bit soundness via Schwartz–Zippel over GF(2¹²⁸); bottleneck is FROST-GKR sumcheck (345/2¹²⁸)
 - Balance is conserved; all values are in range
 - State root is correctly computed from the claimed slot transitions
 - `tx_body_hash` binding prevents cross-transaction replay of proof artifacts
-- Every block received by a full node is ZK-verified before being applied
+- Every block accepted by a full node has been proof-verified before application
+
+**Privacy guarantee** (what the proof does not reveal):
+- `spend_secret` cannot be recovered from any proof or wire artifact — computational one-wayness under Poseidon2b preimage resistance
+- Note: the GKR transcript is not zero-knowledge in the standard simulator sense; it leaks the Poseidon2b execution trace in a one-way form. An observer cannot recover the secret, but two proofs from different secrets are distinguishable. See `SECURITY_MODEL.md §10`.
 
 **What PoW guarantees:**
 - Canonical ordering of valid transitions

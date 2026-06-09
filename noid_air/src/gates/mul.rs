@@ -4,11 +4,9 @@
 //! `MulGate` / `SquareGate`: degree-2 algebraic gates asserting
 //! `out == a · b` (resp. `out == a · a`) over GF(2^128).
 //!
-//! Promoted from ad-hoc forms inside §3a/§3b AIRs to first-class gates
-//! in preparation for §3c Poseidon arithmetization: every round of the
-//! Poseidon2b permutation is a fixed chain of squarings and products
-//! over `Block128`, so the S-box sub-circuit is expressed as repeated
-//! applications of these two primitives.
+//! Used throughout the AIR library: the Poseidon2b S-box sub-circuit
+//! (`poseidon_sbox`) is a fixed chain of squarings and products over
+//! `Block128`, expressed as repeated applications of these two primitives.
 //!
 //! In char-2 the constraint `out + a·b == 0` is the same as
 //! `out − a·b == 0`; we write the char-2 form because `+` and `−`
@@ -100,9 +98,9 @@ impl Constraint for SquareGate {
 ///
 /// Motivation. Several AIR stages stack two `MulGate`s through an
 /// intermediate committed column to express a triple product —
-/// e.g. `FriStateOpenAir`'s β.2.a pipeline
+/// e.g. `BlockStateBindingAir`'s gamma-RLC pipeline
 ///   `gp_lane = γ^i · (eq(r, slot_bits) · opened_pre_lane)`
-/// which α + β.2.a split via a committed `col_mle_prod_*`
+/// which would otherwise require a committed `col_mle_prod_*`
 /// intermediate. Fusing to one degree-3 gate drops the intermediate
 /// column (one fewer FRI commitment per lane) at the cost of one
 /// more degree level, which the quotient machinery already

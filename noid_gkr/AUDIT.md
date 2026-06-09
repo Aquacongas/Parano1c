@@ -16,8 +16,7 @@ The GKR track proves:
 
 Both use the Kill-Shot protocol: a single unified degree-7 sumcheck +
 a Shift Gadget + 3x batch-eval reductions. This is the sole
-production path. The former per-slot PermProof chain is retained in
-the crate only for differential testing.
+production path.
 
 ## Non-goals
 
@@ -154,8 +153,9 @@ configurations. Cross-fixture tests (`stage_5_7_roundtrip.rs`,
      opening.
    - Auth: `tx_body_hash` -> expected outputs -> same unified/shift/
      batch pattern.
-4. Any re-ordering invalidates transcript vectors and will be caught
-   by `tests/transcript_vectors.rs`.
+4. Any re-ordering invalidates transcript vectors; regression is caught
+   by the integration tests in `spine_killshot_vs_native.rs` and
+   `auth_killshot_vs_native.rs`.
 
 ---
 
@@ -194,18 +194,15 @@ configurations. Cross-fixture tests (`stage_5_7_roundtrip.rs`,
 ## Test coverage matrix
 
 | area | file | covers |
-|---|---|---|
+|---|---|
 | Kill-Shot spine | `tests/spine_killshot_vs_native.rs` | honest proof/verify, mutations, transcript match |
 | Kill-Shot auth | `tests/auth_killshot_vs_native.rs` | honest proof/verify, privacy invariant, output pin check |
+| Kill-Shot Merkle | `tests/merkle_killshot_vs_native.rs` | honest proof/verify, depth 1/8/16, root/sibling tamper |
 | layer witness | `tests/layered_witness.rs` | MDS schedule, S-box, partial-round kill |
 | MLE packing | `tests/mle_layout.rs` | hypercube roundtrip, packing determinism |
-| batch-eval primitive | `tests/product_sumcheck.rs` | honest + mutations + transcript determinism |
-| legacy per-perm | `tests/perm_sumcheck.rs` | differential reference (not production) |
-| legacy spine | `tests/spine_sumcheck.rs` | differential reference (not production) |
 | G0 differential | `tests/differential_vs_native.rs` | oracle = native hash, coinbase, wrap role |
 | cross-check | `tests/spine_uses_layers.rs` | layered evaluator = permute_mut on full spine |
 | fuzz | `tests/fuzz_spine.rs` | N random fixtures (default 1024) |
-| transcript vectors | `tests/transcript_vectors.rs` | 5 fixtures x byte-determinism + distinct fingerprints |
 
 STARK integration:
 - `noid_stark/tests/stage_5_7_roundtrip.rs` — full prove/verify with

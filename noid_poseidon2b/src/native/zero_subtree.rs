@@ -12,7 +12,7 @@
 //! `[0u8; 32]` leaves. Under the segmented architecture, the segment-tree leaves are FRI combined
 //! roots of all-zero segment columns — a different base value.
 //!
-//! **For the expansion procedure (SPECIFICATION.md §15.3.7), use
+//! **For the expansion procedure, use
 //! `noid_chain::segmented_state::zero_segtree_node(d)` instead.**
 //!
 //! This module is retained for reference and tests that verify the

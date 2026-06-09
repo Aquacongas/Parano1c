@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G1b.α tests — MLE column packing of the layered witness.
+//! MLE column packing tests for the layered Poseidon2b witness.
 
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::Block128;

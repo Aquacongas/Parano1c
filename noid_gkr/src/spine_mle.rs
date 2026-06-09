@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop, clippy::doc_overindented_list_items)]
 
-//! Stage 1.5.3 — unified 15-variable MLE layout for the Spine Kill Shot.
+//! Unified 15-variable MLE layout for the Spine Kill-Shot.
 //!
 //! Architecture
 //! ------------
@@ -37,7 +37,7 @@
 //!     and rounds 67..127 are zero by convention.
 //!   - Slots `N_SPINE_SLOTS..64` are zero-padded.
 //!
-//! Identities discharged by the unified Stage 1.5.4 sumcheck (degree 9
+//! Identities discharged by the unified Kill-Shot sumcheck (degree 9
 //! after the change of variable `y = inc_round(x)`):
 //!
 //! ```text
@@ -72,8 +72,7 @@ use noid_poseidon2b::native::permutation::{F_ROUNDS, N_ROUNDS, P_ROUNDS, STATE_S
 use crate::layers::{evaluate_permutation, PermLayerWitness, RoundKind};
 
 /// Number of slots in the tx-body spine. Mirrors
-/// `spine_sumcheck::N_SPINE_SLOTS` so the kill-shot and legacy paths
-/// stay in lockstep on topology.
+/// `spine_sumcheck::N_SPINE_SLOTS`; both constants must stay in sync.
 pub const N_SPINE_SLOTS: usize = 59;
 
 /// `log2(64) = 6` slot variables.
@@ -172,7 +171,7 @@ impl SpineUnifiedMle {
 
     /// Local consistency check: every cell satisfies all three
     /// kill-shot identities (`C1`, `C1'`, `C2`). Used by debug paths
-    /// and the differential test in Stage 1.5.7.
+    /// and the integration differential test in `spine_killshot_vs_native`.
     pub fn debug_check_identity(&self) {
         use crate::spine_shift::{
             build_mu_table, build_rc_table, dec_round_index, mds_coeff, round_of,
@@ -237,7 +236,7 @@ impl SpineUnifiedMle {
 
 /// Build the unified MLE from `N_SPINE_SLOTS` `state_in` vectors. The
 /// returned object also carries the witness slice for the boundary
-/// pin step (Stage 1.5.6 will read `state_in` from `s_in[..,0,..]`).
+/// boundary pin step (the Kill-Shot orchestrator reads `state_in` from `s_in[..,0,..]`).
 pub fn build_unified_mle(
     slot_state_ins: &[[Block128; STATE_SIZE]],
 ) -> (SpineUnifiedMle, Vec<PermLayerWitness>) {

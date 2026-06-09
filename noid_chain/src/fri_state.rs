@@ -9,7 +9,7 @@
 //! per slot-column — keyed by `TAG_FRISTATE` capacity IV with `log_slots`
 //! absorbed first. Unused / spent slots carry `SlotValue::EMPTY` (all
 //! zeros). Poseidon2b (not Blake3) was chosen so that the in-circuit
-//! Stage 4c.3 combiner AIR reuses the already-arithmetised
+//! combiner AIR reuses the already-arithmetised
 //! `PoseidonPermAir` primitive. FRI Merkle internals still use Blake3.
 //!
 //! Why FRI over SMT: opening a slot is a batched FRI opening, which the
@@ -39,7 +39,7 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
 /// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not
 /// a circuit-wide constant — the AIR and STARK transcript are
-/// parameterised by the header-declared `log_slots` (Stage E.6, see
+/// parameterised by the header-declared `log_slots` (see
 /// `noid_tx::public::PublicInputs::log_slots` and `MAX_LOG_SLOTS`),
 /// which may grow to at most `32` via the `§15.3` expansion trigger.
 /// This value is used only as the seed depth when instantiating a
@@ -83,7 +83,7 @@ pub enum StateError {
 /// Batched FRI opening of all three state columns for one segment at an arbitrary eval point.
 ///
 /// Uses the compact `noid_fri_binius` interleaved commitment scheme — the SAME scheme
-/// as the block-level FRI proof, enabling efficient Steps 2+3 of full proof-native.
+/// as the block-level FRI proof, enabling efficient compact FRI + Merkle path openings.
 ///
 /// For **slot openings** (`local_idx`-based), `eval_point` is the boolean hypercube
 /// encoding of `local_idx`; `slot_vals` are the actual slot values.
@@ -226,7 +226,7 @@ impl FriState {
     }
 
     /// Consume `self` and return the three raw columns. Useful for the
-    /// Stage 3 witness builder that needs the whole evaluation vector.
+    /// Prover-side witness builder that needs the whole evaluation vector.
     pub fn into_columns(self) -> (Vec<Block128>, Vec<Block128>, Vec<Block128>) {
         (self.values, self.owners_hi, self.owners_lo)
     }
@@ -323,8 +323,8 @@ fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
 /// Returns `(commitment, slot_vals, proof, seg_root)`.
 ///
 /// Used by both `FriState::open()` (boolean eval point = slot index) and
-/// `SegmentedFriState::open()` (same), and by Steps 2+3 of full proof-native
-/// (random eval point from `BlockStateBindingAir`).
+/// `SegmentedFriState::open()` (same), and for compact FRI + Merkle
+/// path openings from `BlockStateBindingAir` (random eval point).
 pub fn open_segment_at_point(
     eff_log: usize,
     values: &[Block128],
@@ -400,7 +400,7 @@ pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotVa
     let eff_log = op.effective_log_seg();
     let point = eval_point_for_local_index(op.local_idx, eff_log);
 
-    // Step 1: Verify compact FRI batched opening.
+    // Verify compact FRI batched opening.
     // Use same padding/point extension as open_segment_at_point.
     let commit_log = eff_log.max(MIN_COMMIT_LOG);
     let padded_point: Vec<Block128> = {
@@ -435,13 +435,13 @@ pub fn verify_opening(state_root: &StateRoot, op: &SlotOpening) -> Result<SlotVa
         return Err(StateError::OpeningFailed);
     }
 
-    // Step 2: seg_root must match commitment cap + eff_log.
+    // seg_root must match commitment cap + eff_log.
     let derived = cap_to_seg_root_with_depth(&op.commitment.cap, eff_log);
     if derived != op.seg_root {
         return Err(StateError::OpeningFailed);
     }
 
-    // Step 3: Merkle path seg_root → state_root.
+    // Merkle path seg_root → state_root.
     if op.merkle_siblings.is_empty() {
         if op.seg_root != *state_root {
             return Err(StateError::OpeningFailed);

@@ -114,7 +114,7 @@ pub fn validate_block_full(
     nullifiers: &NullifierSet,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
-    // Step 1: header + tx checks (cheap, fail-fast — NO state reads, NO apply_block).
+    // Header + tx checks (cheap, fail-fast — no state reads, no apply_block).
     validate_block_checks(
         block,
         parent,
@@ -125,7 +125,7 @@ pub fn validate_block_full(
         nullifiers,
     )?;
 
-    // Step 1b: verify pi.log_slots == header.log_slots.
+    // Verify pi.log_slots == header.log_slots.
     let header_log_slots = block.header.log_slots;
     for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
         if pi.log_slots != header_log_slots {
@@ -139,7 +139,7 @@ pub fn validate_block_full(
         }
     }
 
-    // Step 2: ZK proof verification (Steps 1+2+3 in FULLPROOFNATIVE).
+    // ZK proof verification.
     let tx_airs: Vec<TxLogicAir> = block
         .transactions
         .iter()
@@ -155,8 +155,7 @@ pub fn validate_block_full(
         state_binding_airs,
     )?;
 
-    // Step 3: apply state delta (ZK proved correctness — no pre-state reads).
-    // Replaces apply_block() which needed ~2400 MDBX reads for 100-tx blocks.
+    // Apply state delta — ZK proved correctness means no pre-state reads are needed.
     apply_state_delta(state, block).map_err(|e| {
         use noid_chain::block::BlockApplyError;
         match e {
@@ -437,8 +436,8 @@ pub fn build_state_binding_airs(
 
 /// Build `TxLogicAir` instances from a block's transactions.
 ///
-/// Coinbase transactions do not have a TxLogicAir (they are proved directly
-/// by BlockStateBinding). This function skips them.
+/// Coinbase transactions are excluded from ZK proof coverage (validated by
+/// consensus rules only). This function skips them.
 ///
 /// The returned AIRs are in the same order as non-coinbase txs in the block.
 pub fn build_tx_airs(block: &Block) -> Vec<TxLogicAir> {

@@ -11,7 +11,7 @@
 //!
 //! After `UNDO_LOG_RETENTION` confirmations, the undo log for a block is
 //! pruned (`prune_undo_logs`). Full block DA (BlockProof + PackedWitness)
-//! is deleted immediately after `apply_block`; see SPECIFICATION.md §20.
+//! is deleted immediately after `apply_block`.
 
 use std::collections::HashMap;
 

@@ -4,13 +4,13 @@
 //! State storage backend abstraction .
 //!
 //! `StateBackend` decouples the chain state from its physical storage.
-//! The RAM backend (`SegmentedFriState`) is the default and is used
-//! whenever `log_slots ≤ 26`. A future MDBX disk backend will implement
-//! the same trait with zero-copy mmap reads (`SegmentView<'txn>`).
+//! `RamBackend` is the sole current `StateBackend` implementor.
+//! `MdbxChainContext` manages on-disk state through its own `MdbxStore` layer
+//! rather than implementing this trait.
 //!
-//! **K.3 future requirement**: the MDBX backend MUST return zero-copy slices
-//! via `load_segment_view<'txn>(...) -> &'txn [Block128]` — NOT `Vec<Block128>`
-//! — to avoid memcpy bandwidth collapse at log_slots ≥ 28.
+//! **K.3 open item**: add a zero-copy `StateBackend` impl for MDBX
+//! (`load_segment_view<'txn>(...) -> &'txn [Block128]` instead of `Vec<Block128>`)
+//! to avoid memcpy bandwidth collapse at log_slots ≥ 28.
 
 pub mod mdbx_context;
 pub mod mdbx_store;
@@ -76,9 +76,8 @@ pub trait NullifierProvider {
 /// Combined durable chain store.
 ///
 /// Implementors provide unified access to headers, the recursive proof, the
-/// transaction index, and recent full blocks. The `MdbxStore` type implements
-/// this trait for the disk-backed node; a `RamBlockStore` (future) may
-/// implement it for testing.
+/// transaction index, and recent full blocks. `MdbxStore` implements this trait
+/// for the disk-backed node.
 pub trait BlockStore: Send + Sync {
     /// Current best tip: `(height, H_BLOCK hash)`.
     fn best_tip(&self) -> Option<(u64, [u8; 32])>;

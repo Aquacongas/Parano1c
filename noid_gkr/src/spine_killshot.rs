@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 1.5.6 — Kill-Shot orchestration.
+//! Kill-Shot orchestration.
 //!
-//! Top-level entry point that replaces the legacy 59 × per-slot
-//! `prove_perm` chain with a single
+//! Top-level entry point that runs the unified Spine Kill-Shot:
+//! replaces the legacy `prove_perm` chain with a single
 //! `prove_spine_unified` + `prove_spine_shift` pair, then collapses the
 //! four resulting witness claims into three column-level batch-eval
 //! reductions:
@@ -18,20 +18,18 @@
 //! ```
 //!
 //! Each column is a 15-variable MLE over the unified hypercube (same
-//! bit layout as the legacy boundary MLE for the `state` column, so
+//! bit layout as the boundary MLE for the `state` column, so
 //! existing FRI commitments to `B = state` continue to work
 //! unchanged). The three columns share the same hypercube topology.
 //!
 //! `s_in` and `s_out` MLEs are built once from the slot witnesses and
-//! reduced via `batch_eval` like the existing `state` boundary; this
-//! crate does not yet emit a 3-column FRI commitment — that is wired
-//! by the STARK bridge in a follow-up task. For now both `s_in` /
-//! `s_out` reductions are discharged natively by the verifier.
+//! reduced alongside `state` via `batch_eval`. All three columns are
+//! discharged via `batch_eval` reductions on the unified hypercube.
 //!
 //! Transcript order
 //! ----------------
 //! 1. Absorb `claimed_tx_body_hash`.
-//! 2. Absorb the spine inputs header (same as legacy spine).
+//! 2. Absorb the spine inputs header.
 //! 3. Run `prove_spine_unified` (squeezes ρ, β, γ; 15 round polys; 12
 //!    final witness scalars).
 //! 4. Run `prove_spine_shift` (squeezes δ; 15 round polys; 3 final
@@ -108,7 +106,8 @@ fn absorb_hash<T: FiatShamir<Block128>>(channel: &mut T, hash: &[Block128; 2]) {
 
 /// Materialise the unified MLE bundle from pre-computed slot states.
 /// Avoids redundant `reconstruct_slot_states` when the caller already
-/// has them (e.g. `prove_tx` which needs them for `build_boundary_mle`).
+/// has them (e.g. `prove_tx` which derives them to feed both the
+/// Kill-Shot unified MLE and boundary digest computation).
 pub fn build_unified_from_states(
     states: &[([Block128; STATE_SIZE], [Block128; STATE_SIZE])],
 ) -> SpineUnifiedMle {

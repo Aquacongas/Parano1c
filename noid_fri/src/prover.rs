@@ -197,7 +197,7 @@ pub fn commit(
 
 /// Commit to a multilinear polynomial, returning only the [`FriCommitment`].
 ///
-/// Stage 3b-0.5.1 / CRYPTO.md §12b: the round-0 Merkle tree built by
+/// CRYPTO.md §12b: the round-0 Merkle tree built by
 /// [`commit`] is **never opened** — FRI query openings authenticate only
 /// the per-round folded oracles that `prove` builds internally, and the
 /// batched-opening path binds the round-0 codeword via the per-column
@@ -276,8 +276,8 @@ pub fn commit_fast(evals: &[Block128], ntt: &AdditiveNTT<Block128>) -> FriCommit
 ///
 /// The caller is responsible for having absorbed the commitment that binds
 /// `evals` into the transcript **before** this call (via
-/// `channel.observe_fri_commitment(...)`). This is what lets Stage 3b-0.5.1
-/// skip the commitment step entirely in the RLC-batched path: the batched
+/// `channel.observe_fri_commitment(...)`). This is what lets the
+/// RLC-batched path skip the commitment step entirely: the batched
 /// codeword `C_batch = Σ λ_i · C_i` is a linear combination of already-
 /// committed columns, so the per-column roots upstream are sufficient
 /// binding — no extra Merkle tree over `C_batch` is needed.
@@ -301,7 +301,7 @@ pub fn prove(
     let (right, left) = eval_point.split_at(n - tau);
 
     // -----------------------------------------------------------------------
-    // Step 1: Compute upper partial evaluations.
+    // Compute upper partial evaluations.
     // Row `i` is indexed by the high `tau` bits; each row has `2^(n-tau)` evals.
     // Evaluate each row at `right`.
     // -----------------------------------------------------------------------
@@ -329,7 +329,7 @@ pub fn prove(
     channel.observe_field_elem(eval);
 
     // -----------------------------------------------------------------------
-    // Step 2: Draw tensor-batching challenge and batch rows.
+    // Draw tensor-batching challenge and batch rows.
     // -----------------------------------------------------------------------
     let tensor_batching_point = channel.get_random_points(tau);
     let batching_eq = noid_core::mle::eq::eq_ind_partial_eval(&tensor_batching_point);
@@ -365,7 +365,7 @@ pub fn prove(
     };
 
     // -----------------------------------------------------------------------
-    // Step 3: FRI commit phase — iteratively fold.
+    // FRI commit phase — iteratively fold.
     //
     // The sumcheck operates on h(X) = g(X) * eq(X, right), so that:
     //   Σ_X h(X) = Σ_X g(X)*eq(X,right) = g(right) = <batching_eq, upper_partial_evals>
@@ -471,7 +471,7 @@ pub fn prove(
     channel.observe_field_elems(&final_codeword);
 
     // -----------------------------------------------------------------------
-    // Step 4: FRI query phase.
+    // FRI query phase.
     // -----------------------------------------------------------------------
     // Query domain: same log-size as the initial (round-0) code domain.
     // fri_codes[r] and fri_trees[r] correspond to the code *at the start of*
@@ -608,7 +608,7 @@ mod tests {
             .collect();
 
         // Prove — caller binds the commitment into the transcript
-        // before calling `prove` (Stage 3b-0.5.1 contract).
+        // before calling `prove` (per-column reuse contract).
         let mut prover_channel = Channel::new();
         prover_channel.observe_fri_commitment(&commitment);
         let proof = prove(&evals, &eval_point, &ntt, &mut prover_channel, &hasher);

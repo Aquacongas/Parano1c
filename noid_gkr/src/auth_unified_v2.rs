@@ -3,11 +3,11 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage 2.3 — AuthGKR unified Kill-Shot sumcheck driver, retargeted on
+//! AuthGKR unified Kill-Shot sumcheck driver, retargeted on
 //! the 14-variable hypercube.
 //!
-//! Forked from `spine_unified.rs` (Stages 1.5.4-B / 1.5.4-C / 1.5.8.A /
-//! 1.5.8.B). The protocol shape is identical:
+//! Forked from `spine_unified.rs` (main sumcheck / shift gadget / flat-basis /
+//! monomial-form variants). The protocol shape is identical:
 //!
 //!   * 14-round main sumcheck of degree 9 (C1 + β·C1' + γ·C2)
 //!   * 14-round shift gadget of degree 2 (reduces 11 `_dec` claims to

@@ -8,27 +8,17 @@
 //! ```text
 //!  submit(TxIntent)
 //!    │
-//!    ├─ Phase 0 (no lock):  tx_body_hash consistency — O(1) hash, rejects garbage immediately
+//!    ├─ Stateless check (no lock):  tx_body_hash consistency — O(1) hash, rejects garbage immediately
 //!    │
-//!    ├─ Phase 1 (lock, brief): all cheap checks on current view
+//!    ├─ Pre-ZK filter (lock, brief): all cheap checks on current view
 //!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
 //!    │   Extracts log_slots: u32 only — NO ChainView clone.
 //!    │   DoS guard: invalid txs rejected here, never reach ZK verify.
 //!    │
-//!    ├─ Phase 2 (no lock): ZK verify ~84ms, semaphore-bounded
+//!    ├─ ZK verify (no lock): ~84ms, semaphore-bounded
 //!    │
-//!    └─ Phase 3 (lock): re-run all checks against current state (TOCTOU guard)
+//!    └─ Final admission (lock): re-run all checks against current state (TOCTOU guard)
 //!                        anchor_height derived here → pool.admit
-//!
-//!  on_new_block() ──► [remove confirmed] ──► [evict expired] ──► [update chain view]
-//!
-//!  select_for_block() ──► fee-sorted list of MempoolEntry (verified txs only)
-//!
-//!  submit(TxIntent) ──► [fast native checks] ──► [admit] ──► [broadcast TxAdmitted]
-//!                                │                               │
-//!                                └── rejected → SubmitError     └── P2P gossip
-//!                                                                └── RPC subscription
-//!                                                                └── block builder wakeup
 //!
 //!  on_new_block() ──► [remove confirmed] ──► [evict expired] ──► [update chain view]
 //!
@@ -157,7 +147,7 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
-        // ── Phase 0: stateless sanity (no lock, no IO) ────────────────────
+        // ── Stateless sanity check (no lock, no IO) ────────────────────
         // One hash computation rejects malformed intents before touching any
         // shared state.  Previously this ran after ZK verify — moved here so
         // hash-confusion spam is free to reject.
@@ -179,7 +169,7 @@ impl AsyncMempool {
 
         let needs_zk = !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase;
 
-        // ── Phase 1: cheap pre-filter (lock held briefly) ─────────────────
+        // ── Cheap pre-filter (lock held briefly) ─────────────────
         // Runs all O(1)–O(ANCHOR_DEPTH) checks on current state.
         // Rejects invalid txs BEFORE ZK verify — the DoS guard.
         // Extracts only `log_slots: u32`; avoids cloning ChainView
@@ -191,13 +181,13 @@ impl AsyncMempool {
             }
             let tx = intent_to_transaction(&intent)?;
             // All cheap checks. anchor_height is discarded here — re-derived
-            // under lock in Phase 3 against current state (TOCTOU safety).
+            // under lock in the final admission step against current state (TOCTOU safety).
             let _ = run_admission_checks(&tx, &st)?;
             st.view.log_slots()
         }; // lock released — no ChainView clone
 
-        // ── Phase 2: ZK verify (CPU-heavy, outside lock, semaphore-bounded) ─
-        // Runs only when Phase 1 passed — invalid fee/anchor/slot txs are
+        // ── ZK verify (CPU-heavy, outside lock, semaphore-bounded) ─
+        // Runs only when the pre-filter passed — invalid fee/anchor/slot txs are
         // already gone.  Semaphore caps concurrent CPU threads.
         if needs_zk {
             let proof_bytes = intent.logic_proof_bytes.clone();
@@ -217,11 +207,11 @@ impl AsyncMempool {
             .map_err(|e| SubmitError::InvalidProof(e))?;
         }
 
-        // ── Phase 3: final admission under lock ───────────────────────────
+        // ── Final admission under lock ───────────────────────
         // Re-run all cheap checks against CURRENT state: the chain may have
         // advanced during the ~84 ms ZK verify window (new block → new
         // nullifiers, spent slots, changed fee floor).  This is the
-        // authoritative check; Phase 1 was the DoS guard.
+        // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
 
         let tx = intent_to_transaction(&intent)?;
@@ -547,13 +537,13 @@ impl AsyncMempool {
 /// Run every O(1)–O(ANCHOR_DEPTH) admission check against `st`.
 ///
 /// Called **twice** per `submit`:
-/// - Phase 1 (pre-ZK DoS guard): rejects invalid txs before CPU-heavy work.
-/// - Phase 3 (post-ZK TOCTOU guard): final authority against current state.
+/// - Pre-ZK filter (DoS guard): rejects invalid txs before CPU-heavy work.
+/// - Post-ZK TOCTOU guard: final authority against current state.
 ///
 /// Returns `anchor_height` (needed by `pool.admit` for expiry tracking).
-/// Phase 1 discards it; Phase 3 uses it.
+/// The pre-filter discards it; the final admission step uses it.
 fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, SubmitError> {
-    // Step 0: dynamic fee floor.
+    // Dynamic fee floor.
     if !tx.body.is_coinbase {
         let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
         let required = st.floor.current().max(min_fee(n_outputs));
@@ -565,10 +555,10 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
         }
     }
 
-    // Step 1: basic consensus (fee overflow, body hash non-zero, anchor non-zero, nullifier).
+    // Basic consensus (fee overflow, body hash non-zero, anchor non-zero, nullifier).
     validate_tx_consensus(tx, &st.view.nullifiers)?;
 
-    // Step 2: epoch_anchor must be a known header within ANCHOR_DEPTH window.
+    // Epoch anchor must be a known header within ANCHOR_DEPTH window.
     // Returns anchor_height for pool.admit expiry tracking.
     let anchor_height: u64 = if !tx.body.is_coinbase {
         let anchor_hash = tx.body.epoch_anchor;
@@ -593,13 +583,13 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
         u64::MAX
     };
 
-    // Step 3: no slot conflict with currently admitted txs (O(inputs + outputs)).
+    // No slot conflict with currently admitted txs (O(inputs + outputs)).
     check_slot_conflicts_with_pool(tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
 
-    // Step 4: input slots must be live in state.
+    // Input slots must be live in state.
     check_input_slots(tx, &st.view)?;
 
-    // Step 5: output slots must be empty in state.
+    // Output slots must be empty in state.
     check_output_slots(tx, &st.view)?;
 
     Ok(anchor_height)

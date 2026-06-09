@@ -67,11 +67,11 @@ impl TxInput {
 /// can recompute the leaf via `hash_utxo_leaf` (which binds `(value,
 /// owner)`). The `slot_index` picks which `FriState` cell the chain
 /// allocator must occupy with this output; the AIR proves in-circuit
-/// that the prev-state cell at that slot was `(0,0,0)` (Stage E.2).
+/// that the prev-state cell at that slot was `(0,0,0)` (proved by `BlockStateBindingAir`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxOutput {
     /// Index of the `FriState` slot this output activates. Must be
-    /// free (prev-state `(0,0,0)`) per `§GENERAL_DESIGN.md §15.1`.
+    /// free (prev-state `(0,0,0)`).
     pub slot_index: u32,
     /// Transparent value (LE u64).
     pub value: u64,
@@ -106,7 +106,7 @@ pub struct TxBody {
     pub fee: u128,
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
-    /// Stage E.5.f₁ — tx-level coinbase marker. When `true`, the engine
+    /// Coinbase marker. When `true`, the engine
     /// relaxes the UTXO conservation law (`Σin − Σout − fee == 0`) and
     /// replaces it with `Σout == coinbase_credit`; also requires
     /// `fee == 0 ∧ n_live_inputs == 0`. Chain-layer policy enforces

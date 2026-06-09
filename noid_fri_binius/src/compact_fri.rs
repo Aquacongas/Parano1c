@@ -122,7 +122,7 @@ pub fn compact_fri_prove(
     let n = eval_point.len();
     let (right, left) = eval_point.split_at(n - tau);
 
-    // Step 1: Upper partial evaluations.
+    // Upper partial evaluations.
     let n_rows = 1 << tau;
     let row_len = evals.len() / n_rows;
     let upper_partial_evals: Vec<Block128> = (0..n_rows)
@@ -141,7 +141,7 @@ pub fn compact_fri_prove(
         .fold(Block128::ZERO, |a, b| a + b);
     channel.observe_field_elem(eval);
 
-    // Step 2: Tensor batching.
+    // Tensor batching.
     let tensor_batching_point = channel.get_random_points(tau);
     let batching_eq = eq_ind_partial_eval(&tensor_batching_point);
 
@@ -169,7 +169,7 @@ pub fn compact_fri_prove(
         out
     };
 
-    // Step 3: FRI commit phase with sumcheck.
+    // FRI commit phase with sumcheck.
     let n_rounds = right.len();
     let eq_right = eq_ind_partial_eval(right);
 
@@ -236,7 +236,7 @@ pub fn compact_fri_prove(
     let final_codeword = current_code.encoding.clone();
     channel.observe_field_elems(&final_codeword);
 
-    // Step 4: Query phase with batched Merkle compression.
+    // Query phase with batched Merkle compression.
     let log_domain = n_rounds + LOG_RATE;
     let query_indices = gen_compact_queries(channel, log_domain, num_queries);
 

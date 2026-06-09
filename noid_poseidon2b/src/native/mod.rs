@@ -14,7 +14,3 @@ pub use domain::{
     TAG_TXBODY,
 };
 pub use permutation::{sbox_x7, Poseidon2bPermutation};
-pub use zero_subtree::{
-    zero_subtree_root, zero_subtree_root_table, ZERO_SUBTREE_MAX_K, ZERO_SUBTREE_MIN_K,
-    ZERO_SUBTREE_TABLE_LEN,
-};

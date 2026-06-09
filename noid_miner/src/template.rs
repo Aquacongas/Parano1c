@@ -62,7 +62,7 @@ pub struct BlockTemplate {
     pub proof_bytes: Vec<Option<Vec<u8>>>,
     /// Pre-state segment columns for every segment touched by this block's transactions.
     /// Captured at template-build time (before `apply_block`), keyed by seg_id.
-    /// Used by the ZK block prover for FRI state openings (Step 2).
+    /// Used by the ZK block prover for FRI state openings.
     pub pre_segs: HashMap<u16, SegmentColumns>,
 }
 
@@ -166,7 +166,7 @@ impl TemplateBuilder {
             difficulty_target,
         ) {
             Ok(inner) => {
-                // Capture pre-state columns for Step 2 FRI openings.
+                // Capture pre-state columns for FRI openings.
                 let eff_log = ctx.state.state.effective_log_segment_size();
                 let mut touched_segs = std::collections::HashSet::new();
                 for tx in inner.txs.iter().chain(std::iter::once(&inner.coinbase)) {

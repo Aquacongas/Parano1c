@@ -11,12 +11,12 @@
 //!    │  TxIntent (body + LogicProof bytes)
 //!    ▼
 //!  AsyncMempool::submit()
-//!    ├─ Step 0: fee ≥ dynamic floor
-//!    ├─ Step 1: consensus (fee overflow, body hash, anchor non-zero, nullifier)
-//!    ├─ Step 2: epoch_anchor hash ∈ known headers within ANCHOR_DEPTH window
-//!    ├─ Step 3: no slot conflict with already-admitted pool txs
-//!    ├─ Step 4: input slots live in state (value + owner match)
-//!    └─ Step 5: output slots empty in state
+//!    ├─ fee ≥ dynamic floor
+//!    ├─ consensus (fee overflow, body hash, anchor non-zero, nullifier)
+//!    ├─ epoch_anchor hash ∈ known headers within ANCHOR_DEPTH window
+//!    ├─ no slot conflict with already-admitted pool txs
+//!    ├─ input slots live in state (value + owner match)
+//!    └─ output slots empty in state
 //!         │
 //!         ▼ admitted
 //!    broadcast MempoolEvent::TxAdmitted

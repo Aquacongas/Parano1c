@@ -62,7 +62,7 @@ pub fn prove_batched_opening(
     let n = 1 << log_n;
     assert_eq!(eval_point.len(), log_n);
 
-    // Step 1: Compute per-column openings e_k = col_k(eval_point)
+    // Compute per-column openings e_k = col_k(eval_point)
     // Use thread-local scratch buffer to avoid per-column allocations
     thread_local! {
         static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
@@ -79,20 +79,20 @@ pub fn prove_batched_opening(
         })
         .collect();
 
-    // Step 2: Absorb openings, draw gamma
+    // Absorb openings, draw gamma
     channel.observe_field_elem(Block128::from(BATCHED_OPEN_TAG));
     channel.observe_field_elems(&column_openings);
     let gamma = channel.get_random_point();
     let weights = horner_weights(gamma, n_cols);
 
-    // Step 3: Compute batched claim V = sum_k gamma^k * e_k
+    // Compute batched claim V = sum_k gamma^k * e_k
     let batched_claim: Block128 = weights
         .iter()
         .zip(column_openings.iter())
         .map(|(&w, &e)| w * e)
         .fold(Block128::ZERO, |acc, x| acc + x);
 
-    // Step 4: Run degree-2 sumcheck on H(x) = B(x) * eq(x, eval_point)
+    // Run degree-2 sumcheck on H(x) = B(x) * eq(x, eval_point)
     // where B(x) = sum_k gamma^k * col_k(x)
     //
     // We maintain folded column states and eq table simultaneously.
@@ -140,7 +140,7 @@ pub fn prove_batched_opening(
     let eq_at_r = eq_table[0];
     debug_assert_eq!(claim, b_at_r * eq_at_r);
 
-    // Step 5: FRI proof on batched polynomial B at point r (the sumcheck's challenge)
+    // FRI proof on batched polynomial B at point r (the sumcheck's challenge)
     // Build B's evaluations: B[i] = sum_k gamma^k * col_k[i]
     let b_evals: Vec<Block128> = (0..n)
         .into_par_iter()

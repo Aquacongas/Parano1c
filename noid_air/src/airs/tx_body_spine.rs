@@ -12,9 +12,7 @@
 //!   59-perm soundness).
 //! - tail column → `TxvLiveMask` `PublicColumn`.
 
-use crate::airs::tx_body_merkle::{
-    TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
-};
+use crate::airs::tx_body_merkle::{TxBodyMerkleBoundaryPins, TXBODY_MERKLE_LAYOUT};
 use crate::gates::PublicColumn;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{Block128, TowerField};
@@ -26,7 +24,6 @@ pub const TXV_COL_OFFSET: usize = 0;
 
 /// Width of the witness + balance block inside the composite.
 /// = TX_VALIDITY_N_COLS(10) + BALANCE_N_COLS(66) + 2 mask cols = 78.
-/// Previously `TXV_BLOCK_N_COLS` from the legacy AIR.
 pub const TXV_BLOCK_N_COLS: usize = 78;
 
 /// Column offset of the TxBodyMerkle block inside the composite.
@@ -138,7 +135,7 @@ impl Constraint for ShiftedColumnsConstraint {
     }
 }
 
-/// Stage 2(b) — programme for one of the four tx-body witness columns
+/// Cross-AIR programme for one of the four tx-body witness columns
 /// (slot_index=2, value=3, owner_hi=4, owner_lo=3), derived from
 /// `TxBodyMerkleBoundaryPins.{input,output}_leaf_absorb`.
 ///
@@ -156,8 +153,8 @@ fn txv_tx_body_col_programme(lane: usize, pins: &TxBodyMerkleBoundaryPins) -> Ve
     out
 }
 
-/// Stage 2(b) — emit the four `PublicColumn`s that pin tx-body
-/// witness columns to the Stage-1b leaf-absorb pins.
+/// Emit the four `PublicColumn`s that pin tx-body
+/// witness columns to the verifier-known leaf-absorb pins.
 pub fn emit_txv_tx_body_public_columns(pins: &TxBodyMerkleBoundaryPins) -> Vec<PublicColumn> {
     // col indices: slot_index=COL_SLOT_INDEX(2), value=COL_VALUE(3),
     //              owner_hi=COL_OWNER_HI(4), owner_lo=COL_OWNER_LO(5).
@@ -205,7 +202,7 @@ pub fn spine_n_cols() -> usize {
     txv_live_mask_col() + 1
 }
 
-/// Stage 1.5 composite AIR. See module docs.
+/// Composite AIR combining TxValidity and TxBodyMerkle columns. See module docs.
 pub struct TxBodySpineComposite {
     n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
@@ -214,7 +211,7 @@ pub struct TxBodySpineComposite {
 }
 
 impl TxBodySpineComposite {
-    /// Build the composite from the Stage-1 boundary pins.
+    /// Build the composite from the boundary pins.
     pub fn new(pins: TxBodyMerkleBoundaryPins) -> Self {
         use crate::airs::balance_gate::{
             emit_balance_constraints, emit_balance_selector_public_columns,
@@ -298,11 +295,11 @@ impl TxBodySpineComposite {
             }
         }
 
-        // Stage 2(b) — cross-AIR tx-body payload tie. The four TxValidity
+        // Cross-AIR tx-body payload tie. The four TxValidity
         // tx-body witness columns (`SlotIndex`, `Value`, `OwnerHi`,
         // `OwnerLo`) are pinned directly to the same
         // `input_leaf_absorb` / `output_leaf_absorb` scalars the
-        // Merkle-side Stage 1b programmes consume. Both sides thus bind
+        // Merkle-side leaf-absorb programmes consume. Both sides thus bind
         // to the same verifier-known pins — cross-AIR consistency is
         // closed by defence-in-depth, not by a cross-row indicator.
         //
@@ -312,9 +309,8 @@ impl TxBodySpineComposite {
         // required.
         public_columns.extend(emit_txv_tx_body_public_columns(&pins));
 
-        // TxvLiveMask — declared; used by the Stage 1.5 skeleton
-        // invariants and kept available for any later stage that
-        // needs row-domain gating (Stage 3+ cross-sub-circuit ties).
+        // TxvLiveMask — declared; used by the skeleton invariants
+        // and available for row-domain gating in composite AIRs.
         public_columns.push(PublicColumn::new(mask_col, txv_live_mask_programme()));
 
         // Final alignment check: every constraint column ∈ [0, n_cols),
@@ -347,7 +343,7 @@ impl TxBodySpineComposite {
 
     /// Consume the composite and surrender its constraints, public
     /// columns, total column count, and boundary pins. Used by the
-    /// Stage 5.7 `TxValidityCompositeWithSpine` to embed the spine as
+    /// `TxValidityCompositeWithSpine` to embed the spine as
     /// a column-block inside a wider outer composite — the outer
     /// shifts each constraint and public column by the spine block's
     /// outer offset and rebuilds its own [`crate::CompositeAir`].
@@ -371,16 +367,15 @@ impl TxBodySpineComposite {
     }
 
     /// Stitch a composite trace from the caller-supplied TxValidity
-    /// witness triple (body + balance view) and the TxBodyMerkle input
-    /// chain. No cross-AIR consistency pinning happens here — that is
-    /// the job of Stage 1b.
+    /// witness triple (body + balance view). The TxBodyMerkle band
+    /// carries only the two `tx_body_hash` lanes; GKR owns the
+    /// 59-perm soundness and no permutation inputs are needed here.
     pub fn build_trace(
         &self,
         body: &TxBody,
         balance_inputs: [u64; 4],
         balance_outputs: [u64; 8],
         balance_fee: u64,
-        merkle_inputs: &[[Block128; 4]; TXBODY_MERKLE_N_PERMS],
     ) -> Trace {
         use crate::airs::balance_gate::build_balance_columns;
         use crate::gates::multi_row_indicator_programme;
@@ -444,9 +439,8 @@ impl TxBodySpineComposite {
 
         assert_eq!(cols.len(), TXV_BLOCK_N_COLS);
 
-        // G4: GKR owns the 59-perm soundness. STARK keeps only the two
+        // GKR owns the 59-perm soundness. STARK keeps only the two
         // tx_body_hash lanes as row-wide PublicColumns.
-        let _ = merkle_inputs;
         let total_rows = 1usize << SPINE_LOG_ROWS;
         let mut merkle_cols: Vec<Vec<Block128>> = (0..merkle_band_width())
             .map(|_| vec![Block128::ZERO; total_rows])
@@ -571,20 +565,12 @@ mod tests {
         [Block128::from(lo), Block128::from(hi)]
     }
 
-    /// Derive an internally-consistent `(pins, merkle_inputs)` pair by
-    /// asking the native Poseidon2b oracle for the wrap digest. The
-    /// `merkle_inputs` array is legacy residue left for callers that
-    /// still thread it into `build_trace`; it is no longer consumed on
-    /// the AIR side once the 59-perm chain was handed to GKR.
-    fn build_honest_pins_and_inputs() -> (
-        TxBodyMerkleBoundaryPins,
-        Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]>,
-    ) {
-        let inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
-            Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
+    /// Build `TxBodyMerkleBoundaryPins` with a consistent `tx_body_hash`
+    /// derived via the native Poseidon2b oracle.
+    fn build_honest_pins_and_inputs() -> TxBodyMerkleBoundaryPins {
         let mut pins = TxBodyMerkleBoundaryPins::default();
         pins.tx_body_hash = native_wrap_digest(&pins);
-        (pins, inputs)
+        pins
     }
 
     #[test]
@@ -612,23 +598,23 @@ mod tests {
 
     #[test]
     fn honest_round_trip_accepts() {
-        let (pins, merkle_inputs) = build_honest_pins_and_inputs();
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
         let body = empty_tx_body();
-        let trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &merkle_inputs);
+        let trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64);
         assert_eq!(trace.n_cols(), spine.n_columns());
         assert_eq!(trace.log_rows, spine.log_rows());
         assert!(spine.check(&trace), "honest composite trace must accept");
     }
 
     #[test]
-    fn stage_1a_wrap_tamper_still_rejects_in_composite() {
-        let (pins, merkle_inputs) = build_honest_pins_and_inputs();
+    fn wrap_output_tamper_rejects_in_composite() {
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
         let body = empty_tx_body();
-        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &merkle_inputs);
+        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64);
 
         // Every row of the retained wrap-output lane is pinned to
         // `pins.tx_body_hash[0]` by a PublicColumn, so any row-level
@@ -637,17 +623,17 @@ mod tests {
         trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
-            "wrap-output tamper must reject at composite layer (Stage 1a regression)"
+            "wrap-output tamper must reject at composite layer (regression guard)"
         );
     }
 
     #[test]
     fn txv_live_mask_tamper_rejects() {
-        let (pins, merkle_inputs) = build_honest_pins_and_inputs();
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
         let body = empty_tx_body();
-        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &merkle_inputs);
+        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64);
 
         let col = txv_live_mask_col();
         trace.columns[col][0] = Block128::ZERO;
@@ -662,7 +648,7 @@ mod tests {
         // Property: writing arbitrary junk into *any* TxValidity
         // witness column on *any* dead row (TXV_LIVE_ROWS..2^11) does
         // not cause `Air::check` to reject. This is the formal
-        // statement of the B2 soundness claim in CRYPTO.md §Stage 1.5.
+        // statement of the B2 soundness claim (dead-tail freedom).
         //
         // Scope: non-bool TxValidity witness columns. Bool columns
         // (`InputValid`, `OutputValid`) are excluded because the
@@ -677,7 +663,7 @@ mod tests {
         // Coverage: 8 non-bool TxValidity witness columns × 64 random
         // dead rows sampled from [TXV_LIVE_ROWS, 2^11) with a mix of
         // junk values.
-        let (pins, merkle_inputs) = build_honest_pins_and_inputs();
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
         let body = empty_tx_body();
         let total_rows = 1usize << SPINE_LOG_ROWS;
@@ -685,7 +671,7 @@ mod tests {
         // Non-bool TxValidity witness columns: SpendSecretHi=6,
         // SpendSecretLo=7, AuthTagHi=8, AuthTagLo=9.
         //
-        // Stage 2(b) pinned SlotIndex=2 / Value=3 / OwnerHi=4 /
+        // Cross-AIR tx-body payload tie pinned SlotIndex=2 / Value=3 / OwnerHi=4 /
         // OwnerLo=5 as PublicColumns over the whole composite
         // (including the dead tail, which the pin forces to ZERO), so
         // they are no longer free-tail witnesses. The B2 claim still
@@ -712,7 +698,7 @@ mod tests {
             sampled_rows.push(r);
         }
 
-        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64, &merkle_inputs);
+        let mut trace = spine.build_trace(&body, [0u64; 4], [0u64; 8], 0u64);
         for (trial, &row) in sampled_rows.iter().enumerate() {
             for &col_idx in &non_bool_cols {
                 let col = TXV_COL_OFFSET + col_idx;
@@ -729,21 +715,17 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Stage 2(b) — cross-AIR tx-body payload tie
+    // Cross-AIR tx-body payload tie
     // ------------------------------------------------------------------
 
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
     use noid_tx::{TxInput, TxOutput};
 
-    /// Build a honest `(TxBody, TxBodyMerkleBoundaryPins, merkle_inputs)`
-    /// triple where the TxValidity tx-body witness columns match
+    /// Build a honest `(TxBody, TxBodyMerkleBoundaryPins)` pair where
+    /// the TxValidity tx-body witness columns match
     /// `pins.{input,output}_leaf_absorb`. Uses one real input + one
     /// real output (balanced, zero fee); remaining slots are dummy.
-    fn honest_stage2b_fixture() -> (
-        TxBody,
-        TxBodyMerkleBoundaryPins,
-        Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]>,
-    ) {
+    fn honest_stage2b_fixture() -> (TxBody, TxBodyMerkleBoundaryPins) {
         let slot_index: u32 = 7;
         let value: u64 = 1234;
         let in_owner_bytes: [u8; 32] = [
@@ -771,7 +753,7 @@ mod tests {
             in_owner_lo,
         ];
 
-        // Stage E.1: output leaf absorbs 4 fields symmetric with input.
+        // Output leaf absorbs 4 fields symmetric with input.
         let out_slot: u32 = 1;
         let mut output_leaf_absorb = [[Block128::ZERO; 4]; 8];
         output_leaf_absorb[0] = [
@@ -783,8 +765,6 @@ mod tests {
 
         // Derive the wrap digest via the native Poseidon2b oracle — the
         // same kernel the GKR spine evaluates in circuit.
-        let merkle_inputs: Box<[[Block128; 4]; TXBODY_MERKLE_N_PERMS]> =
-            Box::new([[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS]);
         let mut pins = TxBodyMerkleBoundaryPins {
             tx_body_hash: [Block128::ZERO; 2],
             input_leaf_absorb,
@@ -827,18 +807,18 @@ mod tests {
             is_coinbase: false,
         };
 
-        (body, pins, merkle_inputs)
+        (body, pins)
     }
 
-    /// Stage 5.7 invariant guard: `AuthTagHi` / `AuthTagLo` (composite
+    /// Invariant guard: `AuthTagHi` / `AuthTagLo` (composite
     /// cols 8 / 9) must remain witness-only on the spine side. They
     /// are pinned through the external `AuthGKR` boundary and must
     /// never be declared as a `PublicColumn` — doing so would
     /// re-introduce the "third source of truth" the audit § 1 warns
     /// about (PI vs Merkle vs GKR pin).
     #[test]
-    fn stage_5_7_invariant_auth_tag_columns_are_not_pi_pinned() {
-        let (pins, _inputs) = build_honest_pins_and_inputs();
+    fn auth_tag_columns_are_not_pi_pinned() {
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
         let auth_hi = COL_AUTH_TAG_HI;
@@ -849,24 +829,24 @@ mod tests {
         for pc in spine.public_columns() {
             assert_ne!(
                 pc.col, auth_hi,
-                "AuthTagHi (col 8) is PI-pinned — Stage 5.7 invariant broken"
+                "AuthTagHi (col 8) is PI-pinned — AuthTag invariant broken"
             );
             assert_ne!(
                 pc.col, auth_lo,
-                "AuthTagLo (col 9) is PI-pinned — Stage 5.7 invariant broken"
+                "AuthTagLo (col 9) is PI-pinned — AuthTag invariant broken"
             );
         }
     }
 
-    /// Stage 5.7 invariant guard: `tx_body_hash` must remain
+    /// Invariant guard: `tx_body_hash` must remain
     /// single-origin on the Merkle side (wrap-perm output) inside the
     /// spine. The TxValidity block must not redundantly pin
     /// `tx_body_hash` to any of its witness columns — the hash is
     /// consumed downstream only through the external `AuthGKR`
     /// boundary, never through a parallel PublicColumn.
     #[test]
-    fn stage_5_7_invariant_tx_body_hash_single_origin() {
-        let (pins, _inputs) = build_honest_pins_and_inputs();
+    fn tx_body_hash_single_origin_in_spine() {
+        let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
         let merkle_n_cols = merkle_band_width();
         let merkle_lo = TX_BODY_MERKLE_COL_OFFSET;
@@ -897,8 +877,8 @@ mod tests {
     }
 
     #[test]
-    fn stage_2b_declares_four_txv_tx_body_public_columns() {
-        let (_body, pins, _inputs) = honest_stage2b_fixture();
+    fn declares_four_txv_tx_body_public_columns() {
+        let (_body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
 
         // Every TxValidity tx-body column must be among the composite
@@ -911,133 +891,105 @@ mod tests {
     }
 
     #[test]
-    fn stage_2b_accepts_honest_tx_body_witness() {
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+    fn accepts_honest_tx_body_witness() {
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
+        let trace = spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
+        assert!(
+            spine.check(&trace),
+            "honest cross-AIR tx-body payload tie trace must accept"
         );
-        assert!(spine.check(&trace), "honest Stage 2(b) trace must accept");
     }
 
     #[test]
-    fn stage_2b_rejects_slot_index_tamper() {
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+    fn rejects_slot_index_tamper() {
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let mut trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
-        );
+        let mut trace =
+            spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
         // Flip SlotIndex on input row 0 — pinned to input_leaf_absorb[0][0].
         let col = COL_SLOT_INDEX;
         trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
-            "Stage 2(b) must reject SlotIndex tamper on an input row"
+            "cross-AIR pin must reject SlotIndex tamper on an input row"
         );
     }
 
     #[test]
-    fn stage_2b_rejects_value_tamper_on_output_row() {
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+    fn rejects_value_tamper_on_output_row() {
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let mut trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
-        );
+        let mut trace =
+            spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
         // Flip Value on output row 0 — pinned to output_leaf_absorb[0][1].
         let col = COL_VALUE;
         let row = MAX_INPUTS;
         trace.columns[col][row] += Block128::ONE;
         assert!(
             !spine.check(&trace),
-            "Stage 2(b) must reject Value tamper on an output row"
+            "cross-AIR pin must reject Value tamper on an output row"
         );
     }
 
     #[test]
-    fn stage_2b_rejects_owner_hi_tamper_on_input_row() {
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+    fn rejects_owner_hi_tamper_on_input_row() {
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let mut trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
-        );
+        let mut trace =
+            spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
         let col = COL_OWNER_HI;
         trace.columns[col][0] += Block128::ONE;
         assert!(
             !spine.check(&trace),
-            "Stage 2(b) must reject OwnerHi tamper on an input row"
+            "cross-AIR pin must reject OwnerHi tamper on an input row"
         );
     }
 
     #[test]
-    fn stage_2b_rejects_owner_lo_tamper_on_output_row() {
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+    fn rejects_owner_lo_tamper_on_output_row() {
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let mut trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
-        );
+        let mut trace =
+            spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
         let col = COL_OWNER_LO;
         let row = MAX_INPUTS;
         trace.columns[col][row] += Block128::ONE;
         assert!(
             !spine.check(&trace),
-            "Stage 2(b) must reject OwnerLo tamper on an output row"
+            "cross-AIR pin must reject OwnerLo tamper on an output row"
         );
     }
 
     #[test]
-    fn stage_2b_rejects_value_on_dead_row_tamper() {
+    fn rejects_tx_body_pin_value_on_dead_row() {
         // Dead-tail rows of the four pinned tx-body columns are now
-        // pinned to ZERO by the Stage 2(b) PublicColumn programmes.
+        // pinned to ZERO by the cross-AIR PublicColumn programmes.
         // Writing junk there must reject (this is what distinguishes
-        // Stage 2(b) from the pre-existing B2 `dead_tail_freedom`
+        // the cross-AIR pinning from the pre-existing B2 `dead_tail_freedom`
         // property: those 4 columns were free before, pinned now).
-        let (body, pins, merkle_inputs) = honest_stage2b_fixture();
+        let (body, pins) = honest_stage2b_fixture();
         let spine = TxBodySpineComposite::new(pins);
         let in_val = body.inputs[0].value;
         let out_val = body.outputs[0].value;
-        let mut trace = spine.build_trace(
-            &body,
-            [in_val, 0, 0, 0],
-            [out_val, 0, 0, 0, 0, 0, 0, 0],
-            0,
-            &merkle_inputs,
-        );
+        let mut trace =
+            spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
         let col = COL_VALUE;
         let row = TXV_LIVE_ROWS + 42; // deep in the dead tail
         trace.columns[col][row] = Block128::from(0xBADu128);
         assert!(
             !spine.check(&trace),
-            "Stage 2(b) pins must force dead-tail Value cells to ZERO"
+            "cross-AIR pins must force dead-tail Value cells to ZERO"
         );
     }
 }

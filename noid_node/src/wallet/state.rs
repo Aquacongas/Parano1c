@@ -145,23 +145,6 @@ impl WalletState {
         self.secret.derive_address(index)
     }
 
-    /// Derive the next fresh address and advance next_index.
-    /// Used by GUI wallet for address rotation.
-    #[allow(dead_code)]
-    pub fn next_address(&mut self) -> (u32, Address) {
-        let idx = self.next_index;
-        let addr = self.secret.derive_address(idx);
-        self.known_addresses.insert(addr.0, idx);
-        self.next_index += 1;
-        // Extend lookahead window.
-        let top = self.next_index + 50;
-        for i in self.next_index..top {
-            let a = self.secret.derive_address(i);
-            self.known_addresses.insert(a.0, i);
-        }
-        (idx, addr)
-    }
-
     /// Spend secret for a specific key index.
     pub fn spend_secret_for(&self, key_index: u32) -> SpendSecret {
         self.secret.derive_spend_secret(key_index)
@@ -173,13 +156,6 @@ impl WalletState {
             .values()
             .map(|u| u.value)
             .fold(0u64, |a, v| a.saturating_add(v))
-    }
-
-    /// Check if a given address is owned by this wallet.
-    /// Used by P2P address scanning and GUI wallet.
-    #[allow(dead_code)]
-    pub fn owns_address(&self, addr: &Address) -> Option<u32> {
-        self.known_addresses.get(&addr.0).copied()
     }
 
     /// Replace all UTXOs with the result of a full state scan.
@@ -204,13 +180,6 @@ impl WalletState {
         // chain state, so any in-flight tracking is now stale.
         self.pending_output_slots.clear();
         self.pending_input_slots.clear();
-    }
-
-    /// Store a receipt for a confirmed transaction.
-    /// Public API for external callers; scanner uses receipts map directly.
-    #[allow(dead_code)]
-    pub fn store_receipt(&mut self, tx_hash: [u8; 32], receipt_bytes: Vec<u8>) {
-        self.receipts.insert(tx_hash, receipt_bytes);
     }
 
     /// Get a cached receipt by tx_body_hash.
@@ -276,14 +245,6 @@ impl WalletState {
     pub fn add_pending_inputs(&mut self, slot_indices: &[u32]) {
         for &slot in slot_indices {
             self.pending_input_slots.insert(slot);
-        }
-    }
-
-    /// Clear pending input slots for a confirmed or evicted tx.
-    #[allow(dead_code)]
-    pub fn remove_pending_inputs(&mut self, slot_indices: &[u32]) {
-        for slot in slot_indices {
-            self.pending_input_slots.remove(slot);
         }
     }
 

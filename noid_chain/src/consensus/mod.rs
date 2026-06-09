@@ -9,12 +9,25 @@
 //!
 //! # Modules
 //!
-//! - [`params`]      — All consensus constants (single source of truth).
-//! - [`emission`]    — Block reward schedule (halves per state expansion).
-//! - [`difficulty`]  — ASERT difficulty adjustment (no floats).
-//! - [`pow`]         — Blake3 PoW over `header_core` (parallel-provable).
-//! - [`timestamps`]  — Median-time-past and future-drift rules.
-//! - [`receipt`]     — ParanoidReceipt generation and verification.
+//! - [`params`]         — All consensus constants (single source of truth).
+//! - [`emission`]       — Block reward schedule (halves per state expansion).
+//! - [`difficulty`]     — ASERT difficulty adjustment (no floats).
+//! - [`pow`]            — Blake3 PoW over `header_core` (parallel-provable).
+//! - [`timestamps`]     — Median-time-past and future-drift rules.
+//! - [`receipt`]        — ParanoidReceipt generation and verification.
+//! - [`header`]         — Per-block header validation rules.
+//! - [`checks`]         — Slot-conflict and tx-consensus validation.
+//! - [`mempool_checks`] — Full tx validation for mempool admission.
+//! - [`allocator`]      — Slot hint generation (splitmix64, zone-based).
+//! - [`fork_choice`]    — Cumulative-chainwork fork choice rule.
+//! - [`reorg`]          — Chain reorganisation within finality window.
+//! - [`template`]       — Block template assembly for the miner.
+//! - [`validation`]     — Full block consensus + state application.
+//! - [`ordering`]       — Canonical tx ordering policy for block assembly.
+//! - [`conflict`]       — Slot-conflict resolution between competing txs.
+//! - [`da_prune`]       — Undo-log build/prune for chain reorg support.
+//! - [`genesis`]        — Genesis block / state root derivation.
+//! - [`network`]        — Network-kind parameters and per-network constants.
 
 pub mod checks;
 pub mod conflict;
@@ -65,7 +78,6 @@ pub use timestamps::{median_time_past, median_u64, validate_timestamp};
 pub use validation::{validate_block_checks, validate_block_consensus, AnchorInfo};
 
 /// Consensus validation errors — one variant per block invariant.
-/// See SPECIFICATION.md §16 for the full list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
     /// §16.1 — PoW hash ≥ difficulty target.

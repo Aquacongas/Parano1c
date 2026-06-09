@@ -38,7 +38,7 @@ pub fn verify_batched_opening(
         return Err("Eval point dimension mismatch".into());
     }
 
-    // Step 1: Absorb openings, draw gamma (mirror prover)
+    // Absorb openings, draw gamma (mirror prover)
     channel.observe_field_elem(Block128::from(BATCHED_OPEN_TAG));
     channel.observe_field_elems(&proof.column_openings);
     let gamma = channel.get_random_point();
@@ -51,7 +51,7 @@ pub fn verify_batched_opening(
         gamma_pow *= gamma;
     }
 
-    // Step 2: Verify sumcheck rounds
+    // Verify sumcheck rounds
     let mut claim = batched_claim;
     let mut challenges = Vec::with_capacity(log_n);
 
@@ -75,14 +75,14 @@ pub fn verify_batched_opening(
         claim = lagrange_eval_3pt(round_poly[0], round_poly[1], round_poly[2], r);
     }
 
-    // Step 3: Verify terminal claim
+    // Verify terminal claim
     // claim should equal B(r) * eq(r, eval_point)
     // where B(r) = sum_k gamma^k * col_k(r) ... but we don't have col_k(r) directly.
     // Instead, verify via FRI that B evaluated at eval_point equals batched_claim.
     // The FRI proof was produced with B_evals and eval_point.
     let b_at_eval_point = batched_claim;
 
-    // Step 4: Verify FRI proof
+    // Verify FRI proof
     // The FRI proof shows B(eval_point) = b_at_eval_point
     fri_verify(
         eval_point,

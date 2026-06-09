@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Per-transaction consensus checks (SPECIFICATION.md §6).
+//! Per-transaction consensus checks.
 //!
 //! These checks are cheap (O(1) per tx) and run before ZK verification.
 //! Ordering: cheapest first to fail fast.
@@ -62,12 +62,12 @@ fn validate_tx_consensus_inner(
         return Err(ConsensusError::BadFee);
     }
 
-    // 0b. Coinbase fee must be zero (SPECIFICATION.md §12: "fee: 0").
+    // 0b. Coinbase fee must be zero.
     if tx.body.is_coinbase && tx.body.fee != 0 {
         return Err(ConsensusError::BadFee);
     }
 
-    // 0c. Coinbase must have exactly one valid output (SPECIFICATION.md §12).
+    // 0c. Coinbase must have exactly one valid output.
     if tx.body.is_coinbase {
         let n_valid_outputs = tx.body.outputs.iter().filter(|o| o.valid).count();
         if n_valid_outputs != 1 {

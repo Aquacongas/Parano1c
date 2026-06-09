@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 1.6.5 — AuthGKR Kill-Shot differential against the native
+//! AuthGKR Kill-Shot differential against the native
 //! reference oracle.
 //!
 //! Three guarantees this suite pins:

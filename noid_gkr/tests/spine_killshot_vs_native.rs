@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 1.5.7 — Kill-Shot differential against the native oracle.
+//! Kill-Shot differential against the native oracle.
 //!
 //! Three guarantees this suite pins:
 //!

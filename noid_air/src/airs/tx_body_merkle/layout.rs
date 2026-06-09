@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 3d-0.9.B — instance layout for the 59-instance tx-body Merkle
-//! stack (Option α, post-order linearization).
+//! Instance layout for the 59-instance tx-body Merkle
+//! stack (post-order linearization).
 //!
-//! See ROADMAP §3d-0.9 "Design decisions":
+//! Design decisions:
 //!
 //! - 4 input leaves × 3 permutations (two `absorb_pair` blocks + the
 //!   padding-flush in `finalize`) = 12 instances
@@ -39,9 +39,9 @@ pub const TXBODY_MERKLE_LAYOUT: PermLayout = DEFAULT_PERM_LAYOUT;
 /// `layout::N_INSTANCES` directly.
 pub const TXBODY_MERKLE_N_PERMS: usize = N_INSTANCES;
 
-/// Stage 1 — verifier-known scalars binding the tx-body Merkle tree
-/// into the outer STARK. See `CRYPTO.md §Stage 1` for the full pin
-/// catalogue and soundness argument.
+/// Verifier-known scalars binding the tx-body Merkle tree
+/// into the outer STARK (see CRYPTO.md for the full pin
+/// catalogue and soundness argument).
 ///
 /// Fields store the little-endian `[Block128; 2]` representation of
 /// 32-byte digests (as produced by
@@ -57,16 +57,16 @@ pub struct TxBodyMerkleBoundaryPins {
     /// Canonical tx-body hash; pinned into `s[0..1]` at the wrap
     /// instance's post-MDS output row (instance 58).
     pub tx_body_hash: [Block128; 2],
-    /// Stage 1b — declared absorbed payload for each of the 4 input
+    /// Verifier-known absorbed payload for each of the 4 input
     /// leaves. `input_leaf_absorb[leaf][word]` holds the four
     /// `hash_leaf([slot, value, owner_hi, owner_lo])` field inputs in
     /// canonical order. Word 0/1 are absorbed into PermA's
     /// `pre_s[0..1]`; word 2/3 appear at PermB's `payload[0..1]`.
     pub input_leaf_absorb: [[Block128; 4]; 4],
-    /// E.5.f₂ — L14 leaf digest `[is_coinbase_as_u128, 0]`, pinned at
+    /// L14 leaf digest `[is_coinbase_as_u128, 0]`, pinned at
     /// instance-42 `pre_s[0..1]` (the pos=7 level-1 compress PermA).
     pub is_coinbase_leaf: [Block128; 2],
-    /// Stage 1b — declared absorbed payload for each of the 8 output
+    /// Verifier-known absorbed payload for each of the 8 output
     /// leaves. `output_leaf_absorb[leaf][word]` holds
     /// `hash_leaf([slot_index, value, owner_hi, owner_lo])` field inputs.
     pub output_leaf_absorb: [[Block128; 4]; 8],

@@ -92,10 +92,10 @@ pub struct BlockStateBinding {
     pub prev_state_root: StateRoot,
     /// State root after all txs are applied.
     pub new_state_root: StateRoot,
-    /// Poseidon2b Merkle siblings for each dirty segment at PRE-state (Step 3).
+    /// Poseidon2b Merkle siblings for each dirty segment at PRE-state.
     /// Key = seg_id. Empty when `num_segments == 1` (single-segment / test mode).
     pub pre_seg_siblings: HashMap<u16, Vec<StateRoot>>,
-    /// Poseidon2b Merkle siblings for each dirty segment at POST-state (Step 3).
+    /// Poseidon2b Merkle siblings for each dirty segment at POST-state.
     pub post_seg_siblings: HashMap<u16, Vec<StateRoot>>,
     /// Depth of the segment Merkle tree (= log2(num_segments)). 0 = single-segment.
     pub tree_depth: usize,
@@ -117,7 +117,7 @@ impl BlockStateBinding {
     /// # epoch_anchor freshness
     ///
     /// `epoch_anchor` is verified at mempool admission in `noid_mempool::pool::submit`
-    /// (step 2): the anchor hash must be a known block header within the ANCHOR_DEPTH
+    /// The anchor hash must be a known block header within the ANCHOR_DEPTH
     /// window. Invalid anchors are rejected before the tx enters the pool.
     pub fn build(
         state: &mut SegmentedFriState,

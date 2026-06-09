@@ -333,12 +333,12 @@ pub fn fee_leaf(fee: u128) -> Digest {
     out
 }
 
-/// E.5.f₂ — encode `is_coinbase` into the L14 tx-body Merkle leaf as a
+/// Encode `is_coinbase` into the L14 tx-body Merkle leaf as a
 /// bit-wide digest: `L14 = [is_coinbase as u8, 0, …, 0]`.
 ///
 /// Zero-preserving: `is_coinbase=false` leaves the leaf at the all-zero
-/// digest used by every pre-E.5 body hash, so this change is a pure
-/// extension of the digest surface. The corresponding AIR pin lives at
+/// digest, so both branches share the same tree shape. The corresponding
+/// AIR pin lives at
 /// `TxBodyMerkleBoundaryPins.is_coinbase_leaf` and is tied to
 /// `SKEL_IS_COINBASE_COL` in f₃.
 #[inline]
@@ -359,7 +359,7 @@ pub fn is_coinbase_leaf(is_coinbase: bool) -> Digest {
 /// L1         = fee_leaf(fee)
 /// L2..L5     = input_leaves[0..4]        // hash_input_leaf
 /// L6..L13    = output_leaves[0..8]       // hash_output_leaf
-/// L14        = is_coinbase_leaf(is_coinbase)  // E.5.f₂
+/// L14        = is_coinbase_leaf(is_coinbase)
 /// L15        = [0u8; 32]                 // pad
 /// ```
 ///
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn is_coinbase_flips_tx_body_hash() {
-        // E.5.f₂: body hash must be sensitive to the is_coinbase flag;
+        // Body hash must be sensitive to the is_coinbase flag;
         // the L14 leaf separates the coinbase branch from regular txs.
         let prev = [0u8; 32];
         let ins = [[0u8; 32]; TXBODY_INPUTS];

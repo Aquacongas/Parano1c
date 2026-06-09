@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage G1a tests — the layered witness must byte-equal native
+//! Layered witness tests — the layered witness must byte-equal native
 //! Poseidon2b on the final state, and each S-box / MDS sub-relation
 //! must hold row-by-row, lane-by-lane.
 

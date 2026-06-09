@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage G1a — Poseidon2b permutation as a layered arithmetic witness.
+//! Poseidon2b permutation as a layered arithmetic witness.
 //!
 //! One `permute_mut` call is re-expressed as:
 //!
@@ -21,13 +21,13 @@
 //! semantics — partial-round rows zero out lanes 1..3 of `sin`, `x2`,
 //! `x4`, `x3`, `sout`, and the MDS_PARTIAL step reads `[sout[0],
 //! state[1], state[2], state[3]]` (lanes 1..3 come from the raw state,
-//! not from the zeroed S-box outputs). This is critical for G3 where
-//! the sumcheck claim must line up with the AIR's committed columns.
+//! not from the zeroed S-box outputs). This is critical for the
+//! batch-eval sumcheck to line up with the AIR's committed columns.
 //!
-//! This stage produces *no* proof. Its sole contract is:
+//! This module produces *no* proof. Its sole contract is:
 //! `evaluate_permutation(state_in).final_state()` must byte-equal
-//! `Poseidon2bPermutation::permute_mut(state_in)`. G1b builds the
-//! sumcheck on top.
+//! `Poseidon2bPermutation::permute_mut(state_in)`. `mle_layout` builds
+//! the MLE representation on top.
 
 use noid_core::Block128;
 use noid_poseidon2b::native::permutation::{

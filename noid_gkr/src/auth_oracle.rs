@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Step 1a — native reference execution of the 20-slot `AuthCircuit`.
+//! Native reference execution of the 20-slot `AuthCircuit`.
 //!
 //! Mirrors [`crate::oracle::evaluate_spine`] but drives the per-input
 //! HAddr/HAuth schedule instead of the tx-body Merkle spine. Each slot

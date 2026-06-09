@@ -30,7 +30,7 @@ pub use witness_builder::{
 };
 
 use crate::channel::{
-    block_multipoint_channel, compute_tx_transcript_digest, merkle_reduce,
+    block_multipoint_channel, compute_tx_transcript_digest, hash_to_fields, merkle_reduce,
     per_tx_algebraic_channel, state_binding_channel,
 };
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
@@ -69,18 +69,21 @@ use rayon::prelude::*;
 /// Public so wallet code can slice auth MLEs to the same granularity.
 pub const BLOCK_BASE_LOG: usize = 11;
 const BASE_LOG: usize = BLOCK_BASE_LOG;
+/// Domain separator absorbed between the Merkle transcript-root and the
+/// block column-opening phase of the block multipoint channel. Keeps the
+/// multipoint-sumcheck phase distinct from the per-tx phases.
 const BLOCK_MULTIPOINT_TAG: u128 = 0xFFFB_0000_0000_0000;
 
 // ---------------------------------------------------------------------------
-// Segment MLE opening (Steps 2+3)
+// Segment MLE opening (FRI + Merkle path)
 // ---------------------------------------------------------------------------
 
 /// FRI opening proof for one segment's three-column MLE + Merkle path binding.
 ///
-/// **Step 2**: `opening` proves `MLE([values, owners_hi, owners_lo], eval_point) = lane_values`
+/// **FRI opening**: `opening` proves `MLE([values, owners_hi, owners_lo], eval_point) = lane_values`
 /// via compact interleaved FRI (same scheme as `SegmentedFriState`).
 ///
-/// **Step 3**: `merkle_siblings` proves `seg_root → state_root` via O(depth)
+/// **Merkle path**: `merkle_siblings` proves `seg_root → state_root` via O(depth)
 /// native Poseidon2b Merkle path verification.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SegmentMleOpening {
@@ -121,7 +124,7 @@ impl SegmentMleOpening {
 pub struct BlockPublicMeta {
     pub prev_block_state_root: [u8; 32],
     /// New state root (= block header's `state_root`). Used in `verify_block`
-    /// to check post-state Merkle paths (Step 3).
+    /// to check post-state Merkle paths.
     pub new_state_root: [u8; 32],
     pub n_tx: u32,
     pub n_air_per_tx: u32,
@@ -167,13 +170,14 @@ pub struct BlockProof {
     pub mixed_opening: MixedOpeningProof,
     /// Initial claim for the block-level multipoint sumcheck.
     /// = block_target = Σ_k μ^k × Σ_i β^i × col_openings_k[i].
-    /// Stored here so the recursive prover can bind the fold-check to the
-    /// real value via `extra_transcript` instead of the placeholder ZERO.
+    /// Block-level multipoint sumcheck initial value
+    /// = Σ_k μ^k × Σ_i β^i × col_openings_k[i]. Stored so the recursive
+    /// verifier can reproduce the sumcheck target without re-running prove_block.
     pub block_initial_claim: Block128,
-    /// FRI+Merkle opening proofs for pre-state segment MLEs (Steps 2+3).
+    /// FRI+Merkle opening proofs for pre-state segment MLEs (FRI + Merkle path).
     /// One per dirty segment. Proves `BlockStateBindingAir.prev_lane_openings` are real.
     pub pre_state_openings: Vec<SegmentMleOpening>,
-    /// FRI+Merkle opening proofs for post-state segment MLEs (Steps 2+3).
+    /// FRI+Merkle opening proofs for post-state segment MLEs (FRI + Merkle path).
     /// One per dirty segment. Proves `BlockStateBindingAir.new_lane_openings` are real.
     pub post_state_openings: Vec<SegmentMleOpening>,
 }
@@ -226,7 +230,7 @@ pub enum VerifyBlockError {
     AlgebraicStark(usize, VerifyError),
     BlockMultipoint,
     FriFailed(String),
-    /// FRI/Merkle opening for a segment MLE failed (Step 2 or Step 3).
+    /// FRI/Merkle opening for a segment MLE failed.
     StateMleOpeningFailed(usize),
     /// A transaction's PublicInputs.log_slots does not match BlockHeader.log_slots.
     /// The STARK proof is bound to the wrong chain configuration.
@@ -268,15 +272,15 @@ pub struct TxBlockWitness<'a> {
 pub struct StateBindingBlockWitness<'a> {
     pub air: &'a BlockStateBindingAir,
     pub columns: Vec<Vec<Block128>>,
-    /// Segment ID for this binding. Used for FRI opening channel seeding (Step 2).
+    /// Segment ID for this binding. Used for FRI opening channel seeding.
     pub seg_id: u16,
-    /// Pre-state segment columns for FRI opening (Step 2). `None` = bench/legacy mode.
+    /// Pre-state segment columns for FRI opening. `None` = bench mode.
     pub pre_cols: Option<&'a SegmentColumns>,
     /// Claims used to derive post-state columns on demand.
     pub claims: &'a [noid_air::airs::block_state_binding::BlockStateBindingClaim],
-    /// Merkle siblings for pre-state seg_root → prev_state_root (Step 3).
+    /// Merkle siblings for pre-state seg_root → prev_state_root.
     pub pre_siblings: &'a [[u8; 32]],
-    /// Merkle siblings for post-state seg_root → new_state_root (Step 3).
+    /// Merkle siblings for post-state seg_root → new_state_root.
     pub post_siblings: &'a [[u8; 32]],
     /// Merkle tree depth. 0 = single-segment.
     pub tree_depth: usize,
@@ -287,12 +291,6 @@ pub struct StateBindingBlockWitness<'a> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn hash_to_fields(h: &[u8; 32]) -> [Block128; 2] {
-    let lo = u128::from_le_bytes(h[..16].try_into().unwrap());
-    let hi = u128::from_le_bytes(h[16..].try_into().unwrap());
-    [Block128::from(lo), Block128::from(hi)]
-}
 
 fn absorb_cap_into_p2b(ch: &mut Poseidon2bChannel, cap: &noid_fri_binius::MerkleCap) {
     for hash in &cap.hashes {
@@ -353,7 +351,7 @@ fn build_auth_slice_claims(
 // ---------------------------------------------------------------------------
 
 /// `new_block_state_root` = block header's `state_root`; used in `BlockPublicMeta`
-/// for post-state Merkle path verification (Step 3). Pass `[0u8;32]` when there
+/// for post-state Merkle path verification. Pass `[0u8;32]` when there
 /// are no state bindings (bench / coinbase-only mode).
 pub fn prove_block(
     prev_block_state_root: [u8; 32],
@@ -376,11 +374,7 @@ pub fn prove_block(
     let log_len = noid_stark::padded_log_len(witnesses[0].trace.log_rows);
 
     // -------------------------------------------------------------------------
-    // Stage 1: State continuity is now enforced by BlockStateBinding (S.5).
-    // -------------------------------------------------------------------------
-
-    // -------------------------------------------------------------------------
-    // Stage 2: Build per-tx column pools + block spine MLE.
+    // Build per-tx column pools + block spine MLE.
     // -------------------------------------------------------------------------
     // Per-tx: AIR columns (padded) + N_AUTH_SLICES auth slices.
     // Block-level: unified spine state MLE split into slices.
@@ -398,7 +392,7 @@ pub fn prove_block(
         auth_slices: Vec<Vec<Block128>>,
     }
 
-    // Q.2b: Parallel prep loop.
+    // Parallel prep loop.
     // Each tx's spine-state reconstruction and witness column padding are
     // fully independent; parallelize across txs with rayon.
     struct TxPrepBundle {
@@ -429,6 +423,7 @@ pub fn prove_block(
         })
         .collect();
 
+    // 59 = N_SPINE_SLOTS = max slot-state entries per tx in the BlockSpineMle layout.
     let mut all_slot_state_ins: Vec<[Block128; 4]> = Vec::with_capacity(n_tx * 59);
     let mut preps: Vec<TxPrep> = Vec::with_capacity(n_tx);
     for bundle in bundles {
@@ -444,7 +439,7 @@ pub fn prove_block(
     let n_block_spine_slices = block_spine_slices.len();
 
     // -------------------------------------------------------------------------
-    // Stage 3: Single block-wide interleaved commit.
+    // Single block-wide interleaved commit.
     // Layout: [per-tx columns | block spine slices | state binding columns…].
     // Multiple state binding AIRs (one per dirty segment) are flattened.
     // -------------------------------------------------------------------------
@@ -462,9 +457,6 @@ pub fn prove_block(
                 .map(|c| noid_stark::pad_column(c, log_len))
         })
         .collect();
-    // Backward compat: use `sb_n_cols` as the total column count for existing calculations.
-    let sb_n_cols = sb_n_cols_total;
-
     // Pad block spine slices to log_len (they may be shorter if num_vars < BASE_LOG).
     let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
         .iter()
@@ -474,7 +466,7 @@ pub fn prove_block(
     // Build the flat column-ref list for the interleaved commitment.
     // For each tx: fixed columns (zero-copy from shared_fixed) then witness then auth slices.
     let mut flat_refs: Vec<&[Block128]> =
-        Vec::with_capacity(n_tx * n_per_tx + n_block_spine_slices + sb_n_cols);
+        Vec::with_capacity(n_tx * n_per_tx + n_block_spine_slices + sb_n_cols_total);
     for p in &preps {
         let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &p.witness_cols);
         flat_refs.extend_from_slice(&air_refs);
@@ -495,7 +487,7 @@ pub fn prove_block(
     let cap = &commitment.cap;
 
     // -------------------------------------------------------------------------
-    // Stage 4: GKR Kill-Shots.
+    // GKR Kill-Shots.
     //   (a) Unified block spine Kill-Shot (all txs in one shot).
     //   (b) Per-tx auth Kill-Shots (wallet pre-built, replayed for reductions).
     // -------------------------------------------------------------------------
@@ -581,14 +573,13 @@ pub fn prove_block(
         .collect::<Result<Vec<_>, _>>()?;
 
     // -------------------------------------------------------------------------
-    // Stage 5: Q.2c — Parallel per-tx algebraic STARK proofs.
-
+    // Parallel per-tx algebraic STARK proofs.
     //
     // Each tx uses an independent Fiat-Shamir channel seeded from:
     //   DOMAIN_TAG_TX_ALGEBRAIC || PROTOCOL_VERSION || state_root || cap || tx_index
     // This is safe because the cap already commits ALL columns (committed before
-    // any challenge is drawn). The block-level binding happens in Stage 6 via
-    // the Merkle reduction of all per-tx transcripts (Q.4a).
+    // any challenge is drawn). The block-level binding happens via
+    // the Merkle reduction of all per-tx transcripts.
     // -------------------------------------------------------------------------
     struct TxAlgResult {
         alg: AlgebraicStarkProof,
@@ -610,7 +601,7 @@ pub fn prove_block(
                 &auth_res.auth_slice_vals,
             );
 
-            // Per-tx independent Fiat-Shamir channel (Q.2c / Q.1).
+            // Per-tx independent Fiat-Shamir channel, domain-separated by tx index.
             let mut ch = per_tx_algebraic_channel(&prev_block_state_root, cap, k as u32);
 
             // Build full ordered column refs (fixed zero-copy + witness).
@@ -649,9 +640,9 @@ pub fn prove_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 5b: BlockStateBindingAir algebraic STARKs — one per segment AIR.
-    //   Q.4: each gets a dedicated channel seeded with (prev_state_root, cap,
-    //   n_tx, segment_index) to avoid sharing with per-tx channels.
+    // BlockStateBindingAir algebraic STARKs — one per segment AIR.
+    // Each gets a dedicated channel seeded with (prev_state_root, cap,
+    // n_tx + sb_idx) — combined index avoids overlap with per-tx channels.
     // -------------------------------------------------------------------------
     let empty_pi = PublicInputs {
         epoch_anchor: [0u8; 32],
@@ -702,7 +693,7 @@ pub fn prove_block(
     let sb_r_pp_list: Vec<Vec<Block128>> = sb_results.into_iter().map(|r| r.r_pp).collect();
 
     // -------------------------------------------------------------------------
-    // Stage 5c: Per-segment FRI MLE openings + Merkle path (Steps 2 + 3).
+    // Per-segment FRI MLE openings + Merkle path.
     //
     // For each dirty segment, open the 3 pre-state and 3 post-state columns at
     // eval_point using compact interleaved FRI (same scheme as SegmentedFriState).
@@ -757,7 +748,7 @@ pub fn prove_block(
     }
 
     // -------------------------------------------------------------------------
-    // Q.4a: Segmented Transcript Absorption.
+    // Segmented Transcript Absorption.
     //
     // Each per-tx algebraic STARK produced an independent Fiat-Shamir transcript.
     // We summarise all transcripts into a single 32-byte Merkle root that the
@@ -779,7 +770,7 @@ pub fn prove_block(
     let transcript_root = merkle_reduce(&tx_digests);
 
     // -------------------------------------------------------------------------
-    // Q.4: Block multipoint channel — fresh, domain-separated from per-tx channels.
+    // Block multipoint channel — fresh, domain-separated from per-tx channels.
     // -------------------------------------------------------------------------
     let mut block_channel = block_multipoint_channel(&prev_block_state_root, cap);
     let [tr0, tr1] = hash_to_fields(&transcript_root);
@@ -787,7 +778,7 @@ pub fn prove_block(
     block_channel.observe_field_elem(tr1);
 
     // -------------------------------------------------------------------------
-    // Stage 6 (§6): Block-level multipoint sumcheck.
+    // Block-level multipoint sumcheck (CRYPTO.md §6).
     //
     // Participants:
     //   0..n_tx: per-tx (AIR + auth slices), each with n_per_tx columns
@@ -802,7 +793,7 @@ pub fn prove_block(
 
     // M2: Parallel per-tx column openings with thread-local scratch.
     // Eliminates ~n_tx * n_per_tx * 128 KB = ~1 GB of allocations for 100 txs.
-    let total_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols;
+    let total_cols = n_tx * n_per_tx + n_block_spine_slices + sb_n_cols_total;
 
     // M2 + flat-basis: evaluate_flat_with_scratch uses clmul_gcm (~4 ns/mul)
     // instead of tower-basis Karatsuba (~30 ns/mul) — 7-8x faster per column.
@@ -1000,9 +991,6 @@ pub fn prove_block(
         .collect();
     let pairs_b: Vec<&[Block128]> = pairs_b_owned.iter().map(|v| v.as_slice()).collect();
 
-    let _ = &tx_lambdas;
-    let _ = &tx_claims;
-
     let (block_mp_rounds, block_mp_challenges) =
         noid_stark::multipoint_batch::prove_multipoint_sumcheck(
             pairs_a,
@@ -1014,7 +1002,7 @@ pub fn prove_block(
     debug_assert_eq!(r_block.len(), log_len);
 
     // -------------------------------------------------------------------------
-    // Stage 7: Single FRI-Binius mixed opening at r_block.
+    // Single FRI-Binius mixed opening at r_block.
     // -------------------------------------------------------------------------
     let mixed_opening = prove_mixed_opening(
         &prover_state,
@@ -1120,7 +1108,7 @@ pub fn verify_block(
     let cap = &proof.commitment.cap;
 
     // -------------------------------------------------------------------------
-    // Stage 2: Unified block spine Kill-Shot + per-tx parallel verification.
+    // Unified block spine Kill-Shot + per-tx parallel verification.
     // -------------------------------------------------------------------------
 
     // (a) Unified block spine Kill-Shot — self-seeded, independent of per-tx channels.
@@ -1155,7 +1143,7 @@ pub fn verify_block(
     }
     let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
 
-    // (b) Q.3/Q.5 — Parallel per-tx auth Kill-Shots + algebraic STARK.
+    // (b) Parallel per-tx auth Kill-Shots + algebraic STARK.
     //
     // Each tx uses an independent per_tx_algebraic_channel, mirroring the prover.
     // Results are collected in order; any error short-circuits the whole block.
@@ -1216,7 +1204,7 @@ pub fn verify_block(
 
             let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
 
-            // Q.3: per-tx channel mirrors the prover's channel.
+            // Per-tx channel mirrors the prover's per_tx_algebraic_channel.
             let mut ch = per_tx_algebraic_channel(&meta.prev_block_state_root, cap, k as u32);
 
             let (r_pp_k, final_claim_k, lambdas_k) =
@@ -1242,7 +1230,7 @@ pub fn verify_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 2b: State binding algebraic STARKs — one per segment AIR.
+    // State binding algebraic STARKs — one per segment AIR.
     // -------------------------------------------------------------------------
     let empty_pi_sb = PublicInputs {
         epoch_anchor: [0u8; 32],
@@ -1269,12 +1257,12 @@ pub fn verify_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 2c: Verify segment MLE openings (Steps 2 + 3).
+    // Verify segment MLE openings (FRI + Merkle path).
     //
     // For each dirty segment:
-    //   Step 2: verify compact FRI opening proves lane_values == MLE(cols, eval_point)
+    //   FRI: verify compact FRI opening proves lane_values == MLE(cols, eval_point)
     //           and seg_root == cap_to_seg_root_with_depth(cap, eff_log).
-    //   Step 3: verify Merkle path seg_root → prev/new_state_root natively.
+    //   Merkle: verify path seg_root → prev/new_state_root natively.
     //
     // Full chain: AIR constraints → lane_values → FRI cols → seg_root → state_root.
     // -------------------------------------------------------------------------
@@ -1300,7 +1288,7 @@ pub fn verify_block(
             let verify_one = |op: &SegmentMleOpening,
                               expected_lane: &[Block128; 3]|
              -> Result<(), VerifyBlockError> {
-                // Step 2a: verify compact FRI opening.
+                // Verify compact FRI opening.
                 let commit_log = eff_log.max(noid_fri_binius::MERKLE_CAP_DEPTH);
                 let ntt = AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
                 let padded_pt = {
@@ -1329,7 +1317,7 @@ pub fn verify_block(
                 {
                     return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
                 }
-                // Step 2b: seg_root = cap_to_seg_root_with_depth(cap, eff_log).
+                // seg_root = cap_to_seg_root_with_depth(cap, eff_log).
                 let derived = cap_to_seg_root_with_depth(&op.commitment.cap, eff_log);
                 if derived != op.seg_root {
                     return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
@@ -1340,7 +1328,7 @@ pub fn verify_block(
             verify_one(pre, &sb_air.prev_lane_openings)?;
             verify_one(post, &sb_air.new_lane_openings)?;
 
-            // Step 3: Merkle path seg_root → state_root (O(depth) native).
+            // Merkle path seg_root → state_root (O(depth) native).
             let check_merkle = |op: &SegmentMleOpening,
                                 expected_root: &[u8; 32]|
              -> Result<(), VerifyBlockError> {
@@ -1363,7 +1351,7 @@ pub fn verify_block(
     }
 
     // -------------------------------------------------------------------------
-    // Q.4a: Reconstruct Merkle root of per-tx transcript digests.
+    // Reconstruct Merkle root of per-tx transcript digests.
     // The block channel absorbs this root instead of N sequential transcripts.
     // -------------------------------------------------------------------------
     let tx_digests: Vec<[u8; 32]> = (0..n_tx)
@@ -1380,14 +1368,14 @@ pub fn verify_block(
         .collect();
     let transcript_root = merkle_reduce(&tx_digests);
 
-    // Q.4: Block multipoint channel — mirrors the prover's block_multipoint_channel.
+    // Block multipoint channel — mirrors the prover's block_multipoint_channel.
     let mut block_channel = block_multipoint_channel(&meta.prev_block_state_root, cap);
     let [tr0, tr1] = hash_to_fields(&transcript_root);
     block_channel.observe_field_elem(tr0);
     block_channel.observe_field_elem(tr1);
 
     // -------------------------------------------------------------------------
-    // Stage 3: Block-level multipoint sumcheck.
+    // Block-level multipoint sumcheck.
     // -------------------------------------------------------------------------
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
@@ -1441,8 +1429,6 @@ pub fn verify_block(
         target
     };
 
-    let _ = &tx_final_claims;
-
     let (block_sc_challenges, block_final_claim) =
         noid_stark::multipoint_batch::verify_multipoint_sumcheck(
             &proof.block_multipoint_rounds,
@@ -1457,7 +1443,7 @@ pub fn verify_block(
     }
 
     // -------------------------------------------------------------------------
-    // Stage 4: FRI-Binius mixed opening verify.
+    // FRI-Binius mixed opening verify.
     // -------------------------------------------------------------------------
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
@@ -1475,7 +1461,7 @@ pub fn verify_block(
     .map_err(VerifyBlockError::FriFailed)?;
 
     // -------------------------------------------------------------------------
-    // Stage 5: Block sumcheck terminal identity.
+    // Block sumcheck terminal identity.
     // -------------------------------------------------------------------------
     let m = &proof.mixed_opening.all_openings;
     if m.len() < total_committed_cols {

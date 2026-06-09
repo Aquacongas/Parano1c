@@ -1,34 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! All consensus constants. Every constant references SPECIFICATION.md §§.
-//! This is the single source of truth — no other file should hardcode these.
+//! All consensus constants.
 
-// ---------------------------------------------------------------------------
-// Timing  (SPECIFICATION.md §18)
-// ---------------------------------------------------------------------------
-
-/// Target inter-block interval in seconds (SPECIFICATION.md §18.1).
+/// Target inter-block interval in seconds.
 ///
 /// ASERT adjusts PoW difficulty so all hardware converges to this target.
 /// Bounded below by `prove_block_time` on the miner's hardware; PoW is
 /// ordering-only, not security-critical.
 pub const BLOCK_TIME: u64 = 12;
 
-/// Number of blocks per ASERT epoch (SPECIFICATION.md §18.3.1).
+/// Number of blocks per ASERT epoch.
 pub const EPOCH_LENGTH: u64 = 6;
 
-/// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME (SPECIFICATION.md §18.3.1).
+/// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
 pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 72s at BLOCK_TIME=12
 
-/// Maximum seconds a block timestamp may exceed local wall clock (SPECIFICATION.md §18.4).
+/// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
 
-/// Number of previous blocks used for median-time-past (SPECIFICATION.md §18.4).
+/// Number of previous blocks used for median-time-past.
 pub const MEDIAN_TIME_BLOCKS: usize = 11;
 
 // ---------------------------------------------------------------------------
-// Block limits  (SPECIFICATION.md §7)
+// Block limits
 // ---------------------------------------------------------------------------
 
 /// Maximum non-coinbase transactions per block.
@@ -38,14 +33,14 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 /// Strong hardware can prove ~1024 txs in ≤ 12s.
 pub const BLOCK_MAX_TXS: usize = 1024;
 
-/// Maximum inputs per transaction (SPECIFICATION.md §3).
+/// Maximum inputs per transaction.
 pub const MAX_INPUTS: usize = 4;
 
-/// Maximum outputs per transaction (SPECIFICATION.md §3).
+/// Maximum outputs per transaction.
 pub const MAX_OUTPUTS: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Epoch anchor  (SPECIFICATION.md §2 / §17)
+// Epoch anchor
 // ---------------------------------------------------------------------------
 
 /// Epoch anchor validity depth.
@@ -54,7 +49,7 @@ pub const MAX_OUTPUTS: usize = 8;
 /// `[block_height - ANCHOR_DEPTH - 1, block_height - 1]`.
 /// This gives a window of **ANCHOR_DEPTH + 1 = 145** possible anchor heights.
 ///
-/// At 60s block time: ~144 minutes under normal conditions.
+/// At 12 s block time: ~29 minutes under normal conditions.
 ///
 /// Controls:
 /// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
@@ -87,7 +82,7 @@ pub const FINALITY_DEPTH: u64 = 18; // 3 × EPOCH_LENGTH
 pub const EXPANSION_WINDOW: u64 = FINALITY_DEPTH; // 18 blocks
 
 // ---------------------------------------------------------------------------
-// Slot state  (SPECIFICATION.md §0 / §15)
+// Slot state
 // ---------------------------------------------------------------------------
 
 /// Initial `log_slots` at genesis: 2^24 = 16,777,216 slots.
@@ -96,7 +91,7 @@ pub const LOG_SLOTS_GENESIS: u32 = 24;
 /// Maximum `log_slots`: 2^32 = 4,294,967,296 slots.
 pub const LOG_SLOTS_MAX: u32 = 32;
 
-/// Each segment holds 2^LOG_SEGMENT_SIZE slots (SPECIFICATION.md §19).
+/// Each segment holds 2^LOG_SEGMENT_SIZE slots.
 pub const LOG_SEGMENT_SIZE: u32 = 16;
 
 /// Fraction of current capacity that triggers expansion (numerator/denominator).
@@ -105,7 +100,7 @@ pub const EXPAND_NUM: u64 = 3; // 75 %
 pub const EXPAND_DENOM: u64 = 4;
 
 // ---------------------------------------------------------------------------
-// PoW  (SPECIFICATION.md §18)
+// PoW
 // ---------------------------------------------------------------------------
 
 /// Genesis difficulty target = 2^229.
@@ -171,7 +166,7 @@ pub const MIN_TARGET: [u8; 32] = {
 pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 
 // ---------------------------------------------------------------------------
-// DA retention  (SPECIFICATION.md §20)
+// DA retention
 // ---------------------------------------------------------------------------
 
 /// How many blocks to keep for undo logs (local reorg) AND for serving to peers
@@ -196,17 +191,11 @@ pub const BASE_REWARD_MICRONOID: u64 = 50 * MICRONOID_PER_NOID;
 pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 
 // ---------------------------------------------------------------------------
-// Slot allocator PRNG  (SPECIFICATION.md §15.1)
+// Slot allocator PRNG
 // ---------------------------------------------------------------------------
 // splitmix64 constants are embedded in noid_chain::consensus::allocator.
 // No separate params needed — the algorithm uses fixed Weyl/mixing constants.
 
-// ---------------------------------------------------------------------------
-// Pre-proving channel tag
-// ---------------------------------------------------------------------------
-
-/// Domain tag for the per-tx pre-proving channel.
-///
 // ---------------------------------------------------------------------------
 // Fee policy  (non-consensus — local node enforcement only)
 // ---------------------------------------------------------------------------

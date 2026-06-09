@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 3c-1.2 — S-box `x^7` chain as an AIR sub-circuit.
+//! S-box `x^7` chain as an AIR sub-circuit.
 //!
 //! Native reference: `noid_poseidon2b::native::permutation::sbox_x7`,
 //!

@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage G3.γ₂ — batch-evaluation sumcheck.
+//! Batch-evaluation sumcheck.
 //!
 //! Reduces `M` MLE-evaluation claims `(r_i, v_i)` on a **single**
 //! multilinear polynomial `B` of length `2^n` to one point-value pair
@@ -26,16 +26,16 @@
 //! concatenated boundary MLE; in γ₃ by a STARK multipoint opening on
 //! the committed boundary column.
 //!
-//! Why a fresh primitive rather than reusing `product_sumcheck`:
-//! `product_sumcheck` folds in an extra `eq(r, x)` factor (degree 3
-//! per variable). Here the outer eq has been absorbed into `W`, so
-//! `H = W · B` is degree 2 per variable, one less round polynomial
-//! coefficient per round.
+//! Why a fresh primitive rather than the old per-slot degree-3 product
+//! sumcheck: the per-slot prover folded in an extra `eq(r, x)` factor
+//! (degree 3 per variable). Here the outer eq has been absorbed into
+//! `W`, so `H = W · B` is degree 2 per variable, one less round
+//! polynomial coefficient per round.
 
 use std::sync::OnceLock;
 
 use noid_core::mle::eq::eq_ind;
-use noid_core::mle::fold::fold_highest_var_par;
+
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use rayon::prelude::*;
@@ -134,11 +134,6 @@ pub struct BatchEvalReduction {
     pub value: Block128,
 }
 
-#[allow(dead_code)]
-fn fold_inplace(tbl: &mut Vec<Block128>, r: Block128) {
-    fold_highest_var_par(tbl, r);
-}
-
 /// Flat-basis fold: folds a `Vec<u128>` table in place using `clmul_gcm` (~4 ns/mul).
 /// ~7x faster than the tower-basis `fold_highest_var_par`.
 fn fold_flat(tbl: &mut Vec<u128>, r_flat: u128) {
@@ -190,40 +185,6 @@ fn build_w_table_flat(claims: &[EvalClaim], alphas: &[Block128], n: usize) -> Ve
             || vec![0u128; len],
             |mut a, b| {
                 a.iter_mut().zip(b.iter()).for_each(|(ai, bi)| *ai ^= bi);
-                a
-            },
-        )
-}
-
-/// Build `W(x)` table in tower (Block128) basis. Used for small tables.
-#[allow(dead_code)]
-fn build_w_table(claims: &[EvalClaim], alphas: &[Block128], n: usize) -> Vec<Block128> {
-    debug_assert_eq!(claims.len(), alphas.len());
-    let len = 1usize << n;
-    claims
-        .par_iter()
-        .zip(alphas.par_iter())
-        .map(|(claim, &alpha)| {
-            debug_assert_eq!(claim.point.len(), n);
-            let mut eq: Vec<Block128> = Vec::with_capacity(len);
-            eq.push(alpha);
-            for &r_i in &claim.point {
-                let cur = eq.len();
-                for j in 0..cur {
-                    let prod = eq[j] * r_i;
-                    eq[j] -= prod;
-                    eq.push(prod);
-                }
-            }
-            debug_assert_eq!(eq.len(), len);
-            eq
-        })
-        .reduce(
-            || vec![Block128::ZERO; len],
-            |mut a, b| {
-                for (ai, bi) in a.iter_mut().zip(b.iter()) {
-                    *ai += *bi;
-                }
                 a
             },
         )
@@ -432,37 +393,6 @@ pub fn verify_batch_eval<T: FiatShamir<Block128>>(
         point: challenges,
         value: proof.b_final,
     })
-}
-
-#[allow(dead_code)]
-fn eval_round_at_0_1_2(w: &[Block128], b: &[Block128], half: usize) -> [Block128; 3] {
-    let f2 = Block128::from(2u128);
-    let per_entry = |j: usize| -> [Block128; 3] {
-        let w_lo = w[j];
-        let w_hi = w[j + half];
-        let b_lo = b[j];
-        let b_hi = b[j + half];
-        let d_w = w_lo + w_hi;
-        let d_b = b_lo + b_hi;
-        let w2 = w_lo + f2 * d_w;
-        let b2 = b_lo + f2 * d_b;
-        [w_lo * b_lo, w_hi * b_hi, w2 * b2]
-    };
-    if half >= PAR_THRESHOLD {
-        (0..half).into_par_iter().map(per_entry).reduce(
-            || [Block128::ZERO; 3],
-            |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
-        )
-    } else {
-        let mut acc = [Block128::ZERO; 3];
-        for j in 0..half {
-            let p = per_entry(j);
-            acc[0] += p[0];
-            acc[1] += p[1];
-            acc[2] += p[2];
-        }
-        acc
-    }
 }
 
 #[cfg(test)]

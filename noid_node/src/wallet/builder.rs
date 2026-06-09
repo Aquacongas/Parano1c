@@ -53,8 +53,7 @@ pub struct TxBuildData {
     /// Free-slot hints for outputs: index `0` = payment output slot,
     /// index `1` = change output slot (present only when change > 0).
     pub output_slot_hints: Vec<u32>,
-    /// `log2(state_size)` — stored for future use when `prove_tx` accepts it
-    /// as an explicit parameter.
+    /// `log2(state_size)` — passed to `prove_tx` to select the correct AIR shape.
     pub log_slots: u32,
 }
 
@@ -282,7 +281,7 @@ pub fn build_and_prove_tx(
     data: TxBuildData,
 ) -> Result<([u8; 32], Vec<u8>), BuildError> {
     // -----------------------------------------------------------------------
-    // Step 1: Build outputs.
+    // Build outputs.
     // -----------------------------------------------------------------------
     let total_selected: u64 = data.selected_utxos.iter().map(|u| u.value).sum();
     // Subtraction is safe: extract_build_data already validated that
@@ -331,7 +330,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Step 4: Compute the body hash. Auth tags are NOT inputs to this hash.
+    // Compute the body hash. Auth tags are NOT inputs to this hash.
     // -----------------------------------------------------------------------
     let tx_body_hash = hash_tx_body(
         &data.epoch_anchor,
@@ -349,7 +348,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Step 7: Assemble TxBody and run the ZK prover.
+    // Assemble TxBody and run the ZK prover.
     //
     // spend_secrets is consumed here; SpendSecret's ZeroizeOnDrop impl
     // ensures the raw key material is cleared from memory when prove_tx returns.

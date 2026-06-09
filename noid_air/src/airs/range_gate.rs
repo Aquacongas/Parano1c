@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! `RangeGateAir` — Stage 3b-2 u64 range check via bit-decomposition.
+//! `RangeGateAir` — u64 range check via bit-decomposition.
 //!
 //! One range-check instance occupies `WORD_BITS = 64` consecutive rows;
 //! `2^(log_rows - LOG_WORD_BITS)` instances are stacked per trace. Each
@@ -25,11 +25,9 @@
 //! instance equals `Σ bit_i · tower_pow(2, i)` — a faithful linear
 //! encoding of the bit vector, but NOT the integer embedding of `x`.
 //! For range-checking alone this is sufficient (the bool constraints
-//! pin every `bit_i ∈ {0, 1}` and the recurrence is injective). For
-//! §3b-3 BalanceGate the integer-sum relation is built directly on the
-//! bit columns without relying on `acc`, and integer-embedding of `acc`
-//! is deferred to §3b-4 where a `ConstColumnGate` can pin `weight[i] =
-//! Block128::from(1u128 << i)` explicitly.
+//! pin every `bit_i ∈ {0, 1}` and the recurrence is injective). The
+//! BalanceGate builds the integer-sum relation directly on the bit
+//! columns without relying on `acc`.
 
 use crate::gates::BoolGate;
 use crate::{Air, ColumnDomain, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -431,11 +429,8 @@ mod tests {
         // system. NOTE: `Block128` is GF(2^128) in *tower basis*, so
         // `Block128::from(2)^i != Block128::from(1u128 << i)`; `acc` is
         // therefore NOT the integer embedding of the decoded value — it
-        // is `Σ bit_i · tower_pow(2, i)`. Making `acc` an honest
-        // integer-embedding requires a fixed weight column driven by a
-        // `ConstColumnGate` and is deferred to §3b-4 composition (see
-        // ROADMAP). Here we just replay the field recurrence and confirm
-        // the builder agrees with itself.
+        // is `Σ bit_i · tower_pow(2, i)`. Here we just replay the field
+        // recurrence and confirm the builder agrees with itself.
         let air = mk_air();
         let values = mk_values();
         let trace = air.build_trace(&values);

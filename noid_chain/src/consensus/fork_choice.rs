@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Fork choice rule: heaviest chain wins (SPECIFICATION.md §16 / §7).
+//! Fork choice rule: heaviest chain wins.
 //!
 //! Paranoid uses **cumulative PoW work** as the canonical chain selector,
 //! identical to Bitcoin's "most work" rule. Since PoW provides ordering
@@ -57,10 +57,10 @@ pub fn choose_chain(
     )
 }
 
-/// Full fork choice using cumulative chainwork.
+/// Full fork choice using cumulative chainwork (production API).
 ///
-/// This is the production API. The simple `choose_chain` is kept for
-/// compatibility with tests that don't track cumulative work.
+/// Prefer this over `choose_chain` when cumulative chainwork is available.
+/// `choose_chain` is a convenience wrapper for callers without chainwork.
 ///
 /// # Arguments
 /// - `chainwork_a`: cumulative work for chain A (sum of block_work() for all blocks)

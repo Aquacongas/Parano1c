@@ -3,9 +3,11 @@
 
 #![allow(clippy::doc_overindented_list_items)]
 
-//! Stage 1.5.4 — degree-7 sumcheck on the unified spine MLE.
+//! Standalone degree-7 sumcheck: discharge of the S-box identity (C1)
+//! over the 15-variable Spine unified hypercube.
 //!
-//! Discharge of the S-box identity over the 15-variable hypercube:
+//! This is a **reference / differential prover** for the C1 constraint
+//! only:
 //!
 //! ```text
 //!   sigma(x) · (sout(x) + sin(x)^7)
@@ -28,14 +30,13 @@
 //! variable the round polynomial has degree 9 (eq:1 × sigma:1 × sin^7:7
 //! = 9), so we emit ten evaluations per round and Lagrange-interpolate.
 //! After 15 rounds the verifier obtains the final point `r' ∈ F^15`
-//! and the prover's four claimed evaluations
-//! `(eq(rho,r'), sigma(r'), sin(r'), sout(r'))` — which the next stage
-//! cross-checks against the MDS/RC sumcheck (Stage 1.5.5) and the
-//! boundary pin (Stage 1.5.6).
+//! and the prover's three claimed evaluations `(sigma(r'), sin(r'),
+//! sout(r'))`.
 //!
-//! This file is the *kernel* of the Kill-Shot prover. It does not yet
-//! plug into the legacy `spine_sumcheck::prove_spine` orchestration —
-//! Stage 1.5.6 wires it in.
+//! **Production note:** The full Kill-Shot prover in `spine_killshot.rs`
+//! does NOT use this module. It uses `spine_unified.rs` which jointly
+//! proves C1 + β·C1' + γ·C2 in a single degree-9 sumcheck. This file
+//! is kept as a standalone reference for the pure S-box identity.
 
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_slice;
@@ -106,12 +107,12 @@ pub fn prove_spine_degree7<T: FiatShamir<Block128>>(
     assert_eq!(mle.s_out.len(), N_SPINE_UNIFIED_CELLS);
     assert_eq!(mle.sigma.len(), N_SPINE_UNIFIED_CELLS);
 
-    // Step 1 — squeeze the constraint-batching point rho.
+    // Squeeze the constraint-batching point rho.
     let rho: Vec<Block128> = (0..N_SPINE_UNIFIED_VARS)
         .map(|_| channel.squeeze())
         .collect();
 
-    // Step 2 — materialise the eq table at rho.
+    // Materialise the eq table at rho.
     let mut eq_tab = eq_ind_partial_eval::<Block128>(&rho);
     let mut sigma_tab = mle.sigma.clone();
     let mut sin_tab = mle.s_in.clone();
@@ -119,7 +120,7 @@ pub fn prove_spine_degree7<T: FiatShamir<Block128>>(
 
     let mut round_polys = Vec::with_capacity(N_SPINE_UNIFIED_VARS);
 
-    // Step 3 — run the sumcheck rounds.
+    // Run the sumcheck rounds.
     for _ in 0..N_SPINE_UNIFIED_VARS {
         let poly = compute_round_polynomial(&eq_tab, &sigma_tab, &sin_tab, &sout_tab);
         for &c in &poly.coeffs {

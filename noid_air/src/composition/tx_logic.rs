@@ -39,8 +39,6 @@ use crate::{Air, Trace};
 use noid_core::{Block128, TowerField};
 use noid_tx::TxBody;
 
-use crate::airs::tx_body_merkle::TXBODY_MERKLE_N_PERMS;
-
 /// Log-rows of the TxLogicAir trace. Matches `SPINE_LOG_ROWS = 11`.
 pub const TX_LOGIC_LOG_ROWS: usize = SPINE_LOG_ROWS;
 
@@ -77,13 +75,11 @@ impl TxLogicAir {
 
     /// Build the honest trace from a `TxLogicWitness`.
     pub fn build_trace(&self, witness: &TxLogicWitness) -> Trace {
-        let merkle_inputs = [[Block128::ZERO; 4]; TXBODY_MERKLE_N_PERMS];
         self.inner.build_trace(
             &witness.body,
             witness.balance_inputs,
             witness.balance_outputs,
             witness.balance_fee,
-            &merkle_inputs,
         )
     }
 
@@ -132,8 +128,6 @@ impl Air for TxLogicAir {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Construction helpers
 // ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------

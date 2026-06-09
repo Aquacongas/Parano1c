@@ -34,9 +34,6 @@ pub enum MempoolEvent {
     /// ZK pre-proof completed for a transaction (background proving cache).
     /// The block assembler can now use the cached proof.
     TxPreProved { hash: TxBodyHash },
-
-    /// Dynamic fee floor changed. New txs below this floor are rejected.
-    FeeFlorChanged { new_floor: u64 },
 }
 
 /// Why a transaction was evicted.

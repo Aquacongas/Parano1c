@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage 2.2 — round-shift index helpers and public schedule MLEs for
+//! Round-shift index helpers and public schedule MLEs for
 //! the AuthGKR 14-variable unified Kill Shot.
 //!
 //! Forked from `spine_shift.rs`, retargeted onto the AuthGKR hypercube

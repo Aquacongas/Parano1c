@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Native slot allocator for wallet hint generation (SPECIFICATION.md §15.1).
+//! Native slot allocator for wallet hint generation.
 //!
 //! Uses splitmix64 seeded from `alloc_counter` to produce candidate free slot
 //! indices. Hints are **non-authoritative** — miners verify slot emptiness via

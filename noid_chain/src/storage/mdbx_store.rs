@@ -652,7 +652,6 @@ impl MdbxStore {
         // after the block is already durably in MDBX, leaving RAM and MDBX
         // desynchronised until the next restart.
         if let Err(_e) = self.prune_after_commit(header.height) {
-            // TODO tracing::warn!("prune_after_commit failed: {_e}");
             // Safe to ignore: prune is retried on the next commit.
         }
 

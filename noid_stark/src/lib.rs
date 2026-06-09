@@ -165,14 +165,14 @@ pub fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
     // zero-check betas in particular.
     let live_packed: u128 = (pi.n_live_inputs as u128) | ((pi.n_live_outputs as u128) << 8);
     channel.observe_field_elem(Block128::from(live_packed));
-    // Stage E.6 — absorb coinbase_credit alongside the live counts and
+    // Absorb coinbase_credit alongside the live counts and
     // log_slots alongside the roots. A disagreement on either forks
     // the channel, preventing a prover from quietly reusing a
     // different circuit sizing or mint credit than the one the
     // verifier (and block header) sees.
     channel.observe_field_elem(Block128::from(pi.coinbase_credit as u128));
     channel.observe_field_elem(Block128::from(pi.log_slots as u128));
-    // Stage E.4 — activation / deactivation booleans. Packed into one
+    // Activation / deactivation booleans. Packed into one
     // field element each (MAX_OUTPUTS, MAX_INPUTS ≤ 8 bits, well under
     // 128). Any disagreement between prover and verifier on these
     // surfaces forks the Fiat-Shamir channel, so the chain/block
@@ -928,13 +928,11 @@ pub fn prove_air_unchecked_timed<A: Air>(
     )
 }
 
-/// Stage 3b-0.6 prover — compute base per-column openings at
-/// `r_point` and the VSHIFT ladder partials for every shifted column.
-/// Absorbs both into the parent channel in a deterministic order so
-/// the verifier replay is bit-for-bit. Unlike the legacy §12a, this
+/// Compute base per-column openings at `r_point` and the VSHIFT ladder
+/// partials for every shifted column. Absorbs both into the parent channel
+/// in a deterministic order so the verifier replay is bit-for-bit. This
 /// routine does **not** run a per-slot product sumcheck: ladder claims
-/// are inlined directly into the §12c' multipoint sumcheck that
-/// follows.
+/// are inlined directly into the §12c' multipoint sumcheck that follows.
 pub(crate) fn prove_base_and_ladder_partials(
     padded_columns: &[Vec<Block128>],
     shifted_indices: &[usize],
@@ -968,7 +966,7 @@ pub(crate) fn prove_base_and_ladder_partials(
     (base_openings, partials_per_slot)
 }
 
-/// Stage 3b-0.6 §12c' prover — multipoint-to-single-point reduction
+/// §12c' prover — multipoint-to-single-point reduction
 /// with inlined ladder terms.
 ///
 /// For each base column we contribute a pair
@@ -1205,7 +1203,7 @@ pub struct ExtraColumn {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 0: MLE Splitting — SliceClaim for uniform FRI path
+// MLE Splitting — SliceClaim for uniform FRI path
 // ---------------------------------------------------------------------------
 
 /// A claim that a boundary-slice column (appended after the AIR columns)
@@ -1256,15 +1254,11 @@ pub fn prove_air_unchecked<A: Air>(air: &A, trace: &Trace, pi: &PublicInputs) ->
 
 /// γ₃b opt-in wrapper around [`prove_air_unchecked_with_extra`] that
 /// threads additional externally-committed MLEs through the
-/// multipoint close. When `extras` is empty this is a direct
-/// delegation to `prove_air_unchecked_with_extra(extra_transcript)`
-/// and the output is byte-identical to the default path.
-///
-/// The non-empty branch (actual mixed-length close) is gated behind a
-/// follow-up that lands the wiring; attempting to use it now panics
-/// with a clear message. The scaffolding exists so callers (notably
-/// `noid_stark::spine`) can commit to the API shape before the
-/// wiring is in place.
+/// multipoint close. When `extras` is empty this delegates directly to
+/// `prove_air_unchecked_with_extra(extra_transcript)` and the output
+/// is byte-identical to the default path. When `extras` is non-empty
+/// the mixed-length multipoint close ([`prove_multipoint_close_mixed`])
+/// handles columns of differing hypercube sizes under a shared FRI.
 #[doc(hidden)]
 pub fn prove_air_unchecked_with_extra_columns<A: Air + ?Sized>(
     air: &A,
@@ -2042,8 +2036,8 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
     // cyclic-next of the last witness row is a padding row, not row 0
     // of the witness. Every current AIR that opts into rotation
     // (shipped sub-AIRs: `POSEIDON_PERM_LOG_ROWS = 8`,
-    // `TXBODY_MERKLE_LOG_ROWS = 13`, `FRI_STATE_COMBINER_LOG_ROWS = 9`;
-    // the stitched Stage 7 `[L]` composite lands at its own derived
+    // `FRI_STATE_COMBINER_LOG_ROWS = 9`;
+    // the stitched composite lands at its own derived
     // `log_rows`, measured — not hardcoded) satisfies
     // `log_rows >= TAU+1`, so the padded case is not part of the
     // protocol contract.
@@ -2243,7 +2237,7 @@ pub fn verify_air_with_extra<A: Air + ?Sized>(
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
 
-    // Stage 3d-0.2: bind every `PublicColumn` to its committed base
+    // Bind every `PublicColumn` to its committed base
     // opening via MLE re-evaluation at `r_point`.
     check_public_columns(air, &proof.base_openings, &r_point, log_len)?;
 
@@ -2489,7 +2483,7 @@ pub fn verify_air_timed<A: Air>(
         .iter()
         .map(|partials| reconstruct_shifted_opening(&r_point, partials))
         .collect();
-    // Stage 3d-0.2: bind declared public columns to their base openings.
+    // Bind declared public columns to their base openings.
     if let Err(e) = check_public_columns(air, &proof.base_openings, &r_point, log_len) {
         t.composition = t1.elapsed();
         return (Err(e), t);
@@ -2621,7 +2615,7 @@ pub fn mle_eval(evals: &[Block128], point: &[Block128]) -> Block128 {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3d-0.2: PublicColumn verifier-side binding
+// PublicColumn verifier-side binding
 // ---------------------------------------------------------------------------
 
 /// Enforce every `PublicColumn` declaration on the given proof.
@@ -3346,7 +3340,7 @@ mod tests {
     }
 
     // =====================================================================
-    // VSHIFT (cross-row rotation) — Stage 3b-0.2b integration tests
+    // VSHIFT (cross-row rotation) integration tests
     // =====================================================================
 
     /// `local[0] + next[0] == 0` — forces the column to be constant
@@ -3425,7 +3419,7 @@ mod tests {
 
     #[test]
     fn vshift_tampered_multipoint_round_rejected() {
-        // Stage 3b-0.6: flipping a byte inside the §12c' multipoint
+        // Ladder-merge tamper: flipping a byte inside the §12c' multipoint
         // sumcheck transcript must diverge the channel → final FRI fails.
         let log_rows = 8;
         let constraints: Vec<Box<dyn Constraint>> =
@@ -3477,7 +3471,7 @@ mod tests {
     }
 
     // =====================================================================
-    // CarryRippleAir — Stage 3b-0.3 integration tests
+    // CarryRippleAir integration tests
     // =====================================================================
 
     use noid_air::{
@@ -3603,7 +3597,7 @@ mod tests {
     }
 
     // =====================================================================
-    // RangeGateAir — Stage 3b-2 integration tests
+    // RangeGateAir integration tests
     // =====================================================================
 
     use noid_air::{
@@ -3705,7 +3699,7 @@ mod tests {
         // produces tower-field powers, not integer `1 << i`. `acc` at the
         // final row of an instance is therefore `Σ bit_i · tower_pow(2, i)`
         // — a faithful linear encoding of the bit vector, not the integer
-        // embedding of `x`. Integer-embedding is deferred to §3b-4 via a
+        // embedding of `x`. Integer-embedding requires a
         // `ConstColumnGate` pinning `weight[i] = Block128::from(1u128 << i)`.
         let log_rows = 8;
         let air = RangeGateAir::new(log_rows);
@@ -3730,7 +3724,7 @@ mod tests {
     }
 
     // =====================================================================
-    // BitAdderAir — Stage 3b-3a integration tests
+    // BitAdderAir integration tests
     // =====================================================================
 
     use noid_air::{
@@ -3857,7 +3851,7 @@ mod tests {
     }
 
     // =====================================================================
-    // BalanceGateAir — Stage 3b-3 integration tests
+    // BalanceGateAir integration tests
     // =====================================================================
 
     use noid_air::BalanceGateAir;
@@ -3984,7 +3978,7 @@ mod tests {
     }
 }
 // ---------------------------------------------------------------------------
-// Stage 3c-1.5 — PoseidonPermAir STARK integration tests
+// PoseidonPermAir STARK integration tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -4125,7 +4119,7 @@ mod poseidon_perm_stark_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3d-0.2 — PublicColumn verifier-side binding tests.
+// PublicColumn verifier-side binding tests.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -4149,7 +4143,7 @@ mod tx_body_merkle_stark_tests {
     }
 
     // =====================================================================
-    // Stage 3d-0.2 — PublicColumn verifier-side binding
+    // PublicColumn verifier-side binding
     // =====================================================================
 
     use noid_air::{BoolGate, Constraint, PublicColumn};
@@ -4391,7 +4385,7 @@ mod tx_body_merkle_stark_tests {
     }
 
     // =====================================================================
-    // Stage 3d-0.5 — RowSelectorGate primitive (STARK-level)
+    // RowSelectorGate primitive (STARK-level)
     // =====================================================================
 
     #[test]
@@ -4399,7 +4393,7 @@ mod tx_body_merkle_stark_tests {
         // End-to-end STARK check of a "pin target_col[row] == constant"
         // row-selector tie: honest trace verifies; tampering the pinned
         // cell produces a rejecting verifier. Exercises the same code
-        // path that §3d-0.6..0.10 boundary ties will exercise per tie.
+        // path that boundary-tie tests exercise per tie.
         use noid_air::{emit_public_cell, BoolGate, CompositeAir, Constraint};
 
         let log_rows = 4;
@@ -4467,7 +4461,7 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn column_eq_at_row_honest_accept_and_tamper_reject() {
-        // §3d-0.6b / §3d-0.9 cross-column, same-row equality primitive.
+        // Cross-column, same-row equality primitive.
         // `emit_column_eq_at_row` pins `col_a@row == col_b@row` via a
         // shared row-indicator programme. Honest traces verify; tampers
         // that break the equality on the pinned row, or shift the
@@ -4540,7 +4534,7 @@ mod tx_body_merkle_stark_tests {
 
     #[test]
     fn column_eq_at_next_row_honest_accept_and_tamper_reject() {
-        // §3d-0.5.2 off-by-one cross-row equality primitive. Pins
+        // Off-by-one cross-row equality primitive. Pins
         // `col_a@row == col_b@row+1` through the base `Air`'s cyclic
         // rotation. End-to-end STARK round-trip confirms the zero-check
         // composition handles a gate with `next`-slot reads combined

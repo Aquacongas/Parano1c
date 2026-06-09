@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! `CarryRippleAir` — Stage 3b-0.3 first rotation-consuming AIR. 64-bit
+//! `CarryRippleAir` — 64-bit
 //! ripple-carry adder laid out along the hypercube, one instance per
 //! `WORD_BITS` rows.
 
@@ -119,7 +119,7 @@ impl Constraint for CarryInitGate {
 /// 64-bit ripple-carry adder AIR. One or more adder instances are laid
 /// out consecutively along the hypercube, each occupying `WORD_BITS`
 /// rows. `log_rows` must satisfy `log_rows >= LOG_WORD_BITS` (at least
-/// one instance); the Stage 3b-0.2b VSHIFT invariant `log_rows >=
+/// one instance); the VSHIFT invariant `log_rows >=
 /// TAU + 1 = 8` is enforced by the STARK layer.
 pub struct CarryRippleAir {
     log_rows: usize,

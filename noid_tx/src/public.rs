@@ -19,7 +19,6 @@ use crate::types::{MAX_INPUTS, MAX_OUTPUTS};
 /// at this depth; any smaller is a test-only configuration.
 pub const MIN_LOG_SLOTS: u32 = 24;
 /// Maximum accepted `log_slots` in `PublicInputs`. Upper bound of the
-/// expansion trigger per `GENERAL_DESIGN §15.3`.
 pub const MAX_LOG_SLOTS: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -31,7 +30,7 @@ pub struct PublicInputs {
     pub fee: u128,
     pub n_live_inputs: u8,
     pub n_live_outputs: u8,
-    /// Stage E.5.f₁ — coinbase credit. Zero for non-coinbase.
+    /// Coinbase block reward credit. Zero for non-coinbase transactions.
     pub coinbase_credit: u64,
     /// Slot-space depth `k ∈ [MIN_LOG_SLOTS, MAX_LOG_SLOTS]` from block
     /// header. Absorbed into STARK transcript to bind circuit sizing.

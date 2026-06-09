@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G0 differential test.
+//! Spine oracle differential test.
 //!
 //! Runs the reference spine oracle in `noid_gkr` on a handful of
 //! fixtures and asserts its output byte-equals
-//! `noid_poseidon2b::primitives::hash_tx_body`. This is the contract
-//! every later GKR stage must preserve.
+//! `noid_poseidon2b::primitives::hash_tx_body`.
 //!
-//! Note: the Stage G0 oracle always hashes payload pre-images for
+//! Note: the spine oracle always hashes payload pre-images for
 //! every leaf slot (it doesn't model "dummy slots with zero digest").
 //! Every test therefore fills all 4 input + 8 output slots with real
 //! payloads — which is also the most adversarial shape (full tree).

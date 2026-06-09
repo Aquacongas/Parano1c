@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Mempool admission checks (SPECIFICATION.md §6).
+//! Mempool admission checks.
 //!
 //! `validate_tx_for_mempool` enforces all native checks a node performs
 //! before admitting a transaction to the mempool. This is a SUPERSET of
@@ -46,7 +46,7 @@ pub fn validate_tx_for_mempool(
     ctx: &ChainContext,
     mempool_txs: &[Transaction],
 ) -> Result<(), ConsensusError> {
-    // --- Step 0: minimum relay fee (P.16, non-consensus local policy) ---
+    // --- Minimum relay fee (non-consensus local policy) ---
     // Coinbase is exempt: it's built by the miner, not submitted by a wallet.
     if !tx.body.is_coinbase {
         let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
@@ -57,10 +57,10 @@ pub fn validate_tx_for_mempool(
         }
     }
 
-    // --- Step 1: basic consensus checks ---
+    // --- Basic consensus checks ---
     validate_tx_consensus(tx, &ctx.nullifiers)?;
 
-    // --- Step 2: epoch_anchor hash must be a known header within window ---
+    // --- Epoch anchor hash must be a known header within window ---
     if !tx.body.is_coinbase {
         let anchor_hash = tx.body.epoch_anchor;
         let tip = ctx.tip_height;
@@ -76,7 +76,7 @@ pub fn validate_tx_for_mempool(
         }
     }
 
-    // --- Step 3: no slot conflict with mempool ---
+    // --- No slot conflict with mempool ---
     let mut mempool_inputs: HashSet<u32> = HashSet::new();
     let mut mempool_outputs: HashSet<u32> = HashSet::new();
     for admitted in mempool_txs {
@@ -102,7 +102,7 @@ pub fn validate_tx_for_mempool(
         }
     }
 
-    // --- Step 4: input slots live in state with matching (value, owner) ---
+    // --- Input slots live in state with matching (value, owner) ---
     for inp in &tx.body.inputs {
         if !inp.valid {
             continue;
@@ -125,7 +125,7 @@ pub fn validate_tx_for_mempool(
         }
     }
 
-    // --- Step 5: output slots empty in state ---
+    // --- Output slots empty in state ---
     for out in &tx.body.outputs {
         if !out.valid {
             continue;

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Phase 7 end-to-end test: prove_recursive_step + verify_tip.
+//! End-to-end test: prove_recursive_step + verify_tip.
 //!
-//! Builds a single-transaction block proof (reusing stage_g_roundtrip
-//! infrastructure), then wraps it in a RecursiveBlockProof and verifies
+//! Builds a single-transaction block proof, then wraps it in a RecursiveBlockProof and verifies
 //! with verify_tip (O(1) chain verification).
 //!
 //! Marked `#[ignore]` — runs the full block STARK prove (heavy).
-//! Execute with:  `cargo test -p noid_block --ignored phase7 --release`
+//! Execute with:  `cargo test -p noid_block --ignored recursive_e2e --release`
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
@@ -184,18 +183,18 @@ fn wallet_auth(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 E2E test
+// Recursive proof end-to-end test
 // ---------------------------------------------------------------------------
 
-/// Full Phase 7 roundtrip:
+/// Full recursive prove + verify roundtrip:
 /// 1. Build a real single-tx BlockProof (via prove_block).
 /// 2. Extract BlockReplayWitness.
 /// 3. prove_recursive_step → RecursiveBlockProof (~11 KB).
 /// 4. Verify RecursiveBlockAir constraints (check_legacy).
 /// 5. verify_tip → O(1) chain verification.
 #[test]
-#[ignore = "phase7_e2e: full block prove + recursive step (heavy); run with --ignored"]
-fn phase7_recursive_step_and_verify_tip() {
+#[ignore = "full block prove + recursive step (heavy); run with --ignored"]
+fn recursive_step_and_verify_tip() {
     // ----- Build block proof -----
     let body = mk_test_body();
     let (air, trace, pi, spine_inputs) = build_fixture(&body);
@@ -261,10 +260,10 @@ fn phase7_recursive_step_and_verify_tip() {
     );
 
     // ----- prove_recursive_step -----
-    eprintln!("[phase7] Running prove_recursive_step...");
+    eprintln!("[recursive_e2e] Running prove_recursive_step...");
     let rec_proof = prove_recursive_step(&block_witness, &block_header, &genesis_acc, None);
     eprintln!(
-        "[phase7] RecursiveBlockProof: ~{} bytes",
+        "[recursive_e2e] RecursiveBlockProof: ~{} bytes",
         rec_proof.byte_len()
     );
 
@@ -304,7 +303,7 @@ fn phase7_recursive_step_and_verify_tip() {
         };
         let ok = noid_air::check_legacy(&rec_air, &trace_obj);
         assert!(ok, "RecursiveBlockAir AIR check must pass");
-        eprintln!("[phase7] RecursiveBlockAir AIR check: PASS");
+        eprintln!("[recursive_e2e] RecursiveBlockAir AIR check: PASS");
     }
 
     // ----- verify_tip -----
@@ -335,7 +334,7 @@ fn phase7_recursive_step_and_verify_tip() {
         };
         let rec_air_for_verify = RecursiveBlockAir::new(&verify_witness);
 
-        eprintln!("[phase7] Running verify_tip...");
+        eprintln!("[recursive_e2e] Running verify_tip...");
         let result = verify_tip(
             &rec_proof,
             &rec_air_for_verify,
@@ -345,7 +344,7 @@ fn phase7_recursive_step_and_verify_tip() {
             None, // no expected_chain_hash: test doesn't have full header chain
         );
         assert!(result.is_ok(), "verify_tip must succeed: {result:?}");
-        eprintln!("[phase7] verify_tip: PASS — O(1) chain verification works!");
+        eprintln!("[recursive_e2e] verify_tip: PASS — O(1) chain verification works!");
     }
 }
 
@@ -380,7 +379,9 @@ fn phase7_accumulator_chain_e2e() {
         "null-witness substitution detectable via chain_hash"
     );
 
-    eprintln!("[phase7] 3-step accumulator chain: genesis → block1 → block2, all consistent");
+    eprintln!(
+        "[recursive_e2e] 3-step accumulator chain: genesis → block1 → block2, all consistent"
+    );
 }
 
 /// AIR constraint check for RecursiveBlockAir with zero data (fast, always runs).

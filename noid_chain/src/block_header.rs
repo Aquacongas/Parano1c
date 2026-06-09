@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Block-header hash. SPECIFICATION.md §0.4 / §8.
+//! Block-header hash.
 //!
 //! `H_BLOCK` absorbs all consensus-significant header fields in the order
 //! declared below, using capacity IV = `BLOCKHDR`. Each 32-byte digest is
@@ -42,7 +42,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 pub struct BlockHeader {
     pub prev_block_hash: Digest,
     /// Global state root — Poseidon2b Merkle root over per-segment FRI roots
-    /// (SPECIFICATION.md §19). For a single-segment state (`log_slots ≤ 16`)
+    /// For a single-segment state (`log_slots ≤ 16`)
     /// this degenerates to the single segment's FRI combined root.
     pub state_root: Digest,
     /// COMPRESS-domain Merkle root of all `tx_body_hash`es in block order.
@@ -63,7 +63,6 @@ pub struct BlockHeader {
     pub witness_root: Digest,
     /// Slot-space depth: `log₂(num_slots)`. Lives in [24, 32] on mainnet;
     /// may be smaller in test mode. Replicated in every Fiat-Shamir
-    /// transcript (SPECIFICATION.md §15.3.9).
     pub log_slots: u32,
     /// Number of live (non-empty) slots after all transactions in this block
     /// are applied. Drives the §15.3.6 expansion trigger. MUST equal

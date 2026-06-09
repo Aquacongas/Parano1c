@@ -96,13 +96,11 @@ pub struct GetStateSnapshotResponse {
 
 /// Gossipsub message for block announcements.
 ///
-/// Replaces the previous bare `block_bytes` format. The `block_proof_bytes`
-/// field carries the `BlockProof` (bincode-encoded) alongside the block.
-///
-/// For coinbase-only blocks (no user transactions) `block_proof_bytes` is
-/// empty — those blocks are validated by native consensus only (PoW +
-/// state_root). The `STUB_MARKER [1u8;32]` in the header guards against
-/// fake "no proof" blocks that contain user transactions.
+/// `block_proof_bytes` carries the `BlockProof` (bincode-encoded) alongside
+/// the block. For coinbase-only blocks (no user transactions)
+/// `block_proof_bytes` is empty — those blocks are validated by native
+/// consensus only (PoW + state_root). The `STUB_MARKER [1u8;32]` in the
+/// header guards against fake "no proof" blocks that contain user transactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockGossipMsg {
     /// `Block::to_bytes()` — header + transactions.

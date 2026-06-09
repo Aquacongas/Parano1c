@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 1.6.4 — AuthGKR Kill-Shot orchestrator (Stage 2.4: retargeted
+//! AuthGKR Kill-Shot orchestrator (retargeted
 //! onto the dedicated 14-variable AuthGKR hypercube).
 //!
-//! Replaces the legacy 20-slot per-permutation `prove_perm` chain with
+//! Runs the unified AuthGKR Kill-Shot instead of a per-permutation chain:
 //! a single `prove_auth_unified` + `prove_auth_shift` pair, then
 //! collapses the four resulting witness claims into three column
 //! batch-eval reductions:

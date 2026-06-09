@@ -12,7 +12,9 @@
 //! 2. Reject if reorg depth > FINALITY_DEPTH.
 //! 3. Revert blocks from current tip to common ancestor using undo logs.
 //! 4. Apply new blocks one by one using validate_block_consensus.
-//! 5. Rebuild nullifier set from the surviving chain's undo logs.
+//! 5. Rebuild nullifier set from surviving-chain undo logs (ANCHOR_DEPTH window;
+//!    blocks older than FINALITY_DEPTH produce empty entries — safe because
+//!    those txs are already protected by the UTXO state check).
 //! 6. Return hashes of reverted transactions for mempool re-admission.
 
 use std::collections::HashMap;

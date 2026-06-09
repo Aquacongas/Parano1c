@@ -27,8 +27,6 @@ use noid_chain::block::Block;
 use noid_chain::consensus::receipt::{generate_receipt, TxSummary};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::segmented_state::SegmentedFriState;
-use noid_core::Block128;
-use noid_poseidon2b::primitives::Address;
 
 use super::keystore::MasterSecret;
 use super::state::{TxDirection, TxHistoryEntry, WalletUtxo};
@@ -59,16 +57,6 @@ pub fn owner_bytes_from_slot(sv: &SlotValue) -> [u8; 32] {
     b
 }
 
-/// Convert an Address to the two Block128 owner fields stored in state.
-/// Used by BlockStateBinding to match slot owners in ZK proofs.
-#[inline]
-#[allow(dead_code)]
-pub fn address_to_owner_fields(addr: &Address) -> (Block128, Block128) {
-    let hi = u128::from_le_bytes(addr.0[..16].try_into().unwrap());
-    let lo = u128::from_le_bytes(addr.0[16..].try_into().unwrap());
-    (Block128::from(hi), Block128::from(lo))
-}
-
 // ---------------------------------------------------------------------------
 // Full state scan
 // ---------------------------------------------------------------------------
@@ -92,7 +80,7 @@ pub fn scan_state_for_utxos(
     let seg_log = state.effective_log_segment_size();
     let seg_size = 1usize << seg_log;
 
-    // Phase 1: Collect all non-empty slots from active segments (O(active_slots))
+    // Collect all non-empty slots from active segments (O(active_slots))
     // Build reverse map: owner_bytes → Vec<(slot_index, value)>
     let mut owner_to_slots: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
     for seg_id in state.active_segment_ids() {
@@ -117,7 +105,7 @@ pub fn scan_state_for_utxos(
         return (vec![], known, BATCH_SIZE);
     }
 
-    // Phase 2: Derive addresses in batches until gap condition met
+    // Derive addresses in batches until gap condition met
     let mut known_addresses: HashMap<[u8; 32], u32> = HashMap::new();
     let mut found_utxos: Vec<WalletUtxo> = Vec::new();
     let mut max_found_index: u32 = 0;

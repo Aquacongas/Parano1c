@@ -3,7 +3,7 @@
 
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
-//! `BalanceGateAir` — Stage 3b-3 UTXO conservation law AIR.
+//! `BalanceGateAir` — UTXO conservation law AIR.
 //!
 //! Enforces `Σ inputs == Σ outputs + fee` (standard UTXO accounting) for
 //! a 4-in / 8-out / 1-fee tx shape, all operands treated as `u64`. The
@@ -66,7 +66,7 @@ pub const BALANCE_N_COLS: usize = BALANCE_N_BLOCKS * BIT_ADDER_N_COLS;
 /// `log_rows >= 8` floor forcing a second zero-filled instance.
 pub const BALANCE_MIN_LOG_ROWS: usize = 8;
 
-/// E.5.f₄ — public accessor for the `B21` block column offset. `B21`
+/// Public accessor for the `B21` block column offset. `B21`
 /// is the last block in the B chain (B20 + fee, 67-bit output). Used
 /// by `tx_validity_with_spine` to pin `coinbase_credit` against
 /// `B21.sum` on coinbase txs.
@@ -403,7 +403,7 @@ fn src_sum_col(block: usize) -> usize {
 
 /// Emit the full `BalanceGateAir` constraint set with every column
 /// index shifted by `base_col`. `base_col == 0` recovers the
-/// standalone layout. Used by Stage 3b-4 to embed this AIR as a
+/// standalone layout. Used to embed this AIR as a
 /// sub-circuit of `TxValidityAir` at an arbitrary column offset.
 pub fn emit_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
     let (mut internal, cross) = emit_balance_constraints_split(base_col);
@@ -411,7 +411,7 @@ pub fn emit_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
     internal
 }
 
-/// E.5.f₄ — split variant for callers that need to mux the cross-chain
+/// Split variant for callers that need to mux the cross-chain
 /// equality gates (A2 ≡ B21) independently of the balance internals.
 ///
 /// Returns `(internal, cross_chain_equality)`:
@@ -928,7 +928,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Stage 3d-0.10 — selector programme pinning
+    // Selector programme pinning
     // -----------------------------------------------------------------
 
     #[test]
@@ -980,7 +980,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Stage 3d-0.10.5 — primary-operand value pinning
+    // Primary-operand value pinning
     // -----------------------------------------------------------------
 
     #[test]

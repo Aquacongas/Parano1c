@@ -6,11 +6,11 @@
 //! The chain state is a single `FriState` — a FRI-committed vector of
 //! `2^STATE_LOG_SLOTS` UTXO slots, each holding a `(value, owner)`
 //! pair. A spend zeroes the slot at `input.slot_index` and returns
-//! that index to the free-list. Stage E.1: a mint now writes to the
-//! wallet-chosen `output.slot_index` and the chain verifies the
-//! destination was empty (prev-state `(0,0,0)`) — the AIR (Stage E.2)
-//! proves the same opening in-circuit so consensus is four-corner
-//! bound. The state root is `FriState::root()`.
+//! that index to the free-list. A mint writes to the wallet-chosen
+//! `output.slot_index`; the chain verifies the destination was empty
+//! (prev-state `(0,0,0)`) and `BlockStateBindingAir` proves the same
+//! opening in-circuit so consensus is four-corner bound.
+//! The state root is `FriState::root()`.
 //!
 //! This is *not* the in-circuit state transition — it is the native
 //! reference the prover uses to compute the post-root that the STARK
@@ -27,20 +27,19 @@ use crate::segmented_state::SegmentedFriState;
 
 /// Chain-level mutable state.
 ///
-/// Stage E.1: the wallet picks each output's `slot_index` and binds
-/// it into the body hash. The chain is no longer an allocator — it
-/// only *verifies* that the chosen slot is currently empty and that
-/// the outputs of a single tx don't collide. `alloc_counter` is
-/// retained as a seed for the splitmix64-based wallet hint generator
-/// (SPECIFICATION.md §15.1); it does not influence `apply_tx` outcomes.
+/// The wallet picks each output's `slot_index` and binds it into the
+/// body hash. The chain only *verifies* that the chosen slot is
+/// currently empty and that the outputs of a single tx don't collide.
+/// `alloc_counter` is retained as a seed for the splitmix64-based
+/// wallet hint generator; it does not
+/// influence `apply_tx` outcomes.
 #[derive(Debug, Clone)]
 pub struct ChainState {
-    /// Segmented FRI-committed UTXO state (replaces the old monolithic `FriState`).
+    /// Segmented FRI-committed UTXO state (2^16 slots per segment).
     pub state: SegmentedFriState,
     /// Number of live (non-empty) slots. Grows on activation, shrinks
     /// on deactivation. This is the consensus-significant occupancy
     /// signal for the `log_slots` expansion trigger (see
-    /// `GENERAL_DESIGN §15.3`).
     pub active_slot_count: u64,
     /// Monotone counter incremented on each successful allocation.
     /// Used only as a seed source for the pseudo-random fallback —
@@ -107,12 +106,11 @@ pub enum ApplyError {
     /// The slot's `(value, owner)` does not match the input's claimed
     /// fields — spending a non-existent or already-spent UTXO.
     UnknownOrSpentInput,
-    /// Stage E.1: the wallet-chosen output slot is already occupied in
-    /// the prev-state (not `(0,0,0)`). The mint would clobber a live
-    /// UTXO.
+    /// The wallet-chosen output slot is already occupied in the
+    /// prev-state (not `(0,0,0)`). The mint would clobber a live UTXO.
     OutputSlotNotEmpty,
-    /// Stage E.1: two valid outputs in the same tx target the same
-    /// `slot_index`, which would produce a double-write to one cell.
+    /// Two valid outputs in the same tx target the same `slot_index`,
+    /// which would produce a double-write to one cell.
     DuplicateOutputSlot,
 }
 
@@ -134,11 +132,11 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
         spend_input(&mut snapshot, input)?;
     }
 
-    // Stage E.1: wallet-chosen output slots. Reject duplicates *within
-    // this tx* up-front so we don't silently overwrite our own earlier
-    // write. The AIR mirrors this as a per-output `is_mint ⇒
-    // prev_state[slot] == (0,0,0)` opening plus a cross-output
-    // uniqueness check (Stage E.2/E.3).
+    // Wallet-chosen output slots: reject duplicates *within this tx*
+    // up-front so we don't silently overwrite our own earlier write.
+    // BlockStateBindingAir mirrors this as a per-output
+    // `is_mint ⇒ prev_state[slot] == (0,0,0)` opening plus a
+    // cross-output uniqueness check.
     let mut seen: HashSet<u32> = HashSet::new();
     for output in &body.outputs {
         if !output.valid {
@@ -190,9 +188,9 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
     if (idx as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
-    // Stage E.1 four-corner invariant: the wallet-chosen destination
-    // must be empty in prev-state. The STARK's §FriStateOpen proves
-    // the same fact in-circuit (Stage E.2 `is_mint ⇒ prev == (0,0,0)`).
+    // The wallet-chosen destination must be empty in prev-state.
+    // BlockStateBindingAir proves the same fact in-circuit
+    // (`is_mint ⇒ prev == (0,0,0)`).
     if state.state.slot(idx) != SlotValue::EMPTY {
         return Err(ApplyError::OutputSlotNotEmpty);
     }
@@ -258,10 +256,9 @@ mod tests {
         }
     }
 
-    /// Stage E.1: the output's slot_index is now wallet-chosen and
-    /// bound into the body hash. Callers know the target slot from
-    /// the `TxOutput` itself — this helper is the trivial accessor
-    /// kept so the existing tests read naturally.
+    /// The output's slot_index is wallet-chosen and bound into the
+    /// body hash. This helper is a trivial accessor kept so tests
+    /// read naturally.
     fn find_slot(_state: &ChainState, out: &TxOutput) -> u32 {
         out.slot_index
     }
@@ -334,9 +331,8 @@ mod tests {
 
     #[test]
     fn spent_slot_can_be_reused_by_next_mint() {
-        // Stage E.1: the wallet is the slot chooser. After a spend
-        // frees a slot, the wallet is free to reuse that exact slot
-        // in a later mint.
+        // The wallet is the slot chooser. After a spend frees a slot,
+        // the wallet is free to reuse that exact slot in a later mint.
         let mut state = fresh();
 
         let a = mk_output_at(7, 1);

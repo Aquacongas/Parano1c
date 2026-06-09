@@ -3,16 +3,16 @@
 
 #![allow(clippy::needless_range_loop)]
 
-//! Stage 2.1 — AuthGKR dedicated 14-variable unified MLE.
+//! AuthGKR dedicated 14-variable unified MLE.
 //!
 //! Architecture
 //! ------------
 //!
 //! AuthGKR drives `N_AUTH_LIVE_SLOTS = 20` Poseidon2b permutations
 //! (4 inputs × 5 perms each: HAddrPermA, HAddrPermB, HAuthPermA,
-//! HAuthPermB, HAuthPermC). The Stage 1.6 kill-shot reused the Spine's
+//! HAuthPermB, HAuthPermC). The Spine Kill-Shot reused the Spine's
 //! 15-variable hypercube (`2^15 = 32K` cells) verbatim — paying for
-//! 44 padded slots. Stage 2 forks AuthGKR onto a smaller hypercube:
+//! 44 padded slots. AuthGKR is instead placed on a smaller hypercube:
 //!
 //! Bit layout (14 bits, low → high): `elem:2 | round:7 | slot:5`.
 //! `(slot, round, elem)` lives at index

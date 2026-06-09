@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G5 fuzz — topology-preserving random inputs compared
+//! Spine fuzz test — topology-preserving random inputs compared
 //! native vs GKR oracle.
 //!
 //! Each iteration rolls fresh: epoch_anchor, fee, is_coinbase, 4

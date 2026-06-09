@@ -3,7 +3,7 @@
 
 #![allow(clippy::unnecessary_cast)]
 
-//! Stage 3b-0.4 — multipoint-to-single-point reduction (CRYPTO.md §12c).
+//! Multipoint-to-single-point reduction (CRYPTO.md §12c).
 //!
 //! After the zero-check sumcheck we hold `N` base claims
 //! `e_i = MLE_i(r_point)` and, after per-slot product sumchecks

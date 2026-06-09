@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Step 1a — typed topology description of the `AuthCircuit`:
+//! Typed topology description of the `AuthCircuit`:
 //! per-input HAddr (2 perms) + HAuth (3 perms) sponges packed into a
 //! single GKR sub-protocol. The purpose is to evacuate all Poseidon2b
 //! authorisation permutations out of the STARK AIR, mirroring what the
@@ -16,7 +16,7 @@
 //!   - `AuthTag[i]   = H_AUTH (SpendSecret[i], tx_body_hash)` (3-perm sponge, IV = `TAG_AUTHTAG`)
 //!
 //! and exposes the derived `(Address[i], AuthTag[i])` pairs at the GKR
-//! boundary. The STARK side (landed in Step 1b) pins these boundaries
+//! boundary. The STARK side pins these boundaries
 //! via `PublicColumn` so `T1a` / `T2a/b` close through equality, not
 //! through trace materialisation of the sponge state.
 //!
@@ -43,15 +43,15 @@
 //!
 //! The verifier reconstructs every slot's `state_in` natively from these
 //! inputs + previous slots' outputs (see `auth_oracle`). The sumcheck
-//! (see `auth_sumcheck`) then discharges per-slot `state`-MLE claims
-//! against the concatenated boundary MLE. Equality-bound output pins:
+//! (see `auth_killshot`) then discharges per-slot `state`-MLE claims
+//! against the unified boundary MLE. Equality-bound output pins:
 //!
 //!   - HAddrPermB slot's `state_out[0..1]` == `expected_address[i]`,
 //!   - HAuthPermC slot's `state_out[0..1]` == `expected_auth_tag[i]`.
 //!
 //! Any mismatch rejects deterministically — no probabilistic handoff.
 //!
-//! ## Privacy invariant (load-bearing — `SPECIFICATION.md §5`)
+//! ## Privacy invariant
 //!
 //! `spend_secret[i]` is a witness-only input. The sumcheck transcript
 //! never absorbs raw secret values; it only absorbs the publicly-known
@@ -164,7 +164,7 @@ impl AuthPublicInputs {
 
 /// Per-transaction private + public witness inputs the GKR boundary
 /// carries. Public fields are the same cells the STARK's `PublicColumn`
-/// pins consume (landed in Step 1b); private fields are witness-only.
+/// pins consume; private fields are witness-only.
 ///
 /// PRIVACY: This struct must NEVER leave the wallet. The block prover
 /// receives only `AuthPublicInputs` + a pre-built `AuthProofKillShot`.

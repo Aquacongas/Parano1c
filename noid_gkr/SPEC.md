@@ -80,23 +80,15 @@ transcript. Only public inputs seed the channel.
 | `spine_mle.rs` | Spine-wide MLE construction: 15-var unified hypercube (`state`, `s_in`, `s_out` columns). |
 | `auth_mle_v2.rs` | Auth-wide MLE construction: 14-var unified hypercube. |
 | `spine_unified.rs` | Unified degree-7 sumcheck over all 59 spine slots. |
-| `spine_degree7.rs` | Degree-7 round polynomial evaluator (Frobenius-based). |
+| `spine_degree7.rs` | Standalone C1-only S-box identity reference prover+verifier (Frobenius-based). NOT orchestrated by `spine_killshot.rs`; kept as a differential reference alongside `spine_unified.rs`. |
 | `auth_unified_v2.rs` | Unified degree-7 sumcheck over all 20 auth slots. |
 | `spine_shift.rs` | Shift Gadget for spine: proves `state(x) == s_in(x XOR 1)`. |
 | `auth_shift.rs` | Shift Gadget for auth. |
 | `spine_killshot.rs` | Kill-Shot orchestrator (spine): unified + shift + 3x batch-eval -> `SpineProofKillShot`. |
 | `auth_killshot.rs` | Kill-Shot orchestrator (auth): unified + shift + 3x batch-eval -> `AuthProofKillShot`. |
 | `batch_eval.rs` | Gamma-2 primitive: RLC + degree-2 sumcheck collapses M claims into `(r_B, v_B)`. |
-| `binding.rs` | Pure contract: `BindingCut` names the STARK-GKR cut in code. |
-
-### 2.2 Legacy modules (retained for tests / reference)
-
-| Module | Purpose |
-|---|---|
-| `product_sumcheck.rs` | Degree-3 product sumcheck primitive (used by batch-eval). |
-| `perm_sumcheck.rs` | Former per-slot PermProof chain. Retained for differential testing; NOT used in production. |
-| `spine_sumcheck.rs` | Former 59-slot orchestrator. NOT used in production (`prove_tx` calls Kill-Shot). |
-| `auth_sumcheck.rs` | Former auth orchestrator. NOT used in production. |
+| `binding.rs` | `BindingCut` names the STARK-GKR output cut; `BindingCut::honest` runs the reference oracle. |
+| `spine_sumcheck.rs` | Utility functions: `reconstruct_slot_states`, `compute_tx_body_hash`, `build_boundary_mle`, topology constants. Used by `spine_killshot.rs` and `block_spine.rs`. |
 
 ---
 
@@ -405,18 +397,15 @@ Auth Kill-Shot follows the same pattern at reduced scale (20 slots,
 `noid_gkr/tests/`:
 
 | File | What it locks |
-|---|---|
+|---|
 | `spine_killshot_vs_native.rs` | Kill-Shot spine proof/verify matches oracle; mutation rejection |
 | `auth_killshot_vs_native.rs` | Kill-Shot auth proof/verify matches oracle; privacy invariant |
+| `merkle_killshot_vs_native.rs` | Kill-Shot Merkle proof/verify; depth 1/8/16; root + sibling tamper |
 | `differential_vs_native.rs` | Oracle == `hash_tx_body` native; coinbase flag; wrap role; slot count = 59 |
 | `layered_witness.rs` | MDS schedule, S-box, partial-round kill, round-kind vector |
 | `mle_layout.rs` | Hypercube round-trip, packing determinism |
-| `product_sumcheck.rs` | Honest + mutations + transcript determinism |
-| `perm_sumcheck.rs` | Legacy per-slot (retained for differential reference) |
-| `spine_sumcheck.rs` | Legacy orchestrator (retained for differential reference) |
 | `spine_uses_layers.rs` | Layered evaluator = permute_mut on full spine |
 | `fuzz_spine.rs` | N random fixtures (default 1024, `GKR_FUZZ_ITERS`) |
-| `transcript_vectors.rs` | 5 fixtures x byte-determinism + distinct fingerprints |
 
 STARK integration:
 - `noid_air/tests/tx_body_hash_air_matches_native.rs` — three-way lock

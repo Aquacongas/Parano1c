@@ -516,7 +516,7 @@ impl BlockMiner {
             .unwrap_or_default()
             .as_secs();
 
-        // --- Phase 1: MDBX commit off the async executor ---
+        // --- MDBX commit off the async executor ---
         //
         // SyncMode::Durable means commit_block issues fsync before returning —
         // a blocking syscall.  spawn_blocking keeps it off the tokio worker.
@@ -539,7 +539,7 @@ impl BlockMiner {
             .map_err(anyhow::Error::from)?
         } // write lock released here
 
-        // --- Phase 2: build ChainView under read lock (shared, non-blocking) ---
+        // --- Build ChainView under read lock (shared, non-blocking) ---
         let confirmed: Vec<_> = block
             .transactions
             .iter()
@@ -550,7 +550,7 @@ impl BlockMiner {
             ChainView::from_mdbx(&ctx)
         }; // read lock released
 
-        // --- Phase 3: update mempool (no chain lock held) ---
+        // --- Update mempool (no chain lock held) ---
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
@@ -575,9 +575,10 @@ impl BlockMiner {
 ///
 /// # State binding
 ///
-/// `state_bindings = &[]` is intentional. Full ZK state
-/// binding via `BlockStateBindingAir` is not yet wired in. Native consensus checks
-/// enforce state correctness; the proof proves LogicProof validity only.
+/// When `tmpl.inner.state_binding` is `Some`, state bindings are built via
+/// `build_state_bindings_from_binding` and passed to `prove_block`. When the
+/// template has no state binding (e.g. coinbase-only blocks), empty bindings
+/// are used and native consensus checks enforce state correctness.
 pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
@@ -623,7 +624,7 @@ pub(crate) fn run_prove_block(
         .map(|w| w.as_block_witness())
         .collect();
 
-    // Build state bindings (Steps 1+2+3 data) if binding is available.
+    // Build state bindings (FRI + Merkle path data) if binding is available.
     let n_tx = tmpl.n_user_txs() as u32;
     let non_cb_bodies: Vec<noid_tx::TxBody> =
         tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();

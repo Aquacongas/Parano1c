@@ -226,7 +226,7 @@ pub struct OwnedStateBindingWitness {
     pub air: BlockStateBindingAir,
     pub columns: Vec<Vec<Block128>>,
     pub seg_id: u16,
-    /// Pre-state segment columns (owned; for FRI opening in prove_block Stage 5c).
+    /// Pre-state segment columns (owned; for FRI opening in `prove_block`).
     pub pre_cols: SegmentColumns,
     /// Claims (spend/mint) for this segment; used to derive post-state columns.
     pub claims: Vec<BlockStateBindingClaim>,
@@ -302,7 +302,9 @@ pub fn build_state_bindings_from_binding(
         }
         let mut out_iter = opening.output_openings.iter();
         for out in body.outputs.iter().filter(|o| o.valid) {
-            let _pre = out_iter.next();
+            // Pre-state for mint outputs is always zero by invariant; advance
+            // iterator in lockstep with outputs but discard the value.
+            let _ = out_iter.next();
             let seg_id = (out.slot_index >> eff_log) as u16;
             let local = out.slot_index & seg_mask;
             let [owner_hi, owner_lo] = out.owner.as_fields();
@@ -420,6 +422,7 @@ pub fn build_empty_state_bindings() -> Vec<StateBindingBlockWitness<'static>> {
 /// | `block_multipoint_rounds`     | `proof.block_multipoint_rounds`          |
 /// | `compact_fri`                 | `proof.mixed_opening.fri_proof`          |
 /// | `mixed_all_openings`          | `proof.mixed_opening.all_openings`       |
+/// | `block_initial_claim`         | `proof.block_initial_claim`              |
 pub fn block_proof_to_replay_witness(proof: &BlockProof) -> noid_recursive::BlockReplayWitness {
     noid_recursive::BlockReplayWitness::from_parts(
         proof.commitment.cap.clone(),

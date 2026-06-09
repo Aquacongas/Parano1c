@@ -9,7 +9,7 @@
 //!
 //! # Security Model
 //!
-//! After Stage 3 (interleaved commit), the Merkle cap cryptographically binds
+//! After the interleaved commit, the Merkle cap cryptographically binds
 //! ALL witness columns. Zero-check challenges derived from `H(state_root || cap || k)`
 //! are:
 //! - Unpredictable before commit (cap depends on columns)
@@ -131,7 +131,7 @@ pub fn state_binding_channel(prev_state_root: &[u8; 32], cap: &MerkleCap, n_tx: 
 
 /// Create a deterministic Fiat-Shamir channel for block-level multipoint sumcheck.
 ///
-/// This channel is used in Stage 6 to bind all per-tx results together.
+/// This channel is used in the block-level multipoint sumcheck to bind all per-tx results together.
 ///
 /// # Arguments
 ///
@@ -170,7 +170,7 @@ pub fn block_multipoint_channel(prev_state_root: &[u8; 32], cap: &MerkleCap) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Q.4a — Segmented Transcript Absorption helpers
+// Segmented Transcript Absorption helpers
 // ---------------------------------------------------------------------------
 
 /// Compute a per-tx transcript digest that commits to all algebraic STARK
@@ -245,10 +245,8 @@ pub fn merkle_reduce(digests: &[[u8; 32]]) -> [u8; 32] {
 ///
 /// * `h` - 32-byte hash
 ///
-/// # Returns
-///
-/// Array of two `Block128` values: `[low_128_bits, high_128_bits]`
-fn hash_to_fields(h: &[u8; 32]) -> [Block128; 2] {
+/// Array of two `Block128` values: `[low_128_bits, high_128_bits]`.
+pub(crate) fn hash_to_fields(h: &[u8; 32]) -> [Block128; 2] {
     let lo = u128::from_le_bytes(h[..16].try_into().unwrap());
     let hi = u128::from_le_bytes(h[16..].try_into().unwrap());
     [Block128::from(lo), Block128::from(hi)]

@@ -126,7 +126,7 @@ pub fn verify_tip(
         rec_proof_n.rec_initial_claim,
     ];
 
-    // Step 1: Verify the recursive STARK proof (tiny, O(1)).
+    // Verify the recursive STARK proof (tiny, O(1)).
     let empty_pi = make_empty_pi();
     verify_air_interleaved(
         rec_air,
@@ -138,7 +138,7 @@ pub fn verify_tip(
     )
     .map_err(|_| RecVerifyError::StarkInvalid)?;
 
-    // Step 2: Cross-check with the tip block.
+    // Cross-check with the tip block.
     // The tip's prev_state_root must equal the recursive accumulator's state_root.
     if rec_proof_n.acc.state_root != *tip_prev_state_root {
         return Err(RecVerifyError::TipAccumulatorMismatch);
@@ -148,7 +148,7 @@ pub fn verify_tip(
         return Err(RecVerifyError::HeightMismatch);
     }
 
-    // Step 3: chain_hash verification.
+    // chain_hash verification.
     //
     // When the caller has all block headers from genesis, it computes the full
     // expected chain_hash by replaying ChainAccumulator::extend and passes
@@ -199,7 +199,7 @@ pub fn verify_step_stark_only(
     // Reconstruct extra_transcript from proof fields (same as prover).
     let extra_transcript = [proof.block_initial_claim, proof.rec_initial_claim];
 
-    // Step 1: verify the STARK proof over the RecursiveBlockAir.
+    // Verify the STARK proof over the RecursiveBlockAir.
     let rec_air = crate::air::RecursiveBlockAir::from_prev_state_root(acc_prev_state_root);
     let empty_pi = make_empty_pi();
     verify_air_interleaved(
@@ -212,7 +212,7 @@ pub fn verify_step_stark_only(
     )
     .map_err(|_| RecVerifyError::StarkInvalid)?;
 
-    // Step 2: the proof's committed state_root must match the header we have.
+    // The proof's committed state_root must match the header we have.
     if proof.acc.state_root != *expected_new_state_root {
         return Err(RecVerifyError::NewStateRootMismatch);
     }
@@ -224,22 +224,7 @@ pub fn verify_step_stark_only(
 // Helper
 // ---------------------------------------------------------------------------
 
-fn make_empty_pi() -> noid_tx::PublicInputs {
-    use noid_poseidon2b::primitives::TxBodyHash;
-    use noid_tx::PublicInputs;
-    PublicInputs {
-        epoch_anchor: [0u8; 32],
-        tx_body_hash: TxBodyHash([0u8; 32]),
-        fee: 0,
-        n_live_inputs: 0,
-        n_live_outputs: 0,
-        coinbase_credit: 0,
-        log_slots: 0,
-        claims_commitment: [0u8; 32],
-        is_activation: [false; 8],
-        is_deactivation: [false; 4],
-    }
-}
+use crate::prove::make_empty_pi;
 
 // ---------------------------------------------------------------------------
 // Tests

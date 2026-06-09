@@ -604,7 +604,7 @@ pub struct BlockStateBindingAir {
     n_cols: usize,
     constraints: Vec<Box<dyn Constraint>>,
     public_columns: Vec<PublicColumn>,
-    /// Stored for FRI opening cross-check (Step 2).
+    /// Stored for FRI opening cross-check.
     pub eval_point: Vec<Block128>,
     pub prev_lane_openings: [Block128; 3],
     pub new_lane_openings: [Block128; 3],
@@ -750,7 +750,7 @@ impl BlockStateBindingAir {
         // 6. Eq-ladder: eq_0 = 1 + r_0 + b_0 (linear), then
         //    eq_k = eq_{k-1} · (1 + r_k + b_k) for k >= 1 (fused EqLadderStep)
         // =====================================================================
-        // Step 0: eq_0 + r_0 + b_0 + 1 == 0
+        // Constraint 0: eq_0 + r_0 + b_0 + 1 == 0
         constraints.push(Box::new(WeightedLinearGate::new(
             vec![
                 (layout.col_eq_ladder(0), Block128::ONE),

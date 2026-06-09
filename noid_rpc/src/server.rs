@@ -499,10 +499,10 @@ impl ParanoidApiServer for RpcHandler {
         let receipt = noid_chain::consensus::receipt::ParanoidReceipt::from_bytes(&bytes)
             .map_err(|e| rpc_err(format!("decode receipt: {e:?}")))?;
 
-        // Step 1: verify Merkle inclusion (offline, math only).
+        // Verify Merkle inclusion (offline, math only).
         let merkle_valid = verify_merkle_inclusion(&receipt);
 
-        // Step 2: verify against canonical chain (look up header by height).
+        // Verify against canonical chain (look up header by height).
         let chain = self.chain.read().await;
         let canonical = match chain.get_header_from_store(receipt.claimed_height) {
             Ok(Some(hdr)) => Some(verify_against_header(&receipt, &hdr)),

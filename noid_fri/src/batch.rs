@@ -7,19 +7,15 @@
 //!
 //! * [`horner_weights`] — derive `[1, α, α², …, α^{n-1}]` from the single
 //!   batching scalar `α` squeezed from the parent transcript (§12b.2
-//!   step 2).
+//!   (batching step).
 //! * [`rlc_openings`] — batched claim `e_batch = Σ λ_i · e_i`
-//!   (§12b.2 step 3).
+//!   (§12b.2).
 //! * [`rlc_codewords`] — batched codeword `C_batch = Σ λ_i · C_i`
-//!   (§12b.2 step 3, pointwise sum of per-column RS codewords).
+//!   (§12b.2, pointwise sum of per-column RS codewords).
 //! * [`rlc_symbol_pairs`] — query-phase batched symbol pair
-//!   `(Σ λ_i · s_{i,0}, Σ λ_i · s_{i,1})` (§12b.2 step 5).
+//!   `(Σ λ_i · s_{i,0}, Σ λ_i · s_{i,1})` (§12b.2).
 //!
-//! These are pure building blocks that the next sub-stage (3b-0.5c-2)
-//! will compose into `prove_batched` / `verify_batched`. Keeping them
-//! here lets the implementation ship with its own test coverage
-//! before the full protocol path lands, so any regression in the
-//! reduction can be bisected cheaply.
+//! These are pure building blocks composing `prove_batched` / `verify_batched`.
 
 use noid_core::{AdditiveNTT, Block128, TowerField};
 
@@ -52,7 +48,7 @@ pub const RLCOPEN_TAG: u64 = 0xFFFD_0000_0000_0000;
 /// multilinear `MLE_batch = Σ_i α^i · MLE_i` evaluates to `e_batch` at
 /// `r`.
 ///
-/// **Stage 3b-0.5.1 — per-column reuse.** There is no Merkle commitment
+/// **Per-column opening reuse.** There is no Merkle commitment
 /// to the batched codeword `C_batch` in the proof. The batched MLE is a
 /// linear combination of per-column MLEs that the caller has already
 /// committed (and whose roots are already bound into the parent
@@ -65,7 +61,7 @@ pub const RLCOPEN_TAG: u64 = 0xFFFD_0000_0000_0000;
 #[derive(Clone, Debug)]
 pub struct BatchedEvalProof {
     /// Per-column openings `e_i = MLE_i(r)`. Absorbed into the parent
-    /// transcript in column-index order (§12b.2 step 1).
+    /// transcript in column-index order (§12b.2).
     pub column_openings: Vec<Block128>,
     /// Single FRI evaluation proof of `MLE_batch(r) == e_batch`. The
     /// proof's own FRI-oracle commitments (per-round folded roots)
@@ -209,7 +205,7 @@ pub fn prove_batched_mixed(
         );
     }
 
-    // Step 1: per-column opening `e_i = MLE_i(r_{log_len_i})`; absorb
+    // Per-column opening `e_i = MLE_i(r_{log_len_i})`; absorb
     // flat list in caller order.
     let column_openings: Vec<Block128> = {
         use rayon::prelude::*;
@@ -225,13 +221,13 @@ pub fn prove_batched_mixed(
     // the uniform `RLCOPEN_TAG`.
     channel.observe_field_elem(Block128::from(RLCOPEN_MIXED_TAG as u128));
 
-    // Step 2: one `α` shared across every group. Weights run over the
+    // One `α` shared across every group. Weights run over the
     // flat column list so each column's λ_i is its global position —
     // groups don't renumber.
     let alpha = channel.get_random_point();
     let lambdas = horner_weights(alpha, evals_per_col.len());
 
-    // Step 3: group columns by log_len. BTreeMap keeps iteration
+    // Group columns by log_len. BTreeMap keeps iteration
     // order canonical (ascending `log_len`) for transcript stability.
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -239,7 +235,7 @@ pub fn prove_batched_mixed(
         groups.entry(ll).or_default().push(i);
     }
 
-    // Step 4: per group, form the RLC'd codeword and run one
+    // Per group, form the RLC'd codeword and run one
     // `fri_prove` on the group's eval_point. The λ_i's preserve the
     // flat column indexing — within a group we use λ_{column_indices[j]}.
     let mut group_proofs: Vec<MixedGroupProof> = Vec::with_capacity(groups.len());
@@ -420,7 +416,7 @@ pub fn prove_batched(
         );
     }
 
-    // Step 1 (§12b.2): compute per-column openings e_i = MLE_i(r) and
+    // §12b.2: compute per-column openings e_i = MLE_i(r) and
     // absorb them into the parent transcript in ascending column order.
     let column_openings: Vec<Block128> = {
         use rayon::prelude::*;
@@ -434,19 +430,19 @@ pub fn prove_batched(
     // Domain separation for the batched-opening sub-protocol.
     channel.observe_field_elem(Block128::from(RLCOPEN_TAG as u128));
 
-    // Step 2 (§12b.2): squeeze α, derive Horner weights.
+    // §12b.2: squeeze α, derive Horner weights.
     let alpha = channel.get_random_point();
     let n_cols = evals_per_col.len();
     let lambdas = horner_weights(alpha, n_cols);
 
-    // Step 3 (§12b.2): batched evaluations on the hypercube. The MLE
+    // §12b.2: batched evaluations on the hypercube. The MLE
     // of the pointwise RLC of per-column evaluation vectors is
     // exactly `Σ λ_i · MLE_i`, so `MLE_batch(r) = Σ λ_i · e_i` — the
     // verifier reconstructs that claim independently from the
     // openings it has already absorbed.
     let evals_batch: Vec<Block128> = rlc_codewords(&lambdas, evals_per_col);
 
-    // Step 4 (§12b.2, 3b-0.5.1): single FRI opening of the batched
+    // §12b.2: single FRI opening of the batched
     // MLE. No commitment to `C_batch` is built — the per-column
     // commitments absorbed upstream already bind every column of the
     // RLC, and α was drawn from that same transcript prefix. `fri_prove`
@@ -523,7 +519,7 @@ pub fn verify_batched(
 
 /// Horner weights `λ_i = α^i` for `i = 0, …, n - 1`.
 ///
-/// CRYPTO.md §12b.2 step 2 — Fiat–Shamir squeezes exactly one scalar
+/// CRYPTO.md §12b.2 — Fiat–Shamir squeezes exactly one scalar
 /// `α` and both parties derive the weights by iterated multiplication.
 /// Soundness is `(n - 1) / |F|`, negligible for `|F| = 2^128` at any
 /// realistic column count.
@@ -537,7 +533,7 @@ pub fn horner_weights(alpha: Block128, n: usize) -> Vec<Block128> {
     out
 }
 
-/// Batched claim `e_batch = Σ λ_i · e_i` (§12b.2 step 3).
+/// Batched claim `e_batch = Σ λ_i · e_i` (§12b.2).
 ///
 /// Panics if `lambdas.len() != openings.len()`.
 pub fn rlc_openings(lambdas: &[Block128], openings: &[Block128]) -> Block128 {
@@ -553,7 +549,7 @@ pub fn rlc_openings(lambdas: &[Block128], openings: &[Block128]) -> Block128 {
     acc
 }
 
-/// Pointwise batched codeword `C_batch[j] = Σ λ_i · C_i[j]` (§12b.2 step 3).
+/// Pointwise batched codeword `C_batch[j] = Σ λ_i · C_i[j]` (§12b.2).
 ///
 /// All inputs must be the same length. Column-major accumulation for
 /// cache locality: each codeword is read sequentially, the output buffer
@@ -606,7 +602,7 @@ pub fn rlc_codewords(lambdas: &[Block128], codewords: &[&[Block128]]) -> Vec<Blo
 }
 
 /// Query-phase batched symbol pair `(Σ λ_i · s_{i,0}, Σ λ_i · s_{i,1})`
-/// (§12b.2 step 5). Takes the per-column symbol pairs collected from
+/// (§12b.2). Takes the per-column symbol pairs collected from
 /// each column's Merkle opening and reduces them against the RLC
 /// weights.
 pub fn rlc_symbol_pairs(
@@ -879,7 +875,7 @@ mod tests {
     }
 
     /// Soundness: tampering any of the FRI oracle roots inside the
-    /// batched proof must be caught. Stage 3b-0.5.1 removes the outer
+    /// batched proof must be caught. Per-column reuse removes the outer
     /// commitment to `C_batch`, so the authentication chain now runs
     /// entirely through the per-round FRI-fold oracles inside
     /// `batch_proof`. Flipping a bit in any of those roots must make

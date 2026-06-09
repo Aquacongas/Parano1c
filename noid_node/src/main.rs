@@ -851,22 +851,24 @@ async fn handle_p2p_events(
     use std::collections::HashMap;
     let mut orphan_pool: HashMap<[u8; 32], noid_chain::block::Block> = HashMap::new();
 
-    // --- Snapshot verification state (Fix 3.2) ---
+    // --- Snapshot verification state ---
     //
     // Two-step snapshot sync:
-    //   Step 1: receive StateSnapshot  → store as pending, request RecursiveProof from same peer
-    //   Step 2: receive RecursiveProof → verify proof → apply snapshot (or discard on failure)
+    //   (1) receive StateSnapshot  → store as pending, request RecursiveProof from same peer
+    //   (2) receive RecursiveProof → verify proof → apply snapshot (or discard on failure)
     //
     // The pending snapshot is stored here while we await the proof.
-    // If the proof is not received within the event loop (e.g. peer disconnects), the pending
-    // snapshot is discarded on the next PeerConnected (a fresh sync attempt begins).
+    // If no matching proof arrives (e.g. the peer disconnects), the snapshot
+    // remains pending until a RecursiveProof arrives from the expected peer.
+    // Subsequent peer connections buffer new snapshots in snapshot_candidates
+    // without replacing the pending entry.
     struct PendingSnapshot {
         from: libp2p::PeerId,
         snapshot: Box<noid_p2p::protocol::GetStateSnapshotResponse>,
     }
     let mut pending_snapshot: Option<PendingSnapshot> = None;
 
-    // Fix 1.4: Eclipse attack mitigation — collect snapshots from multiple peers
+    // Eclipse attack mitigation — collect snapshots from multiple peers
     // before selecting the best one, requiring an attacker to control ALL first N
     // peers instead of just the first one.
     //
@@ -879,7 +881,7 @@ async fn handle_p2p_events(
     let mut snapshot_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
-    // --- Per-peer tx rate limiter (Fix 3.1) ---
+    // --- Per-peer tx rate limiter ---
     //
     // Sliding-window rate limiter: tracks (tx_count_in_window, window_start) per peer.
     // Prevents a single peer from flooding the ZK semaphore queue.
@@ -1006,8 +1008,8 @@ async fn handle_p2p_events(
                             continue;
                         }
 
-                        // Phase 1: apply block off the async executor (MDBX fsync is blocking).
-                        // Phase 2: Build ChainView under read lock (shared, non-blocking).
+                        // Apply block off the async executor (MDBX fsync is blocking).
+                        // Build ChainView under read lock (shared, non-blocking).
                         // This avoids holding the write lock during SegmentedFriState clone
                         // (~50ms at 256 segments), which was blocking all RPC/miner operations.
                         let apply_result =
@@ -1385,7 +1387,7 @@ async fn handle_p2p_events(
                     // policy). New nodes sync via the current state, not block replay.
                     // The state is proven valid by the recursive chain proof.
                     //
-                    // Fix 1.4: request from up to 3 distinct peers; we'll pick the
+                    // Request from up to 3 distinct peers; we'll pick the
                     // snapshot with the highest tip_height after collecting >= 2.
                     if snapshot_candidates.len() < 3 && !snapshot_requested_peers.contains(&peer) {
                         tracing::info!(peer = %peer, "fresh node — requesting state snapshot (Paranoid sync)");
@@ -1549,16 +1551,13 @@ async fn handle_p2p_events(
                 }
             }
             Ok(NetworkEvent::StateSnapshot { from, snapshot }) => {
-                // SECURITY (Fix 3.2 + Fix 1.4): Do NOT apply the snapshot yet.
-                //
-                // Fix 1.4: collect snapshots from multiple peers and pick the one with
-                // the highest tip_height before entering the 2-step verification flow.
-                // This prevents a single malicious first peer from providing a fabricated
-                // snapshot (Eclipse attack), since an attacker must now control ALL first
-                // N peers.
-                //
-                // Fix 3.2: once a candidate is selected, request a RecursiveBlockProof
-                // to cryptographically verify the snapshot before accepting it.
+                // SECURITY: Do NOT apply the snapshot yet. Collect snapshots from
+                // multiple peers and pick the one with the highest tip_height before
+                // entering the 2-step verification flow. This prevents a single
+                // malicious first peer from providing a fabricated snapshot (Eclipse
+                // attack), since an attacker must now control ALL first N peers.
+                // Once a candidate is selected, a RecursiveBlockProof is requested
+                // and verified cryptographically before the snapshot is accepted.
                 if snapshot.tip_height == 0 {
                     tracing::debug!(from = %from, "snapshot tip_height=0, ignoring");
                 } else if pending_snapshot.is_some() {
@@ -1610,7 +1609,7 @@ async fn handle_p2p_events(
                         });
                         // Request the recursive chain proof from the selected peer.
                         // The response arrives as NetworkEvent::RecursiveProof and
-                        // triggers Step 2: verify proof then apply snapshot.
+                        // triggers (2): verify proof then apply snapshot.
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestRecursiveProof {
                                 peer: best_peer,
@@ -1633,7 +1632,7 @@ async fn handle_p2p_events(
                 proof_bytes,
                 tip_header_bytes: _, // tip header from peer; we use recent_headers from snapshot
             }) => {
-                // SECURITY (Fix 3.2): Step 2 of snapshot verification.
+                // SECURITY: RecursiveProof verification before applying snapshot.
                 // Verify the recursive proof against genesis, then apply the pending snapshot.
                 use bincode;
                 use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
@@ -1710,7 +1709,7 @@ async fn handle_p2p_events(
                     //    recent_headers. This ensures the proof is consistent with the claimed
                     //    chain, even if it hasn't caught up to the tip yet.
                     //
-                    // In either case, Fix 1.1 (state_root check in apply_state_snapshot)
+                    // In either case, the state_root check in apply_state_snapshot
                     // independently verifies that slot data matches the tip header state_root.
                     let verify_result: Result<(), String> = (|| {
                         use noid_chain::block_header::BlockHeader;
@@ -1724,7 +1723,7 @@ async fn handle_p2p_events(
                         let snap_tip_h = snap.snapshot.tip_height;
                         let proof_h = proof.block_height;
 
-                        // --- Step A: validate PoW + chainwork of snapshot headers ---
+                        // Validate PoW + chainwork of snapshot headers.
                         // This is the primary Eclipse-attack protection.
                         // state_root is in header_core so valid PoW cryptographically
                         // commits each state_root to real mining work.
@@ -2086,7 +2085,7 @@ async fn handle_p2p_events(
 }
 
 // ---------------------------------------------------------------------------
-// Orphan pool helper (Fix 1.5)
+// Orphan pool helper
 // ---------------------------------------------------------------------------
 
 /// Insert a block into the orphan pool, evicting the lowest-height entry when

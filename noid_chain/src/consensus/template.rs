@@ -209,7 +209,7 @@ pub fn build_block_template(
     }
     let ordered_winners = applied_winners;
 
-    // 3b. Build BlockStateBinding from pre-state slot values (Step 1).
+    // Build BlockStateBinding from pre-state slot values.
     // Read slot values from `state.state` (original, untouched by scratch).
     let state_binding: Option<BlockStateBinding> = if ordered_winners.is_empty() {
         None
@@ -298,7 +298,7 @@ pub fn build_block_template(
 
     // 5. Compute final header fields.
     let state_root = scratch.state_root();
-    // Patch new_state_root + Merkle siblings into the binding (Step 1 + Step 3 data).
+    // Patch new_state_root + Merkle siblings into the binding.
     // scratch.state_root() flushes the tree, so merkle_siblings is valid now.
     let state_binding = state_binding.map(|mut b| {
         b.new_state_root = state_root;

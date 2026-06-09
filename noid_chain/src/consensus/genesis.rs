@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Genesis block construction (SPECIFICATION.md §1).
+//! Genesis block construction.
 //!
 //! The genesis block is hardcoded: same bytes on every node.
 //! It has:

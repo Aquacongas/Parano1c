@@ -59,7 +59,6 @@ pub enum BlockApplyError {
     /// `header.tx_root` disagrees with the computed tx-root.
     HeaderTxRootMismatch,
     /// `header.active_slot_count` disagrees with the post-apply chain count.
-    /// (SPECIFICATION.md §15.3.3, §16 invariant 10)
     HeaderActiveSlotCountMismatch,
     /// `header.alloc_counter` disagrees with the post-apply allocator seed.
     HeaderAllocCounterMismatch,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! ASERT difficulty adjustment (SPECIFICATION.md §18.3).
+//! ASERT difficulty adjustment.
 //!
 //! Direct port of Bitcoin Cash `CalculateASERT()`:
 //!   https://gitlab.com/bitcoin-cash-node/bitcoin-cash-node/-/blob/master/src/pow.cpp

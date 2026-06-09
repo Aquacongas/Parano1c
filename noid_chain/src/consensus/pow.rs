@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Blake3 Proof-of-Work validation (SPECIFICATION.md §18.1-18.2).
+//! Blake3 Proof-of-Work validation.
 //!
 //! PoW is computed over `header_core` which does NOT include
 //! `proof_transcript_hash`. This allows PoW search and ZK proving to run

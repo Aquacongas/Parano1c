@@ -529,7 +529,7 @@ fn build_block_unified_flat_tables(
     let n_cells = 1 << mle.num_vars;
     let live = mle.live_slots;
 
-    // Phase 1: Build the shared permuted tables in parallel (each is independent).
+    // Build the shared permuted tables in parallel (each is independent).
     let (
         sigma_dec_b128,
         (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_b128, state_dec_b128)))),
@@ -558,14 +558,14 @@ fn build_block_unified_flat_tables(
         },
     );
 
-    // Phase 2: Convert sigma_dec/s_out_dec/state_dec to flat AND build their lane
+    // Convert sigma_dec/s_out_dec/state_dec to flat AND build their lane
     // tables — all using the already-computed Block128 permuted tables.
     let sigma_dec_flat = vec_to_flat(&sigma_dec_b128);
     let s_out_dec_flat = vec_to_flat(&s_out_dec_b128);
     let state_dec_flat = vec_to_flat(&state_dec_b128);
     let state_flat = vec_to_flat(&mle.state);
 
-    // Phase 3: Parallel lane table construction (STATE_SIZE = 4 lanes each).
+    // Parallel lane table construction (STATE_SIZE = 4 lanes each).
     // mds_lane and sigma_lane/s_out_lane/state_lane are all independent.
     let lane_idx: Vec<usize> = (0..STATE_SIZE).collect();
     let (mds_vecs, sigma_lane_vecs, s_out_lane_vecs, state_lane_vecs) = {
@@ -1159,7 +1159,7 @@ fn build_block_combined_weights(
 
     use rayon::prelude::*;
 
-    // Phase 1: fill w_dec and w_lane in parallel over slots.
+    // Fill w_dec and w_lane in parallel over slots.
     // Collect (idx, w_dec, es_er) tuples per slot, then scatter sequentially.
     // Slots write to disjoint indices (guaranteed by pack_index_dyn).
     let scatter_data: Vec<Vec<(usize, Block128, Block128)>> = (0..n_slots)
@@ -1206,7 +1206,7 @@ fn build_block_combined_weights(
     let lane_sout = [d3, d4, d5, d6];
     let lane_state = [d7, d8, d9, d10];
 
-    // Phase 2: fill w_sin/w_sout/w_state in parallel over all cells.
+    // Fill w_sin/w_sout/w_state in parallel over all cells.
     let (w_sin, (w_sout, w_state)) = rayon::join(
         || {
             (0..n_cells)

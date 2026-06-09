@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Header chain validation (SPECIFICATION.md §16.2–16.7).
+//! Header chain validation.
 //!
 //! Validates a candidate block header against its parent and the expected
 //! ASERT difficulty target. Pure, I/O-free — the caller provides all data.

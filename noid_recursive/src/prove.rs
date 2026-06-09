@@ -322,7 +322,7 @@ fn derive_sumcheck_challenges(rounds: &[Vec<Block128>]) -> Vec<Block128> {
 /// fields are zero.  The absorb sequence still runs (binding the empty
 /// inputs to the Fiat-Shamir transcript), which is correct because the
 /// verifier will supply the same zero inputs.
-fn make_empty_pi() -> PublicInputs {
+pub(crate) fn make_empty_pi() -> PublicInputs {
     PublicInputs {
         epoch_anchor: [0u8; 32],
         tx_body_hash: TxBodyHash([0u8; 32]),

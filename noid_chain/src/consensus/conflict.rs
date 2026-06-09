@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Slot conflict resolution for block assembly (SPECIFICATION.md §15.2).
+//! Slot conflict resolution for block assembly.
 //!
 //! When two transactions in the candidate set both attempt to mint the same
 //! output slot, the tie-break rule is deterministic: the winner is the

@@ -5,7 +5,7 @@
 
 //! FRI-Binius interleaved PCS integration for the STARK.
 //!
-//! # Algebraic split (Stage G)
+//! # Algebraic split
 //!
 //! `prove_air_interleaved_algebraic` / `verify_air_interleaved_algebraic`
 //! run every algebraic step (zero-check, base openings, ladder partials,
@@ -60,8 +60,8 @@ pub struct InterleavedStarkProof {
 }
 
 /// Algebraic-only per-tx proof — no commitment header, no FRI opening.
-/// Used by `noid_block` (Stage G) to accumulate N algebraic transcripts
-/// before issuing one block-level FRI.
+/// Used by `noid_block` to accumulate N algebraic transcripts before
+/// issuing one block-level FRI opening.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlgebraicStarkProof {
     pub log_rows: usize,

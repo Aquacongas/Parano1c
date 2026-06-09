@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Timestamp validation rules (SPECIFICATION.md §18.4).
+//! Timestamp validation rules.
 //!
 //! A block's timestamp must satisfy two constraints:
 //!

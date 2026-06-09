@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage 3c-1.3 — MDS mixing layer as an AIR sub-circuit.
+//! MDS mixing layer as an AIR sub-circuit.
 //!
 //! Native reference: `noid_poseidon2b::native::permutation::{apply_mds_full,
 //! apply_mds_partial, MDS_FULL, MDS_PARTIAL}`. For each row (= one

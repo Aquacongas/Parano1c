@@ -68,7 +68,7 @@ pub fn prove_mixed_opening(
     let n = 1 << log_n;
     assert_eq!(primary_point.len(), log_n);
 
-    // Step 1: Compute primary openings (all columns at primary_point)
+    // Compute primary openings (all columns at primary_point)
     // Use thread-local scratch buffer to avoid per-column allocations
     thread_local! {
         static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
@@ -85,7 +85,7 @@ pub fn prove_mixed_opening(
         })
         .collect();
 
-    // Step 2: Verify secondary claims are consistent
+    // Verify secondary claims are consistent
     for claim in secondary_claims {
         assert!(claim.col_index < n_cols);
         assert_eq!(claim.eval_point.len(), log_n);
@@ -97,7 +97,7 @@ pub fn prove_mixed_opening(
         all_openings.push(claim.value);
     }
 
-    // Step 3: Absorb all openings, draw gamma
+    // Absorb all openings, draw gamma
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
     channel.observe_field_elems(&all_openings);
     let gamma = channel.get_random_point();
@@ -105,7 +105,7 @@ pub fn prove_mixed_opening(
     // Horner weights for primary columns only (FRI batching)
     let weights = compute_horner_weights(gamma, n_cols);
 
-    // Step 4: Build batched polynomial C(x) = sum_k gamma^k * col_k(x)
+    // Build batched polynomial C(x) = sum_k gamma^k * col_k(x)
     let c_evals: Vec<Block128> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -117,7 +117,7 @@ pub fn prove_mixed_opening(
         })
         .collect();
 
-    // Step 5: Prove C(primary_point) via compact FRI
+    // Prove C(primary_point) via compact FRI
     let fri_proof = compact_fri_prove(&c_evals, primary_point, ntt, channel, hasher, num_queries);
 
     MixedOpeningProof {
@@ -148,12 +148,12 @@ pub fn verify_mixed_opening(
         return Err("Eval point dimension mismatch".into());
     }
 
-    // Step 1: Absorb openings, draw gamma (mirror prover)
+    // Absorb openings, draw gamma (mirror prover)
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
     channel.observe_field_elems(&proof.all_openings);
     let gamma = channel.get_random_point();
 
-    // Step 2: Compute batched claim for primary columns
+    // Compute batched claim for primary columns
     let weights = compute_horner_weights(gamma, n_cols);
     let batched_claim: Block128 = weights
         .iter()
@@ -161,7 +161,7 @@ pub fn verify_mixed_opening(
         .map(|(&w, &e)| w * e)
         .fold(Block128::ZERO, |acc, x| acc + x);
 
-    // Step 3: Verify compact FRI proof: C(primary_point) == batched_claim
+    // Verify compact FRI proof: C(primary_point) == batched_claim
     compact_fri_verify(
         primary_point,
         batched_claim,

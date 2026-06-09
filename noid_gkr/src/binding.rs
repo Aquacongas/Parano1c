@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Binding contract between the GKR sub-proof (future stages G1..G3)
+//! Binding contract between the Kill-Shot GKR sub-proof
 //! and the outer STARK's `TxBodyMerkleBoundaryPins`.
 //!
-//! This module does not run any protocol yet. It names, in code, the
-//! exact cut the GKR proof will claim and the exact cell the STARK
-//! will equality-bind. If this contract is ever weakened, the
-//! `(prev_root, tx) → new_root` invariant is at risk; the checklist in
-//! `gkr.md §0 rule 3` is the guard.
+//! This module names, in code, the exact cut the GKR proof claims and
+//! the exact cell the STARK equality-binds. If this contract is ever
+//! weakened, the `(prev_root, tx) → new_root` invariant is at risk;
+//! the checklist in `gkr.md §0 rule 3` is the guard.
 
 use crate::circuit::{SpineCircuit, SpineInputs};
 use crate::oracle::{evaluate_spine, SpineWitness};

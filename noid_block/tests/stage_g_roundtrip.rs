@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid.
 
-//! Stage G acceptance tests for `noid_block`.
+//! Full block prove/verify roundtrip acceptance tests.
 //!
-//! Full block prove/verify roundtrip using the production TxLogicAir path.
+//! Uses the production TxLogicAir path.
 //! Marked `#[ignore]` to keep ordinary `cargo test` runs quick.
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
@@ -204,8 +204,13 @@ fn block_one_tx_roundtrip() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
-        .expect("prove_block must succeed on a valid single-tx block");
+    let proof = prove_block(
+        prev_state_root,
+        [0u8; 32],
+        std::slice::from_ref(&witness),
+        &[],
+    )
+    .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
     assert_eq!(
@@ -243,8 +248,13 @@ fn block_verify_rejects_tampered_epoch_anchor() {
     };
 
     let prev_state_root = pi.epoch_anchor;
-    let mut proof = prove_block(prev_state_root, [0u8; 32], std::slice::from_ref(&witness), &[])
-        .expect("honest prove_block must succeed");
+    let mut proof = prove_block(
+        prev_state_root,
+        [0u8; 32],
+        std::slice::from_ref(&witness),
+        &[],
+    )
+    .expect("honest prove_block must succeed");
 
     proof.tx_pis[0].epoch_anchor[0] ^= 0x01;
 

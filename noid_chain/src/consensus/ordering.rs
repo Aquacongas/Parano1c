@@ -8,8 +8,6 @@
 //! enforce this specific ordering. Two valid blocks from different miners
 //! MAY have different orderings of the same transaction set.
 //!
-//! # Canonical rule (proposed for SPECIFICATION.md §7)
-//!
 //! 1. Coinbase transaction first (if present).
 //! 2. Remaining transactions: descending fee (largest fee first).
 //! 3. Tie-break: ascending `tx_body_hash` (lexicographic).

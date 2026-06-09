@@ -50,9 +50,7 @@ pub struct BlockChainContext {
 impl BlockChainContext {
     /// Initialise from genesis: build `ChainContext` + genesis recursive proof.
     ///
-    /// The genesis recursive proof is produced synchronously here (~2s on first call).
-    /// Subsequent recursive steps are much cheaper (~0.5s) since they only cover
-    /// one block each.
+    /// The genesis recursive proof is produced synchronously here.
     ///
     /// If the genesis recursive proof should be deferred (e.g. for fast startup),
     /// use `init_from_genesis_no_proof()` and call `bootstrap_recursive_proof()` later.
@@ -284,8 +282,6 @@ mod tests {
         };
 
         // GENESIS_TARGET = 2^228 requires avg 2^28 ≈ 268 M hash attempts.
-        // This is the only PoW-mining test in this binary, so rayon gets
-        // full use of all CPU cores without contention from other tests.
         // Expected wall time: ~1 s on a multi-core machine.
         {
             use noid_chain::consensus::pow::search_pow;

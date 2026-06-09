@@ -15,7 +15,7 @@
 //!
 //! `round_degree` is a parameter, not a constant. The legacy spine /
 //! Auth / Merkle sumchecks pin `round_degree = 2`; the Spine Kill-Shot
-//! degree-7 sumcheck (Stage 1.5.4) uses `round_degree = 8` (`d+1` for
+//! degree-7 sumcheck uses `round_degree = 8` (`d+1` for
 //! degree-7 `g` under an `eq(r, x)` factor). For an honest *multilinear*
 //! `f` the round poly is intrinsically linear, so `round_degree >= 1`
 //! is always correct — higher degrees just record extra zero

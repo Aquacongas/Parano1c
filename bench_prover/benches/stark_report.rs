@@ -322,7 +322,7 @@ struct BlockResult {
 fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockResult {
     let n_tx = fixtures.len();
 
-    // Step 1: Full-node verifies all wallet LogicProofs (each with its own AIR)
+    // Full-node verifies all wallet LogicProofs (each with its own AIR)
     let verify_logic_time = time_once(|| {
         for k in 0..n_tx {
             verify_logic(
@@ -336,7 +336,7 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
         }
     });
 
-    // Step 2: Full-node constructs TxBlockWitnesses and calls prove_block.
+    // Full-node constructs TxBlockWitnesses and calls prove_block.
     // The block prover receives only public auth data + pre-built proof.
     let witnesses: Vec<TxBlockWitness<'_>> = fixtures
         .iter()
@@ -357,7 +357,8 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
         let _ = prove_block(prev_state_root, [0u8; 32], &witnesses, &[]).expect("prove_block");
     });
 
-    let block_proof = prove_block(prev_state_root, [0u8; 32], &witnesses, &[]).expect("prove_block");
+    let block_proof =
+        prove_block(prev_state_root, [0u8; 32], &witnesses, &[]).expect("prove_block");
     let block_proof_bytes = block_proof.byte_len();
     let per_tx_algebraic_bytes = if !block_proof.tx_algebraic.is_empty() {
         block_proof.tx_algebraic[0].byte_len()
@@ -366,7 +367,7 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     };
     let unified_spine_bytes = block_proof.block_spine_proof.byte_len();
 
-    // Step 3: Verifier verifies the block proof (only public auth data)
+    // Verifier verifies the block proof (only public auth data)
     let spine_inputs_list: Vec<SpineInputs> =
         fixtures.iter().map(|f| f.spine_inputs.clone()).collect();
     let auth_public_list: Vec<AuthPublicInputs> = fixtures.iter().map(|f| f.auth_public).collect();
