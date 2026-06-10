@@ -1220,15 +1220,25 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            if !response.txs.is_empty() {
+            const MAX_SYNC_TXS: usize = 8192;
+            let mut txs = response.txs;
+            if txs.len() > MAX_SYNC_TXS {
+                tracing::warn!(
+                    from = %peer,
+                    count = txs.len(),
+                    "mempool sync response oversized, truncating to {MAX_SYNC_TXS}"
+                );
+                txs.truncate(MAX_SYNC_TXS);
+            }
+            if !txs.is_empty() {
                 tracing::debug!(
                     from = %peer,
-                    tx_count = response.txs.len(),
+                    tx_count = txs.len(),
                     "received mempool sync response"
                 );
                 let _ = event_tx.send(NetworkEvent::MempoolSyncResponse {
                     from: peer,
-                    txs: response.txs,
+                    txs,
                 });
             }
         }

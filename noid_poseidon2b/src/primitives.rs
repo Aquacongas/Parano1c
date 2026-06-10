@@ -31,8 +31,27 @@ pub type Digest = [u8; 32];
 macro_rules! newtype_digest {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
         pub struct $name(pub [u8; 32]);
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}(", stringify!($name))?;
+                for byte in &self.0 {
+                    write!(f, "{:02x}", byte)?;
+                }
+                f.write_str(")")
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for byte in &self.0 {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
+            }
+        }
 
         impl $name {
             #[inline]

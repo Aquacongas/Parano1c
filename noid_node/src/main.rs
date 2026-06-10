@@ -456,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
                         .send(noid_p2p::NetworkCommand::BroadcastTx { intent_bytes })
                         .await;
                 }
-                Ok(_) => {} // TxEvicted, TxConfirmed, TxPreProved — ignore
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(skipped = n, "mempool relay: lagged, some TXs not gossiped");
                 }
@@ -953,6 +953,9 @@ async fn handle_p2p_events(
         std::collections::HashMap::new();
     // Segment IDs still outstanding.
     let mut pending_segment_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    // Segment IDs queued but not yet requested (concurrency cap).
+    let mut segment_queue: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
+    const MAX_INFLIGHT_SEGMENTS: usize = 8;
 
     // Helper: reset all segment-sync state on any failure.
     // Called whenever sync needs to restart (bad proof, apply failure, missing segment).
@@ -966,6 +969,7 @@ async fn handle_p2p_events(
             manifest_first_candidate_at = None;
             collected_segments.clear();
             pending_segment_ids.clear();
+            segment_queue.clear();
             tracing::debug!("sync state reset — will retry on next peer connection");
         }};
     }
@@ -1040,7 +1044,7 @@ async fn handle_p2p_events(
                     // Peer is far ahead: we can't catch up block-by-block since
                     // intermediate blocks are pruned (proof-native statechain).
                     // Go straight to state manifest sync.
-                    if pending_manifest.is_none() && pending_segment_ids.is_empty() {
+                    if pending_manifest.is_none() && pending_segment_ids.is_empty() && segment_queue.is_empty() {
                         if !manifest_requested_peers.contains(&from) {
                             tracing::info!(
                                 their_height = height,
@@ -1392,6 +1396,7 @@ async fn handle_p2p_events(
                                                     // O(1) snapshot sync, not attempting more block replays.
                                                     if pending_manifest.is_none()
                                                         && pending_segment_ids.is_empty()
+                                                        && segment_queue.is_empty()
                                                         && !manifest_requested_peers.contains(&from)
                                                     {
                                                         tracing::info!(
@@ -1441,6 +1446,7 @@ async fn handle_p2p_events(
                                             // Guard: don't re-request if already syncing or asked this peer.
                                             if pending_manifest.is_none()
                                                 && pending_segment_ids.is_empty()
+                                                && segment_queue.is_empty()
                                                 && !manifest_requested_peers.contains(&from)
                                             {
                                                 tracing::info!(
@@ -1499,17 +1505,12 @@ async fn handle_p2p_events(
                 let sync_ready_task = Arc::clone(&sync_ready);
                 let chain_task = Arc::clone(&chain);
                 tokio::spawn(async move {
-                    // If this node is still performing state sync (height == 0),
-                    // the chain view in the mempool has no recent_headers yet.
-                    // TX anchor checks will fail with BadEpochAnchor because the
-                    // PoW block hashes referenced by the TXs are not yet known.
-                    // Wait for sync_ready (fires after snapshot is fully applied)
-                    // before attempting to submit anything.
                     {
+                        let notified = sync_ready_task.notified();
                         let h = chain_task.read().await.tip_height();
                         if h == 0 {
                             tracing::debug!("mempool sync: waiting for state sync before admitting TXs");
-                            sync_ready_task.notified().await;
+                            notified.await;
                             tracing::debug!("mempool sync: state ready, submitting {} TXs", txs.len());
                         }
                     }
@@ -1532,6 +1533,17 @@ async fn handle_p2p_events(
                 });
             }
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
+                // Hard cap: reject oversized payloads before any processing.
+                const MAX_TX_WIRE_SIZE: usize = 1024 * 1024; // 1 MB
+                if intent_bytes.len() > MAX_TX_WIRE_SIZE {
+                    tracing::debug!(
+                        peer = %from,
+                        size = intent_bytes.len(),
+                        "tx dropped: exceeds 1MB wire size limit"
+                    );
+                    continue;
+                }
+
                 tracing::debug!(peer = %from, "received tx from P2P");
 
                 // Per-peer rate limiting: enforce before any further processing.
@@ -1871,10 +1883,25 @@ async fn handle_p2p_events(
                         }
                         collected_segments.insert(response.segment_id, (response.eff_log, data));
                         pending_segment_ids.remove(&response.segment_id);
+                        // Dispatch next queued segment if available.
+                        if !segment_queue.is_empty() {
+                            if let Some(ref pm) = pending_manifest {
+                                if let Some(next_seg) = segment_queue.pop_front() {
+                                    pending_segment_ids.insert(next_seg);
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::RequestStateSegment {
+                                            peer: pm.from,
+                                            segment_id: next_seg,
+                                            expected_tip_height: pm.manifest.tip_height,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                         tracing::debug!(
                             from = %from,
                             segment = response.segment_id,
-                            remaining = pending_segment_ids.len(),
+                            remaining = pending_segment_ids.len() + segment_queue.len(),
                             "segment received"
                         );
                     } else {
@@ -1890,7 +1917,7 @@ async fn handle_p2p_events(
                     }
 
                     // All segments received: assemble + apply snapshot.
-                    if pending_segment_ids.is_empty() && !collected_segments.is_empty() {
+                    if pending_segment_ids.is_empty() && segment_queue.is_empty() && !collected_segments.is_empty() {
                         if let Some(pending) = pending_manifest.take() {
                             let m = pending.manifest;
                             let segments: Vec<(
@@ -2027,7 +2054,7 @@ async fn handle_p2p_events(
                 // If segment collection is already in progress (pending_segment_ids non-empty),
                 // a second RecursiveProof event would corrupt the active session.
                 // Ignore it to protect the in-flight segment download.
-                if !pending_segment_ids.is_empty() {
+                if !pending_segment_ids.is_empty() || !segment_queue.is_empty() {
                     tracing::debug!(
                         from = %from,
                         "ignoring recursive proof — segment collection already in progress"
@@ -2249,25 +2276,34 @@ async fn handle_p2p_events(
                                     tracing::warn!(err = ?e, "failed to persist recursive proof");
                                 }
                             }
-                            // Start downloading all segments in parallel (up to 8 at a time).
-                            // The StateSegment handler assembles them and applies when complete.
+                            // Start downloading segments with concurrency cap.
+                            // The StateSegment handler dispatches queued requests as responses arrive.
                             let tip_h = snap.manifest.tip_height;
                             for &seg_id in &snap.manifest.segment_ids {
-                                pending_segment_ids.insert(seg_id);
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::RequestStateSegment {
-                                        peer: from,
-                                        segment_id: seg_id,
-                                        expected_tip_height: tip_h,
-                                    })
-                                    .await;
+                                segment_queue.push_back(seg_id);
+                            }
+                            let mut launched = 0usize;
+                            while launched < MAX_INFLIGHT_SEGMENTS {
+                                if let Some(seg_id) = segment_queue.pop_front() {
+                                    pending_segment_ids.insert(seg_id);
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::RequestStateSegment {
+                                            peer: from,
+                                            segment_id: seg_id,
+                                            expected_tip_height: tip_h,
+                                        })
+                                        .await;
+                                    launched += 1;
+                                } else {
+                                    break;
+                                }
                             }
                             // Restore pending_manifest for the StateSegment handler to use.
                             pending_manifest = Some(PendingManifest {
                                 from,
                                 manifest: snap.manifest,
                             });
-                            if pending_segment_ids.is_empty() {
+                            if pending_segment_ids.is_empty() && segment_queue.is_empty() {
                                 // No segments (fresh network, no UTXOs yet).
                                 // Apply directly with empty segment list.
                                 let m = pending_manifest.take().unwrap().manifest;
@@ -2494,6 +2530,9 @@ async fn handle_p2p_events(
                 tracing::debug!(peer = %peer, "peer disconnected");
                 fetch_in_progress.remove(&peer);
                 manifest_requested_peers.remove(&peer);
+                fetch_depth.remove(&peer);
+                peer_tx_rate.remove(&peer);
+                peer_block_rate.remove(&peer);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(n, "P2P event receiver lagged — some events dropped");

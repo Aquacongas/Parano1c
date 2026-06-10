@@ -525,6 +525,15 @@ impl AsyncMempool {
         st.pool.iter().map(|(_, e)| e.clone()).collect()
     }
 
+    /// O(1) lookup of a single entry by tx_body_hash.
+    pub async fn get_entry_by_hash(
+        &self,
+        hash: &TxBodyHash,
+    ) -> Option<noid_chain::mempool::MempoolEntry> {
+        let st = self.state.lock().await;
+        st.pool.get(hash).cloned()
+    }
+
     /// All raw TxIntent bytes for every pending transaction (for mempool sync).
     pub async fn all_intent_bytes(&self) -> Vec<Vec<u8>> {
         let st = self.state.lock().await;

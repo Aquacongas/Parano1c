@@ -197,6 +197,11 @@ impl Mempool {
         self.entries.contains_key(hash)
     }
 
+    /// Get an entry by tx_body_hash. O(1) HashMap lookup.
+    pub fn get(&self, hash: &TxBodyHash) -> Option<&MempoolEntry> {
+        self.entries.get(hash)
+    }
+
     /// Attempt to add a transaction to the pool.
     ///
     /// Does NOT call `validate_tx_for_mempool()` — the caller is responsible

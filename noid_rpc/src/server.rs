@@ -468,12 +468,14 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
-        let entries = self.mempool.get_all_entries().await;
-        let found = entries
-            .into_iter()
-            .find(|e| hex::encode(e.tx.tx_body_hash.0) == txhash);
+        let hash_bytes: [u8; 32] = hex::decode(&txhash)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let hash = noid_poseidon2b::primitives::TxBodyHash(hash_bytes);
+        let found = self.mempool.get_entry_by_hash(&hash).await;
         Ok(found.map(|e| MempoolTxInfo {
-            tx_hash: hex::encode(e.tx.tx_body_hash.0),
+            tx_hash: txhash,
             fee_micronoid: e.tx.body.fee.min(u64::MAX as u128) as u64,
             fee_rate: {
                 let slots = (e.tx.body.inputs.iter().filter(|i| i.valid).count()
