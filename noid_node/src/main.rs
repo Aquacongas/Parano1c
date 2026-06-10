@@ -449,12 +449,19 @@ async fn main() -> anyhow::Result<()> {
     let mut mp_events = mempool.subscribe();
     let p2p_tx_relay = p2p.cmd_tx.clone();
     tokio::spawn(async move {
-        while let Ok(noid_mempool::MempoolEvent::TxAdmitted { intent_bytes, .. }) =
-            mp_events.recv().await
-        {
-            let _ = p2p_tx_relay
-                .send(noid_p2p::NetworkCommand::BroadcastTx { intent_bytes })
-                .await;
+        loop {
+            match mp_events.recv().await {
+                Ok(noid_mempool::MempoolEvent::TxAdmitted { intent_bytes, .. }) => {
+                    let _ = p2p_tx_relay
+                        .send(noid_p2p::NetworkCommand::BroadcastTx { intent_bytes })
+                        .await;
+                }
+                Ok(_) => {} // TxEvicted, TxConfirmed, TxPreProved — ignore
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "mempool relay: lagged, some TXs not gossiped");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
@@ -1482,6 +1489,48 @@ async fn handle_p2p_events(
                     }
                 }
             }
+            Ok(NetworkEvent::MempoolSyncResponse { from, txs }) => {
+                tracing::info!(
+                    peer = %from,
+                    tx_count = txs.len(),
+                    "mempool sync: received pending TXs from peer"
+                );
+                let mempool_task = mempool.clone();
+                let sync_ready_task = Arc::clone(&sync_ready);
+                let chain_task = Arc::clone(&chain);
+                tokio::spawn(async move {
+                    // If this node is still performing state sync (height == 0),
+                    // the chain view in the mempool has no recent_headers yet.
+                    // TX anchor checks will fail with BadEpochAnchor because the
+                    // PoW block hashes referenced by the TXs are not yet known.
+                    // Wait for sync_ready (fires after snapshot is fully applied)
+                    // before attempting to submit anything.
+                    {
+                        let h = chain_task.read().await.tip_height();
+                        if h == 0 {
+                            tracing::debug!("mempool sync: waiting for state sync before admitting TXs");
+                            sync_ready_task.notified().await;
+                            tracing::debug!("mempool sync: state ready, submitting {} TXs", txs.len());
+                        }
+                    }
+                    for intent_bytes in txs {
+                        match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                            Ok(intent) => {
+                                match mempool_task.submit(intent, intent_bytes).await {
+                                    Ok(hash) => {
+                                        tracing::debug!(hash = ?hash, "mempool sync: tx admitted");
+                                    }
+                                    Err(e) if e.is_soft() => {}
+                                    Err(e) => {
+                                        tracing::debug!(err = %e, "mempool sync: tx rejected");
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                });
+            }
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
                 tracing::debug!(peer = %from, "received tx from P2P");
 
@@ -1582,6 +1631,14 @@ async fn handle_p2p_events(
                         "triggered recent-block sync"
                     );
                 }
+
+                // Request peer's mempool regardless of sync state.
+                // Late-joining nodes miss gossipsub events published before
+                // they subscribed; this fills the gap.
+                p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestMempoolSync { peer })
+                    .await
+                    .ok();
             }
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
                 // Headers batch arrived — clear the in-progress guard.

@@ -83,6 +83,12 @@ pub struct MempoolEntry {
     /// re-doing any per-tx work.  `prove_block` then only runs the unified
     /// block-level SpineGKR + single FRI opening.
     pub cached_algebraic_proof: Option<Vec<u8>>,
+
+    /// Raw `TxIntent` bytes as submitted by the wallet.
+    /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
+    /// newly connected peers (gossipsub deduplication prevents re-gossiping;
+    /// a dedicated request-response exchange is the only reliable mechanism).
+    pub intent_bytes: Vec<u8>,
 }
 
 impl MempoolEntry {
@@ -107,6 +113,7 @@ impl MempoolEntry {
             anchor_height,
             fee_rate,
             cached_algebraic_proof: None,
+            intent_bytes: Vec::new(), // populated by AsyncMempool::submit
         }
     }
 }
@@ -342,6 +349,22 @@ impl Mempool {
         if let Some(entry) = self.entries.get_mut(hash) {
             entry.cached_algebraic_proof = Some(proof_bytes);
         }
+    }
+
+    /// Store raw TxIntent bytes for mempool-sync serving.
+    pub fn set_intent_bytes(&mut self, hash: &TxBodyHash, bytes: Vec<u8>) {
+        if let Some(entry) = self.entries.get_mut(hash) {
+            entry.intent_bytes = bytes;
+        }
+    }
+
+    /// All intent_bytes for all pending transactions (for mempool sync).
+    pub fn all_intent_bytes(&self) -> Vec<Vec<u8>> {
+        self.entries
+            .values()
+            .filter(|e| !e.intent_bytes.is_empty())
+            .map(|e| e.intent_bytes.clone())
+            .collect()
     }
 
     /// Total fees available in the pool (useful for coinbase computation).

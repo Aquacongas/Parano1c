@@ -256,6 +256,8 @@ impl AsyncMempool {
         if !intent.logic_proof_bytes.is_empty() {
             st.pool.set_cached_proof(&hash, intent.logic_proof_bytes);
         }
+        // Store raw intent bytes for mempool-sync serving to new peers.
+        st.pool.set_intent_bytes(&hash, intent_bytes.clone());
 
         if !is_coinbase {
             st.floor.record(fee);
@@ -521,6 +523,12 @@ impl AsyncMempool {
     pub async fn get_all_entries(&self) -> Vec<noid_chain::mempool::MempoolEntry> {
         let st = self.state.lock().await;
         st.pool.iter().map(|(_, e)| e.clone()).collect()
+    }
+
+    /// All raw TxIntent bytes for every pending transaction (for mempool sync).
+    pub async fn all_intent_bytes(&self) -> Vec<Vec<u8>> {
+        let st = self.state.lock().await;
+        st.pool.all_intent_bytes()
     }
 
     /// Update the chain view without applying a new block.

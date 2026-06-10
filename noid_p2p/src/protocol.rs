@@ -152,6 +152,29 @@ pub struct GetStateSegmentResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Mempool sync — request-response on peer connect
+// ---------------------------------------------------------------------------
+
+/// Request all pending transactions from a peer.
+/// Sent immediately when a new peer connects to ensure both sides have
+/// each other's mempool. This is necessary because gossipsub only propagates
+/// NEW events — existing mempool entries are not retransmitted to late-joining
+/// peers via gossipsub (which would be deduplicated away).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GetMempoolRequest;
+
+/// Response: raw TxIntent bytes for every pending transaction.
+///
+/// The receiver submits each entry to its own mempool; duplicates are silently
+/// ignored by the admission pipeline (hash already present → Ok(existing_hash)).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GetMempoolResponse {
+    /// Raw `TxIntent` bytes, one per pending transaction.
+    /// Empty when the peer's mempool is empty or the node is just starting.
+    pub txs: Vec<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------
 // Compact block announcement (gossip)
 // ---------------------------------------------------------------------------
 

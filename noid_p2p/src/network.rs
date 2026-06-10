@@ -89,6 +89,10 @@ pub enum NetworkCommand {
     /// Used to cryptographically verify a state snapshot before applying it.
     /// Emits `NetworkEvent::RecursiveProof` when the response arrives.
     RequestRecursiveProof { peer: PeerId },
+    /// Request a peer's mempool contents (all pending TxIntent bytes).
+    /// Triggered on peer connect so late-joining nodes receive existing TXs.
+    /// Emits `NetworkEvent::MempoolSyncResponse` when the response arrives.
+    RequestMempoolSync { peer: PeerId },
 }
 
 /// Events emitted by the P2P layer to the node.
@@ -146,6 +150,13 @@ pub enum NetworkEvent {
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
+    },
+    /// Mempool sync response: raw TxIntent bytes from a peer's mempool.
+    /// Received after sending `RequestMempoolSync` on peer connect.
+    MempoolSyncResponse {
+        from: PeerId,
+        /// Raw TxIntent bytes, one per pending transaction.
+        txs: Vec<Vec<u8>>,
     },
     /// A peer connected.
     PeerConnected(PeerId),
@@ -293,6 +304,15 @@ impl P2PNetwork {
             .await;
     }
 
+    /// Request all pending transactions from a peer's mempool.
+    /// Used on peer connect so late-joining nodes receive existing TXs.
+    pub async fn request_mempool_sync(&self, peer: PeerId) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::RequestMempoolSync { peer })
+            .await;
+    }
+
     /// Get peer count via an existing command channel (for RPC handler).
     pub async fn peer_count_via(cmd: &tokio::sync::mpsc::Sender<NetworkCommand>) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -319,7 +339,7 @@ async fn run_swarm(
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
     chain: Arc<RwLock<MdbxChainContext>>,
-    _mempool: AsyncMempool,
+    mempool: AsyncMempool,
     topics: NetworkTopics,
     data_dir: std::path::PathBuf,
 ) -> anyhow::Result<()> {
@@ -420,7 +440,7 @@ async fn run_swarm(
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &topics, &mut reconnect).await;
+                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &mempool, &topics, &mut reconnect).await;
             }
 
             // Commands from the node (when no swarm event pending).
@@ -637,6 +657,13 @@ fn handle_network_command(
                 },
             );
         }
+        NetworkCommand::RequestMempoolSync { peer } => {
+            let _ = swarm
+                .behaviour_mut()
+                .mempool_sync
+                .send_request(&peer, crate::protocol::GetMempoolRequest);
+            tracing::debug!(peer = %peer, "requesting mempool sync");
+        }
     }
 }
 
@@ -646,6 +673,7 @@ async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
     chain: &Arc<RwLock<MdbxChainContext>>,
+    mempool: &AsyncMempool,
     topics: &NetworkTopics,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
@@ -1163,6 +1191,53 @@ async fn handle_swarm_event(
                 from: peer,
                 response,
             });
+        }
+
+        // --- Mempool sync: server side (peer requests our mempool) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request { channel, .. },
+                peer,
+            },
+        )) => {
+            let txs = mempool.all_intent_bytes().await;
+            tracing::debug!(
+                peer = %peer,
+                tx_count = txs.len(),
+                "serving mempool sync request"
+            );
+            let _ = swarm
+                .behaviour_mut()
+                .mempool_sync
+                .send_response(channel, crate::protocol::GetMempoolResponse { txs });
+        }
+
+        // --- Mempool sync: client side (response to our request) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            if !response.txs.is_empty() {
+                tracing::debug!(
+                    from = %peer,
+                    tx_count = response.txs.len(),
+                    "received mempool sync response"
+                );
+                let _ = event_tx.send(NetworkEvent::MempoolSyncResponse {
+                    from: peer,
+                    txs: response.txs,
+                });
+            }
+        }
+
+        // --- Mempool sync: outbound failure ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "mempool sync request failed");
         }
 
         // --- Connection events ---

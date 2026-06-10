@@ -32,9 +32,10 @@ use libp2p::{
 use libp2p_connection_limits as connection_limits;
 
 use crate::protocol::{
-    GetHeadersRequest, GetHeadersResponse, GetRecentBlockRequest, GetRecentBlockResponse,
-    GetRecursiveProofRequest, GetRecursiveProofResponse, GetStateManifestRequest,
-    GetStateManifestResponse, GetStateSegmentRequest, GetStateSegmentResponse,
+    GetHeadersRequest, GetHeadersResponse, GetMempoolRequest, GetMempoolResponse,
+    GetRecentBlockRequest, GetRecentBlockResponse, GetRecursiveProofRequest,
+    GetRecursiveProofResponse, GetStateManifestRequest, GetStateManifestResponse,
+    GetStateSegmentRequest, GetStateSegmentResponse,
 };
 
 /// All P2P behaviours composed via the derive macro.
@@ -123,6 +124,13 @@ pub struct NodeBehaviour {
     /// Downloaded in parallel after manifest is received.
     pub state_segment_sync:
         request_response::cbor::Behaviour<GetStateSegmentRequest, GetStateSegmentResponse>,
+
+    /// Mempool sync — exchange pending TXs on peer connect.
+    /// When a new peer joins, both sides request each other's mempool so that
+    /// TXs submitted before connection are immediately propagated.
+    /// This complements gossipsub (which only delivers NEW events) with a
+    /// state-sync mechanism for existing mempool entries.
+    pub mempool_sync: request_response::cbor::Behaviour<GetMempoolRequest, GetMempoolResponse>,
 }
 
 impl NodeBehaviour {
@@ -189,12 +197,27 @@ impl NodeBehaviour {
 
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(700))
-            .mesh_n(6)
-            .mesh_n_low(4)
-            .mesh_n_high(12)
-            .mesh_outbound_min(2)
+            // Mesh params tuned for 2-1000 peers:
+            //   mesh_n(4)           — target mesh; forms with as few as 4 peers
+            //   mesh_n_low(2)       — expand if fewer than 2 mesh peers
+            //   mesh_n_high(8)      — prune above 8 (vs 12 before)
+            //   mesh_outbound_min(1)— CRITICAL: was 2, blocked publish with ≤1 outbound
+            //                        (every spoke node connecting to a single seed
+            //                         has exactly 1 outbound; publish was silently
+            //                         failing with InsufficientPeers for all of them)
+            .mesh_n(4)
+            .mesh_n_low(2)
+            .mesh_n_high(8)
+            .mesh_outbound_min(1)
             .max_transmit_size(GOSSIP_MAX_TRANSMIT_BYTES)
-            .flood_publish(false)
+            // flood_publish(true): send to ALL connected peers, not just mesh.
+            // TXs are small (1-5 KB); flooding ensures instant delivery to every
+            // peer regardless of mesh topology. Gossipsub content-addressed
+            // deduplication (blake3 hash ID) prevents infinite rebroadcast loops.
+            // For mainnet at scale, TX flooding is still correct (spam filtered by
+            // mempool fee checks) while block announcements are already compact
+            // (~310 bytes header-only; proof pulled on demand).
+            .flood_publish(true)
             // Peer exchange: when the mesh prunes a peer it advertises up to 6
             // alternative peers (PeerInfo with signed address records). The
             // receiving node dials those peers automatically, enabling organic
@@ -266,6 +289,19 @@ impl NodeBehaviour {
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(60))
                 .with_max_concurrent_streams(16),
+        );
+
+        // Mempool sync: exchange pending TXs on peer connect.
+        // Response contains raw TxIntent bytes for all pending transactions.
+        // 10s timeout is generous for a few KB of mempool data.
+        let mempool_sync = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::try_from_owned(format!("{}/mempool/1", protocol_id))?,
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10))
+                .with_max_concurrent_streams(4),
         );
 
         // ----------------------------------------------------------------
@@ -383,6 +419,7 @@ impl NodeBehaviour {
             connection_limits,
             state_manifest_sync,
             state_segment_sync,
+            mempool_sync,
         })
     }
 }
