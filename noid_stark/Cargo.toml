@@ -13,6 +13,7 @@ noid_tx = { path = "../noid_tx" }
 noid_air = { path = "../noid_air" }
 noid_gkr = { path = "../noid_gkr" }
 rayon = "1.10"
+tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 

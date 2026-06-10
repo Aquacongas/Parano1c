@@ -776,6 +776,50 @@ impl MdbxStore {
         Ok(())
     }
 
+    /// Clear all volatile tables on node restart, keeping only T_HEADERS and T_HASH_TO_HEIGHT.
+    ///
+    /// This implements the proof-native restart model: on every startup, volatile state
+    /// (segments, undo logs, nullifiers, recent blocks, etc.) is discarded and re-synced
+    /// from the network. The recursive chain proof guarantees correctness of the synced
+    /// state, so there is no benefit to persisting it across restarts.
+    ///
+    /// T_HEADERS is kept (append-only, small, useful for historical header queries).
+    /// T_HASH_TO_HEIGHT is kept (companion to T_HEADERS, hash->height index).
+    /// T_RECURSIVE_PROOF is kept (6.5 KB; used to seed new peers immediately on connect).
+    pub fn clear_for_restart(&self) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let volatile = [
+            T_SEGMENTS,
+            T_RECENT_BLOCKS,
+            T_UNDO_LOGS,
+            T_NULLIFIERS,
+            T_NULLIFIER_BLOCKS,
+            T_BLOCK_PROOFS,
+            T_OWNER_INDEX,
+            T_STATE_META,
+            T_CHAIN_TIP,
+            T_TX_INDEX,
+        ];
+        for name in volatile {
+            let tbl = txn.open_table(Some(name))?;
+            let keys: Vec<Vec<u8>> = {
+                let mut cur = txn.cursor(&tbl)?;
+                let mut keys = Vec::new();
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                while let Some((k, _)) = item {
+                    keys.push(k);
+                    item = cur.next()?;
+                }
+                keys
+            };
+            for k in keys {
+                let _ = txn.del(&tbl, &k, None);
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Returns `true` if the store has never had a block committed (fresh database).
     pub fn is_empty(&self) -> Result<bool, StoreError> {
         Ok(self.get_chain_tip()?.is_none())

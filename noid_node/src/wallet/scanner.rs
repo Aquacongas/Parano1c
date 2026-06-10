@@ -76,6 +76,7 @@ pub fn scan_state_for_utxos(
     state: &SegmentedFriState,
     master: &MasterSecret,
     current_height: u64,
+    hint_next_index: u32, // always scan at least to this index
 ) -> (Vec<WalletUtxo>, HashMap<[u8; 32], u32>, u32) {
     let seg_log = state.effective_log_segment_size();
     let seg_size = 1usize << seg_log;
@@ -145,9 +146,14 @@ pub fn scan_state_for_utxos(
         batch_start = batch_end;
 
         // Stop conditions:
-        // 1. GAP_LIMIT consecutive empty batches
+        // 1. GAP_LIMIT consecutive empty batches AND we've scanned past hint_next_index
+        //    (always cover addresses the user generated via address --new)
         // 2. Safety cap: never derive more than 100_000 addresses
-        if empty_batches >= GAP_LIMIT || batch_start >= 100_000 {
+        let min_scan_to = hint_next_index.saturating_add(BATCH_SIZE);
+        if empty_batches >= GAP_LIMIT && batch_start >= min_scan_to {
+            break;
+        }
+        if batch_start >= 100_000 {
             break;
         }
     }
@@ -211,6 +217,7 @@ pub fn update_wallet_from_block(
                         confirmed_height: height,
                     };
                     utxos.insert(output.slot_index, utxo);
+                    let addr_str = output.owner.to_bech32();
                     history.push(TxHistoryEntry {
                         tx_hash: tx.tx_body_hash.0,
                         height,
@@ -218,6 +225,8 @@ pub fn update_wallet_from_block(
                         amount_micronoid: output.value,
                         peer_address: None,
                         timestamp,
+                        own_address: Some(addr_str),
+                        own_key_index: Some(key_idx),
                     });
                 }
             }
@@ -227,12 +236,21 @@ pub fn update_wallet_from_block(
         // Track value flow for this transaction
         let mut sent_from_wallet: u64 = 0;
         let mut received_by_wallet: u64 = 0;
+        let mut sent_own_address: Option<String> = None;
+        let mut sent_own_key_index: Option<u32> = None;
+        let mut recv_own_address: Option<String> = None;
+        let mut recv_own_key_index: Option<u32> = None;
 
         // Inputs: remove spent UTXOs and clear from pending_input_slots.
         for input in tx.body.inputs.iter().filter(|i| i.valid) {
             pending_input_slots.remove(&input.slot_index);
             if let Some(spent) = utxos.remove(&input.slot_index) {
                 sent_from_wallet = sent_from_wallet.saturating_add(spent.value);
+                // Track the first spent address as the "own" sending address.
+                if sent_own_address.is_none() {
+                    sent_own_address = Some(spent.address.to_bech32());
+                    sent_own_key_index = Some(spent.key_index);
+                }
             }
         }
 
@@ -248,6 +266,11 @@ pub fn update_wallet_from_block(
                 };
                 utxos.insert(output.slot_index, utxo);
                 received_by_wallet = received_by_wallet.saturating_add(output.value);
+                // Track the first received-to address as the "own" receiving address.
+                if recv_own_address.is_none() {
+                    recv_own_address = Some(output.owner.to_bech32());
+                    recv_own_key_index = Some(key_idx);
+                }
             }
         }
 
@@ -266,6 +289,8 @@ pub fn update_wallet_from_block(
                     amount_micronoid: net_sent,
                     peer_address: None,
                     timestamp,
+                    own_address: sent_own_address,
+                    own_key_index: sent_own_key_index,
                 });
             } else if received_by_wallet > 0 {
                 history.push(TxHistoryEntry {
@@ -275,6 +300,8 @@ pub fn update_wallet_from_block(
                     amount_micronoid: received_by_wallet,
                     peer_address: None,
                     timestamp,
+                    own_address: recv_own_address,
+                    own_key_index: recv_own_key_index,
                 });
             }
         }

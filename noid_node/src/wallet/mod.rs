@@ -40,8 +40,8 @@ use std::sync::Arc;
 
 use noid_chain::segmented_state::SegmentedFriState;
 use noid_rpc::types::{
-    micronoid_to_noid, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletStatus,
-    WalletUtxoInfo,
+    micronoid_to_noid, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult,
+    WalletStatus, WalletUtxoInfo,
 };
 use noid_rpc::WalletOps;
 
@@ -104,13 +104,26 @@ impl WalletOps for WalletHandle {
                 total_micronoid: 0,
                 total_noid: 0.0,
                 utxo_count: 0,
+                pending_outbound_micronoid: 0,
+                spendable_micronoid: 0,
+                spendable_noid: 0.0,
             },
             Some(w) => {
                 let total = w.balance();
+                let pending_out: u64 = w
+                    .pending_input_slots
+                    .iter()
+                    .filter_map(|&s| w.utxos.get(&s))
+                    .map(|u| u.value)
+                    .sum();
+                let spendable = total.saturating_sub(pending_out);
                 WalletBalance {
                     total_micronoid: total,
                     total_noid: micronoid_to_noid(total),
                     utxo_count: w.utxos.len(),
+                    pending_outbound_micronoid: pending_out,
+                    spendable_micronoid: spendable,
+                    spendable_noid: micronoid_to_noid(spendable),
                 }
             }
         }
@@ -155,14 +168,16 @@ impl WalletOps for WalletHandle {
                         .peer_address
                         .map(|a| noid_poseidon2b::primitives::Address(a).to_bech32()),
                     timestamp: h.timestamp,
+                    own_address: h.own_address.clone(),
+                    own_key_index: h.own_key_index,
                 })
                 .collect(),
         }
     }
 
     fn scan_state(&self, state: &SegmentedFriState, height: u64) -> WalletScanResult {
-        // Extract master secret (brief lock, then release).
-        let master = {
+        // Extract master secret and hint_next_index (brief lock, then release).
+        let (master, hint_next_index) = {
             let guard = self.inner.lock().unwrap();
             match &*guard {
                 None => {
@@ -170,13 +185,16 @@ impl WalletOps for WalletHandle {
                         found_utxos: 0,
                         balance_micronoid: 0,
                         balance_noid: 0.0,
+                        addresses_scanned: 0,
+                        next_index: 0,
                     }
                 }
-                Some(w) => w.secret_clone(),
+                Some(w) => (w.secret_clone(), w.next_index),
             }
         };
 
-        let (utxos, known_addresses, next_index) = scan_state_for_utxos(state, &master, height);
+        let (utxos, known_addresses, next_index) =
+            scan_state_for_utxos(state, &master, height, hint_next_index);
 
         let found = utxos.len();
         let balance: u64 = utxos.iter().map(|u| u.value).sum();
@@ -191,6 +209,8 @@ impl WalletOps for WalletHandle {
             found_utxos: found,
             balance_micronoid: balance,
             balance_noid: micronoid_to_noid(balance),
+            addresses_scanned: next_index,
+            next_index,
         }
     }
 
@@ -266,7 +286,7 @@ impl WalletOps for WalletHandle {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
         // Extract consolidation build data from wallet (brief lock).
         let (build_data, consolidation_amount) = {
             let guard = self.inner.lock().unwrap();
@@ -313,10 +333,13 @@ impl WalletOps for WalletHandle {
         )
         .map_err(|e| e.to_string())?;
 
-        // Register output and input slots as pending (brief lock).
+        // Register output slots as pending (brief lock).
         // Output slots: prevents concurrent TXs from targeting the same empty slot.
-        // Input slots: prevents the next consolidation round from double-spending
-        //              the same UTXOs before this TX is confirmed.
+        // Input slots are intentionally NOT registered here — the caller
+        // (wallet_consolidate in server.rs) must call add_pending_inputs only
+        // after a successful mempool.submit.  Registering inputs before submit
+        // would permanently lock UTXOs on a failed attempt, making every retry
+        // unable to find inputs to consolidate (Bug #3).
         {
             let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
                 .map_err(|e| format!("decode: {e:?}"))?;
@@ -330,11 +353,106 @@ impl WalletOps for WalletHandle {
             let mut guard = self.inner.lock().unwrap();
             if let Some(w) = guard.as_mut() {
                 w.add_pending_outputs(&output_slots);
-                w.add_pending_inputs(&input_slots);
             }
         }
 
-        Ok(intent_bytes)
+        Ok((intent_bytes, input_slots))
+    }
+
+    fn add_pending_inputs(&self, slots: &[u32]) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            w.add_pending_inputs(slots);
+        }
+    }
+
+    fn next_address(&self) -> Option<WalletAddressInfo> {
+        let mut guard = self.inner.lock().unwrap();
+        let w = guard.as_mut()?;
+        let idx = w.next_index;
+        let addr = w.address_at(idx);
+        // Register in known_addresses so incremental block updates catch payments to it.
+        w.known_addresses.insert(addr.0, idx);
+        w.next_index += 1;
+        Some(WalletAddressInfo {
+            address: addr.to_bech32(),
+            key_index: idx,
+            balance_micronoid: 0,
+            balance_noid: 0.0,
+            utxo_count: 0,
+        })
+    }
+
+    fn list_addresses(&self) -> Vec<WalletAddressInfo> {
+        let guard = self.inner.lock().unwrap();
+        let w = match &*guard {
+            None => return vec![],
+            Some(w) => w,
+        };
+
+        // Build per-address balance and UTXO count from current UTXO set.
+        let mut addr_balance: std::collections::HashMap<u32, (u64, usize)> =
+            std::collections::HashMap::new();
+        for utxo in w.utxos.values() {
+            let e = addr_balance.entry(utxo.key_index).or_default();
+            e.0 += utxo.value;
+            e.1 += 1;
+        }
+
+        // Collect all key indices that have had any activity (UTXOs or history).
+        let mut seen_indices: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for utxo in w.utxos.values() {
+            seen_indices.insert(utxo.key_index);
+        }
+        for entry in &w.history {
+            if let Some(idx) = entry.own_key_index {
+                seen_indices.insert(idx);
+            }
+        }
+        // Always include index 0 (primary address).
+        seen_indices.insert(0);
+
+        let mut result: Vec<WalletAddressInfo> = seen_indices
+            .iter()
+            .map(|&idx| {
+                let addr = w.address_at(idx);
+                let (bal, count) = addr_balance.get(&idx).copied().unwrap_or((0, 0));
+                WalletAddressInfo {
+                    address: addr.to_bech32(),
+                    key_index: idx,
+                    balance_micronoid: bal,
+                    balance_noid: micronoid_to_noid(bal),
+                    utxo_count: count,
+                }
+            })
+            .collect();
+
+        // Append next_index as a fresh address if it hasn't appeared yet.
+        if !seen_indices.contains(&w.next_index) {
+            let addr = w.address_at(w.next_index);
+            result.push(WalletAddressInfo {
+                address: addr.to_bech32(),
+                key_index: w.next_index,
+                balance_micronoid: 0,
+                balance_noid: 0.0,
+                utxo_count: 0,
+            });
+        }
+
+        result
+    }
+
+    fn pending_outbound(&self) -> u64 {
+        let guard = self.inner.lock().unwrap();
+        match &*guard {
+            None => 0,
+            Some(w) => w
+                .pending_input_slots
+                .iter()
+                .filter_map(|&s| w.utxos.get(&s))
+                .map(|u| u.value)
+                .sum(),
+        }
     }
 
     fn export_receipt(&self, txhash_hex: &str) -> Result<String, String> {

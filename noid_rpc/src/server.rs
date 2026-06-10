@@ -23,7 +23,7 @@ use noid_miner::template::TemplateBuilder;
 use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MempoolTxInfo,
-    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletBalance,
+    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
     WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 use crate::wallet_ops::WalletOps;
@@ -137,9 +137,10 @@ impl ParanoidApiServer for RpcHandler {
         }
         use noid_chain::fri_state::SlotValue;
         let sv = chain.state.state.slot(slot_index);
+        // Compute value independently so the response always reflects the actual FRI state.
+        // Never suppress value based on empty — exposes any inconsistency rather than hiding it.
+        let value = sv.value.0 as u64;
         let empty = sv == SlotValue::EMPTY;
-        // Block128(pub u128): lower 64 bits = value (UTXO balances are u64).
-        let value = if empty { 0u64 } else { sv.value.0 as u64 };
         let owner_bytes = {
             let mut b = [0u8; 32];
             b[..16].copy_from_slice(&sv.owner_hi.0.to_le_bytes());
@@ -818,6 +819,16 @@ impl ParanoidApiServer for RpcHandler {
         self.wallet.export_receipt(&txhash_hex).map_err(rpc_err)
     }
 
+    async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo> {
+        self.wallet
+            .next_address()
+            .ok_or_else(|| rpc_err("wallet not initialized"))
+    }
+
+    async fn wallet_list_addresses(&self) -> RpcResult<Vec<WalletAddressInfo>> {
+        Ok(self.wallet.list_addresses())
+    }
+
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
         use noid_chain::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
 
@@ -875,12 +886,12 @@ impl ParanoidApiServer for RpcHandler {
             }
 
             let wallet = Arc::clone(&self.wallet);
-            let intent_bytes = match tokio::task::spawn_blocking(move || {
+            let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
                 wallet.build_consolidate(effective_fee, epoch_anchor, slot_hints, log_slots)
             })
             .await
             {
-                Ok(Ok(bytes)) => bytes,
+                Ok(Ok(tuple)) => tuple,
                 Ok(Err(e)) => return Err(rpc_err(e)),
                 Err(e) => return Err(rpc_err(format!("task: {e}"))),
             };
@@ -892,6 +903,11 @@ impl ParanoidApiServer for RpcHandler {
 
             match self.mempool.submit(intent, intent_bytes).await {
                 Ok(hash) => {
+                    // Lock input slots only after the tx is accepted by the mempool.
+                    // Doing this before submit (as build_consolidate used to do)
+                    // caused Bug #3: a failed submit left UTXOs permanently locked,
+                    // so every subsequent retry failed to find inputs.
+                    self.wallet.add_pending_inputs(&input_slots);
                     return Ok(WalletSendResult {
                         tx_hash: hex::encode(hash.0),
                         fee_micronoid: effective_fee,

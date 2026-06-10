@@ -1068,6 +1068,45 @@ impl BlockStateBindingAir {
         }
         cols
     }
+
+    /// Extend trace columns from `n_rows` to `2^target_log` for the interleaved commitment.
+    ///
+    /// Standard zero-padding violates the eq-ladder base constraint at external rows:
+    ///   `eq_0 + r_0 + b_0 + 1 = 0 + 0 + 0 + 1 = 1 ≠ 0`  (char-2)
+    ///
+    /// Fix: pad eq_ladder columns with `1` at external rows.
+    /// With `r_k = 0` (zero-padded) and `b_k = 0` at those rows:
+    ///   - Base:  `1 + 0 + 0 + 1 = 0` ✓
+    ///   - Step:  `eq_k + eq_{k-1} * (1+0+0) = 1 + 1 = 0` ✓  (char-2)
+    /// All other columns remain zero-padded (selectors gate every other constraint).
+    ///
+    /// Does not allocate if `target_log <= self.log_rows()`.
+    pub fn extend_for_proving(
+        &self,
+        cols: Vec<Vec<Block128>>,
+        target_log: usize,
+    ) -> Vec<Vec<Block128>> {
+        let n_rows = self.layout.n_rows();
+        let target = 1usize << target_log;
+        if target <= n_rows {
+            return cols;
+        }
+        // eq_ladder columns occupy a contiguous range.
+        let eq_base = self.layout.col_eq_ladder(0);
+        let eq_end = eq_base + self.layout.log_slots; // exclusive
+        cols.into_iter()
+            .enumerate()
+            .map(|(idx, mut col)| {
+                let pad = if idx >= eq_base && idx < eq_end {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                };
+                col.resize(target, pad);
+                col
+            })
+            .collect()
+    }
 }
 
 impl Air for BlockStateBindingAir {

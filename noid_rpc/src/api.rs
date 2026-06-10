@@ -7,8 +7,8 @@ use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MiningInfo,
-    ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletBalance, WalletHistoryEntry,
-    WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
+    WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -215,4 +215,14 @@ pub trait ParanoidApi {
     /// `fee_micronoid = 0` uses the minimum fee (5000 μNOID).
     #[method(name = "walletConsolidate")]
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult>;
+
+    /// Derive and return the next fresh address (increments the internal index).
+    /// Use this to get a unique address for each incoming payment.
+    #[method(name = "walletNextAddress")]
+    async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo>;
+
+    /// List all addresses that have ever had activity (UTXOs or history),
+    /// plus the next fresh address. Shows per-address balance.
+    #[method(name = "walletListAddresses")]
+    async fn wallet_list_addresses(&self) -> RpcResult<Vec<WalletAddressInfo>>;
 }

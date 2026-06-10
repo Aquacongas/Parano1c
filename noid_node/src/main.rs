@@ -388,8 +388,13 @@ async fn main() -> anyhow::Result<()> {
         ip_port_to_multiaddr(&p2p_listen_str).context("--p2p-listen")?;
 
     let topics = noid_p2p::protocol::NetworkTopics::for_network_cfg(&net);
-    let (p2p, _p2p_task) =
-        P2PNetwork::start(listen_addr.clone(), chain.clone(), mempool.clone(), topics);
+    let (p2p, _p2p_task) = P2PNetwork::start(
+        listen_addr.clone(),
+        chain.clone(),
+        mempool.clone(),
+        topics,
+        data_dir.clone(),
+    );
     tracing::debug!(listen = %listen_addr, "P2P started");
 
     // Dial seeds: CLI seeds + config seeds + DNS seeds.
@@ -561,14 +566,29 @@ async fn main() -> anyhow::Result<()> {
                             txs = n_txs,
                             "broadcast block"
                         );
-                        // Wallet update already done in apply_found_block via hook.
-                        // Broadcast block + proof so all peers can verify ZK.
+                        // Announce compact header to all peers (~310 bytes).
+                        // Peers pull the full block + proof via GetRecentBlockRequest.
+                        // This is correct for a proof-native statechain: blocks are
+                        // ephemeral (pruned after FINALITY_DEPTH), sync is via state
+                        // snapshot + recursive proof, not block replay.
+                        let header_bytes = {
+                            let mut buf = Vec::new();
+                            if let Ok(block) = noid_chain::block::Block::from_bytes(&block_bytes) {
+                                block.header.encode(&mut buf);
+                            }
+                            buf
+                        };
                         let _ = p2p_block_relay
-                            .send(noid_p2p::NetworkCommand::BroadcastBlock {
-                                block_bytes,
-                                block_proof_bytes,
+                            .send(noid_p2p::NetworkCommand::AnnounceBlock {
+                                height,
+                                hash,
+                                header_bytes,
                             })
                             .await;
+                        // block_bytes and block_proof_bytes are stored locally by
+                        // apply_found_block and available for pull requests.
+                        let _ = block_bytes; // consumed above
+                        let _ = block_proof_bytes; // stored in MDBX by miner
                     }
                     Ok(noid_miner::MinerEvent::ProveFailed { height, error }) => {
                         tracing::warn!(height, err = %error, "block prove failed");
@@ -844,6 +864,18 @@ async fn apply_reorg_offthread(
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
+        // Re-validate anchor inside write lock: if another task advanced the chain
+        // past ancestor_height since we computed it, the reorg is stale.
+        // apply_reorg_mdbx now also checks this, but checking here lets us
+        // return a specific "stale reorg" result without going into the reorg path.
+        if ancestor_height > ctx.tip_height() {
+            return (
+                Err(noid_chain::storage::MdbxContextError::Consensus(
+                    noid_chain::consensus::ConsensusError::BadParentHash,
+                )),
+                new_blocks,
+            );
+        }
         let result = ctx.apply_reorg_mdbx(ancestor_height, &new_blocks, local_time);
         (result, new_blocks) // return new_blocks so the caller can use them
     })
@@ -877,23 +909,67 @@ async fn handle_p2p_events(
     // remains pending until a RecursiveProof arrives from the expected peer.
     // Subsequent peer connections buffer new snapshots in snapshot_candidates
     // without replacing the pending entry.
-    struct PendingSnapshot {
-        from: libp2p::PeerId,
-        snapshot: Box<noid_p2p::protocol::GetStateSnapshotResponse>,
-    }
-    let mut pending_snapshot: Option<PendingSnapshot> = None;
-
-    // Eclipse attack mitigation — collect snapshots from multiple peers
-    // before selecting the best one, requiring an attacker to control ALL first N
-    // peers instead of just the first one.
+    // --- Segmented state sync state ---
     //
-    // snapshot_candidates: buffered snapshots awaiting selection.
-    // snapshot_requested_peers: tracks which peers we already asked, prevents duplicates.
-    let mut snapshot_candidates: Vec<(
+    // Sync flow:
+    //   1. PeerConnected + our_height==0 → RequestStateManifest
+    //   2. StateManifest received → collect candidates, select best, RequestRecursiveProof
+    //   3. RecursiveProof verified → RequestStateSegment for each segment_id
+    //   4. StateSegment responses → collect all → apply_state_snapshot
+    //
+    // Eclipse mitigation: collect from up to 3 peers before selecting.
+    // Recovery: any failure resets ALL state and clears requested_peers
+    // so the next PeerConnected event starts fresh.
+    struct PendingManifest {
+        from: libp2p::PeerId,
+        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+    }
+    let mut pending_manifest: Option<PendingManifest> = None;
+    let mut manifest_candidates: Vec<(
         libp2p::PeerId,
-        Box<noid_p2p::protocol::GetStateSnapshotResponse>,
+        Box<noid_p2p::protocol::GetStateManifestResponse>,
     )> = Vec::new();
-    let mut snapshot_requested_peers: std::collections::HashSet<libp2p::PeerId> =
+    // Tracks peers already asked; cleared on failure so recovery is automatic.
+    let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+    // Count of manifest responses received (including tip=0 "no state" replies).
+    // When this equals manifest_requested_peers.len(), all peers have responded
+    // and we proceed with whatever valid candidates we have (even just 1).
+    let mut manifest_response_count: usize = 0;
+    // Timestamp of the first valid manifest candidate.  If we haven't proceeded
+    // within 10 seconds of the first candidate arriving, proceed anyway —
+    // some peers may be offline, behind NAT, or not yet synced.
+    let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
+    // Segments collected so far: segment_id → (eff_log, data).
+    // Max 256 segments × ~3 MB = ~768 MB ceiling; acceptable for initial sync.
+    let mut collected_segments: std::collections::HashMap<u16, (u8, Vec<u8>)> =
+        std::collections::HashMap::new();
+    // Segment IDs still outstanding.
+    let mut pending_segment_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
+
+    // Helper: reset all segment-sync state on any failure.
+    // Called whenever sync needs to restart (bad proof, apply failure, missing segment).
+    // Clearing manifest_requested_peers lets the next PeerConnected start fresh.
+    macro_rules! reset_sync_state {
+        () => {{
+            pending_manifest = None;
+            manifest_candidates.clear();
+            manifest_requested_peers.clear();
+            manifest_response_count = 0;
+            manifest_first_candidate_at = None;
+            collected_segments.clear();
+            pending_segment_ids.clear();
+            tracing::debug!("sync state reset — will retry on next peer connection");
+        }};
+    }
+
+    // --- FetchHeaders in-progress guard ---
+    //
+    // Prevents FetchHeaders from being sent to the same peer thousands of
+    // times during a block burst.  Entry is removed when HeadersBatch arrives
+    // from that peer (or on disconnect).  Without this guard, 10 peers each
+    // sending 40 blocks/s = 400 redundant FetchHeaders/s.
+    let mut fetch_in_progress: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
     // --- Per-peer tx rate limiter ---
@@ -929,8 +1005,56 @@ async fn handle_p2p_events(
     let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
     const MAX_FETCH_DEPTH: u32 = 4;
 
+    // Heartbeat for time-dependent checks (manifest timeout, etc.)
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await; // skip first
+
     loop {
-        match rx.recv().await {
+        tokio::select! {
+        biased; // check P2P events first
+        rx_result = rx.recv() => { let rx_item = rx_result;
+        match rx_item {
+            Ok(NetworkEvent::NewBlockAnnouncement {
+                from,
+                height,
+                hash: _,
+                header_bytes: _,
+            }) => {
+                // Compact block announcement: peer has a block at `height`.
+                // If it's ahead of us, pull the full block + proof via block_sync.
+                // This is the correct flow for a proof-native statechain where blocks
+                // are ephemeral (pruned after FINALITY_DEPTH) and sync is via state.
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                if height > our_height + noid_chain::consensus::params::FINALITY_DEPTH {
+                    // Peer is far ahead: we can't catch up block-by-block since
+                    // intermediate blocks are pruned (proof-native statechain).
+                    // Go straight to state manifest sync.
+                    if pending_manifest.is_none() && pending_segment_ids.is_empty() {
+                        if !manifest_requested_peers.contains(&from) {
+                            tracing::info!(
+                                their_height = height,
+                                our_height,
+                                peer = %from,
+                                "deep gap — requesting state manifest directly"
+                            );
+                            manifest_requested_peers.insert(from);
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                .await;
+                        }
+                    }
+                } else if height > our_height {
+                    // Within FINALITY_DEPTH: pull the block + proof directly.
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
+                        .await;
+                }
+                // height <= our_height: already have this block.
+            }
             Ok(NetworkEvent::NewBlock {
                 from,
                 block_bytes,
@@ -1255,6 +1379,23 @@ async fn handle_p2p_events(
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(err = ?e, "reorg failed, keeping current chain");
+                                                    // Reorg failure means our state diverged from the canonical
+                                                    // chain in a way that block-by-block recovery can't fix.
+                                                    // On a proof-native statechain the correct recovery is
+                                                    // O(1) snapshot sync, not attempting more block replays.
+                                                    if pending_manifest.is_none()
+                                                        && pending_segment_ids.is_empty()
+                                                        && !manifest_requested_peers.contains(&from)
+                                                    {
+                                                        tracing::info!(
+                                                            peer = %from,
+                                                            "reorg failed — requesting state manifest for recovery"
+                                                        );
+                                                        manifest_requested_peers.insert(from);
+                                                        let _ = p2p_cmd
+                                                            .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                                            .await;
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -1289,18 +1430,28 @@ async fn handle_p2p_events(
                                         insert_orphan(&mut orphan_pool, block);
 
                                         if is_deep_fork {
-                                            tracing::info!(
-                                                our_tip = our_tip_height,
-                                                their_tip = block_height,
-                                                gap = block_height - our_tip_height,
-                                                peer = %from,
-                                                "deep fork (gap > FINALITY_DEPTH) — requesting snapshot directly"
-                                            );
-                                            let _ = p2p_cmd
-                                                .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
-                                                .await;
-                                        } else {
-                                            // Shallow fork: fetch batch headers to find the common ancestor.
+                                            // Deep fork: O(1) snapshot sync is faster and correct.
+                                            // Guard: don't re-request if already syncing or asked this peer.
+                                            if pending_manifest.is_none()
+                                                && pending_segment_ids.is_empty()
+                                                && !manifest_requested_peers.contains(&from)
+                                            {
+                                                tracing::info!(
+                                                    our_tip = our_tip_height,
+                                                    their_tip = block_height,
+                                                    gap = block_height - our_tip_height,
+                                                    peer = %from,
+                                                    "deep fork (gap > FINALITY_DEPTH) — requesting manifest directly"
+                                                );
+                                                manifest_requested_peers.insert(from);
+                                                let _ = p2p_cmd
+                                                    .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                                    .await;
+                                            }
+                                        } else if !fetch_in_progress.contains(&from) {
+                                            // Shallow fork: fetch batch headers to find common ancestor.
+                                            // Guard: only one outstanding FetchHeaders per peer at a time.
+                                            fetch_in_progress.insert(from);
                                             let fetch_from =
                                                 our_tip_height.saturating_sub(FINALITY_DEPTH);
                                             tracing::info!(
@@ -1396,19 +1547,19 @@ async fn handle_p2p_events(
                 };
 
                 if our_height == 0 {
-                    // Fresh node with no state: request a full STATE SNAPSHOT.
+                    // Fresh node: request the state MANIFEST (tiny, ~few KB).
                     //
-                    // Paranoid does NOT store block history (DA delete-immediately
-                    // policy). New nodes sync via the current state, not block replay.
-                    // The state is proven valid by the recursive chain proof.
+                    // Paranoid is a proof-native statechain: nodes sync via
+                    // current state + recursive proof, not block replay.
+                    // Manifest tells us which segments to download next.
+                    // Segments are pulled in parallel after proof verification.
                     //
-                    // Request from up to 3 distinct peers; we'll pick the
-                    // snapshot with the highest tip_height after collecting >= 2.
-                    if snapshot_candidates.len() < 3 && !snapshot_requested_peers.contains(&peer) {
-                        tracing::info!(peer = %peer, "fresh node — requesting state snapshot (Paranoid sync)");
-                        snapshot_requested_peers.insert(peer);
+                    // Request from up to 3 distinct peers for eclipse mitigation.
+                    if manifest_candidates.len() < 3 && !manifest_requested_peers.contains(&peer) {
+                        tracing::info!(peer = %peer, "fresh node — requesting state manifest (Paranoid sync)");
+                        manifest_requested_peers.insert(peer);
                         p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer })
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest { peer })
                             .await
                             .ok();
                     }
@@ -1433,8 +1584,9 @@ async fn handle_p2p_events(
                 }
             }
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
-                // Headers batch from FetchHeaders — find common ancestor for reorg.
-                // We requested headers when we got BadParentHash for a competing block.
+                // Headers batch arrived — clear the in-progress guard.
+                fetch_in_progress.remove(&from);
+                // Find common ancestor for reorg.
                 if headers.is_empty() {
                     continue;
                 }
@@ -1500,7 +1652,7 @@ async fn handle_p2p_events(
                                 FINALITY_DEPTH
                             );
                             let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
                                 .await;
                         } else {
                             // Shallow fork (≤ FINALITY_DEPTH): apply_reorg_mdbx can handle it.
@@ -1544,7 +1696,7 @@ async fn handle_p2p_events(
                             );
                             *depth = 0; // reset for next time
                             let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateSnapshot { peer: from })
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
                                 .await;
                         } else {
                             *depth += 1;
@@ -1565,66 +1717,69 @@ async fn handle_p2p_events(
                     }
                 }
             }
-            Ok(NetworkEvent::StateSnapshot { from, snapshot }) => {
-                // SECURITY: Do NOT apply the snapshot yet. Collect snapshots from
-                // multiple peers and pick the one with the highest tip_height before
-                // entering the 2-step verification flow. This prevents a single
-                // malicious first peer from providing a fabricated snapshot (Eclipse
-                // attack), since an attacker must now control ALL first N peers.
-                // Once a candidate is selected, a RecursiveBlockProof is requested
-                // and verified cryptographically before the snapshot is accepted.
-                if snapshot.tip_height == 0 {
-                    tracing::debug!(from = %from, "snapshot tip_height=0, ignoring");
-                } else if pending_snapshot.is_some() {
-                    // Already in the 2-step verification flow — do not override.
-                    // Buffer this snapshot in case we need it later (e.g. current
-                    // proof fails and we want to retry with a different candidate).
-                    if snapshot_candidates.len() < 3 {
+            Ok(NetworkEvent::StateManifest { from, manifest }) => {
+                // Received the state manifest (step 1 of snapshot sync).
+                // Eclipse mitigation: collect from multiple peers, pick best.
+                // Track all responses (including tip=0) to detect when all
+                // requested peers have replied, avoiding infinite wait.
+                manifest_response_count += 1;
+                if manifest.tip_height == 0 {
+                    tracing::debug!(from = %from, "manifest tip_height=0, peer has no state yet");
+                    // Don't add to candidates, but fall through to check if we should
+                    // proceed with existing candidates now that we've heard from this peer.
+                } else if pending_manifest.is_some() {
+                    if manifest_candidates.len() < 3 {
                         tracing::debug!(
-                            from = %from,
-                            tip = snapshot.tip_height,
-                            "already verifying a snapshot; storing as late candidate"
+                            from = %from, tip = manifest.tip_height,
+                            "already verifying a manifest; storing as late candidate"
                         );
-                        snapshot_candidates.push((from, snapshot));
+                        manifest_candidates.push((from, manifest));
                     }
                 } else {
-                    // Collect into candidates (cap at 3).
-                    let tip_h = snapshot.tip_height;
-                    if snapshot_candidates.len() < 3 {
-                        snapshot_candidates.push((from, snapshot));
+                    if manifest_candidates.len() < 3 {
+                        manifest_candidates.push((from, manifest));
                     }
+                }
 
-                    // Proceed when we have >= 2 candidates (Eclipse-resistant
-                    // multi-peer selection), OR when only 1 peer is reachable.
-                    //
-                    // Single-peer fallback is safe because validate_snapshot_headers
-                    // (called below) enforces PoW + chainwork on every accepted
-                    // snapshot: a malicious sole peer would need to out-mine the
-                    // real network to forge valid headers. Multi-peer selection is
-                    // defence-in-depth on top of that PoW check.
-                    let should_proceed =
-                        snapshot_candidates.len() >= 2 || snapshot_requested_peers.len() <= 1;
-
+                // Check whether to proceed after EVERY response (including tip=0).
+                // This prevents the node from waiting forever when some peers have
+                // no state yet (fresh network) or return an empty manifest.
+                //
+                // Proceed when:
+                //  a) 2+ valid candidates (Eclipse resistant), OR
+                //  b) only 1 peer was ever requested (single-peer network), OR
+                //  c) all requested peers have responded (even if some returned tip=0), OR
+                //  d) 10 seconds elapsed since the first valid candidate arrived
+                //     (handles offline/slow peers that never respond)
+                if !manifest_candidates.is_empty() {
+                    manifest_first_candidate_at.get_or_insert_with(std::time::Instant::now);
+                }
+                if pending_manifest.is_none() && !manifest_candidates.is_empty() {
+                    let all_responded = manifest_response_count >= manifest_requested_peers.len();
+                    let timed_out = manifest_first_candidate_at
+                        .map(|t| t.elapsed() > std::time::Duration::from_secs(10))
+                        .unwrap_or(false);
+                    let should_proceed = manifest_candidates.len() >= 2
+                        || manifest_requested_peers.len() <= 1
+                        || all_responded
+                        || timed_out;
                     if should_proceed {
-                        // Pick the snapshot with the highest tip_height (most chainwork).
-                        let (best_peer, best_snapshot) = snapshot_candidates
+                        let (best_peer, best_manifest) = manifest_candidates
                             .drain(..)
-                            .max_by_key(|(_, s)| s.tip_height)
-                            .expect("snapshot_candidates is non-empty");
-
+                            .max_by_key(|(_, m)| m.tip_height)
+                            .expect("manifest_candidates is non-empty");
                         tracing::info!(
                             from = %best_peer,
-                            tip = best_snapshot.tip_height,
-                            segments = best_snapshot.segments.len(),
-                            "selected best snapshot — requesting recursive proof for verification"
+                            tip = best_manifest.tip_height,
+                            segments = best_manifest.segment_ids.len(),
+                            responded = manifest_response_count,
+                            requested = manifest_requested_peers.len(),
+                            "selected best manifest — requesting recursive proof for verification"
                         );
-                        pending_snapshot = Some(PendingSnapshot {
+                        pending_manifest = Some(PendingManifest {
                             from: best_peer,
-                            snapshot: best_snapshot,
+                            manifest: best_manifest,
                         });
-                        // Request the recursive chain proof from the selected peer.
-                        // The response arrives as NetworkEvent::RecursiveProof and
-                        // triggers (2): verify proof then apply snapshot.
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestRecursiveProof {
                                 peer: best_peer,
@@ -1632,12 +1787,172 @@ async fn handle_p2p_events(
                             .await;
                     } else {
                         tracing::info!(
-                            from = %from,
-                            tip = tip_h,
-                            candidates = snapshot_candidates.len(),
-                            "received snapshot — waiting for more candidates before selecting \
-                             (Eclipse attack protection)"
+                            responded = manifest_response_count,
+                            requested = manifest_requested_peers.len(),
+                            candidates = manifest_candidates.len(),
+                            "manifest received — waiting for more candidates (Eclipse protection)"
                         );
+                    }
+                }
+            }
+
+            Ok(NetworkEvent::StateSegment { from, response }) => {
+                // Received one segment (step 2 of snapshot sync).
+                // Collect until all pending segments are received, then apply.
+                if pending_segment_ids.contains(&response.segment_id) {
+                    if let Some(data) = response.data {
+                        // Sanity check: each segment is ~3 MB; 32 MB cap catches corrupt responses.
+                        const MAX_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
+                        if data.len() > MAX_SEGMENT_BYTES {
+                            tracing::warn!(
+                                from = %from, segment = response.segment_id,
+                                bytes = data.len(),
+                                "segment too large — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                        collected_segments.insert(response.segment_id, (response.eff_log, data));
+                        pending_segment_ids.remove(&response.segment_id);
+                        tracing::debug!(
+                            from = %from,
+                            segment = response.segment_id,
+                            remaining = pending_segment_ids.len(),
+                            "segment received"
+                        );
+                    } else {
+                        // Peer couldn't serve this segment (stale state / pruned).
+                        // This means their state has advanced past our expected_tip_height.
+                        // Reset and restart sync from the next peer connection.
+                        tracing::warn!(
+                            from = %from, segment = response.segment_id,
+                            "segment unavailable — server state moved on; restarting sync"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+
+                    // All segments received: assemble + apply snapshot.
+                    if pending_segment_ids.is_empty() && !collected_segments.is_empty() {
+                        if let Some(pending) = pending_manifest.take() {
+                            let m = pending.manifest;
+                            let segments: Vec<(
+                                u16,
+                                u8,
+                                noid_chain::segmented_state::SegmentColumns,
+                            )> = {
+                                use noid_chain::storage::serial::decode_segment;
+                                collected_segments
+                                    .drain()
+                                    .filter_map(|(seg_id, (eff_log, data))| {
+                                        decode_segment(&data)
+                                            .map(|(_, cols)| (seg_id, eff_log, cols))
+                                    })
+                                    .collect()
+                            };
+                            tracing::info!(
+                                segments = segments.len(),
+                                tip = m.tip_height,
+                                "snapshot: all segments received, writing to MDBX…"
+                            );
+                            let nullifier_blocks: Vec<
+                                Vec<noid_poseidon2b::primitives::TxBodyHash>,
+                            > = m
+                                .nullifier_blocks
+                                .iter()
+                                .map(|hashes| {
+                                    hashes
+                                        .iter()
+                                        .map(|h| noid_poseidon2b::primitives::TxBodyHash(*h))
+                                        .collect()
+                                })
+                                .collect();
+                            let result = {
+                                let mut ctx = chain.write().await;
+                                ctx.apply_state_snapshot(
+                                    m.tip_height,
+                                    m.tip_hash,
+                                    m.log_slots,
+                                    m.active_slot_count,
+                                    m.alloc_counter,
+                                    &segments,
+                                    &m.recent_headers,
+                                    &nullifier_blocks,
+                                )
+                            };
+                            match result {
+                                Ok(_) => {
+                                    let ctx = chain.read().await;
+                                    let new_view = ChainView::from_mdbx(&ctx);
+                                    let new_height = ctx.tip_height();
+                                    drop(ctx);
+                                    mempool.on_new_block(&[], new_height, new_view).await;
+                                    sync_ready.notify_one();
+                                    tracing::info!(height = new_height, "snapshot: fully applied");
+                                    tracing::info!(
+                                        height = new_height,
+                                        "chain snapshot applied — mining can begin"
+                                    );
+                                    // Trigger wallet scan in background after snapshot sync.
+                                    // UTXOs created before the snapshot are not tracked by
+                                    // incremental block updates, so a full scan is needed.
+                                    {
+                                        let wallet_snap = wallet.clone();
+                                        let chain_snap = chain.clone();
+                                        tokio::spawn(async move {
+                                            let ctx = chain_snap.read().await;
+                                            let height = ctx.tip_height();
+                                            let (master, hint_next_index) = {
+                                                let guard = wallet_snap.lock().unwrap();
+                                                match guard.as_ref() {
+                                                    None => return,
+                                                    Some(w) => (w.secret_clone(), w.next_index),
+                                                }
+                                            };
+                                            let (utxos, known_addresses, next_index) =
+                                                wallet::scanner::scan_state_for_utxos(
+                                                    &ctx.state.state,
+                                                    &master,
+                                                    height,
+                                                    hint_next_index,
+                                                );
+                                            drop(ctx);
+                                            let found = utxos.len();
+                                            let balance: u64 =
+                                                utxos.iter().map(|u| u.value).sum();
+                                            {
+                                                let mut guard = wallet_snap.lock().unwrap();
+                                                if let Some(w) = guard.as_mut() {
+                                                    w.apply_scan_results(
+                                                        utxos,
+                                                        known_addresses,
+                                                        next_index,
+                                                    );
+                                                }
+                                            }
+                                            tracing::info!(
+                                                height,
+                                                utxos = found,
+                                                balance_micronoid = balance,
+                                                "wallet: auto-scan complete after snapshot sync"
+                                            );
+                                        });
+                                    }
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                            peer: from,
+                                            from_height: new_height + 1,
+                                            count: noid_chain::consensus::params::FINALITY_DEPTH
+                                                as u16,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    tracing::error!(err = ?e, "failed to apply verified state snapshot");
+                                    reset_sync_state!();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1652,36 +1967,34 @@ async fn handle_p2p_events(
                 use bincode;
                 use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
 
-                let snap = match pending_snapshot.take() {
+                // If segment collection is already in progress (pending_segment_ids non-empty),
+                // a second RecursiveProof event would corrupt the active session.
+                // Ignore it to protect the in-flight segment download.
+                if !pending_segment_ids.is_empty() {
+                    tracing::debug!(
+                        from = %from,
+                        "ignoring recursive proof — segment collection already in progress"
+                    );
+                    continue;
+                }
+
+                let snap = match pending_manifest.take() {
                     Some(p) if p.from == from => p,
                     Some(p) => {
-                        // Proof arrived from a different peer — discard (could be unsolicited).
                         tracing::warn!(
-                            proof_from = %from,
-                            snapshot_from = %p.from,
-                            "recursive proof from unexpected peer, discarding pending snapshot"
+                            proof_from = %from, manifest_from = %p.from,
+                            "recursive proof from unexpected peer, discarding pending manifest"
                         );
-                        // Restore the pending snapshot so another proof from the right peer can still work.
-                        pending_snapshot = Some(p);
+                        pending_manifest = Some(p);
                         continue;
                     }
                     None => {
-                        // No pending snapshot — this proof was unsolicited, ignore.
-                        tracing::debug!(from = %from, "unexpected recursive proof, no pending snapshot");
+                        tracing::debug!(from = %from, "unexpected recursive proof, no pending manifest");
                         continue;
                     }
                 };
 
                 if proof_bytes.is_empty() {
-                    // Peer has no recursive proof yet: the proof updater only
-                    // starts after FINALITY_DEPTH=18 finalised blocks, so on
-                    // a fresh network this is normal for the first few minutes.
-                    //
-                    // We still accept the snapshot BUT only after validate_snapshot_headers
-                    // passes: PoW on every header + linkage + MIN_SNAPSHOT_CHAINWORK.
-                    // That check cryptographically commits state_root to real mining work,
-                    // providing Eclipse protection equivalent to what the recursive proof
-                    // would add once available.
                     use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
                     use noid_chain::consensus::pow::full_block_hash as fbh;
                     use noid_recursive::genesis_accumulator;
@@ -1690,22 +2003,22 @@ async fn handle_p2p_events(
                         genesis_accumulator(genesis_state_root(), fbh(&g))
                     };
                     match validate_snapshot_headers(
-                        &snap.snapshot.recent_headers,
+                        &snap.manifest.recent_headers,
                         &genesis_acc_pow,
-                        0, // no proof_h: chain_hash not computed (no proof)
+                        0,
                     ) {
                         Ok(_) => tracing::info!(
                             from = %from,
-                            tip = snap.snapshot.tip_height,
+                            tip = snap.manifest.tip_height,
                             "no recursive proof yet (proof updater catching up) — \
-                             accepting snapshot: PoW + chainwork verified on headers"
+                             accepting manifest: PoW + chainwork verified on headers"
                         ),
                         Err(e) => {
                             tracing::error!(
                                 from = %from,
-                                tip = snap.snapshot.tip_height,
+                                tip = snap.manifest.tip_height,
                                 err = %e,
-                                "REJECTED snapshot: header PoW/chainwork check failed \
+                                "REJECTED manifest: header PoW/chainwork check failed \
                                  (peer has no recursive proof)"
                             );
                             continue;
@@ -1735,7 +2048,7 @@ async fn handle_p2p_events(
                         let proof: RecursiveBlockProof = bincode::deserialize(&proof_bytes)
                             .map_err(|e| format!("proof deserialize: {e}"))?;
 
-                        let snap_tip_h = snap.snapshot.tip_height;
+                        let snap_tip_h = snap.manifest.tip_height;
                         let proof_h = proof.block_height;
 
                         // Validate PoW + chainwork of snapshot headers.
@@ -1747,14 +2060,14 @@ async fn handle_p2p_events(
                             genesis_accumulator(genesis_state_root(), full_block_hash(&g))
                         };
                         let (_sorted_hdrs, expected_chain_hash) = validate_snapshot_headers(
-                            &snap.snapshot.recent_headers,
+                            &snap.manifest.recent_headers,
                             &genesis_acc,
                             proof_h,
                         )?;
 
                         // Helper: find state_root of a given height in snapshot's recent_headers.
                         let find_root = |h: u64| -> Option<[u8; 32]> {
-                            snap.snapshot.recent_headers.iter().find_map(|b| {
+                            snap.manifest.recent_headers.iter().find_map(|b| {
                                 BlockHeader::from_bytes(b)
                                     .ok()
                                     .filter(|hdr| hdr.height == h)
@@ -1868,109 +2181,144 @@ async fn handle_p2p_events(
                         Ok(()) => {
                             tracing::info!(
                                 from = %from,
-                                tip = snap.snapshot.tip_height,
-                                "recursive proof VERIFIED — applying snapshot"
+                                tip = snap.manifest.tip_height,
+                                segments = snap.manifest.segment_ids.len(),
+                                "recursive proof VERIFIED — starting segment download"
                             );
-                            // Persist the verified proof so the local recursive-proof
-                            // updater can resume from this height instead of
-                            // re-proving the entire chain from genesis.
+                            // Persist the verified proof.
                             {
                                 let ctx = chain.read().await;
                                 if let Err(e) = ctx.store.put_recursive_proof(&proof_bytes) {
-                                    tracing::warn!(
-                                        err = ?e,
-                                        "failed to persist received recursive proof"
-                                    );
+                                    tracing::warn!(err = ?e, "failed to persist recursive proof");
+                                }
+                            }
+                            // Start downloading all segments in parallel (up to 8 at a time).
+                            // The StateSegment handler assembles them and applies when complete.
+                            let tip_h = snap.manifest.tip_height;
+                            for &seg_id in &snap.manifest.segment_ids {
+                                pending_segment_ids.insert(seg_id);
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestStateSegment {
+                                        peer: from,
+                                        segment_id: seg_id,
+                                        expected_tip_height: tip_h,
+                                    })
+                                    .await;
+                            }
+                            // Restore pending_manifest for the StateSegment handler to use.
+                            pending_manifest = Some(PendingManifest {
+                                from,
+                                manifest: snap.manifest,
+                            });
+                            if pending_segment_ids.is_empty() {
+                                // No segments (fresh network, no UTXOs yet).
+                                // Apply directly with empty segment list.
+                                let m = pending_manifest.take().unwrap().manifest;
+                                let nullifier_blocks: Vec<
+                                    Vec<noid_poseidon2b::primitives::TxBodyHash>,
+                                > = m
+                                    .nullifier_blocks
+                                    .iter()
+                                    .map(|hashes| {
+                                        hashes
+                                            .iter()
+                                            .map(|h| noid_poseidon2b::primitives::TxBodyHash(*h))
+                                            .collect()
+                                    })
+                                    .collect();
+                                let result = {
+                                    let mut ctx = chain.write().await;
+                                    ctx.apply_state_snapshot(
+                                        m.tip_height,
+                                        m.tip_hash,
+                                        m.log_slots,
+                                        m.active_slot_count,
+                                        m.alloc_counter,
+                                        &[],
+                                        &m.recent_headers,
+                                        &nullifier_blocks,
+                                    )
+                                };
+                                match result {
+                                    Ok(_) => {
+                                        let ctx = chain.read().await;
+                                        let new_view = ChainView::from_mdbx(&ctx);
+                                        let new_height = ctx.tip_height();
+                                        drop(ctx);
+                                        mempool.on_new_block(&[], new_height, new_view).await;
+                                        sync_ready.notify_one();
+                                        tracing::info!(
+                                            height = new_height,
+                                            "snapshot: applied (no segments)"
+                                        );
+                                        // Trigger wallet scan in background after snapshot sync.
+                                        {
+                                            let wallet_snap = wallet.clone();
+                                            let chain_snap = chain.clone();
+                                            tokio::spawn(async move {
+                                                let ctx = chain_snap.read().await;
+                                                let height = ctx.tip_height();
+                                                let (master, hint_next_index) = {
+                                                    let guard = wallet_snap.lock().unwrap();
+                                                    match guard.as_ref() {
+                                                        None => return,
+                                                        Some(w) => (w.secret_clone(), w.next_index),
+                                                    }
+                                                };
+                                                let (utxos, known_addresses, next_index) =
+                                                    wallet::scanner::scan_state_for_utxos(
+                                                        &ctx.state.state,
+                                                        &master,
+                                                        height,
+                                                        hint_next_index,
+                                                    );
+                                                drop(ctx);
+                                                let found = utxos.len();
+                                                let balance: u64 =
+                                                    utxos.iter().map(|u| u.value).sum();
+                                                {
+                                                    let mut guard = wallet_snap.lock().unwrap();
+                                                    if let Some(w) = guard.as_mut() {
+                                                        w.apply_scan_results(
+                                                            utxos,
+                                                            known_addresses,
+                                                            next_index,
+                                                        );
+                                                    }
+                                                }
+                                                tracing::info!(
+                                                    height,
+                                                    utxos = found,
+                                                    balance_micronoid = balance,
+                                                    "wallet: auto-scan complete after snapshot sync"
+                                                );
+                                            });
+                                        }
+                                        let _ = p2p_cmd
+                                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                                peer: from,
+                                                from_height: new_height + 1,
+                                                count: noid_chain::consensus::params::FINALITY_DEPTH
+                                                    as u16,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(err = ?e, "failed to apply empty snapshot");
+                                        reset_sync_state!();
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             tracing::error!(
-                                from = %from,
-                                tip = snap.snapshot.tip_height,
-                                err = %e,
-                                "REJECTED snapshot: recursive proof verification failed — \
-                                 possible Eclipse attack or fabricated snapshot"
+                                from = %from, tip = snap.manifest.tip_height, err = %e,
+                                "REJECTED manifest: recursive proof verification failed — \
+                                 possible Eclipse attack or fabricated state"
                             );
-                            // Discard the snapshot. The node will try again from the next peer.
+                            reset_sync_state!();
                             continue;
                         }
-                    }
-                }
-
-                // --- Apply the (verified) snapshot ---
-                let snapshot = snap.snapshot;
-                let segments: Vec<(u16, u8, noid_chain::segmented_state::SegmentColumns)> = {
-                    use noid_chain::storage::serial::decode_segment;
-                    snapshot
-                        .segments
-                        .iter()
-                        .filter_map(|e| {
-                            decode_segment(&e.data).map(|(_, cols)| (e.seg_id, e.eff_log, cols))
-                        })
-                        .collect()
-                };
-                tracing::info!(
-                    segments = segments.len(),
-                    tip = snapshot.tip_height,
-                    "snapshot: decoded {} segments, writing to MDBX...",
-                    segments.len()
-                );
-                let nullifier_blocks: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> = snapshot
-                    .nullifier_blocks
-                    .iter()
-                    .map(|hashes| {
-                        hashes
-                            .iter()
-                            .map(|h| noid_poseidon2b::primitives::TxBodyHash(*h))
-                            .collect()
-                    })
-                    .collect();
-
-                let result = {
-                    let mut ctx = chain.write().await;
-                    ctx.apply_state_snapshot(
-                        snapshot.tip_height,
-                        snapshot.tip_hash,
-                        snapshot.log_slots,
-                        snapshot.active_slot_count,
-                        snapshot.alloc_counter,
-                        &segments,
-                        &snapshot.recent_headers,
-                        &nullifier_blocks,
-                    )
-                };
-
-                match result {
-                    Ok(_) => {
-                        let ctx = chain.read().await;
-                        let new_view = ChainView::from_mdbx(&ctx);
-                        let new_height = ctx.tip_height();
-                        drop(ctx);
-                        mempool.on_new_block(&[], new_height, new_view).await;
-                        sync_ready.notify_one();
-                        tracing::info!(
-                            height = new_height,
-                            "snapshot: fully applied and persisted to disk"
-                        );
-                        tracing::info!(
-                            height = new_height,
-                            "chain snapshot applied — mining can begin"
-                        );
-                        // Kick off post-snapshot catch-up.
-                        // We request FINALITY_DEPTH blocks at a time; auto-continue
-                        // (triggered on each applied block) iterates until the peer
-                        // has no more blocks to serve.
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                peer: from,
-                                from_height: new_height + 1,
-                                count: noid_chain::consensus::params::FINALITY_DEPTH as u16,
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::error!(err = ?e, "failed to apply verified state snapshot");
                     }
                 }
             }
@@ -2087,6 +2435,8 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
+                fetch_in_progress.remove(&peer);
+                manifest_requested_peers.remove(&peer);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(n, "P2P event receiver lagged — some events dropped");
@@ -2095,8 +2445,39 @@ async fn handle_p2p_events(
                 tracing::info!("P2P event channel closed");
                 break;
             }
+        } // match rx_item
+        } // rx_result arm
+
+        // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
+        _ = heartbeat.tick() => {
+            // If we have valid candidates and the timeout has elapsed, proceed now.
+            if pending_manifest.is_none() && !manifest_candidates.is_empty() {
+                let timed_out = manifest_first_candidate_at
+                    .map(|t| t.elapsed() > std::time::Duration::from_secs(10))
+                    .unwrap_or(false);
+                if timed_out {
+                    let (best_peer, best_manifest) = manifest_candidates
+                        .drain(..)
+                        .max_by_key(|(_, m)| m.tip_height)
+                        .expect("manifest_candidates is non-empty");
+                    tracing::info!(
+                        from = %best_peer,
+                        tip = best_manifest.tip_height,
+                        "manifest timeout — proceeding with best available candidate"
+                    );
+                    pending_manifest = Some(PendingManifest {
+                        from: best_peer,
+                        manifest: best_manifest,
+                    });
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: best_peer })
+                        .await;
+                }
+            }
         }
-    }
+
+        } // tokio::select!
+    } // loop
 }
 
 // ---------------------------------------------------------------------------

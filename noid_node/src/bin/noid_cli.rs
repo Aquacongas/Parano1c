@@ -227,12 +227,18 @@ enum Command {
     },
 
     // ---- Wallet ---------------------------------------------------------------
-    /// Show your wallet address (default: key index 0).
+    /// Show and manage wallet addresses.
     #[command(alias = "addr")]
     Address {
-        /// Key derivation index (0 = primary).
-        #[arg(default_value_t = 0)]
-        index: u32,
+        /// Derive and return the next fresh address (for a new incoming payment).
+        #[arg(long)]
+        new: bool,
+        /// List all addresses with their balances.
+        #[arg(long)]
+        list: bool,
+        /// Show address at a specific key index.
+        #[arg(long, value_name = "INDEX")]
+        index: Option<u32>,
     },
 
     /// Confirmed wallet balance (NOID and μNOID).
@@ -255,8 +261,10 @@ enum Command {
         /// Recipient address (32-byte hex, 64 characters).
         #[arg(value_name = "ADDRESS")]
         to: String,
-        /// Amount to send in NOID (e.g. 10.5 or 0.000001).
-        #[arg(value_name = "AMOUNT_NOID")]
+        /// Amount in NOID  (1 NOID = 1 000 000 μNOID).
+        /// Examples: "50" = 50 NOID, "0.5" = 500 000 μNOID, "0.000001" = 1 μNOID (minimum).
+        /// Tip: for programmatic use the RPC walletSend accepts raw μNOID directly.
+        #[arg(value_name = "AMOUNT")]
         amount: String,
         /// Transaction fee in NOID. Omit for automatic minimum fee.
         #[arg(long, value_name = "FEE_NOID")]
@@ -265,7 +273,14 @@ enum Command {
 
     /// Transaction history: received and sent transactions.
     #[command(alias = "hist", alias = "txs")]
-    History,
+    History {
+        /// Filter by a specific wallet address (bech32m).
+        #[arg(long, value_name = "ADDRESS")]
+        address: Option<String>,
+        /// Show only the last N entries.
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+    },
 
     /// Rescan chain state to (re)discover owned UTXOs.
     /// Run this if your balance seems wrong or after importing a wallet.
@@ -388,11 +403,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Epoch => cmd_epoch(&ctx).await,
         Command::Mempool => cmd_mempool(&ctx).await,
         Command::MempoolTx { txhash } => cmd_mempool_tx(&ctx, txhash).await,
-        Command::Address { index } => cmd_address(&ctx, *index).await,
+        Command::Address { new, list, index } => cmd_address(&ctx, *new, *list, *index).await,
         Command::Balance => cmd_balance(&ctx).await,
         Command::Utxos => cmd_utxos(&ctx).await,
         Command::Send { to, amount, fee } => cmd_send(&ctx, to, amount, fee.as_deref()).await,
-        Command::History => cmd_history(&ctx).await,
+        Command::History { address, last } => cmd_history(&ctx, address.as_deref(), *last).await,
         Command::Scan => cmd_scan(&ctx).await,
         Command::Consolidate { fee, rounds } => {
             cmd_consolidate(&ctx, fee.as_deref(), *rounds).await
@@ -1132,32 +1147,128 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 // Wallet commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_address(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
-    let result = rpc(ctx, "walletGetAddress", &[index.into()])
-        .await
-        .context("walletGetAddress")?;
-
-    if ctx.json {
-        return print_json(&result);
-    }
-
-    let addr = result.as_str().unwrap_or("?");
-    section(&format!("Wallet address [index={index}]"));
-    // Show full address always (it IS the address — no abbreviation here)
-    if is_tty() {
-        println!("  {}{}{}", BOLD, addr, RST);
+async fn cmd_address(
+    ctx: &Ctx<'_>,
+    new: bool,
+    list: bool,
+    index: Option<u32>,
+) -> anyhow::Result<()> {
+    if list {
+        let result = rpc(ctx, "walletListAddresses", &[])
+            .await
+            .context("walletListAddresses")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let addrs = result.as_array().cloned().unwrap_or_default();
+        section("Wallet addresses");
+        if is_tty() {
+            println!(
+                "  {}  {:>6}  {:>18}  {:>6}  {}{}",
+                BOLD, "index", "NOID", "UTXOs", "address", RST
+            );
+        } else {
+            println!(
+                "  {:>6}  {:>18}  {:>6}  {}",
+                "index", "NOID", "UTXOs", "address"
+            );
+        }
+        separator(72);
+        for a in &addrs {
+            let idx = a["key_index"].as_u64().unwrap_or(0);
+            let noid = a["balance_noid"].as_f64().unwrap_or(0.0);
+            let utxos = a["utxo_count"].as_u64().unwrap_or(0);
+            let addr = a["address"].as_str().unwrap_or("");
+            let marker = if utxos > 0 { "●" } else { "○" };
+            println!(
+                "  {} {:>5}  {:>18.6}  {:>6}  {}",
+                marker,
+                idx,
+                noid,
+                utxos,
+                ctx.h(addr)
+            );
+        }
+        separator(72);
+        let total_noid: f64 = addrs
+            .iter()
+            .map(|a| a["balance_noid"].as_f64().unwrap_or(0.0))
+            .sum();
+        let total_utxos: u64 = addrs
+            .iter()
+            .map(|a| a["utxo_count"].as_u64().unwrap_or(0))
+            .sum();
+        println!(
+            "  Total: {:.6} NOID  ({} UTXOs across {} addresses)",
+            total_noid,
+            total_utxos,
+            addrs.len()
+        );
+        println!();
+        println!(
+            "  {}Tip: use 'noid-cli address --new' to generate a fresh receiving address.{}",
+            c!(DIM, ""),
+            RST
+        );
+    } else if new {
+        let result = rpc(ctx, "walletNextAddress", &[])
+            .await
+            .context("walletNextAddress")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let addr = result["address"].as_str().unwrap_or("");
+        let idx = result["key_index"].as_u64().unwrap_or(0);
+        section(&format!("New receiving address [index={idx}]"));
+        if is_tty() {
+            println!("  {}{}{}", BOLD, addr, RST);
+        } else {
+            println!("  {}", addr);
+        }
+        println!();
+        println!(
+            "  {} Share this address to receive NOID. Each payment should use a fresh address.",
+            c!(DIM, "↑")
+        );
+    } else if let Some(idx) = index {
+        let result = rpc(ctx, "walletGetAddress", &[serde_json::json!(idx)])
+            .await
+            .context("walletGetAddress")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let addr = result.as_str().unwrap_or("?");
+        section(&format!("Wallet address [index={idx}]"));
+        if is_tty() {
+            println!("  {}{}{}", BOLD, addr, RST);
+        } else {
+            println!("  {}", addr);
+        }
     } else {
-        println!("  {addr}");
-    }
-
-    if index == 0 {
+        // default: primary address (index 0)
+        let result = rpc(ctx, "walletGetAddress", &[serde_json::json!(0u32)])
+            .await
+            .context("walletGetAddress")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let addr = result.as_str().unwrap_or("?");
+        section("Wallet address [index=0]");
+        if is_tty() {
+            println!("  {}{}{}", BOLD, addr, RST);
+        } else {
+            println!("  {}", addr);
+        }
         println!();
         println!(
             "  {} This is your primary receiving address. Share it to receive NOID.",
             c!(DIM, "↑")
         );
+        println!(
+            "  {}Tip: use 'address --new' for a fresh address, 'address --list' to see all.{}",
+            DIM, RST
+        );
     }
-
     Ok(())
 }
 
@@ -1172,11 +1283,15 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     let micro = result["total_micronoid"].as_u64().unwrap_or(0);
     let utxos = result["utxo_count"].as_u64().unwrap_or(0);
+    let pending_out = result["pending_outbound_micronoid"].as_u64().unwrap_or(0);
+    let spendable_noid = result["spendable_noid"]
+        .as_f64()
+        .unwrap_or(micro as f64 / MICRO_PER_NOID);
 
     section("Wallet balance");
     if is_tty() {
         println!(
-            "  {}Balance:{} {}{} NOID{} {}({} μNOID){}",
+            "  {}Balance:{} {}{} NOID{} {}({} \u{03bc}NOID){}  {}({} UTXOs){}",
             CYN,
             RST,
             BOLD,
@@ -1184,15 +1299,41 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             RST,
             DIM,
             micro,
+            RST,
+            DIM,
+            utxos,
             RST
         );
     } else {
         println!(
-            "  Balance:           {} NOID  ({micro} μNOID)",
+            "  Balance:           {} NOID  ({micro} \u{03bc}NOID)  ({utxos} UTXOs)",
             noid_str(micro)
         );
     }
-    kv("UTXOs", &utxos.to_string());
+
+    if pending_out > 0 {
+        if is_tty() {
+            println!(
+                "  {}Pending:{}  -{} NOID outbound  {}({} \u{03bc}NOID locked){}",
+                YLW,
+                RST,
+                noid_str(pending_out),
+                DIM,
+                pending_out,
+                RST
+            );
+            println!(
+                "  {}Spendable:{} {}{:.6} NOID{}",
+                CYN, RST, BOLD, spendable_noid, RST
+            );
+        } else {
+            println!(
+                "  Pending:           -{} NOID outbound ({pending_out} \u{03bc}NOID locked)",
+                noid_str(pending_out)
+            );
+            println!("  Spendable:         {:.6} NOID", spendable_noid);
+        }
+    }
 
     if micro == 0 && utxos == 0 {
         println!();
@@ -1280,6 +1421,18 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
 
     if amount_micro == 0 {
         bail!("Amount cannot be zero.");
+    }
+
+    // Warn if the amount looks suspiciously large (> 1 000 000 NOID = 1e12 μNOID).
+    // This catches the common mistake of passing μNOID to a NOID-denomination CLI.
+    const MAX_WARN_MICRO: u64 = 1_000_000 * 1_000_000; // 1M NOID in μNOID
+    if amount_micro > MAX_WARN_MICRO {
+        eprintln!(
+            "⚠  Large amount: {:.6} NOID ({} μNOID). \
+             Note: this CLI takes NOID, not μNOID. Press Ctrl-C to cancel.",
+            amount_micro as f64 / 1_000_000.0,
+            amount_micro
+        );
     }
 
     let fee_micro = match fee {
@@ -1391,7 +1544,11 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
     Ok(())
 }
 
-async fn cmd_history(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+async fn cmd_history(
+    ctx: &Ctx<'_>,
+    address_filter: Option<&str>,
+    last: Option<usize>,
+) -> anyhow::Result<()> {
     let result = rpc(ctx, "walletHistory", &[])
         .await
         .context("walletHistory")?;
@@ -1402,41 +1559,67 @@ async fn cmd_history(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     let entries = result.as_array().cloned().unwrap_or_default();
 
+    // Apply address filter
+    let mut filtered: Vec<&Value> = entries
+        .iter()
+        .filter(|e| {
+            if let Some(filter) = address_filter {
+                e["own_address"]
+                    .as_str()
+                    .map(|a| a == filter)
+                    .unwrap_or(false)
+                    || e["peer_address"]
+                        .as_str()
+                        .map(|a| a == filter)
+                        .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // Apply --last N limit
+    if let Some(n) = last {
+        let len = filtered.len();
+        if len > n {
+            filtered = filtered[len - n..].to_vec();
+        }
+    }
+
     section("Transaction history");
 
-    if entries.is_empty() {
+    if filtered.is_empty() {
         println!("  {}", c!(DIM, "(no transactions yet)"));
         return Ok(());
     }
 
-    separator(80);
+    separator(88);
     if is_tty() {
         println!(
-            "  {}  {:<7}  {:<8}  {:>14}  {:<20}{}",
-            BOLD, "#", "block", "NOID", "tx hash", RST
+            "  {}  {:<8}  {:<8}  {:>14}  {:<16}  {}{}",
+            BOLD, "block", "dir", "NOID", "own[idx]", "counterparty", RST
         );
     } else {
         println!(
-            "  {:<7}  {:<8}  {:>14}  {:<20}",
-            "#", "block", "NOID", "tx hash"
+            "  {:<8}  {:<8}  {:>14}  {:<16}  {}",
+            "block", "dir", "NOID", "own[idx]", "counterparty"
         );
     }
-    separator(80);
+    separator(88);
 
     // Compute totals
     let mut sent: u64 = 0;
     let mut received: u64 = 0;
 
-    for (i, e) in entries.iter().enumerate() {
+    for e in &filtered {
         let height = e["height"].as_u64().unwrap_or(0);
         let dir = e["direction"].as_str().unwrap_or("?");
         let micro = e["amount_micronoid"].as_u64().unwrap_or(0);
-        let tx_hash = e["tx_hash"].as_str().unwrap_or("?");
 
-        let (sign, colour) = if dir == "received" {
-            ("+ ", GRN)
+        let (sign, arrow, colour) = if dir == "received" || dir == "recv" {
+            ("+", "\u{2190} recv", GRN)
         } else {
-            ("- ", RED)
+            ("-", "\u{2192} sent", RED)
         };
 
         if dir == "sent" {
@@ -1445,40 +1628,47 @@ async fn cmd_history(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             received += micro;
         }
 
-        let amount_str = format!("{}{} NOID", sign, noid_str(micro));
+        let own = e["own_address"].as_str().unwrap_or("");
+        let own_idx = e["own_key_index"].as_u64();
+        let own_display = if let Some(idx) = own_idx {
+            let truncated = &own[..own.len().min(10)];
+            format!("[{}]{}", idx, truncated)
+        } else {
+            String::new()
+        };
+        let peer = e["peer_address"].as_str().unwrap_or("\u{2014}");
+        let amount_str = format!("{:>14.6}{}", micro as f64 / MICRO_PER_NOID, sign);
 
         if is_tty() {
             println!(
-                "  {:<7}  {:<8}  {}{:>14}{}  {:<20}",
-                format!("#{}", i + 1),
+                "  {:>8}  {:<8}  {}{}{}  {:<16}  {}",
                 height,
+                arrow,
                 colour,
                 amount_str,
                 RST,
-                ctx.h(tx_hash)
+                own_display,
+                ctx.h(peer)
             );
         } else {
             println!(
-                "  {:<7}  {:<8}  {:>14}  {:<20}",
-                format!("#{}", i + 1),
-                height,
-                amount_str,
-                ctx.h(tx_hash)
+                "  {:>8}  {:<8}  {}  {:<16}  {}",
+                height, arrow, amount_str, own_display, peer
             );
         }
     }
 
-    separator(80);
+    separator(88);
     if is_tty() {
         println!(
-            "  {}  {:<7}  {:<8}  {}{}  {}{}{}",
+            "  {}  {:<8}  {:<8}  {}{}  {}{}{}",
             BOLD,
             "",
             "",
             GRN,
             format!("+ {} NOID received", noid_str(received)),
             RED,
-            format!("- {} NOID sent", noid_str(sent)),
+            format!("  - {} NOID sent", noid_str(sent)),
             RST
         );
     } else {
@@ -1494,7 +1684,7 @@ async fn cmd_history(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
 async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
-        eprint!("  Scanning chain state for your UTXOs");
+        eprint!("  Scanning chain state for your UTXOs...");
         io::stderr().flush()?;
     }
 
@@ -1509,15 +1699,30 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     let found = result["found_utxos"].as_u64().unwrap_or(0);
-    let micro = result["balance_micronoid"].as_u64().unwrap_or(0);
+    let balance_noid = result["balance_noid"].as_f64().unwrap_or_else(|| {
+        result["balance_micronoid"].as_u64().unwrap_or(0) as f64 / MICRO_PER_NOID
+    });
+    let scanned = result["addresses_scanned"].as_u64().unwrap_or(0);
+    let next_idx = result["next_index"].as_u64().unwrap_or(0);
 
     section("Wallet scan complete");
-    ok_msg(&format!("Found {found} UTXO(s)"));
-    kv2(
-        "Balance",
-        &format!("{} NOID", noid_str(micro)),
-        &format!("({micro} μNOID)"),
-    );
+    if scanned > 0 {
+        println!(
+            "  Scanned {} addresses  \u{2022}  Found {} UTXO(s)  \u{2022}  Balance: {:.6} NOID",
+            scanned, found, balance_noid
+        );
+    } else {
+        println!(
+            "  Found {} UTXO(s)  \u{2022}  Balance: {:.6} NOID",
+            found, balance_noid
+        );
+    }
+    if next_idx > 0 {
+        println!(
+            "  Next available address: index {} (use 'address --new' to generate)",
+            next_idx
+        );
+    }
 
     if found == 0 {
         println!();

@@ -9,7 +9,8 @@
 use noid_chain::segmented_state::SegmentedFriState;
 
 use crate::types::{
-    WalletBalance, WalletHistoryEntry, WalletScanResult, WalletStatus, WalletUtxoInfo,
+    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletStatus,
+    WalletUtxoInfo,
 };
 
 pub trait WalletOps: Send + Sync {
@@ -69,8 +70,12 @@ pub trait WalletOps: Send + Sync {
     /// Selects the smallest UTXOs (up to `MAX_INPUTS=4`) and sends their
     /// combined value minus fee to the wallet's own primary address.
     ///
-    /// Returns raw `TxIntent` bytes on success, or an error string if there
-    /// is nothing to consolidate (e.g. only 1 UTXO, or insufficient funds).
+    /// Returns `(intent_bytes, input_slot_indices)` on success, or an error
+    /// string if there is nothing to consolidate (e.g. only 1 UTXO, or
+    /// insufficient funds).  The caller is responsible for calling
+    /// `add_pending_inputs` with the returned slot indices **only after**
+    /// the transaction is successfully submitted to the mempool, so that a
+    /// failed submit does not permanently lock those UTXOs.
     ///
     /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
     fn build_consolidate(
@@ -79,5 +84,23 @@ pub trait WalletOps: Send + Sync {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<(Vec<u8>, Vec<u32>), String>;
+
+    /// Mark input slot indices as pending (spent by a submitted but
+    /// unconfirmed tx).  Prevents subsequent consolidation or send rounds
+    /// from double-spending the same UTXOs before the first TX is confirmed.
+    ///
+    /// For `build_consolidate` this must be called by the RPC layer only
+    /// after a successful `mempool.submit`.
+    fn add_pending_inputs(&self, slots: &[u32]);
+
+    /// Derive and return the next unused address, advancing next_index.
+    fn next_address(&self) -> Option<WalletAddressInfo>;
+
+    /// List all addresses that have been used (have UTXOs or history),
+    /// plus the next_index address if it's fresh.
+    fn list_addresses(&self) -> Vec<WalletAddressInfo>;
+
+    /// Sum of values of UTXOs currently being spent by pending txs.
+    fn pending_outbound(&self) -> u64;
 }

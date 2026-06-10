@@ -43,6 +43,10 @@ pub struct TxHistoryEntry {
     pub peer_address: Option<[u8; 32]>,
     /// Block timestamp (Unix seconds).
     pub timestamp: u64,
+    /// Which of our addresses was involved in this tx.
+    pub own_address: Option<String>,
+    /// Key index of that address.
+    pub own_key_index: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,8 @@ impl WalletState {
             amount_micronoid,
             peer_address: Some(to_address),
             timestamp: now,
+            own_address: None,
+            own_key_index: None,
         });
     }
 

@@ -12,7 +12,12 @@ libp2p       = { version = "0.54", features = [
     "tokio", "tcp", "noise", "yamux", "dns",
     "gossipsub", "request-response", "cbor", "identify",
     "ping", "macros", "kad", "mdns",
+    # NAT traversal
+    "autonat",   # detect NAT status
+    "relay",     # circuit relay v2 (client + server modes)
+    "dcutr",     # direct connection upgrade through relay (hole punching)
 ] }
+libp2p-connection-limits = "0.4"
 bincode  = "1"
 blake3   = "1"
 futures  = "0.3"

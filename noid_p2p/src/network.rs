@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, kad, mdns, request_response, swarm::SwarmEvent, Multiaddr, PeerId,
+    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
+    Multiaddr, PeerId,
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -22,20 +23,23 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::protocol::{
-    BlockGossipMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
-    NetworkTopics, RecursiveProofGossipMsg,
+    CompactBlockMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
+    GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics, RecursiveProofGossipMsg,
 };
 
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
-    /// Broadcast a new block (with optional ZK proof) to all peers.
+    /// Announce a new block to all peers (compact: header only, ~310 bytes).
     ///
-    /// `block_proof_bytes` is the bincode-serialised `BlockProof`. Pass an
-    /// empty `Vec` for coinbase-only blocks that have no user transactions.
-    BroadcastBlock {
-        block_bytes: Vec<u8>,
-        block_proof_bytes: Vec<u8>,
+    /// Peers that need the block pull it via `GetRecentBlockRequest`.
+    /// This replaces broadcasting the full block (~19 MB for 1024-tx blocks)
+    /// over gossipsub, which is architecturally unsound at any network size.
+    AnnounceBlock {
+        height: u64,
+        hash: [u8; 32],
+        /// Wire-encoded BlockHeader (276 bytes).
+        header_bytes: Vec<u8>,
     },
     /// Broadcast a new recursive proof update to all peers.
     BroadcastRecursiveProof {
@@ -71,11 +75,16 @@ pub enum NetworkCommand {
         start_height: u64,
         count: u16, // max 512
     },
-    /// Request a full state snapshot from a peer.
-    /// Paranoid's primary initial-sync mechanism: new nodes download the
-    /// CURRENT STATE (not block history which is not stored).
-    /// Emits `NetworkEvent::StateSnapshot` when the response arrives.
-    RequestStateSnapshot { peer: PeerId },
+    /// Request the state manifest from a peer (step 1 of snapshot sync).
+    /// Returns metadata + active segment IDs.  Emits `NetworkEvent::StateManifest`.
+    RequestStateManifest { peer: PeerId },
+    /// Request a single state segment from a peer (step 2, one per segment).
+    /// Emits `NetworkEvent::StateSegment`.
+    RequestStateSegment {
+        peer: PeerId,
+        segment_id: u16,
+        expected_tip_height: u64,
+    },
     /// Request the latest recursive chain proof from a peer.
     /// Used to cryptographically verify a state snapshot before applying it.
     /// Emits `NetworkEvent::RecursiveProof` when the response arrives.
@@ -85,11 +94,22 @@ pub enum NetworkCommand {
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// A new block arrived from a peer.
+    /// A compact block announcement arrived from a peer.
+    ///
+    /// Contains only the header; the full block must be pulled via
+    /// `NetworkCommand::SyncBlocksFrom` or `RequestBlock`.
+    NewBlockAnnouncement {
+        from: PeerId,
+        height: u64,
+        hash: [u8; 32],
+        /// Wire-encoded BlockHeader (276 bytes).
+        header_bytes: Vec<u8>,
+    },
+    /// A full block + proof arrived (response to a pull request).
     NewBlock {
         from: PeerId,
         block_bytes: Vec<u8>,
-        /// `BlockProof` bincode bytes. Empty for coinbase-only blocks.
+        /// `BlockProof` bincode bytes.  Empty Vec for coinbase-only blocks.
         block_proof_bytes: Vec<u8>,
     },
     /// A recursive proof update arrived from a peer.
@@ -107,10 +127,15 @@ pub enum NetworkEvent {
         from: PeerId,
         headers: Vec<noid_chain::block_header::BlockHeader>,
     },
-    /// Full state snapshot received from a peer (response to RequestStateSnapshot).
-    StateSnapshot {
+    /// State manifest received from a peer (step 1 of snapshot sync).
+    StateManifest {
         from: PeerId,
-        snapshot: Box<crate::protocol::GetStateSnapshotResponse>,
+        manifest: Box<crate::protocol::GetStateManifestResponse>,
+    },
+    /// One state segment received from a peer (step 2).
+    StateSegment {
+        from: PeerId,
+        response: crate::protocol::GetStateSegmentResponse,
     },
     /// Recursive chain proof received from a peer (response to RequestRecursiveProof).
     /// Contains serialized `RecursiveBlockProof` bytes and the peer's tip header bytes.
@@ -147,14 +172,23 @@ impl P2PNetwork {
         chain: Arc<RwLock<MdbxChainContext>>,
         mempool: AsyncMempool,
         topics: NetworkTopics,
+        data_dir: std::path::PathBuf,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
 
         let event_tx_clone = event_tx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                run_swarm(listen_addr, cmd_rx, event_tx_clone, chain, mempool, topics).await
+            if let Err(e) = run_swarm(
+                listen_addr,
+                cmd_rx,
+                event_tx_clone,
+                chain,
+                mempool,
+                topics,
+                data_dir,
+            )
+            .await
             {
                 tracing::error!("P2P network error: {e}");
             }
@@ -167,12 +201,14 @@ impl P2PNetwork {
         self.event_tx.subscribe()
     }
 
-    pub async fn broadcast_block(&self, block_bytes: Vec<u8>, block_proof_bytes: Vec<u8>) {
+    /// Announce a new block to all peers (sends compact header only, ~310 bytes).
+    pub async fn announce_block(&self, height: u64, hash: [u8; 32], header_bytes: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::BroadcastBlock {
-                block_bytes,
-                block_proof_bytes,
+            .send(NetworkCommand::AnnounceBlock {
+                height,
+                hash,
+                header_bytes,
             })
             .await;
     }
@@ -223,11 +259,28 @@ impl P2PNetwork {
             .await;
     }
 
-    /// Request a full state snapshot from a peer (initial sync).
-    pub async fn request_state_snapshot(&self, peer: PeerId) {
+    /// Request the state manifest from a peer (step 1 of snapshot sync).
+    pub async fn request_state_manifest(&self, peer: PeerId) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestStateSnapshot { peer })
+            .send(NetworkCommand::RequestStateManifest { peer })
+            .await;
+    }
+
+    /// Request a single state segment from a peer (step 2).
+    pub async fn request_state_segment(
+        &self,
+        peer: PeerId,
+        segment_id: u16,
+        expected_tip_height: u64,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCommand::RequestStateSegment {
+                peer,
+                segment_id,
+                expected_tip_height,
+            })
             .await;
     }
 
@@ -268,6 +321,7 @@ async fn run_swarm(
     chain: Arc<RwLock<MdbxChainContext>>,
     _mempool: AsyncMempool,
     topics: NetworkTopics,
+    data_dir: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
@@ -280,19 +334,13 @@ async fn run_swarm(
             yamux::Config::default,
         )?
         .with_dns()?
-        .with_behaviour(move |key| NodeBehaviour::new(key, &protocol_id))?
+        // Relay client transport: enables dialling and listening through relay
+        // nodes.  The relay::client::Behaviour is wired here by the builder
+        // and passed into NodeBehaviour::new() via the closure below.
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| NodeBehaviour::new(key, &protocol_id, relay_client))?
         .with_swarm_config(|cfg| {
-            cfg
-                // Keep connections alive for 5 minutes — essential for
-                // blockchain peers that have infrequent block intervals.
-                .with_idle_connection_timeout(std::time::Duration::from_secs(300))
-                // Hard cap on total connections.  Prevents resource exhaustion
-                // from connection floods on large networks.
-                // 128 inbound + 64 outbound = 192 max total.
-                // Substrate uses 100 in/25 out; Ethereum clients use 50/25.
-                // We set higher defaults since Paranoid is a full-ZK node
-                // and peers actively push block proofs to each other.
-                .with_max_negotiating_inbound_streams(128)
+            cfg.with_idle_connection_timeout(std::time::Duration::from_secs(300))
         })
         .build();
 
@@ -314,9 +362,42 @@ async fn run_swarm(
     // routing table (populated when seeds connect and identify fires).
     // The bootstrap is a no-op if the routing table is empty; it will be
     // re-triggered automatically when the first peer is added via identify.
+    // Load persisted peers and add to Kademlia routing table.
+    // This makes cold restarts resilient when DNS seeds are temporarily down.
+    let cached_peers = crate::peer_store::load(&data_dir);
+    if !cached_peers.is_empty() {
+        tracing::debug!(
+            count = cached_peers.len(),
+            "peer store: seeding Kademlia from cache"
+        );
+        for (peer_id, addrs) in &cached_peers {
+            for addr in addrs {
+                swarm.behaviour_mut().kad.add_address(peer_id, addr.clone());
+            }
+        }
+    }
+
     if let Err(e) = swarm.behaviour_mut().kad.bootstrap() {
         tracing::debug!("kad bootstrap deferred (no peers yet): {e}");
     }
+
+    // Reconnect list: peers whose addresses we know, to re-dial after disconnect.
+    // Maps PeerId -> (Multiaddr, next_retry_at, retry_count).
+    // Uses exponential backoff: 10s, 20s, 40s, 80s ... capped at 10 minutes.
+    let mut reconnect: std::collections::HashMap<
+        libp2p::PeerId,
+        (Multiaddr, tokio::time::Instant, u32),
+    > = std::collections::HashMap::new();
+
+    // Reconnect timer: poll the reconnect list every 5 seconds.
+    let mut reconnect_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    reconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    reconnect_timer.tick().await; // skip first immediate tick
+
+    // Peer store save timer: persist routing table every 5 minutes.
+    let mut peer_store_timer = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+    peer_store_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    peer_store_timer.tick().await; // skip first immediate tick
 
     // Periodic Kademlia random walk timer.
     //
@@ -339,7 +420,7 @@ async fn run_swarm(
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &topics).await;
+                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &topics, &mut reconnect).await;
             }
 
             // Commands from the node (when no swarm event pending).
@@ -352,10 +433,71 @@ async fn run_swarm(
 
             // Periodic Kademlia random walk for topology health.
             _ = kad_walk_interval.tick() => {
-                // Random PeerId as target to explore different parts of the DHT.
                 let random_peer = libp2p::PeerId::random();
                 swarm.behaviour_mut().kad.get_closest_peers(random_peer);
                 tracing::debug!("kad: periodic random walk");
+            }
+
+            // Peer store: persist routing table for cold-restart resilience.
+            _ = peer_store_timer.tick() => {
+                // Collect addresses from Kademlia routing table.
+                // We iterate kbuckets and collect all known (peer, addrs) pairs.
+                let peers: Vec<(PeerId, Vec<Multiaddr>)> = swarm
+                    .behaviour_mut()
+                    .kad
+                    .kbuckets()
+                    .flat_map(|bucket| {
+                        bucket.iter().map(|entry| {
+                            let peer_id = *entry.node.key.preimage();
+                            let addrs: Vec<Multiaddr> = entry.node.value.iter().cloned().collect();
+                            (peer_id, addrs)
+                        }).collect::<Vec<_>>()
+                    })
+                    .filter(|(_, addrs)| !addrs.is_empty())
+                    .collect();
+                let data_dir = data_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::peer_store::save(&data_dir, &peers);
+                });
+            }
+
+            // Reconnect: re-dial known peers after disconnect with backoff.
+            _ = reconnect_timer.tick() => {
+                let now = tokio::time::Instant::now();
+                let to_dial: Vec<_> = reconnect
+                    .iter()
+                    .filter(|(peer, (_, retry_at, _))| {
+                        now >= *retry_at
+                            && !swarm.is_connected(peer)
+                    })
+                    .map(|(peer, (addr, _, count))| (*peer, addr.clone(), *count))
+                    .collect();
+                // Max reconnect attempts before giving up.
+                // Prevents unbounded map growth for permanently-offline peers.
+                const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+                for (peer, addr, count) in to_dial {
+                    if count >= MAX_RECONNECT_ATTEMPTS {
+                        tracing::debug!(
+                            peer = %peer,
+                            attempts = count,
+                            "reconnect: giving up after max attempts"
+                        );
+                        reconnect.remove(&peer);
+                        continue;
+                    }
+                    tracing::debug!(peer = %peer, attempt = count + 1, "reconnecting");
+                    if let Err(e) = swarm.dial(addr.clone()) {
+                        tracing::debug!(peer = %peer, err = %e, "reconnect dial failed");
+                    }
+                    // Exponential backoff: 10s * 2^count, capped at 10min.
+                    let delay_secs = (10u64 * (1u64 << count.min(6))).min(600);
+                    let next_retry = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(delay_secs);
+                    reconnect.insert(peer, (addr, next_retry, count + 1));
+                }
+                // Remove peers that are now connected (reconnect succeeded).
+                reconnect.retain(|peer, _| !swarm.is_connected(peer));
             }
         }
     }
@@ -370,24 +512,28 @@ fn handle_network_command(
     topics: &NetworkTopics,
 ) {
     match cmd {
-        NetworkCommand::BroadcastBlock {
-            block_bytes,
-            block_proof_bytes,
+        NetworkCommand::AnnounceBlock {
+            height,
+            hash,
+            header_bytes,
         } => {
-            let msg = BlockGossipMsg {
-                block_bytes,
-                block_proof_bytes,
+            let msg = CompactBlockMsg {
+                height,
+                hash,
+                header_bytes,
             };
             match bincode::serialize(&msg) {
                 Ok(encoded) => {
                     let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
-                        tracing::debug!(
-                            "gossipsub: {e} (block delivered via direct peer connections)"
-                        );
+                        // InsufficientPeers is normal at startup with 2-3 peers.
+                        // With flood_publish=false the mesh must form before messages
+                        // propagate.  The compact announcement is ~310 bytes so
+                        // MessageTooLarge should never occur.
+                        tracing::debug!(height, err = %e, "gossipsub: block announcement");
                     }
                 }
-                Err(e) => tracing::error!("BlockGossipMsg serialize: {e}"),
+                Err(e) => tracing::error!("CompactBlockMsg serialize: {e}"),
             }
         }
         NetworkCommand::BroadcastRecursiveProof {
@@ -447,14 +593,28 @@ fn handle_network_command(
                 .block_sync
                 .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
         }
-        NetworkCommand::RequestStateSnapshot { peer } => {
-            let _ = swarm.behaviour_mut().snapshot_sync.send_request(
+        NetworkCommand::RequestStateManifest { peer } => {
+            let _ = swarm.behaviour_mut().state_manifest_sync.send_request(
                 &peer,
-                crate::protocol::GetStateSnapshotRequest {
+                crate::protocol::GetStateManifestRequest {
                     requester_height: 0,
                 },
             );
-            tracing::debug!(peer = %peer, "requesting state snapshot");
+            tracing::debug!(peer = %peer, "requesting state manifest");
+        }
+        NetworkCommand::RequestStateSegment {
+            peer,
+            segment_id,
+            expected_tip_height,
+        } => {
+            let _ = swarm.behaviour_mut().state_segment_sync.send_request(
+                &peer,
+                crate::protocol::GetStateSegmentRequest {
+                    segment_id,
+                    expected_tip_height,
+                },
+            );
+            tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
         NetworkCommand::RequestRecursiveProof { peer } => {
             let _ = swarm
@@ -480,12 +640,17 @@ fn handle_network_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     event: SwarmEvent<NodeBehaviourEvent>,
     event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
     chain: &Arc<RwLock<MdbxChainContext>>,
     topics: &NetworkTopics,
+    reconnect: &mut std::collections::HashMap<
+        libp2p::PeerId,
+        (Multiaddr, tokio::time::Instant, u32),
+    >,
 ) {
     match event {
         // --- GossipSub: received broadcast ---
@@ -496,19 +661,23 @@ async fn handle_swarm_event(
         })) => {
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
-                match bincode::deserialize::<crate::protocol::BlockGossipMsg>(&message.data) {
+                // Compact block announcement: header only (~310 bytes).
+                // The receiver pulls the full block + proof via block_sync
+                // if it needs the block (height > local tip).
+                match bincode::deserialize::<CompactBlockMsg>(&message.data) {
                     Ok(msg) => {
-                        let _ = event_tx.send(NetworkEvent::NewBlock {
+                        let _ = event_tx.send(NetworkEvent::NewBlockAnnouncement {
                             from: propagation_source,
-                            block_bytes: msg.block_bytes,
-                            block_proof_bytes: msg.block_proof_bytes,
+                            height: msg.height,
+                            hash: msg.hash,
+                            header_bytes: msg.header_bytes,
                         });
                     }
                     Err(e) => {
                         tracing::debug!(
                             peer = %propagation_source,
                             err = %e,
-                            "block gossip deserialize failed, dropping"
+                            "compact block announcement deserialize failed"
                         );
                     }
                 }
@@ -627,6 +796,62 @@ async fn handle_swarm_event(
             _ => {}
         },
 
+        // --- AutoNAT: log reachability status ---
+        //
+        // Operators need to know if their node is publicly reachable.
+        // If private: advise configuring port forwarding or using a relay.
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Autonat(autonat::Event::StatusChanged {
+            old,
+            new,
+        })) => match &new {
+            autonat::NatStatus::Public(addr) => {
+                tracing::info!(addr = %addr, "autonat: node is publicly reachable");
+            }
+            autonat::NatStatus::Private => {
+                tracing::warn!(
+                    prev = ?old,
+                    "autonat: node is behind NAT — inbound connections will \
+                     use relay; consider port forwarding tcp/9400 for better connectivity"
+                );
+            }
+            autonat::NatStatus::Unknown => {
+                tracing::debug!(prev = ?old, "autonat: NAT status unknown (probing)");
+            }
+        },
+
+        // --- Relay client: reservation / circuit events ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::RelayClient(ev)) => match ev {
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+                tracing::info!(relay = %relay_peer_id, "relay: reservation accepted — reachable via circuit");
+            }
+            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+                tracing::debug!(relay = %relay_peer_id, "relay: outbound circuit established");
+            }
+            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+                tracing::debug!(peer = %src_peer_id, "relay: inbound circuit from peer");
+            }
+        },
+
+        // --- DCUtR: direct connection upgrade through relay ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::Dcutr(dcutr::Event {
+            remote_peer_id,
+            result,
+        })) => match result {
+            Ok(_conn_id) => {
+                tracing::debug!(
+                    peer = %remote_peer_id,
+                    "dcutr: hole punch succeeded — direct connection established"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer = %remote_peer_id,
+                    err = %e,
+                    "dcutr: hole punch failed — relay connection kept"
+                );
+            }
+        },
+
         // --- Request-Response: headers client side (response to our FetchHeaders) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
             request_response::Event::Message {
@@ -675,7 +900,7 @@ async fn handle_swarm_event(
                 .send_response(channel, GetHeadersResponse { headers });
         }
 
-        // --- Request-Response: recent block (client side — response to our sync request) ---
+        // --- Block pull: client received block + proof ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::BlockSync(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
@@ -683,19 +908,22 @@ async fn handle_swarm_event(
             },
         )) => {
             if let Some(block_bytes) = response.block_bytes {
-                tracing::debug!(peer = %peer, "received block via sync");
-                // Request-response sync does not carry proof bytes;
-                // the block will be applied consensus-only and the
-                // RecursiveProofUpdate arrives separately via gossip.
+                tracing::debug!(peer = %peer, "received block via pull");
+                // Include proof bytes if the peer served them.
+                // Empty vec for coinbase-only blocks (correct, matches node expectations).
+                let block_proof_bytes = response.block_proof_bytes.unwrap_or_default();
                 let _ = event_tx.send(NetworkEvent::NewBlock {
                     from: peer,
                     block_bytes,
-                    block_proof_bytes: vec![],
+                    block_proof_bytes,
                 });
             }
         }
 
-        // --- Request-Response: recent block (server side — peer requests a block from us) ---
+        // --- Block pull: server side — serve block + proof to requesting peer ---
+        //
+        // Only last FINALITY_DEPTH blocks are available; pruned blocks return None.
+        // Peers that request pruned blocks must do a full state sync instead.
         SwarmEvent::Behaviour(NodeBehaviourEvent::BlockSync(
             request_response::Event::Message {
                 message:
@@ -707,11 +935,18 @@ async fn handle_swarm_event(
         )) => {
             let ctx = chain.read().await;
             let block_bytes = ctx.store.get_recent_block(request.height).ok().flatten();
+            // Also load the block proof if we have it.
+            // Proofs are stored temporarily (last FINALITY_DEPTH blocks) for the
+            // recursive prover and for serving to syncing peers.
+            let block_proof_bytes = ctx.store.get_block_proof(request.height).ok().flatten();
             drop(ctx);
-            let _ = swarm
-                .behaviour_mut()
-                .block_sync
-                .send_response(channel, GetRecentBlockResponse { block_bytes });
+            let _ = swarm.behaviour_mut().block_sync.send_response(
+                channel,
+                GetRecentBlockResponse {
+                    block_bytes,
+                    block_proof_bytes,
+                },
+            );
         }
 
         // --- Request-Response: recursive proof ---
@@ -759,8 +994,11 @@ async fn handle_swarm_event(
             });
         }
 
-        // --- State snapshot: server side (peer requests full state from us) ---
-        SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotSync(
+        // --- State sync: manifest server (step 1) ---
+        //
+        // Serves metadata + active segment IDs.  Tiny response (~few KB).
+        // Client uses this to know which segments to request next.
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message:
                     request_response::Message::Request {
@@ -769,141 +1007,225 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            use crate::protocol::{GetStateSnapshotResponse, StateSegmentEntry};
             use noid_chain::consensus::params::ANCHOR_DEPTH;
-            use noid_chain::storage::serial::encode_segment;
-
-            // Snapshot needs mutable access for segment_columns (lazy materialization)
-            let mut ctx = chain.write().await;
-            let tip_h = ctx.tip_height();
-
-            // Only serve if we have state to give
-            if tip_h == 0 || tip_h <= request.requester_height {
-                drop(ctx);
-                let _ = swarm
-                    .behaviour_mut()
-                    .snapshot_sync
-                    .send_response(channel, GetStateSnapshotResponse::default());
-                return;
-            }
-
-            tracing::info!(
-                requester_height = request.requester_height,
-                our_height = tip_h,
-                "serving state snapshot"
-            );
-
-            // Collect active state segments
-            let eff_log = ctx.state.state.effective_log_segment_size() as u8;
-            let seg_ids: Vec<u16> = ctx.state.state.active_segment_ids().collect();
-            let mut segments = Vec::new();
-            for seg_id in seg_ids {
-                let cols = ctx.state.state.segment_columns(seg_id).clone();
-                let data = encode_segment(&cols, eff_log);
-                segments.push(StateSegmentEntry {
-                    seg_id,
-                    eff_log,
-                    data,
-                });
-            }
-
-            // Collect recent headers (last 155 blocks)
-            let header_start = tip_h.saturating_sub(154);
-            let mut recent_headers = Vec::new();
-            for h in header_start..=tip_h {
-                let hdr_opt = ctx
-                    .recent_headers
-                    .get(&h)
-                    .cloned()
-                    .or_else(|| ctx.get_header_from_store(h).ok().flatten());
-                if let Some(hdr) = hdr_opt {
-                    let mut buf = Vec::new();
-                    hdr.encode(&mut buf);
-                    recent_headers.push(buf);
+            let manifest = {
+                let mut ctx = chain.write().await;
+                let tip_h = ctx.tip_height();
+                if tip_h == 0 || tip_h <= request.requester_height {
+                    GetStateManifestResponse::default()
+                } else {
+                    let eff_log = ctx.state.state.effective_log_segment_size() as u8;
+                    let segment_ids: Vec<u16> = ctx.state.state.active_segment_ids().collect();
+                    let header_start = tip_h.saturating_sub(154);
+                    let recent_headers = (header_start..=tip_h)
+                        .filter_map(|h| {
+                            ctx.recent_headers
+                                .get(&h)
+                                .cloned()
+                                .or_else(|| ctx.get_header_from_store(h).ok().flatten())
+                        })
+                        .map(|hdr| {
+                            let mut b = Vec::new();
+                            hdr.encode(&mut b);
+                            b
+                        })
+                        .collect();
+                    let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
+                    let nullifier_blocks = (null_start..=tip_h)
+                        .map(|h| {
+                            ctx.store
+                                .get_undo_log(h)
+                                .ok()
+                                .flatten()
+                                .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let tip_hdr = ctx.tip_header().clone();
+                    tracing::info!(
+                        requester_height = request.requester_height,
+                        our_height = tip_h,
+                        segments = segment_ids.len(),
+                        "serving state manifest"
+                    );
+                    GetStateManifestResponse {
+                        tip_height: tip_h,
+                        tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
+                        log_slots: tip_hdr.log_slots,
+                        active_slot_count: tip_hdr.active_slot_count,
+                        alloc_counter: tip_hdr.alloc_counter,
+                        eff_log,
+                        segment_ids,
+                        recent_headers,
+                        nullifier_blocks,
+                    }
                 }
-            }
-
-            // Collect nullifier blocks (last ANCHOR_DEPTH blocks)
-            let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
-            let mut nullifier_blocks = Vec::new();
-            for h in null_start..=tip_h {
-                let hashes: Vec<[u8; 32]> = ctx
-                    .store
-                    .get_undo_log(h)
-                    .ok()
-                    .flatten()
-                    .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
-                    .unwrap_or_default();
-                nullifier_blocks.push(hashes);
-            }
-
-            let tip_hdr = ctx.tip_header().clone();
-            drop(ctx);
-
-            let response = GetStateSnapshotResponse {
-                tip_height: tip_h,
-                tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
-                log_slots: tip_hdr.log_slots,
-                active_slot_count: tip_hdr.active_slot_count,
-                alloc_counter: tip_hdr.alloc_counter,
-                segments,
-                recent_headers,
-                nullifier_blocks,
             };
             let _ = swarm
                 .behaviour_mut()
-                .snapshot_sync
-                .send_response(channel, response);
+                .state_manifest_sync
+                .send_response(channel, manifest);
         }
 
-        // --- State snapshot: client side (received snapshot we requested) ---
-        SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotSync(
+        // --- State sync: manifest client (step 1 response) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
                 peer,
             },
         )) => {
             if response.tip_height > 0 {
-                // Sanity check: reject absurdly large snapshots before forwarding to
-                // node.  A valid snapshot for log_slots=32 has at most 65536 segments.
-                const MAX_SNAPSHOT_SEGMENTS: usize = 65536;
                 const MAX_RECENT_HEADERS: usize = 512;
-                if response.segments.len() > MAX_SNAPSHOT_SEGMENTS
-                    || response.recent_headers.len() > MAX_RECENT_HEADERS
-                {
-                    tracing::warn!(
-                        from = %peer,
-                        segments = response.segments.len(),
-                        "snapshot too large — dropping (possible OOM attack)"
-                    );
-                    return; // don't emit the event
+                if response.recent_headers.len() > MAX_RECENT_HEADERS {
+                    tracing::warn!(from = %peer, "manifest: too many headers, dropping");
+                    return;
                 }
-
                 tracing::info!(
                     from = %peer,
                     tip = response.tip_height,
-                    segments = response.segments.len(),
-                    "received state snapshot"
+                    segments = response.segment_ids.len(),
+                    "received state manifest"
                 );
-                let _ = event_tx.send(NetworkEvent::StateSnapshot {
+                let _ = event_tx.send(NetworkEvent::StateManifest {
                     from: peer,
-                    snapshot: Box::new(response),
+                    manifest: Box::new(response),
                 });
             }
+        }
+
+        // --- State sync: segment server (step 2) ---
+        //
+        // Serves one encoded segment (~3 MB) per request.
+        // Lock is held only during column clone; encoding happens outside.
+        // Rejects requests if our tip has moved more than FINALITY_DEPTH
+        // past the expected_tip_height to prevent serving stale segments.
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            use noid_chain::consensus::params::FINALITY_DEPTH;
+            use noid_chain::storage::serial::encode_segment;
+            let seg_id = request.segment_id;
+            let result = {
+                let mut ctx = chain.write().await;
+                let our_tip = ctx.tip_height();
+                // Staleness guard: if we're more than FINALITY_DEPTH ahead,
+                // the client is syncing from a fork; it should restart.
+                if our_tip > request.expected_tip_height + FINALITY_DEPTH {
+                    None
+                } else {
+                    let eff_log = ctx.state.state.effective_log_segment_size() as u8;
+                    let cols = ctx.state.state.segment_columns(seg_id).clone();
+                    Some((eff_log, cols))
+                }
+            };
+            let response = match result {
+                None => GetStateSegmentResponse {
+                    segment_id: seg_id,
+                    eff_log: 0,
+                    data: None,
+                },
+                Some((eff_log, cols)) => {
+                    // Encode OUTSIDE the lock (CPU-heavy, ~3 MB allocation).
+                    let data = encode_segment(&cols, eff_log);
+                    GetStateSegmentResponse {
+                        segment_id: seg_id,
+                        eff_log,
+                        data: Some(data),
+                    }
+                }
+            };
+            let _ = swarm
+                .behaviour_mut()
+                .state_segment_sync
+                .send_response(channel, response);
+        }
+
+        // --- State sync: segment client (step 2 response) ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            tracing::debug!(
+                from = %peer,
+                segment_id = response.segment_id,
+                present = response.data.is_some(),
+                "received state segment"
+            );
+            let _ = event_tx.send(NetworkEvent::StateSegment {
+                from: peer,
+                response,
+            });
         }
 
         // --- Connection events ---
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
             tracing::debug!(peer = %peer_id, "peer connected");
+            // Clear any pending reconnect entry — connection succeeded.
+            reconnect.remove(&peer_id);
         }
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            endpoint,
+            cause,
+            ..
+        } => {
             let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
-            tracing::debug!(peer = %peer_id, "peer disconnected");
+            tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
+            // Schedule reconnect for peers we dialled (outbound connections).
+            // We don't attempt to reconnect inbound peers — they should re-dial us.
+            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
+                if !reconnect.contains_key(&peer_id) {
+                    let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    reconnect.insert(peer_id, (address, retry_at, 0));
+                    tracing::debug!(peer = %peer_id, "scheduled reconnect in 10s");
+                }
+            }
+        }
+
+        // --- Outgoing connection failed (dial error) ---
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            tracing::debug!(peer = ?peer_id, err = %error, "outgoing connection error");
+            // The error is already logged; Kademlia / GossipSub will try
+            // other peers.  No explicit action needed here.
+        }
+
+        // --- Request-response failure: emit event so consumers can retry ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::BlockSync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "block sync request failed");
+            // Emit a generic disconnect so the sync state machine can retry.
+            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "manifest sync request failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "proof sync request failed");
         }
 
         SwarmEvent::NewListenAddr { address, .. } => {
-            // Logged at debug — the startup banner already shows the configured listen address.
             tracing::debug!(%address, "P2P listening");
         }
 

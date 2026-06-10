@@ -57,6 +57,21 @@ pub struct BlockTemplateResponse {
 // Wallet types
 // ---------------------------------------------------------------------------
 
+/// Info about a single derived wallet address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletAddressInfo {
+    /// Bech32m address string.
+    pub address: String,
+    /// HD derivation index (0 = primary).
+    pub key_index: u32,
+    /// Confirmed balance in μNOID across all UTXOs at this address.
+    pub balance_micronoid: u64,
+    /// Balance in NOID.
+    pub balance_noid: f64,
+    /// Number of confirmed UTXOs at this address.
+    pub utxo_count: usize,
+}
+
 /// Overall wallet status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletStatus {
@@ -80,6 +95,12 @@ pub struct WalletBalance {
     pub total_micronoid: u64,
     pub total_noid: f64,
     pub utxo_count: usize,
+    /// Confirmed UTXOs being spent by pending (mempool) txs.
+    /// These are locked and cannot be spent again until confirmed or evicted.
+    pub pending_outbound_micronoid: u64,
+    /// Spendable = total - pending_outbound.
+    pub spendable_micronoid: u64,
+    pub spendable_noid: f64,
 }
 
 /// Info about a single UTXO.
@@ -103,6 +124,10 @@ pub struct WalletHistoryEntry {
     pub amount_noid: f64,
     pub peer_address: Option<String>,
     pub timestamp: u64,
+    /// Which of our own addresses was involved (received-to or sent-from address).
+    pub own_address: Option<String>,
+    /// Key index of the own address.
+    pub own_key_index: Option<u32>,
 }
 
 /// Result of a full state scan.
@@ -111,6 +136,10 @@ pub struct WalletScanResult {
     pub found_utxos: usize,
     pub balance_micronoid: u64,
     pub balance_noid: f64,
+    /// Total addresses derived during this scan.
+    pub addresses_scanned: u32,
+    /// Next available key index after scan (use for address --new).
+    pub next_index: u32,
 }
 
 /// Result of a send operation.

@@ -420,22 +420,14 @@ impl BlockMiner {
                                 "block found"
                             );
 
-                            let _ = self.events.send(MinerEvent::BlockFound {
-                                height,
-                                hash,
-                                n_txs,
-                                pow_nonce: sol.nonce,
-                                block_bytes: block_bytes.clone(),
-                                block_proof_bytes: block_proof_bytes.clone(),
-                            });
-
-                            // Apply the block to the chain and update mempool.
+                            // IMPORTANT: apply and store the block FIRST, THEN fire the event.
+                            // The announcement triggers peers to request the block immediately;
+                            // if we fire the event before storing, a fast peer gets None.
                             if let Err(e) = self.apply_found_block(&block, &block_bytes).await {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
                             // Store block proof bytes for recursive proof advancement.
-                            // Only store if we have real proof bytes (not marker hashes from coinbase-only blocks).
                             if !block_proof_bytes.is_empty() {
                                 let ctx = self.chain.read().await;
                                 if let Err(e) = ctx.store.put_block_proof(height, &block_proof_bytes) {
@@ -444,6 +436,16 @@ impl BlockMiner {
                                     tracing::debug!(height, bytes = block_proof_bytes.len(), "block proof stored");
                                 }
                             }
+
+                            // Now safe to announce — block and proof are in MDBX.
+                            let _ = self.events.send(MinerEvent::BlockFound {
+                                height,
+                                hash,
+                                n_txs,
+                                pow_nonce: sol.nonce,
+                                block_bytes: block_bytes.clone(),
+                                block_proof_bytes: block_proof_bytes.clone(),
+                            });
                         }
                         (Ok(Some(_sol)), Ok(Err(e))) => {
                             // PoW succeeded but proof failed — abandon block.
@@ -632,6 +634,7 @@ pub(crate) fn run_prove_block(
         Some(binding) if !non_cb_bodies.is_empty() => build_state_bindings_from_binding(
             binding,
             &non_cb_bodies,
+            Some(&tmpl.inner.coinbase.body),
             &tmpl.pre_segs,
             prev_state_root,
             n_tx,

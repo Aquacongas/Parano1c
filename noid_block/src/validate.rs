@@ -348,7 +348,28 @@ pub fn build_state_binding_airs(
     // Collect slot changes per segment, sorted by seg_id (BTreeMap).
     let mut seg_claims: BTreeMap<u16, Vec<BlockStateBindingClaim>> = BTreeMap::new();
 
-    for tx in block.transactions.iter().filter(|t| !t.body.is_coinbase) {
+    for tx in block.transactions.iter() {
+        if tx.body.is_coinbase {
+            // Coinbase has no inputs. Include its outputs as mint claims so the
+            // post-state MLE and seg_root are consistent with the global new_state_root
+            // (which includes coinbase changes). Skipping coinbase would cause a Merkle
+            // path mismatch when coinbase and user TXs touch the same segment.
+            for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                let seg_id = (out.slot_index >> eff_log) as u16;
+                let local = out.slot_index & seg_mask;
+                let [owner_hi, owner_lo] = out.owner.as_fields();
+                seg_claims
+                    .entry(seg_id)
+                    .or_default()
+                    .push(BlockStateBindingClaim::mint(
+                        local,
+                        Block128::from(out.value as u128),
+                        owner_hi,
+                        owner_lo,
+                    ));
+            }
+            continue;
+        }
         // Spend claims: deactivated input slots.
         for inp in tx.body.inputs.iter().filter(|i| i.valid) {
             let seg_id = (inp.slot_index >> eff_log) as u16;
@@ -382,6 +403,16 @@ pub fn build_state_binding_airs(
     }
 
     // BTreeMap iteration is already sorted by seg_id.
+    tracing::debug!(
+        n_state_bindings = seg_claims.len(),
+        eff_log,
+        "build_state_binding_airs: segments={}",
+        seg_claims
+            .iter()
+            .map(|(s, c)| format!("seg{}:{}", s, c.len()))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     seg_claims
         .into_iter()
         .enumerate()

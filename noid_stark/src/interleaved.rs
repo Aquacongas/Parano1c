@@ -397,12 +397,38 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
     slice_claims: &[SliceClaim],
     channel: &mut Channel,
 ) -> Result<(Vec<Block128>, Block128, Vec<Block128>), VerifyError> {
+    verify_air_interleaved_algebraic_with_log_len(
+        air,
+        pi,
+        proof,
+        extra_transcript,
+        slice_claims,
+        None,
+        channel,
+    )
+}
+
+/// Like `verify_air_interleaved_algebraic` but with an optional explicit log_len.
+/// When `log_len_override = Some(len)`, uses `len` instead of `padded_log_len(proof.log_rows)`.
+/// This is needed for `BlockStateBindingAir` proofs which are committed at the global block
+/// log_len (= TX air log_len) even though the state binding AIR itself has fewer rows.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_air_interleaved_algebraic_with_log_len<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &AlgebraicStarkProof,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    log_len_override: Option<usize>,
+    channel: &mut Channel,
+) -> Result<(Vec<Block128>, Block128, Vec<Block128>), VerifyError> {
     let out = verify_algebraic_inner(
         air,
         pi,
         proof.into(),
         extra_transcript,
         slice_claims,
+        log_len_override,
         channel,
     )?;
     Ok((out.r_pp, out.final_claim, out.lambdas))
@@ -416,34 +442,65 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     proof: AlgebraicStarkProofRef<'_>,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
+    log_len_override: Option<usize>,
     channel: &mut Channel,
 ) -> Result<AlgebraicVerifyOut, VerifyError> {
     let n_air_cols = air.n_columns();
     let n_slices = slice_claims.len();
 
-    if proof.log_rows != air.log_rows() {
+    // proof.log_rows holds the committed log_len, which may be >= air.log_rows() when
+    // state-binding columns are padded to the global block log_len.
+    if proof.log_rows < air.log_rows() {
+        tracing::warn!(
+            proof_log_rows = proof.log_rows,
+            air_log_rows = air.log_rows(),
+            "SHAPE1: log_rows too small"
+        );
         return Err(VerifyError::ShapeMismatch);
     }
     if proof.base_openings.len() != n_air_cols {
+        tracing::warn!(
+            got = proof.base_openings.len(),
+            want = n_air_cols,
+            "SHAPE2: base_openings"
+        );
         return Err(VerifyError::ShapeMismatch);
     }
 
-    let log_len = padded_log_len(proof.log_rows);
+    // If an explicit log_len was provided (e.g. global block log_len for state binding AIRs
+    // whose columns are padded to a larger domain), use it; otherwise derive from proof.log_rows.
+    let log_len = log_len_override.unwrap_or_else(|| padded_log_len(proof.log_rows));
     if proof.zero_check_rounds.len() != log_len {
+        tracing::warn!(
+            got = proof.zero_check_rounds.len(),
+            want = log_len,
+            "SHAPE3: zero_check_rounds"
+        );
         return Err(VerifyError::ShapeMismatch);
     }
     let degree = round_poly_degree(air);
     let n_points = degree + 1;
     for rp in proof.zero_check_rounds {
         if rp.len() != n_points {
+            tracing::warn!(
+                got = rp.len(),
+                want = n_points,
+                "SHAPE4: zero_check round_poly_degree"
+            );
             return Err(VerifyError::ShapeMismatch);
         }
     }
     if proof.multipoint_rounds.len() != log_len {
+        tracing::warn!(
+            got = proof.multipoint_rounds.len(),
+            want = log_len,
+            "SHAPE5: multipoint_rounds"
+        );
         return Err(VerifyError::ShapeMismatch);
     }
     for rp in proof.multipoint_rounds {
         if rp.len() != crate::multipoint_batch::MULTIPOINT_ROUND_POINTS {
+            tracing::warn!("SHAPE6: multipoint round points");
             return Err(VerifyError::ShapeMismatch);
         }
     }
@@ -477,11 +534,21 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     // Constraint composition check.
     let shifted_indices: Vec<usize> = air.shifted_column_indices();
     if proof.shift_partials.len() != shifted_indices.len() {
+        tracing::warn!(
+            got = proof.shift_partials.len(),
+            want = shifted_indices.len(),
+            "SHAPE7: shift_partials"
+        );
         return Err(VerifyError::ShapeMismatch);
     }
     let expected_ladder_len = log_len + 1;
     for partials in proof.shift_partials {
         if partials.len() != expected_ladder_len {
+            tracing::warn!(
+                got = partials.len(),
+                want = expected_ladder_len,
+                "SHAPE8: shift_partials ladder"
+            );
             return Err(VerifyError::ShapeMismatch);
         }
     }
@@ -722,6 +789,7 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
         alg_ref,
         extra_transcript,
         slice_claims,
+        None, // no log_len override for full verify_air_interleaved
         &mut channel,
     )?;
 

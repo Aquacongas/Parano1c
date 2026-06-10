@@ -26,13 +26,15 @@
 use std::time::Duration;
 
 use libp2p::{
-    gossipsub, identify, kad, mdns, ping, request_response, swarm::NetworkBehaviour, StreamProtocol,
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
+    swarm::NetworkBehaviour, StreamProtocol,
 };
+use libp2p_connection_limits as connection_limits;
 
 use crate::protocol::{
     GetHeadersRequest, GetHeadersResponse, GetRecentBlockRequest, GetRecentBlockResponse,
-    GetRecursiveProofRequest, GetRecursiveProofResponse, GetStateSnapshotRequest,
-    GetStateSnapshotResponse,
+    GetRecursiveProofRequest, GetRecursiveProofResponse, GetStateManifestRequest,
+    GetStateManifestResponse, GetStateSegmentRequest, GetStateSegmentResponse,
 };
 
 /// All P2P behaviours composed via the derive macro.
@@ -78,10 +80,49 @@ pub struct NodeBehaviour {
     /// Liveness probing.
     pub ping: ping::Behaviour,
 
-    /// State snapshot sync — allows joining nodes to download the full current
-    /// state without block history (Paranoid's designed sync mechanism).
-    pub snapshot_sync:
-        request_response::cbor::Behaviour<GetStateSnapshotRequest, GetStateSnapshotResponse>,
+    /// AutoNAT — probes whether this node is reachable from the internet.
+    ///
+    /// Periodically asks connected peers to dial us back.  If all probes
+    /// fail, the node is behind NAT and should activate the relay client
+    /// to make itself reachable.
+    pub autonat: autonat::Behaviour,
+
+    /// Circuit relay client — routes traffic through relay nodes when
+    /// direct connections are not possible (NAT, firewall).
+    ///
+    /// When AutoNAT confirms NAT, the node makes a reservation at one of
+    /// its connected peers that supports the relay server protocol.
+    /// Other peers can then reach us via:
+    ///   /ip4/<relay>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
+    pub relay_client: relay::client::Behaviour,
+
+    /// DCUtR — Direct Connection Upgrade Through Relay.
+    ///
+    /// Once two NAT'd nodes are connected through a relay, DCUtR coordinates
+    /// simultaneous TCP/UDP connection attempts to punch through both NATs.
+    /// On success the relay connection is replaced by a direct connection.
+    pub dcutr: dcutr::Behaviour,
+
+    /// Hard connection limits — enforced by the swarm before any other
+    /// behaviour sees the connection.  Prevents file-descriptor exhaustion
+    /// and connection-flood DoS.
+    ///
+    /// Limits (production defaults, tunable via config):
+    ///   128 established inbound  — matches Substrate's default
+    ///    64 established outbound — we initiate fewer than we accept
+    ///    64 pending inbound      — cap half-open handshakes
+    ///    32 pending outbound     — cap simultaneous dial attempts
+    pub connection_limits: connection_limits::Behaviour,
+
+    /// State manifest sync — step 1: request chain metadata + active segment IDs.
+    /// Tiny response (~few KB), establishes what needs downloading.
+    pub state_manifest_sync:
+        request_response::cbor::Behaviour<GetStateManifestRequest, GetStateManifestResponse>,
+
+    /// State segment sync — step 2: request individual segments (~3 MB each).
+    /// Downloaded in parallel after manifest is received.
+    pub state_segment_sync:
+        request_response::cbor::Behaviour<GetStateSegmentRequest, GetStateSegmentResponse>,
 }
 
 impl NodeBehaviour {
@@ -90,9 +131,15 @@ impl NodeBehaviour {
     /// `protocol_id` is the network-specific prefix used for all sync stream
     /// protocols (e.g. `/noid/mainnet/1.0.0`).  This ensures mainnet and
     /// testnet nodes can never accidentally sync with each other.
+    /// Build the combined behaviour.
+    ///
+    /// `relay_client` MUST come from `SwarmBuilder::with_relay_client()` —
+    /// it cannot be constructed manually because it is wired into the relay
+    /// transport layer by the builder.
     pub fn new(
         key: &libp2p::identity::Keypair,
         protocol_id: &str,
+        relay_client: relay::client::Behaviour,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -103,9 +150,11 @@ impl NodeBehaviour {
         //
         // Tuned for heterogeneous network sizes (2 → 10 000+ peers):
         //
-        //  flood_publish=true   publish to ALL connected peers, not just mesh
-        //                       peers. Ensures propagation with 2 nodes where
-        //                       the mesh can't form (D=6 minimum).
+        //  flood_publish=false  rely on the mesh for propagation at scale.
+        //                       With flood_publish=true every block would be
+        //                       sent to all 192 connections simultaneously
+        //                       (~400 MB/s egress at max capacity).  The mesh
+        //                       handles small networks fine once formed.
         //
         //  mesh_n / _low / _high  scaled-down so a mesh FORMS with as few as
         //                         2 nodes in local tests; still works at scale.
@@ -116,13 +165,36 @@ impl NodeBehaviour {
         //
         //  heartbeat 700ms      fast mesh maintenance for dev/test; fine at
         //                       scale (Ethereum uses 700ms too).
+        // Max gossipsub message size.
+        //
+        // Block sizes (block_bytes only, no proof):
+        //   coinbase:  ~1 KB
+        //   100 txs:   ~53 KB
+        //   1024 txs:  ~540 KB
+        //
+        // Block proof sizes (block_proof_bytes):
+        //   coinbase:  0 B (empty)
+        //   10 txs:    ~213 KB
+        //   100 txs:   ~1.9 MB
+        //   1024 txs:  ~19 MB  ← exceeds gossip, must use pull sync
+        //
+        // Strategy: gossip blocks up to ~2 MB (covers ~100 txs with proof).
+        // For larger blocks, nodes fall back to pull sync via block_sync
+        // request-response.  Gossiping 19 MB to 12 mesh peers at once
+        // (228 MB/block) is architecturally wrong regardless of the limit.
+        //
+        // TODO: implement compact block announcements (header + hash only)
+        // and have nodes pull the proof on demand for large blocks.
+        const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(700))
             .mesh_n(6)
             .mesh_n_low(4)
             .mesh_n_high(12)
             .mesh_outbound_min(2)
-            .flood_publish(true)
+            .max_transmit_size(GOSSIP_MAX_TRANSMIT_BYTES)
+            .flood_publish(false)
             // Peer exchange: when the mesh prunes a peer it advertises up to 6
             // alternative peers (PeerInfo with signed address records). The
             // receiving node dials those peers automatically, enabling organic
@@ -173,16 +245,27 @@ impl NodeBehaviour {
             request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
         );
 
-        let snapshot_sync = request_response::cbor::Behaviour::new(
+        // Manifest: tiny request/response, short timeout is fine.
+        let state_manifest_sync = request_response::cbor::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/snapshot/1", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
-            // Generous timeout: full state transfer can be several hundred MB
-            // at high occupancy; 120 s is safe even on slow connections.
             request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(120))
-                .with_max_concurrent_streams(32),
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(8),
+        );
+
+        // Segment: each response is ~3 MB; 60s per segment is generous.
+        // 16 concurrent streams lets us pipeline downloads aggressively.
+        let state_segment_sync = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::try_from_owned(format!("{}/sync/segment/1", protocol_id))?,
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(60))
+                .with_max_concurrent_streams(16),
         );
 
         // ----------------------------------------------------------------
@@ -246,6 +329,45 @@ impl NodeBehaviour {
 
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
 
+        // ----------------------------------------------------------------
+        // NAT traversal: AutoNAT + DCUtR
+        // ----------------------------------------------------------------
+        //
+        // AutoNAT probes our reachability every 90s by asking peers to
+        // dial us back.  Result is logged so operators know if their node
+        // is publicly reachable.
+        let autonat = autonat::Behaviour::new(
+            key.public().to_peer_id(),
+            autonat::Config {
+                boot_delay: Duration::from_secs(30),
+                refresh_interval: Duration::from_secs(90),
+                retry_interval: Duration::from_secs(30),
+                // 3 confirmations before declaring public/private.
+                confidence_max: 3,
+                ..Default::default()
+            },
+        );
+
+        // DCUtR: coordinates simultaneous dial attempts between two NAT'd
+        // nodes connected through a relay, upgrading to a direct connection.
+        let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+        // ----------------------------------------------------------------
+        // Connection limits
+        // ----------------------------------------------------------------
+        //
+        // Enforced at the swarm level before any behaviour receives events.
+        // Substrate defaults: 100 in / 25 out.  We use slightly higher
+        // values because Paranoid nodes actively push block proofs and
+        // have higher per-connection bandwidth.
+        let connection_limits = connection_limits::Behaviour::new(
+            connection_limits::ConnectionLimits::default()
+                .with_max_established_incoming(Some(128))
+                .with_max_established_outgoing(Some(64))
+                .with_max_pending_incoming(Some(64))
+                .with_max_pending_outgoing(Some(32)),
+        );
+
         Ok(Self {
             gossipsub,
             chain_sync,
@@ -255,7 +377,12 @@ impl NodeBehaviour {
             mdns,
             identify,
             ping,
-            snapshot_sync,
+            autonat,
+            relay_client,
+            dcutr,
+            connection_limits,
+            state_manifest_sync,
+            state_segment_sync,
         })
     }
 }

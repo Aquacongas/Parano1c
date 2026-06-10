@@ -274,6 +274,7 @@ fn mle_eval(vals: &[Block128], point: &[Block128]) -> Block128 {
 pub fn build_state_bindings_from_binding(
     binding: &BlockStateBinding,
     bodies: &[noid_tx::TxBody],
+    coinbase_body: Option<&noid_tx::TxBody>,
     pre_segs: &HashMap<u16, SegmentColumns>,
     prev_state_root: [u8; 32],
     n_tx: u32,
@@ -284,6 +285,26 @@ pub fn build_state_bindings_from_binding(
 
     // Group claims by segment.
     let mut seg_claims: HashMap<u16, Vec<BlockStateBindingClaim>> = HashMap::new();
+
+    // Include coinbase output mints so post-state MLE and seg_root are consistent
+    // with the global new_state_root (which includes coinbase changes).
+    if let Some(cb) = coinbase_body {
+        for out in cb.outputs.iter().filter(|o| o.valid) {
+            let seg_id = (out.slot_index >> eff_log) as u16;
+            let local = out.slot_index & seg_mask;
+            let [owner_hi, owner_lo] = out.owner.as_fields();
+            seg_claims
+                .entry(seg_id)
+                .or_default()
+                .push(BlockStateBindingClaim::mint(
+                    local,
+                    noid_core::Block128::from(out.value as u128),
+                    owner_hi,
+                    owner_lo,
+                ));
+        }
+    }
+
     for (body, opening) in bodies.iter().zip(binding.tx_openings.iter()) {
         let mut inp_iter = opening.input_openings.iter();
         for inp in body.inputs.iter().filter(|i| i.valid) {

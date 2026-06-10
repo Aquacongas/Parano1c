@@ -127,11 +127,24 @@ impl MdbxChainContext {
 
     /// Open an existing MDBX database, or initialise a fresh one from genesis.
     ///
-    /// If the database is empty (first run), writes the genesis state.
-    /// If the database already has data, rebuilds hot RAM state from MDBX.
+    /// On every startup, volatile tables (segments, undo logs, nullifiers, etc.)
+    /// are cleared via `clear_for_restart`. The node will sync fresh state from
+    /// peers and verify it against the recursive chain proof (~5 ms). This avoids
+    /// stale-state issues and aligns with the proof-native architecture.
+    ///
+    /// T_HEADERS and T_HASH_TO_HEIGHT are preserved across restarts.
     pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError> {
         let store = MdbxStore::open(path)?;
 
+        // Clear volatile state on every startup. The node will sync fresh state
+        // from peers and verify it via the recursive chain proof. We don't need
+        // to trust our own cached state when the network provides a verified snapshot.
+        if let Err(e) = store.clear_for_restart() {
+            tracing::warn!(err = %e, "clear_for_restart failed — continuing anyway");
+        }
+
+        // After clearing, T_CHAIN_TIP is empty -> is_empty() returns true -> init from genesis.
+        // The P2P layer will request a state snapshot and override this immediately.
         if store.is_empty()? {
             // First run: initialise from genesis.
             let consensus = ChainContext::init_from_genesis();
@@ -494,7 +507,15 @@ impl MdbxChainContext {
     ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError> {
         use crate::consensus::reorg::{revert_state_counters, ReorgResult};
 
-        let reorg_depth = self.tip_height.saturating_sub(ancestor_height);
+        // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
+        // The caller computed ancestor_height outside the lock — if another task applied
+        // blocks (or completed a reorg) in the meantime, ancestor_height may now be
+        // ABOVE our tip, which would make saturating_sub silently return 0 and
+        // discard the reorg. Fail loudly instead.
+        if ancestor_height > self.tip_height {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+        }
+        let reorg_depth = self.tip_height - ancestor_height; // safe: guarded above
 
         if reorg_depth > FINALITY_DEPTH {
             return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));

@@ -10,6 +10,7 @@
 
 pub mod behaviour;
 pub mod network;
+pub mod peer_store;
 pub mod protocol;
 
 pub use network::{NetworkCommand, NetworkEvent, P2PNetwork};

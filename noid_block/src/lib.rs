@@ -55,7 +55,8 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::interleaved::{
-    prove_air_interleaved_algebraic, verify_air_interleaved_algebraic, AlgebraicStarkProof,
+    prove_air_interleaved_algebraic, verify_air_interleaved_algebraic,
+    verify_air_interleaved_algebraic_with_log_len, AlgebraicStarkProof,
 };
 use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
@@ -448,14 +449,13 @@ pub fn prove_block(
     let sb_log_rows = state_bindings.first().map_or(0, |sb| sb.air.log_rows());
     let sb_n_cols_total = sb_n_cols_per_seg * n_state_bindings;
 
-    // Pad all state binding columns (flat across all AIR instances).
+    // Extend all state binding columns to log_len using constraint-aware padding.
+    // Standard zero-padding violates the eq-ladder base constraint at external rows;
+    // `extend_for_proving` pads eq_ladder columns with 1 instead of 0 so that
+    // `eq_0 + r_0 + b_0 + 1 = 1 + 0 + 0 + 1 = 0` (char-2) holds everywhere.
     let sb_padded_columns: Vec<Vec<Block128>> = state_bindings
         .iter()
-        .flat_map(|sb| {
-            sb.columns
-                .iter()
-                .map(|c| noid_stark::pad_column(c, log_len))
-        })
+        .flat_map(|sb| sb.air.extend_for_proving(sb.columns.clone(), log_len))
         .collect();
     // Pad block spine slices to log_len (they may be shorter if num_vars < BASE_LOG).
     let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
@@ -1094,11 +1094,22 @@ pub fn verify_block(
         return Err(VerifyBlockError::ShapeMismatch);
     }
     if has_state_binding && state_binding_airs.len() != n_state_bindings {
+        tracing::warn!(
+            sb_airs_len = state_binding_airs.len(),
+            n_state_bindings,
+            "verify_block: state_binding count mismatch"
+        );
         return Err(VerifyBlockError::ShapeMismatch);
     }
     if has_state_binding {
-        for sb_air in state_binding_airs {
+        for (i, sb_air) in state_binding_airs.iter().enumerate() {
             if sb_air.n_columns() != sb_n_cols_per_seg {
+                tracing::warn!(
+                    sb_idx = i,
+                    air_n_cols = sb_air.n_columns(),
+                    proof_n_cols = sb_n_cols_per_seg,
+                    "verify_block: state_binding n_cols mismatch"
+                );
                 return Err(VerifyBlockError::ShapeMismatch);
             }
         }
@@ -1247,12 +1258,31 @@ pub fn verify_block(
     let mut sb_r_pp_list: Vec<Vec<Block128>> = Vec::with_capacity(n_state_bindings);
     for sb_idx in 0..n_state_bindings {
         let sb_air = state_binding_airs[sb_idx];
+        let sb_alg_log_rows = proof.state_binding_algebraics[sb_idx].log_rows;
+        tracing::debug!(
+            sb_idx,
+            air_log_rows = sb_air.log_rows(),
+            proof_log_rows = sb_alg_log_rows,
+            air_n_cols = sb_air.n_columns(),
+            proof_n_cols = sb_n_cols_per_seg,
+            "verify_block: checking state_binding_air shape"
+        );
         let sb_alg = &proof.state_binding_algebraics[sb_idx];
         let mut sb_ch =
             state_binding_channel(&meta.prev_block_state_root, cap, (n_tx + sb_idx) as u32);
-        let (r_pp_sb, _, _) =
-            verify_air_interleaved_algebraic(sb_air, &empty_pi_sb, sb_alg, &[], &[], &mut sb_ch)
-                .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx + sb_idx, e))?;
+        // State-binding columns are padded to the global block log_len (same as TX AIR)
+        // even though the state-binding AIR itself has fewer rows (log_rows < global log_rows).
+        // Pass log_len explicitly so the verifier uses the correct zero-check round count.
+        let (r_pp_sb, _, _) = verify_air_interleaved_algebraic_with_log_len(
+            sb_air,
+            &empty_pi_sb,
+            sb_alg,
+            &[],
+            &[],
+            Some(log_len),
+            &mut sb_ch,
+        )
+        .map_err(|e| VerifyBlockError::AlgebraicStark(n_tx + sb_idx, e))?;
         sb_r_pp_list.push(r_pp_sb);
     }
 
@@ -1280,6 +1310,7 @@ pub fn verify_block(
 
             // eval_points must match the AIR.
             if pre.eval_point != sb_air.eval_point || post.eval_point != sb_air.eval_point {
+                tracing::warn!(sb_idx, "StateMle: eval_point mismatch");
                 return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
             }
             let eff_log = pre.eval_point.len();
@@ -1308,18 +1339,29 @@ pub fn verify_block(
                     &frib_hasher,
                     COMPACT_NUM_QUERIES,
                 )
-                .map_err(|_| VerifyBlockError::StateMleOpeningFailed(sb_idx))?;
+                .map_err(|e| {
+                    tracing::warn!(sb_idx, err=?e, "StateMle: FRI verify failed");
+                    VerifyBlockError::StateMleOpeningFailed(sb_idx)
+                })?;
 
                 // Proved values must match lane_values AND AIR's expected values.
                 if col_evals.len() < 3
                     || [col_evals[0], col_evals[1], col_evals[2]] != op.lane_values
                     || &op.lane_values != expected_lane
                 {
+                    tracing::warn!(
+                        sb_idx,
+                        col_ok = (col_evals.len() >= 3
+                            && [col_evals[0], col_evals[1], col_evals[2]] == op.lane_values),
+                        lane_ok = (&op.lane_values == expected_lane),
+                        "StateMle: lane_values mismatch"
+                    );
                     return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
                 }
                 // seg_root = cap_to_seg_root_with_depth(cap, eff_log).
                 let derived = cap_to_seg_root_with_depth(&op.commitment.cap, eff_log);
                 if derived != op.seg_root {
+                    tracing::warn!(sb_idx, "StateMle: seg_root mismatch");
                     return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
                 }
                 Ok(())
@@ -1345,8 +1387,14 @@ pub fn verify_block(
                 }
                 Ok(())
             };
-            check_merkle(pre, &meta.prev_block_state_root)?;
-            check_merkle(post, &meta.new_state_root)?;
+            check_merkle(pre, &meta.prev_block_state_root).map_err(|e| {
+                tracing::warn!(sb_idx, "StateMle: pre Merkle failed");
+                e
+            })?;
+            check_merkle(post, &meta.new_state_root).map_err(|e| {
+                tracing::warn!(sb_idx, "StateMle: post Merkle failed");
+                e
+            })?;
         }
     }
 
