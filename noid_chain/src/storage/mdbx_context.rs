@@ -1070,6 +1070,21 @@ impl MdbxChainContext {
         }
     }
 
+    /// Check whether `anchor_hash` references a known header within the
+    /// ANCHOR_DEPTH window relative to `tip_height`.
+    ///
+    /// Used by the template builder to filter out transactions whose
+    /// epoch_anchor has expired since mempool admission.
+    pub fn is_anchor_fresh(&self, anchor_hash: &[u8; 32], tip_height: u64) -> bool {
+        let lo = tip_height.saturating_sub(ANCHOR_DEPTH);
+        (lo..=tip_height).any(|h| {
+            self.recent_headers
+                .get(&h)
+                .map(|hdr| full_block_hash(hdr) == *anchor_hash)
+                .unwrap_or(false)
+        })
+    }
+
     pub fn tip_height(&self) -> u64 {
         self.tip_height
     }

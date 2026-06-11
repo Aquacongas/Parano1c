@@ -155,6 +155,18 @@ impl TemplateBuilder {
             .map(|e| (e.cached_algebraic_proof, e.tx))
             .unzip();
 
+        // Filter out transactions whose epoch_anchor has expired since mempool
+        // admission. Without this, the miner wastes proving time on txs that
+        // will be rejected by peers during full block validation.
+        let tip_height = parent.height;
+        let (proof_bytes, txs): (Vec<_>, Vec<_>) = proof_bytes
+            .into_iter()
+            .zip(txs)
+            .filter(|(_, tx)| {
+                tx.body.is_coinbase || ctx.is_anchor_fresh(&tx.body.epoch_anchor, tip_height)
+            })
+            .unzip();
+
         let state = &ctx.state;
         match build_block_template(
             &parent,
