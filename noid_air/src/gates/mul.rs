@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `MulGate` / `SquareGate`: degree-2 algebraic gates asserting
 //! `out == a · b` (resp. `out == a · a`) over GF(2^128).

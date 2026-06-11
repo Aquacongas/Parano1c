@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Merkle path Kill-Shot orchestrator.
 //!

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `SelectorGate`: wraps any constraint in a boolean selector column so
 //! the underlying gate is suppressed at boundary / padding rows without

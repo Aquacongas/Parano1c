@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 // Adapted from binius_poseidon2b circuit reference.
 
 //! Native Poseidon2b permutation over GF(2^128).

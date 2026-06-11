@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Typed topology description of the `AuthCircuit`:
 //! per-input HAddr (2 perms) + HAuth (3 perms) sponges packed into a

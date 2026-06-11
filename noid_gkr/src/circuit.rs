@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Typed topology description of the 59-slot tx-body Merkle Poseidon2b
 //! spine. Sourced from the existing layout module in

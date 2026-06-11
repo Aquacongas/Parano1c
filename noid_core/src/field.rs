@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid. Ported from hekate-math.
+// Copyright (C) 2026 Paranoid Zero. Ported from hekate-math.
 
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use zeroize::Zeroize;

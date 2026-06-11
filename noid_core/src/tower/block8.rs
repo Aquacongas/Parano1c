@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 Paranoid.
+// Ported from hekate-math. Copyright (C) 2026 Paranoid Zero.
 
 //! GF(2^8) — AES polynomial: x^8 + x^4 + x^3 + x + 1 (0x11B)
 

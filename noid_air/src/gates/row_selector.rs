@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Row-selector helpers: pin a witness cell to a public constant on
 //! exactly one row, or enforce equality of two cells at a single row.

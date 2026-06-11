@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `PublicColumn`: an AIR-level declaration that trace column `col`
 //! must match a fixed, verifier-known sequence `values[0..2^log_rows]`.

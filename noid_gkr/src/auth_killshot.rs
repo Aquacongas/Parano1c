@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! AuthGKR Kill-Shot orchestrator (retargeted
 //! onto the dedicated 14-variable AuthGKR hypercube).

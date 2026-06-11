@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 //! JSON-RPC trait definition (generated server + client traits via proc macro).
 
 use jsonrpsee::core::RpcResult;

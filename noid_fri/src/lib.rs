@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid. All rights reserved.
+// Copyright (C) 2026 Paranoid Zero. All rights reserved.
 
 //! FRI Protocol: Fast Reed-Solomon IOP of Proximity.
 

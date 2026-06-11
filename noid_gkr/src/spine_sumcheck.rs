@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Spine utility functions: boundary MLE construction, state reconstruction,
 //! and tx-body hash computation.

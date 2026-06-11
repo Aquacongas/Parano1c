@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 Paranoid.
+// Ported from hekate-math. Copyright (C) 2026 Paranoid Zero.
 
 //! GF(2^128) — the anchor field. Quadratic extension of GF(2^64).
 

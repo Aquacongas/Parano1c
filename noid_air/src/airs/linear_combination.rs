@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `LinearCombinationAir` — fixed-shape AIR enforcing `Σ_i col_i(x) == 0`
 //! on the boolean hypercube. Used as the XOR-linear / balance test rig

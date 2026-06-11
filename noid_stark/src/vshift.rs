@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! VSHIFT gadget — cyclic row-rotation of a committed column inside the
 //! zero-check sumcheck, via a closed-form multilinear identity.

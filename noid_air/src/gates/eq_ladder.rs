@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `EqLadderStepGate` — fused degree-2 recurrence gate for the
 //! char-2 MLE equality-indicator ladder.

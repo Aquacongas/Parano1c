@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from binius64. Copyright (C) 2026 Paranoid.
+// Adapted from binius64. Copyright (C) 2026 Paranoid Zero.
 
 //! Equality indicator polynomial for multilinear extensions.
 //! Computes tensor products of (1 - r_i, r_i) over the boolean hypercube.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 //! noid-cli — Paranoid full node CLI client.
 //!
 //! Connects to a running `paranoid` daemon via JSON-RPC (no local keys, no crypto).

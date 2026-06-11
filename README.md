@@ -1,4 +1,4 @@
-# Paranoid — Proof-Native UTXO Statechain
+# Paranoid Zero — Proof-Native Transparent UTXO Statechain
 
 > The entire history of the network from genesis fits in **6.5 KB**.  
 > A new node verifies it cryptographically in **~5 ms**.  
@@ -23,13 +23,13 @@ In Paranoid, validity is established once, locally, by the party with the most i
 | Validation model | Re-execute everywhere | Verify proof once |
 | Full sync | Replay N GB of history | State snapshot + 6.5 KB proof, ~5 ms |
 | History required to validate | Yes. From genesis | No |
-| Signatures | ECDSA / EdDSA | None. ZK ownership proof |
+| Signatures | ECDSA / EdDSA | None. Hash-preimage ownership proof |
 | Quantum safety | No (discrete log problem) | Yes. Hash-only primitives |
 | 51% attack capability | Spend others' coins | Choose ordering only |
 | State growth | Spent outputs accumulate forever | Spent outputs removed; slots freed and reused |
 | Block proofs | None. Trust replays | `verify_block()` on every node |
 
-A 51% miner in Paranoid can only choose the ordering of valid transitions. They cannot forge proofs. They cannot spend coins they do not own. The ZK layer is the security boundary; PoW is the ordering mechanism.
+A 51% miner in Paranoid can only choose the ordering of valid transitions. They cannot forge proofs. They cannot spend coins they do not own. The proof layer is the security boundary; PoW is the ordering mechanism.
 
 ---
 
@@ -47,7 +47,7 @@ This proof is **stateless**: no Merkle paths, no dependency on the current state
 
 ### The Network Verifies, Not Executes
 
-Every full node independently verifies the ZK proof of each block it receives. A `BlockProof` covers:
+Every full node independently verifies the validity proof of each block it receives. A `BlockProof` covers:
 - All per-transaction LogicProofs (via interleaved STARK aggregation)
 - State binding: that input slots held the claimed values and output slots were empty
 - Correct computation of the new `state_root`
@@ -153,7 +153,7 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 ┌──────────────────────▼──────────────────────────────────────┐
 │  LogicProof  ·  ~26 KB  ·  stateless  ·  ~140 ms prove     │
 │  TxLogicAir: balance + range + ownership binding            │
-│  AuthGKR Kill-Shot: ZK proof of spending secret preimage          │
+│  AuthGKR Kill-Shot: proof-of-knowledge of spending secret preimage │
 │  Stateless: no Merkle paths, no state_root dependency       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -202,7 +202,7 @@ Block reward halves with each expansion. Attacking by filling slots halves the a
 
 ## Ownership: No Signatures
 
-There are no digital signatures in Paranoid. Ownership is proven entirely by ZK — a Poseidon2b hash preimage proof over GF(2^128).
+There are no digital signatures in Paranoid. Ownership is proven by a **proof-of-knowledge** — a Poseidon2b hash preimage proof over GF(2^128). This is a soundness guarantee (you cannot forge ownership), not a privacy guarantee (proofs from different secrets are distinguishable).
 
 Your **spending secret** is any 32 bytes: random, a passphrase hash, anything. The wallet derives addresses:
 
@@ -228,13 +228,12 @@ The algebraic layers (FRI proximity, sumcheck, GKR) are **information-theoretic*
 soundness bound holds against any prover, classical or quantum, by the Schwartz–Zippel lemma.
 This is proven, not assumed.
 
-For hash-based components: post-quantum security is indeed lower than classical for Poseidon2b
-preimage (256 → 128 bits via Grover). The overall system minimum stays at 128 bits because the
-algebraic layer already caps classical security at 128 bits by design (FRI parameter choice).
-
-The 128-bit PQ claim holds under standard quantum circuit model (NIST assumption). The
-theoretical BHT collision attack (O(2⁸⁵) quantum) requires O(2⁸⁵) QRAM cells — hardware that
-does not exist and may never be physically realizable at that scale.
+The system bottleneck is the FROST-GKR unified sumcheck at ~120 bits (345/2^128). For
+hash-based components, post-quantum security is lower than classical for Poseidon2b preimage
+(256 -> 128 bits via Grover), but the algebraic layer already caps the system at ~120 bits
+regardless. The ~120-bit PQ claim holds under the standard quantum circuit model (NIST
+assumption). The theoretical BHT collision attack (O(2^85) quantum) requires O(2^85) QRAM
+cells — hardware that does not exist and may never be physically realizable at that scale.
 
 ---
 
@@ -269,9 +268,11 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 - `tx_body_hash` binding prevents cross-transaction replay of proof artifacts
 - Every block accepted by a full node has been proof-verified before application
 
-**Privacy guarantee** (what the proof does not reveal):
+**Privacy model** (what the proof system does NOT provide):
+- The protocol is **not zero-knowledge** in the standard simulator sense. Two different secrets produce different (distinguishable) proof transcripts
+- Transaction graph analysis by proof pattern is possible
 - `spend_secret` cannot be recovered from any proof or wire artifact — computational one-wayness under Poseidon2b preimage resistance
-- Note: the GKR transcript is not zero-knowledge in the standard simulator sense; it leaks the Poseidon2b execution trace in a one-way form. An observer cannot recover the secret, but two proofs from different secrets are distinguishable. See [docs/security.md §10](docs/security.md).
+- See [docs/security.md §10](docs/security.md) for the formal analysis
 
 **What PoW guarantees:**
 - Canonical ordering of valid transitions
@@ -282,11 +283,11 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 - Forge a valid proof for slots the attacker does not own
 - Produce a `state_root` inconsistent with actual transitions
 - Spend outputs without knowing the spending secret
-- Fabricate a valid RecursiveProof (requires solving the underlying ZK hardness assumption)
+- Fabricate a valid RecursiveProof (requires breaking the underlying soundness assumption)
 
 **Snapshot sync security:** new nodes verify the RecursiveProof before accepting a snapshot. A malicious peer cannot serve a fabricated snapshot — the STARK verification would fail. Multiple peers are queried for Eclipse resistance; RecursiveProof STARK is unforgeable.
 
-**Replay protection:** `epoch_anchor` — a recent block hash committed inside the tx body hash and therefore inside all ZK proofs. Transactions expire after ~144 blocks.
+**Replay protection:** `epoch_anchor` — a recent block hash committed inside the tx body hash and therefore inside all proofs. Transactions expire after ~144 blocks.
 
 ---
 
@@ -371,21 +372,35 @@ proves the entire chain history from genesis.
 ### Quick Start
 
 ```bash
-# --- Join noid network (relay node) ---
-paranoid --mode relay
+# --- First node on a new network ---
+paranoid --mode miner --genesis \
+  --p2p-listen 0.0.0.0:9400 \
+  --rpc-listen 127.0.0.1:9401
+
+# --- Join an existing network (relay node) ---
+paranoid --mode relay \
+  --seed node1.noid.network \
+  --p2p-listen 0.0.0.0:9400 \
+  --rpc-listen 127.0.0.1:9401
 
 # --- Join and mine ---
-paranoid --mode miner
+paranoid --mode miner \
+  --seed node1.noid.network \
+  --p2p-listen 0.0.0.0:9400 \
+  --rpc-listen 127.0.0.1:9401
 
-# --- Solo Mining (node does ZK proving; external miners do PoW) ---
+# --- Mining pool (node does ZK proving; external miners do PoW) ---
 paranoid --mode extminer \
+  --seed node1.noid.network \
+  --rpc-listen 0.0.0.0:9401 \
   --mining-key my_secret_token \
   --allow-custom-coinbase       # each miner specifies their own payout address
 
 # --- External PoW miner (solo) ---
 noid-extminer --rpc http://127.0.0.1:9401
 
-noid-extminer --rpc http://ip:9401 \
+# --- External PoW miner (pool) ---
+noid-extminer --rpc http://pool.example.com:9401 \
   --key my_secret_token \
   --coinbase noid1my_payout_address
 ```
@@ -434,7 +449,7 @@ noid-cli utxos           # all owned UTXOs with slot indices
 noid-cli send <addr> <μNOID>  # --fee 0 auto-computes minimum
 noid-cli history         # confirmed TX history
 noid-cli consolidate     # merge small UTXOs
-noid-cli receipt <hash>  # export inclusion proof (Merkle + ZK)
+noid-cli receipt <hash>  # export inclusion proof (Merkle + STARK)
 noid-cli scan            # rescan state (after wallet restore)
 
 # Node
@@ -476,7 +491,7 @@ paranoid_submitBlock                  (extminer mode only)
 | Document | Contents |
 |----------|----------|
 | [docs/protocol.md](docs/protocol.md) | System architecture: all layers, interfaces, data flow, block structure, transaction lifecycle |
-| [docs/cryptography.md](docs/cryptography.md) | ZK proof stack: binary tower, Poseidon2b, FROST-GKR Kill-Shot, FRI-Binius, recursive STARK. Theorems and soundness proofs |
+| [docs/cryptography.md](docs/cryptography.md) | Proof stack: binary tower, Poseidon2b, FROST-GKR Kill-Shot, FRI-Binius, recursive STARK. Theorems and soundness proofs |
 | [docs/security.md](docs/security.md) | Formal security analysis: claims, proofs, soundness budget, privacy model |
 | [docs/network.md](docs/network.md) | P2P protocol: sync flows, gossip, peer discovery, validation pipeline, consensus parameters |
 | [docs/cli.md](docs/cli.md) | CLI reference, JSON-RPC API, configuration, deployment recipes |
@@ -502,7 +517,7 @@ Chain layer
   noid_chain         Consensus, UTXO state, MDBX storage, DA pruning, state binding
 
 Node layer
-  noid_mempool       Async mempool: ZK admission gate (semaphore-bounded), fee floor
+  noid_mempool       Async mempool: proof-verification admission gate (semaphore-bounded), fee floor
   noid_miner         Parallel PoW + ZK prover orchestrator
   noid_p2p           libp2p: BlockGossipMsg, RecursiveProofGossipMsg, snapshot sync
   noid_rpc           jsonrpsee JSON-RPC server

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Claims commitment (C_claimed): a Poseidon2b sponge binding the
 //! wallet's claimed slot values to the LogicProof via the Fiat-Shamir

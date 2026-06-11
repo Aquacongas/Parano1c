@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Helpers to build `TxBlockWitness` and `StateBindingBlockWitness` from
 //! public data + wallet proof bundles — **no SpendSecret required**.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 Paranoid.
+// Ported from hekate-math. Copyright (C) 2026 Paranoid Zero.
 
 //! `PackableField` trait and `PackedFlat<T>` fallback (WIDTH=1).
 

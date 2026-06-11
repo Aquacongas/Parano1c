@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Spine cross-check — running the 59-slot spine via the layered
 //! evaluator instead of `Poseidon2bPermutation::permute_mut` must

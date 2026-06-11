@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `WeightedLinearGate`: `Σ wᵢ · colᵢ + c == 0` — degree-1 linear gate
 //! over GF(2^128). XOR-linear sum (all weights `ONE`, no constant) is

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Adapted from binius64. Copyright (C) 2026 Paranoid.
+// Adapted from binius64. Copyright (C) 2026 Paranoid Zero.
 
 //! Variable folding for multilinear polynomials.
 

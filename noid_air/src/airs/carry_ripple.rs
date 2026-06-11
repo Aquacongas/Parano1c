@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! `CarryRippleAir` — 64-bit
 //! ripple-carry adder laid out along the hypercube, one instance per

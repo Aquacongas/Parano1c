@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 //! JSON response types for the Paranoid RPC API.
 
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Ported from hekate-math. Copyright (C) 2026 Paranoid.
+// Ported from hekate-math. Copyright (C) 2026 Paranoid Zero.
 
 //! GF(2^16) — quadratic extension of GF(2^8) with TAU = (0x20 left-shifted).
 

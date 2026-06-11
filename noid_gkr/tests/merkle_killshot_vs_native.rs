@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Integration test: Merkle Kill-Shot GKR produces the same root as
 //! native `noid_poseidon2b::native::compress` and the proof verifies.

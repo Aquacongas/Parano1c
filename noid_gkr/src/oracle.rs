@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Paranoid.
+// Copyright (C) 2026 Paranoid Zero.
 
 //! Reference oracle: re-executes the 59-permutation spine slot-by-slot
 //! using the native `noid_poseidon2b::Poseidon2bPermutation`. The
