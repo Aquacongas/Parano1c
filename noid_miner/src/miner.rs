@@ -23,9 +23,9 @@
 //! }
 //! ```
 //!
-//! Expected timing at 1024 txs on 8 cores:
+//! Expected timing at 256 txs on 8 cores:
 //!   PoW:   ~60s target (ASERT-controlled)
-//!   Prove: ~10s (parallel algebraic STARK + unified GKR + FRI)
+//!   Prove: ~8s (parallel algebraic STARK + unified GKR + FRI)
 //!   → PoW is the bottleneck; no block time wasted on proving.
 //!
 //! Template refresh triggers (see run loop):
@@ -69,7 +69,7 @@ pub struct MinerConfig {
     /// running).  This timer exists only for edge cases where both are silent.
     ///
     /// Must be > BLOCK_TIME to avoid firing during active proving and
-    /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 60s.
+    /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 75s.
     pub refresh_interval_secs: u64,
 }
 
@@ -78,7 +78,7 @@ impl Default for MinerConfig {
         Self {
             miner_address: Address([0u8; 32]),
             pow_threads: 0,
-            refresh_interval_secs: 60, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
+            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
         }
     }
 }
@@ -401,7 +401,7 @@ impl BlockMiner {
                             // Count leading zeros of the difficulty target (MSB-first, LE).
                             // Matches block_work() in difficulty.rs — higher = harder.
                             // Genesis = 27lz. ASERT raises this when blocks arrive faster
-                            // than BLOCK_TIME (12s) and lowers it when they're slower.
+                            // than BLOCK_TIME (15s) and lowers it when they're slower.
                             let diff_lz: u32 = {
                                 let t = &block.header.difficulty_target;
                                 let mut lz = 0u32;

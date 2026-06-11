@@ -37,7 +37,7 @@ pub struct TxSummary {
 pub struct ParanoidReceipt {
     pub version: u8,
     pub tx_body_hash: [u8; 32],
-    /// Sibling hashes along the Merkle path (leaf → root), length ≤ 10 for 1024 txs.
+    /// Sibling hashes along the Merkle path (leaf → root), length ≤ 8 for 256 txs.
     pub merkle_path: Vec<[u8; 32]>,
     /// Bitmask: bit k = 1 means the sibling at level k is on the LEFT.
     /// (equivalently: the current node at level k is a RIGHT child.)

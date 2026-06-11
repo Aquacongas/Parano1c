@@ -23,13 +23,13 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::protocol::{
-    CompactBlockMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
+    BlockGossipMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
     GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics, RecursiveProofGossipMsg,
 };
 
 // Hard caps on incoming response sizes to prevent OOM from malicious peers.
-const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024; // 2 MB (1024 txs × ~750 B each + header)
-const MAX_BLOCK_PROOF_BYTES: usize = 24 * 1024 * 1024; // 24 MB (19 MB at max + margin)
+const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB (256 txs × ~750 B each + header)
+const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // 6 MB (5 MB at max 256 txs + margin)
 const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin)
 const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB (6.5 KB typical)
 const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
@@ -37,16 +37,20 @@ const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
-    /// Announce a new block to all peers (compact: header only, ~310 bytes).
+    /// Announce a new block to all peers.
     ///
-    /// Peers that need the block pull it via `GetRecentBlockRequest`.
-    /// This replaces broadcasting the full block (~19 MB for 1024-tx blocks)
-    /// over gossipsub, which is architecturally unsound at any network size.
+    /// If `block_bytes` + `block_proof_bytes` fit within the inline threshold
+    /// (1 MB), the full block is gossiped directly (no round-trip needed).
+    /// Otherwise only the header is sent and peers pull via request-response.
     AnnounceBlock {
         height: u64,
         hash: [u8; 32],
         /// Wire-encoded BlockHeader (276 bytes).
         header_bytes: Vec<u8>,
+        /// Full block bytes (for inline mode). Empty = compact-only.
+        block_bytes: Vec<u8>,
+        /// Block proof bytes (for inline mode). Empty = compact-only.
+        block_proof_bytes: Vec<u8>,
     },
     /// Broadcast a new recursive proof update to all peers.
     BroadcastRecursiveProof {
@@ -219,14 +223,23 @@ impl P2PNetwork {
         self.event_tx.subscribe()
     }
 
-    /// Announce a new block to all peers (sends compact header only, ~310 bytes).
-    pub async fn announce_block(&self, height: u64, hash: [u8; 32], header_bytes: Vec<u8>) {
+    /// Announce a new block to all peers.  Small blocks are inlined in gossip.
+    pub async fn announce_block(
+        &self,
+        height: u64,
+        hash: [u8; 32],
+        header_bytes: Vec<u8>,
+        block_bytes: Vec<u8>,
+        block_proof_bytes: Vec<u8>,
+    ) {
         let _ = self
             .cmd_tx
             .send(NetworkCommand::AnnounceBlock {
                 height,
                 hash,
                 header_bytes,
+                block_bytes,
+                block_proof_bytes,
             })
             .await;
     }
@@ -543,24 +556,36 @@ fn handle_network_command(
             height,
             hash,
             header_bytes,
+            block_bytes,
+            block_proof_bytes,
         } => {
-            let msg = CompactBlockMsg {
-                height,
-                hash,
-                header_bytes,
+            // Inline threshold: if block + proof fit in 1 MB, gossip the full
+            // block directly.  Eliminates the round-trip for the common case
+            // (coinbase-only and low-tx blocks).
+            const INLINE_THRESHOLD: usize = 1024 * 1024; // 1 MB
+            let total = block_bytes.len() + block_proof_bytes.len();
+            let msg = if !block_bytes.is_empty() && total <= INLINE_THRESHOLD {
+                BlockGossipMsg::Inline {
+                    height,
+                    hash,
+                    block_bytes,
+                    block_proof_bytes,
+                }
+            } else {
+                BlockGossipMsg::Compact {
+                    height,
+                    hash,
+                    header_bytes,
+                }
             };
             match bincode::serialize(&msg) {
                 Ok(encoded) => {
                     let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
-                        // InsufficientPeers is normal at startup with 2-3 peers.
-                        // With flood_publish=false the mesh must form before messages
-                        // propagate.  The compact announcement is ~310 bytes so
-                        // MessageTooLarge should never occur.
                         tracing::debug!(height, err = %e, "gossipsub: block announcement");
                     }
                 }
-                Err(e) => tracing::error!("CompactBlockMsg serialize: {e}"),
+                Err(e) => tracing::error!("BlockGossipMsg serialize: {e}"),
             }
         }
         NetworkCommand::BroadcastRecursiveProof {
@@ -694,25 +719,54 @@ async fn handle_swarm_event(
             message,
             ..
         })) => {
+            // Prefer the original publisher (message.source) if we have a direct
+            // connection — they definitely have the full block. Fall back to
+            // propagation_source (forwarder) for nodes not directly connected to
+            // the publisher (common in large networks with multi-hop gossip).
+            let origin = message
+                .source
+                .filter(|src| swarm.is_connected(src))
+                .unwrap_or(propagation_source);
+
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
-                // Compact block announcement: header only (~310 bytes).
-                // The receiver pulls the full block + proof via block_sync
-                // if it needs the block (height > local tip).
-                match bincode::deserialize::<CompactBlockMsg>(&message.data) {
-                    Ok(msg) => {
+                match bincode::deserialize::<BlockGossipMsg>(&message.data) {
+                    Ok(BlockGossipMsg::Compact {
+                        height,
+                        hash,
+                        header_bytes,
+                    }) => {
                         let _ = event_tx.send(NetworkEvent::NewBlockAnnouncement {
-                            from: propagation_source,
-                            height: msg.height,
-                            hash: msg.hash,
-                            header_bytes: msg.header_bytes,
+                            from: origin,
+                            height,
+                            hash,
+                            header_bytes,
                         });
+                    }
+                    Ok(BlockGossipMsg::Inline {
+                        height,
+                        hash: _,
+                        block_bytes,
+                        block_proof_bytes,
+                    }) => {
+                        if block_bytes.len() > MAX_BLOCK_BYTES {
+                            tracing::warn!(peer = %propagation_source, len = block_bytes.len(), "inline block too large — dropped");
+                        } else if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
+                            tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
+                        } else {
+                            tracing::debug!(height, peer = %propagation_source, "received inline block via gossip");
+                            let _ = event_tx.send(NetworkEvent::NewBlock {
+                                from: origin,
+                                block_bytes,
+                                block_proof_bytes,
+                            });
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(
                             peer = %propagation_source,
                             err = %e,
-                            "compact block announcement deserialize failed"
+                            "block gossip message deserialize failed"
                         );
                     }
                 }
@@ -727,7 +781,7 @@ async fn handle_swarm_event(
                 ) {
                     Ok(msg) => {
                         let _ = event_tx.send(NetworkEvent::RecursiveProofUpdate {
-                            from: propagation_source,
+                            from: origin,
                             height: msg.height,
                             tip_hash: msg.tip_hash,
                             proof_bytes: msg.proof_bytes,
@@ -1171,9 +1225,20 @@ async fn handle_swarm_event(
             let result = {
                 let mut ctx = chain.write().await;
                 let our_tip = ctx.tip_height();
-                // Staleness guard: if we're more than FINALITY_DEPTH ahead,
-                // the client is syncing from a fork; it should restart.
-                if our_tip > request.expected_tip_height + FINALITY_DEPTH {
+                // Exact match: if our state has advanced past the manifest's tip,
+                // the segment data won't match the client's expected state_root.
+                // Return None so the client re-requests a fresh manifest.
+                // Also reject if we're far ahead (stale client on a fork).
+                if our_tip != request.expected_tip_height
+                    && our_tip > request.expected_tip_height + FINALITY_DEPTH
+                {
+                    None
+                } else if our_tip != request.expected_tip_height {
+                    tracing::debug!(
+                        our_tip,
+                        expected = request.expected_tip_height,
+                        "segment request tip mismatch — state advanced"
+                    );
                     None
                 } else {
                     let eff_log = ctx.state.state.effective_log_segment_size() as u8;

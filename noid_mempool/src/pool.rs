@@ -406,7 +406,7 @@ impl AsyncMempool {
         // invalid: their input slot is EMPTY (was moved elsewhere by the block).
         //
         // Without this eviction, stale txs occupy pool capacity for up to
-        // ANCHOR_DEPTH blocks (~28 min at 12s/block) before anchor_expiry.
+        // ANCHOR_DEPTH blocks (~36 min at 15s/block) before anchor_expiry.
         // They also fail silently in build_block_template (apply_tx returns Err)
         // wasting template-build cycles.
         let input_consumed: Vec<TxBodyHash> = st

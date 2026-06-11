@@ -784,7 +784,7 @@ impl MdbxChainContext {
     /// `BadStateRoot` consensus error.
     ///
     /// Cost: one MDBX read per evicted segment, O(evicted_count). Called once
-    /// per block template refresh; negligible at mainnet (12 s blocks).
+    /// per block template refresh; negligible at mainnet (15 s blocks).
     pub fn preload_all_evicted_segments(&mut self) -> Result<(), MdbxContextError> {
         let evicted: Vec<u16> = self.state.state.evicted_segment_ids().collect();
         for seg_id in evicted {

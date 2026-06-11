@@ -43,7 +43,7 @@ pub fn validate_tx_consensus(
 /// Called by `validate_block_consensus` because `apply_block` already
 /// verifies tx_body_hash for every transaction in the block, making the
 /// recomputation here redundant.
-/// At 1024 txs × 59-perm Poseidon2b, this saves ~60 ms per block application.
+/// At 256 txs × 59-perm Poseidon2b, this saves ~15 ms per block application.
 #[inline]
 pub(crate) fn validate_tx_consensus_skip_hash(
     tx: &Transaction,

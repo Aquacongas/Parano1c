@@ -9,8 +9,8 @@
 //! sized MLE and runs one unified Kill-Shot.
 //!
 //! Result: proof size and verification cost grow logarithmically (not
-//! linearly) in N. For N=1024 txs, this saves ~5.5 MB of spine proofs
-//! and reduces verifier time from 25s to ~35ms.
+//! linearly) in N. For N=256 txs, this saves ~1.4 MB of spine proofs
+//! and reduces verifier time from 6s to ~35ms.
 //!
 //! # Layout
 //!

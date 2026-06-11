@@ -30,7 +30,7 @@ use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 /// The economic / consensus limit is enforced elsewhere; this just keeps
 /// a malformed wire blob from allocating unbounded memory.
-pub const BLOCK_MAX_TXS: usize = 1024;
+pub const BLOCK_MAX_TXS: usize = 256;
 
 /// A block: header plus transactions. A block's STARK proof lives
 /// outside this struct; its transcript is bound into

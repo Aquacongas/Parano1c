@@ -585,11 +585,9 @@ async fn main() -> anyhow::Result<()> {
                             txs = n_txs,
                             "broadcast block"
                         );
-                        // Announce compact header to all peers (~310 bytes).
-                        // Peers pull the full block + proof via GetRecentBlockRequest.
-                        // This is correct for a proof-native statechain: blocks are
-                        // ephemeral (pruned after FINALITY_DEPTH), sync is via state
-                        // snapshot + recursive proof, not block replay.
+                        // Announce block to all peers.  Small blocks (< 1 MB)
+                        // are inlined in gossip — no round-trip.  Large blocks
+                        // fall back to compact header + pull.
                         let header_bytes = {
                             let mut buf = Vec::new();
                             if let Ok(block) = noid_chain::block::Block::from_bytes(&block_bytes) {
@@ -602,12 +600,10 @@ async fn main() -> anyhow::Result<()> {
                                 height,
                                 hash,
                                 header_bytes,
+                                block_bytes,
+                                block_proof_bytes,
                             })
                             .await;
-                        // block_bytes and block_proof_bytes are stored locally by
-                        // apply_found_block and available for pull requests.
-                        let _ = block_bytes; // consumed above
-                        let _ = block_proof_bytes; // stored in MDBX by miner
                     }
                     Ok(noid_miner::MinerEvent::ProveFailed { height, error }) => {
                         tracing::warn!(height, err = %error, "block prove failed");
@@ -1040,6 +1036,16 @@ async fn handle_p2p_events(
     let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
     const MAX_FETCH_DEPTH: u32 = 4;
 
+    // --- Stale-tip detection ---
+    //
+    // In large networks, block requests may fail (peer doesn't have the block
+    // yet, stream capacity hit, etc.) with no retry.  The stale-tip check
+    // detects when our chain hasn't advanced despite seeing higher announcements
+    // and re-requests from a random connected peer.
+    let mut last_tip_advance: Instant = Instant::now();
+    let mut highest_announced: u64 = 0;
+    let mut last_announcement_peer: Option<libp2p::PeerId> = None;
+
     // Heartbeat for time-dependent checks (manifest timeout, etc.)
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1055,6 +1061,10 @@ async fn handle_p2p_events(
                 hash: _,
                 header_bytes: _,
             }) => {
+                if height > highest_announced {
+                    highest_announced = height;
+                    last_announcement_peer = Some(from);
+                }
                 // Compact block announcement: peer has a block at `height`.
                 // If it's ahead of us, pull the full block + proof via block_sync.
                 // This is the correct flow for a proof-native statechain where blocks
@@ -1232,6 +1242,7 @@ async fn handle_p2p_events(
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
+                                last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
 
                                 // Store the BlockProof bytes so run_recursive_proof_updater
@@ -1289,6 +1300,7 @@ async fn handle_p2p_events(
                                                 height = h,
                                                 "applied chained orphan block"
                                             );
+                                            last_tip_advance = Instant::now();
                                         }
                                         Err(e) => {
                                             tracing::warn!(err = %e, "chained orphan apply failed");
@@ -2580,6 +2592,39 @@ async fn handle_p2p_events(
 
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
+            // --- Stale-tip recovery ---
+            // If our chain hasn't advanced in 30s but we've seen higher announcements,
+            // re-request the missing blocks from the peer that announced highest.
+            // This handles the case where all initial block requests failed (peer
+            // didn't have the block yet, stream capacity hit, etc.) in large networks.
+            let stale_secs = last_tip_advance.elapsed().as_secs();
+            if stale_secs >= 30 {
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                if highest_announced > our_height {
+                    if let Some(peer) = last_announcement_peer {
+                        let gap = (highest_announced - our_height) as u16;
+                        tracing::info!(
+                            our_height,
+                            highest_announced,
+                            stale_secs,
+                            peer = %peer,
+                            "stale tip — re-requesting blocks"
+                        );
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                peer,
+                                from_height: our_height + 1,
+                                count: gap,
+                            })
+                            .await;
+                        last_tip_advance = Instant::now();
+                    }
+                }
+            }
+
             // If we have valid candidates and the timeout has elapsed, proceed now.
             if pending_manifest.is_none() && !manifest_candidates.is_empty() {
                 let timed_out = manifest_first_candidate_at

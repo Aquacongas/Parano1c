@@ -246,13 +246,13 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 
 **Why Blake3:** block withholding protection is built into the proof structure. The coinbase address is bound inside `witness_root → proof_transcript_hash → BlockProof`. An external miner cannot substitute their payout address without regenerating the entire block proof (multi-second CPU operation — longer than the PoW at genesis difficulty).
 
-**Difficulty:** ASERT algorithm (Bitcoin Cash variant), 6-block epoch, 72-second halflife. Responds to any hashrate change within ~6 minutes. Floor: difficulty never eases below genesis target — ASERT can only move harder.
+**Difficulty:** ASERT algorithm (Bitcoin Cash variant), 6-block epoch, 90-second halflife. Responds to any hashrate change within ~7 minutes. Floor: difficulty never eases below genesis target — ASERT can only move harder.
 
 | Parameter | Value |
 |---|---|
-| Block time target | 12 s |
+| Block time target | 15 s |
 | Genesis difficulty | 2^229 |
-| ASERT halflife | 72 s (6 epochs × 12 s) |
+| ASERT halflife | 90 s (6 epochs × 15 s) |
 | Finality depth | 18 blocks |
 | Epoch anchor window | 144 blocks |
 | Header size | 276 bytes |
@@ -305,14 +305,14 @@ and BlockProofs are pruned. Only block **headers** (276 bytes each) are kept per
 **Temporary storage (pruned after 18 blocks):**
 | Data | Size |
 |---|---|
-| Block bytes | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~750 KB (1024 txs) |
-| BlockProofs | 0 (coinbase-only) – ~19 MB per block at max capacity (1024 txs) |
+| Block bytes | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~192 KB (256 txs) |
+| BlockProofs | 0 (coinbase-only) – ~5 MB per block at max capacity (256 txs) |
 | Undo logs | ~few KB per block |
 | Nullifier window | ~few KB (last 144 blocks) |
 
 At any given time the node holds at most 18 blocks’ worth of block data + BlockProofs.
-A network at full capacity (1024 txs/block) peaks at ~18 × 20 MB ≈ 360 MB of temporary
-storage before pruning (750 KB block + ~19 MB BlockProof per block).
+A network at full capacity (256 txs/block) peaks at ~18 × 5.2 MB ≈ 94 MB of temporary
+storage before pruning (192 KB block + ~5 MB BlockProof per block).
 
 | RAM | ~60–120 MB (jemalloc, small-state node) |
 
@@ -343,7 +343,7 @@ Proof size is **constant** regardless of input/output count (always 4 inputs, 8 
 
 PoW search and ZK proving run **in parallel**. BlockProof bytes are stored only for the **last 18 blocks** (reorg window), then pruned.
 
-The ~19 MB full-block proof does not accumulate on disk. What persists forever is the
+The ~5 MB full-block proof does not accumulate on disk. What persists forever is the
 **RecursiveProof** (6.5 KB) — a single entry that is overwritten with each advance and
 proves the entire chain history from genesis.
 

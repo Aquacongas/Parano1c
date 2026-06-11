@@ -57,7 +57,7 @@ Purpose: independent verification, snapshot serving, eclipse resistance.
 #### `--mode miner`
 
 ```
-Internal miner    : ENABLED  (PoW + ZK prove in parallel, ~12s target)
+Internal miner    : ENABLED  (PoW + ZK prove in parallel, ~15s target)
 Block templates   : DISABLED (extminer cannot connect)
 ZK block verify   : ENABLED
 State snapshots   : SERVES
@@ -169,7 +169,7 @@ struct RecursiveProofGossipMsg {
 Miner (--mode miner or --mode extminer):
   1. Build template (txs from mempool + coinbase)
   2. Parallel:
-       PoW search (Blake3, ~12s target)
+       PoW search (Blake3, ~15s target)
        ZK prove_block (~10s, TxLogicAir × N + SpineGKR + AuthGKR + FRI)
   3. Both done → seal block (embed proof_transcript_hash, witness_root)
   4. apply_found_block → commit to MDBX

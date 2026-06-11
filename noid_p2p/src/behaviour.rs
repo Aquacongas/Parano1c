@@ -177,21 +177,18 @@ impl NodeBehaviour {
         //
         // Block sizes (block_bytes only, no proof):
         //   coinbase:  ~1 KB
-        //   100 txs:   ~53 KB
-        //   1024 txs:  ~540 KB
+        //   50 txs:    ~27 KB
+        //   256 txs:   ~135 KB
         //
         // Block proof sizes (block_proof_bytes):
         //   coinbase:  0 B (empty)
         //   10 txs:    ~213 KB
-        //   100 txs:   ~1.9 MB
-        //   1024 txs:  ~19 MB  ← exceeds gossip, must use pull sync
+        //   50 txs:    ~1.2 MB
+        //   256 txs:   ~5 MB  ← exceeds gossip, must use pull sync
         //
-        // Strategy: gossip blocks up to ~2 MB (covers ~100 txs with proof).
-        // For larger blocks, nodes fall back to pull sync via block_sync
-        // request-response.  Gossiping 19 MB to 12 mesh peers at once
-        // (228 MB/block) is architecturally wrong regardless of the limit.
-        //
-        // TODO: implement compact block announcements (header + hash only)
+        // Strategy: inline blocks up to 1 MB via gossip (covers ~50 txs with
+        // proof).  Larger blocks use compact announcement + pull sync via
+        // block_sync request-response.
         // and have nodes pull the proof on demand for large blocks.
         const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024; // 2 MB
 

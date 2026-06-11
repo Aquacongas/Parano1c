@@ -8,13 +8,13 @@
 /// ASERT adjusts PoW difficulty so all hardware converges to this target.
 /// Bounded below by `prove_block_time` on the miner's hardware; PoW is
 /// ordering-only, not security-critical.
-pub const BLOCK_TIME: u64 = 12;
+pub const BLOCK_TIME: u64 = 15;
 
 /// Number of blocks per ASERT epoch.
 pub const EPOCH_LENGTH: u64 = 6;
 
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 72s at BLOCK_TIME=12
+pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 90s at BLOCK_TIME=15
 
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;
@@ -30,8 +30,9 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 ///
 /// Hardware is the natural regulator: weak nodes prove fewer txs within
 /// BLOCK_TIME and fall back to coinbase-only blocks via the prove semaphore.
-/// Strong hardware can prove ~1024 txs in ≤ 12s.
-pub const BLOCK_MAX_TXS: usize = 1024;
+/// A 32-core server can prove ~256 txs in ~15s; a laptop proves ~130 txs
+/// within BLOCK_TIME. ASERT adjusts so average block time converges regardless.
+pub const BLOCK_MAX_TXS: usize = 256;
 
 /// Maximum inputs per transaction.
 pub const MAX_INPUTS: usize = 4;
@@ -49,7 +50,7 @@ pub const MAX_OUTPUTS: usize = 8;
 /// `[block_height - ANCHOR_DEPTH - 1, block_height - 1]`.
 /// This gives a window of **ANCHOR_DEPTH + 1 = 145** possible anchor heights.
 ///
-/// At 12 s block time: ~29 minutes under normal conditions.
+/// At 15 s block time: ~36 minutes under normal conditions.
 ///
 /// Controls:
 /// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
@@ -58,7 +59,7 @@ pub const MAX_OUTPUTS: usize = 8;
 /// Note: the window *size* is ANCHOR_DEPTH+1 (inclusive on both ends).
 /// The constant name reflects maximum *depth*, not window size.
 ///
-/// NullifierSet max RAM: 144 blocks × 1024 txs × 32 bytes = ~4.7 MB (negligible).
+/// NullifierSet max RAM: 144 blocks × 256 txs × 32 bytes = ~1.2 MB (negligible).
 pub const ANCHOR_DEPTH: u64 = 144;
 
 // Compile-time assertion: ANCHOR_DEPTH must match noid_tx::ANCHOR_DEPTH.
@@ -231,7 +232,7 @@ mod tests {
     #[test]
     fn epoch_timing_is_consistent() {
         assert_eq!(HALFLIFE, EPOCH_LENGTH * BLOCK_TIME);
-        assert_eq!(HALFLIFE, 72, "HALFLIFE = 6 epochs × 12s");
+        assert_eq!(HALFLIFE, 90, "HALFLIFE = 6 epochs × 15s");
         assert_eq!(FINALITY_DEPTH, 3 * EPOCH_LENGTH);
     }
 

@@ -5,16 +5,18 @@
 //!
 //! ## Block propagation
 //!
-//! Blocks are NOT gossiped in full.  Large blocks (up to ~19 MB for 1024 txs)
-//! are incompatible with gossipsub bandwidth requirements.  Instead:
+//! Blocks use dual-mode gossip:
 //!
-//! 1. Miner gossips a `CompactBlockMsg` (~310 bytes: header + hash).
-//! 2. Peers that need the block pull it via `GetRecentBlockRequest`.
-//! 3. `GetRecentBlockResponse` includes both block_bytes AND block_proof_bytes.
+//! 1. **Inline** (common case): small blocks (coinbase-only or few txs, total
+//!    < 1 MB) are sent in full via gossipsub.  Receivers apply immediately —
+//!    no round-trip, no race condition.
 //!
-//! This mirrors Bitcoin's compact block protocol and Ethereum's `NewBlockHashes`
-//! announcement.  One extra round-trip per block is an acceptable tradeoff for
-//! correct bandwidth behaviour at any network size.
+//! 2. **Compact** (large blocks): header-only gossip (~310 bytes).  Receivers
+//!    pull the full block + proof via `GetRecentBlockRequest`.  This mirrors
+//!    Bitcoin's compact block protocol and Ethereum's `NewBlockHashes`.
+//!
+//! The 1 MB inline threshold is well below the 2 MB gossipsub transmit limit
+//! and handles 99%+ of real-world blocks (coinbase-only through ~100 txs).
 //!
 //! ## State sync
 //!
@@ -178,21 +180,30 @@ pub struct GetMempoolResponse {
 // Compact block announcement (gossip)
 // ---------------------------------------------------------------------------
 
-/// Gossipsub announcement: a new block is available.
+/// Gossipsub block message — compact announcement OR inline full block.
 ///
-/// Contains only the block header (~310 bytes total) — NOT the block body or
-/// proof.  Receivers that need the block pull it via `GetRecentBlockRequest`.
+/// For small blocks (coinbase-only or few txs) that fit within the gossipsub
+/// message size limit (2 MB), the full block + proof are inlined.  This
+/// eliminates the request-response round-trip, removing the race condition
+/// where the pull target hasn't fetched the block yet.
 ///
-/// This replaces the legacy `BlockGossipMsg` design where the full proof
-/// (up to 19 MB for 1024-tx blocks) was broadcast to all mesh peers.
-/// Gossiping 19 MB × 12 mesh peers = 228 MB per block is architecturally
-/// unsound regardless of the transport limit.
+/// For large blocks (many txs, proof > 1 MB), only the header is sent and
+/// receivers pull the full block via `GetRecentBlockRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactBlockMsg {
-    pub height: u64,
-    pub hash: [u8; 32],
-    /// Wire-encoded BlockHeader (276 bytes).
-    pub header_bytes: Vec<u8>,
+pub enum BlockGossipMsg {
+    /// Compact: header only.  Receivers must pull full block.
+    Compact {
+        height: u64,
+        hash: [u8; 32],
+        header_bytes: Vec<u8>,
+    },
+    /// Inline: full block + proof in gossip message.  No pull needed.
+    Inline {
+        height: u64,
+        hash: [u8; 32],
+        block_bytes: Vec<u8>,
+        block_proof_bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------

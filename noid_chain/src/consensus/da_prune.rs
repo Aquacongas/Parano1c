@@ -26,7 +26,7 @@ use noid_poseidon2b::primitives::TxBodyHash;
 /// mutated by the block, enabling reversion without the full block data.
 ///
 /// Maximum size: `BLOCK_MAX_TXS × (MAX_INPUTS + MAX_OUTPUTS) × sizeof(SlotValue)`
-/// ≈ 590 KB at genesis parameters .
+/// ≈ 147 KB at genesis parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.

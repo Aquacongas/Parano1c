@@ -67,8 +67,8 @@ pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u64 {
 /// Same as `max_coinbase_value` but accepts a pre-computed fee sum.
 ///
 /// Used by `validate_block_consensus` to avoid cloning all non-coinbase
-/// `TxBody` objects just to sum their fees. Saves ~1024 × (Vec allocs +
-/// TxInput/TxOutput copies) per block at 1024 txs.
+/// `TxBody` objects just to sum their fees. Saves ~256 × (Vec allocs +
+/// TxInput/TxOutput copies) per block at 256 txs.
 #[inline]
 pub fn max_coinbase_value_from_fee_sum(log_slots: u32, fee_sum: u64) -> u64 {
     block_reward(log_slots).saturating_add(fee_sum)

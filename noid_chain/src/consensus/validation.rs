@@ -198,7 +198,7 @@ pub fn validate_block_consensus(
     // --- Per-tx consensus checks (P.8) ---
     // Use skip_hash variant: apply_block (called below) already verifies
     // tx_body_hash for every tx, so recomputing 59-perm Poseidon2b here
-    // would be pure redundant work (~60 ms at 1024 txs).
+    // would be pure redundant work (~15 ms at 256 txs).
     for tx in &block.transactions {
         validate_tx_consensus_skip_hash(tx, nullifiers)?;
     }
