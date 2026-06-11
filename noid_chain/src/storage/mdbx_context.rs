@@ -630,8 +630,18 @@ impl MdbxChainContext {
         // Persist the reverted state to MDBX atomically.
         // dirty segments are written before new blocks so crash
         // recovery always sees a consistent ancestor checkpoint.
+        //
+        // SAFETY: if persist fails, the node is in a degraded state (RAM reverted
+        // but MDBX at old tip). The caller must trigger snapshot sync to recover.
+        // On crash-and-restart, MDBX wins (still at old tip, consistent).
         // -----------------------------------------------------------------------
-        self.persist_reorg_checkpoint(&ancestor_header)?;
+        if let Err(e) = self.persist_reorg_checkpoint(&ancestor_header) {
+            tracing::error!(
+                ancestor_height,
+                "persist_reorg_checkpoint failed — node state degraded, snapshot sync required"
+            );
+            return Err(e);
+        }
 
         // -----------------------------------------------------------------------
         // Apply new blocks using the existing apply_next_block.

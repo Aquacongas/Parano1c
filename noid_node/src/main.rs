@@ -1098,6 +1098,23 @@ async fn handle_p2p_events(
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
 
+                        // Skip blocks at or below our current tip — we already have them.
+                        // This avoids expensive ZK verification against a stale pre-state
+                        // (build_state_binding_airs needs pre-state, but chain has already
+                        // advanced past this height, causing false ConstraintViolated errors).
+                        {
+                            let our_tip = chain.read().await.tip_height();
+                            if block.header.height <= our_tip {
+                                tracing::debug!(
+                                    peer = %from,
+                                    height = block.header.height,
+                                    our_tip,
+                                    "dropping duplicate/stale block (already at tip)"
+                                );
+                                continue;
+                            }
+                        }
+
                         // ZK proof verification (when proof bytes are present).
                         //
                         // For coinbase-only blocks (empty proof) this is skipped entirely.
@@ -1108,6 +1125,9 @@ async fn handle_p2p_events(
                         // Important: verify_block is called under a READ lock so it does
                         // NOT modify the chain state. apply_next_block (below) then applies
                         // the block under a WRITE lock once ZK is confirmed valid.
+                        // SECURITY: Blocks with user transactions MUST carry proof bytes.
+                        // An empty proof is only acceptable for coinbase-only blocks.
+                        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
                         let zk_reject = if !block_proof_bytes.is_empty() {
                             match bincode::deserialize::<noid_block::BlockProof>(&block_proof_bytes)
                             {
@@ -1151,8 +1171,15 @@ async fn handle_p2p_events(
                                     Some(())
                                 }
                             }
+                        } else if has_user_txs {
+                            tracing::warn!(
+                                peer = %from,
+                                height = block.header.height,
+                                "P2P block has user txs but no proof bytes — rejected"
+                            );
+                            Some(())
                         } else {
-                            None // no proof bytes — coinbase-only, skip ZK check
+                            None // coinbase-only, no proof needed
                         };
                         if zk_reject.is_some() {
                             continue;
@@ -2789,21 +2816,45 @@ async fn run_recursive_proof_updater(
         // Build the replay witness.
         // Real proof available  → extract from BlockProof bytes.
         // Coinbase-only block   → null witness (accumulator still advances correctly).
+        // SECURITY: Only use null witness for blocks whose header declares the
+        // stub marker. Blocks with a real proof_transcript_hash MUST have proof
+        // bytes; if missing, wait instead of fabricating a zero-claim chain_hash.
+        const STUB_MARKER: [u8; 32] = [1u8; 32];
+        let is_coinbase_only = header.proof_transcript_hash == STUB_MARKER;
         let witness = match block_proof_bytes_opt {
             Some(ref bytes) if !bytes.is_empty() => {
                 match bincode::deserialize::<BlockProof>(bytes) {
                     Ok(bp) => block_proof_to_replay_witness(&bp),
                     Err(e) => {
-                        tracing::warn!(
-                            next_height,
-                            err = ?e,
-                            "block proof decode failed — using null witness"
-                        );
-                        null_block_replay_witness()
+                        if is_coinbase_only {
+                            tracing::warn!(
+                                next_height,
+                                err = ?e,
+                                "block proof decode failed on coinbase-only block — using null witness"
+                            );
+                            null_block_replay_witness()
+                        } else {
+                            tracing::warn!(
+                                next_height,
+                                err = ?e,
+                                "block proof decode failed — cannot advance, waiting for re-sync"
+                            );
+                            continue;
+                        }
                     }
                 }
             }
-            _ => null_block_replay_witness(),
+            _ => {
+                if is_coinbase_only {
+                    null_block_replay_witness()
+                } else {
+                    tracing::debug!(
+                        next_height,
+                        "non-coinbase block missing proof bytes — waiting"
+                    );
+                    continue;
+                }
+            }
         };
 
         // prev_acc comes from the last proved block's accumulator.

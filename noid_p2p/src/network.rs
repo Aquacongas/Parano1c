@@ -27,6 +27,13 @@ use crate::protocol::{
     GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics, RecursiveProofGossipMsg,
 };
 
+// Hard caps on incoming response sizes to prevent OOM from malicious peers.
+const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024; // 2 MB (1024 txs × ~750 B each + header)
+const MAX_BLOCK_PROOF_BYTES: usize = 24 * 1024 * 1024; // 24 MB (19 MB at max + margin)
+const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin)
+const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB (6.5 KB typical)
+const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
+
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -936,15 +943,21 @@ async fn handle_swarm_event(
             },
         )) => {
             if let Some(block_bytes) = response.block_bytes {
-                tracing::debug!(peer = %peer, "received block via pull");
-                // Include proof bytes if the peer served them.
-                // Empty vec for coinbase-only blocks (correct, matches node expectations).
-                let block_proof_bytes = response.block_proof_bytes.unwrap_or_default();
-                let _ = event_tx.send(NetworkEvent::NewBlock {
-                    from: peer,
-                    block_bytes,
-                    block_proof_bytes,
-                });
+                if block_bytes.len() > MAX_BLOCK_BYTES {
+                    tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
+                } else {
+                    let proof_bytes = response.block_proof_bytes.unwrap_or_default();
+                    if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
+                        tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
+                    } else {
+                        tracing::debug!(peer = %peer, "received block via pull");
+                        let _ = event_tx.send(NetworkEvent::NewBlock {
+                            from: peer,
+                            block_bytes,
+                            block_proof_bytes: proof_bytes,
+                        });
+                    }
+                }
             }
         }
 
@@ -1010,6 +1023,14 @@ async fn handle_swarm_event(
         )) => {
             let proof_bytes = response.proof_bytes.unwrap_or_default();
             let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
+            if proof_bytes.len() > MAX_RECURSIVE_PROOF_BYTES {
+                tracing::warn!(peer = %peer, len = proof_bytes.len(), "recursive proof response too large — dropped");
+                return;
+            }
+            if tip_header_bytes.len() > MAX_HEADER_BYTES {
+                tracing::warn!(peer = %peer, len = tip_header_bytes.len(), "tip header in proof response too large — dropped");
+                return;
+            }
             tracing::debug!(
                 from = %peer,
                 proof_len = proof_bytes.len(),
@@ -1037,7 +1058,7 @@ async fn handle_swarm_event(
         )) => {
             use noid_chain::consensus::params::ANCHOR_DEPTH;
             let manifest = {
-                let mut ctx = chain.write().await;
+                let ctx = chain.write().await;
                 let tip_h = ctx.tip_height();
                 if tip_h == 0 || tip_h <= request.requester_height {
                     GetStateManifestResponse::default()
@@ -1106,6 +1127,14 @@ async fn handle_swarm_event(
                 const MAX_RECENT_HEADERS: usize = 512;
                 if response.recent_headers.len() > MAX_RECENT_HEADERS {
                     tracing::warn!(from = %peer, "manifest: too many headers, dropping");
+                    return;
+                }
+                if response.recent_headers.iter().any(|h| h.len() > MAX_HEADER_BYTES) {
+                    tracing::warn!(from = %peer, "manifest: oversized header entry, dropping");
+                    return;
+                }
+                if response.segment_ids.len() > 4096 {
+                    tracing::warn!(from = %peer, "manifest: too many segment IDs, dropping");
                     return;
                 }
                 tracing::info!(
@@ -1181,6 +1210,12 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
+            if let Some(ref data) = response.data {
+                if data.len() > MAX_SEGMENT_BYTES {
+                    tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response too large — dropped");
+                    return;
+                }
+            }
             tracing::debug!(
                 from = %peer,
                 segment_id = response.segment_id,

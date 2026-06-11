@@ -44,15 +44,6 @@ macro_rules! newtype_digest {
             }
         }
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                for byte in &self.0 {
-                    write!(f, "{:02x}", byte)?;
-                }
-                Ok(())
-            }
-        }
-
         impl $name {
             #[inline]
             pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -196,6 +187,33 @@ newtype_digest!(
     /// Canonical transaction-body hash.
     TxBodyHash
 );
+
+impl std::fmt::Display for Commitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for AuthTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TxBodyHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
 
 /// The 256-bit wallet spend secret. Preimage of `Address`. Stored
 /// encrypted at rest.
