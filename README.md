@@ -64,7 +64,7 @@ inner_n       = Poseidon2b_compress(H_BLOCK(header_n), block_initial_claim_n)
 chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 ```
 
-`block_initial_claim` encodes the MLE evaluation of the block’s slot-state transitions and is folded into every step, binding the chain hash to both the block header and the block’s state-transition proof. The recursive proof proves that this accumulator was correctly computed from genesis, and that the current `state_root` is the result. It is a single STARK over a 256-row trace — constant size regardless of chain length.
+`block_initial_claim` encodes the MLE evaluation of the block's slot-state transitions and is folded into every step, binding the chain hash to both the block header and the block's state-transition proof. The recursive proof proves that this accumulator was correctly computed from genesis, and that the current `state_root` is the result. It is a single STARK over a 256-row trace — constant size regardless of chain length.
 
 **Result:** A new node downloads:
 1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
@@ -271,7 +271,7 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 
 **Privacy guarantee** (what the proof does not reveal):
 - `spend_secret` cannot be recovered from any proof or wire artifact — computational one-wayness under Poseidon2b preimage resistance
-- Note: the GKR transcript is not zero-knowledge in the standard simulator sense; it leaks the Poseidon2b execution trace in a one-way form. An observer cannot recover the secret, but two proofs from different secrets are distinguishable. See `SECURITY_MODEL.md §10`.
+- Note: the GKR transcript is not zero-knowledge in the standard simulator sense; it leaks the Poseidon2b execution trace in a one-way form. An observer cannot recover the secret, but two proofs from different secrets are distinguishable. See [docs/security.md §10](docs/security.md).
 
 **What PoW guarantees:**
 - Canonical ordering of valid transitions
@@ -298,7 +298,7 @@ and BlockProofs are pruned. Only block **headers** (276 bytes each) are kept per
 **Permanent storage:**
 | Data | Size |
 |---|---|
-| Headers | ~145 MB/year (276 bytes × every block, forever) |
+| Headers | ~553 MB/year (276 bytes × every block, forever) |
 | UTXO set | ~3 MB per 65,536 unspent outputs (populated segments only) |
 | Recursive proof | 6.5 KB (single entry, overwritten on each advance) |
 
@@ -310,7 +310,7 @@ and BlockProofs are pruned. Only block **headers** (276 bytes each) are kept per
 | Undo logs | ~few KB per block |
 | Nullifier window | ~few KB (last 144 blocks) |
 
-At any given time the node holds at most 18 blocks’ worth of block data + BlockProofs.
+At any given time the node holds at most 18 blocks' worth of block data + BlockProofs.
 A network at full capacity (256 txs/block) peaks at ~18 × 5.2 MB ≈ 94 MB of temporary
 storage before pruning (192 KB block + ~5 MB BlockProof per block).
 
@@ -339,7 +339,7 @@ Proof size is **constant** regardless of input/output count (always 4 inputs, 8 
 | 10 txs | ~1.0 s | ~290 ms | ~213 KB |
 | 20 txs | ~1.9 s | ~530 ms | ~410 KB |
 | 100 txs | ~9.0 s | ~2.5 s | ~1.9 MB |
-| 1024 txs (max) | ~90 s | ~25 s | ~19 MB |
+| 256 txs (max) | ~23 s | ~6.4 s | ~5 MB |
 
 PoW search and ZK proving run **in parallel**. BlockProof bytes are stored only for the **last 18 blocks** (reorg window), then pruned.
 
@@ -371,35 +371,21 @@ proves the entire chain history from genesis.
 ### Quick Start
 
 ```bash
-# --- First node on a new network ---
-paranoid --mode miner --genesis \
-  --p2p-listen 0.0.0.0:9400 \
-  --rpc-listen 127.0.0.1:9401
-
-# --- Join an existing network (relay node) ---
-paranoid --mode relay \
-  --seed node1.noid.network \
-  --p2p-listen 0.0.0.0:9400 \
-  --rpc-listen 127.0.0.1:9401
+# --- Join noid network (relay node) ---
+paranoid --mode relay
 
 # --- Join and mine ---
-paranoid --mode miner \
-  --seed node1.noid.network \
-  --p2p-listen 0.0.0.0:9400 \
-  --rpc-listen 127.0.0.1:9401
+paranoid --mode miner
 
-# --- Mining pool (node does ZK proving; external miners do PoW) ---
+# --- Solo Mining (node does ZK proving; external miners do PoW) ---
 paranoid --mode extminer \
-  --seed node1.noid.network \
-  --rpc-listen 0.0.0.0:9401 \
   --mining-key my_secret_token \
   --allow-custom-coinbase       # each miner specifies their own payout address
 
 # --- External PoW miner (solo) ---
 noid-extminer --rpc http://127.0.0.1:9401
 
-# --- External PoW miner (pool) ---
-noid-extminer --rpc http://pool.example.com:9401 \
+noid-extminer --rpc http://ip:9401 \
   --key my_secret_token \
   --coinbase noid1my_payout_address
 ```
@@ -482,6 +468,18 @@ paranoid_stop
 paranoid_getBlockTemplate             (extminer mode only)
 paranoid_submitBlock                  (extminer mode only)
 ```
+
+---
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [docs/protocol.md](docs/protocol.md) | System architecture: all layers, interfaces, data flow, block structure, transaction lifecycle |
+| [docs/cryptography.md](docs/cryptography.md) | ZK proof stack: binary tower, Poseidon2b, FROST-GKR Kill-Shot, FRI-Binius, recursive STARK. Theorems and soundness proofs |
+| [docs/security.md](docs/security.md) | Formal security analysis: claims, proofs, soundness budget, privacy model |
+| [docs/network.md](docs/network.md) | P2P protocol: sync flows, gossip, peer discovery, validation pipeline, consensus parameters |
+| [docs/cli.md](docs/cli.md) | CLI reference, JSON-RPC API, configuration, deployment recipes |
 
 ---
 

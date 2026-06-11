@@ -37,8 +37,8 @@ use crate::BlockProof;
 /// - Recursive proof advances asynchronously via `update_recursive_proof`.
 ///
 /// The recursive proof is never required for consensus validity — it exists
-/// only for O(1) light-client sync. Missing or lagging recursive proof does
-/// not affect block validation.
+/// only for O(1) snapshot sync verification. Missing or lagging recursive
+/// proof does not affect block validation.
 pub struct BlockChainContext {
     /// Native consensus chain state (headers, nullifiers, UTXO state, undo logs).
     pub consensus: ChainContext,
@@ -172,7 +172,7 @@ impl BlockChainContext {
         self.recursive_lag() <= 3
     }
 
-    /// True if light clients should fall back to native verification
+    /// True if syncing nodes should fall back to native verification
     /// (recursive proof > FINALITY_DEPTH blocks behind).
     pub fn recursive_fallback(&self) -> bool {
         use noid_chain::consensus::params::FINALITY_DEPTH;

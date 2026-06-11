@@ -54,7 +54,7 @@ pub struct NodeBehaviour {
     pub block_sync:
         request_response::cbor::Behaviour<GetRecentBlockRequest, GetRecentBlockResponse>,
 
-    /// Recursive proof sync (O(1) light client sync).
+    /// Recursive proof sync (O(1) chain-history verification).
     pub proof_sync:
         request_response::cbor::Behaviour<GetRecursiveProofRequest, GetRecursiveProofResponse>,
 

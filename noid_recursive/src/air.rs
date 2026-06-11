@@ -195,7 +195,7 @@ impl RecursiveBlockAir {
     /// generation (prover side) and are not needed here.
     ///
     /// Use this when verifying a `RecursiveBlockProof` without having the
-    /// full prover witness (e.g. snapshot verification in a light client).
+    /// full prover witness (e.g. snapshot verification during sync).
     pub fn from_prev_state_root(acc_prev_state_root: &[u8; 32]) -> Self {
         let dummy_witness = RecursiveBlockWitness {
             block_multipoint_rounds: Vec::new(),

@@ -111,8 +111,8 @@ flowchart TD
 
 ## 5. FROST-GKR Kill-Shot (SC-1, SC-6)
 
-> Protocol specification: `noid_gkr/SPEC.md`  
-> Soundness checklist: `noid_gkr/AUDIT.md`
+> Protocol specification: `docs/cryptography.md §3`  
+> Full system protocol: `docs/protocol.md`
 
 ### 5.1 What Is Proved
 
@@ -483,4 +483,4 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 
 ---
 
-*All security arguments in this document reduce to the assumptions in §2 and are grounded in the production code. Per-crate protocol detail: `noid_gkr/SPEC.md`, `noid_gkr/AUDIT.md`.*
+*All security arguments in this document reduce to the assumptions in §2 and are grounded in the production code. Cryptographic protocol detail: `docs/cryptography.md`. System architecture: `docs/protocol.md`.*

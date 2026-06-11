@@ -130,7 +130,7 @@ pub enum MinerEvent {
 /// is updated. Enables the built-in wallet to capture receipts race-free:
 /// by the time `getMempoolSize` drops to 0, the receipt is already stored.
 ///
-/// Light-node wallets subscribe via the P2P block event instead.
+/// Remote wallets subscribe via the P2P block event instead.
 pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>;
 
 pub struct BlockMiner {

@@ -556,7 +556,7 @@ async fn main() -> anyhow::Result<()> {
         // Register wallet hook: called synchronously in apply_found_block BEFORE
         // on_new_block. Guarantees receipt is stored before getMempoolSize drops to 0.
         // Works at any mining speed — no channel, no capacity limit, no race.
-        // Light-node wallets use P2P block subscription independently.
+        // Remote wallets use P2P block subscription independently.
         {
             let hook_wallet = shared_wallet.clone();
             miner.set_block_applied_hook(std::sync::Arc::new(move |block| {
