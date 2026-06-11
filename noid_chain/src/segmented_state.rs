@@ -392,6 +392,16 @@ impl SegmentedFriState {
         self.seg_roots[id].unwrap()
     }
 
+    /// Try to borrow segment columns without mutation.
+    ///
+    /// Returns `Some(&SegmentColumns)` if the segment is loaded in RAM.
+    /// Returns `None` if the segment is evicted or never allocated (caller
+    /// should fall back to MDBX or construct a zero segment).
+    #[inline]
+    pub fn try_get_segment_columns(&self, seg_id: u16) -> Option<&SegmentColumns> {
+        self.segments[seg_id as usize].as_deref()
+    }
+
     /// Borrow the column data for a segment (materialises if needed).
     ///
     /// For virtual zero segments at production size (`effective_log_seg ==

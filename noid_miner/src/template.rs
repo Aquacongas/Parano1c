@@ -180,9 +180,15 @@ impl TemplateBuilder {
                 let mut pre_segs: HashMap<u16, SegmentColumns> =
                     HashMap::with_capacity(touched_segs.len());
                 for seg_id in touched_segs {
-                    let cols = match ctx.store.get_segment(seg_id) {
-                        Ok(Some((_eff, c))) => c,
-                        _ => SegmentColumns::new_zero(1usize << eff_log),
+                    // Fast path: read from RAM if segment is loaded (avoids MDBX I/O).
+                    let cols = if let Some(c) = ctx.state.state.try_get_segment_columns(seg_id) {
+                        c.clone()
+                    } else {
+                        // Evicted or never-allocated: read from MDBX.
+                        match ctx.store.get_segment(seg_id) {
+                            Ok(Some((_eff, c))) => c,
+                            _ => SegmentColumns::new_zero(1usize << eff_log),
+                        }
                     };
                     pre_segs.insert(seg_id, cols);
                 }

@@ -15,6 +15,19 @@
 //! (nullifiers from stored nullifier-block entries, segment columns from the
 //! `segments` table). No replay from genesis needed.
 //!
+//! # Restart strategy
+//!
+//! On startup, the node attempts to resume from persisted state. If the
+//! state_root integrity check passes (segment columns produce the expected
+//! root), the node resumes at its stored tip height and forward-syncs from
+//! peers (block-by-block for small gaps, snapshot-sync for large gaps).
+//!
+//! If state is corrupt (bit-rot, incomplete write), volatile tables are
+//! cleared and the node falls back to genesis + snapshot-sync from peers.
+//!
+//! This prevents simultaneous-restart network death: when all nodes reboot,
+//! each resumes from its own verified state instead of needing a peer snapshot.
+//!
 //! # Hot vs cold data
 //!
 //! | Data | Where | Why |
@@ -127,28 +140,28 @@ impl MdbxChainContext {
 
     /// Open an existing MDBX database, or initialise a fresh one from genesis.
     ///
-    /// On every startup, volatile tables (segments, undo logs, nullifiers, etc.)
-    /// are cleared via `clear_for_restart`. The node will sync fresh state from
-    /// peers and verify it against the recursive chain proof (~5 ms). This avoids
-    /// stale-state issues and aligns with the proof-native architecture.
+    /// State persistence strategy:
     ///
-    /// T_HEADERS and T_HASH_TO_HEIGHT are preserved across restarts.
+    /// 1. If MDBX has valid state (chain_tip + segments with correct state_root),
+    ///    resume from local state. The P2P layer handles forward-sync (block-by-block
+    ///    if gap <= FINALITY_DEPTH, snapshot-sync if gap > FINALITY_DEPTH).
+    ///
+    /// 2. If state is corrupted (state_root mismatch, missing tables), clear volatile
+    ///    tables and fall back to genesis. The P2P layer will snapshot-sync from peers.
+    ///
+    /// 3. If MDBX is empty (first run), initialise from genesis.
+    ///
+    /// This prevents simultaneous-restart network death: when all nodes reboot at
+    /// once (provider outage), each resumes from its own verified local state instead
+    /// of requiring peers to serve a snapshot that nobody has.
+    ///
+    /// T_HEADERS, T_HASH_TO_HEIGHT, and T_RECURSIVE_PROOF are always preserved.
     pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError> {
         let store = MdbxStore::open(path)?;
 
-        // Clear volatile state on every startup. The node will sync fresh state
-        // from peers and verify it via the recursive chain proof. We don't need
-        // to trust our own cached state when the network provides a verified snapshot.
-        if let Err(e) = store.clear_for_restart() {
-            tracing::warn!(err = %e, "clear_for_restart failed — continuing anyway");
-        }
-
-        // After clearing, T_CHAIN_TIP is empty -> is_empty() returns true -> init from genesis.
-        // The P2P layer will request a state snapshot and override this immediately.
         if store.is_empty()? {
             // First run: initialise from genesis.
             let consensus = ChainContext::init_from_genesis();
-            // Genesis chainwork = work contributed by the genesis block alone.
             let tip_chain_work = block_work(&GENESIS_TARGET);
             let ctx = Self {
                 store,
@@ -159,12 +172,44 @@ impl MdbxChainContext {
                 tip_hash: consensus.tip_hash,
                 tip_chain_work,
             };
-            // Persist genesis state_meta and chain_tip so subsequent restarts work.
             ctx.persist_genesis()?;
             Ok(ctx)
         } else {
-            // Subsequent run: restore from MDBX.
-            Self::restore_from_mdbx(store)
+            // Try to restore from existing MDBX state (state_root integrity check inside).
+            match Self::restore_from_mdbx(store) {
+                Ok(ctx) => {
+                    tracing::info!(
+                        height = ctx.tip_height,
+                        "resumed from persisted state"
+                    );
+                    Ok(ctx)
+                }
+                Err(MdbxContextError::Corrupt(reason)) => {
+                    tracing::warn!(
+                        reason,
+                        "local state corrupt — clearing and restarting from genesis"
+                    );
+                    // Re-open store (the previous one was consumed by restore_from_mdbx).
+                    let store = MdbxStore::open(path)?;
+                    if let Err(e) = store.clear_for_restart() {
+                        tracing::warn!(err = %e, "clear_for_restart failed");
+                    }
+                    let consensus = ChainContext::init_from_genesis();
+                    let tip_chain_work = block_work(&GENESIS_TARGET);
+                    let ctx = Self {
+                        store,
+                        state: consensus.state,
+                        nullifiers: consensus.nullifiers,
+                        recent_headers: consensus.headers,
+                        tip_height: consensus.tip_height,
+                        tip_hash: consensus.tip_hash,
+                        tip_chain_work,
+                    };
+                    ctx.persist_genesis()?;
+                    Ok(ctx)
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 

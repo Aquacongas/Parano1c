@@ -1286,27 +1286,42 @@ async fn handle_swarm_event(
         }
 
         // --- Connection events ---
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
-            tracing::debug!(peer = %peer_id, "peer connected");
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            num_established,
+            ..
+        } => {
+            // Only emit PeerConnected on the FIRST connection to a peer.
+            // Multiple connections to the same peer are common (simultaneous dials,
+            // mDNS re-discovery, relay + direct). Emitting for each one causes
+            // redundant SyncBlocksFrom and RequestMempoolSync from the node handler.
+            if num_established.get() == 1 {
+                let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
+                tracing::debug!(peer = %peer_id, "peer connected");
+            }
             // Clear any pending reconnect entry — connection succeeded.
             reconnect.remove(&peer_id);
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
+            num_established,
             endpoint,
             cause,
             ..
         } => {
-            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
-            tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
-            // Schedule reconnect for peers we dialled (outbound connections).
-            // We don't attempt to reconnect inbound peers — they should re-dial us.
-            if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
-                if !reconnect.contains_key(&peer_id) {
-                    let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                    reconnect.insert(peer_id, (address, retry_at, 0));
-                    tracing::debug!(peer = %peer_id, "scheduled reconnect in 10s");
+            // Only emit PeerDisconnected when the LAST connection to a peer closes.
+            if num_established == 0 {
+                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
+                // Schedule reconnect for peers we dialled (outbound connections).
+                // We don't attempt to reconnect inbound peers — they should re-dial us.
+                if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
+                    if !reconnect.contains_key(&peer_id) {
+                        let retry_at =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                        reconnect.insert(peer_id, (address, retry_at, 0));
+                        tracing::debug!(peer = %peer_id, "scheduled reconnect in 10s");
+                    }
                 }
             }
         }

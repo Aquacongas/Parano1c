@@ -327,6 +327,7 @@ impl BlockMiner {
             // Extract only the PoW header — avoids cloning the full BlockTemplate
             // (which includes all transaction and proof bytes) just for PoW.
             let pow_header = tmpl.header_for_pow(0);
+            let tmpl = Arc::new(tmpl);
             let tmpl_prove = tmpl.clone();
             let cancel_pow = cancel.clone();
 
@@ -363,7 +364,7 @@ impl BlockMiner {
                     // template rebuild.
                     let result = {
                         let _permit = permit;
-                        run_prove_block(&tmpl_prove, prev_state_root)
+                        run_prove_block(&*tmpl_prove, prev_state_root)
                     };
                     prove_done_clone.store(true, Ordering::Release);
                     result
@@ -501,15 +502,9 @@ impl BlockMiner {
     ///
     /// # Lock strategy
     ///
-    /// Write lock is held ONLY for the MDBX commit + wallet hook.
-    /// `ChainView::from_mdbx` (which clones SegmentedFriState) runs under a
-    /// READ lock so it does not block incoming P2P blocks or RPC queries.
-    ///
-    /// Between write unlock and read lock, another block could arrive and be
-    /// applied. In that case `ChainView` reflects height H+2 while we notify
-    /// the mempool about confirmed txs at height H+1. This is safe:
-    /// - Confirmed tx removal uses the hash list (always correct).
-    /// - ChainView slot checks use the newest available state (safe to be ahead).
+    /// Write lock is held for MDBX commit + wallet hook + ChainView clone.
+    /// Building ChainView inside the write lock adds zero contention (the lock
+    /// is already exclusive) and eliminates a separate ~50ms read lock.
     async fn apply_found_block(&self, block: &Block, _block_bytes: &[u8]) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
@@ -518,13 +513,15 @@ impl BlockMiner {
             .unwrap_or_default()
             .as_secs();
 
-        // --- MDBX commit off the async executor ---
+        // --- MDBX commit + ChainView build off the async executor ---
         //
         // SyncMode::Durable means commit_block issues fsync before returning —
         // a blocking syscall.  spawn_blocking keeps it off the tokio worker.
         // The wallet hook fires inside the closure while the write lock is
         // still held, preserving the original "hook before mempool" ordering.
-        {
+        // ChainView is built inside the write lock (no added contention since
+        // the lock is already exclusive).
+        let new_view = {
             let chain_clone = self.chain.clone();
             let block_owned = block.clone();
             let hook = self.on_block_applied.clone();
@@ -534,25 +531,20 @@ impl BlockMiner {
                 if let Some(h) = &hook {
                     h(&block_owned);
                 }
-                Ok::<(), noid_chain::storage::MdbxContextError>(())
+                let view = ChainView::from_mdbx(&ctx);
+                Ok::<ChainView, noid_chain::storage::MdbxContextError>(view)
             })
             .await
             .expect("apply_next_block panicked in spawn_blocking")
             .map_err(anyhow::Error::from)?
-        } // write lock released here
+        };
 
-        // --- Build ChainView under read lock (shared, non-blocking) ---
+        // --- Update mempool (no chain lock held) ---
         let confirmed: Vec<_> = block
             .transactions
             .iter()
             .map(|tx| tx.tx_body_hash)
             .collect();
-        let new_view = {
-            let ctx = self.chain.read().await;
-            ChainView::from_mdbx(&ctx)
-        }; // read lock released
-
-        // --- Update mempool (no chain lock held) ---
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;

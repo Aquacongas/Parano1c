@@ -153,6 +153,12 @@ struct Cli {
     ///   # Miner: getBlockTemplate("noid1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
+
+    /// Force-clear all volatile state on startup (segments, nullifiers, undo logs).
+    /// The node will re-sync from peers via snapshot. Use after consensus upgrades
+    /// or to recover from suspected data corruption.
+    #[arg(long)]
+    purge_state: bool,
 }
 
 /// Resolve a seed string to a libp2p Multiaddr.
@@ -332,6 +338,12 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
+    if cli.purge_state {
+        tracing::info!("--purge-state: clearing volatile state before startup");
+        let tmp_store = noid_chain::storage::MdbxStore::open(&data_dir).context("open MDBX for purge")?;
+        tmp_store.clear_for_restart().context("purge state")?;
+        drop(tmp_store);
+    }
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
     let tip_height = ctx.tip_height();
     let state_root = hex::encode(ctx.tip_header().state_root);
@@ -845,11 +857,16 @@ async fn apply_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
     local_time: u64,
-) -> Result<[u8; 32], noid_chain::storage::MdbxContextError> {
+) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
-        ctx.apply_next_block(&block, local_time)
+        let hash = ctx.apply_next_block(&block, local_time)?;
+        // Build ChainView while write lock is still held — no added contention
+        // since nobody else can acquire any lock during a write anyway.
+        // This eliminates the ~50ms read lock that was previously needed after release.
+        let view = ChainView::from_mdbx(&ctx);
+        Ok((hash, view))
     })
     .await
     .expect("apply_next_block panicked in spawn_blocking")
@@ -857,8 +874,8 @@ async fn apply_block_offthread(
 
 /// Apply a chain reorg off the tokio executor.  Same `fsync` rationale.
 ///
-/// Returns `(result, new_blocks)` so the caller can iterate `new_blocks`
-/// in the success path without an extra clone.
+/// Returns `(result, new_blocks, view)` so the caller can use blocks and view
+/// in the success path without an extra clone or read lock.
 async fn apply_reorg_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     ancestor_height: u64,
@@ -867,24 +884,27 @@ async fn apply_reorg_offthread(
 ) -> (
     Result<noid_chain::consensus::ReorgResult, noid_chain::storage::MdbxContextError>,
     Vec<noid_chain::block::Block>,
+    Option<ChainView>,
 ) {
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
-        // Re-validate anchor inside write lock: if another task advanced the chain
-        // past ancestor_height since we computed it, the reorg is stale.
-        // apply_reorg_mdbx now also checks this, but checking here lets us
-        // return a specific "stale reorg" result without going into the reorg path.
         if ancestor_height > ctx.tip_height() {
             return (
                 Err(noid_chain::storage::MdbxContextError::Consensus(
                     noid_chain::consensus::ConsensusError::BadParentHash,
                 )),
                 new_blocks,
+                None,
             );
         }
         let result = ctx.apply_reorg_mdbx(ancestor_height, &new_blocks, local_time);
-        (result, new_blocks) // return new_blocks so the caller can use them
+        let view = if result.is_ok() {
+            Some(ChainView::from_mdbx(&ctx))
+        } else {
+            None
+        };
+        (result, new_blocks, view)
     })
     .await
     .expect("apply_reorg_mdbx panicked in spawn_blocking")
@@ -919,10 +939,14 @@ async fn handle_p2p_events(
     // --- Segmented state sync state ---
     //
     // Sync flow:
-    //   1. PeerConnected + our_height==0 → RequestStateManifest
+    //   1. PeerConnected + our_height==0 (fresh/corrupt) → RequestStateManifest
+    //      OR NewBlockAnnouncement with deep gap (> FINALITY_DEPTH) → RequestStateManifest
     //   2. StateManifest received → collect candidates, select best, RequestRecursiveProof
     //   3. RecursiveProof verified → RequestStateSegment for each segment_id
     //   4. StateSegment responses → collect all → apply_state_snapshot
+    //
+    // Normal restart (state persisted): our_height > 0 → block-by-block sync
+    // for the gap (at most FINALITY_DEPTH blocks, typically 0-3).
     //
     // Eclipse mitigation: collect from up to 3 peers before selecting.
     // Recovery: any failure resets ALL state and clears requested_peers
@@ -1023,7 +1047,6 @@ async fn handle_p2p_events(
 
     loop {
         tokio::select! {
-        biased; // check P2P events first
         rx_result = rx.recv() => { let rx_item = rx_result;
         match rx_item {
             Ok(NetworkEvent::NewBlockAnnouncement {
@@ -1059,9 +1082,16 @@ async fn handle_p2p_events(
                         }
                     }
                 } else if height > our_height {
-                    // Within FINALITY_DEPTH: pull the block + proof directly.
+                    // Within FINALITY_DEPTH: pull missing blocks from our tip to announced height.
+                    // Requesting only the announced height causes BadParentHash when intermediate
+                    // blocks were missed (gossip not yet delivered), triggering expensive orphan
+                    // recovery. SyncBlocksFrom fetches the full gap in one batch.
                     let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
+                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                            peer: from,
+                            from_height: our_height + 1,
+                            count: (height - our_height) as u16,
+                        })
                         .await;
                 }
                 // height <= our_height: already have this block.
@@ -1186,27 +1216,19 @@ async fn handle_p2p_events(
                         }
 
                         // Apply block off the async executor (MDBX fsync is blocking).
-                        // Build ChainView under read lock (shared, non-blocking).
-                        // This avoids holding the write lock during SegmentedFriState clone
-                        // (~50ms at 256 segments), which was blocking all RPC/miner operations.
+                        // ChainView is built inside the write lock (zero added contention
+                        // since the lock is already exclusive).
                         let apply_result =
                             apply_block_offthread(&chain, block.clone(), local_time).await;
-                        let maybe_view = if apply_result.is_ok() {
-                            let ctx = chain.read().await;
-                            Some(ChainView::from_mdbx(&ctx))
-                        } else {
-                            None
-                        };
 
                         match apply_result {
-                            Ok(_) => {
+                            Ok((_hash, new_view)) => {
                                 let height = block.header.height;
                                 let confirmed: Vec<_> = block
                                     .transactions
                                     .iter()
                                     .map(|tx| tx.tx_body_hash)
                                     .collect();
-                                let new_view = maybe_view.unwrap();
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
@@ -1246,7 +1268,7 @@ async fn handle_p2p_events(
                                     let orphan_local_time = unix_now();
                                     next_hash =
                                         noid_chain::consensus::pow::full_block_hash(&orphan.header);
-                                    // Write lock: apply only. Read lock: build view.
+                                    // Write lock: apply and build ChainView atomically.
                                     let orphan_result = apply_block_offthread(
                                         &chain,
                                         orphan.clone(),
@@ -1254,17 +1276,13 @@ async fn handle_p2p_events(
                                     )
                                     .await;
                                     match orphan_result {
-                                        Ok(_) => {
+                                        Ok((_hash, nv)) => {
                                             let h = orphan.header.height;
                                             let conf: Vec<_> = orphan
                                                 .transactions
                                                 .iter()
                                                 .map(|tx| tx.tx_body_hash)
                                                 .collect();
-                                            let nv = {
-                                                let ctx = chain.read().await;
-                                                ChainView::from_mdbx(&ctx)
-                                            };
                                             mempool.on_new_block(&conf, h, nv).await;
                                             update_wallet_for_block(&wallet, &orphan);
                                             tracing::info!(
@@ -1362,21 +1380,14 @@ async fn handle_p2p_events(
 
                                             let local_time = unix_now();
                                             // Reorg off the async executor (MDBX fsync is blocking).
-                                            // `new_chain` is returned from spawn_blocking to avoid
-                                            // an extra clone (used in the success path below).
-                                            let (reorg_result, new_chain) = apply_reorg_offthread(
+                                            // ChainView is built inside write lock (no extra read lock needed).
+                                            let (reorg_result, new_chain, maybe_reorg_view) = apply_reorg_offthread(
                                                 &chain,
                                                 ancestor_height,
                                                 new_chain,
                                                 local_time,
                                             )
                                             .await;
-                                            let maybe_reorg_view = if reorg_result.is_ok() {
-                                                let ctx = chain.read().await;
-                                                Some(ChainView::from_mdbx(&ctx))
-                                            } else {
-                                                None
-                                            };
 
                                             match reorg_result {
                                                 Ok(result) => {
@@ -1980,7 +1991,7 @@ async fn handle_p2p_events(
                                 .collect();
                             let result = {
                                 let mut ctx = chain.write().await;
-                                ctx.apply_state_snapshot(
+                                let r = ctx.apply_state_snapshot(
                                     m.tip_height,
                                     m.tip_hash,
                                     m.log_slots,
@@ -1989,14 +2000,15 @@ async fn handle_p2p_events(
                                     &segments,
                                     &m.recent_headers,
                                     &nullifier_blocks,
-                                )
+                                );
+                                r.map(|_| {
+                                    let view = ChainView::from_mdbx(&ctx);
+                                    let height = ctx.tip_height();
+                                    (height, view)
+                                })
                             };
                             match result {
-                                Ok(_) => {
-                                    let ctx = chain.read().await;
-                                    let new_view = ChainView::from_mdbx(&ctx);
-                                    let new_height = ctx.tip_height();
-                                    drop(ctx);
+                                Ok((new_height, new_view)) => {
                                     mempool.on_new_block(&[], new_height, new_view).await;
                                     sync_ready.notify_one();
                                     tracing::info!(height = new_height, "snapshot: fully applied");
@@ -2348,7 +2360,7 @@ async fn handle_p2p_events(
                                     .collect();
                                 let result = {
                                     let mut ctx = chain.write().await;
-                                    ctx.apply_state_snapshot(
+                                    let r = ctx.apply_state_snapshot(
                                         m.tip_height,
                                         m.tip_hash,
                                         m.log_slots,
@@ -2357,14 +2369,15 @@ async fn handle_p2p_events(
                                         &[],
                                         &m.recent_headers,
                                         &nullifier_blocks,
-                                    )
+                                    );
+                                    r.map(|_| {
+                                        let view = ChainView::from_mdbx(&ctx);
+                                        let height = ctx.tip_height();
+                                        (height, view)
+                                    })
                                 };
                                 match result {
-                                    Ok(_) => {
-                                        let ctx = chain.read().await;
-                                        let new_view = ChainView::from_mdbx(&ctx);
-                                        let new_height = ctx.tip_height();
-                                        drop(ctx);
+                                    Ok((new_height, new_view)) => {
                                         mempool.on_new_block(&[], new_height, new_view).await;
                                         sync_ready.notify_one();
                                         tracing::info!(
@@ -2450,31 +2463,21 @@ async fn handle_p2p_events(
             }) => {
                 use noid_recursive::{verify_step_stark_only, RecursiveBlockProof};
 
-                // Only process if this proof is ahead of what we have.
-                let our_height = {
+                // Single read lock to gather all required state.
+                let (already_have, prev_root_opt, expected_root_opt) = {
                     let ctx = chain.read().await;
-                    ctx.store
+                    let our_height = ctx.store
                         .get_recursive_proof()
                         .ok()
                         .flatten()
                         .and_then(|b| bincode::deserialize::<RecursiveBlockProof>(&b).ok())
-                        .map(|p| p.block_height)
-                };
-                let already_have = our_height.map_or(false, |h| h >= height);
-                if already_have {
-                    tracing::debug!(
-                        from = %from,
-                        height,
-                        our = our_height.unwrap_or(0),
-                        "RecursiveProofUpdate: stale, ignoring"
-                    );
-                } else {
-                    // Lightweight STARK verify before storing.
-                    // We need the prev state_root from our recent headers.
-                    let prev_root_opt = {
-                        let ctx = chain.read().await;
-                        if height == 0 {
-                            Some([0u8; 32]) // pre-genesis accumulator
+                        .map(|p| p.block_height);
+                    let already = our_height.map_or(false, |h| h >= height);
+                    if already {
+                        (true, None, None)
+                    } else {
+                        let prev_root = if height == 0 {
+                            Some([0u8; 32])
                         } else {
                             ctx.recent_headers
                                 .get(&(height - 1))
@@ -2486,11 +2489,8 @@ async fn handle_p2p_events(
                                         .flatten()
                                         .map(|h| h.state_root)
                                 })
-                        }
-                    };
-                    let expected_root_opt = {
-                        let ctx = chain.read().await;
-                        ctx.recent_headers
+                        };
+                        let expected_root = ctx.recent_headers
                             .get(&height)
                             .map(|h| h.state_root)
                             .or_else(|| {
@@ -2499,9 +2499,18 @@ async fn handle_p2p_events(
                                     .ok()
                                     .flatten()
                                     .map(|h| h.state_root)
-                            })
-                    };
+                            });
+                        (false, prev_root, expected_root)
+                    }
+                };
 
+                if already_have {
+                    tracing::debug!(
+                        from = %from,
+                        height,
+                        "RecursiveProofUpdate: stale, ignoring"
+                    );
+                } else {
                     match (prev_root_opt, expected_root_opt) {
                         (Some(prev_root), Some(expected_root)) => {
                             match bincode::deserialize::<RecursiveBlockProof>(&proof_bytes) {
@@ -2542,8 +2551,6 @@ async fn handle_p2p_events(
                             }
                         }
                         _ => {
-                            // Headers for this height not in our window — can't verify yet.
-                            // The local updater will produce its own proof when it catches up.
                             tracing::debug!(
                                 from = %from,
                                 height,

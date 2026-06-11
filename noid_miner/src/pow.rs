@@ -45,9 +45,9 @@ pub fn search_pow_parallel(
     };
 
     // Partition the 128-bit nonce space into thread-sized chunks.
-    // We use chunks of 10M nonces per iteration so cancellation is checked
-    // every ~10M / thread_count iterations.
-    const CHUNK_SIZE: u128 = 10_000_000;
+    // Each thread checks cancel every per_thread iterations (~125K on 8 cores).
+    // At ~1M hashes/s/core this gives ~125ms cancel latency.
+    const CHUNK_SIZE: u128 = 1_000_000;
     let target = header_template.difficulty_target;
 
     let mut start_nonce: u128 = random_start;
