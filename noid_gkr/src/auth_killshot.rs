@@ -211,14 +211,46 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
         );
     }
 
-    let public = inputs.to_public();
-    absorb_public_boundary(channel, &public);
-
     let state_ins: Vec<[Block128; STATE_SIZE]> = witness.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_auth_unified_mle_v2(&state_ins);
+    prove_auth_killshot_from_mle(circuit, &inputs.to_public(), &mle, channel)
+}
 
-    let (main, r_prime) = prove_auth_unified(&mle, channel);
-    let (shift, r_double_prime) = prove_auth_shift(&mle, &r_prime, channel);
+/// Honest prover variant for callers that already materialised the auth MLE.
+pub fn prove_auth_killshot_with_mle<T: FiatShamir<Block128>>(
+    circuit: &AuthCircuit,
+    inputs: &AuthInputs,
+    mle: &AuthUnifiedMle,
+    channel: &mut T,
+) -> (AuthProofKillShot, AuthKillShotReductions) {
+    #[cfg(debug_assertions)]
+    {
+        let witness = evaluate_auth(circuit, inputs);
+        for i in 0..N_AUTH_INPUTS {
+            debug_assert_eq!(
+                witness.derived_address[i], inputs.expected_address[i],
+                "prover asked to prove a mismatching Address at input {i}",
+            );
+            debug_assert_eq!(
+                witness.derived_auth_tag[i], inputs.expected_auth_tag[i],
+                "prover asked to prove a mismatching AuthTag at input {i}",
+            );
+        }
+    }
+
+    prove_auth_killshot_from_mle(circuit, &inputs.to_public(), mle, channel)
+}
+
+fn prove_auth_killshot_from_mle<T: FiatShamir<Block128>>(
+    circuit: &AuthCircuit,
+    public: &AuthPublicInputs,
+    mle: &AuthUnifiedMle,
+    channel: &mut T,
+) -> (AuthProofKillShot, AuthKillShotReductions) {
+    absorb_public_boundary(channel, public);
+
+    let (main, r_prime) = prove_auth_unified(mle, channel);
+    let (shift, r_double_prime) = prove_auth_shift(mle, &r_prime, channel);
 
     let mut state_claims = vec![
         EvalClaim {
@@ -230,7 +262,7 @@ pub fn prove_auth_killshot<T: FiatShamir<Block128>>(
             value: shift.state_at_r2,
         },
     ];
-    state_claims.extend(public_pin_claims(circuit, &public));
+    state_claims.extend(public_pin_claims(circuit, public));
     let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
 
     let sin_claims = vec![EvalClaim {

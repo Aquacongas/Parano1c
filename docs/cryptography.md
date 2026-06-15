@@ -527,11 +527,12 @@ Implementation: `noid_recursive/src/accumulator.rs`.
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| SpineGKR Kill-Shot | ~5.4 KB | 15 round polys + shift + 3× batch-eval |
-| AuthGKR Kill-Shot | ~4.2 KB | 14 round polys + shift + 3× batch-eval |
-| TxLogicAir STARK | ~8 KB | Zero-check + FRI opening |
-| Per-tx total (LogicProof) | ~18 KB | GKR + STARK + FRI |
-| BlockProof (256 txs) | ~30 KB | Interleaved, one FRI opening |
+| SpineGKR Kill-Shot | ~7.8 KB | Unified block-side spine proof at 100 txs |
+| AuthGKR Kill-Shot | ~5.1 KB | 14 round polys + shift + 3× batch-eval |
+| TxLogicAir STARK | ~21.2 KB | Zero-check + FRI opening |
+| Per-tx total (LogicProof) | ~26.3 KB | GKR + STARK + FRI |
+| BlockProof (100 txs) | ~1.9 MB | Interleaved, one FRI opening |
+| BlockProof (256 txs) | ~5 MB | Interleaved, one FRI opening |
 | RecursiveProof | ~6.5 KB | 256-row AIR, tensor PCS only |
 
 ---

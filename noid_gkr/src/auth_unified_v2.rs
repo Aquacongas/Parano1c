@@ -781,13 +781,7 @@ fn build_combined_weights(r_prime: &[Block128], delta: Block128) -> CombinedWeig
     let r_round = &r_prime[ROUND_LO..ROUND_HI];
     let r_elem = &r_prime[ELEM_LO..ELEM_HI];
 
-    let mut w_dec = vec![Block128::ZERO; N_AUTH_UNIFIED_CELLS];
-    let mut w_lane: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|_| vec![Block128::ZERO; N_AUTH_UNIFIED_CELLS]);
-
-    let n_slots = 1usize << N_AUTH_SLOT_BITS;
     let n_rounds = 1usize << N_AUTH_ROUND_VARS;
-    let n_elems = 1usize << N_AUTH_ELEM_VARS;
 
     let eq_slot_tab = boolean_tensor(r_slot);
     let eq_elem_tab = boolean_tensor(r_elem);
@@ -797,20 +791,6 @@ fn build_combined_weights(r_prime: &[Block128], delta: Block128) -> CombinedWeig
     for round_x in 0..n_rounds {
         let inc = (round_x + 1) & (n_rounds - 1);
         eq_round_at_inc[round_x] = eq_round_tab[inc];
-    }
-
-    for slot in 0..n_slots {
-        let es = eq_slot_tab[slot];
-        for round_x in 0..n_rounds {
-            let er = eq_round_at_inc[round_x];
-            let es_er = es * er;
-            for elem in 0..n_elems {
-                let idx = (slot << SLOT_LO) | (round_x << ROUND_LO) | (elem << ELEM_LO);
-                let ee = eq_elem_tab[elem];
-                w_dec[idx] = es_er * ee;
-                w_lane[elem][idx] = es_er;
-            }
-        }
     }
 
     let d0 = Block128::ONE;
@@ -833,13 +813,14 @@ fn build_combined_weights(r_prime: &[Block128], delta: Block128) -> CombinedWeig
     let mut w_state = vec![Block128::ZERO; N_AUTH_UNIFIED_CELLS];
 
     for x in 0..N_AUTH_UNIFIED_CELLS {
-        let dec = w_dec[x];
-        w_sin[x] = d0 * dec;
-        w_sout[x] = d1 * dec;
-        w_state[x] = d2 * dec;
+        let slot = (x >> SLOT_LO) & ((1 << N_AUTH_SLOT_BITS) - 1);
+        let round = (x >> ROUND_LO) & ((1 << N_AUTH_ROUND_VARS) - 1);
         let elem = x & ((1 << N_AUTH_ELEM_VARS) - 1);
-        w_sout[x] += lane_sout[elem] * w_lane[elem][x];
-        w_state[x] += lane_state[elem] * w_lane[elem][x];
+        let es_er = eq_slot_tab[slot] * eq_round_at_inc[round];
+        let w_dec = es_er * eq_elem_tab[elem];
+        w_sin[x] = d0 * w_dec;
+        w_sout[x] = d1 * w_dec + lane_sout[elem] * es_er;
+        w_state[x] = d2 * w_dec + lane_state[elem] * es_er;
     }
 
     CombinedWeights {

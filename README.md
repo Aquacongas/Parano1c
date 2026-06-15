@@ -43,7 +43,7 @@ When you send NOID, your wallet builds a **LogicProof**. A ~26 KB STARK that pro
 - All values are in range
 - The transaction body is cryptographically bound
 
-This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~28 minutes). You prove it once, on your device, ~140 ms for 4 inputs/8 outputs tx
+This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~28 minutes). You prove it once, on your device, ~135 ms for 4 inputs/8 outputs tx
 
 ### The Network Verifies, Not Executes
 
@@ -124,7 +124,7 @@ The result is a single Kill-Shot proof per GKR instance:
 | **Speedup** | — | **10.6× faster · 141× fewer rounds** |
 
 \*Full GKR layer = SpineGKR (59 perms, block-side) + AuthGKR (20 perms, wallet-side).
-The wallet `prove_logic` alone (AuthGKR + TxLogicAir STARK) runs in **~144 ms**.
+The wallet `prove_logic` alone (AuthGKR + TxLogicAir STARK) runs in **~135 ms**.
 
 **Two Kill-Shot instances per transaction:**
 - **SpineGKR** (59 permutations) — computes `tx_body_hash` from the full transaction body. Binds every field of every input and output into a single 32-byte hash that the STARK pins.
@@ -142,7 +142,7 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 └──────────────────────┬──────────────────────────────────────┘
                        │ each step wraps ↓
 ┌──────────────────────▼──────────────────────────────────────┐
-│  BlockProof  ·  ~26 KB per tx  ·  O(txs) verify            │
+│  BlockProof  ·  ~20 KB per tx  ·  O(txs) verify            │
 │  = N × TxLogicAir STARKs (algebraic, no FRI per tx)        │
 │  + SpineGKR Kill-Shot (unified over all txs in block)       │
 │  + N × AuthGKR Kill-Shot (per-tx ownership)                 │
@@ -151,7 +151,7 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 └──────────────────────┬──────────────────────────────────────┘
                        │ wallet produces ↓
 ┌──────────────────────▼──────────────────────────────────────┐
-│  LogicProof  ·  ~26 KB  ·  stateless  ·  ~140 ms prove     │
+│  LogicProof  ·  ~26 KB  ·  stateless  ·  ~135 ms prove     │
 │  TxLogicAir: balance + range + ownership binding            │
 │  AuthGKR Kill-Shot: proof-of-knowledge of spending secret preimage │
 │  Stateless: no Merkle paths, no state_root dependency       │
@@ -325,8 +325,8 @@ storage before pruning (192 KB block + ~5 MB BlockProof per block).
 
 | Metric | Value |
 |---|---|
-| Wallet prove time | ~140 ms |
-| Mempool verify time | ~76 ms |
+| Wallet prove time | ~134 ms |
+| Mempool verify time | ~77 ms |
 | LogicProof size | ~26.3 KB |
 | — STARK component | ~21.2 KB (81%) |
 | — AuthGKR Kill-Shot | ~5.1 KB (19%) |
@@ -337,10 +337,10 @@ Proof size is **constant** regardless of input/output count (always 4 inputs, 8 
 
 | Block | Prove time | Verify time | BlockProof size |
 |---|---|---|---|
-| 10 txs | ~1.0 s | ~290 ms | ~213 KB |
-| 20 txs | ~1.9 s | ~530 ms | ~410 KB |
-| 100 txs | ~9.0 s | ~2.5 s | ~1.9 MB |
-| 256 txs (max) | ~23 s | ~6.4 s | ~5 MB |
+| 10 txs | ~880 ms | ~294 ms | ~213 KB |
+| 20 txs | ~1.7 s | ~546 ms | ~410 KB |
+| 100 txs | ~7.9 s | ~2.5 s | ~1.9 MB |
+| 256 txs (max) | ~20 s | ~6.4 s | ~5 MB |
 
 PoW search and ZK proving run **in parallel**. BlockProof bytes are stored only for the **last 18 blocks** (reorg window), then pruned.
 

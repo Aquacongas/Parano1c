@@ -32,8 +32,9 @@ use noid_air::{Air, Trace};
 use noid_core::mle::split::{reconstruct_from_slices, split_mle_into_slices};
 use noid_core::Block128;
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, prove_auth_killshot, verify_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, build_auth_unified_from_inputs, prove_auth_killshot_with_mle,
+    verify_auth_killshot, AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs,
+    SpineInputs, N_AUTH_UNIFIED_VARS,
 };
 use noid_tx::PublicInputs;
 
@@ -146,10 +147,9 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
 
     // Build auth boundary MLE and slice it
     let auth_unified_mle = build_auth_unified_from_inputs(&auth_circuit, auth_inputs);
-    let auth_state_mle = auth_unified_mle.state;
-    debug_assert_eq!(auth_state_mle.len(), 1 << N_AUTH_UNIFIED_VARS);
+    debug_assert_eq!(auth_unified_mle.state.len(), 1 << N_AUTH_UNIFIED_VARS);
 
-    let auth_slices = split_mle_into_slices(&auth_state_mle, N_AUTH_UNIFIED_VARS, BASE_LOG);
+    let auth_slices = split_mle_into_slices(&auth_unified_mle.state, N_AUTH_UNIFIED_VARS, BASE_LOG);
     debug_assert_eq!(auth_slices.len(), N_AUTH_SLICES);
 
     let n_air_cols = trace.columns.len();
@@ -174,8 +174,12 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
 
     let mut auth_channel = auth_gkr_channel();
-    let (auth_proof, auth_reductions) =
-        prove_auth_killshot(&auth_circuit, auth_inputs, &mut auth_channel);
+    let (auth_proof, auth_reductions) = prove_auth_killshot_with_mle(
+        &auth_circuit,
+        auth_inputs,
+        &auth_unified_mle,
+        &mut auth_channel,
+    );
 
     // STARK with auth slice claims only
     let extras_transcript =

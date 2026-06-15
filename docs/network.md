@@ -67,7 +67,7 @@ no ZK proving.
 | `T_OWNER_INDEX` | owner_addr (32B) | packed Vec<(slot_u32, value_u64)> | current state | proportional to UTXO set |
 | `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | 6.5 KB |
 | `T_RECENT_BLOCKS` | height (u64) | full Block bytes | last 18 blocks | ~4 MB |
-| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | last 18 blocks | ~8 MB |
+| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | last 18 blocks | ~35 MB at 100 txs/block; ~90 MB at max |
 | `T_UNDO_LOGS` | height (u64) | BlockUndoLog | last 18 blocks | ~2 MB |
 | `T_NULLIFIERS` | tx_body_hash (32B) | height (u64) | last 144 blocks | ~1.2 MB |
 | `T_NULLIFIER_BLOCKS` | height (u64) | packed tx_body_hashes | last 144 blocks | ~1.2 MB |
@@ -123,7 +123,7 @@ Only segments with live UTXOs are materialized (rest are virtual zero, no disk).
 At full capacity (2^32 slots, all materialized): ~48 GB max theoretical ceiling.
 
 **Volatile (fixed, independent of chain age):**
-- Recent blocks + proofs + undo: ~14 MB (always last 18 blocks)
+- Recent blocks + proofs + undo: ~40 MB at 100 txs/block; ~96 MB at max (always last 18 blocks)
 - Nullifiers + tx_index: ~3.6 MB (always last 144 blocks)
 - Recursive proof: 6.5 KB (single latest)
 
@@ -478,7 +478,7 @@ enum BlockGossipMsg {
 
 - Blocks < 1 MB total (block + proof): inlined in gossip message
 - Blocks >= 1 MB: compact announcement, peers pull via request-response
-- At 256 txs, typical block+proof is ~30 KB (well under inline threshold)
+- At 256 txs, block+proof is ~5.2 MB, so compact announcement + pull is used
 
 ### Request-Response Protocols
 

@@ -48,7 +48,8 @@ pub use auth_circuit::{
 };
 pub use auth_killshot::{
     auth_gkr_channel, build_auth_unified_from_inputs, discharge_auth_reductions_native,
-    prove_auth_killshot, verify_auth_killshot, AuthKillShotReductions, AuthProofKillShot,
+    prove_auth_killshot, prove_auth_killshot_with_mle, verify_auth_killshot,
+    AuthKillShotReductions, AuthProofKillShot,
 };
 pub use auth_mle_v2::{
     build_auth_unified_mle_v2, AuthUnifiedMle, N_AUTH_LIVE_SLOTS, N_AUTH_UNIFIED_CELLS,

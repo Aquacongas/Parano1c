@@ -369,11 +369,11 @@ Wallet                    Mempool              Miner                   Network
 
 | Step | Duration | Bottleneck |
 |------|----------|-----------|
-| Wallet prove (1 tx) | ~150 ms | GKR unified sumcheck |
+| Wallet prove (1 tx) | ~135 ms | GKR unified sumcheck |
 | Mempool admission | <1 ms | Slot lookups |
-| Block prove (full, 256 txs) | ~10 s | Interleaved FRI |
+| Block prove (full, 256 txs) | ~20 s | Block GKR + algebraic STARK |
 | PoW (target 15s) | ~15 s | Blake3 nonce search |
-| Block verify (full) | ~50 ms/tx | GKR verify + STARK |
+| Block verify (full) | ~25 ms/tx | GKR verify + STARK |
 | Recursive step | ~2 s | RecursiveBlockAir prove |
 
 ---
