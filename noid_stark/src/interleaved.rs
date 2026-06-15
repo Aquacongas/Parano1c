@@ -36,6 +36,7 @@ use noid_fri_binius::{
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 use crate::{
     absorb_public_inputs, lagrange_eval_at, padded_log_len, round_poly_degree, RoundPoly,
@@ -138,6 +139,93 @@ struct AlgebraicVerifyOut {
     shifted_indices: Vec<usize>,
 }
 
+#[derive(Debug)]
+struct AlgebraicPhaseTiming {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct AlgebraicProfiler {
+    enabled: bool,
+    started: Instant,
+    last: Instant,
+    phases: Vec<AlgebraicPhaseTiming>,
+}
+
+impl AlgebraicProfiler {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: prove_profile_enabled(),
+            started: now,
+            last: now,
+            phases: Vec::with_capacity(16),
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.phases.push(AlgebraicPhaseTiming {
+            name,
+            elapsed: now.duration_since(self.last),
+        });
+        self.last = now;
+    }
+
+    fn finish(
+        self,
+        log_rows: usize,
+        log_len: usize,
+        n_air_cols: usize,
+        n_constraints: usize,
+        n_shifted: usize,
+        n_slice_claims: usize,
+        n_extra_transcript: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.started.elapsed();
+        let summary = self
+            .phases
+            .iter()
+            .map(|p| format!("{}={:.3}ms", p.name, duration_ms(p.elapsed)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "prove_block_profile stark_algebraic summary log_rows={} log_len={} n_air_cols={} n_constraints={} n_shifted={} n_slice_claims={} n_extra_transcript={} total_ms={:.3} phases={}",
+            log_rows,
+            log_len,
+            n_air_cols,
+            n_constraints,
+            n_shifted,
+            n_slice_claims,
+            n_extra_transcript,
+            duration_ms(total),
+            summary
+        );
+    }
+}
+
+fn prove_profile_enabled() -> bool {
+    std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
+
 // ---------------------------------------------------------------------------
 // Algebraic prover core
 // ---------------------------------------------------------------------------
@@ -162,6 +250,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     log_len: usize,
     channel: &mut Channel,
 ) -> (AlgebraicStarkProof, Vec<Block128>, Block128, Vec<Block128>) {
+    let mut profiler = AlgebraicProfiler::new();
     let log_rows = air.log_rows();
     let n_air_cols = air.n_columns();
 
@@ -175,6 +264,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     let betas: Vec<Block128> = (0..n_constraints)
         .map(|_| channel.get_random_point())
         .collect();
+    profiler.phase("transcript_setup");
 
     // Zero-check sumcheck.
     let shifted_indices: Vec<usize> = air.shifted_column_indices();
@@ -197,6 +287,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     for col in &rotated_columns {
         sumcheck_cols.push(col.as_slice());
     }
+    profiler.phase("shifted_column_prep");
 
     // Tower Sumcheck: get column domains for boolean fast-path.
     // Base columns [0..n_air_cols] from the AIR, rotated columns inherit source domain.
@@ -224,6 +315,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         &sumcheck_domains,
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
+    profiler.phase("zero_check_sumcheck");
 
     // M2 + flat-basis: clmul_gcm-based fold is ~7x faster than tower-basis mul.
     // Thread-local u128 scratch avoids per-call allocation.
@@ -250,6 +342,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         })
         .collect();
     channel.observe_field_elems(&base_openings);
+    profiler.phase("base_openings");
 
     // VSHIFT ladder partials.
     let partials_per_slot: Vec<Vec<Block128>> = shifted_indices
@@ -260,9 +353,11 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         channel.observe_field_elem(crate::ladder_batch::sub_channel_tag(slot));
         channel.observe_field_elems(partials);
     }
+    profiler.phase("vshift_ladder_partials");
 
     let slice_values: Vec<Block128> = slice_claims.iter().map(|sc| sc.value).collect();
     channel.observe_field_elems(&slice_values);
+    profiler.phase("slice_claim_absorb");
 
     // Multipoint sumcheck.
     let s_count = shifted_indices.len();
@@ -281,6 +376,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         }
         v
     };
+    profiler.phase("multipoint_challenges");
 
     let mut target = Block128::ZERO;
     for i in 0..n_air_cols {
@@ -296,19 +392,21 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
 
     let eq_base = eq_ind_partial_eval(&r_point);
     let hyper_len = 1usize << log_len;
-    // Cache-friendly column-outer accumulation for combined_base_b.
-    // Processing one column at a time (128 KB) keeps both combined_base_b
-    // and the current column in L2 cache, avoiding L3/DRAM thrashing that
-    // the previous row-outer layout caused (81 columns × random stride).
-    let mut combined_base_b: Vec<Block128> = vec![Block128::ZERO; hyper_len];
+    // Build the combined base B table directly in flat/GCM basis for the
+    // multipoint prover's flat-B fast path. This is the same polynomial
+    // Σ_i λ_i·MLE_i(x), but avoids materializing it in tower basis only for
+    // `prove_multipoint_sumcheck` to immediately flatten it again.
+    use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
+    let mut combined_base_b_flat: Vec<u128> = vec![0; hyper_len];
     for i in 0..n_air_cols {
-        let lam = lambdas[i];
+        let lam_flat = tower_to_flat_u128(lambdas[i].0);
         let col = padded_columns[i];
-        combined_base_b
+        combined_base_b_flat
             .par_iter_mut()
             .zip(col.par_iter())
-            .for_each(|(acc, &val)| *acc += lam * val);
+            .for_each(|(acc, &val)| *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(val.0)));
     }
+    profiler.phase("combined_base_b_flat");
 
     let weight_trails = if s_count > 0 {
         Some(crate::ladder_batch::WeightTrails::new(&r_point))
@@ -327,9 +425,16 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
             w
         })
         .collect();
-    let ladder_pairs_b: Vec<&[Block128]> = (0..s_count)
-        .map(|slot| padded_columns[shifted_indices[slot]])
+    let ladder_pairs_b_flat: Vec<Vec<u128>> = (0..s_count)
+        .into_par_iter()
+        .map(|slot| {
+            padded_columns[shifted_indices[slot]]
+                .iter()
+                .map(|v| tower_to_flat_u128(v.0))
+                .collect()
+        })
         .collect();
+    profiler.phase("ladder_pairs");
 
     let slice_pairs_a: Vec<Vec<Block128>> = (0..n_slices)
         .into_par_iter()
@@ -339,23 +444,36 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
             eq_s.into_iter().map(|v| v * lam).collect()
         })
         .collect();
-    let slice_pairs_b: Vec<&[Block128]> = (0..n_slices)
-        .map(|i| padded_columns[slice_claims[i].col_index])
+    let slice_pairs_b_flat: Vec<Vec<u128>> = (0..n_slices)
+        .into_par_iter()
+        .map(|i| {
+            padded_columns[slice_claims[i].col_index]
+                .iter()
+                .map(|v| tower_to_flat_u128(v.0))
+                .collect()
+        })
         .collect();
+    profiler.phase("slice_pairs");
 
     let mut pairs_a: Vec<Vec<Block128>> = Vec::with_capacity(1 + s_count + n_slices);
     pairs_a.push(eq_base);
     pairs_a.extend(ladder_pairs_a);
     pairs_a.extend(slice_pairs_a);
-    let mut pairs_b: Vec<&[Block128]> = Vec::with_capacity(1 + s_count + n_slices);
-    pairs_b.push(combined_base_b.as_slice());
-    pairs_b.extend(ladder_pairs_b);
-    pairs_b.extend(slice_pairs_b);
+    let mut pairs_b_flat: Vec<Vec<u128>> = Vec::with_capacity(1 + s_count + n_slices);
+    pairs_b_flat.push(combined_base_b_flat);
+    pairs_b_flat.extend(ladder_pairs_b_flat);
+    pairs_b_flat.extend(slice_pairs_b_flat);
 
     let (multipoint_rounds, mp_challenges) =
-        crate::multipoint_batch::prove_multipoint_sumcheck(pairs_a, pairs_b, target, channel);
+        crate::multipoint_batch::prove_multipoint_sumcheck_flat_b(
+            pairs_a,
+            pairs_b_flat,
+            target,
+            channel,
+        );
     let r_pp: Vec<Block128> = mp_challenges.iter().rev().cloned().collect();
     debug_assert_eq!(r_pp.len(), log_len);
+    profiler.phase("multipoint_sumcheck");
 
     // Derive final_claim. The sumcheck terminal claim is the value of the
     // last round polynomial at the last challenge (or `target` when there
@@ -374,6 +492,16 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         multipoint_rounds,
         slice_claimed_values: slice_values,
     };
+    profiler.phase("final_claim_and_proof_assembly");
+    profiler.finish(
+        log_rows,
+        log_len,
+        n_air_cols,
+        n_constraints,
+        shifted_indices.len(),
+        slice_claims.len(),
+        extra_transcript.len(),
+    );
     (proof, r_pp, final_claim, lambdas)
 }
 

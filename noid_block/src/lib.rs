@@ -1074,62 +1074,66 @@ pub fn prove_block(
     // B-side: B_k[j] = sum_i beta^i * cols_k[i][j].
     let hyper_len = 1usize << log_len;
 
-    // Column-outer accumulation: process one column at a time so both
-    // b_k (128 KB) and the current column (128 KB) stay in L2 cache.
-    // This avoids the L3/DRAM cache-miss storm of the row-outer layout.
-    let pairs_b_owned: Vec<Vec<Block128>> = (0..n_participants)
+    // Build B-side directly in flat/GCM basis for the multipoint fast path.
+    // This materializes the same B_k polynomials as the tower-basis path, but
+    // avoids immediately flattening them again inside the sumcheck prover.
+    use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
+    let beta_powers_flat: Vec<u128> = beta_powers
+        .iter()
+        .map(|v| tower_to_flat_u128(v.0))
+        .collect();
+    let pairs_b_flat: Vec<Vec<u128>> = (0..n_participants)
         .into_par_iter()
         .map(|k| {
             if k < n_tx {
                 let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &preps[k].witness_cols);
-                let mut b_k = vec![Block128::ZERO; hyper_len];
+                let mut b_k = vec![0u128; hyper_len];
                 for i in 0..n_air_cols {
-                    let lam = beta_powers[i];
+                    let lam_flat = beta_powers_flat[i];
                     let col = air_refs[i];
-                    b_k.iter_mut()
-                        .zip(col.iter())
-                        .for_each(|(acc, &v)| *acc += lam * v);
+                    b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(v.0));
+                    });
                 }
                 for (off, s) in preps[k].auth_slices.iter().enumerate() {
-                    let lam = beta_powers[n_air_cols + off];
-                    b_k.iter_mut()
-                        .zip(s.iter())
-                        .for_each(|(acc, &v)| *acc += lam * v);
+                    let lam_flat = beta_powers_flat[n_air_cols + off];
+                    b_k.iter_mut().zip(s.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(v.0));
+                    });
                 }
                 b_k
             } else if k == spine_participant_idx {
-                let mut b_k = vec![Block128::ZERO; hyper_len];
+                let mut b_k = vec![0u128; hyper_len];
                 for i in 0..n_block_spine_slices {
-                    let lam = beta_powers[i];
+                    let lam_flat = beta_powers_flat[i];
                     let col = spine_padded_slices[i].as_slice();
-                    b_k.iter_mut()
-                        .zip(col.iter())
-                        .for_each(|(acc, &v)| *acc += lam * v);
+                    b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(v.0));
+                    });
                 }
                 b_k
             } else {
                 // State binding participant k → segment index sb_idx.
                 let sb_idx = k - sb_participant_base;
                 let col_offset = sb_idx * sb_n_cols_per_seg;
-                let mut b_k = vec![Block128::ZERO; hyper_len];
+                let mut b_k = vec![0u128; hyper_len];
                 for i in 0..sb_n_cols_per_seg {
-                    let lam = beta_powers[i];
+                    let lam_flat = beta_powers_flat[i];
                     let col = sb_padded_columns[col_offset + i].as_slice();
-                    b_k.iter_mut()
-                        .zip(col.iter())
-                        .for_each(|(acc, &v)| *acc += lam * v);
+                    b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(v.0));
+                    });
                 }
                 b_k
             }
         })
         .collect();
-    let pairs_b: Vec<&[Block128]> = pairs_b_owned.iter().map(|v| v.as_slice()).collect();
     profiler.phase("sumcheck_pair_materialization");
 
     let (block_mp_rounds, block_mp_challenges) =
-        noid_stark::multipoint_batch::prove_multipoint_sumcheck(
+        noid_stark::multipoint_batch::prove_multipoint_sumcheck_flat_b(
             pairs_a,
-            pairs_b,
+            pairs_b_flat,
             block_target,
             &mut block_channel,
         );

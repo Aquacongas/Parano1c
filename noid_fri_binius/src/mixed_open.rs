@@ -23,12 +23,88 @@ use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri::Channel;
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 use crate::compact_fri::{compact_fri_prove, compact_fri_verify, CompactEvalProof};
 use crate::interleaved_commit::InterleavedProverState;
 
 /// Domain-separation tag for mixed opening sub-protocol.
 pub const MIXED_OPEN_TAG: u64 = 0xFFF8_0000_0000_0000;
+
+#[derive(Debug)]
+struct MixedOpenPhaseTiming {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct MixedOpenProfiler {
+    enabled: bool,
+    started: Instant,
+    last: Instant,
+    phases: Vec<MixedOpenPhaseTiming>,
+}
+
+impl MixedOpenProfiler {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: prove_profile_enabled(),
+            started: now,
+            last: now,
+            phases: Vec::with_capacity(8),
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.phases.push(MixedOpenPhaseTiming {
+            name,
+            elapsed: now.duration_since(self.last),
+        });
+        self.last = now;
+    }
+
+    fn finish(self, n_cols: usize, log_n: usize, n_secondary_claims: usize, num_queries: usize) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.started.elapsed();
+        let summary = self
+            .phases
+            .iter()
+            .map(|p| format!("{}={:.3}ms", p.name, duration_ms(p.elapsed)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "prove_block_profile mixed_opening summary n_cols={} log_n={} n_secondary_claims={} num_queries={} total_ms={:.3} phases={}",
+            n_cols,
+            log_n,
+            n_secondary_claims,
+            num_queries,
+            duration_ms(total),
+            summary
+        );
+    }
+}
+
+fn prove_profile_enabled() -> bool {
+    std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
 
 /// A claim that column at `col_index` evaluates to `value` at `eval_point`.
 #[derive(Clone, Debug)]
@@ -63,6 +139,7 @@ pub fn prove_mixed_opening(
     hasher: &dyn CryptographicHasher,
     num_queries: usize,
 ) -> MixedOpeningProof {
+    let mut profiler = MixedOpenProfiler::new();
     let n_cols = state.n_cols;
     let log_n = state.log_rows;
     let n = 1 << log_n;
@@ -84,18 +161,20 @@ pub fn prove_mixed_opening(
             })
         })
         .collect();
+    profiler.phase("primary_openings");
 
     // Verify secondary claims are consistent
     for claim in secondary_claims {
         assert!(claim.col_index < n_cols);
         assert_eq!(claim.eval_point.len(), log_n);
     }
+    profiler.phase("secondary_claim_validation");
 
-    // Build flat list: primary openings then secondary claim values
-    let mut all_openings = primary_openings.clone();
-    for claim in secondary_claims {
-        all_openings.push(claim.value);
-    }
+    // Build flat list: primary openings then secondary claim values.
+    let mut all_openings = primary_openings;
+    all_openings.reserve(secondary_claims.len());
+    all_openings.extend(secondary_claims.iter().map(|claim| claim.value));
+    profiler.phase("all_openings_assembly");
 
     // Absorb all openings, draw gamma
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
@@ -104,26 +183,47 @@ pub fn prove_mixed_opening(
 
     // Horner weights for primary columns only (FRI batching)
     let weights = compute_horner_weights(gamma, n_cols);
+    profiler.phase("transcript_gamma_weights");
 
-    // Build batched polynomial C(x) = sum_k gamma^k * col_k(x)
-    let c_evals: Vec<Block128> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut acc = Block128::ZERO;
-            for (k, col) in state.raw_cols.iter().enumerate() {
-                acc += weights[k] * col[i];
-            }
-            acc
-        })
-        .collect();
+    // Build batched polynomial C(x) = sum_k gamma^k * col_k(x).
+    // Column-parallel accumulation keeps each source column and the small
+    // accumulator vector hot in cache. The previous row-outer layout walked
+    // thousands of columns for every row and thrashed cache on large blocks.
+    let c_evals: Vec<Block128> = state
+        .raw_cols
+        .par_iter()
+        .zip(weights.par_iter())
+        .fold(
+            || vec![Block128::ZERO; n],
+            |mut acc, (col, &weight)| {
+                acc.iter_mut()
+                    .zip(col.iter())
+                    .for_each(|(acc_i, &v)| *acc_i += weight * v);
+                acc
+            },
+        )
+        .reduce(
+            || vec![Block128::ZERO; n],
+            |mut a, b| {
+                a.iter_mut()
+                    .zip(b.iter())
+                    .for_each(|(a_i, &b_i)| *a_i += b_i);
+                a
+            },
+        );
+    profiler.phase("batched_polynomial");
 
     // Prove C(primary_point) via compact FRI
     let fri_proof = compact_fri_prove(&c_evals, primary_point, ntt, channel, hasher, num_queries);
+    profiler.phase("compact_fri_prove");
 
-    MixedOpeningProof {
+    let proof = MixedOpeningProof {
         all_openings,
         fri_proof,
-    }
+    };
+    profiler.phase("proof_assembly");
+    profiler.finish(n_cols, log_n, secondary_claims.len(), num_queries);
+    proof
 }
 
 /// Verify a mixed opening proof.
