@@ -48,7 +48,7 @@ use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
-use crate::template::{TemplateBuilder, TemplateRefreshTrigger};
+use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -288,18 +288,26 @@ impl BlockMiner {
                 .unwrap_or_default()
                 .as_secs();
 
-            let (tmpl, prev_state_root) = {
-                let ctx = self.chain.read().await;
-                let t = match builder.build(&ctx, addr, now).await {
-                    Some(t) => t,
-                    None => {
-                        tracing::warn!("template build failed, retrying in 1s");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
-                let prev_state_root = ctx.tip_header().state_root; // O(1) — no clone
-                (t, prev_state_root)
+            let snapshot_result = {
+                let mut ctx = self.chain.write().await;
+                TemplateChainSnapshot::from_context(&mut ctx)
+            };
+            let snapshot = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    tracing::warn!(err = ?e, "template snapshot failed, retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let prev_state_root = snapshot.prev_state_root();
+            let tmpl = match builder.build_from_snapshot(&snapshot, addr, now).await {
+                Some(t) => t,
+                None => {
+                    tracing::warn!("template build failed, retrying in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
             };
 
             let height = tmpl.inner.height;
@@ -341,7 +349,7 @@ impl BlockMiner {
             // cannot legally use a stub proof — skip this iteration and wait for
             // the running prove to release the permit.
             if prove_permit.is_err() && tmpl.n_user_txs() > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     height,
                     "prove task busy and block has user txs — skipping this template iteration"
                 );
@@ -371,7 +379,7 @@ impl BlockMiner {
                 }),
                 Err(_) => {
                     // Semaphore busy, but coinbase-only block — stub is consensus-legal.
-                    tracing::warn!(
+                    tracing::debug!(
                         height,
                         "prove task busy, will use stub proof (coinbase-only this round)"
                     );

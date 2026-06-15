@@ -348,7 +348,7 @@ mod tests {
         let mut ctx = ChainContext::init_from_easy_genesis();
         let mut block = build_empty_block_on(&mut ctx);
         block.header.prev_block_hash = [0xAB; 32]; // wrong
-        // TEST_TARGET: nonce = 0 always satisfies the target after tampering.
+                                                   // TEST_TARGET: nonce = 0 always satisfies the target after tampering.
         block.header.nonce = 0;
         let result = ctx.apply_next_block(&block, block.header.timestamp + 1);
         assert_eq!(result, Err(ConsensusError::BadParentHash));

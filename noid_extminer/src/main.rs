@@ -25,11 +25,12 @@
 //! `getBlockTemplate("")` returns:
 //!   - `header_core_hex`       — 212-byte PoW input
 //!   - `block_hex`             — full sealed block with nonce = 0
+//!   - `block_proof_hex`       — serialized BlockProof, empty for coinbase-only
 //!   - `nonce_offset`          — byte offset of nonce inside block_hex (always 144)
 //!   - `difficulty_target_hex` — 256-bit LE target
 //!
 //! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
-//! 16-byte LE nonce and calls `submitBlock(patched_block_hex)`.
+//! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex)`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -93,6 +94,7 @@ struct Cli {
 struct BlockTemplateResponse {
     header_core_hex: String,
     block_hex: String,
+    block_proof_hex: String,
     nonce_offset: usize,
     difficulty_target_hex: String,
     height: u64,
@@ -174,8 +176,8 @@ impl RpcClient {
         self.call("paranoid_getBlockTemplate", [coinbase])
     }
 
-    fn submit_block(&self, block_hex: &str) -> Result<String> {
-        self.call("paranoid_submitBlock", [block_hex])
+    fn submit_block(&self, block_hex: &str, block_proof_hex: &str) -> Result<String> {
+        self.call("paranoid_submitBlock", (block_hex, block_proof_hex))
     }
 }
 
@@ -365,7 +367,7 @@ fn mine(cli: &Cli) -> Result<()> {
         block_bytes[nonce_offset..nonce_offset + 16].copy_from_slice(&nonce_bytes);
 
         // Submit.
-        match rpc.submit_block(&hex::encode(&block_bytes)) {
+        match rpc.submit_block(&hex::encode(&block_bytes), &tmpl.block_proof_hex) {
             Ok(hash) => {
                 blocks_found += 1;
                 last_height = height;

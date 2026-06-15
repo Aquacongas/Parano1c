@@ -786,6 +786,7 @@ Response fields:
 |-------|------|-------------|
 | `header_core_hex` | hex | 212-byte PoW input buffer |
 | `block_hex` | hex | Full sealed block (nonce=0); patch bytes [144..160] with found nonce |
+| `block_proof_hex` | hex | Serialized BlockProof; empty for coinbase-only blocks |
 | `nonce_offset` | usize | Byte offset of nonce in `block_hex` (always 144) |
 | `difficulty_target_hex` | hex(32) | Target (LE); find N where `Blake3(patched_header_core) < target` |
 | `height` | u64 | Block height being mined |
@@ -798,16 +799,16 @@ Response fields:
    - Compute `hash = Blake3(patched_212_bytes)`
    - If `hash < difficulty_target`: found a valid block
 3. Patch bytes [144..160] of `block_hex` with the winning nonce
-4. Submit via `submitBlock`
+4. Submit via `submitBlock(block_hex, block_proof_hex)`
 
 ---
 
-### `submit-block <BLOCK_HEX>` (alias: `submit`)
+### `submit-block <BLOCK_HEX> <BLOCK_PROOF_HEX>` (alias: `submit`)
 
-Submit a solved block.
+Submit a solved block plus its serialized BlockProof. Use `""` as `BLOCK_PROOF_HEX` for coinbase-only blocks.
 
 ```
-$ noid-cli submit-block a41c9f0b237e...
+$ noid-cli submit-block a41c9f0b237e... 9f1c02...
 ✓ Block accepted: 6e7a8027180707317e2ba8fdc63af0d7...
 ```
 
@@ -941,7 +942,7 @@ Error:
 | Method | Params | Returns | Description |
 |--------|--------|---------|-------------|
 | `paranoid_getBlockTemplate` | `miner_address: string` | `BlockTemplateResponse` | PoW template (ZK pre-proved) |
-| `paranoid_submitBlock` | `block_hex: string` | `string` | Submit solved block, returns hash |
+| `paranoid_submitBlock` | `block_hex: string, block_proof_hex: string` | `string` | Submit solved block, returns hash |
 
 #### Node Control
 
@@ -1044,7 +1045,7 @@ curl -s http://127.0.0.1:9401 -X POST \
 # Submit solved block
 curl -s http://127.0.0.1:9401 -X POST \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"paranoid_submitBlock","params":["<block_hex>"]}' | jq .result
+  -d '{"jsonrpc":"2.0","id":1,"method":"paranoid_submitBlock","params":["<block_hex>","<block_proof_hex>"]}' | jq .result
 
 # Check if tx is spent (nullifier)
 curl -s http://127.0.0.1:9401 -X POST \

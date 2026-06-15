@@ -207,14 +207,10 @@ impl NodeBehaviour {
             .mesh_n_high(8)
             .mesh_outbound_min(1)
             .max_transmit_size(GOSSIP_MAX_TRANSMIT_BYTES)
-            // flood_publish(true): send to ALL connected peers, not just mesh.
-            // TXs are small (1-5 KB); flooding ensures instant delivery to every
-            // peer regardless of mesh topology. Gossipsub content-addressed
-            // deduplication (blake3 hash ID) prevents infinite rebroadcast loops.
-            // For mainnet at scale, TX flooding is still correct (spam filtered by
-            // mempool fee checks) while block announcements are already compact
-            // (~310 bytes header-only; proof pulled on demand).
-            .flood_publish(true)
+            // Mainnet: rely on the mesh for publish fanout. Flood-publishing to
+            // every connected peer turns inbound spam into O(connected_peers)
+            // outbound bandwidth even when downstream validation drops it.
+            .flood_publish(false)
             // Peer exchange: when the mesh prunes a peer it advertises up to 6
             // alternative peers (PeerInfo with signed address records). The
             // receiving node dials those peers automatically, enabling organic

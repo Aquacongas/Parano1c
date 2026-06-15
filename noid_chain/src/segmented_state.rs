@@ -46,8 +46,8 @@ use noid_poseidon2b::native::compress;
 #[cfg(test)]
 use crate::fri_state::merkle_root_from_leaf;
 use crate::fri_state::{
-    compute_segment_root, eval_point_for_local_index, open_segment_at_point,
-    SlotOpening, SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE,
+    compute_segment_root, eval_point_for_local_index, open_segment_at_point, SlotOpening,
+    SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE,
 };
 
 // ---------------------------------------------------------------------------

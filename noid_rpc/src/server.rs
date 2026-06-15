@@ -18,7 +18,7 @@ use noid_chain::block::Block;
 use noid_chain::consensus::{allocator::generate_slot_hints, pow::full_block_hash};
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
-use noid_miner::template::TemplateBuilder;
+use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
@@ -30,6 +30,60 @@ use crate::wallet_ops::WalletOps;
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
+}
+
+fn verify_rpc_block_against_context(
+    ctx: &mut MdbxChainContext,
+    block: &Block,
+    block_proof_bytes: &[u8],
+    local_time: u64,
+) -> Result<(), String> {
+    noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
+        .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+
+    let parent = ctx.tip_header().clone();
+    let prev_timestamps = ctx.prev_timestamps();
+    let prev_active_counts = ctx.prev_active_counts();
+    let anchor = ctx.anchor_info();
+    noid_chain::consensus::validate_block_checks(
+        block,
+        &parent,
+        &prev_timestamps,
+        &prev_active_counts,
+        local_time,
+        &anchor,
+        &ctx.nullifiers,
+    )
+    .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
+
+    if block_proof_bytes.is_empty() {
+        return Ok(());
+    }
+
+    let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
+        .map_err(|e| format!("proof deserialize failed: {e}"))?;
+    for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
+        if pi.log_slots != block.header.log_slots {
+            return Err(format!(
+                "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
+                pi.log_slots, block.header.log_slots
+            ));
+        }
+    }
+
+    ctx.preload_segments_for_block(block)
+        .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
+
+    let spine = noid_block::build_spine_inputs_list(block);
+    let auth = noid_block::build_auth_public_list(block, &proof);
+    let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
+    let tx_airs = noid_block::build_tx_airs(block);
+    let air_refs: Vec<&dyn noid_air::Air> =
+        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
+    let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
+        sb_airs.iter().collect();
+    noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
+        .map_err(|e| format!("ZK proof invalid: {e:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -578,13 +632,16 @@ impl ParanoidApiServer for RpcHandler {
             .as_secs();
 
         let builder = TemplateBuilder::new(self.mempool.clone());
-        let ctx = self.chain.read().await;
-        let prev_state_root = ctx.tip_header().state_root;
+        let snapshot = {
+            let mut ctx = self.chain.write().await;
+            TemplateChainSnapshot::from_context(&mut ctx)
+                .map_err(|e| rpc_err(format!("template snapshot: {e:?}")))?
+        };
+        let prev_state_root = snapshot.prev_state_root();
         let tmpl = builder
-            .build(&ctx, addr, now)
+            .build_from_snapshot(&snapshot, addr, now)
             .await
             .ok_or_else(|| rpc_err("template build failed"))?;
-        drop(ctx);
 
         let height = tmpl.inner.height;
         let n_txs = tmpl.inner.n_txs();
@@ -596,12 +653,13 @@ impl ParanoidApiServer for RpcHandler {
         // External miner only needs to patch the nonce — no other computation required.
         // Coinbase-only blocks prove instantly; user-tx blocks take ~1-3 s.
         let tmpl_for_prove = tmpl.clone();
-        let (proof_transcript_hash, witness_root, _proof_bytes) =
+        let (proof_transcript_hash, witness_root, proof_bytes) =
             tokio::task::spawn_blocking(move || {
                 noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
             })
             .await
-            .map_err(|e| rpc_err(format!("prove task: {e}")))?;
+            .map_err(|e| rpc_err(format!("prove task: {e}")))?
+            .map_err(|e| rpc_err(format!("prove_block: {e}")))?;
 
         // Seal block with nonce = 0. External miner patches bytes [144..160].
         let sealed = tmpl.seal(0, proof_transcript_hash, witness_root);
@@ -614,6 +672,7 @@ impl ParanoidApiServer for RpcHandler {
         Ok(BlockTemplateResponse {
             header_core_hex: hex::encode(header_core),
             block_hex: hex::encode(block_bytes),
+            block_proof_hex: hex::encode(proof_bytes),
             nonce_offset,
             difficulty_target_hex: hex::encode(diff_target),
             height,
@@ -624,23 +683,35 @@ impl ParanoidApiServer for RpcHandler {
     /// Submit a mined block (from external miner or internal PoW).
     ///
     /// `block_hex`: hex-encoded serialized `Block` bytes.
-    ///
-    /// Validates the block via native consensus checks + applies it to the chain.
-    async fn submit_block(&self, block_hex: String) -> RpcResult<String> {
-        let bytes = hex::decode(&block_hex).map_err(|e| rpc_err(format!("hex: {e}")))?;
+    /// `block_proof_hex`: serialized `BlockProof` bytes, empty for coinbase-only blocks.
+    async fn submit_block(&self, block_hex: String, block_proof_hex: String) -> RpcResult<String> {
+        let bytes = hex::decode(&block_hex).map_err(|e| rpc_err(format!("block hex: {e}")))?;
         let block =
             Block::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode block: {e:?}")))?;
+        let block_proof_bytes = if block_proof_hex.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&block_proof_hex).map_err(|e| rpc_err(format!("proof hex: {e}")))?
+        };
 
         let local_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Apply to chain and build ChainView under the same write lock.
+        // Verify proof-native validity before committing. Native apply repeats
+        // consensus/root checks and performs the durable state transition.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
+            verify_rpc_block_against_context(&mut ctx, &block, &block_proof_bytes, local_time)
+                .map_err(|e| rpc_err(format!("validation: {e}")))?;
             ctx.apply_next_block(&block, local_time)
                 .map_err(|e| rpc_err(format!("consensus: {e}")))?;
+            if !block_proof_bytes.is_empty() {
+                ctx.store
+                    .put_block_proof(block.header.height, &block_proof_bytes)
+                    .map_err(|e| rpc_err(format!("store block proof: {e}")))?;
+            }
             let hash = full_block_hash(&block.header);
             let view = noid_mempool::ChainView::from_mdbx(&ctx);
             (hash, view)

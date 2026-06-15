@@ -327,12 +327,15 @@ enum Command {
         miner_addr: String,
     },
 
-    /// Submit a solved block from an external miner.
+    /// Submit a solved block plus BlockProof bytes from an external miner.
     #[command(name = "submit-block", alias = "submit")]
     SubmitBlock {
         /// Solved block as hex (full block bytes with valid nonce).
         #[arg(value_name = "BLOCK_HEX")]
         block_hex: String,
+        /// Serialized BlockProof hex. Use empty string "" for coinbase-only blocks.
+        #[arg(value_name = "BLOCK_PROOF_HEX")]
+        block_proof_hex: String,
     },
 }
 
@@ -416,7 +419,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
         Command::Stop => cmd_stop(&ctx).await,
         Command::BlockTemplate { miner_addr } => cmd_block_template(&ctx, miner_addr).await,
-        Command::SubmitBlock { block_hex } => cmd_submit_block(&ctx, block_hex).await,
+        Command::SubmitBlock {
+            block_hex,
+            block_proof_hex,
+        } => cmd_submit_block(&ctx, block_hex, block_proof_hex).await,
     }
 }
 
@@ -1975,10 +1981,18 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn cmd_submit_block(ctx: &Ctx<'_>, block_hex: &str) -> anyhow::Result<()> {
-    let result = rpc(ctx, "submitBlock", &[block_hex.into()])
-        .await
-        .context("submitBlock")?;
+async fn cmd_submit_block(
+    ctx: &Ctx<'_>,
+    block_hex: &str,
+    block_proof_hex: &str,
+) -> anyhow::Result<()> {
+    let result = rpc(
+        ctx,
+        "submitBlock",
+        &[block_hex.into(), block_proof_hex.into()],
+    )
+    .await
+    .context("submitBlock")?;
 
     if ctx.json {
         return print_json(&result);

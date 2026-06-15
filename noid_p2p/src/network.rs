@@ -10,13 +10,14 @@
 //! - Ping: pruning stale connections
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
     Multiaddr, PeerId,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
@@ -27,12 +28,19 @@ use crate::protocol::{
     GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics, RecursiveProofGossipMsg,
 };
 
+struct PendingStateSegmentResponse {
+    channel: request_response::ResponseChannel<GetStateSegmentResponse>,
+    response: GetStateSegmentResponse,
+}
+
 // Hard caps on incoming response sizes to prevent OOM from malicious peers.
 const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB (256 txs × ~750 B each + header)
 const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // 6 MB (5 MB at max 256 txs + margin)
 const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin)
 const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB (6.5 KB typical)
 const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
+const MAX_TX_WIRE_SIZE: usize = 1024 * 1024; // 1 MB TxIntent hard cap
+const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-sync response
 
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
@@ -429,6 +437,21 @@ async fn run_swarm(
         (Multiaddr, tokio::time::Instant, u32),
     > = std::collections::HashMap::new();
 
+    // Cheap P2P-layer DoS guards that run before emitting NetworkEvent into
+    // the bounded broadcast channel.
+    let mut block_event_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
+        std::collections::HashMap::new();
+    let mut tx_gossip_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
+        std::collections::HashMap::new();
+    let mut recursive_proof_gossip_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
+        std::collections::HashMap::new();
+    let mut mempool_sync_last_request: std::collections::HashMap<PeerId, Instant> =
+        std::collections::HashMap::new();
+
+    let (segment_response_tx, mut segment_response_rx) =
+        mpsc::channel::<PendingStateSegmentResponse>(32);
+    let segment_encode_semaphore = Arc::new(Semaphore::new(2));
+
     // Reconnect timer: poll the reconnect list every 5 seconds.
     let mut reconnect_timer = tokio::time::interval(std::time::Duration::from_secs(5));
     reconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -454,19 +477,49 @@ async fn run_swarm(
         // Drain all pending commands first (priority: outgoing blocks must propagate
         // immediately without waiting for swarm event processing).
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_network_command(&mut swarm, cmd, &topics);
+            handle_network_command(&mut swarm, cmd, &topics, &mut mempool_sync_last_request);
         }
 
         tokio::select! {
             // Swarm events.
             event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, event, &event_tx, &chain, &mempool, &topics, &mut reconnect).await;
+                handle_swarm_event(
+                    &mut swarm,
+                    event,
+                    &event_tx,
+                    &chain,
+                    &mempool,
+                    &topics,
+                    &segment_response_tx,
+                    &segment_encode_semaphore,
+                    &mut reconnect,
+                    &mut block_event_rate,
+                    &mut tx_gossip_rate,
+                    &mut recursive_proof_gossip_rate,
+                )
+                .await;
+            }
+
+            // Completed state-segment encodes. Responses must be sent from the
+            // swarm task, but the CPU-heavy encoding runs on blocking workers.
+            encoded = segment_response_rx.recv() => {
+                if let Some(encoded) = encoded {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .state_segment_sync
+                        .send_response(encoded.channel, encoded.response);
+                }
             }
 
             // Commands from the node (when no swarm event pending).
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(cmd) => handle_network_command(&mut swarm, cmd, &topics),
+                    Some(cmd) => handle_network_command(
+                        &mut swarm,
+                        cmd,
+                        &topics,
+                        &mut mempool_sync_last_request,
+                    ),
                     None => break, // cmd_tx dropped
                 }
             }
@@ -544,12 +597,65 @@ async fn run_swarm(
     Ok(())
 }
 
+fn allow_peer_rate(
+    rates: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    peer: PeerId,
+    max: u32,
+    window: Duration,
+) -> bool {
+    let now = Instant::now();
+    let entry = rates.entry(peer).or_insert((0, now));
+    if now.duration_since(entry.1) > window {
+        *entry = (1, now);
+        true
+    } else if entry.0 >= max {
+        false
+    } else {
+        entry.0 += 1;
+        true
+    }
+}
+
+fn is_routable_identify_addr(addr: &Multiaddr) -> bool {
+    for protocol in addr.iter() {
+        match protocol {
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                if ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || ip.is_unspecified()
+                {
+                    return false;
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                let octets = ip.octets();
+                let unique_local = (octets[0] & 0xfe) == 0xfc;
+                let link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
+                if ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || unique_local
+                    || link_local
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Process a single network command. Separated from the select! loop so that
 /// pending commands can be drained synchronously via `try_recv` before blocking.
 fn handle_network_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     cmd: NetworkCommand,
     topics: &NetworkTopics,
+    mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock {
@@ -690,6 +796,15 @@ fn handle_network_command(
             );
         }
         NetworkCommand::RequestMempoolSync { peer } => {
+            const MEMPOOL_SYNC_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
+            let now = Instant::now();
+            if let Some(last) = mempool_sync_last_request.get(&peer) {
+                if now.duration_since(*last) < MEMPOOL_SYNC_REQUEST_COOLDOWN {
+                    tracing::debug!(peer = %peer, "mempool sync request suppressed by cooldown");
+                    return;
+                }
+            }
+            mempool_sync_last_request.insert(peer, now);
             let _ = swarm
                 .behaviour_mut()
                 .mempool_sync
@@ -707,10 +822,15 @@ async fn handle_swarm_event(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
+    segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
+    segment_encode_semaphore: &Arc<Semaphore>,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
         (Multiaddr, tokio::time::Instant, u32),
     >,
+    block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    recursive_proof_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
 ) {
     match event {
         // --- GossipSub: received broadcast ---
@@ -736,6 +856,17 @@ async fn handle_swarm_event(
                         hash,
                         header_bytes,
                     }) => {
+                        const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
+                        const BLOCK_RATE_MAX: u32 = 40;
+                        if !allow_peer_rate(
+                            block_event_rate,
+                            origin,
+                            BLOCK_RATE_MAX,
+                            BLOCK_RATE_WINDOW,
+                        ) {
+                            tracing::debug!(peer = %origin, "block announcement rate limit exceeded — dropped before event channel");
+                            return;
+                        }
                         let _ = event_tx.send(NetworkEvent::NewBlockAnnouncement {
                             from: origin,
                             height,
@@ -754,6 +885,17 @@ async fn handle_swarm_event(
                         } else if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
                         } else {
+                            const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
+                            const BLOCK_RATE_MAX: u32 = 40;
+                            if !allow_peer_rate(
+                                block_event_rate,
+                                origin,
+                                BLOCK_RATE_MAX,
+                                BLOCK_RATE_WINDOW,
+                            ) {
+                                tracing::debug!(peer = %origin, "inline block rate limit exceeded — dropped before event channel");
+                                return;
+                            }
                             tracing::debug!(height, peer = %propagation_source, "received inline block via gossip");
                             let _ = event_tx.send(NetworkEvent::NewBlock {
                                 from: origin,
@@ -771,21 +913,54 @@ async fn handle_swarm_event(
                     }
                 }
             } else if topic == topics.txs.as_str() {
-                let _ = event_tx.send(NetworkEvent::NewTx {
-                    from: propagation_source,
-                    intent_bytes: message.data,
-                });
+                if message.data.len() > MAX_TX_WIRE_SIZE {
+                    tracing::warn!(peer = %propagation_source, len = message.data.len(), "tx gossip too large — dropped");
+                } else {
+                    const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
+                    const TX_RATE_MAX: u32 = 50;
+                    if !allow_peer_rate(
+                        tx_gossip_rate,
+                        propagation_source,
+                        TX_RATE_MAX,
+                        TX_RATE_WINDOW,
+                    ) {
+                        tracing::debug!(peer = %propagation_source, "tx gossip rate limit exceeded — dropped before event channel");
+                        return;
+                    }
+                    let _ = event_tx.send(NetworkEvent::NewTx {
+                        from: propagation_source,
+                        intent_bytes: message.data,
+                    });
+                }
             } else if topic == topics.rec_proofs.as_str() {
                 match bincode::deserialize::<crate::protocol::RecursiveProofGossipMsg>(
                     &message.data,
                 ) {
                     Ok(msg) => {
-                        let _ = event_tx.send(NetworkEvent::RecursiveProofUpdate {
-                            from: origin,
-                            height: msg.height,
-                            tip_hash: msg.tip_hash,
-                            proof_bytes: msg.proof_bytes,
-                        });
+                        if msg.proof_bytes.len() > MAX_RECURSIVE_PROOF_BYTES {
+                            tracing::warn!(peer = %propagation_source, len = msg.proof_bytes.len(), "recursive proof gossip too large — dropped");
+                        } else {
+                            const REC_PROOF_RATE_WINDOW: Duration = Duration::from_secs(60);
+                            const REC_PROOF_RATE_MAX: u32 = 4;
+                            let now = Instant::now();
+                            let entry = recursive_proof_gossip_rate
+                                .entry(origin)
+                                .or_insert((0, now));
+                            if now.duration_since(entry.1) > REC_PROOF_RATE_WINDOW {
+                                *entry = (1, now);
+                            } else if entry.0 >= REC_PROOF_RATE_MAX {
+                                tracing::debug!(peer = %origin, "recursive proof gossip rate limit exceeded — dropped");
+                                return;
+                            } else {
+                                entry.0 += 1;
+                            }
+                            let _ = event_tx.send(NetworkEvent::RecursiveProofUpdate {
+                                from: origin,
+                                height: msg.height,
+                                tip_hash: msg.tip_hash,
+                                proof_bytes: msg.proof_bytes,
+                            });
+                        }
                     }
                     Err(e) => tracing::debug!("RecursiveProofGossipMsg decode: {e}"),
                 }
@@ -806,10 +981,22 @@ async fn handle_swarm_event(
             info,
             ..
         })) => {
-            // 1. Add every advertised listen address to the Kademlia routing
-            //    table.  This is what makes the DHT actually work: Kademlia
-            //    can now answer FIND_NODE queries with this peer's address.
+            // 1. Add a bounded, routable subset of advertised listen addresses
+            //    to Kademlia and the swarm address book. Blindly accepting all
+            //    Identify addresses lets a peer bloat our peer store/routing state
+            //    or advertise localhost/private addresses that are useless off-LAN.
+            const MAX_IDENTIFY_ADDRS_PER_PEER: usize = 8;
+            let mut accepted_addrs = 0usize;
+            let mut dropped_addrs = 0usize;
             for addr in &info.listen_addrs {
+                if accepted_addrs >= MAX_IDENTIFY_ADDRS_PER_PEER {
+                    dropped_addrs += 1;
+                    continue;
+                }
+                if !is_routable_identify_addr(addr) {
+                    dropped_addrs += 1;
+                    continue;
+                }
                 swarm
                     .behaviour_mut()
                     .kad
@@ -817,6 +1004,7 @@ async fn handle_swarm_event(
                 // Also populate the swarm's address book so GossipSub PX
                 // can build signed PeerInfo records for this peer.
                 swarm.add_peer_address(peer_id, addr.clone());
+                accepted_addrs += 1;
             }
 
             // 2. Add to gossipsub explicit peers so the mesh can form even
@@ -830,7 +1018,9 @@ async fn handle_swarm_event(
             tracing::debug!(
                 peer = %peer_id,
                 protocols = ?info.protocols,
-                addrs = info.listen_addrs.len(),
+                advertised_addrs = info.listen_addrs.len(),
+                accepted_addrs,
+                dropped_addrs,
                 "peer identified"
             );
         }
@@ -975,7 +1165,9 @@ async fn handle_swarm_event(
         )) => {
             let ctx = chain.read().await;
             let mut headers = Vec::new();
-            for h in request.start_height..(request.start_height + request.count as u64) {
+            let count = request.count.min(512);
+            let end = request.start_height.saturating_add(count as u64);
+            for h in request.start_height..end {
                 if let Ok(Some(hdr)) = ctx.get_header_from_store(h) {
                     let mut buf = Vec::new();
                     hdr.encode(&mut buf);
@@ -1004,6 +1196,17 @@ async fn handle_swarm_event(
                     if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                         tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
                     } else {
+                        const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
+                        const BLOCK_RATE_MAX: u32 = 40;
+                        if !allow_peer_rate(
+                            block_event_rate,
+                            peer,
+                            BLOCK_RATE_MAX,
+                            BLOCK_RATE_WINDOW,
+                        ) {
+                            tracing::debug!(peer = %peer, "pulled block response rate limit exceeded — dropped before event channel");
+                            return;
+                        }
                         tracing::debug!(peer = %peer, "received block via pull");
                         let _ = event_tx.send(NetworkEvent::NewBlock {
                             from: peer,
@@ -1183,12 +1386,34 @@ async fn handle_swarm_event(
                     tracing::warn!(from = %peer, "manifest: too many headers, dropping");
                     return;
                 }
-                if response.recent_headers.iter().any(|h| h.len() > MAX_HEADER_BYTES) {
+                if response
+                    .recent_headers
+                    .iter()
+                    .any(|h| h.len() > MAX_HEADER_BYTES)
+                {
                     tracing::warn!(from = %peer, "manifest: oversized header entry, dropping");
+                    return;
+                }
+                let segment_span = response.log_slots.saturating_sub(response.eff_log as u32);
+                let max_possible_segments = 1usize.checked_shl(segment_span).unwrap_or(usize::MAX);
+                if response.segment_ids.len() > max_possible_segments {
+                    tracing::warn!(
+                        from = %peer,
+                        segments = response.segment_ids.len(),
+                        max_possible_segments,
+                        log_slots = response.log_slots,
+                        eff_log = response.eff_log,
+                        "manifest: impossible segment count, dropping"
+                    );
                     return;
                 }
                 if response.segment_ids.len() > 4096 {
                     tracing::warn!(from = %peer, "manifest: too many segment IDs, dropping");
+                    return;
+                }
+                if response.segment_ids.len().saturating_mul(MAX_SEGMENT_BYTES) > 1024 * 1024 * 1024
+                {
+                    tracing::warn!(from = %peer, segments = response.segment_ids.len(), "manifest: total segment bytes exceed cap, dropping");
                     return;
                 }
                 tracing::info!(
@@ -1206,8 +1431,9 @@ async fn handle_swarm_event(
 
         // --- State sync: segment server (step 2) ---
         //
-        // Serves one encoded segment (~3 MB) per request.
-        // Lock is held only during column clone; encoding happens outside.
+        // Serves one encoded segment (~3 MB) per request. The swarm loop only
+        // clones the segment columns; CPU-heavy encoding runs on a bounded
+        // blocking worker and returns through `segment_response_tx`.
         // Rejects requests if our tip has moved more than FINALITY_DEPTH
         // past the expected_tip_height to prevent serving stale segments.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
@@ -1240,32 +1466,66 @@ async fn handle_swarm_event(
                         "segment request tip mismatch — state advanced"
                     );
                     None
+                } else if seg_id as usize >= ctx.state.state.num_segments() {
+                    tracing::debug!(seg_id, "segment request out of range");
+                    None
                 } else {
                     let eff_log = ctx.state.state.effective_log_segment_size() as u8;
                     let cols = ctx.state.state.segment_columns(seg_id).clone();
                     Some((eff_log, cols))
                 }
             };
-            let response = match result {
-                None => GetStateSegmentResponse {
-                    segment_id: seg_id,
-                    eff_log: 0,
-                    data: None,
-                },
-                Some((eff_log, cols)) => {
-                    // Encode OUTSIDE the lock (CPU-heavy, ~3 MB allocation).
-                    let data = encode_segment(&cols, eff_log);
+
+            let Some((eff_log, cols)) = result else {
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: seg_id,
+                        eff_log: 0,
+                        data: None,
+                    },
+                );
+                return;
+            };
+
+            let Ok(permit) = segment_encode_semaphore.clone().try_acquire_owned() else {
+                tracing::warn!(seg_id, "state segment encode concurrency limit reached");
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: seg_id,
+                        eff_log: 0,
+                        data: None,
+                    },
+                );
+                return;
+            };
+
+            let response_tx = segment_response_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let data = encode_segment(&cols, eff_log);
+                let response = if data.len() <= MAX_SEGMENT_BYTES {
                     GetStateSegmentResponse {
                         segment_id: seg_id,
                         eff_log,
                         data: Some(data),
                     }
-                }
-            };
-            let _ = swarm
-                .behaviour_mut()
-                .state_segment_sync
-                .send_response(channel, response);
+                } else {
+                    tracing::warn!(
+                        seg_id,
+                        len = data.len(),
+                        "encoded state segment exceeds cap"
+                    );
+                    GetStateSegmentResponse {
+                        segment_id: seg_id,
+                        eff_log: 0,
+                        data: None,
+                    }
+                };
+                let _ =
+                    response_tx.blocking_send(PendingStateSegmentResponse { channel, response });
+            });
         }
 
         // --- State sync: segment client (step 2 response) ---
@@ -1296,8 +1556,7 @@ async fn handle_swarm_event(
         // --- Mempool sync: server side (peer requests our mempool) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
             request_response::Event::Message {
-                message:
-                    request_response::Message::Request { channel, .. },
+                message: request_response::Message::Request { channel, .. },
                 peer,
             },
         )) => {
@@ -1330,16 +1589,26 @@ async fn handle_swarm_event(
                 );
                 txs.truncate(MAX_SYNC_TXS);
             }
+            let mut total_bytes = 0usize;
+            txs.retain(|tx| {
+                if tx.len() > MAX_TX_WIRE_SIZE {
+                    tracing::warn!(from = %peer, len = tx.len(), "mempool sync tx too large — dropped");
+                    return false;
+                }
+                total_bytes = total_bytes.saturating_add(tx.len());
+                if total_bytes > MAX_MEMPOOL_SYNC_BYTES {
+                    tracing::warn!(from = %peer, total_bytes, "mempool sync response total bytes exceeded cap — truncating");
+                    return false;
+                }
+                true
+            });
             if !txs.is_empty() {
                 tracing::debug!(
                     from = %peer,
                     tx_count = txs.len(),
                     "received mempool sync response"
                 );
-                let _ = event_tx.send(NetworkEvent::MempoolSyncResponse {
-                    from: peer,
-                    txs,
-                });
+                let _ = event_tx.send(NetworkEvent::MempoolSyncResponse { from: peer, txs });
             }
         }
 

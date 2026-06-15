@@ -167,7 +167,17 @@ impl AsyncMempool {
             }
         }
 
-        let needs_zk = !intent.logic_proof_bytes.is_empty() && !intent.tx_body.is_coinbase;
+        const MAX_LOGIC_PROOF_BYTES: usize = 1024 * 1024; // 1 MB TxIntent wire cap
+        if !intent.tx_body.is_coinbase && intent.logic_proof_bytes.is_empty() {
+            return Err(SubmitError::MissingProof);
+        }
+        if intent.logic_proof_bytes.len() > MAX_LOGIC_PROOF_BYTES {
+            return Err(SubmitError::ProofTooLarge {
+                actual: intent.logic_proof_bytes.len(),
+                max: MAX_LOGIC_PROOF_BYTES,
+            });
+        }
+        let needs_zk = !intent.tx_body.is_coinbase;
 
         // ── Cheap pre-filter (lock held briefly) ─────────────────
         // Runs all O(1)–O(ANCHOR_DEPTH) checks on current state.

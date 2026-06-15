@@ -12,6 +12,8 @@ noid_mempool    = { path = "../noid_mempool" }
 noid_miner      = { path = "../noid_miner" }
 noid_p2p        = { path = "../noid_p2p" }
 noid_recursive  = { path = "../noid_recursive" }
+noid_block      = { path = "../noid_block" }
+noid_air        = { path = "../noid_air" }
 bincode         = "1"
 jsonrpsee    = { version = "0.24", features = ["server", "macros"] }
 tower        = { version = "0.4", features = ["util"] }

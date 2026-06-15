@@ -178,10 +178,7 @@ impl MdbxChainContext {
             // Try to restore from existing MDBX state (state_root integrity check inside).
             match Self::restore_from_mdbx(store) {
                 Ok(ctx) => {
-                    tracing::info!(
-                        height = ctx.tip_height,
-                        "resumed from persisted state"
-                    );
+                    tracing::info!(height = ctx.tip_height, "resumed from persisted state");
                     Ok(ctx)
                 }
                 Err(MdbxContextError::Corrupt(reason)) => {
@@ -550,6 +547,30 @@ impl MdbxChainContext {
         new_blocks: &[Block],
         local_time: u64,
     ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError> {
+        self.apply_reorg_mdbx_with_validator(
+            ancestor_height,
+            new_blocks,
+            local_time,
+            |_ctx, _block, _local_time| Ok(()),
+        )
+    }
+
+    /// Apply a chain reorganization with a caller-provided pre-apply validator.
+    ///
+    /// The validator runs after the context has been reverted to the fork pre-state
+    /// and before each new block is applied. This keeps `noid_chain` independent
+    /// from `noid_block` while allowing the node to run proof-native ZK validation
+    /// against the exact pre-block state during reorgs.
+    pub fn apply_reorg_mdbx_with_validator<F>(
+        &mut self,
+        ancestor_height: u64,
+        new_blocks: &[Block],
+        local_time: u64,
+        mut validate_before_apply: F,
+    ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
+    where
+        F: FnMut(&mut Self, &Block, u64) -> Result<(), MdbxContextError>,
+    {
         use crate::consensus::reorg::{revert_state_counters, ReorgResult};
 
         // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
@@ -694,6 +715,14 @@ impl MdbxChainContext {
         let mut applied_heights: Vec<u64> = Vec::new();
 
         for block in new_blocks {
+            if let Err(e) = validate_before_apply(self, block, local_time) {
+                tracing::error!(
+                    height = block.header.height,
+                    err = ?e,
+                    "reorg: pre-apply validation failed"
+                );
+                return Err(e);
+            }
             match self.apply_next_block(block, local_time) {
                 Ok(_) => {
                     applied_heights.push(block.header.height);
@@ -806,7 +835,7 @@ impl MdbxChainContext {
     /// Checks each input slot (must be non-empty = need to read existing data)
     /// and each output slot (must be empty = need to read to verify).
     /// Reloads from MDBX any segment that is currently evicted.
-    fn preload_segments_for_block(&mut self, block: &Block) -> Result<(), MdbxContextError> {
+    pub fn preload_segments_for_block(&mut self, block: &Block) -> Result<(), MdbxContextError> {
         let eff_log = self.state.state.effective_log_segment_size();
         let mut needed: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
@@ -856,26 +885,32 @@ impl MdbxChainContext {
     ///
     /// After this call, the node is at the snapshot's tip height and can
     /// immediately start receiving gossipsub blocks and mining.
-    pub fn apply_state_snapshot(
+    pub fn apply_state_snapshot<I>(
         &mut self,
         tip_height: u64,
         tip_hash: [u8; 32],
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
-        segments: &[(u16, u8, crate::segmented_state::SegmentColumns)],
+        segments: I,
         recent_headers_bytes: &[Vec<u8>],
         nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
-    ) -> Result<(), MdbxContextError> {
+    ) -> Result<(), MdbxContextError>
+    where
+        I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns)>,
+    {
         use crate::block_header::BlockHeader;
         use crate::consensus::difficulty::{add_work, block_work};
+        use crate::consensus::pow::full_block_hash;
         use crate::nullifier::NullifierSet;
 
         // 1. Rebuild SegmentedFriState from snapshot segments.
         let mut seg_state =
             crate::segmented_state::SegmentedFriState::new_empty(log_slots as usize);
+        let mut segment_count = 0usize;
         for (seg_id, _eff_log, cols) in segments {
-            seg_state.set_segment_columns(*seg_id, cols.clone());
+            seg_state.set_segment_columns(seg_id, cols);
+            segment_count += 1;
         }
 
         // 2. Decode and index recent headers.
@@ -901,6 +936,11 @@ impl MdbxChainContext {
             let tip_hdr = new_tip_header.as_ref().ok_or(MdbxContextError::Corrupt(
                 "snapshot missing tip header in recent_headers: cannot verify state_root",
             ))?;
+            if tip_hash != full_block_hash(tip_hdr) {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot tip_hash mismatch: manifest tip_hash does not match tip header",
+                ));
+            }
             let computed_root = seg_state.root();
             if computed_root != tip_hdr.state_root {
                 return Err(MdbxContextError::Corrupt(
@@ -938,19 +978,23 @@ impl MdbxChainContext {
         // 6. Persist the snapshot to MDBX so the node survives restarts.
         // We persist all segments plus tip header (if we have it).
         if let Some(tip_hdr) = new_tip_header {
-            // Collect all segments to write
+            // Write installed snapshot segments by reference. Avoid cloning all
+            // columns a second time; the decoded columns were already moved into
+            // `self.state.state` above.
             let eff_log = self.state.state.effective_log_segment_size() as u8;
             let seg_ids: Vec<u16> = self.state.state.active_segment_ids().collect();
             let total = seg_ids.len();
-            let dirty_segments: Vec<(u16, u8, crate::segmented_state::SegmentColumns)> = seg_ids
+            let dirty_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> = seg_ids
                 .iter()
-                .map(|&id| (id, eff_log, self.state.state.segment_columns(id).clone()))
+                .map(|&id| {
+                    let cols = self
+                        .state
+                        .state
+                        .try_get_segment_columns(id)
+                        .expect("active segment must have columns");
+                    (id, eff_log, cols)
+                })
                 .collect();
-            let dirty_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> =
-                dirty_segments
-                    .iter()
-                    .map(|(id, eff, cols)| (*id, *eff, cols))
-                    .collect();
 
             use crate::consensus::da_prune::BlockUndoLog;
             let empty_undo = BlockUndoLog {
@@ -982,12 +1026,7 @@ impl MdbxChainContext {
             );
 
             // Rebuild the owner index from snapshot segments so wallet scan is O(1).
-            let snapshot_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> =
-                dirty_segments
-                    .iter()
-                    .map(|(id, eff, cols)| (*id, *eff, cols))
-                    .collect();
-            if let Err(e) = self.store.rebuild_owner_index_from_segments(&snapshot_refs) {
+            if let Err(e) = self.store.rebuild_owner_index_from_segments(&dirty_refs) {
                 tracing::warn!(err = %e, "rebuild_owner_index_from_segments failed");
             }
 
@@ -1007,7 +1046,7 @@ impl MdbxChainContext {
 
         tracing::info!(
             height = tip_height,
-            segments = segments.len(),
+            segments = segment_count,
             active_slots = active_slot_count,
             "state snapshot applied"
         );

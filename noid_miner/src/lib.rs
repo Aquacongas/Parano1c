@@ -51,6 +51,6 @@ pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
 pub fn run_prove_block_for_rpc(
     tmpl: &BlockTemplate,
     prev_state_root: [u8; 32],
-) -> ([u8; 32], [u8; 32], Vec<u8>) {
-    miner::run_prove_block(tmpl, prev_state_root).unwrap_or(([1u8; 32], [1u8; 32], vec![]))
+) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
+    miner::run_prove_block(tmpl, prev_state_root)
 }

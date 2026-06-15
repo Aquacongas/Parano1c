@@ -26,6 +26,14 @@ pub enum SubmitError {
     #[error("malformed intent: {0}")]
     MalformedIntent(String),
 
+    /// Non-coinbase transactions must carry a wallet logic proof.
+    #[error("missing logic proof for non-coinbase transaction")]
+    MissingProof,
+
+    /// Logic proof bytes exceed the mempool wire/admission cap.
+    #[error("logic proof too large: {actual} bytes (max {max})")]
+    ProofTooLarge { actual: usize, max: usize },
+
     /// ZK logic proof verification failed.
     #[error("invalid logic proof: {0}")]
     InvalidProof(String),

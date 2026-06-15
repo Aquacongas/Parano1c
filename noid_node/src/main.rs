@@ -30,6 +30,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use clap::Parser;
@@ -42,6 +43,34 @@ use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_p2p::{NetworkEvent, P2PNetwork};
 use noid_rpc::start_rpc_server;
+
+#[derive(Clone)]
+struct ProvedBlockCandidate {
+    block: noid_chain::block::Block,
+    block_proof_bytes: Vec<u8>,
+}
+
+struct OrphanBlock {
+    block: noid_chain::block::Block,
+    block_proof_bytes: Vec<u8>,
+    from: libp2p::PeerId,
+    received_at: Instant,
+}
+
+impl OrphanBlock {
+    fn new(
+        block: noid_chain::block::Block,
+        block_proof_bytes: Vec<u8>,
+        from: libp2p::PeerId,
+    ) -> Self {
+        Self {
+            block,
+            block_proof_bytes,
+            from,
+            received_at: Instant::now(),
+        }
+    }
+}
 
 mod config;
 mod wallet;
@@ -340,7 +369,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
     if cli.purge_state {
         tracing::info!("--purge-state: clearing volatile state before startup");
-        let tmp_store = noid_chain::storage::MdbxStore::open(&data_dir).context("open MDBX for purge")?;
+        let tmp_store =
+            noid_chain::storage::MdbxStore::open(&data_dir).context("open MDBX for purge")?;
         tmp_store.clear_for_restart().context("purge state")?;
         drop(tmp_store);
     }
@@ -875,11 +905,11 @@ async fn apply_block_offthread(
 async fn apply_reorg_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     ancestor_height: u64,
-    new_blocks: Vec<noid_chain::block::Block>,
+    new_blocks: Vec<ProvedBlockCandidate>,
     local_time: u64,
 ) -> (
     Result<noid_chain::consensus::ReorgResult, noid_chain::storage::MdbxContextError>,
-    Vec<noid_chain::block::Block>,
+    Vec<ProvedBlockCandidate>,
     Option<ChainView>,
 ) {
     let chain = chain.clone();
@@ -894,8 +924,58 @@ async fn apply_reorg_offthread(
                 None,
             );
         }
-        let result = ctx.apply_reorg_mdbx(ancestor_height, &new_blocks, local_time);
+        let proof_by_hash: std::collections::HashMap<[u8; 32], Vec<u8>> = new_blocks
+            .iter()
+            .map(|candidate| {
+                (
+                    noid_chain::consensus::pow::full_block_hash(&candidate.block.header),
+                    candidate.block_proof_bytes.clone(),
+                )
+            })
+            .collect();
+        let block_bodies: Vec<_> = new_blocks
+            .iter()
+            .map(|candidate| candidate.block.clone())
+            .collect();
+        let result = ctx.apply_reorg_mdbx_with_validator(
+            ancestor_height,
+            &block_bodies,
+            local_time,
+            |ctx, block, block_local_time| {
+                let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+                let proof_bytes = proof_by_hash.get(&block_hash).ok_or_else(|| {
+                    noid_chain::storage::MdbxContextError::Consensus(
+                        noid_chain::consensus::ConsensusError::ShapeMismatch(
+                            "missing proof bytes for reorg candidate".to_string(),
+                        ),
+                    )
+                })?;
+                verify_p2p_block_against_context(ctx, block, proof_bytes, block_local_time).map_err(
+                    |e| {
+                        noid_chain::storage::MdbxContextError::Consensus(
+                            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                                "reorg proof validation failed: {e}"
+                            )),
+                        )
+                    },
+                )
+            },
+        );
         let view = if result.is_ok() {
+            for candidate in &new_blocks {
+                if !candidate.block_proof_bytes.is_empty() {
+                    if let Err(e) = ctx.store.put_block_proof(
+                        candidate.block.header.height,
+                        &candidate.block_proof_bytes,
+                    ) {
+                        tracing::warn!(
+                            height = candidate.block.header.height,
+                            err = %e,
+                            "failed to store reorg block proof"
+                        );
+                    }
+                }
+            }
             Some(ChainView::from_mdbx(&ctx))
         } else {
             None
@@ -904,6 +984,98 @@ async fn apply_reorg_offthread(
     })
     .await
     .expect("apply_reorg_mdbx panicked in spawn_blocking")
+}
+
+fn verify_p2p_block_against_context(
+    ctx: &mut MdbxChainContext,
+    block: &noid_chain::block::Block,
+    block_proof_bytes: &[u8],
+    local_time: u64,
+) -> Result<(), String> {
+    noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
+        .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+
+    if block.header.height != ctx.tip_height().saturating_add(1)
+        || block.header.prev_block_hash != ctx.tip_hash()
+    {
+        return Err(format!(
+            "block does not extend current pre-state tip: block_height={} tip_height={}",
+            block.header.height,
+            ctx.tip_height()
+        ));
+    }
+
+    let parent = ctx.tip_header().clone();
+    let prev_timestamps = ctx.prev_timestamps();
+    let prev_active_counts = ctx.prev_active_counts();
+    let anchor = ctx.anchor_info();
+    noid_chain::consensus::validate_block_checks(
+        block,
+        &parent,
+        &prev_timestamps,
+        &prev_active_counts,
+        local_time,
+        &anchor,
+        &ctx.nullifiers,
+    )
+    .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
+
+    if block_proof_bytes.is_empty() {
+        return Ok(());
+    }
+
+    let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
+        .map_err(|e| format!("proof deserialize failed: {e}"))?;
+    for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
+        if pi.log_slots != block.header.log_slots {
+            return Err(format!(
+                "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
+                pi.log_slots, block.header.log_slots
+            ));
+        }
+    }
+
+    // ZK state-binding reconstruction reads pre-state slots. Reload evicted MDBX
+    // segments first so an evicted non-zero segment is never mistaken for virtual zero.
+    ctx.preload_segments_for_block(block)
+        .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
+
+    let spine = noid_block::build_spine_inputs_list(block);
+    let auth = noid_block::build_auth_public_list(block, &proof);
+    let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
+    let tx_airs = noid_block::build_tx_airs(block);
+    let air_refs: Vec<&dyn noid_air::Air> =
+        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
+    let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
+        sb_airs.iter().collect();
+    noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
+        .map_err(|e| format!("ZK proof invalid: {e:?}"))
+}
+
+async fn verify_p2p_block_against_current_tip(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    block: &noid_chain::block::Block,
+    block_proof_bytes: &[u8],
+    local_time: u64,
+    from: libp2p::PeerId,
+    context: &'static str,
+) -> bool {
+    let result = {
+        let mut ctx = chain.write().await;
+        verify_p2p_block_against_context(&mut ctx, block, block_proof_bytes, local_time)
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            peer = %from,
+            height = block.header.height,
+            err = %e,
+            context,
+            "P2P block validation failed before apply — rejected"
+        );
+        false
+    } else {
+        true
+    }
 }
 
 async fn handle_p2p_events(
@@ -919,7 +1091,7 @@ async fn handle_p2p_events(
     // Keyed by parent_hash, limited to FINALITY_DEPTH entries.
     use noid_chain::consensus::params::FINALITY_DEPTH;
     use std::collections::HashMap;
-    let mut orphan_pool: HashMap<[u8; 32], noid_chain::block::Block> = HashMap::new();
+    let mut orphan_pool: HashMap<[u8; 32], OrphanBlock> = HashMap::new();
 
     // --- Snapshot verification state ---
     //
@@ -968,7 +1140,10 @@ async fn handle_p2p_events(
     // some peers may be offline, behind NAT, or not yet synced.
     let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
     // Segments collected so far: segment_id → (eff_log, data).
-    // Max 256 segments × ~3 MB = ~768 MB ceiling; acceptable for initial sync.
+    // Kept bounded while the longer-term streaming snapshot apply path is pending.
+    const MAX_SNAPSHOT_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_SNAPSHOT_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+    let mut collected_segment_bytes: usize = 0;
     let mut collected_segments: std::collections::HashMap<u16, (u8, Vec<u8>)> =
         std::collections::HashMap::new();
     // Segment IDs still outstanding.
@@ -990,6 +1165,7 @@ async fn handle_p2p_events(
             collected_segments.clear();
             pending_segment_ids.clear();
             segment_queue.clear();
+            collected_segment_bytes = 0;
             tracing::debug!("sync state reset — will retry on next peer connection");
         }};
     }
@@ -1155,74 +1331,37 @@ async fn handle_p2p_events(
                             }
                         }
 
-                        // ZK proof verification (when proof bytes are present).
-                        //
-                        // For coinbase-only blocks (empty proof) this is skipped entirely.
-                        // For user-tx blocks: verify_block checks ZK correctness before
-                        // we commit to the chain. The spend_secret is NOT needed — all
-                        // inputs are reconstructed from public wire data (owner, auth_tag).
-                        //
-                        // Important: verify_block is called under a READ lock so it does
-                        // NOT modify the chain state. apply_next_block (below) then applies
-                        // the block under a WRITE lock once ZK is confirmed valid.
-                        // SECURITY: Blocks with user transactions MUST carry proof bytes.
-                        // An empty proof is only acceptable for coinbase-only blocks.
-                        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-                        let zk_reject = if !block_proof_bytes.is_empty() {
-                            match bincode::deserialize::<noid_block::BlockProof>(&block_proof_bytes)
-                            {
-                                Ok(proof) => {
-                                    let ctx = chain.read().await;
-                                    let spine = noid_block::build_spine_inputs_list(&block);
-                                    let auth = noid_block::build_auth_public_list(&block, &proof);
-                                    let sb_airs = noid_block::build_state_binding_airs(
-                                        &block,
-                                        &proof,
-                                        &ctx.state.state,
-                                    );
-                                    drop(ctx);
-                                    let tx_airs = noid_block::build_tx_airs(&block);
-                                    let air_refs: Vec<&dyn noid_air::Air> =
-                                        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
-                                    let sb_refs: Vec<
-                                        &noid_air::airs::block_state_binding::BlockStateBindingAir,
-                                    > = sb_airs.iter().collect();
-                                    match noid_block::verify_block(
-                                        &air_refs, &proof, &spine, &auth, &sb_refs,
-                                    ) {
-                                        Ok(()) => None,
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                peer = %from,
-                                                height = block.header.height,
-                                                err = ?e,
-                                                "P2P block ZK proof invalid — rejected"
-                                            );
-                                            Some(())
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        peer = %from,
-                                        err = ?e,
-                                        "P2P block proof deserialize failed"
-                                    );
-                                    Some(())
-                                }
-                            }
-                        } else if has_user_txs {
-                            tracing::warn!(
-                                peer = %from,
-                                height = block.header.height,
-                                "P2P block has user txs but no proof bytes — rejected"
-                            );
-                            Some(())
-                        } else {
-                            None // coinbase-only, no proof needed
+                        // Cheap consensus and proof/header binding run before ZK.
+                        // Fork/orphan blocks are not ZK-verified until their parent
+                        // becomes the current tip, because state-binding AIRs must be
+                        // built against the exact pre-block state.
+                        let extends_current_tip = {
+                            let ctx = chain.read().await;
+                            block.header.height == ctx.tip_height().saturating_add(1)
+                                && block.header.prev_block_hash == ctx.tip_hash()
                         };
-                        if zk_reject.is_some() {
+                        if extends_current_tip
+                            && !verify_p2p_block_against_current_tip(
+                                &chain,
+                                &block,
+                                &block_proof_bytes,
+                                local_time,
+                                from,
+                                "tip block",
+                            )
+                            .await
+                        {
                             continue;
+                        } else if !extends_current_tip {
+                            if let Err(e) = noid_chain::block::validate_block_proof_binding(&block, &block_proof_bytes) {
+                                tracing::warn!(
+                                    peer = %from,
+                                    height = block.header.height,
+                                    err = %e,
+                                    "P2P fork/orphan block proof/header binding invalid — rejected"
+                                );
+                                continue;
+                            }
                         }
 
                         // Apply block off the async executor (MDBX fsync is blocking).
@@ -1277,27 +1416,56 @@ async fn handle_p2p_events(
                                 let mut next_hash = block_hash;
                                 while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                     let orphan_local_time = unix_now();
+                                    let orphan_from = orphan.from;
+                                    let orphan_age_ms = orphan.received_at.elapsed().as_millis();
+                                    let orphan_block = orphan.block;
+                                    let orphan_proof_bytes = orphan.block_proof_bytes;
                                     next_hash =
-                                        noid_chain::consensus::pow::full_block_hash(&orphan.header);
+                                        noid_chain::consensus::pow::full_block_hash(&orphan_block.header);
+                                    if !verify_p2p_block_against_current_tip(
+                                        &chain,
+                                        &orphan_block,
+                                        &orphan_proof_bytes,
+                                        orphan_local_time,
+                                        orphan_from,
+                                        "chained orphan",
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            peer = %orphan_from,
+                                            height = orphan_block.header.height,
+                                            age_ms = orphan_age_ms,
+                                            "chained orphan failed pre-apply validation"
+                                        );
+                                        break;
+                                    }
                                     // Write lock: apply and build ChainView atomically.
                                     let orphan_result = apply_block_offthread(
                                         &chain,
-                                        orphan.clone(),
+                                        orphan_block.clone(),
                                         orphan_local_time,
                                     )
                                     .await;
                                     match orphan_result {
                                         Ok((_hash, nv)) => {
-                                            let h = orphan.header.height;
-                                            let conf: Vec<_> = orphan
+                                            let h = orphan_block.header.height;
+                                            let conf: Vec<_> = orphan_block
                                                 .transactions
                                                 .iter()
                                                 .map(|tx| tx.tx_body_hash)
                                                 .collect();
                                             mempool.on_new_block(&conf, h, nv).await;
-                                            update_wallet_for_block(&wallet, &orphan);
+                                            update_wallet_for_block(&wallet, &orphan_block);
+                                            if !orphan_proof_bytes.is_empty() {
+                                                let ctx = chain.read().await;
+                                                if let Err(e) = ctx.store.put_block_proof(h, &orphan_proof_bytes) {
+                                                    tracing::warn!(height = h, err = %e, "failed to store orphan block proof");
+                                                }
+                                            }
                                             tracing::info!(
                                                 height = h,
+                                                age_ms = orphan_age_ms,
                                                 "applied chained orphan block"
                                             );
                                             last_tip_advance = Instant::now();
@@ -1324,16 +1492,22 @@ async fn handle_p2p_events(
                                     Some(ancestor_height) if ancestor_height < our_tip_height => {
                                         // Parent IS in our chain — this block starts or extends a competing fork.
                                         // Collect the new chain: this block + any buffered orphans on top.
-                                        let mut new_chain = vec![block.clone()];
+                                        let mut new_chain = vec![ProvedBlockCandidate {
+                                            block: block.clone(),
+                                            block_proof_bytes: block_proof_bytes.clone(),
+                                        }];
                                         let mut next_hash =
                                             noid_chain::consensus::pow::full_block_hash(
                                                 &block.header,
                                             );
                                         while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                             next_hash = noid_chain::consensus::pow::full_block_hash(
-                                                &orphan.header,
+                                                &orphan.block.header,
                                             );
-                                            new_chain.push(orphan);
+                                            new_chain.push(ProvedBlockCandidate {
+                                                block: orphan.block,
+                                                block_proof_bytes: orphan.block_proof_bytes,
+                                            });
                                         }
 
                                         // Compare cumulative chainwork: the chain with MORE TOTAL PoW wins.
@@ -1351,7 +1525,7 @@ async fn handle_p2p_events(
                                             for b in &new_chain {
                                                 w = add_work(
                                                     &w,
-                                                    &block_work(&b.header.difficulty_target),
+                                                    &block_work(&b.block.header.difficulty_target),
                                                 );
                                             }
                                             // competing_extra_work = work of new blocks
@@ -1407,7 +1581,8 @@ async fn handle_p2p_events(
                                                     let confirmed_in_new: Vec<_> = new_chain
                                                         .iter()
                                                         .flat_map(|b| {
-                                                            b.transactions
+                                                            b.block
+                                                                .transactions
                                                                 .iter()
                                                                 .map(|tx| tx.tx_body_hash)
                                                         })
@@ -1421,7 +1596,7 @@ async fn handle_p2p_events(
                                                         .await;
 
                                                     for new_block in &new_chain {
-                                                        update_wallet_for_block(&wallet, new_block);
+                                                        update_wallet_for_block(&wallet, &new_block.block);
                                                     }
 
                                                     mempool
@@ -1467,7 +1642,10 @@ async fn handle_p2p_events(
                                                 "reorg: competing chain not longer, keeping current chain"
                                             );
                                             // Still buffer in case more blocks arrive from this fork.
-                                            insert_orphan(&mut orphan_pool, block);
+                                            insert_orphan(
+                                                &mut orphan_pool,
+                                                OrphanBlock::new(block, block_proof_bytes.clone(), from),
+                                            );
                                         }
                                     }
                                     Some(_) => {
@@ -1489,7 +1667,10 @@ async fn handle_p2p_events(
                                         let is_deep_fork = block_height > our_tip_height
                                             && (block_height - our_tip_height) > FINALITY_DEPTH;
 
-                                        insert_orphan(&mut orphan_pool, block);
+                                        insert_orphan(
+                                            &mut orphan_pool,
+                                            OrphanBlock::new(block, block_proof_bytes.clone(), from),
+                                        );
 
                                         if is_deep_fork {
                                             // Deep fork: O(1) snapshot sync is faster and correct.
@@ -1846,7 +2027,36 @@ async fn handle_p2p_events(
                     tracing::debug!(from = %from, "manifest tip_height=0, peer has no state yet");
                     // Don't add to candidates, but fall through to check if we should
                     // proceed with existing candidates now that we've heard from this peer.
-                } else if pending_manifest.is_some() {
+                } else {
+                    let segment_span = manifest
+                        .log_slots
+                        .saturating_sub(manifest.eff_log as u32);
+                    let max_possible_segments = 1usize.checked_shl(segment_span).unwrap_or(usize::MAX);
+                    if manifest.segment_ids.len() > max_possible_segments {
+                        tracing::warn!(
+                            from = %from,
+                            segments = manifest.segment_ids.len(),
+                            max_possible_segments,
+                            log_slots = manifest.log_slots,
+                            eff_log = manifest.eff_log,
+                            "manifest impossible for advertised log_slots/eff_log — dropping"
+                        );
+                        continue;
+                    }
+                    if manifest.segment_ids.len().saturating_mul(MAX_SNAPSHOT_SEGMENT_BYTES)
+                        > MAX_SNAPSHOT_TOTAL_BYTES
+                    {
+                        tracing::warn!(
+                            from = %from,
+                            segments = manifest.segment_ids.len(),
+                            max_total = MAX_SNAPSHOT_TOTAL_BYTES,
+                            "manifest exceeds snapshot total-byte cap — dropping"
+                        );
+                        continue;
+                    }
+                }
+
+                if manifest.tip_height > 0 && pending_manifest.is_some() {
                     if manifest_candidates.len() < 3 {
                         tracing::debug!(
                             from = %from, tip = manifest.tip_height,
@@ -1854,7 +2064,7 @@ async fn handle_p2p_events(
                         );
                         manifest_candidates.push((from, manifest));
                     }
-                } else {
+                } else if manifest.tip_height > 0 {
                     if manifest_candidates.len() < 3 {
                         manifest_candidates.push((from, manifest));
                     }
@@ -1920,17 +2130,35 @@ async fn handle_p2p_events(
                 // Collect until all pending segments are received, then apply.
                 if pending_segment_ids.contains(&response.segment_id) {
                     if let Some(data) = response.data {
-                        // Sanity check: each segment is ~3 MB; 32 MB cap catches corrupt responses.
-                        const MAX_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
-                        if data.len() > MAX_SEGMENT_BYTES {
+                        if data.len() > MAX_SNAPSHOT_SEGMENT_BYTES {
                             tracing::warn!(
                                 from = %from, segment = response.segment_id,
                                 bytes = data.len(),
+                                max = MAX_SNAPSHOT_SEGMENT_BYTES,
                                 "segment too large — aborting sync"
                             );
                             reset_sync_state!();
                             continue;
                         }
+                        let old_len = collected_segments
+                            .get(&response.segment_id)
+                            .map(|(_, bytes)| bytes.len())
+                            .unwrap_or(0);
+                        let projected_total = collected_segment_bytes
+                            .saturating_sub(old_len)
+                            .saturating_add(data.len());
+                        if projected_total > MAX_SNAPSHOT_TOTAL_BYTES {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                projected_total,
+                                max = MAX_SNAPSHOT_TOTAL_BYTES,
+                                "snapshot total-byte cap exceeded — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                        collected_segment_bytes = projected_total;
                         collected_segments.insert(response.segment_id, (response.eff_log, data));
                         pending_segment_ids.remove(&response.segment_id);
                         // Dispatch next queued segment if available.
@@ -1976,13 +2204,15 @@ async fn handle_p2p_events(
                                 noid_chain::segmented_state::SegmentColumns,
                             )> = {
                                 use noid_chain::storage::serial::decode_segment;
-                                collected_segments
+                                let decoded: Vec<_> = collected_segments
                                     .drain()
                                     .filter_map(|(seg_id, (eff_log, data))| {
                                         decode_segment(&data)
                                             .map(|(_, cols)| (seg_id, eff_log, cols))
                                     })
-                                    .collect()
+                                    .collect();
+                                collected_segment_bytes = 0;
+                                decoded
                             };
                             tracing::info!(
                                 segments = segments.len(),
@@ -2009,7 +2239,7 @@ async fn handle_p2p_events(
                                     m.log_slots,
                                     m.active_slot_count,
                                     m.alloc_counter,
-                                    &segments,
+                                    segments,
                                     &m.recent_headers,
                                     &nullifier_blocks,
                                 );
@@ -2130,35 +2360,13 @@ async fn handle_p2p_events(
                 };
 
                 if proof_bytes.is_empty() {
-                    use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
-                    use noid_chain::consensus::pow::full_block_hash as fbh;
-                    use noid_recursive::genesis_accumulator;
-                    let genesis_acc_pow = {
-                        let g = genesis_header();
-                        genesis_accumulator(genesis_state_root(), fbh(&g))
-                    };
-                    match validate_snapshot_headers(
-                        &snap.manifest.recent_headers,
-                        &genesis_acc_pow,
-                        0,
-                    ) {
-                        Ok(_) => tracing::info!(
-                            from = %from,
-                            tip = snap.manifest.tip_height,
-                            "no recursive proof yet (proof updater catching up) — \
-                             accepting manifest: PoW + chainwork verified on headers"
-                        ),
-                        Err(e) => {
-                            tracing::error!(
-                                from = %from,
-                                tip = snap.manifest.tip_height,
-                                err = %e,
-                                "REJECTED manifest: header PoW/chainwork check failed \
-                                 (peer has no recursive proof)"
-                            );
-                            continue;
-                        }
-                    }
+                    tracing::error!(
+                        from = %from,
+                        tip = snap.manifest.tip_height,
+                        "REJECTED manifest: snapshot sync requires a non-empty RecursiveProof; headers-only snapshots are not proof-native safe"
+                    );
+                    reset_sync_state!();
+                    continue;
                 } else {
                     // Verify the recursive proof.
                     //
@@ -2378,7 +2586,11 @@ async fn handle_p2p_events(
                                         m.log_slots,
                                         m.active_slot_count,
                                         m.alloc_counter,
-                                        &[],
+                                        std::iter::empty::<(
+                                            u16,
+                                            u8,
+                                            noid_chain::segmented_state::SegmentColumns,
+                                        )>(),
                                         &m.recent_headers,
                                         &nullifier_blocks,
                                     );
@@ -2668,23 +2880,20 @@ async fn handle_p2p_events(
 /// Eviction policy: remove the orphan with the **lowest block height** first.
 /// This mimics LRU by height — stale orphans from a long-dead fork are
 /// discarded before newer ones that are more likely to be resolved.
-fn insert_orphan(
-    pool: &mut std::collections::HashMap<[u8; 32], noid_chain::block::Block>,
-    block: noid_chain::block::Block,
-) {
+fn insert_orphan(pool: &mut std::collections::HashMap<[u8; 32], OrphanBlock>, orphan: OrphanBlock) {
     use noid_chain::consensus::params::FINALITY_DEPTH;
     const MAX_ORPHAN_POOL: usize = FINALITY_DEPTH as usize * 2; // 36
     if pool.len() >= MAX_ORPHAN_POOL {
         // Find and evict the orphan with the lowest block height.
         if let Some(key) = pool
             .iter()
-            .min_by_key(|(_, b)| b.header.height)
+            .min_by_key(|(_, b)| b.block.header.height)
             .map(|(k, _)| *k)
         {
             pool.remove(&key);
         }
     }
-    pool.insert(block.header.prev_block_hash, block);
+    pool.insert(orphan.block.header.prev_block_hash, orphan);
 }
 
 // ---------------------------------------------------------------------------

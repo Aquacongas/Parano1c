@@ -21,9 +21,12 @@ use std::collections::HashMap;
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::next_target;
+use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
+use noid_chain::consensus::AnchorInfo;
 use noid_chain::segmented_state::SegmentColumns;
-use noid_chain::storage::MdbxChainContext;
+use noid_chain::state::ChainState;
+use noid_chain::storage::{MdbxChainContext, MdbxContextError};
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
@@ -98,7 +101,52 @@ impl BlockTemplate {
     }
 }
 
-/// Builds `BlockTemplate` from the current chain state and mempool.
+/// Immutable chain view used for template construction.
+///
+/// Capture this under the chain lock, then drop the lock before awaiting mempool
+/// selection or doing proof/template work. `from_context()` preloads evicted
+/// segments before cloning so the scratch state used by block assembly sees the
+/// same slots as the durable chain state.
+pub struct TemplateChainSnapshot {
+    pub parent: BlockHeader,
+    pub prev_active_counts: Vec<u64>,
+    pub prev_timestamps: Vec<u64>,
+    pub anchor: AnchorInfo,
+    pub state: ChainState,
+    fresh_anchor_hashes: Vec<[u8; 32]>,
+}
+
+impl TemplateChainSnapshot {
+    pub fn from_context(ctx: &mut MdbxChainContext) -> Result<Self, MdbxContextError> {
+        ctx.preload_all_evicted_segments()?;
+
+        let parent = ctx.tip_header().clone();
+        let tip_height = parent.height;
+        let lo = tip_height.saturating_sub(noid_chain::consensus::params::ANCHOR_DEPTH);
+        let fresh_anchor_hashes = (lo..=tip_height)
+            .filter_map(|h| ctx.header(h).map(full_block_hash))
+            .collect();
+
+        Ok(Self {
+            parent,
+            prev_active_counts: ctx.prev_active_counts(),
+            prev_timestamps: ctx.prev_timestamps(),
+            anchor: ctx.anchor_info(),
+            state: ctx.state.clone(),
+            fresh_anchor_hashes,
+        })
+    }
+
+    pub fn prev_state_root(&self) -> [u8; 32] {
+        self.parent.state_root
+    }
+
+    fn is_anchor_fresh(&self, anchor_hash: &[u8; 32]) -> bool {
+        self.fresh_anchor_hashes.iter().any(|h| h == anchor_hash)
+    }
+}
+
+/// Builds `BlockTemplate` from a chain snapshot and top-fee mempool txs.
 pub struct TemplateBuilder {
     pub mempool: AsyncMempool,
 }
@@ -108,21 +156,21 @@ impl TemplateBuilder {
         Self { mempool }
     }
 
-    /// Build a new template using the current chain state and top-fee mempool txs.
+    /// Build a new template using a pre-captured chain snapshot and top-fee mempool txs.
     ///
     /// Computes the ASERT difficulty target correctly using `next_target()`.
-    pub async fn build(
+    pub async fn build_from_snapshot(
         &self,
-        ctx: &MdbxChainContext,
+        snapshot: &TemplateChainSnapshot,
         miner_address: Address,
         now_unix: u64,
     ) -> Option<BlockTemplate> {
         use noid_chain::consensus::median_time_past;
         use noid_chain::consensus::template::build_block_template;
 
-        let parent = ctx.tip_header().clone();
-        let prev_active_counts = ctx.prev_active_counts();
-        let prev_timestamps = ctx.prev_timestamps();
+        let parent = &snapshot.parent;
+        let prev_active_counts = &snapshot.prev_active_counts;
+        let prev_timestamps = &snapshot.prev_timestamps;
 
         // Compute the minimum valid timestamp for the new block:
         //   timestamp MUST be strictly greater than MTP (median of last 11 blocks).
@@ -135,7 +183,7 @@ impl TemplateBuilder {
 
         // Compute the correct ASERT target for the new block.
         // MUST match what validate_header computes; wrong target = block rejected.
-        let anchor = ctx.anchor_info();
+        let anchor = &snapshot.anchor;
         let difficulty_target = next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
@@ -158,20 +206,19 @@ impl TemplateBuilder {
         // Filter out transactions whose epoch_anchor has expired since mempool
         // admission. Without this, the miner wastes proving time on txs that
         // will be rejected by peers during full block validation.
-        let tip_height = parent.height;
         let (proof_bytes, txs): (Vec<_>, Vec<_>) = proof_bytes
             .into_iter()
             .zip(txs)
             .filter(|(_, tx)| {
-                tx.body.is_coinbase || ctx.is_anchor_fresh(&tx.body.epoch_anchor, tip_height)
+                tx.body.is_coinbase || snapshot.is_anchor_fresh(&tx.body.epoch_anchor)
             })
             .unzip();
 
-        let state = &ctx.state;
+        let state = &snapshot.state;
         match build_block_template(
-            &parent,
+            parent,
             state,
-            &prev_active_counts,
+            prev_active_counts,
             txs,
             miner_address,
             timestamp,
@@ -179,7 +226,7 @@ impl TemplateBuilder {
         ) {
             Ok(inner) => {
                 // Capture pre-state columns for FRI openings.
-                let eff_log = ctx.state.state.effective_log_segment_size();
+                let eff_log = snapshot.state.state.effective_log_segment_size();
                 let mut touched_segs = std::collections::HashSet::new();
                 for tx in inner.txs.iter().chain(std::iter::once(&inner.coinbase)) {
                     for inp in tx.body.inputs.iter().filter(|i| i.valid) {
@@ -193,15 +240,12 @@ impl TemplateBuilder {
                     HashMap::with_capacity(touched_segs.len());
                 for seg_id in touched_segs {
                     // Fast path: read from RAM if segment is loaded (avoids MDBX I/O).
-                    let cols = if let Some(c) = ctx.state.state.try_get_segment_columns(seg_id) {
-                        c.clone()
-                    } else {
-                        // Evicted or never-allocated: read from MDBX.
-                        match ctx.store.get_segment(seg_id) {
-                            Ok(Some((_eff, c))) => c,
-                            _ => SegmentColumns::new_zero(1usize << eff_log),
-                        }
-                    };
+                    let cols = snapshot
+                        .state
+                        .state
+                        .try_get_segment_columns(seg_id)
+                        .cloned()
+                        .unwrap_or_else(|| SegmentColumns::new_zero(1usize << eff_log));
                     pre_segs.insert(seg_id, cols);
                 }
                 Some(BlockTemplate {
@@ -209,7 +253,7 @@ impl TemplateBuilder {
                     difficulty_target,
                     miner_address,
                     timestamp,
-                    parent,
+                    parent: parent.clone(),
                     proof_bytes,
                     pre_segs,
                 })

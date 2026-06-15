@@ -40,10 +40,11 @@ pub struct BlockTemplateResponse {
     /// Valid nonce N satisfies: Blake3(patched_header_core) < difficulty_target.
     pub header_core_hex: String,
     /// Full sealed block bytes (hex) with nonce = 0.
-    /// External miner: patch bytes at nonce_offset (144..160) with the found nonce
-    /// and submit the result directly to `submitBlock`.
-    /// No other fields need to change — the ZK proof is already embedded.
+    /// External miner: patch bytes at nonce_offset (144..160) with the found nonce.
     pub block_hex: String,
+    /// Serialized BlockProof bytes as hex. Empty for coinbase-only blocks.
+    /// Submit this alongside `block_hex` to `submitBlock`.
+    pub block_proof_hex: String,
     /// Byte offset of the nonce field inside `block_hex` (NOT inside `header_core_hex`).
     /// Always 144 bytes from the start of the block header (= start of block bytes).
     pub nonce_offset: usize,

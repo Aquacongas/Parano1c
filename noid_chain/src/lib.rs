@@ -70,7 +70,8 @@ pub use da::{
 
 pub use block::{
     apply_block, apply_genesis_block, apply_state_delta, compute_tx_root, proof_transcript_hash,
-    Block, BlockApplyError, BLOCK_MAX_TXS,
+    validate_block_proof_binding, Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS,
+    STUB_PROOF_MARKER,
 };
 pub use block_header::{hash_block_header, BlockHeader};
 

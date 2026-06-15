@@ -41,6 +41,79 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
+/// Consensus-legal marker for coinbase-only blocks that carry no user transaction proof.
+pub const STUB_PROOF_MARKER: [u8; 32] = [1u8; 32];
+
+/// Errors returned when checking that a block header binds the exact proof bytes
+/// received from the network or RPC mining API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofBindingError {
+    /// A block with user transactions did not include `BlockProof` bytes.
+    MissingProof,
+    /// A coinbase-only block carried proof bytes; those blocks must use the stub marker.
+    UnexpectedProofForCoinbaseOnly,
+    /// A coinbase-only block did not use the consensus stub marker.
+    BadCoinbaseStub,
+    /// A user-transaction block used the coinbase-only stub marker.
+    StubProofWithUserTxs,
+    /// The header's `proof_transcript_hash` does not equal `proof_transcript_hash(proof_bytes)`.
+    BadProofTranscriptHash,
+}
+
+impl std::fmt::Display for ProofBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingProof => write!(f, "user-transaction block is missing BlockProof bytes"),
+            Self::UnexpectedProofForCoinbaseOnly => {
+                write!(f, "coinbase-only block unexpectedly carried proof bytes")
+            }
+            Self::BadCoinbaseStub => {
+                write!(f, "coinbase-only block must use the stub proof marker")
+            }
+            Self::StubProofWithUserTxs => {
+                write!(f, "user-transaction block used stub proof marker")
+            }
+            Self::BadProofTranscriptHash => {
+                write!(
+                    f,
+                    "block proof bytes do not match header proof_transcript_hash"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProofBindingError {}
+
+/// Validate that the block/proof shape matches the proof-native consensus policy
+/// and that user-transaction blocks bind the exact `BlockProof` bytes in their header.
+pub fn validate_block_proof_binding(
+    block: &Block,
+    block_proof_bytes: &[u8],
+) -> Result<(), ProofBindingError> {
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if has_user_txs {
+        if block_proof_bytes.is_empty() {
+            return Err(ProofBindingError::MissingProof);
+        }
+        if block.header.proof_transcript_hash == STUB_PROOF_MARKER {
+            return Err(ProofBindingError::StubProofWithUserTxs);
+        }
+        let expected = proof_transcript_hash(block_proof_bytes);
+        if block.header.proof_transcript_hash != expected {
+            return Err(ProofBindingError::BadProofTranscriptHash);
+        }
+    } else {
+        if !block_proof_bytes.is_empty() {
+            return Err(ProofBindingError::UnexpectedProofForCoinbaseOnly);
+        }
+        if block.header.proof_transcript_hash != STUB_PROOF_MARKER {
+            return Err(ProofBindingError::BadCoinbaseStub);
+        }
+    }
+    Ok(())
+}
+
 /// Errors surfaced by [`apply_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockApplyError {
@@ -109,9 +182,8 @@ pub fn apply_block(
     //
     // The stub value [1u8;32] is intentionally distinct from the zero sentinel
     // [0u8;32] (which is rejected above) so both are caught deterministically.
-    const STUB_MARKER: [u8; 32] = [1u8; 32];
     let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if has_user_txs && block.header.proof_transcript_hash == STUB_MARKER {
+    if has_user_txs && block.header.proof_transcript_hash == STUB_PROOF_MARKER {
         return Err(BlockApplyError::StubProofWithUserTxs);
     }
 
