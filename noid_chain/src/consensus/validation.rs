@@ -33,6 +33,7 @@ use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus_skip_hash},
     emission::max_coinbase_value_from_fee_sum,
+    fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
     header::validate_header,
     params::BLOCK_MAX_TXS,
     ConsensusError,
@@ -48,6 +49,27 @@ pub struct AnchorInfo {
     pub anchor_timestamp: u64,
     /// Difficulty target at the ASERT anchor block.
     pub anchor_target: [u8; 32],
+}
+
+fn validate_fee_policy_and_claimable_fee_sum(
+    block: &Block,
+    parent: &BlockHeader,
+) -> Result<u64, ConsensusError> {
+    let mut claimable_fee_sum = 0u64;
+    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
+        let required =
+            required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
+        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        if actual < required {
+            return Err(ConsensusError::BelowMinFee { required, actual });
+        }
+        claimable_fee_sum = claimable_fee_sum.saturating_add(claimable_fee_for_tx_body(
+            &tx.body,
+            parent.active_slot_count,
+            parent.log_slots,
+        ));
+    }
+    Ok(claimable_fee_sum)
 }
 
 /// Run all native consensus checks WITHOUT applying the state transition.
@@ -103,6 +125,7 @@ pub fn validate_block_checks(
     for tx in &block.transactions {
         validate_tx_consensus_skip_hash(tx, nullifiers)?;
     }
+    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
             let cb_value: u64 = cb
@@ -112,13 +135,8 @@ pub fn validate_block_checks(
                 .filter(|o| o.valid)
                 .map(|o| o.value)
                 .fold(0u64, |a, v| a.saturating_add(v));
-            let fee_sum: u64 = block
-                .transactions
-                .iter()
-                .filter(|tx| !tx.body.is_coinbase)
-                .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
-                .fold(0u64, |a, f| a.saturating_add(f));
-            let max_allowed = max_coinbase_value_from_fee_sum(block.header.log_slots, fee_sum);
+            let max_allowed =
+                max_coinbase_value_from_fee_sum(block.header.log_slots, claimable_fee_sum);
             if cb_value > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }
@@ -203,6 +221,8 @@ pub fn validate_block_consensus(
         validate_tx_consensus_skip_hash(tx, nullifiers)?;
     }
 
+    let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
+
     // --- Coinbase amount validation (P.7) ---
     // Sum fees directly from &Transaction references — no TxBody cloning.
     if let Some(cb) = block.transactions.first() {
@@ -215,14 +235,8 @@ pub fn validate_block_consensus(
                 .map(|o| o.value)
                 .fold(0u64, |acc, v| acc.saturating_add(v));
 
-            let fee_sum: u64 = block
-                .transactions
-                .iter()
-                .filter(|tx| !tx.body.is_coinbase)
-                .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
-                .fold(0u64, |acc, f| acc.saturating_add(f));
-
-            let max_allowed = max_coinbase_value_from_fee_sum(block.header.log_slots, fee_sum);
+            let max_allowed =
+                max_coinbase_value_from_fee_sum(block.header.log_slots, claimable_fee_sum);
             if cb_value > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }
@@ -255,7 +269,8 @@ mod tests {
     use crate::consensus::{genesis::GENESIS_TIMESTAMP, params::BLOCK_TIME};
     use crate::nullifier::NullifierSet;
     use crate::state::ChainState;
-    use noid_poseidon2b::primitives::Address;
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
     const TEST_LOG_SLOTS: usize = 6;
@@ -313,6 +328,93 @@ mod tests {
         }
     }
 
+    fn tx_from_body(body: TxBody) -> Transaction {
+        let hash = hash_tx_body(
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction {
+            body,
+            tx_body_hash: hash,
+        }
+    }
+
+    fn fee_test_user_tx(fee: u128) -> Transaction {
+        tx_from_body(TxBody {
+            epoch_anchor: [1u8; 32],
+            fee,
+            inputs: vec![TxInput {
+                slot_index: 1,
+                value: 10_000,
+                owner: Address([1u8; 32]),
+                spend_secret: SpendSecret([2u8; 32]),
+                auth_tag: AuthTag([3u8; 32]),
+                valid: true,
+            }],
+            outputs: vec![
+                TxOutput {
+                    slot_index: 2,
+                    value: 1_000,
+                    owner: Address([4u8; 32]),
+                    valid: true,
+                },
+                TxOutput {
+                    slot_index: 3,
+                    value: 0,
+                    owner: Address([5u8; 32]),
+                    valid: true,
+                },
+            ],
+            is_coinbase: false,
+        })
+    }
+
+    fn fee_test_coinbase(value: u64) -> Transaction {
+        tx_from_body(TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                slot_index: 0,
+                value,
+                owner: Address([9u8; 32]),
+                valid: true,
+            }],
+            is_coinbase: true,
+        })
+    }
+
+    fn block_for_fee_checks(parent: &BlockHeader, coinbase_value: u64, user_fee: u64) -> Block {
+        use crate::block::compute_tx_root;
+        use crate::consensus::pow::full_block_hash;
+
+        let txs = vec![
+            fee_test_coinbase(coinbase_value),
+            fee_test_user_tx(user_fee as u128),
+        ];
+        Block {
+            header: BlockHeader {
+                prev_block_hash: full_block_hash(parent),
+                state_root: parent.state_root,
+                tx_root: compute_tx_root(&txs),
+                timestamp: parent.timestamp + BLOCK_TIME,
+                height: parent.height + 1,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: TEST_TARGET,
+                proof_transcript_hash: [2u8; 32],
+                witness_root: [2u8; 32],
+                log_slots: parent.log_slots,
+                active_slot_count: parent.active_slot_count,
+                alloc_counter: parent.alloc_counter,
+            },
+            transactions: txs,
+        }
+    }
+
     #[test]
     fn empty_block_on_genesis_validates() {
         let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
@@ -332,6 +434,78 @@ mod tests {
             &mut apply_state,
         );
         assert!(result.is_ok(), "empty block should validate: {:?}", result);
+    }
+
+    #[test]
+    fn block_checks_reject_underpriced_user_tx() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let state_root = state.state_root();
+        let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], state_root);
+        let required = crate::consensus::required_fee_for_tx_body(
+            &fee_test_user_tx(0).body,
+            parent.active_slot_count,
+            parent.log_slots,
+        );
+        let block = block_for_fee_checks(&parent, 0, required - 1);
+
+        let result = validate_block_checks(
+            &block,
+            &parent,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+            block.header.timestamp + 1,
+            &genesis_anchor(&parent),
+            &NullifierSet::new(),
+        );
+        assert_eq!(
+            result,
+            Err(ConsensusError::BelowMinFee {
+                required,
+                actual: required - 1
+            })
+        );
+    }
+
+    #[test]
+    fn block_checks_burn_state_growth_fee_for_coinbase_limit() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let state_root = state.state_root();
+        let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], state_root);
+        let user_tx = fee_test_user_tx(9_000);
+        let claimable = crate::consensus::claimable_fee_for_tx_body(
+            &user_tx.body,
+            parent.active_slot_count,
+            parent.log_slots,
+        );
+        assert_eq!(claimable, 6_500);
+        let reward = crate::consensus::block_reward(parent.log_slots);
+
+        let valid = block_for_fee_checks(&parent, reward + claimable, 9_000);
+        let valid_result = validate_block_checks(
+            &valid,
+            &parent,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+            valid.header.timestamp + 1,
+            &genesis_anchor(&parent),
+            &NullifierSet::new(),
+        );
+        assert!(
+            valid_result.is_ok(),
+            "coinbase may claim reward + non-burned fees"
+        );
+
+        let inflated = block_for_fee_checks(&parent, reward + 9_000, 9_000);
+        let inflated_result = validate_block_checks(
+            &inflated,
+            &parent,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+            inflated.header.timestamp + 1,
+            &genesis_anchor(&parent),
+            &NullifierSet::new(),
+        );
+        assert_eq!(inflated_result, Err(ConsensusError::InflatedCoinbase));
     }
 
     #[test]

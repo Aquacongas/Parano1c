@@ -321,7 +321,7 @@ UTXO state
   Active UTXOs       29 (0.00% full)
   Fill               [░░░░░░░░░░░░░░░░░░░░░░|░░░░░░░░] 0.00%  (| = expand at 75%)
   Until expand       12582883 slots (75.00% headroom)
-  State size         48.0 MB RAM  /  48.0 MB disk  /  768.0 MB max
+  State size         48.0 MB RAM  /  48.0 MB disk  /  768.0 MiB current capacity (192 GiB at 2^32)
 ```
 
 RPC method: `paranoid_getStateInfo`
@@ -388,19 +388,21 @@ RPC method: `paranoid_getPeerCount`
 
 ### `estimate-fee [N_OUTPUTS]`
 
-Minimum relay fee for N outputs (default: 2).
+Estimated minimum fee for N outputs (default: 2), assuming one input and current occupancy pressure.
 
 ```
 $ noid-cli estimate-fee 3
 Fee estimate (3 outputs)
-  Min fee            0.011000 NOID (11000 μNOID)
+  Min fee            0.011500 NOID (11500 μNOID)
 
-  Formula: MIN_FEE_BASE(5000) + n_outputs × FEE_PER_OUTPUT(2000) μNOID
+  Formula: base(5000) + io_fee(500) × (inputs + outputs)
+           + state_growth_fee(2500 × pressure) × max(0, outputs - inputs)
+  estimate-fee assumes inputs = 1; pressure starts at 1× and rises with occupancy.
 ```
 
 RPC method: `paranoid_estimateFee`
 
-Fee formula: `MIN_FEE_BASE (5000) + n_outputs × FEE_PER_OUTPUT (2000)` in μNOID.
+Fee formula charges base + I/O + occupancy-scaled net-new-state growth. The state-growth component is burned; miners can claim only the remainder plus any tip.
 
 ---
 
@@ -469,7 +471,7 @@ Each `MempoolTxInfo`:
 |-------|------|-------------|
 | `tx_hash` | hex(32) | Transaction body hash |
 | `fee_micronoid` | u64 | Fee in μNOID |
-| `fee_rate` | u64 | fee / max(1, n_inputs + n_outputs) |
+| `fee_rate` | u64 | fee / weighted resource units (`inputs + outputs + 4 × net_new_slots`) |
 | `n_inputs` | usize | Active input count |
 | `n_outputs` | usize | Active output count |
 | `admitted_height` | u64 | Chain height when admitted |
@@ -915,7 +917,7 @@ Error:
 |--------|--------|---------|-------------|
 | `paranoid_getMiningInfo` | — | `MiningInfo` | Difficulty, reward, recursive height |
 | `paranoid_getPeerCount` | — | `usize` | Connected peers |
-| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Min relay fee in μNOID |
+| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Estimated min fee in μNOID |
 
 #### Utilities
 

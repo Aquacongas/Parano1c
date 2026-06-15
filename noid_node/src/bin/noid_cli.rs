@@ -987,8 +987,12 @@ async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_outputs: u32) -> anyhow::Result<()> {
     );
     println!();
     println!(
-        "  {} MIN_FEE_BASE(5000) + n_outputs × FEE_PER_OUTPUT(2000) \u{03bc}NOID",
+        "  {} base(5000) + io(500)×(inputs+outputs) + growth(2500×pressure)×net_new",
         c!(DIM, "Formula:")
+    );
+    println!(
+        "  {} estimate assumes inputs=1; state-growth fee is burned",
+        c!(DIM, "Note:")
     );
     Ok(())
 }

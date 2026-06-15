@@ -442,8 +442,11 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
-        use noid_chain::consensus::params::min_fee;
-        Ok(min_fee(n_outputs as u64))
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        Ok(
+            noid_chain::consensus::fee_breakdown(1, n_outputs as u64, active_slot_count, log_slots)
+                .required_total,
+        )
     }
 
     async fn validate_address(&self, address: String) -> RpcResult<AddressInfo> {
@@ -531,12 +534,7 @@ impl ParanoidApiServer for RpcHandler {
         Ok(found.map(|e| MempoolTxInfo {
             tx_hash: txhash,
             fee_micronoid: e.tx.body.fee.min(u64::MAX as u128) as u64,
-            fee_rate: {
-                let slots = (e.tx.body.inputs.iter().filter(|i| i.valid).count()
-                    + e.tx.body.outputs.iter().filter(|o| o.valid).count())
-                .max(1);
-                (e.tx.body.fee as u64) / slots as u64
-            },
+            fee_rate: e.fee_rate,
             n_inputs: e.tx.body.inputs.iter().filter(|i| i.valid).count(),
             n_outputs: e.tx.body.outputs.iter().filter(|o| o.valid).count(),
             admitted_height: e.admitted_height,
@@ -774,15 +772,15 @@ impl ParanoidApiServer for RpcHandler {
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
-        use noid_chain::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
-
         // Auto-fee: when fee_micronoid == 0, compute the minimum acceptable fee.
-        // A send TX typically has 2 outputs (payment + change), so use
-        // MIN_FEE_BASE + 2 * FEE_PER_OUTPUT = 9 000 μNOID baseline.
+        // A send TX typically has 1 input and 2 outputs (payment + change).
         // Also respect the current dynamic fee floor from the mempool.
         let effective_fee = if fee_micronoid == 0 {
             let floor = self.mempool.fee_floor().await;
-            (MIN_FEE_BASE + 2 * FEE_PER_OUTPUT).max(floor)
+            let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+            noid_chain::consensus::fee_breakdown(1, 2, active_slot_count, log_slots)
+                .required_total
+                .max(floor)
         } else {
             fee_micronoid
         };
@@ -903,17 +901,19 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
-        use noid_chain::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
-
-        // Consolidation always produces exactly 1 output (to self), so the
-        // minimum fee is MIN_FEE_BASE + 1 × FEE_PER_OUTPUT = 7 000 μNOID.
-        // When fee_micronoid == 0 (auto), also account for the current dynamic
-        // fee floor so the TX is never rejected as BelowMinFee.
-        let min_consolidate_fee = MIN_FEE_BASE + FEE_PER_OUTPUT;
+        // Consolidation produces exactly 1 output (to self) and may consume up to
+        // MAX_INPUTS inputs. Estimate the max-input shape so auto-fee stays valid.
         let effective_fee = if fee_micronoid == 0 {
-            // Auto: use the higher of the protocol minimum and the current floor.
             let floor = self.mempool.fee_floor().await;
-            min_consolidate_fee.max(floor)
+            let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+            noid_chain::consensus::fee_breakdown(
+                noid_tx::MAX_INPUTS as u64,
+                1,
+                active_slot_count,
+                log_slots,
+            )
+            .required_total
+            .max(floor)
         } else {
             fee_micronoid
         };

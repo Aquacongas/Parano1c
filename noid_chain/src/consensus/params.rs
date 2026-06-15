@@ -198,19 +198,29 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 // No separate params needed — the algorithm uses fixed Weyl/mixing constants.
 
 // ---------------------------------------------------------------------------
-// Fee policy  (non-consensus — local node enforcement only)
+// Fee policy
 // ---------------------------------------------------------------------------
 
-/// Minimum relay fee in μNOID per transaction (covers amortized proving cost).
-/// Nodes MAY raise this; they MUST NOT relay below this default.
+/// Base minimum fee in μNOID per non-coinbase transaction.
 pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 NOID
 
-/// Additional relay fee per valid output slot (covers permanent state cost).
-pub const FEE_PER_OUTPUT: u64 = 2_000; // 0.002 NOID per output
+/// Fee charged per live input or output touched by a transaction.
+pub const FEE_PER_IO: u64 = 500; // 0.0005 NOID per input/output
 
-/// Compute the minimum acceptable fee for a tx with `n_outputs` valid outputs.
+/// Base fee charged per net-new live UTXO slot at low occupancy.
+/// This state-growth component is burned by consensus.
+pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
+
+/// Legacy output-fee constant kept for API/source compatibility.
+/// New consensus-critical code should use `consensus::fees`.
+pub const FEE_PER_OUTPUT: u64 = 2_000;
+
+/// Compatibility estimator for legacy call sites that only know `n_outputs`.
+/// Assumes one live input at low occupancy. New consensus-critical code should
+/// use `consensus::fees::required_fee_for_tx_body` instead.
 pub const fn min_fee(n_outputs: u64) -> u64 {
-    MIN_FEE_BASE + n_outputs * FEE_PER_OUTPUT
+    let net_new_outputs = if n_outputs > 1 { n_outputs - 1 } else { 0 };
+    MIN_FEE_BASE + FEE_PER_IO * (1 + n_outputs) + STATE_GROWTH_FEE_BASE * net_new_outputs
 }
 
 #[cfg(test)]
@@ -245,10 +255,13 @@ mod tests {
 
     #[test]
     fn min_fee_formula() {
-        assert_eq!(min_fee(0), MIN_FEE_BASE);
-        assert_eq!(min_fee(1), MIN_FEE_BASE + FEE_PER_OUTPUT);
-        assert_eq!(min_fee(8), MIN_FEE_BASE + 8 * FEE_PER_OUTPUT);
-        // Ensure non-zero floor even with zero outputs (coinbase).
+        assert_eq!(min_fee(0), MIN_FEE_BASE + FEE_PER_IO);
+        assert_eq!(min_fee(1), MIN_FEE_BASE + 2 * FEE_PER_IO);
+        assert_eq!(min_fee(2), 9_000);
+        assert_eq!(
+            min_fee(8),
+            MIN_FEE_BASE + 9 * FEE_PER_IO + 7 * STATE_GROWTH_FEE_BASE
+        );
         assert!(min_fee(0) > 0);
     }
 

@@ -13,7 +13,7 @@
 //!
 //! # Check order (cheapest first)
 //!
-//! 0. P.16 min relay fee: `fee ≥ MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT` (coinbase exempt)
+//! 0. P.16 min fee: base + I/O + occupancy-scaled net-new-state fee (coinbase exempt)
 //! 1. Basic consensus checks: fee overflow, body_hash, anchor non-zero, nullifier
 //! 2. epoch_anchor hash is a known block header within the ANCHOR_DEPTH window
 //! 3. No slot conflict with currently admitted mempool transactions
@@ -24,10 +24,8 @@ use std::collections::HashSet;
 
 use crate::chain_context::ChainContext;
 use crate::consensus::{
-    checks::validate_tx_consensus,
-    params::{min_fee, ANCHOR_DEPTH},
-    pow::full_block_hash,
-    ConsensusError,
+    checks::validate_tx_consensus, fees::required_fee_for_tx_body, params::ANCHOR_DEPTH,
+    pow::full_block_hash, ConsensusError,
 };
 use crate::fri_state::SlotValue;
 use noid_core::Block128;
@@ -46,11 +44,14 @@ pub fn validate_tx_for_mempool(
     ctx: &ChainContext,
     mempool_txs: &[Transaction],
 ) -> Result<(), ConsensusError> {
-    // --- Minimum relay fee (non-consensus local policy) ---
+    // --- Minimum fee ---
     // Coinbase is exempt: it's built by the miner, not submitted by a wallet.
     if !tx.body.is_coinbase {
-        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
-        let required = min_fee(n_outputs);
+        let required = required_fee_for_tx_body(
+            &tx.body,
+            ctx.state.active_slot_count,
+            ctx.state.state.log_slots() as u32,
+        );
         let actual = tx.body.fee.min(u64::MAX as u128) as u64;
         if actual < required {
             return Err(ConsensusError::BelowMinFee { required, actual });
@@ -206,10 +207,14 @@ mod tests {
 
     #[test]
     fn min_fee_enforced_for_non_coinbase() {
-        use crate::consensus::params::{FEE_PER_OUTPUT, MIN_FEE_BASE};
+        use crate::consensus::required_fee_for_tx_body;
         let ctx = ChainContext::init_from_genesis();
-        // 1 output: required = MIN_FEE_BASE + 1 * FEE_PER_OUTPUT
-        let required = MIN_FEE_BASE + FEE_PER_OUTPUT;
+        let probe = make_mint_tx(5, 0);
+        let required = required_fee_for_tx_body(
+            &probe.body,
+            ctx.state.active_slot_count,
+            ctx.state.state.log_slots() as u32,
+        );
 
         // Below minimum.
         let tx_low = make_mint_tx(5, (required - 1) as u128);

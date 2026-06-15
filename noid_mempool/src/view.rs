@@ -43,6 +43,9 @@ pub struct ChainView {
     /// Total number of slots in the current state space.
     pub num_slots: u64,
 
+    /// Number of live UTXO slots at the current tip.
+    pub active_slot_count: u64,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -54,6 +57,7 @@ impl ChainView {
         tip_height: u64,
         recent_headers: HashMap<u64, BlockHeader>,
         nullifiers: NullifierSet,
+        active_slot_count: u64,
         state: SegmentedFriState,
     ) -> Self {
         let num_slots = state.num_slots();
@@ -62,6 +66,7 @@ impl ChainView {
             recent_headers,
             nullifiers,
             num_slots,
+            active_slot_count,
             state,
         }
     }
@@ -91,6 +96,7 @@ impl ChainView {
             ctx.tip_height,
             ctx.recent_headers.clone(),
             ctx.nullifiers.clone(),
+            ctx.state.active_slot_count,
             ctx.state.state.clone(),
         )
     }

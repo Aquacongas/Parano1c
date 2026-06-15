@@ -331,9 +331,7 @@ pub fn apply_state_delta(
                 .set_slot(out.slot_index, sv)
                 .map_err(|_| BlockApplyError::Tx(crate::state::ApplyError::SlotOutOfRange))?;
             snap.active_slot_count = snap.active_slot_count.saturating_add(1);
-            if tx.body.is_coinbase {
-                snap.alloc_counter = snap.alloc_counter.wrapping_add(1);
-            }
+            snap.alloc_counter = snap.alloc_counter.wrapping_add(1);
         }
     }
 

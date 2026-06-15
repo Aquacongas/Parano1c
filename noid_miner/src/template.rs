@@ -231,6 +231,12 @@ impl TemplateBuilder {
                 tx.body.is_coinbase || snapshot.is_anchor_fresh(&tx.body.epoch_anchor)
             })
             .unzip();
+        let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
+            proof_bytes
+                .into_iter()
+                .zip(txs.iter().map(|tx| tx.tx_body_hash))
+                .map(|(proof, hash)| (hash, proof))
+                .collect();
 
         let state = &snapshot.state;
         match build_block_template(
@@ -266,6 +272,11 @@ impl TemplateBuilder {
                         .unwrap_or_else(|| SegmentColumns::new_zero(1usize << eff_log));
                     pre_segs.insert(seg_id, cols);
                 }
+                let proof_bytes = inner
+                    .txs
+                    .iter()
+                    .map(|tx| proof_by_hash.remove(&tx.tx_body_hash).unwrap_or(None))
+                    .collect();
                 Some(BlockTemplate {
                     inner,
                     difficulty_target,

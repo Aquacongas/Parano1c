@@ -40,7 +40,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use noid_chain::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_TXS};
-use noid_chain::consensus::{checks::validate_tx_consensus, min_fee, pow::full_block_hash};
+use noid_chain::consensus::{
+    checks::validate_tx_consensus, pow::full_block_hash, required_fee_for_tx_body,
+};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
 use noid_core::Block128;
@@ -529,6 +531,12 @@ impl AsyncMempool {
         self.state.lock().await.floor.current()
     }
 
+    /// Current chain occupancy used for fee estimation: (active slots, log_slots).
+    pub async fn fee_context(&self) -> (u64, u32) {
+        let st = self.state.lock().await;
+        (st.view.active_slot_count, st.view.log_slots())
+    }
+
     /// Snapshot all current mempool entries (for RPC inspection).
     pub async fn get_all_entries(&self) -> Vec<noid_chain::mempool::MempoolEntry> {
         let st = self.state.lock().await;
@@ -570,10 +578,11 @@ impl AsyncMempool {
 /// Returns `anchor_height` (needed by `pool.admit` for expiry tracking).
 /// The pre-filter discards it; the final admission step uses it.
 fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, SubmitError> {
-    // Dynamic fee floor.
+    // Dynamic fee floor layered over the deterministic consensus minimum.
     if !tx.body.is_coinbase {
-        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
-        let required = st.floor.current().max(min_fee(n_outputs));
+        let consensus_required =
+            required_fee_for_tx_body(&tx.body, st.view.active_slot_count, st.view.log_slots());
+        let required = st.floor.current().max(consensus_required);
         let actual = tx.body.fee.min(u64::MAX as u128) as u64;
         if actual < required {
             return Err(SubmitError::Consensus(

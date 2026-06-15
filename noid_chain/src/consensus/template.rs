@@ -167,6 +167,7 @@ pub fn build_block_template(
 ) -> Result<BlockTemplate, TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
+    use crate::consensus::fees::{claimable_fee_for_tx_body, required_fee_for_tx_body};
     use crate::consensus::timestamps::median_u64;
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
     use crate::state::apply_tx;
@@ -202,6 +203,12 @@ pub fn build_block_template(
     let mut applied_winners: Vec<Transaction> = Vec::new();
     let ordered_winners = order_block_txs(winners);
     for tx in ordered_winners {
+        let required =
+            required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
+        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        if actual < required {
+            continue;
+        }
         match apply_tx(&mut scratch, &tx.body) {
             Ok(_) => applied_winners.push(tx),
             Err(_e) => {}
@@ -260,13 +267,13 @@ pub fn build_block_template(
             .ok_or(TemplateBuildError::NoCoinbaseSlot)?
     };
 
-    // Sum fees directly — avoids cloning every TxBody just to pass to max_coinbase_value.
-    let fee_sum: u64 = ordered_winners
+    // Sum only claimable fees. The deterministic state-growth component is burned.
+    let claimable_fee_sum: u64 = ordered_winners
         .iter()
         .filter(|tx| !tx.body.is_coinbase)
-        .map(|tx| tx.body.fee.min(u64::MAX as u128) as u64)
+        .map(|tx| claimable_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots))
         .fold(0u64, |acc, f| acc.saturating_add(f));
-    let coinbase_value = block_reward(new_log_slots).saturating_add(fee_sum);
+    let coinbase_value = block_reward(new_log_slots).saturating_add(claimable_fee_sum);
 
     let cb_body = TxBody {
         epoch_anchor: [0u8; 32],

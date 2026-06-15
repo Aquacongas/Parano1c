@@ -71,8 +71,10 @@ pub struct MempoolEntry {
     ///
     /// `u64::MAX` for coinbase (no anchor, never expires via this mechanism).
     pub anchor_height: u64,
-    /// Fee per slot-slot-unit (fee / max(1, n_inputs + n_outputs)).
-    /// Used for priority ordering in block template selection.
+    /// Fee per weighted resource unit.
+    ///
+    /// The weight is `inputs + outputs + 4 × net_new_slots`, so transactions
+    /// that grow live state are deprioritised versus consolidation at similar fees.
     pub fee_rate: u64,
 
     /// Cached `WalletProofBundle` bytes (LogicProof + auth_slices) provided
@@ -94,10 +96,14 @@ pub struct MempoolEntry {
 impl MempoolEntry {
     /// Compute the fee_rate from the transaction body.
     pub fn compute_fee_rate(tx: &Transaction) -> u64 {
-        let n_active = tx.body.inputs.iter().filter(|i| i.valid).count()
-            + tx.body.outputs.iter().filter(|o| o.valid).count();
-        let denom = n_active.max(1) as u64;
-        (tx.body.fee.min(u64::MAX as u128) as u64) / denom
+        let n_inputs = tx.body.inputs.iter().filter(|i| i.valid).count() as u64;
+        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
+        let net_new_slots = n_outputs.saturating_sub(n_inputs);
+        let weight = n_inputs
+            .saturating_add(n_outputs)
+            .saturating_add(net_new_slots.saturating_mul(4))
+            .max(1);
+        (tx.body.fee.min(u64::MAX as u128) as u64) / weight
     }
 
     /// Create a new entry.

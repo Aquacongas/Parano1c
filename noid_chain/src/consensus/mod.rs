@@ -11,6 +11,7 @@
 //!
 //! - [`params`]         — All consensus constants (single source of truth).
 //! - [`emission`]       — Block reward schedule (halves per state expansion).
+//! - [`fees`]           — Consensus fee model and burned state-growth fee.
 //! - [`difficulty`]     — ASERT difficulty adjustment (no floats).
 //! - [`pow`]            — Blake3 PoW over `header_core` (parallel-provable).
 //! - [`timestamps`]     — Median-time-past and future-drift rules.
@@ -42,6 +43,7 @@ pub mod validation;
 pub mod allocator;
 pub mod difficulty;
 pub mod emission;
+pub mod fees;
 pub mod fork_choice;
 pub mod genesis;
 pub mod header;
@@ -59,6 +61,11 @@ pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
 pub use emission::{
     block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_fee_sum, total_fees,
 };
+pub use fees::{
+    burned_fee_for_tx_body, claimable_fee_for_tx_body, fee_breakdown, fee_breakdown_for_tx_body,
+    occupancy_bps, pressure_multiplier, required_fee_for_tx_body, state_growth_fee_per_slot,
+    tx_shape, FeeBreakdown,
+};
 pub use fork_choice::{choose_chain, choose_chain_by_work, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};
@@ -66,7 +73,7 @@ pub use mempool_checks::validate_tx_for_mempool;
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use params::*;
-pub use params::{min_fee, FEE_PER_OUTPUT, MIN_FEE_BASE};
+pub use params::{min_fee, FEE_PER_IO, FEE_PER_OUTPUT, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE};
 pub use pow::{full_block_hash, header_core_bytes, search_pow, validate_pow, BlockHash};
 pub use receipt::{
     generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
@@ -112,8 +119,7 @@ pub enum ConsensusError {
     InflatedCoinbase,
     /// Fee exceeds u64::MAX (values are 64-bit in this protocol).
     BadFee,
-    /// P.16 — transaction fee is below the node's minimum relay fee.
-    /// Non-consensus (local policy); enforced at mempool admission only.
+    /// P.16 — transaction fee is below the deterministic minimum fee.
     BelowMinFee { required: u64, actual: u64 },
     /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,
     /// and must not expand when occupancy < 75 %.

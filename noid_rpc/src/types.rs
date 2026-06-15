@@ -271,7 +271,7 @@ pub struct MempoolTxInfo {
     pub tx_hash: String,
     /// Fee in μNOID.
     pub fee_micronoid: u64,
-    /// Fee rate (fee / max(1, n_inputs + n_outputs)).
+    /// Fee rate using weighted resource units (`inputs + outputs + 4 × net_new_slots`).
     pub fee_rate: u64,
     /// Number of live inputs.
     pub n_inputs: usize,

@@ -120,7 +120,7 @@ Fits on any modern device indefinitely.
 Each materialized segment is ~3 MB. State auto-expands from 2^24 to 2^32 slots
 as the network fills. Whether this takes 1 year or 50 years depends on adoption.
 Only segments with live UTXOs are materialized (rest are virtual zero, no disk).
-At full capacity (2^32 slots, all materialized): ~48 GB max theoretical ceiling.
+At full capacity (2^32 slots, all materialized): 2^32 × 48 bytes ≈ 192 GiB max theoretical ceiling.
 
 **Volatile (fixed, independent of chain age):**
 - Recent blocks + proofs + undo: ~40 MB at 100 txs/block; ~96 MB at max (always last 18 blocks)
@@ -389,7 +389,7 @@ When a transaction arrives via gossip, BEFORE entering the mempool:
 |---|-------|---------|
 | 0 | Wire size <= 1 MB | DoS prevention |
 | 1 | Per-peer rate: 50 txs / 10 seconds | Flood prevention |
-| 2 | Fee >= MIN_FEE_BASE + n_outputs x FEE_PER_OUTPUT | Spam prevention |
+| 2 | Fee minimum: base + I/O + occupancy-scaled net-new-state growth | Spam prevention |
 | 3 | Body hash binding (recompute and compare) | Integrity |
 | 4 | Coinbase: must have exactly 1 valid output, fee = 0 | Structure |
 | 5 | Epoch anchor references a known header in last 144 blocks | Freshness |
@@ -644,8 +644,9 @@ with sufficient chainwork requires actually performing the PoW.
 | `EXPAND threshold` | 75% occupancy | Trigger: median_active >= 75% capacity |
 | `MAX_FUTURE_DRIFT` | 120 seconds | Max timestamp ahead of local clock |
 | `MEDIAN_TIME_BLOCKS` | 11 | MTP calculation window |
-| `MIN_FEE_BASE` | 5,000 uNOID (0.005) | Minimum relay fee per tx |
-| `FEE_PER_OUTPUT` | 2,000 uNOID (0.002) | Additional fee per output |
+| `MIN_FEE_BASE` | 5,000 μNOID (0.005) | Base fee per non-coinbase tx |
+| `FEE_PER_IO` | 500 μNOID (0.0005) | Fee per live input/output |
+| `STATE_GROWTH_FEE_BASE` | 2,500 μNOID (0.0025) | Base burned fee per net-new UTXO slot |
 | `BASE_REWARD` | 50 NOID | Starting block reward |
 | `FLOOR_REWARD` | 1 NOID | Minimum reward (forever) |
 | `MICRONOID_PER_NOID` | 1,000,000 | Precision unit |

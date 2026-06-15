@@ -43,7 +43,7 @@ When you send NOID, your wallet builds a **LogicProof**. A ~26 KB STARK that pro
 - All values are in range
 - The transaction body is cryptographically bound
 
-This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~28 minutes). You prove it once, on your device, ~135 ms for 4 inputs/8 outputs tx
+This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~36 minutes). You prove it once, on your device, ~135 ms for 4 inputs/8 outputs tx
 
 ### The Network Verifies, Not Executes
 
@@ -446,7 +446,7 @@ noid-cli mempool         # pending txs, fee floor
 noid-cli address         # primary address (bech32m, noid1…)
 noid-cli balance         # confirmed balance + UTXO count
 noid-cli utxos           # all owned UTXOs with slot indices
-noid-cli send <addr> <μNOID>  # --fee 0 auto-computes minimum
+noid-cli send <addr> <NOID>   # amount in human NOID; --fee 0 auto-computes minimum
 noid-cli history         # confirmed TX history
 noid-cli consolidate     # merge small UTXOs
 noid-cli receipt <hash>  # export inclusion proof (Merkle + STARK)
@@ -458,7 +458,7 @@ noid-cli stop            # graceful shutdown
 
 Connect to `http://127.0.0.1:9401` by default. Override with `--rpc <url>`.
 
-**Fee formula:** `5000 μNOID base + 2000 μNOID × n_outputs`. Default `--fee 0` auto-computes the correct minimum.  
+**Fee formula:** `base + io_fee × (inputs + outputs) + state_growth_fee × max(0, outputs - inputs)`. The state-growth component scales with occupancy and is burned; `--fee 0` auto-computes the current minimum.  
 **1 NOID = 1,000,000 μNOID.**  
 **Addresses:** bech32m, prefix `noid1`.
 

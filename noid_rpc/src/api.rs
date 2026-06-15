@@ -91,8 +91,8 @@ pub trait ParanoidApi {
     #[method(name = "getPeerCount")]
     async fn get_peer_count(&self) -> RpcResult<usize>;
 
-    /// Minimum relay fee in μNOID for a transaction with `n_outputs` outputs.
-    /// Formula: MIN_FEE_BASE + n_outputs × FEE_PER_OUTPUT.
+    /// Estimated minimum fee in μNOID for a transaction with `n_outputs` outputs.
+    /// Assumes a single input and current occupancy pressure.
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
 

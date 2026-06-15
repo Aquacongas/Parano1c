@@ -186,7 +186,7 @@ GKR outputs pin into the STARK via `PublicColumn`: `tx_body_hash` via `TxBodyMer
 
 `BitAdderCarryNextGate::degree()` returns literal 4 (`noid_air/src/airs/bit_adder.rs`), wrapped only in `ShiftedColumnsConstraint` (degree-preserving). Verified in code, not comments.
 
-**Stateless property:** `TxLogicAir` proves nothing about the current blockchain state. It only proves internal transaction consistency and ownership. This is intentional: the wallet proves once, the result is valid across block boundaries until the epoch anchor expires (~28 minutes).
+**Stateless property:** `TxLogicAir` proves nothing about the current blockchain state. It only proves internal transaction consistency and ownership. This is intentional: the wallet proves once, the result is valid across block boundaries until the epoch anchor expires (~36 minutes).
 
 ---
 
