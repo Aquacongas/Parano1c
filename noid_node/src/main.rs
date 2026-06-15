@@ -152,9 +152,9 @@ struct Cli {
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
 
-    /// PoW mining threads. 0 = all physical cores.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    threads: usize,
+    /// Internal PoW mining threads for --mode miner. If omitted, uses a balanced split.
+    #[arg(long = "mining-threads", value_name = "N")]
+    mining_threads: Option<usize>,
 
     /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
     ///
@@ -323,6 +323,9 @@ async fn main() -> anyhow::Result<()> {
     if cli.allow_custom_coinbase && cli.mode != NodeMode::Extminer {
         anyhow::bail!("--allow-custom-coinbase requires --mode extminer");
     }
+    if cli.mode != NodeMode::Miner && cli.mining_threads.is_some() {
+        anyhow::bail!("--mining-threads is only valid with --mode miner");
+    }
 
     // --- Network ---
     let net = NetworkConfig::mainnet();
@@ -341,14 +344,25 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.data_dir {
         cfg.storage.path = dir;
     }
-    if cli.mode == NodeMode::Miner {
-        cfg.mining.enabled = true;
-    }
+    // The CLI mode is authoritative: relay/extminer never start the internal
+    // miner even if a stale config file has mining.enabled=true.
+    cfg.mining.enabled = cli.mode == NodeMode::Miner;
     if let Some(addr) = cli.miner_address {
         cfg.mining.miner_address = addr;
     }
-    if cli.threads > 0 {
-        cfg.mining.threads = cli.threads;
+    if let Some(mining_threads) = cli.mining_threads {
+        cfg.mining.mining_threads = mining_threads;
+    }
+    if cli.mode == NodeMode::Miner {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if available > 1 && cfg.mining.mining_threads > 0 && cfg.mining.mining_threads >= available
+        {
+            anyhow::bail!(
+                "--mining-threads must be less than available CPU cores ({available}) so the node/prover has capacity"
+            );
+        }
     }
     // --seed accepts HOST:PORT; convert to multiaddr strings for internal use
     for raw_seed in cli.seed {
@@ -573,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!(address = %miner_addr, "miner coinbase address");
         let miner_cfg = MinerConfig {
             miner_address: miner_addr,
-            pow_threads: cfg.mining.threads,
+            mining_threads: cfg.mining.mining_threads,
             ..Default::default()
         };
         let (mut miner, mut miner_rx) = BlockMiner::new(
@@ -1060,11 +1074,109 @@ async fn verify_p2p_block_against_current_tip(
     from: libp2p::PeerId,
     context: &'static str,
 ) -> bool {
-    let result = {
+    struct VerifyWork {
+        proof: noid_block::BlockProof,
+        spine: Vec<noid_gkr::SpineInputs>,
+        auth: Vec<noid_gkr::AuthPublicInputs>,
+        tx_airs: Vec<noid_air::composition::tx_logic::TxLogicAir>,
+        sb_airs: Vec<noid_air::airs::block_state_binding::BlockStateBindingAir>,
+    }
+
+    let prep: Result<Option<VerifyWork>, String> = {
         let mut ctx = chain.write().await;
-        verify_p2p_block_against_context(&mut ctx, block, block_proof_bytes, local_time)
+
+        if block.header.height != ctx.tip_height().saturating_add(1)
+            || block.header.prev_block_hash != ctx.tip_hash()
+        {
+            return false;
+        }
+
+        (|| -> Result<Option<VerifyWork>, String> {
+            noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
+                .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+
+            let parent = ctx.tip_header().clone();
+            let prev_timestamps = ctx.prev_timestamps();
+            let prev_active_counts = ctx.prev_active_counts();
+            let anchor = ctx.anchor_info();
+            noid_chain::consensus::validate_block_checks(
+                block,
+                &parent,
+                &prev_timestamps,
+                &prev_active_counts,
+                local_time,
+                &anchor,
+                &ctx.nullifiers,
+            )
+            .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
+
+            if block_proof_bytes.is_empty() {
+                Ok(None)
+            } else {
+                let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
+                    .map_err(|e| format!("proof deserialize failed: {e}"))?;
+                for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
+                    if pi.log_slots != block.header.log_slots {
+                        return Err(format!(
+                            "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
+                            pi.log_slots, block.header.log_slots
+                        ));
+                    }
+                }
+
+                // ZK state-binding reconstruction reads pre-state slots. Reload evicted
+                // MDBX segments while the lock is held, then move only owned verifier
+                // inputs off-thread for the expensive proof verification.
+                ctx.preload_segments_for_block(block)
+                    .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
+
+                let spine = noid_block::build_spine_inputs_list(block);
+                let auth = noid_block::build_auth_public_list(block, &proof);
+                let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
+                let tx_airs = noid_block::build_tx_airs(block);
+
+                Ok(Some(VerifyWork {
+                    proof,
+                    spine,
+                    auth,
+                    tx_airs,
+                    sb_airs,
+                }))
+            }
+        })()
     };
-    if let Err(e) = result {
+
+    let work = match prep {
+        Ok(None) => return true,
+        Ok(Some(work)) => work,
+        Err(e) => {
+            tracing::warn!(
+                peer = %from,
+                height = block.header.height,
+                err = %e,
+                context,
+                "P2P block validation failed before apply — rejected"
+            );
+            return false;
+        }
+    };
+
+    let verify_result = tokio::task::spawn_blocking(move || {
+        let air_refs: Vec<&dyn noid_air::Air> = work
+            .tx_airs
+            .iter()
+            .map(|a| a as &dyn noid_air::Air)
+            .collect();
+        let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
+            work.sb_airs.iter().collect();
+        noid_block::verify_block(&air_refs, &work.proof, &work.spine, &work.auth, &sb_refs)
+            .map_err(|e| format!("ZK proof invalid: {e:?}"))
+    })
+    .await
+    .map_err(|e| format!("verify task failed: {e}"))
+    .and_then(|r| r);
+
+    if let Err(e) = verify_result {
         tracing::warn!(
             peer = %from,
             height = block.header.height,

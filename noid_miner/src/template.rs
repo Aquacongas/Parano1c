@@ -165,6 +165,25 @@ impl TemplateBuilder {
         miner_address: Address,
         now_unix: u64,
     ) -> Option<BlockTemplate> {
+        self.build_from_snapshot_with_limit(
+            snapshot,
+            miner_address,
+            now_unix,
+            noid_chain::consensus::params::BLOCK_MAX_TXS - 1,
+        )
+        .await
+    }
+
+    /// Build a template while capping non-coinbase transactions.
+    /// Internal miners use this for adaptive block sizing; external mining keeps
+    /// the consensus maximum via `build_from_snapshot`.
+    pub async fn build_from_snapshot_with_limit(
+        &self,
+        snapshot: &TemplateChainSnapshot,
+        miner_address: Address,
+        now_unix: u64,
+        max_user_txs: usize,
+    ) -> Option<BlockTemplate> {
         use noid_chain::consensus::median_time_past;
         use noid_chain::consensus::template::build_block_template;
 
@@ -192,11 +211,10 @@ impl TemplateBuilder {
             timestamp,
         );
 
-        // Select top txs from mempool (leave one slot for coinbase).
-        let entries = self
-            .mempool
-            .select_for_block(noid_chain::consensus::params::BLOCK_MAX_TXS - 1)
-            .await;
+        // Select top txs from mempool (coinbase is added separately by the chain template).
+        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS - 1;
+        let max_user_txs = max_user_txs.min(consensus_max);
+        let entries = self.mempool.select_for_block(max_user_txs).await;
         // Single-pass: move proof bytes and transactions together (no clone).
         let (proof_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
             .into_iter()

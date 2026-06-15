@@ -386,19 +386,19 @@ pub fn prove_block(
     // copies of ~65 MB of selector data per block.
     let shared_fixed = FixedColumns::from_air(witnesses[0].air, witnesses[0].trace, log_len);
 
-    struct TxPrep {
+    struct TxPrep<'a> {
         /// Non-fixed AIR witness columns in ascending original column-index order.
         witness_cols: Vec<Vec<Block128>>,
-        /// Per-tx auth slices (2 slices of length 2^BASE_LOG).
-        auth_slices: Vec<Vec<Block128>>,
+        /// Per-tx auth slices borrowed from the wallet bundle; no block-time clone.
+        auth_slices: &'a [Vec<Block128>],
     }
 
     // Parallel prep loop.
     // Each tx's spine-state reconstruction and witness column padding are
     // fully independent; parallelize across txs with rayon.
-    struct TxPrepBundle {
+    struct TxPrepBundle<'a> {
         slot_state_ins: Vec<[Block128; 4]>,
-        prep: TxPrep,
+        prep: TxPrep<'a>,
     }
     let bundles: Vec<TxPrepBundle> = (0..n_tx)
         .into_par_iter()
@@ -418,7 +418,7 @@ pub fn prove_block(
                 slot_state_ins,
                 prep: TxPrep {
                     witness_cols,
-                    auth_slices: w.auth_slices.to_vec(),
+                    auth_slices: w.auth_slices,
                 },
             }
         })
@@ -470,7 +470,7 @@ pub fn prove_block(
     for p in &preps {
         let air_refs = shared_fixed.build_full_col_refs(n_air_cols, &p.witness_cols);
         flat_refs.extend_from_slice(&air_refs);
-        for s in &p.auth_slices {
+        for s in p.auth_slices {
             flat_refs.push(s.as_slice());
         }
     }
@@ -606,7 +606,7 @@ pub fn prove_block(
 
             // Build full ordered column refs (fixed zero-copy + witness).
             let mut all_col_refs = shared_fixed.build_full_col_refs(n_air_cols, &prep.witness_cols);
-            for s in &prep.auth_slices {
+            for s in prep.auth_slices {
                 all_col_refs.push(s.as_slice());
             }
 
@@ -819,7 +819,7 @@ pub fn prove_block(
                             col, r_pp_k, &mut flat, &mut pt,
                         ));
                     }
-                    for auth_s in &preps[k].auth_slices {
+                    for auth_s in preps[k].auth_slices {
                         cols_k.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
                             auth_s, r_pp_k, &mut flat, &mut pt,
                         ));

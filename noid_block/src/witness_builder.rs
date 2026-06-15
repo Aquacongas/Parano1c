@@ -42,7 +42,7 @@ use noid_core::mle::evaluate_slice;
 use noid_core::{Block128, TowerField};
 use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, SpineInputs};
-use noid_stark::{prove_logic::LogicProof, WalletProofBundle};
+use noid_stark::WalletProofBundle;
 use noid_tx::{PublicInputs, Transaction, TxBody, MAX_INPUTS, MAX_OUTPUTS};
 
 use crate::{BlockProof, StateBindingBlockWitness, TxBlockWitness};
@@ -107,7 +107,7 @@ pub fn build_tx_witness(
     let trace = air.build_trace(&logic_witness);
 
     // Build public inputs (log_slots injected by caller from block header).
-    let pi = build_public_inputs(tx_body, &bundle.logic_proof, log_slots);
+    let pi = build_public_inputs(tx_body, pins.tx_body_hash, log_slots);
 
     // Build SpineInputs from boundary pins (all public data).
     let spine_inputs = SpineInputs {
@@ -174,7 +174,11 @@ pub fn build_block_witnesses(
 // PublicInputs construction
 // ---------------------------------------------------------------------------
 
-fn build_public_inputs(tx_body: &TxBody, _proof: &LogicProof, log_slots: u32) -> PublicInputs {
+fn build_public_inputs(
+    tx_body: &TxBody,
+    tx_body_hash: [Block128; 2],
+    log_slots: u32,
+) -> PublicInputs {
     use noid_tx::compute_claims_commitment;
 
     let n_live_inputs = tx_body.inputs.iter().filter(|i| i.valid).count() as u8;
@@ -190,9 +194,8 @@ fn build_public_inputs(tx_body: &TxBody, _proof: &LogicProof, log_slots: u32) ->
         is_deactivation[i] = inp.valid;
     }
 
-    // tx_body_hash comes from the pins (public computation from body).
-    let pins = boundary_pins_from_body(tx_body);
-    let [lo, hi] = pins.tx_body_hash;
+    // tx_body_hash comes from the already-computed boundary pins.
+    let [lo, hi] = tx_body_hash;
     let mut hash_bytes = [0u8; 32];
     hash_bytes[..16].copy_from_slice(&lo.to_u128().to_le_bytes());
     hash_bytes[16..].copy_from_slice(&hi.to_u128().to_le_bytes());

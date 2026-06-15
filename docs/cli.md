@@ -20,7 +20,7 @@ The daemon opens MDBX storage, starts P2P networking, JSON-RPC, and optionally t
 | `--rpc-listen <HOST:PORT>` | `127.0.0.1:9401` | JSON-RPC listen address |
 | `--seed <HOST:PORT>` | — | Bootstrap peer (repeatable) |
 | `--miner-address <HEX>` | wallet addr | Coinbase recipient (32-byte hex) |
-| `--threads <N>` | `0` (all cores) | PoW mining threads |
+| `--mining-threads <N>` | balanced | Internal PoW threads for `--mode miner`; if omitted, uses roughly half of available cores and leaves the rest for node/prover work |
 | `--mining-key <TOKEN>` | — | Bearer token for external mining API |
 | `--allow-custom-coinbase` | off | Let external miners set their own coinbase (requires `--mining-key`) |
 | `--genesis` | off | Bootstrap a fresh network (first node only) |
@@ -30,11 +30,11 @@ The daemon opens MDBX storage, starts P2P networking, JSON-RPC, and optionally t
 
 ### 1.3 Operating Modes
 
-**relay** — Full verification node. Validates all blocks (ZK + PoW), serves state and recursive proofs. No mining.
+**relay** — Full verification node. Validates all blocks (ZK + PoW), serves state and recursive proofs. No internal mining; all CPU remains available to node work.
 
-**miner** — Internal PoW + ZK proving. Blocks external miner access. Produces blocks autonomously.
+**miner** — Internal PoW + ZK proving. Blocks external miner access. Produces blocks autonomously. `--mining-threads` controls only internal PoW threads; all remaining cores are left for node/prover work automatically.
 
-**extminer** — Serves `getBlockTemplate`/`submitBlock` to external `noid-extminer` workers. Requires `--mining-key`.
+**extminer** — Serves `getBlockTemplate`/`submitBlock` to external `noid-extminer` workers. Requires `--mining-key`. Internal PoW is disabled, so node CPU remains available for template/proof/RPC/P2P work.
 
 ### 1.4 Seed Formats
 
@@ -48,8 +48,11 @@ The daemon opens MDBX storage, starts P2P networking, JSON-RPC, and optionally t
 ### 1.5 Examples
 
 ```bash
-# Solo miner
+# Solo miner (balanced internal PoW/prover CPU split)
 paranoid --mode miner --data-dir ~/.paranoid
+
+# Solo miner with explicit internal PoW threads; remaining cores stay with the node/prover
+paranoid --mode miner --mining-threads 6 --data-dir ~/.paranoid
 
 # Public relay node
 paranoid --mode relay --p2p-listen 0.0.0.0:9400 --seed 1.2.3.4:9400

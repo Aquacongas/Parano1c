@@ -26,7 +26,7 @@ class Node:
         mode="relay",
         genesis=False,
         seed=None,
-        threads=1,
+        mining_threads=None,
         log="info",
     ):
         self.name = name
@@ -35,7 +35,7 @@ class Node:
         self.mode = mode
         self.genesis = genesis
         self.seed = seed or []
-        self.threads = threads
+        self.mining_threads = mining_threads
         self.log = log
         self.data_dir = BASE / name
         self.log_path = LOGS / f"{name}.log"
@@ -65,11 +65,11 @@ class Node:
             f"127.0.0.1:{self.p2p_port}",
             "--rpc-listen",
             f"127.0.0.1:{self.rpc_port}",
-            "--threads",
-            str(self.threads),
             "--log",
             self.log,
         ]
+        if self.mining_threads is not None:
+            args.extend(["--mining-threads", str(self.mining_threads)])
         if self.genesis:
             args.append("--genesis")
         for seed in self.seed:
@@ -259,7 +259,7 @@ def main():
         19401,
         mode="miner",
         genesis=True,
-        threads=2,
+        mining_threads=None,
         log="info",
     )
     n2 = Node(
@@ -268,7 +268,7 @@ def main():
         19411,
         mode="relay",
         seed=[n1.seed_addr],
-        threads=1,
+        mining_threads=None,
         log="info",
     )
     n3 = Node(
@@ -277,7 +277,7 @@ def main():
         19421,
         mode="relay",
         seed=[n2.seed_addr],
-        threads=1,
+        mining_threads=None,
         log="info",
     )
     n4 = Node(
@@ -286,7 +286,7 @@ def main():
         19431,
         mode="miner",
         seed=[n2.seed_addr, n3.seed_addr],
-        threads=2,
+        mining_threads=None,
         log="info",
     )
     started = []
@@ -298,7 +298,7 @@ def main():
         wait_until(
             "node1 height >= 18",
             lambda: n1.height() if n1.height() >= 18 else False,
-            timeout=240,
+            timeout=420,
             interval=2,
         )
         wait_until(
@@ -321,7 +321,7 @@ def main():
         wait_until(
             "node2 catches node1 tip",
             lambda: all_same_tip([n1, n2], max_lag=2),
-            timeout=240,
+            timeout=420,
             interval=3,
         )
         print(f"[status] node2 {n2.info()} peers={n2.peers()}", flush=True)
@@ -338,7 +338,7 @@ def main():
         wait_until(
             "node1/node2/node3 converge",
             lambda: all_same_tip([n1, n2, n3], max_lag=2),
-            timeout=240,
+            timeout=420,
             interval=3,
         )
         print(f"[status] node3 {n3.info()} peers={n3.peers()}", flush=True)
@@ -382,7 +382,7 @@ def main():
         wait_until(
             "tx confirmed on node1",
             lambda: rpc(n1.rpc_url, "getTx", [tx_hash], timeout=10),
-            timeout=240,
+            timeout=420,
             interval=4,
         )
         wait_until(
@@ -423,14 +423,14 @@ def main():
         wait_until(
             "node4 syncs to relays",
             lambda: all_same_tip([n2, n3, n4], max_lag=2),
-            timeout=240,
+            timeout=420,
             interval=3,
         )
         h4 = n4.height()
         wait_until(
             "node4 mines after sync",
             lambda: n4.height() if n4.height() >= h4 + 1 else False,
-            timeout=240,
+            timeout=420,
             interval=3,
         )
         wait_until(
@@ -459,7 +459,7 @@ def main():
         wait_until(
             "two miners near-converged",
             lambda: all_same_tip([n1, n3, n4], max_lag=3),
-            timeout=240,
+            timeout=420,
             interval=3,
         )
         base = max(n1.height(), n4.height())
@@ -476,7 +476,7 @@ def main():
         wait_until(
             "network settles after two-miner race exactly",
             lambda: all_same_tip([n1, n3, n4], max_lag=0),
-            timeout=240,
+            timeout=420,
             interval=4,
         )
 
@@ -494,7 +494,7 @@ def main():
         wait_until(
             "all four nodes converge exactly",
             lambda: all_same_tip([n1, n2, n3, n4], max_lag=0),
-            timeout=240,
+            timeout=420,
             interval=4,
         )
 

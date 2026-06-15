@@ -28,7 +28,7 @@ class Node:
         mode="relay",
         genesis=False,
         seed=None,
-        threads=1,
+        mining_threads=None,
         log="info",
     ):
         self.name = name
@@ -37,7 +37,7 @@ class Node:
         self.mode = mode
         self.genesis = genesis
         self.seed = seed or []
-        self.threads = threads
+        self.mining_threads = mining_threads
         self.log = log
         self.data_dir = BASE / name
         self.log_path = LOGS / f"{name}.log"
@@ -65,11 +65,11 @@ class Node:
             f"127.0.0.1:{self.p2p_port}",
             "--rpc-listen",
             f"127.0.0.1:{self.rpc_port}",
-            "--threads",
-            str(self.threads),
             "--log",
             self.log,
         ]
+        if self.mining_threads is not None:
+            args.extend(["--mining-threads", str(self.mining_threads)])
         if self.genesis:
             args.append("--genesis")
         for seed in self.seed:
@@ -239,7 +239,7 @@ def main():
         shutil.rmtree(BASE)
     LOGS.mkdir(parents=True, exist_ok=True)
 
-    n1 = Node("node1-cli-miner", 19500, 19501, mode="miner", genesis=True, threads=2)
+    n1 = Node("node1-cli-miner", 19500, 19501, mode="miner", genesis=True, mining_threads=None)
     n2 = Node("node2-cli-relay", 19510, 19511, mode="relay", seed=[n1.seed_addr])
     n3 = Node("node3-cli-wallet", 19520, 19521, mode="relay", seed=[n2.seed_addr])
     nodes = [n1, n2, n3]
@@ -253,7 +253,7 @@ def main():
         wait_until(
             "node1 mines 20 blocks",
             lambda: n1.height() if n1.height() >= 20 else False,
-            timeout=300,
+            timeout=480,
             interval=2,
         )
         n2.start()
@@ -374,7 +374,7 @@ def main():
                 if cli_json(n1, ["tx", tx1]) is not None
                 else False
             ),
-            timeout=300,
+            timeout=480,
             interval=4,
         )
         wait_until(
@@ -397,7 +397,7 @@ def main():
                 if cli_json(n1, ["tx", tx2]) is not None
                 else False
             ),
-            timeout=300,
+            timeout=480,
             interval=4,
         )
         wait_until(

@@ -372,7 +372,7 @@ fn main() {
     // Full Node block proving (THE block-time bottleneck)
     // -------------------------------------------------------------------------
     println!("  -------------------------------------------------------------------");
-    println!("  FULL NODE prove_block (block-time budget = 60s target):");
+    println!("  FULL NODE prove_block (block-time budget = 15s target):");
     println!("  -------------------------------------------------------------------");
     println!("  Receives pre-proven TxIntents from mempool. Work done here:");
     println!("    1. Interleaved Merkle commit (all columns, one tree)");
@@ -390,11 +390,11 @@ fn main() {
 
     println!("  -------------------------------------------------------------------");
     println!("  NOTES:");
-    println!("    - prove_block runs on the full node BEFORE PoW mining starts.");
-    println!("    - If prove_block < 60s, the block can include those transactions.");
+    println!("    - Internal miner runs PoW search and prove_block in parallel.");
+    println!("    - If prove_block fits the miner's adaptive budget, the block can include those transactions.");
     println!("    - Empty-block fallback: miner starts on coinbase-only header");
     println!("      immediately; full template replaces it once prove_block finishes.");
-    println!("    - Wallet prove time (~330ms) is NOT additive to block time.");
+    println!("    - Wallet-side prep shown above is NOT additive to block time.");
     println!("  -------------------------------------------------------------------");
     println!();
     println!("  Reproduce: cargo bench --bench block_scaling");

@@ -48,8 +48,8 @@ pub struct RpcConfig {
 pub struct MiningConfig {
     /// Enable built-in miner.
     pub enabled: bool,
-    /// PoW threads. 0 = all physical cores.
-    pub threads: usize,
+    /// Internal PoW mining threads. 0 = balanced default (roughly half of available cores).
+    pub mining_threads: usize,
     /// Miner coinbase address (32-byte hex). Empty = burn address [0;32].
     pub miner_address: String,
 }

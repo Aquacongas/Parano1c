@@ -23,10 +23,11 @@
 //! }
 //! ```
 //!
-//! Expected timing at 256 txs on 8 cores:
-//!   PoW:   ~60s target (ASERT-controlled)
-//!   Prove: ~8s (parallel algebraic STARK + unified GKR + FRI)
-//!   → PoW is the bottleneck; no block time wasted on proving.
+//! Internal miner uses separate Rayon pools for PoW and proving.  With default
+//! settings it splits available cores roughly in half and adapts the transaction
+//! cap to recent proof throughput instead of always trying to fill 256 txs.
+//! External miner mode disables internal PoW, so the node can spend its CPUs on
+//! template building, ZK proving, validation, RPC, and P2P while miners run elsewhere.
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
@@ -37,7 +38,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
@@ -59,8 +60,9 @@ use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTri
 pub struct MinerConfig {
     /// Address that receives the coinbase reward.
     pub miner_address: Address,
-    /// Number of rayon threads for PoW search. 0 = all physical cores.
-    pub pow_threads: usize,
+    /// Number of Rayon threads for internal PoW search.
+    /// 0 = balanced default (roughly half of available cores).
+    pub mining_threads: usize,
     /// Safety-net heartbeat interval (seconds).
     ///
     /// Fires only if the miner has been stuck without a block for this long.
@@ -77,7 +79,7 @@ impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            pow_threads: 0,
+            mining_threads: 0,
             refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
         }
     }
@@ -122,6 +124,53 @@ pub enum MinerEvent {
 }
 
 // ---------------------------------------------------------------------------
+// CPU split + adaptive block sizing
+// ---------------------------------------------------------------------------
+
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Internal mining default: do not give PoW every core.  A balanced split keeps
+/// the block prover responsive while still giving PoW more than a token thread.
+fn effective_mining_threads(configured: usize) -> usize {
+    if configured > 0 {
+        return configured.max(1);
+    }
+    let total = available_threads();
+    if total <= 2 {
+        1
+    } else {
+        (total / 2).max(1)
+    }
+}
+
+fn effective_prover_threads(mining_configured: usize) -> usize {
+    let total = available_threads();
+    let mining = effective_mining_threads(mining_configured).min(total.saturating_sub(1).max(1));
+    total.saturating_sub(mining).max(1)
+}
+
+fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
+    let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS.saturating_sub(1);
+    if consensus_max == 0 {
+        return 0;
+    }
+
+    // Keep proving comfortably under the 15s consensus target.  PoW runs in
+    // parallel, but a full block must still have a ready proof before it can be
+    // sealed and propagated.
+    let block_time_ms = noid_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0;
+    let budget_ms = (block_time_ms * 0.70).max(1_000.0);
+    let ms_per_tx = ms_per_tx_ewma.unwrap_or(100.0).max(10.0);
+    let cap = (budget_ms / ms_per_tx).floor() as usize;
+    cap.clamp(1, consensus_max)
+}
+
+// ---------------------------------------------------------------------------
 // BlockMiner
 // ---------------------------------------------------------------------------
 
@@ -138,6 +187,8 @@ pub struct BlockMiner {
     mempool: AsyncMempool,
     chain: Arc<RwLock<MdbxChainContext>>,
     events: broadcast::Sender<MinerEvent>,
+    pow_pool: Arc<rayon::ThreadPool>,
+    prove_pool: Arc<rayon::ThreadPool>,
     /// Cancel flag: set to abort current PoW search and restart.
     cancel_pow: Arc<AtomicBool>,
     /// Permanent stop flag: set only by stop(), never reset. The main loop
@@ -163,11 +214,28 @@ impl BlockMiner {
         sync_ready: Arc<tokio::sync::Notify>,
     ) -> (Self, broadcast::Receiver<MinerEvent>) {
         let (events, rx) = broadcast::channel(32);
+        let mining_threads = effective_mining_threads(config.mining_threads);
+        let prover_threads = effective_prover_threads(config.mining_threads);
+        tracing::info!(mining_threads, prover_threads, "internal miner CPU split");
         let miner = Self {
             config,
             mempool,
             chain,
             events,
+            pow_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(mining_threads)
+                    .thread_name(|i| format!("noid-pow-{i}"))
+                    .build()
+                    .expect("create PoW Rayon pool"),
+            ),
+            prove_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(prover_threads)
+                    .thread_name(|i| format!("noid-prove-{i}"))
+                    .build()
+                    .expect("create prove Rayon pool"),
+            ),
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
@@ -271,6 +339,7 @@ impl BlockMiner {
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
+        let mut prove_ms_per_tx_ewma: Option<f64> = None;
 
         tracing::debug!(address = %addr, "BlockMiner started");
 
@@ -301,7 +370,11 @@ impl BlockMiner {
                 }
             };
             let prev_state_root = snapshot.prev_state_root();
-            let tmpl = match builder.build_from_snapshot(&snapshot, addr, now).await {
+            let max_user_txs = adaptive_user_tx_limit(prove_ms_per_tx_ewma);
+            let tmpl = match builder
+                .build_from_snapshot_with_limit(&snapshot, addr, now, max_user_txs)
+                .await
+            {
                 Some(t) => t,
                 None => {
                     tracing::warn!("template build failed, retrying in 1s");
@@ -318,7 +391,13 @@ impl BlockMiner {
                 n_txs,
                 trigger: TemplateRefreshTrigger::Startup,
             });
-            tracing::debug!(height, n_txs, "mining template ready");
+            tracing::debug!(
+                height,
+                n_txs,
+                max_user_txs,
+                prove_ms_per_tx_ewma,
+                "mining template ready"
+            );
 
             // Track when PoW search started so we can report solve time.
             let pow_start = std::time::Instant::now();
@@ -338,6 +417,8 @@ impl BlockMiner {
             let tmpl = Arc::new(tmpl);
             let tmpl_prove = tmpl.clone();
             let cancel_pow = cancel.clone();
+            let pow_pool = self.pow_pool.clone();
+            let prove_pool = self.prove_pool.clone();
 
             // Try to acquire the single-permit prove semaphore.
             // spawn_blocking tasks are NOT cancelled when JoinHandles are dropped;
@@ -357,9 +438,9 @@ impl BlockMiner {
                 continue;
             }
 
-            // PoW: Blake3 over header_core, CPU-bound via rayon.
+            // PoW: Blake3 over header_core, CPU-bound via the dedicated PoW Rayon pool.
             let pow_handle = tokio::task::spawn_blocking(move || {
-                crate::pow::search_pow_parallel(&pow_header, &cancel_pow)
+                pow_pool.install(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
             });
 
             // ZK Prove: run for real (permit held until done) or return a consensus-legal
@@ -370,12 +451,14 @@ impl BlockMiner {
                     // BEFORE we set prove_done. This guarantees: when the miner loop
                     // sees prove_done=true, the semaphore is already free for the next
                     // template rebuild.
+                    let started = Instant::now();
                     let result = {
                         let _permit = permit;
-                        run_prove_block(&*tmpl_prove, prev_state_root)
+                        prove_pool.install(|| run_prove_block(&*tmpl_prove, prev_state_root))
                     };
+                    let elapsed = started.elapsed();
                     prove_done_clone.store(true, Ordering::Release);
-                    result
+                    (result, elapsed)
                 }),
                 Err(_) => {
                     // Semaphore busy, but coinbase-only block — stub is consensus-legal.
@@ -386,7 +469,7 @@ impl BlockMiner {
                     tokio::task::spawn_blocking(move || {
                         // Stub is instant; mark prove_done so TxAdmitted can trigger rebuild.
                         prove_done_clone.store(true, Ordering::Release);
-                        Ok(([1u8; 32], [1u8; 32], vec![]))
+                        (Ok(([1u8; 32], [1u8; 32], vec![])), Duration::ZERO)
                     })
                 }
             };
@@ -399,7 +482,7 @@ impl BlockMiner {
                     (p, r)
                 } => {
                     match (pow_res, prove_res) {
-                        (Ok(Some(sol)), Ok(Ok((proof_hash, witness_root, block_proof_bytes)))) => {
+                        (Ok(Some(sol)), Ok((Ok((proof_hash, witness_root, block_proof_bytes)), prove_elapsed))) => {
                             let block = tmpl.seal(sol.nonce, proof_hash, witness_root);
                             let block_bytes = block.to_bytes();
                             let hash = full_block_hash(&block.header);
@@ -420,10 +503,20 @@ impl BlockMiner {
                                 lz
                             };
 
+                            let user_txs = tmpl.n_user_txs();
+                            if user_txs > 0 && prove_elapsed > Duration::ZERO {
+                                let sample = prove_elapsed.as_secs_f64() * 1_000.0 / user_txs as f64;
+                                prove_ms_per_tx_ewma = Some(match prove_ms_per_tx_ewma {
+                                    Some(prev) => prev * 0.75 + sample * 0.25,
+                                    None => sample,
+                                });
+                            }
                             tracing::info!(
                                 height,
                                 hash = %hex::encode(hash),
                                 n_txs,
+                                prove_ms = prove_elapsed.as_millis(),
+                                prove_ms_per_tx_ewma,
                                 time = %format!("{elapsed_s:.2}s"),
                                 diff = %format!("lz{diff_lz}"),
                                 "block found"
@@ -456,9 +549,9 @@ impl BlockMiner {
                                 block_proof_bytes: block_proof_bytes.clone(),
                             });
                         }
-                        (Ok(Some(_sol)), Ok(Err(e))) => {
+                        (Ok(Some(_sol)), Ok((Err(e), prove_elapsed))) => {
                             // PoW succeeded but proof failed — abandon block.
-                            tracing::error!("prove_block failed at height {height}: {e}");
+                            tracing::error!(prove_ms = prove_elapsed.as_millis(), "prove_block failed at height {height}: {e}");
                             let _ = self.events.send(MinerEvent::ProveFailed {
                                 height,
                                 error: e,

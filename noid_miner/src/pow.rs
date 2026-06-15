@@ -18,7 +18,8 @@ pub struct PowSolution {
     pub pow_hash: [u8; 32],
 }
 
-/// Search for a valid PoW nonce using all available CPU threads (rayon).
+/// Search for a valid PoW nonce using the current Rayon pool.
+/// Internal miner calls this inside its dedicated PoW pool.
 ///
 /// `header_template` must have `proof_transcript_hash = [0;32]` and `witness_root = [0;32]`
 /// (they are not part of the PoW hash; only `header_core` is hashed).
