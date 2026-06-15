@@ -44,6 +44,7 @@ use crate::layers::evaluate_permutation;
 use crate::spine_mle::{sigma_at, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS};
 use crate::spine_sumcheck::N_SPINE_SLOTS;
 use noid_core::sumcheck::RoundPolynomial;
+use std::time::{Duration, Instant};
 
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
 const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
@@ -51,6 +52,113 @@ const ROUND_LIMIT: usize = 1 << ROUND_BITS; // 128
 
 /// Per-variable degree of the unified block sumcheck (same as per-tx).
 pub const BLOCK_SPINE_ROUND_DEGREE: usize = 9;
+
+#[derive(Debug)]
+struct BlockSpinePhaseTiming {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct BlockSpineProfiler {
+    enabled: bool,
+    scope: &'static str,
+    n_instances: usize,
+    live_slots: usize,
+    num_vars: usize,
+    started: Instant,
+    last: Instant,
+    phases: Vec<BlockSpinePhaseTiming>,
+}
+
+impl BlockSpineProfiler {
+    fn new(scope: &'static str, n_instances: usize, live_slots: usize, num_vars: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: block_spine_profile_enabled(),
+            scope,
+            n_instances,
+            live_slots,
+            num_vars,
+            started: now,
+            last: now,
+            phases: Vec::with_capacity(12),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.phases.push(BlockSpinePhaseTiming {
+            name,
+            elapsed: now.duration_since(self.last),
+        });
+        self.last = now;
+    }
+
+    fn record(&mut self, name: &'static str, elapsed: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.phases.push(BlockSpinePhaseTiming { name, elapsed });
+    }
+
+    fn finish(self) {
+        if !self.enabled {
+            return;
+        }
+
+        let total = self.started.elapsed();
+        let summary = self
+            .phases
+            .iter()
+            .map(|p| format!("{}={:.3}ms", p.name, duration_ms(p.elapsed)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        for phase in &self.phases {
+            eprintln!(
+                "prove_block_profile block_spine scope={} phase={} n_instances={} live_slots={} num_vars={} elapsed_ms={:.3}",
+                self.scope,
+                phase.name,
+                self.n_instances,
+                self.live_slots,
+                self.num_vars,
+                duration_ms(phase.elapsed)
+            );
+        }
+        eprintln!(
+            "prove_block_profile block_spine summary scope={} n_instances={} live_slots={} num_vars={} total_ms={:.3} phases={}",
+            self.scope,
+            self.n_instances,
+            self.live_slots,
+            self.num_vars,
+            duration_ms(total),
+            summary
+        );
+    }
+}
+
+fn block_spine_profile_enabled() -> bool {
+    std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
 
 /// Compute the number of slot variables needed for `total_live_slots`.
 fn slot_vars_for(total_live_slots: usize) -> usize {
@@ -116,6 +224,8 @@ impl BlockSpineMle {
         assert_eq!(slot_state_ins.len(), total_live);
         let num_vars = num_vars_for(total_live);
         let n_cells = 1usize << num_vars;
+        let mut profiler =
+            BlockSpineProfiler::new("block_spine_mle_build", n_instances, total_live, num_vars);
 
         let mut mle = BlockSpineMle {
             s_in: vec![Block128::ZERO; n_cells],
@@ -125,6 +235,7 @@ impl BlockSpineMle {
             num_vars,
             live_slots: total_live,
         };
+        profiler.phase("allocate_columns");
 
         // Parallel: evaluate_permutation (Poseidon2b chain) is the expensive part.
         // Each slot's computation is fully independent.
@@ -133,12 +244,15 @@ impl BlockSpineMle {
             .par_iter()
             .map(|&state_in| evaluate_permutation(state_in))
             .collect();
+        profiler.phase("evaluate_permutation_witnesses");
 
         // Sequential fill: populate_slot takes &mut self but writes to disjoint
         // indices; this pass is cheap compared to the permutation evaluations.
         for (slot, witness) in witnesses.iter().enumerate() {
             mle.populate_slot(slot, witness);
         }
+        profiler.phase("populate_columns");
+        profiler.finish();
         mle
     }
 
@@ -177,83 +291,6 @@ impl BlockSpineMle {
 // Public schedule tables (dynamic size)
 // ---------------------------------------------------------------------------
 
-fn build_mu_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    use rayon::prelude::*;
-    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
-            for round in 0..N_ROUNDS {
-                for elem in 0..STATE_SIZE {
-                    local.push((pack_index_dyn(slot, round, elem), Block128::ONE));
-                }
-            }
-            local
-        })
-        .collect();
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot_p in slot_pairs {
-        for (idx, val) in slot_p {
-            tab[idx] = val;
-        }
-    }
-    tab
-}
-
-fn build_sigma_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    use rayon::prelude::*;
-    // Collect per-slot (index, value) pairs in parallel.
-    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
-            for round in 0..N_ROUNDS {
-                for elem in 0..STATE_SIZE {
-                    local.push((pack_index_dyn(slot, round, elem), sigma_at(round, elem)));
-                }
-            }
-            local
-        })
-        .collect();
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot_p in slot_pairs {
-        for (idx, val) in slot_p {
-            tab[idx] = val;
-        }
-    }
-    tab
-}
-
-fn build_rc_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    use rayon::prelude::*;
-    let slot_pairs: Vec<Vec<(usize, Block128)>> = (0..live_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let mut local = Vec::with_capacity(N_ROUNDS * STATE_SIZE);
-            for round in 0..N_ROUNDS {
-                let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
-                for elem in 0..STATE_SIZE {
-                    if is_partial && elem != 0 {
-                        continue;
-                    }
-                    local.push((
-                        pack_index_dyn(slot, round, elem),
-                        Block128::from(ROUND_CONSTANTS[elem][round]),
-                    ));
-                }
-            }
-            local
-        })
-        .collect();
-    let mut tab = vec![Block128::ZERO; n_cells];
-    for slot_p in slot_pairs {
-        for (idx, val) in slot_p {
-            tab[idx] = val;
-        }
-    }
-    tab
-}
-
 fn mds_coeff_dyn(round: usize, i: usize, j: usize) -> Block128 {
     let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
     let raw = if is_partial {
@@ -264,21 +301,82 @@ fn mds_coeff_dyn(round: usize, i: usize, j: usize) -> Block128 {
     Block128::from(raw)
 }
 
-fn build_mds_lane_table_dyn(lane: usize, live_slots: usize, n_cells: usize) -> Vec<Block128> {
+fn sigma_dec_value(live_slots: usize, y: usize) -> Block128 {
+    let slot = slot_of_dyn(y);
+    if slot >= live_slots {
+        return Block128::ZERO;
+    }
+    let dec_round = round_of_dyn(dec_round_dyn(y));
+    if dec_round >= N_ROUNDS {
+        return Block128::ZERO;
+    }
+    sigma_at(dec_round, elem_of_dyn(y))
+}
+
+fn build_sigma_dec_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
+    use rayon::prelude::*;
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| sigma_dec_value(live_slots, y))
+        .collect()
+}
+
+fn build_rc_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     (0..n_cells)
         .into_par_iter()
         .map(|y| {
             let slot = slot_of_dyn(y);
             if slot >= live_slots {
-                return Block128::ZERO;
+                return 0;
             }
             let dec_round = round_of_dyn(dec_round_dyn(y));
             if dec_round >= N_ROUNDS {
-                return Block128::ZERO;
+                return 0;
             }
             let elem = elem_of_dyn(y);
-            mds_coeff_dyn(dec_round, elem, lane)
+            let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&dec_round);
+            if is_partial && elem != 0 {
+                0
+            } else {
+                tower_to_flat_u128(ROUND_CONSTANTS[elem][dec_round])
+            }
+        })
+        .collect()
+}
+
+fn build_mds_lane_table_flat_dyn(lane: usize, live_slots: usize, n_cells: usize) -> Vec<u128> {
+    use rayon::prelude::*;
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| {
+            let slot = slot_of_dyn(y);
+            if slot >= live_slots {
+                return 0;
+            }
+            let dec_round = round_of_dyn(dec_round_dyn(y));
+            if dec_round >= N_ROUNDS {
+                return 0;
+            }
+            let elem = elem_of_dyn(y);
+            tower_to_flat_u128(mds_coeff_dyn(dec_round, elem, lane).to_u128())
+        })
+        .collect()
+}
+
+fn build_u_table_flat_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec<u128> {
+    use rayon::prelude::*;
+    let eq_tab = eq_ind_partial_eval::<Block128>(rho);
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| {
+            let x = dec_round_dyn(y);
+            let slot = slot_of_dyn(x);
+            if slot >= live_slots || round_of_dyn(x) >= N_ROUNDS {
+                0
+            } else {
+                tower_to_flat_u128(eq_tab[x].to_u128())
+            }
         })
         .collect()
 }
@@ -450,19 +548,6 @@ fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
         .collect()
 }
 
-fn build_u_table_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec<Block128> {
-    use rayon::prelude::*;
-    let eq_tab = eq_ind_partial_eval::<Block128>(rho);
-    let mu_tab = build_mu_table_dyn(live_slots, n_cells);
-    (0..n_cells)
-        .into_par_iter()
-        .map(|y| {
-            let x = dec_round_dyn(y);
-            eq_tab[x] * mu_tab[x]
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // Unified sumcheck (dynamic-size variant)
 // ---------------------------------------------------------------------------
@@ -534,13 +619,13 @@ fn build_block_unified_flat_tables(
         sigma_dec_b128,
         (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_b128, state_dec_b128)))),
     ) = rayon::join(
-        || permute_by_dec_dyn(&build_sigma_table_dyn(live, n_cells)),
+        || build_sigma_dec_table_dyn(live, n_cells),
         || {
             rayon::join(
-                || vec_to_flat(&permute_by_dec_dyn(&build_rc_table_dyn(live, n_cells))),
+                || build_rc_dec_table_flat_dyn(live, n_cells),
                 || {
                     rayon::join(
-                        || vec_to_flat(&build_u_table_dyn(rho, live, n_cells)),
+                        || build_u_table_flat_dyn(rho, live, n_cells),
                         || {
                             rayon::join(
                                 || vec_to_flat(&permute_by_dec_dyn(&mle.s_in)),
@@ -573,7 +658,7 @@ fn build_block_unified_flat_tables(
             || {
                 lane_idx
                     .par_iter()
-                    .map(|&j| vec_to_flat(&build_mds_lane_table_dyn(j, live, n_cells)))
+                    .map(|&j| build_mds_lane_table_flat_dyn(j, live, n_cells))
                     .collect::<Vec<_>>()
             },
             || {
@@ -955,29 +1040,56 @@ pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
     channel: &mut T,
 ) -> (BlockSpineUnifiedProof, Vec<Block128>) {
     let num_vars = mle.num_vars;
+    let n_instances = mle.live_slots / N_SPINE_SLOTS;
+    let mut profiler =
+        BlockSpineProfiler::new("block_spine_unified", n_instances, mle.live_slots, num_vars);
 
     let rho: Vec<Block128> = (0..num_vars).map(|_| channel.squeeze()).collect();
     let beta = channel.squeeze();
     let gamma = channel.squeeze();
+    profiler.phase("challenge_squeeze");
 
     let mut tabs = build_block_unified_flat_tables(mle, &rho);
     let beta_flat = tower_to_flat_u128(beta.to_u128());
     let gamma_flat = tower_to_flat_u128(gamma.to_u128());
+    profiler.phase("build_flat_tables");
 
     let mut round_polys = Vec::with_capacity(num_vars);
     let mut r_prime = vec![Block128::ZERO; num_vars];
+    let mut round_poly_total = Duration::ZERO;
+    let mut transcript_total = Duration::ZERO;
+    let mut fold_total = Duration::ZERO;
 
     for round in 0..num_vars {
+        let t0 = profiler.enabled().then(Instant::now);
         let poly = compute_block_round_polynomial_flat(&tabs, beta_flat, gamma_flat);
+        if let Some(t0) = t0 {
+            round_poly_total += t0.elapsed();
+        }
+
+        let t0 = profiler.enabled().then(Instant::now);
         for &c in &poly.coeffs {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
         let challenge_flat = tower_to_flat_u128(challenge.to_u128());
+        if let Some(t0) = t0 {
+            transcript_total += t0.elapsed();
+        }
+
+        let t0 = profiler.enabled().then(Instant::now);
         tabs.fold(challenge_flat);
+        if let Some(t0) = t0 {
+            fold_total += t0.elapsed();
+        }
+
         r_prime[num_vars - 1 - round] = challenge;
         round_polys.push(poly);
     }
+    profiler.record("round_polynomials_total", round_poly_total);
+    profiler.record("round_transcript_total", transcript_total);
+    profiler.record("round_folds_total", fold_total);
+    profiler.phase("sumcheck_rounds_wall");
 
     let claims = tabs.final_claims_tower();
 
@@ -991,6 +1103,7 @@ pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
     for v in &claims.state_lane_dec {
         channel.absorb(*v);
     }
+    profiler.phase("final_claim_absorb");
 
     let proof = BlockSpineUnifiedProof {
         round_polys,
@@ -1001,6 +1114,8 @@ pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
         s_out_lane_dec_at_r: claims.s_out_lane_dec,
         state_lane_dec_at_r: claims.state_lane_dec,
     };
+    profiler.phase("proof_assembly");
+    profiler.finish();
     (proof, r_prime)
 }
 
@@ -1137,7 +1252,6 @@ fn build_block_combined_weights(
     num_vars: usize,
 ) -> BlockCombinedWeights {
     let n_cells = 1usize << num_vars;
-    let slot_vars = num_vars - ROUND_BITS - ELEM_BITS;
 
     let rp_elem = &r_prime[0..ELEM_BITS];
     let rp_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
@@ -1146,9 +1260,7 @@ fn build_block_combined_weights(
     let eq_slot_tab = eq_ind_partial_eval::<Block128>(rp_slot);
     let eq_elem_tab = eq_ind_partial_eval::<Block128>(rp_elem);
 
-    let n_slots = 1usize << slot_vars;
     let n_rounds = 1usize << ROUND_BITS;
-    let n_elems = 1usize << ELEM_BITS;
 
     let eq_round_tab = eq_ind_partial_eval::<Block128>(rp_round);
     let mut eq_round_at_inc = vec![Block128::ZERO; n_rounds];
@@ -1158,38 +1270,6 @@ fn build_block_combined_weights(
     }
 
     use rayon::prelude::*;
-
-    // Fill w_dec and w_lane in parallel over slots.
-    // Collect (idx, w_dec, es_er) tuples per slot, then scatter sequentially.
-    // Slots write to disjoint indices (guaranteed by pack_index_dyn).
-    let scatter_data: Vec<Vec<(usize, Block128, Block128)>> = (0..n_slots)
-        .into_par_iter()
-        .map(|slot| {
-            let es = eq_slot_tab[slot];
-            let mut local = Vec::with_capacity(n_rounds * n_elems);
-            for round_x in 0..n_rounds {
-                let er = eq_round_at_inc[round_x];
-                let es_er = es * er;
-                for elem in 0..n_elems {
-                    let idx = pack_index_dyn(slot, round_x, elem);
-                    let ee = eq_elem_tab[elem];
-                    local.push((idx, es_er * ee, es_er));
-                }
-            }
-            local
-        })
-        .collect();
-
-    let mut w_dec = vec![Block128::ZERO; n_cells];
-    let mut w_lane: [Vec<Block128>; STATE_SIZE] =
-        std::array::from_fn(|_| vec![Block128::ZERO; n_cells]);
-    for slot_d in &scatter_data {
-        for &(idx, wd, es_er) in slot_d {
-            w_dec[idx] = wd;
-            let elem = elem_of_dyn(idx);
-            w_lane[elem][idx] = es_er;
-        }
-    }
 
     let d0 = Block128::ONE;
     let d1 = delta;
@@ -1206,37 +1286,27 @@ fn build_block_combined_weights(
     let lane_sout = [d3, d4, d5, d6];
     let lane_state = [d7, d8, d9, d10];
 
-    // Fill w_sin/w_sout/w_state in parallel over all cells.
-    let (w_sin, (w_sout, w_state)) = rayon::join(
-        || {
-            (0..n_cells)
-                .into_par_iter()
-                .map(|x| d0 * w_dec[x])
-                .collect::<Vec<_>>()
-        },
-        || {
-            rayon::join(
-                || {
-                    (0..n_cells)
-                        .into_par_iter()
-                        .map(|x| {
-                            let e = elem_of_dyn(x);
-                            d1 * w_dec[x] + lane_sout[e] * w_lane[e][x]
-                        })
-                        .collect::<Vec<_>>()
-                },
-                || {
-                    (0..n_cells)
-                        .into_par_iter()
-                        .map(|x| {
-                            let e = elem_of_dyn(x);
-                            d2 * w_dec[x] + lane_state[e] * w_lane[e][x]
-                        })
-                        .collect::<Vec<_>>()
-                },
-            )
-        },
-    );
+    // Directly fill the final combined weight tables. This is algebraically
+    // identical to materializing w_dec plus four lane tables, but avoids the
+    // scatter_data allocation and four full-size temporary lane vectors.
+    let mut w_sin = vec![Block128::ZERO; n_cells];
+    let mut w_sout = vec![Block128::ZERO; n_cells];
+    let mut w_state = vec![Block128::ZERO; n_cells];
+    w_sin
+        .par_iter_mut()
+        .zip(w_sout.par_iter_mut())
+        .zip(w_state.par_iter_mut())
+        .enumerate()
+        .for_each(|(x, ((sin, sout), state))| {
+            let slot = slot_of_dyn(x);
+            let round = round_of_dyn(x);
+            let elem = elem_of_dyn(x);
+            let es_er = eq_slot_tab[slot] * eq_round_at_inc[round];
+            let w_dec = es_er * eq_elem_tab[elem];
+            *sin = d0 * w_dec;
+            *sout = d1 * w_dec + lane_sout[elem] * es_er;
+            *state = d2 * w_dec + lane_state[elem] * es_er;
+        });
 
     BlockCombinedWeights {
         w_sin,
@@ -1344,9 +1414,14 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
 ) -> (BlockSpineShiftProof, Vec<Block128>) {
     let num_vars = mle.num_vars;
     debug_assert_eq!(r_prime.len(), num_vars);
+    let n_instances = mle.live_slots / N_SPINE_SLOTS;
+    let mut profiler =
+        BlockSpineProfiler::new("block_spine_shift", n_instances, mle.live_slots, num_vars);
 
     let delta = channel.squeeze();
+    profiler.phase("delta_squeeze");
     let weights = build_block_combined_weights(r_prime, delta, num_vars);
+    profiler.phase("build_combined_weights");
 
     // Degree-2 sumcheck in flat basis for hw acceleration.
     // Convert all 6 tables to flat in parallel.
@@ -1370,12 +1445,17 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
                 )
             },
         );
+    profiler.phase("convert_tables_to_flat");
 
     let mut round_polys = Vec::with_capacity(num_vars);
     let mut r_double_prime = vec![Block128::ZERO; num_vars];
+    let mut round_poly_total = Duration::ZERO;
+    let mut transcript_total = Duration::ZERO;
+    let mut fold_total = Duration::ZERO;
 
     for round in 0..num_vars {
         let half = f_sin.len() / 2;
+        let t0 = profiler.enabled().then(Instant::now);
         // Parallel reduction over positions (same pattern as compute_block_round_polynomial_flat).
         let acc: [u128; BLOCK_SPINE_SHIFT_DEGREE + 1] = if half >= 256 {
             use rayon::prelude::*;
@@ -1426,25 +1506,42 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
             }
             acc
         };
+        if let Some(t0) = t0 {
+            round_poly_total += t0.elapsed();
+        }
+
         let coeffs_tower: Vec<Block128> = acc
             .iter()
             .map(|&c| Block128::from(flat_to_tower_u128(c)))
             .collect();
         let poly = RoundPolynomial::from_coeffs(coeffs_tower);
+        let t0 = profiler.enabled().then(Instant::now);
         for &c in &poly.coeffs {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
         let challenge_flat = tower_to_flat_u128(challenge.to_u128());
+        if let Some(t0) = t0 {
+            transcript_total += t0.elapsed();
+        }
+
+        let t0 = profiler.enabled().then(Instant::now);
         fold_flat_inplace(&mut f_sin, challenge_flat);
         fold_flat_inplace(&mut f_sout, challenge_flat);
         fold_flat_inplace(&mut f_state, challenge_flat);
         fold_flat_inplace(&mut f_wsin, challenge_flat);
         fold_flat_inplace(&mut f_wsout, challenge_flat);
         fold_flat_inplace(&mut f_wstate, challenge_flat);
+        if let Some(t0) = t0 {
+            fold_total += t0.elapsed();
+        }
         r_double_prime[num_vars - 1 - round] = challenge;
         round_polys.push(poly);
     }
+    profiler.record("round_polynomials_total", round_poly_total);
+    profiler.record("round_transcript_total", transcript_total);
+    profiler.record("round_folds_total", fold_total);
+    profiler.phase("sumcheck_rounds_wall");
 
     debug_assert_eq!(f_sin.len(), 1);
     let s_in_at_r2 = Block128::from(flat_to_tower_u128(f_sin[0]));
@@ -1454,6 +1551,7 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
     channel.absorb(s_in_at_r2);
     channel.absorb(s_out_at_r2);
     channel.absorb(state_at_r2);
+    profiler.phase("final_claim_absorb");
 
     let proof = BlockSpineShiftProof {
         round_polys,
@@ -1461,6 +1559,8 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
         s_out_at_r2,
         state_at_r2,
     };
+    profiler.phase("proof_assembly");
+    profiler.finish();
     (proof, r_double_prime)
 }
 
@@ -1560,27 +1660,33 @@ pub struct BlockSpineReductions {
 
 /// Prove the unified block spine Kill-Shot over N*59 slots.
 ///
-/// `all_slot_state_ins` must have length `n_instances * N_SPINE_SLOTS`,
-/// ordered as: tx0_slot0, tx0_slot1, ..., tx0_slot58, tx1_slot0, ...
+/// The caller provides the already-built `BlockSpineMle`. This keeps the block
+/// prover honest-by-construction: the GKR proof is derived from the same spine
+/// MLE whose `state` column is committed into the block-level FRI slices.
 pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
     n_instances: usize,
-    all_slot_state_ins: &[[Block128; STATE_SIZE]],
+    mle: &BlockSpineMle,
     all_tx_body_hashes: &[[Block128; 2]],
     channel: &mut T,
 ) -> (BlockSpineProof, BlockSpineReductions) {
-    assert_eq!(all_slot_state_ins.len(), n_instances * N_SPINE_SLOTS);
     assert_eq!(all_tx_body_hashes.len(), n_instances);
+    let live_slots = n_instances * N_SPINE_SLOTS;
+    let num_vars = num_vars_for(live_slots);
+    assert_eq!(mle.live_slots, live_slots);
+    assert_eq!(mle.num_vars, num_vars);
+    let mut profiler =
+        BlockSpineProfiler::new("block_spine_killshot", n_instances, live_slots, num_vars);
 
     // Absorb all tx_body_hashes into the channel (binds block contents).
     for hash in all_tx_body_hashes {
         channel.absorb(hash[0]);
         channel.absorb(hash[1]);
     }
-
-    let mle = BlockSpineMle::build(n_instances, all_slot_state_ins);
+    profiler.phase("absorb_tx_body_hashes");
 
     // (1) Main unified sumcheck.
-    let (main, r_prime) = prove_block_spine_unified(&mle, channel);
+    let (main, r_prime) = prove_block_spine_unified(mle, channel);
+    profiler.phase("unified_sumcheck");
 
     let main_red = BlockSpineUnifiedReduction {
         r_prime: r_prime.clone(),
@@ -1593,9 +1699,11 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
         beta: Block128::ZERO, // filled by verifier
         gamma: Block128::ZERO,
     };
+    profiler.phase("main_reduction_assembly");
 
     // (2) Shift gadget.
-    let (shift, r_double_prime) = prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
+    let (shift, r_double_prime) = prove_block_spine_shift(mle, &r_prime, &main_red, channel);
+    profiler.phase("shift_gadget");
 
     // (3) Batch eval on state column.
     let state_claims = vec![
@@ -1609,6 +1717,7 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
         },
     ];
     let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
+    profiler.phase("state_batch_eval");
 
     // (4) Batch eval on s_in column.
     let sin_claims = vec![EvalClaim {
@@ -1616,6 +1725,7 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
         value: shift.s_in_at_r2,
     }];
     let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
+    profiler.phase("sin_batch_eval");
 
     // (5) Batch eval on s_out column.
     let sout_claims = vec![EvalClaim {
@@ -1623,6 +1733,7 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
         value: shift.s_out_at_r2,
     }];
     let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
+    profiler.phase("sout_batch_eval");
 
     let proof = BlockSpineProof {
         kill_shot: BlockSpineKillShotProof { main, shift },
@@ -1637,6 +1748,8 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
         sin: sin_red,
         sout: sout_red,
     };
+    profiler.phase("proof_and_reduction_assembly");
+    profiler.finish();
     (proof, reductions)
 }
 
@@ -1781,9 +1894,9 @@ mod tests {
         let wrap = states.last().unwrap();
         let tx_body_hash = [wrap.1[0], wrap.1[1]];
 
+        let mle = BlockSpineMle::build(1, &all_state_ins);
         let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) =
-            prove_block_spine_killshot(1, &all_state_ins, &[tx_body_hash], &mut ch_p);
+        let (proof, reductions) = prove_block_spine_killshot(1, &mle, &[tx_body_hash], &mut ch_p);
 
         let mut ch_v = Poseidon2bChannel::new();
         let v_red = verify_block_spine_killshot(&proof, 1, &[tx_body_hash], &mut ch_v)
@@ -1813,9 +1926,9 @@ mod tests {
             })
             .collect();
 
+        let mle = BlockSpineMle::build(4, &all_state_ins);
         let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) =
-            prove_block_spine_killshot(4, &all_state_ins, &tx_body_hashes, &mut ch_p);
+        let (proof, reductions) = prove_block_spine_killshot(4, &mle, &tx_body_hashes, &mut ch_p);
 
         assert_eq!(proof.num_vars, 8 + 7 + 2); // 17 vars for 236 slots
         assert_eq!(proof.live_slots, 4 * 59);
@@ -1848,9 +1961,9 @@ mod tests {
             })
             .collect();
 
+        let mle = BlockSpineMle::build(2, &all_state_ins);
         let mut ch_p = Poseidon2bChannel::new();
-        let (mut proof, _) =
-            prove_block_spine_killshot(2, &all_state_ins, &tx_body_hashes, &mut ch_p);
+        let (mut proof, _) = prove_block_spine_killshot(2, &mle, &tx_body_hashes, &mut ch_p);
         proof.kill_shot.main.state_at_r += Block128::ONE;
 
         let mut ch_v = Poseidon2bChannel::new();

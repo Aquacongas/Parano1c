@@ -61,6 +61,7 @@ use noid_stark::interleaved::{
 use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 /// Log2 of the FRI slice size for the block-level interleaved commitment.
 /// All per-tx columns (AIR + auth slices) and spine slices are padded
@@ -347,6 +348,128 @@ fn build_auth_slice_claims(
     claims
 }
 
+#[derive(Debug)]
+struct ProveBlockPhaseTiming {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct ProveBlockProfilerInner {
+    started: Instant,
+    last: Instant,
+    phases: Vec<ProveBlockPhaseTiming>,
+}
+
+#[derive(Debug)]
+struct ProveBlockProfiler {
+    inner: Option<ProveBlockProfilerInner>,
+}
+
+impl ProveBlockProfiler {
+    fn new() -> Self {
+        let enabled = std::env::var("NOID_PROVE_BLOCK_PROFILE")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
+        if enabled {
+            let now = Instant::now();
+            Self {
+                inner: Some(ProveBlockProfilerInner {
+                    started: now,
+                    last: now,
+                    phases: Vec::with_capacity(16),
+                }),
+            }
+        } else {
+            Self { inner: None }
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if let Some(inner) = &mut self.inner {
+            let now = Instant::now();
+            inner.phases.push(ProveBlockPhaseTiming {
+                name,
+                elapsed: now.duration_since(inner.last),
+            });
+            inner.last = now;
+        }
+    }
+
+    fn finish(
+        self,
+        n_tx: usize,
+        n_state_bindings: usize,
+        n_air_cols: usize,
+        n_auth_slices: usize,
+        n_block_spine_slices: usize,
+        log_len: usize,
+    ) {
+        let Some(inner) = self.inner else {
+            return;
+        };
+
+        let total = inner.started.elapsed();
+        let summary = inner
+            .phases
+            .iter()
+            .map(|p| format!("{}={:.3}ms", p.name, duration_ms(p.elapsed)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        for phase in &inner.phases {
+            let elapsed_ms = duration_ms(phase.elapsed);
+            tracing::info!(
+                target: "noid_block::prove_block_profile",
+                n_tx,
+                n_state_bindings,
+                phase = phase.name,
+                elapsed_ms,
+                "prove_block phase"
+            );
+            eprintln!(
+                "prove_block_profile phase n_tx={} n_state_bindings={} phase={} elapsed_ms={:.3}",
+                n_tx, n_state_bindings, phase.name, elapsed_ms
+            );
+        }
+
+        let total_ms = duration_ms(total);
+        tracing::info!(
+            target: "noid_block::prove_block_profile",
+            n_tx,
+            n_state_bindings,
+            n_air_cols,
+            n_auth_slices,
+            n_block_spine_slices,
+            log_len,
+            total_ms,
+            phases = %summary,
+            "prove_block phase profile"
+        );
+        eprintln!(
+            "prove_block_profile summary n_tx={} n_state_bindings={} n_air_cols={} n_auth_slices={} n_block_spine_slices={} log_len={} total_ms={:.3} phases={}",
+            n_tx,
+            n_state_bindings,
+            n_air_cols,
+            n_auth_slices,
+            n_block_spine_slices,
+            log_len,
+            total_ms,
+            summary
+        );
+    }
+}
+
+fn duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
+
 // ---------------------------------------------------------------------------
 // prove_block
 // ---------------------------------------------------------------------------
@@ -363,6 +486,8 @@ pub fn prove_block(
     let n_tx = witnesses.len();
     assert!(n_tx >= 1, "block must have at least one transaction");
 
+    let mut profiler = ProveBlockProfiler::new();
+
     let spine_circuit = SpineCircuit::build();
     let auth_circuit = AuthCircuit::build();
 
@@ -373,6 +498,7 @@ pub fn prove_block(
     let n_auth_slices: usize = witnesses[0].auth_slices.len();
     let n_per_tx = n_air_cols + n_auth_slices;
     let log_len = noid_stark::padded_log_len(witnesses[0].trace.log_rows);
+    profiler.phase("setup");
 
     // -------------------------------------------------------------------------
     // Build per-tx column pools + block spine MLE.
@@ -438,6 +564,7 @@ pub fn prove_block(
     let block_spine_slices =
         split_mle_into_slices(&block_spine_mle.state, block_spine_num_vars, BASE_LOG);
     let n_block_spine_slices = block_spine_slices.len();
+    profiler.phase("tx_prep_and_block_spine_mle");
 
     // -------------------------------------------------------------------------
     // Single block-wide interleaved commit.
@@ -480,11 +607,13 @@ pub fn prove_block(
     for c in &sb_padded_columns {
         flat_refs.push(c.as_slice());
     }
+    profiler.phase("state_binding_padding_and_flat_refs");
 
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
     let (commitment, prover_state) = interleaved_commit(&flat_refs, &ntt, &hasher);
     let cap = &commitment.cap;
+    profiler.phase("interleaved_commit");
 
     // -------------------------------------------------------------------------
     // GKR Kill-Shots.
@@ -502,12 +631,8 @@ pub fn prove_block(
     // (a) Unified block spine.
     let mut spine_channel = Poseidon2bChannel::new();
     absorb_cap_into_p2b(&mut spine_channel, cap);
-    let (block_spine_proof, block_spine_reductions) = prove_block_spine_killshot(
-        n_tx,
-        &all_slot_state_ins,
-        &tx_body_hashes,
-        &mut spine_channel,
-    );
+    let (block_spine_proof, block_spine_reductions) =
+        prove_block_spine_killshot(n_tx, &block_spine_mle, &tx_body_hashes, &mut spine_channel);
 
     // Spine reduction -> slice bridge.
     // spine_r_low is the BASE_LOG-dimensional opening point for the spine slices.
@@ -522,6 +647,7 @@ pub fn prove_block(
         v
     };
     let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
+    profiler.phase("block_spine_gkr");
 
     // (b) Per-tx auth Kill-Shots (parallel).
     struct AuthResult {
@@ -571,6 +697,7 @@ pub fn prove_block(
         .enumerate()
         .map(|(k, r)| r.ok_or(ProveBlockError::AuthProofInvalid(k)))
         .collect::<Result<Vec<_>, _>>()?;
+    profiler.phase("auth_verify_and_slice_openings");
 
     // -------------------------------------------------------------------------
     // Parallel per-tx algebraic STARK proofs.
@@ -638,6 +765,7 @@ pub fn prove_block(
         tx_claims.push(r.final_claim);
         tx_lambdas.push(r.lambdas);
     }
+    profiler.phase("tx_algebraic_starks");
 
     // -------------------------------------------------------------------------
     // BlockStateBindingAir algebraic STARKs — one per segment AIR.
@@ -691,6 +819,7 @@ pub fn prove_block(
     let sb_algebraics: Vec<AlgebraicStarkProof> =
         sb_results.iter().map(|r| r.alg.clone()).collect();
     let sb_r_pp_list: Vec<Vec<Block128>> = sb_results.into_iter().map(|r| r.r_pp).collect();
+    profiler.phase("state_binding_algebraic_starks");
 
     // -------------------------------------------------------------------------
     // Per-segment FRI MLE openings + Merkle path.
@@ -746,6 +875,7 @@ pub fn prove_block(
             });
         }
     }
+    profiler.phase("state_mle_openings");
 
     // -------------------------------------------------------------------------
     // Segmented Transcript Absorption.
@@ -768,6 +898,7 @@ pub fn prove_block(
         })
         .collect();
     let transcript_root = merkle_reduce(&tx_digests);
+    profiler.phase("tx_transcript_merkle_root");
 
     // -------------------------------------------------------------------------
     // Block multipoint channel — fresh, domain-separated from per-tx channels.
@@ -776,6 +907,7 @@ pub fn prove_block(
     let [tr0, tr1] = hash_to_fields(&transcript_root);
     block_channel.observe_field_elem(tr0);
     block_channel.observe_field_elem(tr1);
+    profiler.phase("block_channel_setup");
 
     // -------------------------------------------------------------------------
     // Block-level multipoint sumcheck (CRYPTO.md §6).
@@ -862,6 +994,7 @@ pub fn prove_block(
             }
         })
     });
+    profiler.phase("column_openings");
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
     block_channel.observe_field_elems(&block_col_openings);
@@ -917,6 +1050,7 @@ pub fn prove_block(
         }
         target
     };
+    profiler.phase("sumcheck_challenge_and_target");
 
     // Collect all r_pp points for all participants.
     let all_r_pp: Vec<&[Block128]> = {
@@ -990,6 +1124,7 @@ pub fn prove_block(
         })
         .collect();
     let pairs_b: Vec<&[Block128]> = pairs_b_owned.iter().map(|v| v.as_slice()).collect();
+    profiler.phase("sumcheck_pair_materialization");
 
     let (block_mp_rounds, block_mp_challenges) =
         noid_stark::multipoint_batch::prove_multipoint_sumcheck(
@@ -1000,6 +1135,7 @@ pub fn prove_block(
         );
     let r_block: Vec<Block128> = block_mp_challenges.iter().rev().cloned().collect();
     debug_assert_eq!(r_block.len(), log_len);
+    profiler.phase("multipoint_sumcheck");
 
     // -------------------------------------------------------------------------
     // Single FRI-Binius mixed opening at r_block.
@@ -1013,10 +1149,20 @@ pub fn prove_block(
         &hasher,
         COMPACT_NUM_QUERIES,
     );
+    profiler.phase("mixed_opening");
 
     let tx_pis: Vec<PublicInputs> = witnesses.iter().map(|w| w.pi.clone()).collect();
     let tx_auth_proofs: Vec<AuthProofKillShot> =
         witnesses.iter().map(|w| w.auth_proof.clone()).collect();
+    profiler.phase("proof_output_clones");
+    profiler.finish(
+        n_tx,
+        n_state_bindings,
+        n_air_cols,
+        n_auth_slices,
+        n_block_spine_slices,
+        log_len,
+    );
 
     Ok(BlockProof {
         meta: BlockPublicMeta {
