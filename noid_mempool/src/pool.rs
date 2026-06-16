@@ -407,7 +407,7 @@ impl AsyncMempool {
             tracing::debug!(?hash, "tx evicted: output slot occupied by confirmed block");
             let _ = self.events.send(MempoolEvent::TxEvicted {
                 hash,
-                reason: EvictReason::InputConsumed, // output slot conflict
+                reason: EvictReason::OutputSlotOccupied,
             });
         }
 
@@ -529,6 +529,11 @@ impl AsyncMempool {
     /// Current dynamic fee floor (μNOID).
     pub async fn fee_floor(&self) -> u64 {
         self.state.lock().await.floor.current()
+    }
+
+    /// Snapshot of output slots currently reserved by admitted mempool txs.
+    pub async fn reserved_output_slots(&self) -> HashSet<u32> {
+        self.state.lock().await.admitted_output_slots.clone()
     }
 
     /// Current chain occupancy used for fee estimation: (active slots, log_slots).

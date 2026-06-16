@@ -174,7 +174,7 @@ pub fn build_block_template(
     use noid_tx::{hash_tx_body, TxBody, TxOutput};
 
     // 1. Resolve slot conflicts among candidate txs.
-    let (winners, _losers) = resolve_slot_conflicts(candidate_txs);
+    let (mut winners, _losers) = resolve_slot_conflicts(candidate_txs);
 
     // 2. Determine expansion trigger using median over prev_active_counts window.
     //    Must match validate_block_consensus exactly so the block we produce passes
@@ -193,6 +193,14 @@ pub fn build_block_template(
     } else {
         parent.log_slots
     };
+
+    // Wallet proofs are bound to log_slots. If this block expands the state,
+    // mempool transactions proved against the parent log_slots cannot be valid
+    // under the expanded header. Produce a coinbase-only expansion block; wallets
+    // will re-prove after observing the new tip.
+    if should_expand {
+        winners.clear();
+    }
 
     // 3. Apply non-coinbase txs to scratch state.
     let mut scratch = state.clone();
@@ -258,13 +266,34 @@ pub fn build_block_template(
     // Use the scratch state's actual capacity so hints are always in range.
     let coinbase_slot = {
         let state_log_slots = scratch.state.log_slots() as u32;
-        // Use 256 hints to keep failure probability negligible even at high occupancy
-        // (p_all_occupied = occupancy^256; at 90% occupancy ≈ 2×10^{-12}).
-        let hints = generate_slot_hints(scratch.alloc_counter, state_log_slots, 256);
-        hints
+        let reserved = HashSet::new();
+        let seed =
+            scratch.alloc_counter ^ u64::from_le_bytes(parent.state_root[..8].try_into().unwrap());
+
+        // Best case: reuse a hole in an already-populated segment. This avoids
+        // materialising a new 3 MB segment just for coinbase.
+        let reuse_hints = scratch
+            .state
+            .empty_slot_hints_in_populated_segments(seed, 32, &reserved);
+        if let Some(slot) = reuse_hints
             .into_iter()
             .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY)
-            .ok_or(TemplateBuildError::NoCoinbaseSlot)?
+        {
+            slot
+        } else {
+            // Fall back to the virgin-zone allocator. Grow the candidate window
+            // so a block is not rejected merely because the first 256 hints were
+            // occupied; NoCoinbaseSlot should mean genuinely no reachable empty slot.
+            let mut found = None;
+            let mut count = 256usize;
+            while found.is_none() && count <= 65_536 {
+                found = generate_slot_hints(scratch.alloc_counter, state_log_slots, count)
+                    .into_iter()
+                    .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY);
+                count *= 2;
+            }
+            found.ok_or(TemplateBuildError::NoCoinbaseSlot)?
+        }
     };
 
     // Sum only claimable fees. The deterministic state-growth component is burned.

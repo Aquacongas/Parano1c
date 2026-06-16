@@ -52,6 +52,22 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 ///    will naturally give different hints even in the same zone.
 pub const ZONE_CAPACITY: u64 = 1 << 16; // = 2^LOG_SEGMENT_SIZE = 65536
 
+/// Bijective zone permutation for `num_zones = 2^k`.
+///
+/// An odd multiplier is invertible modulo `2^k`, so
+/// `zone_id ↦ zone_id * mul + add (mod 2^k)` visits every segment exactly once
+/// per cycle. This avoids the collision-heavy `splitmix64(zone_id) % num_zones`
+/// mapping while keeping allocation deterministic and cheap.
+#[inline]
+pub fn permute_zone(zone_id: u64, num_zones: u64, seed: u64) -> u64 {
+    debug_assert!(num_zones.is_power_of_two());
+    let mask = num_zones - 1;
+    let mut s = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mul = splitmix64(&mut s) | 1; // odd => invertible modulo 2^k
+    let add = splitmix64(&mut s);
+    zone_id.wrapping_mul(mul).wrapping_add(add) & mask
+}
+
 /// Generate `count` candidate free slot indices from an `alloc_counter` seed.
 ///
 /// ## Zone-based strategy
@@ -90,6 +106,7 @@ pub fn generate_slot_hints(alloc_counter: u64, log_slots: u32, count: usize) -> 
     // rather than O(min(alloc_counter, num_segments)).
     let zone_mask: u64 = ZONE_CAPACITY - 1;
     let num_zones: u64 = num_slots / ZONE_CAPACITY; // = 2^(log_slots - 16) = 256 at genesis
+    let perm_seed = 0xA076_1D64_78BD_642F ^ ((log_slots as u64) << 32);
 
     let mut hints = Vec::with_capacity(count);
     let mut counter = alloc_counter;
@@ -98,9 +115,9 @@ pub fn generate_slot_hints(alloc_counter: u64, log_slots: u32, count: usize) -> 
         let zone_id = counter / ZONE_CAPACITY;
         let zone_offset = counter & zone_mask;
 
-        // Map zone_id to a random segment index (uniform, bijective over num_zones).
-        let raw = splitmix64(&mut { zone_id });
-        let zone_seg = raw % num_zones; // which segment this zone lives in
+        // Map zone_id to a permuted segment index. Because num_zones is a
+        // power of two, this is a real permutation (no modulo collisions).
+        let zone_seg = permute_zone(zone_id, num_zones, perm_seed);
         let zone_start = zone_seg * ZONE_CAPACITY;
         let slot = (zone_start + zone_offset) as u32;
 
@@ -271,6 +288,19 @@ mod tests {
             segments.is_disjoint(&segs2),
             "zone 0 and zone 1 should use different segments"
         );
+    }
+
+    #[test]
+    fn zone_permutation_covers_all_segments_once() {
+        let log_slots = 24u32;
+        let num_zones = 1u64 << (log_slots - 16);
+        let seed = 0xA076_1D64_78BD_642F ^ ((log_slots as u64) << 32);
+        let mut seen = std::collections::HashSet::new();
+        for zone in 0..num_zones {
+            let seg = permute_zone(zone, num_zones, seed);
+            assert!(seen.insert(seg), "duplicate segment {seg} for zone {zone}");
+        }
+        assert_eq!(seen.len() as u64, num_zones);
     }
 
     #[test]

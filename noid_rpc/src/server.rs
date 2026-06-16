@@ -32,6 +32,33 @@ fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
 }
 
+#[inline]
+fn node_entropy_nonce() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+#[inline]
+fn mix_slot_hint_seed(tip_seed: u64, salt: u64) -> u64 {
+    let mut s = tip_seed ^ salt ^ 0x9E37_79B9_7F4A_7C15;
+    noid_chain::consensus::allocator::splitmix64(&mut s)
+}
+
+fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
+    let salt = salt_hex.trim_start_matches("0x");
+    let bytes = hex::decode(salt).map_err(|e| rpc_err(format!("salt hex decode: {e}")))?;
+    let mut acc = 0xD6E8_FD9D_AA28_4A7Bu64;
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        acc ^= u64::from_le_bytes(word);
+        acc = noid_chain::consensus::allocator::splitmix64(&mut acc);
+    }
+    Ok(acc)
+}
+
 fn verify_rpc_block_against_context(
     ctx: &mut MdbxChainContext,
     block: &Block,
@@ -116,6 +143,47 @@ pub struct RpcHandler {
     /// any valid address as `miner_address` in getBlockTemplate and receive
     /// block rewards directly. The node operator earns via off-chain service fees.
     pub allow_custom_coinbase: bool,
+}
+
+impl RpcHandler {
+    async fn collect_slot_hints(&self, count: u32, salt_seed: u64) -> RpcResult<Vec<u32>> {
+        let count = (count as usize).min(256);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reserved = self.mempool.reserved_output_slots().await;
+        let chain = self.chain.read().await;
+        let tip = chain.tip_header();
+        let log_slots = tip.log_slots;
+        let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+        let seed = mix_slot_hint_seed(tip_seed, salt_seed);
+
+        let mut hints = chain
+            .state
+            .state
+            .empty_slot_hints_in_populated_segments(seed, count, &reserved);
+        let mut seen: std::collections::HashSet<u32> = reserved;
+        seen.extend(hints.iter().copied());
+
+        if hints.len() < count {
+            let raw = generate_slot_hints(seed, log_slots, (count * 64).max(512));
+            for idx in raw {
+                if (idx as u64) < (1u64 << log_slots)
+                    && seen.insert(idx)
+                    && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
+                {
+                    hints.push(idx);
+                    if hints.len() == count {
+                        break;
+                    }
+                }
+            }
+        }
+
+        hints.truncate(count);
+        Ok(hints)
+    }
 }
 
 #[async_trait]
@@ -238,15 +306,10 @@ impl ParanoidApiServer for RpcHandler {
             1
         };
 
-        // Materialized = segments with actual data in RAM (Some(Box<SegmentColumns>)).
-        // Virtual-zero segments (None) hold 0 bytes — they are lazily allocated on first write.
-        // Evicted = materialized on disk (MDBX) but currently paged out of RAM.
-        let materialized_in_ram = chain.state.state.active_segment_ids().count();
-        let evicted_in_mdbx = chain.state.state.evicted_segment_ids().count();
-        // Segments that have any data at all (RAM + disk):
-        // materialized covers active RAM segments; evicted covers paged-out ones.
-        // Together they are the segments with non-zero UTXO data.
-        let nonempty_segments = materialized_in_ram + evicted_in_mdbx;
+        // Populated = segments with at least one live UTXO. Fully-empty touched
+        // segments are dematerialised and excluded from RAM, disk, and snapshots.
+        let materialized_in_ram = chain.state.state.materialized_segment_ids().count();
+        let nonempty_segments = chain.state.state.active_segment_ids().count();
 
         // Per-segment on-disk size:
         //   3 columns (values, owners_hi, owners_lo)
@@ -472,33 +535,12 @@ impl ParanoidApiServer for RpcHandler {
     // -----------------------------------------------------------------------
 
     async fn get_slot_hints(&self, count: u32) -> RpcResult<Vec<u32>> {
-        let count = (count as usize).min(256);
-        let chain = self.chain.read().await;
-        let tip = chain.tip_header();
-        let log_slots = tip.log_slots;
-        let num_slots = 1u32 << log_slots;
+        self.collect_slot_hints(count, node_entropy_nonce()).await
+    }
 
-        // Wallet slot hints use the tip state_root as seed — completely independent
-        // from the miner's alloc_counter PRNG. This minimises collisions between
-        // wallet output slots and upcoming coinbase allocations.
-        //
-        // At genesis difficulty (200ms/block) prove_tx (~300ms) spans 1-2 blocks,
-        // so we over-generate 32× to guarantee enough empty candidates survive.
-        // At mainnet difficulty (60s/block) this is essentially collision-free.
-        let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
-
-        let raw = generate_slot_hints(tip_seed, log_slots, (count * 32).max(256));
-        let mut hints: Vec<u32> = raw
-            .into_iter()
-            .filter(|&idx| {
-                (idx as u64) < (1u64 << log_slots)
-                    && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
-            })
-            .collect();
-        hints.dedup();
-        hints.truncate(count);
-        let _ = num_slots;
-        Ok(hints)
+    async fn get_slot_hints_salted(&self, count: u32, salt_hex: String) -> RpcResult<Vec<u32>> {
+        self.collect_slot_hints(count, seed_from_salt_hex(&salt_hex)?)
+            .await
     }
 
     async fn get_epoch_anchor(&self) -> RpcResult<String> {
@@ -804,6 +846,8 @@ impl ParanoidApiServer for RpcHandler {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
 
+            let reserved_outputs = self.mempool.reserved_output_slots().await;
+
             // Lock 1: extract tip data only (no PRNG or heavy work under lock).
             let (epoch_anchor, log_slots, unique_seed) = {
                 let chain = self.chain.read().await;
@@ -819,20 +863,28 @@ impl ParanoidApiServer for RpcHandler {
                 (epoch_anchor, log_slots, unique_seed)
             };
             // PRNG runs without holding the lock.
-            let raw = generate_slot_hints(unique_seed, log_slots, 256);
-            // Lock 2: filter empty slots only.
+            let raw = generate_slot_hints(unique_seed, log_slots, 512);
+            // Lock 2: filter empty slots only, preferring holes in live segments.
             let slot_hints = {
                 let chain = self.chain.read().await;
-                let mut hints: Vec<u32> = raw
-                    .into_iter()
-                    .filter(|&idx| {
-                        (idx as u64) < (1u64 << log_slots)
-                            && chain.state.state.slot(idx)
-                                == noid_chain::fri_state::SlotValue::EMPTY
-                    })
-                    .collect();
-                hints.dedup();
-                hints.truncate(8);
+                let mut hints = chain.state.state.empty_slot_hints_in_populated_segments(
+                    unique_seed,
+                    8,
+                    &reserved_outputs,
+                );
+                let mut seen = reserved_outputs.clone();
+                seen.extend(hints.iter().copied());
+                for idx in raw {
+                    if (idx as u64) < (1u64 << log_slots)
+                        && seen.insert(idx)
+                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
+                    {
+                        hints.push(idx);
+                        if hints.len() == 8 {
+                            break;
+                        }
+                    }
+                }
                 hints
             };
 
@@ -929,6 +981,8 @@ impl ParanoidApiServer for RpcHandler {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
 
+            let reserved_outputs = self.mempool.reserved_output_slots().await;
+
             let (epoch_anchor, slot_hints, log_slots) = {
                 let chain = self.chain.read().await;
                 let tip = chain.tip_header();
@@ -940,17 +994,25 @@ impl ParanoidApiServer for RpcHandler {
                         .wrapping_add(attempt as u64)
                         .wrapping_mul(0x9e3779b97f4a7c15),
                 );
-                let raw = generate_slot_hints(unique_seed, log_slots, 64);
-                let mut hints: Vec<u32> = raw
-                    .into_iter()
-                    .filter(|&idx| {
-                        (idx as u64) < (1u64 << log_slots)
-                            && chain.state.state.slot(idx)
-                                == noid_chain::fri_state::SlotValue::EMPTY
-                    })
-                    .collect();
-                hints.dedup();
-                hints.truncate(4);
+                let raw = generate_slot_hints(unique_seed, log_slots, 256);
+                let mut hints = chain.state.state.empty_slot_hints_in_populated_segments(
+                    unique_seed,
+                    4,
+                    &reserved_outputs,
+                );
+                let mut seen = reserved_outputs.clone();
+                seen.extend(hints.iter().copied());
+                for idx in raw {
+                    if (idx as u64) < (1u64 << log_slots)
+                        && seen.insert(idx)
+                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
+                    {
+                        hints.push(idx);
+                        if hints.len() == 4 {
+                            break;
+                        }
+                    }
+                }
                 (epoch_anchor, hints, log_slots)
             };
 

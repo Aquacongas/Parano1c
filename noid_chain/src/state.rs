@@ -112,6 +112,10 @@ pub enum ApplyError {
     /// Two valid outputs in the same tx target the same `slot_index`,
     /// which would produce a double-write to one cell.
     DuplicateOutputSlot,
+    /// A tx tries to spend and mint to the same slot in one body. Reuse is
+    /// allowed after a slot is freed, but not inside the same transaction: the
+    /// block state-binding layer proves output slots were empty before the tx.
+    InputOutputSlotOverlap,
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
@@ -125,12 +129,12 @@ pub enum ApplyError {
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
     let mut snapshot = state.clone();
 
-    for input in &body.inputs {
-        if !input.valid {
-            continue;
-        }
-        spend_input(&mut snapshot, input)?;
-    }
+    let input_slots: HashSet<u32> = body
+        .inputs
+        .iter()
+        .filter(|input| input.valid)
+        .map(|input| input.slot_index)
+        .collect();
 
     // Wallet-chosen output slots: reject duplicates *within this tx*
     // up-front so we don't silently overwrite our own earlier write.
@@ -145,6 +149,16 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
         if !seen.insert(output.slot_index) {
             return Err(ApplyError::DuplicateOutputSlot);
         }
+        if input_slots.contains(&output.slot_index) {
+            return Err(ApplyError::InputOutputSlotOverlap);
+        }
+    }
+
+    for input in &body.inputs {
+        if !input.valid {
+            continue;
+        }
+        spend_input(&mut snapshot, input)?;
     }
 
     for output in &body.outputs {
@@ -346,6 +360,22 @@ mod tests {
         let c = mk_output_at(7, 3);
         apply_tx(&mut state, &body_with(0, vec![], vec![c])).unwrap();
         assert_eq!(state.active_slot_count, 1);
+    }
+
+    #[test]
+    fn same_tx_cannot_reuse_input_slot_as_output() {
+        let mut state = fresh();
+        let a = mk_output_at(7, 1);
+        apply_tx(&mut state, &body_with(0, vec![], vec![a])).unwrap();
+
+        let replacement = mk_output_at(7, 2);
+        assert_eq!(
+            apply_tx(
+                &mut state,
+                &body_with(0, vec![mk_input_for(7, &a)], vec![replacement]),
+            ),
+            Err(ApplyError::InputOutputSlotOverlap),
+        );
     }
 
     #[test]

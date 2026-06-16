@@ -197,6 +197,13 @@ pub struct SegmentedFriState {
     /// `seg_roots[i] = None` means the root must be recomputed.
     /// Kept valid even after segment columns are evicted.
     seg_roots: Vec<Option<StateRoot>>,
+    /// Number of live (non-empty) slots in each segment.
+    ///
+    /// This is tiny even at `log_slots = 32` (65,536 segments × 4 bytes) and
+    /// lets us reuse holes without storing a global free-list. It also lets us
+    /// dematerialise all-empty segments so RAM/disk/snapshot size follows the
+    /// live UTXO set rather than historical touched segments.
+    live_counts: Vec<u32>,
     /// 1-indexed binary Merkle tree. Size = 2*num_segments + 1.
     /// Only meaningful when num_segments > 1.
     tree: Vec<StateRoot>,
@@ -255,6 +262,7 @@ impl SegmentedFriState {
             num_segments,
             segments: vec![None; num_segments],
             seg_roots: vec![Some(zero_leaf); num_segments],
+            live_counts: vec![0; num_segments],
             tree,
             tree_dirty: false,
             dirty: HashSet::new(),
@@ -297,6 +305,28 @@ impl SegmentedFriState {
         (idx & ((1u32 << self.effective_log_seg) - 1)) as u16
     }
 
+    #[inline]
+    fn segment_slot_count(&self) -> usize {
+        1usize << self.effective_log_seg
+    }
+
+    #[inline]
+    pub fn segment_live_count(&self, seg_id: u16) -> u32 {
+        self.live_counts.get(seg_id as usize).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn count_live(cols: &SegmentColumns) -> u32 {
+        cols.values
+            .iter()
+            .zip(cols.owners_hi.iter())
+            .zip(cols.owners_lo.iter())
+            .filter(|((v, hi), lo)| {
+                **v != Block128::ZERO || **hi != Block128::ZERO || **lo != Block128::ZERO
+            })
+            .count() as u32
+    }
+
     // -----------------------------------------------------------------------
     // Slot read
     // -----------------------------------------------------------------------
@@ -333,18 +363,49 @@ impl SegmentedFriState {
             let loc = self.local_idx_of(*idx) as usize;
             let seg_idx = seg as usize;
 
+            let old = self.slot(*idx);
+            if old == *v {
+                continue;
+            }
+
             if self.segments[seg_idx].is_none() {
                 if v.is_empty() {
                     continue; // writing EMPTY to virtual zero is a no-op
                 }
                 // Materialise the segment.
-                let seg_size = 1 << self.effective_log_seg;
+                let seg_size = self.segment_slot_count();
                 self.segments[seg_idx] = Some(Box::new(SegmentColumns::new_zero(seg_size)));
+                self.evicted.remove(&seg);
             }
-            let cols = self.segments[seg_idx].as_mut().unwrap();
-            cols.values[loc] = v.value;
-            cols.owners_hi[loc] = v.owner_hi;
-            cols.owners_lo[loc] = v.owner_lo;
+
+            let old_empty = old.is_empty();
+            let new_empty = v.is_empty();
+            {
+                let cols = self.segments[seg_idx].as_mut().unwrap();
+                cols.values[loc] = v.value;
+                cols.owners_hi[loc] = v.owner_hi;
+                cols.owners_lo[loc] = v.owner_lo;
+            }
+
+            match (old_empty, new_empty) {
+                (true, false) => {
+                    self.live_counts[seg_idx] = self.live_counts[seg_idx].saturating_add(1)
+                }
+                (false, true) => {
+                    self.live_counts[seg_idx] = self.live_counts[seg_idx].saturating_sub(1)
+                }
+                _ => {}
+            }
+
+            // If the last live UTXO in this segment was spent, drop the 3 MB
+            // column buffer immediately and make the segment virtual-zero again.
+            // The segment remains MDBX-dirty so commit_block can delete any old
+            // persisted copy from T_SEGMENTS.
+            if self.live_counts[seg_idx] == 0 {
+                self.segments[seg_idx] = None;
+                self.evicted.remove(&seg);
+            }
+
             // Mark FRI root stale (cleared by flush_segment) and MDBX-pending
             // (cleared only by explicit clear_dirty()).
             self.seg_roots[seg_idx] = None;
@@ -420,6 +481,18 @@ impl SegmentedFriState {
         self.segments[id].as_ref().unwrap().as_ref()
     }
 
+    /// Clone columns for durable persistence.
+    ///
+    /// Fully-empty dirty segments return zero-length columns as a deletion marker.
+    /// `MdbxStore::commit_block` checks for all-empty columns before encoding, so
+    /// this avoids cloning a 3 MB all-zero production segment just to delete it.
+    pub fn segment_columns_for_persistence(&mut self, seg_id: u16) -> SegmentColumns {
+        if self.segment_live_count(seg_id) == 0 {
+            return SegmentColumns::new_zero(0);
+        }
+        self.segment_columns(seg_id).clone()
+    }
+
     /// Borrow the three column slices for a segment.
     pub fn columns_for_segment(&mut self, seg_id: u16) -> (&[Block128], &[Block128], &[Block128]) {
         let cols = self.segment_columns(seg_id);
@@ -473,8 +546,16 @@ impl SegmentedFriState {
         if id >= self.num_segments {
             return;
         }
-        // Directly install the column data.
-        self.segments[id] = Some(Box::new(cols));
+        let live = Self::count_live(&cols);
+        self.live_counts[id] = live;
+        // Directly install the column data. All-zero segments are kept virtual so
+        // old/stale zero records in MDBX do not inflate RAM or snapshots.
+        self.segments[id] = if live == 0 {
+            None
+        } else {
+            Some(Box::new(cols))
+        };
+        self.evicted.remove(&seg_id);
         // Invalidate the FRI root so it is recomputed on next root() call.
         self.seg_roots[id] = None;
         self.tree_dirty = true;
@@ -482,13 +563,88 @@ impl SegmentedFriState {
         self.dirty.insert(seg_id);
     }
 
-    /// All segment IDs that have been materialised (non-None).
+    /// Segment IDs that currently contain at least one live UTXO.
+    ///
+    /// This intentionally differs from "materialised in RAM": an all-empty
+    /// touched segment is not active and should not be persisted or served in
+    /// snapshots. Evicted-but-live segments are still active.
     pub fn active_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.live_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, live)| **live > 0)
+            .map(|(i, _)| i as u16)
+    }
+
+    /// Segment IDs currently materialised in RAM, regardless of live count.
+    pub fn materialized_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
         self.segments
             .iter()
             .enumerate()
             .filter(|(_, s)| s.is_some())
             .map(|(i, _)| i as u16)
+    }
+
+    /// Find empty slots inside already-populated RAM segments.
+    ///
+    /// This is the memory-friendly reuse path: filling holes in live segments
+    /// does not materialise a new 3 MB segment. It deliberately avoids a global
+    /// free-list; the only permanent metadata is `live_counts`.
+    pub fn empty_slot_hints_in_populated_segments(
+        &self,
+        seed: u64,
+        count: usize,
+        reserved: &HashSet<u32>,
+    ) -> Vec<u32> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let seg_size = self.segment_slot_count();
+        let full = seg_size as u32;
+        let mut candidates: Vec<u16> = self
+            .live_counts
+            .iter()
+            .enumerate()
+            .filter(|(seg_id, live)| {
+                **live > 0 && **live < full && self.segments[*seg_id].is_some()
+            })
+            .map(|(seg_id, _)| seg_id as u16)
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rng = seed;
+        // Deterministic rotation avoids always hammering the lowest segment.
+        let start = (crate::consensus::allocator::splitmix64(&mut rng) as usize) % candidates.len();
+        candidates.rotate_left(start);
+
+        let mask = (seg_size - 1) as u64;
+        let mut out = Vec::with_capacity(count);
+        let mut seen = reserved.clone();
+        for seg_id in candidates {
+            let cols = match self.segments[seg_id as usize].as_ref() {
+                Some(cols) => cols,
+                None => continue,
+            };
+            let local_start = (crate::consensus::allocator::splitmix64(&mut rng) & mask) as usize;
+            for step in 0..seg_size {
+                let local = (local_start + step) & (seg_size - 1);
+                if cols.values[local] == Block128::ZERO
+                    && cols.owners_hi[local] == Block128::ZERO
+                    && cols.owners_lo[local] == Block128::ZERO
+                {
+                    let slot = ((seg_id as u32) << self.effective_log_seg) | (local as u32);
+                    if seen.insert(slot) {
+                        out.push(slot);
+                        if out.len() == count {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -523,7 +679,13 @@ impl SegmentedFriState {
     /// The FRI root will be recomputed lazily when next needed.
     pub fn restore_evicted_segment(&mut self, seg_id: u16, cols: SegmentColumns) {
         let id = seg_id as usize;
-        self.segments[id] = Some(Box::new(cols));
+        let live = Self::count_live(&cols);
+        self.live_counts[id] = live;
+        self.segments[id] = if live == 0 {
+            None
+        } else {
+            Some(Box::new(cols))
+        };
         self.evicted.remove(&seg_id);
         // Invalidate the cached FRI root so it will be recomputed.
         // (The loaded data might differ from what we last computed for, if
@@ -701,6 +863,7 @@ impl SegmentedFriState {
         // Extend segment arrays — upper half is all virtual zero.
         self.segments.resize(self.num_segments, None);
         self.seg_roots.resize(self.num_segments, None);
+        self.live_counts.resize(self.num_segments, 0);
 
         // Fill the new seg_roots for the upper half with the zero-segment root.
         let zero_leaf = zero_seg_root_for(self.effective_log_seg);
@@ -874,6 +1037,35 @@ mod tests {
         s.set_slot(2, SlotValue::EMPTY).unwrap();
         assert_eq!(s.root(), r0);
         assert!(s.segments[0].is_none(), "segment must stay virtual");
+    }
+
+    #[test]
+    fn segment_dematerializes_when_last_slot_cleared() {
+        let mut s = SegmentedFriState::new_empty(TS);
+        s.set_slot(3, sv(42)).unwrap();
+        assert_eq!(s.segment_live_count(0), 1);
+        assert_eq!(s.materialized_segment_ids().count(), 1);
+
+        s.set_slot(3, SlotValue::EMPTY).unwrap();
+        assert_eq!(s.segment_live_count(0), 0);
+        assert_eq!(s.active_segment_ids().count(), 0);
+        assert_eq!(s.materialized_segment_ids().count(), 0);
+        assert_eq!(s.slot(3), SlotValue::EMPTY);
+    }
+
+    #[test]
+    fn empty_slot_hints_prefer_holes_in_live_segments() {
+        let mut s = SegmentedFriState::new_empty(TS);
+        s.set_slot(0, sv(1)).unwrap();
+        s.set_slot(1, sv(2)).unwrap();
+        s.set_slot(1, SlotValue::EMPTY).unwrap();
+
+        let reserved = HashSet::new();
+        let hints = s.empty_slot_hints_in_populated_segments(123, 8, &reserved);
+        assert!(
+            hints.contains(&1),
+            "expected freed hole in live segment, got {hints:?}"
+        );
     }
 
     #[test]

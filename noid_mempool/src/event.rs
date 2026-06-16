@@ -45,6 +45,9 @@ pub enum EvictReason {
     CapacityPressure,
     /// The transaction's claimed input slot was spent by a confirmed block.
     InputConsumed,
+    /// One of the transaction's chosen output slots was filled by a confirmed block.
+    /// The wallet should rebuild/re-prove with fresh slot hints.
+    OutputSlotOccupied,
     /// Transaction was proved with a log_slots that no longer matches the chain
     /// (state expansion occurred). Must be re-proved with the new log_slots.
     LogSlotsChanged,

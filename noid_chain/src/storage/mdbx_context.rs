@@ -433,7 +433,7 @@ impl MdbxChainContext {
         let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
             .iter()
             .map(|&seg_id| {
-                let cols = self.state.state.segment_columns(seg_id).clone();
+                let cols = self.state.state.segment_columns_for_persistence(seg_id);
                 (seg_id, eff_log, cols)
             })
             .collect();
@@ -766,7 +766,7 @@ impl MdbxChainContext {
         let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
             .iter()
             .map(|&seg_id| {
-                let cols = self.state.state.segment_columns(seg_id).clone();
+                let cols = self.state.state.segment_columns_for_persistence(seg_id);
                 (seg_id, eff_log, cols)
             })
             .collect();

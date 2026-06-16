@@ -125,6 +125,13 @@ fn decode_owner_entries(bytes: &[u8]) -> Vec<(u32, u64)> {
         .collect()
 }
 
+#[inline]
+fn segment_columns_empty(cols: &SegmentColumns) -> bool {
+    cols.values.iter().all(|v| v.0 == 0)
+        && cols.owners_hi.iter().all(|v| v.0 == 0)
+        && cols.owners_lo.iter().all(|v| v.0 == 0)
+}
+
 impl MdbxStore {
     /// Open or create the MDBX database at `path`.
     /// Creates all tables on first run; subsequent opens reuse them.
@@ -464,8 +471,14 @@ impl MdbxStore {
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
         for (seg_id, eff_log, cols) in dirty_segments {
             let key = seg_id.to_le_bytes();
-            let val = encode_segment(cols, *eff_log);
-            txn.put(&seg_tbl, &key, &val, WriteFlags::empty())?;
+            if segment_columns_empty(cols) {
+                // Do not persist fully-empty segments. This keeps disk and snapshot
+                // size proportional to live UTXOs, not historical touched ranges.
+                let _ = txn.del(&seg_tbl, &key, None);
+            } else {
+                let val = encode_segment(cols, *eff_log);
+                txn.put(&seg_tbl, &key, &val, WriteFlags::empty())?;
+            }
         }
 
         // --- 2. BlockHeader ---

@@ -106,8 +106,19 @@ pub trait ParanoidApi {
     async fn validate_address(&self, address: String) -> RpcResult<AddressInfo>;
 
     /// Candidate empty slot indices for transaction outputs.
+    ///
+    /// Uses node-local entropy in addition to the tip state so concurrent callers
+    /// are unlikely to receive identical hints.
     #[method(name = "getSlotHints")]
     async fn get_slot_hints(&self, count: u32) -> RpcResult<Vec<u32>>;
+
+    /// Candidate empty slot indices salted by wallet/request entropy.
+    ///
+    /// `salt_hex` can be any caller-chosen bytes encoded as hex (for example a
+    /// wallet address plus a random nonce). Different salts on the same tip produce
+    /// different hint streams across nodes without creating global reservations.
+    #[method(name = "getSlotHintsSalted")]
+    async fn get_slot_hints_salted(&self, count: u32, salt_hex: String) -> RpcResult<Vec<u32>>;
 
     /// Current epoch anchor hash (use as `epoch_anchor` when building transactions).
     #[method(name = "getEpochAnchor")]
