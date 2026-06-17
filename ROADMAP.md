@@ -85,16 +85,16 @@ Current code reality:
 - `[x]` RPC/CLI report consolidation shape and input/output counts.
 - `[x]` Failed consolidation mempool submits clean temporary output reservations before retry.
 - `[x]` Fast live smoke confirms a `Sweep25x2` consolidation with >4 inputs.
-- `[ ]` Restart/reorg hardening for confirmed consolidation remains part of later workstreams.
+- `[x]` Restart/reorg hardening for confirmed consolidation is covered by Workstreams C/D.
 
-### 0.4 Fee policy is functional but not final
+### 0.4 Fee policy is shape-aware
 
-Current behavior is safe/conservative:
+Current behavior:
 
-- `walletSend` auto fee currently uses a per-tx upper bound valid for both standard and sweep.
-- This avoids underpayment but can overcharge standard/small transactions.
-- `estimateFee` RPC is still too simple and not shape-aware.
-- Final policy must be driven by real bench data.
+- `walletSend fee=0` plans the logical payment first and computes automatic fee per actual chunk.
+- Fee policy is output-centric and deterministic: base + small input anti-DoS + output fee + burned net-new-state growth.
+- `Sweep25x2` has no separate proof-cost premium; it pays for actual live inputs/outputs and remains cheap for consolidation/state cleanup.
+- `estimateFeeDetailed` exposes shape-aware fee breakdown; legacy `estimateFee` remains for compatibility.
 
 ### 0.5 Retained checkpoint / expected chain hash hardening is optional production hardening
 
@@ -204,7 +204,7 @@ Reason: consolidation is the obvious user-visible win from `Sweep25x2`. It also 
 
 - `[x]` A wallet with many small UTXOs can consolidate them in one confirmed `Sweep25x2` transaction.
 - `[x]` Consolidation fee is automatic when omitted.
-- `[ ]` Restart after confirmed consolidation preserves the resulting UTXO.
+- `[x]` Restart after confirmed consolidation preserves the resulting UTXO.
 
 ---
 
@@ -347,38 +347,43 @@ Reason: current auto fee is safe but conservative. Final policy should be fair, 
 
 ### Current behavior
 
-- `[~]` `walletSend fee=0` uses a conservative per-transaction upper bound.
-- `[~]` `estimateFee` RPC is not shape-aware enough.
-- `[~]` Split payments use one effective fee per chunk.
+- `[x]` `walletSend fee=0` uses a shape-aware dry-run plan and computes automatic fee per actual chunk.
+- `[x]` `estimateFeeDetailed` RPC is shape-aware by explicit live input/output counts.
+- `[x]` Split payments use per-chunk fees and report total fee.
 - `[x]` Consolidation fee is shape-aware for the selected consolidation input count.
+- `[x]` Policy deliberately does not add a `Sweep25x2` proof-cost premium: sweeps/consolidations are beneficial when they reduce live slots.
 
 ### Tasks
 
-- `[ ]` Define deterministic fee formula by actual live inputs/outputs and state growth.
-- `[ ]` Decide whether proof-cost premium is needed for `Sweep25x2`, based on benches.
-- `[ ]` Add shape-aware fee estimation API.
-- `[ ]` Add wallet dry-run/plan API returning:
+- `[x]` Define deterministic fee formula by actual live inputs/outputs and state growth:
+  - base;
+  - small input anti-DoS component;
+  - output component;
+  - burned occupancy-scaled net-new-state growth.
+- `[x]` Decide whether proof-cost premium is needed for `Sweep25x2`: no separate shape premium for current production policy.
+- `[x]` Add shape-aware fee estimation API.
+- `[x]` Add wallet dry-run/plan API returning:
   - selected inputs count;
   - planned chunks;
   - shapes;
   - per-chunk fee;
   - total fee;
   - expected change.
-- `[ ]` Make `walletSend` compute fee per actual chunk, not only one conservative global fee, if safe.
+- `[x]` Make `walletSend` compute fee per actual chunk, not only one conservative global fee.
 - `[x]` Make `walletConsolidate` compute fee from selected consolidation shape/input count.
-- `[ ]` Expose fee breakdown in RPC/CLI where useful:
+- `[x]` Expose fee breakdown in RPC/CLI where useful:
   - base;
-  - IO;
+  - input/output IO;
   - state growth;
   - burned;
   - miner claimable.
 
 ### Acceptance
 
-- `[ ]` A small standard send does not pay sweep worst-case unless policy explicitly chooses that.
-- `[ ]` A 5-input sweep send pays enough and reports why.
-- `[ ]` Split payments report total and per-tx fees.
-- `[ ]` Miner fee accounting and burned fee accounting match consensus validation.
+- `[x]` A small standard send does not pay sweep worst-case.
+- `[x]` A 5-input sweep send pays enough and reports why.
+- `[x]` Split payments report total and per-tx fees.
+- `[x]` Miner fee accounting and burned fee accounting match consensus validation.
 
 ---
 

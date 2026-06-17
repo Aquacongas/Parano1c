@@ -386,23 +386,30 @@ RPC method: `paranoid_getPeerCount`
 
 ---
 
-### `estimate-fee [N_OUTPUTS]`
+### `estimate-fee [N_OUTPUTS] [--inputs N]`
 
-Estimated minimum fee for N outputs (default: 2), assuming one input and current occupancy pressure.
+Estimated minimum relay fee for explicit live input/output counts. Outputs are the main fee driver; inputs pay only a small anti-DoS/prover-work component.
 
 ```
-$ noid-cli estimate-fee 3
-Fee estimate (3 outputs)
-  Min fee            0.011500 NOID (11500 μNOID)
+$ noid-cli estimate-fee 3 --inputs 1
+Fee estimate (1 input(s), 3 output(s))
+  Shape              Standard4x8
+  Min relay fee      0.012200 NOID (12200 μNOID)
+  Base               5000 μNOID
+  Inputs             100 μNOID
+  Outputs            2100 μNOID
+  State growth burned 5000 μNOID
+  Miner claimable    7200 μNOID
 
-  Formula: base(5000) + io_fee(500) × (inputs + outputs)
-           + state_growth_fee(2500 × pressure) × max(0, outputs - inputs)
-  estimate-fee assumes inputs = 1; pressure starts at 1× and rises with occupancy.
+  Formula: output-centric: base + small input anti-DoS + output fee + burned net-new-state fee
 ```
 
-RPC method: `paranoid_estimateFee`
+RPC methods:
 
-Fee formula charges base + I/O + occupancy-scaled net-new-state growth. The state-growth component is burned; miners can claim only the remainder plus any tip.
+- `paranoid_estimateFeeDetailed(n_inputs, n_outputs)` → detailed breakdown
+- `paranoid_estimateFee(n_outputs)` → legacy `u64`, assumes one input
+
+Fee formula charges base + small input component + output component + occupancy-scaled net-new-state growth. The state-growth component is burned; miners can claim only the remainder plus any tip. There is no `Sweep25x2` shape premium.
 
 ---
 
@@ -603,13 +610,14 @@ Response (array of):
 
 ---
 
-### `send <ADDRESS> <AMOUNT> [--fee <FEE>]`
+### `send <ADDRESS> <AMOUNT> [--fee <FEE>] [--dry-run]`
 
-Send NOID to a recipient.
+Send NOID to a recipient. With omitted fee, the wallet first plans the logical payment and computes an automatic per-transaction fee from the actual selected input/output counts; split payments no longer reuse one conservative sweep-sized fee for every chunk.
 
 ```bash
-noid-cli send f784b2c1...64charhex 10.5          # auto fee
-noid-cli send noid1qg7nxj... 10.5 --fee 0.01    # explicit fee
+noid-cli send f784b2c1...64charhex 10.5              # auto per-chunk fee
+noid-cli send noid1qg7nxj... 10.5 --fee 0.01        # explicit fee per tx
+noid-cli send noid1qg7nxj... 10.5 --dry-run         # plan only, no proof/submission
 ```
 
 ```
@@ -620,6 +628,7 @@ Transaction submitted
   To                 f784b2c1d3e5a6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081920a1b2c3d4e5
   Amount             10.500000 NOID (10500000 μNOID)
   Fee                0.009000 NOID (9000 μNOID)(auto)
+  Fee split          burned 2500 μNOID, miner claimable 6500 μNOID
   TX hash            a1b2c3d4e5f6...
 
   ⏳ The transaction is pending. It will confirm in the next block (~60s).
@@ -628,7 +637,10 @@ Transaction submitted
 
 Amounts > 1000 NOID prompt interactive confirmation. Address accepts bech32m (`noid1...`) or 64-char hex.
 
-RPC method: `paranoid_walletSend`
+RPC methods:
+
+- `paranoid_walletPlanSend(to_hex, amount_micronoid, fee_micronoid)` → dry-run plan
+- `paranoid_walletSend(to_hex, amount_micronoid, fee_micronoid)` → prove and submit
 
 Parameters:
 
@@ -636,7 +648,9 @@ Parameters:
 |-------|------|-------------|
 | `to_hex` | string | Recipient address (bech32m or hex) |
 | `amount_micronoid` | u64 | Amount in μNOID |
-| `fee_micronoid` | u64 | Fee in μNOID (0 = auto minimum) |
+| `fee_micronoid` | u64 | Fee in μNOID (0 = automatic per-chunk minimum) |
+
+`walletSend` response includes backwards-compatible `tx_hash`/`fee_micronoid` plus split-aware fields: `tx_hashes`, `tx_shapes`, `tx_input_counts`, `tx_output_counts`, `tx_fees_micronoid`, and `tx_fee_breakdowns`.
 
 ---
 

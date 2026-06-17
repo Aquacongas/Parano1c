@@ -6,9 +6,10 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
-    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MiningInfo,
-    ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate, MempoolInfo,
+    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
+    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -92,9 +93,13 @@ pub trait ParanoidApi {
     async fn get_peer_count(&self) -> RpcResult<usize>;
 
     /// Estimated minimum fee in μNOID for a transaction with `n_outputs` outputs.
-    /// Assumes a single input and current occupancy pressure.
+    /// Backwards-compatible legacy method: assumes one live input.
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
+
+    /// Detailed shape-aware fee estimate for explicit live input/output counts.
+    #[method(name = "estimateFeeDetailed")]
+    async fn estimate_fee_detailed(&self, n_inputs: u32, n_outputs: u32) -> RpcResult<FeeEstimate>;
 
     // =========================================================================
     // Utilities
@@ -205,10 +210,20 @@ pub trait ParanoidApi {
     #[method(name = "walletScan")]
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult>;
 
+    /// Dry-run wallet send planning without proving or submitting.
+    /// `fee_micronoid = 0` uses automatic per-chunk minimum relay fee.
+    #[method(name = "walletPlanSend")]
+    async fn wallet_plan_send(
+        &self,
+        to_hex: String,
+        amount_micronoid: u64,
+        fee_micronoid: u64,
+    ) -> RpcResult<WalletSendPlan>;
+
     /// Send NOID to a recipient address.
     /// `to_hex`: 32-byte recipient address as hex.
     /// `amount_micronoid`: amount in μNOID.
-    /// `fee_micronoid`: transaction fee in μNOID (0 = use minimum).
+    /// `fee_micronoid`: transaction fee in μNOID (0 = use automatic per-chunk minimum).
     #[method(name = "walletSend")]
     async fn wallet_send(
         &self,

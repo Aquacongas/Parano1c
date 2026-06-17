@@ -204,23 +204,37 @@ pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 /// Base minimum fee in μNOID per non-coinbase transaction.
 pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 NOID
 
-/// Fee charged per live input or output touched by a transaction.
-pub const FEE_PER_IO: u64 = 500; // 0.0005 NOID per input/output
+/// Small anti-DoS fee charged per live input verified by a transaction.
+///
+/// Inputs do not grow chain state, so this intentionally stays much lower than
+/// the output fee. It keeps very large-input transactions from becoming free
+/// relay/prover spam without penalising useful sweep/consolidation shapes.
+pub const FEE_PER_INPUT: u64 = 100; // 0.0001 NOID per input
+
+/// Fee charged per live output created by a transaction.
+///
+/// Outputs are the main user-visible driver of fee because they create UTXOs and
+/// may increase state pressure. The 1-input/2-output low-pressure send remains
+/// at the historical 9_000 μNOID baseline together with state-growth burn.
+pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 NOID per output
+
+/// Compatibility alias for legacy source that only knows about a combined I/O
+/// unit. New consensus code uses `FEE_PER_INPUT` and `FEE_PER_OUTPUT`.
+pub const FEE_PER_IO: u64 = (FEE_PER_INPUT + FEE_PER_OUTPUT) / 2;
 
 /// Base fee charged per net-new live UTXO slot at low occupancy.
 /// This state-growth component is burned by consensus.
 pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
-
-/// Legacy output-fee constant kept for API/source compatibility.
-/// New consensus-critical code should use `consensus::fees`.
-pub const FEE_PER_OUTPUT: u64 = 2_000;
 
 /// Compatibility estimator for legacy call sites that only know `n_outputs`.
 /// Assumes one live input at low occupancy. New consensus-critical code should
 /// use `consensus::fees::required_fee_for_tx_body` instead.
 pub const fn min_fee(n_outputs: u64) -> u64 {
     let net_new_outputs = if n_outputs > 1 { n_outputs - 1 } else { 0 };
-    MIN_FEE_BASE + FEE_PER_IO * (1 + n_outputs) + STATE_GROWTH_FEE_BASE * net_new_outputs
+    MIN_FEE_BASE
+        + FEE_PER_INPUT
+        + FEE_PER_OUTPUT * n_outputs
+        + STATE_GROWTH_FEE_BASE * net_new_outputs
 }
 
 #[cfg(test)]
@@ -255,12 +269,12 @@ mod tests {
 
     #[test]
     fn min_fee_formula() {
-        assert_eq!(min_fee(0), MIN_FEE_BASE + FEE_PER_IO);
-        assert_eq!(min_fee(1), MIN_FEE_BASE + 2 * FEE_PER_IO);
+        assert_eq!(min_fee(0), MIN_FEE_BASE + FEE_PER_INPUT);
+        assert_eq!(min_fee(1), MIN_FEE_BASE + FEE_PER_INPUT + FEE_PER_OUTPUT);
         assert_eq!(min_fee(2), 9_000);
         assert_eq!(
             min_fee(8),
-            MIN_FEE_BASE + 9 * FEE_PER_IO + 7 * STATE_GROWTH_FEE_BASE
+            MIN_FEE_BASE + FEE_PER_INPUT + 8 * FEE_PER_OUTPUT + 7 * STATE_GROWTH_FEE_BASE
         );
         assert!(min_fee(0) > 0);
     }

@@ -40,8 +40,8 @@ use std::sync::Arc;
 
 use noid_chain::segmented_state::SegmentedFriState;
 use noid_rpc::types::{
-    micronoid_to_noid, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult,
-    WalletStatus, WalletUtxoInfo,
+    micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
+    WalletScanResult, WalletSendChunkPlan, WalletSendPlan, WalletStatus, WalletUtxoInfo,
 };
 use noid_rpc::WalletOps;
 use noid_tx::TxShape;
@@ -59,6 +59,47 @@ pub struct WalletHandle {
 impl WalletHandle {
     pub fn new(inner: SharedWallet) -> Arc<dyn WalletOps + Send + Sync> {
         Arc::new(Self { inner })
+    }
+}
+
+fn fee_breakdown_info(
+    breakdown: noid_chain::consensus::FeeBreakdown,
+    relay_floor: u64,
+    paid_total: u64,
+) -> FeeBreakdownInfo {
+    let relay_total = breakdown.required_total.max(relay_floor);
+    let paid_total = paid_total.max(relay_total);
+    FeeBreakdownInfo {
+        base: breakdown.base,
+        input: breakdown.input,
+        output: breakdown.output,
+        io: breakdown.io,
+        state_growth: breakdown.state_growth,
+        required_total: breakdown.required_total,
+        relay_floor,
+        relay_total,
+        paid_total,
+        burned: breakdown.burned,
+        miner_claimable: paid_total.saturating_sub(breakdown.burned),
+    }
+}
+
+fn wallet_send_shape_for_counts(n_inputs: usize, n_outputs: usize) -> Result<TxShape, String> {
+    if n_inputs == 0 {
+        return Err("send plan needs at least one input".to_string());
+    }
+    if n_inputs <= TxShape::Standard4x8.max_inputs()
+        && n_outputs <= TxShape::Standard4x8.max_outputs()
+    {
+        Ok(TxShape::Standard4x8)
+    } else if n_inputs <= TxShape::Sweep25x2.max_inputs()
+        && n_outputs <= TxShape::Sweep25x2.max_outputs()
+    {
+        Ok(TxShape::Sweep25x2)
+    } else {
+        Err(format!(
+            "no supported wallet tx shape for {n_inputs} input(s) and {n_outputs} output(s)"
+        ))
     }
 }
 
@@ -270,6 +311,211 @@ impl WalletOps for WalletHandle {
         }
 
         Ok(chunks)
+    }
+
+    fn plan_send(
+        &self,
+        amount_micronoid: u64,
+        explicit_fee_micronoid: Option<u64>,
+        active_slot_count: u64,
+        log_slots: u32,
+        relay_floor: u64,
+    ) -> Result<WalletSendPlan, String> {
+        if amount_micronoid == 0 {
+            return Err("amount cannot be zero".to_string());
+        }
+
+        let guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_ref()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+
+        let mut available: Vec<state::WalletUtxo> = w
+            .utxos
+            .values()
+            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
+            .cloned()
+            .collect();
+        available.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let spendable: u64 = available.iter().map(|u| u.value).sum();
+        let mut cursor = 0usize;
+        let mut remaining = amount_micronoid;
+        let mut chunks = Vec::new();
+
+        while remaining > 0 {
+            let mut selected_value = 0u64;
+            let mut selected_inputs = 0usize;
+            let planned = loop {
+                if cursor + selected_inputs >= available.len()
+                    || selected_inputs >= TxShape::Sweep25x2.max_inputs()
+                {
+                    if selected_inputs == TxShape::Sweep25x2.max_inputs() {
+                        let output_count = 1usize;
+                        let shape = wallet_send_shape_for_counts(selected_inputs, output_count)?;
+                        let breakdown = noid_chain::consensus::fee_breakdown(
+                            selected_inputs as u64,
+                            output_count as u64,
+                            active_slot_count,
+                            log_slots,
+                        );
+                        let minimum_fee = breakdown.required_total.max(relay_floor);
+                        let fee = explicit_fee_micronoid.unwrap_or(minimum_fee);
+                        if fee < minimum_fee {
+                            return Err(format!(
+                                "fee too low for planned {shape:?} tx with {selected_inputs} input(s) and {output_count} output(s): required {minimum_fee} μNOID, got {fee} μNOID"
+                            ));
+                        }
+                        if selected_value > fee {
+                            let chunk_amount = selected_value - fee;
+                            break (shape, output_count, chunk_amount, 0u64, fee, breakdown);
+                        }
+                    }
+                    let planned_fees = chunks
+                        .iter()
+                        .map(|c: &WalletSendChunkPlan| c.fee_micronoid)
+                        .fold(0u64, |acc, f| acc.saturating_add(f));
+                    return Err(format!(
+                        "insufficient funds: need at least {} μNOID including planned fees, have {} μNOID spendable",
+                        amount_micronoid.saturating_add(planned_fees),
+                        spendable
+                    ));
+                }
+
+                selected_value =
+                    selected_value.saturating_add(available[cursor + selected_inputs].value);
+                selected_inputs += 1;
+
+                if let Some(explicit_fee) = explicit_fee_micronoid {
+                    if selected_value < explicit_fee {
+                        continue;
+                    }
+                    let max_payment = selected_value - explicit_fee;
+                    if max_payment >= remaining
+                        || selected_inputs == TxShape::Sweep25x2.max_inputs()
+                    {
+                        let chunk_amount = max_payment.min(remaining);
+                        let expected_change = selected_value - explicit_fee - chunk_amount;
+                        let output_count = if expected_change > 0 { 2 } else { 1 };
+                        let shape = wallet_send_shape_for_counts(selected_inputs, output_count)?;
+                        let breakdown = noid_chain::consensus::fee_breakdown(
+                            selected_inputs as u64,
+                            output_count as u64,
+                            active_slot_count,
+                            log_slots,
+                        );
+                        let minimum_fee = breakdown.required_total.max(relay_floor);
+                        if explicit_fee < minimum_fee {
+                            return Err(format!(
+                                "fee too low for planned {shape:?} tx with {selected_inputs} input(s) and {output_count} output(s): required {minimum_fee} μNOID, got {explicit_fee} μNOID"
+                            ));
+                        }
+                        break (
+                            shape,
+                            output_count,
+                            chunk_amount,
+                            expected_change,
+                            explicit_fee,
+                            breakdown,
+                        );
+                    }
+                    continue;
+                }
+
+                let one_output_breakdown = noid_chain::consensus::fee_breakdown(
+                    selected_inputs as u64,
+                    1,
+                    active_slot_count,
+                    log_slots,
+                );
+                let one_output_fee = one_output_breakdown.required_total.max(relay_floor);
+                if selected_value <= one_output_fee {
+                    continue;
+                }
+
+                if selected_value >= remaining {
+                    let two_output_breakdown = noid_chain::consensus::fee_breakdown(
+                        selected_inputs as u64,
+                        2,
+                        active_slot_count,
+                        log_slots,
+                    );
+                    let two_output_fee = two_output_breakdown.required_total.max(relay_floor);
+                    if selected_value > remaining.saturating_add(two_output_fee) {
+                        let expected_change = selected_value - remaining - two_output_fee;
+                        let shape = wallet_send_shape_for_counts(selected_inputs, 2)?;
+                        break (
+                            shape,
+                            2,
+                            remaining,
+                            expected_change,
+                            two_output_fee,
+                            two_output_breakdown,
+                        );
+                    }
+
+                    let no_change_fee = selected_value - remaining;
+                    if no_change_fee >= one_output_fee {
+                        let shape = wallet_send_shape_for_counts(selected_inputs, 1)?;
+                        break (
+                            shape,
+                            1,
+                            remaining,
+                            0u64,
+                            no_change_fee,
+                            one_output_breakdown,
+                        );
+                    }
+                }
+
+                if selected_inputs == TxShape::Sweep25x2.max_inputs() {
+                    let chunk_amount = selected_value - one_output_fee;
+                    let shape = wallet_send_shape_for_counts(selected_inputs, 1)?;
+                    break (
+                        shape,
+                        1,
+                        chunk_amount,
+                        0u64,
+                        one_output_fee,
+                        one_output_breakdown,
+                    );
+                }
+            };
+
+            let (shape, output_count, chunk_amount, expected_change, fee, breakdown) = planned;
+            if chunk_amount == 0 {
+                return Err(format!(
+                    "insufficient funds: need at least {} μNOID including fee, have {} μNOID spendable",
+                    amount_micronoid.saturating_add(fee),
+                    spendable
+                ));
+            }
+            let chunk_index = chunks.len();
+            chunks.push(WalletSendChunkPlan {
+                chunk_index,
+                amount_micronoid: chunk_amount,
+                shape: format!("{shape:?}"),
+                selected_input_count: selected_inputs,
+                output_count,
+                expected_change_micronoid: expected_change,
+                fee_micronoid: fee,
+                fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee),
+            });
+            cursor += selected_inputs;
+            remaining -= chunk_amount;
+        }
+
+        let total_fee_micronoid = chunks
+            .iter()
+            .map(|c| c.fee_micronoid)
+            .fold(0u64, |acc, f| acc.saturating_add(f));
+        Ok(WalletSendPlan {
+            amount_micronoid,
+            total_fee_micronoid,
+            total_spend_micronoid: amount_micronoid.saturating_add(total_fee_micronoid),
+            split_count: chunks.len(),
+            chunks,
+        })
     }
 
     fn build_send(
@@ -624,6 +870,43 @@ mod tests {
         let (selected, change) = wallet.select_utxos(amount, fee).expect("select UTXOs");
         assert_eq!(selected.len(), 5);
         assert_eq!(change, 49_981_499);
+    }
+
+    #[test]
+    fn shape_aware_plan_keeps_small_standard_fee_at_baseline() {
+        let (_dir, handle) = handle_with_utxos(&[100_000]);
+        let plan = handle.plan_send(50_000, None, 0, 24, 0).unwrap();
+        assert_eq!(plan.split_count, 1);
+        assert_eq!(plan.total_fee_micronoid, 9_000);
+        assert_eq!(plan.chunks[0].shape, "Standard4x8");
+        assert_eq!(plan.chunks[0].selected_input_count, 1);
+        assert_eq!(plan.chunks[0].output_count, 2);
+        assert_eq!(plan.chunks[0].fee_breakdown.burned, 2_500);
+    }
+
+    #[test]
+    fn shape_aware_plan_handles_no_change_boundary_without_oscillation() {
+        let (_dir, handle) = handle_with_utxos(&[100_000]);
+        let plan = handle.plan_send(91_000, None, 0, 24, 0).unwrap();
+        assert_eq!(plan.split_count, 1);
+        assert_eq!(plan.total_fee_micronoid, 9_000);
+        assert_eq!(plan.chunks[0].shape, "Standard4x8");
+        assert_eq!(plan.chunks[0].output_count, 1);
+        assert_eq!(plan.chunks[0].expected_change_micronoid, 0);
+        assert_eq!(plan.chunks[0].fee_breakdown.paid_total, 9_000);
+        assert_eq!(plan.chunks[0].fee_breakdown.relay_total, 5_800);
+    }
+
+    #[test]
+    fn shape_aware_plan_does_not_apply_sweep_worst_case_to_five_input_send() {
+        let (_dir, handle) = handle_with_utxos(&vec![50_000_000; 8]);
+        let plan = handle.plan_send(200_000_001, None, 0, 24, 0).unwrap();
+        assert_eq!(plan.split_count, 1);
+        assert_eq!(plan.chunks[0].shape, "Sweep25x2");
+        assert_eq!(plan.chunks[0].selected_input_count, 5);
+        assert_eq!(plan.chunks[0].output_count, 2);
+        assert_eq!(plan.chunks[0].fee_micronoid, 6_900);
+        assert_eq!(plan.chunks[0].fee_breakdown.state_growth, 0);
     }
 
     #[test]

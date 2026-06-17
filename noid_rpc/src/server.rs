@@ -22,9 +22,10 @@ use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
-    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, MempoolInfo, MempoolTxInfo,
-    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletHistoryEntry, WalletScanResult, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
+    MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo,
+    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
+    WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 use crate::wallet_ops::WalletOps;
 
@@ -44,6 +45,47 @@ fn node_entropy_nonce() -> u64 {
 fn mix_slot_hint_seed(tip_seed: u64, salt: u64) -> u64 {
     let mut s = tip_seed ^ salt ^ 0x9E37_79B9_7F4A_7C15;
     noid_chain::consensus::allocator::splitmix64(&mut s)
+}
+
+fn fee_breakdown_info(
+    breakdown: noid_chain::consensus::FeeBreakdown,
+    relay_floor: u64,
+    paid_total: u64,
+) -> FeeBreakdownInfo {
+    let relay_total = breakdown.required_total.max(relay_floor);
+    let paid_total = paid_total.max(relay_total);
+    FeeBreakdownInfo {
+        base: breakdown.base,
+        input: breakdown.input,
+        output: breakdown.output,
+        io: breakdown.io,
+        state_growth: breakdown.state_growth,
+        required_total: breakdown.required_total,
+        relay_floor,
+        relay_total,
+        paid_total,
+        burned: breakdown.burned,
+        miner_claimable: paid_total.saturating_sub(breakdown.burned),
+    }
+}
+
+fn estimate_shape_for_counts(
+    n_inputs: usize,
+    n_outputs: usize,
+) -> Result<noid_tx::TxShape, ErrorObject<'static>> {
+    if n_inputs <= noid_tx::TxShape::Standard4x8.max_inputs()
+        && n_outputs <= noid_tx::TxShape::Standard4x8.max_outputs()
+    {
+        Ok(noid_tx::TxShape::Standard4x8)
+    } else if n_inputs <= noid_tx::TxShape::Sweep25x2.max_inputs()
+        && n_outputs <= noid_tx::TxShape::Sweep25x2.max_outputs()
+    {
+        Ok(noid_tx::TxShape::Sweep25x2)
+    } else {
+        Err(rpc_err(format!(
+            "no supported tx shape for {n_inputs} input(s) and {n_outputs} output(s)"
+        )))
+    }
 }
 
 fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
@@ -528,10 +570,38 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.fee_floor().await;
         Ok(
             noid_chain::consensus::fee_breakdown(1, n_outputs as u64, active_slot_count, log_slots)
-                .required_total,
+                .required_total
+                .max(floor),
         )
+    }
+
+    async fn estimate_fee_detailed(&self, n_inputs: u32, n_outputs: u32) -> RpcResult<FeeEstimate> {
+        let n_inputs = n_inputs as usize;
+        let n_outputs = n_outputs as usize;
+        let shape = estimate_shape_for_counts(n_inputs, n_outputs)?;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.fee_floor().await;
+        let breakdown = noid_chain::consensus::fee_breakdown(
+            n_inputs as u64,
+            n_outputs as u64,
+            active_slot_count,
+            log_slots,
+        );
+        let relay_total = breakdown.required_total.max(floor);
+        let info = fee_breakdown_info(breakdown, floor, relay_total);
+        Ok(FeeEstimate {
+            shape: format!("{shape:?}"),
+            n_inputs,
+            n_outputs,
+            net_new_slots: (n_outputs as u64).saturating_sub(n_inputs as u64),
+            active_slot_count,
+            log_slots,
+            fee_micronoid: info.relay_total,
+            breakdown: info,
+        })
     }
 
     async fn validate_address(&self, address: String) -> RpcResult<AddressInfo> {
@@ -830,43 +900,63 @@ impl ParanoidApiServer for RpcHandler {
         Ok(self.wallet.scan_state(&chain.state.state, height))
     }
 
+    async fn wallet_plan_send(
+        &self,
+        to_hex: String,
+        amount_micronoid: u64,
+        fee_micronoid: u64,
+    ) -> RpcResult<WalletSendPlan> {
+        let _to_address = parse_address_hex(&to_hex)?.0;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.fee_floor().await;
+        self.wallet
+            .plan_send(
+                amount_micronoid,
+                if fee_micronoid == 0 {
+                    None
+                } else {
+                    Some(fee_micronoid)
+                },
+                active_slot_count,
+                log_slots,
+                floor,
+            )
+            .map_err(rpc_err)
+    }
+
     async fn wallet_send(
         &self,
         to_hex: String,
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
-        // Auto-fee: until Phase I lands a shape-aware estimate API, use a
-        // conservative per-tx upper bound that is valid for either Standard4x8
-        // or Sweep25x2. Auto-split treats this as a per-transaction fee.
-        let effective_fee = if fee_micronoid == 0 {
-            let floor = self.mempool.fee_floor().await;
-            let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-            let standard_fee =
-                noid_chain::consensus::fee_breakdown(1, 2, active_slot_count, log_slots)
-                    .required_total;
-            let sweep_fee =
-                noid_chain::consensus::fee_breakdown(25, 2, active_slot_count, log_slots)
-                    .required_total;
-            standard_fee.max(sweep_fee).max(floor)
-        } else {
-            fee_micronoid
-        };
-
         // 1. Parse recipient address.
         let to_address = parse_address_hex(&to_hex)?.0;
 
-        // Plan the logical payment before proving. If more than Sweep25x2 can
-        // carry, this returns multiple independent chunks.
-        let chunks = self
+        // Plan the logical payment before proving. Automatic fees are computed
+        // per actual planned chunk from live input/output counts; no tx pays a
+        // Sweep25x2 worst-case fee unless it really uses those resources.
+        let (fee_active_slot_count, fee_log_slots) = self.mempool.fee_context().await;
+        let fee_floor = self.mempool.fee_floor().await;
+        let plan = self
             .wallet
-            .plan_send_splits(amount_micronoid, effective_fee)
-            .map_err(rpc_err)?;
-        if chunks.len() > 1 {
-            tracing::info!(
-                chunks = chunks.len(),
+            .plan_send(
                 amount_micronoid,
-                fee_per_tx = effective_fee,
+                if fee_micronoid == 0 {
+                    None
+                } else {
+                    Some(fee_micronoid)
+                },
+                fee_active_slot_count,
+                fee_log_slots,
+                fee_floor,
+            )
+            .map_err(rpc_err)?;
+        if plan.split_count > 1 {
+            tracing::info!(
+                chunks = plan.split_count,
+                amount_micronoid,
+                total_fee_micronoid = plan.total_fee_micronoid,
                 "wallet_send auto-splitting fragmented payment"
             );
         }
@@ -878,12 +968,17 @@ impl ParanoidApiServer for RpcHandler {
             .unwrap_or_default()
             .subsec_nanos() as u64;
 
-        let mut tx_hashes = Vec::with_capacity(chunks.len());
-        let mut tx_shapes = Vec::with_capacity(chunks.len());
-        let mut tx_input_counts = Vec::with_capacity(chunks.len());
-        let mut tx_output_counts = Vec::with_capacity(chunks.len());
+        let mut tx_hashes = Vec::with_capacity(plan.chunks.len());
+        let mut tx_shapes = Vec::with_capacity(plan.chunks.len());
+        let mut tx_input_counts = Vec::with_capacity(plan.chunks.len());
+        let mut tx_output_counts = Vec::with_capacity(plan.chunks.len());
+        let mut tx_fees_micronoid = Vec::with_capacity(plan.chunks.len());
+        let mut tx_fee_breakdowns = Vec::with_capacity(plan.chunks.len());
 
-        for (chunk_idx, chunk_amount) in chunks.iter().copied().enumerate() {
+        for chunk in plan.chunks.iter() {
+            let chunk_idx = chunk.chunk_index;
+            let chunk_amount = chunk.amount_micronoid;
+            let chunk_fee = chunk.fee_micronoid;
             // Retry loop: slots can be claimed between prove_tx and mempool
             // admission. Retry each chunk with fresh hints.
             let mut last_err = String::new();
@@ -948,7 +1043,7 @@ impl ParanoidApiServer for RpcHandler {
                     wallet.build_send(
                         to_address,
                         chunk_amount,
-                        effective_fee,
+                        chunk_fee,
                         epoch_anchor,
                         slot_hints,
                         log_slots,
@@ -968,6 +1063,16 @@ impl ParanoidApiServer for RpcHandler {
                 let tx_shape = format!("{:?}", intent.tx_body.shape);
                 let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
                 let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
+                let tx_fee = intent.tx_body.fee.min(u64::MAX as u128) as u64;
+                let tx_fee_breakdown = fee_breakdown_info(
+                    noid_chain::consensus::fee_breakdown_for_tx_body(
+                        &intent.tx_body,
+                        fee_active_slot_count,
+                        fee_log_slots,
+                    ),
+                    fee_floor,
+                    tx_fee,
+                );
                 let failed_tx_hash = intent.tx_body_hash.0;
                 let output_slots: Vec<u32> = intent
                     .tx_body
@@ -991,6 +1096,8 @@ impl ParanoidApiServer for RpcHandler {
                         tx_shapes.push(tx_shape);
                         tx_input_counts.push(tx_input_count);
                         tx_output_counts.push(tx_output_count);
+                        tx_fees_micronoid.push(tx_fee);
+                        tx_fee_breakdowns.push(tx_fee_breakdown);
                         submitted = true;
                         break;
                     }
@@ -1022,15 +1129,21 @@ impl ParanoidApiServer for RpcHandler {
         } else {
             None
         };
+        let total_fee = tx_fees_micronoid
+            .iter()
+            .copied()
+            .fold(0u64, |acc, fee| acc.saturating_add(fee));
         Ok(WalletSendResult {
             tx_hash: primary,
-            fee_micronoid: effective_fee.saturating_mul(tx_hashes.len() as u64),
+            fee_micronoid: total_fee,
             tx_hashes,
             split_count,
             shape: primary_shape,
             tx_shapes,
             tx_input_counts,
             tx_output_counts,
+            tx_fees_micronoid,
+            tx_fee_breakdowns,
         })
     }
 
@@ -1051,22 +1164,22 @@ impl ParanoidApiServer for RpcHandler {
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
         // Consolidation produces exactly 1 output (to self). Auto-fee uses the
         // actual number of inputs the next consolidation round will select, capped
-        // at Sweep25x2 capacity, instead of the old Standard4x8 bound.
+        // at Sweep25x2 capacity, and has no shape premium/state-growth burn.
+        let (fee_active_slot_count, fee_log_slots) = self.mempool.fee_context().await;
+        let fee_floor = self.mempool.fee_floor().await;
         let effective_fee = if fee_micronoid == 0 {
             let planned_inputs = self
                 .wallet
                 .plan_consolidate_input_count()
                 .map_err(rpc_err)?;
-            let floor = self.mempool.fee_floor().await;
-            let (active_slot_count, log_slots) = self.mempool.fee_context().await;
             noid_chain::consensus::fee_breakdown(
                 planned_inputs as u64,
                 1,
-                active_slot_count,
-                log_slots,
+                fee_active_slot_count,
+                fee_log_slots,
             )
             .required_total
-            .max(floor)
+            .max(fee_floor)
         } else {
             fee_micronoid
         };
@@ -1139,6 +1252,16 @@ impl ParanoidApiServer for RpcHandler {
             let tx_shape = format!("{:?}", intent.tx_body.shape);
             let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
             let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
+            let tx_fee = intent.tx_body.fee.min(u64::MAX as u128) as u64;
+            let tx_fee_breakdown = fee_breakdown_info(
+                noid_chain::consensus::fee_breakdown_for_tx_body(
+                    &intent.tx_body,
+                    fee_active_slot_count,
+                    fee_log_slots,
+                ),
+                fee_floor,
+                tx_fee,
+            );
             let failed_tx_hash = intent.tx_body_hash.0;
             let output_slots: Vec<u32> = intent
                 .tx_body
@@ -1165,6 +1288,8 @@ impl ParanoidApiServer for RpcHandler {
                         tx_shapes: vec![tx_shape],
                         tx_input_counts: vec![tx_input_count],
                         tx_output_counts: vec![tx_output_count],
+                        tx_fees_micronoid: vec![tx_fee],
+                        tx_fee_breakdowns: vec![tx_fee_breakdown],
                     });
                 }
                 Err(e) => {

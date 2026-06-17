@@ -143,6 +143,71 @@ pub struct WalletScanResult {
     pub next_index: u32,
 }
 
+/// Detailed deterministic fee calculation exposed over RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeBreakdownInfo {
+    /// Fixed per-transaction anti-DoS component.
+    pub base: u64,
+    /// Small anti-DoS/prover-work component for live inputs.
+    pub input: u64,
+    /// Output component for created live UTXOs.
+    pub output: u64,
+    /// Aggregate input + output component.
+    pub io: u64,
+    /// Burned state-growth component for net-new live slots.
+    pub state_growth: u64,
+    /// Consensus-required minimum before relay floor.
+    pub required_total: u64,
+    /// Current relay/mempool floor applied by this node.
+    pub relay_floor: u64,
+    /// Required amount accepted by this node: max(required_total, relay_floor).
+    pub relay_total: u64,
+    /// Actual fee this estimate/transaction pays. For estimates this equals
+    /// `relay_total`; for no-change wallet transactions it can be higher and
+    /// the excess is a miner tip.
+    pub paid_total: u64,
+    /// Portion burned by consensus.
+    pub burned: u64,
+    /// Miner-claimable portion at `paid_total`.
+    pub miner_claimable: u64,
+}
+
+/// Shape-aware fee estimate for explicit live input/output counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeEstimate {
+    pub shape: String,
+    pub n_inputs: usize,
+    pub n_outputs: usize,
+    pub net_new_slots: u64,
+    pub active_slot_count: u64,
+    pub log_slots: u32,
+    pub fee_micronoid: u64,
+    pub breakdown: FeeBreakdownInfo,
+}
+
+/// One planned transaction in a logical wallet send.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletSendChunkPlan {
+    pub chunk_index: usize,
+    pub amount_micronoid: u64,
+    pub shape: String,
+    pub selected_input_count: usize,
+    pub output_count: usize,
+    pub expected_change_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub fee_breakdown: FeeBreakdownInfo,
+}
+
+/// Dry-run plan for a logical wallet send.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletSendPlan {
+    pub amount_micronoid: u64,
+    pub total_fee_micronoid: u64,
+    pub total_spend_micronoid: u64,
+    pub split_count: usize,
+    pub chunks: Vec<WalletSendChunkPlan>,
+}
+
 /// Result of a send operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
@@ -170,6 +235,12 @@ pub struct WalletSendResult {
     /// Live output count per submitted transaction, index-aligned with `tx_hashes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_output_counts: Vec<usize>,
+    /// Fee per submitted transaction, index-aligned with `tx_hashes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_fees_micronoid: Vec<u64>,
+    /// Fee breakdown per submitted transaction, index-aligned with `tx_hashes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_fee_breakdowns: Vec<FeeBreakdownInfo>,
 }
 
 /// Decoded block header (structured, not raw bytes).

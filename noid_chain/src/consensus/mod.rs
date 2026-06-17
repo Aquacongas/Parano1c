@@ -73,7 +73,9 @@ pub use mempool_checks::validate_tx_for_mempool;
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use params::*;
-pub use params::{min_fee, FEE_PER_IO, FEE_PER_OUTPUT, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE};
+pub use params::{
+    min_fee, FEE_PER_INPUT, FEE_PER_IO, FEE_PER_OUTPUT, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
+};
 pub use pow::{full_block_hash, header_core_bytes, search_pow, validate_pow, BlockHash};
 pub use receipt::{
     generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ParanoidReceipt,

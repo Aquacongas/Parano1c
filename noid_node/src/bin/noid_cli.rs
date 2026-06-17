@@ -196,12 +196,15 @@ enum Command {
     /// Number of connected peers.
     Peers,
 
-    /// Estimate minimum relay fee for N outputs.
+    /// Estimate minimum relay fee for live inputs/outputs.
     #[command(name = "estimate-fee")]
     EstimateFee {
         /// Number of outputs in the transaction (default: 2).
         #[arg(default_value_t = 2)]
         n_outputs: u32,
+        /// Number of live inputs in the transaction (default: 1).
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        inputs: u32,
     },
 
     /// Validate an address and show its canonical bech32m form.
@@ -269,6 +272,9 @@ enum Command {
         /// Transaction fee in NOID. Omit for automatic minimum fee.
         #[arg(long, value_name = "FEE_NOID")]
         fee: Option<String>,
+        /// Show the wallet's planned chunks/fees without proving or submitting.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Transaction history: received and sent transactions.
@@ -401,7 +407,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::State => cmd_state(&ctx).await,
         Command::Mining => cmd_mining(&ctx).await,
         Command::Peers => cmd_peers(&ctx).await,
-        Command::EstimateFee { n_outputs } => cmd_estimate_fee(&ctx, *n_outputs).await,
+        Command::EstimateFee { n_outputs, inputs } => {
+            cmd_estimate_fee(&ctx, *inputs, *n_outputs).await
+        }
         Command::Validate { address } => cmd_validate(&ctx, address).await,
         Command::Epoch => cmd_epoch(&ctx).await,
         Command::Mempool => cmd_mempool(&ctx).await,
@@ -409,7 +417,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Address { new, list, index } => cmd_address(&ctx, *new, *list, *index).await,
         Command::Balance => cmd_balance(&ctx).await,
         Command::Utxos => cmd_utxos(&ctx).await,
-        Command::Send { to, amount, fee } => cmd_send(&ctx, to, amount, fee.as_deref()).await,
+        Command::Send {
+            to,
+            amount,
+            fee,
+            dry_run,
+        } => cmd_send(&ctx, to, amount, fee.as_deref(), *dry_run).await,
         Command::History { address, last } => cmd_history(&ctx, address.as_deref(), *last).await,
         Command::Scan => cmd_scan(&ctx).await,
         Command::Consolidate { fee, rounds } => {
@@ -971,28 +984,53 @@ async fn cmd_peers(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_outputs: u32) -> anyhow::Result<()> {
-    let result = rpc(ctx, "estimateFee", &[n_outputs.into()])
-        .await
-        .context("estimateFee")?;
+async fn cmd_estimate_fee(ctx: &Ctx<'_>, n_inputs: u32, n_outputs: u32) -> anyhow::Result<()> {
+    let result = rpc(
+        ctx,
+        "estimateFeeDetailed",
+        &[n_inputs.into(), n_outputs.into()],
+    )
+    .await
+    .context("estimateFeeDetailed")?;
     if ctx.json {
         return print_json(&result);
     }
-    let fee_micro = result.as_u64().unwrap_or(0);
-    section(&format!("Fee estimate ({n_outputs} outputs)"));
+    let fee_micro = result["fee_micronoid"].as_u64().unwrap_or(0);
+    let shape = result["shape"].as_str().unwrap_or("?");
+    let b = &result["breakdown"];
+    section(&format!(
+        "Fee estimate ({n_inputs} input(s), {n_outputs} output(s))"
+    ));
+    kv("Shape", shape);
     kv2(
-        "Min fee",
+        "Min relay fee",
         &format!("{} NOID", noid_str(fee_micro)),
-        &format!("({fee_micro} \u{03bc}NOID)"),
+        &format!("({fee_micro} μNOID)"),
+    );
+    kv(
+        "Base",
+        &format!("{} μNOID", b["base"].as_u64().unwrap_or(0)),
+    );
+    kv(
+        "Inputs",
+        &format!("{} μNOID", b["input"].as_u64().unwrap_or(0)),
+    );
+    kv(
+        "Outputs",
+        &format!("{} μNOID", b["output"].as_u64().unwrap_or(0)),
+    );
+    kv(
+        "State growth burned",
+        &format!("{} μNOID", b["state_growth"].as_u64().unwrap_or(0)),
+    );
+    kv(
+        "Miner claimable",
+        &format!("{} μNOID", b["miner_claimable"].as_u64().unwrap_or(0)),
     );
     println!();
     println!(
-        "  {} base(5000) + io(500)×(inputs+outputs) + growth(2500×pressure)×net_new",
+        "  {} output-centric: base + small input anti-DoS + output fee + burned net-new-state fee",
         c!(DIM, "Formula:")
-    );
-    println!(
-        "  {} estimate assumes inputs=1; state-growth fee is burned",
-        c!(DIM, "Note:")
     );
     Ok(())
 }
@@ -1424,7 +1462,13 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> anyhow::Result<()> {
+async fn cmd_send(
+    ctx: &Ctx<'_>,
+    to: &str,
+    amount: &str,
+    fee: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     // --- Parse and validate inputs ---
     let amount_micro =
         parse_noid_amount(amount).with_context(|| format!("invalid amount {amount:?}"))?;
@@ -1466,6 +1510,62 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
         );
     }
 
+    if dry_run {
+        let result = rpc(
+            ctx,
+            "walletPlanSend",
+            &[to_clean.into(), amount_micro.into(), fee_micro.into()],
+        )
+        .await
+        .context("walletPlanSend")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        section("Wallet send plan");
+        kv("To", to_clean);
+        kv2(
+            "Amount",
+            &format!("{} NOID", noid_str(amount_micro)),
+            &format!("({amount_micro} μNOID)"),
+        );
+        let total_fee = result["total_fee_micronoid"].as_u64().unwrap_or(0);
+        kv2(
+            "Total fee",
+            &format!("{} NOID", noid_str(total_fee)),
+            &format!(
+                "({total_fee} μNOID){}",
+                if fee.is_none() { " auto" } else { "" }
+            ),
+        );
+        kv(
+            "Transactions",
+            &result["split_count"].as_u64().unwrap_or(0).to_string(),
+        );
+        if let Some(chunks) = result["chunks"].as_array() {
+            for chunk in chunks {
+                let idx = chunk["chunk_index"].as_u64().unwrap_or(0) + 1;
+                let shape = chunk["shape"].as_str().unwrap_or("?");
+                let inputs = chunk["selected_input_count"].as_u64().unwrap_or(0);
+                let outputs = chunk["output_count"].as_u64().unwrap_or(0);
+                let amount = chunk["amount_micronoid"].as_u64().unwrap_or(0);
+                let fee = chunk["fee_micronoid"].as_u64().unwrap_or(0);
+                let change = chunk["expected_change_micronoid"].as_u64().unwrap_or(0);
+                println!(
+                    "  TX #{idx}: {shape}  inputs={inputs} outputs={outputs} amount={} NOID fee={} NOID change={} NOID",
+                    noid_str(amount),
+                    noid_str(fee),
+                    noid_str(change),
+                );
+            }
+        }
+        println!();
+        println!(
+            "  {} Dry run only; no proof was generated and nothing was submitted.",
+            c!(DIM, "Note:")
+        );
+        return Ok(());
+    }
+
     // --- Confirm interactively for large amounts ---
     if amount_micro >= 1_000_000_000 /* 1000 NOID */ && is_tty() {
         print!(
@@ -1503,6 +1603,10 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
             let split_count = r["split_count"].as_u64().unwrap_or(1);
             let shape = r["shape"].as_str().unwrap_or("?");
             let tx_shapes = r["tx_shapes"].as_array().cloned().unwrap_or_default();
+            let tx_fees = r["tx_fees_micronoid"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
             let auto_tag = if fee.is_none() { " (auto)" } else { "" };
 
@@ -1527,15 +1631,25 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
                 &format!("{} NOID", noid_str(actual_fee)),
                 &format!("({actual_fee} μNOID){auto_tag}"),
             );
+            if let Some(b) = r["tx_fee_breakdowns"].as_array().and_then(|v| v.first()) {
+                let burned = b["burned"].as_u64().unwrap_or(0);
+                let claimable = b["miner_claimable"].as_u64().unwrap_or(0);
+                kv(
+                    "Fee split",
+                    &format!("burned {burned} μNOID, miner claimable {claimable} μNOID"),
+                );
+            }
             if split_count > 1 {
                 kv("Primary TX", &ctx.h(tx_hash));
                 for (i, h) in tx_hashes.iter().enumerate() {
                     if let Some(hs) = h.as_str() {
-                        let label = tx_shapes
-                            .get(i)
-                            .and_then(|s| s.as_str())
-                            .map(|s| format!("TX #{} ({s})", i + 1))
-                            .unwrap_or_else(|| format!("TX #{}", i + 1));
+                        let shape = tx_shapes.get(i).and_then(|s| s.as_str()).unwrap_or("?");
+                        let fee = tx_fees.get(i).and_then(|f| f.as_u64()).unwrap_or(0);
+                        let label = if shape == "?" {
+                            format!("TX #{}", i + 1)
+                        } else {
+                            format!("TX #{} ({shape}, fee {} NOID)", i + 1, noid_str(fee))
+                        };
                         kv(&label, &ctx.h(hs));
                     }
                 }
@@ -1818,6 +1932,11 @@ async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyho
                     noid_str(actual_fee),
                     if fee.is_none() { " auto" } else { "" }
                 );
+                if let Some(b) = r["tx_fee_breakdowns"].as_array().and_then(|v| v.first()) {
+                    let burned = b["burned"].as_u64().unwrap_or(0);
+                    let claimable = b["miner_claimable"].as_u64().unwrap_or(0);
+                    println!("  Burned: {burned} μNOID  Miner claimable: {claimable} μNOID");
+                }
 
                 // Wait for confirmation
                 eprint!("  Waiting for confirmation");

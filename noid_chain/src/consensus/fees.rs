@@ -5,7 +5,8 @@
 //!
 //! Fees are charged for:
 //! - a base anti-DoS component per transaction;
-//! - an I/O component for each live input/output touched by the proof;
+//! - a small input component for anti-DoS/prover work;
+//! - an output component for created UTXOs;
 //! - a state-growth component for `max(0, outputs - inputs)` net-new UTXO slots.
 //!
 //! The state-growth component scales with current occupancy and is burned by
@@ -14,7 +15,7 @@
 use noid_tx::TxBody;
 
 use crate::consensus::params::{
-    FEE_PER_IO, LOG_SLOTS_GENESIS, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
+    FEE_PER_INPUT, FEE_PER_OUTPUT, LOG_SLOTS_GENESIS, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
 };
 
 /// Occupancy pressure thresholds in basis points.
@@ -27,7 +28,11 @@ pub const PRESSURE_EXTREME_BPS: u64 = 9_000; // 90%
 pub struct FeeBreakdown {
     /// Fixed per-tx anti-DoS component.
     pub base: u64,
-    /// Fee for live inputs + live outputs.
+    /// Fee for live inputs.
+    pub input: u64,
+    /// Fee for live outputs.
+    pub output: u64,
+    /// Fee for live inputs + live outputs, kept as a convenient aggregate.
     pub io: u64,
     /// Fee for net-new live UTXO slots. Burned by consensus.
     pub state_growth: u64,
@@ -81,23 +86,32 @@ pub fn state_growth_fee_per_slot(active_slot_count: u64, log_slots: u32) -> u64 
 }
 
 /// Compute the deterministic required fee for an arbitrary tx shape.
+///
+/// The formula is intentionally output-centric: inputs pay a small anti-DoS
+/// component, outputs pay the larger ordinary I/O component, and only net-new
+/// state growth is burned. There is no shape premium; a `Sweep25x2` transaction
+/// pays for its actual live inputs/outputs and is naturally cheap when it
+/// consolidates or otherwise reduces live slot count.
 pub fn fee_breakdown(
     n_inputs: u64,
     n_outputs: u64,
     active_slot_count: u64,
     log_slots: u32,
 ) -> FeeBreakdown {
-    let io_count = n_inputs.saturating_add(n_outputs);
     let net_new_slots = n_outputs.saturating_sub(n_inputs);
 
     let base = MIN_FEE_BASE;
-    let io = FEE_PER_IO.saturating_mul(io_count);
+    let input = FEE_PER_INPUT.saturating_mul(n_inputs);
+    let output = FEE_PER_OUTPUT.saturating_mul(n_outputs);
+    let io = input.saturating_add(output);
     let state_growth =
         state_growth_fee_per_slot(active_slot_count, log_slots).saturating_mul(net_new_slots);
     let required_total = base.saturating_add(io).saturating_add(state_growth);
 
     FeeBreakdown {
         base,
+        input,
+        output,
         io,
         state_growth,
         required_total,
@@ -192,6 +206,9 @@ mod tests {
     #[test]
     fn low_pressure_standard_send_matches_old_baseline() {
         let b = fee_breakdown(1, 2, 0, LOG_SLOTS_GENESIS);
+        assert_eq!(b.input, 100);
+        assert_eq!(b.output, 1_400);
+        assert_eq!(b.io, 1_500);
         assert_eq!(b.required_total, 9_000);
         assert_eq!(b.burned, 2_500);
         assert_eq!(b.claimable_at_minimum(), 6_500);
@@ -202,7 +219,17 @@ mod tests {
         let b = fee_breakdown(4, 1, 0, LOG_SLOTS_GENESIS);
         assert_eq!(b.state_growth, 0);
         assert_eq!(b.burned, 0);
-        assert_eq!(b.required_total, 7_500);
+        assert_eq!(b.required_total, 6_100);
+    }
+
+    #[test]
+    fn sweep_pays_actual_io_without_shape_premium() {
+        let payment = fee_breakdown(25, 2, 0, LOG_SLOTS_GENESIS);
+        let consolidation = fee_breakdown(25, 1, 0, LOG_SLOTS_GENESIS);
+        assert_eq!(payment.state_growth, 0);
+        assert_eq!(consolidation.state_growth, 0);
+        assert_eq!(payment.required_total, 8_900);
+        assert_eq!(consolidation.required_total, 8_200);
     }
 
     #[test]

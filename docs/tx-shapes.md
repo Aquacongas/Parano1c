@@ -8,7 +8,7 @@ Paranoid transactions are fixed-shape proof objects. A transaction carries an ex
 
 `Sweep25x2` has wallet proof generation, mempool admission, miner selection, bucketized block inclusion, and recursive replay support. The wallet can build a real sweep proof bundle, mempool verifies it by shape, malformed/wrong-shape sweep bundles are rejected, and block proofs carry a real sweep bucket aggregation transcript.
 
-The remaining gaps are multi-node/snapshot hardening and final parameterization, not basic block inclusion: the single-node Sweep25x2 + split-send live scenario passes, multi-node scenarios still need final exercise, and final shape-aware fee policy should be derived from benchmark data.
+The remaining gaps are external miner/template hardening and continuing UX/observability polish, not basic block inclusion: restart and reorg paths are covered, and fee policy is now shape-aware without charging a separate `Sweep25x2` premium.
 
 ## Shapes
 
@@ -32,6 +32,23 @@ noid-cli send noid1... 1000
 ```
 
 The wallet decides whether that logical payment is one standard transaction, one sweep transaction, or several chunks.
+
+## Fee policy
+
+Fees are deterministic and output-centric:
+
+```text
+required_fee = base
+             + input_fee  * live_inputs
+             + output_fee * live_outputs
+             + state_growth_fee(active occupancy) * max(0, live_outputs - live_inputs)
+```
+
+The state-growth component is burned. Miners may claim `fee - burned`, including any user tip above the minimum.
+
+There is no shape premium for `Sweep25x2`. A sweep pays for actual live inputs and outputs only. This keeps consolidation and fragmented-wallet cleanup cheap when they reduce live slot count, while the small input fee and mempool resource-weight ordering keep large-input spam from being free.
+
+`walletSend` computes automatic fees per actual planned chunk. Split sends report per-chunk fee and total fee. `walletConsolidate` computes its fee from the selected consolidation input count and one output.
 
 ## Sweep25x2 implementation notes
 

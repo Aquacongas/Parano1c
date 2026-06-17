@@ -9,8 +9,8 @@
 use noid_chain::segmented_state::SegmentedFriState;
 
 use crate::types::{
-    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletStatus,
-    WalletUtxoInfo,
+    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
+    WalletStatus, WalletUtxoInfo,
 };
 
 pub trait WalletOps: Send + Sync {
@@ -37,14 +37,28 @@ pub trait WalletOps: Send + Sync {
     /// `state` is the current chain state (read under chain lock by caller).
     fn scan_state(&self, state: &SegmentedFriState, height: u64) -> WalletScanResult;
 
-    /// Plan one logical payment as one or more transaction amounts.
-    /// The returned amounts sum to `amount_micronoid`; each chunk is intended
-    /// to fit the largest wallet-supported shape (`Sweep25x2`) and one fee.
+    /// Plan one logical payment as one or more transaction amounts using a fixed
+    /// per-tx fee. Kept for legacy tests and simple callers.
     fn plan_send_splits(
         &self,
         amount_micronoid: u64,
         fee_per_tx_micronoid: u64,
     ) -> Result<Vec<u64>, String>;
+
+    /// Shape-aware dry-run plan for one logical payment.
+    ///
+    /// `explicit_fee_micronoid = Some(fee)` applies that fee to every planned tx
+    /// and rejects it if below the deterministic minimum for the resulting shape.
+    /// `None` computes automatic per-chunk relay fee from actual planned
+    /// input/output counts.
+    fn plan_send(
+        &self,
+        amount_micronoid: u64,
+        explicit_fee_micronoid: Option<u64>,
+        active_slot_count: u64,
+        log_slots: u32,
+        relay_floor: u64,
+    ) -> Result<WalletSendPlan, String>;
 
     /// Build, prove, and serialize a send transaction.
     ///
