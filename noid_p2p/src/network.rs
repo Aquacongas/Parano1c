@@ -1145,12 +1145,10 @@ async fn handle_swarm_event(
                     decoded.push(hdr);
                 }
             }
-            if !decoded.is_empty() {
-                let _ = event_tx.send(NetworkEvent::HeadersBatch {
-                    from: peer,
-                    headers: decoded,
-                });
-            }
+            let _ = event_tx.send(NetworkEvent::HeadersBatch {
+                from: peer,
+                headers: decoded,
+            });
         }
 
         // --- Request-Response: headers server side ---

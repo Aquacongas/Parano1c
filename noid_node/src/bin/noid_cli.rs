@@ -298,6 +298,9 @@ enum Command {
         /// Fee per consolidation transaction in NOID. Omit for auto.
         #[arg(long, value_name = "FEE_NOID")]
         fee: Option<String>,
+        /// Show the next consolidation round plan without proving or submitting.
+        #[arg(long)]
+        dry_run: bool,
         /// Maximum consolidation rounds (each round = one TX).
         #[arg(long, default_value_t = 100, value_name = "N")]
         rounds: u32,
@@ -425,9 +428,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => cmd_send(&ctx, to, amount, fee.as_deref(), *dry_run).await,
         Command::History { address, last } => cmd_history(&ctx, address.as_deref(), *last).await,
         Command::Scan => cmd_scan(&ctx).await,
-        Command::Consolidate { fee, rounds } => {
-            cmd_consolidate(&ctx, fee.as_deref(), *rounds).await
-        }
+        Command::Consolidate {
+            fee,
+            dry_run,
+            rounds,
+        } => cmd_consolidate(&ctx, fee.as_deref(), *dry_run, *rounds).await,
         Command::Receipt { txhash } => cmd_receipt(&ctx, txhash).await,
         Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
         Command::Stop => cmd_stop(&ctx).await,
@@ -1076,6 +1081,7 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
         &format!("{} NOID", noid_str(fee)),
         &format!("({fee} \u{03bc}NOID)"),
     );
+    kv("Shape", result["shape"].as_str().unwrap_or("?"));
     kv(
         "Inputs",
         &result["n_inputs"].as_u64().unwrap_or(0).to_string(),
@@ -1149,23 +1155,24 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     println!();
-    separator(90);
+    separator(104);
     if is_tty() {
         println!(
-            "  {}{:<20}  {:>12}  {:>3}→{:<3}  {}{}",
-            BOLD, "tx hash", "fee (μNOID)", "in", "out", "ZK", RST
+            "  {}{:<20}  {:<12}  {:>12}  {:>3}→{:<3}  {}{}",
+            BOLD, "tx hash", "shape", "fee (μNOID)", "in", "out", "ZK", RST
         );
     } else {
         println!(
-            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
-            "tx hash", "fee (μNOID)", "in", "out", "ZK"
+            "  {:<20}  {:<12}  {:>12}  {:>3}→{:<3}  {}",
+            "tx hash", "shape", "fee (μNOID)", "in", "out", "ZK"
         );
     }
-    separator(90);
+    separator(104);
 
     let show = txs.len().min(20);
     for tx in txs.iter().take(show) {
         let hash = tx["tx_hash"].as_str().unwrap_or("?");
+        let shape = tx["shape"].as_str().unwrap_or("?");
         let fee = tx["fee_micronoid"].as_u64().unwrap_or(0);
         let nin = tx["n_inputs"].as_u64().unwrap_or(0);
         let nout = tx["n_outputs"].as_u64().unwrap_or(0);
@@ -1175,8 +1182,9 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             c!(DIM, "·")
         };
         println!(
-            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
+            "  {:<20}  {:<12}  {:>12}  {:>3}→{:<3}  {}",
             ctx.h(hash),
+            shape,
             fee,
             nin,
             nout,
@@ -1670,11 +1678,25 @@ async fn cmd_send(
                      \t  Run 'noid-cli balance' to check your current balance.",
                     noid_str(amount_micro)
                 )
+            } else if msg.contains("already submitted chunks") {
+                format!(
+                    "Partial split payment submitted, but a later chunk failed.\n\
+                     \tSome transaction hashes are already in the mempool; do not retry blindly.\n\
+                     \tRun 'noid-cli mempool' and 'noid-cli balance' after the next block.\n\
+                     \tDetails: {msg}"
+                )
             } else if msg.contains("no UTXO") || msg.contains("no utxo") {
                 "No UTXOs available. Run 'noid-cli scan' to discover your coins.".into()
+            } else if msg.contains("no empty slot hints") {
+                "No empty output slots are currently available. This is usually transient; wait for the next block and retry."
+                    .into()
             } else if msg.contains("output slot") || msg.contains("SlotConflict") {
                 "Slot conflict: the output slot is occupied. This is transient — retry in a moment."
                     .into()
+            } else if msg.contains("BelowMinFee") {
+                format!("Fee is below the current network minimum. Retry without --fee for automatic fee selection.\n\tDetails: {msg}")
+            } else if msg.contains("proof") || msg.contains("prove") || msg.contains("task:") {
+                format!("Proof generation failed. Retry once; if it repeats, save the logs and report it.\n\tDetails: {msg}")
             } else {
                 msg
             };
@@ -1873,11 +1895,48 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyhow::Result<()> {
+async fn cmd_consolidate(
+    ctx: &Ctx<'_>,
+    fee: Option<&str>,
+    dry_run: bool,
+    rounds: u32,
+) -> anyhow::Result<()> {
     let fee_micro = match fee {
         Some(f) => parse_noid_amount(f).with_context(|| format!("invalid fee {f:?}"))?,
         None => 0,
     };
+
+    if dry_run {
+        let result = rpc(ctx, "walletPlanConsolidate", &[fee_micro.into()])
+            .await
+            .context("walletPlanConsolidate")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let fee_actual = result["fee_micronoid"].as_u64().unwrap_or(fee_micro);
+        let selected = result["selected_input_count"].as_u64().unwrap_or(0);
+        let outputs = result["output_count"].as_u64().unwrap_or(1);
+        let reduction = result["expected_utxo_reduction"].as_u64().unwrap_or(0);
+        section("Wallet consolidate plan");
+        kv("Shape", result["shape"].as_str().unwrap_or("?"));
+        kv("Selected inputs", &selected.to_string());
+        kv("Outputs", &outputs.to_string());
+        kv("Expected UTXO reduction", &format!("-{reduction}"));
+        kv2(
+            "Fee",
+            &format!("{} NOID", noid_str(fee_actual)),
+            &format!(
+                "({fee_actual} μNOID){}",
+                if fee.is_none() { " auto" } else { "" }
+            ),
+        );
+        println!();
+        println!(
+            "  {} Dry run only; no proof was generated and nothing was submitted.",
+            c!(DIM, "Note:")
+        );
+        return Ok(());
+    }
 
     section("Wallet consolidate");
     println!("  Merging small UTXOs to reduce UTXO count and lower future fees.");
@@ -1914,10 +1973,13 @@ async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyho
                     .and_then(|v| v.first())
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let reduction = n_inputs.saturating_sub(n_outputs);
                 total_rounds += 1;
                 ok_msg(&format!("Round {total_rounds}: TX {}", ctx.h(tx_hash)));
                 if shape != "?" {
-                    println!("  Shape: {shape}  Inputs: {n_inputs}  Outputs: {n_outputs}");
+                    println!(
+                        "  Shape: {shape}  Inputs: {n_inputs}  Outputs: {n_outputs}  UTXO reduction: -{reduction}"
+                    );
                 }
                 println!(
                     "  Fee: {} NOID ({actual_fee} μNOID){}",

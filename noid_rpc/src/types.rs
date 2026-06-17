@@ -230,6 +230,17 @@ pub struct WalletSendPlan {
     pub chunks: Vec<WalletSendChunkPlan>,
 }
 
+/// Dry-run plan for one consolidation transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConsolidatePlan {
+    pub shape: String,
+    pub selected_input_count: usize,
+    pub output_count: usize,
+    pub fee_micronoid: u64,
+    pub expected_utxo_reduction: usize,
+    pub fee_breakdown: FeeBreakdownInfo,
+}
+
 /// Result of a send operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
@@ -379,6 +390,8 @@ pub fn micronoid_to_noid(micronoid: u64) -> f64 {
 pub struct MempoolTxInfo {
     /// Transaction body hash (hex).
     pub tx_hash: String,
+    /// Transaction shape (`Standard4x8` or `Sweep25x2`).
+    pub shape: String,
     /// Fee in μNOID.
     pub fee_micronoid: u64,
     /// Fee rate using weighted resource units (`inputs + outputs + 4 × net_new_slots`).

@@ -454,12 +454,12 @@ Mempool
   Pending            3 transactions
   Fee floor          0.005000 NOID (5000 μNOID minimum)
 
-  ──────────────────────────────────────────────────────────────────────────────────────────
-  tx hash               fee (μNOID)   in→out  ZK
-  ──────────────────────────────────────────────────────────────────────────────────────────
-  a1b2c3d4e5f6g7h8...        9000    2→ 2   ✓
-  b2c3d4e5f6g7h8i9...        7000    1→ 1   ✓
-  c3d4e5f6g7h8i9j0...        9000    3→ 2   ·
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  tx hash               shape         fee (μNOID)   in→out  ZK
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────
+  a1b2c3d4e5f6g7h8...   Standard4x8          9000    2→ 2   ✓
+  b2c3d4e5f6g7h8i9...   Sweep25x2            7700   10→ 1   ✓
+  c3d4e5f6g7h8i9j0...   Standard4x8          9000    3→ 2   ·
 ```
 
 RPC method: `paranoid_getMempoolInfo`
@@ -477,6 +477,7 @@ Each `MempoolTxInfo`:
 | Field | Type | Description |
 |-------|------|-------------|
 | `tx_hash` | hex(32) | Transaction body hash |
+| `shape` | string | Transaction shape (`Standard4x8` or `Sweep25x2`) |
 | `fee_micronoid` | u64 | Fee in μNOID |
 | `fee_rate` | u64 | fee / weighted resource units (`inputs + outputs + 4 × net_new_slots`) |
 | `n_inputs` | usize | Active input count |
@@ -495,6 +496,7 @@ $ noid-cli mempool-tx a1b2c3...
 Mempool transaction
   tx_hash            a1b2c3d4e5f6...
   Fee                0.009000 NOID (9000 μNOID)
+  Shape              Standard4x8
   Inputs             2
   Outputs            2
   Admitted at height 28
@@ -710,13 +712,14 @@ RPC method: `paranoid_walletScan`
 
 ---
 
-### `consolidate [--fee <FEE>] [--rounds <N>]`  (alias: `merge`)
+### `consolidate [--fee <FEE>] [--dry-run] [--rounds <N>]`  (alias: `merge`)
 
 Merge small UTXOs into fewer larger ones. Reduces future transaction fees.
 
 ```bash
 noid-cli consolidate                 # auto fee, up to 100 rounds
 noid-cli consolidate --fee 0.01     # explicit fee per round
+noid-cli consolidate --dry-run      # plan next round only, no proof/submission
 noid-cli consolidate --rounds 5     # max 5 consolidation txs
 ```
 
@@ -727,6 +730,8 @@ Wallet consolidate
   Fee: auto (minimum per round)
 
 ✓ Round 1: TX a1b2c3d4...
+  Shape: Sweep25x2  Inputs: 10  Outputs: 1  UTXO reduction: -9
+  Fee: 0.007700 NOID (7700 μNOID) auto
   Waiting for confirmation....... confirmed.
   UTXOs remaining: 2  Balance: 155.493000 NOID
 ✓ Round 2: TX b2c3d4e5...
@@ -738,7 +743,10 @@ Wallet consolidate
   Next: Run 'noid-cli balance' after confirmation.
 ```
 
-RPC method: `paranoid_walletConsolidate`
+RPC methods:
+
+- `paranoid_walletPlanConsolidate(fee_micronoid)` → dry-run next consolidation round
+- `paranoid_walletConsolidate(fee_micronoid)` → prove and submit one consolidation round
 
 ---
 
@@ -993,7 +1001,9 @@ Error:
 | `paranoid_walletListUtxos` | — | `WalletUtxoInfo[]` | All confirmed UTXOs |
 | `paranoid_walletHistory` | — | `WalletHistoryEntry[]` | Transaction history |
 | `paranoid_walletScan` | — | `WalletScanResult` | Full state rescan |
+| `paranoid_walletPlanSend` | `to: string, amount: u64, fee: u64` | `WalletSendPlan` | Dry-run send plan |
 | `paranoid_walletSend` | `to: string, amount: u64, fee: u64` | `WalletSendResult` | Send NOID |
+| `paranoid_walletPlanConsolidate` | `fee: u64` | `WalletConsolidatePlan` | Dry-run consolidation plan |
 | `paranoid_walletConsolidate` | `fee: u64` | `WalletSendResult` | Merge UTXOs |
 | `paranoid_walletExportReceipt` | `txhash: string` | `string` | Export receipt hex |
 

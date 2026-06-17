@@ -8,8 +8,8 @@ use jsonrpsee::proc_macros::rpc;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate, MempoolInfo,
     MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo,
+    WalletConsolidatePlan, WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult,
+    WalletStatus, WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -235,6 +235,12 @@ pub trait ParanoidApi {
     /// Export a receipt for a confirmed transaction (hex-encoded bytes).
     #[method(name = "walletExportReceipt")]
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String>;
+
+    /// Dry-run one consolidation round without proving or submitting.
+    /// `fee_micronoid = 0` uses automatic shape-aware minimum relay fee.
+    #[method(name = "walletPlanConsolidate")]
+    async fn wallet_plan_consolidate(&self, fee_micronoid: u64)
+        -> RpcResult<WalletConsolidatePlan>;
 
     /// Consolidate small UTXOs into one larger UTXO (up to `Sweep25x2` capacity).
     /// Returns tx_hash of the submitted consolidation transaction.

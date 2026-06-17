@@ -24,8 +24,8 @@ use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
     MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo,
-    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo,
+    WalletAddressInfo, WalletBalance, WalletConsolidatePlan, WalletHistoryEntry, WalletScanResult,
+    WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 use crate::wallet_ops::WalletOps;
 
@@ -682,6 +682,7 @@ impl ParanoidApiServer for RpcHandler {
         let found = self.mempool.get_entry_by_hash(&hash).await;
         Ok(found.map(|e| MempoolTxInfo {
             tx_hash: txhash,
+            shape: format!("{:?}", e.tx.body.shape),
             fee_micronoid: e.tx.body.fee.min(u64::MAX as u128) as u64,
             fee_rate: e.fee_rate,
             n_inputs: e.tx.body.inputs.iter().filter(|i| i.valid).count(),
@@ -1033,7 +1034,16 @@ impl ParanoidApiServer for RpcHandler {
                 chunks = plan.split_count,
                 amount_micronoid,
                 total_fee_micronoid = plan.total_fee_micronoid,
-                "wallet_send auto-splitting fragmented payment"
+                shapes = %plan.chunks.iter().map(|c| c.shape.as_str()).collect::<Vec<_>>().join(","),
+                "wallet_send split planned"
+            );
+        } else if let Some(chunk) = plan.chunks.first() {
+            tracing::info!(
+                shape = %chunk.shape,
+                inputs = chunk.selected_input_count,
+                outputs = chunk.output_count,
+                fee_micronoid = chunk.fee_micronoid,
+                "wallet_send shape selected"
             );
         }
 
@@ -1225,6 +1235,46 @@ impl ParanoidApiServer for RpcHandler {
         Ok(self.wallet.list_addresses())
     }
 
+    async fn wallet_plan_consolidate(
+        &self,
+        fee_micronoid: u64,
+    ) -> RpcResult<WalletConsolidatePlan> {
+        let selected_input_count = self
+            .wallet
+            .plan_consolidate_input_count()
+            .map_err(rpc_err)?;
+        let output_count = 1usize;
+        let shape = estimate_shape_for_counts(selected_input_count, output_count)?;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let floor = self.mempool.fee_floor().await;
+        let breakdown = noid_chain::consensus::fee_breakdown(
+            selected_input_count as u64,
+            output_count as u64,
+            active_slot_count,
+            log_slots,
+        );
+        let fee = if fee_micronoid == 0 {
+            breakdown.required_total.max(floor)
+        } else {
+            fee_micronoid
+        };
+        if fee < breakdown.required_total.max(floor) {
+            return Err(rpc_err(format!(
+                "BelowMinFee: consolidation fee {fee} μNOID is below required {} μNOID",
+                breakdown.required_total.max(floor)
+            )));
+        }
+        let fee_breakdown = fee_breakdown_info(breakdown, floor, fee);
+        Ok(WalletConsolidatePlan {
+            shape: format!("{shape:?}"),
+            selected_input_count,
+            output_count,
+            fee_micronoid: fee,
+            expected_utxo_reduction: selected_input_count.saturating_sub(output_count),
+            fee_breakdown,
+        })
+    }
+
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
         // Consolidation produces exactly 1 output (to self). Auto-fee uses the
         // actual number of inputs the next consolidation round will select, capped
@@ -1247,6 +1297,20 @@ impl ParanoidApiServer for RpcHandler {
         } else {
             fee_micronoid
         };
+
+        let planned_inputs = self
+            .wallet
+            .plan_consolidate_input_count()
+            .map_err(rpc_err)?;
+        let planned_shape = estimate_shape_for_counts(planned_inputs, 1)?;
+        tracing::info!(
+            shape = ?planned_shape,
+            inputs = planned_inputs,
+            outputs = 1usize,
+            fee_micronoid = effective_fee,
+            expected_utxo_reduction = planned_inputs.saturating_sub(1),
+            "wallet_consolidate planned"
+        );
 
         let call_nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1392,6 +1456,7 @@ impl ParanoidApiServer for RpcHandler {
                 let n_outputs = e.tx.body.outputs.iter().filter(|o| o.valid).count();
                 MempoolTxInfo {
                     tx_hash: hex::encode(e.tx.tx_body_hash.0),
+                    shape: format!("{:?}", e.tx.body.shape),
                     fee_micronoid: e.tx.body.fee.min(u64::MAX as u128) as u64,
                     fee_rate: e.fee_rate,
                     n_inputs,

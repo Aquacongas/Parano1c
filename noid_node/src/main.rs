@@ -959,6 +959,297 @@ fn validate_snapshot_headers(
     Ok((hdrs, expected_chain_hash))
 }
 
+fn first_missing_snapshot_header(
+    store: &noid_chain::storage::MdbxStore,
+    target_height: u64,
+) -> Result<Option<u64>, String> {
+    for h in 0..=target_height {
+        if store
+            .get_header(h)
+            .map_err(|e| format!("header store read h={h}: {e}"))?
+            .is_none()
+        {
+            return Ok(Some(h));
+        }
+    }
+    Ok(None)
+}
+
+fn persist_snapshot_header_batch(
+    store: &noid_chain::storage::MdbxStore,
+    expected_start: u64,
+    headers: &[noid_chain::block_header::BlockHeader],
+) -> Result<u64, String> {
+    use noid_chain::consensus::genesis::genesis_header;
+    use noid_chain::consensus::pow::{full_block_hash, validate_pow};
+
+    if headers.is_empty() {
+        return Err("snapshot header sync returned an empty batch".into());
+    }
+
+    let mut sorted = headers.to_vec();
+    sorted.sort_by_key(|h| h.height);
+
+    let mut next_height = expected_start;
+    let mut prev_hash = if expected_start == 0 {
+        None
+    } else {
+        let prev_h = expected_start - 1;
+        let prev = store
+            .get_header(prev_h)
+            .map_err(|e| format!("header store read h={prev_h}: {e}"))?
+            .ok_or_else(|| format!("cannot validate header batch: missing parent h={prev_h}"))?;
+        Some(full_block_hash(&prev))
+    };
+
+    for hdr in sorted {
+        if hdr.height != next_height {
+            return Err(format!(
+                "snapshot header sync expected h={}, got h={}",
+                next_height, hdr.height
+            ));
+        }
+        validate_pow(&hdr)
+            .map_err(|_| format!("snapshot synced header h={} failed PoW", hdr.height))?;
+
+        if hdr.height == 0 {
+            let expected = genesis_header();
+            if full_block_hash(&hdr) != full_block_hash(&expected) {
+                return Err(
+                    "snapshot synced genesis header does not match hardcoded genesis".into(),
+                );
+            }
+        } else if Some(hdr.prev_block_hash) != prev_hash {
+            return Err(format!(
+                "snapshot synced header h={} is not linked to h={}",
+                hdr.height,
+                hdr.height - 1
+            ));
+        }
+
+        let hash = full_block_hash(&hdr);
+        if let Some(existing) = store
+            .get_header(hdr.height)
+            .map_err(|e| format!("header store read h={}: {e}", hdr.height))?
+        {
+            if full_block_hash(&existing) != hash {
+                return Err(format!(
+                    "snapshot header h={} conflicts with existing local header",
+                    hdr.height
+                ));
+            }
+        } else {
+            store
+                .put_header_only(&hdr, &hash)
+                .map_err(|e| format!("header store write h={}: {e}", hdr.height))?;
+        }
+
+        prev_hash = Some(hash);
+        next_height = next_height.saturating_add(1);
+    }
+
+    Ok(next_height)
+}
+
+fn expected_chain_hash_from_header_store(
+    store: &noid_chain::storage::MdbxStore,
+    proof_h: u64,
+    genesis_acc: &noid_recursive::ChainAccumulator,
+) -> Result<[u8; 32], String> {
+    use noid_chain::consensus::genesis::genesis_header;
+    use noid_chain::consensus::pow::{full_block_hash, validate_pow};
+
+    let mut acc = noid_recursive::ChainAccumulator {
+        height: 0,
+        state_root: [0u8; 32],
+        chain_hash: [0u8; 32],
+    };
+    let mut prev_hash: Option<[u8; 32]> = None;
+
+    for h in 0..=proof_h {
+        let hdr = store
+            .get_header(h)
+            .map_err(|e| format!("header store read h={h}: {e}"))?
+            .ok_or_else(|| {
+                format!("missing header h={h} needed for headers-anchored snapshot verify")
+            })?;
+        validate_pow(&hdr).map_err(|_| format!("stored header h={h} failed PoW"))?;
+        if h == 0 {
+            let expected = genesis_header();
+            if full_block_hash(&hdr) != full_block_hash(&expected) {
+                return Err("stored genesis header does not match hardcoded genesis".into());
+            }
+        } else if Some(hdr.prev_block_hash) != prev_hash {
+            return Err(format!("stored header h={h} is not linked to h={}", h - 1));
+        }
+
+        acc = acc.extend(
+            hdr.state_root,
+            noid_chain::hash_block_header(&hdr),
+            hdr.height,
+            snapshot_chain_claim_from_header(&hdr),
+        );
+        prev_hash = Some(full_block_hash(&hdr));
+    }
+
+    if proof_h == 0 && acc.chain_hash != genesis_acc.chain_hash {
+        return Err("stored genesis chain_hash replay mismatch".into());
+    }
+
+    Ok(acc.chain_hash)
+}
+
+fn validate_snapshot_headers_match_store(
+    store: &noid_chain::storage::MdbxStore,
+    headers: &[noid_chain::block_header::BlockHeader],
+) -> Result<(), String> {
+    use noid_chain::consensus::pow::full_block_hash;
+
+    for hdr in headers {
+        let stored = store
+            .get_header(hdr.height)
+            .map_err(|e| format!("header store read h={}: {e}", hdr.height))?
+            .ok_or_else(|| {
+                format!(
+                    "snapshot manifest references missing stored header h={}",
+                    hdr.height
+                )
+            })?;
+        if full_block_hash(&stored) != full_block_hash(hdr) {
+            return Err(format!(
+                "snapshot manifest header h={} does not match headers DB",
+                hdr.height
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_snapshot_recursive_proof_headers_anchored(
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    proof_bytes: &[u8],
+    store: &noid_chain::storage::MdbxStore,
+) -> Result<(), String> {
+    use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
+    use noid_chain::consensus::pow::full_block_hash;
+    use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
+
+    let proof: RecursiveBlockProof =
+        bincode::deserialize(proof_bytes).map_err(|e| format!("proof deserialize: {e}"))?;
+
+    let snap_tip_h = manifest.tip_height;
+    let proof_h = proof.block_height;
+    if proof_h > snap_tip_h {
+        return Err(format!(
+            "recursive proof h={proof_h} is ahead of snapshot tip h={snap_tip_h}"
+        ));
+    }
+    let proof_lag = snap_tip_h.saturating_sub(proof_h);
+    // The recursive prover targets `tip - FINALITY_DEPTH`, but it runs
+    // asynchronously relative to mining and snapshot serving. In live operation
+    // a manifest can be served just before the prover persists the newest
+    // finalized step, so honest peers commonly appear one block behind the exact
+    // boundary. Keep the hard bound tight while allowing small scheduling jitter;
+    // stale proofs far behind the finality boundary are still rejected.
+    const SNAPSHOT_PROOF_LAG_GRACE: u64 = 2;
+    let max_snapshot_proof_lag =
+        noid_chain::consensus::params::FINALITY_DEPTH + SNAPSHOT_PROOF_LAG_GRACE;
+    if proof_lag > max_snapshot_proof_lag {
+        return Err(format!(
+            "recursive proof lag {proof_lag} exceeds max snapshot lag {max_snapshot_proof_lag} \
+             (FINALITY_DEPTH={} + grace={SNAPSHOT_PROOF_LAG_GRACE}) for snapshot tip h={snap_tip_h}",
+            noid_chain::consensus::params::FINALITY_DEPTH
+        ));
+    }
+
+    let genesis_acc = {
+        let g = genesis_header();
+        noid_recursive::genesis_accumulator(genesis_state_root(), full_block_hash(&g))
+    };
+
+    let (sorted_hdrs, _legacy_expected) =
+        validate_snapshot_headers(&manifest.recent_headers, &genesis_acc, proof_h)?;
+    validate_snapshot_headers_match_store(store, &sorted_hdrs)?;
+
+    let tip_header = store
+        .get_header(snap_tip_h)
+        .map_err(|e| format!("header store read h={snap_tip_h}: {e}"))?
+        .ok_or_else(|| format!("missing stored snapshot tip header h={snap_tip_h}"))?;
+    if full_block_hash(&tip_header) != manifest.tip_hash {
+        return Err("snapshot manifest tip_hash does not match headers DB tip header".into());
+    }
+
+    let expected_chain_hash = expected_chain_hash_from_header_store(store, proof_h, &genesis_acc)?;
+
+    if proof_h + 1 == snap_tip_h {
+        let tip_prev_state_root = if snap_tip_h == 0 {
+            genesis_state_root()
+        } else {
+            store
+                .get_header(snap_tip_h - 1)
+                .map_err(|e| format!("header store read h={}: {e}", snap_tip_h - 1))?
+                .ok_or_else(|| {
+                    format!(
+                        "missing stored header h={} for tip prev root",
+                        snap_tip_h - 1
+                    )
+                })?
+                .state_root
+        };
+        let rec_air_prev_root = if proof_h == 0 {
+            [0u8; 32]
+        } else {
+            store
+                .get_header(proof_h - 1)
+                .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
+                .ok_or_else(|| {
+                    format!("missing stored header h={} for recursive AIR", proof_h - 1)
+                })?
+                .state_root
+        };
+        let rec_air = RecursiveBlockAir::from_prev_state_root(&rec_air_prev_root);
+        verify_tip(
+            &proof,
+            &rec_air,
+            &tip_prev_state_root,
+            snap_tip_h,
+            &genesis_acc,
+            Some(&expected_chain_hash),
+        )
+        .map_err(|e| format!("chain-proof verify failed: {e:?}"))
+    } else {
+        use noid_recursive::verify_step_stark_only;
+
+        let prev_root = if proof_h == 0 {
+            [0u8; 32]
+        } else {
+            store
+                .get_header(proof_h - 1)
+                .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
+                .ok_or_else(|| format!("missing stored header h={} for step proof", proof_h - 1))?
+                .state_root
+        };
+        let expected_new_root = store
+            .get_header(proof_h)
+            .map_err(|e| format!("header store read h={proof_h}: {e}"))?
+            .ok_or_else(|| format!("missing stored header h={proof_h} for step proof"))?
+            .state_root;
+
+        verify_step_stark_only(&proof, &prev_root, &expected_new_root)
+            .map_err(|e| format!("step-proof STARK failed at h={proof_h}: {e:?}"))?;
+        if proof.acc.chain_hash != expected_chain_hash {
+            return Err(format!("step-proof chain_hash mismatch at h={proof_h}"));
+        }
+        tracing::info!(
+            proof_h,
+            snap_tip_h,
+            proof_lag,
+            "snapshot: recursive proof verified at finality boundary"
+        );
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Blocking-I/O helpers
 // ---------------------------------------------------------------------------
@@ -1379,7 +1670,14 @@ async fn handle_p2p_events(
         from: libp2p::PeerId,
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
     }
+    struct PendingSnapshotHeaderSync {
+        from: libp2p::PeerId,
+        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+        next_height: u64,
+        target_height: u64,
+    }
     let mut pending_manifest: Option<PendingManifest> = None;
+    let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut manifest_candidates: Vec<(
         libp2p::PeerId,
         Box<noid_p2p::protocol::GetStateManifestResponse>,
@@ -1414,6 +1712,7 @@ async fn handle_p2p_events(
     macro_rules! reset_sync_state {
         () => {{
             pending_manifest = None;
+            pending_snapshot_header_sync = None;
             manifest_candidates.clear();
             manifest_requested_peers.clear();
             manifest_response_count = 0;
@@ -2148,6 +2447,68 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+
+                if pending_snapshot_header_sync
+                    .as_ref()
+                    .is_some_and(|sync| sync.from == from)
+                {
+                    let mut sync = pending_snapshot_header_sync
+                        .take()
+                        .expect("checked pending snapshot header sync");
+                    if headers.is_empty() {
+                        tracing::warn!(peer = %from, "snapshot header sync returned empty batch");
+                        reset_sync_state!();
+                        continue;
+                    }
+
+                    let next = {
+                        let ctx = chain.read().await;
+                        persist_snapshot_header_batch(&ctx.store, sync.next_height, &headers)
+                    };
+                    let next = match next {
+                        Ok(next) => next,
+                        Err(e) => {
+                            tracing::warn!(peer = %from, err = %e, "snapshot header sync rejected batch");
+                            reset_sync_state!();
+                            continue;
+                        }
+                    };
+
+                    if next <= sync.target_height {
+                        sync.next_height = next;
+                        let count = (sync.target_height - next + 1).min(512) as u16;
+                        tracing::info!(
+                            peer = %from,
+                            next_height = next,
+                            target_height = sync.target_height,
+                            "snapshot: fetching header batch for headers-anchored verification"
+                        );
+                        pending_snapshot_header_sync = Some(sync);
+                        fetch_in_progress.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer: from,
+                                start_height: next,
+                                count,
+                            })
+                            .await;
+                    } else {
+                        tracing::info!(
+                            peer = %from,
+                            target_height = sync.target_height,
+                            "snapshot: header chain synced — requesting recursive proof again"
+                        );
+                        pending_manifest = Some(PendingManifest {
+                            from,
+                            manifest: sync.manifest,
+                        });
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: from })
+                            .await;
+                    }
+                    continue;
+                }
+
                 // Find common ancestor for reorg.
                 if headers.is_empty() {
                     continue;
@@ -2590,9 +2951,9 @@ async fn handle_p2p_events(
                 tip_header_bytes: _, // tip header from peer; we use recent_headers from snapshot
             }) => {
                 // SECURITY: RecursiveProof verification before applying snapshot.
-                // Verify the recursive proof against genesis, then apply the pending snapshot.
-                use bincode;
-                use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
+                // B-lite mode: verify the proof against the full headers DB. If the
+                // snapshot tip headers are not local yet, fetch headers only first;
+                // old block bodies/proofs remain pruned.
 
                 // If segment collection is already in progress (pending_segment_ids non-empty),
                 // a second RecursiveProof event would corrupt the active session.
@@ -2630,165 +2991,53 @@ async fn handle_p2p_events(
                     reset_sync_state!();
                     continue;
                 } else {
-                    // Verify the recursive proof.
-                    //
-                    // Two verification modes based on how far the proof has advanced:
-                    //
-                    // A) FULL VERIFY (proof covers tip-1): call verify_tip for O(1) chain
-                    //    verification. Cryptographically proves the entire chain back to genesis.
-                    //
-                    // B) PARTIAL VERIFY (proof behind tip): verify that the proof's accumulated
-                    //    state_root matches the corresponding header in the snapshot's
-                    //    recent_headers. This ensures the proof is consistent with the claimed
-                    //    chain, even if it hasn't caught up to the tip yet.
-                    //
-                    // In either case, the state_root check in apply_state_snapshot
-                    // independently verifies that slot data matches the tip header state_root.
-                    let verify_result: Result<(), String> = (|| {
-                        use noid_chain::block_header::BlockHeader;
-                        use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
-                        use noid_chain::consensus::pow::full_block_hash;
-                        use noid_recursive::genesis_accumulator;
-
-                        let proof: RecursiveBlockProof = bincode::deserialize(&proof_bytes)
-                            .map_err(|e| format!("proof deserialize: {e}"))?;
-
-                        let snap_tip_h = snap.manifest.tip_height;
-                        let proof_h = proof.block_height;
-
-                        // Validate PoW + chainwork of snapshot headers.
-                        // This is the primary Eclipse-attack protection.
-                        // state_root is in header_core so valid PoW cryptographically
-                        // commits each state_root to real mining work.
-                        let genesis_acc = {
-                            let g = genesis_header();
-                            genesis_accumulator(genesis_state_root(), full_block_hash(&g))
-                        };
-                        let (_sorted_hdrs, expected_chain_hash) = validate_snapshot_headers(
-                            &snap.manifest.recent_headers,
-                            &genesis_acc,
-                            proof_h,
-                        )?;
-
-                        // Helper: find state_root of a given height in snapshot's recent_headers.
-                        let find_root = |h: u64| -> Option<[u8; 32]> {
-                            snap.manifest.recent_headers.iter().find_map(|b| {
-                                BlockHeader::from_bytes(b)
-                                    .ok()
-                                    .filter(|hdr| hdr.height == h)
-                                    .map(|hdr| hdr.state_root)
-                            })
-                        };
-
-                        if proof_h + 1 == snap_tip_h {
-                            // ── ChainProof: recursive proof covers full chain to tip-1 ─────
-                            // The stored RecursiveProof is exactly one step behind the
-                            // snapshot tip.  `verify_tip` performs O(1) cryptographic
-                            // verification of the entire chain history from genesis.
-                            let tip_prev_state_root = if snap_tip_h == 0 {
-                                genesis_state_root()
-                            } else {
-                                find_root(snap_tip_h - 1).ok_or_else(|| {
-                                    format!(
-                                        "snapshot missing header h={} for tip_prev_state_root",
-                                        snap_tip_h - 1
-                                    )
-                                })?
-                            };
-                            // Genesis edge-case (shared with StepProof path below):
-                            // the genesis proof was built with the *pre-genesis*
-                            // accumulator whose state_root is [0u8;32], not genesis_state_root().
-                            let rec_air_prev_root = if proof_h == 0 {
-                                [0u8; 32] // pre-genesis accumulator state_root
-                            } else {
-                                find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
-                            };
-                            let rec_air =
-                                RecursiveBlockAir::from_prev_state_root(&rec_air_prev_root);
-                            tracing::debug!(
-                                proof_h,
-                                snap_tip_h,
-                                "snapshot: chain-proof verify (proof covers tip)"
-                            );
-                            verify_tip(
-                                &proof,
-                                &rec_air,
-                                &tip_prev_state_root,
-                                snap_tip_h,
-                                &genesis_acc,
-                                expected_chain_hash.as_ref().map(|h| h as &[u8; 32]),
-                            )
-                            .map_err(|e| format!("chain-proof verify failed: {e:?}"))
-                        } else {
-                            // ── StepProof: recursive proof is behind snapshot tip ─────────
-                            //
-                            // Normal operating mode: the RecursiveProof lags FINALITY_DEPTH
-                            // (18) blocks behind tip to protect against reorg invalidation.
-                            //
-                            // We call `verify_step_stark_only` which:
-                            //   1. Verifies the STARK over `RecursiveBlockAir(prev_root)` —
-                            //      same underlying check as chain-proof.
-                            //   2. Checks `proof.acc.state_root == header[proof_h].state_root`
-                            //      against the PoW-committed header in recent_headers.
-                            // This cryptographically links the proof to real mining work
-                            // without requiring the proof to cover the full tip distance.
-                            use noid_recursive::verify_step_stark_only;
-
-                            // prev_state_root at proof_h - 1.
-                            // When proof_h == 0 (genesis proof), the STARK was proved with
-                            // the *pre-genesis* accumulator whose state_root is [0u8;32] —
-                            // NOT genesis_state_root().  Using genesis_state_root() here
-                            // would pin a different value in the AIR and cause StarkInvalid.
-                            let prev_root = if proof_h == 0 {
-                                [0u8; 32] // pre-genesis accumulator state_root
-                            } else {
-                                find_root(proof_h - 1).unwrap_or_else(genesis_state_root)
-                            };
-
-                            // expected new state_root from the snapshot's headers.
-                            match find_root(proof_h) {
-                                Some(expected_new_root) => {
-                                    match verify_step_stark_only(
-                                        &proof,
-                                        &prev_root,
-                                        &expected_new_root,
-                                    ) {
-                                        Ok(()) => {
-                                            if let Some(expected) = expected_chain_hash.as_ref() {
-                                                if proof.acc.chain_hash != *expected {
-                                                    return Err(format!(
-                                                        "step-proof chain_hash mismatch at h={proof_h}"
-                                                    ));
-                                                }
-                                            }
-                                            tracing::info!(
-                                                proof_h,
-                                                snap_tip_h,
-                                                gap = snap_tip_h - proof_h,
-                                                expected_chain_hash = expected_chain_hash.is_some(),
-                                                "snapshot: step-proof verified \
-                                                 (proof {} blocks before tip)",
-                                                snap_tip_h - proof_h
-                                            );
-                                            Ok(())
-                                        }
-                                        Err(e) => Err(format!(
-                                            "step-proof STARK failed at h={proof_h}: {e:?}"
-                                        )),
-                                    }
-                                }
-                                None => {
-                                    // Header for proof_h not in the recent_headers window.
-                                    // A well-formed snapshot always includes sufficient
-                                    // headers for step-proof verification.
-                                    Err(format!(
-                                        "step-proof: header[{proof_h}] not in recent_headers \
-                                         (snapshot malformed)"
-                                    ))
-                                }
-                            }
+                    let target_height = snap.manifest.tip_height;
+                    let missing_header = {
+                        let ctx = chain.read().await;
+                        first_missing_snapshot_header(&ctx.store, target_height)
+                    };
+                    let missing_header = match missing_header {
+                        Ok(missing) => missing,
+                        Err(e) => {
+                            tracing::warn!(from = %from, err = %e, "snapshot header DB check failed");
+                            reset_sync_state!();
+                            continue;
                         }
-                    })();
+                    };
+
+                    if let Some(start_height) = missing_header {
+                        let count = (target_height - start_height + 1).min(512) as u16;
+                        tracing::info!(
+                            from = %from,
+                            start_height,
+                            target_height,
+                            "snapshot: local headers incomplete — fetching headers before proof verification"
+                        );
+                        pending_snapshot_header_sync = Some(PendingSnapshotHeaderSync {
+                            from,
+                            manifest: snap.manifest,
+                            next_height: start_height,
+                            target_height,
+                        });
+                        fetch_in_progress.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer: from,
+                                start_height,
+                                count,
+                            })
+                            .await;
+                        continue;
+                    }
+
+                    let verify_result = {
+                        let ctx = chain.read().await;
+                        verify_snapshot_recursive_proof_headers_anchored(
+                            &snap.manifest,
+                            &proof_bytes,
+                            &ctx.store,
+                        )
+                    };
 
                     match verify_result {
                         Ok(()) => {

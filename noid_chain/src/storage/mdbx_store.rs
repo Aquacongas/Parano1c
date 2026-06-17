@@ -226,6 +226,34 @@ impl MdbxStore {
         self.get_header(height)
     }
 
+    /// Persist a historical header and its hash index without changing chain tip,
+    /// state metadata, undo logs, recent blocks, or nullifier data.
+    ///
+    /// Snapshot sync uses this for the B-lite headers-anchored path: nodes fetch
+    /// old headers forever, but still prune old block bodies and block proofs.
+    pub fn put_header_only(&self, header: &BlockHeader, hash: &[u8; 32]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+
+        let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
+        txn.put(
+            &hdr_tbl,
+            &u64_key(header.height),
+            &encode_header(header),
+            WriteFlags::empty(),
+        )?;
+
+        let h2h_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
+        txn.put(
+            &h2h_tbl,
+            hash.as_slice(),
+            &u64_key(header.height),
+            WriteFlags::empty(),
+        )?;
+
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn get_undo_log(&self, height: u64) -> Result<Option<BlockUndoLog>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_UNDO_LOGS))?;
