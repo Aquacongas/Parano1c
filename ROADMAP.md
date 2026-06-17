@@ -65,8 +65,7 @@ Current code state:
 - `[x]` `walletSend` plans split chunks automatically.
 - `[x]` `walletSend` chooses the smallest shape that can carry selected inputs.
 - `[x]` CLI sends use auto fee by default.
-- `[x]` RPC `walletSend(..., fee_micronoid = 0)` computes an automatic fee.
-- `[~]` Auto fee is conservative, not final shape-aware policy.
+- `[x]` RPC `walletSend(..., fee_micronoid = 0)` computes an automatic shape-aware per-chunk fee.
 - `[~]` Split UX exists but needs hardening for partial success and per-chunk reporting.
 
 ### 0.3 Consolidation is now shape-aware
@@ -371,12 +370,10 @@ Reason: current auto fee is safe but conservative. Final policy should be fair, 
   - expected change.
 - `[x]` Make `walletSend` compute fee per actual chunk, not only one conservative global fee.
 - `[x]` Make `walletConsolidate` compute fee from selected consolidation shape/input count.
-- `[x]` Expose fee breakdown in RPC/CLI where useful:
-  - base;
-  - input/output IO;
-  - state growth;
-  - burned;
-  - miner claimable.
+- `[x]` Expose fee breakdown where useful, without cluttering normal submit output:
+  - detailed RPC/CLI fee estimate;
+  - wallet dry-run plan;
+  - base/input/output/state-growth/burned/miner-claimable diagnostics.
 
 ### Acceptance
 

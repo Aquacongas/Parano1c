@@ -973,7 +973,6 @@ impl ParanoidApiServer for RpcHandler {
         let mut tx_input_counts = Vec::with_capacity(plan.chunks.len());
         let mut tx_output_counts = Vec::with_capacity(plan.chunks.len());
         let mut tx_fees_micronoid = Vec::with_capacity(plan.chunks.len());
-        let mut tx_fee_breakdowns = Vec::with_capacity(plan.chunks.len());
 
         for chunk in plan.chunks.iter() {
             let chunk_idx = chunk.chunk_index;
@@ -1064,15 +1063,6 @@ impl ParanoidApiServer for RpcHandler {
                 let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
                 let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
                 let tx_fee = intent.tx_body.fee.min(u64::MAX as u128) as u64;
-                let tx_fee_breakdown = fee_breakdown_info(
-                    noid_chain::consensus::fee_breakdown_for_tx_body(
-                        &intent.tx_body,
-                        fee_active_slot_count,
-                        fee_log_slots,
-                    ),
-                    fee_floor,
-                    tx_fee,
-                );
                 let failed_tx_hash = intent.tx_body_hash.0;
                 let output_slots: Vec<u32> = intent
                     .tx_body
@@ -1097,7 +1087,6 @@ impl ParanoidApiServer for RpcHandler {
                         tx_input_counts.push(tx_input_count);
                         tx_output_counts.push(tx_output_count);
                         tx_fees_micronoid.push(tx_fee);
-                        tx_fee_breakdowns.push(tx_fee_breakdown);
                         submitted = true;
                         break;
                     }
@@ -1143,7 +1132,6 @@ impl ParanoidApiServer for RpcHandler {
             tx_input_counts,
             tx_output_counts,
             tx_fees_micronoid,
-            tx_fee_breakdowns,
         })
     }
 
@@ -1253,15 +1241,6 @@ impl ParanoidApiServer for RpcHandler {
             let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
             let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
             let tx_fee = intent.tx_body.fee.min(u64::MAX as u128) as u64;
-            let tx_fee_breakdown = fee_breakdown_info(
-                noid_chain::consensus::fee_breakdown_for_tx_body(
-                    &intent.tx_body,
-                    fee_active_slot_count,
-                    fee_log_slots,
-                ),
-                fee_floor,
-                tx_fee,
-            );
             let failed_tx_hash = intent.tx_body_hash.0;
             let output_slots: Vec<u32> = intent
                 .tx_body
@@ -1289,7 +1268,6 @@ impl ParanoidApiServer for RpcHandler {
                         tx_input_counts: vec![tx_input_count],
                         tx_output_counts: vec![tx_output_count],
                         tx_fees_micronoid: vec![tx_fee],
-                        tx_fee_breakdowns: vec![tx_fee_breakdown],
                     });
                 }
                 Err(e) => {

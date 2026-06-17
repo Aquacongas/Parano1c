@@ -628,10 +628,9 @@ Transaction submitted
   To                 f784b2c1d3e5a6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081920a1b2c3d4e5
   Amount             10.500000 NOID (10500000 μNOID)
   Fee                0.009000 NOID (9000 μNOID)(auto)
-  Fee split          burned 2500 μNOID, miner claimable 6500 μNOID
   TX hash            a1b2c3d4e5f6...
 
-  ⏳ The transaction is pending. It will confirm in the next block (~60s).
+  ⏳ The transaction is pending. It will confirm in the next block (~15s).
   Tip: Use 'noid-cli balance' to check your balance after confirmation.
 ```
 
@@ -650,7 +649,7 @@ Parameters:
 | `amount_micronoid` | u64 | Amount in μNOID |
 | `fee_micronoid` | u64 | Fee in μNOID (0 = automatic per-chunk minimum) |
 
-`walletSend` response includes backwards-compatible `tx_hash`/`fee_micronoid` plus split-aware fields: `tx_hashes`, `tx_shapes`, `tx_input_counts`, `tx_output_counts`, `tx_fees_micronoid`, and `tx_fee_breakdowns`.
+`walletSend` response includes backwards-compatible `tx_hash`/`fee_micronoid` plus split-aware fields: `tx_hashes`, `tx_shapes`, `tx_input_counts`, `tx_output_counts`, and `tx_fees_micronoid`. Detailed fee breakdown is available from `estimateFeeDetailed` and `walletPlanSend`, not from the normal submit response.
 
 ---
 

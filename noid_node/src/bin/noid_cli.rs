@@ -1631,14 +1631,6 @@ async fn cmd_send(
                 &format!("{} NOID", noid_str(actual_fee)),
                 &format!("({actual_fee} μNOID){auto_tag}"),
             );
-            if let Some(b) = r["tx_fee_breakdowns"].as_array().and_then(|v| v.first()) {
-                let burned = b["burned"].as_u64().unwrap_or(0);
-                let claimable = b["miner_claimable"].as_u64().unwrap_or(0);
-                kv(
-                    "Fee split",
-                    &format!("burned {burned} μNOID, miner claimable {claimable} μNOID"),
-                );
-            }
             if split_count > 1 {
                 kv("Primary TX", &ctx.h(tx_hash));
                 for (i, h) in tx_hashes.iter().enumerate() {
@@ -1658,7 +1650,7 @@ async fn cmd_send(
             }
             println!();
             println!(
-                "  {} The transaction is pending. It will confirm in the next block (~60s).",
+                "  {} The transaction is pending. It will confirm in the next block (~15s).",
                 c!(DIM, "⏳")
             );
             println!(
@@ -1932,12 +1924,6 @@ async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyho
                     noid_str(actual_fee),
                     if fee.is_none() { " auto" } else { "" }
                 );
-                if let Some(b) = r["tx_fee_breakdowns"].as_array().and_then(|v| v.first()) {
-                    let burned = b["burned"].as_u64().unwrap_or(0);
-                    let claimable = b["miner_claimable"].as_u64().unwrap_or(0);
-                    println!("  Burned: {burned} μNOID  Miner claimable: {claimable} μNOID");
-                }
-
                 // Wait for confirmation
                 eprint!("  Waiting for confirmation");
                 io::stderr().flush()?;

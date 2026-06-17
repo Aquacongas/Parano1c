@@ -238,9 +238,6 @@ pub struct WalletSendResult {
     /// Fee per submitted transaction, index-aligned with `tx_hashes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_fees_micronoid: Vec<u64>,
-    /// Fee breakdown per submitted transaction, index-aligned with `tx_hashes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_fee_breakdowns: Vec<FeeBreakdownInfo>,
 }
 
 /// Decoded block header (structured, not raw bytes).
