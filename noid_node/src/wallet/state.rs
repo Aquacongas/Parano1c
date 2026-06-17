@@ -22,14 +22,14 @@ use super::keystore::{Keystore, KeystoreError, MasterSecret};
 // ---------------------------------------------------------------------------
 
 /// Direction of a historical transaction relative to this wallet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TxDirection {
     Sent,
     Received,
 }
 
 /// A record of a past transaction involving this wallet.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TxHistoryEntry {
     /// Transaction body hash (32 bytes).
     pub tx_hash: [u8; 32],
@@ -134,7 +134,9 @@ impl WalletState {
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
         };
+        wallet.load_metadata();
         wallet.load_receipts();
+        wallet.load_history();
         Ok(wallet)
     }
 
@@ -179,6 +181,7 @@ impl WalletState {
         }
         if next_index > self.next_index {
             self.next_index = next_index;
+            self.save_metadata();
         }
         // Clear pending slot sets: the scan has replaced the UTXO set from
         // chain state, so any in-flight tracking is now stale.
@@ -218,21 +221,31 @@ impl WalletState {
             own_address: None,
             own_key_index: None,
         });
+        self.save_history();
     }
 
     /// Remove a pending send that never entered the mempool.
     pub fn remove_pending_send(&mut self, tx_hash: &[u8; 32]) {
+        let before = self.history.len();
         self.history
             .retain(|entry| !(&entry.tx_hash == tx_hash && entry.height == 0));
+        if self.history.len() != before {
+            self.save_history();
+        }
     }
 
     /// Update the height of a pending (height=0) tx once it's confirmed in a block.
     pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) {
+        let mut changed = false;
         for entry in self.history.iter_mut() {
             if &entry.tx_hash == tx_hash && entry.height == 0 {
                 entry.height = confirmed_height;
+                changed = true;
                 break;
             }
+        }
+        if changed {
+            self.save_history();
         }
     }
 
@@ -300,7 +313,61 @@ fn receipts_path(wallet_key_path: &Path) -> PathBuf {
     wallet_key_path.with_extension("receipts")
 }
 
+/// Path for wallet history (JSON format, next to wallet key).
+fn history_path(wallet_key_path: &Path) -> PathBuf {
+    wallet_key_path.with_extension("history")
+}
+
+/// Path for lightweight wallet metadata (JSON format, next to wallet key).
+fn metadata_path(wallet_key_path: &Path) -> PathBuf {
+    wallet_key_path.with_extension("meta")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WalletMetadata {
+    next_index: u32,
+}
+
 impl WalletState {
+    /// Save lightweight wallet metadata to disk.
+    pub fn save_metadata(&self) {
+        let path = metadata_path(&self.keystore_path);
+        let meta = WalletMetadata {
+            next_index: self.next_index,
+        };
+        if let Ok(json) = serde_json::to_string(&meta) {
+            let tmp = path.with_extension("meta.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Load lightweight wallet metadata from disk.
+    pub fn load_metadata(&mut self) {
+        let path = metadata_path(&self.keystore_path);
+        if !path.exists() {
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Ok(meta) = serde_json::from_str::<WalletMetadata>(&text) {
+            if meta.next_index > self.next_index {
+                for i in self.next_index..meta.next_index {
+                    let addr = self.secret.derive_address(i);
+                    self.known_addresses.insert(addr.0, i);
+                }
+                self.next_index = meta.next_index;
+            }
+            tracing::info!(
+                next_index = self.next_index,
+                "loaded wallet metadata from disk"
+            );
+        }
+    }
+
     /// Save receipts to disk. Called after each new receipt is generated.
     pub fn save_receipts(&self) {
         let path = receipts_path(&self.keystore_path);
@@ -339,6 +406,36 @@ impl WalletState {
                 }
             }
             tracing::info!(count = self.receipts.len(), "loaded receipts from disk");
+        }
+    }
+
+    /// Save wallet transaction history to disk.
+    pub fn save_history(&self) {
+        let path = history_path(&self.keystore_path);
+        if let Ok(json) = serde_json::to_string(&self.history) {
+            let tmp = path.with_extension("history.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Load wallet transaction history from disk.
+    pub fn load_history(&mut self) {
+        let path = history_path(&self.keystore_path);
+        if !path.exists() {
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        if let Ok(history) = serde_json::from_str::<Vec<TxHistoryEntry>>(&text) {
+            self.history = history;
+            tracing::info!(
+                count = self.history.len(),
+                "loaded wallet history from disk"
+            );
         }
     }
 }

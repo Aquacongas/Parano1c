@@ -454,6 +454,7 @@ impl WalletOps for WalletHandle {
         // Register in known_addresses so incremental block updates catch payments to it.
         w.known_addresses.insert(addr.0, idx);
         w.next_index += 1;
+        w.save_metadata();
         Some(WalletAddressInfo {
             address: addr.to_bech32(),
             key_index: idx,

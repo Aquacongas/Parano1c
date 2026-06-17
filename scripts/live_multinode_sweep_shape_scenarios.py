@@ -11,9 +11,12 @@ Covers:
 Environment knobs:
   NOID_LIVE_MULTI_SWEEP_START_BLOCKS default 20 (18+ required for recursive aggregation proof readiness)
   NOID_LIVE_MULTI_SWEEP_BASE_PORT    default 19900
-  NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT   default 1 (set 0 to run the heavier >25-input split scenario)
-  NOID_LIVE_MULTI_SWEEP_LATE_JOIN    default 0 (start relays after funding blocks)
-  NOID_LIVE_MULTI_SWEEP_RESTART      default 0 (restart first recipient after Sweep25x2)
+  NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
+  NOID_LIVE_MULTI_SWEEP_LATE_JOIN          default 0 (start relays after funding blocks)
+  NOID_LIVE_MULTI_SWEEP_RESTART            default 0 (legacy: restart sender+recipient after Sweep25x2)
+  NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT  defaults to legacy restart flag
+  NOID_LIVE_MULTI_SWEEP_RESTART_SENDER     defaults to legacy restart flag
+  NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT      defaults to legacy restart flag; only runs when split is enabled
 """
 
 import json
@@ -33,7 +36,25 @@ START_BLOCKS = int(os.environ.get("NOID_LIVE_MULTI_SWEEP_START_BLOCKS", "20"))
 BASE_PORT = int(os.environ.get("NOID_LIVE_MULTI_SWEEP_BASE_PORT", "19900"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT", "1") == "1"
 LATE_JOIN = os.environ.get("NOID_LIVE_MULTI_SWEEP_LATE_JOIN", "0") == "1"
-RESTART_RECIPIENT = os.environ.get("NOID_LIVE_MULTI_SWEEP_RESTART", "0") == "1"
+RESTART_LEGACY = os.environ.get("NOID_LIVE_MULTI_SWEEP_RESTART", "0") == "1"
+RESTART_RECIPIENT = (
+    os.environ.get(
+        "NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT", "1" if RESTART_LEGACY else "0"
+    )
+    == "1"
+)
+RESTART_SENDER = (
+    os.environ.get(
+        "NOID_LIVE_MULTI_SWEEP_RESTART_SENDER", "1" if RESTART_LEGACY else "0"
+    )
+    == "1"
+)
+RESTART_SPLIT = (
+    os.environ.get(
+        "NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT", "1" if RESTART_LEGACY else "0"
+    )
+    == "1"
+)
 
 
 class LiveTestError(Exception):
@@ -273,6 +294,78 @@ def mempool_entries(nodes, tx_hashes):
     return out
 
 
+def history_hashes(node):
+    return {h.get("tx_hash") for h in rpc(node.rpc_url, "walletHistory", timeout=20)}
+
+
+def restart_and_assert_wallet(
+    nodes,
+    node,
+    label,
+    tx_hashes,
+    min_total=None,
+    max_utxo_growth_per_block=False,
+):
+    print(f"\n=== Restart {node.name} after {label} ===", flush=True)
+    before_info = node.info()
+    before_balance = node.balance()
+    before_utxo_count = len(node.utxos())
+    before_height = int(before_info["height"])
+    expected_tip = before_info["best_hash"]
+
+    node.stop()
+    node.start()
+    wait_until(
+        f"{node.name} restarted node has peers",
+        lambda: node.peers() if node.peers() >= 1 else False,
+        timeout=120,
+        interval=2,
+    )
+    wait_until(
+        f"{node.name} reconverges after restart",
+        lambda: same_tip(nodes, max_lag=0),
+        timeout=300,
+        interval=4,
+    )
+
+    after_info = node.info()
+    after_balance = node.balance()
+    after_height = int(after_info["height"])
+    after_utxo_count = len(node.utxos())
+    expected_min_total = (
+        int(before_balance["total_micronoid"]) if min_total is None else min_total
+    )
+
+    assert_true(
+        int(after_balance["total_micronoid"]) >= expected_min_total,
+        f"{node.name}: balance regressed after restart: before={before_balance} after={after_balance}",
+    )
+    assert_true(
+        int(after_balance["pending_outbound_micronoid"]) == 0,
+        f"{node.name}: pending outbound not clear after restart: {after_balance}",
+    )
+    seen = history_hashes(node)
+    assert_true(
+        all(h in seen for h in tx_hashes),
+        f"{node.name}: wallet history missing txs after restart {tx_hashes}: {seen}",
+    )
+    if max_utxo_growth_per_block:
+        allowed = before_utxo_count + max(0, after_height - before_height)
+        assert_true(
+            after_utxo_count <= allowed,
+            f"{node.name}: UTXOs grew too much after restart; before_count={before_utxo_count} after_count={after_utxo_count} expected_tip={expected_tip} after_info={after_info}",
+        )
+    else:
+        assert_true(
+            after_utxo_count == before_utxo_count,
+            f"{node.name}: UTXO count changed across restart; before_count={before_utxo_count} after_count={after_utxo_count}",
+        )
+    print(
+        f"[restart ok] {node.name}: balance={after_balance} utxos={before_utxo_count}->{after_utxo_count} tip={after_info}",
+        flush=True,
+    )
+
+
 def wait_tx_gossiped_or_confirmed(nodes, tx_hashes, label):
     def pred():
         entries = mempool_entries(nodes, tx_hashes)
@@ -470,43 +563,27 @@ def main():
             nodes, n1, n2, sweep_amount, "multi-node Sweep25x2", expect_sweep=True
         )
 
+        sweep_tx_hashes = sweep_send.get("tx_hashes") or [sweep_send["tx_hash"]]
         if RESTART_RECIPIENT:
-            print("\n=== Restart recipient after confirmed Sweep25x2 ===", flush=True)
-            expected_balance = int(
-                sweep_send["recipient_balance_after"]["total_micronoid"]
+            restart_and_assert_wallet(
+                nodes,
+                n2,
+                "confirmed Sweep25x2 recipient state",
+                sweep_tx_hashes,
+                min_total=int(sweep_send["recipient_balance_after"]["total_micronoid"]),
             )
-            expected_tip = n1.info()["best_hash"]
-            n2.stop()
-            n2.start()
-            wait_until(
-                "restarted recipient has peers",
-                lambda: n2.peers() if n2.peers() >= 1 else False,
-                timeout=120,
-                interval=2,
-            )
-            wait_until(
-                "restarted recipient reconverges",
-                lambda: same_tip(nodes, max_lag=0),
-                timeout=240,
-                interval=4,
-            )
-            post_restart_balance = n2.balance()
-            assert_true(
-                int(post_restart_balance["total_micronoid"]) >= expected_balance,
-                f"recipient balance not persisted after restart: expected>={expected_balance} got={post_restart_balance}",
-            )
-            assert_true(
-                n2.info()["best_hash"] == expected_tip or same_tip(nodes, max_lag=0),
-                f"recipient did not persist/reconverge to expected tip {expected_tip}: {n2.info()}",
-            )
-            print(
-                f"[restart ok] {n2.name}: balance={post_restart_balance} tip={n2.info()}",
-                flush=True,
+        if RESTART_SENDER:
+            restart_and_assert_wallet(
+                nodes,
+                n1,
+                "confirmed Sweep25x2 sender state",
+                sweep_tx_hashes,
+                max_utxo_growth_per_block=True,
             )
 
         if not SKIP_SPLIT:
             split_amount = choose_split_amount(n1.utxos())
-            send_and_confirm(
+            split_send = send_and_confirm(
                 nodes,
                 n1,
                 n3,
@@ -515,6 +592,24 @@ def main():
                 expect_sweep=True,
                 expect_split=True,
             )
+            if RESTART_SPLIT:
+                split_tx_hashes = split_send.get("tx_hashes") or [split_send["tx_hash"]]
+                restart_and_assert_wallet(
+                    nodes,
+                    n3,
+                    "confirmed split recipient state",
+                    split_tx_hashes,
+                    min_total=int(
+                        split_send["recipient_balance_after"]["total_micronoid"]
+                    ),
+                )
+                restart_and_assert_wallet(
+                    nodes,
+                    n1,
+                    "confirmed split sender state",
+                    split_tx_hashes,
+                    max_utxo_growth_per_block=True,
+                )
 
         summary = {
             "final": {
@@ -528,6 +623,8 @@ def main():
             "skip_split": SKIP_SPLIT,
             "late_join": LATE_JOIN,
             "restart_recipient": RESTART_RECIPIENT,
+            "restart_sender": RESTART_SENDER,
+            "restart_split": RESTART_SPLIT,
         }
         (BASE / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"[summary] wrote {BASE / 'summary.json'}", flush=True)

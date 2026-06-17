@@ -16,6 +16,7 @@ noid_tx = { path = "../noid_tx" }
 noid_binius = { path = "../noid_binius" }
 noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
+noid_recursive = { path = "../noid_recursive" }
 rayon = "1.10"
 blake3 = "1"
 

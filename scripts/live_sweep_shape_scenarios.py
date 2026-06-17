@@ -14,6 +14,7 @@ Environment knobs:
   NOID_LIVE_SWEEP_BASE_PORT          default 19800
   NOID_LIVE_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
   NOID_LIVE_SWEEP_SKIP_CONSOLIDATE   default 0 (only runs in the quick/no-split path)
+  NOID_LIVE_SWEEP_RESTART            default 0 (restart node after confirmed sweep/split/consolidation)
 """
 
 import json
@@ -33,6 +34,7 @@ START_BLOCKS = int(os.environ.get("NOID_LIVE_SWEEP_START_BLOCKS", "20"))
 BASE_PORT = int(os.environ.get("NOID_LIVE_SWEEP_BASE_PORT", "19800"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_SWEEP_SKIP_SPLIT", "1") == "1"
 SKIP_CONSOLIDATE = os.environ.get("NOID_LIVE_SWEEP_SKIP_CONSOLIDATE", "0") == "1"
+RESTART_AFTER_CONFIRMED = os.environ.get("NOID_LIVE_SWEEP_RESTART", "0") == "1"
 
 
 class LiveTestError(Exception):
@@ -212,6 +214,71 @@ def assert_tx_confirmed(node, tx_hash, label):
     return assert_confirmed(node, tx_hash, label)
 
 
+def history_hashes(node):
+    return {h.get("tx_hash") for h in rpc(node.rpc_url, "walletHistory", timeout=20)}
+
+
+def restart_and_assert_wallet(
+    node, label, tx_hashes, min_total=None, max_utxo_growth_per_block=True
+):
+    print(f"\n=== Restart after {label} ===", flush=True)
+    before_info = (
+        node.info()
+        if hasattr(node, "info")
+        else rpc(node.rpc_url, "getChainInfo", timeout=10)
+    )
+    before_balance = node.balance()
+    before_utxo_count = len(node.utxos())
+    before_height = int(before_info["height"])
+    before_tip = before_info["best_hash"]
+
+    node.stop()
+    node.start()
+
+    wait_until(
+        f"{label} restarted node reaches previous tip",
+        lambda: (
+            info
+            if int((info := rpc(node.rpc_url, "getChainInfo", timeout=10))["height"])
+            >= before_height
+            else False
+        ),
+        timeout=240,
+        interval=3,
+    )
+    after_info = rpc(node.rpc_url, "getChainInfo", timeout=10)
+    after_balance = node.balance()
+    after_height = int(after_info["height"])
+    after_utxo_count = len(node.utxos())
+    expected_min_total = (
+        int(before_balance["total_micronoid"]) if min_total is None else min_total
+    )
+
+    assert_true(
+        int(after_balance["total_micronoid"]) >= expected_min_total,
+        f"{label}: balance regressed after restart: before={before_balance} after={after_balance}",
+    )
+    assert_true(
+        int(after_balance["pending_outbound_micronoid"]) == 0,
+        f"{label}: pending outbound not clear after restart: {after_balance}",
+    )
+    seen = history_hashes(node)
+    assert_true(
+        all(h in seen for h in tx_hashes),
+        f"{label}: wallet history missing txs after restart {tx_hashes}: {seen}",
+    )
+    if max_utxo_growth_per_block:
+        allowed = before_utxo_count + max(0, after_height - before_height)
+        assert_true(
+            after_utxo_count <= allowed,
+            f"{label}: UTXOs grew too much after restart; before_count={before_utxo_count} after_count={after_utxo_count} before_tip={before_tip} after_info={after_info}",
+        )
+    print(
+        f"[restart ok] {label}: balance={after_balance} utxos={before_utxo_count}->{after_utxo_count} tip={after_info}",
+        flush=True,
+    )
+
+
 def submit_and_confirm(node, to_addr, amount, label):
     print(f"\n=== {label}: walletSend amount={amount} μNOID ===", flush=True)
     before = node.balance()
@@ -319,6 +386,12 @@ def main():
         assert_true(
             sweep.get("tx_shapes") == ["Sweep25x2"], f"unexpected sweep shapes: {sweep}"
         )
+        if RESTART_AFTER_CONFIRMED:
+            restart_and_assert_wallet(
+                node,
+                "confirmed Sweep25x2 send",
+                sweep.get("tx_hashes") or [sweep.get("tx_hash")],
+            )
 
         if SKIP_SPLIT and not SKIP_CONSOLIDATE:
             before_height = node.height()
@@ -369,6 +442,12 @@ def main():
                 f"[consolidation ok] utxos {before_count} -> {after_count} inputs={input_counts[0]}",
                 flush=True,
             )
+            if RESTART_AFTER_CONFIRMED:
+                restart_and_assert_wallet(
+                    node,
+                    "confirmed Sweep25x2 consolidation",
+                    [tx_hash],
+                )
 
         if not SKIP_SPLIT:
             utxos = node.utxos()
@@ -385,6 +464,12 @@ def main():
                 "Sweep25x2" in split.get("tx_shapes", []),
                 f"split send did not include Sweep25x2 chunk: {split}",
             )
+            if RESTART_AFTER_CONFIRMED:
+                restart_and_assert_wallet(
+                    node,
+                    "confirmed split send",
+                    split.get("tx_hashes") or [split.get("tx_hash")],
+                )
 
         summary = {
             "height": node.height(),
@@ -392,6 +477,7 @@ def main():
             "utxo_count": len(node.utxos()),
             "skip_split": SKIP_SPLIT,
             "skip_consolidate": SKIP_CONSOLIDATE,
+            "restart_after_confirmed": RESTART_AFTER_CONFIRMED,
         }
         (BASE / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"[summary] wrote {BASE / 'summary.json'}", flush=True)

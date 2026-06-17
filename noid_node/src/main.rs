@@ -428,6 +428,38 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let shared_wallet: SharedWallet = Arc::new(std::sync::Mutex::new(Some(wallet_state)));
+    {
+        let ctx = chain.read().await;
+        let height = ctx.tip_height();
+        let (master, hint_next_index) = {
+            let guard = shared_wallet.lock().unwrap();
+            match guard.as_ref() {
+                None => unreachable!("wallet just initialized"),
+                Some(w) => (w.secret_clone(), w.next_index),
+            }
+        };
+        let (utxos, known_addresses, next_index) = wallet::scanner::scan_state_for_utxos(
+            &ctx.state.state,
+            &master,
+            height,
+            hint_next_index,
+        );
+        drop(ctx);
+        let found = utxos.len();
+        let balance: u64 = utxos.iter().map(|u| u.value).sum();
+        {
+            let mut guard = shared_wallet.lock().unwrap();
+            if let Some(w) = guard.as_mut() {
+                w.apply_scan_results(utxos, known_addresses, next_index);
+            }
+        }
+        tracing::info!(
+            height,
+            utxos = found,
+            balance,
+            "wallet startup scan complete"
+        );
+    }
     let wallet = WalletHandle::new(shared_wallet.clone());
 
     // --- P2P Network ---
@@ -3163,7 +3195,9 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
                 .collect();
             w.remove_pending_outputs(&output_slots);
         }
-        // Save receipts to disk after updating.
+        // Save wallet artifacts after updating. History is in-memory during block
+        // application, but must survive process restarts for confirmed txs.
+        w.save_history();
         if !w.receipts.is_empty() {
             w.save_receipts();
         }

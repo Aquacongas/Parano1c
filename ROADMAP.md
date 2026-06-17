@@ -218,13 +218,14 @@ Reason: fee policy and optimization need real numbers for wallet proofs, block p
 
 Add/refresh scenarios:
 
-- `[ ]` `Standard4x8`: 1 input / 2 outputs.
-- `[ ]` `Standard4x8`: 4 inputs / 8 outputs.
-- `[ ]` `Sweep25x2`: 5 inputs / 2 outputs.
-- `[ ]` `Sweep25x2`: 10 inputs / 2 outputs.
-- `[ ]` `Sweep25x2`: 25 inputs / 2 outputs.
-- `[ ]` Logical split: 26 inputs -> `Sweep25x2 + Standard4x8` or equivalent planner result.
-- `[ ]` Logical split: 50 inputs -> two sweep-sized chunks.
+- `[x]` `Standard4x8`: 1 input / 2 outputs.
+- `[x]` `Standard4x8`: 4 inputs / 8 outputs.
+- `[x]` `Sweep25x2`: 5 inputs / 2 outputs.
+- `[x]` `Sweep25x2`: 10 inputs / 2 outputs.
+- `[x]` `Sweep25x2`: 25 inputs / 2 outputs.
+- `[x]` Sweep consolidation: 25 inputs / 1 output.
+- `[x]` Logical split: 26 inputs -> `Sweep25x2 + Standard4x8` composition.
+- `[x]` Logical split: 50 inputs -> two sweep-sized chunks.
 
 Report at minimum:
 
@@ -242,12 +243,12 @@ Current gap: standard-only fixtures are not enough.
 
 Add block compositions:
 
-- `[ ]` 100% `Standard4x8`.
-- `[ ]` 100% `Sweep25x2`.
-- `[ ]` Mixed 80/20 standard/sweep.
-- `[ ]` Mixed 50/50 standard/sweep.
-- `[ ]` Realistic block: many standard sends plus a few sweeps/consolidations.
-- `[ ]` Split chunks in the same block.
+- `[x]` 100% `Standard4x8`.
+- `[x]` 100% `Sweep25x2` bucket aggregation.
+- `[x]` Mixed 80/20 standard/sweep composition.
+- `[x]` Mixed 50/50 standard/sweep composition.
+- `[x]` Realistic block composition: many standard sends plus a few sweeps/consolidations.
+- `[~]` Split chunks in the same block are represented by mixed/sweep chunk composition, not a wallet-planner-driven block fixture yet.
 - `[ ]` Split chunks across blocks if bench harness can model it cleanly.
 
 Report:
@@ -264,20 +265,21 @@ Report:
 
 Update the report with current transaction classes:
 
-- `[ ]` wallet `Standard4x8` proof;
-- `[ ]` wallet `Sweep25x2` proof;
-- `[ ]` block standard bucket;
-- `[ ]` block sweep bucket;
-- `[ ]` mixed block;
-- `[ ]` recursive update after standard block;
-- `[ ]` recursive update after sweep block;
-- `[ ]` recursive update after mixed block.
+- `[x]` wallet `Standard4x8` proof;
+- `[x]` wallet `Sweep25x2` proof;
+- `[x]` wallet `Sweep25x2` consolidation proof;
+- `[x]` block standard bucket;
+- `[x]` block sweep bucket;
+- `[x]` mixed bucket composition;
+- `[x]` recursive update after standard block;
+- `[x]` recursive update after sweep block;
+- `[x]` recursive update after mixed block.
 
 ### Acceptance
 
-- `[ ]` Bench output makes it possible to compare standard vs sweep vs mixed block costs.
-- `[ ]` Fee policy can be justified using actual measured costs.
-- `[ ]` Bench code does not use dummy proof paths for reported production numbers.
+- `[x]` Bench output makes it possible to compare standard vs sweep vs mixed block costs.
+- `[~]` Fee policy can now start from actual measured costs; final policy still needs a deliberate decision.
+- `[x]` Bench code does not use dummy proof paths for reported production numbers.
 
 ---
 
@@ -289,18 +291,18 @@ Reason: confirmed wallet state must survive process restart for sender, recipien
 
 ### Tasks
 
-- `[ ]` Promote/extend live restart scenario for recipient after confirmed `Sweep25x2`.
-- `[ ]` Add sender restart after confirmed `Sweep25x2`.
-- `[ ]` Add restart after confirmed split payment.
-- `[ ]` Add restart after confirmed consolidation.
-- `[ ]` Verify wallet history, UTXO set, pending locks, and chain tip after restart.
+- `[x]` Promote/extend live restart scenario for recipient after confirmed `Sweep25x2` (`NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT=1`).
+- `[x]` Add sender restart after confirmed `Sweep25x2` (`NOID_LIVE_MULTI_SWEEP_RESTART_SENDER=1`).
+- `[x]` Add restart after confirmed split payment (`NOID_LIVE_SWEEP_RESTART=1` with split enabled).
+- `[x]` Add restart after confirmed consolidation (`NOID_LIVE_SWEEP_RESTART=1`).
+- `[x]` Verify wallet history, UTXO set, pending locks, and chain tip after restart in live harness.
 
 ### Acceptance
 
-- `[ ]` Recipient balance remains at least the confirmed received amount after restart.
-- `[ ]` Sender spent inputs do not reappear after restart.
-- `[ ]` Pending outbound amount is zero after confirmed tx and restart.
-- `[ ]` Node reconverges to the network tip after restart.
+- `[x]` Recipient balance remains at least the confirmed received amount after restart.
+- `[x]` Sender spent inputs do not reappear after restart.
+- `[x]` Pending outbound amount is zero after confirmed tx and restart.
+- `[x]` Node reconverges to the network tip after restart.
 
 ---
 
@@ -523,8 +525,8 @@ This roadmap is complete when:
 
 - `[ ]` Normal send automatically uses standard/sweep/split with accurate reporting.
 - `[x]` Consolidation uses `Sweep25x2` for 5..25 inputs and is live-tested.
-- `[ ]` Benchmark suite covers standard, sweep, mixed, split, and consolidation-relevant cases.
-- `[ ]` Restart after confirmed sweep/split/consolidation is covered.
+- `[x]` Benchmark suite covers standard, sweep, mixed, split, and consolidation-relevant cases.
+- `[x]` Restart after confirmed sweep/split/consolidation is covered.
 - `[ ]` Reorg/undo after sweep/mixed/split/consolidation is covered.
 - `[ ]` Shape-aware fee policy is benchmark-informed and exposed cleanly.
 - `[ ]` External miner/template path works for mixed shapes.
