@@ -322,6 +322,7 @@ mod tests {
         seed_slot(&mut state, 3, 1000, &alice);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 100,
             inputs: vec![
@@ -367,6 +368,7 @@ mod tests {
         seed_slot(&mut state, 2, 700, &bob);
 
         let tx1 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -389,6 +391,7 @@ mod tests {
         };
 
         let tx2 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -432,6 +435,7 @@ mod tests {
 
         // Claim wrong value
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -474,6 +478,7 @@ mod tests {
         seed_slot(&mut state, 7, 999, &bob);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -514,6 +519,7 @@ mod tests {
         seed_slot(&mut state, 3, 1000, &alice);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -550,6 +556,7 @@ mod tests {
         let alice = Address([0x11; 32]);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -586,6 +593,7 @@ mod tests {
 
         // Tx1: Alice spends slot 1 into slot 5
         let tx1 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -609,6 +617,7 @@ mod tests {
 
         // Tx2: Bob spends slot 5 (filled by tx1) into slot 9
         let tx2 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 0,
             inputs: vec![
@@ -650,6 +659,7 @@ mod tests {
         seed_slot(&mut state, 0, 100, &alice);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0; 32],
             fee: 0,
             inputs: vec![

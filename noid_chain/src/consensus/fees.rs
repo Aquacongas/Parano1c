@@ -180,6 +180,7 @@ mod tests {
 
     fn body(n_inputs: u32, n_outputs: u32, fee: u128) -> TxBody {
         TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32],
             fee,
             inputs: (0..n_inputs).map(input).collect(),

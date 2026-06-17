@@ -480,11 +480,18 @@ This check is deterministic (ε = 0), not probabilistic.
 
 **Constraints:**
 
-1. **FoldCheckGate** (rows 0–21): `claim_out + p0 + r·(p0 + p1) = 0`
-   - Rows 0–10: block-n multipoint sumcheck (11 variables)
-   - Rows 11–21: previous recursive proof sumcheck
+1. **ClaimInCheckGate** (rows 0–29): `claim_in + p0 + p1 = 0`
+   - Rows 0–10: primary block bucket multipoint sumcheck (11 variables)
+   - Rows 11–21: secondary block bucket multipoint sumcheck (all-zero for single-shape blocks)
+   - Rows 22–29: previous recursive proof sumcheck (8 variables; recursive STARK log rows)
 
-2. **State-root pins** (row 22): `COL_P0 = sr_hi`, `COL_P1 = sr_lo`
+2. **FoldCheckGate** (rows 0–29): `claim_out + Lagrange([p0,p1,p2], r) = 0`
+   - Rows 0–10: primary block bucket degree-2 multipoint sumcheck
+   - Rows 11–21: secondary block bucket degree-2 multipoint sumcheck
+   - Rows 22–29: previous recursive proof degree-2 sumcheck
+   - `p0,p1,p2` are the round polynomial evaluations at `X = 0,1,2`; `r` is the real Fiat-Shamir challenge replayed from the bucket/recursive transcript.
+
+3. **State-root pins** (row 30): `COL_P0 = sr_hi`, `COL_P1 = sr_lo`
    - Values from externally-verified block header (verifier-hardcoded)
 
 ### 6.2 Tensor PCS at n_rounds = 0
@@ -517,7 +524,7 @@ ChainAccumulator:
         chain_hash = compress(prev_chain_hash, inner)
 ```
 
-The accumulator folds each block into the chain hash via two Poseidon2b compressions. The `block_initial_claim` (multipoint sumcheck target) binds the ZK proof to the block, and `block_hash` binds the PoW header.
+The accumulator folds each block into the chain hash via two Poseidon2b compressions. The `chain_claim` is the canonical block proof claim folded into recursive history; for bucketized proofs it is derived from the canonical block proof transcript hash. The separate `block_initial_claim` remains the bucket-local multipoint sumcheck target checked by `RecursiveBlockAir`. `block_hash` binds the PoW header, including `proof_transcript_hash`.
 
 Implementation: `noid_recursive/src/accumulator.rs`.
 

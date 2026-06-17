@@ -50,6 +50,7 @@ mod tests {
 
     fn make_tx(fee: u128, hash_seed: u8, coinbase: bool) -> Transaction {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: if coinbase { [0u8; 32] } else { [hash_seed; 32] },
             fee,
             inputs: vec![],

@@ -17,7 +17,7 @@
 
 use crate::consensus::ConsensusError;
 use crate::nullifier::NullifierSet;
-use noid_tx::{hash_tx_body, Transaction};
+use noid_tx::{hash_tx_body_for_shape, Transaction};
 
 /// Validate the per-tx consensus rules for a transaction.
 ///
@@ -62,6 +62,28 @@ fn validate_tx_consensus_inner(
         return Err(ConsensusError::BadFee);
     }
 
+    // 0a. Only shapes with complete wallet/mempool proof support are admitted.
+    if !tx.body.shape.proof_supported() {
+        return Err(ConsensusError::ShapeMismatch(format!(
+            "unsupported tx shape {:?}",
+            tx.body.shape
+        )));
+    }
+    if tx.body.inputs.len() > tx.body.shape.max_inputs() {
+        return Err(ConsensusError::ShapeMismatch(format!(
+            "inputs exceed {:?} max {}",
+            tx.body.shape,
+            tx.body.shape.max_inputs()
+        )));
+    }
+    if tx.body.outputs.len() > tx.body.shape.max_outputs() {
+        return Err(ConsensusError::ShapeMismatch(format!(
+            "outputs exceed {:?} max {}",
+            tx.body.shape,
+            tx.body.shape.max_outputs()
+        )));
+    }
+
     // 0b. Coinbase fee must be zero.
     if tx.body.is_coinbase && tx.body.fee != 0 {
         return Err(ConsensusError::BadFee);
@@ -80,7 +102,8 @@ fn validate_tx_consensus_inner(
     // 1. tx_body_hash binding (skipped when called from validate_block_consensus
     //    because apply_block already verifies this for every tx in the block).
     if check_body_hash {
-        let expected_hash = hash_tx_body(
+        let expected_hash = hash_tx_body_for_shape(
+            tx.body.shape,
             &tx.body.epoch_anchor,
             tx.body.fee,
             &tx.body.inputs,
@@ -145,7 +168,7 @@ mod tests {
     use super::*;
     use crate::nullifier::NullifierSet;
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret, TxBodyHash};
-    use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
+    use noid_tx::{hash_tx_body, hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput};
 
     fn dummy_output(slot: u32) -> TxOutput {
         TxOutput {
@@ -169,6 +192,7 @@ mod tests {
 
     fn make_tx(inputs: Vec<TxInput>, outputs: Vec<TxOutput>, is_coinbase: bool) -> Transaction {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: if is_coinbase { [0u8; 32] } else { [1u8; 32] },
             fee: 0,
             inputs,
@@ -193,6 +217,50 @@ mod tests {
         let tx = make_tx(vec![], vec![dummy_output(1)], false);
         let ns = NullifierSet::new();
         assert!(validate_tx_consensus(&tx, &ns).is_ok());
+    }
+
+    #[test]
+    fn sweep_shape_is_consensus_admitted() {
+        let body = TxBody {
+            shape: noid_tx::TxShape::Sweep25x2,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs: (0..5).map(dummy_input).collect(),
+            outputs: vec![dummy_output(1), dummy_output(2)],
+            is_coinbase: false,
+        };
+        let tx_body_hash = hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        let tx = Transaction { body, tx_body_hash };
+        let ns = NullifierSet::new();
+        assert_eq!(validate_tx_consensus(&tx, &ns), Ok(()));
+    }
+
+    #[test]
+    fn sweep_shape_limits_are_enforced() {
+        let body = TxBody {
+            shape: noid_tx::TxShape::Sweep25x2,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs: (0..26).map(dummy_input).collect(),
+            outputs: vec![dummy_output(1)],
+            is_coinbase: false,
+        };
+        let tx = Transaction {
+            body,
+            tx_body_hash: TxBodyHash([0u8; 32]),
+        };
+        let ns = NullifierSet::new();
+        assert!(matches!(
+            validate_tx_consensus(&tx, &ns),
+            Err(ConsensusError::ShapeMismatch(_))
+        ));
     }
 
     #[test]
@@ -268,6 +336,7 @@ mod tests {
     fn fee_overflow_rejected() {
         // Build a tx with fee > u64::MAX
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32],
             fee: u128::MAX, // way over u64::MAX
             inputs: vec![],
@@ -293,6 +362,7 @@ mod tests {
     fn coinbase_must_have_exactly_one_output() {
         // 0 outputs: rejected
         let body_no_output = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
@@ -321,6 +391,7 @@ mod tests {
 
         // 2 outputs: rejected
         let body_two = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
@@ -350,6 +421,7 @@ mod tests {
     #[test]
     fn coinbase_nonzero_fee_rejected() {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 1,
             inputs: vec![],

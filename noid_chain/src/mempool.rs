@@ -400,6 +400,7 @@ mod tests {
 
     fn make_tx(slot: u32, fee: u128, seed: u8) -> Transaction {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [seed; 32],
             fee,
             inputs: vec![],

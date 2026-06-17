@@ -304,18 +304,18 @@ pub fn build_block_template(
         .fold(0u64, |acc, f| acc.saturating_add(f));
     let coinbase_value = block_reward(new_log_slots).saturating_add(claimable_fee_sum);
 
-    let cb_body = TxBody {
-        epoch_anchor: [0u8; 32],
-        fee: 0,
-        inputs: vec![],
-        outputs: vec![TxOutput {
+    let cb_body = TxBody::standard(
+        [0u8; 32],
+        0,
+        vec![],
+        vec![TxOutput {
             slot_index: coinbase_slot,
             value: coinbase_value,
             owner: miner_address,
             valid: true,
         }],
-        is_coinbase: true,
-    };
+        true,
+    );
     let cb_hash = hash_tx_body(
         &cb_body.epoch_anchor,
         cb_body.fee,

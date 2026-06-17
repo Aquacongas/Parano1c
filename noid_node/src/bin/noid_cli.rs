@@ -1499,13 +1499,24 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
         Ok(r) if ctx.json => return print_json(&r),
         Ok(r) => {
             let tx_hash = r["tx_hash"].as_str().unwrap_or("?");
+            let tx_hashes = r["tx_hashes"].as_array().cloned().unwrap_or_default();
+            let split_count = r["split_count"].as_u64().unwrap_or(1);
+            let shape = r["shape"].as_str().unwrap_or("?");
+            let tx_shapes = r["tx_shapes"].as_array().cloned().unwrap_or_default();
             let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
             let auto_tag = if fee.is_none() { " (auto)" } else { "" };
 
             section("Transaction submitted");
-            ok_msg(&format!("TX {}", ctx.h(tx_hash)));
+            if split_count > 1 {
+                ok_msg(&format!("Split payment: {split_count} TXs"));
+            } else {
+                ok_msg(&format!("TX {}", ctx.h(tx_hash)));
+            }
             println!();
             kv("To", to_clean);
+            if shape != "?" {
+                kv("Shape", shape);
+            }
             kv2(
                 "Amount",
                 &format!("{} NOID", noid_str(amount_micro)),
@@ -1516,7 +1527,21 @@ async fn cmd_send(ctx: &Ctx<'_>, to: &str, amount: &str, fee: Option<&str>) -> a
                 &format!("{} NOID", noid_str(actual_fee)),
                 &format!("({actual_fee} μNOID){auto_tag}"),
             );
-            kv("TX hash", &ctx.h(tx_hash));
+            if split_count > 1 {
+                kv("Primary TX", &ctx.h(tx_hash));
+                for (i, h) in tx_hashes.iter().enumerate() {
+                    if let Some(hs) = h.as_str() {
+                        let label = tx_shapes
+                            .get(i)
+                            .and_then(|s| s.as_str())
+                            .map(|s| format!("TX #{} ({s})", i + 1))
+                            .unwrap_or_else(|| format!("TX #{}", i + 1));
+                        kv(&label, &ctx.h(hs));
+                    }
+                }
+            } else {
+                kv("TX hash", &ctx.h(tx_hash));
+            }
             println!();
             println!(
                 "  {} The transaction is pending. It will confirm in the next block (~60s).",

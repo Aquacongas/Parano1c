@@ -19,7 +19,7 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_FSCHALNG};
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::wire::WireError;
-use noid_tx::{hash_tx_body, Transaction};
+use noid_tx::{hash_tx_body_for_shape, Transaction};
 
 use crate::block_header::BlockHeader;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
@@ -125,6 +125,8 @@ pub enum BlockApplyError {
     MissingProofTranscriptHash,
     /// Header does not bind a non-zero DA witness digest.
     MissingWitnessRoot,
+    /// Transaction uses a shape that is not supported by the current proof stack.
+    UnsupportedTxShape,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
     WrongTxBodyHash,
     /// `header.state_root` disagrees with the post-apply chain root.
@@ -236,7 +238,14 @@ pub fn apply_block(
     };
 
     for tx in &block.transactions {
-        let expected_hash = hash_tx_body(
+        if !tx.body.shape.proof_supported()
+            || tx.body.inputs.len() > tx.body.shape.max_inputs()
+            || tx.body.outputs.len() > tx.body.shape.max_outputs()
+        {
+            return Err(BlockApplyError::UnsupportedTxShape);
+        }
+        let expected_hash = hash_tx_body_for_shape(
+            tx.body.shape,
             &tx.body.epoch_anchor,
             tx.body.fee,
             &tx.body.inputs,
@@ -510,7 +519,7 @@ impl Block {
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
-    use noid_tx::{TxBody, TxInput, TxOutput};
+    use noid_tx::{hash_tx_body, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
 
@@ -581,6 +590,7 @@ mod tests {
     ) -> Transaction {
         let mut probe = state.clone();
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs,
@@ -821,6 +831,7 @@ mod tests {
         // Build two distinct coinbase transactions (each mints to a different slot).
         let make_cb = |slot: u8| {
             let body = TxBody {
+                shape: noid_tx::TxShape::Standard4x8,
                 epoch_anchor: [0u8; 32],
                 fee: 0,
                 inputs: vec![],
@@ -872,6 +883,7 @@ mod tests {
         // Now create a coinbase tx that has a valid input (spending slot 1).
         let input = mk_input_for(minted.slot_index, &minted);
         let cb_body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![input],
@@ -977,6 +989,7 @@ mod tests {
         use noid_tx::TxBody;
         for i in 0..n {
             let body = TxBody {
+                shape: noid_tx::TxShape::Standard4x8,
                 epoch_anchor: [0u8; 32],
                 fee: 0,
                 inputs: vec![],
@@ -1118,6 +1131,7 @@ mod tests {
         let new_slot_tx = {
             use noid_tx::{hash_tx_body, TxBody};
             let body = TxBody {
+                shape: noid_tx::TxShape::Standard4x8,
                 epoch_anchor: [0u8; 32],
                 fee: 0,
                 inputs: vec![],

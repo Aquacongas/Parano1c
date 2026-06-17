@@ -249,6 +249,9 @@ pub fn validate_block_consensus(
         use crate::block::BlockApplyError;
         match e {
             BlockApplyError::TooManyTransactions => ConsensusError::TooManyTxs,
+            BlockApplyError::UnsupportedTxShape => {
+                ConsensusError::ShapeMismatch("unsupported tx shape".to_string())
+            }
             BlockApplyError::WrongTxBodyHash => ConsensusError::BadTxBodyHash,
             BlockApplyError::HeaderStateRootMismatch => ConsensusError::BadStateRoot,
             BlockApplyError::HeaderTxRootMismatch => ConsensusError::BadTxRoot,
@@ -344,6 +347,7 @@ mod tests {
 
     fn fee_test_user_tx(fee: u128) -> Transaction {
         tx_from_body(TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32],
             fee,
             inputs: vec![TxInput {
@@ -374,6 +378,7 @@ mod tests {
 
     fn fee_test_coinbase(value: u64) -> Transaction {
         tx_from_body(TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],

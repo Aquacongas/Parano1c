@@ -11,7 +11,10 @@
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
-use noid_block::{prove_block, TxBlockWitness, BLOCK_BASE_LOG};
+use noid_block::{
+    block_recursive_claim_field, block_recursive_claim_hash, prove_block, TxBlockWitness,
+    BLOCK_BASE_LOG,
+};
 use noid_chain::{hash_block_header, BlockHeader};
 use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
@@ -93,6 +96,7 @@ fn mk_test_body() -> TxBody {
         outputs.push(TxOutput::dummy());
     }
     let mut body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xAA; 32],
         fee: 10,
         inputs,
@@ -131,6 +135,7 @@ fn build_fixture(body: &TxBody) -> (TxLogicAir, noid_air::Trace, PublicInputs, S
     let pi = PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: TxBodyHash(fields_to_bytes(pins.tx_body_hash)),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -202,6 +207,7 @@ fn recursive_step_and_verify_tip() {
     let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
+        block_tx_index: 1,
         air: &air as &dyn Air,
         trace: &trace,
         pi: &pi,
@@ -220,6 +226,11 @@ fn recursive_step_and_verify_tip() {
     )
     .expect("prove_block must succeed");
 
+    let standard_bucket = block_proof
+        .standard_bucket
+        .as_ref()
+        .expect("standard bucket");
+
     // ----- Build a minimal block header -----
     let block_header = BlockHeader {
         prev_block_hash: [0u8; 32],
@@ -230,13 +241,7 @@ fn recursive_step_and_verify_tip() {
         miner_address: Address([0u8; 32]),
         nonce: 0,
         difficulty_target: [0xFFu8; 32],
-        proof_transcript_hash: block_proof
-            .commitment
-            .cap
-            .hashes
-            .first()
-            .copied()
-            .unwrap_or([1u8; 32]),
+        proof_transcript_hash: block_recursive_claim_hash(&block_proof),
         witness_root: [2u8; 32],
         log_slots: 24,
         active_slot_count: 0,
@@ -250,13 +255,15 @@ fn recursive_step_and_verify_tip() {
 
     // ----- Extract BlockReplayWitness -----
     let block_witness = BlockReplayWitness::from_parts(
-        block_proof.commitment.cap.clone(),
+        standard_bucket.commitment.cap.clone(),
         block_proof.state_binding_algebraics.clone(),
-        block_proof.block_col_openings.clone(),
-        block_proof.block_multipoint_rounds.clone(),
-        block_proof.mixed_opening.fri_proof.clone(),
-        block_proof.mixed_opening.all_openings.clone(),
-        block_proof.block_initial_claim,
+        standard_bucket.block_col_openings.clone(),
+        standard_bucket.block_multipoint_rounds.clone(),
+        standard_bucket.block_multipoint_challenges.clone(),
+        standard_bucket.mixed_opening.fri_proof.clone(),
+        standard_bucket.mixed_opening.all_openings.clone(),
+        standard_bucket.block_initial_claim,
+        block_recursive_claim_field(&block_proof),
     );
 
     // ----- prove_recursive_step -----
@@ -280,14 +287,13 @@ fn recursive_step_and_verify_tip() {
 
         // Build a synthetic witness from the block proof's multipoint rounds.
         let synthetic_witness = RecursiveBlockWitness {
-            block_multipoint_rounds: block_proof.block_multipoint_rounds.clone(),
-            block_initial_claim: Block128::ZERO,
-            block_challenges: block_proof
-                .block_multipoint_rounds
-                .iter()
-                .map(|_| Block128::ZERO)
-                .collect(),
-            rec_multipoint_rounds: vec![vec![Block128::ZERO; 2]; REC_SUMCHECK_ROUNDS],
+            block_multipoint_rounds: standard_bucket.block_multipoint_rounds.clone(),
+            block_initial_claim: standard_bucket.block_initial_claim,
+            block_challenges: standard_bucket.block_multipoint_challenges.clone(),
+            block_secondary_multipoint_rounds: vec![vec![Block128::ZERO; 3]; REC_SUMCHECK_ROUNDS],
+            block_secondary_initial_claim: Block128::ZERO,
+            block_secondary_challenges: vec![Block128::ZERO; REC_SUMCHECK_ROUNDS],
+            rec_multipoint_rounds: vec![vec![Block128::ZERO; 3]; REC_SUMCHECK_ROUNDS],
             rec_initial_claim: Block128::ZERO,
             rec_challenges: vec![Block128::ZERO; REC_SUMCHECK_ROUNDS],
             acc_prev_state_root: genesis_acc.state_root,
@@ -319,14 +325,13 @@ fn recursive_step_and_verify_tip() {
 
         // Build a minimal RecursiveBlockAir for verification.
         let verify_witness = RecursiveBlockWitness {
-            block_multipoint_rounds: block_proof.block_multipoint_rounds.clone(),
-            block_initial_claim: Block128::ZERO,
-            block_challenges: block_proof
-                .block_multipoint_rounds
-                .iter()
-                .map(|_| Block128::ZERO)
-                .collect(),
-            rec_multipoint_rounds: vec![vec![Block128::ZERO; 2]; REC_SUMCHECK_ROUNDS],
+            block_multipoint_rounds: standard_bucket.block_multipoint_rounds.clone(),
+            block_initial_claim: standard_bucket.block_initial_claim,
+            block_challenges: standard_bucket.block_multipoint_challenges.clone(),
+            block_secondary_multipoint_rounds: vec![vec![Block128::ZERO; 3]; REC_SUMCHECK_ROUNDS],
+            block_secondary_initial_claim: Block128::ZERO,
+            block_secondary_challenges: vec![Block128::ZERO; REC_SUMCHECK_ROUNDS],
+            rec_multipoint_rounds: vec![vec![Block128::ZERO; 3]; REC_SUMCHECK_ROUNDS],
             rec_initial_claim: Block128::ZERO,
             rec_challenges: vec![Block128::ZERO; REC_SUMCHECK_ROUNDS],
             acc_prev_state_root: genesis_acc.state_root,
@@ -394,10 +399,13 @@ fn phase7_recursive_air_zero_data_check() {
     };
 
     let witness = RecursiveBlockWitness {
-        block_multipoint_rounds: vec![vec![Block128::ZERO; 2]; BLOCK_SUMCHECK_ROUNDS],
+        block_multipoint_rounds: vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
         block_initial_claim: Block128::ZERO,
         block_challenges: vec![Block128::ZERO; BLOCK_SUMCHECK_ROUNDS],
-        rec_multipoint_rounds: vec![vec![Block128::ZERO; 2]; REC_SUMCHECK_ROUNDS],
+        block_secondary_multipoint_rounds: vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        block_secondary_initial_claim: Block128::ZERO,
+        block_secondary_challenges: vec![Block128::ZERO; BLOCK_SUMCHECK_ROUNDS],
+        rec_multipoint_rounds: vec![vec![Block128::ZERO; 3]; REC_SUMCHECK_ROUNDS],
         rec_initial_claim: Block128::ZERO,
         rec_challenges: vec![Block128::ZERO; REC_SUMCHECK_ROUNDS],
         acc_prev_state_root: [0u8; 32],

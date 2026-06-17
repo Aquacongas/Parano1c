@@ -48,14 +48,22 @@ pub struct RecursiveBlockProof {
     pub acc: ChainAccumulator,
     /// Block height at which this proof was generated.
     pub block_height: u64,
-    /// Initial claim for block-n multipoint sumcheck (= BlockProof.block_initial_claim).
-    /// ZERO for null/genesis witnesses. Absorbed into the recursive STARK's
-    /// Fiat-Shamir channel via `extra_transcript`, binding the proof to this value.
-    /// Verifier reads this field and supplies the identical `extra_transcript`.
+    /// Initial claim for the block-n multipoint sumcheck (= bucket-local
+    /// sumcheck target). ZERO for null/genesis witnesses. Absorbed into the
+    /// recursive STARK's Fiat-Shamir channel via `extra_transcript`, binding
+    /// the fold-check to this value.
     pub block_initial_claim: Block128,
+    /// Initial claim for the secondary block bucket multipoint sumcheck. ZERO
+    /// for single-shape/null/genesis witnesses. Absorbed into the recursive
+    /// STARK's Fiat-Shamir channel alongside `block_initial_claim`.
+    pub block_secondary_initial_claim: Block128,
+    /// Canonical block claim folded into `ChainAccumulator`. For bucketized
+    /// blocks this is derived from the canonical block proof transcript, not
+    /// from a single shape-local sumcheck claim.
+    pub chain_claim: Block128,
     /// Initial claim for the previous recursive STARK's multipoint sumcheck.
     /// Derived from `prev_rec_proof.stark` by replaying its FS channel
-    /// (`derive_rec_initial_claim`). ZERO at genesis (no previous proof).
+    /// (`derive_rec_multipoint_replay`). ZERO at genesis (no previous proof).
     /// Also absorbed via `extra_transcript` for the same FS-binding guarantee.
     pub rec_initial_claim: Block128,
 }
@@ -108,28 +116,33 @@ pub fn prove_recursive_step(
 ) -> RecursiveBlockProof {
     // 1. Compute initial claims (needed for both accumulator extension and STARK proving).
     //
-    // `block_initial_claim` = the real multipoint sumcheck target from `prove_block`.
-    // `rec_initial_claim`   = the multipoint target of the *previous* recursive STARK.
+    // `block_initial_claim`           = the real primary bucket multipoint target.
+    // `block_secondary_initial_claim` = the real secondary bucket target, or ZERO.
+    // `rec_initial_claim`             = the multipoint target of the previous recursive STARK.
+    // `chain_claim`                   = the canonical block proof claim folded into history.
     //
-    // Both are absorbed into the recursive STARK via `extra_transcript` before any
-    // FS challenges are squeezed.  An attacker cannot forge a proof with different
+    // These claims are absorbed into the recursive STARK via `extra_transcript` before
+    // any FS challenges are squeezed. An attacker cannot forge a proof with different
     // values because the STARK's challenges would differ — binding the proof to
-    // these specific initial claims (Fiat-Shamir security).
+    // these specific claims (Fiat-Shamir security).
     //
-    // `block_initial_claim` is also folded into `acc_new.chain_hash` so that the
-    // verifier can detect null-witness substitutions without accessing the BlockProof.
+    // `chain_claim` is folded into `acc_new.chain_hash` so that the verifier can
+    // detect null-witness substitutions or bucket-transcript substitutions without
+    // accessing the full BlockProof.
     let block_initial_claim = block_witness.block_initial_claim;
-    let rec_initial_claim = prev_rec_proof
-        .map(|p| derive_rec_initial_claim(p))
-        .unwrap_or(Block128::ZERO);
+    let block_secondary_initial_claim = block_witness.block_secondary_initial_claim;
+    let chain_claim = block_witness.chain_claim;
+    let (rec_initial_claim, rec_challenges) = prev_rec_proof
+        .map(derive_rec_multipoint_replay)
+        .unwrap_or_else(|| (Block128::ZERO, vec![Block128::ZERO; REC_SUMCHECK_ROUNDS]));
 
-    // 2. Extend the rolling accumulator — now includes block_initial_claim.
+    // 2. Extend the rolling accumulator with the canonical chain claim.
     let block_hash = noid_chain::hash_block_header(block_header);
     let acc_new = prev_acc.extend(
         block_header.state_root,
         block_hash,
         block_header.height,
-        block_initial_claim,
+        chain_claim,
     );
 
     // 3. Build the RecursiveBlockWitness from the pre-extracted block replay data.
@@ -139,6 +152,7 @@ pub fn prove_recursive_step(
         prev_acc,
         &acc_new,
         rec_initial_claim,
+        rec_challenges,
     );
 
     // 4. Build the RecursiveBlockAir and execution trace.
@@ -152,10 +166,15 @@ pub fn prove_recursive_step(
     let empty_pi = make_empty_pi();
     let no_slices: &[SliceClaim] = &[];
 
-    // extra_transcript binds the proof to the real initial claims.
-    // Verifier supplies the same [block_initial_claim, rec_initial_claim]
-    // read from RecursiveBlockProof fields.
-    let extra_transcript = [block_initial_claim, rec_initial_claim];
+    // extra_transcript binds the proof to the real bucket sumcheck claims,
+    // previous recursive claim, and canonical chain claim. Verifier supplies
+    // the same values read from RecursiveBlockProof fields.
+    let extra_transcript = [
+        block_initial_claim,
+        block_secondary_initial_claim,
+        rec_initial_claim,
+        chain_claim,
+    ];
 
     let stark = prove_air_interleaved(
         &air,
@@ -173,6 +192,8 @@ pub fn prove_recursive_step(
         acc: acc_new,
         block_height: block_header.height,
         block_initial_claim,
+        block_secondary_initial_claim,
+        chain_claim,
         rec_initial_claim,
     }
 }
@@ -184,39 +205,38 @@ pub fn prove_recursive_step(
 /// Build the `RecursiveBlockWitness` from the block replay data and the
 /// optional previous recursive proof.
 ///
-/// `rec_initial_claim` is pre-computed by the caller via `derive_rec_initial_claim`
-/// and passed in explicitly so the FS replay runs once (not twice).
+/// `rec_initial_claim` and `rec_challenges` are pre-computed by the caller via
+/// `derive_rec_multipoint_replay` and passed in explicitly so the FS replay runs
+/// once (not twice).
 fn build_recursive_block_witness(
     witness_data: &BlockReplayWitness,
     prev_rec_proof: Option<&RecursiveBlockProof>,
     prev_acc: &ChainAccumulator,
     acc_new: &ChainAccumulator,
     rec_initial_claim: Block128,
+    rec_challenges: Vec<Block128>,
 ) -> RecursiveBlockWitness {
     // Block multipoint rounds and their real initial claim from the BlockProof.
     let block_multipoint_rounds = witness_data.block_multipoint_rounds.clone();
     let block_initial_claim = witness_data.block_initial_claim;
-    let block_challenges = derive_sumcheck_challenges(&block_multipoint_rounds);
+    let block_challenges = witness_data.block_multipoint_challenges.clone();
+    let block_secondary_multipoint_rounds = witness_data.block_secondary_multipoint_rounds.clone();
+    let block_secondary_initial_claim = witness_data.block_secondary_initial_claim;
+    let block_secondary_challenges = witness_data.block_secondary_multipoint_challenges.clone();
 
     // Rec multipoint rounds from the previous recursive proof (or zeros at genesis).
-    let (rec_multipoint_rounds, rec_challenges) = match prev_rec_proof {
-        None => {
-            // Genesis: no previous recursive proof — use all-zero rounds.
-            let zero_rounds = vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS];
-            let zero_challenges = vec![Block128::ZERO; REC_SUMCHECK_ROUNDS];
-            (zero_rounds, zero_challenges)
-        }
-        Some(prev) => {
-            let rounds = prev.stark.multipoint_rounds.clone();
-            let challenges = derive_sumcheck_challenges(&rounds);
-            (rounds, challenges)
-        }
+    let rec_multipoint_rounds = match prev_rec_proof {
+        None => vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        Some(prev) => prev.stark.multipoint_rounds.clone(),
     };
 
     RecursiveBlockWitness {
         block_multipoint_rounds,
         block_initial_claim,
         block_challenges,
+        block_secondary_multipoint_rounds,
+        block_secondary_initial_claim,
+        block_secondary_challenges,
         rec_multipoint_rounds,
         rec_initial_claim,
         rec_challenges,
@@ -225,26 +245,27 @@ fn build_recursive_block_witness(
     }
 }
 
-/// Derive the multipoint sumcheck initial claim (`mp_target`) for a previous
-/// recursive STARK proof by replaying its Fiat-Shamir channel.
+/// Derive the multipoint sumcheck initial claim (`mp_target`) and challenges for
+/// a previous recursive STARK proof by replaying its Fiat-Shamir channel.
 ///
-/// This replicates the computation in `verify_algebraic_inner` (interleaved.rs
-/// lines 548-558) without running the full verifier.  For `RecursiveBlockAir`:
+/// This replicates the computation in `verify_algebraic_inner` without running
+/// the full verifier. For `RecursiveBlockAir`:
 ///   - No VSHIFT (empty `shift_partials`)
 ///   - No slice claims
 ///   - All-zero `PublicInputs`
+///   - extra_transcript = [block_initial_claim, block_secondary_initial_claim, rec_initial_claim, chain_claim]
 ///
-/// The resulting value is used as `rec_initial_claim` in the next recursive step
-/// and is stored in `RecursiveBlockProof.rec_initial_claim` so the verifier can
-/// supply the same `extra_transcript` without having the previous proof.
-fn derive_rec_initial_claim(prev: &RecursiveBlockProof) -> Block128 {
+/// The initial claim is used as `rec_initial_claim` in the next recursive step;
+/// the challenges are used in the recursive AIR trace so the previous recursive
+/// sumcheck is folded with its real transcript challenges rather than synthetic
+/// fresh-channel values.
+fn derive_rec_multipoint_replay(prev: &RecursiveBlockProof) -> (Block128, Vec<Block128>) {
     use noid_fri_binius::absorb_cap;
     use noid_stark::multipoint_batch::MULTIPOINT_TAG;
     use noid_stark::{absorb_public_inputs, padded_log_len};
 
     let proof = &prev.stark;
     let log_len = padded_log_len(proof.log_rows);
-    let n_air_cols = proof.base_openings.len();
 
     let mut ch = Channel::new();
 
@@ -255,16 +276,19 @@ fn derive_rec_initial_claim(prev: &RecursiveBlockProof) -> Block128 {
     absorb_public_inputs(&mut ch, &make_empty_pi());
 
     // Absorb the extra_transcript that was used when proving this step.
-    // It contained [prev.block_initial_claim, prev.rec_initial_claim].
+    // It contained [prev.block_initial_claim, prev.block_secondary_initial_claim,
+    // prev.rec_initial_claim, prev.chain_claim].
     ch.observe_field_elem(prev.block_initial_claim);
+    ch.observe_field_elem(prev.block_secondary_initial_claim);
     ch.observe_field_elem(prev.rec_initial_claim);
+    ch.observe_field_elem(prev.chain_claim);
 
     // Consume z challenges (log_len squeezed, not needed here).
     for _ in 0..log_len {
         ch.get_random_point();
     }
 
-    // Consume beta constraints (RecursiveBlockAir::N_CONSTRAINTS = 4).
+    // Consume beta constraints.
     for _ in 0..crate::air::RecursiveBlockAir::N_CONSTRAINTS {
         ch.get_random_point();
     }
@@ -283,33 +307,27 @@ fn derive_rec_initial_claim(prev: &RecursiveBlockProof) -> Block128 {
 
     // Squeeze multipoint beta: absorb tag first, then squeeze.
     ch.observe_field_elem(Block128::from(MULTIPOINT_TAG));
-    let beta = ch.get_random_point();
+    let _beta = ch.get_random_point();
 
-    // mp_target = Σ_i β^i * base_openings[i]
-    // = lambdas[0]*e[0] + lambdas[1]*e[1] + ... where lambdas[i] = β^i.
-    // No s_count (VSHIFT), no n_slices — only the n_air_cols term.
-    let mut target = Block128::ZERO;
-    let mut cur = Block128::ONE; // β^0
-    for &opening in &proof.base_openings[..n_air_cols] {
-        target += cur * opening;
-        cur *= beta;
-    }
-    target
-}
+    // The verifier's first multipoint check is `round0[0] + round0[1] == target`.
+    // Use that transcript-committed target directly instead of recomputing it from
+    // beta/base openings here.  This keeps recursive replay robust if the
+    // lower-level multipoint batching formula grows extra terms (VSHIFT/slices)
+    // or changes its weight derivation, while still deriving the per-round
+    // challenges from the same Fiat-Shamir channel below.
+    let target = proof
+        .multipoint_rounds
+        .first()
+        .and_then(|rp| (rp.len() >= 2).then(|| rp[0] + rp[1]))
+        .unwrap_or(Block128::ZERO);
 
-/// Derive a Fiat-Shamir challenge sequence from sumcheck round polynomials.
-///
-/// Absorbs each round polynomial into a fresh channel in order and squeezes
-/// one challenge per round.  This captures the per-round folding structure
-/// without needing the full STARK transcript context.
-fn derive_sumcheck_challenges(rounds: &[Vec<Block128>]) -> Vec<Block128> {
-    let mut channel = Channel::new();
-    let mut challenges = Vec::with_capacity(rounds.len());
-    for round in rounds {
-        channel.observe_field_elems(round);
-        challenges.push(channel.get_random_point());
+    let mut challenges = Vec::with_capacity(proof.multipoint_rounds.len());
+    for rp in &proof.multipoint_rounds {
+        ch.observe_field_elems(rp);
+        challenges.push(ch.get_random_point());
     }
-    challenges
+
+    (target, challenges)
 }
 
 // =============================================================================
@@ -326,6 +344,7 @@ pub(crate) fn make_empty_pi() -> PublicInputs {
     PublicInputs {
         epoch_anchor: [0u8; 32],
         tx_body_hash: TxBodyHash([0u8; 32]),
+        shape_id: noid_tx::TxShape::Standard4x8.id(),
         fee: 0,
         n_live_inputs: 0,
         n_live_outputs: 0,
@@ -381,6 +400,7 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
         vec![], // no block_col_openings
         // BLOCK_SUMCHECK_ROUNDS = 11; each round has 3 evaluations [p(0), p(1), p(2)]
         vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        vec![Block128::ZERO; BLOCK_SUMCHECK_ROUNDS],
         CompactEvalProof {
             upper_partial_evals: vec![],
             sum_check_oracles: vec![],
@@ -391,6 +411,7 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
         },
         vec![],         // no mixed_all_openings
         Block128::ZERO, // block_initial_claim: ZERO for genesis null witness
+        Block128::ZERO, // chain_claim: ZERO for genesis null witness
     );
 
     // prev_rec_proof = None: genesis is the first step, uses zero rec rounds.
@@ -416,6 +437,7 @@ pub fn null_block_replay_witness() -> BlockReplayWitness {
         vec![], // no state_binding_algebraics
         vec![], // no block_col_openings
         vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
+        vec![Block128::ZERO; BLOCK_SUMCHECK_ROUNDS],
         CompactEvalProof {
             upper_partial_evals: vec![],
             sum_check_oracles: vec![],
@@ -426,6 +448,7 @@ pub fn null_block_replay_witness() -> BlockReplayWitness {
         },
         vec![],         // no mixed_all_openings
         Block128::ZERO, // block_initial_claim: ZERO for null witnesses (rounds are all zero)
+        Block128::ZERO, // chain_claim: ZERO for null witnesses
     )
 }
 

@@ -511,6 +511,7 @@ mod tests {
 
     fn empty_tx_body() -> TxBody {
         TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: Vec::new(),
@@ -774,6 +775,7 @@ mod tests {
         pins.tx_body_hash = native_wrap_digest(&pins);
 
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![

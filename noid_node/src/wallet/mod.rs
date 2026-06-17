@@ -44,6 +44,7 @@ use noid_rpc::types::{
     WalletStatus, WalletUtxoInfo,
 };
 use noid_rpc::WalletOps;
+use noid_tx::TxShape;
 
 use crate::wallet::scanner::scan_state_for_utxos;
 
@@ -214,6 +215,63 @@ impl WalletOps for WalletHandle {
         }
     }
 
+    fn plan_send_splits(
+        &self,
+        amount_micronoid: u64,
+        fee_per_tx_micronoid: u64,
+    ) -> Result<Vec<u64>, String> {
+        if amount_micronoid == 0 {
+            return Err("amount cannot be zero".to_string());
+        }
+
+        let guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_ref()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+
+        let mut available: Vec<&state::WalletUtxo> = w
+            .utxos
+            .values()
+            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
+            .collect();
+        available.sort_by(|a, b| b.value.cmp(&a.value));
+
+        let spendable: u64 = available.iter().map(|u| u.value).sum();
+        let mut cursor = 0usize;
+        let mut remaining = amount_micronoid;
+        let mut chunks = Vec::new();
+
+        while remaining > 0 {
+            let mut selected_value = 0u64;
+            let mut selected_inputs = 0usize;
+
+            while cursor < available.len()
+                && selected_inputs < TxShape::Sweep25x2.max_inputs()
+                && selected_value < remaining.saturating_add(fee_per_tx_micronoid)
+            {
+                selected_value = selected_value.saturating_add(available[cursor].value);
+                cursor += 1;
+                selected_inputs += 1;
+            }
+
+            if selected_inputs == 0 || selected_value <= fee_per_tx_micronoid {
+                let planned_fees = fee_per_tx_micronoid.saturating_mul(chunks.len() as u64 + 1);
+                return Err(format!(
+                    "insufficient funds: need at least {} μNOID including split fees, have {} μNOID spendable",
+                    amount_micronoid.saturating_add(planned_fees),
+                    spendable
+                ));
+            }
+
+            let max_payment = selected_value - fee_per_tx_micronoid;
+            let chunk = max_payment.min(remaining);
+            chunks.push(chunk);
+            remaining -= chunk;
+        }
+
+        Ok(chunks)
+    }
+
     fn build_send(
         &self,
         to_address: [u8; 32],
@@ -222,11 +280,11 @@ impl WalletOps for WalletHandle {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
         // Extract build data from wallet (brief lock).
-        // Snapshot both pending_output_slots (avoid output reuse) AND
-        // pending_input_slots (select_utxos already filters these, but we
-        // capture the selected slots here so we can mark them pending below).
+        // Snapshot pending_output_slots (avoid output reuse). Input slots are
+        // returned to the RPC layer and marked pending only after successful
+        // mempool admission, so failed submit retries cannot self-lock UTXOs.
         let (build_data, input_slots) = {
             let guard = self.inner.lock().unwrap();
             let w = guard
@@ -253,10 +311,9 @@ impl WalletOps for WalletHandle {
             builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
                 .map_err(|e| e.to_string())?;
 
-        // Register input AND output slots as pending, record the send.
-        // Registering before returning ensures concurrent wallet_send calls
-        // see claimed slots immediately — preventing SlotConflict on rapid
-        // back-to-back sends even before any tx is confirmed.
+        // Register output slots as pending immediately to avoid output-slot reuse
+        // during retries/concurrent sends. Inputs are intentionally NOT marked
+        // here; the RPC layer marks them only after mempool.submit succeeds.
         {
             let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
                 .map_err(|e| format!("decode: {e:?}"))?;
@@ -269,15 +326,12 @@ impl WalletOps for WalletHandle {
                 .collect();
             let mut guard = self.inner.lock().unwrap();
             if let Some(w) = guard.as_mut() {
-                // Mark input slots as pending so the next wallet_send call's
-                // select_utxos skips them (same fix as build_consolidate).
-                w.add_pending_inputs(&input_slots);
                 w.add_pending_outputs(&output_slots);
                 w.record_pending_send(tx_hash, amount_micronoid, to_address);
             }
         }
 
-        Ok(intent_bytes)
+        Ok((intent_bytes, input_slots))
     }
 
     fn build_consolidate(
@@ -363,6 +417,14 @@ impl WalletOps for WalletHandle {
         let mut guard = self.inner.lock().unwrap();
         if let Some(w) = guard.as_mut() {
             w.add_pending_inputs(slots);
+        }
+    }
+
+    fn cleanup_failed_send(&self, tx_hash: [u8; 32], output_slots: &[u32]) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            w.remove_pending_outputs(output_slots);
+            w.remove_pending_send(&tx_hash);
         }
     }
 
@@ -472,5 +534,76 @@ impl WalletOps for WalletHandle {
                 "no receipt for {txhash_hex} — block already pruned or tx not found"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    fn handle_with_utxos(values: &[u64]) -> (TempDir, WalletHandle) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(path).unwrap();
+        for (i, value) in values.iter().copied().enumerate() {
+            let key_index = i as u32;
+            wallet.utxos.insert(
+                key_index,
+                state::WalletUtxo {
+                    slot_index: key_index,
+                    value,
+                    address: wallet.address_at(key_index),
+                    key_index,
+                    confirmed_height: 1,
+                },
+            );
+        }
+        let handle = WalletHandle {
+            inner: Arc::new(Mutex::new(Some(wallet))),
+        };
+        (dir, handle)
+    }
+
+    #[test]
+    fn planner_uses_one_sweep_sized_chunk_for_20_inputs() {
+        let (_dir, handle) = handle_with_utxos(&vec![1_000; 20]);
+        let chunks = handle.plan_send_splits(19_500, 500).unwrap();
+        assert_eq!(chunks, vec![19_500]);
+    }
+
+    #[test]
+    fn planner_splits_after_25_inputs() {
+        let (_dir, handle) = handle_with_utxos(&vec![1_000; 26]);
+        let chunks = handle.plan_send_splits(25_000, 500).unwrap();
+        assert_eq!(chunks, vec![24_500, 500]);
+    }
+
+    #[test]
+    fn planner_excludes_pending_inputs_from_spendable_balance() {
+        let (_dir, handle) = handle_with_utxos(&[10_000, 1_000, 1_000, 1_000, 1_000]);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            guard.as_mut().unwrap().pending_input_slots.insert(0);
+        }
+        let err = handle.plan_send_splits(9_000, 500).unwrap_err();
+        assert!(err.contains("insufficient funds"));
+        assert!(err.contains("4000 μNOID spendable"));
+    }
+
+    #[test]
+    fn sweep_sized_send_selects_more_than_four_inputs() {
+        let (_dir, handle) = handle_with_utxos(&vec![50_000_000; 8]);
+        let amount = 200_000_001;
+        let fee = 18_500;
+        let chunks = handle.plan_send_splits(amount, fee).unwrap();
+        assert_eq!(chunks, vec![amount]);
+
+        let guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        let (selected, change) = wallet.select_utxos(amount, fee).expect("select UTXOs");
+        assert_eq!(selected.len(), 5);
+        assert_eq!(change, 49_981_499);
     }
 }

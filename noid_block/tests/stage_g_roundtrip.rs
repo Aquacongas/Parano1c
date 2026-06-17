@@ -82,6 +82,7 @@ fn mk_test_body() -> TxBody {
     }
 
     let mut body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xAA; 32],
         fee: 10,
         inputs,
@@ -127,6 +128,7 @@ fn build_fixture(body: &TxBody) -> (TxLogicAir, noid_air::Trace, PublicInputs, S
     let pi = PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: TxBodyHash(fields_to_bytes(pins.tx_body_hash)),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -194,6 +196,7 @@ fn block_one_tx_roundtrip() {
     let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
+        block_tx_index: 1,
         air: &air as &dyn Air,
         trace: &trace,
         pi: &pi,
@@ -238,6 +241,7 @@ fn block_verify_rejects_tampered_epoch_anchor() {
     let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
+        block_tx_index: 1,
         air: &air as &dyn Air,
         trace: &trace,
         pi: &pi,
@@ -256,7 +260,12 @@ fn block_verify_rejects_tampered_epoch_anchor() {
     )
     .expect("honest prove_block must succeed");
 
-    proof.tx_pis[0].epoch_anchor[0] ^= 0x01;
+    proof
+        .standard_bucket
+        .as_mut()
+        .expect("standard bucket")
+        .tx_pis[0]
+        .epoch_anchor[0] ^= 0x01;
 
     let air_ref: &dyn Air = &air;
     let result = verify_block(

@@ -89,28 +89,50 @@ fn verify_rpc_block_against_context(
 
     let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|e| format!("proof deserialize failed: {e}"))?;
-    for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
-        if pi.log_slots != block.header.log_slots {
-            return Err(format!(
-                "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
-                pi.log_slots, block.header.log_slots
-            ));
+    noid_block::validate_block_bucket_tx_indices(block, &proof)
+        .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
+    if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
+        for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
+            if pi.log_slots != block.header.log_slots {
+                return Err(format!(
+                    "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
+                    pi.log_slots, block.header.log_slots
+                ));
+            }
+        }
+    }
+    if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
+        for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
+            if pi.log_slots != block.header.log_slots {
+                return Err(format!(
+                    "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
+                    pi.log_slots, block.header.log_slots
+                ));
+            }
         }
     }
 
     ctx.preload_segments_for_block(block)
         .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
 
-    let spine = noid_block::build_spine_inputs_list(block);
-    let auth = noid_block::build_auth_public_list(block, &proof);
+    noid_block::verify_sweep_bucket_from_block(block, &proof)
+        .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
     let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
-    let tx_airs = noid_block::build_tx_airs(block);
-    let air_refs: Vec<&dyn noid_air::Air> =
-        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
     let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
         sb_airs.iter().collect();
-    noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
-        .map_err(|e| format!("ZK proof invalid: {e:?}"))
+    if proof.standard_bucket.is_some() {
+        let spine = noid_block::build_spine_inputs_list(block);
+        let auth = noid_block::build_auth_public_list(block, &proof);
+        let tx_airs = noid_block::build_tx_airs(block);
+        let air_refs: Vec<&dyn noid_air::Air> =
+            tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
+        noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
+            .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
+    } else {
+        noid_block::verify_state_bindings_standalone(&proof, &sb_refs)
+            .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -814,15 +836,19 @@ impl ParanoidApiServer for RpcHandler {
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
-        // Auto-fee: when fee_micronoid == 0, compute the minimum acceptable fee.
-        // A send TX typically has 1 input and 2 outputs (payment + change).
-        // Also respect the current dynamic fee floor from the mempool.
+        // Auto-fee: until Phase I lands a shape-aware estimate API, use a
+        // conservative per-tx upper bound that is valid for either Standard4x8
+        // or Sweep25x2. Auto-split treats this as a per-transaction fee.
         let effective_fee = if fee_micronoid == 0 {
             let floor = self.mempool.fee_floor().await;
             let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-            noid_chain::consensus::fee_breakdown(1, 2, active_slot_count, log_slots)
-                .required_total
-                .max(floor)
+            let standard_fee =
+                noid_chain::consensus::fee_breakdown(1, 2, active_slot_count, log_slots)
+                    .required_total;
+            let sweep_fee =
+                noid_chain::consensus::fee_breakdown(25, 2, active_slot_count, log_slots)
+                    .required_total;
+            standard_fee.max(sweep_fee).max(floor)
         } else {
             fee_micronoid
         };
@@ -830,112 +856,174 @@ impl ParanoidApiServer for RpcHandler {
         // 1. Parse recipient address.
         let to_address = parse_address_hex(&to_hex)?.0;
 
-        // Helper: snapshot slot hints.
-        // Each call uses a unique seed = tip_state_root XOR current_time_nanos
-        // so concurrent wallet_send calls never pick the same output slots.
+        // Plan the logical payment before proving. If more than Sweep25x2 can
+        // carry, this returns multiple independent chunks.
+        let chunks = self
+            .wallet
+            .plan_send_splits(amount_micronoid, effective_fee)
+            .map_err(rpc_err)?;
+        if chunks.len() > 1 {
+            tracing::info!(
+                chunks = chunks.len(),
+                amount_micronoid,
+                fee_per_tx = effective_fee,
+                "wallet_send auto-splitting fragmented payment"
+            );
+        }
+
+        // Helper: snapshot slot hints. Each chunk/attempt gets a unique seed so
+        // split sends do not collide on output slots.
         let call_nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as u64;
 
-        // Retry loop: at genesis difficulty slots can be claimed between prove_tx
-        // and mempool admission. Retry up to 3 times with fresh hints.
-        let mut last_err = String::new();
-        for attempt in 0..3u32 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
+        let mut tx_hashes = Vec::with_capacity(chunks.len());
+        let mut tx_shapes = Vec::with_capacity(chunks.len());
 
-            let reserved_outputs = self.mempool.reserved_output_slots().await;
+        for (chunk_idx, chunk_amount) in chunks.iter().copied().enumerate() {
+            // Retry loop: slots can be claimed between prove_tx and mempool
+            // admission. Retry each chunk with fresh hints.
+            let mut last_err = String::new();
+            let mut submitted = false;
 
-            // Lock 1: extract tip data only (no PRNG or heavy work under lock).
-            let (epoch_anchor, log_slots, unique_seed) = {
-                let chain = self.chain.read().await;
-                let tip = chain.tip_header();
-                let log_slots = tip.log_slots;
-                let epoch_anchor = full_block_hash(tip);
-                let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
-                let unique_seed = tip_seed.wrapping_add(
-                    call_nonce
-                        .wrapping_add(attempt as u64)
-                        .wrapping_mul(0x9e3779b97f4a7c15),
-                );
-                (epoch_anchor, log_slots, unique_seed)
-            };
-            // PRNG runs without holding the lock.
-            let raw = generate_slot_hints(unique_seed, log_slots, 512);
-            // Lock 2: filter empty slots only, preferring holes in live segments.
-            let slot_hints = {
-                let chain = self.chain.read().await;
-                let mut hints = chain.state.state.empty_slot_hints_in_populated_segments(
-                    unique_seed,
-                    8,
-                    &reserved_outputs,
-                );
-                let mut seen = reserved_outputs.clone();
-                seen.extend(hints.iter().copied());
-                for idx in raw {
-                    if (idx as u64) < (1u64 << log_slots)
-                        && seen.insert(idx)
-                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
-                    {
-                        hints.push(idx);
-                        if hints.len() == 8 {
-                            break;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+
+                let reserved_outputs = self.mempool.reserved_output_slots().await;
+
+                // Lock 1: extract tip data only (no PRNG or heavy work under lock).
+                let (epoch_anchor, log_slots, unique_seed) = {
+                    let chain = self.chain.read().await;
+                    let tip = chain.tip_header();
+                    let log_slots = tip.log_slots;
+                    let epoch_anchor = full_block_hash(tip);
+                    let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+                    let unique_seed = tip_seed.wrapping_add(
+                        call_nonce
+                            .wrapping_add(attempt as u64)
+                            .wrapping_add((chunk_idx as u64).wrapping_mul(0x517cc1b727220a95))
+                            .wrapping_mul(0x9e3779b97f4a7c15),
+                    );
+                    (epoch_anchor, log_slots, unique_seed)
+                };
+                // PRNG runs without holding the lock.
+                let raw = generate_slot_hints(unique_seed, log_slots, 512);
+                // Lock 2: filter empty slots only, preferring holes in live segments.
+                let slot_hints = {
+                    let chain = self.chain.read().await;
+                    let mut hints = chain.state.state.empty_slot_hints_in_populated_segments(
+                        unique_seed,
+                        8,
+                        &reserved_outputs,
+                    );
+                    let mut seen = reserved_outputs.clone();
+                    seen.extend(hints.iter().copied());
+                    for idx in raw {
+                        if (idx as u64) < (1u64 << log_slots)
+                            && seen.insert(idx)
+                            && chain.state.state.slot(idx)
+                                == noid_chain::fri_state::SlotValue::EMPTY
+                        {
+                            hints.push(idx);
+                            if hints.len() == 8 {
+                                break;
+                            }
                         }
                     }
-                }
-                hints
-            };
+                    hints
+                };
 
-            if slot_hints.len() < 2 {
-                return Err(rpc_err("no empty slot hints available"));
+                if slot_hints.len() < 2 {
+                    return Err(rpc_err("no empty slot hints available"));
+                }
+
+                // Build+prove in spawn_blocking (CPU-heavy).
+                let wallet = Arc::clone(&self.wallet);
+                let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
+                    wallet.build_send(
+                        to_address,
+                        chunk_amount,
+                        effective_fee,
+                        epoch_anchor,
+                        slot_hints,
+                        log_slots,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(parts)) => parts,
+                    Ok(Err(e)) => return Err(rpc_err(e)),
+                    Err(e) => return Err(rpc_err(format!("task: {e}"))),
+                };
+
+                let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                    Ok(i) => i,
+                    Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
+                };
+                let tx_shape = format!("{:?}", intent.tx_body.shape);
+                let failed_tx_hash = intent.tx_body_hash.0;
+                let output_slots: Vec<u32> = intent
+                    .tx_body
+                    .outputs
+                    .iter()
+                    .filter(|o| o.valid)
+                    .map(|o| o.slot_index)
+                    .collect();
+
+                match self.mempool.submit(intent, intent_bytes).await {
+                    Ok(hash) => {
+                        self.wallet.add_pending_inputs(&input_slots);
+                        if attempt > 0 {
+                            tracing::info!(
+                                chunk_idx,
+                                attempt,
+                                "wallet_send chunk succeeded after retry"
+                            );
+                        }
+                        tx_hashes.push(hex::encode(hash.0));
+                        tx_shapes.push(tx_shape);
+                        submitted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        self.wallet
+                            .cleanup_failed_send(failed_tx_hash, &output_slots);
+                        last_err = e.to_string();
+                        tracing::debug!(chunk_idx, attempt, err = %last_err, "wallet_send chunk conflict, retrying");
+                    }
+                }
             }
 
-            // Build+prove in spawn_blocking (CPU-heavy: ~0.3–3 s).
-            let wallet = Arc::clone(&self.wallet);
-            let intent_bytes = match tokio::task::spawn_blocking(move || {
-                wallet.build_send(
-                    to_address,
-                    amount_micronoid,
-                    effective_fee,
-                    epoch_anchor,
-                    slot_hints,
-                    log_slots,
-                )
-            })
-            .await
-            {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(e)) => return Err(rpc_err(e)),
-                Err(e) => return Err(rpc_err(format!("task: {e}"))),
-            };
-
-            let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
-                Ok(i) => i,
-                Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
-            };
-
-            match self.mempool.submit(intent, intent_bytes).await {
-                Ok(hash) => {
-                    if attempt > 0 {
-                        tracing::info!(attempt, "wallet_send succeeded after retry");
-                    }
-                    return Ok(WalletSendResult {
-                        tx_hash: hex::encode(hash.0),
-                        fee_micronoid: effective_fee,
-                    });
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tracing::debug!(attempt, err = %last_err, "wallet_send: slot conflict, retrying");
-                }
+            if !submitted {
+                let partial = if tx_hashes.is_empty() {
+                    String::new()
+                } else {
+                    format!("; already submitted chunks: {}", tx_hashes.join(","))
+                };
+                return Err(rpc_err(format!(
+                    "wallet_send chunk {chunk_idx} failed after 3 attempts: {last_err}{partial}"
+                )));
             }
         }
 
-        Err(rpc_err(format!(
-            "wallet_send failed after 3 attempts: {last_err}"
-        )))
+        let primary = tx_hashes.first().cloned().unwrap_or_default();
+        let primary_shape = tx_shapes.first().cloned();
+        let split_count = if tx_hashes.len() > 1 {
+            Some(tx_hashes.len())
+        } else {
+            None
+        };
+        Ok(WalletSendResult {
+            tx_hash: primary,
+            fee_micronoid: effective_fee.saturating_mul(tx_hashes.len() as u64),
+            tx_hashes,
+            split_count,
+            shape: primary_shape,
+            tx_shapes,
+        })
     }
 
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String> {
@@ -1035,6 +1123,7 @@ impl ParanoidApiServer for RpcHandler {
                 Ok(i) => i,
                 Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
             };
+            let tx_shape = format!("{:?}", intent.tx_body.shape);
 
             match self.mempool.submit(intent, intent_bytes).await {
                 Ok(hash) => {
@@ -1043,9 +1132,14 @@ impl ParanoidApiServer for RpcHandler {
                     // caused Bug #3: a failed submit left UTXOs permanently locked,
                     // so every subsequent retry failed to find inputs.
                     self.wallet.add_pending_inputs(&input_slots);
+                    let tx_hash = hex::encode(hash.0);
                     return Ok(WalletSendResult {
-                        tx_hash: hex::encode(hash.0),
+                        tx_hash: tx_hash.clone(),
                         fee_micronoid: effective_fee,
+                        tx_hashes: vec![tx_hash],
+                        split_count: None,
+                        shape: Some(tx_shape.clone()),
+                        tx_shapes: vec![tx_shape],
                     });
                 }
                 Err(e) => {

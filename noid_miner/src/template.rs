@@ -29,6 +29,24 @@ use noid_chain::state::ChainState;
 use noid_chain::storage::{MdbxChainContext, MdbxContextError};
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
+use noid_tx::TxShape;
+
+/// Shapes that the current cryptographic block prover can include directly in a block.
+#[inline]
+fn is_current_block_provable_shape(shape: TxShape) -> bool {
+    matches!(shape, TxShape::Standard4x8 | TxShape::Sweep25x2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_block_template_policy_accepts_current_zk_bound_shapes() {
+        assert!(is_current_block_provable_shape(TxShape::Standard4x8));
+        assert!(is_current_block_provable_shape(TxShape::Sweep25x2));
+    }
+}
 
 /// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +232,7 @@ impl TemplateBuilder {
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS - 1;
         let max_user_txs = max_user_txs.min(consensus_max);
-        let entries = self.mempool.select_for_block(max_user_txs).await;
+        let entries = self.mempool.select_for_block(consensus_max).await;
         // Single-pass: move proof bytes and transactions together (no clone).
         let (proof_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
             .into_iter()
@@ -228,8 +246,10 @@ impl TemplateBuilder {
             .into_iter()
             .zip(txs)
             .filter(|(_, tx)| {
-                tx.body.is_coinbase || snapshot.is_anchor_fresh(&tx.body.epoch_anchor)
+                is_current_block_provable_shape(tx.body.shape)
+                    && (tx.body.is_coinbase || snapshot.is_anchor_fresh(&tx.body.epoch_anchor))
             })
+            .take(max_user_txs)
             .unzip();
         let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
             proof_bytes

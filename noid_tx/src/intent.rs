@@ -158,7 +158,7 @@ impl TxIntent {
         }
         let n_slots = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
         *src = &src[4..];
-        if n_slots > 12 {
+        if n_slots > tx_body.shape.max_claimed_slots() {
             return Err(WireError::CountTooLarge);
         }
         let mut claimed_slots = Vec::with_capacity(n_slots);
@@ -203,10 +203,10 @@ mod tests {
     use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
 
     fn mk_body() -> TxBody {
-        TxBody {
-            epoch_anchor: [0xAA; 32],
-            fee: 100,
-            inputs: vec![TxInput {
+        TxBody::standard(
+            [0xAA; 32],
+            100,
+            vec![TxInput {
                 slot_index: 42,
                 value: 1000,
                 owner: Address([0x11; 32]),
@@ -214,12 +214,45 @@ mod tests {
                 auth_tag: AuthTag([0x33; 32]),
                 valid: true,
             }],
-            outputs: vec![TxOutput {
+            vec![TxOutput {
                 slot_index: 99,
                 value: 900,
                 owner: Address([0x44; 32]),
                 valid: true,
             }],
+            false,
+        )
+    }
+
+    fn mk_sweep_body() -> TxBody {
+        TxBody {
+            shape: crate::types::TxShape::Sweep25x2,
+            epoch_anchor: [0xAB; 32],
+            fee: 250,
+            inputs: (0..5)
+                .map(|i| TxInput {
+                    slot_index: i,
+                    value: 100 + i as u64,
+                    owner: Address([0x20 + i as u8; 32]),
+                    spend_secret: SpendSecret([0x40 + i as u8; 32]),
+                    auth_tag: AuthTag([0x60 + i as u8; 32]),
+                    valid: true,
+                })
+                .collect(),
+            outputs: vec![
+                TxOutput {
+                    slot_index: 100,
+                    value: 400,
+                    owner: Address([0x88; 32]),
+                    valid: true,
+                },
+                TxOutput {
+                    slot_index: 101,
+                    value: 75,
+                    owner: Address([0x99; 32]),
+                    valid: true,
+                },
+            ],
             is_coinbase: false,
         }
     }
@@ -261,6 +294,30 @@ mod tests {
         assert_eq!(back.claims_commitment, intent.claims_commitment);
         assert_eq!(back.claimed_slots, intent.claimed_slots);
         assert_eq!(back.logic_proof_bytes, intent.logic_proof_bytes);
+    }
+
+    #[test]
+    fn sweep_roundtrip() {
+        let body = mk_sweep_body();
+        let claimed_slots = TxIntent::claimed_slots_from_body(&body);
+        let intent = TxIntent {
+            tx_body: body,
+            tx_body_hash: TxBodyHash([0xBC; 32]),
+            claims_commitment: [0xCD; 32],
+            claimed_slots,
+            logic_proof_bytes: vec![1, 2, 3],
+        };
+        let bytes = intent.to_bytes();
+        let back = TxIntent::from_bytes(&bytes).unwrap();
+        assert_eq!(back.tx_body.shape, crate::types::TxShape::Sweep25x2);
+        assert_eq!(back.tx_body.inputs.len(), 5);
+        assert_eq!(back.tx_body.outputs.len(), 2);
+        assert_eq!(back.claimed_slots.len(), 7);
+        assert!(back
+            .tx_body
+            .inputs
+            .iter()
+            .all(|inp| inp.spend_secret == SpendSecret([0u8; 32])));
     }
 
     /// Verify spend_secret is NOT present in the serialized bytes.

@@ -220,6 +220,12 @@ impl WalletState {
         });
     }
 
+    /// Remove a pending send that never entered the mempool.
+    pub fn remove_pending_send(&mut self, tx_hash: &[u8; 32]) {
+        self.history
+            .retain(|entry| !(&entry.tx_hash == tx_hash && entry.height == 0));
+    }
+
     /// Update the height of a pending (height=0) tx once it's confirmed in a block.
     pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) {
         for entry in self.history.iter_mut() {

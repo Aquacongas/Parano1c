@@ -140,6 +140,7 @@ fn build_tx_fixture(slot_base: u32, secrets: &[[Block128; 2]; N_AUTH_INPUTS]) ->
     }
 
     let mut body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xAA; 32],
         fee,
         inputs,
@@ -198,6 +199,7 @@ fn build_tx_fixture(slot_base: u32, secrets: &[[Block128; 2]; N_AUTH_INPUTS]) ->
     let pi = PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: TxBodyHash(fields_to_bytes(tx_body_hash)),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -232,7 +234,9 @@ fn build_tx_fixture(slot_base: u32, secrets: &[[Block128; 2]; N_AUTH_INPUTS]) ->
 fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
     let witnesses: Vec<TxBlockWitness<'_>> = fixtures[..n_tx]
         .iter()
-        .map(|f| TxBlockWitness {
+        .enumerate()
+        .map(|(k, f)| TxBlockWitness {
+            block_tx_index: (k + 1) as u32,
             air: &f.air as &dyn Air,
             trace: &f.trace,
             pi: &f.pi,
@@ -275,8 +279,16 @@ fn bench_block(n_tx: usize, fixtures: &[TxFixture]) {
     let verify_time = t1.elapsed();
 
     let proof_bytes = block_proof.byte_len();
-    let spine_bytes = block_proof.block_spine_proof.byte_len();
-    let alg_bytes_total: usize = block_proof.tx_algebraic.iter().map(|a| a.byte_len()).sum();
+    let standard_bucket = block_proof
+        .standard_bucket
+        .as_ref()
+        .expect("standard bucket");
+    let spine_bytes = standard_bucket.block_spine_proof.byte_len();
+    let alg_bytes_total: usize = standard_bucket
+        .tx_algebraic
+        .iter()
+        .map(|a| a.byte_len())
+        .sum();
 
     println!("  [{:>4}-tx Block]", n_tx);
     println!("    prove_block (full node):   {}", fmt_ms(prove_time));

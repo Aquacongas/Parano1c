@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
+use noid_air::Air;
 use noid_chain::block::Block;
 use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::storage::MdbxChainContext;
@@ -679,10 +680,11 @@ pub(crate) fn run_prove_block(
     prev_state_root: [u8; 32],
 ) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
     use noid_block::{
-        build_block_witnesses, build_empty_state_bindings, build_state_bindings_from_binding,
-        prove_block,
+        assemble_sweep_bucket_proof, block_recursive_claim_hash, build_block_witnesses,
+        build_empty_state_bindings, build_state_bindings_from_binding,
+        prove_block_with_total_tx_count, prove_state_bindings_standalone, BlockProof,
+        BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
     };
-    use noid_chain::block::proof_transcript_hash;
     use noid_stark::WalletProofBundle;
 
     // Coinbase-only: marker proof, no ZK proving needed.
@@ -711,16 +713,57 @@ pub(crate) fn run_prove_block(
             non_cb_count,
         ));
     }
+    for (tx, bundle) in all_txs
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .zip(&bundles)
+    {
+        if bundle.shape() != tx.body.shape {
+            return Err(format!(
+                "WalletProofBundle shape {:?} does not match tx body shape {:?} for {:?}",
+                bundle.shape(),
+                tx.body.shape,
+                tx.tx_body_hash
+            ));
+        }
+    }
 
     let log_slots = tmpl.inner.log_slots;
     let owned_witnesses = build_block_witnesses(&all_txs, &bundles, log_slots);
-    let witnesses: Vec<_> = owned_witnesses
+    let mut standard_owned = Vec::new();
+    let mut sweep_owned = Vec::new();
+    for witness in owned_witnesses {
+        match witness {
+            OwnedTxWitness::Standard4x8(w) => standard_owned.push(w),
+            OwnedTxWitness::Sweep25x2(w) => sweep_owned.push(w),
+        }
+    }
+
+    let witnesses: Vec<TxBlockWitness<'_>> = standard_owned
         .iter()
-        .map(|w| w.as_block_witness())
+        .map(|w| TxBlockWitness {
+            block_tx_index: w.block_tx_index,
+            air: &w.air as &dyn noid_air::Air,
+            trace: &w.trace,
+            pi: &w.pi,
+            spine_inputs: &w.spine_inputs,
+            auth_public: &w.auth_public,
+            auth_proof: &w.auth_proof,
+            auth_slices: &w.auth_slices,
+        })
         .collect();
 
-    // Build state bindings (FRI + Merkle path data) if binding is available.
     let n_tx = tmpl.n_user_txs() as u32;
+    let new_state_root = tmpl
+        .inner
+        .state_binding
+        .as_ref()
+        .map(|b| b.new_state_root)
+        .unwrap_or([0u8; 32]);
+
+    let sweep_bucket = assemble_sweep_bucket_proof(prev_state_root, &sweep_owned)
+        .map_err(|e| format!("assemble_sweep_bucket_proof failed: {e:?}"))?;
+
     let non_cb_bodies: Vec<noid_tx::TxBody> =
         tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();
     let owned_bindings = match &tmpl.inner.state_binding {
@@ -742,18 +785,50 @@ pub(crate) fn run_prove_block(
     } else {
         &state_bindings_owned
     };
-    let new_state_root = tmpl
-        .inner
-        .state_binding
-        .as_ref()
-        .map(|b| b.new_state_root)
-        .unwrap_or([0u8; 32]);
+    let n_state_bindings = state_bindings.len();
+    let sb_n_cols_per_seg = state_bindings.first().map_or(0, |sb| sb.air.n_columns());
+    let sb_log_rows = state_bindings.first().map_or(0, |sb| sb.air.log_rows());
 
-    // Run prove_block (CPU-intensive: ~10s at 100 txs on 8 cores).
-    match prove_block(prev_state_root, new_state_root, &witnesses, state_bindings) {
+    let prove_result = if witnesses.is_empty() {
+        let (state_binding_starks, pre_state_openings, post_state_openings) =
+            prove_state_bindings_standalone(state_bindings);
+        Ok(BlockProof {
+            meta: BlockPublicMeta {
+                prev_block_state_root: prev_state_root,
+                new_state_root,
+                n_tx,
+                n_air_per_tx: 0,
+                n_auth_slices_per_tx: 0,
+                log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
+                n_block_spine_slices: 0,
+                n_state_bindings: n_state_bindings as u32,
+                state_binding_n_cols: sb_n_cols_per_seg as u32,
+                state_binding_log_rows: sb_log_rows as u32,
+            },
+            standard_bucket: None,
+            sweep_bucket,
+            state_binding_algebraics: vec![],
+            state_binding_starks,
+            pre_state_openings,
+            post_state_openings,
+        })
+    } else {
+        let mut proof = prove_block_with_total_tx_count(
+            prev_state_root,
+            new_state_root,
+            &witnesses,
+            state_bindings,
+            n_tx,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        proof.sweep_bucket = sweep_bucket;
+        Ok(proof)
+    };
+
+    match prove_result {
         Ok(block_proof) => {
             let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
-            let transcript_hash = proof_transcript_hash(&proof_bytes);
+            let transcript_hash = block_recursive_claim_hash(&block_proof);
             // witness_root = DA payload commitment; uses transcript_hash until
             // full Binius DA packing is wired (noid_chain::da::trace_witness_root).
             let witness_root = transcript_hash;

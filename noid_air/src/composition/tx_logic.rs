@@ -140,7 +140,18 @@ pub fn boundary_pins_from_body(body: &TxBody) -> TxBodyMerkleBoundaryPins {
     use noid_poseidon2b::primitives::{
         hash_input_leaf, hash_output_leaf, hash_tx_body, TXBODY_INPUTS, TXBODY_OUTPUTS,
     };
-    use noid_tx::{MAX_INPUTS, MAX_OUTPUTS};
+    use noid_tx::{TxShape, MAX_INPUTS, MAX_OUTPUTS};
+
+    assert_eq!(
+        body.shape,
+        TxShape::Standard4x8,
+        "unsupported tx body shape for TxLogicAir"
+    );
+    assert!(body.inputs.len() <= MAX_INPUTS, "inputs exceed MAX_INPUTS");
+    assert!(
+        body.outputs.len() <= MAX_OUTPUTS,
+        "outputs exceed MAX_OUTPUTS"
+    );
 
     let mut pins = TxBodyMerkleBoundaryPins::default();
 
@@ -273,6 +284,7 @@ mod tests {
 
     fn mk_balanced_body() -> TxBody {
         TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xAA; 32],
             fee: 100,
             inputs: vec![
@@ -314,6 +326,14 @@ mod tests {
         let air = TxLogicAir::new(witness.boundary_pins);
         let trace = air.build_trace(&witness);
         assert!(air.check(&trace));
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported tx body shape for TxLogicAir")]
+    fn boundary_pins_reject_reserved_shape() {
+        let mut body = mk_balanced_body();
+        body.shape = noid_tx::TxShape::Sweep25x2;
+        let _ = boundary_pins_from_body(&body);
     }
 
     #[test]
@@ -363,6 +383,7 @@ mod tests {
     #[test]
     fn coinbase_body_produces_valid_witness() {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0xBB; 32],
             fee: 0,
             inputs: vec![

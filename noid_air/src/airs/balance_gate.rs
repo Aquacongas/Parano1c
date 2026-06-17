@@ -263,6 +263,51 @@ impl Constraint for BalanceFinalCarryGate {
     }
 }
 
+/// `is_input_lhs · (1 + is_input_lhs_next) · (lhs_carry_next + rhs_carry_next) == 0`
+/// — final carry equality for two same-width adder tails.
+pub struct BalanceFinalCarryToCarryGate {
+    local: [usize; 1],
+    shifted: [usize; 3],
+}
+
+impl BalanceFinalCarryToCarryGate {
+    pub fn new(is_input_lhs: usize, lhs_carry: usize, rhs_carry: usize) -> Self {
+        Self {
+            local: [is_input_lhs],
+            shifted: [is_input_lhs, lhs_carry, rhs_carry],
+        }
+    }
+}
+
+impl Constraint for BalanceFinalCarryToCarryGate {
+    fn degree(&self) -> usize {
+        3
+    }
+    fn columns(&self) -> &[usize] {
+        &self.local
+    }
+    fn shifted_columns(&self) -> &[usize] {
+        &self.shifted
+    }
+    fn evaluate(&self, frame: EvalFrame) -> Block128 {
+        let sel = frame.local[0];
+        let sel_next = frame.next[0];
+        let lhs_carry_next = frame.next[1];
+        let rhs_carry_next = frame.next[2];
+        sel * (Block128::ONE + sel_next) * (lhs_carry_next + rhs_carry_next)
+    }
+    fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
+        let sel = frame.local[0];
+        let sel_next = frame.next[0];
+        let lhs_carry_next = frame.next[1];
+        let rhs_carry_next = frame.next[2];
+        clmul_gcm(
+            clmul_gcm(sel, 1 ^ sel_next),
+            lhs_carry_next ^ rhs_carry_next,
+        )
+    }
+}
+
 /// `is_input_sel · (1 + is_input_sel_next) · target_next == 0` — degree-3
 /// rotation gate that pins a single target cell to zero on the row
 /// immediately after a selector's `is_input` boundary. Used to pin the
@@ -765,6 +810,211 @@ impl Air for BalanceGateAir {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sweep25x2 balance AIR
+// ---------------------------------------------------------------------------
+
+/// Sweep balance uses two complete 32-leaf addition trees:
+///
+/// - LHS: 25 input values + 7 zero pads.
+/// - RHS: 2 output values + fee + 29 zero pads.
+///
+/// Both trees have identical depth and final width, so equality is enforced by
+/// comparing the final sum bits and final carry bit. This keeps the large shape
+/// separate from Standard4x8 instead of inflating the standard circuit.
+pub const SWEEP_BALANCE_LEAVES: usize = 32;
+pub const SWEEP_BALANCE_INPUTS: usize = 25;
+pub const SWEEP_BALANCE_OUTPUTS: usize = 2;
+pub const SWEEP_BALANCE_TREE_BLOCKS: usize = SWEEP_BALANCE_LEAVES - 1;
+pub const SWEEP_BALANCE_N_BLOCKS: usize = 2 * SWEEP_BALANCE_TREE_BLOCKS;
+pub const SWEEP_BALANCE_N_COLS: usize = SWEEP_BALANCE_N_BLOCKS * BIT_ADDER_N_COLS;
+
+#[inline]
+const fn sweep_level_count(level: usize) -> usize {
+    SWEEP_BALANCE_LEAVES >> (level + 1)
+}
+
+#[inline]
+const fn sweep_level_start(level: usize) -> usize {
+    match level {
+        0 => 0,
+        1 => 16,
+        2 => 24,
+        3 => 28,
+        4 => 30,
+        _ => panic!("invalid sweep balance tree level"),
+    }
+}
+
+#[inline]
+const fn sweep_block(side: usize, level: usize, index: usize) -> usize {
+    side * SWEEP_BALANCE_TREE_BLOCKS + sweep_level_start(level) + index
+}
+
+#[inline]
+const fn sweep_block_width(level: usize) -> usize {
+    64 + level
+}
+
+pub fn emit_sweep_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint>> {
+    let mut constraints: Vec<Box<dyn Constraint>> = Vec::new();
+
+    for blk in 0..SWEEP_BALANCE_N_BLOCKS {
+        let layout = BitAdderLayout::shifted(base_col + blk * BIT_ADDER_N_COLS);
+        constraints.extend(emit_block_constraints(layout));
+    }
+
+    // Inter-level bridges inside each side's complete binary tree.
+    for side in 0..2 {
+        for level in 1..5 {
+            for parent_idx in 0..sweep_level_count(level) {
+                let parent = sweep_block(side, level, parent_idx);
+                let left = sweep_block(side, level - 1, parent_idx * 2);
+                let right = sweep_block(side, level - 1, parent_idx * 2 + 1);
+                for (src, slot) in [(left, OperandSlot::A), (right, OperandSlot::B)] {
+                    let dst = dst_col_at(parent, slot, base_col);
+                    let src_sum = src_sum_col_at(src, base_col);
+                    let src_carry = src_carry_col_at(src, base_col);
+                    let src_is_input = src_is_input_col_at(src, base_col);
+                    constraints.push(Box::new(BalanceBridgeBitsGate::new(
+                        src_is_input,
+                        dst,
+                        src_sum,
+                    )));
+                    constraints.push(Box::new(BalanceBridgeCarryGate::new(
+                        src_is_input,
+                        dst,
+                        src_carry,
+                    )));
+                }
+            }
+        }
+    }
+
+    let lhs_tail = sweep_block(0, 4, 0);
+    let rhs_tail = sweep_block(1, 4, 0);
+    let lhs_is_input = src_is_input_col_at(lhs_tail, base_col);
+    constraints.push(Box::new(BalanceFinalSumGate::new(
+        lhs_is_input,
+        src_sum_col_at(lhs_tail, base_col),
+        src_sum_col_at(rhs_tail, base_col),
+    )));
+    constraints.push(Box::new(BalanceFinalCarryToCarryGate::new(
+        lhs_is_input,
+        src_carry_col_at(lhs_tail, base_col),
+        src_carry_col_at(rhs_tail, base_col),
+    )));
+
+    constraints
+}
+
+pub fn build_sweep_balance_trace_parts(
+    log_rows: usize,
+    inputs: [u64; SWEEP_BALANCE_INPUTS],
+    outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+    fee: u64,
+) -> (Vec<Vec<Block128>>, Vec<ColumnDomain>) {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance sub-trace needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
+
+    fn first_pair(n: usize, a: u128, b: u128) -> Vec<(u128, u128)> {
+        let mut v = vec![(0u128, 0u128); n];
+        v[0] = (a, b);
+        v
+    }
+
+    let mut lhs = [0u128; SWEEP_BALANCE_LEAVES];
+    for i in 0..SWEEP_BALANCE_INPUTS {
+        lhs[i] = inputs[i] as u128;
+    }
+    let mut rhs = [0u128; SWEEP_BALANCE_LEAVES];
+    rhs[0] = outputs[0] as u128;
+    rhs[1] = outputs[1] as u128;
+    rhs[2] = fee as u128;
+
+    let mut per_block = Vec::with_capacity(SWEEP_BALANCE_N_BLOCKS);
+    for mut level_values in [lhs.to_vec(), rhs.to_vec()] {
+        for level in 0..5 {
+            let width = sweep_block_width(level);
+            let mut next = Vec::with_capacity(level_values.len() / 2);
+            for pair in level_values.chunks_exact(2) {
+                let a = pair[0];
+                let b = pair[1];
+                let sum = a + b;
+                assert!(sum < (1u128 << (width + 1)));
+                per_block.push((width, a, b));
+                next.push(sum);
+            }
+            level_values = next;
+        }
+        debug_assert_eq!(level_values.len(), 1);
+    }
+    debug_assert_eq!(per_block.len(), SWEEP_BALANCE_N_BLOCKS);
+
+    let mut cols: Vec<Vec<Block128>> = Vec::with_capacity(SWEEP_BALANCE_N_COLS);
+    let mut domains: Vec<ColumnDomain> = Vec::with_capacity(SWEEP_BALANCE_N_COLS);
+    for (width, a, b) in per_block {
+        let air = BitAdderAir::new(width, log_rows);
+        let sub = air.build_trace(&first_pair(n_instances, a, b));
+        cols.extend(sub.columns);
+        domains.extend(sub.domains);
+    }
+    (cols, domains)
+}
+
+/// Standalone balance AIR for `Sweep25x2`.
+pub struct Sweep25x2BalanceGateAir {
+    log_rows: usize,
+    constraints: Vec<Box<dyn Constraint>>,
+}
+
+impl Sweep25x2BalanceGateAir {
+    pub fn new(log_rows: usize) -> Self {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "Sweep25x2BalanceGateAir needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        Self {
+            log_rows,
+            constraints: emit_sweep_balance_constraints(0),
+        }
+    }
+
+    pub fn build_trace(
+        &self,
+        inputs: [u64; SWEEP_BALANCE_INPUTS],
+        outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+        fee: u64,
+    ) -> Trace {
+        let (cols, domains) = build_sweep_balance_trace_parts(self.log_rows, inputs, outputs, fee);
+        Trace::new_with_domains(cols, domains)
+    }
+}
+
+impl Air for Sweep25x2BalanceGateAir {
+    fn n_columns(&self) -> usize {
+        SWEEP_BALANCE_N_COLS
+    }
+    fn log_rows(&self) -> usize {
+        self.log_rows
+    }
+    fn constraints(&self) -> &[Box<dyn Constraint>] {
+        &self.constraints
+    }
+    fn public_columns(&self) -> &[PublicColumn] {
+        &[]
+    }
+    fn column_domains(&self) -> Vec<ColumnDomain> {
+        // Conservative domain annotation for the large sweep AIR. The generic
+        // Block128 path is slower than the bit-specialised flat path, but avoids
+        // relying on bit-domain shortcuts across the much wider 62-adder layout.
+        vec![ColumnDomain::Block128; SWEEP_BALANCE_N_COLS]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +1066,81 @@ mod tests {
                 "balanced tx rejected: seed={seed} ins={ins:?} outs={outs:?} fee={fee}"
             );
         }
+    }
+
+    fn balanced_sweep_tuple(
+        seed: u64,
+    ) -> (
+        [u64; SWEEP_BALANCE_INPUTS],
+        [u64; SWEEP_BALANCE_OUTPUTS],
+        u64,
+    ) {
+        let mut s = seed.wrapping_mul(0xD6E8_FD93_13A2_9D4D).wrapping_add(7);
+        let mut next = || -> u64 {
+            s = s
+                .wrapping_mul(0x5851F42D4C957F2D)
+                .wrapping_add(0x14057B7EF767814F);
+            s >> 32
+        };
+        let mut inputs = [0u64; SWEEP_BALANCE_INPUTS];
+        for input in inputs.iter_mut() {
+            *input = (next() & 0xFFFF) + 1;
+        }
+        let total: u64 = inputs.iter().sum();
+        let fee = (next() % 1000).min(total);
+        let spendable = total - fee;
+        let out0 = next() % (spendable + 1);
+        let outputs = [out0, spendable - out0];
+        (inputs, outputs, fee)
+    }
+
+    #[test]
+    fn sweep_balance_gate_accepts_balanced_25x2() {
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        for seed in 0..8u64 {
+            let (ins, outs, fee) = balanced_sweep_tuple(seed);
+            let trace = air.build_trace(ins, outs, fee);
+            assert!(
+                air.check(&trace),
+                "sweep balanced tx rejected: seed={seed} ins_sum={} outs={outs:?} fee={fee}",
+                ins.iter().map(|&v| v as u128).sum::<u128>()
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_balance_gate_rejects_unbalanced() {
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        let (ins, outs, fee) = balanced_sweep_tuple(42);
+        let trace = air.build_trace(ins, outs, fee.saturating_add(1));
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn sweep_balance_gate_rejects_last_input_tamper() {
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        let (ins, outs, fee) = balanced_sweep_tuple(77);
+        let mut trace = air.build_trace(ins, outs, fee);
+        assert!(air.check(&trace));
+
+        // input[24] is LHS leaf-level block 12, operand A.
+        let blk = sweep_block(0, 0, 12);
+        let col = dst_col_at(blk, OperandSlot::A, 0);
+        trace.columns[col][0] += Block128::ONE;
+        assert!(!air.check(&trace));
+    }
+
+    #[test]
+    fn sweep_balance_gate_accepts_high_values_without_overflow() {
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        let inputs = [u64::MAX / 64; SWEEP_BALANCE_INPUTS];
+        let total: u128 = inputs.iter().map(|&v| v as u128).sum();
+        assert!(total < u64::MAX as u128);
+        let fee = 12345u64;
+        let spendable = total as u64 - fee;
+        let outputs = [spendable / 2, spendable - spendable / 2];
+        let trace = air.build_trace(inputs, outputs, fee);
+        assert!(air.check(&trace));
     }
 
     #[test]

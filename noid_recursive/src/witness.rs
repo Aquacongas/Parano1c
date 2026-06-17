@@ -11,7 +11,7 @@
 //! `noid_block`).  `noid_recursive` itself never imports `noid_block`
 //! to avoid a cyclic dependency.
 
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 use noid_fri_binius::compact_fri::CompactEvalProof;
 use noid_fri_binius::MerkleCap;
 use noid_stark::interleaved::AlgebraicStarkProof;
@@ -38,6 +38,15 @@ pub struct BlockReplayWitness {
     pub block_col_openings: Vec<Block128>,
     /// Block-level degree-2 multipoint sumcheck round polynomials.
     pub block_multipoint_rounds: Vec<Vec<Block128>>,
+    /// Fiat-Shamir challenges produced by the real block multipoint transcript.
+    pub block_multipoint_challenges: Vec<Block128>,
+    /// Secondary block-level degree-2 multipoint sumcheck round polynomials.
+    /// All-zero for single-shape blocks; populated for mixed shape blocks.
+    pub block_secondary_multipoint_rounds: Vec<Vec<Block128>>,
+    /// Fiat-Shamir challenges produced by the secondary bucket multipoint transcript.
+    pub block_secondary_multipoint_challenges: Vec<Block128>,
+    /// Initial claim for the secondary bucket multipoint sumcheck.
+    pub block_secondary_initial_claim: Block128,
     /// The compact FRI proof embedded in the mixed opening.
     /// Fed to `extract_fri_query_inputs` for the FRI Merkle Kill-Shot.
     pub compact_fri: CompactEvalProof,
@@ -48,6 +57,11 @@ pub struct BlockReplayWitness {
     /// Passed into the recursive STARK via `extra_transcript` to bind the
     /// fold-check to the real value rather than the placeholder ZERO.
     pub block_initial_claim: Block128,
+    /// Canonical claim folded into the chain accumulator. For legacy pure-standard
+    /// blocks this may equal a field projection of the canonical block proof
+    /// transcript hash, while `block_initial_claim` remains the actual sumcheck
+    /// target checked by `RecursiveBlockAir`.
+    pub chain_claim: Block128,
 }
 
 impl BlockReplayWitness {
@@ -61,18 +75,59 @@ impl BlockReplayWitness {
         state_binding_algebraics: Vec<AlgebraicStarkProof>,
         block_col_openings: Vec<Block128>,
         block_multipoint_rounds: Vec<Vec<Block128>>,
+        block_multipoint_challenges: Vec<Block128>,
         compact_fri: CompactEvalProof,
         mixed_all_openings: Vec<Block128>,
         block_initial_claim: Block128,
+        chain_claim: Block128,
+    ) -> Self {
+        Self::from_two_bucket_parts(
+            cap,
+            state_binding_algebraics,
+            block_col_openings,
+            block_multipoint_rounds,
+            block_multipoint_challenges,
+            vec![vec![Block128::ZERO; 3]; noid_air::airs::tx_body_spine::SPINE_LOG_ROWS],
+            vec![Block128::ZERO; noid_air::airs::tx_body_spine::SPINE_LOG_ROWS],
+            Block128::ZERO,
+            compact_fri,
+            mixed_all_openings,
+            block_initial_claim,
+            chain_claim,
+        )
+    }
+
+    /// Construct a replay witness carrying two real block bucket transcripts.
+    /// Used for mixed-shape blocks. The first bucket is conventionally the
+    /// standard bucket when present; the second is the sweep bucket.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_two_bucket_parts(
+        cap: MerkleCap,
+        state_binding_algebraics: Vec<AlgebraicStarkProof>,
+        block_col_openings: Vec<Block128>,
+        block_multipoint_rounds: Vec<Vec<Block128>>,
+        block_multipoint_challenges: Vec<Block128>,
+        block_secondary_multipoint_rounds: Vec<Vec<Block128>>,
+        block_secondary_multipoint_challenges: Vec<Block128>,
+        block_secondary_initial_claim: Block128,
+        compact_fri: CompactEvalProof,
+        mixed_all_openings: Vec<Block128>,
+        block_initial_claim: Block128,
+        chain_claim: Block128,
     ) -> Self {
         Self {
             cap,
             state_binding_algebraics,
             block_col_openings,
             block_multipoint_rounds,
+            block_multipoint_challenges,
+            block_secondary_multipoint_rounds,
+            block_secondary_multipoint_challenges,
+            block_secondary_initial_claim,
             compact_fri,
             mixed_all_openings,
             block_initial_claim,
+            chain_claim,
         }
     }
 }
@@ -83,17 +138,21 @@ pub fn extract_block_replay_witness_parts(
     state_binding_algebraics: Vec<AlgebraicStarkProof>,
     block_col_openings: Vec<Block128>,
     block_multipoint_rounds: Vec<Vec<Block128>>,
+    block_multipoint_challenges: Vec<Block128>,
     compact_fri: CompactEvalProof,
     mixed_all_openings: Vec<Block128>,
     block_initial_claim: Block128,
+    chain_claim: Block128,
 ) -> BlockReplayWitness {
     BlockReplayWitness::from_parts(
         cap,
         state_binding_algebraics,
         block_col_openings,
         block_multipoint_rounds,
+        block_multipoint_challenges,
         compact_fri,
         mixed_all_openings,
         block_initial_claim,
+        chain_claim,
     )
 }

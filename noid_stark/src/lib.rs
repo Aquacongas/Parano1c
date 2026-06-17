@@ -41,9 +41,12 @@ pub mod vshift;
 
 pub mod interleaved;
 pub mod prove_logic;
+pub mod prove_logic_sweep;
 pub mod wallet_bundle;
 
-pub use wallet_bundle::{BundleDecodeError, WalletProofBundle};
+pub use wallet_bundle::{
+    BundleDecodeError, StandardWalletProofBundle, SweepWalletProofBundle, WalletProofBundle,
+};
 
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
@@ -155,6 +158,7 @@ pub fn absorb_public_inputs(channel: &mut Channel, pi: &PublicInputs) {
     absorb_digest_as_pair(channel, &pi.epoch_anchor);
     absorb_digest_as_pair(channel, &pi.claims_commitment);
     absorb_digest_as_pair(channel, &pi.tx_body_hash.0);
+    channel.observe_field_elem(Block128::from(pi.shape_id as u128));
     channel.observe_field_elem(Block128::from(pi.fee));
     // A1a — live-count public inputs. Pack both u8 counts into a
     // single field element so the wire-level struct ordering
@@ -2716,6 +2720,7 @@ mod tests {
             epoch_anchor: [0x11; 32],
             claims_commitment: [0u8; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
+            shape_id: noid_tx::TxShape::Standard4x8.id(),
             fee: 7,
             n_live_inputs: 0,
             n_live_outputs: 0,
@@ -2727,16 +2732,16 @@ mod tests {
     }
 
     fn mk_body() -> noid_tx::TxBody {
-        noid_tx::TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![
+        noid_tx::TxBody::standard(
+            [0u8; 32],
+            0,
+            vec![
                 TxInput::dummy(),
                 TxInput::dummy(),
                 TxInput::dummy(),
                 TxInput::dummy(),
             ],
-            outputs: vec![
+            vec![
                 TxOutput::dummy(),
                 TxOutput::dummy(),
                 TxOutput::dummy(),
@@ -2746,8 +2751,8 @@ mod tests {
                 TxOutput::dummy(),
                 TxOutput::dummy(),
             ],
-            is_coinbase: false,
-        }
+            false,
+        )
     }
 
     /// Build a minimal honest TxLogicAir + trace for use as a STARK engine fixture.
@@ -3998,6 +4003,7 @@ mod poseidon_perm_stark_tests {
             epoch_anchor: [0x11; 32],
             claims_commitment: [0u8; 32],
             tx_body_hash: TxBodyHash([0x44; 32]),
+            shape_id: noid_tx::TxShape::Standard4x8.id(),
             fee: 7,
             n_live_inputs: 0,
             n_live_outputs: 0,
@@ -4132,6 +4138,7 @@ mod tx_body_merkle_stark_tests {
             epoch_anchor: [0x11; 32],
             claims_commitment: [0u8; 32],
             tx_body_hash: noid_poseidon2b::primitives::TxBodyHash([0x44; 32]),
+            shape_id: noid_tx::TxShape::Standard4x8.id(),
             fee: 7,
             n_live_inputs: 0,
             n_live_outputs: 0,

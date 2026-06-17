@@ -37,9 +37,20 @@ pub trait WalletOps: Send + Sync {
     /// `state` is the current chain state (read under chain lock by caller).
     fn scan_state(&self, state: &SegmentedFriState, height: u64) -> WalletScanResult;
 
+    /// Plan one logical payment as one or more transaction amounts.
+    /// The returned amounts sum to `amount_micronoid`; each chunk is intended
+    /// to fit the largest wallet-supported shape (`Sweep25x2`) and one fee.
+    fn plan_send_splits(
+        &self,
+        amount_micronoid: u64,
+        fee_per_tx_micronoid: u64,
+    ) -> Result<Vec<u64>, String>;
+
     /// Build, prove, and serialize a send transaction.
     ///
-    /// Returns raw `TxIntent` bytes ready for mempool submission.
+    /// Returns raw `TxIntent` bytes plus selected input slot indices ready for
+    /// mempool submission. The caller must call `add_pending_inputs` only after
+    /// successful mempool admission; otherwise retries can self-lock UTXOs.
     ///
     /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
     ///
@@ -58,7 +69,7 @@ pub trait WalletOps: Send + Sync {
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,
         log_slots: u32,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
     /// Export a receipt for a past transaction as hex-encoded bytes.
     /// Returns `Err` if the tx is unknown or receipt was not generated
@@ -93,6 +104,10 @@ pub trait WalletOps: Send + Sync {
     /// For `build_consolidate` this must be called by the RPC layer only
     /// after a successful `mempool.submit`.
     fn add_pending_inputs(&self, slots: &[u32]);
+
+    /// Clear wallet-side pending output/history state for a send attempt that
+    /// built successfully but failed mempool admission.
+    fn cleanup_failed_send(&self, tx_hash: [u8; 32], output_slots: &[u32]);
 
     /// Derive and return the next unused address, advancing next_index.
     fn next_address(&self) -> Option<WalletAddressInfo>;

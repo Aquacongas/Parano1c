@@ -92,7 +92,7 @@ flowchart TD
     end
 
     subgraph REC["Chain (recursive)"]
-        ACC["ChainAccumulator\nchain_hash folds block_initial_claim"]
+        ACC["ChainAccumulator\nchain_hash folds chain_claim"]
         RAIR["RecursiveBlockAir\n256 rows · n_rounds=0\nAccumulator continuity"]
     end
 
@@ -119,6 +119,8 @@ flowchart TD
 **SpineGKR** (`spine_killshot.rs`): 59 Poseidon2b permutations forming a Merkle tree over the transaction body correctly produce `tx_body_hash`. Hypercube: 15 variables, 2¹⁵ = 32,768 cells. Output pinned deterministically as `PublicColumn` in `TxLogicAir`.
 
 **AuthGKR** (`auth_killshot.rs`): For each of up to 4 inputs, `Address[i] = H_ADDR(spend_secret[i])` and `AuthTag[i] = H_AUTH(spend_secret[i], tx_body_hash)`. 20 permutation slots, 14-variable hypercube. Outputs pinned as `PublicColumn` in `TxLogicAir`.
+
+**SweepAuthGKR** (`auth_killshot_sweep.rs`): The same AuthGKR construction widened to `Sweep25x2`: up to 25 inputs, 125 permutation slots, 16-variable hypercube. It proves the same relation (`Address`, `AuthTag`) for the larger input set and uses the same public-boundary transcript discipline.
 
 ### 5.2 The Frobenius Insight
 
@@ -206,6 +208,18 @@ Instead of one FRI opening per transaction (which would scale as O(N × FRI_cost
 
 **Proof size scaling:** O(log N) in the FRI layer (one opening), O(N) in the algebraic layer (one round polynomial per transaction per sumcheck round). Block proof does not grow as O(N × per-tx FRI).
 
+### 7.2.1 Sweep25x2 bucket aggregation
+
+`SweepBucketProof` mirrors the standard bucket aggregation pattern for the wider `Sweep25x2` shape. The sweep bucket commitment covers, for each sweep transaction, the sweep balance AIR columns plus wallet-provided `SweepWalletProofBundle::auth_slices` (AuthGKR `state` MLE slices only). The verifier checks:
+
+1. bucket coverage and shape binding against the block transaction bodies (`validate_block_bucket_tx_indices`);
+2. each wallet `SweepLogicProof` with sweep-specific AuthGKR/SpineGKR verifiers, never the standard auth verifier;
+3. AuthGKR bridge consistency: `auth_public.tx_body_hash == tx_pis[k].tx_body_hash`, live-input owner fields match the canonical sweep spine inputs, and the AuthGKR state reduction reconstructs from the algebraic slice claims;
+4. serialized `auth_slices` open at `auth_r_low` to exactly the algebraic slice-claim values, binding the wallet-provided slices to the verifier transcript rather than merely checking their shape;
+5. per-tx algebraic STARKs, bucket `block_col_openings`, `block_initial_claim`, bucket multipoint rounds, and the FRI-Binius `mixed_opening` against the sweep bucket `InterleavedCommitment`.
+
+Thus a forged sweep bucket must either break the wallet sweep logic proof, forge the AuthGKR-slice bridge, or satisfy an inconsistent bucket multipoint / mixed-opening transcript against the committed sweep columns. The same SC-2 bound applies: FRI soundness plus the bucket multipoint Schwartz-Zippel bound. Regression tests in `noid_block/tests/sweep_bucket.rs` cover tampering of `auth_slices`, `block_col_openings`, `block_initial_claim`, `mixed_opening`, tx index/shape, and spine inputs.
+
 ### 7.3 C_claimed Bridge
 
 `TxLogicAir` produces a polynomial commitment `C_claimed` over the slot indices and values each transaction claims as inputs/outputs. `BlockStateBindingAir` takes `C_claimed` as a public input and verifies these claimed values against the actual state MLE.
@@ -236,20 +250,24 @@ Both terminal values are verifier-hardcoded. **A valid `BlockStateBindingAir` pr
 
 ### 9.1 RecursiveBlockAir
 
-`RecursiveBlockAir` (`noid_recursive/src/air.rs`) has exactly four constraints over a 256-row, 8-column trace:
+`RecursiveBlockAir` (`noid_recursive/src/air.rs`) has exactly eight constraints over a 256-row, 10-column trace:
 
 | Constraint | Gate | Degree | Active rows |
 |-----------|------|--------|-------------|
-| Block sumcheck folding | `SelectorGate(FoldCheckGate)` | 3 | 0–10 |
-| Recursive sumcheck folding | `SelectorGate(FoldCheckGate)` | 3 | 11–21 |
-| `COL_P0 = sr_hi` (state root pin) | `SelectorGate(WeightedLinearGate)` | 2 | 22 |
-| `COL_P1 = sr_lo` (state root pin) | `SelectorGate(WeightedLinearGate)` | 2 | 22 |
+| Primary bucket incoming claim `claim_in = p0 + p1` | `SelectorGate(ClaimInCheckGate)` | 2 | 0–10 |
+| Primary bucket folding `claim_out = Lagrange([p0,p1,p2], r)` | `SelectorGate(FoldCheckGate)` | 4 | 0–10 |
+| Secondary bucket incoming claim `claim_in = p0 + p1` | `SelectorGate(ClaimInCheckGate)` | 2 | 11–21 |
+| Secondary bucket folding `claim_out = Lagrange([p0,p1,p2], r)` | `SelectorGate(FoldCheckGate)` | 4 | 11–21 |
+| Recursive sumcheck incoming claim `claim_in = p0 + p1` | `SelectorGate(ClaimInCheckGate)` | 2 | 22–32 |
+| Recursive sumcheck folding `claim_out = Lagrange([p0,p1,p2], r)` | `SelectorGate(FoldCheckGate)` | 4 | 22–32 |
+| `COL_P0 = sr_hi` (state root pin) | `SelectorGate(WeightedLinearGate)` | 2 | 33 |
+| `COL_P1 = sr_lo` (state root pin) | `SelectorGate(WeightedLinearGate)` | 2 | 33 |
 
 The state-root pin values come from `RecursiveBlockAir::from_prev_state_root`, which reads the externally-verified block header. The verifier constructs the AIR with hardcoded `sr_hi, sr_lo` before calling `verify_air_interleaved`. The selector columns `COL_SEL_BLOCK`, `COL_SEL_REC`, `COL_SEL_ACC` are `PublicColumn` — verifier-evaluated from fixed binary vectors, not from the proof.
 
-`FoldCheckGate` enforces `claim_out + p0 + r·(p0+p1) = 0`, the multilinear sumcheck folding identity (degree 2).
+`ClaimInCheckGate` enforces `claim_in + p0 + p1 = 0`, the sumcheck round boundary identity. `FoldCheckGate` enforces the degree-2 round fold by evaluating the round polynomial from its three evaluations at `X = 0,1,2`: `claim_out + Lagrange([p0,p1,p2], r) = 0`. The `r` column is populated from real bucket/recursive Fiat-Shamir challenges, not synthetic fresh-channel values. Mixed blocks use both primary and secondary bucket lanes; single-shape blocks use an all-zero secondary lane.
 
-**Zero-check soundness:** 8 rounds × degree-4 round polynomial / 2¹²⁸ = 32/2¹²⁸ ≈ 2⁻¹²³.
+**Zero-check soundness:** the maximum gated constraint degree is 4: 8 rounds × degree-4 / 2¹²⁸ = 32/2¹²⁸ ≈ 2⁻¹²³.
 
 ### 9.2 n_rounds = 0: Binding and Extraction from Code
 
@@ -311,7 +329,7 @@ verifies that `upper_partial_evals` evaluates to the correct batched value at `e
 
     ε ≤ 0 + d_max/2¹²⁸ + n_cols/2¹²⁸ + 1/2¹²⁸ = (d_max + n_cols + 1)/2¹²⁸
 
-For RecursiveBlockAir: d_max = 3, n_cols = 8 ⇒ ε ≤ 12/2¹²⁸ ≪ 2⁻¹²⁰. □
+For RecursiveBlockAir: d_max = 4 (selector-gated degree-3 Lagrange fold), n_cols = 10 ⇒ ε ≤ 15/2¹²⁸ ≪ 2⁻¹²⁰. □
 
 *Remark on architecture.* The Tensor PCS at n_rounds=0 is not a classical commitment scheme with Merkle opening paths. It is an **authenticated multilinear evaluation protocol**: the cap provides FS binding; the constraint (Condition 1), sumcheck (Condition 2), and terminal identity (Condition 3) jointly establish that the claimed evaluations are correct. An adversary who forges any of the three conditions fails with probability bounded by the above. This is sufficient for STARK soundness: the system does not require proving the evaluation table at all 256 hypercube points — it requires proving that the columns committed in the cap satisfy the AIR constraints, which is exactly what Conditions 1–3 establish.
 
@@ -319,17 +337,22 @@ For RecursiveBlockAir: d_max = 3, n_cols = 8 ⇒ ε ≤ 12/2¹²⁸ ≪ 2⁻¹²
 
 `ChainAccumulator::extend` (`noid_recursive/src/accumulator.rs`):
 
-    inner      = compress(block_hash, claim_bytes)    // encodes block_initial_claim
+    inner      = compress(block_hash, claim_bytes)    // encodes canonical chain_claim
     chain_hash = compress(prev_chain_hash, inner)
 
-`block_initial_claim` is bound at two independent levels:
+The recursive step now distinguishes two claims:
 
-1. **STARK level** (FS channel): `extra_transcript = [block_initial_claim, rec_initial_claim]` absorbed after the cap and before any challenge. Changing this value invalidates all challenges → STARK fails.
-2. **Chain level**: `verify_recursive_step` recomputes `chain_hash` via `extend` and asserts equality. A forged `block_initial_claim` produces a divergent `chain_hash`.
+- `block_initial_claim`: the primary bucket-local multipoint sumcheck target checked by `RecursiveBlockAir` through `claim_in = p0 + p1` and degree-2 Lagrange fold constraints over `[p(0), p(1), p(2)]` using the real replayed Fiat-Shamir challenges. Mixed blocks additionally bind `block_secondary_initial_claim` in the secondary bucket lane.
+- `chain_claim`: the canonical block proof claim folded into `ChainAccumulator`; for bucketized blocks this is derived from the canonical block proof transcript hash, not from one shape-local sumcheck.
+
+These values are bound at two independent levels:
+
+1. **STARK level** (FS channel): `extra_transcript = [block_initial_claim, rec_initial_claim, chain_claim]` is absorbed after the cap and before any challenge. Changing any value invalidates all challenges → STARK fails.
+2. **Chain/header level**: `verify_recursive_step` checks `chain_claim` against the block header's `proof_transcript_hash` field projection for non-stub blocks, then recomputes `chain_hash` via `extend` and asserts equality. A forged or shape-local `chain_claim` produces a divergent `chain_hash` or header mismatch.
 
 **Proposition (SC-4, chain_hash forgery):** Probability ≤ 2⁻¹²³ + 2⁻¹²⁸ under A1, A4.
 
-*Proof sketch.* Either the STARK fails (probability ≥ 1 − 2⁻¹²³ by zero-check soundness) or the chain_hash matches (requires compress collision, probability 2⁻¹²⁸ by A1). These are independent events; union bound gives the stated bound. □
+*Proof sketch.* Either the STARK fails (probability ≥ 1 − 2⁻¹²³ by zero-check soundness), the header/claim projection check fails deterministically for a wrong non-stub claim, or the chain_hash matches despite a different canonical claim (requires compress collision, probability 2⁻¹²⁸ by A1). These are independent events; union bound gives the stated bound. □
 
 ---
 
@@ -359,6 +382,8 @@ The security property that holds is strictly weaker and is sufficient for the sy
 *Proof.* Suppose adversary A recovers `s` from the transcript. The transcript contains MLE evaluations of the Poseidon2b execution trace at random points. Every internal Poseidon2b state value is a deterministic function of the initial input state, which contains `s`. The final output state is `Address = H_ADDR(s)`, which is public. An algorithm that recovers `s` from the trace therefore inverts the Poseidon2b function: given `Address = Perm(Perm([s, iv_addr]) + [PAD])` it finds `s`. This contradicts A2. □
 
 The claim SC-5 is one-wayness: the secret cannot be recovered from the proof. This is what the protocol requires and what is proved above. The stronger property of computational indistinguishability between transcripts is not claimed by SC-5 and is not needed for the system's security model.
+
+`StandardWalletProofBundle::auth_slices` and `SweepWalletProofBundle::auth_slices` are the wallet-provided AuthGKR `state` MLE slices used by block aggregation to bind the AuthGKR batch-eval reduction to the STARK/FRI layer. Sweep deliberately mirrors the Standard4x8 artifact surface here: only AuthGKR `state` slices are serialized; helper columns such as `s_in`/`s_out` and sweep tx-body SpineGKR helper columns remain internal to wallet proving.
 
 ### 10.3 Absence of Raw Secret from Wire and FS Channel
 
@@ -440,7 +465,7 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 | n_rounds=0 in RecursiveBlockAir | 2⁸-point polynomial is fully determined by its table; tensor check is exact, not approximate (§9.2) |
 | Single FRI opening for N txs | Interleaved commitment binds all traces at once; multipoint sumcheck batches all claims (§7.2) |
 | Stateless LogicProof | C_claimed bridge binds stateless ownership proof to stateful state binding (§7.3) |
-| `block_initial_claim=0` for coinbase | No slot openings to bind; state_root still verified against PoW header (§9.3) |
+| `chain_claim=0` for coinbase | No slot openings to bind; state_root still verified against PoW header (§9.3) |
 | ~120-bit system soundness | Bottleneck is GKR, which exceeds the 100-bit production threshold and is 37× better than legacy |
 
 ---

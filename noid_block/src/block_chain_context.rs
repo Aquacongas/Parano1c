@@ -28,7 +28,10 @@ use noid_recursive::{
     witness::BlockReplayWitness,
 };
 
-use crate::BlockProof;
+use crate::{
+    witness_builder::{block_proof_to_replay_witness, ReplayWitnessError},
+    BlockProof,
+};
 
 /// Full chain context: consensus state + recursive proof.
 ///
@@ -109,8 +112,15 @@ impl BlockChainContext {
     /// so that `self.consensus.tip_header()` reflects the newly applied block.
     ///
     /// Returns a reference to the new recursive proof.
-    pub fn update_recursive_proof(&mut self, block_proof: &BlockProof) -> &RecursiveBlockProof {
-        let witness = extract_replay_witness(block_proof);
+    ///
+    /// Current replay rule: standard-only, sweep-only, and mixed proofs are
+    /// accepted when their buckets carry real block-level multipoint transcripts.
+    /// Mixed proofs replay standard and sweep buckets in separate recursive lanes.
+    pub fn update_recursive_proof(
+        &mut self,
+        block_proof: &BlockProof,
+    ) -> Result<&RecursiveBlockProof, ReplayWitnessError> {
+        let witness = extract_replay_witness(block_proof)?;
         let header = self.consensus.tip_header().clone();
 
         // prev_acc: the accumulator BEFORE this block (from the previous recursive proof).
@@ -130,10 +140,10 @@ impl BlockChainContext {
                 } else {
                     // Cannot safely reconstruct — return without updating.
                     // Caller must bootstrap from a known-good recursive proof.
-                    return self
+                    return Ok(self
                         .recursive_proof
                         .as_ref()
-                        .expect("recursive_proof must exist after bootstrap");
+                        .expect("recursive_proof must exist after bootstrap"));
                 }
             }
         };
@@ -141,7 +151,7 @@ impl BlockChainContext {
         let prev_ref = self.recursive_proof.as_ref();
         let new_proof = prove_recursive_step(&witness, &header, &prev_acc, prev_ref);
         self.recursive_proof = Some(new_proof);
-        self.recursive_proof.as_ref().unwrap()
+        Ok(self.recursive_proof.as_ref().unwrap())
     }
 
     // -----------------------------------------------------------------------
@@ -184,21 +194,15 @@ impl BlockChainContext {
 // BlockProof → BlockReplayWitness extraction
 // ---------------------------------------------------------------------------
 
-/// Extract the `BlockReplayWitness` from a `BlockProof`.
+/// Extract the `BlockReplayWitness` from a bucketized `BlockProof`.
 ///
-/// This is the inverse of the prover's assembly step. The witness contains
-/// all algebraic data needed by the recursive prover, extracted from the
-/// already-proven block proof.
-pub fn extract_replay_witness(proof: &BlockProof) -> BlockReplayWitness {
-    BlockReplayWitness::from_parts(
-        proof.commitment.cap.clone(),
-        proof.state_binding_algebraics.clone(),
-        proof.block_col_openings.clone(),
-        proof.block_multipoint_rounds.clone(),
-        proof.mixed_opening.fri_proof.clone(),
-        proof.mixed_opening.all_openings.clone(),
-        proof.block_initial_claim,
-    )
+/// Standard-only and sweep-only proofs contribute one real block-level bucket
+/// sumcheck transcript. Mixed proofs contribute standard and sweep bucket
+/// transcripts in separate recursive lanes.
+pub fn extract_replay_witness(
+    proof: &BlockProof,
+) -> Result<BlockReplayWitness, ReplayWitnessError> {
+    block_proof_to_replay_witness(proof)
 }
 
 // ---------------------------------------------------------------------------

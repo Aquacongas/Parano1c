@@ -262,6 +262,7 @@ mod tests {
 
     fn body_with(fee: u128, inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> TxBody {
         TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee,
             inputs,

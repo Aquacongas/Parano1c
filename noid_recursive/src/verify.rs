@@ -17,7 +17,7 @@ use noid_chain::{hash_block_header, BlockHeader};
 
 use noid_fri_binius::COMPACT_NUM_QUERIES;
 use noid_poseidon2b::native::compress;
-use noid_stark::interleaved::verify_air_interleaved;
+use noid_stark::{interleaved::verify_air_interleaved, VerifyError};
 
 use crate::accumulator::ChainAccumulator;
 use crate::prove::RecursiveBlockProof;
@@ -29,7 +29,9 @@ use crate::prove::RecursiveBlockProof;
 #[derive(Debug)]
 pub enum RecVerifyError {
     /// The underlying STARK proof failed verification.
-    StarkInvalid,
+    StarkInvalid(VerifyError),
+    /// Recursive chain claim does not match the block header's proof transcript hash.
+    ProofTranscriptHashMismatch,
     /// The new accumulator's state root does not match the block header.
     NewStateRootMismatch,
     /// The chain hash does not match the expected value.
@@ -60,7 +62,12 @@ pub fn verify_recursive_step(
     rec_air: &dyn noid_air::Air,
 ) -> Result<ChainAccumulator, RecVerifyError> {
     // Reconstruct extra_transcript from proof fields (same as prover).
-    let extra_transcript = [proof.block_initial_claim, proof.rec_initial_claim];
+    let extra_transcript = [
+        proof.block_initial_claim,
+        proof.block_secondary_initial_claim,
+        proof.rec_initial_claim,
+        proof.chain_claim,
+    ];
 
     // 1. Verify the STARK proof.
     let empty_pi = make_empty_pi();
@@ -72,18 +79,25 @@ pub fn verify_recursive_step(
         &[],
         COMPACT_NUM_QUERIES,
     )
-    .map_err(|_| RecVerifyError::StarkInvalid)?;
+    .map_err(RecVerifyError::StarkInvalid)?;
 
     // 2. Verify accumulator transition.
     //
     // chain_hash = compress(prev, compress(H_BLOCK, claim_bytes))
-    // where claim_bytes = block_initial_claim as LE u128, zero-padded to 32 bytes.
-    // This binds `block_initial_claim` into the chain hash: a forger using a
-    // null-witness (ZERO) for a real-proof block would compute a different
-    // chain_hash than honest nodes, making the forgery detectable here.
+    // where claim_bytes = chain_claim as LE u128, zero-padded to 32 bytes.
+    // This binds the canonical block proof claim into the chain hash: a forger
+    // using a null or shape-local claim for a real bucketized block computes a
+    // different chain_hash than honest nodes.
+    const STUB_MARKER: [u8; 32] = [1u8; 32];
+    if block_header.proof_transcript_hash != STUB_MARKER
+        && proof.chain_claim != claim_field_from_hash(&block_header.proof_transcript_hash)
+    {
+        return Err(RecVerifyError::ProofTranscriptHashMismatch);
+    }
+
     let block_hash = hash_block_header(block_header);
     let mut claim_bytes = [0u8; 32];
-    claim_bytes[..16].copy_from_slice(&proof.block_initial_claim.to_u128().to_le_bytes());
+    claim_bytes[..16].copy_from_slice(&proof.chain_claim.to_u128().to_le_bytes());
     let expected_chain_hash = compress(&prev_acc.chain_hash, &compress(&block_hash, &claim_bytes));
 
     if proof.acc.chain_hash != expected_chain_hash {
@@ -106,9 +120,10 @@ pub fn verify_recursive_step(
 /// Verify the entire chain history in O(1).
 ///
 /// `expected_chain_hash`: when `Some`, `rec_proof_n.acc.chain_hash` is checked
-/// against this value.  Because `chain_hash` now folds `block_initial_claim` into
-/// every step (see `ChainAccumulator::extend`), the caller must have computed
-/// `expected_chain_hash` via the same formula — including the real claim per block.
+/// against this value. Because `chain_hash` folds the canonical `chain_claim`
+/// into every step (see `ChainAccumulator::extend`), the caller must have
+/// computed `expected_chain_hash` via the same formula — including the real
+/// claim per block.
 /// Snapshot paths that lack historical `BlockProof` data pass `None`; the STARK
 /// itself and PoW validation are the primary guards in that case.
 pub fn verify_tip(
@@ -119,11 +134,13 @@ pub fn verify_tip(
     _genesis_acc: &ChainAccumulator,
     expected_chain_hash: Option<&[u8; 32]>,
 ) -> Result<(), RecVerifyError> {
-    // Reconstruct extra_transcript from proof-stored initial claims.
+    // Reconstruct extra_transcript from proof-stored claims.
     // Must match what the prover supplied to prove_air_interleaved.
     let extra_transcript = [
         rec_proof_n.block_initial_claim,
+        rec_proof_n.block_secondary_initial_claim,
         rec_proof_n.rec_initial_claim,
+        rec_proof_n.chain_claim,
     ];
 
     // Verify the recursive STARK proof (tiny, O(1)).
@@ -136,7 +153,7 @@ pub fn verify_tip(
         &[],
         COMPACT_NUM_QUERIES,
     )
-    .map_err(|_| RecVerifyError::StarkInvalid)?;
+    .map_err(RecVerifyError::StarkInvalid)?;
 
     // Cross-check with the tip block.
     // The tip's prev_state_root must equal the recursive accumulator's state_root.
@@ -197,7 +214,12 @@ pub fn verify_step_stark_only(
     expected_new_state_root: &[u8; 32],
 ) -> Result<(), RecVerifyError> {
     // Reconstruct extra_transcript from proof fields (same as prover).
-    let extra_transcript = [proof.block_initial_claim, proof.rec_initial_claim];
+    let extra_transcript = [
+        proof.block_initial_claim,
+        proof.block_secondary_initial_claim,
+        proof.rec_initial_claim,
+        proof.chain_claim,
+    ];
 
     // Verify the STARK proof over the RecursiveBlockAir.
     let rec_air = crate::air::RecursiveBlockAir::from_prev_state_root(acc_prev_state_root);
@@ -210,7 +232,7 @@ pub fn verify_step_stark_only(
         &[],
         COMPACT_NUM_QUERIES,
     )
-    .map_err(|_| RecVerifyError::StarkInvalid)?;
+    .map_err(RecVerifyError::StarkInvalid)?;
 
     // The proof's committed state_root must match the header we have.
     if proof.acc.state_root != *expected_new_state_root {
@@ -225,6 +247,13 @@ pub fn verify_step_stark_only(
 // ---------------------------------------------------------------------------
 
 use crate::prove::make_empty_pi;
+use noid_core::Block128;
+
+fn claim_field_from_hash(hash: &[u8; 32]) -> Block128 {
+    let mut lo = [0u8; 16];
+    lo.copy_from_slice(&hash[..16]);
+    Block128::from(u128::from_le_bytes(lo))
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -237,7 +266,10 @@ mod tests {
 
     #[test]
     fn verify_error_types_are_debug() {
-        let _ = format!("{:?}", RecVerifyError::StarkInvalid);
+        let _ = format!(
+            "{:?}",
+            RecVerifyError::StarkInvalid(VerifyError::ConstraintViolated)
+        );
         let _ = format!("{:?}", RecVerifyError::ChainHashMismatch);
         let _ = format!("{:?}", RecVerifyError::TipAccumulatorMismatch);
     }

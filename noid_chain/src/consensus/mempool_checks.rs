@@ -155,6 +155,7 @@ mod tests {
 
     fn make_coinbase(slot: u32) -> Transaction {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],
@@ -181,6 +182,7 @@ mod tests {
 
     fn make_mint_tx(slot: u32, fee: u128) -> Transaction {
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32], // non-zero anchor for non-coinbase
             fee,
             inputs: vec![],

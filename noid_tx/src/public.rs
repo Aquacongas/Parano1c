@@ -4,7 +4,7 @@
 //! Public-input layout for the LogicProof STARK (stateless).
 //!
 //! Order is locked:
-//! `(epoch_anchor, tx_body_hash, fee, n_live_inputs,
+//! `(epoch_anchor, tx_body_hash, shape_id, fee, n_live_inputs,
 //!   n_live_outputs, coinbase_credit, log_slots,
 //!   claims_commitment)`.
 //!
@@ -27,6 +27,8 @@ pub struct PublicInputs {
     /// prev_state_root; provides fork-binding without state coupling.
     pub epoch_anchor: Digest,
     pub tx_body_hash: TxBodyHash,
+    /// Transaction shape id bound into the public-input transcript.
+    pub shape_id: u8,
     pub fee: u128,
     pub n_live_inputs: u8,
     pub n_live_outputs: u8,

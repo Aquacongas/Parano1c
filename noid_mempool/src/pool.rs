@@ -154,8 +154,23 @@ impl AsyncMempool {
         // shared state.  Previously this ran after ZK verify — moved here so
         // hash-confusion spam is free to reject.
         if !intent.tx_body.is_coinbase {
-            use noid_tx::hash_tx_body;
-            let computed = hash_tx_body(
+            use noid_tx::hash_tx_body_for_shape;
+            if intent.tx_body.inputs.len() > intent.tx_body.shape.max_inputs() {
+                return Err(SubmitError::MalformedIntent(format!(
+                    "inputs exceed {:?} max {}",
+                    intent.tx_body.shape,
+                    intent.tx_body.shape.max_inputs()
+                )));
+            }
+            if intent.tx_body.outputs.len() > intent.tx_body.shape.max_outputs() {
+                return Err(SubmitError::MalformedIntent(format!(
+                    "outputs exceed {:?} max {}",
+                    intent.tx_body.shape,
+                    intent.tx_body.shape.max_outputs()
+                )));
+            }
+            let computed = hash_tx_body_for_shape(
+                intent.tx_body.shape,
                 &intent.tx_body.epoch_anchor,
                 intent.tx_body.fee,
                 &intent.tx_body.inputs,
@@ -169,7 +184,7 @@ impl AsyncMempool {
             }
         }
 
-        const MAX_LOGIC_PROOF_BYTES: usize = 1024 * 1024; // 1 MB TxIntent wire cap
+        const MAX_LOGIC_PROOF_BYTES: usize = 2 * 1024 * 1024; // Sweep25x2 wallet proofs are ~1.15 MB
         if !intent.tx_body.is_coinbase && intent.logic_proof_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
@@ -769,16 +784,37 @@ fn zk_verify_intent(
     proof_bytes: &[u8],
     log_slots: u32,
 ) -> Result<(), String> {
-    use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
-    use noid_core::{Block128, TowerField};
-    use noid_gkr::SpineInputs;
-    use noid_stark::prove_logic::verify_logic;
     use noid_stark::wallet_bundle::WalletProofBundle;
-    use noid_tx::{compute_claims_commitment, PublicInputs, MAX_INPUTS, MAX_OUTPUTS};
 
     // Decode the bundle.
     let bundle =
         WalletProofBundle::from_bytes(proof_bytes).map_err(|e| format!("bundle decode: {e}"))?;
+    if bundle.shape() != tx_body.shape {
+        return Err(format!(
+            "bundle shape {:?} does not match tx body shape {:?}",
+            bundle.shape(),
+            tx_body.shape
+        ));
+    }
+
+    match bundle {
+        WalletProofBundle::Standard4x8(bundle) => {
+            verify_standard_intent(tx_body, log_slots, bundle)
+        }
+        WalletProofBundle::Sweep25x2(bundle) => verify_sweep_intent(tx_body, log_slots, bundle),
+    }
+}
+
+fn verify_standard_intent(
+    tx_body: &noid_tx::TxBody,
+    log_slots: u32,
+    bundle: noid_stark::wallet_bundle::StandardWalletProofBundle,
+) -> Result<(), String> {
+    use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
+    use noid_core::{Block128, TowerField};
+    use noid_gkr::SpineInputs;
+    use noid_stark::prove_logic::verify_logic;
+    use noid_tx::{compute_claims_commitment, PublicInputs, MAX_INPUTS, MAX_OUTPUTS};
 
     // Build AIR from public tx body.
     let pins = boundary_pins_from_body(tx_body);
@@ -806,6 +842,7 @@ fn zk_verify_intent(
     let pi = PublicInputs {
         epoch_anchor: tx_body.epoch_anchor,
         tx_body_hash: noid_poseidon2b::primitives::TxBodyHash(hash_bytes),
+        shape_id: tx_body.shape.id(),
         fee: tx_body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -835,4 +872,65 @@ fn zk_verify_intent(
         &bundle.logic_proof,
     )
     .map_err(|e| format!("verify_logic: {e:?}"))
+}
+
+fn verify_sweep_intent(
+    tx_body: &noid_tx::TxBody,
+    log_slots: u32,
+    bundle: noid_stark::wallet_bundle::SweepWalletProofBundle,
+) -> Result<(), String> {
+    use noid_air::airs::tx_body_spine::SPINE_LOG_ROWS;
+    use noid_air::airs::Sweep25x2BalanceGateAir;
+    use noid_stark::prove_logic_sweep::{
+        sweep_spine_inputs_from_body, verify_sweep_logic, N_SWEEP_AUTH_SLICES,
+        SWEEP_BOUNDARY_BASE_LOG,
+    };
+    use noid_tx::{
+        compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, MAX_INPUTS, MAX_OUTPUTS,
+    };
+
+    let air = Sweep25x2BalanceGateAir::new(SPINE_LOG_ROWS);
+    let spine_inputs = sweep_spine_inputs_from_body(tx_body);
+    let tx_body_hash = hash_tx_body_for_shape(
+        tx_body.shape,
+        &tx_body.epoch_anchor,
+        tx_body.fee,
+        &tx_body.inputs,
+        &tx_body.outputs,
+        tx_body.is_coinbase,
+    );
+    let pi = PublicInputs {
+        epoch_anchor: tx_body.epoch_anchor,
+        tx_body_hash,
+        shape_id: tx_body.shape.id(),
+        fee: tx_body.fee,
+        n_live_inputs: tx_body.inputs.iter().filter(|i| i.valid).count() as u8,
+        n_live_outputs: tx_body.outputs.iter().filter(|o| o.valid).count() as u8,
+        coinbase_credit: 0,
+        log_slots,
+        claims_commitment: compute_claims_commitment(&tx_body.inputs, &tx_body.outputs),
+        // Sweep block-state activation/deactivation binding is handled in the
+        // later mixed-shape block milestone; the sweep wallet logic proof does
+        // not consume these standard-sized arrays.
+        is_activation: [false; MAX_OUTPUTS],
+        is_deactivation: [false; MAX_INPUTS],
+    };
+
+    if bundle.auth_slices.len() != N_SWEEP_AUTH_SLICES
+        || !bundle
+            .auth_slices
+            .iter()
+            .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG))
+    {
+        return Err("malformed sweep auth_slices".to_string());
+    }
+
+    verify_sweep_logic(
+        &air,
+        &pi,
+        &spine_inputs,
+        &bundle.auth_public,
+        &bundle.logic_proof,
+    )
+    .map_err(|e| format!("verify_sweep_logic: {e:?}"))
 }

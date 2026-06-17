@@ -210,6 +210,7 @@ mod tests {
 
         // Mint one output at slot 1.
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [0u8; 32],
             fee: 0,
             inputs: vec![],

@@ -146,10 +146,24 @@ pub struct WalletScanResult {
 /// Result of a send operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
-    /// Transaction body hash (hex).
+    /// Primary transaction body hash (hex). For split payments this is the first
+    /// submitted transaction, kept for backwards-compatible clients.
     pub tx_hash: String,
-    /// Actual fee paid in μNOID (useful when fee was computed automatically).
+    /// Total fee paid in μNOID across all submitted transactions.
     pub fee_micronoid: u64,
+    /// All transaction body hashes for this logical payment. Single-transaction
+    /// sends contain one hash; auto-split sends contain multiple hashes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_hashes: Vec<String>,
+    /// Number of transactions used for this logical wallet send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_count: Option<usize>,
+    /// Shape of the primary transaction (`Standard4x8` or `Sweep25x2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
+    /// Shape per submitted transaction, index-aligned with `tx_hashes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_shapes: Vec<String>,
 }
 
 /// Decoded block header (structured, not raw bytes).

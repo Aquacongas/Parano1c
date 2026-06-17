@@ -274,14 +274,15 @@ Heaviest chain by cumulative PoW work. Ties: incumbent wins.
 
 ### 7.1 RecursiveBlockAir
 
-A 256-row, 8-column STARK that proves accumulator continuity:
+A 256-row, 10-column STARK that proves accumulator continuity:
 
 | Rows | Purpose | Gate |
 |------|---------|------|
-| 0–10 | Block-n multipoint sumcheck folding | FoldCheckGate (degree 2) |
-| 11–21 | Previous recursive sumcheck folding | FoldCheckGate (degree 2) |
-| 22 | State root continuity pin | WeightedLinearGate (degree 2) |
-| 23–255 | Padding (zero) | — |
+| 0–10 | Primary block bucket degree-2 multipoint sumcheck folding | FoldCheckGate (`Lagrange([p0,p1,p2], r)`) |
+| 11–21 | Secondary block bucket degree-2 multipoint sumcheck folding | FoldCheckGate (`Lagrange([p0,p1,p2], r)`) |
+| 22–32 | Previous recursive degree-2 sumcheck folding | FoldCheckGate (`Lagrange([p0,p1,p2], r)`) |
+| 33 | State root continuity pin | WeightedLinearGate (degree 2) |
+| 34–255 | Padding (zero) | — |
 
 At `2^8 = 256` rows, a multilinear polynomial is fully determined by its hypercube evaluation table. FRI proximity testing is redundant; the tensor check is exact. Therefore `n_rounds = 0` in the FRI layer.
 
@@ -294,16 +295,21 @@ ChainAccumulator {
     chain_hash:  [u8; 32]
 }
 
-extend(block_hash, block_initial_claim, new_state_root):
+extend(block_hash, chain_claim, new_state_root):
     inner      = compress(block_hash, claim_bytes)
     chain_hash = compress(prev_chain_hash, inner)
     state_root = new_state_root
     height    += 1
 ```
 
-The `block_initial_claim` is bound at two levels:
-1. **STARK:** absorbed into `extra_transcript` → forks all challenges
-2. **Chain:** `verify_recursive_step` recomputes `chain_hash` and asserts equality
+The recursive step distinguishes:
+
+- `block_initial_claim`: bucket-local multipoint sumcheck target checked by `RecursiveBlockAir`.
+- `chain_claim`: canonical block proof claim folded into `chain_hash`.
+
+These values are bound at two levels:
+1. **STARK:** `[block_initial_claim, rec_initial_claim, chain_claim]` is absorbed into `extra_transcript` → forks all challenges
+2. **Chain/header:** `verify_recursive_step` checks `chain_claim` against `proof_transcript_hash` for non-stub blocks, recomputes `chain_hash`, and asserts equality
 
 ### 7.3 Properties
 

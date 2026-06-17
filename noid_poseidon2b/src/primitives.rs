@@ -317,13 +317,20 @@ pub fn hash_auth_tag(spend_secret: &SpendSecret, tx_body_hash: &TxBodyHash) -> A
     AuthTag(s.finalize())
 }
 
-/// Shape of the tx-body Merkle tree, locked to keep the AIR
+/// Shape of the standard tx-body Merkle tree, locked to keep the current AIR
 /// `§TxBodyMerkle` sub-circuit at a fixed depth. Changing these breaks
 /// every downstream component; they are intentionally constants.
 pub const TXBODY_INPUTS: usize = 4;
 pub const TXBODY_OUTPUTS: usize = 8;
 pub const TXBODY_LEAVES: usize = 16;
 pub const TXBODY_DEPTH: usize = 4;
+
+/// Shape of the Sweep25x2 tx-body Merkle tree. This native hash is available
+/// before the proof stack so wallets/consensus can agree on the future layout.
+pub const SWEEP_TXBODY_INPUTS: usize = 25;
+pub const SWEEP_TXBODY_OUTPUTS: usize = 2;
+pub const SWEEP_TXBODY_LEAVES: usize = 32;
+pub const SWEEP_TXBODY_DEPTH: usize = 5;
 
 /// Per-input leaf of the tx-body Merkle tree. Binds the slot index to
 /// the UTXO being spent. Sponge-mode 4-field absorb under IV `LEAF____`:
@@ -370,8 +377,20 @@ pub fn fee_leaf(fee: u128) -> Digest {
     out
 }
 
-/// Encode `is_coinbase` into the L14 tx-body Merkle leaf as a
-/// bit-wide digest: `L14 = [is_coinbase as u8, 0, …, 0]`.
+/// Encode a transaction shape id into a tx-body Merkle leaf.
+///
+/// Used by future non-standard layouts (starting with Sweep25x2) for explicit
+/// cross-shape domain separation. Standard4x8 intentionally does not include
+/// this leaf so its launch hash layout remains byte-for-byte unchanged.
+#[inline]
+pub fn tx_shape_leaf(shape_id: u8) -> Digest {
+    let mut out = [0u8; 32];
+    out[0] = shape_id;
+    out
+}
+
+/// Encode `is_coinbase` into the tx-body Merkle leaf as a
+/// bit-wide digest: `[is_coinbase as u8, 0, …, 0]`.
 ///
 /// Zero-preserving: `is_coinbase=false` leaves the leaf at the all-zero
 /// digest, so both branches share the same tree shape. The corresponding
@@ -385,7 +404,32 @@ pub fn is_coinbase_leaf(is_coinbase: bool) -> Digest {
     out
 }
 
-/// Canonical transaction-body hash.
+#[inline]
+fn txbody_merkle_root<const N: usize>(leaves: &[Digest; N]) -> Digest {
+    debug_assert!(N.is_power_of_two());
+    let mut level: Vec<Digest> = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = vec![[0u8; 32]; level.len() / 2];
+        compress_batch_interleaved_into(&level, &mut next);
+        level = next;
+    }
+    level[0]
+}
+
+#[inline]
+fn txbody_wrap(root: Digest) -> TxBodyHash {
+    let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
+    let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
+    let [iv_hi, iv_lo] = capacity_iv(TAG_TXBODY);
+    let mut state = [r0, r1, iv_hi, iv_lo];
+    Poseidon2bPermutation.permute_mut(&mut state);
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&state[0].to_bytes());
+    out[16..].copy_from_slice(&state[1].to_bytes());
+    TxBodyHash(out)
+}
+
+/// Canonical Standard4x8 transaction-body hash.
 ///
 /// Fixed 16-leaf, depth-4 Merkle tree over 32-byte canonical leaves,
 /// reduced with [`compress`](crate::native::compress) and wrapped with
@@ -418,26 +462,39 @@ pub fn hash_tx_body(
     leaves[14] = is_coinbase_leaf(is_coinbase);
     // L15 already zero.
 
-    // Depth-4 reduction, serial: 16 → 8 → 4 → 2 → 1. The batch-parallel
-    // path is overkill for a fixed 16-leaf tree.
-    let mut level: Vec<Digest> = leaves.to_vec();
-    while level.len() > 1 {
-        let mut next = vec![[0u8; 32]; level.len() / 2];
-        compress_batch_interleaved_into(&level, &mut next);
-        level = next;
-    }
+    txbody_wrap(txbody_merkle_root(&leaves))
+}
 
-    // Final wrap: single permutation with capacity IV = `TXBODY__`.
-    let root = level[0];
-    let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
-    let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
-    let [iv_hi, iv_lo] = capacity_iv(TAG_TXBODY);
-    let mut state = [r0, r1, iv_hi, iv_lo];
-    Poseidon2bPermutation.permute_mut(&mut state);
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&state[0].to_bytes());
-    out[16..].copy_from_slice(&state[1].to_bytes());
-    TxBodyHash(out)
+/// Canonical Sweep25x2 transaction-body hash.
+///
+/// Fixed 32-leaf, depth-5 Merkle tree. Layout:
+///
+/// ```text
+/// L0          = epoch_anchor
+/// L1          = fee_leaf(fee)
+/// L2          = tx_shape_leaf(1)             // Sweep25x2
+/// L3..L27     = input_leaves[0..25]
+/// L28..L29    = output_leaves[0..2]
+/// L30         = is_coinbase_leaf(is_coinbase)
+/// L31         = [0u8; 32]                    // reserved/pad
+/// ```
+pub fn hash_tx_body_sweep25x2(
+    epoch_anchor: &Digest,
+    fee: u128,
+    input_leaves: &[Digest; SWEEP_TXBODY_INPUTS],
+    output_leaves: &[Digest; SWEEP_TXBODY_OUTPUTS],
+    is_coinbase: bool,
+) -> TxBodyHash {
+    let mut leaves: [Digest; SWEEP_TXBODY_LEAVES] = [[0u8; 32]; SWEEP_TXBODY_LEAVES];
+    leaves[0] = *epoch_anchor;
+    leaves[1] = fee_leaf(fee);
+    leaves[2] = tx_shape_leaf(1);
+    leaves[3..3 + SWEEP_TXBODY_INPUTS].copy_from_slice(input_leaves);
+    leaves[28..28 + SWEEP_TXBODY_OUTPUTS].copy_from_slice(output_leaves);
+    leaves[30] = is_coinbase_leaf(is_coinbase);
+    // L31 already zero/reserved.
+
+    txbody_wrap(txbody_merkle_root(&leaves))
 }
 
 #[cfg(test)]
@@ -456,6 +513,22 @@ mod tests {
     }
     fn pad_outputs(leaves: Vec<Digest>) -> [Digest; TXBODY_OUTPUTS] {
         let mut out = [[0u8; 32]; TXBODY_OUTPUTS];
+        for (i, d) in leaves.into_iter().enumerate() {
+            out[i] = d;
+        }
+        out
+    }
+
+    fn pad_sweep_inputs(leaves: Vec<Digest>) -> [Digest; SWEEP_TXBODY_INPUTS] {
+        let mut out = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
+        for (i, d) in leaves.into_iter().enumerate() {
+            out[i] = d;
+        }
+        out
+    }
+
+    fn pad_sweep_outputs(leaves: Vec<Digest>) -> [Digest; SWEEP_TXBODY_OUTPUTS] {
+        let mut out = [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
         for (i, d) in leaves.into_iter().enumerate() {
             out[i] = d;
         }
@@ -578,6 +651,78 @@ mod tests {
             false,
         );
         assert_eq!(got.0, expected);
+    }
+
+    #[test]
+    fn sweep_tx_body_matches_reference_construction() {
+        use crate::native::compress;
+
+        let anchor = [0xBBu8; 32];
+        let fee = 0xCAFE_BABEu128;
+        let addr = Address([3u8; 32]);
+        let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
+        for i in 0..SWEEP_TXBODY_INPUTS {
+            ins[i] = hash_input_leaf(i as u32, 100 + i as u64, &addr);
+        }
+        let outs = pad_sweep_outputs(vec![
+            hash_output_leaf(1000, 1200, &addr),
+            hash_output_leaf(1001, 200, &addr),
+        ]);
+
+        let mut leaves: [Digest; SWEEP_TXBODY_LEAVES] = [[0u8; 32]; SWEEP_TXBODY_LEAVES];
+        leaves[0] = anchor;
+        leaves[1] = fee_leaf(fee);
+        leaves[2] = tx_shape_leaf(1);
+        leaves[3..28].copy_from_slice(&ins);
+        leaves[28..30].copy_from_slice(&outs);
+        leaves[30] = is_coinbase_leaf(false);
+
+        let mut level = leaves.to_vec();
+        while level.len() > 1 {
+            let mut next = vec![[0u8; 32]; level.len() / 2];
+            for (i, pair) in level.chunks_exact(2).enumerate() {
+                next[i] = compress(&pair[0], &pair[1]);
+            }
+            level = next;
+        }
+        let expected = txbody_wrap(level[0]);
+        let got = hash_tx_body_sweep25x2(&anchor, fee, &ins, &outs, false);
+        assert_eq!(got.0, expected);
+    }
+
+    #[test]
+    fn sweep_tx_body_is_shape_separated_from_standard() {
+        let addr = Address([4u8; 32]);
+        let standard_ins = pad_inputs(vec![hash_input_leaf(1, 100, &addr)]);
+        let standard_outs = pad_outputs(vec![hash_output_leaf(2, 90, &addr)]);
+        let sweep_ins = pad_sweep_inputs(vec![hash_input_leaf(1, 100, &addr)]);
+        let sweep_outs = pad_sweep_outputs(vec![hash_output_leaf(2, 90, &addr)]);
+        let standard = hash_tx_body(&[0x11; 32], 10, &standard_ins, &standard_outs, false);
+        let sweep = hash_tx_body_sweep25x2(&[0x11; 32], 10, &sweep_ins, &sweep_outs, false);
+        assert_ne!(standard, sweep);
+    }
+
+    #[test]
+    fn sweep_tx_body_sensitive_to_each_edge_slot() {
+        let addr = Address([5u8; 32]);
+        let anchor = [0x22; 32];
+        let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
+        for i in 0..SWEEP_TXBODY_INPUTS {
+            ins[i] = hash_input_leaf(i as u32, 10 + i as u64, &addr);
+        }
+        let outs = pad_sweep_outputs(vec![
+            hash_output_leaf(30, 100, &addr),
+            hash_output_leaf(31, 200, &addr),
+        ]);
+        let h = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs, false);
+        let mut ins2 = ins;
+        ins2[24] = hash_input_leaf(24, 999, &addr);
+        let h2 = hash_tx_body_sweep25x2(&anchor, 3, &ins2, &outs, false);
+        assert_ne!(h, h2);
+        let mut outs2 = outs;
+        outs2[1] = hash_output_leaf(31, 201, &addr);
+        let h3 = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs2, false);
+        assert_ne!(h, h3);
     }
 
     #[test]

@@ -142,6 +142,7 @@ mod tests {
     fn total_fees_sums_non_coinbase() {
         use noid_tx::types::TxBody;
         let coinbase = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             fee: 0,
             is_coinbase: true,
             inputs: vec![],
@@ -149,6 +150,7 @@ mod tests {
             epoch_anchor: [0; 32],
         };
         let tx1 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             fee: 5_000_000,
             is_coinbase: false,
             inputs: vec![],
@@ -156,6 +158,7 @@ mod tests {
             epoch_anchor: [0; 32],
         };
         let tx2 = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             fee: 3_000_000,
             is_coinbase: false,
             inputs: vec![],

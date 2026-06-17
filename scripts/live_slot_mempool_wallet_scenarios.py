@@ -162,12 +162,20 @@ class Node:
     def status(self):
         return rpc(self.rpc_url, "walletStatus", timeout=10)
 
-    def address_hex(self):
+    def address(self):
         addr = self.status()["address"]
+        if not addr.startswith("noid1"):
+            raise LiveTestError(
+                f"{self.name} wallet returned non-canonical address: {addr}"
+            )
         info = rpc(self.rpc_url, "validateAddress", [addr], timeout=10)
         if not info.get("valid") or not info.get("hex"):
             raise LiveTestError(f"{self.name} invalid wallet address: {info}")
-        return info["hex"]
+        if info.get("bech32") != addr:
+            raise LiveTestError(
+                f"{self.name} address did not round-trip: {addr} -> {info}"
+            )
+        return addr
 
 
 def rpc(url, method, params=None, timeout=8):
@@ -342,7 +350,7 @@ def main():
         )
 
         # Register known primary addresses; no repeated scans after tx confirmations.
-        addrs = {n.name: n.address_hex() for n in nodes}
+        addrs = {n.name: n.address() for n in nodes}
         print(f"[addresses] {addrs}", flush=True)
         assert_hints_empty_and_diverse(nodes)
 
@@ -351,7 +359,7 @@ def main():
             dst = n2 if i % 2 == 0 else n3
             amount = AMOUNT_BASE + i * 10_000
             send = rpc(
-                n1.rpc_url, "walletSend", [dst.address_hex(), amount, 0], timeout=240
+                n1.rpc_url, "walletSend", [dst.address(), amount, 0], timeout=240
             )
             tx_hashes.append(send["tx_hash"])
             print(
@@ -412,7 +420,7 @@ def main():
                 send = rpc(
                     src.rpc_url,
                     "walletSend",
-                    [dst.address_hex(), amount, 0],
+                    [dst.address(), amount, 0],
                     timeout=240,
                 )
                 tx_hash = send["tx_hash"]

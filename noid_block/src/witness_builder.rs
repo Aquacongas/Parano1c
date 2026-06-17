@@ -8,8 +8,8 @@
 //!
 //! SpendSecret never enters this module. All inputs are:
 //! - `tx_body`: public (SpendSecret stripped on wire via `decode_public`)
-//! - `WalletProofBundle`: proof artifacts derived from SpendSecret via
-//!   one-way Poseidon2b; cannot be reversed to recover SpendSecret.
+//! - `WalletProofBundle`: wallet proof artifacts derived from SpendSecret.
+//!   These are not raw secrets and are covered by the SC-5 one-wayness model.
 //!
 //! # Witness construction
 //!
@@ -20,9 +20,9 @@
 //! trace        ← TxLogicAir.build_trace(witness_from_body(tx_body))
 //! pi           ← build_public_inputs(tx_body)
 //! spine_inputs ← SpineInputs from boundary_pins
-//! auth_public  ← extracted from bundle.logic_proof.auth
-//! auth_proof   ← &bundle.logic_proof.auth
-//! auth_slices  ← &bundle.auth_slices
+//! auth_public  ← extracted from Standard4x8 bundle
+//! auth_proof   ← extracted from Standard4x8 bundle.logic_proof.auth
+//! auth_slices  ← extracted from Standard4x8 bundle.auth_slices
 //! ```
 //!
 //! The trace only uses `inp.value`, `out.value`, `fee` from the body — no
@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use noid_air::airs::block_state_binding::{
     BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingWitness,
 };
+use noid_air::composition::sweep25x2_balance_witness_from_body;
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::{Air, Trace};
 use noid_chain::consensus::params::LOG_SEGMENT_SIZE;
@@ -41,9 +42,12 @@ use noid_chain::state_binding::BlockStateBinding;
 use noid_core::mle::evaluate_slice;
 use noid_core::{Block128, TowerField};
 use noid_fri::Channel;
-use noid_gkr::{AuthPublicInputs, SpineInputs};
+use noid_gkr::{AuthPublicInputs, SpineInputs, SweepAuthPublicInputs, SweepSpineInputs};
+use noid_stark::prove_logic_sweep::{
+    sweep_spine_inputs_from_body, SweepLogicProof, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
+};
 use noid_stark::WalletProofBundle;
-use noid_tx::{PublicInputs, Transaction, TxBody, MAX_INPUTS, MAX_OUTPUTS};
+use noid_tx::{PublicInputs, Transaction, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
 
 use crate::{BlockProof, StateBindingBlockWitness, TxBlockWitness};
 
@@ -51,12 +55,10 @@ use crate::{BlockProof, StateBindingBlockWitness, TxBlockWitness};
 // Per-transaction witness from public data + bundle
 // ---------------------------------------------------------------------------
 
-/// Owned version of `TxBlockWitness` (all fields stored by value).
-///
-/// The borrow-based `TxBlockWitness<'a>` from `noid_block` requires lifetimes
-/// tied to the original data.  `OwnedTxWitness` owns everything so it can be
-/// collected into a `Vec` and then referenced.
-pub struct OwnedTxWitness {
+/// Owned standard witness (all fields stored by value).
+pub struct OwnedStandardTxWitness {
+    /// Index into `Block.transactions`.
+    pub block_tx_index: u32,
     pub air: TxLogicAir,
     pub trace: Trace,
     pub pi: PublicInputs,
@@ -68,17 +70,60 @@ pub struct OwnedTxWitness {
     pub auth_slices: Vec<Vec<Block128>>,
 }
 
+/// Owned sweep witness.  This is not block-provable until `SweepBucketProof`
+/// lands, but constructing it here removes the standard-only witness-builder
+/// assumption and keeps all data public/no-secret.
+pub struct OwnedSweepTxWitness {
+    /// Index into `Block.transactions`.
+    pub block_tx_index: u32,
+    pub air: noid_air::airs::Sweep25x2BalanceGateAir,
+    pub trace: Trace,
+    pub pi: PublicInputs,
+    pub spine_inputs: SweepSpineInputs,
+    pub auth_public: SweepAuthPublicInputs,
+    /// Owned sweep AuthGKR `state` slices, mirroring standard `auth_slices`.
+    pub auth_slices: Vec<Vec<Block128>>,
+    pub logic_proof: SweepLogicProof,
+}
+
+/// Shape-dispatched owned transaction witness.
+pub enum OwnedTxWitness {
+    Standard4x8(OwnedStandardTxWitness),
+    Sweep25x2(OwnedSweepTxWitness),
+}
+
 impl OwnedTxWitness {
-    /// Borrow self as a `TxBlockWitness<'_>` for passing to `prove_block`.
+    pub fn shape(&self) -> TxShape {
+        match self {
+            Self::Standard4x8(_) => TxShape::Standard4x8,
+            Self::Sweep25x2(_) => TxShape::Sweep25x2,
+        }
+    }
+
+    pub fn block_tx_index(&self) -> u32 {
+        match self {
+            Self::Standard4x8(w) => w.block_tx_index,
+            Self::Sweep25x2(w) => w.block_tx_index,
+        }
+    }
+
+    /// Borrow self as a standard `TxBlockWitness<'_>` for the current standard
+    /// bucket prover. Sweep witnesses require the Phase N5 sweep bucket prover.
     pub fn as_block_witness(&self) -> TxBlockWitness<'_> {
-        TxBlockWitness {
-            air: &self.air as &dyn Air,
-            trace: &self.trace,
-            pi: &self.pi,
-            spine_inputs: &self.spine_inputs,
-            auth_public: &self.auth_public,
-            auth_proof: &self.auth_proof,
-            auth_slices: &self.auth_slices,
+        match self {
+            Self::Standard4x8(w) => TxBlockWitness {
+                block_tx_index: w.block_tx_index,
+                air: &w.air as &dyn Air,
+                trace: &w.trace,
+                pi: &w.pi,
+                spine_inputs: &w.spine_inputs,
+                auth_public: &w.auth_public,
+                auth_proof: &w.auth_proof,
+                auth_slices: &w.auth_slices,
+            },
+            Self::Sweep25x2(_) => {
+                panic!("Sweep25x2 witness requires SweepBucketProof; miner must keep filtering sweep until Phase N5")
+            }
         }
     }
 }
@@ -90,50 +135,92 @@ impl OwnedTxWitness {
 ///
 /// SpendSecret is NEVER used here. The trace is derived from the public
 /// `tx_body` fields (slot indices, values, fee, epoch_anchor).
-/// The `auth_proof` and `auth_slices` come from the bundle — they are
-/// Poseidon2b outputs that cannot reveal SpendSecret.
+/// The `auth_proof` and `auth_slices` come from the bundle. They are
+/// proof artifacts, not raw `SpendSecret`; SC-5 covers their one-wayness model.
 pub fn build_tx_witness(
+    block_tx_index: u32,
     tx_body: &TxBody,
     bundle: &WalletProofBundle,
     log_slots: u32,
 ) -> OwnedTxWitness {
-    // Build the AIR from the boundary pins (all public data).
-    let pins = boundary_pins_from_body(tx_body);
-    let air = TxLogicAir::new(pins);
+    assert_eq!(
+        bundle.shape(),
+        tx_body.shape,
+        "wallet proof bundle shape does not match tx body shape"
+    );
+    match bundle {
+        WalletProofBundle::Standard4x8(bundle) => {
+            // Build the AIR from the boundary pins (all public data).
+            let pins = boundary_pins_from_body(tx_body);
+            let air = TxLogicAir::new(pins);
 
-    // Build the trace from the public witness (no SpendSecret needed).
-    // witness_from_body uses: inp.value, out.value, fee, epoch_anchor — all public.
-    let logic_witness = witness_from_body(tx_body);
-    let trace = air.build_trace(&logic_witness);
+            // Build the trace from the public witness (no SpendSecret needed).
+            // witness_from_body uses: inp.value, out.value, fee, epoch_anchor — all public.
+            let logic_witness = witness_from_body(tx_body);
+            let trace = air.build_trace(&logic_witness);
 
-    // Build public inputs (log_slots injected by caller from block header).
-    let pi = build_public_inputs(tx_body, pins.tx_body_hash, log_slots);
+            // Build public inputs (log_slots injected by caller from block header).
+            let pi = build_public_inputs(tx_body, log_slots);
 
-    // Build SpineInputs from boundary pins (all public data).
-    let spine_inputs = SpineInputs {
-        epoch_anchor: pins.epoch_anchor,
-        fee_leaf: pins.fee_leaf,
-        input_leaves: pins.input_leaf_absorb,
-        output_leaves: pins.output_leaf_absorb,
-        is_coinbase_leaf: pins.is_coinbase_leaf,
-        pad_leaf: [Block128::ZERO; 2],
-    };
+            // Build SpineInputs from boundary pins (all public data).
+            let spine_inputs = SpineInputs {
+                epoch_anchor: pins.epoch_anchor,
+                fee_leaf: pins.fee_leaf,
+                input_leaves: pins.input_leaf_absorb,
+                output_leaves: pins.output_leaf_absorb,
+                is_coinbase_leaf: pins.is_coinbase_leaf,
+                pad_leaf: [Block128::ZERO; 2],
+            };
 
-    // Use the pre-computed AuthPublicInputs from the bundle.
-    // These were produced by auth_inputs.to_public() during prove_tx,
-    // so they include correct expected_address for ALL slots — including
-    // dummy (valid=false) slots where the GKR circuit uses derived ZERO
-    // secrets rather than zero bytes.
-    let auth_public = bundle.auth_public;
+            // Use the pre-computed AuthPublicInputs from the bundle.
+            // These were produced by auth_inputs.to_public() during prove_tx,
+            // so they include correct expected_address for ALL slots — including
+            // dummy (valid=false) slots where the GKR circuit uses derived ZERO
+            // secrets rather than zero bytes.
+            let auth_public = bundle.auth_public;
 
-    OwnedTxWitness {
-        air,
-        trace,
-        pi,
-        spine_inputs,
-        auth_public,
-        auth_proof: bundle.logic_proof.auth.clone(),
-        auth_slices: bundle.auth_slices.clone(),
+            OwnedTxWitness::Standard4x8(OwnedStandardTxWitness {
+                block_tx_index,
+                air,
+                trace,
+                pi,
+                spine_inputs,
+                auth_public,
+                auth_proof: bundle.logic_proof.auth.clone(),
+                auth_slices: bundle.auth_slices.clone(),
+            })
+        }
+        WalletProofBundle::Sweep25x2(bundle) => {
+            assert_eq!(
+                bundle.auth_slices.len(),
+                N_SWEEP_AUTH_SLICES,
+                "malformed Sweep25x2 auth_slices count"
+            );
+            assert!(
+                bundle
+                    .auth_slices
+                    .iter()
+                    .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG)),
+                "malformed Sweep25x2 auth_slices length"
+            );
+
+            let balance = sweep25x2_balance_witness_from_body(tx_body);
+            let (air, trace) = balance
+                .build_air_and_trace_with_log_rows(noid_air::airs::tx_body_spine::SPINE_LOG_ROWS);
+            let pi = build_public_inputs(tx_body, log_slots);
+            let spine_inputs = sweep_spine_inputs_from_body(tx_body);
+
+            OwnedTxWitness::Sweep25x2(OwnedSweepTxWitness {
+                block_tx_index,
+                air,
+                trace,
+                pi,
+                spine_inputs,
+                auth_public: bundle.auth_public,
+                auth_slices: bundle.auth_slices.clone(),
+                logic_proof: bundle.logic_proof.clone(),
+            })
+        }
     }
 }
 
@@ -155,7 +242,8 @@ pub fn build_block_witnesses(
     // bundles are in the same order as non-coinbase txs.
     let non_cb: Vec<_> = transactions
         .iter()
-        .filter(|tx| !tx.body.is_coinbase)
+        .enumerate()
+        .filter(|(_, tx)| !tx.body.is_coinbase)
         .collect();
     assert_eq!(
         non_cb.len(),
@@ -164,9 +252,11 @@ pub fn build_block_witnesses(
     );
 
     non_cb
-        .iter()
+        .into_iter()
         .zip(bundles.iter())
-        .map(|(tx, bundle)| build_tx_witness(&tx.body, bundle, log_slots))
+        .map(|((block_tx_index, tx), bundle)| {
+            build_tx_witness(block_tx_index as u32, &tx.body, bundle, log_slots)
+        })
         .collect()
 }
 
@@ -174,35 +264,35 @@ pub fn build_block_witnesses(
 // PublicInputs construction
 // ---------------------------------------------------------------------------
 
-fn build_public_inputs(
-    tx_body: &TxBody,
-    tx_body_hash: [Block128; 2],
-    log_slots: u32,
-) -> PublicInputs {
-    use noid_tx::compute_claims_commitment;
+fn build_public_inputs(tx_body: &TxBody, log_slots: u32) -> PublicInputs {
+    use noid_tx::{compute_claims_commitment, hash_tx_body_for_shape};
 
     let n_live_inputs = tx_body.inputs.iter().filter(|i| i.valid).count() as u8;
     let n_live_outputs = tx_body.outputs.iter().filter(|o| o.valid).count() as u8;
     let claims_commitment = compute_claims_commitment(&tx_body.inputs, &tx_body.outputs);
 
     let mut is_activation = [false; MAX_OUTPUTS];
-    for (j, out) in tx_body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-        is_activation[j] = out.valid;
-    }
     let mut is_deactivation = [false; MAX_INPUTS];
-    for (i, inp) in tx_body.inputs.iter().enumerate().take(MAX_INPUTS) {
-        is_deactivation[i] = inp.valid;
+    if tx_body.shape == TxShape::Standard4x8 {
+        for (j, out) in tx_body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+            is_activation[j] = out.valid;
+        }
+        for (i, inp) in tx_body.inputs.iter().enumerate().take(MAX_INPUTS) {
+            is_deactivation[i] = inp.valid;
+        }
     }
-
-    // tx_body_hash comes from the already-computed boundary pins.
-    let [lo, hi] = tx_body_hash;
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes[..16].copy_from_slice(&lo.to_u128().to_le_bytes());
-    hash_bytes[16..].copy_from_slice(&hi.to_u128().to_le_bytes());
 
     PublicInputs {
         epoch_anchor: tx_body.epoch_anchor,
-        tx_body_hash: noid_poseidon2b::primitives::TxBodyHash(hash_bytes),
+        tx_body_hash: hash_tx_body_for_shape(
+            tx_body.shape,
+            &tx_body.epoch_anchor,
+            tx_body.fee,
+            &tx_body.inputs,
+            &tx_body.outputs,
+            tx_body.is_coinbase,
+        ),
+        shape_id: tx_body.shape.id(),
         fee: tx_body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -430,31 +520,85 @@ pub fn build_empty_state_bindings() -> Vec<StateBindingBlockWitness<'static>> {
 // BlockProof → BlockReplayWitness extraction (recursive chain proof)
 // ---------------------------------------------------------------------------
 
-/// Extract a [`noid_recursive::BlockReplayWitness`] from a [`BlockProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayWitnessError {
+    /// The current recursive AIR can replay only buckets that carry a real
+    /// block-level multipoint transcript. Blocks with no replayable bucket stay
+    /// fail-closed.
+    MissingReplayableBucket,
+    /// Reserved for future cases where a bucket is present but cannot be mapped
+    /// into the recursive replay relation.
+    UnsupportedBucketLayout,
+}
+
+/// Extract a [`noid_recursive::BlockReplayWitness`] from a bucketized
+/// [`BlockProof`].
 ///
 /// Used by the recursive proof updater in `noid_node` to advance the chain
 /// proof without requiring `noid_fri_binius` as a direct dependency of the
 /// node daemon.
 ///
+/// Security: this accepts standard-only, sweep-only, and mixed proofs. Mixed
+/// proofs map the standard bucket to the primary recursive lane and the sweep
+/// bucket to the secondary recursive lane, so recursion does not drop either
+/// bucket while relying on the canonical hash for the other.
+///
 /// # Field mapping
 ///
-/// | BlockReplayWitness field      | BlockProof source                        |
-/// |-------------------------------|------------------------------------------|
-/// | `cap`                         | `proof.commitment.cap`                   |
-/// | `state_binding_algebraics`    | `proof.state_binding_algebraics`         |
-/// | `block_col_openings`          | `proof.block_col_openings`               |
-/// | `block_multipoint_rounds`     | `proof.block_multipoint_rounds`          |
-/// | `compact_fri`                 | `proof.mixed_opening.fri_proof`          |
-/// | `mixed_all_openings`          | `proof.mixed_opening.all_openings`       |
-/// | `block_initial_claim`         | `proof.block_initial_claim`              |
-pub fn block_proof_to_replay_witness(proof: &BlockProof) -> noid_recursive::BlockReplayWitness {
-    noid_recursive::BlockReplayWitness::from_parts(
-        proof.commitment.cap.clone(),
-        proof.state_binding_algebraics.clone(),
-        proof.block_col_openings.clone(),
-        proof.block_multipoint_rounds.clone(),
-        proof.mixed_opening.fri_proof.clone(),
-        proof.mixed_opening.all_openings.clone(),
-        proof.block_initial_claim,
-    )
+/// | BlockReplayWitness field      | BlockProof source                                      |
+/// |-------------------------------|--------------------------------------------------------|
+/// | `cap`                         | primary bucket `commitment.cap`                        |
+/// | `state_binding_algebraics`    | `proof.state_binding_algebraics`                       |
+/// | `block_col_openings`          | primary bucket `block_col_openings`                    |
+/// | `block_multipoint_rounds`     | primary bucket `block_multipoint_rounds`               |
+/// | `block_multipoint_challenges` | primary bucket `block_multipoint_challenges`           |
+/// | secondary block fields        | secondary bucket transcript, or zero for single bucket |
+/// | `compact_fri`                 | primary bucket `mixed_opening.fri_proof`               |
+/// | `mixed_all_openings`          | primary bucket `mixed_opening.all_openings`            |
+/// | `block_initial_claim`         | primary bucket `block_initial_claim`                   |
+/// | `chain_claim`                 | `block_recursive_claim_field(proof)`                   |
+pub fn block_proof_to_replay_witness(
+    proof: &BlockProof,
+) -> Result<noid_recursive::BlockReplayWitness, ReplayWitnessError> {
+    match (proof.standard_bucket.as_ref(), proof.sweep_bucket.as_ref()) {
+        (Some(standard), Some(sweep)) => {
+            Ok(noid_recursive::BlockReplayWitness::from_two_bucket_parts(
+                standard.commitment.cap.clone(),
+                proof.state_binding_algebraics.clone(),
+                standard.block_col_openings.clone(),
+                standard.block_multipoint_rounds.clone(),
+                standard.block_multipoint_challenges.clone(),
+                sweep.block_multipoint_rounds.clone(),
+                sweep.block_multipoint_challenges.clone(),
+                sweep.block_initial_claim,
+                standard.mixed_opening.fri_proof.clone(),
+                standard.mixed_opening.all_openings.clone(),
+                standard.block_initial_claim,
+                crate::block_recursive_claim_field(proof),
+            ))
+        }
+        (Some(bucket), None) => Ok(noid_recursive::BlockReplayWitness::from_parts(
+            bucket.commitment.cap.clone(),
+            proof.state_binding_algebraics.clone(),
+            bucket.block_col_openings.clone(),
+            bucket.block_multipoint_rounds.clone(),
+            bucket.block_multipoint_challenges.clone(),
+            bucket.mixed_opening.fri_proof.clone(),
+            bucket.mixed_opening.all_openings.clone(),
+            bucket.block_initial_claim,
+            crate::block_recursive_claim_field(proof),
+        )),
+        (None, Some(bucket)) => Ok(noid_recursive::BlockReplayWitness::from_parts(
+            bucket.commitment.cap.clone(),
+            proof.state_binding_algebraics.clone(),
+            bucket.block_col_openings.clone(),
+            bucket.block_multipoint_rounds.clone(),
+            bucket.block_multipoint_challenges.clone(),
+            bucket.mixed_opening.fri_proof.clone(),
+            bucket.mixed_opening.all_openings.clone(),
+            bucket.block_initial_claim,
+            crate::block_recursive_claim_field(proof),
+        )),
+        (None, None) => Err(ReplayWitnessError::MissingReplayableBucket),
+    }
 }

@@ -17,11 +17,12 @@
 //! the AIR's `pins.{input,output}_leaf_absorb` lowering exactly.
 
 use noid_poseidon2b::primitives::{
-    hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core, Digest, TxBodyHash,
-    TXBODY_INPUTS, TXBODY_OUTPUTS,
+    hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core,
+    hash_tx_body_sweep25x2 as hash_tx_body_sweep25x2_core, Digest, TxBodyHash, SWEEP_TXBODY_INPUTS,
+    SWEEP_TXBODY_OUTPUTS, TXBODY_INPUTS, TXBODY_OUTPUTS,
 };
 
-use crate::types::{TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
+use crate::types::{TxInput, TxOutput, TxShape};
 
 /// Compute the canonical transaction-body hash. `inputs.len()` and
 /// `outputs.len()` must not exceed `MAX_INPUTS` / `MAX_OUTPUTS`;
@@ -38,30 +39,88 @@ pub fn hash_tx_body(
     outputs: &[TxOutput],
     is_coinbase: bool,
 ) -> TxBodyHash {
-    assert!(inputs.len() <= MAX_INPUTS, "inputs exceed MAX_INPUTS");
-    assert!(outputs.len() <= MAX_OUTPUTS, "outputs exceed MAX_OUTPUTS");
-    debug_assert_eq!(MAX_INPUTS, TXBODY_INPUTS);
-    debug_assert_eq!(MAX_OUTPUTS, TXBODY_OUTPUTS);
-
-    let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
-    for i in 0..TXBODY_INPUTS {
-        let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-        input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
-    }
-
-    let mut output_leaves: [Digest; TXBODY_OUTPUTS] = [[0u8; 32]; TXBODY_OUTPUTS];
-    for i in 0..TXBODY_OUTPUTS {
-        let out = outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-        output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
-    }
-
-    hash_tx_body_core(
+    hash_tx_body_for_shape(
+        TxShape::Standard4x8,
         epoch_anchor,
         fee,
-        &input_leaves,
-        &output_leaves,
+        inputs,
+        outputs,
         is_coinbase,
     )
+}
+
+/// Compute the canonical transaction-body hash for a specific shape.
+///
+/// `Standard4x8` preserves the existing 16-leaf launch layout exactly.
+/// `Sweep25x2` uses the reserved 32-leaf layout with an explicit shape leaf.
+pub fn hash_tx_body_for_shape(
+    shape: TxShape,
+    epoch_anchor: &Digest,
+    fee: u128,
+    inputs: &[TxInput],
+    outputs: &[TxOutput],
+    is_coinbase: bool,
+) -> TxBodyHash {
+    assert!(
+        inputs.len() <= shape.max_inputs(),
+        "inputs exceed shape max"
+    );
+    assert!(
+        outputs.len() <= shape.max_outputs(),
+        "outputs exceed shape max"
+    );
+
+    match shape {
+        TxShape::Standard4x8 => {
+            debug_assert_eq!(shape.max_inputs(), TXBODY_INPUTS);
+            debug_assert_eq!(shape.max_outputs(), TXBODY_OUTPUTS);
+
+            let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
+            for i in 0..TXBODY_INPUTS {
+                let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
+                input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
+            }
+
+            let mut output_leaves: [Digest; TXBODY_OUTPUTS] = [[0u8; 32]; TXBODY_OUTPUTS];
+            for i in 0..TXBODY_OUTPUTS {
+                let out = outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
+                output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
+            }
+
+            hash_tx_body_core(
+                epoch_anchor,
+                fee,
+                &input_leaves,
+                &output_leaves,
+                is_coinbase,
+            )
+        }
+        TxShape::Sweep25x2 => {
+            debug_assert_eq!(shape.max_inputs(), SWEEP_TXBODY_INPUTS);
+            debug_assert_eq!(shape.max_outputs(), SWEEP_TXBODY_OUTPUTS);
+
+            let mut input_leaves: [Digest; SWEEP_TXBODY_INPUTS] = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
+            for i in 0..SWEEP_TXBODY_INPUTS {
+                let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
+                input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
+            }
+
+            let mut output_leaves: [Digest; SWEEP_TXBODY_OUTPUTS] =
+                [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
+            for i in 0..SWEEP_TXBODY_OUTPUTS {
+                let out = outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
+                output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
+            }
+
+            hash_tx_body_sweep25x2_core(
+                epoch_anchor,
+                fee,
+                &input_leaves,
+                &output_leaves,
+                is_coinbase,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,5 +235,47 @@ mod tests {
         let h1 = hash_tx_body(&a1, 0, &[], &[], false);
         let h2 = hash_tx_body(&a2, 0, &[], &[], false);
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn sweep_hash_is_shape_separated() {
+        let anchor = [0x44u8; 32];
+        let inputs = vec![mk_input(1)];
+        let outputs = vec![mk_output(1)];
+        let standard =
+            hash_tx_body_for_shape(TxShape::Standard4x8, &anchor, 7, &inputs, &outputs, false);
+        let sweep =
+            hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 7, &inputs, &outputs, false);
+        assert_ne!(standard, sweep);
+    }
+
+    #[test]
+    fn sweep_hash_binds_last_input_and_second_output() {
+        let anchor = [0x55u8; 32];
+        let mut inputs: Vec<TxInput> = (0..25).map(|i| mk_input(i as u8 + 1)).collect();
+        let outputs = vec![mk_output(1), mk_output(2)];
+        let h1 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs, false);
+        inputs[24].value ^= 1;
+        let h2 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs, false);
+        assert_ne!(h1, h2);
+
+        let mut outputs2 = outputs;
+        outputs2[1].owner = Address([0xEE; 32]);
+        let h3 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs2, false);
+        assert_ne!(h2, h3);
+    }
+
+    #[test]
+    #[should_panic(expected = "inputs exceed shape max")]
+    fn standard_hash_rejects_more_than_four_inputs() {
+        let inputs = vec![TxInput::dummy(); 5];
+        let _ = hash_tx_body_for_shape(TxShape::Standard4x8, &[0u8; 32], 0, &inputs, &[], false);
+    }
+
+    #[test]
+    #[should_panic(expected = "outputs exceed shape max")]
+    fn sweep_hash_rejects_more_than_two_outputs() {
+        let outputs = vec![TxOutput::dummy(); 3];
+        let _ = hash_tx_body_for_shape(TxShape::Sweep25x2, &[0u8; 32], 0, &[], &outputs, false);
     }
 }

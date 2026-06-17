@@ -799,10 +799,22 @@ async fn main() -> anyhow::Result<()> {
 /// the returned headers are cryptographically committed to by real PoW work.
 /// A fabricated snapshot with fake state_roots would need to out-mine the real
 /// network to pass this check, making Eclipse attacks computationally infeasible.
+fn snapshot_chain_claim_from_header(
+    header: &noid_chain::block_header::BlockHeader,
+) -> noid_core::Block128 {
+    if header.proof_transcript_hash == noid_chain::block::STUB_PROOF_MARKER {
+        noid_core::Block128::from(0u128)
+    } else {
+        let mut lo = [0u8; 16];
+        lo.copy_from_slice(&header.proof_transcript_hash[..16]);
+        noid_core::Block128::from(u128::from_le_bytes(lo))
+    }
+}
+
 fn validate_snapshot_headers(
     recent_headers_bytes: &[Vec<u8>],
-    _genesis_acc: &noid_recursive::ChainAccumulator,
-    _proof_h: u64,
+    genesis_acc: &noid_recursive::ChainAccumulator,
+    proof_h: u64,
 ) -> Result<(Vec<noid_chain::block_header::BlockHeader>, Option<[u8; 32]>), String> {
     use noid_chain::block_header::BlockHeader;
     use noid_chain::consensus::difficulty::{add_work, block_work, work_gt};
@@ -872,15 +884,47 @@ fn validate_snapshot_headers(
         ));
     }
 
-    // The chain_hash formula now folds block_initial_claim into each step:
+    // The chain_hash formula folds the canonical chain_claim into each step:
     //   chain_hash_n = compress(prev, compress(H_BLOCK, claim_bytes_n))
     //
-    // Replaying this from headers-only is no longer possible because
-    // block_initial_claim is part of the BlockProof (pruned after FINALITY_DEPTH
-    // and unavailable here).  We return None; the STARK in verify_tip provides
-    // the authoritative chain-validity guarantee.  The hardcoded genesis hash
-    // check above is still the primary Eclipse anchor.
-    Ok((hdrs, None))
+    // For snapshots whose header window includes the full prefix from genesis to
+    // proof_h, the expected recursive accumulator chain_hash is derivable from
+    // headers alone: non-stub headers commit the canonical block proof transcript
+    // in `proof_transcript_hash`, while stub/coinbase-only headers use ZERO.
+    // Long-running networks whose manifest only carries a suffix still need the
+    // retained-checkpoint path tracked by N7; in that case return None and let the
+    // STARK/state-root checks run in legacy suffix mode.
+    let expected_chain_hash = if hdrs.first().is_some_and(|h| h.height == 0) {
+        let max_h = hdrs.last().map_or(0, |h| h.height);
+        if proof_h <= max_h {
+            let mut acc = noid_recursive::ChainAccumulator {
+                height: 0,
+                state_root: [0u8; 32],
+                chain_hash: [0u8; 32],
+            };
+            for h in 0..=proof_h {
+                let hdr = hdrs.iter().find(|hdr| hdr.height == h).ok_or_else(|| {
+                    format!("snapshot headers missing h={h} needed for expected chain_hash replay")
+                })?;
+                acc = acc.extend(
+                    hdr.state_root,
+                    noid_chain::hash_block_header(hdr),
+                    hdr.height,
+                    snapshot_chain_claim_from_header(hdr),
+                );
+            }
+            if proof_h == 0 && acc.chain_hash != genesis_acc.chain_hash {
+                return Err("snapshot genesis chain_hash replay mismatch".into());
+            }
+            Some(acc.chain_hash)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok((hdrs, expected_chain_hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,14 +1044,38 @@ async fn apply_reorg_offthread(
     .expect("apply_reorg_mdbx panicked in spawn_blocking")
 }
 
+fn validate_p2p_block_proof_binding(
+    block: &noid_chain::block::Block,
+    block_proof_bytes: &[u8],
+) -> Result<(), String> {
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if !has_user_txs {
+        noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
+            .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+        return Ok(());
+    }
+    if block_proof_bytes.is_empty() {
+        return Err(
+            "proof/header binding invalid: user-transaction block is missing BlockProof bytes"
+                .to_string(),
+        );
+    }
+    let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
+        .map_err(|e| format!("proof/header binding invalid: proof deserialize failed: {e}"))?;
+    let expected = noid_block::block_recursive_claim_hash(&proof);
+    if block.header.proof_transcript_hash != expected {
+        return Err("proof/header binding invalid: block proof canonical transcript does not match header proof_transcript_hash".to_string());
+    }
+    Ok(())
+}
+
 fn verify_p2p_block_against_context(
     ctx: &mut MdbxChainContext,
     block: &noid_chain::block::Block,
     block_proof_bytes: &[u8],
     local_time: u64,
 ) -> Result<(), String> {
-    noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
-        .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+    validate_p2p_block_proof_binding(block, block_proof_bytes)?;
 
     if block.header.height != ctx.tip_height().saturating_add(1)
         || block.header.prev_block_hash != ctx.tip_hash()
@@ -1040,12 +1108,26 @@ fn verify_p2p_block_against_context(
 
     let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|e| format!("proof deserialize failed: {e}"))?;
-    for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
-        if pi.log_slots != block.header.log_slots {
-            return Err(format!(
-                "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
-                pi.log_slots, block.header.log_slots
-            ));
+    noid_block::validate_block_bucket_tx_indices(block, &proof)
+        .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
+    if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
+        for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
+            if pi.log_slots != block.header.log_slots {
+                return Err(format!(
+                    "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
+                    pi.log_slots, block.header.log_slots
+                ));
+            }
+        }
+    }
+    if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
+        for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
+            if pi.log_slots != block.header.log_slots {
+                return Err(format!(
+                    "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
+                    pi.log_slots, block.header.log_slots
+                ));
+            }
         }
     }
 
@@ -1054,16 +1136,24 @@ fn verify_p2p_block_against_context(
     ctx.preload_segments_for_block(block)
         .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
 
-    let spine = noid_block::build_spine_inputs_list(block);
-    let auth = noid_block::build_auth_public_list(block, &proof);
+    noid_block::verify_sweep_bucket_from_block(block, &proof)
+        .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
     let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
-    let tx_airs = noid_block::build_tx_airs(block);
-    let air_refs: Vec<&dyn noid_air::Air> =
-        tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
     let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
         sb_airs.iter().collect();
-    noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
-        .map_err(|e| format!("ZK proof invalid: {e:?}"))
+    if proof.standard_bucket.is_some() {
+        let spine = noid_block::build_spine_inputs_list(block);
+        let auth = noid_block::build_auth_public_list(block, &proof);
+        let tx_airs = noid_block::build_tx_airs(block);
+        let air_refs: Vec<&dyn noid_air::Air> =
+            tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
+        noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
+            .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
+    } else {
+        noid_block::verify_state_bindings_standalone(&proof, &sb_refs)
+            .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
+    }
+    Ok(())
 }
 
 async fn verify_p2p_block_against_current_tip(
@@ -1092,8 +1182,7 @@ async fn verify_p2p_block_against_current_tip(
         }
 
         (|| -> Result<Option<VerifyWork>, String> {
-            noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
-                .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+            validate_p2p_block_proof_binding(block, block_proof_bytes)?;
 
             let parent = ctx.tip_header().clone();
             let prev_timestamps = ctx.prev_timestamps();
@@ -1115,12 +1204,26 @@ async fn verify_p2p_block_against_current_tip(
             } else {
                 let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
                     .map_err(|e| format!("proof deserialize failed: {e}"))?;
-                for (tx_index, pi) in proof.tx_pis.iter().enumerate() {
-                    if pi.log_slots != block.header.log_slots {
-                        return Err(format!(
-                            "proof log_slots/header binding invalid at tx {tx_index}: proof={} header={}",
-                            pi.log_slots, block.header.log_slots
-                        ));
+                noid_block::validate_block_bucket_tx_indices(block, &proof)
+                    .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
+                if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
+                    for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
+                        if pi.log_slots != block.header.log_slots {
+                            return Err(format!(
+                                "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
+                                pi.log_slots, block.header.log_slots
+                            ));
+                        }
+                    }
+                }
+                if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
+                    for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
+                        if pi.log_slots != block.header.log_slots {
+                            return Err(format!(
+                                "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
+                                pi.log_slots, block.header.log_slots
+                            ));
+                        }
                     }
                 }
 
@@ -1134,6 +1237,9 @@ async fn verify_p2p_block_against_current_tip(
                 let auth = noid_block::build_auth_public_list(block, &proof);
                 let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
                 let tx_airs = noid_block::build_tx_airs(block);
+
+                noid_block::verify_sweep_bucket_from_block(block, &proof)
+                    .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
 
                 Ok(Some(VerifyWork {
                     proof,
@@ -1169,8 +1275,14 @@ async fn verify_p2p_block_against_current_tip(
             .collect();
         let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
             work.sb_airs.iter().collect();
-        noid_block::verify_block(&air_refs, &work.proof, &work.spine, &work.auth, &sb_refs)
-            .map_err(|e| format!("ZK proof invalid: {e:?}"))
+        if work.proof.standard_bucket.is_some() {
+            noid_block::verify_block(&air_refs, &work.proof, &work.spine, &work.auth, &sb_refs)
+                .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
+        } else {
+            noid_block::verify_state_bindings_standalone(&work.proof, &sb_refs)
+                .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("verify task failed: {e}"))
@@ -1465,7 +1577,7 @@ async fn handle_p2p_events(
                         {
                             continue;
                         } else if !extends_current_tip {
-                            if let Err(e) = noid_chain::block::validate_block_proof_binding(&block, &block_proof_bytes) {
+                            if let Err(e) = validate_p2p_block_proof_binding(&block, &block_proof_bytes) {
                                 tracing::warn!(
                                     peer = %from,
                                     height = block.header.height,
@@ -2604,10 +2716,18 @@ async fn handle_p2p_events(
                                         &expected_new_root,
                                     ) {
                                         Ok(()) => {
+                                            if let Some(expected) = expected_chain_hash.as_ref() {
+                                                if proof.acc.chain_hash != *expected {
+                                                    return Err(format!(
+                                                        "step-proof chain_hash mismatch at h={proof_h}"
+                                                    ));
+                                                }
+                                            }
                                             tracing::info!(
                                                 proof_h,
                                                 snap_tip_h,
                                                 gap = snap_tip_h - proof_h,
+                                                expected_chain_hash = expected_chain_hash.is_some(),
                                                 "snapshot: step-proof verified \
                                                  (proof {} blocks before tip)",
                                                 snap_tip_h - proof_h
@@ -3077,7 +3197,7 @@ async fn run_recursive_proof_updater(
     use noid_chain::consensus::params::FINALITY_DEPTH;
     use noid_recursive::{
         null_block_replay_witness, prove_genesis_recursive, prove_recursive_step,
-        RecursiveBlockProof,
+        verify_step_stark_only, RecursiveBlockProof,
     };
     use std::time::Duration;
 
@@ -3143,6 +3263,15 @@ async fn run_recursive_proof_updater(
             let result = tokio::task::spawn_blocking(prove_genesis_recursive).await;
             match result {
                 Ok(genesis_proof) => {
+                    let genesis_header = noid_chain::consensus::genesis::genesis_header();
+                    if let Err(e) = verify_step_stark_only(
+                        &genesis_proof,
+                        &[0u8; 32],
+                        &genesis_header.state_root,
+                    ) {
+                        tracing::error!(err = ?e, "genesis recursive proof failed self-verification");
+                        continue;
+                    }
                     let bytes = bincode::serialize(&genesis_proof).unwrap_or_default();
                     let (stored, tip_hash) = {
                         let ctx = chain.read().await;
@@ -3197,7 +3326,17 @@ async fn run_recursive_proof_updater(
         let witness = match block_proof_bytes_opt {
             Some(ref bytes) if !bytes.is_empty() => {
                 match bincode::deserialize::<BlockProof>(bytes) {
-                    Ok(bp) => block_proof_to_replay_witness(&bp),
+                    Ok(bp) => match block_proof_to_replay_witness(&bp) {
+                        Ok(witness) => witness,
+                        Err(e) => {
+                            tracing::warn!(
+                                next_height,
+                                err = ?e,
+                                "recursive proof cannot extract replay witness from malformed block proof — waiting for re-sync"
+                            );
+                            continue;
+                        }
+                    },
                     Err(e) => {
                         if is_coinbase_only {
                             tracing::warn!(
@@ -3236,6 +3375,9 @@ async fn run_recursive_proof_updater(
         // Move rec_proof_opt into the closure — RecursiveBlockProof is not Clone.
         // prev_acc is already extracted above (ChainAccumulator: Clone).
 
+        let header_for_verify = header.clone();
+        let prev_state_root_for_verify = prev_acc.state_root;
+
         tracing::debug!(next_height, "recursive proof: proving step");
         let result = tokio::task::spawn_blocking(move || {
             prove_recursive_step(&witness, &header, &prev_acc, rec_proof_opt.as_ref())
@@ -3245,6 +3387,14 @@ async fn run_recursive_proof_updater(
         match result {
             Ok(new_proof) => {
                 let h = new_proof.block_height;
+                if let Err(e) = verify_step_stark_only(
+                    &new_proof,
+                    &prev_state_root_for_verify,
+                    &header_for_verify.state_root,
+                ) {
+                    tracing::error!(height = h, err = ?e, "recursive proof failed self-verification — not storing");
+                    continue;
+                }
                 let bytes = bincode::serialize(&new_proof).unwrap_or_default();
                 let (stored, tip_hash) = {
                     let ctx = chain.read().await;

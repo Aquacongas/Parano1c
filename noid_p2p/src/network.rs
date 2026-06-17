@@ -39,7 +39,7 @@ const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // 6 MB (5 MB at max 256 t
 const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin)
 const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB (6.5 KB typical)
 const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
-const MAX_TX_WIRE_SIZE: usize = 1024 * 1024; // 1 MB TxIntent hard cap
+const MAX_TX_WIRE_SIZE: usize = 2 * 1024 * 1024; // 2 MB TxIntent hard cap (covers Sweep25x2 proofs)
 const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-sync response
 
 /// Commands sent to the P2P network event loop.

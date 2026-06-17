@@ -99,6 +99,7 @@ mod tests {
             })
             .collect();
         let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [hash_seed; 32],
             fee: 0,
             inputs: vec![],

@@ -103,6 +103,7 @@ fn build_standard_scenario() -> Scenario {
     ];
 
     let body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xAA; 32],
         fee: 50,
         inputs: vec![
@@ -192,6 +193,7 @@ fn build_max_scenario() -> Scenario {
     let out_owners: [Address; 8] = std::array::from_fn(|i| native_address(out_secrets[i]));
 
     let body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xBB; 32],
         fee: 575,
         inputs: vec![
@@ -355,6 +357,7 @@ fn build_logic_inputs(
     let pi = PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: TxBodyHash(fields_to_bytes(tx_body_hash)),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,

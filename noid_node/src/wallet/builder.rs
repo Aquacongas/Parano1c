@@ -15,17 +15,17 @@
 //! the body hash input. The correct order is:
 //!
 //! 1. Build inputs with `AuthTag([0; 32])` placeholders.
-//! 2. `tx_body_hash = hash_tx_body(epoch_anchor, fee, inputs, outputs, false)`
+//! 2. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`
 //! 3. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`
 //! 4. Fill auth tags in place.
 //! 5. `prove_tx(&body, spend_secrets)` → `WalletProofBundle`
 
 use noid_poseidon2b::primitives::{hash_auth_tag, Address, AuthTag, SpendSecret};
 use noid_tx::{
-    body_hash::hash_tx_body,
+    body_hash::hash_tx_body_for_shape,
     claims::compute_claims_commitment,
     intent::TxIntent,
-    types::{TxBody, TxInput, TxOutput},
+    types::{TxBody, TxInput, TxOutput, TxShape},
     MAX_INPUTS,
 };
 
@@ -55,6 +55,8 @@ pub struct TxBuildData {
     pub output_slot_hints: Vec<u32>,
     /// `log2(state_size)` — passed to `prove_tx` to select the correct AIR shape.
     pub log_slots: u32,
+    /// Transaction proof/body shape selected by coin selection.
+    pub shape: TxShape,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +94,7 @@ pub enum BuildError {
 /// - [`BuildError::InsufficientFunds`] — confirmed balance is below
 ///   `amount_micronoid + fee_micronoid`.
 /// - [`BuildError::TooManyInputs`] — coin selection required more than
-///   [`MAX_INPUTS`] UTXOs to cover the target amount.
+///   [`TxShape::Sweep25x2`] UTXOs to cover the target amount.
 /// - [`BuildError::NotEnoughSlots`] — `slot_hints` did not supply enough
 ///   free-slot indices for all outputs (1 for payment, +1 if change > 0).
 pub fn extract_build_data(
@@ -114,11 +116,16 @@ pub fn extract_build_data(
             have: wallet.balance(),
         })?;
 
-    // Reject if selection would exceed the circuit's fixed input count.
-    if selected_refs.len() > MAX_INPUTS {
+    // Select the smallest proof shape that can carry the selected inputs.
+    let shape = if selected_refs.len() <= TxShape::Standard4x8.max_inputs() {
+        TxShape::Standard4x8
+    } else {
+        TxShape::Sweep25x2
+    };
+    if selected_refs.len() > shape.max_inputs() {
         return Err(BuildError::TooManyInputs {
             selected: selected_refs.len(),
-            max: MAX_INPUTS,
+            max: shape.max_inputs(),
         });
     }
 
@@ -153,6 +160,7 @@ pub fn extract_build_data(
         epoch_anchor,
         output_slot_hints: slot_hints,
         log_slots,
+        shape,
     })
 }
 
@@ -237,6 +245,7 @@ pub fn extract_consolidate_data(
             epoch_anchor,
             output_slot_hints: slot_hints,
             log_slots,
+            shape: TxShape::Standard4x8,
         },
         consolidation_amount,
     ))
@@ -257,8 +266,8 @@ pub fn extract_consolidate_data(
 /// 1. Build outputs: payment output at `slot_hints[0]`; change output at
 ///    `slot_hints[1]` if `change_amount > 0`.
 /// 2. Build live inputs with `AuthTag([0; 32])` placeholders.
-/// 3. Pad inputs to [`MAX_INPUTS`] with `TxInput::dummy()` (`valid = false`).
-/// 4. `tx_body_hash = hash_tx_body(epoch_anchor, fee, inputs, outputs, false)`.
+/// 3. Pad inputs to the selected shape with `TxInput::dummy()` (`valid = false`).
+/// 4. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`.
 ///    Auth tags are intentionally excluded from the body hash.
 /// 5. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`.
 /// 6. Fill real auth tags into the live input slots.
@@ -305,7 +314,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Steps 2–3: Build live inputs with dummy auth tags; pad to MAX_INPUTS.
+    // Steps 2–3: Build live inputs with dummy auth tags; pad to selected shape.
     // -----------------------------------------------------------------------
     let n_live = data.selected_utxos.len();
 
@@ -325,14 +334,15 @@ pub fn build_and_prove_tx(
         })
         .collect();
 
-    while inputs.len() < MAX_INPUTS {
+    while inputs.len() < data.shape.max_inputs() {
         inputs.push(TxInput::dummy());
     }
 
     // -----------------------------------------------------------------------
     // Compute the body hash. Auth tags are NOT inputs to this hash.
     // -----------------------------------------------------------------------
-    let tx_body_hash = hash_tx_body(
+    let tx_body_hash = hash_tx_body_for_shape(
+        data.shape,
         &data.epoch_anchor,
         fee_micronoid as u128,
         &inputs,
@@ -354,6 +364,7 @@ pub fn build_and_prove_tx(
     // ensures the raw key material is cleared from memory when prove_tx returns.
     // -----------------------------------------------------------------------
     let body = TxBody {
+        shape: data.shape,
         epoch_anchor: data.epoch_anchor,
         fee: fee_micronoid as u128,
         inputs,
@@ -381,4 +392,94 @@ pub fn build_and_prove_tx(
     };
 
     Ok((tx_body_hash.0, intent.to_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn wallet_with_utxos(n: u32, value: u64) -> (TempDir, WalletState) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(path).unwrap();
+        for i in 0..n {
+            wallet.utxos.insert(
+                i,
+                WalletUtxo {
+                    slot_index: i,
+                    value,
+                    address: wallet.address_at(i),
+                    key_index: i,
+                    confirmed_height: 1,
+                },
+            );
+        }
+        (dir, wallet)
+    }
+
+    fn extract_for(wallet: &WalletState, amount: u64, fee: u64) -> Result<TxBuildData, BuildError> {
+        extract_build_data(
+            wallet,
+            amount,
+            fee,
+            [0x11; 32],
+            vec![50_000, 50_001],
+            24,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn extract_build_data_uses_standard_for_four_inputs() {
+        let (_dir, wallet) = wallet_with_utxos(4, 1_000);
+        let data = extract_for(&wallet, 3_500, 500).unwrap();
+        assert_eq!(data.selected_utxos.len(), 4);
+        assert_eq!(data.shape, TxShape::Standard4x8);
+    }
+
+    #[test]
+    fn extract_build_data_uses_sweep_for_five_inputs() {
+        let (_dir, wallet) = wallet_with_utxos(5, 1_000);
+        let data = extract_for(&wallet, 4_500, 500).unwrap();
+        assert_eq!(data.selected_utxos.len(), 5);
+        assert_eq!(data.shape, TxShape::Sweep25x2);
+    }
+
+    #[test]
+    fn extract_build_data_rejects_more_than_sweep_capacity() {
+        let (_dir, wallet) = wallet_with_utxos(26, 1_000);
+        let err = match extract_for(&wallet, 26_000, 0) {
+            Ok(_) => panic!("expected too many inputs error"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            BuildError::TooManyInputs {
+                selected: 26,
+                max: 25
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+    fn build_and_prove_tx_emits_sweep_intent_for_five_inputs() {
+        let (_dir, wallet) = wallet_with_utxos(5, 20_000);
+        let amount = 80_000;
+        let fee = 18_500;
+        let data = extract_for(&wallet, amount, fee).unwrap();
+        assert_eq!(data.shape, TxShape::Sweep25x2);
+
+        let (tx_hash, intent_bytes) =
+            build_and_prove_tx([0xA7; 32], amount, fee, data).expect("prove sweep wallet tx");
+        let intent = TxIntent::from_bytes(&intent_bytes).expect("decode intent");
+        assert_eq!(intent.tx_body.shape, TxShape::Sweep25x2);
+        assert_eq!(intent.tx_body.inputs.iter().filter(|i| i.valid).count(), 5);
+        assert_eq!(intent.tx_body_hash.0, tx_hash);
+
+        let bundle = noid_stark::WalletProofBundle::from_bytes(&intent.logic_proof_bytes)
+            .expect("decode wallet proof bundle");
+        assert_eq!(bundle.shape(), TxShape::Sweep25x2);
+    }
 }

@@ -179,6 +179,7 @@ fn build_tx_fixture(
     }
 
     let mut body = TxBody {
+        shape: noid_tx::TxShape::Standard4x8,
         epoch_anchor: [0xAA; 32],
         fee,
         inputs,
@@ -237,6 +238,7 @@ fn build_tx_fixture(
     let pi = PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: TxBodyHash(fields_to_bytes(tx_body_hash)),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,
@@ -340,7 +342,9 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     // The block prover receives only public auth data + pre-built proof.
     let witnesses: Vec<TxBlockWitness<'_>> = fixtures
         .iter()
-        .map(|f| TxBlockWitness {
+        .enumerate()
+        .map(|(k, f)| TxBlockWitness {
+            block_tx_index: (k + 1) as u32,
             air: &f.air as &dyn Air,
             trace: &f.trace,
             pi: &f.pi,
@@ -360,12 +364,16 @@ fn bench_block_pipeline(fixtures: &[TxFixture], proofs: &[LogicProof]) -> BlockR
     let block_proof =
         prove_block(prev_state_root, [0u8; 32], &witnesses, &[]).expect("prove_block");
     let block_proof_bytes = block_proof.byte_len();
-    let per_tx_algebraic_bytes = if !block_proof.tx_algebraic.is_empty() {
-        block_proof.tx_algebraic[0].byte_len()
+    let standard_bucket = block_proof
+        .standard_bucket
+        .as_ref()
+        .expect("standard bucket");
+    let per_tx_algebraic_bytes = if !standard_bucket.tx_algebraic.is_empty() {
+        standard_bucket.tx_algebraic[0].byte_len()
     } else {
         0
     };
-    let unified_spine_bytes = block_proof.block_spine_proof.byte_len();
+    let unified_spine_bytes = standard_bucket.block_spine_proof.byte_len();
 
     // Verifier verifies the block proof (only public auth data)
     let spine_inputs_list: Vec<SpineInputs> =

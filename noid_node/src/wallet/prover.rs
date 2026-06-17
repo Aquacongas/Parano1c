@@ -9,8 +9,8 @@
 //!
 //! # What this produces
 //!
-//! `WalletProofBundle { logic_proof, auth_slices }` — the wallet's proof artifact
-//! that is submitted to the local mempool via `submitTxIntent`. The bundle is
+//! `WalletProofBundle::{Standard4x8, Sweep25x2}` — the wallet's proof artifact
+//! submitted to the local mempool via `submitTxIntent`. The bundle is
 //! forwarded from the mempool to the block prover inside the daemon.
 //!
 //! # SpendSecret handling
@@ -27,10 +27,16 @@ use noid_gkr::{
     N_AUTH_UNIFIED_VARS,
 };
 use noid_poseidon2b::primitives::SpendSecret;
-use noid_stark::{prove_logic::LogicWitness, wallet_bundle::WalletProofBundle};
-use noid_tx::{PublicInputs, TxBody, MAX_INPUTS, MAX_OUTPUTS};
-
 use noid_stark::prove_logic::prove_logic;
+use noid_stark::prove_logic::LogicWitness;
+use noid_stark::prove_logic_sweep::{
+    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
+    SweepLogicWitness,
+};
+use noid_stark::wallet_bundle::{
+    StandardWalletProofBundle, SweepWalletProofBundle, WalletProofBundle,
+};
+use noid_tx::{PublicInputs, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
 
 /// Error from transaction proving.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +61,17 @@ pub enum ProveError {
 pub fn prove_tx(
     body: &TxBody,
     spend_secrets: Vec<SpendSecret>, // consumed and zeroized
+    log_slots: u32,
+) -> Result<WalletProofBundle, ProveError> {
+    match body.shape {
+        TxShape::Standard4x8 => prove_standard_tx(body, spend_secrets, log_slots),
+        TxShape::Sweep25x2 => prove_sweep_tx(body, spend_secrets, log_slots),
+    }
+}
+
+fn prove_standard_tx(
+    body: &TxBody,
+    spend_secrets: Vec<SpendSecret>,
     log_slots: u32,
 ) -> Result<WalletProofBundle, ProveError> {
     // Build boundary pins from the tx body (public computation).
@@ -105,15 +122,52 @@ pub fn prove_tx(
 
     // SpendSecret is now only in `auth_inputs` and `spend_secret_arr` which
     // are stack-allocated and will be dropped (zeroized) at the end of this fn.
-    // The `WalletProofBundle` contains NO secret material:
-    //   logic_proof = STARK + AuthKillShot (one-way outputs only)
-    //   auth_slices = Poseidon2b MLE state (one-way from secret)
+    // The `WalletProofBundle` contains NO raw SpendSecret material:
+    //   logic_proof = STARK + AuthKillShot
+    //   auth_slices = AuthGKR state slices, matching the SC-5 one-wayness model
 
-    Ok(WalletProofBundle {
+    Ok(WalletProofBundle::Standard4x8(StandardWalletProofBundle {
         logic_proof,
         auth_slices,
         auth_public: auth_inputs.to_public(),
-    })
+    }))
+}
+
+fn prove_sweep_tx(
+    body: &TxBody,
+    spend_secrets: Vec<SpendSecret>,
+    log_slots: u32,
+) -> Result<WalletProofBundle, ProveError> {
+    let mut body_with_secrets = body.clone();
+    let mut secret_iter = spend_secrets.into_iter();
+    for input in body_with_secrets.inputs.iter_mut().filter(|i| i.valid) {
+        if let Some(secret) = secret_iter.next() {
+            input.spend_secret = secret;
+        }
+    }
+
+    let (air, trace, auth_inputs, spine_inputs) =
+        sweep_logic_witness_parts_from_body(&body_with_secrets);
+    let pi = build_public_inputs_for_shape(&body_with_secrets, log_slots);
+    let witness = SweepLogicWitness {
+        air: &air,
+        trace: &trace,
+        pi: &pi,
+        auth_inputs: &auth_inputs,
+        spine_inputs: &spine_inputs,
+    };
+    let logic_proof =
+        prove_sweep_logic(&witness).map_err(|e| ProveError::Logic(format!("{e:?}")))?;
+
+    // Sweep follows the Standard4x8 wallet artifact model: serialize only
+    // AuthGKR `state` slices, not s_in/s_out or tx-body SpineGKR helper columns.
+    let auth_slices = build_sweep_auth_slices(&auth_inputs);
+
+    Ok(WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
+        logic_proof,
+        auth_slices,
+        auth_public: auth_inputs.to_public(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -146,11 +200,53 @@ fn build_public_inputs(body: &TxBody, log_slots: u32) -> PublicInputs {
     PublicInputs {
         epoch_anchor: body.epoch_anchor,
         tx_body_hash: noid_poseidon2b::primitives::TxBodyHash(hash_bytes),
+        shape_id: body.shape.id(),
         fee: body.fee,
         n_live_inputs,
         n_live_outputs,
         coinbase_credit: 0,
         log_slots, // from block header at inclusion time
+        claims_commitment: claims,
+        is_activation,
+        is_deactivation,
+    }
+}
+
+fn build_public_inputs_for_shape(body: &TxBody, log_slots: u32) -> PublicInputs {
+    use noid_tx::{compute_claims_commitment, hash_tx_body_for_shape};
+
+    let tx_body_hash = hash_tx_body_for_shape(
+        body.shape,
+        &body.epoch_anchor,
+        body.fee,
+        &body.inputs,
+        &body.outputs,
+        body.is_coinbase,
+    );
+    let n_live_inputs = body.inputs.iter().filter(|i| i.valid).count() as u8;
+    let n_live_outputs = body.outputs.iter().filter(|o| o.valid).count() as u8;
+    let claims = compute_claims_commitment(&body.inputs, &body.outputs);
+
+    let mut is_activation = [false; MAX_OUTPUTS];
+    let mut is_deactivation = [false; MAX_INPUTS];
+    if body.shape == TxShape::Standard4x8 {
+        for (j, out) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+            is_activation[j] = out.valid;
+        }
+        for (i, inp) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
+            is_deactivation[i] = inp.valid;
+        }
+    }
+
+    PublicInputs {
+        epoch_anchor: body.epoch_anchor,
+        tx_body_hash,
+        shape_id: body.shape.id(),
+        fee: body.fee,
+        n_live_inputs,
+        n_live_outputs,
+        coinbase_credit: 0,
+        log_slots,
         claims_commitment: claims,
         is_activation,
         is_deactivation,

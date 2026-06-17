@@ -11,7 +11,7 @@
 use noid_poseidon2b::primitives::{Address, AuthTag, Digest, SpendSecret, TxBodyHash};
 
 use crate::public::PublicInputs;
-use crate::types::{Transaction, TxBody, TxInput, TxOutput};
+use crate::types::{Transaction, TxBody, TxInput, TxOutput, TxShape};
 
 /// Encoding / decoding errors surfaced to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,8 @@ pub enum WireError {
     FeeTooLarge,
     ShapeMismatch,
     InvalidBool,
+    InvalidShape,
+    UnsupportedShape,
     TrailingBytes,
 }
 
@@ -45,6 +47,10 @@ fn put_u32(buf: &mut Vec<u8>, v: u32) {
 #[inline]
 fn put_bool(buf: &mut Vec<u8>, v: bool) {
     buf.push(if v { 1u8 } else { 0u8 });
+}
+#[inline]
+fn put_u8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
 }
 
 #[inline]
@@ -86,6 +92,15 @@ fn take_bool(src: &mut &[u8]) -> Result<bool, WireError> {
         1 => Ok(true),
         _ => Err(WireError::InvalidBool),
     }
+}
+#[inline]
+fn take_u8(src: &mut &[u8]) -> Result<u8, WireError> {
+    Ok(take(src, 1)?[0])
+}
+
+#[inline]
+fn take_shape(src: &mut &[u8]) -> Result<TxShape, WireError> {
+    TxShape::from_id(take_u8(src)?).ok_or(WireError::InvalidShape)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +223,12 @@ impl TxBody {
     /// MUST NOT be used for network payloads — use `encode_public` instead.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         assert!(
-            self.inputs.len() <= crate::types::MAX_INPUTS,
-            "inputs exceed MAX_INPUTS"
+            self.inputs.len() <= self.shape.max_inputs(),
+            "inputs exceed shape max"
         );
         assert!(
-            self.outputs.len() <= crate::types::MAX_OUTPUTS,
-            "outputs exceed MAX_OUTPUTS"
+            self.outputs.len() <= self.shape.max_outputs(),
+            "outputs exceed shape max"
         );
         assert!(
             self.fee <= u64::MAX as u128,
@@ -221,6 +236,7 @@ impl TxBody {
             self.fee,
         );
 
+        put_u8(buf, self.shape.id());
         put_digest(buf, &self.epoch_anchor);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
@@ -238,12 +254,12 @@ impl TxBody {
     /// used inside `TxIntent`. Safe to broadcast to full nodes.
     pub fn encode_public(&self, buf: &mut Vec<u8>) {
         assert!(
-            self.inputs.len() <= crate::types::MAX_INPUTS,
-            "inputs exceed MAX_INPUTS"
+            self.inputs.len() <= self.shape.max_inputs(),
+            "inputs exceed shape max"
         );
         assert!(
-            self.outputs.len() <= crate::types::MAX_OUTPUTS,
-            "outputs exceed MAX_OUTPUTS"
+            self.outputs.len() <= self.shape.max_outputs(),
+            "outputs exceed shape max"
         );
         assert!(
             self.fee <= u64::MAX as u128,
@@ -251,6 +267,7 @@ impl TxBody {
             self.fee,
         );
 
+        put_u8(buf, self.shape.id());
         put_digest(buf, &self.epoch_anchor);
         put_u128(buf, self.fee);
         put_u32(buf, self.inputs.len() as u32);
@@ -266,7 +283,8 @@ impl TxBody {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            32 + 16
+            1 + 32
+                + 16
                 + 4
                 + self.inputs.len() * TX_INPUT_WIRE_SIZE
                 + 4
@@ -279,6 +297,7 @@ impl TxBody {
 
     /// Decode full format (includes spend_secret). Local storage only.
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
+        let shape = take_shape(src)?;
         let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
         if fee > u64::MAX as u128 {
@@ -286,7 +305,7 @@ impl TxBody {
         }
 
         let n_in = take_u32(src)? as usize;
-        if n_in > crate::types::MAX_INPUTS {
+        if n_in > shape.max_inputs() {
             return Err(WireError::CountTooLarge);
         }
         let mut inputs = Vec::with_capacity(n_in);
@@ -295,7 +314,7 @@ impl TxBody {
         }
 
         let n_out = take_u32(src)? as usize;
-        if n_out > crate::types::MAX_OUTPUTS {
+        if n_out > shape.max_outputs() {
             return Err(WireError::CountTooLarge);
         }
         let mut outputs = Vec::with_capacity(n_out);
@@ -306,6 +325,7 @@ impl TxBody {
         let is_coinbase = take_bool(src)?;
 
         Ok(Self {
+            shape,
             epoch_anchor,
             fee,
             inputs,
@@ -325,6 +345,7 @@ impl TxBody {
 
     /// Decode public network format (spend_secret absent in inputs → zeroed).
     pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
+        let shape = take_shape(src)?;
         let epoch_anchor = take_digest(src)?;
         let fee = take_u128(src)?;
         if fee > u64::MAX as u128 {
@@ -332,7 +353,7 @@ impl TxBody {
         }
 
         let n_in = take_u32(src)? as usize;
-        if n_in > crate::types::MAX_INPUTS {
+        if n_in > shape.max_inputs() {
             return Err(WireError::CountTooLarge);
         }
         let mut inputs = Vec::with_capacity(n_in);
@@ -341,7 +362,7 @@ impl TxBody {
         }
 
         let n_out = take_u32(src)? as usize;
-        if n_out > crate::types::MAX_OUTPUTS {
+        if n_out > shape.max_outputs() {
             return Err(WireError::CountTooLarge);
         }
         let mut outputs = Vec::with_capacity(n_out);
@@ -352,6 +373,7 @@ impl TxBody {
         let is_coinbase = take_bool(src)?;
 
         Ok(Self {
+            shape,
             epoch_anchor,
             fee,
             inputs,
@@ -403,8 +425,8 @@ impl Transaction {
 }
 
 // ---------------------------------------------------------------------------
-// PublicInputs : epoch_anchor (32) + tx_body_hash (32) + fee (16)
-//              + n_live_inputs (1) + n_live_outputs (1)
+// PublicInputs : epoch_anchor (32) + tx_body_hash (32) + shape_id (1)
+//              + fee (16) + n_live_inputs (1) + n_live_outputs (1)
 //              + coinbase_credit (8) + log_slots (4)
 //              + claims_commitment (32)
 //              + is_activation[MAX_OUTPUTS] (MAX_OUTPUTS bytes, 0/1)
@@ -412,12 +434,13 @@ impl Transaction {
 // ---------------------------------------------------------------------------
 
 pub const PUBLIC_INPUTS_WIRE_SIZE: usize =
-    3 * 32 + 16 + 1 + 1 + 8 + 4 + crate::types::MAX_OUTPUTS + crate::types::MAX_INPUTS;
+    3 * 32 + 1 + 16 + 1 + 1 + 8 + 4 + crate::types::MAX_OUTPUTS + crate::types::MAX_INPUTS;
 
 impl PublicInputs {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         put_digest(buf, &self.epoch_anchor);
         put_digest(buf, &self.tx_body_hash.0);
+        put_u8(buf, self.shape_id);
         put_u128(buf, self.fee);
         buf.push(self.n_live_inputs);
         buf.push(self.n_live_outputs);
@@ -439,6 +462,8 @@ impl PublicInputs {
         i += 32;
         out[i..i + 32].copy_from_slice(&self.tx_body_hash.0);
         i += 32;
+        out[i] = self.shape_id;
+        i += 1;
         out[i..i + 16].copy_from_slice(&self.fee.to_le_bytes());
         i += 16;
         out[i] = self.n_live_inputs;
@@ -465,6 +490,10 @@ impl PublicInputs {
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let epoch_anchor = take_digest(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
+        let shape_id = take_u8(src)?;
+        if TxShape::from_id(shape_id).is_none() {
+            return Err(WireError::InvalidShape);
+        }
         let fee = take_u128(src)?;
         let n_live_inputs = take(src, 1)?[0];
         let n_live_outputs = take(src, 1)?[0];
@@ -490,6 +519,7 @@ impl PublicInputs {
         Ok(Self {
             epoch_anchor,
             tx_body_hash,
+            shape_id,
             fee,
             n_live_inputs,
             n_live_outputs,
@@ -562,13 +592,13 @@ mod tests {
 
     #[test]
     fn tx_body_roundtrip() {
-        let body = TxBody {
-            epoch_anchor: [0x11u8; 32],
-            fee: 42u128,
-            inputs: vec![mk_input(1), mk_input(2), TxInput::dummy()],
-            outputs: vec![mk_output(1), mk_output(2), TxOutput::dummy()],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard(
+            [0x11u8; 32],
+            42u128,
+            vec![mk_input(1), mk_input(2), TxInput::dummy()],
+            vec![mk_output(1), mk_output(2), TxOutput::dummy()],
+            false,
+        );
         let bytes = body.to_bytes();
         let back = TxBody::from_bytes(&bytes).unwrap();
         assert_eq!(back, body);
@@ -576,13 +606,7 @@ mod tests {
 
     #[test]
     fn tx_body_coinbase_roundtrip() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![mk_output(1)],
-            is_coinbase: true,
-        };
+        let body = TxBody::standard([0u8; 32], 0, vec![], vec![mk_output(1)], true);
         let bytes = body.to_bytes();
         let back = TxBody::from_bytes(&bytes).unwrap();
         assert_eq!(back, body);
@@ -591,13 +615,7 @@ mod tests {
 
     #[test]
     fn tx_body_is_coinbase_byte_is_bound() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard([0u8; 32], 0, vec![], vec![], false);
         let mut bytes = body.to_bytes();
         let last = bytes.len() - 1;
         bytes[last] = 1;
@@ -608,11 +626,44 @@ mod tests {
     }
 
     #[test]
+    fn tx_body_rejects_invalid_shape_id() {
+        let bytes = [0xFFu8];
+        assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::InvalidShape));
+    }
+
+    #[test]
+    fn tx_body_sweep25x2_roundtrip() {
+        let body = TxBody {
+            shape: TxShape::Sweep25x2,
+            epoch_anchor: [0x22u8; 32],
+            fee: 123,
+            inputs: (0..25).map(|i| mk_input(i as u8 + 1)).collect(),
+            outputs: vec![mk_output(1), mk_output(2)],
+            is_coinbase: false,
+        };
+        let bytes = body.to_bytes();
+        let back = TxBody::from_bytes(&bytes).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
     fn tx_body_rejects_too_many_inputs() {
         let mut buf = Vec::new();
+        put_u8(&mut buf, TxShape::Standard4x8.id());
         buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
         buf.extend_from_slice(&[0u8; 16]); // fee
-        put_u32(&mut buf, (crate::types::MAX_INPUTS + 1) as u32);
+        put_u32(&mut buf, (TxShape::Standard4x8.max_inputs() + 1) as u32);
+        assert_eq!(TxBody::from_bytes(&buf), Err(WireError::CountTooLarge));
+    }
+
+    #[test]
+    fn tx_body_rejects_too_many_sweep_outputs() {
+        let mut buf = Vec::new();
+        put_u8(&mut buf, TxShape::Sweep25x2.id());
+        buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
+        buf.extend_from_slice(&[0u8; 16]); // fee
+        put_u32(&mut buf, 0u32); // n_inputs
+        put_u32(&mut buf, (TxShape::Sweep25x2.max_outputs() + 1) as u32);
         assert_eq!(TxBody::from_bytes(&buf), Err(WireError::CountTooLarge));
     }
 
@@ -622,6 +673,7 @@ mod tests {
         // circuit uses 64-bit operands; u128 fee above this range cannot
         // be faithfully represented.
         let mut buf = Vec::new();
+        put_u8(&mut buf, TxShape::Standard4x8.id());
         buf.extend_from_slice(&[0u8; 32]); // epoch_anchor
                                            // fee = u64::MAX + 1 as little-endian u128
         let fee_too_large: u128 = u64::MAX as u128 + 1;
@@ -635,13 +687,7 @@ mod tests {
 
     #[test]
     fn tx_body_rejects_trailing_bytes() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard([0u8; 32], 0, vec![], vec![], false);
         let mut bytes = body.to_bytes();
         bytes.push(0xFF);
         assert_eq!(TxBody::from_bytes(&bytes), Err(WireError::TrailingBytes));
@@ -649,13 +695,13 @@ mod tests {
 
     #[test]
     fn transaction_roundtrip() {
-        let body = TxBody {
-            epoch_anchor: [0xAAu8; 32],
-            fee: 7,
-            inputs: vec![mk_input(3)],
-            outputs: vec![mk_output(4)],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard(
+            [0xAAu8; 32],
+            7,
+            vec![mk_input(3)],
+            vec![mk_output(4)],
+            false,
+        );
         let tx = Transaction {
             tx_body_hash: TxBodyHash([0x99u8; 32]),
             body,
@@ -676,6 +722,7 @@ mod tests {
         let p = PublicInputs {
             epoch_anchor: [1u8; 32],
             tx_body_hash: TxBodyHash([4u8; 32]),
+            shape_id: TxShape::Standard4x8.id(),
             fee: 0xFEED_FACE_CAFE_BEEFu128,
             n_live_inputs: 2,
             n_live_outputs: 4,
@@ -692,10 +739,11 @@ mod tests {
     }
 
     #[test]
-    fn public_inputs_rejects_live_count_over_max() {
-        let good = PublicInputs {
+    fn public_inputs_rejects_invalid_shape_id() {
+        let mut p = PublicInputs {
             epoch_anchor: [0u8; 32],
             tx_body_hash: TxBodyHash([0u8; 32]),
+            shape_id: TxShape::Standard4x8.id(),
             fee: 0,
             n_live_inputs: 0,
             n_live_outputs: 0,
@@ -705,8 +753,30 @@ mod tests {
             is_activation: [false; crate::types::MAX_OUTPUTS],
             is_deactivation: [false; crate::types::MAX_INPUTS],
         };
-        // Layout: epoch_anchor(32) + tx_body_hash(32) + fee(16) + n_live_in(1) + n_live_out(1) ...
-        let n_in_off = 32 + 32 + 16; // offset of n_live_inputs
+        p.shape_id = 0xFF;
+        assert_eq!(
+            PublicInputs::from_bytes(&p.to_bytes()),
+            Err(WireError::InvalidShape)
+        );
+    }
+
+    #[test]
+    fn public_inputs_rejects_live_count_over_max() {
+        let good = PublicInputs {
+            epoch_anchor: [0u8; 32],
+            tx_body_hash: TxBodyHash([0u8; 32]),
+            shape_id: TxShape::Standard4x8.id(),
+            fee: 0,
+            n_live_inputs: 0,
+            n_live_outputs: 0,
+            coinbase_credit: 0,
+            log_slots: 24,
+            claims_commitment: [0u8; 32],
+            is_activation: [false; crate::types::MAX_OUTPUTS],
+            is_deactivation: [false; crate::types::MAX_INPUTS],
+        };
+        // Layout: epoch_anchor(32) + tx_body_hash(32) + shape_id(1) + fee(16) + n_live_in(1) + n_live_out(1) ...
+        let n_in_off = 32 + 32 + 1 + 16; // offset of n_live_inputs
         let n_out_off = n_in_off + 1; // offset of n_live_outputs
         let mut bytes = good.to_bytes();
         bytes[n_in_off] = (crate::types::MAX_INPUTS + 1) as u8;
@@ -724,13 +794,7 @@ mod tests {
 
     #[test]
     fn truncated_decode_errors_cleanly() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![mk_input(1)],
-            outputs: vec![],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard([0u8; 32], 0, vec![mk_input(1)], vec![], false);
         let bytes = body.to_bytes();
         for cut in 0..bytes.len() {
             let res = TxBody::from_bytes(&bytes[..cut]);
@@ -739,29 +803,29 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "inputs exceed MAX_INPUTS")]
+    #[should_panic(expected = "inputs exceed shape max")]
     fn tx_body_encode_panics_when_inputs_exceed_bound() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
-            outputs: vec![],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard(
+            [0u8; 32],
+            0,
+            vec![TxInput::dummy(); crate::types::MAX_INPUTS + 1],
+            vec![],
+            false,
+        );
         let mut buf = Vec::new();
         body.encode(&mut buf);
     }
 
     #[test]
-    #[should_panic(expected = "outputs exceed MAX_OUTPUTS")]
+    #[should_panic(expected = "outputs exceed shape max")]
     fn tx_body_encode_panics_when_outputs_exceed_bound() {
-        let body = TxBody {
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],
-            is_coinbase: false,
-        };
+        let body = TxBody::standard(
+            [0u8; 32],
+            0,
+            vec![],
+            vec![TxOutput::dummy(); crate::types::MAX_OUTPUTS + 1],
+            false,
+        );
         let mut buf = Vec::new();
         body.encode(&mut buf);
     }
