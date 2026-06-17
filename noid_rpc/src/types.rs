@@ -51,7 +51,29 @@ pub struct BlockTemplateResponse {
     /// Difficulty target as 64-char little-endian hex. Find N such that Blake3(patched_header_core) < target.
     pub difficulty_target_hex: String,
     pub height: u64,
+    /// Total transaction count including coinbase.
     pub n_txs: usize,
+    /// User transaction shapes in canonical block order (coinbase excluded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_shapes: Vec<String>,
+    /// Number of `Standard4x8` user transactions in the template.
+    pub standard_tx_count: usize,
+    /// Number of `Sweep25x2` user transactions in the template.
+    pub sweep_tx_count: usize,
+    /// Live input counts per user transaction, index-aligned with `tx_shapes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_input_counts: Vec<usize>,
+    /// Live output counts per user transaction, index-aligned with `tx_shapes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_output_counts: Vec<usize>,
+    /// Coinbase output value in μNOID.
+    pub coinbase_value_micronoid: u64,
+    /// Sum of user fees claimable by the miner after burned state-growth fees.
+    pub claimable_fees_micronoid: u64,
+    /// Whether the template carries a serialized proof to submit with the block.
+    pub has_block_proof: bool,
+    /// Serialized BlockProof size in bytes (`0` for coinbase-only templates).
+    pub block_proof_size_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------

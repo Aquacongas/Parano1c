@@ -2115,11 +2115,23 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
 
     let height = result["height"].as_u64().unwrap_or(0);
     let n_txs = result["n_txs"].as_u64().unwrap_or(0);
+    let standard_txs = result["standard_tx_count"].as_u64().unwrap_or(0);
+    let sweep_txs = result["sweep_tx_count"].as_u64().unwrap_or(0);
+    let proof_size = result["block_proof_size_bytes"].as_u64().unwrap_or(0);
+    let claimable_fees = result["claimable_fees_micronoid"].as_u64().unwrap_or(0);
+    let coinbase_value = result["coinbase_value_micronoid"].as_u64().unwrap_or(0);
     let header_core = result["header_core_hex"].as_str().unwrap_or("");
 
     section("Block template");
     kv("Height", &height.to_string());
     kv("Txs in block", &n_txs.to_string());
+    kv(
+        "User tx shapes",
+        &format!("Standard4x8={standard_txs}, Sweep25x2={sweep_txs}"),
+    );
+    kv("Block proof", &format!("{proof_size} bytes"));
+    kv("Claimable fees", &format!("{claimable_fees} μNOID"));
+    kv("Coinbase value", &format!("{coinbase_value} μNOID"));
     kv2(
         "Header core",
         &format!("{}…", &header_core[..header_core.len().min(32)]),

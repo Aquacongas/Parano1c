@@ -28,6 +28,7 @@
 //!   - `block_proof_hex`       — serialized BlockProof, empty for coinbase-only
 //!   - `nonce_offset`          — byte offset of nonce inside block_hex (always 144)
 //!   - `difficulty_target_hex` — 256-bit LE target
+//!   - shape/proof metadata    — operator display only; PoW uses header_core
 //!
 //! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
 //! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex)`.
@@ -99,6 +100,14 @@ struct BlockTemplateResponse {
     difficulty_target_hex: String,
     height: u64,
     n_txs: usize,
+    #[serde(default)]
+    tx_shapes: Vec<String>,
+    #[serde(default)]
+    standard_tx_count: usize,
+    #[serde(default)]
+    sweep_tx_count: usize,
+    #[serde(default)]
+    block_proof_size_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +197,12 @@ impl RpcClient {
 const CHUNK_SIZE: u128 = 10_000_000;
 /// Byte offset of the nonce inside header_core (= header start).
 const NONCE_OFFSET_IN_CORE: usize = 144;
+/// Serialized block header size: header_core fields plus proof_transcript_hash and witness_root.
+const BLOCK_HEADER_WIRE_SIZE: usize = 276;
+/// `log_slots`, `active_slot_count`, and `alloc_counter` are at the tail of `header_core`.
+const HEADER_CORE_TAIL_OFFSET: usize = 192;
+/// The same tail starts after proof_transcript_hash and witness_root in the full header wire layout.
+const BLOCK_HEADER_TAIL_OFFSET: usize = 256;
 
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` if cancelled.
@@ -250,6 +265,56 @@ fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
         }
     }
     false
+}
+
+fn validate_template_layout(
+    header_core: &[u8; 212],
+    block_bytes: &[u8],
+    nonce_offset: usize,
+) -> Result<()> {
+    if nonce_offset != NONCE_OFFSET_IN_CORE {
+        return Err(anyhow!(
+            "unexpected nonce_offset={nonce_offset}; expected {NONCE_OFFSET_IN_CORE}"
+        ));
+    }
+    if block_bytes.len() < BLOCK_HEADER_WIRE_SIZE {
+        return Err(anyhow!(
+            "block_hex too short: {} bytes, need at least {BLOCK_HEADER_WIRE_SIZE}",
+            block_bytes.len()
+        ));
+    }
+
+    // Full header wire layout inserts proof_transcript_hash and witness_root after
+    // difficulty_target, while header_core omits them. Compare the prefix before
+    // those proof fields and the consensus tail after them.
+    if block_bytes[..HEADER_CORE_TAIL_OFFSET] != header_core[..HEADER_CORE_TAIL_OFFSET]
+        || block_bytes[BLOCK_HEADER_TAIL_OFFSET..BLOCK_HEADER_WIRE_SIZE]
+            != header_core[HEADER_CORE_TAIL_OFFSET..]
+    {
+        return Err(anyhow!(
+            "template mismatch: header_core_hex does not match the header embedded in block_hex"
+        ));
+    }
+
+    Ok(())
+}
+
+fn shape_summary(tmpl: &BlockTemplateResponse) -> String {
+    let proof_size = if tmpl.block_proof_size_bytes > 0 {
+        tmpl.block_proof_size_bytes
+    } else {
+        tmpl.block_proof_hex.len() / 2
+    };
+    if tmpl.standard_tx_count > 0 || tmpl.sweep_tx_count > 0 {
+        return format!(
+            "std={} sweep={} proof={}B",
+            tmpl.standard_tx_count, tmpl.sweep_tx_count, proof_size
+        );
+    }
+    if !tmpl.tx_shapes.is_empty() {
+        return format!("shapes={} proof={}B", tmpl.tx_shapes.join(","), proof_size);
+    }
+    format!("proof={proof_size}B")
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +385,7 @@ fn mine(cli: &Cli) -> Result<()> {
 
         let mut block_bytes = hex::decode(&tmpl.block_hex).context("decode block_hex")?;
         let nonce_offset = tmpl.nonce_offset;
+        validate_template_layout(&header_core, &block_bytes, nonce_offset)?;
 
         // Count leading zero bits for display.
         let diff_bits = {
@@ -338,8 +404,9 @@ fn mine(cli: &Cli) -> Result<()> {
         };
 
         eprintln!(
-            "┌─ h={height} txs={n_txs} diff={diff_bits} leading-zero-bits  \
+            "┌─ h={height} txs={n_txs} {} diff={diff_bits} leading-zero-bits  \
              target={}…",
+            shape_summary(&tmpl),
             &tmpl.difficulty_target_hex[tmpl.difficulty_target_hex.len().saturating_sub(8)..]
         );
 
@@ -397,5 +464,41 @@ fn main() {
     if let Err(e) = mine(&cli) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matching_header_and_block_bytes() -> ([u8; 212], Vec<u8>) {
+        let mut header_core = [0u8; 212];
+        for (i, b) in header_core.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut block = vec![0u8; BLOCK_HEADER_WIRE_SIZE + 4];
+        block[..HEADER_CORE_TAIL_OFFSET].copy_from_slice(&header_core[..HEADER_CORE_TAIL_OFFSET]);
+        block[BLOCK_HEADER_TAIL_OFFSET..BLOCK_HEADER_WIRE_SIZE]
+            .copy_from_slice(&header_core[HEADER_CORE_TAIL_OFFSET..]);
+        (header_core, block)
+    }
+
+    #[test]
+    fn template_layout_accepts_matching_core_and_full_header() {
+        let (header_core, block) = matching_header_and_block_bytes();
+        validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE).unwrap();
+    }
+
+    #[test]
+    fn template_layout_rejects_mismatched_tail() {
+        let (header_core, mut block) = matching_header_and_block_bytes();
+        block[BLOCK_HEADER_TAIL_OFFSET] ^= 0xFF;
+        assert!(validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE).is_err());
+    }
+
+    #[test]
+    fn template_layout_rejects_unexpected_nonce_offset() {
+        let (header_core, block) = matching_header_and_block_bytes();
+        assert!(validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE + 1).is_err());
     }
 }

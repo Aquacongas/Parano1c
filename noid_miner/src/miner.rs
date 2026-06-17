@@ -849,3 +849,224 @@ pub(crate) fn run_prove_block(
         Err(e) => Err(format!("{e:?}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use bench_prover::{
+        prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
+        standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
+        BENCH_PREV_STATE_ROOT,
+    };
+    use noid_block::{
+        validate_block_bucket_tx_indices, validate_block_proof_transcript_hash, BlockProof,
+    };
+    use noid_chain::block::{compute_tx_root, Block};
+    use noid_chain::consensus::genesis::{genesis_header, GENESIS_TIMESTAMP};
+    use noid_chain::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
+    use noid_chain::consensus::pow::full_block_hash;
+    use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
+    use noid_chain::segmented_state::SegmentColumns;
+    use noid_poseidon2b::primitives::Address;
+    use noid_stark::WalletProofBundle;
+    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
+    use std::collections::HashMap;
+
+    fn tx_from_body(body: TxBody) -> Transaction {
+        let tx_body_hash = hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction { body, tx_body_hash }
+    }
+
+    fn coinbase_tx() -> Transaction {
+        tx_from_body(TxBody::standard(
+            [0u8; 32],
+            0,
+            vec![],
+            vec![TxOutput {
+                slot_index: 42,
+                value: 1_000_000,
+                owner: Address([0xCB; 32]),
+                valid: true,
+            }],
+            true,
+        ))
+    }
+
+    fn standard_fixture_with_bundle(
+        label: &'static str,
+        slot_base: u32,
+        seed: u128,
+    ) -> (TxBody, WalletProofBundle) {
+        let fixture = standard_fixture(standard_scenario(label, 1, 2, slot_base, seed));
+        let proof = prove_standard_wallet(&fixture, 1).proof;
+        let body = fixture.scenario.body.clone();
+        (body, standard_bundle(&fixture, proof))
+    }
+
+    fn sweep_fixture_with_bundle(
+        label: &'static str,
+        n_inputs: usize,
+        slot_base: u32,
+        seed: u128,
+    ) -> (TxBody, WalletProofBundle) {
+        let fixture = sweep_fixture(sweep_scenario(label, n_inputs, slot_base, seed));
+        let proof = prove_sweep_wallet(&fixture, 1).proof;
+        let body = fixture.scenario.body.clone();
+        (body, sweep_bundle(&fixture, proof))
+    }
+
+    fn miner_template(user: Vec<(TxBody, WalletProofBundle)>) -> crate::template::BlockTemplate {
+        let parent = genesis_header();
+        let coinbase = coinbase_tx();
+        let txs: Vec<Transaction> = user
+            .iter()
+            .map(|(body, _)| tx_from_body(body.clone()))
+            .collect();
+        let proof_bytes = user
+            .into_iter()
+            .map(|(_, bundle)| Some(bundle.to_bytes()))
+            .collect();
+        let all_txs: Vec<Transaction> = std::iter::once(coinbase.clone())
+            .chain(txs.iter().cloned())
+            .collect();
+        let tx_root = compute_tx_root(&all_txs);
+        let inner = ChainTemplate {
+            coinbase,
+            txs,
+            state_root: [0u8; 32],
+            tx_root,
+            active_slot_count: 1,
+            alloc_counter: 1,
+            log_slots: BENCH_LOG_SLOTS,
+            height: parent.height + 1,
+            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
+            miner_address: Address([0xCB; 32]),
+            difficulty_target: GENESIS_TARGET,
+            prev_block_hash: full_block_hash(&parent),
+            state_binding: None,
+        };
+        crate::template::BlockTemplate {
+            inner,
+            difficulty_target: GENESIS_TARGET,
+            miner_address: Address([0xCB; 32]),
+            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
+            parent,
+            proof_bytes,
+            pre_segs: HashMap::<u16, SegmentColumns>::new(),
+        }
+    }
+
+    fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
+        let (proof_hash, witness_root, proof_bytes) =
+            run_prove_block(tmpl, BENCH_PREV_STATE_ROOT).expect("run_prove_block");
+        assert!(
+            !proof_bytes.is_empty(),
+            "user-tx templates must carry BlockProof bytes"
+        );
+        let block = tmpl.seal(0, proof_hash, witness_root);
+        let proof: BlockProof = bincode::deserialize(&proof_bytes).expect("decode BlockProof");
+        validate_block_bucket_tx_indices(&block, &proof).expect("bucket coverage");
+        validate_block_proof_transcript_hash(&block, &proof).expect("header/proof binding");
+        (block, proof)
+    }
+
+    fn assert_shape_counts(proof: &BlockProof, standard: usize, sweep: usize) {
+        assert_eq!(
+            proof
+                .standard_bucket
+                .as_ref()
+                .map_or(0, |b| b.meta.tx_indices.len()),
+            standard
+        );
+        assert_eq!(
+            proof
+                .sweep_bucket
+                .as_ref()
+                .map_or(0, |b| b.meta.tx_indices.len()),
+            sweep
+        );
+        assert_eq!(proof.meta.n_tx as usize, standard + sweep);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
+    fn run_prove_block_serializes_standard_only_template() {
+        let standard = standard_fixture_with_bundle("std-only", 100, 0xA1);
+        let tmpl = miner_template(vec![standard]);
+        let (_block, proof) = prove_template(&tmpl);
+        assert_shape_counts(&proof, 1, 0);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
+    fn run_prove_block_serializes_sweep_only_template() {
+        let sweep = sweep_fixture_with_bundle("sweep-only", 5, 1_000, 0xB1);
+        let tmpl = miner_template(vec![sweep]);
+        let (_block, proof) = prove_template(&tmpl);
+        assert_shape_counts(&proof, 0, 1);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
+    fn run_prove_block_serializes_mixed_template() {
+        let standard = standard_fixture_with_bundle("mixed-std", 100, 0xC1);
+        let sweep = sweep_fixture_with_bundle("mixed-sweep", 5, 1_000, 0xD1);
+        let tmpl = miner_template(vec![standard, sweep]);
+        let (_block, proof) = prove_template(&tmpl);
+        assert_shape_counts(&proof, 1, 1);
+        assert_eq!(
+            proof.standard_bucket.as_ref().unwrap().meta.tx_indices,
+            vec![1]
+        );
+        assert_eq!(
+            proof.sweep_bucket.as_ref().unwrap().meta.tx_indices,
+            vec![2]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
+    fn run_prove_block_serializes_split_sweep_plus_standard_tail_template() {
+        let sweep = sweep_fixture_with_bundle(
+            "split-sweep-25x2",
+            TxShape::Sweep25x2.max_inputs(),
+            1_000,
+            0xE1,
+        );
+        let standard_tail = standard_fixture_with_bundle("split-standard-tail", 5_000, 0xF1);
+        let tmpl = miner_template(vec![sweep, standard_tail]);
+        let (_block, proof) = prove_template(&tmpl);
+        assert_shape_counts(&proof, 1, 1);
+        assert_eq!(
+            proof.sweep_bucket.as_ref().unwrap().meta.tx_indices,
+            vec![1]
+        );
+        assert_eq!(
+            proof.standard_bucket.as_ref().unwrap().meta.tx_indices,
+            vec![2]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
+    fn mismatched_bucket_proof_is_rejected_before_submit_verification() {
+        let standard = standard_fixture_with_bundle("bad-std", 100, 0xA11);
+        let sweep = sweep_fixture_with_bundle("bad-sweep", 5, 1_000, 0xB11);
+        let tmpl = miner_template(vec![standard, sweep]);
+        let (block, mut proof) = prove_template(&tmpl);
+
+        proof.sweep_bucket.as_mut().unwrap().meta.tx_indices = vec![1];
+        assert!(
+            validate_block_bucket_tx_indices(&block, &proof).is_err(),
+            "submit-side bucket coverage validation must reject cross-shape proof indices"
+        );
+    }
+}

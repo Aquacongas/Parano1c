@@ -107,8 +107,21 @@ fn verify_rpc_block_against_context(
     block_proof_bytes: &[u8],
     local_time: u64,
 ) -> Result<(), String> {
-    noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
-        .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if !has_user_txs {
+        noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
+            .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+    } else if block_proof_bytes.is_empty() {
+        return Err(
+            "proof/header binding invalid: user-transaction block is missing BlockProof bytes"
+                .to_string(),
+        );
+    } else if block.header.proof_transcript_hash == noid_chain::block::STUB_PROOF_MARKER {
+        return Err(
+            "proof/header binding invalid: user-transaction block used stub proof marker"
+                .to_string(),
+        );
+    }
 
     let parent = ctx.tip_header().clone();
     let prev_timestamps = ctx.prev_timestamps();
@@ -131,6 +144,8 @@ fn verify_rpc_block_against_context(
 
     let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|e| format!("proof deserialize failed: {e}"))?;
+    noid_block::validate_block_proof_transcript_hash(block, &proof)
+        .map_err(|e| format!("proof/header binding invalid: {e:?}"))?;
     noid_block::validate_block_bucket_tx_indices(block, &proof)
         .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
     if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
@@ -777,6 +792,57 @@ impl ParanoidApiServer for RpcHandler {
 
         let height = tmpl.inner.height;
         let n_txs = tmpl.inner.n_txs();
+        let tx_shapes: Vec<String> = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| format!("{:?}", tx.body.shape))
+            .collect();
+        let standard_tx_count = tmpl
+            .inner
+            .txs
+            .iter()
+            .filter(|tx| tx.body.shape == noid_tx::TxShape::Standard4x8)
+            .count();
+        let sweep_tx_count = tmpl
+            .inner
+            .txs
+            .iter()
+            .filter(|tx| tx.body.shape == noid_tx::TxShape::Sweep25x2)
+            .count();
+        let tx_input_counts: Vec<usize> = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| tx.body.inputs.iter().filter(|i| i.valid).count())
+            .collect();
+        let tx_output_counts: Vec<usize> = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| tx.body.outputs.iter().filter(|o| o.valid).count())
+            .collect();
+        let coinbase_value_micronoid: u64 = tmpl
+            .inner
+            .coinbase
+            .body
+            .outputs
+            .iter()
+            .filter(|o| o.valid)
+            .map(|o| o.value)
+            .fold(0u64, |acc, value| acc.saturating_add(value));
+        let claimable_fees_micronoid = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| {
+                noid_chain::consensus::claimable_fee_for_tx_body(
+                    &tx.body,
+                    tmpl.parent.active_slot_count,
+                    tmpl.parent.log_slots,
+                )
+            })
+            .fold(0u64, |acc, fee| acc.saturating_add(fee));
         let pow_header = tmpl.header_for_pow(0);
         let header_core = noid_chain::consensus::pow::header_core_bytes(&pow_header);
         let diff_target = pow_header.difficulty_target;
@@ -801,14 +867,24 @@ impl ParanoidApiServer for RpcHandler {
         // nonce is at NONCE_OFFSET (144) inside the header.
         let nonce_offset = noid_chain::consensus::pow::NONCE_OFFSET;
 
+        let block_proof_hex = hex::encode(&proof_bytes);
         Ok(BlockTemplateResponse {
             header_core_hex: hex::encode(header_core),
             block_hex: hex::encode(block_bytes),
-            block_proof_hex: hex::encode(proof_bytes),
+            block_proof_hex: block_proof_hex.clone(),
             nonce_offset,
             difficulty_target_hex: hex::encode(diff_target),
             height,
             n_txs,
+            tx_shapes,
+            standard_tx_count,
+            sweep_tx_count,
+            tx_input_counts,
+            tx_output_counts,
+            coinbase_value_micronoid,
+            claimable_fees_micronoid,
+            has_block_proof: !block_proof_hex.is_empty(),
+            block_proof_size_bytes: proof_bytes.len(),
         })
     }
 

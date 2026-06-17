@@ -23,4 +23,5 @@ anyhow        = { workspace = true }
 bincode       = "1"
 
 [dev-dependencies]
+bench_prover = { path = "../bench_prover" }
 tempfile = "3"

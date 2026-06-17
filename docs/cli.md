@@ -790,6 +790,10 @@ $ noid-cli block-template
 Block template
   Height             31
   Txs in block       2
+  User tx shapes     Standard4x8=1, Sweep25x2=1
+  Block proof        91342 bytes
+  Claimable fees     14600 μNOID
+  Coinbase value     500014600 μNOID
   Header core        a41c9f0b237e6d1f8a9b4c2e...… (212 bytes, PoW input)
 
   PoW: Compute Blake3(header_core || nonce) < difficulty_target, then submit.
@@ -808,7 +812,16 @@ Response fields:
 | `nonce_offset` | usize | Byte offset of nonce in `block_hex` (always 144) |
 | `difficulty_target_hex` | hex(32) | Target (LE); find N where `Blake3(patched_header_core) < target` |
 | `height` | u64 | Block height being mined |
-| `n_txs` | usize | Transaction count in template |
+| `n_txs` | usize | Transaction count in template, including coinbase |
+| `tx_shapes` | string[] | User transaction shapes in canonical block order |
+| `standard_tx_count` | usize | Number of `Standard4x8` user transactions |
+| `sweep_tx_count` | usize | Number of `Sweep25x2` user transactions |
+| `tx_input_counts` | usize[] | Live input counts, index-aligned with `tx_shapes` |
+| `tx_output_counts` | usize[] | Live output counts, index-aligned with `tx_shapes` |
+| `coinbase_value_micronoid` | u64 | Coinbase output value, including block reward and claimable fees |
+| `claimable_fees_micronoid` | u64 | Fee amount claimable by the miner; burned state-growth fees are excluded |
+| `has_block_proof` | bool | Whether `block_proof_hex` is non-empty |
+| `block_proof_size_bytes` | usize | Serialized `BlockProof` size in bytes |
 
 **PoW algorithm:**
 1. Call `getBlockTemplate` to receive `header_core_hex` (212 bytes) and `difficulty_target_hex`

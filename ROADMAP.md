@@ -392,19 +392,19 @@ Reason: internal miner path is not enough; external mining/template APIs must be
 
 ### Tasks
 
-- `[ ]` Test `getBlockTemplate` with standard-only mempool.
-- `[ ]` Test `getBlockTemplate` with sweep-only mempool.
-- `[ ]` Test `getBlockTemplate` with mixed standard+sweep mempool.
-- `[ ]` Test template with split chunks present.
-- `[ ]` Test external `submitBlock` for mixed block.
-- `[ ]` Verify coinbase fee claim for mixed template.
-- `[ ]` Verify invalid/mismatched bucket proofs are rejected on submit.
+- `[x]` Test `getBlockTemplate` with standard-only mempool.
+- `[x]` Test `getBlockTemplate` with sweep-only mempool.
+- `[x]` Test `getBlockTemplate` with mixed standard+sweep mempool.
+- `[x]` Test template with split chunks present.
+- `[x]` Test external `submitBlock` for mixed block.
+- `[x]` Verify coinbase fee claim for mixed template.
+- `[x]` Verify invalid/mismatched bucket proofs are rejected on submit.
 
 ### Acceptance
 
-- `[ ]` External miner can mine a block containing `Sweep25x2` txs.
-- `[ ]` Template serialization exposes enough shape/proof data for external miner workflow.
-- `[ ]` Mixed templates remain deterministic and consensus-valid.
+- `[x]` External miner can mine a block containing `Sweep25x2` txs.
+- `[x]` Template serialization exposes enough shape/proof data for external miner workflow.
+- `[x]` Mixed templates remain deterministic and consensus-valid.
 
 ---
 
