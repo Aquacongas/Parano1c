@@ -164,6 +164,12 @@ pub struct WalletSendResult {
     /// Shape per submitted transaction, index-aligned with `tx_hashes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_shapes: Vec<String>,
+    /// Live input count per submitted transaction, index-aligned with `tx_hashes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_input_counts: Vec<usize>,
+    /// Live output count per submitted transaction, index-aligned with `tx_hashes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tx_output_counts: Vec<usize>,
 }
 
 /// Decoded block header (structured, not raw bytes).

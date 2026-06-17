@@ -221,10 +221,10 @@ pub trait ParanoidApi {
     #[method(name = "walletExportReceipt")]
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String>;
 
-    /// Consolidate small UTXOs into one larger UTXO (reduces UTXO count by up to 3).
+    /// Consolidate small UTXOs into one larger UTXO (up to `Sweep25x2` capacity).
     /// Returns tx_hash of the submitted consolidation transaction.
-    /// Returns an error if the wallet has 1 or fewer UTXOs, or insufficient funds.
-    /// `fee_micronoid = 0` uses the minimum fee (5000 μNOID).
+    /// Returns an error if the wallet has 1 or fewer available UTXOs, or insufficient funds.
+    /// `fee_micronoid = 0` uses a shape-aware automatic fee for the selected inputs.
     #[method(name = "walletConsolidate")]
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult>;
 

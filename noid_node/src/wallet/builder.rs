@@ -26,7 +26,6 @@ use noid_tx::{
     claims::compute_claims_commitment,
     intent::TxIntent,
     types::{TxBody, TxInput, TxOutput, TxShape},
-    MAX_INPUTS,
 };
 
 use crate::wallet::prover::prove_tx;
@@ -170,9 +169,10 @@ pub fn extract_build_data(
 
 /// Build `TxBuildData` for a consolidation transaction.
 ///
-/// Consolidation selects the **smallest** UTXOs (up to [`MAX_INPUTS`] = 4)
-/// and sends their total value minus fee back to the wallet's own address.
-/// This reduces the UTXO count by up to `MAX_INPUTS - 1` per call.
+/// Consolidation selects the **smallest** UTXOs (up to [`TxShape::Sweep25x2`]'s
+/// input limit) and sends their total value minus fee back to the wallet's own
+/// address. It uses `Standard4x8` for 1..4 selected inputs and `Sweep25x2` for
+/// 5..25 selected inputs.
 ///
 /// Unlike `extract_build_data` (which uses largest-first greedy selection to
 /// cover a target amount), this function explicitly selects the smallest UTXOs
@@ -184,7 +184,8 @@ pub fn extract_build_data(
 ///
 /// # Errors
 ///
-/// - `InsufficientFunds`: total of smallest UTXOs ≤ fee.
+/// - `InsufficientFunds`: fewer than 2 available UTXOs, or total of selected
+///   UTXOs ≤ fee.
 /// - `NotEnoughSlots`: fewer than 1 empty slot hint available.
 pub fn extract_consolidate_data(
     wallet: &WalletState,
@@ -205,14 +206,24 @@ pub fn extract_consolidate_data(
         .filter(|u| !pending_input_slots.contains(&u.slot_index))
         .collect();
     all_utxos.sort_by_key(|u| u.value);
-    let selected: Vec<WalletUtxo> = all_utxos.into_iter().take(MAX_INPUTS).cloned().collect();
+    let selected: Vec<WalletUtxo> = all_utxos
+        .into_iter()
+        .take(TxShape::Sweep25x2.max_inputs())
+        .cloned()
+        .collect();
 
-    if selected.is_empty() {
+    if selected.len() < 2 {
         return Err(BuildError::InsufficientFunds {
             need: fee_micronoid,
-            have: 0,
+            have: selected.iter().map(|u| u.value).sum(),
         });
     }
+
+    let shape = if selected.len() <= TxShape::Standard4x8.max_inputs() {
+        TxShape::Standard4x8
+    } else {
+        TxShape::Sweep25x2
+    };
 
     let total: u64 = selected.iter().map(|u| u.value).sum();
     if total <= fee_micronoid {
@@ -245,7 +256,7 @@ pub fn extract_consolidate_data(
             epoch_anchor,
             output_slot_hints: slot_hints,
             log_slots,
-            shape: TxShape::Standard4x8,
+            shape,
         },
         consolidation_amount,
     ))

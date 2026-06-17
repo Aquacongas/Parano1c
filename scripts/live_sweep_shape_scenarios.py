@@ -11,8 +11,9 @@ Covers the roadmap N9 local lifecycle:
 
 Environment knobs:
   NOID_LIVE_SWEEP_START_BLOCKS default 20 (18+ required for recursive aggregation proof readiness)
-  NOID_LIVE_SWEEP_BASE_PORT    default 19800
-  NOID_LIVE_SWEEP_SKIP_SPLIT   default 1 (set 0 to run the heavier >25-input split scenario)
+  NOID_LIVE_SWEEP_BASE_PORT          default 19800
+  NOID_LIVE_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
+  NOID_LIVE_SWEEP_SKIP_CONSOLIDATE   default 0 (only runs in the quick/no-split path)
 """
 
 import json
@@ -31,6 +32,7 @@ LOGS = BASE / "logs"
 START_BLOCKS = int(os.environ.get("NOID_LIVE_SWEEP_START_BLOCKS", "20"))
 BASE_PORT = int(os.environ.get("NOID_LIVE_SWEEP_BASE_PORT", "19800"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_SWEEP_SKIP_SPLIT", "1") == "1"
+SKIP_CONSOLIDATE = os.environ.get("NOID_LIVE_SWEEP_SKIP_CONSOLIDATE", "0") == "1"
 
 
 class LiveTestError(Exception):
@@ -206,6 +208,10 @@ def assert_confirmed(node, tx_hash, label):
     )
 
 
+def assert_tx_confirmed(node, tx_hash, label):
+    return assert_confirmed(node, tx_hash, label)
+
+
 def submit_and_confirm(node, to_addr, amount, label):
     print(f"\n=== {label}: walletSend amount={amount} μNOID ===", flush=True)
     before = node.balance()
@@ -314,6 +320,56 @@ def main():
             sweep.get("tx_shapes") == ["Sweep25x2"], f"unexpected sweep shapes: {sweep}"
         )
 
+        if SKIP_SPLIT and not SKIP_CONSOLIDATE:
+            before_height = node.height()
+            before_utxos = node.utxos()
+            before_count = len(before_utxos)
+            assert_true(
+                before_count >= 5,
+                f"not enough UTXOs for sweep consolidation: {before_count}",
+            )
+            print("\n=== Sweep25x2 consolidation ===", flush=True)
+            cons = rpc(node.rpc_url, "walletConsolidate", [0], timeout=360)
+            print(f"[consolidate] {json.dumps(cons, indent=2)}", flush=True)
+            assert_true(
+                cons.get("shape") == "Sweep25x2",
+                f"consolidation did not use Sweep25x2: {cons}",
+            )
+            input_counts = cons.get("tx_input_counts") or []
+            assert_true(
+                input_counts and int(input_counts[0]) > 4,
+                f"consolidation did not consume >4 inputs: {cons}",
+            )
+            tx_hash = cons.get("tx_hash")
+            assert_true(tx_hash, f"consolidation returned no tx hash: {cons}")
+            assert_tx_confirmed(node, tx_hash, "Sweep25x2 consolidation")
+            wait_until(
+                "consolidation mempool drains",
+                lambda: node.mempool_size() == 0,
+                timeout=240,
+                interval=3,
+            )
+            rpc(node.rpc_url, "walletScan", timeout=240)
+            after_height = node.height()
+            after_count = len(node.utxos())
+            # Consolidation itself replaces N inputs with 1 output. Every block
+            # mined while waiting can also pay this miner wallet one fresh coinbase
+            # UTXO, so allow the observed height delta.
+            expected_max = (
+                before_count
+                - int(input_counts[0])
+                + 1
+                + max(0, after_height - before_height)
+            )
+            assert_true(
+                after_count <= expected_max,
+                f"consolidation did not reduce UTXO count enough: before={before_count} after={after_count} inputs={input_counts[0]}",
+            )
+            print(
+                f"[consolidation ok] utxos {before_count} -> {after_count} inputs={input_counts[0]}",
+                flush=True,
+            )
+
         if not SKIP_SPLIT:
             utxos = node.utxos()
             recv2 = rpc(node.rpc_url, "walletNextAddress", timeout=20)["address"]
@@ -335,6 +391,7 @@ def main():
             "balance": node.balance(),
             "utxo_count": len(node.utxos()),
             "skip_split": SKIP_SPLIT,
+            "skip_consolidate": SKIP_CONSOLIDATE,
         }
         (BASE / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"[summary] wrote {BASE / 'summary.json'}", flush=True)

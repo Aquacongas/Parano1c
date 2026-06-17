@@ -334,6 +334,24 @@ impl WalletOps for WalletHandle {
         Ok((intent_bytes, input_slots))
     }
 
+    fn plan_consolidate_input_count(&self) -> Result<usize, String> {
+        let guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_ref()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        let available = w
+            .utxos
+            .values()
+            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
+            .count();
+        if available < 2 {
+            return Err(
+                "nothing to consolidate — wallet has 1 or fewer available UTXOs".to_string(),
+            );
+        }
+        Ok(available.min(TxShape::Sweep25x2.max_inputs()))
+    }
+
     fn build_consolidate(
         &self,
         fee_micronoid: u64,
@@ -605,5 +623,72 @@ mod tests {
         let (selected, change) = wallet.select_utxos(amount, fee).expect("select UTXOs");
         assert_eq!(selected.len(), 5);
         assert_eq!(change, 49_981_499);
+    }
+
+    #[test]
+    fn consolidate_planner_caps_at_sweep_capacity() {
+        let (_dir, handle) = handle_with_utxos(&vec![1_000; 30]);
+        assert_eq!(handle.plan_consolidate_input_count().unwrap(), 25);
+    }
+
+    #[test]
+    fn consolidate_planner_skips_pending_inputs() {
+        let (_dir, handle) = handle_with_utxos(&vec![1_000; 6]);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            guard.as_mut().unwrap().pending_input_slots.insert(0);
+            guard.as_mut().unwrap().pending_input_slots.insert(1);
+        }
+        assert_eq!(handle.plan_consolidate_input_count().unwrap(), 4);
+    }
+
+    fn extract_consolidate_shape(values: &[u64]) -> (TxShape, usize, u64) {
+        let (_dir, handle) = handle_with_utxos(values);
+        let guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        let pending_outputs = wallet.pending_output_slots.clone();
+        let pending_inputs = wallet.pending_input_slots.clone();
+        let (data, amount) = builder::extract_consolidate_data(
+            wallet,
+            10,
+            [0xAA; 32],
+            vec![10_000],
+            24,
+            &pending_outputs,
+            &pending_inputs,
+        )
+        .unwrap();
+        (data.shape, data.selected_utxos.len(), amount)
+    }
+
+    #[test]
+    fn consolidate_four_inputs_uses_standard_shape() {
+        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 4]);
+        assert_eq!(shape, TxShape::Standard4x8);
+        assert_eq!(selected, 4);
+        assert_eq!(amount, 3_990);
+    }
+
+    #[test]
+    fn consolidate_five_inputs_uses_sweep_shape() {
+        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 5]);
+        assert_eq!(shape, TxShape::Sweep25x2);
+        assert_eq!(selected, 5);
+        assert_eq!(amount, 4_990);
+    }
+
+    #[test]
+    fn consolidate_twenty_five_inputs_uses_sweep_shape() {
+        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 30]);
+        assert_eq!(shape, TxShape::Sweep25x2);
+        assert_eq!(selected, 25);
+        assert_eq!(amount, 24_990);
+    }
+
+    #[test]
+    fn consolidate_rejects_one_available_utxo() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        let err = handle.plan_consolidate_input_count().unwrap_err();
+        assert!(err.contains("nothing to consolidate"));
     }
 }

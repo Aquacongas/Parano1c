@@ -1796,8 +1796,28 @@ async fn cmd_consolidate(ctx: &Ctx<'_>, fee: Option<&str>, rounds: u32) -> anyho
         match rpc(ctx, "walletConsolidate", &[fee_micro.into()]).await {
             Ok(r) => {
                 let tx_hash = r["tx_hash"].as_str().unwrap_or("?");
+                let shape = r["shape"].as_str().unwrap_or("?");
+                let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
+                let n_inputs = r["tx_input_counts"]
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let n_outputs = r["tx_output_counts"]
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 total_rounds += 1;
                 ok_msg(&format!("Round {total_rounds}: TX {}", ctx.h(tx_hash)));
+                if shape != "?" {
+                    println!("  Shape: {shape}  Inputs: {n_inputs}  Outputs: {n_outputs}");
+                }
+                println!(
+                    "  Fee: {} NOID ({actual_fee} μNOID){}",
+                    noid_str(actual_fee),
+                    if fee.is_none() { " auto" } else { "" }
+                );
 
                 // Wait for confirmation
                 eprint!("  Waiting for confirmation");

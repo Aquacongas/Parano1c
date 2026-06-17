@@ -76,9 +76,16 @@ pub trait WalletOps: Send + Sync {
     /// (block already pruned when it was confirmed).
     fn export_receipt(&self, txhash_hex: &str) -> Result<String, String>;
 
+    /// Return how many inputs the next consolidation round would select.
+    ///
+    /// This is lightweight planning used for shape-aware auto-fee calculation.
+    /// It must skip pending input slots and cap at the largest supported wallet
+    /// shape (`Sweep25x2`).
+    fn plan_consolidate_input_count(&self) -> Result<usize, String>;
+
     /// Consolidate small UTXOs into one larger UTXO.
     ///
-    /// Selects the smallest UTXOs (up to `MAX_INPUTS=4`) and sends their
+    /// Selects the smallest UTXOs (up to `Sweep25x2` capacity) and sends their
     /// combined value minus fee to the wallet's own primary address.
     ///
     /// Returns `(intent_bytes, input_slot_indices)` on success, or an error

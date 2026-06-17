@@ -880,6 +880,8 @@ impl ParanoidApiServer for RpcHandler {
 
         let mut tx_hashes = Vec::with_capacity(chunks.len());
         let mut tx_shapes = Vec::with_capacity(chunks.len());
+        let mut tx_input_counts = Vec::with_capacity(chunks.len());
+        let mut tx_output_counts = Vec::with_capacity(chunks.len());
 
         for (chunk_idx, chunk_amount) in chunks.iter().copied().enumerate() {
             // Retry loop: slots can be claimed between prove_tx and mempool
@@ -964,6 +966,8 @@ impl ParanoidApiServer for RpcHandler {
                     Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
                 };
                 let tx_shape = format!("{:?}", intent.tx_body.shape);
+                let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
+                let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
                 let failed_tx_hash = intent.tx_body_hash.0;
                 let output_slots: Vec<u32> = intent
                     .tx_body
@@ -985,6 +989,8 @@ impl ParanoidApiServer for RpcHandler {
                         }
                         tx_hashes.push(hex::encode(hash.0));
                         tx_shapes.push(tx_shape);
+                        tx_input_counts.push(tx_input_count);
+                        tx_output_counts.push(tx_output_count);
                         submitted = true;
                         break;
                     }
@@ -1023,6 +1029,8 @@ impl ParanoidApiServer for RpcHandler {
             split_count,
             shape: primary_shape,
             tx_shapes,
+            tx_input_counts,
+            tx_output_counts,
         })
     }
 
@@ -1041,13 +1049,18 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
-        // Consolidation produces exactly 1 output (to self) and may consume up to
-        // MAX_INPUTS inputs. Estimate the max-input shape so auto-fee stays valid.
+        // Consolidation produces exactly 1 output (to self). Auto-fee uses the
+        // actual number of inputs the next consolidation round will select, capped
+        // at Sweep25x2 capacity, instead of the old Standard4x8 bound.
         let effective_fee = if fee_micronoid == 0 {
+            let planned_inputs = self
+                .wallet
+                .plan_consolidate_input_count()
+                .map_err(rpc_err)?;
             let floor = self.mempool.fee_floor().await;
             let (active_slot_count, log_slots) = self.mempool.fee_context().await;
             noid_chain::consensus::fee_breakdown(
-                noid_tx::MAX_INPUTS as u64,
+                planned_inputs as u64,
                 1,
                 active_slot_count,
                 log_slots,
@@ -1124,6 +1137,16 @@ impl ParanoidApiServer for RpcHandler {
                 Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
             };
             let tx_shape = format!("{:?}", intent.tx_body.shape);
+            let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
+            let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
+            let failed_tx_hash = intent.tx_body_hash.0;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.slot_index)
+                .collect();
 
             match self.mempool.submit(intent, intent_bytes).await {
                 Ok(hash) => {
@@ -1140,9 +1163,13 @@ impl ParanoidApiServer for RpcHandler {
                         split_count: None,
                         shape: Some(tx_shape.clone()),
                         tx_shapes: vec![tx_shape],
+                        tx_input_counts: vec![tx_input_count],
+                        tx_output_counts: vec![tx_output_count],
                     });
                 }
                 Err(e) => {
+                    self.wallet
+                        .cleanup_failed_send(failed_tx_hash, &output_slots);
                     last_err = e.to_string();
                     tracing::debug!(attempt, err = %last_err, "wallet_consolidate: retrying");
                 }
