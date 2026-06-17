@@ -240,15 +240,21 @@ pub fn apply_reorg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{compute_tx_root, Block};
+    use crate::block::{compute_tx_root, Block, STUB_PROOF_MARKER};
     use crate::block_header::BlockHeader;
     use crate::chain_context::ChainContext;
     use crate::consensus::{
+        fees::required_fee_for_tx_body,
         params::{BLOCK_TIME, GENESIS_TARGET},
         pow::full_block_hash,
     };
-    use noid_poseidon2b::primitives::Address;
+    use crate::fri_state::SlotValue;
+    use crate::state::{apply_tx, ChainState};
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
+    const TEST_LOG_SLOTS: usize = 8;
 
     fn build_empty_block(ctx: &mut ChainContext) -> Block {
         let parent = ctx.tip_header().clone();
@@ -273,6 +279,153 @@ mod tests {
             header,
             transactions: vec![],
         }
+    }
+
+    fn init_small_easy_context() -> ChainContext {
+        let mut ctx = ChainContext::init_from_easy_genesis();
+        ctx.state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let root = ctx.state.state_root();
+        let genesis = ctx.headers.get_mut(&0).expect("genesis header");
+        genesis.state_root = root;
+        genesis.log_slots = TEST_LOG_SLOTS as u32;
+        genesis.active_slot_count = 0;
+        genesis.alloc_counter = 0;
+        genesis.difficulty_target = TEST_TARGET;
+        genesis.nonce = 0;
+        ctx.tip_hash = full_block_hash(genesis);
+        ctx
+    }
+
+    fn output(slot: u32, value: u64, seed: u8) -> TxOutput {
+        TxOutput {
+            slot_index: slot,
+            value,
+            owner: Address([seed; 32]),
+            valid: true,
+        }
+    }
+
+    fn input_from_output(out: &TxOutput) -> TxInput {
+        TxInput {
+            slot_index: out.slot_index,
+            value: out.value,
+            owner: out.owner,
+            spend_secret: SpendSecret([0x55; 32]),
+            auth_tag: AuthTag([0x77; 32]),
+            valid: true,
+        }
+    }
+
+    fn tx_from_body(body: TxBody) -> Transaction {
+        let tx_body_hash = hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction { body, tx_body_hash }
+    }
+
+    fn build_block(ctx: &ChainContext, txs: Vec<Transaction>) -> Block {
+        let parent = ctx.tip_header().clone();
+        let mut dry = ctx.state.clone();
+        for tx in &txs {
+            apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
+        }
+        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
+        let header = BlockHeader {
+            prev_block_hash: full_block_hash(&parent),
+            state_root: dry.state_root(),
+            tx_root: compute_tx_root(&txs),
+            timestamp: parent.timestamp + BLOCK_TIME,
+            height: parent.height + 1,
+            miner_address: Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: TEST_TARGET,
+            proof_transcript_hash: if has_user_txs {
+                [0xAA; 32]
+            } else {
+                STUB_PROOF_MARKER
+            },
+            witness_root: [0xBB; 32],
+            log_slots: dry.state.log_slots() as u32,
+            active_slot_count: dry.active_slot_count,
+            alloc_counter: dry.alloc_counter,
+        };
+        Block {
+            header,
+            transactions: txs,
+        }
+    }
+
+    fn coinbase_tx(slot: u32, value: u64, seed: u8) -> Transaction {
+        tx_from_body(TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![output(slot, value, seed)],
+            is_coinbase: true,
+        })
+    }
+
+    fn apply_funding_outputs(ctx: &mut ChainContext, n: usize) -> Vec<TxOutput> {
+        let mut outs = Vec::with_capacity(n);
+        for i in 0..n {
+            let slot = 1 + i as u32;
+            let out = output(slot, 10_000_000, 0x10u8.wrapping_add(i as u8));
+            let block = build_block(
+                ctx,
+                vec![coinbase_tx(slot, out.value, 0x10u8.wrapping_add(i as u8))],
+            );
+            ctx.apply_next_block(&block, block.header.timestamp + 1)
+                .expect("funding block applies");
+            outs.push(out);
+        }
+        outs
+    }
+
+    fn user_tx(
+        ctx: &ChainContext,
+        shape: TxShape,
+        inputs: &[TxOutput],
+        outputs: Vec<TxOutput>,
+    ) -> Transaction {
+        let mut body = TxBody {
+            shape,
+            epoch_anchor: [0x42; 32],
+            fee: 0,
+            inputs: inputs.iter().map(input_from_output).collect(),
+            outputs,
+            is_coinbase: false,
+        };
+        body.fee = required_fee_for_tx_body(
+            &body,
+            ctx.tip_header().active_slot_count,
+            ctx.tip_header().log_slots,
+        ) as u128;
+        tx_from_body(body)
+    }
+
+    fn slot_value(state: &ChainState, slot: u32) -> SlotValue {
+        state.state.slot(slot)
+    }
+
+    fn assert_live_slot(state: &ChainState, out: &TxOutput) {
+        assert_eq!(
+            slot_value(state, out.slot_index),
+            SlotValue {
+                value: Block128::from(out.value as u128),
+                owner_hi: out.owner.as_fields()[0],
+                owner_lo: out.owner.as_fields()[1],
+            }
+        );
+    }
+
+    fn assert_empty_slot(state: &ChainState, slot: u32) {
+        assert_eq!(slot_value(state, slot), SlotValue::EMPTY);
     }
 
     #[test]
@@ -398,5 +551,152 @@ mod tests {
         );
         assert_eq!(ctx.state.active_slot_count, 0);
         assert_eq!(ctx.tip_height, 0);
+    }
+
+    fn apply_user_block_and_reorg(ctx: &mut ChainContext, txs: Vec<Transaction>) -> ReorgResult {
+        let ancestor_height = ctx.tip_height;
+        let ancestor_root = ctx.state.state_root();
+        let block = build_block(ctx, txs.clone());
+        let tx_hashes: Vec<_> = txs.iter().map(|tx| tx.tx_body_hash).collect();
+        ctx.apply_next_block(&block, block.header.timestamp + 1)
+            .expect("user block applies before reorg");
+        for h in &tx_hashes {
+            assert!(
+                ctx.nullifiers.contains(h),
+                "tx nullifier is active before reorg"
+            );
+        }
+        let result = apply_reorg(ctx, ancestor_height, &[]).expect("shape block reorg succeeds");
+        assert_eq!(ctx.tip_height, ancestor_height);
+        assert_eq!(ctx.state.state_root(), ancestor_root);
+        for h in &tx_hashes {
+            assert!(
+                result.reclaimed_tx_hashes.contains(h),
+                "reorg reports reclaimed tx hash"
+            );
+            assert!(
+                !ctx.nullifiers.contains(h),
+                "reverted tx nullifier is removed"
+            );
+        }
+        result
+    }
+
+    #[test]
+    fn reorg_after_standard_only_restores_inputs_and_removes_outputs() {
+        let mut ctx = init_small_easy_context();
+        let funding = apply_funding_outputs(&mut ctx, 4);
+        let out = output(90, 30_000_000, 0x91);
+        let tx = user_tx(&ctx, TxShape::Standard4x8, &funding[..4], vec![out.clone()]);
+
+        apply_user_block_and_reorg(&mut ctx, vec![tx]);
+        for restored in &funding[..4] {
+            assert_live_slot(&ctx.state, restored);
+        }
+        assert_empty_slot(&ctx.state, out.slot_index);
+    }
+
+    #[test]
+    fn reorg_after_single_sweep_restores_inputs_and_removes_outputs() {
+        let mut ctx = init_small_easy_context();
+        let funding = apply_funding_outputs(&mut ctx, 5);
+        let out_a = output(100, 24_000_000, 0xA1);
+        let out_b = output(101, 25_000_000, 0xA2);
+        let tx = user_tx(
+            &ctx,
+            TxShape::Sweep25x2,
+            &funding[..5],
+            vec![out_a.clone(), out_b.clone()],
+        );
+
+        let block = build_block(&ctx, vec![tx.clone()]);
+        ctx.apply_next_block(&block, block.header.timestamp + 1)
+            .expect("sweep applies");
+        for spent in &funding[..5] {
+            assert_empty_slot(&ctx.state, spent.slot_index);
+        }
+        assert_live_slot(&ctx.state, &out_a);
+        assert_live_slot(&ctx.state, &out_b);
+
+        apply_reorg(&mut ctx, block.header.height - 1, &[]).expect("sweep reorg succeeds");
+        for restored in &funding[..5] {
+            assert_live_slot(&ctx.state, restored);
+        }
+        assert_empty_slot(&ctx.state, out_a.slot_index);
+        assert_empty_slot(&ctx.state, out_b.slot_index);
+        assert!(!ctx.nullifiers.contains(&tx.tx_body_hash));
+    }
+
+    #[test]
+    fn reorg_after_mixed_standard_and_sweep_block_restores_all_slots() {
+        let mut ctx = init_small_easy_context();
+        let funding = apply_funding_outputs(&mut ctx, 9);
+        let std_out = output(110, 18_000_000, 0xB1);
+        let sweep_out = output(111, 42_000_000, 0xB2);
+        let std_tx = user_tx(
+            &ctx,
+            TxShape::Standard4x8,
+            &funding[..4],
+            vec![std_out.clone()],
+        );
+        let sweep_tx = user_tx(
+            &ctx,
+            TxShape::Sweep25x2,
+            &funding[4..9],
+            vec![sweep_out.clone()],
+        );
+
+        apply_user_block_and_reorg(&mut ctx, vec![std_tx, sweep_tx]);
+        for restored in &funding[..9] {
+            assert_live_slot(&ctx.state, restored);
+        }
+        assert_empty_slot(&ctx.state, std_out.slot_index);
+        assert_empty_slot(&ctx.state, sweep_out.slot_index);
+    }
+
+    #[test]
+    fn reorg_after_split_chunks_restores_sweep_and_standard_chunks() {
+        let mut ctx = init_small_easy_context();
+        let funding = apply_funding_outputs(&mut ctx, 26);
+        let sweep_chunk_out = output(130, 200_000_000, 0xC1);
+        let standard_tail_out = output(131, 8_000_000, 0xC2);
+        let sweep_chunk = user_tx(
+            &ctx,
+            TxShape::Sweep25x2,
+            &funding[..25],
+            vec![sweep_chunk_out.clone()],
+        );
+        let standard_tail = user_tx(
+            &ctx,
+            TxShape::Standard4x8,
+            &funding[25..26],
+            vec![standard_tail_out.clone()],
+        );
+
+        apply_user_block_and_reorg(&mut ctx, vec![sweep_chunk, standard_tail]);
+        for restored in &funding[..26] {
+            assert_live_slot(&ctx.state, restored);
+        }
+        assert_empty_slot(&ctx.state, sweep_chunk_out.slot_index);
+        assert_empty_slot(&ctx.state, standard_tail_out.slot_index);
+    }
+
+    #[test]
+    fn reorg_after_sweep_consolidation_restores_fragmented_inputs() {
+        let mut ctx = init_small_easy_context();
+        let funding = apply_funding_outputs(&mut ctx, 18);
+        let consolidated = output(150, 179_000_000, 0xD1);
+        let consolidation = user_tx(
+            &ctx,
+            TxShape::Sweep25x2,
+            &funding[..18],
+            vec![consolidated.clone()],
+        );
+
+        apply_user_block_and_reorg(&mut ctx, vec![consolidation]);
+        for restored in &funding[..18] {
+            assert_live_slot(&ctx.state, restored);
+        }
+        assert_empty_slot(&ctx.state, consolidated.slot_index);
     }
 }

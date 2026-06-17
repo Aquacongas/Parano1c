@@ -234,6 +234,25 @@ impl WalletState {
         }
     }
 
+    /// Remove history entries for transactions that were reverted by a chain reorg.
+    ///
+    /// Current mempool policy does not persist full proof-bearing transaction bytes,
+    /// so reverted wallet transactions are marked non-final by removing their history
+    /// entry; users/wallet automation may resubmit if still desired.
+    pub fn remove_reorged_history(
+        &mut self,
+        tx_hashes: &std::collections::HashSet<[u8; 32]>,
+    ) -> usize {
+        let before = self.history.len();
+        self.history
+            .retain(|entry| !tx_hashes.contains(&entry.tx_hash));
+        let removed = before.saturating_sub(self.history.len());
+        if removed > 0 {
+            self.save_history();
+        }
+        removed
+    }
+
     /// Update the height of a pending (height=0) tx once it's confirmed in a block.
     pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) {
         let mut changed = false;

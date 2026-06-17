@@ -1851,14 +1851,20 @@ async fn handle_p2p_events(
                                                         )
                                                         .await;
 
+                                                    let reclaimed = result.reclaimed_tx_hashes.clone();
+                                                    remove_reorged_wallet_history(&wallet, &reclaimed);
                                                     for new_block in &new_chain {
                                                         update_wallet_for_block(&wallet, &new_block.block);
                                                     }
+                                                    rescan_wallet_from_chain(
+                                                        &wallet,
+                                                        &chain,
+                                                        "after reorg",
+                                                    )
+                                                    .await;
 
                                                     mempool
-                                                        .readmit_after_reorg(
-                                                            result.reclaimed_tx_hashes,
-                                                        )
+                                                        .readmit_after_reorg(reclaimed)
                                                         .await;
 
                                                     let new_tip = new_tip_height;
@@ -3163,6 +3169,60 @@ fn insert_orphan(pool: &mut std::collections::HashMap<[u8; 32], OrphanBlock>, or
 // ---------------------------------------------------------------------------
 // Wallet block update
 // ---------------------------------------------------------------------------
+
+fn remove_reorged_wallet_history(
+    wallet: &SharedWallet,
+    tx_hashes: &[noid_poseidon2b::primitives::TxBodyHash],
+) {
+    if tx_hashes.is_empty() {
+        return;
+    }
+    let hashes: std::collections::HashSet<[u8; 32]> = tx_hashes.iter().map(|h| h.0).collect();
+    let mut guard = wallet.lock().unwrap();
+    if let Some(w) = guard.as_mut() {
+        let removed = w.remove_reorged_history(&hashes);
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "wallet: removed reorged transaction history entries"
+            );
+        }
+    }
+}
+
+async fn rescan_wallet_from_chain(
+    wallet: &SharedWallet,
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    reason: &'static str,
+) {
+    let ctx = chain.read().await;
+    let height = ctx.tip_height();
+    let (master, hint_next_index) = {
+        let guard = wallet.lock().unwrap();
+        match guard.as_ref() {
+            None => return,
+            Some(w) => (w.secret_clone(), w.next_index),
+        }
+    };
+    let (utxos, known_addresses, next_index) =
+        wallet::scanner::scan_state_for_utxos(&ctx.state.state, &master, height, hint_next_index);
+    drop(ctx);
+    let found = utxos.len();
+    let balance: u64 = utxos.iter().map(|u| u.value).sum();
+    {
+        let mut guard = wallet.lock().unwrap();
+        if let Some(w) = guard.as_mut() {
+            w.apply_scan_results(utxos, known_addresses, next_index);
+        }
+    }
+    tracing::info!(
+        height,
+        utxos = found,
+        balance,
+        reason,
+        "wallet scan complete"
+    );
+}
 
 /// Apply a newly confirmed block to the in-process wallet state.
 ///

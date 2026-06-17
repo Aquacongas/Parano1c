@@ -314,27 +314,28 @@ Reason: state transition correctness is only production-grade if undo/reorg is c
 
 ### Scenarios
 
-- `[ ]` Reorg after confirmed single `Sweep25x2`.
-- `[ ]` Reorg after mixed block containing standard + sweep txs.
-- `[ ]` Reorg after split payment where one or more chunks confirmed.
-- `[ ]` Reorg after sweep consolidation.
+- `[x]` Reorg after confirmed single `Sweep25x2` covered by `noid_chain::consensus::reorg` regression.
+- `[x]` Reorg after mixed block containing standard + sweep txs covered by regression.
+- `[x]` Reorg after split payment chunks (`Sweep25x2` + `Standard4x8`) covered by regression.
+- `[x]` Reorg after sweep consolidation covered by regression.
 
 ### Required checks
 
-- `[ ]` Spent inputs are restored on disconnect.
-- `[ ]` Created outputs are removed on disconnect.
-- `[ ]` Recipient balance rolls back correctly.
-- `[ ]` Sender balance rolls back correctly.
-- `[ ]` Wallet history does not claim reverted txs as final.
-- `[ ]` Pending/mempool policy is explicit for reverted txs:
-  - either reinsert if still valid;
-  - or mark dropped with clear reason.
-- `[ ]` Recursive proof state follows the active chain, not the orphaned branch.
+- `[x]` Spent inputs are restored on disconnect.
+- `[x]` Created outputs are removed on disconnect.
+- `[x]` Recipient balance rolls back via wallet full rescan after reorg.
+- `[x]` Sender balance rolls back via wallet full rescan after reorg.
+- `[x]` Wallet history does not claim reverted txs as final; reorged entries are removed.
+- `[x]` Pending/mempool policy is explicit for reverted txs:
+  - full proof-bearing tx bytes are not persisted for automatic readmission;
+  - reclaimed hashes are logged and duplicate pool entries are evicted;
+  - wallets can resubmit after scan if still desired.
+- `[~]` Recursive proof state follows the active chain at block verification level; explicit live reorg proof-state assertion still pending.
 
 ### Acceptance
 
-- `[ ]` Reorg tests pass for standard-only, sweep-only, and mixed blocks.
-- `[ ]` No double-spend or ghost-output remains after undo.
+- `[x]` Reorg tests pass for standard-only, sweep-only, and mixed blocks.
+- `[x]` No double-spend or ghost-output remains after undo in regression coverage.
 
 ---
 
@@ -527,7 +528,7 @@ This roadmap is complete when:
 - `[x]` Consolidation uses `Sweep25x2` for 5..25 inputs and is live-tested.
 - `[x]` Benchmark suite covers standard, sweep, mixed, split, and consolidation-relevant cases.
 - `[x]` Restart after confirmed sweep/split/consolidation is covered.
-- `[ ]` Reorg/undo after sweep/mixed/split/consolidation is covered.
+- `[~]` Reorg/undo after sweep/mixed/split/consolidation is covered by unit regressions; live reorg smoke remains useful.
 - `[ ]` Shape-aware fee policy is benchmark-informed and exposed cleanly.
 - `[ ]` External miner/template path works for mixed shapes.
 - `[ ]` Wallet UX hides shape complexity from normal users.
