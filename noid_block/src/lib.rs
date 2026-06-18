@@ -61,7 +61,7 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_stark::interleaved::{
-    prove_air_interleaved, prove_air_interleaved_algebraic, verify_air_interleaved,
+    prove_air_interleaved_algebraic, prove_air_interleaved_from_refs, verify_air_interleaved,
     verify_air_interleaved_algebraic, verify_air_interleaved_algebraic_with_log_len,
     AlgebraicStarkProof, InterleavedStarkProof,
 };
@@ -69,6 +69,7 @@ use noid_stark::prove_logic_sweep::{N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG
 use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 /// Log2 of the FRI slice size for the block-level interleaved commitment.
@@ -375,6 +376,27 @@ pub struct BlockRecursiveClaimTranscript {
     pub post_state_openings: Vec<SegmentMleOpening>,
 }
 
+#[derive(serde::Serialize)]
+struct BucketCoverageSummaryRef<'a> {
+    total_non_coinbase_tx: u32,
+    standard_tx_indices: &'a [u32],
+    sweep_tx_indices: &'a [u32],
+}
+
+#[derive(serde::Serialize)]
+struct BlockRecursiveClaimTranscriptRef<'a> {
+    domain: &'static [u8],
+    meta: &'a BlockPublicMeta,
+    state_binding_mode: StateBindingProofMode,
+    coverage: BucketCoverageSummaryRef<'a>,
+    standard_bucket: Option<&'a StandardBucketProof>,
+    sweep_bucket: Option<&'a SweepBucketProof>,
+    state_binding_algebraics: &'a [AlgebraicStarkProof],
+    state_binding_starks: &'a [InterleavedStarkProof],
+    pre_state_openings: &'a [SegmentMleOpening],
+    post_state_openings: &'a [SegmentMleOpening],
+}
+
 pub fn state_binding_proof_mode(proof: &BlockProof) -> StateBindingProofMode {
     match (
         proof.state_binding_algebraics.is_empty(),
@@ -401,6 +423,20 @@ pub fn bucket_coverage_summary(proof: &BlockProof) -> BucketCoverageSummary {
     }
 }
 
+fn bucket_coverage_summary_ref(proof: &BlockProof) -> BucketCoverageSummaryRef<'_> {
+    BucketCoverageSummaryRef {
+        total_non_coinbase_tx: proof.meta.n_tx,
+        standard_tx_indices: proof
+            .standard_bucket
+            .as_ref()
+            .map_or(&[], |bucket| bucket.meta.tx_indices.as_slice()),
+        sweep_tx_indices: proof
+            .sweep_bucket
+            .as_ref()
+            .map_or(&[], |bucket| bucket.meta.tx_indices.as_slice()),
+    }
+}
+
 pub fn block_recursive_claim_transcript(proof: &BlockProof) -> BlockRecursiveClaimTranscript {
     BlockRecursiveClaimTranscript {
         domain: BLOCK_RECURSIVE_CLAIM_DOMAIN.to_vec(),
@@ -416,13 +452,62 @@ pub fn block_recursive_claim_transcript(proof: &BlockProof) -> BlockRecursiveCla
     }
 }
 
+fn block_recursive_claim_transcript_ref(
+    proof: &BlockProof,
+) -> BlockRecursiveClaimTranscriptRef<'_> {
+    BlockRecursiveClaimTranscriptRef {
+        domain: BLOCK_RECURSIVE_CLAIM_DOMAIN,
+        meta: &proof.meta,
+        state_binding_mode: state_binding_proof_mode(proof),
+        coverage: bucket_coverage_summary_ref(proof),
+        standard_bucket: proof.standard_bucket.as_ref(),
+        sweep_bucket: proof.sweep_bucket.as_ref(),
+        state_binding_algebraics: &proof.state_binding_algebraics,
+        state_binding_starks: &proof.state_binding_starks,
+        pre_state_openings: &proof.pre_state_openings,
+        post_state_openings: &proof.post_state_openings,
+    }
+}
+
 pub fn block_recursive_claim_bytes(proof: &BlockProof) -> Vec<u8> {
-    bincode::serialize(&block_recursive_claim_transcript(proof))
+    bincode::serialize(&block_recursive_claim_transcript_ref(proof))
         .expect("BlockRecursiveClaimTranscript serialization must be infallible")
 }
 
+struct ProofTranscriptHashWriter {
+    sponge: Poseidon2bSponge,
+}
+
+impl ProofTranscriptHashWriter {
+    fn new() -> Self {
+        Self {
+            sponge: Poseidon2bSponge::with_iv(noid_poseidon2b::native::domain::capacity_iv(
+                noid_poseidon2b::native::domain::TAG_FSCHALNG,
+            )),
+        }
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        self.sponge.finalize()
+    }
+}
+
+impl Write for ProofTranscriptHashWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sponge.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn block_recursive_claim_hash(proof: &BlockProof) -> [u8; 32] {
-    noid_chain::block::proof_transcript_hash(&block_recursive_claim_bytes(proof))
+    let mut writer = ProofTranscriptHashWriter::new();
+    bincode::serialize_into(&mut writer, &block_recursive_claim_transcript_ref(proof))
+        .expect("BlockRecursiveClaimTranscript serialization must be infallible");
+    writer.finalize()
 }
 
 pub fn block_recursive_claim_field(proof: &BlockProof) -> Block128 {
@@ -430,6 +515,43 @@ pub fn block_recursive_claim_field(proof: &BlockProof) -> Block128 {
     let mut lo = [0u8; 16];
     lo.copy_from_slice(&hash[..16]);
     Block128::from(u128::from_le_bytes(lo))
+}
+
+#[cfg(test)]
+mod recursive_claim_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_recursive_claim_serialization_matches_owned_transcript() {
+        let proof = BlockProof {
+            meta: BlockPublicMeta {
+                prev_block_state_root: [0x11; 32],
+                new_state_root: [0x22; 32],
+                n_tx: 0,
+                n_air_per_tx: 0,
+                n_auth_slices_per_tx: 0,
+                log_rows: 0,
+                n_block_spine_slices: 0,
+                n_state_bindings: 0,
+                state_binding_n_cols: 0,
+                state_binding_log_rows: 0,
+            },
+            standard_bucket: None,
+            sweep_bucket: None,
+            state_binding_algebraics: Vec::new(),
+            state_binding_starks: Vec::new(),
+            pre_state_openings: Vec::new(),
+            post_state_openings: Vec::new(),
+        };
+
+        let owned = bincode::serialize(&block_recursive_claim_transcript(&proof)).unwrap();
+        let borrowed = bincode::serialize(&block_recursive_claim_transcript_ref(&proof)).unwrap();
+        assert_eq!(borrowed, owned);
+        assert_eq!(
+            block_recursive_claim_hash(&proof),
+            noid_chain::block::proof_transcript_hash(&owned)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +626,7 @@ pub struct TxBlockWitness<'a> {
 /// per-tx columns and proven via the shared block channel.
 pub struct StateBindingBlockWitness<'a> {
     pub air: &'a BlockStateBindingAir,
-    pub columns: Vec<Vec<Block128>>,
+    pub columns: &'a [Vec<Block128>],
     /// Segment ID for this binding. Used for FRI opening channel seeding.
     pub seg_id: u16,
     /// Pre-state segment columns for FRI opening. `None` = bench mode.
@@ -765,22 +887,30 @@ pub fn assemble_sweep_bucket_proof(
         .map(|s| noid_stark::pad_column(s, log_len))
         .collect();
 
-    let mut per_tx_columns: Vec<Vec<Vec<Block128>>> = Vec::with_capacity(n_tx);
+    struct SweepTxColumns<'a> {
+        air_columns: Vec<Vec<Block128>>,
+        auth_slices: &'a [Vec<Block128>],
+    }
+
+    let mut per_tx_columns: Vec<SweepTxColumns<'_>> = Vec::with_capacity(n_tx);
     let mut flat_refs: Vec<&[Block128]> =
         Vec::with_capacity(n_tx * n_per_tx + n_block_spine_slices);
     for w in witnesses {
-        let mut cols: Vec<Vec<Block128>> = Vec::with_capacity(n_per_tx);
+        let mut air_columns: Vec<Vec<Block128>> = Vec::with_capacity(n_air_per_tx);
         for col in &w.trace.columns {
-            cols.push(noid_stark::pad_column(col, log_len));
+            air_columns.push(noid_stark::pad_column(col, log_len));
         }
-        for s in &w.auth_slices {
-            cols.push(s.clone());
-        }
-        per_tx_columns.push(cols);
+        per_tx_columns.push(SweepTxColumns {
+            air_columns,
+            auth_slices: &w.auth_slices,
+        });
     }
     for cols in &per_tx_columns {
-        for col in cols {
+        for col in &cols.air_columns {
             flat_refs.push(col.as_slice());
+        }
+        for slice in cols.auth_slices {
+            flat_refs.push(slice.as_slice());
         }
     }
     for slice in &spine_padded_slices {
@@ -876,8 +1006,13 @@ pub fn assemble_sweep_bucket_proof(
             extras.extend_from_slice(&spine_extras);
             extras.extend_from_slice(&auth_tr);
             let slice_claims = build_auth_slice_claims(n_air_per_tx, auth_r_low, &auth_slice_vals);
-            let col_refs: Vec<&[Block128]> =
-                per_tx_columns[k].iter().map(|c| c.as_slice()).collect();
+            let mut col_refs: Vec<&[Block128]> = Vec::with_capacity(n_per_tx);
+            for col in &per_tx_columns[k].air_columns {
+                col_refs.push(col.as_slice());
+            }
+            for slice in per_tx_columns[k].auth_slices {
+                col_refs.push(slice.as_slice());
+            }
             let mut ch = per_tx_algebraic_channel(&prev_block_state_root, cap, k as u32);
             let (alg, r_pp, final_claim, lambdas) = prove_air_interleaved_algebraic(
                 &w.air,
@@ -935,14 +1070,44 @@ pub fn assemble_sweep_bucket_proof(
 
     let total_cols = n_tx * n_per_tx + n_block_spine_slices;
     let mut block_col_openings: Vec<Block128> = Vec::with_capacity(total_cols);
-    for k in 0..n_tx {
-        for col in &per_tx_columns[k] {
-            block_col_openings.push(noid_core::mle::evaluate::evaluate_flat(col, &tx_r_pp[k]));
-        }
+    thread_local! {
+        static SWEEP_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            std::cell::RefCell::new(Vec::new());
+        static SWEEP_POINT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            std::cell::RefCell::new(Vec::new());
     }
-    for sp in &spine_padded_slices {
-        block_col_openings.push(noid_core::mle::evaluate::evaluate_flat(sp, &spine_r_low));
-    }
+    SWEEP_FLAT_SCRATCH.with(|fs| {
+        SWEEP_POINT_SCRATCH.with(|ps| {
+            let mut flat = fs.borrow_mut();
+            let mut point = ps.borrow_mut();
+            for k in 0..n_tx {
+                for col in &per_tx_columns[k].air_columns {
+                    block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                        col,
+                        &tx_r_pp[k],
+                        &mut flat,
+                        &mut point,
+                    ));
+                }
+                for slice in per_tx_columns[k].auth_slices {
+                    block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                        slice,
+                        &tx_r_pp[k],
+                        &mut flat,
+                        &mut point,
+                    ));
+                }
+            }
+            for sp in &spine_padded_slices {
+                block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
+                    sp,
+                    &spine_r_low,
+                    &mut flat,
+                    &mut point,
+                ));
+            }
+        })
+    });
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
     block_channel.observe_field_elems(&block_col_openings);
@@ -1011,7 +1176,13 @@ pub fn assemble_sweep_bucket_proof(
         .map(|k| {
             let mut b_k = vec![0u128; hyper_len];
             if k < n_tx {
-                for (i, col) in per_tx_columns[k].iter().enumerate() {
+                for (i, col) in per_tx_columns[k]
+                    .air_columns
+                    .iter()
+                    .map(|c| c.as_slice())
+                    .chain(per_tx_columns[k].auth_slices.iter().map(|s| s.as_slice()))
+                    .enumerate()
+                {
                     let lam = beta_powers_flat[i];
                     b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
                         *acc ^= clmul_gcm(lam, tower_to_flat_u128(v.0));
@@ -1101,61 +1272,85 @@ pub fn prove_state_bindings_standalone(
     Vec<SegmentMleOpening>,
 ) {
     let empty_pi = empty_state_binding_public_inputs();
-    let mut starks = Vec::with_capacity(state_bindings.len());
-    let mut pre_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(state_bindings.len());
-    let mut post_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(state_bindings.len());
 
-    for sb in state_bindings {
-        let log_len = noid_stark::padded_log_len(sb.air.log_rows());
-        let columns = sb.air.extend_for_proving(sb.columns.clone(), log_len);
-        starks.push(prove_air_interleaved(
-            sb.air,
-            &columns,
-            &empty_pi,
-            &[],
-            &[],
-            log_len,
-            None,
-            COMPACT_NUM_QUERIES,
-        ));
-
-        if let Some(pre_cols) = sb.pre_cols {
-            let seg_id = sb.seg_id;
-            let eff_log = sb.air.eval_point.len();
-            let (pre_commit, pre_vals, pre_proof, pre_seg_root) = open_segment_at_point(
-                eff_log,
-                &pre_cols.values,
-                &pre_cols.owners_hi,
-                &pre_cols.owners_lo,
-                &sb.air.eval_point,
+    let results: Vec<(
+        InterleavedStarkProof,
+        Option<SegmentMleOpening>,
+        Option<SegmentMleOpening>,
+    )> = state_bindings
+        .par_iter()
+        .map(|sb| {
+            let log_len = noid_stark::padded_log_len(sb.air.log_rows());
+            let columns = sb.air.extend_for_proving_borrowed(sb.columns, log_len);
+            let col_refs: Vec<&[Block128]> = columns.iter().map(|c| c.as_ref()).collect();
+            let stark = prove_air_interleaved_from_refs(
+                sb.air,
+                &col_refs,
+                &empty_pi,
+                &[],
+                &[],
+                log_len,
+                None,
+                COMPACT_NUM_QUERIES,
             );
-            pre_state_openings.push(SegmentMleOpening {
-                seg_id,
-                eval_point: sb.air.eval_point.clone(),
-                lane_values: pre_vals,
-                commitment: pre_commit,
-                opening: pre_proof,
-                seg_root: pre_seg_root,
-                merkle_siblings: sb.pre_siblings.to_vec(),
+
+            let openings = sb.pre_cols.map(|pre_cols| {
+                let seg_id = sb.seg_id;
+                let eff_log = sb.air.eval_point.len();
+                let (pre_commit, pre_vals, pre_proof, pre_seg_root) = open_segment_at_point(
+                    eff_log,
+                    &pre_cols.values,
+                    &pre_cols.owners_hi,
+                    &pre_cols.owners_lo,
+                    &sb.air.eval_point,
+                );
+                let pre_opening = SegmentMleOpening {
+                    seg_id,
+                    eval_point: sb.air.eval_point.clone(),
+                    lane_values: pre_vals,
+                    commitment: pre_commit,
+                    opening: pre_proof,
+                    seg_root: pre_seg_root,
+                    merkle_siblings: sb.pre_siblings.to_vec(),
+                };
+
+                let post_cols = apply_claims_to_cols(pre_cols, sb.claims);
+                let (post_commit, post_vals, post_proof, post_seg_root) = open_segment_at_point(
+                    eff_log,
+                    &post_cols.values,
+                    &post_cols.owners_hi,
+                    &post_cols.owners_lo,
+                    &sb.air.eval_point,
+                );
+                let post_opening = SegmentMleOpening {
+                    seg_id,
+                    eval_point: sb.air.eval_point.clone(),
+                    lane_values: post_vals,
+                    commitment: post_commit,
+                    opening: post_proof,
+                    seg_root: post_seg_root,
+                    merkle_siblings: sb.post_siblings.to_vec(),
+                };
+                (pre_opening, post_opening)
             });
 
-            let post_cols = apply_claims_to_cols(pre_cols, sb.claims);
-            let (post_commit, post_vals, post_proof, post_seg_root) = open_segment_at_point(
-                eff_log,
-                &post_cols.values,
-                &post_cols.owners_hi,
-                &post_cols.owners_lo,
-                &sb.air.eval_point,
-            );
-            post_state_openings.push(SegmentMleOpening {
-                seg_id,
-                eval_point: sb.air.eval_point.clone(),
-                lane_values: post_vals,
-                commitment: post_commit,
-                opening: post_proof,
-                seg_root: post_seg_root,
-                merkle_siblings: sb.post_siblings.to_vec(),
-            });
+            match openings {
+                Some((pre, post)) => (stark, Some(pre), Some(post)),
+                None => (stark, None, None),
+            }
+        })
+        .collect();
+
+    let mut starks = Vec::with_capacity(results.len());
+    let mut pre_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(results.len());
+    let mut post_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(results.len());
+    for (stark, pre, post) in results {
+        starks.push(stark);
+        if let Some(pre) = pre {
+            pre_state_openings.push(pre);
+        }
+        if let Some(post) = post {
+            post_state_openings.push(post);
         }
     }
 
@@ -1416,9 +1611,9 @@ pub fn prove_block_with_total_tx_count(
     // Standard zero-padding violates the eq-ladder base constraint at external rows;
     // `extend_for_proving` pads eq_ladder columns with 1 instead of 0 so that
     // `eq_0 + r_0 + b_0 + 1 = 1 + 0 + 0 + 1 = 0` (char-2) holds everywhere.
-    let sb_padded_columns: Vec<Vec<Block128>> = state_bindings
+    let sb_padded_columns: Vec<std::borrow::Cow<'_, [Block128]>> = state_bindings
         .iter()
-        .flat_map(|sb| sb.air.extend_for_proving(sb.columns.clone(), log_len))
+        .flat_map(|sb| sb.air.extend_for_proving_borrowed(sb.columns, log_len))
         .collect();
     // Pad block spine slices to log_len (they may be shorter if num_vars < BASE_LOG).
     let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
@@ -1441,7 +1636,7 @@ pub fn prove_block_with_total_tx_count(
         flat_refs.push(s.as_slice());
     }
     for c in &sb_padded_columns {
-        flat_refs.push(c.as_slice());
+        flat_refs.push(c.as_ref());
     }
     profiler.phase("state_binding_padding_and_flat_refs");
 
@@ -1628,7 +1823,7 @@ pub fn prove_block_with_total_tx_count(
         r_pp: Vec<Block128>,
     }
     let sb_results: Vec<SbResult> = state_bindings
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(sb_idx, sb)| {
             // Channel seed: n_tx + sb_idx distinguishes each segment's channel.
@@ -1641,7 +1836,7 @@ pub fn prove_block_with_total_tx_count(
             let sb_col_refs: Vec<&[Block128]> = sb_padded_columns
                 [col_offset..col_offset + sb_n_cols_per_seg]
                 .iter()
-                .map(|c| c.as_slice())
+                .map(|c| c.as_ref())
                 .collect();
             let (alg, r_pp_sb, _, _) = prove_air_interleaved_algebraic(
                 sb.air,
@@ -1656,9 +1851,12 @@ pub fn prove_block_with_total_tx_count(
         })
         .collect();
 
-    let sb_algebraics: Vec<AlgebraicStarkProof> =
-        sb_results.iter().map(|r| r.alg.clone()).collect();
-    let sb_r_pp_list: Vec<Vec<Block128>> = sb_results.into_iter().map(|r| r.r_pp).collect();
+    let mut sb_algebraics: Vec<AlgebraicStarkProof> = Vec::with_capacity(sb_results.len());
+    let mut sb_r_pp_list: Vec<Vec<Block128>> = Vec::with_capacity(sb_results.len());
+    for r in sb_results {
+        sb_algebraics.push(r.alg);
+        sb_r_pp_list.push(r.r_pp);
+    }
     profiler.phase("state_binding_algebraic_starks");
 
     // -------------------------------------------------------------------------
@@ -1669,50 +1867,65 @@ pub fn prove_block_with_total_tx_count(
     // The resulting seg_root matches the Merkle tree leaf exactly.
     // post_cols is derived from pre_cols + claims and dropped immediately after.
     // -------------------------------------------------------------------------
+    let state_opening_results: Vec<(Option<SegmentMleOpening>, Option<SegmentMleOpening>)> =
+        state_bindings
+            .par_iter()
+            .map(|sb| {
+                let Some(pre_cols) = sb.pre_cols else {
+                    return (None, None);
+                };
+                let seg_id = sb.seg_id;
+                let eff_log = sb.air.eval_point.len();
+
+                // Pre-state: zero-copy (borrows pre_cols).
+                let (pre_commit, pre_vals, pre_proof, pre_seg_root) = open_segment_at_point(
+                    eff_log,
+                    &pre_cols.values,
+                    &pre_cols.owners_hi,
+                    &pre_cols.owners_lo,
+                    &sb.air.eval_point,
+                );
+                let pre_opening = SegmentMleOpening {
+                    seg_id,
+                    eval_point: sb.air.eval_point.clone(),
+                    lane_values: pre_vals,
+                    commitment: pre_commit,
+                    opening: pre_proof,
+                    seg_root: pre_seg_root,
+                    merkle_siblings: sb.pre_siblings.to_vec(),
+                };
+
+                // Post-state: derive columns, open, then drop immediately.
+                let post_cols = apply_claims_to_cols(pre_cols, sb.claims);
+                let (post_commit, post_vals, post_proof, post_seg_root) = open_segment_at_point(
+                    eff_log,
+                    &post_cols.values,
+                    &post_cols.owners_hi,
+                    &post_cols.owners_lo,
+                    &sb.air.eval_point,
+                );
+                // post_cols dropped here — frees memory immediately.
+                let post_opening = SegmentMleOpening {
+                    seg_id,
+                    eval_point: sb.air.eval_point.clone(),
+                    lane_values: post_vals,
+                    commitment: post_commit,
+                    opening: post_proof,
+                    seg_root: post_seg_root,
+                    merkle_siblings: sb.post_siblings.to_vec(),
+                };
+                (Some(pre_opening), Some(post_opening))
+            })
+            .collect();
+
     let mut pre_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(n_state_bindings);
     let mut post_state_openings: Vec<SegmentMleOpening> = Vec::with_capacity(n_state_bindings);
-    for sb in state_bindings {
-        if let Some(pre_cols) = sb.pre_cols {
-            let seg_id = sb.seg_id;
-            let eff_log = sb.air.eval_point.len();
-
-            // Pre-state: zero-copy (borrows pre_cols).
-            let (pre_commit, pre_vals, pre_proof, pre_seg_root) = open_segment_at_point(
-                eff_log,
-                &pre_cols.values,
-                &pre_cols.owners_hi,
-                &pre_cols.owners_lo,
-                &sb.air.eval_point,
-            );
-            pre_state_openings.push(SegmentMleOpening {
-                seg_id,
-                eval_point: sb.air.eval_point.clone(),
-                lane_values: pre_vals,
-                commitment: pre_commit,
-                opening: pre_proof,
-                seg_root: pre_seg_root,
-                merkle_siblings: sb.pre_siblings.to_vec(),
-            });
-
-            // Post-state: derive columns, open, then drop immediately.
-            let post_cols = apply_claims_to_cols(pre_cols, sb.claims);
-            let (post_commit, post_vals, post_proof, post_seg_root) = open_segment_at_point(
-                eff_log,
-                &post_cols.values,
-                &post_cols.owners_hi,
-                &post_cols.owners_lo,
-                &sb.air.eval_point,
-            );
-            // post_cols dropped here — frees memory immediately.
-            post_state_openings.push(SegmentMleOpening {
-                seg_id,
-                eval_point: sb.air.eval_point.clone(),
-                lane_values: post_vals,
-                commitment: post_commit,
-                opening: post_proof,
-                seg_root: post_seg_root,
-                merkle_siblings: sb.post_siblings.to_vec(),
-            });
+    for (pre, post) in state_opening_results {
+        if let Some(pre) = pre {
+            pre_state_openings.push(pre);
+        }
+        if let Some(post) = post {
+            post_state_openings.push(post);
         }
     }
     profiler.phase("state_mle_openings");
@@ -1825,7 +2038,7 @@ pub fn prove_block_with_total_tx_count(
                 let r_pp = &sb_r_pp_list[sb_idx];
                 for i in 0..sb_n_cols_per_seg {
                     block_col_openings.push(noid_core::mle::evaluate::evaluate_flat_with_scratch(
-                        &sb_padded_columns[col_offset + i],
+                        sb_padded_columns[col_offset + i].as_ref(),
                         r_pp,
                         &mut flat,
                         &mut pt,
@@ -1959,7 +2172,7 @@ pub fn prove_block_with_total_tx_count(
                 let mut b_k = vec![0u128; hyper_len];
                 for i in 0..sb_n_cols_per_seg {
                     let lam_flat = beta_powers_flat[i];
-                    let col = sb_padded_columns[col_offset + i].as_slice();
+                    let col = sb_padded_columns[col_offset + i].as_ref();
                     b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
                         *acc ^= clmul_gcm(lam_flat, tower_to_flat_u128(v.0));
                     });

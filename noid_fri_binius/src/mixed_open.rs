@@ -18,7 +18,7 @@
 //! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
-use noid_core::mle::evaluate::evaluate_slice_with_scratch;
+use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::CryptographicHasher;
 use noid_fri::Channel;
@@ -145,19 +145,27 @@ pub fn prove_mixed_opening(
     let n = 1 << log_n;
     assert_eq!(primary_point.len(), log_n);
 
-    // Compute primary openings (all columns at primary_point)
-    // Use thread-local scratch buffer to avoid per-column allocations
+    // Compute primary openings (all columns at primary_point). Use the same
+    // flat/GCM evaluator as block multipoint openings: it preserves the field
+    // value but avoids tower-basis multiplication in the hot fold loop.
     thread_local! {
-        static EVAL_SCRATCH: std::cell::RefCell<Vec<Block128>> = std::cell::RefCell::new(Vec::new());
+        static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+        static POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
     }
 
     let primary_openings: Vec<Block128> = state
         .raw_cols
         .par_iter()
         .map(|col| {
-            EVAL_SCRATCH.with(|scratch| {
-                let mut scratch = scratch.borrow_mut();
-                evaluate_slice_with_scratch(col, primary_point, &mut scratch)
+            FLAT_SCRATCH.with(|flat| {
+                POINT_FLAT_SCRATCH.with(|point_flat| {
+                    evaluate_flat_with_scratch(
+                        col,
+                        primary_point,
+                        &mut flat.borrow_mut(),
+                        &mut point_flat.borrow_mut(),
+                    )
+                })
             })
         })
         .collect();
@@ -176,41 +184,49 @@ pub fn prove_mixed_opening(
     all_openings.extend(secondary_claims.iter().map(|claim| claim.value));
     profiler.phase("all_openings_assembly");
 
-    // Absorb all openings, draw gamma
+    // Absorb all openings, draw gamma.
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
     channel.observe_field_elems(&all_openings);
+    profiler.phase("transcript_absorb_openings");
     let gamma = channel.get_random_point();
+    profiler.phase("transcript_draw_gamma");
 
-    // Horner weights for primary columns only (FRI batching)
-    let weights = compute_horner_weights(gamma, n_cols);
-    profiler.phase("transcript_gamma_weights");
+    // Horner weights for primary columns only (FRI batching), stored in the
+    // flat/GCM basis so the batched polynomial can use carry-less multiply.
+    let weights_flat = compute_horner_weights_flat(gamma, n_cols);
+    profiler.phase("gamma_weights");
 
     // Build batched polynomial C(x) = sum_k gamma^k * col_k(x).
     // Column-parallel accumulation keeps each source column and the small
-    // accumulator vector hot in cache. The previous row-outer layout walked
-    // thousands of columns for every row and thrashed cache on large blocks.
-    let c_evals: Vec<Block128> = state
+    // accumulator vector hot in cache. Accumulation is performed in the flat
+    // basis and converted back once for compact FRI.
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+    let c_evals_flat: Vec<u128> = state
         .raw_cols
         .par_iter()
-        .zip(weights.par_iter())
+        .zip(weights_flat.par_iter())
         .fold(
-            || vec![Block128::ZERO; n],
+            || vec![0u128; n],
             |mut acc, (col, &weight)| {
-                acc.iter_mut()
-                    .zip(col.iter())
-                    .for_each(|(acc_i, &v)| *acc_i += weight * v);
+                acc.iter_mut().zip(col.iter()).for_each(|(acc_i, &v)| {
+                    *acc_i ^= clmul_gcm(weight, tower_to_flat_u128(v.0));
+                });
                 acc
             },
         )
         .reduce(
-            || vec![Block128::ZERO; n],
+            || vec![0u128; n],
             |mut a, b| {
                 a.iter_mut()
                     .zip(b.iter())
-                    .for_each(|(a_i, &b_i)| *a_i += b_i);
+                    .for_each(|(a_i, &b_i)| *a_i ^= b_i);
                 a
             },
         );
+    let c_evals: Vec<Block128> = c_evals_flat
+        .into_iter()
+        .map(|v| Block128::from(flat_to_tower_u128(v)))
+        .collect();
     profiler.phase("batched_polynomial");
 
     // Prove C(primary_point) via compact FRI
@@ -253,13 +269,8 @@ pub fn verify_mixed_opening(
     channel.observe_field_elems(&proof.all_openings);
     let gamma = channel.get_random_point();
 
-    // Compute batched claim for primary columns
-    let weights = compute_horner_weights(gamma, n_cols);
-    let batched_claim: Block128 = weights
-        .iter()
-        .zip(proof.all_openings[..n_cols].iter())
-        .map(|(&w, &e)| w * e)
-        .fold(Block128::ZERO, |acc, x| acc + x);
+    // Compute batched claim for primary columns in flat/GCM basis.
+    let batched_claim = compute_batched_claim_flat(gamma, &proof.all_openings[..n_cols]);
 
     // Verify compact FRI proof: C(primary_point) == batched_claim
     compact_fri_verify(
@@ -276,14 +287,28 @@ pub fn verify_mixed_opening(
     Ok(proof.all_openings[..n_cols].to_vec())
 }
 
-fn compute_horner_weights(gamma: Block128, n: usize) -> Vec<Block128> {
+fn compute_horner_weights_flat(gamma: Block128, n: usize) -> Vec<u128> {
+    use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
+    let gamma_flat = tower_to_flat_u128(gamma.0);
     let mut weights = Vec::with_capacity(n);
-    let mut w = Block128::ONE;
+    let mut w = tower_to_flat_u128(Block128::ONE.0);
     for _ in 0..n {
         weights.push(w);
-        w *= gamma;
+        w = clmul_gcm(w, gamma_flat);
     }
     weights
+}
+
+fn compute_batched_claim_flat(gamma: Block128, openings: &[Block128]) -> Block128 {
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+    let gamma_flat = tower_to_flat_u128(gamma.0);
+    let mut weight = tower_to_flat_u128(Block128::ONE.0);
+    let mut acc = 0u128;
+    for opening in openings {
+        acc ^= clmul_gcm(weight, tower_to_flat_u128(opening.0));
+        weight = clmul_gcm(weight, gamma_flat);
+    }
+    Block128::from(flat_to_tower_u128(acc))
 }
 
 impl MixedOpeningProof {

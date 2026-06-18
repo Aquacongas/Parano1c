@@ -22,6 +22,8 @@
 //! minting into `slot_j` is `slot_j ← new`. `apply_delta` applies a batch
 //! of such updates in place and returns the new root.
 
+use std::borrow::Cow;
+
 use noid_core::{Block128, TowerField};
 
 /// Segment size used by `SegmentedFriState`.
@@ -340,18 +342,9 @@ pub fn open_segment_at_point(
     // Use same padding as compute_segment_root for consistency.
     let commit_log = eff_log.max(MIN_COMMIT_LOG);
     let commit_n = 1usize << commit_log;
-    let pad = |col: &[Block128]| -> Vec<Block128> {
-        if col.len() < commit_n {
-            let mut v = col.to_vec();
-            v.resize(commit_n, Block128::ZERO);
-            v
-        } else {
-            col.to_vec()
-        }
-    };
-    let v = pad(values);
-    let h = pad(owners_hi);
-    let l = pad(owners_lo);
+    let v = pad_column_borrowed(values, commit_n);
+    let h = pad_column_borrowed(owners_hi, commit_n);
+    let l = pad_column_borrowed(owners_lo, commit_n);
 
     // Eval point must have commit_log dimensions (extend with zeros for padded columns).
     // MLE(padded, [original_bits..., 0...]) == MLE(original, original_bits) because
@@ -364,7 +357,7 @@ pub fn open_segment_at_point(
 
     let ntt = noid_core::AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
-    let cols: [&[Block128]; 3] = [&v, &h, &l];
+    let cols: [&[Block128]; 3] = [v.as_ref(), h.as_ref(), l.as_ref()];
     let (commitment, prover_state) = interleaved_commit(&cols, &ntt, &hasher);
     let seg_root = cap_to_seg_root_with_depth(&commitment.cap, eff_log);
     let mut ch = Channel::new();
@@ -480,6 +473,16 @@ pub fn merkle_root_from_leaf(leaf: &StateRoot, seg_id: u16, siblings: &[StateRoo
 /// (cap_size = 2^MERKLE_CAP_DEPTH = 32 requires n >= 32).
 const MIN_COMMIT_LOG: usize = noid_fri_binius::MERKLE_CAP_DEPTH;
 
+fn pad_column_borrowed(col: &[Block128], commit_n: usize) -> Cow<'_, [Block128]> {
+    if col.len() < commit_n {
+        let mut padded = col.to_vec();
+        padded.resize(commit_n, Block128::ZERO);
+        Cow::Owned(padded)
+    } else {
+        Cow::Borrowed(col)
+    }
+}
+
 /// Compute the segment root from three column vectors using compact interleaved FRI.
 ///
 /// `seg_root = cap_to_seg_root(interleaved_commit(padded_cols).cap)` where
@@ -494,22 +497,15 @@ pub fn compute_segment_root(
 ) -> StateRoot {
     let commit_log = eff_log.max(MIN_COMMIT_LOG);
     let commit_n = 1usize << commit_log;
-    // Pad to commit_n if needed (zero-extends, preserves MLE on lower hypercube)
-    let pad = |col: &[Block128]| -> Vec<Block128> {
-        if col.len() < commit_n {
-            let mut v = col.to_vec();
-            v.resize(commit_n, Block128::ZERO);
-            v
-        } else {
-            col.to_vec()
-        }
-    };
-    let v = pad(values);
-    let h = pad(owners_hi);
-    let l = pad(owners_lo);
+    // Pad to commit_n if needed (zero-extends, preserves MLE on lower hypercube).
+    // Production segments already have commit_n rows, so borrow them to avoid
+    // copying three full 2^16 columns before every root/opening computation.
+    let v = pad_column_borrowed(values, commit_n);
+    let h = pad_column_borrowed(owners_hi, commit_n);
+    let l = pad_column_borrowed(owners_lo, commit_n);
     let ntt = noid_core::AdditiveNTT::<Block128>::new(commit_log + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
-    let cols: [&[Block128]; 3] = [&v, &h, &l];
+    let cols: [&[Block128]; 3] = [v.as_ref(), h.as_ref(), l.as_ref()];
     let (commitment, _) = interleaved_commit(&cols, &ntt, &hasher);
     cap_to_seg_root_with_depth(&commitment.cap, eff_log)
 }

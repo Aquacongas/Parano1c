@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "block_scaling"
 harness = false
+
+[[bench]]
+name = "block_hotspots"
+harness = false

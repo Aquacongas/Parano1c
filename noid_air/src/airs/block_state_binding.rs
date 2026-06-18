@@ -1107,6 +1107,38 @@ impl BlockStateBindingAir {
             })
             .collect()
     }
+
+    pub fn extend_for_proving_borrowed<'a>(
+        &self,
+        cols: &'a [Vec<Block128>],
+        target_log: usize,
+    ) -> Vec<std::borrow::Cow<'a, [Block128]>> {
+        let n_rows = self.layout.n_rows();
+        let target = 1usize << target_log;
+        if target <= n_rows {
+            return cols
+                .iter()
+                .map(|col| std::borrow::Cow::Borrowed(col.as_slice()))
+                .collect();
+        }
+        // eq_ladder columns occupy a contiguous range.
+        let eq_base = self.layout.col_eq_ladder(0);
+        let eq_end = eq_base + self.layout.log_slots; // exclusive
+        cols.iter()
+            .enumerate()
+            .map(|(idx, col)| {
+                let pad = if idx >= eq_base && idx < eq_end {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                };
+                let mut out = Vec::with_capacity(target);
+                out.extend_from_slice(col);
+                out.resize(target, pad);
+                std::borrow::Cow::Owned(out)
+            })
+            .collect()
+    }
 }
 
 impl Air for BlockStateBindingAir {

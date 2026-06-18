@@ -325,13 +325,14 @@ pub fn apply_state_delta(
     }
 
     // 2. Apply delta: zero inputs, fill outputs — no pre-state verification.
+    // Keep the exact old operation order, but avoid `set_slot()` because it
+    // recomputes the FRI/Merkle root after every individual slot update.
+    let mut deltas = Vec::new();
     for tx in &block.transactions {
         for inp in tx.body.inputs.iter().filter(|i| i.valid) {
             // ZK proved inp.slot_index contained the claimed value.
             // Just zero it out; no read needed.
-            snap.state
-                .set_slot(inp.slot_index, SlotValue::EMPTY)
-                .map_err(|_| BlockApplyError::Tx(crate::state::ApplyError::SlotOutOfRange))?;
+            deltas.push((inp.slot_index, SlotValue::EMPTY));
             snap.active_slot_count = snap.active_slot_count.saturating_sub(1);
         }
         for out in tx.body.outputs.iter().filter(|o| o.valid) {
@@ -341,13 +342,14 @@ pub fn apply_state_delta(
                 owner_hi: out.owner.as_fields()[0],
                 owner_lo: out.owner.as_fields()[1],
             };
-            snap.state
-                .set_slot(out.slot_index, sv)
-                .map_err(|_| BlockApplyError::Tx(crate::state::ApplyError::SlotOutOfRange))?;
+            deltas.push((out.slot_index, sv));
             snap.active_slot_count = snap.active_slot_count.saturating_add(1);
             snap.alloc_counter = snap.alloc_counter.wrapping_add(1);
         }
     }
+    snap.state
+        .apply_delta_unrooted(&deltas)
+        .map_err(|_| BlockApplyError::Tx(crate::state::ApplyError::SlotOutOfRange))?;
 
     // 3. Check counters (these are cheap, O(n_outputs) above).
     if block.header.active_slot_count != snap.active_slot_count {

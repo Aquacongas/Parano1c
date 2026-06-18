@@ -175,6 +175,95 @@ where
     (t.elapsed(), r)
 }
 
+#[derive(Debug)]
+struct BenchFullBlockPhaseTiming {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct BenchFullBlockProfiler {
+    enabled: bool,
+    started: Instant,
+    last: Instant,
+    phases: Vec<BenchFullBlockPhaseTiming>,
+}
+
+impl BenchFullBlockProfiler {
+    fn new() -> Self {
+        let now = Instant::now();
+        let enabled = std::env::var("NOID_PROVE_BLOCK_PROFILE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        Self {
+            enabled,
+            started: now,
+            last: now,
+            phases: Vec::with_capacity(12),
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.phases.push(BenchFullBlockPhaseTiming {
+            name,
+            elapsed: now.duration_since(self.last),
+        });
+        self.last = now;
+    }
+
+    fn finish(
+        self,
+        n_standard: usize,
+        n_sweep: usize,
+        n_sweep_witnesses: usize,
+        n_state_bindings: usize,
+        has_standard_bucket: bool,
+        has_sweep_bucket: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.started.elapsed();
+        let summary = self
+            .phases
+            .iter()
+            .map(|p| format!("{}={:.3}ms", p.name, p.elapsed.as_secs_f64() * 1_000.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for phase in &self.phases {
+            eprintln!(
+                "bench_full_block_profile phase n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} phase={} elapsed_ms={:.3}",
+                n_standard,
+                n_sweep,
+                n_sweep_witnesses,
+                n_state_bindings,
+                phase.name,
+                phase.elapsed.as_secs_f64() * 1_000.0
+            );
+        }
+        eprintln!(
+            "bench_full_block_profile summary n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} has_standard_bucket={} has_sweep_bucket={} total_ms={:.3} phases={}",
+            n_standard,
+            n_sweep,
+            n_sweep_witnesses,
+            n_state_bindings,
+            has_standard_bucket,
+            has_sweep_bucket,
+            total.as_secs_f64() * 1_000.0,
+            summary
+        );
+    }
+}
+
 pub fn time_median<F>(samples: usize, mut f: F) -> Duration
 where
     F: FnMut(),
@@ -511,24 +600,26 @@ pub fn tx_from_body(body: TxBody) -> Transaction {
 
 fn seed_state_for_bodies(bodies: &[TxBody]) -> ChainState {
     let mut state = ChainState::with_log_slots(BENCH_LOG_SLOTS as usize);
+    let mut deltas = Vec::new();
     for input in bodies
         .iter()
         .flat_map(|body| body.inputs.iter().filter(|i| i.valid))
     {
         let [owner_hi, owner_lo] = input.owner.as_fields();
-        state
-            .state
-            .set_slot(
-                input.slot_index,
-                SlotValue {
-                    value: Block128::from(input.value as u128),
-                    owner_hi,
-                    owner_lo,
-                },
-            )
-            .expect("bench input slot in range");
+        deltas.push((
+            input.slot_index,
+            SlotValue {
+                value: Block128::from(input.value as u128),
+                owner_hi,
+                owner_lo,
+            },
+        ));
         state.active_slot_count += 1;
     }
+    state
+        .state
+        .apply_delta(&deltas)
+        .expect("bench input slots in range");
     state
 }
 
@@ -661,6 +752,7 @@ fn bench_block_from_parts(
         .iter()
         .filter(|o| o.valid)
         .count() as u64;
+    let proof_hash = block_recursive_claim_hash(proof);
     Block {
         header: BlockHeader {
             prev_block_hash: [0u8; 32],
@@ -671,8 +763,8 @@ fn bench_block_from_parts(
             miner_address: Address([0xCB; 32]),
             nonce: 0,
             difficulty_target: [0xFF; 32],
-            proof_transcript_hash: block_recursive_claim_hash(proof),
-            witness_root: block_recursive_claim_hash(proof),
+            proof_transcript_hash: proof_hash,
+            witness_root: proof_hash,
             log_slots: BENCH_LOG_SLOTS,
             active_slot_count: active_outputs + coinbase_outputs,
             alloc_counter: active_outputs
@@ -688,12 +780,14 @@ fn prove_full_block_proof_once(
     sweep_fixtures: &[SweepFixture],
     sweep_witnesses: &[OwnedSweepTxWitness],
 ) -> (BlockProof, Block, ChainState) {
+    let mut profiler = BenchFullBlockProfiler::new();
     let mut user_bodies: Vec<TxBody> = standard_fixtures
         .iter()
         .map(|f| f.scenario.body.clone())
         .collect();
     user_bodies.extend(sweep_fixtures.iter().map(|f| f.scenario.body.clone()));
     assert_eq!(sweep_fixtures.len(), sweep_witnesses.len());
+    profiler.phase("body_clone");
 
     let mut pre_state = seed_state_for_bodies(&user_bodies);
     let prev_state_root = pre_state.state_root();
@@ -702,9 +796,12 @@ fn prove_full_block_proof_once(
         .iter()
         .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
+    profiler.phase("seed_state_and_commitments");
+
     let mut binding_state = pre_state.state.clone();
     let mut binding = BlockStateBinding::build(&mut binding_state, &user_bodies, &commitments)
         .expect("build bench state binding");
+    profiler.phase("state_binding_build");
     patch_binding_with_coinbase_root_and_siblings(
         &mut binding,
         &pre_state.state,
@@ -723,15 +820,19 @@ fn prove_full_block_proof_once(
         BENCH_LOG_SLOTS,
     );
     let state_bindings: Vec<_> = owned_bindings.iter().map(|b| b.as_witness()).collect();
+    profiler.phase("state_binding_witnesses");
 
     let standard_witnesses: Vec<_> = standard_fixtures
         .iter()
         .enumerate()
         .map(|(i, f)| standard_block_witness(1 + i as u32, f))
         .collect();
+    profiler.phase("standard_witnesses");
+
     let sweep_bucket = assemble_sweep_bucket_proof(prev_state_root, sweep_witnesses)
         .expect("assemble sweep bucket")
         .filter(|_| !sweep_witnesses.is_empty());
+    profiler.phase("sweep_bucket_prove");
 
     let mut proof = if standard_witnesses.is_empty() {
         let (state_binding_starks, pre_state_openings, post_state_openings) =
@@ -771,8 +872,19 @@ fn prove_full_block_proof_once(
         proof.sweep_bucket = sweep_bucket;
         proof
     };
+    profiler.phase("core_proof");
+
     let block = bench_block_from_parts(coinbase_body, &user_bodies, &proof);
     proof.meta.new_state_root = block.header.state_root;
+    profiler.phase("block_assembly");
+    profiler.finish(
+        standard_fixtures.len(),
+        sweep_fixtures.len(),
+        sweep_witnesses.len(),
+        state_bindings.len(),
+        proof.standard_bucket.is_some(),
+        proof.sweep_bucket.is_some(),
+    );
     (proof, block, pre_state)
 }
 

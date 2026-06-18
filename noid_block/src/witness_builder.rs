@@ -337,7 +337,7 @@ impl OwnedStateBindingWitness {
     pub fn as_witness(&self) -> StateBindingBlockWitness<'_> {
         StateBindingBlockWitness {
             air: &self.air,
-            columns: self.columns.clone(),
+            columns: &self.columns,
             seg_id: self.seg_id,
             pre_cols: Some(&self.pre_cols),
             claims: &self.claims,
@@ -452,14 +452,16 @@ pub fn build_state_bindings_from_binding(
         let eval_point: Vec<Block128> = (0..eff_log).map(|_| ch.get_random_point()).collect();
         let gamma = ch.get_random_point();
 
-        // Pre-state MLE evaluation.
-        let zero_cols = SegmentColumns::new_zero(seg_size);
-        let pre_ref = pre_segs.get(&seg_id).unwrap_or(&zero_cols);
-        let pre_cols_owned = pre_ref.clone();
+        // Pre-state MLE evaluation. Allocate a zero segment only for genuinely
+        // absent pre-state segments; production hot paths usually provide one.
+        let pre_cols_owned = pre_segs
+            .get(&seg_id)
+            .cloned()
+            .unwrap_or_else(|| SegmentColumns::new_zero(seg_size));
         let prev_lane_openings = [
-            mle_eval(&pre_ref.values, &eval_point),
-            mle_eval(&pre_ref.owners_hi, &eval_point),
-            mle_eval(&pre_ref.owners_lo, &eval_point),
+            mle_eval(&pre_cols_owned.values, &eval_point),
+            mle_eval(&pre_cols_owned.owners_hi, &eval_point),
+            mle_eval(&pre_cols_owned.owners_lo, &eval_point),
         ];
 
         // Build witness and compute new_lane_openings.

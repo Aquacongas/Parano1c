@@ -353,6 +353,25 @@ impl SegmentedFriState {
     /// Apply a batch of `(global_idx, new_value)` updates. Returns the
     /// post-update global `state_root`. On error, state is unchanged.
     pub fn apply_delta(&mut self, deltas: &[(u32, SlotValue)]) -> Result<StateRoot, StateError> {
+        self.apply_delta_in_place(deltas)?;
+        Ok(self.root())
+    }
+
+    /// Apply a proven delta without recomputing the global root immediately.
+    ///
+    /// This is crate-private because callers must either trust a separately
+    /// verified root (the block-verification path) or call [`Self::root`] before
+    /// exposing the state root. The dirty segment/tree markers are still updated,
+    /// so the next `root()` call recomputes exactly the same commitment as
+    /// `apply_delta()` would have returned.
+    pub(crate) fn apply_delta_unrooted(
+        &mut self,
+        deltas: &[(u32, SlotValue)],
+    ) -> Result<(), StateError> {
+        self.apply_delta_in_place(deltas)
+    }
+
+    fn apply_delta_in_place(&mut self, deltas: &[(u32, SlotValue)]) -> Result<(), StateError> {
         for (idx, _) in deltas {
             if (*idx as u64) >= self.num_slots() {
                 return Err(StateError::SlotOutOfRange);
@@ -413,7 +432,7 @@ impl SegmentedFriState {
             self.mdbx_dirty.insert(seg);
             self.tree_dirty = true;
         }
-        Ok(self.root())
+        Ok(())
     }
 
     /// Write one slot and return the new state root.

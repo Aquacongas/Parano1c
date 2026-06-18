@@ -777,9 +777,9 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
+pub fn prove_air_interleaved_from_refs<'cols, A: Air + ?Sized>(
     air: &A,
-    padded_columns: &'cols [Vec<Block128>],
+    padded_columns: &[&'cols [Block128]],
     pi: &PublicInputs,
     extra_transcript: &[Block128],
     slice_claims: &[SliceClaim],
@@ -793,20 +793,17 @@ pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
 
-    let col_refs: Vec<&'cols [Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
     let (commitment, prover_state) = match pre_committed {
         Some(pre) => pre,
-        None => interleaved_commit(&col_refs, &ntt, &hasher),
+        None => interleaved_commit(padded_columns, &ntt, &hasher),
     };
 
     let mut channel = Channel::new();
     absorb_cap(&mut channel, &commitment.cap);
 
-    // Collect slice refs: prove_air_interleaved_algebraic takes &[&[Block128]].
-    let col_refs: Vec<&[Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
     let (alg, r_pp, _final_claim, _lambdas) = prove_air_interleaved_algebraic(
         air,
-        &col_refs,
+        padded_columns,
         pi,
         extra_transcript,
         slice_claims,
@@ -843,6 +840,33 @@ pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
         mixed_opening,
         slice_claimed_values: alg.slice_claimed_values,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_air_interleaved<'cols, A: Air + ?Sized>(
+    air: &A,
+    padded_columns: &'cols [Vec<Block128>],
+    pi: &PublicInputs,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    log_len: usize,
+    pre_committed: Option<(
+        InterleavedCommitment,
+        noid_fri_binius::InterleavedProverState<'cols>,
+    )>,
+    num_queries: usize,
+) -> InterleavedStarkProof {
+    let col_refs: Vec<&'cols [Block128]> = padded_columns.iter().map(|c| c.as_slice()).collect();
+    prove_air_interleaved_from_refs(
+        air,
+        &col_refs,
+        pi,
+        extra_transcript,
+        slice_claims,
+        log_len,
+        pre_committed,
+        num_queries,
+    )
 }
 
 // ---------------------------------------------------------------------------

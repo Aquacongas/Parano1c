@@ -313,11 +313,27 @@ fn sigma_dec_value(live_slots: usize, y: usize) -> Block128 {
     sigma_at(dec_round, elem_of_dyn(y))
 }
 
-fn build_sigma_dec_table_dyn(live_slots: usize, n_cells: usize) -> Vec<Block128> {
+fn build_sigma_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     (0..n_cells)
         .into_par_iter()
-        .map(|y| sigma_dec_value(live_slots, y))
+        .map(|y| tower_to_flat_u128(sigma_dec_value(live_slots, y).to_u128()))
+        .collect()
+}
+
+fn build_sigma_lane_dec_table_flat_dyn(
+    lane: usize,
+    live_slots: usize,
+    n_cells: usize,
+) -> Vec<u128> {
+    use rayon::prelude::*;
+    let elem_mask = (1 << ELEM_BITS) - 1;
+    (0..n_cells)
+        .into_par_iter()
+        .map(|y| {
+            let row_base = y & !elem_mask;
+            tower_to_flat_u128(sigma_dec_value(live_slots, row_base | lane).to_u128())
+        })
         .collect()
 }
 
@@ -381,12 +397,12 @@ fn build_u_table_flat_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -
         .collect()
 }
 
-fn permute_by_dec_dyn(src: &[Block128]) -> Vec<Block128> {
+fn permute_by_dec_flat_dyn(src: &[Block128]) -> Vec<u128> {
     use rayon::prelude::*;
     let n = src.len();
     (0..n)
         .into_par_iter()
-        .map(|y| src[dec_round_dyn(y)])
+        .map(|y| tower_to_flat_u128(src[dec_round_dyn(y)].to_u128()))
         .collect()
 }
 
@@ -535,7 +551,7 @@ fn fast_eval_block_schedules(
     )
 }
 
-fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
+fn project_lane_dec_flat_dyn(src: &[Block128], lane: usize) -> Vec<u128> {
     use rayon::prelude::*;
     let n = src.len();
     let elem_mask = (1 << ELEM_BITS) - 1;
@@ -543,7 +559,7 @@ fn project_lane_dyn(src: &[Block128], lane: usize) -> Vec<Block128> {
         .into_par_iter()
         .map(|y| {
             let row_base = y & !elem_mask;
-            src[row_base | lane]
+            tower_to_flat_u128(src[dec_round_dyn(row_base | lane)].to_u128())
         })
         .collect()
 }
@@ -616,10 +632,10 @@ fn build_block_unified_flat_tables(
 
     // Build the shared permuted tables in parallel (each is independent).
     let (
-        sigma_dec_b128,
-        (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_b128, state_dec_b128)))),
+        sigma_dec_flat,
+        (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_flat, state_dec_flat)))),
     ) = rayon::join(
-        || build_sigma_dec_table_dyn(live, n_cells),
+        || build_sigma_dec_table_flat_dyn(live, n_cells),
         || {
             rayon::join(
                 || build_rc_dec_table_flat_dyn(live, n_cells),
@@ -628,11 +644,11 @@ fn build_block_unified_flat_tables(
                         || build_u_table_flat_dyn(rho, live, n_cells),
                         || {
                             rayon::join(
-                                || vec_to_flat(&permute_by_dec_dyn(&mle.s_in)),
+                                || permute_by_dec_flat_dyn(&mle.s_in),
                                 || {
                                     rayon::join(
-                                        || permute_by_dec_dyn(&mle.s_out),
-                                        || permute_by_dec_dyn(&mle.state),
+                                        || permute_by_dec_flat_dyn(&mle.s_out),
+                                        || permute_by_dec_flat_dyn(&mle.state),
                                     )
                                 },
                             )
@@ -643,11 +659,8 @@ fn build_block_unified_flat_tables(
         },
     );
 
-    // Convert sigma_dec/s_out_dec/state_dec to flat AND build their lane
-    // tables — all using the already-computed Block128 permuted tables.
-    let sigma_dec_flat = vec_to_flat(&sigma_dec_b128);
-    let s_out_dec_flat = vec_to_flat(&s_out_dec_b128);
-    let state_dec_flat = vec_to_flat(&state_dec_b128);
+    // s_out/state/sigma dec tables were built directly in flat basis above
+    // to avoid Block128 intermediates.
     let state_flat = vec_to_flat(&mle.state);
 
     // Parallel lane table construction (STATE_SIZE = 4 lanes each).
@@ -666,7 +679,7 @@ fn build_block_unified_flat_tables(
                     || {
                         lane_idx
                             .par_iter()
-                            .map(|&j| vec_to_flat(&project_lane_dyn(&sigma_dec_b128, j)))
+                            .map(|&j| build_sigma_lane_dec_table_flat_dyn(j, live, n_cells))
                             .collect::<Vec<_>>()
                     },
                     || {
@@ -674,13 +687,13 @@ fn build_block_unified_flat_tables(
                             || {
                                 lane_idx
                                     .par_iter()
-                                    .map(|&j| vec_to_flat(&project_lane_dyn(&s_out_dec_b128, j)))
+                                    .map(|&j| project_lane_dec_flat_dyn(&mle.s_out, j))
                                     .collect::<Vec<_>>()
                             },
                             || {
                                 lane_idx
                                     .par_iter()
-                                    .map(|&j| vec_to_flat(&project_lane_dyn(&state_dec_b128, j)))
+                                    .map(|&j| project_lane_dec_flat_dyn(&mle.state, j))
                                     .collect::<Vec<_>>()
                             },
                         )
@@ -691,13 +704,18 @@ fn build_block_unified_flat_tables(
         (mds, sig, sout, stt)
     };
 
-    let mds_flat: [Vec<u128>; STATE_SIZE] = std::array::from_fn(|j| mds_vecs[j].clone());
-    let sigma_lane_flat: [Vec<u128>; STATE_SIZE] =
-        std::array::from_fn(|j| sigma_lane_vecs[j].clone());
-    let s_out_lane_flat: [Vec<u128>; STATE_SIZE] =
-        std::array::from_fn(|j| s_out_lane_vecs[j].clone());
-    let state_lane_flat: [Vec<u128>; STATE_SIZE] =
-        std::array::from_fn(|j| state_lane_vecs[j].clone());
+    let mds_flat: [Vec<u128>; STATE_SIZE] = mds_vecs
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
+    let sigma_lane_flat: [Vec<u128>; STATE_SIZE] = sigma_lane_vecs
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
+    let s_out_lane_flat: [Vec<u128>; STATE_SIZE] = s_out_lane_vecs
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
+    let state_lane_flat: [Vec<u128>; STATE_SIZE] = state_lane_vecs
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
 
     BlockUnifiedFlatTables {
         u: u_flat,
@@ -1235,9 +1253,9 @@ pub struct BlockSpineKillShotProof {
 }
 
 struct BlockCombinedWeights {
-    w_sin: Vec<Block128>,
-    w_sout: Vec<Block128>,
-    w_state: Vec<Block128>,
+    w_sin: Vec<u128>,
+    w_sout: Vec<u128>,
+    w_state: Vec<u128>,
 }
 
 struct BlockWeightsAtPoint {
@@ -1257,13 +1275,13 @@ fn build_block_combined_weights(
     let rp_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
     let rp_slot = &r_prime[ELEM_BITS + ROUND_BITS..num_vars];
 
-    let eq_slot_tab = eq_ind_partial_eval::<Block128>(rp_slot);
-    let eq_elem_tab = eq_ind_partial_eval::<Block128>(rp_elem);
+    let eq_slot_tab = vec_to_flat(&eq_ind_partial_eval::<Block128>(rp_slot));
+    let eq_elem_tab = vec_to_flat(&eq_ind_partial_eval::<Block128>(rp_elem));
 
     let n_rounds = 1usize << ROUND_BITS;
 
-    let eq_round_tab = eq_ind_partial_eval::<Block128>(rp_round);
-    let mut eq_round_at_inc = vec![Block128::ZERO; n_rounds];
+    let eq_round_tab = vec_to_flat(&eq_ind_partial_eval::<Block128>(rp_round));
+    let mut eq_round_at_inc = vec![0u128; n_rounds];
     for round_x in 0..n_rounds {
         let inc = (round_x + 1) & (n_rounds - 1);
         eq_round_at_inc[round_x] = eq_round_tab[inc];
@@ -1271,17 +1289,16 @@ fn build_block_combined_weights(
 
     use rayon::prelude::*;
 
-    let d0 = Block128::ONE;
-    let d1 = delta;
-    let d2 = d1 * delta;
-    let d3 = d2 * delta;
-    let d4 = d3 * delta;
-    let d5 = d4 * delta;
-    let d6 = d5 * delta;
-    let d7 = d6 * delta;
-    let d8 = d7 * delta;
-    let d9 = d8 * delta;
-    let d10 = d9 * delta;
+    let d1 = tower_to_flat_u128(delta.to_u128());
+    let d2 = clmul_gcm(d1, d1);
+    let d3 = clmul_gcm(d2, d1);
+    let d4 = clmul_gcm(d3, d1);
+    let d5 = clmul_gcm(d4, d1);
+    let d6 = clmul_gcm(d5, d1);
+    let d7 = clmul_gcm(d6, d1);
+    let d8 = clmul_gcm(d7, d1);
+    let d9 = clmul_gcm(d8, d1);
+    let d10 = clmul_gcm(d9, d1);
 
     let lane_sout = [d3, d4, d5, d6];
     let lane_state = [d7, d8, d9, d10];
@@ -1289,9 +1306,9 @@ fn build_block_combined_weights(
     // Directly fill the final combined weight tables. This is algebraically
     // identical to materializing w_dec plus four lane tables, but avoids the
     // scatter_data allocation and four full-size temporary lane vectors.
-    let mut w_sin = vec![Block128::ZERO; n_cells];
-    let mut w_sout = vec![Block128::ZERO; n_cells];
-    let mut w_state = vec![Block128::ZERO; n_cells];
+    let mut w_sin = vec![0u128; n_cells];
+    let mut w_sout = vec![0u128; n_cells];
+    let mut w_state = vec![0u128; n_cells];
     w_sin
         .par_iter_mut()
         .zip(w_sout.par_iter_mut())
@@ -1301,11 +1318,11 @@ fn build_block_combined_weights(
             let slot = slot_of_dyn(x);
             let round = round_of_dyn(x);
             let elem = elem_of_dyn(x);
-            let es_er = eq_slot_tab[slot] * eq_round_at_inc[round];
-            let w_dec = es_er * eq_elem_tab[elem];
-            *sin = d0 * w_dec;
-            *sout = d1 * w_dec + lane_sout[elem] * es_er;
-            *state = d2 * w_dec + lane_state[elem] * es_er;
+            let es_er = clmul_gcm(eq_slot_tab[slot], eq_round_at_inc[round]);
+            let w_dec = clmul_gcm(es_er, eq_elem_tab[elem]);
+            *sin = w_dec;
+            *sout = clmul_gcm(d1, w_dec) ^ clmul_gcm(lane_sout[elem], es_er);
+            *state = clmul_gcm(d2, w_dec) ^ clmul_gcm(lane_state[elem], es_er);
         });
 
     BlockCombinedWeights {
@@ -1424,27 +1441,15 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
     profiler.phase("build_combined_weights");
 
     // Degree-2 sumcheck in flat basis for hw acceleration.
-    // Convert all 6 tables to flat in parallel.
-    let ((mut f_sin, mut f_sout), (mut f_state, (mut f_wsin, (mut f_wsout, mut f_wstate)))) =
-        rayon::join(
-            || rayon::join(|| vec_to_flat(&mle.s_in), || vec_to_flat(&mle.s_out)),
-            || {
-                rayon::join(
-                    || vec_to_flat(&mle.state),
-                    || {
-                        rayon::join(
-                            || vec_to_flat(&weights.w_sin),
-                            || {
-                                rayon::join(
-                                    || vec_to_flat(&weights.w_sout),
-                                    || vec_to_flat(&weights.w_state),
-                                )
-                            },
-                        )
-                    },
-                )
-            },
-        );
+    // Witness tables still need conversion; combined weights are built directly
+    // in flat basis by `build_block_combined_weights`.
+    let ((mut f_sin, mut f_sout), mut f_state) = rayon::join(
+        || rayon::join(|| vec_to_flat(&mle.s_in), || vec_to_flat(&mle.s_out)),
+        || vec_to_flat(&mle.state),
+    );
+    let mut f_wsin = weights.w_sin;
+    let mut f_wsout = weights.w_sout;
+    let mut f_wstate = weights.w_state;
     profiler.phase("convert_tables_to_flat");
 
     let mut round_polys = Vec::with_capacity(num_vars);
