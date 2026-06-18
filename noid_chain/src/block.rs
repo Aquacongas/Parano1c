@@ -4,10 +4,12 @@
 //! Block container, block-level state transition, and helpers that bind
 //! proofs into block headers.
 //!
-//! A `Block` is a header plus an ordered list of transactions. Applying
-//! a block runs `apply_tx` sequentially. Per-tx state-root chaining is
-//! obsolete; block-level state validation ensures `header.state_root`
-//! matches the final computed post-root after all txs are applied, and
+//! A `Block` is a header plus an ordered list of transactions. Live full-node
+//! validation is proof-native: the block proof establishes the state transition,
+//! then the node commits the proven delta with `apply_state_delta`. The older
+//! sequential interpreter remains for in-memory tests and non-live utilities.
+//! Per-tx state-root chaining is obsolete; block-level state validation ensures
+//! `header.state_root` matches the final computed post-root after all txs are applied, and
 //! `tx_root` equals the Merkle reduction over the transactions'
 //! `tx_body_hash`es (Poseidon2b COMPRESS domain, zero-padded to a power of two).
 //! The Poseidon2b-based Merkle tree is ZK-friendly: its internal nodes can be
@@ -158,8 +160,13 @@ impl From<ApplyError> for BlockApplyError {
     }
 }
 
-/// Apply a block in place. On error, `state` is left untouched (work
-/// happens on a snapshot and is swapped only on success).
+/// Sequential state-transition interpreter.
+///
+/// This is not the live MDBX/node production validity path for user-transaction
+/// blocks. Full nodes verify `BlockProof` + `BlockStateBindingAir` and then call
+/// `apply_state_delta`. This interpreter is kept for in-memory tests and utility
+/// contexts that need to recompute a transition directly. On error, `state` is
+/// left untouched (work happens on a snapshot and is swapped only on success).
 pub fn apply_block(
     state: &mut ChainState,
     block: &Block,
@@ -190,7 +197,7 @@ pub fn apply_block(
     }
 
     // Coinbase structure: at most one, must be first, zero inputs.
-    // Coinbase VALUE validation (≤ block_reward + fees) is in validate_block_consensus().
+    // Coinbase VALUE validation (≤ block_reward + fees) is in consensus checks.
     let coinbase_count = block
         .transactions
         .iter()
@@ -295,10 +302,8 @@ pub fn apply_block(
 ///   4. Sets `state_root` from `block.header.state_root` (trusted by ZK).
 ///   5. Still checks tx_root (cheap, O(n) hashing).
 ///
-/// **Savings vs `apply_block`:**
-///   - ~2400 MDBX slot reads eliminated for a 100-tx block.
-///   - No state_root recomputation (~50 ms for 100 dirty segments).
-///   - No pre-state value verification (ZK handles this).
+/// This is the live production apply primitive for non-genesis blocks after
+/// proof verification.
 pub fn apply_state_delta(
     state: &mut ChainState,
     block: &Block,

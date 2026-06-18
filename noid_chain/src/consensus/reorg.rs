@@ -11,7 +11,7 @@
 //! 1. Find the common ancestor between the current tip and the new chain.
 //! 2. Reject if reorg depth > FINALITY_DEPTH.
 //! 3. Revert blocks from current tip to common ancestor using undo logs.
-//! 4. Apply new blocks one by one using validate_block_consensus.
+//! 4. Apply new blocks one by one using the in-memory sequential interpreter.
 //! 5. Rebuild nullifier set from surviving-chain undo logs (ANCHOR_DEPTH window;
 //!    blocks older than FINALITY_DEPTH produce empty entries — safe because
 //!    those txs are already protected by the UTXO state check).
@@ -179,7 +179,7 @@ pub fn apply_reorg(
     // chain produce empty entries.  This is safe: those older blocks' txs are
     // protected by the UTXO state itself — their input slots are already EMPTY
     // ("unknown or spent") and output slots are LIVE ("output slot not empty"),
-    // so native apply_tx would reject re-inclusion regardless of the nullifier set.
+    // so the sequential interpreter rejects re-inclusion regardless of the nullifier set.
     {
         use crate::consensus::params::ANCHOR_DEPTH;
         let rebuild_start = ancestor_height.saturating_sub(ANCHOR_DEPTH);

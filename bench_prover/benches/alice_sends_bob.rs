@@ -13,8 +13,9 @@
 
 use bench_prover::{
     consolidation_scenario, fmt_bytes, fmt_ms, live_counts, proof_size_standard, proof_size_sweep,
-    prove_standard_wallet, prove_sweep_wallet, standard_fixture, standard_scenario, sweep_fixture,
-    sweep_scenario, StandardFixture, StandardWalletBench, SweepFixture, SweepWalletBench,
+    prove_standard_wallet, prove_sweep_wallet, standard_fixture, standard_scenario,
+    standard_wallet_bundle_size, sweep_fixture, sweep_scenario, sweep_wallet_bundle_size,
+    StandardFixture, StandardWalletBench, SweepFixture, SweepWalletBench,
 };
 
 const SAMPLES_STANDARD: usize = 5;
@@ -31,7 +32,9 @@ fn print_standard(f: &StandardFixture, r: &StandardWalletBench) {
     println!("    live IO:        {n_in} inputs / {n_out} outputs");
     println!("    prove median:   {}", fmt_ms(r.prove_time));
     println!("    verify median:  {}", fmt_ms(r.verify_time));
-    println!("    proof size:     {}", fmt_bytes(total));
+    let bundle = standard_wallet_bundle_size(f, &r.proof);
+    println!("    wallet bundle:  {}", fmt_bytes(bundle));
+    println!("    logic proof:    {}", fmt_bytes(total));
     println!("      STARK:        {}", fmt_bytes(stark));
     println!("      AuthGKR:      {}", fmt_bytes(auth));
     println!();
@@ -48,10 +51,15 @@ fn print_sweep(f: &SweepFixture, r: &SweepWalletBench) {
     println!("    live IO:        {n_in} inputs / {n_out} outputs");
     println!("    prove median:   {}", fmt_ms(r.prove_time));
     println!("    verify median:  {}", fmt_ms(r.verify_time));
-    println!("    proof size:     {}", fmt_bytes(total));
+    let bundle = sweep_wallet_bundle_size(f, &r.proof);
+    println!("    wallet bundle:  {}", fmt_bytes(bundle));
+    println!("    logic proof:    {}", fmt_bytes(total));
     println!("      STARK:        {}", fmt_bytes(stark));
     println!("      AuthGKR:      {}", fmt_bytes(auth));
-    println!("      SpineGKR:     {}", fmt_bytes(spine));
+    println!(
+        "      Wallet spine: {} (removed; block-side only)",
+        fmt_bytes(spine)
+    );
     println!();
 }
 
@@ -94,11 +102,13 @@ fn main() {
     println!("  ====================================================================");
     println!("  Logical split compositions");
     println!("  ====================================================================");
-    println!("  These rows are composition summaries using the measured chunk proofs above.");
+    println!("  These rows are composition summaries using the measured wallet bundles above.");
     println!();
 
     let (s25_total, _, _, _) = proof_size_sweep(&r_sweep_25x2.proof);
     let (std_tail_total, _, _) = proof_size_standard(&r_standard_1x2.proof);
+    let s25_bundle = sweep_wallet_bundle_size(&sweep_25x2, &r_sweep_25x2.proof);
+    let std_tail_bundle = standard_wallet_bundle_size(&standard_1x2, &r_standard_1x2.proof);
 
     let split_26_prove = r_sweep_25x2.prove_time + r_standard_1x2.prove_time;
     let split_26_verify = r_sweep_25x2.verify_time + r_standard_1x2.verify_time;
@@ -106,7 +116,11 @@ fn main() {
     println!("    prove total:   {}", fmt_ms(split_26_prove));
     println!("    verify total:  {}", fmt_ms(split_26_verify));
     println!(
-        "    proof total:   {}",
+        "    bundle total:  {}",
+        fmt_bytes(s25_bundle + std_tail_bundle)
+    );
+    println!(
+        "    logic total:   {}",
         fmt_bytes(s25_total + std_tail_total)
     );
     println!();
@@ -120,7 +134,8 @@ fn main() {
         "    verify total:  {}",
         fmt_ms(r_sweep_25x2.verify_time + r_sweep_25x2.verify_time)
     );
-    println!("    proof total:   {}", fmt_bytes(s25_total * 2));
+    println!("    bundle total:  {}", fmt_bytes(s25_bundle * 2));
+    println!("    logic total:   {}", fmt_bytes(s25_total * 2));
     println!();
 
     println!("  ====================================================================");

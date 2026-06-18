@@ -182,14 +182,13 @@ impl NodeBehaviour {
         //
         // Block proof sizes (block_proof_bytes):
         //   coinbase:  0 B (empty)
-        //   10 txs:    ~213 KB
-        //   50 txs:    ~1.2 MB
-        //   256 txs:   ~5 MB  ← exceeds gossip, must use pull sync
+        //   user-tx blocks carry shape-specific BlockProof bytes.
+        //   Current caps are conservative; exact Standard4x8/Sweep25x2 and
+        //   mixed-block sizes are remeasured in the benchmark/report phase.
         //
-        // Strategy: inline blocks up to 1 MB via gossip (covers ~50 txs with
-        // proof).  Larger blocks use compact announcement + pull sync via
-        // block_sync request-response.
-        // and have nodes pull the proof on demand for large blocks.
+        // Strategy: inline blocks up to 1 MB via gossip for low-tx blocks.
+        // Larger blocks use compact announcement + pull sync via block_sync
+        // request-response so peers pull block/proof bytes on demand.
         const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024; // 2 MB
 
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()

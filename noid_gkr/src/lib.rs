@@ -31,6 +31,7 @@ pub mod auth_unified_v2;
 pub mod batch_eval;
 pub mod binding;
 pub mod block_spine;
+pub mod block_spine_sweep;
 pub mod circuit;
 pub mod circuit_sweep;
 pub mod layers;
@@ -106,6 +107,11 @@ pub use block_spine::{
     verify_block_spine_killshot, BlockSpineKillShotProof, BlockSpineMle, BlockSpineProof,
     BlockSpineReductions, BlockSpineShiftProof, BlockSpineShiftReduction, BlockSpineUnifiedProof,
     BlockSpineUnifiedReduction, BLOCK_SPINE_ROUND_DEGREE, BLOCK_SPINE_SHIFT_DEGREE,
+};
+pub use block_spine_sweep::{
+    discharge_sweep_block_spine_reductions_native, prove_sweep_block_spine_killshot,
+    verify_sweep_block_spine_killshot, SweepBlockSpineMle, SweepBlockSpineProof,
+    SweepBlockSpineReductions,
 };
 pub use circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
 pub use circuit_sweep::{

@@ -239,7 +239,9 @@ def main():
         shutil.rmtree(BASE)
     LOGS.mkdir(parents=True, exist_ok=True)
 
-    n1 = Node("node1-cli-miner", 19500, 19501, mode="miner", genesis=True, mining_threads=None)
+    n1 = Node(
+        "node1-cli-miner", 19500, 19501, mode="miner", genesis=True, mining_threads=None
+    )
     n2 = Node("node2-cli-relay", 19510, 19511, mode="relay", seed=[n1.seed_addr])
     n3 = Node("node3-cli-wallet", 19520, 19521, mode="relay", seed=[n2.seed_addr])
     nodes = [n1, n2, n3]
@@ -289,7 +291,7 @@ def main():
 
         out, _, _ = cli(n1, ["estimate-fee", "2"])
         assert_contains(out, "Fee estimate", "estimate-fee output")
-        assert_contains(out, "Min fee", "estimate-fee output")
+        assert_contains(out, "Min relay fee", "estimate-fee output")
 
         print(
             "\n=== CLI Scenario 3: address generation/list/validation ===", flush=True

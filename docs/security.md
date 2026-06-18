@@ -15,7 +15,7 @@ These three properties together enable **FROST-GKR** (Frobenius Reduction Over S
 The engine operates at three verification levels:
 
 - **Transaction** — stateless ZK proof of ownership and balance; wallet-produced, valid until epoch anchor expires
-- **Block** — N transaction traces aggregated under one `InterleavedCommitment`, one FRI opening; state consistency proved by `BlockStateBindingAir`
+- **Block** — standard and sweep transactions are aggregated in shape-specific buckets; the canonical `BlockProof` binds all bucket proofs plus `BlockStateBindingAir`, which proves the state-root transition
 - **Chain** — 256-row recursive STARK accumulating the full chain into 6.5 KB, verifiable in ~5 ms
 
 **System soundness: ~120 bits**, bottlenecked by the FROST-GKR unified sumcheck (345/2¹²⁸). All other components are bounded by 2⁻¹²². Privacy reduces to 128-bit Poseidon2b preimage resistance.
@@ -45,9 +45,9 @@ The following construction choices deviate from a conventional FRI-STARK. Each h
 |----------|-------------------|--|
 | `RecursiveBlockAir`: `n_rounds = 0`, `folded_symbols` all-`None`, query loop vacuous | The committed polynomial has exactly 2⁸ = 256 entries — a multilinear polynomial is uniquely determined by its Boolean-hypercube evaluation table. FRI proximity testing is redundant; the tensor check is an exact evaluation. | **9.2** |
 | FROST-GKR unified sumcheck: round polynomial degree 9 (vs conventional degree 2–3) | Higher degree, fewer rounds. Total soundness error 345/2¹²⁸ is 37× lower than the legacy degree-2 decomposition (12,744/2¹²⁸). Schwartz-Zippel applies for any degree. | **5.3** |
-| Single `InterleavedCommitment` cap covers all N transaction traces in a block | One joint commitment binds the entire block simultaneously. Selective forgery of a single transaction requires forging the whole block cap. | **7.1** |
-| One FRI opening for the whole block (deferred aggregation) | A block-level multipoint sumcheck reduces all N terminal claims to a single evaluation point `r_block` before the FRI opening. Soundness does not degrade with N. | **7.2** |
-| `TxLogicAir` contains no state-root checks | `TxLogicAir` is intentionally stateless — it proves ownership and balance without knowledge of the chain state. `BlockStateBindingAir` proves state consistency; the C_claimed bridge binds the two. | **7.3** |
+| Per-bucket `InterleavedCommitment` caps cover all traces of each transaction shape | Standard and `Sweep25x2` transactions have different AIR shapes, so each non-empty bucket has its own joint commitment. Selective forgery inside a bucket requires forging that bucket's committed columns; the canonical `BlockProof` binds all buckets together. | **7.1** |
+| Per-bucket FRI opening with deferred aggregation | A bucket-level multipoint sumcheck reduces that bucket's terminal claims to one evaluation point before the FRI opening. Soundness does not degrade with the number of transactions in the bucket. | **7.2** |
+| Transaction AIRs contain no state-root checks | `TxLogicAir` and `SweepTxLogicAir` are intentionally stateless — they prove ownership and balance without knowledge of the chain state. `BlockStateBindingAir` proves state consistency; the claim bridge binds the layers. | **7.3** |
 | `spend_secret` absent from the Fiat-Shamir transcript | `absorb_public_boundary` accepts `&AuthPublicInputs`, a type that structurally cannot hold the secret. The verifier function `verify_auth_killshot` takes the same type. Exclusion is enforced by the Rust type system. | **10.1** |
 
 ---
@@ -85,10 +85,10 @@ flowchart TD
     end
 
     subgraph BLK["Block (stateful aggregation)"]
-        IC["InterleavedCommitment\nAll N tx traces, one Merkle cap"]
-        MS["Block multipoint sumcheck\nReduces N terminal claims → r_block"]
-        FRI1["Single FRI opening\nCloses all columns of all txs"]
-        BSB["BlockStateBindingAir\nSlot openings vs state MLE"]
+        STD["Standard bucket\nInterleavedCommitment + multipoint + FRI"]
+        SWP["Sweep25x2 bucket\nSweepBlockSpineProof + bucket FRI"]
+        BP["Canonical BlockProof\nBinds all non-empty buckets"]
+        BSB["BlockStateBindingAir\nPre-state → post-state root"]
     end
 
     subgraph REC["Chain (recursive)"]
@@ -100,12 +100,16 @@ flowchart TD
     W --> GKR_S
     GKR_S -->|tx_body_hash pinned| AIR1
     GKR_A -->|Address, AuthTag pinned| AIR1
-    AIR1 -->|C_claimed bridge| BSB
-    IC --> MS --> FRI1
-    BSB --> ACC --> RAIR
+    AIR1 -->|claim bridge| BSB
+    STD --> BP
+    SWP --> BP
+    BSB --> BP
+    BP --> ACC --> RAIR
 ```
 
-**Key architectural property — C_claimed bridge:** The `TxLogicAir` produces a commitment `C_claimed` over the slot indices and values it claims. `BlockStateBindingAir` takes `C_claimed` as a public input and verifies each claimed slot is consistent with the actual state MLE. Neither layer can lie about the state independently: `TxLogicAir` cannot touch the state (stateless), and `BlockStateBindingAir` cannot forge ownership (no secret).
+**Key architectural property — claim bridge:** The `TxLogicAir` / `SweepTxLogicAir` proofs produce commitments over the slot indices and values they claim. `BlockStateBindingAir` takes these claimed values as public inputs and verifies each claimed slot is consistent with the actual pre-state and post-state MLE openings. Neither layer can lie about the state independently: transaction AIRs cannot touch the chain state (stateless), and `BlockStateBindingAir` cannot forge ownership (no secret).
+
+**Production acceptance property:** A user-transaction block is valid only if the canonical `BlockProof` verifies completely: every non-empty standard/sweep bucket plus the common `BlockStateBindingAir`. The live node does not accept a user-transaction block by re-running a sequential state interpreter instead of the block proof.
 
 ---
 
@@ -196,17 +200,17 @@ GKR outputs pin into the STARK via `PublicColumn`: `tx_body_hash` via `TxBodyMer
 
 ### 7.1 Interleaved Commitment
 
-All N transaction traces share a **single** `InterleavedCommitment` (`noid_fri_binius/src/interleaved_commit.rs`): one Merkle cap covers all columns of all transactions simultaneously. The cap is absorbed into the Fiat-Shamir channel before any challenge, binding the prover to the entire block's trace at once.
+Within each non-empty transaction-shape bucket, all traces share one `InterleavedCommitment` (`noid_fri_binius/src/interleaved_commit.rs`): one Merkle cap covers all columns of all transactions of that shape simultaneously. The cap is absorbed into the Fiat-Shamir channel before any challenge, binding the prover to the whole bucket trace at once.
 
-This is the core of the aggregation security: there is no per-transaction commitment that could be selectively forged. An adversary must forge the entire block's committed columns or none.
+This is the core of the aggregation security: there is no per-transaction commitment that could be selectively forged inside a bucket. An adversary must forge the bucket's committed columns or none. The canonical `BlockProof` transcript then binds all non-empty buckets together with the common state-binding proof.
 
 ### 7.2 Deferred FRI Aggregation
 
-Instead of one FRI opening per transaction (which would scale as O(N × FRI_cost)), the block prover runs a **block-level multipoint sumcheck** that reduces all N transaction terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening (`verify_mixed_opening` in `noid_fri_binius/src/mixed_open.rs`) closes all columns of all transactions simultaneously.
+Instead of one FRI opening per transaction (which would scale as O(N × FRI_cost)), each bucket prover runs a **bucket-level multipoint sumcheck** that reduces that bucket's terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening (`verify_mixed_opening` in `noid_fri_binius/src/mixed_open.rs`) closes all columns of that bucket simultaneously.
 
-**Security argument (SC-2):** The multipoint sumcheck is a Schwartz-Zippel reduction. For N claims at N distinct points to all be simultaneously satisfiable with wrong committed values, an adversary would need to find a polynomial that disagrees with the committed columns yet satisfies every terminal claim. The probability is bounded by the sumcheck soundness over all N claims, which does not degrade with N because the claims are batched into a single evaluation via random linear combination. Soundness: 2⁻¹²⁸ from FRI (A5) + 2⁻¹²² from the multipoint sumcheck (A4).
+**Security argument (SC-2):** The multipoint sumcheck is a Schwartz-Zippel reduction. For N claims at N distinct points inside one bucket to all be simultaneously satisfiable with wrong committed values, an adversary would need to find a polynomial that disagrees with the committed columns yet satisfies every terminal claim. The probability is bounded by the sumcheck soundness over all N claims, which does not degrade with N because the claims are batched into a single evaluation via random linear combination. Soundness: 2⁻¹²⁸ from FRI (A5) + 2⁻¹²² from the multipoint sumcheck (A4).
 
-**Proof size scaling:** O(log N) in the FRI layer (one opening), O(N) in the algebraic layer (one round polynomial per transaction per sumcheck round). Block proof does not grow as O(N × per-tx FRI).
+**Proof size scaling:** O(log N) in the FRI layer per non-empty bucket, O(N) in the algebraic layer (one round polynomial per transaction per sumcheck round). Block proof does not grow as O(N × per-tx FRI).
 
 ### 7.2.1 Sweep25x2 bucket aggregation
 
@@ -220,11 +224,11 @@ Instead of one FRI opening per transaction (which would scale as O(N × FRI_cost
 
 Thus a forged sweep bucket must either break the wallet sweep logic proof, forge the AuthGKR-slice bridge, or satisfy an inconsistent bucket multipoint / mixed-opening transcript against the committed sweep columns. The same SC-2 bound applies: FRI soundness plus the bucket multipoint Schwartz-Zippel bound. Regression tests in `noid_block/tests/sweep_bucket.rs` cover tampering of `auth_slices`, `block_col_openings`, `block_initial_claim`, `mixed_opening`, tx index/shape, and spine inputs.
 
-### 7.3 C_claimed Bridge
+### 7.3 Claim Bridge
 
-`TxLogicAir` produces a polynomial commitment `C_claimed` over the slot indices and values each transaction claims as inputs/outputs. `BlockStateBindingAir` takes `C_claimed` as a public input and verifies these claimed values against the actual state MLE.
+`TxLogicAir` and `SweepTxLogicAir` produce claimed slot indices and values for transaction inputs/outputs. `BlockStateBindingAir` takes the aggregated claimed values as public inputs and verifies them against the actual state MLE.
 
-**Security of the bridge:** If a transaction claims to spend a slot with value v, but the actual state has value v' ≠ v, the `BlockStateBindingAir` delta-accumulator terminal constraint fails deterministically (not probabilistically — it is an equality check against verifier-supplied state MLE openings). The `TxLogicAir` cannot fabricate slot values because `C_claimed` is pinned into the block-level multipoint sumcheck via the interleaved commitment.
+**Security of the bridge:** If a transaction claims to spend a slot with value v, but the actual state has value v' ≠ v, the `BlockStateBindingAir` delta-accumulator terminal constraint fails deterministically (not probabilistically — it is an equality check against verifier-supplied state MLE openings). The transaction AIR cannot fabricate slot values because the claims are pinned into the corresponding bucket multipoint sumcheck via the bucket interleaved commitment.
 
 ---
 
@@ -234,7 +238,7 @@ Thus a forged sweep bucket must either break the wallet sweep logic proof, forge
 
 **Gamma-RLC terminal:** `acc_lane[n_slots−1] = expected_batched_claims[lane]`
 
-This pins the accumulated gamma-weighted pre-state openings (proven in-circuit) to the verifier-supplied batched claim derived from the `TxLogicAir` outputs. A prover cannot satisfy this constraint with slot values that differ from what the transactions claimed.
+This pins the accumulated gamma-weighted pre-state openings (proven in-circuit) to the verifier-supplied batched claim derived from the transaction AIR outputs. A prover cannot satisfy this constraint with slot values that differ from what the transactions claimed.
 
 **Delta-acc terminal:** `delta_acc_lane[n_slots−1] = prev_opening[lane] ⊕ new_opening[lane]`
 
@@ -242,7 +246,36 @@ This pins the net change in the state MLE (proven in-circuit) to the difference 
 
 Both terminal values are verifier-hardcoded. **A valid `BlockStateBindingAir` proof is a proof that the state root transition is correct** — given honest pre- and post-state MLE openings. The state roots come from PoW-bound block headers.
 
+For production user-transaction blocks, `BlockStateBindingAir` is mandatory. A block proof that contains bucket proofs but lacks the corresponding state-binding proof is incomplete and must be rejected.
+
 **Max constraint degree:** 3 (`TripleProductGate`, bare, `noid_air/src/gates/mul.rs`). Zero-check soundness: 11 rounds × degree-4 round polynomial / 2¹²⁸ = 44/2¹²⁸ ≈ 2⁻¹²³.
+
+### 8.1 Live Production Validation Path
+
+The live P2P/RPC/miner acceptance path is proof-native:
+
+1. bind proof bytes to the block header transcript;
+2. run cheap consensus checks (height, parent, timestamp, PoW/header fields, deterministic metadata);
+3. verify the full canonical `BlockProof` via `validate_block_from_network`, including every non-empty standard/sweep bucket and `BlockStateBindingAir`;
+4. commit only the proven state delta with `apply_state_delta`;
+5. write the block/header/state update atomically in `MdbxChainContext::apply_next_block`.
+
+`apply_block` and `validate_block_consensus` are sequential in-memory utilities for tests and local construction. They are not the live production acceptance rule for user-transaction blocks.
+
+Coinbase-only blocks are the only no-user-proof exception: there are no user slot claims to bind, so they use the canonical stub proof marker/header binding, cheap consensus checks, and deterministic coinbase `apply_state_delta` commit. This exception does not create a second validation scheme for user transactions.
+
+### 8.2 No-History Storage Security
+
+The node does not keep full raw history. Security is preserved by verifying before commit and by carrying old history forward in the recursive proof:
+
+- headers are retained long-term;
+- current state segments and roots are persisted;
+- recent raw blocks, block proofs, and undo logs are retained only for `FINALITY_DEPTH = 18` blocks;
+- nullifier and transaction-index data are retained for the anchor window (`ANCHOR_DEPTH = 144`);
+- history older than the recent window is represented by the recursive chain proof and header chain;
+- a peer that is more than the recent window behind must use snapshot sync, then verify the snapshot root/recursive proof before continuing block-by-block.
+
+Pruning old raw block/proof bytes after finality does not weaken block validity: the proof-native checks happened before the block was committed, and the recursive accumulator carries the verified chain claim forward.
 
 ---
 
@@ -463,9 +496,9 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 |--------|-----------------|
 | FROST-GKR degree-9 sumcheck | Schwartz-Zippel applies for any degree; total error 345/2¹²⁸ is lower than legacy 12,744/2¹²⁸ (§5.3) |
 | n_rounds=0 in RecursiveBlockAir | 2⁸-point polynomial is fully determined by its table; tensor check is exact, not approximate (§9.2) |
-| Single FRI opening for N txs | Interleaved commitment binds all traces at once; multipoint sumcheck batches all claims (§7.2) |
-| Stateless LogicProof | C_claimed bridge binds stateless ownership proof to stateful state binding (§7.3) |
-| `chain_claim=0` for coinbase | No slot openings to bind; state_root still verified against PoW header (§9.3) |
+| Per-bucket FRI opening for N same-shape txs | Bucket interleaved commitment binds all traces of that shape at once; multipoint sumcheck batches all bucket claims (§7.2) |
+| Stateless LogicProof | Claim bridge binds stateless ownership proof to stateful `BlockStateBindingAir` (§7.3) |
+| Coinbase-only stub proof | No user slot openings exist, so no `BlockStateBindingAir` is required; the canonical stub marker is header-bound and the deterministic coinbase delta is checked before `apply_state_delta` (§8.1, §9.3) |
 | ~120-bit system soundness | Bottleneck is GKR, which exceeds the 100-bit production threshold and is 37× better than legacy |
 
 ---
@@ -479,12 +512,16 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 | `LOG_RATE` | 2 (ρ = 1/4) | `noid_fri/src/code.rs` |
 | `MERKLE_CAP_DEPTH` | 5 | `noid_fri_binius/src/lib.rs` |
 | `N_SPINE_SLOTS` | 59 | `noid_gkr/src/spine_sumcheck.rs` |
-| `N_AUTH_SLOTS` | 20 (5 × MAX_INPUTS) | `noid_gkr/src/auth_circuit.rs` |
+| `N_AUTH_SLOTS` | 20 (`Standard4x8`, 5 × 4 inputs) | `noid_gkr/src/auth_circuit.rs` |
+| `N_SWEEP_AUTH_SLOTS` | 125 (`Sweep25x2`, 5 × 25 inputs) | `noid_gkr/src/auth_circuit_sweep.rs` |
 | `N_SPINE_UNIFIED_VARS` | 15 | `noid_gkr/src/spine_mle.rs` |
 | `N_AUTH_UNIFIED_VARS` | 14 | `noid_gkr/src/auth_mle_v2.rs` |
 | `SPINE_UNIFIED_ROUND_DEGREE` | 9 | `noid_gkr/src/spine_unified.rs` |
 | `LOG_ROWS` (Recursive) | 8 | `noid_recursive/src/air.rs` |
 | `SPINE_LOG_ROWS` | 11 | `noid_air/src/airs/tx_body_spine.rs` |
+| `FINALITY_DEPTH` | 18 | `noid_chain/src/consensus/params.rs` |
+| `UNDO_LOG_RETENTION` | 18 | `noid_chain/src/consensus/params.rs` |
+| `ANCHOR_DEPTH` | 144 | `noid_chain/src/consensus/params.rs` |
 
 | Function / Type | File | Role |
 |----------------|------|------|
@@ -497,15 +534,21 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 | `verify_algebraic_inner` | `noid_stark/src/interleaved.rs` | Zero-check + extra_transcript |
 | `absorb_cap` | `noid_stark/src/interleaved.rs` | Cap first in FS channel |
 | `commit_interleaved` | `noid_fri_binius/src/interleaved_commit.rs` | Block-level joint commitment |
-| `verify_mixed_opening` | `noid_fri_binius/src/mixed_open.rs` | Single FRI opening for all txs |
+| `verify_mixed_opening` | `noid_fri_binius/src/mixed_open.rs` | Per-bucket FRI mixed opening |
 | `compact_fri_verify` | `noid_fri_binius/src/compact_fri.rs` | Tensor PCS at n_rounds=0 |
-| `BlockStateBindingAir` | `noid_air/src/airs/block_state_binding.rs` | State transition proof |
+| `BlockProof` | `noid_block/src/lib.rs` | Canonical production block proof envelope |
+| `validate_block_from_network` | `noid_block/src/validate.rs` | Live full block-proof validator |
+| `validate_block_full` | `noid_block/src/validate.rs` | Internal full proof verification core used by `validate_block_from_network` |
+| `MdbxChainContext::apply_next_block` | `noid_chain/src/storage/mdbx_context.rs` | Atomic proof-native block application |
+| `apply_state_delta` | `noid_chain/src/block.rs` | Proven state-delta commit primitive |
+| `BlockStateBindingAir` | `noid_air/src/airs/block_state_binding.rs` | Mandatory user-tx state transition proof |
 | `RecursiveBlockAir::from_prev_state_root` | `noid_recursive/src/air.rs` | State-root pin from PoW header |
 | `ChainAccumulator::extend` | `noid_recursive/src/accumulator.rs` | Chain hash fold |
 | `verify_recursive_step`, `verify_tip` | `noid_recursive/src/verify.rs` | Recursive verifier |
+| `SweepBlockSpineProof` | `noid_gkr/src/block_spine_sweep.rs` | Sweep25x2 block-side spine aggregation |
 | `TxInput::encode_public` | `noid_tx/src/wire.rs` | Secret excluded from wire |
 | `spend_secret_absent_from_wire` | `noid_tx/src/intent.rs` | Wire exclusion test |
 
 ---
 
-*All security arguments in this document reduce to the assumptions in §2 and are grounded in the production code. Cryptographic protocol detail: `docs/cryptography.md`. System architecture: `docs/protocol.md`.*
+*All security arguments in this document reduce to the assumptions in §2 and are grounded in the production code. Cryptographic protocol detail: `docs/cryptography.md`. System and network/storage architecture: `docs/protocol.md`, `docs/network.md`.*

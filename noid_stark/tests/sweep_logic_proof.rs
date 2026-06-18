@@ -163,7 +163,7 @@ fn sweep_balance_interleaved_with_long_extra_proves() {
 fn prove_verify_sweep_logic(
     n_live_inputs: usize,
 ) -> (
-    noid_air::airs::Sweep25x2BalanceGateAir,
+    noid_air::composition::SweepTxLogicAir,
     PublicInputs,
     noid_gkr::SweepSpineInputs,
     noid_gkr::SweepAuthPublicInputs,
@@ -179,7 +179,6 @@ fn prove_verify_sweep_logic(
         trace: &trace,
         pi: &pi,
         auth_inputs: &auth_inputs,
-        spine_inputs: &spine_inputs,
     };
     let proof = prove_sweep_logic(&witness).expect("prove sweep logic");
     assert!(proof.n_boundary_slices > 0);
@@ -199,7 +198,7 @@ fn sweep_logic_proves_and_verifies_5_live_inputs() {
     assert!(verify_sweep_logic(&air, &wrong_shape, &spine_inputs, &auth_public, &proof).is_err());
 
     let mut wrong_spine = spine_inputs.clone();
-    wrong_spine.output_leaves[1][1] += noid_core::Block128::ONE;
+    wrong_spine.input_leaves[1][2] += noid_core::Block128::ONE;
     assert!(verify_sweep_logic(&air, &pi, &wrong_spine, &auth_public, &proof).is_err());
 
     let mut wrong_auth_public = auth_public;

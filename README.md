@@ -14,14 +14,12 @@ In Paranoid, validity is established once, locally, by the party with the most i
 
 ---
 
-*All timing figures measured on an Intel Core i7-1365U (laptop 10 cores, 2023).*
-
 ## The Fundamental Shift
 
 | | Traditional Chain | Paranoid |
 |---|---|---|
 | Validation model | Re-execute everywhere | Verify proof once |
-| Full sync | Replay N GB of history | State snapshot + 6.5 KB proof, ~5 ms |
+| Full sync | Replay N GB of history | State snapshot + 6.5 KB proof, ~5 ms (laptop) |
 | History required to validate | Yes. From genesis | No |
 | Signatures | ECDSA / EdDSA | None. Hash-preimage ownership proof |
 | Quantum safety | No (discrete log problem) | Yes. Hash-only primitives |
@@ -37,23 +35,22 @@ A 51% miner in Paranoid can only choose the ordering of valid transitions. They 
 
 ### Execution is Local
 
-When you send NOID, your wallet builds a **LogicProof**. A ~26 KB STARK that proves:
+When you send NOID, your wallet builds a stateless **LogicProof** that proves:
 - You know the secret behind the input address (`Address = Poseidon2b(spend_secret)`)
 - Inputs equal outputs plus fee
 - All values are in range
 - The transaction body is cryptographically bound
 
-This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~36 minutes). You prove it once, on your device, ~135 ms for 4 inputs/8 outputs tx
+This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~36 minutes). You prove it once, on your device.
 
 ### The Network Verifies, Not Executes
 
-Every full node independently verifies the validity proof of each block it receives. A `BlockProof` covers:
-- All per-transaction LogicProofs (via interleaved STARK aggregation)
-- State binding: that input slots held the claimed values and output slots were empty
-- Correct computation of the new `state_root`
-- A single unified FRI opening over all columns of all transactions
+Every full node independently verifies the validity proof of each user-transaction block it receives. A canonical `BlockProof` covers:
+- All per-transaction LogicProofs, aggregated in shape-specific buckets (`Standard4x8`, `Sweep25x2`)
+- Mandatory `BlockStateBindingAir`: input slots held the claimed values, output slots were empty, and the post-block `state_root` follows from the proven delta
+- Per-bucket FRI openings for non-empty transaction-shape buckets, all bound into one block proof transcript
 
-The full node never re-runs the wallet logic. It verifies the proof that the wallet already produced.
+The full node never re-runs the wallet logic as a production acceptance rule. It verifies the proof, then commits only the proven state delta.
 
 ### History Collapses Recursively
 
@@ -70,7 +67,7 @@ chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
    one per 65,536 UTXOs; scales with UTXO set size)
 2. The **RecursiveProof** (6.5 KB)
-3. Calls `verify_tip()` → cryptographic certainty over the full history in ~5 ms
+3. Calls `verify_tip()` → cryptographic certainty over the full history in ~5 ms (laptop)
 
 No genesis replay. No archive nodes. No trust assumption.
 
@@ -91,7 +88,7 @@ Poseidon2b is a native GF(2^128) permutation: S-box is `x^7 = x · x² · x⁴` 
 The PCS is **FRI-Binius** — Reed-Solomon over binary towers with compact interleaved FRI. Key properties:
 
 - **COMPACT_TAU = 8** with `log_rows = 8`: the recursive RecursiveBlockAir has exactly **zero FRI Merkle paths**. The recursive proof is pure sumcheck algebra.
-- **Interleaved commitment**: all columns across all transactions in a block are committed jointly in a single Merkle cap. One FRI opening covers all of them (the `mixed_multipoint_close`).
+- **Interleaved commitment**: all columns for same-shape transactions in a non-empty block bucket are committed jointly in one Merkle cap. Each non-empty bucket has its own mixed FRI opening; the canonical `BlockProof` binds all buckets plus `BlockStateBindingAir`.
 - **Segmented state PCS**: the UTXO state is divided into independent 2^16-slot segments, each with its own FRI commitment. Only dirty segments are re-committed per block.
 
 ### FROST-GKR Kill-Shot
@@ -123,8 +120,8 @@ The result is a single Kill-Shot proof per GKR instance:
 | Full GKR verifier time\* | 1.06 s | **69 ms** |
 | **Speedup** | — | **10.6× faster · 141× fewer rounds** |
 
-\*Full GKR layer = SpineGKR (59 perms, block-side) + AuthGKR (20 perms, wallet-side).
-The wallet `prove_logic` alone (AuthGKR + TxLogicAir STARK) runs in **~135 ms**.
+\*Measured on an Intel Core i7-1365U laptop. Full GKR layer = SpineGKR (59 perms, block-side) + AuthGKR (20 perms, wallet-side).  
+The wallet `prove_logic` path (AuthGKR + TxLogicAir STARK) runs in **~135 ms** on the same laptop.
 
 **Two Kill-Shot instances per transaction:**
 - **SpineGKR** (59 permutations) — computes `tx_body_hash` from the full transaction body. Binds every field of every input and output into a single 32-byte hash that the STARK pins.
@@ -136,35 +133,34 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  RecursiveProof  ·  6.5 KB  ·  O(1) verify  ·  ~5 ms       │
+│  RecursiveProof  ·  6.5 KB  ·  O(1) verify · ~5 ms (laptop) │
 │  RecursiveBlockAir: 8×8-row trace, COMPACT_TAU=8            │
 │  Proves: accumulator continuity from genesis to h=N         │
 └──────────────────────┬──────────────────────────────────────┘
                        │ each step wraps ↓
 ┌──────────────────────▼──────────────────────────────────────┐
-│  BlockProof  ·  ~20 KB per tx  ·  O(txs) verify            │
-│  = N × TxLogicAir STARKs (algebraic, no FRI per tx)        │
-│  + SpineGKR Kill-Shot (unified over all txs in block)       │
-│  + N × AuthGKR Kill-Shot (per-tx ownership)                 │
-│  + BlockStateBindingAir (slot state transitions, per seg)   │
-│  + single mixed FRI opening (all columns, all txs)          │
+│  BlockProof  ·  O(txs) verify                               │
+│  = Standard/Sweep shape buckets for tx logic aggregation    │
+│  + SpineGKR/AuthGKR binding for each included transaction   │
+│  + mandatory BlockStateBindingAir for user-tx blocks        │
+│  + per-bucket mixed FRI openings                            │
 └──────────────────────┬──────────────────────────────────────┘
                        │ wallet produces ↓
 ┌──────────────────────▼──────────────────────────────────────┐
-│  LogicProof  ·  ~26 KB  ·  stateless  ·  ~135 ms prove     │
+│  LogicProof  ·  stateless                                   │
 │  TxLogicAir: balance + range + ownership binding            │
 │  AuthGKR Kill-Shot: proof-of-knowledge of spending secret preimage │
 │  Stateless: no Merkle paths, no state_root dependency       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Stateless / stateful proof separation:** The LogicProof is created by the wallet — the only party that knows the spending secret. It is stateless and valid until the epoch anchor expires. The BlockStateBinding is created by the block producer from the public transaction body: it proves that the claimed slot values are consistent with the actual FRI state root. The `C_claimed` bridge commits the LogicProof's slot claims to the BlockStateBinding's slot openings, so neither layer can lie about the state.
+**Stateless / stateful proof separation:** The LogicProof is created by the wallet — the only party that knows the spending secret. It is stateless and valid until the epoch anchor expires. `BlockStateBindingAir` is created by the block producer from the public transaction bodies and current state openings: it proves that all claimed slot values are consistent with the pre-state root and that the post-state root follows from the block delta. The claim bridge binds transaction bucket claims to the state-binding openings, so neither layer can lie independently.
 
 ### Deferred FRI Aggregation
 
-All per-transaction STARK traces share a single Merkle commitment (the `InterleavedCommitment`). Instead of per-tx FRI openings, the block prover runs a **block-level multipoint sumcheck** that reduces all terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening closes everything simultaneously.
+All same-shape transaction STARK traces inside a bucket share one Merkle commitment (`InterleavedCommitment`). Instead of per-tx FRI openings, each non-empty bucket runs a **multipoint sumcheck** that reduces that bucket's terminal claims to one evaluation point `r_block`. One FRI-Binius mixed opening closes that bucket.
 
-Block proof size scales as `O(log N)` in the FRI layer and `O(N)` in the algebraic layer — not `O(N × per-tx FRI)`.
+Block proof size scales as `O(log N)` in the FRI layer per non-empty bucket and `O(N)` in the algebraic layer — not `O(N × per-tx FRI)`.
 
 ---
 
@@ -241,9 +237,9 @@ cells — hardware that does not exist and may never be physically realizable at
 
 PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence of valid state transitions. Block validity is already established by the proof system.
 
-**Algorithm:** Blake3 over the 276-byte block header. 128-bit nonce. CPU-friendly (~1 GH/s on any laptop), nanosecond verification.
+**Algorithm:** Blake3 over the 276-byte block header. 128-bit nonce. CPU-friendly and cheap to verify.
 
-**Why Blake3:** block withholding protection is built into the proof structure. The coinbase address is bound inside `witness_root → proof_transcript_hash → BlockProof`. An external miner cannot substitute their payout address without regenerating the entire block proof (multi-second CPU operation — longer than the PoW at genesis difficulty).
+**Why Blake3:** block withholding protection is built into the proof structure. The coinbase address is bound inside `witness_root → proof_transcript_hash → BlockProof`. An external miner cannot substitute their payout address without regenerating the entire block proof before PoW search can be valid.
 
 **Difficulty:** ASERT algorithm (Bitcoin Cash variant), 6-block epoch, 90-second halflife. Responds to any hashrate change within ~7 minutes. Floor: difficulty never eases below genesis target — ASERT can only move harder.
 
@@ -307,13 +303,11 @@ and BlockProofs are pruned. Only block **headers** (276 bytes each) are kept per
 | Data | Size |
 |---|---|
 | Block bytes | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~192 KB (256 txs) |
-| BlockProofs | 0 (coinbase-only) – ~5 MB per block at max capacity (256 txs) |
+| BlockProofs | 0 (coinbase-only); user-tx proof size depends on shape mix and tx count |
 | Undo logs | ~few KB per block |
 | Nullifier window | ~few KB (last 144 blocks) |
 
-At any given time the node holds at most 18 blocks' worth of block data + BlockProofs.
-A network at full capacity (256 txs/block) peaks at ~18 × 5.2 MB ≈ 94 MB of temporary
-storage before pruning (192 KB block + ~5 MB BlockProof per block).
+At any given time the node holds at most 18 blocks' worth of block data + BlockProofs. These bytes are temporary reorg/sync data, not permanent history. Exact proof sizes are shape- and optimization-dependent and will be republished after the proof-native optimization pass.
 
 | RAM | ~60–120 MB (jemalloc, small-state node) |
 
@@ -321,34 +315,11 @@ storage before pruning (192 KB block + ~5 MB BlockProof per block).
 
 ## Performance
 
-**Per transaction (wallet, 2 inputs / 4 outputs):**
-
-| Metric | Value |
-|---|---|
-| Wallet prove time | ~134 ms |
-| Mempool verify time | ~77 ms |
-| LogicProof size | ~26.3 KB |
-| — STARK component | ~21.2 KB (81%) |
-| — AuthGKR Kill-Shot | ~5.1 KB (19%) |
-
-Proof size is **constant** regardless of input/output count (always 4 inputs, 8 outputs in the circuit; unused input/output positions are padded with dummy witnesses).
-
-**Block production (laptop i7-1365U, 10 threads):**
-
-| Block | Prove time | Verify time | BlockProof size |
-|---|---|---|---|
-| 10 txs | ~880 ms | ~294 ms | ~213 KB |
-| 20 txs | ~1.7 s | ~546 ms | ~410 KB |
-| 100 txs | ~7.9 s | ~2.5 s | ~1.9 MB |
-| 256 txs (max) | ~20 s | ~6.4 s | ~5 MB |
+...
 
 PoW search and ZK proving run **in parallel**. BlockProof bytes are stored only for the **last 18 blocks** (reorg window), then pruned.
 
-The ~5 MB full-block proof does not accumulate on disk. What persists forever is the
-**RecursiveProof** (6.5 KB) — a single entry that is overwritten with each advance and
-proves the entire chain history from genesis.
-
-**Recursive proof:** ~2 s to prove one step (laptop i7-1365U), **~5 ms to verify the entire chain**.
+Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (6.5 KB) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
 
 ---
 
@@ -408,7 +379,7 @@ noid-extminer --rpc http://pool.example.com:9401 \
 Relay node syncs automatically on first start:
 1. Connects to peers
 2. Downloads the current state snapshot and RecursiveProof
-3. Verifies the proof cryptographically (O(1), ~5 ms)
+3. Verifies the proof cryptographically (O(1), ~5 ms (laptop))
 4. Applies the snapshot and begins receiving new blocks
 
 No history download. No archive dependency.
@@ -458,7 +429,7 @@ noid-cli stop            # graceful shutdown
 
 Connect to `http://127.0.0.1:9401` by default. Override with `--rpc <url>`.
 
-**Fee formula:** `base + io_fee × (inputs + outputs) + state_growth_fee × max(0, outputs - inputs)`. The state-growth component scales with occupancy and is burned; `--fee 0` auto-computes the current minimum.  
+**Fee formula:** `base + input_fee × inputs + output_fee × outputs + state_growth_fee × max(0, outputs - inputs)`. The state-growth component scales with occupancy and is burned; `--fee 0` auto-computes the current minimum.  
 **1 NOID = 1,000,000 μNOID.**  
 **Addresses:** bech32m, prefix `noid1`.
 

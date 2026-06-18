@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Full block validation: consensus checks + ZK proof verification.
+//! Full proof-native block validation.
 //!
-//! `validate_block_full` is the complete validation pipeline for a full
-//! node receiving a block from the network:
+//! `validate_block_full` is the complete user-transaction validation pipeline
+//! for a full node receiving a block from the network:
 //!
-//! 1. `validate_block_consensus()` — all native checks (O(txs))
-//! 2. `verify_block()` — ZK proof verification (O(txs × ~84ms))
+//! 1. `validate_block_checks()` — cheap header/PoW/nullifier/fee checks.
+//! 2. Verify the canonical `BlockProof`, including bucket proofs and
+//!    `BlockStateBindingAir` state-root transition proofs.
+//! 3. `apply_state_delta()` — commit the already-proven state delta without
+//!    running native `apply_block` as a second validity source.
 //!
 //! # SpineInputs / AuthPublicInputs reconstruction
 //!
@@ -28,7 +31,7 @@
 //! The `spend_secret` (private key) is NEVER transmitted, NEVER accessed
 //! here, and NEVER needed for verification.
 
-use noid_air::composition::sweep25x2_balance_witness_from_body;
+use noid_air::composition::sweep_logic_air_and_trace_from_body;
 use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
 use noid_air::Air;
 use noid_chain::block::{apply_state_delta, Block};
@@ -46,7 +49,7 @@ use crate::{
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_gkr::{AuthPublicInputs, SpineInputs};
 use noid_stark::prove_logic_sweep::{
-    sweep_spine_inputs_from_body, verify_sweep_logic, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
+    sweep_spine_inputs_from_body, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
 };
 use noid_tx::TxShape;
 
@@ -88,14 +91,16 @@ impl std::error::Error for FullValidationError {}
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Full block validation: native consensus + ZK proof verification.
+/// Full proof-native block validation.
 ///
 /// Steps (ordered cheapest-first):
-/// 1. `validate_block_consensus()` — all native checks
-/// 2. `verify_block()` — ZK proof verification
+/// 1. `validate_block_checks()` — cheap consensus checks that do not mutate state.
+/// 2. Full `BlockProof` verification, including standard/sweep bucket proofs and
+///    `BlockStateBindingAir` for every dirty segment.
+/// 3. `apply_state_delta()` — apply the proven delta to the mutable chain state.
 ///
 /// On success, `state` is updated to the post-block UTXO state.
-/// On failure, `state` is left unchanged.
+/// On failure, callers restore the pre-validation state snapshot.
 ///
 /// # Callers must provide
 ///
@@ -166,9 +171,9 @@ pub fn validate_block_full(
         verify_sweep_bucket_from_block(block, proof).map_err(FullValidationError::ZkProof)?;
     }
 
-    // ZK proof verification for the current standard bucket path. Mixed blocks
-    // verify sweep wallet proofs above and state-binding through the standard
-    // bucket commitment.
+    // Verify the full proof. Standard and mixed blocks use the shared block
+    // verifier; sweep-only blocks verify their bucket plus standalone state
+    // binding proofs.
     if proof.standard_bucket.is_some() {
         let tx_airs: Vec<TxLogicAir> = block
             .transactions
@@ -349,9 +354,10 @@ pub fn validate_block_bucket_tx_indices(
                 || bucket.tx_pis.len() != expected_sweep.len()
                 || bucket.auth_public.len() != expected_sweep.len()
                 || bucket.auth_slices.len() != expected_sweep.len()
+                || bucket.tx_auth_proofs.len() != expected_sweep.len()
                 || bucket.spine_inputs.len() != expected_sweep.len()
-                || bucket.logic_proofs.len() != expected_sweep.len()
                 || bucket.meta.n_boundary_slices_per_tx as usize != N_SWEEP_AUTH_SLICES
+                || bucket.meta.n_block_spine_slices == 0
             {
                 return Err(crate::VerifyBlockError::ShapeMismatch);
             }
@@ -412,17 +418,7 @@ pub fn verify_sweep_bucket_from_block(
             return Err(crate::VerifyBlockError::ShapeMismatch);
         }
 
-        let balance = sweep25x2_balance_witness_from_body(&tx.body);
-        let (air, _trace) = balance
-            .build_air_and_trace_with_log_rows(noid_air::airs::tx_body_spine::SPINE_LOG_ROWS);
-        verify_sweep_logic(
-            &air,
-            &bucket.tx_pis[k],
-            &bucket.spine_inputs[k],
-            &bucket.auth_public[k],
-            &bucket.logic_proofs[k],
-        )
-        .map_err(|_| crate::VerifyBlockError::SweepLogic(k))?;
+        let (air, _trace) = sweep_logic_air_and_trace_from_body(&tx.body);
         sweep_airs.push(air);
     }
 

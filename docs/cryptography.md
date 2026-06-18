@@ -131,9 +131,11 @@ Implementation: `noid_poseidon2b/src/native/compression.rs`.
 
 FROST-GKR (Frobenius Reduction Over Shifted Tables) proves batched Poseidon2b permutations via a single unified degree-7 sumcheck. It replaces 472 degree-2 sumchecks with 2 sumchecks (unified + shift), achieving 141× fewer Fiat-Shamir rounds.
 
-Two instances:
+Standard instances:
 - **Spine:** 59 permutation slots, 15-variable hypercube (2^15 = 32,768 cells)
 - **Auth:** 20 permutation slots, 14-variable hypercube (2^14 = 16,384 cells)
+
+`Sweep25x2` reuses the same construction with a wider auth surface: 125 auth permutation slots for up to 25 live inputs, plus a distinct sweep tx-body spine layout.
 
 ### 3.2 MLE Layout
 
@@ -411,9 +413,9 @@ Implementation: `noid_fri_binius/src/compact_fri.rs`.
 
 ### 4.6 Interleaved Commitment (Block-Level)
 
-For N transactions in a block, all trace columns are committed under a single interleaved Merkle cap. One FRI opening closes all columns simultaneously via a multipoint sumcheck that reduces N terminal claims to one evaluation point.
+For N same-shape transactions inside one block bucket, all trace columns are committed under one interleaved Merkle cap. One FRI mixed opening closes that bucket's columns via a multipoint sumcheck that reduces the bucket's N terminal claims to one evaluation point. Standard and `Sweep25x2` transactions use separate non-empty buckets because their AIR shapes differ; the canonical `BlockProof` binds the bucket proofs together with `BlockStateBindingAir`.
 
-Implementation: `noid_fri_binius/src/interleaved_commit.rs`, `noid_fri_binius/src/mixed_open.rs`.
+Implementation: `noid_fri_binius/src/interleaved_commit.rs`, `noid_fri_binius/src/mixed_open.rs`, `noid_block/src/lib.rs`.
 
 ---
 
@@ -474,24 +476,24 @@ This check is deterministic (ε = 0), not probabilistic.
 | Parameter | Value |
 |-----------|-------|
 | Rows | 256 (2^8) |
-| Columns | 8 |
-| Max degree | 3 |
+| Columns | 10 |
+| Max degree | 4 |
 | n_rounds (FRI) | 0 |
 
 **Constraints:**
 
-1. **ClaimInCheckGate** (rows 0–29): `claim_in + p0 + p1 = 0`
+1. **ClaimInCheckGate**: `claim_in + p0 + p1 = 0`
    - Rows 0–10: primary block bucket multipoint sumcheck (11 variables)
    - Rows 11–21: secondary block bucket multipoint sumcheck (all-zero for single-shape blocks)
-   - Rows 22–29: previous recursive proof sumcheck (8 variables; recursive STARK log rows)
+   - Rows 22–32: previous recursive proof sumcheck
 
-2. **FoldCheckGate** (rows 0–29): `claim_out + Lagrange([p0,p1,p2], r) = 0`
+2. **FoldCheckGate**: `claim_out + Lagrange([p0,p1,p2], r) = 0`
    - Rows 0–10: primary block bucket degree-2 multipoint sumcheck
    - Rows 11–21: secondary block bucket degree-2 multipoint sumcheck
-   - Rows 22–29: previous recursive proof degree-2 sumcheck
+   - Rows 22–32: previous recursive proof degree-2 sumcheck
    - `p0,p1,p2` are the round polynomial evaluations at `X = 0,1,2`; `r` is the real Fiat-Shamir challenge replayed from the bucket/recursive transcript.
 
-3. **State-root pins** (row 30): `COL_P0 = sr_hi`, `COL_P1 = sr_lo`
+3. **State-root pins** (row 33): `COL_P0 = sr_hi`, `COL_P1 = sr_lo`
    - Values from externally-verified block header (verifier-hardcoded)
 
 ### 6.2 Tensor PCS at n_rounds = 0
@@ -510,7 +512,7 @@ assert derived == eval
 **Theorem 7 (RecursiveBlockAir Soundness).** Under A3, A4, the recursive AIR STARK has soundness:
 
 ```
-ε_rec ≤ (d_max + n_cols + 1) / 2^128 = (3 + 8 + 1) / 2^128 = 12/2^128 ≈ 2^{-124}
+ε_rec ≤ (d_max + n_cols + 1) / 2^128 = (4 + 10 + 1) / 2^128 = 15/2^128 ≪ 2^{-120}
 ```
 
 *Proof.* See Security Model §9.2 for the full three-condition proof (public column determinism, witness constraint via Schwartz-Zippel, opening consistency via multipoint sumcheck). □
@@ -534,12 +536,14 @@ Implementation: `noid_recursive/src/accumulator.rs`.
 
 | Component | Size | Notes |
 |-----------|------|-------|
-| SpineGKR Kill-Shot | ~7.8 KB | Unified block-side spine proof at 100 txs |
-| AuthGKR Kill-Shot | ~5.1 KB | 14 round polys + shift + 3× batch-eval |
-| TxLogicAir STARK | ~21.2 KB | Zero-check + FRI opening |
-| Per-tx total (LogicProof) | ~26.3 KB | GKR + STARK + FRI |
-| BlockProof (100 txs) | ~1.9 MB | Interleaved, one FRI opening |
-| BlockProof (256 txs) | ~5 MB | Interleaved, one FRI opening |
+| Standard SpineGKR Kill-Shot | ~7.8 KB | Unified block-side spine proof at 100 txs |
+| Standard AuthGKR Kill-Shot | ~5.1 KB | 14 round polys + shift + 3× batch-eval |
+| Standard TxLogicAir STARK | ~21.2 KB | Zero-check + FRI opening |
+| Standard LogicProof | ~26.3 KB | Wallet proof, stateless |
+| Standard BlockProof (10 txs) | ~511 KB | Production proof-native path, includes `BlockStateBindingAir` |
+| Standard BlockProof (20 txs) | ~805 KB | Production proof-native path, includes `BlockStateBindingAir` |
+| Standard BlockProof (100 txs) | ~3.57 MB | Production proof-native path, includes `BlockStateBindingAir` |
+| Sweep-heavy BlockProof | shape-dependent, larger | Wider AuthGKR slice data dominates current sweep proofs |
 | RecursiveProof | ~6.5 KB | 256-row AIR, tensor PCS only |
 
 ---
@@ -663,7 +667,7 @@ No module in the system constructs a parallel channel. The boundary-MLE FRI open
 | `compact_fri_prove` | `noid_fri_binius/src/compact_fri.rs` | Compact FRI (production) |
 | `compact_fri_verify` | `noid_fri_binius/src/compact_fri.rs` | Compact FRI verifier |
 | `commit_interleaved` | `noid_fri_binius/src/interleaved_commit.rs` | Block-level joint commitment |
-| `verify_mixed_opening` | `noid_fri_binius/src/mixed_open.rs` | Single FRI opening for N txs |
+| `verify_mixed_opening` | `noid_fri_binius/src/mixed_open.rs` | Per-bucket FRI mixed opening for N same-shape txs |
 | `verify_air_interleaved` | `noid_stark/src/interleaved.rs` | STARK verifier |
 | `RecursiveBlockAir` | `noid_recursive/src/air.rs` | 256-row recursive AIR |
 | `ChainAccumulator::extend` | `noid_recursive/src/accumulator.rs` | Chain hash fold |

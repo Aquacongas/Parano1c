@@ -8,16 +8,16 @@
 //! Summarizes real production proof paths for:
 //! - wallet `Standard4x8` proofs;
 //! - wallet `Sweep25x2` proofs;
-//! - standard block bucket;
-//! - sweep bucket aggregation;
-//! - mixed bucket composition.
+//! - full standard/sweep/mixed `BlockProof` construction and verification;
+//! - state-binding byte contribution;
+//! - recursive updates over those same full block proofs.
 
 use bench_prover::{
-    bench_recursive_step, bench_standard_block_with_total, bench_sweep_bucket,
-    consolidation_scenario, fmt_bytes, fmt_ms, live_counts, mixed_block_proof, owned_sweep_witness,
+    bench_full_block_proof, bench_recursive_step, bench_standard_block, bench_sweep_bucket,
+    consolidation_scenario, fmt_bytes, fmt_ms, live_counts, owned_sweep_witness,
     proof_size_standard, proof_size_sweep, prove_standard_wallet, prove_sweep_wallet,
-    standard_block_proof_with_total, standard_fixture, standard_scenario, sweep_fixture,
-    sweep_only_block_proof, sweep_scenario, RecursiveStepBench, StandardFixture, SweepFixture,
+    standard_fixture, standard_scenario, sweep_fixture, sweep_scenario, RecursiveStepBench,
+    StandardFixture, SweepFixture,
 };
 use noid_block::OwnedSweepTxWitness;
 
@@ -29,7 +29,7 @@ fn print_banner() {
     println!("  ======================================================================");
     println!("  PARANOID — Mixed Shape STARK/GKR Report");
     println!("  ======================================================================");
-    println!("  Real proof paths only: wallet proofs, bucket aggregation, block verify.");
+    println!("  Wallet proofs, bucket components, full block proofs, recursive update.");
     println!("  Standard samples: {STANDARD_SAMPLES}; Sweep samples: {SWEEP_SAMPLES}");
     println!();
 }
@@ -62,7 +62,10 @@ fn print_wallet_sweep(f: &SweepFixture) -> bench_prover::SweepWalletBench {
     println!("    proof:         {}", fmt_bytes(total));
     println!("      STARK:       {}", fmt_bytes(stark));
     println!("      AuthGKR:     {}", fmt_bytes(auth));
-    println!("      SpineGKR:    {}", fmt_bytes(spine));
+    println!(
+        "      Wallet spine: {} (removed; block spine measured below)",
+        fmt_bytes(spine)
+    );
     println!();
     r
 }
@@ -117,7 +120,7 @@ fn main() {
     let sweep_consolidate_r = print_wallet_sweep(&sweep_consolidate);
 
     println!("  ----------------------------------------------------------------------");
-    println!("  Layer 2: bucket/block aggregation");
+    println!("  Layer 2: bucket components and full block proofs");
     println!("  ----------------------------------------------------------------------");
 
     let standard_block = vec![
@@ -126,19 +129,50 @@ fn main() {
         standard_fixture(standard_scenario("std-b2", 2, 2, 10_200, 0x30)),
         standard_fixture(standard_scenario("std-b3", 4, 8, 10_300, 0x40)),
     ];
-    eprintln!("  report: standard block bucket N=4");
-    let std_block_r = bench_standard_block_with_total(&standard_block, 4);
-    println!("  [Standard block bucket: 4 tx]");
+    eprintln!("  report: standard bucket component N=4");
+    let std_bucket_r = bench_standard_block(&standard_block);
+    println!("  [Standard bucket component: 4 tx]");
+    println!("    prove:         {}", fmt_ms(std_bucket_r.prove_time));
+    println!("    verify:        {}", fmt_ms(std_bucket_r.verify_time));
+    println!("    proof:         {}", fmt_bytes(std_bucket_r.proof_bytes));
+    println!(
+        "      bucket:      {}",
+        fmt_bytes(std_bucket_r.standard_bucket_bytes)
+    );
+    println!(
+        "      spine:       {}",
+        fmt_bytes(std_bucket_r.unified_spine_bytes)
+    );
+    println!();
+
+    eprintln!("  report: standard full block proof N=4");
+    let std_block_r = bench_full_block_proof(&standard_block, &[], &[]);
+    println!("  [Standard full block proof: 4 tx]");
     println!("    prove:         {}", fmt_ms(std_block_r.prove_time));
     println!("    verify:        {}", fmt_ms(std_block_r.verify_time));
-    println!("    proof:         {}", fmt_bytes(std_block_r.proof_bytes));
+    println!("    block proof:   {}", fmt_bytes(std_block_r.proof_bytes));
     println!(
-        "    bucket:        {}",
+        "      bucket:      {}",
         fmt_bytes(std_block_r.standard_bucket_bytes)
     );
     println!(
-        "    spine:         {}",
-        fmt_bytes(std_block_r.unified_spine_bytes)
+        "      state bind:  {}",
+        fmt_bytes(std_block_r.state_binding_bytes)
+    );
+    println!(
+        "    overhead:      prove +{}, bytes +{}",
+        fmt_ms(
+            std_block_r
+                .prove_time
+                .saturating_sub(std_bucket_r.prove_time)
+        )
+        .trim(),
+        fmt_bytes(
+            std_block_r
+                .proof_bytes
+                .saturating_sub(std_bucket_r.proof_bytes)
+        )
+        .trim()
     );
     println!();
 
@@ -148,34 +182,67 @@ fn main() {
         sweep_fixture(sweep_scenario("sw-b2", 25, 20_200, 0x70)),
         sweep_fixture(consolidation_scenario("sw-b3", 25, 20_300)),
     ];
-    eprintln!("  report: sweep bucket N=4");
+    eprintln!("  report: sweep full block proof N=4");
     let sweep_witnesses = preprove_sweep_witnesses(&sweep_block, 1);
+    let sweep_block_r = bench_full_block_proof(&[], &sweep_block, &sweep_witnesses);
     let sweep_bucket_r = bench_sweep_bucket(&sweep_witnesses);
-    println!("  [Sweep bucket: 4 tx]");
-    println!("    assemble:      {}", fmt_ms(sweep_bucket_r.prove_time));
-    println!("    verify:        {}", fmt_ms(sweep_bucket_r.verify_time));
+    println!("  [Sweep full block proof: 4 tx]");
+    println!("    prove:         {}", fmt_ms(sweep_block_r.prove_time));
+    println!("    verify:        {}", fmt_ms(sweep_block_r.verify_time));
     println!(
-        "    bucket proof:  {}",
-        fmt_bytes(sweep_bucket_r.bucket_bytes)
+        "    block proof:   {}",
+        fmt_bytes(sweep_block_r.proof_bytes)
     );
     println!(
-        "    algebraic/tx:  {}",
+        "      bucket:      {}",
+        fmt_bytes(sweep_block_r.sweep_bucket_bytes)
+    );
+    println!(
+        "      state bind:  {}",
+        fmt_bytes(sweep_block_r.state_binding_bytes)
+    );
+    println!("    bucket detail:");
+    println!(
+        "      aggregation verify: {}",
+        fmt_ms(sweep_bucket_r.aggregation_verify_time)
+    );
+    println!(
+        "      block spine:        {}",
+        fmt_bytes(sweep_bucket_r.block_spine_bytes)
+    );
+    println!(
+        "      auth proofs:        {}",
+        fmt_bytes(sweep_bucket_r.tx_auth_proofs_bytes)
+    );
+    println!(
+        "      algebraic/tx:       {}",
         fmt_bytes(sweep_bucket_r.per_tx_algebraic_bytes)
     );
     println!();
 
-    println!("  [Mixed composition: 4 standard + 4 sweep]");
+    eprintln!("  report: mixed full block proof N=8");
+    let mixed_sweep_witnesses =
+        preprove_sweep_witnesses(&sweep_block, 1 + standard_block.len() as u32);
+    let mixed_block_r =
+        bench_full_block_proof(&standard_block, &sweep_block, &mixed_sweep_witnesses);
+    println!("  [Mixed full block proof: 4 standard + 4 sweep]");
+    println!("    prove:         {}", fmt_ms(mixed_block_r.prove_time));
+    println!("    verify:        {}", fmt_ms(mixed_block_r.verify_time));
     println!(
-        "    prove total:   {}",
-        fmt_ms(std_block_r.prove_time + sweep_bucket_r.prove_time)
+        "    block proof:   {}",
+        fmt_bytes(mixed_block_r.proof_bytes)
     );
     println!(
-        "    verify total:  {}",
-        fmt_ms(std_block_r.verify_time + sweep_bucket_r.verify_time)
+        "      standard:    {}",
+        fmt_bytes(mixed_block_r.standard_bucket_bytes)
     );
     println!(
-        "    proof total:   {}",
-        fmt_bytes(std_block_r.standard_bucket_bytes + sweep_bucket_r.bucket_bytes)
+        "      sweep:       {}",
+        fmt_bytes(mixed_block_r.sweep_bucket_bytes)
+    );
+    println!(
+        "      state bind:  {}",
+        fmt_bytes(mixed_block_r.state_binding_bytes)
     );
     println!();
 
@@ -184,21 +251,16 @@ fn main() {
     println!("  ----------------------------------------------------------------------");
 
     eprintln!("  report: recursive update standard block");
-    let (_, std_block_proof) = standard_block_proof_with_total(&standard_block, 4);
-    let rec_standard = bench_recursive_step(&std_block_proof);
-    print_recursive("standard-only block", &rec_standard);
+    let rec_standard = bench_recursive_step(&std_block_r.proof);
+    print_recursive("standard-only full block", &rec_standard);
 
     eprintln!("  report: recursive update sweep block");
-    let (_, sweep_block_proof) = sweep_only_block_proof(&sweep_witnesses);
-    let rec_sweep = bench_recursive_step(&sweep_block_proof);
-    print_recursive("sweep-only block", &rec_sweep);
+    let rec_sweep = bench_recursive_step(&sweep_block_r.proof);
+    print_recursive("sweep-only full block", &rec_sweep);
 
     eprintln!("  report: recursive update mixed block");
-    let mixed_sweep_witnesses =
-        preprove_sweep_witnesses(&sweep_block, 1 + standard_block.len() as u32);
-    let (_, mixed_proof) = mixed_block_proof(&standard_block, &mixed_sweep_witnesses);
-    let rec_mixed = bench_recursive_step(&mixed_proof);
-    print_recursive("mixed standard+sweep block", &rec_mixed);
+    let rec_mixed = bench_recursive_step(&mixed_block_r.proof);
+    print_recursive("mixed standard+sweep full block", &rec_mixed);
 
     println!("  ----------------------------------------------------------------------");
     println!("  Summary / fee-policy inputs");
@@ -233,8 +295,12 @@ fn main() {
         fmt_ms(std_block_r.prove_time)
     );
     println!(
-        "    Sweep bucket N=4 prove:     {}",
-        fmt_ms(sweep_bucket_r.prove_time)
+        "    Sweep full block N=4 prove: {}",
+        fmt_ms(sweep_block_r.prove_time)
+    );
+    println!(
+        "    Mixed full block N=8 prove: {}",
+        fmt_ms(mixed_block_r.prove_time)
     );
     println!();
     println!(

@@ -19,8 +19,8 @@ This document specifies the complete protocol: all layers, their interfaces, and
 │  Blake3 PoW, ASERT difficulty, fork choice by cumulative chainwork.      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Layer 3: Block (Aggregation + State Binding)                           │
-│  N transaction proofs under one InterleavedCommitment + single FRI.      │
-│  BlockStateBindingAir proves state transitions against state MLE.        │
+│  Shape-specific tx buckets, per-bucket FRI, one canonical BlockProof.    │
+│  BlockStateBindingAir proves user-tx state transitions against state MLE.│
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Layer 2: Transaction (ZK Proof)                                        │
 │  Per-tx: FROST-GKR Kill-Shot (Spine + Auth) + TxLogicAir STARK.         │
@@ -115,12 +115,13 @@ A transaction proof is **stateless**: produced by the wallet without knowledge o
 
 ```
 TxIntent = {
-    epoch_anchor:  [u8; 32]     -- block hash within last 144 blocks
+    shape:         TxShape        -- Standard4x8 or Sweep25x2
+    epoch_anchor:  [u8; 32]      -- block hash within last 144 blocks
     fee:           u64           -- fee in μNOID
-    inputs:        [TxInput; 1..4]
-    outputs:       [TxOutput; 1..8]
+    inputs:        [TxInput; shape max]
+    outputs:       [TxOutput; shape max]
     is_coinbase:   bool
-    logic_proof:   LogicProof    -- ZK proof bundle
+    logic_proof:   LogicProof    -- shape-specific ZK proof bundle
 }
 
 TxInput = {
@@ -142,17 +143,18 @@ TxOutput = {
 The transaction body hash is deterministic from public data only:
 
 ```
-tx_body_hash = SpineMerkle(
-    prev_state_root,
+tx_body_hash = ShapeSpineMerkle(
+    epoch_anchor,
     fee_leaf,
-    input_leaves[0..4],
-    output_leaves[0..8],
+    shape_leaf,
+    input_leaves[0..shape_max_inputs],
+    output_leaves[0..shape_max_outputs],
     is_coinbase_leaf,
     pad_leaf
 )
 ```
 
-59 Poseidon2b permutations arranged as a Merkle tree (4 leaf-hash + 8 leaf-hash + 15 compress + 1 wrap = 59 slots). The FROST-GKR Spine Kill-Shot proves this computation.
+`Standard4x8` uses the 16-leaf / 59-permutation spine. `Sweep25x2` uses its distinct wider 32-leaf body layout and sweep spine. The shape leaf is part of the hash, so a proof for one shape cannot be replayed as another shape.
 
 ### 4.3 Ownership Authentication
 
@@ -163,7 +165,7 @@ Address[i]  = H_ADDR(spend_secret[i])   = Poseidon2b sponge with TAG_ADDR IV
 AuthTag[i]  = H_AUTH(spend_secret[i], tx_body_hash) = Poseidon2b sponge with TAG_AUTH IV
 ```
 
-5 permutations per input, 20 slots total. The FROST-GKR Auth Kill-Shot proves all 20 simultaneously.
+Standard auth uses 5 permutations per input, 20 slots total. `Sweep25x2` widens the same ownership relation to 25 inputs / 125 auth permutation slots. The FROST-GKR Auth Kill-Shot proves all auth slots for the selected shape simultaneously.
 
 **Privacy:** `spend_secret` never enters the Fiat-Shamir transcript. Only `(tx_body_hash, Address[], AuthTag[])` are absorbed. The proof reveals MLE evaluations of the execution trace at random points, not raw secret values.
 
@@ -200,15 +202,17 @@ The `extra_transcript` hook binds GKR proofs to the STARK: any byte-level tamper
 
 ## 5. Layer 3: Block Aggregation
 
-### 5.1 Interleaved Commitment
+### 5.1 Bucket Interleaved Commitment
 
-All N transaction traces in a block share a **single** `InterleavedCommitment`: one Merkle cap covers all columns of all transactions. The cap is absorbed into the Fiat-Shamir channel before any challenge. There is no per-transaction commitment that could be selectively forged.
+All same-shape transaction traces inside one non-empty block bucket share one per-bucket `InterleavedCommitment`: one Merkle cap covers all columns of that bucket. Standard and `Sweep25x2` transactions use separate buckets because their AIR shapes differ. Each bucket cap is absorbed into its Fiat-Shamir channel before any challenge, so there is no per-transaction commitment that could be selectively forged inside the bucket.
 
-### 5.2 Deferred FRI (Single Opening)
+The canonical `BlockProof` binds all non-empty bucket proofs together with the common `BlockStateBindingAir` proof.
 
-Instead of N independent FRI openings (O(N × FRI_cost)), the block prover runs a **multipoint sumcheck** that reduces all N terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening closes all columns simultaneously.
+### 5.2 Deferred FRI (Per-Bucket Opening)
 
-**Proof size scales as O(log N)** in the FRI layer, not O(N).
+Instead of N independent FRI openings (O(N × FRI_cost)), each bucket prover runs a **multipoint sumcheck** that reduces that bucket's N terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening closes all bucket columns simultaneously.
+
+**Proof size scales as O(log N)** in the FRI layer per non-empty bucket, not O(N × per-tx FRI).
 
 ### 5.3 BlockStateBindingAir
 
@@ -216,16 +220,18 @@ This AIR proves that the slot-state transitions claimed by transactions are cons
 
 | Terminal constraint | What it proves |
 |--------------------|---------------|
-| Gamma-RLC terminal | Accumulated pre-state openings match the verifier-supplied batched claims from TxLogicAir outputs |
+| Gamma-RLC terminal | Accumulated pre-state openings match the verifier-supplied batched claims from Standard/Sweep transaction AIR outputs |
 | Delta-acc terminal | Net state MLE change equals `prev_opening ⊕ new_opening` from externally-verified state roots |
 
 Both terminal values are **verifier-hardcoded** from the block header's state root fields. Max constraint degree: 3. Zero-check soundness: `44/2^128`.
 
-### 5.4 The C_claimed Bridge
+For user-transaction blocks this proof is mandatory production validity, not an optimization layer and not an alternate mode.
 
-`TxLogicAir` produces `C_claimed` (commitment over slot indices and values it claims). `BlockStateBindingAir` takes `C_claimed` as a public input and verifies each claim against the actual state MLE. Neither layer can lie independently:
+### 5.4 Claim Bridge
 
-- `TxLogicAir` is stateless (cannot touch state)
+`TxLogicAir` and `SweepTxLogicAir` produce claimed slot indices and values. `BlockStateBindingAir` takes the aggregated claims as public inputs and verifies each claim against the actual state MLE. Neither layer can lie independently:
+
+- transaction AIRs are stateless (cannot touch state)
 - `BlockStateBindingAir` has no secret (cannot forge ownership)
 
 ---
@@ -362,9 +368,10 @@ Wallet                    Mempool              Miner                   Network
   │                         │                    │ 9. Gossip ──────────> │
   │                         │                    │                       │
   │                         │                    │                 10. Verify:
-  │                         │                    │                     consensus
-  │                         │                    │                     + ZK proof
-  │                         │                    │                     + state δ
+  │                         │                    │                     proof/header binding
+  │                         │                    │                     + cheap consensus
+  │                         │                    │                     + full BlockProof
+  │                         │                    │                     + proven state δ
   │                         │                    │                       │
   │                         │                    │ 11. Async:            │
   │                         │                    │     prove_recursive   │
@@ -375,11 +382,11 @@ Wallet                    Mempool              Miner                   Network
 
 | Step | Duration | Bottleneck |
 |------|----------|-----------|
-| Wallet prove (1 tx) | ~135 ms | GKR unified sumcheck |
-| Mempool admission | <1 ms | Slot lookups |
-| Block prove (full, 256 txs) | ~20 s | Block GKR + algebraic STARK |
+| Wallet prove (`Standard4x8`) | ~135 ms | GKR unified sumcheck |
+| Mempool admission | <1 ms native checks + async proof verify | Slot lookups / proof workers |
+| Block prove (`Standard4x8`, 100 txs, proof-native) | ~38 s | Bucket proof + `BlockStateBindingAir` |
+| Block verify (`Standard4x8`, 100 txs, proof-native) | ~8.6 s | Bucket verify + `BlockStateBindingAir` |
 | PoW (target 15s) | ~15 s | Blake3 nonce search |
-| Block verify (full) | ~25 ms/tx | GKR verify + STARK |
 | Recursive step | ~2 s | RecursiveBlockAir prove |
 
 ---
@@ -422,7 +429,8 @@ The `tx_root` in the header is the Poseidon2b Merkle root over all `tx_body_hash
 Blocks with no user transactions:
 - Have empty `block_proof_bytes`
 - `proof_transcript_hash = STUB_MARKER = [1u8; 32]`
-- Skip ZK verification entirely (nothing to prove)
+- Skip user proof verification because there are no user slot claims to bind
+- Still pass proof/header stub binding, cheap consensus checks, and deterministic coinbase `apply_state_delta`
 - `STUB_MARKER` prevents stripping a real proof and claiming coinbase-only
 
 ---
@@ -484,7 +492,7 @@ ParanoidReceipt = {
 
 These properties hold at all times for a correct node:
 
-1. **State root binding.** The stored state root equals the Poseidon2b Merkle root over all segment FRI roots. Verified by `BlockStateBindingAir` for every block.
+1. **State root binding.** The stored state root equals the Poseidon2b Merkle root over all segment FRI roots. Verified by `BlockStateBindingAir` for every user-transaction block; coinbase-only blocks have no user slot claims and use the canonical stub path plus deterministic coinbase delta.
 
 2. **Recursive proof covers finalized history.** `recursive_proof.height >= tip - FINALITY_DEPTH`. Proves every block from genesis to that height satisfies all ZK constraints.
 

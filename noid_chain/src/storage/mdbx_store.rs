@@ -482,7 +482,8 @@ impl MdbxStore {
     ///
     /// After commit (non-atomic, re-runnable):
     ///   - Prune old undo_logs beyond FINALITY_DEPTH
-    ///   - Prune old recent_blocks beyond RECENT_BLOCK_RETENTION
+    ///   - Prune old recent_blocks beyond FINALITY_DEPTH
+    ///   - Prune old block_proofs beyond FINALITY_DEPTH
     ///   - Prune old nullifier entries beyond ANCHOR_DEPTH
     pub fn commit_block(
         &self,
@@ -817,16 +818,14 @@ impl MdbxStore {
         Ok(())
     }
 
-    /// Clear all volatile tables on node restart, keeping only T_HEADERS and T_HASH_TO_HEIGHT.
+    /// Clear volatile tables after local state corruption is detected, keeping
+    /// append-only headers, hash->height index, and the recursive proof.
     ///
-    /// This implements the proof-native restart model: on every startup, volatile state
-    /// (segments, undo logs, nullifiers, recent blocks, etc.) is discarded and re-synced
-    /// from the network. The recursive chain proof guarantees correctness of the synced
-    /// state, so there is no benefit to persisting it across restarts.
-    ///
-    /// T_HEADERS is kept (append-only, small, useful for historical header queries).
-    /// T_HASH_TO_HEIGHT is kept (companion to T_HEADERS, hash->height index).
-    /// T_RECURSIVE_PROOF is kept (6.5 KB; used to seed new peers immediately on connect).
+    /// Normal startup does NOT clear these tables: `MdbxChainContext::open_or_create`
+    /// first tries to restore persisted current state from MDBX and checks it against
+    /// the tip header's `state_root`. This function is the recovery fallback for corrupt
+    /// local state; after clearing, the node resyncs current state from peers and verifies
+    /// it with the recursive chain proof.
     pub fn clear_for_restart(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let volatile = [

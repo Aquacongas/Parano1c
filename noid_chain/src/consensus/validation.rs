@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Native block validation pipeline.
+//! Consensus checks shared by proof-native validation and in-memory utilities.
 //!
-//! `validate_block_consensus` enforces all consensus rules that do NOT require
-//! ZK proof verification. ZK verification (LogicProof + BlockProof) is layered
-//! on top in `noid_block::validate_block_full()`.
+//! Live full nodes use `validate_block_checks` as the cheap first stage, then
+//! verify the full `BlockProof`/`BlockStateBindingAir`, then commit via
+//! `apply_state_delta`. `validate_block_consensus` is the sequential interpreter
+//! path for RAM tests/utilities and is not the live production acceptance path.
 //!
 //! # Invariants checked here (SPEC §16)
 //!
@@ -15,14 +16,14 @@
 //!  ✅  Per-tx: body_hash binding, non-zero anchor, nullifier             [P.8]
 //!  ✅  Cross-tx slot conflicts                                           [P.8]
 //!  ✅  TooManyTxs                                                        [P.9]
-//!  ✅  Native state transition (apply_block) — state_root, active count  [P.9]
+//!  ✅  Sequential state transition (`validate_block_consensus` only)       [P.9]
 //!
-//! # Invariants NOT checked here (require ZK layer in noid_block)
+//! # Invariants checked by the production ZK layer
 //!
-//!  ❌  LogicProof verifies (STARK + AuthGKR)
-//!  ❌  BlockStateBinding verifies (Merkle openings)
-//!  ❌  C_claimed bridge
-//!  ❌  BlockProof aggregate verifies
+//!  ✅  Wallet/bucket proof verifies (STARK + AuthGKR)
+//!  ✅  BlockStateBinding verifies state openings and roots
+//!  ✅  C_claimed bridge
+//!  ✅  BlockProof aggregate verifies
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
 //!  ❌  da_root / witness_root binding (needs packed DA data)
 
@@ -145,12 +146,12 @@ pub fn validate_block_checks(
     Ok(())
 }
 
-/// Validate all native consensus rules for a block and apply it to `state`.
+/// Validate through the sequential interpreter and apply it to `state`.
 ///
-/// **Non-ZK path.** Validates all native consensus rules and applies the
-/// state transition without ZK proof verification.
-/// For the full ZK-verified path, use:
-///   `validate_block_checks` + `verify_block(BlockProof)` + `apply_state_delta`.
+/// This is not the live full-node production path. It is used by the in-memory
+/// context and tests/utilities that intentionally recompute the transition
+/// directly. Production validation uses:
+/// `validate_block_checks` + full `BlockProof` verification + `apply_state_delta`.
 ///
 /// On success, `state` is updated. On failure, `state` is left unchanged.
 pub fn validate_block_consensus(
@@ -214,7 +215,7 @@ pub fn validate_block_consensus(
     validate_block_slot_conflicts(&block.transactions)?;
 
     // --- Per-tx consensus checks (P.8) ---
-    // Use skip_hash variant: apply_block (called below) already verifies
+    // Use skip_hash variant: the sequential interpreter below already verifies
     // tx_body_hash for every tx, so recomputing 59-perm Poseidon2b here
     // would be pure redundant work (~15 ms at 256 txs).
     for tx in &block.transactions {
@@ -243,7 +244,7 @@ pub fn validate_block_consensus(
         }
     }
 
-    // --- Native state transition (apply_block handles state_root, active counts, etc.) ---
+    // --- Sequential state transition (apply_block handles state_root, active counts, etc.) ---
     // apply_block returns Err(BlockApplyError) on mismatch; map to ConsensusError.
     apply_block(state, block).map_err(|e| {
         use crate::block::BlockApplyError;

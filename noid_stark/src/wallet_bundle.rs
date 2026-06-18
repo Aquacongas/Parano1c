@@ -29,7 +29,7 @@ pub struct StandardWalletProofBundle {
 /// Sweep25x2 wallet proof bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweepWalletProofBundle {
-    /// STARK over sweep balance plus sweep AuthGKR + sweep SpineGKR.
+    /// STARK over body-bound sweep tx logic plus SweepAuthGKR.
     pub logic_proof: SweepLogicProof,
     /// Sweep AuthGKR MLE `state` slices required by the sweep block bucket.
     /// This mirrors `StandardWalletProofBundle::auth_slices` for Sweep25x2.
@@ -92,8 +92,6 @@ mod tests {
     use noid_gkr::{
         AuthKillShotProof, AuthProofKillShot, AuthShiftProof, AuthUnifiedProof,
         SweepAuthKillShotProof, SweepAuthProofKillShot, SweepAuthShiftProof, SweepAuthUnifiedProof,
-        SweepSpineKillShotProof, SweepSpineProofKillShot, SweepSpineShiftProof,
-        SweepSpineUnifiedProof,
     };
 
     fn dummy_stark() -> InterleavedStarkProof {
@@ -193,40 +191,6 @@ mod tests {
         }
     }
 
-    fn dummy_sweep_spine() -> SweepSpineProofKillShot {
-        SweepSpineProofKillShot {
-            kill_shot: SweepSpineKillShotProof {
-                main: SweepSpineUnifiedProof {
-                    round_polys: vec![],
-                    s_in_dec_at_r: Block128(0),
-                    s_out_dec_at_r: Block128(0),
-                    state_dec_at_r: Block128(0),
-                    state_at_r: Block128(0),
-                    s_out_lane_dec_at_r: [Block128(0); 4],
-                    state_lane_dec_at_r: [Block128(0); 4],
-                },
-                shift: SweepSpineShiftProof {
-                    round_polys: vec![],
-                    s_in_at_r2: Block128(0),
-                    s_out_at_r2: Block128(0),
-                    state_at_r2: Block128(0),
-                },
-            },
-            state_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
-            sin_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
-            sout_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
-        }
-    }
-
     fn dummy_standard_bundle() -> WalletProofBundle {
         let logic_proof = LogicProof {
             stark: dummy_stark(),
@@ -244,8 +208,7 @@ mod tests {
         let logic_proof = SweepLogicProof {
             stark: dummy_stark(),
             auth: dummy_sweep_auth(),
-            spine: dummy_sweep_spine(),
-            n_boundary_slices: 216,
+            n_boundary_slices: crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES,
         };
         WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
             logic_proof,
@@ -282,7 +245,10 @@ mod tests {
         assert_eq!(back.shape(), TxShape::Sweep25x2);
         match back {
             WalletProofBundle::Sweep25x2(b) => {
-                assert_eq!(b.logic_proof.n_boundary_slices, 216);
+                assert_eq!(
+                    b.logic_proof.n_boundary_slices,
+                    crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES
+                );
                 assert_eq!(
                     b.auth_slices.len(),
                     crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES

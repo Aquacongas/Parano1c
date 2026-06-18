@@ -10,7 +10,7 @@ use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::fri_state::SlotValue;
 use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 use noid_mempool::{AsyncMempool, ChainView, SubmitError};
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
@@ -131,7 +131,7 @@ fn chain_view_with_inputs(body: &TxBody) -> ChainView {
 }
 
 fn prove_bundle(body: &TxBody) -> WalletProofBundle {
-    let (air, trace, auth_inputs, spine_inputs) = sweep_logic_witness_parts_from_body(body);
+    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(body);
     assert!(air.check(&trace));
 
     let tx_body_hash = hash_tx_body_for_shape(
@@ -161,7 +161,6 @@ fn prove_bundle(body: &TxBody) -> WalletProofBundle {
         trace: &trace,
         pi: &pi,
         auth_inputs: &auth_inputs,
-        spine_inputs: &spine_inputs,
     };
     let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
     let auth_slices = build_sweep_auth_slices(&auth_inputs);
@@ -273,6 +272,92 @@ async fn mempool_rejects_sweep_body_tamper_against_valid_bundle() {
         claimed_slots: TxIntent::claimed_slots_from_body(&tampered),
         logic_proof_bytes: bundle.to_bytes(),
     };
+    let intent_bytes = intent.to_bytes();
+
+    let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
+    let result = mempool.submit(intent, intent_bytes).await;
+    assert!(matches!(result, Err(SubmitError::InvalidProof(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+async fn mempool_rejects_sweep_fee_tamper_against_valid_bundle() {
+    let genesis = genesis_header();
+    let epoch_anchor = full_block_hash(&genesis);
+    let probe = mk_sweep_body(epoch_anchor, 0);
+    let fee = required_fee_for_tx_body(&probe, 5, 24);
+    let body = mk_sweep_body(epoch_anchor, fee);
+    let view = chain_view_with_inputs(&body);
+    let bundle = prove_bundle(&body);
+
+    let mut tampered = body.clone();
+    tampered.fee = tampered.fee.saturating_add(1);
+    tampered.outputs[1].value = tampered.outputs[1].value.saturating_sub(1);
+    let intent = intent_with_proof(tampered, bundle.to_bytes());
+    let intent_bytes = intent.to_bytes();
+
+    let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
+    let result = mempool.submit(intent, intent_bytes).await;
+    assert!(matches!(result, Err(SubmitError::InvalidProof(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+async fn mempool_rejects_sweep_auth_tamper() {
+    let genesis = genesis_header();
+    let epoch_anchor = full_block_hash(&genesis);
+    let probe = mk_sweep_body(epoch_anchor, 0);
+    let fee = required_fee_for_tx_body(&probe, 5, 24);
+    let body = mk_sweep_body(epoch_anchor, fee);
+    let view = chain_view_with_inputs(&body);
+    let mut bundle = prove_bundle(&body);
+    match &mut bundle {
+        WalletProofBundle::Sweep25x2(sweep) => {
+            sweep.auth_public.expected_auth_tag[0][0] += Block128::ONE;
+        }
+        WalletProofBundle::Standard4x8(_) => panic!("expected sweep bundle"),
+    }
+    let intent = intent_with_proof(body, bundle.to_bytes());
+    let intent_bytes = intent.to_bytes();
+
+    let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
+    let result = mempool.submit(intent, intent_bytes).await;
+    assert!(matches!(result, Err(SubmitError::InvalidProof(_))));
+}
+
+#[tokio::test]
+async fn mempool_rejects_malformed_sweep_bundle_bytes() {
+    let genesis = genesis_header();
+    let epoch_anchor = full_block_hash(&genesis);
+    let probe = mk_sweep_body(epoch_anchor, 0);
+    let fee = required_fee_for_tx_body(&probe, 5, 24);
+    let body = mk_sweep_body(epoch_anchor, fee);
+    let view = chain_view_with_inputs(&body);
+    let intent = intent_with_proof(body, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let intent_bytes = intent.to_bytes();
+
+    let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
+    let result = mempool.submit(intent, intent_bytes).await;
+    assert!(matches!(result, Err(SubmitError::InvalidProof(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
+    let genesis = genesis_header();
+    let epoch_anchor = full_block_hash(&genesis);
+    let probe = mk_sweep_body(epoch_anchor, 0);
+    let fee = required_fee_for_tx_body(&probe, 5, 24);
+    let sweep_body = mk_sweep_body(epoch_anchor, fee);
+    let view = chain_view_with_inputs(&sweep_body);
+    let sweep_bundle = prove_bundle(&sweep_body);
+
+    let mut standard_body = sweep_body.clone();
+    standard_body.shape = TxShape::Standard4x8;
+    standard_body
+        .inputs
+        .truncate(TxShape::Standard4x8.max_inputs());
+    let intent = intent_with_proof(standard_body, sweep_bundle.to_bytes());
     let intent_bytes = intent.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());

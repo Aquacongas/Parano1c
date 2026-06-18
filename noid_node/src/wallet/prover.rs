@@ -146,15 +146,13 @@ fn prove_sweep_tx(
         }
     }
 
-    let (air, trace, auth_inputs, spine_inputs) =
-        sweep_logic_witness_parts_from_body(&body_with_secrets);
+    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(&body_with_secrets);
     let pi = build_public_inputs_for_shape(&body_with_secrets, log_slots);
     let witness = SweepLogicWitness {
         air: &air,
         trace: &trace,
         pi: &pi,
         auth_inputs: &auth_inputs,
-        spine_inputs: &spine_inputs,
     };
     let logic_proof =
         prove_sweep_logic(&witness).map_err(|e| ProveError::Logic(format!("{e:?}")))?;

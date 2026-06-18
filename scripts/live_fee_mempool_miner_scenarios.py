@@ -17,7 +17,8 @@ LOGS = BASE / "logs"
 
 BLOCK_HEADER_WIRE_SIZE = 276
 MIN_FEE_BASE = 5_000
-FEE_PER_IO = 500
+FEE_PER_INPUT = 100
+FEE_PER_OUTPUT = 700
 STATE_GROWTH_FEE_BASE = 2_500
 LOG_SLOTS_GENESIS = 24
 BASE_REWARD_MICRONOID = 50_000_000
@@ -247,7 +248,9 @@ def pressure_multiplier(active_slot_count, log_slots):
 
 def fee_breakdown(n_inputs, n_outputs, active_slot_count, log_slots):
     net_new = max(0, n_outputs - n_inputs)
-    io = FEE_PER_IO * (n_inputs + n_outputs)
+    input_fee = FEE_PER_INPUT * n_inputs
+    output_fee = FEE_PER_OUTPUT * n_outputs
+    io = input_fee + output_fee
     growth = (
         STATE_GROWTH_FEE_BASE
         * pressure_multiplier(active_slot_count, log_slots)
@@ -256,6 +259,8 @@ def fee_breakdown(n_inputs, n_outputs, active_slot_count, log_slots):
     total = MIN_FEE_BASE + io + growth
     return {
         "base": MIN_FEE_BASE,
+        "input": input_fee,
+        "output": output_fee,
         "io": io,
         "state_growth": growth,
         "required_total": total,
@@ -309,6 +314,9 @@ def decode_block(block_hex):
     n_txs, off = take_u32(buf, off)
     txs = []
     for _ in range(n_txs):
+        shape_raw, off = take(buf, off, 1)  # TxShape id
+        if shape_raw[0] not in (0, 1):
+            raise LiveTestError(f"invalid tx shape byte {shape_raw[0]}")
         _, off = take(buf, off, 32)  # epoch_anchor
         fee, off = take_u128(buf, off)
         n_inputs, off = take_u32(buf, off)
@@ -441,10 +449,13 @@ def main():
             flush=True,
         )
         info = miner.info()
+        fee_floor = int(rpc(miner.rpc_url, "getMempoolInfo", timeout=10)["fee_floor"])
         for n_outputs in [0, 1, 2, 3, 8]:
-            expected = expected_fee_estimate(n_outputs, info)
+            expected = max(expected_fee_estimate(n_outputs, info), fee_floor)
             got_rpc = int(rpc(miner.rpc_url, "estimateFee", [n_outputs], timeout=10))
-            got_cli = int(cli_json(miner, ["estimate-fee", str(n_outputs)]))
+            got_cli = int(
+                cli_json(miner, ["estimate-fee", str(n_outputs)])["fee_micronoid"]
+            )
             assert_eq(got_rpc, expected, f"RPC estimateFee({n_outputs})")
             assert_eq(got_cli, expected, f"CLI JSON estimate-fee {n_outputs}")
         out, _, _ = cli(miner, ["estimate-fee", "3"])
@@ -474,9 +485,10 @@ def main():
             low_code != 0,
             f"underpriced send unexpectedly succeeded:\nstdout={low_out}\nstderr={low_err}",
         )
+        low_combined = f"{low_out}\n{low_err}".lower()
         assert_true(
-            "BelowMinFee" in low_err or "BelowMinFee" in low_out,
-            f"underpriced failure did not mention BelowMinFee:\nstdout={low_out}\nstderr={low_err}",
+            "fee too low" in low_combined and "required" in low_combined,
+            f"underpriced failure did not mention fee-too-low/required:\nstdout={low_out}\nstderr={low_err}",
         )
         wait_until(
             "mempools empty after rejected tx",

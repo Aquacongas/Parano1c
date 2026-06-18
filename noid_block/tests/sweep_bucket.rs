@@ -3,9 +3,10 @@
 
 //! Sweep25x2 block-bucket binding tests.
 //!
-//! These tests exercise the lightweight bucket layer added before full mixed
-//! block aggregation: wallet-produced sweep logic proofs are carried in a
-//! `SweepBucketProof` and bound to concrete block transaction indices.
+//! These tests exercise the redesigned Sweep25x2 bucket layer: per-tx
+//! SweepAuth proofs and body-bound `SweepTxLogicAir` algebraics are aggregated
+//! with one block-side `SweepBlockSpineProof` and bound to concrete block
+//! transaction indices.
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
@@ -22,7 +23,8 @@ use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::params::GENESIS_TARGET;
 use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
-use noid_chain::state_binding::BlockStateBinding;
+use noid_chain::state_binding::{BlockStateBinding, StateBindingError};
+use noid_chain::SlotValue;
 use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
@@ -164,6 +166,63 @@ fn tx_from_body(body: TxBody) -> Transaction {
         body.is_coinbase,
     );
     Transaction { body, tx_body_hash }
+}
+
+fn seed_slot(state: &mut ChainState, slot_index: u32, value: u64, owner: Address) {
+    let [owner_hi, owner_lo] = owner.as_fields();
+    state
+        .state
+        .set_slot(
+            slot_index,
+            SlotValue {
+                value: Block128::from(value as u128),
+                owner_hi,
+                owner_lo,
+            },
+        )
+        .expect("test slot in range");
+    state.active_slot_count += 1;
+}
+
+fn pre_segments_for_state(
+    state: &ChainState,
+    slot_indices: &[u32],
+) -> HashMap<u16, SegmentColumns> {
+    let eff_log = state.state.effective_log_segment_size();
+    let seg_size = 1usize << eff_log;
+    let mut pre_segs = HashMap::new();
+    for slot in slot_indices {
+        let seg_id = (*slot >> eff_log) as u16;
+        pre_segs.entry(seg_id).or_insert_with(|| {
+            state
+                .state
+                .try_get_segment_columns(seg_id)
+                .cloned()
+                .unwrap_or_else(|| SegmentColumns::new_zero(seg_size))
+        });
+    }
+    pre_segs
+}
+
+fn patch_binding_new_root_with_coinbase(
+    binding: &mut BlockStateBinding,
+    mut post_state: noid_chain::segmented_state::SegmentedFriState,
+    coinbase_body: &TxBody,
+) {
+    for out in coinbase_body.outputs.iter().filter(|o| o.valid) {
+        let [owner_hi, owner_lo] = out.owner.as_fields();
+        post_state
+            .set_slot(
+                out.slot_index,
+                SlotValue {
+                    value: Block128::from(out.value as u128),
+                    owner_hi,
+                    owner_lo,
+                },
+            )
+            .expect("coinbase slot in range");
+    }
+    binding.new_state_root = post_state.root();
 }
 
 fn coinbase_tx() -> Transaction {
@@ -381,14 +440,13 @@ fn standard_fixture_with_params(
 
 fn prove_sweep_bundle(body: &TxBody) -> WalletProofBundle {
     let pi = public_inputs_for_body(body);
-    let (air, trace, auth_inputs, spine_inputs) = sweep_logic_witness_parts_from_body(body);
+    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(body);
     assert!(air.check(&trace));
     let witness = SweepLogicWitness {
         air: &air,
         trace: &trace,
         pi: &pi,
         auth_inputs: &auth_inputs,
-        spine_inputs: &spine_inputs,
     };
     let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
     let auth_slices = build_sweep_auth_slices(&auth_inputs);
@@ -685,6 +743,83 @@ fn sweep_bucket_rejects_block_multipoint_challenge_tampering() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+fn sweep_recursive_claim_hash_binds_new_sweep_auth_proof_field() {
+    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
+    validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
+
+    let canonical_hash = block.header.proof_transcript_hash;
+    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs[0]
+        .state_batch
+        .b_final += Block128::ONE;
+
+    assert_ne!(canonical_hash, block_recursive_claim_hash(&proof));
+    assert!(
+        validate_block_proof_transcript_hash(&block, &proof).is_err(),
+        "header transcript hash must bind per-tx sweep auth proofs"
+    );
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+fn sweep_recursive_claim_hash_binds_block_spine_proof_field() {
+    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
+    validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
+
+    let canonical_hash = block.header.proof_transcript_hash;
+    proof
+        .sweep_bucket
+        .as_mut()
+        .unwrap()
+        .block_spine_proof
+        .state_batch
+        .b_final += Block128::ONE;
+
+    assert_ne!(canonical_hash, block_recursive_claim_hash(&proof));
+    assert!(
+        validate_block_proof_transcript_hash(&block, &proof).is_err(),
+        "header transcript hash must bind the sweep block-spine proof"
+    );
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+fn sweep_recursive_claim_hash_binds_committed_spine_columns() {
+    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
+    validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
+
+    let canonical_hash = block.header.proof_transcript_hash;
+    proof.sweep_bucket.as_mut().unwrap().commitment.cap.hashes[0][0] ^= 0x01;
+
+    assert_ne!(canonical_hash, block_recursive_claim_hash(&proof));
+    assert!(
+        validate_block_proof_transcript_hash(&block, &proof).is_err(),
+        "header transcript hash must bind sweep bucket committed columns"
+    );
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+fn sweep_only_replay_witness_zeroes_unused_secondary_lane() {
+    let (_block, proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let witness = extract_replay_witness(&proof).expect("sweep-only replay witness");
+
+    assert_eq!(witness.block_secondary_initial_claim, Block128::ZERO);
+    assert!(witness
+        .block_secondary_multipoint_rounds
+        .iter()
+        .flatten()
+        .all(|v| *v == Block128::ZERO));
+    assert!(witness
+        .block_secondary_multipoint_challenges
+        .iter()
+        .all(|v| *v == Block128::ZERO));
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_mixed_opening_tampering() {
     let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
@@ -852,8 +987,13 @@ fn mixed_block_rejects_duplicate_and_missing_bucket_indices() {
     missing.sweep_bucket.as_mut().unwrap().tx_pis.clear();
     missing.sweep_bucket.as_mut().unwrap().auth_public.clear();
     missing.sweep_bucket.as_mut().unwrap().auth_slices.clear();
+    missing
+        .sweep_bucket
+        .as_mut()
+        .unwrap()
+        .tx_auth_proofs
+        .clear();
     missing.sweep_bucket.as_mut().unwrap().spine_inputs.clear();
-    missing.sweep_bucket.as_mut().unwrap().logic_proofs.clear();
     assert!(
         validate_block_bucket_tx_indices(&block, &missing).is_err(),
         "missing sweep tx index must reject"
@@ -943,6 +1083,172 @@ fn mixed_header_transcript_rejects_state_meta_tamper() {
     assert!(
         validate_block_proof_transcript_hash(&block, &proof).is_err(),
         "header proof_transcript_hash must bind mixed proof state metadata"
+    );
+}
+
+#[test]
+fn sweep_only_state_binding_witness_includes_coinbase_claims() {
+    let body = mk_sweep_mint_body();
+    let coinbase = coinbase_tx().body;
+    let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
+
+    let mut state = ChainState::with_log_slots(6);
+    let prev_state_root = state.state_root();
+    let mut binding_state = state.state.clone();
+    let mut binding = BlockStateBinding::build(&mut binding_state, &[body.clone()], &[commitment])
+        .expect("build sweep-only binding");
+    patch_binding_new_root_with_coinbase(&mut binding, binding_state, &coinbase);
+
+    let pre_segs = pre_segments_for_state(&state, &[7, 42]);
+    let owned = build_state_bindings_from_binding(
+        &binding,
+        &[body],
+        Some(&coinbase),
+        &pre_segs,
+        prev_state_root,
+        1,
+        6,
+    );
+
+    assert_eq!(owned.len(), 1, "test fixture touches one segment");
+    let claims = &owned[0].claims;
+    assert_eq!(claims.len(), 2, "sweep mint plus coinbase mint");
+    assert!(claims
+        .iter()
+        .any(|c| c.is_mint && c.slot_index == 7 && c.value == Block128::from(12_345u128)));
+    assert!(claims
+        .iter()
+        .any(|c| c.is_mint && c.slot_index == 42 && c.value == Block128::from(5_000u128)));
+}
+
+#[test]
+fn mixed_state_binding_witness_is_common_across_standard_sweep_and_coinbase() {
+    let standard = standard_fixture();
+    let sweep_owner = Address([0x51; 32]);
+    let sweep_body = TxBody {
+        shape: TxShape::Sweep25x2,
+        epoch_anchor: [0x5A; 32],
+        fee: 100,
+        inputs: vec![TxInput {
+            slot_index: 3,
+            value: 1_000,
+            owner: sweep_owner,
+            spend_secret: SpendSecret([0x51; 32]),
+            auth_tag: AuthTag([0u8; 32]),
+            valid: true,
+        }],
+        outputs: vec![TxOutput {
+            slot_index: 12,
+            value: 900,
+            owner: Address([0x52; 32]),
+            valid: true,
+        }],
+        is_coinbase: false,
+    };
+    let coinbase = coinbase_tx().body;
+
+    let mut state = ChainState::with_log_slots(6);
+    for input in standard.body.inputs.iter().filter(|i| i.valid) {
+        seed_slot(&mut state, input.slot_index, input.value, input.owner);
+    }
+    seed_slot(&mut state, 3, 1_000, sweep_owner);
+    let prev_state_root = state.state_root();
+
+    let bodies = vec![standard.body.clone(), sweep_body.clone()];
+    let commitments = vec![
+        compute_claims_commitment(&standard.body.inputs, &standard.body.outputs),
+        compute_claims_commitment(&sweep_body.inputs, &sweep_body.outputs),
+    ];
+    let mut binding_state = state.state.clone();
+    let mut binding = BlockStateBinding::build(&mut binding_state, &bodies, &commitments)
+        .expect("build mixed binding");
+    patch_binding_new_root_with_coinbase(&mut binding, binding_state, &coinbase);
+
+    let pre_segs = pre_segments_for_state(&state, &[0, 1, 3, 10, 11, 12, 42]);
+    let owned = build_state_bindings_from_binding(
+        &binding,
+        &bodies,
+        Some(&coinbase),
+        &pre_segs,
+        prev_state_root,
+        bodies.len() as u32,
+        6,
+    );
+
+    assert_eq!(owned.len(), 1, "test fixture touches one segment");
+    let claims = &owned[0].claims;
+    assert_eq!(
+        claims.iter().filter(|c| c.is_spend).count(),
+        3,
+        "two standard spends plus one sweep spend"
+    );
+    assert_eq!(
+        claims.iter().filter(|c| c.is_mint).count(),
+        4,
+        "two standard mints plus one sweep mint plus coinbase mint"
+    );
+    for slot in [0, 1, 3] {
+        assert!(
+            claims.iter().any(|c| c.is_spend && c.slot_index == slot),
+            "missing spend claim for slot {slot}"
+        );
+    }
+    for slot in [10, 11, 12, 42] {
+        assert!(
+            claims.iter().any(|c| c.is_mint && c.slot_index == slot),
+            "missing mint claim for slot {slot}"
+        );
+    }
+}
+
+#[test]
+fn common_state_binding_rejects_cross_shape_double_spend() {
+    let standard = standard_fixture();
+    let shared = standard
+        .body
+        .inputs
+        .iter()
+        .find(|i| i.valid)
+        .expect("standard fixture input")
+        .clone();
+    let sweep_body = TxBody {
+        shape: TxShape::Sweep25x2,
+        epoch_anchor: [0x5A; 32],
+        fee: 0,
+        inputs: vec![TxInput {
+            slot_index: shared.slot_index,
+            value: shared.value,
+            owner: shared.owner,
+            spend_secret: shared.spend_secret,
+            auth_tag: AuthTag([0u8; 32]),
+            valid: true,
+        }],
+        outputs: vec![],
+        is_coinbase: false,
+    };
+
+    let mut state = ChainState::with_log_slots(6);
+    seed_slot(&mut state, shared.slot_index, shared.value, shared.owner);
+    for input in standard.body.inputs.iter().filter(|i| i.valid) {
+        if input.slot_index != shared.slot_index {
+            seed_slot(&mut state, input.slot_index, input.value, input.owner);
+        }
+    }
+
+    let bodies = vec![standard.body.clone(), sweep_body.clone()];
+    let commitments = vec![
+        compute_claims_commitment(&standard.body.inputs, &standard.body.outputs),
+        compute_claims_commitment(&sweep_body.inputs, &sweep_body.outputs),
+    ];
+    let err = BlockStateBinding::build(&mut state.state, &bodies, &commitments)
+        .expect_err("second cross-shape spend must see the slot already spent");
+
+    assert_eq!(
+        err,
+        StateBindingError::InputMismatch {
+            tx_index: 1,
+            input_index: 0
+        }
     );
 }
 

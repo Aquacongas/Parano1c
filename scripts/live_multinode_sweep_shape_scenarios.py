@@ -9,7 +9,7 @@ Covers:
 - recipient wallet balance increases by the sent amount without explicit post-confirmation rescan.
 
 Environment knobs:
-  NOID_LIVE_MULTI_SWEEP_START_BLOCKS default 20 (18+ required for recursive aggregation proof readiness)
+  NOID_LIVE_MULTI_SWEEP_START_BLOCKS default 20, raised to at least 30 when split is enabled
   NOID_LIVE_MULTI_SWEEP_BASE_PORT    default 19900
   NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
   NOID_LIVE_MULTI_SWEEP_LATE_JOIN          default 0 (start relays after funding blocks)
@@ -35,6 +35,8 @@ LOGS = BASE / "logs"
 START_BLOCKS = int(os.environ.get("NOID_LIVE_MULTI_SWEEP_START_BLOCKS", "20"))
 BASE_PORT = int(os.environ.get("NOID_LIVE_MULTI_SWEEP_BASE_PORT", "19900"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT", "1") == "1"
+if not SKIP_SPLIT:
+    START_BLOCKS = max(START_BLOCKS, 30)
 LATE_JOIN = os.environ.get("NOID_LIVE_MULTI_SWEEP_LATE_JOIN", "0") == "1"
 RESTART_LEGACY = os.environ.get("NOID_LIVE_MULTI_SWEEP_RESTART", "0") == "1"
 RESTART_RECIPIENT = (

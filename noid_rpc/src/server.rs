@@ -101,97 +101,6 @@ fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
     Ok(acc)
 }
 
-fn verify_rpc_block_against_context(
-    ctx: &mut MdbxChainContext,
-    block: &Block,
-    block_proof_bytes: &[u8],
-    local_time: u64,
-) -> Result<(), String> {
-    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if !has_user_txs {
-        noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
-            .map_err(|e| format!("proof/header binding invalid: {e}"))?;
-    } else if block_proof_bytes.is_empty() {
-        return Err(
-            "proof/header binding invalid: user-transaction block is missing BlockProof bytes"
-                .to_string(),
-        );
-    } else if block.header.proof_transcript_hash == noid_chain::block::STUB_PROOF_MARKER {
-        return Err(
-            "proof/header binding invalid: user-transaction block used stub proof marker"
-                .to_string(),
-        );
-    }
-
-    let parent = ctx.tip_header().clone();
-    let prev_timestamps = ctx.prev_timestamps();
-    let prev_active_counts = ctx.prev_active_counts();
-    let anchor = ctx.anchor_info();
-    noid_chain::consensus::validate_block_checks(
-        block,
-        &parent,
-        &prev_timestamps,
-        &prev_active_counts,
-        local_time,
-        &anchor,
-        &ctx.nullifiers,
-    )
-    .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
-
-    if block_proof_bytes.is_empty() {
-        return Ok(());
-    }
-
-    let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
-        .map_err(|e| format!("proof deserialize failed: {e}"))?;
-    noid_block::validate_block_proof_transcript_hash(block, &proof)
-        .map_err(|e| format!("proof/header binding invalid: {e:?}"))?;
-    noid_block::validate_block_bucket_tx_indices(block, &proof)
-        .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
-    if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
-        for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
-            if pi.log_slots != block.header.log_slots {
-                return Err(format!(
-                    "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
-                    pi.log_slots, block.header.log_slots
-                ));
-            }
-        }
-    }
-    if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
-        for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
-            if pi.log_slots != block.header.log_slots {
-                return Err(format!(
-                    "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
-                    pi.log_slots, block.header.log_slots
-                ));
-            }
-        }
-    }
-
-    ctx.preload_segments_for_block(block)
-        .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
-
-    noid_block::verify_sweep_bucket_from_block(block, &proof)
-        .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
-    let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
-    let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
-        sb_airs.iter().collect();
-    if proof.standard_bucket.is_some() {
-        let spine = noid_block::build_spine_inputs_list(block);
-        let auth = noid_block::build_auth_public_list(block, &proof);
-        let tx_airs = noid_block::build_tx_airs(block);
-        let air_refs: Vec<&dyn noid_air::Air> =
-            tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
-        noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
-            .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
-    } else {
-        noid_block::verify_state_bindings_standalone(&proof, &sb_refs)
-            .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // RpcHandler
 // ---------------------------------------------------------------------------
@@ -908,14 +817,39 @@ impl ParanoidApiServer for RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
-        // Verify proof-native validity before committing. Native apply repeats
-        // consensus/root checks and performs the durable state transition.
+        // Single production path: verify full BlockProof (including state binding),
+        // apply the proven state delta, then commit atomically to MDBX.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
-            verify_rpc_block_against_context(&mut ctx, &block, &block_proof_bytes, local_time)
-                .map_err(|e| rpc_err(format!("validation: {e}")))?;
-            ctx.apply_next_block(&block, local_time)
-                .map_err(|e| rpc_err(format!("consensus: {e}")))?;
+            ctx.apply_next_block(
+                &block,
+                &block_proof_bytes,
+                local_time,
+                |block,
+                 proof_bytes,
+                 parent,
+                 prev_timestamps,
+                 prev_active_counts,
+                 local_time,
+                 anchor,
+                 nullifiers,
+                 pre_state,
+                 state| {
+                    noid_block::validate_block_from_network(
+                        block,
+                        proof_bytes,
+                        parent,
+                        prev_timestamps,
+                        prev_active_counts,
+                        local_time,
+                        anchor,
+                        nullifiers,
+                        pre_state,
+                        state,
+                    )
+                },
+            )
+            .map_err(|e| rpc_err(format!("consensus: {e}")))?;
             if !block_proof_bytes.is_empty() {
                 ctx.store
                     .put_block_proof(block.header.height, &block_proof_bytes)
@@ -1508,6 +1442,56 @@ fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
 #[inline]
 fn parse_address_hex(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     parse_address(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_shape_for_counts_selects_sweep_for_consolidation_width() {
+        assert_eq!(
+            estimate_shape_for_counts(4, 8).expect("standard max"),
+            noid_tx::TxShape::Standard4x8
+        );
+        assert_eq!(
+            estimate_shape_for_counts(5, 1).expect("sweep consolidation"),
+            noid_tx::TxShape::Sweep25x2
+        );
+        assert_eq!(
+            estimate_shape_for_counts(25, 2).expect("sweep max"),
+            noid_tx::TxShape::Sweep25x2
+        );
+        assert!(estimate_shape_for_counts(26, 1).is_err());
+        assert!(estimate_shape_for_counts(25, 3).is_err());
+    }
+
+    #[test]
+    fn block_template_response_serializes_sweep_counts() {
+        let response = BlockTemplateResponse {
+            header_core_hex: "00".into(),
+            block_hex: "11".into(),
+            block_proof_hex: "22".into(),
+            nonce_offset: 144,
+            difficulty_target_hex: "ff".into(),
+            height: 7,
+            n_txs: 3,
+            tx_shapes: vec!["Standard4x8".into(), "Sweep25x2".into()],
+            standard_tx_count: 1,
+            sweep_tx_count: 1,
+            tx_input_counts: vec![2, 5],
+            tx_output_counts: vec![2, 1],
+            coinbase_value_micronoid: 50,
+            claimable_fees_micronoid: 9,
+            has_block_proof: true,
+            block_proof_size_bytes: 1234,
+        };
+
+        let json = serde_json::to_value(response).expect("serialize template response");
+        assert_eq!(json["sweep_tx_count"], 1);
+        assert_eq!(json["tx_shapes"][1], "Sweep25x2");
+        assert_eq!(json["has_block_proof"], true);
+    }
 }
 
 // ---------------------------------------------------------------------------

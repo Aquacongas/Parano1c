@@ -50,10 +50,12 @@ use noid_fri_binius::{
     MixedOpeningProof, COMPACT_NUM_QUERIES,
 };
 use noid_gkr::{
-    auth_gkr_channel, prove_block_spine_killshot, reconstruct_slot_states, sweep_auth_gkr_channel,
-    verify_auth_killshot, verify_block_spine_killshot, verify_sweep_auth_killshot, AuthCircuit,
-    AuthProofKillShot, AuthPublicInputs, BlockSpineProof, SpineCircuit, SpineInputs,
-    SweepAuthCircuit, SweepAuthPublicInputs, SweepSpineInputs,
+    auth_gkr_channel, prove_block_spine_killshot, prove_sweep_block_spine_killshot,
+    reconstruct_slot_states, sweep_auth_gkr_channel, verify_auth_killshot,
+    verify_block_spine_killshot, verify_sweep_auth_killshot, verify_sweep_block_spine_killshot,
+    AuthCircuit, AuthProofKillShot, AuthPublicInputs, BlockSpineProof, SpineCircuit, SpineInputs,
+    SweepAuthCircuit, SweepAuthProofKillShot, SweepAuthPublicInputs, SweepBlockSpineMle,
+    SweepBlockSpineProof, SweepSpineInputs,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
@@ -63,9 +65,7 @@ use noid_stark::interleaved::{
     verify_air_interleaved_algebraic, verify_air_interleaved_algebraic_with_log_len,
     AlgebraicStarkProof, InterleavedStarkProof,
 };
-use noid_stark::prove_logic_sweep::{
-    SweepLogicProof, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
-};
+use noid_stark::prove_logic_sweep::{N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG};
 use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
 use rayon::prelude::*;
@@ -238,10 +238,9 @@ impl StandardBucketProof {
 
 /// Sweep25x2 bucket proof target shape.
 ///
-/// Sweep wallet logic proofs are already full shape-specific proofs. The sweep
-/// block bucket binds those proofs to concrete block transaction indices and
-/// public inputs, then aggregates sweep balance AIR columns plus wallet-provided
-/// AuthGKR `state` slices through a bucket commitment, multipoint sumcheck, and
+/// The sweep block bucket mirrors the Standard4x8 split: per-tx algebraic
+/// `SweepTxLogicAir` proofs and per-tx SweepAuth proofs are aggregated with one
+/// block-level SweepBlockSpine proof, one bucket multipoint sumcheck, and one
 /// mixed opening. Common state binding remains at `BlockProof` level.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SweepBucketProof {
@@ -252,11 +251,13 @@ pub struct SweepBucketProof {
     pub auth_public: Vec<SweepAuthPublicInputs>,
     /// Sweep AuthGKR `state` slices, one slice-list per bucket tx.
     pub auth_slices: Vec<Vec<Vec<Block128>>>,
+    /// Sweep AuthGKR Kill-Shot proofs, one per bucket tx.
+    pub tx_auth_proofs: Vec<SweepAuthProofKillShot>,
     /// Public sweep tx-body spine inputs, one per bucket tx.
     pub spine_inputs: Vec<SweepSpineInputs>,
-    /// Wallet-produced sweep logic proofs, one per bucket tx.
-    pub logic_proofs: Vec<SweepLogicProof>,
-    /// Interleaved commitment for sweep balance AIR columns + sweep auth slices.
+    /// Unified block-level SweepBlockSpine Kill-Shot proof for bucket txs.
+    pub block_spine_proof: SweepBlockSpineProof,
+    /// Interleaved commitment for sweep AIR columns + sweep auth slices + sweep block spine slices.
     pub commitment: InterleavedCommitment,
     /// Algebraic STARK transcripts — no per-tx FRI, one per sweep tx.
     pub tx_algebraic: Vec<AlgebraicStarkProof>,
@@ -749,8 +750,24 @@ pub fn assemble_sweep_bucket_proof(
         }
     }
 
+    let spine_inputs: Vec<SweepSpineInputs> =
+        witnesses.iter().map(|w| w.spine_inputs.clone()).collect();
+    let sweep_block_spine_mle = SweepBlockSpineMle::build(&spine_inputs);
+    let sweep_block_spine_num_vars = sweep_block_spine_mle.inner.num_vars;
+    let block_spine_slices = split_mle_into_slices(
+        &sweep_block_spine_mle.inner.state,
+        sweep_block_spine_num_vars,
+        BASE_LOG,
+    );
+    let n_block_spine_slices = block_spine_slices.len();
+    let spine_padded_slices: Vec<Vec<Block128>> = block_spine_slices
+        .iter()
+        .map(|s| noid_stark::pad_column(s, log_len))
+        .collect();
+
     let mut per_tx_columns: Vec<Vec<Vec<Block128>>> = Vec::with_capacity(n_tx);
-    let mut flat_refs: Vec<&[Block128]> = Vec::with_capacity(n_tx * n_per_tx);
+    let mut flat_refs: Vec<&[Block128]> =
+        Vec::with_capacity(n_tx * n_per_tx + n_block_spine_slices);
     for w in witnesses {
         let mut cols: Vec<Vec<Block128>> = Vec::with_capacity(n_per_tx);
         for col in &w.trace.columns {
@@ -766,11 +783,44 @@ pub fn assemble_sweep_bucket_proof(
             flat_refs.push(col.as_slice());
         }
     }
+    for slice in &spine_padded_slices {
+        flat_refs.push(slice.as_slice());
+    }
 
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
     let (commitment, prover_state) = interleaved_commit(&flat_refs, &ntt, &hasher);
     let cap = &commitment.cap;
+
+    let tx_body_hashes: Vec<[Block128; 2]> = witnesses
+        .iter()
+        .map(|w| w.pi.tx_body_hash.as_fields())
+        .collect();
+    let mut spine_channel = Poseidon2bChannel::new();
+    absorb_cap_into_p2b(&mut spine_channel, cap);
+    let (block_spine_proof, block_spine_reductions) = prove_sweep_block_spine_killshot(
+        n_tx,
+        &sweep_block_spine_mle,
+        &tx_body_hashes,
+        &mut spine_channel,
+    );
+    let spine_r = &block_spine_reductions.state.point;
+    let spine_r_low_base = &spine_r[..BASE_LOG];
+    let spine_r_low: Vec<Block128> = {
+        let mut v = spine_r_low_base.to_vec();
+        v.resize(log_len, Block128::ZERO);
+        v
+    };
+    let spine_slice_vals: Vec<Block128> = block_spine_slices
+        .iter()
+        .map(|s| noid_core::mle::evaluate::evaluate_slice(s, spine_r_low_base))
+        .collect();
+    let recon_spine =
+        noid_core::mle::split::reconstruct_from_slices(&spine_slice_vals, &spine_r[BASE_LOG..]);
+    if recon_spine != block_spine_reductions.state.value {
+        return Err(ProveBlockError::InvalidTxIndices);
+    }
+    let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
 
     let auth_circuit = SweepAuthCircuit::build();
     struct TxAlgResult {
@@ -786,7 +836,7 @@ pub fn assemble_sweep_bucket_proof(
             let w = &witnesses[k];
             let mut auth_ch = sweep_auth_gkr_channel();
             let auth_reductions = verify_sweep_auth_killshot(
-                &w.logic_proof.auth,
+                &w.auth_proof,
                 &auth_circuit,
                 &w.auth_public,
                 &mut auth_ch,
@@ -822,6 +872,9 @@ pub fn assemble_sweep_bucket_proof(
             }
 
             let auth_tr = reduction_to_transcript(r_auth, auth_reductions.state.value);
+            let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
+            extras.extend_from_slice(&spine_extras);
+            extras.extend_from_slice(&auth_tr);
             let slice_claims = build_auth_slice_claims(n_air_per_tx, auth_r_low, &auth_slice_vals);
             let col_refs: Vec<&[Block128]> =
                 per_tx_columns[k].iter().map(|c| c.as_slice()).collect();
@@ -830,7 +883,7 @@ pub fn assemble_sweep_bucket_proof(
                 &w.air,
                 &col_refs,
                 &w.pi,
-                &auth_tr,
+                &extras,
                 &slice_claims,
                 log_len,
                 &mut ch,
@@ -880,11 +933,15 @@ pub fn assemble_sweep_bucket_proof(
     block_channel.observe_field_elem(tr0);
     block_channel.observe_field_elem(tr1);
 
-    let mut block_col_openings: Vec<Block128> = Vec::with_capacity(n_tx * n_per_tx);
+    let total_cols = n_tx * n_per_tx + n_block_spine_slices;
+    let mut block_col_openings: Vec<Block128> = Vec::with_capacity(total_cols);
     for k in 0..n_tx {
         for col in &per_tx_columns[k] {
             block_col_openings.push(noid_core::mle::evaluate::evaluate_flat(col, &tx_r_pp[k]));
         }
+    }
+    for sp in &spine_padded_slices {
+        block_col_openings.push(noid_core::mle::evaluate::evaluate_flat(sp, &spine_r_low));
     }
 
     block_channel.observe_field_elem(Block128::from(BLOCK_MULTIPOINT_TAG));
@@ -892,19 +949,22 @@ pub fn assemble_sweep_bucket_proof(
     let mu = block_channel.get_random_point();
     let beta_block = block_channel.get_random_point();
 
+    let n_participants = n_tx + 1;
+    let spine_participant_idx = n_tx;
     let mu_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(n_tx);
+        let mut v = Vec::with_capacity(n_participants);
         let mut cur = Block128::ONE;
-        for _ in 0..n_tx {
+        for _ in 0..n_participants {
             v.push(cur);
             cur *= mu;
         }
         v
     };
+    let max_cols = n_per_tx.max(n_block_spine_slices);
     let beta_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(n_per_tx);
+        let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
-        for _ in 0..n_per_tx {
+        for _ in 0..max_cols {
             v.push(cur);
             cur *= beta_block;
         }
@@ -919,13 +979,23 @@ pub fn assemble_sweep_bucket_proof(
                 .fold(Block128::ZERO, |a, b| a + b);
             target += mu_powers[k] * inner;
         }
+        let spine_offset = n_tx * n_per_tx;
+        let inner_spine = (0..n_block_spine_slices)
+            .map(|i| beta_powers[i] * block_col_openings[spine_offset + i])
+            .fold(Block128::ZERO, |a, b| a + b);
+        target += mu_powers[spine_participant_idx] * inner_spine;
         target
     };
 
-    let pairs_a: Vec<Vec<Block128>> = (0..n_tx)
+    let all_r_pp: Vec<&[Block128]> = {
+        let mut v: Vec<&[Block128]> = tx_r_pp.iter().map(|r| r.as_slice()).collect();
+        v.push(&spine_r_low);
+        v
+    };
+    let pairs_a: Vec<Vec<Block128>> = (0..n_participants)
         .into_par_iter()
         .map(|k| {
-            let eq_k = eq_ind_partial_eval(&tx_r_pp[k]);
+            let eq_k = eq_ind_partial_eval(all_r_pp[k]);
             eq_k.into_iter().map(|v| v * mu_powers[k]).collect()
         })
         .collect();
@@ -936,15 +1006,24 @@ pub fn assemble_sweep_bucket_proof(
         .map(|v| tower_to_flat_u128(v.0))
         .collect();
     let hyper_len = 1usize << log_len;
-    let pairs_b_flat: Vec<Vec<u128>> = (0..n_tx)
+    let pairs_b_flat: Vec<Vec<u128>> = (0..n_participants)
         .into_par_iter()
         .map(|k| {
             let mut b_k = vec![0u128; hyper_len];
-            for (i, col) in per_tx_columns[k].iter().enumerate() {
-                let lam = beta_powers_flat[i];
-                b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
-                    *acc ^= clmul_gcm(lam, tower_to_flat_u128(v.0));
-                });
+            if k < n_tx {
+                for (i, col) in per_tx_columns[k].iter().enumerate() {
+                    let lam = beta_powers_flat[i];
+                    b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam, tower_to_flat_u128(v.0));
+                    });
+                }
+            } else {
+                for (i, col) in spine_padded_slices.iter().enumerate() {
+                    let lam = beta_powers_flat[i];
+                    b_k.iter_mut().zip(col.iter()).for_each(|(acc, &v)| {
+                        *acc ^= clmul_gcm(lam, tower_to_flat_u128(v.0));
+                    });
+                }
             }
             b_k
         })
@@ -975,13 +1054,14 @@ pub fn assemble_sweep_bucket_proof(
             n_air_per_tx: n_air_per_tx as u32,
             n_boundary_slices_per_tx: n_auth_slices as u32,
             log_rows: log_rows as u32,
-            n_block_spine_slices: 0,
+            n_block_spine_slices: n_block_spine_slices as u32,
         },
         tx_pis: witnesses.iter().map(|w| w.pi.clone()).collect(),
         auth_public: witnesses.iter().map(|w| w.auth_public).collect(),
         auth_slices: witnesses.iter().map(|w| w.auth_slices.clone()).collect(),
-        spine_inputs: witnesses.iter().map(|w| w.spine_inputs.clone()).collect(),
-        logic_proofs: witnesses.iter().map(|w| w.logic_proof.clone()).collect(),
+        tx_auth_proofs: witnesses.iter().map(|w| w.auth_proof.clone()).collect(),
+        spine_inputs,
+        block_spine_proof,
         commitment,
         tx_algebraic,
         block_col_openings,
@@ -1990,20 +2070,22 @@ pub fn verify_sweep_bucket_aggregation(
     let n_air_cols = bucket.meta.n_air_per_tx as usize;
     let n_auth_slices = bucket.meta.n_boundary_slices_per_tx as usize;
     let n_per_tx = n_air_cols + n_auth_slices;
+    let n_block_spine_slices = bucket.meta.n_block_spine_slices as usize;
     let log_len = noid_stark::padded_log_len(bucket.meta.log_rows as usize);
-    let total_cols = n_tx * n_per_tx;
+    let total_cols = n_tx * n_per_tx + n_block_spine_slices;
 
     if bucket.meta.shape != noid_tx::TxShape::Sweep25x2
         || airs.len() != n_tx
         || bucket.tx_pis.len() != n_tx
         || bucket.auth_public.len() != n_tx
         || bucket.auth_slices.len() != n_tx
+        || bucket.tx_auth_proofs.len() != n_tx
         || bucket.spine_inputs.len() != n_tx
-        || bucket.logic_proofs.len() != n_tx
         || bucket.tx_algebraic.len() != n_tx
         || bucket.block_col_openings.len() != total_cols
         || bucket.commitment.n_cols != total_cols
         || n_auth_slices != N_SWEEP_AUTH_SLICES
+        || n_block_spine_slices == 0
         || log_len != BASE_LOG
     {
         return Err(VerifyBlockError::ShapeMismatch);
@@ -2011,6 +2093,34 @@ pub fn verify_sweep_bucket_aggregation(
 
     let auth_circuit = SweepAuthCircuit::build();
     let cap = &bucket.commitment.cap;
+    let tx_body_hashes: Vec<[Block128; 2]> = bucket
+        .tx_pis
+        .iter()
+        .map(|pi| pi.tx_body_hash.as_fields())
+        .collect();
+    let block_spine_reductions = {
+        let mut ch = Poseidon2bChannel::new();
+        absorb_cap_into_p2b(&mut ch, cap);
+        verify_sweep_block_spine_killshot(&bucket.block_spine_proof, n_tx, &tx_body_hashes, &mut ch)
+            .ok_or(VerifyBlockError::BlockSpineKillShot)?
+    };
+    let spine_r = &block_spine_reductions.state.point;
+    let spine_r_low: Vec<Block128> = {
+        let mut v = spine_r[..BASE_LOG].to_vec();
+        v.resize(log_len, Block128::ZERO);
+        v
+    };
+    let spine_r_high = &spine_r[BASE_LOG..];
+    let spine_offset = n_tx * n_per_tx;
+    let spine_slice_vals: Vec<Block128> = (0..n_block_spine_slices)
+        .map(|i| bucket.block_col_openings[spine_offset + i])
+        .collect();
+    let recon_spine =
+        noid_core::mle::split::reconstruct_from_slices(&spine_slice_vals, spine_r_high);
+    if recon_spine != block_spine_reductions.state.value {
+        return Err(VerifyBlockError::BlockSpineSliceReconstruction);
+    }
+    let spine_extras = reduction_to_transcript(spine_r, block_spine_reductions.state.value);
 
     struct TxVerifyResult {
         r_pp: Vec<Block128>,
@@ -2025,7 +2135,7 @@ pub fn verify_sweep_bucket_aggregation(
             let alg = &bucket.tx_algebraic[k];
             let auth_public = &bucket.auth_public[k];
             let spine_inputs = &bucket.spine_inputs[k];
-            let logic_proof = &bucket.logic_proofs[k];
+            let auth_proof = &bucket.tx_auth_proofs[k];
             let auth_slices = &bucket.auth_slices[k];
 
             if airs[k].n_columns() != n_air_cols
@@ -2038,13 +2148,9 @@ pub fn verify_sweep_bucket_aggregation(
             }
 
             let mut auth_ch = sweep_auth_gkr_channel();
-            let auth_reductions = verify_sweep_auth_killshot(
-                &logic_proof.auth,
-                &auth_circuit,
-                auth_public,
-                &mut auth_ch,
-            )
-            .ok_or(VerifyBlockError::AuthKillShot(k))?;
+            let auth_reductions =
+                verify_sweep_auth_killshot(auth_proof, &auth_circuit, auth_public, &mut auth_ch)
+                    .ok_or(VerifyBlockError::AuthKillShot(k))?;
 
             let claimed = pi.tx_body_hash.as_fields();
             if auth_public.tx_body_hash != claimed {
@@ -2082,17 +2188,14 @@ pub fn verify_sweep_bucket_aggregation(
             }
 
             let auth_tr = reduction_to_transcript(r_auth, auth_reductions.state.value);
+            let mut extras = Vec::with_capacity(spine_extras.len() + auth_tr.len());
+            extras.extend_from_slice(&spine_extras);
+            extras.extend_from_slice(&auth_tr);
             let slice_claims = build_auth_slice_claims(n_air_cols, auth_r_low, auth_slice_vals);
             let mut ch = per_tx_algebraic_channel(prev_block_state_root, cap, k as u32);
-            let (r_pp, final_claim, lambdas) = verify_air_interleaved_algebraic(
-                airs[k],
-                pi,
-                alg,
-                &auth_tr,
-                &slice_claims,
-                &mut ch,
-            )
-            .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
+            let (r_pp, final_claim, lambdas) =
+                verify_air_interleaved_algebraic(airs[k], pi, alg, &extras, &slice_claims, &mut ch)
+                    .map_err(|e| VerifyBlockError::AlgebraicStark(k, e))?;
 
             Ok(TxVerifyResult {
                 r_pp,
@@ -2135,19 +2238,22 @@ pub fn verify_sweep_bucket_aggregation(
     let mu = block_channel.get_random_point();
     let beta_block = block_channel.get_random_point();
 
+    let n_participants = n_tx + 1;
+    let spine_participant_idx = n_tx;
     let mu_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(n_tx);
+        let mut v = Vec::with_capacity(n_participants);
         let mut cur = Block128::ONE;
-        for _ in 0..n_tx {
+        for _ in 0..n_participants {
             v.push(cur);
             cur *= mu;
         }
         v
     };
+    let max_cols = n_per_tx.max(n_block_spine_slices);
     let beta_powers: Vec<Block128> = {
-        let mut v = Vec::with_capacity(n_per_tx);
+        let mut v = Vec::with_capacity(max_cols);
         let mut cur = Block128::ONE;
-        for _ in 0..n_per_tx {
+        for _ in 0..max_cols {
             v.push(cur);
             cur *= beta_block;
         }
@@ -2162,6 +2268,10 @@ pub fn verify_sweep_bucket_aggregation(
                 .fold(Block128::ZERO, |a, b| a + b);
             target += mu_powers[k] * inner;
         }
+        let inner_spine = (0..n_block_spine_slices)
+            .map(|i| beta_powers[i] * bucket.block_col_openings[spine_offset + i])
+            .fold(Block128::ZERO, |a, b| a + b);
+        target += mu_powers[spine_participant_idx] * inner_spine;
         target
     };
     if bucket.block_initial_claim != block_target {
@@ -2210,6 +2320,12 @@ pub fn verify_sweep_bucket_aggregation(
         }
         expected += mu_powers[k] * eq_k * inner;
     }
+    let eq_spine = noid_core::mle::eq::eq_ind(&spine_r_low, &r_block);
+    let mut inner_spine = Block128::ZERO;
+    for i in 0..n_block_spine_slices {
+        inner_spine += beta_powers[i] * m[spine_offset + i];
+    }
+    expected += mu_powers[spine_participant_idx] * eq_spine * inner_spine;
     if expected != block_final_claim {
         return Err(VerifyBlockError::BlockMultipoint);
     }

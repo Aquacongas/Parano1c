@@ -5,10 +5,9 @@
 //!
 //!   cargo bench --bench block_scaling
 //!
-//! Measures:
-//! - existing `Standard4x8` block prover (`prove_block` standard bucket path);
-//! - `Sweep25x2` bucket aggregation (`assemble_sweep_bucket_proof`);
-//! - mixed composition estimates using real standard + real sweep bucket proofs.
+//! Measures both component bucket paths and full production block proof paths.
+//! The standard bucket-only rows reproduce the old numbers; full block rows add
+//! common state-binding proofs and are the cap-driving production numbers.
 //!
 //! Wallet proof generation is pre-built and reported separately; block timings do
 //! not include wallet proving latency.
@@ -16,7 +15,7 @@
 use std::time::{Duration, Instant};
 
 use bench_prover::{
-    bench_standard_block, bench_standard_block_with_total, bench_sweep_bucket, fmt_bytes, fmt_ms,
+    bench_full_block_proof, bench_standard_block, bench_sweep_bucket, fmt_bytes, fmt_ms,
     owned_sweep_witness, prove_sweep_wallet, standard_fixture, standard_scenario, sweep_fixture,
     sweep_scenario, time_once, StandardFixture, SweepFixture,
 };
@@ -30,7 +29,7 @@ fn build_standard_fixtures(n: usize, slot_base: u32) -> Vec<StandardFixture> {
                 "standard block tx",
                 shape.0,
                 shape.1,
-                slot_base + i as u32 * 100,
+                slot_base + i as u32 * 10_000,
                 0xA1 + i as u128 * 0x100,
             ))
         })
@@ -72,23 +71,53 @@ fn preprove_sweep_witnesses(
 }
 
 fn print_standard_block(n: usize, fixtures: &[StandardFixture]) {
-    eprintln!("  benchmarking standard-only block N={n}...");
-    let r = bench_standard_block(fixtures);
-    println!("  [Standard-only block: {n} tx]");
-    println!("    prove_block:             {}", fmt_ms(r.prove_time));
-    println!("    verify_block:            {}", fmt_ms(r.verify_time));
-    println!("    block proof:             {}", fmt_bytes(r.proof_bytes));
+    eprintln!("  benchmarking standard-only bucket component N={n}...");
+    let bucket = bench_standard_block(fixtures);
+    println!("  [Standard-only bucket component: {n} tx]");
+    println!("    prove bucket path:       {}", fmt_ms(bucket.prove_time));
     println!(
-        "    standard bucket:         {}",
-        fmt_bytes(r.standard_bucket_bytes)
+        "    verify bucket path:      {}",
+        fmt_ms(bucket.verify_time)
     );
     println!(
-        "    unified spine:           {}",
-        fmt_bytes(r.unified_spine_bytes)
+        "    component proof:         {}",
+        fmt_bytes(bucket.proof_bytes)
     );
     println!(
-        "    per-tx algebraic:        {}",
-        fmt_bytes(r.per_tx_algebraic_bytes)
+        "      standard bucket:       {}",
+        fmt_bytes(bucket.standard_bucket_bytes)
+    );
+    println!(
+        "      block spine:           {}",
+        fmt_bytes(bucket.unified_spine_bytes)
+    );
+    println!(
+        "      per-tx algebraic:      {}",
+        fmt_bytes(bucket.per_tx_algebraic_bytes)
+    );
+    println!();
+
+    eprintln!("  benchmarking standard-only full block proof N={n}...");
+    let full = bench_full_block_proof(fixtures, &[], &[]);
+    println!("  [Standard-only full block proof: {n} tx]");
+    println!("    prove full block:        {}", fmt_ms(full.prove_time));
+    println!("    verify full block:       {}", fmt_ms(full.verify_time));
+    println!(
+        "    block proof:             {}",
+        fmt_bytes(full.proof_bytes)
+    );
+    println!(
+        "      standard bucket:       {}",
+        fmt_bytes(full.standard_bucket_bytes)
+    );
+    println!(
+        "      state binding:         {}",
+        fmt_bytes(full.state_binding_bytes)
+    );
+    println!(
+        "    state-binding overhead:  prove +{}, bytes +{}",
+        fmt_ms(full.prove_time.saturating_sub(bucket.prove_time)).trim(),
+        fmt_bytes(full.proof_bytes.saturating_sub(bucket.proof_bytes)).trim()
     );
     println!();
 }
@@ -96,16 +125,41 @@ fn print_standard_block(n: usize, fixtures: &[StandardFixture]) {
 fn print_sweep_bucket(n: usize, fixtures: &[SweepFixture]) {
     eprintln!("  pre-proving sweep wallet proofs N={n}...");
     let (wallet_prep, witnesses) = preprove_sweep_witnesses(fixtures, 1);
-    eprintln!("  benchmarking sweep bucket N={n}...");
-    let r = bench_sweep_bucket(&witnesses);
-    println!("  [Sweep-only bucket: {n} tx]");
+    eprintln!("  benchmarking sweep-only full block proof N={n}...");
+    let full = bench_full_block_proof(&[], fixtures, &witnesses);
+    eprintln!("  benchmarking sweep bucket detail N={n}...");
+    let bucket = bench_sweep_bucket(&witnesses);
+    println!("  [Sweep-only full block proof: {n} tx]");
     println!("    wallet pre-proof total:  {}", fmt_ms(wallet_prep));
-    println!("    assemble bucket:         {}", fmt_ms(r.prove_time));
-    println!("    verify bucket:           {}", fmt_ms(r.verify_time));
-    println!("    sweep bucket proof:      {}", fmt_bytes(r.bucket_bytes));
+    println!("    prove full block:        {}", fmt_ms(full.prove_time));
+    println!("    verify full block:       {}", fmt_ms(full.verify_time));
     println!(
-        "    per-tx algebraic:        {}",
-        fmt_bytes(r.per_tx_algebraic_bytes)
+        "    block proof:             {}",
+        fmt_bytes(full.proof_bytes)
+    );
+    println!(
+        "      sweep bucket:          {}",
+        fmt_bytes(full.sweep_bucket_bytes)
+    );
+    println!(
+        "      state binding:         {}",
+        fmt_bytes(full.state_binding_bytes)
+    );
+    println!(
+        "    bucket aggregation only:  {}",
+        fmt_ms(bucket.aggregation_verify_time)
+    );
+    println!(
+        "      block spine:           {}",
+        fmt_bytes(bucket.block_spine_bytes)
+    );
+    println!(
+        "      tx auth proofs total:  {}",
+        fmt_bytes(bucket.tx_auth_proofs_bytes)
+    );
+    println!(
+        "      per-tx algebraic:      {}",
+        fmt_bytes(bucket.per_tx_algebraic_bytes)
     );
     println!();
 }
@@ -113,41 +167,32 @@ fn print_sweep_bucket(n: usize, fixtures: &[SweepFixture]) {
 fn print_mixed(n_standard: usize, n_sweep: usize) {
     eprintln!("  building mixed block fixtures {n_standard} standard + {n_sweep} sweep...");
     let standard = build_standard_fixtures(n_standard, 20_000);
-    let sweep = build_sweep_fixtures(n_sweep, 40_000);
+    let sweep = build_sweep_fixtures(n_sweep, 2_000_000);
     let (sweep_wallet_prep, sweep_witnesses) =
         preprove_sweep_witnesses(&sweep, 1 + n_standard as u32);
 
-    eprintln!("  benchmarking mixed standard bucket...");
-    let std_r = bench_standard_block_with_total(&standard, (n_standard + n_sweep) as u32);
-    eprintln!("  benchmarking mixed sweep bucket...");
-    let sweep_r = bench_sweep_bucket(&sweep_witnesses);
+    eprintln!("  benchmarking mixed full block proof...");
+    let full = bench_full_block_proof(&standard, &sweep, &sweep_witnesses);
 
-    println!("  [Mixed composition: {n_standard} Standard4x8 + {n_sweep} Sweep25x2]");
+    println!("  [Mixed full block proof: {n_standard} Standard4x8 + {n_sweep} Sweep25x2]");
     println!("    sweep wallet pre-proof:  {}", fmt_ms(sweep_wallet_prep));
+    println!("    prove full block:        {}", fmt_ms(full.prove_time));
+    println!("    verify full block:       {}", fmt_ms(full.verify_time));
     println!(
-        "    prove buckets total:     {}",
-        fmt_ms(std_r.prove_time + sweep_r.prove_time)
-    );
-    println!("      standard bucket:       {}", fmt_ms(std_r.prove_time));
-    println!(
-        "      sweep bucket:          {}",
-        fmt_ms(sweep_r.prove_time)
-    );
-    println!(
-        "    verify buckets total:    {}",
-        fmt_ms(std_r.verify_time + sweep_r.verify_time)
-    );
-    println!(
-        "    proof bytes total:       {}",
-        fmt_bytes(std_r.standard_bucket_bytes + sweep_r.bucket_bytes)
+        "    block proof:             {}",
+        fmt_bytes(full.proof_bytes)
     );
     println!(
         "      standard bucket:       {}",
-        fmt_bytes(std_r.standard_bucket_bytes)
+        fmt_bytes(full.standard_bucket_bytes)
     );
     println!(
         "      sweep bucket:          {}",
-        fmt_bytes(sweep_r.bucket_bytes)
+        fmt_bytes(full.sweep_bucket_bytes)
+    );
+    println!(
+        "      state binding:         {}",
+        fmt_bytes(full.state_binding_bytes)
     );
     println!();
 }
@@ -157,7 +202,8 @@ fn main() {
     println!("  =====================================================================");
     println!("  PARANOID Block/Bucket Scaling Benchmark");
     println!("  =====================================================================");
-    println!("  Real production proof paths; wallet proofs are pre-built for block timing.");
+    println!("  Bucket components plus full production block proofs.");
+    println!("  Wallet proofs are pre-built for block timing.");
     println!();
 
     let max_standard = 100;
@@ -183,9 +229,12 @@ fn main() {
 
     println!("  -------------------------------------------------------------------");
     println!("  NOTES:");
-    println!("    - Standard timings use current prove_block/verify_block API.");
-    println!("    - Sweep timings use assemble_sweep_bucket_proof + aggregation verifier.");
-    println!("    - Mixed rows are real standard bucket + real sweep bucket composition.");
+    println!("    - Bucket component rows are diagnostic breakdowns, not production validity.");
+    println!(
+        "    - Full block rows are the production proof-native path: buckets + state binding."
+    );
+    println!("    - Sweep bucket aggregation is printed only as a component breakdown.");
+    println!("    - Mixed rows include both buckets plus common state-binding proofs.");
     println!("    - Wallet pre-proof time is reported separately and is not block-time work.");
     println!("  -------------------------------------------------------------------");
     println!("  Reproduce: cargo bench --bench block_scaling");

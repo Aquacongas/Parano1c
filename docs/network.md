@@ -67,7 +67,7 @@ no ZK proving.
 | `T_OWNER_INDEX` | owner_addr (32B) | packed Vec<(slot_u32, value_u64)> | current state | proportional to UTXO set |
 | `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | 6.5 KB |
 | `T_RECENT_BLOCKS` | height (u64) | full Block bytes | last 18 blocks | ~4 MB |
-| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | last 18 blocks | ~35 MB at 100 txs/block; ~90 MB at max |
+| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | last 18 blocks | ~64 MB at 100 Standard txs/block; shape-mix dependent |
 | `T_UNDO_LOGS` | height (u64) | BlockUndoLog | last 18 blocks | ~2 MB |
 | `T_NULLIFIERS` | tx_body_hash (32B) | height (u64) | last 144 blocks | ~1.2 MB |
 | `T_NULLIFIER_BLOCKS` | height (u64) | packed tx_body_hashes | last 144 blocks | ~1.2 MB |
@@ -123,7 +123,7 @@ Only segments with live UTXOs are materialized (rest are virtual zero, no disk).
 At full capacity (2^32 slots, all materialized): 2^32 × 48 bytes ≈ 192 GiB max theoretical ceiling.
 
 **Volatile (fixed, independent of chain age):**
-- Recent blocks + proofs + undo: ~40 MB at 100 txs/block; ~96 MB at max (always last 18 blocks)
+- Recent blocks + proofs + undo: ~70 MB at 100 Standard txs/block; shape-mix dependent (always last 18 blocks)
 - Nullifiers + tx_index: ~3.6 MB (always last 144 blocks)
 - Recursive proof: 6.5 KB (single latest)
 
@@ -230,7 +230,7 @@ New Node                         Peers (up to 3 queried)
    |<-- RecursiveProof (6.5 KB)
    |
    | 3. Verify the ENTIRE chain history in one call:
-   |    verify_tip(proof, prev_state_root, tip_height)
+   |    verify_tip(proof, expected_state_root, tip_height)
    |      - STARK verify: O(1), ~5 ms
    |      - proof.state_root == manifest state_root (from headers)
    |      - proof covers height == tip - 1
@@ -329,7 +329,7 @@ When a node receives a block from the network, it runs these checks in order
 - Deserialization succeeds
 - Per-peer rate limit: 40 blocks / 10 seconds
 
-**Stage 2: Native Consensus (`validate_block_checks`, O(txs))**
+**Stage 2: Cheap Consensus Checks (`validate_block_checks`, O(txs))**
 
 | Check | Error | Purpose |
 |-------|-------|---------|
@@ -348,36 +348,41 @@ When a node receives a block from the network, it runs these checks in order
 | Coinbase: value <= reward + fees | InflatedCoinbase | Inflation prevention |
 | `header.log_slots` matches expansion rule | BadLogSlotsExpansion | State capacity |
 
-**Stage 3: ZK Proof Verification (`verify_block`, O(txs x ~50ms))**
+**Stage 3: Full BlockProof Verification (`validate_block_from_network`, proof-native)**
 
 Only for blocks with user transactions (coinbase-only blocks skip this):
 
 | Check | Error | Purpose |
 |-------|-------|---------|
-| proof.log_slots == header.log_slots per tx | LogSlotsInconsistent | Parameter binding |
-| SpineGKR: tx_body_hash computation correct | StarkInvalid | TX body integrity |
-| AuthGKR: Address = H_ADDR(secret), AuthTag = H_AUTH(secret, body) | StarkInvalid | Ownership proof |
-| TxLogicAir STARK: balance, range, binding | StarkInvalid | TX validity |
-| BlockStateBindingAir: slot openings vs state MLE | StarkInvalid | State consistency |
-| FRI opening: all columns committed correctly | StarkInvalid | Commitment |
+| proof/header transcript binding | BadProofTranscript | Header commits to this exact `BlockProof` |
+| bucket coverage: every non-coinbase tx appears once in the correct shape bucket | ShapeMismatch | Standard/Sweep binding |
+| SpineGKR / sweep spine: tx_body_hash computation correct | StarkInvalid | TX body integrity |
+| AuthGKR / sweep auth: Address = H_ADDR(secret), AuthTag = H_AUTH(secret, body) | StarkInvalid | Ownership proof |
+| TxLogicAir / SweepTxLogicAir: balance, range, binding | StarkInvalid | TX validity |
+| mandatory BlockStateBindingAir: slot openings vs state MLE | StarkInvalid | State consistency |
+| per-bucket FRI opening: all bucket columns committed correctly | StarkInvalid | Commitment |
 
-**Stage 4: State Transition (`apply_state_delta`)**
+**Stage 4: Commit Proven State Delta (`apply_state_delta`)**
+
+`BlockStateBindingAir` already proved the pre-root → post-root transition against
+state MLE openings. `apply_state_delta` therefore commits the proven delta. It does
+not re-run wallet logic or create a second user-transaction acceptance path.
 
 | Check | Error | Purpose |
 |-------|-------|---------|
-| Computed state_root == header.state_root | BadStateRoot | State binding |
-| Computed tx_root == header.tx_root | BadTxRoot | TX binding |
-| active_slot_count == header.active_slot_count | ShapeMismatch | Counter |
-| alloc_counter == header.alloc_counter | ShapeMismatch | Allocator |
+| `tx_root == header.tx_root` | BadTxRoot | TX binding |
+| `active_slot_count == header.active_slot_count` | ShapeMismatch | Counter |
+| `alloc_counter == header.alloc_counter` | ShapeMismatch | Allocator |
+| `log_slots == header.log_slots` | BadLogSlotsExpansion | State capacity |
 
-After all 4 stages pass: block is committed to MDBX, gossiped to peers.
+After all 4 stages pass: block is committed atomically to MDBX, then gossiped to peers.
 
 ### Coinbase-Only Blocks (No User TXs)
 
 Most blocks at low TPS contain only a coinbase transaction. These:
 - Have empty `block_proof_bytes` in gossip
 - Skip ZK verification entirely (no user txs to prove)
-- Are validated by native consensus + state transition only
+- Are validated by proof/header stub binding, cheap consensus checks, and `apply_state_delta`
 - `header.proof_transcript_hash` = `STUB_MARKER [1u8; 32]` (prevents an
   adversary from omitting the proof on blocks that DO have user txs)
 
@@ -464,7 +469,7 @@ Dedup:           blake3 content hash
 | Topic | Message Type | Size |
 |-------|-------------|------|
 | `/noid/{network}/blocks/1` | BlockGossipMsg | 310B compact or <1MB inline |
-| `/noid/{network}/txs/1` | raw TxIntent bytes | ~1-2 KB |
+| `/noid/{network}/txs/1` | raw TxIntent bytes | shape-dependent; Standard wallet proofs are ~26 KB, sweep proofs are larger |
 | `/noid/{network}/recproofs/1` | RecursiveProofGossipMsg | ~6.5 KB |
 
 ### Block Gossip (Dual Mode)
@@ -478,7 +483,7 @@ enum BlockGossipMsg {
 
 - Blocks < 1 MB total (block + proof): inlined in gossip message
 - Blocks >= 1 MB: compact announcement, peers pull via request-response
-- At 256 txs, block+proof is ~5.2 MB, so compact announcement + pull is used
+- Large proof-native user-tx blocks normally use compact announcement + pull
 
 ### Request-Response Protocols
 
@@ -520,8 +525,8 @@ MAX_SYNC_TXS:            8,192
 
 2. Parallel execution:
    - Thread A: PoW search (Blake3, nonce space 2^128, ~15s target)
-   - Thread B: prove_block (TxLogicAir x N + SpineGKR + AuthGKR + FRI)
-     ZK proving takes ~10s for a full block
+   - Thread B: prove_block (shape buckets + BlockStateBindingAir + per-bucket FRI)
+     ZK proving time depends on tx count and shape mix; proof-native 100-tx Standard blocks are ~38s on the reference laptop
 
 3. Both complete:
    - Seal header (embed proof_transcript_hash, witness_root)
@@ -547,12 +552,14 @@ MAX_SYNC_TXS:            8,192
 
 2. Rate limit check (40/peer/10s)
 
-3. validate_block_full():
-   - Native consensus (header chain, PoW, timestamps, fees, slots)
-   - ZK verify (if has user txs)
-   - State transition (apply, check roots)
+3. Proof-native apply path (`MdbxChainContext::apply_next_block`):
+   - Bind proof bytes to `header.proof_transcript_hash`
+   - Run cheap consensus checks (header chain, PoW, timestamps, fees, slot conflicts)
+   - For user-tx blocks, run `validate_block_from_network` over the full canonical `BlockProof`
+   - For coinbase-only blocks, enforce the canonical stub marker and deterministic coinbase delta
+   - Commit the proven state delta via `apply_state_delta`
 
-4. Commit to MDBX:
+4. Atomic MDBX commit:
    - Update state (segments, owner index)
    - Store header, recent block, block proof, undo log
    - Prune old entries beyond retention windows
@@ -636,8 +643,8 @@ with sufficient chainwork requires actually performing the PoW.
 | `FINALITY_DEPTH` | 18 blocks | Max reorg depth; undo/proof retention |
 | `ANCHOR_DEPTH` | 144 blocks (~36 min) | TX validity window; nullifier retention |
 | `BLOCK_MAX_TXS` | 256 | Max user transactions per block |
-| `MAX_INPUTS` | 4 per tx | Input count limit |
-| `MAX_OUTPUTS` | 8 per tx | Output count limit |
+| `Standard4x8` | 4 inputs / 8 outputs | Default payment shape |
+| `Sweep25x2` | 25 inputs / 2 outputs | Sweep/consolidation shape |
 | `LOG_SLOTS_GENESIS` | 24 (16.7M slots) | Initial state capacity |
 | `LOG_SLOTS_MAX` | 32 (4.3B slots) | Maximum state capacity |
 | `LOG_SEGMENT_SIZE` | 16 (65,536 slots) | Slots per FRI segment |
@@ -646,7 +653,8 @@ with sufficient chainwork requires actually performing the PoW.
 | `MAX_FUTURE_DRIFT` | 120 seconds | Max timestamp ahead of local clock |
 | `MEDIAN_TIME_BLOCKS` | 11 | MTP calculation window |
 | `MIN_FEE_BASE` | 5,000 μNOID (0.005) | Base fee per non-coinbase tx |
-| `FEE_PER_IO` | 500 μNOID (0.0005) | Fee per live input/output |
+| `FEE_PER_INPUT` | 100 μNOID (0.0001) | Small anti-DoS/prover-work fee per live input |
+| `FEE_PER_OUTPUT` | 700 μNOID (0.0007) | Fee per live output |
 | `STATE_GROWTH_FEE_BASE` | 2,500 μNOID (0.0025) | Base burned fee per net-new UTXO slot |
 | `BASE_REWARD` | 50 NOID | Starting block reward |
 | `FLOOR_REWARD` | 1 NOID | Minimum reward (forever) |

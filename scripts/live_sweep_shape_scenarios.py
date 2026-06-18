@@ -10,7 +10,7 @@ Covers the roadmap N9 local lifecycle:
 - optionally, a larger fragmented payment auto-splits into multiple chunks, including Sweep25x2.
 
 Environment knobs:
-  NOID_LIVE_SWEEP_START_BLOCKS default 20 (18+ required for recursive aggregation proof readiness)
+  NOID_LIVE_SWEEP_START_BLOCKS default 20, raised to at least 30 when split is enabled
   NOID_LIVE_SWEEP_BASE_PORT          default 19800
   NOID_LIVE_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
   NOID_LIVE_SWEEP_SKIP_CONSOLIDATE   default 0 (only runs in the quick/no-split path)
@@ -33,6 +33,8 @@ LOGS = BASE / "logs"
 START_BLOCKS = int(os.environ.get("NOID_LIVE_SWEEP_START_BLOCKS", "20"))
 BASE_PORT = int(os.environ.get("NOID_LIVE_SWEEP_BASE_PORT", "19800"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_SWEEP_SKIP_SPLIT", "1") == "1"
+if not SKIP_SPLIT:
+    START_BLOCKS = max(START_BLOCKS, 30)
 SKIP_CONSOLIDATE = os.environ.get("NOID_LIVE_SWEEP_SKIP_CONSOLIDATE", "0") == "1"
 RESTART_AFTER_CONFIRMED = os.environ.get("NOID_LIVE_SWEEP_RESTART", "0") == "1"
 

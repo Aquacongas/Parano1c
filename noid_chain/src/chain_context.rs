@@ -7,18 +7,15 @@
 //! it needs recent block headers (for timestamp MTP and ASERT anchor), the nullifier
 //! set, undo logs (for reorg), and the running tip info.
 //!
-//! `ChainContext` bundles all of this into one struct. It is the authoritative
-//! in-memory representation of the chain. The MDBX backend persists
-//! this data to disk; the RAM backend is used for tests and light contexts.
+//! `ChainContext` bundles all of this into one struct. It is the RAM/in-memory
+//! chain context used by tests and non-live utilities. The live full node uses
+//! `MdbxChainContext::apply_next_block`, which verifies full block proofs before
+//! committing the proven state delta to durable storage.
 //!
-//! # Usage
+//! # Scope
 //!
-//! ```text
-//! let mut ctx = ChainContext::init_from_genesis();
-//! for block in incoming_blocks {
-//!     ctx.apply_next_block(&block, local_time)?;
-//! }
-//! ```
+//! This context intentionally does not verify `BlockProof`. Do not use it as the
+//! full-node production block acceptance path.
 
 use std::collections::HashMap;
 
@@ -37,11 +34,10 @@ use crate::nullifier::NullifierSet;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
 
-/// Unified chain context for block validation and application.
+/// In-memory chain context for tests and non-live utilities.
 ///
-/// All fields are derived deterministically from the block history.
-/// Two nodes applying the same sequence of valid blocks will have
-/// identical `ChainContext` state.
+/// All fields are derived deterministically from the block history. Live full
+/// nodes use the MDBX-backed proof-native context instead.
 pub struct ChainContext {
     /// All block headers ever seen, indexed by height. Never pruned.
     /// 276 bytes × N blocks (≈ 1.5 GB after 10 years at 1 block/min).
@@ -143,7 +139,11 @@ impl ChainContext {
         }
     }
 
-    /// Validate and apply the next block on top of the current tip.
+    /// Validate and apply the next block on top of the current tip using the
+    /// sequential consensus interpreter.
+    ///
+    /// This is not the live full-node production path; it does not verify a
+    /// `BlockProof` or `BlockStateBindingAir`.
     ///
     /// On success:
     /// - `state` is updated to the post-block UTXO state
@@ -155,8 +155,7 @@ impl ChainContext {
     ///
     /// On failure, the context is left **unchanged**.
     ///
-    /// Note: ZK proof verification (LogicProof + BlockProof) is NOT performed here.
-    /// Call `validate_block_full()` from `noid_block` for full validation.
+    /// Note: ZK proof verification is NOT performed here.
     pub fn apply_next_block(
         &mut self,
         block: &Block,
@@ -170,7 +169,7 @@ impl ChainContext {
         // Build undo log BEFORE applying (captures pre-state).
         let undo = build_undo_log(&self.state, block);
 
-        // Run native consensus validation (no ZK).
+        // Run the sequential consensus interpreter (no ZK).
         // On success, self.state is updated to the post-block state.
         // On failure, self.state is left unchanged.
         let new_state_root = validate_block_consensus(

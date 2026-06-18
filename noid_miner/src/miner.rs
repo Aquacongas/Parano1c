@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
-use noid_air::Air;
 use noid_chain::block::Block;
 use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::storage::MdbxChainContext;
@@ -526,7 +525,7 @@ impl BlockMiner {
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
                             // if we fire the event before storing, a fast peer gets None.
-                            if let Err(e) = self.apply_found_block(&block, &block_bytes).await {
+                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes).await {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
@@ -607,7 +606,11 @@ impl BlockMiner {
     /// Write lock is held for MDBX commit + wallet hook + ChainView clone.
     /// Building ChainView inside the write lock adds zero contention (the lock
     /// is already exclusive) and eliminates a separate ~50ms read lock.
-    async fn apply_found_block(&self, block: &Block, _block_bytes: &[u8]) -> anyhow::Result<()> {
+    async fn apply_found_block(
+        &self,
+        block: &Block,
+        block_proof_bytes: &[u8],
+    ) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
         let local_time = std::time::SystemTime::now()
@@ -626,10 +629,38 @@ impl BlockMiner {
         let new_view = {
             let chain_clone = self.chain.clone();
             let block_owned = block.clone();
+            let proof_bytes = block_proof_bytes.to_vec();
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
-                ctx.apply_next_block(&block_owned, local_time)?;
+                ctx.apply_next_block(
+                    &block_owned,
+                    &proof_bytes,
+                    local_time,
+                    |block,
+                     proof_bytes,
+                     parent,
+                     prev_timestamps,
+                     prev_active_counts,
+                     local_time,
+                     anchor,
+                     nullifiers,
+                     pre_state,
+                     state| {
+                        noid_block::validate_block_from_network(
+                            block,
+                            proof_bytes,
+                            parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            local_time,
+                            anchor,
+                            nullifiers,
+                            pre_state,
+                            state,
+                        )
+                    },
+                )?;
                 if let Some(h) = &hook {
                     h(&block_owned);
                 }
@@ -669,21 +700,22 @@ impl BlockMiner {
 /// (when pre-proving cache is populated). When no bundles exist, the
 /// decoded from `logic_proof_bytes` at block assembly time.
 ///
-/// # State binding
+/// # State correctness
 ///
-/// When `tmpl.inner.state_binding` is `Some`, state bindings are built via
-/// `build_state_bindings_from_binding` and passed to `prove_block`. When the
-/// template has no state binding (e.g. coinbase-only blocks), empty bindings
-/// are used and native consensus checks enforce state correctness.
+/// Production block validity is proof-native: every user-transaction block must
+/// include `BlockStateBindingAir` witnesses proving the header state-root
+/// transition. The live node/miner verify the full block proof and then commit
+/// the proven delta via the single `apply_next_block` path.
 pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
 ) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
+    use noid_air::Air;
     use noid_block::{
         assemble_sweep_bucket_proof, block_recursive_claim_hash, build_block_witnesses,
-        build_empty_state_bindings, build_state_bindings_from_binding,
-        prove_block_with_total_tx_count, prove_state_bindings_standalone, BlockProof,
-        BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
+        build_state_bindings_from_binding, prove_block_with_total_tx_count,
+        prove_state_bindings_standalone, BlockProof, BlockPublicMeta, OwnedTxWitness,
+        TxBlockWitness,
     };
     use noid_stark::WalletProofBundle;
 
@@ -754,59 +786,55 @@ pub(crate) fn run_prove_block(
         .collect();
 
     let n_tx = tmpl.n_user_txs() as u32;
-    let new_state_root = tmpl
-        .inner
-        .state_binding
-        .as_ref()
-        .map(|b| b.new_state_root)
-        .unwrap_or([0u8; 32]);
+    let new_state_root = tmpl.inner.state_root;
 
     let sweep_bucket = assemble_sweep_bucket_proof(prev_state_root, &sweep_owned)
         .map_err(|e| format!("assemble_sweep_bucket_proof failed: {e:?}"))?;
 
-    let non_cb_bodies: Vec<noid_tx::TxBody> =
-        tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();
-    let owned_bindings = match &tmpl.inner.state_binding {
-        Some(binding) if !non_cb_bodies.is_empty() => build_state_bindings_from_binding(
-            binding,
-            &non_cb_bodies,
-            Some(&tmpl.inner.coinbase.body),
-            &tmpl.pre_segs,
-            prev_state_root,
-            n_tx,
-            log_slots,
-        ),
-        _ => vec![],
-    };
-    let empty_bindings = build_empty_state_bindings();
-    let state_bindings_owned: Vec<_> = owned_bindings.iter().map(|b| b.as_witness()).collect();
-    let state_bindings: &[_] = if state_bindings_owned.is_empty() {
-        &empty_bindings
-    } else {
-        &state_bindings_owned
-    };
-    let n_state_bindings = state_bindings.len();
-    let sb_n_cols_per_seg = state_bindings.first().map_or(0, |sb| sb.air.n_columns());
-    let sb_log_rows = state_bindings.first().map_or(0, |sb| sb.air.log_rows());
+    let user_bodies: Vec<_> = tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();
+    let binding = tmpl.inner.state_binding.as_ref().ok_or_else(|| {
+        "user-transaction template is missing BlockStateBinding; proof-native block production requires state binding".to_string()
+    })?;
+    if binding.prev_state_root != prev_state_root || binding.new_state_root != new_state_root {
+        return Err("BlockStateBinding roots do not match template/header roots".to_string());
+    }
+    let owned_state_bindings = build_state_bindings_from_binding(
+        binding,
+        &user_bodies,
+        Some(&tmpl.inner.coinbase.body),
+        &tmpl.pre_segs,
+        prev_state_root,
+        n_tx,
+        log_slots,
+    );
+    let state_bindings: Vec<_> = owned_state_bindings
+        .iter()
+        .map(|b| b.as_witness())
+        .collect();
 
     let prove_result = if witnesses.is_empty() {
+        let Some(bucket) = sweep_bucket else {
+            return Err("user-transaction block has no provable bucket".to_string());
+        };
         let (state_binding_starks, pre_state_openings, post_state_openings) =
-            prove_state_bindings_standalone(state_bindings);
+            prove_state_bindings_standalone(&state_bindings);
         Ok(BlockProof {
             meta: BlockPublicMeta {
                 prev_block_state_root: prev_state_root,
                 new_state_root,
                 n_tx,
-                n_air_per_tx: 0,
-                n_auth_slices_per_tx: 0,
-                log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
-                n_block_spine_slices: 0,
-                n_state_bindings: n_state_bindings as u32,
-                state_binding_n_cols: sb_n_cols_per_seg as u32,
-                state_binding_log_rows: sb_log_rows as u32,
+                n_air_per_tx: bucket.meta.n_air_per_tx,
+                n_auth_slices_per_tx: bucket.meta.n_boundary_slices_per_tx,
+                log_rows: bucket.meta.log_rows,
+                n_block_spine_slices: bucket.meta.n_block_spine_slices,
+                n_state_bindings: state_bindings.len() as u32,
+                state_binding_n_cols: state_bindings.first().map_or(0, |sb| sb.air.n_columns())
+                    as u32,
+                state_binding_log_rows: state_bindings.first().map_or(0, |sb| sb.air.log_rows())
+                    as u32,
             },
             standard_bucket: None,
-            sweep_bucket,
+            sweep_bucket: Some(bucket),
             state_binding_algebraics: vec![],
             state_binding_starks,
             pre_state_openings,
@@ -817,7 +845,7 @@ pub(crate) fn run_prove_block(
             prev_state_root,
             new_state_root,
             &witnesses,
-            state_bindings,
+            &state_bindings,
             n_tx,
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -857,7 +885,6 @@ mod tests {
     use bench_prover::{
         prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
         standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
-        BENCH_PREV_STATE_ROOT,
     };
     use noid_block::{
         validate_block_bucket_tx_indices, validate_block_proof_transcript_hash, BlockProof,
@@ -867,10 +894,15 @@ mod tests {
     use noid_chain::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
     use noid_chain::consensus::pow::full_block_hash;
     use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
+    use noid_chain::fri_state::SlotValue;
     use noid_chain::segmented_state::SegmentColumns;
+    use noid_chain::state::{apply_tx, ChainState};
+    use noid_chain::state_binding::BlockStateBinding;
     use noid_poseidon2b::primitives::Address;
     use noid_stark::WalletProofBundle;
-    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
+    use noid_tx::{
+        compute_claims_commitment, hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape,
+    };
     use std::collections::HashMap;
 
     fn tx_from_body(body: TxBody) -> Transaction {
@@ -923,13 +955,154 @@ mod tests {
         (body, sweep_bundle(&fixture, proof))
     }
 
-    fn miner_template(user: Vec<(TxBody, WalletProofBundle)>) -> crate::template::BlockTemplate {
-        let parent = genesis_header();
-        let coinbase = coinbase_tx();
-        let txs: Vec<Transaction> = user
+    fn seed_pre_state(user_bodies: &[TxBody]) -> ChainState {
+        let mut state = ChainState::with_log_slots(BENCH_LOG_SLOTS as usize);
+        for input in user_bodies
             .iter()
-            .map(|(body, _)| tx_from_body(body.clone()))
+            .flat_map(|body| body.inputs.iter().filter(|i| i.valid))
+        {
+            let [owner_hi, owner_lo] = input.owner.as_fields();
+            state
+                .state
+                .set_slot(
+                    input.slot_index,
+                    SlotValue {
+                        value: (input.value as u128).into(),
+                        owner_hi,
+                        owner_lo,
+                    },
+                )
+                .expect("test input slot in range");
+            state.active_slot_count += 1;
+            state.alloc_counter += 1;
+        }
+        state
+    }
+
+    fn pre_segments_for_template(
+        state: &ChainState,
+        user_bodies: &[TxBody],
+        coinbase_body: &TxBody,
+    ) -> HashMap<u16, SegmentColumns> {
+        let eff_log = state.state.effective_log_segment_size();
+        let seg_size = 1usize << eff_log;
+        let mut pre_segs = HashMap::new();
+        for slot in user_bodies
+            .iter()
+            .chain(std::iter::once(coinbase_body))
+            .flat_map(|body| {
+                body.inputs
+                    .iter()
+                    .filter(|i| i.valid)
+                    .map(|i| i.slot_index)
+                    .chain(
+                        body.outputs
+                            .iter()
+                            .filter(|o| o.valid)
+                            .map(|o| o.slot_index),
+                    )
+            })
+        {
+            let seg_id = (slot >> eff_log) as u16;
+            pre_segs.entry(seg_id).or_insert_with(|| {
+                state
+                    .state
+                    .try_get_segment_columns(seg_id)
+                    .cloned()
+                    .unwrap_or_else(|| SegmentColumns::new_zero(seg_size))
+            });
+        }
+        pre_segs
+    }
+
+    fn patch_binding_with_coinbase(
+        binding: &mut BlockStateBinding,
+        pre_state: &noid_chain::segmented_state::SegmentedFriState,
+        mut post_user_state: noid_chain::segmented_state::SegmentedFriState,
+        user_bodies: &[TxBody],
+        coinbase_body: &TxBody,
+    ) {
+        for out in coinbase_body.outputs.iter().filter(|o| o.valid) {
+            let [owner_hi, owner_lo] = out.owner.as_fields();
+            post_user_state
+                .set_slot(
+                    out.slot_index,
+                    SlotValue {
+                        value: (out.value as u128).into(),
+                        owner_hi,
+                        owner_lo,
+                    },
+                )
+                .expect("test coinbase slot in range");
+        }
+
+        binding.new_state_root = post_user_state.root();
+        binding.tree_depth = post_user_state.tree_depth();
+        if binding.tree_depth == 0 {
+            return;
+        }
+
+        let eff_log = pre_state.effective_log_segment_size();
+        let mut touched = std::collections::HashSet::new();
+        for body in user_bodies {
+            for input in body.inputs.iter().filter(|i| i.valid) {
+                touched.insert((input.slot_index >> eff_log) as u16);
+            }
+            for output in body.outputs.iter().filter(|o| o.valid) {
+                touched.insert((output.slot_index >> eff_log) as u16);
+            }
+        }
+        for output in coinbase_body.outputs.iter().filter(|o| o.valid) {
+            touched.insert((output.slot_index >> eff_log) as u16);
+        }
+
+        for seg_id in touched {
+            binding
+                .pre_seg_siblings
+                .insert(seg_id, pre_state.merkle_siblings(seg_id));
+            binding
+                .post_seg_siblings
+                .insert(seg_id, post_user_state.merkle_siblings(seg_id));
+        }
+    }
+
+    fn miner_template(user: Vec<(TxBody, WalletProofBundle)>) -> crate::template::BlockTemplate {
+        let coinbase = coinbase_tx();
+        let user_bodies: Vec<TxBody> = user.iter().map(|(body, _)| body.clone()).collect();
+        let mut pre_state = seed_pre_state(&user_bodies);
+        let prev_state_root = pre_state.state_root();
+        let mut parent = genesis_header();
+        parent.state_root = prev_state_root;
+        parent.log_slots = BENCH_LOG_SLOTS;
+        parent.active_slot_count = pre_state.active_slot_count;
+        parent.alloc_counter = pre_state.alloc_counter;
+
+        let commitments: Vec<_> = user_bodies
+            .iter()
+            .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
             .collect();
+        let mut binding_state = pre_state.state.clone();
+        let mut state_binding =
+            BlockStateBinding::build(&mut binding_state, &user_bodies, &commitments)
+                .expect("build test BlockStateBinding");
+        patch_binding_with_coinbase(
+            &mut state_binding,
+            &pre_state.state,
+            binding_state,
+            &user_bodies,
+            &coinbase.body,
+        );
+        let state_root = state_binding.new_state_root;
+        let pre_segs = pre_segments_for_template(&pre_state, &user_bodies, &coinbase.body);
+
+        let mut post_state = pre_state.clone();
+        for body in &user_bodies {
+            apply_tx(&mut post_state, body).expect("test user tx applies");
+        }
+        apply_tx(&mut post_state, &coinbase.body).expect("test coinbase applies");
+        assert_eq!(post_state.state_root(), state_root);
+
+        let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();
         let proof_bytes = user
             .into_iter()
             .map(|(_, bundle)| Some(bundle.to_bytes()))
@@ -941,17 +1114,17 @@ mod tests {
         let inner = ChainTemplate {
             coinbase,
             txs,
-            state_root: [0u8; 32],
+            state_root,
             tx_root,
-            active_slot_count: 1,
-            alloc_counter: 1,
+            active_slot_count: post_state.active_slot_count,
+            alloc_counter: post_state.alloc_counter,
             log_slots: BENCH_LOG_SLOTS,
             height: parent.height + 1,
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
             miner_address: Address([0xCB; 32]),
             difficulty_target: GENESIS_TARGET,
             prev_block_hash: full_block_hash(&parent),
-            state_binding: None,
+            state_binding: Some(state_binding),
         };
         crate::template::BlockTemplate {
             inner,
@@ -960,13 +1133,13 @@ mod tests {
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
             parent,
             proof_bytes,
-            pre_segs: HashMap::<u16, SegmentColumns>::new(),
+            pre_segs,
         }
     }
 
     fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
         let (proof_hash, witness_root, proof_bytes) =
-            run_prove_block(tmpl, BENCH_PREV_STATE_ROOT).expect("run_prove_block");
+            run_prove_block(tmpl, tmpl.parent.state_root).expect("run_prove_block");
         assert!(
             !proof_bytes.is_empty(),
             "user-tx templates must carry BlockProof bytes"

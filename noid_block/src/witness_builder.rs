@@ -33,8 +33,9 @@ use std::collections::HashMap;
 use noid_air::airs::block_state_binding::{
     BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingWitness,
 };
-use noid_air::composition::sweep25x2_balance_witness_from_body;
+use noid_air::composition::sweep_logic_air_and_trace_from_body;
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
+use noid_air::composition::SweepTxLogicAir;
 use noid_air::{Air, Trace};
 use noid_chain::consensus::params::LOG_SEGMENT_SIZE;
 use noid_chain::segmented_state::SegmentColumns;
@@ -44,7 +45,7 @@ use noid_core::{Block128, TowerField};
 use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, SpineInputs, SweepAuthPublicInputs, SweepSpineInputs};
 use noid_stark::prove_logic_sweep::{
-    sweep_spine_inputs_from_body, SweepLogicProof, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
+    sweep_spine_inputs_from_body, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
 };
 use noid_stark::WalletProofBundle;
 use noid_tx::{PublicInputs, Transaction, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
@@ -76,14 +77,15 @@ pub struct OwnedStandardTxWitness {
 pub struct OwnedSweepTxWitness {
     /// Index into `Block.transactions`.
     pub block_tx_index: u32,
-    pub air: noid_air::airs::Sweep25x2BalanceGateAir,
+    pub air: SweepTxLogicAir,
     pub trace: Trace,
     pub pi: PublicInputs,
     pub spine_inputs: SweepSpineInputs,
     pub auth_public: SweepAuthPublicInputs,
+    /// Owned sweep AuthGKR proof cloned from the wallet logic proof.
+    pub auth_proof: noid_gkr::SweepAuthProofKillShot,
     /// Owned sweep AuthGKR `state` slices, mirroring standard `auth_slices`.
     pub auth_slices: Vec<Vec<Block128>>,
-    pub logic_proof: SweepLogicProof,
 }
 
 /// Shape-dispatched owned transaction witness.
@@ -204,9 +206,7 @@ pub fn build_tx_witness(
                 "malformed Sweep25x2 auth_slices length"
             );
 
-            let balance = sweep25x2_balance_witness_from_body(tx_body);
-            let (air, trace) = balance
-                .build_air_and_trace_with_log_rows(noid_air::airs::tx_body_spine::SPINE_LOG_ROWS);
+            let (air, trace) = sweep_logic_air_and_trace_from_body(tx_body);
             let pi = build_public_inputs(tx_body, log_slots);
             let spine_inputs = sweep_spine_inputs_from_body(tx_body);
 
@@ -217,8 +217,8 @@ pub fn build_tx_witness(
                 pi,
                 spine_inputs,
                 auth_public: bundle.auth_public,
+                auth_proof: bundle.logic_proof.auth.clone(),
                 auth_slices: bundle.auth_slices.clone(),
-                logic_proof: bundle.logic_proof.clone(),
             })
         }
     }

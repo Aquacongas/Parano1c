@@ -3,16 +3,15 @@
 
 //! `BlockChainContext` — extends `ChainContext` with recursive proof tracking.
 //!
-//! `ChainContext` (in `noid_chain`) handles all native consensus state.
+//! `ChainContext` (in `noid_chain`) is an in-memory, non-live utility context.
 //! `BlockChainContext` wraps it and adds:
 //!
 //! - `recursive_proof: Option<RecursiveBlockProof>` — the current O(1) chain proof.
 //! - `update_recursive_proof(block_proof)` — advances the recursive proof by one block.
 //! - `init_from_genesis()` — initialises both consensus state and genesis recursive proof.
 //!
-//! The recursive proof is updated **asynchronously** relative to block application:
-//! call `apply_block_consensus` (or `apply_block_full`) to advance consensus state,
-//! then call `update_recursive_proof` with the block's `BlockProof` when ready.
+//! The live full node does not use this wrapper as its block acceptance path; it
+//! uses `MdbxChainContext::apply_next_block` with full `BlockProof` validation.
 //!
 //! # Dependency note
 //!
@@ -83,13 +82,13 @@ impl BlockChainContext {
     }
 
     // -----------------------------------------------------------------------
-    // Block application (consensus only)
+    // In-memory block application (non-live utility)
     // -----------------------------------------------------------------------
 
-    /// Apply the next block using native consensus validation only (no ZK).
+    /// Apply the next block through the in-memory sequential interpreter.
     ///
-    /// Does NOT verify the block's ZK proof. For full ZK validation, use
-    /// `noid_block::validate_block_full` before calling this.
+    /// This is not the live full-node production path and does not verify the
+    /// block's ZK proof. Live nodes use MDBX proof-native application.
     ///
     /// Does NOT update the recursive proof. Call `update_recursive_proof`
     /// after this to advance the recursive chain.
@@ -108,7 +107,7 @@ impl BlockChainContext {
     /// Extract `BlockReplayWitness` from a `BlockProof` and advance the
     /// recursive chain proof by one step.
     ///
-    /// MUST be called after `apply_block_consensus` (or `apply_block_full`)
+    /// MUST be called after this utility context has advanced its in-memory tip
     /// so that `self.consensus.tip_header()` reflects the newly applied block.
     ///
     /// Returns a reference to the new recursive proof.

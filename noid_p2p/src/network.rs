@@ -34,13 +34,22 @@ struct PendingStateSegmentResponse {
 }
 
 // Hard caps on incoming response sizes to prevent OOM from malicious peers.
-const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB (256 txs × ~750 B each + header)
-const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // 6 MB (5 MB at max 256 txs + margin)
-const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin)
-const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB (6.5 KB typical)
-const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin
-const MAX_TX_WIRE_SIZE: usize = 2 * 1024 * 1024; // 2 MB TxIntent hard cap (covers Sweep25x2 proofs)
-const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-sync response
+// Proof-related caps are intentionally conservative until the Sweep25x2
+// post-redesign benchmark phase remeasures wallet and block proof sizes.
+const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB block payload cap.
+const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // temporary block-proof cap.
+const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin).
+const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB recursive proof cap.
+const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin.
+const MAX_TX_WIRE_SIZE: usize = 2 * 1024 * 1024; // temporary TxIntent cap until wallet proof remeasure.
+const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-sync response.
+const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024; // 1 MB block+proof inline gossip cap.
+
+#[inline]
+fn should_inline_block_gossip(block_bytes_len: usize, block_proof_bytes_len: usize) -> bool {
+    block_bytes_len > 0
+        && block_bytes_len.saturating_add(block_proof_bytes_len) <= INLINE_BLOCK_GOSSIP_THRESHOLD
+}
 
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
@@ -666,11 +675,8 @@ fn handle_network_command(
             block_proof_bytes,
         } => {
             // Inline threshold: if block + proof fit in 1 MB, gossip the full
-            // block directly.  Eliminates the round-trip for the common case
-            // (coinbase-only and low-tx blocks).
-            const INLINE_THRESHOLD: usize = 1024 * 1024; // 1 MB
-            let total = block_bytes.len() + block_proof_bytes.len();
-            let msg = if !block_bytes.is_empty() && total <= INLINE_THRESHOLD {
+            // block directly.  Larger blocks use compact announcement + pull sync.
+            let msg = if should_inline_block_gossip(block_bytes.len(), block_proof_bytes.len()) {
                 BlockGossipMsg::Inline {
                     height,
                     hash,
@@ -1697,5 +1703,32 @@ async fn handle_swarm_event(
         }
 
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_block_gossip_policy_uses_combined_block_and_proof_size() {
+        assert!(should_inline_block_gossip(1, 0));
+        assert!(should_inline_block_gossip(
+            512 * 1024,
+            INLINE_BLOCK_GOSSIP_THRESHOLD - 512 * 1024
+        ));
+        assert!(!should_inline_block_gossip(0, 0));
+        assert!(!should_inline_block_gossip(
+            512 * 1024,
+            INLINE_BLOCK_GOSSIP_THRESHOLD - 512 * 1024 + 1
+        ));
+    }
+
+    #[test]
+    fn conservative_wire_caps_are_ordered_for_sweep_redesign() {
+        assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(MAX_TX_WIRE_SIZE >= INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_WIRE_SIZE);
+        assert!(MAX_RECURSIVE_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
     }
 }

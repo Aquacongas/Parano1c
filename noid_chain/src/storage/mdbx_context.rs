@@ -45,7 +45,7 @@ use std::path::Path;
 
 use noid_poseidon2b::primitives::TxBodyHash;
 
-use crate::block::Block;
+use crate::block::{apply_state_delta, Block};
 use crate::block_header::BlockHeader;
 use crate::chain_context::ChainContext;
 use crate::consensus::{
@@ -54,7 +54,7 @@ use crate::consensus::{
     header::epoch_anchor_height,
     params::{ANCHOR_DEPTH, EXPANSION_WINDOW, FINALITY_DEPTH, GENESIS_TARGET, MEDIAN_TIME_BLOCKS},
     pow::full_block_hash,
-    validation::{validate_block_consensus, AnchorInfo},
+    validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
 use crate::nullifier::NullifierSet;
@@ -376,58 +376,13 @@ impl MdbxChainContext {
     // Block application
     // -----------------------------------------------------------------------
 
-    /// Validate and apply the next block, persisting atomically to MDBX.
-    ///
-    /// # Consistency guarantee
-    ///
-    /// On **success**: MDBX and RAM are both at height H+1.
-    ///
-    /// On **consensus failure** (`ConsensusError`): MDBX and RAM are both at
-    /// height H (the block was never applied).
-    ///
-    /// On **MDBX commit failure**: the block is rolled back in RAM via the
-    /// pre-built undo log so that both MDBX and RAM remain at height H.  The
-    /// error is propagated to the caller; no restart is required.
-    pub fn apply_next_block(
+    fn commit_applied_next_block(
         &mut self,
         block: &Block,
-        local_time: u64,
-    ) -> Result<[u8; 32], MdbxContextError> {
-        let parent = self.tip_header().clone();
-        let prev_timestamps = self.prev_timestamps();
-        let prev_active_counts = self.prev_active_counts();
-        let anchor = self.anchor_info();
-
-        // Snapshot mutable counters before apply so we can roll them back.
-        let pre_active = self.state.active_slot_count;
-        let pre_alloc = self.state.alloc_counter;
-
-        // Preload any evicted segments that this block will read or write.
-        //
-        // Segments are evicted after each block commit to bound RAM usage.
-        // Before applying the next block we must reload any segment that
-        // contains an input (to validate it is non-empty) or an output
-        // (to verify the slot is empty and write the new UTXO).
-        self.preload_segments_for_block(block)?;
-
-        // Build undo log BEFORE applying (captures pre-state slot values).
-        let undo = build_undo_log(&self.state, block);
-
-        // Run native consensus validation (modifies self.state on success).
-        let new_state_root = validate_block_consensus(
-            block,
-            &parent,
-            &prev_timestamps,
-            &prev_active_counts,
-            local_time,
-            &anchor,
-            &self.nullifiers,
-            &mut self.state,
-        )?;
-        // self.state is now at H+1. From this point forward any early return
-        // MUST revert self.state back to H.
-
-        // Collect dirty segments from the now-updated state.
+        undo: &crate::consensus::da_prune::BlockUndoLog,
+        pre_active: u64,
+        pre_alloc: u64,
+    ) -> Result<(), MdbxContextError> {
         let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
         let eff_log = self.state.state.effective_log_segment_size() as u8;
         let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
@@ -442,67 +397,139 @@ impl MdbxChainContext {
             .map(|(id, eff, cols)| (*id, *eff, cols))
             .collect();
 
-        // Collect nullifier hashes.
         let tx_hashes: Vec<TxBodyHash> =
             block.transactions.iter().map(|t| t.tx_body_hash).collect();
-
-        // Atomic MDBX commit.
         let block_hash = full_block_hash(&block.header);
         if let Err(e) = self.store.commit_block(
             &block.header,
             &block_hash,
-            &undo,
+            undo,
             &dirty_refs,
             &tx_hashes,
             Some(&block.to_bytes()),
         ) {
-            // MDBX commit failed (e.g. disk full).  Roll back RAM so that
-            // both stores agree at height H.  After this the caller can
-            // safely retry or skip the block.
-            revert_block(&mut self.state.state, &undo);
+            revert_block(&mut self.state.state, undo);
             self.state.active_slot_count = pre_active;
             self.state.alloc_counter = pre_alloc;
             self.state.state.clear_dirty();
             return Err(e.into());
         }
 
-        // Update hot RAM state (only after successful MDBX commit).
         self.recent_headers
             .insert(block.header.height, block.header.clone());
         self.nullifiers.insert_block(&tx_hashes);
         self.tip_height = block.header.height;
         self.tip_hash = block_hash;
-        // Accumulate PoW work for the newly applied block.
         self.tip_chain_work = add_work(
             &self.tip_chain_work,
             &block_work(&block.header.difficulty_target),
         );
-
-        // Clear MDBX-dirty tracking: next block's dirty_segment_ids() should
-        // return only segments modified by THAT block, not accumulated history.
-        //
-        // NOTE: Segment eviction (evict_clean_segments) is NOT called here.
-        // While the infrastructure exists (see evict_clean_segments/restore_evicted_segment),
-        // eviction creates subtle bugs:
-        //  1. The ChainView (used by mempool for slot validation) is cloned from the
-        //     state AFTER eviction. If eviction happens between preload and clone,
-        //     the ChainView has evicted (empty) slots for non-zero UTXOs, causing
-        //     mempool check_input_slots to reject valid TXs (BadStateRoot).
-        //  2. The template builder clones the state; evicted segments materialize
-        //     as zeros causing wrong FRI roots (BadStateRoot from block validation).
-        //
-        // The jemalloc allocator (enabled in noid_node) already returns freed
-        // pages to the OS aggressively, providing a 10× RSS reduction vs glibc.
-        // Segment eviction is an optimization that requires atomic
-        // snapshot semantics (Arc<RwLock<SegmentedFriState>> or similar).
         self.state.state.clear_dirty();
 
-        // Evict old recent_headers beyond the window.
         let window = (MEDIAN_TIME_BLOCKS as u64) + ANCHOR_DEPTH;
         if self.tip_height > window {
             self.recent_headers.remove(&(self.tip_height - window - 1));
         }
 
+        Ok(())
+    }
+
+    /// Production block application: proof-native only.
+    ///
+    /// For user-transaction blocks, `validate_and_apply` must verify the full
+    /// network `BlockProof` against the pre-block state and mutate `state` to the
+    /// post-block state (the node passes `noid_block::validate_block_from_network`).
+    /// The sequential interpreter is not a second production validity source.
+    /// Coinbase-only blocks are the sole no-proof exception, but they still go
+    /// through this same method: proof/header stub binding, cheap consensus checks,
+    /// `apply_state_delta`, then atomic commit.
+    pub fn apply_next_block<F, E>(
+        &mut self,
+        block: &Block,
+        block_proof_bytes: &[u8],
+        local_time: u64,
+        validate_and_apply: F,
+    ) -> Result<[u8; 32], MdbxContextError>
+    where
+        F: FnOnce(
+            &Block,
+            &[u8],
+            &BlockHeader,
+            &[u64],
+            &[u64],
+            u64,
+            &AnchorInfo,
+            &NullifierSet,
+            &SegmentedFriState,
+            &mut ChainState,
+        ) -> Result<[u8; 32], E>,
+        E: std::fmt::Display,
+    {
+        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+        if !has_user_txs {
+            crate::block::validate_block_proof_binding(block, block_proof_bytes).map_err(|e| {
+                MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
+                    "coinbase-only proof binding invalid: {e}"
+                )))
+            })?;
+        }
+
+        let parent = self.tip_header().clone();
+        let prev_timestamps = self.prev_timestamps();
+        let prev_active_counts = self.prev_active_counts();
+        let anchor = self.anchor_info();
+        let pre_active = self.state.active_slot_count;
+        let pre_alloc = self.state.alloc_counter;
+
+        self.preload_segments_for_block(block)?;
+        let pre_state = self.state.state.clone();
+        let state_before_validation = self.state.clone();
+        let undo = build_undo_log(&self.state, block);
+
+        let new_state_root = if has_user_txs {
+            match validate_and_apply(
+                block,
+                block_proof_bytes,
+                &parent,
+                &prev_timestamps,
+                &prev_active_counts,
+                local_time,
+                &anchor,
+                &self.nullifiers,
+                &pre_state,
+                &mut self.state,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    self.state = state_before_validation;
+                    self.state.state.clear_dirty();
+                    return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                        format!("proof-native validation failed: {e}"),
+                    )));
+                }
+            }
+        } else {
+            validate_block_checks(
+                block,
+                &parent,
+                &prev_timestamps,
+                &prev_active_counts,
+                local_time,
+                &anchor,
+                &self.nullifiers,
+            )?;
+            apply_state_delta(&mut self.state, block)
+                .map_err(|e| {
+                    self.state = state_before_validation;
+                    self.state.state.clear_dirty();
+                    MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
+                        "coinbase-only proven-delta apply failed: {e:?}"
+                    )))
+                })?
+                .new_state_root
+        };
+
+        self.commit_applied_next_block(block, &undo, pre_active, pre_alloc)?;
         Ok(new_state_root)
     }
 
@@ -536,37 +563,21 @@ impl MdbxChainContext {
     /// 1. Reverts our chain from tip back to `ancestor_height` using MDBX undo logs.
     /// 2. Rebuilds the nullifier set for the surviving chain.
     /// 3. Persists the reverted state to MDBX atomically (crash-safe checkpoint).
-    /// 4. Applies `new_blocks` on top of `ancestor_height` via `apply_next_block`.
+    /// 4. Applies `new_blocks` on top of `ancestor_height` through the caller's
+    ///    proof-native applier. The node passes a closure that calls this type's
+    ///    single production `apply_next_block` method with the matching `BlockProof`
+    ///    bytes and `noid_block::validate_block_from_network`.
     ///
     /// Returns the hashes of reclaimed transactions for mempool re-admission.
     ///
-    /// Fails if reorg depth > `FINALITY_DEPTH` or if an undo log is missing.
-    pub fn apply_reorg_mdbx(
+    /// Fails if reorg depth > `FINALITY_DEPTH`, if an undo log is missing, or if
+    /// any fork block fails full proof-native validation/application.
+    pub fn apply_reorg_mdbx_with_applier<F>(
         &mut self,
         ancestor_height: u64,
         new_blocks: &[Block],
         local_time: u64,
-    ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError> {
-        self.apply_reorg_mdbx_with_validator(
-            ancestor_height,
-            new_blocks,
-            local_time,
-            |_ctx, _block, _local_time| Ok(()),
-        )
-    }
-
-    /// Apply a chain reorganization with a caller-provided pre-apply validator.
-    ///
-    /// The validator runs after the context has been reverted to the fork pre-state
-    /// and before each new block is applied. This keeps `noid_chain` independent
-    /// from `noid_block` while allowing the node to run proof-native ZK validation
-    /// against the exact pre-block state during reorgs.
-    pub fn apply_reorg_mdbx_with_validator<F>(
-        &mut self,
-        ancestor_height: u64,
-        new_blocks: &[Block],
-        local_time: u64,
-        mut validate_before_apply: F,
+        mut apply_block: F,
     ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
     where
         F: FnMut(&mut Self, &Block, u64) -> Result<(), MdbxContextError>,
@@ -710,21 +721,13 @@ impl MdbxChainContext {
         }
 
         // -----------------------------------------------------------------------
-        // Apply new blocks using the existing apply_next_block.
+        // Apply fork blocks via the caller's proof-native applier.
         // -----------------------------------------------------------------------
         let mut applied_heights: Vec<u64> = Vec::new();
 
         for block in new_blocks {
-            if let Err(e) = validate_before_apply(self, block, local_time) {
-                tracing::error!(
-                    height = block.header.height,
-                    err = ?e,
-                    "reorg: pre-apply validation failed"
-                );
-                return Err(e);
-            }
-            match self.apply_next_block(block, local_time) {
-                Ok(_) => {
+            match apply_block(self, block, local_time) {
+                Ok(()) => {
                     applied_heights.push(block.header.height);
                     tracing::info!(height = block.header.height, "reorg: applied new block");
                 }
@@ -1181,6 +1184,31 @@ mod tests {
         }
     }
 
+    fn apply_coinbase_only_for_test(
+        ctx: &mut MdbxChainContext,
+        block: &Block,
+        local_time: u64,
+    ) -> Result<[u8; 32], MdbxContextError> {
+        ctx.apply_next_block(
+            block,
+            &[],
+            local_time,
+            |_block,
+             _proof_bytes,
+             _parent,
+             _prev_timestamps,
+             _prev_active_counts,
+             _local_time,
+             _anchor,
+             _nullifiers,
+             _pre_state,
+             _state|
+             -> Result<[u8; 32], std::convert::Infallible> {
+                unreachable!("empty/coinbase-only blocks do not call full proof validator")
+            },
+        )
+    }
+
     #[test]
     fn open_fresh_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -1197,7 +1225,7 @@ mod tests {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
-            ctx.apply_next_block(&block, ts).unwrap();
+            apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             assert_eq!(ctx.tip_height(), 1);
         }
 
@@ -1217,7 +1245,7 @@ mod tests {
             for _ in 0..3 {
                 let block = build_empty_block_on(&mut ctx);
                 let ts = block.header.timestamp + 1;
-                ctx.apply_next_block(&block, ts).unwrap();
+                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             }
         }
 
@@ -1235,7 +1263,7 @@ mod tests {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
-            root_after_block = ctx.apply_next_block(&block, ts).unwrap();
+            root_after_block = apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
         }
 
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
@@ -1269,7 +1297,7 @@ mod tests {
             // Apply block 1 (empty, no transactions).
             let block1 = build_empty_block_on(&mut ctx);
             let ts = block1.header.timestamp + 1;
-            ctx.apply_next_block(&block1, ts).unwrap();
+            apply_coinbase_only_for_test(&mut ctx, &block1, ts).unwrap();
             block1_hash = full_block_hash(&block1.header);
 
             // Directly commit a fake block 2 with sentinel nullifiers.
@@ -1337,8 +1365,7 @@ mod tests {
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             let block = build_empty_block_on(&mut ctx);
-            ctx.apply_next_block(&block, block.header.timestamp + 1)
-                .unwrap();
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
 
         // Second run: open and verify no dirty segments are queued.

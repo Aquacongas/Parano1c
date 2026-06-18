@@ -7,21 +7,17 @@
 //! standard proof keeps its 4x8 AIR/GKR shape, while sweep uses its own balance
 //! AIR plus dedicated 25-input AuthGKR and 142-slot tx-body SpineGKR families.
 
-use noid_air::composition::{sweep25x2_balance_witness_from_body, Sweep25x2BalanceWitness};
+use noid_air::composition::{sweep_logic_air_and_trace_from_body, SweepTxLogicAir};
 use noid_air::{Air, Trace};
 use noid_core::mle::split::{reconstruct_from_slices, split_mle_into_slices};
 use noid_core::{Block128, TowerField};
 use noid_fri_binius::COMPACT_NUM_QUERIES;
 use noid_gkr::{
-    build_sweep_auth_unified_from_inputs, build_sweep_spine_unified_from_inputs,
-    compute_sweep_auth_boundary, compute_sweep_tx_body_hash, prove_sweep_auth_killshot_with_mle,
-    prove_sweep_spine_killshot, sweep_auth_gkr_channel, verify_sweep_auth_killshot,
-    verify_sweep_spine_killshot, SweepAuthCircuit, SweepAuthInputs, SweepAuthProofKillShot,
-    SweepAuthPublicInputs, SweepAuthUnifiedMle, SweepSpineCircuit, SweepSpineInputs,
-    SweepSpineProofKillShot, SweepSpineUnifiedMle, N_SWEEP_AUTH_INPUTS, N_SWEEP_AUTH_UNIFIED_VARS,
-    N_SWEEP_SPINE_UNIFIED_VARS,
+    build_sweep_auth_unified_from_inputs, compute_sweep_auth_boundary,
+    prove_sweep_auth_killshot_with_mle, sweep_auth_gkr_channel, verify_sweep_auth_killshot,
+    SweepAuthCircuit, SweepAuthInputs, SweepAuthProofKillShot, SweepAuthPublicInputs,
+    SweepSpineInputs, N_SWEEP_AUTH_INPUTS, N_SWEEP_AUTH_UNIFIED_VARS,
 };
-use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::primitives::{fee_leaf, is_coinbase_leaf, tx_shape_leaf, Digest};
 use noid_tx::{hash_tx_body_for_shape, PublicInputs, TxBody, TxInput, TxOutput, TxShape};
 
@@ -36,24 +32,18 @@ const N_SWEEP_AUTH_SLICES_PER_COLUMN: usize = 1 << (N_SWEEP_AUTH_UNIFIED_VARS - 
 /// Number of sweep AuthGKR `state` slices carried on wire, matching the
 /// Standard4x8 `auth_slices` design at the larger Sweep25x2 auth hypercube.
 pub const N_SWEEP_AUTH_SLICES: usize = N_SWEEP_AUTH_SLICES_PER_COLUMN;
-const N_SWEEP_SPINE_SLICES_PER_COLUMN: usize = 1 << (N_SWEEP_SPINE_UNIFIED_VARS - BASE_LOG);
-const N_SWEEP_AUTH_COLUMNS_COMMITTED: usize = 3; // state, s_in, s_out.
-const N_SWEEP_SPINE_COLUMNS_COMMITTED: usize = 3; // state, s_in, s_out.
 /// Number of wallet-derived Sweep25x2 boundary slices committed by the sweep
-/// logic STARK and later consumed by the real sweep bucket aggregation path.
-pub const N_SWEEP_LOGIC_BOUNDARY_SLICES: usize = N_SWEEP_AUTH_COLUMNS_COMMITTED
-    * N_SWEEP_AUTH_SLICES_PER_COLUMN
-    + N_SWEEP_SPINE_COLUMNS_COMMITTED * N_SWEEP_SPINE_SLICES_PER_COLUMN;
+/// logic STARK. The redesigned wallet proof commits only AuthGKR `state` slices;
+/// tx-body spine is proven at block level by `SweepBlockSpine`.
+pub const N_SWEEP_LOGIC_BOUNDARY_SLICES: usize = N_SWEEP_AUTH_SLICES;
 
 /// Wallet-produced proof for `Sweep25x2`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SweepLogicProof {
-    /// STARK seal over the sweep balance AIR plus committed GKR boundary slices.
+    /// STARK seal over `SweepTxLogicAir` plus committed AuthGKR state slices.
     pub stark: InterleavedStarkProof,
     /// 25-input AuthGKR Kill-Shot proof.
     pub auth: SweepAuthProofKillShot,
-    /// 142-slot tx-body SpineGKR Kill-Shot proof.
-    pub spine: SweepSpineProofKillShot,
     /// Number of committed boundary-slice columns.
     pub n_boundary_slices: usize,
 }
@@ -64,7 +54,6 @@ pub struct SweepLogicWitness<'a> {
     pub trace: &'a Trace,
     pub pi: &'a PublicInputs,
     pub auth_inputs: &'a SweepAuthInputs,
-    pub spine_inputs: &'a SweepSpineInputs,
 }
 
 #[derive(Debug)]
@@ -110,20 +99,6 @@ fn reduction_to_transcript(point: &[Block128], value: Block128, out: &mut Vec<Bl
     out.push(value);
 }
 
-fn absorb_all_reductions_to_transcript(
-    auth: &noid_gkr::SweepAuthKillShotReductions,
-    spine: &noid_gkr::SweepSpineKillShotReductions,
-) -> Vec<Block128> {
-    let mut out = Vec::new();
-    reduction_to_transcript(&auth.state.point, auth.state.value, &mut out);
-    reduction_to_transcript(&auth.sin.point, auth.sin.value, &mut out);
-    reduction_to_transcript(&auth.sout.point, auth.sout.value, &mut out);
-    reduction_to_transcript(&spine.state.point, spine.state.value, &mut out);
-    reduction_to_transcript(&spine.sin.point, spine.sin.value, &mut out);
-    reduction_to_transcript(&spine.sout.point, spine.sout.value, &mut out);
-    out
-}
-
 /// Build Sweep25x2 AuthGKR state slices for the wallet bundle.
 ///
 /// This is the direct analogue of Standard4x8 `auth_slices`: only the AuthGKR
@@ -135,86 +110,6 @@ pub fn build_sweep_auth_slices(auth_inputs: &SweepAuthInputs) -> Vec<Vec<Block12
     let auth_slices = split_mle_into_slices(&auth_mle.state, N_SWEEP_AUTH_UNIFIED_VARS, BASE_LOG);
     debug_assert_eq!(auth_slices.len(), N_SWEEP_AUTH_SLICES);
     auth_slices
-}
-
-fn sweep_boundary_slices_from_mles(
-    auth_mle: &SweepAuthUnifiedMle,
-    spine_mle: &SweepSpineUnifiedMle,
-) -> Vec<Vec<Block128>> {
-    let mut boundary_slices = Vec::with_capacity(N_SWEEP_LOGIC_BOUNDARY_SLICES);
-
-    // Canonical order inside the wallet-local sweep logic STARK:
-    // 1. auth.state, 2. auth.s_in, 3. auth.s_out,
-    // 4. spine.state, 5. spine.s_in, 6. spine.s_out.
-    // Only auth.state is exported separately as `build_sweep_auth_slices`, matching
-    // the existing Standard4x8 wire model. The additional s_in/s_out/spine columns
-    // are internal helper columns for this proof.
-    boundary_slices.extend(split_mle_into_slices(
-        &auth_mle.state,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-    boundary_slices.extend(split_mle_into_slices(
-        &auth_mle.s_in,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-    boundary_slices.extend(split_mle_into_slices(
-        &auth_mle.s_out,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-    boundary_slices.extend(split_mle_into_slices(
-        &spine_mle.state,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-    boundary_slices.extend(split_mle_into_slices(
-        &spine_mle.s_in,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-    boundary_slices.extend(split_mle_into_slices(
-        &spine_mle.s_out,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        BASE_LOG,
-    ));
-
-    debug_assert_eq!(boundary_slices.len(), N_SWEEP_LOGIC_BOUNDARY_SLICES);
-    boundary_slices
-}
-
-fn push_precomputed_boundary_slices(
-    boundary_slices: &[Vec<Block128>],
-    cursor: &mut usize,
-    n_slices: usize,
-    num_vars: usize,
-    all_columns: &mut Vec<Vec<Block128>>,
-    reductions_point: &[Block128],
-    reductions_value: Block128,
-    slice_claims: &mut Vec<SliceClaim>,
-) -> Vec<Block128> {
-    debug_assert_eq!(reductions_point.len(), num_vars);
-    let group = &boundary_slices[*cursor..*cursor + n_slices];
-    let r_low = reductions_point[..BASE_LOG].to_vec();
-    let values: Vec<Block128> = group
-        .iter()
-        .map(|s| noid_core::mle::evaluate::evaluate_slice(s, &r_low))
-        .collect();
-    let reconstructed = reconstruct_from_slices(&values, &reductions_point[BASE_LOG..]);
-    debug_assert_eq!(reconstructed, reductions_value);
-
-    for (slice, &value) in group.iter().zip(values.iter()) {
-        let col_index = all_columns.len();
-        all_columns.push(slice.clone());
-        slice_claims.push(SliceClaim {
-            col_index,
-            eval_point: r_low.clone(),
-            value,
-        });
-    }
-    *cursor += n_slices;
-    values
 }
 
 fn reconstruct_column_reduction(
@@ -342,14 +237,8 @@ pub fn sweep_auth_inputs_from_body(body: &TxBody) -> SweepAuthInputs {
 /// mempool integration.
 pub fn sweep_logic_witness_parts_from_body(
     body: &TxBody,
-) -> (
-    noid_air::airs::Sweep25x2BalanceGateAir,
-    Trace,
-    SweepAuthInputs,
-    SweepSpineInputs,
-) {
-    let balance: Sweep25x2BalanceWitness = sweep25x2_balance_witness_from_body(body);
-    let (air, trace) = balance.build_air_and_trace_with_log_rows(BASE_LOG);
+) -> (SweepTxLogicAir, Trace, SweepAuthInputs, SweepSpineInputs) {
+    let (air, trace) = sweep_logic_air_and_trace_from_body(body);
     let auth_inputs = sweep_auth_inputs_from_body(body);
     let spine_inputs = sweep_spine_inputs_from_body(body);
     (air, trace, auth_inputs, spine_inputs)
@@ -370,15 +259,10 @@ pub fn prove_sweep_logic(
         return Err(ProveSweepLogicError::ShapeMismatch);
     }
 
-    let spine_circuit = SweepSpineCircuit::build();
-    let actual_spine_hash = compute_sweep_tx_body_hash(&spine_circuit, witness.spine_inputs);
-    if actual_spine_hash != claimed {
-        return Err(ProveSweepLogicError::ShapeMismatch);
-    }
-
     let auth_circuit = SweepAuthCircuit::build();
     let auth_mle = build_sweep_auth_unified_from_inputs(&auth_circuit, witness.auth_inputs);
-    let spine_mle = build_sweep_spine_unified_from_inputs(&spine_circuit, witness.spine_inputs);
+    let auth_slices = split_mle_into_slices(&auth_mle.state, N_SWEEP_AUTH_UNIFIED_VARS, BASE_LOG);
+    debug_assert_eq!(auth_slices.len(), N_SWEEP_LOGIC_BOUNDARY_SLICES);
 
     let mut auth_channel = sweep_auth_gkr_channel();
     let (auth_proof, auth_reductions) = prove_sweep_auth_killshot_with_mle(
@@ -388,16 +272,15 @@ pub fn prove_sweep_logic(
         &mut auth_channel,
     );
 
-    let mut spine_channel = Poseidon2bChannel::new();
-    let (spine_proof, spine_reductions) = prove_sweep_spine_killshot(
-        &spine_circuit,
-        witness.spine_inputs,
-        claimed,
-        &mut spine_channel,
-    );
-
-    let extras_transcript =
-        absorb_all_reductions_to_transcript(&auth_reductions, &spine_reductions);
+    let extras_transcript = {
+        let mut out = Vec::with_capacity(auth_reductions.state.point.len() + 1);
+        reduction_to_transcript(
+            &auth_reductions.state.point,
+            auth_reductions.state.value,
+            &mut out,
+        );
+        out
+    };
 
     let n_air_cols = witness.trace.columns.len();
     let log_len = crate::padded_log_len(witness.trace.log_rows);
@@ -409,72 +292,26 @@ pub fn prove_sweep_logic(
         all_columns.push(crate::pad_column(col, log_len));
     }
 
-    let boundary_slices = sweep_boundary_slices_from_mles(&auth_mle, &spine_mle);
-    let mut boundary_cursor = 0usize;
-    let mut slice_claims: Vec<SliceClaim> = Vec::with_capacity(N_SWEEP_LOGIC_BOUNDARY_SLICES);
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_AUTH_SLICES_PER_COLUMN,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        &mut all_columns,
-        &auth_reductions.state.point,
-        auth_reductions.state.value,
-        &mut slice_claims,
-    );
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_AUTH_SLICES_PER_COLUMN,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        &mut all_columns,
-        &auth_reductions.sin.point,
-        auth_reductions.sin.value,
-        &mut slice_claims,
-    );
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_AUTH_SLICES_PER_COLUMN,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        &mut all_columns,
-        &auth_reductions.sout.point,
-        auth_reductions.sout.value,
-        &mut slice_claims,
-    );
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_SPINE_SLICES_PER_COLUMN,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        &mut all_columns,
-        &spine_reductions.state.point,
-        spine_reductions.state.value,
-        &mut slice_claims,
-    );
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_SPINE_SLICES_PER_COLUMN,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        &mut all_columns,
-        &spine_reductions.sin.point,
-        spine_reductions.sin.value,
-        &mut slice_claims,
-    );
-    push_precomputed_boundary_slices(
-        &boundary_slices,
-        &mut boundary_cursor,
-        N_SWEEP_SPINE_SLICES_PER_COLUMN,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        &mut all_columns,
-        &spine_reductions.sout.point,
-        spine_reductions.sout.value,
-        &mut slice_claims,
+    let auth_r_low = auth_reductions.state.point[..BASE_LOG].to_vec();
+    let auth_slice_values: Vec<Block128> = auth_slices
+        .iter()
+        .map(|s| noid_core::mle::evaluate::evaluate_slice(s, &auth_r_low))
+        .collect();
+    debug_assert_eq!(
+        reconstruct_from_slices(&auth_slice_values, &auth_reductions.state.point[BASE_LOG..]),
+        auth_reductions.state.value
     );
 
-    debug_assert_eq!(boundary_cursor, N_SWEEP_LOGIC_BOUNDARY_SLICES);
-    debug_assert_eq!(slice_claims.len(), N_SWEEP_LOGIC_BOUNDARY_SLICES);
+    let mut slice_claims: Vec<SliceClaim> = Vec::with_capacity(N_SWEEP_LOGIC_BOUNDARY_SLICES);
+    for (slice, &value) in auth_slices.iter().zip(auth_slice_values.iter()) {
+        let col_index = all_columns.len();
+        all_columns.push(slice.clone());
+        slice_claims.push(SliceClaim {
+            col_index,
+            eval_point: auth_r_low.clone(),
+            value,
+        });
+    }
 
     let stark = prove_air_interleaved(
         witness.air,
@@ -490,7 +327,6 @@ pub fn prove_sweep_logic(
     Ok(SweepLogicProof {
         stark,
         auth: auth_proof,
-        spine: spine_proof,
         n_boundary_slices: slice_claims.len(),
     })
 }
@@ -514,26 +350,11 @@ pub fn verify_sweep_logic(
         return Err(VerifySweepLogicError::AuthSpineBridge);
     }
 
-    let spine_circuit = SweepSpineCircuit::build();
-    if compute_sweep_tx_body_hash(&spine_circuit, spine_inputs) != claimed {
-        return Err(VerifySweepLogicError::SpineHashBridge);
-    }
-
     let auth_circuit = SweepAuthCircuit::build();
     let mut auth_ch = sweep_auth_gkr_channel();
     let auth_reductions =
         verify_sweep_auth_killshot(&proof.auth, &auth_circuit, auth_public, &mut auth_ch)
             .ok_or(VerifySweepLogicError::AuthKillShot)?;
-
-    let mut spine_ch = Poseidon2bChannel::new();
-    let spine_reductions = verify_sweep_spine_killshot(
-        &proof.spine,
-        &spine_circuit,
-        spine_inputs,
-        claimed,
-        &mut spine_ch,
-    )
-    .ok_or(VerifySweepLogicError::SpineKillShot)?;
 
     let n_live = pi.n_live_inputs as usize;
     if n_live > N_SWEEP_AUTH_INPUTS {
@@ -549,8 +370,15 @@ pub fn verify_sweep_logic(
         }
     }
 
-    let extras_transcript =
-        absorb_all_reductions_to_transcript(&auth_reductions, &spine_reductions);
+    let extras_transcript = {
+        let mut out = Vec::with_capacity(auth_reductions.state.point.len() + 1);
+        reduction_to_transcript(
+            &auth_reductions.state.point,
+            auth_reductions.state.value,
+            &mut out,
+        );
+        out
+    };
 
     let proof_values = &proof.stark.slice_claimed_values;
     if proof_values.len() != N_SWEEP_LOGIC_BOUNDARY_SLICES {
@@ -578,52 +406,6 @@ pub fn verify_sweep_logic(
         &mut cursor,
         &mut slice_claims,
     )?;
-    reconstruct_column_reduction(
-        &proof_values[cursor..cursor + N_SWEEP_AUTH_SLICES_PER_COLUMN],
-        &auth_reductions.sin.point,
-        auth_reductions.sin.value,
-    )?;
-    push_verify_slice_claims(
-        n_air_cols,
-        N_SWEEP_AUTH_SLICES_PER_COLUMN,
-        &auth_reductions.sin.point,
-        proof_values,
-        &mut cursor,
-        &mut slice_claims,
-    )?;
-    reconstruct_column_reduction(
-        &proof_values[cursor..cursor + N_SWEEP_AUTH_SLICES_PER_COLUMN],
-        &auth_reductions.sout.point,
-        auth_reductions.sout.value,
-    )?;
-    push_verify_slice_claims(
-        n_air_cols,
-        N_SWEEP_AUTH_SLICES_PER_COLUMN,
-        &auth_reductions.sout.point,
-        proof_values,
-        &mut cursor,
-        &mut slice_claims,
-    )?;
-
-    for (point, value) in [
-        (&spine_reductions.state.point, spine_reductions.state.value),
-        (&spine_reductions.sin.point, spine_reductions.sin.value),
-        (&spine_reductions.sout.point, spine_reductions.sout.value),
-    ] {
-        reconstruct_column_reduction(
-            &proof_values[cursor..cursor + N_SWEEP_SPINE_SLICES_PER_COLUMN],
-            point,
-            value,
-        )?;
-        push_verify_slice_claims(
-            n_air_cols,
-            N_SWEEP_SPINE_SLICES_PER_COLUMN,
-            point,
-            proof_values,
-            &mut cursor,
-            &mut slice_claims,
-        )?;
-    }
     debug_assert_eq!(cursor, N_SWEEP_LOGIC_BOUNDARY_SLICES);
 
     verify_air_interleaved(
@@ -640,6 +422,6 @@ pub fn verify_sweep_logic(
 
 impl SweepLogicProof {
     pub fn estimated_byte_len(&self) -> usize {
-        self.auth.byte_len() + self.spine.byte_len() + self.stark.byte_len()
+        self.auth.byte_len() + self.stark.byte_len()
     }
 }

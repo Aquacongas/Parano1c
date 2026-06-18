@@ -951,7 +951,8 @@ Error:
 |--------|--------|---------|-------------|
 | `paranoid_getMiningInfo` | — | `MiningInfo` | Difficulty, reward, recursive height |
 | `paranoid_getPeerCount` | — | `usize` | Connected peers |
-| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Estimated min fee in μNOID |
+| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Legacy estimated min fee in μNOID, assumes one input |
+| `paranoid_estimateFeeDetailed` | `n_inputs: u32, n_outputs: u32` | `FeeBreakdown` | Current detailed fee breakdown, including burned state-growth fee |
 
 #### Utilities
 

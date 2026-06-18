@@ -184,7 +184,9 @@ impl AsyncMempool {
             }
         }
 
-        const MAX_LOGIC_PROOF_BYTES: usize = 2 * 1024 * 1024; // Sweep25x2 wallet proofs are ~1.15 MB
+        // Temporary relay cap until the post-redesign proof-size measurement phase
+        // tightens wallet/proof wire limits from observed release benchmarks.
+        const MAX_LOGIC_PROOF_BYTES: usize = 2 * 1024 * 1024;
         if !intent.tx_body.is_coinbase && intent.logic_proof_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
@@ -879,8 +881,7 @@ fn verify_sweep_intent(
     log_slots: u32,
     bundle: noid_stark::wallet_bundle::SweepWalletProofBundle,
 ) -> Result<(), String> {
-    use noid_air::airs::tx_body_spine::SPINE_LOG_ROWS;
-    use noid_air::airs::Sweep25x2BalanceGateAir;
+    use noid_air::composition::sweep_logic_air_and_trace_from_body;
     use noid_stark::prove_logic_sweep::{
         sweep_spine_inputs_from_body, verify_sweep_logic, N_SWEEP_AUTH_SLICES,
         SWEEP_BOUNDARY_BASE_LOG,
@@ -889,7 +890,7 @@ fn verify_sweep_intent(
         compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, MAX_INPUTS, MAX_OUTPUTS,
     };
 
-    let air = Sweep25x2BalanceGateAir::new(SPINE_LOG_ROWS);
+    let (air, _trace) = sweep_logic_air_and_trace_from_body(tx_body);
     let spine_inputs = sweep_spine_inputs_from_body(tx_body);
     let tx_body_hash = hash_tx_body_for_shape(
         tx_body.shape,

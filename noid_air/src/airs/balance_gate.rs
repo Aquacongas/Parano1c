@@ -966,9 +966,88 @@ pub fn build_sweep_balance_trace_parts(
 }
 
 /// Standalone balance AIR for `Sweep25x2`.
+pub fn emit_sweep_balance_selector_public_columns(
+    base_col: usize,
+    log_rows: usize,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance selector publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let mut out = Vec::with_capacity(2 * SWEEP_BALANCE_N_BLOCKS);
+    for side in 0..2 {
+        for level in 0..5 {
+            let width = sweep_block_width(level);
+            for idx in 0..sweep_level_count(level) {
+                let blk = sweep_block(side, level, idx);
+                let block_base = base_col + blk * BIT_ADDER_N_COLS;
+                out.push(PublicColumn::new(
+                    block_base + BIT_ADDER_COL_IS_RESET,
+                    bit_adder_is_reset_programme(log_rows),
+                ));
+                out.push(PublicColumn::new(
+                    block_base + BIT_ADDER_COL_IS_INPUT,
+                    bit_adder_is_input_programme(width, log_rows),
+                ));
+            }
+        }
+    }
+    out
+}
+
+pub fn emit_sweep_balance_value_public_columns(
+    base_col: usize,
+    log_rows: usize,
+    inputs: [u64; SWEEP_BALANCE_INPUTS],
+    outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+    fee: u64,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance value publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let mut out = Vec::with_capacity(SWEEP_BALANCE_INPUTS + SWEEP_BALANCE_OUTPUTS + 1);
+
+    for i in 0..SWEEP_BALANCE_INPUTS {
+        let blk = sweep_block(0, 0, i / 2);
+        let slot = if i % 2 == 0 {
+            OperandSlot::A
+        } else {
+            OperandSlot::B
+        };
+        out.push(PublicColumn::new(
+            dst_col_at(blk, slot, base_col),
+            bit_adder_operand_programme(64, inputs[i], log_rows),
+        ));
+    }
+
+    for i in 0..SWEEP_BALANCE_OUTPUTS {
+        let blk = sweep_block(1, 0, i / 2);
+        let slot = if i % 2 == 0 {
+            OperandSlot::A
+        } else {
+            OperandSlot::B
+        };
+        out.push(PublicColumn::new(
+            dst_col_at(blk, slot, base_col),
+            bit_adder_operand_programme(64, outputs[i], log_rows),
+        ));
+    }
+
+    let fee_blk = sweep_block(1, 0, 1);
+    out.push(PublicColumn::new(
+        dst_col_at(fee_blk, OperandSlot::A, base_col),
+        bit_adder_operand_programme(64, fee, log_rows),
+    ));
+
+    out
+}
+
+/// Standalone balance AIR for `Sweep25x2`.
 pub struct Sweep25x2BalanceGateAir {
     log_rows: usize,
     constraints: Vec<Box<dyn Constraint>>,
+    public_columns: Vec<PublicColumn>,
 }
 
 impl Sweep25x2BalanceGateAir {
@@ -980,6 +1059,28 @@ impl Sweep25x2BalanceGateAir {
         Self {
             log_rows,
             constraints: emit_sweep_balance_constraints(0),
+            public_columns: Vec::new(),
+        }
+    }
+
+    pub fn new_with_value_pins(
+        log_rows: usize,
+        inputs: [u64; SWEEP_BALANCE_INPUTS],
+        outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+        fee: u64,
+    ) -> Self {
+        assert!(
+            log_rows >= BALANCE_MIN_LOG_ROWS,
+            "Sweep25x2BalanceGateAir needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+        );
+        let mut public_columns = emit_sweep_balance_selector_public_columns(0, log_rows);
+        public_columns.extend(emit_sweep_balance_value_public_columns(
+            0, log_rows, inputs, outputs, fee,
+        ));
+        Self {
+            log_rows,
+            constraints: emit_sweep_balance_constraints(0),
+            public_columns,
         }
     }
 
@@ -1005,7 +1106,7 @@ impl Air for Sweep25x2BalanceGateAir {
         &self.constraints
     }
     fn public_columns(&self) -> &[PublicColumn] {
-        &[]
+        &self.public_columns
     }
     fn column_domains(&self) -> Vec<ColumnDomain> {
         // Conservative domain annotation for the large sweep AIR. The generic

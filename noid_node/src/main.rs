@@ -53,20 +53,14 @@ struct ProvedBlockCandidate {
 struct OrphanBlock {
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
-    from: libp2p::PeerId,
     received_at: Instant,
 }
 
 impl OrphanBlock {
-    fn new(
-        block: noid_chain::block::Block,
-        block_proof_bytes: Vec<u8>,
-        from: libp2p::PeerId,
-    ) -> Self {
+    fn new(block: noid_chain::block::Block, block_proof_bytes: Vec<u8>) -> Self {
         Self {
             block,
             block_proof_bytes,
-            from,
             received_at: Instant::now(),
         }
     }
@@ -1254,29 +1248,54 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 // Blocking-I/O helpers
 // ---------------------------------------------------------------------------
 
-/// Apply a single block off the tokio executor.
+/// Verify and apply a single P2P block off the tokio executor.
 ///
-/// `MdbxStore` is opened with `SyncMode::Durable` — every `commit_block`
-/// issues `fsync` before returning, a real blocking syscall.  Running it
-/// directly on a tokio worker stalls async scheduling for 1–100 ms;
-/// `spawn_blocking` offloads it to the dedicated blocking thread pool.
-async fn apply_block_offthread(
+/// User-transaction blocks take the proof-native path: verify the full
+/// `BlockProof` (including `BlockStateBindingAir`) against the pre-state, apply
+/// the proven state delta, then atomically commit to MDBX. Coinbase-only blocks
+/// are the explicit no-proof/stub exception.
+async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
+    block_proof_bytes: Vec<u8>,
     local_time: u64,
 ) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
-        let hash = ctx.apply_next_block(&block, local_time)?;
-        // Build ChainView while write lock is still held — no added contention
-        // since nobody else can acquire any lock during a write anyway.
-        // This eliminates the ~50ms read lock that was previously needed after release.
+        let hash = ctx.apply_next_block(
+            &block,
+            &block_proof_bytes,
+            local_time,
+            |block,
+             proof_bytes,
+             parent,
+             prev_timestamps,
+             prev_active_counts,
+             local_time,
+             anchor,
+             nullifiers,
+             pre_state,
+             state| {
+                noid_block::validate_block_from_network(
+                    block,
+                    proof_bytes,
+                    parent,
+                    prev_timestamps,
+                    prev_active_counts,
+                    local_time,
+                    anchor,
+                    nullifiers,
+                    pre_state,
+                    state,
+                )
+            },
+        )?;
         let view = ChainView::from_mdbx(&ctx);
         Ok((hash, view))
     })
     .await
-    .expect("apply_next_block panicked in spawn_blocking")
+    .expect("apply_p2p_block_offthread panicked in spawn_blocking")
 }
 
 /// Apply a chain reorg off the tokio executor.  Same `fsync` rationale.
@@ -1318,7 +1337,7 @@ async fn apply_reorg_offthread(
             .iter()
             .map(|candidate| candidate.block.clone())
             .collect();
-        let result = ctx.apply_reorg_mdbx_with_validator(
+        let result = ctx.apply_reorg_mdbx_with_applier(
             ancestor_height,
             &block_bodies,
             local_time,
@@ -1331,15 +1350,35 @@ async fn apply_reorg_offthread(
                         ),
                     )
                 })?;
-                verify_p2p_block_against_context(ctx, block, proof_bytes, block_local_time).map_err(
-                    |e| {
-                        noid_chain::storage::MdbxContextError::Consensus(
-                            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                                "reorg proof validation failed: {e}"
-                            )),
+                ctx.apply_next_block(
+                    block,
+                    proof_bytes,
+                    block_local_time,
+                    |block,
+                     proof_bytes,
+                     parent,
+                     prev_timestamps,
+                     prev_active_counts,
+                     local_time,
+                     anchor,
+                     nullifiers,
+                     pre_state,
+                     state| {
+                        noid_block::validate_block_from_network(
+                            block,
+                            proof_bytes,
+                            parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            local_time,
+                            anchor,
+                            nullifiers,
+                            pre_state,
+                            state,
                         )
                     },
-                )
+                )?;
+                Ok(())
             },
         );
         let view = if result.is_ok() {
@@ -1392,236 +1431,54 @@ fn validate_p2p_block_proof_binding(
     Ok(())
 }
 
-fn verify_p2p_block_against_context(
-    ctx: &mut MdbxChainContext,
-    block: &noid_chain::block::Block,
-    block_proof_bytes: &[u8],
-    local_time: u64,
-) -> Result<(), String> {
-    validate_p2p_block_proof_binding(block, block_proof_bytes)?;
-
-    if block.header.height != ctx.tip_height().saturating_add(1)
-        || block.header.prev_block_hash != ctx.tip_hash()
-    {
-        return Err(format!(
-            "block does not extend current pre-state tip: block_height={} tip_height={}",
-            block.header.height,
-            ctx.tip_height()
-        ));
-    }
-
-    let parent = ctx.tip_header().clone();
-    let prev_timestamps = ctx.prev_timestamps();
-    let prev_active_counts = ctx.prev_active_counts();
-    let anchor = ctx.anchor_info();
-    noid_chain::consensus::validate_block_checks(
-        block,
-        &parent,
-        &prev_timestamps,
-        &prev_active_counts,
-        local_time,
-        &anchor,
-        &ctx.nullifiers,
-    )
-    .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
-
-    if block_proof_bytes.is_empty() {
-        return Ok(());
-    }
-
-    let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
-        .map_err(|e| format!("proof deserialize failed: {e}"))?;
-    noid_block::validate_block_bucket_tx_indices(block, &proof)
-        .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
-    if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
-        for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
-            if pi.log_slots != block.header.log_slots {
-                return Err(format!(
-                    "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
-                    pi.log_slots, block.header.log_slots
-                ));
-            }
-        }
-    }
-    if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
-        for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
-            if pi.log_slots != block.header.log_slots {
-                return Err(format!(
-                    "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
-                    pi.log_slots, block.header.log_slots
-                ));
-            }
+#[cfg(test)]
+mod tests {
+    fn minimal_current_block_proof() -> noid_block::BlockProof {
+        noid_block::BlockProof {
+            meta: noid_block::BlockPublicMeta {
+                prev_block_state_root: [0u8; 32],
+                new_state_root: [0u8; 32],
+                n_tx: 0,
+                n_air_per_tx: 0,
+                n_auth_slices_per_tx: 0,
+                log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
+                n_block_spine_slices: 0,
+                n_state_bindings: 0,
+                state_binding_n_cols: 0,
+                state_binding_log_rows: 0,
+            },
+            standard_bucket: None,
+            sweep_bucket: None,
+            state_binding_algebraics: vec![],
+            state_binding_starks: vec![],
+            pre_state_openings: vec![],
+            post_state_openings: vec![],
         }
     }
 
-    // ZK state-binding reconstruction reads pre-state slots. Reload evicted MDBX
-    // segments first so an evicted non-zero segment is never mistaken for virtual zero.
-    ctx.preload_segments_for_block(block)
-        .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
+    #[test]
+    fn block_proof_bytes_survive_store_reopen_and_deserialize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proof = minimal_current_block_proof();
+        let bytes = bincode::serialize(&proof).expect("serialize BlockProof");
 
-    noid_block::verify_sweep_bucket_from_block(block, &proof)
-        .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
-    let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
-    let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
-        sb_airs.iter().collect();
-    if proof.standard_bucket.is_some() {
-        let spine = noid_block::build_spine_inputs_list(block);
-        let auth = noid_block::build_auth_public_list(block, &proof);
-        let tx_airs = noid_block::build_tx_airs(block);
-        let air_refs: Vec<&dyn noid_air::Air> =
-            tx_airs.iter().map(|a| a as &dyn noid_air::Air).collect();
-        noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
-            .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
-    } else {
-        noid_block::verify_state_bindings_standalone(&proof, &sb_refs)
-            .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
-    }
-    Ok(())
-}
-
-async fn verify_p2p_block_against_current_tip(
-    chain: &Arc<RwLock<MdbxChainContext>>,
-    block: &noid_chain::block::Block,
-    block_proof_bytes: &[u8],
-    local_time: u64,
-    from: libp2p::PeerId,
-    context: &'static str,
-) -> bool {
-    struct VerifyWork {
-        proof: noid_block::BlockProof,
-        spine: Vec<noid_gkr::SpineInputs>,
-        auth: Vec<noid_gkr::AuthPublicInputs>,
-        tx_airs: Vec<noid_air::composition::tx_logic::TxLogicAir>,
-        sb_airs: Vec<noid_air::airs::block_state_binding::BlockStateBindingAir>,
-    }
-
-    let prep: Result<Option<VerifyWork>, String> = {
-        let mut ctx = chain.write().await;
-
-        if block.header.height != ctx.tip_height().saturating_add(1)
-            || block.header.prev_block_hash != ctx.tip_hash()
         {
-            return false;
+            let store = noid_chain::storage::MdbxStore::open(dir.path()).expect("open store");
+            store.put_block_proof(7, &bytes).expect("store proof bytes");
         }
 
-        (|| -> Result<Option<VerifyWork>, String> {
-            validate_p2p_block_proof_binding(block, block_proof_bytes)?;
+        let store = noid_chain::storage::MdbxStore::open(dir.path()).expect("reopen store");
+        let loaded = store
+            .get_block_proof(7)
+            .expect("load proof bytes")
+            .expect("proof bytes present after reopen");
+        assert_eq!(loaded, bytes);
 
-            let parent = ctx.tip_header().clone();
-            let prev_timestamps = ctx.prev_timestamps();
-            let prev_active_counts = ctx.prev_active_counts();
-            let anchor = ctx.anchor_info();
-            noid_chain::consensus::validate_block_checks(
-                block,
-                &parent,
-                &prev_timestamps,
-                &prev_active_counts,
-                local_time,
-                &anchor,
-                &ctx.nullifiers,
-            )
-            .map_err(|e| format!("cheap consensus checks failed: {e}"))?;
-
-            if block_proof_bytes.is_empty() {
-                Ok(None)
-            } else {
-                let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
-                    .map_err(|e| format!("proof deserialize failed: {e}"))?;
-                noid_block::validate_block_bucket_tx_indices(block, &proof)
-                    .map_err(|e| format!("proof bucket coverage invalid: {e:?}"))?;
-                if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
-                    for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
-                        if pi.log_slots != block.header.log_slots {
-                            return Err(format!(
-                                "proof log_slots/header binding invalid at standard tx {tx_index}: proof={} header={}",
-                                pi.log_slots, block.header.log_slots
-                            ));
-                        }
-                    }
-                }
-                if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
-                    for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
-                        if pi.log_slots != block.header.log_slots {
-                            return Err(format!(
-                                "proof log_slots/header binding invalid at sweep tx {tx_index}: proof={} header={}",
-                                pi.log_slots, block.header.log_slots
-                            ));
-                        }
-                    }
-                }
-
-                // ZK state-binding reconstruction reads pre-state slots. Reload evicted
-                // MDBX segments while the lock is held, then move only owned verifier
-                // inputs off-thread for the expensive proof verification.
-                ctx.preload_segments_for_block(block)
-                    .map_err(|e| format!("preload segments for ZK validation failed: {e}"))?;
-
-                let spine = noid_block::build_spine_inputs_list(block);
-                let auth = noid_block::build_auth_public_list(block, &proof);
-                let sb_airs = noid_block::build_state_binding_airs(block, &proof, &ctx.state.state);
-                let tx_airs = noid_block::build_tx_airs(block);
-
-                noid_block::verify_sweep_bucket_from_block(block, &proof)
-                    .map_err(|e| format!("sweep bucket invalid: {e:?}"))?;
-
-                Ok(Some(VerifyWork {
-                    proof,
-                    spine,
-                    auth,
-                    tx_airs,
-                    sb_airs,
-                }))
-            }
-        })()
-    };
-
-    let work = match prep {
-        Ok(None) => return true,
-        Ok(Some(work)) => work,
-        Err(e) => {
-            tracing::warn!(
-                peer = %from,
-                height = block.header.height,
-                err = %e,
-                context,
-                "P2P block validation failed before apply — rejected"
-            );
-            return false;
-        }
-    };
-
-    let verify_result = tokio::task::spawn_blocking(move || {
-        let air_refs: Vec<&dyn noid_air::Air> = work
-            .tx_airs
-            .iter()
-            .map(|a| a as &dyn noid_air::Air)
-            .collect();
-        let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
-            work.sb_airs.iter().collect();
-        if work.proof.standard_bucket.is_some() {
-            noid_block::verify_block(&air_refs, &work.proof, &work.spine, &work.auth, &sb_refs)
-                .map_err(|e| format!("ZK proof invalid: {e:?}"))?;
-        } else {
-            noid_block::verify_state_bindings_standalone(&work.proof, &sb_refs)
-                .map_err(|e| format!("standalone state binding invalid: {e:?}"))?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("verify task failed: {e}"))
-    .and_then(|r| r);
-
-    if let Err(e) = verify_result {
-        tracing::warn!(
-            peer = %from,
-            height = block.header.height,
-            err = %e,
-            context,
-            "P2P block validation failed before apply — rejected"
-        );
-        false
-    } else {
-        true
+        let decoded: noid_block::BlockProof =
+            bincode::deserialize(&loaded).expect("deserialize current BlockProof format");
+        assert!(decoded.standard_bucket.is_none());
+        assert!(decoded.sweep_bucket.is_none());
+        assert_eq!(decoded.meta.n_tx, 0);
     }
 }
 
@@ -1886,28 +1743,17 @@ async fn handle_p2p_events(
                             }
                         }
 
-                        // Cheap consensus and proof/header binding run before ZK.
                         // Fork/orphan blocks are not ZK-verified until their parent
                         // becomes the current tip, because state-binding AIRs must be
-                        // built against the exact pre-block state.
+                        // built against the exact pre-block state. For the current tip,
+                        // apply_p2p_block_offthread performs proof-native validation and
+                        // atomic commit in one pass; no duplicate apply path.
                         let extends_current_tip = {
                             let ctx = chain.read().await;
                             block.header.height == ctx.tip_height().saturating_add(1)
                                 && block.header.prev_block_hash == ctx.tip_hash()
                         };
-                        if extends_current_tip
-                            && !verify_p2p_block_against_current_tip(
-                                &chain,
-                                &block,
-                                &block_proof_bytes,
-                                local_time,
-                                from,
-                                "tip block",
-                            )
-                            .await
-                        {
-                            continue;
-                        } else if !extends_current_tip {
+                        if !extends_current_tip {
                             if let Err(e) = validate_p2p_block_proof_binding(&block, &block_proof_bytes) {
                                 tracing::warn!(
                                     peer = %from,
@@ -1919,11 +1765,13 @@ async fn handle_p2p_events(
                             }
                         }
 
-                        // Apply block off the async executor (MDBX fsync is blocking).
-                        // ChainView is built inside the write lock (zero added contention
-                        // since the lock is already exclusive).
-                        let apply_result =
-                            apply_block_offthread(&chain, block.clone(), local_time).await;
+                        let apply_result = apply_p2p_block_offthread(
+                            &chain,
+                            block.clone(),
+                            block_proof_bytes.clone(),
+                            local_time,
+                        )
+                        .await;
 
                         match apply_result {
                             Ok((_hash, new_view)) => {
@@ -1971,34 +1819,15 @@ async fn handle_p2p_events(
                                 let mut next_hash = block_hash;
                                 while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                     let orphan_local_time = unix_now();
-                                    let orphan_from = orphan.from;
                                     let orphan_age_ms = orphan.received_at.elapsed().as_millis();
                                     let orphan_block = orphan.block;
                                     let orphan_proof_bytes = orphan.block_proof_bytes;
                                     next_hash =
                                         noid_chain::consensus::pow::full_block_hash(&orphan_block.header);
-                                    if !verify_p2p_block_against_current_tip(
-                                        &chain,
-                                        &orphan_block,
-                                        &orphan_proof_bytes,
-                                        orphan_local_time,
-                                        orphan_from,
-                                        "chained orphan",
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            peer = %orphan_from,
-                                            height = orphan_block.header.height,
-                                            age_ms = orphan_age_ms,
-                                            "chained orphan failed pre-apply validation"
-                                        );
-                                        break;
-                                    }
-                                    // Write lock: apply and build ChainView atomically.
-                                    let orphan_result = apply_block_offthread(
+                                    let orphan_result = apply_p2p_block_offthread(
                                         &chain,
                                         orphan_block.clone(),
+                                        orphan_proof_bytes.clone(),
                                         orphan_local_time,
                                     )
                                     .await;
@@ -2205,7 +2034,7 @@ async fn handle_p2p_events(
                                             // Still buffer in case more blocks arrive from this fork.
                                             insert_orphan(
                                                 &mut orphan_pool,
-                                                OrphanBlock::new(block, block_proof_bytes.clone(), from),
+                                                OrphanBlock::new(block, block_proof_bytes.clone()),
                                             );
                                         }
                                     }
@@ -2230,7 +2059,7 @@ async fn handle_p2p_events(
 
                                         insert_orphan(
                                             &mut orphan_pool,
-                                            OrphanBlock::new(block, block_proof_bytes.clone(), from),
+                                            OrphanBlock::new(block, block_proof_bytes.clone()),
                                         );
 
                                         if is_deep_fork {
