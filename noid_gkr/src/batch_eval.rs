@@ -39,6 +39,7 @@ use noid_core::mle::eq::eq_ind;
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use rayon::prelude::*;
+use zeroize::Zeroize;
 
 /// Inverse Lagrange denominators at `{0,1,2}`. Cached so per-round
 /// `evaluate` is invert-free in the hot path.
@@ -125,6 +126,26 @@ impl BatchEvalProof {
     }
 }
 
+/// Multi-column batch-evaluation sumcheck.
+///
+/// Reduces claim sets over several committed MLE columns to one shared terminal
+/// point and one final value per column. This is used by Auth Capsule to close
+/// `state`, `s_in`, and `s_out` with one sumcheck and one PCS opening instead
+/// of three independent openings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MultiBatchEvalProof {
+    pub rounds: Vec<BatchEvalRound>,
+    pub b_finals: Vec<Block128>,
+}
+
+impl MultiBatchEvalProof {
+    /// Raw field-element byte size: `rounds.len() * 3` degree-2 round evals
+    /// plus one terminal column value per batched column.
+    pub fn byte_len(&self) -> usize {
+        self.rounds.len() * 3 * 16 + self.b_finals.len() * 16
+    }
+}
+
 /// Output of a successful verify.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchEvalReduction {
@@ -137,6 +158,17 @@ pub struct BatchEvalReduction {
 /// Flat-basis fold: folds a `Vec<u128>` table in place using `clmul_gcm` (~4 ns/mul).
 /// ~7x faster than the tower-basis `fold_highest_var_par`.
 fn fold_flat(tbl: &mut Vec<u128>, r_flat: u128) {
+    fold_flat_inner(tbl, r_flat, false);
+}
+
+/// Same fold, but wipes the discarded high half before truncating. Use this for
+/// secret-derived target tables: `Vec::truncate` alone would leave stale `u128`
+/// limbs in the allocation backing store.
+fn fold_flat_zeroing_truncated(tbl: &mut Vec<u128>, r_flat: u128) {
+    fold_flat_inner(tbl, r_flat, true);
+}
+
+fn fold_flat_inner(tbl: &mut Vec<u128>, r_flat: u128, zeroize_truncated: bool) {
     use noid_core::hardware::clmul_gcm;
     let half = tbl.len() / 2;
     if half >= 1024 {
@@ -148,6 +180,9 @@ fn fold_flat(tbl: &mut Vec<u128>, r_flat: u128) {
         for j in 0..half {
             tbl[j] ^= clmul_gcm(r_flat, tbl[j] ^ tbl[j + half]);
         }
+    }
+    if zeroize_truncated {
+        tbl[half..].zeroize();
     }
     tbl.truncate(half);
 }
@@ -254,6 +289,44 @@ fn absorb_claims<T: FiatShamir<Block128>>(channel: &mut T, claims: &[EvalClaim])
     }
 }
 
+const MULTI_BATCH_EVAL_TAG: u128 = 0xA07D_6B12_BA7C_0001;
+
+fn absorb_multi_claims<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    claims_by_column: &[&[EvalClaim]],
+) {
+    channel.absorb(Block128::from(MULTI_BATCH_EVAL_TAG));
+    channel.absorb(Block128::from(claims_by_column.len() as u128));
+    for (col_idx, claims) in claims_by_column.iter().enumerate() {
+        channel.absorb(Block128::from(col_idx as u128));
+        channel.absorb(Block128::from(claims.len() as u128));
+        absorb_claims(channel, claims);
+    }
+}
+
+fn squeeze_alphas_by_column<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    claims_by_column: &[&[EvalClaim]],
+) -> Vec<Vec<Block128>> {
+    claims_by_column
+        .iter()
+        .map(|claims| squeeze_alphas(channel, claims.len()))
+        .collect()
+}
+
+fn initial_multi_claim(
+    claims_by_column: &[&[EvalClaim]],
+    alphas_by_column: &[Vec<Block128>],
+) -> Block128 {
+    let mut claim = Block128::ZERO;
+    for (claims, alphas) in claims_by_column.iter().zip(alphas_by_column.iter()) {
+        for (c, &a) in claims.iter().zip(alphas.iter()) {
+            claim += a * c.value;
+        }
+    }
+    claim
+}
+
 /// Honest prover.
 ///
 /// `b`: length-`2^n` table of the target MLE. Must be the same table
@@ -317,7 +390,7 @@ pub fn prove_batch_eval<T: FiatShamir<Block128>>(
 
         claim = re.evaluate(r_i);
         fold_flat(&mut w_flat, r_i_flat);
-        fold_flat(&mut b_flat, r_i_flat);
+        fold_flat_zeroing_truncated(&mut b_flat, r_i_flat);
 
         rounds.push(re);
         challenges.push(r_i);
@@ -328,6 +401,8 @@ pub fn prove_batch_eval<T: FiatShamir<Block128>>(
     let b_final = Block128::from(noid_core::hardware::flat_to_tower_u128(b_flat[0]));
     let w_final = Block128::from(noid_core::hardware::flat_to_tower_u128(w_flat[0]));
     debug_assert_eq!(claim, w_final * b_final);
+    w_flat.zeroize();
+    b_flat.zeroize();
 
     challenges.reverse();
 
@@ -395,6 +470,177 @@ pub fn verify_batch_eval<T: FiatShamir<Block128>>(
     })
 }
 
+/// Honest prover for multiple target MLE columns with a shared terminal point.
+pub fn prove_multi_batch_eval<T: FiatShamir<Block128>>(
+    columns: &[&[Block128]],
+    claims_by_column: &[&[EvalClaim]],
+    channel: &mut T,
+) -> (MultiBatchEvalProof, Vec<BatchEvalReduction>) {
+    assert!(!columns.is_empty());
+    assert_eq!(columns.len(), claims_by_column.len());
+    let n = columns[0].len().trailing_zeros() as usize;
+    assert_eq!(columns[0].len(), 1 << n);
+    for b in columns {
+        assert_eq!(b.len(), 1 << n);
+    }
+    for claims in claims_by_column {
+        assert!(!claims.is_empty());
+        for c in *claims {
+            assert_eq!(c.point.len(), n);
+        }
+    }
+
+    absorb_multi_claims(channel, claims_by_column);
+    let alphas_by_column = squeeze_alphas_by_column(channel, claims_by_column);
+
+    let mut w_tables: Vec<Vec<u128>> = claims_by_column
+        .iter()
+        .zip(alphas_by_column.iter())
+        .map(|(claims, alphas)| build_w_table_flat(claims, alphas, n))
+        .collect();
+    let mut b_tables: Vec<Vec<u128>> = columns
+        .iter()
+        .map(|b| {
+            use noid_core::hardware::tower_to_flat_u128;
+            if b.len() >= 4096 {
+                b.par_iter().map(|v| tower_to_flat_u128(v.0)).collect()
+            } else {
+                b.iter().map(|v| tower_to_flat_u128(v.0)).collect()
+            }
+        })
+        .collect();
+
+    let mut claim = initial_multi_claim(claims_by_column, &alphas_by_column);
+    let mut rounds = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _round in 0..n {
+        let half = b_tables[0].len() / 2;
+        let mut evals_flat = [0u128; 3];
+        for (w, b) in w_tables.iter().zip(b_tables.iter()) {
+            debug_assert_eq!(w.len(), b.len());
+            let e = eval_round_flat(w, b, half);
+            evals_flat[0] ^= e[0];
+            evals_flat[1] ^= e[1];
+            evals_flat[2] ^= e[2];
+        }
+        let evals: [Block128; 3] =
+            evals_flat.map(|v| Block128::from(noid_core::hardware::flat_to_tower_u128(v)));
+        let re = BatchEvalRound { evals };
+        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
+
+        for e in &re.evals {
+            channel.absorb(*e);
+        }
+        let r_i = channel.squeeze();
+        let r_i_flat = noid_core::hardware::tower_to_flat_u128(r_i.0);
+
+        claim = re.evaluate(r_i);
+        for w in &mut w_tables {
+            fold_flat(w, r_i_flat);
+        }
+        for b in &mut b_tables {
+            fold_flat_zeroing_truncated(b, r_i_flat);
+        }
+
+        rounds.push(re);
+        challenges.push(r_i);
+    }
+
+    debug_assert!(w_tables.iter().all(|w| w.len() == 1));
+    debug_assert!(b_tables.iter().all(|b| b.len() == 1));
+    let b_finals: Vec<Block128> = b_tables
+        .iter()
+        .map(|b| Block128::from(noid_core::hardware::flat_to_tower_u128(b[0])))
+        .collect();
+    let w_finals: Vec<Block128> = w_tables
+        .iter()
+        .map(|w| Block128::from(noid_core::hardware::flat_to_tower_u128(w[0])))
+        .collect();
+    let final_claim = w_finals
+        .iter()
+        .zip(b_finals.iter())
+        .map(|(&w, &b)| w * b)
+        .fold(Block128::ZERO, |a, b| a + b);
+    debug_assert_eq!(claim, final_claim);
+    b_tables.zeroize();
+
+    challenges.reverse();
+    let reductions = b_finals
+        .iter()
+        .map(|&value| BatchEvalReduction {
+            point: challenges.clone(),
+            value,
+        })
+        .collect();
+    let proof = MultiBatchEvalProof { rounds, b_finals };
+    (proof, reductions)
+}
+
+/// Verifier for `prove_multi_batch_eval`.
+pub fn verify_multi_batch_eval<T: FiatShamir<Block128>>(
+    proof: &MultiBatchEvalProof,
+    claims_by_column: &[&[EvalClaim]],
+    n: usize,
+    channel: &mut T,
+) -> Option<Vec<BatchEvalReduction>> {
+    if claims_by_column.is_empty() || proof.b_finals.len() != claims_by_column.len() {
+        return None;
+    }
+    for claims in claims_by_column {
+        if claims.is_empty() {
+            return None;
+        }
+        for c in *claims {
+            if c.point.len() != n {
+                return None;
+            }
+        }
+    }
+    if proof.rounds.len() != n {
+        return None;
+    }
+
+    absorb_multi_claims(channel, claims_by_column);
+    let alphas_by_column = squeeze_alphas_by_column(channel, claims_by_column);
+    let mut claim = initial_multi_claim(claims_by_column, &alphas_by_column);
+
+    let mut challenges = Vec::with_capacity(n);
+    for re in &proof.rounds {
+        if re.sum_at_0_plus_1() != claim {
+            return None;
+        }
+        for e in &re.evals {
+            channel.absorb(*e);
+        }
+        let r_i = channel.squeeze();
+        claim = re.evaluate(r_i);
+        challenges.push(r_i);
+    }
+    challenges.reverse();
+
+    let final_claim = claims_by_column
+        .iter()
+        .zip(alphas_by_column.iter())
+        .zip(proof.b_finals.iter())
+        .map(|((claims, alphas), &b_final)| evaluate_w_at(claims, alphas, &challenges) * b_final)
+        .fold(Block128::ZERO, |a, b| a + b);
+    if claim != final_claim {
+        return None;
+    }
+
+    Some(
+        proof
+            .b_finals
+            .iter()
+            .map(|&value| BatchEvalReduction {
+                point: challenges.clone(),
+                value,
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +701,63 @@ mod tests {
         let red_v = verify_batch_eval(&proof, &claims, n, &mut cv).unwrap();
         assert_eq!(red_p, red_v);
         assert_eq!(red_v.value, evaluate_slice(&b, &red_v.point));
+    }
+
+    #[test]
+    fn honest_multi_column_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(33);
+        let n = 6;
+        let columns: Vec<Vec<Block128>> = (0..3).map(|_| rand_vec(&mut rng, 1 << n)).collect();
+        let mut claims_by_column: Vec<Vec<EvalClaim>> = Vec::new();
+        for (col_idx, b) in columns.iter().enumerate() {
+            let m = col_idx + 2;
+            let claims: Vec<EvalClaim> = (0..m)
+                .map(|_| {
+                    let r = rand_vec(&mut rng, n);
+                    let v = evaluate_slice(b, &r);
+                    EvalClaim { point: r, value: v }
+                })
+                .collect();
+            claims_by_column.push(claims);
+        }
+        let column_refs: Vec<&[Block128]> = columns.iter().map(Vec::as_slice).collect();
+        let claim_refs: Vec<&[EvalClaim]> = claims_by_column.iter().map(Vec::as_slice).collect();
+
+        let mut cp = fresh_channel(77);
+        let (proof, red_p) = prove_multi_batch_eval(&column_refs, &claim_refs, &mut cp);
+
+        let mut cv = fresh_channel(77);
+        let red_v = verify_multi_batch_eval(&proof, &claim_refs, n, &mut cv).unwrap();
+        assert_eq!(red_p, red_v);
+        assert_eq!(red_v.len(), columns.len());
+        for (col, red) in columns.iter().zip(red_v.iter()) {
+            assert_eq!(red.value, evaluate_slice(col, &red.point));
+        }
+        assert!(red_v.windows(2).all(|w| w[0].point == w[1].point));
+    }
+
+    #[test]
+    fn tampered_multi_column_final_rejected() {
+        let mut rng = StdRng::seed_from_u64(34);
+        let n = 5;
+        let columns: Vec<Vec<Block128>> = (0..3).map(|_| rand_vec(&mut rng, 1 << n)).collect();
+        let claims_by_column: Vec<Vec<EvalClaim>> = columns
+            .iter()
+            .map(|b| {
+                let r = rand_vec(&mut rng, n);
+                let v = evaluate_slice(b, &r);
+                vec![EvalClaim { point: r, value: v }]
+            })
+            .collect();
+        let column_refs: Vec<&[Block128]> = columns.iter().map(Vec::as_slice).collect();
+        let claim_refs: Vec<&[EvalClaim]> = claims_by_column.iter().map(Vec::as_slice).collect();
+
+        let mut cp = fresh_channel(78);
+        let (mut proof, _) = prove_multi_batch_eval(&column_refs, &claim_refs, &mut cp);
+        proof.b_finals[1] += Block128::from(1u128);
+
+        let mut cv = fresh_channel(78);
+        assert!(verify_multi_batch_eval(&proof, &claim_refs, n, &mut cv).is_none());
     }
 
     #[test]

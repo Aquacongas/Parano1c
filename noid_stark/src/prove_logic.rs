@@ -22,19 +22,18 @@
 //!
 //! Pipeline:
 //! 1. Build `TxLogicAir` trace from `LogicWitness`
-//! 2. Slice auth boundary MLE into base-length columns
-//! 3. Interleaved commit (AIR cols + N_AUTH_SLICES auth slice cols, one Merkle tree)
-//! 4. AuthGKR Kill-Shot (deterministic self-seeded channel)
-//! 5. STARK zero-check over `TxLogicAir` with auth slice claims
+//! 2. AuthGKR Kill-Shot capsule proves ownership and internally discharges
+//!    `state/s_in/s_out` reductions.
+//! 3. Interleaved commit over tx AIR columns only.
+//! 4. STARK zero-check over `TxLogicAir`.
 
 use noid_air::composition::tx_logic::TxLogicAir;
 use noid_air::{Air, Trace};
-use noid_core::mle::split::{reconstruct_from_slices, split_mle_into_slices};
 use noid_core::Block128;
 use noid_gkr::{
     auth_gkr_channel, build_auth_unified_from_inputs, prove_auth_killshot_with_mle,
     verify_auth_killshot, AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs,
-    SpineInputs, N_AUTH_UNIFIED_VARS,
+    SpineInputs,
 };
 use noid_tx::PublicInputs;
 
@@ -44,15 +43,9 @@ use crate::{SliceClaim, VerifyError};
 use noid_air::airs::tx_body_spine::SPINE_LOG_ROWS;
 use noid_fri_binius::COMPACT_NUM_QUERIES;
 
-/// Auth-MLE slice granularity: must equal `SPINE_LOG_ROWS` so that
-/// every column in the interleaved commit has the same length
-/// `2^BASE_LOG`. With `SPINE_LOG_ROWS = 11` this gives
-/// `N_AUTH_UNIFIED_SLICES = 2^(14-11) = 8` slices per proof.
-const BASE_LOG: usize = SPINE_LOG_ROWS;
-
-/// Number of auth-MLE boundary slices committed per LogicProof.
-/// = 2^(N_AUTH_UNIFIED_VARS - BASE_LOG) = 2^(14 - 11) = 8.
-const N_AUTH_SLICES: usize = 1 << (N_AUTH_UNIFIED_VARS - BASE_LOG);
+/// Wallet logic proofs now commit only tx AIR columns. AuthGKR private MLE
+/// reductions are discharged inside `AuthProofKillShot` capsule-local PCS.
+const N_AUTH_SLICES: usize = 0;
 
 // ---------------------------------------------------------------------------
 // LogicProof — the wallet-produced proof bundle
@@ -65,12 +58,12 @@ const N_AUTH_SLICES: usize = 1 << (N_AUTH_UNIFIED_VARS - BASE_LOG);
 /// block prover who generates it from public SpineInputs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogicProof {
-    /// STARK seal over the TxLogicAir trace + 2 auth boundary-slice columns.
+    /// STARK seal over the TxLogicAir trace only.
     pub stark: InterleavedStarkProof,
     /// AuthGKR Kill-Shot proof (4x5 auth sponges).
     pub auth: AuthProofKillShot,
-    /// Number of boundary-slice columns: `N_AUTH_SLICES` auth slices.
-    /// With BASE_LOG=11 this is 8 (was 2 at BASE_LOG=13).
+    /// Number of boundary-slice columns. Must be zero: auth is self-contained
+    /// in `AuthProofKillShot`.
     pub n_boundary_slices: usize,
 }
 
@@ -145,26 +138,20 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
 
     let auth_circuit = AuthCircuit::build();
 
-    // Build auth boundary MLE and slice it
+    // Build AuthGKR MLE for the self-contained capsule.
     let auth_unified_mle = build_auth_unified_from_inputs(&auth_circuit, auth_inputs);
-    debug_assert_eq!(auth_unified_mle.state.len(), 1 << N_AUTH_UNIFIED_VARS);
-
-    let auth_slices = split_mle_into_slices(&auth_unified_mle.state, N_AUTH_UNIFIED_VARS, BASE_LOG);
-    debug_assert_eq!(auth_slices.len(), N_AUTH_SLICES);
 
     let n_air_cols = trace.columns.len();
-    let n_boundary_slices = auth_slices.len();
+    let n_boundary_slices = N_AUTH_SLICES;
 
-    // Build extended column set (AIR + N_AUTH_SLICES auth slices)
+    // Build column set: AIR columns only. Secret-bearing AuthGKR MLE slices are
+    // not committed in the wallet logic STARK.
     let log_len = crate::padded_log_len(trace.log_rows);
-    debug_assert_eq!(log_len, BASE_LOG);
+    debug_assert_eq!(log_len, SPINE_LOG_ROWS);
 
-    let mut all_columns: Vec<Vec<Block128>> = Vec::with_capacity(n_air_cols + n_boundary_slices);
+    let mut all_columns: Vec<Vec<Block128>> = Vec::with_capacity(n_air_cols);
     for col in &trace.columns {
         all_columns.push(crate::pad_column(col, log_len));
-    }
-    for s in &auth_slices {
-        all_columns.push(s.clone());
     }
 
     // Interleaved commit + AuthGKR
@@ -185,24 +172,7 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     let extras_transcript =
         reduction_to_transcript(&auth_reductions.state.point, auth_reductions.state.value);
 
-    let r_auth = &auth_reductions.state.point;
-    debug_assert_eq!(r_auth.len(), N_AUTH_UNIFIED_VARS);
-
-    let auth_r_low = r_auth[..BASE_LOG].to_vec();
-
-    let auth_slice_values: Vec<Block128> = auth_slices
-        .iter()
-        .map(|s| noid_core::mle::evaluate::evaluate_slice(s, &auth_r_low))
-        .collect();
-
-    let mut slice_claims: Vec<SliceClaim> = Vec::with_capacity(n_boundary_slices);
-    for (i, &val) in auth_slice_values.iter().enumerate() {
-        slice_claims.push(SliceClaim {
-            col_index: n_air_cols + i,
-            eval_point: auth_r_low.clone(),
-            value: val,
-        });
-    }
+    let slice_claims: Vec<SliceClaim> = Vec::new();
 
     let stark = prove_air_interleaved(
         air,
@@ -278,29 +248,12 @@ pub fn verify_logic(
         }
     }
 
-    // Verify STARK with auth slice claims
+    // Verify STARK over tx AIR columns only. Auth reductions are already
+    // discharged inside `verify_auth_killshot`; the state reduction stays in
+    // the transcript to bind the AIR proof to the same auth capsule.
     let extras_transcript =
         reduction_to_transcript(&auth_reductions.state.point, auth_reductions.state.value);
-
-    let r_auth = &auth_reductions.state.point;
-    let auth_r_low = r_auth[..BASE_LOG].to_vec();
-    let auth_r_high = r_auth[BASE_LOG..].to_vec();
-
-    let auth_slice_values = &proof.stark.slice_claimed_values[..n_slices];
-
-    let reconstructed_auth = reconstruct_from_slices(auth_slice_values, &auth_r_high);
-    if reconstructed_auth != auth_reductions.state.value {
-        return Err(VerifyLogicError::SliceReconstruction);
-    }
-
-    let mut slice_claims: Vec<SliceClaim> = Vec::with_capacity(n_slices);
-    for (i, &val) in auth_slice_values.iter().enumerate() {
-        slice_claims.push(SliceClaim {
-            col_index: n_air_cols + i,
-            eval_point: auth_r_low.clone(),
-            value: val,
-        });
-    }
+    let slice_claims: Vec<SliceClaim> = Vec::new();
 
     verify_air_interleaved(
         air,

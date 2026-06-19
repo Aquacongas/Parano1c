@@ -57,7 +57,7 @@ const _: () = assert!(STATE_SIZE <= (1 << N_SWEEP_AUTH_ELEM_VARS));
 /// The four columns of the Sweep AuthGKR unified MLE. Each is a length-`2^16`
 /// vector of `Block128`. The verifier opens all of them at points
 /// derived from the unified sumcheck's final challenge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SweepAuthUnifiedMle {
     pub s_in: Vec<Block128>,
     pub s_out: Vec<Block128>,

@@ -170,7 +170,7 @@ impl SweepAuthPublicInputs {
 /// `spend_secret` which must never appear in logs, panic output, or
 /// test output. Use `auth_inputs.to_public()` for any diagnostic
 /// printing that is safe to expose.
-#[derive(Clone, Copy)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct SweepAuthInputs {
     /// Per-input `SpendSecret = [secret_hi, secret_lo]`. **Private.**
     /// Inactive rows MUST be filled with the zero secret — the circuit

@@ -4,7 +4,7 @@
 //! Shared benchmark fixtures for production standard/sweep proof paths.
 //!
 //! These helpers intentionally build real transaction bodies, real wallet logic
-//! proofs, real auth slices, and real block-bucket witnesses. They are used by
+//! proofs, self-contained auth capsules, and real block-bucket witnesses. They are used by
 //! `alice_sends_bob`, `block_scaling`, and `stark_report` so benchmark numbers
 //! stay comparable across reports.
 
@@ -19,26 +19,24 @@ use noid_block::{
     build_tx_witness, extract_replay_witness, prove_block_with_total_tx_count,
     prove_state_bindings_standalone, verify_state_bindings_standalone,
     verify_sweep_bucket_aggregation, verify_sweep_bucket_from_block, BlockProof, BlockPublicMeta,
-    OwnedSweepTxWitness, OwnedTxWitness, TxBlockWitness, BLOCK_BASE_LOG,
+    OwnedSweepTxWitness, OwnedTxWitness, TxBlockWitness,
 };
 use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
 use noid_chain::state_binding::BlockStateBinding;
 use noid_chain::{Block, BlockHeader, SlotValue};
-use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
-    N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
 use noid_stark::prove_logic::{prove_logic, verify_logic, LogicProof, LogicWitness};
 use noid_stark::prove_logic_sweep::{
-    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
-    sweep_spine_inputs_from_body, verify_sweep_logic, SweepLogicProof, SweepLogicWitness,
+    prove_sweep_logic, sweep_logic_witness_parts_from_body, sweep_spine_inputs_from_body,
+    verify_sweep_logic, SweepLogicProof, SweepLogicWitness,
 };
 use noid_stark::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
@@ -73,7 +71,6 @@ pub struct StandardFixture {
     pub auth_inputs: AuthInputs,
     pub auth_public: AuthPublicInputs,
     pub auth_proof: AuthProofKillShot,
-    pub auth_slices: Vec<Vec<Block128>>,
 }
 
 pub struct SweepFixture {
@@ -83,7 +80,6 @@ pub struct SweepFixture {
     pub pi: PublicInputs,
     pub auth_inputs: noid_gkr::SweepAuthInputs,
     pub auth_public: noid_gkr::SweepAuthPublicInputs,
-    pub auth_slices: Vec<Vec<Block128>>,
     pub spine_inputs: noid_gkr::SweepSpineInputs,
 }
 
@@ -507,8 +503,6 @@ pub fn standard_fixture(scenario: BenchScenario) -> StandardFixture {
     let auth_public = auth_inputs.to_public();
     let mut ch = auth_gkr_channel();
     let (auth_proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
-    let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
     let pi = public_inputs_for_body(body);
     let spine_inputs = SpineInputs {
@@ -529,7 +523,6 @@ pub fn standard_fixture(scenario: BenchScenario) -> StandardFixture {
         auth_inputs,
         auth_public,
         auth_proof,
-        auth_slices,
     }
 }
 
@@ -539,7 +532,6 @@ pub fn sweep_fixture(scenario: BenchScenario) -> SweepFixture {
         sweep_logic_witness_parts_from_body(&scenario.body);
     assert!(air.check(&trace), "sweep trace rejected by AIR");
     let auth_public = auth_inputs.to_public();
-    let auth_slices = build_sweep_auth_slices(&auth_inputs);
     let pi = public_inputs_for_body(&scenario.body);
     SweepFixture {
         scenario,
@@ -548,7 +540,6 @@ pub fn sweep_fixture(scenario: BenchScenario) -> SweepFixture {
         pi,
         auth_inputs,
         auth_public,
-        auth_slices,
         spine_inputs,
     }
 }
@@ -848,10 +839,8 @@ fn prove_full_block_proof_once(
                 log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
                 n_block_spine_slices: 0,
                 n_state_bindings: state_bindings.len() as u32,
-                state_binding_n_cols: state_bindings.first().map_or(0, |sb| sb.air.n_columns())
-                    as u32,
-                state_binding_log_rows: state_bindings.first().map_or(0, |sb| sb.air.log_rows())
-                    as u32,
+                state_binding_n_cols: 0,
+                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: Some(bucket),
@@ -1003,7 +992,6 @@ pub fn prove_sweep_wallet(f: &SweepFixture, samples: usize) -> SweepWalletBench 
 pub fn standard_bundle(f: &StandardFixture, proof: LogicProof) -> WalletProofBundle {
     WalletProofBundle::Standard4x8(noid_stark::StandardWalletProofBundle {
         logic_proof: proof,
-        auth_slices: f.auth_slices.clone(),
         auth_public: f.auth_public,
     })
 }
@@ -1011,7 +999,6 @@ pub fn standard_bundle(f: &StandardFixture, proof: LogicProof) -> WalletProofBun
 pub fn sweep_bundle(f: &SweepFixture, proof: SweepLogicProof) -> WalletProofBundle {
     WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
         logic_proof: proof,
-        auth_slices: f.auth_slices.clone(),
         auth_public: f.auth_public,
     })
 }
@@ -1025,7 +1012,6 @@ pub fn standard_block_witness<'a>(idx: u32, f: &'a StandardFixture) -> TxBlockWi
         spine_inputs: &f.spine_inputs,
         auth_public: &f.auth_public,
         auth_proof: &f.auth_proof,
-        auth_slices: &f.auth_slices,
     }
 }
 

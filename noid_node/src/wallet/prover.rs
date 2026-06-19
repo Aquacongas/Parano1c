@@ -6,32 +6,30 @@
 //! This is the ONLY place where `SpendSecret` is combined with the ZK proof
 //! pipeline. It NEVER leaves this function — it's passed in, used to compute
 //! the auth proof, and then dropped (zeroized by `ZeroizeOnDrop` on `SpendSecret`).
+//! Field-limb temporaries are wallet-local proof workspace and are not serialized.
 //!
 //! # What this produces
 //!
 //! `WalletProofBundle::{Standard4x8, Sweep25x2}` — the wallet's proof artifact
 //! submitted to the local mempool via `submitTxIntent`. The bundle is
 //! forwarded from the mempool to the block prover inside the daemon.
+//! AuthGKR witness tables remain wallet-local; the bundle carries only public
+//! auth inputs plus self-contained KillShot proof capsules embedded in logic proofs.
 //!
 //! # SpendSecret handling
 //!
 //! The secret is taken by value and zeroized when this function returns.
-//! No reference escapes. No copy is stored anywhere on disk or in memory
-//! after this function completes.
+//! No reference escapes. No copy is serialized or stored on disk after this
+//! function completes.
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
-use noid_core::mle::split::split_mle_into_slices;
 use noid_core::Block128;
-use noid_gkr::{
-    build_auth_unified_from_inputs, compute_auth_boundary, AuthCircuit, AuthInputs, N_AUTH_INPUTS,
-    N_AUTH_UNIFIED_VARS,
-};
+use noid_gkr::{compute_auth_boundary, AuthCircuit, AuthInputs, N_AUTH_INPUTS};
 use noid_poseidon2b::primitives::SpendSecret;
 use noid_stark::prove_logic::prove_logic;
 use noid_stark::prove_logic::LogicWitness;
 use noid_stark::prove_logic_sweep::{
-    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
-    SweepLogicWitness,
+    prove_sweep_logic, sweep_logic_witness_parts_from_body, SweepLogicWitness,
 };
 use noid_stark::wallet_bundle::{
     StandardWalletProofBundle, SweepWalletProofBundle, WalletProofBundle,
@@ -55,9 +53,9 @@ pub enum ProveError {
 ///
 /// # Returns
 ///
-/// `WalletProofBundle` containing the `LogicProof` and `auth_slices`.
+/// `WalletProofBundle` containing the transaction logic proof and public auth inputs.
 /// This bundle is submitted to the local mempool, which forwards it to
-/// the block prover. SpendSecret NEVER appears in the bundle.
+/// the block prover. SpendSecret and raw AuthGKR MLE slices NEVER appear in the bundle.
 pub fn prove_tx(
     body: &TxBody,
     spend_secrets: Vec<SpendSecret>, // consumed and zeroized
@@ -102,11 +100,6 @@ fn prove_standard_tx(
     let logic_witness = witness_from_body(body);
     let trace = air.build_trace(&logic_witness);
 
-    // Build auth MLE and auth_slices (requires spend_secret internally).
-    use noid_block::BLOCK_BASE_LOG;
-    let auth_mle = build_auth_unified_from_inputs(&auth_circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
-
     // Build public inputs.
     let pi = build_public_inputs(body, log_slots);
 
@@ -120,15 +113,14 @@ fn prove_standard_tx(
     };
     let logic_proof = prove_logic(&witness).map_err(|e| ProveError::Logic(format!("{e:?}")))?;
 
-    // SpendSecret is now only in `auth_inputs` and `spend_secret_arr` which
-    // are stack-allocated and will be dropped (zeroized) at the end of this fn.
-    // The `WalletProofBundle` contains NO raw SpendSecret material:
-    //   logic_proof = STARK + AuthKillShot
-    //   auth_slices = AuthGKR state slices, matching the SC-5 one-wayness model
+    // SpendSecret field limbs are now only in wallet-local proof workspace.
+    // The `WalletProofBundle` contains NO raw SpendSecret material and no raw
+    // AuthGKR MLE slices:
+    //   logic_proof = STARK + self-contained AuthKillShot capsule
+    //   auth_public = public address/auth-tag boundary only
 
     Ok(WalletProofBundle::Standard4x8(StandardWalletProofBundle {
         logic_proof,
-        auth_slices,
         auth_public: auth_inputs.to_public(),
     }))
 }
@@ -157,13 +149,10 @@ fn prove_sweep_tx(
     let logic_proof =
         prove_sweep_logic(&witness).map_err(|e| ProveError::Logic(format!("{e:?}")))?;
 
-    // Sweep follows the Standard4x8 wallet artifact model: serialize only
-    // AuthGKR `state` slices, not s_in/s_out or tx-body SpineGKR helper columns.
-    let auth_slices = build_sweep_auth_slices(&auth_inputs);
-
+    // Sweep follows the Standard4x8 wallet artifact model: serialize only the
+    // logic proof capsule plus public auth boundary, never raw AuthGKR MLE slices.
     Ok(WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
         logic_proof,
-        auth_slices,
         auth_public: auth_inputs.to_public(),
     }))
 }
@@ -248,5 +237,139 @@ fn build_public_inputs_for_shape(body: &TxBody, log_slots: u32) -> PublicInputs 
         claims_commitment: claims,
         is_activation,
         is_deactivation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, Address, AuthTag};
+    use noid_tx::{hash_tx_body_for_shape, TxInput, TxOutput};
+
+    const TEST_LOG_SLOTS: u32 = 24;
+
+    fn secret(seed: u8) -> SpendSecret {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = seed.wrapping_mul(37).wrapping_add(i as u8).wrapping_add(3);
+        }
+        SpendSecret(bytes)
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn finalize_auth_tags(body: &mut TxBody) {
+        let tx_body_hash = hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        for input in body.inputs.iter_mut().filter(|i| i.valid) {
+            input.auth_tag = hash_auth_tag(&input.spend_secret, &tx_body_hash);
+        }
+    }
+
+    fn standard_body(spend_secret: SpendSecret) -> TxBody {
+        let owner = derive_address(&spend_secret);
+        let mut body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [0x51; 32],
+            fee: 10,
+            inputs: vec![TxInput {
+                slot_index: 7,
+                value: 1_000,
+                owner,
+                spend_secret,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
+            }],
+            outputs: vec![TxOutput {
+                slot_index: 70,
+                value: 990,
+                owner: Address([0xA7; 32]),
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        finalize_auth_tags(&mut body);
+        body
+    }
+
+    fn sweep_body(secrets: &[SpendSecret]) -> TxBody {
+        let mut inputs = Vec::with_capacity(secrets.len());
+        for (i, spend_secret) in secrets.iter().cloned().enumerate() {
+            inputs.push(TxInput {
+                slot_index: 1_000 + i as u32,
+                value: 10_000 + i as u64,
+                owner: derive_address(&spend_secret),
+                spend_secret,
+                auth_tag: AuthTag([0u8; 32]),
+                valid: true,
+            });
+        }
+        let total: u64 = inputs.iter().map(|i| i.value).sum();
+        let fee = 123u64;
+        let mut body = TxBody {
+            shape: TxShape::Sweep25x2,
+            epoch_anchor: [0x52; 32],
+            fee: fee as u128,
+            inputs,
+            outputs: vec![
+                TxOutput {
+                    slot_index: 50_000,
+                    value: (total - fee) / 2,
+                    owner: Address([0xB1; 32]),
+                    valid: true,
+                },
+                TxOutput {
+                    slot_index: 50_001,
+                    value: total - fee - (total - fee) / 2,
+                    owner: Address([0xB2; 32]),
+                    valid: true,
+                },
+            ],
+            is_coinbase: false,
+        };
+        finalize_auth_tags(&mut body);
+        body
+    }
+
+    #[test]
+    fn standard_wallet_bundle_does_not_serialize_spend_secret_bytes() {
+        let spend_secret = secret(11);
+        let raw_secret = spend_secret.0;
+        let body = standard_body(spend_secret.clone());
+
+        let bundle =
+            prove_tx(&body, vec![spend_secret], TEST_LOG_SLOTS).expect("prove standard tx");
+        let bytes = bincode::serialize(&bundle).expect("serialize wallet bundle");
+
+        assert!(
+            !contains_subslice(&bytes, &raw_secret),
+            "standard wallet bundle must not contain raw spend_secret bytes"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
+    fn sweep_wallet_bundle_does_not_serialize_spend_secret_bytes() {
+        let secrets: Vec<_> = (0..5).map(|i| secret(21 + i)).collect();
+        let raw_secrets: Vec<_> = secrets.iter().map(|s| s.0).collect();
+        let body = sweep_body(&secrets);
+
+        let bundle = prove_tx(&body, secrets, TEST_LOG_SLOTS).expect("prove sweep tx");
+        let bytes = bincode::serialize(&bundle).expect("serialize wallet bundle");
+
+        for raw_secret in raw_secrets {
+            assert!(
+                !contains_subslice(&bytes, &raw_secret),
+                "sweep wallet bundle must not contain raw spend_secret bytes"
+            );
+        }
     }
 }

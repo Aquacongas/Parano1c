@@ -24,6 +24,7 @@ pub mod auth_mle_sweep;
 pub mod auth_mle_v2;
 pub mod auth_oracle;
 pub mod auth_oracle_sweep;
+pub mod auth_pcs;
 pub mod auth_shift;
 pub mod auth_shift_sweep;
 pub mod auth_unified_sweep;
@@ -86,6 +87,11 @@ pub use auth_oracle::{compute_auth_boundary, evaluate_auth, AuthSlotState, AuthW
 pub use auth_oracle_sweep::{
     compute_sweep_auth_boundary, evaluate_sweep_auth, SweepAuthSlotState, SweepAuthWitness,
 };
+pub use auth_pcs::{
+    commit_auth_mle_columns, open_auth_mle_columns_committed, prove_auth_mle_opening,
+    verify_auth_mle_multi_opening, verify_auth_mle_opening, AuthMleMultiOpeningProof,
+    AuthMleOpeningProof, AUTH_PCS_BASE_LOG,
+};
 pub use auth_unified_sweep::{
     prove_sweep_auth_shift, prove_sweep_auth_unified, verify_sweep_auth_shift,
     verify_sweep_auth_unified, SweepAuthKillShotProof, SweepAuthShiftProof,
@@ -98,8 +104,8 @@ pub use auth_unified_v2::{
     AUTH_SHIFT_ROUND_DEGREE, AUTH_UNIFIED_ROUND_DEGREE,
 };
 pub use batch_eval::{
-    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, BatchEvalRound,
-    EvalClaim,
+    prove_batch_eval, prove_multi_batch_eval, verify_batch_eval, verify_multi_batch_eval,
+    BatchEvalProof, BatchEvalReduction, BatchEvalRound, EvalClaim, MultiBatchEvalProof,
 };
 pub use binding::BindingCut;
 pub use block_spine::{

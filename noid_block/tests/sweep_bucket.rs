@@ -8,15 +8,16 @@
 //! with one block-side `SweepBlockSpineProof` and bound to concrete block
 //! transaction indices.
 
+use noid_air::airs::block_state_binding::BlockStateBindingClaim;
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
 use noid_block::{
-    assemble_sweep_bucket_proof, block_recursive_claim_hash, build_state_bindings_from_binding,
-    build_tx_witness, extract_replay_witness, prove_block_with_total_tx_count,
-    prove_state_bindings_standalone, validate_block_bucket_tx_indices,
-    validate_block_proof_transcript_hash, verify_state_bindings_standalone,
-    verify_sweep_bucket_from_block, BlockProof, BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
-    BLOCK_BASE_LOG,
+    assemble_sweep_bucket_proof, block_recursive_claim_hash, build_state_binding_airs,
+    build_state_bindings_from_binding, build_tx_witness, extract_replay_witness,
+    prove_block_with_total_tx_count, prove_state_bindings_standalone,
+    validate_block_bucket_tx_indices, validate_block_proof_transcript_hash,
+    verify_state_bindings_standalone, verify_sweep_bucket_from_block, BlockProof, BlockPublicMeta,
+    OwnedTxWitness, TxBlockWitness, VerifyBlockError,
 };
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
@@ -24,13 +25,11 @@ use noid_chain::consensus::params::GENESIS_TARGET;
 use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
 use noid_chain::state_binding::{BlockStateBinding, StateBindingError};
-use noid_chain::SlotValue;
-use noid_core::mle::split::split_mle_into_slices;
+use noid_chain::{build_state_delta_witness, SlotValue, StateDeltaActionKind, StateDeltaWitness};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
-    N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
@@ -40,8 +39,7 @@ use noid_recursive::{
     verify::verify_recursive_step,
 };
 use noid_stark::prove_logic_sweep::{
-    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
-    SweepLogicWitness,
+    prove_sweep_logic, sweep_logic_witness_parts_from_body, SweepLogicWitness,
 };
 use noid_stark::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
@@ -225,6 +223,93 @@ fn patch_binding_new_root_with_coinbase(
     binding.new_state_root = post_state.root();
 }
 
+fn sorted_claim_pairs(
+    mut pairs: Vec<(u16, BlockStateBindingClaim)>,
+) -> Vec<(u16, BlockStateBindingClaim)> {
+    pairs.sort_by_key(|(seg_id, claim)| {
+        (
+            *seg_id,
+            claim.slot_index,
+            claim.is_mint,
+            claim.is_spend,
+            claim.value.to_u128(),
+            claim.owner_hi.to_u128(),
+            claim.owner_lo.to_u128(),
+            claim.delta_value.to_u128(),
+            claim.delta_owner_hi.to_u128(),
+            claim.delta_owner_lo.to_u128(),
+        )
+    });
+    pairs
+}
+
+fn owned_state_binding_claim_pairs(
+    owned: &[noid_block::OwnedStateBindingWitness],
+) -> Vec<(u16, BlockStateBindingClaim)> {
+    sorted_claim_pairs(
+        owned
+            .iter()
+            .flat_map(|binding| {
+                binding
+                    .claims
+                    .iter()
+                    .copied()
+                    .map(|claim| (binding.seg_id, claim))
+            })
+            .collect(),
+    )
+}
+
+fn state_delta_claim_pairs(
+    delta: &StateDeltaWitness,
+    coinbase_body: Option<&TxBody>,
+    log_slots: u32,
+) -> Vec<(u16, BlockStateBindingClaim)> {
+    let eff_log =
+        (log_slots as usize).min(noid_chain::consensus::params::LOG_SEGMENT_SIZE as usize);
+    let seg_mask = (1u32 << eff_log) - 1;
+    let mut pairs = Vec::new();
+
+    if let Some(coinbase) = coinbase_body {
+        for output in coinbase.outputs.iter().filter(|output| output.valid) {
+            let seg_id = (output.slot_index >> eff_log) as u16;
+            let local = output.slot_index & seg_mask;
+            let [owner_hi, owner_lo] = output.owner.as_fields();
+            pairs.push((
+                seg_id,
+                BlockStateBindingClaim::mint(
+                    local,
+                    Block128::from(output.value as u128),
+                    owner_hi,
+                    owner_lo,
+                ),
+            ));
+        }
+    }
+
+    for action in &delta.actions {
+        let seg_id = (action.slot_index >> eff_log) as u16;
+        let local = action.slot_index & seg_mask;
+        let claim = match action.kind {
+            StateDeltaActionKind::Spend => BlockStateBindingClaim::spend(
+                local,
+                action.pre.value,
+                action.pre.owner_hi,
+                action.pre.owner_lo,
+            ),
+            StateDeltaActionKind::Mint => BlockStateBindingClaim::mint(
+                local,
+                action.post.value,
+                action.post.owner_hi,
+                action.post.owner_lo,
+            ),
+        };
+        pairs.push((seg_id, claim));
+    }
+
+    sorted_claim_pairs(pairs)
+}
+
 fn coinbase_tx() -> Transaction {
     tx_from_body(TxBody {
         shape: TxShape::Standard4x8,
@@ -294,7 +379,6 @@ struct StandardFixture {
     spine_inputs: SpineInputs,
     auth_public: AuthPublicInputs,
     auth_proof: AuthProofKillShot,
-    auth_slices: Vec<Vec<Block128>>,
 }
 
 #[allow(dead_code)]
@@ -423,8 +507,6 @@ fn standard_fixture_with_params(
     };
     let mut ch = auth_gkr_channel();
     let (auth_proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
-    let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let auth_slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
     StandardFixture {
         body,
@@ -434,7 +516,6 @@ fn standard_fixture_with_params(
         spine_inputs,
         auth_public: auth_inputs.to_public(),
         auth_proof,
-        auth_slices,
     }
 }
 
@@ -449,10 +530,8 @@ fn prove_sweep_bundle(body: &TxBody) -> WalletProofBundle {
         auth_inputs: &auth_inputs,
     };
     let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
-    let auth_slices = build_sweep_auth_slices(&auth_inputs);
     WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
         logic_proof,
-        auth_slices,
         auth_public: auth_inputs.to_public(),
     })
 }
@@ -532,6 +611,10 @@ fn block_with_user_txs(mut user_txs: Vec<Transaction>) -> Block {
     block
 }
 
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 #[allow(dead_code)]
 fn mixed_block_proof() -> (Block, BlockProof) {
     mixed_block_proof_with_counts(1, 1)
@@ -570,7 +653,6 @@ fn mixed_block_proof_with_counts(n_standard: usize, n_sweep: usize) -> (Block, B
             spine_inputs: &standard.spine_inputs,
             auth_public: &standard.auth_public,
             auth_proof: &standard.auth_proof,
-            auth_slices: &standard.auth_slices,
         })
         .collect();
     let mut proof = prove_block_with_total_tx_count(
@@ -648,10 +730,13 @@ fn sweep_bucket_assembles_and_verifies_from_owned_witness() {
     assert_eq!(bucket.meta.shape, TxShape::Sweep25x2);
     assert_eq!(bucket.meta.tx_indices, vec![1]);
     assert_eq!(bucket.tx_pis[0].shape_id, TxShape::Sweep25x2.id());
-    assert_eq!(bucket.auth_slices.len(), 1);
-    assert_eq!(
-        bucket.meta.n_boundary_slices_per_tx as usize,
-        bucket.auth_slices[0].len()
+    assert_eq!(bucket.tx_auth_proofs.len(), 1);
+    assert_eq!(bucket.meta.n_boundary_slices_per_tx, 0);
+    assert_eq!(bucket.commitment.n_cols, bucket.block_col_openings.len());
+    assert!(
+        bucket.commitment.n_cols
+            < bucket.meta.n_air_per_tx as usize + bucket.meta.n_block_spine_slices as usize,
+        "public AIR columns should be verifier-derived, not committed"
     );
     assert!(bucket.byte_len() > 0);
 
@@ -688,21 +773,22 @@ fn sweep_bucket_rejects_spine_tampering() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-fn sweep_bucket_rejects_auth_slice_shape_tampering() {
+fn sweep_bucket_rejects_missing_auth_proof() {
     let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
-    proof.sweep_bucket.as_mut().unwrap().auth_slices[0].pop();
+    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs.pop();
     assert!(validate_block_bucket_tx_indices(&block, &proof).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-fn sweep_bucket_rejects_auth_slice_value_tampering() {
+fn sweep_bucket_rejects_auth_capsule_pcs_value_tampering() {
     let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
-    for v in &mut proof.sweep_bucket.as_mut().unwrap().auth_slices[0][0] {
-        *v += Block128::ONE;
-    }
+    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs[0]
+        .pcs
+        .opening
+        .all_openings[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
     assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
 }
@@ -714,7 +800,11 @@ fn sweep_bucket_rejects_aggregation_opening_tampering() {
 
     proof.sweep_bucket.as_mut().unwrap().block_col_openings[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    let err = verify_sweep_bucket_from_block(&block, &proof).expect_err("tampered opening rejects");
+    assert!(
+        matches!(err, VerifyBlockError::AlgebraicTerminal(0)),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]
@@ -750,8 +840,8 @@ fn sweep_recursive_claim_hash_binds_new_sweep_auth_proof_field() {
 
     let canonical_hash = block.header.proof_transcript_hash;
     proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs[0]
-        .state_batch
-        .b_final += Block128::ONE;
+        .batch
+        .b_finals[0] += Block128::ONE;
 
     assert_ne!(canonical_hash, block_recursive_claim_hash(&proof));
     assert!(
@@ -859,6 +949,28 @@ fn sweep_only_replay_witness_extracts_and_recursive_step_verifies() {
     let rec_air = RecursiveBlockAir::from_prev_state_root(&prev_acc.state_root);
     verify_recursive_step(&rec_proof, &prev_acc, &block.header, &rec_air)
         .expect("sweep-only recursive step verifies");
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
+fn mixed_block_proof_does_not_serialize_spend_secret_bytes() {
+    let (block, proof) = mixed_block_proof();
+    let raw_secrets: Vec<[u8; 32]> = block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.body.inputs.iter())
+        .filter(|input| input.valid)
+        .map(|input| input.spend_secret.0)
+        .collect();
+    assert!(!raw_secrets.is_empty(), "test must contain spend secrets");
+
+    let proof_bytes = bincode::serialize(&proof).expect("serialize block proof");
+    for raw_secret in raw_secrets {
+        assert!(
+            !contains_subslice(&proof_bytes, &raw_secret),
+            "block proof must not contain raw spend_secret bytes"
+        );
+    }
 }
 
 #[test]
@@ -986,7 +1098,6 @@ fn mixed_block_rejects_duplicate_and_missing_bucket_indices() {
         .clear();
     missing.sweep_bucket.as_mut().unwrap().tx_pis.clear();
     missing.sweep_bucket.as_mut().unwrap().auth_public.clear();
-    missing.sweep_bucket.as_mut().unwrap().auth_slices.clear();
     missing
         .sweep_bucket
         .as_mut()
@@ -1102,12 +1213,21 @@ fn sweep_only_state_binding_witness_includes_coinbase_claims() {
     let pre_segs = pre_segments_for_state(&state, &[7, 42]);
     let owned = build_state_bindings_from_binding(
         &binding,
-        &[body],
+        &[body.clone()],
         Some(&coinbase),
         &pre_segs,
         prev_state_root,
         1,
         6,
+    );
+
+    let mut delta_state = state.state.clone();
+    let delta = build_state_delta_witness(&mut delta_state, &[body], &[commitment])
+        .expect("build native state-delta witness");
+    assert_eq!(
+        owned_state_binding_claim_pairs(&owned),
+        state_delta_claim_pairs(&delta, Some(&coinbase), 6),
+        "current BlockStateBindingAir claims must match native state-delta actions"
     );
 
     assert_eq!(owned.len(), 1, "test fixture touches one segment");
@@ -1175,6 +1295,15 @@ fn mixed_state_binding_witness_is_common_across_standard_sweep_and_coinbase() {
         6,
     );
 
+    let mut delta_state = state.state.clone();
+    let delta = build_state_delta_witness(&mut delta_state, &bodies, &commitments)
+        .expect("build native state-delta witness");
+    assert_eq!(
+        owned_state_binding_claim_pairs(&owned),
+        state_delta_claim_pairs(&delta, Some(&coinbase), 6),
+        "mixed standard/sweep state-binding claims must match native state-delta actions"
+    );
+
     assert_eq!(owned.len(), 1, "test fixture touches one segment");
     let claims = &owned[0].claims;
     assert_eq!(
@@ -1199,6 +1328,87 @@ fn mixed_state_binding_witness_is_common_across_standard_sweep_and_coinbase() {
             "missing mint claim for slot {slot}"
         );
     }
+}
+
+#[test]
+fn state_delta_claim_equivalence_allows_prefix_overlay_spend() {
+    let alice = Address([0xA3; 32]);
+    let bob = Address([0xB4; 32]);
+    let tx0 = TxBody {
+        shape: TxShape::Standard4x8,
+        epoch_anchor: [0x41; 32],
+        fee: 0,
+        inputs: vec![],
+        outputs: vec![TxOutput {
+            slot_index: 10,
+            value: 123,
+            owner: alice,
+            valid: true,
+        }],
+        is_coinbase: false,
+    };
+    let tx1 = TxBody {
+        shape: TxShape::Sweep25x2,
+        epoch_anchor: [0x42; 32],
+        fee: 0,
+        inputs: vec![TxInput {
+            slot_index: 10,
+            value: 123,
+            owner: alice,
+            spend_secret: SpendSecret([0xA3; 32]),
+            auth_tag: AuthTag([0u8; 32]),
+            valid: true,
+        }],
+        outputs: vec![TxOutput {
+            slot_index: 70_000,
+            value: 100,
+            owner: bob,
+            valid: true,
+        }],
+        is_coinbase: false,
+    };
+    let bodies = vec![tx0, tx1];
+    let commitments: Vec<_> = bodies
+        .iter()
+        .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
+        .collect();
+
+    let mut state = ChainState::with_log_slots(18);
+    let prev_state_root = state.state_root();
+
+    let mut binding_state = state.state.clone();
+    let binding = BlockStateBinding::build(&mut binding_state, &bodies, &commitments)
+        .expect("current binding accepts prefix-overlay spend");
+
+    let mut delta_state = state.state.clone();
+    let delta = build_state_delta_witness(&mut delta_state, &bodies, &commitments)
+        .expect("native delta accepts prefix-overlay spend");
+    assert_eq!(binding.new_state_root, delta.post_state_root);
+
+    let pre_segs = pre_segments_for_state(&state, &[10, 70_000]);
+    let owned = build_state_bindings_from_binding(
+        &binding,
+        &bodies,
+        None,
+        &pre_segs,
+        prev_state_root,
+        bodies.len() as u32,
+        18,
+    );
+
+    assert_eq!(
+        owned_state_binding_claim_pairs(&owned),
+        state_delta_claim_pairs(&delta, None, 18),
+        "prefix-overlay mints/spends across segments must map to the same BSB claims"
+    );
+    assert!(
+        owned.iter().any(|binding| binding.seg_id == 0),
+        "mint-then-spend slot should live in segment 0"
+    );
+    assert!(
+        owned.iter().any(|binding| binding.seg_id == 1),
+        "70_000 output should live in segment 1 for log_slots=18"
+    );
 }
 
 #[test]
@@ -1255,6 +1465,78 @@ fn common_state_binding_rejects_cross_shape_double_spend() {
 #[test]
 #[cfg_attr(
     debug_assertions,
+    ignore = "release-only state-delta native identity regression"
+)]
+fn native_state_delta_rejects_wrong_post_lane_before_opening_verify() {
+    let standard = standard_fixture_with_params(0xD1, 0, 10, 0x44);
+    let body = standard.body.clone();
+    let block = block_with_user_tx(tx_from_body(body.clone()));
+    let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
+
+    let mut state = ChainState::with_log_slots(6);
+    seed_slot(&mut state, 0, body.inputs[0].value, body.inputs[0].owner);
+    seed_slot(&mut state, 1, body.inputs[1].value, body.inputs[1].owner);
+    let prev_state_root = state.state_root();
+
+    let tx_witness = TxBlockWitness {
+        block_tx_index: 1,
+        air: &standard.air as &dyn Air,
+        trace: &standard.trace,
+        pi: &standard.pi,
+        spine_inputs: &standard.spine_inputs,
+        auth_public: &standard.auth_public,
+        auth_proof: &standard.auth_proof,
+    };
+    let mut proof =
+        prove_block_with_total_tx_count(prev_state_root, [0u8; 32], &[tx_witness], &[], 1)
+            .expect("prove standard bucket");
+
+    let mut state_for_binding = state.state.clone();
+    let mut binding =
+        BlockStateBinding::build(&mut state_for_binding, &[body.clone()], &[commitment])
+            .expect("build binding");
+    patch_binding_new_root_with_coinbase(
+        &mut binding,
+        state_for_binding,
+        &block.transactions[0].body,
+    );
+
+    let pre_segs = pre_segments_for_state(&state, &[0, 1, 10, 11, 42]);
+    let owned = build_state_bindings_from_binding(
+        &binding,
+        &[body],
+        Some(&block.transactions[0].body),
+        &pre_segs,
+        prev_state_root,
+        1,
+        6,
+    );
+    let witnesses: Vec<_> = owned.iter().map(|b| b.as_witness()).collect();
+    let (_starks, pre_openings, post_openings) = prove_state_bindings_standalone(&witnesses);
+
+    proof.meta.new_state_root = binding.new_state_root;
+    proof.meta.n_state_bindings = witnesses.len() as u32;
+    proof.meta.state_binding_n_cols = 0;
+    proof.meta.state_binding_log_rows = 0;
+    proof.pre_state_openings = pre_openings;
+    proof.post_state_openings = post_openings;
+
+    let mut bad = proof;
+    bad.post_state_openings[0].lane_values[0] += Block128::ONE;
+
+    let err = match build_state_binding_airs(&block, &bad, &state.state) {
+        Ok(_) => panic!("wrong post lane must fail native state-delta identity"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        noid_block::VerifyBlockError::StateMleOpeningFailed(0)
+    ));
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
     ignore = "release-only state-binding proof regression"
 )]
 fn standalone_state_binding_proves_and_verifies_for_sweep_only_path() {
@@ -1290,9 +1572,9 @@ fn standalone_state_binding_proves_and_verifies_for_sweep_only_path() {
             n_auth_slices_per_tx: 0,
             log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
             n_block_spine_slices: 0,
-            n_state_bindings: starks.len() as u32,
-            state_binding_n_cols: witnesses[0].air.n_columns() as u32,
-            state_binding_log_rows: witnesses[0].air.log_rows() as u32,
+            n_state_bindings: witnesses.len() as u32,
+            state_binding_n_cols: 0,
+            state_binding_log_rows: 0,
         },
         standard_bucket: None,
         sweep_bucket: None,

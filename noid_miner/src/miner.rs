@@ -703,14 +703,13 @@ impl BlockMiner {
 /// # State correctness
 ///
 /// Production block validity is proof-native: every user-transaction block must
-/// include `BlockStateBindingAir` witnesses proving the header state-root
-/// transition. The live node/miner verify the full block proof and then commit
-/// the proven delta via the single `apply_next_block` path.
+/// include NativeDelta state openings proving the header state-root transition.
+/// The live node/miner verify the full block proof and then commit the proven
+/// delta via the single `apply_next_block` path.
 pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
 ) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
-    use noid_air::Air;
     use noid_block::{
         assemble_sweep_bucket_proof, block_recursive_claim_hash, build_block_witnesses,
         build_state_bindings_from_binding, prove_block_with_total_tx_count,
@@ -781,7 +780,6 @@ pub(crate) fn run_prove_block(
             spine_inputs: &w.spine_inputs,
             auth_public: &w.auth_public,
             auth_proof: &w.auth_proof,
-            auth_slices: &w.auth_slices,
         })
         .collect();
 
@@ -828,10 +826,8 @@ pub(crate) fn run_prove_block(
                 log_rows: bucket.meta.log_rows,
                 n_block_spine_slices: bucket.meta.n_block_spine_slices,
                 n_state_bindings: state_bindings.len() as u32,
-                state_binding_n_cols: state_bindings.first().map_or(0, |sb| sb.air.n_columns())
-                    as u32,
-                state_binding_log_rows: state_bindings.first().map_or(0, |sb| sb.air.log_rows())
-                    as u32,
+                state_binding_n_cols: 0,
+                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: Some(bucket),

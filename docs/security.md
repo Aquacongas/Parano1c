@@ -14,7 +14,7 @@ These three properties together enable **FROST-GKR** (Frobenius Reduction Over S
 
 The engine operates at three verification levels:
 
-- **Transaction** — stateless ZK proof of ownership and balance; wallet-produced, valid until epoch anchor expires
+- **Transaction** — stateless proof of ownership and balance with `spend_secret` non-extraction (§10); wallet-produced, valid until epoch anchor expires
 - **Block** — standard and sweep transactions are aggregated in shape-specific buckets; the canonical `BlockProof` binds all bucket proofs plus `BlockStateBindingAir`, which proves the state-root transition
 - **Chain** — 256-row recursive STARK accumulating the full chain into 6.5 KB, verifiable in ~5 ms
 

@@ -9,7 +9,8 @@ use noid_gkr::{
 };
 use noid_poseidon2b::primitives::{hash_auth_tag, SpendSecret, TxBodyHash};
 
-const SWEEP_AUTH_PROOF_BYTES: usize = 5_920;
+const MAX_SWEEP_AUTH_CAPSULE_BYTES: usize = 128 * 1024;
+const RAW_SWEEP_AUTH_SLICES_BYTES: usize = 32 * 2048 * 16;
 
 fn mk_secret(seed: u8) -> SpendSecret {
     let mut bytes = [0u8; 32];
@@ -72,7 +73,14 @@ fn prove_verify(inputs: &SweepAuthInputs) -> usize {
 fn sweep_auth_killshot_roundtrip_5_live_inputs() {
     let inputs = build_inputs(5);
     let proof_len = prove_verify(&inputs);
-    assert_eq!(proof_len, SWEEP_AUTH_PROOF_BYTES);
+    assert!(
+        proof_len < MAX_SWEEP_AUTH_CAPSULE_BYTES,
+        "capsule proof unexpectedly large: {proof_len} bytes"
+    );
+    assert!(
+        proof_len < RAW_SWEEP_AUTH_SLICES_BYTES,
+        "capsule must stay smaller than raw serialized auth_slices"
+    );
 
     let zero_secret = SpendSecret([0u8; 32]);
     let zero_tag = hash_auth_tag(&zero_secret, &TxBodyHash([0xA5; 32]));
@@ -84,7 +92,14 @@ fn sweep_auth_killshot_roundtrip_5_live_inputs() {
 fn sweep_auth_killshot_roundtrip_25_live_inputs() {
     let inputs = build_inputs(N_SWEEP_AUTH_INPUTS);
     let proof_len = prove_verify(&inputs);
-    assert_eq!(proof_len, SWEEP_AUTH_PROOF_BYTES);
+    assert!(
+        proof_len < MAX_SWEEP_AUTH_CAPSULE_BYTES,
+        "capsule proof unexpectedly large: {proof_len} bytes"
+    );
+    assert!(
+        proof_len < RAW_SWEEP_AUTH_SLICES_BYTES,
+        "capsule must stay smaller than raw serialized auth_slices"
+    );
 }
 
 #[test]

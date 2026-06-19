@@ -16,8 +16,7 @@ use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
 use noid_stark::prove_logic_sweep::{
-    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
-    SweepLogicWitness,
+    prove_sweep_logic, sweep_logic_witness_parts_from_body, SweepLogicWitness,
 };
 use noid_stark::wallet_bundle::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
@@ -163,11 +162,9 @@ fn prove_bundle(body: &TxBody) -> WalletProofBundle {
         auth_inputs: &auth_inputs,
     };
     let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
-    let auth_slices = build_sweep_auth_slices(&auth_inputs);
 
     WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
         logic_proof,
-        auth_slices,
         auth_public: auth_inputs.to_public(),
     })
 }

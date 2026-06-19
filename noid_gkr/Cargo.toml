@@ -8,9 +8,12 @@ license = "Apache-2.0"
 noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_air = { path = "../noid_air" }
+noid_fri = { path = "../noid_fri" }
+noid_fri_binius = { path = "../noid_fri_binius" }
 noid_tx = { path = "../noid_tx" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 rand = "0.8"

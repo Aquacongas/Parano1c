@@ -25,6 +25,7 @@ pub mod nullifier;
 pub mod segmented_state;
 pub mod state;
 pub mod state_binding;
+pub mod state_delta;
 pub mod storage;
 pub mod wire;
 
@@ -84,6 +85,10 @@ pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use nullifier::NullifierSet;
 pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
 pub use state_binding::{BlockStateBinding, StateBindingError, TxStateOpening};
+pub use state_delta::{
+    build_state_delta_action_surface, build_state_delta_witness, StateDeltaAction,
+    StateDeltaActionKind, StateDeltaActionSurface, StateDeltaError, StateDeltaWitness,
+};
 pub use wire::BLOCK_HEADER_WIRE_SIZE;
 
 // ---------------------------------------------------------------------------

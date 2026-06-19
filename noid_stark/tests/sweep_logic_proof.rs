@@ -10,8 +10,8 @@ use noid_poseidon2b::primitives::{
 };
 use noid_stark::interleaved::{prove_air_interleaved, verify_air_interleaved};
 use noid_stark::prove_logic_sweep::{
-    build_sweep_auth_slices, prove_sweep_logic, sweep_logic_witness_parts_from_body,
-    verify_sweep_logic, SweepLogicWitness, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
+    prove_sweep_logic, sweep_logic_witness_parts_from_body, verify_sweep_logic, SweepLogicWitness,
+    N_SWEEP_AUTH_SLICES,
 };
 use noid_stark::{prove_air, verify_air};
 use noid_tx::{
@@ -110,15 +110,23 @@ fn public_inputs_for_body(body: &TxBody) -> PublicInputs {
 }
 
 #[test]
-fn sweep_auth_slices_match_standard_wire_shape_model() {
-    let body = mk_sweep_body(5);
-    let (_, _, auth_inputs, _) = sweep_logic_witness_parts_from_body(&body);
-    let auth_slices = build_sweep_auth_slices(&auth_inputs);
+fn sweep_auth_slices_are_not_part_of_logic_wire_shape() {
+    assert_eq!(N_SWEEP_AUTH_SLICES, 0);
 
-    assert_eq!(auth_slices.len(), N_SWEEP_AUTH_SLICES);
-    assert!(auth_slices
-        .iter()
-        .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG)));
+    let body = mk_sweep_body(5);
+    let pi = public_inputs_for_body(&body);
+    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(&body);
+    let witness = SweepLogicWitness {
+        air: &air,
+        trace: &trace,
+        pi: &pi,
+        auth_inputs: &auth_inputs,
+    };
+    let proof = prove_sweep_logic(&witness).expect("prove sweep logic");
+
+    assert_eq!(proof.n_boundary_slices, 0);
+    assert!(proof.stark.slice_claimed_values.is_empty());
+    assert_eq!(proof.stark.commitment.n_cols, air.n_columns());
 }
 
 #[test]
@@ -181,7 +189,9 @@ fn prove_verify_sweep_logic(
         auth_inputs: &auth_inputs,
     };
     let proof = prove_sweep_logic(&witness).expect("prove sweep logic");
-    assert!(proof.n_boundary_slices > 0);
+    assert_eq!(proof.n_boundary_slices, 0);
+    assert!(proof.stark.slice_claimed_values.is_empty());
+    assert_eq!(proof.stark.commitment.n_cols, air.n_columns());
 
     let auth_public = auth_inputs.to_public();
     verify_sweep_logic(&air, &pi, &spine_inputs, &auth_public, &proof).expect("verify sweep logic");

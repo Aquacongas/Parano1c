@@ -37,6 +37,10 @@ pub const DOMAIN_TAG_STATE_BINDING: u128 = 0x5354_4154_4542_494E_4449_4E47_3230_
 /// ASCII: "BLOCK_MULTIPOINT_2026"
 pub const DOMAIN_TAG_BLOCK_MULTIPOINT: u128 = 0x424C_4F43_4B4D_554C_5449_504F_494E_5400;
 
+/// Domain tag for state transition MLE point derivation.
+/// ASCII: "STATE_DELTA_EVAL"
+pub const DOMAIN_TAG_STATE_DELTA_EVAL: u128 = 0x5354_4154_455F_4445_4C54_415F_4556_414C;
+
 /// Protocol version for domain separation.
 /// Bump on any protocol change that affects transcript structure.
 pub const PROTOCOL_VERSION_Q: u128 = 1;
@@ -127,6 +131,43 @@ pub fn state_binding_channel(prev_state_root: &[u8; 32], cap: &MerkleCap, n_tx: 
     ch.observe_field_elem(Block128::from(DOMAIN_TAG_STATE_BINDING));
 
     ch
+}
+
+/// Derive the state-transition MLE point and batching challenge for one dirty
+/// segment from committed transition endpoints.
+///
+/// The point must not be accepted from proof bytes alone: otherwise a prover can
+/// fit the state-delta identity at a known/adversarial point.  This helper is
+/// used by both prover and verifier and is intentionally independent from the
+/// block-bucket cap to avoid circularity: state-binding columns are part of the
+/// block cap, but the state transition endpoint roots are already fixed by the
+/// block header/proof metadata.
+pub fn state_binding_eval_point_and_gamma(
+    prev_state_root: &[u8; 32],
+    new_state_root: &[u8; 32],
+    seg_id: u16,
+    state_binding_index: u32,
+    n_tx: u32,
+    eff_log: usize,
+) -> (Vec<Block128>, Block128) {
+    let mut ch = Channel::new();
+    ch.observe_field_elem(Block128::from(DOMAIN_TAG_STATE_DELTA_EVAL));
+    ch.observe_field_elem(Block128::from(PROTOCOL_VERSION_Q));
+
+    let [prev0, prev1] = hash_to_fields(prev_state_root);
+    let [new0, new1] = hash_to_fields(new_state_root);
+    ch.observe_field_elem(prev0);
+    ch.observe_field_elem(prev1);
+    ch.observe_field_elem(new0);
+    ch.observe_field_elem(new1);
+    ch.observe_field_elem(Block128::from(seg_id as u128));
+    ch.observe_field_elem(Block128::from(state_binding_index as u128));
+    ch.observe_field_elem(Block128::from(n_tx as u128));
+    ch.observe_field_elem(Block128::from(eff_log as u128));
+
+    let eval_point = (0..eff_log).map(|_| ch.get_random_point()).collect();
+    let gamma = ch.get_random_point();
+    (eval_point, gamma)
 }
 
 /// Create a deterministic Fiat-Shamir channel for block-level multipoint sumcheck.
@@ -374,6 +415,28 @@ mod tests {
         assert_ne!(
             p1, p2,
             "State binding must add additional domain separation"
+        );
+    }
+
+    #[test]
+    fn state_binding_eval_point_is_deterministic_and_endpoint_bound() {
+        let prev = [0xAA; 32];
+        let new_a = [0xBB; 32];
+        let new_b = [0xBC; 32];
+
+        let a = state_binding_eval_point_and_gamma(&prev, &new_a, 7, 2, 10, 16);
+        let a_again = state_binding_eval_point_and_gamma(&prev, &new_a, 7, 2, 10, 16);
+        let different_new_root = state_binding_eval_point_and_gamma(&prev, &new_b, 7, 2, 10, 16);
+        let different_segment = state_binding_eval_point_and_gamma(&prev, &new_a, 8, 2, 10, 16);
+
+        assert_eq!(a, a_again, "state eval derivation must be deterministic");
+        assert_ne!(
+            a, different_new_root,
+            "state eval point must bind the committed post-state root"
+        );
+        assert_ne!(
+            a, different_segment,
+            "state eval point must be segment-specific"
         );
     }
 

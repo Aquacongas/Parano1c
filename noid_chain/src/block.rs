@@ -299,11 +299,13 @@ pub fn apply_block(
 ///   1. Handles log_slots expansion (still structural, not ZK-proved).
 ///   2. Zeros out spent inputs and fills minted outputs — NO pre-state reads.
 ///   3. Updates `active_slot_count` and `alloc_counter` from the block data.
-///   4. Sets `state_root` from `block.header.state_root` (trusted by ZK).
+///   4. Recomputes the post-delta state root and requires it to match
+///      `block.header.state_root`.
 ///   5. Still checks tx_root (cheap, O(n) hashing).
 ///
 /// This is the live production apply primitive for non-genesis blocks after
-/// proof verification.
+/// proof verification. The native post-root check is a consensus belt; it does
+/// not replace the proof-layer state-transition argument.
 pub fn apply_state_delta(
     state: &mut ChainState,
     block: &Block,
@@ -362,16 +364,17 @@ pub fn apply_state_delta(
         return Err(BlockApplyError::HeaderLogSlotsMismatch);
     }
 
-    // 4. Accept state_root from ZK-verified header (no recompute).
-    // The SegmentedFriState will recompute it lazily only if accessed.
-    // Force-set via the segments that were modified (already marked dirty).
-    // Calling state_root() here would recompute — we trust the header instead.
-    // The dirty segments will recompute on next `root()` call, which will match
-    // header.state_root (ZK proved this).
+    // 4. Native post-root guard. ZK proves the transition, but full nodes still
+    // recompute the dirty segment roots before accepting the local state update.
+    let computed_post_root = snap.state_root();
+    if block.header.state_root != computed_post_root {
+        return Err(BlockApplyError::HeaderStateRootMismatch);
+    }
+
     *state = snap;
 
     Ok(StateTransition {
-        new_state_root: block.header.state_root,
+        new_state_root: computed_post_root,
     })
 }
 
@@ -635,6 +638,75 @@ mod tests {
         };
         let out = apply_block(&mut state, &block).expect("apply");
         assert_eq!(out.new_state_root, state.state_root());
+    }
+
+    #[test]
+    fn apply_state_delta_accepts_correct_post_root() {
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
+        let txs = vec![tx];
+        let block = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        let expected_root = block.header.state_root;
+
+        let out = apply_state_delta(&mut state, &block).expect("delta apply");
+        assert_eq!(out.new_state_root, expected_root);
+        assert_eq!(state.state_root(), expected_root);
+    }
+
+    #[test]
+    fn apply_state_delta_rejects_wrong_post_root_and_preserves_state() {
+        let mut state = fresh_state();
+        let pre_root = state.state_root();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
+        let txs = vec![tx];
+        let mut block = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        block.header.state_root[0] ^= 0x80;
+
+        assert_eq!(
+            apply_state_delta(&mut state, &block),
+            Err(BlockApplyError::HeaderStateRootMismatch)
+        );
+        assert_eq!(
+            state.state_root(),
+            pre_root,
+            "state must not be swapped on rejection"
+        );
+        assert_eq!(
+            state.active_slot_count, 0,
+            "counters must not change on rejection"
+        );
+    }
+
+    #[test]
+    fn apply_state_delta_matches_native_apply_block_on_small_block() {
+        let mut native_state = fresh_state();
+        let mut delta_state = native_state.clone();
+        let tx1 = build_tx(&mut native_state, vec![], vec![mk_output(1)]);
+        let mut probe = native_state.clone();
+        apply_tx(&mut probe, &tx1.body).unwrap();
+        let spend = mk_input_for(1, &mk_output(1));
+        let tx2 = build_tx(&mut probe, vec![spend], vec![mk_output(3)]);
+        let txs = vec![tx1, tx2];
+        let block = Block {
+            header: mk_header(&native_state, &txs),
+            transactions: txs,
+        };
+
+        let native_out = apply_block(&mut native_state, &block).expect("native apply");
+        let delta_out = apply_state_delta(&mut delta_state, &block).expect("delta apply");
+        assert_eq!(delta_out.new_state_root, native_out.new_state_root);
+        assert_eq!(delta_state.state_root(), native_state.state_root());
+        assert_eq!(
+            delta_state.active_slot_count,
+            native_state.active_slot_count
+        );
+        assert_eq!(delta_state.alloc_counter, native_state.alloc_counter);
     }
 
     #[test]

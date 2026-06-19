@@ -263,6 +263,27 @@ pub fn verify_mixed_opening(
     if primary_point.len() != log_n {
         return Err("Eval point dimension mismatch".into());
     }
+    for (i, claim) in secondary_claims.iter().enumerate() {
+        if claim.col_index >= n_cols {
+            return Err(format!(
+                "Secondary claim column out of range: col_index={} n_cols={}",
+                claim.col_index, n_cols
+            ));
+        }
+        if claim.eval_point.len() != log_n {
+            return Err(format!(
+                "Secondary claim eval point dimension mismatch at index {i}: expected {log_n}, got {}",
+                claim.eval_point.len()
+            ));
+        }
+        let opening = proof.all_openings[n_cols + i];
+        if opening != claim.value {
+            return Err(format!(
+                "Secondary claim value mismatch at index {i}: opening {:?} != claim {:?}",
+                opening, claim.value
+            ));
+        }
+    }
 
     // Absorb openings, draw gamma (mirror prover)
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
@@ -316,5 +337,141 @@ impl MixedOpeningProof {
         let openings = self.all_openings.len() * 16;
         let fri = self.fri_proof.byte_len();
         openings + fri
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interleaved_commit::{absorb_cap, interleaved_commit, InterleavedCommitment};
+    use noid_fri::hasher::Blake3Hasher;
+
+    const TEST_LOG_ROWS: usize = 8;
+    const TEST_NUM_QUERIES: usize = 2;
+
+    fn test_columns() -> Vec<Vec<Block128>> {
+        let n = 1usize << TEST_LOG_ROWS;
+        vec![
+            (0..n)
+                .map(|i| Block128::from((i as u128).wrapping_mul(3) ^ 0x1234))
+                .collect(),
+            (0..n)
+                .map(|i| Block128::from((i as u128).wrapping_mul(5) ^ 0xABCD))
+                .collect(),
+            (0..n)
+                .map(|i| Block128::from((i as u128).wrapping_mul(7) ^ 0xCAFE))
+                .collect(),
+        ]
+    }
+
+    fn valid_fixture() -> (
+        InterleavedCommitment,
+        Vec<Block128>,
+        Vec<EvalClaim>,
+        MixedOpeningProof,
+        AdditiveNTT<Block128>,
+        Blake3Hasher,
+    ) {
+        let cols = test_columns();
+        let col_refs: Vec<&[Block128]> = cols.iter().map(Vec::as_slice).collect();
+        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let (commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
+        let primary_point: Vec<Block128> = (0..TEST_LOG_ROWS)
+            .map(|i| Block128::from(0x1000u128 + i as u128))
+            .collect();
+        let secondary_claims = vec![EvalClaim {
+            col_index: 1,
+            eval_point: (0..TEST_LOG_ROWS)
+                .map(|i| Block128::from(0x2000u128 + i as u128))
+                .collect(),
+            value: Block128::from(0xDEAD_BEEFu128),
+        }];
+
+        let mut prover_channel = Channel::new();
+        absorb_cap(&mut prover_channel, &commitment.cap);
+        let proof = prove_mixed_opening(
+            &state,
+            &primary_point,
+            &secondary_claims,
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+            TEST_NUM_QUERIES,
+        );
+
+        (
+            commitment,
+            primary_point,
+            secondary_claims,
+            proof,
+            ntt,
+            hasher,
+        )
+    }
+
+    fn verify_with_claims(
+        commitment: &InterleavedCommitment,
+        primary_point: &[Block128],
+        claims: &[EvalClaim],
+        proof: &MixedOpeningProof,
+        ntt: &AdditiveNTT<Block128>,
+        hasher: &Blake3Hasher,
+    ) -> Result<Vec<Block128>, String> {
+        let mut channel = Channel::new();
+        absorb_cap(&mut channel, &commitment.cap);
+        verify_mixed_opening(
+            commitment,
+            primary_point,
+            claims,
+            proof,
+            ntt,
+            &mut channel,
+            hasher,
+            TEST_NUM_QUERIES,
+        )
+    }
+
+    #[test]
+    fn valid_secondary_claim_hygiene_passes() {
+        let (commitment, primary_point, claims, proof, ntt, hasher) = valid_fixture();
+        verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+            .expect("valid mixed opening must verify");
+    }
+
+    #[test]
+    fn secondary_claim_value_mismatch_rejects_before_fri() {
+        let (commitment, primary_point, mut claims, proof, ntt, hasher) = valid_fixture();
+        claims[0].value += Block128::ONE;
+        let err = verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+            .expect_err("mismatched secondary claim value must reject");
+        assert!(
+            err.contains("Secondary claim value mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_claim_column_out_of_range_rejects_before_fri() {
+        let (commitment, primary_point, mut claims, proof, ntt, hasher) = valid_fixture();
+        claims[0].col_index = commitment.n_cols;
+        let err = verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+            .expect_err("out-of-range secondary claim column must reject");
+        assert!(
+            err.contains("Secondary claim column out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_claim_eval_point_dimension_mismatch_rejects_before_fri() {
+        let (commitment, primary_point, mut claims, proof, ntt, hasher) = valid_fixture();
+        claims[0].eval_point.pop();
+        let err = verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+            .expect_err("secondary claim dimension mismatch must reject");
+        assert!(
+            err.contains("Secondary claim eval point dimension mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

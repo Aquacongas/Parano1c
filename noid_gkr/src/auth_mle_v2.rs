@@ -58,7 +58,7 @@ const _: () = assert!(STATE_SIZE <= (1 << N_AUTH_ELEM_VARS));
 /// The four columns of the AuthGKR unified MLE. Each is a length-`2^14`
 /// vector of `Block128`. The verifier opens all of them at points
 /// derived from the unified sumcheck's final challenge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct AuthUnifiedMle {
     pub s_in: Vec<Block128>,
     pub s_out: Vec<Block128>,

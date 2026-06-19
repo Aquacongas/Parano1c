@@ -13,15 +13,12 @@ use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body
 use noid_air::Air;
 use noid_block::{
     block_recursive_claim_field, block_recursive_claim_hash, prove_block, TxBlockWitness,
-    BLOCK_BASE_LOG,
 };
 use noid_chain::{hash_block_header, BlockHeader};
-use noid_core::mle::split::split_mle_into_slices;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
-    N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, SpendSecret, TxBodyHash,
@@ -159,7 +156,7 @@ fn build_fixture(body: &TxBody) -> (TxLogicAir, noid_air::Trace, PublicInputs, S
 fn wallet_auth(
     body: &TxBody,
     tx_body_hash: [Block128; 2],
-) -> (AuthPublicInputs, AuthProofKillShot, Vec<Vec<Block128>>) {
+) -> (AuthPublicInputs, AuthProofKillShot) {
     let secrets = [
         mk_secret(0xA1),
         mk_secret(0xB2),
@@ -182,9 +179,7 @@ fn wallet_auth(
     };
     let mut ch = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
-    let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
-    (auth_inputs.to_public(), proof, slices)
+    (auth_inputs.to_public(), proof)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +199,7 @@ fn recursive_step_and_verify_tip() {
     let body = mk_test_body();
     let (air, trace, pi, spine_inputs) = build_fixture(&body);
     let tx_body_hash = pi.tx_body_hash.as_fields();
-    let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
+    let (auth_public, auth_proof) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
         block_tx_index: 1,
@@ -214,7 +209,6 @@ fn recursive_step_and_verify_tip() {
         spine_inputs: &spine_inputs,
         auth_public: &auth_public,
         auth_proof: &auth_proof,
-        auth_slices: &auth_slices,
     };
 
     let prev_state_root = pi.epoch_anchor;

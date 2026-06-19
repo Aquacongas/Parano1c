@@ -6,8 +6,8 @@
 //!
 //! Runs the unified AuthGKR Kill-Shot instead of a per-permutation chain:
 //! a single `prove_sweep_auth_unified` + `prove_sweep_auth_shift` pair, then
-//! collapses the four resulting witness claims into three column
-//! batch-eval reductions:
+//! collapses the resulting witness claims for `state`, `s_in`, and `s_out`
+//! through one multi-column batch-eval reduction:
 //!
 //! ```text
 //!         column           claims at points
@@ -36,11 +36,9 @@
 //!    final witness scalars).
 //! 4. Run `prove_sweep_auth_shift` (squeezes δ; 16 round polys; 3 final
 //!    witness scalars).
-//! 5. Run `prove_batch_eval` on `state` with claims `(r', state_at_r)`,
-//!    `(r'', state_at_r2)`, plus the per-input `(Address, AuthTag)`
-//!    pins.
-//! 6. Run `prove_batch_eval` on `s_in` with claim `(r'', s_in_at_r2)`.
-//! 7. Run `prove_batch_eval` on `s_out` with claim `(r'', s_out_at_r2)`.
+//! 5. Run one `prove_multi_batch_eval` over `state`, `s_in`, `s_out`.
+//! 6. Open the three committed Sweep AuthGKR MLE columns with one mixed PCS
+//!    opening at the shared terminal batch-eval point.
 
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
@@ -55,13 +53,18 @@ use crate::auth_mle_sweep::{
     N_SWEEP_AUTH_UNIFIED_VARS,
 };
 use crate::auth_oracle_sweep::evaluate_sweep_auth;
+use crate::auth_pcs::{
+    absorb_auth_mle_commitment, commit_auth_mle_columns, open_auth_mle_columns_committed,
+    verify_auth_mle_multi_opening, AuthMleMultiOpeningProof,
+};
 use crate::auth_unified_sweep::{
     prove_sweep_auth_shift, prove_sweep_auth_unified, verify_sweep_auth_shift,
     verify_sweep_auth_unified, SweepAuthKillShotProof, SweepAuthShiftReduction,
     SweepAuthUnifiedReduction,
 };
 use crate::batch_eval::{
-    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
+    prove_multi_batch_eval, verify_multi_batch_eval, BatchEvalReduction, EvalClaim,
+    MultiBatchEvalProof,
 };
 
 /// Number of digest lanes pinned at the boundary per output (Address
@@ -69,16 +72,15 @@ use crate::batch_eval::{
 pub const SWEEP_AUTH_PIN_LANES: usize = 2;
 
 /// Composite proof for an AuthGKR boundary in the Kill-Shot flow.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SweepAuthProofKillShot {
     pub kill_shot: SweepAuthKillShotProof,
-    /// Discharges `state(r')`, `state(r'')`, plus all output digest
-    /// pins against the committed `state` MLE.
-    pub state_batch: BatchEvalProof,
-    /// Discharges `s_in(r'')` against the committed `s_in` MLE.
-    pub sin_batch: BatchEvalProof,
-    /// Discharges `s_out(r'')` against the committed `s_out` MLE.
-    pub sout_batch: BatchEvalProof,
+    /// Reduces `state`, `s_in`, and `s_out` claims to one shared terminal point
+    /// with one terminal value per logical Sweep AuthGKR MLE column.
+    pub batch: MultiBatchEvalProof,
+    /// Capsule-local PCS discharge for the three reduced claims. The commitment
+    /// contains column-major slices for `state`, `s_in`, then `s_out`.
+    pub pcs: AuthMleMultiOpeningProof,
 }
 
 impl SweepAuthProofKillShot {
@@ -91,9 +93,8 @@ impl SweepAuthProofKillShot {
             + shift_polys
             + main_finals
             + shift_finals
-            + self.state_batch.byte_len()
-            + self.sin_batch.byte_len()
-            + self.sout_batch.byte_len()
+            + self.batch.byte_len()
+            + self.pcs.byte_len()
     }
 }
 
@@ -257,7 +258,17 @@ fn prove_sweep_auth_killshot_from_mle<T: FiatShamir<Block128>>(
     mle: &SweepAuthUnifiedMle,
     channel: &mut T,
 ) -> (SweepAuthProofKillShot, SweepAuthKillShotReductions) {
+    let committed = commit_auth_mle_columns(
+        &[
+            mle.state.as_slice(),
+            mle.s_in.as_slice(),
+            mle.s_out.as_slice(),
+        ],
+        N_SWEEP_AUTH_UNIFIED_VARS,
+    );
+
     absorb_public_boundary(channel, public);
+    absorb_auth_mle_commitment(channel, &committed.commitment);
 
     let (main, r_prime) = prove_sweep_auth_unified(mle, channel);
     let (shift, r_double_prime) = prove_sweep_auth_shift(mle, &r_prime, channel);
@@ -273,30 +284,42 @@ fn prove_sweep_auth_killshot_from_mle<T: FiatShamir<Block128>>(
         },
     ];
     state_claims.extend(public_pin_claims(circuit, public));
-    let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
 
     let sin_claims = vec![EvalClaim {
         point: r_double_prime.clone(),
         value: shift.s_in_at_r2,
     }];
-    let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
 
     let sout_claims = vec![EvalClaim {
         point: r_double_prime,
         value: shift.s_out_at_r2,
     }];
-    let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
+
+    let (batch, reds) = prove_multi_batch_eval(
+        &[
+            mle.state.as_slice(),
+            mle.s_in.as_slice(),
+            mle.s_out.as_slice(),
+        ],
+        &[
+            state_claims.as_slice(),
+            sin_claims.as_slice(),
+            sout_claims.as_slice(),
+        ],
+        channel,
+    );
+    debug_assert_eq!(reds.len(), 3);
+    let pcs = open_auth_mle_columns_committed(&committed, N_SWEEP_AUTH_UNIFIED_VARS, &reds);
 
     let proof = SweepAuthProofKillShot {
         kill_shot: SweepAuthKillShotProof { main, shift },
-        state_batch,
-        sin_batch,
-        sout_batch,
+        batch,
+        pcs,
     };
     let reductions = SweepAuthKillShotReductions {
-        state: state_red,
-        sin: sin_red,
-        sout: sout_red,
+        state: reds[0].clone(),
+        sin: reds[1].clone(),
+        sout: reds[2].clone(),
     };
     (proof, reductions)
 }
@@ -314,6 +337,7 @@ pub fn verify_sweep_auth_killshot<T: FiatShamir<Block128>>(
     }
 
     absorb_public_boundary(channel, inputs);
+    absorb_auth_mle_commitment(channel, &proof.pcs.commitment);
 
     let main_red: SweepAuthUnifiedReduction =
         verify_sweep_auth_unified(&proof.kill_shot.main, channel)?;
@@ -331,39 +355,37 @@ pub fn verify_sweep_auth_killshot<T: FiatShamir<Block128>>(
         },
     ];
     state_claims.extend(public_pin_claims(circuit, inputs));
-    let state_red = verify_batch_eval(
-        &proof.state_batch,
-        &state_claims,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        channel,
-    )?;
 
     let sin_claims = vec![EvalClaim {
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(
-        &proof.sin_batch,
-        &sin_claims,
-        N_SWEEP_AUTH_UNIFIED_VARS,
-        channel,
-    )?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
         value: shift_red.s_out_at_r2,
     }];
-    let sout_red = verify_batch_eval(
-        &proof.sout_batch,
-        &sout_claims,
+
+    let reds = verify_multi_batch_eval(
+        &proof.batch,
+        &[
+            state_claims.as_slice(),
+            sin_claims.as_slice(),
+            sout_claims.as_slice(),
+        ],
         N_SWEEP_AUTH_UNIFIED_VARS,
         channel,
     )?;
+    if reds.len() != 3
+        || !verify_auth_mle_multi_opening(&proof.pcs, N_SWEEP_AUTH_UNIFIED_VARS, &reds)
+    {
+        return None;
+    }
 
     Some(SweepAuthKillShotReductions {
-        state: state_red,
-        sin: sin_red,
-        sout: sout_red,
+        state: reds[0].clone(),
+        sin: reds[1].clone(),
+        sout: reds[2].clone(),
     })
 }
 
@@ -494,7 +516,7 @@ mod tests {
 
         let mut ch_p = sweep_auth_gkr_channel();
         let (mut proof, _) = prove_sweep_auth_killshot(&circuit, &inputs, &mut ch_p);
-        proof.state_batch.b_final += Block128::ONE;
+        proof.batch.b_finals[0] += Block128::ONE;
 
         let mut ch_v = sweep_auth_gkr_channel();
         assert!(verify_sweep_auth_killshot(&proof, &circuit, &public, &mut ch_v).is_none());

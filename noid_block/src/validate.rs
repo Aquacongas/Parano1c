@@ -7,8 +7,8 @@
 //! for a full node receiving a block from the network:
 //!
 //! 1. `validate_block_checks()` — cheap header/PoW/nullifier/fee checks.
-//! 2. Verify the canonical `BlockProof`, including bucket proofs and
-//!    `BlockStateBindingAir` state-root transition proofs.
+//! 2. Verify the canonical `BlockProof`, including bucket proofs and NativeDelta
+//!    state-root transition openings.
 //! 3. `apply_state_delta()` — commit the already-proven state delta without
 //!    running native `apply_block` as a second validity source.
 //!
@@ -26,7 +26,7 @@
 //! - `AuthPublicInputs.expected_auth_tag[i]` — from `TxInput.auth_tag`
 //!   (= H_AUTH(spend_secret, tx_body_hash), a one-way hash).
 //!   For dummy inputs (valid=false) the tag is computed from zero spend_secret.
-//! - `BlockStateBindingAir` — from proof openings + pre-block FRI state.
+//! - NativeDelta state summaries — from proof openings + pre-block FRI state.
 //!
 //! The `spend_secret` (private key) is NEVER transmitted, NEVER accessed
 //! here, and NEVER needed for verification.
@@ -42,18 +42,16 @@ use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
 
 use crate::{
-    block_recursive_claim_hash, verify_block, verify_state_bindings_standalone, BlockProof,
-    VerifyBlockError,
+    block_recursive_claim_hash, channel::state_binding_eval_point_and_gamma, verify_block,
+    verify_state_bindings_standalone, BlockProof, VerifyBlockError,
 };
 
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_gkr::{AuthPublicInputs, SpineInputs};
-use noid_stark::prove_logic_sweep::{
-    sweep_spine_inputs_from_body, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
-};
+use noid_stark::prove_logic_sweep::sweep_spine_inputs_from_body;
 use noid_tx::{
-    compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxInput,
-    TxOutput, TxShape, MAX_INPUTS, MAX_OUTPUTS,
+    compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxShape,
+    MAX_INPUTS, MAX_OUTPUTS,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,7 +97,7 @@ impl std::error::Error for FullValidationError {}
 /// Steps (ordered cheapest-first):
 /// 1. `validate_block_checks()` — cheap consensus checks that do not mutate state.
 /// 2. Full `BlockProof` verification, including standard/sweep bucket proofs and
-///    `BlockStateBindingAir` for every dirty segment.
+///    NativeDelta state openings for every dirty segment.
 /// 3. `apply_state_delta()` — apply the proven delta to the mutable chain state.
 ///
 /// On success, `state` is updated to the post-block UTXO state.
@@ -113,7 +111,7 @@ impl std::error::Error for FullValidationError {}
 /// - `auth_public_list`: auth GKR public inputs, one per transaction.
 ///   Derived from the standard bucket public inputs.
 ///
-/// - `state_binding_airs`: BlockStateBinding AIRs for each dirty segment.
+/// - `state_binding_airs`: temporary NativeDelta summaries for each dirty segment.
 pub fn validate_block_full(
     block: &Block,
     proof: &BlockProof,
@@ -271,7 +269,7 @@ pub fn validate_block_proof_transcript_hash(
 ///
 /// Takes the raw `block_proof_bytes` received over P2P and:
 /// 1. Deserialises the `BlockProof`.
-/// 2. Reconstructs `SpineInputs`, `AuthPublicInputs`, and `BlockStateBindingAir`
+/// 2. Reconstructs `SpineInputs`, `AuthPublicInputs`, and NativeDelta state summaries
 ///    purely from the block's public wire data and the pre-block FRI state.
 /// 3. Calls `validate_block_full` (consensus + ZK + state delta).
 ///
@@ -376,27 +374,16 @@ pub fn validate_block_bucket_tx_indices(
                 || bucket.meta.tx_indices != expected_sweep
                 || bucket.tx_pis.len() != expected_sweep.len()
                 || bucket.auth_public.len() != expected_sweep.len()
-                || bucket.auth_slices.len() != expected_sweep.len()
                 || bucket.tx_auth_proofs.len() != expected_sweep.len()
                 || bucket.spine_inputs.len() != expected_sweep.len()
-                || bucket.meta.n_boundary_slices_per_tx as usize != N_SWEEP_AUTH_SLICES
+                || bucket.meta.n_boundary_slices_per_tx != 0
                 || bucket.meta.n_block_spine_slices == 0
             {
                 return Err(crate::VerifyBlockError::ShapeMismatch);
             }
-            for ((pi, auth_slices), block_idx) in bucket
-                .tx_pis
-                .iter()
-                .zip(bucket.auth_slices.iter())
-                .zip(expected_sweep.iter().copied())
-            {
+            for (pi, block_idx) in bucket.tx_pis.iter().zip(expected_sweep.iter().copied()) {
                 let tx = &block.transactions[block_idx as usize];
-                if tx.body.shape != TxShape::Sweep25x2
-                    || auth_slices.len() != N_SWEEP_AUTH_SLICES
-                    || !auth_slices
-                        .iter()
-                        .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG))
-                {
+                if tx.body.shape != TxShape::Sweep25x2 {
                     return Err(crate::VerifyBlockError::ShapeMismatch);
                 }
                 validate_public_inputs_for_tx(block_idx as usize, tx, pi)?;
@@ -656,217 +643,32 @@ fn proof_claim_commitments_by_block_index(
     Ok(commitments)
 }
 
-#[inline]
-fn slot_value_from_input(inp: &TxInput) -> noid_chain::fri_state::SlotValue {
-    let [owner_hi, owner_lo] = inp.owner.as_fields();
-    noid_chain::fri_state::SlotValue {
-        value: noid_core::Block128::from(inp.value as u128),
-        owner_hi,
-        owner_lo,
-    }
-}
-
-#[inline]
-fn slot_value_from_output(out: &TxOutput) -> noid_chain::fri_state::SlotValue {
-    let [owner_hi, owner_lo] = out.owner.as_fields();
-    noid_chain::fri_state::SlotValue {
-        value: noid_core::Block128::from(out.value as u128),
-        owner_hi,
-        owner_lo,
-    }
-}
-
-fn read_state_view(
-    pre_state: &noid_chain::segmented_state::SegmentedFriState,
-    overlay: &std::collections::BTreeMap<u32, noid_chain::fri_state::SlotValue>,
-    slot_index: u32,
-) -> noid_chain::fri_state::SlotValue {
-    overlay
-        .get(&slot_index)
-        .copied()
-        .unwrap_or_else(|| pre_state.slot(slot_index))
-}
-
-fn push_mint_claim(
-    seg_claims: &mut std::collections::BTreeMap<
-        u16,
-        Vec<noid_air::airs::block_state_binding::BlockStateBindingClaim>,
-    >,
-    eff_log: usize,
-    seg_mask: u32,
-    out: &TxOutput,
-) {
-    use noid_air::airs::block_state_binding::BlockStateBindingClaim;
-    let seg_id = (out.slot_index >> eff_log) as u16;
-    let local = out.slot_index & seg_mask;
-    let [owner_hi, owner_lo] = out.owner.as_fields();
-    seg_claims
-        .entry(seg_id)
-        .or_default()
-        .push(BlockStateBindingClaim::mint(
-            local,
-            noid_core::Block128::from(out.value as u128),
-            owner_hi,
-            owner_lo,
-        ));
-}
-
 fn collect_state_binding_claims(
     block: &Block,
     commitments_by_block_index: &[Option<[u8; 32]>],
     pre_state: &noid_chain::segmented_state::SegmentedFriState,
-) -> Result<
-    std::collections::BTreeMap<
-        u16,
-        Vec<noid_air::airs::block_state_binding::BlockStateBindingClaim>,
-    >,
-    crate::VerifyBlockError,
-> {
-    use noid_air::airs::block_state_binding::BlockStateBindingClaim;
-    use noid_chain::fri_state::SlotValue;
-    use std::collections::{BTreeMap, HashSet};
-
-    let eff_log = pre_state.effective_log_segment_size();
-    let seg_mask = (1u32 << eff_log) - 1;
-    let n_slots = pre_state.num_slots();
-    let mut seg_claims: BTreeMap<u16, Vec<BlockStateBindingClaim>> = BTreeMap::new();
-    let mut overlay: BTreeMap<u32, SlotValue> = BTreeMap::new();
-    let mut coinbase_output_slots = HashSet::new();
-
-    // Coinbase mints are included first to match prover-side
-    // `build_state_bindings_from_binding`. They are validated against the
-    // pre-block state but are not made spendable by user transactions in the
-    // same block, because the state-binding construction builds user tx openings
-    // before patching the coinbase post-root.
-    for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        if !tx.body.is_coinbase {
-            continue;
-        }
-        for (output_index, out) in tx.body.outputs.iter().enumerate() {
-            if !out.valid {
-                continue;
-            }
-            if (out.slot_index as u64) >= n_slots {
-                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
-                    tx_index: tx_idx,
-                });
-            }
-            if !coinbase_output_slots.insert(out.slot_index)
-                || pre_state.slot(out.slot_index) != SlotValue::EMPTY
-            {
-                return Err(crate::VerifyBlockError::StateBindingOutputOccupied {
-                    tx_index: tx_idx,
-                    output_index,
-                });
-            }
-            push_mint_claim(&mut seg_claims, eff_log, seg_mask, out);
-        }
-    }
-
-    for (tx_idx, tx) in block.transactions.iter().enumerate() {
-        if tx.body.is_coinbase {
-            continue;
-        }
-
-        let Some(expected_commitment) = commitments_by_block_index.get(tx_idx).and_then(|v| *v)
-        else {
-            return Err(crate::VerifyBlockError::ShapeMismatch);
-        };
-        let recomputed = compute_claims_commitment(&tx.body.inputs, &tx.body.outputs);
-        if recomputed != expected_commitment {
-            return Err(
-                crate::VerifyBlockError::StateBindingClaimsCommitmentMismatch { tx_index: tx_idx },
-            );
-        }
-
-        let mut seen_outputs = HashSet::new();
-        for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            if !seen_outputs.insert(out.slot_index) {
-                return Err(crate::VerifyBlockError::StateBindingDuplicateOutputSlot {
-                    tx_index: tx_idx,
-                });
-            }
-        }
-
-        // Inputs are checked before any output of the same tx is applied.
-        for (input_index, inp) in tx.body.inputs.iter().enumerate() {
-            if !inp.valid {
-                continue;
-            }
-            if (inp.slot_index as u64) >= n_slots {
-                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
-                    tx_index: tx_idx,
-                });
-            }
-            let opened = read_state_view(pre_state, &overlay, inp.slot_index);
-            let expected = slot_value_from_input(inp);
-            if opened != expected {
-                return Err(crate::VerifyBlockError::StateBindingInputMismatch {
-                    tx_index: tx_idx,
-                    input_index,
-                });
-            }
-            let seg_id = (inp.slot_index >> eff_log) as u16;
-            let local = inp.slot_index & seg_mask;
-            seg_claims
-                .entry(seg_id)
-                .or_default()
-                .push(BlockStateBindingClaim::spend(
-                    local,
-                    expected.value,
-                    expected.owner_hi,
-                    expected.owner_lo,
-                ));
-        }
-
-        // Outputs are opened against the same pre-tx view, before same-tx inputs
-        // are zeroed. Thus input-output overlap inside one tx remains invalid.
-        for (output_index, out) in tx.body.outputs.iter().enumerate() {
-            if !out.valid {
-                continue;
-            }
-            if (out.slot_index as u64) >= n_slots {
-                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
-                    tx_index: tx_idx,
-                });
-            }
-            if coinbase_output_slots.contains(&out.slot_index)
-                || read_state_view(pre_state, &overlay, out.slot_index) != SlotValue::EMPTY
-            {
-                return Err(crate::VerifyBlockError::StateBindingOutputOccupied {
-                    tx_index: tx_idx,
-                    output_index,
-                });
-            }
-            push_mint_claim(&mut seg_claims, eff_log, seg_mask, out);
-        }
-
-        for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-            overlay.insert(inp.slot_index, SlotValue::EMPTY);
-        }
-        for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            overlay.insert(out.slot_index, slot_value_from_output(out));
-        }
-    }
-
-    Ok(seg_claims)
+) -> Result<crate::state_delta_claims::StateBindingClaimMap, crate::VerifyBlockError> {
+    crate::state_delta_claims::collect_state_binding_claims_from_block(
+        block,
+        commitments_by_block_index,
+        pre_state,
+    )
 }
 
-/// Reconstruct `BlockStateBindingAir` instances from proof openings and
+/// Reconstruct temporary NativeDelta state summaries from proof openings and
 /// the pre-block FRI state.
 ///
-/// The verifier reconstructs claims from the canonical tx body and checks the
-/// sequential pre-state relation before constructing the AIR. It never copies
-/// `(value, owner)` out of the state into a spend claim unless that value equals
-/// the transaction's public claim; this is the SC-3 claim bridge.
+/// The verifier reconstructs claims from the canonical tx body, checks the
+/// sequential pre-state relation, derives the state evaluation point from endpoint
+/// roots, and enforces the native delta-MLE identity before returning the summary.
+/// It never copies `(value, owner)` out of the state into a spend claim unless
+/// that value equals the transaction's public claim; this is the SC-3 claim bridge.
 pub fn build_state_binding_airs(
     block: &Block,
     proof: &BlockProof,
     pre_state: &noid_chain::segmented_state::SegmentedFriState,
 ) -> Result<Vec<BlockStateBindingAir>, crate::VerifyBlockError> {
     use noid_air::airs::block_state_binding::BlockStateBindingWitness;
-    use noid_core::Block128;
-    use noid_fri::Channel;
 
     let n_state_bindings = proof.meta.n_state_bindings as usize;
     let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
@@ -888,7 +690,6 @@ pub fn build_state_binding_airs(
     }
 
     let eff_log = pre_state.effective_log_segment_size();
-    let n_tx = proof.meta.n_tx as usize;
     let prev_state_root = &proof.meta.prev_block_state_root;
 
     // BTreeMap iteration is already sorted by seg_id.
@@ -921,26 +722,29 @@ pub fn build_state_binding_airs(
                 return Err(crate::VerifyBlockError::ShapeMismatch);
             }
 
-            let eval_point = pre_op.eval_point.clone();
+            let (eval_point, gamma) = state_binding_eval_point_and_gamma(
+                prev_state_root,
+                &proof.meta.new_state_root,
+                seg_id,
+                sb_idx as u32,
+                proof.meta.n_tx,
+                eff_log,
+            );
+            if pre_op.eval_point != eval_point {
+                return Err(crate::VerifyBlockError::StateMleOpeningFailed(sb_idx));
+            }
+
             let prev_lane_openings = pre_op.lane_values;
             let new_lane_openings = post_op.lane_values;
 
-            // Re-derive gamma from the same deterministic channel as the prover.
-            let gamma = {
-                let mut ch = Channel::new();
-                let lo = u128::from_le_bytes(prev_state_root[..16].try_into().unwrap());
-                let hi = u128::from_le_bytes(prev_state_root[16..].try_into().unwrap());
-                ch.observe_field_elem(Block128::from(lo));
-                ch.observe_field_elem(Block128::from(hi));
-                ch.observe_field_elem(Block128::from((n_tx as u128) + sb_idx as u128));
-                // Consume the eval_point squeezes (same count as prover).
-                for _ in 0..eval_point.len() {
-                    ch.get_random_point();
-                }
-                ch.get_random_point() // gamma follows the eval_point
-            };
-
-            // Compute expected_batched_claims deterministically from claims.
+            // Native state-delta identity for the current production proof surface:
+            // post_lane(r) = pre_lane(r) + Σ eq(r, slot_i) · delta_i.
+            //
+            // The claims are verifier-reconstructed from the canonical block body
+            // and pre-state prefix overlay, while `r` is derived from the endpoint
+            // roots above. This replaces the old wide `BlockStateBindingAir` STARK
+            // as the soundness-critical transition check; the returned AIR is now
+            // only a compact summary used by existing opening-verifier plumbing.
             let witness = BlockStateBindingWitness::new(
                 claims.clone(),
                 eval_point.clone(),
@@ -948,6 +752,9 @@ pub fn build_state_binding_airs(
                 prev_lane_openings,
                 new_lane_openings,
             );
+            if witness.expected_new_lane_openings(prev_lane_openings) != new_lane_openings {
+                return Err(crate::VerifyBlockError::StateMleOpeningFailed(sb_idx));
+            }
             let expected_batched = witness.expected_batched_claims();
 
             Ok(BlockStateBindingAir::new(

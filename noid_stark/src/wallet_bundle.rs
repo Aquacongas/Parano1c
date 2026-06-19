@@ -7,7 +7,6 @@
 //! different proof artifacts, so they cannot be accidentally accepted under the
 //! wrong fixed circuit family. Spend secrets are never serialized.
 
-use noid_core::Block128;
 use noid_gkr::{AuthPublicInputs, SweepAuthPublicInputs};
 use noid_tx::TxShape;
 use serde::{Deserialize, Serialize};
@@ -20,8 +19,6 @@ use crate::prove_logic_sweep::SweepLogicProof;
 pub struct StandardWalletProofBundle {
     /// STARK + standard 4-input AuthGKR Kill-Shot proof.
     pub logic_proof: LogicProof,
-    /// Standard AuthGKR MLE state slices required by current block proving.
-    pub auth_slices: Vec<Vec<Block128>>,
     /// Public-only standard auth boundary.
     pub auth_public: AuthPublicInputs,
 }
@@ -31,9 +28,6 @@ pub struct StandardWalletProofBundle {
 pub struct SweepWalletProofBundle {
     /// STARK over body-bound sweep tx logic plus SweepAuthGKR.
     pub logic_proof: SweepLogicProof,
-    /// Sweep AuthGKR MLE `state` slices required by the sweep block bucket.
-    /// This mirrors `StandardWalletProofBundle::auth_slices` for Sweep25x2.
-    pub auth_slices: Vec<Vec<Block128>>,
     /// Public-only sweep auth boundary.
     pub auth_public: SweepAuthPublicInputs,
 }
@@ -88,7 +82,9 @@ impl std::fmt::Display for BundleDecodeError {
 mod tests {
     use super::*;
     use crate::interleaved::InterleavedStarkProof;
+    use noid_core::Block128;
     use noid_fri_binius::{InterleavedCommitment, MerkleCap, MixedOpeningProof};
+    use noid_gkr::AuthMleMultiOpeningProof;
     use noid_gkr::{
         AuthKillShotProof, AuthProofKillShot, AuthShiftProof, AuthUnifiedProof,
         SweepAuthKillShotProof, SweepAuthProofKillShot, SweepAuthShiftProof, SweepAuthUnifiedProof,
@@ -123,6 +119,29 @@ mod tests {
         }
     }
 
+    fn dummy_auth_pcs() -> AuthMleMultiOpeningProof {
+        AuthMleMultiOpeningProof {
+            commitment: InterleavedCommitment {
+                cap: MerkleCap {
+                    hashes: vec![[0xCDu8; 32]],
+                },
+                log_rows: 11,
+                n_cols: 1,
+            },
+            opening: MixedOpeningProof {
+                all_openings: vec![Block128(0)],
+                fri_proof: noid_fri_binius::CompactEvalProof {
+                    upper_partial_evals: vec![],
+                    sum_check_oracles: vec![],
+                    fri_roots: vec![],
+                    fri_queried_symbols: vec![],
+                    fri_merkle_batch: vec![],
+                    final_codeword: vec![],
+                },
+            },
+        }
+    }
+
     fn dummy_standard_auth() -> AuthProofKillShot {
         AuthProofKillShot {
             kill_shot: AuthKillShotProof {
@@ -142,18 +161,11 @@ mod tests {
                     state_at_r2: Block128(0),
                 },
             },
-            state_batch: noid_gkr::BatchEvalProof {
+            batch: noid_gkr::MultiBatchEvalProof {
                 rounds: vec![],
-                b_final: Block128(0),
+                b_finals: vec![Block128(0); 3],
             },
-            sin_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
-            sout_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
+            pcs: dummy_auth_pcs(),
         }
     }
 
@@ -176,18 +188,11 @@ mod tests {
                     state_at_r2: Block128(0),
                 },
             },
-            state_batch: noid_gkr::BatchEvalProof {
+            batch: noid_gkr::MultiBatchEvalProof {
                 rounds: vec![],
-                b_final: Block128(0),
+                b_finals: vec![Block128(0); 3],
             },
-            sin_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
-            sout_batch: noid_gkr::BatchEvalProof {
-                rounds: vec![],
-                b_final: Block128(0),
-            },
+            pcs: dummy_auth_pcs(),
         }
     }
 
@@ -195,11 +200,10 @@ mod tests {
         let logic_proof = LogicProof {
             stark: dummy_stark(),
             auth: dummy_standard_auth(),
-            n_boundary_slices: 8,
+            n_boundary_slices: 0,
         };
         WalletProofBundle::Standard4x8(StandardWalletProofBundle {
             logic_proof,
-            auth_slices: vec![vec![Block128(7u128); 8], vec![Block128(8u128); 8]],
             auth_public: AuthPublicInputs::zero(),
         })
     }
@@ -212,10 +216,6 @@ mod tests {
         };
         WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
             logic_proof,
-            auth_slices: vec![
-                vec![Block128(9u128); 8];
-                crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES
-            ],
             auth_public: SweepAuthPublicInputs::zero(),
         })
     }
@@ -229,8 +229,7 @@ mod tests {
         assert_eq!(back.shape(), TxShape::Standard4x8);
         match back {
             WalletProofBundle::Standard4x8(b) => {
-                assert_eq!(b.auth_slices.len(), 2);
-                assert_eq!(b.logic_proof.n_boundary_slices, 8);
+                assert_eq!(b.logic_proof.n_boundary_slices, 0);
             }
             WalletProofBundle::Sweep25x2(_) => panic!("wrong variant"),
         }
@@ -245,14 +244,7 @@ mod tests {
         assert_eq!(back.shape(), TxShape::Sweep25x2);
         match back {
             WalletProofBundle::Sweep25x2(b) => {
-                assert_eq!(
-                    b.logic_proof.n_boundary_slices,
-                    crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES
-                );
-                assert_eq!(
-                    b.auth_slices.len(),
-                    crate::prove_logic_sweep::N_SWEEP_AUTH_SLICES
-                );
+                assert_eq!(b.logic_proof.n_boundary_slices, 0);
             }
             WalletProofBundle::Standard4x8(_) => panic!("wrong variant"),
         }

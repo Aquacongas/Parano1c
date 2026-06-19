@@ -8,13 +8,11 @@
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
 use noid_air::Air;
-use noid_block::{prove_block, verify_block, TxBlockWitness, BLOCK_BASE_LOG};
-use noid_core::mle::split::split_mle_into_slices;
+use noid_block::{prove_block, verify_block, TxBlockWitness, VerifyBlockError};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    auth_gkr_channel, build_auth_unified_from_inputs, compute_auth_boundary, prove_auth_killshot,
-    AuthCircuit, AuthInputs, AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
-    N_AUTH_UNIFIED_VARS,
+    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, SpendSecret, TxBodyHash};
 use noid_tx::{PublicInputs, TxBody, TxInput, TxOutput, MAX_INPUTS, MAX_OUTPUTS};
@@ -151,11 +149,11 @@ fn build_fixture(body: &TxBody) -> (TxLogicAir, noid_air::Trace, PublicInputs, S
     (air, trace, pi, spine_inputs)
 }
 
-/// Wallet-side: generate auth proof + slices from the body secrets.
+/// Wallet-side: generate self-contained auth proof capsule from the body secrets.
 fn wallet_auth(
     body: &TxBody,
     tx_body_hash: [Block128; 2],
-) -> (AuthPublicInputs, AuthProofKillShot, Vec<Vec<Block128>>) {
+) -> (AuthPublicInputs, AuthProofKillShot) {
     let secrets = [
         mk_secret(0xA1),
         mk_secret(0xB2),
@@ -181,10 +179,8 @@ fn wallet_auth(
 
     let mut ch = auth_gkr_channel();
     let (proof, _) = prove_auth_killshot(&circuit, &auth_inputs, &mut ch);
-    let auth_mle = build_auth_unified_from_inputs(&circuit, &auth_inputs);
-    let slices = split_mle_into_slices(&auth_mle.state, N_AUTH_UNIFIED_VARS, BLOCK_BASE_LOG);
 
-    (auth_inputs.to_public(), proof, slices)
+    (auth_inputs.to_public(), proof)
 }
 
 #[test]
@@ -193,7 +189,7 @@ fn block_one_tx_roundtrip() {
     let body = mk_test_body();
     let (air, trace, pi, spine_inputs) = build_fixture(&body);
     let tx_body_hash = pi.tx_body_hash.as_fields();
-    let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
+    let (auth_public, auth_proof) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
         block_tx_index: 1,
@@ -203,7 +199,6 @@ fn block_one_tx_roundtrip() {
         spine_inputs: &spine_inputs,
         auth_public: &auth_public,
         auth_proof: &auth_proof,
-        auth_slices: &auth_slices,
     };
 
     let prev_state_root = pi.epoch_anchor;
@@ -216,10 +211,7 @@ fn block_one_tx_roundtrip() {
     .expect("prove_block must succeed on a valid single-tx block");
 
     assert_eq!(proof.meta.n_tx, 1);
-    assert_eq!(
-        proof.meta.n_auth_slices_per_tx as usize,
-        1 << (N_AUTH_UNIFIED_VARS - BLOCK_BASE_LOG)
-    );
+    assert_eq!(proof.meta.n_auth_slices_per_tx, 0);
 
     let air_ref: &dyn Air = &air;
     verify_block(
@@ -234,11 +226,11 @@ fn block_one_tx_roundtrip() {
 
 #[test]
 #[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
-fn block_verify_rejects_tampered_epoch_anchor() {
+fn block_verify_rejects_tampered_bucket_opening_at_algebraic_terminal() {
     let body = mk_test_body();
     let (air, trace, pi, spine_inputs) = build_fixture(&body);
     let tx_body_hash = pi.tx_body_hash.as_fields();
-    let (auth_public, auth_proof, auth_slices) = wallet_auth(&body, tx_body_hash);
+    let (auth_public, auth_proof) = wallet_auth(&body, tx_body_hash);
 
     let witness = TxBlockWitness {
         block_tx_index: 1,
@@ -248,7 +240,54 @@ fn block_verify_rejects_tampered_epoch_anchor() {
         spine_inputs: &spine_inputs,
         auth_public: &auth_public,
         auth_proof: &auth_proof,
-        auth_slices: &auth_slices,
+    };
+
+    let prev_state_root = pi.epoch_anchor;
+    let mut proof = prove_block(
+        prev_state_root,
+        [0u8; 32],
+        std::slice::from_ref(&witness),
+        &[],
+    )
+    .expect("honest prove_block must succeed");
+
+    proof
+        .standard_bucket
+        .as_mut()
+        .expect("standard bucket")
+        .block_col_openings[0] += Block128::ONE;
+
+    let air_ref: &dyn Air = &air;
+    let err = verify_block(
+        &[air_ref],
+        &proof,
+        std::slice::from_ref(&spine_inputs),
+        std::slice::from_ref(&auth_public),
+        &[],
+    )
+    .expect_err("tampered bucket opening must reject");
+    assert!(
+        matches!(err, VerifyBlockError::AlgebraicTerminal(0)),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "stage_g_roundtrip: heavy (full block prove); run with --ignored"]
+fn block_verify_rejects_tampered_epoch_anchor() {
+    let body = mk_test_body();
+    let (air, trace, pi, spine_inputs) = build_fixture(&body);
+    let tx_body_hash = pi.tx_body_hash.as_fields();
+    let (auth_public, auth_proof) = wallet_auth(&body, tx_body_hash);
+
+    let witness = TxBlockWitness {
+        block_tx_index: 1,
+        air: &air as &dyn Air,
+        trace: &trace,
+        pi: &pi,
+        spine_inputs: &spine_inputs,
+        auth_public: &auth_public,
+        auth_proof: &auth_proof,
     };
 
     let prev_state_root = pi.epoch_anchor;

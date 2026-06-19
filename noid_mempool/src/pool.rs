@@ -882,10 +882,7 @@ fn verify_sweep_intent(
     bundle: noid_stark::wallet_bundle::SweepWalletProofBundle,
 ) -> Result<(), String> {
     use noid_air::composition::sweep_logic_air_and_trace_from_body;
-    use noid_stark::prove_logic_sweep::{
-        sweep_spine_inputs_from_body, verify_sweep_logic, N_SWEEP_AUTH_SLICES,
-        SWEEP_BOUNDARY_BASE_LOG,
-    };
+    use noid_stark::prove_logic_sweep::{sweep_spine_inputs_from_body, verify_sweep_logic};
     use noid_tx::{
         compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, MAX_INPUTS, MAX_OUTPUTS,
     };
@@ -916,15 +913,6 @@ fn verify_sweep_intent(
         is_activation: [false; MAX_OUTPUTS],
         is_deactivation: [false; MAX_INPUTS],
     };
-
-    if bundle.auth_slices.len() != N_SWEEP_AUTH_SLICES
-        || !bundle
-            .auth_slices
-            .iter()
-            .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG))
-    {
-        return Err("malformed sweep auth_slices".to_string());
-    }
 
     verify_sweep_logic(
         &air,

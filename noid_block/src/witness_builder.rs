@@ -22,7 +22,6 @@
 //! spine_inputs ← SpineInputs from boundary_pins
 //! auth_public  ← extracted from Standard4x8 bundle
 //! auth_proof   ← extracted from Standard4x8 bundle.logic_proof.auth
-//! auth_slices  ← extracted from Standard4x8 bundle.auth_slices
 //! ```
 //!
 //! The trace only uses `inp.value`, `out.value`, `fee` from the body — no
@@ -42,14 +41,12 @@ use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state_binding::BlockStateBinding;
 use noid_core::mle::evaluate_slice;
 use noid_core::{Block128, TowerField};
-use noid_fri::Channel;
 use noid_gkr::{AuthPublicInputs, SpineInputs, SweepAuthPublicInputs, SweepSpineInputs};
-use noid_stark::prove_logic_sweep::{
-    sweep_spine_inputs_from_body, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
-};
+use noid_stark::prove_logic_sweep::sweep_spine_inputs_from_body;
 use noid_stark::WalletProofBundle;
 use noid_tx::{PublicInputs, Transaction, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
 
+use crate::channel::state_binding_eval_point_and_gamma;
 use crate::{BlockProof, StateBindingBlockWitness, TxBlockWitness};
 
 // ---------------------------------------------------------------------------
@@ -65,10 +62,8 @@ pub struct OwnedStandardTxWitness {
     pub pi: PublicInputs,
     pub spine_inputs: SpineInputs,
     pub auth_public: AuthPublicInputs,
-    /// Owned auth_proof (clone from bundle).
+    /// Owned auth proof capsule (clone from bundle).
     pub auth_proof: noid_gkr::AuthProofKillShot,
-    /// Owned auth_slices (clone from bundle).
-    pub auth_slices: Vec<Vec<Block128>>,
 }
 
 /// Owned sweep witness.  This is not block-provable until `SweepBucketProof`
@@ -82,10 +77,8 @@ pub struct OwnedSweepTxWitness {
     pub pi: PublicInputs,
     pub spine_inputs: SweepSpineInputs,
     pub auth_public: SweepAuthPublicInputs,
-    /// Owned sweep AuthGKR proof cloned from the wallet logic proof.
+    /// Owned sweep AuthGKR proof capsule cloned from the wallet logic proof.
     pub auth_proof: noid_gkr::SweepAuthProofKillShot,
-    /// Owned sweep AuthGKR `state` slices, mirroring standard `auth_slices`.
-    pub auth_slices: Vec<Vec<Block128>>,
 }
 
 /// Shape-dispatched owned transaction witness.
@@ -121,7 +114,6 @@ impl OwnedTxWitness {
                 spine_inputs: &w.spine_inputs,
                 auth_public: &w.auth_public,
                 auth_proof: &w.auth_proof,
-                auth_slices: &w.auth_slices,
             },
             Self::Sweep25x2(_) => {
                 panic!("Sweep25x2 witness requires SweepBucketProof; miner must keep filtering sweep until Phase N5")
@@ -137,8 +129,8 @@ impl OwnedTxWitness {
 ///
 /// SpendSecret is NEVER used here. The trace is derived from the public
 /// `tx_body` fields (slot indices, values, fee, epoch_anchor).
-/// The `auth_proof` and `auth_slices` come from the bundle. They are
-/// proof artifacts, not raw `SpendSecret`; SC-5 covers their one-wayness model.
+/// The `auth_proof` comes from the bundle. It is a self-contained Auth
+/// KillShot capsule; raw AuthGKR MLE slices are not accepted here.
 pub fn build_tx_witness(
     block_tx_index: u32,
     tx_body: &TxBody,
@@ -189,23 +181,9 @@ pub fn build_tx_witness(
                 spine_inputs,
                 auth_public,
                 auth_proof: bundle.logic_proof.auth.clone(),
-                auth_slices: bundle.auth_slices.clone(),
             })
         }
         WalletProofBundle::Sweep25x2(bundle) => {
-            assert_eq!(
-                bundle.auth_slices.len(),
-                N_SWEEP_AUTH_SLICES,
-                "malformed Sweep25x2 auth_slices count"
-            );
-            assert!(
-                bundle
-                    .auth_slices
-                    .iter()
-                    .all(|slice| slice.len() == (1usize << SWEEP_BOUNDARY_BASE_LOG)),
-                "malformed Sweep25x2 auth_slices length"
-            );
-
             let (air, trace) = sweep_logic_air_and_trace_from_body(tx_body);
             let pi = build_public_inputs(tx_body, log_slots);
             let spine_inputs = sweep_spine_inputs_from_body(tx_body);
@@ -218,7 +196,6 @@ pub fn build_tx_witness(
                 spine_inputs,
                 auth_public: bundle.auth_public,
                 auth_proof: bundle.logic_proof.auth.clone(),
-                auth_slices: bundle.auth_slices.clone(),
             })
         }
     }
@@ -442,15 +419,16 @@ pub fn build_state_bindings_from_binding(
     let mut result = Vec::with_capacity(sorted.len());
 
     for (sb_idx, (seg_id, claims)) in sorted.into_iter().enumerate() {
-        // Derive eval_point and gamma from deterministic channel.
-        let mut ch = Channel::new();
-        let lo = u128::from_le_bytes(prev_state_root[..16].try_into().unwrap());
-        let hi = u128::from_le_bytes(prev_state_root[16..].try_into().unwrap());
-        ch.observe_field_elem(Block128::from(lo));
-        ch.observe_field_elem(Block128::from(hi));
-        ch.observe_field_elem(Block128::from((n_tx as u128) + sb_idx as u128));
-        let eval_point: Vec<Block128> = (0..eff_log).map(|_| ch.get_random_point()).collect();
-        let gamma = ch.get_random_point();
+        // Derive the state transition point from committed endpoint roots. The
+        // verifier recomputes this and rejects proof-provided points that differ.
+        let (eval_point, gamma) = state_binding_eval_point_and_gamma(
+            &prev_state_root,
+            &binding.new_state_root,
+            seg_id,
+            sb_idx as u32,
+            n_tx,
+            eff_log,
+        );
 
         // Pre-state MLE evaluation. Allocate a zero segment only for genuinely
         // absent pre-state segments; production hot paths usually provide one.
@@ -484,7 +462,11 @@ pub fn build_state_bindings_from_binding(
             gamma,
             expected_batched,
         );
-        let columns = air.build_trace(&witness);
+        // NativeDelta proof mode no longer commits/proves the wide
+        // BlockStateBindingAir trace. Keep this empty for compatibility with the
+        // temporary `StateBindingBlockWitness` shape until the obsolete AIR
+        // plumbing is removed entirely.
+        let columns = Vec::new();
 
         // Extract siblings for this segment from the binding.
         let pre_siblings = binding

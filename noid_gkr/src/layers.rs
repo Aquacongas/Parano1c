@@ -33,6 +33,7 @@ use noid_core::Block128;
 use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
+use zeroize::Zeroize;
 
 #[cfg(test)]
 use noid_poseidon2b::native::permutation::sbox_x7;
@@ -83,6 +84,17 @@ pub struct PermLayerWitness {
     /// carries `Full` purely for column-typing convenience — its
     /// `sin/x2/...` rows are zero and carry no S-box meaning.
     pub kind: Vec<RoundKind>,
+}
+
+impl Drop for PermLayerWitness {
+    fn drop(&mut self) {
+        self.state.zeroize();
+        self.sin.zeroize();
+        self.x2.zeroize();
+        self.x4.zeroize();
+        self.x3.zeroize();
+        self.sout.zeroize();
+    }
 }
 
 impl PermLayerWitness {

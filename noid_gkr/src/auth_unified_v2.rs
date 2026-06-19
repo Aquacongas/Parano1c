@@ -30,6 +30,7 @@ use noid_core::sumcheck::RoundPolynomial;
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
+use zeroize::Zeroize;
 
 use crate::auth_mle_v2::{
     AuthUnifiedMle, N_AUTH_ELEM_VARS, N_AUTH_ROUND_VARS, N_AUTH_SLOT_BITS, N_AUTH_UNIFIED_CELLS,
@@ -334,10 +335,23 @@ struct UnifiedFlatTables {
 }
 
 #[inline]
-fn vec_tower_to_flat(v: Vec<Block128>) -> Vec<u128> {
-    v.into_iter()
-        .map(|b| tower_to_flat_u128(b.to_u128()))
-        .collect()
+fn vec_tower_to_flat(mut v: Vec<Block128>) -> Vec<u128> {
+    let out = v.iter().map(|b| tower_to_flat_u128(b.to_u128())).collect();
+    v.zeroize();
+    out
+}
+
+impl Drop for UnifiedFlatTables {
+    fn drop(&mut self) {
+        self.s_in_dec.zeroize();
+        self.s_out_dec.zeroize();
+        self.state_dec.zeroize();
+        self.state.zeroize();
+        for j in 0..STATE_SIZE {
+            self.s_out_lane_dec[j].zeroize();
+            self.state_lane_dec[j].zeroize();
+        }
+    }
 }
 
 impl UnifiedFlatTables {
@@ -361,15 +375,15 @@ impl UnifiedFlatTables {
         fold_highest_var_inplace_flat(&mut self.u, r_flat);
         fold_highest_var_inplace_flat(&mut self.sigma_dec, r_flat);
         fold_highest_var_inplace_flat(&mut self.rc_dec, r_flat);
-        fold_highest_var_inplace_flat(&mut self.s_in_dec, r_flat);
-        fold_highest_var_inplace_flat(&mut self.s_out_dec, r_flat);
-        fold_highest_var_inplace_flat(&mut self.state_dec, r_flat);
-        fold_highest_var_inplace_flat(&mut self.state, r_flat);
+        fold_secret_highest_var_inplace_flat(&mut self.s_in_dec, r_flat);
+        fold_secret_highest_var_inplace_flat(&mut self.s_out_dec, r_flat);
+        fold_secret_highest_var_inplace_flat(&mut self.state_dec, r_flat);
+        fold_secret_highest_var_inplace_flat(&mut self.state, r_flat);
         for j in 0..STATE_SIZE {
             fold_highest_var_inplace_flat(&mut self.mds_lane_dec[j], r_flat);
             fold_highest_var_inplace_flat(&mut self.sigma_lane_dec[j], r_flat);
-            fold_highest_var_inplace_flat(&mut self.s_out_lane_dec[j], r_flat);
-            fold_highest_var_inplace_flat(&mut self.state_lane_dec[j], r_flat);
+            fold_secret_highest_var_inplace_flat(&mut self.s_out_lane_dec[j], r_flat);
+            fold_secret_highest_var_inplace_flat(&mut self.state_lane_dec[j], r_flat);
         }
     }
 
@@ -389,6 +403,19 @@ impl UnifiedFlatTables {
 
 #[inline]
 fn fold_highest_var_inplace_flat(evals: &mut Vec<u128>, r_flat: u128) {
+    fold_highest_var_inplace_flat_inner(evals, r_flat, false);
+}
+
+#[inline]
+fn fold_secret_highest_var_inplace_flat(evals: &mut Vec<u128>, r_flat: u128) {
+    fold_highest_var_inplace_flat_inner(evals, r_flat, true);
+}
+
+fn fold_highest_var_inplace_flat_inner(
+    evals: &mut Vec<u128>,
+    r_flat: u128,
+    zeroize_truncated: bool,
+) {
     let half = evals.len() / 2;
     debug_assert!(half > 0);
     if half >= 1024 {
@@ -402,6 +429,9 @@ fn fold_highest_var_inplace_flat(evals: &mut Vec<u128>, r_flat: u128) {
             let delta = evals[j] ^ evals[j + half];
             evals[j] ^= clmul_gcm(r_flat, delta);
         }
+    }
+    if zeroize_truncated {
+        evals[half..].zeroize();
     }
     evals.truncate(half);
 }

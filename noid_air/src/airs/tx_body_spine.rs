@@ -402,9 +402,9 @@ impl TxBodySpineComposite {
             let [oh, ol] = input.owner.as_fields();
             cols[COL_OWNER_HI - TXV_COL_OFFSET][i] = oh;
             cols[COL_OWNER_LO - TXV_COL_OFFSET][i] = ol;
-            let [sh, sl] = input.spend_secret.as_fields();
-            cols[6][i] = sh; // SpendSecretHi
-            cols[7][i] = sl; // SpendSecretLo
+            // Legacy SpendSecretHi/SpendSecretLo slots intentionally remain zero.
+            // Authorization is handled by AuthGKR; the public tx trace must never
+            // commit the user's spend_secret limbs.
             let [th, tl] = input.auth_tag.as_fields();
             cols[COL_AUTH_TAG_HI - TXV_COL_OFFSET][i] = th;
             cols[COL_AUTH_TAG_LO - TXV_COL_OFFSET][i] = tl;
@@ -902,6 +902,45 @@ mod tests {
         assert!(
             spine.check(&trace),
             "honest cross-AIR tx-body payload tie trace must accept"
+        );
+    }
+
+    #[test]
+    fn spend_secret_limbs_are_not_written_to_trace() {
+        let (body, pins) = honest_stage2b_fixture();
+        let spine = TxBodySpineComposite::new(pins);
+        let in_val = body.inputs[0].value;
+        let out_val = body.outputs[0].value;
+        let trace = spine.build_trace(&body, [in_val, 0, 0, 0], [out_val, 0, 0, 0, 0, 0, 0, 0], 0);
+        let [secret_hi, secret_lo] = body.inputs[0].spend_secret.as_fields();
+
+        assert_ne!(
+            secret_hi,
+            Block128::ZERO,
+            "fixture must use non-zero secret hi limb"
+        );
+        assert_ne!(
+            secret_lo,
+            Block128::ZERO,
+            "fixture must use non-zero secret lo limb"
+        );
+        assert_eq!(
+            trace.columns[6][0],
+            Block128::ZERO,
+            "SpendSecretHi trace slot must stay zero"
+        );
+        assert_eq!(
+            trace.columns[7][0],
+            Block128::ZERO,
+            "SpendSecretLo trace slot must stay zero"
+        );
+        assert_ne!(
+            trace.columns[6][0], secret_hi,
+            "SpendSecretHi leaked into trace"
+        );
+        assert_ne!(
+            trace.columns[7][0], secret_lo,
+            "SpendSecretLo leaked into trace"
         );
     }
 

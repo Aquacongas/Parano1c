@@ -52,6 +52,12 @@ use crate::{
 pub struct InterleavedStarkProof {
     pub log_rows: usize,
     pub commitment: InterleavedCommitment,
+    /// MLE evaluations for every logical AIR column at the zero-check terminal point.
+    ///
+    /// Public columns remain in this per-proof transcript. Phase 5.1 omits them only
+    /// from the block bucket PCS/mixed-opening surface; changing this vector would
+    /// change algebraic transcript serialization and recursive replay, so it is
+    /// intentionally deferred to the B2/G proof-shape work.
     pub base_openings: Vec<Block128>,
     pub zero_check_rounds: Vec<RoundPoly>,
     pub shift_partials: Vec<Vec<Block128>>,
@@ -66,6 +72,12 @@ pub struct InterleavedStarkProof {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlgebraicStarkProof {
     pub log_rows: usize,
+    /// MLE evaluations for every logical AIR column at the zero-check terminal point.
+    ///
+    /// Public columns remain in this per-tx algebraic transcript for now. Removing
+    /// them saves only `16 * public_column_count` bytes per tx but changes transcript
+    /// serialization and recursive replay, and may be subsumed by the B2/G binding
+    /// redesign.
     pub base_openings: Vec<Block128>,
     pub zero_check_rounds: Vec<RoundPoly>,
     pub shift_partials: Vec<Vec<Block128>>,
@@ -137,6 +149,36 @@ struct AlgebraicVerifyOut {
     gammas: Vec<Block128>,
     lambdas: Vec<Block128>,
     shifted_indices: Vec<usize>,
+}
+
+/// Verifier-side terminal data for an algebraic STARK transcript whose PCS
+/// opening is discharged by an outer aggregator rather than by
+/// [`verify_air_interleaved`].
+///
+/// The aggregator must check the sumcheck terminal identity against real column
+/// openings at `r_pp`; otherwise the algebraic multipoint sumcheck is replayed
+/// but not bound to the committed columns.
+#[derive(Clone, Debug)]
+pub struct AlgebraicTerminalData {
+    pub r_pp: Vec<Block128>,
+    pub final_claim: Block128,
+    pub r_point: Vec<Block128>,
+    pub gammas: Vec<Block128>,
+    pub lambdas: Vec<Block128>,
+    pub shifted_indices: Vec<usize>,
+}
+
+impl From<AlgebraicVerifyOut> for AlgebraicTerminalData {
+    fn from(out: AlgebraicVerifyOut) -> Self {
+        Self {
+            r_pp: out.r_pp,
+            final_claim: out.final_claim,
+            r_point: out.r_point,
+            gammas: out.gammas,
+            lambdas: out.lambdas,
+            shifted_indices: out.shifted_indices,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -535,6 +577,30 @@ pub fn verify_air_interleaved_algebraic<A: Air + ?Sized>(
         None,
         channel,
     )
+}
+
+/// Replay an algebraic STARK transcript and return the extra terminal data an
+/// outer aggregation verifier needs to bind the sumcheck terminal claim to PCS
+/// openings. The historical API above returns only `(r_pp, final_claim,
+/// lambdas)` and is kept for compatibility.
+pub fn verify_air_interleaved_algebraic_terminal<A: Air + ?Sized>(
+    air: &A,
+    pi: &PublicInputs,
+    proof: &AlgebraicStarkProof,
+    extra_transcript: &[Block128],
+    slice_claims: &[SliceClaim],
+    channel: &mut Channel,
+) -> Result<AlgebraicTerminalData, VerifyError> {
+    let out = verify_algebraic_inner(
+        air,
+        pi,
+        proof.into(),
+        extra_transcript,
+        slice_claims,
+        None,
+        channel,
+    )?;
+    Ok(out.into())
 }
 
 /// Like `verify_air_interleaved_algebraic` but with an optional explicit log_len.
