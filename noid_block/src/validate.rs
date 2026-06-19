@@ -51,7 +51,10 @@ use noid_gkr::{AuthPublicInputs, SpineInputs};
 use noid_stark::prove_logic_sweep::{
     sweep_spine_inputs_from_body, N_SWEEP_AUTH_SLICES, SWEEP_BOUNDARY_BASE_LOG,
 };
-use noid_tx::TxShape;
+use noid_tx::{
+    compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxInput,
+    TxOutput, TxShape, MAX_INPUTS, MAX_OUTPUTS,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -138,17 +141,33 @@ pub fn validate_block_full(
         nullifiers,
     )?;
 
-    // Verify bucket coverage, canonical proof transcript binding, and
-    // pi.log_slots == header.log_slots.
+    // Verify bucket coverage, canonical proof transcript binding, proof roots,
+    // and pi.log_slots == header.log_slots.
     let header_log_slots = block.header.log_slots;
     validate_block_bucket_tx_indices(block, proof).map_err(FullValidationError::ZkProof)?;
     validate_block_proof_transcript_hash(block, proof).map_err(FullValidationError::ZkProof)?;
+    if proof.meta.prev_block_state_root != parent.state_root {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::PrevStateRootMismatch,
+        ));
+    }
+    if proof.meta.new_state_root != block.header.state_root {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::NewStateRootMismatch,
+        ));
+    }
     if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
-        for (tx_index, pi) in standard_bucket.tx_pis.iter().enumerate() {
+        for (block_tx_index, pi) in standard_bucket
+            .meta
+            .tx_indices
+            .iter()
+            .copied()
+            .zip(standard_bucket.tx_pis.iter())
+        {
             if pi.log_slots != header_log_slots {
                 return Err(FullValidationError::ZkProof(
                     crate::VerifyBlockError::LogSlotsInconsistent {
-                        tx_index,
+                        tx_index: block_tx_index as usize,
                         pi_log_slots: pi.log_slots,
                         header_log_slots,
                     },
@@ -157,11 +176,17 @@ pub fn validate_block_full(
         }
     }
     if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
-        for (tx_index, pi) in sweep_bucket.tx_pis.iter().enumerate() {
+        for (block_tx_index, pi) in sweep_bucket
+            .meta
+            .tx_indices
+            .iter()
+            .copied()
+            .zip(sweep_bucket.tx_pis.iter())
+        {
             if pi.log_slots != header_log_slots {
                 return Err(FullValidationError::ZkProof(
                     crate::VerifyBlockError::LogSlotsInconsistent {
-                        tx_index,
+                        tx_index: block_tx_index as usize,
                         pi_log_slots: pi.log_slots,
                         header_log_slots,
                     },
@@ -271,7 +296,7 @@ pub fn validate_block_from_network(
 
     let spine_inputs = build_spine_inputs_list(block);
     let auth_public = build_auth_public_list(block, &proof);
-    let sb_airs = build_state_binding_airs(block, &proof, pre_state);
+    let sb_airs = build_state_binding_airs(block, &proof, pre_state)?;
     let sb_air_refs: Vec<&BlockStateBindingAir> = sb_airs.iter().collect();
 
     validate_block_full(
@@ -334,12 +359,10 @@ pub fn validate_block_bucket_tx_indices(
             }
             for (pi, block_idx) in bucket.tx_pis.iter().zip(expected_standard.iter().copied()) {
                 let tx = &block.transactions[block_idx as usize];
-                if tx.body.shape != TxShape::Standard4x8
-                    || pi.tx_body_hash != tx.tx_body_hash
-                    || pi.shape_id != TxShape::Standard4x8.id()
-                {
+                if tx.body.shape != TxShape::Standard4x8 {
                     return Err(crate::VerifyBlockError::ShapeMismatch);
                 }
+                validate_public_inputs_for_tx(block_idx as usize, tx, pi)?;
             }
         }
         (None, true) => {}
@@ -369,8 +392,6 @@ pub fn validate_block_bucket_tx_indices(
             {
                 let tx = &block.transactions[block_idx as usize];
                 if tx.body.shape != TxShape::Sweep25x2
-                    || pi.tx_body_hash != tx.tx_body_hash
-                    || pi.shape_id != TxShape::Sweep25x2.id()
                     || auth_slices.len() != N_SWEEP_AUTH_SLICES
                     || !auth_slices
                         .iter()
@@ -378,10 +399,61 @@ pub fn validate_block_bucket_tx_indices(
                 {
                     return Err(crate::VerifyBlockError::ShapeMismatch);
                 }
+                validate_public_inputs_for_tx(block_idx as usize, tx, pi)?;
             }
         }
         (None, true) => {}
         _ => return Err(crate::VerifyBlockError::ShapeMismatch),
+    }
+
+    Ok(())
+}
+
+fn validate_public_inputs_for_tx(
+    tx_index: usize,
+    tx: &Transaction,
+    pi: &PublicInputs,
+) -> Result<(), crate::VerifyBlockError> {
+    if tx.body.is_coinbase {
+        return Err(crate::VerifyBlockError::ShapeMismatch);
+    }
+
+    let canonical_hash = hash_tx_body_for_shape(
+        tx.body.shape,
+        &tx.body.epoch_anchor,
+        tx.body.fee,
+        &tx.body.inputs,
+        &tx.body.outputs,
+        tx.body.is_coinbase,
+    );
+    let n_live_inputs = tx.body.inputs.iter().filter(|i| i.valid).count() as u8;
+    let n_live_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u8;
+    let claims_commitment = compute_claims_commitment(&tx.body.inputs, &tx.body.outputs);
+
+    let mut is_activation = [false; MAX_OUTPUTS];
+    let mut is_deactivation = [false; MAX_INPUTS];
+    if tx.body.shape == TxShape::Standard4x8 {
+        for (j, out) in tx.body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+            is_activation[j] = out.valid;
+        }
+        for (i, inp) in tx.body.inputs.iter().enumerate().take(MAX_INPUTS) {
+            is_deactivation[i] = inp.valid;
+        }
+    }
+
+    if tx.tx_body_hash != canonical_hash
+        || pi.tx_body_hash != canonical_hash
+        || pi.epoch_anchor != tx.body.epoch_anchor
+        || pi.shape_id != tx.body.shape.id()
+        || pi.fee != tx.body.fee
+        || pi.n_live_inputs != n_live_inputs
+        || pi.n_live_outputs != n_live_outputs
+        || pi.coinbase_credit != 0
+        || pi.claims_commitment != claims_commitment
+        || pi.is_activation != is_activation
+        || pi.is_deactivation != is_deactivation
+    {
+        return Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index });
     }
 
     Ok(())
@@ -518,90 +590,306 @@ pub fn build_auth_public_list(block: &Block, proof: &BlockProof) -> Vec<AuthPubl
         .collect()
 }
 
-/// Reconstruct `BlockStateBindingAir` instances from proof openings and
-/// the pre-block FRI state.
-///
-/// Collects per-segment slot-change claims from the block's transactions,
-/// reads pre-state slot values from `pre_state`, then re-derives `gamma`
-/// and `expected_batched_claims` using the same deterministic channel as
-/// the prover.  Returns one `BlockStateBindingAir` per dirty segment in
-/// segment-id order.
-pub fn build_state_binding_airs(
+fn proof_claim_commitments_by_block_index(
     block: &Block,
     proof: &BlockProof,
-    pre_state: &noid_chain::segmented_state::SegmentedFriState,
-) -> Vec<BlockStateBindingAir> {
-    use noid_air::airs::block_state_binding::{BlockStateBindingClaim, BlockStateBindingWitness};
-    use noid_core::Block128;
-    use noid_fri::Channel;
-    use std::collections::BTreeMap;
+) -> Result<Vec<Option<[u8; 32]>>, crate::VerifyBlockError> {
+    let mut commitments = vec![None; block.transactions.len()];
+    let mut seen = 0usize;
 
-    let n_state_bindings = proof.meta.n_state_bindings as usize;
-    if n_state_bindings == 0 {
-        return vec![];
+    if let Some(bucket) = proof.standard_bucket.as_ref() {
+        if bucket.meta.tx_indices.len() != bucket.tx_pis.len() {
+            return Err(crate::VerifyBlockError::ShapeMismatch);
+        }
+        for (block_idx, pi) in bucket
+            .meta
+            .tx_indices
+            .iter()
+            .copied()
+            .zip(bucket.tx_pis.iter())
+        {
+            let block_idx = block_idx as usize;
+            let Some(tx) = block.transactions.get(block_idx) else {
+                return Err(crate::VerifyBlockError::ShapeMismatch);
+            };
+            validate_public_inputs_for_tx(block_idx, tx, pi)?;
+            if commitments[block_idx]
+                .replace(pi.claims_commitment)
+                .is_some()
+            {
+                return Err(crate::VerifyBlockError::ShapeMismatch);
+            }
+            seen += 1;
+        }
     }
+
+    if let Some(bucket) = proof.sweep_bucket.as_ref() {
+        if bucket.meta.tx_indices.len() != bucket.tx_pis.len() {
+            return Err(crate::VerifyBlockError::ShapeMismatch);
+        }
+        for (block_idx, pi) in bucket
+            .meta
+            .tx_indices
+            .iter()
+            .copied()
+            .zip(bucket.tx_pis.iter())
+        {
+            let block_idx = block_idx as usize;
+            let Some(tx) = block.transactions.get(block_idx) else {
+                return Err(crate::VerifyBlockError::ShapeMismatch);
+            };
+            validate_public_inputs_for_tx(block_idx, tx, pi)?;
+            if commitments[block_idx]
+                .replace(pi.claims_commitment)
+                .is_some()
+            {
+                return Err(crate::VerifyBlockError::ShapeMismatch);
+            }
+            seen += 1;
+        }
+    }
+
+    if seen != proof.meta.n_tx as usize {
+        return Err(crate::VerifyBlockError::ShapeMismatch);
+    }
+
+    Ok(commitments)
+}
+
+#[inline]
+fn slot_value_from_input(inp: &TxInput) -> noid_chain::fri_state::SlotValue {
+    let [owner_hi, owner_lo] = inp.owner.as_fields();
+    noid_chain::fri_state::SlotValue {
+        value: noid_core::Block128::from(inp.value as u128),
+        owner_hi,
+        owner_lo,
+    }
+}
+
+#[inline]
+fn slot_value_from_output(out: &TxOutput) -> noid_chain::fri_state::SlotValue {
+    let [owner_hi, owner_lo] = out.owner.as_fields();
+    noid_chain::fri_state::SlotValue {
+        value: noid_core::Block128::from(out.value as u128),
+        owner_hi,
+        owner_lo,
+    }
+}
+
+fn read_state_view(
+    pre_state: &noid_chain::segmented_state::SegmentedFriState,
+    overlay: &std::collections::BTreeMap<u32, noid_chain::fri_state::SlotValue>,
+    slot_index: u32,
+) -> noid_chain::fri_state::SlotValue {
+    overlay
+        .get(&slot_index)
+        .copied()
+        .unwrap_or_else(|| pre_state.slot(slot_index))
+}
+
+fn push_mint_claim(
+    seg_claims: &mut std::collections::BTreeMap<
+        u16,
+        Vec<noid_air::airs::block_state_binding::BlockStateBindingClaim>,
+    >,
+    eff_log: usize,
+    seg_mask: u32,
+    out: &TxOutput,
+) {
+    use noid_air::airs::block_state_binding::BlockStateBindingClaim;
+    let seg_id = (out.slot_index >> eff_log) as u16;
+    let local = out.slot_index & seg_mask;
+    let [owner_hi, owner_lo] = out.owner.as_fields();
+    seg_claims
+        .entry(seg_id)
+        .or_default()
+        .push(BlockStateBindingClaim::mint(
+            local,
+            noid_core::Block128::from(out.value as u128),
+            owner_hi,
+            owner_lo,
+        ));
+}
+
+fn collect_state_binding_claims(
+    block: &Block,
+    commitments_by_block_index: &[Option<[u8; 32]>],
+    pre_state: &noid_chain::segmented_state::SegmentedFriState,
+) -> Result<
+    std::collections::BTreeMap<
+        u16,
+        Vec<noid_air::airs::block_state_binding::BlockStateBindingClaim>,
+    >,
+    crate::VerifyBlockError,
+> {
+    use noid_air::airs::block_state_binding::BlockStateBindingClaim;
+    use noid_chain::fri_state::SlotValue;
+    use std::collections::{BTreeMap, HashSet};
 
     let eff_log = pre_state.effective_log_segment_size();
     let seg_mask = (1u32 << eff_log) - 1;
-    let n_tx = proof.meta.n_tx as usize;
-    let prev_state_root = &proof.meta.prev_block_state_root;
-
-    // Collect slot changes per segment, sorted by seg_id (BTreeMap).
+    let n_slots = pre_state.num_slots();
     let mut seg_claims: BTreeMap<u16, Vec<BlockStateBindingClaim>> = BTreeMap::new();
+    let mut overlay: BTreeMap<u32, SlotValue> = BTreeMap::new();
+    let mut coinbase_output_slots = HashSet::new();
 
-    for tx in block.transactions.iter() {
-        if tx.body.is_coinbase {
-            // Coinbase has no inputs. Include its outputs as mint claims so the
-            // post-state MLE and seg_root are consistent with the global new_state_root
-            // (which includes coinbase changes). Skipping coinbase would cause a Merkle
-            // path mismatch when coinbase and user TXs touch the same segment.
-            for out in tx.body.outputs.iter().filter(|o| o.valid) {
-                let seg_id = (out.slot_index >> eff_log) as u16;
-                let local = out.slot_index & seg_mask;
-                let [owner_hi, owner_lo] = out.owner.as_fields();
-                seg_claims
-                    .entry(seg_id)
-                    .or_default()
-                    .push(BlockStateBindingClaim::mint(
-                        local,
-                        Block128::from(out.value as u128),
-                        owner_hi,
-                        owner_lo,
-                    ));
-            }
+    // Coinbase mints are included first to match prover-side
+    // `build_state_bindings_from_binding`. They are validated against the
+    // pre-block state but are not made spendable by user transactions in the
+    // same block, because the state-binding construction builds user tx openings
+    // before patching the coinbase post-root.
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
+        if !tx.body.is_coinbase {
             continue;
         }
-        // Spend claims: deactivated input slots.
-        for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+        for (output_index, out) in tx.body.outputs.iter().enumerate() {
+            if !out.valid {
+                continue;
+            }
+            if (out.slot_index as u64) >= n_slots {
+                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
+                    tx_index: tx_idx,
+                });
+            }
+            if !coinbase_output_slots.insert(out.slot_index)
+                || pre_state.slot(out.slot_index) != SlotValue::EMPTY
+            {
+                return Err(crate::VerifyBlockError::StateBindingOutputOccupied {
+                    tx_index: tx_idx,
+                    output_index,
+                });
+            }
+            push_mint_claim(&mut seg_claims, eff_log, seg_mask, out);
+        }
+    }
+
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
+        if tx.body.is_coinbase {
+            continue;
+        }
+
+        let Some(expected_commitment) = commitments_by_block_index.get(tx_idx).and_then(|v| *v)
+        else {
+            return Err(crate::VerifyBlockError::ShapeMismatch);
+        };
+        let recomputed = compute_claims_commitment(&tx.body.inputs, &tx.body.outputs);
+        if recomputed != expected_commitment {
+            return Err(
+                crate::VerifyBlockError::StateBindingClaimsCommitmentMismatch { tx_index: tx_idx },
+            );
+        }
+
+        let mut seen_outputs = HashSet::new();
+        for out in tx.body.outputs.iter().filter(|o| o.valid) {
+            if !seen_outputs.insert(out.slot_index) {
+                return Err(crate::VerifyBlockError::StateBindingDuplicateOutputSlot {
+                    tx_index: tx_idx,
+                });
+            }
+        }
+
+        // Inputs are checked before any output of the same tx is applied.
+        for (input_index, inp) in tx.body.inputs.iter().enumerate() {
+            if !inp.valid {
+                continue;
+            }
+            if (inp.slot_index as u64) >= n_slots {
+                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
+                    tx_index: tx_idx,
+                });
+            }
+            let opened = read_state_view(pre_state, &overlay, inp.slot_index);
+            let expected = slot_value_from_input(inp);
+            if opened != expected {
+                return Err(crate::VerifyBlockError::StateBindingInputMismatch {
+                    tx_index: tx_idx,
+                    input_index,
+                });
+            }
             let seg_id = (inp.slot_index >> eff_log) as u16;
             let local = inp.slot_index & seg_mask;
-            let sv = pre_state.slot(inp.slot_index);
             seg_claims
                 .entry(seg_id)
                 .or_default()
                 .push(BlockStateBindingClaim::spend(
                     local,
-                    sv.value,
-                    sv.owner_hi,
-                    sv.owner_lo,
+                    expected.value,
+                    expected.owner_hi,
+                    expected.owner_lo,
                 ));
         }
-        // Mint claims: activated output slots.
+
+        // Outputs are opened against the same pre-tx view, before same-tx inputs
+        // are zeroed. Thus input-output overlap inside one tx remains invalid.
+        for (output_index, out) in tx.body.outputs.iter().enumerate() {
+            if !out.valid {
+                continue;
+            }
+            if (out.slot_index as u64) >= n_slots {
+                return Err(crate::VerifyBlockError::StateBindingSlotOutOfRange {
+                    tx_index: tx_idx,
+                });
+            }
+            if coinbase_output_slots.contains(&out.slot_index)
+                || read_state_view(pre_state, &overlay, out.slot_index) != SlotValue::EMPTY
+            {
+                return Err(crate::VerifyBlockError::StateBindingOutputOccupied {
+                    tx_index: tx_idx,
+                    output_index,
+                });
+            }
+            push_mint_claim(&mut seg_claims, eff_log, seg_mask, out);
+        }
+
+        for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+            overlay.insert(inp.slot_index, SlotValue::EMPTY);
+        }
         for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            let seg_id = (out.slot_index >> eff_log) as u16;
-            let local = out.slot_index & seg_mask;
-            let [owner_hi, owner_lo] = out.owner.as_fields();
-            seg_claims
-                .entry(seg_id)
-                .or_default()
-                .push(BlockStateBindingClaim::mint(
-                    local,
-                    Block128::from(out.value as u128),
-                    owner_hi,
-                    owner_lo,
-                ));
+            overlay.insert(out.slot_index, slot_value_from_output(out));
         }
     }
+
+    Ok(seg_claims)
+}
+
+/// Reconstruct `BlockStateBindingAir` instances from proof openings and
+/// the pre-block FRI state.
+///
+/// The verifier reconstructs claims from the canonical tx body and checks the
+/// sequential pre-state relation before constructing the AIR. It never copies
+/// `(value, owner)` out of the state into a spend claim unless that value equals
+/// the transaction's public claim; this is the SC-3 claim bridge.
+pub fn build_state_binding_airs(
+    block: &Block,
+    proof: &BlockProof,
+    pre_state: &noid_chain::segmented_state::SegmentedFriState,
+) -> Result<Vec<BlockStateBindingAir>, crate::VerifyBlockError> {
+    use noid_air::airs::block_state_binding::BlockStateBindingWitness;
+    use noid_core::Block128;
+    use noid_fri::Channel;
+
+    let n_state_bindings = proof.meta.n_state_bindings as usize;
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if !has_user_txs && n_state_bindings == 0 {
+        return Ok(Vec::new());
+    }
+
+    let commitments_by_block_index = proof_claim_commitments_by_block_index(block, proof)?;
+    let seg_claims = collect_state_binding_claims(block, &commitments_by_block_index, pre_state)?;
+
+    if seg_claims.len() != n_state_bindings
+        || proof.pre_state_openings.len() != n_state_bindings
+        || proof.post_state_openings.len() != n_state_bindings
+    {
+        return Err(crate::VerifyBlockError::ShapeMismatch);
+    }
+    if n_state_bindings == 0 {
+        return Ok(Vec::new());
+    }
+
+    let eff_log = pre_state.effective_log_segment_size();
+    let n_tx = proof.meta.n_tx as usize;
+    let prev_state_root = &proof.meta.prev_block_state_root;
 
     // BTreeMap iteration is already sorted by seg_id.
     tracing::debug!(
@@ -614,12 +902,24 @@ pub fn build_state_binding_airs(
             .collect::<Vec<_>>()
             .join(",")
     );
+
     seg_claims
         .into_iter()
         .enumerate()
-        .map(|(sb_idx, (_seg_id, claims))| {
+        .map(|(sb_idx, (seg_id, claims))| {
             let pre_op = &proof.pre_state_openings[sb_idx];
             let post_op = &proof.post_state_openings[sb_idx];
+            if pre_op.seg_id != seg_id || post_op.seg_id != seg_id {
+                return Err(crate::VerifyBlockError::StateBindingSegmentMismatch {
+                    state_binding_index: sb_idx,
+                    expected_seg_id: seg_id,
+                    pre_seg_id: pre_op.seg_id,
+                    post_seg_id: post_op.seg_id,
+                });
+            }
+            if pre_op.eval_point != post_op.eval_point || pre_op.eval_point.len() != eff_log {
+                return Err(crate::VerifyBlockError::ShapeMismatch);
+            }
 
             let eval_point = pre_op.eval_point.clone();
             let prev_lane_openings = pre_op.lane_values;
@@ -650,14 +950,14 @@ pub fn build_state_binding_airs(
             );
             let expected_batched = witness.expected_batched_claims();
 
-            BlockStateBindingAir::new(
+            Ok(BlockStateBindingAir::new(
                 &claims,
                 prev_lane_openings,
                 new_lane_openings,
                 &eval_point,
                 gamma,
                 expected_batched,
-            )
+            ))
         })
         .collect()
 }
@@ -691,9 +991,11 @@ mod tests {
     use noid_chain::block::Block;
     use noid_chain::block_header::BlockHeader;
     use noid_chain::consensus::{genesis::GENESIS_TIMESTAMP, params::GENESIS_TARGET};
+    use noid_chain::fri_state::SlotValue;
     use noid_chain::state::ChainState;
-    use noid_poseidon2b::primitives::Address;
-    use noid_tx::{Transaction, TxBody, TxOutput};
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_tx::{compute_claims_commitment, Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
 
@@ -725,6 +1027,186 @@ mod tests {
             body,
             tx_body_hash: hash,
         }
+    }
+
+    fn make_input(slot: u32, value: u64, owner: Address) -> TxInput {
+        TxInput {
+            slot_index: slot,
+            value,
+            owner,
+            spend_secret: SpendSecret([0x55; 32]),
+            auth_tag: AuthTag([0x77; 32]),
+            valid: true,
+        }
+    }
+
+    fn seed_slot(state: &mut ChainState, slot: u32, value: u64, owner: Address) {
+        let [owner_hi, owner_lo] = owner.as_fields();
+        state
+            .state
+            .set_slot(
+                slot,
+                SlotValue {
+                    value: Block128::from(value as u128),
+                    owner_hi,
+                    owner_lo,
+                },
+            )
+            .unwrap();
+    }
+
+    fn public_inputs_for_body(body: &TxBody) -> PublicInputs {
+        let mut is_activation = [false; MAX_OUTPUTS];
+        let mut is_deactivation = [false; MAX_INPUTS];
+        if body.shape == TxShape::Standard4x8 {
+            for (j, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
+                is_activation[j] = output.valid;
+            }
+            for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
+                is_deactivation[i] = input.valid;
+            }
+        }
+        PublicInputs {
+            epoch_anchor: body.epoch_anchor,
+            tx_body_hash: hash_tx_body_for_shape(
+                body.shape,
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            shape_id: body.shape.id(),
+            fee: body.fee,
+            n_live_inputs: body.inputs.iter().filter(|i| i.valid).count() as u8,
+            n_live_outputs: body.outputs.iter().filter(|o| o.valid).count() as u8,
+            coinbase_credit: 0,
+            log_slots: TEST_LOG_SLOTS as u32,
+            claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
+            is_activation,
+            is_deactivation,
+        }
+    }
+
+    #[test]
+    fn canonical_public_inputs_reject_wrong_tx_hash_or_claims_commitment() {
+        let body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                slot_index: 9,
+                value: 100,
+                owner: Address([0x33; 32]),
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        let tx = make_transaction(body.clone());
+        let pi = public_inputs_for_body(&body);
+        validate_public_inputs_for_tx(0, &tx, &pi).expect("canonical public inputs pass");
+
+        let mut bad_tx = tx.clone();
+        bad_tx.tx_body_hash.0[0] ^= 1;
+        assert!(matches!(
+            validate_public_inputs_for_tx(0, &bad_tx, &pi),
+            Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index: 0 })
+        ));
+
+        let mut bad_pi = pi;
+        bad_pi.claims_commitment[0] ^= 1;
+        assert!(matches!(
+            validate_public_inputs_for_tx(0, &tx, &bad_pi),
+            Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn state_binding_claim_collection_rejects_input_owner_mismatch() {
+        let alice = Address([0x11; 32]);
+        let mallory = Address([0x22; 32]);
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        seed_slot(&mut state, 3, 100, alice);
+
+        let body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs: vec![make_input(3, 100, mallory)],
+            outputs: vec![],
+            is_coinbase: false,
+        };
+        let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                tx_root: [0u8; 32],
+                timestamp: 0,
+                height: 1,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: GENESIS_TARGET,
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [1u8; 32],
+                log_slots: TEST_LOG_SLOTS as u32,
+                active_slot_count: 0,
+                alloc_counter: 0,
+            },
+            transactions: vec![make_transaction(body)],
+        };
+
+        let err = collect_state_binding_claims(&block, &[Some(commitment)], &state.state)
+            .expect_err("owner mismatch must reject");
+        assert!(matches!(
+            err,
+            crate::VerifyBlockError::StateBindingInputMismatch {
+                tx_index: 0,
+                input_index: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn state_binding_claim_collection_rejects_claim_commitment_mismatch() {
+        let alice = Address([0x11; 32]);
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        seed_slot(&mut state, 4, 250, alice);
+
+        let body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs: vec![make_input(4, 250, alice)],
+            outputs: vec![],
+            is_coinbase: false,
+        };
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                tx_root: [0u8; 32],
+                timestamp: 0,
+                height: 1,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: GENESIS_TARGET,
+                proof_transcript_hash: [1u8; 32],
+                witness_root: [1u8; 32],
+                log_slots: TEST_LOG_SLOTS as u32,
+                active_slot_count: 0,
+                alloc_counter: 0,
+            },
+            transactions: vec![make_transaction(body)],
+        };
+
+        let err = collect_state_binding_claims(&block, &[Some([0xAB; 32])], &state.state)
+            .expect_err("claims commitment mismatch must reject");
+        assert!(matches!(
+            err,
+            crate::VerifyBlockError::StateBindingClaimsCommitmentMismatch { tx_index: 0 }
+        ));
     }
 
     #[test]

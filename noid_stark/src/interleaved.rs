@@ -303,7 +303,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     }
 
     let degree = round_poly_degree(air);
-    let (zero_check_rounds, r) = crate::prove_zero_check_with_domains(
+    let (zero_check_rounds, r) = crate::prove_zero_check_with_domains_and_air_log_rows(
         &sumcheck_cols,
         air.constraints(),
         &betas,
@@ -313,6 +313,7 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
         &shifted_slot,
         n_air_cols,
         &sumcheck_domains,
+        air.log_rows(),
     );
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
     profiler.phase("zero_check_sumcheck");
@@ -709,7 +710,7 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
             local: &local_scratch,
             next: &next_scratch,
         };
-        composition += betas[k] * c.evaluate(frame);
+        composition += betas[k] * c.evaluate_at_point(frame, &r_point, air.log_rows());
     }
     if eq_zr * composition != zc_claim {
         return Err(VerifyError::ConstraintViolated);

@@ -343,6 +343,11 @@ struct CompiledGates<'a> {
     /// the Tower Sumcheck boolean fast-path: replaces `clmul_gcm(r, diff)`
     /// with `r & (diff as u128).wrapping_neg()` (bitwise AND) when diff \in {0,1}.
     col_is_bool: Vec<bool>,
+    /// Per-constraint flag for virtual selectors / point-aware gates.
+    constraint_needs_point: Vec<bool>,
+    /// Fast aggregate for the common case where no constraint needs the
+    /// current sumcheck point.
+    any_needs_point: bool,
 }
 
 impl<'a> CompiledGates<'a> {
@@ -360,9 +365,14 @@ impl<'a> CompiledGates<'a> {
         let mut next_index_starts: Vec<u32> = Vec::with_capacity(n + 1);
         let mut max_local_arity = 0usize;
         let mut max_next_arity = 0usize;
+        let mut constraint_needs_point: Vec<bool> = Vec::with_capacity(n);
+        let mut any_needs_point = false;
         col_index_starts.push(0);
         next_index_starts.push(0);
         for c in constraints {
+            let needs_point = c.needs_eval_point();
+            any_needs_point |= needs_point;
+            constraint_needs_point.push(needs_point);
             let locals = c.columns();
             max_local_arity = max_local_arity.max(locals.len());
             for &idx in locals {
@@ -391,6 +401,8 @@ impl<'a> CompiledGates<'a> {
             max_next_arity,
             betas_flat,
             col_is_bool,
+            constraint_needs_point,
+            any_needs_point,
         }
     }
 }
@@ -478,6 +490,9 @@ fn accumulate_sum_tower(
     compiled: &CompiledGates<'_>,
     s_idx: usize,
     s_flat: u128,
+    round_idx: usize,
+    fixed_point_flat: &[u128],
+    air_log_rows: usize,
 ) -> u128 {
     use noid_core::hardware::clmul_gcm;
     use rayon::prelude::*;
@@ -486,6 +501,8 @@ fn accumulate_sum_tower(
     let local_cap = compiled.max_local_arity;
     let next_cap = compiled.max_next_arity;
     let bool_mask = &compiled.col_is_bool;
+    let log_len = fixed_point_flat.len();
+    let point_var = log_len - 1 - round_idx;
 
     (0..half)
         .into_par_iter()
@@ -495,9 +512,10 @@ fn accumulate_sum_tower(
                     Vec::<u128>::with_capacity(local_cap),
                     Vec::<u128>::with_capacity(next_cap),
                     vec![0u128; n_cols],
+                    Vec::<u128>::with_capacity(log_len),
                 )
             },
-            |(local_scratch, next_scratch, col_partials), j| {
+            |(local_scratch, next_scratch, col_partials, point_scratch), j| {
                 // --- eq partial evaluation ---
                 // cur_eq has length 2*half; lo-half is [0..half], hi-half is [half..2*half].
                 let eq_val = {
@@ -542,6 +560,18 @@ fn accumulate_sum_tower(
                     }
                 }
 
+                // --- virtual-selector point reconstruction (only when needed) ---
+                if compiled.any_needs_point {
+                    point_scratch.clear();
+                    point_scratch.resize(log_len, 0u128);
+                    for i in 0..point_var {
+                        point_scratch[i] = ((j >> i) & 1) as u128;
+                    }
+                    point_scratch[point_var] = s_flat;
+                    point_scratch[(point_var + 1)..]
+                        .copy_from_slice(&fixed_point_flat[(point_var + 1)..]);
+                }
+
                 // --- constraint evaluation (unchanged from fused version) ---
                 let mut composition: u128 = 0;
                 for k in 0..n_constraints {
@@ -561,7 +591,15 @@ fn accumulate_sum_tower(
                         local: local_scratch.as_slice(),
                         next: next_scratch.as_slice(),
                     };
-                    let ck = compiled.constraints[k].evaluate_flat(frame);
+                    let ck = if compiled.constraint_needs_point[k] {
+                        compiled.constraints[k].evaluate_flat_at_point(
+                            frame,
+                            point_scratch.as_slice(),
+                            air_log_rows,
+                        )
+                    } else {
+                        compiled.constraints[k].evaluate_flat(frame)
+                    };
                     composition ^= clmul_gcm(compiled.betas_flat[k], ck);
                 }
                 clmul_gcm(eq_val, composition)
@@ -629,8 +667,42 @@ pub fn prove_zero_check_with_domains(
     n_base: usize,
     col_domains: &[noid_air::ColumnDomain],
 ) -> (Vec<RoundPoly>, Vec<Block128>) {
+    prove_zero_check_with_domains_and_air_log_rows(
+        cols,
+        constraints,
+        betas,
+        z,
+        channel,
+        degree,
+        shifted_slot,
+        n_base,
+        col_domains,
+        z.len(),
+    )
+}
+
+/// Like [`prove_zero_check_with_domains`], but supplies the AIR's native
+/// row-domain size separately from the committed/proving domain `z.len()`.
+/// Virtual row selectors use this to reproduce the old zero-padded public
+/// selector columns when `log_len > air.log_rows()`.
+pub fn prove_zero_check_with_domains_and_air_log_rows(
+    cols: &[&[Block128]],
+    constraints: &[Box<dyn Constraint>],
+    betas: &[Block128],
+    z: &[Block128],
+    channel: &mut Channel,
+    degree: usize,
+    shifted_slot: &[Option<usize>],
+    n_base: usize,
+    col_domains: &[noid_air::ColumnDomain],
+    air_log_rows: usize,
+) -> (Vec<RoundPoly>, Vec<Block128>) {
     use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
     let n = z.len();
+    assert!(
+        air_log_rows <= n,
+        "air_log_rows must not exceed proving log_len"
+    );
     let n_points = degree + 1;
     let n_cols = cols.len();
 
@@ -668,8 +740,9 @@ pub fn prove_zero_check_with_domains(
 
     let mut round_polys: Vec<RoundPoly> = Vec::with_capacity(n);
     let mut challenges: Vec<Block128> = Vec::with_capacity(n);
+    let mut fixed_point_flat = vec![0u128; n];
 
-    for _ in 0..n {
+    for round_idx in 0..n {
         let half = cur_eq.len() / 2;
         // cur_cols[k].len() == 2*half at the start of each round (before fold).
         // We need the lo-half [0..half] and hi-half [half..2*half] transposed.
@@ -709,6 +782,9 @@ pub fn prove_zero_check_with_domains(
                     &compiled,
                     s_idx,
                     s_flat,
+                    round_idx,
+                    &fixed_point_flat,
+                    air_log_rows,
                 );
                 Block128::from(flat_to_tower_u128(acc_flat))
             })
@@ -717,6 +793,7 @@ pub fn prove_zero_check_with_domains(
         channel.observe_field_elems(&evals);
         let r = channel.get_random_point();
         let r_flat = tower_to_flat_u128(r.0);
+        fixed_point_flat[n - 1 - round_idx] = r_flat;
 
         // Fold column-major (cache-friendly: each column is sequential).
         {
@@ -877,7 +954,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
     }
 
     let degree = round_poly_degree(air);
-    let (zero_check_rounds, r) = prove_zero_check_with_domains(
+    let (zero_check_rounds, r) = prove_zero_check_with_domains_and_air_log_rows(
         &sumcheck_cols,
         air.constraints(),
         &betas,
@@ -887,6 +964,7 @@ pub fn prove_air_unchecked_timed<A: Air>(
         &shifted_slot,
         n_base,
         &sumcheck_domains,
+        air.log_rows(),
     );
     t.transcript_sumcheck = t1.elapsed();
 
@@ -1408,7 +1486,7 @@ fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
     }
 
     let degree = round_poly_degree(air);
-    let (zero_check_rounds, r) = prove_zero_check(
+    let (zero_check_rounds, r) = prove_zero_check_with_domains_and_air_log_rows(
         &sumcheck_cols,
         air.constraints(),
         &betas,
@@ -1417,6 +1495,8 @@ fn prove_air_unchecked_with_extras_inner<A: Air + ?Sized>(
         degree,
         &shifted_slot,
         n_base,
+        &[],
+        air.log_rows(),
     );
 
     let r_point: Vec<Block128> = r.iter().rev().cloned().collect();
@@ -1819,7 +1899,7 @@ fn verify_air_with_extras_inner<A: Air + ?Sized>(
             local: &local_scratch,
             next: &next_scratch,
         };
-        composition += betas[k] * c.evaluate(frame);
+        composition += betas[k] * c.evaluate_at_point(frame, &r_point, air.log_rows());
     }
     if eq_zr * composition != claim {
         return Err(VerifyError::ConstraintViolated);
@@ -2070,7 +2150,7 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
 
     // --- Batched zero-check sumcheck ---
     let degree = round_poly_degree(air);
-    let (zero_check_rounds, r) = prove_zero_check(
+    let (zero_check_rounds, r) = prove_zero_check_with_domains_and_air_log_rows(
         &sumcheck_cols,
         air.constraints(),
         &betas,
@@ -2079,6 +2159,8 @@ pub fn prove_air_unchecked_with_extra<A: Air + ?Sized>(
         degree,
         &shifted_slot,
         n_base,
+        &[],
+        air.log_rows(),
     );
 
     // --- Column openings at the sumcheck's final challenge point ---
@@ -2263,7 +2345,7 @@ pub fn verify_air_with_extra<A: Air + ?Sized>(
             local: &local_scratch,
             next: &next_scratch,
         };
-        composition += betas[k] * c.evaluate(frame);
+        composition += betas[k] * c.evaluate_at_point(frame, &r_point, air.log_rows());
     }
     if eq_zr * composition != claim {
         return Err(VerifyError::ConstraintViolated);
@@ -2517,7 +2599,7 @@ pub fn verify_air_timed<A: Air>(
             local: &local_scratch,
             next: &next_scratch,
         };
-        composition += betas[k] * c.evaluate(frame);
+        composition += betas[k] * c.evaluate_at_point(frame, &r_point, air.log_rows());
     }
     if eq_zr * composition != claim {
         t.composition = t1.elapsed();

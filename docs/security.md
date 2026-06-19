@@ -10,7 +10,7 @@ The Paranoid Zero proof engine is built entirely over the binary tower field GF(
 2. **Poseidon2b is native:** designed for GF(2¹²⁸) with S-box `x⁷`, MDS matrix operations over the tower, and capacity IV domain separation — no field extension, no mismatch between hash and proof arithmetic.
 3. **FRI-Binius PCS:** Reed-Solomon codes over the binary tower. All AIR constraints, all GKR sumchecks, and all FRI operations operate in the same field — no extension towers, no field-switching, no conversion artefacts that could create soundness gaps.
 
-These three properties together enable **FROST-GKR** (Frobenius Reduction Over Shifted Tables): a unified degree-9 sumcheck that proves all 59 (or 20) Poseidon2b permutations simultaneously, replacing a degree-2 decomposition that required 4,248 Fiat-Shamir rounds with 30 rounds and reducing proof size from >280 KB to ~5.4 KB.
+These three properties together enable **FROST-GKR** (Frobenius Reduction Over Shifted Tables): a unified degree-9 sumcheck over Poseidon2b permutation traces. SpineGKR covers 59 permutation slots, AuthGKR covers 20 slots, and SweepAuthGKR covers 125 slots; each sub-proof stays in GF(2¹²⁸) and is sound by the Schwartz-Zippel / Fiat-Shamir argument in §5.3.
 
 The engine operates at three verification levels:
 
@@ -18,7 +18,7 @@ The engine operates at three verification levels:
 - **Block** — standard and sweep transactions are aggregated in shape-specific buckets; the canonical `BlockProof` binds all bucket proofs plus `BlockStateBindingAir`, which proves the state-root transition
 - **Chain** — 256-row recursive STARK accumulating the full chain into 6.5 KB, verifiable in ~5 ms
 
-**System soundness: ~120 bits**, bottlenecked by the FROST-GKR unified sumcheck (345/2¹²⁸). All other components are bounded by 2⁻¹²². Privacy reduces to 128-bit Poseidon2b preimage resistance.
+**System soundness: approximately 119–120 bits**, bottlenecked by the FROST-GKR relation checks (`ε_GKR ≤ 348/2¹²⁸` per sub-proof). `BlockStateBindingAir` contributes `44/2¹²⁸ ≈ 2⁻¹²³`. Privacy reduces to 128-bit Poseidon2b preimage resistance.
 
 ---
 
@@ -33,21 +33,22 @@ This document proves the following claims against a PPT adversary:
 | SC-3 | A block proof with inconsistent state transitions cannot pass | §8 | 2⁻¹²³ |
 | SC-4 | A recursive proof with falsified state_root or chain_hash cannot pass | §9 | 2⁻¹²³ |
 | SC-5 | spend_secret cannot be extracted from any proof or wire artifact | §10 | 2⁻¹²⁸ |
-| SC-6 | The FROST-GKR degree-9 sumcheck is sound despite higher degree than legacy | §5.3 | 2⁻¹²⁰ |
+| SC-6 | The FROST-GKR degree-9 sumcheck is sound under the stated Schwartz-Zippel / Fiat-Shamir assumptions | §5.3 | 2⁻¹²⁰ |
 
 ---
 
-## 2. Non-Standard Design Decisions
+## 2. Load-Bearing Design Decisions
 
-The following construction choices deviate from a conventional FRI-STARK. Each has a formal security argument in the indicated section.
+The following construction choices affect soundness or privacy. Each has a formal security argument in the indicated section.
 
 | Property | Security argument | §|
 |----------|-------------------|--|
 | `RecursiveBlockAir`: `n_rounds = 0`, `folded_symbols` all-`None`, query loop vacuous | The committed polynomial has exactly 2⁸ = 256 entries — a multilinear polynomial is uniquely determined by its Boolean-hypercube evaluation table. FRI proximity testing is redundant; the tensor check is an exact evaluation. | **9.2** |
-| FROST-GKR unified sumcheck: round polynomial degree 9 (vs conventional degree 2–3) | Higher degree, fewer rounds. Total soundness error 345/2¹²⁸ is 37× lower than the legacy degree-2 decomposition (12,744/2¹²⁸). Schwartz-Zippel applies for any degree. | **5.3** |
+| FROST-GKR unified sumcheck: round polynomial degree 9 | Schwartz-Zippel applies to the committed round polynomial degree. Fiat-Shamir soundness follows from the absorb-then-squeeze ordering of every round. | **5.3** |
 | Per-bucket `InterleavedCommitment` caps cover all traces of each transaction shape | Standard and `Sweep25x2` transactions have different AIR shapes, so each non-empty bucket has its own joint commitment. Selective forgery inside a bucket requires forging that bucket's committed columns; the canonical `BlockProof` binds all buckets together. | **7.1** |
 | Per-bucket FRI opening with deferred aggregation | A bucket-level multipoint sumcheck reduces that bucket's terminal claims to one evaluation point before the FRI opening. Soundness does not degrade with the number of transactions in the bucket. | **7.2** |
-| Transaction AIRs contain no state-root checks | `TxLogicAir` and `SweepTxLogicAir` are intentionally stateless — they prove ownership and balance without knowledge of the chain state. `BlockStateBindingAir` proves state consistency; the claim bridge binds the layers. | **7.3** |
+| Transaction AIRs contain no state-root checks | `TxLogicAir` and `SweepTxLogicAir` are intentionally stateless — they prove ownership and balance without knowledge of the chain state. Verifier-side canonical `PublicInputs` reconstruction plus `BlockStateBindingAir` binds the layers. | **7.3**, **8.1** |
+| `BlockStateBindingAir` virtual selectors | Row/prefix selectors are verifier-known zero-padded MLEs of deterministic public selector tables. They are not witness columns and add no witness-dependent degree of freedom. | **8.3** |
 | `spend_secret` absent from the Fiat-Shamir transcript | `absorb_public_boundary` accepts `&AuthPublicInputs`, a type that structurally cannot hold the secret. The verifier function `verify_auth_killshot` takes the same type. Exclusion is enforced by the Rust type system. | **10.1** |
 
 ---
@@ -70,7 +71,7 @@ For an adversarial prover whose committed codeword is at relative Hamming distan
 
 ---
 
-## 3. Proof Engine Architecture
+## 4. Proof Engine Architecture
 
 The proof engine operates in three levels. Each level is independently verifiable; they compose by embedding lower-level claims as verifier-computed public inputs to higher-level proofs.
 
@@ -107,7 +108,7 @@ flowchart TD
     BP --> ACC --> RAIR
 ```
 
-**Key architectural property — claim bridge:** The `TxLogicAir` / `SweepTxLogicAir` proofs produce commitments over the slot indices and values they claim. `BlockStateBindingAir` takes these claimed values as public inputs and verifies each claimed slot is consistent with the actual pre-state and post-state MLE openings. Neither layer can lie about the state independently: transaction AIRs cannot touch the chain state (stateless), and `BlockStateBindingAir` cannot forge ownership (no secret).
+**Key architectural property — claim bridge:** the block verifier derives all state claims from the canonical block transaction body, not from prover-supplied state openings. For each non-coinbase transaction it checks that bucket-local `PublicInputs` equal the canonical public inputs computed from `TxBody` (`tx_body_hash`, fee, live counts, activation/deactivation bits, and `claims_commitment = H_claims(inputs, outputs)`). `BlockStateBindingAir` is then parameterized with the same `(slot_index, value, owner)` tuples and proves they match pre-state and post-state MLE openings. Neither layer can lie about the state independently: transaction AIRs are stateless, while `BlockStateBindingAir` cannot silently substitute a different owner/value from the state because verifier-side claim reconstruction rejects any tx-body/pre-state mismatch before constructing the AIR.
 
 **Production acceptance property:** A user-transaction block is valid only if the canonical `BlockProof` verifies completely: every non-empty standard/sweep bucket plus the common `BlockStateBindingAir`. The live node does not accept a user-transaction block by re-running a sequential state interpreter instead of the block proof.
 
@@ -132,9 +133,7 @@ In GF(2¹²⁸), squaring is **free** (Frobenius endomorphism: `x ↦ x²` is GF
 
     x⁷ = x · x² · x⁴       (x² and x⁴ by free squaring)
 
-The **legacy approach** decomposed this into 4 degree-2 products (auxiliary columns `x², x³, x⁴, sout`) → 8 sumchecks per slot × 59 slots = 472 sumchecks, 4,248 FS rounds, >280 KB proof.
-
-**FROST-GKR** treats `σ(x) = x⁷` as a degree-7 constraint directly. Combined with the eq polynomial (degree 1) and selector (degree 1), the round polynomial is degree 9. One unified sumcheck of 15 rounds replaces 472. **141× fewer FS rounds, >50× smaller proof.**
+**FROST-GKR** proves `σ(x) = x⁷` as a degree-7 constraint directly. Combined with the eq polynomial (degree 1) and the selector factor (degree 1 in each sumcheck variable), the unified round polynomial has degree 9. The verifier checks the resulting round polynomials through the Fiat-Shamir sumcheck loop described in §11.1.
 
 ### 5.3 Soundness of the Degree-9 Sumcheck (SC-6)
 
@@ -149,15 +148,9 @@ where:
 
 The Change-of-Variable `y = inc(x)` pre-materialises shifted tables so that all constraints are degree-9 in `y`.
 
-**Proposition (SC-6):** Under A4, if any permutation slot's witness violates any constraint at any cell, the unified sumcheck rejects with probability ≥ 1 − 135/2¹²⁸.
+**Proposition (SC-6):** Under A3 and A4, if any permutation slot's witness violates any FROST-GKR constraint at any cell, the batched constraint and unified sumcheck accept with probability at most `(3 + 15·9) / 2¹²⁸ = 138 / 2¹²⁸`.
 
-*Proof sketch.* If any constraint is violated, the composition polynomial `C1 + ρ·C1' + ρ²·C2` is nonzero on at least one hypercube point with probability 1 − 3/2¹²⁸ over ρ (S-Z). The sumcheck then catches it per round with error ≤ 9/2¹²⁸ (round poly degree 9), over 15 rounds: 15×9/2¹²⁸ = 135/2¹²⁸. □
-
-**Comparison with legacy soundness.** The legacy per-slot PermProof (superseded, documented in `noid_gkr/src/spine_sumcheck.rs` header) ran 8 degree-2 sumchecks per slot: products `x²=x·x`, `x³=x²·x`, `x´=x²·x²`, `sout=x³·x´`, plus 3 sin-expansion checks, plus 1 MDS check = 8 per slot. For 59 spine slots: 8×59 = 472 sumchecks. Each ran 9 rounds (log of 2⁹ MLE) at degree 3. Total: 472×9×3/2¹²⁸ = **12,744/2¹²⁸**.
-
-FROST-GKR total: 135 + 120 + 90 = **345/2¹²⁸**.
-
-Ratio: 12,744/345 ≈ **37× lower soundness error**. The improvement comes from eliminating 472 − 2 = 470 sumchecks; higher per-round degree (9 vs 3) contributes only a 3× penalty per round, while reducing round count by 141× yields a net 37× gain.
+*Proof sketch.* If any individual constraint is violated, the batched composition polynomial `C1 + ρ·C1' + ρ²·C2` can become the zero polynomial only if the random batching challenge `ρ` is a root of a nonzero polynomial of degree at most 3. By A4 this event has probability ≤ `3/2¹²⁸`. Conditioned on a nonzero batched polynomial, each of the 15 sumcheck rounds has round-polynomial degree at most 9, so the total sumcheck error is at most `15×9/2¹²⁸ = 135/2¹²⁸`. The union bound gives `(3+135)/2¹²⁸`. □
 
 ### 5.4 Shift Gadget
 
@@ -169,7 +162,7 @@ Three column claims collapse via `batch_eval` (random linear combination + degre
 
 **Total GKR soundness per sub-proof:**
 
-    ε_GKR = (135 + 120 + 90) / 2¹²⁸ = 345 / 2¹²⁸ ≈ 2⁻¹²⁰
+    ε_GKR ≤ (138 + 120 + 90) / 2¹²⁸ = 348 / 2¹²⁸ ≈ 2⁻¹²⁰
 
 ### 5.6 STARK–GKR Binding
 
@@ -206,7 +199,7 @@ This is the core of the aggregation security: there is no per-transaction commit
 
 ### 7.2 Deferred FRI Aggregation
 
-Instead of one FRI opening per transaction (which would scale as O(N × FRI_cost)), each bucket prover runs a **bucket-level multipoint sumcheck** that reduces that bucket's terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening (`verify_mixed_opening` in `noid_fri_binius/src/mixed_open.rs`) closes all columns of that bucket simultaneously.
+Each bucket prover runs a **bucket-level multipoint sumcheck** that reduces that bucket's terminal claims to a single evaluation point `r_block`. One FRI-Binius mixed opening (`verify_mixed_opening` in `noid_fri_binius/src/mixed_open.rs`) closes all columns of that bucket simultaneously.
 
 **Security argument (SC-2):** The multipoint sumcheck is a Schwartz-Zippel reduction. For N claims at N distinct points inside one bucket to all be simultaneously satisfiable with wrong committed values, an adversary would need to find a polynomial that disagrees with the committed columns yet satisfies every terminal claim. The probability is bounded by the sumcheck soundness over all N claims, which does not degrade with N because the claims are batched into a single evaluation via random linear combination. Soundness: 2⁻¹²⁸ from FRI (A5) + 2⁻¹²² from the multipoint sumcheck (A4).
 
@@ -226,56 +219,263 @@ Thus a forged sweep bucket must either break the wallet sweep logic proof, forge
 
 ### 7.3 Claim Bridge
 
-`TxLogicAir` and `SweepTxLogicAir` produce claimed slot indices and values for transaction inputs/outputs. `BlockStateBindingAir` takes the aggregated claimed values as public inputs and verifies them against the actual state MLE.
+The claim bridge is the equality relation between three independently bound objects:
 
-**Security of the bridge:** If a transaction claims to spend a slot with value v, but the actual state has value v' ≠ v, the `BlockStateBindingAir` delta-accumulator terminal constraint fails deterministically (not probabilistically — it is an equality check against verifier-supplied state MLE openings). The transaction AIR cannot fabricate slot values because the claims are pinned into the corresponding bucket multipoint sumcheck via the bucket interleaved commitment.
+```text
+TxBody T
+  ├─ canonical tx_body_hash(T)
+  ├─ canonical C_claims(T) = H_claims(live inputs || live outputs)
+  └─ canonical per-row claims q_i = (slot_i, value_i, owner_i, action_i)
+
+Bucket PublicInputs PI
+BlockStateBinding claims Q
+```
+
+For every non-coinbase transaction at block index `k`, `validate_public_inputs_for_tx(k, tx, pi)` checks:
+
+```text
+pi.tx_body_hash      = tx_body_hash(T)
+pi.claims_commitment = H_claims(T.inputs, T.outputs)
+pi.fee               = T.fee
+pi.n_live_*          = count(valid entries in T)
+pi.shape_id          = T.shape.id()
+pi.activation bits   = canonical bits from T        (Standard4x8)
+pi.deactivation bits = canonical bits from T        (Standard4x8)
+tx.tx_body_hash      = tx_body_hash(T)
+```
+
+`build_state_binding_airs` then rebuilds `Q` from the same `TxBody`; it does not accept claim tuples from proof bytes. For each live input it reads the verifier's sequential pre-state view and checks:
+
+```text
+state_view[inp.slot_index]
+  = (Block128(inp.value), inp.owner_hi, inp.owner_lo)
+```
+
+Only after this equality holds is a spend claim inserted into `BlockStateBindingAir`. For each live output it checks the pre-tx slot is empty before inserting a mint claim. Therefore the verifier never constructs a BSB spend claim using `(value, owner)` copied from the opened state unless it is byte-for-byte equal to the transaction's public claim.
+
+**Security of the bridge:** an adversary who changes a transaction's claimed slot/value/owner must either (a) change `tx_body_hash(T)`, (b) change `C_claims(T)`, or (c) make the verifier-side pre-state equality fail. Cases (a) and (b) are rejected deterministically by canonical public-input reconstruction before bucket verification; case (c) is rejected deterministically before `BlockStateBindingAir` is constructed. If the adversary instead forges the algebraic proof for the canonical claims, the residual error is the STARK/FRI soundness of §8 and §11.
+
+Regression guards:
+
+- `validate::tests::canonical_public_inputs_reject_wrong_tx_hash_or_claims_commitment`
+- `validate::tests::state_binding_claim_collection_rejects_input_owner_mismatch`
+- `validate::tests::state_binding_claim_collection_rejects_claim_commitment_mismatch`
+- `cargo test -p noid_block --release`
 
 ---
 
 ## 8. State Integrity: BlockStateBindingAir (SC-3)
 
-`BlockStateBindingAir` (`noid_air/src/airs/block_state_binding.rs`) proves that all slot-state transitions across a block are consistent with the pre-state and post-state MLE roots. Its two terminal constraints are the primary security anchors:
+`BlockStateBindingAir` (`noid_air/src/airs/block_state_binding.rs`) proves that the block's claimed slot updates are exactly the difference between the pre-state segment MLEs and post-state segment MLEs authenticated by the block proof.
 
-**Gamma-RLC terminal:** `acc_lane[n_slots−1] = expected_batched_claims[lane]`
+For one dirty segment, let `Q = (q_0, ..., q_{t-1})` be the verifier-reconstructed claims in canonical order. Each claim is:
 
-This pins the accumulated gamma-weighted pre-state openings (proven in-circuit) to the verifier-supplied batched claim derived from the transaction AIR outputs. A prover cannot satisfy this constraint with slot values that differ from what the transactions claimed.
+```text
+q_j = (local_slot_j, value_j, owner_hi_j, owner_lo_j, is_spend_j, is_mint_j)
+```
 
-**Delta-acc terminal:** `delta_acc_lane[n_slots−1] = prev_opening[lane] ⊕ new_opening[lane]`
+The verifier supplies:
 
-This pins the net change in the state MLE (proven in-circuit) to the difference between the pre-state and post-state FRI openings, which the verifier supplies from externally-verified state roots.
+```text
+r                := segment MLE evaluation point
+γ                := state-binding RLC challenge
+prev_opening[3]  := MLE(pre_segment.values/owners_hi/owners_lo, r)
+new_opening[3]   := MLE(post_segment.values/owners_hi/owners_lo, r)
+expected_claims  := deterministic γ-RLC of Q
+```
 
-Both terminal values are verifier-hardcoded. **A valid `BlockStateBindingAir` proof is a proof that the state root transition is correct** — given honest pre- and post-state MLE openings. The state roots come from PoW-bound block headers.
+The AIR proves, lane by lane:
 
-For production user-transaction blocks, `BlockStateBindingAir` is mandatory. A block proof that contains bucket proofs but lacks the corresponding state-binding proof is incomplete and must be rejected.
+```text
+Gamma-RLC terminal:
+  acc_lane[t−1] = expected_claims[lane]
 
-**Max constraint degree:** 3 (`TripleProductGate`, bare, `noid_air/src/gates/mul.rs`). Zero-check soundness: 11 rounds × degree-4 round polynomial / 2¹²⁸ = 44/2¹²⁸ ≈ 2⁻¹²³.
+Delta-acc terminal:
+  delta_acc_lane[t−1] = prev_opening[lane] ⊕ new_opening[lane]
+```
+
+`expected_claims`, `prev_opening`, and `new_opening` are verifier-side constants. The first terminal equation binds the AIR trace to the exact claim tuples `Q`; the second binds the net MLE delta caused by those tuples to the externally opened pre/post segment commitments.
 
 ### 8.1 Live Production Validation Path
 
 The live P2P/RPC/miner acceptance path is proof-native:
 
-1. bind proof bytes to the block header transcript;
-2. run cheap consensus checks (height, parent, timestamp, PoW/header fields, deterministic metadata);
-3. verify the full canonical `BlockProof` via `validate_block_from_network`, including every non-empty standard/sweep bucket and `BlockStateBindingAir`;
-4. commit only the proven state delta with `apply_state_delta`;
-5. write the block/header/state update atomically in `MdbxChainContext::apply_next_block`.
+1. deserialize the canonical `BlockProof`;
+2. reconstruct public transaction inputs from `TxBody` and proof bucket metadata;
+3. reconstruct `BlockStateBindingAir` instances via `build_state_binding_airs`;
+4. run cheap consensus/header checks;
+5. verify the full canonical `BlockProof`, including every non-empty standard/sweep bucket and every dirty-segment `BlockStateBindingAir`;
+6. commit only the proven state delta with `apply_state_delta`;
+7. write the block/header/state update atomically in `MdbxChainContext::apply_next_block`.
 
 `apply_block` and `validate_block_consensus` are sequential in-memory utilities for tests and local construction. They are not the live production acceptance rule for user-transaction blocks.
 
-Coinbase-only blocks are the only no-user-proof exception: there are no user slot claims to bind, so they use the canonical stub proof marker/header binding, cheap consensus checks, and deterministic coinbase `apply_state_delta` commit. This exception does not create a second validation scheme for user transactions.
+The live verifier enforces these deterministic bridge checks before accepting a proof:
 
-### 8.2 No-History Storage Security
+```text
+proof.meta.prev_block_state_root = parent.state_root
+proof.meta.new_state_root        = block.header.state_root
+block.header.proof_transcript_hash = H_canonical(BlockProof)
+```
 
-The node does not keep full raw history. Security is preserved by verifying before commit and by carrying old history forward in the recursive proof:
+For every bucket transaction, `validate_public_inputs_for_tx` recomputes canonical `PublicInputs` from the block `TxBody`. For every state-binding segment, `build_state_binding_airs` enforces:
+
+```text
+pre_opening.seg_id  = expected dirty segment id
+post_opening.seg_id = expected dirty segment id
+pre_opening.eval_point = post_opening.eval_point
+len(eval_point) = pre_state.effective_log_segment_size()
+```
+
+This prevents using a valid local-slot proof for the wrong Merkle segment. Lower-level MLE verifiers also reject `pre.seg_id != post.seg_id`.
+
+For each non-coinbase transaction, the verifier maintains a sequential public state view:
+
+```text
+read(slot) = overlay[slot] if already changed by an earlier user tx
+             else pre_state.slot(slot)
+```
+
+Then for each live input:
+
+```text
+read(inp.slot_index)
+  = (Block128(inp.value), inp.owner_hi, inp.owner_lo)
+```
+
+and for each live output before applying same-tx inputs:
+
+```text
+read(out.slot_index) = (0,0,0)
+```
+
+Only after these equalities hold are claims inserted into `Q`. Thus an attack where `TxBody` claims `(slot, value, attacker_owner)` while the real state contains `(slot, value, victim_owner)` is rejected before the AIR is built; the verifier never substitutes `victim_owner` into the claim list on behalf of the transaction.
+
+For production user-transaction blocks, `BlockStateBindingAir` is mandatory whenever there are state claims. A block proof that contains user bucket proofs but omits the corresponding dirty-segment state-binding proofs is rejected by `seg_claims.len() != proof.meta.n_state_bindings` / opening-count checks.
+
+Coinbase-only blocks are the only no-user-proof exception: there are no user slot claims to bind, so they use the canonical stub proof marker/header binding, cheap consensus checks, and deterministic coinbase `apply_state_delta` commit. In mixed user+coinbase blocks, coinbase output mints are included in the common state-binding claim set so the post-state root includes coinbase changes; they are checked empty against pre-state and are not used as spendable user inputs inside the same verifier-side state view.
+
+### 8.2 Soundness Bound
+
+The maximum BSB constraint degree remains 3 (`TripleProductGate`, bare, `noid_air/src/gates/mul.rs`). In the zero-check, the multilinear equality polynomial contributes +1 to the per-round degree, so for committed/proving log length `L`:
+
+```text
+ε_BSB_zc ≤ L · (d_max + 1) / 2^128
+          = L · 4 / 2^128
+```
+
+In the production block proof path, the state-binding AIR is padded to global `log_len = 11`, giving:
+
+```text
+ε_BSB_zc ≤ 11 · 4 / 2^128 = 44 / 2^128 ≈ 2^-123
+```
+
+The native state-binding trace may have a smaller `air.log_rows()` than the global committed length. The verifier passes the global committed `log_len` to the algebraic zero-check, and the virtual selectors in §8.3 are zero-padded to that same `L`.
+
+### 8.3 Virtual Row and Prefix Selectors
+
+`BlockStateBindingAir` uses verifier-known row and prefix selector MLEs inside its constraints (`noid_air/src/gates/virtual_selector.rs`). These selectors are deterministic functions of public AIR shape and public row/prefix indices. They are not witness columns and are not deserialized from proof bytes.
+
+Let:
+
+- `m = air.log_rows()` be the native AIR trace height;
+- `L = log_len` be the committed/proving height used by the block STARK;
+- `x = (x_0, ..., x_{L-1}) ∈ GF(2^128)^L`;
+- bit order is little-endian: bit `i` of row index uses variable `x_i`;
+- the field has characteristic 2, so `1 − x_i = 1 + x_i`.
+
+Define two deterministic selector tables of length `2^L`:
+
+```text
+R_r^{m,L}[j] = 1  iff  j_low = r and j_high = 0
+              0  otherwise
+
+P_t^{m,L}[j] = 1  iff  0 ≤ j_low < t and j_high = 0
+              0  otherwise
+```
+
+where `j_low` is the integer encoded by the low `m` bits of `j`, and `j_high` is the remaining `L−m` high-bit suffix.
+
+**Single-row selector.** For row `r < 2^m`, the verifier evaluates:
+
+```text
+χ_r^{m,L}(x)
+ = (∏_{i=0}^{m-1} ( bit_i(r) ? x_i : 1+x_i ))
+   · (∏_{i=m}^{L-1} (1+x_i))
+```
+
+**Prefix selector.** For prefix length `t`, the verifier evaluates:
+
+```text
+π_t^{m,L}(x)
+ = MLE(1_{0≤j<t})(x_0,...,x_{m-1})
+   · (∏_{i=m}^{L-1}(1+x_i))
+```
+
+The high-variable factor is part of the selector definition: it is the MLE of zero-padding from native length `2^m` to committed length `2^L`.
+
+**Lemma 1 (zero-padding MLE).** Let `S ∈ F^{2^m}` and define `S' ∈ F^{2^L}` by `S'_j = S_j` for `j < 2^m` and `S'_j = 0` otherwise. Then:
+
+```text
+MLE(S')(x_0,...,x_{L-1})
+ = MLE(S)(x_0,...,x_{m-1}) · ∏_{i=m}^{L-1}(1+x_i)
+```
+
+*Proof.* Split the hypercube sum defining `MLE(S')` into low bits `a ∈ {0,1}^m` and high bits `b ∈ {0,1}^{L-m}`. All terms with any high bit `b ≠ 0` have table value 0 by construction. The only surviving high assignment is `b = 0`, whose equality basis contribution is `∏_{i=m}^{L-1}(1+x_i)`. The remaining low-bit sum is exactly `MLE(S)`. □
+
+**Lemma 2 (selector MLE identities).** `χ_r^{m,L} = MLE(R_r^{m,L})` and `π_t^{m,L} = MLE(P_t^{m,L})`.
+
+*Proof.* `R_r^{m,L}` is the zero-padding of the native single-hot table with value 1 at row `r`. Applying Lemma 1 gives exactly `χ_r^{m,L}`. `P_t^{m,L}` is the zero-padding of the native prefix table `1_{0≤j<t}`. Applying Lemma 1 gives exactly `π_t^{m,L}`. □
+
+**Theorem (deterministic selector soundness).** The selector factors in `BlockStateBindingAir` give the prover no additional degree of freedom and do not weaken the BSB soundness bound in §8.2.
+
+*Proof.* For fixed public `(r, t, m, L)` and zero-check point `x`, the values `χ_r^{m,L}(x)` and `π_t^{m,L}(x)` are uniquely determined by Lemma 2. The prover can choose witness column openings, but cannot choose or bias selector openings because there are no selector openings in the proof. The verified relation is therefore the fixed polynomial relation
+
+```text
+F_BSB(witness_openings; χ_r^{m,L}(x), π_t^{m,L}(x), public_constants) = 0
+```
+
+with selector values computed by the verifier. If a witness violates the BSB relation, the composed constraint polynomial is nonzero, and the zero-check catches it with probability bounded by §8.2. □
+
+**Degree.** For the zero-check round-polynomial bound, each selector factor is multilinear in the hypercube variables, so it adds at most one to the per-variable degree of a wrapped constraint:
+
+```text
+deg_round(selector · inner) ≤ 1 + deg_round(inner)
+```
+
+Selector-wrapped BSB linear constraints have round degree at most 2. The BSB maximum remains the bare degree-3 `TripleProductGate`; with the multilinear equality factor the zero-check round degree remains 4.
+
+**Privacy.** Virtual selectors depend only on public shape data: row index or prefix length, `air.log_rows()`, and global `log_len`. They do not depend on `spend_secret`, witness values, transaction private data, state openings, or Merkle authentication data. They are verifier-internal deterministic evaluations, not serialized proof data and not additional Fiat-Shamir transcript inputs.
+
+Regression guards in `noid_air/src/gates/virtual_selector.rs`:
+
+- `virtual_row_selector_matches_single_hot_mle`
+- `virtual_row_selector_matches_zero_padded_single_hot_mle`
+- `virtual_row_selector_flat_matches_tower`
+- `virtual_prefix_selector_matches_multi_hot_mle`
+- `virtual_prefix_selector_matches_zero_padded_multi_hot_mle`
+- `virtual_prefix_selector_flat_matches_tower`
+- `virtual_row_gate_fires_only_on_native_target_row`
+- `virtual_prefix_gate_fires_on_native_prefix_only`
+
+State-binding guards:
+
+- `cargo test -p noid_air virtual_ --release`
+- `cargo test -p noid_air block_state_binding --release`
+- `cargo test -p noid_block --release`
+
+### 8.4 No-History Storage Security
+
+The node does not keep full raw history. Security is preserved by verifying before commit and by carrying accumulated chain history forward in the recursive proof:
 
 - headers are retained long-term;
 - current state segments and roots are persisted;
 - recent raw blocks, block proofs, and undo logs are retained only for `FINALITY_DEPTH = 18` blocks;
 - nullifier and transaction-index data are retained for the anchor window (`ANCHOR_DEPTH = 144`);
-- history older than the recent window is represented by the recursive chain proof and header chain;
+- chain history outside the recent window is represented by the recursive chain proof and header chain;
 - a peer that is more than the recent window behind must use snapshot sync, then verify the snapshot root/recursive proof before continuing block-by-block.
 
-Pruning old raw block/proof bytes after finality does not weaken block validity: the proof-native checks happened before the block was committed, and the recursive accumulator carries the verified chain claim forward.
+Pruning finalized raw block/proof bytes after finality does not weaken block validity: the proof-native checks happened before the block was committed, and the recursive accumulator carries the verified chain claim forward.
 
 ---
 
@@ -373,7 +573,7 @@ For RecursiveBlockAir: d_max = 4 (selector-gated degree-3 Lagrange fold), n_cols
     inner      = compress(block_hash, claim_bytes)    // encodes canonical chain_claim
     chain_hash = compress(prev_chain_hash, inner)
 
-The recursive step now distinguishes two claims:
+The recursive step distinguishes two claims:
 
 - `block_initial_claim`: the primary bucket-local multipoint sumcheck target checked by `RecursiveBlockAir` through `claim_in = p0 + p1` and degree-2 Lagrange fold constraints over `[p(0), p(1), p(2)]` using the real replayed Fiat-Shamir challenges. Mixed blocks additionally bind `block_secondary_initial_claim` in the secondary bucket lane.
 - `chain_claim`: the canonical block proof claim folded into `ChainAccumulator`; for bucketized blocks this is derived from the canonical block proof transcript hash, not from one shape-local sumcheck.
@@ -426,7 +626,7 @@ The claim SC-5 is one-wayness: the secret cannot be recovered from the proof. Th
 
 *Implementation note.* The `SpendSecret` struct has `ZeroizeOnDrop` and no `Copy` trait (`noid_poseidon2b/src/primitives.rs`). Its `Debug` impl emits `[REDACTED]`. These are engineering safeguards against accidental exposure in logs and stack copies. They are not part of the cryptographic security argument.
 
-### 10.3 Nullifiers
+### 10.4 Nullifiers
 
 Nullifiers are `TxBodyHash` values. `hash_tx_body` (`noid_tx/src/body_hash.rs`) hashes `(epoch_anchor, fee, inputs_public, outputs, is_coinbase)`. `inputs_public` uses `TxInput::encode_public`, which has no `spend_secret` field. Nullifiers are pure functions of public transaction data.
 
@@ -438,7 +638,7 @@ Nullifiers are `TxBodyHash` values. `hash_tx_body` (`noid_tx/src/body_hash.rs`) 
 
 | Component | Rounds × Degree | ε | Bits |
 |-----------|----------------|---|------|
-| **GKR unified sumcheck** (Spine+Auth) | 15 × 9 | 135/2¹²⁸ | **~120** |
+| **GKR unified sumcheck + constraint RLC** (Spine/Auth) | 15 × 9 + 3 | 138/2¹²⁸ | **~120** |
 | GKR shift gadget | 15 × 8 | 120/2¹²⁸ | ~120 |
 | GKR batch-eval (3 columns) | 3 × 15 × 2 | 90/2¹²⁸ | ~121 |
 | TxLogicAir zero-check | 11 × 5 | 55/2¹²⁸ | 122 |
@@ -448,7 +648,7 @@ Nullifiers are `TxBodyHash` values. `hash_tx_body` (`noid_tx/src/body_hash.rs`) 
 | Tensor PCS (n_rounds=0) | — | (n_cols+1)/2¹²⁸ | 128 |
 | Chain accumulator / compress | — | 2⁻¹²⁸ | 128 |
 | Privacy (spend_secret) | — | 2⁻¹²⁸ | 128 |
-| **System** | — | **~400/2¹²⁸** | **~120** |
+| **System** | — | **≤500/2¹²⁸** | **~119–120** |
 
 **Why union bound is valid with shared FS challenges.**
 
@@ -465,7 +665,7 @@ It does, and the argument is per-round, not per-protocol. In each sumcheck round
 
 The prover cannot see `r_i` before committing `rp_i` — this is enforced by the hash absorb/squeeze order in `verify_algebraic_inner` and all GKR sumcheck loops. If the prover sends a wrong round polynomial `rp_i ≠ q_i` (the honest polynomial), then `rp_i − q_i` is a nonzero polynomial of degree ≤ d. By A4, `Pr[r_i is a root] ≤ d/2¹²⁸`.
 
-This bound holds **regardless of what came before in the transcript**: previous challenges `r_0, ..., r_{i-1}` appear in the hash state that produces `r_i`, but they do not constrain which values of `r_i` would expose a wrong polynomial. For any fixed wrong `rp_i ≠ q_i`, the challenge `r_i = Hash(transcript || rp_i)` is pseudorandom by A3 (Blake3 ROM), so the detection probability per round is exactly `d/2¹²⁸`.
+This bound holds **regardless of earlier transcript state**: earlier challenges `r_0, ..., r_{i-1}` appear in the hash state that produces `r_i`, but they do not constrain which values of `r_i` would expose a wrong polynomial. For any fixed wrong `rp_i ≠ q_i`, the challenge `r_i = Hash(transcript || rp_i)` is pseudorandom by A3 (Blake3 ROM), so the detection probability per round is exactly `d/2¹²⁸`.
 
 The union bound `ε_total ≤ Σ ε_i` applies because we are asking for the probability that **any single check fails to catch a cheating prover** — i.e., the union over all rounds. This does not require independence between rounds; it requires only that each round has bounded failure probability, which holds from the per-round argument above.
 
@@ -477,7 +677,7 @@ This is the standard Schwartz-Zippel sumcheck analysis applied round-by-round in
 
 **Layer boundary binding (GKR ↔ AIR ↔ PCS).** The three abstraction layers share one transcript and are bound at explicit interface points: GKR outputs are embedded in AIR `PublicColumn` values (checked deterministically by `check_public_columns` before composition runs); AIR terminal identity links the zero-check output to the PCS evaluation (proven in §9.2 Theorem). Each interface is proven in this document by tracing the actual verifier code and verifying that the FS-channel absorb/squeeze ordering enforces the required commitment semantics at each boundary. A unified IOP-level formalization of all three layers as a single relation is a known open direction in proof system theory, not specific to this construction.
 
-The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zero-checks contribute ≤55/2¹²⁸. Total system error ≤ 400/2¹²⁸ ≈ 2⁻¹²⁰. This exceeds the 100-bit production threshold.
+The system bottleneck is the FROST-GKR relation check at 138/2¹²⁸; the full GKR sub-proof bound is 348/2¹²⁸ after shift and batch-eval reductions. All STARK zero-checks contribute at most 55/2¹²⁸ each. A conservative aggregate bound is ≤500/2¹²⁸ ≈ 2⁻¹¹⁹, which exceeds the 100-bit production threshold.
 
 ### 11.2 Security Claims Disposition
 
@@ -485,21 +685,22 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 |----|-------|--------|----------|
 | SC-1 | Forged tx proof cannot pass | **Proved** | GKR soundness (§5.3) + STARK soundness (§6) |
 | SC-2 | Block aggregation cannot be selectively forged | **Proved** | Interleaved commitment + multipoint sumcheck (§7) |
-| SC-3 | Wrong state transitions cannot pass | **Proved** | BSB terminal constraints (§8) |
+| SC-3 | Wrong state transitions cannot pass | **Proved** | Canonical tx/body claim bridge + root/meta checks + BSB terminal constraints (§7.3, §8) |
 | SC-4 | Forged state_root/chain_hash cannot pass | **Proved** | RecursiveBlockAir + accumulator (§9) |
 | SC-5 | spend_secret cannot be extracted | **Proved (one-wayness)** | Poseidon2b preimage resistance; transcript contains MLE evals of execution trace, not raw secret (§10.2) |
-| SC-6 | Degree-9 sumcheck is sound | **Proved** | Schwartz-Zippel; lower error than legacy (§5.3) |
+| SC-6 | Degree-9 sumcheck is sound | **Proved** | Schwartz-Zippel plus Fiat-Shamir absorb-then-squeeze ordering (§5.3, §11.1) |
 
-### 11.3 Non-Standard Design Choices
+### 11.3 Load-Bearing Design Choices
 
 | Choice | Why it is secure |
 |--------|-----------------|
-| FROST-GKR degree-9 sumcheck | Schwartz-Zippel applies for any degree; total error 345/2¹²⁸ is lower than legacy 12,744/2¹²⁸ (§5.3) |
+| FROST-GKR degree-9 sumcheck | Schwartz-Zippel applies to the committed round polynomial degree; constraint RLC plus 15 degree-9 rounds give 138/2¹²⁸ for the relation check (§5.3) |
 | n_rounds=0 in RecursiveBlockAir | 2⁸-point polynomial is fully determined by its table; tensor check is exact, not approximate (§9.2) |
 | Per-bucket FRI opening for N same-shape txs | Bucket interleaved commitment binds all traces of that shape at once; multipoint sumcheck batches all bucket claims (§7.2) |
-| Stateless LogicProof | Claim bridge binds stateless ownership proof to stateful `BlockStateBindingAir` (§7.3) |
+| Stateless LogicProof | Canonical verifier-side claim bridge binds stateless ownership proof to stateful `BlockStateBindingAir` (§7.3, §8.1) |
+| BSB virtual selectors | Verifier-known zero-padded selector MLEs are deterministic functions of public AIR shape; same max round degree and no private inputs (§8.3) |
 | Coinbase-only stub proof | No user slot openings exist, so no `BlockStateBindingAir` is required; the canonical stub marker is header-bound and the deterministic coinbase delta is checked before `apply_state_delta` (§8.1, §9.3) |
-| ~120-bit system soundness | Bottleneck is GKR, which exceeds the 100-bit production threshold and is 37× better than legacy |
+| ~119–120-bit system soundness | Conservative aggregate soundness remains above the 100-bit production threshold (§11.1) |
 
 ---
 
@@ -542,6 +743,8 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 | `MdbxChainContext::apply_next_block` | `noid_chain/src/storage/mdbx_context.rs` | Atomic proof-native block application |
 | `apply_state_delta` | `noid_chain/src/block.rs` | Proven state-delta commit primitive |
 | `BlockStateBindingAir` | `noid_air/src/airs/block_state_binding.rs` | Mandatory user-tx state transition proof |
+| `VirtualRowSelectorGate`, `VirtualPrefixSelectorGate` | `noid_air/src/gates/virtual_selector.rs` | Verifier-known BSB selector MLEs |
+| `validate_public_inputs_for_tx`, `collect_state_binding_claims` | `noid_block/src/validate.rs` | Canonical claim bridge and verifier-side state precondition checks |
 | `RecursiveBlockAir::from_prev_state_root` | `noid_recursive/src/air.rs` | State-root pin from PoW header |
 | `ChainAccumulator::extend` | `noid_recursive/src/accumulator.rs` | Chain hash fold |
 | `verify_recursive_step`, `verify_tip` | `noid_recursive/src/verify.rs` | Recursive verifier |
@@ -551,4 +754,4 @@ The system bottleneck is the GKR unified sumcheck at 135/2¹²⁸. All STARK zer
 
 ---
 
-*All security arguments in this document reduce to the assumptions in §2 and are grounded in the production code. Cryptographic protocol detail: `docs/cryptography.md`. System and network/storage architecture: `docs/protocol.md`, `docs/network.md`.*
+*All security arguments in this document reduce to the assumptions in §3 and are grounded in the production code. Cryptographic protocol detail: `docs/cryptography.md`. System and network/storage architecture: `docs/protocol.md`, `docs/network.md`.*

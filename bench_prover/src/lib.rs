@@ -900,7 +900,8 @@ pub fn bench_full_block_proof(
         if proof.sweep_bucket.is_some() {
             verify_sweep_bucket_from_block(&block, &proof).expect("verify sweep bucket from block");
         }
-        let sb_airs = noid_block::build_state_binding_airs(&block, &proof, &pre_state.state);
+        let sb_airs = noid_block::build_state_binding_airs(&block, &proof, &pre_state.state)
+            .expect("build verifier state binding AIRs");
         let sb_refs: Vec<&noid_air::airs::block_state_binding::BlockStateBindingAir> =
             sb_airs.iter().collect();
         if proof.standard_bucket.is_some() {

@@ -12,6 +12,7 @@ pub mod linear;
 pub mod mul;
 pub mod row_selector;
 pub mod selector;
+pub mod virtual_selector;
 
 pub use bool::BoolGate;
 pub use const_column::PublicColumn;
@@ -24,3 +25,4 @@ pub use row_selector::{
     row_indicator_programme,
 };
 pub use selector::SelectorGate;
+pub use virtual_selector::{VirtualPrefixSelectorGate, VirtualRowSelectorGate};

@@ -71,7 +71,8 @@ pub use gates::{
     emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector, emit_public_cell,
     emit_row_selector, emit_rows_must_be_zero, multi_row_indicator_programme,
     row_indicator_programme, BoolGate, EqLadderStepGate, MulGate, PublicColumn, SelectorGate,
-    SquareGate, WeightedLinearGate, WeightedLinearGateShifted,
+    SquareGate, VirtualPrefixSelectorGate, VirtualRowSelectorGate, WeightedLinearGate,
+    WeightedLinearGateShifted,
 };
 
 use std::borrow::Cow;
@@ -436,6 +437,44 @@ pub trait Constraint: Send + Sync {
     /// Evaluate the constraint on the given frame.
     fn evaluate(&self, frame: EvalFrame) -> Block128;
 
+    /// Whether this constraint needs the current AIR row / sumcheck point
+    /// in order to evaluate. Ordinary constraints depend only on committed
+    /// column values; virtual selectors override this so the STARK layer
+    /// supplies deterministic selector values without committing selector
+    /// columns.
+    fn needs_eval_point(&self) -> bool {
+        false
+    }
+
+    /// Row-aware native evaluator. Default preserves legacy semantics.
+    fn evaluate_row(&self, frame: EvalFrame, _row: usize, _log_rows: usize) -> Block128 {
+        self.evaluate(frame)
+    }
+
+    /// Point-aware tower-basis evaluator used by verifier composition.
+    /// `point` is the full committed-domain point (possibly longer than
+    /// `log_rows` when the AIR trace was zero-padded for proving).
+    fn evaluate_at_point(
+        &self,
+        frame: EvalFrame,
+        _point: &[Block128],
+        _log_rows: usize,
+    ) -> Block128 {
+        self.evaluate(frame)
+    }
+
+    /// Point-aware flat-basis evaluator used by the zero-check prover hot
+    /// loop. `point_flat` is the same point as [`evaluate_at_point`], but
+    /// in the flat/GCM basis.
+    fn evaluate_flat_at_point(
+        &self,
+        frame: FlatEvalFrame,
+        _point_flat: &[u128],
+        _log_rows: usize,
+    ) -> u128 {
+        self.evaluate_flat(frame)
+    }
+
     /// [2.C.1] Flat-basis evaluator — default implementation converts
     /// the flat inputs back to tower, delegates to `evaluate`, and
     /// converts the result back to flat. Bit-identical to the
@@ -589,6 +628,7 @@ pub trait Air: Send + Sync {
             return false;
         }
         let n = trace.n_rows();
+        let log_rows = self.log_rows();
 
         // Public-column pin-check — same linear scan, same order as the
         // reference implementation.
@@ -682,7 +722,7 @@ pub trait Air: Send + Sync {
                         local: local_buf,
                         next: next_buf,
                     };
-                    if c.evaluate(frame) != Block128::ZERO {
+                    if c.evaluate_row(frame, row, log_rows) != Block128::ZERO {
                         return true;
                     }
                 }
@@ -704,6 +744,7 @@ pub fn check_legacy<A: Air + ?Sized>(air: &A, trace: &Trace) -> bool {
         return false;
     }
     let n = trace.n_rows();
+    let log_rows = air.log_rows();
     for pc in air.public_columns() {
         if pc.col >= air.n_columns() || pc.values.len() != n {
             return false;
@@ -727,7 +768,7 @@ pub fn check_legacy<A: Air + ?Sized>(air: &A, trace: &Trace) -> bool {
                 local: &local,
                 next: &next,
             };
-            if c.evaluate(frame) != Block128::ZERO {
+            if c.evaluate_row(frame, row, log_rows) != Block128::ZERO {
                 return false;
             }
         }

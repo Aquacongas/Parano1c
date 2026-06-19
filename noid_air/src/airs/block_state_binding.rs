@@ -36,14 +36,15 @@
 //! - Fused `TripleProductGate` for `eq_delta_lane = eq_{L-1} · live_mask ·
 //!   delta_lane` — eliminates 3 intermediate columns.
 //! - `EqLadderStepGate` for eq-ladder — eliminates L-1 intermediate columns.
-//! - Shared row indicators across boundary pins — amortises MLE re-eval.
-//! - Shared `acc_step_indicator` for both gamma-acc and delta-acc recurrences.
+//! - Virtual row selectors across boundary pins — no committed row-indicator slab.
+//! - Virtual prefix selector for both gamma-acc and delta-acc recurrences.
 //! - PublicColumn for eval_point and gamma_powers — verifier computes, prover
 //!   pins without extra constraints.
 
 use crate::gates::{
-    multi_row_indicator_programme, row_indicator_programme, BoolGate, EqLadderStepGate, MulGate,
-    PublicColumn, SelectorGate, TripleProductGate, WeightedLinearGate, WeightedLinearGateShifted,
+    BoolGate, EqLadderStepGate, MulGate, PublicColumn, SelectorGate, TripleProductGate,
+    VirtualPrefixSelectorGate, VirtualRowSelectorGate, WeightedLinearGate,
+    WeightedLinearGateShifted,
 };
 use crate::{Air, Constraint};
 use noid_core::{Block128, TowerField};
@@ -87,8 +88,9 @@ pub const BLOCK_STATE_BINDING_N_ROWS: usize = 1 << BLOCK_STATE_BINDING_LOG_ROWS;
 //   gamma_powers                         — γ^row (PublicColumn)
 //   gp_value, gp_hi, gp_lo              — fused: γ^i · eq_{L-1} · opened_pre_lane
 //   acc_value, acc_hi, acc_lo            — gamma-RLC prefix-sum
-//   row_indicator_0 .. row_indicator_{N-1} — shared single-hot indicators
-//   acc_step_indicator                   — multi-hot for shifted recurrences
+//
+// Single-row boundary selectors and the accumulator step prefix selector are
+// virtual verifier-known MLEs, not committed trace columns.
 
 pub const COL_VALUE: usize = 0;
 pub const COL_OWNER_HI: usize = 1;
@@ -117,8 +119,6 @@ pub const COL_EVAL_POINT_BASE_OFFSET: usize = 15;
 // gamma_powers at eq_ladder_base + log_slots
 // gp lanes at gamma_powers + 1
 // acc lanes at gp + 3
-// row indicators at acc + 3
-// acc_step_indicator at row_indicators + n_live_slots
 
 // =============================================================================
 // Layout
@@ -150,10 +150,9 @@ impl BlockStateBindingLayout {
     pub const fn n_cols(&self) -> usize {
         // 3 claim lanes + log_slots idx bits + 15 fixed columns
         // + log_slots eval_point + log_slots eq_ladder + 1 gamma_powers
-        // + 3 gp lanes + 3 acc lanes + n_rows row indicators + 1 acc_step
-        // n_rows is FIXED per block (same log_rows for all segments),
-        // ensuring all state binding AIRs have identical n_cols.
-        3 + self.log_slots + 15 + self.log_slots + self.log_slots + 1 + 3 + 3 + self.n_rows() + 1
+        // + 3 gp lanes + 3 acc lanes.
+        // Row selectors are virtual verifier-known polynomials.
+        3 + self.log_slots + 15 + self.log_slots + self.log_slots + 1 + 3 + 3
     }
 
     // Column accessors
@@ -242,14 +241,6 @@ impl BlockStateBindingLayout {
     }
     pub const fn col_acc_owner_lo(&self) -> usize {
         self.col_gamma_powers() + 6
-    }
-
-    pub const fn col_row_indicator(&self, r: usize) -> usize {
-        self.col_gamma_powers() + 7 + r
-    }
-
-    pub const fn col_acc_step_indicator(&self) -> usize {
-        self.col_gamma_powers() + 7 + self.n_rows()
     }
 }
 
@@ -392,28 +383,20 @@ impl BlockStateBindingWitness {
     pub fn expected_batched_claims(&self) -> [Block128; 3] {
         let mut gamma_pow = Block128::ONE;
         let mut acc = [Block128::ZERO; 3];
-        let n_rows = self.layout.n_rows();
-        for i in 0..n_rows {
-            let claim = if i < self.claims.len() {
-                &self.claims[i]
-            } else {
-                &BlockStateBindingClaim::EMPTY
-            };
-            let (pre_value, pre_hi, pre_lo) = if claim.is_spend {
-                (claim.value, claim.owner_hi, claim.owner_lo)
-            } else {
-                (Block128::ZERO, Block128::ZERO, Block128::ZERO)
-            };
-            let mut eq = Block128::ONE;
-            let mut idx = claim.slot_index as usize;
-            for k in 0..self.layout.log_slots {
-                let bit = Block128::from((idx & 1) as u128);
-                idx >>= 1;
-                eq *= Block128::ONE + self.eval_point[k] + bit;
+        for claim in &self.claims {
+            if claim.is_spend {
+                let mut eq = Block128::ONE;
+                let mut idx = claim.slot_index as usize;
+                for k in 0..self.layout.log_slots {
+                    let bit = Block128::from((idx & 1) as u128);
+                    idx >>= 1;
+                    eq *= Block128::ONE + self.eval_point[k] + bit;
+                }
+                let factor = gamma_pow * eq;
+                acc[0] += factor * claim.value;
+                acc[1] += factor * claim.owner_hi;
+                acc[2] += factor * claim.owner_lo;
             }
-            acc[0] += gamma_pow * eq * pre_value;
-            acc[1] += gamma_pow * eq * pre_hi;
-            acc[2] += gamma_pow * eq * pre_lo;
             gamma_pow *= self.gamma;
         }
         acc
@@ -423,13 +406,7 @@ impl BlockStateBindingWitness {
     ///   `new_lane = prev_lane + Σ_i eq(r, slot_bits_i) · live_i · delta_lane_i`
     pub fn expected_new_lane_openings(&self, prev: [Block128; 3]) -> [Block128; 3] {
         let mut acc = [Block128::ZERO; 3];
-        let n_rows = self.layout.n_rows();
-        for i in 0..n_rows {
-            let claim = if i < self.claims.len() {
-                &self.claims[i]
-            } else {
-                &BlockStateBindingClaim::EMPTY
-            };
+        for claim in &self.claims {
             if !claim.live() {
                 continue;
             }
@@ -453,23 +430,19 @@ impl BlockStateBindingWitness {
         let n_cols = layout.n_cols();
         let n_rows = layout.n_rows();
         let log_slots = layout.log_slots;
-        let n_slots = layout.n_slots;
 
         let mut cols = vec![vec![Block128::ZERO; n_rows]; n_cols];
 
-        // Pad claims to trace height
-        let mut padded_claims: Vec<BlockStateBindingClaim> = self.claims.clone();
-        padded_claims.resize(n_rows, BlockStateBindingClaim::EMPTY);
-
-        // Compute gamma powers: γ^0, γ^1, ..., γ^{n_rows-1}
-        let mut gamma_powers = vec![Block128::ONE; n_rows];
-        for i in 1..n_rows {
-            gamma_powers[i] = gamma_powers[i - 1] * self.gamma;
-        }
-
-        // Fill columns row by row
+        // Fill columns row by row. Padding rows use the all-zero EMPTY claim
+        // without materialising a cloned-and-resized claims vector.
+        let mut gamma_pow = Block128::ONE;
+        let gamma_col = layout.col_gamma_powers();
         for row in 0..n_rows {
-            let claim = &padded_claims[row];
+            let claim = self
+                .claims
+                .get(row)
+                .unwrap_or(&BlockStateBindingClaim::EMPTY);
+            cols[gamma_col][row] = gamma_pow;
 
             // Claim triple
             cols[COL_VALUE][row] = claim.value;
@@ -516,12 +489,14 @@ impl BlockStateBindingWitness {
             cols[layout.col_eq_delta_owner_lo()][row] = eq_tail * live_f * claim.delta_owner_lo;
 
             // Gamma-weighted MLE product: gp_lane = γ^i · eq_{L-1} · opened_pre_lane
-            let gp_factor = gamma_powers[row] * eq_tail;
+            let gp_factor = gamma_pow * eq_tail;
             cols[layout.col_gp_value()][row] = gp_factor * cols[layout.col_opened_pre_value()][row];
             cols[layout.col_gp_owner_hi()][row] =
                 gp_factor * cols[layout.col_opened_pre_owner_hi()][row];
             cols[layout.col_gp_owner_lo()][row] =
                 gp_factor * cols[layout.col_opened_pre_owner_lo()][row];
+
+            gamma_pow *= self.gamma;
         }
 
         // Prefix-sum accumulators (gamma-RLC)
@@ -566,29 +541,6 @@ impl BlockStateBindingWitness {
             for row in 0..n_rows {
                 cols[col][row] = self.eval_point[k];
             }
-        }
-
-        // Public column: gamma_powers
-        let gp_col = layout.col_gamma_powers();
-        for row in 0..n_rows {
-            cols[gp_col][row] = gamma_powers[row];
-        }
-
-        // Row indicators (single-hot) — one column per row in the trace.
-        for r in 0..n_rows {
-            let col = layout.col_row_indicator(r);
-            let prog = row_indicator_programme(r, n_rows);
-            for (i, v) in prog.iter().enumerate() {
-                cols[col][i] = *v;
-            }
-        }
-
-        // Acc-step indicator: multi-hot on rows 0..n_slots-1
-        let step_col = layout.col_acc_step_indicator();
-        let step_rows: Vec<usize> = (0..n_slots.saturating_sub(1)).collect();
-        let step_prog = multi_row_indicator_programme(&step_rows, n_rows);
-        for (i, v) in step_prog.iter().enumerate() {
-            cols[step_col][i] = *v;
         }
 
         cols
@@ -821,33 +773,23 @@ impl BlockStateBindingAir {
         // 9. Gamma-RLC prefix-sum: acc_lane[0] = gp_lane[0] (row-0 pin)
         //    acc_lane[i+1] = acc_lane[i] + gp_lane[i+1] (shifted recurrence)
         // =====================================================================
-        // Row-0 pins: acc_lane[0] + gp_lane[0] == 0 (gated by row_indicator(0))
-        let row0_prog = row_indicator_programme(0, n_rows);
-        let row0_col = layout.col_row_indicator(0);
-        public_columns.push(PublicColumn {
-            col: row0_col,
-            values: row0_prog.clone(),
-        });
+        // Row-0 pins: acc_lane[0] + gp_lane[0] == 0 (virtual row selector).
+        let row0 = 0usize;
 
         for (acc_c, gp_c) in [
             (layout.col_acc_value(), layout.col_gp_value()),
             (layout.col_acc_owner_hi(), layout.col_gp_owner_hi()),
             (layout.col_acc_owner_lo(), layout.col_gp_owner_lo()),
         ] {
-            constraints.push(Box::new(SelectorGate::new(
-                row0_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                row0,
                 Box::new(WeightedLinearGate::new_xor(vec![acc_c, gp_c])),
             )));
         }
 
-        // Shifted recurrence: acc[i+1] = acc[i] + gp[i+1], gated by step indicator
-        let step_rows: Vec<usize> = (0..n_slots.saturating_sub(1)).collect();
-        let step_prog = multi_row_indicator_programme(&step_rows, n_rows);
-        let step_col = layout.col_acc_step_indicator();
-        public_columns.push(PublicColumn {
-            col: step_col,
-            values: step_prog,
-        });
+        // Shifted recurrence: acc[i+1] = acc[i] + gp[i+1], gated by a
+        // virtual prefix selector on rows 0..n_slots-1.
+        let step_end = n_slots.saturating_sub(1);
 
         for (acc_c, gp_c) in [
             (layout.col_acc_value(), layout.col_gp_value()),
@@ -855,8 +797,8 @@ impl BlockStateBindingAir {
             (layout.col_acc_owner_lo(), layout.col_gp_owner_lo()),
         ] {
             // acc[i] + acc[i+1] + gp[i+1] == 0 (char-2 XOR addition)
-            constraints.push(Box::new(SelectorGate::new(
-                step_col,
+            constraints.push(Box::new(VirtualPrefixSelectorGate::new(
+                step_end,
                 Box::new(WeightedLinearGateShifted::new(
                     vec![(acc_c, Block128::ONE)],
                     vec![(acc_c, Block128::ONE), (gp_c, Block128::ONE)],
@@ -867,22 +809,14 @@ impl BlockStateBindingAir {
 
         // Terminal closure: acc_lane[n_slots-1] == expected_batched_claims[lane]
         let terminal_row = n_slots.saturating_sub(1);
-        let terminal_prog = row_indicator_programme(terminal_row, n_rows);
-        let terminal_col = layout.col_row_indicator(terminal_row);
-        if terminal_row != 0 {
-            public_columns.push(PublicColumn {
-                col: terminal_col,
-                values: terminal_prog,
-            });
-        }
 
         for (lane, acc_c) in [
             (0, layout.col_acc_value()),
             (1, layout.col_acc_owner_hi()),
             (2, layout.col_acc_owner_lo()),
         ] {
-            constraints.push(Box::new(SelectorGate::new(
-                terminal_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                terminal_row,
                 Box::new(WeightedLinearGate::new(
                     vec![(acc_c, Block128::ONE)],
                     expected_batched_claims[lane],
@@ -907,14 +841,14 @@ impl BlockStateBindingAir {
             ),
         ] {
             // Row-0: delta_acc[0] + eq_delta[0] == 0
-            constraints.push(Box::new(SelectorGate::new(
-                row0_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                row0,
                 Box::new(WeightedLinearGate::new_xor(vec![delta_acc_c, eq_delta_c])),
             )));
 
             // Shifted recurrence
-            constraints.push(Box::new(SelectorGate::new(
-                step_col,
+            constraints.push(Box::new(VirtualPrefixSelectorGate::new(
+                step_end,
                 Box::new(WeightedLinearGateShifted::new(
                     vec![(delta_acc_c, Block128::ONE)],
                     vec![(delta_acc_c, Block128::ONE), (eq_delta_c, Block128::ONE)],
@@ -931,8 +865,8 @@ impl BlockStateBindingAir {
             (2, layout.col_delta_acc_owner_lo()),
         ] {
             let expected_delta = prev_lane_openings[lane] + new_lane_openings[lane];
-            constraints.push(Box::new(SelectorGate::new(
-                terminal_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                terminal_row,
                 Box::new(WeightedLinearGate::new(
                     vec![(delta_acc_c, Block128::ONE)],
                     expected_delta,
@@ -965,35 +899,25 @@ impl BlockStateBindingAir {
         // Boundary pins: claim triple values on live rows
         // =====================================================================
         for (r, claim) in claims.iter().enumerate() {
-            let ind_col = layout.col_row_indicator(r);
-            // Only emit indicators we haven't already pushed (row 0, terminal)
-            if r != 0 && r != terminal_row {
-                let prog = row_indicator_programme(r, n_rows);
-                public_columns.push(PublicColumn {
-                    col: ind_col,
-                    values: prog,
-                });
-            }
-
             // Pin claim.value at row r
-            constraints.push(Box::new(SelectorGate::new(
-                ind_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                r,
                 Box::new(WeightedLinearGate::new(
                     vec![(COL_VALUE, Block128::ONE)],
                     claim.value,
                 )),
             )));
             // Pin claim.owner_hi at row r
-            constraints.push(Box::new(SelectorGate::new(
-                ind_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                r,
                 Box::new(WeightedLinearGate::new(
                     vec![(COL_OWNER_HI, Block128::ONE)],
                     claim.owner_hi,
                 )),
             )));
             // Pin claim.owner_lo at row r
-            constraints.push(Box::new(SelectorGate::new(
-                ind_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                r,
                 Box::new(WeightedLinearGate::new(
                     vec![(COL_OWNER_LO, Block128::ONE)],
                     claim.owner_lo,
@@ -1003,8 +927,8 @@ impl BlockStateBindingAir {
             // Pin idx bits at row r
             for b in 0..log_slots {
                 let bit_val = Block128::from(((claim.slot_index >> b) & 1) as u128);
-                constraints.push(Box::new(SelectorGate::new(
-                    ind_col,
+                constraints.push(Box::new(VirtualRowSelectorGate::new(
+                    r,
                     Box::new(WeightedLinearGate::new(
                         vec![(layout.col_idx_bit(b), Block128::ONE)],
                         bit_val,
@@ -1013,32 +937,20 @@ impl BlockStateBindingAir {
             }
 
             // Pin is_spend, is_mint at row r
-            constraints.push(Box::new(SelectorGate::new(
-                ind_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                r,
                 Box::new(WeightedLinearGate::new(
                     vec![(layout.col_is_spend(), Block128::ONE)],
                     Block128::from(claim.is_spend as u128),
                 )),
             )));
-            constraints.push(Box::new(SelectorGate::new(
-                ind_col,
+            constraints.push(Box::new(VirtualRowSelectorGate::new(
+                r,
                 Box::new(WeightedLinearGate::new(
                     vec![(layout.col_is_mint(), Block128::ONE)],
                     Block128::from(claim.is_mint as u128),
                 )),
             )));
-        }
-
-        // Remaining row indicators for rows that had no claims (padding rows)
-        for r in claims.len()..n_rows {
-            if r != 0 && r != terminal_row {
-                let ind_col = layout.col_row_indicator(r);
-                let prog = row_indicator_programme(r, n_rows);
-                public_columns.push(PublicColumn {
-                    col: ind_col,
-                    values: prog,
-                });
-            }
         }
 
         Self {
@@ -1060,12 +972,13 @@ impl BlockStateBindingAir {
         (self.n_cols, self.constraints, self.public_columns)
     }
 
-    /// Build the full trace from a witness, overlaying public columns.
+    /// Build the full trace from a witness.
     pub fn build_trace(&self, witness: &BlockStateBindingWitness) -> Vec<Vec<Block128>> {
-        let mut cols = witness.build_columns();
-        for pc in &self.public_columns {
-            cols[pc.col] = pc.values.clone();
-        }
+        let cols = witness.build_columns();
+        debug_assert!(self
+            .public_columns
+            .iter()
+            .all(|pc| cols[pc.col] == pc.values));
         cols
     }
 
@@ -1620,10 +1533,11 @@ mod tests {
             log_slots: 4,
         };
         let n_cols = layout.n_cols();
-        // All column accessors must be < n_cols
-        assert!(layout.col_acc_step_indicator() < n_cols);
-        // Last column is acc_step_indicator
-        assert_eq!(layout.col_acc_step_indicator(), n_cols - 1);
+        // All committed column accessors must be < n_cols.
+        assert!(layout.col_acc_owner_lo() < n_cols);
+        // Row selectors are virtual; the last committed column is acc_owner_lo.
+        assert_eq!(layout.col_acc_owner_lo(), n_cols - 1);
+        assert_eq!(n_cols, 37);
     }
 
     #[test]
@@ -1651,8 +1565,6 @@ mod tests {
             layout.col_gamma_powers(),
             layout.col_gp_value(),
             layout.col_acc_value(),
-            layout.col_row_indicator(0),
-            layout.col_acc_step_indicator(),
         ];
         for i in 0..cols.len() {
             for j in (i + 1)..cols.len() {

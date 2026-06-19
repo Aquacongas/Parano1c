@@ -573,6 +573,17 @@ pub enum ProveBlockError {
 pub enum VerifyBlockError {
     ShapeMismatch,
     ProofTranscriptHashMismatch,
+    /// `BlockProof.meta.prev_block_state_root` must equal the parent header's
+    /// state root. Otherwise the proof is for a different chain state.
+    PrevStateRootMismatch,
+    /// `BlockProof.meta.new_state_root` must equal the candidate block header's
+    /// state root. Otherwise the proved transition is not the accepted header.
+    NewStateRootMismatch,
+    /// Bucket-local public inputs are not the canonical public inputs derived
+    /// from the block transaction body.
+    TxPublicInputsMismatch {
+        tx_index: usize,
+    },
     BlockSpineKillShot,
     BlockSpineSliceReconstruction,
     AuthKillShot(usize),
@@ -584,6 +595,38 @@ pub enum VerifyBlockError {
     FriFailed(String),
     /// FRI/Merkle opening for a segment MLE failed.
     StateMleOpeningFailed(usize),
+    /// Verifier-side state-claim reconstruction found an input whose tx-body
+    /// `(slot,value,owner)` claim does not match the sequential pre-state view.
+    StateBindingInputMismatch {
+        tx_index: usize,
+        input_index: usize,
+    },
+    /// Verifier-side state-claim reconstruction found an output slot that is
+    /// not empty in the sequential pre-state view for that transaction.
+    StateBindingOutputOccupied {
+        tx_index: usize,
+        output_index: usize,
+    },
+    /// Two valid outputs in one transaction target the same slot.
+    StateBindingDuplicateOutputSlot {
+        tx_index: usize,
+    },
+    /// The tx-body claims commitment does not match the bucket public input.
+    StateBindingClaimsCommitmentMismatch {
+        tx_index: usize,
+    },
+    /// A tx input/output slot is outside the current state vector.
+    StateBindingSlotOutOfRange {
+        tx_index: usize,
+    },
+    /// The proof opening order must match verifier-reconstructed dirty segment
+    /// order. `pre` and `post` openings must also refer to the same segment.
+    StateBindingSegmentMismatch {
+        state_binding_index: usize,
+        expected_seg_id: u16,
+        pre_seg_id: u16,
+        post_seg_id: u16,
+    },
     /// A transaction's PublicInputs.log_slots does not match BlockHeader.log_slots.
     /// The STARK proof is bound to the wrong chain configuration.
     LogSlotsInconsistent {
@@ -1406,6 +1449,15 @@ fn verify_state_mle_openings(
         let pre = &proof.pre_state_openings[sb_idx];
         let post = &proof.post_state_openings[sb_idx];
 
+        if pre.seg_id != post.seg_id {
+            tracing::warn!(
+                sb_idx,
+                pre_seg_id = pre.seg_id,
+                post_seg_id = post.seg_id,
+                "StateMle: pre/post segment mismatch"
+            );
+            return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+        }
         if pre.eval_point != sb_air.eval_point || post.eval_point != sb_air.eval_point {
             tracing::warn!(sb_idx, "StateMle: eval_point mismatch");
             return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
@@ -2826,6 +2878,16 @@ pub fn verify_block(
             let sb_air = state_binding_airs[sb_idx];
             let pre = &proof.pre_state_openings[sb_idx];
             let post = &proof.post_state_openings[sb_idx];
+
+            if pre.seg_id != post.seg_id {
+                tracing::warn!(
+                    sb_idx,
+                    pre_seg_id = pre.seg_id,
+                    post_seg_id = post.seg_id,
+                    "StateMle: pre/post segment mismatch"
+                );
+                return Err(VerifyBlockError::StateMleOpeningFailed(sb_idx));
+            }
 
             // eval_points must match the AIR.
             if pre.eval_point != sb_air.eval_point || post.eval_point != sb_air.eval_point {
