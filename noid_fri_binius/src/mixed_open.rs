@@ -474,4 +474,62 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    #[ignore = "S1 open: current mixed opening does not bind the compact FRI oracle to InterleavedCommitment"]
+    fn commit_to_a_open_from_a_prime_must_reject_after_s1_fix() {
+        let cols_a = test_columns();
+        let mut cols_b = cols_a.clone();
+        for (col_idx, col) in cols_b.iter_mut().enumerate() {
+            for (row_idx, value) in col.iter_mut().enumerate() {
+                *value += Block128::from(
+                    0xA5A5_0000_0000_0000u128 ^ ((col_idx as u128) << 16) ^ row_idx as u128,
+                );
+            }
+        }
+
+        let refs_a: Vec<&[Block128]> = cols_a.iter().map(Vec::as_slice).collect();
+        let refs_b: Vec<&[Block128]> = cols_b.iter().map(Vec::as_slice).collect();
+        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let (commitment_a, _state_a) = interleaved_commit(&refs_a, &ntt, &hasher);
+        let (commitment_b, state_b) = interleaved_commit(&refs_b, &ntt, &hasher);
+        assert_ne!(
+            commitment_a.cap, commitment_b.cap,
+            "test must use two distinct committed column sets"
+        );
+
+        let primary_point: Vec<Block128> = (0..TEST_LOG_ROWS)
+            .map(|i| Block128::from(0x3000u128 + i as u128))
+            .collect();
+        let secondary_claims = Vec::new();
+
+        // Malicious shape: the Fiat-Shamir prefix uses commitment A, while the
+        // prover-side columns used to build all_openings and C(x) come from A'.
+        // A source-bound PCS must reject this mixed state.
+        let mut prover_channel = Channel::new();
+        absorb_cap(&mut prover_channel, &commitment_a.cap);
+        let proof_from_b = prove_mixed_opening(
+            &state_b,
+            &primary_point,
+            &secondary_claims,
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+            TEST_NUM_QUERIES,
+        );
+
+        let result = verify_with_claims(
+            &commitment_a,
+            &primary_point,
+            &secondary_claims,
+            &proof_from_b,
+            &ntt,
+            &hasher,
+        );
+        assert!(
+            result.is_err(),
+            "S1 gap: verifier accepted an opening proof built from A' against commitment(A)"
+        );
+    }
 }
