@@ -53,12 +53,14 @@
 //!
 //! ## Privacy invariant
 //!
-//! `spend_secret[i]` is a witness-only input. The sumcheck transcript
-//! never absorbs raw secret values; it only absorbs the publicly-known
-//! `(claimed_address, claimed_auth_tag, tx_body_hash)` boundary and the
-//! derived sumcheck proof bytes, which expose only random-point MLE
-//! evaluations — the same hiding profile as the current in-AIR proof.
-//! The secret is therefore not recoverable from the payload.
+//! `spend_secret[i]` is a witness-only input. It is not part of
+//! `AuthPublicInputs`, is not serialized by the Auth proof, and is never
+//! absorbed raw into the Fiat-Shamir channel. The current Auth capsule is
+//! intentionally documented as **non-ZK**: it exposes deterministic
+//! random-point evaluations / PCS artifacts of the private AuthGKR trace.
+//! The supported privacy claim is raw-secret non-disclosure plus
+//! one-wayness under the Poseidon2b preimage assumption and the stated
+//! trace-evaluation side-information assumption, not simulator ZK.
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRESS, TAG_AUTHTAG};

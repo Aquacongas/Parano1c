@@ -19,6 +19,7 @@ use noid_gkr::{
 };
 use noid_poseidon2b::primitives::{fee_leaf, is_coinbase_leaf, tx_shape_leaf, Digest};
 use noid_tx::{hash_tx_body_for_shape, PublicInputs, TxBody, TxInput, TxOutput, TxShape};
+use zeroize::Zeroize;
 
 use crate::interleaved::{prove_air_interleaved, verify_air_interleaved, InterleavedStarkProof};
 use crate::{SliceClaim, VerifyError};
@@ -170,12 +171,14 @@ pub fn sweep_auth_inputs_from_body(body: &TxBody) -> SweepAuthInputs {
     let (expected_address, expected_auth_tag) =
         compute_sweep_auth_boundary(&auth_circuit, spend_secret, tx_body_hash);
 
-    SweepAuthInputs {
+    let auth_inputs = SweepAuthInputs {
         spend_secret,
         tx_body_hash,
         expected_address,
         expected_auth_tag,
-    }
+    };
+    spend_secret.zeroize();
+    auth_inputs
 }
 
 /// Build the sweep balance AIR/trace, AuthGKR inputs and SpineGKR inputs from a

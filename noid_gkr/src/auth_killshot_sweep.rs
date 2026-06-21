@@ -23,27 +23,32 @@
 //! `lane ∈ {0, 1}`. The batch-eval reduction therefore enforces all
 //! public boundary equalities through a single mixed-close opening.
 //!
-//! Privacy invariant: `spend_secret` is never absorbed. Only public
-//! inputs (`tx_body_hash`, `expected_address`, `expected_auth_tag`)
-//! seed the channel before the sumchecks run.
+//! Privacy invariant: raw `spend_secret` is never serialized and never
+//! absorbed into Fiat-Shamir. The channel is seeded by the public boundary
+//! plus the Auth MLE PCS commitment before GKR challenges. This is a compact
+//! non-ZK authorization capsule: it removes raw-secret/raw-slice leakage, but
+//! still exposes deterministic random-point side information about the private
+//! AuthGKR trace.
 //!
 //! Transcript order
 //! ----------------
 //! 1. Absorb `tx_body_hash`.
 //! 2. For each `i ∈ 0..N_SWEEP_AUTH_INPUTS`: absorb `expected_address[i]`
 //!    then `expected_auth_tag[i]`.
-//! 3. Run `prove_sweep_auth_unified` (squeezes ρ, β, γ; 16 round polys; 12
+//! 3. Absorb the Auth MLE PCS commitment (`state`, `s_in`, `s_out`).
+//! 4. Run `prove_sweep_auth_unified` (squeezes ρ, β, γ; 16 round polys; 12
 //!    final witness scalars).
-//! 4. Run `prove_sweep_auth_shift` (squeezes δ; 16 round polys; 3 final
+//! 5. Run `prove_sweep_auth_shift` (squeezes δ; 16 round polys; 3 final
 //!    witness scalars).
-//! 5. Run one `prove_multi_batch_eval` over `state`, `s_in`, `s_out`.
-//! 6. Open the three committed Sweep AuthGKR MLE columns with one mixed PCS
+//! 6. Run one `prove_multi_batch_eval` over `state`, `s_in`, `s_out`.
+//! 7. Open the three committed Sweep AuthGKR MLE columns with one mixed PCS
 //!    opening at the shared terminal batch-eval point.
 
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
+use zeroize::Zeroize;
 
 use crate::auth_circuit_sweep::{
     SweepAuthCircuit, SweepAuthInputs, SweepAuthPublicInputs, N_SWEEP_AUTH_INPUTS,
@@ -199,8 +204,9 @@ pub fn build_sweep_auth_unified_from_inputs(
 ) -> SweepAuthUnifiedMle {
     let w = evaluate_sweep_auth(circuit, inputs);
     debug_assert_eq!(w.slots.len(), N_SWEEP_AUTH_LIVE_SLOTS);
-    let state_ins: Vec<[Block128; STATE_SIZE]> = w.slots.iter().map(|s| s.state_in).collect();
+    let mut state_ins: Vec<[Block128; STATE_SIZE]> = w.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_sweep_auth_unified_mle(&state_ins);
+    state_ins.zeroize();
     mle
 }
 
@@ -222,8 +228,10 @@ pub fn prove_sweep_auth_killshot<T: FiatShamir<Block128>>(
         );
     }
 
-    let state_ins: Vec<[Block128; STATE_SIZE]> = witness.slots.iter().map(|s| s.state_in).collect();
+    let mut state_ins: Vec<[Block128; STATE_SIZE]> =
+        witness.slots.iter().map(|s| s.state_in).collect();
     let (mle, _) = build_sweep_auth_unified_mle(&state_ins);
+    state_ins.zeroize();
     prove_sweep_auth_killshot_from_mle(circuit, &inputs.to_public(), &mle, channel)
 }
 
@@ -408,6 +416,46 @@ mod tests {
     use super::*;
     use noid_poseidon2b::primitives::{SpendSecret, TxBodyHash};
 
+    struct RecordingChannel {
+        inner: Poseidon2bChannel,
+        absorbed: Vec<Block128>,
+    }
+
+    impl RecordingChannel {
+        fn sweep_auth_domain() -> Self {
+            let mut ch = Self {
+                inner: Poseidon2bChannel::new(),
+                absorbed: Vec::new(),
+            };
+            ch.absorb(Block128::from(SWEEP_AUTH_GKR_DOMAIN_TAG));
+            ch
+        }
+    }
+
+    impl FiatShamir<Block128> for RecordingChannel {
+        fn absorb(&mut self, elem: Block128) {
+            self.absorbed.push(elem);
+            self.inner.absorb(elem);
+        }
+
+        fn squeeze(&mut self) -> Block128 {
+            self.inner.squeeze()
+        }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn secret_bytes_from_fields(fields: &[Block128; 2]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&fields[0].to_u128().to_le_bytes());
+        out[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
+        out
+    }
+
     fn fixture_inputs() -> SweepAuthInputs {
         let circuit = SweepAuthCircuit::build();
         let secrets: [SpendSecret; N_SWEEP_AUTH_INPUTS] = std::array::from_fn(|i| {
@@ -464,6 +512,57 @@ mod tests {
         assert!(discharge_sweep_auth_reductions_native(
             &circuit, &inputs, &v_red
         ));
+    }
+
+    #[test]
+    fn auth_killshot_serialization_does_not_contain_raw_spend_secret_limbs() {
+        let circuit = SweepAuthCircuit::build();
+        let inputs = fixture_inputs();
+        let raw_secrets: Vec<[u8; 32]> = inputs
+            .spend_secret
+            .iter()
+            .map(secret_bytes_from_fields)
+            .collect();
+
+        let mut ch_p = sweep_auth_gkr_channel();
+        let (proof, _) = prove_sweep_auth_killshot(&circuit, &inputs, &mut ch_p);
+        let bytes = bincode::serialize(&proof).expect("SweepAuthProofKillShot serializes");
+
+        for secret in raw_secrets {
+            assert!(
+                !contains_bytes(&bytes, &secret),
+                "Sweep Auth capsule serialized raw 32-byte spend_secret"
+            );
+            assert!(
+                !contains_bytes(&bytes, &secret[..16]),
+                "Sweep Auth capsule serialized spend_secret low limb"
+            );
+            assert!(
+                !contains_bytes(&bytes, &secret[16..]),
+                "Sweep Auth capsule serialized spend_secret high limb"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_killshot_transcript_never_absorbs_raw_spend_secret_limbs() {
+        let circuit = SweepAuthCircuit::build();
+        let inputs = fixture_inputs();
+        let secret_limbs: Vec<Block128> = inputs
+            .spend_secret
+            .iter()
+            .flat_map(|fields| fields.iter().copied())
+            .collect();
+
+        let mut ch = RecordingChannel::sweep_auth_domain();
+        let _ = prove_sweep_auth_killshot(&circuit, &inputs, &mut ch);
+
+        for limb in secret_limbs {
+            assert!(
+                !ch.absorbed.contains(&limb),
+                "Sweep Auth transcript absorbed a raw spend_secret limb"
+            );
+        }
     }
 
     #[test]

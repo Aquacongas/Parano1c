@@ -16,6 +16,7 @@
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+use zeroize::Zeroize;
 
 use crate::auth_circuit::{
     AuthCircuit, AuthInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0, AUTH_PAD_1,
@@ -23,7 +24,10 @@ use crate::auth_circuit::{
 };
 
 /// Per-slot state snapshot.
-#[derive(Debug, Clone, Copy)]
+///
+/// SECURITY: `state_in` for head auth slots contains raw `spend_secret`
+/// limbs. Do not implement `Debug`/`Copy`; the buffer is zeroized on drop.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct AuthSlotState {
     pub state_in: [Block128; 4],
     pub state_out: [Block128; 4],
@@ -39,7 +43,10 @@ impl AuthSlotState {
 
 /// Full auth witness: per-slot states plus the derived `(Address,
 /// AuthTag)` boundary for each input.
-#[derive(Debug, Clone)]
+///
+/// SECURITY: contains secret-derived Poseidon trace rows. It is wallet-local,
+/// not serialized, not printable via `Debug`, and zeroized on drop.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct AuthWitness {
     pub slots: Vec<AuthSlotState>,
     pub derived_address: [[Block128; 2]; N_AUTH_INPUTS],
@@ -123,7 +130,7 @@ fn chain_absorb_pair(
 /// transcript.
 pub fn compute_auth_boundary(
     circuit: &AuthCircuit,
-    spend_secret: [[Block128; 2]; N_AUTH_INPUTS],
+    mut spend_secret: [[Block128; 2]; N_AUTH_INPUTS],
     tx_body_hash: [Block128; 2],
 ) -> (
     [[Block128; 2]; N_AUTH_INPUTS],
@@ -136,6 +143,7 @@ pub fn compute_auth_boundary(
         expected_address: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
         expected_auth_tag: [[Block128::ZERO; 2]; N_AUTH_INPUTS],
     };
+    spend_secret.zeroize();
     let w = evaluate_auth(circuit, &probe);
     (w.derived_address, w.derived_auth_tag)
 }

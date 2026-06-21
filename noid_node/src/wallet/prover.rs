@@ -35,6 +35,7 @@ use noid_stark::wallet_bundle::{
     StandardWalletProofBundle, SweepWalletProofBundle, WalletProofBundle,
 };
 use noid_tx::{PublicInputs, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
+use zeroize::Zeroize;
 
 /// Error from transaction proving.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +95,7 @@ fn prove_standard_tx(
         expected_address,
         expected_auth_tag,
     };
+    spend_secret_arr.zeroize();
 
     // Build AIR trace (balance, range, selector constraints — public data).
     let air = TxLogicAir::new(pins);
