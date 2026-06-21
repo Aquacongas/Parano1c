@@ -396,7 +396,7 @@ const MIXED_SOURCE_BINDING_TAG: u128 = 0x5B1D_0000_0000_0001u128;
 
 struct HighFoldLayer {
     log_rows: usize,
-    code: Code,
+    code: Option<Code>,
     tree: ShortMerkleTree,
 }
 
@@ -418,19 +418,52 @@ fn prove_source_binding(
     assert_eq!(state.encoded_cols.len(), n_cols);
     assert_eq!(c_evals.len(), 1usize << log_n);
 
-    let (h_evals, folded_layers) =
-        build_high_tensor_layers(c_evals, &ctx.tensor_batching_point, ctx.tau, ntt, hasher);
+    let profile = prove_profile_enabled() && log_n >= 20;
+    let profile_started = Instant::now();
+    let mut profile_last = profile_started;
+    let mut profile_phase = |name: &'static str| {
+        if profile {
+            let now = Instant::now();
+            eprintln!(
+                "prove_block_profile source_binding phase log_n={} n_cols={} phase={} elapsed_ms={:.3}",
+                log_n,
+                n_cols,
+                name,
+                duration_ms(now.duration_since(profile_last))
+            );
+            profile_last = now;
+        }
+    };
+
+    let (h_evals, folded_layers) = if n_cols == 1 {
+        build_high_tensor_layers_from_source_code(
+            c_evals,
+            &state.encoded_cols[0],
+            &ctx.tensor_batching_point,
+            ctx.tau,
+            hasher,
+        )
+    } else {
+        build_high_tensor_layers(c_evals, &ctx.tensor_batching_point, ctx.tau, ntt, hasher)
+    };
+    profile_phase("build_high_tensor_layers");
+    #[cfg(debug_assertions)]
     assert_source_h_matches_compact(primary_point, ctx, &h_evals, ntt, hasher)
+        .expect("prover constructed inconsistent source H");
+    #[cfg(not(debug_assertions))]
+    assert_source_h_claim_matches_compact(primary_point, ctx, &h_evals)
         .expect("prover constructed inconsistent source H");
 
     let folded_roots: Vec<ShortHash> = folded_layers
         .iter()
         .map(|layer| layer.tree.get_root())
         .collect();
+    profile_phase("folded_roots");
 
     observe_source_binding_commitments(channel, &folded_roots, &h_evals, log_n, ctx.tau);
     let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
     let n_queries = query_indices.len();
+    profile_phase("observe_and_queries");
 
     let source_pair_indices: Vec<usize> = query_indices
         .iter()
@@ -444,11 +477,13 @@ fn prove_source_binding(
             source_symbols.push(col[pos1]);
         }
     }
+    profile_phase("source_symbols");
     let source_merkle_batch = build_short_batched_merkle_proof(
         &state.source_tree,
         &source_pair_indices,
         source_tree_depth(log_n),
     );
+    profile_phase("source_merkle_batch");
 
     let mut folded_queried_symbols = Vec::with_capacity(folded_layers.len());
     let mut folded_merkle_batch = Vec::with_capacity(folded_layers.len());
@@ -471,6 +506,15 @@ fn prove_source_binding(
         folded_queried_symbols.push(symbols);
         folded_merkle_batch.push(batch);
         current_indices = pair_indices;
+    }
+    profile_phase("folded_queries_and_batches");
+    if profile {
+        eprintln!(
+            "prove_block_profile source_binding summary log_n={} n_cols={} total_ms={:.3}",
+            log_n,
+            n_cols,
+            duration_ms(profile_started.elapsed())
+        );
     }
 
     SourceBindingProof {
@@ -689,6 +733,79 @@ fn build_high_tensor_layers(
     (current, layers)
 }
 
+fn build_high_tensor_layers_from_source_code(
+    c_evals: &[Block128],
+    source_code: &[Block128],
+    beta: &[Block128],
+    tau: usize,
+    hasher: &dyn CryptographicHasher,
+) -> (Vec<Block128>, Vec<HighFoldLayer>) {
+    let log_n = c_evals.len().trailing_zeros() as usize;
+    assert_eq!(c_evals.len(), 1usize << log_n);
+    assert_eq!(source_code.len(), RATE * (1usize << log_n));
+
+    let profile = prove_profile_enabled() && log_n >= 20;
+    let mut mle_fold_total = Duration::ZERO;
+    let mut direct_code_total = Duration::ZERO;
+    let mut tree_total = Duration::ZERO;
+
+    let mut current = c_evals.to_vec();
+    let mut layers: Vec<HighFoldLayer> = Vec::with_capacity(tau.saturating_sub(1));
+    for round in 0..tau {
+        let r = beta[tau - 1 - round];
+        let fold_t0 = Instant::now();
+        fold_highest_mle_eq_in_place(&mut current, r);
+        mle_fold_total += fold_t0.elapsed();
+        if round + 1 >= tau {
+            continue;
+        }
+
+        let before_layer_log = log_n - round;
+        let layer_log = before_layer_log - 1;
+        let input_code: &[Block128] = if round == 0 {
+            source_code
+        } else {
+            &layers[round - 1].code.encoding
+        };
+        let out_len = RATE * (1usize << layer_log);
+        let code_t0 = Instant::now();
+        let encoding: Vec<Block128> = (0..out_len)
+            .into_par_iter()
+            .map(|leaf_idx| {
+                let (pos0, pos1) = high_pair_positions(before_layer_log, leaf_idx);
+                tensor_high_fold_pair(
+                    r,
+                    before_layer_log,
+                    leaf_idx,
+                    input_code[pos0],
+                    input_code[pos1],
+                )
+            })
+            .collect();
+        direct_code_total += code_t0.elapsed();
+        let code = Code { encoding };
+        let tree_t0 = Instant::now();
+        let tree = build_high_pair_tree(&code, layer_log, hasher);
+        tree_total += tree_t0.elapsed();
+        layers.push(HighFoldLayer {
+            log_rows: layer_log,
+            code,
+            tree,
+        });
+    }
+    if profile {
+        eprintln!(
+            "prove_block_profile source_binding_direct_layers log_n={} tau={} mle_fold_ms={:.3} direct_code_ms={:.3} tree_ms={:.3}",
+            log_n,
+            tau,
+            duration_ms(mle_fold_total),
+            duration_ms(direct_code_total),
+            duration_ms(tree_total)
+        );
+    }
+    (current, layers)
+}
+
 #[cfg(test)]
 fn fold_highest_mle_eq(evals: &[Block128], r: Block128) -> Vec<Block128> {
     let mut out = evals.to_vec();
@@ -711,6 +828,19 @@ fn fold_highest_mle_eq_in_place(evals: &mut Vec<Block128>, r: Block128) {
     evals.truncate(half);
 }
 
+fn assert_source_h_claim_matches_compact(
+    primary_point: &[Block128],
+    ctx: &CompactFriQueryContext,
+    h_evals: &[Block128],
+) -> Result<(), String> {
+    let right = &primary_point[..ctx.n_rounds];
+    let h_at_right = mle_evaluate_small(h_evals, right);
+    if h_at_right != ctx.initial_sumcheck_claim {
+        return Err("source binding H(right) does not match compact tensor claim".into());
+    }
+    Ok(())
+}
+
 fn assert_source_h_matches_compact(
     primary_point: &[Block128],
     ctx: &CompactFriQueryContext,
@@ -718,12 +848,8 @@ fn assert_source_h_matches_compact(
     ntt: &AdditiveNTT<Block128>,
     hasher: &dyn CryptographicHasher,
 ) -> Result<(), String> {
+    assert_source_h_claim_matches_compact(primary_point, ctx, h_evals)?;
     let right = &primary_point[..ctx.n_rounds];
-    let h_at_right = mle_evaluate_small(h_evals, right);
-    if h_at_right != ctx.initial_sumcheck_claim {
-        return Err("source binding H(right) does not match compact tensor claim".into());
-    }
-
     let eq_right = eq_ind_partial_eval(right);
     let g_evals: Vec<Block128> = h_evals
         .iter()
@@ -928,7 +1054,11 @@ mod tests {
     const TEST_NUM_QUERIES: usize = 2;
 
     fn test_columns() -> Vec<Vec<Block128>> {
-        let n = 1usize << TEST_LOG_ROWS;
+        test_columns_with_log(TEST_LOG_ROWS)
+    }
+
+    fn test_columns_with_log(log_rows: usize) -> Vec<Vec<Block128>> {
+        let n = 1usize << log_rows;
         vec![
             (0..n)
                 .map(|i| Block128::from((i as u128).wrapping_mul(3) ^ 0x1234))
@@ -950,17 +1080,31 @@ mod tests {
         AdditiveNTT<Block128>,
         Blake3Hasher,
     ) {
-        let cols = test_columns();
+        valid_fixture_with_log(TEST_LOG_ROWS, TEST_NUM_QUERIES)
+    }
+
+    fn valid_fixture_with_log(
+        log_rows: usize,
+        num_queries: usize,
+    ) -> (
+        InterleavedCommitment,
+        Vec<Block128>,
+        Vec<EvalClaim>,
+        MixedOpeningProof,
+        AdditiveNTT<Block128>,
+        Blake3Hasher,
+    ) {
+        let cols = test_columns_with_log(log_rows);
         let col_refs: Vec<&[Block128]> = cols.iter().map(Vec::as_slice).collect();
-        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
         let hasher = Blake3Hasher::new();
         let (commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
-        let primary_point: Vec<Block128> = (0..TEST_LOG_ROWS)
+        let primary_point: Vec<Block128> = (0..log_rows)
             .map(|i| Block128::from(0x1000u128 + i as u128))
             .collect();
         let secondary_claims = vec![EvalClaim {
             col_index: 1,
-            eval_point: (0..TEST_LOG_ROWS)
+            eval_point: (0..log_rows)
                 .map(|i| Block128::from(0x2000u128 + i as u128))
                 .collect(),
             value: Block128::from(0xDEAD_BEEFu128),
@@ -975,7 +1119,7 @@ mod tests {
             &ntt,
             &mut prover_channel,
             &hasher,
-            TEST_NUM_QUERIES,
+            num_queries,
         );
 
         (
@@ -996,6 +1140,26 @@ mod tests {
         ntt: &AdditiveNTT<Block128>,
         hasher: &Blake3Hasher,
     ) -> Result<Vec<Block128>, String> {
+        verify_with_claims_num_queries(
+            commitment,
+            primary_point,
+            claims,
+            proof,
+            ntt,
+            hasher,
+            TEST_NUM_QUERIES,
+        )
+    }
+
+    fn verify_with_claims_num_queries(
+        commitment: &InterleavedCommitment,
+        primary_point: &[Block128],
+        claims: &[EvalClaim],
+        proof: &MixedOpeningProof,
+        ntt: &AdditiveNTT<Block128>,
+        hasher: &Blake3Hasher,
+        num_queries: usize,
+    ) -> Result<Vec<Block128>, String> {
         let mut channel = Channel::new();
         absorb_cap(&mut channel, &commitment.cap);
         verify_mixed_opening(
@@ -1006,7 +1170,7 @@ mod tests {
             ntt,
             &mut channel,
             hasher,
-            TEST_NUM_QUERIES,
+            num_queries,
         )
     }
 
@@ -1079,6 +1243,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn source_code_high_tensor_layers_match_ntt_rebuild_path() {
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let tau = crate::compact_fri::COMPACT_TAU;
+        let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let c_evals: Vec<Block128> = (0..(1usize << log_rows))
+            .map(|i| Block128::from((i as u128).wrapping_mul(0x10_0001) ^ 0xD1A6))
+            .collect();
+        let beta: Vec<Block128> = (0..tau)
+            .map(|i| Block128::from(0x9100u128 + i as u128))
+            .collect();
+        let source_code = Code::new_parallel(&c_evals, &ntt);
+
+        let (h_ref, layers_ref) = build_high_tensor_layers(&c_evals, &beta, tau, &ntt, &hasher);
+        let (h_direct, layers_direct) = build_high_tensor_layers_from_source_code(
+            &c_evals,
+            &source_code.encoding,
+            &beta,
+            tau,
+            &hasher,
+        );
+
+        assert_eq!(h_ref, h_direct);
+        assert_eq!(layers_ref.len(), layers_direct.len());
+        for (idx, (a, b)) in layers_ref.iter().zip(layers_direct.iter()).enumerate() {
+            assert_eq!(a.log_rows, b.log_rows, "layer {idx} log_rows mismatch");
+            assert_eq!(
+                a.code.encoding, b.code.encoding,
+                "layer {idx} code mismatch"
+            );
+            assert_eq!(
+                a.tree.get_root(),
+                b.tree.get_root(),
+                "layer {idx} root mismatch"
+            );
+        }
+    }
+
     fn source_leaf_count_for_test(log_rows: usize) -> usize {
         RATE * (1usize << (log_rows - 1))
     }
@@ -1088,6 +1291,73 @@ mod tests {
         let (commitment, primary_point, claims, proof, ntt, hasher) = valid_fixture();
         verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
             .expect("valid mixed opening must verify");
+    }
+
+    #[test]
+    fn valid_round0_source_binding_path_passes() {
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let num_queries = 3;
+        let (commitment, primary_point, claims, proof, ntt, hasher) =
+            valid_fixture_with_log(log_rows, num_queries);
+        verify_with_claims_num_queries(
+            &commitment,
+            &primary_point,
+            &claims,
+            &proof,
+            &ntt,
+            &hasher,
+            num_queries,
+        )
+        .expect("valid mixed opening with compact FRI round-0 source binding must verify");
+    }
+
+    #[test]
+    fn tampered_round0_fri_root_rejects_source_binding() {
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let num_queries = 3;
+        let (commitment, primary_point, claims, mut proof, ntt, hasher) =
+            valid_fixture_with_log(log_rows, num_queries);
+        proof.fri_proof.fri_roots[0][0] ^= 1;
+        let err = verify_with_claims_num_queries(
+            &commitment,
+            &primary_point,
+            &claims,
+            &proof,
+            &ntt,
+            &hasher,
+            num_queries,
+        )
+        .expect_err("tampered compact FRI round-0 root must reject");
+        assert!(
+            err.contains(
+                "source binding Code(H*eq_right) root does not match compact FRI round-0 root"
+            ) || err.contains("FRI root mismatch")
+                || err.contains("sumcheck failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tampered_source_h_rejects_round0_binding() {
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let num_queries = 3;
+        let (commitment, primary_point, claims, mut proof, ntt, hasher) =
+            valid_fixture_with_log(log_rows, num_queries);
+        proof.source_proof.h_evals[0] += Block128::ONE;
+        let err = verify_with_claims_num_queries(
+            &commitment,
+            &primary_point,
+            &claims,
+            &proof,
+            &ntt,
+            &hasher,
+            num_queries,
+        )
+        .expect_err("tampered source H table must reject");
+        assert!(
+            err.contains("source binding") || err.contains("FRI"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1128,7 +1398,9 @@ mod tests {
 
     #[test]
     fn commit_to_a_open_from_a_prime_must_reject_after_s1_fix() {
-        let cols_a = test_columns();
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let num_queries = 3;
+        let cols_a = test_columns_with_log(log_rows);
         let mut cols_b = cols_a.clone();
         for (col_idx, col) in cols_b.iter_mut().enumerate() {
             for (row_idx, value) in col.iter_mut().enumerate() {
@@ -1140,7 +1412,7 @@ mod tests {
 
         let refs_a: Vec<&[Block128]> = cols_a.iter().map(Vec::as_slice).collect();
         let refs_b: Vec<&[Block128]> = cols_b.iter().map(Vec::as_slice).collect();
-        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
         let hasher = Blake3Hasher::new();
         let (commitment_a, _state_a) = interleaved_commit(&refs_a, &ntt, &hasher);
         let (commitment_b, state_b) = interleaved_commit(&refs_b, &ntt, &hasher);
@@ -1149,7 +1421,7 @@ mod tests {
             "test must use two distinct committed column sets"
         );
 
-        let primary_point: Vec<Block128> = (0..TEST_LOG_ROWS)
+        let primary_point: Vec<Block128> = (0..log_rows)
             .map(|i| Block128::from(0x3000u128 + i as u128))
             .collect();
         let secondary_claims = Vec::new();
@@ -1166,16 +1438,17 @@ mod tests {
             &ntt,
             &mut prover_channel,
             &hasher,
-            TEST_NUM_QUERIES,
+            num_queries,
         );
 
-        let result = verify_with_claims(
+        let result = verify_with_claims_num_queries(
             &commitment_a,
             &primary_point,
             &secondary_claims,
             &proof_from_b,
             &ntt,
             &hasher,
+            num_queries,
         );
         assert!(
             result.is_err(),

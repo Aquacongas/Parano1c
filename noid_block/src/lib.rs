@@ -278,7 +278,7 @@ pub struct SweepBucketProof {
 
 impl SweepBucketProof {
     pub fn byte_len(&self) -> usize {
-        bincode::serialize(self).map_or(0, |bytes| bytes.len())
+        bincode::serialized_size(self).map_or(0, |len| len as usize)
     }
 }
 
@@ -377,7 +377,7 @@ pub struct BlockAuthSidecar {
 
 impl BlockAuthSidecar {
     pub fn byte_len(&self) -> usize {
-        bincode::serialize(self).map_or(0, |bytes| bytes.len())
+        bincode::serialized_size(self).map_or(0, |len| len as usize)
     }
 }
 
@@ -430,9 +430,10 @@ pub fn block_auth_sidecar_root(
         domain: BLOCK_AUTH_SIDECAR_ROOT_DOMAIN,
         entries,
     };
-    let bytes =
-        bincode::serialize(&transcript).map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
-    Ok(noid_chain::block::proof_transcript_hash(&bytes))
+    let mut writer = ProofTranscriptHashWriter::new();
+    bincode::serialize_into(&mut writer, &transcript)
+        .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
+    Ok(writer.finalize())
 }
 
 pub fn split_auth_sidecar_for_buckets(
@@ -703,6 +704,21 @@ mod recursive_claim_tests {
         assert_eq!(
             block_recursive_claim_hash(&proof),
             noid_chain::block::proof_transcript_hash(&owned)
+        );
+    }
+
+    #[test]
+    fn sidecar_root_streaming_hash_matches_legacy_byte_hash() {
+        let transcript = BlockAuthSidecarRootTranscript {
+            domain: BLOCK_AUTH_SIDECAR_ROOT_DOMAIN,
+            entries: Vec::new(),
+        };
+        let bytes = bincode::serialize(&transcript).unwrap();
+        let mut writer = ProofTranscriptHashWriter::new();
+        bincode::serialize_into(&mut writer, &transcript).unwrap();
+        assert_eq!(
+            writer.finalize(),
+            noid_chain::block::proof_transcript_hash(&bytes)
         );
     }
 }

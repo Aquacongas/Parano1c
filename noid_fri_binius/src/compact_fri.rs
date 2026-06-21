@@ -25,6 +25,7 @@ use noid_fri::hasher::{CryptographicHasher, HashOutput};
 use noid_fri::merkle::{compute_leaf_hashes, MerkleTree, VectorCommitment};
 use noid_fri::Channel;
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 /// Compact FRI TAU: number of high variables handled by tensor decomposition.
 /// TAU=8 means 2^8=256 upper partial evaluations and log_len-8 FRI rounds.
@@ -38,6 +39,21 @@ pub const COMPACT_TAU: usize = 8;
 pub const COMPACT_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
 pub const COMPACT_NUM_QUERIES: usize = 8;
+
+fn compact_profile_enabled() -> bool {
+    std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn compact_duration_ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
 
 // ---------------------------------------------------------------------------
 // Proof structures
@@ -160,6 +176,22 @@ pub(crate) fn compact_fri_prove_with_query_hook<E, F>(
 where
     F: FnOnce(&CompactFriQueryContext, &mut Channel) -> E,
 {
+    let profile = compact_profile_enabled() && eval_point.len() >= 20;
+    let profile_started = Instant::now();
+    let mut profile_last = profile_started;
+    let mut profile_phase = |name: &'static str| {
+        if profile {
+            let now = Instant::now();
+            eprintln!(
+                "prove_block_profile compact_fri phase log_n={} phase={} elapsed_ms={:.3}",
+                eval_point.len(),
+                name,
+                compact_duration_ms(now.duration_since(profile_last))
+            );
+            profile_last = now;
+        }
+    };
+
     channel.observe_field_elems(eval_point);
 
     let tau = COMPACT_TAU.min(eval_point.len());
@@ -176,6 +208,7 @@ where
             mle_evaluate(row_evals, right)
         })
         .collect();
+    profile_phase("upper_partial_evals");
 
     let left_eq = eq_ind_partial_eval(left);
     let eval: Block128 = upper_partial_evals
@@ -184,6 +217,7 @@ where
         .map(|(&v, &e)| v * e)
         .fold(Block128::ZERO, |a, b| a + b);
     channel.observe_field_elem(eval);
+    profile_phase("eval_claim");
 
     // Tensor batching.
     let tensor_batching_point = channel.get_random_points(tau);
@@ -212,6 +246,7 @@ where
         }
         out
     };
+    profile_phase("tensor_batching");
 
     // FRI commit phase with sumcheck.
     let n_rounds = right.len();
@@ -230,6 +265,7 @@ where
             .map(|(&g, &e)| g * e)
             .collect()
     };
+    profile_phase("sumcheck_evals");
 
     let sum_check_claim: Block128 = upper_partial_evals
         .iter()
@@ -243,9 +279,15 @@ where
     let mut fri_trees: Vec<MerkleTree> = Vec::with_capacity(n_rounds);
     let mut fri_codes: Vec<Code> = Vec::with_capacity(n_rounds);
     let mut current_code = Code::new_parallel(&current_evals, ntt);
+    profile_phase("initial_code");
     let mut claim = sum_check_claim;
+    let mut round_sumcheck_total = Duration::ZERO;
+    let mut round_merkle_total = Duration::ZERO;
+    let mut round_transcript_total = Duration::ZERO;
+    let mut round_fold_total = Duration::ZERO;
 
     for round in 0..n_rounds {
+        let round_t0 = Instant::now();
         let half = current_evals.len() / 2;
         let p0 = current_evals[..half]
             .iter()
@@ -254,15 +296,19 @@ where
         let c0 = p0;
         let c1 = p0 + p1;
         sum_check_oracles.push([c0, c1]);
+        round_sumcheck_total += round_t0.elapsed();
 
+        let merkle_t0 = Instant::now();
         let leaf_hashes = compute_leaf_hashes(&current_code.encoding, hasher);
         let tree = MerkleTree::new_parallel(leaf_hashes, hasher);
         let root = tree.get_root();
         let code_depth = current_code.encoding.len().trailing_zeros() as usize - 1;
         fri_roots.push(root);
         fri_trees.push(tree);
+        round_merkle_total += merkle_t0.elapsed();
 
         // Transcript: oracle coeffs + root + squeeze challenge
+        let transcript_t0 = Instant::now();
         channel.observe_field_elem(c0);
         channel.observe_field_elem(c1);
         let vc = VectorCommitment {
@@ -271,16 +317,33 @@ where
         };
         channel.observe_vector_commitment(&vc);
         let r = channel.get_random_point();
+        round_transcript_total += transcript_t0.elapsed();
 
+        let fold_t0 = Instant::now();
         claim = c0 + c1 * r;
         let next_code = current_code.fold_code(r, round, ntt);
         fri_codes.push(current_code);
         fold_evals_in_place(&mut current_evals, r);
         current_code = next_code;
+        round_fold_total += fold_t0.elapsed();
     }
+
+    if profile {
+        eprintln!(
+            "prove_block_profile compact_fri rounds log_n={} n_rounds={} sumcheck_ms={:.3} merkle_ms={:.3} transcript_ms={:.3} fold_ms={:.3}",
+            eval_point.len(),
+            n_rounds,
+            compact_duration_ms(round_sumcheck_total),
+            compact_duration_ms(round_merkle_total),
+            compact_duration_ms(round_transcript_total),
+            compact_duration_ms(round_fold_total)
+        );
+    }
+    profile_phase("fri_commit_rounds");
 
     let final_codeword = current_code.encoding.clone();
     channel.observe_field_elems(&final_codeword);
+    profile_phase("final_codeword");
 
     let context = CompactFriQueryContext {
         tau,
@@ -291,13 +354,17 @@ where
         final_codeword: final_codeword.clone(),
     };
     let extra = before_queries(&context, channel);
+    profile_phase("before_queries_hook");
 
     // Query phase with batched Merkle compression.
     let log_domain = n_rounds + LOG_RATE;
     let query_indices = gen_compact_queries(channel, log_domain, num_queries);
+    profile_phase("query_indices");
 
     let mut fri_queried_symbols: Vec<Vec<(Block128, Block128)>> = Vec::with_capacity(n_rounds);
     let mut fri_merkle_batch: Vec<BatchedMerkleProof> = Vec::with_capacity(n_rounds);
+    let mut query_symbols_total = Duration::ZERO;
+    let mut query_batch_total = Duration::ZERO;
 
     for round in 0..n_rounds {
         let code = &fri_codes[round];
@@ -307,6 +374,7 @@ where
         let mut symbols = Vec::with_capacity(query_indices.len());
         let mut pair_indices = Vec::with_capacity(query_indices.len());
 
+        let query_symbols_t0 = Instant::now();
         for &qi in &query_indices {
             let scaled = qi >> round;
             let pair_idx = scaled >> 1;
@@ -315,10 +383,31 @@ where
             symbols.push((s0, s1));
             pair_indices.push(pair_idx);
         }
+        query_symbols_total += query_symbols_t0.elapsed();
 
+        let query_batch_t0 = Instant::now();
         let batch_proof = build_batched_merkle_proof(tree, &pair_indices, depth);
+        query_batch_total += query_batch_t0.elapsed();
         fri_queried_symbols.push(symbols);
         fri_merkle_batch.push(batch_proof);
+    }
+    if profile {
+        eprintln!(
+            "prove_block_profile compact_fri query log_n={} n_rounds={} symbols_ms={:.3} batch_ms={:.3}",
+            eval_point.len(),
+            n_rounds,
+            compact_duration_ms(query_symbols_total),
+            compact_duration_ms(query_batch_total)
+        );
+    }
+    profile_phase("query_phase");
+
+    if profile {
+        eprintln!(
+            "prove_block_profile compact_fri summary log_n={} total_ms={:.3}",
+            eval_point.len(),
+            compact_duration_ms(profile_started.elapsed())
+        );
     }
 
     let query_info = CompactFriQueryInfo {
