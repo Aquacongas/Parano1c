@@ -18,6 +18,7 @@
 //! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
+use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
@@ -46,6 +47,8 @@ pub const MIXED_OPEN_TAG: u64 = 0xFFF8_0000_0000_0000;
 struct MixedOpenPhaseTiming {
     name: &'static str,
     elapsed: Duration,
+    mem: Option<MemSnapshot>,
+    delta_rss_mb: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -53,16 +56,26 @@ struct MixedOpenProfiler {
     enabled: bool,
     started: Instant,
     last: Instant,
+    start_mem: Option<MemSnapshot>,
+    last_mem: Option<MemSnapshot>,
     phases: Vec<MixedOpenPhaseTiming>,
 }
 
 impl MixedOpenProfiler {
     fn new() -> Self {
         let now = Instant::now();
+        let enabled = prove_profile_enabled();
+        let start_mem = if enabled {
+            current_mem_snapshot()
+        } else {
+            None
+        };
         Self {
-            enabled: prove_profile_enabled(),
+            enabled,
             started: now,
             last: now,
+            start_mem,
+            last_mem: start_mem,
             phases: Vec::with_capacity(8),
         }
     }
@@ -72,11 +85,21 @@ impl MixedOpenProfiler {
             return;
         }
         let now = Instant::now();
+        let mem = current_mem_snapshot();
+        let delta_rss_mb = match (mem, self.last_mem) {
+            (Some(current), Some(previous)) => Some(current.delta_rss_mb(previous)),
+            _ => None,
+        };
         self.phases.push(MixedOpenPhaseTiming {
             name,
             elapsed: now.duration_since(self.last),
+            mem,
+            delta_rss_mb,
         });
         self.last = now;
+        if mem.is_some() {
+            self.last_mem = mem;
+        }
     }
 
     fn finish(self, n_cols: usize, log_n: usize, n_secondary_claims: usize, num_queries: usize) {
@@ -84,20 +107,22 @@ impl MixedOpenProfiler {
             return;
         }
         let total = self.started.elapsed();
+        let final_mem = current_mem_snapshot().or(self.last_mem);
         let summary = self
             .phases
             .iter()
-            .map(|p| format!("{}={:.3}ms", p.name, duration_ms(p.elapsed)))
+            .map(mixed_phase_summary)
             .collect::<Vec<_>>()
             .join(", ");
         eprintln!(
-            "prove_block_profile mixed_opening summary n_cols={} log_n={} n_secondary_claims={} num_queries={} total_ms={:.3} phases={}",
+            "prove_block_profile mixed_opening summary n_cols={} log_n={} n_secondary_claims={} num_queries={} total_ms={:.3} phases={}{}",
             n_cols,
             log_n,
             n_secondary_claims,
             num_queries,
             duration_ms(total),
-            summary
+            summary,
+            profile_total_mem_fields(self.start_mem, final_mem)
         );
     }
 }
@@ -115,6 +140,44 @@ fn prove_profile_enabled() -> bool {
 
 fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
+}
+
+fn mixed_phase_summary(phase: &MixedOpenPhaseTiming) -> String {
+    let base = format!("{}={:.3}ms", phase.name, duration_ms(phase.elapsed));
+    let Some(mem) = phase.mem else {
+        return base;
+    };
+    match phase.delta_rss_mb {
+        Some(delta) => format!(
+            "{base}/rss={:.1}MB/hwm={:.1}MB/drss={:+.1}MB",
+            mem.rss_mb(),
+            mem.hwm_mb(),
+            delta
+        ),
+        None => format!("{base}/rss={:.1}MB/hwm={:.1}MB", mem.rss_mb(), mem.hwm_mb()),
+    }
+}
+
+fn profile_total_mem_fields(
+    start_mem: Option<MemSnapshot>,
+    final_mem: Option<MemSnapshot>,
+) -> String {
+    let Some(final_mem) = final_mem else {
+        return String::new();
+    };
+    match start_mem {
+        Some(start_mem) => format!(
+            " rss_mb={:.1} hwm_mb={:.1} delta_rss_mb={:+.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb(),
+            final_mem.delta_rss_mb(start_mem)
+        ),
+        None => format!(
+            " rss_mb={:.1} hwm_mb={:.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb()
+        ),
+    }
 }
 
 /// A claim that column at `col_index` evaluates to `value` at `eval_point`.
@@ -435,7 +498,16 @@ fn prove_source_binding(
         }
     };
 
-    let (h_evals, folded_layers) = if n_cols == 1 {
+    let direct_source_expansion = n_cols == 1 && ctx.tau > 1;
+    let (h_evals, folded_layers) = if direct_source_expansion {
+        let expected_h_len = 1usize << ctx.n_rounds;
+        let h_evals = if ctx.source_h_evals.len() == expected_h_len {
+            ctx.source_h_evals.clone()
+        } else {
+            build_high_tensor_h_evals(c_evals, &ctx.tensor_batching_point, ctx.tau)
+        };
+        (h_evals, Vec::new())
+    } else if n_cols == 1 {
         build_high_tensor_layers_from_source_code(
             c_evals,
             &state.encoded_cols[0],
@@ -465,11 +537,15 @@ fn prove_source_binding(
     let n_queries = query_indices.len();
     profile_phase("observe_and_queries");
 
-    let source_pair_indices: Vec<usize> = query_indices
-        .iter()
-        .map(|&qi| high_pair_leaf_index(qi, log_n))
-        .collect();
-    let mut source_symbols = Vec::with_capacity(n_queries * n_cols * 2);
+    let source_pair_indices: Vec<usize> = if direct_source_expansion {
+        high_expansion_source_leaf_indices(&query_indices, log_n, ctx.tau)
+    } else {
+        query_indices
+            .iter()
+            .map(|&qi| high_pair_leaf_index(qi, log_n))
+            .collect()
+    };
+    let mut source_symbols = Vec::with_capacity(source_pair_indices.len() * n_cols * 2);
     for &leaf_idx in &source_pair_indices {
         let (pos0, pos1) = source_leaf_positions(log_n, leaf_idx);
         for col in &state.encoded_cols {
@@ -478,16 +554,21 @@ fn prove_source_binding(
         }
     }
     profile_phase("source_symbols");
-    let source_merkle_batch = build_short_batched_merkle_proof(
-        &state.source_tree,
+    let source_merkle_batch = state.source_tree.build_batched_merkle_proof(
+        &state.encoded_cols,
+        log_n,
+        n_cols,
         &source_pair_indices,
-        source_tree_depth(log_n),
     );
     profile_phase("source_merkle_batch");
 
     let mut folded_queried_symbols = Vec::with_capacity(folded_layers.len());
     let mut folded_merkle_batch = Vec::with_capacity(folded_layers.len());
-    let mut current_indices: Vec<usize> = source_pair_indices.clone();
+    let mut current_indices: Vec<usize> = if direct_source_expansion {
+        Vec::new()
+    } else {
+        source_pair_indices.clone()
+    };
     for layer in &folded_layers {
         let pair_indices: Vec<usize> = current_indices
             .iter()
@@ -496,7 +577,30 @@ fn prove_source_binding(
         let mut symbols = Vec::with_capacity(n_queries);
         for &pair_idx in &pair_indices {
             let (pos0, pos1) = high_pair_positions(layer.log_rows, pair_idx);
-            symbols.push((layer.code.idx(pos0), layer.code.idx(pos1)));
+            let pair = if let Some(code) = &layer.code {
+                (code.idx(pos0), code.idx(pos1))
+            } else {
+                debug_assert_eq!(n_cols, 1);
+                (
+                    source_high_fold_symbol(
+                        &state.encoded_cols[0],
+                        log_n,
+                        layer.log_rows,
+                        pos0,
+                        &ctx.tensor_batching_point,
+                        ctx.tau,
+                    ),
+                    source_high_fold_symbol(
+                        &state.encoded_cols[0],
+                        log_n,
+                        layer.log_rows,
+                        pos1,
+                        &ctx.tensor_batching_point,
+                        ctx.tau,
+                    ),
+                )
+            };
+            symbols.push(pair);
         }
         let batch = build_short_batched_merkle_proof(
             &layer.tree,
@@ -555,9 +659,15 @@ fn verify_source_binding(
         ));
     }
     let expected_layers = ctx.tau.saturating_sub(1);
-    if proof.folded_roots.len() != expected_layers
-        || proof.folded_queried_symbols.len() != expected_layers
-        || proof.folded_merkle_batch.len() != expected_layers
+    let direct_source_expansion = n_cols == 1
+        && expected_layers > 0
+        && proof.folded_roots.is_empty()
+        && proof.folded_queried_symbols.is_empty()
+        && proof.folded_merkle_batch.is_empty();
+    if !direct_source_expansion
+        && (proof.folded_roots.len() != expected_layers
+            || proof.folded_queried_symbols.len() != expected_layers
+            || proof.folded_merkle_batch.len() != expected_layers)
     {
         return Err("source binding high-fold round count mismatch".into());
     }
@@ -572,28 +682,32 @@ fn verify_source_binding(
     );
     let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
     let n_queries = query_indices.len();
-    if proof.source_symbols.len() != n_queries * n_cols * 2 {
-        return Err(format!(
-            "source binding source symbol length mismatch: expected {}, got {}",
-            n_queries * n_cols * 2,
-            proof.source_symbols.len()
-        ));
-    }
 
     let source_root = source_root_short_from_cap(&commitment.cap)
         .ok_or_else(|| "missing short source root in interleaved commitment".to_string())?;
-    let source_pair_indices: Vec<usize> = query_indices
-        .iter()
-        .map(|&qi| high_pair_leaf_index(qi, log_n))
-        .collect();
-    let mut source_leaf_hashes = Vec::with_capacity(n_queries);
-    for query_idx in 0..n_queries {
-        let start = query_idx * n_cols * 2;
+    let source_pair_indices: Vec<usize> = if direct_source_expansion {
+        high_expansion_source_leaf_indices(&query_indices, log_n, ctx.tau)
+    } else {
+        query_indices
+            .iter()
+            .map(|&qi| high_pair_leaf_index(qi, log_n))
+            .collect()
+    };
+    if proof.source_symbols.len() != source_pair_indices.len() * n_cols * 2 {
+        return Err(format!(
+            "source binding source symbol length mismatch: expected {}, got {}",
+            source_pair_indices.len() * n_cols * 2,
+            proof.source_symbols.len()
+        ));
+    }
+    let mut source_leaf_hashes = Vec::with_capacity(source_pair_indices.len());
+    for (leaf_pos, &leaf_idx) in source_pair_indices.iter().enumerate() {
+        let start = leaf_pos * n_cols * 2;
         let end = start + n_cols * 2;
         source_leaf_hashes.push(source_leaf_hash(
             log_n,
             n_cols,
-            source_pair_indices[query_idx],
+            leaf_idx,
             &proof.source_symbols[start..end],
         ));
     }
@@ -604,6 +718,34 @@ fn verify_source_binding(
         &source_pair_indices,
         &source_leaf_hashes,
     )?;
+
+    let h_code = Code::new_parallel(&proof.h_evals, ntt);
+    if direct_source_expansion {
+        let source_pairs: Vec<(Block128, Block128)> = proof
+            .source_symbols
+            .chunks_exact(2)
+            .map(|chunk| (chunk[0], chunk[1]))
+            .collect();
+        for (query_idx, &qi) in query_indices.iter().enumerate() {
+            let h_idx = high_fold_h_code_index(qi, log_n, ctx.tau);
+            let folded = source_high_fold_symbol_from_authenticated_pairs(
+                &source_pair_indices,
+                &source_pairs,
+                log_n,
+                log_n - ctx.tau,
+                h_idx,
+                &ctx.tensor_batching_point,
+                ctx.tau,
+            )?;
+            let expected = h_code.idx(h_idx);
+            if folded != expected {
+                return Err(format!(
+                    "source binding direct high expansion mismatch at query {query_idx}: got {folded:?} expected {expected:?}"
+                ));
+            }
+        }
+        return Ok(());
+    }
 
     let weights_flat = compute_horner_weights_flat(gamma, n_cols);
     let mut folded_symbols = Vec::with_capacity(n_queries);
@@ -674,7 +816,6 @@ fn verify_source_binding(
         current_indices = pair_indices;
     }
 
-    let h_code = Code::new_parallel(&proof.h_evals, ntt);
     for (query_idx, folded) in folded_symbols.iter().enumerate() {
         let expected = h_code.idx(current_indices[query_idx]);
         if *folded != expected {
@@ -706,6 +847,15 @@ fn observe_source_binding_commitments(
     }
 }
 
+fn build_high_tensor_h_evals(c_evals: &[Block128], beta: &[Block128], tau: usize) -> Vec<Block128> {
+    let mut current = c_evals.to_vec();
+    for round in 0..tau {
+        let r = beta[tau - 1 - round];
+        fold_highest_mle_eq_in_place(&mut current, r);
+    }
+    current
+}
+
 fn build_high_tensor_layers(
     c_evals: &[Block128],
     beta: &[Block128],
@@ -725,7 +875,7 @@ fn build_high_tensor_layers(
             let tree = build_high_pair_tree(&code, layer_log, hasher);
             layers.push(HighFoldLayer {
                 log_rows: layer_log,
-                code,
+                code: Some(code),
                 tree,
             });
         }
@@ -750,6 +900,7 @@ fn build_high_tensor_layers_from_source_code(
     let mut tree_total = Duration::ZERO;
 
     let mut current = c_evals.to_vec();
+    let mut prev_encoding: Option<Vec<Block128>> = None;
     let mut layers: Vec<HighFoldLayer> = Vec::with_capacity(tau.saturating_sub(1));
     for round in 0..tau {
         let r = beta[tau - 1 - round];
@@ -762,11 +913,7 @@ fn build_high_tensor_layers_from_source_code(
 
         let before_layer_log = log_n - round;
         let layer_log = before_layer_log - 1;
-        let input_code: &[Block128] = if round == 0 {
-            source_code
-        } else {
-            &layers[round - 1].code.encoding
-        };
+        let input_code: &[Block128] = prev_encoding.as_deref().unwrap_or(source_code);
         let out_len = RATE * (1usize << layer_log);
         let code_t0 = Instant::now();
         let encoding: Vec<Block128> = (0..out_len)
@@ -787,9 +934,10 @@ fn build_high_tensor_layers_from_source_code(
         let tree_t0 = Instant::now();
         let tree = build_high_pair_tree(&code, layer_log, hasher);
         tree_total += tree_t0.elapsed();
+        prev_encoding = Some(code.encoding);
         layers.push(HighFoldLayer {
             log_rows: layer_log,
-            code,
+            code: None,
             tree,
         });
     }
@@ -891,6 +1039,122 @@ fn mle_evaluate_small(evals: &[Block128], point: &[Block128]) -> Block128 {
 
 fn high_pair_tree_depth(layer_log: usize) -> usize {
     layer_log + LOG_RATE - 1
+}
+
+fn high_fold_h_code_index(query_index: usize, log_n: usize, tau: usize) -> usize {
+    let mut idx = high_pair_leaf_index(query_index, log_n);
+    for layer_idx in 0..tau.saturating_sub(1) {
+        let layer_log = log_n - 1 - layer_idx;
+        idx = high_pair_leaf_index(idx, layer_log);
+    }
+    idx
+}
+
+fn high_expansion_source_leaf_indices(
+    query_indices: &[usize],
+    log_n: usize,
+    tau: usize,
+) -> Vec<usize> {
+    let mut out = Vec::with_capacity(query_indices.len() * (1usize << tau.saturating_sub(1)));
+    let target_log = log_n - tau;
+    for &qi in query_indices {
+        let h_idx = high_fold_h_code_index(qi, log_n, tau);
+        collect_high_expansion_source_leaves(log_n, target_log, h_idx, &mut out);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn collect_high_expansion_source_leaves(
+    source_log: usize,
+    target_log: usize,
+    code_index: usize,
+    out: &mut Vec<usize>,
+) {
+    debug_assert!(target_log < source_log);
+    if target_log + 1 == source_log {
+        out.push(code_index);
+        return;
+    }
+    let before_log = target_log + 1;
+    let (pos0, pos1) = high_pair_positions(before_log, code_index);
+    collect_high_expansion_source_leaves(source_log, before_log, pos0, out);
+    collect_high_expansion_source_leaves(source_log, before_log, pos1, out);
+}
+
+fn source_high_fold_symbol_from_authenticated_pairs(
+    source_leaf_indices: &[usize],
+    source_pairs: &[(Block128, Block128)],
+    source_log: usize,
+    target_log: usize,
+    code_index: usize,
+    beta: &[Block128],
+    tau: usize,
+) -> Result<Block128, String> {
+    debug_assert_eq!(source_leaf_indices.len(), source_pairs.len());
+    debug_assert!(target_log < source_log);
+    if target_log + 1 == source_log {
+        let leaf_pos = source_leaf_indices
+            .binary_search(&code_index)
+            .map_err(|_| format!("missing source expansion leaf {code_index}"))?;
+        let (s0, s1) = source_pairs[leaf_pos];
+        return Ok(tensor_high_fold_pair(
+            beta[tau - 1],
+            source_log,
+            code_index,
+            s0,
+            s1,
+        ));
+    }
+
+    let before_log = target_log + 1;
+    let round = source_log - before_log;
+    let r = beta[tau - 1 - round];
+    let (pos0, pos1) = high_pair_positions(before_log, code_index);
+    let s0 = source_high_fold_symbol_from_authenticated_pairs(
+        source_leaf_indices,
+        source_pairs,
+        source_log,
+        before_log,
+        pos0,
+        beta,
+        tau,
+    )?;
+    let s1 = source_high_fold_symbol_from_authenticated_pairs(
+        source_leaf_indices,
+        source_pairs,
+        source_log,
+        before_log,
+        pos1,
+        beta,
+        tau,
+    )?;
+    Ok(tensor_high_fold_pair(r, before_log, code_index, s0, s1))
+}
+
+fn source_high_fold_symbol(
+    source_code: &[Block128],
+    source_log: usize,
+    target_log: usize,
+    code_index: usize,
+    beta: &[Block128],
+    tau: usize,
+) -> Block128 {
+    debug_assert!(target_log <= source_log);
+    debug_assert!(source_log - target_log <= tau);
+    debug_assert!(code_index < RATE * (1usize << target_log));
+    if target_log == source_log {
+        return source_code[code_index];
+    }
+
+    let before_log = target_log + 1;
+    let round = source_log - before_log;
+    let r = beta[tau - 1 - round];
+    let (pos0, pos1) = high_pair_positions(before_log, code_index);
+    let s0 = source_high_fold_symbol(source_code, source_log, before_log, pos0, beta, tau);
+    let s1 = source_high_fold_symbol(source_code, source_log, before_log, pos1, beta, tau);
+    tensor_high_fold_pair(r, before_log, code_index, s0, s1)
 }
 
 fn high_pair_leaf_index(code_index: usize, layer_log: usize) -> usize {
@@ -1070,6 +1334,47 @@ mod tests {
                 .map(|i| Block128::from((i as u128).wrapping_mul(7) ^ 0xCAFE))
                 .collect(),
         ]
+    }
+
+    fn test_one_column_with_log(log_rows: usize) -> Vec<Block128> {
+        let n = 1usize << log_rows;
+        (0..n)
+            .map(|i| Block128::from((i as u128).wrapping_mul(0x1_0001) ^ 0x5151))
+            .collect()
+    }
+
+    fn valid_one_col_fixture_with_log(
+        log_rows: usize,
+        num_queries: usize,
+    ) -> (
+        InterleavedCommitment,
+        Vec<Block128>,
+        MixedOpeningProof,
+        AdditiveNTT<Block128>,
+        Blake3Hasher,
+    ) {
+        let col = test_one_column_with_log(log_rows);
+        let col_refs: Vec<&[Block128]> = vec![col.as_slice()];
+        let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let (commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
+        let primary_point: Vec<Block128> = (0..log_rows)
+            .map(|i| Block128::from(0x3100u128 + i as u128))
+            .collect();
+
+        let mut prover_channel = Channel::new();
+        absorb_cap(&mut prover_channel, &commitment.cap);
+        let proof = prove_mixed_opening(
+            &state,
+            &primary_point,
+            &[],
+            &ntt,
+            &mut prover_channel,
+            &hasher,
+            num_queries,
+        );
+
+        (commitment, primary_point, proof, ntt, hasher)
     }
 
     fn valid_fixture() -> (
@@ -1270,10 +1575,26 @@ mod tests {
         assert_eq!(layers_ref.len(), layers_direct.len());
         for (idx, (a, b)) in layers_ref.iter().zip(layers_direct.iter()).enumerate() {
             assert_eq!(a.log_rows, b.log_rows, "layer {idx} log_rows mismatch");
-            assert_eq!(
-                a.code.encoding, b.code.encoding,
-                "layer {idx} code mismatch"
+            assert!(
+                b.code.is_none(),
+                "direct layer {idx} must not retain full code"
             );
+            let a_code = a.code.as_ref().expect("reference path stores layer code");
+            for code_index in 0..a_code.encoding.len() {
+                let got = source_high_fold_symbol(
+                    &source_code.encoding,
+                    log_rows,
+                    b.log_rows,
+                    code_index,
+                    &beta,
+                    tau,
+                );
+                assert_eq!(
+                    got,
+                    a_code.idx(code_index),
+                    "layer {idx} code mismatch at index {code_index}"
+                );
+            }
             assert_eq!(
                 a.tree.get_root(),
                 b.tree.get_root(),
@@ -1291,6 +1612,44 @@ mod tests {
         let (commitment, primary_point, claims, proof, ntt, hasher) = valid_fixture();
         verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
             .expect("valid mixed opening must verify");
+    }
+
+    #[test]
+    fn one_col_direct_source_expansion_passes_and_tamper_rejects() {
+        let log_rows = crate::compact_fri::COMPACT_TAU + 2;
+        let num_queries = 4;
+        let (commitment, primary_point, proof, ntt, hasher) =
+            valid_one_col_fixture_with_log(log_rows, num_queries);
+        assert!(proof.source_proof.folded_roots.is_empty());
+        assert!(proof.source_proof.folded_queried_symbols.is_empty());
+        assert!(proof.source_proof.folded_merkle_batch.is_empty());
+        assert!(proof.source_proof.source_symbols.len() > num_queries * 2);
+        verify_with_claims_num_queries(
+            &commitment,
+            &primary_point,
+            &[],
+            &proof,
+            &ntt,
+            &hasher,
+            num_queries,
+        )
+        .expect("valid one-column direct source expansion must verify");
+
+        let mut tampered = proof.clone();
+        tampered.source_proof.source_symbols[0] += Block128::ONE;
+        assert!(
+            verify_with_claims_num_queries(
+                &commitment,
+                &primary_point,
+                &[],
+                &tampered,
+                &ntt,
+                &hasher,
+                num_queries,
+            )
+            .is_err(),
+            "tampered direct source expansion symbol must reject"
+        );
     }
 
     #[test]

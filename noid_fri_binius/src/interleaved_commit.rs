@@ -37,13 +37,19 @@ pub struct InterleavedProverState<'a> {
     /// RS-encoded source columns used by source-bound mixed openings.
     /// Layout: `encoded_cols[col][code_index]`.
     pub encoded_cols: Vec<Vec<Block128>>,
-    /// 128-bit Merkle tree over encoded interleaved high-pair leaves. Each leaf
-    /// contains the two code symbols needed for the first source TensorFold
-    /// over the highest message variable, for every committed column.
-    pub source_tree: ShortMerkleTree,
+    /// 128-bit Merkle commitment over encoded interleaved high-pair leaves. Each
+    /// leaf contains the two code symbols needed for the first source TensorFold
+    /// over the highest message variable, for every committed column. Large
+    /// trees are retained in chunked form to avoid keeping a full 1GB source tree
+    /// resident for `log_rows=24` block bucket openings.
+    pub source_tree: SourceMerkleTree,
 }
 
 pub type ShortHash = [u8; 16];
+
+const SOURCE_MERKLE_CHUNK_LOG: usize = 8;
+const SOURCE_MERKLE_CHUNK_LEAVES: usize = 1 << SOURCE_MERKLE_CHUNK_LOG;
+const SOURCE_MERKLE_FULL_TREE_MAX_DEPTH: usize = 18;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ShortBatchedMerkleProof {
@@ -57,6 +63,100 @@ pub struct ShortMerkleTree {
     layer_lens: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceMerkleTree {
+    Full(ShortMerkleTree),
+    Chunked {
+        full_depth: usize,
+        chunk_log: usize,
+        upper_tree: ShortMerkleTree,
+    },
+}
+
+impl SourceMerkleTree {
+    pub(crate) fn new(encoded_cols: &[Vec<Block128>], log_rows: usize, n_cols: usize) -> Self {
+        let full_depth = source_tree_depth(log_rows);
+        if full_depth <= SOURCE_MERKLE_FULL_TREE_MAX_DEPTH {
+            return Self::Full(ShortMerkleTree::new(build_source_leaf_hashes(
+                encoded_cols,
+                log_rows,
+                n_cols,
+            )));
+        }
+
+        let chunk_log = SOURCE_MERKLE_CHUNK_LOG.min(full_depth);
+        let upper_depth = full_depth - chunk_log;
+        let chunk_count = 1usize << upper_depth;
+        let chunk_roots: Vec<ShortHash> = (0..chunk_count)
+            .into_par_iter()
+            .with_min_len(16)
+            .map(|chunk_idx| {
+                build_source_chunk_root(encoded_cols, log_rows, n_cols, chunk_log, chunk_idx)
+            })
+            .collect();
+        Self::Chunked {
+            full_depth,
+            chunk_log,
+            upper_tree: ShortMerkleTree::new(chunk_roots),
+        }
+    }
+
+    pub(crate) fn get_root(&self) -> ShortHash {
+        match self {
+            Self::Full(tree) => tree.get_root(),
+            Self::Chunked { upper_tree, .. } => upper_tree.get_root(),
+        }
+    }
+
+    pub(crate) fn build_batched_merkle_proof(
+        &self,
+        encoded_cols: &[Vec<Block128>],
+        log_rows: usize,
+        n_cols: usize,
+        leaf_indices: &[usize],
+    ) -> ShortBatchedMerkleProof {
+        match self {
+            Self::Full(tree) => {
+                build_short_batched_merkle_proof(tree, leaf_indices, source_tree_depth(log_rows))
+            }
+            Self::Chunked {
+                full_depth,
+                chunk_log,
+                upper_tree,
+            } => {
+                debug_assert_eq!(*full_depth, source_tree_depth(log_rows));
+                let upper_depth = full_depth - chunk_log;
+                let mut chunk_cache: std::collections::HashMap<usize, ShortMerkleTree> =
+                    std::collections::HashMap::new();
+                build_short_batched_merkle_proof_with_getter(
+                    *full_depth,
+                    leaf_indices,
+                    |node_depth, node_index| {
+                        if node_depth <= upper_depth {
+                            return upper_tree.get_node_at_depth(node_depth, node_index);
+                        }
+
+                        let local_depth = node_depth - upper_depth;
+                        let local_width = 1usize << local_depth;
+                        let chunk_idx = node_index >> local_depth;
+                        let local_index = node_index & (local_width - 1);
+                        let chunk_tree = chunk_cache.entry(chunk_idx).or_insert_with(|| {
+                            build_source_chunk_tree(
+                                encoded_cols,
+                                log_rows,
+                                n_cols,
+                                *chunk_log,
+                                chunk_idx,
+                            )
+                        });
+                        chunk_tree.get_node_at_depth(local_depth, local_index)
+                    },
+                )
+            }
+        }
+    }
+}
+
 impl ShortMerkleTree {
     pub(crate) fn new(leaf_hashes: Vec<ShortHash>) -> Self {
         let n = leaf_hashes.len();
@@ -66,8 +166,8 @@ impl ShortMerkleTree {
         );
         let tree_depth = n.trailing_zeros() as usize;
         let total = 2 * n - 1;
-        let mut nodes = Vec::with_capacity(total);
-        nodes.extend_from_slice(&leaf_hashes);
+        let mut nodes = leaf_hashes;
+        nodes.reserve_exact(total - n);
         nodes.resize(total, [0u8; 16]);
 
         let mut level_start = 0usize;
@@ -164,6 +264,19 @@ pub(crate) fn build_short_batched_merkle_proof(
     leaf_indices: &[usize],
     depth: usize,
 ) -> ShortBatchedMerkleProof {
+    build_short_batched_merkle_proof_with_getter(depth, leaf_indices, |node_depth, node_index| {
+        tree.get_node_at_depth(node_depth, node_index)
+    })
+}
+
+fn build_short_batched_merkle_proof_with_getter<F>(
+    depth: usize,
+    leaf_indices: &[usize],
+    mut get_node_at_depth: F,
+) -> ShortBatchedMerkleProof
+where
+    F: FnMut(usize, usize) -> ShortHash,
+{
     let mut siblings = Vec::new();
     let mut known_at_layer: Vec<std::collections::HashSet<usize>> =
         vec![std::collections::HashSet::new(); depth + 1];
@@ -183,10 +296,10 @@ pub(crate) fn build_short_batched_merkle_proof(
             if left_known && right_known {
                 known_at_layer[d + 1].insert(parent);
             } else if left_known {
-                siblings.push(tree.get_node_at_depth(depth - d, right_child));
+                siblings.push(get_node_at_depth(depth - d, right_child));
                 known_at_layer[d + 1].insert(parent);
             } else if right_known {
-                siblings.push(tree.get_node_at_depth(depth - d, left_child));
+                siblings.push(get_node_at_depth(depth - d, left_child));
                 known_at_layer[d + 1].insert(parent);
             }
         }
@@ -314,8 +427,7 @@ pub fn interleaved_commit<'a>(
         .par_iter()
         .map(|col| Code::new_parallel(col, _ntt).encoding)
         .collect();
-    let source_leaf_hashes = build_source_leaf_hashes(&encoded_cols, log_rows, n_cols);
-    let source_tree = ShortMerkleTree::new(source_leaf_hashes);
+    let source_tree = SourceMerkleTree::new(&encoded_cols, log_rows, n_cols);
     let source_root = short_hash_to_output(source_tree.get_root());
 
     let mut cap_hashes = cap_hashes;
@@ -384,26 +496,105 @@ fn build_source_leaf_hashes(
     log_rows: usize,
     n_cols: usize,
 ) -> Vec<ShortHash> {
+    assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
+    let leaf_count = source_leaf_count(log_rows);
+    (0..leaf_count)
+        .into_par_iter()
+        .map(|leaf_index| {
+            source_leaf_hash_from_encoded_cols_at(encoded_cols, log_rows, n_cols, leaf_index)
+        })
+        .collect()
+}
+
+fn build_source_chunk_root(
+    encoded_cols: &[Vec<Block128>],
+    log_rows: usize,
+    n_cols: usize,
+    chunk_log: usize,
+    chunk_idx: usize,
+) -> ShortHash {
+    assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
+    let chunk_leaf_count = 1usize << chunk_log;
+    let first_leaf = chunk_idx * chunk_leaf_count;
+    if chunk_log == SOURCE_MERKLE_CHUNK_LOG {
+        let mut layer = [[0u8; 16]; SOURCE_MERKLE_CHUNK_LEAVES];
+        for local in 0..chunk_leaf_count {
+            layer[local] = source_leaf_hash_from_encoded_cols_at(
+                encoded_cols,
+                log_rows,
+                n_cols,
+                first_leaf + local,
+            );
+        }
+        let mut len = chunk_leaf_count;
+        while len > 1 {
+            for i in 0..(len / 2) {
+                layer[i] = short_compress(&layer[2 * i], &layer[2 * i + 1]);
+            }
+            len /= 2;
+        }
+        return layer[0];
+    }
+
+    let mut layer: Vec<ShortHash> = (0..chunk_leaf_count)
+        .map(|local| {
+            source_leaf_hash_from_encoded_cols_at(
+                encoded_cols,
+                log_rows,
+                n_cols,
+                first_leaf + local,
+            )
+        })
+        .collect();
+    let mut len = chunk_leaf_count;
+    while len > 1 {
+        for i in 0..(len / 2) {
+            layer[i] = short_compress(&layer[2 * i], &layer[2 * i + 1]);
+        }
+        len /= 2;
+    }
+    layer[0]
+}
+
+fn build_source_chunk_tree(
+    encoded_cols: &[Vec<Block128>],
+    log_rows: usize,
+    n_cols: usize,
+    chunk_log: usize,
+    chunk_idx: usize,
+) -> ShortMerkleTree {
+    assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
+    let chunk_leaf_count = 1usize << chunk_log;
+    let first_leaf = chunk_idx * chunk_leaf_count;
+    let leaf_hashes: Vec<ShortHash> = (0..chunk_leaf_count)
+        .map(|local| {
+            source_leaf_hash_from_encoded_cols_at(
+                encoded_cols,
+                log_rows,
+                n_cols,
+                first_leaf + local,
+            )
+        })
+        .collect();
+    ShortMerkleTree::new(leaf_hashes)
+}
+
+fn source_leaf_hash_from_encoded_cols_at(
+    encoded_cols: &[Vec<Block128>],
+    log_rows: usize,
+    n_cols: usize,
+    leaf_index: usize,
+) -> ShortHash {
+    let (pos0, pos1) = source_leaf_positions(log_rows, leaf_index);
+    source_leaf_hash_from_encoded_cols(log_rows, n_cols, leaf_index, encoded_cols, pos0, pos1)
+}
+
+fn assert_source_encoded_shape(encoded_cols: &[Vec<Block128>], log_rows: usize, n_cols: usize) {
     assert_eq!(encoded_cols.len(), n_cols);
     let code_len = (1usize << log_rows) * RATE;
     for col in encoded_cols {
         assert_eq!(col.len(), code_len);
     }
-    let leaf_count = source_leaf_count(log_rows);
-    (0..leaf_count)
-        .into_par_iter()
-        .map(|leaf_index| {
-            let (pos0, pos1) = source_leaf_positions(log_rows, leaf_index);
-            source_leaf_hash_from_encoded_cols(
-                log_rows,
-                n_cols,
-                leaf_index,
-                encoded_cols,
-                pos0,
-                pos1,
-            )
-        })
-        .collect()
 }
 
 fn source_leaf_hash_from_encoded_cols(

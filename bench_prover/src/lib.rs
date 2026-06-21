@@ -26,6 +26,7 @@ use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
 use noid_chain::state_binding::BlockStateBinding;
 use noid_chain::{Block, BlockHeader, SlotValue};
+use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
@@ -179,6 +180,8 @@ where
 struct BenchFullBlockPhaseTiming {
     name: &'static str,
     elapsed: Duration,
+    mem: Option<MemSnapshot>,
+    delta_rss_mb: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -186,6 +189,8 @@ struct BenchFullBlockProfiler {
     enabled: bool,
     started: Instant,
     last: Instant,
+    start_mem: Option<MemSnapshot>,
+    last_mem: Option<MemSnapshot>,
     phases: Vec<BenchFullBlockPhaseTiming>,
 }
 
@@ -200,10 +205,17 @@ impl BenchFullBlockProfiler {
                 )
             })
             .unwrap_or(false);
+        let start_mem = if enabled {
+            current_mem_snapshot()
+        } else {
+            None
+        };
         Self {
             enabled,
             started: now,
             last: now,
+            start_mem,
+            last_mem: start_mem,
             phases: Vec::with_capacity(12),
         }
     }
@@ -213,11 +225,21 @@ impl BenchFullBlockProfiler {
             return;
         }
         let now = Instant::now();
+        let mem = current_mem_snapshot();
+        let delta_rss_mb = match (mem, self.last_mem) {
+            (Some(current), Some(previous)) => Some(current.delta_rss_mb(previous)),
+            _ => None,
+        };
         self.phases.push(BenchFullBlockPhaseTiming {
             name,
             elapsed: now.duration_since(self.last),
+            mem,
+            delta_rss_mb,
         });
         self.last = now;
+        if mem.is_some() {
+            self.last_mem = mem;
+        }
     }
 
     fn finish(
@@ -233,6 +255,7 @@ impl BenchFullBlockProfiler {
             return;
         }
         let total = self.started.elapsed();
+        let final_mem = current_mem_snapshot().or(self.last_mem);
         let summary = self
             .phases
             .iter()
@@ -241,17 +264,18 @@ impl BenchFullBlockProfiler {
             .join(", ");
         for phase in &self.phases {
             eprintln!(
-                "bench_full_block_profile phase n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} phase={} elapsed_ms={:.3}",
+                "bench_full_block_profile phase n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} phase={} elapsed_ms={:.3}{}",
                 n_standard,
                 n_sweep,
                 n_sweep_witnesses,
                 n_state_bindings,
                 phase.name,
-                phase.elapsed.as_secs_f64() * 1_000.0
+                phase.elapsed.as_secs_f64() * 1_000.0,
+                profile_mem_fields(phase.mem, phase.delta_rss_mb)
             );
         }
         eprintln!(
-            "bench_full_block_profile summary n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} has_standard_bucket={} has_sweep_bucket={} total_ms={:.3} phases={}",
+            "bench_full_block_profile summary n_standard={} n_sweep={} n_sweep_witnesses={} n_state_bindings={} has_standard_bucket={} has_sweep_bucket={} total_ms={:.3} phases={}{}",
             n_standard,
             n_sweep,
             n_sweep_witnesses,
@@ -259,8 +283,46 @@ impl BenchFullBlockProfiler {
             has_standard_bucket,
             has_sweep_bucket,
             total.as_secs_f64() * 1_000.0,
-            summary
+            summary,
+            profile_total_mem_fields(self.start_mem, final_mem)
         );
+    }
+}
+
+fn profile_mem_fields(mem: Option<MemSnapshot>, delta_rss_mb: Option<f64>) -> String {
+    let Some(mem) = mem else {
+        return String::new();
+    };
+    match delta_rss_mb {
+        Some(delta) => format!(
+            " rss_mb={:.1} hwm_mb={:.1} delta_rss_mb={:+.1}",
+            mem.rss_mb(),
+            mem.hwm_mb(),
+            delta
+        ),
+        None => format!(" rss_mb={:.1} hwm_mb={:.1}", mem.rss_mb(), mem.hwm_mb()),
+    }
+}
+
+fn profile_total_mem_fields(
+    start_mem: Option<MemSnapshot>,
+    final_mem: Option<MemSnapshot>,
+) -> String {
+    let Some(final_mem) = final_mem else {
+        return String::new();
+    };
+    match start_mem {
+        Some(start_mem) => format!(
+            " rss_mb={:.1} hwm_mb={:.1} delta_rss_mb={:+.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb(),
+            final_mem.delta_rss_mb(start_mem)
+        ),
+        None => format!(
+            " rss_mb={:.1} hwm_mb={:.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb()
+        ),
     }
 }
 

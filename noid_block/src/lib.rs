@@ -43,6 +43,7 @@ use noid_chain::fri_state::{
     cap_to_seg_root_with_depth, merkle_root_from_leaf, open_segment_at_point,
 };
 use noid_chain::segmented_state::SegmentColumns;
+use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_core::mle::{eq::eq_ind_partial_eval, split::split_mle_into_slices};
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128, TowerField};
@@ -628,8 +629,11 @@ pub fn block_recursive_claim_bytes(proof: &BlockProof) -> Vec<u8> {
         .expect("BlockRecursiveClaimTranscript serialization must be infallible")
 }
 
+const PROOF_TRANSCRIPT_HASH_WRITE_BUFFER: usize = 64 * 1024;
+
 struct ProofTranscriptHashWriter {
     sponge: Poseidon2bSponge,
+    buffer: Vec<u8>,
 }
 
 impl ProofTranscriptHashWriter {
@@ -638,21 +642,44 @@ impl ProofTranscriptHashWriter {
             sponge: Poseidon2bSponge::with_iv(noid_poseidon2b::native::domain::capacity_iv(
                 noid_poseidon2b::native::domain::TAG_FSCHALNG,
             )),
+            buffer: Vec::with_capacity(PROOF_TRANSCRIPT_HASH_WRITE_BUFFER),
         }
     }
 
-    fn finalize(self) -> [u8; 32] {
+    fn flush_buffer(&mut self) {
+        if !self.buffer.is_empty() {
+            self.sponge.update(&self.buffer);
+            self.buffer.clear();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        self.flush_buffer();
         self.sponge.finalize()
     }
 }
 
 impl Write for ProofTranscriptHashWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sponge.update(buf);
-        Ok(buf.len())
+    fn write(&mut self, mut buf: &[u8]) -> io::Result<usize> {
+        let written = buf.len();
+        while !buf.is_empty() {
+            if self.buffer.is_empty() && buf.len() >= PROOF_TRANSCRIPT_HASH_WRITE_BUFFER {
+                self.sponge.update(buf);
+                break;
+            }
+            let free = PROOF_TRANSCRIPT_HASH_WRITE_BUFFER - self.buffer.len();
+            let take = free.min(buf.len());
+            self.buffer.extend_from_slice(&buf[..take]);
+            buf = &buf[take..];
+            if self.buffer.len() == PROOF_TRANSCRIPT_HASH_WRITE_BUFFER {
+                self.flush_buffer();
+            }
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffer();
         Ok(())
     }
 }
@@ -942,12 +969,16 @@ fn apply_claims_to_cols(
 struct ProveBlockPhaseTiming {
     name: &'static str,
     elapsed: Duration,
+    mem: Option<MemSnapshot>,
+    delta_rss_mb: Option<f64>,
 }
 
 #[derive(Debug)]
 struct ProveBlockProfilerInner {
     started: Instant,
     last: Instant,
+    start_mem: Option<MemSnapshot>,
+    last_mem: Option<MemSnapshot>,
     phases: Vec<ProveBlockPhaseTiming>,
 }
 
@@ -969,10 +1000,13 @@ impl ProveBlockProfiler {
 
         if enabled {
             let now = Instant::now();
+            let start_mem = current_mem_snapshot();
             Self {
                 inner: Some(ProveBlockProfilerInner {
                     started: now,
                     last: now,
+                    start_mem,
+                    last_mem: start_mem,
                     phases: Vec::with_capacity(16),
                 }),
             }
@@ -984,11 +1018,21 @@ impl ProveBlockProfiler {
     fn phase(&mut self, name: &'static str) {
         if let Some(inner) = &mut self.inner {
             let now = Instant::now();
+            let mem = current_mem_snapshot();
+            let delta_rss_mb = match (mem, inner.last_mem) {
+                (Some(current), Some(previous)) => Some(current.delta_rss_mb(previous)),
+                _ => None,
+            };
             inner.phases.push(ProveBlockPhaseTiming {
                 name,
                 elapsed: now.duration_since(inner.last),
+                mem,
+                delta_rss_mb,
             });
             inner.last = now;
+            if mem.is_some() {
+                inner.last_mem = mem;
+            }
         }
     }
 
@@ -1006,6 +1050,7 @@ impl ProveBlockProfiler {
         };
 
         let total = inner.started.elapsed();
+        let final_mem = current_mem_snapshot().or(inner.last_mem);
         let summary = inner
             .phases
             .iter()
@@ -1024,8 +1069,12 @@ impl ProveBlockProfiler {
                 "prove_block phase"
             );
             eprintln!(
-                "prove_block_profile phase n_tx={} n_state_bindings={} phase={} elapsed_ms={:.3}",
-                n_tx, n_state_bindings, phase.name, elapsed_ms
+                "prove_block_profile phase n_tx={} n_state_bindings={} phase={} elapsed_ms={:.3}{}",
+                n_tx,
+                n_state_bindings,
+                phase.name,
+                elapsed_ms,
+                profile_mem_fields(phase.mem, phase.delta_rss_mb)
             );
         }
 
@@ -1043,7 +1092,7 @@ impl ProveBlockProfiler {
             "prove_block phase profile"
         );
         eprintln!(
-            "prove_block_profile summary n_tx={} n_state_bindings={} n_air_cols={} n_auth_slices={} n_block_spine_slices={} log_len={} total_ms={:.3} phases={}",
+            "prove_block_profile summary n_tx={} n_state_bindings={} n_air_cols={} n_auth_slices={} n_block_spine_slices={} log_len={} total_ms={:.3} phases={}{}",
             n_tx,
             n_state_bindings,
             n_air_cols,
@@ -1051,13 +1100,51 @@ impl ProveBlockProfiler {
             n_block_spine_slices,
             log_len,
             total_ms,
-            summary
+            summary,
+            profile_total_mem_fields(inner.start_mem, final_mem)
         );
     }
 }
 
 fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
+}
+
+fn profile_mem_fields(mem: Option<MemSnapshot>, delta_rss_mb: Option<f64>) -> String {
+    let Some(mem) = mem else {
+        return String::new();
+    };
+    match delta_rss_mb {
+        Some(delta) => format!(
+            " rss_mb={:.1} hwm_mb={:.1} delta_rss_mb={:+.1}",
+            mem.rss_mb(),
+            mem.hwm_mb(),
+            delta
+        ),
+        None => format!(" rss_mb={:.1} hwm_mb={:.1}", mem.rss_mb(), mem.hwm_mb()),
+    }
+}
+
+fn profile_total_mem_fields(
+    start_mem: Option<MemSnapshot>,
+    final_mem: Option<MemSnapshot>,
+) -> String {
+    let Some(final_mem) = final_mem else {
+        return String::new();
+    };
+    match start_mem {
+        Some(start_mem) => format!(
+            " rss_mb={:.1} hwm_mb={:.1} delta_rss_mb={:+.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb(),
+            final_mem.delta_rss_mb(start_mem)
+        ),
+        None => format!(
+            " rss_mb={:.1} hwm_mb={:.1}",
+            final_mem.rss_mb(),
+            final_mem.hwm_mb()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

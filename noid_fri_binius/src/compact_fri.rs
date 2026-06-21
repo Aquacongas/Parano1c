@@ -119,6 +119,9 @@ pub(crate) struct CompactFriQueryContext {
     pub n_rounds: usize,
     pub tensor_batching_point: Vec<Block128>,
     pub initial_sumcheck_claim: Block128,
+    /// Prover-only tensor-batched low table H. Verifier contexts leave this empty
+    /// and use the serialized source-binding H instead.
+    pub source_h_evals: Vec<Block128>,
     pub fri_roots: Vec<HashOutput>,
     pub final_codeword: Vec<Block128>,
 }
@@ -350,6 +353,7 @@ where
         n_rounds,
         tensor_batching_point: tensor_batching_point.clone(),
         initial_sumcheck_claim: sum_check_claim,
+        source_h_evals: batched_evals,
         fri_roots: fri_roots.clone(),
         final_codeword: final_codeword.clone(),
     };
@@ -552,6 +556,7 @@ where
         n_rounds,
         tensor_batching_point: tensor_batching_point.clone(),
         initial_sumcheck_claim,
+        source_h_evals: Vec::new(),
         fri_roots: proof.fri_roots.clone(),
         final_codeword: proof.final_codeword.clone(),
     };
