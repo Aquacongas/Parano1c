@@ -48,7 +48,8 @@
 //! as integer-doubling anywhere in the chain.
 
 use crate::airs::bit_adder::{
-    bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
+    bit_adder_carry_programme, bit_adder_is_input_programme, bit_adder_is_reset_programme,
+    bit_adder_operand_programme, bit_adder_operand_u128_programme, bit_adder_sum_programme,
     emit_block_constraints, BitAdderAir, BitAdderLayout, BIT_ADDER_COL_A, BIT_ADDER_COL_B,
     BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT, BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM,
     BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_N_COLS,
@@ -354,7 +355,7 @@ impl Constraint for BalanceZeroAtTransitionGate {
 
 /// One bridge spec: upstream block feeds one operand slot
 /// (`a` or `b`) of the downstream block.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OperandSlot {
     A,
     B,
@@ -908,24 +909,11 @@ pub fn emit_sweep_balance_constraints(base_col: usize) -> Vec<Box<dyn Constraint
     constraints
 }
 
-pub fn build_sweep_balance_trace_parts(
-    log_rows: usize,
+fn sweep_balance_block_specs(
     inputs: [u64; SWEEP_BALANCE_INPUTS],
     outputs: [u64; SWEEP_BALANCE_OUTPUTS],
     fee: u64,
-) -> (Vec<Vec<Block128>>, Vec<ColumnDomain>) {
-    assert!(
-        log_rows >= BALANCE_MIN_LOG_ROWS,
-        "sweep balance sub-trace needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
-    );
-    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
-
-    fn first_pair(n: usize, a: u128, b: u128) -> Vec<(u128, u128)> {
-        let mut v = vec![(0u128, 0u128); n];
-        v[0] = (a, b);
-        v
-    }
-
+) -> Vec<(usize, u128, u128)> {
     let mut lhs = [0u128; SWEEP_BALANCE_LEAVES];
     for i in 0..SWEEP_BALANCE_INPUTS {
         lhs[i] = inputs[i] as u128;
@@ -953,10 +941,30 @@ pub fn build_sweep_balance_trace_parts(
         debug_assert_eq!(level_values.len(), 1);
     }
     debug_assert_eq!(per_block.len(), SWEEP_BALANCE_N_BLOCKS);
+    per_block
+}
+
+pub fn build_sweep_balance_trace_parts(
+    log_rows: usize,
+    inputs: [u64; SWEEP_BALANCE_INPUTS],
+    outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+    fee: u64,
+) -> (Vec<Vec<Block128>>, Vec<ColumnDomain>) {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance sub-trace needs log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let n_instances = 1usize << (log_rows - BIT_ADDER_LOG_WORD_BITS);
+
+    fn first_pair(n: usize, a: u128, b: u128) -> Vec<(u128, u128)> {
+        let mut v = vec![(0u128, 0u128); n];
+        v[0] = (a, b);
+        v
+    }
 
     let mut cols: Vec<Vec<Block128>> = Vec::with_capacity(SWEEP_BALANCE_N_COLS);
     let mut domains: Vec<ColumnDomain> = Vec::with_capacity(SWEEP_BALANCE_N_COLS);
-    for (width, a, b) in per_block {
+    for (width, a, b) in sweep_balance_block_specs(inputs, outputs, fee) {
         let air = BitAdderAir::new(width, log_rows);
         let sub = air.build_trace(&first_pair(n_instances, a, b));
         cols.extend(sub.columns);
@@ -1040,6 +1048,100 @@ pub fn emit_sweep_balance_value_public_columns(
         bit_adder_operand_programme(64, fee, log_rows),
     ));
 
+    out
+}
+
+/// Pin every deterministic sweep adder `sum` and `carry` column to the exact
+/// programmes implied by the public values. This removes those columns from the
+/// source-bound PCS surface without changing the AIR equations or adding any
+/// char-2 integer shortcut.
+pub fn emit_sweep_balance_sum_carry_public_columns(
+    base_col: usize,
+    log_rows: usize,
+    inputs: [u64; SWEEP_BALANCE_INPUTS],
+    outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+    fee: u64,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance sum/carry publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let mut out = Vec::with_capacity(2 * SWEEP_BALANCE_N_BLOCKS);
+    for (blk, (width, a, b)) in sweep_balance_block_specs(inputs, outputs, fee)
+        .into_iter()
+        .enumerate()
+    {
+        let block_base = base_col + blk * BIT_ADDER_N_COLS;
+        out.push(PublicColumn::new(
+            block_base + BIT_ADDER_COL_SUM,
+            bit_adder_sum_programme(width, a, b, log_rows),
+        ));
+        out.push(PublicColumn::new(
+            block_base + BIT_ADDER_COL_CARRY,
+            bit_adder_carry_programme(width, a, b, log_rows),
+        ));
+    }
+    out
+}
+
+#[inline]
+fn sweep_primary_operand_pinned(blk: usize, slot: OperandSlot) -> bool {
+    if blk < SWEEP_BALANCE_TREE_BLOCKS {
+        // LHS leaf operands 0..24 are public input values.
+        let leaf = 2 * blk
+            + match slot {
+                OperandSlot::A => 0,
+                OperandSlot::B => 1,
+            };
+        return leaf < SWEEP_BALANCE_INPUTS;
+    }
+
+    if blk < 2 * SWEEP_BALANCE_TREE_BLOCKS {
+        let rhs_blk = blk - SWEEP_BALANCE_TREE_BLOCKS;
+        if rhs_blk == 0 {
+            // RHS leaves 0 and 1 are public output values.
+            return true;
+        }
+        if rhs_blk == 1 && slot == OperandSlot::A {
+            // RHS leaf 2 is the public fee value.
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Pin deterministic non-primary sweep operands: zero leaf pads and internal
+/// tree operands. One zero leaf operand is intentionally left committed so the
+/// current production PCS path keeps a non-empty committed surface.
+pub fn emit_sweep_balance_deterministic_operand_public_columns(
+    base_col: usize,
+    log_rows: usize,
+    inputs: [u64; SWEEP_BALANCE_INPUTS],
+    outputs: [u64; SWEEP_BALANCE_OUTPUTS],
+    fee: u64,
+) -> Vec<PublicColumn> {
+    assert!(
+        log_rows >= BALANCE_MIN_LOG_ROWS,
+        "sweep balance deterministic operand publics need log_rows >= {BALANCE_MIN_LOG_ROWS}"
+    );
+    let leave_committed = (sweep_block(1, 0, 1), OperandSlot::B);
+    let mut out = Vec::with_capacity(2 * SWEEP_BALANCE_N_BLOCKS);
+    for (blk, (width, a, b)) in sweep_balance_block_specs(inputs, outputs, fee)
+        .into_iter()
+        .enumerate()
+    {
+        for (slot, value) in [(OperandSlot::A, a), (OperandSlot::B, b)] {
+            if sweep_primary_operand_pinned(blk, slot) || (blk, slot) == leave_committed {
+                continue;
+            }
+            out.push(PublicColumn::new(
+                dst_col_at(blk, slot, base_col),
+                bit_adder_operand_u128_programme(width, value, log_rows),
+            ));
+        }
+    }
+    debug_assert_eq!(out.len(), 95);
     out
 }
 
@@ -1206,6 +1308,31 @@ mod tests {
                 "sweep balanced tx rejected: seed={seed} ins_sum={} outs={outs:?} fee={fee}",
                 ins.iter().map(|&v| v as u128).sum::<u128>()
             );
+        }
+    }
+
+    #[test]
+    fn sweep_sum_carry_public_programmes_match_trace() {
+        let (ins, outs, fee) = balanced_sweep_tuple(11);
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        let trace = air.build_trace(ins, outs, fee);
+        let publics = emit_sweep_balance_sum_carry_public_columns(0, LOG_ROWS, ins, outs, fee);
+        assert_eq!(publics.len(), 2 * SWEEP_BALANCE_N_BLOCKS);
+        for public in publics {
+            assert_eq!(public.values, trace.columns[public.col]);
+        }
+    }
+
+    #[test]
+    fn sweep_deterministic_operand_public_programmes_match_trace() {
+        let (ins, outs, fee) = balanced_sweep_tuple(12);
+        let air = Sweep25x2BalanceGateAir::new(LOG_ROWS);
+        let trace = air.build_trace(ins, outs, fee);
+        let publics =
+            emit_sweep_balance_deterministic_operand_public_columns(0, LOG_ROWS, ins, outs, fee);
+        assert_eq!(publics.len(), 95);
+        for public in publics {
+            assert_eq!(public.values, trace.columns[public.col]);
         }
     }
 

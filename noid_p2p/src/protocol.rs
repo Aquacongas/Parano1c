@@ -61,17 +61,19 @@ pub struct GetRecentBlockRequest {
     pub height: u64,
 }
 
-/// Response: full block bytes + ZK proof bytes.
+/// Response: full block bytes + ZK proof bytes + public AuthGKR sidecar bytes.
 ///
-/// Both fields are `None` when the peer does not have the block.
-/// `block_proof_bytes` is `None` (not empty) for coinbase-only blocks that
-/// carry no user transactions — those blocks have no ZK proof to serve.
+/// All optional fields are `None` when the peer does not have the block.
+/// `block_proof_bytes` and `block_auth_sidecar_bytes` are `None` (not empty)
+/// for coinbase-only blocks that carry no user transactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockResponse {
     /// `Block::to_bytes()` — header + transactions.
     pub block_bytes: Option<Vec<u8>>,
     /// `BlockProof` bincode bytes.  `None` for coinbase-only blocks.
     pub block_proof_bytes: Option<Vec<u8>>,
+    /// `BlockAuthSidecar` bincode bytes.  `None` for coinbase-only blocks.
+    pub block_auth_sidecar_bytes: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +205,7 @@ pub enum BlockGossipMsg {
         hash: [u8; 32],
         block_bytes: Vec<u8>,
         block_proof_bytes: Vec<u8>,
+        block_auth_sidecar_bytes: Vec<u8>,
     },
 }
 

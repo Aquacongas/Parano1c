@@ -315,10 +315,15 @@ impl<F: TowerField> AdditiveNTT<F> {
         let start = round as usize;
         let log_n = data.len().trailing_zeros() as usize;
         let end = start + log_n;
-        if end > self.basis.len() {
-            return;
-        }
-        let sub_basis = &self.basis[start..end];
+        let owned_basis;
+        let sub_basis = if end <= self.basis.len() {
+            &self.basis[start..end]
+        } else {
+            owned_basis = (start..end)
+                .map(|i| F::from(1u128 << i))
+                .collect::<Vec<_>>();
+            &owned_basis
+        };
         let transformed = forward_ntt(data, sub_basis);
         data.copy_from_slice(&transformed);
     }
@@ -356,10 +361,15 @@ impl AdditiveNTT<Block128> {
         let start = round as usize;
         let log_n = data.len().trailing_zeros() as usize;
         let end = start + log_n;
-        if end > self.basis.len() {
-            return;
-        }
-        let sub_basis = &self.basis[start..end];
+        let owned_basis;
+        let sub_basis = if end <= self.basis.len() {
+            &self.basis[start..end]
+        } else {
+            owned_basis = (start..end)
+                .map(|i| Block128::from(1u128 << i))
+                .collect::<Vec<_>>();
+            &owned_basis
+        };
         forward_ntt_parallel_inplace(data, sub_basis);
     }
 }

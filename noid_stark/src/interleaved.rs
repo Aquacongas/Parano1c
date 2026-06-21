@@ -268,6 +268,94 @@ fn duration_ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
 }
 
+fn public_column_flags<A: Air + ?Sized>(
+    air: &A,
+    n_air_cols: usize,
+) -> Result<Vec<bool>, VerifyError> {
+    let expected_rows = 1usize << air.log_rows();
+    let mut flags = vec![false; n_air_cols];
+    for pc in air.public_columns() {
+        if pc.col >= n_air_cols || pc.values.len() != expected_rows || flags[pc.col] {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        flags[pc.col] = true;
+    }
+    Ok(flags)
+}
+
+fn committed_air_indices_from_public_flags(flags: &[bool]) -> Vec<usize> {
+    flags
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, is_public)| (!*is_public).then_some(idx))
+        .collect()
+}
+
+fn committed_column_positions(
+    n_air_cols: usize,
+    n_slices: usize,
+    committed_air_indices: &[usize],
+) -> Result<Vec<Option<usize>>, VerifyError> {
+    let mut positions = vec![None; n_air_cols + n_slices];
+    for (pos, &col_id) in committed_air_indices.iter().enumerate() {
+        if col_id >= n_air_cols || positions[col_id].is_some() {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        positions[col_id] = Some(pos);
+    }
+    for i in 0..n_slices {
+        positions[n_air_cols + i] = Some(committed_air_indices.len() + i);
+    }
+    Ok(positions)
+}
+
+fn public_openings_at_point<A: Air + ?Sized>(
+    air: &A,
+    point: &[Block128],
+    log_len: usize,
+    n_air_cols: usize,
+) -> Result<Vec<Option<Block128>>, VerifyError> {
+    if point.len() != log_len {
+        return Err(VerifyError::ShapeMismatch);
+    }
+    let expected_rows = 1usize << air.log_rows();
+    let mut openings = vec![None; n_air_cols];
+    let mut hi_factor: Vec<Block128> = vec![Block128::ONE; log_len + 1];
+    for k in (0..log_len).rev() {
+        hi_factor[k] = hi_factor[k + 1] * (Block128::ONE + point[k]);
+    }
+    let mut eq_tensors: Vec<Option<Vec<Block128>>> = (0..=log_len).map(|_| None).collect();
+    for pc in air.public_columns() {
+        if pc.col >= n_air_cols || pc.values.len() != expected_rows || openings[pc.col].is_some() {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        let k = pc.log_rows();
+        if k > log_len {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        let values = pc.values.as_slice();
+        let lo = if values.is_empty() {
+            Block128::ZERO
+        } else if values.iter().all(|v| *v == values[0]) {
+            values[0]
+        } else {
+            let tensor = eq_tensors[k]
+                .get_or_insert_with(|| noid_core::mle::eq::eq_ind_partial_eval(&point[..k]));
+            let mut hi = values.len();
+            while hi > 0 && values[hi - 1] == Block128::ZERO {
+                hi -= 1;
+            }
+            let mut acc = Block128::ZERO;
+            for i in 0..hi {
+                acc += tensor[i] * values[i];
+            }
+            acc
+        };
+        openings[pc.col] = Some(hi_factor[k] * lo);
+    }
+    Ok(openings)
+}
+
 // ---------------------------------------------------------------------------
 // Algebraic prover core
 // ---------------------------------------------------------------------------
@@ -857,13 +945,36 @@ pub fn prove_air_interleaved_from_refs<'cols, A: Air + ?Sized>(
     )>,
     num_queries: usize,
 ) -> InterleavedStarkProof {
+    let n_air_cols = air.n_columns();
+    let n_slices = slice_claims.len();
+    assert_eq!(
+        padded_columns.len(),
+        n_air_cols + n_slices,
+        "interleaved STARK expects AIR columns followed by slice columns"
+    );
+    let public_flags =
+        public_column_flags(air, n_air_cols).expect("invalid public column metadata");
+    let committed_air_indices = committed_air_indices_from_public_flags(&public_flags);
+    let committed_positions =
+        committed_column_positions(n_air_cols, n_slices, &committed_air_indices)
+            .expect("invalid committed column map");
+    let mut committed_refs: Vec<&'cols [Block128]> =
+        Vec::with_capacity(committed_air_indices.len() + n_slices);
+    for &col_id in &committed_air_indices {
+        committed_refs.push(padded_columns[col_id]);
+    }
+    for i in 0..n_slices {
+        committed_refs.push(padded_columns[n_air_cols + i]);
+    }
+
     let ntt = AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
 
     let (commitment, prover_state) = match pre_committed {
         Some(pre) => pre,
-        None => interleaved_commit(padded_columns, &ntt, &hasher),
+        None => interleaved_commit(&committed_refs, &ntt, &hasher),
     };
+    assert_eq!(commitment.n_cols, committed_refs.len());
 
     let mut channel = Channel::new();
     absorb_cap(&mut channel, &commitment.cap);
@@ -881,7 +992,10 @@ pub fn prove_air_interleaved_from_refs<'cols, A: Air + ?Sized>(
     let secondary_claims: Vec<EvalClaim> = slice_claims
         .iter()
         .map(|sc| EvalClaim {
-            col_index: sc.col_index,
+            col_index: committed_positions
+                .get(sc.col_index)
+                .and_then(|p| *p)
+                .expect("slice claim must target a committed extended column"),
             eval_point: sc.eval_point.clone(),
             value: sc.value,
         })
@@ -951,11 +1065,16 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
     let n_air_cols = air.n_columns();
     let n_slices = slice_claims.len();
     let n_total = n_air_cols + n_slices;
+    let public_flags = public_column_flags(air, n_air_cols)?;
+    let committed_air_indices = committed_air_indices_from_public_flags(&public_flags);
+    let committed_positions =
+        committed_column_positions(n_air_cols, n_slices, &committed_air_indices)?;
+    let n_committed = committed_air_indices.len() + n_slices;
 
     if proof.log_rows != air.log_rows() {
         return Err(VerifyError::ShapeMismatch);
     }
-    if proof.commitment.n_cols != n_total {
+    if proof.commitment.n_cols != n_committed {
         return Err(VerifyError::ShapeMismatch);
     }
     if proof.base_openings.len() != n_air_cols {
@@ -1023,27 +1142,42 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
 
     let s_count = shifted_indices.len();
 
-    // Verify terminal identity against FRI-supplied openings.
+    // Verify terminal identity against public programme openings plus
+    // FRI-supplied committed openings. Public AIR columns are not committed and
+    // therefore do not pay source-binding bytes.
     let m = &proof.mixed_opening.all_openings;
-    if m.len() < n_total {
+    if m.len() < n_committed {
         return Err(VerifyError::ShapeMismatch);
     }
+    let public_openings = public_openings_at_point(air, &r_pp, log_len, n_air_cols)?;
+    let column_opening = |col_id: usize| -> Result<Block128, VerifyError> {
+        if col_id >= n_total {
+            return Err(VerifyError::ShapeMismatch);
+        }
+        if col_id < n_air_cols {
+            if let Some(value) = public_openings[col_id] {
+                return Ok(value);
+            }
+        }
+        let pos = committed_positions[col_id].ok_or(VerifyError::ShapeMismatch)?;
+        Ok(m[pos])
+    };
 
     let eq_base = noid_core::mle::eq::eq_ind(&r_point, &r_pp);
     let mut expected = Block128::ZERO;
     for k in 0..n_air_cols {
-        expected += lambdas[k] * eq_base * m[k];
+        expected += lambdas[k] * eq_base * column_opening(k)?;
     }
     if s_count > 0 {
         let axes = crate::ladder_batch::LadderWeightAxes::new(&r_point, &r_pp);
         for (slot, &col_id) in shifted_indices.iter().enumerate() {
             let w_s = crate::ladder_batch::weight_at_axes(gammas[slot], &axes);
-            expected += lambdas[n_air_cols + slot] * w_s * m[col_id];
+            expected += lambdas[n_air_cols + slot] * w_s * column_opening(col_id)?;
         }
     }
     for (i, sc) in slice_claims.iter().enumerate() {
         let eq_s = noid_core::mle::eq::eq_ind(&sc.eval_point, &r_pp);
-        expected += lambdas[n_air_cols + s_count + i] * eq_s * m[sc.col_index];
+        expected += lambdas[n_air_cols + s_count + i] * eq_s * column_opening(sc.col_index)?;
     }
     if expected != final_claim {
         return Err(VerifyError::ConstraintViolated);
@@ -1051,12 +1185,18 @@ pub fn verify_air_interleaved<A: Air + ?Sized>(
 
     let secondary_claims: Vec<EvalClaim> = slice_claims
         .iter()
-        .map(|sc| EvalClaim {
-            col_index: sc.col_index,
-            eval_point: sc.eval_point.clone(),
-            value: sc.value,
+        .map(|sc| {
+            let col_index = committed_positions
+                .get(sc.col_index)
+                .and_then(|p| *p)
+                .ok_or(VerifyError::ShapeMismatch)?;
+            Ok(EvalClaim {
+                col_index,
+                eval_point: sc.eval_point.clone(),
+                value: sc.value,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, VerifyError>>()?;
 
     verify_mixed_opening(
         &proof.commitment,

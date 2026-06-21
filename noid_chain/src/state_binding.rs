@@ -226,18 +226,23 @@ fn verify_and_apply_tx(
         return Err(StateBindingError::ClaimsCommitmentMismatch { tx_index: tx_idx });
     }
 
-    // Apply state transition: zero inputs, fill outputs
+    // Apply the whole tx delta without recomputing the FRI/state root after
+    // every slot write. All preconditions above are checked against the same
+    // pre-tx state; `BlockStateBinding::build` computes the final block root
+    // once after all txs have been applied.
+    let mut deltas = Vec::with_capacity(
+        body.inputs.iter().filter(|i| i.valid).count()
+            + body.outputs.iter().filter(|o| o.valid).count(),
+    );
     for inp in body.inputs.iter().filter(|i| i.valid) {
-        state
-            .set_slot(inp.slot_index, SlotValue::EMPTY)
-            .expect("bounds checked above");
+        deltas.push((inp.slot_index, SlotValue::EMPTY));
     }
     for out in body.outputs.iter().filter(|o| o.valid) {
-        let slot = slot_value_from_output(out);
-        state
-            .set_slot(out.slot_index, slot)
-            .expect("bounds checked above");
+        deltas.push((out.slot_index, slot_value_from_output(out)));
     }
+    state
+        .apply_delta_unrooted(&deltas)
+        .map_err(|_| StateBindingError::SlotOutOfRange { tx_index: tx_idx })?;
 
     Ok(TxStateOpening {
         input_openings,

@@ -34,8 +34,7 @@ pub struct FriRoundQueryInputs {
     /// Tree depth: number of layers from leaf to root (exclusive of root).
     /// Equals `n_rounds + LOG_RATE - 1 - round`.
     pub depth: usize,
-    /// Queried symbol pairs `(s0, s1)` for each query, in the same order
-    /// as `batch.query_indices`.
+    /// Queried symbol pairs `(s0, s1)` in transcript-derived query order.
     pub queried_symbols: Vec<(Block128, Block128)>,
     /// Compressed Merkle authentication for all queries in this round.
     ///

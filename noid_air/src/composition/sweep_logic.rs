@@ -11,8 +11,10 @@
 
 use crate::airs::{
     build_sweep_balance_trace_parts, emit_sweep_balance_constraints,
-    emit_sweep_balance_selector_public_columns, emit_sweep_balance_value_public_columns,
-    BALANCE_MIN_LOG_ROWS, SWEEP_BALANCE_INPUTS, SWEEP_BALANCE_N_COLS, SWEEP_BALANCE_OUTPUTS,
+    emit_sweep_balance_deterministic_operand_public_columns,
+    emit_sweep_balance_selector_public_columns, emit_sweep_balance_sum_carry_public_columns,
+    emit_sweep_balance_value_public_columns, BALANCE_MIN_LOG_ROWS, SWEEP_BALANCE_INPUTS,
+    SWEEP_BALANCE_N_COLS, SWEEP_BALANCE_OUTPUTS,
 };
 use crate::{Air, ColumnDomain, Constraint, PublicColumn, Trace};
 use noid_core::{Block128, TowerField};
@@ -72,6 +74,20 @@ impl SweepTxLogicAir {
         );
         let mut public_columns = emit_sweep_balance_selector_public_columns(0, log_rows);
         public_columns.extend(emit_sweep_balance_value_public_columns(
+            0,
+            log_rows,
+            witness.balance_inputs,
+            witness.balance_outputs,
+            witness.balance_fee,
+        ));
+        public_columns.extend(emit_sweep_balance_deterministic_operand_public_columns(
+            0,
+            log_rows,
+            witness.balance_inputs,
+            witness.balance_outputs,
+            witness.balance_fee,
+        ));
+        public_columns.extend(emit_sweep_balance_sum_carry_public_columns(
             0,
             log_rows,
             witness.balance_inputs,
@@ -368,7 +384,12 @@ mod tests {
         assert!(air.public_columns().len() > 0);
         assert_eq!(
             air.public_columns().len(),
-            2 * crate::airs::SWEEP_BALANCE_N_BLOCKS
+            4 * crate::airs::SWEEP_BALANCE_N_BLOCKS
+                + (2 * crate::airs::SWEEP_BALANCE_N_BLOCKS
+                    - SWEEP_BALANCE_INPUTS
+                    - SWEEP_BALANCE_OUTPUTS
+                    - 1
+                    - 1)
                 + SWEEP_BALANCE_INPUTS
                 + SWEEP_BALANCE_OUTPUTS
                 + 1

@@ -43,10 +43,12 @@ const T_RECURSIVE_PROOF: &str = "rec_proof";
 const T_TX_INDEX: &str = "tx_index";
 /// Block ZK proofs (retention = FINALITY_DEPTH). Key: height (u64 LE). Value: bincode BlockProof bytes.
 const T_BLOCK_PROOFS: &str = "block_proofs";
+/// Public AuthGKR sidecars (retention = FINALITY_DEPTH). Key: height (u64 LE).
+const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
-const N_TABLES: u64 = 13;
+const N_TABLES: u64 = 14;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -177,6 +179,7 @@ impl MdbxStore {
             T_RECURSIVE_PROOF,
             T_TX_INDEX,
             T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
             T_OWNER_INDEX,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
@@ -328,6 +331,24 @@ impl MdbxStore {
     pub fn get_block_proof(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw)
+    }
+
+    /// Store a serialised `BlockAuthSidecar` for `height`.
+    /// Automatically pruned after `FINALITY_DEPTH` blocks by `prune_after_commit`.
+    pub fn put_block_auth_sidecar(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        txn.put(&tbl, &u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve the `BlockAuthSidecar` bytes for `height`, or `None` if pruned / not yet stored.
+    pub fn get_block_auth_sidecar(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw)
     }
@@ -750,25 +771,27 @@ impl MdbxStore {
             }
         }
 
-        // --- Prune block_proofs older than FINALITY_DEPTH ---
+        // --- Prune block_proofs and auth sidecars older than FINALITY_DEPTH ---
         if current_height > FINALITY_DEPTH {
-            let bp_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
             let cutoff = current_height - FINALITY_DEPTH;
-            let keys_to_del: Vec<u64> = {
-                let mut cur = txn.cursor(&bp_tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= cutoff => keys.push(h),
-                        _ => break,
+            for table_name in [T_BLOCK_PROOFS, T_BLOCK_AUTH_SIDECARS] {
+                let tbl = txn.open_table(Some(table_name))?;
+                let keys_to_del: Vec<u64> = {
+                    let mut cur = txn.cursor(&tbl)?;
+                    let mut keys = Vec::new();
+                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                    while let Some((k, _)) = item {
+                        match u64_from_key(&k) {
+                            Some(h) if h <= cutoff => keys.push(h),
+                            _ => break,
+                        }
+                        item = cur.next()?;
                     }
-                    item = cur.next()?;
+                    keys
+                };
+                for h in keys_to_del {
+                    txn.del(&tbl, &u64_key(h), None)?;
                 }
-                keys
-            };
-            for h in keys_to_del {
-                txn.del(&bp_tbl, &u64_key(h), None)?;
             }
         }
 
@@ -835,6 +858,7 @@ impl MdbxStore {
             T_NULLIFIERS,
             T_NULLIFIER_BLOCKS,
             T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
             T_OWNER_INDEX,
             T_STATE_META,
             T_CHAIN_TIP,

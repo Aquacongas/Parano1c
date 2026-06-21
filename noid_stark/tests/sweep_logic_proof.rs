@@ -126,7 +126,12 @@ fn sweep_auth_slices_are_not_part_of_logic_wire_shape() {
 
     assert_eq!(proof.n_boundary_slices, 0);
     assert!(proof.stark.slice_claimed_values.is_empty());
-    assert_eq!(proof.stark.commitment.n_cols, air.n_columns());
+    assert_eq!(air.public_columns().len(), 481);
+    assert_eq!(proof.stark.commitment.n_cols, 1);
+    assert_eq!(
+        proof.stark.commitment.n_cols,
+        air.n_columns() - air.public_columns().len()
+    );
 }
 
 #[test]
@@ -191,7 +196,12 @@ fn prove_verify_sweep_logic(
     let proof = prove_sweep_logic(&witness).expect("prove sweep logic");
     assert_eq!(proof.n_boundary_slices, 0);
     assert!(proof.stark.slice_claimed_values.is_empty());
-    assert_eq!(proof.stark.commitment.n_cols, air.n_columns());
+    assert_eq!(air.public_columns().len(), 481);
+    assert_eq!(proof.stark.commitment.n_cols, 1);
+    assert_eq!(
+        proof.stark.commitment.n_cols,
+        air.n_columns() - air.public_columns().len()
+    );
 
     let auth_public = auth_inputs.to_public();
     verify_sweep_logic(&air, &pi, &spine_inputs, &auth_public, &proof).expect("verify sweep logic");

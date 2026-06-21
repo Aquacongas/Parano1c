@@ -42,12 +42,15 @@ use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
 
 use crate::{
-    block_recursive_claim_hash, channel::state_binding_eval_point_and_gamma, verify_block,
-    verify_state_bindings_standalone, BlockProof, VerifyBlockError,
+    block_auth_sidecar_root, block_recursive_claim_hash,
+    channel::state_binding_eval_point_and_gamma, split_auth_sidecar_for_buckets, verify_block,
+    verify_state_bindings_standalone, BlockAuthSidecar, BlockProof, VerifyBlockError,
 };
 
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
-use noid_gkr::{AuthPublicInputs, SpineInputs};
+use noid_gkr::{
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot, SweepAuthPublicInputs,
+};
 use noid_stark::prove_logic_sweep::sweep_spine_inputs_from_body;
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxShape,
@@ -117,6 +120,8 @@ pub fn validate_block_full(
     proof: &BlockProof,
     spine_inputs_list: &[SpineInputs],
     auth_public_list: &[AuthPublicInputs],
+    standard_auth_proofs: &[AuthProofKillShot],
+    sweep_auth_proofs: &[SweepAuthProofKillShot],
     state_binding_airs: &[&BlockStateBindingAir],
     parent: &BlockHeader,
     prev_timestamps: &[u64],
@@ -191,7 +196,8 @@ pub fn validate_block_full(
                 ));
             }
         }
-        verify_sweep_bucket_from_block(block, proof).map_err(FullValidationError::ZkProof)?;
+        verify_sweep_bucket_from_block(block, proof, sweep_auth_proofs)
+            .map_err(FullValidationError::ZkProof)?;
     }
 
     // Verify the full proof. Standard and mixed blocks use the shared block
@@ -210,6 +216,7 @@ pub fn validate_block_full(
             proof,
             spine_inputs_list,
             auth_public_list,
+            standard_auth_proofs,
             state_binding_airs,
         )?;
     } else {
@@ -261,6 +268,24 @@ pub fn validate_block_proof_transcript_hash(
     Ok(())
 }
 
+pub fn validate_block_auth_sidecar_root(
+    block: &Block,
+    sidecar: &BlockAuthSidecar,
+) -> Result<(), VerifyBlockError> {
+    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+    if !has_user_txs {
+        if !sidecar.tx_auth.is_empty() {
+            return Err(VerifyBlockError::AuthSidecarShapeMismatch);
+        }
+        return Ok(());
+    }
+    let expected = block_auth_sidecar_root(block, sidecar)?;
+    if block.header.witness_root != expected {
+        return Err(VerifyBlockError::AuthSidecarRootMismatch);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Network-facing entry point
 // ---------------------------------------------------------------------------
@@ -280,6 +305,7 @@ pub fn validate_block_proof_transcript_hash(
 pub fn validate_block_from_network(
     block: &Block,
     block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
@@ -291,6 +317,14 @@ pub fn validate_block_from_network(
 ) -> Result<[u8; 32], FullValidationError> {
     let proof: BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|_| FullValidationError::ZkProof(crate::VerifyBlockError::ShapeMismatch))?;
+    let sidecar: BlockAuthSidecar =
+        bincode::deserialize(block_auth_sidecar_bytes).map_err(|_| {
+            FullValidationError::ZkProof(crate::VerifyBlockError::AuthSidecarShapeMismatch)
+        })?;
+    validate_block_auth_sidecar_root(block, &sidecar).map_err(FullValidationError::ZkProof)?;
+    let (standard_auth_proofs, sweep_auth_proofs) =
+        split_auth_sidecar_for_buckets(block, &proof, &sidecar)
+            .map_err(FullValidationError::ZkProof)?;
 
     let spine_inputs = build_spine_inputs_list(block);
     let auth_public = build_auth_public_list(block, &proof);
@@ -302,6 +336,8 @@ pub fn validate_block_from_network(
         &proof,
         &spine_inputs,
         &auth_public,
+        &standard_auth_proofs,
+        &sweep_auth_proofs,
         &sb_air_refs,
         parent,
         prev_timestamps,
@@ -350,7 +386,6 @@ pub fn validate_block_bucket_tx_indices(
                 || !bucket.meta.tx_indices.windows(2).all(|w| w[0] < w[1])
                 || bucket.meta.tx_indices != expected_standard
                 || bucket.tx_pis.len() != expected_standard.len()
-                || bucket.tx_auth_proofs.len() != expected_standard.len()
                 || bucket.tx_algebraic.len() != expected_standard.len()
             {
                 return Err(crate::VerifyBlockError::ShapeMismatch);
@@ -373,9 +408,6 @@ pub fn validate_block_bucket_tx_indices(
                 || !bucket.meta.tx_indices.windows(2).all(|w| w[0] < w[1])
                 || bucket.meta.tx_indices != expected_sweep
                 || bucket.tx_pis.len() != expected_sweep.len()
-                || bucket.auth_public.len() != expected_sweep.len()
-                || bucket.tx_auth_proofs.len() != expected_sweep.len()
-                || bucket.spine_inputs.len() != expected_sweep.len()
                 || bucket.meta.n_boundary_slices_per_tx != 0
                 || bucket.meta.n_block_spine_slices == 0
             {
@@ -463,6 +495,7 @@ pub fn validate_standard_bucket_tx_indices(
 pub fn verify_sweep_bucket_from_block(
     block: &Block,
     proof: &BlockProof,
+    sweep_auth_proofs: &[SweepAuthProofKillShot],
 ) -> Result<(), crate::VerifyBlockError> {
     let Some(bucket) = proof.sweep_bucket.as_ref() else {
         return Ok(());
@@ -470,12 +503,13 @@ pub fn verify_sweep_bucket_from_block(
     validate_block_bucket_tx_indices(block, proof)?;
 
     let mut sweep_airs = Vec::with_capacity(bucket.meta.tx_indices.len());
+    let mut sweep_spines = Vec::with_capacity(bucket.meta.tx_indices.len());
+    let mut sweep_auth_public = Vec::with_capacity(bucket.meta.tx_indices.len());
     for (k, block_idx) in bucket.meta.tx_indices.iter().copied().enumerate() {
         let tx = &block.transactions[block_idx as usize];
-        let canonical_spine = sweep_spine_inputs_from_body(&tx.body);
-        if bucket.spine_inputs[k] != canonical_spine {
-            return Err(crate::VerifyBlockError::ShapeMismatch);
-        }
+        let pi = &bucket.tx_pis[k];
+        sweep_spines.push(sweep_spine_inputs_from_body(&tx.body));
+        sweep_auth_public.push(build_sweep_auth_public_for_tx(tx, pi));
 
         let (air, _trace) = sweep_logic_air_and_trace_from_body(&tx.body);
         sweep_airs.push(air);
@@ -486,6 +520,9 @@ pub fn verify_sweep_bucket_from_block(
         &proof.meta.prev_block_state_root,
         &sweep_air_refs,
         bucket,
+        &sweep_auth_public,
+        sweep_auth_proofs,
+        &sweep_spines,
     )?;
 
     Ok(())
@@ -575,6 +612,38 @@ pub fn build_auth_public_list(block: &Block, proof: &BlockProof) -> Vec<AuthPubl
             }
         })
         .collect()
+}
+
+fn build_sweep_auth_public_for_tx(tx: &Transaction, pi: &PublicInputs) -> SweepAuthPublicInputs {
+    use noid_core::Block128;
+    use noid_gkr::{compute_sweep_auth_boundary, SweepAuthCircuit, N_SWEEP_AUTH_INPUTS};
+
+    debug_assert_eq!(tx.body.shape, TxShape::Sweep25x2);
+    let tx_body_hash = pi.tx_body_hash.as_fields();
+    let zero_secrets = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
+    let auth_circuit = SweepAuthCircuit::build();
+    let (dummy_addresses, dummy_auth_tags) =
+        compute_sweep_auth_boundary(&auth_circuit, zero_secrets, tx_body_hash);
+
+    let mut expected_address = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
+    let mut expected_auth_tag = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
+    for i in 0..N_SWEEP_AUTH_INPUTS {
+        if let Some(inp) = tx.body.inputs.get(i) {
+            if inp.valid {
+                expected_address[i] = inp.owner.as_fields();
+                expected_auth_tag[i] = inp.auth_tag.as_fields();
+                continue;
+            }
+        }
+        expected_address[i] = dummy_addresses[i];
+        expected_auth_tag[i] = dummy_auth_tags[i];
+    }
+
+    SweepAuthPublicInputs {
+        tx_body_hash,
+        expected_address,
+        expected_auth_tag,
+    }
 }
 
 fn proof_claim_commitments_by_block_index(

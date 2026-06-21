@@ -337,13 +337,18 @@ pub fn bit_adder_is_input_programme(width: usize, log_rows: usize) -> Vec<Block1
 /// binding gap without any new gate types or widened trace.
 pub fn bit_adder_operand_programme(width: usize, value: u64, log_rows: usize) -> Vec<Block128> {
     assert!((1..=64).contains(&width));
+    bit_adder_operand_u128_programme(width, value as u128, log_rows)
+}
+
+/// Programme for a `bit_adder` operand column of instance 0, supporting the
+/// wider internal sweep-balance tree nodes. Higher instances are zero-filled.
+pub fn bit_adder_operand_u128_programme(
+    width: usize,
+    value: u128,
+    log_rows: usize,
+) -> Vec<Block128> {
+    assert_programme_operand(width, value, "operand");
     assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
-    if width < 64 {
-        assert!(
-            value < (1u64 << width),
-            "operand value {value} exceeds width {width} bits"
-        );
-    }
     let n_rows = 1usize << log_rows;
     let mut v = vec![Block128::ZERO; n_rows];
     for r in 0..width {
@@ -351,6 +356,64 @@ pub fn bit_adder_operand_programme(width: usize, value: u64, log_rows: usize) ->
         if bit == 1 {
             v[r] = Block128::ONE;
         }
+    }
+    v
+}
+
+#[inline]
+fn assert_programme_operand(width: usize, value: u128, label: &str) {
+    assert!((1..=BIT_ADDER_MAX_WIDTH).contains(&width));
+    if width < 128 {
+        assert!(
+            value < (1u128 << width),
+            "{label} operand value {value} exceeds width {width} bits"
+        );
+    }
+}
+
+/// Programme for the deterministic `sum` column of instance 0 for an
+/// honest `BitAdderAir` block with operands `(a, b)`. Higher instances and
+/// padding rows are zero, matching [`BitAdderAir::build_trace`].
+pub fn bit_adder_sum_programme(width: usize, a: u128, b: u128, log_rows: usize) -> Vec<Block128> {
+    assert_programme_operand(width, a, "a");
+    assert_programme_operand(width, b, "b");
+    assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
+    let n_rows = 1usize << log_rows;
+    let mut v = vec![Block128::ZERO; n_rows];
+    let mut carry = 0u128;
+    for r in 0..width {
+        let a_bit = (a >> r) & 1;
+        let b_bit = (b >> r) & 1;
+        let sum_bit = a_bit ^ b_bit ^ carry;
+        if sum_bit == 1 {
+            v[r] = Block128::ONE;
+        }
+        carry = (a_bit & b_bit) ^ (a_bit & carry) ^ (b_bit & carry);
+    }
+    v
+}
+
+/// Programme for the deterministic `carry` column of instance 0 for an
+/// honest `BitAdderAir` block with operands `(a, b)`. This pins the final
+/// carry at row `width` and zero-fills all don't-care padding rows, matching
+/// the current honest trace builder.
+pub fn bit_adder_carry_programme(width: usize, a: u128, b: u128, log_rows: usize) -> Vec<Block128> {
+    assert_programme_operand(width, a, "a");
+    assert_programme_operand(width, b, "b");
+    assert!(log_rows >= BIT_ADDER_LOG_WORD_BITS);
+    let n_rows = 1usize << log_rows;
+    let mut v = vec![Block128::ZERO; n_rows];
+    let mut carry = 0u128;
+    for r in 0..width {
+        let a_bit = (a >> r) & 1;
+        let b_bit = (b >> r) & 1;
+        if carry == 1 {
+            v[r] = Block128::ONE;
+        }
+        carry = (a_bit & b_bit) ^ (a_bit & carry) ^ (b_bit & carry);
+    }
+    if carry == 1 {
+        v[width] = Block128::ONE;
     }
     v
 }

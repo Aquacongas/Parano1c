@@ -29,7 +29,7 @@ use noid_chain::{build_state_delta_witness, SlotValue, StateDeltaActionKind, Sta
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
-    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
@@ -559,7 +559,7 @@ fn empty_bucketized_proof(n_tx: u32) -> BlockProof {
     }
 }
 
-fn sweep_bucket_proof_for_body(body: TxBody) -> (Block, BlockProof) {
+fn sweep_bucket_proof_for_body(body: TxBody) -> (Block, BlockProof, Vec<SweepAuthProofKillShot>) {
     let bundle = prove_sweep_bundle(&body);
     let block = block_with_user_tx(tx_from_body(body));
     let owned = noid_block::build_block_witnesses(&block.transactions, &[bundle], TEST_LOG_SLOTS);
@@ -569,6 +569,10 @@ fn sweep_bucket_proof_for_body(body: TxBody) -> (Block, BlockProof) {
             OwnedTxWitness::Sweep25x2(w) => w,
             OwnedTxWitness::Standard4x8(_) => panic!("expected sweep witness"),
         })
+        .collect();
+    let sweep_auth_proofs: Vec<_> = sweep_witnesses
+        .iter()
+        .map(|w| w.auth_proof.clone())
         .collect();
     assert_eq!(sweep_witnesses[0].block_tx_index, 1);
 
@@ -596,7 +600,7 @@ fn sweep_bucket_proof_for_body(body: TxBody) -> (Block, BlockProof) {
         pre_state_openings: vec![],
         post_state_openings: vec![],
     };
-    (block, proof)
+    (block, proof, sweep_auth_proofs)
 }
 
 #[allow(dead_code)]
@@ -616,12 +620,15 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[allow(dead_code)]
-fn mixed_block_proof() -> (Block, BlockProof) {
+fn mixed_block_proof() -> (Block, BlockProof, Vec<SweepAuthProofKillShot>) {
     mixed_block_proof_with_counts(1, 1)
 }
 
 #[allow(dead_code)]
-fn mixed_block_proof_with_counts(n_standard: usize, n_sweep: usize) -> (Block, BlockProof) {
+fn mixed_block_proof_with_counts(
+    n_standard: usize,
+    n_sweep: usize,
+) -> (Block, BlockProof, Vec<SweepAuthProofKillShot>) {
     assert!(n_standard > 0, "mixed test needs at least one standard tx");
     assert!(n_sweep > 0, "mixed test needs at least one sweep tx");
 
@@ -681,13 +688,17 @@ fn mixed_block_proof_with_counts(n_standard: usize, n_sweep: usize) -> (Block, B
             }
         })
         .collect();
+    let sweep_auth_proofs: Vec<_> = sweep_witnesses
+        .iter()
+        .map(|w| w.auth_proof.clone())
+        .collect();
     proof.sweep_bucket = Some(
         assemble_sweep_bucket_proof([0u8; 32], &sweep_witnesses)
             .expect("assemble sweep bucket")
             .expect("non-empty sweep bucket"),
     );
 
-    (block, proof)
+    (block, proof, sweep_auth_proofs)
 }
 
 #[test]
@@ -721,21 +732,28 @@ fn proof_transcript_hash_mismatch_rejects() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_assembles_and_verifies_from_owned_witness() {
-    let (block, proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     validate_block_bucket_tx_indices(&block, &proof).expect("bucket coverage");
-    verify_sweep_bucket_from_block(&block, &proof).expect("sweep bucket verifies");
+    verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+        .expect("sweep bucket verifies");
 
     let bucket = proof.sweep_bucket.as_ref().expect("sweep bucket");
     assert_eq!(bucket.meta.shape, TxShape::Sweep25x2);
     assert_eq!(bucket.meta.tx_indices, vec![1]);
     assert_eq!(bucket.tx_pis[0].shape_id, TxShape::Sweep25x2.id());
-    assert_eq!(bucket.tx_auth_proofs.len(), 1);
+    assert_eq!(sweep_auth_proofs.len(), 1);
     assert_eq!(bucket.meta.n_boundary_slices_per_tx, 0);
-    assert_eq!(bucket.commitment.n_cols, bucket.block_col_openings.len());
+    let total_cols = bucket.block_col_openings.len();
+    let log_cols = total_cols.next_power_of_two().trailing_zeros() as usize;
+    assert_eq!(bucket.commitment.n_cols, 1);
+    assert_eq!(
+        bucket.commitment.log_rows,
+        noid_stark::padded_log_len(bucket.meta.log_rows as usize) + log_cols
+    );
+    assert!(!bucket.block_column_sumcheck_rounds.is_empty());
     assert!(
-        bucket.commitment.n_cols
-            < bucket.meta.n_air_per_tx as usize + bucket.meta.n_block_spine_slices as usize,
+        total_cols < bucket.meta.n_air_per_tx as usize + bucket.meta.n_block_spine_slices as usize,
         "public AIR columns should be verifier-derived, not committed"
     );
     assert!(bucket.byte_len() > 0);
@@ -749,7 +767,7 @@ fn sweep_bucket_assembles_and_verifies_from_owned_witness() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_index_and_shape_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, mut proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     proof.sweep_bucket.as_mut().unwrap().meta.tx_indices[0] = 0;
     assert!(validate_block_bucket_tx_indices(&block, &proof).is_err());
@@ -761,46 +779,44 @@ fn sweep_bucket_rejects_index_and_shape_tampering() {
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-fn sweep_bucket_rejects_spine_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+fn sweep_bucket_rejects_tx_body_spine_tampering() {
+    let (mut block, proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
-    let bucket = proof.sweep_bucket.as_mut().unwrap();
-    bucket.spine_inputs[0].output_leaves[0][0] += Block128::ONE;
+    let tx_idx = proof.sweep_bucket.as_ref().unwrap().meta.tx_indices[0] as usize;
+    block.transactions[tx_idx].body.outputs[0].slot_index ^= 1;
 
-    validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_missing_auth_proof() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, proof, mut sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
-    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs.pop();
-    assert!(validate_block_bucket_tx_indices(&block, &proof).is_err());
+    sweep_auth_proofs.pop();
+    validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_auth_capsule_pcs_value_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, proof, mut sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
-    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs[0]
-        .pcs
-        .opening
-        .all_openings[0] += Block128::ONE;
+    sweep_auth_proofs[0].pcs.opening.all_openings[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_aggregation_opening_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, mut proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     proof.sweep_bucket.as_mut().unwrap().block_col_openings[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    let err = verify_sweep_bucket_from_block(&block, &proof).expect_err("tampered opening rejects");
+    let err = verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+        .expect_err("tampered opening rejects");
     assert!(
         matches!(err, VerifyBlockError::AlgebraicTerminal(0)),
         "unexpected error: {err:?}"
@@ -810,17 +826,17 @@ fn sweep_bucket_rejects_aggregation_opening_tampering() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_block_initial_claim_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, mut proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     proof.sweep_bucket.as_mut().unwrap().block_initial_claim += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_block_multipoint_challenge_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, mut proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     proof
         .sweep_bucket
@@ -828,32 +844,29 @@ fn sweep_bucket_rejects_block_multipoint_challenge_tampering() {
         .unwrap()
         .block_multipoint_challenges[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-fn sweep_recursive_claim_hash_binds_new_sweep_auth_proof_field() {
-    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+fn sweep_auth_sidecar_not_in_recursive_claim_but_verification_rejects_tamper() {
+    let (mut block, proof, mut sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
     validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
 
     let canonical_hash = block.header.proof_transcript_hash;
-    proof.sweep_bucket.as_mut().unwrap().tx_auth_proofs[0]
-        .batch
-        .b_finals[0] += Block128::ONE;
+    sweep_auth_proofs[0].batch.b_finals[0] += Block128::ONE;
 
-    assert_ne!(canonical_hash, block_recursive_claim_hash(&proof));
-    assert!(
-        validate_block_proof_transcript_hash(&block, &proof).is_err(),
-        "header transcript hash must bind per-tx sweep auth proofs"
-    );
+    assert_eq!(canonical_hash, block_recursive_claim_hash(&proof));
+    validate_block_proof_transcript_hash(&block, &proof)
+        .expect("sidecar is not in recursive claim");
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_recursive_claim_hash_binds_block_spine_proof_field() {
-    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (mut block, mut proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(5));
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
     validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
 
@@ -876,7 +889,7 @@ fn sweep_recursive_claim_hash_binds_block_spine_proof_field() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_recursive_claim_hash_binds_committed_spine_columns() {
-    let (mut block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (mut block, mut proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(5));
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
     validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
 
@@ -893,7 +906,7 @@ fn sweep_recursive_claim_hash_binds_committed_spine_columns() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_only_replay_witness_zeroes_unused_secondary_lane() {
-    let (_block, proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (_block, proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(5));
     let witness = extract_replay_witness(&proof).expect("sweep-only replay witness");
 
     assert_eq!(witness.block_secondary_initial_claim, Block128::ZERO);
@@ -911,7 +924,7 @@ fn sweep_only_replay_witness_zeroes_unused_secondary_lane() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_bucket_rejects_mixed_opening_tampering() {
-    let (block, mut proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (block, mut proof, sweep_auth_proofs) = sweep_bucket_proof_for_body(mk_sweep_body(5));
 
     proof
         .sweep_bucket
@@ -920,13 +933,13 @@ fn sweep_bucket_rejects_mixed_opening_tampering() {
         .mixed_opening
         .all_openings[0] += Block128::ONE;
     validate_block_bucket_tx_indices(&block, &proof).expect("coverage still intact");
-    assert!(verify_sweep_bucket_from_block(&block, &proof).is_err());
+    assert!(verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs).is_err());
 }
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 fn sweep_only_replay_witness_extracts_and_recursive_step_verifies() {
-    let (mut block, proof) = sweep_bucket_proof_for_body(mk_sweep_body(5));
+    let (mut block, proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(5));
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
 
     let witness = extract_replay_witness(&proof).expect("sweep-only replay witness");
@@ -954,7 +967,7 @@ fn sweep_only_replay_witness_extracts_and_recursive_step_verifies() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_block_proof_does_not_serialize_spend_secret_bytes() {
-    let (block, proof) = mixed_block_proof();
+    let (block, proof, _) = mixed_block_proof();
     let raw_secrets: Vec<[u8; 32]> = block
         .transactions
         .iter()
@@ -976,11 +989,12 @@ fn mixed_block_proof_does_not_serialize_spend_secret_bytes() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_replay_witness_extracts_secondary_lane_and_recursive_step_verifies() {
-    let (mut block, proof) = mixed_block_proof();
+    let (mut block, proof, sweep_auth_proofs) = mixed_block_proof();
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
 
     validate_block_bucket_tx_indices(&block, &proof).expect("mixed bucket coverage");
-    verify_sweep_bucket_from_block(&block, &proof).expect("mixed sweep bucket verifies");
+    verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+        .expect("mixed sweep bucket verifies");
     validate_block_proof_transcript_hash(&block, &proof).expect("mixed header transcript hash");
 
     let standard_bucket = proof.standard_bucket.as_ref().expect("standard bucket");
@@ -1026,11 +1040,12 @@ fn mixed_replay_witness_extracts_secondary_lane_and_recursive_step_verifies() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_many_standard_one_sweep_replay_witness_verifies() {
-    let (mut block, proof) = mixed_block_proof_with_counts(2, 1);
+    let (mut block, proof, sweep_auth_proofs) = mixed_block_proof_with_counts(2, 1);
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
 
     validate_block_bucket_tx_indices(&block, &proof).expect("mixed coverage");
-    verify_sweep_bucket_from_block(&block, &proof).expect("mixed sweep bucket verifies");
+    verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+        .expect("mixed sweep bucket verifies");
     validate_block_proof_transcript_hash(&block, &proof).expect("mixed transcript hash");
 
     let standard_bucket = proof.standard_bucket.as_ref().expect("standard bucket");
@@ -1052,11 +1067,12 @@ fn mixed_many_standard_one_sweep_replay_witness_verifies() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_one_standard_many_sweep_replay_witness_verifies() {
-    let (mut block, proof) = mixed_block_proof_with_counts(1, 2);
+    let (mut block, proof, sweep_auth_proofs) = mixed_block_proof_with_counts(1, 2);
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
 
     validate_block_bucket_tx_indices(&block, &proof).expect("mixed coverage");
-    verify_sweep_bucket_from_block(&block, &proof).expect("mixed sweep bucket verifies");
+    verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+        .expect("mixed sweep bucket verifies");
     validate_block_proof_transcript_hash(&block, &proof).expect("mixed transcript hash");
 
     let standard_bucket = proof.standard_bucket.as_ref().expect("standard bucket");
@@ -1078,7 +1094,7 @@ fn mixed_one_standard_many_sweep_replay_witness_verifies() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_block_rejects_duplicate_and_missing_bucket_indices() {
-    let (block, proof) = mixed_block_proof();
+    let (block, proof, _) = mixed_block_proof();
     validate_block_bucket_tx_indices(&block, &proof).expect("honest mixed coverage");
 
     let mut duplicate = proof.clone();
@@ -1097,14 +1113,6 @@ fn mixed_block_rejects_duplicate_and_missing_bucket_indices() {
         .tx_indices
         .clear();
     missing.sweep_bucket.as_mut().unwrap().tx_pis.clear();
-    missing.sweep_bucket.as_mut().unwrap().auth_public.clear();
-    missing
-        .sweep_bucket
-        .as_mut()
-        .unwrap()
-        .tx_auth_proofs
-        .clear();
-    missing.sweep_bucket.as_mut().unwrap().spine_inputs.clear();
     assert!(
         validate_block_bucket_tx_indices(&block, &missing).is_err(),
         "missing sweep tx index must reject"
@@ -1114,7 +1122,7 @@ fn mixed_block_rejects_duplicate_and_missing_bucket_indices() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_block_rejects_cross_shape_bucket_indices() {
-    let (block, proof) = mixed_block_proof();
+    let (block, proof, _) = mixed_block_proof();
     validate_block_bucket_tx_indices(&block, &proof).expect("honest mixed coverage");
 
     let mut sweep_in_standard = proof.clone();
@@ -1145,7 +1153,7 @@ fn mixed_block_rejects_cross_shape_bucket_indices() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_bucket_order_tampering_rejects() {
-    let (block, mut proof) = mixed_block_proof_with_counts(2, 1);
+    let (block, mut proof, _) = mixed_block_proof_with_counts(2, 1);
     validate_block_bucket_tx_indices(&block, &proof).expect("honest mixed coverage");
 
     proof
@@ -1164,10 +1172,10 @@ fn mixed_bucket_order_tampering_rejects() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_block_rejects_swapped_sweep_bucket_after_validation() {
-    let (block, mut proof) = mixed_block_proof();
+    let (block, mut proof, _) = mixed_block_proof();
     validate_block_bucket_tx_indices(&block, &proof).expect("honest mixed coverage");
 
-    let (_other_block, other_sweep_only_proof) = sweep_bucket_proof_for_body(mk_sweep_body(6));
+    let (_other_block, other_sweep_only_proof, _) = sweep_bucket_proof_for_body(mk_sweep_body(6));
     let mut swapped_bucket = other_sweep_only_proof
         .sweep_bucket
         .expect("alternate sweep bucket");
@@ -1183,7 +1191,7 @@ fn mixed_block_rejects_swapped_sweep_bucket_after_validation() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only mixed proof regression")]
 fn mixed_header_transcript_rejects_state_meta_tamper() {
-    let (mut block, mut proof) = mixed_block_proof();
+    let (mut block, mut proof, _) = mixed_block_proof();
     block.header.proof_transcript_hash = block_recursive_claim_hash(&proof);
     validate_block_proof_transcript_hash(&block, &proof).expect("honest transcript hash");
 

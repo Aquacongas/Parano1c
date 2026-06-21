@@ -5,7 +5,14 @@
 //!
 //!   cargo bench -p bench_prover --bench block_hotspots
 //!
-//! Runs exactly two production block cases:
+//! Defaults are intentionally small for fast optimization loops. Use:
+//!
+//!   NOID_HOTSPOT_STANDARD_TX=10 NOID_HOTSPOT_SWEEP_TX=2 \
+//!     cargo bench -p bench_prover --bench block_hotspots
+//!
+//! to reproduce the larger reference hotspot, or set either count to `0` to skip it.
+//!
+//! Runs up to two production block cases:
 //! - one standard-only block;
 //! - one sweep-only block.
 //!
@@ -23,17 +30,18 @@ use bench_prover::{
 };
 use noid_block::OwnedSweepTxWitness;
 
-const DEFAULT_STANDARD_TX: usize = 10;
-const DEFAULT_SWEEP_TX: usize = 2;
+const DEFAULT_STANDARD_TX: usize = 2;
+const DEFAULT_SWEEP_TX: usize = 1;
+const REFERENCE_STANDARD_TX: usize = 10;
+const REFERENCE_SWEEP_TX: usize = 2;
 const STANDARD_SLOT_BASE: u32 = 0;
 const SWEEP_SLOT_BASE: u32 = 2_000_000;
 const SWEEP_SLOT_STRIDE: u32 = 100_000;
 
-fn env_usize(name: &str, default: usize) -> usize {
+fn env_count(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|&value| value > 0)
         .unwrap_or(default)
 }
 
@@ -299,14 +307,14 @@ fn print_sweep_hotspot(n: usize) {
 fn main() {
     let phase_profile = enable_phase_profile();
 
-    let n_standard = env_usize("NOID_HOTSPOT_STANDARD_TX", DEFAULT_STANDARD_TX);
-    let n_sweep = env_usize("NOID_HOTSPOT_SWEEP_TX", DEFAULT_SWEEP_TX);
+    let n_standard = env_count("NOID_HOTSPOT_STANDARD_TX", DEFAULT_STANDARD_TX);
+    let n_sweep = env_count("NOID_HOTSPOT_SWEEP_TX", DEFAULT_SWEEP_TX);
 
     println!();
     println!("  =====================================================================");
     println!("  PARANOID Block Hotspot Benchmark");
     println!("  =====================================================================");
-    println!("  Exactly two block cases: one standard-only block and one sweep-only block.");
+    println!("  Up to two block cases: one standard-only block and one sweep-only block.");
     println!(
         "  Full-block phase profile: {}",
         if phase_profile {
@@ -316,16 +324,28 @@ fn main() {
         }
     );
     println!("  Defaults: standard tx={DEFAULT_STANDARD_TX}, sweep tx={DEFAULT_SWEEP_TX}");
+    println!("  Reference: standard tx={REFERENCE_STANDARD_TX}, sweep tx={REFERENCE_SWEEP_TX}");
     println!("  Current:  standard tx={n_standard}, sweep tx={n_sweep}");
-    println!("  Override: NOID_HOTSPOT_STANDARD_TX=<n> NOID_HOTSPOT_SWEEP_TX=<n>");
+    println!("  Override: NOID_HOTSPOT_STANDARD_TX=<n> NOID_HOTSPOT_SWEEP_TX=<n> (0 skips a case)");
     println!();
 
-    print_standard_hotspot(n_standard);
-    print_sweep_hotspot(n_sweep);
+    if n_standard == 0 {
+        println!("  [skip] standard hotspot disabled by NOID_HOTSPOT_STANDARD_TX=0");
+        println!();
+    } else {
+        print_standard_hotspot(n_standard);
+    }
+    if n_sweep == 0 {
+        println!("  [skip] sweep hotspot disabled by NOID_HOTSPOT_SWEEP_TX=0");
+        println!();
+    } else {
+        print_sweep_hotspot(n_sweep);
+    }
 
     println!("  -------------------------------------------------------------------");
     println!("  NOTES:");
     println!("    - This bench intentionally has no 10/20/100 matrix and no mixed cases.");
+    println!("    - Reference hotspot: NOID_HOTSPOT_STANDARD_TX={REFERENCE_STANDARD_TX} NOID_HOTSPOT_SWEEP_TX={REFERENCE_SWEEP_TX} cargo bench -p bench_prover --bench block_hotspots");
     println!("    - Wallet pre-proof time is separate; block prove uses prebuilt wallet proofs.");
     println!("    - bench_full_block_profile lines expose body_clone, seed_state,");
     println!("      sweep_bucket_prove, core_proof, block_assembly, etc.");

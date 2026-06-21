@@ -48,19 +48,26 @@ use noid_rpc::start_rpc_server;
 struct ProvedBlockCandidate {
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
+    block_auth_sidecar_bytes: Vec<u8>,
 }
 
 struct OrphanBlock {
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
+    block_auth_sidecar_bytes: Vec<u8>,
     received_at: Instant,
 }
 
 impl OrphanBlock {
-    fn new(block: noid_chain::block::Block, block_proof_bytes: Vec<u8>) -> Self {
+    fn new(
+        block: noid_chain::block::Block,
+        block_proof_bytes: Vec<u8>,
+        block_auth_sidecar_bytes: Vec<u8>,
+    ) -> Self {
         Self {
             block,
             block_proof_bytes,
+            block_auth_sidecar_bytes,
             received_at: Instant::now(),
         }
     }
@@ -644,6 +651,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(noid_miner::MinerEvent::BlockFound {
                         block_bytes,
                         block_proof_bytes,
+                        block_auth_sidecar_bytes,
                         height,
                         hash,
                         n_txs,
@@ -672,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
                                 header_bytes,
                                 block_bytes,
                                 block_proof_bytes,
+                                block_auth_sidecar_bytes,
                             })
                             .await;
                     }
@@ -1258,6 +1267,7 @@ async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
+    block_auth_sidecar_bytes: Vec<u8>,
     local_time: u64,
 ) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
     let chain = chain.clone();
@@ -1266,9 +1276,11 @@ async fn apply_p2p_block_offthread(
         let hash = ctx.apply_next_block(
             &block,
             &block_proof_bytes,
+            &block_auth_sidecar_bytes,
             local_time,
             |block,
              proof_bytes,
+             auth_sidecar_bytes,
              parent,
              prev_timestamps,
              prev_active_counts,
@@ -1280,6 +1292,7 @@ async fn apply_p2p_block_offthread(
                 noid_block::validate_block_from_network(
                     block,
                     proof_bytes,
+                    auth_sidecar_bytes,
                     parent,
                     prev_timestamps,
                     prev_active_counts,
@@ -1324,12 +1337,15 @@ async fn apply_reorg_offthread(
                 None,
             );
         }
-        let proof_by_hash: std::collections::HashMap<[u8; 32], Vec<u8>> = new_blocks
+        let proof_by_hash: std::collections::HashMap<[u8; 32], (Vec<u8>, Vec<u8>)> = new_blocks
             .iter()
             .map(|candidate| {
                 (
                     noid_chain::consensus::pow::full_block_hash(&candidate.block.header),
-                    candidate.block_proof_bytes.clone(),
+                    (
+                        candidate.block_proof_bytes.clone(),
+                        candidate.block_auth_sidecar_bytes.clone(),
+                    ),
                 )
             })
             .collect();
@@ -1343,19 +1359,22 @@ async fn apply_reorg_offthread(
             local_time,
             |ctx, block, block_local_time| {
                 let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
-                let proof_bytes = proof_by_hash.get(&block_hash).ok_or_else(|| {
-                    noid_chain::storage::MdbxContextError::Consensus(
-                        noid_chain::consensus::ConsensusError::ShapeMismatch(
-                            "missing proof bytes for reorg candidate".to_string(),
-                        ),
-                    )
-                })?;
+                let (proof_bytes, auth_sidecar_bytes) =
+                    proof_by_hash.get(&block_hash).ok_or_else(|| {
+                        noid_chain::storage::MdbxContextError::Consensus(
+                            noid_chain::consensus::ConsensusError::ShapeMismatch(
+                                "missing proof/sidecar bytes for reorg candidate".to_string(),
+                            ),
+                        )
+                    })?;
                 ctx.apply_next_block(
                     block,
                     proof_bytes,
+                    auth_sidecar_bytes,
                     block_local_time,
                     |block,
                      proof_bytes,
+                     auth_sidecar_bytes,
                      parent,
                      prev_timestamps,
                      prev_active_counts,
@@ -1367,6 +1386,7 @@ async fn apply_reorg_offthread(
                         noid_block::validate_block_from_network(
                             block,
                             proof_bytes,
+                            auth_sidecar_bytes,
                             parent,
                             prev_timestamps,
                             prev_active_counts,
@@ -1394,6 +1414,16 @@ async fn apply_reorg_offthread(
                             "failed to store reorg block proof"
                         );
                     }
+                    if let Err(e) = ctx.store.put_block_auth_sidecar(
+                        candidate.block.header.height,
+                        &candidate.block_auth_sidecar_bytes,
+                    ) {
+                        tracing::warn!(
+                            height = candidate.block.header.height,
+                            err = %e,
+                            "failed to store reorg block auth sidecar"
+                        );
+                    }
                 }
             }
             Some(ChainView::from_mdbx(&ctx))
@@ -1409,11 +1439,18 @@ async fn apply_reorg_offthread(
 fn validate_p2p_block_proof_binding(
     block: &noid_chain::block::Block,
     block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
 ) -> Result<(), String> {
     let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
     if !has_user_txs {
         noid_chain::block::validate_block_proof_binding(block, block_proof_bytes)
             .map_err(|e| format!("proof/header binding invalid: {e}"))?;
+        if !block_auth_sidecar_bytes.is_empty() {
+            return Err(
+                "proof/header binding invalid: coinbase-only block has auth sidecar bytes"
+                    .to_string(),
+            );
+        }
         return Ok(());
     }
     if block_proof_bytes.is_empty() {
@@ -1422,12 +1459,21 @@ fn validate_p2p_block_proof_binding(
                 .to_string(),
         );
     }
+    if block_auth_sidecar_bytes.is_empty() {
+        return Err("proof/header binding invalid: user-transaction block is missing BlockAuthSidecar bytes".to_string());
+    }
     let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|e| format!("proof/header binding invalid: proof deserialize failed: {e}"))?;
     let expected = noid_block::block_recursive_claim_hash(&proof);
     if block.header.proof_transcript_hash != expected {
         return Err("proof/header binding invalid: block proof canonical transcript does not match header proof_transcript_hash".to_string());
     }
+    let sidecar: noid_block::BlockAuthSidecar = bincode::deserialize(block_auth_sidecar_bytes)
+        .map_err(|e| {
+            format!("proof/header binding invalid: auth sidecar deserialize failed: {e}")
+        })?;
+    noid_block::validate_block_auth_sidecar_root(block, &sidecar)
+        .map_err(|e| format!("proof/header binding invalid: auth sidecar root mismatch: {e:?}"))?;
     Ok(())
 }
 
@@ -1698,6 +1744,7 @@ async fn handle_p2p_events(
                 from,
                 block_bytes,
                 block_proof_bytes,
+                block_auth_sidecar_bytes,
             }) => {
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
@@ -1754,7 +1801,11 @@ async fn handle_p2p_events(
                                 && block.header.prev_block_hash == ctx.tip_hash()
                         };
                         if !extends_current_tip {
-                            if let Err(e) = validate_p2p_block_proof_binding(&block, &block_proof_bytes) {
+                            if let Err(e) = validate_p2p_block_proof_binding(
+                                &block,
+                                &block_proof_bytes,
+                                &block_auth_sidecar_bytes,
+                            ) {
                                 tracing::warn!(
                                     peer = %from,
                                     height = block.header.height,
@@ -1769,6 +1820,7 @@ async fn handle_p2p_events(
                             &chain,
                             block.clone(),
                             block_proof_bytes.clone(),
+                            block_auth_sidecar_bytes.clone(),
                             local_time,
                         )
                         .await;
@@ -1800,6 +1852,16 @@ async fn handle_p2p_events(
                                             "failed to store received block proof"
                                         );
                                     }
+                                    if let Err(e) = ctx
+                                        .store
+                                        .put_block_auth_sidecar(height, &block_auth_sidecar_bytes)
+                                    {
+                                        tracing::warn!(
+                                            height,
+                                            err = %e,
+                                            "failed to store received block auth sidecar"
+                                        );
+                                    }
                                 }
 
                                 // Auto-continue sync: immediately request the next batch from
@@ -1822,12 +1884,14 @@ async fn handle_p2p_events(
                                     let orphan_age_ms = orphan.received_at.elapsed().as_millis();
                                     let orphan_block = orphan.block;
                                     let orphan_proof_bytes = orphan.block_proof_bytes;
+                                    let orphan_auth_sidecar_bytes = orphan.block_auth_sidecar_bytes;
                                     next_hash =
                                         noid_chain::consensus::pow::full_block_hash(&orphan_block.header);
                                     let orphan_result = apply_p2p_block_offthread(
                                         &chain,
                                         orphan_block.clone(),
                                         orphan_proof_bytes.clone(),
+                                        orphan_auth_sidecar_bytes.clone(),
                                         orphan_local_time,
                                     )
                                     .await;
@@ -1845,6 +1909,9 @@ async fn handle_p2p_events(
                                                 let ctx = chain.read().await;
                                                 if let Err(e) = ctx.store.put_block_proof(h, &orphan_proof_bytes) {
                                                     tracing::warn!(height = h, err = %e, "failed to store orphan block proof");
+                                                }
+                                                if let Err(e) = ctx.store.put_block_auth_sidecar(h, &orphan_auth_sidecar_bytes) {
+                                                    tracing::warn!(height = h, err = %e, "failed to store orphan block auth sidecar");
                                                 }
                                             }
                                             tracing::info!(
@@ -1879,6 +1946,7 @@ async fn handle_p2p_events(
                                         let mut new_chain = vec![ProvedBlockCandidate {
                                             block: block.clone(),
                                             block_proof_bytes: block_proof_bytes.clone(),
+                                            block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
                                         }];
                                         let mut next_hash =
                                             noid_chain::consensus::pow::full_block_hash(
@@ -1891,6 +1959,7 @@ async fn handle_p2p_events(
                                             new_chain.push(ProvedBlockCandidate {
                                                 block: orphan.block,
                                                 block_proof_bytes: orphan.block_proof_bytes,
+                                                block_auth_sidecar_bytes: orphan.block_auth_sidecar_bytes,
                                             });
                                         }
 
@@ -2034,7 +2103,11 @@ async fn handle_p2p_events(
                                             // Still buffer in case more blocks arrive from this fork.
                                             insert_orphan(
                                                 &mut orphan_pool,
-                                                OrphanBlock::new(block, block_proof_bytes.clone()),
+                                                OrphanBlock::new(
+                                                    block,
+                                                    block_proof_bytes.clone(),
+                                                    block_auth_sidecar_bytes.clone(),
+                                                ),
                                             );
                                         }
                                     }
@@ -2059,7 +2132,11 @@ async fn handle_p2p_events(
 
                                         insert_orphan(
                                             &mut orphan_pool,
-                                            OrphanBlock::new(block, block_proof_bytes.clone()),
+                                            OrphanBlock::new(
+                                                block,
+                                                block_proof_bytes.clone(),
+                                                block_auth_sidecar_bytes.clone(),
+                                            ),
                                         );
 
                                         if is_deep_fork {

@@ -219,6 +219,7 @@ fn block_one_tx_roundtrip() {
         &proof,
         std::slice::from_ref(&spine_inputs),
         std::slice::from_ref(&auth_public),
+        std::slice::from_ref(&auth_proof),
         &[],
     )
     .expect("verify_block must succeed on an honest block proof");
@@ -263,6 +264,7 @@ fn block_verify_rejects_tampered_bucket_opening_at_algebraic_terminal() {
         &proof,
         std::slice::from_ref(&spine_inputs),
         std::slice::from_ref(&auth_public),
+        std::slice::from_ref(&auth_proof),
         &[],
     )
     .expect_err("tampered bucket opening must reject");
@@ -312,6 +314,7 @@ fn block_verify_rejects_tampered_epoch_anchor() {
         &proof,
         std::slice::from_ref(&spine_inputs),
         std::slice::from_ref(&auth_public),
+        std::slice::from_ref(&auth_proof),
         &[],
     );
     assert!(

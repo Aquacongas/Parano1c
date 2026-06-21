@@ -15,11 +15,12 @@ use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body
 use noid_air::composition::SweepTxLogicAir;
 use noid_air::Air;
 use noid_block::{
-    assemble_sweep_bucket_proof, block_recursive_claim_hash, build_state_bindings_from_binding,
-    build_tx_witness, extract_replay_witness, prove_block_with_total_tx_count,
-    prove_state_bindings_standalone, verify_state_bindings_standalone,
-    verify_sweep_bucket_aggregation, verify_sweep_bucket_from_block, BlockProof, BlockPublicMeta,
-    OwnedSweepTxWitness, OwnedTxWitness, TxBlockWitness,
+    assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
+    build_block_auth_sidecar, build_state_bindings_from_binding, build_tx_witness,
+    extract_replay_witness, prove_block_with_total_tx_count, prove_state_bindings_standalone,
+    split_auth_sidecar_for_buckets, verify_state_bindings_standalone,
+    verify_sweep_bucket_aggregation, verify_sweep_bucket_from_block, BlockAuthSidecar, BlockProof,
+    BlockPublicMeta, OwnedSweepTxWitness, OwnedTxWitness, TxBlockWitness,
 };
 use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
@@ -120,6 +121,8 @@ pub struct FullBlockProofBench {
     pub prove_time: Duration,
     pub verify_time: Duration,
     pub proof_bytes: usize,
+    /// Public AuthGKR sidecar bytes bound by block.header.witness_root.
+    pub auth_sidecar_bytes: usize,
     pub standard_bucket_bytes: usize,
     pub sweep_bucket_bytes: usize,
     pub state_binding_bytes: usize,
@@ -127,6 +130,7 @@ pub struct FullBlockProofBench {
     /// this for recursive measurements so they bind the same state-binding and
     /// mixed-bucket proof bytes that block validation measured.
     pub proof: BlockProof,
+    pub auth_sidecar: BlockAuthSidecar,
 }
 
 pub struct RecursiveStepBench {
@@ -722,6 +726,7 @@ fn bench_block_from_parts(
     coinbase_body: TxBody,
     user_bodies: &[TxBody],
     proof: &BlockProof,
+    auth_sidecar: &BlockAuthSidecar,
 ) -> Block {
     let coinbase = tx_from_body(coinbase_body);
     let mut transactions = Vec::with_capacity(user_bodies.len() + 1);
@@ -744,7 +749,7 @@ fn bench_block_from_parts(
         .filter(|o| o.valid)
         .count() as u64;
     let proof_hash = block_recursive_claim_hash(proof);
-    Block {
+    let mut block = Block {
         header: BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: proof.meta.new_state_root,
@@ -755,7 +760,7 @@ fn bench_block_from_parts(
             nonce: 0,
             difficulty_target: [0xFF; 32],
             proof_transcript_hash: proof_hash,
-            witness_root: proof_hash,
+            witness_root: [0u8; 32],
             log_slots: BENCH_LOG_SLOTS,
             active_slot_count: active_outputs + coinbase_outputs,
             alloc_counter: active_outputs
@@ -763,14 +768,17 @@ fn bench_block_from_parts(
                 + active_inputs.saturating_sub(active_inputs),
         },
         transactions,
-    }
+    };
+    block.header.witness_root =
+        block_auth_sidecar_root(&block, auth_sidecar).expect("bench sidecar root");
+    block
 }
 
 fn prove_full_block_proof_once(
     standard_fixtures: &[StandardFixture],
     sweep_fixtures: &[SweepFixture],
     sweep_witnesses: &[OwnedSweepTxWitness],
-) -> (BlockProof, Block, ChainState) {
+) -> (BlockProof, Block, BlockAuthSidecar, ChainState) {
     let mut profiler = BenchFullBlockProfiler::new();
     let mut user_bodies: Vec<TxBody> = standard_fixtures
         .iter()
@@ -818,6 +826,8 @@ fn prove_full_block_proof_once(
         .enumerate()
         .map(|(i, f)| standard_block_witness(1 + i as u32, f))
         .collect();
+    let auth_sidecar =
+        build_block_auth_sidecar(&standard_witnesses, sweep_witnesses).expect("bench auth sidecar");
     profiler.phase("standard_witnesses");
 
     let sweep_bucket = assemble_sweep_bucket_proof(prev_state_root, sweep_witnesses)
@@ -863,7 +873,7 @@ fn prove_full_block_proof_once(
     };
     profiler.phase("core_proof");
 
-    let block = bench_block_from_parts(coinbase_body, &user_bodies, &proof);
+    let block = bench_block_from_parts(coinbase_body, &user_bodies, &proof, &auth_sidecar);
     proof.meta.new_state_root = block.header.state_root;
     profiler.phase("block_assembly");
     profiler.finish(
@@ -874,7 +884,7 @@ fn prove_full_block_proof_once(
         proof.standard_bucket.is_some(),
         proof.sweep_bucket.is_some(),
     );
-    (proof, block, pre_state)
+    (proof, block, auth_sidecar, pre_state)
 }
 
 pub fn bench_full_block_proof(
@@ -882,12 +892,18 @@ pub fn bench_full_block_proof(
     sweep_fixtures: &[SweepFixture],
     sweep_witnesses: &[OwnedSweepTxWitness],
 ) -> FullBlockProofBench {
-    let (prove_time, (proof, block, pre_state)) = time_once(|| {
+    let (prove_time, (proof, block, auth_sidecar, pre_state)) = time_once(|| {
         prove_full_block_proof_once(standard_fixtures, sweep_fixtures, sweep_witnesses)
     });
     let (verify_time, _) = time_once(|| {
+        noid_block::validate_block_auth_sidecar_root(&block, &auth_sidecar)
+            .expect("auth sidecar root");
+        let (standard_auth_proofs, sweep_auth_proofs) =
+            split_auth_sidecar_for_buckets(&block, &proof, &auth_sidecar)
+                .expect("split auth sidecar");
         if proof.sweep_bucket.is_some() {
-            verify_sweep_bucket_from_block(&block, &proof).expect("verify sweep bucket from block");
+            verify_sweep_bucket_from_block(&block, &proof, &sweep_auth_proofs)
+                .expect("verify sweep bucket from block");
         }
         let sb_airs = noid_block::build_state_binding_airs(&block, &proof, &pre_state.state)
             .expect("build verifier state binding AIRs");
@@ -898,8 +914,15 @@ pub fn bench_full_block_proof(
             let auth = noid_block::build_auth_public_list(&block, &proof);
             let tx_airs = noid_block::build_tx_airs(&block);
             let air_refs: Vec<&dyn Air> = tx_airs.iter().map(|a| a as &dyn Air).collect();
-            noid_block::verify_block(&air_refs, &proof, &spine, &auth, &sb_refs)
-                .expect("verify full standard/mixed block proof");
+            noid_block::verify_block(
+                &air_refs,
+                &proof,
+                &spine,
+                &auth,
+                &standard_auth_proofs,
+                &sb_refs,
+            )
+            .expect("verify full standard/mixed block proof");
         } else {
             verify_state_bindings_standalone(&proof, &sb_refs)
                 .expect("verify sweep-only standalone state binding");
@@ -926,6 +949,7 @@ pub fn bench_full_block_proof(
             .map(|p| p.byte_len())
             .sum::<usize>();
     let proof_bytes = proof.byte_len();
+    let auth_sidecar_bytes = auth_sidecar.byte_len();
     let standard_bucket_bytes = proof
         .standard_bucket
         .as_ref()
@@ -938,10 +962,12 @@ pub fn bench_full_block_proof(
         prove_time,
         verify_time,
         proof_bytes,
+        auth_sidecar_bytes,
         standard_bucket_bytes,
         sweep_bucket_bytes,
         state_binding_bytes,
         proof,
+        auth_sidecar,
     }
 }
 
@@ -1067,6 +1093,7 @@ pub fn bench_standard_block_with_total(
 
     let spine_inputs_list: Vec<_> = fixtures.iter().map(|f| f.spine_inputs.clone()).collect();
     let auth_public_list: Vec<_> = fixtures.iter().map(|f| f.auth_public).collect();
+    let auth_proofs: Vec<_> = fixtures.iter().map(|f| f.auth_proof.clone()).collect();
     let air_refs: Vec<&dyn Air> = fixtures.iter().map(|f| &f.air as &dyn Air).collect();
     let (verify_time, _) = time_once(|| {
         noid_block::verify_block(
@@ -1074,6 +1101,7 @@ pub fn bench_standard_block_with_total(
             &proof,
             &spine_inputs_list,
             &auth_public_list,
+            &auth_proofs,
             &[],
         )
         .expect("verify standard block")
@@ -1148,14 +1176,24 @@ pub fn mixed_block_proof(
 pub fn bench_sweep_bucket(witnesses: &[OwnedSweepTxWitness]) -> SweepBucketBench {
     let (prove_time, bucket) = sweep_bucket_proof(witnesses);
     let airs: Vec<&dyn Air> = witnesses.iter().map(|w| &w.air as &dyn Air).collect();
+    let auth_public: Vec<_> = witnesses.iter().map(|w| w.auth_public).collect();
+    let auth_proofs: Vec<_> = witnesses.iter().map(|w| w.auth_proof.clone()).collect();
+    let spine_inputs: Vec<_> = witnesses.iter().map(|w| w.spine_inputs.clone()).collect();
     let (aggregation_verify_time, _) = time_once(|| {
-        verify_sweep_bucket_aggregation(&BENCH_PREV_STATE_ROOT, &airs, &bucket)
-            .expect("verify sweep bucket aggregation")
+        verify_sweep_bucket_aggregation(
+            &BENCH_PREV_STATE_ROOT,
+            &airs,
+            &bucket,
+            &auth_public,
+            &auth_proofs,
+            &spine_inputs,
+        )
+        .expect("verify sweep bucket aggregation")
     });
     let per_tx_algebraic_bytes = bucket.tx_algebraic.first().map_or(0, |a| a.byte_len());
     let block_spine_bytes = bucket.block_spine_proof.byte_len();
-    let tx_auth_proofs_bytes: usize = bucket.tx_auth_proofs.iter().map(|p| p.byte_len()).sum();
-    let per_tx_auth_proof_bytes = bucket.tx_auth_proofs.first().map_or(0, |p| p.byte_len());
+    let tx_auth_proofs_bytes: usize = auth_proofs.iter().map(|p| p.byte_len()).sum();
+    let per_tx_auth_proof_bytes = auth_proofs.first().map_or(0, |p| p.byte_len());
     SweepBucketBench {
         prove_time,
         aggregation_verify_time,

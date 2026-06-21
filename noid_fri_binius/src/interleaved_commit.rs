@@ -9,6 +9,7 @@
 //! commitment of the batched polynomial separately.
 
 use noid_core::{AdditiveNTT, Block128};
+use noid_fri::code::{Code, LOG_RATE, RATE};
 use noid_fri::hasher::{CryptographicHasher, HashOutput};
 use rayon::prelude::*;
 
@@ -29,14 +30,241 @@ pub struct InterleavedCommitment {
 }
 
 /// Prover-side state retained after commitment (not sent to verifier).
-///
-/// M5: `encoded_cols` removed — it was always `Vec::new()` and wasted
-/// layout space.  Only `raw_cols` (borrowed references to the actual
-/// column data) are kept.
 pub struct InterleavedProverState<'a> {
     pub raw_cols: Vec<&'a [Block128]>,
     pub log_rows: usize,
     pub n_cols: usize,
+    /// RS-encoded source columns used by source-bound mixed openings.
+    /// Layout: `encoded_cols[col][code_index]`.
+    pub encoded_cols: Vec<Vec<Block128>>,
+    /// 128-bit Merkle tree over encoded interleaved high-pair leaves. Each leaf
+    /// contains the two code symbols needed for the first source TensorFold
+    /// over the highest message variable, for every committed column.
+    pub source_tree: ShortMerkleTree,
+}
+
+pub type ShortHash = [u8; 16];
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ShortBatchedMerkleProof {
+    pub siblings: Vec<ShortHash>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortMerkleTree {
+    nodes: Vec<ShortHash>,
+    layer_offsets: Vec<usize>,
+    layer_lens: Vec<usize>,
+}
+
+impl ShortMerkleTree {
+    pub(crate) fn new(leaf_hashes: Vec<ShortHash>) -> Self {
+        let n = leaf_hashes.len();
+        assert!(
+            n.is_power_of_two(),
+            "short Merkle leaves must be a power of two"
+        );
+        let tree_depth = n.trailing_zeros() as usize;
+        let total = 2 * n - 1;
+        let mut nodes = Vec::with_capacity(total);
+        nodes.extend_from_slice(&leaf_hashes);
+        nodes.resize(total, [0u8; 16]);
+
+        let mut level_start = 0usize;
+        let mut level_len = n;
+        while level_len > 1 {
+            let next_start = level_start + level_len;
+            let next_len = level_len / 2;
+            let (prefix, suffix) = nodes.split_at_mut(next_start);
+            let current = &prefix[level_start..level_start + level_len];
+            let next = &mut suffix[..next_len];
+            if next_len >= 1024 {
+                next.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    *out = short_compress(&current[2 * i], &current[2 * i + 1]);
+                });
+            } else {
+                for i in 0..next_len {
+                    next[i] = short_compress(&current[2 * i], &current[2 * i + 1]);
+                }
+            }
+            level_start = next_start;
+            level_len = next_len;
+        }
+
+        let mut layer_offsets = Vec::with_capacity(tree_depth + 1);
+        let mut layer_lens = Vec::with_capacity(tree_depth + 1);
+        let mut bottom_up_offsets = Vec::with_capacity(tree_depth + 1);
+        let mut bottom_up_lens = Vec::with_capacity(tree_depth + 1);
+        let mut off = 0usize;
+        let mut len = n;
+        loop {
+            bottom_up_offsets.push(off);
+            bottom_up_lens.push(len);
+            if len == 1 {
+                break;
+            }
+            off += len;
+            len /= 2;
+        }
+        for i in (0..bottom_up_offsets.len()).rev() {
+            layer_offsets.push(bottom_up_offsets[i]);
+            layer_lens.push(bottom_up_lens[i]);
+        }
+
+        Self {
+            nodes,
+            layer_offsets,
+            layer_lens,
+        }
+    }
+
+    pub(crate) fn get_root(&self) -> ShortHash {
+        self.nodes[self.layer_offsets[0]]
+    }
+
+    pub(crate) fn get_node_at_depth(&self, depth: usize, index: usize) -> ShortHash {
+        assert!(depth < self.layer_offsets.len());
+        assert!(index < self.layer_lens[depth]);
+        self.nodes[self.layer_offsets[depth] + index]
+    }
+}
+
+pub(crate) fn short_hash_to_output(h: ShortHash) -> HashOutput {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&h);
+    out
+}
+
+pub(crate) fn short_hash_from_output(h: &HashOutput) -> Option<ShortHash> {
+    if h[16..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h[..16]);
+    Some(out)
+}
+
+fn short_hash(hasher: blake3::Hasher) -> ShortHash {
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+pub(crate) fn short_compress(left: &ShortHash, right: &ShortHash) -> ShortHash {
+    let mut h = blake3::Hasher::new();
+    h.update(b"PARANOID/SOURCE-BINDING-MERKLE-128/v1");
+    h.update(left);
+    h.update(right);
+    short_hash(h)
+}
+
+pub(crate) fn build_short_batched_merkle_proof(
+    tree: &ShortMerkleTree,
+    leaf_indices: &[usize],
+    depth: usize,
+) -> ShortBatchedMerkleProof {
+    let mut siblings = Vec::new();
+    let mut known_at_layer: Vec<std::collections::HashSet<usize>> =
+        vec![std::collections::HashSet::new(); depth + 1];
+    for &idx in leaf_indices {
+        known_at_layer[0].insert(idx);
+    }
+    for d in 0..depth {
+        let mut parents_needed = std::collections::BTreeSet::new();
+        for &idx in &known_at_layer[d] {
+            parents_needed.insert(idx >> 1);
+        }
+        for &parent in &parents_needed {
+            let left_child = parent * 2;
+            let right_child = parent * 2 + 1;
+            let left_known = known_at_layer[d].contains(&left_child);
+            let right_known = known_at_layer[d].contains(&right_child);
+            if left_known && right_known {
+                known_at_layer[d + 1].insert(parent);
+            } else if left_known {
+                siblings.push(tree.get_node_at_depth(depth - d, right_child));
+                known_at_layer[d + 1].insert(parent);
+            } else if right_known {
+                siblings.push(tree.get_node_at_depth(depth - d, left_child));
+                known_at_layer[d + 1].insert(parent);
+            }
+        }
+    }
+    ShortBatchedMerkleProof { siblings }
+}
+
+pub(crate) fn verify_short_batched_merkle_proof(
+    root: &ShortHash,
+    batch: &ShortBatchedMerkleProof,
+    depth: usize,
+    leaf_indices: &[usize],
+    leaf_hashes: &[ShortHash],
+) -> Result<(), String> {
+    if leaf_indices.len() != leaf_hashes.len() {
+        return Err("short leaf index/hash count mismatch".into());
+    }
+    let mut known: std::collections::HashMap<(usize, usize), ShortHash> =
+        std::collections::HashMap::new();
+    for (i, &idx) in leaf_indices.iter().enumerate() {
+        if let Some(&existing) = known.get(&(0, idx)) {
+            if existing != leaf_hashes[i] {
+                return Err(format!("inconsistent short leaf hashes for index {idx}"));
+            }
+        } else {
+            known.insert((0, idx), leaf_hashes[i]);
+        }
+    }
+
+    let mut sib_cursor = 0usize;
+    for d in 0..depth {
+        let mut parents_needed = std::collections::BTreeSet::new();
+        for (&(layer, idx), _) in known.iter() {
+            if layer == d {
+                parents_needed.insert(idx >> 1);
+            }
+        }
+        for &parent in &parents_needed {
+            let left_child = parent * 2;
+            let right_child = parent * 2 + 1;
+            let left = known.get(&(d, left_child)).copied();
+            let right = known.get(&(d, right_child)).copied();
+            let parent_hash = match (left, right) {
+                (Some(l), Some(r)) => short_compress(&l, &r),
+                (Some(l), None) => {
+                    if sib_cursor >= batch.siblings.len() {
+                        return Err(format!("insufficient short siblings at layer {d}"));
+                    }
+                    let r = batch.siblings[sib_cursor];
+                    sib_cursor += 1;
+                    short_compress(&l, &r)
+                }
+                (None, Some(r)) => {
+                    if sib_cursor >= batch.siblings.len() {
+                        return Err(format!("insufficient short siblings at layer {d}"));
+                    }
+                    let l = batch.siblings[sib_cursor];
+                    sib_cursor += 1;
+                    short_compress(&l, &r)
+                }
+                (None, None) => return Err(format!("short orphan parent at layer {d}")),
+            };
+            known.insert((d + 1, parent), parent_hash);
+        }
+    }
+    let computed_root = known
+        .get(&(depth, 0))
+        .ok_or_else(|| "failed to compute short root".to_string())?;
+    if computed_root != root {
+        return Err("short batched Merkle root mismatch".into());
+    }
+    if sib_cursor != batch.siblings.len() {
+        return Err(format!(
+            "unused short siblings: consumed {sib_cursor}, total {}",
+            batch.siblings.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Commit all columns into a compact cap + prover state.
@@ -82,6 +310,16 @@ pub fn interleaved_commit<'a>(
         })
         .collect();
 
+    let encoded_cols: Vec<Vec<Block128>> = cols
+        .par_iter()
+        .map(|col| Code::new_parallel(col, _ntt).encoding)
+        .collect();
+    let source_leaf_hashes = build_source_leaf_hashes(&encoded_cols, log_rows, n_cols);
+    let source_tree = ShortMerkleTree::new(source_leaf_hashes);
+    let source_root = short_hash_to_output(source_tree.get_root());
+
+    let mut cap_hashes = cap_hashes;
+    cap_hashes.push(source_root);
     let cap = MerkleCap { hashes: cap_hashes };
 
     let commitment = InterleavedCommitment {
@@ -94,9 +332,98 @@ pub fn interleaved_commit<'a>(
         raw_cols: cols.to_vec(),
         log_rows,
         n_cols,
+        encoded_cols,
+        source_tree,
     };
 
     (commitment, state)
+}
+
+pub(crate) fn source_leaf_count(log_rows: usize) -> usize {
+    1usize << (log_rows + LOG_RATE - 1)
+}
+
+pub(crate) fn source_tree_depth(log_rows: usize) -> usize {
+    log_rows + LOG_RATE - 1
+}
+
+pub(crate) fn source_root_short_from_cap(cap: &MerkleCap) -> Option<ShortHash> {
+    cap.hashes.last().and_then(short_hash_from_output)
+}
+
+pub(crate) fn source_leaf_hash(
+    log_rows: usize,
+    n_cols: usize,
+    leaf_index: usize,
+    symbols: &[Block128],
+) -> ShortHash {
+    assert_eq!(symbols.len(), n_cols * 2);
+    let mut h = blake3::Hasher::new();
+    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/128/v1");
+    h.update(&(log_rows as u64).to_le_bytes());
+    h.update(&(n_cols as u64).to_le_bytes());
+    h.update(&(leaf_index as u64).to_le_bytes());
+    for symbol in symbols {
+        h.update(&symbol.0.to_le_bytes());
+    }
+    short_hash(h)
+}
+
+pub(crate) fn source_leaf_positions(log_rows: usize, leaf_index: usize) -> (usize, usize) {
+    assert!(log_rows > 0);
+    let half = 1usize << (log_rows - 1);
+    let local_mask = half - 1;
+    let local = leaf_index & local_mask;
+    let coset = leaf_index >> (log_rows - 1);
+    let base = coset * (1usize << log_rows) + local;
+    (base, base + half)
+}
+
+fn build_source_leaf_hashes(
+    encoded_cols: &[Vec<Block128>],
+    log_rows: usize,
+    n_cols: usize,
+) -> Vec<ShortHash> {
+    assert_eq!(encoded_cols.len(), n_cols);
+    let code_len = (1usize << log_rows) * RATE;
+    for col in encoded_cols {
+        assert_eq!(col.len(), code_len);
+    }
+    let leaf_count = source_leaf_count(log_rows);
+    (0..leaf_count)
+        .into_par_iter()
+        .map(|leaf_index| {
+            let (pos0, pos1) = source_leaf_positions(log_rows, leaf_index);
+            source_leaf_hash_from_encoded_cols(
+                log_rows,
+                n_cols,
+                leaf_index,
+                encoded_cols,
+                pos0,
+                pos1,
+            )
+        })
+        .collect()
+}
+
+fn source_leaf_hash_from_encoded_cols(
+    log_rows: usize,
+    n_cols: usize,
+    leaf_index: usize,
+    encoded_cols: &[Vec<Block128>],
+    pos0: usize,
+    pos1: usize,
+) -> ShortHash {
+    let mut h = blake3::Hasher::new();
+    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/128/v1");
+    h.update(&(log_rows as u64).to_le_bytes());
+    h.update(&(n_cols as u64).to_le_bytes());
+    h.update(&(leaf_index as u64).to_le_bytes());
+    for col in encoded_cols {
+        h.update(&col[pos0].0.to_le_bytes());
+        h.update(&col[pos1].0.to_le_bytes());
+    }
+    short_hash(h)
 }
 
 /// Absorb the cap into a Fiat-Shamir channel.

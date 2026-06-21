@@ -18,15 +18,26 @@
 //! Uses the compact FRI (TAU=8, 64 queries, batched Merkle paths) for ~26KB
 //! opening proofs instead of ~70KB from the standard FRI.
 
+use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
+use noid_fri::code::{Code, LOG_RATE, RATE};
 use noid_fri::hasher::CryptographicHasher;
+use noid_fri::merkle::{compute_leaf_hashes, MerkleTree, VectorCommitment};
 use noid_fri::Channel;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
-use crate::compact_fri::{compact_fri_prove, compact_fri_verify, CompactEvalProof};
-use crate::interleaved_commit::InterleavedProverState;
+use crate::compact_fri::{
+    compact_fri_prove_with_query_hook, compact_fri_verify_with_query_hook, gen_compact_queries,
+    CompactEvalProof, CompactFriQueryContext,
+};
+use crate::interleaved_commit::{
+    build_short_batched_merkle_proof, short_hash_to_output, source_leaf_hash,
+    source_leaf_positions, source_root_short_from_cap, source_tree_depth,
+    verify_short_batched_merkle_proof, InterleavedProverState, ShortBatchedMerkleProof, ShortHash,
+    ShortMerkleTree,
+};
 
 /// Domain-separation tag for mixed opening sub-protocol.
 pub const MIXED_OPEN_TAG: u64 = 0xFFF8_0000_0000_0000;
@@ -114,6 +125,33 @@ pub struct EvalClaim {
     pub value: Block128,
 }
 
+/// Source binding proof for the compact FRI round-0 oracle.
+///
+/// The proof binds the small tensor-batched table `H` to the encoded source
+/// columns with high-variable TensorFold path checks.  The verifier then
+/// computes `g = H * eq_right`, encodes `Code(g)`, and requires its root to be
+/// the compact FRI round-0 root.  This closes the B2/G gap without a standalone
+/// prover-chosen FRI oracle.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SourceBindingProof {
+    /// Tensor-batched low table H.  Length is `2^(log_rows - tau)`; in the
+    /// current production shapes this is 8 for block/Auth and 256 for state
+    /// segments, so direct reveal is cheaper and simpler than a second low PCS.
+    pub h_evals: Vec<Block128>,
+    /// Merkle roots for intermediate high TensorFold layers after source round
+    /// 0 and before the final revealed H layer. Length is `tau - 1`.
+    pub folded_roots: Vec<ShortHash>,
+    /// For each source-binding query, serialized as column-major high pairs:
+    /// `[col0_s0, col0_s1, col1_s0, col1_s1, ...]`.
+    pub source_symbols: Vec<Block128>,
+    /// Batched Merkle proof against the encoded interleaved source root.
+    pub source_merkle_batch: ShortBatchedMerkleProof,
+    /// Per intermediate high-folded layer queried high pairs.
+    pub folded_queried_symbols: Vec<Vec<(Block128, Block128)>>,
+    /// Batched Merkle proofs for `folded_roots`.
+    pub folded_merkle_batch: Vec<ShortBatchedMerkleProof>,
+}
+
 /// Proof of mixed-point opening.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MixedOpeningProof {
@@ -121,7 +159,12 @@ pub struct MixedOpeningProof {
     /// followed by secondary claim values.
     pub all_openings: Vec<Block128>,
     /// Compact FRI proof of the gamma-batched polynomial at primary_point.
+    /// Kept for current recursive/replay compatibility; source binding is
+    /// enforced by `source_proof` below.
     pub fri_proof: CompactEvalProof,
+    /// Source binding proof tying the batched opening oracle to the committed
+    /// interleaved columns.
+    pub source_proof: SourceBindingProof,
 }
 
 /// Prove a mixed-point opening.
@@ -201,41 +244,68 @@ pub fn prove_mixed_opening(
     // accumulator vector hot in cache. Accumulation is performed in the flat
     // basis and converted back once for compact FRI.
     use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
-    let c_evals_flat: Vec<u128> = state
-        .raw_cols
-        .par_iter()
-        .zip(weights_flat.par_iter())
-        .fold(
-            || vec![0u128; n],
-            |mut acc, (col, &weight)| {
-                acc.iter_mut().zip(col.iter()).for_each(|(acc_i, &v)| {
-                    *acc_i ^= clmul_gcm(weight, tower_to_flat_u128(v.0));
-                });
-                acc
-            },
-        )
-        .reduce(
-            || vec![0u128; n],
-            |mut a, b| {
-                a.iter_mut()
-                    .zip(b.iter())
-                    .for_each(|(a_i, &b_i)| *a_i ^= b_i);
-                a
-            },
-        );
-    let c_evals: Vec<Block128> = c_evals_flat
-        .into_iter()
-        .map(|v| Block128::from(flat_to_tower_u128(v)))
-        .collect();
+    let c_evals: Vec<Block128> = if n_cols == 1 {
+        state.raw_cols[0].to_vec()
+    } else {
+        let c_evals_flat: Vec<u128> = state
+            .raw_cols
+            .par_iter()
+            .zip(weights_flat.par_iter())
+            .fold(
+                || vec![0u128; n],
+                |mut acc, (col, &weight)| {
+                    acc.iter_mut().zip(col.iter()).for_each(|(acc_i, &v)| {
+                        *acc_i ^= clmul_gcm(weight, tower_to_flat_u128(v.0));
+                    });
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0u128; n],
+                |mut a, b| {
+                    a.iter_mut()
+                        .zip(b.iter())
+                        .for_each(|(a_i, &b_i)| *a_i ^= b_i);
+                    a
+                },
+            );
+        c_evals_flat
+            .into_iter()
+            .map(|v| Block128::from(flat_to_tower_u128(v)))
+            .collect()
+    };
     profiler.phase("batched_polynomial");
 
-    // Prove C(primary_point) via compact FRI
-    let fri_proof = compact_fri_prove(&c_evals, primary_point, ntt, channel, hasher, num_queries);
-    profiler.phase("compact_fri_prove");
+    // Prove C(primary_point) via compact FRI.  The source-binding hook absorbs
+    // the H/table commitments before compact FRI draws query indices, so the
+    // FRI round-0 oracle cannot be chosen independently of the committed source.
+    let (fri_proof, _fri_query_info, source_proof) = compact_fri_prove_with_query_hook(
+        &c_evals,
+        primary_point,
+        ntt,
+        channel,
+        hasher,
+        num_queries,
+        |ctx, channel| {
+            prove_source_binding(
+                state,
+                &c_evals,
+                primary_point,
+                ctx,
+                ntt,
+                channel,
+                hasher,
+                num_queries,
+            )
+        },
+    );
+    let _ = gamma; // gamma is bound in the source verifier through source symbols.
+    profiler.phase("compact_fri_and_source_binding_prove");
 
     let proof = MixedOpeningProof {
         all_openings,
         fri_proof,
+        source_proof,
     };
     profiler.phase("proof_assembly");
     profiler.finish(n_cols, log_n, secondary_claims.len(), num_queries);
@@ -293,8 +363,9 @@ pub fn verify_mixed_opening(
     // Compute batched claim for primary columns in flat/GCM basis.
     let batched_claim = compute_batched_claim_flat(gamma, &proof.all_openings[..n_cols]);
 
-    // Verify compact FRI proof: C(primary_point) == batched_claim
-    compact_fri_verify(
+    // Verify compact FRI proof and, before its query indices are drawn, bind
+    // the round-0 oracle to the committed encoded source columns.
+    compact_fri_verify_with_query_hook(
         primary_point,
         batched_claim,
         &proof.fri_proof,
@@ -302,10 +373,483 @@ pub fn verify_mixed_opening(
         channel,
         hasher,
         num_queries,
+        |ctx, channel| {
+            verify_source_binding(
+                commitment,
+                gamma,
+                primary_point,
+                &proof.source_proof,
+                ctx,
+                ntt,
+                channel,
+                hasher,
+                num_queries,
+            )
+        },
     )?;
 
     // Return primary openings (first n_cols entries)
     Ok(proof.all_openings[..n_cols].to_vec())
+}
+
+const MIXED_SOURCE_BINDING_TAG: u128 = 0x5B1D_0000_0000_0001u128;
+
+struct HighFoldLayer {
+    log_rows: usize,
+    code: Code,
+    tree: ShortMerkleTree,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_source_binding(
+    state: &InterleavedProverState<'_>,
+    c_evals: &[Block128],
+    primary_point: &[Block128],
+    ctx: &CompactFriQueryContext,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+    num_queries: usize,
+) -> SourceBindingProof {
+    let log_n = state.log_rows;
+    let n_cols = state.n_cols;
+    assert_eq!(primary_point.len(), log_n);
+    assert_eq!(ctx.tau + ctx.n_rounds, log_n);
+    assert_eq!(state.encoded_cols.len(), n_cols);
+    assert_eq!(c_evals.len(), 1usize << log_n);
+
+    let (h_evals, folded_layers) =
+        build_high_tensor_layers(c_evals, &ctx.tensor_batching_point, ctx.tau, ntt, hasher);
+    assert_source_h_matches_compact(primary_point, ctx, &h_evals, ntt, hasher)
+        .expect("prover constructed inconsistent source H");
+
+    let folded_roots: Vec<ShortHash> = folded_layers
+        .iter()
+        .map(|layer| layer.tree.get_root())
+        .collect();
+
+    observe_source_binding_commitments(channel, &folded_roots, &h_evals, log_n, ctx.tau);
+    let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
+    let n_queries = query_indices.len();
+
+    let source_pair_indices: Vec<usize> = query_indices
+        .iter()
+        .map(|&qi| high_pair_leaf_index(qi, log_n))
+        .collect();
+    let mut source_symbols = Vec::with_capacity(n_queries * n_cols * 2);
+    for &leaf_idx in &source_pair_indices {
+        let (pos0, pos1) = source_leaf_positions(log_n, leaf_idx);
+        for col in &state.encoded_cols {
+            source_symbols.push(col[pos0]);
+            source_symbols.push(col[pos1]);
+        }
+    }
+    let source_merkle_batch = build_short_batched_merkle_proof(
+        &state.source_tree,
+        &source_pair_indices,
+        source_tree_depth(log_n),
+    );
+
+    let mut folded_queried_symbols = Vec::with_capacity(folded_layers.len());
+    let mut folded_merkle_batch = Vec::with_capacity(folded_layers.len());
+    let mut current_indices: Vec<usize> = source_pair_indices.clone();
+    for layer in &folded_layers {
+        let pair_indices: Vec<usize> = current_indices
+            .iter()
+            .map(|&idx| high_pair_leaf_index(idx, layer.log_rows))
+            .collect();
+        let mut symbols = Vec::with_capacity(n_queries);
+        for &pair_idx in &pair_indices {
+            let (pos0, pos1) = high_pair_positions(layer.log_rows, pair_idx);
+            symbols.push((layer.code.idx(pos0), layer.code.idx(pos1)));
+        }
+        let batch = build_short_batched_merkle_proof(
+            &layer.tree,
+            &pair_indices,
+            high_pair_tree_depth(layer.log_rows),
+        );
+        folded_queried_symbols.push(symbols);
+        folded_merkle_batch.push(batch);
+        current_indices = pair_indices;
+    }
+
+    SourceBindingProof {
+        h_evals,
+        folded_roots,
+        source_symbols,
+        source_merkle_batch,
+        folded_queried_symbols,
+        folded_merkle_batch,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_source_binding(
+    commitment: &crate::interleaved_commit::InterleavedCommitment,
+    gamma: Block128,
+    primary_point: &[Block128],
+    proof: &SourceBindingProof,
+    ctx: &CompactFriQueryContext,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+    num_queries: usize,
+) -> Result<(), String> {
+    let log_n = commitment.log_rows;
+    let n_cols = commitment.n_cols;
+    if primary_point.len() != log_n {
+        return Err("source binding point dimension mismatch".into());
+    }
+    if ctx.tau + ctx.n_rounds != log_n {
+        return Err("source binding compact context dimension mismatch".into());
+    }
+    if proof.h_evals.len() != (1usize << ctx.n_rounds) {
+        return Err(format!(
+            "source binding H length mismatch: expected {}, got {}",
+            1usize << ctx.n_rounds,
+            proof.h_evals.len()
+        ));
+    }
+    let expected_layers = ctx.tau.saturating_sub(1);
+    if proof.folded_roots.len() != expected_layers
+        || proof.folded_queried_symbols.len() != expected_layers
+        || proof.folded_merkle_batch.len() != expected_layers
+    {
+        return Err("source binding high-fold round count mismatch".into());
+    }
+
+    assert_source_h_matches_compact(primary_point, ctx, &proof.h_evals, ntt, hasher)?;
+    observe_source_binding_commitments(
+        channel,
+        &proof.folded_roots,
+        &proof.h_evals,
+        log_n,
+        ctx.tau,
+    );
+    let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
+    let n_queries = query_indices.len();
+    if proof.source_symbols.len() != n_queries * n_cols * 2 {
+        return Err(format!(
+            "source binding source symbol length mismatch: expected {}, got {}",
+            n_queries * n_cols * 2,
+            proof.source_symbols.len()
+        ));
+    }
+
+    let source_root = source_root_short_from_cap(&commitment.cap)
+        .ok_or_else(|| "missing short source root in interleaved commitment".to_string())?;
+    let source_pair_indices: Vec<usize> = query_indices
+        .iter()
+        .map(|&qi| high_pair_leaf_index(qi, log_n))
+        .collect();
+    let mut source_leaf_hashes = Vec::with_capacity(n_queries);
+    for query_idx in 0..n_queries {
+        let start = query_idx * n_cols * 2;
+        let end = start + n_cols * 2;
+        source_leaf_hashes.push(source_leaf_hash(
+            log_n,
+            n_cols,
+            source_pair_indices[query_idx],
+            &proof.source_symbols[start..end],
+        ));
+    }
+    verify_short_batched_merkle_proof(
+        &source_root,
+        &proof.source_merkle_batch,
+        source_tree_depth(log_n),
+        &source_pair_indices,
+        &source_leaf_hashes,
+    )?;
+
+    let weights_flat = compute_horner_weights_flat(gamma, n_cols);
+    let mut folded_symbols = Vec::with_capacity(n_queries);
+    for query_idx in 0..n_queries {
+        let start = query_idx * n_cols * 2;
+        let source_pair = reduce_source_pair_flat(
+            &proof.source_symbols[start..start + n_cols * 2],
+            &weights_flat,
+        );
+        folded_symbols.push(tensor_high_fold_pair(
+            ctx.tensor_batching_point[ctx.tau - 1],
+            log_n,
+            source_pair_indices[query_idx],
+            source_pair.0,
+            source_pair.1,
+        ));
+    }
+
+    let mut current_indices = source_pair_indices;
+    for (layer_idx, symbols) in proof.folded_queried_symbols.iter().enumerate() {
+        let layer_log = log_n - 1 - layer_idx;
+        if symbols.len() != n_queries {
+            return Err(format!(
+                "source binding symbol count mismatch at high layer {layer_idx}: expected {n_queries}, got {}",
+                symbols.len()
+            ));
+        }
+        let pair_indices: Vec<usize> = current_indices
+            .iter()
+            .map(|&idx| high_pair_leaf_index(idx, layer_log))
+            .collect();
+        let leaf_hashes: Vec<ShortHash> = symbols
+            .iter()
+            .zip(pair_indices.iter())
+            .map(|(&(s0, s1), &pair_idx)| high_pair_leaf_hash(layer_log, pair_idx, s0, s1))
+            .collect();
+        verify_short_batched_merkle_proof(
+            &proof.folded_roots[layer_idx],
+            &proof.folded_merkle_batch[layer_idx],
+            high_pair_tree_depth(layer_log),
+            &pair_indices,
+            &leaf_hashes,
+        )?;
+
+        let r = ctx.tensor_batching_point[ctx.tau - 2 - layer_idx];
+        let mut next_folded = Vec::with_capacity(n_queries);
+        for query_idx in 0..n_queries {
+            let (s0, s1) = symbols[query_idx];
+            let expected = if high_pair_parity(current_indices[query_idx], layer_log) == 1 {
+                s1
+            } else {
+                s0
+            };
+            if folded_symbols[query_idx] != expected {
+                return Err(format!(
+                    "source binding high-fold path inconsistency at query {query_idx} layer {layer_idx}"
+                ));
+            }
+            next_folded.push(tensor_high_fold_pair(
+                r,
+                layer_log,
+                pair_indices[query_idx],
+                s0,
+                s1,
+            ));
+        }
+        folded_symbols = next_folded;
+        current_indices = pair_indices;
+    }
+
+    let h_code = Code::new_parallel(&proof.h_evals, ntt);
+    for (query_idx, folded) in folded_symbols.iter().enumerate() {
+        let expected = h_code.idx(current_indices[query_idx]);
+        if *folded != expected {
+            return Err(format!(
+                "source binding H-code mismatch at query {query_idx}: got {folded:?} expected {expected:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn observe_source_binding_commitments(
+    channel: &mut Channel,
+    folded_roots: &[ShortHash],
+    h_evals: &[Block128],
+    log_n: usize,
+    tau: usize,
+) {
+    channel.observe_field_elem(Block128::from(MIXED_SOURCE_BINDING_TAG));
+    channel.observe_field_elems(h_evals);
+    for (i, &root) in folded_roots.iter().enumerate() {
+        let layer_log = log_n - 1 - i;
+        debug_assert!(i + 1 < tau);
+        channel.observe_vector_commitment(&VectorCommitment {
+            root: short_hash_to_output(root),
+            depth: high_pair_tree_depth(layer_log),
+        });
+    }
+}
+
+fn build_high_tensor_layers(
+    c_evals: &[Block128],
+    beta: &[Block128],
+    tau: usize,
+    ntt: &AdditiveNTT<Block128>,
+    hasher: &dyn CryptographicHasher,
+) -> (Vec<Block128>, Vec<HighFoldLayer>) {
+    let log_n = c_evals.len().trailing_zeros() as usize;
+    let mut current = c_evals.to_vec();
+    let mut layers = Vec::with_capacity(tau.saturating_sub(1));
+    for round in 0..tau {
+        let r = beta[tau - 1 - round];
+        fold_highest_mle_eq_in_place(&mut current, r);
+        let layer_log = log_n - 1 - round;
+        if round + 1 < tau {
+            let code = Code::new_parallel(&current, ntt);
+            let tree = build_high_pair_tree(&code, layer_log, hasher);
+            layers.push(HighFoldLayer {
+                log_rows: layer_log,
+                code,
+                tree,
+            });
+        }
+    }
+    (current, layers)
+}
+
+#[cfg(test)]
+fn fold_highest_mle_eq(evals: &[Block128], r: Block128) -> Vec<Block128> {
+    let mut out = evals.to_vec();
+    fold_highest_mle_eq_in_place(&mut out, r);
+    out
+}
+
+fn fold_highest_mle_eq_in_place(evals: &mut Vec<Block128>, r: Block128) {
+    let half = evals.len() / 2;
+    if half >= 1024 {
+        let (lo, hi) = evals.split_at_mut(half);
+        lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, &h)| {
+            *l = *l + r * (*l + h);
+        });
+    } else {
+        for i in 0..half {
+            evals[i] = evals[i] + r * (evals[i] + evals[i + half]);
+        }
+    }
+    evals.truncate(half);
+}
+
+fn assert_source_h_matches_compact(
+    primary_point: &[Block128],
+    ctx: &CompactFriQueryContext,
+    h_evals: &[Block128],
+    ntt: &AdditiveNTT<Block128>,
+    hasher: &dyn CryptographicHasher,
+) -> Result<(), String> {
+    let right = &primary_point[..ctx.n_rounds];
+    let h_at_right = mle_evaluate_small(h_evals, right);
+    if h_at_right != ctx.initial_sumcheck_claim {
+        return Err("source binding H(right) does not match compact tensor claim".into());
+    }
+
+    let eq_right = eq_ind_partial_eval(right);
+    let g_evals: Vec<Block128> = h_evals
+        .iter()
+        .zip(eq_right.iter())
+        .map(|(&h, &e)| h * e)
+        .collect();
+    let g_code = Code::new_parallel(&g_evals, ntt);
+    if ctx.n_rounds == 0 {
+        if g_code.encoding != ctx.final_codeword {
+            return Err("source binding Code(H) final codeword mismatch".into());
+        }
+        return Ok(());
+    }
+
+    let leaf_hashes = compute_leaf_hashes(&g_code.encoding, hasher);
+    let tree = MerkleTree::new_parallel(leaf_hashes, hasher);
+    if ctx.fri_roots.first().copied() != Some(tree.get_root()) {
+        return Err(
+            "source binding Code(H*eq_right) root does not match compact FRI round-0 root".into(),
+        );
+    }
+    Ok(())
+}
+
+fn mle_evaluate_small(evals: &[Block128], point: &[Block128]) -> Block128 {
+    if point.is_empty() {
+        return evals[0];
+    }
+    let mut buf = evals.to_vec();
+    for &r in point.iter().rev() {
+        let half = buf.len() / 2;
+        for i in 0..half {
+            buf[i] = buf[i] + r * (buf[i] + buf[i + half]);
+        }
+        buf.truncate(half);
+    }
+    buf[0]
+}
+
+fn high_pair_tree_depth(layer_log: usize) -> usize {
+    layer_log + LOG_RATE - 1
+}
+
+fn high_pair_leaf_index(code_index: usize, layer_log: usize) -> usize {
+    debug_assert!(layer_log > 0);
+    let local_mask = (1usize << layer_log) - 1;
+    let local = code_index & local_mask;
+    let coset = code_index >> layer_log;
+    let low = local & ((1usize << (layer_log - 1)) - 1);
+    (coset << (layer_log - 1)) | low
+}
+
+fn high_pair_parity(code_index: usize, layer_log: usize) -> usize {
+    let local = code_index & ((1usize << layer_log) - 1);
+    (local >> (layer_log - 1)) & 1
+}
+
+fn high_pair_positions(layer_log: usize, leaf_index: usize) -> (usize, usize) {
+    debug_assert!(layer_log > 0);
+    let half = 1usize << (layer_log - 1);
+    let local = leaf_index & (half - 1);
+    let coset = leaf_index >> (layer_log - 1);
+    let base = coset * (1usize << layer_log) + local;
+    (base, base + half)
+}
+
+fn tensor_high_fold_pair(
+    r: Block128,
+    layer_log: usize,
+    leaf_index: usize,
+    s0: Block128,
+    s1: Block128,
+) -> Block128 {
+    let coset = leaf_index >> (layer_log - 1);
+    let basis_idx = coset + layer_log - 1;
+    let basis = Block128::from(1u128 << basis_idx);
+    s1 + (basis + Block128::ONE + r) * s0
+}
+
+fn high_pair_leaf_hash(
+    layer_log: usize,
+    leaf_index: usize,
+    s0: Block128,
+    s1: Block128,
+) -> ShortHash {
+    let mut h = blake3::Hasher::new();
+    h.update(b"PARANOID/MIXED-SOURCE-HIGH-FOLD-LEAF/128/v1");
+    h.update(&(layer_log as u64).to_le_bytes());
+    h.update(&(leaf_index as u64).to_le_bytes());
+    h.update(&s0.0.to_le_bytes());
+    h.update(&s1.0.to_le_bytes());
+    let digest = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+fn build_high_pair_tree(
+    code: &Code,
+    layer_log: usize,
+    _hasher: &dyn CryptographicHasher,
+) -> ShortMerkleTree {
+    let leaf_count = RATE * (1usize << (layer_log - 1));
+    let leaf_hashes: Vec<ShortHash> = (0..leaf_count)
+        .into_par_iter()
+        .map(|leaf_idx| {
+            let (pos0, pos1) = high_pair_positions(layer_log, leaf_idx);
+            high_pair_leaf_hash(layer_log, leaf_idx, code.idx(pos0), code.idx(pos1))
+        })
+        .collect();
+    ShortMerkleTree::new(leaf_hashes)
+}
+
+fn reduce_source_pair_flat(symbols: &[Block128], weights_flat: &[u128]) -> (Block128, Block128) {
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+    assert_eq!(symbols.len(), weights_flat.len() * 2);
+    let mut s0 = 0u128;
+    let mut s1 = 0u128;
+    for (col_idx, &weight) in weights_flat.iter().enumerate() {
+        s0 ^= clmul_gcm(weight, tower_to_flat_u128(symbols[2 * col_idx].0));
+        s1 ^= clmul_gcm(weight, tower_to_flat_u128(symbols[2 * col_idx + 1].0));
+    }
+    (
+        Block128::from(flat_to_tower_u128(s0)),
+        Block128::from(flat_to_tower_u128(s1)),
+    )
 }
 
 fn compute_horner_weights_flat(gamma: Block128, n: usize) -> Vec<u128> {
@@ -332,11 +876,45 @@ fn compute_batched_claim_flat(gamma: Block128, openings: &[Block128]) -> Block12
     Block128::from(flat_to_tower_u128(acc))
 }
 
+impl SourceBindingProof {
+    pub fn byte_len(&self) -> usize {
+        let h = self.h_evals.len() * 16;
+        let roots = self.folded_roots.len() * 16;
+        let source_symbols = self.source_symbols.len() * 16;
+        let source_batch = self.source_merkle_batch.siblings.len() * 16;
+        let folded_symbols: usize = self
+            .folded_queried_symbols
+            .iter()
+            .map(|v| v.len() * 2 * 16)
+            .sum();
+        let folded_batches: usize = self
+            .folded_merkle_batch
+            .iter()
+            .map(|b| b.siblings.len() * 16)
+            .sum();
+        let total = h + roots + source_symbols + source_batch + folded_symbols + folded_batches;
+        if std::env::var("NOID_SOURCE_BINDING_PROFILE").is_ok() {
+            eprintln!(
+                "source_binding bytes h={} roots={} source_symbols={} source_batch={} folded_symbols={} folded_batches={} total={}",
+                h,
+                roots,
+                source_symbols,
+                source_batch,
+                folded_symbols,
+                folded_batches,
+                total
+            );
+        }
+        total
+    }
+}
+
 impl MixedOpeningProof {
     pub fn byte_len(&self) -> usize {
         let openings = self.all_openings.len() * 16;
         let fri = self.fri_proof.byte_len();
-        openings + fri
+        let source = self.source_proof.byte_len();
+        openings + fri + source
     }
 }
 
@@ -433,6 +1011,79 @@ mod tests {
     }
 
     #[test]
+    fn source_pair_reduction_matches_batched_code_symbols() {
+        let cols = test_columns();
+        let col_refs: Vec<&[Block128]> = cols.iter().map(Vec::as_slice).collect();
+        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let hasher = Blake3Hasher::new();
+        let (_commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
+        let gamma = Block128::from(0xBAD5_EEDu128);
+        let weights_flat = compute_horner_weights_flat(gamma, state.n_cols);
+        let n = 1usize << state.log_rows;
+
+        let c_evals: Vec<Block128> = (0..n)
+            .map(|row| {
+                compute_batched_claim_flat(
+                    gamma,
+                    &cols.iter().map(|col| col[row]).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let c_code = Code::new_parallel(&c_evals, &ntt);
+
+        for leaf_idx in 0..source_leaf_count_for_test(state.log_rows) {
+            let (pos0, pos1) = source_leaf_positions(state.log_rows, leaf_idx);
+            let mut symbols = Vec::with_capacity(state.n_cols * 2);
+            for col in &state.encoded_cols {
+                symbols.push(col[pos0]);
+                symbols.push(col[pos1]);
+            }
+            let reduced = reduce_source_pair_flat(&symbols, &weights_flat);
+            assert_eq!(reduced.0, c_code.idx(pos0), "pos0 mismatch leaf {leaf_idx}");
+            assert_eq!(reduced.1, c_code.idx(pos1), "pos1 mismatch leaf {leaf_idx}");
+        }
+    }
+
+    #[test]
+    fn high_tensor_fold_matches_code_new_parallel() {
+        let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
+        let mut current: Vec<Block128> = (0..(1usize << TEST_LOG_ROWS))
+            .map(|i| Block128::from((i as u128).wrapping_mul(0x1_0001) ^ 0xA11CE))
+            .collect();
+        let beta: Vec<Block128> = (0..TEST_LOG_ROWS)
+            .map(|i| Block128::from(0x7000u128 + i as u128))
+            .collect();
+
+        for round in 0..TEST_LOG_ROWS {
+            let layer_log = TEST_LOG_ROWS - round;
+            let r = beta[TEST_LOG_ROWS - 1 - round];
+            let code_before = Code::new_parallel(&current, &ntt);
+            let folded = fold_highest_mle_eq(&current, r);
+            let code_after = Code::new_parallel(&folded, &ntt);
+            for leaf_idx in 0..(RATE * (1usize << (layer_log - 1))) {
+                let (pos0, pos1) = high_pair_positions(layer_log, leaf_idx);
+                let got = tensor_high_fold_pair(
+                    r,
+                    layer_log,
+                    leaf_idx,
+                    code_before.idx(pos0),
+                    code_before.idx(pos1),
+                );
+                assert_eq!(
+                    got,
+                    code_after.idx(leaf_idx),
+                    "high TensorFold mismatch round {round} layer_log {layer_log} leaf {leaf_idx}"
+                );
+            }
+            current = folded;
+        }
+    }
+
+    fn source_leaf_count_for_test(log_rows: usize) -> usize {
+        RATE * (1usize << (log_rows - 1))
+    }
+
+    #[test]
     fn valid_secondary_claim_hygiene_passes() {
         let (commitment, primary_point, claims, proof, ntt, hasher) = valid_fixture();
         verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
@@ -476,7 +1127,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "S1 open: current mixed opening does not bind the compact FRI oracle to InterleavedCommitment"]
     fn commit_to_a_open_from_a_prime_must_reject_after_s1_fix() {
         let cols_a = test_columns();
         let mut cols_b = cols_a.clone();

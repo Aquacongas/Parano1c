@@ -45,6 +45,10 @@ pub struct BlockTemplateResponse {
     /// Serialized BlockProof bytes as hex. Empty for coinbase-only blocks.
     /// Submit this alongside `block_hex` to `submitBlock`.
     pub block_proof_hex: String,
+    /// Serialized BlockAuthSidecar bytes as hex. Empty for coinbase-only blocks.
+    /// Submit this alongside `block_hex` and `block_proof_hex` to `submitBlock`.
+    #[serde(default)]
+    pub block_auth_sidecar_hex: String,
     /// Byte offset of the nonce field inside `block_hex` (NOT inside `header_core_hex`).
     /// Always 144 bytes from the start of the block header (= start of block bytes).
     pub nonce_offset: usize,

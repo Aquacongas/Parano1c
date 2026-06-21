@@ -18,13 +18,16 @@ pub mod tx_body_spine;
 pub use balance_gate::{
     build_balance_columns, build_sweep_balance_trace_parts, emit_balance_constraints,
     emit_balance_selector_public_columns, emit_sweep_balance_constraints,
-    emit_sweep_balance_selector_public_columns, emit_sweep_balance_value_public_columns,
-    BalanceGateAir, Sweep25x2BalanceGateAir, BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS,
-    BALANCE_N_COLS, SWEEP_BALANCE_INPUTS, SWEEP_BALANCE_LEAVES, SWEEP_BALANCE_N_BLOCKS,
-    SWEEP_BALANCE_N_COLS, SWEEP_BALANCE_OUTPUTS, SWEEP_BALANCE_TREE_BLOCKS,
+    emit_sweep_balance_deterministic_operand_public_columns,
+    emit_sweep_balance_selector_public_columns, emit_sweep_balance_sum_carry_public_columns,
+    emit_sweep_balance_value_public_columns, BalanceGateAir, Sweep25x2BalanceGateAir,
+    BALANCE_MIN_LOG_ROWS, BALANCE_N_BLOCKS, BALANCE_N_COLS, SWEEP_BALANCE_INPUTS,
+    SWEEP_BALANCE_LEAVES, SWEEP_BALANCE_N_BLOCKS, SWEEP_BALANCE_N_COLS, SWEEP_BALANCE_OUTPUTS,
+    SWEEP_BALANCE_TREE_BLOCKS,
 };
 pub use bit_adder::{
-    bit_adder_is_input_programme, bit_adder_is_reset_programme, bit_adder_operand_programme,
+    bit_adder_carry_programme, bit_adder_is_input_programme, bit_adder_is_reset_programme,
+    bit_adder_operand_programme, bit_adder_operand_u128_programme, bit_adder_sum_programme,
     emit_block_constraints, BitAdderAir, BitAdderCarryInitGate, BitAdderCarryNextGate, FaSumGate,
     PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
     BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,

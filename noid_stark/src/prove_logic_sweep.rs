@@ -308,7 +308,8 @@ pub fn verify_sweep_logic(
     };
 
     let n_air_cols = air.n_columns();
-    if proof.stark.commitment.n_cols != n_air_cols {
+    let expected_committed_cols = n_air_cols.saturating_sub(air.public_columns().len());
+    if proof.stark.commitment.n_cols != expected_committed_cols {
         return Err(VerifySweepLogicError::ShapeMismatch);
     }
 

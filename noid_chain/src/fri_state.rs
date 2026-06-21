@@ -510,23 +510,41 @@ pub fn compute_segment_root(
     cap_to_seg_root_with_depth(&commitment.cap, eff_log)
 }
 
-/// Reduce a compact FRI Merkle cap (always 2^`MERKLE_CAP_DEPTH` = 32 hashes)
-/// to a single 32-byte state root via pairwise Poseidon2b compression,
-/// then mix in `eff_log` for domain separation across segment sizes.
+/// Reduce an interleaved FRI cap to a single 32-byte state root via pairwise
+/// Poseidon2b compression, then mix in `eff_log` for domain separation across
+/// segment sizes.
+///
+/// Modern caps contain the 32 legacy segment hashes plus a source-code root used
+/// by source-bound mixed openings.  The source root is part of the state
+/// commitment: odd layers are padded with a deterministic domain-separated leaf
+/// instead of silently dropping the final hash.
 ///
 /// Including `eff_log` ensures states with different `log_slots` produce
 /// distinct roots even when all data is zero.
 pub fn cap_to_seg_root(cap: &noid_fri_binius::MerkleCap) -> StateRoot {
     let mut layer: Vec<[u8; 32]> = cap.hashes.clone();
-    debug_assert!(!layer.is_empty() && layer.len().is_power_of_two());
+    assert!(!layer.is_empty(), "state cap must not be empty");
+    let mut level = 0u64;
     while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            layer.push(state_cap_odd_pad(level, layer.len()));
+        }
         let mut next = Vec::with_capacity(layer.len() / 2);
         for chunk in layer.chunks_exact(2) {
             next.push(compress(&chunk[0], &chunk[1]));
         }
         layer = next;
+        level += 1;
     }
     layer[0]
+}
+
+fn state_cap_odd_pad(level: u64, layer_len: usize) -> [u8; 32] {
+    let mut pad = [0u8; 32];
+    pad[..8].copy_from_slice(&level.to_le_bytes());
+    pad[8..16].copy_from_slice(&(layer_len as u64).to_le_bytes());
+    pad[16..].copy_from_slice(b"NOID_STATE_PAD_v");
+    pad
 }
 
 /// Like `cap_to_seg_root` but mixes in the ORIGINAL `eff_log` so that

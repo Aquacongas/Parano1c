@@ -761,7 +761,7 @@ impl ParanoidApiServer for RpcHandler {
         // External miner only needs to patch the nonce — no other computation required.
         // Coinbase-only blocks prove instantly; user-tx blocks take ~1-3 s.
         let tmpl_for_prove = tmpl.clone();
-        let (proof_transcript_hash, witness_root, proof_bytes) =
+        let (proof_transcript_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
             tokio::task::spawn_blocking(move || {
                 noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
             })
@@ -778,10 +778,12 @@ impl ParanoidApiServer for RpcHandler {
         let nonce_offset = noid_chain::consensus::pow::NONCE_OFFSET;
 
         let block_proof_hex = hex::encode(&proof_bytes);
+        let block_auth_sidecar_hex = hex::encode(&auth_sidecar_bytes);
         Ok(BlockTemplateResponse {
             header_core_hex: hex::encode(header_core),
             block_hex: hex::encode(block_bytes),
             block_proof_hex: block_proof_hex.clone(),
+            block_auth_sidecar_hex,
             nonce_offset,
             difficulty_target_hex: hex::encode(diff_target),
             height,
@@ -802,7 +804,13 @@ impl ParanoidApiServer for RpcHandler {
     ///
     /// `block_hex`: hex-encoded serialized `Block` bytes.
     /// `block_proof_hex`: serialized `BlockProof` bytes, empty for coinbase-only blocks.
-    async fn submit_block(&self, block_hex: String, block_proof_hex: String) -> RpcResult<String> {
+    /// `block_auth_sidecar_hex`: serialized `BlockAuthSidecar` bytes, empty for coinbase-only blocks.
+    async fn submit_block(
+        &self,
+        block_hex: String,
+        block_proof_hex: String,
+        block_auth_sidecar_hex: String,
+    ) -> RpcResult<String> {
         let bytes = hex::decode(&block_hex).map_err(|e| rpc_err(format!("block hex: {e}")))?;
         let block =
             Block::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode block: {e:?}")))?;
@@ -810,6 +818,12 @@ impl ParanoidApiServer for RpcHandler {
             Vec::new()
         } else {
             hex::decode(&block_proof_hex).map_err(|e| rpc_err(format!("proof hex: {e}")))?
+        };
+        let block_auth_sidecar_bytes = if block_auth_sidecar_hex.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&block_auth_sidecar_hex)
+                .map_err(|e| rpc_err(format!("auth sidecar hex: {e}")))?
         };
 
         let local_time = std::time::SystemTime::now()
@@ -824,9 +838,11 @@ impl ParanoidApiServer for RpcHandler {
             ctx.apply_next_block(
                 &block,
                 &block_proof_bytes,
+                &block_auth_sidecar_bytes,
                 local_time,
                 |block,
                  proof_bytes,
+                 auth_sidecar_bytes,
                  parent,
                  prev_timestamps,
                  prev_active_counts,
@@ -838,6 +854,7 @@ impl ParanoidApiServer for RpcHandler {
                     noid_block::validate_block_from_network(
                         block,
                         proof_bytes,
+                        auth_sidecar_bytes,
                         parent,
                         prev_timestamps,
                         prev_active_counts,
@@ -854,6 +871,9 @@ impl ParanoidApiServer for RpcHandler {
                 ctx.store
                     .put_block_proof(block.header.height, &block_proof_bytes)
                     .map_err(|e| rpc_err(format!("store block proof: {e}")))?;
+                ctx.store
+                    .put_block_auth_sidecar(block.header.height, &block_auth_sidecar_bytes)
+                    .map_err(|e| rpc_err(format!("store block auth sidecar: {e}")))?;
             }
             let hash = full_block_hash(&block.header);
             let view = noid_mempool::ChainView::from_mdbx(&ctx);
@@ -1472,6 +1492,7 @@ mod tests {
             header_core_hex: "00".into(),
             block_hex: "11".into(),
             block_proof_hex: "22".into(),
+            block_auth_sidecar_hex: "33".into(),
             nonce_offset: 144,
             difficulty_target_hex: "ff".into(),
             height: 7,

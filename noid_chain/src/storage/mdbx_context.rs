@@ -447,12 +447,14 @@ impl MdbxChainContext {
         &mut self,
         block: &Block,
         block_proof_bytes: &[u8],
+        block_auth_sidecar_bytes: &[u8],
         local_time: u64,
         validate_and_apply: F,
     ) -> Result<[u8; 32], MdbxContextError>
     where
         F: FnOnce(
             &Block,
+            &[u8],
             &[u8],
             &BlockHeader,
             &[u64],
@@ -490,6 +492,7 @@ impl MdbxChainContext {
             match validate_and_apply(
                 block,
                 block_proof_bytes,
+                block_auth_sidecar_bytes,
                 &parent,
                 &prev_timestamps,
                 &prev_active_counts,
@@ -1192,9 +1195,11 @@ mod tests {
         ctx.apply_next_block(
             block,
             &[],
+            &[],
             local_time,
             |_block,
              _proof_bytes,
+             _auth_sidecar_bytes,
              _parent,
              _prev_timestamps,
              _prev_active_counts,

@@ -169,9 +169,14 @@ pub trait ParanoidApi {
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse>;
 
     /// Submit a solved block plus serialized BlockProof bytes.
-    /// `block_proof_hex` is empty for coinbase-only blocks.
+    /// `block_proof_hex` and `block_auth_sidecar_hex` are empty for coinbase-only blocks.
     #[method(name = "submitBlock")]
-    async fn submit_block(&self, block_hex: String, block_proof_hex: String) -> RpcResult<String>;
+    async fn submit_block(
+        &self,
+        block_hex: String,
+        block_proof_hex: String,
+        block_auth_sidecar_hex: String,
+    ) -> RpcResult<String>;
 
     // =========================================================================
     // Node control

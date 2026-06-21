@@ -107,6 +107,14 @@ fn print_standard_block(n: usize, fixtures: &[StandardFixture]) {
         fmt_bytes(full.proof_bytes)
     );
     println!(
+        "    auth sidecar:            {}",
+        fmt_bytes(full.auth_sidecar_bytes)
+    );
+    println!(
+        "    block proof + sidecar:   {}",
+        fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
+    );
+    println!(
         "      standard bucket:       {}",
         fmt_bytes(full.standard_bucket_bytes)
     );
@@ -136,6 +144,14 @@ fn print_sweep_bucket(n: usize, fixtures: &[SweepFixture]) {
     println!(
         "    block proof:             {}",
         fmt_bytes(full.proof_bytes)
+    );
+    println!(
+        "    auth sidecar:            {}",
+        fmt_bytes(full.auth_sidecar_bytes)
+    );
+    println!(
+        "    block proof + sidecar:   {}",
+        fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
     );
     println!(
         "      sweep bucket:          {}",
@@ -181,6 +197,14 @@ fn print_mixed(n_standard: usize, n_sweep: usize) {
     println!(
         "    block proof:             {}",
         fmt_bytes(full.proof_bytes)
+    );
+    println!(
+        "    auth sidecar:            {}",
+        fmt_bytes(full.auth_sidecar_bytes)
+    );
+    println!(
+        "    block proof + sidecar:   {}",
+        fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
     );
     println!(
         "      standard bucket:       {}",

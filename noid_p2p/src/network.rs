@@ -37,7 +37,8 @@ struct PendingStateSegmentResponse {
 // Proof-related caps are intentionally conservative until the Sweep25x2
 // post-redesign benchmark phase remeasures wallet and block proof sizes.
 const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB block payload cap.
-const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // temporary block-proof cap.
+const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // canonical BlockProof cap.
+const MAX_BLOCK_AUTH_SIDECAR_BYTES: usize = 12 * 1024 * 1024; // public AuthGKR sidecar cap.
 const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin).
 const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB recursive proof cap.
 const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin.
@@ -46,9 +47,16 @@ const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-s
 const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024; // 1 MB block+proof inline gossip cap.
 
 #[inline]
-fn should_inline_block_gossip(block_bytes_len: usize, block_proof_bytes_len: usize) -> bool {
+fn should_inline_block_gossip(
+    block_bytes_len: usize,
+    block_proof_bytes_len: usize,
+    block_auth_sidecar_bytes_len: usize,
+) -> bool {
     block_bytes_len > 0
-        && block_bytes_len.saturating_add(block_proof_bytes_len) <= INLINE_BLOCK_GOSSIP_THRESHOLD
+        && block_bytes_len
+            .saturating_add(block_proof_bytes_len)
+            .saturating_add(block_auth_sidecar_bytes_len)
+            <= INLINE_BLOCK_GOSSIP_THRESHOLD
 }
 
 /// Commands sent to the P2P network event loop.
@@ -56,8 +64,8 @@ fn should_inline_block_gossip(block_bytes_len: usize, block_proof_bytes_len: usi
 pub enum NetworkCommand {
     /// Announce a new block to all peers.
     ///
-    /// If `block_bytes` + `block_proof_bytes` fit within the inline threshold
-    /// (1 MB), the full block is gossiped directly (no round-trip needed).
+    /// If `block_bytes` + `block_proof_bytes` + `block_auth_sidecar_bytes` fit
+    /// within the inline threshold (1 MB), the full block is gossiped directly.
     /// Otherwise only the header is sent and peers pull via request-response.
     AnnounceBlock {
         height: u64,
@@ -68,6 +76,8 @@ pub enum NetworkCommand {
         block_bytes: Vec<u8>,
         /// Block proof bytes (for inline mode). Empty = compact-only.
         block_proof_bytes: Vec<u8>,
+        /// Public AuthGKR sidecar bytes (for inline mode). Empty = compact-only.
+        block_auth_sidecar_bytes: Vec<u8>,
     },
     /// Broadcast a new recursive proof update to all peers.
     BroadcastRecursiveProof {
@@ -137,12 +147,14 @@ pub enum NetworkEvent {
         /// Wire-encoded BlockHeader (276 bytes).
         header_bytes: Vec<u8>,
     },
-    /// A full block + proof arrived (response to a pull request).
+    /// A full block + proof + public AuthGKR sidecar arrived.
     NewBlock {
         from: PeerId,
         block_bytes: Vec<u8>,
-        /// `BlockProof` bincode bytes.  Empty Vec for coinbase-only blocks.
+        /// `BlockProof` bincode bytes. Empty Vec for coinbase-only blocks.
         block_proof_bytes: Vec<u8>,
+        /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
+        block_auth_sidecar_bytes: Vec<u8>,
     },
     /// A recursive proof update arrived from a peer.
     RecursiveProofUpdate {
@@ -248,6 +260,7 @@ impl P2PNetwork {
         header_bytes: Vec<u8>,
         block_bytes: Vec<u8>,
         block_proof_bytes: Vec<u8>,
+        block_auth_sidecar_bytes: Vec<u8>,
     ) {
         let _ = self
             .cmd_tx
@@ -257,6 +270,7 @@ impl P2PNetwork {
                 header_bytes,
                 block_bytes,
                 block_proof_bytes,
+                block_auth_sidecar_bytes,
             })
             .await;
     }
@@ -673,15 +687,21 @@ fn handle_network_command(
             header_bytes,
             block_bytes,
             block_proof_bytes,
+            block_auth_sidecar_bytes,
         } => {
-            // Inline threshold: if block + proof fit in 1 MB, gossip the full
-            // block directly.  Larger blocks use compact announcement + pull sync.
-            let msg = if should_inline_block_gossip(block_bytes.len(), block_proof_bytes.len()) {
+            // Inline threshold: if block + proof + sidecar fit in 1 MB, gossip
+            // the full block directly. Larger blocks use compact announcement.
+            let msg = if should_inline_block_gossip(
+                block_bytes.len(),
+                block_proof_bytes.len(),
+                block_auth_sidecar_bytes.len(),
+            ) {
                 BlockGossipMsg::Inline {
                     height,
                     hash,
                     block_bytes,
                     block_proof_bytes,
+                    block_auth_sidecar_bytes,
                 }
             } else {
                 BlockGossipMsg::Compact {
@@ -885,11 +905,14 @@ async fn handle_swarm_event(
                         hash: _,
                         block_bytes,
                         block_proof_bytes,
+                        block_auth_sidecar_bytes,
                     }) => {
                         if block_bytes.len() > MAX_BLOCK_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_bytes.len(), "inline block too large — dropped");
                         } else if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
+                        } else if block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
+                            tracing::warn!(peer = %propagation_source, len = block_auth_sidecar_bytes.len(), "inline auth sidecar too large — dropped");
                         } else {
                             const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                             const BLOCK_RATE_MAX: u32 = 40;
@@ -907,6 +930,7 @@ async fn handle_swarm_event(
                                 from: origin,
                                 block_bytes,
                                 block_proof_bytes,
+                                block_auth_sidecar_bytes,
                             });
                         }
                     }
@@ -1197,8 +1221,11 @@ async fn handle_swarm_event(
                     tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
                 } else {
                     let proof_bytes = response.block_proof_bytes.unwrap_or_default();
+                    let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
                     if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                         tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
+                    } else if auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
+                        tracing::warn!(peer = %peer, len = auth_sidecar_bytes.len(), "block auth sidecar too large — dropped");
                     } else {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
@@ -1216,6 +1243,7 @@ async fn handle_swarm_event(
                             from: peer,
                             block_bytes,
                             block_proof_bytes: proof_bytes,
+                            block_auth_sidecar_bytes: auth_sidecar_bytes,
                         });
                     }
                 }
@@ -1241,12 +1269,18 @@ async fn handle_swarm_event(
             // Proofs are stored temporarily (last FINALITY_DEPTH blocks) for the
             // recursive prover and for serving to syncing peers.
             let block_proof_bytes = ctx.store.get_block_proof(request.height).ok().flatten();
+            let block_auth_sidecar_bytes = ctx
+                .store
+                .get_block_auth_sidecar(request.height)
+                .ok()
+                .flatten();
             drop(ctx);
             let _ = swarm.behaviour_mut().block_sync.send_response(
                 channel,
                 GetRecentBlockResponse {
                     block_bytes,
                     block_proof_bytes,
+                    block_auth_sidecar_bytes,
                 },
             );
         }
@@ -1711,22 +1745,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_block_gossip_policy_uses_combined_block_and_proof_size() {
-        assert!(should_inline_block_gossip(1, 0));
+    fn inline_block_gossip_policy_uses_combined_block_proof_and_sidecar_size() {
+        assert!(should_inline_block_gossip(1, 0, 0));
         assert!(should_inline_block_gossip(
             512 * 1024,
-            INLINE_BLOCK_GOSSIP_THRESHOLD - 512 * 1024
+            256 * 1024,
+            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024,
         ));
-        assert!(!should_inline_block_gossip(0, 0));
+        assert!(!should_inline_block_gossip(0, 0, 0));
         assert!(!should_inline_block_gossip(
             512 * 1024,
-            INLINE_BLOCK_GOSSIP_THRESHOLD - 512 * 1024 + 1
+            256 * 1024,
+            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024 + 1,
         ));
     }
 
     #[test]
     fn conservative_wire_caps_are_ordered_for_sweep_redesign() {
         assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_TX_WIRE_SIZE >= INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_WIRE_SIZE);
         assert!(MAX_RECURSIVE_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);

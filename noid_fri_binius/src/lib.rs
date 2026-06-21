@@ -40,7 +40,9 @@ pub use compact_fri::{CompactEvalProof, COMPACT_NUM_QUERIES, COMPACT_TAU};
 pub use interleaved_commit::{
     absorb_cap, interleaved_commit, InterleavedCommitment, InterleavedProverState, MerkleCap,
 };
-pub use mixed_open::{prove_mixed_opening, verify_mixed_opening, EvalClaim, MixedOpeningProof};
+pub use mixed_open::{
+    prove_mixed_opening, verify_mixed_opening, EvalClaim, MixedOpeningProof, SourceBindingProof,
+};
 pub use verify::verify_batched_opening;
 
 /// Top levels of Merkle tree stored in the cap commitment.

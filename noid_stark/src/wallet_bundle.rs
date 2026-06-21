@@ -114,6 +114,7 @@ mod tests {
                     fri_merkle_batch: vec![],
                     final_codeword: vec![],
                 },
+                source_proof: noid_fri_binius::SourceBindingProof::default(),
             },
             slice_claimed_values: vec![Block128(6)],
         }
@@ -138,6 +139,7 @@ mod tests {
                     fri_merkle_batch: vec![],
                     final_codeword: vec![],
                 },
+                source_proof: noid_fri_binius::SourceBindingProof::default(),
             },
         }
     }

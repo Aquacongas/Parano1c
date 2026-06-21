@@ -157,7 +157,17 @@ pub fn prove_logic(witness: &LogicWitness) -> Result<LogicProof, ProveLogicError
     // Interleaved commit + AuthGKR
     let ntt = noid_core::AdditiveNTT::<Block128>::new(log_len + noid_fri::code::LOG_RATE);
     let hasher = noid_poseidon2b::native::compression::Poseidon2bSponge::new();
-    let col_refs: Vec<&[Block128]> = all_columns.iter().map(|c| c.as_slice()).collect();
+    let mut public_flags = vec![false; n_air_cols];
+    for pc in air.public_columns() {
+        if pc.col < n_air_cols {
+            public_flags[pc.col] = true;
+        }
+    }
+    let col_refs: Vec<&[Block128]> = all_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| (!public_flags[idx]).then_some(c.as_slice()))
+        .collect();
     let (pre_commitment, pre_state) = noid_fri_binius::interleaved_commit(&col_refs, &ntt, &hasher);
 
     let mut auth_channel = auth_gkr_channel();
@@ -225,8 +235,11 @@ pub fn verify_logic(
         return Err(VerifyLogicError::Stark(VerifyError::ShapeMismatch));
     }
 
-    // Verify AuthGKR Kill-Shot
-    if proof.stark.commitment.n_cols != n_air_cols + n_slices {
+    // Verify AuthGKR Kill-Shot. Public AIR programme columns are verifier-derived
+    // and omitted from the source-bound PCS. Auth MLE data remains inside the
+    // wallet-local AuthGKR capsule, not in the logic STARK commitment.
+    let expected_committed_cols = n_air_cols.saturating_sub(air.public_columns().len());
+    if proof.stark.commitment.n_cols != expected_committed_cols {
         return Err(VerifyLogicError::Stark(VerifyError::ShapeMismatch));
     }
 

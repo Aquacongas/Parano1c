@@ -110,6 +110,9 @@ pub enum MinerEvent {
         /// Serialized BlockProof bytes for P2P broadcast.
         /// Empty for coinbase-only blocks (stub proof).
         block_proof_bytes: Vec<u8>,
+        /// Serialized public AuthGKR sidecar bytes bound by header.witness_root.
+        /// Empty for coinbase-only blocks.
+        block_auth_sidecar_bytes: Vec<u8>,
     },
     /// Template refreshed.
     TemplateRefreshed {
@@ -469,7 +472,7 @@ impl BlockMiner {
                     tokio::task::spawn_blocking(move || {
                         // Stub is instant; mark prove_done so TxAdmitted can trigger rebuild.
                         prove_done_clone.store(true, Ordering::Release);
-                        (Ok(([1u8; 32], [1u8; 32], vec![])), Duration::ZERO)
+                        (Ok(([1u8; 32], [1u8; 32], vec![], vec![])), Duration::ZERO)
                     })
                 }
             };
@@ -482,7 +485,7 @@ impl BlockMiner {
                     (p, r)
                 } => {
                     match (pow_res, prove_res) {
-                        (Ok(Some(sol)), Ok((Ok((proof_hash, witness_root, block_proof_bytes)), prove_elapsed))) => {
+                        (Ok(Some(sol)), Ok((Ok((proof_hash, witness_root, block_proof_bytes, block_auth_sidecar_bytes)), prove_elapsed))) => {
                             let block = tmpl.seal(sol.nonce, proof_hash, witness_root);
                             let block_bytes = block.to_bytes();
                             let hash = full_block_hash(&block.header);
@@ -525,17 +528,26 @@ impl BlockMiner {
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
                             // if we fire the event before storing, a fast peer gets None.
-                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes).await {
+                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes, &block_auth_sidecar_bytes).await {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
-                            // Store block proof bytes for recursive proof advancement.
+                            // Store block proof + public auth sidecar bytes for recursive proof advancement
+                            // and for serving compact P2P pull requests.
                             if !block_proof_bytes.is_empty() {
                                 let ctx = self.chain.read().await;
                                 if let Err(e) = ctx.store.put_block_proof(height, &block_proof_bytes) {
                                     tracing::warn!(height, err = %e, "failed to store block proof bytes");
                                 } else {
                                     tracing::debug!(height, bytes = block_proof_bytes.len(), "block proof stored");
+                                }
+                                if let Err(e) = ctx
+                                    .store
+                                    .put_block_auth_sidecar(height, &block_auth_sidecar_bytes)
+                                {
+                                    tracing::warn!(height, err = %e, "failed to store block auth sidecar bytes");
+                                } else {
+                                    tracing::debug!(height, bytes = block_auth_sidecar_bytes.len(), "block auth sidecar stored");
                                 }
                             }
 
@@ -547,6 +559,7 @@ impl BlockMiner {
                                 pow_nonce: sol.nonce,
                                 block_bytes: block_bytes.clone(),
                                 block_proof_bytes: block_proof_bytes.clone(),
+                                block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
                             });
                         }
                         (Ok(Some(_sol)), Ok((Err(e), prove_elapsed))) => {
@@ -610,6 +623,7 @@ impl BlockMiner {
         &self,
         block: &Block,
         block_proof_bytes: &[u8],
+        block_auth_sidecar_bytes: &[u8],
     ) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
@@ -630,15 +644,18 @@ impl BlockMiner {
             let chain_clone = self.chain.clone();
             let block_owned = block.clone();
             let proof_bytes = block_proof_bytes.to_vec();
+            let auth_sidecar_bytes = block_auth_sidecar_bytes.to_vec();
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
                 ctx.apply_next_block(
                     &block_owned,
                     &proof_bytes,
+                    &auth_sidecar_bytes,
                     local_time,
                     |block,
                      proof_bytes,
+                     auth_sidecar_bytes,
                      parent,
                      prev_timestamps,
                      prev_active_counts,
@@ -650,6 +667,7 @@ impl BlockMiner {
                         noid_block::validate_block_from_network(
                             block,
                             proof_bytes,
+                            auth_sidecar_bytes,
                             parent,
                             prev_timestamps,
                             prev_active_counts,
@@ -692,7 +710,7 @@ impl BlockMiner {
 
 /// Run `prove_block` with the witnesses from the template's transactions.
 ///
-/// Returns `(proof_transcript_hash, witness_root, proof_bytes)` on success.
+/// Returns `(proof_transcript_hash, witness_root, proof_bytes, auth_sidecar_bytes)` on success.
 ///
 /// # Correctness
 ///
@@ -709,12 +727,12 @@ impl BlockMiner {
 pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
-) -> Result<([u8; 32], [u8; 32], Vec<u8>), String> {
+) -> Result<([u8; 32], [u8; 32], Vec<u8>, Vec<u8>), String> {
     use noid_block::{
-        assemble_sweep_bucket_proof, block_recursive_claim_hash, build_block_witnesses,
-        build_state_bindings_from_binding, prove_block_with_total_tx_count,
-        prove_state_bindings_standalone, BlockProof, BlockPublicMeta, OwnedTxWitness,
-        TxBlockWitness,
+        assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
+        build_block_auth_sidecar, build_block_witnesses, build_state_bindings_from_binding,
+        prove_block_with_total_tx_count, prove_state_bindings_standalone, BlockProof,
+        BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
     };
     use noid_stark::WalletProofBundle;
 
@@ -725,7 +743,7 @@ pub(crate) fn run_prove_block(
             height = tmpl.inner.height,
             "coinbase-only block — marker proof OK"
         );
-        return Ok(([1u8; 32], [1u8; 32], vec![]));
+        return Ok(([1u8; 32], [1u8; 32], vec![], vec![]));
     }
 
     let all_txs = tmpl.inner.all_txs();
@@ -782,6 +800,11 @@ pub(crate) fn run_prove_block(
             auth_proof: &w.auth_proof,
         })
         .collect();
+
+    let auth_sidecar = build_block_auth_sidecar(&witnesses, &sweep_owned)
+        .map_err(|e| format!("build_block_auth_sidecar failed: {e:?}"))?;
+    let auth_sidecar_bytes = bincode::serialize(&auth_sidecar)
+        .map_err(|e| format!("BlockAuthSidecar serialize failed: {e}"))?;
 
     let n_tx = tmpl.n_user_txs() as u32;
     let new_state_root = tmpl.inner.state_root;
@@ -853,12 +876,21 @@ pub(crate) fn run_prove_block(
         Ok(block_proof) => {
             let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
             let transcript_hash = block_recursive_claim_hash(&block_proof);
-            // witness_root = DA payload commitment; uses transcript_hash until
-            // full Binius DA packing is wired (noid_chain::da::trace_witness_root).
-            let witness_root = transcript_hash;
+            let root_block = tmpl.seal(0, transcript_hash, [0u8; 32]);
+            let witness_root = block_auth_sidecar_root(&root_block, &auth_sidecar)
+                .map_err(|e| format!("BlockAuthSidecar root failed: {e:?}"))?;
 
-            tracing::info!(bytes = proof_bytes.len(), "prove_block succeeded");
-            Ok((transcript_hash, witness_root, proof_bytes))
+            tracing::info!(
+                proof_bytes = proof_bytes.len(),
+                auth_sidecar_bytes = auth_sidecar_bytes.len(),
+                "prove_block succeeded"
+            );
+            Ok((
+                transcript_hash,
+                witness_root,
+                proof_bytes,
+                auth_sidecar_bytes,
+            ))
         }
         Err(noid_block::ProveBlockError::AuthProofInvalid(k)) => {
             // Auth proof mismatch: wallet proved with a different epoch_anchor or
@@ -1134,14 +1166,21 @@ mod tests {
     }
 
     fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
-        let (proof_hash, witness_root, proof_bytes) =
+        let (proof_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
             run_prove_block(tmpl, tmpl.parent.state_root).expect("run_prove_block");
         assert!(
             !proof_bytes.is_empty(),
             "user-tx templates must carry BlockProof bytes"
         );
         let block = tmpl.seal(0, proof_hash, witness_root);
+        assert!(
+            !auth_sidecar_bytes.is_empty(),
+            "user-tx templates must carry BlockAuthSidecar bytes"
+        );
         let proof: BlockProof = bincode::deserialize(&proof_bytes).expect("decode BlockProof");
+        let sidecar: noid_block::BlockAuthSidecar =
+            bincode::deserialize(&auth_sidecar_bytes).expect("decode BlockAuthSidecar");
+        noid_block::validate_block_auth_sidecar_root(&block, &sidecar).expect("sidecar root");
         validate_block_bucket_tx_indices(&block, &proof).expect("bucket coverage");
         validate_block_proof_transcript_hash(&block, &proof).expect("header/proof binding");
         (block, proof)

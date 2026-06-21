@@ -67,15 +67,11 @@ pub struct CompactEvalProof {
 /// Instead of storing full independent paths (which repeat shared ancestors),
 /// stores only the unique sibling nodes needed. The verifier reconstructs
 /// all paths from this compact representation.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct BatchedMerkleProof {
-    /// Tree depth (number of layers from leaf to root, exclusive of root).
-    pub depth: usize,
-    /// Query leaf indices (pair indices, sorted).
-    pub query_indices: Vec<usize>,
     /// Sibling hashes needed for reconstruction, in layer-by-layer order.
     /// For each layer (bottom to top), only siblings that are NOT already
-    /// computable from other query paths are included.
+    /// computable from transcript-derived query paths are included.
     pub siblings: Vec<HashOutput>,
 }
 
@@ -92,11 +88,34 @@ impl CompactEvalProof {
         let paths: usize = self
             .fri_merkle_batch
             .iter()
-            .map(|b| b.siblings.len() * 32 + b.query_indices.len() * 4 + 8)
+            .map(|b| b.siblings.len() * 32)
             .sum();
         let final_cw = self.final_codeword.len() * 16;
         upper + sc + roots + symbols + paths + final_cw
     }
+}
+
+/// Compact-FRI transcript state at the point where all oracle roots/final
+/// codeword have been absorbed, but query indices have not yet been drawn.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactFriQueryContext {
+    pub tau: usize,
+    pub n_rounds: usize,
+    pub tensor_batching_point: Vec<Block128>,
+    pub initial_sumcheck_claim: Block128,
+    pub fri_roots: Vec<HashOutput>,
+    pub final_codeword: Vec<Block128>,
+}
+
+/// Query information produced after optional extra roots are absorbed.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct CompactFriQueryInfo {
+    pub tau: usize,
+    pub n_rounds: usize,
+    pub tensor_batching_point: Vec<Block128>,
+    pub initial_sumcheck_claim: Block128,
+    pub query_indices: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +135,31 @@ pub fn compact_fri_prove(
     hasher: &dyn CryptographicHasher,
     num_queries: usize,
 ) -> CompactEvalProof {
+    let (proof, _, ()) = compact_fri_prove_with_query_hook(
+        evals,
+        eval_point,
+        ntt,
+        channel,
+        hasher,
+        num_queries,
+        |_, _| (),
+    );
+    proof
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compact_fri_prove_with_query_hook<E, F>(
+    evals: &[Block128],
+    eval_point: &[Block128],
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+    num_queries: usize,
+    before_queries: F,
+) -> (CompactEvalProof, CompactFriQueryInfo, E)
+where
+    F: FnOnce(&CompactFriQueryContext, &mut Channel) -> E,
+{
     channel.observe_field_elems(eval_point);
 
     let tau = COMPACT_TAU.min(eval_point.len());
@@ -214,27 +258,39 @@ pub fn compact_fri_prove(
         let leaf_hashes = compute_leaf_hashes(&current_code.encoding, hasher);
         let tree = MerkleTree::new_parallel(leaf_hashes, hasher);
         let root = tree.get_root();
+        let code_depth = current_code.encoding.len().trailing_zeros() as usize - 1;
         fri_roots.push(root);
         fri_trees.push(tree);
-        fri_codes.push(current_code.clone());
 
         // Transcript: oracle coeffs + root + squeeze challenge
         channel.observe_field_elem(c0);
         channel.observe_field_elem(c1);
         let vc = VectorCommitment {
             root,
-            depth: fri_codes.last().unwrap().encoding.len().trailing_zeros() as usize - 1,
+            depth: code_depth,
         };
         channel.observe_vector_commitment(&vc);
         let r = channel.get_random_point();
 
         claim = c0 + c1 * r;
-        current_evals = fold_evals(&current_evals, r);
-        current_code = current_code.fold_code(r, round, ntt);
+        let next_code = current_code.fold_code(r, round, ntt);
+        fri_codes.push(current_code);
+        fold_evals_in_place(&mut current_evals, r);
+        current_code = next_code;
     }
 
     let final_codeword = current_code.encoding.clone();
     channel.observe_field_elems(&final_codeword);
+
+    let context = CompactFriQueryContext {
+        tau,
+        n_rounds,
+        tensor_batching_point: tensor_batching_point.clone(),
+        initial_sumcheck_claim: sum_check_claim,
+        fri_roots: fri_roots.clone(),
+        final_codeword: final_codeword.clone(),
+    };
+    let extra = before_queries(&context, channel);
 
     // Query phase with batched Merkle compression.
     let log_domain = n_rounds + LOG_RATE;
@@ -265,14 +321,26 @@ pub fn compact_fri_prove(
         fri_merkle_batch.push(batch_proof);
     }
 
-    CompactEvalProof {
-        upper_partial_evals,
-        sum_check_oracles,
-        fri_roots,
-        fri_queried_symbols,
-        fri_merkle_batch,
-        final_codeword,
-    }
+    let query_info = CompactFriQueryInfo {
+        tau,
+        n_rounds,
+        tensor_batching_point,
+        initial_sumcheck_claim: sum_check_claim,
+        query_indices,
+    };
+
+    (
+        CompactEvalProof {
+            upper_partial_evals,
+            sum_check_oracles,
+            fri_roots,
+            fri_queried_symbols,
+            fri_merkle_batch,
+            final_codeword,
+        },
+        query_info,
+        extra,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +357,33 @@ pub fn compact_fri_verify(
     hasher: &dyn CryptographicHasher,
     num_queries: usize,
 ) -> Result<(), String> {
+    compact_fri_verify_with_query_hook(
+        eval_point,
+        eval,
+        proof,
+        ntt,
+        channel,
+        hasher,
+        num_queries,
+        |_, _| Ok(()),
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compact_fri_verify_with_query_hook<E, F>(
+    eval_point: &[Block128],
+    eval: Block128,
+    proof: &CompactEvalProof,
+    ntt: &AdditiveNTT<Block128>,
+    channel: &mut Channel,
+    hasher: &dyn CryptographicHasher,
+    num_queries: usize,
+    before_queries: F,
+) -> Result<(CompactFriQueryInfo, E), String>
+where
+    F: FnOnce(&CompactFriQueryContext, &mut Channel) -> Result<E, String>,
+{
     channel.observe_field_elems(eval_point);
 
     let tau = COMPACT_TAU.min(eval_point.len());
@@ -324,6 +419,7 @@ pub fn compact_fri_verify(
         .zip(batching_eq.iter())
         .map(|(&u, &b)| u * b)
         .fold(Block128::ZERO, |a, x| a + x);
+    let initial_sumcheck_claim = claim;
 
     // Verify sumcheck rounds
     let n_rounds = right.len();
@@ -361,6 +457,16 @@ pub fn compact_fri_verify(
         return Err("empty final codeword".into());
     }
     channel.observe_field_elems(&proof.final_codeword);
+
+    let context = CompactFriQueryContext {
+        tau,
+        n_rounds,
+        tensor_batching_point: tensor_batching_point.clone(),
+        initial_sumcheck_claim,
+        fri_roots: proof.fri_roots.clone(),
+        final_codeword: proof.final_codeword.clone(),
+    };
+    let extra = before_queries(&context, channel)?;
 
     // Generate query indices (must match prover)
     let log_domain = n_rounds + LOG_RATE;
@@ -403,6 +509,7 @@ pub fn compact_fri_verify(
         verify_batched_merkle_proof(
             &proof.fri_roots[round],
             batch,
+            compute_round_depth(n_rounds, round),
             &pair_indices,
             &leaf_hashes,
             hasher,
@@ -434,7 +541,15 @@ pub fn compact_fri_verify(
         }
     }
 
-    Ok(())
+    let query_info = CompactFriQueryInfo {
+        tau,
+        n_rounds,
+        tensor_batching_point,
+        initial_sumcheck_claim,
+        query_indices,
+    };
+
+    Ok((query_info, extra))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +562,7 @@ pub fn compact_fri_verify(
 /// identifies which sibling nodes are NOT derivable from other query leaves
 /// and stores only those. Nodes that appear as query leaves or as
 /// computable parents of query leaves are omitted.
-fn build_batched_merkle_proof(
+pub(crate) fn build_batched_merkle_proof(
     tree: &MerkleTree,
     leaf_indices: &[usize],
     depth: usize,
@@ -499,17 +614,14 @@ fn build_batched_merkle_proof(
         }
     }
 
-    BatchedMerkleProof {
-        depth,
-        query_indices: leaf_indices.to_vec(),
-        siblings,
-    }
+    BatchedMerkleProof { siblings }
 }
 
 /// Verify a batched Merkle proof against a known root.
-fn verify_batched_merkle_proof(
+pub(crate) fn verify_batched_merkle_proof(
     root: &HashOutput,
     batch: &BatchedMerkleProof,
+    depth: usize,
     leaf_indices: &[usize],
     leaf_hashes: &[HashOutput],
     hasher: &dyn CryptographicHasher,
@@ -517,11 +629,6 @@ fn verify_batched_merkle_proof(
     if leaf_indices.len() != leaf_hashes.len() {
         return Err("leaf index/hash count mismatch".into());
     }
-    if batch.query_indices.len() != leaf_indices.len() {
-        return Err("batch query index count mismatch".into());
-    }
-
-    let depth = batch.depth;
 
     // Reconstruct bottom-up, consuming siblings as needed.
     let mut known: std::collections::HashMap<(usize, usize), HashOutput> =
@@ -604,7 +711,7 @@ fn verify_batched_merkle_proof(
 // ---------------------------------------------------------------------------
 
 /// Generate compact query indices.
-fn gen_compact_queries(
+pub(crate) fn gen_compact_queries(
     channel: &mut Channel,
     log_max_len: usize,
     num_queries: usize,
@@ -650,15 +757,17 @@ fn mle_evaluate(evals: &[Block128], point: &[Block128]) -> Block128 {
 }
 
 /// Fold an evaluation vector in half at challenge r.
-fn fold_evals(evals: &[Block128], r: Block128) -> Vec<Block128> {
+fn fold_evals_in_place(evals: &mut Vec<Block128>, r: Block128) {
     let half = evals.len() / 2;
+    let (lo, hi) = evals.split_at_mut(half);
     if half >= 1024 {
-        let (lo, hi) = evals.split_at(half);
-        lo.par_iter()
-            .zip(hi.par_iter())
-            .map(|(l, h)| *l + r * *h)
-            .collect()
+        lo.par_iter_mut().zip(hi.par_iter()).for_each(|(l, &h)| {
+            *l += r * h;
+        });
     } else {
-        (0..half).map(|i| evals[i] + r * evals[i + half]).collect()
+        for i in 0..half {
+            lo[i] += r * hi[i];
+        }
     }
+    evals.truncate(half);
 }
