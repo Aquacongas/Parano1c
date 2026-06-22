@@ -249,7 +249,10 @@ impl NodeBehaviour {
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(30))
-                .with_max_concurrent_streams(64),
+                // Full proof-native block responses can be tens of MiB. Keep this
+                // below the generic libp2p default so a large miner set cannot
+                // force multi-GiB simultaneous block/proof transfers.
+                .with_max_concurrent_streams(8),
         );
 
         let proof_sync = request_response::cbor::Behaviour::new(

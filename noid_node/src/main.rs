@@ -1698,6 +1698,14 @@ async fn handle_p2p_events(
     let mut recent_header_fetches: HashMap<(libp2p::PeerId, u64, u16), Instant> = HashMap::new();
     let mut recent_block_fetches: HashMap<(libp2p::PeerId, u64), Instant> = HashMap::new();
     const FETCH_DEDUP_TTL: Duration = Duration::from_secs(15);
+
+    struct PendingBlockFetch {
+        peer: libp2p::PeerId,
+        requested_at: Instant,
+    }
+    let mut pending_block_fetches: HashMap<(u64, [u8; 32]), PendingBlockFetch> = HashMap::new();
+    const BLOCK_FETCH_INFLIGHT_TTL: Duration = Duration::from_secs(8);
+
     let mut peer_tx_rate: HashMap<libp2p::PeerId, (u32, Instant)> = HashMap::new();
     const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
     const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
@@ -1748,25 +1756,59 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::NewBlockAnnouncement {
                 from,
                 height,
-                hash: _,
-                header_bytes: _,
+                hash,
+                header_bytes,
             }) => {
+                let announced_header = match noid_chain::block_header::BlockHeader::from_bytes(&header_bytes) {
+                    Ok(header) => header,
+                    Err(e) => {
+                        tracing::debug!(peer = %from, height, err = ?e, "compact block header decode failed — not pulling block body");
+                        continue;
+                    }
+                };
+                if announced_header.height != height {
+                    tracing::debug!(
+                        peer = %from,
+                        announced_height = height,
+                        header_height = announced_header.height,
+                        "compact block height mismatch — not pulling block body"
+                    );
+                    continue;
+                }
+                let header_hash = noid_chain::consensus::pow::full_block_hash(&announced_header);
+                if header_hash != hash {
+                    tracing::debug!(
+                        peer = %from,
+                        height,
+                        announced_hash = %hex::encode(hash),
+                        header_hash = %hex::encode(header_hash),
+                        "compact block hash mismatch — not pulling block body"
+                    );
+                    continue;
+                }
+
                 if height > highest_announced {
                     highest_announced = height;
                     last_announcement_peer = Some(from);
                 }
-                // Compact block announcement: peer has a block at `height`.
-                // If it's ahead of us, pull the full block + proof via block_sync.
-                // This is the correct flow for a proof-native statechain where blocks
-                // are ephemeral (pruned after FINALITY_DEPTH) and sync is via state.
+                // Compact block announcement: validate the advertised header before
+                // downloading a potentially large proof-native block.  Direct-next
+                // headers can be fully checked against the current tip; larger recent
+                // gaps first pull headers, then bodies are requested only for the
+                // verified competing chain in the HeadersBatch path.
                 let our_height = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
+                if height <= our_height {
+                    continue;
+                }
+
                 if height > our_height + noid_chain::consensus::params::FINALITY_DEPTH {
                     // Peer is far ahead: we can't catch up block-by-block since
                     // intermediate blocks are pruned (proof-native statechain).
-                    // Go straight to state manifest sync.
+                    // Go straight to state manifest sync after the compact header's
+                    // self-hash has been checked.
                     if pending_manifest.is_none() && pending_segment_ids.is_empty() && segment_queue.is_empty() {
                         if !manifest_requested_peers.contains(&from) {
                             tracing::info!(
@@ -1785,20 +1827,99 @@ async fn handle_p2p_events(
                                 .await;
                         }
                     }
-                } else if height > our_height {
-                    // Within FINALITY_DEPTH: pull missing blocks from our tip to announced height.
-                    // Requesting only the announced height causes BadParentHash when intermediate
-                    // blocks were missed (gossip not yet delivered), triggering expensive orphan
-                    // recovery. SyncBlocksFrom fetches the full gap in one batch.
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                } else if height == our_height + 1 {
+                    let precheck = {
+                        let ctx = chain.read().await;
+                        let parent = ctx.tip_header().clone();
+                        let prev_timestamps = ctx.prev_timestamps();
+                        let prev_active_counts = ctx.prev_active_counts();
+                        let anchor = ctx.anchor_info();
+                        let local_time = unix_now();
+                        noid_chain::consensus::validate_header(
+                            &announced_header,
+                            &parent,
+                            &prev_timestamps,
+                            local_time,
+                            anchor.anchor_height,
+                            anchor.anchor_timestamp,
+                            &anchor.anchor_target,
+                        )
+                        .and_then(|_| {
+                            use noid_chain::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
+                            let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
+                            let median_active = if prev_active_counts.is_empty() {
+                                parent.active_slot_count
+                            } else {
+                                noid_chain::consensus::median_u64(&prev_active_counts)
+                            };
+                            let trigger = median_active.saturating_mul(EXPAND_DENOM)
+                                >= prev_capacity.saturating_mul(EXPAND_NUM);
+                            let expected_log_slots = if trigger {
+                                parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
+                            } else {
+                                parent.log_slots
+                            };
+                            if announced_header.log_slots == expected_log_slots {
+                                Ok(())
+                            } else {
+                                Err(noid_chain::consensus::ConsensusError::BadLogSlotsExpansion)
+                            }
+                        })
+                    };
+                    if let Err(e) = precheck {
+                        tracing::debug!(
+                            peer = %from,
+                            height,
+                            err = %e,
+                            "compact block header precheck failed — not pulling block body"
+                        );
+                        continue;
+                    }
+
+                    let fetch_key = (height, hash);
+                    if let Some(pending) = pending_block_fetches.get(&fetch_key) {
+                        if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
+                            tracing::debug!(
+                                peer = %from,
+                                pending_peer = %pending.peer,
+                                height,
+                                "block body/proof already in-flight — suppressing duplicate pull"
+                            );
+                            continue;
+                        }
+                    }
+                    pending_block_fetches.insert(
+                        fetch_key,
+                        PendingBlockFetch {
                             peer: from,
-                            from_height: our_height + 1,
-                            count: (height - our_height) as u16,
+                            requested_at: Instant::now(),
+                        },
+                    );
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
+                        .await;
+                } else {
+                    // Recent gap > 1: pull headers first so full block/proof bodies are
+                    // requested only after the header chain is anchored to our tip.
+                    let count = (height - our_height + 1).min(512) as u16;
+                    let request_key = (from, our_height, count);
+                    let recently_requested = recent_header_fetches
+                        .get(&request_key)
+                        .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
+                    if fetch_in_progress.contains(&from) || recently_requested {
+                        tracing::debug!(peer = %from, height, our_height, "header fetch already in-flight for compact gap");
+                        continue;
+                    }
+                    fetch_in_progress.insert(from);
+                    recent_header_fetches.insert(request_key, Instant::now());
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::FetchHeaders {
+                            peer: from,
+                            start_height: our_height,
+                            count,
                         })
                         .await;
                 }
-                // height <= our_height: already have this block.
             }
             Ok(NetworkEvent::NewBlock {
                 from,
@@ -1832,6 +1953,7 @@ async fn handle_p2p_events(
                     Ok(block) => {
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+                        pending_block_fetches.remove(&(block.header.height, block_hash));
 
                         // Skip blocks at or below our current tip — we already have them.
                         // This avoids expensive ZK verification against a stale pre-state
@@ -2591,6 +2713,20 @@ async fn handle_p2p_events(
                                 competing.len()
                             );
                             for hdr in &competing {
+                                let hdr_hash = noid_chain::consensus::pow::full_block_hash(hdr);
+                                let inflight_key = (hdr.height, hdr_hash);
+                                if let Some(pending) = pending_block_fetches.get(&inflight_key) {
+                                    if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
+                                        tracing::debug!(
+                                            peer = %from,
+                                            pending_peer = %pending.peer,
+                                            height = hdr.height,
+                                            "fork block body/proof already in-flight"
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 let request_key = (from, hdr.height);
                                 let recently_requested = recent_block_fetches
                                     .get(&request_key)
@@ -2603,6 +2739,13 @@ async fn handle_p2p_events(
                                     );
                                     continue;
                                 }
+                                pending_block_fetches.insert(
+                                    inflight_key,
+                                    PendingBlockFetch {
+                                        peer: from,
+                                        requested_at: Instant::now(),
+                                    },
+                                );
                                 recent_block_fetches.insert(request_key, Instant::now());
                                 let _ = p2p_cmd
                                     .send(noid_p2p::NetworkCommand::RequestBlock {
@@ -3508,6 +3651,7 @@ async fn handle_p2p_events(
                 fetch_in_progress.remove(&peer);
                 recent_header_fetches.retain(|(p, _, _), _| *p != peer);
                 recent_block_fetches.retain(|(p, _), _| *p != peer);
+                pending_block_fetches.retain(|_, pending| pending.peer != peer);
                 manifest_requested_peers.remove(&peer);
                 fetch_depth.remove(&peer);
                 peer_tx_rate.remove(&peer);
@@ -3525,9 +3669,12 @@ async fn handle_p2p_events(
 
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
-            let fetch_cutoff = Instant::now() - FETCH_DEDUP_TTL;
+            let now = Instant::now();
+            let fetch_cutoff = now - FETCH_DEDUP_TTL;
             recent_header_fetches.retain(|_, t| *t >= fetch_cutoff);
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
+            pending_block_fetches
+                .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
 
             // --- Stale-tip recovery ---
             // If our chain hasn't advanced in 30s but we've seen higher announcements,
