@@ -304,8 +304,9 @@ pub fn build_block_template(
         .fold(0u64, |acc, f| acc.saturating_add(f));
     let coinbase_value = block_reward(new_log_slots).saturating_add(claimable_fee_sum);
 
+    let prev_block_hash = full_block_hash(parent);
     let cb_body = TxBody::standard(
-        [0u8; 32],
+        prev_block_hash,
         0,
         vec![],
         vec![TxOutput {
@@ -388,7 +389,6 @@ pub fn build_block_template(
             layer[0]
         }
     };
-    let prev_block_hash = full_block_hash(parent);
 
     Ok(BlockTemplate {
         coinbase,
@@ -497,6 +497,41 @@ mod tests {
 
         let expected_tx_root = crate::block::compute_tx_root(&tmpl.all_txs());
         assert_eq!(tmpl.tx_root, expected_tx_root);
+    }
+
+    #[test]
+    fn coinbase_anchor_binds_parent_hash_and_prevents_repeated_body_hash() {
+        let parent = genesis_header();
+        let mut state = fresh_state();
+        let miner = Address([0xAB; 32]);
+
+        let tmpl1 = build_block_template(
+            &parent,
+            &state,
+            &[parent.active_slot_count],
+            vec![],
+            miner,
+            GENESIS_TIMESTAMP + BLOCK_TIME,
+            GENESIS_TARGET,
+        )
+        .unwrap();
+        assert_eq!(tmpl1.coinbase.body.epoch_anchor, full_block_hash(&parent));
+
+        crate::state::apply_tx(&mut state, &tmpl1.coinbase.body).unwrap();
+        let parent2 = tmpl1.clone().into_header(0, [1u8; 32], [1u8; 32]);
+        let tmpl2 = build_block_template(
+            &parent2,
+            &state,
+            &[parent2.active_slot_count],
+            vec![],
+            miner,
+            parent2.timestamp + BLOCK_TIME,
+            GENESIS_TARGET,
+        )
+        .unwrap();
+
+        assert_eq!(tmpl2.coinbase.body.epoch_anchor, full_block_hash(&parent2));
+        assert_ne!(tmpl1.coinbase.tx_body_hash, tmpl2.coinbase.tx_body_hash);
     }
 
     #[test]

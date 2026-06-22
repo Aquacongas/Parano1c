@@ -73,6 +73,50 @@ fn validate_fee_policy_and_claimable_fee_sum(
     Ok(claimable_fee_sum)
 }
 
+fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<(), ConsensusError> {
+    let expected_anchor = crate::consensus::pow::full_block_hash(parent);
+    let mut seen_coinbase = false;
+
+    for (idx, tx) in block.transactions.iter().enumerate() {
+        if !tx.body.is_coinbase {
+            continue;
+        }
+        if seen_coinbase {
+            return Err(ConsensusError::ShapeMismatch(
+                "multiple coinbase transactions".into(),
+            ));
+        }
+        seen_coinbase = true;
+        if idx != 0 {
+            return Err(ConsensusError::ShapeMismatch(
+                "coinbase transaction must be first".into(),
+            ));
+        }
+        if tx.body.inputs.iter().any(|input| input.valid) {
+            return Err(ConsensusError::ShapeMismatch(
+                "coinbase transaction has valid inputs".into(),
+            ));
+        }
+        if tx.body.epoch_anchor != expected_anchor {
+            return Err(ConsensusError::BadCoinbaseAnchor);
+        }
+
+        let expected_hash = noid_tx::hash_tx_body_for_shape(
+            tx.body.shape,
+            &tx.body.epoch_anchor,
+            tx.body.fee,
+            &tx.body.inputs,
+            &tx.body.outputs,
+            tx.body.is_coinbase,
+        );
+        if tx.tx_body_hash != expected_hash {
+            return Err(ConsensusError::BadTxBodyHash);
+        }
+    }
+
+    Ok(())
+}
+
 /// Run all native consensus checks WITHOUT applying the state transition.
 ///
 /// Use this as the first step of the full-proof-native validation path:
@@ -122,6 +166,7 @@ pub fn validate_block_checks(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+    validate_coinbase_canonical(block, parent)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
         validate_tx_consensus_skip_hash(tx, nullifiers)?;
@@ -210,6 +255,8 @@ pub fn validate_block_consensus(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+
+    validate_coinbase_canonical(block, parent)?;
 
     // --- Cross-tx slot conflict check (P.8, §16 invariants 4-5) ---
     validate_block_slot_conflicts(&block.transactions)?;
@@ -377,10 +424,10 @@ mod tests {
         })
     }
 
-    fn fee_test_coinbase(value: u64) -> Transaction {
+    fn fee_test_coinbase(anchor: [u8; 32], value: u64) -> Transaction {
         tx_from_body(TxBody {
             shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
+            epoch_anchor: anchor,
             fee: 0,
             inputs: vec![],
             outputs: vec![TxOutput {
@@ -397,8 +444,9 @@ mod tests {
         use crate::block::compute_tx_root;
         use crate::consensus::pow::full_block_hash;
 
+        let parent_hash = full_block_hash(parent);
         let txs = vec![
-            fee_test_coinbase(coinbase_value),
+            fee_test_coinbase(parent_hash, coinbase_value),
             fee_test_user_tx(user_fee as u128),
         ];
         Block {

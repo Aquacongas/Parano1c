@@ -404,6 +404,10 @@ impl BlockMiner {
 
             // Track when PoW search started so we can report solve time.
             let pow_start = std::time::Instant::now();
+            // The heartbeat is a per-template safety net. Reset it here so an old
+            // interval tick from a long previous search cannot cancel a fresh
+            // user-transaction template and force the same block proof to be rebuilt.
+            heartbeat.reset();
 
             cancel.store(false, Ordering::Relaxed);
 
@@ -585,8 +589,16 @@ impl BlockMiner {
                 }
 
                 _ = heartbeat.tick() => {
-                    cancel.store(true, Ordering::Relaxed);
-                    tracing::debug!("heartbeat: refreshing template (safety net)");
+                    if tmpl.n_user_txs() == 0 {
+                        cancel.store(true, Ordering::Relaxed);
+                        tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
+                    } else {
+                        // User-transaction proofs are expensive and PoW solve time is
+                        // stochastic. Do not cancel/rebuild the same proved template just
+                        // because one safety interval elapsed; new chain tips still cancel
+                        // through sync_ready, and new mempool txs wait for the next block.
+                        tracing::debug!(height, n_txs, "heartbeat: keeping user-tx template active");
+                    }
                 }
 
                 event = mempool_events.recv(), if tmpl.n_user_txs() == 0 => {

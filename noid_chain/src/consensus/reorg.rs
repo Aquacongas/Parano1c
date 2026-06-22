@@ -360,10 +360,10 @@ mod tests {
         }
     }
 
-    fn coinbase_tx(slot: u32, value: u64, seed: u8) -> Transaction {
+    fn coinbase_tx(parent_hash: [u8; 32], slot: u32, value: u64, seed: u8) -> Transaction {
         tx_from_body(TxBody {
             shape: TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
+            epoch_anchor: parent_hash,
             fee: 0,
             inputs: vec![],
             outputs: vec![output(slot, value, seed)],
@@ -376,9 +376,15 @@ mod tests {
         for i in 0..n {
             let slot = 1 + i as u32;
             let out = output(slot, 10_000_000, 0x10u8.wrapping_add(i as u8));
+            let parent_hash = full_block_hash(ctx.tip_header());
             let block = build_block(
                 ctx,
-                vec![coinbase_tx(slot, out.value, 0x10u8.wrapping_add(i as u8))],
+                vec![coinbase_tx(
+                    parent_hash,
+                    slot,
+                    out.value,
+                    0x10u8.wrapping_add(i as u8),
+                )],
             );
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .expect("funding block applies");

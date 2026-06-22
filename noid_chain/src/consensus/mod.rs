@@ -121,6 +121,8 @@ pub enum ConsensusError {
     InvalidLogicProof { tx_index: usize },
     /// §16.15 — Coinbase value exceeds `block_reward + sum(fees)`.
     InflatedCoinbase,
+    /// Coinbase `epoch_anchor` must equal the parent block hash.
+    BadCoinbaseAnchor,
     /// Fee exceeds u64::MAX (values are 64-bit in this protocol).
     BadFee,
     /// P.16 — transaction fee is below the deterministic minimum fee.

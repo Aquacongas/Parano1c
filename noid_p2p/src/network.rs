@@ -1585,6 +1585,16 @@ async fn handle_swarm_event(
                     from: peer,
                     manifest: Box::new(response),
                 });
+            } else {
+                // tip=0 is still a valid response for sync coordination: the node
+                // layer counts it as "peer responded but has no usable state", so
+                // it can proceed with another valid candidate without waiting for
+                // the manifest timeout.
+                tracing::debug!(from = %peer, "received empty state manifest");
+                let _ = event_tx.send(NetworkEvent::StateManifest {
+                    from: peer,
+                    manifest: Box::new(response),
+                });
             }
         }
 

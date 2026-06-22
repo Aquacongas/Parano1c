@@ -1630,6 +1630,13 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // A manifest can be either a lightweight tip probe (persisted-state catch-up)
+    // or an explicit snapshot recovery request (deep gap/fork/reorg). Only tip
+    // probes may downgrade to recent-block replay when peer_tip - our_tip is
+    // small; forced snapshot requests must continue through RecursiveProof +
+    // segment verification because height gap alone does not describe fork depth.
+    let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
     // Count of manifest responses received (including tip=0 "no state" replies).
     // When this equals manifest_requested_peers.len(), all peers have responded
     // and we proceed with whatever valid candidates we have (even just 1).
@@ -1659,12 +1666,13 @@ async fn handle_p2p_events(
             pending_snapshot_header_sync = None;
             manifest_candidates.clear();
             manifest_requested_peers.clear();
+            manifest_force_snapshot_peers.clear();
             manifest_response_count = 0;
             manifest_first_candidate_at = None;
             collected_segments.clear();
             pending_segment_ids.clear();
             segment_queue.clear();
-            tracing::debug!("sync state reset — will retry on next peer connection");
+            tracing::debug!("sync state reset — ready for fresh manifest retry");
         }};
     }
 
@@ -1768,6 +1776,7 @@ async fn handle_p2p_events(
                                 "deep gap — requesting state manifest directly"
                             );
                             manifest_requested_peers.insert(from);
+                            manifest_force_snapshot_peers.insert(from);
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                     peer: from,
@@ -2139,6 +2148,7 @@ async fn handle_p2p_events(
                                                             "reorg failed — requesting state manifest for recovery"
                                                         );
                                                         manifest_requested_peers.insert(from);
+                                                        manifest_force_snapshot_peers.insert(from);
                                                         let _ = p2p_cmd
                                                             .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                                                 peer: from,
@@ -2209,6 +2219,7 @@ async fn handle_p2p_events(
                                                     "deep fork (gap > FINALITY_DEPTH) — requesting manifest directly"
                                                 );
                                                 manifest_requested_peers.insert(from);
+                                                manifest_force_snapshot_peers.insert(from);
                                                 let _ = p2p_cmd
                                                     .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                                         peer: from,
@@ -2559,6 +2570,8 @@ async fn handle_p2p_events(
                                 peer = %from,
                                 "fork near finality window — requesting snapshot (O(1) Paranoid sync)"
                             );
+                            manifest_requested_peers.insert(from);
+                            manifest_force_snapshot_peers.insert(from);
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                     peer: from,
@@ -2619,6 +2632,8 @@ async fn handle_p2p_events(
                                 "FetchHeaders depth limit reached — requesting state snapshot instead"
                             );
                             *depth = 0; // reset for next time
+                            manifest_requested_peers.insert(from);
+                            manifest_force_snapshot_peers.insert(from);
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                     peer: from,
@@ -2649,6 +2664,7 @@ async fn handle_p2p_events(
                 // Eclipse mitigation: collect from multiple peers, pick best.
                 // Track all responses (including tip=0) to detect when all
                 // requested peers have replied, avoiding infinite wait.
+                let force_snapshot = manifest_force_snapshot_peers.remove(&from);
                 manifest_response_count += 1;
                 if manifest.tip_height == 0 {
                     tracing::debug!(from = %from, "manifest tip_height=0, peer has no state yet");
@@ -2719,7 +2735,7 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         ctx.tip_height()
                     };
-                    if our_height > 0 {
+                    if our_height > 0 && !force_snapshot {
                         if manifest.tip_height <= our_height {
                             tracing::debug!(
                                 from = %from,
@@ -2747,6 +2763,13 @@ async fn handle_p2p_events(
                                 .await;
                             continue;
                         }
+                    } else if force_snapshot {
+                        tracing::info!(
+                            from = %from,
+                            our_height,
+                            peer_tip = manifest.tip_height,
+                            "forced snapshot manifest — bypassing recent-block shortcut"
+                        );
                     }
                     manifest_requested_peers.insert(from);
                 }
@@ -2947,14 +2970,30 @@ async fn handle_p2p_events(
                             "segment received"
                         );
                     } else {
-                        // Peer couldn't serve this segment (stale state / pruned).
-                        // This means their state has advanced past our expected_tip_height.
-                        // Reset and restart sync from the next peer connection.
+                        // Peer couldn't serve this exact snapshot segment. Most commonly
+                        // the peer mined/applied a newer tip after serving the manifest,
+                        // so the old segment no longer matches the authenticated root.
+                        // Restart immediately from a fresh manifest instead of waiting for
+                        // the next block announcement/peer event.
+                        let requester_height = {
+                            let ctx = chain.read().await;
+                            ctx.tip_height()
+                        };
                         tracing::info!(
-                            from = %from, segment = response.segment_id,
-                            "snapshot segment unavailable or stale; restarting sync from a fresh manifest"
+                            from = %from,
+                            segment = response.segment_id,
+                            requester_height,
+                            "snapshot segment unavailable or stale; requesting fresh manifest"
                         );
                         reset_sync_state!();
+                        manifest_requested_peers.insert(from);
+                        manifest_force_snapshot_peers.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height,
+                            })
+                            .await;
                         continue;
                     }
 
