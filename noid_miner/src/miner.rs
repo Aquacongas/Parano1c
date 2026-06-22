@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! `BlockMiner` — the parallel PoW + Prove orchestrator.
+//! `BlockMiner` — the parallel PoW + BlockProof generation orchestrator.
 //!
-//! ## Parallel proving design
+//! ## Parallel block production design
 //!
 //! ```text
 //! loop {
 //!   template = build_template(mempool, ctx)
 //!
 //!   ┌─────────────────────────┐   ┌─────────────────────────────────┐
-//!   │  PoW Search             │   │  ZK Block Prove                 │
+//!   │  PoW Search             │   │  BlockProof generation          │
 //!   │  Blake3(header_core||n) │   │  prove_block(witnesses, &[])    │
 //!   │  < difficulty_target    │   │  ~10s on 8 cores (100 txs)      │
 //!   └──────────┬──────────────┘   └──────────────┬──────────────────┘
@@ -27,7 +27,7 @@
 //! settings it splits available cores roughly in half and adapts the transaction
 //! cap to recent proof throughput instead of always trying to fill 256 txs.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
-//! template building, ZK proving, validation, RPC, and P2P while miners run elsewhere.
+//! template building, BlockProof generation, validation, RPC, and P2P while miners run elsewhere.
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
@@ -122,7 +122,7 @@ pub enum MinerEvent {
     },
     /// Mining cancelled (new P2P block or heartbeat).
     MiningCancelled { reason: String },
-    /// ZK proving failed (non-fatal: block is abandoned, new template built).
+    /// BlockProof generation failed (non-fatal: block is abandoned, new template built).
     ProveFailed { height: u64, error: String },
 }
 
@@ -199,7 +199,7 @@ pub struct BlockMiner {
     stopped: Arc<AtomicBool>,
     /// Notified when the chain is sufficiently synced to begin mining.
     sync_ready: Arc<tokio::sync::Notify>,
-    /// Semaphore (1 permit) preventing concurrent ZK prove tasks from accumulating.
+    /// Semaphore (1 permit) preventing concurrent BlockProof generation tasks from accumulating.
     /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
     /// without this guard N × 10s prove tasks pile up and saturate all CPU.
     prove_semaphore: Arc<tokio::sync::Semaphore>,
@@ -419,7 +419,7 @@ impl BlockMiner {
             let prove_done = Arc::new(AtomicBool::new(false));
             let prove_done_clone = prove_done.clone();
 
-            // --- Parallel: PoW + ZK prove ---
+            // --- Parallel: PoW + BlockProof generation ---
             // Extract only the PoW header — avoids cloning the full BlockTemplate
             // (which includes all transaction and proof bytes) just for PoW.
             let pow_header = tmpl.header_for_pow(0);
@@ -452,7 +452,7 @@ impl BlockMiner {
                 pow_pool.install(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
             });
 
-            // ZK Prove: run for real (permit held until done) or return a consensus-legal
+            // BlockProof generation: run for real (permit held until done) or return a consensus-legal
             // stub for coinbase-only blocks when the prove slot is already occupied.
             let prove_handle = match prove_permit {
                 Ok(permit) => tokio::task::spawn_blocking(move || {
@@ -588,17 +588,9 @@ impl BlockMiner {
                     }
                 }
 
-                _ = heartbeat.tick() => {
-                    if tmpl.n_user_txs() == 0 {
-                        cancel.store(true, Ordering::Relaxed);
-                        tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
-                    } else {
-                        // User-transaction proofs are expensive and PoW solve time is
-                        // stochastic. Do not cancel/rebuild the same proved template just
-                        // because one safety interval elapsed; new chain tips still cancel
-                        // through sync_ready, and new mempool txs wait for the next block.
-                        tracing::debug!(height, n_txs, "heartbeat: keeping user-tx template active");
-                    }
+                _ = heartbeat.tick(), if tmpl.n_user_txs() == 0 => {
+                    cancel.store(true, Ordering::Relaxed);
+                    tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
                 }
 
                 event = mempool_events.recv(), if tmpl.n_user_txs() == 0 => {
@@ -717,7 +709,7 @@ impl BlockMiner {
 }
 
 // ---------------------------------------------------------------------------
-// ZK prove_block (CPU-bound, called inside spawn_blocking)
+// BlockProof generation (CPU-bound, called inside spawn_blocking)
 // ---------------------------------------------------------------------------
 
 /// Run `prove_block` with the witnesses from the template's transactions.
@@ -743,12 +735,12 @@ pub(crate) fn run_prove_block(
     use noid_block::{
         assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
         build_block_auth_sidecar, build_block_witnesses, build_state_bindings_from_binding,
-        prove_block_with_total_tx_count, prove_state_bindings_standalone, BlockProof,
+        prove_block_with_total_tx_count, prove_state_mle_openings_only, BlockProof,
         BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
     };
     use noid_stark::WalletProofBundle;
 
-    // Coinbase-only: marker proof, no ZK proving needed.
+    // Coinbase-only: marker proof, no full BlockProof generation needed.
     let non_cb_count = tmpl.n_user_txs();
     if non_cb_count == 0 {
         tracing::debug!(
@@ -849,8 +841,8 @@ pub(crate) fn run_prove_block(
         let Some(bucket) = sweep_bucket else {
             return Err("user-transaction block has no provable bucket".to_string());
         };
-        let (state_binding_starks, pre_state_openings, post_state_openings) =
-            prove_state_bindings_standalone(&state_bindings);
+        let (pre_state_openings, post_state_openings) =
+            prove_state_mle_openings_only(&state_bindings);
         Ok(BlockProof {
             meta: BlockPublicMeta {
                 prev_block_state_root: prev_state_root,
@@ -861,13 +853,9 @@ pub(crate) fn run_prove_block(
                 log_rows: bucket.meta.log_rows,
                 n_block_spine_slices: bucket.meta.n_block_spine_slices,
                 n_state_bindings: state_bindings.len() as u32,
-                state_binding_n_cols: 0,
-                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: Some(bucket),
-            state_binding_algebraics: vec![],
-            state_binding_starks,
             pre_state_openings,
             post_state_openings,
         })

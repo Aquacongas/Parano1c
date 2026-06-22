@@ -11,7 +11,7 @@
 //! The tip block itself is verified separately by the caller (e.g.
 //! `noid_block::full_node::verify_block_full`).
 //!
-//! **Complexity**: O(1) — the recursive proof is ~11 KB regardless of chain length.
+//! **Complexity**: O(1) — the recursive proof is ~38 KB encoded regardless of chain length.
 
 use noid_chain::{hash_block_header, BlockHeader};
 

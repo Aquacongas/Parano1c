@@ -58,7 +58,7 @@ rand             = "0.8"
 zeroize          = { version = "1", features = ["zeroize_derive"] }
 
 # Memory: jemalloc as global allocator.
-# glibc malloc retains freed pages from large ZK allocations (FRI/NTT Vecs)
+# glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)
 # indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
 # the OS aggressively via background threads (dirty_decay_ms=1000).
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }

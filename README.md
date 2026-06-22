@@ -1,6 +1,6 @@
-# Paranoid Zero. The Proof-Native Transparent UTXO Statechain
+# PARANOID. The Proof-Native Transparent UTXO Statechain
 
-> The proof of the entire chain history from genesis fits in **~6.5 KB**. Verification **~5 ms**.  
+> The proof of the entire chain history from genesis fits in **~38 KB**. Verification **~5 ms**.  
 > No archive nodes. No history replay. No signatures. No trusted setup.
 
 ---
@@ -18,7 +18,7 @@ In Paranoid, validity is established once, locally, by the party with the most i
 | | Classic blockchain | Paranoid |
 |---|---|---|
 | Validation model | Re-execute everywhere | Verify proof once |
-| Full sync | Replay N GB of history | State snapshot + ~6.5 KB recursive proof; proof verification ~5 ms |
+| Full sync | Replay N GB of history | State snapshot + ~38 KB recursive proof; proof verification ~5 ms |
 | History required to validate | Yes. From genesis | No |
 | Signatures | ECDSA / EdDSA | None. Hash-preimage ownership proof |
 | Quantum safety | No (discrete log problem) | Yes. Hash-only primitives |
@@ -65,7 +65,7 @@ chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 **Result:** A new node downloads:
 1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
    one per 65,536 UTXOs; scales with UTXO set size)
-2. The **RecursiveProof** (6.5 KB)
+2. The **RecursiveProof** (~38 KB)
 3. Verifies the recursive proof in ~5 ms, then applies the authenticated snapshot segments
 
 No genesis replay. No archive nodes. No trust assumption.
@@ -74,7 +74,7 @@ No genesis replay. No archive nodes. No trust assumption.
 
 ## Cryptographic Architecture
 
-*This section is aimed at ZK engineers. Skip to [Running Paranoid](#running-paranoid) if you just want to use it.*
+*This section is aimed at proof-system engineers. Skip to [Running Paranoid](#running-paranoid) if you just want to use it.*
 
 ### Field: Binary Tower GF(2^128)
 
@@ -93,7 +93,7 @@ The PCS is **FRI-Binius** — Reed-Solomon over binary towers with compact inter
 
 ### FROST-GKR Kill-Shot
 
-This is Paranoid's core cryptographic innovation. Poseidon2b proving is the bottleneck in every ZK system using it. The standard approach decomposes S-box constraints into degree-2 layers:
+This is Paranoid's core cryptographic innovation. Poseidon2b proof generation is the bottleneck in proof systems that use it. The standard approach decomposes S-box constraints into degree-2 layers:
 
 ```
 Standard (spine only): 59 permutations × 8 sumchecks × 9 rounds = 4,248 FS challenges
@@ -132,7 +132,7 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  RecursiveProof  ·  6.5 KB  ·  O(1) verify · ~5 ms (laptop) │
+│  RecursiveProof  ·  ~38 KB ·  O(1) verify · ~5 ms (laptop) │
 │  RecursiveBlockAir: 256×10 trace, COMPACT_TAU=8             │
 │  Proves: accumulator continuity from genesis to h=N         │
 └──────────────────────┬──────────────────────────────────────┘
@@ -236,7 +236,7 @@ cells — hardware that does not exist and may never be physically realizable at
 
 PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence of valid state transitions. Block validity is already established by the proof system.
 
-**Algorithm:** Blake3 over the 212-byte `header_core` PoW input. The full 276-byte header hash still commits `proof_transcript_hash` and `witness_root` for chain linking, while PoW and ZK proving can run in parallel. 128-bit nonce. CPU-friendly and cheap to verify.
+**Algorithm:** Blake3 over the 212-byte `header_core` PoW input. The full 276-byte header hash still commits `proof_transcript_hash` and `witness_root` for chain linking, while PoW and BlockProof generation can run in parallel. 128-bit nonce. CPU-friendly and cheap to verify.
 
 **Why Blake3:** block withholding protection is built into the proof structure. The coinbase address is bound inside `witness_root → proof_transcript_hash → BlockProof`. An external miner cannot substitute their payout address without regenerating the entire block proof before PoW search can be valid.
 
@@ -296,7 +296,7 @@ BlockProofs, and public Auth sidecars are pruned. Only block **headers** (276 by
 |---|---|
 | Headers | ~553 MB/year (276 bytes × every block, forever) |
 | UTXO set | ~3 MB per 65,536 unspent outputs (populated segments only) |
-| Recursive proof | 6.5 KB (single entry, overwritten on each advance) |
+| Recursive proof | ~38 KB encoded (single entry, overwritten on each advance) |
 
 **Temporary storage (pruned after 18 blocks):**
 | Data | Size |
@@ -347,9 +347,9 @@ Selected block scaling rows (`cargo bench --bench block_scaling`, up to 100 tran
 | 8 Standard4x8 + 2 Sweep25x2 | 3.53 s | 771.87 ms | 2.95 MB | 891.25 KB | 3.82 MB |
 | 5 Standard4x8 + 5 Sweep25x2 | 4.05 s | 917.24 ms | 3.73 MB | 985.12 KB | 4.70 MB |
 
-PoW search and ZK proving run **in parallel**. BlockProof bytes and public Auth sidecars are stored only for the **last 18 blocks** (reorg window), then pruned.
+PoW search and BlockProof generation run **in parallel**. BlockProof bytes and public Auth sidecars are stored only for the **last 18 blocks** (reorg window), then pruned.
 
-Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (6.5 KB) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
+Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (~38 KB encoded) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
 
 ---
 
@@ -362,11 +362,11 @@ Full-block proofs do not accumulate on disk. What persists forever is the **Recu
                  Verifies all blocks, serves snapshots, relays txs.
                  Suitable for: exchanges, explorers, infrastructure.
 
---mode miner     Internal PoW + ZK prover.
+--mode miner     Internal PoW + BlockProof generator.
                  Mines blocks with the built-in wallet as coinbase.
 
 --mode extminer  Serves block templates to noid-extminer clients.
-                 Node does ZK proving; external processes do PoW.
+                 Node generates BlockProofs; external processes do PoW.
                  Requires: --mining-key <TOKEN>
 ```
 
@@ -390,7 +390,7 @@ paranoid --mode miner \
   --p2p-listen 0.0.0.0:9400 \
   --rpc-listen 127.0.0.1:9401
 
-# --- Mining pool (node does ZK proving; external miners do PoW) ---
+# --- Mining pool (node generates BlockProofs; external miners do PoW) ---
 paranoid --mode extminer \
   --seed node1.noid.network \
   --rpc-listen 0.0.0.0:9401 \
@@ -480,7 +480,7 @@ paranoid_validateAddress
 paranoid_getSlotHints / paranoid_getSlotHintsSalted / paranoid_getEpochAnchor
 paranoid_submitTxIntent
 paranoid_getMempoolInfo / paranoid_getMempoolSize / paranoid_getMempoolEntry
-paranoid_getRecursiveProof            (~6.5 KB recursive chain proof)
+paranoid_getRecursiveProof            (~76 KB hex for ~38 KB recursive chain proof)
 paranoid_verifyReceipt
 paranoid_walletStatus / paranoid_walletGetAddress / paranoid_walletGetBalance
 paranoid_walletSend / paranoid_walletPlanSend / paranoid_walletHistory
@@ -525,7 +525,7 @@ Chain layer
 
 Node layer
   noid_mempool       Async mempool: proof-verification admission gate (semaphore-bounded), fee floor
-  noid_miner         Parallel PoW + ZK prover orchestrator
+  noid_miner         Parallel PoW + BlockProof generation orchestrator
   noid_p2p           libp2p: BlockGossipMsg, RecursiveProofGossipMsg, snapshot sync
   noid_rpc           jsonrpsee JSON-RPC server
   noid_node          paranoid binary (relay / miner / extminer modes) + noid-cli binary

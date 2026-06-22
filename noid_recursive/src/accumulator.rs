@@ -78,6 +78,6 @@ pub fn genesis_accumulator(
         state_root: [0u8; 32],
         chain_hash: [0u8; 32],
     };
-    // Genesis block has no ZK proof — chain_claim is ZERO.
+    // Genesis block has no BlockProof — chain_claim is ZERO.
     pre_genesis.extend(genesis_state_root, genesis_block_hash, 0, Block128::ZERO)
 }

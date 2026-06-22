@@ -149,7 +149,7 @@ pub enum BlockApplyError {
     CoinbaseHasInputs,
     /// Block contains non-coinbase transactions but `proof_transcript_hash` is the
     /// development stub marker `[1u8; 32]`. Such blocks are produced only by the
-    /// local miner as a fallback when ZK proving fails; they must never be accepted
+    /// local miner as a fallback when proof generation fails; they must never be accepted
     /// from the network. Any block with user transactions MUST carry a real proof hash.
     StubProofWithUserTxs,
 }
@@ -185,7 +185,7 @@ pub fn apply_block(
     // stub marker [1u8;32] as proof_transcript_hash.
     //
     // The marker is only legal for coinbase-only blocks where there is nothing to
-    // prove. A block with user transactions MUST reference a real ZK transcript
+    // prove. A block with user transactions MUST reference a real proof transcript
     // digest. Accepting stub-proof blocks with user transactions would let any node
     // craft arbitrary UTXOs without a valid proof.
     //
@@ -290,13 +290,13 @@ pub fn apply_block(
 /// Apply a block's state delta without re-validating pre-conditions.
 ///
 /// **Full proof-native path** — called after `verify_block(BlockProof)` succeeds.
-/// The ZK proof has already established that:
+/// The BlockProof has already established that:
 ///   - All slot pre-conditions are correct (`prev_lane_openings` → `state_root`).
 ///   - The state transition is correct (`new_lane_openings` → `new_state_root`).
 ///   - `block.header.state_root` is cryptographically sound.
 ///
 /// This function therefore:
-///   1. Handles log_slots expansion (still structural, not ZK-proved).
+///   1. Handles log_slots expansion (still structural, not covered by the proof layer).
 ///   2. Zeros out spent inputs and fills minted outputs — NO pre-state reads.
 ///   3. Updates `active_slot_count` and `alloc_counter` from the block data.
 ///   4. Recomputes the post-delta state root and requires it to match
@@ -313,7 +313,7 @@ pub fn apply_state_delta(
     use crate::fri_state::SlotValue;
     use noid_core::Block128;
 
-    // Sanity-guard: must be called after ZK proof verification.
+    // Sanity-guard: must be called after BlockProof verification.
     // tx_root is still checked natively (cheap, doesn't require state reads).
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(BlockApplyError::HeaderTxRootMismatch);
@@ -332,13 +332,13 @@ pub fn apply_state_delta(
     let mut deltas = Vec::new();
     for tx in &block.transactions {
         for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-            // ZK proved inp.slot_index contained the claimed value.
+            // The BlockProof established that inp.slot_index contained the claimed value.
             // Just zero it out; no read needed.
             deltas.push((inp.slot_index, SlotValue::EMPTY));
             snap.active_slot_count = snap.active_slot_count.saturating_sub(1);
         }
         for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            // ZK proved out.slot_index was EMPTY before this tx.
+            // The BlockProof established that out.slot_index was EMPTY before this tx.
             let sv = SlotValue {
                 value: Block128::from(out.value as u128),
                 owner_hi: out.owner.as_fields()[0],
@@ -364,7 +364,7 @@ pub fn apply_state_delta(
         return Err(BlockApplyError::HeaderLogSlotsMismatch);
     }
 
-    // 4. Native post-root guard. ZK proves the transition, but full nodes still
+    // 4. Native post-root guard. The proof layer proves the transition, but full nodes still
     // recompute the dirty segment roots before accepting the local state update.
     let computed_post_root = snap.state_root();
     if block.header.state_root != computed_post_root {
@@ -378,7 +378,7 @@ pub fn apply_state_delta(
     })
 }
 
-/// Apply the genesis block to `state` without requiring a ZK proof or witness root.
+/// Apply the genesis block to `state` without requiring a BlockProof or witness root.
 ///
 /// Genesis (height = 0) is a special case: it has no transactions to prove
 /// and uses marker values for `proof_transcript_hash` and `witness_root`.
@@ -423,7 +423,7 @@ pub fn apply_genesis_block(
 ///
 /// Uses a Poseidon2b COMPRESS binary Merkle tree, padded to the next power
 /// of two (minimum 2). Poseidon2b is chosen because this Merkle root feeds
-/// directly into the ZK block spine and recursive proof system — the internal
+/// directly into the BlockProof spine and recursive proof system — the internal
 /// nodes are proved in-circuit, which requires a ZK-native hash function.
 /// Blake3 is NOT ZK-friendly and would make in-circuit proofs prohibitively large.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {

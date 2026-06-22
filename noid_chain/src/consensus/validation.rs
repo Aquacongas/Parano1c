@@ -18,7 +18,7 @@
 //!  ✅  TooManyTxs                                                        [P.9]
 //!  ✅  Sequential state transition (`validate_block_consensus` only)       [P.9]
 //!
-//! # Invariants checked by the production ZK layer
+//! # Invariants checked by the production proof layer
 //!
 //!  ✅  Wallet/bucket proof verifies (STARK + AuthGKR)
 //!  ✅  BlockStateBinding verifies state openings and roots
@@ -121,10 +121,10 @@ fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<()
 ///
 /// Use this as the first step of the full-proof-native validation path:
 ///   1. `validate_block_checks()` — header + tx checks (no MDBX reads)
-///   2. `verify_block(BlockProof)` — ZK proof verification
+///   2. `verify_block(BlockProof)` — BlockProof verification
 ///   3. `apply_state_delta()` — write delta to MDBX (no pre-state reads)
 ///
-/// Note: does NOT check `state_root` (that's done by ZK proof verification).
+/// Note: does NOT check `state_root` (that's done by BlockProof verification).
 /// Does NOT check `active_slot_count` / `alloc_counter` (done by `apply_state_delta`).
 pub fn validate_block_checks(
     block: &Block,

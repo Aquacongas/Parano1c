@@ -25,7 +25,7 @@
 //!         ├──► RPC WebSocket: notify subscribed wallets
 //!         └──► Block builder: wake up if 100+ new txs
 //!
-//!  Background: ZK verify on admission + pre-prove cache
+//!  Background: LogicProof verification on admission + cached proof reuse
 //! ```
 //!
 //! ## Usage

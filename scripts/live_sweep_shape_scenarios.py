@@ -5,7 +5,7 @@
 Covers the roadmap N9 local lifecycle:
 - miner creates enough fragmented wallet UTXOs;
 - walletSend chooses Sweep25x2 for a payment requiring 5 inputs;
-- tx enters mempool with a cached ZK proof and confirms in a mined block;
+- tx enters mempool with a cached LogicProof and confirms in a mined block;
 - mempool drains and wallet pending locks clear;
 - optionally, a larger fragmented payment auto-splits into multiple chunks, including Sweep25x2.
 

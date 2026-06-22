@@ -61,7 +61,7 @@ pub struct GetRecentBlockRequest {
     pub height: u64,
 }
 
-/// Response: full block bytes + ZK proof bytes + public AuthGKR sidecar bytes.
+/// Response: full block bytes + BlockProof bytes + public AuthGKR sidecar bytes.
 ///
 /// All optional fields are `None` when the peer does not have the block.
 /// `block_proof_bytes` and `block_auth_sidecar_bytes` are `None` (not empty)
@@ -80,13 +80,13 @@ pub struct GetRecentBlockResponse {
 // Recursive chain proof
 // ---------------------------------------------------------------------------
 
-/// Get the current recursive chain proof (6.5 KB, O(1) sync).
+/// Get the current recursive chain proof (~38 KB encoded, O(1) sync).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecursiveProofRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecursiveProofResponse {
-    /// Serialized RecursiveBlockProof bytes (~6.5 KB).
+    /// Serialized RecursiveBlockProof bytes (~38 KB encoded).
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
@@ -222,7 +222,7 @@ pub enum BlockGossipMsg {
 pub struct RecursiveProofGossipMsg {
     pub height: u64,
     pub tip_hash: [u8; 32],
-    /// `RecursiveBlockProof` bincode bytes (~6.5 KB).
+    /// `RecursiveBlockProof` bincode bytes (~38 KB encoded).
     pub proof_bytes: Vec<u8>,
 }
 

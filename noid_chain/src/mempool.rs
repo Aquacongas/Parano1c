@@ -11,7 +11,7 @@
 //!
 //! Admission pipeline (cheapest first):
 //!   1. `validate_tx_for_mempool()` — native checks (~0ms)
-//!   2. [async] `verify_logic()` — ZK verification (~84ms, semaphore-bounded)
+//!   2. [async] `verify_logic()` — LogicProof verification (~84ms, semaphore-bounded)
 //!
 //! When a block is confirmed: `on_block_confirmed()` removes confirmed txs
 //! and returns reverted txs (from reorged blocks) to the pool.

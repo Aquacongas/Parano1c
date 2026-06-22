@@ -11,8 +11,8 @@
 //!
 //! **Merkle inclusion** (offline): Poseidon2b COMPRESS binary tree.
 //!   Must match `noid_chain::block::compute_tx_root` exactly.
-//!   Poseidon2b is used (not Blake3) because the tx_root feeds into the ZK
-//!   block spine — an in-circuit Poseidon2b Merkle proof is far cheaper than Blake3.
+//!   Poseidon2b is used (not Blake3) because the tx_root feeds into the
+//!   BlockProof spine — an in-circuit Poseidon2b Merkle proof is far cheaper than Blake3.
 //! **Header lookup** (online): `getHeaderByHeight(claimed_height)` → check `tx_root`.
 //! **Chain cert verify** (offline): `verify_tip(chain_cert, ...)` with embedded proof.
 

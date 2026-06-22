@@ -1,8 +1,8 @@
-# Paranoid Zero: Cryptography Specification
+# PARANOID: Cryptography Specification
 
 ## Abstract
 
-This document specifies the zero-knowledge proof stack of Paranoid Zero. All constructions operate over the binary tower field GF(2^128). The proof system composes four protocols: Poseidon2b (algebraic hash), FROST-GKR (hash computation proof), FRI-Binius (polynomial commitment), and recursive STARK (chain accumulation).
+This document specifies Paranoid's transparent validity proof stack. All constructions operate over the binary tower field GF(2^128). The proof system composes four protocols: Poseidon2b (algebraic hash), FROST-GKR (hash computation proof), FRI-Binius (polynomial commitment), and recursive STARK (chain accumulation).
 
 System soundness: **~120 bits** (bottleneck: FROST-GKR unified sumcheck at 345/2^128).
 
@@ -271,9 +271,9 @@ Implementation: `noid_gkr/src/spine_unified.rs::compute_round_polynomial_flat()`
 
 ### 3.8 Fiat-Shamir Security: Round Reduction
 
-The Kill-Shot reduces the Fiat-Shamir transcript from **4,248 rounds** (legacy) to **30 rounds** (spine), tightening the grinding/collision attack surface:
+The Kill-Shot reduces the Fiat-Shamir transcript from **4,248 rounds** in a naive per-permutation decomposition to **30 rounds** (spine), tightening the grinding/collision attack surface:
 
-**Legacy approach (per-permutation decomposition):**
+**Naive per-permutation decomposition:**
 ```
 59 slots × 8 sumchecks/slot × 9 rounds/sumcheck = 4,248 FS rounds
 ```
@@ -344,7 +344,7 @@ Implementation: `noid_gkr/src/batch_eval.rs`.
 
 ### 3.12 Performance Comparison
 
-| Metric | Legacy (degree-2 decomposition) | Kill-Shot | Improvement |
+| Metric | Naive degree-2 decomposition | Kill-Shot | Improvement |
 |--------|--------------------------------|-----------|-------------|
 | Sumchecks (spine) | 472 (8/slot × 59) | 2 (unified + shift) | 236× |
 | FS rounds (spine) | 4,248 | 30 | 141× |
@@ -413,7 +413,7 @@ Implementation: `noid_fri_binius/src/compact_fri.rs`.
 
 ### 4.6 Interleaved Commitment (Block-Level)
 
-For N same-shape transactions inside one block bucket, all trace columns are committed under one interleaved Merkle cap. One FRI mixed opening closes that bucket's columns via a multipoint sumcheck that reduces the bucket's N terminal claims to one evaluation point. Standard and `Sweep25x2` transactions use separate non-empty buckets because their AIR shapes differ; the canonical `BlockProof` binds the bucket proofs together with `BlockStateBindingAir`.
+For N same-shape transactions inside one block bucket, all trace columns are committed under one interleaved Merkle cap. A bucket multipoint sumcheck reduces the bucket's N terminal claims to one row point. A column-axis terminal-compression sumcheck then reduces the resulting linear form to one source-bound mixed FRI opening of the flattened row×column MLE. Standard and `Sweep25x2` transactions use separate non-empty buckets because their AIR shapes differ; the canonical `BlockProof` binds all non-empty bucket proofs together with common NativeDelta pre/post `SegmentMleOpening`s.
 
 Implementation: `noid_fri_binius/src/interleaved_commit.rs`, `noid_fri_binius/src/mixed_open.rs`, `noid_block/src/lib.rs`.
 
@@ -534,17 +534,17 @@ Implementation: `noid_recursive/src/accumulator.rs`.
 
 ## 7. Proof Sizes
 
-| Component | Size | Notes |
-|-----------|------|-------|
-| Standard SpineGKR Kill-Shot | ~7.8 KB | Unified block-side spine proof at 100 txs |
-| Standard AuthGKR Kill-Shot | ~5.1 KB | 14 round polys + shift + 3× batch-eval |
-| Standard TxLogicAir STARK | ~21.2 KB | Zero-check + FRI opening |
-| Standard LogicProof | ~26.3 KB | Wallet proof, stateless |
-| Standard BlockProof (10 txs) | ~511 KB | Production proof-native path, includes `BlockStateBindingAir` |
-| Standard BlockProof (20 txs) | ~805 KB | Production proof-native path, includes `BlockStateBindingAir` |
-| Standard BlockProof (100 txs) | ~3.57 MB | Production proof-native path, includes `BlockStateBindingAir` |
-| Sweep-heavy BlockProof | shape-dependent, larger | Wider AuthGKR slice data dominates current sweep proofs |
-| RecursiveProof | ~6.5 KB | 256-row AIR, tensor PCS only |
+Measured medians on the reference 2023 Intel Core i7-1365U laptop:
+
+| Component | Size / time | Notes |
+|-----------|-------------|-------|
+| Standard4x8 wallet bundle (4-in/8-out) | 235.79 KB; prove 89.41 ms; verify 24.60 ms | Logic proof = 234.08 KB = 151.50 KB STARK + 82.58 KB AuthGKR |
+| Sweep25x2 wallet bundle (25-in/2-out) | 214.94 KB; prove 372.33 ms; verify 111.54 ms | Logic proof = 210.28 KB = 96.19 KB STARK + 114.09 KB AuthGKR |
+| Standard-only full block, 10 txs | 2.24 MB proof + 828.17 KB Auth sidecar; prove 2.37 s; verify 542.39 ms | Production proof-native path: bucket proof + NativeDelta pre/post state openings |
+| Standard-only full block, 20 txs | 2.85 MB proof + 1.62 MB Auth sidecar; prove 3.95 s; verify 960.62 ms | Same path |
+| Standard-only full block, 100 txs | 7.62 MB proof + 8.11 MB Auth sidecar; prove 14.26 s; verify 4.10 s | Same path |
+| Sweep-only full block, 10 txs | 2.70 MB proof + 1.11 MB Auth sidecar; prove 3.97 s; verify 1.06 s | Wallet pre-proving excluded from block prove time |
+| RecursiveProof | ~38 KB encoded; verify ~5 ms | 256-row `RecursiveBlockAir`; current `recursive_hotspots` run measured 37.91–38.34 KB encoded |
 
 ---
 
@@ -556,15 +556,15 @@ Implementation: `noid_recursive/src/accumulator.rs`.
 | GKR shift gadget | 15 × 8 / 2^128 | 120/2^128 | ~120 |
 | GKR batch-eval (3 cols) | 3 × 15 × 2 / 2^128 | 90/2^128 | ~121 |
 | TxLogicAir zero-check | 11 × 5 / 2^128 | 55/2^128 | ~122 |
-| BlockStateBindingAir zero-check | 11 × 4 / 2^128 | 44/2^128 | ~123 |
+| NativeDelta state identity, per dirty segment | 3 × eff_log / 2^128, eff_log ≤ 16 | ≤48/2^128 | ~122 |
 | RecursiveBlockAir zero-check | 8 × 4 / 2^128 | 32/2^128 | ~123 |
 | FRI PCS (64 queries, ρ=1/4) | (1/4)^64 | 2^{-128} | 128 |
 | Poseidon2b collision | — | 2^{-128} | 128 |
-| **System total (union bound)** | | **~400/2^128** | **~120** |
+| **Block aggregate** | union bound over active checks and dirty segments | see `docs/security.md` | target ≥120-bit for accepted production caps |
 
-**Theorem 8 (System Soundness).** Under assumptions A1–A5, no PPT adversary can produce a block proof accepted by an honest verifier for a block containing an invalid transaction, with probability better than ~400/2^128.
+**Theorem 8 (System Soundness).** Under assumptions A1–A5, no PPT adversary can produce a block proof accepted by an honest verifier for a block containing an invalid transaction except with the union-bound probability over the verified wallet proofs, bucket proofs, NativeDelta segment identities, source-bound FRI openings, recursive AIR check, and Poseidon2b collision events.
 
-*Proof.* By union bound over all independent failure events in the verification pipeline. Each event is bounded by Schwartz-Zippel (A4) applied to the respective sumcheck degree and round count. FRI proximity uses the code-rate bound (A5). The shared Fiat-Shamir transcript (A3) ensures challenges are pseudorandom at each round regardless of prior transcript state. See Security Model §11.1 for the complete analysis. □
+*Proof.* Each sumcheck or random-point identity term is bounded by Schwartz-Zippel (A4) using its degree and round count. Each source-bound FRI opening contributes the code-rate query bound (A5). Poseidon2b commitments contribute the collision term (A2). Fiat-Shamir domain separation (A3) makes every challenge pseudorandom for the already-bound transcript prefix. See `docs/security.md` for the exact production acceptance predicates and block-level aggregate analysis. □
 
 ---
 

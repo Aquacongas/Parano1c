@@ -44,7 +44,7 @@ pub trait ParanoidApi {
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Latest recursive chain proof (~6.5 KB hex). Covers the entire history in O(1).
+    /// Latest recursive chain proof (~76 KB hex for ~38 KB raw proof). Covers the entire history in O(1).
     #[method(name = "getRecursiveProof")]
     async fn get_recursive_proof(&self) -> RpcResult<Option<String>>;
 
@@ -93,7 +93,7 @@ pub trait ParanoidApi {
     async fn get_peer_count(&self) -> RpcResult<usize>;
 
     /// Estimated minimum fee in μNOID for a transaction with `n_outputs` outputs.
-    /// Backwards-compatible legacy method: assumes one live input.
+    /// Simple u64 method: assumes one live input.
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
 
@@ -129,7 +129,7 @@ pub trait ParanoidApi {
     #[method(name = "getEpochAnchor")]
     async fn get_epoch_anchor(&self) -> RpcResult<String>;
 
-    /// Submit a raw `TxIntent` (transaction + ZK proof) to the mempool.
+    /// Submit a raw `TxIntent` (transaction + LogicProof) to the mempool.
     #[method(name = "submitTxIntent")]
     async fn submit_tx_intent(&self, hex: String) -> RpcResult<String>;
 

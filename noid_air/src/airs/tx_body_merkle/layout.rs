@@ -576,8 +576,8 @@ mod tests {
 
     #[test]
     fn total_row_budget_fits_half_hypercube() {
-        // 59 × 128 = 7552 ≤ 2^13 = 8192 — the ROADMAP-claimed halving
-        // from 2^14 to 2^13 is feasible at this instance count.
+        // 59 × 128 = 7552 ≤ 2^13 = 8192, so the layout fits in the
+        // 2^13 row budget at this instance count.
         let live_rows = N_INSTANCES * TXBODY_MERKLE_SLOT_ROWS;
         assert_eq!(live_rows, 7552);
         assert!(live_rows <= (1 << 13));

@@ -18,8 +18,8 @@ pub struct MempoolConfig {
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
     pub fee_floor_window: usize,
 
-    /// Number of concurrent ZK verification workers (tokio::spawn_blocking slots).
-    /// 0 = skip ZK verification at admission (native checks only).
+    /// Number of concurrent LogicProof verification workers (tokio::spawn_blocking slots).
+    /// 0 = skip LogicProof verification at admission (native checks only).
     /// Recommended: number of physical cores.
     pub zk_verify_workers: usize,
 }

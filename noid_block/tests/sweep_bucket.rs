@@ -14,7 +14,7 @@ use noid_air::Air;
 use noid_block::{
     assemble_sweep_bucket_proof, block_recursive_claim_hash, build_state_binding_airs,
     build_state_bindings_from_binding, build_tx_witness, extract_replay_witness,
-    prove_block_with_total_tx_count, prove_state_bindings_standalone,
+    prove_block_with_total_tx_count, prove_state_mle_openings_only,
     validate_block_bucket_tx_indices, validate_block_proof_transcript_hash,
     verify_state_bindings_standalone, verify_sweep_bucket_from_block, BlockProof, BlockPublicMeta,
     OwnedTxWitness, TxBlockWitness, VerifyBlockError,
@@ -547,13 +547,9 @@ fn empty_bucketized_proof(n_tx: u32) -> BlockProof {
             log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
             n_block_spine_slices: 0,
             n_state_bindings: 0,
-            state_binding_n_cols: 0,
-            state_binding_log_rows: 0,
         },
         standard_bucket: None,
         sweep_bucket: None,
-        state_binding_algebraics: vec![],
-        state_binding_starks: vec![],
         pre_state_openings: vec![],
         post_state_openings: vec![],
     }
@@ -590,13 +586,9 @@ fn sweep_bucket_proof_for_body(body: TxBody) -> (Block, BlockProof, Vec<SweepAut
             log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
             n_block_spine_slices: 0,
             n_state_bindings: 0,
-            state_binding_n_cols: 0,
-            state_binding_log_rows: 0,
         },
         standard_bucket: None,
         sweep_bucket: Some(sweep_bucket),
-        state_binding_algebraics: vec![],
-        state_binding_starks: vec![],
         pre_state_openings: vec![],
         post_state_openings: vec![],
     };
@@ -1520,12 +1512,10 @@ fn native_state_delta_rejects_wrong_post_lane_before_opening_verify() {
         6,
     );
     let witnesses: Vec<_> = owned.iter().map(|b| b.as_witness()).collect();
-    let (_starks, pre_openings, post_openings) = prove_state_bindings_standalone(&witnesses);
+    let (pre_openings, post_openings) = prove_state_mle_openings_only(&witnesses);
 
     proof.meta.new_state_root = binding.new_state_root;
     proof.meta.n_state_bindings = witnesses.len() as u32;
-    proof.meta.state_binding_n_cols = 0;
-    proof.meta.state_binding_log_rows = 0;
     proof.pre_state_openings = pre_openings;
     proof.post_state_openings = post_openings;
 
@@ -1592,12 +1582,10 @@ fn native_state_delta_rejects_tampered_segment_id_before_opening_verify() {
         6,
     );
     let witnesses: Vec<_> = owned.iter().map(|b| b.as_witness()).collect();
-    let (_starks, pre_openings, post_openings) = prove_state_bindings_standalone(&witnesses);
+    let (pre_openings, post_openings) = prove_state_mle_openings_only(&witnesses);
 
     proof.meta.new_state_root = binding.new_state_root;
     proof.meta.n_state_bindings = witnesses.len() as u32;
-    proof.meta.state_binding_n_cols = 0;
-    proof.meta.state_binding_log_rows = 0;
     proof.pre_state_openings = pre_openings;
     proof.post_state_openings = post_openings;
 
@@ -1639,7 +1627,7 @@ fn standalone_state_binding_proves_and_verifies_for_sweep_only_path() {
         6,
     );
     let witnesses: Vec<_> = owned.iter().map(|b| b.as_witness()).collect();
-    let (starks, pre_openings, post_openings) = prove_state_bindings_standalone(&witnesses);
+    let (pre_openings, post_openings) = prove_state_mle_openings_only(&witnesses);
 
     let proof = BlockProof {
         meta: BlockPublicMeta {
@@ -1651,13 +1639,9 @@ fn standalone_state_binding_proves_and_verifies_for_sweep_only_path() {
             log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
             n_block_spine_slices: 0,
             n_state_bindings: witnesses.len() as u32,
-            state_binding_n_cols: 0,
-            state_binding_log_rows: 0,
         },
         standard_bucket: None,
         sweep_bucket: None,
-        state_binding_algebraics: vec![],
-        state_binding_starks: starks,
         pre_state_openings: pre_openings,
         post_state_openings: post_openings,
     };

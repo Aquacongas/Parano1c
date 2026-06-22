@@ -17,7 +17,7 @@
 // ---------------------------------------------------------------------------
 // Global allocator: jemalloc
 //
-// glibc malloc retains freed pages from large ZK allocations (FRI/NTT Vecs,
+// glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs,
 // often 10-100 MB each) indefinitely, causing 3-4 GB RSS fragmentation on
 // a full node even with only a few hundred active UTXOs.
 //
@@ -101,12 +101,12 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum NodeMode {
     /// Relay node (default). No mining, no block-template serving.
-    /// Verifies all blocks (ZK + PoW), serves state snapshots and
+    /// Verifies all blocks (proofs + PoW), serves state snapshots and
     /// recursive proofs to peers. Suitable for exchanges, explorers,
     /// and infrastructure operators.
     #[default]
     Relay,
-    /// Internal miner. Runs built-in PoW + ZK proving in parallel.
+    /// Internal miner. Runs built-in PoW + BlockProof generation in parallel.
     /// Blocks external miner (extminer) access to the block-template API.
     Miner,
     /// External miner mode. Serves `getBlockTemplate` / `submitBlock`
@@ -130,7 +130,7 @@ struct Cli {
     /// Node operating mode.
     ///
     /// relay    — full node, no mining (default)
-    /// miner    — internal PoW + ZK prover; blocks extminer access
+    /// miner    — internal PoW + BlockProof generation; blocks extminer access
     /// extminer — serves block templates to noid-extminer; requires --mining-key
     #[arg(long, value_enum, default_value_t = NodeMode::Relay)]
     mode: NodeMode,
@@ -187,7 +187,7 @@ struct Cli {
     /// REQUIRES --mining-key to be set. Without --mining-key this flag is rejected
     /// at startup to prevent unauthenticated access to custom-coinbase templates.
     ///
-    /// Use case: infrastructure pool where the node provides ZK-proving and P2P
+    /// Use case: infrastructure pool where the node provides BlockProof generation and P2P
     /// relay, but each miner receives block rewards directly to their own address.
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
@@ -609,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
         mempool.clone(),
         wallet,
         p2p.cmd_tx.clone(),
+        cli.mode == NodeMode::Extminer,
         mining_payout_address,
         cli.mining_key,
         cli.allow_custom_coinbase,
@@ -1532,13 +1533,9 @@ mod tests {
                 log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
                 n_block_spine_slices: 0,
                 n_state_bindings: 0,
-                state_binding_n_cols: 0,
-                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: None,
-            state_binding_algebraics: vec![],
-            state_binding_starks: vec![],
             pre_state_openings: vec![],
             post_state_openings: vec![],
         }
@@ -1688,7 +1685,7 @@ async fn handle_p2p_events(
     // --- Per-peer tx rate limiter ---
     //
     // Sliding-window rate limiter: tracks (tx_count_in_window, window_start) per peer.
-    // Prevents a single peer from flooding the ZK semaphore queue.
+    // Prevents a single peer from flooding the proof-verification semaphore queue.
     use std::time::{Duration, Instant};
 
     // Short-lived dedup for fork-recovery pulls. During two-miner races the same
@@ -1956,7 +1953,7 @@ async fn handle_p2p_events(
                         pending_block_fetches.remove(&(block.header.height, block_hash));
 
                         // Skip blocks at or below our current tip — we already have them.
-                        // This avoids expensive ZK verification against a stale pre-state
+                        // This avoids expensive proof verification against a stale pre-state
                         // (build_state_binding_airs needs pre-state, but chain has already
                         // advanced past this height, causing false ConstraintViolated errors).
                         {
@@ -1972,7 +1969,7 @@ async fn handle_p2p_events(
                             }
                         }
 
-                        // Fork/orphan blocks are not ZK-verified until their parent
+                        // Fork/orphan blocks are not proof-verified until their parent
                         // becomes the current tip, because state-binding AIRs must be
                         // built against the exact pre-block state. For the current tip,
                         // apply_p2p_block_offthread performs proof-native validation and
@@ -2463,7 +2460,7 @@ async fn handle_p2p_events(
 
                 // Per-peer rate limiting: enforce before any further processing.
                 // This check is synchronous (O(1) HashMap lookup) so the event loop
-                // is not blocked; the heavy ZK verify is spawned below.
+                // is not blocked; the heavy LogicProof verification is spawned below.
                 {
                     let now = Instant::now();
                     let entry = peer_tx_rate.entry(from.clone()).or_insert((0, now));
@@ -2484,9 +2481,9 @@ async fn handle_p2p_events(
                     peer_tx_rate.retain(|_, (_, window_start)| *window_start >= cutoff);
                 }
 
-                // Spawn ZK verify + mempool admit as a background task.
+                // Spawn LogicProof verification + mempool admit as a background task.
                 //
-                // WHY: `mempool.submit()` runs a ZK proof verify (~84ms, CPU-bound via
+                // WHY: `mempool.submit()` runs a LogicProof verification (~84ms, CPU-bound via
                 // spawn_blocking) under an async semaphore. If we await it here, the
                 // entire P2P event loop stalls for 84ms — delaying block propagation.
                 //
@@ -3884,16 +3881,16 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 
 /// Background recursive proof updater.
 ///
-/// Advances the chain's recursive ZK proof one block at a time, storing the
+/// Advances the chain's recursive proof one block at a time, storing the
 /// result in MDBX. The recursive proof provides O(1) trustless sync for new
 /// nodes: instead of replaying all blocks, they verify one constant-size
-/// (~11 KB) STARK proof and trust the committed state root.
+/// (~38 KB encoded) STARK proof and trust the committed state root.
 ///
 /// ## Design
 ///
 /// - Advances only for **finalised** blocks (>= FINALITY_DEPTH behind tip)
 ///   so reorgs never invalidate a stored proof.
-/// - Blocks with no real ZK proof (coinbase-only) use a null witness — the
+/// - Blocks with no real BlockProof (coinbase-only) use a null witness — the
 ///   chain-hash accumulator still advances correctly.
 /// - Runs a tight loop when catching up; sleeps when at finality boundary.
 /// - Recursive proving runs in `spawn_blocking` so catch-up never blocks the async runtime.

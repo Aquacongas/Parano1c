@@ -88,7 +88,7 @@ impl BlockChainContext {
     /// Apply the next block through the in-memory sequential interpreter.
     ///
     /// This is not the live full-node production path and does not verify the
-    /// block's ZK proof. Live nodes use MDBX proof-native application.
+    /// block's BlockProof. Live nodes use MDBX proof-native application.
     ///
     /// Does NOT update the recursive proof. Call `update_recursive_proof`
     /// after this to advance the recursive chain.

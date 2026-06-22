@@ -30,20 +30,20 @@ The daemon opens MDBX storage, starts P2P networking, JSON-RPC, and optionally t
 
 ### 1.3 Operating Modes
 
-**relay** — Full verification node. Validates all blocks (ZK + PoW), serves state and recursive proofs. No internal mining; all CPU remains available to node work.
+**relay** — Full verification node. Validates all blocks (proofs + PoW), serves state and recursive proofs. No internal mining; all CPU remains available to node work.
 
-**miner** — Internal PoW + ZK proving. Blocks external miner access. Produces blocks autonomously. `--mining-threads` controls only internal PoW threads; all remaining cores are left for node/prover work automatically.
+**miner** — Internal PoW + BlockProof generation. Produces blocks autonomously. `--mining-threads` controls only internal PoW threads; all remaining cores are left for node/prover work automatically.
 
-**extminer** — Serves `getBlockTemplate`/`submitBlock` to external `noid-extminer` workers. Requires `--mining-key`. Internal PoW is disabled, so node CPU remains available for template/proof/RPC/P2P work.
+**extminer** — Intended mode for external `noid-extminer` workers. Requires `--mining-key`. Internal PoW is disabled, and the node serves `getBlockTemplate`/`submitBlock` over JSON-RPC for external PoW workers while keeping BlockProof generation, RPC, P2P, and template construction on the node.
 
 ### 1.4 Seed Formats
 
 ```
 --seed 1.2.3.4:9400                       # HOST:PORT (IP)
 --seed noid.example.com:9400              # HOST:PORT (DNS)
---seed /ip4/1.2.3.4/tcp/9400             # libp2p multiaddr
---seed dnsaddr:noid.network              # _dnsaddr DNS TXT lookup
 ```
+
+The CLI flag accepts `HOST:PORT` and may be repeated. Config-file `network.seeds` entries may also be libp2p multiaddrs or `dnsaddr:<hostname>`.
 
 ### 1.5 Examples
 
@@ -75,7 +75,7 @@ paranoid --mode extminer --rpc-listen 0.0.0.0:9401 \
 noid-cli [--rpc <URL>] [--json] <COMMAND> [ARGS...]
 ```
 
-Thin terminal client. Connects to a running daemon via JSON-RPC. No local keys, no crypto.
+Thin terminal client. Connects to a running daemon via JSON-RPC; wallet/proving operations are performed by the daemon’s built-in wallet.
 
 ### 2.2 Global Options
 
@@ -167,7 +167,7 @@ Response fields:
 | `timestamp` | u64 | Unix seconds |
 | `miner` | bech32m | Coinbase recipient |
 | `difficulty_target` | hex(32) | PoW target (LE 256-bit) |
-| `proof_transcript_hash` | hex(32) | ZK BlockProof Fiat-Shamir digest |
+| `proof_transcript_hash` | hex(32) | BlockProof Fiat-Shamir transcript digest |
 | `log_slots` | u32 | log2(UTXO slot capacity) |
 | `active_slot_count` | u64 | Live UTXOs after this block |
 | `alloc_counter` | u64 | Monotonic PRNG seed for slot allocation |
@@ -209,12 +209,12 @@ RPC method: `paranoid_getHeaderByHeight`
 
 ### `proof` (alias: `rec`)
 
-Recursive chain proof: the entire chain history compressed into ~6.5 KB.
+Recursive chain proof: the entire chain history compressed into ~38 KB encoded.
 
 ```
 $ noid-cli proof
 Recursive chain proof  (O(1) sync)
-  Size               6432 bytes (6.3 KB) (full chain history in one tiny proof)
+  Size               ~38 KB encoded (full chain history in one tiny proof)
   Fingerprint        a1b2c3d4…e5f6g7h8
 
   Note: Any node can verify the ENTIRE chain history in ~5 ms using this proof.
@@ -312,7 +312,7 @@ RPC method: `paranoid_isNullifier`
 
 ### `state`
 
-UTXO state dimensions: capacity, fill %, memory footprint, expansion headroom.
+UTXO state dimensions: capacity, fill %, materialized state size, expansion headroom.
 
 ```
 $ noid-cli state
@@ -321,7 +321,7 @@ UTXO state
   Active UTXOs       29 (0.00% full)
   Fill               [░░░░░░░░░░░░░░░░░░░░░░|░░░░░░░░] 0.00%  (| = expand at 75%)
   Until expand       12582883 slots (75.00% headroom)
-  State size         48.0 MB RAM  /  48.0 MB disk  /  768.0 MiB current capacity (192 GiB at 2^32)
+  State size         materialized segments only; virtual-zero segments use no disk
 ```
 
 RPC method: `paranoid_getStateInfo`
@@ -407,7 +407,7 @@ Fee estimate (1 input(s), 3 output(s))
 RPC methods:
 
 - `paranoid_estimateFeeDetailed(n_inputs, n_outputs)` → detailed breakdown
-- `paranoid_estimateFee(n_outputs)` → legacy `u64`, assumes one input
+- `paranoid_estimateFee(n_outputs)` → simple `u64`, assumes one input
 
 Fee formula charges base + small input component + output component + occupancy-scaled net-new-state growth. The state-growth component is burned; miners can claim only the remainder plus any tip. There is no `Sweep25x2` shape premium.
 
@@ -455,7 +455,7 @@ Mempool
   Fee floor          0.005000 NOID (5000 μNOID minimum)
 
   ────────────────────────────────────────────────────────────────────────────────────────────────────────
-  tx hash               shape         fee (μNOID)   in→out  ZK
+  tx hash               shape         fee (μNOID)   in→out  proof
   ────────────────────────────────────────────────────────────────────────────────────────────────────────
   a1b2c3d4e5f6g7h8...   Standard4x8          9000    2→ 2   ✓
   b2c3d4e5f6g7h8i9...   Sweep25x2            7700   10→ 1   ✓
@@ -483,7 +483,7 @@ Each `MempoolTxInfo`:
 | `n_inputs` | usize | Active input count |
 | `n_outputs` | usize | Active output count |
 | `admitted_height` | u64 | Chain height when admitted |
-| `has_proof` | bool | Whether ZK proof is cached |
+| `has_proof` | bool | Whether the wallet LogicProof is cached |
 
 ---
 
@@ -500,7 +500,7 @@ Mempool transaction
   Inputs             2
   Outputs            2
   Admitted at height 28
-  ZK proof           attached
+  LogicProof         attached
 ```
 
 RPC method: `paranoid_getMempoolEntry`
@@ -636,7 +636,7 @@ Transaction submitted
   Tip: Use 'noid-cli balance' to check your balance after confirmation.
 ```
 
-Amounts > 1000 NOID prompt interactive confirmation. Address accepts bech32m (`noid1...`) or 64-char hex.
+Amounts ≥ 1000 NOID prompt interactive confirmation when running in a TTY. Address accepts bech32m (`noid1...`) or 64-char hex.
 
 RPC methods:
 
@@ -791,7 +791,7 @@ Response fields:
 
 ### `block-template [--miner-addr <HEX>]` (alias: `template`)
 
-Get a PoW block template. The node performs ZK proving; the external miner only patches the nonce.
+Get a PoW block template. The node performs BlockProof generation; the external miner only patches the nonce.
 
 ```
 $ noid-cli block-template
@@ -800,11 +800,12 @@ Block template
   Txs in block       2
   User tx shapes     Standard4x8=1, Sweep25x2=1
   Block proof        91342 bytes
+  Auth sidecar       113840 bytes
   Claimable fees     14600 μNOID
-  Coinbase value     500014600 μNOID
+  Coinbase value     50014600 μNOID
   Header core        a41c9f0b237e6d1f8a9b4c2e...… (212 bytes, PoW input)
 
-  PoW: Compute Blake3(header_core || nonce) < difficulty_target, then submit.
+  PoW: patch nonce bytes [144..160] inside header_core, compute Blake3(patched_header_core) < difficulty_target, then submit.
   Full hex: a41c9f0b237e6d1f8a9b4c2e3d5f7a0182b3c4d5e6f7...
 ```
 
@@ -817,6 +818,7 @@ Response fields:
 | `header_core_hex` | hex | 212-byte PoW input buffer |
 | `block_hex` | hex | Full sealed block (nonce=0); patch bytes [144..160] with found nonce |
 | `block_proof_hex` | hex | Serialized BlockProof; empty for coinbase-only blocks |
+| `block_auth_sidecar_hex` | hex | Serialized public BlockAuthSidecar; empty for coinbase-only blocks |
 | `nonce_offset` | usize | Byte offset of nonce in `block_hex` (always 144) |
 | `difficulty_target_hex` | hex(32) | Target (LE); find N where `Blake3(patched_header_core) < target` |
 | `height` | u64 | Block height being mined |
@@ -838,16 +840,16 @@ Response fields:
    - Compute `hash = Blake3(patched_212_bytes)`
    - If `hash < difficulty_target`: found a valid block
 3. Patch bytes [144..160] of `block_hex` with the winning nonce
-4. Submit via `submitBlock(block_hex, block_proof_hex)`
+4. Submit via `submitBlock(block_hex, block_proof_hex, block_auth_sidecar_hex)`
 
 ---
 
-### `submit-block <BLOCK_HEX> <BLOCK_PROOF_HEX>` (alias: `submit`)
+### `submit-block <BLOCK_HEX> <BLOCK_PROOF_HEX> [BLOCK_AUTH_SIDECAR_HEX]` (alias: `submit`)
 
-Submit a solved block plus its serialized BlockProof. Use `""` as `BLOCK_PROOF_HEX` for coinbase-only blocks.
+Submit a solved block plus its serialized `BlockProof` and public `BlockAuthSidecar`. Use `""` for absent proof/sidecar on coinbase-only blocks.
 
 ```
-$ noid-cli submit-block a41c9f0b237e... 9f1c02...
+$ noid-cli submit-block a41c9f0b237e... 9f1c02... 4d2a8b...
 ✓ Block accepted: 6e7a8027180707317e2ba8fdc63af0d7...
 ```
 
@@ -881,8 +883,7 @@ RPC method: `paranoid_stop`
 
 ### 7.2 Authentication
 
-When `--mining-key` is set, all requests require `Authorization: Bearer <TOKEN>` header.
-Without `--mining-key`, RPC is bound to `127.0.0.1` (localhost only).
+When `--mining-key` is set, all requests require `Authorization: Bearer <TOKEN>` header. Without `--mining-key`, auth middleware is a pass-through; this is safe by default because `--rpc-listen` defaults to `127.0.0.1:9401`. Binding RPC publicly without `--mining-key` exposes unauthenticated RPC.
 
 ### 7.3 Request Format
 
@@ -937,7 +938,7 @@ Error:
 | `paranoid_getHeaderByHeight` | `height: u64` | `string?` | Raw 276-byte header hex |
 | `paranoid_getHeaderByHash` | `hash: string` | `string?` | Raw header by hash |
 | `paranoid_getBlock` | `height: u64` | `string?` | Full block hex (last 18 only) |
-| `paranoid_getRecursiveProof` | — | `string?` | ~6.5 KB recursive proof hex |
+| `paranoid_getRecursiveProof` | — | `string?` | ~76 KB hex string for the ~38 KB recursive proof |
 | `paranoid_getSlot` | `slot_index: u32` | `SlotInfo` | Single UTXO slot |
 | `paranoid_getSlotsByOwner` | `address: string` | `SlotInfo[]` | All UTXOs of an address |
 | `paranoid_getActiveSlotCount` | — | `u64` | Live UTXO count |
@@ -951,8 +952,8 @@ Error:
 |--------|--------|---------|-------------|
 | `paranoid_getMiningInfo` | — | `MiningInfo` | Difficulty, reward, recursive height |
 | `paranoid_getPeerCount` | — | `usize` | Connected peers |
-| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Legacy estimated min fee in μNOID, assumes one input |
-| `paranoid_estimateFeeDetailed` | `n_inputs: u32, n_outputs: u32` | `FeeBreakdown` | Current detailed fee breakdown, including burned state-growth fee |
+| `paranoid_estimateFee` | `n_outputs: u32` | `u64` | Simple estimated min fee in μNOID, assumes one input |
+| `paranoid_estimateFeeDetailed` | `n_inputs: u32, n_outputs: u32` | `FeeEstimate` | Current shape-aware fee estimate, including burned state-growth fee |
 
 #### Utilities
 
@@ -960,6 +961,7 @@ Error:
 |--------|--------|---------|-------------|
 | `paranoid_validateAddress` | `address: string` | `AddressInfo` | Validate and normalize |
 | `paranoid_getSlotHints` | `count: u32` | `u32[]` | Empty slot candidates for tx building |
+| `paranoid_getSlotHintsSalted` | `count: u32, salt_hex: string` | `u32[]` | Salted empty slot candidates for wallet-specific hint streams |
 | `paranoid_getEpochAnchor` | — | `string` | Current epoch anchor hash |
 | `paranoid_submitTxIntent` | `hex: string` | `string` | Submit raw TxIntent to mempool |
 
@@ -981,8 +983,8 @@ Error:
 
 | Method | Params | Returns | Description |
 |--------|--------|---------|-------------|
-| `paranoid_getBlockTemplate` | `miner_address: string` | `BlockTemplateResponse` | PoW template (ZK pre-proved) |
-| `paranoid_submitBlock` | `block_hex: string, block_proof_hex: string` | `string` | Submit solved block, returns hash |
+| `paranoid_getBlockTemplate` | `miner_address: string` | `BlockTemplateResponse` | PoW template with BlockProof already generated |
+| `paranoid_submitBlock` | `block_hex: string, block_proof_hex: string, block_auth_sidecar_hex: string` | `string` | Submit solved block, returns hash |
 
 #### Node Control
 
@@ -1002,10 +1004,10 @@ Error:
 | `paranoid_walletListUtxos` | — | `WalletUtxoInfo[]` | All confirmed UTXOs |
 | `paranoid_walletHistory` | — | `WalletHistoryEntry[]` | Transaction history |
 | `paranoid_walletScan` | — | `WalletScanResult` | Full state rescan |
-| `paranoid_walletPlanSend` | `to: string, amount: u64, fee: u64` | `WalletSendPlan` | Dry-run send plan |
-| `paranoid_walletSend` | `to: string, amount: u64, fee: u64` | `WalletSendResult` | Send NOID |
-| `paranoid_walletPlanConsolidate` | `fee: u64` | `WalletConsolidatePlan` | Dry-run consolidation plan |
-| `paranoid_walletConsolidate` | `fee: u64` | `WalletSendResult` | Merge UTXOs |
+| `paranoid_walletPlanSend` | `to_hex: string, amount_micronoid: u64, fee_micronoid: u64` | `WalletSendPlan` | Dry-run send plan |
+| `paranoid_walletSend` | `to_hex: string, amount_micronoid: u64, fee_micronoid: u64` | `WalletSendResult` | Send NOID |
+| `paranoid_walletPlanConsolidate` | `fee_micronoid: u64` | `WalletConsolidatePlan` | Dry-run consolidation plan |
+| `paranoid_walletConsolidate` | `fee_micronoid: u64` | `WalletSendResult` | Merge UTXOs |
 | `paranoid_walletExportReceipt` | `txhash: string` | `string` | Export receipt hex |
 
 ---
@@ -1029,9 +1031,11 @@ listen = "127.0.0.1:9401"
 
 [mining]
 enabled = true
-threads = 0
+mining_threads = 0
 miner_address = "f784b2c1d3e5a6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081920a1b2c3d4e5"
 ```
+
+`--mode` is authoritative for internal mining: `relay` and `extminer` do not start the internal miner even if `mining.enabled = true` remains in a config file. CLI `--seed` values are converted from `HOST:PORT`; config `network.seeds` entries are parsed by the P2P layer and may use `HOST:PORT`, multiaddr, or `dnsaddr:` syntax.
 
 CLI flags override config file values.
 
@@ -1087,7 +1091,8 @@ curl -s http://127.0.0.1:9401 -X POST \
 # Submit solved block
 curl -s http://127.0.0.1:9401 -X POST \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"paranoid_submitBlock","params":["<block_hex>","<block_proof_hex>"]}' | jq .result
+  -H "Authorization: Bearer s3cr3t" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"paranoid_submitBlock","params":["<block_hex>","<block_proof_hex>","<block_auth_sidecar_hex>"]}' | jq .result
 
 # Check if tx is spent (nullifier)
 curl -s http://127.0.0.1:9401 -X POST \

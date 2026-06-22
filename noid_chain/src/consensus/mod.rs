@@ -101,7 +101,7 @@ pub enum ConsensusError {
     BadDifficultyTarget,
     /// §16.5 — Timestamp violates MTP or future-drift rules.
     BadTimestamp,
-    /// §16.6 — `proof_transcript_hash` is zero (block has no ZK proof).
+    /// §16.6 — `proof_transcript_hash` is zero (block has no proof transcript).
     MissingProof,
     /// §16.7 — `log_slots < parent.log_slots` (slots must be monotone).
     BadLogSlots,
@@ -133,7 +133,7 @@ pub enum ConsensusError {
     /// §16.16 — `state_root` does not match post-block state.
     BadStateRoot,
     /// Block carries user transactions with the development stub proof marker [1u8;32].
-    /// User-tx blocks must reference a real ZK transcript digest.
+    /// User-tx blocks must reference a real proof transcript digest.
     StubProof,
     /// Generic shape / length mismatch.
     ShapeMismatch(String),

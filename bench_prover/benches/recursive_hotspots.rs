@@ -121,6 +121,9 @@ fn print_genesis_case() -> RecursiveBlockProof {
     print_mem("before", before);
     let (prove_time, proof) = time_once(prove_genesis_recursive);
     let verify_time = verify_step(&proof, &pre_acc, &genesis);
+    let encoded_len = bincode::serialize(&proof)
+        .expect("serialize recursive proof")
+        .len();
     let after = current_mem_snapshot();
     println!("    prove:                  {}", fmt_ms(prove_time));
     println!("    verify:                 {}", fmt_ms(verify_time));
@@ -128,6 +131,7 @@ fn print_genesis_case() -> RecursiveBlockProof {
         "    recursive proof:        {}",
         fmt_bytes(proof.byte_len())
     );
+    println!("    recursive encoded:      {}", fmt_bytes(encoded_len));
     print_mem_delta("after", before, after);
     println!();
     proof
@@ -148,6 +152,9 @@ fn print_null_step_case(
     let (prove_time, proof) =
         time_once(|| prove_recursive_step(&witness, &header, &prev_acc, Some(prev_proof)));
     let verify_time = verify_step(&proof, &prev_acc, &header);
+    let encoded_len = bincode::serialize(&proof)
+        .expect("serialize recursive proof")
+        .len();
     let after = current_mem_snapshot();
     println!("    prove:                  {}", fmt_ms(prove_time));
     println!("    verify:                 {}", fmt_ms(verify_time));
@@ -155,6 +162,7 @@ fn print_null_step_case(
         "    recursive proof:        {}",
         fmt_bytes(proof.byte_len())
     );
+    println!("    recursive encoded:      {}", fmt_bytes(encoded_len));
     print_mem_delta("after", before, after);
     println!();
     proof
@@ -191,6 +199,10 @@ fn print_recursive_block_case(label: &str, r: &RecursiveStepBench) {
     println!("    recursive prove:        {}", fmt_ms(r.prove_time));
     println!("    recursive verify:       {}", fmt_ms(r.verify_time));
     println!("    recursive proof:        {}", fmt_bytes(r.proof_bytes));
+    println!(
+        "    recursive encoded:      {}",
+        fmt_bytes(r.proof_encoded_bytes)
+    );
     println!(
         "    source block proof:     {}",
         fmt_bytes(r.block_proof_bytes)

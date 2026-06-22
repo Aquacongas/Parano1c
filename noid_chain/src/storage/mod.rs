@@ -94,7 +94,7 @@ pub trait BlockStore: Send + Sync {
     /// `FINALITY_DEPTH` blocks; returns `None` for older blocks.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
-    /// Retrieve the persisted recursive chain proof (6.5 KB). `None` means
+    /// Retrieve the persisted recursive chain proof (~38 KB encoded). `None` means
     /// the prover has not yet caught up (DEGRADED / FALLBACK mode).
     fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError>;
 

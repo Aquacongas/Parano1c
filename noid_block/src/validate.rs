@@ -69,7 +69,7 @@ use noid_tx::{
 pub enum FullValidationError {
     /// Native consensus check failed.
     Consensus(ConsensusError),
-    /// ZK proof verification failed.
+    /// BlockProof verification failed.
     ZkProof(VerifyBlockError),
 }
 
@@ -226,7 +226,7 @@ pub fn validate_block_full(
         verify_state_bindings_standalone(proof, state_binding_airs)?;
     }
 
-    // Apply state delta — ZK proved correctness means no pre-state reads are needed.
+    // Apply state delta — BlockProof correctness means no pre-state reads are needed.
     apply_state_delta(state, block).map_err(|e| {
         use noid_chain::block::BlockApplyError;
         match e {
@@ -299,7 +299,7 @@ pub fn validate_block_auth_sidecar_root(
 /// 1. Deserialises the `BlockProof`.
 /// 2. Reconstructs `SpineInputs`, `AuthPublicInputs`, and NativeDelta state summaries
 ///    purely from the block's public wire data and the pre-block FRI state.
-/// 3. Calls `validate_block_full` (consensus + ZK + state delta).
+/// 3. Calls `validate_block_full` (consensus + BlockProof + state delta).
 ///
 /// # Security
 ///
@@ -860,7 +860,7 @@ pub fn build_state_binding_airs(
 
 /// Build `TxLogicAir` instances from a block's transactions.
 ///
-/// Coinbase transactions are excluded from ZK proof coverage (validated by
+/// Coinbase transactions are excluded from LogicProof coverage (validated by
 /// consensus rules only). This function skips them.
 ///
 /// The returned AIRs are in the same order as non-coinbase txs in the block.

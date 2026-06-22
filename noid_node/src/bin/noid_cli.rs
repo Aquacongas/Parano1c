@@ -1108,7 +1108,7 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     );
     let has_proof = result["has_proof"].as_bool().unwrap_or(false);
     kv(
-        "ZK proof",
+        "LogicProof",
         if has_proof {
             "attached"
         } else {
@@ -1171,12 +1171,12 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if is_tty() {
         println!(
             "  {}{:<20}  {:<12}  {:>12}  {:>3}→{:<3}  {}{}",
-            BOLD, "tx hash", "shape", "fee (μNOID)", "in", "out", "ZK", RST
+            BOLD, "tx hash", "shape", "fee (μNOID)", "in", "out", "proof", RST
         );
     } else {
         println!(
             "  {:<20}  {:<12}  {:>12}  {:>3}→{:<3}  {}",
-            "tx hash", "shape", "fee (μNOID)", "in", "out", "ZK"
+            "tx hash", "shape", "fee (μNOID)", "in", "out", "proof"
         );
     }
     separator(104);

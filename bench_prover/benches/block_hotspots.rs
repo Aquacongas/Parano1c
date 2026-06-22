@@ -141,11 +141,8 @@ fn print_standard_hotspot(n: usize) {
     println!("    fixture build:             {}", fmt_ms(fixture_build));
     println!("    live IO total:             {live_inputs} inputs / {live_outputs} outputs");
     println!(
-        "    meta:                      n_tx={}, state_bindings={}, state_cols={}, state_log_rows={}",
-        full.proof.meta.n_tx,
-        full.proof.meta.n_state_bindings,
-        full.proof.meta.state_binding_n_cols,
-        full.proof.meta.state_binding_log_rows
+        "    meta:                      n_tx={}, state_bindings={}",
+        full.proof.meta.n_tx, full.proof.meta.n_state_bindings
     );
     println!(
         "                               n_air_per_tx={}, auth_slices_per_tx={}, block_spine_slices={}",
@@ -235,11 +232,8 @@ fn print_sweep_hotspot(n: usize) {
     println!("    wallet pre-proof total:    {}", fmt_ms(wallet_prep));
     println!("    live IO total:             {live_inputs} inputs / {live_outputs} outputs");
     println!(
-        "    meta:                      n_tx={}, state_bindings={}, state_cols={}, state_log_rows={}",
-        full.proof.meta.n_tx,
-        full.proof.meta.n_state_bindings,
-        full.proof.meta.state_binding_n_cols,
-        full.proof.meta.state_binding_log_rows
+        "    meta:                      n_tx={}, state_bindings={}",
+        full.proof.meta.n_tx, full.proof.meta.n_state_bindings
     );
     println!(
         "                               n_air_per_tx={}, auth_slices_per_tx={}, block_spine_slices={}",

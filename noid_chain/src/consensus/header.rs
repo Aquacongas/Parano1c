@@ -25,7 +25,7 @@ use crate::consensus::{
 /// 3. `difficulty_target` == ASERT-computed target
 /// 4. Timestamp rules (MTP + future drift)
 /// 5. Blake3 PoW satisfies difficulty_target
-/// 6. `proof_transcript_hash != [0;32]` (block has a ZK proof)
+/// 6. `proof_transcript_hash != [0;32]` (block has a proof transcript)
 /// 7. `log_slots >= parent.log_slots` (slot space monotone)
 ///
 /// `prev_timestamps`: timestamps of the last ≤11 ancestors, oldest-first.

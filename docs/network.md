@@ -7,29 +7,27 @@ Paranoid nodes do not store transaction history. A node holds:
 1. **Current UTXO state** -- the live balances right now. Overwritten every block.
 2. **Block headers** -- 276 bytes each, kept forever (~553 MB/year). The only
    permanent growth.
-3. **Last 18 blocks with full data** (block bodies + ZK proofs + undo logs) --
-   for shallow reorgs and peer serving. Pruned after finality.
-4. **One recursive proof** -- 6.5 KB. Proves the entire chain from genesis to
+3. **Recent block data** -- block bodies, public Auth sidecars, BlockProofs, and undo logs for shallow reorgs, peer serving, and recursive proof advancement. Bodies/undo/sidecars are pruned at finality; `BlockProof` bytes are retained until both finalized and folded into the recursive proof.
+4. **One recursive proof** -- ~38 KB encoded. Proves the entire chain from genesis to
    near-tip in a single STARK verification (~5 ms).
 
 **Why this works without history:**
 
 - **State correctness**: The recursive proof mathematically guarantees that
   the current state is the honest result of every transaction since genesis.
-  No replay needed. The proof IS the replay, compressed to 6.5 KB.
+  No replay needed. The proof IS the replay, compressed to ~38 KB encoded.
 - **Past payments**: Users store their own receipts (~300 bytes). A receipt
   contains a Merkle path from the transaction to the block's `tx_root`.
   Any node verifies it against its permanent header chain. No block body needed.
-- **Replay protection**: Transactions expire after 144 blocks (~36 min) via
-  `epoch_anchor`. Nullifiers only need to cover this window, then self-prune.
+- **Replay protection**: Transactions expire by `epoch_anchor` depth. With
+  `ANCHOR_DEPTH = 144`, consensus accepts anchors in an inclusive window of up to
+  145 past header heights; nullifiers cover this bounded window, then self-prune.
 
 A node that joins the network downloads the current state + recursive proof,
 verifies the proof in 5 ms, and has full confidence. It never downloads or
 processes historical blocks. Sync from zero takes 1-2 seconds.
 
-The network does not execute transactions -- it verifies ZK proofs. Execution
-is local (wallet), validity is global (ZK), ordering is PoW. Every node
-independently verifies ZK validity of every block. No node trusts miners.
+The network does not re-execute wallet logic as the acceptance rule -- it verifies validity proofs. Execution is local to the wallet, validity is global through proof verification, ordering is PoW. Every node independently verifies block validity. No node trusts miners.
 
 ---
 
@@ -37,11 +35,11 @@ independently verifies ZK validity of every block. No node trusts miners.
 
 A single binary, three mutually exclusive modes (`--mode`):
 
-| Mode | Mining | Block Templates | ZK Verify | Serves State | P2P |
-|------|--------|-----------------|-----------|--------------|-----|
+| Mode | Mining | Block Templates | Proof Verify | Serves State | P2P |
+|------|--------|-----------------|--------------|--------------|-----|
 | `relay` (default) | no | no | yes | yes | full gossip |
-| `miner` | internal PoW + ZK | no | yes | yes | full gossip |
-| `extminer` | ZK only (PoW external) | yes (requires `--mining-key`) | yes | yes | full gossip |
+| `miner` | internal PoW + BlockProof generation | no | yes | yes | full gossip |
+| `extminer` | BlockProof generation only (PoW external) | yes (requires `--mining-key`) | yes | yes | full gossip |
 
 All modes are functionally identical in what they verify and store. The only
 difference is block production.
@@ -49,13 +47,13 @@ difference is block production.
 **External PoW Miner (`noid-extminer`)** is a separate stateless binary. It
 connects to an `--mode extminer` node via JSON-RPC, fetches templates, searches
 for Blake3 nonces with rayon, and submits solved blocks. It has no P2P, no state,
-no ZK proving.
+no proof generation.
 
 ---
 
 ## What a Node Stores
 
-### Storage Layout (MDBX, 13 tables)
+### Storage Layout (MDBX, 14 tables)
 
 | Table | Key | Value | Retention | Approx Size |
 |-------|-----|-------|-----------|-------------|
@@ -65,13 +63,14 @@ no ZK proving.
 | `T_SEGMENTS` | seg_id (u16) | SegmentColumns (3 x 64K x 16B) | current state | ~3 MB per materialized segment |
 | `T_STATE_META` | single key | (log_slots, active_count, alloc_counter) | latest only | 20 bytes |
 | `T_OWNER_INDEX` | owner_addr (32B) | packed Vec<(slot_u32, value_u64)> | current state | proportional to UTXO set |
-| `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | 6.5 KB |
+| `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | ~38 KB encoded |
 | `T_RECENT_BLOCKS` | height (u64) | full Block bytes | last 18 blocks | ~4 MB |
-| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | last 18 blocks | ~64 MB at 100 Standard txs/block; shape-mix dependent |
+| `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | finalized and recursive-consumed window | shape-mix dependent; bounded by proof caps |
+| `T_BLOCK_AUTH_SIDECARS` | height (u64) | public BlockAuthSidecar bincode | last 18 blocks | shape-mix dependent; public Auth proofs only |
 | `T_UNDO_LOGS` | height (u64) | BlockUndoLog | last 18 blocks | ~2 MB |
-| `T_NULLIFIERS` | tx_body_hash (32B) | height (u64) | last 144 blocks | ~1.2 MB |
-| `T_NULLIFIER_BLOCKS` | height (u64) | packed tx_body_hashes | last 144 blocks | ~1.2 MB |
-| `T_TX_INDEX` | tx_body_hash (32B) | (height, position) | last 144 blocks | ~1.2 MB |
+| `T_NULLIFIERS` | tx_body_hash (32B) | height (u64) | bounded anchor window | ~1.2 MB |
+| `T_NULLIFIER_BLOCKS` | height (u64) | packed tx_body_hashes | bounded anchor window | ~1.2 MB |
+| `T_TX_INDEX` | tx_body_hash (32B) | (height, position) | bounded anchor window | ~1.2 MB |
 
 ### Why These Retention Policies
 
@@ -88,26 +87,33 @@ The node stores only the CURRENT UTXO state. No history.
 - Past payments: proven by user-held receipts against permanent headers.
 - State trust: guaranteed by the recursive proof, not by replay.
 
-**Recent blocks and proofs (last 18 = FINALITY_DEPTH):**
-Used for two purposes only:
+**Recent block data (FINALITY_DEPTH = 18):**
+Used for three purposes:
 1. **Shallow reorgs**: if a competing chain with more chainwork arrives for
    the last <=18 blocks, the node can undo and re-apply using undo logs.
 2. **Peer serving**: a syncing node that is nearly caught up can request the
    last few blocks + proofs instead of a full snapshot.
+3. **Recursive folding**: finalized user-transaction `BlockProof` bytes remain
+   available until the background recursive updater has consumed that height.
 
-After 18 blocks, a block is final. Its data is no longer needed because:
-- Its state transitions are already reflected in the current state.
-- Its ZK validity is already folded into the recursive proof.
-- Its undo log is unreachable (no reorg past finality depth).
+After finality, block bodies, undo logs, and public Auth sidecars are pruned. `BlockProof` pruning is additionally gated by the stored recursive proof height to avoid racing the recursive updater.
 
-**Nullifiers (last 144 blocks = ANCHOR_DEPTH):**
-A tx's epoch_anchor references a block header hash within the last 144 blocks.
-Nullifiers (tx_body_hash values) are tracked for this window to prevent replay.
-After ANCHOR_DEPTH blocks, the anchor expires and the tx cannot be replayed
-even without the nullifier entry (the anchor check rejects it structurally).
+**Nullifiers (`ANCHOR_DEPTH = 144`):**
+A tx's `epoch_anchor` references a recent block header hash. For block consensus,
+valid anchor heights are:
+
+```text
+[block_height - ANCHOR_DEPTH - 1, block_height - 1]
+```
+
+with saturation near genesis, so the window contains up to 145 possible anchor
+heights. Mempool admission uses the analogous tip-inclusive recent-header window.
+Nullifiers (`tx_body_hash` values) are tracked for this bounded window to prevent
+replay while an anchor remains admissible. After the anchor expires, replay is
+structurally impossible even without the nullifier entry.
 The two mechanisms are redundant within the window and self-sufficient after:
-- Within 144 blocks: nullifier prevents replay (fast, O(1) lookup)
-- After 144 blocks: anchor expiry prevents replay (no storage needed)
+- Within the anchor window: nullifier prevents replay (fast, O(1) lookup)
+- After the anchor window: anchor expiry prevents replay (no storage needed)
 
 ### Storage Size Estimates
 
@@ -123,9 +129,10 @@ Only segments with live UTXOs are materialized (rest are virtual zero, no disk).
 At full capacity (2^32 slots, all materialized): 2^32 × 48 bytes ≈ 192 GiB max theoretical ceiling.
 
 **Volatile (fixed, independent of chain age):**
-- Recent blocks + proofs + undo: ~70 MB at 100 Standard txs/block; shape-mix dependent (always last 18 blocks)
-- Nullifiers + tx_index: ~3.6 MB (always last 144 blocks)
-- Recursive proof: 6.5 KB (single latest)
+- Recent bodies + sidecars + undo: finality window only; shape-mix dependent
+- BlockProof bytes: finality window plus recursive-consumption guard; bounded by wire caps
+- Nullifiers + tx_index: bounded by the `ANCHOR_DEPTH = 144` recent-header window (up to 145 anchor heights)
+- Recursive proof: ~38 KB encoded (single latest)
 
 ---
 
@@ -194,7 +201,7 @@ Any wallet or node can verify a receipt against stored headers:
 
 3. **What this proves**:
    - **Inclusion**: the tx was in block N (Merkle path to tx_root)
-   - **Validity**: the tx was ZK-verified at inclusion (header's
+   - **Validity**: the tx's `LogicProof` was verified at inclusion (header's
      `proof_transcript_hash` commits to the BlockProof)
    - **Finality**: the block had real PoW cost (nonce + difficulty in header)
 
@@ -207,8 +214,8 @@ cannot produce a valid BlockProof, so it cannot enter a block's tx_root.
 ## Synchronisation
 
 Two sync modes only:
-1. **Snapshot sync** (gap > 18 blocks or fresh node): download state + recursive proof, verify, done.
-2. **Block-by-block** (gap <= 18 blocks): apply recent blocks with full ZK verification.
+1. **Snapshot sync** (gap > 18 blocks or fresh node): download authenticated current state + recursive proof, verify, done.
+2. **Block-by-block** (gap <= 18 blocks): apply recent blocks with full proof verification.
 
 There is no third option. A node never "catches up" hundreds of blocks one
 by one. If it's behind by more than 18 blocks, it gets a fresh snapshot.
@@ -224,17 +231,18 @@ New Node                         Peers (up to 3 queried)
    |<-- manifests (tip_height, segment_ids, headers, nullifiers)
    |
    | 2. Select best manifest (highest tip with valid PoW chainwork)
-   |    Reject if chainwork < MIN_SNAPSHOT_CHAINWORK (prevents fake chains)
+   |    Reject if chainwork does not strictly exceed MIN_SNAPSHOT_CHAINWORK
    |
    |--- GetRecursiveProof ------> Best peer
-   |<-- RecursiveProof (6.5 KB)
+   |<-- RecursiveProof (~38 KB encoded)
    |
-   | 3. Verify the ENTIRE chain history in one call:
-   |    verify_tip(proof, expected_state_root, tip_height)
-   |      - STARK verify: O(1), ~5 ms
-   |      - proof.state_root == manifest state_root (from headers)
-   |      - proof covers height == tip - 1
-   |    If STARK fails: reject this peer, try next candidate.
+   | 3. Verify the recursive proof and header anchor:
+   |    - STARK verify: O(1), ~5 ms
+   |    - proof height <= snapshot tip
+   |    - proof lag <= FINALITY_DEPTH + 2
+   |    - proof state root matches the corresponding stored header root
+   |    - manifest segment-root table reconstructs the snapshot tip state_root
+   |    If verification fails: reject this peer, try next candidate.
    |    A forged RecursiveProof CANNOT pass STARK verification.
    |
    |--- GetStateSegment x N ----> Best peer (8 parallel, ~3 MB each)
@@ -254,13 +262,13 @@ New Node                         Peers (up to 3 queried)
 ```
 
 **Total sync time: 1-2 seconds** for typical state sizes (tested: node syncs
-from h=0 to h=21 in ~1s including ZK verification of all received blocks).
+from h=0 to h=21 in ~1s including proof verification of all received blocks).
 
 ### Flow B: Node Restarts (Has State)
 
 ```
 Node restarts. Reads MDBX. tip = h=N.
-  - If tip timestamp within 3 block-times of wall clock:
+  - If tip timestamp is within 3 minutes of wall clock:
       sync_ready immediately, wait for gossip
   - If slightly behind (<=18 blocks):
       SyncBlocksFrom(N+1) -- download and verify each block
@@ -274,7 +282,7 @@ No special "recovery mode". Same logic as a fresh node with gap detection.
 
 If a node was offline for 2 hours (~480 blocks), it does NOT replay them:
 
-1. BlockProofs are only stored for the last 18 blocks -- replay is impossible.
+1. Recent block bodies are retained only for the finality window; deep replay is not the sync path.
 2. The node requests a fresh state snapshot + RecursiveProof from peers.
 3. Verifies the RecursiveProof (STARK, ~5 ms). Done.
 4. Overwrites stale local state. Recursive updater continues from here.
@@ -289,11 +297,11 @@ with cumulative chainwork above threshold.
 Our tip: h=120. Competing block at h=115 (parent at h=114) arrives.
   1. FetchHeaders from peer to find common ancestor (h=114)
   2. Compare cumulative chainwork:
-     - Competing chain must have STRICTLY MORE work to reorg
-     - Equal work: keep current chain (tie-break: incumbent wins)
+     - Reorg if competing extra work is strictly greater
+     - If extra work is equal, reorg only if the competing tip height is greater
   3. If reorg:
      - Undo blocks h=120..115 using T_UNDO_LOGS
-     - Apply competing blocks h=115..h=120+ with full ZK verification
+     - Apply competing blocks h=115..h=120+ with full proof verification
      - Recursive proof updater catches up from h=114
 ```
 
@@ -324,8 +332,10 @@ When a node receives a block from the network, it runs these checks in order
 (cheapest first -- fail fast):
 
 **Stage 1: Wire Validation (instant)**
-- Block size <= 512 KB
-- BlockProof size <= 6 MB
+- Block bytes <= 1 MiB
+- BlockProof bytes <= 32 MiB
+- BlockAuthSidecar bytes <= 32 MiB
+- BlockProof + BlockAuthSidecar <= 48 MiB
 - Deserialization succeeds
 - Per-peer rate limit: 40 blocks / 10 seconds
 
@@ -354,19 +364,18 @@ Only for blocks with user transactions (coinbase-only blocks skip this):
 
 | Check | Error | Purpose |
 |-------|-------|---------|
-| proof/header transcript binding | BadProofTranscript | Header commits to this exact `BlockProof` |
+| proof/header transcript binding | BadProofTranscript | Header commits to the canonical `BlockProof` transcript |
+| sidecar/header binding | AuthSidecarRootMismatch | `witness_root` commits to the public Auth sidecar in block order |
 | bucket coverage: every non-coinbase tx appears once in the correct shape bucket | ShapeMismatch | Standard/Sweep binding |
 | SpineGKR / sweep spine: tx_body_hash computation correct | StarkInvalid | TX body integrity |
 | AuthGKR / sweep auth: Address = H_ADDR(secret), AuthTag = H_AUTH(secret, body) | StarkInvalid | Ownership proof |
 | TxLogicAir / SweepTxLogicAir: balance, range, binding | StarkInvalid | TX validity |
-| mandatory BlockStateBindingAir: slot openings vs state MLE | StarkInvalid | State consistency |
-| per-bucket FRI opening: all bucket columns committed correctly | StarkInvalid | Commitment |
+| NativeDelta identity + pre/post segment MLE openings | StateMleOpeningFailed | State consistency under prev/new state roots |
+| per-bucket source-bound FRI opening | StarkInvalid | Commitment/source binding |
 
 **Stage 4: Commit Proven State Delta (`apply_state_delta`)**
 
-`BlockStateBindingAir` already proved the pre-root → post-root transition against
-state MLE openings. `apply_state_delta` therefore commits the proven delta. It does
-not re-run wallet logic or create a second user-transaction acceptance path.
+NativeDelta verification reconstructs ordered per-segment claims from the canonical block body and pre-state, checks the random-point delta identity, and binds pre/post lane values to segment MLE openings under `prev_state_root` and `new_state_root`. `apply_state_delta` therefore commits the proven delta. It does not re-run wallet logic or create a second user-transaction acceptance path.
 
 | Check | Error | Purpose |
 |-------|-------|---------|
@@ -380,9 +389,9 @@ After all 4 stages pass: block is committed atomically to MDBX, then gossiped to
 ### Coinbase-Only Blocks (No User TXs)
 
 Most blocks at low TPS contain only a coinbase transaction. These:
-- Have empty `block_proof_bytes` in gossip
-- Skip ZK verification entirely (no user txs to prove)
-- Are validated by proof/header stub binding, cheap consensus checks, and `apply_state_delta`
+- Have empty `block_proof_bytes` and empty `block_auth_sidecar_bytes` in gossip
+- Skip user-transaction proof verification entirely (no user txs to prove)
+- Are validated by proof/header stub binding, cheap consensus checks, and deterministic `apply_state_delta`
 - `header.proof_transcript_hash` = `STUB_MARKER [1u8; 32]` (prevents an
   adversary from omitting the proof on blocks that DO have user txs)
 
@@ -392,19 +401,18 @@ When a transaction arrives via gossip, BEFORE entering the mempool:
 
 | # | Check | Purpose |
 |---|-------|---------|
-| 0 | Wire size <= 1 MB | DoS prevention |
+| 0 | Wire size <= 512 KiB global and <=384 KiB shape cap | DoS prevention |
 | 1 | Per-peer rate: 50 txs / 10 seconds | Flood prevention |
 | 2 | Fee minimum: base + I/O + occupancy-scaled net-new-state growth | Spam prevention |
 | 3 | Body hash binding (recompute and compare) | Integrity |
 | 4 | Coinbase: must have exactly 1 valid output, fee = 0 | Structure |
-| 5 | Epoch anchor references a known header in last 144 blocks | Freshness |
+| 5 | Epoch anchor references a known header in the bounded anchor window | Freshness |
 | 6 | Nullifier not in nullifier set | Replay prevention |
 | 7 | No slot conflicts with existing mempool txs | Double-spend |
 | 8 | Input slots exist in state with matching value + owner | Liveness |
 | 9 | Output slots are EMPTY in state | Availability |
 
-ZK proof verification (LogicProof) runs ASYNCHRONOUSLY after admission as a
-background task. Invalid proofs are evicted when detected.
+LogicProof verification runs ASYNCHRONOUSLY after admission as a background task. Invalid proofs are evicted when detected.
 
 ### Recursive Proof Verification (On Snapshot Sync)
 
@@ -412,11 +420,13 @@ When receiving a RecursiveProof from a peer during snapshot sync:
 
 | Check | Purpose |
 |-------|---------|
+| proof bytes non-empty and <=64 KiB | DoS prevention |
 | STARK verify passes (RecursiveBlockAir, ~5ms) | Proof validity |
-| proof.state_root == snapshot header state_root | State binding |
-| proof.height == tip - 1 | Height consistency |
-| Optional: chain_hash matches expected (if genesis in window) | Chain integrity |
-| PoW chainwork of snapshot headers >= MIN_SNAPSHOT_CHAINWORK | Eclipse resistance |
+| proof height <= snapshot tip and lag <= FINALITY_DEPTH + 2 | Freshness |
+| proof state root matches the corresponding header root | State binding |
+| manifest segment roots reconstruct the snapshot tip state root | Snapshot binding |
+| chain_hash matches the header-derived chain hash | Chain integrity |
+| PoW chainwork of snapshot headers strictly exceeds MIN_SNAPSHOT_CHAINWORK | Eclipse resistance |
 
 ---
 
@@ -459,7 +469,7 @@ Heartbeat:       700ms
 Mesh:            n=4, n_low=2, n_high=8
 Outbound min:    1 (critical for small networks)
 Max transmit:    2 MB
-Flood publish:   true (for txs)
+Flood publish:   false
 Peer exchange:   enabled
 Dedup:           blake3 content hash
 ```
@@ -469,20 +479,20 @@ Dedup:           blake3 content hash
 | Topic | Message Type | Size |
 |-------|-------------|------|
 | `/noid/{network}/blocks/1` | BlockGossipMsg | 310B compact or <1MB inline |
-| `/noid/{network}/txs/1` | raw TxIntent bytes | shape-dependent; Standard wallet proofs are ~26 KB, sweep proofs are larger |
-| `/noid/{network}/recproofs/1` | RecursiveProofGossipMsg | ~6.5 KB |
+| `/noid/{network}/txs/1` | raw TxIntent bytes | shape-capped at 384 KiB; current wallet bundles are ~214–236 KiB on the reference laptop |
+| `/noid/{network}/recproofs/1` | RecursiveProofGossipMsg | ~38 KB encoded |
 
 ### Block Gossip (Dual Mode)
 
 ```rust
 enum BlockGossipMsg {
-    Compact { height, hash, header_bytes },  // 310 bytes -- triggers pull
-    Inline { height, hash, block_bytes, block_proof_bytes },  // full block
+    Compact { height, hash, header_bytes },  // header only -- triggers pull
+    Inline { height, hash, block_bytes, block_proof_bytes, block_auth_sidecar_bytes },
 }
 ```
 
-- Blocks < 1 MB total (block + proof): inlined in gossip message
-- Blocks >= 1 MB: compact announcement, peers pull via request-response
+- Blocks < 1 MiB total (block + proof + public sidecar): inlined in gossip message
+- Blocks >= 1 MiB: compact announcement, peers pull via request-response
 - Large proof-native user-tx blocks normally use compact announcement + pull
 
 ### Request-Response Protocols
@@ -492,24 +502,38 @@ All use CBOR encoding. Network-isolated protocol IDs prevent cross-network pollu
 | Protocol | Request | Response | Timeout | Max Streams |
 |----------|---------|----------|---------|-------------|
 | `sync/headers/1` | start_height + count (max 512) | BlockHeader bytes | default | default |
-| `sync/blocks/1` | height | block_bytes + block_proof_bytes | 30s | 64 |
+| `sync/block/1` | height | block_bytes + block_proof_bytes + block_auth_sidecar_bytes | 30s | 8 |
 | `sync/proof/1` | (unit) | proof_bytes + tip_header_bytes | 10s | default |
 | `sync/manifest/1` | requester_height | manifest (tip, segments, headers, nullifiers) | 30s | 8 |
-| `sync/segment/1` | segment_id + expected_tip | segment data (~3 MB) | 60s | 16 |
-| `sync/mempool/1` | (unit) | up to 8192 pending txs | 10s | 4 |
+| `sync/segment/1` | segment_id + expected_tip | segment data (~3 MB) | 60s | 8 client in-flight; 2 server encoders |
+| `{protocol_id}/mempool/1` | (unit) | up to 128 pending txs / 16 MiB | 10s | 4 |
 
 ### Wire Size Limits (Enforced, Hard Reject)
 
 ```
-MAX_BLOCK_BYTES:           512 KB
-MAX_BLOCK_PROOF_BYTES:       6 MB
-MAX_SEGMENT_BYTES:           8 MB
-MAX_RECURSIVE_PROOF_BYTES:  64 KB
-MAX_HEADER_BYTES:          512 B
-MAX_TX_WIRE_SIZE:           2 MB
-MAX_RECENT_HEADERS:        512
-MAX_SYNC_TXS:            8,192
+MAX_TX_INTENT_BYTES_GLOBAL:          512 KiB
+MAX_STANDARD_TX_INTENT_BYTES:        384 KiB
+MAX_SWEEP_TX_INTENT_BYTES:           384 KiB
+MAX_MEMPOOL_TXS:                     1024
+MAX_MEMPOOL_BYTES:                   384 MiB
+MAX_MEMPOOL_SYNC_TXS:                128
+MAX_MEMPOOL_SYNC_BYTES:              16 MiB
+MAX_BLOCK_BYTES:                     1 MiB
+MAX_BLOCK_PROOF_BYTES:               32 MiB
+MAX_BLOCK_AUTH_SIDECAR_BYTES:        32 MiB
+MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES:  48 MiB
+GOSSIP_MAX_TRANSMIT_BYTES:           2 MiB
+INLINE_BLOCK_GOSSIP_THRESHOLD:       1 MiB
+MAX_RECURSIVE_PROOF_BYTES:           64 KiB
+MAX_HEADER_BYTES:                    512 B
+MAX_SEGMENT_BYTES:                   8 MiB
+MAX_SNAPSHOT_MANIFEST_SEGMENTS:      65,536
+MAX_INFLIGHT_SEGMENTS:               8
+MAX_ORPHAN_POOL:                     36
+MAX_ORPHAN_POOL_BYTES:               128 MiB
 ```
+
+Snapshot segment memory is bounded by `MAX_INFLIGHT_SEGMENTS × MAX_SEGMENT_BYTES = 64 MiB` on the requesting side. There is no separate 1 GiB snapshot-total cap: the authenticated manifest may describe any sparse subset up to `MAX_SNAPSHOT_MANIFEST_SEGMENTS = 65,536` segment IDs, and each accepted segment is independently size-limited, decoded exactly, root-checked, and applied to MDBX.
 
 ---
 
@@ -525,20 +549,20 @@ MAX_SYNC_TXS:            8,192
 
 2. Parallel execution:
    - Thread A: PoW search (Blake3, nonce space 2^128, ~15s target)
-   - Thread B: prove_block (shape buckets + BlockStateBindingAir + per-bucket FRI)
-     ZK proving time depends on tx count and shape mix; proof-native 100-tx Standard blocks are ~38s on the reference laptop
+   - Thread B: prove_block (shape buckets + NativeDelta state openings + per-bucket source-bound FRI)
+     BlockProof generation time depends on tx count and shape mix. On the 2023 Intel Core i7-1365U reference laptop, 100 Standard4x8 txs prove in ~14.26s and verify in ~4.10s; proof + sidecar is ~15.73 MB.
 
 3. Both complete:
    - Seal header (embed proof_transcript_hash, witness_root)
    - Commit to MDBX (state transition applied)
-   - Store BlockProof in T_BLOCK_PROOFS
+   - Store BlockProof in T_BLOCK_PROOFS and public Auth sidecar in T_BLOCK_AUTH_SIDECARS
 
 4. Gossip immediately:
    - BlockGossipMsg (inline or compact depending on size)
    - Peers receive, verify, apply
 
-5. Async (~2s later):
-   - prove_recursive_step(block_proof) -> new RecursiveProof
+5. Background recursive updater:
+   - when the block is finalized, prove_recursive_step(block_proof) -> new RecursiveProof
    - Store in T_RECURSIVE_PROOF
    - Gossip RecursiveProofGossipMsg
 ```
@@ -547,7 +571,7 @@ MAX_SYNC_TXS:            8,192
 
 ```
 1. Receive BlockGossipMsg
-   - Compact: request full block via sync/blocks/1
+   - Compact: request full block via sync/block/1
    - Inline: proceed directly
 
 2. Rate limit check (40/peer/10s)
@@ -561,7 +585,7 @@ MAX_SYNC_TXS:            8,192
 
 4. Atomic MDBX commit:
    - Update state (segments, owner index)
-   - Store header, recent block, block proof, undo log
+   - Store header, recent block, block proof, public Auth sidecar, undo log
    - Prune old entries beyond retention windows
    - Insert nullifiers, update tx_index
 
@@ -592,15 +616,12 @@ Loop:
     witness = block_proof_to_replay_witness(block_proof)
 
   new_proof = prove_recursive_step(witness, header, current_proof.acc)
-    -- ~2s on 8 cores
 
   store new_proof in T_RECURSIVE_PROOF
   gossip RecursiveProofGossipMsg { height: next, tip_hash, proof_bytes }
 ```
 
-Every node eventually produces the same recursive proof as the miner, because
-every node stores real BlockProof bytes received from gossip. The recursive
-proof is NOT a miner privilege -- it is a network-wide property.
+Every node eventually produces the same recursive proof as the miner for finalized history, because every node stores real BlockProof bytes received from gossip until recursive folding consumes them. The recursive proof is not a miner privilege; it is a network-wide property.
 
 ---
 
@@ -611,14 +632,14 @@ Snapshot sync is the only "trust point". Defenses:
 | Defense | How It Works |
 |---------|-------------|
 | Multi-peer manifest | Query up to 3 peers, select best by height |
-| PoW chainwork threshold | Snapshot headers must have cumulative work >= MIN_SNAPSHOT_CHAINWORK |
+| PoW chainwork threshold | Snapshot headers must have cumulative work strictly above MIN_SNAPSHOT_CHAINWORK |
 | STARK unforgeable | RecursiveProof verification at ~2^-120 soundness |
-| State root pinned in proof | proof.state_root must match snapshot headers |
+| State root pinned in proof | proof state root must match the corresponding stored header root |
+| Manifest state-root binding | Sparse segment-root table must reconstruct the snapshot tip state_root |
 | Header PoW verified | Each header in the snapshot has valid Blake3 PoW |
 
 Even if ALL peers are adversarial, they cannot forge a valid snapshot: producing
-a RecursiveProof for a fake state requires breaking ZK hardness; producing headers
-with sufficient chainwork requires actually performing the PoW.
+a RecursiveProof for a fake state requires breaking the transparent proof system's soundness; producing headers with sufficient chainwork requires actually performing the PoW.
 
 ---
 
@@ -630,7 +651,7 @@ with sufficient chainwork requires actually performing the PoW.
 | TXs per peer | 50 | 10s | Prevent tx spam |
 | FetchHeaders | 1 outstanding | per peer | Prevent header flood |
 | Orphan pool | 36 blocks max | evict lowest | Bound memory |
-| Mempool | ANCHOR_DEPTH x BLOCK_MAX_TXS | rolling | Bound by design |
+| Mempool | 1024 tx / 384 MiB | rolling | Bound RAM and relay work |
 
 ---
 
@@ -641,8 +662,8 @@ with sufficient chainwork requires actually performing the PoW.
 | `BLOCK_TIME` | 15 seconds | Target inter-block interval |
 | `EPOCH_LENGTH` | 6 blocks | ASERT difficulty adjustment epoch |
 | `FINALITY_DEPTH` | 18 blocks | Max reorg depth; undo/proof retention |
-| `ANCHOR_DEPTH` | 144 blocks (~36 min) | TX validity window; nullifier retention |
-| `BLOCK_MAX_TXS` | 256 | Max user transactions per block |
+| `ANCHOR_DEPTH` | 144 depth parameter (~36 min) | TX validity window; consensus anchor heights are inclusive up to 145 recent past headers |
+| `BLOCK_MAX_TXS` | 256 | Max transactions per block, including coinbase when present |
 | `Standard4x8` | 4 inputs / 8 outputs | Default payment shape |
 | `Sweep25x2` | 25 inputs / 2 outputs | Sweep/consolidation shape |
 | `LOG_SLOTS_GENESIS` | 24 (16.7M slots) | Initial state capacity |
@@ -675,14 +696,11 @@ Offset  Size  Field
 144      16   nonce                  Blake3 PoW nonce (128-bit)
 160      32   difficulty_target      ASERT target (256-bit LE)
 192      32   proof_transcript_hash  Fiat-Shamir hash of BlockProof
-224      32   witness_root           Binius-packed DA payload root
+224      32   witness_root           BlockAuthSidecar root
 256       4   log_slots              log2(state capacity)
 260       8   active_slot_count      live UTXOs after this block
 268       8   alloc_counter          allocator PRNG seed after this block
                                      Total: 276 bytes
 ```
 
-`proof_transcript_hash` is non-zero for blocks with user txs (hash of the ZK
-proof that validated them) and `STUB_MARKER = [1u8; 32]` for coinbase-only
-blocks. This prevents an adversary from stripping the proof from a block that
-has user transactions and claiming it was coinbase-only.
+For user-transaction blocks, `proof_transcript_hash = block_recursive_claim_hash(BlockProof)` and `witness_root = block_auth_sidecar_root(block, sidecar)`. Coinbase-only blocks use `proof_transcript_hash = STUB_MARKER = [1u8; 32]` with empty proof and sidecar bytes. This prevents an adversary from stripping the proof from a block that has user transactions and claiming it was coinbase-only.

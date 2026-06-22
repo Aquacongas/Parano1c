@@ -42,7 +42,7 @@ pub enum SubmitError {
     #[error("logic proof too large: {actual} bytes (max {max})")]
     ProofTooLarge { actual: usize, max: usize },
 
-    /// ZK logic proof verification failed.
+    /// LogicProof verification failed.
     #[error("invalid logic proof: {0}")]
     InvalidProof(String),
 

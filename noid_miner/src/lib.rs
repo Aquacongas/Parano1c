@@ -3,7 +3,7 @@
 
 //! # noid_miner — Block Production Engine
 //!
-//! Implements the parallel PoW + Prove pipeline.
+//! Implements the parallel PoW + BlockProof generation pipeline.
 //!
 //! ## Pipeline
 //!
@@ -12,12 +12,12 @@
 //!  │                   Block Production Loop                    │
 //!  │                                                            │
 //!  │  1. Build template (txs from mempool + coinbase)           │
-//!  │     ├─ Empty block template first (instant, no ZK)         │
+//!  │     ├─ Empty block template first (marker proof only)      │
 //!  │     └─ Full template with txs (~1s state transition)       │
 //!  │                                                            │
 //!  │  2. Parallel execution:                                    │
 //!  │     ┌──────────────────┐   ┌──────────────────────────┐   │
-//!  │     │  PoW Search      │   │  ZK Block Prove          │   │
+//!  │     │  PoW Search      │   │  BlockProof generation   │   │
 //!  │     │  Blake3(core||n) │   │  prove_block(witnesses)  │   │
 //!  │     │  < target        │   │  ~10s on 8 cores         │   │
 //!  │     └───────┬──────────┘   └──────────┬───────────────┘   │

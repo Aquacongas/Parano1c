@@ -402,7 +402,7 @@ impl TxBodySpineComposite {
             let [oh, ol] = input.owner.as_fields();
             cols[COL_OWNER_HI - TXV_COL_OFFSET][i] = oh;
             cols[COL_OWNER_LO - TXV_COL_OFFSET][i] = ol;
-            // Legacy SpendSecretHi/SpendSecretLo slots intentionally remain zero.
+            // SpendSecretHi/SpendSecretLo slots intentionally remain zero.
             // Authorization is handled by AuthGKR; the public tx trace must never
             // commit the user's spend_secret limbs.
             let [th, tl] = input.auth_tag.as_fields();

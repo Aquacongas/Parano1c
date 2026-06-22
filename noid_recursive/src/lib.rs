@@ -5,7 +5,7 @@
 //!
 //! Core components:
 //! - `ChainAccumulator`: rolling hash commitment to the entire chain history.
-//! - `RecursiveBlockProof`: ~11 KB constant-size proof covering all blocks.
+//! - `RecursiveBlockProof`: ~38 KB encoded constant-size proof covering all blocks.
 //! - `prove_recursive_step`: build one recursive proof step.
 //! - `verify_tip`: verify the entire chain in O(1) ≈ 5 ms.
 

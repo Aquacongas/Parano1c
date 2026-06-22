@@ -14,7 +14,6 @@
 use noid_core::{Block128, TowerField};
 use noid_fri_binius::compact_fri::CompactEvalProof;
 use noid_fri_binius::MerkleCap;
-use noid_stark::interleaved::AlgebraicStarkProof;
 
 /// All data from a `BlockProof` needed for algebraic in-circuit verification.
 ///
@@ -30,9 +29,6 @@ pub struct BlockReplayWitness {
     /// the recursive circuit).  Treated as raw bytes — the recursive circuit
     /// does not verify cap generation (security via `chain_hash`).
     pub cap: MerkleCap,
-    /// Algebraic STARK transcripts for state-binding AIRs (one per touched
-    /// segment).  Empty when there is no state transition.
-    pub state_binding_algebraics: Vec<AlgebraicStarkProof>,
     /// Column evaluations at the per-tx terminal points `r''_k`
     /// (flat layout across all transactions and block-spine slices).
     pub block_col_openings: Vec<Block128>,
@@ -57,10 +53,10 @@ pub struct BlockReplayWitness {
     /// Passed into the recursive STARK via `extra_transcript` to bind the
     /// fold-check to the real value rather than the placeholder ZERO.
     pub block_initial_claim: Block128,
-    /// Canonical claim folded into the chain accumulator. For legacy pure-standard
-    /// blocks this may equal a field projection of the canonical block proof
-    /// transcript hash, while `block_initial_claim` remains the actual sumcheck
-    /// target checked by `RecursiveBlockAir`.
+    /// Canonical claim folded into the chain accumulator. For bucketized blocks
+    /// this is a field projection of the canonical block proof transcript hash,
+    /// while `block_initial_claim` remains the actual sumcheck target checked by
+    /// `RecursiveBlockAir`.
     pub chain_claim: Block128,
 }
 
@@ -72,7 +68,6 @@ impl BlockReplayWitness {
     /// `noid_block::BlockProof` (which would create a cyclic dependency).
     pub fn from_parts(
         cap: MerkleCap,
-        state_binding_algebraics: Vec<AlgebraicStarkProof>,
         block_col_openings: Vec<Block128>,
         block_multipoint_rounds: Vec<Vec<Block128>>,
         block_multipoint_challenges: Vec<Block128>,
@@ -83,7 +78,6 @@ impl BlockReplayWitness {
     ) -> Self {
         Self::from_two_bucket_parts(
             cap,
-            state_binding_algebraics,
             block_col_openings,
             block_multipoint_rounds,
             block_multipoint_challenges,
@@ -103,7 +97,6 @@ impl BlockReplayWitness {
     #[allow(clippy::too_many_arguments)]
     pub fn from_two_bucket_parts(
         cap: MerkleCap,
-        state_binding_algebraics: Vec<AlgebraicStarkProof>,
         block_col_openings: Vec<Block128>,
         block_multipoint_rounds: Vec<Vec<Block128>>,
         block_multipoint_challenges: Vec<Block128>,
@@ -117,7 +110,6 @@ impl BlockReplayWitness {
     ) -> Self {
         Self {
             cap,
-            state_binding_algebraics,
             block_col_openings,
             block_multipoint_rounds,
             block_multipoint_challenges,
@@ -135,7 +127,6 @@ impl BlockReplayWitness {
 /// Convenience alias used in integration code.
 pub fn extract_block_replay_witness_parts(
     cap: MerkleCap,
-    state_binding_algebraics: Vec<AlgebraicStarkProof>,
     block_col_openings: Vec<Block128>,
     block_multipoint_rounds: Vec<Vec<Block128>>,
     block_multipoint_challenges: Vec<Block128>,
@@ -146,7 +137,6 @@ pub fn extract_block_replay_witness_parts(
 ) -> BlockReplayWitness {
     BlockReplayWitness::from_parts(
         cap,
-        state_binding_algebraics,
         block_col_openings,
         block_multipoint_rounds,
         block_multipoint_challenges,

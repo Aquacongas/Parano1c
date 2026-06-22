@@ -1,8 +1,8 @@
-# Paranoid Zero: System Protocol
+# PARANOID: System Protocol
 
 ## Abstract
 
-Paranoid Zero is a UTXO-based blockchain where every block carries a zero-knowledge proof of its validity. Nodes verify ZK proofs instead of re-executing transactions. The entire chain history compresses into a single 6.5 KB recursive STARK, verifiable in ~5 ms.
+Paranoid is a UTXO-based statechain where every user-transaction block carries a validity proof. Nodes verify proof objects instead of re-executing wallet logic. The entire chain history compresses into a single ~38 KB encoded recursive STARK, verifiable in ~5 ms.
 
 This document specifies the complete protocol: all layers, their interfaces, and the data flow from wallet to finalized block.
 
@@ -19,10 +19,10 @@ This document specifies the complete protocol: all layers, their interfaces, and
 │  Blake3 PoW, ASERT difficulty, fork choice by cumulative chainwork.      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Layer 3: Block (Aggregation + State Binding)                           │
-│  Shape-specific tx buckets, per-bucket FRI, one canonical BlockProof.    │
-│  BlockStateBindingAir proves user-tx state transitions against state MLE.│
+│  Shape-specific tx buckets, source-bound FRI, canonical BlockProof.      │
+│  NativeDelta binds block state transitions to pre/post segment MLEs.      │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  Layer 2: Transaction (ZK Proof)                                        │
+│  Layer 2: Transaction (LogicProof)                                      │
 │  Per-tx: FROST-GKR Kill-Shot (Spine + Auth) + TxLogicAir STARK.         │
 │  Stateless. Produced by wallet. Valid until epoch_anchor expires.         │
 ├─────────────────────────────────────────────────────────────────────────┤
@@ -103,7 +103,7 @@ Triggered when `median(active_slot_count, last 18 blocks) >= 75% * capacity`:
 
 ### 3.4 State Root Binding
 
-The state root appears in the block header (`offset 32, 32 bytes`). It commits the node to the exact UTXO state after applying all transactions in the block. Any inconsistency between the committed root and the actual state is detected by `BlockStateBindingAir` (Layer 3).
+The state root appears in the block header (`offset 32, 32 bytes`). It commits the node to the exact UTXO state after applying all transactions in the block. Any inconsistency between the committed root and the actual state transition is detected by NativeDelta state verification: verifier-reconstructed per-segment claims, the random-point delta identity, and source-bound pre/post segment MLE openings under the parent and new state roots.
 
 ---
 
@@ -116,12 +116,12 @@ A transaction proof is **stateless**: produced by the wallet without knowledge o
 ```
 TxIntent = {
     shape:         TxShape        -- Standard4x8 or Sweep25x2
-    epoch_anchor:  [u8; 32]      -- block hash within last 144 blocks
+    epoch_anchor:  [u8; 32]      -- recent block hash within ANCHOR_DEPTH window
     fee:           u64           -- fee in μNOID
     inputs:        [TxInput; shape max]
     outputs:       [TxOutput; shape max]
     is_coinbase:   bool
-    logic_proof:   LogicProof    -- shape-specific ZK proof bundle
+    logic_proof:   LogicProof    -- shape-specific validity proof bundle
 }
 
 TxInput = {
@@ -206,7 +206,7 @@ The `extra_transcript` hook binds GKR proofs to the STARK: any byte-level tamper
 
 All same-shape transaction traces inside one non-empty block bucket share one per-bucket `InterleavedCommitment`: one Merkle cap covers all columns of that bucket. Standard and `Sweep25x2` transactions use separate buckets because their AIR shapes differ. Each bucket cap is absorbed into its Fiat-Shamir channel before any challenge, so there is no per-transaction commitment that could be selectively forged inside the bucket.
 
-The canonical `BlockProof` binds all non-empty bucket proofs together with the common `BlockStateBindingAir` proof.
+The canonical `BlockProof` binds all non-empty bucket proofs together with common NativeDelta state openings: one pre-state and one post-state `SegmentMleOpening` per dirty segment. The block header separately binds the public Auth sidecar through `witness_root`.
 
 ### 5.2 Deferred FRI (Per-Bucket Opening)
 
@@ -214,25 +214,31 @@ Instead of N independent FRI openings (O(N × FRI_cost)), each bucket prover run
 
 **Proof size scales as O(log N)** in the FRI layer per non-empty bucket, not O(N × per-tx FRI).
 
-### 5.3 BlockStateBindingAir
+### 5.3 NativeDelta state binding
 
-This AIR proves that the slot-state transitions claimed by transactions are consistent with the actual state MLE:
+For every dirty state segment, the verifier reconstructs spend/mint claims from the canonical block body and the pre-block segmented state. It derives a segment evaluation point and batching challenge from the transition endpoints:
 
-| Terminal constraint | What it proves |
-|--------------------|---------------|
-| Gamma-RLC terminal | Accumulated pre-state openings match the verifier-supplied batched claims from Standard/Sweep transaction AIR outputs |
-| Delta-acc terminal | Net state MLE change equals `prev_opening ⊕ new_opening` from externally-verified state roots |
+```text
+(r_seg, gamma_seg) = FS("STATE_DELTA_EVAL", prev_state_root, new_state_root, seg_id, state_binding_index, n_tx, eff_log)
+```
 
-Both terminal values are **verifier-hardcoded** from the block header's state root fields. Max constraint degree: 3. Zero-check soundness: `44/2^128`.
+The checked identity is:
 
-For user-transaction blocks this proof is mandatory production validity, not an optimization layer and not an alternate mode.
+```text
+post_lane(r_seg) = pre_lane(r_seg) + Σ_i eq(r_seg, local_slot_i) · delta_i
+```
+
+for the three segment lanes `[value, owner_hi, owner_lo]`. The proof then opens the pre-state segment MLE under `prev_state_root` and the post-state segment MLE under `new_state_root`. Both openings carry the same `seg_id`, the same `eval_point`, a compact mixed opening for the three lanes, and a Poseidon2b Merkle path from the segment root to the block state root.
+
+For user-transaction blocks this NativeDelta check is mandatory production validity. Coinbase-only blocks have no user claims and use the explicit empty-proof/stub path.
 
 ### 5.4 Claim Bridge
 
-`TxLogicAir` and `SweepTxLogicAir` produce claimed slot indices and values. `BlockStateBindingAir` takes the aggregated claims as public inputs and verifies each claim against the actual state MLE. Neither layer can lie independently:
+`TxLogicAir` and `SweepTxLogicAir` produce public claimed slot indices, values, owners, body hashes, and claim commitments. NativeDelta reconstructs the ordered state action surface from those public block bodies and the pre-state. Neither layer can lie independently:
 
-- transaction AIRs are stateless (cannot touch state)
-- `BlockStateBindingAir` has no secret (cannot forge ownership)
+- transaction AIRs are stateless and cannot mutate chain state;
+- NativeDelta has no wallet secret and cannot forge ownership;
+- any mismatch between public transaction claims and pre-state reads is rejected before the post-state opening is accepted.
 
 ---
 
@@ -258,7 +264,7 @@ Properties: stateless (computable from any header + anchor), immune to timewarp,
 
 ### 6.3 Fork Choice
 
-Heaviest chain by cumulative PoW work. Ties: incumbent wins.
+Heaviest chain by cumulative PoW work. A competing fork reorgs the incumbent only if its extra work is strictly greater, or if extra work is equal and the competing tip height is greater.
 
 ### 6.4 Finality
 
@@ -269,10 +275,16 @@ Heaviest chain by cumulative PoW work. Ties: incumbent wins.
 
 ### 6.5 Transaction Validity Window
 
-`ANCHOR_DEPTH = 144` blocks (~36 minutes). A transaction's `epoch_anchor` must reference a header hash within this window. This provides:
+`ANCHOR_DEPTH = 144` (~36 minutes) is the anchor-depth parameter. For block validation, accepted anchor heights are:
 
-- **Replay protection without permanent storage:** after 144 blocks, the anchor expires → replay structurally impossible
-- **Nullifier pruning:** nullifiers (tx_body_hash values) only need to cover the 144-block window
+```text
+[block_height - ANCHOR_DEPTH - 1, block_height - 1]
+```
+
+with saturation near genesis, so the consensus window contains up to 145 recent past headers. This provides:
+
+- **Replay protection without permanent storage:** after the anchor window expires, replay is structurally impossible
+- **Nullifier pruning:** nullifiers (`tx_body_hash` values) only need to cover the bounded anchor window
 
 ---
 
@@ -314,14 +326,14 @@ The recursive step distinguishes:
 - `chain_claim`: canonical block proof claim folded into `chain_hash`.
 
 These values are bound at two levels:
-1. **STARK:** `[block_initial_claim, rec_initial_claim, chain_claim]` is absorbed into `extra_transcript` → forks all challenges
+1. **STARK:** `[block_initial_claim, block_secondary_initial_claim, rec_initial_claim, chain_claim]` is absorbed into `extra_transcript` → forks all challenges
 2. **Chain/header:** `verify_recursive_step` checks `chain_claim` against `proof_transcript_hash` for non-stub blocks, recomputes `chain_hash`, and asserts equality
 
 ### 7.3 Properties
 
-- **Size:** ~6.5 KB constant (independent of chain length)
+- **Size:** ~38 KB encoded constant (independent of chain length)
 - **Verification:** ~5 ms (one STARK verify)
-- **Coverage:** proves the entire chain from genesis to `height - FINALITY_DEPTH`
+- **Coverage:** a recursive proof at height `h` proves the chain from genesis through block `h`; healthy nodes target finalized history near `tip - FINALITY_DEPTH`
 - **Unforgeable:** soundness ~2^-123 (RecursiveBlockAir zero-check)
 
 ---
@@ -358,7 +370,7 @@ Wallet                    Mempool              Miner                   Network
   │                         │                    │                       │
   │                         │                    │ 7. Parallel:          │
   │                         │                    │    PoW (Blake3 nonce) │
-  │                         │                    │    ZK (prove_block)   │
+  │                         │                    │    prove_block        │
   │                         │                    │                       │
   │                         │                    │ 8. Seal header        │
   │                         │                    │    (state_root,       │
@@ -375,19 +387,20 @@ Wallet                    Mempool              Miner                   Network
   │                         │                    │                       │
   │                         │                    │ 11. Async:            │
   │                         │                    │     prove_recursive   │
-  │                         │                    │     → 6.5 KB proof    │
+  │                         │                    │     → ~38 KB proof    │
 ```
 
 ### 8.2 Timing
 
 | Step | Duration | Bottleneck |
 |------|----------|-----------|
-| Wallet prove (`Standard4x8`) | ~135 ms | GKR unified sumcheck |
+| Wallet prove (`Standard4x8`, 4-in/8-out) | ~89.41 ms | wallet proof generation |
+| Wallet verify (`Standard4x8`, 4-in/8-out) | ~24.60 ms | wallet proof verification |
 | Mempool admission | <1 ms native checks + async proof verify | Slot lookups / proof workers |
-| Block prove (`Standard4x8`, 100 txs, proof-native) | ~38 s | Bucket proof + `BlockStateBindingAir` |
-| Block verify (`Standard4x8`, 100 txs, proof-native) | ~8.6 s | Bucket verify + `BlockStateBindingAir` |
+| Block prove (`Standard4x8`, 100 txs, proof-native) | ~14.26 s | bucket proof + NativeDelta openings |
+| Block verify (`Standard4x8`, 100 txs, proof-native) | ~4.10 s | bucket verify + NativeDelta openings |
 | PoW (target 15s) | ~15 s | Blake3 nonce search |
-| Recursive step | ~2 s | RecursiveBlockAir prove |
+| Recursive proof verify | ~5 ms | RecursiveBlockAir verify |
 
 ---
 
@@ -405,8 +418,8 @@ Offset  Size  Field                    Purpose
 112      32   miner_address            Coinbase recipient (32 bytes)
 144      16   nonce                    Blake3 PoW nonce (128-bit LE)
 160      32   difficulty_target        ASERT target (256-bit LE)
-192      32   proof_transcript_hash    Fiat-Shamir hash of BlockProof
-224      32   witness_root             Binius-packed DA payload root
+192      32   proof_transcript_hash    canonical BlockProof claim hash
+224      32   witness_root             BlockAuthSidecar root
 256       4   log_slots                log2(state capacity)
 260       8   active_slot_count        Live UTXOs after this block
 268       8   alloc_counter            Allocator PRNG seed after this block
@@ -427,7 +440,7 @@ The `tx_root` in the header is the Poseidon2b Merkle root over all `tx_body_hash
 ### 9.3 Coinbase-Only Blocks
 
 Blocks with no user transactions:
-- Have empty `block_proof_bytes`
+- Have empty `block_proof_bytes` and empty `block_auth_sidecar_bytes`
 - `proof_transcript_hash = STUB_MARKER = [1u8; 32]`
 - Skip user proof verification because there are no user slot claims to bind
 - Still pass proof/header stub binding, cheap consensus checks, and deterministic coinbase `apply_state_delta`
@@ -474,7 +487,7 @@ ParanoidReceipt = {
 | `noid_fri` | 0-2 | Generic FRI protocol: commit, prove, verify |
 | `noid_fri_binius` | 2-3 | Compact FRI, interleaved commitment, mixed opening |
 | `noid_gkr` | 2 | FROST-GKR Kill-Shot: spine + auth + batch-eval |
-| `noid_air` | 2-3 | AIR definitions: TxLogicAir, BlockStateBindingAir, gates |
+| `noid_air` | 2-3 | AIR definitions: TxLogicAir, SweepTxLogicAir, recursive/helper gates |
 | `noid_stark` | 2-3 | STARK prover/verifier, interleaved composition |
 | `noid_tx` | 2 | Transaction types, wire format, body_hash, claims |
 | `noid_block` | 3 | Block validation, witness builder |
@@ -492,13 +505,13 @@ ParanoidReceipt = {
 
 These properties hold at all times for a correct node:
 
-1. **State root binding.** The stored state root equals the Poseidon2b Merkle root over all segment FRI roots. Verified by `BlockStateBindingAir` for every user-transaction block; coinbase-only blocks have no user slot claims and use the canonical stub path plus deterministic coinbase delta.
+1. **State root binding.** The stored state root equals the Poseidon2b Merkle root over all segment FRI roots. Verified for user-transaction blocks by NativeDelta state-delta identity plus source-bound pre/post segment MLE openings; coinbase-only blocks have no user slot claims and use the canonical stub path plus deterministic coinbase delta.
 
-2. **Recursive proof covers finalized history.** `recursive_proof.height >= tip - FINALITY_DEPTH`. Proves every block from genesis to that height satisfies all ZK constraints.
+2. **Recursive proof covers finalized history.** A stored recursive proof at height `h` proves every block from genesis through `h`. Snapshot serving accepts only proofs whose lag from the snapshot tip is bounded by `FINALITY_DEPTH + 2`.
 
 3. **No double-spend within anchor window.** Nullifier set covers all `tx_body_hash` values in the last `ANCHOR_DEPTH` blocks. After expiry, structural replay protection (anchor check) takes over.
 
-4. **Single transcript.** Every proof (transaction, block, recursive) is bound to a single `Poseidon2bChannel`. No forked transcripts exist anywhere in the system.
+4. **Domain-separated transcripts.** Wallet proofs use domain-separated Fiat-Shamir transcripts. Block proving uses per-tx algebraic transcripts seeded by the common bucket commitment and tx index, then Merkle-reduces those transcript digests into the block multipoint channel. Recursive proofs bind the canonical block claim into the chain accumulator.
 
 5. **Stateless transaction validity.** A valid `LogicProof` remains valid across block boundaries until its `epoch_anchor` expires. No re-proving needed.
 
@@ -506,4 +519,4 @@ These properties hold at all times for a correct node:
 
 ---
 
-*Cross-references: [Security Model](security.md) for formal proofs. [Cryptography](cryptography.md) for the ZK stack. [Network](network.md) for P2P protocol. [CLI](cli.md) for operations.*
+*Cross-references: [Security Model](security.md) for formal proofs. [Cryptography](cryptography.md) for the proof stack. [Network](network.md) for P2P protocol. [CLI](cli.md) for operations.*

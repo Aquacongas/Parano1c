@@ -19,6 +19,7 @@ noid_chain = { path = "../noid_chain" }
 noid_recursive = { path = "../noid_recursive" }
 rayon = "1.10"
 blake3 = "1"
+bincode = "1"
 
 [[bench]]
 name = "stark_report"

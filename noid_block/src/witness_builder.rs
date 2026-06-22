@@ -532,7 +532,6 @@ pub enum ReplayWitnessError {
 /// | BlockReplayWitness field      | BlockProof source                                      |
 /// |-------------------------------|--------------------------------------------------------|
 /// | `cap`                         | primary bucket `commitment.cap`                        |
-/// | `state_binding_algebraics`    | `proof.state_binding_algebraics`                       |
 /// | `block_col_openings`          | primary bucket `block_col_openings`                    |
 /// | `block_multipoint_rounds`     | primary bucket `block_multipoint_rounds`               |
 /// | `block_multipoint_challenges` | primary bucket `block_multipoint_challenges`           |
@@ -548,7 +547,6 @@ pub fn block_proof_to_replay_witness(
         (Some(standard), Some(sweep)) => {
             Ok(noid_recursive::BlockReplayWitness::from_two_bucket_parts(
                 standard.commitment.cap.clone(),
-                proof.state_binding_algebraics.clone(),
                 standard.block_col_openings.clone(),
                 standard.block_multipoint_rounds.clone(),
                 standard.block_multipoint_challenges.clone(),
@@ -563,7 +561,6 @@ pub fn block_proof_to_replay_witness(
         }
         (Some(bucket), None) => Ok(noid_recursive::BlockReplayWitness::from_parts(
             bucket.commitment.cap.clone(),
-            proof.state_binding_algebraics.clone(),
             bucket.block_col_openings.clone(),
             bucket.block_multipoint_rounds.clone(),
             bucket.block_multipoint_challenges.clone(),
@@ -574,7 +571,6 @@ pub fn block_proof_to_replay_witness(
         )),
         (None, Some(bucket)) => Ok(noid_recursive::BlockReplayWitness::from_parts(
             bucket.commitment.cap.clone(),
-            proof.state_binding_algebraics.clone(),
             bucket.block_col_openings.clone(),
             bucket.block_multipoint_rounds.clone(),
             bucket.block_multipoint_challenges.clone(),

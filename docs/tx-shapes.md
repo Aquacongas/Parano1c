@@ -2,7 +2,7 @@
 
 Paranoid transactions are fixed-shape proof objects. Every transaction carries an explicit `TxShape` so wallets, mempools, miners, block provers, verifiers, and recursive replay all dispatch to the same circuit shape.
 
-The production block format is singular: shape-specific transaction buckets plus one common `BlockStateBindingAir` proof for the whole user-transaction block.
+The production block format is singular: shape-specific transaction buckets plus common NativeDelta state openings for the whole user-transaction block, with public Auth proofs carried in a header-bound `BlockAuthSidecar`.
 
 ## Current production status
 
@@ -10,7 +10,7 @@ The production block format is singular: shape-specific transaction buckets plus
 
 `Sweep25x2` is the large-input payment/consolidation shape and is also supported end-to-end: wallet proof generation, mempool admission, miner selection, bucketized block inclusion, mixed Standard/Sweep blocks, recursive replay, restart, reorg, and external template/submit flows.
 
-Live validation has covered Standard-only, Sweep-only, and mixed Standard/Sweep blocks on real release nodes. The next phase is optimization and cap tuning, not a second production validation path.
+Live validation covers Standard-only, Sweep-only, and mixed Standard/Sweep blocks on release nodes.
 
 ## Shapes
 
@@ -88,43 +88,54 @@ Implemented crypto pieces:
 Implemented block/recursive pieces:
 
 - block proof bucket dispatch by `TxShape` for standard, sweep-only, and mixed Standard/Sweep blocks;
-- real sweep bucket aggregation transcript: per-bucket commitment, per-tx algebraic STARKs, bucket multipoint sumcheck, and mixed FRI opening;
+- real sweep bucket aggregation transcript: per-bucket commitment, per-tx algebraic STARKs, bucket multipoint sumcheck, column-axis terminal compression, and source-bound mixed FRI opening;
+- common NativeDelta state binding: verifier-reconstructed state claims plus pre/post segment MLE openings;
+- public `BlockAuthSidecar` binding through `header.witness_root`;
 - recursive replay witness extraction for standard-only, sweep-only, and mixed blocks, with separate primary/secondary bucket lanes for mixed replay.
 
 ## Canonical BlockProof format
 
-The production block proof format is bucketized `BlockProof`:
+The production-valid `BlockProof` surface is bucketized:
 
 ```rust
 pub struct BlockProof {
     pub meta: BlockPublicMeta,
     pub standard_bucket: Option<StandardBucketProof>,
     pub sweep_bucket: Option<SweepBucketProof>,
-    pub state_binding: BlockStateBindingProof,
+    pub pre_state_openings: Vec<SegmentMleOpening>,
+    pub post_state_openings: Vec<SegmentMleOpening>,
+}
+
+pub struct BlockAuthSidecar {
+    pub tx_auth: Vec<BlockTxAuthProof>,
 }
 ```
 
-The optional fields mean “bucket absent because this shape has no transactions in this block”. They do not mean “optional validation”. For every non-coinbase transaction in the block, exactly one matching shape bucket must be present and valid. For every user-transaction block, `state_binding` is mandatory.
+The optional bucket fields mean “bucket absent because this shape has no transactions in this block”. They do not mean “optional validation”. For every non-coinbase transaction in the block, exactly one matching shape bucket must be present and valid. For every dirty state segment in a user-transaction block, matching pre/post `SegmentMleOpening`s are mandatory. The public Auth sidecar has one entry per non-coinbase transaction in canonical block order and is bound by `header.witness_root`.
 
 Standard-only blocks are represented as:
 
 ```text
-standard_bucket = Some(...)
-sweep_bucket    = None
-state_binding   = present
+standard_bucket      = Some(...)
+sweep_bucket         = None
+pre_state_openings   = one per dirty segment
+post_state_openings  = one per dirty segment
+BlockAuthSidecar     = one Standard auth proof per non-coinbase tx
 ```
 
 Sweep-only blocks are represented as:
 
 ```text
-standard_bucket = None
-sweep_bucket    = Some(...)
-state_binding   = present
+standard_bucket      = None
+sweep_bucket         = Some(...)
+pre_state_openings   = one per dirty segment
+post_state_openings  = one per dirty segment
+BlockAuthSidecar     = one Sweep auth proof per non-coinbase tx
 ```
 
-Mixed blocks have both buckets present and one common state-binding proof.
+Mixed blocks have both buckets present, one common NativeDelta state-binding surface, and one block-order Auth sidecar containing Standard and Sweep entries.
 
-Coinbase-only blocks are the only no-user-proof exception: there are no user slot claims to bind, so they use the canonical stub proof marker/header binding, cheap consensus checks, and deterministic coinbase `apply_state_delta`.
+Coinbase-only blocks are the only no-user-proof exception: there are no user slot claims to bind, so they use empty proof/sidecar bytes, the canonical stub proof marker/header binding, cheap consensus checks, and deterministic coinbase `apply_state_delta`.
 
 ## Bucket public format
 
@@ -165,7 +176,8 @@ The verifier derives expected coverage from the actual block transactions and re
 - `PublicInputs.tx_body_hash` mismatches;
 - swapped standard/sweep buckets;
 - bucket order or index tampering;
-- missing `BlockStateBindingAir` on a user-transaction block.
+- missing or mismatched pre/post `SegmentMleOpening`s for dirty state segments;
+- missing or mismatched public Auth sidecar entries.
 
 ## State-binding rule
 
@@ -174,10 +186,11 @@ State binding is common across the full block:
 ```text
 standard bucket proves standard tx logic
 sweep bucket proves sweep tx logic
-common state binding proves all spend/mint claims together
+NativeDelta reconstructs all spend/mint claims together from the canonical block body
+pre/post segment MLE openings bind the delta to prev_state_root and new_state_root
 ```
 
-Do not split state binding per bucket. The common state binding is what prevents cross-shape double spends and keeps one canonical state transition for the whole block.
+Do not split state binding per bucket. The common NativeDelta state surface prevents cross-shape double spends and keeps one canonical state transition for the whole block.
 
 ## Design rationale
 

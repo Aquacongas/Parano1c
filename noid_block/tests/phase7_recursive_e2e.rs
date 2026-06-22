@@ -189,7 +189,7 @@ fn wallet_auth(
 /// Full recursive prove + verify roundtrip:
 /// 1. Build a real single-tx BlockProof (via prove_block).
 /// 2. Extract BlockReplayWitness.
-/// 3. prove_recursive_step → RecursiveBlockProof (~11 KB).
+/// 3. prove_recursive_step → RecursiveBlockProof (~38 KB encoded).
 /// 4. Verify RecursiveBlockAir constraints (check_legacy).
 /// 5. verify_tip → O(1) chain verification.
 #[test]
@@ -250,7 +250,6 @@ fn recursive_step_and_verify_tip() {
     // ----- Extract BlockReplayWitness -----
     let block_witness = BlockReplayWitness::from_parts(
         standard_bucket.commitment.cap.clone(),
-        block_proof.state_binding_algebraics.clone(),
         standard_bucket.block_col_openings.clone(),
         standard_bucket.block_multipoint_rounds.clone(),
         standard_bucket.block_multipoint_challenges.clone(),

@@ -4,7 +4,7 @@
 //! Blake3 Proof-of-Work validation.
 //!
 //! PoW is computed over `header_core` which does NOT include
-//! `proof_transcript_hash`. This allows PoW search and ZK proving to run
+//! `proof_transcript_hash`. This allows PoW search and BlockProof generation to run
 //! in parallel: both are committed to the chain (the next block's
 //! `prev_block_hash` = Blake3 of the FULL header), but miners only need
 //! `header_core` to start searching.
@@ -64,7 +64,7 @@ pub type BlockHash = [u8; 32];
 ///
 /// The nonce is included; changing the nonce changes the hash.
 /// `proof_transcript_hash` and `witness_root` are excluded so that
-/// ZK proving and PoW search can proceed in parallel.
+/// BlockProof generation and PoW search can proceed in parallel.
 pub fn header_core_bytes(h: &BlockHeader) -> HeaderCoreBytes {
     let mut buf = Vec::with_capacity(212);
     buf.extend_from_slice(&h.prev_block_hash);

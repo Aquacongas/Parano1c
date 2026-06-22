@@ -3,8 +3,8 @@
 
 //! Transaction proving inside the daemon.
 //!
-//! This is the ONLY place where `SpendSecret` is combined with the ZK proof
-//! pipeline. It NEVER leaves this function — it's passed in, used to compute
+//! This is the ONLY place where `SpendSecret` is combined with the wallet
+//! LogicProof pipeline. It NEVER leaves this function — it's passed in, used to compute
 //! the auth proof, and then dropped (zeroized by `ZeroizeOnDrop` on `SpendSecret`).
 //! Field-limb temporaries are wallet-local proof workspace and are not serialized.
 //!

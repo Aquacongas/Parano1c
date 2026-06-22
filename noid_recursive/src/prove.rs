@@ -11,8 +11,7 @@
 //! sumcheck rounds, accumulator state-root pins) are packed into one
 //! `InterleavedStarkProof` via `prove_air_interleaved`.  With LOG_ROWS=8
 //! and TAU=7 the padded log-length is 8, giving compact FRI with 0 folding
-//! rounds — no Merkle paths in the FRI, making the proof ultra-compact
-//! (~11 KB).
+//! rounds. The current source-bound production proof encodes to about 38 KB.
 
 use crate::accumulator::ChainAccumulator;
 use crate::air::{
@@ -396,7 +395,6 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
     // verification which is not relevant for the genesis stub).
     let null_witness = BlockReplayWitness::from_parts(
         MerkleCap { hashes: vec![] },
-        vec![], // no state_binding_algebraics
         vec![], // no block_col_openings
         // BLOCK_SUMCHECK_ROUNDS = 11; each round has 3 evaluations [p(0), p(1), p(2)]
         vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
@@ -419,7 +417,7 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
 }
 
 // ---------------------------------------------------------------------------
-// Null witness (for coinbase-only blocks with no real ZK proof)
+// Null witness (for coinbase-only blocks with no real BlockProof)
 // ---------------------------------------------------------------------------
 
 /// Build a null `BlockReplayWitness` — used for coinbase-only blocks that have
@@ -434,7 +432,6 @@ pub fn prove_genesis_recursive() -> RecursiveBlockProof {
 pub fn null_block_replay_witness() -> BlockReplayWitness {
     BlockReplayWitness::from_parts(
         MerkleCap { hashes: vec![] },
-        vec![], // no state_binding_algebraics
         vec![], // no block_col_openings
         vec![vec![Block128::ZERO; 3]; BLOCK_SUMCHECK_ROUNDS],
         vec![Block128::ZERO; BLOCK_SUMCHECK_ROUNDS],

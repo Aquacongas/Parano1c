@@ -1306,7 +1306,7 @@ mod tests {
             block1_hash = full_block_hash(&block1.header);
 
             // Directly commit a fake block 2 with sentinel nullifiers.
-            // (We bypass apply_next_block to avoid ZK-proof requirements.)
+            // (We bypass apply_next_block to avoid BlockProof requirements.)
             let parent = ctx.tip_header().clone();
             let mut hdr2 = BlockHeader {
                 prev_block_hash: block1_hash,

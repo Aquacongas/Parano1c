@@ -463,7 +463,12 @@ fn mine(cli: &Cli) -> Result<()> {
                 );
             }
             Err(e) => {
-                eprintln!("└─ submit failed (stale block?): {e}");
+                let err = e.to_string();
+                if err.contains("BadParentHash") {
+                    eprintln!("└─ STALE  template parent lost race; fetching fresh template");
+                } else {
+                    eprintln!("└─ submit failed: {err}");
+                }
                 last_height = height; // skip this height, get a fresh template
             }
         }

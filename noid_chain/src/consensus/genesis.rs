@@ -43,7 +43,7 @@ pub fn genesis_header() -> BlockHeader {
         miner_address: GENESIS_BURN_ADDRESS,
         nonce: GENESIS_NONCE,
         difficulty_target: GENESIS_TARGET,
-        // No ZK proof for genesis: marker value 0x01...01
+        // No BlockProof for genesis: marker value 0x01...01
         proof_transcript_hash: [0x01u8; 32],
         witness_root: [0u8; 32],
         log_slots: LOG_SLOTS_GENESIS,

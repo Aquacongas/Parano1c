@@ -70,7 +70,7 @@ impl ChainContext {
     ///
     /// This is the only valid starting state for a new node.
     /// The genesis block is applied via the hardcoded genesis header
-    /// (no ZK proof required for genesis).
+    /// (no BlockProof required for genesis).
     pub fn init_from_genesis() -> Self {
         let genesis = genesis_header();
         let state = ChainState::new();
@@ -155,7 +155,7 @@ impl ChainContext {
     ///
     /// On failure, the context is left **unchanged**.
     ///
-    /// Note: ZK proof verification is NOT performed here.
+    /// Note: BlockProof verification is NOT performed here.
     pub fn apply_next_block(
         &mut self,
         block: &Block,
@@ -169,7 +169,7 @@ impl ChainContext {
         // Build undo log BEFORE applying (captures pre-state).
         let undo = build_undo_log(&self.state, block);
 
-        // Run the sequential consensus interpreter (no ZK).
+        // Run the sequential consensus interpreter (no proof verification).
         // On success, self.state is updated to the post-block state.
         // On failure, self.state is left unchanged.
         let new_state_root = validate_block_consensus(

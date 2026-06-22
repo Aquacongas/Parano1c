@@ -3,11 +3,9 @@
 
 //! Body-bound transaction logic AIR for the `Sweep25x2` shape.
 //!
-//! The legacy sweep wallet path used the standalone `Sweep25x2BalanceGateAir`,
-//! whose `public_columns()` were empty. `SweepTxLogicAir` is the replacement
-//! production-facing AIR for sweep transaction logic: it reuses the 25-input /
-//! 2-output sweep balance constraints, but pins body-derived values and the
-//! canonical `tx_body_hash` through `PublicColumn`s.
+//! `SweepTxLogicAir` is the production AIR for sweep transaction logic. It
+//! reuses the 25-input / 2-output sweep balance constraints, while pinning
+//! body-derived values and the canonical `tx_body_hash` through `PublicColumn`s.
 
 use crate::airs::{
     build_sweep_balance_trace_parts, emit_sweep_balance_constraints,

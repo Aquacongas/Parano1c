@@ -1183,7 +1183,7 @@ Blocks above the inline threshold are propagated as compact header announcements
 | Surface | Enforcement |
 | --- | --- |
 | RPC hex input | `noid_rpc/src/server.rs` checks maximum hex characters before `hex::decode` for tx intent, block, block proof, auth sidecar, receipt, and salt. |
-| Mempool admission | `noid_mempool/src/pool.rs` checks global and shape-specific transaction caps before hash/ZK verification and checks total retained bytes before final insertion. |
+| Mempool admission | `noid_mempool/src/pool.rs` checks global and shape-specific transaction caps before body-hash recomputation and LogicProof verification and checks total retained bytes before final insertion. |
 | Core mempool byte accounting | `noid_chain/src/mempool.rs::total_intent_bytes`. |
 | P2P transaction gossip | `noid_p2p/src/network.rs` and `noid_node/src/main.rs` use the shared transaction intent cap before decode. |
 | P2P inline/pulled blocks | Block body, proof, sidecar, and combined proof+sidecar caps are checked before forwarding to node validation. |

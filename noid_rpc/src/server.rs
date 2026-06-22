@@ -166,6 +166,9 @@ pub struct RpcHandler {
     /// (same effect as Ctrl-C). Wrapped in Mutex so the RPC handler can
     /// take ownership on first call.
     pub stop_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Whether getBlockTemplate/submitBlock are enabled for external PoW workers.
+    /// This is true only for nodes explicitly started with `--mode extminer`.
+    pub mining_api_enabled: bool,
     /// Address that receives block rewards in getBlockTemplate.
     /// Always the node operator's address — external callers cannot override this.
     pub mining_payout_address: noid_poseidon2b::primitives::Address,
@@ -687,10 +690,16 @@ impl ParanoidApiServer for RpcHandler {
     ///   `Blake3(header_core || nonce) < difficulty_target`
     ///
     /// CANNOT change the coinbase address: it is committed via the
-    /// ZK BlockProof which the full node generates. Changing the coinbase
+    /// BlockProof which the full node generates. Changing the coinbase
     /// would require regenerating the entire proof.
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse> {
-        // Security: always use the node operator's payout address for the ZK proof.
+        if !self.mining_api_enabled {
+            return Err(rpc_err(
+                "external mining API is disabled; start this node with --mode extminer",
+            ));
+        }
+
+        // Security: always use the node operator's payout address for proof generation.
         // The coinbase is committed inside the proof — external callers cannot redirect
         // rewards to themselves. The `miner_address` param is accepted for API
         // compatibility but ONLY used when it equals the node's payout address or is empty.
@@ -792,7 +801,7 @@ impl ParanoidApiServer for RpcHandler {
         let header_core = noid_chain::consensus::pow::header_core_bytes(&pow_header);
         let diff_target = pow_header.difficulty_target;
 
-        // Run ZK prove so the full block (including proof fields) is ready.
+        // Run BlockProof generation so the full block (including proof fields) is ready.
         // External miner only needs to patch the nonce — no other computation required.
         // Coinbase-only blocks prove instantly; user-tx blocks take ~1-3 s.
         let tmpl_for_prove = tmpl.clone();
@@ -846,6 +855,12 @@ impl ParanoidApiServer for RpcHandler {
         block_proof_hex: String,
         block_auth_sidecar_hex: String,
     ) -> RpcResult<String> {
+        if !self.mining_api_enabled {
+            return Err(rpc_err(
+                "external mining API is disabled; start this node with --mode extminer",
+            ));
+        }
+
         let bytes = decode_bounded_hex("block", &block_hex, MAX_BLOCK_BYTES)?;
         let block =
             Block::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode block: {e:?}")))?;
@@ -937,9 +952,26 @@ impl ParanoidApiServer for RpcHandler {
 
         tracing::info!(
             height = block.header.height,
-            hash = ?hash,
+            hash = %hex::encode(hash),
             "block submitted via RPC"
         );
+
+        let mut header_bytes = Vec::new();
+        block.header.encode(&mut header_bytes);
+        if let Err(e) = self
+            .p2p_cmd
+            .send(noid_p2p::NetworkCommand::AnnounceBlock {
+                height: block.header.height,
+                hash,
+                header_bytes,
+                block_bytes: bytes,
+                block_proof_bytes,
+                block_auth_sidecar_bytes,
+            })
+            .await
+        {
+            tracing::warn!(height = block.header.height, err = %e, "failed to broadcast RPC-submitted block");
+        }
 
         Ok(hex::encode(hash))
     }
@@ -1575,6 +1607,7 @@ pub async fn start_rpc_server(
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    mining_api_enabled: bool,
     mining_payout_address: noid_poseidon2b::primitives::Address,
     mining_key: Option<String>,
     allow_custom_coinbase: bool,
@@ -1591,6 +1624,7 @@ pub async fn start_rpc_server(
         wallet,
         p2p_cmd,
         stop_tx,
+        mining_api_enabled,
         mining_payout_address,
         mining_key: mining_key.clone(),
         allow_custom_coinbase,

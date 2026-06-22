@@ -343,7 +343,7 @@ def main():
             interval=2,
         )
         wait_until(
-            "all nodes converge",
+            "all nodes reach same chain within 2-block live PoW lag",
             lambda: same_tip(nodes, max_lag=2),
             timeout=420,
             interval=3,
@@ -380,7 +380,7 @@ def main():
                 interval=3,
             )
             wait_until(
-                "chain convergence after funding",
+                "chain tip within 1-block live PoW lag after funding",
                 lambda: same_tip(nodes, max_lag=1),
                 timeout=180,
                 interval=3,
@@ -456,7 +456,7 @@ def main():
                     interval=3,
                 )
                 wait_until(
-                    "chain convergence",
+                    "chain tip within 1-block live PoW lag",
                     lambda: same_tip(nodes, max_lag=1),
                     timeout=180,
                     interval=3,

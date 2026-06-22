@@ -64,7 +64,7 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
 use noid_stark::interleaved::{
     prove_air_interleaved_algebraic, verify_air_interleaved_algebraic_terminal,
-    AlgebraicStarkProof, AlgebraicTerminalData, InterleavedStarkProof,
+    AlgebraicStarkProof, AlgebraicTerminalData,
 };
 use noid_stark::{SliceClaim, VerifyError};
 use noid_tx::PublicInputs;
@@ -148,10 +148,6 @@ pub struct BlockPublicMeta {
     pub n_block_spine_slices: u32,
     /// Number of NativeDelta dirty-segment openings (one per touched segment; 0 = no state binding).
     pub n_state_bindings: u32,
-    /// Legacy state-binding AIR column count. Production NativeDelta proofs set this to 0.
-    pub state_binding_n_cols: u32,
-    /// Legacy state-binding AIR log-rows. Production NativeDelta proofs set this to 0.
-    pub state_binding_log_rows: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,13 +292,6 @@ pub struct BlockProof {
     /// Sweep transaction-shape bucket. Present when the proof carries
     /// `Sweep25x2` wallet logic proofs bound to concrete block tx indices.
     pub sweep_bucket: Option<SweepBucketProof>,
-    /// Legacy state-binding algebraic transcripts. Production NativeDelta proofs
-    /// keep this empty; non-empty values are rejected by current verifiers.
-    pub state_binding_algebraics: Vec<AlgebraicStarkProof>,
-    /// Legacy standalone state-binding STARKs. Production NativeDelta proofs keep
-    /// this empty; state transition soundness is checked by native delta identity
-    /// plus pre/post segment MLE openings.
-    pub state_binding_starks: Vec<InterleavedStarkProof>,
     /// FRI+Merkle opening proofs for pre-state segment MLEs (FRI + Merkle path).
     /// One per dirty segment. Binds native delta `pre_lane(r)` to `prev_state_root`.
     pub pre_state_openings: Vec<SegmentMleOpening>,
@@ -321,15 +310,9 @@ impl BlockProof {
             .sweep_bucket
             .as_ref()
             .map_or(0, SweepBucketProof::byte_len);
-        let sb_alg: usize = self
-            .state_binding_algebraics
-            .iter()
-            .map(|a| a.byte_len())
-            .sum();
-        let sb_stark: usize = self.state_binding_starks.iter().map(|p| p.byte_len()).sum();
         let pre: usize = self.pre_state_openings.iter().map(|o| o.byte_len()).sum();
         let post: usize = self.post_state_openings.iter().map(|o| o.byte_len()).sum();
-        standard + sweep + sb_alg + sb_stark + pre + post
+        standard + sweep + pre + post
     }
 
     pub fn standard_bucket(&self) -> Result<&StandardBucketProof, VerifyBlockError> {
@@ -490,24 +473,6 @@ pub fn split_auth_sidecar_for_buckets(
 
 pub const BLOCK_RECURSIVE_CLAIM_DOMAIN: &[u8] = b"NOID_BLOCK_RECURSIVE_CLAIM_V1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum StateBindingProofMode {
-    Empty,
-    /// Current production state transition mode: verifier reconstructs the
-    /// canonical state-delta claim surface natively, verifies the delta-MLE
-    /// identity at a root-derived random point, and binds pre/post lane
-    /// openings to the endpoint state roots via compact segment MLE openings.
-    NativeDelta,
-    /// Legacy wide `BlockStateBindingAir` algebraic transcripts aggregated into
-    /// a standard bucket commitment. Kept as an enum variant so old proof-shape
-    /// failures are explicit, but production no longer emits this mode.
-    Algebraic,
-    /// Legacy standalone full STARKs for state binding. Production no longer
-    /// emits this mode.
-    Standalone,
-    MixedInvalid,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BucketCoverageSummary {
     pub total_non_coinbase_tx: u32,
@@ -519,12 +484,9 @@ pub struct BucketCoverageSummary {
 pub struct BlockRecursiveClaimTranscript {
     pub domain: Vec<u8>,
     pub meta: BlockPublicMeta,
-    pub state_binding_mode: StateBindingProofMode,
     pub coverage: BucketCoverageSummary,
     pub standard_bucket: Option<StandardBucketProof>,
     pub sweep_bucket: Option<SweepBucketProof>,
-    pub state_binding_algebraics: Vec<AlgebraicStarkProof>,
-    pub state_binding_starks: Vec<InterleavedStarkProof>,
     pub pre_state_openings: Vec<SegmentMleOpening>,
     pub post_state_openings: Vec<SegmentMleOpening>,
 }
@@ -540,28 +502,11 @@ struct BucketCoverageSummaryRef<'a> {
 struct BlockRecursiveClaimTranscriptRef<'a> {
     domain: &'static [u8],
     meta: &'a BlockPublicMeta,
-    state_binding_mode: StateBindingProofMode,
     coverage: BucketCoverageSummaryRef<'a>,
     standard_bucket: Option<&'a StandardBucketProof>,
     sweep_bucket: Option<&'a SweepBucketProof>,
-    state_binding_algebraics: &'a [AlgebraicStarkProof],
-    state_binding_starks: &'a [InterleavedStarkProof],
     pre_state_openings: &'a [SegmentMleOpening],
     post_state_openings: &'a [SegmentMleOpening],
-}
-
-pub fn state_binding_proof_mode(proof: &BlockProof) -> StateBindingProofMode {
-    match (
-        proof.state_binding_algebraics.is_empty(),
-        proof.state_binding_starks.is_empty(),
-        proof.meta.n_state_bindings,
-    ) {
-        (true, true, 0) => StateBindingProofMode::Empty,
-        (true, true, _) => StateBindingProofMode::NativeDelta,
-        (false, true, _) => StateBindingProofMode::Algebraic,
-        (true, false, _) => StateBindingProofMode::Standalone,
-        (false, false, _) => StateBindingProofMode::MixedInvalid,
-    }
 }
 
 pub fn bucket_coverage_summary(proof: &BlockProof) -> BucketCoverageSummary {
@@ -596,12 +541,9 @@ pub fn block_recursive_claim_transcript(proof: &BlockProof) -> BlockRecursiveCla
     BlockRecursiveClaimTranscript {
         domain: BLOCK_RECURSIVE_CLAIM_DOMAIN.to_vec(),
         meta: proof.meta.clone(),
-        state_binding_mode: state_binding_proof_mode(proof),
         coverage: bucket_coverage_summary(proof),
         standard_bucket: proof.standard_bucket.clone(),
         sweep_bucket: proof.sweep_bucket.clone(),
-        state_binding_algebraics: proof.state_binding_algebraics.clone(),
-        state_binding_starks: proof.state_binding_starks.clone(),
         pre_state_openings: proof.pre_state_openings.clone(),
         post_state_openings: proof.post_state_openings.clone(),
     }
@@ -613,12 +555,9 @@ fn block_recursive_claim_transcript_ref(
     BlockRecursiveClaimTranscriptRef {
         domain: BLOCK_RECURSIVE_CLAIM_DOMAIN,
         meta: &proof.meta,
-        state_binding_mode: state_binding_proof_mode(proof),
         coverage: bucket_coverage_summary_ref(proof),
         standard_bucket: proof.standard_bucket.as_ref(),
         sweep_bucket: proof.sweep_bucket.as_ref(),
-        state_binding_algebraics: &proof.state_binding_algebraics,
-        state_binding_starks: &proof.state_binding_starks,
         pre_state_openings: &proof.pre_state_openings,
         post_state_openings: &proof.post_state_openings,
     }
@@ -714,13 +653,9 @@ mod recursive_claim_tests {
                 log_rows: 0,
                 n_block_spine_slices: 0,
                 n_state_bindings: 0,
-                state_binding_n_cols: 0,
-                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: None,
-            state_binding_algebraics: Vec::new(),
-            state_binding_starks: Vec::new(),
             pre_state_openings: Vec::new(),
             post_state_openings: Vec::new(),
         };
@@ -735,7 +670,7 @@ mod recursive_claim_tests {
     }
 
     #[test]
-    fn sidecar_root_streaming_hash_matches_legacy_byte_hash() {
+    fn sidecar_root_streaming_hash_matches_reference_byte_hash() {
         let transcript = BlockAuthSidecarRootTranscript {
             domain: BLOCK_AUTH_SIDECAR_ROOT_DOMAIN,
             entries: Vec::new(),
@@ -901,9 +836,11 @@ pub fn build_block_auth_sidecar(
 // Block-level state binding witness bundle
 // ---------------------------------------------------------------------------
 
-/// Optional state binding witness for prove_block.
-/// When present, the BlockStateBindingAir columns are committed alongside
-/// per-tx columns and proven via the shared block channel.
+/// State-binding witness for NativeDelta verification.
+/// The `BlockStateBindingAir` value carries the verifier-reconstructed random
+/// point and lane claims; the proof binds those claims with pre/post
+/// `SegmentMleOpening`s rather than committing state-binding columns inside the
+/// bucket PCS.
 pub struct StateBindingBlockWitness<'a> {
     pub air: &'a BlockStateBindingAir,
     pub columns: &'a [Vec<Block128>],
@@ -1553,7 +1490,7 @@ pub fn assemble_sweep_bucket_proof(
     }))
 }
 
-fn prove_state_mle_openings_only(
+pub fn prove_state_mle_openings_only(
     state_bindings: &[StateBindingBlockWitness<'_>],
 ) -> (Vec<SegmentMleOpening>, Vec<SegmentMleOpening>) {
     let results: Vec<(Option<SegmentMleOpening>, Option<SegmentMleOpening>)> = state_bindings
@@ -1622,35 +1559,12 @@ fn prove_state_mle_openings_only(
     (pre_state_openings, post_state_openings)
 }
 
-/// Prove block-level state transition openings for sweep-only compatibility path.
-///
-/// Production no longer emits standalone `BlockStateBindingAir` STARKs. The state
-/// transition proof is the native state-delta identity checked by the verifier,
-/// plus pre/post segment MLE openings bound to `prev_state_root` and
-/// `new_state_root`. The empty first return value keeps older call sites source-
-/// compatible while making the proof surface explicitly `NativeDelta`.
-pub fn prove_state_bindings_standalone(
-    state_bindings: &[StateBindingBlockWitness<'_>],
-) -> (
-    Vec<InterleavedStarkProof>,
-    Vec<SegmentMleOpening>,
-    Vec<SegmentMleOpening>,
-) {
-    let (pre_state_openings, post_state_openings) = prove_state_mle_openings_only(state_bindings);
-    (Vec::new(), pre_state_openings, post_state_openings)
-}
-
 pub fn verify_state_bindings_standalone(
     proof: &BlockProof,
     state_binding_airs: &[&BlockStateBindingAir],
 ) -> Result<(), VerifyBlockError> {
     let n_state_bindings = proof.meta.n_state_bindings as usize;
-    if !proof.state_binding_starks.is_empty()
-        || !proof.state_binding_algebraics.is_empty()
-        || proof.meta.state_binding_n_cols != 0
-        || proof.meta.state_binding_log_rows != 0
-        || state_binding_airs.len() != n_state_bindings
-    {
+    if state_binding_airs.len() != n_state_bindings {
         return Err(VerifyBlockError::ShapeMismatch);
     }
 
@@ -2069,7 +1983,6 @@ pub fn prove_block_with_total_tx_count(
     // natively from canonical claims, then checks these openings against
     // prev/new state roots.
     // -------------------------------------------------------------------------
-    let sb_algebraics: Vec<AlgebraicStarkProof> = Vec::new();
     let (pre_state_openings, post_state_openings) = prove_state_mle_openings_only(state_bindings);
     profiler.phase("state_mle_openings");
 
@@ -2342,8 +2255,6 @@ pub fn prove_block_with_total_tx_count(
         log_rows: witnesses[0].trace.log_rows as u32,
         n_block_spine_slices: n_block_spine_slices as u32,
         n_state_bindings: n_state_bindings as u32,
-        state_binding_n_cols: 0,
-        state_binding_log_rows: 0,
     };
 
     let tx_indices: Vec<u32> = witnesses.iter().map(|w| w.block_tx_index).collect();
@@ -2375,8 +2286,6 @@ pub fn prove_block_with_total_tx_count(
         meta,
         standard_bucket: Some(standard_bucket),
         sweep_bucket: None,
-        state_binding_algebraics: sb_algebraics,
-        state_binding_starks: vec![],
         pre_state_openings,
         post_state_openings,
     })
@@ -3016,10 +2925,6 @@ pub fn verify_block(
         || bucket.tx_pis.len() != n_tx
         || auth_proofs.len() != n_tx
         || bucket.tx_algebraic.len() != n_tx
-        || !proof.state_binding_algebraics.is_empty()
-        || !proof.state_binding_starks.is_empty()
-        || meta.state_binding_n_cols != 0
-        || meta.state_binding_log_rows != 0
         || bucket.block_col_openings.len() != total_committed_cols
         || spine_inputs_list.len() != n_tx
         || auth_public_list.len() != n_tx

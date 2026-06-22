@@ -295,7 +295,7 @@ pub struct BlockHeaderInfo {
     pub miner: String,
     /// Blake3 PoW difficulty target (64-char hex, LE).
     pub difficulty_target: String,
-    /// Fiat-Shamir transcript digest of the ZK BlockProof.
+    /// Fiat-Shamir transcript digest of the BlockProof.
     pub proof_transcript_hash: String,
     /// log₂ of total UTXO slot space capacity.
     pub log_slots: u32,
@@ -406,7 +406,7 @@ pub struct MempoolTxInfo {
     pub n_outputs: usize,
     /// Chain height at admission.
     pub admitted_height: u64,
-    /// Whether a ZK proof bundle is cached (wallet proof attached).
+    /// Whether a wallet LogicProof bundle is cached.
     pub has_proof: bool,
 }
 

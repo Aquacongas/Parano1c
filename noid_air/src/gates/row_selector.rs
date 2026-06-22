@@ -119,9 +119,8 @@ pub fn emit_public_cell(
 /// WeightedLinearGate { col_a + col_b == 0 })`. In characteristic 2 the
 /// XOR residue `col_a + col_b` vanishes iff the two cells agree.
 ///
-/// The two-column witness form (vs. the one-column `emit_public_cell`)
-/// is what `ColumnEqAtRowGate` in the roadmap refers to — needed for
-/// cross-instance carries where neither side is a verifier-known
+/// The two-column witness form (vs. the one-column `emit_public_cell`) is
+/// needed for cross-instance carries where neither side is a verifier-known
 /// constant. Cross-row comparison (`col_a@row_x == col_b@row_y` with
 /// `row_x != row_y`) is out of scope here because it requires a
 /// `shifted_columns` path through the base AIR abstraction; every

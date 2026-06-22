@@ -269,8 +269,9 @@ pub fn extract_consolidate_data(
 /// Build, prove, and serialize a send transaction. Called **without** the
 /// wallet lock.
 ///
-/// This function is CPU-heavy (~0.3–3 s depending on hardware) due to the ZK
-/// proving step; keep the wallet mutex released for the full duration.
+/// This function is CPU-heavy (~0.3–3 s depending on hardware) due to the
+/// wallet LogicProof generation step; keep the wallet mutex released for the
+/// full duration.
 ///
 /// # Construction order
 ///
@@ -293,7 +294,7 @@ pub fn extract_consolidate_data(
 ///
 /// # Errors
 ///
-/// - [`BuildError::ProveFailed`] — the ZK prover returned an error.
+/// - [`BuildError::ProveFailed`] — LogicProof generation returned an error.
 pub fn build_and_prove_tx(
     to_address: [u8; 32],
     amount_micronoid: u64,
@@ -369,7 +370,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Assemble TxBody and run the ZK prover.
+    // Assemble TxBody and run LogicProof generation.
     //
     // spend_secrets is consumed here; SpendSecret's ZeroizeOnDrop impl
     // ensures the raw key material is cleared from memory when prove_tx returns.

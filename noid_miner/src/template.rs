@@ -62,7 +62,7 @@ pub enum TemplateRefreshTrigger {
     Startup,
 }
 
-/// A `BlockTemplate` ready for parallel PoW + ZK prove.
+/// A `BlockTemplate` ready for parallel PoW + BlockProof generation.
 ///
 /// Security: `state_root` is in `header_core` which is the PoW input.
 /// An external miner CANNOT change the coinbase without regenerating the
@@ -83,7 +83,7 @@ pub struct BlockTemplate {
     pub proof_bytes: Vec<Option<Vec<u8>>>,
     /// Pre-state segment columns for every segment touched by this block's transactions.
     /// Captured at template-build time (before `apply_block`), keyed by seg_id.
-    /// Used by the ZK block prover for FRI state openings.
+    /// Used by the BlockProof generator for FRI state openings.
     pub pre_segs: HashMap<u16, SegmentColumns>,
 }
 
@@ -96,7 +96,7 @@ impl BlockTemplate {
         self.inner.to_pow_header(nonce)
     }
 
-    /// Assemble the final sealed block after PoW and ZK proof complete.
+    /// Assemble the final sealed block after PoW and BlockProof generation complete.
     pub fn seal(
         &self,
         nonce: u128,

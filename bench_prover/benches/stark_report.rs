@@ -89,6 +89,7 @@ fn print_recursive(label: &str, r: &RecursiveStepBench) {
     println!("    prove:         {}", fmt_ms(r.prove_time));
     println!("    verify:        {}", fmt_ms(r.verify_time));
     println!("    proof:         {}", fmt_bytes(r.proof_bytes));
+    println!("    encoded:       {}", fmt_bytes(r.proof_encoded_bytes));
     println!("    source proof:  {}", fmt_bytes(r.block_proof_bytes));
     if r.standard_bucket_bytes > 0 {
         println!("      standard:    {}", fmt_bytes(r.standard_bucket_bytes));

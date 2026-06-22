@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn balance_without_selector_pin_is_backward_compatible() {
-        // Legacy `new()` still works, no public columns declared.
+        // The original `new()` constructor still works, with no public columns declared.
         let air = BalanceGateAir::new(LOG_ROWS);
         let (ins, outs, fee) = balanced_tuple(23);
         assert!(air.check(&air.build_trace(ins, outs, fee)));

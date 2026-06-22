@@ -363,10 +363,10 @@ def main():
         out, _, _ = cli(n2, ["mempool"])
         assert_contains(out, "Mempool", "mempool output")
         assert_contains(out, "Pending", "mempool output")
-        assert_contains(out, "ZK", "mempool output")
+        assert_contains(out, "proof", "mempool output")
         out, _, _ = cli(n2, ["mempool-tx", tx1])
         assert_contains(out, "Mempool transaction", "mempool-tx output")
-        assert_contains(out, "ZK proof", "mempool-tx output")
+        assert_contains(out, "LogicProof", "mempool-tx output")
         assert_contains(out, "attached", "mempool-tx output")
 
         wait_until(

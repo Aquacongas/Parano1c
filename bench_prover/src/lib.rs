@@ -17,7 +17,7 @@ use noid_air::Air;
 use noid_block::{
     assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
     build_block_auth_sidecar, build_state_bindings_from_binding, build_tx_witness,
-    extract_replay_witness, prove_block_with_total_tx_count, prove_state_bindings_standalone,
+    extract_replay_witness, prove_block_with_total_tx_count, prove_state_mle_openings_only,
     split_auth_sidecar_for_buckets, verify_state_bindings_standalone,
     verify_sweep_bucket_aggregation, verify_sweep_bucket_from_block, BlockAuthSidecar, BlockProof,
     BlockPublicMeta, OwnedSweepTxWitness, OwnedTxWitness, TxBlockWitness,
@@ -138,6 +138,7 @@ pub struct RecursiveStepBench {
     pub prove_time: Duration,
     pub verify_time: Duration,
     pub proof_bytes: usize,
+    pub proof_encoded_bytes: usize,
     pub block_proof_bytes: usize,
     pub standard_bucket_bytes: usize,
     pub sweep_bucket_bytes: usize,
@@ -898,8 +899,8 @@ fn prove_full_block_proof_once(
     profiler.phase("sweep_bucket_prove");
 
     let mut proof = if standard_witnesses.is_empty() {
-        let (state_binding_starks, pre_state_openings, post_state_openings) =
-            prove_state_bindings_standalone(&state_bindings);
+        let (pre_state_openings, post_state_openings) =
+            prove_state_mle_openings_only(&state_bindings);
         let bucket = sweep_bucket.expect("sweep-only block needs sweep bucket");
         BlockProof {
             meta: BlockPublicMeta {
@@ -911,13 +912,9 @@ fn prove_full_block_proof_once(
                 log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
                 n_block_spine_slices: 0,
                 n_state_bindings: state_bindings.len() as u32,
-                state_binding_n_cols: 0,
-                state_binding_log_rows: 0,
             },
             standard_bucket: None,
             sweep_bucket: Some(bucket),
-            state_binding_algebraics: vec![],
-            state_binding_starks,
             pre_state_openings,
             post_state_openings,
         }
@@ -991,20 +988,10 @@ pub fn bench_full_block_proof(
         }
     });
     let state_binding_bytes = proof
-        .state_binding_starks
+        .pre_state_openings
         .iter()
         .map(|p| p.byte_len())
         .sum::<usize>()
-        + proof
-            .state_binding_algebraics
-            .iter()
-            .map(|p| p.byte_len())
-            .sum::<usize>()
-        + proof
-            .pre_state_openings
-            .iter()
-            .map(|p| p.byte_len())
-            .sum::<usize>()
         + proof
             .post_state_openings
             .iter()
@@ -1200,8 +1187,6 @@ pub fn sweep_only_block_proof(witnesses: &[OwnedSweepTxWitness]) -> (Duration, B
         log_rows: bucket.meta.log_rows,
         n_block_spine_slices: bucket.meta.n_block_spine_slices,
         n_state_bindings: 0,
-        state_binding_n_cols: 0,
-        state_binding_log_rows: 0,
     };
     (
         prove_time,
@@ -1209,8 +1194,6 @@ pub fn sweep_only_block_proof(witnesses: &[OwnedSweepTxWitness]) -> (Duration, B
             meta,
             standard_bucket: None,
             sweep_bucket: Some(bucket),
-            state_binding_algebraics: vec![],
-            state_binding_starks: vec![],
             pre_state_openings: vec![],
             post_state_openings: vec![],
         },
@@ -1339,6 +1322,9 @@ pub fn bench_recursive_step(proof: &BlockProof) -> RecursiveStepBench {
         prove_time,
         verify_time,
         proof_bytes: rec_proof.byte_len(),
+        proof_encoded_bytes: bincode::serialize(&rec_proof)
+            .expect("serialize recursive proof")
+            .len(),
         block_proof_bytes: proof.byte_len(),
         standard_bucket_bytes: proof
             .standard_bucket

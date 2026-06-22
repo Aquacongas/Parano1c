@@ -37,11 +37,11 @@ const T_UNDO_LOGS: &str = "undo";
 const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
 const T_RECENT_BLOCKS: &str = "recent";
-/// Recursive chain proof (6.5 KB, FOREVER). Key: KEY_REC. Value: raw proof bytes.
+/// Recursive chain proof (~38 KB encoded, FOREVER). Key: KEY_REC. Value: raw proof bytes.
 const T_RECURSIVE_PROOF: &str = "rec_proof";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
-/// Block ZK proofs (retention = FINALITY_DEPTH). Key: height (u64 LE). Value: bincode BlockProof bytes.
+/// BlockProofs (retention = FINALITY_DEPTH). Key: height (u64 LE). Value: bincode BlockProof bytes.
 const T_BLOCK_PROOFS: &str = "block_proofs";
 /// Public AuthGKR sidecars (retention = FINALITY_DEPTH). Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
@@ -302,7 +302,7 @@ impl MdbxStore {
         Ok(result)
     }
 
-    /// Read the persisted recursive chain proof (6.5 KB), if present.
+    /// Read the persisted recursive chain proof (~38 KB encoded), if present.
     pub fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
@@ -317,7 +317,7 @@ impl MdbxStore {
         Ok(raw.and_then(|b| u64_from_key(&b)))
     }
 
-    /// Persist the recursive chain proof (6.5 KB, FOREVER, single entry).
+    /// Persist the recursive chain proof (~38 KB encoded, FOREVER, single entry).
     ///
     /// Prefer `put_recursive_proof_at` in node code so proof-byte pruning can
     /// retain finalized block proofs until recursive history has consumed them.

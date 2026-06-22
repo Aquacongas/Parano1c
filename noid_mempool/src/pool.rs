@@ -10,12 +10,12 @@
 //!    │
 //!    ├─ Stateless check (no lock):  tx_body_hash consistency — O(1) hash, rejects garbage immediately
 //!    │
-//!    ├─ Pre-ZK filter (lock, brief): all cheap checks on current view
+//!    ├─ Pre-proof filter (lock, brief): all cheap checks on current view
 //!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
 //!    │   Extracts log_slots: u32 only — NO ChainView clone.
-//!    │   DoS guard: invalid txs rejected here, never reach ZK verify.
+//!    │   DoS guard: invalid txs rejected here, never reach LogicProof verification.
 //!    │
-//!    ├─ ZK verify (no lock): ~84ms, semaphore-bounded
+//!    ├─ LogicProof verification (no lock): ~84ms, semaphore-bounded
 //!    │
 //!    └─ Final admission (lock): re-run all checks against current state (TOCTOU guard)
 //!                        anchor_height derived here → pool.admit
@@ -87,8 +87,8 @@ pub struct AsyncMempool {
     state: Arc<Mutex<MempoolState>>,
     events: broadcast::Sender<MempoolEvent>,
     config: Arc<MempoolConfig>,
-    /// Semaphore limiting concurrent ZK verification tasks.
-    /// Bounds CPU usage: at most `config.zk_verify_workers` ZK proofs in flight.
+    /// Semaphore limiting concurrent LogicProof verification tasks.
+    /// Bounds CPU usage: at most `config.zk_verify_workers` proofs in flight.
     /// Set to 0 in config → semaphore with MAX permits (no limit).
     zk_semaphore: Arc<Semaphore>,
 }
@@ -142,7 +142,7 @@ impl AsyncMempool {
     /// 4. No slot conflict with admitted mempool txs
     /// 5. Input slots live in state, output slots empty
     ///
-    /// ZK verification (`verify_logic`) is performed synchronously (in a
+    /// LogicProof verification (`verify_logic`) is performed synchronously (in a
     /// `spawn_blocking` task) BEFORE the pool mutex is acquired, so invalid
     /// proofs are rejected at the mempool boundary without holding the lock.
     ///
@@ -168,7 +168,7 @@ impl AsyncMempool {
 
         // ── Stateless sanity check (no lock, no IO) ────────────────────
         // One hash computation rejects malformed intents before touching any
-        // shared state.  Previously this ran after ZK verify — moved here so
+        // shared state. Previously this ran after LogicProof verification — moved here so
         // hash-confusion spam is free to reject.
         if !intent.tx_body.is_coinbase {
             use noid_tx::hash_tx_body_for_shape;
@@ -214,7 +214,7 @@ impl AsyncMempool {
 
         // ── Cheap pre-filter (lock held briefly) ─────────────────
         // Runs all O(1)–O(ANCHOR_DEPTH) checks on current state.
-        // Rejects invalid txs BEFORE ZK verify — the DoS guard.
+        // Rejects invalid txs BEFORE LogicProof verification — the DoS guard.
         // Extracts only `log_slots: u32`; avoids cloning ChainView
         // (which carries SegmentedFriState + ~28 KB of recent headers).
         let log_slots: u32 = {
@@ -239,18 +239,17 @@ impl AsyncMempool {
             st.view.log_slots()
         }; // lock released — no ChainView clone
 
-        // ── ZK verify (CPU-heavy, outside lock, semaphore-bounded) ─
+        // ── LogicProof verification (CPU-heavy, outside lock, semaphore-bounded) ─
         // Runs only when the pre-filter passed — invalid fee/anchor/slot txs are
         // already gone.  Semaphore caps concurrent CPU threads.
         if needs_zk {
             let proof_bytes = intent.logic_proof_bytes.clone();
             let tx_body_clone = intent.tx_body.clone();
 
-            let _permit = self
-                .zk_semaphore
-                .acquire()
-                .await
-                .map_err(|_| SubmitError::Internal("zk semaphore closed".into()))?;
+            let _permit =
+                self.zk_semaphore.acquire().await.map_err(|_| {
+                    SubmitError::Internal("proof-verification semaphore closed".into())
+                })?;
 
             tokio::task::spawn_blocking(move || {
                 zk_verify_intent(&tx_body_clone, &proof_bytes, log_slots)
@@ -262,7 +261,7 @@ impl AsyncMempool {
 
         // ── Final admission under lock ───────────────────────
         // Re-run all cheap checks against CURRENT state: the chain may have
-        // advanced during the ~84 ms ZK verify window (new block → new
+        // advanced during the ~84 ms LogicProof verification window (new block → new
         // nullifiers, spent slots, changed fee floor).  This is the
         // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
@@ -392,7 +391,7 @@ impl AsyncMempool {
 
         // Detect state expansion: if log_slots changed, all non-coinbase TXs in the
         // pool were proved with the old log_slots and cannot be included in future
-        // blocks (their ZK proofs are bound to log_slots via PublicInputs).
+        // blocks (their LogicProofs are bound to log_slots via PublicInputs).
         // Evict them now so the miner doesn't waste time on stale proofs.
         let old_log_slots = st.view.log_slots();
         let new_log_slots = new_view.log_slots();
@@ -535,11 +534,11 @@ impl AsyncMempool {
     ///
     /// These TXs were in reverted blocks. We log the count for observability
     /// and evict any that happen to be sitting in the pool already (duplicate
-    /// re-submission race). Full re-admission with fresh ZK proofs is the
+    /// re-submission race). Full re-admission with fresh LogicProofs is the
     /// wallet's responsibility — wallets detect the unconfirmed state via
     /// wallet scan and resubmit.
     ///
-    /// NOTE: We do not have the original ZK proof bytes after a reorg (they
+    /// NOTE: We do not have the original LogicProof bytes after a reorg (they
     /// are not persisted). Durable TX storage could enable
     /// automatic re-admission without wallet involvement.
     pub async fn readmit_after_reorg(&self, tx_hashes: Vec<TxBodyHash>) {
@@ -628,8 +627,8 @@ impl AsyncMempool {
 /// Run every O(1)–O(ANCHOR_DEPTH) admission check against `st`.
 ///
 /// Called **twice** per `submit`:
-/// - Pre-ZK filter (DoS guard): rejects invalid txs before CPU-heavy work.
-/// - Post-ZK TOCTOU guard: final authority against current state.
+/// - Pre-proof filter (DoS guard): rejects invalid txs before CPU-heavy work.
+/// - Post-proof TOCTOU guard: final authority against current state.
 ///
 /// Returns `anchor_height` (needed by `pool.admit` for expiry tracking).
 /// The pre-filter discards it; the final admission step uses it.
@@ -810,7 +809,7 @@ fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitEr
 }
 
 // ---------------------------------------------------------------------------
-// Helper: ZK verify_logic
+// Helper: LogicProof verify_logic
 // ---------------------------------------------------------------------------
 
 /// Verify the wallet's LogicProof for a non-coinbase tx.

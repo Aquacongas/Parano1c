@@ -4,7 +4,7 @@
 //! Parallel Blake3 PoW nonce search.
 //!
 //! PoW is computed over `header_core` (212 bytes, excludes `proof_transcript_hash`).
-//! This allows ZK proving and PoW search to run concurrently.
+//! This allows BlockProof generation and PoW search to run concurrently.
 //!
 
 use noid_chain::block_header::BlockHeader;
