@@ -121,6 +121,10 @@ pub struct GetStateManifestResponse {
     pub eff_log: u8,
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
+    /// FRI segment roots aligned with `segment_ids`.  The sparse Merkle root
+    /// reconstructed from this table and canonical zero leaves must equal the
+    /// snapshot tip header's `state_root` before segment download is trusted.
+    pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
     /// TX hashes per block for nullifier-set rebuild (last ANCHOR_DEPTH blocks).

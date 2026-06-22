@@ -138,6 +138,71 @@ pub fn zero_segtree_node(d: usize) -> StateRoot {
     zero_segtree_table()[d]
 }
 
+/// Reconstruct the global state root from a sparse list of non-zero segment roots.
+///
+/// `segment_ids` and `segment_roots` are the manifest table. Missing leaves are
+/// interpreted as canonical zero segments.  The table must be strictly sorted by
+/// `segment_id`; duplicates and out-of-range IDs are rejected.
+pub fn sparse_state_root_from_segment_roots(
+    log_slots: usize,
+    effective_log_seg: usize,
+    segment_ids: &[u16],
+    segment_roots: &[StateRoot],
+) -> Result<StateRoot, String> {
+    if effective_log_seg > log_slots {
+        return Err(format!(
+            "effective_log_seg {} exceeds log_slots {}",
+            effective_log_seg, log_slots
+        ));
+    }
+    if segment_ids.len() != segment_roots.len() {
+        return Err(format!(
+            "segment_ids/segment_roots length mismatch: {} != {}",
+            segment_ids.len(),
+            segment_roots.len()
+        ));
+    }
+    if !segment_ids.windows(2).all(|w| w[0] < w[1]) {
+        return Err("segment_ids must be strictly sorted and unique".into());
+    }
+
+    let depth = log_slots - effective_log_seg;
+    if depth > MAX_SEGTREE_DEPTH {
+        return Err(format!(
+            "segment tree depth {} exceeds maximum {}",
+            depth, MAX_SEGTREE_DEPTH
+        ));
+    }
+    let num_segments = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| format!("segment tree depth {} overflows usize", depth))?;
+    let zero_leaf = zero_seg_root_for(effective_log_seg);
+    let mut leaves = vec![zero_leaf; num_segments];
+    for (&seg_id, &root) in segment_ids.iter().zip(segment_roots.iter()) {
+        let idx = seg_id as usize;
+        if idx >= num_segments {
+            return Err(format!(
+                "segment id {} out of range for {} segments",
+                seg_id, num_segments
+            ));
+        }
+        leaves[idx] = root;
+    }
+
+    if num_segments == 1 {
+        return Ok(leaves[0]);
+    }
+
+    let mut tree = vec![[0u8; 32]; 2 * num_segments];
+    for (i, leaf) in leaves.into_iter().enumerate() {
+        tree[num_segments + i] = leaf;
+    }
+    for k in (1..num_segments).rev() {
+        tree[k] = compress(&tree[2 * k], &tree[2 * k + 1]);
+    }
+    Ok(tree[1])
+}
+
 fn zero_segtree_table() -> &'static [[u8; 32]; MAX_SEGTREE_DEPTH + 1] {
     ZERO_SEGTREE.get_or_init(|| {
         let mut t = [[0u8; 32]; MAX_SEGTREE_DEPTH + 1];
@@ -580,6 +645,40 @@ impl SegmentedFriState {
         self.tree_dirty = true;
         // Mark FRI-dirty (NOT mdbx_dirty: data is already in MDBX).
         self.dirty.insert(seg_id);
+    }
+
+    /// Directly install pre-loaded column data together with its already verified
+    /// FRI segment root.
+    ///
+    /// Used by snapshot apply after the P2P layer has decoded the segment and
+    /// checked `compute_segment_root(cols) == authenticated_manifest_root`. This
+    /// avoids recomputing the same FRI segment root during the final global-root
+    /// integrity check; only the upper segment Merkle tree is recomputed.
+    pub(crate) fn set_segment_columns_with_root(
+        &mut self,
+        seg_id: u16,
+        cols: SegmentColumns,
+        seg_root: StateRoot,
+    ) {
+        let id = seg_id as usize;
+        if id >= self.num_segments {
+            return;
+        }
+        let live = Self::count_live(&cols);
+        self.live_counts[id] = live;
+        self.segments[id] = if live == 0 {
+            None
+        } else {
+            Some(Box::new(cols))
+        };
+        self.evicted.remove(&seg_id);
+        self.seg_roots[id] = Some(seg_root);
+        self.dirty.remove(&seg_id);
+        if self.num_segments > 1 {
+            self.tree[self.num_segments + id] = seg_root;
+            self.tree_dirty = true;
+            self.dirty_tree_leaves.insert(seg_id);
+        }
     }
 
     /// Segment IDs that currently contain at least one live UTXO.
@@ -1047,6 +1146,45 @@ mod tests {
         let r0 = s.root();
         s.set_slot(3, sv(42)).unwrap();
         assert_ne!(s.root(), r0);
+    }
+
+    #[test]
+    fn sparse_manifest_root_matches_segmented_state_root() {
+        let mut s = SegmentedFriState::new_empty(LOG_SEGMENT_SIZE + 1);
+        s.set_slot(3, sv(42)).unwrap();
+        s.set_slot((SEGMENT_SIZE + 7) as u32, sv(77)).unwrap();
+        let expected = s.root();
+        let ids: Vec<u16> = s.active_segment_ids().collect();
+        let roots: Vec<StateRoot> = ids.iter().map(|&seg_id| s.seg_root(seg_id)).collect();
+
+        let reconstructed = sparse_state_root_from_segment_roots(
+            LOG_SEGMENT_SIZE + 1,
+            LOG_SEGMENT_SIZE,
+            &ids,
+            &roots,
+        )
+        .expect("sparse root reconstructs");
+        assert_eq!(reconstructed, expected);
+
+        let unsorted_ids = vec![ids[1], ids[0]];
+        let unsorted_roots = vec![roots[1], roots[0]];
+        assert!(sparse_state_root_from_segment_roots(
+            LOG_SEGMENT_SIZE + 1,
+            LOG_SEGMENT_SIZE,
+            &unsorted_ids,
+            &unsorted_roots,
+        )
+        .is_err());
+
+        let duplicate_ids = vec![ids[0], ids[0]];
+        let duplicate_roots = vec![roots[0], roots[0]];
+        assert!(sparse_state_root_from_segment_roots(
+            LOG_SEGMENT_SIZE + 1,
+            LOG_SEGMENT_SIZE,
+            &duplicate_ids,
+            &duplicate_roots,
+        )
+        .is_err());
     }
 
     #[test]

@@ -43,6 +43,24 @@ use crate::interleaved_commit::{
 /// Domain-separation tag for mixed opening sub-protocol.
 pub const MIXED_OPEN_TAG: u64 = 0xFFF8_0000_0000_0000;
 
+/// Maximum column count for vector-mode mixed openings.
+///
+/// The vector binding loss is `(m - 1) / 2^128`.  With this cap the loss is
+/// at most `255 / 2^128 < 2^-120`.  Wider block/bucket relations must use a
+/// scalar terminal reduction before calling this PCS surface, which gives
+/// `n_cols = 1` at the mixed-opening layer.
+pub const MAX_MIXED_OPEN_VECTOR_COLS: usize = 256;
+
+#[cfg(not(test))]
+const DIRECT_SOURCE_EXPANSION_MIN_LOG: usize = 20;
+#[cfg(test)]
+const DIRECT_SOURCE_EXPANSION_MIN_LOG: usize = crate::compact_fri::COMPACT_TAU + 2;
+
+#[inline]
+fn use_direct_source_expansion(n_cols: usize, tau: usize, log_n: usize) -> bool {
+    n_cols == 1 && tau > 1 && log_n >= DIRECT_SOURCE_EXPANSION_MIN_LOG
+}
+
 #[derive(Debug)]
 struct MixedOpenPhaseTiming {
     name: &'static str,
@@ -249,6 +267,12 @@ pub fn prove_mixed_opening(
     let n_cols = state.n_cols;
     let log_n = state.log_rows;
     let n = 1 << log_n;
+    assert!(
+        n_cols <= MAX_MIXED_OPEN_VECTOR_COLS,
+        "mixed opening vector column count exceeds 120-bit soundness cap: n_cols={} max={}",
+        n_cols,
+        MAX_MIXED_OPEN_VECTOR_COLS
+    );
     assert_eq!(primary_point.len(), log_n);
 
     // Compute primary openings (all columns at primary_point). Use the same
@@ -388,6 +412,12 @@ pub fn verify_mixed_opening(
 ) -> Result<Vec<Block128>, String> {
     let n_cols = commitment.n_cols;
     let log_n = commitment.log_rows;
+    if n_cols > MAX_MIXED_OPEN_VECTOR_COLS {
+        return Err(format!(
+            "mixed opening vector column count exceeds 120-bit soundness cap: n_cols={} max={}",
+            n_cols, MAX_MIXED_OPEN_VECTOR_COLS
+        ));
+    }
     let total_claims = n_cols + secondary_claims.len();
 
     if proof.all_openings.len() != total_claims {
@@ -498,7 +528,11 @@ fn prove_source_binding(
         }
     };
 
-    let direct_source_expansion = n_cols == 1 && ctx.tau > 1;
+    // For very large single-column openings (state/block segments), avoid
+    // materializing high TensorFold layer trees: authenticating the source
+    // expansion is cheaper in time and memory. For wallet-sized single-column
+    // STARKs, the expansion dominates proof bytes, so use the folded-layer path.
+    let direct_source_expansion = use_direct_source_expansion(n_cols, ctx.tau, log_n);
     let (h_evals, folded_layers) = if direct_source_expansion {
         let expected_h_len = 1usize << ctx.n_rounds;
         let h_evals = if ctx.source_h_evals.len() == expected_h_len {
@@ -659,7 +693,7 @@ fn verify_source_binding(
         ));
     }
     let expected_layers = ctx.tau.saturating_sub(1);
-    let direct_source_expansion = n_cols == 1
+    let direct_source_expansion = use_direct_source_expansion(n_cols, ctx.tau, log_n)
         && expected_layers > 0
         && proof.folded_roots.is_empty()
         && proof.folded_queried_symbols.is_empty()
@@ -1477,6 +1511,26 @@ mod tests {
             hasher,
             num_queries,
         )
+    }
+
+    #[test]
+    fn vector_mode_rejects_columns_above_120_bit_cap() {
+        let (mut commitment, primary_point, secondary_claims, proof, ntt, hasher) = valid_fixture();
+        commitment.n_cols = MAX_MIXED_OPEN_VECTOR_COLS + 1;
+
+        let err = verify_with_claims(
+            &commitment,
+            &primary_point,
+            &secondary_claims,
+            &proof,
+            &ntt,
+            &hasher,
+        )
+        .expect_err("wide vector-mode mixed opening must reject before FRI verification");
+        assert!(
+            err.contains("120-bit soundness cap"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

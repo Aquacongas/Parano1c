@@ -378,6 +378,11 @@ impl Mempool {
             .collect()
     }
 
+    /// Total serialized TxIntent bytes retained by this mempool.
+    pub fn total_intent_bytes(&self) -> usize {
+        self.entries.values().map(|e| e.intent_bytes.len()).sum()
+    }
+
     /// Total fees available in the pool (useful for coinbase computation).
     pub fn total_fees(&self) -> u64 {
         self.entries

@@ -22,9 +22,17 @@ pub enum SubmitError {
     #[error("mempool full (capacity {capacity})")]
     Full { capacity: usize },
 
+    /// Pool serialized TxIntent byte cap would be exceeded.
+    #[error("mempool byte cap exceeded: {actual} bytes (max {max})")]
+    BytesFull { actual: usize, max: usize },
+
     /// Malformed TxIntent wire format.
     #[error("malformed intent: {0}")]
     MalformedIntent(String),
+
+    /// Serialized TxIntent bytes exceed the wire/admission cap.
+    #[error("tx intent too large: {actual} bytes (max {max})")]
+    IntentTooLarge { actual: usize, max: usize },
 
     /// Non-coinbase transactions must carry a wallet logic proof.
     #[error("missing logic proof for non-coinbase transaction")]
@@ -51,6 +59,7 @@ impl SubmitError {
             self,
             SubmitError::AlreadyAdmitted(_)
                 | SubmitError::Full { .. }
+                | SubmitError::BytesFull { .. }
                 | SubmitError::Consensus(ConsensusError::SlotConflict)
         )
     }

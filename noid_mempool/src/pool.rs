@@ -40,6 +40,9 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use noid_chain::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_TXS};
+use noid_chain::consensus::wire_limits::{
+    max_tx_intent_bytes_for_shape, MAX_TX_INTENT_BYTES_GLOBAL,
+};
 use noid_chain::consensus::{
     checks::validate_tx_consensus, pow::full_block_hash, required_fee_for_tx_body,
 };
@@ -149,6 +152,20 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
+        if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
+            return Err(SubmitError::IntentTooLarge {
+                actual: intent_bytes.len(),
+                max: MAX_TX_INTENT_BYTES_GLOBAL,
+            });
+        }
+        let shape_intent_cap = max_tx_intent_bytes_for_shape(intent.tx_body.shape);
+        if !intent.tx_body.is_coinbase && intent_bytes.len() > shape_intent_cap {
+            return Err(SubmitError::IntentTooLarge {
+                actual: intent_bytes.len(),
+                max: shape_intent_cap,
+            });
+        }
+
         // ── Stateless sanity check (no lock, no IO) ────────────────────
         // One hash computation rejects malformed intents before touching any
         // shared state.  Previously this ran after ZK verify — moved here so
@@ -184,16 +201,13 @@ impl AsyncMempool {
             }
         }
 
-        // Temporary relay cap until the post-redesign proof-size measurement phase
-        // tightens wallet/proof wire limits from observed release benchmarks.
-        const MAX_LOGIC_PROOF_BYTES: usize = 2 * 1024 * 1024;
         if !intent.tx_body.is_coinbase && intent.logic_proof_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
-        if intent.logic_proof_bytes.len() > MAX_LOGIC_PROOF_BYTES {
+        if intent.logic_proof_bytes.len() > shape_intent_cap {
             return Err(SubmitError::ProofTooLarge {
                 actual: intent.logic_proof_bytes.len(),
-                max: MAX_LOGIC_PROOF_BYTES,
+                max: shape_intent_cap,
             });
         }
         let needs_zk = !intent.tx_body.is_coinbase;
@@ -207,6 +221,16 @@ impl AsyncMempool {
             let st = self.state.lock().await;
             if st.pool.contains(&intent.tx_body_hash) {
                 return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
+            }
+            let projected_bytes = st
+                .pool
+                .total_intent_bytes()
+                .saturating_add(intent_bytes.len());
+            if projected_bytes > self.config.max_total_intent_bytes {
+                return Err(SubmitError::BytesFull {
+                    actual: projected_bytes,
+                    max: self.config.max_total_intent_bytes,
+                });
             }
             let tx = intent_to_transaction(&intent)?;
             // All cheap checks. anchor_height is discarded here — re-derived
@@ -248,6 +272,16 @@ impl AsyncMempool {
 
         if st.pool.contains(&hash) {
             return Err(SubmitError::AlreadyAdmitted(hash));
+        }
+        let projected_bytes = st
+            .pool
+            .total_intent_bytes()
+            .saturating_add(intent_bytes.len());
+        if projected_bytes > self.config.max_total_intent_bytes {
+            return Err(SubmitError::BytesFull {
+                actual: projected_bytes,
+                max: self.config.max_total_intent_bytes,
+            });
         }
 
         // Re-derive anchor_height from current state (needed by pool.admit).

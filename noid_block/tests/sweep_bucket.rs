@@ -1545,6 +1545,76 @@ fn native_state_delta_rejects_wrong_post_lane_before_opening_verify() {
 #[test]
 #[cfg_attr(
     debug_assertions,
+    ignore = "release-only state-delta segment-id binding regression"
+)]
+fn native_state_delta_rejects_tampered_segment_id_before_opening_verify() {
+    let standard = standard_fixture_with_params(0xE1, 0, 10, 0x55);
+    let body = standard.body.clone();
+    let block = block_with_user_tx(tx_from_body(body.clone()));
+    let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
+
+    let mut state = ChainState::with_log_slots(6);
+    seed_slot(&mut state, 0, body.inputs[0].value, body.inputs[0].owner);
+    seed_slot(&mut state, 1, body.inputs[1].value, body.inputs[1].owner);
+    let prev_state_root = state.state_root();
+
+    let tx_witness = TxBlockWitness {
+        block_tx_index: 1,
+        air: &standard.air as &dyn Air,
+        trace: &standard.trace,
+        pi: &standard.pi,
+        spine_inputs: &standard.spine_inputs,
+        auth_public: &standard.auth_public,
+        auth_proof: &standard.auth_proof,
+    };
+    let mut proof =
+        prove_block_with_total_tx_count(prev_state_root, [0u8; 32], &[tx_witness], &[], 1)
+            .expect("prove standard bucket");
+
+    let mut state_for_binding = state.state.clone();
+    let mut binding =
+        BlockStateBinding::build(&mut state_for_binding, &[body.clone()], &[commitment])
+            .expect("build binding");
+    patch_binding_new_root_with_coinbase(
+        &mut binding,
+        state_for_binding,
+        &block.transactions[0].body,
+    );
+
+    let pre_segs = pre_segments_for_state(&state, &[0, 1, 10, 11, 42]);
+    let owned = build_state_bindings_from_binding(
+        &binding,
+        &[body],
+        Some(&block.transactions[0].body),
+        &pre_segs,
+        prev_state_root,
+        1,
+        6,
+    );
+    let witnesses: Vec<_> = owned.iter().map(|b| b.as_witness()).collect();
+    let (_starks, pre_openings, post_openings) = prove_state_bindings_standalone(&witnesses);
+
+    proof.meta.new_state_root = binding.new_state_root;
+    proof.meta.n_state_bindings = witnesses.len() as u32;
+    proof.meta.state_binding_n_cols = 0;
+    proof.meta.state_binding_log_rows = 0;
+    proof.pre_state_openings = pre_openings;
+    proof.post_state_openings = post_openings;
+
+    proof.pre_state_openings[0].seg_id ^= 1;
+    let err = match build_state_binding_airs(&block, &proof, &state.state) {
+        Ok(_) => panic!("tampered pre-state segment id must reject"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        noid_block::VerifyBlockError::StateBindingSegmentMismatch { .. }
+    ));
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
     ignore = "release-only state-binding proof regression"
 )]
 fn standalone_state_binding_proves_and_verifies_for_sweep_only_path() {

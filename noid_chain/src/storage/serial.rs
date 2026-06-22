@@ -157,11 +157,31 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
 //   owners_hi         : n_elems × 16 bytes
 //   owners_lo         : n_elems × 16 bytes
 
+pub const ENCODED_SEGMENT_HEADER_BYTES: usize = 5;
+pub const SEGMENT_LANE_COUNT: usize = 3;
+pub const SEGMENT_FIELD_BYTES: usize = 16;
+pub const ENCODED_SEGMENT_SLOT_BYTES: usize = SEGMENT_LANE_COUNT * SEGMENT_FIELD_BYTES;
+
+#[inline]
+pub fn encoded_segment_len_for_eff_log(effective_log_seg: u8) -> Option<usize> {
+    if effective_log_seg as u32 >= usize::BITS {
+        return None;
+    }
+    let n = 1usize.checked_shl(effective_log_seg as u32)?;
+    ENCODED_SEGMENT_HEADER_BYTES.checked_add(n.checked_mul(ENCODED_SEGMENT_SLOT_BYTES)?)
+}
+
+#[inline]
+pub fn encoded_segments_total_len(segment_count: usize, effective_log_seg: u8) -> Option<usize> {
+    segment_count.checked_mul(encoded_segment_len_for_eff_log(effective_log_seg)?)
+}
+
 pub fn encode_segment(seg: &SegmentColumns, effective_log_seg: u8) -> Vec<u8> {
     let n = seg.values.len();
     debug_assert_eq!(n, seg.owners_hi.len());
     debug_assert_eq!(n, seg.owners_lo.len());
-    let mut buf = Vec::with_capacity(5 + n * 3 * 16);
+    let mut buf =
+        Vec::with_capacity(encoded_segment_len_for_eff_log(effective_log_seg).unwrap_or(0));
     buf.push(effective_log_seg);
     buf.extend_from_slice(&(n as u32).to_le_bytes());
     for b in &seg.values {
@@ -183,10 +203,16 @@ pub fn decode_segment(bytes: &[u8]) -> Option<(u8, SegmentColumns)> {
     }
     let effective_log_seg = bytes[0];
     let n = u32::from_le_bytes(bytes[1..5].try_into().ok()?) as usize;
-    let values_end = 5 + n * 16;
-    let hi_end = values_end + n * 16;
-    let lo_end = hi_end + n * 16;
-    if bytes.len() < lo_end {
+    if effective_log_seg as usize >= usize::BITS as usize {
+        return None;
+    }
+    if n != (1usize << effective_log_seg) {
+        return None;
+    }
+    let values_end = 5usize.checked_add(n.checked_mul(16)?)?;
+    let hi_end = values_end.checked_add(n.checked_mul(16)?)?;
+    let lo_end = hi_end.checked_add(n.checked_mul(16)?)?;
+    if bytes.len() != lo_end {
         return None;
     }
     // Bounds are already verified above (bytes.len() >= lo_end), so unwrap is safe.
@@ -390,6 +416,25 @@ mod tests {
         assert_eq!(ls, 25);
         assert_eq!(active, 1234567);
         assert_eq!(alloc, 999999);
+    }
+
+    #[test]
+    fn encoded_segment_size_matches_snapshot_caps() {
+        use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
+
+        assert_eq!(encoded_segment_len_for_eff_log(16), Some(3_145_733));
+        assert!(encoded_segment_len_for_eff_log(16).unwrap() <= MAX_SEGMENT_BYTES);
+        assert_eq!(MAX_SNAPSHOT_MANIFEST_SEGMENTS, u16::MAX as usize + 1);
+        assert_eq!(
+            encoded_segments_total_len(MAX_SNAPSHOT_MANIFEST_SEGMENTS, 16),
+            Some(206_158_757_888)
+        );
+    }
+
+    #[test]
+    fn encoded_segment_size_rejects_impossible_logs() {
+        assert_eq!(encoded_segment_len_for_eff_log(usize::BITS as u8), None);
+        assert_eq!(encoded_segments_total_len(usize::MAX, 16), None);
     }
 
     #[test]

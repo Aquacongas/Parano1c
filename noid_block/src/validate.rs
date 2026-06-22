@@ -37,6 +37,9 @@ use noid_air::Air;
 use noid_chain::block::{apply_state_delta, Block};
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::validation::{validate_block_checks, AnchorInfo};
+use noid_chain::consensus::wire_limits::{
+    proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_PROOF_BYTES,
+};
 use noid_chain::consensus::ConsensusError;
 use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
@@ -315,6 +318,19 @@ pub fn validate_block_from_network(
     pre_state: &noid_chain::segmented_state::SegmentedFriState,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
+    if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
+        || !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len())
+    {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::ShapeMismatch,
+        ));
+    }
+    if block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::AuthSidecarShapeMismatch,
+        ));
+    }
+
     let proof: BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|_| FullValidationError::ZkProof(crate::VerifyBlockError::ShapeMismatch))?;
     let sidecar: BlockAuthSidecar =

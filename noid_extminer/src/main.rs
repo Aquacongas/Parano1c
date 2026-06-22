@@ -23,15 +23,17 @@
 //! ## Template protocol
 //!
 //! `getBlockTemplate("")` returns:
-//!   - `header_core_hex`       — 212-byte PoW input
-//!   - `block_hex`             — full sealed block with nonce = 0
-//!   - `block_proof_hex`       — serialized BlockProof, empty for coinbase-only
-//!   - `nonce_offset`          — byte offset of nonce inside block_hex (always 144)
-//!   - `difficulty_target_hex` — 256-bit LE target
-//!   - shape/proof metadata    — operator display only; PoW uses header_core
+//!   - `header_core_hex`          — 212-byte PoW input
+//!   - `block_hex`                — full sealed block with nonce = 0
+//!   - `block_proof_hex`          — serialized BlockProof, empty for coinbase-only
+//!   - `block_auth_sidecar_hex`   — serialized public Auth sidecar, empty when absent
+//!   - `nonce_offset`             — byte offset of nonce inside block_hex (always 144)
+//!   - `difficulty_target_hex`    — 256-bit LE target
+//!   - shape/proof metadata       — operator display only; PoW uses header_core
 //!
 //! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
-//! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex)`.
+//! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex,
+//! block_auth_sidecar_hex)`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,8 +55,9 @@ use serde::{Deserialize, Serialize};
     about = "External Blake3 PoW miner for the Paranoid blockchain",
     long_about = "Fetches block templates from a paranoid node and mines blocks \
                   using all available CPU cores.\n\n\
-                  The node controls coinbase address — the miner only does PoW.\n\
-                  Rewards go to whoever operates the node (pool or solo)."
+                  The node builds the proven template; this worker only does PoW.\n\
+                  Coinbase is the node payout address unless the node enables \
+                  --allow-custom-coinbase and the worker supplies --coinbase."
 )]
 struct Cli {
     /// JSON-RPC endpoint of the paranoid node or pool.
@@ -96,6 +99,8 @@ struct BlockTemplateResponse {
     header_core_hex: String,
     block_hex: String,
     block_proof_hex: String,
+    #[serde(default)]
+    block_auth_sidecar_hex: String,
     nonce_offset: usize,
     difficulty_target_hex: String,
     height: u64,
@@ -185,8 +190,16 @@ impl RpcClient {
         self.call("paranoid_getBlockTemplate", [coinbase])
     }
 
-    fn submit_block(&self, block_hex: &str, block_proof_hex: &str) -> Result<String> {
-        self.call("paranoid_submitBlock", (block_hex, block_proof_hex))
+    fn submit_block(
+        &self,
+        block_hex: &str,
+        block_proof_hex: &str,
+        block_auth_sidecar_hex: &str,
+    ) -> Result<String> {
+        self.call(
+            "paranoid_submitBlock",
+            (block_hex, block_proof_hex, block_auth_sidecar_hex),
+        )
     }
 }
 
@@ -434,7 +447,11 @@ fn mine(cli: &Cli) -> Result<()> {
         block_bytes[nonce_offset..nonce_offset + 16].copy_from_slice(&nonce_bytes);
 
         // Submit.
-        match rpc.submit_block(&hex::encode(&block_bytes), &tmpl.block_proof_hex) {
+        match rpc.submit_block(
+            &hex::encode(&block_bytes),
+            &tmpl.block_proof_hex,
+            &tmpl.block_auth_sidecar_hex,
+        ) {
             Ok(hash) => {
                 blocks_found += 1;
                 last_height = height;

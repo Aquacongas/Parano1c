@@ -23,7 +23,8 @@ pub use memory::RamBackend;
 pub use serial::{
     decode_chain_tip, decode_header, decode_segment, decode_state_meta, decode_tx_index_value,
     decode_undo_log, encode_chain_tip, encode_header, encode_segment, encode_slot_value,
-    encode_state_meta, encode_tx_index_value, encode_undo_log, u64_key,
+    encode_state_meta, encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
+    encoded_segments_total_len, u64_key,
 };
 
 use crate::block_header::BlockHeader;

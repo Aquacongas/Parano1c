@@ -15,6 +15,11 @@ use jsonrpsee::types::ErrorObject;
 use tokio::sync::RwLock;
 
 use noid_chain::block::Block;
+use noid_chain::consensus::wire_limits::{
+    hex_chars_for_bytes, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES, MAX_RPC_SALT_BYTES,
+    MAX_TX_INTENT_BYTES_GLOBAL,
+};
 use noid_chain::consensus::{allocator::generate_slot_hints, pow::full_block_hash};
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
@@ -31,6 +36,49 @@ use crate::wallet_ops::WalletOps;
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
+}
+
+#[inline]
+fn trim_hex_prefix(s: &str) -> &str {
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
+}
+
+fn ensure_hex_max_chars(
+    name: &str,
+    hex_str: &str,
+    max_bytes: usize,
+) -> Result<(), ErrorObject<'static>> {
+    let hex_str = trim_hex_prefix(hex_str);
+    let max_chars = hex_chars_for_bytes(max_bytes);
+    if hex_str.len() > max_chars {
+        return Err(rpc_err(format!(
+            "{name} too large: {} hex chars (max {max_chars}, {max_bytes} bytes)",
+            hex_str.len()
+        )));
+    }
+    Ok(())
+}
+
+fn decode_bounded_hex(
+    name: &str,
+    hex_str: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ErrorObject<'static>> {
+    ensure_hex_max_chars(name, hex_str, max_bytes)?;
+    hex::decode(trim_hex_prefix(hex_str)).map_err(|e| rpc_err(format!("{name} hex decode: {e}")))
+}
+
+fn decode_32_byte_hex(name: &str, hex_str: &str) -> Result<[u8; 32], ErrorObject<'static>> {
+    let hex_str = trim_hex_prefix(hex_str);
+    if hex_str.len() != 64 {
+        return Err(rpc_err(format!("invalid {name}: expected 64-char hex")));
+    }
+    hex::decode(hex_str)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| rpc_err(format!("invalid {name}: expected 32-byte hex")))
 }
 
 #[inline]
@@ -89,8 +137,7 @@ fn estimate_shape_for_counts(
 }
 
 fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
-    let salt = salt_hex.trim_start_matches("0x");
-    let bytes = hex::decode(salt).map_err(|e| rpc_err(format!("salt hex decode: {e}")))?;
+    let bytes = decode_bounded_hex("salt", salt_hex, MAX_RPC_SALT_BYTES)?;
     let mut acc = 0xD6E8_FD9D_AA28_4A7Bu64;
     for chunk in bytes.chunks(8) {
         let mut word = [0u8; 8];
@@ -211,10 +258,7 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>> {
-        let hash_bytes: [u8; 32] = hex::decode(&hash)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| rpc_err("invalid hash hex (expected 32-byte hex)"))?;
+        let hash_bytes = decode_32_byte_hex("hash", &hash)?;
         let chain = self.chain.read().await;
         match chain.store.get_header_by_hash(&hash_bytes) {
             Ok(Some(hdr)) => {
@@ -404,10 +448,7 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>> {
-        let hash_bytes: [u8; 32] = hex::decode(&txhash)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let chain = self.chain.read().await;
         match chain.store.get_tx_index(&hash_bytes) {
             Ok(Some((height, tx_position))) => {
@@ -431,10 +472,7 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn is_nullifier(&self, txhash: String) -> RpcResult<bool> {
         use noid_poseidon2b::primitives::TxBodyHash;
-        let hash_bytes: [u8; 32] = hex::decode(&txhash)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let chain = self.chain.read().await;
         Ok(chain.nullifiers.contains(&TxBodyHash(hash_bytes)))
     }
@@ -567,7 +605,7 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn submit_tx_intent(&self, hex_str: String) -> RpcResult<String> {
-        let bytes = hex::decode(&hex_str).map_err(|e| rpc_err(format!("hex decode: {e}")))?;
+        let bytes = decode_bounded_hex("tx intent", &hex_str, MAX_TX_INTENT_BYTES_GLOBAL)?;
         let intent =
             noid_tx::TxIntent::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode: {e:?}")))?;
         let hash = self
@@ -583,10 +621,7 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
-        let hash_bytes: [u8; 32] = hex::decode(&txhash)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| rpc_err("invalid txhash: expected 64-char hex"))?;
+        let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = noid_poseidon2b::primitives::TxBodyHash(hash_bytes);
         let found = self.mempool.get_entry_by_hash(&hash).await;
         Ok(found.map(|e| MempoolTxInfo {
@@ -608,7 +643,7 @@ impl ParanoidApiServer for RpcHandler {
     async fn verify_receipt(&self, receipt_hex: String) -> RpcResult<ReceiptVerifyResult> {
         use noid_chain::consensus::receipt::{verify_against_header, verify_merkle_inclusion};
 
-        let bytes = hex::decode(&receipt_hex).map_err(|e| rpc_err(format!("hex: {e}")))?;
+        let bytes = decode_bounded_hex("receipt", &receipt_hex, MAX_RPC_RECEIPT_BYTES)?;
 
         let receipt = noid_chain::consensus::receipt::ParanoidReceipt::from_bytes(&bytes)
             .map_err(|e| rpc_err(format!("decode receipt: {e:?}")))?;
@@ -811,20 +846,30 @@ impl ParanoidApiServer for RpcHandler {
         block_proof_hex: String,
         block_auth_sidecar_hex: String,
     ) -> RpcResult<String> {
-        let bytes = hex::decode(&block_hex).map_err(|e| rpc_err(format!("block hex: {e}")))?;
+        let bytes = decode_bounded_hex("block", &block_hex, MAX_BLOCK_BYTES)?;
         let block =
             Block::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode block: {e:?}")))?;
         let block_proof_bytes = if block_proof_hex.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&block_proof_hex).map_err(|e| rpc_err(format!("proof hex: {e}")))?
+            decode_bounded_hex("block proof", &block_proof_hex, MAX_BLOCK_PROOF_BYTES)?
         };
         let block_auth_sidecar_bytes = if block_auth_sidecar_hex.is_empty() {
             Vec::new()
         } else {
-            hex::decode(&block_auth_sidecar_hex)
-                .map_err(|e| rpc_err(format!("auth sidecar hex: {e}")))?
+            decode_bounded_hex(
+                "block auth sidecar",
+                &block_auth_sidecar_hex,
+                MAX_BLOCK_AUTH_SIDECAR_BYTES,
+            )?
         };
+        if !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len()) {
+            return Err(rpc_err(format!(
+                "block proof+auth sidecar too large: proof={} bytes, sidecar={} bytes",
+                block_proof_bytes.len(),
+                block_auth_sidecar_bytes.len()
+            )));
+        }
 
         let local_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

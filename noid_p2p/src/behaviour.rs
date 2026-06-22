@@ -30,6 +30,7 @@ use libp2p::{
     swarm::NetworkBehaviour, StreamProtocol,
 };
 use libp2p_connection_limits as connection_limits;
+use noid_chain::consensus::wire_limits::GOSSIP_MAX_TRANSMIT_BYTES;
 
 use crate::protocol::{
     GetHeadersRequest, GetHeadersResponse, GetMempoolRequest, GetMempoolResponse,
@@ -189,7 +190,6 @@ impl NodeBehaviour {
         // Strategy: inline blocks up to 1 MB via gossip for low-tx blocks.
         // Larger blocks use compact announcement + pull sync via block_sync
         // request-response so peers pull block/proof bytes on demand.
-        const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024; // 2 MB
 
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(700))

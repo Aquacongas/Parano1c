@@ -19,7 +19,13 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
-use noid_chain::storage::MdbxChainContext;
+use noid_chain::consensus::wire_limits::{
+    proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HEADER_BYTES, MAX_MEMPOOL_SYNC_BYTES,
+    MAX_MEMPOOL_SYNC_TXS, MAX_RECURSIVE_PROOF_BYTES, MAX_SEGMENT_BYTES,
+    MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
+};
+use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
 use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
@@ -33,18 +39,7 @@ struct PendingStateSegmentResponse {
     response: GetStateSegmentResponse,
 }
 
-// Hard caps on incoming response sizes to prevent OOM from malicious peers.
-// Proof-related caps are intentionally conservative until the Sweep25x2
-// post-redesign benchmark phase remeasures wallet and block proof sizes.
-const MAX_BLOCK_BYTES: usize = 512 * 1024; // 512 KB block payload cap.
-const MAX_BLOCK_PROOF_BYTES: usize = 6 * 1024 * 1024; // canonical BlockProof cap.
-const MAX_BLOCK_AUTH_SIDECAR_BYTES: usize = 12 * 1024 * 1024; // public AuthGKR sidecar cap.
-const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024; // 8 MB per segment (3 MB typical + margin).
-const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024; // 64 KB recursive proof cap.
-const MAX_HEADER_BYTES: usize = 512; // 276 bytes typical + margin.
-const MAX_TX_WIRE_SIZE: usize = 2 * 1024 * 1024; // temporary TxIntent cap until wallet proof remeasure.
-const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024; // bound total mempool-sync response.
-const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024; // 1 MB block+proof inline gossip cap.
+// Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
 #[inline]
 fn should_inline_block_gossip(
@@ -913,6 +908,11 @@ async fn handle_swarm_event(
                             tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
                         } else if block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_auth_sidecar_bytes.len(), "inline auth sidecar too large — dropped");
+                        } else if !proof_sidecar_combined_len_ok(
+                            block_proof_bytes.len(),
+                            block_auth_sidecar_bytes.len(),
+                        ) {
+                            tracing::warn!(peer = %propagation_source, proof_len = block_proof_bytes.len(), sidecar_len = block_auth_sidecar_bytes.len(), "inline proof+sidecar combined cap exceeded — dropped");
                         } else {
                             const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                             const BLOCK_RATE_MAX: u32 = 40;
@@ -943,7 +943,7 @@ async fn handle_swarm_event(
                     }
                 }
             } else if topic == topics.txs.as_str() {
-                if message.data.len() > MAX_TX_WIRE_SIZE {
+                if message.data.len() > MAX_TX_INTENT_BYTES_GLOBAL {
                     tracing::warn!(peer = %propagation_source, len = message.data.len(), "tx gossip too large — dropped");
                 } else {
                     const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -1226,6 +1226,11 @@ async fn handle_swarm_event(
                         tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
                     } else if auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
                         tracing::warn!(peer = %peer, len = auth_sidecar_bytes.len(), "block auth sidecar too large — dropped");
+                    } else if !proof_sidecar_combined_len_ok(
+                        proof_bytes.len(),
+                        auth_sidecar_bytes.len(),
+                    ) {
+                        tracing::warn!(peer = %peer, proof_len = proof_bytes.len(), sidecar_len = auth_sidecar_bytes.len(), "block proof+sidecar combined cap exceeded — dropped");
                     } else {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
@@ -1264,17 +1269,61 @@ async fn handle_swarm_event(
             },
         )) => {
             let ctx = chain.read().await;
-            let block_bytes = ctx.store.get_recent_block(request.height).ok().flatten();
+            let mut block_bytes = ctx.store.get_recent_block(request.height).ok().flatten();
             // Also load the block proof if we have it.
             // Proofs are stored temporarily (last FINALITY_DEPTH blocks) for the
             // recursive prover and for serving to syncing peers.
-            let block_proof_bytes = ctx.store.get_block_proof(request.height).ok().flatten();
-            let block_auth_sidecar_bytes = ctx
+            let mut block_proof_bytes = ctx.store.get_block_proof(request.height).ok().flatten();
+            let mut block_auth_sidecar_bytes = ctx
                 .store
                 .get_block_auth_sidecar(request.height)
                 .ok()
                 .flatten();
             drop(ctx);
+            if block_bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
+            {
+                tracing::warn!(
+                    height = request.height,
+                    "stored block exceeds wire cap — not serving"
+                );
+                block_bytes = None;
+                block_proof_bytes = None;
+                block_auth_sidecar_bytes = None;
+            }
+            if block_proof_bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_PROOF_BYTES)
+            {
+                tracing::warn!(
+                    height = request.height,
+                    "stored block proof exceeds wire cap — not serving proof"
+                );
+                block_proof_bytes = None;
+            }
+            if block_auth_sidecar_bytes
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES)
+            {
+                tracing::warn!(
+                    height = request.height,
+                    "stored auth sidecar exceeds wire cap — not serving sidecar"
+                );
+                block_auth_sidecar_bytes = None;
+            }
+            let proof_len = block_proof_bytes.as_ref().map_or(0, Vec::len);
+            let sidecar_len = block_auth_sidecar_bytes.as_ref().map_or(0, Vec::len);
+            if !proof_sidecar_combined_len_ok(proof_len, sidecar_len) {
+                tracing::warn!(
+                    height = request.height,
+                    proof_len,
+                    sidecar_len,
+                    "stored proof+sidecar exceed combined wire cap — not serving proof data"
+                );
+                block_proof_bytes = None;
+                block_auth_sidecar_bytes = None;
+            }
             let _ = swarm.behaviour_mut().block_sync.send_response(
                 channel,
                 GetRecentBlockResponse {
@@ -1353,55 +1402,98 @@ async fn handle_swarm_event(
         )) => {
             use noid_chain::consensus::params::ANCHOR_DEPTH;
             let manifest = {
-                let ctx = chain.write().await;
+                let mut ctx = chain.write().await;
                 let tip_h = ctx.tip_height();
                 if tip_h == 0 || tip_h <= request.requester_height {
                     GetStateManifestResponse::default()
                 } else {
                     let eff_log = ctx.state.state.effective_log_segment_size() as u8;
                     let segment_ids: Vec<u16> = ctx.state.state.active_segment_ids().collect();
-                    let header_start = tip_h.saturating_sub(154);
-                    let recent_headers = (header_start..=tip_h)
-                        .filter_map(|h| {
-                            ctx.recent_headers
-                                .get(&h)
-                                .cloned()
-                                .or_else(|| ctx.get_header_from_store(h).ok().flatten())
-                        })
-                        .map(|hdr| {
-                            let mut b = Vec::new();
-                            hdr.encode(&mut b);
-                            b
-                        })
-                        .collect();
-                    let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
-                    let nullifier_blocks = (null_start..=tip_h)
-                        .map(|h| {
-                            ctx.store
-                                .get_undo_log(h)
-                                .ok()
-                                .flatten()
-                                .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    let tip_hdr = ctx.tip_header().clone();
-                    tracing::info!(
-                        requester_height = request.requester_height,
-                        our_height = tip_h,
-                        segments = segment_ids.len(),
-                        "serving state manifest"
-                    );
-                    GetStateManifestResponse {
-                        tip_height: tip_h,
-                        tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
-                        log_slots: tip_hdr.log_slots,
-                        active_slot_count: tip_hdr.active_slot_count,
-                        alloc_counter: tip_hdr.alloc_counter,
-                        eff_log,
-                        segment_ids,
-                        recent_headers,
-                        nullifier_blocks,
+                    let snapshot_caps_ok = match encoded_segment_len_for_eff_log(eff_log) {
+                        Some(expected_segment_bytes)
+                            if expected_segment_bytes <= MAX_SEGMENT_BYTES
+                                && segment_ids.len() <= MAX_SNAPSHOT_MANIFEST_SEGMENTS =>
+                        {
+                            true
+                        }
+                        Some(expected_segment_bytes)
+                            if expected_segment_bytes <= MAX_SEGMENT_BYTES =>
+                        {
+                            tracing::warn!(
+                                segments = segment_ids.len(),
+                                max_segments = MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+                                "state manifest not served: snapshot manifest segment cap exceeded"
+                            );
+                            false
+                        }
+                        Some(expected_segment_bytes) => {
+                            tracing::warn!(
+                                eff_log,
+                                expected_segment_bytes,
+                                max_segment = MAX_SEGMENT_BYTES,
+                                "state manifest not served: segment encoding exceeds per-segment cap"
+                            );
+                            false
+                        }
+                        None => {
+                            tracing::warn!(
+                                eff_log,
+                                "state manifest not served: invalid effective segment log"
+                            );
+                            false
+                        }
+                    };
+                    if !snapshot_caps_ok {
+                        GetStateManifestResponse::default()
+                    } else {
+                        let segment_roots: Vec<[u8; 32]> = segment_ids
+                            .iter()
+                            .map(|&seg_id| ctx.state.state.seg_root(seg_id))
+                            .collect();
+                        let header_start = tip_h.saturating_sub(154);
+                        let recent_headers = (header_start..=tip_h)
+                            .filter_map(|h| {
+                                ctx.recent_headers
+                                    .get(&h)
+                                    .cloned()
+                                    .or_else(|| ctx.get_header_from_store(h).ok().flatten())
+                            })
+                            .map(|hdr| {
+                                let mut b = Vec::new();
+                                hdr.encode(&mut b);
+                                b
+                            })
+                            .collect();
+                        let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
+                        let nullifier_blocks = (null_start..=tip_h)
+                            .map(|h| {
+                                ctx.store
+                                    .get_undo_log(h)
+                                    .ok()
+                                    .flatten()
+                                    .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let tip_hdr = ctx.tip_header().clone();
+                        tracing::info!(
+                            requester_height = request.requester_height,
+                            our_height = tip_h,
+                            segments = segment_ids.len(),
+                            "serving state manifest"
+                        );
+                        GetStateManifestResponse {
+                            tip_height: tip_h,
+                            tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
+                            log_slots: tip_hdr.log_slots,
+                            active_slot_count: tip_hdr.active_slot_count,
+                            alloc_counter: tip_hdr.alloc_counter,
+                            eff_log,
+                            segment_ids,
+                            segment_roots,
+                            recent_headers,
+                            nullifier_blocks,
+                        }
                     }
                 }
             };
@@ -1432,6 +1524,14 @@ async fn handle_swarm_event(
                     tracing::warn!(from = %peer, "manifest: oversized header entry, dropping");
                     return;
                 }
+                if response.segment_ids.len() != response.segment_roots.len() {
+                    tracing::warn!(from = %peer, "manifest: segment_ids/segment_roots length mismatch, dropping");
+                    return;
+                }
+                if !response.segment_ids.windows(2).all(|w| w[0] < w[1]) {
+                    tracing::warn!(from = %peer, "manifest: segment IDs are not strictly sorted, dropping");
+                    return;
+                }
                 let segment_span = response.log_slots.saturating_sub(response.eff_log as u32);
                 let max_possible_segments = 1usize.checked_shl(segment_span).unwrap_or(usize::MAX);
                 if response.segment_ids.len() > max_possible_segments {
@@ -1445,13 +1545,29 @@ async fn handle_swarm_event(
                     );
                     return;
                 }
-                if response.segment_ids.len() > 4096 {
-                    tracing::warn!(from = %peer, "manifest: too many segment IDs, dropping");
+                if response.segment_ids.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS {
+                    tracing::warn!(
+                        from = %peer,
+                        segments = response.segment_ids.len(),
+                        max_segments = MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+                        "manifest: too many segment IDs, dropping"
+                    );
                     return;
                 }
-                if response.segment_ids.len().saturating_mul(MAX_SEGMENT_BYTES) > 1024 * 1024 * 1024
-                {
-                    tracing::warn!(from = %peer, segments = response.segment_ids.len(), "manifest: total segment bytes exceed cap, dropping");
+                let Some(expected_segment_bytes) =
+                    encoded_segment_len_for_eff_log(response.eff_log)
+                else {
+                    tracing::warn!(from = %peer, eff_log = response.eff_log, "manifest: invalid effective segment log, dropping");
+                    return;
+                };
+                if expected_segment_bytes > MAX_SEGMENT_BYTES {
+                    tracing::warn!(
+                        from = %peer,
+                        eff_log = response.eff_log,
+                        expected_segment_bytes,
+                        max_segment = MAX_SEGMENT_BYTES,
+                        "manifest: segment encoding exceeds per-segment cap, dropping"
+                    );
                     return;
                 }
                 tracing::info!(
@@ -1574,6 +1690,20 @@ async fn handle_swarm_event(
             },
         )) => {
             if let Some(ref data) = response.data {
+                let Some(expected_len) = encoded_segment_len_for_eff_log(response.eff_log) else {
+                    tracing::warn!(peer = %peer, segment = response.segment_id, eff_log = response.eff_log, "segment response has invalid effective segment log — dropped");
+                    return;
+                };
+                if data.len() != expected_len {
+                    tracing::warn!(
+                        peer = %peer,
+                        segment = response.segment_id,
+                        len = data.len(),
+                        expected = expected_len,
+                        "segment response encoded length mismatch — dropped"
+                    );
+                    return;
+                }
                 if data.len() > MAX_SEGMENT_BYTES {
                     tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response too large — dropped");
                     return;
@@ -1598,10 +1728,22 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            let txs = mempool.all_intent_bytes().await;
+            let mut txs = mempool.all_intent_bytes().await;
+            if txs.len() > MAX_MEMPOOL_SYNC_TXS {
+                txs.truncate(MAX_MEMPOOL_SYNC_TXS);
+            }
+            let mut total_bytes = 0usize;
+            txs.retain(|tx| {
+                if tx.len() > MAX_TX_INTENT_BYTES_GLOBAL {
+                    return false;
+                }
+                total_bytes = total_bytes.saturating_add(tx.len());
+                total_bytes <= MAX_MEMPOOL_SYNC_BYTES
+            });
             tracing::debug!(
                 peer = %peer,
                 tx_count = txs.len(),
+                total_bytes,
                 "serving mempool sync request"
             );
             let _ = swarm
@@ -1617,19 +1759,18 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            const MAX_SYNC_TXS: usize = 8192;
             let mut txs = response.txs;
-            if txs.len() > MAX_SYNC_TXS {
+            if txs.len() > MAX_MEMPOOL_SYNC_TXS {
                 tracing::warn!(
                     from = %peer,
                     count = txs.len(),
-                    "mempool sync response oversized, truncating to {MAX_SYNC_TXS}"
+                    "mempool sync response oversized, truncating to {MAX_MEMPOOL_SYNC_TXS}"
                 );
-                txs.truncate(MAX_SYNC_TXS);
+                txs.truncate(MAX_MEMPOOL_SYNC_TXS);
             }
             let mut total_bytes = 0usize;
             txs.retain(|tx| {
-                if tx.len() > MAX_TX_WIRE_SIZE {
+                if tx.len() > MAX_TX_INTENT_BYTES_GLOBAL {
                     tracing::warn!(from = %peer, len = tx.len(), "mempool sync tx too large — dropped");
                     return false;
                 }
@@ -1764,8 +1905,8 @@ mod tests {
     fn conservative_wire_caps_are_ordered_for_sweep_redesign() {
         assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
-        assert!(MAX_TX_WIRE_SIZE >= INLINE_BLOCK_GOSSIP_THRESHOLD);
-        assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_WIRE_SIZE);
+        assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
         assert!(MAX_RECURSIVE_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
     }
 }

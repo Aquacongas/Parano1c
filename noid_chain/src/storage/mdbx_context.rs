@@ -903,7 +903,7 @@ impl MdbxChainContext {
         nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
     ) -> Result<(), MdbxContextError>
     where
-        I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns)>,
+        I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
     {
         use crate::block_header::BlockHeader;
         use crate::consensus::difficulty::{add_work, block_work};
@@ -914,8 +914,8 @@ impl MdbxChainContext {
         let mut seg_state =
             crate::segmented_state::SegmentedFriState::new_empty(log_slots as usize);
         let mut segment_count = 0usize;
-        for (seg_id, _eff_log, cols) in segments {
-            seg_state.set_segment_columns(seg_id, cols);
+        for (seg_id, _eff_log, cols, seg_root) in segments {
+            seg_state.set_segment_columns_with_root(seg_id, cols, seg_root);
             segment_count += 1;
         }
 

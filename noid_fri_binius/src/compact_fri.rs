@@ -19,6 +19,7 @@
 //! - final_codeword: 4 * 16 = 64 bytes
 
 use noid_core::mle::eq::eq_ind_partial_eval;
+use noid_core::mle::evaluate::evaluate_flat_with_scratch;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::code::{fold, Code, LOG_RATE};
 use noid_fri::hasher::{CryptographicHasher, HashOutput};
@@ -201,14 +202,29 @@ where
     let n = eval_point.len();
     let (right, left) = eval_point.split_at(n - tau);
 
-    // Upper partial evaluations.
+    // Upper partial evaluations.  This is a prover hot path for block
+    // buckets (`tau=8`, `row_len=2^16`): use the flat/GCM evaluator with
+    // per-thread scratch instead of allocating and tower-folding each row.
     let n_rows = 1 << tau;
     let row_len = evals.len() / n_rows;
+    thread_local! {
+        static UPPER_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+        static UPPER_POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+    }
     let upper_partial_evals: Vec<Block128> = (0..n_rows)
         .into_par_iter()
         .map(|row| {
             let row_evals = &evals[row * row_len..(row + 1) * row_len];
-            mle_evaluate(row_evals, right)
+            UPPER_FLAT_SCRATCH.with(|flat| {
+                UPPER_POINT_FLAT_SCRATCH.with(|point_flat| {
+                    evaluate_flat_with_scratch(
+                        row_evals,
+                        right,
+                        &mut flat.borrow_mut(),
+                        &mut point_flat.borrow_mut(),
+                    )
+                })
+            })
         })
         .collect();
     profile_phase("upper_partial_evals");
@@ -226,29 +242,7 @@ where
     let tensor_batching_point = channel.get_random_points(tau);
     let batching_eq = eq_ind_partial_eval(&tensor_batching_point);
 
-    let batched_evals: Vec<Block128> = if row_len >= 1024 {
-        (0..row_len)
-            .into_par_iter()
-            .map(|j| {
-                let mut acc = Block128::ZERO;
-                for (row_idx, &coeff) in batching_eq.iter().enumerate() {
-                    acc += coeff * evals[row_idx * row_len + j];
-                }
-                acc
-            })
-            .collect()
-    } else {
-        let mut out = vec![Block128::ZERO; row_len];
-        for (row_idx, &coeff) in batching_eq.iter().enumerate() {
-            for (j, val) in evals[row_idx * row_len..(row_idx + 1) * row_len]
-                .iter()
-                .enumerate()
-            {
-                out[j] += coeff * *val;
-            }
-        }
-        out
-    };
+    let batched_evals: Vec<Block128> = tensor_batch_rows_flat(evals, row_len, &batching_eq);
     profile_phase("tensor_batching");
 
     // FRI commit phase with sumcheck.
@@ -830,24 +824,58 @@ fn compute_round_depth(n_rounds: usize, round: usize) -> usize {
     n_rounds + LOG_RATE - 1 - round
 }
 
-/// Evaluate a multilinear extension at a point.
-fn mle_evaluate(evals: &[Block128], point: &[Block128]) -> Block128 {
-    if point.is_empty() {
-        return if evals.is_empty() {
-            Block128::ZERO
-        } else {
-            evals[0]
-        };
+/// Batch high rows with a tensor-product coefficient table:
+/// `out[j] = Σ_row coeff[row] * evals[row * row_len + j]`.
+///
+/// The old column-parallel loop touched `evals` with a `row_len` stride for each
+/// output position, which is cache-hostile for block buckets.  This version reads
+/// each source row contiguously, accumulates per worker in flat/GCM basis, then
+/// XOR-reduces worker accumulators.  It preserves the exact field operation while
+/// avoiding tower-basis multiplication in the hot loop.
+fn tensor_batch_rows_flat(
+    evals: &[Block128],
+    row_len: usize,
+    coeffs: &[Block128],
+) -> Vec<Block128> {
+    use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
+
+    if coeffs.is_empty() {
+        return Vec::new();
     }
-    let mut buf = evals.to_vec();
-    for &r in point.iter().rev() {
-        let half = buf.len() / 2;
-        for i in 0..half {
-            buf[i] = buf[i] + r * (buf[i + half] + buf[i]);
-        }
-        buf.truncate(half);
-    }
-    buf[0]
+    debug_assert_eq!(evals.len(), row_len * coeffs.len());
+
+    let coeffs_flat: Vec<u128> = coeffs
+        .iter()
+        .map(|coeff| tower_to_flat_u128(coeff.0))
+        .collect();
+
+    let out_flat = (0..coeffs.len())
+        .into_par_iter()
+        .fold(
+            || vec![0u128; row_len],
+            |mut acc, row_idx| {
+                let coeff = coeffs_flat[row_idx];
+                if coeff != 0 {
+                    let row = &evals[row_idx * row_len..(row_idx + 1) * row_len];
+                    acc.iter_mut().zip(row.iter()).for_each(|(slot, &v)| {
+                        *slot ^= clmul_gcm(coeff, tower_to_flat_u128(v.0));
+                    });
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0u128; row_len],
+            |mut a, b| {
+                a.iter_mut().zip(b.iter()).for_each(|(ai, &bi)| *ai ^= bi);
+                a
+            },
+        );
+
+    out_flat
+        .into_iter()
+        .map(|v| Block128::from(flat_to_tower_u128(v)))
+        .collect()
 }
 
 /// Fold an evaluation vector in half at challenge r.

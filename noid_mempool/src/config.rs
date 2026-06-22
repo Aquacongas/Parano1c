@@ -3,13 +3,16 @@
 
 //! Mempool configuration.
 
-use noid_chain::consensus::params::BLOCK_MAX_TXS;
+use noid_chain::consensus::wire_limits::{MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS};
 
 /// Configuration for the async mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {
-    /// Maximum number of admitted transactions. Default: 8 × BLOCK_MAX_TXS.
+    /// Maximum number of admitted transactions.
     pub capacity: usize,
+
+    /// Maximum serialized TxIntent bytes retained in RAM.
+    pub max_total_intent_bytes: usize,
 
     /// Number of recent admitted-tx fees used to compute the dynamic fee floor.
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
@@ -24,7 +27,8 @@ pub struct MempoolConfig {
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
-            capacity: BLOCK_MAX_TXS * 8,
+            capacity: MAX_MEMPOOL_TXS,
+            max_total_intent_bytes: MAX_MEMPOOL_BYTES,
             fee_floor_window: 50,
             zk_verify_workers: 4,
         }
@@ -34,6 +38,11 @@ impl Default for MempoolConfig {
 impl MempoolConfig {
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
+        self
+    }
+
+    pub fn with_max_total_intent_bytes(mut self, bytes: usize) -> Self {
+        self.max_total_intent_bytes = bytes;
         self
     }
 

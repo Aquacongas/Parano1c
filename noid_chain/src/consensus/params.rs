@@ -26,12 +26,10 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 // Block limits
 // ---------------------------------------------------------------------------
 
-/// Maximum non-coinbase transactions per block.
+/// Maximum transactions per block.
 ///
-/// Hardware is the natural regulator: weak nodes prove fewer txs within
-/// BLOCK_TIME and fall back to coinbase-only blocks via the prove semaphore.
-/// A 32-core server can prove ~256 txs in ~15s; a laptop proves ~130 txs
-/// within BLOCK_TIME. ASERT adjusts so average block time converges regardless.
+/// This is the consensus hard cap. Miner/template policy may choose fewer txs
+/// on weaker hardware, but validators accept any block within this cap.
 pub const BLOCK_MAX_TXS: usize = 256;
 
 /// Maximum inputs per transaction.
@@ -59,7 +57,7 @@ pub const MAX_OUTPUTS: usize = 8;
 /// Note: the window *size* is ANCHOR_DEPTH+1 (inclusive on both ends).
 /// The constant name reflects maximum *depth*, not window size.
 ///
-/// NullifierSet max RAM: 144 blocks × 256 txs × 32 bytes = ~1.2 MB (negligible).
+/// NullifierSet max RAM: 144 blocks × 256 txs × 32 bytes = ~1.2 MiB (negligible).
 pub const ANCHOR_DEPTH: u64 = 144;
 
 // Compile-time assertion: ANCHOR_DEPTH must match noid_tx::ANCHOR_DEPTH.

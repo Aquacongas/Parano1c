@@ -37,8 +37,12 @@ use clap::Parser;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
+use noid_chain::consensus::wire_limits::{
+    MAX_INFLIGHT_SEGMENTS, MAX_ORPHAN_POOL, MAX_ORPHAN_POOL_BYTES, MAX_SEGMENT_BYTES,
+    MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
+};
 use noid_chain::consensus::NetworkConfig;
-use noid_chain::storage::MdbxChainContext;
+use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_p2p::{NetworkEvent, P2PNetwork};
@@ -53,6 +57,7 @@ struct ProvedBlockCandidate {
 
 struct OrphanBlock {
     block: noid_chain::block::Block,
+    block_bytes_len: usize,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
     received_at: Instant,
@@ -64,12 +69,20 @@ impl OrphanBlock {
         block_proof_bytes: Vec<u8>,
         block_auth_sidecar_bytes: Vec<u8>,
     ) -> Self {
+        let block_bytes_len = block.to_bytes().len();
         Self {
             block,
+            block_bytes_len,
             block_proof_bytes,
             block_auth_sidecar_bytes,
             received_at: Instant::now(),
         }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.block_bytes_len
+            .saturating_add(self.block_proof_bytes.len())
+            .saturating_add(self.block_auth_sidecar_bytes.len())
     }
 }
 
@@ -1128,6 +1141,22 @@ fn validate_snapshot_headers_match_store(
     Ok(())
 }
 
+fn verify_snapshot_manifest_segment_roots(
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    expected_state_root: &[u8; 32],
+) -> Result<(), String> {
+    let computed = noid_chain::segmented_state::sparse_state_root_from_segment_roots(
+        manifest.log_slots as usize,
+        manifest.eff_log as usize,
+        &manifest.segment_ids,
+        &manifest.segment_roots,
+    )?;
+    if &computed != expected_state_root {
+        return Err("snapshot manifest segment-root table does not match tip state_root".into());
+    }
+    Ok(())
+}
+
 fn verify_snapshot_recursive_proof_headers_anchored(
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
     proof_bytes: &[u8],
@@ -1167,7 +1196,7 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 
     let genesis_acc = {
         let g = genesis_header();
-        noid_recursive::genesis_accumulator(genesis_state_root(), full_block_hash(&g))
+        noid_recursive::genesis_accumulator(genesis_state_root(), noid_chain::hash_block_header(&g))
     };
 
     let (sorted_hdrs, _legacy_expected) =
@@ -1181,6 +1210,7 @@ fn verify_snapshot_recursive_proof_headers_anchored(
     if full_block_hash(&tip_header) != manifest.tip_hash {
         return Err("snapshot manifest tip_hash does not match headers DB tip header".into());
     }
+    verify_snapshot_manifest_segment_roots(manifest, &tip_header.state_root)?;
 
     let expected_chain_hash = expected_chain_hash_from_header_store(store, proof_h, &genesis_acc)?;
 
@@ -1596,18 +1626,17 @@ async fn handle_p2p_events(
     // within 10 seconds of the first candidate arriving, proceed anyway —
     // some peers may be offline, behind NAT, or not yet synced.
     let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
-    // Segments collected so far: segment_id → (eff_log, data).
-    // Kept bounded while the longer-term streaming snapshot apply path is pending.
-    const MAX_SNAPSHOT_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
-    const MAX_SNAPSHOT_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
-    let mut collected_segment_bytes: usize = 0;
-    let mut collected_segments: std::collections::HashMap<u16, (u8, Vec<u8>)> =
-        std::collections::HashMap::new();
+    // Segments collected so far: segment_id → (eff_log, decoded columns, verified root).
+    // Incoming bytes are decoded and checked against the authenticated manifest
+    // segment root before they enter this map.
+    let mut collected_segments: std::collections::HashMap<
+        u16,
+        (u8, noid_chain::segmented_state::SegmentColumns, [u8; 32]),
+    > = std::collections::HashMap::new();
     // Segment IDs still outstanding.
     let mut pending_segment_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
     // Segment IDs queued but not yet requested (concurrency cap).
     let mut segment_queue: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
-    const MAX_INFLIGHT_SEGMENTS: usize = 8;
 
     // Helper: reset all segment-sync state on any failure.
     // Called whenever sync needs to restart (bad proof, apply failure, missing segment).
@@ -1623,7 +1652,6 @@ async fn handle_p2p_events(
             collected_segments.clear();
             pending_segment_ids.clear();
             segment_queue.clear();
-            collected_segment_bytes = 0;
             tracing::debug!("sync state reset — will retry on next peer connection");
         }};
     }
@@ -2213,6 +2241,14 @@ async fn handle_p2p_events(
                         }
                     }
                     for intent_bytes in txs {
+                        if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
+                            tracing::debug!(
+                                size = intent_bytes.len(),
+                                max = MAX_TX_INTENT_BYTES_GLOBAL,
+                                "mempool sync: tx dropped before decode due to size cap"
+                            );
+                            continue;
+                        }
                         match noid_tx::TxIntent::from_bytes(&intent_bytes) {
                             Ok(intent) => {
                                 match mempool_task.submit(intent, intent_bytes).await {
@@ -2232,12 +2268,12 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
                 // Hard cap: reject oversized payloads before any processing.
-                const MAX_TX_WIRE_SIZE: usize = 1024 * 1024; // 1 MB
-                if intent_bytes.len() > MAX_TX_WIRE_SIZE {
+                if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
                     tracing::debug!(
                         peer = %from,
                         size = intent_bytes.len(),
-                        "tx dropped: exceeds 1MB wire size limit"
+                        max = MAX_TX_INTENT_BYTES_GLOBAL,
+                        "tx dropped: exceeds global TxIntent wire size limit"
                     );
                     continue;
                 }
@@ -2455,30 +2491,21 @@ async fn handle_p2p_events(
                     if new_tip_height > our_tip {
                         use noid_chain::consensus::params::FINALITY_DEPTH;
 
-                        if competing.len() > FINALITY_DEPTH as usize {
-                            // Competing fork is deeper than FINALITY_DEPTH.
-                            //
-                            // WHY SNAPSHOT, NOT BLOCK-BY-BLOCK:
-                            // apply_reorg_mdbx enforces reorg_depth ≤ FINALITY_DEPTH, so
-                            // block-by-block is structurally impossible here anyway.
-                            //
-                            // More importantly: blocks arrive as individual NewBlock events.
-                            // When the first competing block arrives alone its chainwork is
-                            // tiny vs our full chain — the reorg comparison fires prematurely
-                            // and always says "keep our chain". Subsequent blocks hit the
-                            // None branch (parent not found) → FetchHeaders again → cycle.
-                            //
-                            // In Paranoid, snapshot sync is O(1) regardless of chain length.
-                            // It is always correct and always faster than N round-trips of
-                            // block fetching for forks this deep.
+                        let snapshot_catchup_depth = FINALITY_DEPTH.saturating_sub(1) as usize;
+                        if competing.len() >= snapshot_catchup_depth {
+                            // Near-finality catch-up is cheaper and less failure-prone through
+                            // the snapshot path. Active peers may advance while header batches are
+                            // in flight, so a 17-block observed gap can already be 18+ by the time
+                            // block requests complete. Snapshot verification remains fully anchored
+                            // by PoW headers, recursive proof, and segment roots.
                             tracing::info!(
                                 ancestor = ancestor_height,
                                 our_tip,
                                 competing_tip = new_tip_height,
                                 blocks_needed = competing.len(),
+                                snapshot_catchup_depth,
                                 peer = %from,
-                                "fork >{} blocks deep — requesting snapshot (O(1) Paranoid sync)",
-                                FINALITY_DEPTH
+                                "fork near finality window — requesting snapshot (O(1) Paranoid sync)"
                             );
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
@@ -2557,6 +2584,19 @@ async fn handle_p2p_events(
                     // Don't add to candidates, but fall through to check if we should
                     // proceed with existing candidates now that we've heard from this peer.
                 } else {
+                    if manifest.segment_ids.len() != manifest.segment_roots.len() {
+                        tracing::warn!(
+                            from = %from,
+                            ids = manifest.segment_ids.len(),
+                            roots = manifest.segment_roots.len(),
+                            "manifest segment_ids/segment_roots length mismatch — dropping"
+                        );
+                        continue;
+                    }
+                    if !manifest.segment_ids.windows(2).all(|w| w[0] < w[1]) {
+                        tracing::warn!(from = %from, "manifest segment IDs are not strictly sorted — dropping");
+                        continue;
+                    }
                     let segment_span = manifest
                         .log_slots
                         .saturating_sub(manifest.eff_log as u32);
@@ -2572,14 +2612,32 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
-                    if manifest.segment_ids.len().saturating_mul(MAX_SNAPSHOT_SEGMENT_BYTES)
-                        > MAX_SNAPSHOT_TOTAL_BYTES
-                    {
+                    let Some(expected_segment_bytes) =
+                        encoded_segment_len_for_eff_log(manifest.eff_log)
+                    else {
+                        tracing::warn!(
+                            from = %from,
+                            eff_log = manifest.eff_log,
+                            "manifest has invalid effective segment log — dropping"
+                        );
+                        continue;
+                    };
+                    if expected_segment_bytes > MAX_SEGMENT_BYTES {
+                        tracing::warn!(
+                            from = %from,
+                            eff_log = manifest.eff_log,
+                            expected_segment_bytes,
+                            max_segment = MAX_SEGMENT_BYTES,
+                            "manifest segment encoding exceeds per-segment cap — dropping"
+                        );
+                        continue;
+                    }
+                    if manifest.segment_ids.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS {
                         tracing::warn!(
                             from = %from,
                             segments = manifest.segment_ids.len(),
-                            max_total = MAX_SNAPSHOT_TOTAL_BYTES,
-                            "manifest exceeds snapshot total-byte cap — dropping"
+                            max_segments = MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+                            "manifest exceeds snapshot manifest segment cap — dropping"
                         );
                         continue;
                     }
@@ -2659,36 +2717,105 @@ async fn handle_p2p_events(
                 // Collect until all pending segments are received, then apply.
                 if pending_segment_ids.contains(&response.segment_id) {
                     if let Some(data) = response.data {
-                        if data.len() > MAX_SNAPSHOT_SEGMENT_BYTES {
+                        if data.len() > MAX_SEGMENT_BYTES {
                             tracing::warn!(
                                 from = %from, segment = response.segment_id,
                                 bytes = data.len(),
-                                max = MAX_SNAPSHOT_SEGMENT_BYTES,
+                                max = MAX_SEGMENT_BYTES,
                                 "segment too large — aborting sync"
                             );
                             reset_sync_state!();
                             continue;
                         }
-                        let old_len = collected_segments
-                            .get(&response.segment_id)
-                            .map(|(_, bytes)| bytes.len())
-                            .unwrap_or(0);
-                        let projected_total = collected_segment_bytes
-                            .saturating_sub(old_len)
-                            .saturating_add(data.len());
-                        if projected_total > MAX_SNAPSHOT_TOTAL_BYTES {
+                        let Some(expected_response_bytes) =
+                            encoded_segment_len_for_eff_log(response.eff_log)
+                        else {
                             tracing::warn!(
                                 from = %from,
                                 segment = response.segment_id,
-                                projected_total,
-                                max = MAX_SNAPSHOT_TOTAL_BYTES,
-                                "snapshot total-byte cap exceeded — aborting sync"
+                                eff_log = response.eff_log,
+                                "segment has invalid effective segment log — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        };
+                        if data.len() != expected_response_bytes {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                bytes = data.len(),
+                                expected = expected_response_bytes,
+                                "segment encoded length mismatch — aborting sync"
                             );
                             reset_sync_state!();
                             continue;
                         }
-                        collected_segment_bytes = projected_total;
-                        collected_segments.insert(response.segment_id, (response.eff_log, data));
+                        let Some(pending) = pending_manifest.as_ref() else {
+                            tracing::warn!(from = %from, "segment received without pending manifest — aborting sync");
+                            reset_sync_state!();
+                            continue;
+                        };
+                        let Ok(root_idx) = pending
+                            .manifest
+                            .segment_ids
+                            .binary_search(&response.segment_id)
+                        else {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                "segment not present in authenticated manifest — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        };
+                        let expected_root = pending.manifest.segment_roots[root_idx];
+                        if response.eff_log != pending.manifest.eff_log {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                got = response.eff_log,
+                                expected = pending.manifest.eff_log,
+                                "segment eff_log mismatch — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+
+                        let Some((encoded_eff_log, cols)) =
+                            noid_chain::storage::serial::decode_segment(&data)
+                        else {
+                            tracing::warn!(from = %from, segment = response.segment_id, "segment decode failed — aborting sync");
+                            reset_sync_state!();
+                            continue;
+                        };
+                        if encoded_eff_log != response.eff_log {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                encoded = encoded_eff_log,
+                                response = response.eff_log,
+                                "encoded segment eff_log mismatch — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                        let computed_root = noid_chain::fri_state::compute_segment_root(
+                            encoded_eff_log as usize,
+                            &cols.values,
+                            &cols.owners_hi,
+                            &cols.owners_lo,
+                        );
+                        if computed_root != expected_root {
+                            tracing::warn!(
+                                from = %from,
+                                segment = response.segment_id,
+                                "segment root mismatch against authenticated manifest — aborting sync"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+
+                        collected_segments.insert(response.segment_id, (response.eff_log, cols, expected_root));
                         pending_segment_ids.remove(&response.segment_id);
                         // Dispatch next queued segment if available.
                         if !segment_queue.is_empty() {
@@ -2715,9 +2842,9 @@ async fn handle_p2p_events(
                         // Peer couldn't serve this segment (stale state / pruned).
                         // This means their state has advanced past our expected_tip_height.
                         // Reset and restart sync from the next peer connection.
-                        tracing::warn!(
+                        tracing::info!(
                             from = %from, segment = response.segment_id,
-                            "segment unavailable — server state moved on; restarting sync"
+                            "snapshot segment unavailable or stale; restarting sync from a fresh manifest"
                         );
                         reset_sync_state!();
                         continue;
@@ -2731,16 +2858,12 @@ async fn handle_p2p_events(
                                 u16,
                                 u8,
                                 noid_chain::segmented_state::SegmentColumns,
+                                [u8; 32],
                             )> = {
-                                use noid_chain::storage::serial::decode_segment;
                                 let decoded: Vec<_> = collected_segments
                                     .drain()
-                                    .filter_map(|(seg_id, (eff_log, data))| {
-                                        decode_segment(&data)
-                                            .map(|(_, cols)| (seg_id, eff_log, cols))
-                                    })
+                                    .map(|(seg_id, (eff_log, cols, root))| (seg_id, eff_log, cols, root))
                                     .collect();
-                                collected_segment_bytes = 0;
                                 decoded
                             };
                             tracing::info!(
@@ -3015,6 +3138,7 @@ async fn handle_p2p_events(
                                             u16,
                                             u8,
                                             noid_chain::segmented_state::SegmentColumns,
+                                            [u8; 32],
                                         )>(),
                                         &m.recent_headers,
                                         &nullifier_blocks,
@@ -3297,7 +3421,7 @@ async fn handle_p2p_events(
 // ---------------------------------------------------------------------------
 
 /// Insert a block into the orphan pool, evicting the lowest-height entry when
-/// the pool is at capacity.
+/// the pool is over count or retained-byte capacity.
 ///
 /// Keyed by `block.header.prev_block_hash` so that when the missing parent
 /// arrives, `orphan_pool.remove(&parent_hash)` instantly finds the child.
@@ -3306,19 +3430,31 @@ async fn handle_p2p_events(
 /// This mimics LRU by height — stale orphans from a long-dead fork are
 /// discarded before newer ones that are more likely to be resolved.
 fn insert_orphan(pool: &mut std::collections::HashMap<[u8; 32], OrphanBlock>, orphan: OrphanBlock) {
-    use noid_chain::consensus::params::FINALITY_DEPTH;
-    const MAX_ORPHAN_POOL: usize = FINALITY_DEPTH as usize * 2; // 36
-    if pool.len() >= MAX_ORPHAN_POOL {
-        // Find and evict the orphan with the lowest block height.
-        if let Some(key) = pool
-            .iter()
-            .min_by_key(|(_, b)| b.block.header.height)
-            .map(|(k, _)| *k)
-        {
-            pool.remove(&key);
-        }
-    }
     pool.insert(orphan.block.header.prev_block_hash, orphan);
+
+    while pool.len() > MAX_ORPHAN_POOL {
+        evict_lowest_orphan(pool, "count cap");
+    }
+    while orphan_pool_retained_bytes(pool) > MAX_ORPHAN_POOL_BYTES && !pool.is_empty() {
+        evict_lowest_orphan(pool, "byte cap");
+    }
+}
+
+fn orphan_pool_retained_bytes(pool: &std::collections::HashMap<[u8; 32], OrphanBlock>) -> usize {
+    pool.values().fold(0usize, |sum, orphan| {
+        sum.saturating_add(orphan.retained_bytes())
+    })
+}
+
+fn evict_lowest_orphan(pool: &mut std::collections::HashMap<[u8; 32], OrphanBlock>, reason: &str) {
+    if let Some((key, height, bytes)) = pool
+        .iter()
+        .min_by_key(|(_, b)| b.block.header.height)
+        .map(|(key, orphan)| (*key, orphan.block.header.height, orphan.retained_bytes()))
+    {
+        pool.remove(&key);
+        tracing::debug!(height, bytes, reason, "evicted orphan block");
+    }
 }
 
 // ---------------------------------------------------------------------------

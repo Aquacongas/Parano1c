@@ -336,7 +336,7 @@ enum Command {
         miner_addr: String,
     },
 
-    /// Submit a solved block plus BlockProof bytes from an external miner.
+    /// Submit a solved block plus BlockProof/AuthSidecar bytes from an external miner.
     #[command(name = "submit-block", alias = "submit")]
     SubmitBlock {
         /// Solved block as hex (full block bytes with valid nonce).
@@ -345,6 +345,9 @@ enum Command {
         /// Serialized BlockProof hex. Use empty string "" for coinbase-only blocks.
         #[arg(value_name = "BLOCK_PROOF_HEX")]
         block_proof_hex: String,
+        /// Serialized public BlockAuthSidecar hex. Omit or use "" when absent.
+        #[arg(value_name = "BLOCK_AUTH_SIDECAR_HEX")]
+        block_auth_sidecar_hex: Option<String>,
     },
 }
 
@@ -440,7 +443,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::SubmitBlock {
             block_hex,
             block_proof_hex,
-        } => cmd_submit_block(&ctx, block_hex, block_proof_hex).await,
+            block_auth_sidecar_hex,
+        } => {
+            cmd_submit_block(
+                &ctx,
+                block_hex,
+                block_proof_hex,
+                block_auth_sidecar_hex.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -2213,11 +2225,16 @@ async fn cmd_submit_block(
     ctx: &Ctx<'_>,
     block_hex: &str,
     block_proof_hex: &str,
+    block_auth_sidecar_hex: Option<&str>,
 ) -> anyhow::Result<()> {
     let result = rpc(
         ctx,
         "submitBlock",
-        &[block_hex.into(), block_proof_hex.into()],
+        &[
+            block_hex.into(),
+            block_proof_hex.into(),
+            block_auth_sidecar_hex.unwrap_or("").into(),
+        ],
     )
     .await
     .context("submitBlock")?;

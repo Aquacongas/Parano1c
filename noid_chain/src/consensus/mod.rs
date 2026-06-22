@@ -29,6 +29,7 @@
 //! - [`da_prune`]       — Undo-log build/prune for chain reorg support.
 //! - [`genesis`]        — Genesis block / state root derivation.
 //! - [`network`]        — Network-kind parameters and per-network constants.
+//! - [`wire_limits`]    — Shared wire/memory/decode DoS caps.
 
 pub mod checks;
 pub mod conflict;
@@ -39,6 +40,7 @@ pub mod ordering;
 pub mod reorg;
 pub mod template;
 pub mod validation;
+pub mod wire_limits;
 
 pub mod allocator;
 pub mod difficulty;
