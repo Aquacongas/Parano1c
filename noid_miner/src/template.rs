@@ -13,7 +13,7 @@
 //! ## Template refresh triggers
 //!
 //! 1. Heartbeat every `refresh_interval_secs` seconds (safety net)
-//! 2. First `TxAdmitted` while prove is done (Sealed state — semaphore free, PoW still running)
+//! 2. First `TxAdmitted` while a coinbase-only marker proof is done
 //! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
 
 use std::collections::HashMap;

@@ -108,9 +108,10 @@ pub enum NetworkCommand {
         start_height: u64,
         count: u16, // max 512
     },
-    /// Request the state manifest from a peer (step 1 of snapshot sync).
-    /// Returns metadata + active segment IDs.  Emits `NetworkEvent::StateManifest`.
-    RequestStateManifest { peer: PeerId },
+    /// Request the state manifest from a peer (step 1 of snapshot sync, or a
+    /// lightweight peer-tip probe for recent persisted-state catch-up).
+    /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
+    RequestStateManifest { peer: PeerId, requester_height: u64 },
     /// Request a single state segment from a peer (step 2, one per segment).
     /// Emits `NetworkEvent::StateSegment`.
     RequestStateSegment {
@@ -320,7 +321,10 @@ impl P2PNetwork {
     pub async fn request_state_manifest(&self, peer: PeerId) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestStateManifest { peer })
+            .send(NetworkCommand::RequestStateManifest {
+                peer,
+                requester_height: 0,
+            })
             .await;
     }
 
@@ -772,14 +776,15 @@ fn handle_network_command(
                 .block_sync
                 .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
         }
-        NetworkCommand::RequestStateManifest { peer } => {
+        NetworkCommand::RequestStateManifest {
+            peer,
+            requester_height,
+        } => {
             let _ = swarm.behaviour_mut().state_manifest_sync.send_request(
                 &peer,
-                crate::protocol::GetStateManifestRequest {
-                    requester_height: 0,
-                },
+                crate::protocol::GetStateManifestRequest { requester_height },
             );
-            tracing::debug!(peer = %peer, "requesting state manifest");
+            tracing::debug!(peer = %peer, requester_height, "requesting state manifest");
         }
         NetworkCommand::RequestStateSegment {
             peer,

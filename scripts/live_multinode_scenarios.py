@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "target" / "release" / "paranoid"
 BASE = ROOT / "target" / "live-tests" / "multinode"
 LOGS = BASE / "logs"
+FINALITY_DEPTH = 18
 
 
 class LiveTestError(Exception):
@@ -167,6 +168,12 @@ class Node:
 
     def recursive_proof(self):
         return rpc(self.rpc_url, "getRecursiveProof", [], timeout=10)
+
+    def mining_info(self):
+        return rpc(self.rpc_url, "getMiningInfo", [], timeout=10)
+
+    def recursive_proof_height(self):
+        return self.mining_info().get("recursive_proof_height")
 
 
 def rpc(url, method, params=None, timeout=8):
@@ -426,7 +433,17 @@ def main():
             timeout=420,
             interval=3,
         )
-        h4 = n4.height()
+        node4_snapshot_tip = n4.height()
+        node4_snapshot_recursive_height = n4.recursive_proof_height()
+        assert_true(
+            node4_snapshot_recursive_height is not None,
+            f"node4 snapshot synced without recursive proof height: {n4.mining_info()}",
+        )
+        print(
+            f"[status] node4 snapshot tip={node4_snapshot_tip} recursive_proof_height={node4_snapshot_recursive_height}",
+            flush=True,
+        )
+        h4 = node4_snapshot_tip
         wait_until(
             "node4 mines after sync",
             lambda: n4.height() if n4.height() >= h4 + 1 else False,
@@ -444,6 +461,7 @@ def main():
             "\n=== Scenario 6: stop node2, restart node1 as second miner, observe two-miner convergence/orphans ===",
             flush=True,
         )
+        n2_stop_height = n2.height()
         n2.crash()
         time.sleep(5)
         # Restart node1 with same data dir, now seeded to node3/node4 and still in miner mode.
@@ -480,8 +498,49 @@ def main():
             interval=4,
         )
 
+        snapshot_finality_tip = node4_snapshot_tip + FINALITY_DEPTH
+        wait_until(
+            f"tip reaches node4 snapshot finality boundary h>={snapshot_finality_tip}",
+            lambda: (
+                {n.name: n.height() for n in [n1, n3, n4]}
+                if min(n.height() for n in [n1, n3, n4]) >= snapshot_finality_tip
+                else False
+            ),
+            timeout=900,
+            interval=5,
+        )
+        wait_until(
+            f"node4 recursive proof advances through snapshot tip {node4_snapshot_tip}",
+            lambda: (
+                n4.recursive_proof_height()
+                if (n4.recursive_proof_height() or 0) >= node4_snapshot_tip
+                else False
+            ),
+            timeout=420,
+            interval=3,
+        )
+        wait_until(
+            "network settles after snapshot-finality proof advance exactly",
+            lambda: all_same_tip([n1, n3, n4], max_lag=0),
+            timeout=420,
+            interval=4,
+        )
+
+        wait_until(
+            f"node2 persisted restart gap exceeds finality depth from h={n2_stop_height}",
+            lambda: (
+                {n.name: n.height() for n in [n1, n3, n4]}
+                if min(n.height() for n in [n1, n3, n4])
+                >= n2_stop_height + FINALITY_DEPTH + 1
+                else False
+            ),
+            timeout=900,
+            interval=5,
+        )
+        n2_restart_tip = max(n1.height(), n3.height(), n4.height())
         print(
-            "\n=== Scenario 7: restart relay node2 and verify catch-up ===", flush=True
+            f"\n=== Scenario 7: restart relay node2 and verify catch-up (gap={n2_restart_tip - n2_stop_height}) ===",
+            flush=True,
         )
         n2.seed = [n1.seed_addr, n3.seed_addr, n4.seed_addr]
         n2.start()
@@ -501,7 +560,7 @@ def main():
         print("\n=== Final status ===", flush=True)
         for n in [n1, n2, n3, n4]:
             print(
-                f"{n.name}: info={n.info()} peers={n.peers()} mempool={n.mempool_size()} wallet={n.wallet_status()}",
+                f"{n.name}: info={n.info()} mining={n.mining_info()} peers={n.peers()} mempool={n.mempool_size()} wallet={n.wallet_status()}",
                 flush=True,
             )
 
@@ -528,6 +587,7 @@ def main():
                             "info": n.info(),
                             "peers": n.peers(),
                             "mempool": n.mempool_size(),
+                            "mining": n.mining_info(),
                         }
                         for n in [n1, n2, n3, n4]
                     },

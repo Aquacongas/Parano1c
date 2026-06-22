@@ -1303,6 +1303,7 @@ async fn apply_p2p_block_offthread(
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
+        let block_height = block.header.height;
         let hash = ctx.apply_next_block(
             &block,
             &block_proof_bytes,
@@ -1334,6 +1335,17 @@ async fn apply_p2p_block_offthread(
                 )
             },
         )?;
+        if !block_proof_bytes.is_empty() {
+            if let Err(e) = ctx.store.put_block_proof(block_height, &block_proof_bytes) {
+                tracing::warn!(height = block_height, err = %e, "failed to store P2P block proof bytes");
+            }
+            if let Err(e) = ctx
+                .store
+                .put_block_auth_sidecar(block_height, &block_auth_sidecar_bytes)
+            {
+                tracing::warn!(height = block_height, err = %e, "failed to store P2P block auth sidecar");
+            }
+        }
         let view = ChainView::from_mdbx(&ctx);
         Ok((hash, view))
     })
@@ -1670,6 +1682,14 @@ async fn handle_p2p_events(
     // Sliding-window rate limiter: tracks (tx_count_in_window, window_start) per peer.
     // Prevents a single peer from flooding the ZK semaphore queue.
     use std::time::{Duration, Instant};
+
+    // Short-lived dedup for fork-recovery pulls. During two-miner races the same
+    // orphan/fork announcement can be observed many times before the local node
+    // reorganizes. Without this, each observation re-sends identical header/block
+    // requests and floods logs/P2P with no extra safety.
+    let mut recent_header_fetches: HashMap<(libp2p::PeerId, u64, u16), Instant> = HashMap::new();
+    let mut recent_block_fetches: HashMap<(libp2p::PeerId, u64), Instant> = HashMap::new();
+    const FETCH_DEDUP_TTL: Duration = Duration::from_secs(15);
     let mut peer_tx_rate: HashMap<libp2p::PeerId, (u32, Instant)> = HashMap::new();
     const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
     const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
@@ -1749,7 +1769,10 @@ async fn handle_p2p_events(
                             );
                             manifest_requested_peers.insert(from);
                             let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                    peer: from,
+                                    requester_height: our_height,
+                                })
                                 .await;
                         }
                     }
@@ -2117,7 +2140,10 @@ async fn handle_p2p_events(
                                                         );
                                                         manifest_requested_peers.insert(from);
                                                         let _ = p2p_cmd
-                                                            .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                                                peer: from,
+                                                                requester_height: 0,
+                                                            })
                                                             .await;
                                                     }
                                                 }
@@ -2184,29 +2210,51 @@ async fn handle_p2p_events(
                                                 );
                                                 manifest_requested_peers.insert(from);
                                                 let _ = p2p_cmd
-                                                    .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                                        peer: from,
+                                                        requester_height: our_tip_height,
+                                                    })
                                                     .await;
                                             }
-                                        } else if !fetch_in_progress.contains(&from) {
+                                        } else {
                                             // Shallow fork: fetch batch headers to find common ancestor.
-                                            // Guard: only one outstanding FetchHeaders per peer at a time.
-                                            fetch_in_progress.insert(from);
+                                            // Guard: only one outstanding FetchHeaders per peer at a time,
+                                            // plus a short dedup window for the same request tuple.
                                             let fetch_from =
                                                 our_tip_height.saturating_sub(FINALITY_DEPTH);
-                                            tracing::info!(
-                                                our_height = our_tip_height,
-                                                block_height,
-                                                peer = %from,
-                                                fetch_from,
-                                                "shallow orphan — fetching batch headers to find common ancestor"
-                                            );
-                                            let _ = p2p_cmd
-                                                .send(noid_p2p::NetworkCommand::FetchHeaders {
-                                                    peer: from,
-                                                    start_height: fetch_from,
-                                                    count: (FINALITY_DEPTH as u16 * 2).min(512),
-                                                })
-                                                .await;
+                                            let fetch_count = (FINALITY_DEPTH as u16 * 2).min(512);
+                                            let fetch_key = (from, fetch_from, fetch_count);
+                                            let recently_requested = recent_header_fetches
+                                                .get(&fetch_key)
+                                                .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
+                                            if !recently_requested && !fetch_in_progress.contains(&from) {
+                                                fetch_in_progress.insert(from);
+                                                recent_header_fetches.insert(fetch_key, Instant::now());
+                                                tracing::info!(
+                                                    our_height = our_tip_height,
+                                                    block_height,
+                                                    peer = %from,
+                                                    fetch_from,
+                                                    "shallow orphan — fetching batch headers to find common ancestor"
+                                                );
+                                                let _ = p2p_cmd
+                                                    .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                                        peer: from,
+                                                        start_height: fetch_from,
+                                                        count: fetch_count,
+                                                    })
+                                                    .await;
+                                            } else {
+                                                tracing::debug!(
+                                                    our_height = our_tip_height,
+                                                    block_height,
+                                                    peer = %from,
+                                                    fetch_from,
+                                                    recently_requested,
+                                                    in_progress = fetch_in_progress.contains(&from),
+                                                    "shallow orphan header fetch already requested"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -2354,27 +2402,31 @@ async fn handle_p2p_events(
                         tracing::info!(peer = %peer, "fresh node — requesting state manifest (Paranoid sync)");
                         manifest_requested_peers.insert(peer);
                         p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateManifest { peer })
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer,
+                                requester_height: 0,
+                            })
                             .await
                             .ok();
                     }
                 } else {
-                    // Already have state — catch up on recent blocks.
-                    // Auto-continue (applied in NewBlock handler) iterates
-                    // until the peer has no more blocks to serve.
-                    let count = noid_chain::consensus::params::FINALITY_DEPTH as u16;
+                    // Already have persisted state. First ask for a tiny manifest
+                    // as a peer-tip probe; the StateManifest handler chooses the
+                    // correct sync path from the measured gap:
+                    //   gap <= FINALITY_DEPTH  -> recent block replay;
+                    //   gap >  FINALITY_DEPTH  -> proof-verified state snapshot.
+                    // This prevents stale nodes from blindly replaying a near-pruned
+                    // window before discovering they needed snapshot sync.
                     p2p_cmd
-                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                        .send(noid_p2p::NetworkCommand::RequestStateManifest {
                             peer,
-                            from_height: our_height + 1,
-                            count,
+                            requester_height: our_height,
                         })
                         .await
                         .ok();
                     tracing::debug!(
-                        from_height = our_height + 1,
-                        count,
-                        "triggered recent-block sync"
+                        requester_height = our_height,
+                        "triggered manifest tip probe for persisted-state sync"
                     );
                 }
 
@@ -2508,7 +2560,10 @@ async fn handle_p2p_events(
                                 "fork near finality window — requesting snapshot (O(1) Paranoid sync)"
                             );
                             let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                    peer: from,
+                                    requester_height: our_tip,
+                                })
                                 .await;
                         } else {
                             // Shallow fork (≤ FINALITY_DEPTH): apply_reorg_mdbx can handle it.
@@ -2523,6 +2578,19 @@ async fn handle_p2p_events(
                                 competing.len()
                             );
                             for hdr in &competing {
+                                let request_key = (from, hdr.height);
+                                let recently_requested = recent_block_fetches
+                                    .get(&request_key)
+                                    .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
+                                if recently_requested {
+                                    tracing::debug!(
+                                        peer = %from,
+                                        height = hdr.height,
+                                        "fork block fetch already requested"
+                                    );
+                                    continue;
+                                }
+                                recent_block_fetches.insert(request_key, Instant::now());
                                 let _ = p2p_cmd
                                     .send(noid_p2p::NetworkCommand::RequestBlock {
                                         peer: from,
@@ -2552,7 +2620,10 @@ async fn handle_p2p_events(
                             );
                             *depth = 0; // reset for next time
                             let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest { peer: from })
+                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                    peer: from,
+                                    requester_height: 0,
+                                })
                                 .await;
                         } else {
                             *depth += 1;
@@ -2641,6 +2712,43 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
+                }
+
+                if manifest.tip_height > 0 {
+                    let our_height = {
+                        let ctx = chain.read().await;
+                        ctx.tip_height()
+                    };
+                    if our_height > 0 {
+                        if manifest.tip_height <= our_height {
+                            tracing::debug!(
+                                from = %from,
+                                our_height,
+                                peer_tip = manifest.tip_height,
+                                "manifest tip probe not ahead"
+                            );
+                            continue;
+                        }
+                        let gap = manifest.tip_height - our_height;
+                        if gap <= FINALITY_DEPTH {
+                            tracing::info!(
+                                from = %from,
+                                our_height,
+                                peer_tip = manifest.tip_height,
+                                gap,
+                                "manifest tip within finality — requesting recent blocks"
+                            );
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                    peer: from,
+                                    from_height: our_height + 1,
+                                    count: gap as u16,
+                                })
+                                .await;
+                            continue;
+                        }
+                    }
+                    manifest_requested_peers.insert(from);
                 }
 
                 if manifest.tip_height > 0 && pending_manifest.is_some() {
@@ -3076,11 +3184,24 @@ async fn handle_p2p_events(
                                 segments = snap.manifest.segment_ids.len(),
                                 "recursive proof VERIFIED — starting segment download"
                             );
-                            // Persist the verified proof.
+                            // Persist the verified proof and its height so proof-byte
+                            // pruning never races recursive-history catch-up.
                             {
-                                let ctx = chain.read().await;
-                                if let Err(e) = ctx.store.put_recursive_proof(&proof_bytes) {
-                                    tracing::warn!(err = ?e, "failed to persist recursive proof");
+                                match bincode::deserialize::<noid_recursive::RecursiveBlockProof>(
+                                    &proof_bytes,
+                                ) {
+                                    Ok(proof) => {
+                                        let ctx = chain.read().await;
+                                        if let Err(e) = ctx
+                                            .store
+                                            .put_recursive_proof_at(proof.block_height, &proof_bytes)
+                                        {
+                                            tracing::warn!(err = ?e, "failed to persist recursive proof");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(err = ?e, "verified recursive proof failed to decode for persistence");
+                                    }
                                 }
                             }
                             // Start downloading segments with concurrency cap.
@@ -3288,12 +3409,22 @@ async fn handle_p2p_events(
                         (Some(prev_root), Some(expected_root)) => {
                             match bincode::deserialize::<RecursiveBlockProof>(&proof_bytes) {
                                 Ok(proof) => {
+                                    if proof.block_height != height {
+                                        tracing::debug!(
+                                            from = %from,
+                                            height,
+                                            proof_height = proof.block_height,
+                                            "RecursiveProofUpdate: height mismatch, ignoring"
+                                        );
+                                        continue;
+                                    }
                                     match verify_step_stark_only(&proof, &prev_root, &expected_root)
                                     {
                                         Ok(()) => {
                                             let ctx = chain.read().await;
-                                            if let Err(e) =
-                                                ctx.store.put_recursive_proof(&proof_bytes)
+                                            if let Err(e) = ctx
+                                                .store
+                                                .put_recursive_proof_at(proof.block_height, &proof_bytes)
                                             {
                                                 tracing::warn!(
                                                     err = ?e,
@@ -3336,6 +3467,8 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
                 fetch_in_progress.remove(&peer);
+                recent_header_fetches.retain(|(p, _, _), _| *p != peer);
+                recent_block_fetches.retain(|(p, _), _| *p != peer);
                 manifest_requested_peers.remove(&peer);
                 fetch_depth.remove(&peer);
                 peer_tx_rate.remove(&peer);
@@ -3353,6 +3486,10 @@ async fn handle_p2p_events(
 
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
+            let fetch_cutoff = Instant::now() - FETCH_DEDUP_TTL;
+            recent_header_fetches.retain(|_, t| *t >= fetch_cutoff);
+            recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
+
             // --- Stale-tip recovery ---
             // If our chain hasn't advanced in 30s but we've seen higher announcements,
             // re-request the missing blocks from the peer that announced highest.
@@ -3573,7 +3710,7 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 /// - Blocks with no real ZK proof (coinbase-only) use a null witness — the
 ///   chain-hash accumulator still advances correctly.
 /// - Runs a tight loop when catching up; sleeps when at finality boundary.
-/// - `prove_recursive_step` is ~2s on 8 cores → run in `spawn_blocking`.
+/// - Recursive proving runs in `spawn_blocking` so catch-up never blocks the async runtime.
 async fn run_recursive_proof_updater(
     chain: Arc<RwLock<MdbxChainContext>>,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
@@ -3645,6 +3782,7 @@ async fn run_recursive_proof_updater(
         // --- Prove genesis (special case) ---
         if next_height == 0 {
             tracing::debug!("recursive proof: proving genesis block");
+            let prove_started = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(prove_genesis_recursive).await;
             match result {
                 Ok(genesis_proof) => {
@@ -3657,15 +3795,19 @@ async fn run_recursive_proof_updater(
                         tracing::error!(err = ?e, "genesis recursive proof failed self-verification");
                         continue;
                     }
+                    let prove_ms = prove_started.elapsed().as_millis();
                     let bytes = bincode::serialize(&genesis_proof).unwrap_or_default();
                     let (stored, tip_hash) = {
                         let ctx = chain.read().await;
                         let tip_hash = ctx.tip_hash();
-                        let ok = ctx.store.put_recursive_proof(&bytes).is_ok();
+                        let ok = ctx
+                            .store
+                            .put_recursive_proof_at(genesis_proof.block_height, &bytes)
+                            .is_ok();
                         (ok, tip_hash)
                     };
                     if stored {
-                        tracing::info!("recursive proof: genesis proved");
+                        tracing::info!(prove_ms, "recursive proof: genesis proved");
                         just_advanced = true;
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {
@@ -3764,6 +3906,7 @@ async fn run_recursive_proof_updater(
         let prev_state_root_for_verify = prev_acc.state_root;
 
         tracing::debug!(next_height, "recursive proof: proving step");
+        let prove_started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             prove_recursive_step(&witness, &header, &prev_acc, rec_proof_opt.as_ref())
         })
@@ -3780,15 +3923,16 @@ async fn run_recursive_proof_updater(
                     tracing::error!(height = h, err = ?e, "recursive proof failed self-verification — not storing");
                     continue;
                 }
+                let prove_ms = prove_started.elapsed().as_millis();
                 let bytes = bincode::serialize(&new_proof).unwrap_or_default();
                 let (stored, tip_hash) = {
                     let ctx = chain.read().await;
                     let tip_hash = ctx.tip_hash();
-                    let ok = ctx.store.put_recursive_proof(&bytes).is_ok();
+                    let ok = ctx.store.put_recursive_proof_at(h, &bytes).is_ok();
                     (ok, tip_hash)
                 };
                 if stored {
-                    tracing::info!(height = h, "recursive proof advanced");
+                    tracing::info!(height = h, prove_ms, "recursive proof advanced");
                     just_advanced = true;
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {

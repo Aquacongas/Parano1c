@@ -54,6 +54,7 @@ const N_TABLES: u64 = 14;
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
 const KEY_REC: &[u8] = &[0u8];
+const KEY_REC_HEIGHT: &[u8] = &[1u8];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -308,11 +309,32 @@ impl MdbxStore {
         Ok(txn.get(&tbl, KEY_REC)?)
     }
 
+    /// Read the height of the persisted recursive chain proof, if known.
+    pub fn get_recursive_proof_height(&self) -> Result<Option<u64>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_REC_HEIGHT)?;
+        Ok(raw.and_then(|b| u64_from_key(&b)))
+    }
+
     /// Persist the recursive chain proof (6.5 KB, FOREVER, single entry).
+    ///
+    /// Prefer `put_recursive_proof_at` in node code so proof-byte pruning can
+    /// retain finalized block proofs until recursive history has consumed them.
     pub fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
         txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Persist the recursive chain proof and its block height atomically.
+    pub fn put_recursive_proof_at(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
+        txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
+        txn.put(&tbl, KEY_REC_HEIGHT, &u64_key(height), WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
@@ -771,27 +793,58 @@ impl MdbxStore {
             }
         }
 
-        // --- Prune block_proofs and auth sidecars older than FINALITY_DEPTH ---
+        // --- Prune proof data ---
+        //
+        // Auth sidecars are only needed for block validation/reorg serving and can
+        // be removed at finality. BlockProof bytes are additionally needed by the
+        // recursive proof updater: the first time height `h` can be folded into
+        // recursive history is exactly when `current_height - FINALITY_DEPTH >= h`.
+        // Therefore pruning BlockProofs purely by finality races the updater and
+        // can delete the proof for the boundary block before it is consumed.
         if current_height > FINALITY_DEPTH {
-            let cutoff = current_height - FINALITY_DEPTH;
-            for table_name in [T_BLOCK_PROOFS, T_BLOCK_AUTH_SIDECARS] {
-                let tbl = txn.open_table(Some(table_name))?;
-                let keys_to_del: Vec<u64> = {
-                    let mut cur = txn.cursor(&tbl)?;
-                    let mut keys = Vec::new();
-                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                    while let Some((k, _)) = item {
-                        match u64_from_key(&k) {
-                            Some(h) if h <= cutoff => keys.push(h),
-                            _ => break,
-                        }
-                        item = cur.next()?;
+            let finality_cutoff = current_height - FINALITY_DEPTH;
+
+            let auth_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+            let auth_keys_to_del: Vec<u64> = {
+                let mut cur = txn.cursor(&auth_tbl)?;
+                let mut keys = Vec::new();
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                while let Some((k, _)) = item {
+                    match u64_from_key(&k) {
+                        Some(h) if h <= finality_cutoff => keys.push(h),
+                        _ => break,
                     }
-                    keys
-                };
-                for h in keys_to_del {
-                    txn.del(&tbl, &u64_key(h), None)?;
+                    item = cur.next()?;
                 }
+                keys
+            };
+            for h in auth_keys_to_del {
+                txn.del(&auth_tbl, &u64_key(h), None)?;
+            }
+
+            let recursive_height = {
+                let rec_tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
+                let raw: Option<Vec<u8>> = txn.get(&rec_tbl, KEY_REC_HEIGHT)?;
+                raw.and_then(|b| u64_from_key(&b)).unwrap_or(0)
+            };
+            let block_proof_cutoff = finality_cutoff.min(recursive_height);
+
+            let proof_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+            let proof_keys_to_del: Vec<u64> = {
+                let mut cur = txn.cursor(&proof_tbl)?;
+                let mut keys = Vec::new();
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                while let Some((k, _)) = item {
+                    match u64_from_key(&k) {
+                        Some(h) if h <= block_proof_cutoff => keys.push(h),
+                        _ => break,
+                    }
+                    item = cur.next()?;
+                }
+                keys
+            };
+            for h in proof_keys_to_del {
+                txn.del(&proof_tbl, &u64_key(h), None)?;
             }
         }
 

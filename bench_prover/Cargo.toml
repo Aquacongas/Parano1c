@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "block_hotspots"
 harness = false
+
+[[bench]]
+name = "recursive_hotspots"
+harness = false

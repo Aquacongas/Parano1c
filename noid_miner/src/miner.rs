@@ -31,7 +31,7 @@
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
-//!   2. First `TxAdmitted` while prove is done (Sealed state — semaphore free, PoW running)
+//!   2. First `TxAdmitted` while a coinbase-only marker proof is done
 //!   3. New chain tip from P2P (block received or snapshot applied)
 
 use std::sync::{
@@ -67,8 +67,8 @@ pub struct MinerConfig {
     ///
     /// Fires only if the miner has been stuck without a block for this long.
     /// Normal template refreshes happen immediately via `sync_ready` (P2P
-    /// block received) and `TxAdmitted` (Sealed state: prove done, PoW
-    /// running).  This timer exists only for edge cases where both are silent.
+    /// block received) and `TxAdmitted` for coinbase-only sealed templates.
+    /// This timer exists only for edge cases where both are silent.
     ///
     /// Must be > BLOCK_TIME to avoid firing during active proving and
     /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 75s.
@@ -407,9 +407,11 @@ impl BlockMiner {
 
             cancel.store(false, Ordering::Relaxed);
 
-            // Track when prove completes so the TxAdmitted arm can detect "Sealed" state:
-            // prove_done=true means the semaphore has been released and PoW is still running —
-            // safe to cancel PoW and rebuild with newly admitted txs at zero prove-work cost.
+            // Track when prove completes. Coinbase-only proofs are marker proofs; on the
+            // first admitted tx we cancel their PoW search and rebuild immediately. For
+            // user-tx templates we intentionally do not listen to later mempool events:
+            // dropping the JoinHandle would not cancel spawn_blocking proof work and would
+            // wastefully rebuild the same block proof in the next loop.
             let prove_done = Arc::new(AtomicBool::new(false));
             let prove_done_clone = prove_done.clone();
 
@@ -587,18 +589,16 @@ impl BlockMiner {
                     tracing::debug!("heartbeat: refreshing template (safety net)");
                 }
 
-                event = mempool_events.recv() => {
+                event = mempool_events.recv(), if tmpl.n_user_txs() == 0 => {
                     if let Ok(noid_mempool::MempoolEvent::TxAdmitted { .. }) = event {
-                        if prove_done.load(Ordering::Acquire) {
-                            // Sealed state: prove is done (semaphore free) and PoW is still
-                            // running. We can cancel PoW and rebuild immediately at zero
-                            // prove-work cost — the new template will include this tx.
-                            cancel.store(true, Ordering::Relaxed);
-                            tracing::debug!("sealed-state: new tx admitted, cancelling PoW for immediate inclusion");
-                        }
-                        // Proving state: don't cancel — the in-flight prove work would be
-                        // wasted. The tx sits in mempool and is picked up when prove finishes
-                        // and the next template is built.
+                        // Coinbase-only template: the proof is a zero-cost marker. Cancel
+                        // PoW immediately so the first admitted user transaction is not
+                        // delayed by an empty block. If the marker task has not set
+                        // prove_done yet, dropping its JoinHandle is still harmless: the
+                        // spawn_blocking task finishes quickly and releases the semaphore.
+                        let marker_done = prove_done.load(Ordering::Acquire);
+                        cancel.store(true, Ordering::Relaxed);
+                        tracing::debug!(marker_done, "coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
                     }
                 }
 
