@@ -10,10 +10,11 @@
 //! restore the prior UTXO state.
 //!
 //! After `UNDO_LOG_RETENTION` confirmations, the undo log for a block is
-//! pruned (`prune_undo_logs`). MDBX keeps raw block bytes and block proofs only
-//! for the same shallow reorg/peer-sync window; older history is represented by
-//! headers, the current state, and the recursive chain proof rather than by full
-//! block bodies.
+//! pruned (`prune_undo_logs`). MDBX keeps raw block bytes for the shallow
+//! reorg/peer-sync window. BlockProof bytes are kept until the block is both
+//! finalized and covered by the stored recursive proof height, so the recursive
+//! updater cannot race pruning. Older history is represented by headers, the
+//! current state, and the recursive chain proof rather than by full block bodies.
 
 use std::collections::HashMap;
 

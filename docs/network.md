@@ -8,14 +8,14 @@ Paranoid nodes do not store transaction history. A node holds:
 2. **Block headers** -- 276 bytes each, kept forever (~553 MB/year). The only
    permanent growth.
 3. **Recent block data** -- block bodies, public Auth sidecars, BlockProofs, and undo logs for shallow reorgs, peer serving, and recursive proof advancement. Bodies/undo/sidecars are pruned at finality; `BlockProof` bytes are retained until both finalized and folded into the recursive proof.
-4. **One recursive proof** -- ~38 KB encoded. Proves the entire chain from genesis to
-   near-tip in a single STARK verification (~5 ms).
+4. **One recursive proof** -- ~43 KB encoded. Proves the entire chain from genesis to
+   near-tip in one STARK verification taking a few milliseconds.
 
 **Why this works without history:**
 
 - **State correctness**: The recursive proof mathematically guarantees that
   the current state is the honest result of every transaction since genesis.
-  No replay needed. The proof IS the replay, compressed to ~38 KB encoded.
+  No replay needed. The proof IS the replay, compressed to ~43 KB encoded.
 - **Past payments**: Users store their own receipts (~300 bytes). A receipt
   contains a Merkle path from the transaction to the block's `tx_root`.
   Any node verifies it against its permanent header chain. No block body needed.
@@ -24,8 +24,8 @@ Paranoid nodes do not store transaction history. A node holds:
   145 past header heights; nullifiers cover this bounded window, then self-prune.
 
 A node that joins the network downloads the current state + recursive proof,
-verifies the proof in 5 ms, and has full confidence. It never downloads or
-processes historical blocks. Sync from zero takes 1-2 seconds.
+verifies the proof in a few milliseconds, and has full confidence. It never downloads
+or processes historical blocks. Sync from zero takes 1-2 seconds.
 
 The network does not re-execute wallet logic as the acceptance rule -- it verifies validity proofs. Execution is local to the wallet, validity is global through proof verification, ordering is PoW. Every node independently verifies block validity. No node trusts miners.
 
@@ -63,7 +63,7 @@ no proof generation.
 | `T_SEGMENTS` | seg_id (u16) | SegmentColumns (3 x 64K x 16B) | current state | ~3 MB per materialized segment |
 | `T_STATE_META` | single key | (log_slots, active_count, alloc_counter) | latest only | 20 bytes |
 | `T_OWNER_INDEX` | owner_addr (32B) | packed Vec<(slot_u32, value_u64)> | current state | proportional to UTXO set |
-| `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | ~38 KB encoded |
+| `T_RECURSIVE_PROOF` | single key | RecursiveBlockProof bytes | latest only | ~43 KB encoded |
 | `T_RECENT_BLOCKS` | height (u64) | full Block bytes | last 18 blocks | ~4 MB |
 | `T_BLOCK_PROOFS` | height (u64) | BlockProof bincode | finalized and recursive-consumed window | shape-mix dependent; bounded by proof caps |
 | `T_BLOCK_AUTH_SIDECARS` | height (u64) | public BlockAuthSidecar bincode | last 18 blocks | shape-mix dependent; public Auth proofs only |
@@ -132,7 +132,7 @@ At full capacity (2^32 slots, all materialized): 2^32 × 48 bytes ≈ 192 GiB ma
 - Recent bodies + sidecars + undo: finality window only; shape-mix dependent
 - BlockProof bytes: finality window plus recursive-consumption guard; bounded by wire caps
 - Nullifiers + tx_index: bounded by the `ANCHOR_DEPTH = 144` recent-header window (up to 145 anchor heights)
-- Recursive proof: ~38 KB encoded (single latest)
+- Recursive proof: ~43 KB encoded (single latest)
 
 ---
 
@@ -234,10 +234,10 @@ New Node                         Peers (up to 3 queried)
    |    Reject if chainwork does not strictly exceed MIN_SNAPSHOT_CHAINWORK
    |
    |--- GetRecursiveProof ------> Best peer
-   |<-- RecursiveProof (~38 KB encoded)
+   |<-- RecursiveProof (~43 KB encoded)
    |
    | 3. Verify the recursive proof and header anchor:
-   |    - STARK verify: O(1), ~5 ms
+   |    - STARK verify: O(1), a few milliseconds
    |    - proof height <= snapshot tip
    |    - proof lag <= FINALITY_DEPTH + 2
    |    - proof state root matches the corresponding stored header root
@@ -284,7 +284,7 @@ If a node was offline for 2 hours (~480 blocks), it does NOT replay them:
 
 1. Recent block bodies are retained only for the finality window; deep replay is not the sync path.
 2. The node requests a fresh state snapshot + RecursiveProof from peers.
-3. Verifies the RecursiveProof (STARK, ~5 ms). Done.
+3. Verifies the RecursiveProof (STARK, a few milliseconds). Done.
 4. Overwrites stale local state. Recursive updater continues from here.
 
 This is safe because the RecursiveProof is unforgeable (~2^-120), the
@@ -348,7 +348,7 @@ When a node receives a block from the network, it runs these checks in order
 | ASERT difficulty matches expected | BadDifficulty | PoW calibration |
 | `header.timestamp > median_time_past(11)` | TimestampTooOld | Time ordering |
 | `header.timestamp <= local_time + 120s` | TimestampTooFuture | Clock drift |
-| Blake3(header_core, nonce) <= target | BadPoW | Proof of work |
+| `Blake3(header_core_bytes(header)) <= target` | BadPoW | Proof of work; `header_core` already includes nonce bytes `[144..160]` |
 | `block.transactions.len() <= 256` | TooManyTxs | Block size bound |
 | No cross-tx slot conflicts (HashSet) | SlotConflict | Double-spend in block |
 | Per-tx: fee fits u64 | BadFee | Overflow prevention |
@@ -411,8 +411,9 @@ When a transaction arrives via gossip, BEFORE entering the mempool:
 | 7 | No slot conflicts with existing mempool txs | Double-spend |
 | 8 | Input slots exist in state with matching value + owner | Liveness |
 | 9 | Output slots are EMPTY in state | Availability |
+| 10 | LogicProof verification in a semaphore-bounded `spawn_blocking` worker | Proof validity without holding the mempool lock |
 
-LogicProof verification runs ASYNCHRONOUSLY after admission as a background task. Invalid proofs are evicted when detected.
+The implementation first runs checks 0–9 as a cheap pre-filter, then verifies the LogicProof outside the lock, then reacquires the lock and reruns the cheap checks against the current chain/mempool view before final insertion. `TxAdmitted`/gossip is emitted only after this final admission; invalid proofs never enter the admitted pool and are not gossiped as accepted transactions.
 
 ### Recursive Proof Verification (On Snapshot Sync)
 
@@ -479,8 +480,8 @@ Dedup:           blake3 content hash
 | Topic | Message Type | Size |
 |-------|-------------|------|
 | `/noid/{network}/blocks/1` | BlockGossipMsg | 310B compact or <1MB inline |
-| `/noid/{network}/txs/1` | raw TxIntent bytes | shape-capped at 384 KiB; current wallet bundles are ~214–236 KiB on the reference laptop |
-| `/noid/{network}/recproofs/1` | RecursiveProofGossipMsg | ~38 KB encoded |
+| `/noid/{network}/txs/1` | raw TxIntent bytes | shape-capped at 384 KiB; current wallet bundles are ~284–291 KiB on the reference laptop |
+| `/noid/{network}/recproofs/1` | RecursiveProofGossipMsg | ~43 KB encoded |
 
 ### Block Gossip (Dual Mode)
 
@@ -548,9 +549,9 @@ Snapshot segment memory is bounded by `MAX_INFLIGHT_SEGMENTS × MAX_SEGMENT_BYTE
    - Compute tx_root (Poseidon2b Merkle over tx_body_hashes)
 
 2. Parallel execution:
-   - Thread A: PoW search (Blake3, nonce space 2^128, ~15s target)
+   - Thread A: PoW search (`Blake3(header_core)`, patch nonce bytes `[144..160]`, nonce space 2^128, ~15s target)
    - Thread B: prove_block (shape buckets + NativeDelta state openings + per-bucket source-bound FRI)
-     BlockProof generation time depends on tx count and shape mix. On the 2023 Intel Core i7-1365U reference laptop, 100 Standard4x8 txs prove in ~14.26s and verify in ~4.10s; proof + sidecar is ~15.73 MB.
+     BlockProof generation time depends on tx count and shape mix. On the reference 2023 Intel Core i7-1365U laptop, the current `block_scaling` 100-transaction standard-only fixture mix proves in ~14.75s and verifies in ~4.91s; proof + sidecar is ~22.55 MB.
 
 3. Both complete:
    - Seal header (embed proof_transcript_hash, witness_root)
@@ -704,3 +705,5 @@ Offset  Size  Field
 ```
 
 For user-transaction blocks, `proof_transcript_hash = block_recursive_claim_hash(BlockProof)` and `witness_root = block_auth_sidecar_root(block, sidecar)`. Coinbase-only blocks use `proof_transcript_hash = STUB_MARKER = [1u8; 32]` with empty proof and sidecar bytes. This prevents an adversary from stripping the proof from a block that has user transactions and claiming it was coinbase-only.
+
+PoW does not hash the full 276-byte header directly. It hashes the 212-byte `header_core`: fields `0..192` above, followed by `log_slots`, `active_slot_count`, and `alloc_counter`; `proof_transcript_hash` and `witness_root` are omitted. The nonce is included at byte offset 144 and patched by miners.

@@ -34,10 +34,10 @@ use crate::compact_fri::{
     CompactEvalProof, CompactFriQueryContext,
 };
 use crate::interleaved_commit::{
-    build_short_batched_merkle_proof, short_hash_to_output, source_leaf_hash,
-    source_leaf_positions, source_root_short_from_cap, source_tree_depth,
-    verify_short_batched_merkle_proof, InterleavedProverState, ShortBatchedMerkleProof, ShortHash,
-    ShortMerkleTree,
+    build_source_batched_merkle_proof, source_hash_to_output, source_leaf_hash,
+    source_leaf_positions, source_root_from_cap, source_tree_depth,
+    verify_source_batched_merkle_proof, InterleavedProverState, SourceBatchedMerkleProof,
+    SourceHash, SourceHashMerkleTree,
 };
 
 /// Domain-separation tag for mixed opening sub-protocol.
@@ -221,16 +221,16 @@ pub struct SourceBindingProof {
     pub h_evals: Vec<Block128>,
     /// Merkle roots for intermediate high TensorFold layers after source round
     /// 0 and before the final revealed H layer. Length is `tau - 1`.
-    pub folded_roots: Vec<ShortHash>,
+    pub folded_roots: Vec<SourceHash>,
     /// For each source-binding query, serialized as column-major high pairs:
     /// `[col0_s0, col0_s1, col1_s0, col1_s1, ...]`.
     pub source_symbols: Vec<Block128>,
     /// Batched Merkle proof against the encoded interleaved source root.
-    pub source_merkle_batch: ShortBatchedMerkleProof,
+    pub source_merkle_batch: SourceBatchedMerkleProof,
     /// Per intermediate high-folded layer queried high pairs.
     pub folded_queried_symbols: Vec<Vec<(Block128, Block128)>>,
     /// Batched Merkle proofs for `folded_roots`.
-    pub folded_merkle_batch: Vec<ShortBatchedMerkleProof>,
+    pub folded_merkle_batch: Vec<SourceBatchedMerkleProof>,
 }
 
 /// Proof of mixed-point opening.
@@ -490,7 +490,7 @@ const MIXED_SOURCE_BINDING_TAG: u128 = 0x5B1D_0000_0000_0001u128;
 struct HighFoldLayer {
     log_rows: usize,
     code: Option<Code>,
-    tree: ShortMerkleTree,
+    tree: SourceHashMerkleTree,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -560,7 +560,7 @@ fn prove_source_binding(
     assert_source_h_claim_matches_compact(primary_point, ctx, &h_evals)
         .expect("prover constructed inconsistent source H");
 
-    let folded_roots: Vec<ShortHash> = folded_layers
+    let folded_roots: Vec<SourceHash> = folded_layers
         .iter()
         .map(|layer| layer.tree.get_root())
         .collect();
@@ -636,7 +636,7 @@ fn prove_source_binding(
             };
             symbols.push(pair);
         }
-        let batch = build_short_batched_merkle_proof(
+        let batch = build_source_batched_merkle_proof(
             &layer.tree,
             &pair_indices,
             high_pair_tree_depth(layer.log_rows),
@@ -717,8 +717,8 @@ fn verify_source_binding(
     let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
     let n_queries = query_indices.len();
 
-    let source_root = source_root_short_from_cap(&commitment.cap)
-        .ok_or_else(|| "missing short source root in interleaved commitment".to_string())?;
+    let source_root = source_root_from_cap(&commitment.cap)
+        .ok_or_else(|| "missing source root in interleaved commitment".to_string())?;
     let source_pair_indices: Vec<usize> = if direct_source_expansion {
         high_expansion_source_leaf_indices(&query_indices, log_n, ctx.tau)
     } else {
@@ -745,7 +745,7 @@ fn verify_source_binding(
             &proof.source_symbols[start..end],
         ));
     }
-    verify_short_batched_merkle_proof(
+    verify_source_batched_merkle_proof(
         &source_root,
         &proof.source_merkle_batch,
         source_tree_depth(log_n),
@@ -811,12 +811,12 @@ fn verify_source_binding(
             .iter()
             .map(|&idx| high_pair_leaf_index(idx, layer_log))
             .collect();
-        let leaf_hashes: Vec<ShortHash> = symbols
+        let leaf_hashes: Vec<SourceHash> = symbols
             .iter()
             .zip(pair_indices.iter())
             .map(|(&(s0, s1), &pair_idx)| high_pair_leaf_hash(layer_log, pair_idx, s0, s1))
             .collect();
-        verify_short_batched_merkle_proof(
+        verify_source_batched_merkle_proof(
             &proof.folded_roots[layer_idx],
             &proof.folded_merkle_batch[layer_idx],
             high_pair_tree_depth(layer_log),
@@ -864,7 +864,7 @@ fn verify_source_binding(
 
 fn observe_source_binding_commitments(
     channel: &mut Channel,
-    folded_roots: &[ShortHash],
+    folded_roots: &[SourceHash],
     h_evals: &[Block128],
     log_n: usize,
     tau: usize,
@@ -875,7 +875,7 @@ fn observe_source_binding_commitments(
         let layer_log = log_n - 1 - i;
         debug_assert!(i + 1 < tau);
         channel.observe_vector_commitment(&VectorCommitment {
-            root: short_hash_to_output(root),
+            root: source_hash_to_output(root),
             depth: high_pair_tree_depth(layer_log),
         });
     }
@@ -1232,33 +1232,30 @@ fn high_pair_leaf_hash(
     leaf_index: usize,
     s0: Block128,
     s1: Block128,
-) -> ShortHash {
+) -> SourceHash {
     let mut h = blake3::Hasher::new();
-    h.update(b"PARANOID/MIXED-SOURCE-HIGH-FOLD-LEAF/128/v1");
+    h.update(b"PARANOID/MIXED-SOURCE-HIGH-FOLD-LEAF/256/v2");
     h.update(&(layer_log as u64).to_le_bytes());
     h.update(&(leaf_index as u64).to_le_bytes());
     h.update(&s0.0.to_le_bytes());
     h.update(&s1.0.to_le_bytes());
-    let digest = h.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
+    *h.finalize().as_bytes()
 }
 
 fn build_high_pair_tree(
     code: &Code,
     layer_log: usize,
     _hasher: &dyn CryptographicHasher,
-) -> ShortMerkleTree {
+) -> SourceHashMerkleTree {
     let leaf_count = RATE * (1usize << (layer_log - 1));
-    let leaf_hashes: Vec<ShortHash> = (0..leaf_count)
+    let leaf_hashes: Vec<SourceHash> = (0..leaf_count)
         .into_par_iter()
         .map(|leaf_idx| {
             let (pos0, pos1) = high_pair_positions(layer_log, leaf_idx);
             high_pair_leaf_hash(layer_log, leaf_idx, code.idx(pos0), code.idx(pos1))
         })
         .collect();
-    ShortMerkleTree::new(leaf_hashes)
+    SourceHashMerkleTree::new(leaf_hashes)
 }
 
 fn reduce_source_pair_flat(symbols: &[Block128], weights_flat: &[u128]) -> (Block128, Block128) {
@@ -1303,9 +1300,10 @@ fn compute_batched_claim_flat(gamma: Block128, openings: &[Block128]) -> Block12
 impl SourceBindingProof {
     pub fn byte_len(&self) -> usize {
         let h = self.h_evals.len() * 16;
-        let roots = self.folded_roots.len() * 16;
+        let hash_bytes = std::mem::size_of::<SourceHash>();
+        let roots = self.folded_roots.len() * hash_bytes;
         let source_symbols = self.source_symbols.len() * 16;
-        let source_batch = self.source_merkle_batch.siblings.len() * 16;
+        let source_batch = self.source_merkle_batch.siblings.len() * hash_bytes;
         let folded_symbols: usize = self
             .folded_queried_symbols
             .iter()
@@ -1314,7 +1312,7 @@ impl SourceBindingProof {
         let folded_batches: usize = self
             .folded_merkle_batch
             .iter()
-            .map(|b| b.siblings.len() * 16)
+            .map(|b| b.siblings.len() * hash_bytes)
             .sum();
         let total = h + roots + source_symbols + source_batch + folded_symbols + folded_batches;
         if std::env::var("NOID_SOURCE_BINDING_PROFILE").is_ok() {
@@ -1722,6 +1720,58 @@ mod tests {
             num_queries,
         )
         .expect("valid mixed opening with compact FRI round-0 source binding must verify");
+    }
+
+    #[test]
+    fn source_root_upper_half_mutation_rejects() {
+        let (mut commitment, primary_point, claims, proof, ntt, hasher) = valid_fixture();
+        let source_root = commitment
+            .cap
+            .hashes
+            .last_mut()
+            .expect("interleaved cap must contain source root");
+        source_root[16] ^= 0x80;
+
+        assert!(
+            verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+                .is_err(),
+            "mutating only bytes [16..32] of source_root must reject"
+        );
+    }
+
+    #[test]
+    fn source_sibling_upper_half_mutation_rejects() {
+        let (commitment, primary_point, claims, mut proof, ntt, hasher) = valid_fixture();
+        let sibling = proof
+            .source_proof
+            .source_merkle_batch
+            .siblings
+            .first_mut()
+            .expect("source Merkle batch must contain at least one sibling");
+        sibling[16] ^= 0x80;
+
+        assert!(
+            verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+                .is_err(),
+            "mutating only the upper half of a source sibling must reject"
+        );
+    }
+
+    #[test]
+    fn folded_root_upper_half_mutation_rejects() {
+        let (commitment, primary_point, claims, mut proof, ntt, hasher) = valid_fixture();
+        let folded_root = proof
+            .source_proof
+            .folded_roots
+            .first_mut()
+            .expect("folded-layer path must contain at least one folded root");
+        folded_root[16] ^= 0x80;
+
+        assert!(
+            verify_with_claims(&commitment, &primary_point, &claims, &proof, &ntt, &hasher)
+                .is_err(),
+            "mutating only bytes [16..32] of a folded root must reject"
+        );
     }
 
     #[test]

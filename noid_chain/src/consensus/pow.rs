@@ -4,12 +4,12 @@
 //! Blake3 Proof-of-Work validation.
 //!
 //! PoW is computed over `header_core` which does NOT include
-//! `proof_transcript_hash`. This allows PoW search and BlockProof generation to run
-//! in parallel: both are committed to the chain (the next block's
-//! `prev_block_hash` = Blake3 of the FULL header), but miners only need
-//! `header_core` to start searching.
+//! `proof_transcript_hash` or `witness_root`. This allows PoW search and
+//! BlockProof generation to run in parallel: both are committed to the chain
+//! (the next block's `prev_block_hash` = Blake3 of the FULL header), but miners
+//! only need `header_core` to start searching.
 //!
-//! # Wire layout of header_core (256 bytes)
+//! # Wire layout of header_core (212 bytes)
 //!
 //! ```text
 //! prev_block_hash       [32B]

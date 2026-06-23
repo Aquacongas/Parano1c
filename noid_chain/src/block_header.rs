@@ -53,7 +53,7 @@ pub struct BlockHeader {
     /// 128-bit PoW nonce. Provides effectively unlimited search space.
     pub nonce: u128,
     /// 256-bit ASERT difficulty target (LE). Block valid iff
-    /// `Blake3(header_bytes) < difficulty_target`.
+    /// `Blake3(header_core_bytes(header)) < difficulty_target`.
     pub difficulty_target: [u8; 32],
     /// Poseidon2b digest of the `BlockProof` Fiat-Shamir transcript.
     /// Non-zero field required by `apply_block`.

@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Paranoid is a UTXO-based statechain where every user-transaction block carries a validity proof. Nodes verify proof objects instead of re-executing wallet logic. The entire chain history compresses into a single ~38 KB encoded recursive STARK, verifiable in ~5 ms.
+Paranoid is a UTXO-based statechain where every user-transaction block carries a validity proof. Nodes verify proof objects instead of re-executing wallet logic. The entire chain history compresses into a single ~43 KB encoded recursive STARK, verifiable in a few milliseconds.
 
 This document specifies the complete protocol: all layers, their interfaces, and the data flow from wallet to finalized block.
 
@@ -52,7 +52,7 @@ Each extension is quadratic: `F_{2K} = F_K[X] / (X^2 + X + τ_K)` where `τ_K` i
 
 **Three load-bearing properties:**
 
-1. **Frobenius endomorphism.** Squaring `x ↦ x^2` is GF(2)-linear (bit-shuffle, zero cost). This makes `x^7 = x · x^2 · x^4` require only 3 multiplications.
+1. **Frobenius endomorphism.** Squaring `x ↦ x^2` is GF(2)-linear (bit-shuffle, zero cost). This makes `x^7 = x · x^2 · x^4` require only 2 field multiplications after the two free squarings.
 
 2. **Single field everywhere.** FRI, sumcheck, Poseidon2b, GKR, and all AIR constraints operate in the same GF(2^128). No field-switching, no extension towers at proof time.
 
@@ -247,10 +247,28 @@ For user-transaction blocks this NativeDelta check is mandatory production valid
 ### 6.1 Proof of Work
 
 - Hash function: Blake3 (256-bit output)
-- PoW input: 212-byte `header_core` (header with nonce zeroed)
-- Nonce: 128-bit (bytes 144..160 of the header)
-- Validity: `Blake3(header_core_with_nonce) < difficulty_target`
+- PoW input: 212-byte `header_core` with nonce included
+- Nonce: 128-bit LE at bytes `[144..160]` of `header_core` and of the full header
+- Validity: `Blake3(header_core) < difficulty_target`
 - Target block time: 15 seconds
+
+`header_core` is the byte-level preimage:
+
+```text
+core[0..32]    prev_block_hash
+core[32..64]   state_root
+core[64..96]   tx_root
+core[96..104]  timestamp LE u64
+core[104..112] height LE u64
+core[112..144] miner_address
+core[144..160] nonce LE u128
+core[160..192] difficulty_target
+core[192..196] log_slots LE u32
+core[196..204] active_slot_count LE u64
+core[204..212] alloc_counter LE u64
+```
+
+It excludes the full-header fields `proof_transcript_hash` and `witness_root`, allowing PoW search and BlockProof generation to run in parallel. The full block hash used for chain linking still hashes `header_core || proof_transcript_hash || witness_root`.
 
 ### 6.2 Difficulty Adjustment (ASERT)
 
@@ -270,7 +288,8 @@ Heaviest chain by cumulative PoW work. A competing fork reorgs the incumbent onl
 
 `FINALITY_DEPTH = 18` blocks. After 18 confirmations:
 - Undo logs are pruned
-- Block bodies are pruned
+- Block bodies and public Auth sidecars are pruned
+- `BlockProof` bytes become eligible for pruning only after the stored recursive proof has covered that height
 - Reorg is structurally impossible (no undo data)
 
 ### 6.5 Transaction Validity Window
@@ -331,8 +350,8 @@ These values are bound at two levels:
 
 ### 7.3 Properties
 
-- **Size:** ~38 KB encoded constant (independent of chain length)
-- **Verification:** ~5 ms (one STARK verify)
+- **Size:** ~43 KB encoded constant (independent of chain length)
+- **Verification:** a few milliseconds (one STARK verify)
 - **Coverage:** a recursive proof at height `h` proves the chain from genesis through block `h`; healthy nodes target finalized history near `tip - FINALITY_DEPTH`
 - **Unforgeable:** soundness ~2^-123 (RecursiveBlockAir zero-check)
 
@@ -359,11 +378,14 @@ Wallet                    Mempool              Miner                   Network
   │ 3. Submit ────────────> │                    │                       │
   │                         │                    │                       │
   │                         │ 4. Admission       │                       │
-  │                         │    checks (fee,    │                       │
-  │                         │    anchor, slots,  │                       │
-  │                         │    nullifier)      │                       │
+  │                         │    prefilter       │                       │
+  │                         │    (fee, anchor,   │                       │
+  │                         │    slots, nullifier)│                      │
+  │                         │    + LogicProof    │                       │
+  │                         │    verify + final  │                       │
+  │                         │    recheck         │                       │
   │                         │                    │                       │
-  │                         │ 5. Gossip ─────────────────────────────────>
+  │                         │ 5. Gossip after final admission ───────────>
   │                         │                    │                       │
   │                         │ 6. Template ─────> │                       │
   │                         │    (max 256 txs)   │                       │
@@ -387,20 +409,20 @@ Wallet                    Mempool              Miner                   Network
   │                         │                    │                       │
   │                         │                    │ 11. Async:            │
   │                         │                    │     prove_recursive   │
-  │                         │                    │     → ~38 KB proof    │
+  │                         │                    │     → ~43 KB proof    │
 ```
 
 ### 8.2 Timing
 
 | Step | Duration | Bottleneck |
 |------|----------|-----------|
-| Wallet prove (`Standard4x8`, 4-in/8-out) | ~89.41 ms | wallet proof generation |
-| Wallet verify (`Standard4x8`, 4-in/8-out) | ~24.60 ms | wallet proof verification |
-| Mempool admission | <1 ms native checks + async proof verify | Slot lookups / proof workers |
-| Block prove (`Standard4x8`, 100 txs, proof-native) | ~14.26 s | bucket proof + NativeDelta openings |
-| Block verify (`Standard4x8`, 100 txs, proof-native) | ~4.10 s | bucket verify + NativeDelta openings |
+| Wallet prove (`Standard4x8`, 4-in/8-out) | ~98.07 ms | wallet proof generation |
+| Wallet verify (`Standard4x8`, 4-in/8-out) | ~27.58 ms | wallet proof verification |
+| Mempool admission | <1 ms native prefilter + bounded LogicProof worker + final recheck | Slot lookups / proof workers |
+| Block prove (100 standard-shape txs, proof-native `block_scaling` mix) | ~14.75 s | bucket proof + NativeDelta openings |
+| Block verify (100 standard-shape txs, proof-native `block_scaling` mix) | ~4.91 s | bucket verify + NativeDelta openings |
 | PoW (target 15s) | ~15 s | Blake3 nonce search |
-| Recursive proof verify | ~5 ms | RecursiveBlockAir verify |
+| Recursive proof verify | a few ms | RecursiveBlockAir verify |
 
 ---
 
@@ -425,6 +447,8 @@ Offset  Size  Field                    Purpose
 268       8   alloc_counter            Allocator PRNG seed after this block
                                        Total: 276 bytes
 ```
+
+The 212-byte PoW `header_core` is not “the header with nonce zeroed”. It is the header fields above with `proof_transcript_hash` and `witness_root` omitted; `log_slots`, `active_slot_count`, and `alloc_counter` are appended immediately after `difficulty_target` in the PoW preimage. The nonce is included and patched in place by miners at byte offset 144.
 
 ### 9.2 Block Body
 

@@ -28,9 +28,9 @@ pub const GENESIS_BURN_ADDRESS: Address = Address([0u8; 32]);
 
 /// Build the canonical genesis block header.
 ///
-/// The header's PoW is pre-computed and hardcoded. The `state_root` is
-/// all-zeros (empty state) and `tx_root` is all-zeros (coinbase-only, computed
-/// by the full node layer).
+/// The header's PoW is pre-computed and hardcoded. The `state_root` is the
+/// canonical empty-state root and `tx_root` is all-zeros (coinbase-only,
+/// computed by the full node layer).
 ///
 /// Every node must produce byte-identical output from this function.
 pub fn genesis_header() -> BlockHeader {
@@ -64,14 +64,14 @@ pub fn genesis_state_root() -> [u8; 32] {
 /// Pre-computed genesis state root. All 2^24 slots are zero.
 /// Computed via compact interleaved FRI (`noid_fri_binius`).
 const GENESIS_STATE_ROOT: [u8; 32] = [
-    0x6e, 0x7e, 0xb7, 0x14, 0x15, 0xb4, 0xbe, 0xea, 0x72, 0x39, 0xac, 0xa4, 0x09, 0xed, 0x0a, 0x80,
-    0x6b, 0x3b, 0x21, 0xd2, 0xf2, 0xb5, 0x3f, 0x96, 0x38, 0xff, 0x2f, 0x48, 0xcb, 0xcd, 0xbd, 0x34,
+    0xdd, 0xdd, 0xfe, 0xc4, 0x6f, 0xcd, 0xa5, 0x8d, 0x64, 0x3b, 0xa8, 0x94, 0xe1, 0xe2, 0xcb, 0x44,
+    0x5e, 0xfc, 0x8b, 0xbc, 0xd3, 0x98, 0x8b, 0xbd, 0x44, 0xf9, 0x14, 0x81, 0x83, 0x33, 0x92, 0x99,
 ];
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
-/// Recomputed after GENESIS_TARGET changed to 2^229 (halved difficulty).
-const GENESIS_NONCE: u128 = 15_108_031;
+/// Recomputed after the source-binding Merkle hash width changed to 256 bits.
+const GENESIS_NONCE: u128 = 64_894_641;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).

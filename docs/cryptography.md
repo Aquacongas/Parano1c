@@ -4,7 +4,7 @@
 
 This document specifies Paranoid's transparent validity proof stack. All constructions operate over the binary tower field GF(2^128). The proof system composes four protocols: Poseidon2b (algebraic hash), FROST-GKR (hash computation proof), FRI-Binius (polynomial commitment), and recursive STARK (chain accumulation).
 
-System soundness: **~120 bits** (bottleneck: FROST-GKR unified sumcheck at 345/2^128).
+System soundness: **~120 bits** (bottleneck: FROST-GKR subproof bound at 348/2^128).
 
 ---
 
@@ -47,7 +47,7 @@ In the binary tower, this means `sq: x ↦ x^2` is a bitwise permutation of the 
 x^7 = x · x^2 · x^4
 ```
 
-where `x^2` and `x^4` are free (linear maps). Cost: **3 multiplications** in GF(2^128).
+where `x^2` and `x^4` are free (linear maps). Cost: **2 field multiplications** in GF(2^128): compute `x · x^2`, then multiply by `x^4`.
 
 This is the key insight enabling FROST-GKR: the S-box is provable at degree 7 directly, without auxiliary decomposition columns.
 
@@ -201,17 +201,17 @@ Round polynomial degree: 9 (10 coefficients per round). Number of rounds: 15 (sp
 
 Implementation: `noid_gkr/src/spine_unified.rs`, `noid_gkr/src/auth_unified_v2.rs`.
 
-**Theorem 2 (Unified Sumcheck Soundness).** Under Assumption A4 (Schwartz-Zippel over GF(2^128)), if any permutation slot's witness violates any constraint at any hypercube point, the unified sumcheck rejects with probability ≥ 1 − 135/2^128 (spine).
+**Theorem 2 (Unified Sumcheck Soundness).** Under Assumptions A3/A4, if any permutation slot's witness violates any constraint at any hypercube point, the unified sumcheck rejects with probability ≥ 1 − 138/2^128 (spine, conservative).
 
 *Proof.* Let the honest combined polynomial be `P(y) = U(y)·[C1 + ρ·C1' + ρ²·C2]`.
 
-Step 1: If constraint C_i is violated at some point, the combined polynomial `C1 + ρ·C1' + ρ²·C2` is nonzero at that point with probability ≥ 1 − 2/2^128 over (ρ, ρ²) (Schwartz-Zippel on a degree-2 polynomial in ρ).
+Step 1: If any of the three constraint families is violated, random batching by `ρ` can hide it only if the resulting low-degree polynomial in `ρ` vanishes. We use the conservative bound `3/2^128` for this batching step.
 
 Step 2: Given a nonzero combined polynomial, the sumcheck detects it. Per round, the prover commits a round polynomial `rp_i` before the challenge `r_i` is drawn. If `rp_i` differs from the honest polynomial `q_i`, then `rp_i - q_i` is nonzero of degree ≤ 9. By A4, `Pr[r_i is a root] ≤ 9/2^128`.
 
-Step 3: Over 15 rounds, the detection failure probability is at most `15 × 9/2^128 = 135/2^128` by union bound.
+Step 3: Over 15 rounds, the sumcheck detection failure probability is at most `15 × 9/2^128 = 135/2^128` by union bound.
 
-The union bound is valid because each round's failure event depends only on the current round polynomial being wrong, and the challenge is drawn fresh after commitment (Fiat-Shamir under ROM, Assumption A3). □
+Therefore `ε_unified ≤ (3 + 15 × 9)/2^128 = 138/2^128`. The union bound is valid because each round's failure event depends only on the current round polynomial being wrong, and the challenge is drawn fresh after commitment (Fiat-Shamir under A3). □
 
 ### 3.6 Flat-Basis Accumulation
 
@@ -337,8 +337,8 @@ Implementation: `noid_gkr/src/batch_eval.rs`.
 
 ```
 ε_GKR = ε_unified + ε_shift + ε_batch
-      = 135/2^128 + 120/2^128 + 90/2^128
-      = 345/2^128
+      = 138/2^128 + 120/2^128 + 90/2^128
+      = 348/2^128
       ≈ 2^{-120}
 ```
 
@@ -349,7 +349,7 @@ Implementation: `noid_gkr/src/batch_eval.rs`.
 | Sumchecks (spine) | 472 (8/slot × 59) | 2 (unified + shift) | 236× |
 | FS rounds (spine) | 4,248 | 30 | 141× |
 | Proof size (spine) | >280 KB | ~5.4 KB | >50× |
-| Soundness error | 12,744/2^128 | 345/2^128 | 37× better |
+| Soundness error | 12,744/2^128 | 348/2^128 | 36× better |
 | Prover time | 1.63 s | 154 ms | 10.5× |
 | Verifier time | 1.06 s | 69 ms | 15.3× |
 
@@ -403,13 +403,11 @@ The compact FRI uses deduplicated Merkle paths. Instead of Q independent paths (
 
 Implementation: `noid_fri_binius/src/compact_fri.rs`.
 
-**Theorem 5 (FRI Proximity Soundness).** For an adversarial prover whose committed codeword is at relative Hamming distance δ ≥ 1 − ρ = 3/4 from the Reed-Solomon code, the verifier accepts with probability at most:
+**Theorem 5 (FRI Proximity Soundness).** Compact FRI is used as a proximity test for the committed evaluation oracle. Soundness is the standard FRI soundness bound for the configured rate, folding schedule, query count, proximity gap/list-decoding constants, Merkle binding, and Fiat-Shamir challenges.
 
-```
-ε_FRI ≤ ρ^Q = (1/4)^64 = 2^{-128}
-```
+The code distance `1 − ρ = 3/4` is the minimum distance between distinct codewords, not a guarantee that an arbitrary adversarial word is 3/4-far from the code. Therefore `(1/4)^64` is only the query-rate intuition for the target parameter choice, not a standalone proof. The production parameters (`ρ = 1/4`, `COMPACT_NUM_QUERIES = 64`, release builds) target a 128-bit proximity error under the standard FRI theorem, plus the relevant Merkle collision and Fiat-Shamir terms.
 
-*Proof.* After all folding rounds, the final codeword comparison fails at any query position that is in the error set (density ≥ δ ≥ 3/4). A single uniformly random query catches the adversary with probability ≥ δ ≥ 3/4, so it passes with probability ≤ 1/4. For Q = 64 independent queries: ε_FRI ≤ (1/4)^64 = 2^{-128}. The proximity gap theorem [BBHR18] ensures that FRI folding preserves the distance property through each round with overwhelming probability over the fold challenges. □
+*Proof sketch.* The verifier first binds the committed oracles and all FRI folding messages into the transcript, then samples query indices. Standard FRI analysis shows that if the initial oracle is not close to any low-degree codeword, then except with the FRI folding/list-decoding error, the induced inconsistency remains detectable at the queried positions. Merkle authentication binds queried symbols to the previously committed roots, and Fiat-Shamir soundness requires absorb-before-squeeze ordering for every challenge. □
 
 ### 4.6 Interleaved Commitment (Block-Level)
 
@@ -509,13 +507,13 @@ assert derived == eval
 
 *Proof.* A multilinear polynomial `f(x_1,...,x_8)` has exactly 2^8 = 256 coefficients in the multilinear basis `{Π x_i^{b_i} : b ∈ {0,1}^8}`. Its evaluation table on {0,1}^8 uniquely determines all coefficients (the multilinear extension is unique). Therefore `f(z) = Σ_i eq(z, i) · f(i)` is the exact evaluation at any point z. No proximity gap exists; no FRI queries are needed. □
 
-**Theorem 7 (RecursiveBlockAir Soundness).** Under A3, A4, the recursive AIR STARK has soundness:
+**Theorem 7 (RecursiveBlockAir Soundness).** Under A3/A4 and the accumulator hash-collision assumption, the conservative recursive step bound is:
 
 ```
-ε_rec ≤ (d_max + n_cols + 1) / 2^128 = (4 + 10 + 1) / 2^128 = 15/2^128 ≪ 2^{-120}
+ε_rec ≤ 8 × 4 / 2^128 + 2^-128 = 32/2^128 + 2^-128 ≪ 2^-120
 ```
 
-*Proof.* See Security Model §9.2 for the full three-condition proof (public column determinism, witness constraint via Schwartz-Zippel, opening consistency via multipoint sumcheck). □
+The `32/2^128` term is the recursive AIR zero-check budget for `LOG_ROWS = 8` and max constraint degree 4. The additional hash term covers accumulator/header-claim binding collisions. See Security Model §9 for the full three-condition proof (public column determinism, witness constraint via Schwartz-Zippel, opening consistency via multipoint sumcheck). □
 
 ### 6.3 Chain Accumulator
 
@@ -538,13 +536,13 @@ Measured medians on the reference 2023 Intel Core i7-1365U laptop:
 
 | Component | Size / time | Notes |
 |-----------|-------------|-------|
-| Standard4x8 wallet bundle (4-in/8-out) | 235.79 KB; prove 89.41 ms; verify 24.60 ms | Logic proof = 234.08 KB = 151.50 KB STARK + 82.58 KB AuthGKR |
-| Sweep25x2 wallet bundle (25-in/2-out) | 214.94 KB; prove 372.33 ms; verify 111.54 ms | Logic proof = 210.28 KB = 96.19 KB STARK + 114.09 KB AuthGKR |
-| Standard-only full block, 10 txs | 2.24 MB proof + 828.17 KB Auth sidecar; prove 2.37 s; verify 542.39 ms | Production proof-native path: bucket proof + NativeDelta pre/post state openings |
-| Standard-only full block, 20 txs | 2.85 MB proof + 1.62 MB Auth sidecar; prove 3.95 s; verify 960.62 ms | Same path |
-| Standard-only full block, 100 txs | 7.62 MB proof + 8.11 MB Auth sidecar; prove 14.26 s; verify 4.10 s | Same path |
-| Sweep-only full block, 10 txs | 2.70 MB proof + 1.11 MB Auth sidecar; prove 3.97 s; verify 1.06 s | Wallet pre-proving excluded from block prove time |
-| RecursiveProof | ~38 KB encoded; verify ~5 ms | 256-row `RecursiveBlockAir`; current `recursive_hotspots` run measured 37.91–38.34 KB encoded |
+| Standard4x8 wallet bundle (4-in/8-out) | 290.82 KB; prove 98.07 ms; verify 27.58 ms | Logic proof = 289.11 KB = 168.84 KB STARK + 120.27 KB AuthGKR |
+| Sweep25x2 wallet bundle (25-in/2-out) | 284.02 KB; prove 574.80 ms; verify 143.18 ms | Logic proof = 279.36 KB = 114.53 KB STARK + 164.83 KB AuthGKR |
+| Standard-only full block, 10 txs | 3.58 MB proof + 1.18 MB Auth sidecar; prove 2.67 s; verify 586.08 ms | Production proof-native path; `block_scaling` standard-shape fixture mix |
+| Standard-only full block, 20 txs | 4.40 MB proof + 2.36 MB Auth sidecar; prove 4.05 s; verify 1.10 s | Same path |
+| Standard-only full block, 100 txs | 10.75 MB proof + 11.80 MB Auth sidecar; prove 14.75 s; verify 4.91 s | Same path |
+| Sweep-only full block, 10 txs | 4.01 MB proof + 1.63 MB Auth sidecar; prove 5.72 s; verify 1.50 s | Wallet pre-proving excluded from block prove time |
+| RecursiveProof | ~43 KB encoded; verify in a few ms | 256-row `RecursiveBlockAir`; current `recursive_hotspots` run measured 42.59–43.16 KB encoded |
 
 ---
 
@@ -552,19 +550,19 @@ Measured medians on the reference 2023 Intel Core i7-1365U laptop:
 
 | Component | Formula | ε | Bits |
 |-----------|---------|---|------|
-| GKR unified sumcheck (spine) | 15 × 9 / 2^128 | 135/2^128 | ~120 |
+| GKR unified sumcheck (spine) | (3 + 15 × 9) / 2^128 | 138/2^128 | ~120 |
 | GKR shift gadget | 15 × 8 / 2^128 | 120/2^128 | ~120 |
 | GKR batch-eval (3 cols) | 3 × 15 × 2 / 2^128 | 90/2^128 | ~121 |
 | TxLogicAir zero-check | 11 × 5 / 2^128 | 55/2^128 | ~122 |
 | NativeDelta state identity, per dirty segment | 3 × eff_log / 2^128, eff_log ≤ 16 | ≤48/2^128 | ~122 |
 | RecursiveBlockAir zero-check | 8 × 4 / 2^128 | 32/2^128 | ~123 |
-| FRI PCS (64 queries, ρ=1/4) | (1/4)^64 | 2^{-128} | 128 |
-| Poseidon2b collision | — | 2^{-128} | 128 |
+| FRI PCS (64 queries, ρ=1/4) | standard FRI proximity bound for configured parameters | target 2^-128 | 128 |
+| Poseidon2b / full-output Blake3 source-Merkle collision | — | 2^{-128} target | 128 |
 | **Block aggregate** | union bound over active checks and dirty segments | see `docs/security.md` | target ≥120-bit for accepted production caps |
 
-**Theorem 8 (System Soundness).** Under assumptions A1–A5, no PPT adversary can produce a block proof accepted by an honest verifier for a block containing an invalid transaction except with the union-bound probability over the verified wallet proofs, bucket proofs, NativeDelta segment identities, source-bound FRI openings, recursive AIR check, and Poseidon2b collision events.
+**Theorem 8 (System Soundness).** Under assumptions A1–A6, no PPT adversary can produce a block proof accepted by an honest verifier for a block containing an invalid transaction except with the union-bound probability over the verified wallet proofs, bucket proofs, NativeDelta segment identities, source-bound FRI openings, recursive AIR check, and hash collision events.
 
-*Proof.* Each sumcheck or random-point identity term is bounded by Schwartz-Zippel (A4) using its degree and round count. Each source-bound FRI opening contributes the code-rate query bound (A5). Poseidon2b commitments contribute the collision term (A2). Fiat-Shamir domain separation (A3) makes every challenge pseudorandom for the already-bound transcript prefix. See `docs/security.md` for the exact production acceptance predicates and block-level aggregate analysis. □
+*Proof.* Each sumcheck or random-point identity term is bounded by Schwartz-Zippel (A4) using its degree and round count. Each source-bound FRI opening contributes the standard FRI proximity term for the configured parameters (A5), plus source/Merkle binding terms. Poseidon2b and Blake3 commitments contribute their collision terms (A1/A6). Fiat-Shamir domain separation (A3) makes every challenge pseudorandom for the already-bound transcript prefix. See `docs/security.md` for the exact production acceptance predicates and block-level aggregate analysis. □
 
 ---
 
@@ -572,11 +570,11 @@ Measured medians on the reference 2023 Intel Core i7-1365U laptop:
 
 ### 9.1 Channel
 
-A single `Poseidon2bChannel` spans the entire proof (GKR + STARK + FRI). Operations:
-- `absorb(data)`: feed bytes into the sponge state
+Fiat-Shamir challenges are produced by Poseidon2b-based channels, not Blake3. The generic GKR/STARK channel is `Poseidon2bChannel`; compact FRI uses `noid_fri::Channel`, also a Poseidon2b sponge duplex. Operations:
+- `absorb(data)`: feed bytes/field elements into the sponge state
 - `squeeze() → Block128`: extract a field element challenge
 
-The channel uses Poseidon2b in sponge mode (rate-2, capacity-2).
+Each channel uses Poseidon2b in sponge mode (rate-2, capacity-2) with domain-separated transcript prefixes.
 
 ### 9.2 Transcript Ordering (Per-Transaction)
 
@@ -607,9 +605,11 @@ The channel uses Poseidon2b in sponge mode (rate-2, capacity-2).
 
 **Critical invariant:** `extra_transcript` (step 3, second absorb) binds GKR proofs to the STARK. Any byte-level modification forks all downstream challenges.
 
-### 9.3 No Forked Channels
+### 9.3 Domain-Separated Channels, No Unbound Forks
 
-No module in the system constructs a parallel channel. The boundary-MLE FRI opening uses a fresh `noid_fri::Channel` whose output bytes are re-absorbed into the shared channel via the extras hook.
+The implementation does construct independent channels for parallel per-transaction algebraic STARK work, block-level bucket reductions, state binding, and FRI openings. These are not unbound forks: every such channel is domain-separated and seeded with the commitments, state roots, transaction index, bucket cap, or segment identity it must bind. Per-tx transcript digests and shared caps are then absorbed by the block-level transcript before downstream challenges are sampled.
+
+The boundary-MLE/compact FRI opening uses a fresh `noid_fri::Channel`; its commitments, roots, source-binding data, and query indices are tied to the caller through the opening proof and the surrounding transcript hooks.
 
 ---
 
@@ -619,9 +619,10 @@ No module in the system constructs a parallel channel. The boundary-MLE FRI open
 |----|-----------|----------|---------|
 | A1 | Poseidon2b collision resistance | 128 bits | Merkle trees, state root, accumulator |
 | A2 | Poseidon2b preimage resistance | 128 bits | Privacy of spend_secret |
-| A3 | Blake3 random oracle model | 256 bits | Fiat-Shamir, PoW |
+| A3 | Poseidon2b sponge random-oracle model for Fiat-Shamir channels | 128 bits | Fiat-Shamir challenges in GKR, STARK, FRI |
 | A4 | Schwartz-Zippel over GF(2^128) | d/2^128 per eval | All sumchecks |
-| A5 | FRI proximity (Q=64, ρ=1/4) | 128 bits | Polynomial commitments |
+| A5 | Standard FRI proximity bound for configured compact FRI parameters (Q=64, ρ=1/4) | 128-bit target | Polynomial commitments |
+| A6 | Blake3 collision resistance where explicitly used outside Fiat-Shamir | 128-bit collision target for full-output 256-bit source-binding Merkle roots; 256-bit output for PoW/header/content hashes | Source-binding Merkle roots, PoW/full-header hash, P2P dedupe |
 
 ---
 

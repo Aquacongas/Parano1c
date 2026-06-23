@@ -41,7 +41,8 @@ const T_RECENT_BLOCKS: &str = "recent";
 const T_RECURSIVE_PROOF: &str = "rec_proof";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
-/// BlockProofs (retention = FINALITY_DEPTH). Key: height (u64 LE). Value: bincode BlockProof bytes.
+/// BlockProofs retained until finalized and covered by the stored recursive proof height.
+/// Key: height (u64 LE). Value: bincode BlockProof bytes.
 const T_BLOCK_PROOFS: &str = "block_proofs";
 /// Public AuthGKR sidecars (retention = FINALITY_DEPTH). Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
@@ -340,7 +341,7 @@ impl MdbxStore {
     }
 
     /// Store a serialised `BlockProof` for `height`.
-    /// Automatically pruned after `FINALITY_DEPTH` blocks by `prune_after_commit`.
+    /// Pruned by `prune_after_commit` only after both finality and recursive-proof coverage.
     pub fn put_block_proof(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
@@ -526,7 +527,8 @@ impl MdbxStore {
     /// After commit (non-atomic, re-runnable):
     ///   - Prune old undo_logs beyond FINALITY_DEPTH
     ///   - Prune old recent_blocks beyond FINALITY_DEPTH
-    ///   - Prune old block_proofs beyond FINALITY_DEPTH
+    ///   - Prune old auth sidecars beyond FINALITY_DEPTH
+    ///   - Prune old block_proofs beyond min(finality cutoff, recursive proof height)
     ///   - Prune old nullifier entries beyond ANCHOR_DEPTH
     pub fn commit_block(
         &self,

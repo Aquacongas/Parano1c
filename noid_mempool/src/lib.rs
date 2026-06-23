@@ -11,21 +11,20 @@
 //!    │  TxIntent (body + LogicProof bytes)
 //!    ▼
 //!  AsyncMempool::submit()
-//!    ├─ fee ≥ dynamic floor
-//!    ├─ consensus (fee overflow, body hash, anchor non-zero, nullifier)
-//!    ├─ epoch_anchor hash ∈ known headers within ANCHOR_DEPTH window
-//!    ├─ no slot conflict with already-admitted pool txs
-//!    ├─ input slots live in state (value + owner match)
-//!    └─ output slots empty in state
+//!    ├─ stateless body-hash and size checks
+//!    ├─ cheap pre-filter under lock:
+//!    │  fee floor, consensus, anchor, nullifier, slot conflicts/state
+//!    ├─ LogicProof verification outside lock (`spawn_blocking`, semaphore-bounded)
+//!    └─ final admission under lock: re-run cheap checks against current view
 //!         │
-//!         ▼ admitted
+//!         ▼ admitted only after proof verification
 //!    broadcast MempoolEvent::TxAdmitted
 //!         │
 //!         ├──► P2P: gossip to peers
 //!         ├──► RPC WebSocket: notify subscribed wallets
 //!         └──► Block builder: wake up if 100+ new txs
 //!
-//!  Background: LogicProof verification on admission + cached proof reuse
+//!  Cached proof reuse: admitted entries keep verified LogicProof bytes for block assembly
 //! ```
 //!
 //! ## Usage

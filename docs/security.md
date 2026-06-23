@@ -158,10 +158,10 @@ Untrusted inputs must be bounded before expensive decode/allocation/verification
 | --- | --- | ---: |
 | A1 | Poseidon2b collision resistance over `GF(2^128)` for application and transcript hashes | 128 bits |
 | A2 | Poseidon2b preimage resistance for `Address` / `AuthTag` | 128 bits |
-| A3 | Fiat-Shamir transcript challenges are modeled as random-oracle outputs after absorb-before-squeeze | 128 bits |
+| A3 | Poseidon2b Fiat-Shamir channels (`Poseidon2bChannel` and `noid_fri::Channel`) are modeled as random-oracle outputs after absorb-before-squeeze; Blake3 is not used for Fiat-Shamir | 128 bits |
 | A4 | Schwartz-Zippel over `GF(2^128)`: a nonzero degree-`d` polynomial vanishes at a random point with probability at most `d / 2^128` | algebraic |
-| A5 | Compact FRI at rate `1/4` with 64 validator queries has proximity error approximately `(1/4)^64 = 2^-128` | 128 bits |
-| A6 | 128-bit truncated Blake3 roots used for source-binding Merkle trees are collision-resistant to the 128-bit target | 128 bits |
+| A5 | Compact FRI at rate `1/4` with 64 validator queries satisfies the standard FRI proximity bound for the configured folding/query schedule; `(1/4)^64` is only the query-rate intuition, not a standalone proof | 128-bit target |
+| A6 | Blake3 collision resistance where explicitly used outside Fiat-Shamir; source-binding Merkle trees use full 256-bit Blake3 outputs, giving a 128-bit collision-security target | 128 bits |
 
 Validator compact FRI query count:
 
@@ -260,17 +260,17 @@ The source root commits to encoded columns:
 encoded_cols[col][code_index]
 ```
 
-using a 128-bit Blake3-based Merkle tree. Each source leaf is a high-variable pair for all columns:
+using a full-output Blake3-based Merkle tree (`SourceHash = [u8; 32]`). Each source leaf is a high-variable pair for all columns with this exact byte-level preimage:
 
 ```text
-leaf = H(
-    "PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/128/v1"
- || log_rows
- || n_cols
- || leaf_index
- || col_0[pos0] || col_0[pos1]
+source_leaf = BLAKE3(
+    "PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/256/v2"
+ || u64_le(log_rows)
+ || u64_le(n_cols)
+ || u64_le(leaf_index)
+ || u128_le(col_0[pos0]) || u128_le(col_0[pos1])
  || ...
- || col_{m-1}[pos0] || col_{m-1}[pos1]
+ || u128_le(col_{m-1}[pos0]) || u128_le(col_{m-1}[pos1])
 )
 ```
 
@@ -280,11 +280,31 @@ where
 (pos0, pos1) = source_leaf_positions(log_rows, leaf_index).
 ```
 
-Internal Merkle compression is domain-separated:
+Internal source-binding Merkle compression is full-output Blake3 over two 32-byte child hashes:
 
 ```text
-H("PARANOID/SOURCE-BINDING-MERKLE-128/v1" || left || right)
+node = BLAKE3(
+    "PARANOID/SOURCE-BINDING-MERKLE-256/v2"
+ || left[32]
+ || right[32]
+)
 ```
+
+Intermediate folded-layer roots use the same Merkle internal-node tag and a distinct folded-layer leaf tag. This is intentional safe reuse: source leaves and folded-layer leaves are role-separated by their leaf tags and byte preimages, while each folded root is also absorbed as a `VectorCommitment { root, depth }` before query sampling.
+
+For a folded layer with `layer_log = log_rows - 1 - layer_idx`, each folded leaf is:
+
+```text
+folded_leaf = BLAKE3(
+    "PARANOID/MIXED-SOURCE-HIGH-FOLD-LEAF/256/v2"
+ || u64_le(layer_log)
+ || u64_le(leaf_index)
+ || u128_le(s0)
+ || u128_le(s1)
+)
+```
+
+and the folded root is the Merkle root over `folded_leaf` values using the `SOURCE-BINDING-MERKLE-256/v2` internal compression above.
 
 The batched Merkle verifier:
 
@@ -300,9 +320,10 @@ noid_fri_binius/src/interleaved_commit.rs
   InterleavedCommitment
   InterleavedProverState::encoded_cols
   SourceMerkleTree
+  SourceHash
   source_leaf_hash
   source_leaf_positions
-  verify_short_batched_merkle_proof
+  verify_source_batched_merkle_proof
 ```
 
 ### 5.3 Transcript order
@@ -424,7 +445,7 @@ noid_fri_binius/src/mixed_open.rs
 Implementation tests:
 
 ```text
-cargo test -p noid_fri_binius --lib mixed_open::tests -- --nocapture
+cargo test --release -p noid_fri_binius --lib mixed_open::tests -- --nocapture
 
 Tests include:
   high TensorFold matches Code::new_parallel on random vectors
@@ -545,7 +566,7 @@ noid_fri_binius/src/mixed_open.rs
 Implementation tests:
 
 ```text
-cargo test -p noid_fri_binius --lib mixed_open::tests -- --nocapture
+cargo test --release -p noid_fri_binius --lib mixed_open::tests -- --nocapture
 
 Tests include:
   vector_mode_rejects_columns_above_120_bit_cap
@@ -553,6 +574,9 @@ Tests include:
   valid round-0 source-binding path passes
   tampered round-0 FRI root rejects
   tampered source H rejects
+  source_root_upper_half_mutation_rejects
+  source_sibling_upper_half_mutation_rejects
+  folded_root_upper_half_mutation_rejects
   one-column direct source expansion passes and tampering rejects
 ```
 
@@ -865,11 +889,13 @@ where a spend contributes the removed value/owner tuple and a mint contributes t
 new_opening_ℓ = prev_opening_ℓ + D_ℓ(r_s).
 ```
 
-Because `F` has characteristic 2, the `+` operator is the algebraic XOR delta. If the claimed segment transition differs from the verifier-reconstructed transition, then for at least one lane the difference is a nonzero multilinear polynomial in `r_s` of individual degree at most one and total degree at most `eff_log`; by Schwartz-Zippel,
+Because `F` has characteristic 2, the `+` operator is the algebraic XOR delta. If a fixed claimed three-lane segment transition differs from the verifier-reconstructed transition, then for at least one lane the difference is a nonzero multilinear polynomial in `r_s` of individual degree at most one and total degree at most `eff_log`; by Schwartz-Zippel,
 
 ```text
-Pr[wrong segment delta passes native point check] ≤ eff_log / 2^128.
+Pr[wrong complete segment delta passes native point check] ≤ eff_log / 2^128.
 ```
+
+The aggregate budget below uses the more conservative lane-union term `3 * eff_log / 2^128`, matching the implementation surface where value, owner-high, and owner-low lanes are checked independently at the same transcript-derived point.
 
 The pre/post lane values used in the equation are themselves accepted only if all of the following hold:
 
@@ -984,9 +1010,9 @@ The storage layer separates consensus-verifiable history from raw payload retent
 
 ```text
 headers:               retained without historical pruning
-recursive proof:       retained as latest/single entry
+recursive proof:       retained as latest/single entry plus covered height
 retained block bodies: FINALITY_DEPTH = 18
-block proofs:          FINALITY_DEPTH = 18
+block proofs:          retained until min(finality cutoff, recursive proof height) passes them
 block auth sidecars:   FINALITY_DEPTH = 18
 undo logs:             FINALITY_DEPTH = 18
 nullifiers / tx idx:   ANCHOR_DEPTH = 144
@@ -999,7 +1025,7 @@ FINALITY_DEPTH = 18
 ANCHOR_DEPTH   = 144
 ```
 
-At `BLOCK_TIME = 15s`, the anchor window is approximately 36 minutes under nominal timing. `ANCHOR_DEPTH` bounds nullifier and transaction-index retention for the valid transaction anchor window.
+At `BLOCK_TIME = 15s`, the anchor window is approximately 36 minutes under nominal timing. `ANCHOR_DEPTH` bounds nullifier and transaction-index retention for the valid transaction anchor window. MDBX pruning removes public Auth sidecars at finality, but removes `BlockProof` bytes only after the block is both finalized and covered by the stored recursive proof height; this avoids racing the background recursive updater.
 
 ### 10.2 Snapshot manifest acceptance predicate
 
@@ -1215,13 +1241,13 @@ Tests:
 Benchmark observations:
 
 ```text
-Standard4x8 wallet bundle: ~235–236 KiB
-Sweep25x2 wallet bundle:   ~214–217 KiB
+Standard4x8 wallet bundle: ~288–291 KiB
+Sweep25x2 wallet bundle:   ~284–285 KiB
 
-256 x Standard4x8 block:
-  full block proof: 17.62 MiB
-  bucket proof:      9.05 MiB
-  state binding:     8.54 MiB
+Current largest `block_scaling` row, 100 standard-shape tx fixture mix:
+  full block proof:       10.75 MiB
+  public Auth sidecar:    11.80 MiB
+  proof + sidecar total:  22.55 MiB
 ```
 
 These measurements fit under configured caps:
@@ -1245,12 +1271,12 @@ The main algebraic and hash-based terms are:
 | FROST-GKR unified relation | `138 / 2^128` | ~120 |
 | FROST-GKR full subproof including shift/batch-eval reductions | `348 / 2^128` | ~120 |
 | Transaction AIR zero-check | `55 / 2^128` | ~122 |
-| Native state-delta point check | `eff_log / 2^128` per dirty segment, plus source-bound pre/post opening terms | ~124 per segment for `eff_log = 16` |
+| Native state-delta point check | exact fixed-vector term `eff_log / 2^128`; conservative budget `3 * eff_log / 2^128` per dirty segment, plus source-bound pre/post opening terms | ~122 per segment for `eff_log = 16` |
 | Recursive block AIR zero-check | `32 / 2^128` | ~123 |
 | Source-bound mixed opening vector random linear combination | `(m - 1) / 2^128` plus source/FRI terms, with `m <= 256` | at least ~120 |
 | Tensor/source query binding | targeted around `2^-128` | 128 |
-| Compact FRI proximity | approximately `2^-128` | 128 |
-| Poseidon2b / source-Merkle collision | `2^-128` target | 128 |
+| Compact FRI proximity | standard FRI bound for configured parameters, target `2^-128` | 128 |
+| Poseidon2b / full-output Blake3 source-Merkle collision | `2^-128` target | 128 |
 | `spend_secret` one-wayness through public hashes | `2^-128` target | 128 |
 
 For one accepted block, let:
@@ -1269,7 +1295,7 @@ A conservative block-level union bound has the form
   ≤ N_gkr   * ε_GKR
    + N_txair * ε_txair
    + N_mix   * (ε_hash + ε_tensor_query + ε_FRI + 255/2^128 + ε_FS)
-   + D_seg   * eff_log/2^128
+   + D_seg   * (3*eff_log)/2^128
    + ε_recursive
    + ε_header_sidecar_hash.
 ```
@@ -1291,7 +1317,7 @@ cargo test -p noid_chain --release
 cargo test -p noid_block --release
 cargo test -p noid_node --release
 cargo test -p noid_mempool -p noid_p2p -p noid_rpc --release
-cargo test -p noid_fri_binius --lib mixed_open::tests -- --nocapture
+cargo test --release -p noid_fri_binius --lib mixed_open::tests -- --nocapture
 ```
 
 ### 13.1 Source-bound mixed opening
@@ -1299,7 +1325,7 @@ cargo test -p noid_fri_binius --lib mixed_open::tests -- --nocapture
 Command:
 
 ```text
-cargo test -p noid_fri_binius --lib mixed_open::tests -- --nocapture
+cargo test --release -p noid_fri_binius --lib mixed_open::tests -- --nocapture
 ```
 
 Coverage includes:
@@ -1312,6 +1338,9 @@ Coverage includes:
 | TensorFold layers match additive-NTT rebuild path | source-code high TensorFold layer test |
 | Tampered compact-FRI round-0 root rejects | round-0 FRI root tamper test |
 | Tampered `H` table rejects | source `H` tamper test |
+| Upper half of `source_root` is authenticated | `source_root_upper_half_mutation_rejects` |
+| Upper half of source Merkle siblings is authenticated | `source_sibling_upper_half_mutation_rejects` |
+| Upper half of folded-layer roots is authenticated | `folded_root_upper_half_mutation_rejects` |
 | One-column direct source expansion is sound | direct expansion pass/tamper test |
 | Flat/GCM source-pair reduction equals batched code symbols | source-pair reduction test |
 | Vector mode rejects widths exceeding the 120-bit cap | `vector_mode_rejects_columns_above_120_bit_cap` |

@@ -1,6 +1,6 @@
 # PARANOID. The Proof-Native Transparent UTXO Statechain
 
-> The proof of the entire chain history from genesis fits in **~38 KB**. Verification **~5 ms**.  
+> The proof of the entire chain history from genesis fits in **~43 KB**. Verification takes a few milliseconds.
 > No archive nodes. No history replay. No signatures. No trusted setup.
 
 ---
@@ -18,7 +18,7 @@ In Paranoid, validity is established once, locally, by the party with the most i
 | | Classic blockchain | Paranoid |
 |---|---|---|
 | Validation model | Re-execute everywhere | Verify proof once |
-| Full sync | Replay N GB of history | State snapshot + ~38 KB recursive proof; proof verification ~5 ms |
+| Full sync | Replay N GB of history | State snapshot + ~43 KB recursive proof; proof verification in a few ms |
 | History required to validate | Yes. From genesis | No |
 | Signatures | ECDSA / EdDSA | None. Hash-preimage ownership proof |
 | Quantum safety | No (discrete log problem) | Yes. Hash-only primitives |
@@ -65,8 +65,8 @@ chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 **Result:** A new node downloads:
 1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
    one per 65,536 UTXOs; scales with UTXO set size)
-2. The **RecursiveProof** (~38 KB)
-3. Verifies the recursive proof in ~5 ms, then applies the authenticated snapshot segments
+2. The **RecursiveProof** (~43 KB encoded)
+3. Verifies the recursive proof in a few milliseconds, then applies the authenticated snapshot segments
 
 No genesis replay. No archive nodes. No trust assumption.
 
@@ -103,12 +103,12 @@ Standard (spine only): 59 permutations × 8 sumchecks × 9 rounds = 4,248 FS cha
 FROST-GKR exploits the Frobenius endomorphism in GF(2^128):
 
 ```
-x^7 = x · x² · x⁴
-        ↑    ↑    ↑
-     1 mult  free  free   (squaring is linear over GF(2))
+x² = square(x)              // free: Frobenius is GF(2)-linear
+x⁴ = square(x²)             // free
+x⁷ = (x · x²) · x⁴          // 2 field multiplications
 ```
 
-S-box evaluation requires only **3 multiplications** (+ 2 free squarings). This makes the S-box natively degree-7 — no auxiliary columns, no degree-2 decomposition needed. A single **unified sumcheck** (round polynomial degree 9: eq × selector × s_in⁷) runs over all 59 (or 20) permutations simultaneously. The MDS matrix transition is handled by a **Shift Gadget** — a bounded-degree polynomial over the permutation state that folds into the same sumcheck.
+S-box evaluation requires only **2 field multiplications** (+ 2 free squarings). This makes the S-box natively degree-7 — no auxiliary columns, no degree-2 decomposition needed. A single **unified sumcheck** (round polynomial degree 9: eq × selector × s_in⁷) runs over all 59 (or 20) permutations simultaneously. The MDS matrix transition is handled by a **Shift Gadget** — a bounded-degree polynomial over the permutation state that folds into the same sumcheck.
 
 The result is a single Kill-Shot proof per GKR instance:
 
@@ -132,7 +132,7 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  RecursiveProof  ·  ~38 KB ·  O(1) verify · ~5 ms (laptop) │
+│  RecursiveProof  ·  ~43 KB ·  O(1) verify · few ms          │
 │  RecursiveBlockAir: 256×10 trace, COMPACT_TAU=8             │
 │  Proves: accumulator continuity from genesis to h=N         │
 └──────────────────────┬──────────────────────────────────────┘
@@ -199,14 +199,15 @@ Block reward halves with each expansion. Attacking by filling slots halves the a
 
 There are no digital signatures in Paranoid. Ownership is proven by a **proof-of-knowledge** — a Poseidon2b hash preimage proof over GF(2^128). This is a soundness guarantee (you cannot forge ownership), not a privacy guarantee (proofs from different secrets are distinguishable).
 
-Your **spending secret** is any 32 bytes: random, a passphrase hash, anything. The wallet derives addresses:
+Your **spending secret** is any 32 bytes: random, a passphrase hash, anything. At the protocol layer an address is derived from one spending secret; wallet HD-style indexes derive distinct spending secrets first:
 
 ```
-Address_n = Poseidon2b(spend_secret, n)   // index n for multiple addresses
-AuthTag   = Poseidon2b(spend_secret, tx_body_hash)   // per-tx replay protection
+spend_secret_i = H_DERIVE(master_secret, i)        // wallet-local index i
+Address_i      = H_ADDR(spend_secret_i)            // protocol primitive
+AuthTag        = H_AUTH(spend_secret_i, tx_body_hash)  // per-tx replay protection
 ```
 
-To spend, the wallet proves knowledge of the `spend_secret` whose hash equals the stored address. This is proven by the AuthGKR Kill-Shot. The spending secret never leaves the device — it is used to compute a proof, then zeroed from memory.
+To spend, the wallet proves knowledge of the `spend_secret_i` whose hash equals the stored address. This is proven by the AuthGKR Kill-Shot. The spending secret never leaves the device — it is used to compute a proof, then zeroed from memory.
 
 **Post-quantum by construction.** Zero elliptic curve operations. No discrete logarithm.
 The entire stack is hash-based and algebraic:
@@ -236,9 +237,9 @@ cells — hardware that does not exist and may never be physically realizable at
 
 PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence of valid state transitions. Block validity is already established by the proof system.
 
-**Algorithm:** Blake3 over the 212-byte `header_core` PoW input. The full 276-byte header hash still commits `proof_transcript_hash` and `witness_root` for chain linking, while PoW and BlockProof generation can run in parallel. 128-bit nonce. CPU-friendly and cheap to verify.
+**Algorithm:** Blake3 over the 212-byte `header_core` PoW input. `header_core` includes the 128-bit nonce and these fields, in order: `prev_block_hash`, `state_root`, `tx_root`, `timestamp`, `height`, `miner_address`, `nonce`, `difficulty_target`, `log_slots`, `active_slot_count`, `alloc_counter`. It excludes `proof_transcript_hash` and `witness_root`; the full 276-byte header hash still commits both for chain linking. Miners patch nonce bytes `[144..160]` in `header_core`.
 
-**Why Blake3:** block withholding protection is built into the proof structure. The coinbase address is bound inside `witness_root → proof_transcript_hash → BlockProof`. An external miner cannot substitute their payout address without regenerating the entire block proof before PoW search can be valid.
+**Why Blake3:** PoW is byte-native and cheap to verify. The coinbase recipient is part of `header_core` (`miner_address`) and the block transaction root; changing it after solving changes the PoW input and block binding. User-transaction blocks additionally bind the canonical `BlockProof` via `proof_transcript_hash` and the public Auth sidecar via `witness_root`.
 
 **Difficulty:** ASERT algorithm (Bitcoin Cash variant), 6-block epoch, 90-second halflife. Responds to any hashrate change within ~7 minutes. Floor: difficulty never eases below genesis target — ASERT can only move harder.
 
@@ -288,25 +289,25 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 
 ## No Block History
 
-Paranoid does not store block history. After FINALITY_DEPTH (18 blocks), full block data,
-BlockProofs, and public Auth sidecars are pruned. Only block **headers** (276 bytes each) are kept permanently.
+Paranoid does not store block history. After FINALITY_DEPTH (18 blocks), full block data and public Auth sidecars are pruned. `BlockProof` bytes are retained until the block is both finalized and folded into the recursive proof. Only block **headers** (276 bytes each) are kept permanently.
 
 **Permanent storage:**
 | Data | Size |
 |---|---|
 | Headers | ~553 MB/year (276 bytes × every block, forever) |
 | UTXO set | ~3 MB per 65,536 unspent outputs (populated segments only) |
-| Recursive proof | ~38 KB encoded (single entry, overwritten on each advance) |
+| Recursive proof | ~43 KB encoded (single entry, overwritten on each advance) |
 
-**Temporary storage (pruned after 18 blocks):**
-| Data | Size |
-|---|---|
-| Block bytes | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~192 KB (256 txs) |
-| BlockProofs + public Auth sidecars | 0 (coinbase-only); user-tx proof size depends on shape mix and tx count |
-| Undo logs | ~few KB per block |
-| Nullifier window | ~few KB (last 144 blocks) |
+**Temporary storage:**
+| Data | Retention | Size |
+|---|---|---|
+| Block bytes | last 18 blocks | 276-byte header (fixed) + tx bodies: ~530 B (coinbase-only) – ~192 KB (256 txs) |
+| Public Auth sidecars | last 18 blocks | shape-mix dependent |
+| BlockProofs | finalized and recursive-consumed window | 0 (coinbase-only); user-tx proof size depends on shape mix and tx count |
+| Undo logs | last 18 blocks | ~few KB per block |
+| Nullifier window | last 144 blocks | ~few KB |
 
-At any given time the node holds at most 18 blocks' worth of block data + BlockProofs + public Auth sidecars. These bytes are retained only for the reorg/sync window, not permanent history. In the current `block_scaling` bench, 100 Standard4x8 transactions produce a 7.62 MB `BlockProof` and an 8.11 MB public Auth sidecar on a 2023 Intel Core i7-1365U laptop.
+At any given time the node holds at most 18 blocks' worth of block bodies, public Auth sidecars, and undo logs. `BlockProof` bytes may remain longer only if the background recursive updater is behind; pruning is gated by the stored recursive proof height, not kept as permanent history. In the current `block_scaling` bench, the 100-transaction standard-only fixture mix produces a 10.75 MB `BlockProof` and an 11.80 MB public Auth sidecar on the reference 2023 Intel Core i7-1365U laptop.
 
 | RAM | ~60–120 MB (jemalloc, small-state node) |
 
@@ -320,36 +321,36 @@ Wallet proof benchmark (`cargo bench --bench alice_sends_bob`):
 
 | Scenario | Prove median | Verify median | Wallet bundle | Logic proof | STARK | AuthGKR |
 |---|---:|---:|---:|---:|---:|---:|
-| Standard4x8, 1 input / 2 outputs | 92.61 ms | 24.68 ms | 236.24 KB | 234.53 KB | 151.94 KB | 82.59 KB |
-| Standard4x8, 4 inputs / 8 outputs | 89.41 ms | 24.60 ms | 235.79 KB | 234.08 KB | 151.50 KB | 82.58 KB |
-| Sweep25x2, 5 inputs / 2 outputs | 374.72 ms | 95.44 ms | 214.08 KB | 209.42 KB | 96.50 KB | 112.92 KB |
-| Sweep25x2, 10 inputs / 2 outputs | 371.38 ms | 97.76 ms | 215.11 KB | 210.45 KB | 97.27 KB | 113.19 KB |
-| Sweep25x2, 25 inputs / 2 outputs | 372.33 ms | 111.54 ms | 214.94 KB | 210.28 KB | 96.19 KB | 114.09 KB |
-| Sweep25x2 consolidation, 25 inputs / 1 output | 394.71 ms | 109.60 ms | 216.63 KB | 211.97 KB | 96.89 KB | 115.08 KB |
+| Standard4x8, 1 input / 2 outputs | 110.11 ms | 27.34 ms | 288.00 KB | 286.30 KB | 169.12 KB | 117.17 KB |
+| Standard4x8, 4 inputs / 8 outputs | 98.07 ms | 27.58 ms | 290.82 KB | 289.11 KB | 168.84 KB | 120.27 KB |
+| Sweep25x2, 5 inputs / 2 outputs | 422.76 ms | 133.16 ms | 285.33 KB | 280.67 KB | 114.41 KB | 166.27 KB |
+| Sweep25x2, 10 inputs / 2 outputs | 578.40 ms | 138.51 ms | 284.58 KB | 279.92 KB | 114.78 KB | 165.14 KB |
+| Sweep25x2, 25 inputs / 2 outputs | 574.80 ms | 143.18 ms | 284.02 KB | 279.36 KB | 114.53 KB | 164.83 KB |
+| Sweep25x2 consolidation, 25 inputs / 1 output | 576.91 ms | 138.72 ms | 283.71 KB | 279.05 KB | 114.69 KB | 164.36 KB |
 
 Logical split compositions from the same run:
 
 | Composition | Prove total | Verify total | Bundle total | Logic total |
 |---|---:|---:|---:|---:|
-| 26 inputs: Sweep25x2(25) + Standard4x8 tail | 464.93 ms | 136.22 ms | 451.18 KB | 444.81 KB |
-| 50 inputs: Sweep25x2(25) + Sweep25x2(25) | 744.65 ms | 223.08 ms | 429.88 KB | 420.56 KB |
+| 26 inputs: Sweep25x2(25) + Standard4x8 tail | 684.90 ms | 170.51 ms | 572.02 KB | 565.66 KB |
+| 50 inputs: Sweep25x2(25) + Sweep25x2(25) | 1.15 s | 286.36 ms | 568.04 KB | 558.72 KB |
 
-Selected block scaling rows (`cargo bench --bench block_scaling`, up to 100 transactions shown here). Wallet proofs are pre-built for block timing; wallet pre-proof time is reported separately by the bench and is not block-time work.
+Selected block scaling rows (`cargo bench --bench block_scaling`, up to 100 transactions shown here). Wallet proofs are pre-built for block timing; wallet pre-proof time is reported separately by the bench and is not block-time work. The standard-only rows use the benchmark's standard-shape fixture mix (`Standard4x8` and smaller standard sends), not an all-`Standard4x8` worst case.
 
 | Block proof path | Prove full block | Verify full block | BlockProof | Auth sidecar | BlockProof + sidecar |
 |---|---:|---:|---:|---:|---:|
-| 10 × Standard4x8 | 2.37 s | 542.39 ms | 2.24 MB | 828.17 KB | 3.04 MB |
-| 20 × Standard4x8 | 3.95 s | 960.62 ms | 2.85 MB | 1.62 MB | 4.47 MB |
-| 100 × Standard4x8 | 14.26 s | 4.10 s | 7.62 MB | 8.11 MB | 15.73 MB |
-| 1 × Sweep25x2 | 810.01 ms | 224.44 ms | 656.85 KB | 113.84 KB | 770.69 KB |
-| 4 × Sweep25x2 | 2.14 s | 509.76 ms | 1.96 MB | 452.74 KB | 2.40 MB |
-| 10 × Sweep25x2 | 3.97 s | 1.06 s | 2.70 MB | 1.11 MB | 3.81 MB |
-| 8 Standard4x8 + 2 Sweep25x2 | 3.53 s | 771.87 ms | 2.95 MB | 891.25 KB | 3.82 MB |
-| 5 Standard4x8 + 5 Sweep25x2 | 4.05 s | 917.24 ms | 3.73 MB | 985.12 KB | 4.70 MB |
+| 10 × standard-only mix | 2.67 s | 586.08 ms | 3.58 MB | 1.18 MB | 4.77 MB |
+| 20 × standard-only mix | 4.05 s | 1.10 s | 4.40 MB | 2.36 MB | 6.76 MB |
+| 100 × standard-only mix | 14.75 s | 4.91 s | 10.75 MB | 11.80 MB | 22.55 MB |
+| 1 × Sweep25x2 | 835.71 ms | 231.51 ms | 935.59 KB | 166.36 KB | 1.08 MB |
+| 4 × Sweep25x2 | 2.36 s | 577.76 ms | 3.07 MB | 664.05 KB | 3.72 MB |
+| 10 × Sweep25x2 | 5.72 s | 1.50 s | 4.01 MB | 1.63 MB | 5.64 MB |
+| 8 standard-shape + 2 Sweep25x2 | 4.88 s | 902.34 ms | 4.50 MB | 1.27 MB | 5.76 MB |
+| 5 standard-shape + 5 Sweep25x2 | 5.34 s | 1.08 s | 5.94 MB | 1.40 MB | 7.34 MB |
 
-PoW search and BlockProof generation run **in parallel**. BlockProof bytes and public Auth sidecars are stored only for the **last 18 blocks** (reorg window), then pruned.
+PoW search and BlockProof generation run **in parallel**. Public Auth sidecars are stored only for the **last 18 blocks** (reorg window); `BlockProof` bytes are pruned once they are both finalized and consumed by the recursive updater.
 
-Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (~38 KB encoded) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
+Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (~43 KB encoded) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
 
 ---
 
@@ -409,7 +410,7 @@ noid-extminer --rpc http://pool.example.com:9401 \
 Relay node syncs automatically on first start:
 1. Connects to peers
 2. Downloads the current state snapshot and RecursiveProof
-3. Verifies the proof cryptographically (O(1), ~5 ms (laptop))
+3. Verifies the proof cryptographically (O(1), a few milliseconds on the reference laptop)
 4. Applies the snapshot and begins receiving new blocks
 
 No history download. No archive dependency.
@@ -480,7 +481,7 @@ paranoid_validateAddress
 paranoid_getSlotHints / paranoid_getSlotHintsSalted / paranoid_getEpochAnchor
 paranoid_submitTxIntent
 paranoid_getMempoolInfo / paranoid_getMempoolSize / paranoid_getMempoolEntry
-paranoid_getRecursiveProof            (~76 KB hex for ~38 KB recursive chain proof)
+paranoid_getRecursiveProof            (~86 KB hex for ~43 KB recursive chain proof)
 paranoid_verifyReceipt
 paranoid_walletStatus / paranoid_walletGetAddress / paranoid_walletGetBalance
 paranoid_walletSend / paranoid_walletPlanSend / paranoid_walletHistory

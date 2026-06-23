@@ -209,15 +209,15 @@ RPC method: `paranoid_getHeaderByHeight`
 
 ### `proof` (alias: `rec`)
 
-Recursive chain proof: the entire chain history compressed into ~38 KB encoded.
+Recursive chain proof: the entire chain history compressed into ~43 KB encoded.
 
 ```
 $ noid-cli proof
 Recursive chain proof  (O(1) sync)
-  Size               ~38 KB encoded (full chain history in one tiny proof)
+  Size               ~43 KB encoded (full chain history in one tiny proof)
   Fingerprint        a1b2c3d4…e5f6g7h8
 
-  Note: Any node can verify the ENTIRE chain history in ~5 ms using this proof.
+  Note: Any node can verify the ENTIRE chain history in a few milliseconds using this proof.
 ```
 
 RPC method: `paranoid_getRecursiveProof`
@@ -938,7 +938,7 @@ Error:
 | `paranoid_getHeaderByHeight` | `height: u64` | `string?` | Raw 276-byte header hex |
 | `paranoid_getHeaderByHash` | `hash: string` | `string?` | Raw header by hash |
 | `paranoid_getBlock` | `height: u64` | `string?` | Full block hex (last 18 only) |
-| `paranoid_getRecursiveProof` | — | `string?` | ~76 KB hex string for the ~38 KB recursive proof |
+| `paranoid_getRecursiveProof` | — | `string?` | ~86 KB hex string for the ~43 KB recursive proof |
 | `paranoid_getSlot` | `slot_index: u32` | `SlotInfo` | Single UTXO slot |
 | `paranoid_getSlotsByOwner` | `address: string` | `SlotInfo[]` | All UTXOs of an address |
 | `paranoid_getActiveSlotCount` | — | `u64` | Live UTXO count |

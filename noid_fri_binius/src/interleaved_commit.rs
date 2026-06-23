@@ -37,39 +37,40 @@ pub struct InterleavedProverState<'a> {
     /// RS-encoded source columns used by source-bound mixed openings.
     /// Layout: `encoded_cols[col][code_index]`.
     pub encoded_cols: Vec<Vec<Block128>>,
-    /// 128-bit Merkle commitment over encoded interleaved high-pair leaves. Each
-    /// leaf contains the two code symbols needed for the first source TensorFold
-    /// over the highest message variable, for every committed column. Large
-    /// trees are retained in chunked form to avoid keeping a full 1GB source tree
-    /// resident for `log_rows=24` block bucket openings.
+    /// 256-bit Blake3 Merkle commitment over encoded interleaved high-pair
+    /// leaves. Each leaf contains the two code symbols needed for the first
+    /// source TensorFold over the highest message variable, for every committed
+    /// column. Large trees are retained in chunked form to avoid keeping a full
+    /// 1GB source tree resident for `log_rows=24` block bucket openings.
     pub source_tree: SourceMerkleTree,
 }
 
-pub type ShortHash = [u8; 16];
+pub type SourceHash = [u8; 32];
 
+const SOURCE_HASH_BYTES: usize = 32;
 const SOURCE_MERKLE_CHUNK_LOG: usize = 8;
 const SOURCE_MERKLE_CHUNK_LEAVES: usize = 1 << SOURCE_MERKLE_CHUNK_LOG;
 const SOURCE_MERKLE_FULL_TREE_MAX_DEPTH: usize = 18;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct ShortBatchedMerkleProof {
-    pub siblings: Vec<ShortHash>,
+pub struct SourceBatchedMerkleProof {
+    pub siblings: Vec<SourceHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShortMerkleTree {
-    nodes: Vec<ShortHash>,
+pub struct SourceHashMerkleTree {
+    nodes: Vec<SourceHash>,
     layer_offsets: Vec<usize>,
     layer_lens: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceMerkleTree {
-    Full(ShortMerkleTree),
+    Full(SourceHashMerkleTree),
     Chunked {
         full_depth: usize,
         chunk_log: usize,
-        upper_tree: ShortMerkleTree,
+        upper_tree: SourceHashMerkleTree,
     },
 }
 
@@ -77,7 +78,7 @@ impl SourceMerkleTree {
     pub(crate) fn new(encoded_cols: &[Vec<Block128>], log_rows: usize, n_cols: usize) -> Self {
         let full_depth = source_tree_depth(log_rows);
         if full_depth <= SOURCE_MERKLE_FULL_TREE_MAX_DEPTH {
-            return Self::Full(ShortMerkleTree::new(build_source_leaf_hashes(
+            return Self::Full(SourceHashMerkleTree::new(build_source_leaf_hashes(
                 encoded_cols,
                 log_rows,
                 n_cols,
@@ -87,7 +88,7 @@ impl SourceMerkleTree {
         let chunk_log = SOURCE_MERKLE_CHUNK_LOG.min(full_depth);
         let upper_depth = full_depth - chunk_log;
         let chunk_count = 1usize << upper_depth;
-        let chunk_roots: Vec<ShortHash> = (0..chunk_count)
+        let chunk_roots: Vec<SourceHash> = (0..chunk_count)
             .into_par_iter()
             .with_min_len(16)
             .map(|chunk_idx| {
@@ -97,11 +98,11 @@ impl SourceMerkleTree {
         Self::Chunked {
             full_depth,
             chunk_log,
-            upper_tree: ShortMerkleTree::new(chunk_roots),
+            upper_tree: SourceHashMerkleTree::new(chunk_roots),
         }
     }
 
-    pub(crate) fn get_root(&self) -> ShortHash {
+    pub(crate) fn get_root(&self) -> SourceHash {
         match self {
             Self::Full(tree) => tree.get_root(),
             Self::Chunked { upper_tree, .. } => upper_tree.get_root(),
@@ -114,10 +115,10 @@ impl SourceMerkleTree {
         log_rows: usize,
         n_cols: usize,
         leaf_indices: &[usize],
-    ) -> ShortBatchedMerkleProof {
+    ) -> SourceBatchedMerkleProof {
         match self {
             Self::Full(tree) => {
-                build_short_batched_merkle_proof(tree, leaf_indices, source_tree_depth(log_rows))
+                build_source_batched_merkle_proof(tree, leaf_indices, source_tree_depth(log_rows))
             }
             Self::Chunked {
                 full_depth,
@@ -126,9 +127,9 @@ impl SourceMerkleTree {
             } => {
                 debug_assert_eq!(*full_depth, source_tree_depth(log_rows));
                 let upper_depth = full_depth - chunk_log;
-                let mut chunk_cache: std::collections::HashMap<usize, ShortMerkleTree> =
+                let mut chunk_cache: std::collections::HashMap<usize, SourceHashMerkleTree> =
                     std::collections::HashMap::new();
-                build_short_batched_merkle_proof_with_getter(
+                build_source_batched_merkle_proof_with_getter(
                     *full_depth,
                     leaf_indices,
                     |node_depth, node_index| {
@@ -157,18 +158,18 @@ impl SourceMerkleTree {
     }
 }
 
-impl ShortMerkleTree {
-    pub(crate) fn new(leaf_hashes: Vec<ShortHash>) -> Self {
+impl SourceHashMerkleTree {
+    pub(crate) fn new(leaf_hashes: Vec<SourceHash>) -> Self {
         let n = leaf_hashes.len();
         assert!(
             n.is_power_of_two(),
-            "short Merkle leaves must be a power of two"
+            "source Merkle leaves must be a power of two"
         );
         let tree_depth = n.trailing_zeros() as usize;
         let total = 2 * n - 1;
         let mut nodes = leaf_hashes;
         nodes.reserve_exact(total - n);
-        nodes.resize(total, [0u8; 16]);
+        nodes.resize(total, [0u8; SOURCE_HASH_BYTES]);
 
         let mut level_start = 0usize;
         let mut level_len = n;
@@ -180,11 +181,11 @@ impl ShortMerkleTree {
             let next = &mut suffix[..next_len];
             if next_len >= 1024 {
                 next.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    *out = short_compress(&current[2 * i], &current[2 * i + 1]);
+                    *out = source_compress(&current[2 * i], &current[2 * i + 1]);
                 });
             } else {
                 for i in 0..next_len {
-                    next[i] = short_compress(&current[2 * i], &current[2 * i + 1]);
+                    next[i] = source_compress(&current[2 * i], &current[2 * i + 1]);
                 }
             }
             level_start = next_start;
@@ -218,64 +219,54 @@ impl ShortMerkleTree {
         }
     }
 
-    pub(crate) fn get_root(&self) -> ShortHash {
+    pub(crate) fn get_root(&self) -> SourceHash {
         self.nodes[self.layer_offsets[0]]
     }
 
-    pub(crate) fn get_node_at_depth(&self, depth: usize, index: usize) -> ShortHash {
+    pub(crate) fn get_node_at_depth(&self, depth: usize, index: usize) -> SourceHash {
         assert!(depth < self.layer_offsets.len());
         assert!(index < self.layer_lens[depth]);
         self.nodes[self.layer_offsets[depth] + index]
     }
 }
 
-pub(crate) fn short_hash_to_output(h: ShortHash) -> HashOutput {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&h);
-    out
+pub(crate) fn source_hash_to_output(h: SourceHash) -> HashOutput {
+    h
 }
 
-pub(crate) fn short_hash_from_output(h: &HashOutput) -> Option<ShortHash> {
-    if h[16..].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&h[..16]);
-    Some(out)
+pub(crate) fn source_hash_from_output(h: &HashOutput) -> Option<SourceHash> {
+    Some(*h)
 }
 
-fn short_hash(hasher: blake3::Hasher) -> ShortHash {
-    let digest = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
+fn source_hash(hasher: blake3::Hasher) -> SourceHash {
+    *hasher.finalize().as_bytes()
 }
 
-pub(crate) fn short_compress(left: &ShortHash, right: &ShortHash) -> ShortHash {
+pub(crate) fn source_compress(left: &SourceHash, right: &SourceHash) -> SourceHash {
     let mut h = blake3::Hasher::new();
-    h.update(b"PARANOID/SOURCE-BINDING-MERKLE-128/v1");
+    h.update(b"PARANOID/SOURCE-BINDING-MERKLE-256/v2");
     h.update(left);
     h.update(right);
-    short_hash(h)
+    source_hash(h)
 }
 
-pub(crate) fn build_short_batched_merkle_proof(
-    tree: &ShortMerkleTree,
+pub(crate) fn build_source_batched_merkle_proof(
+    tree: &SourceHashMerkleTree,
     leaf_indices: &[usize],
     depth: usize,
-) -> ShortBatchedMerkleProof {
-    build_short_batched_merkle_proof_with_getter(depth, leaf_indices, |node_depth, node_index| {
+) -> SourceBatchedMerkleProof {
+    build_source_batched_merkle_proof_with_getter(depth, leaf_indices, |node_depth, node_index| {
         tree.get_node_at_depth(node_depth, node_index)
     })
 }
 
-fn build_short_batched_merkle_proof_with_getter<F>(
+fn build_source_batched_merkle_proof_with_getter<F>(
     depth: usize,
     leaf_indices: &[usize],
     mut get_node_at_depth: F,
-) -> ShortBatchedMerkleProof
+) -> SourceBatchedMerkleProof
 where
-    F: FnMut(usize, usize) -> ShortHash,
+    F: FnMut(usize, usize) -> SourceHash,
 {
     let mut siblings = Vec::new();
     let mut known_at_layer: Vec<std::collections::HashSet<usize>> =
@@ -304,25 +295,25 @@ where
             }
         }
     }
-    ShortBatchedMerkleProof { siblings }
+    SourceBatchedMerkleProof { siblings }
 }
 
-pub(crate) fn verify_short_batched_merkle_proof(
-    root: &ShortHash,
-    batch: &ShortBatchedMerkleProof,
+pub(crate) fn verify_source_batched_merkle_proof(
+    root: &SourceHash,
+    batch: &SourceBatchedMerkleProof,
     depth: usize,
     leaf_indices: &[usize],
-    leaf_hashes: &[ShortHash],
+    leaf_hashes: &[SourceHash],
 ) -> Result<(), String> {
     if leaf_indices.len() != leaf_hashes.len() {
-        return Err("short leaf index/hash count mismatch".into());
+        return Err("source leaf index/hash count mismatch".into());
     }
-    let mut known: std::collections::HashMap<(usize, usize), ShortHash> =
+    let mut known: std::collections::HashMap<(usize, usize), SourceHash> =
         std::collections::HashMap::new();
     for (i, &idx) in leaf_indices.iter().enumerate() {
         if let Some(&existing) = known.get(&(0, idx)) {
             if existing != leaf_hashes[i] {
-                return Err(format!("inconsistent short leaf hashes for index {idx}"));
+                return Err(format!("inconsistent source leaf hashes for index {idx}"));
             }
         } else {
             known.insert((0, idx), leaf_hashes[i]);
@@ -343,37 +334,37 @@ pub(crate) fn verify_short_batched_merkle_proof(
             let left = known.get(&(d, left_child)).copied();
             let right = known.get(&(d, right_child)).copied();
             let parent_hash = match (left, right) {
-                (Some(l), Some(r)) => short_compress(&l, &r),
+                (Some(l), Some(r)) => source_compress(&l, &r),
                 (Some(l), None) => {
                     if sib_cursor >= batch.siblings.len() {
-                        return Err(format!("insufficient short siblings at layer {d}"));
+                        return Err(format!("insufficient source siblings at layer {d}"));
                     }
                     let r = batch.siblings[sib_cursor];
                     sib_cursor += 1;
-                    short_compress(&l, &r)
+                    source_compress(&l, &r)
                 }
                 (None, Some(r)) => {
                     if sib_cursor >= batch.siblings.len() {
-                        return Err(format!("insufficient short siblings at layer {d}"));
+                        return Err(format!("insufficient source siblings at layer {d}"));
                     }
                     let l = batch.siblings[sib_cursor];
                     sib_cursor += 1;
-                    short_compress(&l, &r)
+                    source_compress(&l, &r)
                 }
-                (None, None) => return Err(format!("short orphan parent at layer {d}")),
+                (None, None) => return Err(format!("source orphan parent at layer {d}")),
             };
             known.insert((d + 1, parent), parent_hash);
         }
     }
     let computed_root = known
         .get(&(depth, 0))
-        .ok_or_else(|| "failed to compute short root".to_string())?;
+        .ok_or_else(|| "failed to compute source root".to_string())?;
     if computed_root != root {
-        return Err("short batched Merkle root mismatch".into());
+        return Err("source batched Merkle root mismatch".into());
     }
     if sib_cursor != batch.siblings.len() {
         return Err(format!(
-            "unused short siblings: consumed {sib_cursor}, total {}",
+            "unused source siblings: consumed {sib_cursor}, total {}",
             batch.siblings.len()
         ));
     }
@@ -428,7 +419,7 @@ pub fn interleaved_commit<'a>(
         .map(|col| Code::new_parallel(col, _ntt).encoding)
         .collect();
     let source_tree = SourceMerkleTree::new(&encoded_cols, log_rows, n_cols);
-    let source_root = short_hash_to_output(source_tree.get_root());
+    let source_root = source_hash_to_output(source_tree.get_root());
 
     let mut cap_hashes = cap_hashes;
     cap_hashes.push(source_root);
@@ -459,8 +450,8 @@ pub(crate) fn source_tree_depth(log_rows: usize) -> usize {
     log_rows + LOG_RATE - 1
 }
 
-pub(crate) fn source_root_short_from_cap(cap: &MerkleCap) -> Option<ShortHash> {
-    cap.hashes.last().and_then(short_hash_from_output)
+pub(crate) fn source_root_from_cap(cap: &MerkleCap) -> Option<SourceHash> {
+    cap.hashes.last().and_then(source_hash_from_output)
 }
 
 pub(crate) fn source_leaf_hash(
@@ -468,17 +459,17 @@ pub(crate) fn source_leaf_hash(
     n_cols: usize,
     leaf_index: usize,
     symbols: &[Block128],
-) -> ShortHash {
+) -> SourceHash {
     assert_eq!(symbols.len(), n_cols * 2);
     let mut h = blake3::Hasher::new();
-    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/128/v1");
+    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/256/v2");
     h.update(&(log_rows as u64).to_le_bytes());
     h.update(&(n_cols as u64).to_le_bytes());
     h.update(&(leaf_index as u64).to_le_bytes());
     for symbol in symbols {
         h.update(&symbol.0.to_le_bytes());
     }
-    short_hash(h)
+    source_hash(h)
 }
 
 pub(crate) fn source_leaf_positions(log_rows: usize, leaf_index: usize) -> (usize, usize) {
@@ -495,7 +486,7 @@ fn build_source_leaf_hashes(
     encoded_cols: &[Vec<Block128>],
     log_rows: usize,
     n_cols: usize,
-) -> Vec<ShortHash> {
+) -> Vec<SourceHash> {
     assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
     let leaf_count = source_leaf_count(log_rows);
     (0..leaf_count)
@@ -512,12 +503,12 @@ fn build_source_chunk_root(
     n_cols: usize,
     chunk_log: usize,
     chunk_idx: usize,
-) -> ShortHash {
+) -> SourceHash {
     assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
     let chunk_leaf_count = 1usize << chunk_log;
     let first_leaf = chunk_idx * chunk_leaf_count;
     if chunk_log == SOURCE_MERKLE_CHUNK_LOG {
-        let mut layer = [[0u8; 16]; SOURCE_MERKLE_CHUNK_LEAVES];
+        let mut layer = [[0u8; SOURCE_HASH_BYTES]; SOURCE_MERKLE_CHUNK_LEAVES];
         for local in 0..chunk_leaf_count {
             layer[local] = source_leaf_hash_from_encoded_cols_at(
                 encoded_cols,
@@ -529,14 +520,14 @@ fn build_source_chunk_root(
         let mut len = chunk_leaf_count;
         while len > 1 {
             for i in 0..(len / 2) {
-                layer[i] = short_compress(&layer[2 * i], &layer[2 * i + 1]);
+                layer[i] = source_compress(&layer[2 * i], &layer[2 * i + 1]);
             }
             len /= 2;
         }
         return layer[0];
     }
 
-    let mut layer: Vec<ShortHash> = (0..chunk_leaf_count)
+    let mut layer: Vec<SourceHash> = (0..chunk_leaf_count)
         .map(|local| {
             source_leaf_hash_from_encoded_cols_at(
                 encoded_cols,
@@ -549,7 +540,7 @@ fn build_source_chunk_root(
     let mut len = chunk_leaf_count;
     while len > 1 {
         for i in 0..(len / 2) {
-            layer[i] = short_compress(&layer[2 * i], &layer[2 * i + 1]);
+            layer[i] = source_compress(&layer[2 * i], &layer[2 * i + 1]);
         }
         len /= 2;
     }
@@ -562,11 +553,11 @@ fn build_source_chunk_tree(
     n_cols: usize,
     chunk_log: usize,
     chunk_idx: usize,
-) -> ShortMerkleTree {
+) -> SourceHashMerkleTree {
     assert_source_encoded_shape(encoded_cols, log_rows, n_cols);
     let chunk_leaf_count = 1usize << chunk_log;
     let first_leaf = chunk_idx * chunk_leaf_count;
-    let leaf_hashes: Vec<ShortHash> = (0..chunk_leaf_count)
+    let leaf_hashes: Vec<SourceHash> = (0..chunk_leaf_count)
         .map(|local| {
             source_leaf_hash_from_encoded_cols_at(
                 encoded_cols,
@@ -576,7 +567,7 @@ fn build_source_chunk_tree(
             )
         })
         .collect();
-    ShortMerkleTree::new(leaf_hashes)
+    SourceHashMerkleTree::new(leaf_hashes)
 }
 
 fn source_leaf_hash_from_encoded_cols_at(
@@ -584,7 +575,7 @@ fn source_leaf_hash_from_encoded_cols_at(
     log_rows: usize,
     n_cols: usize,
     leaf_index: usize,
-) -> ShortHash {
+) -> SourceHash {
     let (pos0, pos1) = source_leaf_positions(log_rows, leaf_index);
     source_leaf_hash_from_encoded_cols(log_rows, n_cols, leaf_index, encoded_cols, pos0, pos1)
 }
@@ -604,9 +595,9 @@ fn source_leaf_hash_from_encoded_cols(
     encoded_cols: &[Vec<Block128>],
     pos0: usize,
     pos1: usize,
-) -> ShortHash {
+) -> SourceHash {
     let mut h = blake3::Hasher::new();
-    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/128/v1");
+    h.update(b"PARANOID/INTERLEAVED-SOURCE-HIGH-PAIR-LEAF/256/v2");
     h.update(&(log_rows as u64).to_le_bytes());
     h.update(&(n_cols as u64).to_le_bytes());
     h.update(&(leaf_index as u64).to_le_bytes());
@@ -614,7 +605,7 @@ fn source_leaf_hash_from_encoded_cols(
         h.update(&col[pos0].0.to_le_bytes());
         h.update(&col[pos1].0.to_le_bytes());
     }
-    short_hash(h)
+    source_hash(h)
 }
 
 /// Absorb the cap into a Fiat-Shamir channel.
