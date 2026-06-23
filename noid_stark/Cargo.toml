@@ -15,7 +15,6 @@ noid_gkr = { path = "../noid_gkr" }
 rayon = "1.10"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
 zeroize = "1.8"
 
 [dev-dependencies]

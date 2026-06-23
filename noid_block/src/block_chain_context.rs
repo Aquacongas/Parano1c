@@ -38,9 +38,10 @@ use crate::{
 /// - Consensus state advances synchronously on each `apply_block_consensus` call.
 /// - Recursive proof advances asynchronously via `update_recursive_proof`.
 ///
-/// The recursive proof is never required for consensus validity — it exists
-/// only for O(1) snapshot sync verification. Missing or lagging recursive
-/// proof does not affect block validation.
+/// The recursive proof is never required for consensus validity. In FIX1 it is
+/// retained as finalized-history metadata; public arbitrary-peer snapshot sync
+/// remains disabled until the real recursive verifier/checkpoint generation work
+/// lands. Missing or lagging recursive proof does not affect block validation.
 pub struct BlockChainContext {
     /// Native consensus chain state (headers, nullifiers, UTXO state, undo logs).
     pub consensus: ChainContext,

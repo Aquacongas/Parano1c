@@ -49,7 +49,7 @@ pub struct ChainContext {
     /// Current UTXO state (FRI-committed slot array).
     pub state: ChainState,
 
-    /// Compact undo logs for the last `UNDO_LOG_RETENTION` blocks.
+    /// Compact undo logs for the last `UNDO_RETENTION_DEPTH` blocks.
     /// Enables state revert during reorg without replaying from genesis.
     pub undo_logs: HashMap<u64, BlockUndoLog>,
 
@@ -150,7 +150,7 @@ impl ChainContext {
     /// - the block's header is stored in `headers`
     /// - the nullifier set is updated
     /// - a new undo log is appended
-    /// - old undo logs (> UNDO_LOG_RETENTION blocks old) are pruned
+    /// - old undo logs (> UNDO_RETENTION_DEPTH blocks old) are pruned
     /// - `tip_height` and `tip_hash` are updated
     ///
     /// On failure, the context is left **unchanged**.
@@ -195,7 +195,7 @@ impl ChainContext {
             block.transactions.iter().map(|t| t.tx_body_hash).collect();
         self.nullifiers.insert_block(&tx_hashes);
 
-        // Store undo log keyed by height; prune old ones beyond UNDO_LOG_RETENTION.
+        // Store undo log keyed by height; prune old ones beyond UNDO_RETENTION_DEPTH.
         self.undo_logs.insert(block.header.height, undo);
         prune_undo_logs(&mut self.undo_logs, block.header.height);
 
@@ -251,7 +251,7 @@ mod tests {
     use crate::block_header::BlockHeader;
     use crate::consensus::{
         genesis::GENESIS_TIMESTAMP,
-        params::{BLOCK_TIME, MEDIAN_TIME_BLOCKS, UNDO_LOG_RETENTION},
+        params::{BLOCK_TIME, MEDIAN_TIME_BLOCKS, UNDO_RETENTION_DEPTH},
         pow::full_block_hash,
     };
     // Easy target for test blocks: any Blake3 hash satisfies hash < 0xFF..FF.
@@ -327,18 +327,18 @@ mod tests {
     #[test]
     fn undo_logs_pruned_after_retention() {
         let mut ctx = ChainContext::init_from_easy_genesis();
-        // Apply UNDO_LOG_RETENTION + 2 blocks.
-        for _ in 0..(UNDO_LOG_RETENTION + 2) {
+        // Apply UNDO_RETENTION_DEPTH + 2 blocks.
+        for _ in 0..(UNDO_RETENTION_DEPTH + 2) {
             let block = build_empty_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts).expect("apply");
         }
-        // Undo logs should cover at most UNDO_LOG_RETENTION blocks.
+        // Undo logs should cover at most UNDO_RETENTION_DEPTH blocks.
         assert!(
-            ctx.undo_logs.len() <= UNDO_LOG_RETENTION as usize,
+            ctx.undo_logs.len() <= UNDO_RETENTION_DEPTH as usize,
             "undo logs exceeded retention: {} > {}",
             ctx.undo_logs.len(),
-            UNDO_LOG_RETENTION
+            UNDO_RETENTION_DEPTH
         );
     }
 

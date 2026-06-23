@@ -52,7 +52,10 @@ use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
     difficulty::{add_work, block_work},
     header::epoch_anchor_height,
-    params::{ANCHOR_DEPTH, EXPANSION_WINDOW, FINALITY_DEPTH, GENESIS_TARGET, MEDIAN_TIME_BLOCKS},
+    params::{
+        ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET,
+        MEDIAN_TIME_BLOCKS,
+    },
     pow::full_block_hash,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
@@ -60,7 +63,7 @@ use crate::consensus::{
 use crate::nullifier::NullifierSet;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
-use crate::storage::{MdbxStore, StoreError};
+use crate::storage::{ConsensusMeta, FinalizedCheckpoint, MdbxStore, StoreError};
 
 // ---------------------------------------------------------------------------
 // Error
@@ -131,6 +134,13 @@ pub struct MdbxChainContext {
     /// Sum of block_work(difficulty_target) for all blocks from genesis to tip.
     /// Used as the primary fork choice criterion (more work = canonical chain).
     pub tip_chain_work: [u8; 32],
+
+    /// Non-optional hard-finalized canonical checkpoint.
+    pub finalized: FinalizedCheckpoint,
+
+    /// Internal guard used during batch reorg application: finality is advanced
+    /// only after the whole replacement branch has been applied successfully.
+    defer_finality_updates: bool,
 }
 
 impl MdbxChainContext {
@@ -144,7 +154,7 @@ impl MdbxChainContext {
     ///
     /// 1. If MDBX has valid state (chain_tip + segments with correct state_root),
     ///    resume from local state. The P2P layer handles forward-sync (block-by-block
-    ///    if gap <= FINALITY_DEPTH, snapshot-sync if gap > FINALITY_DEPTH).
+    ///    if gap <= CONSENSUS_FINALITY_DEPTH, snapshot-sync if gap is larger).
     ///
     /// 2. If state is corrupted (state_root mismatch, missing tables), clear volatile
     ///    tables and fall back to genesis. The P2P layer will snapshot-sync from peers.
@@ -163,6 +173,10 @@ impl MdbxChainContext {
             // First run: initialise from genesis.
             let consensus = ChainContext::init_from_genesis();
             let tip_chain_work = block_work(&GENESIS_TARGET);
+            let finalized = FinalizedCheckpoint {
+                height: 0,
+                hash: consensus.tip_hash,
+            };
             let ctx = Self {
                 store,
                 state: consensus.state,
@@ -171,6 +185,8 @@ impl MdbxChainContext {
                 tip_height: consensus.tip_height,
                 tip_hash: consensus.tip_hash,
                 tip_chain_work,
+                finalized,
+                defer_finality_updates: false,
             };
             ctx.persist_genesis()?;
             Ok(ctx)
@@ -193,6 +209,10 @@ impl MdbxChainContext {
                     }
                     let consensus = ChainContext::init_from_genesis();
                     let tip_chain_work = block_work(&GENESIS_TARGET);
+                    let finalized = FinalizedCheckpoint {
+                        height: 0,
+                        hash: consensus.tip_hash,
+                    };
                     let ctx = Self {
                         store,
                         state: consensus.state,
@@ -201,6 +221,8 @@ impl MdbxChainContext {
                         tip_height: consensus.tip_height,
                         tip_hash: consensus.tip_hash,
                         tip_chain_work,
+                        finalized,
+                        defer_finality_updates: false,
                     };
                     ctx.persist_genesis()?;
                     Ok(ctx)
@@ -220,6 +242,10 @@ impl MdbxChainContext {
         if store.is_empty()? {
             let consensus = ChainContext::init_from_easy_genesis();
             let tip_chain_work = crate::block_work(&TEST_TARGET);
+            let finalized = FinalizedCheckpoint {
+                height: 0,
+                hash: consensus.tip_hash,
+            };
             let ctx = Self {
                 store,
                 state: consensus.state,
@@ -228,6 +254,8 @@ impl MdbxChainContext {
                 tip_height: consensus.tip_height,
                 tip_hash: consensus.tip_hash,
                 tip_chain_work,
+                finalized,
+                defer_finality_updates: false,
             };
             // Persist easy genesis.
             {
@@ -238,6 +266,12 @@ impl MdbxChainContext {
                     .expect("easy genesis header must exist")
                     .clone();
                 let genesis_hash = full_block_hash(&genesis);
+                let meta = ConsensusMeta {
+                    tip_height: 0,
+                    tip_hash: genesis_hash,
+                    cumulative_chainwork: tip_chain_work,
+                    finalized,
+                };
                 ctx.store.commit_block(
                     &genesis,
                     &genesis_hash,
@@ -245,6 +279,7 @@ impl MdbxChainContext {
                     &[],
                     &[],
                     None,
+                    &meta,
                 )?;
             }
             Ok(ctx)
@@ -259,9 +294,14 @@ impl MdbxChainContext {
 
         let genesis = genesis_header();
         let genesis_hash = full_block_hash(&genesis);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            cumulative_chainwork: self.tip_chain_work,
+            finalized: self.finalized,
+        };
 
-        // Write genesis header + tip + state_meta in one transaction.
-        // We can't use commit_block (no undo_log for genesis), so write directly.
+        // Write genesis header + tip + state_meta + consensus_meta in one transaction.
         // For genesis: segments are all virtual-zero, no dirty segments.
         self.store.commit_block(
             &genesis,
@@ -270,15 +310,38 @@ impl MdbxChainContext {
             &[],  // no dirty segments (all virtual zero)
             &[],  // no nullifiers
             None, // no block bytes for genesis
+            &meta,
         )?;
         Ok(())
     }
 
     fn restore_from_mdbx(store: MdbxStore) -> Result<Self, MdbxContextError> {
-        // 1. Read chain tip.
-        let (tip_height, tip_hash) = store
-            .get_chain_tip()?
-            .ok_or(MdbxContextError::Corrupt("missing chain_tip"))?;
+        // 1. Read non-optional consensus metadata.
+        let meta = store
+            .get_consensus_meta()?
+            .ok_or(MdbxContextError::Corrupt("missing consensus_meta"))?;
+        let tip_height = meta.tip_height;
+        let tip_hash = meta.tip_hash;
+        let finalized = meta.finalized;
+
+        if store.get_chain_tip()? != Some((tip_height, tip_hash)) {
+            return Err(MdbxContextError::Corrupt(
+                "chain_tip mismatch with consensus_meta",
+            ));
+        }
+        if finalized.height > tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "finalized checkpoint is above canonical tip",
+            ));
+        }
+        let stored_tip_chain_work = store
+            .get_chain_work(tip_height)?
+            .ok_or(MdbxContextError::Corrupt("missing exact chainwork for tip"))?;
+        if stored_tip_chain_work != meta.cumulative_chainwork {
+            return Err(MdbxContextError::Corrupt(
+                "tip chainwork mismatch with consensus_meta",
+            ));
+        }
 
         // 2. Read state_meta.
         let (log_slots, active_slot_count, alloc_counter) = store
@@ -307,6 +370,22 @@ impl MdbxChainContext {
         let tip_hdr = store
             .get_header(tip_height)?
             .ok_or(MdbxContextError::Corrupt("tip header missing from store"))?;
+        if full_block_hash(&tip_hdr) != tip_hash {
+            return Err(MdbxContextError::Corrupt(
+                "tip hash mismatch with persisted tip header",
+            ));
+        }
+        let finalized_hdr =
+            store
+                .get_header(finalized.height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "finalized header missing from store",
+                ))?;
+        if full_block_hash(&finalized_hdr) != finalized.hash {
+            return Err(MdbxContextError::Corrupt(
+                "finalized hash mismatch with persisted finalized header",
+            ));
+        }
         if restored_root != tip_hdr.state_root {
             return Err(MdbxContextError::Corrupt(
                 "state root mismatch after restore: segment data is corrupt",
@@ -343,23 +422,8 @@ impl MdbxChainContext {
         let nullifiers =
             NullifierSet::rebuild_from_blocks(null_blocks.into_iter().map(|(_, hashes)| hashes));
 
-        // 7. Reconstruct cumulative chainwork.
-        //
-        //    Headers are kept in MDBX forever, but reading them all on startup
-        //    would be slow for very long chains. We approximate blocks outside
-        //    the recent_headers window with GENESIS_TARGET (conservative), and
-        //    use precise targets for the recent window (already loaded above).
-        let mut tip_chain_work = [0u8; 32];
-        // Old blocks (before recent_headers window): approximate with genesis target.
-        for _ in 0..start_height {
-            tip_chain_work = add_work(&tip_chain_work, &block_work(&GENESIS_TARGET));
-        }
-        // Recent blocks: use precise difficulty targets.
-        for h in start_height..=tip_height {
-            if let Some(hdr) = recent_headers.get(&h) {
-                tip_chain_work = add_work(&tip_chain_work, &block_work(&hdr.difficulty_target));
-            }
-        }
+        // 7. Use exact persisted cumulative chainwork.
+        let tip_chain_work = meta.cumulative_chainwork;
 
         Ok(Self {
             store,
@@ -369,12 +433,30 @@ impl MdbxChainContext {
             tip_height,
             tip_hash,
             tip_chain_work,
+            finalized,
+            defer_finality_updates: false,
         })
     }
 
     // -----------------------------------------------------------------------
     // Block application
     // -----------------------------------------------------------------------
+
+    fn finalized_for_tip(&self, tip_height: u64) -> Result<FinalizedCheckpoint, MdbxContextError> {
+        let finalized_height = tip_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+        if finalized_height <= self.finalized.height {
+            return Ok(self.finalized);
+        }
+        let header =
+            self.get_header_from_store(finalized_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "missing header for finalized checkpoint",
+                ))?;
+        Ok(FinalizedCheckpoint {
+            height: finalized_height,
+            hash: full_block_hash(&header),
+        })
+    }
 
     fn commit_applied_next_block(
         &mut self,
@@ -400,6 +482,21 @@ impl MdbxChainContext {
         let tx_hashes: Vec<TxBodyHash> =
             block.transactions.iter().map(|t| t.tx_body_hash).collect();
         let block_hash = full_block_hash(&block.header);
+        let new_tip_chain_work = add_work(
+            &self.tip_chain_work,
+            &block_work(&block.header.difficulty_target),
+        );
+        let new_finalized = if self.defer_finality_updates {
+            self.finalized
+        } else {
+            self.finalized_for_tip(block.header.height)?
+        };
+        let consensus_meta = ConsensusMeta {
+            tip_height: block.header.height,
+            tip_hash: block_hash,
+            cumulative_chainwork: new_tip_chain_work,
+            finalized: new_finalized,
+        };
         if let Err(e) = self.store.commit_block(
             &block.header,
             &block_hash,
@@ -407,6 +504,7 @@ impl MdbxChainContext {
             &dirty_refs,
             &tx_hashes,
             Some(&block.to_bytes()),
+            &consensus_meta,
         ) {
             revert_block(&mut self.state.state, undo);
             self.state.active_slot_count = pre_active;
@@ -420,10 +518,8 @@ impl MdbxChainContext {
         self.nullifiers.insert_block(&tx_hashes);
         self.tip_height = block.header.height;
         self.tip_hash = block_hash;
-        self.tip_chain_work = add_work(
-            &self.tip_chain_work,
-            &block_work(&block.header.difficulty_target),
-        );
+        self.tip_chain_work = new_tip_chain_work;
+        self.finalized = new_finalized;
         self.state.state.clear_dirty();
 
         let window = (MEDIAN_TIME_BLOCKS as u64) + ANCHOR_DEPTH;
@@ -544,7 +640,7 @@ impl MdbxChainContext {
     ///
     /// Searches `recent_headers` first (fast RAM lookup), then falls back to
     /// the MDBX hash→height index. Returns `None` if the hash is not found
-    /// within the last `FINALITY_DEPTH` blocks.
+    /// within the last `CONSENSUS_FINALITY_DEPTH` blocks.
     pub fn find_ancestor_height(&self, hash: &[u8; 32]) -> Option<u64> {
         // Search recent_headers first (fast path in RAM).
         for (height, header) in &self.recent_headers {
@@ -554,7 +650,7 @@ impl MdbxChainContext {
         }
 
         // Fall back to MDBX hash→height index.
-        let oldest = self.tip_height.saturating_sub(FINALITY_DEPTH);
+        let oldest = self.tip_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
         match self.store.get_header_by_hash(hash) {
             Ok(Some(header)) if header.height >= oldest => Some(header.height),
             _ => None,
@@ -573,8 +669,8 @@ impl MdbxChainContext {
     ///
     /// Returns the hashes of reclaimed transactions for mempool re-admission.
     ///
-    /// Fails if reorg depth > `FINALITY_DEPTH`, if an undo log is missing, or if
-    /// any fork block fails full proof-native validation/application.
+    /// Fails if the reorg would change the finalized prefix, if an undo log is
+    /// missing, or if any fork block fails full proof-native validation/application.
     pub fn apply_reorg_mdbx_with_applier<F>(
         &mut self,
         ancestor_height: u64,
@@ -597,7 +693,29 @@ impl MdbxChainContext {
         }
         let reorg_depth = self.tip_height - ancestor_height; // safe: guarded above
 
-        if reorg_depth > FINALITY_DEPTH {
+        if ancestor_height < self.finalized.height {
+            tracing::warn!(
+                ancestor_height,
+                finalized_height = self.finalized.height,
+                "reorg rejected: ancestor is below finalized checkpoint"
+            );
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+        }
+        if ancestor_height == self.finalized.height {
+            let ancestor_header =
+                self.get_header_from_store(ancestor_height)?
+                    .ok_or(MdbxContextError::Corrupt(
+                        "finalized ancestor header missing",
+                    ))?;
+            if full_block_hash(&ancestor_header) != self.finalized.hash {
+                tracing::warn!(
+                    ancestor_height,
+                    "reorg rejected: finalized checkpoint hash mismatch"
+                );
+                return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+            }
+        }
+        if reorg_depth > CONSENSUS_FINALITY_DEPTH {
             return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
         }
 
@@ -682,8 +800,7 @@ impl MdbxChainContext {
 
         // -----------------------------------------------------------------------
         // Rebuild nullifier set from the surviving chain.
-        // Uses T_NULLIFIER_BLOCKS (kept for ANCHOR_DEPTH blocks), not undo logs
-        // (kept for only FINALITY_DEPTH blocks).
+        // Uses T_NULLIFIER_BLOCKS (kept for ANCHOR_DEPTH blocks), not undo logs.
         // -----------------------------------------------------------------------
         {
             let rebuild_start = ancestor_height.saturating_sub(ANCHOR_DEPTH - 1);
@@ -703,8 +820,16 @@ impl MdbxChainContext {
                     "ancestor header missing from store",
                 ))?;
 
+        let ancestor_chain_work =
+            self.store
+                .get_chain_work(ancestor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "missing exact chainwork for reorg ancestor",
+                ))?;
+
         self.tip_height = ancestor_height;
         self.tip_hash = full_block_hash(&ancestor_header);
+        self.tip_chain_work = ancestor_chain_work;
 
         // -----------------------------------------------------------------------
         // Persist the reverted state to MDBX atomically.
@@ -727,6 +852,8 @@ impl MdbxChainContext {
         // Apply fork blocks via the caller's proof-native applier.
         // -----------------------------------------------------------------------
         let mut applied_heights: Vec<u64> = Vec::new();
+        let previous_defer_finality = self.defer_finality_updates;
+        self.defer_finality_updates = true;
 
         for block in new_blocks {
             match apply_block(self, block, local_time) {
@@ -735,10 +862,24 @@ impl MdbxChainContext {
                     tracing::info!(height = block.header.height, "reorg: applied new block");
                 }
                 Err(e) => {
+                    self.defer_finality_updates = previous_defer_finality;
                     tracing::error!(height = block.header.height, err = ?e, "reorg: failed to apply block");
                     return Err(e);
                 }
             }
+        }
+
+        self.defer_finality_updates = previous_defer_finality;
+        let finalized_after_reorg = self.finalized_for_tip(self.tip_height)?;
+        if finalized_after_reorg != self.finalized {
+            let meta = ConsensusMeta {
+                tip_height: self.tip_height,
+                tip_hash: self.tip_hash,
+                cumulative_chainwork: self.tip_chain_work,
+                finalized: finalized_after_reorg,
+            };
+            self.store.put_consensus_meta(&meta)?;
+            self.finalized = finalized_after_reorg;
         }
 
         tracing::info!(
@@ -782,6 +923,12 @@ impl MdbxChainContext {
             .collect();
 
         let ancestor_hash = full_block_hash(ancestor_header);
+        let consensus_meta = ConsensusMeta {
+            tip_height: ancestor_header.height,
+            tip_hash: ancestor_hash,
+            cumulative_chainwork: self.tip_chain_work,
+            finalized: self.finalized,
+        };
 
         // Read the ancestor's existing undo log so we don't overwrite it with
         // empty — it must remain intact for any future reorg within finality.
@@ -801,6 +948,7 @@ impl MdbxChainContext {
                 &dirty_refs,
                 &[],  // ancestor's nullifiers already stored; don't duplicate
                 None, // no block bytes (stored earlier or DA-pruned)
+                &consensus_meta,
             )
             .map_err(MdbxContextError::Store)?;
 
@@ -884,180 +1032,28 @@ impl MdbxChainContext {
 
     /// Apply a full state snapshot received from a peer during initial sync.
     ///
-    /// Paranoid's designed sync method: new nodes download the CURRENT STATE
-    /// (not block history, which is not stored after FINALITY_DEPTH blocks).
-    /// The state's validity is proven by the recursive chain proof (see noid_recursive).
-    /// For testnet, nodes accept snapshots from configured seed peers.
-    ///
-    /// After this call, the node is at the snapshot's tip height and can
-    /// immediately start receiving gossipsub blocks and mining.
+    /// FIX1 fail-closed policy: public arbitrary-peer snapshots are disabled until
+    /// immutable exact-height checkpoint generations and the real recursive verifier
+    /// are implemented. Installing a snapshot here would otherwise require exact
+    /// persisted chainwork, finalized checkpoint compatibility, nullifier-window
+    /// pinning, and atomic metadata replacement.
     pub fn apply_state_snapshot<I>(
         &mut self,
-        tip_height: u64,
-        tip_hash: [u8; 32],
-        log_slots: u32,
-        active_slot_count: u64,
-        alloc_counter: u64,
-        segments: I,
-        recent_headers_bytes: &[Vec<u8>],
-        nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
+        _tip_height: u64,
+        _tip_hash: [u8; 32],
+        _log_slots: u32,
+        _active_slot_count: u64,
+        _alloc_counter: u64,
+        _segments: I,
+        _recent_headers_bytes: &[Vec<u8>],
+        _nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
     ) -> Result<(), MdbxContextError>
     where
         I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
     {
-        use crate::block_header::BlockHeader;
-        use crate::consensus::difficulty::{add_work, block_work};
-        use crate::consensus::pow::full_block_hash;
-        use crate::nullifier::NullifierSet;
-
-        // 1. Rebuild SegmentedFriState from snapshot segments.
-        let mut seg_state =
-            crate::segmented_state::SegmentedFriState::new_empty(log_slots as usize);
-        let mut segment_count = 0usize;
-        for (seg_id, _eff_log, cols, seg_root) in segments {
-            seg_state.set_segment_columns_with_root(seg_id, cols, seg_root);
-            segment_count += 1;
-        }
-
-        // 2. Decode and index recent headers.
-        let mut new_recent: std::collections::HashMap<u64, BlockHeader> =
-            std::collections::HashMap::new();
-        let mut new_tip_header: Option<BlockHeader> = None;
-        for bytes in recent_headers_bytes {
-            if let Ok(hdr) = BlockHeader::from_bytes(bytes) {
-                if hdr.height == tip_height {
-                    new_tip_header = Some(hdr.clone());
-                }
-                new_recent.insert(hdr.height, hdr);
-            }
-        }
-
-        // SECURITY: Verify that the snapshot's segment data matches the tip header's
-        // state_root BEFORE touching in-memory or MDBX state.
-        //
-        // Without this check a malicious peer can send fabricated slot values while
-        // providing valid-looking block headers, completely replacing our state
-        // (Eclipse attack). This mirrors the identical check in restore_from_mdbx().
-        {
-            let tip_hdr = new_tip_header.as_ref().ok_or(MdbxContextError::Corrupt(
-                "snapshot missing tip header in recent_headers: cannot verify state_root",
-            ))?;
-            if tip_hash != full_block_hash(tip_hdr) {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot tip_hash mismatch: manifest tip_hash does not match tip header",
-                ));
-            }
-            let computed_root = seg_state.root();
-            if computed_root != tip_hdr.state_root {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot state_root mismatch: segment data does not match \
-                     tip header state_root (possible Eclipse / fabricated-snapshot attack)",
-                ));
-            }
-        }
-
-        // 3. Rebuild NullifierSet from nullifier_blocks.
-        let null_vecs: Vec<Vec<noid_poseidon2b::primitives::TxBodyHash>> =
-            nullifier_blocks.to_vec();
-        let new_nullifiers = NullifierSet::rebuild_from_blocks(null_vecs);
-
-        // 4. Compute approximate chainwork from recent headers.
-        let new_tip_chain_work = {
-            let mut w = [0u8; 32];
-            for hdr in new_recent.values() {
-                w = add_work(&w, &block_work(&hdr.difficulty_target));
-            }
-            w
-        };
-
-        // 5. Apply to in-memory state.
-        self.state.state = seg_state;
-        self.state.active_slot_count = active_slot_count;
-        self.state.alloc_counter = alloc_counter;
-        self.state.state.clear_dirty();
-        self.recent_headers = new_recent;
-        self.nullifiers = new_nullifiers;
-        self.tip_height = tip_height;
-        self.tip_hash = tip_hash;
-        self.tip_chain_work = new_tip_chain_work;
-
-        // 6. Persist the snapshot to MDBX so the node survives restarts.
-        // We persist all segments plus tip header (if we have it).
-        if let Some(tip_hdr) = new_tip_header {
-            // Write installed snapshot segments by reference. Avoid cloning all
-            // columns a second time; the decoded columns were already moved into
-            // `self.state.state` above.
-            let eff_log = self.state.state.effective_log_segment_size() as u8;
-            let seg_ids: Vec<u16> = self.state.state.active_segment_ids().collect();
-            let total = seg_ids.len();
-            let dirty_refs: Vec<(u16, u8, &crate::segmented_state::SegmentColumns)> = seg_ids
-                .iter()
-                .map(|&id| {
-                    let cols = self
-                        .state
-                        .state
-                        .try_get_segment_columns(id)
-                        .expect("active segment must have columns");
-                    (id, eff_log, cols)
-                })
-                .collect();
-
-            use crate::consensus::da_prune::BlockUndoLog;
-            let empty_undo = BlockUndoLog {
-                block_height: tip_height,
-                slot_changes: vec![],
-                tx_hashes: vec![],
-            };
-
-            tracing::info!(
-                height = tip_height,
-                segments = total,
-                "snapshot: writing {} segments to MDBX...",
-                total
-            );
-            self.store
-                .commit_block(
-                    &tip_hdr,
-                    &tip_hash,
-                    &empty_undo,
-                    &dirty_refs,
-                    &[],  // no new nullifier hashes (already rebuilt above)
-                    None, // no full block bytes (not stored for snapshot)
-                )
-                .map_err(MdbxContextError::Store)?;
-            tracing::info!(
-                height = tip_height,
-                segments = total,
-                "snapshot: MDBX write complete"
-            );
-
-            // Rebuild the owner index from snapshot segments so wallet scan is O(1).
-            if let Err(e) = self.store.rebuild_owner_index_from_segments(&dirty_refs) {
-                tracing::warn!(err = %e, "rebuild_owner_index_from_segments failed");
-            }
-
-            self.state.state.clear_dirty();
-        }
-
-        // Populate T_TX_INDEX from nullifier_blocks so getTx works on snapshot nodes.
-        // nullifier_blocks[i] = tx hashes in order for block (null_start + i).
-        use crate::consensus::params::ANCHOR_DEPTH;
-        let null_start = tip_height.saturating_sub(ANCHOR_DEPTH.saturating_sub(1));
-        if let Err(e) = self
-            .store
-            .rebuild_tx_index_from_nullifier_blocks(nullifier_blocks, null_start)
-        {
-            tracing::warn!(err = %e, "rebuild_tx_index_from_nullifier_blocks failed (non-fatal)");
-        }
-
-        tracing::info!(
-            height = tip_height,
-            segments = segment_count,
-            active_slots = active_slot_count,
-            "state snapshot applied"
-        );
-
-        Ok(())
+        Err(MdbxContextError::Corrupt(
+            "public state snapshot install disabled until exact checkpoint generation",
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1138,6 +1134,9 @@ impl MdbxChainContext {
     }
     pub fn tip_chain_work(&self) -> &[u8; 32] {
         &self.tip_chain_work
+    }
+    pub fn finalized_checkpoint(&self) -> FinalizedCheckpoint {
+        self.finalized
     }
 }
 
@@ -1260,6 +1259,59 @@ mod tests {
     }
 
     #[test]
+    fn exact_chainwork_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_work;
+
+        {
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            for _ in 0..3 {
+                let block = build_empty_block_on(&mut ctx);
+                let ts = block.header.timestamp + 1;
+                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
+            }
+            expected_work = *ctx.tip_chain_work();
+            assert_eq!(
+                ctx.store.get_chain_work(ctx.tip_height()).unwrap(),
+                Some(expected_work)
+            );
+        }
+
+        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        assert_eq!(*ctx.tip_chain_work(), expected_work);
+        assert_eq!(
+            ctx.store.get_chain_work(ctx.tip_height()).unwrap(),
+            Some(expected_work)
+        );
+    }
+
+    #[test]
+    fn finalized_pair_survives_restart() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let expected_finalized;
+
+        {
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
+                let block = build_empty_block_on(&mut ctx);
+                let ts = block.header.timestamp + 1;
+                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
+            }
+            expected_finalized = ctx.finalized_checkpoint();
+            assert_eq!(expected_finalized.height, 2);
+        }
+
+        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        assert_eq!(ctx.finalized_checkpoint(), expected_finalized);
+        assert_eq!(
+            ctx.store.get_consensus_meta().unwrap().unwrap().finalized,
+            expected_finalized
+        );
+    }
+
+    #[test]
     fn state_root_consistent_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let root_after_block;
@@ -1325,6 +1377,13 @@ mod tests {
             };
             hdr2.nonce = 0; // TEST_TARGET: any nonce works
             let hash2 = full_block_hash(&hdr2);
+            let chainwork2 = crate::add_work(&ctx.tip_chain_work, &crate::block_work(&TEST_TARGET));
+            let meta2 = ConsensusMeta {
+                tip_height: 2,
+                tip_hash: hash2,
+                cumulative_chainwork: chainwork2,
+                finalized: ctx.finalized,
+            };
             ctx.store
                 .commit_block(
                     &hdr2,
@@ -1333,14 +1392,15 @@ mod tests {
                     &[],
                     &[sentinel_a, sentinel_b],
                     None,
+                    &meta2,
                 )
                 .unwrap();
         }
 
         // reopen. The rebuilt nullifier set must contain both sentinels.
         {
-            // Open by reading chain_tip from MDBX (tip is still 1 since we
-            // bypassed apply_next_block for block 2; that's fine for this test).
+            // Open by reading chain_tip from MDBX. The direct commit above made
+            // block 2 durable without updating the old in-memory ctx.
             let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
             // Verify via the store directly: get_nullifier_blocks_range(0, 1)

@@ -31,9 +31,9 @@ pub enum MempoolEvent {
     /// A transaction was confirmed in a block and removed from the pool.
     TxConfirmed { hash: TxBodyHash, block_height: u64 },
 
-    /// Wallet LogicProof cached for a transaction (background proving cache).
+    /// Wallet AuthGKR cached for a transaction (background proving cache).
     /// The block assembler can now use the cached proof.
-    TxPreProved { hash: TxBodyHash },
+    TxAuthorizationVerified { hash: TxBodyHash },
 }
 
 /// Why a transaction was evicted.

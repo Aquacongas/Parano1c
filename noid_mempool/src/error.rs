@@ -34,16 +34,16 @@ pub enum SubmitError {
     #[error("tx intent too large: {actual} bytes (max {max})")]
     IntentTooLarge { actual: usize, max: usize },
 
-    /// Non-coinbase transactions must carry a wallet logic proof.
-    #[error("missing logic proof for non-coinbase transaction")]
+    /// Non-coinbase transactions must carry a wallet authorization.
+    #[error("missing auth authorization for non-coinbase transaction")]
     MissingProof,
 
     /// Logic proof bytes exceed the mempool wire/admission cap.
-    #[error("logic proof too large: {actual} bytes (max {max})")]
+    #[error("auth authorization too large: {actual} bytes (max {max})")]
     ProofTooLarge { actual: usize, max: usize },
 
-    /// LogicProof verification failed.
-    #[error("invalid logic proof: {0}")]
+    /// AuthGKR verification failed.
+    #[error("invalid auth authorization: {0}")]
     InvalidProof(String),
 
     /// Internal error (lock poisoned, channel closed, etc).

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Public-input layout for the LogicProof STARK (stateless).
+//! Public-input layout for canonical per-transaction TxLogic AIR.
 //!
 //! Order is locked:
 //! `(epoch_anchor, tx_body_hash, shape_id, fee, n_live_inputs,
@@ -38,7 +38,7 @@ pub struct PublicInputs {
     /// header. Absorbed into STARK transcript to bind circuit sizing.
     pub log_slots: u32,
     /// Binding commitment to all claimed slot values (inputs + outputs).
-    /// Bridges LogicProof to BlockStateBinding: the miner opens the
+    /// Bridges canonical TxLogic public inputs to BlockStateBinding: the miner opens the
     /// same slots and verifies equality.
     pub claims_commitment: Digest,
     /// Per-output activation booleans.

@@ -18,10 +18,10 @@ pub struct MempoolConfig {
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
     pub fee_floor_window: usize,
 
-    /// Number of concurrent LogicProof verification workers (tokio::spawn_blocking slots).
-    /// 0 = skip LogicProof verification at admission (native checks only).
+    /// Number of concurrent AuthGKR verification workers (tokio::spawn_blocking slots).
+    /// 0 = no concurrency limit; AuthGKR verification is still required.
     /// Recommended: number of physical cores.
-    pub zk_verify_workers: usize,
+    pub auth_verify_workers: usize,
 }
 
 impl Default for MempoolConfig {
@@ -30,7 +30,7 @@ impl Default for MempoolConfig {
             capacity: MAX_MEMPOOL_TXS,
             max_total_intent_bytes: MAX_MEMPOOL_BYTES,
             fee_floor_window: 50,
-            zk_verify_workers: 4,
+            auth_verify_workers: 4,
         }
     }
 }
@@ -46,8 +46,8 @@ impl MempoolConfig {
         self
     }
 
-    pub fn with_zk_workers(mut self, n: usize) -> Self {
-        self.zk_verify_workers = n;
+    pub fn with_auth_verify_workers(mut self, n: usize) -> Self {
+        self.auth_verify_workers = n;
         self
     }
 }

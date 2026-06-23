@@ -718,9 +718,9 @@ impl BlockMiner {
 ///
 /// # Correctness
 ///
-/// This uses the `WalletProofBundle` stored in each `MempoolEntry.cached_algebraic_proof`
+/// This uses the `WalletAuthorizationBundle` stored in each `MempoolEntry.cached_authorization`
 /// (when pre-proving cache is populated). When no bundles exist, the
-/// decoded from `logic_proof_bytes` at block assembly time.
+/// decoded from `authorization_bytes` at block assembly time.
 ///
 /// # State correctness
 ///
@@ -738,7 +738,7 @@ pub(crate) fn run_prove_block(
         prove_block_with_total_tx_count, prove_state_mle_openings_only, BlockProof,
         BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
     };
-    use noid_stark::WalletProofBundle;
+    use noid_gkr::WalletAuthorizationBundle;
 
     // Coinbase-only: marker proof, no full BlockProof generation needed.
     let non_cb_count = tmpl.n_user_txs();
@@ -751,17 +751,23 @@ pub(crate) fn run_prove_block(
     }
 
     let all_txs = tmpl.inner.all_txs();
-    let bundles: Vec<WalletProofBundle> = tmpl
-        .proof_bytes
-        .iter()
-        .filter_map(|opt| {
-            opt.as_ref()
-                .and_then(|b| WalletProofBundle::from_bytes(b).ok())
-        })
-        .collect();
+    let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
+    for (idx, opt) in tmpl.authorization_bytes.iter().enumerate() {
+        let bytes = opt.as_ref().ok_or_else(|| {
+            format!(
+                "missing WalletAuthorizationBundle for non-coinbase tx index {idx} — will retry coinbase-only"
+            )
+        })?;
+        let expected_shape = tmpl.inner.txs[idx].body.shape;
+        let bundle = WalletAuthorizationBundle::from_bytes_for_shape(bytes, expected_shape)
+            .map_err(|e| {
+                format!("WalletAuthorizationBundle decode failed at tx index {idx}: {e}")
+            })?;
+        bundles.push(bundle);
+    }
     if bundles.len() != non_cb_count {
         return Err(format!(
-            "missing WalletProofBundles: have {}, need {} — will retry coinbase-only",
+            "authorization bundle count mismatch: have {}, need {}",
             bundles.len(),
             non_cb_count,
         ));
@@ -773,7 +779,7 @@ pub(crate) fn run_prove_block(
     {
         if bundle.shape() != tx.body.shape {
             return Err(format!(
-                "WalletProofBundle shape {:?} does not match tx body shape {:?} for {:?}",
+                "WalletAuthorizationBundle shape {:?} does not match tx body shape {:?} for {:?}",
                 bundle.shape(),
                 tx.body.shape,
                 tx.tx_body_hash
@@ -926,8 +932,8 @@ mod tests {
     use noid_chain::segmented_state::SegmentColumns;
     use noid_chain::state::{apply_tx, ChainState};
     use noid_chain::state_binding::BlockStateBinding;
+    use noid_gkr::WalletAuthorizationBundle;
     use noid_poseidon2b::primitives::Address;
-    use noid_stark::WalletProofBundle;
     use noid_tx::{
         compute_claims_commitment, hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape,
     };
@@ -964,7 +970,7 @@ mod tests {
         label: &'static str,
         slot_base: u32,
         seed: u128,
-    ) -> (TxBody, WalletProofBundle) {
+    ) -> (TxBody, WalletAuthorizationBundle) {
         let fixture = standard_fixture(standard_scenario(label, 1, 2, slot_base, seed));
         let proof = prove_standard_wallet(&fixture, 1).proof;
         let body = fixture.scenario.body.clone();
@@ -976,7 +982,7 @@ mod tests {
         n_inputs: usize,
         slot_base: u32,
         seed: u128,
-    ) -> (TxBody, WalletProofBundle) {
+    ) -> (TxBody, WalletAuthorizationBundle) {
         let fixture = sweep_fixture(sweep_scenario(label, n_inputs, slot_base, seed));
         let proof = prove_sweep_wallet(&fixture, 1).proof;
         let body = fixture.scenario.body.clone();
@@ -1094,7 +1100,9 @@ mod tests {
         }
     }
 
-    fn miner_template(user: Vec<(TxBody, WalletProofBundle)>) -> crate::template::BlockTemplate {
+    fn miner_template(
+        user: Vec<(TxBody, WalletAuthorizationBundle)>,
+    ) -> crate::template::BlockTemplate {
         let coinbase = coinbase_tx();
         let user_bodies: Vec<TxBody> = user.iter().map(|(body, _)| body.clone()).collect();
         let mut pre_state = seed_pre_state(&user_bodies);
@@ -1131,9 +1139,9 @@ mod tests {
         assert_eq!(post_state.state_root(), state_root);
 
         let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();
-        let proof_bytes = user
+        let authorization_bytes = user
             .into_iter()
-            .map(|(_, bundle)| Some(bundle.to_bytes()))
+            .map(|(_, bundle)| Some(bundle.to_bytes().expect("serialize authorization")))
             .collect();
         let all_txs: Vec<Transaction> = std::iter::once(coinbase.clone())
             .chain(txs.iter().cloned())
@@ -1160,7 +1168,7 @@ mod tests {
             miner_address: Address([0xCB; 32]),
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
             parent,
-            proof_bytes,
+            authorization_bytes,
             pre_segs,
         }
     }

@@ -406,8 +406,8 @@ pub struct MempoolTxInfo {
     pub n_outputs: usize,
     /// Chain height at admission.
     pub admitted_height: u64,
-    /// Whether a wallet LogicProof bundle is cached.
-    pub has_proof: bool,
+    /// Whether a wallet authorization bundle is cached.
+    pub has_authorization: bool,
 }
 
 /// Summary of the current mempool state.

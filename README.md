@@ -1,15 +1,15 @@
 # PARANOID. The Proof-Native Transparent UTXO Statechain
 
-> The proof of the entire chain history from genesis fits in **~43 KB**. Verification takes a few milliseconds.
-> No archive nodes. No history replay. No signatures. No trusted setup.
+> Design target: compact recursive verification of chain history.
+> Current FIX1 status: recent block validation is trustless; public arbitrary-peer snapshot sync is disabled until immutable checkpoint generations and the real recursive verifier are implemented.
 
 ---
 
 Blockchains have a fundamental architectural flaw: to validate the present, you must replay the past. Every major network inherits this property, full nodes download and re-execute every transaction back to genesis. This isn't a temporary limitation; it is baked into the model.
 
-Paranoid removes this requirement entirely.
+Paranoid is designed to remove this requirement.
 
-In Paranoid, validity is established once, locally, by the party with the most information — the wallet owner. The result is a cryptographic proof that the network verifies without re-executing. Recursive composition collapses the entire chain history into a single compact proof. The present can be verified without the past. **Truth is a function of mathematics, not time.**
+In Paranoid, validity is established once, locally, by the party with the most information — the wallet owner. The result is a cryptographic proof that the network verifies without re-executing wallet logic. Recursive composition is the intended long-term path for compact history verification; until the recursive verifier proves the full block-verifier relation, public snapshot sync remains fail-closed.
 
 ---
 
@@ -18,8 +18,8 @@ In Paranoid, validity is established once, locally, by the party with the most i
 | | Classic blockchain | Paranoid |
 |---|---|---|
 | Validation model | Re-execute everywhere | Verify proof once |
-| Full sync | Replay N GB of history | State snapshot + ~43 KB recursive proof; proof verification in a few ms |
-| History required to validate | Yes. From genesis | No |
+| Full sync | Replay N GB of history | Current: recent block sync or explicitly trusted bootstrap. Future: checkpoint snapshot + full recursive verifier |
+| History required to validate | Yes. From genesis | Current public mode: recent blocks only. Future design target: no full replay |
 | Signatures | ECDSA / EdDSA | None. Hash-preimage ownership proof |
 | Quantum safety | No (discrete log problem) | Yes. Hash-only primitives |
 | 51% attack capability | Spend others' coins | Choose ordering only |
@@ -34,18 +34,14 @@ A 51% miner in Paranoid can only choose the ordering of valid transitions. They 
 
 ### Execution is Local
 
-When you send NOID, your wallet builds a stateless **LogicProof** that proves:
-- You know the secret behind the input address (`Address = Poseidon2b(spend_secret)`)
-- Inputs equal outputs plus fee
-- All values are in range
-- The transaction body is cryptographically bound
+When you send NOID, your wallet builds a stateless **WalletAuthorizationBundle** that proves you know the secret behind each input address (`Address = Poseidon2b(spend_secret)`). Public transaction arithmetic is checked natively by nodes at mempool admission and then proved canonically by the block producer from the public `TxBody`.
 
-This proof is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~36 minutes). You prove it once, on your device.
+The authorization is **stateless**: no Merkle paths, no dependency on the current state root. It is valid across block boundaries until the epoch anchor expires (~36 minutes). You prove authorization once, on your device.
 
 ### The Network Verifies, Not Executes
 
 Every full node independently verifies the validity proof of each user-transaction block it receives. A canonical `BlockProof` covers:
-- All per-transaction LogicProofs, aggregated in shape-specific buckets (`Standard4x8`, `Sweep25x2`)
+- Canonical per-transaction TxLogic AIR, rebuilt from public transaction bodies and aggregated in shape-specific buckets (`Standard4x8`, `Sweep25x2`)
 - Mandatory NativeDelta state-root transition proof: input slots held the claimed values, output slots were empty, and the post-block `state_root` follows from the proven delta
 - Source-bound per-bucket FRI openings for non-empty transaction-shape buckets, all bound into one block proof transcript
 
@@ -62,13 +58,16 @@ chain_hash_n  = Poseidon2b_compress(chain_hash_{n-1}, inner_n)
 
 `block_initial_claim` encodes the MLE evaluation of the block's slot-state transitions and is folded into every step, binding the chain hash to both the block header and the block's state-transition proof. The recursive proof proves that this accumulator was correctly computed from genesis, and that the current `state_root` is the result. It is a single STARK over a 256-row trace — constant size regardless of chain length.
 
-**Result:** A new node downloads:
-1. The current **state snapshot**. Only populated FRI segments (~3 MB each,
-   one per 65,536 UTXOs; scales with UTXO set size)
-2. The **RecursiveProof** (~43 KB encoded)
-3. Verifies the recursive proof in a few milliseconds, then applies the authenticated snapshot segments
+**Current FIX1 status:** public arbitrary-peer snapshot sync is disabled. A node can trustlessly validate recent blocks and can resume from its own persisted MDBX state. If it is too far behind for retained recent blocks, it must use an explicitly trusted bootstrap path until checkpoint snapshot generations and the real recursive verifier exist.
 
-No genesis replay. No archive nodes. No trust assumption.
+**Future target:** a new node installs an immutable exact-height checkpoint snapshot only when:
+
+```text
+snapshot.height == recursive_proof.height
+snapshot.state_root == recursive_proof.acc.state_root
+```
+
+That future path also needs pinned snapshot generations, retained tail data, and a recursive verifier that proves the full block-verifier relation.
 
 ---
 
@@ -146,14 +145,14 @@ Both are single-transcript, bound into the per-tx STARK via `extra_transcript`. 
 └──────────────────────┬──────────────────────────────────────┘
                        │ wallet produces ↓
 ┌──────────────────────▼──────────────────────────────────────┐
-│  LogicProof  ·  stateless                                   │
-│  TxLogicAir: balance + range + ownership binding            │
+│  WalletAuthorizationBundle · stateless AuthGKR only          │
 │  AuthGKR Kill-Shot: proof-of-knowledge of spending secret preimage │
+│  TxLogicAir is rebuilt publicly by mempool/block code        │
 │  Stateless: no Merkle paths, no state_root dependency       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Stateless / stateful proof separation:** The LogicProof is created by the wallet — the only party that knows the spending secret. It is stateless and valid until the epoch anchor expires. The block producer creates the NativeDelta state transition proof from public transaction bodies and current state openings: the verifier reconstructs the canonical delta, checks the delta-MLE identity, and binds pre/post segment openings to `prev_state_root` and `new_state_root`. The claim bridge binds transaction bucket claims to the state-binding openings, so neither layer can lie independently.
+**Stateless / stateful proof separation:** The wallet authorization is created by the wallet, the only party that knows the spending secret. Public transaction validity is checked natively by mempool admission and then included in the canonical `BlockProof`. The block producer creates the NativeDelta state transition proof from public transaction bodies and current state openings: the verifier reconstructs the canonical delta, checks the delta-MLE identity, and binds pre/post segment openings to `prev_state_root` and `new_state_root`. The claim bridge binds transaction bucket claims to the state-binding openings, so neither layer can lie independently.
 
 ### Deferred FRI Aggregation
 
@@ -281,7 +280,7 @@ PoW in Paranoid has a single job: **ordering**. It picks the canonical sequence 
 - Spend outputs without knowing the spending secret
 - Fabricate a valid RecursiveProof (requires breaking the underlying soundness assumption)
 
-**Snapshot sync security:** new nodes verify the RecursiveProof and header anchor before accepting a snapshot. The manifest must describe strictly sorted segment IDs within the `u16` segment namespace, exact canonical segment encoding, and segment roots reconstructing the advertised `state_root`. Each received segment is bounded by `MAX_SEGMENT_BYTES = 8 MiB`, decoded, and root-checked before snapshot application; at most `MAX_INFLIGHT_SEGMENTS = 8` segment requests are in flight. A malicious peer cannot serve a fabricated snapshot without breaking the recursive proof or a segment-root check.
+**Snapshot sync status:** public arbitrary-peer snapshot sync is disabled fail-closed in FIX1. The previous lagging-proof mode did not prove the block interval between recursive proof height and snapshot tip. Trusted seed/bootstrap snapshots may be used only as an explicitly trusted operational shortcut. Trustless public snapshot sync returns only after immutable checkpoint generations and the real recursive verifier are implemented.
 
 **Replay protection:** `epoch_anchor` — a recent block hash committed inside the tx body hash and therefore inside all proofs. Transactions expire after ~144 blocks.
 
@@ -350,7 +349,7 @@ Selected block scaling rows (`cargo bench --bench block_scaling`, up to 100 tran
 
 PoW search and BlockProof generation run **in parallel**. Public Auth sidecars are stored only for the **last 18 blocks** (reorg window); `BlockProof` bytes are pruned once they are both finalized and consumed by the recursive updater.
 
-Full-block proofs do not accumulate on disk. What persists forever is the **RecursiveProof** (~43 KB encoded) — a single entry that is overwritten with each advance and proves the entire chain history from genesis.
+Full-block proofs do not accumulate on disk. What persists long-term is the latest **RecursiveProof** (~43 KB encoded), but in the current implementation it is not yet sufficient to enable trustless public snapshot sync.
 
 ---
 
@@ -360,7 +359,8 @@ Full-block proofs do not accumulate on disk. What persists forever is the **Recu
 
 ```
 --mode relay     Full node, no mining (default).
-                 Verifies all blocks, serves snapshots, relays txs.
+                 Verifies all blocks, serves recent block sync, relays txs.
+                 Public snapshot serving is disabled in FIX1.
                  Suitable for: exchanges, explorers, infrastructure.
 
 --mode miner     Internal PoW + BlockProof generator.
@@ -409,11 +409,11 @@ noid-extminer --rpc http://pool.example.com:9401 \
 
 Relay node syncs automatically on first start:
 1. Connects to peers
-2. Downloads the current state snapshot and RecursiveProof
-3. Verifies the proof cryptographically (O(1), a few milliseconds on the reference laptop)
-4. Applies the snapshot and begins receiving new blocks
+2. Syncs recent blocks when the gap is within retained recent history
+3. Verifies block proofs and state transitions normally
+4. If the gap is too large, fails closed instead of accepting an arbitrary peer snapshot
 
-No history download. No archive dependency.
+Public trustless snapshot bootstrap is a future feature, not enabled in FIX1.
 
 ### Local Development / Testing (3-node setup)
 
@@ -527,7 +527,7 @@ Chain layer
 Node layer
   noid_mempool       Async mempool: proof-verification admission gate (semaphore-bounded), fee floor
   noid_miner         Parallel PoW + BlockProof generation orchestrator
-  noid_p2p           libp2p: BlockGossipMsg, RecursiveProofGossipMsg, snapshot sync
+  noid_p2p           libp2p: BlockGossipMsg, RecursiveProofGossipMsg, recent-block sync; public snapshot sync disabled in FIX1
   noid_rpc           jsonrpsee JSON-RPC server
   noid_node          paranoid binary (relay / miner / extminer modes) + noid-cli binary
   noid_extminer      noid-extminer binary (external PoW worker)

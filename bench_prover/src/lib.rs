@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use noid_air::composition::tx_logic::{boundary_pins_from_body, witness_from_body, TxLogicAir};
-use noid_air::composition::SweepTxLogicAir;
+use noid_air::composition::{sweep_logic_air_and_trace_from_body, SweepTxLogicAir};
 use noid_air::Air;
 use noid_block::{
     assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
@@ -28,19 +28,16 @@ use noid_chain::state_binding::BlockStateBinding;
 use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_core::{Block128, TowerField};
+use noid_gkr::WalletAuthorizationBundle;
 use noid_gkr::{
-    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
-    AuthProofKillShot, AuthPublicInputs, SpineInputs, N_AUTH_INPUTS,
+    auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, prove_sweep_auth_killshot,
+    sweep_auth_gkr_channel, sweep_auth_inputs_from_body, sweep_spine_inputs_from_body,
+    verify_auth_killshot, verify_sweep_auth_killshot, AuthCircuit, AuthInputs, AuthProofKillShot,
+    AuthPublicInputs, SpineInputs, SweepAuthProofKillShot, N_AUTH_INPUTS,
 };
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
-use noid_stark::prove_logic::{prove_logic, verify_logic, LogicProof, LogicWitness};
-use noid_stark::prove_logic_sweep::{
-    prove_sweep_logic, sweep_logic_witness_parts_from_body, sweep_spine_inputs_from_body,
-    verify_sweep_logic, SweepLogicProof, SweepLogicWitness,
-};
-use noid_stark::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxBody, TxInput,
     TxOutput, TxShape, MAX_INPUTS, MAX_OUTPUTS,
@@ -88,13 +85,13 @@ pub struct SweepFixture {
 pub struct StandardWalletBench {
     pub prove_time: Duration,
     pub verify_time: Duration,
-    pub proof: LogicProof,
+    pub proof: AuthProofKillShot,
 }
 
 pub struct SweepWalletBench {
     pub prove_time: Duration,
     pub verify_time: Duration,
-    pub proof: SweepLogicProof,
+    pub proof: SweepAuthProofKillShot,
 }
 
 pub struct StandardBlockBench {
@@ -595,8 +592,11 @@ pub fn standard_fixture(scenario: BenchScenario) -> StandardFixture {
 
 pub fn sweep_fixture(scenario: BenchScenario) -> SweepFixture {
     assert_eq!(scenario.body.shape, TxShape::Sweep25x2);
-    let (air, trace, auth_inputs, spine_inputs) =
-        sweep_logic_witness_parts_from_body(&scenario.body);
+    let (air, trace) = sweep_logic_air_and_trace_from_body(&scenario.body);
+    let auth_inputs =
+        sweep_auth_inputs_from_body(&scenario.body).expect("sweep auth inputs from bench body");
+    let spine_inputs =
+        sweep_spine_inputs_from_body(&scenario.body).expect("sweep spine inputs from bench body");
     assert!(air.check(&trace), "sweep trace rejected by AIR");
     let auth_public = auth_inputs.to_public();
     let pi = public_inputs_for_body(&scenario.body);
@@ -1021,19 +1021,17 @@ pub fn bench_full_block_proof(
 }
 
 pub fn prove_standard_wallet(f: &StandardFixture, samples: usize) -> StandardWalletBench {
-    let witness = LogicWitness {
-        air: &f.air,
-        trace: &f.trace,
-        pi: &f.pi,
-        auth_inputs: &f.auth_inputs,
-    };
+    let circuit = AuthCircuit::build();
     let prove_time = time_median(samples, || {
-        let _ = prove_logic(&witness).expect("prove standard logic");
+        let mut ch = auth_gkr_channel();
+        let _ = prove_auth_killshot(&circuit, &f.auth_inputs, &mut ch);
     });
-    let proof = prove_logic(&witness).expect("prove standard logic");
+    let mut ch = auth_gkr_channel();
+    let (proof, _) = prove_auth_killshot(&circuit, &f.auth_inputs, &mut ch);
     let verify_time = time_median(samples, || {
-        verify_logic(&f.air, &f.pi, &f.spine_inputs, &f.auth_public, &proof)
-            .expect("verify standard logic");
+        let mut ch = auth_gkr_channel();
+        verify_auth_killshot(&proof, &circuit, &f.auth_public, &mut ch)
+            .expect("verify standard authorization");
     });
     StandardWalletBench {
         prove_time,
@@ -1043,19 +1041,17 @@ pub fn prove_standard_wallet(f: &StandardFixture, samples: usize) -> StandardWal
 }
 
 pub fn prove_sweep_wallet(f: &SweepFixture, samples: usize) -> SweepWalletBench {
-    let witness = SweepLogicWitness {
-        air: &f.air,
-        trace: &f.trace,
-        pi: &f.pi,
-        auth_inputs: &f.auth_inputs,
-    };
+    let circuit = noid_gkr::SweepAuthCircuit::build();
     let prove_time = time_median(samples, || {
-        let _ = prove_sweep_logic(&witness).expect("prove sweep logic");
+        let mut ch = sweep_auth_gkr_channel();
+        let _ = prove_sweep_auth_killshot(&circuit, &f.auth_inputs, &mut ch);
     });
-    let proof = prove_sweep_logic(&witness).expect("prove sweep logic");
+    let mut ch = sweep_auth_gkr_channel();
+    let (proof, _) = prove_sweep_auth_killshot(&circuit, &f.auth_inputs, &mut ch);
     let verify_time = time_median(samples, || {
-        verify_sweep_logic(&f.air, &f.pi, &f.spine_inputs, &f.auth_public, &proof)
-            .expect("verify sweep logic");
+        let mut ch = sweep_auth_gkr_channel();
+        verify_sweep_auth_killshot(&proof, &circuit, &f.auth_public, &mut ch)
+            .expect("verify sweep authorization");
     });
     SweepWalletBench {
         prove_time,
@@ -1064,18 +1060,15 @@ pub fn prove_sweep_wallet(f: &SweepFixture, samples: usize) -> SweepWalletBench 
     }
 }
 
-pub fn standard_bundle(f: &StandardFixture, proof: LogicProof) -> WalletProofBundle {
-    WalletProofBundle::Standard4x8(noid_stark::StandardWalletProofBundle {
-        logic_proof: proof,
-        auth_public: f.auth_public,
-    })
+pub fn standard_bundle(
+    _f: &StandardFixture,
+    proof: AuthProofKillShot,
+) -> WalletAuthorizationBundle {
+    WalletAuthorizationBundle::Standard4x8(proof)
 }
 
-pub fn sweep_bundle(f: &SweepFixture, proof: SweepLogicProof) -> WalletProofBundle {
-    WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
-        logic_proof: proof,
-        auth_public: f.auth_public,
-    })
+pub fn sweep_bundle(_f: &SweepFixture, proof: SweepAuthProofKillShot) -> WalletAuthorizationBundle {
+    WalletAuthorizationBundle::Sweep25x2(proof)
 }
 
 pub fn standard_block_witness<'a>(idx: u32, f: &'a StandardFixture) -> TxBlockWitness<'a> {
@@ -1093,7 +1086,7 @@ pub fn standard_block_witness<'a>(idx: u32, f: &'a StandardFixture) -> TxBlockWi
 pub fn owned_sweep_witness(
     idx: u32,
     f: &SweepFixture,
-    proof: SweepLogicProof,
+    proof: SweepAuthProofKillShot,
 ) -> OwnedSweepTxWitness {
     let bundle = sweep_bundle(f, proof);
     match build_tx_witness(idx, &f.scenario.body, &bundle, BENCH_LOG_SLOTS) {
@@ -1337,27 +1330,28 @@ pub fn bench_recursive_step(proof: &BlockProof) -> RecursiveStepBench {
     }
 }
 
-pub fn proof_size_standard(proof: &LogicProof) -> (usize, usize, usize) {
-    let total = proof.estimated_byte_len();
-    let auth = proof.auth.byte_len();
-    let stark = total - auth;
-    (total, stark, auth)
+pub fn proof_size_standard(proof: &AuthProofKillShot) -> (usize, usize, usize) {
+    let auth = proof.byte_len();
+    (auth, 0, auth)
 }
 
-pub fn proof_size_sweep(proof: &SweepLogicProof) -> (usize, usize, usize, usize) {
-    let total = proof.estimated_byte_len();
-    let auth = proof.auth.byte_len();
-    let wallet_spine = 0;
-    let stark = total - auth;
-    (total, stark, auth, wallet_spine)
+pub fn proof_size_sweep(proof: &SweepAuthProofKillShot) -> (usize, usize, usize, usize) {
+    let auth = proof.byte_len();
+    (auth, 0, auth, 0)
 }
 
-pub fn standard_wallet_bundle_size(f: &StandardFixture, proof: &LogicProof) -> usize {
-    standard_bundle(f, proof.clone()).to_bytes().len()
+pub fn standard_wallet_bundle_size(f: &StandardFixture, proof: &AuthProofKillShot) -> usize {
+    standard_bundle(f, proof.clone())
+        .to_bytes()
+        .expect("serialize standard authorization")
+        .len()
 }
 
-pub fn sweep_wallet_bundle_size(f: &SweepFixture, proof: &SweepLogicProof) -> usize {
-    sweep_bundle(f, proof.clone()).to_bytes().len()
+pub fn sweep_wallet_bundle_size(f: &SweepFixture, proof: &SweepAuthProofKillShot) -> usize {
+    sweep_bundle(f, proof.clone())
+        .to_bytes()
+        .expect("serialize sweep authorization")
+        .len()
 }
 
 pub fn live_counts(body: &TxBody) -> (usize, usize) {
@@ -1379,5 +1373,5 @@ pub fn block_tx_hash_body(body: &TxBody) -> TxBodyHash {
 }
 
 pub fn canonical_sweep_spine_inputs(body: &TxBody) -> noid_gkr::SweepSpineInputs {
-    sweep_spine_inputs_from_body(body)
+    sweep_spine_inputs_from_body(body).expect("canonical sweep spine inputs")
 }

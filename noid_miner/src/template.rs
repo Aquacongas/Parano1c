@@ -79,8 +79,8 @@ pub struct BlockTemplate {
     pub timestamp: u64,
     /// Parent header.
     pub parent: BlockHeader,
-    /// Cached WalletProofBundle bytes for each non-coinbase tx (same order as inner.txs).
-    pub proof_bytes: Vec<Option<Vec<u8>>>,
+    /// Cached WalletAuthorizationBundle bytes for each non-coinbase tx (same order as inner.txs).
+    pub authorization_bytes: Vec<Option<Vec<u8>>>,
     /// Pre-state segment columns for every segment touched by this block's transactions.
     /// Captured at template-build time (before `apply_block`), keyed by seg_id.
     /// Used by the BlockProof generator for FRI state openings.
@@ -233,16 +233,16 @@ impl TemplateBuilder {
         let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS - 1;
         let max_user_txs = max_user_txs.min(consensus_max);
         let entries = self.mempool.select_for_block(consensus_max).await;
-        // Single-pass: move proof bytes and transactions together (no clone).
-        let (proof_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
+        // Single-pass: move authorization bytes and transactions together (no clone).
+        let (authorization_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
             .into_iter()
-            .map(|e| (e.cached_algebraic_proof, e.tx))
+            .map(|e| (e.cached_authorization, e.tx))
             .unzip();
 
         // Filter out transactions whose epoch_anchor has expired since mempool
         // admission. Without this, the miner wastes proving time on txs that
         // will be rejected by peers during full block validation.
-        let (proof_bytes, txs): (Vec<_>, Vec<_>) = proof_bytes
+        let (authorization_bytes, txs): (Vec<_>, Vec<_>) = authorization_bytes
             .into_iter()
             .zip(txs)
             .filter(|(_, tx)| {
@@ -252,7 +252,7 @@ impl TemplateBuilder {
             .take(max_user_txs)
             .unzip();
         let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
-            proof_bytes
+            authorization_bytes
                 .into_iter()
                 .zip(txs.iter().map(|tx| tx.tx_body_hash))
                 .map(|(proof, hash)| (hash, proof))
@@ -292,7 +292,7 @@ impl TemplateBuilder {
                         .unwrap_or_else(|| SegmentColumns::new_zero(1usize << eff_log));
                     pre_segs.insert(seg_id, cols);
                 }
-                let proof_bytes = inner
+                let authorization_bytes = inner
                     .txs
                     .iter()
                     .map(|tx| proof_by_hash.remove(&tx.tx_body_hash).unwrap_or(None))
@@ -303,7 +303,7 @@ impl TemplateBuilder {
                     miner_address,
                     timestamp,
                     parent: parent.clone(),
-                    proof_bytes,
+                    authorization_bytes,
                     pre_segs,
                 })
             }

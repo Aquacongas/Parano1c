@@ -14,6 +14,7 @@ use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::fri_state::SlotValue;
 use crate::segmented_state::SegmentColumns;
+use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
 use crate::wire::BLOCK_HEADER_WIRE_SIZE;
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -313,6 +314,49 @@ pub fn decode_state_meta(bytes: &[u8]) -> Option<(u32, u64, u64)> {
     Some((log_slots, active, alloc))
 }
 
+// consensus_meta value:
+//   tip_height(u64) + tip_hash([u8;32]) + cumulative_chainwork([u8;32])
+//   + finalized_height(u64) + finalized_hash([u8;32]) = 112 bytes
+pub const ENCODED_CONSENSUS_META_BYTES: usize = 112;
+
+pub fn encode_consensus_meta(meta: &ConsensusMeta) -> [u8; ENCODED_CONSENSUS_META_BYTES] {
+    let mut out = [0u8; ENCODED_CONSENSUS_META_BYTES];
+    out[0..8].copy_from_slice(&meta.tip_height.to_le_bytes());
+    out[8..40].copy_from_slice(&meta.tip_hash);
+    out[40..72].copy_from_slice(&meta.cumulative_chainwork);
+    out[72..80].copy_from_slice(&meta.finalized.height.to_le_bytes());
+    out[80..112].copy_from_slice(&meta.finalized.hash);
+    out
+}
+
+pub fn decode_consensus_meta(bytes: &[u8]) -> Option<ConsensusMeta> {
+    if bytes.len() != ENCODED_CONSENSUS_META_BYTES {
+        return None;
+    }
+    let tip_height = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let tip_hash: [u8; 32] = bytes[8..40].try_into().ok()?;
+    let cumulative_chainwork: [u8; 32] = bytes[40..72].try_into().ok()?;
+    let finalized_height = u64::from_le_bytes(bytes[72..80].try_into().ok()?);
+    let finalized_hash: [u8; 32] = bytes[80..112].try_into().ok()?;
+    Some(ConsensusMeta {
+        tip_height,
+        tip_hash,
+        cumulative_chainwork,
+        finalized: FinalizedCheckpoint {
+            height: finalized_height,
+            hash: finalized_hash,
+        },
+    })
+}
+
+pub fn encode_chain_work(work: &[u8; 32]) -> [u8; 32] {
+    *work
+}
+
+pub fn decode_chain_work(bytes: &[u8]) -> Option<[u8; 32]> {
+    bytes.try_into().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -416,6 +460,23 @@ mod tests {
         assert_eq!(ls, 25);
         assert_eq!(active, 1234567);
         assert_eq!(alloc, 999999);
+    }
+
+    #[test]
+    fn consensus_meta_roundtrip() {
+        let meta = ConsensusMeta {
+            tip_height: 42,
+            tip_hash: [0xAA; 32],
+            cumulative_chainwork: [0xBB; 32],
+            finalized: FinalizedCheckpoint {
+                height: 24,
+                hash: [0xCC; 32],
+            },
+        };
+        let bytes = encode_consensus_meta(&meta);
+        assert_eq!(bytes.len(), ENCODED_CONSENSUS_META_BYTES);
+        assert_eq!(decode_consensus_meta(&bytes), Some(meta));
+        assert_eq!(decode_consensus_meta(&bytes[..111]), None);
     }
 
     #[test]

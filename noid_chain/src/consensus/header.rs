@@ -11,7 +11,7 @@
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     difficulty::next_target,
-    params::{ANCHOR_DEPTH, EPOCH_LENGTH, FINALITY_DEPTH, LOG_SLOTS_MAX},
+    params::{ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH, LOG_SLOTS_MAX},
     pow::{full_block_hash, validate_pow},
     timestamps::validate_timestamp,
     ConsensusError,
@@ -111,7 +111,7 @@ pub fn is_anchor_height_valid(tx_anchor_height: u64, block_height: u64) -> bool 
 
 /// Returns `true` if a block at `height` is considered final (cannot be reorged).
 pub fn is_final(block_height: u64, tip_height: u64) -> bool {
-    tip_height >= block_height + FINALITY_DEPTH
+    tip_height >= block_height + CONSENSUS_FINALITY_DEPTH
 }
 
 #[cfg(test)]

@@ -841,13 +841,11 @@ async fn main() -> anyhow::Result<()> {
 /// Validate PoW, header linkage, and cumulative chainwork of snapshot headers.
 ///
 /// Returns `(sorted_headers, Option<expected_chain_hash_at_proof_h>)`.
-/// `expected_chain_hash` is `Some` only when headers span from height 0 (genesis)
-/// so that `verify_tip` can check the full chain_hash from genesis.
+/// `expected_chain_hash` is `Some` only when headers span from height 0 (genesis).
 ///
-/// Security guarantee: if this returns `Ok`, the `state_root` values embedded in
-/// the returned headers are cryptographically committed to by real PoW work.
-/// A fabricated snapshot with fake state_roots would need to out-mine the real
-/// network to pass this check, making Eclipse attacks computationally infeasible.
+/// FIX1 note: public snapshot acceptance is fail-closed. Header PoW/linkage is
+/// necessary for future checkpoint snapshot verification, but it is not sufficient
+/// by itself to make arbitrary peer snapshots trustless.
 fn snapshot_chain_claim_from_header(
     header: &noid_chain::block_header::BlockHeader,
 ) -> noid_core::Block128 {
@@ -1056,9 +1054,10 @@ fn persist_snapshot_header_batch(
                 ));
             }
         } else {
-            store
-                .put_header_only(&hdr, &hash)
-                .map_err(|e| format!("header store write h={}: {e}", hdr.height))?;
+            return Err(format!(
+                "snapshot header h={} is not in canonical store; refusing to write candidate header into canonical DB",
+                hdr.height
+            ));
         }
 
         prev_hash = Some(hash);
@@ -1165,33 +1164,16 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 ) -> Result<(), String> {
     use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
     use noid_chain::consensus::pow::full_block_hash;
-    use noid_recursive::{verify_tip, RecursiveBlockAir, RecursiveBlockProof};
+    use noid_recursive::{verify_step_stark_only, RecursiveBlockProof};
 
     let proof: RecursiveBlockProof =
         bincode::deserialize(proof_bytes).map_err(|e| format!("proof deserialize: {e}"))?;
 
     let snap_tip_h = manifest.tip_height;
     let proof_h = proof.block_height;
-    if proof_h > snap_tip_h {
+    if proof_h != snap_tip_h {
         return Err(format!(
-            "recursive proof h={proof_h} is ahead of snapshot tip h={snap_tip_h}"
-        ));
-    }
-    let proof_lag = snap_tip_h.saturating_sub(proof_h);
-    // The recursive prover targets `tip - FINALITY_DEPTH`, but it runs
-    // asynchronously relative to mining and snapshot serving. In live operation
-    // a manifest can be served just before the prover persists the newest
-    // finalized step, so honest peers commonly appear one block behind the exact
-    // boundary. Keep the hard bound tight while allowing small scheduling jitter;
-    // stale proofs far behind the finality boundary are still rejected.
-    const SNAPSHOT_PROOF_LAG_GRACE: u64 = 2;
-    let max_snapshot_proof_lag =
-        noid_chain::consensus::params::FINALITY_DEPTH + SNAPSHOT_PROOF_LAG_GRACE;
-    if proof_lag > max_snapshot_proof_lag {
-        return Err(format!(
-            "recursive proof lag {proof_lag} exceeds max snapshot lag {max_snapshot_proof_lag} \
-             (FINALITY_DEPTH={} + grace={SNAPSHOT_PROOF_LAG_GRACE}) for snapshot tip h={snap_tip_h}",
-            noid_chain::consensus::params::FINALITY_DEPTH
+            "exact-height snapshot required: recursive proof h={proof_h}, manifest h={snap_tip_h}"
         ));
     }
 
@@ -1215,73 +1197,31 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 
     let expected_chain_hash = expected_chain_hash_from_header_store(store, proof_h, &genesis_acc)?;
 
-    if proof_h + 1 == snap_tip_h {
-        let tip_prev_state_root = if snap_tip_h == 0 {
-            genesis_state_root()
-        } else {
-            store
-                .get_header(snap_tip_h - 1)
-                .map_err(|e| format!("header store read h={}: {e}", snap_tip_h - 1))?
-                .ok_or_else(|| {
-                    format!(
-                        "missing stored header h={} for tip prev root",
-                        snap_tip_h - 1
-                    )
-                })?
-                .state_root
-        };
-        let rec_air_prev_root = if proof_h == 0 {
-            [0u8; 32]
-        } else {
-            store
-                .get_header(proof_h - 1)
-                .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
-                .ok_or_else(|| {
-                    format!("missing stored header h={} for recursive AIR", proof_h - 1)
-                })?
-                .state_root
-        };
-        let rec_air = RecursiveBlockAir::from_prev_state_root(&rec_air_prev_root);
-        verify_tip(
-            &proof,
-            &rec_air,
-            &tip_prev_state_root,
-            snap_tip_h,
-            &genesis_acc,
-            Some(&expected_chain_hash),
-        )
-        .map_err(|e| format!("chain-proof verify failed: {e:?}"))
+    let prev_root = if proof_h == 0 {
+        [0u8; 32]
     } else {
-        use noid_recursive::verify_step_stark_only;
+        store
+            .get_header(proof_h - 1)
+            .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
+            .ok_or_else(|| format!("missing stored header h={} for step proof", proof_h - 1))?
+            .state_root
+    };
+    let expected_new_root = tip_header.state_root;
 
-        let prev_root = if proof_h == 0 {
-            [0u8; 32]
-        } else {
-            store
-                .get_header(proof_h - 1)
-                .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
-                .ok_or_else(|| format!("missing stored header h={} for step proof", proof_h - 1))?
-                .state_root
-        };
-        let expected_new_root = store
-            .get_header(proof_h)
-            .map_err(|e| format!("header store read h={proof_h}: {e}"))?
-            .ok_or_else(|| format!("missing stored header h={proof_h} for step proof"))?
-            .state_root;
-
-        verify_step_stark_only(&proof, &prev_root, &expected_new_root)
-            .map_err(|e| format!("step-proof STARK failed at h={proof_h}: {e:?}"))?;
-        if proof.acc.chain_hash != expected_chain_hash {
-            return Err(format!("step-proof chain_hash mismatch at h={proof_h}"));
-        }
-        tracing::info!(
-            proof_h,
-            snap_tip_h,
-            proof_lag,
-            "snapshot: recursive proof verified at finality boundary"
-        );
-        Ok(())
+    verify_step_stark_only(&proof, &prev_root, &expected_new_root)
+        .map_err(|e| format!("exact-height recursive proof STARK failed at h={proof_h}: {e:?}"))?;
+    if proof.acc.state_root != expected_new_root {
+        return Err(format!(
+            "exact-height proof state_root mismatch at h={proof_h}"
+        ));
     }
+    if proof.acc.chain_hash != expected_chain_hash {
+        return Err(format!(
+            "exact-height proof chain_hash mismatch at h={proof_h}"
+        ));
+    }
+    tracing::info!(proof_h, "snapshot: exact-height recursive proof verified");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,8 +1517,8 @@ async fn handle_p2p_events(
 ) {
     // Orphan pool: blocks whose parent is not yet known.
     // When the parent arrives, we re-apply the orphan.
-    // Keyed by parent_hash, limited to FINALITY_DEPTH entries.
-    use noid_chain::consensus::params::FINALITY_DEPTH;
+    // Keyed by parent_hash, limited to CONSENSUS_FINALITY_DEPTH entries.
+    use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
     let mut orphan_pool: HashMap<[u8; 32], OrphanBlock> = HashMap::new();
 
@@ -1595,15 +1535,14 @@ async fn handle_p2p_events(
     // without replacing the pending entry.
     // --- Segmented state sync state ---
     //
-    // Sync flow:
-    //   1. PeerConnected + our_height==0 (fresh/corrupt) → RequestStateManifest
-    //      OR NewBlockAnnouncement with deep gap (> FINALITY_DEPTH) → RequestStateManifest
-    //   2. StateManifest received → collect candidates, select best, RequestRecursiveProof
-    //   3. RecursiveProof verified → RequestStateSegment for each segment_id
-    //   4. StateSegment responses → collect all → apply_state_snapshot
+    // Sync flow (FIX1):
+    //   1. Recent gaps (<= CONSENSUS_FINALITY_DEPTH) use SyncBlocksFrom and full
+    //      block/proof validation.
+    //   2. Deep gaps fail closed. Public arbitrary-peer snapshot sync is disabled
+    //      until immutable checkpoint generations and the real recursive verifier exist.
     //
     // Normal restart (state persisted): our_height > 0 → block-by-block sync
-    // for the gap (at most FINALITY_DEPTH blocks, typically 0-3).
+    // for recent gaps only.
     //
     // Eclipse mitigation: collect from up to 3 peers before selecting.
     // Recovery: any failure resets ALL state and clears requested_peers
@@ -1627,11 +1566,9 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
-    // A manifest can be either a lightweight tip probe (persisted-state catch-up)
-    // or an explicit snapshot recovery request (deep gap/fork/reorg). Only tip
-    // probes may downgrade to recent-block replay when peer_tip - our_tip is
-    // small; forced snapshot requests must continue through RecursiveProof +
-    // segment verification because height gap alone does not describe fork depth.
+    // Legacy marker for old forced snapshot attempts. In FIX1 public snapshot
+    // recovery is rejected fail-closed; tip probes may still downgrade to recent
+    // block replay when peer_tip - our_tip is small.
     let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Count of manifest responses received (including tip=0 "no state" replies).
@@ -1726,7 +1663,7 @@ async fn handle_p2p_events(
     //
     // Caps how many times we fetch further-back headers without finding a common
     // ancestor.  Each step covers 512 blocks, so 4 steps = 2048 blocks, well
-    // beyond FINALITY_DEPTH=18.  If the limit is hit we request a full state
+    // beyond CONSENSUS_FINALITY_DEPTH=18.  If the limit is hit we request a full state
     // snapshot instead (the designed deep-sync mechanism).
     let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
     const MAX_FETCH_DEPTH: u32 = 4;
@@ -1801,29 +1738,13 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if height > our_height + noid_chain::consensus::params::FINALITY_DEPTH {
-                    // Peer is far ahead: we can't catch up block-by-block since
-                    // intermediate blocks are pruned (proof-native statechain).
-                    // Go straight to state manifest sync after the compact header's
-                    // self-hash has been checked.
-                    if pending_manifest.is_none() && pending_segment_ids.is_empty() && segment_queue.is_empty() {
-                        if !manifest_requested_peers.contains(&from) {
-                            tracing::info!(
-                                their_height = height,
-                                our_height,
-                                peer = %from,
-                                "deep gap — requesting state manifest directly"
-                            );
-                            manifest_requested_peers.insert(from);
-                            manifest_force_snapshot_peers.insert(from);
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                    peer: from,
-                                    requester_height: our_height,
-                                })
-                                .await;
-                        }
-                    }
+                if height > our_height + noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH {
+                    tracing::warn!(
+                        their_height = height,
+                        our_height,
+                        peer = %from,
+                        "deep gap beyond consensus finality — public snapshot sync disabled; fail closed"
+                    );
                 } else if height == our_height + 1 {
                     let precheck = {
                         let ctx = chain.read().await;
@@ -2253,28 +2174,14 @@ async fn handle_p2p_events(
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(err = ?e, "reorg failed, keeping current chain");
-                                                    // Reorg failure means our state diverged from the canonical
-                                                    // chain in a way that block-by-block recovery can't fix.
-                                                    // On a proof-native statechain the correct recovery is
-                                                    // O(1) snapshot sync, not attempting more block replays.
-                                                    if pending_manifest.is_none()
-                                                        && pending_segment_ids.is_empty()
-                                                        && segment_queue.is_empty()
-                                                        && !manifest_requested_peers.contains(&from)
-                                                    {
-                                                        tracing::info!(
-                                                            peer = %from,
-                                                            "reorg failed — requesting state manifest for recovery"
-                                                        );
-                                                        manifest_requested_peers.insert(from);
-                                                        manifest_force_snapshot_peers.insert(from);
-                                                        let _ = p2p_cmd
-                                                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                                                peer: from,
-                                                                requester_height: 0,
-                                                            })
-                                                            .await;
-                                                    }
+                                                    // Reorg failure means block-by-block recovery could not
+                                                    // safely converge. Public arbitrary-peer snapshot recovery is
+                                                    // disabled in FIX1, so fail closed and wait for operator/trusted
+                                                    // bootstrap rather than accepting peer state.
+                                                    tracing::warn!(
+                                                        peer = %from,
+                                                        "reorg failed — public snapshot recovery disabled; fail closed"
+                                                    );
                                                 }
                                             }
                                         } else {
@@ -2301,17 +2208,15 @@ async fn handle_p2p_events(
                                     None => {
                                         // Parent NOT in our chain.
                                         //
-                                        // Heuristic: if the competing block is clearly deeper than our finality
-                                        // window, skip FetchHeaders entirely and request a snapshot directly.
-                                        // Paranoid's O(1) snapshot sync (snapshot + RecursiveProof) is correct
-                                        // regardless of fork depth, and is faster than N round-trips of block
-                                        // fetching for deep forks where peers may no longer have the old blocks.
+                                        // If the competing block is clearly deeper than our finality window,
+                                        // block-by-block reorg is not safe/available. Public snapshot recovery is
+                                        // disabled in FIX1, so deep forks fail closed instead of requesting peer state.
                                         //
-                                        // FetchHeaders is only worth doing for shallow forks (within FINALITY_DEPTH)
+                                        // FetchHeaders is only worth doing for shallow forks (within CONSENSUS_FINALITY_DEPTH)
                                         // where block-by-block reorg is possible.
                                         let block_height = block.header.height;
                                         let is_deep_fork = block_height > our_tip_height
-                                            && (block_height - our_tip_height) > FINALITY_DEPTH;
+                                            && (block_height - our_tip_height) > CONSENSUS_FINALITY_DEPTH;
 
                                         insert_orphan(
                                             &mut orphan_pool,
@@ -2323,36 +2228,20 @@ async fn handle_p2p_events(
                                         );
 
                                         if is_deep_fork {
-                                            // Deep fork: O(1) snapshot sync is faster and correct.
-                                            // Guard: don't re-request if already syncing or asked this peer.
-                                            if pending_manifest.is_none()
-                                                && pending_segment_ids.is_empty()
-                                                && segment_queue.is_empty()
-                                                && !manifest_requested_peers.contains(&from)
-                                            {
-                                                tracing::info!(
-                                                    our_tip = our_tip_height,
-                                                    their_tip = block_height,
-                                                    gap = block_height - our_tip_height,
-                                                    peer = %from,
-                                                    "deep fork (gap > FINALITY_DEPTH) — requesting manifest directly"
-                                                );
-                                                manifest_requested_peers.insert(from);
-                                                manifest_force_snapshot_peers.insert(from);
-                                                let _ = p2p_cmd
-                                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                                        peer: from,
-                                                        requester_height: our_tip_height,
-                                                    })
-                                                    .await;
-                                            }
+                                            tracing::warn!(
+                                                our_tip = our_tip_height,
+                                                their_tip = block_height,
+                                                gap = block_height - our_tip_height,
+                                                peer = %from,
+                                                "deep fork beyond consensus finality — public snapshot sync disabled; fail closed"
+                                            );
                                         } else {
                                             // Shallow fork: fetch batch headers to find common ancestor.
                                             // Guard: only one outstanding FetchHeaders per peer at a time,
                                             // plus a short dedup window for the same request tuple.
                                             let fetch_from =
-                                                our_tip_height.saturating_sub(FINALITY_DEPTH);
-                                            let fetch_count = (FINALITY_DEPTH as u16 * 2).min(512);
+                                                our_tip_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+                                            let fetch_count = (CONSENSUS_FINALITY_DEPTH as u16 * 2).min(512);
                                             let fetch_key = (from, fetch_from, fetch_count);
                                             let recently_requested = recent_header_fetches
                                                 .get(&fetch_key)
@@ -2460,7 +2349,7 @@ async fn handle_p2p_events(
 
                 // Per-peer rate limiting: enforce before any further processing.
                 // This check is synchronous (O(1) HashMap lookup) so the event loop
-                // is not blocked; the heavy LogicProof verification is spawned below.
+                // is not blocked; the heavy AuthGKR authorization verification is spawned below.
                 {
                     let now = Instant::now();
                     let entry = peer_tx_rate.entry(from.clone()).or_insert((0, now));
@@ -2481,9 +2370,9 @@ async fn handle_p2p_events(
                     peer_tx_rate.retain(|_, (_, window_start)| *window_start >= cutoff);
                 }
 
-                // Spawn LogicProof verification + mempool admit as a background task.
+                // Spawn AuthGKR authorization verification + mempool admit as a background task.
                 //
-                // WHY: `mempool.submit()` runs a LogicProof verification (~84ms, CPU-bound via
+                // WHY: `mempool.submit()` runs an AuthGKR authorization verification (~84ms, CPU-bound via
                 // spawn_blocking) under an async semaphore. If we await it here, the
                 // entire P2P event loop stalls for 84ms — delaying block propagation.
                 //
@@ -2543,8 +2432,8 @@ async fn handle_p2p_events(
                     // Already have persisted state. First ask for a tiny manifest
                     // as a peer-tip probe; the StateManifest handler chooses the
                     // correct sync path from the measured gap:
-                    //   gap <= FINALITY_DEPTH  -> recent block replay;
-                    //   gap >  FINALITY_DEPTH  -> proof-verified state snapshot.
+                    //   gap <= CONSENSUS_FINALITY_DEPTH  -> recent block replay;
+                    //   gap >  CONSENSUS_FINALITY_DEPTH  -> proof-verified state snapshot.
                     // This prevents stale nodes from blindly replaying a near-pruned
                     // window before discovering they needed snapshot sync.
                     p2p_cmd
@@ -2671,34 +2560,7 @@ async fn handle_p2p_events(
                         .unwrap_or(ancestor_height);
 
                     if new_tip_height > our_tip {
-                        use noid_chain::consensus::params::FINALITY_DEPTH;
-
-                        let snapshot_catchup_depth = FINALITY_DEPTH.saturating_sub(1) as usize;
-                        if competing.len() >= snapshot_catchup_depth {
-                            // Near-finality catch-up is cheaper and less failure-prone through
-                            // the snapshot path. Active peers may advance while header batches are
-                            // in flight, so a 17-block observed gap can already be 18+ by the time
-                            // block requests complete. Snapshot verification remains fully anchored
-                            // by PoW headers, recursive proof, and segment roots.
-                            tracing::info!(
-                                ancestor = ancestor_height,
-                                our_tip,
-                                competing_tip = new_tip_height,
-                                blocks_needed = competing.len(),
-                                snapshot_catchup_depth,
-                                peer = %from,
-                                "fork near finality window — requesting snapshot (O(1) Paranoid sync)"
-                            );
-                            manifest_requested_peers.insert(from);
-                            manifest_force_snapshot_peers.insert(from);
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                    peer: from,
-                                    requester_height: our_tip,
-                                })
-                                .await;
-                        } else {
-                            // Shallow fork (≤ FINALITY_DEPTH): apply_reorg_mdbx can handle it.
+                            // Shallow fork (≤ CONSENSUS_FINALITY_DEPTH): apply_reorg_mdbx can handle it.
                             // Fetch individual blocks; they arrive quickly and the orphan
                             // pool assembles them into a chain for the reorg comparison.
                             tracing::info!(
@@ -2751,7 +2613,6 @@ async fn handle_p2p_events(
                                     })
                                     .await;
                             }
-                        }
                     } else {
                         tracing::debug!(
                             our_tip,
@@ -2769,17 +2630,9 @@ async fn handle_p2p_events(
                             tracing::warn!(
                                 peer = %from,
                                 depth = *depth,
-                                "FetchHeaders depth limit reached — requesting state snapshot instead"
+                                "FetchHeaders depth limit reached — public snapshot sync disabled; fail closed"
                             );
                             *depth = 0; // reset for next time
-                            manifest_requested_peers.insert(from);
-                            manifest_force_snapshot_peers.insert(from);
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                    peer: from,
-                                    requester_height: 0,
-                                })
-                                .await;
                         } else {
                             *depth += 1;
                             let fetch_from = oldest.saturating_sub(512);
@@ -2875,43 +2728,45 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         ctx.tip_height()
                     };
-                    if our_height > 0 && !force_snapshot {
-                        if manifest.tip_height <= our_height {
-                            tracing::debug!(
-                                from = %from,
-                                our_height,
-                                peer_tip = manifest.tip_height,
-                                "manifest tip probe not ahead"
-                            );
-                            continue;
-                        }
-                        let gap = manifest.tip_height - our_height;
-                        if gap <= FINALITY_DEPTH {
-                            tracing::info!(
-                                from = %from,
-                                our_height,
-                                peer_tip = manifest.tip_height,
-                                gap,
-                                "manifest tip within finality — requesting recent blocks"
-                            );
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                    peer: from,
-                                    from_height: our_height + 1,
-                                    count: gap as u16,
-                                })
-                                .await;
-                            continue;
-                        }
-                    } else if force_snapshot {
+                    if manifest.tip_height <= our_height && !force_snapshot {
+                        tracing::debug!(
+                            from = %from,
+                            our_height,
+                            peer_tip = manifest.tip_height,
+                            "manifest tip probe not ahead"
+                        );
+                        continue;
+                    }
+
+                    let gap = manifest.tip_height.saturating_sub(our_height);
+                    if !force_snapshot && gap <= CONSENSUS_FINALITY_DEPTH {
                         tracing::info!(
                             from = %from,
                             our_height,
                             peer_tip = manifest.tip_height,
-                            "forced snapshot manifest — bypassing recent-block shortcut"
+                            gap,
+                            "manifest tip within finality — requesting recent blocks"
                         );
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                peer: from,
+                                from_height: our_height + 1,
+                                count: gap as u16,
+                            })
+                            .await;
+                        continue;
                     }
+
+                    tracing::warn!(
+                        from = %from,
+                        our_height,
+                        peer_tip = manifest.tip_height,
+                        gap,
+                        force_snapshot,
+                        "REJECTED state manifest: public snapshot sync disabled until immutable checkpoint generation"
+                    );
                     manifest_requested_peers.insert(from);
+                    continue;
                 }
 
                 if manifest.tip_height > 0 && pending_manifest.is_some() {
@@ -3119,21 +2974,13 @@ async fn handle_p2p_events(
                             let ctx = chain.read().await;
                             ctx.tip_height()
                         };
-                        tracing::info!(
+                        tracing::warn!(
                             from = %from,
                             segment = response.segment_id,
                             requester_height,
-                            "snapshot segment unavailable or stale; requesting fresh manifest"
+                            "snapshot segment unavailable or stale — public snapshot sync disabled; fail closed"
                         );
                         reset_sync_state!();
-                        manifest_requested_peers.insert(from);
-                        manifest_force_snapshot_peers.insert(from);
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                peer: from,
-                                requester_height,
-                            })
-                            .await;
                         continue;
                     }
 
@@ -3246,7 +3093,7 @@ async fn handle_p2p_events(
                                         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                                             peer: from,
                                             from_height: new_height + 1,
-                                            count: noid_chain::consensus::params::FINALITY_DEPTH
+                                            count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
                                                 as u16,
                                         })
                                         .await;
@@ -3504,7 +3351,7 @@ async fn handle_p2p_events(
                                             .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                                                 peer: from,
                                                 from_height: new_height + 1,
-                                                count: noid_chain::consensus::params::FINALITY_DEPTH
+                                                count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
                                                     as u16,
                                             })
                                             .await;
@@ -3888,7 +3735,7 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 ///
 /// ## Design
 ///
-/// - Advances only for **finalised** blocks (>= FINALITY_DEPTH behind tip)
+/// - Advances only for **finalised** blocks (>= CONSENSUS_FINALITY_DEPTH behind tip)
 ///   so reorgs never invalidate a stored proof.
 /// - Blocks with no real BlockProof (coinbase-only) use a null witness — the
 ///   chain-hash accumulator still advances correctly.
@@ -3899,7 +3746,7 @@ async fn run_recursive_proof_updater(
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) {
     use noid_block::{witness_builder::block_proof_to_replay_witness, BlockProof};
-    use noid_chain::consensus::params::FINALITY_DEPTH;
+    use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use noid_recursive::{
         null_block_replay_witness, prove_genesis_recursive, prove_recursive_step,
         verify_step_stark_only, RecursiveBlockProof,
@@ -3938,12 +3785,12 @@ async fn run_recursive_proof_updater(
             Some(h) => h + 1,
         };
 
-        // Only prove blocks that are finalised (FINALITY_DEPTH behind tip).
+        // Only prove blocks that are finalised (CONSENSUS_FINALITY_DEPTH behind tip).
         // This guarantees a reorg can never invalidate the stored proof.
-        let finalized_tip = tip.saturating_sub(FINALITY_DEPTH);
+        let finalized_tip = tip.saturating_sub(CONSENSUS_FINALITY_DEPTH);
         if next_height > finalized_tip {
             let lag = tip.saturating_sub(rec_height_opt.unwrap_or(0));
-            if lag > FINALITY_DEPTH {
+            if lag > CONSENSUS_FINALITY_DEPTH {
                 tracing::warn!(
                     lag,
                     tip,
@@ -3951,7 +3798,7 @@ async fn run_recursive_proof_updater(
                     "recursive proof DEGRADED — {lag} blocks behind finality boundary"
                 );
             } else {
-                // Normal: tracking finality boundary (lag ≈ FINALITY_DEPTH)
+                // Normal: tracking finality boundary (lag ≈ CONSENSUS_FINALITY_DEPTH)
                 tracing::debug!(
                     lag,
                     tip,

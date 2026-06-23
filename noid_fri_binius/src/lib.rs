@@ -29,13 +29,10 @@
 //! | Gamma batching | (n-1)/2^128 (Horner RLC) |
 //! | Compact FRI | 64 queries * 2 bits = 128-bit proven |
 
-pub mod batched_open;
 pub mod compact_fri;
 pub mod interleaved_commit;
 pub mod mixed_open;
-pub mod verify;
 
-pub use batched_open::{prove_batched_opening, BatchedOpeningProof};
 pub use compact_fri::{CompactEvalProof, COMPACT_NUM_QUERIES, COMPACT_TAU};
 pub use interleaved_commit::{
     absorb_cap, interleaved_commit, InterleavedCommitment, InterleavedProverState, MerkleCap,
@@ -43,7 +40,6 @@ pub use interleaved_commit::{
 pub use mixed_open::{
     prove_mixed_opening, verify_mixed_opening, EvalClaim, MixedOpeningProof, SourceBindingProof,
 };
-pub use verify::verify_batched_opening;
 
 /// Top levels of Merkle tree stored in the cap commitment.
 /// 2^5 = 32 hash nodes at cap level.

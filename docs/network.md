@@ -201,7 +201,7 @@ Any wallet or node can verify a receipt against stored headers:
 
 3. **What this proves**:
    - **Inclusion**: the tx was in block N (Merkle path to tx_root)
-   - **Validity**: the tx's `LogicProof` was verified at inclusion (header's
+   - **Validity**: the tx authorization was verified before admission and the block's canonical TxLogic proof was verified at inclusion (header's
      `proof_transcript_hash` commits to the BlockProof)
    - **Finality**: the block had real PoW cost (nonce + difficulty in header)
 
@@ -213,83 +213,47 @@ cannot produce a valid BlockProof, so it cannot enter a block's tx_root.
 
 ## Synchronisation
 
-Two sync modes only:
-1. **Snapshot sync** (gap > 18 blocks or fresh node): download authenticated current state + recursive proof, verify, done.
-2. **Block-by-block** (gap <= 18 blocks): apply recent blocks with full proof verification.
+FIX1 status: public arbitrary-peer snapshot sync is **disabled / fail-closed**.
 
-There is no third option. A node never "catches up" hundreds of blocks one
-by one. If it's behind by more than 18 blocks, it gets a fresh snapshot.
+Active trustless sync path today:
+
+1. **Block-by-block recent sync** for gaps within `CONSENSUS_FINALITY_DEPTH`: download recent blocks, verify PoW/header rules, full `BlockProof`, Auth sidecars, and state transition.
+2. **Local restart from MDBX**: resume from persisted state, exact cumulative chainwork, and persisted `FinalizedCheckpoint`.
+
+If a node is behind beyond recent block retention, it must not accept an arbitrary peer snapshot. Recovery is currently an operator/trusted-seed/bootstrap procedure until immutable checkpoint snapshot generations and the real recursive verifier are implemented.
+
+Future public snapshot sync must be exact-height checkpoint based:
+
+```text
+snapshot.height == recursive_proof.height
+snapshot.state_root == recursive_proof.acc.state_root
+```
+
+No proof-lag mode is allowed. A server must advertise only immutable generations that pin checkpoint height/hash/root, segment set, recursive proof, nullifier window, and retained tail data.
 
 ### Flow A: Fresh Node Joins Network
 
+```text
+New node connects to peers.
+  - If peer height is within recent retention, request and verify blocks from genesis/current tip.
+  - If the gap exceeds recent retention, public snapshot bootstrap is rejected fail-closed.
+  - Operator may use an explicitly trusted seed/bootstrap artifact until checkpoint generations exist.
 ```
-New Node                         Peers (up to 3 queried)
-   |
-   | 1. Connect to seeds, discover peers via Kademlia DHT
-   |
-   |--- GetStateManifest -------> Peer 1, 2, 3  (eclipse mitigation)
-   |<-- manifests (tip_height, segment_ids, headers, nullifiers)
-   |
-   | 2. Select best manifest (highest tip with valid PoW chainwork)
-   |    Reject if chainwork does not strictly exceed MIN_SNAPSHOT_CHAINWORK
-   |
-   |--- GetRecursiveProof ------> Best peer
-   |<-- RecursiveProof (~43 KB encoded)
-   |
-   | 3. Verify the recursive proof and header anchor:
-   |    - STARK verify: O(1), a few milliseconds
-   |    - proof height <= snapshot tip
-   |    - proof lag <= FINALITY_DEPTH + 2
-   |    - proof state root matches the corresponding stored header root
-   |    - manifest segment-root table reconstructs the snapshot tip state_root
-   |    If verification fails: reject this peer, try next candidate.
-   |    A forged RecursiveProof CANNOT pass STARK verification.
-   |
-   |--- GetStateSegment x N ----> Best peer (8 parallel, ~3 MB each)
-   |<-- segments
-   |
-   | 4. Apply snapshot:
-   |    - Load segments into MDBX
-   |    - Load recent headers (for ASERT, median timestamps)
-   |    - Load nullifiers (for ANCHOR_DEPTH window)
-   |    - Store the peer's RecursiveProof (updater continues from here)
-   |    - Wallet: background scan for owned UTXOs
-   |
-   |--- SyncBlocksFrom(tip+1) --> Any peer  (catch up finality window)
-   |<-- blocks with proofs
-   |
-   | 5. Normal operation: gossip blocks and txs
-```
-
-**Total sync time: 1-2 seconds** for typical state sizes (tested: node syncs
-from h=0 to h=21 in ~1s including proof verification of all received blocks).
 
 ### Flow B: Node Restarts (Has State)
 
+```text
+Node restarts. Reads MDBX ConsensusMeta. tip = h=N.
+  - Verify local state_root against the persisted tip header.
+  - Restore exact cumulative_chainwork from T_CHAIN_WORK.
+  - Restore non-optional FinalizedCheckpoint.
+  - If slightly behind (<= CONSENSUS_FINALITY_DEPTH): SyncBlocksFrom(N+1).
+  - If far behind: fail closed; do not accept arbitrary peer snapshot.
 ```
-Node restarts. Reads MDBX. tip = h=N.
-  - If tip timestamp is within 3 minutes of wall clock:
-      sync_ready immediately, wait for gossip
-  - If slightly behind (<=18 blocks):
-      SyncBlocksFrom(N+1) -- download and verify each block
-  - If far behind (>18 blocks):
-      same as Flow A (snapshot sync)
-```
 
-No special "recovery mode". Same logic as a fresh node with gap detection.
+### Flow C: Node Behind > CONSENSUS_FINALITY_DEPTH
 
-### Flow C: Node Behind > 18 Blocks
-
-If a node was offline for 2 hours (~480 blocks), it does NOT replay them:
-
-1. Recent block bodies are retained only for the finality window; deep replay is not the sync path.
-2. The node requests a fresh state snapshot + RecursiveProof from peers.
-3. Verifies the RecursiveProof (STARK, a few milliseconds). Done.
-4. Overwrites stale local state. Recursive updater continues from here.
-
-This is safe because the RecursiveProof is unforgeable (~2^-120), the
-state_root is committed in the proof, and snapshot headers have valid PoW
-with cumulative chainwork above threshold.
+A node that is beyond recent block availability cannot automatically recover from arbitrary peers in FIX1. This is intentional: the previous lagging-recursive-proof snapshot path did not prove the skipped interval and is disabled until the checkpoint-generation and recursive-verifier work lands.
 
 ### Flow D: Shallow Reorg (<=18 blocks)
 
@@ -411,23 +375,25 @@ When a transaction arrives via gossip, BEFORE entering the mempool:
 | 7 | No slot conflicts with existing mempool txs | Double-spend |
 | 8 | Input slots exist in state with matching value + owner | Liveness |
 | 9 | Output slots are EMPTY in state | Availability |
-| 10 | LogicProof verification in a semaphore-bounded `spawn_blocking` worker | Proof validity without holding the mempool lock |
+| 10 | AuthGKR authorization verification in a semaphore-bounded `spawn_blocking` worker | Proof validity without holding the mempool lock |
 
-The implementation first runs checks 0–9 as a cheap pre-filter, then verifies the LogicProof outside the lock, then reacquires the lock and reruns the cheap checks against the current chain/mempool view before final insertion. `TxAdmitted`/gossip is emitted only after this final admission; invalid proofs never enter the admitted pool and are not gossiped as accepted transactions.
+The implementation first runs checks 0–9 as a cheap pre-filter, then verifies the wallet authorization outside the lock, then reacquires the lock and reruns the cheap checks against the current chain/mempool view before final insertion. `TxAdmitted`/gossip is emitted only after this final admission; invalid authorizations never enter the admitted pool and are not gossiped as accepted transactions.
 
-### Recursive Proof Verification (On Snapshot Sync)
+### Recursive Proof Verification (Future Snapshot Sync)
 
-When receiving a RecursiveProof from a peer during snapshot sync:
+FIX1 disables public arbitrary-peer snapshot sync. The old lag mode is not accepted.
+
+Future checkpoint snapshot verification must require:
 
 | Check | Purpose |
 |-------|---------|
 | proof bytes non-empty and <=64 KiB | DoS prevention |
-| STARK verify passes (RecursiveBlockAir, ~5ms) | Proof validity |
-| proof height <= snapshot tip and lag <= FINALITY_DEPTH + 2 | Freshness |
-| proof state root matches the corresponding header root | State binding |
-| manifest segment roots reconstruct the snapshot tip state root | Snapshot binding |
+| `manifest.height == recursive_proof.height` | No unverified proof-to-snapshot gap |
+| `manifest.state_root == recursive_proof.acc.state_root` | Exact state binding |
+| manifest segment roots reconstruct the checkpoint `state_root` | Snapshot binding |
 | chain_hash matches the header-derived chain hash | Chain integrity |
-| PoW chainwork of snapshot headers strictly exceeds MIN_SNAPSHOT_CHAINWORK | Eclipse resistance |
+| checkpoint preserves local finalized prefix | Hard-finality compatibility |
+| retained tail data is complete for `checkpoint+1..tail_tip` | Safe catch-up after install |
 
 ---
 
@@ -628,19 +594,16 @@ Every node eventually produces the same recursive proof as the miner for finaliz
 
 ## Eclipse Resistance
 
-Snapshot sync is the only "trust point". Defenses:
+Public snapshot sync is currently not a trustless path. FIX1 fails closed instead of accepting arbitrary peer state.
+
+Active eclipse defenses today:
 
 | Defense | How It Works |
 |---------|-------------|
-| Multi-peer manifest | Query up to 3 peers, select best by height |
-| PoW chainwork threshold | Snapshot headers must have cumulative work strictly above MIN_SNAPSHOT_CHAINWORK |
-| STARK unforgeable | RecursiveProof verification at ~2^-120 soundness |
-| State root pinned in proof | proof state root must match the corresponding stored header root |
-| Manifest state-root binding | Sparse segment-root table must reconstruct the snapshot tip state_root |
-| Header PoW verified | Each header in the snapshot has valid Blake3 PoW |
-
-Even if ALL peers are adversarial, they cannot forge a valid snapshot: producing
-a RecursiveProof for a fake state requires breaking the transparent proof system's soundness; producing headers with sufficient chainwork requires actually performing the PoW.
+| Recent block validation | Blocks are accepted only after header/PoW checks, full `BlockProof`, Auth sidecar, and state-transition verification |
+| Exact cumulative chainwork | Restart and reorg use persisted exact chainwork, never genesis-target approximation |
+| Persisted hard finality | Fork/reorg candidates must preserve the non-optional finalized checkpoint |
+| Snapshot fail-closed | Deep gaps do not accept peer state until immutable checkpoint generations and full recursion exist |
 
 ---
 

@@ -848,8 +848,8 @@ async fn handle_swarm_event(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
-    segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
-    segment_encode_semaphore: &Arc<Semaphore>,
+    _segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
+    _segment_encode_semaphore: &Arc<Semaphore>,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
         (Multiaddr, tokio::time::Instant, u32),
@@ -1394,8 +1394,10 @@ async fn handle_swarm_event(
 
         // --- State sync: manifest server (step 1) ---
         //
-        // Serves metadata + active segment IDs.  Tiny response (~few KB).
-        // Client uses this to know which segments to request next.
+        // FIX1 fail-closed policy: public arbitrary-peer state snapshots are not
+        // served until immutable checkpoint generations and the real recursive
+        // verifier exist. Recent block sync remains available through the
+        // GetRecentBlock path.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message:
@@ -1405,107 +1407,21 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            use noid_chain::consensus::params::ANCHOR_DEPTH;
-            let manifest = {
-                let mut ctx = chain.write().await;
-                let tip_h = ctx.tip_height();
-                if tip_h == 0 || tip_h <= request.requester_height {
-                    GetStateManifestResponse::default()
-                } else {
-                    let eff_log = ctx.state.state.effective_log_segment_size() as u8;
-                    let segment_ids: Vec<u16> = ctx.state.state.active_segment_ids().collect();
-                    let snapshot_caps_ok = match encoded_segment_len_for_eff_log(eff_log) {
-                        Some(expected_segment_bytes)
-                            if expected_segment_bytes <= MAX_SEGMENT_BYTES
-                                && segment_ids.len() <= MAX_SNAPSHOT_MANIFEST_SEGMENTS =>
-                        {
-                            true
-                        }
-                        Some(expected_segment_bytes)
-                            if expected_segment_bytes <= MAX_SEGMENT_BYTES =>
-                        {
-                            tracing::warn!(
-                                segments = segment_ids.len(),
-                                max_segments = MAX_SNAPSHOT_MANIFEST_SEGMENTS,
-                                "state manifest not served: snapshot manifest segment cap exceeded"
-                            );
-                            false
-                        }
-                        Some(expected_segment_bytes) => {
-                            tracing::warn!(
-                                eff_log,
-                                expected_segment_bytes,
-                                max_segment = MAX_SEGMENT_BYTES,
-                                "state manifest not served: segment encoding exceeds per-segment cap"
-                            );
-                            false
-                        }
-                        None => {
-                            tracing::warn!(
-                                eff_log,
-                                "state manifest not served: invalid effective segment log"
-                            );
-                            false
-                        }
-                    };
-                    if !snapshot_caps_ok {
-                        GetStateManifestResponse::default()
-                    } else {
-                        let segment_roots: Vec<[u8; 32]> = segment_ids
-                            .iter()
-                            .map(|&seg_id| ctx.state.state.seg_root(seg_id))
-                            .collect();
-                        let header_start = tip_h.saturating_sub(154);
-                        let recent_headers = (header_start..=tip_h)
-                            .filter_map(|h| {
-                                ctx.recent_headers
-                                    .get(&h)
-                                    .cloned()
-                                    .or_else(|| ctx.get_header_from_store(h).ok().flatten())
-                            })
-                            .map(|hdr| {
-                                let mut b = Vec::new();
-                                hdr.encode(&mut b);
-                                b
-                            })
-                            .collect();
-                        let null_start = tip_h.saturating_sub(ANCHOR_DEPTH - 1);
-                        let nullifier_blocks = (null_start..=tip_h)
-                            .map(|h| {
-                                ctx.store
-                                    .get_undo_log(h)
-                                    .ok()
-                                    .flatten()
-                                    .map(|u| u.tx_hashes.iter().map(|t| t.0).collect())
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        let tip_hdr = ctx.tip_header().clone();
-                        tracing::info!(
-                            requester_height = request.requester_height,
-                            our_height = tip_h,
-                            segments = segment_ids.len(),
-                            "serving state manifest"
-                        );
-                        GetStateManifestResponse {
-                            tip_height: tip_h,
-                            tip_hash: noid_chain::consensus::pow::full_block_hash(&tip_hdr),
-                            log_slots: tip_hdr.log_slots,
-                            active_slot_count: tip_hdr.active_slot_count,
-                            alloc_counter: tip_hdr.alloc_counter,
-                            eff_log,
-                            segment_ids,
-                            segment_roots,
-                            recent_headers,
-                            nullifier_blocks,
-                        }
-                    }
-                }
+            let our_height = {
+                let ctx = chain.read().await;
+                ctx.tip_height()
             };
+            if our_height > request.requester_height {
+                tracing::info!(
+                    requester_height = request.requester_height,
+                    our_height,
+                    "state manifest not served: public snapshot sync disabled until checkpoint generation"
+                );
+            }
             let _ = swarm
                 .behaviour_mut()
                 .state_manifest_sync
-                .send_response(channel, manifest);
+                .send_response(channel, GetStateManifestResponse::default());
         }
 
         // --- State sync: manifest client (step 1 response) ---
@@ -1600,11 +1516,8 @@ async fn handle_swarm_event(
 
         // --- State sync: segment server (step 2) ---
         //
-        // Serves one encoded segment (~3 MB) per request. The swarm loop only
-        // clones the segment columns; CPU-heavy encoding runs on a bounded
-        // blocking worker and returns through `segment_response_tx`.
-        // Rejects requests if our tip has moved more than FINALITY_DEPTH
-        // past the expected_tip_height to prevent serving stale segments.
+        // FIX1 fail-closed policy: no public snapshot segments are served until
+        // immutable checkpoint generations pin height/hash/root/segment set.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::Message {
                 message:
@@ -1614,87 +1527,19 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            use noid_chain::consensus::params::FINALITY_DEPTH;
-            use noid_chain::storage::serial::encode_segment;
-            let seg_id = request.segment_id;
-            let result = {
-                let mut ctx = chain.write().await;
-                let our_tip = ctx.tip_height();
-                // Exact match: if our state has advanced past the manifest's tip,
-                // the segment data won't match the client's expected state_root.
-                // Return None so the client re-requests a fresh manifest.
-                // Also reject if we're far ahead (stale client on a fork).
-                if our_tip != request.expected_tip_height
-                    && our_tip > request.expected_tip_height + FINALITY_DEPTH
-                {
-                    None
-                } else if our_tip != request.expected_tip_height {
-                    tracing::debug!(
-                        our_tip,
-                        expected = request.expected_tip_height,
-                        "segment request tip mismatch — state advanced"
-                    );
-                    None
-                } else if seg_id as usize >= ctx.state.state.num_segments() {
-                    tracing::debug!(seg_id, "segment request out of range");
-                    None
-                } else {
-                    let eff_log = ctx.state.state.effective_log_segment_size() as u8;
-                    let cols = ctx.state.state.segment_columns(seg_id).clone();
-                    Some((eff_log, cols))
-                }
-            };
-
-            let Some((eff_log, cols)) = result else {
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: seg_id,
-                        eff_log: 0,
-                        data: None,
-                    },
-                );
-                return;
-            };
-
-            let Ok(permit) = segment_encode_semaphore.clone().try_acquire_owned() else {
-                tracing::warn!(seg_id, "state segment encode concurrency limit reached");
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: seg_id,
-                        eff_log: 0,
-                        data: None,
-                    },
-                );
-                return;
-            };
-
-            let response_tx = segment_response_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let data = encode_segment(&cols, eff_log);
-                let response = if data.len() <= MAX_SEGMENT_BYTES {
-                    GetStateSegmentResponse {
-                        segment_id: seg_id,
-                        eff_log,
-                        data: Some(data),
-                    }
-                } else {
-                    tracing::warn!(
-                        seg_id,
-                        len = data.len(),
-                        "encoded state segment exceeds cap"
-                    );
-                    GetStateSegmentResponse {
-                        segment_id: seg_id,
-                        eff_log: 0,
-                        data: None,
-                    }
-                };
-                let _ =
-                    response_tx.blocking_send(PendingStateSegmentResponse { channel, response });
-            });
+            tracing::debug!(
+                segment = request.segment_id,
+                expected_tip_height = request.expected_tip_height,
+                "state segment not served: public snapshot sync disabled until checkpoint generation"
+            );
+            let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                channel,
+                GetStateSegmentResponse {
+                    segment_id: request.segment_id,
+                    eff_log: 0,
+                    data: None,
+                },
+            );
         }
 
         // --- State sync: segment client (step 2 response) ---

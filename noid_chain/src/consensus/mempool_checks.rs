@@ -8,7 +8,7 @@
 //! `validate_tx_consensus` — it adds state-dependent checks that require
 //! knowing the current UTXO state and the last ANCHOR_DEPTH block headers.
 //!
-//! LogicProof verification (`verify_logic`) is intentionally NOT performed here.
+//! Wallet authorization verification is intentionally NOT performed here.
 //! It runs as a background verification task after admission.
 //!
 //! # Check order (cheapest first)
@@ -38,7 +38,7 @@ use noid_tx::Transaction;
 /// for cross-tx slot conflict detection within the mempool).
 ///
 /// Returns `Ok(())` if the transaction passes all native admission checks.
-/// LogicProof verification is performed separately (async).
+/// Wallet authorization verification is performed separately (async).
 pub fn validate_tx_for_mempool(
     tx: &Transaction,
     ctx: &ChainContext,

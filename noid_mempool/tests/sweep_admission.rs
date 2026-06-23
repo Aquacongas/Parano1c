@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 
-use noid_air::Air;
 use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::genesis::genesis_header;
 use noid_chain::consensus::pow::full_block_hash;
@@ -11,14 +10,11 @@ use noid_chain::fri_state::SlotValue;
 use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
+use noid_gkr::{prove_wallet_authorization, WalletAuthorizationBundle};
 use noid_mempool::{AsyncMempool, ChainView, SubmitError};
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
-use noid_stark::prove_logic_sweep::{
-    prove_sweep_logic, sweep_logic_witness_parts_from_body, SweepLogicWitness,
-};
-use noid_stark::wallet_bundle::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, TxBody, TxInput, TxIntent, TxOutput, TxShape,
 };
@@ -129,47 +125,21 @@ fn chain_view_with_inputs(body: &TxBody) -> ChainView {
     )
 }
 
-fn prove_bundle(body: &TxBody) -> WalletProofBundle {
-    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(body);
-    assert!(air.check(&trace));
-
-    let tx_body_hash = hash_tx_body_for_shape(
-        body.shape,
-        &body.epoch_anchor,
-        body.fee,
-        &body.inputs,
-        &body.outputs,
-        body.is_coinbase,
-    );
-    let pi = noid_tx::PublicInputs {
-        epoch_anchor: body.epoch_anchor,
-        tx_body_hash,
-        shape_id: body.shape.id(),
-        fee: body.fee,
-        n_live_inputs: body.inputs.iter().filter(|i| i.valid).count() as u8,
-        n_live_outputs: body.outputs.iter().filter(|o| o.valid).count() as u8,
-        coinbase_credit: 0,
-        log_slots: 24,
-        claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
-        is_activation: [false; noid_tx::MAX_OUTPUTS],
-        is_deactivation: [false; noid_tx::MAX_INPUTS],
-    };
-
-    let witness = SweepLogicWitness {
-        air: &air,
-        trace: &trace,
-        pi: &pi,
-        auth_inputs: &auth_inputs,
-    };
-    let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
-
-    WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
-        logic_proof,
-        auth_public: auth_inputs.to_public(),
-    })
+fn prove_bundle(body: &TxBody) -> WalletAuthorizationBundle {
+    let spend_secrets = body
+        .inputs
+        .iter()
+        .filter(|input| input.valid)
+        .map(|input| input.spend_secret.clone())
+        .collect();
+    prove_wallet_authorization(body, spend_secrets).expect("prove sweep authorization")
 }
 
-fn intent_with_proof(body: TxBody, logic_proof_bytes: Vec<u8>) -> TxIntent {
+fn authorization_bytes(bundle: &WalletAuthorizationBundle) -> Vec<u8> {
+    bundle.to_bytes().expect("serialize wallet authorization")
+}
+
+fn intent_with_proof(body: TxBody, authorization_bytes: Vec<u8>) -> TxIntent {
     let tx_body_hash = hash_tx_body_for_shape(
         body.shape,
         &body.epoch_anchor,
@@ -183,7 +153,7 @@ fn intent_with_proof(body: TxBody, logic_proof_bytes: Vec<u8>) -> TxIntent {
         tx_body_hash,
         claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
         claimed_slots: TxIntent::claimed_slots_from_body(&body),
-        logic_proof_bytes,
+        authorization_bytes,
     }
 }
 
@@ -193,7 +163,7 @@ fn intent_without_proof(body: TxBody) -> TxIntent {
         tx_body_hash: TxBodyHash([0u8; 32]),
         claims_commitment: [0u8; 32],
         claimed_slots: vec![],
-        logic_proof_bytes: vec![],
+        authorization_bytes: vec![],
     }
 }
 
@@ -220,7 +190,7 @@ async fn mempool_accepts_valid_sweep25x2_bundle() {
         tx_body_hash,
         claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
         claimed_slots: TxIntent::claimed_slots_from_body(&body),
-        logic_proof_bytes: bundle.to_bytes(),
+        authorization_bytes: authorization_bytes(&bundle),
     };
     let intent_bytes = intent.to_bytes();
 
@@ -234,10 +204,11 @@ async fn mempool_accepts_valid_sweep25x2_bundle() {
     let selected = mempool.select_for_block(1).await;
     assert_eq!(selected.len(), 1);
     let cached = selected[0]
-        .cached_algebraic_proof
+        .cached_authorization
         .as_ref()
         .expect("admitted sweep proof should be cached");
-    let cached_bundle = WalletProofBundle::from_bytes(cached).expect("decode cached bundle");
+    let cached_bundle =
+        WalletAuthorizationBundle::from_bytes(cached).expect("decode cached authorization");
     assert_eq!(cached_bundle.shape(), TxShape::Sweep25x2);
 }
 
@@ -267,13 +238,13 @@ async fn mempool_rejects_sweep_body_tamper_against_valid_bundle() {
         tx_body_hash,
         claims_commitment: compute_claims_commitment(&tampered.inputs, &tampered.outputs),
         claimed_slots: TxIntent::claimed_slots_from_body(&tampered),
-        logic_proof_bytes: bundle.to_bytes(),
+        authorization_bytes: authorization_bytes(&bundle),
     };
     let intent_bytes = intent.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
     let result = mempool.submit(intent, intent_bytes).await;
-    assert!(matches!(result, Err(SubmitError::InvalidProof(_))));
+    assert!(matches!(result, Err(SubmitError::MalformedIntent(_))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -290,7 +261,7 @@ async fn mempool_rejects_sweep_fee_tamper_against_valid_bundle() {
     let mut tampered = body.clone();
     tampered.fee = tampered.fee.saturating_add(1);
     tampered.outputs[1].value = tampered.outputs[1].value.saturating_sub(1);
-    let intent = intent_with_proof(tampered, bundle.to_bytes());
+    let intent = intent_with_proof(tampered, authorization_bytes(&bundle));
     let intent_bytes = intent.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
@@ -309,12 +280,12 @@ async fn mempool_rejects_sweep_auth_tamper() {
     let view = chain_view_with_inputs(&body);
     let mut bundle = prove_bundle(&body);
     match &mut bundle {
-        WalletProofBundle::Sweep25x2(sweep) => {
-            sweep.auth_public.expected_auth_tag[0][0] += Block128::ONE;
+        WalletAuthorizationBundle::Sweep25x2(proof) => {
+            proof.kill_shot.main.state_at_r += Block128::ONE;
         }
-        WalletProofBundle::Standard4x8(_) => panic!("expected sweep bundle"),
+        WalletAuthorizationBundle::Standard4x8(_) => panic!("expected sweep bundle"),
     }
-    let intent = intent_with_proof(body, bundle.to_bytes());
+    let intent = intent_with_proof(body, authorization_bytes(&bundle));
     let intent_bytes = intent.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
@@ -354,7 +325,15 @@ async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
     standard_body
         .inputs
         .truncate(TxShape::Standard4x8.max_inputs());
-    let intent = intent_with_proof(standard_body, sweep_bundle.to_bytes());
+    let standard_input_sum: u64 = standard_body
+        .inputs
+        .iter()
+        .filter(|input| input.valid)
+        .map(|input| input.value)
+        .sum();
+    standard_body.outputs[0].value = standard_input_sum - standard_body.fee as u64;
+    standard_body.outputs[1].valid = false;
+    let intent = intent_with_proof(standard_body, authorization_bytes(&sweep_bundle));
     let intent_bytes = intent.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
@@ -393,7 +372,7 @@ async fn mempool_rejects_sweep_input_conflict_with_admitted_sweep() {
     let body = mk_sweep_body(epoch_anchor, fee);
     let view = chain_view_with_inputs(&body);
     let bundle = prove_bundle(&body);
-    let first = intent_with_proof(body.clone(), bundle.to_bytes());
+    let first = intent_with_proof(body.clone(), authorization_bytes(&bundle));
     let first_bytes = first.to_bytes();
 
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());

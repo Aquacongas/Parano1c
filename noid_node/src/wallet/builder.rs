@@ -18,7 +18,7 @@
 //! 2. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`
 //! 3. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`
 //! 4. Fill auth tags in place.
-//! 5. `prove_tx(&body, spend_secrets)` → `WalletProofBundle`
+//! 5. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
 
 use noid_poseidon2b::primitives::{hash_auth_tag, Address, AuthTag, SpendSecret};
 use noid_tx::{
@@ -52,8 +52,6 @@ pub struct TxBuildData {
     /// Free-slot hints for outputs: index `0` = payment output slot,
     /// index `1` = change output slot (present only when change > 0).
     pub output_slot_hints: Vec<u32>,
-    /// `log2(state_size)` — passed to `prove_tx` to select the correct AIR shape.
-    pub log_slots: u32,
     /// Transaction proof/body shape selected by coin selection.
     pub shape: TxShape,
 }
@@ -102,7 +100,7 @@ pub fn extract_build_data(
     fee_micronoid: u64,
     epoch_anchor: [u8; 32],
     slot_hints: Vec<u32>,
-    log_slots: u32,
+    _log_slots: u32,
     pending_output_slots: &std::collections::HashSet<u32>,
 ) -> Result<TxBuildData, BuildError> {
     let total_needed = amount_micronoid.saturating_add(fee_micronoid);
@@ -158,7 +156,6 @@ pub fn extract_build_data(
         change_address: wallet.primary_address(),
         epoch_anchor,
         output_slot_hints: slot_hints,
-        log_slots,
         shape,
     })
 }
@@ -192,7 +189,7 @@ pub fn extract_consolidate_data(
     fee_micronoid: u64,
     epoch_anchor: [u8; 32],
     slot_hints: Vec<u32>,
-    log_slots: u32,
+    _log_slots: u32,
     pending_output_slots: &std::collections::HashSet<u32>,
     pending_input_slots: &std::collections::HashSet<u32>,
 ) -> Result<(TxBuildData, u64), BuildError> {
@@ -255,7 +252,6 @@ pub fn extract_consolidate_data(
             change_address: wallet.primary_address(),
             epoch_anchor,
             output_slot_hints: slot_hints,
-            log_slots,
             shape,
         },
         consolidation_amount,
@@ -270,7 +266,7 @@ pub fn extract_consolidate_data(
 /// wallet lock.
 ///
 /// This function is CPU-heavy (~0.3–3 s depending on hardware) due to the
-/// wallet LogicProof generation step; keep the wallet mutex released for the
+/// wallet authorization generation step; keep the wallet mutex released for the
 /// full duration.
 ///
 /// # Construction order
@@ -283,7 +279,7 @@ pub fn extract_consolidate_data(
 ///    Auth tags are intentionally excluded from the body hash.
 /// 5. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`.
 /// 6. Fill real auth tags into the live input slots.
-/// 7. `prove_tx(&body, spend_secrets)` → `WalletProofBundle`
+/// 7. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
 ///    (secrets are consumed and zeroized inside).
 /// 8. `claims_commitment = compute_claims_commitment(inputs, outputs)`.
 /// 9. Assemble and wire-encode the [`TxIntent`].
@@ -294,7 +290,7 @@ pub fn extract_consolidate_data(
 ///
 /// # Errors
 ///
-/// - [`BuildError::ProveFailed`] — LogicProof generation returned an error.
+/// - [`BuildError::ProveFailed`] — wallet authorization generation returned an error.
 pub fn build_and_prove_tx(
     to_address: [u8; 32],
     amount_micronoid: u64,
@@ -370,7 +366,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Assemble TxBody and run LogicProof generation.
+    // Assemble TxBody and run wallet authorization generation.
     //
     // spend_secrets is consumed here; SpendSecret's ZeroizeOnDrop impl
     // ensures the raw key material is cleared from memory when prove_tx returns.
@@ -384,10 +380,12 @@ pub fn build_and_prove_tx(
         is_coinbase: false,
     };
 
-    let bundle = prove_tx(&body, data.spend_secrets, data.log_slots)
-        .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
+    let bundle =
+        prove_tx(&body, data.spend_secrets).map_err(|e| BuildError::ProveFailed(e.to_string()))?;
 
-    let logic_proof_bytes = bundle.to_bytes();
+    let authorization_bytes = bundle
+        .to_bytes()
+        .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
 
     // -----------------------------------------------------------------------
     // Steps 8–9: Claims commitment, claimed slots, assemble TxIntent.
@@ -400,7 +398,7 @@ pub fn build_and_prove_tx(
         tx_body_hash,
         claims_commitment,
         claimed_slots,
-        logic_proof_bytes,
+        authorization_bytes,
     };
 
     Ok((tx_body_hash.0, intent.to_bytes()))
@@ -490,8 +488,8 @@ mod tests {
         assert_eq!(intent.tx_body.inputs.iter().filter(|i| i.valid).count(), 5);
         assert_eq!(intent.tx_body_hash.0, tx_hash);
 
-        let bundle = noid_stark::WalletProofBundle::from_bytes(&intent.logic_proof_bytes)
-            .expect("decode wallet proof bundle");
+        let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
+            .expect("decode wallet authorization bundle");
         assert_eq!(bundle.shape(), TxShape::Sweep25x2);
     }
 }

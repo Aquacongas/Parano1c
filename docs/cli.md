@@ -483,7 +483,7 @@ Each `MempoolTxInfo`:
 | `n_inputs` | usize | Active input count |
 | `n_outputs` | usize | Active output count |
 | `admitted_height` | u64 | Chain height when admitted |
-| `has_proof` | bool | Whether the wallet LogicProof is cached |
+| `has_authorization` | bool | Whether the wallet authorization is cached |
 
 ---
 
@@ -500,7 +500,7 @@ Mempool transaction
   Inputs             2
   Outputs            2
   Admitted at height 28
-  LogicProof         attached
+  Authorization      attached
 ```
 
 RPC method: `paranoid_getMempoolEntry`

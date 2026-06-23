@@ -98,8 +98,9 @@ pub struct GetRecursiveProofResponse {
 
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
-/// This is the first step of snapshot sync.  The manifest is tiny (~few KB)
-/// regardless of state size and establishes what needs to be downloaded.
+/// FIX1: public arbitrary-peer snapshot serving is disabled fail-closed, so
+/// production peers return an empty manifest. This message shape is retained
+/// for future immutable checkpoint snapshot generations and as a legacy wire cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
@@ -108,7 +109,9 @@ pub struct GetStateManifestRequest {
 
 /// Manifest response: chain metadata + list of active segment IDs.
 ///
-/// Does NOT include segment data — segments are fetched individually.
+/// In FIX1, `tip_height = 0` means no public snapshot is being advertised.
+/// Future checkpoint generations will use this shape or a successor with a
+/// generation identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GetStateManifestResponse {
     /// Tip height at snapshot time.  0 = "use block sync instead".
@@ -137,9 +140,9 @@ pub struct GetStateManifestResponse {
 
 /// Request one state segment by ID.
 ///
-/// The `tip_height` must match the manifest's tip_height.  The peer rejects
-/// requests where its current tip has moved beyond `tip_height + FINALITY_DEPTH`
-/// to prevent serving stale segments from a forked state.
+/// FIX1: public state segment serving is disabled and peers respond with
+/// `data = None`. Future checkpoint generations must use an immutable snapshot
+/// identifier, not only a height, to avoid live-state races.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
@@ -149,7 +152,8 @@ pub struct GetStateSegmentRequest {
 
 /// Response: one encoded state segment (~3 MB).
 ///
-/// `None` if the peer no longer has this segment at the expected tip height.
+/// `None` if the peer cannot serve this segment. In FIX1, public peers always
+/// return `None` for arbitrary snapshot segment requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentResponse {
     pub segment_id: u16,

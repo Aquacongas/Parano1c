@@ -3,17 +3,17 @@
 
 //! Chain reorg logic .
 //!
-//! Handles chain reorganisations within the finality window (≤ FINALITY_DEPTH blocks).
-//! Deeper reorgs are rejected — blocks beyond FINALITY_DEPTH are considered final.
+//! Handles chain reorganisations within the finality window.
+//! Production hard-finality enforcement lives in the MDBX-backed context.
 //!
 //! # Algorithm
 //!
 //! 1. Find the common ancestor between the current tip and the new chain.
-//! 2. Reject if reorg depth > FINALITY_DEPTH.
+//! 2. Reject if reorg depth > CONSENSUS_FINALITY_DEPTH.
 //! 3. Revert blocks from current tip to common ancestor using undo logs.
 //! 4. Apply new blocks one by one using the in-memory sequential interpreter.
 //! 5. Rebuild nullifier set from surviving-chain undo logs (ANCHOR_DEPTH window;
-//!    blocks older than FINALITY_DEPTH produce empty entries — safe because
+//!    blocks older than undo retention produce empty entries — safe because
 //!    those txs are already protected by the UTXO state check).
 //! 6. Return hashes of reverted transactions for mempool re-admission.
 
@@ -24,7 +24,7 @@ use crate::block_header::BlockHeader;
 use crate::chain_context::ChainContext;
 use crate::consensus::{
     da_prune::{revert_block, BlockUndoLog},
-    params::FINALITY_DEPTH,
+    params::CONSENSUS_FINALITY_DEPTH,
     pow::full_block_hash,
     ConsensusError,
 };
@@ -39,7 +39,7 @@ use noid_poseidon2b::primitives::TxBodyHash;
 
 #[derive(Debug, Clone)]
 pub enum ReorgError {
-    /// Reorg depth exceeds FINALITY_DEPTH — block is final.
+    /// Reorg depth exceeds CONSENSUS_FINALITY_DEPTH — block is final.
     ExceedsFinality { depth: u64 },
     /// Common ancestor not found — chains are unrelated.
     NoCommonAncestor,
@@ -74,7 +74,7 @@ pub struct ReorgResult {
 /// new block headers.
 ///
 /// Returns the height of the highest common ancestor, or `None` if no common
-/// ancestor is found within the FINALITY_DEPTH window.
+/// ancestor is found within the consensus finality window.
 pub fn find_common_ancestor(ctx: &ChainContext, new_headers: &[(u64, BlockHeader)]) -> Option<u64> {
     let new_chain: HashMap<u64, [u8; 32]> = new_headers
         .iter()
@@ -82,7 +82,7 @@ pub fn find_common_ancestor(ctx: &ChainContext, new_headers: &[(u64, BlockHeader
         .collect();
 
     let tip = ctx.tip_height;
-    let oldest_revertable = tip.saturating_sub(FINALITY_DEPTH);
+    let oldest_revertable = tip.saturating_sub(CONSENSUS_FINALITY_DEPTH);
 
     for height in (oldest_revertable..=tip).rev() {
         if let Some(our_header) = ctx.headers.get(&height) {
@@ -132,7 +132,7 @@ pub fn apply_reorg(
 ) -> Result<ReorgResult, ReorgError> {
     let reorg_depth = ctx.tip_height.saturating_sub(ancestor_height);
 
-    if reorg_depth > FINALITY_DEPTH {
+    if reorg_depth > CONSENSUS_FINALITY_DEPTH {
         return Err(ReorgError::ExceedsFinality { depth: reorg_depth });
     }
 
@@ -174,8 +174,8 @@ pub fn apply_reorg(
 
     // Rebuild nullifier set from the surviving chain.
     //
-    // tx_hashes are stored in undo logs.  Undo logs are kept
-    // for FINALITY_DEPTH = 18 blocks; blocks older than that in the surviving
+    // tx_hashes are stored in undo logs.  Undo logs are retained only for a
+    // bounded recent window; blocks older than that in the surviving
     // chain produce empty entries.  This is safe: those older blocks' txs are
     // protected by the UTXO state itself — their input slots are already EMPTY
     // ("unknown or spent") and output slots are LIVE ("output slot not empty"),
@@ -188,7 +188,7 @@ pub fn apply_reorg(
                 ctx.undo_logs
                     .get(&h)
                     .map(|u| u.tx_hashes.clone())
-                    .unwrap_or_default() // empty for blocks beyond FINALITY_DEPTH
+                    .unwrap_or_default() // empty for blocks beyond retention
             })
             .collect();
         ctx.nullifiers = NullifierSet::rebuild_from_blocks(rebuild_blocks);
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn apply_reorg_exceeds_finality_rejects() {
         let mut ctx = ChainContext::init_from_easy_genesis();
-        for _ in 0..(FINALITY_DEPTH + 1) {
+        for _ in 0..(CONSENSUS_FINALITY_DEPTH + 1) {
             let block = build_empty_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .unwrap();

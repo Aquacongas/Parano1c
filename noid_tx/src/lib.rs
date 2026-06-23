@@ -12,6 +12,7 @@ pub mod body_hash;
 pub mod claims;
 pub mod intent;
 pub mod public;
+pub mod public_logic;
 pub mod types;
 pub mod wire;
 
@@ -19,6 +20,7 @@ pub use body_hash::{hash_tx_body, hash_tx_body_for_shape};
 pub use claims::compute_claims_commitment;
 pub use intent::{ClaimedSlot, TxIntent};
 pub use public::{PublicInputs, MAX_LOG_SLOTS, MIN_LOG_SLOTS};
+pub use public_logic::{validate_public_tx_logic, PublicLogicError, PublicLogicFacts};
 pub use types::{
     Transaction, TxBody, TxInput, TxOutput, TxShape, ANCHOR_DEPTH, MAX_INPUTS, MAX_OUTPUTS,
 };

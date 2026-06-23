@@ -14,7 +14,8 @@
 //! Reference: Bitcoin Core `src/chain.h::CChainWork`, Grin `chain/src/chain.rs`.
 
 use crate::consensus::difficulty::{le256_lt, work_gt};
-use crate::consensus::params::FINALITY_DEPTH;
+use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+use crate::storage::FinalizedCheckpoint;
 
 /// Compare two chain tips by cumulative PoW work.
 ///
@@ -126,13 +127,23 @@ pub fn choose_chain_by_work(
     }
 }
 
-/// Check whether a reorg is allowed.
+/// Return true when a candidate chain preserves the local finalized prefix.
 ///
-/// A reorg that would undo blocks with `n_confirmations` confirmations
-/// (i.e., the common ancestor is `n_confirmations` blocks behind the tip)
-/// is rejected once `n_confirmations >= FINALITY_DEPTH`.
+/// Fork choice must choose maximum cumulative work only among candidates for
+/// which the block hash at `finalized.height` equals `finalized.hash`.
+pub fn preserves_finalized_prefix(
+    candidate_hash_at_finalized_height: Option<[u8; 32]>,
+    finalized: FinalizedCheckpoint,
+) -> bool {
+    candidate_hash_at_finalized_height == Some(finalized.hash)
+}
+
+/// Check whether a reorg is allowed by depth alone.
+///
+/// Callers must also enforce `preserves_finalized_prefix`; this helper only
+/// answers whether the depth is inside the configured consensus finality window.
 pub fn reorg_allowed(n_confirmations_to_undo: u64) -> bool {
-    n_confirmations_to_undo < FINALITY_DEPTH
+    n_confirmations_to_undo < CONSENSUS_FINALITY_DEPTH
 }
 
 #[cfg(test)]
@@ -196,8 +207,19 @@ mod tests {
     fn reorg_within_finality_allowed() {
         assert!(reorg_allowed(0));
         assert!(reorg_allowed(17));
-        assert!(!reorg_allowed(18)); // FINALITY_DEPTH = 18
+        assert!(!reorg_allowed(18)); // CONSENSUS_FINALITY_DEPTH = 18
         assert!(!reorg_allowed(100));
+    }
+
+    #[test]
+    fn finalized_prefix_must_match() {
+        let finalized = FinalizedCheckpoint {
+            height: 7,
+            hash: [0xAA; 32],
+        };
+        assert!(preserves_finalized_prefix(Some([0xAA; 32]), finalized));
+        assert!(!preserves_finalized_prefix(Some([0xBB; 32]), finalized));
+        assert!(!preserves_finalized_prefix(None, finalized));
     }
 
     #[test]

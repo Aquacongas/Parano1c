@@ -6,7 +6,7 @@
 //! A TxIntent carries everything a full node needs to validate and
 //! include a transaction without re-executing it:
 //! - The transaction body (epoch_anchor, fee, inputs, outputs)
-//! - The opaque LogicProof bytes (STARK + GKR)
+//! - The opaque wallet authorization bytes (AuthGKR Kill-Shot)
 //! - The claims commitment (C_claimed)
 //! - The list of claimed slots with their values
 //!
@@ -26,8 +26,8 @@ pub struct ClaimedSlot {
     pub owner_lo: [u8; 16],
 }
 
-/// Network payload for a stateless transaction. Full nodes validate
-/// the logic_proof, check the epoch_anchor window, verify claimed
+/// Network payload for a stateless transaction. Full nodes verify
+/// the wallet authorization, check the epoch_anchor window, verify claimed
 /// slots against native state, and admit to mempool.
 ///
 /// # tx_body_hash consistency
@@ -42,9 +42,9 @@ pub struct TxIntent {
     pub tx_body_hash: TxBodyHash,
     pub claims_commitment: Digest,
     pub claimed_slots: Vec<ClaimedSlot>,
-    /// Opaque serialized LogicProof (STARK + SpineGKR + AuthGKR).
+    /// Opaque serialized WalletAuthorizationBundle (AuthGKR only).
     /// Wire format is defined by the proof system; we carry raw bytes.
-    pub logic_proof_bytes: Vec<u8>,
+    pub authorization_bytes: Vec<u8>,
 }
 
 impl TxIntent {
@@ -119,10 +119,10 @@ impl TxIntent {
         for s in &self.claimed_slots {
             s.encode(buf);
         }
-        // logic_proof_bytes (length-prefixed)
-        let proof_len = self.logic_proof_bytes.len() as u32;
+        // authorization_bytes (length-prefixed)
+        let proof_len = self.authorization_bytes.len() as u32;
         buf.extend_from_slice(&proof_len.to_le_bytes());
-        buf.extend_from_slice(&self.logic_proof_bytes);
+        buf.extend_from_slice(&self.authorization_bytes);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -174,7 +174,7 @@ impl TxIntent {
         if src.len() < proof_len {
             return Err(WireError::Truncated);
         }
-        let logic_proof_bytes = src[..proof_len].to_vec();
+        let authorization_bytes = src[..proof_len].to_vec();
         *src = &src[proof_len..];
 
         Ok(Self {
@@ -182,7 +182,7 @@ impl TxIntent {
             tx_body_hash: TxBodyHash(tx_body_hash),
             claims_commitment,
             claimed_slots,
-            logic_proof_bytes,
+            authorization_bytes,
         })
     }
 
@@ -278,7 +278,7 @@ mod tests {
                     owner_lo: [0x44; 16],
                 },
             ],
-            logic_proof_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            authorization_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
         let bytes = intent.to_bytes();
         let back = TxIntent::from_bytes(&bytes).unwrap();
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(back.tx_body_hash, intent.tx_body_hash);
         assert_eq!(back.claims_commitment, intent.claims_commitment);
         assert_eq!(back.claimed_slots, intent.claimed_slots);
-        assert_eq!(back.logic_proof_bytes, intent.logic_proof_bytes);
+        assert_eq!(back.authorization_bytes, intent.authorization_bytes);
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
             tx_body_hash: TxBodyHash([0xBC; 32]),
             claims_commitment: [0xCD; 32],
             claimed_slots,
-            logic_proof_bytes: vec![1, 2, 3],
+            authorization_bytes: vec![1, 2, 3],
         };
         let bytes = intent.to_bytes();
         let back = TxIntent::from_bytes(&bytes).unwrap();
@@ -330,7 +330,7 @@ mod tests {
             tx_body_hash: TxBodyHash([0xBB; 32]),
             claims_commitment: [0xCC; 32],
             claimed_slots: vec![],
-            logic_proof_bytes: vec![],
+            authorization_bytes: vec![],
         };
         let bytes = intent.to_bytes();
         // The raw secret bytes must not appear anywhere in the wire payload.
@@ -345,7 +345,7 @@ mod tests {
             tx_body_hash: TxBodyHash([0; 32]),
             claims_commitment: [0; 32],
             claimed_slots: vec![],
-            logic_proof_bytes: vec![],
+            authorization_bytes: vec![],
         };
         let mut bytes = intent.to_bytes();
         bytes.push(0xFF);

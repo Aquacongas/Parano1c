@@ -9,7 +9,10 @@ use noid_gkr::{
 };
 use noid_poseidon2b::primitives::{hash_auth_tag, SpendSecret, TxBodyHash};
 
-const MAX_SWEEP_AUTH_CAPSULE_BYTES: usize = 128 * 1024;
+// 32-byte source-binding Merkle siblings make the capsule ~167 KiB for the
+// current Sweep25x2 AuthGKR shape; keep a tight regression ceiling while still
+// requiring it to remain far smaller than raw serialized auth_slices below.
+const MAX_SWEEP_AUTH_CAPSULE_BYTES: usize = 192 * 1024;
 const RAW_SWEEP_AUTH_SLICES_BYTES: usize = 32 * 2048 * 16;
 
 fn mk_secret(seed: u8) -> SpendSecret {

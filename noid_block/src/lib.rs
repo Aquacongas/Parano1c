@@ -1090,8 +1090,9 @@ fn profile_total_mem_fields(
 
 /// Assemble the public Sweep25x2 bucket from wallet-produced sweep witnesses.
 ///
-/// This does not re-prove sweep logic: each `OwnedSweepTxWitness` already carries
-/// the wallet-produced `SweepLogicProof`. The block bucket binds those proofs to
+/// Each `OwnedSweepTxWitness` carries canonical public witness data plus
+/// an auth-only wallet authorization capsule. The block bucket binds those
+/// capsules to
 /// concrete block transaction indices plus canonical public inputs, and proves a
 /// real aggregation transcript over sweep balance AIR columns and sweep block-spine
 /// slices. AuthGKR is carried by self-contained per-tx capsules. Verification is performed by

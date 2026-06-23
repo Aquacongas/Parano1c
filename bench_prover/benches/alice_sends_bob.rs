@@ -34,7 +34,7 @@ fn print_standard(f: &StandardFixture, r: &StandardWalletBench) {
     println!("    verify median:  {}", fmt_ms(r.verify_time));
     let bundle = standard_wallet_bundle_size(f, &r.proof);
     println!("    wallet bundle:  {}", fmt_bytes(bundle));
-    println!("    logic proof:    {}", fmt_bytes(total));
+    println!("    authorization:  {}", fmt_bytes(total));
     println!("      STARK:        {}", fmt_bytes(stark));
     println!("      AuthGKR:      {}", fmt_bytes(auth));
     println!();
@@ -53,7 +53,7 @@ fn print_sweep(f: &SweepFixture, r: &SweepWalletBench) {
     println!("    verify median:  {}", fmt_ms(r.verify_time));
     let bundle = sweep_wallet_bundle_size(f, &r.proof);
     println!("    wallet bundle:  {}", fmt_bytes(bundle));
-    println!("    logic proof:    {}", fmt_bytes(total));
+    println!("    authorization:  {}", fmt_bytes(total));
     println!("      STARK:        {}", fmt_bytes(stark));
     println!("      AuthGKR:      {}", fmt_bytes(auth));
     println!(
@@ -120,7 +120,7 @@ fn main() {
         fmt_bytes(s25_bundle + std_tail_bundle)
     );
     println!(
-        "    logic total:   {}",
+        "    auth total:    {}",
         fmt_bytes(s25_total + std_tail_total)
     );
     println!();
@@ -135,7 +135,7 @@ fn main() {
         fmt_ms(r_sweep_25x2.verify_time + r_sweep_25x2.verify_time)
     );
     println!("    bundle total:  {}", fmt_bytes(s25_bundle * 2));
-    println!("    logic total:   {}", fmt_bytes(s25_total * 2));
+    println!("    auth total:    {}", fmt_bytes(s25_total * 2));
     println!();
 
     println!("  ====================================================================");

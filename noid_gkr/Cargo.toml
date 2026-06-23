@@ -13,6 +13,7 @@ noid_fri_binius = { path = "../noid_fri_binius" }
 noid_tx = { path = "../noid_tx" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
+bincode = "1"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [dev-dependencies]

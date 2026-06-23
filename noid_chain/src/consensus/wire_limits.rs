@@ -10,11 +10,17 @@
 /// Maximum serialized TxIntent accepted by P2P/RPC/mempool admission.
 pub const MAX_TX_INTENT_BYTES_GLOBAL: usize = 512 * 1024;
 
-/// Shape-specific serialized TxIntent cap for Standard4x8 wallet bundles.
-pub const MAX_STANDARD_TX_INTENT_BYTES: usize = 384 * 1024;
+/// Maximum serialized Standard4x8 wallet authorization bytes.
+pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
 
-/// Shape-specific serialized TxIntent cap for Sweep25x2 wallet bundles.
-pub const MAX_SWEEP_TX_INTENT_BYTES: usize = 384 * 1024;
+/// Maximum serialized Sweep25x2 wallet authorization bytes.
+pub const MAX_SWEEP_AUTHORIZATION_BYTES: usize = 256 * 1024;
+
+/// Shape-specific serialized TxIntent cap for Standard4x8 auth-only wallet artifacts.
+pub const MAX_STANDARD_TX_INTENT_BYTES: usize = 256 * 1024;
+
+/// Shape-specific serialized TxIntent cap for Sweep25x2 auth-only wallet artifacts.
+pub const MAX_SWEEP_TX_INTENT_BYTES: usize = 320 * 1024;
 
 /// Maximum admitted mempool transactions kept in RAM.
 pub const MAX_MEMPOOL_TXS: usize = 1024;
@@ -86,6 +92,14 @@ pub fn max_tx_intent_bytes_for_shape(shape: noid_tx::TxShape) -> usize {
     match shape {
         noid_tx::TxShape::Standard4x8 => MAX_STANDARD_TX_INTENT_BYTES,
         noid_tx::TxShape::Sweep25x2 => MAX_SWEEP_TX_INTENT_BYTES,
+    }
+}
+
+#[inline]
+pub fn max_authorization_bytes_for_shape(shape: noid_tx::TxShape) -> usize {
+    match shape {
+        noid_tx::TxShape::Standard4x8 => MAX_STANDARD_AUTHORIZATION_BYTES,
+        noid_tx::TxShape::Sweep25x2 => MAX_SWEEP_AUTHORIZATION_BYTES,
     }
 }
 

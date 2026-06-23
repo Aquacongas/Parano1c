@@ -22,9 +22,9 @@ This document specifies the complete protocol: all layers, their interfaces, and
 │  Shape-specific tx buckets, source-bound FRI, canonical BlockProof.      │
 │  NativeDelta binds block state transitions to pre/post segment MLEs.      │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  Layer 2: Transaction (LogicProof)                                      │
-│  Per-tx: FROST-GKR Kill-Shot (Spine + Auth) + TxLogicAir STARK.         │
-│  Stateless. Produced by wallet. Valid until epoch_anchor expires.         │
+│  Layer 2: Transaction Authorization                                      │
+│  Per-tx wallet AuthGKR Kill-Shot plus public native TxLogic checks.       │
+│  BlockProof rebuilds canonical TxLogicAir from public TxBody.             │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Layer 1: State (Segmented FRI)                                         │
 │  Flat UTXO slot array. Poseidon2b Merkle root. Segments of 2^16 slots.  │
@@ -121,7 +121,7 @@ TxIntent = {
     inputs:        [TxInput; shape max]
     outputs:       [TxOutput; shape max]
     is_coinbase:   bool
-    logic_proof:   LogicProof    -- shape-specific validity proof bundle
+    authorization_bytes: WalletAuthorizationBundle -- AuthGKR-only wallet authorization
 }
 
 TxInput = {
@@ -381,7 +381,7 @@ Wallet                    Mempool              Miner                   Network
   │                         │    prefilter       │                       │
   │                         │    (fee, anchor,   │                       │
   │                         │    slots, nullifier)│                      │
-  │                         │    + LogicProof    │                       │
+  │                         │    + AuthGKR authorization    │                       │
   │                         │    verify + final  │                       │
   │                         │    recheck         │                       │
   │                         │                    │                       │
@@ -416,11 +416,11 @@ Wallet                    Mempool              Miner                   Network
 
 | Step | Duration | Bottleneck |
 |------|----------|-----------|
-| Wallet prove (`Standard4x8`, 4-in/8-out) | ~98.07 ms | wallet proof generation |
-| Wallet verify (`Standard4x8`, 4-in/8-out) | ~27.58 ms | wallet proof verification |
-| Mempool admission | <1 ms native prefilter + bounded LogicProof worker + final recheck | Slot lookups / proof workers |
-| Block prove (100 standard-shape txs, proof-native `block_scaling` mix) | ~14.75 s | bucket proof + NativeDelta openings |
-| Block verify (100 standard-shape txs, proof-native `block_scaling` mix) | ~4.91 s | bucket verify + NativeDelta openings |
+| Wallet authorize (`Standard4x8`, 4-in/8-out) | ~78.90 ms | AuthGKR authorization generation |
+| Wallet authorization verify (`Standard4x8`, 4-in/8-out) | ~13.84 ms | AuthGKR authorization verification |
+| Mempool admission | <1 ms native prefilter + bounded AuthGKR authorization worker + final recheck | Slot lookups / proof workers |
+| Block prove (100 standard-shape txs, proof-native `block_scaling` mix) | ~15.93 s | bucket proof + NativeDelta openings |
+| Block verify (100 standard-shape txs, proof-native `block_scaling` mix) | ~5.71 s | bucket verify + NativeDelta openings |
 | PoW (target 15s) | ~15 s | Blake3 nonce search |
 | Recursive proof verify | a few ms | RecursiveBlockAir verify |
 
@@ -531,13 +531,13 @@ These properties hold at all times for a correct node:
 
 1. **State root binding.** The stored state root equals the Poseidon2b Merkle root over all segment FRI roots. Verified for user-transaction blocks by NativeDelta state-delta identity plus source-bound pre/post segment MLE openings; coinbase-only blocks have no user slot claims and use the canonical stub path plus deterministic coinbase delta.
 
-2. **Recursive proof covers finalized history.** A stored recursive proof at height `h` proves every block from genesis through `h`. Snapshot serving accepts only proofs whose lag from the snapshot tip is bounded by `FINALITY_DEPTH + 2`.
+2. **Recursive proof status.** The current stored recursive proof tracks finalized history, but public snapshot serving is disabled in FIX1. Future snapshot serving must require exact-height checkpoint anchoring (`snapshot.height == recursive_proof.height`) and a recursive verifier that proves the full block-verifier relation.
 
 3. **No double-spend within anchor window.** Nullifier set covers all `tx_body_hash` values in the last `ANCHOR_DEPTH` blocks. After expiry, structural replay protection (anchor check) takes over.
 
-4. **Domain-separated transcripts.** Wallet proofs use domain-separated Fiat-Shamir transcripts. Block proving uses per-tx algebraic transcripts seeded by the common bucket commitment and tx index, then Merkle-reduces those transcript digests into the block multipoint channel. Recursive proofs bind the canonical block claim into the chain accumulator.
+4. **Domain-separated transcripts.** Wallet authorization proofs use domain-separated Fiat-Shamir transcripts. Block proving uses per-tx algebraic transcripts seeded by the common bucket commitment and tx index, then Merkle-reduces those transcript digests into the block multipoint channel. Recursive proofs bind the canonical block claim into the chain accumulator.
 
-5. **Stateless transaction validity.** A valid `LogicProof` remains valid across block boundaries until its `epoch_anchor` expires. No re-proving needed.
+5. **Stateless transaction validity.** A valid wallet authorization remains valid across block boundaries until its `epoch_anchor` expires. No wallet re-proving is needed.
 
 6. **Expansion is monotonic.** `log_slots` can only increase. State capacity never shrinks.
 

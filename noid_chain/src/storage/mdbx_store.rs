@@ -17,12 +17,16 @@ use noid_poseidon2b::primitives::TxBodyHash;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
-use crate::consensus::params::{ANCHOR_DEPTH, FINALITY_DEPTH};
+use crate::consensus::params::{
+    ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
+};
 use crate::segmented_state::SegmentColumns;
+use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
-    decode_chain_tip, decode_header, decode_segment, decode_state_meta, decode_tx_index_value,
-    decode_undo_log, encode_chain_tip, encode_header, encode_segment, encode_state_meta,
-    encode_tx_index_value, encode_undo_log, u64_from_key, u64_key,
+    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header, decode_segment,
+    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    encode_consensus_meta, encode_header, encode_segment, encode_state_meta, encode_tx_index_value,
+    encode_undo_log, u64_from_key, u64_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -31,6 +35,8 @@ use crate::storage::serial::{
 const T_HEADERS: &str = "headers";
 const T_HASH_TO_HEIGHT: &str = "h2h";
 const T_CHAIN_TIP: &str = "tip";
+const T_CONSENSUS_META: &str = "consensus_meta";
+const T_CHAIN_WORK: &str = "chain_work";
 const T_NULLIFIERS: &str = "nullifiers";
 const T_NULLIFIER_BLOCKS: &str = "nul_blk";
 const T_UNDO_LOGS: &str = "undo";
@@ -44,16 +50,17 @@ const T_TX_INDEX: &str = "tx_index";
 /// BlockProofs retained until finalized and covered by the stored recursive proof height.
 /// Key: height (u64 LE). Value: bincode BlockProof bytes.
 const T_BLOCK_PROOFS: &str = "block_proofs";
-/// Public AuthGKR sidecars (retention = FINALITY_DEPTH). Key: height (u64 LE).
+/// Public AuthGKR sidecars (retention = CONSENSUS_FINALITY_DEPTH). Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
-const N_TABLES: u64 = 14;
+const N_TABLES: u64 = 16;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
+const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_REC: &[u8] = &[0u8];
 const KEY_REC_HEIGHT: &[u8] = &[1u8];
 
@@ -172,6 +179,8 @@ impl MdbxStore {
             T_HEADERS,
             T_HASH_TO_HEIGHT,
             T_CHAIN_TIP,
+            T_CONSENSUS_META,
+            T_CHAIN_WORK,
             T_NULLIFIERS,
             T_NULLIFIER_BLOCKS,
             T_UNDO_LOGS,
@@ -201,6 +210,33 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_chain_tip(&b)))
     }
 
+    pub fn get_consensus_meta(&self) -> Result<Option<ConsensusMeta>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_CONSENSUS_META)?;
+        Ok(raw.and_then(|b| decode_consensus_meta(&b)))
+    }
+
+    pub fn get_chain_work(&self, height: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw.and_then(|b| decode_chain_work(&b)))
+    }
+
+    pub fn put_consensus_meta(&self, meta: &ConsensusMeta) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        txn.put(
+            &tbl,
+            KEY_CONSENSUS_META,
+            &encode_consensus_meta(meta),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn get_state_meta(&self) -> Result<Option<(u32, u64, u64)>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_STATE_META))?;
@@ -228,14 +264,19 @@ impl MdbxStore {
             }
             // h_tbl and txn are dropped here
         };
-        self.get_header(height)
+        match self.get_header(height)? {
+            Some(header) if crate::consensus::pow::full_block_hash(&header) == *hash => {
+                Ok(Some(header))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Persist a historical header and its hash index without changing chain tip,
     /// state metadata, undo logs, recent blocks, or nullifier data.
     ///
-    /// Snapshot sync uses this for the B-lite headers-anchored path: nodes fetch
-    /// old headers forever, but still prune old block bodies and block proofs.
+    /// FIX1: snapshot candidate headers must not be written into this canonical
+    /// table before full acceptance; public snapshot sync is fail-closed.
     pub fn put_header_only(&self, header: &BlockHeader, hash: &[u8; 32]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
 
@@ -359,7 +400,7 @@ impl MdbxStore {
     }
 
     /// Store a serialised `BlockAuthSidecar` for `height`.
-    /// Automatically pruned after `FINALITY_DEPTH` blocks by `prune_after_commit`.
+    /// Automatically pruned after `CONSENSUS_FINALITY_DEPTH` blocks by `prune_after_commit`.
     pub fn put_block_auth_sidecar(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
@@ -519,15 +560,16 @@ impl MdbxStore {
     /// 1. Write dirty segment columns
     /// 2. Write BlockHeader (height → bytes)
     /// 3. Write hash→height index
-    /// 4. Write chain_tip
-    /// 5. Write state_meta (log_slots, active_slot_count, alloc_counter)
-    /// 6. Write BlockUndoLog
-    /// 7. Write nullifier hashes for this block; write recent_block bytes
+    /// 4. Write chain_tip and consensus_meta
+    /// 5. Write exact cumulative chainwork at this height
+    /// 6. Write state_meta (log_slots, active_slot_count, alloc_counter)
+    /// 7. Write BlockUndoLog
+    /// 8. Write nullifier hashes for this block; write recent_block bytes
     ///
     /// After commit (non-atomic, re-runnable):
-    ///   - Prune old undo_logs beyond FINALITY_DEPTH
-    ///   - Prune old recent_blocks beyond FINALITY_DEPTH
-    ///   - Prune old auth sidecars beyond FINALITY_DEPTH
+    ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH
+    ///   - Prune old recent_blocks beyond RECENT_BLOCK_RETENTION_DEPTH
+    ///   - Prune old auth sidecars beyond CONSENSUS_FINALITY_DEPTH
     ///   - Prune old block_proofs beyond min(finality cutoff, recursive proof height)
     ///   - Prune old nullifier entries beyond ANCHOR_DEPTH
     pub fn commit_block(
@@ -538,6 +580,7 @@ impl MdbxStore {
         dirty_segments: &[(u16, u8, &SegmentColumns)], // (seg_id, effective_log_seg, cols)
         nullifier_hashes: &[TxBodyHash],
         block_bytes: Option<&[u8]>, // None = don't store (DA already pruned)
+        consensus_meta: &ConsensusMeta,
     ) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
 
@@ -573,7 +616,10 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        // --- 4. chain_tip ---
+        // --- 4. chain_tip + consensus_meta ---
+        debug_assert_eq!(consensus_meta.tip_height, header.height);
+        debug_assert_eq!(consensus_meta.tip_hash, *hash);
+
         let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
         txn.put(
             &tip_tbl,
@@ -582,7 +628,24 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        // --- 5. state_meta ---
+        let consensus_tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        txn.put(
+            &consensus_tbl,
+            KEY_CONSENSUS_META,
+            &encode_consensus_meta(consensus_meta),
+            WriteFlags::empty(),
+        )?;
+
+        // --- 5. exact chainwork at canonical height ---
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        txn.put(
+            &work_tbl,
+            &u64_key(header.height),
+            &encode_chain_work(&consensus_meta.cumulative_chainwork),
+            WriteFlags::empty(),
+        )?;
+
+        // --- 6. state_meta ---
         let meta_tbl = txn.open_table(Some(T_STATE_META))?;
         txn.put(
             &meta_tbl,
@@ -595,7 +658,7 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        // --- 6. BlockUndoLog ---
+        // --- 7. BlockUndoLog ---
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
         txn.put(
             &undo_tbl,
@@ -604,7 +667,7 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        // --- 7. Nullifiers + recent block ---
+        // --- 8. Nullifiers + recent block ---
         let nul_tbl = txn.open_table(Some(T_NULLIFIERS))?;
         let nul_blk_tbl = txn.open_table(Some(T_NULLIFIER_BLOCKS))?;
         // Store each tx nullifier mapped to this block's height.
@@ -634,7 +697,7 @@ impl MdbxStore {
             )?;
         }
 
-        // --- 7.5. tx_index: TxBodyHash → (height, position_in_block) ---
+        // --- 8.5. tx_index: TxBodyHash → (height, position_in_block) ---
         // Enables O(1) receipt lookup: given a tx_body_hash, find the block
         // and position to reconstruct the Merkle inclusion path.
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
@@ -647,7 +710,7 @@ impl MdbxStore {
             )?;
         }
 
-        // --- 8. Owner index: update live-UTXO index incrementally ---
+        // --- 9. Owner index: update live-UTXO index incrementally ---
         // Uses undo_log (which records pre-block slot values) and dirty_segments
         // (which hold post-block slot values) to determine what changed.
         {
@@ -728,7 +791,7 @@ impl MdbxStore {
             }
         }
 
-        // Commit atomically — all seven steps or none.
+        // Commit atomically — all steps or none.
         txn.commit()?;
 
         // Post-commit pruning is non-atomic and non-critical.
@@ -748,10 +811,10 @@ impl MdbxStore {
     fn prune_after_commit(&self, current_height: u64) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
 
-        // --- Prune undo_logs older than FINALITY_DEPTH ---
-        if current_height > FINALITY_DEPTH {
+        // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
+        if current_height > UNDO_RETENTION_DEPTH {
             let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
-            let cutoff = current_height - FINALITY_DEPTH;
+            let cutoff = current_height - UNDO_RETENTION_DEPTH;
             // Collect keys first (cursor must be dropped before del).
             let keys_to_del: Vec<u64> = {
                 let mut cur = txn.cursor(&undo_tbl)?;
@@ -771,12 +834,10 @@ impl MdbxStore {
             }
         }
 
-        // --- Prune recent_blocks older than FINALITY_DEPTH ---
-        // Peers only need blocks within the shallow-fork window (≤ FINALITY_DEPTH);
-        // deeper forks use O(1) snapshot sync. One constant, two purposes.
-        if current_height > FINALITY_DEPTH {
+        // --- Prune recent_blocks older than RECENT_BLOCK_RETENTION_DEPTH ---
+        if current_height > RECENT_BLOCK_RETENTION_DEPTH {
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
-            let cutoff = current_height - FINALITY_DEPTH;
+            let cutoff = current_height - RECENT_BLOCK_RETENTION_DEPTH;
             let keys_to_del: Vec<u64> = {
                 let mut cur = txn.cursor(&recent_tbl)?;
                 let mut keys = Vec::new();
@@ -800,11 +861,11 @@ impl MdbxStore {
         // Auth sidecars are only needed for block validation/reorg serving and can
         // be removed at finality. BlockProof bytes are additionally needed by the
         // recursive proof updater: the first time height `h` can be folded into
-        // recursive history is exactly when `current_height - FINALITY_DEPTH >= h`.
+        // recursive history is exactly when `current_height - CONSENSUS_FINALITY_DEPTH >= h`.
         // Therefore pruning BlockProofs purely by finality races the updater and
         // can delete the proof for the boundary block before it is consumed.
-        if current_height > FINALITY_DEPTH {
-            let finality_cutoff = current_height - FINALITY_DEPTH;
+        if current_height > CONSENSUS_FINALITY_DEPTH {
+            let finality_cutoff = current_height - CONSENSUS_FINALITY_DEPTH;
 
             let auth_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
             let auth_keys_to_del: Vec<u64> = {
@@ -917,6 +978,8 @@ impl MdbxStore {
             T_OWNER_INDEX,
             T_STATE_META,
             T_CHAIN_TIP,
+            T_CONSENSUS_META,
+            T_CHAIN_WORK,
             T_TX_INDEX,
         ];
         for name in volatile {

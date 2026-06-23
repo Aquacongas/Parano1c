@@ -27,6 +27,7 @@ pub mod auth_oracle_sweep;
 pub mod auth_pcs;
 pub mod auth_shift;
 pub mod auth_shift_sweep;
+pub mod auth_statement;
 pub mod auth_unified_sweep;
 pub mod auth_unified_v2;
 pub mod batch_eval;
@@ -56,6 +57,7 @@ pub mod spine_sumcheck;
 pub mod spine_sumcheck_sweep;
 pub mod spine_unified;
 pub mod spine_unified_sweep;
+pub mod wallet_authorization;
 
 pub use auth_circuit::{
     AuthCircuit, AuthInputs, AuthPublicInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0,
@@ -91,6 +93,10 @@ pub use auth_pcs::{
     commit_auth_mle_columns, open_auth_mle_columns_committed, prove_auth_mle_opening,
     verify_auth_mle_multi_opening, verify_auth_mle_opening, AuthMleMultiOpeningProof,
     AuthMleOpeningProof, AUTH_PCS_BASE_LOG,
+};
+pub use auth_statement::{
+    standard_auth_public_from_body, sweep_auth_inputs_from_body, sweep_auth_public_from_body,
+    sweep_spine_inputs_from_body, AuthStatementError,
 };
 pub use auth_unified_sweep::{
     prove_sweep_auth_shift, prove_sweep_auth_unified, verify_sweep_auth_shift,
@@ -199,4 +205,10 @@ pub use spine_unified_sweep::{
     SweepSpineShiftReduction, SweepSpineUnifiedProof, SweepSpineUnifiedReduction,
     N_SWEEP_UNIFIED_WITNESS_CLAIMS, SWEEP_SPINE_SHIFT_ROUND_DEGREE,
     SWEEP_SPINE_UNIFIED_ROUND_DEGREE,
+};
+pub use wallet_authorization::{
+    max_authorization_bytes_for_shape, prove_wallet_authorization, verify_wallet_authorization,
+    AuthorizationDecodeError, AuthorizationEncodeError, ProveAuthorizationError,
+    VerifyAuthorizationError, WalletAuthorizationBundle, MAX_AUTHORIZATION_BUNDLE_BYTES,
+    MAX_STANDARD_AUTHORIZATION_BYTES, MAX_SWEEP_AUTHORIZATION_BYTES,
 };

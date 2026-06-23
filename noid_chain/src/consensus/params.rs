@@ -71,14 +71,32 @@ const _: () = assert!(
 // Finality
 // ---------------------------------------------------------------------------
 
-/// After this many confirmations a block is considered final.
-/// Reorgs deeper than this are rejected by fork choice.
-pub const FINALITY_DEPTH: u64 = 18; // 3 × EPOCH_LENGTH
+/// Consensus hard-finality depth.
+///
+/// Reorgs that would change the finalized prefix are rejected by fork choice.
+/// `18` is suitable only as an initial testnet value (~4.5 minutes at 15s
+/// blocks); mainnet must choose this independently in protocol parameters.
+pub const CONSENSUS_FINALITY_DEPTH: u64 = 18; // testnet initial value
+
+/// Undo-log retention depth for local shallow reorg recovery.
+///
+/// This is intentionally separate from consensus finality. Retention may be
+/// tuned for operational needs; it must not silently define finality.
+pub const UNDO_RETENTION_DEPTH: u64 = 18;
+
+/// Recent full-block retention depth for peer serving.
+pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
+
+/// Backwards-compatible alias during the FIX1 migration.
+pub const FINALITY_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
+
+/// Backwards-compatible alias for in-memory undo pruning.
+pub const UNDO_LOG_RETENTION: u64 = UNDO_RETENTION_DEPTH;
 
 /// Number of finalised block headers used for the expansion trigger median.
 /// Using median over this window makes the trigger immune to single-block spam.
-/// Must be ≤ FINALITY_DEPTH so the required headers are always available as undo logs.
-pub const EXPANSION_WINDOW: u64 = FINALITY_DEPTH; // 18 blocks
+/// Must be ≤ available recent-header retention.
+pub const EXPANSION_WINDOW: u64 = CONSENSUS_FINALITY_DEPTH; // 18 blocks
 
 // ---------------------------------------------------------------------------
 // Slot state
@@ -127,15 +145,15 @@ pub const GENESIS_TARGET: [u8; 32] = {
 /// The difficulty floor ensures every block contributes at least:
 ///   block_work(GENESIS_TARGET) = 2^26 = 67,108,864  (26 leading zeros)
 ///
-/// We require FINALITY_DEPTH (18) blocks' worth of work:
+/// We require CONSENSUS_FINALITY_DEPTH (18) blocks' worth of work:
 ///
-///   MIN_SNAPSHOT_CHAINWORK = FINALITY_DEPTH × block_work(GENESIS_TARGET)
+///   MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH × block_work(GENESIS_TARGET)
 ///                          = 18 × 2^26 = 1,207,959,552 = 0x4800_0000
 ///
-/// # Why FINALITY_DEPTH?
+/// # Why CONSENSUS_FINALITY_DEPTH?
 ///
 /// The recursive proof updater only builds proofs for blocks that are
-/// FINALITY_DEPTH behind tip. Until a peer has 18+ finalized blocks it has
+/// CONSENSUS_FINALITY_DEPTH behind tip. Until a peer has 18+ finalized blocks it has
 /// NO recursive proof. Requiring 18 blocks of chainwork aligns these two:
 ///
 ///   tip < 18  → no recursive proof AND chainwork < threshold → peer cannot serve sync
@@ -150,7 +168,7 @@ pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
     // 18 × 2^26 = 0x12 × 0x400_0000 = 0x4800_0000 = 1,207,959,552
     // In LE bytes: byte[3] = 0x48 (bits 24-31)
     // Verify: 0x48 × 2^24 = 72 × 16,777,216 = 1,207,959,552 = 18 × 67,108,864 ✓
-    w[3] = 0x48; // = FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
+    w[3] = 0x48; // = CONSENSUS_FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
     w
 };
 
@@ -167,14 +185,6 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // ---------------------------------------------------------------------------
 // DA retention
 // ---------------------------------------------------------------------------
-
-/// How many blocks to keep for undo logs (local reorg) AND for serving to peers
-/// (shallow fork resolution).
-///
-/// Both needs are identical: you can only reorg up to FINALITY_DEPTH blocks,
-/// and peers only need blocks within that window (deeper forks use O(1) snapshot
-/// sync instead). A single constant avoids the confusion of two separate values.
-pub const UNDO_LOG_RETENTION: u64 = FINALITY_DEPTH;
 
 // ---------------------------------------------------------------------------
 // Emission  (ROADMAP2.md §Emission)
@@ -255,7 +265,7 @@ mod tests {
     fn epoch_timing_is_consistent() {
         assert_eq!(HALFLIFE, EPOCH_LENGTH * BLOCK_TIME);
         assert_eq!(HALFLIFE, 90, "HALFLIFE = 6 epochs × 15s");
-        assert_eq!(FINALITY_DEPTH, 3 * EPOCH_LENGTH);
+        assert_eq!(CONSENSUS_FINALITY_DEPTH, 3 * EPOCH_LENGTH);
     }
 
     #[test]

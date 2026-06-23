@@ -15,15 +15,18 @@
 pub mod mdbx_context;
 pub mod mdbx_store;
 pub mod memory;
+pub mod meta;
 pub mod serial;
 
 pub use mdbx_context::{MdbxChainContext, MdbxContextError};
 pub use mdbx_store::{MdbxStore, StoreError};
 pub use memory::RamBackend;
+pub use meta::{ConsensusMeta, FinalizedCheckpoint};
 pub use serial::{
-    decode_chain_tip, decode_header, decode_segment, decode_state_meta, decode_tx_index_value,
-    decode_undo_log, encode_chain_tip, encode_header, encode_segment, encode_slot_value,
-    encode_state_meta, encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
+    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header, decode_segment,
+    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    encode_consensus_meta, encode_header, encode_segment, encode_slot_value, encode_state_meta,
+    encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
     encoded_segments_total_len, u64_key,
 };
 
@@ -90,8 +93,8 @@ pub trait BlockStore: Send + Sync {
     /// Retrieve a header by its `H_BLOCK` hash.
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
 
-    /// Retrieve a recent block's raw bytes. Only available for the last
-    /// `FINALITY_DEPTH` blocks; returns `None` for older blocks.
+    /// Retrieve a recent block's raw bytes. Only available for the recent
+    /// block retention window; returns `None` for older blocks.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     /// Retrieve the persisted recursive chain proof (~38 KB encoded). `None` means

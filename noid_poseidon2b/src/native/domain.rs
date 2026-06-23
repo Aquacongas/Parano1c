@@ -61,7 +61,7 @@ pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
 /// pad-flushed variable-length `hash_leaf` under the same IV.
 pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
 /// Claims commitment: Poseidon2b sponge over all claimed slot data
-/// (inputs + outputs). Bridges LogicProof to BlockStateBinding.
+/// (inputs + outputs). Bridges WalletAuthorizationBundle to BlockStateBinding.
 pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
 
 #[cfg(test)]

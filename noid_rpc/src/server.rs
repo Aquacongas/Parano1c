@@ -635,7 +635,7 @@ impl ParanoidApiServer for RpcHandler {
             n_inputs: e.tx.body.inputs.iter().filter(|i| i.valid).count(),
             n_outputs: e.tx.body.outputs.iter().filter(|o| o.valid).count(),
             admitted_height: e.admitted_height,
-            has_proof: e.cached_algebraic_proof.is_some(),
+            has_authorization: e.cached_authorization.is_some(),
         }))
     }
 
@@ -1493,7 +1493,7 @@ impl ParanoidApiServer for RpcHandler {
                     n_inputs,
                     n_outputs,
                     admitted_height: e.admitted_height,
-                    has_proof: e.cached_algebraic_proof.is_some(),
+                    has_authorization: e.cached_authorization.is_some(),
                 }
             })
             .collect();

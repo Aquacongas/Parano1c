@@ -52,9 +52,10 @@ use crate::{
 
 use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_gkr::{
-    AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot, SweepAuthPublicInputs,
+    standard_auth_public_from_body, sweep_auth_public_from_body, sweep_spine_inputs_from_body,
+    AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot,
+    SweepAuthPublicInputs,
 };
-use noid_stark::prove_logic_sweep::sweep_spine_inputs_from_body;
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxShape,
     MAX_INPUTS, MAX_OUTPUTS,
@@ -524,7 +525,10 @@ pub fn verify_sweep_bucket_from_block(
     for (k, block_idx) in bucket.meta.tx_indices.iter().copied().enumerate() {
         let tx = &block.transactions[block_idx as usize];
         let pi = &bucket.tx_pis[k];
-        sweep_spines.push(sweep_spine_inputs_from_body(&tx.body));
+        sweep_spines.push(
+            sweep_spine_inputs_from_body(&tx.body)
+                .expect("canonical sweep spine inputs from block body"),
+        );
         sweep_auth_public.push(build_sweep_auth_public_for_tx(tx, pi));
 
         let (air, _trace) = sweep_logic_air_and_trace_from_body(&tx.body);
@@ -571,21 +575,11 @@ pub fn build_spine_inputs_list(block: &Block) -> Vec<SpineInputs> {
         .collect()
 }
 
-/// Reconstruct `AuthPublicInputs` for each non-coinbase transaction.
+/// Reconstruct `AuthPublicInputs` for each standard non-coinbase transaction.
 ///
-/// Live inputs (`valid = true`): `expected_address = inp.owner.as_fields()`,
-/// `expected_auth_tag = inp.auth_tag.as_fields()`.  Both values are
-/// one-way hashes of the spend_secret — safe to use publicly.
-///
-/// Dummy inputs (`valid = false`): address/tag are computed from a zero
-/// spend_secret via `compute_auth_boundary`.  This matches what the wallet
-/// prover supplies and does not reveal any private key material.
+/// The statement is derived only from the canonical transaction body; no
+/// prover-provided public boundary is accepted.
 pub fn build_auth_public_list(block: &Block, proof: &BlockProof) -> Vec<AuthPublicInputs> {
-    use noid_core::Block128;
-    use noid_gkr::{compute_auth_boundary, AuthCircuit, N_AUTH_INPUTS};
-
-    let auth_circuit = AuthCircuit::build();
-
     let Some(bucket) = proof.standard_bucket.as_ref() else {
         return Vec::new();
     };
@@ -594,72 +588,16 @@ pub fn build_auth_public_list(block: &Block, proof: &BlockProof) -> Vec<AuthPubl
         .meta
         .tx_indices
         .iter()
-        .zip(bucket.tx_pis.iter())
-        .map(|(block_tx_index, pi)| {
+        .map(|block_tx_index| {
             let tx = &block.transactions[*block_tx_index as usize];
-            let tx_body_hash = pi.tx_body_hash.as_fields();
-
-            // Dummy inputs use zero spend_secret.  Compute their boundary once.
-            let zero_secrets = [[Block128(0); 2]; N_AUTH_INPUTS];
-            let (dummy_addresses, dummy_auth_tags) =
-                compute_auth_boundary(&auth_circuit, zero_secrets, tx_body_hash);
-
-            let mut expected_address = [[Block128(0); 2]; N_AUTH_INPUTS];
-            let mut expected_auth_tag = [[Block128(0); 2]; N_AUTH_INPUTS];
-
-            for (i, inp) in tx.body.inputs.iter().take(N_AUTH_INPUTS).enumerate() {
-                if inp.valid {
-                    // Live input: use the one-way hashes from the wire format.
-                    // owner = H_ADDR(spend_secret)  — already computed by wallet.
-                    // auth_tag = H_AUTH(spend_secret, tx_body_hash) — idem.
-                    expected_address[i] = inp.owner.as_fields();
-                    expected_auth_tag[i] = inp.auth_tag.as_fields();
-                } else {
-                    // Dummy input: boundary derived from zero spend_secret.
-                    expected_address[i] = dummy_addresses[i];
-                    expected_auth_tag[i] = dummy_auth_tags[i];
-                }
-            }
-
-            AuthPublicInputs {
-                tx_body_hash,
-                expected_address,
-                expected_auth_tag,
-            }
+            standard_auth_public_from_body(&tx.body)
+                .expect("canonical standard auth statement from block body")
         })
         .collect()
 }
 
-fn build_sweep_auth_public_for_tx(tx: &Transaction, pi: &PublicInputs) -> SweepAuthPublicInputs {
-    use noid_core::Block128;
-    use noid_gkr::{compute_sweep_auth_boundary, SweepAuthCircuit, N_SWEEP_AUTH_INPUTS};
-
-    debug_assert_eq!(tx.body.shape, TxShape::Sweep25x2);
-    let tx_body_hash = pi.tx_body_hash.as_fields();
-    let zero_secrets = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
-    let auth_circuit = SweepAuthCircuit::build();
-    let (dummy_addresses, dummy_auth_tags) =
-        compute_sweep_auth_boundary(&auth_circuit, zero_secrets, tx_body_hash);
-
-    let mut expected_address = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
-    let mut expected_auth_tag = [[Block128(0); 2]; N_SWEEP_AUTH_INPUTS];
-    for i in 0..N_SWEEP_AUTH_INPUTS {
-        if let Some(inp) = tx.body.inputs.get(i) {
-            if inp.valid {
-                expected_address[i] = inp.owner.as_fields();
-                expected_auth_tag[i] = inp.auth_tag.as_fields();
-                continue;
-            }
-        }
-        expected_address[i] = dummy_addresses[i];
-        expected_auth_tag[i] = dummy_auth_tags[i];
-    }
-
-    SweepAuthPublicInputs {
-        tx_body_hash,
-        expected_address,
-        expected_auth_tag,
-    }
+fn build_sweep_auth_public_for_tx(tx: &Transaction, _pi: &PublicInputs) -> SweepAuthPublicInputs {
+    sweep_auth_public_from_body(&tx.body).expect("canonical sweep auth statement from block body")
 }
 
 fn proof_claim_commitments_by_block_index(
@@ -860,7 +798,7 @@ pub fn build_state_binding_airs(
 
 /// Build `TxLogicAir` instances from a block's transactions.
 ///
-/// Coinbase transactions are excluded from LogicProof coverage (validated by
+/// Coinbase transactions are excluded from WalletAuthorizationBundle coverage (validated by
 /// consensus rules only). This function skips them.
 ///
 /// The returned AIRs are in the same order as non-coinbase txs in the block.

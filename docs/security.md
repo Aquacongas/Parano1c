@@ -690,7 +690,7 @@ Implementation anchors:
 ```text
 noid_tx/src/wire.rs
 noid_tx/src/intent.rs
-noid_stark/tests/sweep_logic_proof.rs
+noid_gkr/tests/sweep_auth_killshot.rs
 ```
 
 Implementation tests:
@@ -702,7 +702,7 @@ cargo test -p noid_stark --release
 Tests include:
   spend_secret_absent_from_wire
   sweep_auth_slices_are_not_part_of_logic_wire_shape
-  sweep_logic_proves_and_verifies_25_live_inputs
+  sweep_auth_killshot_proves_and_verifies_25_live_inputs
 ```
 
 ---
@@ -738,7 +738,7 @@ Standard and sweep transactions are aggregated in shape-specific buckets. For ea
 
 1. bucket transaction coverage and order;
 2. canonical public inputs reconstructed from `TxBody`;
-3. wallet logic proof / AuthGKR / SpineGKR outputs;
+3. wallet authorization / AuthGKR outputs and canonical spine outputs;
 4. bucket algebraic terminal relation;
 5. source-bound FRI-Binius mixed opening.
 
@@ -1209,21 +1209,21 @@ Blocks above the inline threshold are propagated as compact header announcements
 | Surface | Enforcement |
 | --- | --- |
 | RPC hex input | `noid_rpc/src/server.rs` checks maximum hex characters before `hex::decode` for tx intent, block, block proof, auth sidecar, receipt, and salt. |
-| Mempool admission | `noid_mempool/src/pool.rs` checks global and shape-specific transaction caps before body-hash recomputation and LogicProof verification and checks total retained bytes before final insertion. |
+| Mempool admission | `noid_mempool/src/pool.rs` checks global and shape-specific transaction caps before body-hash recomputation and AuthGKR authorization verification and checks total retained bytes before final insertion. |
 | Core mempool byte accounting | `noid_chain/src/mempool.rs::total_intent_bytes`. |
 | P2P transaction gossip | `noid_p2p/src/network.rs` and `noid_node/src/main.rs` use the shared transaction intent cap before decode. |
 | P2P inline/pulled blocks | Block body, proof, sidecar, and combined proof+sidecar caps are checked before forwarding to node validation. |
 | Block validation | `noid_block/src/validate.rs::validate_block_from_network` checks proof and sidecar caps before `bincode::deserialize`. |
 | Mempool sync | Server and client truncate by transaction count and total bytes. |
 | Orphan pool | `noid_node/src/main.rs` evicts by count and retained bytes. |
-| Snapshot sync | Manifest `segment_ids`/`segment_roots` shape, sparse-root equality to the tip header state root, segment byte caps, exact decode, per-segment `eff_log`, and per-segment FRI root equality are checked before collection/apply. |
+| Snapshot sync | FIX1 public arbitrary-peer snapshot sync is disabled fail-closed. Legacy manifest/segment caps remain as wire DoS guards, but accepted snapshot install requires future immutable checkpoint generation and exact-height recursive verification. |
 | Gossipsub | Large blocks use compact announce + pull; only small inline payloads are gossiped. |
 
 ### 11.3 Theorem 3: bounded pre-verification resource exposure
 
 **Claim.** For the surfaces listed in Section 11.2, an unauthenticated peer or RPC caller cannot force the node to decode, allocate, store, or verify a payload above the corresponding cap before the cap check is applied.
 
-**Proof sketch.** The shared constants in `wire_limits.rs` are imported by RPC, P2P, mempool, node, and block validation paths. The relevant checks occur on byte length or hex-character length before expensive operations: `hex::decode`, `bincode::deserialize`, proof verification, mempool insertion, orphan retention, or snapshot segment collection. Snapshot sync additionally authenticates the manifest segment-root table against the snapshot tip state root and checks each segment root before inserting decoded columns into the collected snapshot set. The tests in `wire_limits.rs` assert ordering relationships among caps, saturating combined proof+sidecar arithmetic, and shape-specific transaction cap consistency.
+**Proof sketch.** The shared constants in `wire_limits.rs` are imported by RPC, P2P, mempool, node, and block validation paths. The relevant checks occur on byte length or hex-character length before expensive operations: `hex::decode`, `bincode::deserialize`, proof verification, mempool insertion, orphan retention, or legacy snapshot segment collection. In FIX1, public snapshot install itself fails closed; manifest/segment checks are retained only as pre-verification resource guards until the future checkpoint-generation path replaces them. The tests in `wire_limits.rs` assert ordering relationships among caps, saturating combined proof+sidecar arithmetic, and shape-specific transaction cap consistency.
 
 Implementation tests:
 
@@ -1241,8 +1241,8 @@ Tests:
 Benchmark observations:
 
 ```text
-Standard4x8 wallet bundle: ~288–291 KiB
-Sweep25x2 wallet bundle:   ~284–285 KiB
+Standard4x8 wallet authorization bundle: 117.75–120.85 KiB
+Sweep25x2 wallet authorization bundle:   165.00–166.91 KiB
 
 Current largest `block_scaling` row, 100 standard-shape tx fixture mix:
   full block proof:       10.75 MiB
@@ -1253,9 +1253,10 @@ Current largest `block_scaling` row, 100 standard-shape tx fixture mix:
 These measurements fit under configured caps:
 
 ```text
-tx intent cap by shape: 384 KiB
-block proof cap:        32 MiB
-proof+sidecar cap:      48 MiB
+standard tx intent cap: 256 KiB
+sweep tx intent cap:    320 KiB
+block proof cap:         32 MiB
+proof+sidecar cap:       48 MiB
 ```
 
 The measurements are not cryptographic assumptions. They show that the measured proof sizes fit inside the configured resource envelope.
@@ -1463,7 +1464,39 @@ The proof stack remains transparent and binary-tower-native. Adding KZG/IPA/Pede
 
 ---
 
-## 15. Primary code index
+## 15. Auth-only Wallet Authorization
+
+Wallet authorization is now the wallet/mempool surface; canonical TxLogic remains
+the block-acceptance surface.
+
+Security theorem:
+
+```text
+If mempool admission accepts a non-coinbase TxIntent, then:
+  1. the public TxBody predicate was checked natively and exactly;
+  2. the WalletAuthorizationBundle verifies against Auth public inputs derived
+     only from canonical TxBody fields;
+  3. no prover-supplied auth_public or wallet STARK public boundary is trusted;
+  4. block acceptance still requires the canonical BlockProof rebuilt from TxBody.
+```
+
+Implementation anchors:
+
+| Surface | Files |
+| --- | --- |
+| Exact public predicate | `noid_tx/src/public_logic.rs` |
+| Auth public statement derivation | `noid_gkr/src/auth_statement.rs` |
+| Auth-only wallet artifact | `noid_gkr/src/wallet_authorization.rs` |
+| Mempool admission order and caps | `noid_mempool/src/pool.rs`, `noid_chain/src/consensus/wire_limits.rs` |
+| Block-side canonical TxLogic rebuild | `noid_block/src/witness_builder.rs`, `noid_block/src/validate.rs` |
+
+Tests cover strict authorization decoding, wrong-shape rejection, proof/body
+tamper rejection, missing/extra/wrong secret rejection before proving, and raw
+secret absence from serialized wallet authorization. Existing block tests cover
+that block witnesses still rebuild public AIR from `TxBody` and verify the
+canonical block relation.
+
+## 16. Primary code index
 
 | Area | Files |
 | --- | --- |

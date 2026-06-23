@@ -13,9 +13,9 @@
 //!    ├─ Pre-proof filter (lock, brief): all cheap checks on current view
 //!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
 //!    │   Extracts log_slots: u32 only — NO ChainView clone.
-//!    │   DoS guard: invalid txs rejected here, never reach LogicProof verification.
+//!    │   DoS guard: invalid txs rejected here, never reach AuthGKR verification.
 //!    │
-//!    ├─ LogicProof verification (no lock): ~84ms, semaphore-bounded
+//!    ├─ AuthGKR verification (no lock): ~84ms, semaphore-bounded
 //!    │
 //!    └─ Final admission (lock): re-run all checks against current state (TOCTOU guard)
 //!                        anchor_height derived here → pool.admit
@@ -27,9 +27,9 @@
 //!
 //! ## Pre-proving cache
 //!
-//! When a wallet submits a `TxIntent`, it includes a `WalletProofBundle`
-//! (LogicProof + auth_slices). The pool stores this bundle in
-//! `MempoolEntry.cached_algebraic_proof` immediately at admission.
+//! When a wallet submits a `TxIntent`, it includes a `WalletAuthorizationBundle`
+//! (AuthGKR + auth_slices). The pool stores this bundle in
+//! `MempoolEntry.cached_authorization` immediately at admission.
 //! The block assembler uses cached bundles so that `prove_block` only
 //! needs to run the unified block-level SpineGKR + single FRI — the
 //! per-tx wallet work is already done.
@@ -41,7 +41,7 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use noid_chain::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_TXS};
 use noid_chain::consensus::wire_limits::{
-    max_tx_intent_bytes_for_shape, MAX_TX_INTENT_BYTES_GLOBAL,
+    max_authorization_bytes_for_shape, max_tx_intent_bytes_for_shape, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::consensus::{
     checks::validate_tx_consensus, pow::full_block_hash, required_fee_for_tx_body,
@@ -50,7 +50,7 @@ use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
 use noid_core::Block128;
 use noid_poseidon2b::primitives::TxBodyHash;
-use noid_tx::{Transaction, TxIntent};
+use noid_tx::{validate_public_tx_logic, Transaction, TxIntent};
 
 use crate::config::MempoolConfig;
 use crate::error::SubmitError;
@@ -87,10 +87,10 @@ pub struct AsyncMempool {
     state: Arc<Mutex<MempoolState>>,
     events: broadcast::Sender<MempoolEvent>,
     config: Arc<MempoolConfig>,
-    /// Semaphore limiting concurrent LogicProof verification tasks.
-    /// Bounds CPU usage: at most `config.zk_verify_workers` proofs in flight.
+    /// Semaphore limiting concurrent AuthGKR verification tasks.
+    /// Bounds CPU usage: at most `config.auth_verify_workers` proofs in flight.
     /// Set to 0 in config → semaphore with MAX permits (no limit).
-    zk_semaphore: Arc<Semaphore>,
+    auth_verify_semaphore: Arc<Semaphore>,
 }
 
 impl AsyncMempool {
@@ -109,18 +109,18 @@ impl AsyncMempool {
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
         };
-        let max_permits = if config.zk_verify_workers == 0 {
-            // 0 = unlimited (native-only mode or testing)
+        let max_permits = if config.auth_verify_workers == 0 {
+            // 0 = unlimited concurrency; verification is still required
             usize::MAX / 2 // Semaphore::MAX_PERMITS
         } else {
-            config.zk_verify_workers
+            config.auth_verify_workers
         };
-        let zk_semaphore = Arc::new(Semaphore::new(max_permits));
+        let auth_verify_semaphore = Arc::new(Semaphore::new(max_permits));
         Self {
             state: Arc::new(Mutex::new(state)),
             events,
             config: Arc::new(config),
-            zk_semaphore,
+            auth_verify_semaphore,
         }
     }
 
@@ -142,7 +142,7 @@ impl AsyncMempool {
     /// 4. No slot conflict with admitted mempool txs
     /// 5. Input slots live in state, output slots empty
     ///
-    /// LogicProof verification (`verify_logic`) is performed synchronously (in a
+    /// AuthGKR authorization verification is performed synchronously (in a
     /// `spawn_blocking` task) BEFORE the pool mutex is acquired, so invalid
     /// proofs are rejected at the mempool boundary without holding the lock.
     ///
@@ -168,56 +168,33 @@ impl AsyncMempool {
 
         // ── Stateless sanity check (no lock, no IO) ────────────────────
         // One hash computation rejects malformed intents before touching any
-        // shared state. Previously this ran after LogicProof verification — moved here so
+        // shared state. Previously this ran after AuthGKR verification — moved here so
         // hash-confusion spam is free to reject.
         if !intent.tx_body.is_coinbase {
-            use noid_tx::hash_tx_body_for_shape;
-            if intent.tx_body.inputs.len() > intent.tx_body.shape.max_inputs() {
-                return Err(SubmitError::MalformedIntent(format!(
-                    "inputs exceed {:?} max {}",
-                    intent.tx_body.shape,
-                    intent.tx_body.shape.max_inputs()
-                )));
-            }
-            if intent.tx_body.outputs.len() > intent.tx_body.shape.max_outputs() {
-                return Err(SubmitError::MalformedIntent(format!(
-                    "outputs exceed {:?} max {}",
-                    intent.tx_body.shape,
-                    intent.tx_body.shape.max_outputs()
-                )));
-            }
-            let computed = hash_tx_body_for_shape(
-                intent.tx_body.shape,
-                &intent.tx_body.epoch_anchor,
-                intent.tx_body.fee,
-                &intent.tx_body.inputs,
-                &intent.tx_body.outputs,
-                intent.tx_body.is_coinbase,
-            );
-            if computed != intent.tx_body_hash {
+            let facts = validate_public_tx_logic(&intent.tx_body)
+                .map_err(|e| SubmitError::MalformedIntent(format!("public tx logic: {e}")))?;
+            if facts.tx_body_hash != intent.tx_body_hash {
                 return Err(SubmitError::MalformedIntent(
                     "tx_body_hash does not match body (hash confusion attack)".into(),
                 ));
             }
         }
 
-        if !intent.tx_body.is_coinbase && intent.logic_proof_bytes.is_empty() {
+        if !intent.tx_body.is_coinbase && intent.authorization_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
-        if intent.logic_proof_bytes.len() > shape_intent_cap {
+        let shape_authorization_cap = max_authorization_bytes_for_shape(intent.tx_body.shape);
+        if intent.authorization_bytes.len() > shape_authorization_cap {
             return Err(SubmitError::ProofTooLarge {
-                actual: intent.logic_proof_bytes.len(),
-                max: shape_intent_cap,
+                actual: intent.authorization_bytes.len(),
+                max: shape_authorization_cap,
             });
         }
         let needs_zk = !intent.tx_body.is_coinbase;
 
         // ── Cheap pre-filter (lock held briefly) ─────────────────
-        // Runs all O(1)–O(ANCHOR_DEPTH) checks on current state.
-        // Rejects invalid txs BEFORE LogicProof verification — the DoS guard.
-        // Extracts only `log_slots: u32`; avoids cloning ChainView
-        // (which carries SegmentedFriState + ~28 KB of recent headers).
-        let log_slots: u32 = {
+        // Runs all O(1)-O(ANCHOR_DEPTH) state checks before expensive Auth verification.
+        {
             let st = self.state.lock().await;
             if st.pool.contains(&intent.tx_body_hash) {
                 return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
@@ -233,26 +210,23 @@ impl AsyncMempool {
                 });
             }
             let tx = intent_to_transaction(&intent)?;
-            // All cheap checks. anchor_height is discarded here — re-derived
-            // under lock in the final admission step against current state (TOCTOU safety).
             let _ = run_admission_checks(&tx, &st)?;
-            st.view.log_slots()
-        }; // lock released — no ChainView clone
+        }
 
-        // ── LogicProof verification (CPU-heavy, outside lock, semaphore-bounded) ─
+        // ── AuthGKR verification (CPU-heavy, outside lock, semaphore-bounded) ─
         // Runs only when the pre-filter passed — invalid fee/anchor/slot txs are
         // already gone.  Semaphore caps concurrent CPU threads.
         if needs_zk {
-            let proof_bytes = intent.logic_proof_bytes.clone();
+            let proof_bytes = intent.authorization_bytes.clone();
             let tx_body_clone = intent.tx_body.clone();
 
             let _permit =
-                self.zk_semaphore.acquire().await.map_err(|_| {
+                self.auth_verify_semaphore.acquire().await.map_err(|_| {
                     SubmitError::Internal("proof-verification semaphore closed".into())
                 })?;
 
             tokio::task::spawn_blocking(move || {
-                zk_verify_intent(&tx_body_clone, &proof_bytes, log_slots)
+                verify_intent_authorization(&tx_body_clone, &proof_bytes)
             })
             .await
             .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
@@ -261,7 +235,7 @@ impl AsyncMempool {
 
         // ── Final admission under lock ───────────────────────
         // Re-run all cheap checks against CURRENT state: the chain may have
-        // advanced during the ~84 ms LogicProof verification window (new block → new
+        // advanced during the ~84 ms AuthGKR verification window (new block → new
         // nullifiers, spent slots, changed fee floor).  This is the
         // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
@@ -289,7 +263,7 @@ impl AsyncMempool {
         // --- Admit ---
         let fee = tx.body.fee.min(u64::MAX as u128) as u64;
         let is_coinbase = tx.body.is_coinbase;
-        let has_zk_proof = needs_zk;
+        let has_authorization = needs_zk;
         let tip_height = st.view.tip_height;
         match st.pool.admit(tx.clone(), tip_height, anchor_height) {
             Ok(()) => {
@@ -315,8 +289,9 @@ impl AsyncMempool {
         }
 
         // Store wallet proof bundle bytes for miner block assembly.
-        if !intent.logic_proof_bytes.is_empty() {
-            st.pool.set_cached_proof(&hash, intent.logic_proof_bytes);
+        if !intent.authorization_bytes.is_empty() {
+            st.pool
+                .set_cached_authorization(&hash, intent.authorization_bytes);
         }
         // Store raw intent bytes for mempool-sync serving to new peers.
         st.pool.set_intent_bytes(&hash, intent_bytes.clone());
@@ -329,8 +304,10 @@ impl AsyncMempool {
             fee,
             intent_bytes,
         });
-        if has_zk_proof {
-            let _ = self.events.send(MempoolEvent::TxPreProved { hash });
+        if has_authorization {
+            let _ = self
+                .events
+                .send(MempoolEvent::TxAuthorizationVerified { hash });
         }
 
         tracing::debug!(
@@ -391,7 +368,7 @@ impl AsyncMempool {
 
         // Detect state expansion: if log_slots changed, all non-coinbase TXs in the
         // pool were proved with the old log_slots and cannot be included in future
-        // blocks (their LogicProofs are bound to log_slots via PublicInputs).
+        // blocks (their AuthGKRs are bound to log_slots via PublicInputs).
         // Evict them now so the miner doesn't waste time on stale proofs.
         let old_log_slots = st.view.log_slots();
         let new_log_slots = new_view.log_slots();
@@ -534,11 +511,11 @@ impl AsyncMempool {
     ///
     /// These TXs were in reverted blocks. We log the count for observability
     /// and evict any that happen to be sitting in the pool already (duplicate
-    /// re-submission race). Full re-admission with fresh LogicProofs is the
+    /// re-submission race). Full re-admission with fresh AuthGKRs is the
     /// wallet's responsibility — wallets detect the unconfirmed state via
     /// wallet scan and resubmit.
     ///
-    /// NOTE: We do not have the original LogicProof bytes after a reorg (they
+    /// NOTE: We do not have the original AuthGKR bytes after a reorg (they
     /// are not persisted). Durable TX storage could enable
     /// automatic re-admission without wallet involvement.
     pub async fn readmit_after_reorg(&self, tx_hashes: Vec<TxBodyHash>) {
@@ -809,150 +786,19 @@ fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitEr
 }
 
 // ---------------------------------------------------------------------------
-// Helper: LogicProof verify_logic
+// Helper: Auth-only wallet authorization verification
 // ---------------------------------------------------------------------------
 
-/// Verify the wallet's LogicProof for a non-coinbase tx.
+/// Verify the wallet authorization for a non-coinbase tx.
 /// Returns Ok(()) if valid, Err(String) with reason if invalid.
-fn zk_verify_intent(
+fn verify_intent_authorization(
     tx_body: &noid_tx::TxBody,
-    proof_bytes: &[u8],
-    log_slots: u32,
+    authorization_bytes: &[u8],
 ) -> Result<(), String> {
-    use noid_stark::wallet_bundle::WalletProofBundle;
+    use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
 
-    // Decode the bundle.
     let bundle =
-        WalletProofBundle::from_bytes(proof_bytes).map_err(|e| format!("bundle decode: {e}"))?;
-    if bundle.shape() != tx_body.shape {
-        return Err(format!(
-            "bundle shape {:?} does not match tx body shape {:?}",
-            bundle.shape(),
-            tx_body.shape
-        ));
-    }
-
-    match bundle {
-        WalletProofBundle::Standard4x8(bundle) => {
-            verify_standard_intent(tx_body, log_slots, bundle)
-        }
-        WalletProofBundle::Sweep25x2(bundle) => verify_sweep_intent(tx_body, log_slots, bundle),
-    }
-}
-
-fn verify_standard_intent(
-    tx_body: &noid_tx::TxBody,
-    log_slots: u32,
-    bundle: noid_stark::wallet_bundle::StandardWalletProofBundle,
-) -> Result<(), String> {
-    use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
-    use noid_core::{Block128, TowerField};
-    use noid_gkr::SpineInputs;
-    use noid_stark::prove_logic::verify_logic;
-    use noid_tx::{compute_claims_commitment, PublicInputs, MAX_INPUTS, MAX_OUTPUTS};
-
-    // Build AIR from public tx body.
-    let pins = boundary_pins_from_body(tx_body);
-    let air = TxLogicAir::new(pins.clone());
-
-    // Build PublicInputs (same as build_public_inputs in witness_builder.rs).
-    let [lo, hi] = pins.tx_body_hash;
-    let mut hash_bytes = [0u8; 32];
-    hash_bytes[..16].copy_from_slice(&lo.to_u128().to_le_bytes());
-    hash_bytes[16..].copy_from_slice(&hi.to_u128().to_le_bytes());
-
-    let n_live_inputs = tx_body.inputs.iter().filter(|i| i.valid).count() as u8;
-    let n_live_outputs = tx_body.outputs.iter().filter(|o| o.valid).count() as u8;
-    let claims = compute_claims_commitment(&tx_body.inputs, &tx_body.outputs);
-
-    let mut is_activation = [false; MAX_OUTPUTS];
-    let mut is_deactivation = [false; MAX_INPUTS];
-    for (j, o) in tx_body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-        is_activation[j] = o.valid;
-    }
-    for (i, inp) in tx_body.inputs.iter().enumerate().take(MAX_INPUTS) {
-        is_deactivation[i] = inp.valid;
-    }
-
-    let pi = PublicInputs {
-        epoch_anchor: tx_body.epoch_anchor,
-        tx_body_hash: noid_poseidon2b::primitives::TxBodyHash(hash_bytes),
-        shape_id: tx_body.shape.id(),
-        fee: tx_body.fee,
-        n_live_inputs,
-        n_live_outputs,
-        coinbase_credit: 0,
-        log_slots,
-        claims_commitment: claims,
-        is_activation,
-        is_deactivation,
-    };
-
-    // Build SpineInputs from boundary pins.
-    let spine_inputs = SpineInputs {
-        epoch_anchor: pins.epoch_anchor,
-        fee_leaf: pins.fee_leaf,
-        input_leaves: pins.input_leaf_absorb,
-        output_leaves: pins.output_leaf_absorb,
-        is_coinbase_leaf: pins.is_coinbase_leaf,
-        pad_leaf: [Block128::ZERO; 2],
-    };
-
-    // Run verify_logic. auth_public comes directly from the bundle.
-    verify_logic(
-        &air,
-        &pi,
-        &spine_inputs,
-        &bundle.auth_public,
-        &bundle.logic_proof,
-    )
-    .map_err(|e| format!("verify_logic: {e:?}"))
-}
-
-fn verify_sweep_intent(
-    tx_body: &noid_tx::TxBody,
-    log_slots: u32,
-    bundle: noid_stark::wallet_bundle::SweepWalletProofBundle,
-) -> Result<(), String> {
-    use noid_air::composition::sweep_logic_air_and_trace_from_body;
-    use noid_stark::prove_logic_sweep::{sweep_spine_inputs_from_body, verify_sweep_logic};
-    use noid_tx::{
-        compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, MAX_INPUTS, MAX_OUTPUTS,
-    };
-
-    let (air, _trace) = sweep_logic_air_and_trace_from_body(tx_body);
-    let spine_inputs = sweep_spine_inputs_from_body(tx_body);
-    let tx_body_hash = hash_tx_body_for_shape(
-        tx_body.shape,
-        &tx_body.epoch_anchor,
-        tx_body.fee,
-        &tx_body.inputs,
-        &tx_body.outputs,
-        tx_body.is_coinbase,
-    );
-    let pi = PublicInputs {
-        epoch_anchor: tx_body.epoch_anchor,
-        tx_body_hash,
-        shape_id: tx_body.shape.id(),
-        fee: tx_body.fee,
-        n_live_inputs: tx_body.inputs.iter().filter(|i| i.valid).count() as u8,
-        n_live_outputs: tx_body.outputs.iter().filter(|o| o.valid).count() as u8,
-        coinbase_credit: 0,
-        log_slots,
-        claims_commitment: compute_claims_commitment(&tx_body.inputs, &tx_body.outputs),
-        // Sweep block-state activation/deactivation binding is handled in the
-        // later mixed-shape block milestone; the sweep wallet logic proof does
-        // not consume these standard-sized arrays.
-        is_activation: [false; MAX_OUTPUTS],
-        is_deactivation: [false; MAX_INPUTS],
-    };
-
-    verify_sweep_logic(
-        &air,
-        &pi,
-        &spine_inputs,
-        &bundle.auth_public,
-        &bundle.logic_proof,
-    )
-    .map_err(|e| format!("verify_sweep_logic: {e:?}"))
+        WalletAuthorizationBundle::from_bytes_for_shape(authorization_bytes, tx_body.shape)
+            .map_err(|e| format!("authorization decode: {e}"))?;
+    verify_wallet_authorization(tx_body, &bundle).map_err(|e| format!("authorization verify: {e}"))
 }

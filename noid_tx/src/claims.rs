@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 //! Claims commitment (C_claimed): a Poseidon2b sponge binding the
-//! wallet's claimed slot values to the LogicProof via the Fiat-Shamir
-//! channel. The miner's BlockStateBinding opens the same slots and
+//! claimed transaction slot values to canonical TxLogic public inputs. The miner's BlockStateBinding opens the same slots and
 //! verifies equality.
 
 use noid_core::Block128;
@@ -23,9 +22,9 @@ use crate::types::{TxInput, TxOutput};
 /// to minimize hashing cost without affecting security (the count of
 /// live entries is separately bound in PublicInputs).
 ///
-/// The resulting digest is absorbed into the LogicProof's Fiat-Shamir
-/// channel, cryptographically binding the proof to these specific slot
-/// claims. Any change to a claimed slot value forks the transcript.
+/// The resulting digest is absorbed into canonical TxLogic public inputs,
+/// cryptographically binding block-side proof/state binding to these
+/// slot claims. Any change to a claimed slot value changes the digest.
 pub fn compute_claims_commitment(inputs: &[TxInput], outputs: &[TxOutput]) -> Digest {
     let iv = capacity_iv(TAG_CLAIMS);
     let mut sponge = Poseidon2bSponge::with_iv(iv);

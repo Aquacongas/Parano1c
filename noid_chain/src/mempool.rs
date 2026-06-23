@@ -11,7 +11,7 @@
 //!
 //! Admission pipeline (cheapest first):
 //!   1. `validate_tx_for_mempool()` — native checks (~0ms)
-//!   2. [async] `verify_logic()` — LogicProof verification (~84ms, semaphore-bounded)
+//!   2. [async] `verify_wallet_authorization()` — AuthGKR authorization verification (semaphore-bounded)
 //!
 //! When a block is confirmed: `on_block_confirmed()` removes confirmed txs
 //! and returns reverted txs (from reorged blocks) to the pool.
@@ -77,14 +77,14 @@ pub struct MempoolEntry {
     /// that grow live state are deprioritised versus consolidation at similar fees.
     pub fee_rate: u64,
 
-    /// Cached `WalletProofBundle` bytes (LogicProof + auth_slices) provided
+    /// Cached `WalletAuthorizationBundle` bytes (AuthGKR authorization) provided
     /// by the wallet at submission time.  Populated immediately on admission;
     /// `None` only for coinbase or txs submitted without a proof bundle.
     ///
     /// The block assembler uses this to build `TxBlockWitness` without
     /// re-doing any per-tx work.  `prove_block` then only runs the unified
     /// block-level SpineGKR + single FRI opening.
-    pub cached_algebraic_proof: Option<Vec<u8>>,
+    pub cached_authorization: Option<Vec<u8>>,
 
     /// Raw `TxIntent` bytes as submitted by the wallet.
     /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
@@ -118,7 +118,7 @@ impl MempoolEntry {
             admitted_height: current_height,
             anchor_height,
             fee_rate,
-            cached_algebraic_proof: None,
+            cached_authorization: None,
             intent_bytes: Vec::new(), // populated by AsyncMempool::submit
         }
     }
@@ -355,10 +355,10 @@ impl Mempool {
 
     /// Store cached proof bytes for an admitted transaction.
     /// Called by the async mempool after admission to attach the wallet's
-    /// `WalletProofBundle` bytes (from `TxIntent.logic_proof_bytes`).
-    pub fn set_cached_proof(&mut self, hash: &TxBodyHash, proof_bytes: Vec<u8>) {
+    /// `WalletAuthorizationBundle` bytes (from `TxIntent.authorization_bytes`).
+    pub fn set_cached_authorization(&mut self, hash: &TxBodyHash, proof_bytes: Vec<u8>) {
         if let Some(entry) = self.entries.get_mut(hash) {
-            entry.cached_algebraic_proof = Some(proof_bytes);
+            entry.cached_authorization = Some(proof_bytes);
         }
     }
 

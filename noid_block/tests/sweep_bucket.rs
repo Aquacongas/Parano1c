@@ -31,6 +31,7 @@ use noid_gkr::{
     auth_gkr_channel, compute_auth_boundary, prove_auth_killshot, AuthCircuit, AuthInputs,
     AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot, N_AUTH_INPUTS,
 };
+use noid_gkr::{prove_wallet_authorization, WalletAuthorizationBundle};
 use noid_poseidon2b::primitives::{
     derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
 };
@@ -38,10 +39,6 @@ use noid_recursive::{
     accumulator::genesis_accumulator, air::RecursiveBlockAir, prove::prove_recursive_step,
     verify::verify_recursive_step,
 };
-use noid_stark::prove_logic_sweep::{
-    prove_sweep_logic, sweep_logic_witness_parts_from_body, SweepLogicWitness,
-};
-use noid_stark::{SweepWalletProofBundle, WalletProofBundle};
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxBody, TxInput,
     TxOutput, TxShape, MAX_INPUTS, MAX_OUTPUTS,
@@ -129,29 +126,6 @@ fn mk_sweep_body(n_live_inputs: usize) -> TxBody {
     }
 
     body
-}
-
-fn public_inputs_for_body(body: &TxBody) -> PublicInputs {
-    PublicInputs {
-        epoch_anchor: body.epoch_anchor,
-        tx_body_hash: hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        ),
-        shape_id: body.shape.id(),
-        fee: body.fee,
-        n_live_inputs: body.inputs.iter().filter(|i| i.valid).count() as u8,
-        n_live_outputs: body.outputs.iter().filter(|o| o.valid).count() as u8,
-        coinbase_credit: 0,
-        log_slots: TEST_LOG_SLOTS,
-        claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
-        is_activation: [false; MAX_OUTPUTS],
-        is_deactivation: [false; MAX_INPUTS],
-    }
 }
 
 fn tx_from_body(body: TxBody) -> Transaction {
@@ -519,21 +493,14 @@ fn standard_fixture_with_params(
     }
 }
 
-fn prove_sweep_bundle(body: &TxBody) -> WalletProofBundle {
-    let pi = public_inputs_for_body(body);
-    let (air, trace, auth_inputs, _) = sweep_logic_witness_parts_from_body(body);
-    assert!(air.check(&trace));
-    let witness = SweepLogicWitness {
-        air: &air,
-        trace: &trace,
-        pi: &pi,
-        auth_inputs: &auth_inputs,
-    };
-    let logic_proof = prove_sweep_logic(&witness).expect("prove sweep logic");
-    WalletProofBundle::Sweep25x2(SweepWalletProofBundle {
-        logic_proof,
-        auth_public: auth_inputs.to_public(),
-    })
+fn prove_sweep_bundle(body: &TxBody) -> WalletAuthorizationBundle {
+    let spend_secrets = body
+        .inputs
+        .iter()
+        .filter(|input| input.valid)
+        .map(|input| input.spend_secret.clone())
+        .collect();
+    prove_wallet_authorization(body, spend_secrets).expect("prove sweep authorization")
 }
 
 fn empty_bucketized_proof(n_tx: u32) -> BlockProof {

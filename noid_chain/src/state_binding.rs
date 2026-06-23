@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Block-level state binding: bridges LogicProofs to on-chain state.
+//! Block-level state binding: bridges canonical transaction claims to on-chain state.
 //!
-//! In the two-layer architecture, each wallet produces a stateless
-//! `LogicProof` that binds to a `claims_commitment` (C_claimed) — a
-//! Poseidon2b sponge over the wallet's declared `(slot_index, value,
+//! In the two-layer architecture, each transaction carries a `claims_commitment`
+//! (C_claimed) bound into canonical block-side TxLogic public inputs.
+//! It is a Poseidon2b sponge over the transaction's declared `(slot_index, value,
 //! owner)` tuples. The miner's `BlockStateBinding` opens the actual
 //! FRI-committed state at each claimed slot and verifies:
 //!
@@ -112,7 +112,7 @@ impl BlockStateBinding {
     /// the returned binding contains the opening data.
     ///
     /// `expected_commitments[i]` is the `claims_commitment` from the
-    /// i-th transaction's `PublicInputs` (carried inside the LogicProof).
+    /// i-th transaction's canonical `PublicInputs`.
     ///
     /// # epoch_anchor freshness
     ///

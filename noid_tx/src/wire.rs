@@ -119,7 +119,7 @@ fn take_shape(src: &mut &[u8]) -> Result<TxShape, WireError> {
 // transaction records. The public format is what goes into TxIntent and
 // is broadcast to the mempool. Full nodes never need spend_secret —
 // they only read (slot_index, value, owner) for state binding and
-// (auth_tag) is already committed via the LogicProof.
+// (auth_tag) is already committed via the WalletAuthorizationBundle.
 // ---------------------------------------------------------------------------
 
 /// Wire size of the FULL local format (includes spend_secret).

@@ -139,7 +139,7 @@ fn absorb_public_boundary<T: FiatShamir<Block128>>(
 /// Seeded with a domain tag only. The prove/verify functions absorb the
 /// public boundary internally. This makes the auth proof portable: it
 /// does NOT depend on any commitment cap, so the same proof works in
-/// both LogicProof and BlockProof contexts.
+/// both WalletAuthorizationBundle and BlockProof contexts.
 ///
 /// PRIVACY: By decoupling the auth channel from the Merkle commitment
 /// cap, the wallet can generate the auth proof locally (with

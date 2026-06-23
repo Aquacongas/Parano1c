@@ -5,11 +5,11 @@
 //!
 //! Compact per-block undo logs record the pre-image of every UTXO slot
 //! mutated by a block. This allows short-range reorgs (up to
-//! `UNDO_LOG_RETENTION` blocks deep) to be resolved without any network
+//! `UNDO_RETENTION_DEPTH` blocks deep) to be resolved without any network
 //! access — the node simply replays the undo entries in reverse to
 //! restore the prior UTXO state.
 //!
-//! After `UNDO_LOG_RETENTION` confirmations, the undo log for a block is
+//! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
 //! pruned (`prune_undo_logs`). MDBX keeps raw block bytes for the shallow
 //! reorg/peer-sync window. BlockProof bytes are kept until the block is both
 //! finalized and covered by the stored recursive proof height, so the recursive
@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::block::Block;
-use crate::consensus::params::UNDO_LOG_RETENTION;
+use crate::consensus::params::UNDO_RETENTION_DEPTH;
 use crate::fri_state::SlotValue;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
@@ -117,11 +117,11 @@ pub fn revert_block(state: &mut SegmentedFriState, undo: &BlockUndoLog) {
     }
 }
 
-/// Remove undo logs older than `UNDO_LOG_RETENTION` blocks from `logs`.
+/// Remove undo logs older than `UNDO_RETENTION_DEPTH` blocks from `logs`.
 /// After this call only logs for heights in
-/// `(current_height - UNDO_LOG_RETENTION, current_height]` are retained.
+/// `(current_height - UNDO_RETENTION_DEPTH, current_height]` are retained.
 pub fn prune_undo_logs(logs: &mut HashMap<u64, BlockUndoLog>, current_height: u64) {
-    let cutoff = current_height.saturating_sub(UNDO_LOG_RETENTION);
+    let cutoff = current_height.saturating_sub(UNDO_RETENTION_DEPTH);
     logs.retain(|&h, _| h > cutoff);
 }
 
@@ -174,16 +174,16 @@ mod tests {
 
     #[test]
     fn prune_removes_old_logs() {
-        use crate::consensus::params::UNDO_LOG_RETENTION;
-        let n = UNDO_LOG_RETENTION + 5; // 23 blocks
+        use crate::consensus::params::UNDO_RETENTION_DEPTH;
+        let n = UNDO_RETENTION_DEPTH + 5; // 23 blocks
         let mut logs: HashMap<u64, BlockUndoLog> = HashMap::new();
         for h in 0..n {
             logs.insert(h, BlockUndoLog::empty(h));
         }
         let current = n - 1;
         prune_undo_logs(&mut logs, current);
-        // cutoff = current - UNDO_LOG_RETENTION; keep heights > cutoff
-        let cutoff = current.saturating_sub(UNDO_LOG_RETENTION);
+        // cutoff = current - UNDO_RETENTION_DEPTH; keep heights > cutoff
+        let cutoff = current.saturating_sub(UNDO_RETENTION_DEPTH);
         for h in 0..=cutoff {
             assert!(
                 !logs.contains_key(&h),

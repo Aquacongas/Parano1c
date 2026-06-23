@@ -1106,10 +1106,10 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
         "Admitted at height",
         &result["admitted_height"].as_u64().unwrap_or(0).to_string(),
     );
-    let has_proof = result["has_proof"].as_bool().unwrap_or(false);
+    let has_authorization = result["has_authorization"].as_bool().unwrap_or(false);
     kv(
-        "LogicProof",
-        if has_proof {
+        "Authorization",
+        if has_authorization {
             "attached"
         } else {
             "not attached"
@@ -1188,7 +1188,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         let fee = tx["fee_micronoid"].as_u64().unwrap_or(0);
         let nin = tx["n_inputs"].as_u64().unwrap_or(0);
         let nout = tx["n_outputs"].as_u64().unwrap_or(0);
-        let proof = if tx["has_proof"].as_bool().unwrap_or(false) {
+        let authorization = if tx["has_authorization"].as_bool().unwrap_or(false) {
             c!(GRN, "✓")
         } else {
             c!(DIM, "·")
@@ -1200,7 +1200,7 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             fee,
             nin,
             nout,
-            proof
+            authorization
         );
     }
 

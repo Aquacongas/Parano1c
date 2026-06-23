@@ -19,7 +19,7 @@
 //!   3. builder::build_and_prove_tx(...)
 //!      a. compute tx_body_hash
 //!      b. compute auth_tags = hash_auth_tag(spend_secret, tx_body_hash)
-//!      c. prove_tx(body, secrets, log_slots) → WalletProofBundle
+//!      c. prove_tx(body, secrets) → WalletAuthorizationBundle
 //!      d. assemble TxIntent bytes
 //!   4. submit to own mempool
 //! ```

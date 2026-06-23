@@ -53,7 +53,8 @@ pub use segmented_state::{
 // ---------------------------------------------------------------------------
 
 pub use storage::{
-    MdbxChainContext, MdbxContextError, MdbxStore, RamBackend, StateBackend, StoreError,
+    ConsensusMeta, FinalizedCheckpoint, MdbxChainContext, MdbxContextError, MdbxStore, RamBackend,
+    StateBackend, StoreError,
 };
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 
 //! Per-transaction consensus checks.
 //!
-//! These checks are cheap (O(1) per tx) and run before LogicProof verification.
+//! These checks are cheap (O(1) per tx) and run before wallet authorization verification.
 //! Ordering: cheapest first to fail fast.
 //!
 //! Checks covered here:

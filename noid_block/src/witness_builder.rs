@@ -8,7 +8,7 @@
 //!
 //! SpendSecret never enters this module. All inputs are:
 //! - `tx_body`: public (SpendSecret stripped on wire via `decode_public`)
-//! - `WalletProofBundle`: wallet proof artifacts derived from SpendSecret.
+//! - `WalletAuthorizationBundle`: wallet proof artifacts derived from SpendSecret.
 //!   These are not raw secrets and are covered by the SC-5 one-wayness model.
 //!
 //! # Witness construction
@@ -20,8 +20,8 @@
 //! trace        ← TxLogicAir.build_trace(witness_from_body(tx_body))
 //! pi           ← build_public_inputs(tx_body)
 //! spine_inputs ← SpineInputs from boundary_pins
-//! auth_public  ← extracted from Standard4x8 bundle
-//! auth_proof   ← extracted from Standard4x8 bundle.logic_proof.auth
+//! auth_public  ← derived from tx_body
+//! auth_proof   ← extracted from WalletAuthorizationBundle
 //! ```
 //!
 //! The trace only uses `inp.value`, `out.value`, `fee` from the body — no
@@ -41,9 +41,11 @@ use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state_binding::BlockStateBinding;
 use noid_core::mle::evaluate_slice;
 use noid_core::{Block128, TowerField};
-use noid_gkr::{AuthPublicInputs, SpineInputs, SweepAuthPublicInputs, SweepSpineInputs};
-use noid_stark::prove_logic_sweep::sweep_spine_inputs_from_body;
-use noid_stark::WalletProofBundle;
+use noid_gkr::{
+    standard_auth_public_from_body, sweep_auth_public_from_body, sweep_spine_inputs_from_body,
+    AuthPublicInputs, SpineInputs, SweepAuthPublicInputs, SweepSpineInputs,
+    WalletAuthorizationBundle,
+};
 use noid_tx::{PublicInputs, Transaction, TxBody, TxShape, MAX_INPUTS, MAX_OUTPUTS};
 
 use crate::channel::state_binding_eval_point_and_gamma;
@@ -77,7 +79,7 @@ pub struct OwnedSweepTxWitness {
     pub pi: PublicInputs,
     pub spine_inputs: SweepSpineInputs,
     pub auth_public: SweepAuthPublicInputs,
-    /// Owned sweep AuthGKR proof capsule cloned from the wallet logic proof.
+    /// Owned sweep AuthGKR proof capsule cloned from the wallet authorization.
     pub auth_proof: noid_gkr::SweepAuthProofKillShot,
 }
 
@@ -134,16 +136,16 @@ impl OwnedTxWitness {
 pub fn build_tx_witness(
     block_tx_index: u32,
     tx_body: &TxBody,
-    bundle: &WalletProofBundle,
+    authorization: &WalletAuthorizationBundle,
     log_slots: u32,
 ) -> OwnedTxWitness {
     assert_eq!(
-        bundle.shape(),
+        authorization.shape(),
         tx_body.shape,
         "wallet proof bundle shape does not match tx body shape"
     );
-    match bundle {
-        WalletProofBundle::Standard4x8(bundle) => {
+    match authorization {
+        WalletAuthorizationBundle::Standard4x8(auth_proof) => {
             // Build the AIR from the boundary pins (all public data).
             let pins = boundary_pins_from_body(tx_body);
             let air = TxLogicAir::new(pins);
@@ -171,7 +173,8 @@ pub fn build_tx_witness(
             // so they include correct expected_address for ALL slots — including
             // dummy (valid=false) slots where the GKR circuit uses derived ZERO
             // secrets rather than zero bytes.
-            let auth_public = bundle.auth_public;
+            let auth_public = standard_auth_public_from_body(tx_body)
+                .expect("canonical standard auth statement from tx body");
 
             OwnedTxWitness::Standard4x8(OwnedStandardTxWitness {
                 block_tx_index,
@@ -180,13 +183,14 @@ pub fn build_tx_witness(
                 pi,
                 spine_inputs,
                 auth_public,
-                auth_proof: bundle.logic_proof.auth.clone(),
+                auth_proof: auth_proof.clone(),
             })
         }
-        WalletProofBundle::Sweep25x2(bundle) => {
+        WalletAuthorizationBundle::Sweep25x2(auth_proof) => {
             let (air, trace) = sweep_logic_air_and_trace_from_body(tx_body);
             let pi = build_public_inputs(tx_body, log_slots);
-            let spine_inputs = sweep_spine_inputs_from_body(tx_body);
+            let spine_inputs = sweep_spine_inputs_from_body(tx_body)
+                .expect("canonical sweep spine inputs from tx body");
 
             OwnedTxWitness::Sweep25x2(OwnedSweepTxWitness {
                 block_tx_index,
@@ -194,8 +198,9 @@ pub fn build_tx_witness(
                 trace,
                 pi,
                 spine_inputs,
-                auth_public: bundle.auth_public,
-                auth_proof: bundle.logic_proof.auth.clone(),
+                auth_public: sweep_auth_public_from_body(tx_body)
+                    .expect("canonical sweep auth statement from tx body"),
+                auth_proof: auth_proof.clone(),
             })
         }
     }
@@ -204,7 +209,7 @@ pub fn build_tx_witness(
 /// Build `OwnedTxWitness` instances for all non-coinbase transactions.
 ///
 /// Returns `(witnesses, non_cb_count)`.
-/// Coinbase transactions are skipped — they have no LogicProof.
+/// Coinbase transactions are skipped — they have no WalletAuthorizationBundle.
 ///
 /// `log_slots` must match the block header's `log_slots` field so that
 /// `PublicInputs.log_slots` is consistent with the chain state at inclusion
@@ -213,7 +218,7 @@ pub fn build_tx_witness(
 /// header.log_slots is rejected by block validation.
 pub fn build_block_witnesses(
     transactions: &[Transaction],
-    bundles: &[WalletProofBundle],
+    bundles: &[WalletAuthorizationBundle],
     log_slots: u32,
 ) -> Vec<OwnedTxWitness> {
     // bundles are in the same order as non-coinbase txs.
@@ -281,11 +286,9 @@ fn build_public_inputs(tx_body: &TxBody, log_slots: u32) -> PublicInputs {
     }
 }
 
-// NOTE: AuthPublicInputs is no longer reconstructed from the tx body here.
-// It is stored in WalletProofBundle.auth_public by the wallet prover and
-// used directly in build_tx_witness. Reconstruction from the tx body was
-// incorrect for dummy (valid=false) input slots — the GKR circuit uses
-// H(zero_secret) for padding, not [0;32].
+// NOTE: AuthPublicInputs is reconstructed from TxBody in build_tx_witness.
+// Dummy (valid=false) input slots use the zero-secret boundary expected by
+// the GKR circuit, so no wallet-supplied public boundary is trusted.
 
 // ---------------------------------------------------------------------------
 // StateBindingBlockWitness

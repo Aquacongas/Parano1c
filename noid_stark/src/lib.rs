@@ -40,14 +40,6 @@ pub mod multipoint_batch;
 pub mod vshift;
 
 pub mod interleaved;
-pub mod prove_logic;
-pub mod prove_logic_sweep;
-pub mod wallet_bundle;
-
-pub use wallet_bundle::{
-    BundleDecodeError, StandardWalletProofBundle, SweepWalletProofBundle, WalletProofBundle,
-};
-
 use crate::vshift::{cyclic_rotate_left, reconstruct_shifted_opening};
 use noid_air::{Air, Constraint, EvalFrame, FlatEvalFrame, Trace};
 use noid_core::{AdditiveNTT, Block128, TowerField};

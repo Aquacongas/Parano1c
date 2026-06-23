@@ -647,40 +647,6 @@ impl SegmentedFriState {
         self.dirty.insert(seg_id);
     }
 
-    /// Directly install pre-loaded column data together with its already verified
-    /// FRI segment root.
-    ///
-    /// Used by snapshot apply after the P2P layer has decoded the segment and
-    /// checked `compute_segment_root(cols) == authenticated_manifest_root`. This
-    /// avoids recomputing the same FRI segment root during the final global-root
-    /// integrity check; only the upper segment Merkle tree is recomputed.
-    pub(crate) fn set_segment_columns_with_root(
-        &mut self,
-        seg_id: u16,
-        cols: SegmentColumns,
-        seg_root: StateRoot,
-    ) {
-        let id = seg_id as usize;
-        if id >= self.num_segments {
-            return;
-        }
-        let live = Self::count_live(&cols);
-        self.live_counts[id] = live;
-        self.segments[id] = if live == 0 {
-            None
-        } else {
-            Some(Box::new(cols))
-        };
-        self.evicted.remove(&seg_id);
-        self.seg_roots[id] = Some(seg_root);
-        self.dirty.remove(&seg_id);
-        if self.num_segments > 1 {
-            self.tree[self.num_segments + id] = seg_root;
-            self.tree_dirty = true;
-            self.dirty_tree_leaves.insert(seg_id);
-        }
-    }
-
     /// Segment IDs that currently contain at least one live UTXO.
     ///
     /// This intentionally differs from "materialised in RAM": an all-empty
