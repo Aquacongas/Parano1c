@@ -70,6 +70,7 @@ pub fn choose_chain(
 /// - `target_a`, `target_b`: tip difficulty targets (used in height-fallback path)
 ///
 /// If chainwork is unavailable (zeros), falls back to height comparison.
+#[allow(clippy::too_many_arguments)]
 pub fn choose_chain_by_work(
     chainwork_a: &[u8; 32],
     hash_a: &[u8; 32],

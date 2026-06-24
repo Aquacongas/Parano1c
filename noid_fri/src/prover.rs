@@ -838,7 +838,7 @@ mod tests {
 
         // Flip one element in evals.
         let mut tampered = evals.clone();
-        tampered[3] = tampered[3] + Block128::ONE;
+        tampered[3] += Block128::ONE;
         let after_tamper = commit_fast(&tampered, &ntt);
 
         assert_ne!(

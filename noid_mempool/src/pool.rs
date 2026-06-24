@@ -137,7 +137,7 @@ impl AsyncMempool {
     ///
     /// Runs the full native admission pipeline:
     /// 1. Fee ≥ dynamic floor
-    /// 2. Basic consensus checks (fee overflow, body hash, anchor, nullifier)
+    /// 2. Basic consensus checks (fee overflow, body hash, anchor)
     /// 3. epoch_anchor hash must be a known header within window
     /// 4. No slot conflict with admitted mempool txs
     /// 5. Input slots live in state, output slots empty
@@ -230,13 +230,13 @@ impl AsyncMempool {
             })
             .await
             .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
-            .map_err(|e| SubmitError::InvalidProof(e))?;
+            .map_err(SubmitError::InvalidProof)?;
         }
 
         // ── Final admission under lock ───────────────────────
         // Re-run all cheap checks against CURRENT state: the chain may have
         // advanced during the ~84 ms AuthGKR verification window (new block → new
-        // nullifiers, spent slots, changed fee floor).  This is the
+        // spent slots and changed fee floor). This is the
         // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
 
@@ -623,8 +623,8 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
         }
     }
 
-    // Basic consensus (fee overflow, body hash non-zero, anchor non-zero, nullifier).
-    validate_tx_consensus(tx, &st.view.nullifiers)?;
+    // Basic consensus (fee overflow, body hash non-zero, anchor non-zero).
+    validate_tx_consensus(tx)?;
 
     // Epoch anchor must be a known header within ANCHOR_DEPTH window.
     // Returns anchor_height for pool.admit expiry tracking.

@@ -66,6 +66,7 @@ impl BlockReplayWitness {
     /// This constructor exists so that the `noid_block` crate can build
     /// a `BlockReplayWitness` without `noid_recursive` needing to import
     /// `noid_block::BlockProof` (which would create a cyclic dependency).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         cap: MerkleCap,
         block_col_openings: Vec<Block128>,
@@ -125,6 +126,7 @@ impl BlockReplayWitness {
 }
 
 /// Convenience alias used in integration code.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_block_replay_witness_parts(
     cap: MerkleCap,
     block_col_openings: Vec<Block128>,

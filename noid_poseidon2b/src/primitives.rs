@@ -5,10 +5,10 @@
 //!
 //! Paranoid is a transparent, Bitcoin-style chain: every UTXO discloses
 //! value and owner address on-chain. Authorization is still signatureless
-//! — a spend is authorized by a Poseidon2b-based `AuthTag` that binds an
-//! `Address`-preimage `spend_secret` to the `TxBodyHash`. All privacy
+//! — a spend is authorized by an owner proof bound to the canonical
+//! transaction statement transcript. All privacy
 //! primitives (stealth addresses, view keys, scan tags, commitment
-//! blinding, nullifiers) have been removed.
+//! blinding, legacy privacy tags) have been removed.
 //!
 //! Every primitive is a thin wrapper over a Poseidon2b sponge seeded
 //! with a capacity IV derived from a domain tag (CRYPTO.md §3). Newtype
@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::batch::compress_batch_interleaved_into;
 use crate::native::compression::Poseidon2bSponge;
 use crate::native::domain::{
-    capacity_iv, DomainTag, TAG_ADDRESS, TAG_AUTHTAG, TAG_COMMIT, TAG_LEAF, TAG_OUTLEAF, TAG_TXBODY,
+    capacity_iv, DomainTag, TAG_ADDRFIX, TAG_COMMIT, TAG_LEAF, TAG_OUTLEAF, TAG_TXBODY,
 };
 use crate::native::permutation::Poseidon2bPermutation;
 use noid_core::CanonicalSerialize;
@@ -131,37 +131,49 @@ impl Address {
     /// Accepts both formats so tooling can transition gracefully.
     /// New code should always produce bech32m; hex input is accepted for
     /// backward-compatibility only.
-    pub fn from_str(s: &str) -> Result<Self, AddressError> {
-        let s = s.trim();
-
-        // Try to determine format:
-        // - 64-char pure hex (legacy) → hex path
-        // - anything else → try bech32m first
-        let clean = s.trim_start_matches("0x");
-        let looks_like_hex = clean.len() == 64 && clean.chars().all(|c| c.is_ascii_hexdigit());
-
-        if looks_like_hex {
-            // Legacy hex path — accepted for backward compatibility.
-            let bytes: [u8; 32] = hex::decode(clean)
-                .map_err(|_| AddressError::InvalidHex)?
-                .try_into()
-                .map_err(|_| AddressError::WrongLength(0))?;
-            return Ok(Self(bytes));
-        }
-
-        // Bech32m path — the canonical format going forward.
-        let (hrp, data) = bech32::decode(s).map_err(|_| AddressError::InvalidFormat)?;
-        // HRP comparison is case-insensitive (bech32 spec: HRP is lowercased).
-        if hrp.as_str().to_ascii_lowercase() != ADDRESS_HRP {
-            return Err(AddressError::WrongHrp(hrp.as_str().to_ascii_lowercase()));
-        }
-        if data.len() != 32 {
-            return Err(AddressError::WrongLength(data.len()));
-        }
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&data);
-        Ok(Self(bytes))
+    pub fn parse(s: &str) -> Result<Self, AddressError> {
+        parse_address(s)
     }
+}
+
+impl std::str::FromStr for Address {
+    type Err = AddressError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_address(s)
+    }
+}
+
+fn parse_address(s: &str) -> Result<Address, AddressError> {
+    let s = s.trim();
+
+    // Try to determine format:
+    // - 64-char pure hex (legacy) → hex path
+    // - anything else → try bech32m first
+    let clean = s.trim_start_matches("0x");
+    let looks_like_hex = clean.len() == 64 && clean.chars().all(|c| c.is_ascii_hexdigit());
+
+    if looks_like_hex {
+        // Legacy hex path — accepted for backward compatibility.
+        let bytes: [u8; 32] = hex::decode(clean)
+            .map_err(|_| AddressError::InvalidHex)?
+            .try_into()
+            .map_err(|_| AddressError::WrongLength(0))?;
+        return Ok(Address(bytes));
+    }
+
+    // Bech32m path — the canonical format going forward.
+    let (hrp, data) = bech32::decode(s).map_err(|_| AddressError::InvalidFormat)?;
+    // HRP comparison is case-insensitive (bech32 spec: HRP is lowercased).
+    if hrp.as_str().to_ascii_lowercase() != ADDRESS_HRP {
+        return Err(AddressError::WrongHrp(hrp.as_str().to_ascii_lowercase()));
+    }
+    if data.len() != 32 {
+        return Err(AddressError::WrongLength(data.len()));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&data);
+    Ok(Address(bytes))
 }
 
 /// Display an `Address` as a bech32m string.
@@ -179,25 +191,11 @@ newtype_digest!(
     Commitment
 );
 newtype_digest!(
-    /// Per-input authorization tag binding `spend_secret` to the
-    /// `TxBodyHash`.
-    AuthTag
-);
-newtype_digest!(
     /// Canonical transaction-body hash.
     TxBodyHash
 );
 
 impl std::fmt::Display for Commitment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{:02x}", byte)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Display for AuthTag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for byte in &self.0 {
             write!(f, "{:02x}", byte)?;
@@ -220,8 +218,8 @@ impl std::fmt::Display for TxBodyHash {
 ///
 /// SECURITY: NOT `Copy` — prevents accidental bitwise copies that bypass
 /// the `ZeroizeOnDrop` destructor. NOT `Debug` — prevents printing in
-/// logs, panics, or test output. Use `derive_address` / `hash_auth_tag`
-/// to derive the public artifacts without exposing the raw bytes.
+/// logs, panics, or test output. Use `derive_address` to derive the public
+/// address without exposing the raw bytes.
 #[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct SpendSecret(pub [u8; 32]);
 
@@ -297,24 +295,12 @@ pub fn hash_utxo_leaf(value: u128, owner: &Address) -> Commitment {
 }
 
 /// Derive a transparent address from a 256-bit spend secret.
-/// `H_ADDR = Poseidon2b(ADDRESS_, secret_hi, secret_lo)`.
+/// `H_ADDR = Poseidon2b_fixed(ADDRFIX_, secret_hi, secret_lo)`.
 pub fn derive_address(secret: &SpendSecret) -> Address {
-    let mut s = sponge(TAG_ADDRESS);
+    let mut s = sponge(TAG_ADDRFIX);
     let [a, b] = secret.as_fields();
     s.absorb_pair(a, b);
-    Address(s.finalize())
-}
-
-/// Per-input authorization tag binding the spend secret to the
-/// transaction body hash. The STARK proves a spender's knowledge of
-/// `spend_secret` and of a matching `auth_tag`.
-pub fn hash_auth_tag(spend_secret: &SpendSecret, tx_body_hash: &TxBodyHash) -> AuthTag {
-    let mut s = sponge(TAG_AUTHTAG);
-    let [a, b] = spend_secret.as_fields();
-    let [c, d] = tx_body_hash.as_fields();
-    s.absorb_pair(a, b);
-    s.absorb_pair(c, d);
-    AuthTag(s.finalize())
+    Address(s.finalize_no_pad())
 }
 
 /// Shape of the standard tx-body Merkle tree, locked to keep the current AIR
@@ -548,8 +534,7 @@ mod tests {
         let tb = hash_tx_body(&[1u8; 32], 3, &ins, &outs, false);
         assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false));
 
-        let t = hash_auth_tag(&SS, &tb);
-        assert_eq!(t, hash_auth_tag(&SS, &tb));
+        assert_ne!(tb.0, addr.0);
     }
 
     #[test]
@@ -569,17 +554,11 @@ mod tests {
         commit.absorb_pair(c, d);
         let d_commit = commit.finalize();
 
-        let mut auth = sponge(TAG_AUTHTAG);
-        auth.absorb_pair(a, b);
-        auth.absorb_pair(c, d);
-        let d_auth = auth.finalize();
-
-        let mut addr = sponge(TAG_ADDRESS);
+        let mut addr = sponge(TAG_ADDRFIX);
         addr.absorb_pair(a, b);
-        addr.absorb_pair(c, d);
-        let d_addr = addr.finalize();
+        let d_addr = addr.finalize_no_pad();
 
-        let all = [d_leaf, d_commit, d_auth, d_addr];
+        let all = [d_leaf, d_commit, d_addr];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j]);
@@ -807,7 +786,7 @@ mod tests {
             encoded.len()
         );
         // Round-trip
-        let decoded = Address::from_str(&encoded).expect("decode own bech32");
+        let decoded = Address::parse(&encoded).expect("decode own bech32");
         assert_eq!(decoded, addr, "round-trip failed");
     }
 
@@ -826,7 +805,7 @@ mod tests {
         ]);
         let lower = addr.to_bech32();
         let upper = lower.to_uppercase();
-        let from_upper = Address::from_str(&upper).expect("uppercase bech32 must parse");
+        let from_upper = Address::parse(&upper).expect("uppercase bech32 must parse");
         assert_eq!(from_upper, addr);
     }
 
@@ -838,7 +817,7 @@ mod tests {
             0x09, 0x0a, 0x0b, 0x0c,
         ]);
         let hex = hex::encode(addr.0);
-        let from_hex = Address::from_str(&hex).expect("64-char hex must parse");
+        let from_hex = Address::parse(&hex).expect("64-char hex must parse");
         assert_eq!(from_hex, addr);
     }
 
@@ -849,17 +828,17 @@ mod tests {
         let hrp = Hrp::parse("btc").unwrap();
         let fake = bech32::encode::<Bech32m>(hrp, &[0u8; 32]).unwrap();
         assert!(matches!(
-            Address::from_str(&fake),
+            Address::parse(&fake),
             Err(AddressError::WrongHrp(_))
         ));
     }
 
     #[test]
     fn invalid_format_rejected() {
-        assert!(Address::from_str("notanaddress").is_err());
-        assert!(Address::from_str("").is_err());
-        assert!(Address::from_str("noid1").is_err());
+        assert!(Address::parse("notanaddress").is_err());
+        assert!(Address::parse("").is_err());
+        assert!(Address::parse("noid1").is_err());
         // 62-char hex (too short)
-        assert!(Address::from_str(&"ab".repeat(31)).is_err());
+        assert!(Address::parse(&"ab".repeat(31)).is_err());
     }
 }

@@ -41,8 +41,7 @@ pub fn capacity_iv(tag: DomainTag) -> [Block128; 2] {
 
 pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
 pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
-pub const TAG_AUTHTAG: DomainTag = DomainTag::new(b"AUTHTAG_");
-pub const TAG_ADDRESS: DomainTag = DomainTag::new(b"ADDRESS_");
+pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");
 pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
@@ -61,8 +60,18 @@ pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
 /// pad-flushed variable-length `hash_leaf` under the same IV.
 pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
 /// Claims commitment: Poseidon2b sponge over all claimed slot data
-/// (inputs + outputs). Bridges WalletAuthorizationBundle to BlockStateBinding.
+/// (inputs + outputs). Bridges WalletAuthorizationBundle to exact state proof.
 pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
+/// Exact UTXO state slot leaf: `PARANOID/EXACT-STATE-SLOT/256/v1`.
+pub const TAG_EXSTSLT: DomainTag = DomainTag::new(b"EXSTSLT_");
+/// Exact UTXO state binary Merkle node: `PARANOID/EXACT-STATE-NODE/256/v1`.
+pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"EXSTNOD_");
+/// Composite exact state root: `PARANOID/EXACT-STATE-ROOT/256/v1`.
+pub const TAG_EXSTROT: DomainTag = DomainTag::new(b"EXSTROT_");
+/// ReuseGuard canonical bucket: `PARANOID/REUSE-GUARD-BUCKET/256/v1`.
+pub const TAG_RGDBUCK: DomainTag = DomainTag::new(b"RGDBUCK_");
+/// ReuseGuard fixed-depth Merkle node: `PARANOID/REUSE-GUARD-NODE/256/v1`.
+pub const TAG_RGDNODE: DomainTag = DomainTag::new(b"RGDNODE_");
 
 #[cfg(test)]
 mod tests {
@@ -74,8 +83,7 @@ mod tests {
         let tags = [
             TAG_LEAF,
             TAG_COMMIT,
-            TAG_AUTHTAG,
-            TAG_ADDRESS,
+            TAG_ADDRFIX,
             TAG_TXBODY,
             TAG_BLOCKHDR,
             TAG_FSCHALNG,
@@ -85,6 +93,11 @@ mod tests {
             TAG_SEGMENTTREE,
             TAG_OUTLEAF,
             TAG_CLAIMS,
+            TAG_EXSTSLT,
+            TAG_EXSTNOD,
+            TAG_EXSTROT,
+            TAG_RGDBUCK,
+            TAG_RGDNODE,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

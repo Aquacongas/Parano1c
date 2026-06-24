@@ -14,7 +14,7 @@
 //! # Check order (cheapest first)
 //!
 //! 0. P.16 min fee: base + I/O + occupancy-scaled net-new-state fee (coinbase exempt)
-//! 1. Basic consensus checks: fee overflow, body_hash, anchor non-zero, nullifier
+//! 1. Basic consensus checks: fee overflow, body_hash, anchor non-zero
 //! 2. epoch_anchor hash is a known block header within the ANCHOR_DEPTH window
 //! 3. No slot conflict with currently admitted mempool transactions
 //! 4. Input slots are live in state with matching (value, owner)
@@ -33,7 +33,7 @@ use noid_tx::Transaction;
 
 /// Validate a transaction for mempool admission.
 ///
-/// `ctx` provides the current chain state, nullifier set, and stored headers.
+/// `ctx` provides the current chain state and stored headers.
 /// `mempool_txs` is the current set of already-admitted transactions (used
 /// for cross-tx slot conflict detection within the mempool).
 ///
@@ -59,7 +59,7 @@ pub fn validate_tx_for_mempool(
     }
 
     // --- Basic consensus checks ---
-    validate_tx_consensus(tx, &ctx.nullifiers)?;
+    validate_tx_consensus(tx)?;
 
     // --- Epoch anchor hash must be a known header within window ---
     if !tx.body.is_coinbase {

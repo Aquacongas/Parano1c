@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! `BlockMiner` — the parallel PoW + BlockProof generation orchestrator.
+//! `BlockMiner` — the parallel PoW + block-certificate generation orchestrator.
 //!
 //! ## Parallel block production design
 //!
@@ -10,9 +10,9 @@
 //!   template = build_template(mempool, ctx)
 //!
 //!   ┌─────────────────────────┐   ┌─────────────────────────────────┐
-//!   │  PoW Search             │   │  BlockProof generation          │
-//!   │  Blake3(header_core||n) │   │  prove_block(witnesses, &[])    │
-//!   │  < difficulty_target    │   │  ~10s on 8 cores (100 txs)      │
+//!   │  PoW Search             │   │  Block certificate assembly    │
+//!   │  Blake3(header_core||n) │   │  build proof + sidecar          │
+//!   │  < difficulty_target    │   │  exact state + auth sidecar     │
 //!   └──────────┬──────────────┘   └──────────────┬──────────────────┘
 //!              │                                 │
 //!              └────────────┬────────────────────┘
@@ -27,7 +27,7 @@
 //! settings it splits available cores roughly in half and adapts the transaction
 //! cap to recent proof throughput instead of always trying to fill 256 txs.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
-//! template building, BlockProof generation, validation, RPC, and P2P while miners run elsewhere.
+//! template building, certificate assembly, validation, RPC, and P2P while miners run elsewhere.
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
@@ -122,7 +122,7 @@ pub enum MinerEvent {
     },
     /// Mining cancelled (new P2P block or heartbeat).
     MiningCancelled { reason: String },
-    /// BlockProof generation failed (non-fatal: block is abandoned, new template built).
+    /// Block certificate assembly failed (non-fatal: block is abandoned, new template built).
     ProveFailed { height: u64, error: String },
 }
 
@@ -163,9 +163,9 @@ fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
         return 0;
     }
 
-    // Keep proving comfortably under the 15s consensus target.  PoW runs in
-    // parallel, but a full block must still have a ready proof before it can be
-    // sealed and propagated.
+    // Keep certificate work comfortably under the 15s consensus target. PoW
+    // runs in parallel, but a user-tx block still needs proof bytes before it
+    // can be sealed and propagated.
     let block_time_ms = noid_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0;
     let budget_ms = (block_time_ms * 0.70).max(1_000.0);
     let ms_per_tx = ms_per_tx_ewma.unwrap_or(100.0).max(10.0);
@@ -199,9 +199,9 @@ pub struct BlockMiner {
     stopped: Arc<AtomicBool>,
     /// Notified when the chain is sufficiently synced to begin mining.
     sync_ready: Arc<tokio::sync::Notify>,
-    /// Semaphore (1 permit) preventing concurrent BlockProof generation tasks from accumulating.
+    /// Semaphore (1 permit) preventing concurrent certificate tasks from accumulating.
     /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
-    /// without this guard N × 10s prove tasks pile up and saturate all CPU.
+    /// without this guard repeated refreshes can pile up blocking proof work.
     prove_semaphore: Arc<tokio::sync::Semaphore>,
     /// Optional hook called synchronously after block is applied to chain, before
     /// the mempool is updated. Used by the built-in wallet to generate receipts
@@ -419,7 +419,7 @@ impl BlockMiner {
             let prove_done = Arc::new(AtomicBool::new(false));
             let prove_done_clone = prove_done.clone();
 
-            // --- Parallel: PoW + BlockProof generation ---
+            // --- Parallel: PoW + certificate assembly ---
             // Extract only the PoW header — avoids cloning the full BlockTemplate
             // (which includes all transaction and proof bytes) just for PoW.
             let pow_header = tmpl.header_for_pow(0);
@@ -431,8 +431,8 @@ impl BlockMiner {
 
             // Try to acquire the single-permit prove semaphore.
             // spawn_blocking tasks are NOT cancelled when JoinHandles are dropped;
-            // without this guard each 15s heartbeat can accumulate another ~10s prove
-            // task, eventually saturating all CPU cores.
+            // without this guard repeated refreshes can accumulate blocking
+            // proof work and saturate CPU cores.
             let prove_permit = self.prove_semaphore.clone().try_acquire_owned();
 
             // If the semaphore is already held and the template has user txs we
@@ -452,8 +452,8 @@ impl BlockMiner {
                 pow_pool.install(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
             });
 
-            // BlockProof generation: run for real (permit held until done) or return a consensus-legal
-            // stub for coinbase-only blocks when the prove slot is already occupied.
+            // Certificate assembly: run for real (permit held until done) or return a
+            // consensus-legal stub for coinbase-only blocks when the prove slot is occupied.
             let prove_handle = match prove_permit {
                 Ok(permit) => tokio::task::spawn_blocking(move || {
                     // Run prove inside a scope so the semaphore permit is released
@@ -463,7 +463,7 @@ impl BlockMiner {
                     let started = Instant::now();
                     let result = {
                         let _permit = permit;
-                        prove_pool.install(|| run_prove_block(&*tmpl_prove, prev_state_root))
+                        prove_pool.install(|| run_prove_block(&tmpl_prove, prev_state_root))
                     };
                     let elapsed = started.elapsed();
                     prove_done_clone.store(true, Ordering::Release);
@@ -665,7 +665,6 @@ impl BlockMiner {
                      prev_active_counts,
                      local_time,
                      anchor,
-                     nullifiers,
                      pre_state,
                      state| {
                         noid_block::validate_block_from_network(
@@ -677,7 +676,6 @@ impl BlockMiner {
                             prev_active_counts,
                             local_time,
                             anchor,
-                            nullifiers,
                             pre_state,
                             state,
                         )
@@ -709,7 +707,7 @@ impl BlockMiner {
 }
 
 // ---------------------------------------------------------------------------
-// BlockProof generation (CPU-bound, called inside spawn_blocking)
+// Block certificate assembly (CPU-bound, called inside spawn_blocking)
 // ---------------------------------------------------------------------------
 
 /// Run `prove_block` with the witnesses from the template's transactions.
@@ -725,22 +723,19 @@ impl BlockMiner {
 /// # State correctness
 ///
 /// Production block validity is proof-native: every user-transaction block must
-/// include NativeDelta state openings proving the header state-root transition.
-/// The live node/miner verify the full block proof and then commit the proven
-/// delta via the single `apply_next_block` path.
+/// include an exact authenticated state transition proof for the header
+/// state-root transition. The live node/miner verify the minimal block proof
+/// and then commit the proven transition via the single `apply_next_block` path.
 pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
-) -> Result<([u8; 32], [u8; 32], Vec<u8>, Vec<u8>), String> {
+) -> Result<crate::ProvedBlockParts, String> {
     use noid_block::{
-        assemble_sweep_bucket_proof, block_auth_sidecar_root, block_recursive_claim_hash,
-        build_block_auth_sidecar, build_block_witnesses, build_state_bindings_from_binding,
-        prove_block_with_total_tx_count, prove_state_mle_openings_only, BlockProof,
-        BlockPublicMeta, OwnedTxWitness, TxBlockWitness,
+        block_auth_sidecar_root, block_recursive_claim_hash, BlockAuthSidecar, BlockProof,
     };
-    use noid_gkr::WalletAuthorizationBundle;
+    use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
 
-    // Coinbase-only: marker proof, no full BlockProof generation needed.
+    // Coinbase-only: marker proof, no block certificate needed.
     let non_cb_count = tmpl.n_user_txs();
     if non_cb_count == 0 {
         tracing::debug!(
@@ -750,7 +745,6 @@ pub(crate) fn run_prove_block(
         return Ok(([1u8; 32], [1u8; 32], vec![], vec![]));
     }
 
-    let all_txs = tmpl.inner.all_txs();
     let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
     for (idx, opt) in tmpl.authorization_bytes.iter().enumerate() {
         let bytes = opt.as_ref().ok_or_else(|| {
@@ -763,6 +757,9 @@ pub(crate) fn run_prove_block(
             .map_err(|e| {
                 format!("WalletAuthorizationBundle decode failed at tx index {idx}: {e}")
             })?;
+        verify_wallet_authorization(&tmpl.inner.txs[idx].body, &bundle).map_err(|e| {
+            format!("WalletAuthorizationBundle verify failed at tx index {idx}: {e}")
+        })?;
         bundles.push(bundle);
     }
     if bundles.len() != non_cb_count {
@@ -772,144 +769,41 @@ pub(crate) fn run_prove_block(
             non_cb_count,
         ));
     }
-    for (tx, bundle) in all_txs
-        .iter()
-        .filter(|tx| !tx.body.is_coinbase)
-        .zip(&bundles)
-    {
-        if bundle.shape() != tx.body.shape {
-            return Err(format!(
-                "WalletAuthorizationBundle shape {:?} does not match tx body shape {:?} for {:?}",
-                bundle.shape(),
-                tx.body.shape,
-                tx.tx_body_hash
-            ));
-        }
-    }
 
-    let log_slots = tmpl.inner.log_slots;
-    let owned_witnesses = build_block_witnesses(&all_txs, &bundles, log_slots);
-    let mut standard_owned = Vec::new();
-    let mut sweep_owned = Vec::new();
-    for witness in owned_witnesses {
-        match witness {
-            OwnedTxWitness::Standard4x8(w) => standard_owned.push(w),
-            OwnedTxWitness::Sweep25x2(w) => sweep_owned.push(w),
-        }
-    }
-
-    let witnesses: Vec<TxBlockWitness<'_>> = standard_owned
-        .iter()
-        .map(|w| TxBlockWitness {
-            block_tx_index: w.block_tx_index,
-            air: &w.air as &dyn noid_air::Air,
-            trace: &w.trace,
-            pi: &w.pi,
-            spine_inputs: &w.spine_inputs,
-            auth_public: &w.auth_public,
-            auth_proof: &w.auth_proof,
-        })
-        .collect();
-
-    let auth_sidecar = build_block_auth_sidecar(&witnesses, &sweep_owned)
-        .map_err(|e| format!("build_block_auth_sidecar failed: {e:?}"))?;
+    let auth_sidecar = BlockAuthSidecar {
+        tx_auth: bundles.into_iter().map(|bundle| bundle.proof).collect(),
+    };
     let auth_sidecar_bytes = bincode::serialize(&auth_sidecar)
         .map_err(|e| format!("BlockAuthSidecar serialize failed: {e}"))?;
 
     let n_tx = tmpl.n_user_txs() as u32;
     let new_state_root = tmpl.inner.state_root;
-
-    let sweep_bucket = assemble_sweep_bucket_proof(prev_state_root, &sweep_owned)
-        .map_err(|e| format!("assemble_sweep_bucket_proof failed: {e:?}"))?;
-
-    let user_bodies: Vec<_> = tmpl.inner.txs.iter().map(|tx| tx.body.clone()).collect();
-    let binding = tmpl.inner.state_binding.as_ref().ok_or_else(|| {
-        "user-transaction template is missing BlockStateBinding; proof-native block production requires state binding".to_string()
+    let exact_state_transition = tmpl.exact_state_transition.clone().ok_or_else(|| {
+        "user-transaction template is missing ExactStateTransitionProof".to_string()
     })?;
-    if binding.prev_state_root != prev_state_root || binding.new_state_root != new_state_root {
-        return Err("BlockStateBinding roots do not match template/header roots".to_string());
-    }
-    let owned_state_bindings = build_state_bindings_from_binding(
-        binding,
-        &user_bodies,
-        Some(&tmpl.inner.coinbase.body),
-        &tmpl.pre_segs,
+    let block_proof = BlockProof::minimal(
         prev_state_root,
+        new_state_root,
         n_tx,
-        log_slots,
+        exact_state_transition,
     );
-    let state_bindings: Vec<_> = owned_state_bindings
-        .iter()
-        .map(|b| b.as_witness())
-        .collect();
+    let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
+    let transcript_hash = block_recursive_claim_hash(&block_proof);
+    let root_block = tmpl.seal(0, transcript_hash, [0u8; 32]);
+    let witness_root = block_auth_sidecar_root(&root_block, &auth_sidecar)
+        .map_err(|e| format!("BlockAuthSidecar root failed: {e:?}"))?;
 
-    let prove_result = if witnesses.is_empty() {
-        let Some(bucket) = sweep_bucket else {
-            return Err("user-transaction block has no provable bucket".to_string());
-        };
-        let (pre_state_openings, post_state_openings) =
-            prove_state_mle_openings_only(&state_bindings);
-        Ok(BlockProof {
-            meta: BlockPublicMeta {
-                prev_block_state_root: prev_state_root,
-                new_state_root,
-                n_tx,
-                n_air_per_tx: bucket.meta.n_air_per_tx,
-                n_auth_slices_per_tx: bucket.meta.n_boundary_slices_per_tx,
-                log_rows: bucket.meta.log_rows,
-                n_block_spine_slices: bucket.meta.n_block_spine_slices,
-                n_state_bindings: state_bindings.len() as u32,
-            },
-            standard_bucket: None,
-            sweep_bucket: Some(bucket),
-            pre_state_openings,
-            post_state_openings,
-        })
-    } else {
-        let mut proof = prove_block_with_total_tx_count(
-            prev_state_root,
-            new_state_root,
-            &witnesses,
-            &state_bindings,
-            n_tx,
-        )
-        .map_err(|e| format!("{e:?}"))?;
-        proof.sweep_bucket = sweep_bucket;
-        Ok(proof)
-    };
-
-    match prove_result {
-        Ok(block_proof) => {
-            let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
-            let transcript_hash = block_recursive_claim_hash(&block_proof);
-            let root_block = tmpl.seal(0, transcript_hash, [0u8; 32]);
-            let witness_root = block_auth_sidecar_root(&root_block, &auth_sidecar)
-                .map_err(|e| format!("BlockAuthSidecar root failed: {e:?}"))?;
-
-            tracing::info!(
-                proof_bytes = proof_bytes.len(),
-                auth_sidecar_bytes = auth_sidecar_bytes.len(),
-                "prove_block succeeded"
-            );
-            Ok((
-                transcript_hash,
-                witness_root,
-                proof_bytes,
-                auth_sidecar_bytes,
-            ))
-        }
-        Err(noid_block::ProveBlockError::AuthProofInvalid(k)) => {
-            // Auth proof mismatch: wallet proved with a different epoch_anchor or
-            // log_slots. We CANNOT produce a stub proof for user-tx blocks (consensus
-            // rejects [1u8;32] when user txs are present). Return an error so the
-            // miner discards this template and rebuilds coinbase-only.
-            Err(format!(
-                "AuthProofInvalid at tx_index={k}: epoch_anchor or log_slots mismatch — \
-                 discarding template, will rebuild coinbase-only"
-            ))
-        }
-        Err(e) => Err(format!("{e:?}")),
-    }
+    tracing::info!(
+        proof_bytes = proof_bytes.len(),
+        auth_sidecar_bytes = auth_sidecar_bytes.len(),
+        "prove_block succeeded"
+    );
+    Ok((
+        transcript_hash,
+        witness_root,
+        proof_bytes,
+        auth_sidecar_bytes,
+    ))
 }
 
 #[cfg(test)]
@@ -920,24 +814,19 @@ mod tests {
         prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
         standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
     };
-    use noid_block::{
-        validate_block_bucket_tx_indices, validate_block_proof_transcript_hash, BlockProof,
-    };
+    use noid_block::{validate_block_proof_transcript_hash, BlockProof};
     use noid_chain::block::{compute_tx_root, Block};
     use noid_chain::consensus::genesis::{genesis_header, GENESIS_TIMESTAMP};
     use noid_chain::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
     use noid_chain::consensus::pow::full_block_hash;
     use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
     use noid_chain::fri_state::SlotValue;
-    use noid_chain::segmented_state::SegmentColumns;
     use noid_chain::state::{apply_tx, ChainState};
-    use noid_chain::state_binding::BlockStateBinding;
     use noid_gkr::WalletAuthorizationBundle;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
         compute_claims_commitment, hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape,
     };
-    use std::collections::HashMap;
 
     fn tx_from_body(body: TxBody) -> Transaction {
         let tx_body_hash = hash_tx_body_for_shape(
@@ -1013,93 +902,6 @@ mod tests {
         state
     }
 
-    fn pre_segments_for_template(
-        state: &ChainState,
-        user_bodies: &[TxBody],
-        coinbase_body: &TxBody,
-    ) -> HashMap<u16, SegmentColumns> {
-        let eff_log = state.state.effective_log_segment_size();
-        let seg_size = 1usize << eff_log;
-        let mut pre_segs = HashMap::new();
-        for slot in user_bodies
-            .iter()
-            .chain(std::iter::once(coinbase_body))
-            .flat_map(|body| {
-                body.inputs
-                    .iter()
-                    .filter(|i| i.valid)
-                    .map(|i| i.slot_index)
-                    .chain(
-                        body.outputs
-                            .iter()
-                            .filter(|o| o.valid)
-                            .map(|o| o.slot_index),
-                    )
-            })
-        {
-            let seg_id = (slot >> eff_log) as u16;
-            pre_segs.entry(seg_id).or_insert_with(|| {
-                state
-                    .state
-                    .try_get_segment_columns(seg_id)
-                    .cloned()
-                    .unwrap_or_else(|| SegmentColumns::new_zero(seg_size))
-            });
-        }
-        pre_segs
-    }
-
-    fn patch_binding_with_coinbase(
-        binding: &mut BlockStateBinding,
-        pre_state: &noid_chain::segmented_state::SegmentedFriState,
-        mut post_user_state: noid_chain::segmented_state::SegmentedFriState,
-        user_bodies: &[TxBody],
-        coinbase_body: &TxBody,
-    ) {
-        for out in coinbase_body.outputs.iter().filter(|o| o.valid) {
-            let [owner_hi, owner_lo] = out.owner.as_fields();
-            post_user_state
-                .set_slot(
-                    out.slot_index,
-                    SlotValue {
-                        value: (out.value as u128).into(),
-                        owner_hi,
-                        owner_lo,
-                    },
-                )
-                .expect("test coinbase slot in range");
-        }
-
-        binding.new_state_root = post_user_state.root();
-        binding.tree_depth = post_user_state.tree_depth();
-        if binding.tree_depth == 0 {
-            return;
-        }
-
-        let eff_log = pre_state.effective_log_segment_size();
-        let mut touched = std::collections::HashSet::new();
-        for body in user_bodies {
-            for input in body.inputs.iter().filter(|i| i.valid) {
-                touched.insert((input.slot_index >> eff_log) as u16);
-            }
-            for output in body.outputs.iter().filter(|o| o.valid) {
-                touched.insert((output.slot_index >> eff_log) as u16);
-            }
-        }
-        for output in coinbase_body.outputs.iter().filter(|o| o.valid) {
-            touched.insert((output.slot_index >> eff_log) as u16);
-        }
-
-        for seg_id in touched {
-            binding
-                .pre_seg_siblings
-                .insert(seg_id, pre_state.merkle_siblings(seg_id));
-            binding
-                .post_seg_siblings
-                .insert(seg_id, post_user_state.merkle_siblings(seg_id));
-        }
-    }
-
     fn miner_template(
         user: Vec<(TxBody, WalletAuthorizationBundle)>,
     ) -> crate::template::BlockTemplate {
@@ -1113,30 +915,35 @@ mod tests {
         parent.active_slot_count = pre_state.active_slot_count;
         parent.alloc_counter = pre_state.alloc_counter;
 
-        let commitments: Vec<_> = user_bodies
-            .iter()
-            .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
-            .collect();
-        let mut binding_state = pre_state.state.clone();
-        let mut state_binding =
-            BlockStateBinding::build(&mut binding_state, &user_bodies, &commitments)
-                .expect("build test BlockStateBinding");
-        patch_binding_with_coinbase(
-            &mut state_binding,
-            &pre_state.state,
-            binding_state,
-            &user_bodies,
-            &coinbase.body,
-        );
-        let state_root = state_binding.new_state_root;
-        let pre_segs = pre_segments_for_template(&pre_state, &user_bodies, &coinbase.body);
-
         let mut post_state = pre_state.clone();
         for body in &user_bodies {
             apply_tx(&mut post_state, body).expect("test user tx applies");
         }
         apply_tx(&mut post_state, &coinbase.body).expect("test coinbase applies");
-        assert_eq!(post_state.state_root(), state_root);
+        let state_root = post_state.state_root();
+        let mut exact_bodies = user_bodies.clone();
+        exact_bodies.push(coinbase.body.clone());
+        let exact_commitments: Vec<_> = exact_bodies
+            .iter()
+            .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
+            .collect();
+        let exact_surface = noid_chain::build_exact_action_surface(
+            &pre_state.state,
+            &exact_bodies,
+            &exact_commitments,
+        )
+        .expect("build exact surface");
+        let exact_cache = pre_state
+            .state
+            .exact_sparse_cache()
+            .expect("build exact sparse cache");
+        let exact_state_transition = noid_block::build_exact_state_transition_proof(
+            &exact_cache,
+            &exact_surface,
+            &pre_state.reuse_guard,
+            parent.height + 1,
+        )
+        .expect("build exact state proof");
 
         let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();
         let authorization_bytes = user
@@ -1160,7 +967,6 @@ mod tests {
             miner_address: Address([0xCB; 32]),
             difficulty_target: GENESIS_TARGET,
             prev_block_hash: full_block_hash(&parent),
-            state_binding: Some(state_binding),
         };
         crate::template::BlockTemplate {
             inner,
@@ -1169,11 +975,13 @@ mod tests {
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
             parent,
             authorization_bytes,
-            pre_segs,
+            exact_state_transition: Some(exact_state_transition),
         }
     }
 
-    fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
+    fn prove_template_wire(
+        tmpl: &crate::template::BlockTemplate,
+    ) -> (Block, Vec<u8>, Vec<u8>, BlockProof) {
         let (proof_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
             run_prove_block(tmpl, tmpl.parent.state_root).expect("run_prove_block");
         assert!(
@@ -1188,28 +996,23 @@ mod tests {
         let proof: BlockProof = bincode::deserialize(&proof_bytes).expect("decode BlockProof");
         let sidecar: noid_block::BlockAuthSidecar =
             bincode::deserialize(&auth_sidecar_bytes).expect("decode BlockAuthSidecar");
+        assert_eq!(sidecar.tx_auth.len(), tmpl.n_user_txs());
         noid_block::validate_block_auth_sidecar_root(&block, &sidecar).expect("sidecar root");
-        validate_block_bucket_tx_indices(&block, &proof).expect("bucket coverage");
         validate_block_proof_transcript_hash(&block, &proof).expect("header/proof binding");
+        (block, proof_bytes, auth_sidecar_bytes, proof)
+    }
+
+    fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
+        let (block, _proof_bytes, _auth_sidecar_bytes, proof) = prove_template_wire(tmpl);
         (block, proof)
     }
 
-    fn assert_shape_counts(proof: &BlockProof, standard: usize, sweep: usize) {
-        assert_eq!(
-            proof
-                .standard_bucket
-                .as_ref()
-                .map_or(0, |b| b.meta.tx_indices.len()),
-            standard
-        );
-        assert_eq!(
-            proof
-                .sweep_bucket
-                .as_ref()
-                .map_or(0, |b| b.meta.tx_indices.len()),
-            sweep
-        );
-        assert_eq!(proof.meta.n_tx as usize, standard + sweep);
+    fn assert_minimal_proof(proof: &BlockProof, n_user_txs: usize) {
+        assert_eq!(proof.meta.n_tx as usize, n_user_txs);
+        assert_eq!(proof.meta.n_air_per_tx, 0);
+        assert_eq!(proof.meta.n_auth_slices_per_tx, 0);
+        assert_eq!(proof.meta.log_rows, 0);
+        assert_eq!(proof.meta.n_block_spine_slices, 0);
     }
 
     #[test]
@@ -1218,7 +1021,7 @@ mod tests {
         let standard = standard_fixture_with_bundle("std-only", 100, 0xA1);
         let tmpl = miner_template(vec![standard]);
         let (_block, proof) = prove_template(&tmpl);
-        assert_shape_counts(&proof, 1, 0);
+        assert_minimal_proof(&proof, 1);
     }
 
     #[test]
@@ -1227,7 +1030,7 @@ mod tests {
         let sweep = sweep_fixture_with_bundle("sweep-only", 5, 1_000, 0xB1);
         let tmpl = miner_template(vec![sweep]);
         let (_block, proof) = prove_template(&tmpl);
-        assert_shape_counts(&proof, 0, 1);
+        assert_minimal_proof(&proof, 1);
     }
 
     #[test]
@@ -1237,15 +1040,7 @@ mod tests {
         let sweep = sweep_fixture_with_bundle("mixed-sweep", 5, 1_000, 0xD1);
         let tmpl = miner_template(vec![standard, sweep]);
         let (_block, proof) = prove_template(&tmpl);
-        assert_shape_counts(&proof, 1, 1);
-        assert_eq!(
-            proof.standard_bucket.as_ref().unwrap().meta.tx_indices,
-            vec![1]
-        );
-        assert_eq!(
-            proof.sweep_bucket.as_ref().unwrap().meta.tx_indices,
-            vec![2]
-        );
+        assert_minimal_proof(&proof, 2);
     }
 
     #[test]
@@ -1260,29 +1055,23 @@ mod tests {
         let standard_tail = standard_fixture_with_bundle("split-standard-tail", 5_000, 0xF1);
         let tmpl = miner_template(vec![sweep, standard_tail]);
         let (_block, proof) = prove_template(&tmpl);
-        assert_shape_counts(&proof, 1, 1);
-        assert_eq!(
-            proof.sweep_bucket.as_ref().unwrap().meta.tx_indices,
-            vec![1]
-        );
-        assert_eq!(
-            proof.standard_bucket.as_ref().unwrap().meta.tx_indices,
-            vec![2]
-        );
+        assert_minimal_proof(&proof, 2);
     }
 
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn mismatched_bucket_proof_is_rejected_before_submit_verification() {
+    fn minimal_proof_serializes_without_bucket_payload() {
         let standard = standard_fixture_with_bundle("bad-std", 100, 0xA11);
         let sweep = sweep_fixture_with_bundle("bad-sweep", 5, 1_000, 0xB11);
         let tmpl = miner_template(vec![standard, sweep]);
-        let (block, mut proof) = prove_template(&tmpl);
+        let (_block, proof_bytes, _auth_sidecar_bytes, proof) = prove_template_wire(&tmpl);
 
-        proof.sweep_bucket.as_mut().unwrap().meta.tx_indices = vec![1];
-        assert!(
-            validate_block_bucket_tx_indices(&block, &proof).is_err(),
-            "submit-side bucket coverage validation must reject cross-shape proof indices"
+        assert_minimal_proof(&proof, 2);
+        assert_eq!(
+            proof_bytes.len(),
+            bincode::serialize(&proof)
+                .expect("serialize minimal proof")
+                .len()
         );
     }
 }

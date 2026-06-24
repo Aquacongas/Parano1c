@@ -22,10 +22,6 @@ blake3 = "1"
 bincode = "1"
 
 [[bench]]
-name = "stark_report"
-harness = false
-
-[[bench]]
 name = "alice_sends_bob"
 harness = false
 
@@ -35,8 +31,4 @@ harness = false
 
 [[bench]]
 name = "block_hotspots"
-harness = false
-
-[[bench]]
-name = "recursive_hotspots"
 harness = false

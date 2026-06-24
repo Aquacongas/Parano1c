@@ -14,6 +14,8 @@
 //! 8. Start background recursive proof updater
 //! 9. Shutdown on Ctrl-C
 
+#![allow(clippy::items_after_test_module)]
+
 // ---------------------------------------------------------------------------
 // Global allocator: jemalloc
 //
@@ -28,7 +30,7 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -106,7 +108,7 @@ pub enum NodeMode {
     /// and infrastructure operators.
     #[default]
     Relay,
-    /// Internal miner. Runs built-in PoW + BlockProof generation in parallel.
+    /// Internal miner. Runs built-in PoW + block-certificate assembly in parallel.
     /// Blocks external miner (extminer) access to the block-template API.
     Miner,
     /// External miner mode. Serves `getBlockTemplate` / `submitBlock`
@@ -130,7 +132,7 @@ struct Cli {
     /// Node operating mode.
     ///
     /// relay    — full node, no mining (default)
-    /// miner    — internal PoW + BlockProof generation; blocks extminer access
+    /// miner    — internal PoW + block-certificate assembly; blocks extminer access
     /// extminer — serves block templates to noid-extminer; requires --mining-key
     #[arg(long, value_enum, default_value_t = NodeMode::Relay)]
     mode: NodeMode,
@@ -187,7 +189,7 @@ struct Cli {
     /// REQUIRES --mining-key to be set. Without --mining-key this flag is rejected
     /// at startup to prevent unauthenticated access to custom-coinbase templates.
     ///
-    /// Use case: infrastructure pool where the node provides BlockProof generation and P2P
+    /// Use case: infrastructure pool where the node provides block-certificate assembly and P2P
     /// relay, but each miner receives block rewards directly to their own address.
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
@@ -197,7 +199,7 @@ struct Cli {
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
 
-    /// Force-clear all volatile state on startup (segments, nullifiers, undo logs).
+    /// Force-clear all volatile state on startup (segments, undo logs).
     /// The node will re-sync from peers via snapshot. Use after consensus upgrades
     /// or to recover from suspected data corruption.
     #[arg(long)]
@@ -385,8 +387,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Data directory: ~/.paranoid/data by default (no network subdir) ---
-    let data_dir = if cfg.storage.path == PathBuf::from("~/.paranoid/data") {
-        expand_tilde(&PathBuf::from("~/.paranoid/data"))
+    let data_dir = if cfg.storage.path == Path::new("~/.paranoid/data") {
+        expand_tilde(Path::new("~/.paranoid/data"))
     } else {
         expand_tilde(&cfg.storage.path)
     };
@@ -742,7 +744,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         let ctx = chain.read().await;
-        let tip_hdr = ctx.tip_header().clone();
+        let tip_hdr = *ctx.tip_header();
 
         let log_slots = tip_hdr.log_slots;
         let active = tip_hdr.active_slot_count;
@@ -1231,9 +1233,9 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 /// Verify and apply a single P2P block off the tokio executor.
 ///
 /// User-transaction blocks take the proof-native path: verify the full
-/// `BlockProof` (including `BlockStateBindingAir`) against the pre-state, apply
-/// the proven state delta, then atomically commit to MDBX. Coinbase-only blocks
-/// are the explicit no-proof/stub exception.
+/// exact `BlockProof` against the pre-state, apply the proven state transition,
+/// then atomically commit to MDBX. Coinbase-only blocks are the explicit
+/// no-proof/stub exception.
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
@@ -1258,7 +1260,6 @@ async fn apply_p2p_block_offthread(
              prev_active_counts,
              local_time,
              anchor,
-             nullifiers,
              pre_state,
              state| {
                 noid_block::validate_block_from_network(
@@ -1270,7 +1271,6 @@ async fn apply_p2p_block_offthread(
                     prev_active_counts,
                     local_time,
                     anchor,
-                    nullifiers,
                     pre_state,
                     state,
                 )
@@ -1363,7 +1363,6 @@ async fn apply_reorg_offthread(
                      prev_active_counts,
                      local_time,
                      anchor,
-                     nullifiers,
                      pre_state,
                      state| {
                         noid_block::validate_block_from_network(
@@ -1375,7 +1374,6 @@ async fn apply_reorg_offthread(
                             prev_active_counts,
                             local_time,
                             anchor,
-                            nullifiers,
                             pre_state,
                             state,
                         )
@@ -1463,22 +1461,15 @@ fn validate_p2p_block_proof_binding(
 #[cfg(test)]
 mod tests {
     fn minimal_current_block_proof() -> noid_block::BlockProof {
-        noid_block::BlockProof {
-            meta: noid_block::BlockPublicMeta {
-                prev_block_state_root: [0u8; 32],
-                new_state_root: [0u8; 32],
-                n_tx: 0,
-                n_air_per_tx: 0,
-                n_auth_slices_per_tx: 0,
-                log_rows: noid_air::airs::tx_body_spine::SPINE_LOG_ROWS as u32,
-                n_block_spine_slices: 0,
-                n_state_bindings: 0,
+        noid_block::BlockProof::minimal(
+            [0u8; 32],
+            [0u8; 32],
+            0,
+            noid_block::ExactStateTransitionProof {
+                slot_siblings: vec![],
+                guard_update: None,
             },
-            standard_bucket: None,
-            sweep_bucket: None,
-            pre_state_openings: vec![],
-            post_state_openings: vec![],
-        }
+        )
     }
 
     #[test]
@@ -1501,9 +1492,9 @@ mod tests {
 
         let decoded: noid_block::BlockProof =
             bincode::deserialize(&loaded).expect("deserialize current BlockProof format");
-        assert!(decoded.standard_bucket.is_none());
-        assert!(decoded.sweep_bucket.is_none());
         assert_eq!(decoded.meta.n_tx, 0);
+        assert_eq!(decoded.meta.n_air_per_tx, 0);
+        assert_eq!(decoded.meta.n_auth_slices_per_tx, 0);
     }
 }
 
@@ -1748,7 +1739,7 @@ async fn handle_p2p_events(
                 } else if height == our_height + 1 {
                     let precheck = {
                         let ctx = chain.read().await;
-                        let parent = ctx.tip_header().clone();
+                        let parent = *ctx.tip_header();
                         let prev_timestamps = ctx.prev_timestamps();
                         let prev_active_counts = ctx.prev_active_counts();
                         let anchor = ctx.anchor_info();
@@ -1861,7 +1852,7 @@ async fn handle_p2p_events(
                 }
                 // Periodic cleanup of stale entries.
                 block_event_count += 1;
-                if block_event_count % 200 == 0 {
+                if block_event_count.is_multiple_of(200) {
                     let cutoff = Instant::now() - Duration::from_secs(60);
                     peer_block_rate.retain(|_, (_, t)| *t >= cutoff);
                 }
@@ -1874,9 +1865,7 @@ async fn handle_p2p_events(
                         pending_block_fetches.remove(&(block.header.height, block_hash));
 
                         // Skip blocks at or below our current tip — we already have them.
-                        // This avoids expensive proof verification against a stale pre-state
-                        // (build_state_binding_airs needs pre-state, but chain has already
-                        // advanced past this height, causing false ConstraintViolated errors).
+                        // This avoids expensive proof verification against a stale pre-state.
                         {
                             let our_tip = chain.read().await.tip_height();
                             if block.header.height <= our_tip {
@@ -1891,10 +1880,10 @@ async fn handle_p2p_events(
                         }
 
                         // Fork/orphan blocks are not proof-verified until their parent
-                        // becomes the current tip, because state-binding AIRs must be
-                        // built against the exact pre-block state. For the current tip,
-                        // apply_p2p_block_offthread performs proof-native validation and
-                        // atomic commit in one pass; no duplicate apply path.
+                        // becomes the current tip, because exact transition proofs must
+                        // be checked against the exact pre-block state. For the current
+                        // tip, apply_p2p_block_offthread performs proof-native validation
+                        // and atomic commit in one pass; no duplicate apply path.
                         let extends_current_tip = {
                             let ctx = chain.read().await;
                             block.header.height == ctx.tip_height().saturating_add(1)
@@ -2316,19 +2305,16 @@ async fn handle_p2p_events(
                             );
                             continue;
                         }
-                        match noid_tx::TxIntent::from_bytes(&intent_bytes) {
-                            Ok(intent) => {
-                                match mempool_task.submit(intent, intent_bytes).await {
-                                    Ok(hash) => {
-                                        tracing::debug!(hash = ?hash, "mempool sync: tx admitted");
-                                    }
-                                    Err(e) if e.is_soft() => {}
-                                    Err(e) => {
-                                        tracing::debug!(err = %e, "mempool sync: tx rejected");
-                                    }
+                        if let Ok(intent) = noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                            match mempool_task.submit(intent, intent_bytes).await {
+                                Ok(hash) => {
+                                    tracing::debug!(hash = ?hash, "mempool sync: tx admitted");
+                                }
+                                Err(e) if e.is_soft() => {}
+                                Err(e) => {
+                                    tracing::debug!(err = %e, "mempool sync: tx rejected");
                                 }
                             }
-                            Err(_) => {}
                         }
                     }
                 });
@@ -2352,7 +2338,7 @@ async fn handle_p2p_events(
                 // is not blocked; the heavy AuthGKR authorization verification is spawned below.
                 {
                     let now = Instant::now();
-                    let entry = peer_tx_rate.entry(from.clone()).or_insert((0, now));
+                    let entry = peer_tx_rate.entry(from).or_insert((0, now));
                     if now.duration_since(entry.1) > TX_RATE_WINDOW {
                         *entry = (1, now);
                     } else if entry.0 >= TX_RATE_MAX {
@@ -2365,7 +2351,7 @@ async fn handle_p2p_events(
 
                 // Periodic cleanup of stale rate-limit entries.
                 tx_event_count += 1;
-                if tx_event_count % 100 == 0 {
+                if tx_event_count.is_multiple_of(100) {
                     let cutoff = Instant::now() - Duration::from_secs(60);
                     peer_tx_rate.retain(|_, (_, window_start)| *window_start >= cutoff);
                 }
@@ -2382,21 +2368,18 @@ async fn handle_p2p_events(
                 // relay task spawned in main() — no extra work needed here.
                 let mempool_task = mempool.clone();
                 tokio::spawn(async move {
-                    match noid_tx::TxIntent::from_bytes(&intent_bytes) {
-                        Ok(intent) => {
-                            match mempool_task.submit(intent, intent_bytes).await {
-                                Ok(hash) => {
-                                    tracing::debug!(hash = ?hash, "P2P tx admitted");
-                                }
-                                Err(e) if e.is_soft() => {
-                                    // Soft reject (duplicate, slot conflict) — normal, ignore.
-                                }
-                                Err(e) => {
-                                    tracing::debug!(err = %e, "P2P tx rejected");
-                                }
+                    if let Ok(intent) = noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                        match mempool_task.submit(intent, intent_bytes).await {
+                            Ok(hash) => {
+                                tracing::debug!(hash = ?hash, "P2P tx admitted");
+                            }
+                            Err(e) if e.is_soft() => {
+                                // Soft reject (duplicate, slot conflict) — normal, ignore.
+                            }
+                            Err(e) => {
+                                tracing::debug!(err = %e, "P2P tx rejected");
                             }
                         }
-                        Err(_) => {} // malformed intent, ignore
                     }
                 });
             }
@@ -2535,7 +2518,7 @@ async fn handle_p2p_events(
                     for hdr in &headers {
                         let hash = noid_chain::consensus::pow::full_block_hash(hdr);
                         if let Some(h) = ctx.find_ancestor_height(&hash) {
-                            if found.map_or(true, |(fh, _)| h > fh) {
+                            if found.is_none_or(|(fh, _)| h > fh) {
                                 found = Some((h, hash));
                             }
                         }
@@ -2777,10 +2760,8 @@ async fn handle_p2p_events(
                         );
                         manifest_candidates.push((from, manifest));
                     }
-                } else if manifest.tip_height > 0 {
-                    if manifest_candidates.len() < 3 {
-                        manifest_candidates.push((from, manifest));
-                    }
+                } else if manifest.tip_height > 0 && manifest_candidates.len() < 3 {
+                    manifest_candidates.push((from, manifest));
                 }
 
                 // Check whether to proceed after EVERY response (including tip=0).
@@ -3005,18 +2986,6 @@ async fn handle_p2p_events(
                                 tip = m.tip_height,
                                 "snapshot: all segments received, writing to MDBX…"
                             );
-                            let nullifier_blocks: Vec<
-                                Vec<noid_poseidon2b::primitives::TxBodyHash>,
-                            > = m
-                                .nullifier_blocks
-                                .iter()
-                                .map(|hashes| {
-                                    hashes
-                                        .iter()
-                                        .map(|h| noid_poseidon2b::primitives::TxBodyHash(*h))
-                                        .collect()
-                                })
-                                .collect();
                             let result = {
                                 let mut ctx = chain.write().await;
                                 let r = ctx.apply_state_snapshot(
@@ -3027,7 +2996,6 @@ async fn handle_p2p_events(
                                     m.alloc_counter,
                                     segments,
                                     &m.recent_headers,
-                                    &nullifier_blocks,
                                 );
                                 r.map(|_| {
                                     let view = ChainView::from_mdbx(&ctx);
@@ -3261,18 +3229,6 @@ async fn handle_p2p_events(
                                 // No segments (fresh network, no UTXOs yet).
                                 // Apply directly with empty segment list.
                                 let m = pending_manifest.take().unwrap().manifest;
-                                let nullifier_blocks: Vec<
-                                    Vec<noid_poseidon2b::primitives::TxBodyHash>,
-                                > = m
-                                    .nullifier_blocks
-                                    .iter()
-                                    .map(|hashes| {
-                                        hashes
-                                            .iter()
-                                            .map(|h| noid_poseidon2b::primitives::TxBodyHash(*h))
-                                            .collect()
-                                    })
-                                    .collect();
                                 let result = {
                                     let mut ctx = chain.write().await;
                                     let r = ctx.apply_state_snapshot(
@@ -3288,7 +3244,6 @@ async fn handle_p2p_events(
                                             [u8; 32],
                                         )>(),
                                         &m.recent_headers,
-                                        &nullifier_blocks,
                                     );
                                     r.map(|_| {
                                         let view = ChainView::from_mdbx(&ctx);
@@ -3392,7 +3347,7 @@ async fn handle_p2p_events(
                         .flatten()
                         .and_then(|b| bincode::deserialize::<RecursiveBlockProof>(&b).ok())
                         .map(|p| p.block_height);
-                    let already = our_height.map_or(false, |h| h >= height);
+                    let already = our_height.is_some_and(|h| h >= height);
                     if already {
                         (true, None, None)
                     } else {
@@ -3745,7 +3700,7 @@ async fn run_recursive_proof_updater(
     chain: Arc<RwLock<MdbxChainContext>>,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) {
-    use noid_block::{witness_builder::block_proof_to_replay_witness, BlockProof};
+    use noid_block::BlockProof;
     use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use noid_recursive::{
         null_block_replay_witness, prove_genesis_recursive, prove_recursive_step,
@@ -3873,8 +3828,11 @@ async fn run_recursive_proof_updater(
         };
 
         // Build the replay witness.
-        // Real proof available  → extract from BlockProof bytes.
         // Coinbase-only block   → null witness (accumulator still advances correctly).
+        // User-transaction block proofs are minimal and no longer contain the
+        // old bucket transcript required by this historical recursive circuit.
+        // Until the real recursive verifier lands, those blocks stay fail-closed
+        // for recursive advancement.
         // SECURITY: Only use null witness for blocks whose header declares the
         // stub marker. Blocks with a real proof_transcript_hash MUST have proof
         // bytes; if missing, wait instead of fabricating a zero-claim chain_hash.
@@ -3883,17 +3841,13 @@ async fn run_recursive_proof_updater(
         let witness = match block_proof_bytes_opt {
             Some(ref bytes) if !bytes.is_empty() => {
                 match bincode::deserialize::<BlockProof>(bytes) {
-                    Ok(bp) => match block_proof_to_replay_witness(&bp) {
-                        Ok(witness) => witness,
-                        Err(e) => {
-                            tracing::warn!(
-                                next_height,
-                                err = ?e,
-                                "recursive proof cannot extract replay witness from malformed block proof — waiting for re-sync"
-                            );
-                            continue;
-                        }
-                    },
+                    Ok(_bp) => {
+                        tracing::warn!(
+                            next_height,
+                            "recursive proof cannot advance over minimal user block proof until real recursive verifier is enabled"
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         if is_coinbase_only {
                             tracing::warn!(
@@ -3932,7 +3886,7 @@ async fn run_recursive_proof_updater(
         // Move rec_proof_opt into the closure — RecursiveBlockProof is not Clone.
         // prev_acc is already extracted above (ChainAccumulator: Clone).
 
-        let header_for_verify = header.clone();
+        let header_for_verify = header;
         let prev_state_root_for_verify = prev_acc.state_root;
 
         tracing::debug!(next_height, "recursive proof: proving step");
@@ -4045,7 +3999,7 @@ fn print_startup_banner(
 ) {
     // ANSI helpers
     let is_tty =
-        std::env::var("TERM").map_or(false, |t| t != "dumb") && std::env::var("NO_COLOR").is_err();
+        std::env::var("TERM").is_ok_and(|t| t != "dumb") && std::env::var("NO_COLOR").is_err();
     macro_rules! col {
         ($c:expr, $s:expr) => {
             if is_tty {
@@ -4193,19 +4147,19 @@ fn print_startup_banner(
     }
 }
 
-fn load_config(path: &PathBuf) -> Option<NodeConfig> {
+fn load_config(path: &Path) -> Option<NodeConfig> {
     let expanded = expand_tilde(path);
     let text = std::fs::read_to_string(&expanded).ok()?;
     toml::from_str(&text).ok()
 }
 
-fn expand_tilde(p: &PathBuf) -> PathBuf {
+fn expand_tilde(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(format!("{home}/{rest}"))
     } else {
-        p.clone()
+        p.to_path_buf()
     }
 }
 
@@ -4214,7 +4168,7 @@ fn parse_address(s: &str) -> anyhow::Result<noid_poseidon2b::primitives::Address
     if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));
     }
-    noid_poseidon2b::primitives::Address::from_str(s)
+    noid_poseidon2b::primitives::Address::parse(s)
         .map_err(|e| anyhow::anyhow!("invalid address: {e}"))
 }
 

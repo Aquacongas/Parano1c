@@ -433,7 +433,7 @@ impl ParanoidApiServer for RpcHandler {
     async fn get_slots_by_owner(&self, address: String) -> RpcResult<Vec<SlotInfo>> {
         use noid_poseidon2b::primitives::Address;
         let addr =
-            Address::from_str(&address).map_err(|e| rpc_err(format!("invalid address: {e}")))?;
+            Address::parse(&address).map_err(|e| rpc_err(format!("invalid address: {e}")))?;
         let chain = self.chain.read().await;
         let utxos = chain
             .store
@@ -471,13 +471,6 @@ impl ParanoidApiServer for RpcHandler {
             Ok(None) => Ok(None),
             Err(e) => Err(rpc_err(e.to_string())),
         }
-    }
-
-    async fn is_nullifier(&self, txhash: String) -> RpcResult<bool> {
-        use noid_poseidon2b::primitives::TxBodyHash;
-        let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
-        let chain = self.chain.read().await;
-        Ok(chain.nullifiers.contains(&TxBodyHash(hash_bytes)))
     }
 
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>> {
@@ -571,7 +564,7 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn validate_address(&self, address: String) -> RpcResult<AddressInfo> {
         use noid_poseidon2b::primitives::Address;
-        match Address::from_str(&address) {
+        match Address::parse(&address) {
             Ok(addr) => Ok(AddressInfo {
                 valid: true,
                 bech32: Some(addr.to_bech32()),
@@ -690,8 +683,8 @@ impl ParanoidApiServer for RpcHandler {
     ///   `Blake3(header_core || nonce) < difficulty_target`
     ///
     /// CANNOT change the coinbase address: it is committed via the
-    /// BlockProof which the full node generates. Changing the coinbase
-    /// would require regenerating the entire proof.
+    /// block certificate which the full node generates. Changing the
+    /// coinbase would require regenerating the certificate.
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse> {
         if !self.mining_api_enabled {
             return Err(rpc_err(
@@ -801,9 +794,9 @@ impl ParanoidApiServer for RpcHandler {
         let header_core = noid_chain::consensus::pow::header_core_bytes(&pow_header);
         let diff_target = pow_header.difficulty_target;
 
-        // Run BlockProof generation so the full block (including proof fields) is ready.
+        // Run certificate assembly so the full block (including proof fields) is ready.
         // External miner only needs to patch the nonce — no other computation required.
-        // Coinbase-only blocks prove instantly; user-tx blocks take ~1-3 s.
+        // Coinbase-only blocks use the marker path; user-tx blocks carry proof + auth sidecar.
         let tmpl_for_prove = tmpl.clone();
         let (proof_transcript_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
             tokio::task::spawn_blocking(move || {
@@ -891,8 +884,8 @@ impl ParanoidApiServer for RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
-        // Single production path: verify full BlockProof (including state binding),
-        // apply the proven state delta, then commit atomically to MDBX.
+        // Single production path: verify the minimal block proof, apply the
+        // proven transition, then commit atomically to MDBX.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
             ctx.apply_next_block(
@@ -908,7 +901,6 @@ impl ParanoidApiServer for RpcHandler {
                  prev_active_counts,
                  local_time,
                  anchor,
-                 nullifiers,
                  pre_state,
                  state| {
                     noid_block::validate_block_from_network(
@@ -920,7 +912,6 @@ impl ParanoidApiServer for RpcHandler {
                         prev_active_counts,
                         local_time,
                         anchor,
-                        nullifiers,
                         pre_state,
                         state,
                     )
@@ -1531,7 +1522,7 @@ fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));
     }
-    noid_poseidon2b::primitives::Address::from_str(s)
+    noid_poseidon2b::primitives::Address::parse(s)
         .map_err(|e| rpc_err(format!("invalid address: {e}")))
 }
 
@@ -1601,6 +1592,7 @@ mod tests {
 /// The server runs until `handle.stop()` is called or it is dropped.
 /// Start the RPC server and return (handle, stop_rx).
 /// `stop_rx` fires when `paranoid_stop` is called via RPC.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     listen: SocketAddr,
     chain: Arc<RwLock<MdbxChainContext>>,
@@ -1700,7 +1692,7 @@ where
         // No key configured — pass through unconditionally.
         let Some(ref expected) = self.expected else {
             let fut = self.inner.call(req);
-            return Box::pin(async move { fut.await });
+            return Box::pin(fut);
         };
 
         let auth = req
@@ -1711,7 +1703,7 @@ where
 
         if auth == expected {
             let fut = self.inner.call(req);
-            Box::pin(async move { fut.await })
+            Box::pin(fut)
         } else {
             Box::pin(async {
                 Ok(http::Response::builder()

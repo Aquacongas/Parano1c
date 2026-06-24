@@ -3,18 +3,17 @@
 
 //! Native-side state transition for the transparent UTXO chain.
 //!
-//! The chain state is a single `FriState` — a FRI-committed vector of
-//! `2^STATE_LOG_SLOTS` UTXO slots, each holding a `(value, owner)`
-//! pair. A spend zeroes the slot at `input.slot_index` and returns
-//! that index to the free-list. A mint writes to the wallet-chosen
-//! `output.slot_index`; the chain verifies the destination was empty
-//! (prev-state `(0,0,0)`) and `BlockStateBindingAir` proves the same
-//! opening in-circuit so consensus is four-corner bound.
-//! The state root is `FriState::root()`.
+//! The chain state is a segmented raw UTXO slot vector plus exact commitments.
+//! A spend zeroes the slot at `input.slot_index` and the block-level exact
+//! transition records that slot in `ReuseGuard`; a mint writes to the
+//! wallet-chosen `output.slot_index` only if the verifier-derived prefix state
+//! says it is empty and not active-guarded.
+//! The block header state root is the exact composite root:
+//! `H(log_slots, UTXO_MerkleRoot, ReuseGuardRoot)`.
 //!
-//! This is *not* the in-circuit state transition — it is the native
-//! reference the prover uses to compute the post-root that the STARK
-//! then proves through §FriStateOpen.
+//! This is the native reference used by miners, validators, storage and tests.
+//! User-transaction block acceptance uses the exact authenticated transition
+//! proof, then commits the sealed verifier result atomically.
 
 use std::collections::HashSet;
 
@@ -22,8 +21,10 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
+use crate::exact_state_hash::{composite_state_root, zero_slot_roots, StateHash};
 use crate::fri_state::{SlotValue, STATE_LOG_SLOTS};
-use crate::segmented_state::SegmentedFriState;
+use crate::reuse_guard::{GuardBucket, ReuseGuard};
+use crate::segmented_state::{ExactStateReadError, SegmentedFriState};
 
 /// Chain-level mutable state.
 ///
@@ -35,8 +36,12 @@ use crate::segmented_state::SegmentedFriState;
 /// influence `apply_tx` outcomes.
 #[derive(Debug, Clone)]
 pub struct ChainState {
-    /// Segmented FRI-committed UTXO state (2^16 slots per segment).
+    /// Segmented raw UTXO state (2^16 slots per segment).
     pub state: SegmentedFriState,
+    /// Exact sparse Merkle root over the UTXO slot vector.
+    pub utxo_root: StateHash,
+    /// Bounded ABA replay guard over recently spent slot indices.
+    pub reuse_guard: ReuseGuard,
     /// Number of live (non-empty) slots. Grows on activation, shrinks
     /// on deactivation. This is the consensus-significant occupancy
     /// signal for the `log_slots` expansion trigger (see
@@ -53,14 +58,35 @@ impl ChainState {
         Self::with_log_slots(STATE_LOG_SLOTS)
     }
 
-    /// Fresh state with a custom slot depth. Tests use a small depth
-    /// to keep the FRI commitment cheap.
+    /// Fresh state with a custom slot depth. Tests use a small depth to keep
+    /// exact sparse-Merkle fixtures cheap.
     pub fn with_log_slots(log_slots: usize) -> Self {
+        let utxo_root = zero_slot_roots(log_slots)[log_slots];
         Self {
             state: SegmentedFriState::new_empty(log_slots),
+            utxo_root,
+            reuse_guard: ReuseGuard::new_empty(),
             active_slot_count: 0,
             alloc_counter: 0,
         }
+    }
+
+    /// Build chain state from fully loaded raw segment columns.
+    pub fn from_loaded_parts(
+        state: SegmentedFriState,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        reuse_guard: ReuseGuard,
+    ) -> Result<Self, ExactStateReadError> {
+        let mut out = Self {
+            utxo_root: zero_slot_roots(state.log_slots())[state.log_slots()],
+            state,
+            reuse_guard,
+            active_slot_count,
+            alloc_counter,
+        };
+        out.rebuild_exact_utxo_root_loaded()?;
+        Ok(out)
     }
 
     /// Total number of slots in the state vector.
@@ -80,7 +106,75 @@ impl ChainState {
 
     #[inline]
     pub fn state_root(&mut self) -> Digest {
-        self.state.root()
+        if let Ok(root) = self.state.exact_utxo_root() {
+            self.utxo_root = root;
+        }
+        composite_state_root(
+            self.state.log_slots() as u32,
+            self.utxo_root,
+            self.reuse_guard.root(),
+        )
+    }
+
+    #[inline]
+    pub fn cached_state_root(&self) -> Digest {
+        composite_state_root(
+            self.state.log_slots() as u32,
+            self.utxo_root,
+            self.reuse_guard.root(),
+        )
+    }
+
+    pub fn rebuild_exact_utxo_root_loaded(&mut self) -> Result<StateHash, ExactStateReadError> {
+        let root = self.state.exact_utxo_root()?;
+        self.utxo_root = root;
+        Ok(root)
+    }
+
+    pub fn exact_sparse_cache(
+        &mut self,
+    ) -> Result<crate::sparse_merkle::SparseMerkleCache, ExactStateReadError> {
+        let cache = self.state.exact_sparse_cache()?;
+        self.utxo_root = cache.root();
+        Ok(cache)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_verified_exact_transition(
+        &mut self,
+        log_slots: u32,
+        child_utxo_root: StateHash,
+        child_guard_root: StateHash,
+        slot_updates: &[(u32, SlotValue)],
+        guard_bucket_update: Option<(usize, GuardBucket)>,
+        active_slot_count: u64,
+        alloc_counter: u64,
+    ) -> Result<Digest, ApplyExactTransitionError> {
+        let mut snapshot = self.clone();
+        while log_slots as usize > snapshot.state.log_slots() {
+            snapshot.state.expand();
+        }
+        if log_slots as usize != snapshot.state.log_slots() {
+            return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
+        }
+        snapshot
+            .state
+            .apply_delta_unrooted(slot_updates)
+            .map_err(|_| ApplyExactTransitionError::SlotOutOfRange)?;
+        snapshot.utxo_root = child_utxo_root;
+        if let Some((bucket_index, bucket)) = guard_bucket_update {
+            snapshot
+                .reuse_guard
+                .apply_verified_bucket_update(bucket_index, bucket, child_guard_root)
+                .map_err(ApplyExactTransitionError::ReuseGuard)?;
+        } else if snapshot.reuse_guard.root() != child_guard_root {
+            return Err(ApplyExactTransitionError::ReuseGuardRootMismatch);
+        }
+        snapshot.active_slot_count = active_slot_count;
+        snapshot.alloc_counter = alloc_counter;
+        let root = snapshot.cached_state_root();
+        *self = snapshot;
+        Ok(root)
     }
 }
 
@@ -114,19 +208,43 @@ pub enum ApplyError {
     DuplicateOutputSlot,
     /// A tx tries to spend and mint to the same slot in one body. Reuse is
     /// allowed after a slot is freed, but not inside the same transaction: the
-    /// block state-binding layer proves output slots were empty before the tx.
+    /// exact transition surface requires output slots to be empty before the tx.
     InputOutputSlotOverlap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyExactTransitionError {
+    SlotOutOfRange,
+    HeaderLogSlotsMismatch,
+    ReuseGuardRootMismatch,
+    ReuseGuard(crate::reuse_guard::ReuseGuardError),
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
 /// root on success. Dummy slots (`valid = false`) are skipped entirely.
 ///
-/// State root validation (epoch_anchor freshness) happens at block level
-/// via BlockStateBinding — this function purely executes the UTXO
-/// state transition without checking anchors.
+/// State root validation happens at block level via the exact authenticated
+/// transition proof — this function purely executes the UTXO state transition
+/// without checking anchors.
 ///
 /// On `Err`, `state` is left untouched.
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
+    apply_tx_checked_deferred_root(state, body)?;
+    let new_state_root = state.state_root();
+    Ok(StateTransition { new_state_root })
+}
+
+/// Apply a `TxBody` to `state` while deferring the expensive Merkle root rebuild.
+///
+/// This preserves the same validation and atomicity semantics as [`apply_tx`],
+/// but leaves dirty segment/tree roots to be flushed by a later `state_root()`
+/// call. This is a consensus-internal construction helper, not a block
+/// acceptance API; callers must compute/bind the final root before publishing or
+/// accepting a header.
+pub(crate) fn apply_tx_checked_deferred_root(
+    state: &mut ChainState,
+    body: &TxBody,
+) -> Result<(), ApplyError> {
     let mut snapshot = state.clone();
 
     let input_slots: HashSet<u32> = body
@@ -138,9 +256,6 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
 
     // Wallet-chosen output slots: reject duplicates *within this tx*
     // up-front so we don't silently overwrite our own earlier write.
-    // BlockStateBindingAir mirrors this as a per-output
-    // `is_mint ⇒ prev_state[slot] == (0,0,0)` opening plus a
-    // cross-output uniqueness check.
     let mut seen: HashSet<u32> = HashSet::new();
     for output in &body.outputs {
         if !output.valid {
@@ -168,9 +283,8 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
         insert_output(&mut snapshot, output)?;
     }
 
-    let new_state_root = snapshot.state_root();
     *state = snapshot;
-    Ok(StateTransition { new_state_root })
+    Ok(())
 }
 
 fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError> {
@@ -202,9 +316,7 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
     if (idx as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
-    // The wallet-chosen destination must be empty in prev-state.
-    // BlockStateBindingAir proves the same fact in-circuit
-    // (`is_mint ⇒ prev == (0,0,0)`).
+    // The wallet-chosen destination must be empty in the current state.
     if state.state.slot(idx) != SlotValue::EMPTY {
         return Err(ApplyError::OutputSlotNotEmpty);
     }
@@ -225,7 +337,7 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::TxInput;
 
     const TEST_LOG_SLOTS: usize = 6; // 64 slots — cheap FRI
@@ -255,7 +367,6 @@ mod tests {
             value: out.value,
             owner: out.owner,
             spend_secret: SpendSecret([0u8; 32]),
-            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         }
     }

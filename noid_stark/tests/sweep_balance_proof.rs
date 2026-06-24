@@ -5,7 +5,7 @@ use noid_air::{
     composition::{sweep25x2_balance_witness_from_body, sweep_logic_air_and_trace_from_body},
     Air,
 };
-use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret, TxBodyHash};
+use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
 use noid_stark::{prove_air, verify_air};
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, TxBody, TxInput, TxOutput,
@@ -18,7 +18,6 @@ fn mk_input(i: usize) -> TxInput {
         value: 1_000 + i as u64,
         owner: Address([i as u8; 32]),
         spend_secret: SpendSecret([0x80 ^ i as u8; 32]),
-        auth_tag: AuthTag([0x40 ^ i as u8; 32]),
         valid: true,
     }
 }
@@ -73,8 +72,7 @@ fn public_inputs_for_body(body: &TxBody) -> PublicInputs {
         log_slots: 24,
         claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
         // PublicInputs currently stores standard-sized activation/deactivation
-        // arrays. The standalone sweep balance proof does not consume them;
-        // shape-aware block-state binding is a later integration step.
+        // arrays. The standalone sweep balance proof does not consume them.
         is_activation: [false; MAX_OUTPUTS],
         is_deactivation: [false; MAX_INPUTS],
     }
@@ -109,7 +107,7 @@ fn sweep_tx_logic_air_proves_and_rejects_body_tamper() {
     let body = mk_sweep_body();
     let pi = public_inputs_for_body(&body);
     let (air, trace) = sweep_logic_air_and_trace_from_body(&body);
-    assert!(air.public_columns().len() > 0);
+    assert!(!air.public_columns().is_empty());
 
     let proof = prove_air(&air, &trace, &pi).expect("prove sweep tx logic AIR");
     verify_air(&air, &pi, &proof).expect("verify sweep tx logic AIR");

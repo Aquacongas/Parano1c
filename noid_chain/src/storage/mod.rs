@@ -71,17 +71,11 @@ pub trait HeaderProvider {
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Option<BlockHeader>;
 }
 
-/// Read-only access to the nullifier set (double-spend detection).
-pub trait NullifierProvider {
-    /// Return `true` if `hash` appears in the rolling nullifier window.
-    fn contains_nullifier(&self, hash: &noid_poseidon2b::primitives::TxBodyHash) -> bool;
-}
-
 /// Combined durable chain store.
 ///
 /// Implementors provide unified access to headers, the recursive proof, the
-/// transaction index, and recent full blocks. `MdbxStore` implements this trait
-/// for the disk-backed node.
+/// transaction index, and retained full blocks. `MdbxStore` implements this
+/// trait for the disk-backed node.
 pub trait BlockStore: Send + Sync {
     /// Current best tip: `(height, H_BLOCK hash)`.
     fn best_tip(&self) -> Option<(u64, [u8; 32])>;
@@ -93,8 +87,8 @@ pub trait BlockStore: Send + Sync {
     /// Retrieve a header by its `H_BLOCK` hash.
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
 
-    /// Retrieve a recent block's raw bytes. Only available for the recent
-    /// block retention window; returns `None` for older blocks.
+    /// Retrieve a retained block's raw bytes. Data is retained until checkpoint
+    /// coverage; returns `None` only if not stored or deliberately pruned later.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     /// Retrieve the persisted recursive chain proof (~38 KB encoded). `None` means

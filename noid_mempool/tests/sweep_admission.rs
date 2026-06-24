@@ -7,14 +7,13 @@ use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::genesis::genesis_header;
 use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::fri_state::SlotValue;
-use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
-use noid_gkr::{prove_wallet_authorization, WalletAuthorizationBundle};
-use noid_mempool::{AsyncMempool, ChainView, SubmitError};
-use noid_poseidon2b::primitives::{
-    derive_address, hash_auth_tag, Address, AuthTag, SpendSecret, TxBodyHash,
+use noid_gkr::{
+    prove_wallet_authorization, verify_wallet_authorization, WalletAuthorizationBundle,
 };
+use noid_mempool::{AsyncMempool, ChainView, SubmitError};
+use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
 use noid_tx::{
     compute_claims_commitment, hash_tx_body_for_shape, TxBody, TxInput, TxIntent, TxOutput, TxShape,
 };
@@ -36,14 +35,13 @@ fn mk_sweep_body(epoch_anchor: [u8; 32], fee: u64) -> TxBody {
             value: 20_000 + i as u64,
             owner: derive_address(&spend_secret),
             spend_secret,
-            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         });
     }
 
     let total: u64 = inputs.iter().map(|i| i.value).sum();
     let spendable = total.checked_sub(fee).expect("fee below input total");
-    let mut body = TxBody {
+    TxBody {
         shape: TxShape::Sweep25x2,
         epoch_anchor,
         fee: fee as u128,
@@ -63,21 +61,7 @@ fn mk_sweep_body(epoch_anchor: [u8; 32], fee: u64) -> TxBody {
             },
         ],
         is_coinbase: false,
-    };
-
-    let tx_body_hash = hash_tx_body_for_shape(
-        body.shape,
-        &body.epoch_anchor,
-        body.fee,
-        &body.inputs,
-        &body.outputs,
-        body.is_coinbase,
-    );
-    for input in &mut body.inputs {
-        input.auth_tag = hash_auth_tag(&input.spend_secret, &tx_body_hash);
     }
-
-    body
 }
 
 fn empty_chain_view() -> ChainView {
@@ -86,16 +70,18 @@ fn empty_chain_view() -> ChainView {
     headers.insert(0, genesis);
 
     let state = ChainState::new();
-    ChainView::new(
-        0,
-        headers,
-        NullifierSet::new(),
-        state.active_slot_count,
-        state.state,
-    )
+    ChainView::new(0, headers, state.active_slot_count, state.state)
 }
 
 fn chain_view_with_inputs(body: &TxBody) -> ChainView {
+    chain_view_with_live_slots(body, false)
+}
+
+fn chain_view_with_inputs_and_outputs(body: &TxBody) -> ChainView {
+    chain_view_with_live_slots(body, true)
+}
+
+fn chain_view_with_live_slots(body: &TxBody, include_outputs: bool) -> ChainView {
     let genesis = genesis_header();
     let mut headers = HashMap::new();
     headers.insert(0, genesis);
@@ -115,14 +101,24 @@ fn chain_view_with_inputs(body: &TxBody) -> ChainView {
             .expect("insert live input slot");
         state.active_slot_count += 1;
     }
+    if include_outputs {
+        for output in body.outputs.iter().filter(|o| o.valid) {
+            state
+                .state
+                .set_slot(
+                    output.slot_index,
+                    SlotValue {
+                        value: Block128::from(output.value as u128),
+                        owner_hi: output.owner.as_fields()[0],
+                        owner_lo: output.owner.as_fields()[1],
+                    },
+                )
+                .expect("insert occupied output slot");
+            state.active_slot_count += 1;
+        }
+    }
 
-    ChainView::new(
-        0,
-        headers,
-        NullifierSet::new(),
-        state.active_slot_count,
-        state.state,
-    )
+    ChainView::new(0, headers, state.active_slot_count, state.state)
 }
 
 fn prove_bundle(body: &TxBody) -> WalletAuthorizationBundle {
@@ -209,7 +205,7 @@ async fn mempool_accepts_valid_sweep25x2_bundle() {
         .expect("admitted sweep proof should be cached");
     let cached_bundle =
         WalletAuthorizationBundle::from_bytes(cached).expect("decode cached authorization");
-    assert_eq!(cached_bundle.shape(), TxShape::Sweep25x2);
+    verify_wallet_authorization(&body, &cached_bundle).expect("verify cached sweep authorization");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -279,12 +275,7 @@ async fn mempool_rejects_sweep_auth_tamper() {
     let body = mk_sweep_body(epoch_anchor, fee);
     let view = chain_view_with_inputs(&body);
     let mut bundle = prove_bundle(&body);
-    match &mut bundle {
-        WalletAuthorizationBundle::Sweep25x2(proof) => {
-            proof.kill_shot.main.state_at_r += Block128::ONE;
-        }
-        WalletAuthorizationBundle::Standard4x8(_) => panic!("expected sweep bundle"),
-    }
+    bundle.proof.kill_shot.main.state_at_r += Block128::ONE;
     let intent = intent_with_proof(body, authorization_bytes(&bundle));
     let intent_bytes = intent.to_bytes();
 
@@ -342,7 +333,7 @@ async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
 }
 
 #[tokio::test]
-async fn mempool_rejects_sweep_nullifier_collision_before_zk() {
+async fn mempool_rejects_sweep_replay_by_occupied_output_before_zk() {
     let genesis = genesis_header();
     let epoch_anchor = full_block_hash(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
@@ -350,14 +341,13 @@ async fn mempool_rejects_sweep_nullifier_collision_before_zk() {
     let body = mk_sweep_body(epoch_anchor, fee);
     let intent = intent_with_proof(body.clone(), vec![0x01]);
 
-    let mut view = chain_view_with_inputs(&body);
-    view.nullifiers.insert_block(&[intent.tx_body_hash]);
+    let view = chain_view_with_inputs_and_outputs(&body);
     let mempool = AsyncMempool::new(view, noid_mempool::MempoolConfig::default());
     let result = mempool.submit(intent, vec![]).await;
     assert!(matches!(
         result,
         Err(SubmitError::Consensus(
-            noid_chain::consensus::ConsensusError::NullifierCollision
+            noid_chain::consensus::ConsensusError::SlotConflict
         ))
     ));
 }

@@ -25,9 +25,7 @@ use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::pow::full_block_hash;
-use crate::fri_state::SlotValue;
-use crate::state::ChainState;
-use crate::state_binding::{BlockStateBinding, TxStateOpening};
+use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
 // ---------------------------------------------------------------------------
 // BlockTemplate
@@ -63,9 +61,6 @@ pub struct BlockTemplate {
     pub difficulty_target: Digest,
     /// Hash of parent block header.
     pub prev_block_hash: Digest,
-    /// Block-level state binding: pre-state slot openings + Merkle siblings.
-    /// `None` for coinbase-only blocks (no user transactions).
-    pub state_binding: Option<BlockStateBinding>,
 }
 
 impl BlockTemplate {
@@ -170,7 +165,6 @@ pub fn build_block_template(
     use crate::consensus::fees::{claimable_fee_for_tx_body, required_fee_for_tx_body};
     use crate::consensus::timestamps::median_u64;
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
-    use crate::state::apply_tx;
     use noid_tx::{hash_tx_body, TxBody, TxOutput};
 
     // 1. Resolve slot conflicts among candidate txs.
@@ -217,49 +211,12 @@ pub fn build_block_template(
         if actual < required {
             continue;
         }
-        match apply_tx(&mut scratch, &tx.body) {
+        match apply_tx_checked_deferred_root(&mut scratch, &tx.body) {
             Ok(_) => applied_winners.push(tx),
             Err(_e) => {}
         }
     }
     let ordered_winners = applied_winners;
-
-    // Build BlockStateBinding from pre-state slot values.
-    // Read slot values from `state.state` (original, untouched by scratch).
-    let state_binding: Option<BlockStateBinding> = if ordered_winners.is_empty() {
-        None
-    } else {
-        let prev_state_root = parent.state_root;
-        let mut tx_openings = Vec::with_capacity(ordered_winners.len());
-        for tx in &ordered_winners {
-            let input_openings: Vec<SlotValue> = tx
-                .body
-                .inputs
-                .iter()
-                .filter(|i| i.valid)
-                .map(|i| state.state.slot(i.slot_index))
-                .collect();
-            let output_openings: Vec<SlotValue> = tx
-                .body
-                .outputs
-                .iter()
-                .filter(|o| o.valid)
-                .map(|_| SlotValue::EMPTY)
-                .collect();
-            tx_openings.push(TxStateOpening {
-                input_openings,
-                output_openings,
-            });
-        }
-        Some(BlockStateBinding {
-            tx_openings,
-            prev_state_root,
-            new_state_root: [0u8; 32], // patched below after coinbase
-            pre_seg_siblings: std::collections::HashMap::new(), // patched below
-            post_seg_siblings: std::collections::HashMap::new(), // patched below
-            tree_depth: 0,             // patched below
-        })
-    };
 
     // 4. Build coinbase transaction.
     // Find an empty slot for coinbase output using the allocator.
@@ -330,43 +287,35 @@ pub fn build_block_template(
     };
 
     // Apply coinbase to scratch state.
-    apply_tx(&mut scratch, &coinbase.body)
+    apply_tx_checked_deferred_root(&mut scratch, &coinbase.body)
+        .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+
+    let exact_bodies: Vec<_> = ordered_winners
+        .iter()
+        .map(|tx| tx.body.clone())
+        .chain(std::iter::once(coinbase.body.clone()))
+        .collect();
+    let exact_commitments: Vec<_> = exact_bodies
+        .iter()
+        .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
+        .collect();
+    let mut exact_parent_state = state.state.clone();
+    if should_expand {
+        exact_parent_state.expand();
+    }
+    let exact_surface = crate::state_delta::build_exact_action_surface(
+        &exact_parent_state,
+        &exact_bodies,
+        &exact_commitments,
+    )
+    .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    scratch
+        .reuse_guard
+        .apply_spends(parent.height + 1, &exact_surface.spent_slots)
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
 
     // 5. Compute final header fields.
     let state_root = scratch.state_root();
-    // Patch new_state_root + Merkle siblings into the binding.
-    // scratch.state_root() flushes the tree, so merkle_siblings is valid now.
-    let state_binding = state_binding.map(|mut b| {
-        b.new_state_root = state_root;
-        let tree_depth = scratch.state.tree_depth();
-        b.tree_depth = tree_depth;
-        if tree_depth > 0 {
-            // Collect all touched segments from user txs and coinbase.
-            let eff = state.state.effective_log_segment_size();
-            let mut segs: HashSet<u16> = HashSet::new();
-            for tx in &ordered_winners {
-                for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-                    segs.insert((inp.slot_index >> eff) as u16);
-                }
-                for out in tx.body.outputs.iter().filter(|o| o.valid) {
-                    segs.insert((out.slot_index >> eff) as u16);
-                }
-            }
-            for out in coinbase.body.outputs.iter().filter(|o| o.valid) {
-                segs.insert((out.slot_index >> eff) as u16);
-            }
-            for seg_id in segs {
-                // Pre-state: from original committed state (tree is flushed between blocks).
-                b.pre_seg_siblings
-                    .insert(seg_id, state.state.merkle_siblings(seg_id));
-                // Post-state: from scratch (tree flushed by state_root() above).
-                b.post_seg_siblings
-                    .insert(seg_id, scratch.state.merkle_siblings(seg_id));
-            }
-        }
-        b
-    });
     // Collect only tx_body_hashes to avoid cloning full Transaction objects.
     let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.tx_body_hash.0)
         .chain(ordered_winners.iter().map(|tx| tx.tx_body_hash.0))
@@ -403,7 +352,6 @@ pub fn build_block_template(
         miner_address,
         difficulty_target,
         prev_block_hash,
-        state_binding,
     })
 }
 
@@ -418,8 +366,11 @@ mod tests {
         genesis::{genesis_header, GENESIS_TIMESTAMP},
         params::{BLOCK_TIME, GENESIS_TARGET},
     };
+    use crate::fri_state::SlotValue;
     use crate::state::ChainState;
-    use noid_poseidon2b::primitives::Address;
+    use noid_core::Block128;
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
+    use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
 
@@ -497,6 +448,90 @@ mod tests {
 
         let expected_tx_root = crate::block::compute_tx_root(&tmpl.all_txs());
         assert_eq!(tmpl.tx_root, expected_tx_root);
+    }
+
+    #[test]
+    fn user_spend_template_state_root_includes_reuse_guard_update() {
+        let owner = Address([0x11; 32]);
+        let [owner_hi, owner_lo] = owner.as_fields();
+        let mut state = fresh_state();
+        state
+            .state
+            .set_slot(
+                3,
+                SlotValue {
+                    value: Block128::from(100_000u128),
+                    owner_hi,
+                    owner_lo,
+                },
+            )
+            .unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 1;
+        let parent_root = state.state_root();
+        let mut parent = genesis_header();
+        parent.state_root = parent_root;
+        parent.log_slots = TEST_LOG_SLOTS as u32;
+        parent.active_slot_count = state.active_slot_count;
+        parent.alloc_counter = state.alloc_counter;
+
+        let input = TxInput {
+            slot_index: 3,
+            value: 100_000,
+            owner,
+            spend_secret: SpendSecret([0x22; 32]),
+            valid: true,
+        };
+        let output = TxOutput {
+            slot_index: 4,
+            value: 80_000,
+            owner: Address([0x44; 32]),
+            valid: true,
+        };
+        let body = TxBody::standard(
+            full_block_hash(&parent),
+            9_000,
+            vec![input],
+            vec![output],
+            false,
+        );
+        let tx = Transaction {
+            tx_body_hash: hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            body,
+        };
+
+        let tmpl = build_block_template(
+            &parent,
+            &state,
+            &[parent.active_slot_count],
+            vec![tx.clone()],
+            Address([0xAB; 32]),
+            GENESIS_TIMESTAMP + BLOCK_TIME,
+            GENESIS_TARGET,
+        )
+        .unwrap();
+
+        let mut expected = state.clone();
+        crate::state::apply_tx(&mut expected, &tx.body).unwrap();
+        crate::state::apply_tx(&mut expected, &tmpl.coinbase.body).unwrap();
+        let no_guard_root = expected.state_root();
+        expected
+            .reuse_guard
+            .apply_spends(tmpl.height, &[3])
+            .unwrap();
+        let expected_root = expected.state_root();
+
+        assert_ne!(
+            no_guard_root, expected_root,
+            "spend blocks must change the composite root through ReuseGuard"
+        );
+        assert_eq!(tmpl.state_root, expected_root);
     }
 
     #[test]

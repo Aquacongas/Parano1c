@@ -20,8 +20,8 @@ use crate::consensus::ConsensusError;
 ///
 /// * `block_ts`        — The timestamp from the candidate block header (Unix seconds).
 /// * `prev_timestamps` — Timestamps of the `N` most recent ancestor blocks,
-///                       ordered oldest-first (index 0 = oldest). Up to
-///                       `MEDIAN_TIME_BLOCKS = 11` entries; fewer at genesis.
+///   ordered oldest-first (index 0 = oldest). Up to
+///   `MEDIAN_TIME_BLOCKS = 11` entries; fewer at genesis.
 /// * `local_time`      — Current wall-clock time at the validating node (Unix seconds).
 pub fn validate_timestamp(
     block_ts: u64,

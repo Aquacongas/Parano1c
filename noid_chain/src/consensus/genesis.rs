@@ -10,7 +10,7 @@
 //! - Coinbase to burn address (initial coins bootstrapping)
 //! - `proof_transcript_hash = [1u8;32]` (marker — no real proof for genesis)
 //!
-//! The genesis state_root is `SegmentedFriState::new(LOG_SLOTS_GENESIS).root()`.
+//! The genesis state_root is the exact composite root of an empty chain state.
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{
@@ -52,8 +52,8 @@ pub fn genesis_header() -> BlockHeader {
     }
 }
 
-/// The canonical genesis state root: Poseidon2b Merkle root of an all-zero
-/// `SegmentedFriState` with `log_slots = LOG_SLOTS_GENESIS`.
+/// The canonical genesis state root: exact composite root of an all-zero UTXO
+/// tree and empty ReuseGuard with `log_slots = LOG_SLOTS_GENESIS`.
 ///
 /// Computed once via `SegmentedFriState::new_empty(24).root()` and hardcoded.
 /// Verified by the test `genesis_state_root_matches_computed` below.
@@ -61,17 +61,16 @@ pub fn genesis_state_root() -> [u8; 32] {
     GENESIS_STATE_ROOT
 }
 
-/// Pre-computed genesis state root. All 2^24 slots are zero.
-/// Computed via compact interleaved FRI (`noid_fri_binius`).
+/// Pre-computed genesis state root. All 2^24 slots are zero and the ReuseGuard is empty.
 const GENESIS_STATE_ROOT: [u8; 32] = [
-    0xdd, 0xdd, 0xfe, 0xc4, 0x6f, 0xcd, 0xa5, 0x8d, 0x64, 0x3b, 0xa8, 0x94, 0xe1, 0xe2, 0xcb, 0x44,
-    0x5e, 0xfc, 0x8b, 0xbc, 0xd3, 0x98, 0x8b, 0xbd, 0x44, 0xf9, 0x14, 0x81, 0x83, 0x33, 0x92, 0x99,
+    0x1e, 0x88, 0xc2, 0xd9, 0xa5, 0x60, 0x86, 0x20, 0x1d, 0x57, 0xd1, 0x38, 0x4f, 0xda, 0xa6, 0xfc,
+    0xe5, 0x56, 0xc0, 0x3a, 0x90, 0x1a, 0x45, 0x16, 0xed, 0xd6, 0x15, 0x0c, 0xf5, 0xcb, 0x65, 0x28,
 ];
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
 /// Recomputed after the source-binding Merkle hash width changed to 256 bits.
-const GENESIS_NONCE: u128 = 64_894_641;
+const GENESIS_NONCE: u128 = 447_551_453;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -109,22 +108,17 @@ mod tests {
 
     #[test]
     fn genesis_state_root_matches_computed() {
-        use crate::segmented_state::SegmentedFriState;
-        let mut state = SegmentedFriState::new_empty(24);
-        assert_eq!(
-            state.root(),
-            genesis_state_root(),
-            "hardcoded GENESIS_STATE_ROOT must match SegmentedFriState::new_empty(24).root()"
-        );
+        let mut state = crate::state::ChainState::with_log_slots(24);
+        assert_eq!(state.state_root(), genesis_state_root());
     }
 
     /// Print the new genesis state root and a valid nonce for it.
     /// Run with: cargo test -p noid_chain --lib -- consensus::genesis::tests::print_new_genesis --nocapture
     #[test]
+    #[ignore]
     fn print_new_genesis() {
-        use crate::segmented_state::SegmentedFriState;
-        let mut state = SegmentedFriState::new_empty(24);
-        let new_root = state.root();
+        let mut state = crate::state::ChainState::with_log_slots(24);
+        let new_root = state.state_root();
         println!("\nNew GENESIS_STATE_ROOT:");
         print!("const GENESIS_STATE_ROOT: [u8; 32] = [");
         for (i, b) in new_root.iter().enumerate() {
@@ -157,7 +151,7 @@ mod tests {
             active_slot_count: 0,
             alloc_counter: 0,
         };
-        search_pow(&h, 0, 200_000_000).expect("genesis target is trivially satisfiable")
+        search_pow(&h, 0, 2_000_000_000).expect("genesis target is trivially satisfiable")
     }
 
     #[test]
@@ -172,6 +166,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn genesis_timestamp_is_reasonable() {
         assert!(GENESIS_TIMESTAMP > 1_700_000_000);
     }

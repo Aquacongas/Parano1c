@@ -4,8 +4,8 @@
 //! Merkle path Kill-Shot orchestrator.
 //!
 //! Proves that a Merkle path of up to 16 Poseidon2b compressions chains
-//! a leaf digest to the expected root. Uses the same unified sumcheck +
-//! shift + batch-eval architecture as Spine and Auth Kill-Shots.
+//! a leaf digest to the expected root. Uses Merkle-local unified sumcheck,
+//! shift, and batch-eval proof structures.
 //!
 //! Transcript order:
 //! 1. Absorb `expected_root`.
@@ -22,7 +22,6 @@ use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
-use crate::auth_unified_v2::{AuthKillShotProof, AuthShiftReduction, AuthUnifiedReduction};
 use crate::batch_eval::{
     prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
 };
@@ -31,6 +30,7 @@ use crate::merkle_mle::{build_merkle_unified_mle, MerkleUnifiedMle, N_MERKLE_UNI
 use crate::merkle_oracle::evaluate_merkle;
 use crate::merkle_unified::{
     prove_merkle_shift, prove_merkle_unified, verify_merkle_shift, verify_merkle_unified,
+    MerkleKillShotProof, MerkleShiftReduction, MerkleUnifiedReduction,
 };
 
 /// Number of output lanes pinned (root = 2 lanes).
@@ -39,7 +39,7 @@ pub const MERKLE_PIN_LANES: usize = 2;
 /// Composite proof for a Merkle path Kill-Shot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerkleProofKillShot {
-    pub kill_shot: AuthKillShotProof,
+    pub kill_shot: MerkleKillShotProof,
     pub state_batch: BatchEvalProof,
     pub sin_batch: BatchEvalProof,
     pub sout_batch: BatchEvalProof,
@@ -179,7 +179,7 @@ pub fn prove_merkle_killshot<T: FiatShamir<Block128>>(
     let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
 
     let proof = MerkleProofKillShot {
-        kill_shot: AuthKillShotProof { main, shift },
+        kill_shot: MerkleKillShotProof { main, shift },
         state_batch,
         sin_batch,
         sout_batch,
@@ -206,9 +206,9 @@ pub fn verify_merkle_killshot<T: FiatShamir<Block128>>(
 
     absorb_public_boundary(channel, inputs);
 
-    let main_red: AuthUnifiedReduction =
+    let main_red: MerkleUnifiedReduction =
         verify_merkle_unified(&proof.kill_shot.main, live_slots, channel)?;
-    let shift_red: AuthShiftReduction =
+    let shift_red: MerkleShiftReduction =
         verify_merkle_shift(&proof.kill_shot.shift, &main_red, channel)?;
 
     let mut state_claims = vec![
@@ -292,13 +292,13 @@ mod tests {
         let leaf = [0x42u8; 32];
         let mut current = leaf;
         let mut siblings_raw = [[0u8; 32]; MAX_MERKLE_DEPTH];
-        for i in 0..depth {
-            siblings_raw[i] = [(i as u8).wrapping_add(0xA0); 32];
-            current = compress(&current, &siblings_raw[i]);
+        for (i, sibling) in siblings_raw.iter_mut().enumerate().take(depth) {
+            *sibling = [(i as u8).wrapping_add(0xA0); 32];
+            current = compress(&current, sibling);
         }
         let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
-        for i in 0..depth {
-            siblings[i] = digest_to_fields(&siblings_raw[i]);
+        for (i, sibling) in siblings_raw.iter().enumerate().take(depth) {
+            siblings[i] = digest_to_fields(sibling);
         }
         MerklePathInputs {
             leaf: digest_to_fields(&leaf),

@@ -9,11 +9,10 @@
 //!
 //! ## What fits in the view
 //!
-//! Only data needed for the five admission steps:
-//! 1. `nullifiers` — double-spend detection
-//! 2. `recent_headers` — epoch_anchor validation
-//! 3. `state` — slot liveness and emptiness checks
-//! 4. `tip_height` — anchor window bounds
+//! Only data needed for admission:
+//! 1. `recent_headers` — epoch_anchor validation
+//! 2. `state` — slot liveness and emptiness checks
+//! 3. `tip_height` — anchor window bounds
 //!
 //! The full `SegmentedFriState` is included because it uses lazy segment
 //! materialisation — virtual-zero segments are not allocated. At genesis with no
@@ -23,7 +22,6 @@ use std::collections::HashMap;
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::fri_state::SlotValue;
-use noid_chain::nullifier::NullifierSet;
 use noid_chain::segmented_state::SegmentedFriState;
 
 /// A consistent snapshot of chain state used for mempool admission.
@@ -35,10 +33,6 @@ pub struct ChainView {
     /// Recent block headers (`[tip - ANCHOR_DEPTH, tip]`).
     /// Needed to validate `epoch_anchor` hash against actual headers.
     pub recent_headers: HashMap<u64, BlockHeader>,
-
-    /// Rolling nullifier window (last ANCHOR_DEPTH blocks).
-    /// O(1) double-spend detection.
-    pub nullifiers: NullifierSet,
 
     /// Total number of slots in the current state space.
     pub num_slots: u64,
@@ -56,7 +50,6 @@ impl ChainView {
     pub fn new(
         tip_height: u64,
         recent_headers: HashMap<u64, BlockHeader>,
-        nullifiers: NullifierSet,
         active_slot_count: u64,
         state: SegmentedFriState,
     ) -> Self {
@@ -64,7 +57,6 @@ impl ChainView {
         Self {
             tip_height,
             recent_headers,
-            nullifiers,
             num_slots,
             active_slot_count,
             state,
@@ -89,13 +81,12 @@ impl ChainView {
 
     /// Build a `ChainView` from a `MdbxChainContext` (call on every new block).
     ///
-    /// Clones only the metadata (headers, nullifiers) and the sparse state.
+    /// Clones only the metadata (headers) and the sparse state.
     /// The state clone is cheap when few segments are materialised.
     pub fn from_mdbx(ctx: &noid_chain::storage::MdbxChainContext) -> Self {
         Self::new(
             ctx.tip_height,
             ctx.recent_headers.clone(),
-            ctx.nullifiers.clone(),
             ctx.state.active_slot_count,
             ctx.state.state.clone(),
         )

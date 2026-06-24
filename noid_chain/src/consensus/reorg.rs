@@ -12,10 +12,7 @@
 //! 2. Reject if reorg depth > CONSENSUS_FINALITY_DEPTH.
 //! 3. Revert blocks from current tip to common ancestor using undo logs.
 //! 4. Apply new blocks one by one using the in-memory sequential interpreter.
-//! 5. Rebuild nullifier set from surviving-chain undo logs (ANCHOR_DEPTH window;
-//!    blocks older than undo retention produce empty entries — safe because
-//!    those txs are already protected by the UTXO state check).
-//! 6. Return hashes of reverted transactions for mempool re-admission.
+//! 5. Return hashes of reverted transactions for mempool re-admission.
 
 use std::collections::HashMap;
 
@@ -29,7 +26,6 @@ use crate::consensus::{
     ConsensusError,
 };
 use crate::fri_state::SlotValue;
-use crate::nullifier::NullifierSet;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -118,6 +114,12 @@ pub fn revert_state_counters(state: &mut ChainState, undo: &BlockUndoLog) {
     }
 }
 
+pub fn revert_reuse_guard(state: &mut ChainState, undo: &BlockUndoLog) {
+    state.reuse_guard =
+        crate::reuse_guard::ReuseGuard::from_buckets(undo.reuse_guard_before.clone())
+            .expect("undo log must contain canonical ReuseGuard buckets");
+}
+
 /// Apply a chain reorg: revert to `ancestor_height` then apply `new_blocks`.
 ///
 /// On success: `ctx` reflects the new canonical chain.
@@ -161,6 +163,10 @@ pub fn apply_reorg(
 
         // Revert UTXO slot data.
         revert_block(&mut ctx.state.state, &undo);
+        ctx.state
+            .rebuild_exact_utxo_root_loaded()
+            .expect("in-memory reorg state must be fully loaded");
+        revert_reuse_guard(&mut ctx.state, &undo);
 
         // Revert active_slot_count and alloc_counter.
         // Without this, the counters stay at the post-reorg tip values and the
@@ -170,28 +176,6 @@ pub fn apply_reorg(
         ctx.undo_logs.remove(&height);
         ctx.headers.remove(&height);
         reverted_heights.push(height);
-    }
-
-    // Rebuild nullifier set from the surviving chain.
-    //
-    // tx_hashes are stored in undo logs.  Undo logs are retained only for a
-    // bounded recent window; blocks older than that in the surviving
-    // chain produce empty entries.  This is safe: those older blocks' txs are
-    // protected by the UTXO state itself — their input slots are already EMPTY
-    // ("unknown or spent") and output slots are LIVE ("output slot not empty"),
-    // so the sequential interpreter rejects re-inclusion regardless of the nullifier set.
-    {
-        use crate::consensus::params::ANCHOR_DEPTH;
-        let rebuild_start = ancestor_height.saturating_sub(ANCHOR_DEPTH);
-        let rebuild_blocks: Vec<Vec<TxBodyHash>> = (rebuild_start..=ancestor_height)
-            .map(|h| {
-                ctx.undo_logs
-                    .get(&h)
-                    .map(|u| u.tx_hashes.clone())
-                    .unwrap_or_default() // empty for blocks beyond retention
-            })
-            .collect();
-        ctx.nullifiers = NullifierSet::rebuild_from_blocks(rebuild_blocks);
     }
 
     ctx.tip_height = ancestor_height;
@@ -251,13 +235,13 @@ mod tests {
     use crate::fri_state::SlotValue;
     use crate::state::{apply_tx, ChainState};
     use noid_core::Block128;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
     const TEST_LOG_SLOTS: usize = 8;
 
     fn build_empty_block(ctx: &mut ChainContext) -> Block {
-        let parent = ctx.tip_header().clone();
+        let parent = *ctx.tip_header();
         let new_root = ctx.state.state_root();
         let mut header = BlockHeader {
             prev_block_hash: full_block_hash(&parent),
@@ -311,7 +295,6 @@ mod tests {
             value: out.value,
             owner: out.owner,
             spend_secret: SpendSecret([0x55; 32]),
-            auth_tag: AuthTag([0x77; 32]),
             valid: true,
         }
     }
@@ -329,7 +312,7 @@ mod tests {
     }
 
     fn build_block(ctx: &ChainContext, txs: Vec<Transaction>) -> Block {
-        let parent = ctx.tip_header().clone();
+        let parent = *ctx.tip_header();
         let mut dry = ctx.state.clone();
         for tx in &txs {
             apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
@@ -437,7 +420,7 @@ mod tests {
     #[test]
     fn find_common_ancestor_same_genesis() {
         let ctx = ChainContext::init_from_genesis();
-        let genesis = ctx.tip_header().clone();
+        let genesis = *ctx.tip_header();
         let new_headers = vec![(0u64, genesis)];
         let ancestor = find_common_ancestor(&ctx, &new_headers);
         assert_eq!(ancestor, Some(0));
@@ -502,6 +485,7 @@ mod tests {
             block_height: 5,
             slot_changes: vec![(10, SlotValue::EMPTY)],
             tx_hashes: vec![],
+            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
         state.active_slot_count = 3;
@@ -525,6 +509,7 @@ mod tests {
             block_height: 5,
             slot_changes: vec![(10, prev)],
             tx_hashes: vec![],
+            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
         state.active_slot_count = 5;
@@ -566,12 +551,6 @@ mod tests {
         let tx_hashes: Vec<_> = txs.iter().map(|tx| tx.tx_body_hash).collect();
         ctx.apply_next_block(&block, block.header.timestamp + 1)
             .expect("user block applies before reorg");
-        for h in &tx_hashes {
-            assert!(
-                ctx.nullifiers.contains(h),
-                "tx nullifier is active before reorg"
-            );
-        }
         let result = apply_reorg(ctx, ancestor_height, &[]).expect("shape block reorg succeeds");
         assert_eq!(ctx.tip_height, ancestor_height);
         assert_eq!(ctx.state.state_root(), ancestor_root);
@@ -579,10 +558,6 @@ mod tests {
             assert!(
                 result.reclaimed_tx_hashes.contains(h),
                 "reorg reports reclaimed tx hash"
-            );
-            assert!(
-                !ctx.nullifiers.contains(h),
-                "reverted tx nullifier is removed"
             );
         }
         result
@@ -593,7 +568,7 @@ mod tests {
         let mut ctx = init_small_easy_context();
         let funding = apply_funding_outputs(&mut ctx, 4);
         let out = output(90, 30_000_000, 0x91);
-        let tx = user_tx(&ctx, TxShape::Standard4x8, &funding[..4], vec![out.clone()]);
+        let tx = user_tx(&ctx, TxShape::Standard4x8, &funding[..4], vec![out]);
 
         apply_user_block_and_reorg(&mut ctx, vec![tx]);
         for restored in &funding[..4] {
@@ -608,12 +583,7 @@ mod tests {
         let funding = apply_funding_outputs(&mut ctx, 5);
         let out_a = output(100, 24_000_000, 0xA1);
         let out_b = output(101, 25_000_000, 0xA2);
-        let tx = user_tx(
-            &ctx,
-            TxShape::Sweep25x2,
-            &funding[..5],
-            vec![out_a.clone(), out_b.clone()],
-        );
+        let tx = user_tx(&ctx, TxShape::Sweep25x2, &funding[..5], vec![out_a, out_b]);
 
         let block = build_block(&ctx, vec![tx.clone()]);
         ctx.apply_next_block(&block, block.header.timestamp + 1)
@@ -630,7 +600,6 @@ mod tests {
         }
         assert_empty_slot(&ctx.state, out_a.slot_index);
         assert_empty_slot(&ctx.state, out_b.slot_index);
-        assert!(!ctx.nullifiers.contains(&tx.tx_body_hash));
     }
 
     #[test]
@@ -639,18 +608,8 @@ mod tests {
         let funding = apply_funding_outputs(&mut ctx, 9);
         let std_out = output(110, 18_000_000, 0xB1);
         let sweep_out = output(111, 42_000_000, 0xB2);
-        let std_tx = user_tx(
-            &ctx,
-            TxShape::Standard4x8,
-            &funding[..4],
-            vec![std_out.clone()],
-        );
-        let sweep_tx = user_tx(
-            &ctx,
-            TxShape::Sweep25x2,
-            &funding[4..9],
-            vec![sweep_out.clone()],
-        );
+        let std_tx = user_tx(&ctx, TxShape::Standard4x8, &funding[..4], vec![std_out]);
+        let sweep_tx = user_tx(&ctx, TxShape::Sweep25x2, &funding[4..9], vec![sweep_out]);
 
         apply_user_block_and_reorg(&mut ctx, vec![std_tx, sweep_tx]);
         for restored in &funding[..9] {
@@ -670,13 +629,13 @@ mod tests {
             &ctx,
             TxShape::Sweep25x2,
             &funding[..25],
-            vec![sweep_chunk_out.clone()],
+            vec![sweep_chunk_out],
         );
         let standard_tail = user_tx(
             &ctx,
             TxShape::Standard4x8,
             &funding[25..26],
-            vec![standard_tail_out.clone()],
+            vec![standard_tail_out],
         );
 
         apply_user_block_and_reorg(&mut ctx, vec![sweep_chunk, standard_tail]);
@@ -692,12 +651,7 @@ mod tests {
         let mut ctx = init_small_easy_context();
         let funding = apply_funding_outputs(&mut ctx, 18);
         let consolidated = output(150, 179_000_000, 0xD1);
-        let consolidation = user_tx(
-            &ctx,
-            TxShape::Sweep25x2,
-            &funding[..18],
-            vec![consolidated.clone()],
-        );
+        let consolidation = user_tx(&ctx, TxShape::Sweep25x2, &funding[..18], vec![consolidated]);
 
         apply_user_block_and_reorg(&mut ctx, vec![consolidation]);
         for restored in &funding[..18] {

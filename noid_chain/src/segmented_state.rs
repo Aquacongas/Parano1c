@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Segmented FRI-committed state .
+//! Segmented raw UTXO state with exact sparse-Merkle helpers.
 //!
 //! The chain state is split into `N = 2^(log_slots - LOG_SEGMENT_SIZE)`
-//! independent segments (each holding `2^LOG_SEGMENT_SIZE` slots). Each
-//! segment is independently FRI-committed; the global `state_root` is the
-//! root of a Poseidon2b binary Merkle tree over the per-segment FRI roots.
+//! independent segments (each holding `2^LOG_SEGMENT_SIZE` slots). The
+//! consensus UTXO commitment is the exact Poseidon2b sparse-Merkle root over
+//! slot leaves; segments are an I/O and cache boundary, not a state FRI proof.
 //!
 //! When `log_slots <= LOG_SEGMENT_SIZE` (test mode), there is exactly one
-//! segment whose size is `2^log_slots`. In that case `state_root` degenerates
-//! to the single segment root — no Merkle tree is needed — and the proof
-//! path is identical to the old monolithic FriState (backward-compatible
-//! with all existing tests).
+//! segment whose size is `2^log_slots`. In that case exact root helpers operate
+//! over that one segment directly.
 //!
-//! # Memory layout (dirty-only commitment)
+//! # Memory layout
 //!
 //! Segments are "virtual zero" by default: `segments[i] = None` means every
 //! slot in that segment reads as `SlotValue::EMPTY`. No memory is allocated
@@ -22,10 +20,11 @@
 //! (F.1b zero-copy mandate: virtual zero segments share a single static
 //! `SegmentColumns` for reads; only writes allocate).
 //!
-//! # Merkle tree (F.3)
+//! # Segment-local cache tree
 //!
 //! `tree[1..=2N-1]` is a 1-indexed perfect binary tree over `N` segment
-//! roots. Leaves are at `tree[N..2N]`, root at `tree[1]`.
+//! roots. Leaves are at `tree[N..2N]`, root at `tree[1]`. This cache is
+//! rebuildable from raw slots and is not a separate consensus input.
 //!
 //! ```text
 //! tree[k] = compress(tree[2k], tree[2k+1])   for k in 1..N
@@ -43,12 +42,14 @@ use std::sync::OnceLock;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::compress;
 
+use crate::exact_state_hash::{slot_leaf_hash_checked, ExactStateHashError, StateHash};
 #[cfg(test)]
 use crate::fri_state::merkle_root_from_leaf;
 use crate::fri_state::{
     compute_segment_root, eval_point_for_local_index, open_segment_at_point, SlotOpening,
     SlotValue, StateError, StateRoot, LOG_SEGMENT_SIZE,
 };
+use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -59,6 +60,40 @@ pub const SEGMENT_SIZE: usize = 1 << LOG_SEGMENT_SIZE;
 
 /// Maximum segment-tree depth at `MAX_LOG_SLOTS = 32`.
 pub const MAX_SEGTREE_DEPTH: usize = 16;
+
+/// Errors returned when rebuilding the exact UTXO commitment from raw slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactStateReadError {
+    EvictedSegment { seg_id: u16 },
+    Hash(ExactStateHashError),
+    SparseMerkle(SparseMerkleError),
+}
+
+impl core::fmt::Display for ExactStateReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EvictedSegment { seg_id } => {
+                write!(f, "exact state rebuild needs evicted segment {seg_id}")
+            }
+            Self::Hash(err) => write!(f, "{err}"),
+            Self::SparseMerkle(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ExactStateReadError {}
+
+impl From<ExactStateHashError> for ExactStateReadError {
+    fn from(err: ExactStateHashError) -> Self {
+        Self::Hash(err)
+    }
+}
+
+impl From<SparseMerkleError> for ExactStateReadError {
+    fn from(err: SparseMerkleError) -> Self {
+        Self::SparseMerkle(err)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SegmentColumns
@@ -244,7 +279,7 @@ fn zero_seg_root_for(log_size: usize) -> StateRoot {
 // SegmentedFriState
 // ---------------------------------------------------------------------------
 
-/// Segmented FRI-committed UTXO state.
+/// Segmented raw UTXO state with exact commitment helpers.
 ///
 /// Production: `log_slots = 24`, `num_segments = 256`, each segment 65536 slots.
 /// Tests: `log_slots ≤ LOG_SEGMENT_SIZE = 16`, `num_segments = 1`.
@@ -660,6 +695,42 @@ impl SegmentedFriState {
             .map(|(i, _)| i as u16)
     }
 
+    /// Rebuild the exact sparse UTXO Merkle cache from loaded live segments.
+    ///
+    /// This scans only live, materialized segments. If a live segment has been
+    /// evicted from RAM, callers must reload it from durable storage first or
+    /// use the chain-level cached exact root instead of rebuilding.
+    pub fn exact_sparse_cache(&self) -> Result<SparseMerkleCache, ExactStateReadError> {
+        let mut leaves: Vec<(u32, StateHash)> = Vec::new();
+        let seg_size = self.segment_slot_count();
+        for seg_id in self.active_segment_ids() {
+            let cols = self
+                .try_get_segment_columns(seg_id)
+                .ok_or(ExactStateReadError::EvictedSegment { seg_id })?;
+            let base = (seg_id as u32) << self.effective_log_seg;
+            for local in 0..seg_size {
+                let slot = SlotValue {
+                    value: cols.values[local],
+                    owner_hi: cols.owners_hi[local],
+                    owner_lo: cols.owners_lo[local],
+                };
+                if slot.is_empty() {
+                    continue;
+                }
+                leaves.push((base | (local as u32), slot_leaf_hash_checked(slot)?));
+            }
+        }
+        Ok(SparseMerkleCache::from_leaves(
+            self.log_slots as u32,
+            &leaves,
+        )?)
+    }
+
+    /// Rebuild the exact UTXO root from loaded live segments.
+    pub fn exact_utxo_root(&self) -> Result<StateHash, ExactStateReadError> {
+        Ok(self.exact_sparse_cache()?.root())
+    }
+
     /// Segment IDs currently materialised in RAM, regardless of live count.
     pub fn materialized_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
         self.segments
@@ -824,7 +895,7 @@ impl SegmentedFriState {
         let mut siblings = Vec::with_capacity(depth);
         let mut k = self.num_segments + seg_id as usize; // 1-indexed leaf
         while k > 1 {
-            let sib = if k % 2 == 0 { k + 1 } else { k - 1 };
+            let sib = if k.is_multiple_of(2) { k + 1 } else { k - 1 };
             siblings.push(self.tree[sib]);
             k /= 2;
         }

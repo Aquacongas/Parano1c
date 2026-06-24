@@ -308,7 +308,7 @@ impl WalletState {
             .values()
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
             .collect();
-        available.sort_by(|a, b| b.value.cmp(&a.value));
+        available.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         let mut selected = Vec::new();
         let mut total = 0u64;

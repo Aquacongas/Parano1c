@@ -27,6 +27,7 @@ use noid_fri::hasher::CryptographicHasher;
 use noid_fri::merkle::{compute_leaf_hashes, MerkleTree, VectorCommitment};
 use noid_fri::Channel;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crate::compact_fri::{
@@ -279,8 +280,10 @@ pub fn prove_mixed_opening(
     // flat/GCM evaluator as block multipoint openings: it preserves the field
     // value but avoids tower-basis multiplication in the hot fold loop.
     thread_local! {
-        static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
-        static POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+        static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     let primary_openings: Vec<Block128> = state
@@ -331,8 +334,8 @@ pub fn prove_mixed_opening(
     // accumulator vector hot in cache. Accumulation is performed in the flat
     // basis and converted back once for compact FRI.
     use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, tower_to_flat_u128};
-    let c_evals: Vec<Block128> = if n_cols == 1 {
-        state.raw_cols[0].to_vec()
+    let c_evals: Cow<'_, [Block128]> = if n_cols == 1 {
+        Cow::Borrowed(state.raw_cols[0])
     } else {
         let c_evals_flat: Vec<u128> = state
             .raw_cols
@@ -359,7 +362,8 @@ pub fn prove_mixed_opening(
         c_evals_flat
             .into_iter()
             .map(|v| Block128::from(flat_to_tower_u128(v)))
-            .collect()
+            .collect::<Vec<_>>()
+            .into()
     };
     profiler.phase("batched_polynomial");
 
@@ -367,7 +371,7 @@ pub fn prove_mixed_opening(
     // the H/table commitments before compact FRI draws query indices, so the
     // FRI round-0 oracle cannot be chosen independently of the committed source.
     let (fri_proof, _fri_query_info, source_proof) = compact_fri_prove_with_query_hook(
-        &c_evals,
+        c_evals.as_ref(),
         primary_point,
         ntt,
         channel,
@@ -376,7 +380,7 @@ pub fn prove_mixed_opening(
         |ctx, channel| {
             prove_source_binding(
                 state,
-                &c_evals,
+                c_evals.as_ref(),
                 primary_point,
                 ctx,
                 ntt,
@@ -400,6 +404,7 @@ pub fn prove_mixed_opening(
 }
 
 /// Verify a mixed opening proof.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_mixed_opening(
     commitment: &crate::interleaved_commit::InterleavedCommitment,
     primary_point: &[Block128],
@@ -783,7 +788,7 @@ fn verify_source_binding(
 
     let weights_flat = compute_horner_weights_flat(gamma, n_cols);
     let mut folded_symbols = Vec::with_capacity(n_queries);
-    for query_idx in 0..n_queries {
+    for (query_idx, _) in source_pair_indices.iter().take(n_queries).enumerate() {
         let start = query_idx * n_cols * 2;
         let source_pair = reduce_source_pair_flat(
             &proof.source_symbols[start..start + n_cols * 2],
@@ -1538,7 +1543,7 @@ mod tests {
         let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
         let hasher = Blake3Hasher::new();
         let (_commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
-        let gamma = Block128::from(0xBAD5_EEDu128);
+        let gamma = Block128::from(0x0BAD_5EED_u128);
         let weights_flat = compute_horner_weights_flat(gamma, state.n_cols);
         let n = 1usize << state.log_rows;
 

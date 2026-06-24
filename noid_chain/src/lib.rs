@@ -3,34 +3,35 @@
 
 //! Chain layer for Paranoid.
 //!
-//! Ties transactions (`noid_tx`) to the on-chain state: the segmented
-//! FRI-committed UTXO state vector and the block-header hash.
+//! Ties transactions (`noid_tx`) to the on-chain state: the segmented raw UTXO
+//! vector, exact state commitments, bounded `ReuseGuard`, and block-header hash.
 //!
 //! Two primary entry points:
 //!
 //! - [`hash_block_header`] — canonical `H_BLOCK` with the `BLOCKHDR`
 //!   capacity IV.
-//! - [`apply_tx`] — applies a validated `TxBody` to mutable state,
-//!   returning the post-transition state root. Native-side shadow of the
-//!   state-transition relation that the STARK enforces in-circuit.
+//! - [`apply_tx`] — applies one `TxBody` to mutable raw state. User block
+//!   acceptance additionally verifies and commits an exact authenticated
+//!   state transition.
 
 pub mod block;
 pub mod block_header;
 pub mod chain_context;
 pub mod consensus;
 pub mod da;
+pub mod exact_state_hash;
 pub mod fri_state;
 pub mod mempool;
-pub mod nullifier;
+pub mod reuse_guard;
 pub mod segmented_state;
+pub mod sparse_merkle;
 pub mod state;
-pub mod state_binding;
 pub mod state_delta;
 pub mod storage;
 pub mod wire;
 
 // ---------------------------------------------------------------------------
-// FRI state primitives (per-segment level)
+// Raw state primitives (per-segment level)
 // ---------------------------------------------------------------------------
 
 pub use fri_state::{
@@ -83,12 +84,12 @@ pub use block_header::{hash_block_header, BlockHeader};
 
 pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
-pub use nullifier::NullifierSet;
+pub use reuse_guard::{GuardBucket, ReuseGuard, REUSE_DELAY, REUSE_GUARD_BUCKETS};
 pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
-pub use state_binding::{BlockStateBinding, StateBindingError, TxStateOpening};
 pub use state_delta::{
-    build_state_delta_action_surface, build_state_delta_witness, StateDeltaAction,
-    StateDeltaActionKind, StateDeltaActionSurface, StateDeltaError, StateDeltaWitness,
+    build_exact_action_surface, build_state_delta_action_surface, build_state_delta_witness,
+    ExactActionSurface, StateDeltaAction, StateDeltaActionKind, StateDeltaActionSurface,
+    StateDeltaError, StateDeltaWitness,
 };
 pub use wire::BLOCK_HEADER_WIRE_SIZE;
 

@@ -55,7 +55,8 @@ pub struct GetHeadersResponse {
 // Block pull: full block + proof
 // ---------------------------------------------------------------------------
 
-/// Request a recent full block (only last FINALITY_DEPTH blocks available).
+/// Request a retained full block. Large-gap public sync still fails closed
+/// until immutable checkpoint coverage exists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockRequest {
     pub height: u64,
@@ -130,8 +131,6 @@ pub struct GetStateManifestResponse {
     pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
-    /// TX hashes per block for nullifier-set rebuild (last ANCHOR_DEPTH blocks).
-    pub nullifier_blocks: Vec<Vec<[u8; 32]>>,
 }
 
 // ---------------------------------------------------------------------------

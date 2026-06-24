@@ -97,11 +97,8 @@ impl Constraint for SquareGate {
 /// `out == a · b · c` (local-only, degree 3).
 ///
 /// Motivation. Several AIR stages stack two `MulGate`s through an
-/// intermediate committed column to express a triple product —
-/// e.g. `BlockStateBindingAir`'s gamma-RLC pipeline
-///   `gp_lane = γ^i · (eq(r, slot_bits) · opened_pre_lane)`
-/// which would otherwise require a committed `col_mle_prod_*`
-/// intermediate. Fusing to one degree-3 gate drops the intermediate
+/// intermediate committed column to express a triple product. Fusing to one
+/// degree-3 gate drops the intermediate
 /// column (one fewer FRI commitment per lane) at the cost of one
 /// more degree level, which the quotient machinery already
 /// absorbs (e.g. MDS-blend constraints are degree-3).

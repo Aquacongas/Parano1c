@@ -18,9 +18,8 @@
 //!   2. get slot hints from local chain state (empty slots for outputs)
 //!   3. builder::build_and_prove_tx(...)
 //!      a. compute tx_body_hash
-//!      b. compute auth_tags = hash_auth_tag(spend_secret, tx_body_hash)
-//!      c. prove_tx(body, secrets) → WalletAuthorizationBundle
-//!      d. assemble TxIntent bytes
+//!      b. prove_tx(body, secrets) → WalletAuthorizationBundle
+//!      c. assemble TxIntent bytes
 //!   4. submit to own mempool
 //! ```
 
@@ -57,6 +56,7 @@ pub struct WalletHandle {
 }
 
 impl WalletHandle {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(inner: SharedWallet) -> Arc<dyn WalletOps + Send + Sync> {
         Arc::new(Self { inner })
     }
@@ -275,7 +275,7 @@ impl WalletOps for WalletHandle {
             .values()
             .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
             .collect();
-        available.sort_by(|a, b| b.value.cmp(&a.value));
+        available.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         let spendable: u64 = available.iter().map(|u| u.value).sum();
         let mut cursor = 0usize;
@@ -336,7 +336,7 @@ impl WalletOps for WalletHandle {
             .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
             .cloned()
             .collect();
-        available.sort_by(|a, b| b.value.cmp(&a.value));
+        available.sort_by_key(|u| std::cmp::Reverse(u.value));
 
         let spendable: u64 = available.iter().map(|u| u.value).sum();
         let mut cursor = 0usize;
@@ -833,14 +833,14 @@ mod tests {
 
     #[test]
     fn planner_uses_one_sweep_sized_chunk_for_20_inputs() {
-        let (_dir, handle) = handle_with_utxos(&vec![1_000; 20]);
+        let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
         let chunks = handle.plan_send_splits(19_500, 500).unwrap();
         assert_eq!(chunks, vec![19_500]);
     }
 
     #[test]
     fn planner_splits_after_25_inputs() {
-        let (_dir, handle) = handle_with_utxos(&vec![1_000; 26]);
+        let (_dir, handle) = handle_with_utxos(&[1_000; 26]);
         let chunks = handle.plan_send_splits(25_000, 500).unwrap();
         assert_eq!(chunks, vec![24_500, 500]);
     }
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn sweep_sized_send_selects_more_than_four_inputs() {
-        let (_dir, handle) = handle_with_utxos(&vec![50_000_000; 8]);
+        let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
         let amount = 200_000_001;
         let fee = 18_500;
         let chunks = handle.plan_send_splits(amount, fee).unwrap();
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn shape_aware_plan_does_not_apply_sweep_worst_case_to_five_input_send() {
-        let (_dir, handle) = handle_with_utxos(&vec![50_000_000; 8]);
+        let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
         let plan = handle.plan_send(200_000_001, None, 0, 24, 0).unwrap();
         assert_eq!(plan.split_count, 1);
         assert_eq!(plan.chunks[0].shape, "Sweep25x2");
@@ -911,13 +911,13 @@ mod tests {
 
     #[test]
     fn consolidate_planner_caps_at_sweep_capacity() {
-        let (_dir, handle) = handle_with_utxos(&vec![1_000; 30]);
+        let (_dir, handle) = handle_with_utxos(&[1_000; 30]);
         assert_eq!(handle.plan_consolidate_input_count().unwrap(), 25);
     }
 
     #[test]
     fn consolidate_planner_skips_pending_inputs() {
-        let (_dir, handle) = handle_with_utxos(&vec![1_000; 6]);
+        let (_dir, handle) = handle_with_utxos(&[1_000; 6]);
         {
             let mut guard = handle.inner.lock().unwrap();
             guard.as_mut().unwrap().pending_input_slots.insert(0);
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn consolidate_four_inputs_uses_standard_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 4]);
+        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 4]);
         assert_eq!(shape, TxShape::Standard4x8);
         assert_eq!(selected, 4);
         assert_eq!(amount, 3_990);
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn consolidate_five_inputs_uses_sweep_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 5]);
+        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 5]);
         assert_eq!(shape, TxShape::Sweep25x2);
         assert_eq!(selected, 5);
         assert_eq!(amount, 4_990);
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn consolidate_twenty_five_inputs_uses_sweep_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&vec![1_000; 30]);
+        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 30]);
         assert_eq!(shape, TxShape::Sweep25x2);
         assert_eq!(selected, 25);
         assert_eq!(amount, 24_990);

@@ -165,9 +165,7 @@ fn shl320(w: [u64; 5], n: u32) -> [u64; 5] {
     let word_sh = (n / 64).min(5) as usize;
     let bit_sh = n % 64;
     let mut out = [0u64; 5];
-    for i in word_sh..5 {
-        out[i] = w[i - word_sh];
-    }
+    out[word_sh..5].copy_from_slice(&w[..(5 - word_sh)]);
     if bit_sh > 0 {
         let mut c = 0u64;
         for limb in out.iter_mut() {
@@ -187,9 +185,7 @@ fn shr320(w: [u64; 5], n: u32) -> [u64; 5] {
     let word_sh = (n / 64).min(5) as usize;
     let bit_sh = n % 64;
     let mut out = [0u64; 5];
-    for i in 0..(5 - word_sh) {
-        out[i] = w[i + word_sh];
-    }
+    out[..(5 - word_sh)].copy_from_slice(&w[word_sh..5]);
     if bit_sh > 0 {
         let mut c = 0u64;
         for limb in out.iter_mut().rev() {
@@ -316,7 +312,7 @@ mod tests {
             // Rounding in fixed-point ≤ 1 bit difference.
             let orig = as_u128(&GENESIS_TARGET);
             let got = as_u128(&new);
-            let delta = if got > orig { got - orig } else { orig - got };
+            let delta = got.abs_diff(orig);
             assert!(delta <= 1, "on-time: delta={delta} at h={h}");
         }
     }

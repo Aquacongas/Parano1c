@@ -271,6 +271,7 @@ impl RecursiveBlockAir {
     /// 3 × ClaimInCheckGate (primary block + secondary block + rec sumcheck)
     /// + 3 × FoldCheckGate (primary block + secondary block + rec sumcheck)
     /// + 2 × WeightedLinearGate (acc hi/lo).
+    ///
     /// Used by `derive_rec_multipoint_replay` to replay the FS channel correctly.
     pub const N_CONSTRAINTS: usize = 8;
 

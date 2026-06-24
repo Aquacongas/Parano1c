@@ -14,7 +14,7 @@ pub enum SubmitError {
     #[error("already admitted: {0:?}")]
     AlreadyAdmitted(TxBodyHash),
 
-    /// Native consensus check failed (fee, anchor, nullifier, slot).
+    /// Native consensus check failed (fee, anchor, slot).
     #[error("consensus: {0}")]
     Consensus(#[from] ConsensusError),
 

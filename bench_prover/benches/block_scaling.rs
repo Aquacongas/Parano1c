@@ -1,31 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Block/bucket scaling benchmark for mixed transaction shapes.
+//! Production block scaling benchmark for mixed transaction shapes.
 //!
 //!   cargo bench --bench block_scaling
 //!
-//! Measures both component bucket paths and full production block proof paths.
-//! The standard bucket-only rows reproduce the old numbers; full block rows add
-//! common state-binding proofs and are the cap-driving production numbers.
-//!
+//! Measures the minimal production block proof path only:
+//! authorization sidecar verification plus exact authenticated state transition.
 //! Wallet proof generation is pre-built and reported separately; block timings do
 //! not include wallet proving latency.
 
 use std::time::{Duration, Instant};
 
 use bench_prover::{
-    bench_full_block_proof, bench_standard_block, bench_sweep_bucket, fmt_bytes, fmt_ms,
-    owned_sweep_witness, prove_sweep_wallet, standard_fixture, standard_scenario, sweep_fixture,
-    sweep_scenario, time_once, StandardFixture, SweepFixture,
+    bench_full_block_proof_minimal, fmt_bytes, fmt_ms, minimal_tx_fixture, standard_scenario,
+    sweep_scenario, time_once, BenchScenario, MinimalTxFixture,
 };
-use noid_block::OwnedSweepTxWitness;
+use noid_chain::consensus::params::BLOCK_MAX_TXS;
 
-fn build_standard_fixtures(n: usize, slot_base: u32) -> Vec<StandardFixture> {
+const MAX_TOTAL_BLOCK_TXS: usize = BLOCK_MAX_TXS;
+const MAX_USER_TXS: usize = BLOCK_MAX_TXS - 1;
+
+fn build_standard_fixtures(n: usize, slot_base: u32) -> Vec<MinimalTxFixture> {
     (0..n)
         .map(|i| {
             let shape = if i % 3 == 0 { (4, 8) } else { (2, 2) };
-            standard_fixture(standard_scenario(
+            minimal_tx_fixture(standard_scenario(
                 "standard block tx",
                 shape.0,
                 shape.1,
@@ -36,7 +36,7 @@ fn build_standard_fixtures(n: usize, slot_base: u32) -> Vec<StandardFixture> {
         .collect()
 }
 
-fn build_sweep_fixtures(n: usize, slot_base: u32) -> Vec<SweepFixture> {
+fn build_sweep_scenarios(n: usize, slot_base: u32) -> Vec<BenchScenario> {
     (0..n)
         .map(|i| {
             let n_inputs = match i % 3 {
@@ -44,64 +44,50 @@ fn build_sweep_fixtures(n: usize, slot_base: u32) -> Vec<SweepFixture> {
                 1 => 10,
                 _ => 25,
             };
-            sweep_fixture(sweep_scenario(
+            sweep_scenario(
                 "sweep block tx",
                 n_inputs,
                 slot_base + i as u32 * 100,
                 0xB1 + i as u128 * 0x100,
-            ))
+            )
         })
         .collect()
 }
 
-fn preprove_sweep_witnesses(
-    fixtures: &[SweepFixture],
-    index_base: u32,
-) -> (Duration, Vec<OwnedSweepTxWitness>) {
+fn build_sweep_heavy_scenarios(n: usize, slot_base: u32) -> Vec<BenchScenario> {
+    (0..n)
+        .map(|i| {
+            sweep_scenario(
+                "sweep-heavy max block tx",
+                25,
+                slot_base + i as u32 * 100,
+                0xC1 + i as u128 * 0x100,
+            )
+        })
+        .collect()
+}
+
+fn preprove_minimal_fixtures(scenarios: &[BenchScenario]) -> (Duration, Vec<MinimalTxFixture>) {
     time_once(|| {
-        fixtures
+        scenarios
             .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let wallet = prove_sweep_wallet(f, 1);
-                owned_sweep_witness(index_base + i as u32, f, wallet.proof)
-            })
+            .cloned()
+            .map(minimal_tx_fixture)
             .collect::<Vec<_>>()
     })
 }
 
-fn print_standard_block(n: usize, fixtures: &[StandardFixture]) {
-    eprintln!("  benchmarking standard-only bucket component N={n}...");
-    let bucket = bench_standard_block(fixtures);
-    println!("  [Standard-only bucket component: {n} tx]");
-    println!("    prove bucket path:       {}", fmt_ms(bucket.prove_time));
-    println!(
-        "    verify bucket path:      {}",
-        fmt_ms(bucket.verify_time)
-    );
-    println!(
-        "    component proof:         {}",
-        fmt_bytes(bucket.proof_bytes)
-    );
-    println!(
-        "      standard bucket:       {}",
-        fmt_bytes(bucket.standard_bucket_bytes)
-    );
-    println!(
-        "      block spine:           {}",
-        fmt_bytes(bucket.unified_spine_bytes)
-    );
-    println!(
-        "      per-tx algebraic:      {}",
-        fmt_bytes(bucket.per_tx_algebraic_bytes)
-    );
-    println!();
-
-    eprintln!("  benchmarking standard-only full block proof N={n}...");
-    let full = bench_full_block_proof(fixtures, &[], &[]);
-    println!("  [Standard-only full block proof: {n} tx]");
-    println!("    prove full block:        {}", fmt_ms(full.prove_time));
-    println!("    verify full block:       {}", fmt_ms(full.verify_time));
+fn print_full_block(
+    label: &str,
+    sweep_wallet_prep: Option<Duration>,
+    full: bench_prover::FullBlockProofBench,
+) {
+    println!("  [{label}]");
+    if let Some(wallet_prep) = sweep_wallet_prep {
+        println!("    sweep wallet pre-proof:  {}", fmt_ms(wallet_prep));
+    }
+    println!("    assemble proof:          {}", fmt_ms(full.prove_time));
+    println!("    verify block:            {}", fmt_ms(full.verify_time));
     println!(
         "    block proof:             {}",
         fmt_bytes(full.proof_bytes)
@@ -115,122 +101,64 @@ fn print_standard_block(n: usize, fixtures: &[StandardFixture]) {
         fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
     );
     println!(
-        "      standard bucket:       {}",
-        fmt_bytes(full.standard_bucket_bytes)
+        "      state transition:      {}",
+        fmt_bytes(full.state_transition_bytes)
     );
-    println!(
-        "      state binding:         {}",
-        fmt_bytes(full.state_binding_bytes)
-    );
-    println!(
-        "    state-binding overhead:  prove +{}, bytes +{}",
-        fmt_ms(full.prove_time.saturating_sub(bucket.prove_time)).trim(),
-        fmt_bytes(full.proof_bytes.saturating_sub(bucket.proof_bytes)).trim()
-    );
+    println!("      user txs:              {}", full.proof.meta.n_tx);
+    println!("      total txs:             {}", full.proof.meta.n_tx + 1);
     println!();
 }
 
-fn print_sweep_bucket(n: usize, fixtures: &[SweepFixture]) {
+fn print_standard_block(n: usize, fixtures: &[MinimalTxFixture]) {
+    eprintln!("  benchmarking standard-only minimal block proof N={n}...");
+    let full = bench_full_block_proof_minimal(fixtures);
+    print_full_block(
+        &format!("Standard-only minimal block proof: {n} tx"),
+        None,
+        full,
+    );
+}
+
+fn print_sweep_block(n: usize, scenarios: &[BenchScenario]) {
     eprintln!("  pre-proving sweep wallet proofs N={n}...");
-    let (wallet_prep, witnesses) = preprove_sweep_witnesses(fixtures, 1);
-    eprintln!("  benchmarking sweep-only full block proof N={n}...");
-    let full = bench_full_block_proof(&[], fixtures, &witnesses);
-    eprintln!("  benchmarking sweep bucket detail N={n}...");
-    let bucket = bench_sweep_bucket(&witnesses);
-    println!("  [Sweep-only full block proof: {n} tx]");
-    println!("    wallet pre-proof total:  {}", fmt_ms(wallet_prep));
-    println!("    prove full block:        {}", fmt_ms(full.prove_time));
-    println!("    verify full block:       {}", fmt_ms(full.verify_time));
-    println!(
-        "    block proof:             {}",
-        fmt_bytes(full.proof_bytes)
+    let (wallet_prep, fixtures) = preprove_minimal_fixtures(scenarios);
+    eprintln!("  benchmarking sweep-only minimal block proof N={n}...");
+    let full = bench_full_block_proof_minimal(&fixtures);
+    print_full_block(
+        &format!("Sweep-only minimal block proof: {n} tx"),
+        Some(wallet_prep),
+        full,
     );
-    println!(
-        "    auth sidecar:            {}",
-        fmt_bytes(full.auth_sidecar_bytes)
-    );
-    println!(
-        "    block proof + sidecar:   {}",
-        fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
-    );
-    println!(
-        "      sweep bucket:          {}",
-        fmt_bytes(full.sweep_bucket_bytes)
-    );
-    println!(
-        "      state binding:         {}",
-        fmt_bytes(full.state_binding_bytes)
-    );
-    println!(
-        "    bucket aggregation only:  {}",
-        fmt_ms(bucket.aggregation_verify_time)
-    );
-    println!(
-        "      block spine:           {}",
-        fmt_bytes(bucket.block_spine_bytes)
-    );
-    println!(
-        "      tx auth proofs total:  {}",
-        fmt_bytes(bucket.tx_auth_proofs_bytes)
-    );
-    println!(
-        "      per-tx algebraic:      {}",
-        fmt_bytes(bucket.per_tx_algebraic_bytes)
-    );
-    println!();
 }
 
 fn print_mixed(n_standard: usize, n_sweep: usize) {
     eprintln!("  building mixed block fixtures {n_standard} standard + {n_sweep} sweep...");
-    let standard = build_standard_fixtures(n_standard, 20_000);
-    let sweep = build_sweep_fixtures(n_sweep, 2_000_000);
-    let (sweep_wallet_prep, sweep_witnesses) =
-        preprove_sweep_witnesses(&sweep, 1 + n_standard as u32);
+    let mut fixtures = build_standard_fixtures(n_standard, 20_000);
+    let sweep = build_sweep_scenarios(n_sweep, 2_000_000);
+    let (sweep_wallet_prep, mut sweep_fixtures) = preprove_minimal_fixtures(&sweep);
+    fixtures.append(&mut sweep_fixtures);
 
-    eprintln!("  benchmarking mixed full block proof...");
-    let full = bench_full_block_proof(&standard, &sweep, &sweep_witnesses);
-
-    println!("  [Mixed full block proof: {n_standard} Standard4x8 + {n_sweep} Sweep25x2]");
-    println!("    sweep wallet pre-proof:  {}", fmt_ms(sweep_wallet_prep));
-    println!("    prove full block:        {}", fmt_ms(full.prove_time));
-    println!("    verify full block:       {}", fmt_ms(full.verify_time));
-    println!(
-        "    block proof:             {}",
-        fmt_bytes(full.proof_bytes)
+    eprintln!("  benchmarking mixed minimal block proof...");
+    let full = bench_full_block_proof_minimal(&fixtures);
+    print_full_block(
+        &format!(
+            "Mixed minimal block proof: {n_standard} TxShape::Standard4x8 + {n_sweep} TxShape::Sweep25x2"
+        ),
+        Some(sweep_wallet_prep),
+        full,
     );
-    println!(
-        "    auth sidecar:            {}",
-        fmt_bytes(full.auth_sidecar_bytes)
-    );
-    println!(
-        "    block proof + sidecar:   {}",
-        fmt_bytes(full.proof_bytes + full.auth_sidecar_bytes)
-    );
-    println!(
-        "      standard bucket:       {}",
-        fmt_bytes(full.standard_bucket_bytes)
-    );
-    println!(
-        "      sweep bucket:          {}",
-        fmt_bytes(full.sweep_bucket_bytes)
-    );
-    println!(
-        "      state binding:         {}",
-        fmt_bytes(full.state_binding_bytes)
-    );
-    println!();
 }
 
 fn main() {
     println!();
     println!("  =====================================================================");
-    println!("  PARANOID Block/Bucket Scaling Benchmark");
+    println!("  PARANOID Block Scaling Benchmark");
     println!("  =====================================================================");
-    println!("  Bucket components plus full production block proofs.");
+    println!("  Minimal production block proof path only.");
     println!("  Wallet proofs are pre-built for block timing.");
     println!();
 
-    let max_standard = 100;
+    let max_standard = MAX_USER_TXS;
     eprintln!("  building {max_standard} standard fixtures...");
     let t = Instant::now();
     let standard_fixtures = build_standard_fixtures(max_standard, 0);
@@ -239,27 +167,29 @@ fn main() {
         fmt_ms(t.elapsed()).trim()
     );
 
-    for &n in &[10usize, 20, 100] {
+    for &n in &[10usize, 20, 100, MAX_USER_TXS] {
         print_standard_block(n, &standard_fixtures[..n]);
     }
 
     for &n in &[1usize, 4, 10] {
-        let fixtures = build_sweep_fixtures(n, 10_000 + n as u32 * 1_000);
-        print_sweep_bucket(n, &fixtures);
+        let scenarios = build_sweep_scenarios(n, 10_000 + n as u32 * 1_000);
+        print_sweep_block(n, &scenarios);
     }
+    eprintln!("  building max sweep-heavy fixtures {MAX_USER_TXS} user txs...");
+    let max_sweep_scenarios = build_sweep_heavy_scenarios(MAX_USER_TXS, 3_000_000);
+    print_sweep_block(MAX_USER_TXS, &max_sweep_scenarios);
 
-    print_mixed(8, 2); // 80/20-ish
-    print_mixed(5, 5); // 50/50
+    print_mixed(8, 2);
+    print_mixed(5, 5);
 
     println!("  -------------------------------------------------------------------");
     println!("  NOTES:");
-    println!("    - Bucket component rows are diagnostic breakdowns, not production validity.");
+    println!("    - Rows measure production BlockProof + BlockAuthSidecar only.");
     println!(
-        "    - Full block rows are the production proof-native path: buckets + state binding."
+        "    - Max block rows use {MAX_USER_TXS} non-coinbase txs + 1 coinbase = {MAX_TOTAL_BLOCK_TXS} total txs."
     );
-    println!("    - Sweep bucket aggregation is printed only as a component breakdown.");
-    println!("    - Mixed rows include both buckets plus common state-binding proofs.");
     println!("    - Wallet pre-proof time is reported separately and is not block-time work.");
+    println!("    - Historical bucket aggregation is not measured by this bench.");
     println!("  -------------------------------------------------------------------");
     println!("  Reproduce: cargo bench --bench block_scaling");
     println!();

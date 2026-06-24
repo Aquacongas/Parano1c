@@ -44,6 +44,7 @@ pub enum PublicLogicError {
         output_sum: u128,
         fee: u128,
     },
+    NoLiveInputs,
     LiveInputCountTooLarge {
         actual: usize,
     },
@@ -93,6 +94,9 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
             actual: n_live_inputs_usize,
         }
     })?;
+    if n_live_inputs == 0 {
+        return Err(PublicLogicError::NoLiveInputs);
+    }
     let n_live_outputs = u8::try_from(n_live_outputs_usize).map_err(|_| {
         PublicLogicError::LiveOutputCountTooLarge {
             actual: n_live_outputs_usize,
@@ -147,7 +151,7 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
 mod tests {
     use super::*;
     use crate::{TxInput, TxOutput};
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn input(slot: u32, value: u64, valid: bool) -> TxInput {
         TxInput {
@@ -155,7 +159,6 @@ mod tests {
             value,
             owner: Address([slot as u8; 32]),
             spend_secret: SpendSecret([0u8; 32]),
-            auth_tag: AuthTag([0u8; 32]),
             valid,
         }
     }
@@ -238,6 +241,15 @@ mod tests {
         assert_eq!(
             validate_public_tx_logic(&body),
             Err(PublicLogicError::Coinbase)
+        );
+    }
+
+    #[test]
+    fn zero_input_non_coinbase_rejects() {
+        let body = TxBody::standard([5u8; 32], 0, vec![], vec![], false);
+        assert_eq!(
+            validate_public_tx_logic(&body),
+            Err(PublicLogicError::NoLiveInputs)
         );
     }
 

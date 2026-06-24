@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Native reference model for the block state-delta proof surface.
+//! Native reference model for the exact block state-transition surface.
 //!
-//! This module defines the production NativeDelta verifier-side state surface.
-//! It formalizes the ordered touched-slot relation that replaces the wide
-//! `BlockStateBindingAir` proof surface:
+//! This module formalizes the ordered touched-slot relation used to build the
+//! exact authenticated state transition proof:
 //!
 //! ```text
 //! read(slot, tx_index) = latest previous write in the block prefix, if any
@@ -21,7 +20,7 @@
 //! ordered delta surface: roots + touched-slot actions, not full pre/post segment
 //! columns.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
@@ -78,6 +77,21 @@ impl StateDeltaActionSurface {
     pub fn active_slot_delta(&self) -> i64 {
         self.mints as i64 - self.spends as i64
     }
+}
+
+/// Canonical exact-state action surface derived from the ordered prefix overlay.
+///
+/// `touched_indices`, `old_slots` and `new_slots` are index-aligned and sorted
+/// by slot index. `actions` remains in canonical tx/op order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactActionSurface {
+    pub actions: Vec<StateDeltaAction>,
+    pub touched_indices: Vec<u32>,
+    pub old_slots: Vec<SlotValue>,
+    pub new_slots: Vec<SlotValue>,
+    pub spent_slots: Vec<u32>,
+    pub spends: u32,
+    pub mints: u32,
 }
 
 /// Native state-delta witness for a block body sequence.
@@ -231,6 +245,51 @@ pub fn build_state_delta_action_surface(
     })
 }
 
+/// Build the exact-state surface that a Merkle frontier verifier consumes.
+pub fn build_exact_action_surface(
+    state: &SegmentedFriState,
+    bodies: &[TxBody],
+    expected_commitments: &[Digest],
+) -> Result<ExactActionSurface, StateDeltaError> {
+    let surface = build_state_delta_action_surface(state, bodies, expected_commitments)?;
+    Ok(exact_action_surface_from_surface(surface))
+}
+
+/// Convert the ordered action surface into sorted old/new leaves and spend set.
+pub fn exact_action_surface_from_surface(surface: StateDeltaActionSurface) -> ExactActionSurface {
+    let mut touched: BTreeMap<u32, (SlotValue, SlotValue)> = BTreeMap::new();
+    let mut spent = BTreeSet::new();
+
+    for action in &surface.actions {
+        touched
+            .entry(action.slot_index)
+            .and_modify(|(_, new_slot)| *new_slot = action.post)
+            .or_insert((action.pre, action.post));
+        if action.kind == StateDeltaActionKind::Spend {
+            spent.insert(action.slot_index);
+        }
+    }
+
+    let mut touched_indices = Vec::with_capacity(touched.len());
+    let mut old_slots = Vec::with_capacity(touched.len());
+    let mut new_slots = Vec::with_capacity(touched.len());
+    for (idx, (old, new)) in touched {
+        touched_indices.push(idx);
+        old_slots.push(old);
+        new_slots.push(new);
+    }
+
+    ExactActionSurface {
+        actions: surface.actions,
+        touched_indices,
+        old_slots,
+        new_slots,
+        spent_slots: spent.into_iter().collect(),
+        spends: surface.spends,
+        mints: surface.mints,
+    }
+}
+
 /// Build a compact ordered state-delta witness and apply it to `state` on success.
 ///
 /// On `Err`, the input state is left untouched. This mirrors the atomic behavior
@@ -310,8 +369,7 @@ fn slot_value_from_output(output: &TxOutput) -> SlotValue {
 mod tests {
     use super::*;
     use crate::state::{apply_tx, ChainState};
-    use crate::state_binding::BlockStateBinding;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::TxShape;
 
     const TEST_LOG_SLOTS: usize = 6;
@@ -330,7 +388,6 @@ mod tests {
             value,
             owner,
             spend_secret: SpendSecret([0xA0; 32]),
-            auth_tag: AuthTag([0x55; 32]),
             valid: true,
         }
     }
@@ -630,7 +687,41 @@ mod tests {
     }
 
     #[test]
-    fn final_root_matches_apply_tx_sequence_and_existing_binding_builder() {
+    fn exact_surface_derives_sorted_old_new_and_spent_slots() {
+        let alice = owner(0x11);
+        let bob = owner(0x22);
+        let carol = owner(0x33);
+
+        let mut segmented = fresh_segmented();
+        seed_slot(&mut segmented, 1, 500, alice);
+
+        let tx0 = body(vec![mk_input(1, 500, alice)], vec![mk_output(5, 450, bob)]);
+        let tx1 = body(vec![mk_input(5, 450, bob)], vec![mk_output(6, 400, carol)]);
+        let bodies = vec![tx0, tx1];
+        let cs = commitments(&bodies);
+
+        let exact = build_exact_action_surface(&segmented, &bodies, &cs).unwrap();
+
+        assert_eq!(exact.touched_indices, vec![1, 5, 6]);
+        assert_eq!(
+            exact.old_slots[0],
+            slot_value_from_output(&mk_output(1, 500, alice))
+        );
+        assert_eq!(exact.new_slots[0], SlotValue::EMPTY);
+        assert_eq!(exact.old_slots[1], SlotValue::EMPTY);
+        assert_eq!(exact.new_slots[1], SlotValue::EMPTY);
+        assert_eq!(exact.old_slots[2], SlotValue::EMPTY);
+        assert_eq!(
+            exact.new_slots[2],
+            slot_value_from_output(&mk_output(6, 400, carol))
+        );
+        assert_eq!(exact.spent_slots, vec![1, 5]);
+        assert_eq!(exact.spends, 2);
+        assert_eq!(exact.mints, 2);
+    }
+
+    #[test]
+    fn final_root_matches_apply_tx_sequence() {
         let alice = owner(0x11);
         let bob = owner(0x22);
         let carol = owner(0x33);
@@ -650,17 +741,13 @@ mod tests {
         let mut delta_state = segmented.clone();
         let delta = build_state_delta_witness(&mut delta_state, &bodies, &cs).unwrap();
 
-        let mut binding_state = segmented.clone();
-        let binding = BlockStateBinding::build(&mut binding_state, &bodies, &cs).unwrap();
-        assert_eq!(delta.post_state_root, binding.new_state_root);
-        assert_eq!(delta_state.root(), binding_state.root());
-
         let mut chain = ChainState::with_log_slots(TEST_LOG_SLOTS);
         chain.state = segmented;
         chain.active_slot_count = 2;
         for body in &bodies {
             apply_tx(&mut chain, body).unwrap();
         }
-        assert_eq!(delta.post_state_root, chain.state_root());
+        assert_eq!(delta.post_state_root, chain.state.root());
+        assert_ne!(delta.post_state_root, chain.state_root());
     }
 }

@@ -50,12 +50,14 @@ const COL_SLOT_INDEX: usize = TXV_COL_OFFSET + 2;
 const COL_VALUE: usize = TXV_COL_OFFSET + 3;
 const COL_OWNER_HI: usize = TXV_COL_OFFSET + 4;
 const COL_OWNER_LO: usize = TXV_COL_OFFSET + 5;
-const COL_AUTH_TAG_HI: usize = TXV_COL_OFFSET + 8;
-const COL_AUTH_TAG_LO: usize = TXV_COL_OFFSET + 9;
+#[cfg(test)]
+const COL_RESERVED_AUTH_HI: usize = TXV_COL_OFFSET + 8;
+#[cfg(test)]
+const COL_RESERVED_AUTH_LO: usize = TXV_COL_OFFSET + 9;
 
 // Column indices for the two row-domain mask columns
 // (the "+2" in TXV_BLOCK_N_COLS = 10 + 66 + 2).
-const COL_INPUT_VALID: usize = TXV_COL_OFFSET + 0;
+const COL_INPUT_VALID: usize = TXV_COL_OFFSET;
 const COL_OUTPUT_VALID: usize = TXV_COL_OFFSET + 1;
 const COL_INPUT_VALID_MASK: usize = TXV_COL_OFFSET + 76; // TX_VALIDITY_3B4_N_COLS = 76
 const COL_OUTPUT_VALID_MASK: usize = TXV_COL_OFFSET + 77;
@@ -405,9 +407,7 @@ impl TxBodySpineComposite {
             // SpendSecretHi/SpendSecretLo slots intentionally remain zero.
             // Authorization is handled by AuthGKR; the public tx trace must never
             // commit the user's spend_secret limbs.
-            let [th, tl] = input.auth_tag.as_fields();
-            cols[COL_AUTH_TAG_HI - TXV_COL_OFFSET][i] = th;
-            cols[COL_AUTH_TAG_LO - TXV_COL_OFFSET][i] = tl;
+            // Reserved authorization columns intentionally remain zero.
         }
         for (j, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
             if !output.valid {
@@ -670,7 +670,7 @@ mod tests {
         let total_rows = 1usize << SPINE_LOG_ROWS;
 
         // Non-bool TxValidity witness columns: SpendSecretHi=6,
-        // SpendSecretLo=7, AuthTagHi=8, AuthTagLo=9.
+        // SpendSecretLo=7, reserved authorization columns 8/9.
         //
         // Cross-AIR tx-body payload tie pinned SlotIndex=2 / Value=3 / OwnerHi=4 /
         // OwnerLo=5 as PublicColumns over the whole composite
@@ -719,7 +719,7 @@ mod tests {
     // Cross-AIR tx-body payload tie
     // ------------------------------------------------------------------
 
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{TxInput, TxOutput};
 
     /// Build a honest `(TxBody, TxBodyMerkleBoundaryPins)` pair where
@@ -784,7 +784,6 @@ mod tests {
                     value,
                     owner: in_owner,
                     spend_secret: SpendSecret([0x22; 32]),
-                    auth_tag: AuthTag([0x33; 32]),
                     valid: true,
                 },
                 TxInput::dummy(),
@@ -812,31 +811,22 @@ mod tests {
         (body, pins)
     }
 
-    /// Invariant guard: `AuthTagHi` / `AuthTagLo` (composite
-    /// cols 8 / 9) must remain witness-only on the spine side. They
-    /// are pinned through the external `AuthGKR` boundary and must
-    /// never be declared as a `PublicColumn` — doing so would
-    /// re-introduce the "third source of truth" the audit § 1 warns
-    /// about (PI vs Merkle vs GKR pin).
+    /// Invariant guard: reserved authorization columns 8 / 9 must remain
+    /// witness-only on the spine side. They must never be declared as a
+    /// `PublicColumn`.
     #[test]
-    fn auth_tag_columns_are_not_pi_pinned() {
+    fn reserved_auth_columns_are_not_pi_pinned() {
         let pins = build_honest_pins_and_inputs();
         let spine = TxBodySpineComposite::new(pins);
 
-        let auth_hi = COL_AUTH_TAG_HI;
-        let auth_lo = COL_AUTH_TAG_LO;
-        assert_eq!(auth_hi, 8, "AuthTagHi composite col drifted from 8");
-        assert_eq!(auth_lo, 9, "AuthTagLo composite col drifted from 9");
+        let auth_hi = COL_RESERVED_AUTH_HI;
+        let auth_lo = COL_RESERVED_AUTH_LO;
+        assert_eq!(auth_hi, 8, "reserved auth col 8 drifted");
+        assert_eq!(auth_lo, 9, "reserved auth col 9 drifted");
 
         for pc in spine.public_columns() {
-            assert_ne!(
-                pc.col, auth_hi,
-                "AuthTagHi (col 8) is PI-pinned — AuthTag invariant broken"
-            );
-            assert_ne!(
-                pc.col, auth_lo,
-                "AuthTagLo (col 9) is PI-pinned — AuthTag invariant broken"
-            );
+            assert_ne!(pc.col, auth_hi, "reserved auth col 8 is PI-pinned");
+            assert_ne!(pc.col, auth_lo, "reserved auth col 9 is PI-pinned");
         }
     }
 

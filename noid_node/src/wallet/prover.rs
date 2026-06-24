@@ -10,11 +10,11 @@
 //!
 //! # What this produces
 //!
-//! `WalletAuthorizationBundle::{Standard4x8, Sweep25x2}` — the wallet's proof artifact
+//! `WalletAuthorizationBundle` — the wallet's owner-batched auth proof artifact
 //! submitted to the local mempool via `submitTxIntent`. The bundle is
 //! forwarded from the mempool to the block prover inside the daemon.
-//! AuthGKR witness tables remain wallet-local; the bundle carries only public
-//! auth inputs plus self-contained KillShot proof capsules embedded in auth authorizations.
+//! AuthGKR witness tables remain wallet-local; the bundle carries one
+//! self-contained owner-auth KillShot proof capsule.
 //!
 //! # SpendSecret handling
 //!
@@ -49,8 +49,8 @@ pub fn prove_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{derive_address, hash_auth_tag, Address, AuthTag};
-    use noid_tx::{hash_tx_body_for_shape, TxInput, TxOutput, TxShape};
+    use noid_poseidon2b::primitives::{derive_address, Address};
+    use noid_tx::{TxInput, TxOutput, TxShape};
 
     fn secret(seed: u8) -> SpendSecret {
         let mut bytes = [0u8; 32];
@@ -64,23 +64,9 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    fn finalize_auth_tags(body: &mut TxBody) {
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        for input in body.inputs.iter_mut().filter(|i| i.valid) {
-            input.auth_tag = hash_auth_tag(&input.spend_secret, &tx_body_hash);
-        }
-    }
-
     fn standard_body(spend_secret: SpendSecret) -> TxBody {
         let owner = derive_address(&spend_secret);
-        let mut body = TxBody {
+        TxBody {
             shape: TxShape::Standard4x8,
             epoch_anchor: [0x51; 32],
             fee: 10,
@@ -89,7 +75,6 @@ mod tests {
                 value: 1_000,
                 owner,
                 spend_secret,
-                auth_tag: AuthTag([0u8; 32]),
                 valid: true,
             }],
             outputs: vec![TxOutput {
@@ -99,9 +84,7 @@ mod tests {
                 valid: true,
             }],
             is_coinbase: false,
-        };
-        finalize_auth_tags(&mut body);
-        body
+        }
     }
 
     fn sweep_body(secrets: &[SpendSecret]) -> TxBody {
@@ -112,13 +95,12 @@ mod tests {
                 value: 10_000 + i as u64,
                 owner: derive_address(&spend_secret),
                 spend_secret,
-                auth_tag: AuthTag([0u8; 32]),
                 valid: true,
             });
         }
         let total: u64 = inputs.iter().map(|i| i.value).sum();
         let fee = 123u64;
-        let mut body = TxBody {
+        TxBody {
             shape: TxShape::Sweep25x2,
             epoch_anchor: [0x52; 32],
             fee: fee as u128,
@@ -138,9 +120,7 @@ mod tests {
                 },
             ],
             is_coinbase: false,
-        };
-        finalize_auth_tags(&mut body);
-        body
+        }
     }
 
     #[test]

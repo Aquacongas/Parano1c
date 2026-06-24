@@ -406,7 +406,7 @@ fn mine(cli: &Cli) -> Result<()> {
             for i in (0..32usize).rev() {
                 if target[i] == 0 {
                     z += 8;
-                } else if z % 8 == 0 {
+                } else if z.is_multiple_of(8) {
                     z += target[i].leading_zeros();
                     break;
                 } else {

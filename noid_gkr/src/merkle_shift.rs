@@ -5,10 +5,9 @@
 
 //! Merkle path GKR — shift index helpers and cached schedule tables.
 //!
-//! Same 14-variable hypercube as AuthGKR (`elem:2 | round:7 | slot:5`).
-//! The only difference is that `live_slots` varies per instance
-//! (2 × active_depth), so schedule tables are parameterised rather than
-//! cached with a fixed slot count.
+//! 14-variable hypercube (`elem:2 | round:7 | slot:5`). The `live_slots`
+//! value varies per Merkle instance (2 × active_depth), so schedule tables are
+//! parameterised rather than cached with a fixed slot count.
 
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::{Block128, TowerField};
@@ -16,7 +15,6 @@ use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
 
-use crate::auth_mle_v2::auth_sigma_at;
 use crate::merkle_mle::{
     N_MERKLE_ELEM_VARS, N_MERKLE_ROUND_VARS, N_MERKLE_SLOT_BITS, N_MERKLE_UNIFIED_CELLS,
     N_MERKLE_UNIFIED_VARS,
@@ -84,6 +82,16 @@ fn mds_coeff(round: usize, i: usize, j: usize) -> Block128 {
     Block128::from(raw)
 }
 
+#[inline]
+fn merkle_sigma_at(round: usize, elem: usize) -> Block128 {
+    let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
+    if is_partial && elem != 0 {
+        Block128::ZERO
+    } else {
+        Block128::ONE
+    }
+}
+
 /// Build mu table for a given live_slots count.
 pub fn build_merkle_mu_table(live_slots: usize) -> Vec<Block128> {
     let mut tab = vec![Block128::ZERO; N_MERKLE_UNIFIED_CELLS];
@@ -105,7 +113,7 @@ pub fn build_merkle_sigma_table(live_slots: usize) -> Vec<Block128> {
         for round in 0..N_ROUNDS {
             for elem in 0..STATE_SIZE {
                 let idx = merkle_pack_index(slot, round, elem);
-                tab[idx as usize] = auth_sigma_at(round, elem);
+                tab[idx as usize] = merkle_sigma_at(round, elem);
             }
         }
     }

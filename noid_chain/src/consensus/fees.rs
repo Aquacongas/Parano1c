@@ -169,7 +169,7 @@ pub fn min_fee(n_outputs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{TxBody, TxInput, TxOutput};
 
     fn input(slot: u32) -> TxInput {
@@ -178,7 +178,6 @@ mod tests {
             value: 100,
             owner: Address([1u8; 32]),
             spend_secret: SpendSecret([2u8; 32]),
-            auth_tag: AuthTag([3u8; 32]),
             valid: true,
         }
     }

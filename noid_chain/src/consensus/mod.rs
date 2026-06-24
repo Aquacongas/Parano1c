@@ -109,13 +109,11 @@ pub enum ConsensusError {
     TooManyTxs,
     /// §16.9 — `tx_root` does not match the computed Merkle root.
     BadTxRoot,
-    /// §16.10 — Nullifier collision (double-spend attempt).
-    NullifierCollision,
-    /// §16.11 — Two transactions claim the same output slot.
+    /// §16.10 — Two transactions claim the same input or output slot.
     SlotConflict,
-    /// §16.12 — `epoch_anchor` outside valid `[height-7, height-1]` window.
+    /// §16.11 — `epoch_anchor` outside valid `[height-7, height-1]` window.
     BadEpochAnchor,
-    /// §16.13 — `tx_body_hash` in `PublicInputs` ≠ `hash(tx.body)`.
+    /// §16.12 — `tx_body_hash` in `PublicInputs` ≠ `hash(tx.body)`.
     BadTxBodyHash,
     /// §16.14 — LogicProof verification failed.
     InvalidLogicProof { tx_index: usize },

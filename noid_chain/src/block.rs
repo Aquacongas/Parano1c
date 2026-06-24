@@ -26,9 +26,6 @@ use noid_tx::{hash_tx_body_for_shape, Transaction};
 use crate::block_header::BlockHeader;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 
-/// Block version on the wire.
-// REMOVED: no network yet, no backwards compatibility needed.
-
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 /// The economic / consensus limit is enforced elsewhere; this just keeps
 /// a malformed wire blob from allocating unbounded memory.
@@ -58,7 +55,7 @@ pub enum ProofBindingError {
     BadCoinbaseStub,
     /// A user-transaction block used the coinbase-only stub marker.
     StubProofWithUserTxs,
-    /// The header's `proof_transcript_hash` does not equal `proof_transcript_hash(proof_bytes)`.
+    /// The header's `proof_transcript_hash` does not equal the expected proof digest.
     BadProofTranscriptHash,
 }
 
@@ -78,7 +75,7 @@ impl std::fmt::Display for ProofBindingError {
             Self::BadProofTranscriptHash => {
                 write!(
                     f,
-                    "block proof bytes do not match header proof_transcript_hash"
+                    "block proof digest does not match header proof_transcript_hash"
                 )
             }
         }
@@ -87,8 +84,11 @@ impl std::fmt::Display for ProofBindingError {
 
 impl std::error::Error for ProofBindingError {}
 
-/// Validate that the block/proof shape matches the proof-native consensus policy
-/// and that user-transaction blocks bind the exact `BlockProof` bytes in their header.
+/// Validate the block/proof shape required before proof-native consensus checks.
+///
+/// For user-transaction blocks this is only a structural guard because this
+/// crate intentionally does not parse `BlockProof`. The canonical proof
+/// transcript hash is checked by the block proof verifier before state commit.
 pub fn validate_block_proof_binding(
     block: &Block,
     block_proof_bytes: &[u8],
@@ -101,8 +101,7 @@ pub fn validate_block_proof_binding(
         if block.header.proof_transcript_hash == STUB_PROOF_MARKER {
             return Err(ProofBindingError::StubProofWithUserTxs);
         }
-        let expected = proof_transcript_hash(block_proof_bytes);
-        if block.header.proof_transcript_hash != expected {
+        if block.header.proof_transcript_hash == [0u8; 32] {
             return Err(ProofBindingError::BadProofTranscriptHash);
         }
     } else {
@@ -163,10 +162,10 @@ impl From<ApplyError> for BlockApplyError {
 /// Sequential state-transition interpreter.
 ///
 /// This is not the live MDBX/node production validity path for user-transaction
-/// blocks. Full nodes verify `BlockProof` + `BlockStateBindingAir` and then call
-/// `apply_state_delta`. This interpreter is kept for in-memory tests and utility
-/// contexts that need to recompute a transition directly. On error, `state` is
-/// left untouched (work happens on a snapshot and is swapped only on success).
+/// blocks. Full nodes verify `BlockProof` and then commit the sealed exact
+/// transition. This interpreter is kept for in-memory tests and utility contexts
+/// that need to recompute a transition directly. On error, `state` is left
+/// untouched (work happens on a snapshot and is swapped only on success).
 pub fn apply_block(
     state: &mut ChainState,
     block: &Block,
@@ -289,11 +288,11 @@ pub fn apply_block(
 
 /// Apply a block's state delta without re-validating pre-conditions.
 ///
-/// **Full proof-native path** — called after `verify_block(BlockProof)` succeeds.
-/// The BlockProof has already established that:
-///   - All slot pre-conditions are correct (`prev_lane_openings` → `state_root`).
-///   - The state transition is correct (`new_lane_openings` → `new_state_root`).
-///   - `block.header.state_root` is cryptographically sound.
+/// **Proof-native path** — called after the minimal block verifier succeeds.
+/// The verifier has already established that:
+///   - Every user transaction satisfies the exact public transaction predicate.
+///   - Every user transaction has a valid authorization proof.
+///   - The exact authenticated state transition matches parent and child roots.
 ///
 /// This function therefore:
 ///   1. Handles log_slots expansion (still structural, not covered by the proof layer).
@@ -332,13 +331,13 @@ pub fn apply_state_delta(
     let mut deltas = Vec::new();
     for tx in &block.transactions {
         for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-            // The BlockProof established that inp.slot_index contained the claimed value.
+            // The exact state certificate established that this slot matched the claim.
             // Just zero it out; no read needed.
             deltas.push((inp.slot_index, SlotValue::EMPTY));
             snap.active_slot_count = snap.active_slot_count.saturating_sub(1);
         }
         for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            // The BlockProof established that out.slot_index was EMPTY before this tx.
+            // The exact state certificate established that this output slot was empty.
             let sv = SlotValue {
                 value: Block128::from(out.value as u128),
                 owner_hi: out.owner.as_fields()[0],
@@ -528,7 +527,7 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{hash_tx_body, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
@@ -588,7 +587,6 @@ mod tests {
             value: out.value,
             owner: out.owner,
             spend_secret: SpendSecret([0u8; 32]),
-            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         }
     }
@@ -1262,7 +1260,7 @@ mod tests {
         // After expansion from 4 to 5: valid range is [0, 32).
         // With enough hints, at least one should land in [16, 32).
         let hints = generate_slot_hints(0, 5, 100);
-        let in_new_range: Vec<_> = hints.iter().filter(|&&s| s >= 16 && s < 32).collect();
+        let in_new_range: Vec<_> = hints.iter().filter(|&&s| (16..32).contains(&s)).collect();
         assert!(
             !in_new_range.is_empty(),
             "splitmix64 with log_slots=5 must produce hints in the new range [16,32); got {:?}",
@@ -1312,7 +1310,6 @@ mod tests {
             pow::full_block_hash,
             validation::{validate_block_consensus, AnchorInfo},
         };
-        use crate::nullifier::NullifierSet;
         const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
         // Use log_slots=4 (tiny) so we can fill it fast.
@@ -1376,7 +1373,6 @@ mod tests {
             &active_window,
             block.header.timestamp + 1,
             &anchor,
-            &NullifierSet::new(),
             &mut apply_state,
         );
         assert!(

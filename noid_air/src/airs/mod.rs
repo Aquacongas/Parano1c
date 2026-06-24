@@ -5,7 +5,6 @@
 
 pub mod balance_gate;
 pub mod bit_adder;
-pub mod block_state_binding;
 pub mod carry_ripple;
 pub mod linear_combination;
 pub mod poseidon_mds;
@@ -32,11 +31,6 @@ pub use bit_adder::{
     PadZeroGate, BIT_ADDER_COL_A, BIT_ADDER_COL_B, BIT_ADDER_COL_CARRY, BIT_ADDER_COL_IS_INPUT,
     BIT_ADDER_COL_IS_RESET, BIT_ADDER_COL_SUM, BIT_ADDER_LOG_WORD_BITS, BIT_ADDER_MAX_WIDTH,
     BIT_ADDER_N_COLS, BIT_ADDER_WORD_BITS,
-};
-pub use block_state_binding::{
-    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
-    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
-    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
 };
 pub use carry_ripple::{
     CarryInitGate, CarryNextGate, CarryRippleAir, CARRY_RIPPLE_COL_A, CARRY_RIPPLE_COL_B,

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 //! Claims commitment (C_claimed): a Poseidon2b sponge binding the
-//! claimed transaction slot values to canonical TxLogic public inputs. The miner's BlockStateBinding opens the same slots and
-//! verifies equality.
+//! claimed transaction slot values to canonical TxLogic public inputs. The
+//! block-level exact transition proof authenticates the same slots and values.
 
 use noid_core::Block128;
 use noid_poseidon2b::native::{
@@ -23,7 +23,7 @@ use crate::types::{TxInput, TxOutput};
 /// live entries is separately bound in PublicInputs).
 ///
 /// The resulting digest is absorbed into canonical TxLogic public inputs,
-/// cryptographically binding block-side proof/state binding to these
+/// cryptographically binding the block-side exact transition proof to these
 /// slot claims. Any change to a claimed slot value changes the digest.
 pub fn compute_claims_commitment(inputs: &[TxInput], outputs: &[TxOutput]) -> Digest {
     let iv = capacity_iv(TAG_CLAIMS);
@@ -58,7 +58,7 @@ fn owner_to_fields(owner: &[u8; 32]) -> (Block128, Block128) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn mk_input(seed: u8) -> TxInput {
         TxInput {
@@ -66,7 +66,6 @@ mod tests {
             value: (seed as u64) * 1000,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
-            auth_tag: AuthTag([seed ^ 0x55; 32]),
             valid: true,
         }
     }
@@ -155,7 +154,7 @@ mod tests {
         let dummy = TxInput::dummy();
         let outputs = [mk_output(2)];
 
-        let c1 = compute_claims_commitment(&[real.clone()], &outputs);
+        let c1 = compute_claims_commitment(std::slice::from_ref(&real), &outputs);
         let c2 = compute_claims_commitment(&[real, dummy], &outputs);
         assert_eq!(c1, c2);
     }

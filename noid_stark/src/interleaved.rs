@@ -452,9 +452,9 @@ pub fn prove_air_interleaved_algebraic<A: Air + ?Sized>(
     // Thread-local u128 scratch avoids per-call allocation.
     thread_local! {
         static FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
-            std::cell::RefCell::new(Vec::new());
+            const { std::cell::RefCell::new(Vec::new()) };
         static PT_FLAT: std::cell::RefCell<Vec<u128>> =
-            std::cell::RefCell::new(Vec::new());
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     let base_openings: Vec<Block128> = padded_columns[..n_air_cols]
         .par_iter()
@@ -692,9 +692,8 @@ pub fn verify_air_interleaved_algebraic_terminal<A: Air + ?Sized>(
 }
 
 /// Like `verify_air_interleaved_algebraic` but with an optional explicit log_len.
-/// When `log_len_override = Some(len)`, uses `len` instead of `padded_log_len(proof.log_rows)`.
-/// This is needed for `BlockStateBindingAir` proofs which are committed at the global block
-/// log_len (= TX air log_len) even though the state binding AIR itself has fewer rows.
+/// When `log_len_override = Some(len)`, uses `len` instead of
+/// `padded_log_len(proof.log_rows)`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_air_interleaved_algebraic_with_log_len<A: Air + ?Sized>(
     air: &A,
@@ -731,8 +730,8 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
     let n_air_cols = air.n_columns();
     let n_slices = slice_claims.len();
 
-    // proof.log_rows holds the committed log_len, which may be >= air.log_rows() when
-    // state-binding columns are padded to the global block log_len.
+    // proof.log_rows holds the committed log_len, which may be >= air.log_rows()
+    // when a caller pads columns to a larger global domain.
     if proof.log_rows < air.log_rows() {
         tracing::warn!(
             proof_log_rows = proof.log_rows,
@@ -750,8 +749,8 @@ fn verify_algebraic_inner<A: Air + ?Sized>(
         return Err(VerifyError::ShapeMismatch);
     }
 
-    // If an explicit log_len was provided (e.g. global block log_len for state binding AIRs
-    // whose columns are padded to a larger domain), use it; otherwise derive from proof.log_rows.
+    // If an explicit log_len was provided for columns padded to a larger domain,
+    // use it; otherwise derive from proof.log_rows.
     let log_len = log_len_override.unwrap_or_else(|| padded_log_len(proof.log_rows));
     if proof.zero_check_rounds.len() != log_len {
         tracing::warn!(

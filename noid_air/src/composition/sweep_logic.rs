@@ -328,7 +328,7 @@ mod tests {
     use super::*;
     use crate::Air;
     use noid_core::TowerField;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{TxInput, TxOutput};
 
     fn mk_input(i: usize) -> TxInput {
@@ -337,7 +337,6 @@ mod tests {
             value: 10_000 + i as u64,
             owner: Address([i as u8; 32]),
             spend_secret: SpendSecret([0xA0 ^ i as u8; 32]),
-            auth_tag: AuthTag([0x55 ^ i as u8; 32]),
             valid: true,
         }
     }
@@ -379,7 +378,7 @@ mod tests {
 
         assert!(air.check(&trace));
         assert_eq!(air.n_columns(), SWEEP_TX_LOGIC_N_COLS);
-        assert!(air.public_columns().len() > 0);
+        assert!(!air.public_columns().is_empty());
         assert_eq!(
             air.public_columns().len(),
             4 * crate::airs::SWEEP_BALANCE_N_BLOCKS

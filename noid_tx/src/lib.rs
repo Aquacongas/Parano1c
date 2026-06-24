@@ -6,11 +6,12 @@
 //! Defines the on-wire shape of a transaction — inputs, outputs, body
 //! roots, auth tags — and the canonical body hash that binds all of it.
 //! Paranoid is a transparent UTXO chain: values and owner addresses are
-//! on-chain, spends are authorized by signatureless `AuthTag`s.
+//! on-chain, spends are authorized by signatureless owner proofs.
 
 pub mod body_hash;
 pub mod claims;
 pub mod intent;
+pub mod owner_auth;
 pub mod public;
 pub mod public_logic;
 pub mod types;
@@ -19,6 +20,9 @@ pub mod wire;
 pub use body_hash::{hash_tx_body, hash_tx_body_for_shape};
 pub use claims::compute_claims_commitment;
 pub use intent::{ClaimedSlot, TxIntent};
+pub use owner_auth::{
+    canonical_owner_auth, CanonicalOwnerAuth, OwnerAuthError, OwnerAuthGroup, MAX_OWNER_AUTH_GROUPS,
+};
 pub use public::{PublicInputs, MAX_LOG_SLOTS, MIN_LOG_SLOTS};
 pub use public_logic::{validate_public_tx_logic, PublicLogicError, PublicLogicFacts};
 pub use types::{

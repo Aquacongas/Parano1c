@@ -4,8 +4,8 @@
 //! Consensus checks shared by proof-native validation and in-memory utilities.
 //!
 //! Live full nodes use `validate_block_checks` as the cheap first stage, then
-//! verify the full `BlockProof`/`BlockStateBindingAir`, then commit via
-//! `apply_state_delta`. `validate_block_consensus` is the sequential interpreter
+//! verify the minimal block proof, then commit via the exact authenticated state
+//! transition. `validate_block_consensus` is the sequential interpreter
 //! path for RAM tests/utilities and is not the live production acceptance path.
 //!
 //! # Invariants checked here (SPEC §16)
@@ -13,17 +13,17 @@
 //!  ✅  Header chain (prev_hash, height, difficulty, timestamp, PoW)     [P.6]
 //!  ✅  Coinbase structure (at most one, first, zero inputs)              [P.7 partial]
 //!  ✅  Coinbase value ≤ block_reward(log_slots) + Σ fees                [P.7 full]
-//!  ✅  Per-tx: body_hash binding, non-zero anchor, nullifier             [P.8]
+//!  ✅  Per-tx: body_hash binding, non-zero anchor                        [P.8]
 //!  ✅  Cross-tx slot conflicts                                           [P.8]
 //!  ✅  TooManyTxs                                                        [P.9]
 //!  ✅  Sequential state transition (`validate_block_consensus` only)       [P.9]
 //!
 //! # Invariants checked by the production proof layer
 //!
-//!  ✅  Wallet/bucket proof verifies (STARK + AuthGKR)
-//!  ✅  BlockStateBinding verifies state openings and roots
-//!  ✅  C_claimed bridge
-//!  ✅  BlockProof aggregate verifies
+//!  ✅  Wallet authorization proof verifies for every user transaction
+//!  ✅  Exact public transaction predicate verifies for every user transaction
+//!  ✅  Exact authenticated state transition verifies state updates
+//!  ✅  Block proof canonical transcript matches the header
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
 //!  ❌  da_root / witness_root binding (needs packed DA data)
 
@@ -39,7 +39,6 @@ use crate::consensus::{
     params::BLOCK_MAX_TXS,
     ConsensusError,
 };
-use crate::nullifier::NullifierSet;
 use crate::state::ChainState;
 
 /// Parameters needed for header chain validation.
@@ -121,10 +120,10 @@ fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<()
 ///
 /// Use this as the first step of the full-proof-native validation path:
 ///   1. `validate_block_checks()` — header + tx checks (no MDBX reads)
-///   2. `verify_block(BlockProof)` — BlockProof verification
+///   2. minimal block proof verification
 ///   3. `apply_state_delta()` — write delta to MDBX (no pre-state reads)
 ///
-/// Note: does NOT check `state_root` (that's done by BlockProof verification).
+/// Note: does NOT check `state_root` (that's done by minimal proof verification).
 /// Does NOT check `active_slot_count` / `alloc_counter` (done by `apply_state_delta`).
 pub fn validate_block_checks(
     block: &Block,
@@ -133,7 +132,6 @@ pub fn validate_block_checks(
     prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
-    nullifiers: &NullifierSet,
 ) -> Result<(), ConsensusError> {
     validate_header(
         &block.header,
@@ -169,7 +167,7 @@ pub fn validate_block_checks(
     validate_coinbase_canonical(block, parent)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
-        validate_tx_consensus_skip_hash(tx, nullifiers)?;
+        validate_tx_consensus_skip_hash(tx)?;
     }
     let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
     if let Some(cb) = block.transactions.first() {
@@ -196,7 +194,7 @@ pub fn validate_block_checks(
 /// This is not the live full-node production path. It is used by the in-memory
 /// context and tests/utilities that intentionally recompute the transition
 /// directly. Production validation uses:
-/// `validate_block_checks` + full `BlockProof` verification + `apply_state_delta`.
+/// `validate_block_checks` + minimal proof verification + `apply_state_delta`.
 ///
 /// On success, `state` is updated. On failure, `state` is left unchanged.
 pub fn validate_block_consensus(
@@ -206,7 +204,6 @@ pub fn validate_block_consensus(
     prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
-    nullifiers: &NullifierSet,
     state: &mut ChainState,
 ) -> Result<[u8; 32], ConsensusError> {
     // --- Header checks (P.6) ---
@@ -266,7 +263,7 @@ pub fn validate_block_consensus(
     // tx_body_hash for every tx, so recomputing 59-perm Poseidon2b here
     // would be pure redundant work (~15 ms at 256 txs).
     for tx in &block.transactions {
-        validate_tx_consensus_skip_hash(tx, nullifiers)?;
+        validate_tx_consensus_skip_hash(tx)?;
     }
 
     let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
@@ -318,9 +315,8 @@ mod tests {
     use crate::block::Block;
     use crate::block_header::BlockHeader;
     use crate::consensus::{genesis::GENESIS_TIMESTAMP, params::BLOCK_TIME};
-    use crate::nullifier::NullifierSet;
     use crate::state::ChainState;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
@@ -403,7 +399,6 @@ mod tests {
                 value: 10_000,
                 owner: Address([1u8; 32]),
                 spend_secret: SpendSecret([2u8; 32]),
-                auth_tag: AuthTag([3u8; 32]),
                 valid: true,
             }],
             outputs: vec![
@@ -484,7 +479,6 @@ mod tests {
             &[parent.active_slot_count],
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
             &mut apply_state,
         );
         assert!(result.is_ok(), "empty block should validate: {:?}", result);
@@ -509,7 +503,6 @@ mod tests {
             &[parent.active_slot_count],
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
         );
         assert_eq!(
             result,
@@ -542,7 +535,6 @@ mod tests {
             &[parent.active_slot_count],
             valid.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
         );
         assert!(
             valid_result.is_ok(),
@@ -557,7 +549,6 @@ mod tests {
             &[parent.active_slot_count],
             inflated.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
         );
         assert_eq!(inflated_result, Err(ConsensusError::InflatedCoinbase));
     }
@@ -578,7 +569,6 @@ mod tests {
             &[parent.active_slot_count],
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
             &mut apply_state,
         );
         // Either InvalidPoW (nonce doesn't satisfy target) or ok if we got unlucky
@@ -650,7 +640,6 @@ mod tests {
             &active_window,
             block_no_expand.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
             &mut apply_state,
         );
         assert_eq!(
@@ -724,7 +713,6 @@ mod tests {
             &active_window,
             block.header.timestamp + 1,
             &genesis_anchor(&parent),
-            &NullifierSet::new(),
             &mut apply_state,
         );
         assert!(

@@ -52,12 +52,11 @@ pub const MAX_OUTPUTS: usize = 8;
 ///
 /// Controls:
 /// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
-/// 2. How long nullifiers are retained (prevents double-spend within window).
+/// 2. How far back block headers are retained for anchor validation.
 ///
 /// Note: the window *size* is ANCHOR_DEPTH+1 (inclusive on both ends).
 /// The constant name reflects maximum *depth*, not window size.
 ///
-/// NullifierSet max RAM: 144 blocks × 256 txs × 32 bytes = ~1.2 MiB (negligible).
 pub const ANCHOR_DEPTH: u64 = 144;
 
 // Compile-time assertion: ANCHOR_DEPTH must match noid_tx::ANCHOR_DEPTH.
@@ -238,7 +237,7 @@ pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
 /// Assumes one live input at low occupancy. New consensus-critical code should
 /// use `consensus::fees::required_fee_for_tx_body` instead.
 pub const fn min_fee(n_outputs: u64) -> u64 {
-    let net_new_outputs = if n_outputs > 1 { n_outputs - 1 } else { 0 };
+    let net_new_outputs = n_outputs.saturating_sub(1);
     MIN_FEE_BASE
         + FEE_PER_INPUT
         + FEE_PER_OUTPUT * n_outputs
@@ -269,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn emission_floor_positive() {
         assert!(FLOOR_REWARD_MICRONOID > 0);
         assert!(BASE_REWARD_MICRONOID > FLOOR_REWARD_MICRONOID);
@@ -288,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn log_slots_range() {
         assert!(LOG_SLOTS_GENESIS < LOG_SLOTS_MAX);
         assert_eq!(LOG_SLOTS_GENESIS, 24);

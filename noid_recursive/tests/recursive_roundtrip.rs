@@ -236,7 +236,7 @@ fn recursive_prove_verify_roundtrip_accumulator() {
     };
 
     let genesis_header = noid_chain::consensus::genesis::genesis_header();
-    let mut prev_header = genesis_header.clone();
+    let mut prev_header = genesis_header;
     let mut prev_proof = prove_genesis_recursive();
 
     verify_step_stark_only(&prev_proof, &[0u8; 32], &genesis_header.state_root)

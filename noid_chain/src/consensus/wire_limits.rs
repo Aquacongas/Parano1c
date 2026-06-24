@@ -113,6 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn production_wire_caps_are_ordered() {
         assert!(MAX_STANDARD_TX_INTENT_BYTES <= MAX_TX_INTENT_BYTES_GLOBAL);
         assert!(MAX_SWEEP_TX_INTENT_BYTES <= MAX_TX_INTENT_BYTES_GLOBAL);

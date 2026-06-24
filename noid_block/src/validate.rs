@@ -6,60 +6,45 @@
 //! `validate_block_full` is the complete user-transaction validation pipeline
 //! for a full node receiving a block from the network:
 //!
-//! 1. `validate_block_checks()` — cheap header/PoW/nullifier/fee checks.
-//! 2. Verify the canonical `BlockProof`, including bucket proofs and NativeDelta
-//!    state-root transition openings.
-//! 3. `apply_state_delta()` — commit the already-proven state delta without
+//! 1. `validate_block_checks()` — cheap header/PoW/fee checks.
+//! 2. Verify the canonical minimal `BlockProof`: exact public transaction
+//!    predicates, wallet authorization capsules, and exact authenticated state
+//!    transition.
+//! 3. Commit the already-verified exact transition without
 //!    running native `apply_block` as a second validity source.
 //!
-//! # SpineInputs / AuthPublicInputs reconstruction
+//! # OwnerAuthPublicInputs reconstruction
 //!
-//! `verify_block` requires `SpineInputs` (slot state for block GKR) and
-//! `AuthPublicInputs` (per-tx auth GKR public inputs). These must be
-//! reconstructed from the block's public data.
-//!
-//! All reconstruction uses ONLY public data:
-//! - `SpineInputs` — fully derived from `TxBody` (no secrets).
-//! - `AuthPublicInputs.expected_address[i]` — from `TxInput.owner`
-//!   (= H_ADDR(spend_secret), a one-way hash; spend_secret never leaves
-//!   the wallet and never appears on the wire).
-//! - `AuthPublicInputs.expected_auth_tag[i]` — from `TxInput.auth_tag`
-//!   (= H_AUTH(spend_secret, tx_body_hash), a one-way hash).
-//!   For dummy inputs (valid=false) the tag is computed from zero spend_secret.
-//! - NativeDelta state summaries — from proof openings + pre-block FRI state.
+//! `OwnerAuthPublicInputs` are reconstructed from each transaction body and
+//! verified through an authorization verifier interface. The block validator
+//! does not parse the internal authorization relation; it only checks that the
+//! canonical statement verifies against the sidecar proof.
 //!
 //! The `spend_secret` (private key) is NEVER transmitted, NEVER accessed
 //! here, and NEVER needed for verification.
 
-use noid_air::composition::sweep_logic_air_and_trace_from_body;
-use noid_air::composition::tx_logic::{boundary_pins_from_body, TxLogicAir};
-use noid_air::Air;
-use noid_chain::block::{apply_state_delta, Block};
+use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::validation::{validate_block_checks, AnchorInfo};
 use noid_chain::consensus::wire_limits::{
     proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_PROOF_BYTES,
 };
 use noid_chain::consensus::ConsensusError;
-use noid_chain::nullifier::NullifierSet;
 use noid_chain::state::ChainState;
+use noid_chain::state_delta::{build_exact_action_surface, ExactActionSurface, StateDeltaError};
+use noid_core::Block128;
 
 use crate::{
-    block_auth_sidecar_root, block_recursive_claim_hash,
-    channel::state_binding_eval_point_and_gamma, split_auth_sidecar_for_buckets, verify_block,
-    verify_state_bindings_standalone, BlockAuthSidecar, BlockProof, VerifyBlockError,
+    block_auth_sidecar_root, block_recursive_claim_hash, BlockAuthSidecar, BlockProof,
+    VerifyBlockError,
 };
 
-use noid_air::airs::block_state_binding::BlockStateBindingAir;
 use noid_gkr::{
-    standard_auth_public_from_body, sweep_auth_public_from_body, sweep_spine_inputs_from_body,
-    AuthProofKillShot, AuthPublicInputs, SpineInputs, SweepAuthProofKillShot,
-    SweepAuthPublicInputs,
+    owner_auth_gkr_channel, owner_auth_public_from_body, verify_owner_auth_killshot,
+    OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs,
 };
-use noid_tx::{
-    compute_claims_commitment, hash_tx_body_for_shape, PublicInputs, Transaction, TxShape,
-    MAX_INPUTS, MAX_OUTPUTS,
-};
+use noid_tx::{compute_claims_commitment, validate_public_tx_logic, Transaction};
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -99,34 +84,71 @@ impl std::error::Error for FullValidationError {}
 // Main entry point
 // ---------------------------------------------------------------------------
 
+pub type AuthorizationProof = OwnerAuthProofKillShot;
+
+#[derive(Debug, Clone)]
+pub struct CanonicalAuthorizationStatement {
+    pub tx_index: usize,
+    pub tx_body_hash: [Block128; 2],
+    pub public: OwnerAuthPublicInputs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedAuthorization {
+    pub tx_index: usize,
+    pub owner_count: usize,
+    pub live_input_count: usize,
+}
+
+pub trait AuthorizationVerifier: Sync {
+    fn verify(
+        &self,
+        statement: &CanonicalAuthorizationStatement,
+        proof: &AuthorizationProof,
+    ) -> Result<VerifiedAuthorization, VerifyBlockError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnerAuthAuthorizationVerifier;
+
+impl AuthorizationVerifier for OwnerAuthAuthorizationVerifier {
+    fn verify(
+        &self,
+        statement: &CanonicalAuthorizationStatement,
+        proof: &AuthorizationProof,
+    ) -> Result<VerifiedAuthorization, VerifyBlockError> {
+        let circuit = OwnerAuthCircuit::build(statement.public.layout);
+        let mut channel = owner_auth_gkr_channel();
+        verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
+            .ok_or(VerifyBlockError::AuthKillShot(statement.tx_index))?;
+
+        if statement.public.tx_body_hash != statement.tx_body_hash {
+            return Err(VerifyBlockError::AuthSpineBridge(statement.tx_index));
+        }
+
+        Ok(VerifiedAuthorization {
+            tx_index: statement.tx_index,
+            owner_count: statement.public.layout.owner_count,
+            live_input_count: statement.public.live_input_positions.len(),
+        })
+    }
+}
+
 /// Full proof-native block validation.
 ///
 /// Steps (ordered cheapest-first):
 /// 1. `validate_block_checks()` — cheap consensus checks that do not mutate state.
-/// 2. Full `BlockProof` verification, including standard/sweep bucket proofs and
-///    NativeDelta state openings for every dirty segment.
-/// 3. `apply_state_delta()` — apply the proven delta to the mutable chain state.
+/// 2. Minimal `BlockProof` verification: exact public tx predicates, sidecar
+///    authorization, and exact authenticated state transition.
+/// 3. Apply the verified exact transition to the mutable chain state.
 ///
 /// On success, `state` is updated to the post-block UTXO state.
 /// On failure, callers restore the pre-validation state snapshot.
-///
-/// # Callers must provide
-///
-/// - `spine_inputs_list`: block GKR slot-state inputs, one per transaction.
-///   Build these from the block's transactions and current state.
-///
-/// - `auth_public_list`: auth GKR public inputs, one per transaction.
-///   Derived from the standard bucket public inputs.
-///
-/// - `state_binding_airs`: temporary NativeDelta summaries for each dirty segment.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_block_full(
     block: &Block,
     proof: &BlockProof,
-    spine_inputs_list: &[SpineInputs],
-    auth_public_list: &[AuthPublicInputs],
-    standard_auth_proofs: &[AuthProofKillShot],
-    sweep_auth_proofs: &[SweepAuthProofKillShot],
-    state_binding_airs: &[&BlockStateBindingAir],
+    auth_sidecar: &BlockAuthSidecar,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     // active_slot_count values from the last EXPANSION_WINDOW finalised headers.
@@ -134,7 +156,6 @@ pub fn validate_block_full(
     prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
-    nullifiers: &NullifierSet,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
     // Header + tx checks (cheap, fail-fast — no state reads, no apply_block).
@@ -145,13 +166,9 @@ pub fn validate_block_full(
         prev_active_counts,
         local_time,
         anchor,
-        nullifiers,
     )?;
 
-    // Verify bucket coverage, canonical proof transcript binding, proof roots,
-    // and pi.log_slots == header.log_slots.
-    let header_log_slots = block.header.log_slots;
-    validate_block_bucket_tx_indices(block, proof).map_err(FullValidationError::ZkProof)?;
+    validate_minimal_block_proof_shape(block, proof).map_err(FullValidationError::ZkProof)?;
     validate_block_proof_transcript_hash(block, proof).map_err(FullValidationError::ZkProof)?;
     if proof.meta.prev_block_state_root != parent.state_root {
         return Err(FullValidationError::ZkProof(
@@ -163,97 +180,202 @@ pub fn validate_block_full(
             crate::VerifyBlockError::NewStateRootMismatch,
         ));
     }
-    if let Some(standard_bucket) = proof.standard_bucket.as_ref() {
-        for (block_tx_index, pi) in standard_bucket
-            .meta
-            .tx_indices
-            .iter()
-            .copied()
-            .zip(standard_bucket.tx_pis.iter())
-        {
-            if pi.log_slots != header_log_slots {
-                return Err(FullValidationError::ZkProof(
-                    crate::VerifyBlockError::LogSlotsInconsistent {
-                        tx_index: block_tx_index as usize,
-                        pi_log_slots: pi.log_slots,
-                        header_log_slots,
-                    },
-                ));
-            }
-        }
+    validate_block_public_logic(block).map_err(FullValidationError::ZkProof)?;
+    validate_block_authorizations(block, auth_sidecar, &OwnerAuthAuthorizationVerifier)
+        .map_err(FullValidationError::ZkProof)?;
+
+    let surface =
+        build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
+    let inputs = crate::ExactStateTransitionInputs {
+        parent_state_root: parent.state_root,
+        parent_log_slots: state.state.log_slots() as u32,
+        parent_utxo_root: state.utxo_root,
+        parent_guard_root: state.reuse_guard.root(),
+        child_state_root: block.header.state_root,
+        child_log_slots: block.header.log_slots,
+        height: block.header.height,
+        parent_active_slot_count: state.active_slot_count,
+        parent_alloc_counter: state.alloc_counter,
+    };
+    let verified = crate::verify_exact_state_transition(
+        &inputs,
+        &surface,
+        &state.reuse_guard,
+        &proof.state_transition,
+    )
+    .map_err(|e| FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e)))?;
+
+    if verified.active_slot_count() != block.header.active_slot_count {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch(
+                "active_slot_count mismatch".into(),
+            ),
+        ));
     }
-    if let Some(sweep_bucket) = proof.sweep_bucket.as_ref() {
-        for (block_tx_index, pi) in sweep_bucket
-            .meta
-            .tx_indices
-            .iter()
-            .copied()
-            .zip(sweep_bucket.tx_pis.iter())
-        {
-            if pi.log_slots != header_log_slots {
-                return Err(FullValidationError::ZkProof(
-                    crate::VerifyBlockError::LogSlotsInconsistent {
-                        tx_index: block_tx_index as usize,
-                        pi_log_slots: pi.log_slots,
-                        header_log_slots,
-                    },
-                ));
-            }
-        }
-        verify_sweep_bucket_from_block(block, proof, sweep_auth_proofs)
-            .map_err(FullValidationError::ZkProof)?;
+    if verified.alloc_counter() != block.header.alloc_counter {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch("alloc_counter mismatch".into()),
+        ));
     }
 
-    // Verify the full proof. Standard and mixed blocks use the shared block
-    // verifier; sweep-only blocks verify their bucket plus standalone state
-    // binding proofs.
-    if proof.standard_bucket.is_some() {
-        let tx_airs: Vec<TxLogicAir> = block
-            .transactions
-            .iter()
-            .filter(|tx| !tx.body.is_coinbase && tx.body.shape == TxShape::Standard4x8)
-            .map(|tx| TxLogicAir::new(boundary_pins_from_body(&tx.body)))
-            .collect();
-        let air_refs: Vec<&dyn Air> = tx_airs.iter().map(|a| a as &dyn Air).collect();
-        verify_block(
-            &air_refs,
-            proof,
-            spine_inputs_list,
-            auth_public_list,
-            standard_auth_proofs,
-            state_binding_airs,
-        )?;
-    } else {
-        verify_state_bindings_standalone(proof, state_binding_airs)?;
+    let applied_root = state
+        .apply_verified_exact_transition(
+            verified.log_slots(),
+            verified.child_utxo_root(),
+            verified.child_guard_root(),
+            verified.slot_updates(),
+            verified.guard_bucket_update().cloned(),
+            verified.active_slot_count(),
+            verified.alloc_counter(),
+        )
+        .map_err(|e| {
+            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
+                format!("exact transition apply failed: {e:?}"),
+            ))
+        })?;
+    if applied_root != block.header.state_root {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch("state_root mismatch".into()),
+        ));
     }
-
-    // Apply state delta — BlockProof correctness means no pre-state reads are needed.
-    apply_state_delta(state, block).map_err(|e| {
-        use noid_chain::block::BlockApplyError;
-        match e {
-            BlockApplyError::HeaderTxRootMismatch => {
-                FullValidationError::Consensus(noid_chain::consensus::ConsensusError::BadTxRoot)
-            }
-            BlockApplyError::HeaderActiveSlotCountMismatch => FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(
-                    "active_slot_count mismatch".into(),
-                ),
-            ),
-            BlockApplyError::HeaderAllocCounterMismatch => FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(
-                    "alloc_counter mismatch".into(),
-                ),
-            ),
-            BlockApplyError::HeaderLogSlotsMismatch => FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::BadLogSlotsExpansion,
-            ),
-            _ => FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!("{:?}", e)),
-            ),
-        }
-    })?;
 
     Ok(block.header.state_root)
+}
+
+fn validate_minimal_block_proof_shape(
+    block: &Block,
+    proof: &BlockProof,
+) -> Result<(), VerifyBlockError> {
+    let expected_non_coinbase = block
+        .transactions
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .count();
+    if proof.meta.n_tx as usize != expected_non_coinbase
+        || proof.meta.n_air_per_tx != 0
+        || proof.meta.n_auth_slices_per_tx != 0
+        || proof.meta.log_rows != 0
+        || proof.meta.n_block_spine_slices != 0
+    {
+        return Err(VerifyBlockError::ShapeMismatch);
+    }
+
+    Ok(())
+}
+
+fn validate_block_public_logic(block: &Block) -> Result<(), VerifyBlockError> {
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        if tx.body.is_coinbase {
+            continue;
+        }
+        let facts = validate_public_tx_logic(&tx.body)
+            .map_err(|error| VerifyBlockError::TxPublicLogic { tx_index, error })?;
+        if tx.tx_body_hash != facts.tx_body_hash {
+            return Err(VerifyBlockError::TxPublicInputsMismatch { tx_index });
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_block_authorizations<V: AuthorizationVerifier>(
+    block: &Block,
+    sidecar: &BlockAuthSidecar,
+    verifier: &V,
+) -> Result<(), VerifyBlockError> {
+    validate_block_auth_sidecar_root(block, sidecar)?;
+    let user_txs: Vec<(usize, &Transaction)> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .filter(|(_, tx)| !tx.body.is_coinbase)
+        .collect();
+    if user_txs.len() != sidecar.tx_auth.len() {
+        return Err(VerifyBlockError::AuthSidecarShapeMismatch);
+    }
+
+    let results: Vec<Result<VerifiedAuthorization, VerifyBlockError>> = user_txs
+        .par_iter()
+        .zip(sidecar.tx_auth.par_iter())
+        .map(|((tx_index, tx), proof)| {
+            let public = owner_auth_public_from_body(&tx.body)
+                .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
+            let statement = CanonicalAuthorizationStatement {
+                tx_index: *tx_index,
+                tx_body_hash: tx.tx_body_hash.as_fields(),
+                public,
+            };
+            verifier.verify(&statement, proof)
+        })
+        .collect();
+
+    for verified in results {
+        let verified = verified?;
+        if verified.live_input_count == 0 || verified.owner_count == 0 {
+            return Err(VerifyBlockError::AuthSidecarShapeMismatch);
+        }
+    }
+
+    Ok(())
+}
+
+fn build_exact_surface_for_block(
+    block: &Block,
+    state: &ChainState,
+) -> Result<ExactActionSurface, VerifyBlockError> {
+    let mut surface_state = state.state.clone();
+    while surface_state.log_slots() < block.header.log_slots as usize {
+        surface_state.expand();
+    }
+    if surface_state.log_slots() != block.header.log_slots as usize {
+        return Err(VerifyBlockError::ShapeMismatch);
+    }
+
+    let mut bodies = Vec::with_capacity(block.transactions.len());
+    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
+        bodies.push(tx.body.clone());
+    }
+    if let Some(coinbase) = block.transactions.iter().find(|tx| tx.body.is_coinbase) {
+        bodies.push(coinbase.body.clone());
+    }
+    let commitments: Vec<[u8; 32]> = bodies
+        .iter()
+        .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
+        .collect();
+    build_exact_action_surface(&surface_state, &bodies, &commitments).map_err(map_state_delta_error)
+}
+
+fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
+    match err {
+        StateDeltaError::InputMismatch {
+            tx_index,
+            input_index,
+        } => VerifyBlockError::ExactStateSurfaceInputMismatch {
+            tx_index,
+            input_index,
+        },
+        StateDeltaError::OutputSlotOccupied {
+            tx_index,
+            output_index,
+        } => VerifyBlockError::ExactStateSurfaceOutputOccupied {
+            tx_index,
+            output_index,
+        },
+        StateDeltaError::ClaimsCommitmentMismatch { tx_index } => {
+            VerifyBlockError::ExactStateSurfaceClaimsCommitmentMismatch { tx_index }
+        }
+        StateDeltaError::DuplicateInputSlot { tx_index } => {
+            VerifyBlockError::ExactStateSurfaceDuplicateInputSlot { tx_index }
+        }
+        StateDeltaError::DuplicateOutputSlot { tx_index } => {
+            VerifyBlockError::ExactStateSurfaceDuplicateOutputSlot { tx_index }
+        }
+        StateDeltaError::InputOutputSlotOverlap { tx_index } => {
+            VerifyBlockError::ExactStateSurfaceInputOutputSlotOverlap { tx_index }
+        }
+        StateDeltaError::SlotOutOfRange { tx_index } => {
+            VerifyBlockError::ExactStateSurfaceSlotOutOfRange { tx_index }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,14 +420,15 @@ pub fn validate_block_auth_sidecar_root(
 ///
 /// Takes the raw `block_proof_bytes` received over P2P and:
 /// 1. Deserialises the `BlockProof`.
-/// 2. Reconstructs `SpineInputs`, `AuthPublicInputs`, and NativeDelta state summaries
-///    purely from the block's public wire data and the pre-block FRI state.
-/// 3. Calls `validate_block_full` (consensus + BlockProof + state delta).
+/// 2. Reconstructs `OwnerAuthPublicInputs` and the exact state-transition
+///    surface purely from the block's public wire data and the pre-block state.
+/// 3. Calls `validate_block_full` (consensus + BlockProof + exact transition).
 ///
 /// # Security
 ///
 /// `spend_secret` is never accessed or needed. All inputs are reconstructed
-/// from one-way hash outputs (`owner = H_ADDR(secret)`, `auth_tag = H_AUTH(secret, …)`).
+/// from one-way hash outputs (`owner = H_ADDR(secret)`).
+#[allow(clippy::too_many_arguments)]
 pub fn validate_block_from_network(
     block: &Block,
     block_proof_bytes: &[u8],
@@ -315,10 +438,10 @@ pub fn validate_block_from_network(
     prev_active_counts: &[u64],
     local_time: u64,
     anchor: &AnchorInfo,
-    nullifiers: &NullifierSet,
     pre_state: &noid_chain::segmented_state::SegmentedFriState,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
+    let _ = pre_state;
     if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
         || !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len())
     {
@@ -338,477 +461,18 @@ pub fn validate_block_from_network(
         bincode::deserialize(block_auth_sidecar_bytes).map_err(|_| {
             FullValidationError::ZkProof(crate::VerifyBlockError::AuthSidecarShapeMismatch)
         })?;
-    validate_block_auth_sidecar_root(block, &sidecar).map_err(FullValidationError::ZkProof)?;
-    let (standard_auth_proofs, sweep_auth_proofs) =
-        split_auth_sidecar_for_buckets(block, &proof, &sidecar)
-            .map_err(FullValidationError::ZkProof)?;
-
-    let spine_inputs = build_spine_inputs_list(block);
-    let auth_public = build_auth_public_list(block, &proof);
-    let sb_airs = build_state_binding_airs(block, &proof, pre_state)?;
-    let sb_air_refs: Vec<&BlockStateBindingAir> = sb_airs.iter().collect();
 
     validate_block_full(
         block,
         &proof,
-        &spine_inputs,
-        &auth_public,
-        &standard_auth_proofs,
-        &sweep_auth_proofs,
-        &sb_air_refs,
+        &sidecar,
         parent,
         prev_timestamps,
         prev_active_counts,
         local_time,
         anchor,
-        nullifiers,
         state,
     )
-}
-
-// ---------------------------------------------------------------------------
-// Bucket coverage helpers
-// ---------------------------------------------------------------------------
-
-/// Validate that all present shape buckets cover exactly the non-coinbase
-/// transactions in `block`, in canonical block order and without cross-shape
-/// substitution.
-///
-/// This binds bucket-local public inputs back to concrete block transaction
-/// bodies before the lower-level proof verifiers check algebraic consistency.
-pub fn validate_block_bucket_tx_indices(
-    block: &Block,
-    proof: &BlockProof,
-) -> Result<(), crate::VerifyBlockError> {
-    let mut expected_standard = Vec::new();
-    let mut expected_sweep = Vec::new();
-    for (idx, tx) in block.transactions.iter().enumerate() {
-        if tx.body.is_coinbase {
-            continue;
-        }
-        match tx.body.shape {
-            TxShape::Standard4x8 => expected_standard.push(idx as u32),
-            TxShape::Sweep25x2 => expected_sweep.push(idx as u32),
-        }
-    }
-
-    let expected_total = expected_standard.len() + expected_sweep.len();
-    if proof.meta.n_tx as usize != expected_total {
-        return Err(crate::VerifyBlockError::ShapeMismatch);
-    }
-
-    match (&proof.standard_bucket, expected_standard.is_empty()) {
-        (Some(bucket), false) => {
-            if bucket.meta.shape != TxShape::Standard4x8
-                || !bucket.meta.tx_indices.windows(2).all(|w| w[0] < w[1])
-                || bucket.meta.tx_indices != expected_standard
-                || bucket.tx_pis.len() != expected_standard.len()
-                || bucket.tx_algebraic.len() != expected_standard.len()
-            {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            }
-            for (pi, block_idx) in bucket.tx_pis.iter().zip(expected_standard.iter().copied()) {
-                let tx = &block.transactions[block_idx as usize];
-                if tx.body.shape != TxShape::Standard4x8 {
-                    return Err(crate::VerifyBlockError::ShapeMismatch);
-                }
-                validate_public_inputs_for_tx(block_idx as usize, tx, pi)?;
-            }
-        }
-        (None, true) => {}
-        _ => return Err(crate::VerifyBlockError::ShapeMismatch),
-    }
-
-    match (&proof.sweep_bucket, expected_sweep.is_empty()) {
-        (Some(bucket), false) => {
-            if bucket.meta.shape != TxShape::Sweep25x2
-                || !bucket.meta.tx_indices.windows(2).all(|w| w[0] < w[1])
-                || bucket.meta.tx_indices != expected_sweep
-                || bucket.tx_pis.len() != expected_sweep.len()
-                || bucket.meta.n_boundary_slices_per_tx != 0
-                || bucket.meta.n_block_spine_slices == 0
-            {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            }
-            for (pi, block_idx) in bucket.tx_pis.iter().zip(expected_sweep.iter().copied()) {
-                let tx = &block.transactions[block_idx as usize];
-                if tx.body.shape != TxShape::Sweep25x2 {
-                    return Err(crate::VerifyBlockError::ShapeMismatch);
-                }
-                validate_public_inputs_for_tx(block_idx as usize, tx, pi)?;
-            }
-        }
-        (None, true) => {}
-        _ => return Err(crate::VerifyBlockError::ShapeMismatch),
-    }
-
-    Ok(())
-}
-
-fn validate_public_inputs_for_tx(
-    tx_index: usize,
-    tx: &Transaction,
-    pi: &PublicInputs,
-) -> Result<(), crate::VerifyBlockError> {
-    if tx.body.is_coinbase {
-        return Err(crate::VerifyBlockError::ShapeMismatch);
-    }
-
-    let canonical_hash = hash_tx_body_for_shape(
-        tx.body.shape,
-        &tx.body.epoch_anchor,
-        tx.body.fee,
-        &tx.body.inputs,
-        &tx.body.outputs,
-        tx.body.is_coinbase,
-    );
-    let n_live_inputs = tx.body.inputs.iter().filter(|i| i.valid).count() as u8;
-    let n_live_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u8;
-    let claims_commitment = compute_claims_commitment(&tx.body.inputs, &tx.body.outputs);
-
-    let mut is_activation = [false; MAX_OUTPUTS];
-    let mut is_deactivation = [false; MAX_INPUTS];
-    if tx.body.shape == TxShape::Standard4x8 {
-        for (j, out) in tx.body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-            is_activation[j] = out.valid;
-        }
-        for (i, inp) in tx.body.inputs.iter().enumerate().take(MAX_INPUTS) {
-            is_deactivation[i] = inp.valid;
-        }
-    }
-
-    if tx.tx_body_hash != canonical_hash
-        || pi.tx_body_hash != canonical_hash
-        || pi.epoch_anchor != tx.body.epoch_anchor
-        || pi.shape_id != tx.body.shape.id()
-        || pi.fee != tx.body.fee
-        || pi.n_live_inputs != n_live_inputs
-        || pi.n_live_outputs != n_live_outputs
-        || pi.coinbase_credit != 0
-        || pi.claims_commitment != claims_commitment
-        || pi.is_activation != is_activation
-        || pi.is_deactivation != is_deactivation
-    {
-        return Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index });
-    }
-
-    Ok(())
-}
-
-/// Standard-only compatibility wrapper used by callers that still require the
-/// current standard block prover format.
-pub fn validate_standard_bucket_tx_indices(
-    block: &Block,
-    proof: &BlockProof,
-) -> Result<(), crate::VerifyBlockError> {
-    if proof.sweep_bucket.is_some() {
-        return Err(crate::VerifyBlockError::ShapeMismatch);
-    }
-    validate_block_bucket_tx_indices(block, proof)
-}
-
-/// Verify all Sweep25x2 wallet logic proofs carried by `proof.sweep_bucket` and
-/// bind their public inputs to the block transaction bodies.
-pub fn verify_sweep_bucket_from_block(
-    block: &Block,
-    proof: &BlockProof,
-    sweep_auth_proofs: &[SweepAuthProofKillShot],
-) -> Result<(), crate::VerifyBlockError> {
-    let Some(bucket) = proof.sweep_bucket.as_ref() else {
-        return Ok(());
-    };
-    validate_block_bucket_tx_indices(block, proof)?;
-
-    let mut sweep_airs = Vec::with_capacity(bucket.meta.tx_indices.len());
-    let mut sweep_spines = Vec::with_capacity(bucket.meta.tx_indices.len());
-    let mut sweep_auth_public = Vec::with_capacity(bucket.meta.tx_indices.len());
-    for (k, block_idx) in bucket.meta.tx_indices.iter().copied().enumerate() {
-        let tx = &block.transactions[block_idx as usize];
-        let pi = &bucket.tx_pis[k];
-        sweep_spines.push(
-            sweep_spine_inputs_from_body(&tx.body)
-                .expect("canonical sweep spine inputs from block body"),
-        );
-        sweep_auth_public.push(build_sweep_auth_public_for_tx(tx, pi));
-
-        let (air, _trace) = sweep_logic_air_and_trace_from_body(&tx.body);
-        sweep_airs.push(air);
-    }
-
-    let sweep_air_refs: Vec<&dyn Air> = sweep_airs.iter().map(|air| air as &dyn Air).collect();
-    crate::verify_sweep_bucket_aggregation(
-        &proof.meta.prev_block_state_root,
-        &sweep_air_refs,
-        bucket,
-        &sweep_auth_public,
-        sweep_auth_proofs,
-        &sweep_spines,
-    )?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Reconstruction helpers
-// ---------------------------------------------------------------------------
-
-/// Reconstruct `SpineInputs` for each non-coinbase transaction.
-///
-/// Derived entirely from the tx body — no private key material involved.
-pub fn build_spine_inputs_list(block: &Block) -> Vec<SpineInputs> {
-    use noid_core::Block128;
-    block
-        .transactions
-        .iter()
-        .filter(|tx| !tx.body.is_coinbase && tx.body.shape == TxShape::Standard4x8)
-        .map(|tx| {
-            let pins = boundary_pins_from_body(&tx.body);
-            SpineInputs {
-                epoch_anchor: pins.epoch_anchor,
-                fee_leaf: pins.fee_leaf,
-                input_leaves: pins.input_leaf_absorb,
-                output_leaves: pins.output_leaf_absorb,
-                is_coinbase_leaf: pins.is_coinbase_leaf,
-                pad_leaf: [Block128(0); 2],
-            }
-        })
-        .collect()
-}
-
-/// Reconstruct `AuthPublicInputs` for each standard non-coinbase transaction.
-///
-/// The statement is derived only from the canonical transaction body; no
-/// prover-provided public boundary is accepted.
-pub fn build_auth_public_list(block: &Block, proof: &BlockProof) -> Vec<AuthPublicInputs> {
-    let Some(bucket) = proof.standard_bucket.as_ref() else {
-        return Vec::new();
-    };
-
-    bucket
-        .meta
-        .tx_indices
-        .iter()
-        .map(|block_tx_index| {
-            let tx = &block.transactions[*block_tx_index as usize];
-            standard_auth_public_from_body(&tx.body)
-                .expect("canonical standard auth statement from block body")
-        })
-        .collect()
-}
-
-fn build_sweep_auth_public_for_tx(tx: &Transaction, _pi: &PublicInputs) -> SweepAuthPublicInputs {
-    sweep_auth_public_from_body(&tx.body).expect("canonical sweep auth statement from block body")
-}
-
-fn proof_claim_commitments_by_block_index(
-    block: &Block,
-    proof: &BlockProof,
-) -> Result<Vec<Option<[u8; 32]>>, crate::VerifyBlockError> {
-    let mut commitments = vec![None; block.transactions.len()];
-    let mut seen = 0usize;
-
-    if let Some(bucket) = proof.standard_bucket.as_ref() {
-        if bucket.meta.tx_indices.len() != bucket.tx_pis.len() {
-            return Err(crate::VerifyBlockError::ShapeMismatch);
-        }
-        for (block_idx, pi) in bucket
-            .meta
-            .tx_indices
-            .iter()
-            .copied()
-            .zip(bucket.tx_pis.iter())
-        {
-            let block_idx = block_idx as usize;
-            let Some(tx) = block.transactions.get(block_idx) else {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            };
-            validate_public_inputs_for_tx(block_idx, tx, pi)?;
-            if commitments[block_idx]
-                .replace(pi.claims_commitment)
-                .is_some()
-            {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            }
-            seen += 1;
-        }
-    }
-
-    if let Some(bucket) = proof.sweep_bucket.as_ref() {
-        if bucket.meta.tx_indices.len() != bucket.tx_pis.len() {
-            return Err(crate::VerifyBlockError::ShapeMismatch);
-        }
-        for (block_idx, pi) in bucket
-            .meta
-            .tx_indices
-            .iter()
-            .copied()
-            .zip(bucket.tx_pis.iter())
-        {
-            let block_idx = block_idx as usize;
-            let Some(tx) = block.transactions.get(block_idx) else {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            };
-            validate_public_inputs_for_tx(block_idx, tx, pi)?;
-            if commitments[block_idx]
-                .replace(pi.claims_commitment)
-                .is_some()
-            {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            }
-            seen += 1;
-        }
-    }
-
-    if seen != proof.meta.n_tx as usize {
-        return Err(crate::VerifyBlockError::ShapeMismatch);
-    }
-
-    Ok(commitments)
-}
-
-fn collect_state_binding_claims(
-    block: &Block,
-    commitments_by_block_index: &[Option<[u8; 32]>],
-    pre_state: &noid_chain::segmented_state::SegmentedFriState,
-) -> Result<crate::state_delta_claims::StateBindingClaimMap, crate::VerifyBlockError> {
-    crate::state_delta_claims::collect_state_binding_claims_from_block(
-        block,
-        commitments_by_block_index,
-        pre_state,
-    )
-}
-
-/// Reconstruct temporary NativeDelta state summaries from proof openings and
-/// the pre-block FRI state.
-///
-/// The verifier reconstructs claims from the canonical tx body, checks the
-/// sequential pre-state relation, derives the state evaluation point from endpoint
-/// roots, and enforces the native delta-MLE identity before returning the summary.
-/// It never copies `(value, owner)` out of the state into a spend claim unless
-/// that value equals the transaction's public claim; this is the SC-3 claim bridge.
-pub fn build_state_binding_airs(
-    block: &Block,
-    proof: &BlockProof,
-    pre_state: &noid_chain::segmented_state::SegmentedFriState,
-) -> Result<Vec<BlockStateBindingAir>, crate::VerifyBlockError> {
-    use noid_air::airs::block_state_binding::BlockStateBindingWitness;
-
-    let n_state_bindings = proof.meta.n_state_bindings as usize;
-    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if !has_user_txs && n_state_bindings == 0 {
-        return Ok(Vec::new());
-    }
-
-    let commitments_by_block_index = proof_claim_commitments_by_block_index(block, proof)?;
-    let seg_claims = collect_state_binding_claims(block, &commitments_by_block_index, pre_state)?;
-
-    if seg_claims.len() != n_state_bindings
-        || proof.pre_state_openings.len() != n_state_bindings
-        || proof.post_state_openings.len() != n_state_bindings
-    {
-        return Err(crate::VerifyBlockError::ShapeMismatch);
-    }
-    if n_state_bindings == 0 {
-        return Ok(Vec::new());
-    }
-
-    let eff_log = pre_state.effective_log_segment_size();
-    let prev_state_root = &proof.meta.prev_block_state_root;
-
-    // BTreeMap iteration is already sorted by seg_id.
-    tracing::debug!(
-        n_state_bindings = seg_claims.len(),
-        eff_log,
-        "build_state_binding_airs: segments={}",
-        seg_claims
-            .iter()
-            .map(|(s, c)| format!("seg{}:{}", s, c.len()))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-
-    seg_claims
-        .into_iter()
-        .enumerate()
-        .map(|(sb_idx, (seg_id, claims))| {
-            let pre_op = &proof.pre_state_openings[sb_idx];
-            let post_op = &proof.post_state_openings[sb_idx];
-            if pre_op.seg_id != seg_id || post_op.seg_id != seg_id {
-                return Err(crate::VerifyBlockError::StateBindingSegmentMismatch {
-                    state_binding_index: sb_idx,
-                    expected_seg_id: seg_id,
-                    pre_seg_id: pre_op.seg_id,
-                    post_seg_id: post_op.seg_id,
-                });
-            }
-            if pre_op.eval_point != post_op.eval_point || pre_op.eval_point.len() != eff_log {
-                return Err(crate::VerifyBlockError::ShapeMismatch);
-            }
-
-            let (eval_point, gamma) = state_binding_eval_point_and_gamma(
-                prev_state_root,
-                &proof.meta.new_state_root,
-                seg_id,
-                sb_idx as u32,
-                proof.meta.n_tx,
-                eff_log,
-            );
-            if pre_op.eval_point != eval_point {
-                return Err(crate::VerifyBlockError::StateMleOpeningFailed(sb_idx));
-            }
-
-            let prev_lane_openings = pre_op.lane_values;
-            let new_lane_openings = post_op.lane_values;
-
-            // Native state-delta identity for the current production proof surface:
-            // post_lane(r) = pre_lane(r) + Σ eq(r, slot_i) · delta_i.
-            //
-            // The claims are verifier-reconstructed from the canonical block body
-            // and pre-state prefix overlay, while `r` is derived from the endpoint
-            // roots above. This replaces the old wide `BlockStateBindingAir` STARK
-            // as the soundness-critical transition check; the returned AIR is now
-            // only a compact summary used by existing opening-verifier plumbing.
-            let witness = BlockStateBindingWitness::new(
-                claims.clone(),
-                eval_point.clone(),
-                gamma,
-                prev_lane_openings,
-                new_lane_openings,
-            );
-            if witness.expected_new_lane_openings(prev_lane_openings) != new_lane_openings {
-                return Err(crate::VerifyBlockError::StateMleOpeningFailed(sb_idx));
-            }
-            let expected_batched = witness.expected_batched_claims();
-
-            Ok(BlockStateBindingAir::new(
-                &claims,
-                prev_lane_openings,
-                new_lane_openings,
-                &eval_point,
-                gamma,
-                expected_batched,
-            ))
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build `TxLogicAir` instances from a block's transactions.
-///
-/// Coinbase transactions are excluded from WalletAuthorizationBundle coverage (validated by
-/// consensus rules only). This function skips them.
-///
-/// The returned AIRs are in the same order as non-coinbase txs in the block.
-pub fn build_tx_airs(block: &Block) -> Vec<TxLogicAir> {
-    block
-        .transactions
-        .iter()
-        .filter(|tx| !tx.body.is_coinbase && tx.body.shape == TxShape::Standard4x8)
-        .map(|tx| TxLogicAir::new(boundary_pins_from_body(&tx.body)))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -820,12 +484,13 @@ mod tests {
     use super::*;
     use noid_chain::block::Block;
     use noid_chain::block_header::BlockHeader;
+    use noid_chain::consensus::wire_limits::{
+        proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
+    };
     use noid_chain::consensus::{genesis::GENESIS_TIMESTAMP, params::GENESIS_TARGET};
-    use noid_chain::fri_state::SlotValue;
     use noid_chain::state::ChainState;
-    use noid_core::Block128;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
-    use noid_tx::{compute_claims_commitment, Transaction, TxBody, TxInput, TxOutput};
+    use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
+    use noid_tx::{Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
 
@@ -859,237 +524,96 @@ mod tests {
         }
     }
 
-    fn make_input(slot: u32, value: u64, owner: Address) -> TxInput {
-        TxInput {
-            slot_index: slot,
-            value,
-            owner,
-            spend_secret: SpendSecret([0x55; 32]),
-            auth_tag: AuthTag([0x77; 32]),
-            valid: true,
-        }
-    }
-
-    fn seed_slot(state: &mut ChainState, slot: u32, value: u64, owner: Address) {
-        let [owner_hi, owner_lo] = owner.as_fields();
-        state
-            .state
-            .set_slot(
-                slot,
-                SlotValue {
-                    value: Block128::from(value as u128),
-                    owner_hi,
-                    owner_lo,
-                },
-            )
-            .unwrap();
-    }
-
-    fn public_inputs_for_body(body: &TxBody) -> PublicInputs {
-        let mut is_activation = [false; MAX_OUTPUTS];
-        let mut is_deactivation = [false; MAX_INPUTS];
-        if body.shape == TxShape::Standard4x8 {
-            for (j, output) in body.outputs.iter().enumerate().take(MAX_OUTPUTS) {
-                is_activation[j] = output.valid;
-            }
-            for (i, input) in body.inputs.iter().enumerate().take(MAX_INPUTS) {
-                is_deactivation[i] = input.valid;
-            }
-        }
-        PublicInputs {
-            epoch_anchor: body.epoch_anchor,
-            tx_body_hash: hash_tx_body_for_shape(
-                body.shape,
-                &body.epoch_anchor,
-                body.fee,
-                &body.inputs,
-                &body.outputs,
-                body.is_coinbase,
-            ),
-            shape_id: body.shape.id(),
-            fee: body.fee,
-            n_live_inputs: body.inputs.iter().filter(|i| i.valid).count() as u8,
-            n_live_outputs: body.outputs.iter().filter(|o| o.valid).count() as u8,
-            coinbase_credit: 0,
-            log_slots: TEST_LOG_SLOTS as u32,
-            claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
-            is_activation,
-            is_deactivation,
-        }
-    }
-
-    #[test]
-    fn canonical_public_inputs_reject_wrong_tx_hash_or_claims_commitment() {
-        let body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [1u8; 32],
+    fn make_spend_body(slot: u32) -> TxBody {
+        let secret = SpendSecret([0x7Au8; 32]);
+        let owner = derive_address(&secret);
+        TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
+            epoch_anchor: [0x42; 32],
             fee: 0,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: 9,
+            inputs: vec![TxInput {
+                slot_index: slot,
                 value: 100,
-                owner: Address([0x33; 32]),
+                owner,
+                spend_secret: secret,
+                valid: true,
+            }],
+            outputs: vec![TxOutput {
+                slot_index: 10_000 + slot,
+                value: 100,
+                owner,
                 valid: true,
             }],
             is_coinbase: false,
+        }
+    }
+
+    fn auth_proof_for_body(body: &TxBody) -> OwnerAuthProofKillShot {
+        use noid_gkr::{
+            owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
+            prove_owner_auth_killshot, OwnerAuthCircuit,
         };
-        let tx = make_transaction(body.clone());
-        let pi = public_inputs_for_body(&body);
-        validate_public_inputs_for_tx(0, &tx, &pi).expect("canonical public inputs pass");
-
-        let mut bad_tx = tx.clone();
-        bad_tx.tx_body_hash.0[0] ^= 1;
-        assert!(matches!(
-            validate_public_inputs_for_tx(0, &bad_tx, &pi),
-            Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index: 0 })
-        ));
-
-        let mut bad_pi = pi;
-        bad_pi.claims_commitment[0] ^= 1;
-        assert!(matches!(
-            validate_public_inputs_for_tx(0, &tx, &bad_pi),
-            Err(crate::VerifyBlockError::TxPublicInputsMismatch { tx_index: 0 })
-        ));
+        let live_secrets: Vec<_> = body
+            .inputs
+            .iter()
+            .filter(|input| input.valid)
+            .map(|input| input.spend_secret.clone())
+            .collect();
+        let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(body, &live_secrets)
+            .expect("owner auth inputs from test body");
+        let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
+        let mut channel = owner_auth_gkr_channel();
+        prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel).0
     }
 
     #[test]
-    fn state_binding_claim_collection_rejects_input_owner_mismatch() {
-        let alice = Address([0x11; 32]);
-        let mallory = Address([0x22; 32]);
-        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-        seed_slot(&mut state, 3, 100, alice);
+    #[cfg_attr(debug_assertions, ignore = "release-only max sidecar regression")]
+    fn max_255_authorization_sidecar_binds_and_fits_caps() {
+        let proof = auth_proof_for_body(&make_spend_body(1));
+        let mut transactions = Vec::with_capacity(noid_chain::block::BLOCK_MAX_TXS);
+        transactions.push(make_transaction(make_tx_body(0, true)));
+        for slot in 0..255u32 {
+            transactions.push(make_transaction(make_spend_body(1_000 + slot)));
+        }
+        assert_eq!(transactions.len(), noid_chain::block::BLOCK_MAX_TXS);
 
-        let body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [1u8; 32],
-            fee: 0,
-            inputs: vec![make_input(3, 100, mallory)],
-            outputs: vec![],
-            is_coinbase: false,
-        };
-        let commitment = compute_claims_commitment(&body.inputs, &body.outputs);
-        let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: [0u8; 32],
-                tx_root: [0u8; 32],
-                timestamp: 0,
-                height: 1,
-                miner_address: Address([0u8; 32]),
-                nonce: 0,
-                difficulty_target: GENESIS_TARGET,
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [1u8; 32],
-                log_slots: TEST_LOG_SLOTS as u32,
-                active_slot_count: 0,
-                alloc_counter: 0,
-            },
-            transactions: vec![make_transaction(body)],
-        };
-
-        let err = collect_state_binding_claims(&block, &[Some(commitment)], &state.state)
-            .expect_err("owner mismatch must reject");
-        assert!(matches!(
-            err,
-            crate::VerifyBlockError::StateBindingInputMismatch {
-                tx_index: 0,
-                input_index: 0
-            }
-        ));
-    }
-
-    #[test]
-    fn state_binding_claim_collection_rejects_claim_commitment_mismatch() {
-        let alice = Address([0x11; 32]);
-        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-        seed_slot(&mut state, 4, 250, alice);
-
-        let body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [1u8; 32],
-            fee: 0,
-            inputs: vec![make_input(4, 250, alice)],
-            outputs: vec![],
-            is_coinbase: false,
-        };
-        let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: [0u8; 32],
-                tx_root: [0u8; 32],
-                timestamp: 0,
-                height: 1,
-                miner_address: Address([0u8; 32]),
-                nonce: 0,
-                difficulty_target: GENESIS_TARGET,
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [1u8; 32],
-                log_slots: TEST_LOG_SLOTS as u32,
-                active_slot_count: 0,
-                alloc_counter: 0,
-            },
-            transactions: vec![make_transaction(body)],
-        };
-
-        let err = collect_state_binding_claims(&block, &[Some([0xAB; 32])], &state.state)
-            .expect_err("claims commitment mismatch must reject");
-        assert!(matches!(
-            err,
-            crate::VerifyBlockError::StateBindingClaimsCommitmentMismatch { tx_index: 0 }
-        ));
-    }
-
-    #[test]
-    fn build_tx_airs_skips_coinbase() {
-        let cb_body = make_tx_body(0, true);
-        let tx_body = make_tx_body(1, false);
-        let block = Block {
+        let mut block = Block {
             header: {
                 let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
                 BlockHeader {
                     prev_block_hash: [0u8; 32],
                     state_root: state.state_root(),
-                    tx_root: [0u8; 32],
+                    tx_root: noid_chain::compute_tx_root(&transactions),
                     timestamp: GENESIS_TIMESTAMP,
                     height: 1,
                     miner_address: Address([0u8; 32]),
                     nonce: 0,
                     difficulty_target: GENESIS_TARGET,
                     proof_transcript_hash: [1u8; 32],
-                    witness_root: [1u8; 32],
+                    witness_root: [0u8; 32],
                     log_slots: TEST_LOG_SLOTS as u32,
                     active_slot_count: 0,
                     alloc_counter: 0,
                 }
             },
-            transactions: vec![make_transaction(cb_body), make_transaction(tx_body)],
+            transactions,
         };
-        let airs = build_tx_airs(&block);
-        // Only the non-coinbase tx gets an AIR.
-        assert_eq!(airs.len(), 1);
-    }
+        let sidecar = BlockAuthSidecar {
+            tx_auth: vec![proof; 255],
+        };
+        let sidecar_bytes = bincode::serialize(&sidecar).expect("serialize sidecar");
+        assert!(sidecar_bytes.len() <= MAX_BLOCK_AUTH_SIDECAR_BYTES);
+        assert!(proof_sidecar_combined_len_ok(0, sidecar_bytes.len()));
 
-    #[test]
-    fn build_tx_airs_empty_block() {
-        let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: [0u8; 32],
-                tx_root: [0u8; 32],
-                timestamp: 0,
-                height: 0,
-                miner_address: Address([0u8; 32]),
-                nonce: 0,
-                difficulty_target: GENESIS_TARGET,
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [1u8; 32],
-                log_slots: 24,
-                active_slot_count: 0,
-                alloc_counter: 0,
-            },
-            transactions: vec![],
-        };
-        let airs = build_tx_airs(&block);
-        assert!(airs.is_empty());
+        block.header.witness_root =
+            block_auth_sidecar_root(&block, &sidecar).expect("max sidecar root");
+        validate_block_auth_sidecar_root(&block, &sidecar).expect("max sidecar root verifies");
+
+        let mut short = sidecar.clone();
+        short.tx_auth.pop();
+        assert!(matches!(
+            validate_block_auth_sidecar_root(&block, &short),
+            Err(crate::VerifyBlockError::AuthSidecarShapeMismatch)
+        ));
     }
 }

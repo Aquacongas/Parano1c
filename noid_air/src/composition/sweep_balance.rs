@@ -100,7 +100,7 @@ pub fn sweep25x2_balance_witness_from_body(body: &TxBody) -> Sweep25x2BalanceWit
 mod tests {
     use super::*;
     use crate::Air;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{TxInput, TxOutput};
 
     fn mk_input(i: usize) -> TxInput {
@@ -109,7 +109,6 @@ mod tests {
             value: 100 + i as u64,
             owner: Address([i as u8; 32]),
             spend_secret: SpendSecret([0xA0 ^ i as u8; 32]),
-            auth_tag: AuthTag([0x55 ^ i as u8; 32]),
             valid: true,
         }
     }

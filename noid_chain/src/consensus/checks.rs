@@ -9,14 +9,12 @@
 //! Checks covered here:
 //!   1. tx_body_hash == hash(tx.body)   [SPEC §6 check 1 — native side]
 //!   2. epoch_anchor within window      [SPEC §6 check 2]
-//!   3. tx_body_hash not in nullifier set [SPEC §6 check 4]
 //!
 //! Cross-tx slot conflicts (checks 4-5 in SPEC §6) are handled by
 //! `validate_block_slot_conflicts()` in `validation.rs` since they require
 //! looking at the full transaction set.
 
 use crate::consensus::ConsensusError;
-use crate::nullifier::NullifierSet;
 use noid_tx::{hash_tx_body_for_shape, Transaction};
 
 /// Validate the per-tx consensus rules for a transaction.
@@ -27,15 +25,11 @@ use noid_tx::{hash_tx_body_for_shape, Transaction};
 ///    (skip when called from `validate_block_consensus` because `apply_block`
 ///    already verifies this, avoiding double Poseidon2b computation per tx).
 /// 2. `epoch_anchor` is non-zero for non-coinbase txs.
-/// 3. `tx.tx_body_hash` is not in the nullifier set.
 ///
 /// `check_body_hash = false` skips check 1, reducing Poseidon2b work by
 /// ~59 permutations per tx (used by `validate_block_consensus`).
-pub fn validate_tx_consensus(
-    tx: &Transaction,
-    nullifiers: &NullifierSet,
-) -> Result<(), ConsensusError> {
-    validate_tx_consensus_inner(tx, nullifiers, true)
+pub fn validate_tx_consensus(tx: &Transaction) -> Result<(), ConsensusError> {
+    validate_tx_consensus_inner(tx, true)
 }
 
 /// Same as `validate_tx_consensus` but skips the tx_body_hash recomputation.
@@ -45,16 +39,12 @@ pub fn validate_tx_consensus(
 /// recomputation here redundant.
 /// At 256 txs × 59-perm Poseidon2b, this saves ~15 ms per block application.
 #[inline]
-pub(crate) fn validate_tx_consensus_skip_hash(
-    tx: &Transaction,
-    nullifiers: &NullifierSet,
-) -> Result<(), ConsensusError> {
-    validate_tx_consensus_inner(tx, nullifiers, false)
+pub(crate) fn validate_tx_consensus_skip_hash(tx: &Transaction) -> Result<(), ConsensusError> {
+    validate_tx_consensus_inner(tx, false)
 }
 
 fn validate_tx_consensus_inner(
     tx: &Transaction,
-    nullifiers: &NullifierSet,
     check_body_hash: bool,
 ) -> Result<(), ConsensusError> {
     // 0. Fee must fit in u64 (values are 64-bit in this protocol).
@@ -124,11 +114,6 @@ fn validate_tx_consensus_inner(
         return Err(ConsensusError::BadEpochAnchor);
     }
 
-    // 3. Nullifier collision.
-    if nullifiers.contains(&tx.tx_body_hash) {
-        return Err(ConsensusError::NullifierCollision);
-    }
-
     Ok(())
 }
 
@@ -136,7 +121,8 @@ fn validate_tx_consensus_inner(
 /// or mint to the same output slot (SPEC §16 invariants 4-5).
 ///
 /// Returns `Err(ConsensusError::SlotConflict)` on the first conflict found.
-/// This is O(n × inputs) per block but n ≤ BLOCK_MAX_TXS and inputs ≤ 4.
+/// This is O(n × inputs) per block but n ≤ BLOCK_MAX_TXS and inputs are bounded
+/// by the admitted transaction proof shape.
 pub fn validate_block_slot_conflicts(txs: &[Transaction]) -> Result<(), ConsensusError> {
     use std::collections::HashSet;
     let mut spent_inputs: HashSet<u32> = HashSet::new();
@@ -166,8 +152,7 @@ pub fn validate_block_slot_conflicts(txs: &[Transaction]) -> Result<(), Consensu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nullifier::NullifierSet;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret, TxBodyHash};
+    use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
     use noid_tx::{hash_tx_body, hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput};
 
     fn dummy_output(slot: u32) -> TxOutput {
@@ -185,7 +170,6 @@ mod tests {
             value: 100,
             owner: Address([1u8; 32]),
             spend_secret: SpendSecret([0u8; 32]),
-            auth_tag: AuthTag([0u8; 32]),
             valid: true,
         }
     }
@@ -215,8 +199,7 @@ mod tests {
     #[test]
     fn valid_tx_passes() {
         let tx = make_tx(vec![], vec![dummy_output(1)], false);
-        let ns = NullifierSet::new();
-        assert!(validate_tx_consensus(&tx, &ns).is_ok());
+        assert!(validate_tx_consensus(&tx).is_ok());
     }
 
     #[test]
@@ -238,8 +221,7 @@ mod tests {
             body.is_coinbase,
         );
         let tx = Transaction { body, tx_body_hash };
-        let ns = NullifierSet::new();
-        assert_eq!(validate_tx_consensus(&tx, &ns), Ok(()));
+        assert_eq!(validate_tx_consensus(&tx), Ok(()));
     }
 
     #[test]
@@ -256,9 +238,8 @@ mod tests {
             body,
             tx_body_hash: TxBodyHash([0u8; 32]),
         };
-        let ns = NullifierSet::new();
         assert!(matches!(
-            validate_tx_consensus(&tx, &ns),
+            validate_tx_consensus(&tx),
             Err(ConsensusError::ShapeMismatch(_))
         ));
     }
@@ -267,21 +248,9 @@ mod tests {
     fn wrong_body_hash_rejected() {
         let mut tx = make_tx(vec![], vec![dummy_output(1)], false);
         tx.tx_body_hash = TxBodyHash([0xAB; 32]); // tamper
-        let ns = NullifierSet::new();
         assert_eq!(
-            validate_tx_consensus(&tx, &ns),
+            validate_tx_consensus(&tx),
             Err(ConsensusError::BadTxBodyHash)
-        );
-    }
-
-    #[test]
-    fn nullifier_collision_rejected() {
-        let tx = make_tx(vec![], vec![dummy_output(1)], false);
-        let mut ns = NullifierSet::new();
-        ns.insert_block(&[tx.tx_body_hash]);
-        assert_eq!(
-            validate_tx_consensus(&tx, &ns),
-            Err(ConsensusError::NullifierCollision)
         );
     }
 
@@ -298,9 +267,8 @@ mod tests {
             tx.body.is_coinbase,
         );
         tx.tx_body_hash = hash;
-        let ns = NullifierSet::new();
         assert_eq!(
-            validate_tx_consensus(&tx, &ns),
+            validate_tx_consensus(&tx),
             Err(ConsensusError::BadEpochAnchor)
         );
     }
@@ -308,8 +276,7 @@ mod tests {
     #[test]
     fn coinbase_zero_anchor_allowed() {
         let tx = make_tx(vec![], vec![dummy_output(1)], true); // is_coinbase=true, epoch_anchor=[0;32]
-        let ns = NullifierSet::new();
-        assert!(validate_tx_consensus(&tx, &ns).is_ok());
+        assert!(validate_tx_consensus(&tx).is_ok());
     }
 
     #[test]
@@ -354,8 +321,7 @@ mod tests {
             body,
             tx_body_hash: hash_bytes,
         };
-        let ns = NullifierSet::new();
-        assert_eq!(validate_tx_consensus(&tx, &ns), Err(ConsensusError::BadFee));
+        assert_eq!(validate_tx_consensus(&tx), Err(ConsensusError::BadFee));
     }
 
     #[test]
@@ -380,10 +346,9 @@ mod tests {
             body: body_no_output,
             tx_body_hash: h0,
         };
-        let ns = NullifierSet::new();
         assert!(
             matches!(
-                validate_tx_consensus(&tx0, &ns),
+                validate_tx_consensus(&tx0),
                 Err(ConsensusError::ShapeMismatch(_))
             ),
             "coinbase with 0 outputs must be rejected"
@@ -411,7 +376,7 @@ mod tests {
         };
         assert!(
             matches!(
-                validate_tx_consensus(&tx2, &ns),
+                validate_tx_consensus(&tx2),
                 Err(ConsensusError::ShapeMismatch(_))
             ),
             "coinbase with 2 outputs must be rejected"
@@ -440,7 +405,7 @@ mod tests {
             tx_body_hash: h,
         };
         assert_eq!(
-            validate_tx_consensus(&tx, &NullifierSet::new()),
+            validate_tx_consensus(&tx),
             Err(ConsensusError::BadFee),
             "coinbase with non-zero fee must be rejected"
         );

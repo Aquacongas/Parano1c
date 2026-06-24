@@ -1689,10 +1689,10 @@ async fn handle_swarm_event(
                 // Schedule reconnect for peers we dialled (outbound connections).
                 // We don't attempt to reconnect inbound peers — they should re-dial us.
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
-                    if !reconnect.contains_key(&peer_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = reconnect.entry(peer_id) {
                         let retry_at =
                             tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                        reconnect.insert(peer_id, (address, retry_at, 0));
+                        e.insert((address, retry_at, 0));
                         tracing::debug!(peer = %peer_id, "scheduled reconnect in 10s");
                     }
                 }
@@ -1762,6 +1762,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn conservative_wire_caps_are_ordered_for_sweep_redesign() {
         assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);

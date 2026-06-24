@@ -13,6 +13,7 @@ use noid_core::Block128;
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::fri_state::SlotValue;
+use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
 use crate::wire::BLOCK_HEADER_WIRE_SIZE;
@@ -95,11 +96,18 @@ pub fn decode_slot_value(bytes: &[u8]) -> Option<SlotValue> {
 // Wire format:
 //   block_height : u64 LE  (8 bytes)
 //   n_changes    : u32 LE  (4 bytes)
+//   n_hashes     : u32 LE  (4 bytes)
 //   [slot_index  : u32 LE  (4 bytes)
 //    slot_value  : 48 bytes          ] × n_changes
+//   tx_hash      : 32 bytes × n_hashes
+//   guard_len    : u32 LE
+//   guard_bytes  : bincode Vec<GuardBucket>
 
 pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32);
+    let guard_bytes = encode_reuse_guard_buckets(&u.reuse_guard_before);
+    let mut buf = Vec::with_capacity(
+        20 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32 + guard_bytes.len(),
+    );
     buf.extend_from_slice(&u.block_height.to_le_bytes());
     buf.extend_from_slice(&(u.slot_changes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(u.tx_hashes.len() as u32).to_le_bytes());
@@ -110,6 +118,8 @@ pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
     for h in &u.tx_hashes {
         buf.extend_from_slice(&h.0);
     }
+    buf.extend_from_slice(&(guard_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&guard_bytes);
     buf
 }
 
@@ -140,10 +150,20 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
         tx_hashes.push(TxBodyHash(h));
         pos += 32;
     }
+    if bytes.len() < pos + 4 {
+        return None;
+    }
+    let guard_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if bytes.len() != pos + guard_len {
+        return None;
+    }
+    let reuse_guard_before = decode_reuse_guard_buckets(&bytes[pos..pos + guard_len])?;
     Some(BlockUndoLog {
         block_height,
         slot_changes,
         tx_hashes,
+        reuse_guard_before,
     })
 }
 
@@ -314,6 +334,15 @@ pub fn decode_state_meta(bytes: &[u8]) -> Option<(u32, u64, u64)> {
     Some((log_slots, active, alloc))
 }
 
+pub fn encode_reuse_guard_buckets(buckets: &[GuardBucket; REUSE_GUARD_BUCKETS]) -> Vec<u8> {
+    bincode::serialize(&buckets.to_vec()).expect("ReuseGuard buckets serialization must succeed")
+}
+
+pub fn decode_reuse_guard_buckets(bytes: &[u8]) -> Option<[GuardBucket; REUSE_GUARD_BUCKETS]> {
+    let buckets: Vec<GuardBucket> = bincode::deserialize(bytes).ok()?;
+    buckets.try_into().ok()
+}
+
 // consensus_meta value:
 //   tip_height(u64) + tip_hash([u8;32]) + cumulative_chainwork([u8;32])
 //   + finalized_height(u64) + finalized_hash([u8;32]) = 112 bytes
@@ -425,6 +454,7 @@ mod tests {
             block_height: 7,
             slot_changes: vec![(3u32, sv), (9u32, SlotValue::EMPTY)],
             tx_hashes: vec![TxBodyHash([0xABu8; 32])],
+            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let bytes = encode_undo_log(&undo);
         let undo2 = decode_undo_log(&bytes).expect("decode");

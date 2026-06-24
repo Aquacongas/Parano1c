@@ -34,8 +34,9 @@ pub const COMPACT_TAU: usize = 8;
 
 /// Number of FRI queries for full security. 64 queries with rate-4 code gives:
 /// - Proven soundness: 64 * log2(4) = 128 bits
-/// Uses batched Merkle proofs to compress shared ancestors,
-/// yielding ~40% path savings vs independent per-query paths.
+///
+/// Uses batched Merkle proofs to compress shared ancestors, yielding ~40% path
+/// savings vs independent per-query paths.
 #[cfg(not(debug_assertions))]
 pub const COMPACT_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
@@ -208,8 +209,10 @@ where
     let n_rows = 1 << tau;
     let row_len = evals.len() / n_rows;
     thread_local! {
-        static UPPER_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
-        static UPPER_POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> = std::cell::RefCell::new(Vec::new());
+        static UPPER_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static UPPER_POINT_FLAT_SCRATCH: std::cell::RefCell<Vec<u128>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     let upper_partial_evals: Vec<Block128> = (0..n_rows)
         .into_par_iter()

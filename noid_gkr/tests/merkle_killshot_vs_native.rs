@@ -34,12 +34,12 @@ fn fields_to_digest(f: [Block128; 2]) -> [u8; 32] {
 
 fn build_path(leaf: &[u8; 32], siblings: &[[u8; 32]], depth: usize) -> MerklePathInputs {
     let mut current = *leaf;
-    for i in 0..depth {
-        current = compress(&current, &siblings[i]);
+    for sibling in siblings.iter().take(depth) {
+        current = compress(&current, sibling);
     }
     let mut sibling_fields = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
-    for i in 0..depth {
-        sibling_fields[i] = digest_to_fields(&siblings[i]);
+    for (i, sibling) in siblings.iter().enumerate().take(depth) {
+        sibling_fields[i] = digest_to_fields(sibling);
     }
     MerklePathInputs {
         leaf: digest_to_fields(leaf),
@@ -60,7 +60,7 @@ fn oracle_matches_native_compress_chain() {
         native_root = compress(&native_root, s);
     }
 
-    let sibling_fields: Vec<[Block128; 2]> = siblings.iter().map(|s| digest_to_fields(s)).collect();
+    let sibling_fields: Vec<[Block128; 2]> = siblings.iter().map(digest_to_fields).collect();
     let gkr_root = compute_merkle_root(&circuit, digest_to_fields(&leaf), &sibling_fields, 8);
 
     assert_eq!(fields_to_digest(gkr_root), native_root);

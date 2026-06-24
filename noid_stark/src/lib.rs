@@ -467,7 +467,7 @@ fn fold_highest_flat(table: &mut Vec<u128>, r_flat: u128) {
 /// Arguments:
 /// - `cur_eq`       — eq-table in flat basis, length `half * 2`.
 /// - `row_data_lo`  — transposed lo-half: `row_data_lo[j*n_cols+k]`
-///                    = partial eval of col k at position j (rows 0..half).
+///   = partial eval of col k at position j (rows 0..half).
 /// - `row_data_hi`  — transposed hi-half: same but for rows half..2*half.
 /// - `n_cols`       — number of columns.
 /// - `compiled`     — compiled constraint metadata.
@@ -704,7 +704,7 @@ pub fn prove_zero_check_with_domains_and_air_log_rows(
         .map(|k| {
             col_domains
                 .get(k)
-                .map_or(false, |d| matches!(d, noid_air::ColumnDomain::Bit))
+                .is_some_and(|d| matches!(d, noid_air::ColumnDomain::Bit))
         })
         .collect();
 

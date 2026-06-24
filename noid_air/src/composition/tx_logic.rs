@@ -6,8 +6,8 @@
 //! This is the AIR the wallet proves against in the two-layer architecture.
 //! It enforces UTXO conservation (balance), value range bounds, selector
 //! domain constraints, and the body-hash pin — but contains NO state columns.
-//! FriStateCombiner, FriStateOpen, and all state-opening machinery live
-//! exclusively in the miner-side `BlockStateBindingAir`.
+//! Block-level live-state authentication is handled outside this stateless
+//! per-transaction AIR by the exact state transition proof.
 //!
 //! Structurally, `TxLogicAir` is the existing `TxBodySpineComposite`: it
 //! stitches `TxValidityAir` (balance + selectors) with the retained
@@ -279,7 +279,7 @@ pub fn witness_from_body(body: &TxBody) -> TxLogicWitness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{TxInput, TxOutput};
 
     fn mk_balanced_body() -> TxBody {
@@ -293,7 +293,6 @@ mod tests {
                     value: 1100,
                     owner: Address([0x11; 32]),
                     spend_secret: SpendSecret([0x22; 32]),
-                    auth_tag: AuthTag([0x33; 32]),
                     valid: true,
                 },
                 TxInput::dummy(),

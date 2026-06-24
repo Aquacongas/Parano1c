@@ -5,8 +5,8 @@
 //!
 //! Uses splitmix64 seeded from `alloc_counter` to produce candidate free slot
 //! indices. Hints are **non-authoritative** — miners verify slot emptiness via
-//! BlockStateBinding. Two wallets may receive the same hint; conflicts are
-//! resolved at block inclusion time.
+//! the exact state transition proof. Two wallets may receive the same hint;
+//! conflicts are resolved at block inclusion time.
 //!
 //! splitmix64 is chosen over LCG because it is bijective and all output bits
 //! are equally well-distributed. With `idx = splitmix64(counter) mod 2^k`,

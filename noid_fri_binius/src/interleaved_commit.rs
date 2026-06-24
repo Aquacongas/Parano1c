@@ -509,8 +509,8 @@ fn build_source_chunk_root(
     let first_leaf = chunk_idx * chunk_leaf_count;
     if chunk_log == SOURCE_MERKLE_CHUNK_LOG {
         let mut layer = [[0u8; SOURCE_HASH_BYTES]; SOURCE_MERKLE_CHUNK_LEAVES];
-        for local in 0..chunk_leaf_count {
-            layer[local] = source_leaf_hash_from_encoded_cols_at(
+        for (local, leaf) in layer.iter_mut().take(chunk_leaf_count).enumerate() {
+            *leaf = source_leaf_hash_from_encoded_cols_at(
                 encoded_cols,
                 log_rows,
                 n_cols,

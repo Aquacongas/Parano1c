@@ -70,11 +70,6 @@ pub trait ParanoidApi {
     #[method(name = "getTx")]
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>>;
 
-    /// Returns true if `txhash` is in the nullifier set (i.e., the tx has been spent
-    /// and cannot be re-submitted within the anchor window).
-    #[method(name = "isNullifier")]
-    async fn is_nullifier(&self, txhash: String) -> RpcResult<bool>;
-
     /// Full block (header + transactions) at `height`, as hex.
     /// Only the last 18 blocks are retained; older blocks are pruned.
     #[method(name = "getBlock")]

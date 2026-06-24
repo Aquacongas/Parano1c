@@ -1,22 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! FRI-committed UTXO state.
+//! Legacy column-state helper for UTXO slots.
 //!
 //! The chain state is a vector of `2^log_slots` UTXO slots. Each slot is
-//! a `SlotValue { value, owner_hi, owner_lo }` tuple. The commitment is
-//! a Poseidon2b sponge over three independent FRI Merkle roots — one
-//! per slot-column — keyed by `TAG_FRISTATE` capacity IV with `log_slots`
-//! absorbed first. Unused / spent slots carry `SlotValue::EMPTY` (all
-//! zeros). Poseidon2b (not Blake3) was chosen so that the in-circuit
-//! combiner AIR reuses the already-arithmetised
-//! `PoseidonPermAir` primitive. FRI Merkle internals still use Blake3.
-//!
-//! Why FRI over SMT: opening a slot is a batched FRI opening, which the
-//! transaction AIR verifies via sumcheck rather than through 32+ hash
-//! compressions. For transparent chains (no leaf hiding), FRI-state
-//! replaces the per-input Merkle path and removes ~85 % of the in-circuit
-//! Poseidon work.
+//! a `SlotValue { value, owner_hi, owner_lo }` tuple. Production block
+//! validation no longer uses this helper as the state proof or state-root
+//! commitment: user blocks use the exact Poseidon2b sparse-Merkle UTXO root
+//! composed with the bounded `ReuseGuard` root. This module remains as a
+//! column-oriented raw-state utility and for tests that exercise old local
+//! opening primitives.
 //!
 //! State transitions are **linear**: spending `slot_i` is `slot_i ← 0`,
 //! minting into `slot_j` is `slot_j ← new`. `apply_delta` applies a batch
@@ -89,8 +82,8 @@ pub enum StateError {
 ///
 /// For **slot openings** (`local_idx`-based), `eval_point` is the boolean hypercube
 /// encoding of `local_idx`; `slot_vals` are the actual slot values.
-/// For **MLE openings** (`eval_point` from `BlockStateBindingAir`), `slot_vals` are
-/// the batched MLE evaluations used in `prev/new_lane_openings`.
+/// Non-Boolean evaluation points are used by lower-level FRI helpers; exact
+/// state transition verification uses sparse-Merkle slot openings.
 #[derive(Debug, Clone)]
 pub struct SlotOpening {
     pub slot_index: u32,
@@ -132,7 +125,7 @@ impl SlotOpening {
     }
 }
 
-/// FRI-committed UTXO state.
+/// Column-oriented UTXO state helper.
 #[derive(Debug, Clone)]
 pub struct FriState {
     log_slots: usize,
@@ -326,7 +319,7 @@ fn mle_eval_native(evals: &[Block128], point: &[Block128]) -> Block128 {
 ///
 /// Used by both `FriState::open()` (boolean eval point = slot index) and
 /// `SegmentedFriState::open()` (same), and for compact FRI + Merkle
-/// path openings from `BlockStateBindingAir` (random eval point).
+/// helper paths that need non-Boolean evaluation points.
 pub fn open_segment_at_point(
     eff_log: usize,
     values: &[Block128],
@@ -455,7 +448,7 @@ pub fn merkle_root_from_leaf(leaf: &StateRoot, seg_id: u16, siblings: &[StateRoo
     let mut current = *leaf;
     let mut idx = seg_id as usize;
     for sib in siblings {
-        current = if idx % 2 == 0 {
+        current = if idx.is_multiple_of(2) {
             compress(&current, sib)
         } else {
             compress(sib, &current)

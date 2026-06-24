@@ -22,15 +22,17 @@ use noid_chain::block::Block;
 use noid_chain::consensus::ConsensusError;
 use noid_chain::ChainContext;
 use noid_recursive::{
-    accumulator::genesis_accumulator,
-    prove::{prove_genesis_recursive, prove_recursive_step, RecursiveBlockProof},
+    prove::{prove_genesis_recursive, RecursiveBlockProof},
     witness::BlockReplayWitness,
 };
 
-use crate::{
-    witness_builder::{block_proof_to_replay_witness, ReplayWitnessError},
-    BlockProof,
-};
+use crate::BlockProof;
+
+#[derive(Debug)]
+pub enum ReplayWitnessError {
+    /// Current minimal `BlockProof` does not contain a recursive replay witness.
+    RealRecursiveVerifierUnavailable,
+}
 
 /// Full chain context: consensus state + recursive proof.
 ///
@@ -43,7 +45,7 @@ use crate::{
 /// remains disabled until the real recursive verifier/checkpoint generation work
 /// lands. Missing or lagging recursive proof does not affect block validation.
 pub struct BlockChainContext {
-    /// Native consensus chain state (headers, nullifiers, UTXO state, undo logs).
+    /// Native consensus chain state (headers, UTXO state, ReuseGuard, undo logs).
     pub consensus: ChainContext,
     /// Current recursive chain proof. `None` only if prove_genesis_recursive
     /// failed or was skipped; this should be treated as DEGRADED mode (P.19).
@@ -105,53 +107,20 @@ impl BlockChainContext {
     // Recursive proof update
     // -----------------------------------------------------------------------
 
-    /// Extract `BlockReplayWitness` from a `BlockProof` and advance the
-    /// recursive chain proof by one step.
+    /// Advance the recursive chain proof by one step.
     ///
     /// MUST be called after this utility context has advanced its in-memory tip
     /// so that `self.consensus.tip_header()` reflects the newly applied block.
     ///
     /// Returns a reference to the new recursive proof.
     ///
-    /// Current replay rule: standard-only, sweep-only, and mixed proofs are
-    /// accepted when their buckets carry real block-level multipoint transcripts.
-    /// Mixed proofs replay standard and sweep buckets in separate recursive lanes.
+    /// Until the real recursive verifier targets the frozen acceptance relation,
+    /// this updater fails closed for user blocks.
     pub fn update_recursive_proof(
         &mut self,
-        block_proof: &BlockProof,
+        _block_proof: &BlockProof,
     ) -> Result<&RecursiveBlockProof, ReplayWitnessError> {
-        let witness = extract_replay_witness(block_proof)?;
-        let header = self.consensus.tip_header().clone();
-
-        // prev_acc: the accumulator BEFORE this block (from the previous recursive proof).
-        // If there's no previous proof yet (shouldn't happen after genesis init),
-        // fall back to the pre-genesis zero accumulator.
-        let prev_acc = match &self.recursive_proof {
-            Some(prev) => prev.acc.clone(),
-            None => {
-                // Reconstruct what the accumulator should be at the parent block.
-                // This path only happens in DEGRADED mode (recursive proof was skipped).
-                // Use genesis_accumulator for the parent of block 1, zero for earlier.
-                use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
-                use noid_chain::hash_block_header;
-                if header.height <= 1 {
-                    let g = genesis_header();
-                    genesis_accumulator(genesis_state_root(), hash_block_header(&g))
-                } else {
-                    // Cannot safely reconstruct — return without updating.
-                    // Caller must bootstrap from a known-good recursive proof.
-                    return Ok(self
-                        .recursive_proof
-                        .as_ref()
-                        .expect("recursive_proof must exist after bootstrap"));
-                }
-            }
-        };
-
-        let prev_ref = self.recursive_proof.as_ref();
-        let new_proof = prove_recursive_step(&witness, &header, &prev_acc, prev_ref);
-        self.recursive_proof = Some(new_proof);
-        Ok(self.recursive_proof.as_ref().unwrap())
+        Err(ReplayWitnessError::RealRecursiveVerifierUnavailable)
     }
 
     // -----------------------------------------------------------------------
@@ -194,15 +163,10 @@ impl BlockChainContext {
 // BlockProof → BlockReplayWitness extraction
 // ---------------------------------------------------------------------------
 
-/// Extract the `BlockReplayWitness` from a bucketized `BlockProof`.
-///
-/// Standard-only and sweep-only proofs contribute one real block-level bucket
-/// sumcheck transcript. Mixed proofs contribute standard and sweep bucket
-/// transcripts in separate recursive lanes.
 pub fn extract_replay_witness(
-    proof: &BlockProof,
+    _proof: &BlockProof,
 ) -> Result<BlockReplayWitness, ReplayWitnessError> {
-    block_proof_to_replay_witness(proof)
+    Err(ReplayWitnessError::RealRecursiveVerifierUnavailable)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +230,7 @@ mod tests {
         let mut ctx = BlockChainContext::init_from_genesis_no_proof();
 
         // Build a trivial empty block.
-        let parent = ctx.consensus.tip_header().clone();
+        let parent = *ctx.consensus.tip_header();
         let new_root = ctx.consensus.state.state_root();
 
         let mut header = BlockHeader {

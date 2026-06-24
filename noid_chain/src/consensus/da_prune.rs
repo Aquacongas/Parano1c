@@ -10,17 +10,17 @@
 //! restore the prior UTXO state.
 //!
 //! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
-//! pruned (`prune_undo_logs`). MDBX keeps raw block bytes for the shallow
-//! reorg/peer-sync window. BlockProof bytes are kept until the block is both
-//! finalized and covered by the stored recursive proof height, so the recursive
-//! updater cannot race pruning. Older history is represented by headers, the
-//! current state, and the recursive chain proof rather than by full block bodies.
+//! pruned (`prune_undo_logs`). MDBX keeps raw block bytes, BlockProof bytes,
+//! and Auth sidecars until a real immutable checkpoint proof covers them. Older
+//! public arbitrary-peer sync remains disabled fail-closed until that checkpoint
+//! coverage exists.
 
 use std::collections::HashMap;
 
 use crate::block::Block;
 use crate::consensus::params::UNDO_RETENTION_DEPTH;
 use crate::fri_state::SlotValue;
+use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
@@ -42,6 +42,8 @@ pub struct BlockUndoLog {
     /// Used to restore the mempool after a reorg: txs that are no longer
     /// on the canonical chain can be re-admitted.
     pub tx_hashes: Vec<TxBodyHash>,
+    /// ReuseGuard buckets before this block was applied.
+    pub reuse_guard_before: [GuardBucket; REUSE_GUARD_BUCKETS],
 }
 
 impl BlockUndoLog {
@@ -51,6 +53,7 @@ impl BlockUndoLog {
             block_height,
             slot_changes: vec![],
             tx_hashes: vec![],
+            reuse_guard_before: std::array::from_fn(|_| GuardBucket::Empty),
         }
     }
 }
@@ -97,6 +100,7 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
         block_height: block.header.height,
         slot_changes,
         tx_hashes,
+        reuse_guard_before: std::array::from_fn(|i| state_before.reuse_guard.bucket(i).clone()),
     }
 }
 
@@ -244,7 +248,7 @@ mod tests {
         let header = BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: post_root,
-            tx_root: compute_tx_root(&[tx.clone()]),
+            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
             timestamp: 1_767_225_600 + 60,
             height: 1,
             miner_address: Address([0u8; 32]),

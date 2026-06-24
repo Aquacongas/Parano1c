@@ -6,8 +6,8 @@
 //! This crate implements the Kill-Shot GKR protocol for Poseidon2b
 //! permutation chains. It provides:
 //!
-//! - **Auth GKR**: proves spend-secret ownership via 20 Poseidon2b
-//!   permutations (4 inputs × 5 perms each).
+//! - **Owner Auth GKR**: proves spend-secret ownership once per canonical
+//!   unique owner group in a transaction.
 //! - **Block Spine GKR**: a single unified Kill-Shot for N×59 permutations
 //!   across all transactions in a block, with proof size and verification
 //!   cost growing O(log N) rather than O(N).
@@ -16,20 +16,7 @@
 //! See `SPEC.md` and `AUDIT.md` in this crate for the cryptographic
 //! specification and security analysis.
 
-pub mod auth_circuit;
-pub mod auth_circuit_sweep;
-pub mod auth_killshot;
-pub mod auth_killshot_sweep;
-pub mod auth_mle_sweep;
-pub mod auth_mle_v2;
-pub mod auth_oracle;
-pub mod auth_oracle_sweep;
 pub mod auth_pcs;
-pub mod auth_shift;
-pub mod auth_shift_sweep;
-pub mod auth_statement;
-pub mod auth_unified_sweep;
-pub mod auth_unified_v2;
 pub mod batch_eval;
 pub mod binding;
 pub mod block_spine;
@@ -46,6 +33,7 @@ pub mod merkle_unified;
 pub mod mle_layout;
 pub mod oracle;
 pub mod oracle_sweep;
+pub mod owner_auth;
 pub mod spine_degree7;
 pub mod spine_killshot;
 pub mod spine_killshot_sweep;
@@ -57,57 +45,13 @@ pub mod spine_sumcheck;
 pub mod spine_sumcheck_sweep;
 pub mod spine_unified;
 pub mod spine_unified_sweep;
+pub mod sweep_spine_statement;
 pub mod wallet_authorization;
 
-pub use auth_circuit::{
-    AuthCircuit, AuthInputs, AuthPublicInputs, AuthSlotDescriptor, AuthSlotRole, AUTH_PAD_0,
-    AUTH_PAD_1, N_AUTH_INPUTS, N_AUTH_SLOTS, N_SLOTS_PER_INPUT,
-};
-pub use auth_circuit_sweep::{
-    SweepAuthCircuit, SweepAuthInputs, SweepAuthPublicInputs, SweepAuthSlotDescriptor,
-    SweepAuthSlotRole, N_SWEEP_AUTH_INPUTS, N_SWEEP_AUTH_SLOTS,
-};
-pub use auth_killshot::{
-    auth_gkr_channel, build_auth_unified_from_inputs, discharge_auth_reductions_native,
-    prove_auth_killshot, prove_auth_killshot_with_mle, verify_auth_killshot,
-    AuthKillShotReductions, AuthProofKillShot,
-};
-pub use auth_killshot_sweep::{
-    build_sweep_auth_unified_from_inputs, discharge_sweep_auth_reductions_native,
-    prove_sweep_auth_killshot, prove_sweep_auth_killshot_with_mle, sweep_auth_gkr_channel,
-    verify_sweep_auth_killshot, SweepAuthKillShotReductions, SweepAuthProofKillShot,
-};
-pub use auth_mle_sweep::{
-    build_sweep_auth_unified_mle, SweepAuthUnifiedMle, N_SWEEP_AUTH_LIVE_SLOTS,
-    N_SWEEP_AUTH_UNIFIED_CELLS, N_SWEEP_AUTH_UNIFIED_VARS,
-};
-pub use auth_mle_v2::{
-    build_auth_unified_mle_v2, AuthUnifiedMle, N_AUTH_LIVE_SLOTS, N_AUTH_UNIFIED_CELLS,
-    N_AUTH_UNIFIED_VARS,
-};
-pub use auth_oracle::{compute_auth_boundary, evaluate_auth, AuthSlotState, AuthWitness};
-pub use auth_oracle_sweep::{
-    compute_sweep_auth_boundary, evaluate_sweep_auth, SweepAuthSlotState, SweepAuthWitness,
-};
 pub use auth_pcs::{
     commit_auth_mle_columns, open_auth_mle_columns_committed, prove_auth_mle_opening,
     verify_auth_mle_multi_opening, verify_auth_mle_opening, AuthMleMultiOpeningProof,
     AuthMleOpeningProof, AUTH_PCS_BASE_LOG,
-};
-pub use auth_statement::{
-    standard_auth_public_from_body, sweep_auth_inputs_from_body, sweep_auth_public_from_body,
-    sweep_spine_inputs_from_body, AuthStatementError,
-};
-pub use auth_unified_sweep::{
-    prove_sweep_auth_shift, prove_sweep_auth_unified, verify_sweep_auth_shift,
-    verify_sweep_auth_unified, SweepAuthKillShotProof, SweepAuthShiftProof,
-    SweepAuthShiftReduction, SweepAuthUnifiedProof, SweepAuthUnifiedReduction,
-    SWEEP_AUTH_SHIFT_ROUND_DEGREE, SWEEP_AUTH_UNIFIED_ROUND_DEGREE,
-};
-pub use auth_unified_v2::{
-    prove_auth_shift, prove_auth_unified, verify_auth_shift, verify_auth_unified,
-    AuthKillShotProof, AuthShiftProof, AuthShiftReduction, AuthUnifiedProof, AuthUnifiedReduction,
-    AUTH_SHIFT_ROUND_DEGREE, AUTH_UNIFIED_ROUND_DEGREE,
 };
 pub use batch_eval::{
     prove_batch_eval, prove_multi_batch_eval, verify_batch_eval, verify_multi_batch_eval,
@@ -150,6 +94,20 @@ pub use merkle_unified::{
 pub use mle_layout::{pack_column, PermColumn, PermMle, N_PERM_CELLS, N_PERM_VARS};
 pub use oracle::{evaluate_spine, SpineWitness};
 pub use oracle_sweep::{evaluate_sweep_spine, SweepSpineSlotState, SweepSpineWitness};
+pub use owner_auth::{
+    build_owner_auth_unified_from_inputs, build_owner_auth_unified_mle,
+    compute_owner_auth_boundary, discharge_owner_auth_reductions_native, evaluate_owner_auth,
+    owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
+    owner_auth_public_from_body, owner_auth_public_from_statement, prove_owner_auth_killshot,
+    prove_owner_auth_killshot_from_mle, verify_owner_auth_killshot, OwnerAuthBoundaryProof,
+    OwnerAuthBoundaryReduction, OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthKillShotProof,
+    OwnerAuthKillShotReductions, OwnerAuthLayout, OwnerAuthLayoutError, OwnerAuthProofKillShot,
+    OwnerAuthPublicInputs, OwnerAuthShiftProof, OwnerAuthShiftReduction, OwnerAuthSlotDescriptor,
+    OwnerAuthSlotRole, OwnerAuthSlotState, OwnerAuthStatementError, OwnerAuthUnifiedMle,
+    OwnerAuthUnifiedProof, OwnerAuthUnifiedReduction, OwnerAuthWitness, OWNER_AUTH_MAX_OWNERS,
+    OWNER_AUTH_MIN_OWNERS, OWNER_AUTH_PIN_LANES, OWNER_AUTH_SHIFT_ROUND_DEGREE,
+    OWNER_AUTH_SLOTS_PER_OWNER, OWNER_AUTH_STATE_ROUND_DEGREE, OWNER_AUTH_UNIFIED_ROUND_DEGREE,
+};
 pub use spine_degree7::{
     prove_spine_degree7, verify_spine_degree7, SpineD7Proof, SpineD7Reduction,
     SPINE_D7_ROUND_DEGREE,
@@ -206,9 +164,11 @@ pub use spine_unified_sweep::{
     N_SWEEP_UNIFIED_WITNESS_CLAIMS, SWEEP_SPINE_SHIFT_ROUND_DEGREE,
     SWEEP_SPINE_UNIFIED_ROUND_DEGREE,
 };
+pub use sweep_spine_statement::{sweep_spine_inputs_from_body, SweepSpineStatementError};
 pub use wallet_authorization::{
     max_authorization_bytes_for_shape, prove_wallet_authorization, verify_wallet_authorization,
-    AuthorizationDecodeError, AuthorizationEncodeError, ProveAuthorizationError,
-    VerifyAuthorizationError, WalletAuthorizationBundle, MAX_AUTHORIZATION_BUNDLE_BYTES,
-    MAX_STANDARD_AUTHORIZATION_BYTES, MAX_SWEEP_AUTHORIZATION_BYTES,
+    verify_wallet_authorization_proof, AuthorizationDecodeError, AuthorizationEncodeError,
+    ProveAuthorizationError, VerifyAuthorizationError, WalletAuthorizationBundle,
+    MAX_AUTHORIZATION_BUNDLE_BYTES, MAX_STANDARD_AUTHORIZATION_BYTES,
+    MAX_SWEEP_AUTHORIZATION_BYTES,
 };

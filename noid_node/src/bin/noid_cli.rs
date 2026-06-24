@@ -11,6 +11,8 @@
 //!   noid-cli send <addr> 10.5  — send 10.5 NOID
 //!   noid-cli help              — full command list
 
+#![allow(clippy::format_in_format_args, clippy::print_literal)]
+
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -33,9 +35,9 @@ const WHT: &str = "\x1b[97m"; // bright white value
 fn is_tty() -> bool {
     // Simple heuristic: if TERM is set and it's not "dumb", we're likely in a TTY.
     // This avoids adding libc/isatty dep.
-    std::env::var("TERM").map_or(false, |t| t != "dumb")
-        && !std::env::var("NO_COLOR").is_ok()
-        && !std::env::var("CI").is_ok()
+    std::env::var("TERM").is_ok_and(|t| t != "dumb")
+        && std::env::var("NO_COLOR").is_err()
+        && std::env::var("CI").is_err()
 }
 
 /// Return coloured string only when outputting to a terminal.
@@ -174,14 +176,6 @@ enum Command {
 
     /// Confirmed transaction info by hash.
     Tx {
-        /// Transaction body hash (64-char hex).
-        #[arg(value_name = "TX_HASH")]
-        txhash: String,
-    },
-
-    /// Check if a transaction hash is in the nullifier set (i.e. spent).
-    #[command(name = "is-nullifier")]
-    IsNullifier {
         /// Transaction body hash (64-char hex).
         #[arg(value_name = "TX_HASH")]
         txhash: String,
@@ -409,7 +403,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Slot { index } => cmd_slot(&ctx, *index).await,
         Command::UtxosOf { address } => cmd_utxos_of(&ctx, address).await,
         Command::Tx { txhash } => cmd_tx(&ctx, txhash).await,
-        Command::IsNullifier { txhash } => cmd_is_nullifier(&ctx, txhash).await,
         Command::State => cmd_state(&ctx).await,
         Command::Mining => cmd_mining(&ctx).await,
         Command::Peers => cmd_peers(&ctx).await,
@@ -483,11 +476,10 @@ fn print_error(msg: &str) {
         || msg.contains("ConnectError")
         || msg.contains("Node is not responding")
     {
-        format!(
-            "Node is not responding.\n\
+        "Node is not responding.\n\
              Is the paranoid daemon running?  Try: paranoid --mine\n\
              Default RPC: http://127.0.0.1:9401  (override with --rpc)"
-        )
+            .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
         // Extract amounts from error if possible
         msg.replace("InsufficientFunds", "Insufficient funds")
@@ -497,7 +489,7 @@ fn print_error(msg: &str) {
         || msg.contains("invalid address")
         || msg.contains("WrongHrp")
     {
-        format!("Invalid address.\nUse a bech32m address (noid1…) or 64-char hex.\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5")
+        "Invalid address.\nUse a bech32m address (noid1…) or 64-char hex.\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
     } else {
         msg.to_string()
     };
@@ -563,18 +555,14 @@ async fn cmd_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let slots = info["active_slot_count"].as_u64().unwrap_or(0);
     let log_slots = info["log_slots"].as_u64().unwrap_or(0);
     let capacity = 1u64 << log_slots.min(63);
-    let fill_pct = if capacity > 0 {
-        slots * 100 / capacity
-    } else {
-        0
-    };
+    let fill_pct = slots.saturating_mul(100).checked_div(capacity).unwrap_or(0);
 
     // Count leading zeroes in difficulty target for human difficulty reading.
     let diff_bits = diff.chars().take_while(|&c| c == '0').count() * 4; // each hex '0' = 4 zero bits
 
     section("Paranoid node status");
     kv("Height", &height.to_string());
-    kv("Best hash", &ctx.h(best_hash));
+    kv("Best hash", ctx.h(best_hash));
     kv2(
         "Difficulty",
         &format!("{diff_bits} leading zeros"),
@@ -620,7 +608,7 @@ async fn cmd_block(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
     );
     kv2(
         "Header (first 276B)",
-        &ctx.h(&hex[..hex.len().min(64)]),
+        ctx.h(&hex[..hex.len().min(64)]),
         "(raw hex)",
     );
     println!();
@@ -727,7 +715,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
             &format!("{} NOID", noid_str(value)),
             &format!("({value} μNOID)"),
         );
-        kv("Owner", &ctx.h(owner));
+        kv("Owner", ctx.h(owner));
     }
 
     Ok(())
@@ -854,24 +842,6 @@ async fn cmd_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
         "position",
         &result["tx_position"].as_u64().unwrap_or(0).to_string(),
     );
-    Ok(())
-}
-
-async fn cmd_is_nullifier(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
-    let result = rpc(ctx, "isNullifier", &[txhash.into()])
-        .await
-        .context("isNullifier")?;
-    if ctx.json {
-        return print_json(&result);
-    }
-    let spent = result.as_bool().unwrap_or(false);
-    section("Nullifier check");
-    kv("tx_hash", txhash);
-    if spent {
-        kv("status", &c!(YLW, "spent (in nullifier set)"));
-    } else {
-        kv("status", &c!(GRN, "not spent"));
-    }
     Ok(())
 }
 
@@ -1129,7 +1099,7 @@ async fn cmd_epoch(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     let hash = result.as_str().unwrap_or("?");
     section("Epoch anchor");
-    kv("Hash", &ctx.h(hash));
+    kv("Hash", ctx.h(hash));
     println!();
     println!(
         "  {} Wallets use this hash as epoch_anchor when building transaction proofs.",
@@ -1652,7 +1622,7 @@ async fn cmd_send(
                 &format!("({actual_fee} μNOID){auto_tag}"),
             );
             if split_count > 1 {
-                kv("Primary TX", &ctx.h(tx_hash));
+                kv("Primary TX", ctx.h(tx_hash));
                 for (i, h) in tx_hashes.iter().enumerate() {
                     if let Some(hs) = h.as_str() {
                         let shape = tx_shapes.get(i).and_then(|s| s.as_str()).unwrap_or("?");
@@ -1662,11 +1632,11 @@ async fn cmd_send(
                         } else {
                             format!("TX #{} ({shape}, fee {} NOID)", i + 1, noid_str(fee))
                         };
-                        kv(&label, &ctx.h(hs));
+                        kv(&label, ctx.h(hs));
                     }
                 }
             } else {
-                kv("TX hash", &ctx.h(tx_hash));
+                kv("TX hash", ctx.h(tx_hash));
             }
             println!();
             println!(
@@ -2018,20 +1988,17 @@ async fn cmd_consolidate(
 
                 let _ = rpc(ctx, "walletScan", &[]).await;
 
-                match rpc(ctx, "walletGetBalance", &[]).await {
-                    Ok(bal) => {
-                        let utxo_count = bal["utxo_count"].as_u64().unwrap_or(0);
-                        let micro = bal["total_micronoid"].as_u64().unwrap_or(0);
-                        println!(
-                            "  UTXOs remaining: {utxo_count}  Balance: {} NOID",
-                            noid_str(micro)
-                        );
-                        if utxo_count <= 1 {
-                            ok_msg("Consolidation complete — wallet has 1 UTXO.");
-                            break;
-                        }
+                if let Ok(bal) = rpc(ctx, "walletGetBalance", &[]).await {
+                    let utxo_count = bal["utxo_count"].as_u64().unwrap_or(0);
+                    let micro = bal["total_micronoid"].as_u64().unwrap_or(0);
+                    println!(
+                        "  UTXOs remaining: {utxo_count}  Balance: {} NOID",
+                        noid_str(micro)
+                    );
+                    if utxo_count <= 1 {
+                        ok_msg("Consolidation complete — wallet has 1 UTXO.");
+                        break;
                     }
-                    Err(_) => {}
                 }
             }
             Err(e) => {

@@ -204,15 +204,15 @@ mod tests {
         let circuit = MerkleCircuit::build();
         let mut current = [0x42u8; 32];
         let mut siblings_raw = [[0u8; 32]; MAX_MERKLE_DEPTH];
-        for i in 0..MAX_MERKLE_DEPTH {
-            siblings_raw[i] = [(i as u8).wrapping_add(1); 32];
-            current = compress(&current, &siblings_raw[i]);
+        for (i, sibling) in siblings_raw.iter_mut().enumerate().take(MAX_MERKLE_DEPTH) {
+            *sibling = [(i as u8).wrapping_add(1); 32];
+            current = compress(&current, sibling);
         }
 
         let leaf_fields = digest_to_fields(&[0x42u8; 32]);
         let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
-        for i in 0..MAX_MERKLE_DEPTH {
-            siblings[i] = digest_to_fields(&siblings_raw[i]);
+        for (i, sibling) in siblings_raw.iter().enumerate().take(MAX_MERKLE_DEPTH) {
+            siblings[i] = digest_to_fields(sibling);
         }
         let inputs = MerklePathInputs {
             leaf: leaf_fields,

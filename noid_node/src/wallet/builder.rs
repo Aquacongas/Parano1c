@@ -9,18 +9,7 @@
 //! CPU-heavy proving work (via [`build_and_prove_tx`]), so the wallet mutex
 //! is held for as short a time as possible.
 //!
-//! # Auth-tag ordering
-//!
-//! Auth tags are computed AFTER the body hash, because they are NOT part of
-//! the body hash input. The correct order is:
-//!
-//! 1. Build inputs with `AuthTag([0; 32])` placeholders.
-//! 2. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`
-//! 3. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`
-//! 4. Fill auth tags in place.
-//! 5. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
-
-use noid_poseidon2b::primitives::{hash_auth_tag, Address, AuthTag, SpendSecret};
+use noid_poseidon2b::primitives::{Address, SpendSecret};
 use noid_tx::{
     body_hash::hash_tx_body_for_shape,
     claims::compute_claims_commitment,
@@ -91,7 +80,7 @@ pub enum BuildError {
 /// - [`BuildError::InsufficientFunds`] — confirmed balance is below
 ///   `amount_micronoid + fee_micronoid`.
 /// - [`BuildError::TooManyInputs`] — coin selection required more than
-///   [`TxShape::Sweep25x2`] UTXOs to cover the target amount.
+///   the largest currently admitted transaction proof shape to cover the target amount.
 /// - [`BuildError::NotEnoughSlots`] — `slot_hints` did not supply enough
 ///   free-slot indices for all outputs (1 for payment, +1 if change > 0).
 pub fn extract_build_data(
@@ -143,7 +132,7 @@ pub fn extract_build_data(
     }
 
     // Clone UTXOs and derive secrets while holding the wallet lock.
-    let selected_utxos: Vec<WalletUtxo> = selected_refs.into_iter().map(|u| u.clone()).collect();
+    let selected_utxos: Vec<WalletUtxo> = selected_refs.into_iter().cloned().collect();
 
     let spend_secrets: Vec<SpendSecret> = selected_utxos
         .iter()
@@ -166,10 +155,10 @@ pub fn extract_build_data(
 
 /// Build `TxBuildData` for a consolidation transaction.
 ///
-/// Consolidation selects the **smallest** UTXOs (up to [`TxShape::Sweep25x2`]'s
-/// input limit) and sends their total value minus fee back to the wallet's own
-/// address. It uses `Standard4x8` for 1..4 selected inputs and `Sweep25x2` for
-/// 5..25 selected inputs.
+/// Consolidation selects the **smallest** UTXOs, capped by the largest current
+/// transaction proof shape, and sends their total value minus fee back to the
+/// wallet's own address. It uses `TxShape::Standard4x8` for 1..4 selected inputs
+/// and `TxShape::Sweep25x2` for 5..25 selected inputs.
 ///
 /// Unlike `extract_build_data` (which uses largest-first greedy selection to
 /// cover a target amount), this function explicitly selects the smallest UTXOs
@@ -273,16 +262,13 @@ pub fn extract_consolidate_data(
 ///
 /// 1. Build outputs: payment output at `slot_hints[0]`; change output at
 ///    `slot_hints[1]` if `change_amount > 0`.
-/// 2. Build live inputs with `AuthTag([0; 32])` placeholders.
+/// 2. Build live inputs.
 /// 3. Pad inputs to the selected shape with `TxInput::dummy()` (`valid = false`).
 /// 4. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`.
-///    Auth tags are intentionally excluded from the body hash.
-/// 5. For each live input: `auth_tag = hash_auth_tag(spend_secret, tx_body_hash)`.
-/// 6. Fill real auth tags into the live input slots.
-/// 7. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
+/// 5. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
 ///    (secrets are consumed and zeroized inside).
-/// 8. `claims_commitment = compute_claims_commitment(inputs, outputs)`.
-/// 9. Assemble and wire-encode the [`TxIntent`].
+/// 6. `claims_commitment = compute_claims_commitment(inputs, outputs)`.
+/// 7. Assemble and wire-encode the [`TxIntent`].
 ///
 /// # Returns
 ///
@@ -322,10 +308,8 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Steps 2–3: Build live inputs with dummy auth tags; pad to selected shape.
+    // Steps 2–3: Build live inputs; pad to selected shape.
     // -----------------------------------------------------------------------
-    let n_live = data.selected_utxos.len();
-
     let mut inputs: Vec<TxInput> = data
         .selected_utxos
         .iter()
@@ -337,7 +321,6 @@ pub fn build_and_prove_tx(
             // Copy secret bytes into the input witness slot.
             // The original in data.spend_secrets is still live for prove_tx.
             spend_secret: SpendSecret(secret.0),
-            auth_tag: AuthTag([0u8; 32]), // placeholder — filled after body hash
             valid: true,
         })
         .collect();
@@ -347,7 +330,7 @@ pub fn build_and_prove_tx(
     }
 
     // -----------------------------------------------------------------------
-    // Compute the body hash. Auth tags are NOT inputs to this hash.
+    // Compute the body hash.
     // -----------------------------------------------------------------------
     let tx_body_hash = hash_tx_body_for_shape(
         data.shape,
@@ -357,13 +340,6 @@ pub fn build_and_prove_tx(
         &outputs,
         false,
     );
-
-    // -----------------------------------------------------------------------
-    // Steps 5–6: Derive real auth tags and fill them into the live input slots.
-    // -----------------------------------------------------------------------
-    for (i, secret) in data.spend_secrets.iter().enumerate().take(n_live) {
-        inputs[i].auth_tag = hash_auth_tag(secret, &tx_body_hash);
-    }
 
     // -----------------------------------------------------------------------
     // Assemble TxBody and run wallet authorization generation.
@@ -490,6 +466,7 @@ mod tests {
 
         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
             .expect("decode wallet authorization bundle");
-        assert_eq!(bundle.shape(), TxShape::Sweep25x2);
+        noid_gkr::verify_wallet_authorization(&intent.tx_body, &bundle)
+            .expect("verify sweep authorization bundle");
     }
 }

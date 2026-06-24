@@ -4,12 +4,12 @@
 //! `ChainContext` — the unified chain state required to validate and apply blocks.
 //!
 //! A full node needs more than just the current UTXO state to validate a new block:
-//! it needs recent block headers (for timestamp MTP and ASERT anchor), the nullifier
-//! set, undo logs (for reorg), and the running tip info.
+//! it needs recent block headers (for timestamp MTP and ASERT anchor), undo logs
+//! (for reorg), and the running tip info.
 //!
 //! `ChainContext` bundles all of this into one struct. It is the RAM/in-memory
 //! chain context used by tests and non-live utilities. The live full node uses
-//! `MdbxChainContext::apply_next_block`, which verifies full block proofs before
+//! `MdbxChainContext::apply_next_block`, which verifies minimal block proofs before
 //! committing the proven state delta to durable storage.
 //!
 //! # Scope
@@ -30,9 +30,7 @@ use crate::consensus::{
     validation::{validate_block_consensus, AnchorInfo},
     ConsensusError,
 };
-use crate::nullifier::NullifierSet;
 use crate::state::ChainState;
-use noid_poseidon2b::primitives::TxBodyHash;
 
 /// In-memory chain context for tests and non-live utilities.
 ///
@@ -43,10 +41,7 @@ pub struct ChainContext {
     /// 276 bytes × N blocks (≈ 1.5 GB after 10 years at 1 block/min).
     pub headers: HashMap<u64, BlockHeader>,
 
-    /// Rolling nullifier window covering the last `ANCHOR_DEPTH` blocks.
-    pub nullifiers: NullifierSet,
-
-    /// Current UTXO state (FRI-committed slot array).
+    /// Current exact UTXO/ReuseGuard chain state.
     pub state: ChainState,
 
     /// Compact undo logs for the last `UNDO_RETENTION_DEPTH` blocks.
@@ -77,12 +72,11 @@ impl ChainContext {
 
         let mut headers = HashMap::new();
         let genesis_hash = full_block_hash(&genesis);
-        headers.insert(0u64, genesis.clone());
+        headers.insert(0u64, genesis);
 
-        // Genesis: no txs, no undo log, no nullifiers.
+        // Genesis: no txs and no undo log.
         Self {
             headers,
-            nullifiers: NullifierSet::new(),
             state,
             undo_logs: HashMap::new(),
             tip_height: 0,
@@ -143,12 +137,12 @@ impl ChainContext {
     /// sequential consensus interpreter.
     ///
     /// This is not the live full-node production path; it does not verify a
-    /// `BlockProof` or `BlockStateBindingAir`.
+    /// `BlockProof`.
     ///
     /// On success:
     /// - `state` is updated to the post-block UTXO state
     /// - the block's header is stored in `headers`
-    /// - the nullifier set is updated
+    /// - the ReuseGuard is updated
     /// - a new undo log is appended
     /// - old undo logs (> UNDO_RETENTION_DEPTH blocks old) are pruned
     /// - `tip_height` and `tip_hash` are updated
@@ -161,7 +155,7 @@ impl ChainContext {
         block: &Block,
         local_time: u64,
     ) -> Result<[u8; 32], ConsensusError> {
-        let parent = self.tip_header().clone();
+        let parent = *self.tip_header();
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
@@ -179,7 +173,6 @@ impl ChainContext {
             &prev_active_counts,
             local_time,
             &anchor,
-            &self.nullifiers,
             &mut self.state,
         )?;
 
@@ -187,13 +180,7 @@ impl ChainContext {
         let block_hash = full_block_hash(&block.header);
 
         // Store header (forever).
-        self.headers
-            .insert(block.header.height, block.header.clone());
-
-        // Update nullifier set.
-        let tx_hashes: Vec<TxBodyHash> =
-            block.transactions.iter().map(|t| t.tx_body_hash).collect();
-        self.nullifiers.insert_block(&tx_hashes);
+        self.headers.insert(block.header.height, block.header);
 
         // Store undo log keyed by height; prune old ones beyond UNDO_RETENTION_DEPTH.
         self.undo_logs.insert(block.header.height, undo);
@@ -231,7 +218,6 @@ impl ChainContext {
 
         Self {
             headers,
-            nullifiers: crate::nullifier::NullifierSet::new(),
             state,
             undo_logs: std::collections::HashMap::new(),
             tip_height: 0,
@@ -261,7 +247,7 @@ mod tests {
     use noid_poseidon2b::primitives::Address;
 
     fn build_empty_block_on(ctx: &mut ChainContext) -> Block {
-        let parent = ctx.tip_header().clone();
+        let parent = *ctx.tip_header();
         let mut state_snap = ctx.state.clone();
         let new_root = state_snap.state_root();
 
@@ -293,7 +279,6 @@ mod tests {
         let ctx = ChainContext::init_from_genesis();
         assert_eq!(ctx.tip_height, 0);
         assert_eq!(ctx.header_count(), 1);
-        assert_eq!(ctx.nullifiers.window_len(), 0);
         assert_eq!(ctx.undo_logs.len(), 0);
         // Tip hash must equal full_block_hash(genesis_header()).
         let genesis = genesis_header();
@@ -372,6 +357,7 @@ mod tests {
 
     /// Ensure GENESIS_TIMESTAMP is a reasonable value (sanity check on the constant).
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn genesis_timestamp_sanity() {
         assert!(GENESIS_TIMESTAMP > 1_700_000_000);
     }

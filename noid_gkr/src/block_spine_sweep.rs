@@ -84,11 +84,11 @@ fn build_block_spine_mle_from_state_ins(
                     m
                 }
             };
-            for elem in 0..STATE_SIZE {
+            for (elem, active) in active_mask.iter().enumerate().take(STATE_SIZE) {
                 let idx = pack_index_dyn(slot, r, elem);
                 mle.s_in[idx] = witness.sin[r][elem];
                 mle.s_out[idx] = witness.sout[r][elem];
-                mle.sigma[idx] = if active_mask[elem] {
+                mle.sigma[idx] = if *active {
                     Block128::ONE
                 } else {
                     Block128::ZERO

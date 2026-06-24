@@ -8,7 +8,7 @@
 //! spec-level maximum. Every 32-byte digest is a passthrough byte copy;
 //! `value` is 8 LE bytes; `slot_index` is 4 LE bytes.
 
-use noid_poseidon2b::primitives::{Address, AuthTag, Digest, SpendSecret, TxBodyHash};
+use noid_poseidon2b::primitives::{Address, Digest, SpendSecret, TxBodyHash};
 
 use crate::public::PublicInputs;
 use crate::types::{Transaction, TxBody, TxInput, TxOutput, TxShape};
@@ -110,23 +110,24 @@ fn take_shape(src: &mut &[u8]) -> Result<TxShape, WireError> {
 //
 //   FULL  (local wallet storage only — NEVER sent over the network):
 //     slot_index (4) + value (8) + owner (32) + spend_secret (32)
-//     + auth_tag (32) + valid (1) = 109 bytes
+//     + valid (1) = 77 bytes
 //
 //   PUBLIC (network wire format — spend_secret omitted):
-//     slot_index (4) + value (8) + owner (32) + auth_tag (32) + valid (1) = 77 bytes
+//     slot_index (4) + value (8) + owner (32) + valid (1) = 45 bytes
 //
 // The full format is used internally by the wallet to persist its own
 // transaction records. The public format is what goes into TxIntent and
 // is broadcast to the mempool. Full nodes never need spend_secret —
-// they only read (slot_index, value, owner) for state binding and
-// (auth_tag) is already committed via the WalletAuthorizationBundle.
+// they only read (slot_index, value, owner) for state verification. The
+// WalletAuthorizationBundle binds authorization to the canonical transaction
+// statement transcript.
 // ---------------------------------------------------------------------------
 
 /// Wire size of the FULL local format (includes spend_secret).
-pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 32 + 1;
+pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 1;
 
 /// Wire size of the PUBLIC network format (spend_secret omitted).
-pub const TX_INPUT_PUBLIC_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 1;
+pub const TX_INPUT_PUBLIC_WIRE_SIZE: usize = 4 + 8 + 32 + 1;
 
 impl TxInput {
     /// Encode with spend_secret included. **Local wallet storage only.**
@@ -136,7 +137,6 @@ impl TxInput {
         put_u64(buf, self.value);
         put_digest(buf, &self.owner.0);
         put_digest(buf, &self.spend_secret.0);
-        put_digest(buf, &self.auth_tag.0);
         put_bool(buf, self.valid);
     }
 
@@ -146,7 +146,6 @@ impl TxInput {
         put_u32(buf, self.slot_index);
         put_u64(buf, self.value);
         put_digest(buf, &self.owner.0);
-        put_digest(buf, &self.auth_tag.0);
         put_bool(buf, self.valid);
     }
 
@@ -156,14 +155,12 @@ impl TxInput {
         let value = take_u64(src)?;
         let owner = Address(take_digest(src)?);
         let spend_secret = SpendSecret(take_digest(src)?);
-        let auth_tag = AuthTag(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
             slot_index,
             value,
             owner,
             spend_secret,
-            auth_tag,
             valid,
         })
     }
@@ -173,14 +170,12 @@ impl TxInput {
         let slot_index = take_u32(src)?;
         let value = take_u64(src)?;
         let owner = Address(take_digest(src)?);
-        let auth_tag = AuthTag(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
             slot_index,
             value,
             owner,
             spend_secret: SpendSecret([0u8; 32]),
-            auth_tag,
             valid,
         })
     }
@@ -544,7 +539,7 @@ impl PublicInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn mk_output(seed: u8) -> TxOutput {
         TxOutput {
@@ -561,7 +556,6 @@ mod tests {
             value: (seed as u64) * 11,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
-            auth_tag: AuthTag([seed ^ 0x55; 32]),
             valid: true,
         }
     }

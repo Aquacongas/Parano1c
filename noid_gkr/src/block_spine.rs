@@ -266,11 +266,11 @@ impl BlockSpineMle {
                     m
                 }
             };
-            for elem in 0..STATE_SIZE {
+            for (elem, active) in active_mask.iter().enumerate().take(STATE_SIZE) {
                 let idx = pack_index_dyn(slot, r, elem);
                 self.s_in[idx] = witness.sin[r][elem];
                 self.s_out[idx] = witness.sout[r][elem];
-                self.sigma[idx] = if active_mask[elem] {
+                self.sigma[idx] = if *active {
                     Block128::ONE
                 } else {
                     Block128::ZERO
@@ -482,9 +482,14 @@ fn fast_eval_block_schedules(
     let mut mds_inner = [Block128::ZERO; STATE_SIZE];
     let mut sigma_round_sum = [Block128::ZERO; STATE_SIZE];
 
-    for round in 1..ROUND_LIMIT.min(N_ROUNDS + 1) {
+    for (round, eq_r) in eq_round_r
+        .iter()
+        .copied()
+        .enumerate()
+        .take(ROUND_LIMIT.min(N_ROUNDS + 1))
+        .skip(1)
+    {
         let prev = round - 1; // prev_round(round) — always < N_ROUNDS
-        let eq_r = eq_round_r[round];
 
         for elem in 0..STATE_SIZE {
             let eq_re = eq_r * eq_elem[elem];
@@ -499,15 +504,15 @@ fn fast_eval_block_schedules(
             }
 
             // mds_lane_dec[j]: mds_coeff(prev, elem, j) for each output lane j
-            for j in 0..STATE_SIZE {
-                mds_inner[j] += eq_re * mds_coeff_dyn(prev, elem, j);
+            for (j, inner) in mds_inner.iter_mut().enumerate().take(STATE_SIZE) {
+                *inner += eq_re * mds_coeff_dyn(prev, elem, j);
             }
         }
 
         // sigma_lane_dec[j]: σ(prev, j) × eq_round[round] × Σ_e eq_elem[e]
         // Σ_e eq_elem[e] = 1 (sum over all 2^ELEM_BITS Boolean vertices = 1)
-        for j in 0..STATE_SIZE {
-            sigma_round_sum[j] += eq_r * sigma_at(prev, j);
+        for (j, sum) in sigma_round_sum.iter_mut().enumerate().take(STATE_SIZE) {
+            *sum += eq_r * sigma_at(prev, j);
         }
     }
 
@@ -1282,9 +1287,9 @@ fn build_block_combined_weights(
 
     let eq_round_tab = vec_to_flat(&eq_ind_partial_eval::<Block128>(rp_round));
     let mut eq_round_at_inc = vec![0u128; n_rounds];
-    for round_x in 0..n_rounds {
+    for (round_x, slot) in eq_round_at_inc.iter_mut().enumerate().take(n_rounds) {
         let inc = (round_x + 1) & (n_rounds - 1);
-        eq_round_at_inc[round_x] = eq_round_tab[inc];
+        *slot = eq_round_tab[inc];
     }
 
     use rayon::prelude::*;
@@ -1368,9 +1373,9 @@ fn block_combined_weights_at_point(
     let n_rounds = 1usize << ROUND_BITS;
     let eq_rp_round_tab = eq_ind_partial_eval::<Block128>(rp_round);
     let mut tab = vec![Block128::ZERO; n_rounds];
-    for round_x in 0..n_rounds {
+    for (round_x, slot) in tab.iter_mut().enumerate().take(n_rounds) {
         let inc = (round_x + 1) & (n_rounds - 1);
-        tab[round_x] = eq_rp_round_tab[inc];
+        *slot = eq_rp_round_tab[inc];
     }
     let g_round = evaluate_slice(&tab, r2_round);
 

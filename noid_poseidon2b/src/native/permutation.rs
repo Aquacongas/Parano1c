@@ -105,32 +105,32 @@ fn flat_tables() -> &'static FlatTables {
 #[inline(always)]
 fn apply_mds_full_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
-    for i in 0..STATE_SIZE {
+    for (i, state_i) in state.iter_mut().enumerate() {
         let mut out = 0u128;
-        for j in 0..STATE_SIZE {
+        for (j, input_j) in input.iter().enumerate() {
             if tables.mds_full_is_one[i][j] {
-                out ^= input[j];
+                out ^= *input_j;
             } else {
-                out ^= clmul_gcm(input[j], tables.mds_full[i][j]);
+                out ^= clmul_gcm(*input_j, tables.mds_full[i][j]);
             }
         }
-        state[i] = out;
+        *state_i = out;
     }
 }
 
 #[inline(always)]
 fn apply_mds_partial_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
     let input = *state;
-    for i in 0..STATE_SIZE {
+    for (i, state_i) in state.iter_mut().enumerate() {
         let mut out = 0u128;
-        for j in 0..STATE_SIZE {
+        for (j, input_j) in input.iter().enumerate() {
             if tables.mds_partial_is_one[i][j] {
-                out ^= input[j];
+                out ^= *input_j;
             } else {
-                out ^= clmul_gcm(input[j], tables.mds_partial[i][j]);
+                out ^= clmul_gcm(*input_j, tables.mds_partial[i][j]);
             }
         }
-        state[i] = out;
+        *state_i = out;
     }
 }
 
@@ -235,7 +235,7 @@ mod tests {
 
     fn permute_mut_tower_reference(state: &mut [Block128; STATE_SIZE]) {
         apply_mds_full_tower_reference(state);
-        for r in 0..N_ROUNDS {
+        for (r, _) in ROUND_CONSTANTS[0].iter().enumerate() {
             if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {
                 for i in 0..STATE_SIZE {
                     state[i] += Block128::from(ROUND_CONSTANTS[i][r]);

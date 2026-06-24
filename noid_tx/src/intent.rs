@@ -200,7 +200,7 @@ impl TxIntent {
 mod tests {
     use super::*;
     use crate::types::{TxInput, TxOutput};
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn mk_body() -> TxBody {
         TxBody::standard(
@@ -211,7 +211,6 @@ mod tests {
                 value: 1000,
                 owner: Address([0x11; 32]),
                 spend_secret: SpendSecret([0x22; 32]),
-                auth_tag: AuthTag([0x33; 32]),
                 valid: true,
             }],
             vec![TxOutput {
@@ -235,7 +234,6 @@ mod tests {
                     value: 100 + i as u64,
                     owner: Address([0x20 + i as u8; 32]),
                     spend_secret: SpendSecret([0x40 + i as u8; 32]),
-                    auth_tag: AuthTag([0x60 + i as u8; 32]),
                     valid: true,
                 })
                 .collect(),

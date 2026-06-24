@@ -62,11 +62,6 @@ pub use airs::{
     SWEEP_BALANCE_TREE_BLOCKS, TXBODY_MERKLE_LAYOUT, TXBODY_MERKLE_N_PERMS,
     TXBODY_MERKLE_SLOT_ROWS, TXV_COL_OFFSET, TXV_LIVE_ROWS, TX_BODY_MERKLE_COL_OFFSET,
 };
-pub use airs::{
-    BlockStateBindingAir, BlockStateBindingClaim, BlockStateBindingLayout,
-    BlockStateBindingWitness, BLOCK_STATE_BINDING_LOG_ROWS, BLOCK_STATE_BINDING_LOG_SLOTS,
-    BLOCK_STATE_BINDING_MAX_SLOTS, BLOCK_STATE_BINDING_N_ROWS,
-};
 pub use gates::{
     emit_column_eq_at_next_row, emit_column_eq_at_row, emit_multi_row_selector, emit_public_cell,
     emit_row_selector, emit_rows_must_be_zero, multi_row_indicator_programme,
@@ -498,9 +493,9 @@ pub trait Constraint: Send + Sync {
     fn evaluate_flat(&self, frame: FlatEvalFrame) -> u128 {
         thread_local! {
             static LOCAL_TMP: std::cell::RefCell<Vec<Block128>> =
-                std::cell::RefCell::new(Vec::new());
+                const { std::cell::RefCell::new(Vec::new()) };
             static NEXT_TMP: std::cell::RefCell<Vec<Block128>> =
-                std::cell::RefCell::new(Vec::new());
+                const { std::cell::RefCell::new(Vec::new()) };
         }
         LOCAL_TMP.with(|local_ref| {
             NEXT_TMP.with(|next_ref| {

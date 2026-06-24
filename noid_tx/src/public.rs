@@ -9,7 +9,7 @@
 //!   claims_commitment)`.
 //!
 //! State roots (prev/new) are NOT part of per-tx public inputs.
-//! They live at block level in BlockStateBinding.
+//! They are bound at block level by the exact state transition proof.
 
 use noid_poseidon2b::primitives::{Digest, TxBodyHash};
 
@@ -38,8 +38,7 @@ pub struct PublicInputs {
     /// header. Absorbed into STARK transcript to bind circuit sizing.
     pub log_slots: u32,
     /// Binding commitment to all claimed slot values (inputs + outputs).
-    /// Bridges canonical TxLogic public inputs to BlockStateBinding: the miner opens the
-    /// same slots and verifies equality.
+    /// Bridges canonical TxLogic public inputs to the exact block transition surface.
     pub claims_commitment: Digest,
     /// Per-output activation booleans.
     pub is_activation: [bool; MAX_OUTPUTS],

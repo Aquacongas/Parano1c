@@ -4,8 +4,8 @@
 //! MDBX-backed persistent storage for the chain .
 //!
 //! `MdbxStore` owns the MDBX `Database` and provides methods for
-//! all persistent chain data: headers, nullifiers, undo logs, segments,
-//! recent blocks, and chain tip.
+//! all persistent chain data: headers, undo logs, segments, recent blocks,
+//! and chain tip.
 //!
 //! The core operation is `commit_block` which writes all block-related
 //! data in ONE atomic MDBX transaction (P.18 7-step protocol).
@@ -17,15 +17,15 @@ use noid_poseidon2b::primitives::TxBodyHash;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
-use crate::consensus::params::{
-    ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
-};
+use crate::consensus::params::UNDO_RETENTION_DEPTH;
+use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
-    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header, decode_segment,
-    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
-    encode_consensus_meta, encode_header, encode_segment, encode_state_meta, encode_tx_index_value,
+    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
+    decode_reuse_guard_buckets, decode_segment, decode_state_meta, decode_tx_index_value,
+    decode_undo_log, encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
+    encode_reuse_guard_buckets, encode_segment, encode_state_meta, encode_tx_index_value,
     encode_undo_log, u64_from_key, u64_key,
 };
 
@@ -37,29 +37,30 @@ const T_HASH_TO_HEIGHT: &str = "h2h";
 const T_CHAIN_TIP: &str = "tip";
 const T_CONSENSUS_META: &str = "consensus_meta";
 const T_CHAIN_WORK: &str = "chain_work";
-const T_NULLIFIERS: &str = "nullifiers";
-const T_NULLIFIER_BLOCKS: &str = "nul_blk";
 const T_UNDO_LOGS: &str = "undo";
 const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
+const T_REUSE_GUARD: &str = "reuse_guard";
 const T_RECENT_BLOCKS: &str = "recent";
 /// Recursive chain proof (~38 KB encoded, FOREVER). Key: KEY_REC. Value: raw proof bytes.
 const T_RECURSIVE_PROOF: &str = "rec_proof";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
-/// BlockProofs retained until finalized and covered by the stored recursive proof height.
+/// BlockProofs retained until finalized and covered by a real immutable checkpoint proof.
 /// Key: height (u64 LE). Value: bincode BlockProof bytes.
 const T_BLOCK_PROOFS: &str = "block_proofs";
-/// Public AuthGKR sidecars (retention = CONSENSUS_FINALITY_DEPTH). Key: height (u64 LE).
+/// Public AuthGKR sidecars retained with block bodies until checkpoint coverage.
+/// Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
-const N_TABLES: u64 = 16;
+const N_TABLES: u64 = 15;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
+const KEY_REUSE_GUARD: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_REC: &[u8] = &[0u8];
 const KEY_REC_HEIGHT: &[u8] = &[1u8];
@@ -156,7 +157,7 @@ impl MdbxStore {
         // Sizing rationale:
         //   min_size  = 4 MB  — enough for genesis + a few hundred blocks
         //   max_size  = 16 GB — full state at log_slots=32: ~768 MB segments
-        //                        + headers + nullifiers + undo logs + margin
+        //                        + headers + undo logs + margin
         //   growth_step = 64 MB — incremental growth to avoid excessive resize churn
         let rw = ReadWriteOptions {
             sync_mode: SyncMode::Durable,
@@ -181,11 +182,10 @@ impl MdbxStore {
             T_CHAIN_TIP,
             T_CONSENSUS_META,
             T_CHAIN_WORK,
-            T_NULLIFIERS,
-            T_NULLIFIER_BLOCKS,
             T_UNDO_LOGS,
             T_SEGMENTS,
             T_STATE_META,
+            T_REUSE_GUARD,
             T_RECENT_BLOCKS,
             T_RECURSIVE_PROOF,
             T_TX_INDEX,
@@ -230,7 +230,7 @@ impl MdbxStore {
         txn.put(
             &tbl,
             KEY_CONSENSUS_META,
-            &encode_consensus_meta(meta),
+            encode_consensus_meta(meta),
             WriteFlags::empty(),
         )?;
         txn.commit()?;
@@ -242,6 +242,15 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_STATE_META))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_META)?;
         Ok(raw.and_then(|b| decode_state_meta(&b)))
+    }
+
+    pub fn get_reuse_guard_buckets(
+        &self,
+    ) -> Result<Option<[GuardBucket; REUSE_GUARD_BUCKETS]>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_REUSE_GUARD))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_REUSE_GUARD)?;
+        Ok(raw.and_then(|b| decode_reuse_guard_buckets(&b)))
     }
 
     pub fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
@@ -273,7 +282,7 @@ impl MdbxStore {
     }
 
     /// Persist a historical header and its hash index without changing chain tip,
-    /// state metadata, undo logs, recent blocks, or nullifier data.
+    /// state metadata, undo logs, or recent blocks.
     ///
     /// FIX1: snapshot candidate headers must not be written into this canonical
     /// table before full acceptance; public snapshot sync is fail-closed.
@@ -283,8 +292,8 @@ impl MdbxStore {
         let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
         txn.put(
             &hdr_tbl,
-            &u64_key(header.height),
-            &encode_header(header),
+            u64_key(header.height),
+            encode_header(header),
             WriteFlags::empty(),
         )?;
 
@@ -292,7 +301,7 @@ impl MdbxStore {
         txn.put(
             &h2h_tbl,
             hash.as_slice(),
-            &u64_key(header.height),
+            u64_key(header.height),
             WriteFlags::empty(),
         )?;
 
@@ -318,30 +327,6 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         Ok(txn.get(&tbl, &u64_key(height))?)
-    }
-
-    /// Read nullifier hashes for blocks in `[from_height, to_height]`, oldest first.
-    ///
-    /// Used on startup to rebuild the RAM `NullifierSet` from durable storage.
-    pub fn get_nullifier_blocks_range(
-        &self,
-        from_height: u64,
-        to_height: u64,
-    ) -> Result<Vec<(u64, Vec<TxBodyHash>)>, StoreError> {
-        let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_NULLIFIER_BLOCKS))?;
-        let mut result = Vec::new();
-        for h in from_height..=to_height {
-            let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(h))?;
-            if let Some(bytes) = raw {
-                let hashes: Vec<TxBodyHash> = bytes
-                    .chunks_exact(32)
-                    .map(|chunk| TxBodyHash(chunk.try_into().expect("chunk is 32 bytes")))
-                    .collect();
-                result.push((h, hashes));
-            }
-        }
-        Ok(result)
     }
 
     /// Read the persisted recursive chain proof (~38 KB encoded), if present.
@@ -376,17 +361,17 @@ impl MdbxStore {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
         txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
-        txn.put(&tbl, KEY_REC_HEIGHT, &u64_key(height), WriteFlags::empty())?;
+        txn.put(&tbl, KEY_REC_HEIGHT, u64_key(height), WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
 
     /// Store a serialised `BlockProof` for `height`.
-    /// Pruned by `prune_after_commit` only after both finality and recursive-proof coverage.
+    /// Retained until a real immutable checkpoint proof covers `height`.
     pub fn put_block_proof(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
-        txn.put(&tbl, &u64_key(height), bytes, WriteFlags::empty())?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
@@ -400,11 +385,11 @@ impl MdbxStore {
     }
 
     /// Store a serialised `BlockAuthSidecar` for `height`.
-    /// Automatically pruned after `CONSENSUS_FINALITY_DEPTH` blocks by `prune_after_commit`.
+    /// Retained with the block body and `BlockProof` until checkpoint coverage.
     pub fn put_block_auth_sidecar(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
-        txn.put(&tbl, &u64_key(height), bytes, WriteFlags::empty())?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
@@ -489,31 +474,31 @@ impl MdbxStore {
         Ok(())
     }
 
-    /// Populate T_TX_INDEX from snapshot nullifier_blocks.
+    /// Populate T_TX_INDEX from snapshot tx hash blocks.
     ///
     /// Called after `apply_state_snapshot` so that `getTx` works for the blocks
-    /// covered by the snapshot (ANCHOR_DEPTH window). Without this, T_TX_INDEX is
+    /// covered by the snapshot. Without this, T_TX_INDEX is
     /// empty on freshly-snapshotted nodes and `getTx` returns null for recent history.
     ///
-    /// `start_height`: the block height of `nullifier_blocks[0]`.
-    /// `nullifier_blocks[i][j]`: tx_body_hash at position j in block start_height+i.
-    pub fn rebuild_tx_index_from_nullifier_blocks(
+    /// `start_height`: the block height of `tx_hash_blocks[0]`.
+    /// `tx_hash_blocks[i][j]`: tx_body_hash at position j in block start_height+i.
+    pub fn rebuild_tx_index_from_tx_hash_blocks(
         &self,
-        nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
+        tx_hash_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
         start_height: u64,
     ) -> Result<(), StoreError> {
-        if nullifier_blocks.is_empty() {
+        if tx_hash_blocks.is_empty() {
             return Ok(());
         }
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_TX_INDEX))?;
-        for (i, block_hashes) in nullifier_blocks.iter().enumerate() {
+        for (i, block_hashes) in tx_hash_blocks.iter().enumerate() {
             let height = start_height + i as u64;
             for (pos, hash) in block_hashes.iter().enumerate() {
                 txn.put(
                     &tbl,
                     hash.0.as_slice(),
-                    &encode_tx_index_value(height, pos as u32),
+                    encode_tx_index_value(height, pos as u32),
                     libmdbx::WriteFlags::empty(),
                 )?;
             }
@@ -564,21 +549,21 @@ impl MdbxStore {
     /// 5. Write exact cumulative chainwork at this height
     /// 6. Write state_meta (log_slots, active_slot_count, alloc_counter)
     /// 7. Write BlockUndoLog
-    /// 8. Write nullifier hashes for this block; write recent_block bytes
+    /// 8. Write recent_block bytes
     ///
     /// After commit (non-atomic, re-runnable):
     ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH
-    ///   - Prune old recent_blocks beyond RECENT_BLOCK_RETENTION_DEPTH
-    ///   - Prune old auth sidecars beyond CONSENSUS_FINALITY_DEPTH
-    ///   - Prune old block_proofs beyond min(finality cutoff, recursive proof height)
-    ///   - Prune old nullifier entries beyond ANCHOR_DEPTH
+    ///   - Keep block bodies, BlockProofs, and Auth sidecars until a real
+    ///     immutable checkpoint proof covers them.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_block(
         &self,
         header: &BlockHeader,
         hash: &[u8; 32],
         undo_log: &BlockUndoLog,
         dirty_segments: &[(u16, u8, &SegmentColumns)], // (seg_id, effective_log_seg, cols)
-        nullifier_hashes: &[TxBodyHash],
+        reuse_guard_buckets: &[GuardBucket; REUSE_GUARD_BUCKETS],
+        tx_hashes: &[TxBodyHash],
         block_bytes: Option<&[u8]>, // None = don't store (DA already pruned)
         consensus_meta: &ConsensusMeta,
     ) -> Result<(), StoreError> {
@@ -591,10 +576,10 @@ impl MdbxStore {
             if segment_columns_empty(cols) {
                 // Do not persist fully-empty segments. This keeps disk and snapshot
                 // size proportional to live UTXOs, not historical touched ranges.
-                let _ = txn.del(&seg_tbl, &key, None);
+                let _ = txn.del(&seg_tbl, key, None);
             } else {
                 let val = encode_segment(cols, *eff_log);
-                txn.put(&seg_tbl, &key, &val, WriteFlags::empty())?;
+                txn.put(&seg_tbl, key, val, WriteFlags::empty())?;
             }
         }
 
@@ -602,8 +587,8 @@ impl MdbxStore {
         let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
         txn.put(
             &hdr_tbl,
-            &u64_key(header.height),
-            &encode_header(header),
+            u64_key(header.height),
+            encode_header(header),
             WriteFlags::empty(),
         )?;
 
@@ -612,7 +597,7 @@ impl MdbxStore {
         txn.put(
             &h2h_tbl,
             hash.as_slice(),
-            &u64_key(header.height),
+            u64_key(header.height),
             WriteFlags::empty(),
         )?;
 
@@ -624,7 +609,7 @@ impl MdbxStore {
         txn.put(
             &tip_tbl,
             KEY_TIP,
-            &encode_chain_tip(header.height, hash),
+            encode_chain_tip(header.height, hash),
             WriteFlags::empty(),
         )?;
 
@@ -632,7 +617,7 @@ impl MdbxStore {
         txn.put(
             &consensus_tbl,
             KEY_CONSENSUS_META,
-            &encode_consensus_meta(consensus_meta),
+            encode_consensus_meta(consensus_meta),
             WriteFlags::empty(),
         )?;
 
@@ -640,8 +625,8 @@ impl MdbxStore {
         let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
         txn.put(
             &work_tbl,
-            &u64_key(header.height),
-            &encode_chain_work(&consensus_meta.cumulative_chainwork),
+            u64_key(header.height),
+            encode_chain_work(&consensus_meta.cumulative_chainwork),
             WriteFlags::empty(),
         )?;
 
@@ -650,7 +635,7 @@ impl MdbxStore {
         txn.put(
             &meta_tbl,
             KEY_META,
-            &encode_state_meta(
+            encode_state_meta(
                 header.log_slots,
                 header.active_slot_count,
                 header.alloc_counter,
@@ -658,40 +643,29 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
+        let guard_tbl = txn.open_table(Some(T_REUSE_GUARD))?;
+        txn.put(
+            &guard_tbl,
+            KEY_REUSE_GUARD,
+            encode_reuse_guard_buckets(reuse_guard_buckets),
+            WriteFlags::empty(),
+        )?;
+
         // --- 7. BlockUndoLog ---
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
         txn.put(
             &undo_tbl,
-            &u64_key(header.height),
-            &encode_undo_log(undo_log),
+            u64_key(header.height),
+            encode_undo_log(undo_log),
             WriteFlags::empty(),
         )?;
 
-        // --- 8. Nullifiers + recent block ---
-        let nul_tbl = txn.open_table(Some(T_NULLIFIERS))?;
-        let nul_blk_tbl = txn.open_table(Some(T_NULLIFIER_BLOCKS))?;
-        // Store each tx nullifier mapped to this block's height.
-        for h in nullifier_hashes {
-            txn.put(&nul_tbl, &h.0, &u64_key(header.height), WriteFlags::empty())?;
-        }
-        // Store the block's full hash list (32 bytes × n) for bulk pruning later.
-        // Only write an entry when there are actual nullifiers to avoid polluting
-        // T_NULLIFIER_BLOCKS with empty entries for coinbase-only / empty blocks.
-        if !nullifier_hashes.is_empty() {
-            let hash_bytes: Vec<u8> = nullifier_hashes.iter().flat_map(|h| h.0).collect();
-            txn.put(
-                &nul_blk_tbl,
-                &u64_key(header.height),
-                &hash_bytes,
-                WriteFlags::empty(),
-            )?;
-        }
-
+        // --- 8. Recent block ---
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         if let Some(bytes) = block_bytes {
             txn.put(
                 &recent_tbl,
-                &u64_key(header.height),
+                u64_key(header.height),
                 bytes,
                 WriteFlags::empty(),
             )?;
@@ -701,11 +675,11 @@ impl MdbxStore {
         // Enables O(1) receipt lookup: given a tx_body_hash, find the block
         // and position to reconstruct the Merkle inclusion path.
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
-        for (pos, h) in nullifier_hashes.iter().enumerate() {
+        for (pos, h) in tx_hashes.iter().enumerate() {
             txn.put(
                 &tx_idx_tbl,
-                &h.0,
-                &encode_tx_index_value(header.height, pos as u32),
+                h.0,
+                encode_tx_index_value(header.height, pos as u32),
                 WriteFlags::empty(),
             )?;
         }
@@ -759,7 +733,7 @@ impl MdbxStore {
                             txn.put(
                                 &oidx_tbl,
                                 owner_key.as_slice(),
-                                &encode_owner_entries(&entries),
+                                encode_owner_entries(&entries),
                                 WriteFlags::empty(),
                             )?;
                         }
@@ -782,7 +756,7 @@ impl MdbxStore {
                             txn.put(
                                 &oidx_tbl,
                                 owner_key.as_slice(),
-                                &encode_owner_entries(&entries),
+                                encode_owner_entries(&entries),
                                 WriteFlags::empty(),
                             )?;
                         }
@@ -795,8 +769,8 @@ impl MdbxStore {
         txn.commit()?;
 
         // Post-commit pruning is non-atomic and non-critical.
-        // A prune failure leaves stale entries (undo logs, recent blocks, old
-        // nullifiers) until the next commit, but the chain state is already
+        // A prune failure leaves stale undo entries until
+        // the next commit, but the chain state is already
         // fully consistent after the commit above.  We must NOT propagate the
         // error here: doing so would cause `apply_next_block` to return Err
         // after the block is already durably in MDBX, leaving RAM and MDBX
@@ -830,129 +804,14 @@ impl MdbxStore {
                 keys
             };
             for h in keys_to_del {
-                txn.del(&undo_tbl, &u64_key(h), None)?;
+                txn.del(&undo_tbl, u64_key(h), None)?;
             }
         }
 
-        // --- Prune recent_blocks older than RECENT_BLOCK_RETENTION_DEPTH ---
-        if current_height > RECENT_BLOCK_RETENTION_DEPTH {
-            let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
-            let cutoff = current_height - RECENT_BLOCK_RETENTION_DEPTH;
-            let keys_to_del: Vec<u64> = {
-                let mut cur = txn.cursor(&recent_tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= cutoff => keys.push(h),
-                        _ => break,
-                    }
-                    item = cur.next()?;
-                }
-                keys
-            };
-            for h in keys_to_del {
-                txn.del(&recent_tbl, &u64_key(h), None)?;
-            }
-        }
-
-        // --- Prune proof data ---
-        //
-        // Auth sidecars are only needed for block validation/reorg serving and can
-        // be removed at finality. BlockProof bytes are additionally needed by the
-        // recursive proof updater: the first time height `h` can be folded into
-        // recursive history is exactly when `current_height - CONSENSUS_FINALITY_DEPTH >= h`.
-        // Therefore pruning BlockProofs purely by finality races the updater and
-        // can delete the proof for the boundary block before it is consumed.
-        if current_height > CONSENSUS_FINALITY_DEPTH {
-            let finality_cutoff = current_height - CONSENSUS_FINALITY_DEPTH;
-
-            let auth_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
-            let auth_keys_to_del: Vec<u64> = {
-                let mut cur = txn.cursor(&auth_tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= finality_cutoff => keys.push(h),
-                        _ => break,
-                    }
-                    item = cur.next()?;
-                }
-                keys
-            };
-            for h in auth_keys_to_del {
-                txn.del(&auth_tbl, &u64_key(h), None)?;
-            }
-
-            let recursive_height = {
-                let rec_tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
-                let raw: Option<Vec<u8>> = txn.get(&rec_tbl, KEY_REC_HEIGHT)?;
-                raw.and_then(|b| u64_from_key(&b)).unwrap_or(0)
-            };
-            let block_proof_cutoff = finality_cutoff.min(recursive_height);
-
-            let proof_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
-            let proof_keys_to_del: Vec<u64> = {
-                let mut cur = txn.cursor(&proof_tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= block_proof_cutoff => keys.push(h),
-                        _ => break,
-                    }
-                    item = cur.next()?;
-                }
-                keys
-            };
-            for h in proof_keys_to_del {
-                txn.del(&proof_tbl, &u64_key(h), None)?;
-            }
-        }
-
-        // --- Prune nullifiers + TX index older than ANCHOR_DEPTH ---
-        //
-        // T_NULLIFIER_BLOCKS maps height -> Vec<TxBodyHash>; we use it to
-        // drive deletion from BOTH T_NULLIFIERS and T_TX_INDEX.
-        // This keeps TX index size bounded: O(ANCHOR_DEPTH × avg_txs_per_block)
-        // instead of growing forever.  Receipts are available for the last
-        // ANCHOR_DEPTH (144) blocks — the same window as nullifier protection.
-        if current_height > ANCHOR_DEPTH {
-            let nul_tbl = txn.open_table(Some(T_NULLIFIERS))?;
-            let nul_blk_tbl = txn.open_table(Some(T_NULLIFIER_BLOCKS))?;
-            let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
-            let cutoff = current_height - ANCHOR_DEPTH;
-            // Gather block heights that are beyond the anchor window.
-            let heights: Vec<u64> = {
-                let mut cur = txn.cursor(&nul_blk_tbl)?;
-                let mut hs = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= cutoff => hs.push(h),
-                        _ => break,
-                    }
-                    item = cur.next()?;
-                }
-                hs
-            };
-            for h in heights {
-                // Retrieve the packed hash list and delete each nullifier entry
-                // AND its corresponding TX index entry.
-                let hash_bytes: Option<Vec<u8>> = txn.get(&nul_blk_tbl, &u64_key(h))?;
-                if let Some(hashes) = hash_bytes {
-                    for chunk in hashes.chunks_exact(32) {
-                        // Nullifier (idempotent).
-                        let _ = txn.del(&nul_tbl, chunk, None);
-                        // TX index entry for same TxBodyHash (idempotent).
-                        let _ = txn.del(&tx_idx_tbl, chunk, None);
-                    }
-                }
-                txn.del(&nul_blk_tbl, &u64_key(h), None)?;
-            }
-        }
-
+        // Block bodies, BlockProofs, and Auth sidecars are checkpoint inputs.
+        // They are pruned only after a future immutable checkpoint package covers
+        // the exact heights being removed. No such coverage table exists in this
+        // implementation yet, so pruning these tables is intentionally disabled.
         txn.commit()?;
         Ok(())
     }
@@ -971,8 +830,6 @@ impl MdbxStore {
             T_SEGMENTS,
             T_RECENT_BLOCKS,
             T_UNDO_LOGS,
-            T_NULLIFIERS,
-            T_NULLIFIER_BLOCKS,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
             T_OWNER_INDEX,

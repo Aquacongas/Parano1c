@@ -24,7 +24,6 @@ use noid_chain::consensus::difficulty::next_target;
 use noid_chain::consensus::pow::full_block_hash;
 use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
 use noid_chain::consensus::AnchorInfo;
-use noid_chain::segmented_state::SegmentColumns;
 use noid_chain::state::ChainState;
 use noid_chain::storage::{MdbxChainContext, MdbxContextError};
 use noid_mempool::AsyncMempool;
@@ -62,11 +61,11 @@ pub enum TemplateRefreshTrigger {
     Startup,
 }
 
-/// A `BlockTemplate` ready for parallel PoW + BlockProof generation.
+/// A `BlockTemplate` ready for parallel PoW + block-certificate assembly.
 ///
 /// Security: `state_root` is in `header_core` which is the PoW input.
 /// An external miner CANNOT change the coinbase without regenerating the
-/// entire BlockProof — they only brute-force the nonce.
+/// block certificate — they only brute-force the nonce.
 #[derive(Clone)]
 pub struct BlockTemplate {
     /// Inner chain-level template with tx ordering and coinbase.
@@ -81,10 +80,8 @@ pub struct BlockTemplate {
     pub parent: BlockHeader,
     /// Cached WalletAuthorizationBundle bytes for each non-coinbase tx (same order as inner.txs).
     pub authorization_bytes: Vec<Option<Vec<u8>>>,
-    /// Pre-state segment columns for every segment touched by this block's transactions.
-    /// Captured at template-build time (before `apply_block`), keyed by seg_id.
-    /// Used by the BlockProof generator for FRI state openings.
-    pub pre_segs: HashMap<u16, SegmentColumns>,
+    /// Exact authenticated state transition proof for user-transaction blocks.
+    pub exact_state_transition: Option<noid_block::ExactStateTransitionProof>,
 }
 
 impl BlockTemplate {
@@ -96,7 +93,7 @@ impl BlockTemplate {
         self.inner.to_pow_header(nonce)
     }
 
-    /// Assemble the final sealed block after PoW and BlockProof generation complete.
+    /// Assemble the final sealed block after PoW and certificate assembly complete.
     pub fn seal(
         &self,
         nonce: u128,
@@ -138,7 +135,7 @@ impl TemplateChainSnapshot {
     pub fn from_context(ctx: &mut MdbxChainContext) -> Result<Self, MdbxContextError> {
         ctx.preload_all_evicted_segments()?;
 
-        let parent = ctx.tip_header().clone();
+        let parent = *ctx.tip_header();
         let tip_height = parent.height;
         let lo = tip_height.saturating_sub(noid_chain::consensus::params::ANCHOR_DEPTH);
         let fresh_anchor_hashes = (lo..=tip_height)
@@ -214,7 +211,7 @@ impl TemplateBuilder {
         //   See validate_timestamp in noid_chain::consensus::timestamps.
         // This prevents BadTimestamp when blocks are found faster than 1 second
         // (genesis target is trivial; multiple blocks per second are possible).
-        let mtp = median_time_past(&prev_timestamps);
+        let mtp = median_time_past(prev_timestamps);
         let min_valid_ts = mtp + 1;
         let timestamp = now_unix.max(min_valid_ts);
 
@@ -269,29 +266,51 @@ impl TemplateBuilder {
             difficulty_target,
         ) {
             Ok(inner) => {
-                // Capture pre-state columns for FRI openings.
-                let eff_log = snapshot.state.state.effective_log_segment_size();
-                let mut touched_segs = std::collections::HashSet::new();
-                for tx in inner.txs.iter().chain(std::iter::once(&inner.coinbase)) {
-                    for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-                        touched_segs.insert((inp.slot_index >> eff_log) as u16);
+                let exact_state_transition = if inner.txs.is_empty() {
+                    None
+                } else {
+                    let mut surface_state = snapshot.state.state.clone();
+                    while surface_state.log_slots() < inner.log_slots as usize {
+                        surface_state.expand();
                     }
-                    for out in tx.body.outputs.iter().filter(|o| o.valid) {
-                        touched_segs.insert((out.slot_index >> eff_log) as u16);
+                    let mut bodies: Vec<_> = inner.txs.iter().map(|tx| tx.body.clone()).collect();
+                    bodies.push(inner.coinbase.body.clone());
+                    let commitments: Vec<[u8; 32]> = bodies
+                        .iter()
+                        .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
+                        .collect();
+                    let surface = match noid_chain::build_exact_action_surface(
+                        &surface_state,
+                        &bodies,
+                        &commitments,
+                    ) {
+                        Ok(surface) => surface,
+                        Err(e) => {
+                            tracing::warn!(err = ?e, "exact state surface build failed");
+                            return None;
+                        }
+                    };
+                    let cache = match snapshot.state.state.exact_sparse_cache() {
+                        Ok(cache) => cache,
+                        Err(e) => {
+                            tracing::warn!(err = %e, "exact parent sparse cache build failed");
+                            return None;
+                        }
+                    };
+                    match noid_block::build_exact_state_transition_proof(
+                        &cache,
+                        &surface,
+                        &snapshot.state.reuse_guard,
+                        inner.height,
+                    ) {
+                        Ok(proof) => Some(proof),
+                        Err(e) => {
+                            tracing::warn!(err = ?e, "exact state proof build failed");
+                            return None;
+                        }
                     }
-                }
-                let mut pre_segs: HashMap<u16, SegmentColumns> =
-                    HashMap::with_capacity(touched_segs.len());
-                for seg_id in touched_segs {
-                    // Fast path: read from RAM if segment is loaded (avoids MDBX I/O).
-                    let cols = snapshot
-                        .state
-                        .state
-                        .try_get_segment_columns(seg_id)
-                        .cloned()
-                        .unwrap_or_else(|| SegmentColumns::new_zero(1usize << eff_log));
-                    pre_segs.insert(seg_id, cols);
-                }
+                };
+
                 let authorization_bytes = inner
                     .txs
                     .iter()
@@ -302,9 +321,9 @@ impl TemplateBuilder {
                     difficulty_target,
                     miner_address,
                     timestamp,
-                    parent: parent.clone(),
+                    parent: *parent,
                     authorization_bytes,
-                    pre_segs,
+                    exact_state_transition,
                 })
             }
             Err(e) => {

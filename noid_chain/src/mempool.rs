@@ -81,9 +81,8 @@ pub struct MempoolEntry {
     /// by the wallet at submission time.  Populated immediately on admission;
     /// `None` only for coinbase or txs submitted without a proof bundle.
     ///
-    /// The block assembler uses this to build `TxBlockWitness` without
-    /// re-doing any per-tx work.  `prove_block` then only runs the unified
-    /// block-level SpineGKR + single FRI opening.
+    /// The block assembler copies this into the public `BlockAuthSidecar`;
+    /// exact state-transition proving is built separately from the block body.
     pub cached_authorization: Option<Vec<u8>>,
 
     /// Raw `TxIntent` bytes as submitted by the wallet.

@@ -126,7 +126,7 @@ pub fn hash_tx_body_for_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, AuthTag, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn mk_input(seed: u8) -> TxInput {
         TxInput {
@@ -134,7 +134,6 @@ mod tests {
             value: (seed as u64) * 11,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
-            auth_tag: AuthTag([seed ^ 0x55; 32]),
             valid: true,
         }
     }
@@ -209,7 +208,7 @@ mod tests {
     fn dummy_input_equals_zero_leaf() {
         let anchor = [0u8; 32];
         let real = mk_input(1);
-        let h1 = hash_tx_body(&anchor, 0, &[real.clone()], &[], false);
+        let h1 = hash_tx_body(&anchor, 0, std::slice::from_ref(&real), &[], false);
         let h2 = hash_tx_body(
             &anchor,
             0,

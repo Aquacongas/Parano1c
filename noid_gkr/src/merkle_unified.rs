@@ -5,9 +5,8 @@
 
 //! Merkle path GKR — unified sumcheck + shift driver (14 variables).
 //!
-//! Same protocol structure as `auth_unified_v2.rs` but uses
-//! `merkle_shift::build_merkle_*` tables parameterised by `live_slots`
-//! instead of the auth-cached tables (fixed at 20 live slots).
+//! Merkle-local protocol structures and reducers. This intentionally does not
+//! depend on the retired fixed AuthGKR modules.
 
 use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128};
 use noid_core::mle::eq::eq_ind;
@@ -18,10 +17,6 @@ use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
-use crate::auth_unified_v2::{
-    AuthShiftProof, AuthShiftReduction, AuthUnifiedProof, AuthUnifiedReduction,
-    AUTH_SHIFT_ROUND_DEGREE, AUTH_UNIFIED_ROUND_DEGREE,
-};
 use crate::merkle_mle::{
     MerkleUnifiedMle, N_MERKLE_ELEM_VARS, N_MERKLE_ROUND_VARS, N_MERKLE_SLOT_BITS,
     N_MERKLE_UNIFIED_CELLS, N_MERKLE_UNIFIED_VARS,
@@ -39,6 +34,55 @@ const ROUND_HI: usize = ROUND_LO + N_MERKLE_ROUND_VARS;
 const SLOT_LO: usize = ROUND_HI;
 const SLOT_HI: usize = SLOT_LO + N_MERKLE_SLOT_BITS;
 
+pub const MERKLE_UNIFIED_ROUND_DEGREE: usize = 9;
+pub const MERKLE_SHIFT_ROUND_DEGREE: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MerkleUnifiedProof {
+    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub s_in_dec_at_r: Block128,
+    pub s_out_dec_at_r: Block128,
+    pub state_dec_at_r: Block128,
+    pub state_at_r: Block128,
+    pub s_out_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub state_lane_dec_at_r: [Block128; STATE_SIZE],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleUnifiedReduction {
+    pub r_prime: Vec<Block128>,
+    pub s_in_dec_at_r: Block128,
+    pub s_out_dec_at_r: Block128,
+    pub state_dec_at_r: Block128,
+    pub state_at_r: Block128,
+    pub s_out_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub state_lane_dec_at_r: [Block128; STATE_SIZE],
+    pub beta: Block128,
+    pub gamma: Block128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MerkleShiftProof {
+    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub s_in_at_r2: Block128,
+    pub s_out_at_r2: Block128,
+    pub state_at_r2: Block128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleShiftReduction {
+    pub r_double_prime: Vec<Block128>,
+    pub s_in_at_r2: Block128,
+    pub s_out_at_r2: Block128,
+    pub state_at_r2: Block128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MerkleKillShotProof {
+    pub main: MerkleUnifiedProof,
+    pub shift: MerkleShiftProof,
+}
+
 // ---------------------------------------------------------------------------
 // Main sumcheck
 // ---------------------------------------------------------------------------
@@ -47,7 +91,7 @@ pub fn prove_merkle_unified<T: FiatShamir<Block128>>(
     mle: &MerkleUnifiedMle,
     live_slots: usize,
     channel: &mut T,
-) -> (AuthUnifiedProof, Vec<Block128>) {
+) -> (MerkleUnifiedProof, Vec<Block128>) {
     assert_eq!(mle.s_in.len(), N_MERKLE_UNIFIED_CELLS);
     assert_eq!(mle.s_out.len(), N_MERKLE_UNIFIED_CELLS);
     assert_eq!(mle.sigma.len(), N_MERKLE_UNIFIED_CELLS);
@@ -91,7 +135,7 @@ pub fn prove_merkle_unified<T: FiatShamir<Block128>>(
         channel.absorb(*v);
     }
 
-    let proof = AuthUnifiedProof {
+    let proof = MerkleUnifiedProof {
         round_polys,
         s_in_dec_at_r: final_claims.s_in_dec,
         s_out_dec_at_r: final_claims.s_out_dec,
@@ -104,15 +148,15 @@ pub fn prove_merkle_unified<T: FiatShamir<Block128>>(
 }
 
 pub fn verify_merkle_unified<T: FiatShamir<Block128>>(
-    proof: &AuthUnifiedProof,
+    proof: &MerkleUnifiedProof,
     live_slots: usize,
     channel: &mut T,
-) -> Option<AuthUnifiedReduction> {
+) -> Option<MerkleUnifiedReduction> {
     if proof.round_polys.len() != N_MERKLE_UNIFIED_VARS {
         return None;
     }
     for p in &proof.round_polys {
-        if p.degree() > AUTH_UNIFIED_ROUND_DEGREE {
+        if p.degree() > MERKLE_UNIFIED_ROUND_DEGREE {
             return None;
         }
     }
@@ -181,7 +225,7 @@ pub fn verify_merkle_unified<T: FiatShamir<Block128>>(
         channel.absorb(*v);
     }
 
-    Some(AuthUnifiedReduction {
+    Some(MerkleUnifiedReduction {
         r_prime,
         s_in_dec_at_r: proof.s_in_dec_at_r,
         s_out_dec_at_r: proof.s_out_dec_at_r,
@@ -202,7 +246,7 @@ pub fn prove_merkle_shift<T: FiatShamir<Block128>>(
     mle: &MerkleUnifiedMle,
     main_red_r_prime: &[Block128],
     channel: &mut T,
-) -> (AuthShiftProof, Vec<Block128>) {
+) -> (MerkleShiftProof, Vec<Block128>) {
     assert_eq!(main_red_r_prime.len(), N_MERKLE_UNIFIED_VARS);
     let delta = channel.squeeze();
     let weights = build_combined_weights(main_red_r_prime, delta);
@@ -242,7 +286,7 @@ pub fn prove_merkle_shift<T: FiatShamir<Block128>>(
     channel.absorb(state_at_r2);
 
     (
-        AuthShiftProof {
+        MerkleShiftProof {
             round_polys,
             s_in_at_r2,
             s_out_at_r2,
@@ -253,15 +297,15 @@ pub fn prove_merkle_shift<T: FiatShamir<Block128>>(
 }
 
 pub fn verify_merkle_shift<T: FiatShamir<Block128>>(
-    proof: &AuthShiftProof,
-    main_red: &AuthUnifiedReduction,
+    proof: &MerkleShiftProof,
+    main_red: &MerkleUnifiedReduction,
     channel: &mut T,
-) -> Option<AuthShiftReduction> {
+) -> Option<MerkleShiftReduction> {
     if proof.round_polys.len() != N_MERKLE_UNIFIED_VARS {
         return None;
     }
     for p in &proof.round_polys {
-        if p.degree() > AUTH_SHIFT_ROUND_DEGREE {
+        if p.degree() > MERKLE_SHIFT_ROUND_DEGREE {
             return None;
         }
     }
@@ -294,7 +338,7 @@ pub fn verify_merkle_shift<T: FiatShamir<Block128>>(
     channel.absorb(proof.s_out_at_r2);
     channel.absorb(proof.state_at_r2);
 
-    Some(AuthShiftReduction {
+    Some(MerkleShiftReduction {
         r_double_prime,
         s_in_at_r2: proof.s_in_at_r2,
         s_out_at_r2: proof.s_out_at_r2,
@@ -507,7 +551,7 @@ fn compute_round_polynomial_flat(
     gamma_flat: u128,
 ) -> RoundPolynomial<Block128> {
     let half = tabs.u.len() / 2;
-    let mut acc = [0u128; AUTH_UNIFIED_ROUND_DEGREE + 1];
+    let mut acc = [0u128; MERKLE_UNIFIED_ROUND_DEGREE + 1];
     const ONE_FLAT: u128 = 1u128;
 
     for i in 0..half {
@@ -587,7 +631,7 @@ fn compute_round_polynomial_flat(
         }
 
         let f_p: [u128; 10] = poly_mul_t::<2, 9, 10>(&u_p, &q_p);
-        for k in 0..=AUTH_UNIFIED_ROUND_DEGREE {
+        for k in 0..=MERKLE_UNIFIED_ROUND_DEGREE {
             acc[k] ^= f_p[k];
         }
     }
@@ -688,7 +732,7 @@ fn build_combined_weights(r_prime: &[Block128], delta: Block128) -> CombinedWeig
     }
 }
 
-fn combined_target(red: &AuthUnifiedReduction, delta: Block128) -> Block128 {
+fn combined_target(red: &MerkleUnifiedReduction, delta: Block128) -> Block128 {
     let d0 = Block128::ONE;
     let d1 = delta;
     let d2 = d1 * delta;
@@ -790,8 +834,8 @@ fn compute_shift_round_polynomial_flat(
     w_state: &[u128],
 ) -> RoundPolynomial<Block128> {
     let half = s_in.len() / 2;
-    let mut evals = [0u128; AUTH_SHIFT_ROUND_DEGREE + 1];
-    let t_flat: [u128; AUTH_SHIFT_ROUND_DEGREE + 1] =
+    let mut evals = [0u128; MERKLE_SHIFT_ROUND_DEGREE + 1];
+    let t_flat: [u128; MERKLE_SHIFT_ROUND_DEGREE + 1] =
         std::array::from_fn(|k| tower_to_flat_u128(k as u128));
 
     for i in 0..half {
@@ -809,7 +853,7 @@ fn compute_shift_round_polynomial_flat(
         let dwsout = wsout0 ^ wsout1;
         let dwst = wst0 ^ wst1;
 
-        for k in 0..=AUTH_SHIFT_ROUND_DEGREE {
+        for k in 0..=MERKLE_SHIFT_ROUND_DEGREE {
             let t = t_flat[k];
             let sin = sin0 ^ clmul_gcm(t, dsin);
             let sout = sout0 ^ clmul_gcm(t, dsout);
@@ -821,7 +865,7 @@ fn compute_shift_round_polynomial_flat(
         }
     }
 
-    let evals_tower: [Block128; AUTH_SHIFT_ROUND_DEGREE + 1] =
+    let evals_tower: [Block128; MERKLE_SHIFT_ROUND_DEGREE + 1] =
         std::array::from_fn(|k| Block128::from(flat_to_tower_u128(evals[k])));
     RoundPolynomial::from_evals(&evals_tower)
 }

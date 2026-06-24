@@ -12,8 +12,7 @@
 //! Every `apply_next_block` call writes all block data in ONE atomic MDBX
 //! transaction. Either the full block is committed or nothing is. On restart,
 //! `open_or_create` reads `chain_tip` from MDBX and rebuilds hot RAM state
-//! (nullifiers from stored nullifier-block entries, segment columns from the
-//! `segments` table). No replay from genesis needed.
+//! from the `segments` table. No replay from genesis needed.
 //!
 //! # Restart strategy
 //!
@@ -34,16 +33,13 @@
 //! |------|-------|-----|
 //! | Headers | MDBX (forever) | Random access by height/hash |
 //! | Segment columns | MDBX (forever) | Persist across restarts |
-//! | Nullifiers | RAM + MDBX | O(1) lookup in RAM; MDBX for recovery |
 //! | Undo logs | MDBX (18 blocks) | Reorg recovery |
-//! | Recent blocks | MDBX (18 blocks) | Peer sync |
+//! | Block bodies/proofs/sidecars | MDBX (until checkpoint coverage) | Checkpoint generation and bounded peer sync |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
 //! | Recent headers | RAM (MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH) | Timestamp + anchor validation |
 
 use std::collections::HashMap;
 use std::path::Path;
-
-use noid_poseidon2b::primitives::TxBodyHash;
 
 use crate::block::{apply_state_delta, Block};
 use crate::block_header::BlockHeader;
@@ -60,10 +56,10 @@ use crate::consensus::{
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
-use crate::nullifier::NullifierSet;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use crate::storage::{ConsensusMeta, FinalizedCheckpoint, MdbxStore, StoreError};
+use noid_poseidon2b::primitives::TxBodyHash;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -105,7 +101,7 @@ impl From<ConsensusError> for MdbxContextError {
 /// Crash-consistent chain context backed by MDBX.
 ///
 /// On startup: reads tip from MDBX, loads all segment columns, rebuilds
-/// nullifier set from stored per-block hash entries, loads recent headers.
+/// loads recent headers.
 ///
 /// On each block: writes all data atomically, then updates hot RAM state.
 pub struct MdbxChainContext {
@@ -116,9 +112,6 @@ pub struct MdbxChainContext {
     /// `state.state` is a `SegmentedFriState` whose dirty segments are written to MDBX
     /// atomically with each block commit.
     pub state: ChainState,
-
-    /// Rolling nullifier window (last ANCHOR_DEPTH blocks).
-    pub nullifiers: NullifierSet,
 
     /// Recent headers for validation (needed for MTP, ASERT anchor, epoch_anchor check).
     /// Covers the last `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` blocks.
@@ -180,7 +173,6 @@ impl MdbxChainContext {
             let ctx = Self {
                 store,
                 state: consensus.state,
-                nullifiers: consensus.nullifiers,
                 recent_headers: consensus.headers,
                 tip_height: consensus.tip_height,
                 tip_hash: consensus.tip_hash,
@@ -216,7 +208,6 @@ impl MdbxChainContext {
                     let ctx = Self {
                         store,
                         state: consensus.state,
-                        nullifiers: consensus.nullifiers,
                         recent_headers: consensus.headers,
                         tip_height: consensus.tip_height,
                         tip_hash: consensus.tip_hash,
@@ -249,7 +240,6 @@ impl MdbxChainContext {
             let ctx = Self {
                 store,
                 state: consensus.state,
-                nullifiers: consensus.nullifiers,
                 recent_headers: consensus.headers,
                 tip_height: consensus.tip_height,
                 tip_hash: consensus.tip_hash,
@@ -260,11 +250,10 @@ impl MdbxChainContext {
             // Persist easy genesis.
             {
                 use crate::consensus::da_prune::BlockUndoLog;
-                let genesis = ctx
+                let genesis = *ctx
                     .recent_headers
                     .get(&0)
-                    .expect("easy genesis header must exist")
-                    .clone();
+                    .expect("easy genesis header must exist");
                 let genesis_hash = full_block_hash(&genesis);
                 let meta = ConsensusMeta {
                     tip_height: 0,
@@ -277,6 +266,7 @@ impl MdbxChainContext {
                     &genesis_hash,
                     &BlockUndoLog::empty(0),
                     &[],
+                    ctx.state.reuse_guard.buckets(),
                     &[],
                     None,
                     &meta,
@@ -307,8 +297,9 @@ impl MdbxChainContext {
             &genesis,
             &genesis_hash,
             &BlockUndoLog::empty(0),
-            &[],  // no dirty segments (all virtual zero)
-            &[],  // no nullifiers
+            &[], // no dirty segments (all virtual zero)
+            self.state.reuse_guard.buckets(),
+            &[],
             None, // no block bytes for genesis
             &meta,
         )?;
@@ -347,6 +338,11 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
+        let reuse_guard_buckets = store
+            .get_reuse_guard_buckets()?
+            .ok_or(MdbxContextError::Corrupt("missing reuse_guard"))?;
+        let reuse_guard = crate::reuse_guard::ReuseGuard::from_buckets(reuse_guard_buckets)
+            .map_err(|_| MdbxContextError::Corrupt("invalid reuse_guard"))?;
 
         // 3. Rebuild SegmentedFriState from stored segments.
         //    Use `set_segment_columns` (not `set_slot`) so that restored
@@ -366,7 +362,6 @@ impl MdbxChainContext {
         // 3b. Integrity check: verify the reloaded state produces the correct
         //     state root.  This catches silent disk corruption or MDBX bit-rot
         //     in the segment columns before the node starts serving requests.
-        let restored_root = seg_state.root();
         let tip_hdr = store
             .get_header(tip_height)?
             .ok_or(MdbxContextError::Corrupt("tip header missing from store"))?;
@@ -386,18 +381,15 @@ impl MdbxChainContext {
                 "finalized hash mismatch with persisted finalized header",
             ));
         }
-        if restored_root != tip_hdr.state_root {
+        // 4. Rebuild ChainState and exact composite root.
+        let mut state =
+            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter, reuse_guard)
+                .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?;
+        if state.state_root() != tip_hdr.state_root {
             return Err(MdbxContextError::Corrupt(
                 "state root mismatch after restore: segment data is corrupt",
             ));
         }
-
-        // 4. Rebuild ChainState.
-        let state = ChainState {
-            state: seg_state,
-            active_slot_count,
-            alloc_counter,
-        };
 
         // 5. Rebuild recent headers (last MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH blocks).
         let window = (MEDIAN_TIME_BLOCKS as u64) + ANCHOR_DEPTH;
@@ -409,26 +401,12 @@ impl MdbxChainContext {
             }
         }
 
-        // 6. Rebuild nullifier set from T_NULLIFIER_BLOCKS (ANCHOR_DEPTH window).
-        //
-        //    Critical for correctness: if the nullifier set is left empty after
-        //    restart, `validate_block_consensus` would accept blocks that
-        //    double-spend transactions confirmed within the last ANCHOR_DEPTH
-        //    blocks.  We reconstruct the exact same window the RAM set would
-        //    have had, by reading the per-block hash entries from MDBX and
-        //    calling `insert_block` in ascending height order.
-        let null_blocks = store
-            .get_nullifier_blocks_range(tip_height.saturating_sub(ANCHOR_DEPTH - 1), tip_height)?;
-        let nullifiers =
-            NullifierSet::rebuild_from_blocks(null_blocks.into_iter().map(|(_, hashes)| hashes));
-
-        // 7. Use exact persisted cumulative chainwork.
+        // 6. Use exact persisted cumulative chainwork.
         let tip_chain_work = meta.cumulative_chainwork;
 
         Ok(Self {
             store,
             state,
-            nullifiers,
             recent_headers,
             tip_height,
             tip_hash,
@@ -502,11 +480,14 @@ impl MdbxChainContext {
             &block_hash,
             undo,
             &dirty_refs,
+            self.state.reuse_guard.buckets(),
             &tx_hashes,
             Some(&block.to_bytes()),
             &consensus_meta,
         ) {
             revert_block(&mut self.state.state, undo);
+            crate::consensus::reorg::revert_reuse_guard(&mut self.state, undo);
+            let _ = self.state.rebuild_exact_utxo_root_loaded();
             self.state.active_slot_count = pre_active;
             self.state.alloc_counter = pre_alloc;
             self.state.state.clear_dirty();
@@ -514,8 +495,7 @@ impl MdbxChainContext {
         }
 
         self.recent_headers
-            .insert(block.header.height, block.header.clone());
-        self.nullifiers.insert_block(&tx_hashes);
+            .insert(block.header.height, block.header);
         self.tip_height = block.header.height;
         self.tip_hash = block_hash;
         self.tip_chain_work = new_tip_chain_work;
@@ -557,7 +537,6 @@ impl MdbxChainContext {
             &[u64],
             u64,
             &AnchorInfo,
-            &NullifierSet,
             &SegmentedFriState,
             &mut ChainState,
         ) -> Result<[u8; 32], E>,
@@ -572,7 +551,7 @@ impl MdbxChainContext {
             })?;
         }
 
-        let parent = self.tip_header().clone();
+        let parent = *self.tip_header();
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
@@ -594,7 +573,6 @@ impl MdbxChainContext {
                 &prev_active_counts,
                 local_time,
                 &anchor,
-                &self.nullifiers,
                 &pre_state,
                 &mut self.state,
             ) {
@@ -615,7 +593,6 @@ impl MdbxChainContext {
                 &prev_active_counts,
                 local_time,
                 &anchor,
-                &self.nullifiers,
             )?;
             apply_state_delta(&mut self.state, block)
                 .map_err(|e| {
@@ -660,9 +637,8 @@ impl MdbxChainContext {
     /// Apply a chain reorganization backed by MDBX undo logs.
     ///
     /// 1. Reverts our chain from tip back to `ancestor_height` using MDBX undo logs.
-    /// 2. Rebuilds the nullifier set for the surviving chain.
-    /// 3. Persists the reverted state to MDBX atomically (crash-safe checkpoint).
-    /// 4. Applies `new_blocks` on top of `ancestor_height` through the caller's
+    /// 2. Persists the reverted state to MDBX atomically (crash-safe checkpoint).
+    /// 3. Applies `new_blocks` on top of `ancestor_height` through the caller's
     ///    proof-native applier. The node passes a closure that calls this type's
     ///    single production `apply_next_block` method with the matching `BlockProof`
     ///    bytes and `noid_block::validate_block_from_network`.
@@ -681,7 +657,7 @@ impl MdbxChainContext {
     where
         F: FnMut(&mut Self, &Block, u64) -> Result<(), MdbxContextError>,
     {
-        use crate::consensus::reorg::{revert_state_counters, ReorgResult};
+        use crate::consensus::reorg::{revert_reuse_guard, revert_state_counters, ReorgResult};
 
         // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
         // The caller computed ancestor_height outside the lock — if another task applied
@@ -785,10 +761,16 @@ impl MdbxChainContext {
             let mut reclaimed_tx_hashes_inner: Vec<TxBodyHash> = Vec::new();
             let mut reverted_heights_inner: Vec<u64> = Vec::new();
 
+            self.preload_all_evicted_segments()?;
+
             for (height, undo) in &loaded {
                 reclaimed_tx_hashes_inner.extend_from_slice(&undo.tx_hashes);
                 revert_block(&mut self.state.state, undo);
                 revert_state_counters(&mut self.state, undo);
+                revert_reuse_guard(&mut self.state, undo);
+                self.state.rebuild_exact_utxo_root_loaded().map_err(|_| {
+                    MdbxContextError::Corrupt("exact root rebuild after reorg failed")
+                })?;
                 self.recent_headers.remove(height);
                 reverted_heights_inner.push(*height);
             }
@@ -796,19 +778,6 @@ impl MdbxChainContext {
             // Move into outer scope variables.
             reclaimed_tx_hashes = reclaimed_tx_hashes_inner;
             reverted_heights = reverted_heights_inner;
-        }
-
-        // -----------------------------------------------------------------------
-        // Rebuild nullifier set from the surviving chain.
-        // Uses T_NULLIFIER_BLOCKS (kept for ANCHOR_DEPTH blocks), not undo logs.
-        // -----------------------------------------------------------------------
-        {
-            let rebuild_start = ancestor_height.saturating_sub(ANCHOR_DEPTH - 1);
-            let null_blocks = self
-                .store
-                .get_nullifier_blocks_range(rebuild_start, ancestor_height)?;
-            self.nullifiers =
-                NullifierSet::rebuild_from_blocks(null_blocks.into_iter().map(|(_, h)| h));
         }
 
         // -----------------------------------------------------------------------
@@ -939,14 +908,14 @@ impl MdbxChainContext {
 
         // Atomic commit: dirty segments + updated chain_tip + state_meta.
         // The ancestor's header and hash→height index are idempotently re-written.
-        // nullifier_hashes=[] avoids re-inserting entries already in MDBX.
         self.store
             .commit_block(
                 ancestor_header,
                 &ancestor_hash,
                 &existing_undo,
                 &dirty_refs,
-                &[],  // ancestor's nullifiers already stored; don't duplicate
+                self.state.reuse_guard.buckets(),
+                &[],
                 None, // no block bytes (stored earlier or DA-pruned)
                 &consensus_meta,
             )
@@ -1035,8 +1004,9 @@ impl MdbxChainContext {
     /// FIX1 fail-closed policy: public arbitrary-peer snapshots are disabled until
     /// immutable exact-height checkpoint generations and the real recursive verifier
     /// are implemented. Installing a snapshot here would otherwise require exact
-    /// persisted chainwork, finalized checkpoint compatibility, nullifier-window
-    /// pinning, and atomic metadata replacement.
+    /// persisted chainwork, finalized checkpoint compatibility, and atomic
+    /// metadata replacement.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_state_snapshot<I>(
         &mut self,
         _tip_height: u64,
@@ -1046,7 +1016,6 @@ impl MdbxChainContext {
         _alloc_counter: u64,
         _segments: I,
         _recent_headers_bytes: &[Vec<u8>],
-        _nullifier_blocks: &[Vec<noid_poseidon2b::primitives::TxBodyHash>],
     ) -> Result<(), MdbxContextError>
     where
         I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
@@ -1074,7 +1043,7 @@ impl MdbxChainContext {
     pub fn get_header_from_store(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
         // Check RAM first (fast path).
         if let Some(h) = self.recent_headers.get(&height) {
-            return Ok(Some(h.clone()));
+            return Ok(Some(*h));
         }
         self.store.get_header(height)
     }
@@ -1154,13 +1123,12 @@ mod tests {
     use super::*;
     use crate::block::{compute_tx_root, Block};
     use crate::block_header::BlockHeader;
-    use crate::chain_context::TEST_TARGET;
     use crate::consensus::{params::BLOCK_TIME, pow::full_block_hash};
     use noid_poseidon2b::primitives::Address;
 
     fn build_empty_block_on(ctx: &mut MdbxChainContext) -> Block {
         use crate::chain_context::TEST_TARGET;
-        let parent = ctx.tip_header().clone();
+        let parent = *ctx.tip_header();
         let new_root = ctx.state.state_root();
 
         // Use TEST_TARGET so nonce=0 trivially satisfies PoW.
@@ -1204,7 +1172,6 @@ mod tests {
              _prev_active_counts,
              _local_time,
              _anchor,
-             _nullifiers,
              _pre_state,
              _state|
              -> Result<[u8; 32], std::convert::Infallible> {
@@ -1312,6 +1279,34 @@ mod tests {
     }
 
     #[test]
+    fn block_payloads_remain_after_finality_without_checkpoint_coverage() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+
+        let first = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
+        ctx.store.put_block_proof(1, b"proof-1").unwrap();
+        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
+
+        for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
+            let block = build_empty_block_on(&mut ctx);
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+        }
+
+        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
+        assert_eq!(
+            ctx.store.get_block_proof(1).unwrap(),
+            Some(b"proof-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_block_auth_sidecar(1).unwrap(),
+            Some(b"sidecar-1".to_vec())
+        );
+    }
+
+    #[test]
     fn state_root_consistent_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let root_after_block;
@@ -1329,95 +1324,6 @@ mod tests {
             root_after_block,
             "state root must be identical after restart"
         );
-    }
-
-    /// Verify that the nullifier set is correctly rebuilt from MDBX on restart.
-    ///
-    /// We inject fake tx_body_hashes directly via `store.commit_block` to
-    /// simulate a block that contained real transactions.  After restart the
-    /// RAM nullifier set must contain exactly those hashes.
-    #[test]
-    fn nullifiers_rebuilt_after_restart_block_hash_appears() {
-        use crate::consensus::da_prune::BlockUndoLog;
-        use noid_poseidon2b::primitives::TxBodyHash;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        let sentinel_a = TxBodyHash([0xAAu8; 32]);
-        let sentinel_b = TxBodyHash([0xBBu8; 32]);
-
-        // open fresh DB, apply one empty block, then directly write
-        // a second block with two sentinel nullifiers via commit_block.
-        let block1_hash;
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            // Apply block 1 (empty, no transactions).
-            let block1 = build_empty_block_on(&mut ctx);
-            let ts = block1.header.timestamp + 1;
-            apply_coinbase_only_for_test(&mut ctx, &block1, ts).unwrap();
-            block1_hash = full_block_hash(&block1.header);
-
-            // Directly commit a fake block 2 with sentinel nullifiers.
-            // (We bypass apply_next_block to avoid BlockProof requirements.)
-            let parent = ctx.tip_header().clone();
-            let mut hdr2 = BlockHeader {
-                prev_block_hash: block1_hash,
-                state_root: parent.state_root,
-                tx_root: compute_tx_root(&[]),
-                timestamp: parent.timestamp + BLOCK_TIME,
-                height: 2,
-                miner_address: Address([0u8; 32]),
-                nonce: 0,
-                difficulty_target: TEST_TARGET,
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [1u8; 32],
-                log_slots: parent.log_slots,
-                active_slot_count: parent.active_slot_count,
-                alloc_counter: parent.alloc_counter,
-            };
-            hdr2.nonce = 0; // TEST_TARGET: any nonce works
-            let hash2 = full_block_hash(&hdr2);
-            let chainwork2 = crate::add_work(&ctx.tip_chain_work, &crate::block_work(&TEST_TARGET));
-            let meta2 = ConsensusMeta {
-                tip_height: 2,
-                tip_hash: hash2,
-                cumulative_chainwork: chainwork2,
-                finalized: ctx.finalized,
-            };
-            ctx.store
-                .commit_block(
-                    &hdr2,
-                    &hash2,
-                    &BlockUndoLog::empty(2),
-                    &[],
-                    &[sentinel_a, sentinel_b],
-                    None,
-                    &meta2,
-                )
-                .unwrap();
-        }
-
-        // reopen. The rebuilt nullifier set must contain both sentinels.
-        {
-            // Open by reading chain_tip from MDBX. The direct commit above made
-            // block 2 durable without updating the old in-memory ctx.
-            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-
-            // Verify via the store directly: get_nullifier_blocks_range(0, 1)
-            // should find the entries we wrote.
-            let entries = ctx.store.get_nullifier_blocks_range(0, 10).unwrap();
-            // Block 1 was empty (no T_NULLIFIER_BLOCKS entry).
-            // Block 2 was injected with sentinels.
-            let all_hashes: Vec<TxBodyHash> = entries.into_iter().flat_map(|(_, hs)| hs).collect();
-            assert!(
-                all_hashes.contains(&sentinel_a),
-                "sentinel_a must be recoverable from MDBX"
-            );
-            assert!(
-                all_hashes.contains(&sentinel_b),
-                "sentinel_b must be recoverable from MDBX"
-            );
-        }
     }
 
     /// Verify that `dirty_segment_ids()` is empty after restart (segments are

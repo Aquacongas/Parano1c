@@ -39,7 +39,7 @@ impl ChainAccumulator {
     ///
     /// - `block_hash`  = `hash_block_header(&header)` (embeds `proof_transcript_hash`)
     /// - `chain_claim` = canonical block claim folded into recursive history.
-    ///                   `Block128::ZERO` for coinbase-only / genesis blocks.
+    ///   `Block128::ZERO` for coinbase-only / genesis blocks.
     pub fn extend(
         &self,
         new_state_root: StateRoot,
