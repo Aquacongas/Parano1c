@@ -17,7 +17,7 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR};
 use noid_poseidon2b::primitives::{Address, Digest};
 
-/// Canonical block header. All fields are consensus-significant.
+/// Canonical block header.
 ///
 /// Byte layout (see `BLOCK_HEADER_WIRE_SIZE` in `wire.rs`):
 ///
@@ -28,16 +28,14 @@ use noid_poseidon2b::primitives::{Address, Digest};
 ///   timestamp             [8B]   seconds since Unix epoch (LE u64)
 ///   height                [8B]   block height (LE u64)
 ///   miner_address         [32B]  coinbase recipient address
-///   nonce                 [16B]  128-bit Blake3 PoW nonce (LE u128)
+///   nonce                 [16B]  128-bit Poseidon2b PoW nonce (LE u128)
 ///   difficulty_target     [32B]  256-bit ASERT target
-///   proof_transcript_hash [32B]  Fiat-Shamir transcript digest of BlockProof
-///   witness_root          [32B]  Binius-packed DA payload root
 ///   log_slots             [4B]   current slot-space depth (LE u32)
 ///   active_slot_count     [8B]   live UTXO count after this block (LE u64)
 ///   alloc_counter         [8B]   monotonic PRNG seed after this block (LE u64)
 /// ```
 ///
-/// Total: 276 bytes (see `BLOCK_HEADER_WIRE_SIZE`).
+/// Total: 212 bytes (see `BLOCK_HEADER_WIRE_SIZE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     pub prev_block_hash: Digest,
@@ -50,17 +48,11 @@ pub struct BlockHeader {
     pub timestamp: u64,
     pub height: u64,
     pub miner_address: Address,
-    /// 128-bit PoW nonce. Provides effectively unlimited search space.
+    /// 128-bit Poseidon2b PoW nonce.
     pub nonce: u128,
     /// 256-bit ASERT difficulty target (LE). Block valid iff
-    /// `Blake3(header_core_bytes(header)) < difficulty_target`.
+    /// `H_POSEIDON_POW(header) < difficulty_target`.
     pub difficulty_target: [u8; 32],
-    /// Poseidon2b digest of the `BlockProof` Fiat-Shamir transcript.
-    /// Non-zero field required by `apply_block`.
-    pub proof_transcript_hash: Digest,
-    /// Binius-packed DA witness root (`noid_chain::da::packed_witness_root`).
-    /// Binds the 128×/16× packed bytes into consensus.
-    pub witness_root: Digest,
     /// Slot-space depth: `log₂(num_slots)`. Lives in [24, 32] on mainnet;
     /// may be smaller in test mode. Replicated in every Fiat-Shamir
     pub log_slots: u32,
@@ -73,7 +65,8 @@ pub struct BlockHeader {
     pub alloc_counter: u64,
 }
 
-/// Compute `H_BLOCK` — the Poseidon2b hash of the canonical header.
+/// Compute the semantic `block_id` — the Poseidon2b hash of the canonical
+/// semantic header.
 ///
 /// Used as `epoch_anchor` in transactions (`H_BLOCK(header[height - 6])`)
 /// and for chain linking (`prev_block_hash`).
@@ -88,13 +81,17 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     absorb_digest(&mut s, hdr.miner_address.as_bytes());
     s.absorb(Block128::from(hdr.nonce));
     absorb_digest(&mut s, &hdr.difficulty_target);
-    absorb_digest(&mut s, &hdr.proof_transcript_hash);
-    absorb_digest(&mut s, &hdr.witness_root);
     s.absorb(Block128::from(hdr.log_slots as u128));
     s.absorb(Block128::from(hdr.active_slot_count as u128));
     s.absorb(Block128::from(hdr.alloc_counter as u128));
 
     s.finalize()
+}
+
+/// Explicit alias for the consensus semantic chain-link id.
+#[inline]
+pub fn block_id(hdr: &BlockHeader) -> Digest {
+    hash_block_header(hdr)
 }
 
 #[inline]
@@ -118,8 +115,6 @@ mod tests {
             miner_address: Address([0x44u8; 32]),
             nonce: 0xDEAD_BEEF_CAFE_BABEu128,
             difficulty_target: [0x77u8; 32],
-            proof_transcript_hash: [0x55u8; 32],
-            witness_root: [0x66u8; 32],
             log_slots: 24,
             active_slot_count: 12_345,
             alloc_counter: 99_999,
@@ -158,8 +153,6 @@ mod tests {
         check!(miner_address, Address([0xAAu8; 32]));
         check!(nonce, base.nonce ^ 1);
         check!(difficulty_target, [0xAAu8; 32]);
-        check!(proof_transcript_hash, [0xAAu8; 32]);
-        check!(witness_root, [0xAAu8; 32]);
         check!(log_slots, base.log_slots + 1);
         check!(active_slot_count, base.active_slot_count + 1);
         check!(alloc_counter, base.alloc_counter + 1);
@@ -182,8 +175,6 @@ mod tests {
         absorb_digest(&mut s, h.miner_address.as_bytes());
         s.absorb(Block128::from(h.nonce));
         absorb_digest(&mut s, &h.difficulty_target);
-        absorb_digest(&mut s, &h.proof_transcript_hash);
-        absorb_digest(&mut s, &h.witness_root);
         s.absorb(Block128::from(h.log_slots as u128));
         s.absorb(Block128::from(h.active_slot_count as u128));
         s.absorb(Block128::from(h.alloc_counter as u128));

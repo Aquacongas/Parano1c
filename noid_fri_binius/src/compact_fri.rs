@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 
 /// Compact FRI TAU: number of high variables handled by tensor decomposition.
 /// TAU=8 means 2^8=256 upper partial evaluations and log_len-8 FRI rounds.
+/// Current Auth traces were benchmarked against TAU=6/7/9; TAU=8 keeps the
+/// best size/verify balance for the production mix.
 pub const COMPACT_TAU: usize = 8;
 
 /// Number of FRI queries for full security. 64 queries with rate-4 code gives:
@@ -44,6 +46,17 @@ pub const COMPACT_NUM_QUERIES: usize = 8;
 
 fn compact_profile_enabled() -> bool {
     std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn compact_verify_profile_enabled() -> bool {
+    std::env::var("NOID_VERIFY_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -474,6 +487,22 @@ pub(crate) fn compact_fri_verify_with_query_hook<E, F>(
 where
     F: FnOnce(&CompactFriQueryContext, &mut Channel) -> Result<E, String>,
 {
+    let profile = compact_verify_profile_enabled();
+    let profile_started = Instant::now();
+    let mut profile_last = profile_started;
+    let mut profile_phase = |name: &'static str| {
+        if profile {
+            let now = Instant::now();
+            eprintln!(
+                "verify_block_profile compact_fri phase log_n={} phase={} elapsed_ms={:.3}",
+                eval_point.len(),
+                name,
+                compact_duration_ms(now.duration_since(profile_last))
+            );
+            profile_last = now;
+        }
+    };
+
     channel.observe_field_elems(eval_point);
 
     let tau = COMPACT_TAU.min(eval_point.len());
@@ -499,6 +528,7 @@ where
         return Err("derived eval does not match claimed eval".into());
     }
     channel.observe_field_elem(eval);
+    profile_phase("eval_claim");
 
     // Tensor batching
     let tensor_batching_point = channel.get_random_points(tau);
@@ -510,6 +540,7 @@ where
         .map(|(&u, &b)| u * b)
         .fold(Block128::ZERO, |a, x| a + x);
     let initial_sumcheck_claim = claim;
+    profile_phase("tensor_batching");
 
     // Verify sumcheck rounds
     let n_rounds = right.len();
@@ -541,6 +572,7 @@ where
         random_point.push(r);
         claim = c0 + c1 * r;
     }
+    profile_phase("sumcheck_rounds");
 
     // Absorb final codeword
     if proof.final_codeword.is_empty() {
@@ -558,14 +590,18 @@ where
         final_codeword: proof.final_codeword.clone(),
     };
     let extra = before_queries(&context, channel)?;
+    profile_phase("before_queries_hook");
 
     // Generate query indices (must match prover)
     let log_domain = n_rounds + LOG_RATE;
     let query_indices = gen_compact_queries(channel, log_domain, num_queries);
     let n_queries = query_indices.len();
+    profile_phase("query_indices");
 
     // Verify each round
     let mut folded_symbols: Vec<Option<Block128>> = vec![None; n_queries];
+    let mut merkle_total = Duration::ZERO;
+    let mut fold_total = Duration::ZERO;
 
     for round in 0..n_rounds {
         let symbols = &proof.fri_queried_symbols[round];
@@ -597,6 +633,7 @@ where
             .map(|&(s0, s1)| hasher.hash_pair(&s0, &s1))
             .collect();
 
+        let merkle_t0 = Instant::now();
         verify_batched_merkle_proof(
             &proof.fri_roots[round],
             batch,
@@ -605,8 +642,10 @@ where
             &leaf_hashes,
             hasher,
         )?;
+        merkle_total += merkle_t0.elapsed();
 
         // Compute folds
+        let fold_t0 = Instant::now();
         let new_folded: Vec<Option<Block128>> = query_indices
             .iter()
             .zip(symbols.iter())
@@ -617,7 +656,18 @@ where
             })
             .collect();
         folded_symbols = new_folded;
+        fold_total += fold_t0.elapsed();
     }
+    if profile {
+        eprintln!(
+            "verify_block_profile compact_fri rounds log_n={} n_rounds={} merkle_ms={:.3} fold_ms={:.3}",
+            eval_point.len(),
+            n_rounds,
+            compact_duration_ms(merkle_total),
+            compact_duration_ms(fold_total)
+        );
+    }
+    profile_phase("query_rounds");
 
     // Final codeword check
     let final_len = proof.final_codeword.len();
@@ -640,6 +690,14 @@ where
         query_indices,
     };
 
+    if profile {
+        eprintln!(
+            "verify_block_profile compact_fri summary log_n={} total_ms={:.3}",
+            eval_point.len(),
+            compact_duration_ms(profile_started.elapsed())
+        );
+    }
+
     Ok((query_info, extra))
 }
 
@@ -658,51 +716,30 @@ pub(crate) fn build_batched_merkle_proof(
     leaf_indices: &[usize],
     depth: usize,
 ) -> BatchedMerkleProof {
-    // Collect all node indices that we can derive from the queries themselves.
-    // A node at (layer, idx) is "known" if:
-    //   - It's a query leaf, OR
-    //   - Both its children are known (computable via hashing)
-    //
-    // We only need to include siblings that are NOT known.
-
     let mut siblings = Vec::new();
-    let mut known_at_layer: Vec<std::collections::HashSet<usize>> =
-        vec![std::collections::HashSet::new(); depth + 1];
-
-    // Layer 0 (leaves) — mark all query positions as known
-    for &idx in leaf_indices {
-        known_at_layer[0].insert(idx);
-    }
-
-    // Bottom-up: determine which siblings we need
+    let mut known = sorted_unique_usize(leaf_indices);
     for d in 0..depth {
-        let mut parents_needed: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-        for &idx in &known_at_layer[d] {
-            parents_needed.insert(idx >> 1);
-        }
-
-        for &parent in &parents_needed {
+        let parents = sorted_unique_parents(&known);
+        let mut next = Vec::with_capacity(parents.len());
+        for &parent in &parents {
             let left_child = parent * 2;
             let right_child = parent * 2 + 1;
-            let left_known = known_at_layer[d].contains(&left_child);
-            let right_known = known_at_layer[d].contains(&right_child);
+            let left_known = known.binary_search(&left_child).is_ok();
+            let right_known = known.binary_search(&right_child).is_ok();
 
             if left_known && right_known {
-                // Both children known — parent is computable
-                known_at_layer[d + 1].insert(parent);
             } else if left_known {
-                // Need right sibling
                 let sibling_hash = tree.get_node_at_depth(depth - d, right_child);
                 siblings.push(sibling_hash);
-                known_at_layer[d + 1].insert(parent);
             } else if right_known {
-                // Need left sibling
                 let sibling_hash = tree.get_node_at_depth(depth - d, left_child);
                 siblings.push(sibling_hash);
-                known_at_layer[d + 1].insert(parent);
+            }
+            if left_known || right_known {
+                next.push(parent);
             }
         }
+        known = next;
     }
 
     BatchedMerkleProof { siblings }
@@ -721,37 +758,32 @@ pub(crate) fn verify_batched_merkle_proof(
         return Err("leaf index/hash count mismatch".into());
     }
 
-    // Reconstruct bottom-up, consuming siblings as needed.
-    let mut known: std::collections::HashMap<(usize, usize), HashOutput> =
-        std::collections::HashMap::new();
-
-    // Layer 0: insert leaf hashes (check consistency for duplicates)
-    for (i, &idx) in leaf_indices.iter().enumerate() {
-        if let Some(&existing) = known.get(&(0, idx)) {
-            if existing != leaf_hashes[i] {
-                return Err(format!("inconsistent leaf hashes for index {idx}"));
-            }
-        } else {
-            known.insert((0, idx), leaf_hashes[i]);
-        }
-    }
+    let (mut known_indices, mut known_hashes) =
+        sorted_unique_leaf_hashes(leaf_indices, leaf_hashes)
+            .map_err(|idx| format!("inconsistent leaf hashes for index {idx}"))?;
 
     let mut sib_cursor = 0usize;
-
     for d in 0..depth {
-        let mut parents_needed: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-        for (&(layer, idx), _) in known.iter() {
-            if layer == d {
-                parents_needed.insert(idx >> 1);
-            }
-        }
-
-        for &parent in &parents_needed {
+        let mut next_indices = Vec::new();
+        let mut next_hashes = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < known_indices.len() {
+            let parent = known_indices[cursor] >> 1;
             let left_child = parent * 2;
-            let right_child = parent * 2 + 1;
-            let left = known.get(&(d, left_child)).copied();
-            let right = known.get(&(d, right_child)).copied();
+            let right_child = left_child + 1;
+            let mut left = None;
+            let mut right = None;
+            while cursor < known_indices.len() && (known_indices[cursor] >> 1) == parent {
+                let idx = known_indices[cursor];
+                if idx == left_child {
+                    left = Some(known_hashes[cursor]);
+                } else if idx == right_child {
+                    right = Some(known_hashes[cursor]);
+                } else {
+                    return Err(format!("bad child index {idx} at layer {d}"));
+                }
+                cursor += 1;
+            }
 
             let parent_hash = match (left, right) {
                 (Some(l), Some(r)) => hasher.compress(&l, &r),
@@ -775,15 +807,17 @@ pub(crate) fn verify_batched_merkle_proof(
                     return Err(format!("orphan parent at layer {d} idx {parent}"));
                 }
             };
-            known.insert((d + 1, parent), parent_hash);
+            next_indices.push(parent);
+            next_hashes.push(parent_hash);
         }
+        known_indices = next_indices;
+        known_hashes = next_hashes;
     }
 
-    // The root should be at (depth, 0)
-    let computed_root = known
-        .get(&(depth, 0))
-        .ok_or_else(|| "failed to compute root".to_string())?;
-    if computed_root != root {
+    if known_indices.len() != 1 || known_indices[0] != 0 {
+        return Err("failed to compute root".to_string());
+    }
+    if &known_hashes[0] != root {
         return Err("batched Merkle root mismatch".into());
     }
 
@@ -795,6 +829,52 @@ pub(crate) fn verify_batched_merkle_proof(
     }
 
     Ok(())
+}
+
+fn sorted_unique_usize(values: &[usize]) -> Vec<usize> {
+    let mut out = values.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn sorted_unique_parents(values: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(values.len());
+    let mut last = None;
+    for &value in values {
+        let parent = value >> 1;
+        if last != Some(parent) {
+            out.push(parent);
+            last = Some(parent);
+        }
+    }
+    out
+}
+
+fn sorted_unique_leaf_hashes(
+    leaf_indices: &[usize],
+    leaf_hashes: &[HashOutput],
+) -> Result<(Vec<usize>, Vec<HashOutput>), usize> {
+    let mut pairs: Vec<(usize, HashOutput)> = leaf_indices
+        .iter()
+        .copied()
+        .zip(leaf_hashes.iter().copied())
+        .collect();
+    pairs.sort_unstable_by_key(|(idx, _)| *idx);
+
+    let mut indices = Vec::with_capacity(pairs.len());
+    let mut hashes = Vec::with_capacity(pairs.len());
+    for (idx, hash) in pairs {
+        if indices.last().copied() == Some(idx) {
+            if hashes.last().copied() != Some(hash) {
+                return Err(idx);
+            }
+        } else {
+            indices.push(idx);
+            hashes.push(hash);
+        }
+    }
+    Ok((indices, hashes))
 }
 
 // ---------------------------------------------------------------------------

@@ -35,10 +35,11 @@ pub struct ReceiptVerifyResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockTemplateResponse {
-    /// 212-byte header_core as hex — the exact 212-byte buffer to hash.
-    /// Patch bytes [144..160] (the nonce field, 16 bytes LE u128) to try each nonce.
-    /// Valid nonce N satisfies: Blake3(patched_header_core) < difficulty_target.
-    pub header_core_hex: String,
+    /// Fixed 16-field Poseidon2b PoW input as hex.
+    /// Each field is serialized as 16 little-endian bytes. Patch field 10
+    /// with the LE u128 nonce. A valid nonce satisfies:
+    /// `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`.
+    pub pow_fields_hex: String,
     /// Full sealed block bytes (hex) with nonce = 0.
     /// External miner: patch bytes at nonce_offset (144..160) with the found nonce.
     pub block_hex: String,
@@ -49,10 +50,10 @@ pub struct BlockTemplateResponse {
     /// Submit this alongside `block_hex` and `block_proof_hex` to `submitBlock`.
     #[serde(default)]
     pub block_auth_sidecar_hex: String,
-    /// Byte offset of the nonce field inside `block_hex` (NOT inside `header_core_hex`).
+    /// Byte offset of the nonce field inside `block_hex`.
     /// Always 144 bytes from the start of the block header (= start of block bytes).
     pub nonce_offset: usize,
-    /// Difficulty target as 64-char little-endian hex. Find N such that Blake3(patched_header_core) < target.
+    /// Difficulty target as 64-char little-endian hex.
     pub difficulty_target_hex: String,
     pub height: u64,
     /// Total transaction count including coinbase.
@@ -104,7 +105,7 @@ pub struct WalletAddressInfo {
 pub struct WalletStatus {
     /// Whether a wallet file exists.
     pub exists: bool,
-    /// Primary address (index 0) as 64-char hex, or empty string.
+    /// Primary address (index 0) as bech32m, or empty string.
     pub address: String,
     /// Total confirmed balance in μNOID.
     pub balance_micronoid: u64,
@@ -293,10 +294,8 @@ pub struct BlockHeaderInfo {
     pub timestamp: u64,
     /// Coinbase recipient address (bech32m).
     pub miner: String,
-    /// Blake3 PoW difficulty target (64-char hex, LE).
+    /// Poseidon2b PoW difficulty target (64-char hex, LE).
     pub difficulty_target: String,
-    /// Fiat-Shamir transcript digest of the BlockProof.
-    pub proof_transcript_hash: String,
     /// log₂ of total UTXO slot space capacity.
     pub log_slots: u32,
     /// Live UTXO count after this block.
@@ -333,8 +332,9 @@ pub struct MiningInfo {
     pub block_reward_noid: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
     pub active_slot_count: u64,
-    /// Height covered by the latest recursive chain proof, if available.
-    pub recursive_proof_height: Option<u64>,
+    /// Height covered by the latest local finalized-history cache object, if available.
+    /// This is a local diagnostic and is not public O(1) snapshot authority.
+    pub local_history_cache_height: Option<u64>,
 }
 
 /// Current UTXO state dimensions and fill metrics.

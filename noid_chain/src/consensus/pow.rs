@@ -1,147 +1,206 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Blake3 Proof-of-Work validation.
+//! Poseidon2b proof-of-work validation.
 //!
-//! PoW is computed over `header_core` which does NOT include
-//! `proof_transcript_hash` or `witness_root`. This allows PoW search and
-//! certificate assembly to run in parallel: both are committed to the chain
-//! (the next block's `prev_block_hash` = Blake3 of the FULL header), but miners
-//! only need `header_core` to start searching.
+//! The mining digest is a fixed-field Poseidon2b sponge over the semantic
+//! header fields, under the dedicated `POWHDR__` capacity IV.
 //!
-//! # Wire layout of header_core (212 bytes)
+//! The absorbed field schedule is fixed at 16 `Block128` elements:
 //!
 //! ```text
-//! prev_block_hash       [32B]
-//! state_root            [32B]
-//! tx_root               [32B]
-//! timestamp             [ 8B]  LE u64
-//! height                [ 8B]  LE u64
-//! miner_address         [32B]
-//! nonce                 [16B]  LE u128
-//! difficulty_target     [32B]
-//! log_slots             [ 4B]  LE u32
-//! active_slot_count     [ 8B]  LE u64
-//! alloc_counter         [ 8B]  LE u64
-//! ---
-//! Total: 212 bytes
+//! prev_block_hash       2 fields
+//! state_root            2 fields
+//! tx_root               2 fields
+//! timestamp             1 field   zero-extended LE u64
+//! height                1 field   zero-extended LE u64
+//! miner_address         2 fields
+//! nonce                 1 field   LE u128
+//! difficulty_target     2 fields
+//! log_slots             1 field   zero-extended LE u32
+//! active_slot_count     1 field   zero-extended LE u64
+//! alloc_counter         1 field   zero-extended LE u64
 //! ```
+//!
+//! With Poseidon2b `rate = 2`, this is exactly eight rate blocks and uses
+//! `finalize_no_pad()`. Domain separation comes from `POWHDR__`; the semantic
+//! chain-link id uses the distinct `BLOCKHDR` domain.
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{difficulty::le256_lt, ConsensusError};
+use noid_core::packed::{PackedBlock128, PACKED_LANES};
+use noid_core::{Block128, TowerField};
+use noid_poseidon2b::batch::packed_poseidon2b_permute;
+use noid_poseidon2b::native::compression::Poseidon2bSponge;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_POWHDR};
 
-/// 212-byte `header_core` — the bytes that PoW is computed over.
-/// Does NOT include `proof_transcript_hash` or `witness_root`.
-pub type HeaderCoreBytes = Vec<u8>;
-
-/// Byte offset of the `nonce` field in the 212-byte `header_core` buffer.
-/// Layout: prev_block_hash(32) + state_root(32) + tx_root(32)
-///        + timestamp(8) + height(8) + miner_address(32) = 144 bytes before nonce.
-pub const NONCE_OFFSET: usize = 144;
-
-/// Write `header_core` into a pre-allocated 212-byte stack buffer (zero allocation).
-/// Call once per thread before the nonce loop, then patch only
-/// `buf[NONCE_OFFSET..NONCE_OFFSET+16]` on each iteration.
-pub fn header_core_bytes_into(h: &BlockHeader, buf: &mut [u8; 212]) {
-    buf[0..32].copy_from_slice(&h.prev_block_hash);
-    buf[32..64].copy_from_slice(&h.state_root);
-    buf[64..96].copy_from_slice(&h.tx_root);
-    buf[96..104].copy_from_slice(&h.timestamp.to_le_bytes());
-    buf[104..112].copy_from_slice(&h.height.to_le_bytes());
-    buf[112..144].copy_from_slice(h.miner_address.as_bytes());
-    buf[144..160].copy_from_slice(&h.nonce.to_le_bytes());
-    buf[160..192].copy_from_slice(&h.difficulty_target);
-    buf[192..196].copy_from_slice(&h.log_slots.to_le_bytes());
-    buf[196..204].copy_from_slice(&h.active_slot_count.to_le_bytes());
-    buf[204..212].copy_from_slice(&h.alloc_counter.to_le_bytes());
-    debug_assert_eq!(buf.len(), 212);
-}
-
-/// Full block hash (Blake3 of the complete block header, including proof fields).
+/// Consensus semantic block id.
 pub type BlockHash = [u8; 32];
 
-/// Serialize `header_core` (PoW input) from a `BlockHeader`.
-///
-/// The nonce is included; changing the nonce changes the hash.
-/// `proof_transcript_hash` and `witness_root` are excluded so that
-/// Certificate assembly and PoW search can proceed in parallel.
-pub fn header_core_bytes(h: &BlockHeader) -> HeaderCoreBytes {
-    let mut buf = Vec::with_capacity(212);
-    buf.extend_from_slice(&h.prev_block_hash);
-    buf.extend_from_slice(&h.state_root);
-    buf.extend_from_slice(&h.tx_root);
-    buf.extend_from_slice(&h.timestamp.to_le_bytes());
-    buf.extend_from_slice(&h.height.to_le_bytes());
-    buf.extend_from_slice(h.miner_address.as_bytes());
-    buf.extend_from_slice(&h.nonce.to_le_bytes());
-    buf.extend_from_slice(&h.difficulty_target);
-    buf.extend_from_slice(&h.log_slots.to_le_bytes());
-    buf.extend_from_slice(&h.active_slot_count.to_le_bytes());
-    buf.extend_from_slice(&h.alloc_counter.to_le_bytes());
-    debug_assert_eq!(buf.len(), 212);
-    buf
+/// Number of `Block128` field elements absorbed by `poseidon_pow_digest`.
+pub const POW_HEADER_FIELD_COUNT: usize = 16;
+
+/// Index of the nonce field in the fixed PoW field schedule.
+pub const POW_NONCE_FIELD_INDEX: usize = 10;
+
+pub type PowHeaderFields = [Block128; POW_HEADER_FIELD_COUNT];
+
+/// Compute the semantic block id (used as `prev_block_hash` in the next block).
+#[inline]
+pub fn block_id(h: &BlockHeader) -> BlockHash {
+    crate::block_header::block_id(h)
 }
 
-/// Compute the full block hash (used as `prev_block_hash` in the next block).
+/// Fill the fixed Poseidon2b PoW field schedule for a header.
+pub fn pow_header_fields_into(h: &BlockHeader, out: &mut PowHeaderFields) {
+    let mut i = 0usize;
+    put_digest(out, &mut i, &h.prev_block_hash);
+    put_digest(out, &mut i, &h.state_root);
+    put_digest(out, &mut i, &h.tx_root);
+    out[i] = Block128::from(h.timestamp as u128);
+    i += 1;
+    out[i] = Block128::from(h.height as u128);
+    i += 1;
+    put_digest(out, &mut i, h.miner_address.as_bytes());
+    debug_assert_eq!(i, POW_NONCE_FIELD_INDEX);
+    out[i] = Block128::from(h.nonce);
+    i += 1;
+    put_digest(out, &mut i, &h.difficulty_target);
+    out[i] = Block128::from(h.log_slots as u128);
+    i += 1;
+    out[i] = Block128::from(h.active_slot_count as u128);
+    i += 1;
+    out[i] = Block128::from(h.alloc_counter as u128);
+    i += 1;
+    debug_assert_eq!(i, POW_HEADER_FIELD_COUNT);
+}
+
+/// Return the fixed Poseidon2b PoW field schedule for a header.
+pub fn pow_header_fields(h: &BlockHeader) -> PowHeaderFields {
+    let mut fields = [Block128::ZERO; POW_HEADER_FIELD_COUNT];
+    pow_header_fields_into(h, &mut fields);
+    fields
+}
+
+/// Compute `H_POSEIDON_POW(header)`.
+#[inline]
+pub fn poseidon_pow_digest(header: &BlockHeader) -> BlockHash {
+    poseidon_pow_digest_from_fields(&pow_header_fields(header))
+}
+
+/// Compute `H_POSEIDON_POW(fields)` from an already materialized field schedule.
+pub fn poseidon_pow_digest_from_fields(fields: &PowHeaderFields) -> BlockHash {
+    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_POWHDR));
+    for chunk in fields.chunks_exact(2) {
+        sponge.absorb_pair(chunk[0], chunk[1]);
+    }
+    sponge.finalize_no_pad()
+}
+
+/// Compute `H_POSEIDON_POW` for consecutive nonce values.
 ///
-/// This covers the COMPLETE header including `proof_transcript_hash`.
-/// Different from the PoW hash: `proof_transcript_hash` is included here
-/// so the full header is committed to the chain.
-pub fn full_block_hash(h: &BlockHeader) -> BlockHash {
-    use blake3::Hasher;
-    let mut hasher = Hasher::new();
-    // Full header: header_core + proof_transcript_hash + witness_root
-    hasher.update(&header_core_bytes(h));
-    hasher.update(&h.proof_transcript_hash);
-    hasher.update(&h.witness_root);
-    *hasher.finalize().as_bytes()
+/// `out[i]` is the digest for `fields` with nonce `start_nonce + i`.
+/// The packed path is consensus-equivalent to [`poseidon_pow_digest_from_fields`]
+/// and only changes how many independent permutations are evaluated together.
+pub fn poseidon_pow_digest_nonce_batch(
+    fields: &PowHeaderFields,
+    start_nonce: u128,
+    out: &mut [[u8; 32]],
+) {
+    if out.is_empty() {
+        return;
+    }
+
+    let [iv_hi, iv_lo] = capacity_iv(TAG_POWHDR);
+    let mut offset = 0usize;
+    while offset < out.len() {
+        let lanes = (out.len() - offset).min(PACKED_LANES);
+        let mut states = [PackedBlock128::ZERO; 4];
+        states[2] = PackedBlock128::broadcast(iv_hi);
+        states[3] = PackedBlock128::broadcast(iv_lo);
+
+        for pair in 0..(POW_HEADER_FIELD_COUNT / 2) {
+            let left_idx = pair * 2;
+            let right_idx = left_idx + 1;
+            let mut left = PackedBlock128::broadcast(fields[left_idx]);
+            let mut right = PackedBlock128::broadcast(fields[right_idx]);
+            if left_idx == POW_NONCE_FIELD_INDEX {
+                left = PackedBlock128::ZERO;
+                for lane in 0..lanes {
+                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
+                    left = left.set_lane(lane, Block128::from(nonce));
+                }
+            } else if right_idx == POW_NONCE_FIELD_INDEX {
+                right = PackedBlock128::ZERO;
+                for lane in 0..lanes {
+                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
+                    right = right.set_lane(lane, Block128::from(nonce));
+                }
+            }
+            states[0] = states[0].xor(left);
+            states[1] = states[1].xor(right);
+            packed_poseidon2b_permute(&mut states);
+        }
+
+        for lane in 0..lanes {
+            let s0 = states[0].get_lane(lane);
+            let s1 = states[1].get_lane(lane);
+            out[offset + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
+            out[offset + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
+        }
+        offset += lanes;
+    }
 }
 
 /// Validate that the block satisfies the declared PoW target.
 ///
-/// Computes `pow_hash = Blake3(header_core_bytes(header))` and checks
-/// `pow_hash < header.difficulty_target` (both as 256-bit LE integers).
-///
-/// Returns `Ok(pow_hash)` on success.
+/// Computes `pow_digest = H_POSEIDON_POW(header)` and checks
+/// `pow_digest < header.difficulty_target` as little-endian 256-bit integers.
+/// Equality is rejected.
 pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
-    let core = header_core_bytes(header);
-    let hash = *blake3::hash(&core).as_bytes();
-
-    // Compare as 256-bit little-endian integers: byte 31 is most significant.
-    if le256_lt(&hash, &header.difficulty_target) {
-        Ok(hash)
+    let digest = poseidon_pow_digest(header);
+    if le256_lt(&digest, &header.difficulty_target) {
+        Ok(digest)
     } else {
         Err(ConsensusError::InvalidPoW)
     }
 }
 
 /// Search for a valid PoW nonce in `[start, start + range)`.
-///
-/// Returns `Some(nonce)` if a valid nonce is found, `None` otherwise.
-/// This is called by the mining engine in parallel across thread ranges.
-///
-/// Uses a pre-allocated 212-byte stack buffer and patches only the 16 nonce
-/// bytes per iteration — no heap allocation in the inner loop.
 pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128) -> Option<u128> {
-    let mut buf = [0u8; 212];
-    header_core_bytes_into(header_template, &mut buf);
+    let fields = pow_header_fields(header_template);
     let target = &header_template.difficulty_target;
-    for nonce in start_nonce..start_nonce.saturating_add(range) {
-        buf[NONCE_OFFSET..NONCE_OFFSET + 16].copy_from_slice(&nonce.to_le_bytes());
-        let hash = *blake3::hash(&buf).as_bytes();
-        if le256_lt(&hash, target) {
-            return Some(nonce);
+    let mut digests = [[0u8; 32]; 64];
+    let mut done = 0u128;
+    while done < range {
+        let batch_len = ((range - done).min(digests.len() as u128)) as usize;
+        let nonce_base = start_nonce.saturating_add(done);
+        poseidon_pow_digest_nonce_batch(&fields, nonce_base, &mut digests[..batch_len]);
+        for (i, digest) in digests[..batch_len].iter().enumerate() {
+            if le256_lt(digest, target) {
+                return Some(nonce_base.saturating_add(i as u128));
+            }
         }
+        done += batch_len as u128;
     }
     None
+}
+
+#[inline]
+fn put_digest(out: &mut PowHeaderFields, index: &mut usize, digest: &[u8; 32]) {
+    out[*index] = Block128::from(u128::from_le_bytes(digest[..16].try_into().unwrap()));
+    *index += 1;
+    out[*index] = Block128::from(u128::from_le_bytes(digest[16..].try_into().unwrap()));
+    *index += 1;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_header::BlockHeader;
+    use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR};
     use noid_poseidon2b::primitives::Address;
-    // Trivially-satisfiable test target: any Blake3 hash < [0xFF;32].
+
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
     fn dummy_header() -> BlockHeader {
@@ -154,8 +213,6 @@ mod tests {
             miner_address: Address([3u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [4u8; 32],
-            witness_root: [5u8; 32],
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -163,61 +220,91 @@ mod tests {
     }
 
     #[test]
-    fn header_core_bytes_length() {
+    fn pow_field_schedule_is_fixed_and_canonical() {
+        let mut h = dummy_header();
+        h.prev_block_hash = [0x10; 32];
+        h.state_root = [0x20; 32];
+        h.tx_root = [0x30; 32];
+        h.timestamp = 0x0102_0304_0506_0708;
+        h.height = 0x1112_1314_1516_1718;
+        h.miner_address = Address([0x40; 32]);
+        h.nonce = 0x2122_2324_2526_2728_3132_3334_3536_3738;
+        h.difficulty_target = [0x50; 32];
+        h.log_slots = 0x6162_6364;
+        h.active_slot_count = 0x7172_7374_7576_7778;
+        h.alloc_counter = 0x8182_8384_8586_8788;
+
+        let fields = pow_header_fields(&h);
+        assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
+        assert_eq!(POW_NONCE_FIELD_INDEX, 10);
+        assert_eq!(fields[0], digest_half(&h.prev_block_hash, 0));
+        assert_eq!(fields[1], digest_half(&h.prev_block_hash, 1));
+        assert_eq!(fields[2], digest_half(&h.state_root, 0));
+        assert_eq!(fields[3], digest_half(&h.state_root, 1));
+        assert_eq!(fields[4], digest_half(&h.tx_root, 0));
+        assert_eq!(fields[5], digest_half(&h.tx_root, 1));
+        assert_eq!(fields[6], Block128::from(h.timestamp as u128));
+        assert_eq!(fields[7], Block128::from(h.height as u128));
+        assert_eq!(fields[8], digest_half(h.miner_address.as_bytes(), 0));
+        assert_eq!(fields[9], digest_half(h.miner_address.as_bytes(), 1));
+        assert_eq!(fields[10], Block128::from(h.nonce));
+        assert_eq!(fields[11], digest_half(&h.difficulty_target, 0));
+        assert_eq!(fields[12], digest_half(&h.difficulty_target, 1));
+        assert_eq!(fields[13], Block128::from(h.log_slots as u128));
+        assert_eq!(fields[14], Block128::from(h.active_slot_count as u128));
+        assert_eq!(fields[15], Block128::from(h.alloc_counter as u128));
+    }
+
+    #[test]
+    fn pow_digest_uses_distinct_domain_from_block_id() {
         let h = dummy_header();
-        assert_eq!(header_core_bytes(&h).len(), 212);
+        assert_ne!(capacity_iv(TAG_POWHDR), capacity_iv(TAG_BLOCKHDR));
+        assert_ne!(poseidon_pow_digest(&h), block_id(&h));
     }
 
     #[test]
-    fn header_core_excludes_proof_fields() {
-        let mut h1 = dummy_header();
-        let mut h2 = dummy_header();
-        // Different proof_transcript_hash should NOT affect header_core.
-        h1.proof_transcript_hash = [0xAA; 32];
-        h2.proof_transcript_hash = [0xBB; 32];
-        assert_eq!(header_core_bytes(&h1), header_core_bytes(&h2));
-        // But they should produce different full_block_hash.
-        assert_ne!(full_block_hash(&h1), full_block_hash(&h2));
-    }
-
-    #[test]
-    fn nonce_change_changes_pow_hash() {
+    fn nonce_change_changes_pow_digest() {
         let mut h = dummy_header();
-        let bytes1 = header_core_bytes(&h);
+        let digest1 = poseidon_pow_digest(&h);
         h.nonce = 42;
-        let bytes2 = header_core_bytes(&h);
-        assert_ne!(bytes1, bytes2);
+        let digest2 = poseidon_pow_digest(&h);
+        assert_ne!(digest1, digest2);
     }
 
     #[test]
-    fn genesis_target_trivially_satisfiable() {
-        // GENESIS_TARGET = 2^228: avg 2^28 ≈ 268 M attempts.
-        // Use a header with the real GENESIS_TARGET (dummy_header uses TEST_TARGET now).
-        use crate::consensus::params::GENESIS_TARGET;
-        use rayon::prelude::*;
+    fn pow_nonce_batch_matches_scalar_for_partial_and_full_chunks() {
+        let h = dummy_header();
+        let fields = pow_header_fields(&h);
+        let start = 123_456u128;
+        let n = PACKED_LANES * 3 + 1;
+        let mut batch = vec![[0u8; 32]; n];
+
+        poseidon_pow_digest_nonce_batch(&fields, start, &mut batch);
+
+        for (i, digest) in batch.iter().enumerate() {
+            let mut scalar_fields = fields;
+            scalar_fields[POW_NONCE_FIELD_INDEX] = Block128::from(start + i as u128);
+            assert_eq!(*digest, poseidon_pow_digest_from_fields(&scalar_fields));
+        }
+    }
+
+    #[test]
+    fn search_pow_returns_nonce_that_validates() {
         let mut h = dummy_header();
-        h.difficulty_target = GENESIS_TARGET;
-        // Parallel search: 12 cores × 19 MH/s ≈ 228 MH/s → avg ~1.2 s.
-        let chunk = 10_000_000u128;
-        let nonce = (0u64..300)
-            .into_par_iter()
-            .find_map_any(|i| search_pow(&h, i as u128 * chunk, chunk))
-            .expect("genesis_target_trivially_satisfiable: no nonce in 3 B attempts");
+        let nonce = search_pow(&h, 0, 16).expect("max target should accept quickly");
         h.nonce = nonce;
         assert!(validate_pow(&h).is_ok());
     }
 
     #[test]
-    fn validate_pow_rejects_wrong_nonce() {
-        // Use a very tight target that a random nonce won't satisfy.
+    fn validate_pow_rejects_zero_target() {
         let mut h = dummy_header();
-        h.difficulty_target = [0u8; 32]; // impossible target (0)
+        h.difficulty_target = [0u8; 32];
         assert_eq!(validate_pow(&h), Err(ConsensusError::InvalidPoW));
     }
 
     #[test]
-    fn validate_pow_accepts_valid_nonce() {
-        // dummy_header uses TEST_TARGET = [0xFF;32]: nonce=0 trivially satisfies it.
+    fn validate_pow_accepts_easy_target() {
         let mut h = dummy_header();
         h.nonce = 0;
         assert!(validate_pow(&h).is_ok());
@@ -229,11 +316,19 @@ mod tests {
         let mut one = [0u8; 32];
         one[0] = 1;
         let mut big = [0u8; 32];
-        big[31] = 1; // = 2^248
+        big[31] = 1;
 
         assert!(le256_lt(&zero, &one));
         assert!(le256_lt(&one, &big));
         assert!(!le256_lt(&big, &zero));
-        assert!(!le256_lt(&one, &one)); // equal → false
+        assert!(!le256_lt(&one, &one));
+    }
+
+    #[inline]
+    fn digest_half(digest: &[u8; 32], half: usize) -> Block128 {
+        let offset = half * 16;
+        Block128::from(u128::from_le_bytes(
+            digest[offset..offset + 16].try_into().unwrap(),
+        ))
     }
 }

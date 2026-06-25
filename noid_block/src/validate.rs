@@ -7,9 +7,9 @@
 //! for a full node receiving a block from the network:
 //!
 //! 1. `validate_block_checks()` — cheap header/PoW/fee checks.
-//! 2. Verify the canonical minimal `BlockProof`: exact public transaction
-//!    predicates, wallet authorization capsules, and exact authenticated state
-//!    transition.
+//! 2. Verify the detached minimal `BlockProof` and Auth sidecar: exact public
+//!    transaction predicates, wallet authorization capsules, and exact
+//!    authenticated state transition.
 //! 3. Commit the already-verified exact transition without
 //!    running native `apply_block` as a second validity source.
 //!
@@ -23,25 +23,24 @@
 //! The `spend_secret` (private key) is NEVER transmitted, NEVER accessed
 //! here, and NEVER needed for verification.
 
-use noid_chain::block::Block;
+use noid_chain::block::{apply_state_delta, validate_block_proof_binding, Block};
 use noid_chain::block_header::BlockHeader;
-use noid_chain::consensus::validation::{validate_block_checks, AnchorInfo};
+use noid_chain::consensus::validation::{
+    validate_block_checks, validate_block_checks_timeless, AnchorInfo,
+};
 use noid_chain::consensus::wire_limits::{
-    proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_PROOF_BYTES,
+    block_resource_weight_ok, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
+    MAX_BLOCK_PROOF_BYTES,
 };
 use noid_chain::consensus::ConsensusError;
 use noid_chain::state::ChainState;
 use noid_chain::state_delta::{build_exact_action_surface, ExactActionSurface, StateDeltaError};
-use noid_core::Block128;
 
-use crate::{
-    block_auth_sidecar_root, block_recursive_claim_hash, BlockAuthSidecar, BlockProof,
-    VerifyBlockError,
-};
+use crate::{BlockAuthSidecar, BlockProof, VerifyBlockError};
 
 use noid_gkr::{
-    owner_auth_gkr_channel, owner_auth_public_from_body, verify_owner_auth_killshot,
-    OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs,
+    canonical_authorization_statement_from_body, verify_authorization_statement_proof,
+    VerifyAuthorizationError,
 };
 use noid_tx::{compute_claims_commitment, validate_public_tx_logic, Transaction};
 use rayon::prelude::*;
@@ -84,20 +83,30 @@ impl std::error::Error for FullValidationError {}
 // Main entry point
 // ---------------------------------------------------------------------------
 
-pub type AuthorizationProof = OwnerAuthProofKillShot;
+pub use noid_gkr::{
+    CanonicalAuthorizationStatement, VerifiedAuthorization, VerifiedAuthorizationBatch,
+};
+
+pub type AuthorizationProof = noid_gkr::OwnerAuthProofKillShot;
 
 #[derive(Debug, Clone)]
-pub struct CanonicalAuthorizationStatement {
-    pub tx_index: usize,
-    pub tx_body_hash: [Block128; 2],
-    pub public: OwnerAuthPublicInputs,
+pub struct AcceptedBlockValidationArtifacts {
+    pub authorization: VerifiedAuthorizationBatch,
+    pub exact_state_inputs: crate::ExactStateTransitionInputs,
+    pub exact_action_surface: ExactActionSurface,
+    pub verified_transition: crate::VerifiedStateTransition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerifiedAuthorization {
-    pub tx_index: usize,
-    pub owner_count: usize,
-    pub live_input_count: usize,
+#[derive(Debug, Clone)]
+pub struct AcceptedBlockValidationOutput {
+    pub state_root: [u8; 32],
+    pub artifacts: AcceptedBlockValidationArtifacts,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptedBlockRawValidationOutput {
+    pub state_root: [u8; 32],
+    pub artifacts: Option<AcceptedBlockValidationArtifacts>,
 }
 
 pub trait AuthorizationVerifier: Sync {
@@ -117,20 +126,16 @@ impl AuthorizationVerifier for OwnerAuthAuthorizationVerifier {
         statement: &CanonicalAuthorizationStatement,
         proof: &AuthorizationProof,
     ) -> Result<VerifiedAuthorization, VerifyBlockError> {
-        let circuit = OwnerAuthCircuit::build(statement.public.layout);
-        let mut channel = owner_auth_gkr_channel();
-        verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
-            .ok_or(VerifyBlockError::AuthKillShot(statement.tx_index))?;
-
-        if statement.public.tx_body_hash != statement.tx_body_hash {
-            return Err(VerifyBlockError::AuthSpineBridge(statement.tx_index));
+        match verify_authorization_statement_proof(statement, proof) {
+            Ok(verified) => Ok(verified),
+            Err(VerifyAuthorizationError::AuthProof) => {
+                Err(VerifyBlockError::AuthKillShot(statement.tx_index))
+            }
+            Err(VerifyAuthorizationError::OwnerAuthStatement(_))
+            | Err(VerifyAuthorizationError::PublicLogic(_)) => {
+                Err(VerifyBlockError::AuthSpineBridge(statement.tx_index))
+            }
         }
-
-        Ok(VerifiedAuthorization {
-            tx_index: statement.tx_index,
-            owner_count: statement.public.layout.owner_count,
-            live_input_count: statement.public.live_input_positions.len(),
-        })
     }
 }
 
@@ -158,18 +163,114 @@ pub fn validate_block_full(
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
-    // Header + tx checks (cheap, fail-fast — no state reads, no apply_block).
-    validate_block_checks(
+    validate_block_full_inner(
         block,
+        proof,
+        auth_sidecar,
         parent,
         prev_timestamps,
         prev_active_counts,
-        local_time,
+        TimestampPolicy::Live(local_time),
         anchor,
-    )?;
+        state,
+    )
+    .map(|output| output.state_root)
+}
+
+/// Timeless form of the production `AcceptBlock` predicate for recursive
+/// history proofs.
+///
+/// This verifies the same proof-native block validity relation as
+/// [`validate_block_full`] while excluding only the local wall-clock
+/// future-drift admission policy.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_block_full_timeless(
+    block: &Block,
+    proof: &BlockProof,
+    auth_sidecar: &BlockAuthSidecar,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<[u8; 32], FullValidationError> {
+    validate_block_full_timeless_with_artifacts(
+        block,
+        proof,
+        auth_sidecar,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        state,
+    )
+    .map(|output| output.state_root)
+}
+
+/// Timeless form of [`validate_block_full_timeless`] that also returns the
+/// proof-facing artifacts reconstructed by `AcceptBlock`.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_block_full_timeless_with_artifacts(
+    block: &Block,
+    proof: &BlockProof,
+    auth_sidecar: &BlockAuthSidecar,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<AcceptedBlockValidationOutput, FullValidationError> {
+    validate_block_full_inner(
+        block,
+        proof,
+        auth_sidecar,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Timeless,
+        anchor,
+        state,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimestampPolicy {
+    Live(u64),
+    Timeless,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_block_full_inner(
+    block: &Block,
+    proof: &BlockProof,
+    auth_sidecar: &BlockAuthSidecar,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    timestamp_policy: TimestampPolicy,
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<AcceptedBlockValidationOutput, FullValidationError> {
+    // Header + tx checks (cheap, fail-fast — no state reads, no apply_block).
+    match timestamp_policy {
+        TimestampPolicy::Live(local_time) => validate_block_checks(
+            block,
+            parent,
+            prev_timestamps,
+            prev_active_counts,
+            local_time,
+            anchor,
+        )?,
+        TimestampPolicy::Timeless => validate_block_checks_timeless(
+            block,
+            parent,
+            prev_timestamps,
+            prev_active_counts,
+            anchor,
+        )?,
+    }
 
     validate_minimal_block_proof_shape(block, proof).map_err(FullValidationError::ZkProof)?;
-    validate_block_proof_transcript_hash(block, proof).map_err(FullValidationError::ZkProof)?;
     if proof.meta.prev_block_state_root != parent.state_root {
         return Err(FullValidationError::ZkProof(
             crate::VerifyBlockError::PrevStateRootMismatch,
@@ -181,8 +282,12 @@ pub fn validate_block_full(
         ));
     }
     validate_block_public_logic(block).map_err(FullValidationError::ZkProof)?;
-    validate_block_authorizations(block, auth_sidecar, &OwnerAuthAuthorizationVerifier)
-        .map_err(FullValidationError::ZkProof)?;
+    let authorization = validate_block_authorizations_with_output(
+        block,
+        auth_sidecar,
+        &OwnerAuthAuthorizationVerifier,
+    )
+    .map_err(FullValidationError::ZkProof)?;
 
     let surface =
         build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
@@ -239,7 +344,15 @@ pub fn validate_block_full(
         ));
     }
 
-    Ok(block.header.state_root)
+    Ok(AcceptedBlockValidationOutput {
+        state_root: block.header.state_root,
+        artifacts: AcceptedBlockValidationArtifacts {
+            authorization,
+            exact_state_inputs: inputs,
+            exact_action_surface: surface,
+            verified_transition: verified,
+        },
+    })
 }
 
 fn validate_minimal_block_proof_shape(
@@ -251,12 +364,7 @@ fn validate_minimal_block_proof_shape(
         .iter()
         .filter(|tx| !tx.body.is_coinbase)
         .count();
-    if proof.meta.n_tx as usize != expected_non_coinbase
-        || proof.meta.n_air_per_tx != 0
-        || proof.meta.n_auth_slices_per_tx != 0
-        || proof.meta.log_rows != 0
-        || proof.meta.n_block_spine_slices != 0
-    {
+    if proof.meta.n_tx as usize != expected_non_coinbase {
         return Err(VerifyBlockError::ShapeMismatch);
     }
 
@@ -282,7 +390,15 @@ pub fn validate_block_authorizations<V: AuthorizationVerifier>(
     sidecar: &BlockAuthSidecar,
     verifier: &V,
 ) -> Result<(), VerifyBlockError> {
-    validate_block_auth_sidecar_root(block, sidecar)?;
+    validate_block_authorizations_with_output(block, sidecar, verifier).map(|_| ())
+}
+
+pub fn validate_block_authorizations_with_output<V: AuthorizationVerifier>(
+    block: &Block,
+    sidecar: &BlockAuthSidecar,
+    verifier: &V,
+) -> Result<VerifiedAuthorizationBatch, VerifyBlockError> {
+    validate_block_auth_sidecar_shape(block, sidecar)?;
     let user_txs: Vec<(usize, &Transaction)> = block
         .transactions
         .iter()
@@ -297,25 +413,32 @@ pub fn validate_block_authorizations<V: AuthorizationVerifier>(
         .par_iter()
         .zip(sidecar.tx_auth.par_iter())
         .map(|((tx_index, tx), proof)| {
-            let public = owner_auth_public_from_body(&tx.body)
-                .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
-            let statement = CanonicalAuthorizationStatement {
-                tx_index: *tx_index,
-                tx_body_hash: tx.tx_body_hash.as_fields(),
-                public,
-            };
+            let statement = canonical_authorization_statement_from_body(
+                *tx_index,
+                tx.tx_body_hash.as_fields(),
+                &tx.body,
+            )
+            .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
             verifier.verify(&statement, proof)
         })
         .collect();
 
+    let mut owner_count_total = 0usize;
+    let mut live_input_count_total = 0usize;
     for verified in results {
         let verified = verified?;
         if verified.live_input_count == 0 || verified.owner_count == 0 {
             return Err(VerifyBlockError::AuthSidecarShapeMismatch);
         }
+        owner_count_total = owner_count_total.saturating_add(verified.owner_count);
+        live_input_count_total = live_input_count_total.saturating_add(verified.live_input_count);
     }
 
-    Ok(())
+    Ok(VerifiedAuthorizationBatch {
+        user_tx_count: user_txs.len(),
+        owner_count_total,
+        live_input_count_total,
+    })
 }
 
 fn build_exact_surface_for_block(
@@ -378,36 +501,23 @@ fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Header/proof transcript binding
-// ---------------------------------------------------------------------------
-
-pub fn validate_block_proof_transcript_hash(
-    block: &Block,
-    proof: &BlockProof,
-) -> Result<(), VerifyBlockError> {
-    if proof.meta.n_tx > 0
-        && block.header.proof_transcript_hash != block_recursive_claim_hash(proof)
-    {
-        return Err(VerifyBlockError::ProofTranscriptHashMismatch);
-    }
-    Ok(())
-}
-
-pub fn validate_block_auth_sidecar_root(
+pub fn validate_block_auth_sidecar_shape(
     block: &Block,
     sidecar: &BlockAuthSidecar,
 ) -> Result<(), VerifyBlockError> {
-    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if !has_user_txs {
+    let user_tx_count = block
+        .transactions
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .count();
+    if user_tx_count == 0 {
         if !sidecar.tx_auth.is_empty() {
             return Err(VerifyBlockError::AuthSidecarShapeMismatch);
         }
         return Ok(());
     }
-    let expected = block_auth_sidecar_root(block, sidecar)?;
-    if block.header.witness_root != expected {
-        return Err(VerifyBlockError::AuthSidecarRootMismatch);
+    if sidecar.tx_auth.len() != user_tx_count {
+        return Err(VerifyBlockError::AuthSidecarShapeMismatch);
     }
     Ok(())
 }
@@ -416,7 +526,9 @@ pub fn validate_block_auth_sidecar_root(
 // Network-facing entry point
 // ---------------------------------------------------------------------------
 
-/// Full block validation for a receiving full node.
+pub const ACCEPT_BLOCK_PREDICATE_VERSION: u32 = 1;
+
+/// Normative production `AcceptBlock` predicate for a receiving full node.
 ///
 /// Takes the raw `block_proof_bytes` received over P2P and:
 /// 1. Deserialises the `BlockProof`.
@@ -429,7 +541,7 @@ pub fn validate_block_auth_sidecar_root(
 /// `spend_secret` is never accessed or needed. All inputs are reconstructed
 /// from one-way hash outputs (`owner = H_ADDR(secret)`).
 #[allow(clippy::too_many_arguments)]
-pub fn validate_block_from_network(
+pub fn accept_block(
     block: &Block,
     block_proof_bytes: &[u8],
     block_auth_sidecar_bytes: &[u8],
@@ -442,6 +554,111 @@ pub fn validate_block_from_network(
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
     let _ = pre_state;
+    accept_block_inner(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Live(local_time),
+        anchor,
+        state,
+    )
+}
+
+/// Timeless raw-witness `AcceptBlock` predicate for recursive batch witnesses.
+///
+/// This is identical to [`accept_block`] except that local future-drift
+/// admission is excluded.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_timeless(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<[u8; 32], FullValidationError> {
+    accept_block_inner(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Timeless,
+        anchor,
+        state,
+    )
+}
+
+/// Timeless raw-witness `AcceptBlock` predicate that also returns
+/// proof-facing artifacts for user-transaction blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_timeless_with_artifacts(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
+    accept_block_inner_with_artifacts(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Timeless,
+        anchor,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_block_inner(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    timestamp_policy: TimestampPolicy,
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<[u8; 32], FullValidationError> {
+    accept_block_inner_with_artifacts(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        timestamp_policy,
+        anchor,
+        state,
+    )
+    .map(|output| output.state_root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_block_inner_with_artifacts(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    timestamp_policy: TimestampPolicy,
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
     if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
         || !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len())
     {
@@ -454,7 +671,67 @@ pub fn validate_block_from_network(
             crate::VerifyBlockError::AuthSidecarShapeMismatch,
         ));
     }
+    let (user_txs, live_inputs, outputs, state_frontier_nodes) = block_resource_counts(block);
+    if !block_resource_weight_ok(
+        block.to_bytes().len(),
+        block_proof_bytes.len(),
+        block_auth_sidecar_bytes.len(),
+        user_txs,
+        live_inputs,
+        outputs,
+        state_frontier_nodes,
+    ) {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::BlockResourceWeightExceeded,
+        ));
+    }
 
+    if user_txs == 0 {
+        validate_block_proof_binding(block, block_proof_bytes)
+            .map_err(|_| FullValidationError::ZkProof(crate::VerifyBlockError::ShapeMismatch))?;
+        if !block_auth_sidecar_bytes.is_empty() {
+            return Err(FullValidationError::ZkProof(
+                crate::VerifyBlockError::AuthSidecarShapeMismatch,
+            ));
+        }
+        match timestamp_policy {
+            TimestampPolicy::Live(local_time) => validate_block_checks(
+                block,
+                parent,
+                prev_timestamps,
+                prev_active_counts,
+                local_time,
+                anchor,
+            )?,
+            TimestampPolicy::Timeless => validate_block_checks_timeless(
+                block,
+                parent,
+                prev_timestamps,
+                prev_active_counts,
+                anchor,
+            )?,
+        }
+        let transition = apply_state_delta(state, block).map_err(|e| {
+            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
+                format!("coinbase-only apply failed: {e:?}"),
+            ))
+        })?;
+        return Ok(AcceptedBlockRawValidationOutput {
+            state_root: transition.new_state_root,
+            artifacts: None,
+        });
+    }
+
+    if block_proof_bytes.is_empty() {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::ShapeMismatch,
+        ));
+    }
+    if block_auth_sidecar_bytes.is_empty() {
+        return Err(FullValidationError::ZkProof(
+            crate::VerifyBlockError::AuthSidecarShapeMismatch,
+        ));
+    }
     let proof: BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|_| FullValidationError::ZkProof(crate::VerifyBlockError::ShapeMismatch))?;
     let sidecar: BlockAuthSidecar =
@@ -462,17 +739,36 @@ pub fn validate_block_from_network(
             FullValidationError::ZkProof(crate::VerifyBlockError::AuthSidecarShapeMismatch)
         })?;
 
-    validate_block_full(
+    validate_block_full_inner(
         block,
         &proof,
         &sidecar,
         parent,
         prev_timestamps,
         prev_active_counts,
-        local_time,
+        timestamp_policy,
         anchor,
         state,
     )
+    .map(|output| AcceptedBlockRawValidationOutput {
+        state_root: output.state_root,
+        artifacts: Some(output.artifacts),
+    })
+}
+
+pub(crate) fn block_resource_counts(block: &Block) -> (usize, usize, usize, usize) {
+    let mut user_txs = 0usize;
+    let mut live_inputs = 0usize;
+    let mut outputs = 0usize;
+    for tx in &block.transactions {
+        if !tx.body.is_coinbase {
+            user_txs += 1;
+            live_inputs += tx.body.inputs.iter().filter(|input| input.valid).count();
+        }
+        outputs += tx.body.outputs.iter().filter(|output| output.valid).count();
+    }
+    let state_frontier_nodes = live_inputs.saturating_add(outputs);
+    (user_txs, live_inputs, outputs, state_frontier_nodes)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +844,7 @@ mod tests {
         }
     }
 
-    fn auth_proof_for_body(body: &TxBody) -> OwnerAuthProofKillShot {
+    fn auth_proof_for_body(body: &TxBody) -> AuthorizationProof {
         use noid_gkr::{
             owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
             prove_owner_auth_killshot, OwnerAuthCircuit,
@@ -567,17 +863,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only max sidecar regression")]
-    fn max_255_authorization_sidecar_binds_and_fits_caps() {
-        let proof = auth_proof_for_body(&make_spend_body(1));
-        let mut transactions = Vec::with_capacity(noid_chain::block::BLOCK_MAX_TXS);
-        transactions.push(make_transaction(make_tx_body(0, true)));
-        for slot in 0..255u32 {
-            transactions.push(make_transaction(make_spend_body(1_000 + slot)));
-        }
-        assert_eq!(transactions.len(), noid_chain::block::BLOCK_MAX_TXS);
-
-        let mut block = Block {
+    fn authorization_batch_output_counts_verified_public_relation() {
+        let tx = make_transaction(make_spend_body(17));
+        let proof = auth_proof_for_body(&tx.body);
+        let transactions = vec![tx];
+        let block = Block {
             header: {
                 let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
                 BlockHeader {
@@ -589,8 +879,57 @@ mod tests {
                     miner_address: Address([0u8; 32]),
                     nonce: 0,
                     difficulty_target: GENESIS_TARGET,
-                    proof_transcript_hash: [1u8; 32],
-                    witness_root: [0u8; 32],
+                    log_slots: TEST_LOG_SLOTS as u32,
+                    active_slot_count: 0,
+                    alloc_counter: 0,
+                }
+            },
+            transactions,
+        };
+        let sidecar = BlockAuthSidecar {
+            tx_auth: vec![proof],
+        };
+
+        let out = validate_block_authorizations_with_output(
+            &block,
+            &sidecar,
+            &OwnerAuthAuthorizationVerifier,
+        )
+        .expect("authorization batch verifies");
+
+        assert_eq!(
+            out,
+            VerifiedAuthorizationBatch {
+                user_tx_count: 1,
+                owner_count_total: 1,
+                live_input_count_total: 1,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only max sidecar regression")]
+    fn max_255_authorization_sidecar_is_detached_and_fits_caps() {
+        let proof = auth_proof_for_body(&make_spend_body(1));
+        let mut transactions = Vec::with_capacity(noid_chain::block::BLOCK_MAX_TXS);
+        transactions.push(make_transaction(make_tx_body(0, true)));
+        for slot in 0..255u32 {
+            transactions.push(make_transaction(make_spend_body(1_000 + slot)));
+        }
+        assert_eq!(transactions.len(), noid_chain::block::BLOCK_MAX_TXS);
+
+        let block = Block {
+            header: {
+                let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+                BlockHeader {
+                    prev_block_hash: [0u8; 32],
+                    state_root: state.state_root(),
+                    tx_root: noid_chain::compute_tx_root(&transactions),
+                    timestamp: GENESIS_TIMESTAMP,
+                    height: 1,
+                    miner_address: Address([0u8; 32]),
+                    nonce: 0,
+                    difficulty_target: GENESIS_TARGET,
                     log_slots: TEST_LOG_SLOTS as u32,
                     active_slot_count: 0,
                     alloc_counter: 0,
@@ -605,14 +944,12 @@ mod tests {
         assert!(sidecar_bytes.len() <= MAX_BLOCK_AUTH_SIDECAR_BYTES);
         assert!(proof_sidecar_combined_len_ok(0, sidecar_bytes.len()));
 
-        block.header.witness_root =
-            block_auth_sidecar_root(&block, &sidecar).expect("max sidecar root");
-        validate_block_auth_sidecar_root(&block, &sidecar).expect("max sidecar root verifies");
+        validate_block_auth_sidecar_shape(&block, &sidecar).expect("max sidecar shape verifies");
 
         let mut short = sidecar.clone();
         short.tx_auth.pop();
         assert!(matches!(
-            validate_block_auth_sidecar_root(&block, &short),
+            validate_block_auth_sidecar_shape(&block, &short),
             Err(crate::VerifyBlockError::AuthSidecarShapeMismatch)
         ));
     }

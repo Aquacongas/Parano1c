@@ -13,12 +13,19 @@ use noid_chain::exact_state_hash::{
 };
 use noid_chain::fri_state::SlotValue;
 use noid_chain::reuse_guard::{
-    bucket_index_for_height, verify_guard_update_roots, GuardBucket, ReuseGuard, ReuseGuardError,
+    bucket_index_for_height, guard_bucket_hash, verify_guard_update_roots, GuardBucket, ReuseGuard,
+    ReuseGuardError, REUSE_GUARD_DEPTH,
 };
 use noid_chain::sparse_merkle::{
-    build_multiproof, reconstruct_root, SparseMerkleCache, SparseMerkleError,
+    build_multiproof, expand_multiproof_paths, reconstruct_root, ExpandedMerklePath,
+    SparseMerkleCache, SparseMerkleError,
 };
 use noid_chain::state_delta::{ExactActionSurface, StateDeltaActionKind};
+use noid_core::{Block128, TowerField};
+use noid_gkr::{
+    CompositeStateRootInputs, GuardBucketHashInputs, MerklePathInputs, SlotLeafInputs,
+    MAX_MERKLE_DEPTH,
+};
 use noid_tx::TxShape;
 
 /// Maximum user transactions in a block with one coinbase.
@@ -86,6 +93,50 @@ pub struct VerifiedStateTransition {
     alloc_counter: u64,
 }
 
+/// Public Merkle-path inputs for the exact UTXO part of the transition proof.
+///
+/// These are derived from the canonical multiproof and are the shape consumed
+/// by the Poseidon2b/KillShot batch relation. Old and new paths use the same
+/// touched indices and implicit topology, but touched sibling subtrees are
+/// recomputed from old vs new leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactStateMerkleBatchInputs {
+    pub old_root: StateHash,
+    pub new_root: StateHash,
+    pub old_paths: Vec<MerklePathInputs>,
+    pub new_paths: Vec<MerklePathInputs>,
+}
+
+/// Public Merkle-path inputs for the ReuseGuard bucket update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactGuardMerkleBatchInputs {
+    pub old_root: StateHash,
+    pub new_root: StateHash,
+    pub old_path: MerklePathInputs,
+    pub new_path: MerklePathInputs,
+}
+
+/// Public slot-leaf hash inputs for old and new exact UTXO leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactSlotLeafBatchInputs {
+    pub old_leaves: Vec<SlotLeafInputs>,
+    pub new_leaves: Vec<SlotLeafInputs>,
+}
+
+/// Public bucket-hash inputs for a ReuseGuard old/new bucket update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactGuardBucketHashBatchInputs {
+    pub old_bucket: GuardBucketHashInputs,
+    pub new_bucket: GuardBucketHashInputs,
+}
+
+/// Public composite state-root hash inputs for parent and child state roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCompositeStateRootBatchInputs {
+    pub parent: CompositeStateRootInputs,
+    pub child: CompositeStateRootInputs,
+}
+
 impl VerifiedStateTransition {
     pub fn parent_state_root(&self) -> StateHash {
         self.parent_state_root
@@ -145,6 +196,7 @@ pub enum ExactStateTransitionError {
     SparseMerkle(SparseMerkleError),
     ReuseGuard(ReuseGuardError),
     NonCanonicalSlot,
+    ProofDepthUnsupported { depth: u32, max_depth: usize },
 }
 
 impl From<SparseMerkleError> for ExactStateTransitionError {
@@ -182,6 +234,245 @@ pub fn build_exact_state_transition_proof(
         slot_siblings: proof.siblings,
         guard_update,
     })
+}
+
+/// Derive directed Poseidon2b Merkle path inputs from an exact-state proof.
+pub fn derive_exact_state_merkle_batch_inputs(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    proof: &ExactStateTransitionProof,
+) -> Result<ExactStateMerkleBatchInputs, ExactStateTransitionError> {
+    if surface.touched_indices.is_empty() {
+        return Err(ExactStateTransitionError::EmptyTouchedSet);
+    }
+    if surface.touched_indices.len() != surface.old_slots.len()
+        || surface.touched_indices.len() != surface.new_slots.len()
+    {
+        return Err(ExactStateTransitionError::SurfaceLengthMismatch);
+    }
+    if proof.slot_siblings.len() > MAX_EXACT_SLOT_SIBLINGS {
+        return Err(ExactStateTransitionError::ProofTooLarge {
+            siblings: proof.slot_siblings.len(),
+        });
+    }
+    if inputs.child_log_slots as usize > MAX_MERKLE_DEPTH {
+        return Err(ExactStateTransitionError::ProofDepthUnsupported {
+            depth: inputs.child_log_slots,
+            max_depth: MAX_MERKLE_DEPTH,
+        });
+    }
+
+    let old_root = match inputs.child_log_slots.cmp(&inputs.parent_log_slots) {
+        std::cmp::Ordering::Equal => inputs.parent_utxo_root,
+        std::cmp::Ordering::Greater if inputs.child_log_slots == inputs.parent_log_slots + 1 => {
+            let zeros = zero_slot_roots(inputs.parent_log_slots as usize);
+            state_node_hash(
+                inputs.parent_utxo_root,
+                zeros[inputs.parent_log_slots as usize],
+            )
+        }
+        _ => return Err(ExactStateTransitionError::InvalidLogSlots),
+    };
+
+    let old_leaf_hashes = hash_slots(&surface.old_slots)?;
+    let new_leaf_hashes = hash_slots(&surface.new_slots)?;
+    let reconstructed_old = reconstruct_root(
+        &surface.touched_indices,
+        &old_leaf_hashes,
+        &proof.slot_siblings,
+        inputs.child_log_slots,
+    )?;
+    if reconstructed_old != old_root {
+        return Err(ExactStateTransitionError::ParentUtxoRootMismatch);
+    }
+    let new_root = reconstruct_root(
+        &surface.touched_indices,
+        &new_leaf_hashes,
+        &proof.slot_siblings,
+        inputs.child_log_slots,
+    )?;
+
+    let old_expanded = expand_multiproof_paths(
+        &surface.touched_indices,
+        &old_leaf_hashes,
+        &proof.slot_siblings,
+        inputs.child_log_slots,
+    )?;
+    let new_expanded = expand_multiproof_paths(
+        &surface.touched_indices,
+        &new_leaf_hashes,
+        &proof.slot_siblings,
+        inputs.child_log_slots,
+    )?;
+    let old_paths = old_expanded
+        .iter()
+        .map(|path| expanded_to_gkr_path(path, old_root, inputs.child_log_slots))
+        .collect::<Result<Vec<_>, _>>()?;
+    let new_paths = new_expanded
+        .iter()
+        .map(|path| expanded_to_gkr_path(path, new_root, inputs.child_log_slots))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ExactStateMerkleBatchInputs {
+        old_root,
+        new_root,
+        old_paths,
+        new_paths,
+    })
+}
+
+/// Derive `EXSTSLT_` slot-leaf hash proof inputs from the exact action surface.
+pub fn derive_exact_slot_leaf_batch_inputs(
+    surface: &ExactActionSurface,
+) -> Result<ExactSlotLeafBatchInputs, ExactStateTransitionError> {
+    if surface.touched_indices.is_empty() {
+        return Err(ExactStateTransitionError::EmptyTouchedSet);
+    }
+    if surface.touched_indices.len() != surface.old_slots.len()
+        || surface.touched_indices.len() != surface.new_slots.len()
+    {
+        return Err(ExactStateTransitionError::SurfaceLengthMismatch);
+    }
+    let old_leaves = surface
+        .old_slots
+        .iter()
+        .copied()
+        .map(slot_to_leaf_input)
+        .collect::<Result<Vec<_>, _>>()?;
+    let new_leaves = surface
+        .new_slots
+        .iter()
+        .copied()
+        .map(slot_to_leaf_input)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ExactSlotLeafBatchInputs {
+        old_leaves,
+        new_leaves,
+    })
+}
+
+fn slot_to_leaf_input(slot: SlotValue) -> Result<SlotLeafInputs, ExactStateTransitionError> {
+    let amount = slot.value.to_u128();
+    if amount >> 64 != 0 {
+        return Err(ExactStateTransitionError::NonCanonicalSlot);
+    }
+    Ok(SlotLeafInputs {
+        amount: amount as u64,
+        owner_hi: slot.owner_hi,
+        owner_lo: slot.owner_lo,
+        expected_leaf: digest_to_fields(
+            slot_leaf_hash_checked(slot)
+                .map_err(|_| ExactStateTransitionError::NonCanonicalSlot)?,
+        ),
+    })
+}
+
+/// Derive directed Poseidon2b Merkle path inputs for the ReuseGuard update.
+pub fn derive_exact_guard_merkle_batch_inputs(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    guard: &ReuseGuard,
+    proof: &ExactStateTransitionProof,
+) -> Result<Option<ExactGuardMerkleBatchInputs>, ExactStateTransitionError> {
+    if surface.spent_slots.is_empty() {
+        if proof.guard_update.is_some() {
+            return Err(ExactStateTransitionError::UnexpectedGuardProof);
+        }
+        return Ok(None);
+    }
+
+    let guard_proof = proof
+        .guard_update
+        .as_ref()
+        .ok_or(ExactStateTransitionError::MissingGuardProof)?;
+    guard.ensure_bucket_reusable_at(inputs.height)?;
+    let index = bucket_index_for_height(inputs.height);
+    let old_bucket = guard.bucket(index);
+    let new_bucket = GuardBucket::Occupied {
+        absolute_height: inputs.height,
+        spent_slots: surface.spent_slots.clone(),
+    };
+    let (old_root, new_root) =
+        verify_guard_update_roots(index, old_bucket, &new_bucket, &guard_proof.siblings)?;
+    if old_root != inputs.parent_guard_root {
+        return Err(ExactStateTransitionError::OldGuardRootMismatch);
+    }
+
+    let old_path = guard_path_to_gkr(
+        index,
+        guard_bucket_hash(old_bucket),
+        &guard_proof.siblings,
+        old_root,
+    );
+    let new_path = guard_path_to_gkr(
+        index,
+        guard_bucket_hash(&new_bucket),
+        &guard_proof.siblings,
+        new_root,
+    );
+    Ok(Some(ExactGuardMerkleBatchInputs {
+        old_root,
+        new_root,
+        old_path,
+        new_path,
+    }))
+}
+
+/// Derive `RGDBUCK_` bucket-hash proof inputs for the ReuseGuard update.
+pub fn derive_exact_guard_bucket_hash_inputs(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    guard: &ReuseGuard,
+    proof: &ExactStateTransitionProof,
+) -> Result<Option<ExactGuardBucketHashBatchInputs>, ExactStateTransitionError> {
+    if surface.spent_slots.is_empty() {
+        if proof.guard_update.is_some() {
+            return Err(ExactStateTransitionError::UnexpectedGuardProof);
+        }
+        return Ok(None);
+    }
+
+    let guard_proof = proof
+        .guard_update
+        .as_ref()
+        .ok_or(ExactStateTransitionError::MissingGuardProof)?;
+    guard.ensure_bucket_reusable_at(inputs.height)?;
+    let index = bucket_index_for_height(inputs.height);
+    let old_bucket = guard.bucket(index);
+    let new_bucket = GuardBucket::Occupied {
+        absolute_height: inputs.height,
+        spent_slots: surface.spent_slots.clone(),
+    };
+    let (old_root, _) =
+        verify_guard_update_roots(index, old_bucket, &new_bucket, &guard_proof.siblings)?;
+    if old_root != inputs.parent_guard_root {
+        return Err(ExactStateTransitionError::OldGuardRootMismatch);
+    }
+    Ok(Some(ExactGuardBucketHashBatchInputs {
+        old_bucket: guard_bucket_to_hash_input(old_bucket),
+        new_bucket: guard_bucket_to_hash_input(&new_bucket),
+    }))
+}
+
+/// Derive parent and child `EXSTROT_` composite-root proof inputs.
+pub fn derive_exact_composite_state_root_inputs(
+    inputs: &ExactStateTransitionInputs,
+    verified: &VerifiedStateTransition,
+) -> ExactCompositeStateRootBatchInputs {
+    ExactCompositeStateRootBatchInputs {
+        parent: CompositeStateRootInputs {
+            log_slots: inputs.parent_log_slots,
+            utxo_root: digest_to_fields(inputs.parent_utxo_root),
+            guard_root: digest_to_fields(inputs.parent_guard_root),
+            expected_state_root: digest_to_fields(inputs.parent_state_root),
+        },
+        child: CompositeStateRootInputs {
+            log_slots: verified.log_slots,
+            utxo_root: digest_to_fields(verified.child_utxo_root),
+            guard_root: digest_to_fields(verified.child_guard_root),
+            expected_state_root: digest_to_fields(verified.child_state_root),
+        },
+    }
 }
 
 /// Verify exact UTXO frontier and ReuseGuard update.
@@ -299,6 +590,88 @@ pub fn verify_exact_state_transition(
     })
 }
 
+fn digest_to_fields(hash: StateHash) -> [Block128; 2] {
+    let mut lo = [0u8; 16];
+    let mut hi = [0u8; 16];
+    lo.copy_from_slice(&hash[..16]);
+    hi.copy_from_slice(&hash[16..]);
+    [
+        Block128::from(u128::from_le_bytes(lo)),
+        Block128::from(u128::from_le_bytes(hi)),
+    ]
+}
+
+fn expanded_to_gkr_path(
+    path: &ExpandedMerklePath,
+    expected_root: StateHash,
+    depth: u32,
+) -> Result<MerklePathInputs, ExactStateTransitionError> {
+    let depth = depth as usize;
+    if depth > MAX_MERKLE_DEPTH {
+        return Err(ExactStateTransitionError::ProofDepthUnsupported {
+            depth: depth as u32,
+            max_depth: MAX_MERKLE_DEPTH,
+        });
+    }
+    let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
+    let mut directions = [false; MAX_MERKLE_DEPTH];
+    for level in 0..depth {
+        siblings[level] = digest_to_fields(path.siblings[level]);
+        directions[level] = path.directions[level];
+    }
+    Ok(MerklePathInputs {
+        leaf: digest_to_fields(path.leaf),
+        siblings,
+        directions,
+        expected_root: digest_to_fields(expected_root),
+        active_depth: depth,
+    })
+}
+
+fn guard_path_to_gkr(
+    bucket_index: usize,
+    leaf: StateHash,
+    path_siblings: &[StateHash; REUSE_GUARD_DEPTH],
+    expected_root: StateHash,
+) -> MerklePathInputs {
+    let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
+    let mut directions = [false; MAX_MERKLE_DEPTH];
+    let mut idx = bucket_index;
+    for level in 0..REUSE_GUARD_DEPTH {
+        siblings[level] = digest_to_fields(path_siblings[level]);
+        directions[level] = idx & 1 == 1;
+        idx >>= 1;
+    }
+    MerklePathInputs {
+        leaf: digest_to_fields(leaf),
+        siblings,
+        directions,
+        expected_root: digest_to_fields(expected_root),
+        active_depth: REUSE_GUARD_DEPTH,
+    }
+}
+
+fn guard_bucket_to_hash_input(bucket: &GuardBucket) -> GuardBucketHashInputs {
+    let expected_hash = digest_to_fields(guard_bucket_hash(bucket));
+    match bucket {
+        GuardBucket::Empty => GuardBucketHashInputs {
+            occupied: false,
+            absolute_height: 0,
+            spent_slots: Vec::new(),
+            expected_hash,
+        },
+        GuardBucket::Occupied {
+            absolute_height,
+            spent_slots,
+        } => GuardBucketHashInputs {
+            occupied: true,
+            absolute_height: *absolute_height,
+            spent_slots: spent_slots.clone(),
+            expected_hash,
+        },
+    }
+}
+
 fn hash_slots(slots: &[SlotValue]) -> Result<Vec<StateHash>, ExactStateTransitionError> {
     slots
         .iter()
@@ -378,7 +751,14 @@ mod tests {
     use noid_chain::exact_state_hash::{composite_state_root, slot_leaf_hash};
     use noid_chain::reuse_guard::ReuseGuard;
     use noid_chain::state_delta::{StateDeltaAction, StateDeltaActionKind};
-    use noid_core::Block128;
+    use noid_gkr::{
+        prove_batched_guard_bucket_killshot, prove_batched_merkle_killshot,
+        prove_batched_slot_leaf_killshot, prove_batched_state_root_killshot,
+        verify_batched_guard_bucket_killshot, verify_batched_merkle_killshot,
+        verify_batched_slot_leaf_killshot, verify_batched_state_root_killshot, MerkleCircuit,
+    };
+    use noid_poseidon2b::channel::Poseidon2bChannel;
+    use noid_poseidon2b::native::domain::{TAG_EXSTNOD, TAG_RGDNODE};
 
     fn sv(value: u64, seed: u128) -> SlotValue {
         SlotValue {
@@ -463,6 +843,180 @@ mod tests {
         assert_eq!(verified.alloc_counter(), 2);
         assert_eq!(verified.slot_updates().len(), 2);
         assert!(verified.guard_bucket_update().is_some());
+    }
+
+    #[test]
+    fn derives_killshot_inputs_for_exact_state_utxo_paths() {
+        let old_a = sv(10, 100);
+        let old_b = sv(11, 110);
+        let new_a = sv(7, 200);
+        let new_b = sv(5, 210);
+        let surface = ExactActionSurface {
+            actions: vec![
+                action(2, old_a, SlotValue::EMPTY, StateDeltaActionKind::Spend, 0),
+                action(13, old_b, SlotValue::EMPTY, StateDeltaActionKind::Spend, 0),
+                action(5, SlotValue::EMPTY, new_a, StateDeltaActionKind::Mint, 0),
+                action(14, SlotValue::EMPTY, new_b, StateDeltaActionKind::Mint, 0),
+            ],
+            touched_indices: vec![2, 5, 13, 14],
+            old_slots: vec![old_a, SlotValue::EMPTY, old_b, SlotValue::EMPTY],
+            new_slots: vec![SlotValue::EMPTY, new_a, SlotValue::EMPTY, new_b],
+            spent_slots: vec![2, 13],
+            spends: 2,
+            mints: 2,
+        };
+        let parent_cache = SparseMerkleCache::from_leaves(
+            4,
+            &[(2, slot_leaf_hash(old_a)), (13, slot_leaf_hash(old_b))],
+        )
+        .unwrap();
+        let child_cache = SparseMerkleCache::from_leaves(
+            4,
+            &[(5, slot_leaf_hash(new_a)), (14, slot_leaf_hash(new_b))],
+        )
+        .unwrap();
+        let guard = ReuseGuard::new_empty();
+        let mut next_guard = guard.clone();
+        next_guard.apply_spends(10, &[2, 13]).unwrap();
+        let inputs = inputs_for(&parent_cache, &child_cache, &guard, next_guard.root());
+        let proof =
+            build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
+
+        let derived = derive_exact_state_merkle_batch_inputs(&inputs, &surface, &proof).unwrap();
+        assert_eq!(derived.old_root, parent_cache.root());
+        assert_eq!(derived.new_root, child_cache.root());
+        assert_eq!(derived.old_paths.len(), 4);
+        assert_eq!(derived.new_paths.len(), 4);
+        assert!(derived
+            .old_paths
+            .iter()
+            .chain(derived.new_paths.iter())
+            .any(|path| path.directions[..path.active_depth].iter().any(|&bit| bit)));
+
+        let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
+        let all_paths = derived
+            .old_paths
+            .iter()
+            .chain(derived.new_paths.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ch_p = Poseidon2bChannel::new();
+        let (path_proof, reductions) =
+            prove_batched_merkle_killshot(&circuit, &all_paths, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        let verified = verify_batched_merkle_killshot(&circuit, &path_proof, &all_paths, &mut ch_v)
+            .expect("exact-state Merkle paths verify under EXSTNOD");
+        assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn derives_killshot_inputs_for_exact_slot_leaf_hashes() {
+        let old = sv(10, 100);
+        let new = sv(7, 200);
+        let surface = spend_and_mint_surface(old, new);
+        let derived = derive_exact_slot_leaf_batch_inputs(&surface).unwrap();
+        assert_eq!(derived.old_leaves.len(), 2);
+        assert_eq!(derived.new_leaves.len(), 2);
+
+        let all_leaves = derived
+            .old_leaves
+            .iter()
+            .chain(derived.new_leaves.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ch_p = Poseidon2bChannel::new();
+        let (leaf_proof, reductions) = prove_batched_slot_leaf_killshot(&all_leaves, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        let verified = verify_batched_slot_leaf_killshot(&leaf_proof, &all_leaves, &mut ch_v)
+            .expect("exact slot leaves verify under EXSTSLT");
+        assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn derives_killshot_inputs_for_composite_state_roots() {
+        let old = sv(10, 100);
+        let new = sv(7, 200);
+        let surface = spend_and_mint_surface(old, new);
+        let parent_cache = SparseMerkleCache::from_leaves(4, &[(2, slot_leaf_hash(old))]).unwrap();
+        let child_cache = SparseMerkleCache::from_leaves(4, &[(5, slot_leaf_hash(new))]).unwrap();
+        let guard = ReuseGuard::new_empty();
+        let mut next_guard = guard.clone();
+        next_guard.apply_spends(10, &[2]).unwrap();
+        let inputs = inputs_for(&parent_cache, &child_cache, &guard, next_guard.root());
+        let proof =
+            build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
+        let verified_transition =
+            verify_exact_state_transition(&inputs, &surface, &guard, &proof).unwrap();
+
+        let derived = derive_exact_composite_state_root_inputs(&inputs, &verified_transition);
+        let roots = vec![derived.parent, derived.child];
+        let mut ch_p = Poseidon2bChannel::new();
+        let (root_proof, reductions) = prove_batched_state_root_killshot(&roots, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        let verified = verify_batched_state_root_killshot(&root_proof, &roots, &mut ch_v)
+            .expect("composite state roots verify under EXSTROT");
+        assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn derives_killshot_inputs_for_reuse_guard_paths() {
+        let old = sv(10, 100);
+        let new = sv(7, 200);
+        let surface = spend_and_mint_surface(old, new);
+        let parent_cache = SparseMerkleCache::from_leaves(4, &[(2, slot_leaf_hash(old))]).unwrap();
+        let child_cache = SparseMerkleCache::from_leaves(4, &[(5, slot_leaf_hash(new))]).unwrap();
+        let guard = ReuseGuard::new_empty();
+        let mut next_guard = guard.clone();
+        next_guard.apply_spends(10, &[2]).unwrap();
+        let inputs = inputs_for(&parent_cache, &child_cache, &guard, next_guard.root());
+        let proof =
+            build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
+
+        let derived = derive_exact_guard_merkle_batch_inputs(&inputs, &surface, &guard, &proof)
+            .unwrap()
+            .expect("spend block has guard update");
+        assert_eq!(derived.old_root, guard.root());
+        assert_eq!(derived.new_root, next_guard.root());
+        assert_eq!(derived.old_path.active_depth, REUSE_GUARD_DEPTH);
+        assert_eq!(derived.new_path.active_depth, REUSE_GUARD_DEPTH);
+
+        let circuit = MerkleCircuit::build_with_tag(TAG_RGDNODE);
+        let paths = vec![derived.old_path, derived.new_path];
+        let mut ch_p = Poseidon2bChannel::new();
+        let (path_proof, reductions) = prove_batched_merkle_killshot(&circuit, &paths, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        let verified = verify_batched_merkle_killshot(&circuit, &path_proof, &paths, &mut ch_v)
+            .expect("ReuseGuard Merkle paths verify under RGDNODE");
+        assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn derives_killshot_inputs_for_reuse_guard_bucket_hashes() {
+        let old = sv(10, 100);
+        let new = sv(7, 200);
+        let surface = spend_and_mint_surface(old, new);
+        let parent_cache = SparseMerkleCache::from_leaves(4, &[(2, slot_leaf_hash(old))]).unwrap();
+        let child_cache = SparseMerkleCache::from_leaves(4, &[(5, slot_leaf_hash(new))]).unwrap();
+        let guard = ReuseGuard::new_empty();
+        let mut next_guard = guard.clone();
+        next_guard.apply_spends(10, &[2]).unwrap();
+        let inputs = inputs_for(&parent_cache, &child_cache, &guard, next_guard.root());
+        let proof =
+            build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
+
+        let derived = derive_exact_guard_bucket_hash_inputs(&inputs, &surface, &guard, &proof)
+            .unwrap()
+            .expect("spend block has guard bucket update");
+        assert!(!derived.old_bucket.occupied);
+        assert!(derived.new_bucket.occupied);
+
+        let buckets = vec![derived.old_bucket, derived.new_bucket];
+        let mut ch_p = Poseidon2bChannel::new();
+        let (bucket_proof, reductions) = prove_batched_guard_bucket_killshot(&buckets, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        let verified = verify_batched_guard_bucket_killshot(&bucket_proof, &buckets, &mut ch_v)
+            .expect("ReuseGuard bucket hashes verify under RGDBUCK");
+        assert_eq!(verified, reductions);
     }
 
     #[test]

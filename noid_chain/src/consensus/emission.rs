@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn reward_table_matches_spec() {
-        // Exact values from ROADMAP2.md emission table.
+        // Exact values from the consensus emission table.
         assert_eq!(block_reward(24), 50_000_000, "50 NOID at genesis");
         assert_eq!(block_reward(25), 25_000_000, "25 NOID");
         assert_eq!(block_reward(26), 12_500_000, "12.5 NOID");

@@ -3,12 +3,12 @@
 
 //! Domain-separated exact-state commitment hashes.
 //!
-//! These helpers are intentionally independent from the current FRI segment
+//! These helpers are intentionally independent from the raw segment storage
 //! commitment path. They are pure building blocks for the exact Merkle state
 //! transition proof.
 
 use noid_core::Block128;
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
+use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD, TAG_EXSTROT, TAG_EXSTSLT};
 
 use crate::fri_state::SlotValue;
@@ -75,12 +75,7 @@ pub fn slot_leaf_hash_checked(slot: SlotValue) -> Result<StateHash, ExactStateHa
 
 /// Hash one exact-state binary Merkle node.
 pub fn state_node_hash(left: StateHash, right: StateHash) -> StateHash {
-    let [l0, l1] = fields_from_digest(left);
-    let [r0, r1] = fields_from_digest(right);
-    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTNOD));
-    s.absorb_pair(l0, l1);
-    s.absorb_pair(r0, r1);
-    s.finalize_no_pad()
+    compress_with_tag(TAG_EXSTNOD, &left, &right)
 }
 
 /// Compose UTXO and ReuseGuard component roots into the header state root.

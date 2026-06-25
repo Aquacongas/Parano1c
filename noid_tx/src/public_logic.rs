@@ -3,9 +3,9 @@
 
 //! Exact public transaction predicate for wallet-originated transactions.
 //!
-//! This checker replaces the wallet-transmitted public-arithmetic STARK at
-//! mempool admission. It does not replace the canonical block-side TxLogic AIR:
-//! block proving still rebuilds and proves that relation from `TxBody`.
+//! Wallets do not transmit a public-arithmetic proof. Mempool and block
+//! validation deterministically rebuild these facts from `TxBody`, while the
+//! authorization proof handles ownership.
 
 use noid_poseidon2b::primitives::TxBodyHash;
 

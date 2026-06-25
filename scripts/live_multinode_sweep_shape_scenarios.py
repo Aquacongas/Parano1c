@@ -12,11 +12,10 @@ Environment knobs:
   NOID_LIVE_MULTI_SWEEP_START_BLOCKS default 20, raised to at least 30 when split is enabled
   NOID_LIVE_MULTI_SWEEP_BASE_PORT    default 19900
   NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT         default 1 (set 0 to run the heavier >25-input split scenario)
-  NOID_LIVE_MULTI_SWEEP_LATE_JOIN          default 0 (start relays after funding blocks)
-  NOID_LIVE_MULTI_SWEEP_RESTART            default 0 (legacy: restart sender+recipient after Sweep25x2)
-  NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT  defaults to legacy restart flag
-  NOID_LIVE_MULTI_SWEEP_RESTART_SENDER     defaults to legacy restart flag
-  NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT      defaults to legacy restart flag; only runs when split is enabled
+  NOID_LIVE_MULTI_SWEEP_RESTART            default 0 (restart sender+recipient after Sweep25x2)
+  NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT  defaults to restart flag
+  NOID_LIVE_MULTI_SWEEP_RESTART_SENDER     defaults to restart flag
+  NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT      defaults to restart flag; only runs when split is enabled
 """
 
 import json
@@ -37,23 +36,22 @@ BASE_PORT = int(os.environ.get("NOID_LIVE_MULTI_SWEEP_BASE_PORT", "19900"))
 SKIP_SPLIT = os.environ.get("NOID_LIVE_MULTI_SWEEP_SKIP_SPLIT", "1") == "1"
 if not SKIP_SPLIT:
     START_BLOCKS = max(START_BLOCKS, 30)
-LATE_JOIN = os.environ.get("NOID_LIVE_MULTI_SWEEP_LATE_JOIN", "0") == "1"
-RESTART_LEGACY = os.environ.get("NOID_LIVE_MULTI_SWEEP_RESTART", "0") == "1"
+RESTART_ALL = os.environ.get("NOID_LIVE_MULTI_SWEEP_RESTART", "0") == "1"
 RESTART_RECIPIENT = (
     os.environ.get(
-        "NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT", "1" if RESTART_LEGACY else "0"
+        "NOID_LIVE_MULTI_SWEEP_RESTART_RECIPIENT", "1" if RESTART_ALL else "0"
     )
     == "1"
 )
 RESTART_SENDER = (
     os.environ.get(
-        "NOID_LIVE_MULTI_SWEEP_RESTART_SENDER", "1" if RESTART_LEGACY else "0"
+        "NOID_LIVE_MULTI_SWEEP_RESTART_SENDER", "1" if RESTART_ALL else "0"
     )
     == "1"
 )
 RESTART_SPLIT = (
     os.environ.get(
-        "NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT", "1" if RESTART_LEGACY else "0"
+        "NOID_LIVE_MULTI_SWEEP_RESTART_SPLIT", "1" if RESTART_ALL else "0"
     )
     == "1"
 )
@@ -495,40 +493,16 @@ def main():
     started = []
 
     try:
-        if LATE_JOIN:
-            print(
-                "\n=== Multi-node sweep: late-join relays after funding blocks ===",
-                flush=True,
-            )
-            n1.start()
-            started.append(n1)
-            wait_until(
-                f"node1 mines {START_BLOCKS} funding blocks",
-                lambda: n1.height() if n1.height() >= START_BLOCKS else False,
-                timeout=max(900, START_BLOCKS * 35),
-                interval=3,
-            )
-            wait_until(
-                "node1 has recursive proof for snapshot sync",
-                lambda: rpc(n1.rpc_url, "getRecursiveProof", timeout=20) is not None,
-                timeout=240,
-                interval=5,
-            )
-            n2.start()
-            started.append(n2)
-            n3.start()
-            started.append(n3)
-        else:
-            print(
-                "\n=== Multi-node sweep: start miner and relays before funding blocks ===",
-                flush=True,
-            )
-            n1.start()
-            started.append(n1)
-            n2.start()
-            started.append(n2)
-            n3.start()
-            started.append(n3)
+        print(
+            "\n=== Multi-node sweep: start miner and relays before funding blocks ===",
+            flush=True,
+        )
+        n1.start()
+        started.append(n1)
+        n2.start()
+        started.append(n2)
+        n3.start()
+        started.append(n3)
 
         wait_until(
             "relays have peers",
@@ -540,13 +514,12 @@ def main():
             timeout=120,
             interval=2,
         )
-        if not LATE_JOIN:
-            wait_until(
-                f"node1 mines {START_BLOCKS} funding blocks",
-                lambda: n1.height() if n1.height() >= START_BLOCKS else False,
-                timeout=max(900, START_BLOCKS * 35),
-                interval=3,
-            )
+        wait_until(
+            f"node1 mines {START_BLOCKS} funding blocks",
+            lambda: n1.height() if n1.height() >= START_BLOCKS else False,
+            timeout=max(900, START_BLOCKS * 35),
+            interval=3,
+        )
         wait_until(
             "all nodes converge after funding blocks",
             lambda: same_tip(nodes, max_lag=0),
@@ -623,7 +596,6 @@ def main():
                 for n in nodes
             },
             "skip_split": SKIP_SPLIT,
-            "late_join": LATE_JOIN,
             "restart_recipient": RESTART_RECIPIENT,
             "restart_sender": RESTART_SENDER,
             "restart_split": RESTART_SPLIT,

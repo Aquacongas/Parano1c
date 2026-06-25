@@ -13,8 +13,8 @@
 //!
 //! Every slot is hashed unconditionally, including `valid=false`
 //! slots (which absorb `(0, 0, zero_address)` fields). `valid` is a
-//! pure AIR selector, not an input to the body hash; this matches
-//! the AIR's `pins.{input,output}_leaf_absorb` lowering exactly.
+//! pure proof selector, not an input to the body hash; this keeps tx identity
+//! independent from selector padding details.
 
 use noid_poseidon2b::primitives::{
     hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core,

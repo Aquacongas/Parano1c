@@ -31,12 +31,15 @@ use libp2p::{
 };
 use libp2p_connection_limits as connection_limits;
 use noid_chain::consensus::wire_limits::GOSSIP_MAX_TRANSMIT_BYTES;
+use noid_poseidon2b::native::poseidon2b_hash_bytes;
+
+const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID_V1";
 
 use crate::protocol::{
-    GetHeadersRequest, GetHeadersResponse, GetMempoolRequest, GetMempoolResponse,
-    GetRecentBlockRequest, GetRecentBlockResponse, GetRecursiveProofRequest,
-    GetRecursiveProofResponse, GetStateManifestRequest, GetStateManifestResponse,
-    GetStateSegmentRequest, GetStateSegmentResponse,
+    GetHeadersRequest, GetHeadersResponse, GetHistoryProofRequest, GetHistoryProofResponse,
+    GetMempoolRequest, GetMempoolResponse, GetRecentBlockRequest, GetRecentBlockResponse,
+    GetStateManifestRequest, GetStateManifestResponse, GetStateSegmentRequest,
+    GetStateSegmentResponse,
 };
 
 /// All P2P behaviours composed via the derive macro.
@@ -48,16 +51,16 @@ pub struct NodeBehaviour {
     /// Block and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Typed request-response for chain sync (headers, blocks, recursive proof).
+    /// Typed request-response for chain sync (headers, blocks, history proof).
     pub chain_sync: request_response::cbor::Behaviour<GetHeadersRequest, GetHeadersResponse>,
 
     /// Block sync (recent blocks).
     pub block_sync:
         request_response::cbor::Behaviour<GetRecentBlockRequest, GetRecentBlockResponse>,
 
-    /// Recursive proof sync (O(1) chain-history verification).
+    /// History proof sync (O(1) chain-history verification).
     pub proof_sync:
-        request_response::cbor::Behaviour<GetRecursiveProofRequest, GetRecursiveProofResponse>,
+        request_response::cbor::Behaviour<GetHistoryProofRequest, GetHistoryProofResponse>,
 
     /// Kademlia DHT — primary peer discovery mechanism.
     ///
@@ -218,8 +221,8 @@ impl NodeBehaviour {
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|msg| {
                 // Content-addressed: hash the message data (not author+seq).
-                let hash = blake3::hash(&msg.data);
-                gossipsub::MessageId::from(hash.as_bytes().to_vec())
+                let hash = poseidon2b_hash_bytes(GOSSIPSUB_MESSAGE_ID_DOMAIN, &msg.data);
+                gossipsub::MessageId::from(hash.to_vec())
             })
             .build()
             .map_err(|e| format!("gossipsub config: {e}"))?;

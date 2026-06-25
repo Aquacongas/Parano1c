@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Native reference execution of the Merkle path circuit (32 slots).
+//! Native Merkle path circuit execution (32 slots).
 //!
 //! Drives `N_MERKLE_SLOTS` Poseidon2b permutations in chain order,
 //! producing a full witness suitable for the unified Kill-Shot sumcheck.
@@ -77,30 +77,43 @@ fn build_state_in(
     match slot.role {
         MerkleSlotRole::PermA { level } => {
             let level = level as usize;
-            if level == 0 {
-                // First compression: left operand is the leaf.
-                let [a, b] = inputs.leaf;
-                [a, b, iv_hi, iv_lo]
+            let current = if level == 0 {
+                inputs.leaf
             } else {
-                // Subsequent compressions: left operand is previous
-                // compression's output, XOR-absorbed into the state
-                // that chains from PermB of level-1.
                 let src_id = slot
                     .prev_output_src
                     .expect("PermA at level > 0 must chain from prev PermB");
-                // Each compression is an independent sponge (fresh IV).
-                // PermA at level > 0 takes its rate input from the
-                // previous compression's output.
-                let left = prev[src_id].digest();
-                [left[0], left[1], iv_hi, iv_lo]
-            }
+                prev[src_id].digest()
+            };
+            let sibling = inputs.siblings[level];
+            let left = if inputs.directions[level] {
+                sibling
+            } else {
+                current
+            };
+            [left[0], left[1], iv_hi, iv_lo]
         }
         MerkleSlotRole::PermB { level } => {
             // Chains from PermA of same level: XOR sibling into rate.
             let src_id = slot.prev_output_src.expect("PermB must chain from PermA");
             let s = prev[src_id].state_out;
-            let [b0, b1] = inputs.siblings[level as usize];
-            [s[0] + b0, s[1] + b1, s[2], s[3]]
+            let level = level as usize;
+            let current = if level == 0 {
+                inputs.leaf
+            } else {
+                let current_src = slot
+                    .id
+                    .checked_sub(2)
+                    .expect("level > 0 PermB must have previous PermB");
+                prev[current_src].digest()
+            };
+            let sibling = inputs.siblings[level];
+            let right = if inputs.directions[level] {
+                current
+            } else {
+                sibling
+            };
+            [s[0] + right[0], s[1] + right[1], s[2], s[3]]
         }
     }
 }
@@ -112,6 +125,23 @@ pub fn compute_merkle_root(
     siblings: &[[Block128; 2]],
     active_depth: usize,
 ) -> [Block128; 2] {
+    compute_merkle_root_with_directions(
+        circuit,
+        leaf,
+        siblings,
+        &[false; MAX_MERKLE_DEPTH],
+        active_depth,
+    )
+}
+
+/// Compute the honest directed root by chaining compressions natively.
+pub fn compute_merkle_root_with_directions(
+    circuit: &MerkleCircuit,
+    leaf: [Block128; 2],
+    siblings: &[[Block128; 2]],
+    directions: &[bool; MAX_MERKLE_DEPTH],
+    active_depth: usize,
+) -> [Block128; 2] {
     let mut full_siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
     for (i, s) in siblings.iter().enumerate().take(active_depth) {
         full_siblings[i] = *s;
@@ -119,6 +149,7 @@ pub fn compute_merkle_root(
     let inputs = MerklePathInputs {
         leaf,
         siblings: full_siblings,
+        directions: *directions,
         expected_root: [Block128::ZERO; 2],
         active_depth,
     };
@@ -164,6 +195,7 @@ mod tests {
                 s[0] = digest_to_fields(&right);
                 s
             },
+            directions: [false; MAX_MERKLE_DEPTH],
             expected_root: digest_to_fields(&native_out),
             active_depth: 1,
         };
@@ -192,6 +224,7 @@ mod tests {
                 s[2] = digest_to_fields(&s2);
                 s
             },
+            directions: [false; MAX_MERKLE_DEPTH],
             expected_root: digest_to_fields(&h2),
             active_depth: 3,
         };
@@ -217,10 +250,44 @@ mod tests {
         let inputs = MerklePathInputs {
             leaf: leaf_fields,
             siblings,
+            directions: [false; MAX_MERKLE_DEPTH],
             expected_root: digest_to_fields(&current),
             active_depth: MAX_MERKLE_DEPTH,
         };
         let w = evaluate_merkle(&circuit, &inputs);
         assert_eq!(fields_to_digest(w.derived_root), current);
+    }
+
+    #[test]
+    fn directed_path_matches_native_left_right_order() {
+        use noid_poseidon2b::native::compress;
+
+        let circuit = MerkleCircuit::build();
+        let leaf = [0x11u8; 32];
+        let s0 = [0x22u8; 32];
+        let s1 = [0x33u8; 32];
+        let s2 = [0x44u8; 32];
+
+        let h0 = compress(&s0, &leaf);
+        let h1 = compress(&h0, &s1);
+        let h2 = compress(&s2, &h1);
+
+        let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
+        siblings[0] = digest_to_fields(&s0);
+        siblings[1] = digest_to_fields(&s1);
+        siblings[2] = digest_to_fields(&s2);
+        let mut directions = [false; MAX_MERKLE_DEPTH];
+        directions[0] = true;
+        directions[2] = true;
+        let inputs = MerklePathInputs {
+            leaf: digest_to_fields(&leaf),
+            siblings,
+            directions,
+            expected_root: digest_to_fields(&h2),
+            active_depth: 3,
+        };
+
+        let w = evaluate_merkle(&circuit, &inputs);
+        assert_eq!(fields_to_digest(w.derived_root), h2);
     }
 }

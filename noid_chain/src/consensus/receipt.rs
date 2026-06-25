@@ -11,15 +11,17 @@
 //!
 //! **Merkle inclusion** (offline): Poseidon2b COMPRESS binary tree.
 //!   Must match `noid_chain::block::compute_tx_root` exactly.
-//!   Poseidon2b is used (not Blake3) because the tx_root feeds into the
-//!   BlockProof spine — an in-circuit Poseidon2b Merkle proof is far cheaper than Blake3.
+//!   Poseidon2b is used because the tx_root feeds into the BlockProof spine and
+//!   must stay in the arithmetic consensus hash domain.
 //! **Header lookup** (online): `getHeaderByHeight(claimed_height)` → check `tx_root`.
 //! **Chain cert verify** (offline): `verify_tip(chain_cert, ...)` with embedded proof.
 
-use noid_poseidon2b::native::compress;
+use noid_poseidon2b::native::{compress, poseidon2b_hash_bytes};
 
 use crate::block_header::BlockHeader;
 use noid_poseidon2b::primitives::Address;
+
+const RECEIPT_SUMMARY_HASH_DOMAIN: &[u8] = b"NOID_RECEIPT_SUMMARY_V1";
 
 /// Compact summary of a transaction (public on-chain data only).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,7 +48,7 @@ pub struct ParanoidReceipt {
     pub claimed_root: [u8; 32],
     pub claimed_height: u64,
     pub summary: TxSummary,
-    /// Blake3(bincode(summary)). Prevents forging payment data (amounts, addresses)
+    /// Poseidon2b(bincode(summary)). Prevents forging payment data (amounts, addresses)
     /// while keeping the Merkle proof valid — summary is not in the Merkle tree.
     pub summary_hash: [u8; 32],
     pub chain_cert: Option<Vec<u8>>,
@@ -88,7 +90,7 @@ pub fn generate_receipt(
 ) -> ParanoidReceipt {
     let (merkle_path, merkle_dirs) = build_merkle_path(block_tx_hashes, tx_index);
     let summary_bytes = bincode::serialize(&summary).expect("TxSummary bincode");
-    let summary_hash = *blake3::hash(&summary_bytes).as_bytes();
+    let summary_hash = poseidon2b_hash_bytes(RECEIPT_SUMMARY_HASH_DOMAIN, &summary_bytes);
     ParanoidReceipt {
         version: 1,
         tx_body_hash,
@@ -109,9 +111,9 @@ pub fn generate_receipt(
 ///
 /// Uses Poseidon2b COMPRESS to match `compute_tx_root` in `noid_chain::block`.
 pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
-    // 1. TxSummary integrity: Blake3(bincode(summary)) must match.
+    // 1. TxSummary integrity: Poseidon2b(bincode(summary)) must match.
     let summary_bytes = bincode::serialize(&receipt.summary).expect("TxSummary bincode");
-    if *blake3::hash(&summary_bytes).as_bytes() != receipt.summary_hash {
+    if poseidon2b_hash_bytes(RECEIPT_SUMMARY_HASH_DOMAIN, &summary_bytes) != receipt.summary_hash {
         return false;
     }
 
@@ -205,8 +207,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: GENESIS_TARGET,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -328,7 +328,7 @@ mod tests {
             let r = generate_receipt(&header, tx, i, &hashes, dummy_summary(tx, 1), None);
             // Direction stored in dirs, not in path bytes.
             for _sibling in &r.merkle_path {
-                // The sibling is an actual Blake3 hash or zero — never modified.
+                // The sibling is an actual Poseidon2b digest or zero — never modified.
                 // Just verify inclusion works correctly for all positions.
             }
             assert!(verify_merkle_inclusion(&r));

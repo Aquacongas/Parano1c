@@ -28,17 +28,32 @@ pub fn validate_timestamp(
     prev_timestamps: &[u64],
     local_time: u64,
 ) -> Result<(), ConsensusError> {
-    // Rule 1: timestamp > median-time-past.
+    validate_median_time_past(block_ts, prev_timestamps)?;
+    validate_future_drift(block_ts, local_time)?;
+    Ok(())
+}
+
+/// Validate only the timeless consensus timestamp rule.
+///
+/// This is the timestamp predicate that can be proven for historical recursive
+/// checkpoints. It deliberately excludes the local wall-clock future-drift
+/// admission policy.
+pub fn validate_median_time_past(
+    block_ts: u64,
+    prev_timestamps: &[u64],
+) -> Result<(), ConsensusError> {
     let mtp = median_time_past(prev_timestamps);
     if block_ts <= mtp {
         return Err(ConsensusError::BadTimestamp);
     }
+    Ok(())
+}
 
-    // Rule 2: timestamp <= local_time + MAX_FUTURE_DRIFT.
+/// Validate the local node admission policy for far-future timestamps.
+pub fn validate_future_drift(block_ts: u64, local_time: u64) -> Result<(), ConsensusError> {
     if block_ts > local_time.saturating_add(MAX_FUTURE_DRIFT) {
         return Err(ConsensusError::BadTimestamp);
     }
-
     Ok(())
 }
 

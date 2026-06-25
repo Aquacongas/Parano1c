@@ -83,10 +83,9 @@ impl BatchedEvalProof {
 // ---------------------------------------------------------------------------
 //
 // `prove_batched` / `verify_batched` require every committed column to
-// share one hypercube size. `noid_stark::spine` γ₃b needs to open a
-// boundary MLE `B` (2^15) together with base-trace columns (2^log_len,
-// typically 2^13) in one batched proof so the standalone boundary
-// commitment and standalone FRI open can be retired.
+// share one hypercube size. Mixed callers need to open boundary MLEs together
+// with base-trace columns in one batched proof so standalone commitments and
+// standalone FRI opens are not introduced.
 //
 // The design: group columns by `log_len`. All groups share one RLC
 // scalar `α` squeezed after absorbing every column's opening — the
@@ -385,8 +384,7 @@ pub fn verify_batched_mixed(
 /// * `ntt` — the additive-NTT plan for `log_len + LOG_RATE`.
 /// * `channel` — the parent Fiat–Shamir transcript. Must already have
 ///   absorbed whatever the outer protocol commits before the batched
-///   opening (in `noid_stark` that is PI + column roots + the
-///   zero-check sumcheck). This function absorbs openings, the
+///   opening. This function absorbs openings, the
 ///   `RLCOPEN_TAG`, the batched commitment, and threads α through the
 ///   transcript — see CRYPTO.md §12b.4.
 ///

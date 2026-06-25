@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::genesis::genesis_header;
-use noid_chain::consensus::pow::full_block_hash;
+use noid_chain::consensus::pow::block_id;
 use noid_chain::fri_state::SlotValue;
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
@@ -167,7 +167,7 @@ fn intent_without_proof(body: TxBody) -> TxIntent {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_accepts_valid_sweep25x2_bundle() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -212,7 +212,7 @@ async fn mempool_accepts_valid_sweep25x2_bundle() {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_rejects_sweep_body_tamper_against_valid_bundle() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -247,7 +247,7 @@ async fn mempool_rejects_sweep_body_tamper_against_valid_bundle() {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_rejects_sweep_fee_tamper_against_valid_bundle() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -269,7 +269,7 @@ async fn mempool_rejects_sweep_fee_tamper_against_valid_bundle() {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_rejects_sweep_auth_tamper() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -287,7 +287,7 @@ async fn mempool_rejects_sweep_auth_tamper() {
 #[tokio::test]
 async fn mempool_rejects_malformed_sweep_bundle_bytes() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -304,7 +304,7 @@ async fn mempool_rejects_malformed_sweep_bundle_bytes() {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let sweep_body = mk_sweep_body(epoch_anchor, fee);
@@ -335,7 +335,7 @@ async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
 #[tokio::test]
 async fn mempool_rejects_sweep_replay_by_occupied_output_before_zk() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -356,7 +356,7 @@ async fn mempool_rejects_sweep_replay_by_occupied_output_before_zk() {
 #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
 async fn mempool_rejects_sweep_input_conflict_with_admitted_sweep() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let probe = mk_sweep_body(epoch_anchor, 0);
     let fee = required_fee_for_tx_body(&probe, 5, 24);
     let body = mk_sweep_body(epoch_anchor, fee);
@@ -387,7 +387,7 @@ async fn mempool_rejects_sweep_input_conflict_with_admitted_sweep() {
 #[tokio::test]
 async fn mempool_rejects_sweep_with_more_than_25_inputs_without_panic() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let mut body = mk_sweep_body(epoch_anchor, 9_000);
     while body.inputs.len() <= TxShape::Sweep25x2.max_inputs() {
         body.inputs.push(body.inputs[0].clone());
@@ -402,7 +402,7 @@ async fn mempool_rejects_sweep_with_more_than_25_inputs_without_panic() {
 #[tokio::test]
 async fn mempool_rejects_sweep_with_more_than_2_outputs_without_panic() {
     let genesis = genesis_header();
-    let epoch_anchor = full_block_hash(&genesis);
+    let epoch_anchor = block_id(&genesis);
     let mut body = mk_sweep_body(epoch_anchor, 9_000);
     body.outputs.push(TxOutput {
         slot_index: 50_002,

@@ -38,7 +38,7 @@ pub trait WalletOps: Send + Sync {
     fn scan_state(&self, state: &SegmentedFriState, height: u64) -> WalletScanResult;
 
     /// Plan one logical payment as one or more transaction amounts using a fixed
-    /// per-tx fee. Kept for legacy tests and simple callers.
+    /// per-tx fee. Kept for focused tests and simple callers.
     fn plan_send_splits(
         &self,
         amount_micronoid: u64,
@@ -72,7 +72,7 @@ pub trait WalletOps: Send + Sync {
     /// - `to_address`: recipient 32-byte address
     /// - `amount_micronoid`: payment amount in μNOID
     /// - `fee_micronoid`: transaction fee in μNOID
-    /// - `epoch_anchor`: current chain tip full-block hash (from `full_block_hash(tip)`)
+    /// - `epoch_anchor`: current chain tip full-block hash (from `block_id(tip)`)
     /// - `slot_hints`: 2–4 empty slot indices for outputs (from `get_slot_hints`)
     /// - `log_slots`: current chain `log_slots` (from `tip_header().log_slots`)
     fn build_send(

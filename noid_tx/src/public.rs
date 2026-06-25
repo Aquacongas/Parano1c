@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Public-input layout for canonical per-transaction TxLogic AIR.
+//! Public-input layout for the canonical per-transaction public predicate.
 //!
 //! Order is locked:
 //! `(epoch_anchor, tx_body_hash, shape_id, fee, n_live_inputs,
@@ -34,8 +34,8 @@ pub struct PublicInputs {
     pub n_live_outputs: u8,
     /// Coinbase block reward credit. Zero for non-coinbase transactions.
     pub coinbase_credit: u64,
-    /// Slot-space depth `k ∈ [MIN_LOG_SLOTS, MAX_LOG_SLOTS]` from block
-    /// header. Absorbed into STARK transcript to bind circuit sizing.
+    /// Slot-space depth `k in [MIN_LOG_SLOTS, MAX_LOG_SLOTS]` from block
+    /// header. Bound into the proof statement to fix relation sizing.
     pub log_slots: u32,
     /// Binding commitment to all claimed slot values (inputs + outputs).
     /// Bridges canonical TxLogic public inputs to the exact block transition surface.

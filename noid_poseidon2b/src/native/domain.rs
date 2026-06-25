@@ -44,6 +44,9 @@ pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
 pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");
 pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
+/// Proof-of-work header digest. Distinct from `BLOCKHDR`: the same semantic
+/// header has separate chain-link and mining-difficulty hash domains.
+pub const TAG_POWHDR: DomainTag = DomainTag::new(b"POWHDR__");
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
@@ -53,9 +56,8 @@ pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
 pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
 /// Fixed-length 4-field output-leaf sponge: `[slot, value, owner_hi,
 /// owner_lo]` absorbed as two rate blocks with no padding flush
-/// (total: 2 permutations). Symmetric twin of the AIR's
-/// `OutputLeafPermA + OutputLeafPermB` schedule in
-/// `noid_air::airs::tx_body_merkle`. Distinct from `TAG_LEAF` so the
+/// (total: 2 permutations). Symmetric twin of the canonical tx-body
+/// GKR `OutputLeafPermA + OutputLeafPermB` schedule. Distinct from `TAG_LEAF` so the
 /// no-pad 4-field output-leaf construction cannot collide with the
 /// pad-flushed variable-length `hash_leaf` under the same IV.
 pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
@@ -72,6 +74,10 @@ pub const TAG_EXSTROT: DomainTag = DomainTag::new(b"EXSTROT_");
 pub const TAG_RGDBUCK: DomainTag = DomainTag::new(b"RGDBUCK_");
 /// ReuseGuard fixed-depth Merkle node: `PARANOID/REUSE-GUARD-NODE/256/v1`.
 pub const TAG_RGDNODE: DomainTag = DomainTag::new(b"RGDNODE_");
+/// Accepted-block claim field transcript for recursive chain accumulation.
+pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
+/// Variable-length byte hashing with an explicit absorbed domain string.
+pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
 
 #[cfg(test)]
 mod tests {
@@ -86,6 +92,7 @@ mod tests {
             TAG_ADDRFIX,
             TAG_TXBODY,
             TAG_BLOCKHDR,
+            TAG_POWHDR,
             TAG_FSCHALNG,
             TAG_COMPRESS,
             TAG_DAWTNSS,
@@ -98,6 +105,8 @@ mod tests {
             TAG_EXSTROT,
             TAG_RGDBUCK,
             TAG_RGDNODE,
+            TAG_ACCBLK,
+            TAG_BYTEHASH,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

@@ -38,9 +38,13 @@ use noid_poseidon2b::native::permutation::{
 };
 
 use crate::batch_eval::{
-    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
+    prove_linear_eval_prebound, prove_multi_batch_eval, verify_linear_eval_prebound,
+    verify_multi_batch_eval, BatchEvalReduction, EvalClaim, LinearEvalClaim, LinearEvalProof,
+    LinearEvalTerm, MultiBatchEvalProof,
 };
-use crate::layers::evaluate_permutation;
+use crate::layers::{
+    apply_mds_full, apply_mds_partial, evaluate_permutation, round_kind, RoundKind,
+};
 use crate::spine_mle::{sigma_at, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS};
 use crate::spine_sumcheck::N_SPINE_SLOTS;
 use noid_core::sumcheck::RoundPolynomial;
@@ -49,6 +53,7 @@ use std::time::{Duration, Instant};
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
 const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
 const ROUND_LIMIT: usize = 1 << ROUND_BITS; // 128
+const BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x4253_5049_4E54_5801; // "BSPINTX"+1
 
 /// Per-variable degree of the unified block sumcheck (same as per-tx).
 pub const BLOCK_SPINE_ROUND_DEGREE: usize = 9;
@@ -168,7 +173,7 @@ fn slot_vars_for(total_live_slots: usize) -> usize {
 }
 
 /// Total number of MLE variables for a given number of live slots.
-fn num_vars_for(total_live_slots: usize) -> usize {
+pub fn num_vars_for(total_live_slots: usize) -> usize {
     slot_vars_for(total_live_slots) + ROUND_BITS + ELEM_BITS
 }
 
@@ -176,6 +181,25 @@ fn num_vars_for(total_live_slots: usize) -> usize {
 #[inline]
 fn pack_index_dyn(slot: usize, round: usize, elem: usize) -> usize {
     (slot << (ROUND_BITS + ELEM_BITS)) | (round << ELEM_BITS) | elem
+}
+
+/// Hypercube point for the dynamic block-spine `state(slot, round, elem)`.
+pub fn block_spine_state_point(
+    num_vars: usize,
+    slot: usize,
+    round: usize,
+    elem: usize,
+) -> Vec<Block128> {
+    let cell = pack_index_dyn(slot, round, elem);
+    (0..num_vars)
+        .map(|b| {
+            if (cell >> b) & 1 == 1 {
+                Block128::ONE
+            } else {
+                Block128::ZERO
+            }
+        })
+        .collect()
 }
 
 /// Extract round from a dynamic-width index.
@@ -217,6 +241,36 @@ pub struct BlockSpineMle {
 }
 
 impl BlockSpineMle {
+    /// Build a dynamic Poseidon2b permutation-trace MLE from arbitrary live
+    /// slot inputs. This is the shared production helper for block spines and
+    /// batched Merkle paths.
+    pub fn build_from_slot_state_ins(slot_state_ins: &[[Block128; STATE_SIZE]]) -> Self {
+        let total_live = slot_state_ins.len();
+        assert!(total_live > 0);
+        let num_vars = num_vars_for(total_live);
+        let n_cells = 1usize << num_vars;
+
+        let mut mle = BlockSpineMle {
+            s_in: vec![Block128::ZERO; n_cells],
+            s_out: vec![Block128::ZERO; n_cells],
+            sigma: vec![Block128::ZERO; n_cells],
+            state: vec![Block128::ZERO; n_cells],
+            num_vars,
+            live_slots: total_live,
+        };
+
+        use rayon::prelude::*;
+        let witnesses: Vec<crate::layers::PermLayerWitness> = slot_state_ins
+            .par_iter()
+            .map(|&state_in| evaluate_permutation(state_in))
+            .collect();
+
+        for (slot, witness) in witnesses.iter().enumerate() {
+            mle.populate_slot(slot, witness);
+        }
+        mle
+    }
+
     /// Build the unified block MLE from N transactions' slot state_in vectors.
     /// Each transaction contributes exactly `N_SPINE_SLOTS` (59) slots.
     pub fn build(n_instances: usize, slot_state_ins: &[[Block128; STATE_SIZE]]) -> Self {
@@ -1637,9 +1691,8 @@ pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineProof {
     pub kill_shot: BlockSpineKillShotProof,
-    pub state_batch: BatchEvalProof,
-    pub sin_batch: BatchEvalProof,
-    pub sout_batch: BatchEvalProof,
+    pub tx_hash_pins: LinearEvalProof,
+    pub batch: MultiBatchEvalProof,
     pub num_vars: usize,
     pub live_slots: usize,
 }
@@ -1654,13 +1707,12 @@ impl BlockSpineProof {
             + shift_polys
             + main_finals
             + shift_finals
-            + self.state_batch.byte_len()
-            + self.sin_batch.byte_len()
-            + self.sout_batch.byte_len()
+            + self.tx_hash_pins.byte_len()
+            + self.batch.byte_len()
     }
 }
 
-/// Reductions delivered to the FRI/STARK bridge.
+/// Reductions delivered to the composed batch relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockSpineReductions {
     pub state: BatchEvalReduction,
@@ -1668,11 +1720,32 @@ pub struct BlockSpineReductions {
     pub sout: BatchEvalReduction,
 }
 
+fn tx_hash_pin_claims(
+    n_instances: usize,
+    tx_body_hashes: &[[Block128; 2]],
+    num_vars: usize,
+) -> Vec<LinearEvalClaim> {
+    let mut claims = Vec::with_capacity(n_instances * 2);
+    for (tx_idx, tx_hash) in tx_body_hashes.iter().enumerate().take(n_instances) {
+        let wrap_slot = tx_idx * N_SPINE_SLOTS + (N_SPINE_SLOTS - 1);
+        for lane in 0..2 {
+            claims.push(LinearEvalClaim {
+                terms: vec![LinearEvalTerm {
+                    point: block_spine_state_point(num_vars, wrap_slot, N_ROUNDS, lane),
+                    coeff: Block128::ONE,
+                }],
+                value: tx_hash[lane],
+            });
+        }
+    }
+    claims
+}
+
 /// Prove the unified block spine Kill-Shot over N*59 slots.
 ///
 /// The caller provides the already-built `BlockSpineMle`. This keeps the block
 /// prover honest-by-construction: the GKR proof is derived from the same spine
-/// MLE whose `state` column is committed into the block-level FRI slices.
+/// MLE whose `state` column is committed into the production PCS opening.
 pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
     n_instances: usize,
     mle: &BlockSpineMle,
@@ -1715,7 +1788,15 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
     let (shift, r_double_prime) = prove_block_spine_shift(mle, &r_prime, &main_red, channel);
     profiler.phase("shift_gadget");
 
-    // (3) Batch eval on state column.
+    let tx_hash_pin_claims = tx_hash_pin_claims(n_instances, all_tx_body_hashes, mle.num_vars);
+    let (tx_hash_pins, tx_hash_pin_red) = prove_linear_eval_prebound(
+        &mle.state,
+        &tx_hash_pin_claims,
+        BLOCK_SPINE_TX_HASH_PIN_TAG,
+        channel,
+    );
+    profiler.phase("tx_hash_pins");
+
     let state_claims = vec![
         EvalClaim {
             point: r_prime.clone(),
@@ -1725,31 +1806,33 @@ pub fn prove_block_spine_killshot<T: FiatShamir<Block128>>(
             point: r_double_prime.clone(),
             value: shift.state_at_r2,
         },
+        EvalClaim {
+            point: tx_hash_pin_red.point,
+            value: tx_hash_pin_red.value,
+        },
     ];
-    let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
-    profiler.phase("state_batch_eval");
 
-    // (4) Batch eval on s_in column.
     let sin_claims = vec![EvalClaim {
         point: r_double_prime.clone(),
         value: shift.s_in_at_r2,
     }];
-    let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
-    profiler.phase("sin_batch_eval");
 
-    // (5) Batch eval on s_out column.
     let sout_claims = vec![EvalClaim {
         point: r_double_prime,
         value: shift.s_out_at_r2,
     }];
-    let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
-    profiler.phase("sout_batch_eval");
+    let columns: [&[Block128]; 3] = [&mle.state, &mle.s_in, &mle.s_out];
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let (batch, reductions) = prove_multi_batch_eval(&columns, &claims_by_column, channel);
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions
+        .try_into()
+        .expect("multi-batch returns one reduction per column");
+    profiler.phase("multi_batch_eval");
 
     let proof = BlockSpineProof {
         kill_shot: BlockSpineKillShotProof { main, shift },
-        state_batch,
-        sin_batch,
-        sout_batch,
+        tx_hash_pins,
+        batch,
         num_vars: mle.num_vars,
         live_slots: mle.live_slots,
     };
@@ -1800,7 +1883,15 @@ pub fn verify_block_spine_killshot<T: FiatShamir<Block128>>(
     let shift_red =
         verify_block_spine_shift(&proof.kill_shot.shift, &main_red, proof.num_vars, channel)?;
 
-    // (3) Verify batch eval on state.
+    let tx_hash_pin_claims = tx_hash_pin_claims(n_instances, all_tx_body_hashes, proof.num_vars);
+    let tx_hash_pin_red = verify_linear_eval_prebound(
+        &proof.tx_hash_pins,
+        &tx_hash_pin_claims,
+        proof.num_vars,
+        BLOCK_SPINE_TX_HASH_PIN_TAG,
+        channel,
+    )?;
+
     let state_claims = vec![
         EvalClaim {
             point: main_red.r_prime.clone(),
@@ -1810,22 +1901,25 @@ pub fn verify_block_spine_killshot<T: FiatShamir<Block128>>(
             point: shift_red.r_double_prime.clone(),
             value: shift_red.state_at_r2,
         },
+        EvalClaim {
+            point: tx_hash_pin_red.point,
+            value: tx_hash_pin_red.value,
+        },
     ];
-    let state_red = verify_batch_eval(&proof.state_batch, &state_claims, proof.num_vars, channel)?;
 
-    // (4) Verify batch eval on s_in.
     let sin_claims = vec![EvalClaim {
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, proof.num_vars, channel)?;
 
-    // (5) Verify batch eval on s_out.
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
         value: shift_red.s_out_at_r2,
     }];
-    let sout_red = verify_batch_eval(&proof.sout_batch, &sout_claims, proof.num_vars, channel)?;
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let reductions =
+        verify_multi_batch_eval(&proof.batch, &claims_by_column, proof.num_vars, channel)?;
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions.try_into().ok()?;
 
     Some(BlockSpineReductions {
         state: state_red,
@@ -1840,10 +1934,151 @@ pub fn discharge_block_spine_reductions_native(
     all_slot_state_ins: &[[Block128; STATE_SIZE]],
     reductions: &BlockSpineReductions,
 ) -> bool {
-    let mle = BlockSpineMle::build(n_instances, all_slot_state_ins);
-    evaluate_slice(&mle.state, &reductions.state.point) == reductions.state.value
-        && evaluate_slice(&mle.s_in, &reductions.sin.point) == reductions.sin.value
-        && evaluate_slice(&mle.s_out, &reductions.sout.point) == reductions.sout.value
+    if all_slot_state_ins.len() != n_instances * N_SPINE_SLOTS {
+        return false;
+    }
+    discharge_block_spine_batch_reductions_from_slot_state_ins_native(
+        all_slot_state_ins,
+        &reductions.state,
+        &reductions.sin,
+        &reductions.sout,
+    )
+}
+
+pub fn discharge_block_spine_batch_reductions_from_slot_state_ins_native(
+    slot_state_ins: &[[Block128; STATE_SIZE]],
+    state: &BatchEvalReduction,
+    sin: &BatchEvalReduction,
+    sout: &BatchEvalReduction,
+) -> bool {
+    if state.point == sin.point && sin.point == sout.point {
+        let Some((state_value, sin_value, sout_value)) =
+            evaluate_block_spine_columns_from_slot_state_ins(slot_state_ins, &state.point)
+        else {
+            return false;
+        };
+        state_value == state.value && sin_value == sin.value && sout_value == sout.value
+    } else {
+        let Some((state_value, _, _)) =
+            evaluate_block_spine_columns_from_slot_state_ins(slot_state_ins, &state.point)
+        else {
+            return false;
+        };
+        let Some((_, sin_value, _)) =
+            evaluate_block_spine_columns_from_slot_state_ins(slot_state_ins, &sin.point)
+        else {
+            return false;
+        };
+        let Some((_, _, sout_value)) =
+            evaluate_block_spine_columns_from_slot_state_ins(slot_state_ins, &sout.point)
+        else {
+            return false;
+        };
+        state_value == state.value && sin_value == sin.value && sout_value == sout.value
+    }
+}
+
+pub fn evaluate_block_spine_columns_from_slot_state_ins(
+    slot_state_ins: &[[Block128; STATE_SIZE]],
+    point: &[Block128],
+) -> Option<(Block128, Block128, Block128)> {
+    if slot_state_ins.is_empty() {
+        return None;
+    }
+    let num_vars = num_vars_for(slot_state_ins.len());
+    if point.len() != num_vars {
+        return None;
+    }
+
+    let r_elem = &point[..ELEM_BITS];
+    let r_round = &point[ELEM_BITS..ELEM_BITS + ROUND_BITS];
+    let r_slot = &point[ELEM_BITS + ROUND_BITS..];
+    let eq_elem = eq_ind_partial_eval(r_elem);
+    let eq_round = eq_ind_partial_eval(r_round);
+    let eq_slot = eq_ind_partial_eval(r_slot);
+
+    use rayon::prelude::*;
+    let (state, sin, sout) = slot_state_ins
+        .par_iter()
+        .enumerate()
+        .map(|(slot, &state_in)| {
+            let slot_weight = eq_slot[slot];
+            if slot_weight == Block128::ZERO {
+                return (Block128::ZERO, Block128::ZERO, Block128::ZERO);
+            }
+            accumulate_permutation_columns_at_point(state_in, slot_weight, &eq_round, &eq_elem)
+        })
+        .reduce(
+            || (Block128::ZERO, Block128::ZERO, Block128::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+        );
+
+    Some((state, sin, sout))
+}
+
+fn accumulate_permutation_columns_at_point(
+    state_in: [Block128; STATE_SIZE],
+    slot_weight: Block128,
+    eq_round: &[Block128],
+    eq_elem: &[Block128],
+) -> (Block128, Block128, Block128) {
+    let mut state_acc = Block128::ZERO;
+    let mut sin_acc = Block128::ZERO;
+    let mut sout_acc = Block128::ZERO;
+    let mut current = state_in;
+    apply_mds_full(&mut current);
+
+    for round in 0..N_ROUNDS {
+        let row_weight = slot_weight * eq_round[round];
+        accumulate_row(&mut state_acc, current, row_weight, eq_elem);
+
+        match round_kind(round) {
+            RoundKind::Full => {
+                let mut sin = [Block128::ZERO; STATE_SIZE];
+                let mut sout = [Block128::ZERO; STATE_SIZE];
+                for lane in 0..STATE_SIZE {
+                    sin[lane] = current[lane] + Block128::from(ROUND_CONSTANTS[lane][round]);
+                    sout[lane] = pow7_block128(sin[lane]);
+                }
+                accumulate_row(&mut sin_acc, sin, row_weight, eq_elem);
+                accumulate_row(&mut sout_acc, sout, row_weight, eq_elem);
+                current = sout;
+                apply_mds_full(&mut current);
+            }
+            RoundKind::Partial => {
+                let mut sin = [Block128::ZERO; STATE_SIZE];
+                let mut sout = [Block128::ZERO; STATE_SIZE];
+                sin[0] = current[0] + Block128::from(ROUND_CONSTANTS[0][round]);
+                sout[0] = pow7_block128(sin[0]);
+                accumulate_row(&mut sin_acc, sin, row_weight, eq_elem);
+                accumulate_row(&mut sout_acc, sout, row_weight, eq_elem);
+                current = apply_mds_partial([sout[0], current[1], current[2], current[3]]);
+            }
+        }
+    }
+
+    accumulate_row(
+        &mut state_acc,
+        current,
+        slot_weight * eq_round[N_ROUNDS],
+        eq_elem,
+    );
+    (state_acc, sin_acc, sout_acc)
+}
+
+#[inline]
+fn accumulate_row(
+    acc: &mut Block128,
+    row: [Block128; STATE_SIZE],
+    row_weight: Block128,
+    eq_elem: &[Block128],
+) {
+    if row_weight == Block128::ZERO {
+        return;
+    }
+    for lane in 0..STATE_SIZE {
+        *acc += row_weight * eq_elem[lane] * row[lane];
+    }
 }
 
 #[cfg(test)]

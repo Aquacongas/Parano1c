@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Legacy column-state helper for UTXO slots.
+//! Column-oriented raw-state helper for UTXO slots.
 //!
 //! The chain state is a vector of `2^log_slots` UTXO slots. Each slot is
 //! a `SlotValue { value, owner_hi, owner_lo }` tuple. Production block
-//! validation no longer uses this helper as the state proof or state-root
-//! commitment: user blocks use the exact Poseidon2b sparse-Merkle UTXO root
-//! composed with the bounded `ReuseGuard` root. This module remains as a
-//! column-oriented raw-state utility and for tests that exercise old local
-//! opening primitives.
+//! validation does not use the column opening as state proof authority: user
+//! blocks use the exact Poseidon2b sparse-Merkle UTXO root composed with the
+//! bounded `ReuseGuard` root. This module remains the raw segment storage
+//! utility used by the node, wallet scanner, and snapshot serializer.
 //!
 //! State transitions are **linear**: spending `slot_i` is `slot_i ← 0`,
 //! minting into `slot_j` is `slot_j ← new`. `apply_delta` applies a batch
@@ -32,11 +31,10 @@ use noid_fri_binius::{
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
-/// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not
-/// a circuit-wide constant — the AIR and STARK transcript are
-/// parameterised by the header-declared `log_slots` (see
-/// `noid_tx::public::PublicInputs::log_slots` and `MAX_LOG_SLOTS`),
-/// which may grow to at most `32` via the `§15.3` expansion trigger.
+/// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not a
+/// proof-wide constant: accepted blocks bind the header-declared `log_slots`
+/// (see `noid_tx::public::PublicInputs::log_slots` and `MAX_LOG_SLOTS`),
+/// which may grow to at most `32` via the expansion trigger.
 /// This value is used only as the seed depth when instantiating a
 /// fresh `ChainState` without an existing header. Tests override with
 /// smaller values through [`FriState::new_empty`].
@@ -75,10 +73,11 @@ pub enum StateError {
     OpeningFailed,
 }
 
-/// Batched FRI opening of all three state columns for one segment at an arbitrary eval point.
+/// Batched raw-segment opening of all three state columns for one segment at an arbitrary eval point.
 ///
-/// Uses the compact `noid_fri_binius` interleaved commitment scheme — the SAME scheme
-/// as the block-level FRI proof, enabling efficient compact FRI + Merkle path openings.
+/// Uses the compact `noid_fri_binius` interleaved commitment scheme for local
+/// raw segment openings. Production block validity uses exact sparse-Merkle
+/// state proofs instead.
 ///
 /// For **slot openings** (`local_idx`-based), `eval_point` is the boolean hypercube
 /// encoding of `local_idx`; `slot_vals` are the actual slot values.
@@ -99,7 +98,7 @@ pub struct SlotOpening {
     pub slot_vals: [Block128; 3],
     /// Mixed opening proof for the 3 columns at `eval_point`.
     pub proof: MixedOpeningProof,
-    /// Compact FRI segment root: `cap_to_seg_root_with_depth(commitment.cap, eff_log)`.
+    /// Compact raw segment root: `cap_to_seg_root_with_depth(commitment.cap, eff_log)`.
     pub seg_root: StateRoot,
     /// Poseidon2b Merkle siblings from `seg_root` up to `state_root` (bottom-up).
     /// Empty when `num_segments == 1` (single-segment / test mode).
@@ -203,9 +202,8 @@ impl FriState {
     ///
     /// Uses `noid_fri_binius::interleaved_commit` over the three columns,
     /// then reduces the cap to a single 32-byte root via
-    /// `cap_to_seg_root`. This is the SAME scheme as `SegmentedFriState`
-    /// and as the block-level FRI proof, ensuring all commitments are
-    /// cryptographically consistent.
+    /// `cap_to_seg_root`. This matches `SegmentedFriState` raw segment storage;
+    /// production block validity uses exact sparse-Merkle transition proofs.
     pub fn root(&mut self) -> StateRoot {
         if let Some(r) = self.cached_root {
             return r;
@@ -507,8 +505,8 @@ pub fn compute_segment_root(
 /// Poseidon2b compression, then mix in `eff_log` for domain separation across
 /// segment sizes.
 ///
-/// Modern caps contain the 32 legacy segment hashes plus a source-code root used
-/// by source-bound mixed openings.  The source root is part of the state
+/// Caps contain the 32 segment hashes plus a source-code root used by
+/// source-bound mixed openings. The source root is part of the state
 /// commitment: odd layers are padded with a deterministic domain-separated leaf
 /// instead of silently dropping the final hash.
 ///

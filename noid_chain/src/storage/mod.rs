@@ -8,9 +8,9 @@
 //! `MdbxChainContext` manages on-disk state through its own `MdbxStore` layer
 //! rather than implementing this trait.
 //!
-//! **K.3 open item**: add a zero-copy `StateBackend` impl for MDBX
-//! (`load_segment_view<'txn>(...) -> &'txn [Block128]` instead of `Vec<Block128>`)
-//! to avoid memcpy bandwidth collapse at log_slots ≥ 28.
+//! A future MDBX-backed `StateBackend` should expose zero-copy segment views
+//! instead of materializing `Vec<Block128>` when large state sizes make memcpy
+//! bandwidth relevant.
 
 pub mod mdbx_context;
 pub mod mdbx_store;
@@ -73,7 +73,7 @@ pub trait HeaderProvider {
 
 /// Combined durable chain store.
 ///
-/// Implementors provide unified access to headers, the recursive proof, the
+/// Implementors provide unified access to headers, local history cache, the
 /// transaction index, and retained full blocks. `MdbxStore` implements this
 /// trait for the disk-backed node.
 pub trait BlockStore: Send + Sync {
@@ -91,12 +91,11 @@ pub trait BlockStore: Send + Sync {
     /// coverage; returns `None` only if not stored or deliberately pruned later.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
-    /// Retrieve the persisted recursive chain proof (~38 KB encoded). `None` means
-    /// the prover has not yet caught up (DEGRADED / FALLBACK mode).
-    fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Retrieve the persisted local finalized-history cache object.
+    fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError>;
 
-    /// Persist a new recursive chain proof.
-    fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError>;
+    /// Persist a new local finalized-history cache object.
+    fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError>;
 
     /// Look up a transaction by body hash. Returns `(block_height, tx_pos)`
     /// for O(1) receipt lookup and Merkle path reconstruction.

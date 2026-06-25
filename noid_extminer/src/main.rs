@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! # noid-extminer — External Blake3 PoW miner for the Paranoid blockchain.
+//! # noid-extminer — External Poseidon2b PoW miner for the Paranoid blockchain.
 //!
 //! Connects to any `paranoid` full node via JSON-RPC, fetches a block template,
 //! searches for a valid PoW nonce using all available CPU cores (rayon), and
@@ -23,13 +23,13 @@
 //! ## Template protocol
 //!
 //! `getBlockTemplate("")` returns:
-//!   - `header_core_hex`          — 212-byte PoW input
+//!   - `pow_fields_hex`           — 16-field Poseidon2b PoW input
 //!   - `block_hex`                — full sealed block with nonce = 0
 //!   - `block_proof_hex`          — serialized BlockProof, empty for coinbase-only
 //!   - `block_auth_sidecar_hex`   — serialized public Auth sidecar, empty when absent
 //!   - `nonce_offset`             — byte offset of nonce inside block_hex (always 144)
 //!   - `difficulty_target_hex`    — 256-bit LE target
-//!   - shape/proof metadata       — operator display only; PoW uses header_core
+//!   - shape/proof metadata       — operator display only; PoW uses pow_fields
 //!
 //! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
 //! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex,
@@ -41,6 +41,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use noid_core::packed::{PackedBlock128, PACKED_LANES};
+use noid_core::{Block128, TowerField};
+use noid_poseidon2b::batch::packed_poseidon2b_permute;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_POWHDR};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +56,7 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "noid-extminer",
     version,
-    about = "External Blake3 PoW miner for the Paranoid blockchain",
+    about = "External Poseidon2b PoW miner for the Paranoid blockchain",
     long_about = "Fetches block templates from a paranoid node and mines blocks \
                   using all available CPU cores.\n\n\
                   The node builds the proven template; this worker only does PoW.\n\
@@ -74,7 +78,7 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
 
-    /// Your own payout address (bech32m noid1... or 64-char hex).
+    /// Your own payout address (bech32m noid1...).
     /// Only works when the node is started with --allow-custom-coinbase.
     /// Leave empty to use the node's configured payout address (pool mode).
     #[arg(long, value_name = "ADDRESS", default_value = "")]
@@ -96,7 +100,7 @@ struct Cli {
 
 #[derive(Debug, Deserialize)]
 struct BlockTemplateResponse {
-    header_core_hex: String,
+    pow_fields_hex: String,
     block_hex: String,
     block_proof_hex: String,
     #[serde(default)]
@@ -208,18 +212,22 @@ impl RpcClient {
 // ---------------------------------------------------------------------------
 
 const CHUNK_SIZE: u128 = 10_000_000;
-/// Byte offset of the nonce inside header_core (= header start).
-const NONCE_OFFSET_IN_CORE: usize = 144;
-/// Serialized block header size: header_core fields plus proof_transcript_hash and witness_root.
-const BLOCK_HEADER_WIRE_SIZE: usize = 276;
-/// `log_slots`, `active_slot_count`, and `alloc_counter` are at the tail of `header_core`.
-const HEADER_CORE_TAIL_OFFSET: usize = 192;
-/// The same tail starts after proof_transcript_hash and witness_root in the full header wire layout.
-const BLOCK_HEADER_TAIL_OFFSET: usize = 256;
+const DIGEST_BATCH: usize = 256;
+const POW_HEADER_FIELD_COUNT: usize = 16;
+const POW_NONCE_FIELD_INDEX: usize = 10;
+const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
+/// Byte offset of the nonce inside block header wire.
+const BLOCK_HEADER_NONCE_OFFSET: usize = 144;
+/// Serialized semantic block header size.
+const BLOCK_HEADER_WIRE_SIZE: usize = 212;
 
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` if cancelled.
-fn search_nonce(header_core: &[u8; 212], target: &[u8; 32], cancel: &AtomicBool) -> Option<u128> {
+fn search_nonce(
+    pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
+    target: &[u8; 32],
+    cancel: &AtomicBool,
+) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE / num_threads as u128;
 
@@ -243,17 +251,21 @@ fn search_nonce(header_core: &[u8; 212], target: &[u8; 32], cancel: &AtomicBool)
             let ts = chunk_start + tid as u128 * per_thread;
             let te = ts + per_thread;
 
-            let mut buf = *header_core;
-            for nonce in ts..te {
+            let fields = *pow_fields;
+            let mut digests = [[0u8; 32]; DIGEST_BATCH];
+            let mut nonce = ts;
+            while nonce < te {
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                buf[NONCE_OFFSET_IN_CORE..NONCE_OFFSET_IN_CORE + 16]
-                    .copy_from_slice(&nonce.to_le_bytes());
-                let hash = *blake3::hash(&buf).as_bytes();
-                if le256_lt(&hash, target) {
-                    return Some(nonce);
+                let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
+                poseidon_pow_digest_nonce_batch(&fields, nonce, &mut digests[..n]);
+                for (i, hash) in digests[..n].iter().enumerate() {
+                    if le256_lt(hash, target) {
+                        return Some(nonce + i as u128);
+                    }
                 }
+                nonce += n as u128;
             }
             None
         });
@@ -264,6 +276,128 @@ fn search_nonce(header_core: &[u8; 212], target: &[u8; 32], cancel: &AtomicBool)
 
         chunk_start = chunk_start.wrapping_add(CHUNK_SIZE);
     }
+}
+
+fn decode_pow_fields_hex(hex_str: &str) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
+    let bytes = hex::decode(hex_str)?;
+    if bytes.len() != POW_FIELDS_HEX_BYTES {
+        return Err(anyhow!(
+            "pow_fields_hex must be {POW_FIELDS_HEX_BYTES} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut fields = [Block128::ZERO; POW_HEADER_FIELD_COUNT];
+    for (i, chunk) in bytes.chunks_exact(16).enumerate() {
+        fields[i] = Block128::from(u128::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(fields)
+}
+
+fn pow_fields_from_block_header(block_bytes: &[u8]) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
+    if block_bytes.len() < BLOCK_HEADER_WIRE_SIZE {
+        return Err(anyhow!(
+            "block_hex too short: {} bytes, need at least {BLOCK_HEADER_WIRE_SIZE}",
+            block_bytes.len()
+        ));
+    }
+
+    let mut fields = [Block128::ZERO; POW_HEADER_FIELD_COUNT];
+    let mut field = 0usize;
+    put_digest_fields(&mut fields, &mut field, &block_bytes[0..32]);
+    put_digest_fields(&mut fields, &mut field, &block_bytes[32..64]);
+    put_digest_fields(&mut fields, &mut field, &block_bytes[64..96]);
+    fields[field] = Block128::from(read_u64(&block_bytes[96..104]) as u128);
+    field += 1;
+    fields[field] = Block128::from(read_u64(&block_bytes[104..112]) as u128);
+    field += 1;
+    put_digest_fields(&mut fields, &mut field, &block_bytes[112..144]);
+    fields[field] = Block128::from(read_u128(&block_bytes[144..160]));
+    field += 1;
+    put_digest_fields(&mut fields, &mut field, &block_bytes[160..192]);
+    fields[field] = Block128::from(read_u32(&block_bytes[192..196]) as u128);
+    field += 1;
+    fields[field] = Block128::from(read_u64(&block_bytes[196..204]) as u128);
+    field += 1;
+    fields[field] = Block128::from(read_u64(&block_bytes[204..212]) as u128);
+    field += 1;
+    debug_assert_eq!(field, POW_HEADER_FIELD_COUNT);
+    Ok(fields)
+}
+
+fn put_digest_fields(
+    fields: &mut [Block128; POW_HEADER_FIELD_COUNT],
+    index: &mut usize,
+    bytes: &[u8],
+) {
+    fields[*index] = Block128::from(u128::from_le_bytes(bytes[..16].try_into().unwrap()));
+    *index += 1;
+    fields[*index] = Block128::from(u128::from_le_bytes(bytes[16..32].try_into().unwrap()));
+    *index += 1;
+}
+
+fn poseidon_pow_digest_nonce_batch(
+    fields: &[Block128; POW_HEADER_FIELD_COUNT],
+    start_nonce: u128,
+    out: &mut [[u8; 32]],
+) {
+    if out.is_empty() {
+        return;
+    }
+
+    let [iv_hi, iv_lo] = capacity_iv(TAG_POWHDR);
+    let mut offset = 0usize;
+    while offset < out.len() {
+        let lanes = (out.len() - offset).min(PACKED_LANES);
+        let mut states = [PackedBlock128::ZERO; 4];
+        states[2] = PackedBlock128::broadcast(iv_hi);
+        states[3] = PackedBlock128::broadcast(iv_lo);
+
+        for pair in 0..(POW_HEADER_FIELD_COUNT / 2) {
+            let left_idx = pair * 2;
+            let right_idx = left_idx + 1;
+            let mut left = PackedBlock128::broadcast(fields[left_idx]);
+            let mut right = PackedBlock128::broadcast(fields[right_idx]);
+            if left_idx == POW_NONCE_FIELD_INDEX {
+                left = PackedBlock128::ZERO;
+                for lane in 0..lanes {
+                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
+                    left = left.set_lane(lane, Block128::from(nonce));
+                }
+            } else if right_idx == POW_NONCE_FIELD_INDEX {
+                right = PackedBlock128::ZERO;
+                for lane in 0..lanes {
+                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
+                    right = right.set_lane(lane, Block128::from(nonce));
+                }
+            }
+            states[0] = states[0].xor(left);
+            states[1] = states[1].xor(right);
+            packed_poseidon2b_permute(&mut states);
+        }
+
+        for lane in 0..lanes {
+            let s0 = states[0].get_lane(lane);
+            let s1 = states[1].get_lane(lane);
+            out[offset + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
+            out[offset + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
+        }
+        offset += lanes;
+    }
+}
+
+#[inline]
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+#[inline]
+fn read_u64(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().unwrap())
+}
+
+#[inline]
+fn read_u128(bytes: &[u8]) -> u128 {
+    u128::from_le_bytes(bytes.try_into().unwrap())
 }
 
 /// Compare two 32-byte values as 256-bit LE integers: `a < b`.
@@ -281,13 +415,13 @@ fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 fn validate_template_layout(
-    header_core: &[u8; 212],
+    pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
     block_bytes: &[u8],
     nonce_offset: usize,
 ) -> Result<()> {
-    if nonce_offset != NONCE_OFFSET_IN_CORE {
+    if nonce_offset != BLOCK_HEADER_NONCE_OFFSET {
         return Err(anyhow!(
-            "unexpected nonce_offset={nonce_offset}; expected {NONCE_OFFSET_IN_CORE}"
+            "unexpected nonce_offset={nonce_offset}; expected {BLOCK_HEADER_NONCE_OFFSET}"
         ));
     }
     if block_bytes.len() < BLOCK_HEADER_WIRE_SIZE {
@@ -297,15 +431,10 @@ fn validate_template_layout(
         ));
     }
 
-    // Full header wire layout inserts proof_transcript_hash and witness_root after
-    // difficulty_target, while header_core omits them. Compare the prefix before
-    // those proof fields and the consensus tail after them.
-    if block_bytes[..HEADER_CORE_TAIL_OFFSET] != header_core[..HEADER_CORE_TAIL_OFFSET]
-        || block_bytes[BLOCK_HEADER_TAIL_OFFSET..BLOCK_HEADER_WIRE_SIZE]
-            != header_core[HEADER_CORE_TAIL_OFFSET..]
-    {
+    let block_fields = pow_fields_from_block_header(block_bytes)?;
+    if &block_fields != pow_fields {
         return Err(anyhow!(
-            "template mismatch: header_core_hex does not match the header embedded in block_hex"
+            "template mismatch: pow_fields_hex does not match the semantic header embedded in block_hex"
         ));
     }
 
@@ -386,10 +515,8 @@ fn mine(cli: &Cli) -> Result<()> {
         let height = tmpl.height;
         let n_txs = tmpl.n_txs;
 
-        let header_core: [u8; 212] = hex::decode(&tmpl.header_core_hex)
-            .context("decode header_core_hex")?
-            .try_into()
-            .map_err(|_| anyhow!("header_core must be 212 bytes"))?;
+        let pow_fields =
+            decode_pow_fields_hex(&tmpl.pow_fields_hex).context("decode pow_fields_hex")?;
 
         let target: [u8; 32] = hex::decode(&tmpl.difficulty_target_hex)
             .context("decode difficulty_target_hex")?
@@ -398,7 +525,7 @@ fn mine(cli: &Cli) -> Result<()> {
 
         let mut block_bytes = hex::decode(&tmpl.block_hex).context("decode block_hex")?;
         let nonce_offset = tmpl.nonce_offset;
-        validate_template_layout(&header_core, &block_bytes, nonce_offset)?;
+        validate_template_layout(&pow_fields, &block_bytes, nonce_offset)?;
 
         // Count leading zero bits for display.
         let diff_bits = {
@@ -426,7 +553,7 @@ fn mine(cli: &Cli) -> Result<()> {
         let cancel = Arc::new(AtomicBool::new(false));
         let t0 = Instant::now();
 
-        let nonce = match search_nonce(&header_core, &target, &cancel) {
+        let nonce = match search_nonce(&pow_fields, &target, &cancel) {
             Some(n) => n,
             None => {
                 // Was cancelled (shouldn't happen without explicit cancellation).
@@ -493,34 +620,31 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn matching_header_and_block_bytes() -> ([u8; 212], Vec<u8>) {
-        let mut header_core = [0u8; 212];
-        for (i, b) in header_core.iter_mut().enumerate() {
+    fn matching_pow_fields_and_block_bytes() -> ([Block128; POW_HEADER_FIELD_COUNT], Vec<u8>) {
+        let mut block = vec![0u8; BLOCK_HEADER_WIRE_SIZE + 4];
+        for (i, b) in block[..BLOCK_HEADER_WIRE_SIZE].iter_mut().enumerate() {
             *b = i as u8;
         }
-        let mut block = vec![0u8; BLOCK_HEADER_WIRE_SIZE + 4];
-        block[..HEADER_CORE_TAIL_OFFSET].copy_from_slice(&header_core[..HEADER_CORE_TAIL_OFFSET]);
-        block[BLOCK_HEADER_TAIL_OFFSET..BLOCK_HEADER_WIRE_SIZE]
-            .copy_from_slice(&header_core[HEADER_CORE_TAIL_OFFSET..]);
-        (header_core, block)
+        let fields = pow_fields_from_block_header(&block).expect("valid header bytes");
+        (fields, block)
     }
 
     #[test]
-    fn template_layout_accepts_matching_core_and_full_header() {
-        let (header_core, block) = matching_header_and_block_bytes();
-        validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE).unwrap();
+    fn template_layout_accepts_matching_pow_fields_and_full_header() {
+        let (fields, block) = matching_pow_fields_and_block_bytes();
+        validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET).unwrap();
     }
 
     #[test]
-    fn template_layout_rejects_mismatched_tail() {
-        let (header_core, mut block) = matching_header_and_block_bytes();
-        block[BLOCK_HEADER_TAIL_OFFSET] ^= 0xFF;
-        assert!(validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE).is_err());
+    fn template_layout_rejects_mismatched_pow_fields() {
+        let (mut fields, block) = matching_pow_fields_and_block_bytes();
+        fields[0] += Block128::from(1u128);
+        assert!(validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET).is_err());
     }
 
     #[test]
     fn template_layout_rejects_unexpected_nonce_offset() {
-        let (header_core, block) = matching_header_and_block_bytes();
-        assert!(validate_template_layout(&header_core, &block, NONCE_OFFSET_IN_CORE + 1).is_err());
+        let (fields, block) = matching_pow_fields_and_block_bytes();
+        assert!(validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET + 1).is_err());
     }
 }

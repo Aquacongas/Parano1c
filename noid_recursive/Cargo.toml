@@ -6,13 +6,11 @@ edition = "2021"
 [dependencies]
 noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
-noid_fri = { path = "../noid_fri" }
-noid_fri_binius = { path = "../noid_fri_binius" }
-noid_air = { path = "../noid_air" }
-noid_gkr = { path = "../noid_gkr" }
-noid_stark = { path = "../noid_stark" }
 noid_chain = { path = "../noid_chain" }
-noid_tx = { path = "../noid_tx" }
+noid_gkr = { path = "../noid_gkr" }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+
+[dev-dependencies]
+noid_tx = { path = "../noid_tx" }

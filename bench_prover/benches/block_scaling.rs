@@ -77,6 +77,33 @@ fn preprove_minimal_fixtures(scenarios: &[BenchScenario]) -> (Duration, Vec<Mini
     })
 }
 
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_usize_list(name: &str, default: &[usize]) -> Vec<usize> {
+    let Ok(value) = std::env::var(name) else {
+        return default.to_vec();
+    };
+    let parsed = value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<usize>().ok())
+        .filter(|&n| (1..=MAX_USER_TXS).contains(&n))
+        .collect::<Vec<_>>();
+    if parsed.is_empty() {
+        default.to_vec()
+    } else {
+        parsed
+    }
+}
+
 fn print_full_block(
     label: &str,
     sweep_wallet_prep: Option<Duration>,
@@ -158,7 +185,11 @@ fn main() {
     println!("  Wallet proofs are pre-built for block timing.");
     println!();
 
-    let max_standard = MAX_USER_TXS;
+    let standard_ns = env_usize_list(
+        "NOID_BLOCK_SCALING_STANDARD_NS",
+        &[10usize, 20, 100, MAX_USER_TXS],
+    );
+    let max_standard = standard_ns.iter().copied().max().unwrap_or(MAX_USER_TXS);
     eprintln!("  building {max_standard} standard fixtures...");
     let t = Instant::now();
     let standard_fixtures = build_standard_fixtures(max_standard, 0);
@@ -167,8 +198,31 @@ fn main() {
         fmt_ms(t.elapsed()).trim()
     );
 
-    for &n in &[10usize, 20, 100, MAX_USER_TXS] {
+    if !standard_fixtures.is_empty() {
+        let warmup_n = standard_ns
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(1)
+            .min(standard_fixtures.len());
+        eprintln!("  warming minimal block proof path N={warmup_n}...");
+        let _ = bench_full_block_proof_minimal(&standard_fixtures[..warmup_n]);
+    }
+
+    for n in standard_ns {
         print_standard_block(n, &standard_fixtures[..n]);
+    }
+
+    if env_bool("NOID_BLOCK_SCALING_STANDARD_ONLY") {
+        println!("  -------------------------------------------------------------------");
+        println!("  NOTES:");
+        println!("    - Standard-only profiling mode enabled.");
+        println!("  -------------------------------------------------------------------");
+        println!(
+            "  Reproduce: NOID_BLOCK_SCALING_STANDARD_ONLY=1 cargo bench --bench block_scaling"
+        );
+        println!();
+        return;
     }
 
     for &n in &[1usize, 4, 10] {

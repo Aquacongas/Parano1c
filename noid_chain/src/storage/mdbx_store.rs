@@ -7,8 +7,8 @@
 //! all persistent chain data: headers, undo logs, segments, recent blocks,
 //! and chain tip.
 //!
-//! The core operation is `commit_block` which writes all block-related
-//! data in ONE atomic MDBX transaction (P.18 7-step protocol).
+//! The core operation is `commit_block`, which writes all block-related data in
+//! one atomic MDBX transaction.
 
 use std::path::Path;
 
@@ -16,15 +16,17 @@ use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, TableFlags, WriteFlag
 use noid_poseidon2b::primitives::TxBodyHash;
 
 use crate::block_header::BlockHeader;
+use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::consensus::params::UNDO_RETENTION_DEPTH;
 use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
-    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
-    decode_reuse_guard_buckets, decode_segment, decode_state_meta, decode_tx_index_value,
-    decode_undo_log, encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
+    decode_chain_tip, decode_chain_work, decode_checkpoint_coverage, decode_checkpoint_package,
+    decode_consensus_meta, decode_header, decode_reuse_guard_buckets, decode_segment,
+    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    encode_checkpoint_coverage, encode_checkpoint_package, encode_consensus_meta, encode_header,
     encode_reuse_guard_buckets, encode_segment, encode_state_meta, encode_tx_index_value,
     encode_undo_log, u64_from_key, u64_key,
 };
@@ -42,8 +44,8 @@ const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
 const T_REUSE_GUARD: &str = "reuse_guard";
 const T_RECENT_BLOCKS: &str = "recent";
-/// Recursive chain proof (~38 KB encoded, FOREVER). Key: KEY_REC. Value: raw proof bytes.
-const T_RECURSIVE_PROOF: &str = "rec_proof";
+/// Local finalized-history cache object. Key: KEY_LOCAL_HISTORY_CACHE. Value: raw bincode bytes.
+const T_LOCAL_HISTORY_CACHE: &str = "local_history_cache";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
 /// BlockProofs retained until finalized and covered by a real immutable checkpoint proof.
@@ -55,15 +57,20 @@ const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
-const N_TABLES: u64 = 15;
+/// Immutable checkpoint package. Key: checkpoint height (u64 LE).
+const T_CHECKPOINT_PACKAGES: &str = "checkpoint_packages";
+/// Latest local checkpoint package coverage metadata. Key: KEY_CHECKPOINT_COVERAGE.
+const T_CHECKPOINT_COVERAGE: &str = "checkpoint_coverage";
+const N_TABLES: u64 = 32;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
 const KEY_REUSE_GUARD: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
-const KEY_REC: &[u8] = &[0u8];
-const KEY_REC_HEIGHT: &[u8] = &[1u8];
+const KEY_LOCAL_HISTORY_CACHE: &[u8] = &[0u8];
+const KEY_LOCAL_HISTORY_CACHE_HEIGHT: &[u8] = &[1u8];
+const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -187,11 +194,13 @@ impl MdbxStore {
             T_STATE_META,
             T_REUSE_GUARD,
             T_RECENT_BLOCKS,
-            T_RECURSIVE_PROOF,
+            T_LOCAL_HISTORY_CACHE,
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
             T_OWNER_INDEX,
+            T_CHECKPOINT_PACKAGES,
+            T_CHECKPOINT_COVERAGE,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
@@ -274,9 +283,7 @@ impl MdbxStore {
             // h_tbl and txn are dropped here
         };
         match self.get_header(height)? {
-            Some(header) if crate::consensus::pow::full_block_hash(&header) == *hash => {
-                Ok(Some(header))
-            }
+            Some(header) if crate::consensus::pow::block_id(&header) == *hash => Ok(Some(header)),
             _ => Ok(None),
         }
     }
@@ -284,8 +291,8 @@ impl MdbxStore {
     /// Persist a historical header and its hash index without changing chain tip,
     /// state metadata, undo logs, or recent blocks.
     ///
-    /// FIX1: snapshot candidate headers must not be written into this canonical
-    /// table before full acceptance; public snapshot sync is fail-closed.
+    /// Snapshot candidate headers must not be written into this canonical table
+    /// before full acceptance; public snapshot sync is fail-closed.
     pub fn put_header_only(&self, header: &BlockHeader, hash: &[u8; 32]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
 
@@ -329,39 +336,45 @@ impl MdbxStore {
         Ok(txn.get(&tbl, &u64_key(height))?)
     }
 
-    /// Read the persisted recursive chain proof (~38 KB encoded), if present.
-    pub fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError> {
+    /// Read the persisted local finalized-history cache object, if present.
+    pub fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
-        Ok(txn.get(&tbl, KEY_REC)?)
+        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
+        Ok(txn.get(&tbl, KEY_LOCAL_HISTORY_CACHE)?)
     }
 
-    /// Read the height of the persisted recursive chain proof, if known.
-    pub fn get_recursive_proof_height(&self) -> Result<Option<u64>, StoreError> {
+    /// Read the height of the persisted local finalized-history cache object, if known.
+    pub fn get_local_history_cache_height(&self) -> Result<Option<u64>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
-        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_REC_HEIGHT)?;
+        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_LOCAL_HISTORY_CACHE_HEIGHT)?;
         Ok(raw.and_then(|b| u64_from_key(&b)))
     }
 
-    /// Persist the recursive chain proof (~38 KB encoded, FOREVER, single entry).
+    /// Persist the local finalized-history cache object.
     ///
-    /// Prefer `put_recursive_proof_at` in node code so proof-byte pruning can
-    /// retain finalized block proofs until recursive history has consumed them.
-    pub fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError> {
+    /// Prefer `put_local_history_cache_at` in node code so proof-byte pruning
+    /// can retain finalized block proofs until history proof generation has
+    /// consumed them.
+    pub fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
-        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
-        txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
+        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
+        txn.put(&tbl, KEY_LOCAL_HISTORY_CACHE, bytes, WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
 
-    /// Persist the recursive chain proof and its block height atomically.
-    pub fn put_recursive_proof_at(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+    /// Persist the local finalized-history cache object and its block height atomically.
+    pub fn put_local_history_cache_at(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
-        let tbl = txn.open_table(Some(T_RECURSIVE_PROOF))?;
-        txn.put(&tbl, KEY_REC, bytes, WriteFlags::empty())?;
-        txn.put(&tbl, KEY_REC_HEIGHT, u64_key(height), WriteFlags::empty())?;
+        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
+        txn.put(&tbl, KEY_LOCAL_HISTORY_CACHE, bytes, WriteFlags::empty())?;
+        txn.put(
+            &tbl,
+            KEY_LOCAL_HISTORY_CACHE_HEIGHT,
+            u64_key(height),
+            WriteFlags::empty(),
+        )?;
         txn.commit()?;
         Ok(())
     }
@@ -400,6 +413,80 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw)
+    }
+
+    /// Store an immutable local checkpoint package for a finalized prefix.
+    pub fn put_checkpoint_package(
+        &self,
+        package: &ImmutableCheckpointPackage,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_CHECKPOINT_PACKAGES))?;
+        txn.put(
+            &tbl,
+            u64_key(package.manifest.height),
+            encode_checkpoint_package(package),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve a local checkpoint package by height.
+    pub fn get_checkpoint_package(
+        &self,
+        height: u64,
+    ) -> Result<Option<ImmutableCheckpointPackage>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_CHECKPOINT_PACKAGES))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw.and_then(|b| decode_checkpoint_package(&b)))
+    }
+
+    /// Persist latest local checkpoint package coverage metadata.
+    pub fn put_checkpoint_coverage(&self, coverage: &CheckpointCoverage) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        txn.put(
+            &tbl,
+            KEY_CHECKPOINT_COVERAGE,
+            encode_checkpoint_coverage(coverage),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Atomically store a checkpoint package and the latest coverage pointer.
+    pub fn put_checkpoint_package_and_coverage(
+        &self,
+        package: &ImmutableCheckpointPackage,
+        coverage: &CheckpointCoverage,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let pkg_tbl = txn.open_table(Some(T_CHECKPOINT_PACKAGES))?;
+        txn.put(
+            &pkg_tbl,
+            u64_key(package.manifest.height),
+            encode_checkpoint_package(package),
+            WriteFlags::empty(),
+        )?;
+        let cov_tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        txn.put(
+            &cov_tbl,
+            KEY_CHECKPOINT_COVERAGE,
+            encode_checkpoint_coverage(coverage),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_checkpoint_coverage(&self) -> Result<Option<CheckpointCoverage>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_CHECKPOINT_COVERAGE)?;
+        Ok(raw.and_then(|b| decode_checkpoint_coverage(&b)))
     }
 
     /// Look up all live UTXOs for a given owner address.
@@ -809,7 +896,7 @@ impl MdbxStore {
         }
 
         // Block bodies, BlockProofs, and Auth sidecars are checkpoint inputs.
-        // They are pruned only after a future immutable checkpoint package covers
+        // They are pruned only after an immutable checkpoint package covers
         // the exact heights being removed. No such coverage table exists in this
         // implementation yet, so pruning these tables is intentionally disabled.
         txn.commit()?;
@@ -817,13 +904,13 @@ impl MdbxStore {
     }
 
     /// Clear volatile tables after local state corruption is detected, keeping
-    /// append-only headers, hash->height index, and the recursive proof.
+    /// append-only headers, hash->height index, and the local history cache.
     ///
     /// Normal startup does NOT clear these tables: `MdbxChainContext::open_or_create`
     /// first tries to restore persisted current state from MDBX and checks it against
-    /// the tip header's `state_root`. This function is the recovery fallback for corrupt
-    /// local state; after clearing, the node resyncs current state from peers and verifies
-    /// it with the recursive chain proof.
+    /// the tip header's `state_root`. This function is the local recovery path
+    /// for corrupt local state; public arbitrary-peer snapshot recovery remains fail-closed
+    /// until the history proof verifier is the trustless authority.
     pub fn clear_for_restart(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let volatile = [
@@ -892,12 +979,12 @@ impl crate::storage::BlockStore for MdbxStore {
         MdbxStore::get_recent_block(self, height)
     }
 
-    fn get_recursive_proof(&self) -> Result<Option<Vec<u8>>, StoreError> {
-        MdbxStore::get_recursive_proof(self)
+    fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        MdbxStore::get_local_history_cache(self)
     }
 
-    fn put_recursive_proof(&self, bytes: &[u8]) -> Result<(), StoreError> {
-        MdbxStore::put_recursive_proof(self, bytes)
+    fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError> {
+        MdbxStore::put_local_history_cache(self, bytes)
     }
 
     fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError> {

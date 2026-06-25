@@ -236,63 +236,200 @@ pub fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
     false
 }
 
-/// Compute the PoW work done for one block with the given difficulty target.
+/// Compute the PoW work done for one block with the given strict-`<` target.
 ///
-/// Returns 2^(leading_zeros_of_target) as a 128-bit value stored in the first
-/// 16 bytes of a [u8; 32] (LE). Leading zeros are counted from the
-/// most-significant byte of the 32-byte little-endian target.
+/// Consensus accepts exactly `target` digest values: `0..target-1`. The
+/// expected trial count is therefore `2^256 / target`. Chainwork stores the
+/// integer ceiling of that value:
 ///
-/// Examples (at mainnet constants):
-///   GENESIS_TARGET (2^228, byte 28=0x10, bytes 29-31=0)
-///     → leading_zeros = 3×8 + lz(0x10) = 24+3 = 27 → work = 2^27 = 134,217,728
-///   MAX_TARGET ([0xFF;32], byte 31=0xFF)
-///     → leading_zeros = 0 → work = 2^0 = 1  (trivial, no real PoW)
-///   MIN_TARGET ({t[0]=1}, all other bytes 0)
-///     → leading_zeros = 31×8 + lz(1) = 248+7 = 255 → work = 2^127 (capped)
+/// ```text
+/// Work(target) = floor((2^256 - 1) / target) + 1
+/// ```
 ///
-/// Using leading-zeros-based work instead of `~target` avoids the critical
-/// overflow bug: `~GENESIS_TARGET` ≈ 2^256, so adding just TWO such values
-/// wraps around and produces a SMALLER result, making 1 block appear to have
-/// more work than 2 blocks. Using 2^(leading_zeros) gives values in the range
-/// [1, 2^128] that sum correctly for millions of blocks.
+/// The result is encoded as a little-endian 256-bit integer and saturates at
+/// `2^256 - 1`. `target = 0` is not a valid consensus target; this helper
+/// returns zero defensively so an already-invalid target cannot add work if it
+/// reaches accounting code.
 pub fn block_work(target: &[u8; 32]) -> [u8; 32] {
-    // Count leading zero BITS in target.
-    // target is LE: the most-significant byte is target[31].
-    let mut leading_zeros: u32 = 0;
-    for i in (0..32).rev() {
-        if target[i] == 0 {
-            leading_zeros += 8;
-        } else {
-            leading_zeros += target[i].leading_zeros();
-            break;
+    if is_zero_256(target) {
+        return [0u8; 32];
+    }
+    let quotient = div_u256(&[0xFFu8; 32], target).expect("target is non-zero");
+    add_one_saturating(&quotient)
+}
+
+/// Add two chain work values as LE u256. Saturates on overflow to prevent
+/// wrap-around.
+pub fn add_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut carry = 0u16;
+    for i in 0..32 {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        result[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    if carry != 0 {
+        [0xFFu8; 32]
+    } else {
+        result
+    }
+}
+
+fn add_one_saturating(a: &[u8; 32]) -> [u8; 32] {
+    let mut result = *a;
+    for byte in &mut result {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return result;
         }
     }
-    // work = 2^leading_zeros, stored as LE u128 in bytes [0..16].
-    // Capped at 2^127 to prevent overflow when summing many blocks.
-    let shift = leading_zeros.min(127);
-    let work_u128: u128 = 1u128 << shift;
-    let mut result = [0u8; 32];
-    result[..16].copy_from_slice(&work_u128.to_le_bytes());
+    [0xFFu8; 32]
+}
+
+fn is_zero_256(a: &[u8; 32]) -> bool {
+    a.iter().all(|byte| *byte == 0)
+}
+
+fn ge256(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    !le256_lt(a, b)
+}
+
+fn shl1_256(a: &mut [u8; 32]) {
+    let mut carry = 0u8;
+    for byte in a.iter_mut() {
+        let next_carry = *byte >> 7;
+        *byte = (*byte << 1) | carry;
+        carry = next_carry;
+    }
+}
+
+fn sub_assign_256(a: &mut [u8; 32], b: &[u8; 32]) {
+    let mut borrow = 0i16;
+    for i in 0..32 {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            a[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            a[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    debug_assert_eq!(borrow, 0);
+}
+
+fn bit_256(a: &[u8; 32], bit: usize) -> bool {
+    debug_assert!(bit < 256);
+    let byte = bit / 8;
+    let bit_in_byte = bit % 8;
+    (a[byte] >> bit_in_byte) & 1 == 1
+}
+
+fn set_bit_256(a: &mut [u8; 32], bit: usize) {
+    debug_assert!(bit < 256);
+    let byte = bit / 8;
+    let bit_in_byte = bit % 8;
+    a[byte] |= 1u8 << bit_in_byte;
+}
+
+fn div_u256(numerator: &[u8; 32], denominator: &[u8; 32]) -> Option<[u8; 32]> {
+    if is_zero_256(denominator) {
+        return None;
+    }
+
+    let mut quotient = [0u8; 32];
+    let mut remainder = [0u8; 32];
+    for bit in (0..256).rev() {
+        shl1_256(&mut remainder);
+        if bit_256(numerator, bit) {
+            remainder[0] |= 1;
+        }
+        if ge256(&remainder, denominator) {
+            sub_assign_256(&mut remainder, denominator);
+            set_bit_256(&mut quotient, bit);
+        }
+    }
+    Some(quotient)
+}
+
+#[cfg(test)]
+fn u256_to_u128_low(a: &[u8; 32]) -> u128 {
+    u128::from_le_bytes(a[..16].try_into().unwrap())
+}
+
+#[cfg(test)]
+fn pow2_target(bit: usize) -> [u8; 32] {
+    let mut target = [0u8; 32];
+    set_bit_256(&mut target, bit);
+    target
+}
+
+#[cfg(test)]
+fn pow2_work(bit: usize) -> [u8; 32] {
+    let mut work = [0u8; 32];
+    set_bit_256(&mut work, bit);
+    work
+}
+
+#[cfg(test)]
+fn u256_from_u64(value: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&value.to_le_bytes());
+    out
+}
+
+#[cfg(test)]
+fn u256_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    le256_lt(b, a)
+}
+
+#[cfg(test)]
+fn div_u256_for_test(numerator: &[u8; 32], denominator: &[u8; 32]) -> Option<[u8; 32]> {
+    div_u256(numerator, denominator)
+}
+
+#[cfg(test)]
+fn max_u256() -> [u8; 32] {
+    [0xFFu8; 32]
+}
+
+#[cfg(test)]
+fn one_u256() -> [u8; 32] {
+    u256_from_u64(1)
+}
+
+#[cfg(test)]
+fn two_u256() -> [u8; 32] {
+    u256_from_u64(2)
+}
+
+#[cfg(test)]
+fn zero_u256() -> [u8; 32] {
+    [0u8; 32]
+}
+
+#[cfg(test)]
+fn add_one_saturating_for_test(a: &[u8; 32]) -> [u8; 32] {
+    add_one_saturating(a)
+}
+
+#[cfg(test)]
+fn sub_one(a: &[u8; 32]) -> [u8; 32] {
+    let mut result = *a;
+    for byte in &mut result {
+        let (next, borrow) = byte.overflowing_sub(1);
+        *byte = next;
+        if !borrow {
+            return result;
+        }
+    }
     result
 }
 
-/// Add two chain work values (stored as LE u128 in first 16 bytes).
-/// Saturates on overflow to prevent wrap-around.
-pub fn add_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let va = u128::from_le_bytes(a[..16].try_into().unwrap());
-    let vb = u128::from_le_bytes(b[..16].try_into().unwrap());
-    let sum = va.saturating_add(vb);
-    let mut result = [0u8; 32];
-    result[..16].copy_from_slice(&sum.to_le_bytes());
-    result
-}
-
-/// Compare two chain work values (stored as LE u128 in first 16 bytes).
-/// Returns true if `a > b`.
+/// Compare two chain work values as LE u256. Returns true if `a > b`.
 pub fn work_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let va = u128::from_le_bytes(a[..16].try_into().unwrap());
-    let vb = u128::from_le_bytes(b[..16].try_into().unwrap());
-    va > vb
+    le256_lt(b, a)
 }
 
 #[cfg(test)]
@@ -431,20 +568,17 @@ mod tests {
 
     #[test]
     fn block_work_genesis_target() {
-        // GENESIS_TARGET = 2^229 (byte 28 = 0x20, bytes 29-31 = 0).
-        // Leading zeros (from MSB, i.e. byte 31 down):
-        //   bytes 31,30,29 = 0    → 24 leading zeros
-        //   byte 28 = 0x20 = 0b00100000 → lz(0x20) = 2 more
-        //   total = 26 → work = 2^26 = 67,108,864
+        // GENESIS_TARGET = 2^237. With strict `< target`, expected trial count
+        // is exactly 2^(256-237) = 2^19.
         use crate::consensus::params::GENESIS_TARGET;
         let w = block_work(&GENESIS_TARGET);
-        let val = u128::from_le_bytes(w[..16].try_into().unwrap());
-        assert_eq!(val, 1u128 << 26, "GENESIS_TARGET work = 2^26");
+        let val = u256_to_u128_low(&w);
+        assert_eq!(val, 1u128 << 19, "GENESIS_TARGET work = 2^19");
 
         // Cross-check: MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH × block_work(GENESIS_TARGET)
         use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MIN_SNAPSHOT_CHAINWORK};
-        let min_work = u128::from_le_bytes(MIN_SNAPSHOT_CHAINWORK[..16].try_into().unwrap());
-        let genesis_block_work = 1u128 << 26;
+        let min_work = u256_to_u128_low(&MIN_SNAPSHOT_CHAINWORK);
+        let genesis_block_work = 1u128 << 19;
         assert_eq!(
             min_work,
             CONSENSUS_FINALITY_DEPTH as u128 * genesis_block_work,
@@ -453,19 +587,70 @@ mod tests {
     }
 
     #[test]
-    fn block_work_max_target_is_one() {
-        // MAX_TARGET = [0xFF;32]: byte 31 = 0xFF → 0 leading zeros → work = 2^0 = 1.
+    fn block_work_max_target_is_two_under_strict_less_than() {
+        // MAX_TARGET = 2^256 - 1. Strict `< target` accepts every digest except
+        // MAX itself, so ceil(2^256 / (2^256 - 1)) = 2.
         let w = block_work(&MAX_TARGET);
-        let val = u128::from_le_bytes(w[..16].try_into().unwrap());
-        assert_eq!(val, 1, "MAX_TARGET (trivial) work = 1");
+        assert_eq!(w, two_u256(), "MAX_TARGET strict-< work = 2");
     }
 
     #[test]
-    fn block_work_min_target_capped_at_2_127() {
-        // MIN_TARGET = {t[0]=1}: 255 leading zeros → shift=min(255,127)=127 → work=2^127.
+    fn block_work_min_target_saturates_at_u256_max() {
+        // MIN_TARGET = 1 would have mathematical work 2^256, so the u256
+        // chainwork representation saturates at 2^256 - 1.
         let w = block_work(&MIN_TARGET);
-        let val = u128::from_le_bytes(w[..16].try_into().unwrap());
-        assert_eq!(val, 1u128 << 127, "MIN_TARGET work = 2^127 (cap)");
+        assert_eq!(w, max_u256(), "MIN_TARGET work saturates");
+    }
+
+    #[test]
+    fn block_work_zero_target_adds_no_work() {
+        assert_eq!(block_work(&zero_u256()), zero_u256());
+    }
+
+    #[test]
+    fn block_work_exact_power_of_two_vectors() {
+        assert_eq!(block_work(&pow2_target(255)), two_u256());
+        assert_eq!(block_work(&pow2_target(254)), u256_from_u64(4));
+        assert_eq!(block_work(&pow2_target(237)), pow2_work(19));
+        assert_eq!(block_work(&pow2_target(236)), pow2_work(20));
+    }
+
+    #[test]
+    fn block_work_boundary_around_genesis_target() {
+        let genesis_minus_one = sub_one(&GENESIS_TARGET);
+        assert!(
+            u256_gt(
+                &block_work(&genesis_minus_one),
+                &block_work(&GENESIS_TARGET)
+            ),
+            "a just-harder target below genesis must have more work"
+        );
+        let harder = pow2_target(236);
+        assert!(
+            u256_gt(&block_work(&harder), &block_work(&GENESIS_TARGET)),
+            "2^236 must have more work than 2^237"
+        );
+    }
+
+    #[test]
+    fn add_work_uses_full_u256_and_saturates() {
+        let mut high = [0u8; 32];
+        high[31] = 1;
+        let doubled = add_work(&high, &high);
+        assert_eq!(doubled[31], 2);
+        assert_eq!(add_work(&max_u256(), &one_u256()), max_u256());
+    }
+
+    #[test]
+    fn div_u256_basic_vectors() {
+        let max = max_u256();
+        assert_eq!(div_u256_for_test(&max, &max), Some(one_u256()));
+        assert_eq!(div_u256_for_test(&max, &pow2_target(255)), Some(one_u256()));
+        assert_eq!(
+            div_u256_for_test(&max, &pow2_target(237)),
+            Some(sub_one(&pow2_work(19)))
+        );
+        assert_eq!(add_one_saturating_for_test(&max), max);
     }
 
     #[test]

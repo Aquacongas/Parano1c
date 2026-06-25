@@ -23,19 +23,18 @@
 //!  ✅  Wallet authorization proof verifies for every user transaction
 //!  ✅  Exact public transaction predicate verifies for every user transaction
 //!  ✅  Exact authenticated state transition verifies state updates
-//!  ✅  Block proof canonical transcript matches the header
+//!  ✅  Detached block proof metadata matches the semantic block statement
+//!  ✅  Detached authorization sidecar verifies for every user transaction
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
-//!  ❌  da_root / witness_root binding (needs packed DA data)
 
 use crate::block::apply_block;
 use crate::block::Block;
 use crate::block_header::BlockHeader;
-use crate::consensus::timestamps::median_u64;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus_skip_hash},
     emission::max_coinbase_value_from_fee_sum,
     fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
-    header::validate_header,
+    header::{validate_header, validate_header_timeless},
     params::BLOCK_MAX_TXS,
     ConsensusError,
 };
@@ -73,7 +72,7 @@ fn validate_fee_policy_and_claimable_fee_sum(
 }
 
 fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<(), ConsensusError> {
-    let expected_anchor = crate::consensus::pow::full_block_hash(parent);
+    let expected_anchor = crate::consensus::pow::block_id(parent);
     let mut seen_coinbase = false;
 
     for (idx, tx) in block.transactions.iter().enumerate() {
@@ -133,33 +132,66 @@ pub fn validate_block_checks(
     local_time: u64,
     anchor: &AnchorInfo,
 ) -> Result<(), ConsensusError> {
-    validate_header(
-        &block.header,
+    validate_block_checks_inner(
+        block,
         parent,
         prev_timestamps,
-        local_time,
-        anchor.anchor_height,
-        anchor.anchor_timestamp,
-        &anchor.anchor_target,
-    )?;
-    {
-        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
-        let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-        let median_active = if prev_active_counts.is_empty() {
-            parent.active_slot_count
-        } else {
-            median_u64(prev_active_counts)
-        };
-        let trigger =
-            median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
-        let expected = if trigger {
-            parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
-        } else {
-            parent.log_slots
-        };
-        if block.header.log_slots != expected {
-            return Err(ConsensusError::BadLogSlotsExpansion);
-        }
+        prev_active_counts,
+        anchor,
+        Some(local_time),
+    )
+}
+
+/// Run deterministic block consensus checks without local wall-clock policy.
+///
+/// This is the deterministic boundary for historical history proofs. Live node
+/// admission must continue to use [`validate_block_checks`] so far-future
+/// timestamps are filtered before relay/acceptance.
+pub fn validate_block_checks_timeless(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+) -> Result<(), ConsensusError> {
+    validate_block_checks_inner(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        None,
+    )
+}
+
+fn validate_block_checks_inner(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    local_time: Option<u64>,
+) -> Result<(), ConsensusError> {
+    match local_time {
+        Some(local_time) => validate_header(
+            &block.header,
+            parent,
+            prev_timestamps,
+            prev_active_counts,
+            local_time,
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+        )?,
+        None => validate_header_timeless(
+            &block.header,
+            parent,
+            prev_timestamps,
+            prev_active_counts,
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+        )?,
     }
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
@@ -211,42 +243,12 @@ pub fn validate_block_consensus(
         &block.header,
         parent,
         prev_timestamps,
+        prev_active_counts,
         local_time,
         anchor.anchor_height,
         anchor.anchor_timestamp,
         &anchor.anchor_target,
     )?;
-
-    // --- §15.3.6 log_slots expansion trigger (median-based) ---
-    //
-    // Expansion fires when the MEDIAN active_slot_count over the last
-    // EXPANSION_WINDOW (= FINALITY_DEPTH = 18) finalised headers exceeds
-    // 75% of capacity.  Using the median prevents a single-block spam spike
-    // from forcing an expansion: an attacker would need to sustain > 75%
-    // occupancy across a majority of the window blocks.
-    //
-    // `prev_active_counts` is supplied by the caller (from stored headers);
-    // it falls back to `[parent.active_slot_count]` when the window is shallow.
-    {
-        use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
-        let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-        // Median of the supplied window; fall back to parent when window is empty.
-        let median_active = if prev_active_counts.is_empty() {
-            parent.active_slot_count
-        } else {
-            median_u64(prev_active_counts)
-        };
-        let trigger =
-            median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
-        let expected_log_slots = if trigger {
-            parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
-        } else {
-            parent.log_slots
-        };
-        if block.header.log_slots != expected_log_slots {
-            return Err(ConsensusError::BadLogSlotsExpansion);
-        }
-    }
 
     // --- Tx count limit ---
     if block.transactions.len() > BLOCK_MAX_TXS {
@@ -300,8 +302,6 @@ pub fn validate_block_consensus(
             BlockApplyError::WrongTxBodyHash => ConsensusError::BadTxBodyHash,
             BlockApplyError::HeaderStateRootMismatch => ConsensusError::BadStateRoot,
             BlockApplyError::HeaderTxRootMismatch => ConsensusError::BadTxRoot,
-            BlockApplyError::MissingProofTranscriptHash => ConsensusError::MissingProof,
-            BlockApplyError::StubProofWithUserTxs => ConsensusError::StubProof,
             _ => ConsensusError::ShapeMismatch(format!("{:?}", e)),
         }
     })?;
@@ -332,8 +332,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -343,10 +341,10 @@ mod tests {
     /// Build a minimal valid block (no txs) on top of `parent`.
     fn build_empty_block(parent: &BlockHeader, state: &mut ChainState) -> Block {
         use crate::block::compute_tx_root;
-        use crate::consensus::pow::full_block_hash;
+        use crate::consensus::pow::block_id;
 
         let mut header = BlockHeader {
-            prev_block_hash: full_block_hash(parent),
+            prev_block_hash: block_id(parent),
             state_root: state.state_root(),
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -354,8 +352,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: state.state.log_slots() as u32,
             active_slot_count: state.active_slot_count,
             alloc_counter: state.alloc_counter,
@@ -437,16 +433,16 @@ mod tests {
 
     fn block_for_fee_checks(parent: &BlockHeader, coinbase_value: u64, user_fee: u64) -> Block {
         use crate::block::compute_tx_root;
-        use crate::consensus::pow::full_block_hash;
+        use crate::consensus::pow::block_id;
 
-        let parent_hash = full_block_hash(parent);
+        let parent_hash = block_id(parent);
         let txs = vec![
             fee_test_coinbase(parent_hash, coinbase_value),
             fee_test_user_tx(user_fee as u128),
         ];
         Block {
             header: BlockHeader {
-                prev_block_hash: full_block_hash(parent),
+                prev_block_hash: block_id(parent),
                 state_root: parent.state_root,
                 tx_root: compute_tx_root(&txs),
                 timestamp: parent.timestamp + BLOCK_TIME,
@@ -454,8 +450,6 @@ mod tests {
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
                 difficulty_target: TEST_TARGET,
-                proof_transcript_hash: [2u8; 32],
-                witness_root: [2u8; 32],
                 log_slots: parent.log_slots,
                 active_slot_count: parent.active_slot_count,
                 alloc_counter: parent.alloc_counter,
@@ -595,8 +589,6 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: target_active,
             alloc_counter: 0,
@@ -605,9 +597,9 @@ mod tests {
         // Block claiming log_slots = TEST_LOG_SLOTS (no expansion) should be rejected.
         let block_no_expand = {
             use crate::block::compute_tx_root;
-            use crate::consensus::pow::full_block_hash;
+            use crate::consensus::pow::block_id;
             let mut hdr = BlockHeader {
-                prev_block_hash: full_block_hash(&parent),
+                prev_block_hash: block_id(&parent),
                 state_root,
                 tx_root: compute_tx_root(&[]),
                 timestamp: parent.timestamp + BLOCK_TIME,
@@ -615,8 +607,6 @@ mod tests {
                 miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
                 nonce: 0,
                 difficulty_target: TEST_TARGET,
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [1u8; 32],
                 log_slots: TEST_LOG_SLOTS as u32, // should be TEST_LOG_SLOTS + 1
                 active_slot_count: target_active,
                 alloc_counter: 0,
@@ -669,8 +659,6 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: spike_active,
             alloc_counter: 0,
@@ -678,9 +666,9 @@ mod tests {
 
         // Build a block that does NOT expand (log_slots unchanged).
         use crate::block::compute_tx_root;
-        use crate::consensus::pow::full_block_hash;
+        use crate::consensus::pow::block_id;
         let mut hdr = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root,
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -688,8 +676,6 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: TEST_LOG_SLOTS as u32, // no expansion
             active_slot_count: spike_active,
             alloc_counter: 0,

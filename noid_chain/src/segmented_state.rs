@@ -6,7 +6,7 @@
 //! The chain state is split into `N = 2^(log_slots - LOG_SEGMENT_SIZE)`
 //! independent segments (each holding `2^LOG_SEGMENT_SIZE` slots). The
 //! consensus UTXO commitment is the exact Poseidon2b sparse-Merkle root over
-//! slot leaves; segments are an I/O and cache boundary, not a state FRI proof.
+//! slot leaves; segments are an I/O and cache boundary, not a consensus state proof.
 //!
 //! When `log_slots <= LOG_SEGMENT_SIZE` (test mode), there is exactly one
 //! segment whose size is `2^log_slots`. In that case exact root helpers operate
@@ -55,7 +55,7 @@ use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Size of each FRI segment when `log_slots > LOG_SEGMENT_SIZE`.
+/// Size of each raw state segment when `log_slots > LOG_SEGMENT_SIZE`.
 pub const SEGMENT_SIZE: usize = 1 << LOG_SEGMENT_SIZE;
 
 /// Maximum segment-tree depth at `MAX_LOG_SLOTS = 32`.
@@ -250,10 +250,10 @@ fn zero_segtree_table() -> &'static [[u8; 32]; MAX_SEGTREE_DEPTH + 1] {
 }
 
 // ---------------------------------------------------------------------------
-// Per-segment FRI root computation
+// Per-segment raw storage commitment computation
 // ---------------------------------------------------------------------------
 
-/// Compute the compact FRI segment root from three column vectors.
+/// Compute the compact raw segment root from three column vectors.
 /// Delegates to `compute_segment_root` in `fri_state.rs` — single source of truth.
 pub(crate) fn compute_seg_root(
     log_size: usize,
@@ -264,7 +264,7 @@ pub(crate) fn compute_seg_root(
     compute_segment_root(log_size, values, owners_hi, owners_lo)
 }
 
-/// Compact FRI segment root for an all-zero segment of given log size.
+/// Compact raw segment root for an all-zero segment of given log size.
 fn zero_seg_root_for(log_size: usize) -> StateRoot {
     if log_size == LOG_SEGMENT_SIZE {
         zero_segment_root_16()

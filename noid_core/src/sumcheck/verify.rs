@@ -43,35 +43,9 @@ pub fn verify_with_channel<F: TowerField, T: FiatShamir<F>>(
     Some((claim, challenges))
 }
 
-/// Legacy verifier that takes pre-derived challenges. Kept for
-/// callsites that synthesize the challenge vector themselves (e.g. when
-/// stitching multiple sumchecks together and the FS state is owned
-/// elsewhere).
-pub fn verify<F: TowerField>(
-    round_polys: &[RoundPolynomial<F>],
-    challenges: &[F],
-    initial_claim: F,
-) -> Option<F> {
-    if round_polys.len() != challenges.len() {
-        return None;
-    }
-
-    let mut claim = initial_claim;
-
-    for (i, poly) in round_polys.iter().enumerate() {
-        let computed_sum = poly.evaluate(F::ZERO) + poly.evaluate(F::ONE);
-        if computed_sum != claim {
-            return None;
-        }
-        claim = poly.evaluate(challenges[i]);
-    }
-
-    Some(claim)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::prove::{prove_single, prove_single_d};
+    use super::super::prove::prove_single_d;
     use super::*;
     use crate::transcript::FiatShamir;
     use crate::Block128;
@@ -101,7 +75,7 @@ mod tests {
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
 
         let mut prover_ch = XorChannel::default();
-        let (round_polys, final_eval, _) = prove_single(&evals, &mut prover_ch);
+        let (round_polys, final_eval, _) = prove_single_d(&evals, 2, &mut prover_ch);
 
         let mut verifier_ch = XorChannel::default();
         let res = verify_with_channel(&round_polys, claimed_sum, &mut verifier_ch);
@@ -113,20 +87,10 @@ mod tests {
     fn test_verify_rejects_wrong_initial_claim() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
         let mut prover_ch = XorChannel::default();
-        let (round_polys, _, _) = prove_single(&evals, &mut prover_ch);
+        let (round_polys, _, _) = prove_single_d(&evals, 2, &mut prover_ch);
 
         let mut verifier_ch = XorChannel::default();
         assert!(verify_with_channel(&round_polys, F::ONE, &mut verifier_ch).is_none());
-    }
-
-    #[test]
-    fn test_verify_rejects_wrong_challenge_length() {
-        let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
-        let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
-        let mut prover_ch = XorChannel::default();
-        let (round_polys, _, _) = prove_single(&evals, &mut prover_ch);
-
-        assert!(verify(&round_polys, &[F::ONE], claimed_sum).is_none());
     }
 
     #[test]
@@ -138,7 +102,7 @@ mod tests {
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
 
         let mut prover_ch = XorChannel::default();
-        let (round_polys, final_eval, _) = prove_single(&evals, &mut prover_ch);
+        let (round_polys, final_eval, _) = prove_single_d(&evals, 2, &mut prover_ch);
 
         let mut verifier_ch = XorChannel::default();
         let (claim, _) = verify_with_channel(&round_polys, claimed_sum, &mut verifier_ch).unwrap();

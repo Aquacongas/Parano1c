@@ -4,7 +4,8 @@
 //! FRI-Binius Polynomial Commitment Scheme for the Paranoid STARK.
 //!
 //! Optimized interleaved commitment + compact FRI opening:
-//! - Single Blake3 Merkle cap for ALL columns (binding commitment)
+//! - Single Merkle cap for ALL columns (binding commitment)
+//! - Arithmetic hasher backend for field-friendly commitments
 //! - Compact FRI with TAU=8, 64 queries, batched Merkle proofs
 //! - Mixed-point opening via gamma-batched polynomial
 //!
@@ -25,7 +26,7 @@
 //!
 //! | Component | Security |
 //! |-----------|----------|
-//! | Blake3 cap | 128-bit collision |
+//! | Merkle cap backend | 128-bit collision target |
 //! | Gamma batching | (n-1)/2^128 (Horner RLC) |
 //! | Compact FRI | 64 queries * 2 bits = 128-bit proven |
 
@@ -35,7 +36,8 @@ pub mod mixed_open;
 
 pub use compact_fri::{CompactEvalProof, COMPACT_NUM_QUERIES, COMPACT_TAU};
 pub use interleaved_commit::{
-    absorb_cap, interleaved_commit, InterleavedCommitment, InterleavedProverState, MerkleCap,
+    absorb_cap, interleaved_commit, interleaved_commit_arithmetic, CommitmentHashBackend,
+    InterleavedCommitment, InterleavedProverState, MerkleCap,
 };
 pub use mixed_open::{
     prove_mixed_opening, verify_mixed_opening, EvalClaim, MixedOpeningProof, SourceBindingProof,

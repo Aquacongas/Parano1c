@@ -35,10 +35,10 @@ use crate::compact_fri::{
     CompactEvalProof, CompactFriQueryContext,
 };
 use crate::interleaved_commit::{
-    build_source_batched_merkle_proof, source_hash_to_output, source_leaf_hash,
-    source_leaf_positions, source_root_from_cap, source_tree_depth,
-    verify_source_batched_merkle_proof, InterleavedProverState, SourceBatchedMerkleProof,
-    SourceHash, SourceHashMerkleTree,
+    build_source_batched_merkle_proof_to_cap, source_cap_depth, source_cap_from_commitment_cap,
+    source_hash_to_output, source_leaf_hash, source_leaf_positions, source_tree_depth,
+    verify_source_batched_merkle_proof_to_cap, CommitmentHashBackend, InterleavedProverState,
+    SourceBatchedMerkleProof, SourceHash, SourceHashMerkleTree,
 };
 
 /// Domain-separation tag for mixed opening sub-protocol.
@@ -148,6 +148,17 @@ impl MixedOpenProfiler {
 
 fn prove_profile_enabled() -> bool {
     std::env::var("NOID_PROVE_BLOCK_PROFILE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn verify_profile_enabled() -> bool {
+    std::env::var("NOID_VERIFY_BLOCK_PROFILE")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -415,6 +426,23 @@ pub fn verify_mixed_opening(
     hasher: &dyn CryptographicHasher,
     num_queries: usize,
 ) -> Result<Vec<Block128>, String> {
+    let profile = verify_profile_enabled();
+    let profile_started = Instant::now();
+    let mut profile_last = profile_started;
+    let mut profile_phase = |name: &'static str| {
+        if profile {
+            let now = Instant::now();
+            eprintln!(
+                "verify_block_profile mixed_opening phase n_cols={} log_n={} phase={} elapsed_ms={:.3}",
+                commitment.n_cols,
+                commitment.log_rows,
+                name,
+                duration_ms(now.duration_since(profile_last))
+            );
+            profile_last = now;
+        }
+    };
+
     let n_cols = commitment.n_cols;
     let log_n = commitment.log_rows;
     if n_cols > MAX_MIXED_OPEN_VECTOR_COLS {
@@ -452,14 +480,17 @@ pub fn verify_mixed_opening(
             ));
         }
     }
+    profile_phase("shape_and_secondary_claims");
 
     // Absorb openings, draw gamma (mirror prover)
     channel.observe_field_elem(Block128::from(MIXED_OPEN_TAG));
     channel.observe_field_elems(&proof.all_openings);
     let gamma = channel.get_random_point();
+    profile_phase("transcript_and_gamma");
 
     // Compute batched claim for primary columns in flat/GCM basis.
     let batched_claim = compute_batched_claim_flat(gamma, &proof.all_openings[..n_cols]);
+    profile_phase("batched_claim");
 
     // Verify compact FRI proof and, before its query indices are drawn, bind
     // the round-0 oracle to the committed encoded source columns.
@@ -485,6 +516,16 @@ pub fn verify_mixed_opening(
             )
         },
     )?;
+    profile_phase("compact_fri_and_source_binding");
+
+    if profile {
+        eprintln!(
+            "verify_block_profile mixed_opening summary n_cols={} log_n={} total_ms={:.3}",
+            n_cols,
+            log_n,
+            duration_ms(profile_started.elapsed())
+        );
+    }
 
     // Return primary openings (first n_cols entries)
     Ok(proof.all_openings[..n_cols].to_vec())
@@ -511,6 +552,7 @@ fn prove_source_binding(
 ) -> SourceBindingProof {
     let log_n = state.log_rows;
     let n_cols = state.n_cols;
+    let backend = state.hash_backend;
     assert_eq!(primary_point.len(), log_n);
     assert_eq!(ctx.tau + ctx.n_rounds, log_n);
     assert_eq!(state.encoded_cols.len(), n_cols);
@@ -553,9 +595,17 @@ fn prove_source_binding(
             &ctx.tensor_batching_point,
             ctx.tau,
             hasher,
+            backend,
         )
     } else {
-        build_high_tensor_layers(c_evals, &ctx.tensor_batching_point, ctx.tau, ntt, hasher)
+        build_high_tensor_layers(
+            c_evals,
+            &ctx.tensor_batching_point,
+            ctx.tau,
+            ntt,
+            hasher,
+            backend,
+        )
     };
     profile_phase("build_high_tensor_layers");
     #[cfg(debug_assertions)]
@@ -567,7 +617,7 @@ fn prove_source_binding(
 
     let folded_roots: Vec<SourceHash> = folded_layers
         .iter()
-        .map(|layer| layer.tree.get_root())
+        .map(|layer| layer.tree.get_layer_at_depth(0)[0])
         .collect();
     profile_phase("folded_roots");
 
@@ -593,11 +643,14 @@ fn prove_source_binding(
         }
     }
     profile_phase("source_symbols");
-    let source_merkle_batch = state.source_tree.build_batched_merkle_proof(
+    let source_merkle_batch = state.source_tree.build_batched_merkle_proof_to_cap(
         &state.encoded_cols,
         log_n,
         n_cols,
         &source_pair_indices,
+        source_cap_depth(log_n),
+        backend,
+        hasher,
     );
     profile_phase("source_merkle_batch");
 
@@ -641,10 +694,13 @@ fn prove_source_binding(
             };
             symbols.push(pair);
         }
-        let batch = build_source_batched_merkle_proof(
+        let batch = build_source_batched_merkle_proof_to_cap(
             &layer.tree,
             &pair_indices,
             high_pair_tree_depth(layer.log_rows),
+            0,
+            backend,
+            hasher,
         );
         folded_queried_symbols.push(symbols);
         folded_merkle_batch.push(batch);
@@ -684,6 +740,7 @@ fn verify_source_binding(
 ) -> Result<(), String> {
     let log_n = commitment.log_rows;
     let n_cols = commitment.n_cols;
+    let backend = commitment.hash_backend;
     if primary_point.len() != log_n {
         return Err("source binding point dimension mismatch".into());
     }
@@ -722,8 +779,8 @@ fn verify_source_binding(
     let query_indices = gen_compact_queries(channel, log_n + LOG_RATE, num_queries);
     let n_queries = query_indices.len();
 
-    let source_root = source_root_from_cap(&commitment.cap)
-        .ok_or_else(|| "missing source root in interleaved commitment".to_string())?;
+    let source_cap = source_cap_from_commitment_cap(&commitment.cap, log_n)
+        .ok_or_else(|| "missing source cap in interleaved commitment".to_string())?;
     let source_pair_indices: Vec<usize> = if direct_source_expansion {
         high_expansion_source_leaf_indices(&query_indices, log_n, ctx.tau)
     } else {
@@ -744,18 +801,23 @@ fn verify_source_binding(
         let start = leaf_pos * n_cols * 2;
         let end = start + n_cols * 2;
         source_leaf_hashes.push(source_leaf_hash(
+            backend,
             log_n,
             n_cols,
             leaf_idx,
             &proof.source_symbols[start..end],
+            hasher,
         ));
     }
-    verify_source_batched_merkle_proof(
-        &source_root,
+    verify_source_batched_merkle_proof_to_cap(
+        source_cap,
+        source_cap_depth(log_n),
         &proof.source_merkle_batch,
         source_tree_depth(log_n),
         &source_pair_indices,
         &source_leaf_hashes,
+        backend,
+        hasher,
     )?;
 
     let h_code = Code::new_parallel(&proof.h_evals, ntt);
@@ -819,14 +881,19 @@ fn verify_source_binding(
         let leaf_hashes: Vec<SourceHash> = symbols
             .iter()
             .zip(pair_indices.iter())
-            .map(|(&(s0, s1), &pair_idx)| high_pair_leaf_hash(layer_log, pair_idx, s0, s1))
+            .map(|(&(s0, s1), &pair_idx)| {
+                high_pair_leaf_hash(backend, layer_log, pair_idx, s0, s1, hasher)
+            })
             .collect();
-        verify_source_batched_merkle_proof(
-            &proof.folded_roots[layer_idx],
+        verify_source_batched_merkle_proof_to_cap(
+            std::slice::from_ref(&proof.folded_roots[layer_idx]),
+            0,
             &proof.folded_merkle_batch[layer_idx],
             high_pair_tree_depth(layer_log),
             &pair_indices,
             &leaf_hashes,
+            backend,
+            hasher,
         )?;
 
         let r = ctx.tensor_batching_point[ctx.tau - 2 - layer_idx];
@@ -901,6 +968,7 @@ fn build_high_tensor_layers(
     tau: usize,
     ntt: &AdditiveNTT<Block128>,
     hasher: &dyn CryptographicHasher,
+    backend: CommitmentHashBackend,
 ) -> (Vec<Block128>, Vec<HighFoldLayer>) {
     let log_n = c_evals.len().trailing_zeros() as usize;
     let mut current = c_evals.to_vec();
@@ -911,7 +979,7 @@ fn build_high_tensor_layers(
         let layer_log = log_n - 1 - round;
         if round + 1 < tau {
             let code = Code::new_parallel(&current, ntt);
-            let tree = build_high_pair_tree(&code, layer_log, hasher);
+            let tree = build_high_pair_tree(&code, layer_log, hasher, backend);
             layers.push(HighFoldLayer {
                 log_rows: layer_log,
                 code: Some(code),
@@ -928,6 +996,7 @@ fn build_high_tensor_layers_from_source_code(
     beta: &[Block128],
     tau: usize,
     hasher: &dyn CryptographicHasher,
+    backend: CommitmentHashBackend,
 ) -> (Vec<Block128>, Vec<HighFoldLayer>) {
     let log_n = c_evals.len().trailing_zeros() as usize;
     assert_eq!(c_evals.len(), 1usize << log_n);
@@ -971,7 +1040,7 @@ fn build_high_tensor_layers_from_source_code(
         direct_code_total += code_t0.elapsed();
         let code = Code { encoding };
         let tree_t0 = Instant::now();
-        let tree = build_high_pair_tree(&code, layer_log, hasher);
+        let tree = build_high_pair_tree(&code, layer_log, hasher, backend);
         tree_total += tree_t0.elapsed();
         prev_encoding = Some(code.encoding);
         layers.push(HighFoldLayer {
@@ -1233,34 +1302,47 @@ fn tensor_high_fold_pair(
 }
 
 fn high_pair_leaf_hash(
+    backend: CommitmentHashBackend,
     layer_log: usize,
     leaf_index: usize,
     s0: Block128,
     s1: Block128,
+    hasher: &dyn CryptographicHasher,
 ) -> SourceHash {
-    let mut h = blake3::Hasher::new();
-    h.update(b"PARANOID/MIXED-SOURCE-HIGH-FOLD-LEAF/256/v2");
-    h.update(&(layer_log as u64).to_le_bytes());
-    h.update(&(leaf_index as u64).to_le_bytes());
-    h.update(&s0.0.to_le_bytes());
-    h.update(&s1.0.to_le_bytes());
-    *h.finalize().as_bytes()
+    let _ = backend;
+    const HIGH_PAIR_DOMAIN: u128 = 0xF21B_1D50_0000_0002u128;
+    let mut acc = hasher.hash_pair(
+        &Block128::from(HIGH_PAIR_DOMAIN),
+        &Block128::from(layer_log as u128),
+    );
+    let meta = hasher.hash_pair(&Block128::from(leaf_index as u128), &s0);
+    let pair = hasher.hash_pair(&s0, &s1);
+    acc = hasher.compress(&acc, &meta);
+    hasher.compress(&acc, &pair)
 }
 
 fn build_high_pair_tree(
     code: &Code,
     layer_log: usize,
-    _hasher: &dyn CryptographicHasher,
+    hasher: &dyn CryptographicHasher,
+    backend: CommitmentHashBackend,
 ) -> SourceHashMerkleTree {
     let leaf_count = RATE * (1usize << (layer_log - 1));
     let leaf_hashes: Vec<SourceHash> = (0..leaf_count)
         .into_par_iter()
         .map(|leaf_idx| {
             let (pos0, pos1) = high_pair_positions(layer_log, leaf_idx);
-            high_pair_leaf_hash(layer_log, leaf_idx, code.idx(pos0), code.idx(pos1))
+            high_pair_leaf_hash(
+                backend,
+                layer_log,
+                leaf_idx,
+                code.idx(pos0),
+                code.idx(pos1),
+                hasher,
+            )
         })
         .collect();
-    SourceHashMerkleTree::new(leaf_hashes)
+    SourceHashMerkleTree::new(leaf_hashes, backend, hasher)
 }
 
 fn reduce_source_pair_flat(symbols: &[Block128], weights_flat: &[u128]) -> (Block128, Block128) {
@@ -1349,7 +1431,7 @@ impl MixedOpeningProof {
 mod tests {
     use super::*;
     use crate::interleaved_commit::{absorb_cap, interleaved_commit, InterleavedCommitment};
-    use noid_fri::hasher::Blake3Hasher;
+    use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
     const TEST_LOG_ROWS: usize = 8;
     const TEST_NUM_QUERIES: usize = 2;
@@ -1388,12 +1470,12 @@ mod tests {
         Vec<Block128>,
         MixedOpeningProof,
         AdditiveNTT<Block128>,
-        Blake3Hasher,
+        Poseidon2bSponge,
     ) {
         let col = test_one_column_with_log(log_rows);
         let col_refs: Vec<&[Block128]> = vec![col.as_slice()];
         let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let (commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
         let primary_point: Vec<Block128> = (0..log_rows)
             .map(|i| Block128::from(0x3100u128 + i as u128))
@@ -1420,7 +1502,7 @@ mod tests {
         Vec<EvalClaim>,
         MixedOpeningProof,
         AdditiveNTT<Block128>,
-        Blake3Hasher,
+        Poseidon2bSponge,
     ) {
         valid_fixture_with_log(TEST_LOG_ROWS, TEST_NUM_QUERIES)
     }
@@ -1434,12 +1516,12 @@ mod tests {
         Vec<EvalClaim>,
         MixedOpeningProof,
         AdditiveNTT<Block128>,
-        Blake3Hasher,
+        Poseidon2bSponge,
     ) {
         let cols = test_columns_with_log(log_rows);
         let col_refs: Vec<&[Block128]> = cols.iter().map(Vec::as_slice).collect();
         let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let (commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
         let primary_point: Vec<Block128> = (0..log_rows)
             .map(|i| Block128::from(0x1000u128 + i as u128))
@@ -1480,7 +1562,7 @@ mod tests {
         claims: &[EvalClaim],
         proof: &MixedOpeningProof,
         ntt: &AdditiveNTT<Block128>,
-        hasher: &Blake3Hasher,
+        hasher: &Poseidon2bSponge,
     ) -> Result<Vec<Block128>, String> {
         verify_with_claims_num_queries(
             commitment,
@@ -1499,7 +1581,7 @@ mod tests {
         claims: &[EvalClaim],
         proof: &MixedOpeningProof,
         ntt: &AdditiveNTT<Block128>,
-        hasher: &Blake3Hasher,
+        hasher: &Poseidon2bSponge,
         num_queries: usize,
     ) -> Result<Vec<Block128>, String> {
         let mut channel = Channel::new();
@@ -1541,7 +1623,7 @@ mod tests {
         let cols = test_columns();
         let col_refs: Vec<&[Block128]> = cols.iter().map(Vec::as_slice).collect();
         let ntt = AdditiveNTT::<Block128>::new(TEST_LOG_ROWS + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let (_commitment, state) = interleaved_commit(&col_refs, &ntt, &hasher);
         let gamma = Block128::from(0x0BAD_5EED_u128);
         let weights_flat = compute_horner_weights_flat(gamma, state.n_cols);
@@ -1610,7 +1692,7 @@ mod tests {
         let log_rows = crate::compact_fri::COMPACT_TAU + 2;
         let tau = crate::compact_fri::COMPACT_TAU;
         let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let c_evals: Vec<Block128> = (0..(1usize << log_rows))
             .map(|i| Block128::from((i as u128).wrapping_mul(0x10_0001) ^ 0xD1A6))
             .collect();
@@ -1619,13 +1701,21 @@ mod tests {
             .collect();
         let source_code = Code::new_parallel(&c_evals, &ntt);
 
-        let (h_ref, layers_ref) = build_high_tensor_layers(&c_evals, &beta, tau, &ntt, &hasher);
+        let (h_ref, layers_ref) = build_high_tensor_layers(
+            &c_evals,
+            &beta,
+            tau,
+            &ntt,
+            &hasher,
+            CommitmentHashBackend::Arithmetic,
+        );
         let (h_direct, layers_direct) = build_high_tensor_layers_from_source_code(
             &c_evals,
             &source_code.encoding,
             &beta,
             tau,
             &hasher,
+            CommitmentHashBackend::Arithmetic,
         );
 
         assert_eq!(h_ref, h_direct);
@@ -1881,7 +1971,7 @@ mod tests {
         let refs_a: Vec<&[Block128]> = cols_a.iter().map(Vec::as_slice).collect();
         let refs_b: Vec<&[Block128]> = cols_b.iter().map(Vec::as_slice).collect();
         let ntt = AdditiveNTT::<Block128>::new(log_rows + noid_fri::code::LOG_RATE);
-        let hasher = Blake3Hasher::new();
+        let hasher = Poseidon2bSponge::new();
         let (commitment_a, _state_a) = interleaved_commit(&refs_a, &ntt, &hasher);
         let (commitment_b, state_b) = interleaved_commit(&refs_b, &ntt, &hasher);
         assert_ne!(

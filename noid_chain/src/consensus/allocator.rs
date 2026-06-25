@@ -28,7 +28,7 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 }
 
 /// Zone capacity: number of consecutive slots allocated within one segment.
-/// Must equal 2^LOG_SEGMENT_SIZE so that one zone == one FRI segment.
+/// Must equal 2^LOG_SEGMENT_SIZE so that one zone == one raw state segment.
 ///
 /// # Rationale for zone-based allocation
 ///

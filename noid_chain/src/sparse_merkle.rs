@@ -16,6 +16,16 @@ pub struct CanonicalMerkleMultiProof {
     pub siblings: Vec<StateHash>,
 }
 
+/// One directed full path derived from a canonical multiproof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedMerklePath {
+    pub index: u32,
+    pub leaf: StateHash,
+    pub siblings: Vec<StateHash>,
+    /// `false`: current node is left child. `true`: current node is right child.
+    pub directions: Vec<bool>,
+}
+
 /// Sparse non-default node cache for exact-state proofs.
 #[derive(Debug, Clone)]
 pub struct SparseMerkleCache {
@@ -242,6 +252,123 @@ pub fn reconstruct_root(
     }
 }
 
+/// Expand a canonical implicit multiproof into one directed full path per leaf.
+///
+/// This is a deterministic verifier-side projection of the same proof consumed
+/// by [`reconstruct_root`]. Sibling hashes may come either from the explicit
+/// proof vector or from another known touched subtree.
+pub fn expand_multiproof_paths(
+    indices: &[u32],
+    leaves: &[StateHash],
+    siblings: &[StateHash],
+    depth: u32,
+) -> Result<Vec<ExpandedMerklePath>, SparseMerkleError> {
+    if indices.len() != leaves.len() {
+        return Err(SparseMerkleError::LeafCountMismatch {
+            indices: indices.len(),
+            leaves: leaves.len(),
+        });
+    }
+    let expected = expected_sibling_count(indices, depth)?;
+    if siblings.len() != expected {
+        return Err(SparseMerkleError::ProofLengthMismatch {
+            expected,
+            actual: siblings.len(),
+        });
+    }
+
+    #[derive(Clone)]
+    struct Node {
+        hash: StateHash,
+        leaves: Vec<usize>,
+    }
+
+    let path_depth = depth as usize;
+    let mut out: Vec<ExpandedMerklePath> = indices
+        .iter()
+        .copied()
+        .zip(leaves.iter().copied())
+        .map(|(index, leaf)| ExpandedMerklePath {
+            index,
+            leaf,
+            siblings: vec![[0u8; 32]; path_depth],
+            directions: vec![false; path_depth],
+        })
+        .collect();
+    let mut known: BTreeMap<u64, Node> = indices
+        .iter()
+        .copied()
+        .zip(leaves.iter().copied())
+        .enumerate()
+        .map(|(leaf_pos, (index, leaf))| {
+            (
+                index as u64,
+                Node {
+                    hash: leaf,
+                    leaves: vec![leaf_pos],
+                },
+            )
+        })
+        .collect();
+    let mut cursor = 0usize;
+
+    for level in 0..depth {
+        let mut next = BTreeMap::new();
+        let mut processed = BTreeSet::new();
+        for &pos in known.keys() {
+            let base = pos & !1;
+            if !processed.insert(base) {
+                continue;
+            }
+            let left = known.get(&base).cloned();
+            let right = known.get(&(base + 1)).cloned();
+            let (left, right) = match (left, right) {
+                (Some(left), Some(right)) => (left, right),
+                (Some(left), None) => {
+                    let right = Node {
+                        hash: siblings[cursor],
+                        leaves: Vec::new(),
+                    };
+                    cursor += 1;
+                    (left, right)
+                }
+                (None, Some(right)) => {
+                    let left = Node {
+                        hash: siblings[cursor],
+                        leaves: Vec::new(),
+                    };
+                    cursor += 1;
+                    (left, right)
+                }
+                (None, None) => unreachable!("processed parent must have one known child"),
+            };
+
+            for &leaf_pos in &left.leaves {
+                out[leaf_pos].siblings[level as usize] = right.hash;
+                out[leaf_pos].directions[level as usize] = false;
+            }
+            for &leaf_pos in &right.leaves {
+                out[leaf_pos].siblings[level as usize] = left.hash;
+                out[leaf_pos].directions[level as usize] = true;
+            }
+
+            let mut parent_leaves = left.leaves;
+            parent_leaves.extend(right.leaves);
+            next.insert(
+                base / 2,
+                Node {
+                    hash: state_node_hash(left.hash, right.hash),
+                    leaves: parent_leaves,
+                },
+            );
+        }
+        known = next;
+    }
+
+    debug_assert_eq!(cursor, siblings.len());
+    Ok(out)
+}
+
 /// Build a canonical multiproof from a sparse cache.
 pub fn build_multiproof(
     cache: &SparseMerkleCache,
@@ -448,5 +575,28 @@ mod tests {
         assert_eq!(root_at_two, cache.root());
         let root_at_three = reconstruct_root(&[3], &[leaf(1)], &proof.siblings, 4).unwrap();
         assert_ne!(root_at_three, cache.root());
+    }
+
+    #[test]
+    fn expanded_paths_match_multiproof_root_with_directions() {
+        let leaves = [(2, leaf(1)), (5, leaf(2)), (14, leaf(3))];
+        let cache = SparseMerkleCache::from_leaves(4, &leaves).unwrap();
+        let indices = [2, 5, 14];
+        let touched = [leaf(1), leaf(2), leaf(3)];
+        let proof = build_multiproof(&cache, &indices, 4).unwrap();
+        let paths = expand_multiproof_paths(&indices, &touched, &proof.siblings, 4).unwrap();
+        assert_eq!(paths.len(), 3);
+
+        for path in paths {
+            let mut current = path.leaf;
+            for level in 0..4 {
+                current = if path.directions[level] {
+                    state_node_hash(path.siblings[level], current)
+                } else {
+                    state_node_hash(current, path.siblings[level])
+                };
+            }
+            assert_eq!(current, cache.root(), "index {}", path.index);
+        }
     }
 }

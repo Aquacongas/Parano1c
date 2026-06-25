@@ -5,7 +5,7 @@
 //!
 //! Sponge parameters: t=4, rate=2, cap=2.
 
-use super::domain::{capacity_iv, TAG_COMPRESS};
+use super::domain::{capacity_iv, DomainTag, TAG_BYTEHASH, TAG_COMPRESS};
 use super::permutation::Poseidon2bPermutation;
 use noid_core::{Block128, CanonicalSerialize, TowerField};
 
@@ -172,12 +172,22 @@ impl Poseidon2bSponge {
 /// absorbed. Uniform with every other sponge-mode primitive in §5.
 #[inline]
 pub fn compress(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    compress_with_tag(TAG_COMPRESS, a, b)
+}
+
+/// 2-to-1 compression of two 32-byte digests under an explicit domain tag.
+///
+/// This is the same fixed two-permutation schedule as [`compress`], but the
+/// capacity IV is caller-selected. Consensus trees must use their own tags
+/// rather than relying on the generic `COMPRESS` domain.
+#[inline]
+pub fn compress_with_tag(tag: DomainTag, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let a0 = Block128::from(u128::from_le_bytes(a[..16].try_into().unwrap()));
     let a1 = Block128::from(u128::from_le_bytes(a[16..].try_into().unwrap()));
     let b0 = Block128::from(u128::from_le_bytes(b[..16].try_into().unwrap()));
     let b1 = Block128::from(u128::from_le_bytes(b[16..].try_into().unwrap()));
 
-    let [iv_hi, iv_lo] = capacity_iv(TAG_COMPRESS);
+    let [iv_hi, iv_lo] = capacity_iv(tag);
     let mut state = [a0, a1, iv_hi, iv_lo];
     Poseidon2bPermutation.permute_mut(&mut state);
     state[0] += b0;
@@ -188,6 +198,35 @@ pub fn compress(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     out[..16].copy_from_slice(&state[0].to_bytes());
     out[16..].copy_from_slice(&state[1].to_bytes());
     out
+}
+
+/// Domain-separated Poseidon2b hash for variable-length byte strings.
+///
+/// The capacity IV fixes this as byte hashing, while the caller-supplied
+/// domain string is length-prefixed and absorbed before the message. The
+/// message length is also absorbed before the message bytes, so concatenation
+/// boundaries are canonical and unambiguous.
+#[inline]
+pub fn poseidon2b_hash_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    poseidon2b_hash_byte_slices(domain, &[bytes])
+}
+
+/// Domain-separated Poseidon2b hash over multiple byte slices.
+///
+/// Every slice is length-prefixed, so `["ab", "c"]` and `["a", "bc"]` are
+/// different inputs. This is the preferred helper for canonical transport
+/// roots that already have structured byte pieces.
+#[inline]
+pub fn poseidon2b_hash_byte_slices(domain: &[u8], pieces: &[&[u8]]) -> [u8; 32] {
+    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_BYTEHASH));
+    s.update(&(domain.len() as u64).to_le_bytes());
+    s.update(domain);
+    s.update(&(pieces.len() as u64).to_le_bytes());
+    for piece in pieces {
+        s.update(&(piece.len() as u64).to_le_bytes());
+        s.update(piece);
+    }
+    s.finalize()
 }
 
 #[inline(always)]
@@ -240,6 +279,20 @@ mod tests {
         let a = [1u8; 32];
         let b = [2u8; 32];
         assert_ne!(compress(&a, &b), compress(&b, &a));
+    }
+
+    #[test]
+    fn test_byte_hash_binds_domain_and_length() {
+        let ab = poseidon2b_hash_bytes(b"D0", b"ab");
+        let ba = poseidon2b_hash_bytes(b"D0", b"ba");
+        let other_domain = poseidon2b_hash_bytes(b"D1", b"ab");
+        let with_zero = poseidon2b_hash_bytes(b"D0", b"ab\0");
+        let split = poseidon2b_hash_byte_slices(b"D0", &[b"a", b"b"]);
+        assert_eq!(ab, poseidon2b_hash_bytes(b"D0", b"ab"));
+        assert_ne!(ab, ba);
+        assert_ne!(ab, other_domain);
+        assert_ne!(ab, with_zero);
+        assert_ne!(ab, split);
     }
 
     #[test]

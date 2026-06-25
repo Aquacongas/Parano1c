@@ -11,7 +11,8 @@
 //! The block header state root is the exact composite root:
 //! `H(log_slots, UTXO_MerkleRoot, ReuseGuardRoot)`.
 //!
-//! This is the native reference used by miners, validators, storage and tests.
+//! This is the canonical native state engine used by miners, validators,
+//! storage and tests.
 //! User-transaction block acceptance uses the exact authenticated transition
 //! proof, then commits the sealed verifier result atomically.
 
@@ -21,10 +22,13 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
-use crate::exact_state_hash::{composite_state_root, zero_slot_roots, StateHash};
-use crate::fri_state::{SlotValue, STATE_LOG_SLOTS};
+use crate::exact_state_hash::{
+    composite_state_root, slot_leaf_hash_checked, zero_slot_roots, ExactStateHashError, StateHash,
+};
+use crate::fri_state::{SlotValue, StateError, STATE_LOG_SLOTS};
 use crate::reuse_guard::{GuardBucket, ReuseGuard};
 use crate::segmented_state::{ExactStateReadError, SegmentedFriState};
+use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 
 /// Chain-level mutable state.
 ///
@@ -47,9 +51,19 @@ pub struct ChainState {
     /// signal for the `log_slots` expansion trigger (see
     pub active_slot_count: u64,
     /// Monotone counter incremented on each successful allocation.
-    /// Used only as a seed source for the pseudo-random fallback —
-    /// does **not** affect the free-list path. Consensus-significant.
+    /// Used only as a seed source for deterministic wallet slot-hint
+    /// generation. Consensus-significant.
     pub alloc_counter: u64,
+}
+
+#[derive(Debug)]
+pub enum SparseUtxoBuildError {
+    SlotOutOfRange,
+    DuplicateSlot(u32),
+    EmptySlot(u32),
+    State(StateError),
+    ExactHash(ExactStateHashError),
+    SparseMerkle(SparseMerkleError),
 }
 
 impl ChainState {
@@ -87,6 +101,49 @@ impl ChainState {
         };
         out.rebuild_exact_utxo_root_loaded()?;
         Ok(out)
+    }
+
+    /// Build state from a sparse set of live UTXO slots.
+    ///
+    /// This is a loaded-state constructor, not a transaction-application API.
+    /// It writes the raw slots without computing the old segment cache root and
+    /// computes the consensus exact UTXO root directly from the same leaves.
+    /// Callers must provide only live, unique slots.
+    pub fn from_sparse_utxos(
+        log_slots: usize,
+        slots: &[(u32, SlotValue)],
+    ) -> Result<Self, SparseUtxoBuildError> {
+        let mut seen = HashSet::with_capacity(slots.len());
+        let max_slots = 1u64
+            .checked_shl(log_slots as u32)
+            .ok_or(SparseUtxoBuildError::SlotOutOfRange)?;
+        let mut leaves = Vec::with_capacity(slots.len());
+        for &(index, slot) in slots {
+            if (index as u64) >= max_slots {
+                return Err(SparseUtxoBuildError::SlotOutOfRange);
+            }
+            if !seen.insert(index) {
+                return Err(SparseUtxoBuildError::DuplicateSlot(index));
+            }
+            if slot.is_empty() {
+                return Err(SparseUtxoBuildError::EmptySlot(index));
+            }
+            leaves.push((
+                index,
+                slot_leaf_hash_checked(slot).map_err(SparseUtxoBuildError::ExactHash)?,
+            ));
+        }
+
+        let mut state = Self::with_log_slots(log_slots);
+        state
+            .state
+            .apply_delta_unrooted(slots)
+            .map_err(SparseUtxoBuildError::State)?;
+        let cache = SparseMerkleCache::from_leaves(log_slots as u32, &leaves)
+            .map_err(SparseUtxoBuildError::SparseMerkle)?;
+        state.utxo_root = cache.root();
+        state.active_slot_count = slots.len() as u64;
+        Ok(state)
     }
 
     /// Total number of slots in the state vector.
@@ -302,7 +359,7 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
     }
     state
         .state
-        .set_slot(input.slot_index, SlotValue::EMPTY)
+        .apply_delta_unrooted(&[(input.slot_index, SlotValue::EMPTY)])
         .expect("bounds checked above");
     state.active_slot_count = state
         .active_slot_count
@@ -327,7 +384,7 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
     };
     state
         .state
-        .set_slot(idx, slot)
+        .apply_delta_unrooted(&[(idx, slot)])
         .expect("bounds checked above");
     state.active_slot_count += 1;
     state.alloc_counter += 1;

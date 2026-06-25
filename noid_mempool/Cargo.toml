@@ -6,8 +6,6 @@ license.workspace = true
 
 [dependencies]
 noid_chain    = { path = "../noid_chain" }
-noid_stark    = { path = "../noid_stark" }
-noid_air      = { path = "../noid_air" }
 noid_gkr      = { path = "../noid_gkr" }
 noid_tx       = { path = "../noid_tx" }
 noid_core     = { path = "../noid_core" }

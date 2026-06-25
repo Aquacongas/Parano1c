@@ -9,17 +9,14 @@ noid_core = { path = "../noid_core" }
 noid_fri = { path = "../noid_fri" }
 noid_fri_binius = { path = "../noid_fri_binius" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
-noid_air = { path = "../noid_air" }
-noid_stark = { path = "../noid_stark" }
 noid_gkr = { path = "../noid_gkr" }
 noid_tx = { path = "../noid_tx" }
-noid_binius = { path = "../noid_binius" }
 noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
 noid_recursive = { path = "../noid_recursive" }
 rayon = "1.10"
-blake3 = "1"
 bincode = "1"
+hex = "0.4"
 
 [[bench]]
 name = "alice_sends_bob"
@@ -31,4 +28,12 @@ harness = false
 
 [[bench]]
 name = "block_hotspots"
+harness = false
+
+[[bench]]
+name = "killshot_components"
+harness = false
+
+[[bench]]
+name = "poseidon_pow_mining"
 harness = false

@@ -166,10 +166,10 @@ enum Command {
         index: u32,
     },
 
-    /// All UTXOs owned by an address (bech32m or hex).
+    /// All UTXOs owned by an address (bech32m).
     #[command(name = "utxos-of")]
     UtxosOf {
-        /// Owner address (bech32m noid1… or 64-char hex).
+        /// Owner address (bech32m noid1…).
         #[arg(value_name = "ADDRESS")]
         address: String,
     },
@@ -184,7 +184,7 @@ enum Command {
     /// UTXO state dimensions: capacity, fill %, size on disk, expansion headroom.
     State,
 
-    /// Mining info: difficulty, block reward, recursive proof height.
+    /// Mining info: difficulty, block reward, history proof height.
     Mining,
 
     /// Number of connected peers.
@@ -203,7 +203,7 @@ enum Command {
 
     /// Validate an address and show its canonical bech32m form.
     Validate {
-        /// Address to validate (bech32m or hex).
+        /// Address to validate (bech32m).
         #[arg(value_name = "ADDRESS")]
         address: String,
     },
@@ -321,8 +321,7 @@ enum Command {
     Stop,
 
     // ---- Mining (external miner API) ------------------------------------------
-    /// Get a block template for an external PoW miner.
-    /// Returns the 212-byte header_core as hex — the input to Blake3 PoW.
+    /// Get a block template for an external Poseidon2b PoW miner.
     #[command(name = "block-template", alias = "template")]
     BlockTemplate {
         /// Coinbase address for this template (hex). Defaults to wallet address.
@@ -489,7 +488,7 @@ fn print_error(msg: &str) {
         || msg.contains("invalid address")
         || msg.contains("WrongHrp")
     {
-        "Invalid address.\nUse a bech32m address (noid1…) or 64-char hex.\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
+        "Invalid address.\nUse a bech32m address (noid1…).\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
     } else {
         msg.to_string()
     };
@@ -651,17 +650,17 @@ async fn cmd_header(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
 }
 
 async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
-    let result = rpc(ctx, "getRecursiveProof", &[])
+    let result = rpc(ctx, "getHistoryProof", &[])
         .await
-        .context("getRecursiveProof")?;
+        .context("getHistoryProof")?;
 
     if ctx.json {
         return print_json(&result);
     }
 
     if result.is_null() {
-        warn_msg("No recursive proof available yet. The node is still building it.");
-        println!("  The recursive proof updates every finalized block (~18 blocks behind tip).");
+        warn_msg("Trustless public HistoryProof is not active yet.");
+        println!("  Public O(1) snapshot authority remains disabled until HistoryProof is active.");
         return Ok(());
     }
 
@@ -676,16 +675,16 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         hex[..hex.len().min(16)].to_string()
     };
 
-    section("Recursive chain proof  (O(1) sync)");
+    section("HistoryProof");
     kv2(
         "Size",
         &format!("{bytes} bytes ({kb:.1} KB)"),
-        "(full chain history in one tiny proof)",
+        "(public O(1) snapshot authority)",
     );
     kv("Fingerprint", &proof_hash);
     println!();
     println!(
-        "  {} Any node can verify the ENTIRE chain history in ~5 ms using this proof.",
+        "  {} Public HistoryProof bytes are active.",
         c!(DIM, "Note:")
     );
 
@@ -937,7 +936,7 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
     let reward_micro = result["block_reward_micronoid"].as_u64().unwrap_or(0);
     let active = result["active_slot_count"].as_u64().unwrap_or(0);
-    let rec_h = result["recursive_proof_height"].as_u64();
+    let rec_h = result["local_history_cache_height"].as_u64();
     section("Mining info");
     kv("Height", &height.to_string());
     kv2(
@@ -952,7 +951,7 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     );
     kv("Active UTXOs", &active.to_string());
     kv(
-        "Recursive proof",
+        "Local cache",
         &rec_h.map_or("not yet".into(), |h| format!("height {h}")),
     );
     Ok(())
@@ -1484,18 +1483,17 @@ async fn cmd_send(
         None => 0, // auto
     };
 
-    // Validate address — accept bech32m (noid1…) or legacy 64-char hex.
+    // Validate address shape before sending to the daemon.
     // Actual parsing/validation happens in the daemon; we just do a basic
     // sanity check to catch obvious typos before sending to RPC.
     let to_clean = to.trim();
     let looks_like_bech32 = to_clean.to_ascii_lowercase().starts_with("noid1");
-    let looks_like_hex = to_clean.len() == 64 && to_clean.chars().all(|c| c.is_ascii_hexdigit());
-    if !looks_like_bech32 && !looks_like_hex {
+    if !looks_like_bech32 {
         bail!(
             "Invalid address format.\n\
-             \tExpected: bech32m address (noid1…) or 64-char hex\n\
+             \tExpected: bech32m address (noid1…)\n\
              \tGot:      {:?}\n\
-             \tExample:  noid1q9gnyj0z… or ec7c7a9a4dfff02d… (64 hex chars)",
+             \tExample:  noid1q9gnyj0z…",
             &to_clean[..to_clean.len().min(30)]
         );
     }
@@ -2161,7 +2159,7 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     let proof_size = result["block_proof_size_bytes"].as_u64().unwrap_or(0);
     let claimable_fees = result["claimable_fees_micronoid"].as_u64().unwrap_or(0);
     let coinbase_value = result["coinbase_value_micronoid"].as_u64().unwrap_or(0);
-    let header_core = result["header_core_hex"].as_str().unwrap_or("");
+    let pow_fields = result["pow_fields_hex"].as_str().unwrap_or("");
 
     section("Block template");
     kv("Height", &height.to_string());
@@ -2173,17 +2171,21 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     kv("Block proof", &format!("{proof_size} bytes"));
     kv("Claimable fees", &format!("{claimable_fees} μNOID"));
     kv("Coinbase value", &format!("{coinbase_value} μNOID"));
-    kv2(
-        "Header core",
-        &format!("{}…", &header_core[..header_core.len().min(32)]),
-        "(212 bytes, PoW input)",
-    );
+    if !pow_fields.is_empty() {
+        kv2(
+            "PoW fields",
+            &format!("{}…", &pow_fields[..pow_fields.len().min(32)]),
+            "(16 field elements, Poseidon2b PoW input)",
+        );
+    }
     println!();
     println!(
-        "  {} Compute Blake3(header_core || nonce) < difficulty_target, then submit.",
+        "  {} Search nonce with Poseidon2b(POWHDR__, semantic_header_fields) < difficulty_target, then submit.",
         c!(DIM, "PoW:")
     );
-    println!("  {} {}", c!(DIM, "Full hex:"), header_core);
+    if !pow_fields.is_empty() {
+        println!("  {} {}", c!(DIM, "Field schedule hex:"), pow_fields);
+    }
 
     Ok(())
 }

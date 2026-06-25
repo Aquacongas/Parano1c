@@ -11,6 +11,7 @@ use noid_core::field::{CanonicalDeserialize, CanonicalSerialize, TowerField};
 use noid_core::Block128;
 
 use crate::block_header::BlockHeader;
+use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::fri_state::SlotValue;
 use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
@@ -386,6 +387,22 @@ pub fn decode_chain_work(bytes: &[u8]) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+pub fn encode_checkpoint_package(package: &ImmutableCheckpointPackage) -> Vec<u8> {
+    bincode::serialize(package).expect("ImmutableCheckpointPackage serialization must succeed")
+}
+
+pub fn decode_checkpoint_package(bytes: &[u8]) -> Option<ImmutableCheckpointPackage> {
+    bincode::deserialize(bytes).ok()
+}
+
+pub fn encode_checkpoint_coverage(coverage: &CheckpointCoverage) -> Vec<u8> {
+    bincode::serialize(coverage).expect("CheckpointCoverage serialization must succeed")
+}
+
+pub fn decode_checkpoint_coverage(bytes: &[u8]) -> Option<CheckpointCoverage> {
+    bincode::deserialize(bytes).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -416,8 +433,6 @@ mod tests {
             miner_address: Address([4u8; 32]),
             nonce: 12345u128,
             difficulty_target: [5u8; 32],
-            proof_transcript_hash: [6u8; 32],
-            witness_root: [7u8; 32],
             log_slots: 24,
             active_slot_count: 100,
             alloc_counter: 200,

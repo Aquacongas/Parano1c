@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use crate::chain_context::ChainContext;
 use crate::consensus::{
     checks::validate_tx_consensus, fees::required_fee_for_tx_body, params::ANCHOR_DEPTH,
-    pow::full_block_hash, ConsensusError,
+    pow::block_id, ConsensusError,
 };
 use crate::fri_state::SlotValue;
 use noid_core::Block128;
@@ -69,7 +69,7 @@ pub fn validate_tx_for_mempool(
         let anchor_valid = (lo..=tip).any(|h| {
             ctx.headers
                 .get(&h)
-                .map(|hdr| full_block_hash(hdr) == anchor_hash)
+                .map(|hdr| block_id(hdr) == anchor_hash)
                 .unwrap_or(false)
         });
         if !anchor_valid {

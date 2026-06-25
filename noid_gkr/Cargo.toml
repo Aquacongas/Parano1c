@@ -7,7 +7,6 @@ license = "Apache-2.0"
 [dependencies]
 noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
-noid_air = { path = "../noid_air" }
 noid_fri = { path = "../noid_fri" }
 noid_fri_binius = { path = "../noid_fri_binius" }
 noid_tx = { path = "../noid_tx" }

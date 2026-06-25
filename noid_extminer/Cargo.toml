@@ -3,7 +3,7 @@ name        = "noid-extminer"
 version     = "0.1.0"
 edition     = "2021"
 license     = "Apache-2.0"
-description = "External Blake3 PoW miner for the Paranoid blockchain"
+description = "External Poseidon2b PoW miner for the Paranoid blockchain"
 default-run = "noid-extminer"
 
 [[bin]]
@@ -12,7 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 # PoW hashing
-blake3     = "1"
+noid_core      = { path = "../noid_core" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
 rayon      = "1"
 
 # HTTP / JSON-RPC

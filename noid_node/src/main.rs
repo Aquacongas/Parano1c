@@ -11,7 +11,7 @@
 //! 5. Dial seed peers
 //! 6. Start RPC server (JSON-RPC on configured address)
 //! 7. Start miner (if --mine or config.mining.enabled)
-//! 8. Start background recursive proof updater
+//! 8. Start background local finalized-coverage updater
 //! 9. Shutdown on Ctrl-C
 
 #![allow(clippy::items_after_test_module)]
@@ -103,9 +103,9 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum NodeMode {
     /// Relay node (default). No mining, no block-template serving.
-    /// Verifies all blocks (proofs + PoW), serves state snapshots and
-    /// recursive proofs to peers. Suitable for exchanges, explorers,
-    /// and infrastructure operators.
+    /// Verifies all blocks (proofs + PoW) and serves recent block/header sync.
+    /// Public snapshot/O(1) sync remains disabled until real HistoryProof
+    /// authority proves the full accepted-block relation.
     #[default]
     Relay,
     /// Internal miner. Runs built-in PoW + block-certificate assembly in parallel.
@@ -721,11 +721,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // --- Background Recursive Proof Updater (P.19) ---
+    // --- Background local history cache updater ---
     let rec_chain = chain.clone();
     let rec_p2p_cmd = p2p.cmd_tx.clone();
     tokio::spawn(async move {
-        run_recursive_proof_updater(rec_chain, rec_p2p_cmd).await;
+        run_history_proof_updater(rec_chain, rec_p2p_cmd).await;
     });
 
     // --- Startup Banner ---
@@ -756,13 +756,13 @@ async fn main() -> anyhow::Result<()> {
         let mat_segs = ctx.state.state.active_segment_ids().count();
         let reward = block_reward(log_slots) as f64 / 1_000_000.0;
 
-        // Get recursive proof height from store
+        // Get local finalized-history cache height from store.
         let rec_h = ctx
             .store
-            .get_recursive_proof()
+            .get_local_history_cache()
             .ok()
             .flatten()
-            .and_then(|b| bincode::deserialize::<noid_recursive::RecursiveBlockProof>(&b).ok())
+            .and_then(|b| bincode::deserialize::<noid_recursive::LocalHistoryCache>(&b).ok())
             .map(|p| p.block_height);
         drop(ctx);
 
@@ -840,142 +840,6 @@ async fn main() -> anyhow::Result<()> {
 // P2P event handler
 // ---------------------------------------------------------------------------
 
-/// Validate PoW, header linkage, and cumulative chainwork of snapshot headers.
-///
-/// Returns `(sorted_headers, Option<expected_chain_hash_at_proof_h>)`.
-/// `expected_chain_hash` is `Some` only when headers span from height 0 (genesis).
-///
-/// FIX1 note: public snapshot acceptance is fail-closed. Header PoW/linkage is
-/// necessary for future checkpoint snapshot verification, but it is not sufficient
-/// by itself to make arbitrary peer snapshots trustless.
-fn snapshot_chain_claim_from_header(
-    header: &noid_chain::block_header::BlockHeader,
-) -> noid_core::Block128 {
-    if header.proof_transcript_hash == noid_chain::block::STUB_PROOF_MARKER {
-        noid_core::Block128::from(0u128)
-    } else {
-        let mut lo = [0u8; 16];
-        lo.copy_from_slice(&header.proof_transcript_hash[..16]);
-        noid_core::Block128::from(u128::from_le_bytes(lo))
-    }
-}
-
-fn validate_snapshot_headers(
-    recent_headers_bytes: &[Vec<u8>],
-    genesis_acc: &noid_recursive::ChainAccumulator,
-    proof_h: u64,
-) -> Result<(Vec<noid_chain::block_header::BlockHeader>, Option<[u8; 32]>), String> {
-    use noid_chain::block_header::BlockHeader;
-    use noid_chain::consensus::difficulty::{add_work, block_work, work_gt};
-    use noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK;
-    use noid_chain::consensus::pow::{full_block_hash, validate_pow};
-
-    // Parse and sort by height.
-    let mut hdrs: Vec<BlockHeader> = recent_headers_bytes
-        .iter()
-        .filter_map(|b| BlockHeader::from_bytes(b).ok())
-        .collect();
-    if hdrs.is_empty() {
-        return Err("snapshot contains no parseable recent_headers".into());
-    }
-    hdrs.sort_by_key(|h| h.height);
-
-    // Validate PoW on each header.
-    // Genesis header (height 0) uses a pre-mined nonce with the trivial
-    // GENESIS_TARGET and passes validate_pow normally.
-    for hdr in &hdrs {
-        validate_pow(hdr)
-            .map_err(|_| format!("snapshot header h={} failed PoW check", hdr.height))?;
-    }
-
-    // Validate linkage for consecutive pairs.
-    // Non-consecutive gaps (snapshot window < full chain) are expected and allowed.
-    for w in hdrs.windows(2) {
-        let (parent, child) = (&w[0], &w[1]);
-        if child.height == parent.height + 1 && child.prev_block_hash != full_block_hash(parent) {
-            return Err(format!(
-                "snapshot headers not linked at h={}: prev_block_hash mismatch",
-                child.height
-            ));
-        }
-    }
-
-    // If the snapshot includes the genesis block (height 0), verify it matches
-    // our hardcoded genesis — this is the primary chain-anchor check.
-    // An attacker cannot forge the genesis hash without breaking Blake3.
-    {
-        use noid_chain::consensus::genesis::genesis_header;
-        use noid_chain::consensus::pow::full_block_hash;
-        if let Some(h0) = hdrs.iter().find(|h| h.height == 0) {
-            let expected = genesis_header();
-            if full_block_hash(h0) != full_block_hash(&expected) {
-                return Err("snapshot genesis header does not match hardcoded genesis".into());
-            }
-        }
-    }
-
-    // Cumulative chainwork check.
-    //
-    // Every real block contributes ≥ block_work(GENESIS_TARGET) because the
-    // difficulty floor is always active (ASERT never eases below GENESIS_TARGET).
-    // An attacker serving a fake snapshot with trivial-difficulty headers cannot
-    // accumulate enough chainwork to pass this threshold.
-    let min_chainwork: [u8; 32] = MIN_SNAPSHOT_CHAINWORK;
-    let mut work = [0u8; 32];
-    for hdr in &hdrs {
-        work = add_work(&work, &block_work(&hdr.difficulty_target));
-    }
-    if min_chainwork != [0u8; 32] && !work_gt(&work, &min_chainwork) {
-        return Err(format!(
-            "snapshot has insufficient cumulative chainwork \
-             ({} headers validated; work must exceed MIN_SNAPSHOT_CHAINWORK)",
-            hdrs.len()
-        ));
-    }
-
-    // The chain_hash formula folds the canonical chain_claim into each step:
-    //   chain_hash_n = compress(prev, compress(H_BLOCK, claim_bytes_n))
-    //
-    // For snapshots whose header window includes the full prefix from genesis to
-    // proof_h, the expected recursive accumulator chain_hash is derivable from
-    // headers alone: non-stub headers commit the canonical block proof transcript
-    // in `proof_transcript_hash`, while stub/coinbase-only headers use ZERO.
-    // Long-running networks whose manifest only carries a suffix still need the
-    // retained-checkpoint path tracked by N7; in that case return None and let the
-    // STARK/state-root checks run in legacy suffix mode.
-    let expected_chain_hash = if hdrs.first().is_some_and(|h| h.height == 0) {
-        let max_h = hdrs.last().map_or(0, |h| h.height);
-        if proof_h <= max_h {
-            let mut acc = noid_recursive::ChainAccumulator {
-                height: 0,
-                state_root: [0u8; 32],
-                chain_hash: [0u8; 32],
-            };
-            for h in 0..=proof_h {
-                let hdr = hdrs.iter().find(|hdr| hdr.height == h).ok_or_else(|| {
-                    format!("snapshot headers missing h={h} needed for expected chain_hash replay")
-                })?;
-                acc = acc.extend(
-                    hdr.state_root,
-                    noid_chain::hash_block_header(hdr),
-                    hdr.height,
-                    snapshot_chain_claim_from_header(hdr),
-                );
-            }
-            if proof_h == 0 && acc.chain_hash != genesis_acc.chain_hash {
-                return Err("snapshot genesis chain_hash replay mismatch".into());
-            }
-            Some(acc.chain_hash)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    Ok((hdrs, expected_chain_hash))
-}
-
 fn first_missing_snapshot_header(
     store: &noid_chain::storage::MdbxStore,
     target_height: u64,
@@ -998,7 +862,7 @@ fn persist_snapshot_header_batch(
     headers: &[noid_chain::block_header::BlockHeader],
 ) -> Result<u64, String> {
     use noid_chain::consensus::genesis::genesis_header;
-    use noid_chain::consensus::pow::{full_block_hash, validate_pow};
+    use noid_chain::consensus::pow::{block_id, validate_pow};
 
     if headers.is_empty() {
         return Err("snapshot header sync returned an empty batch".into());
@@ -1016,7 +880,7 @@ fn persist_snapshot_header_batch(
             .get_header(prev_h)
             .map_err(|e| format!("header store read h={prev_h}: {e}"))?
             .ok_or_else(|| format!("cannot validate header batch: missing parent h={prev_h}"))?;
-        Some(full_block_hash(&prev))
+        Some(block_id(&prev))
     };
 
     for hdr in sorted {
@@ -1031,7 +895,7 @@ fn persist_snapshot_header_batch(
 
         if hdr.height == 0 {
             let expected = genesis_header();
-            if full_block_hash(&hdr) != full_block_hash(&expected) {
+            if block_id(&hdr) != block_id(&expected) {
                 return Err(
                     "snapshot synced genesis header does not match hardcoded genesis".into(),
                 );
@@ -1044,12 +908,12 @@ fn persist_snapshot_header_batch(
             ));
         }
 
-        let hash = full_block_hash(&hdr);
+        let hash = block_id(&hdr);
         if let Some(existing) = store
             .get_header(hdr.height)
             .map_err(|e| format!("header store read h={}: {e}", hdr.height))?
         {
-            if full_block_hash(&existing) != hash {
+            if block_id(&existing) != hash {
                 return Err(format!(
                     "snapshot header h={} conflicts with existing local header",
                     hdr.height
@@ -1069,161 +933,15 @@ fn persist_snapshot_header_batch(
     Ok(next_height)
 }
 
-fn expected_chain_hash_from_header_store(
-    store: &noid_chain::storage::MdbxStore,
-    proof_h: u64,
-    genesis_acc: &noid_recursive::ChainAccumulator,
-) -> Result<[u8; 32], String> {
-    use noid_chain::consensus::genesis::genesis_header;
-    use noid_chain::consensus::pow::{full_block_hash, validate_pow};
-
-    let mut acc = noid_recursive::ChainAccumulator {
-        height: 0,
-        state_root: [0u8; 32],
-        chain_hash: [0u8; 32],
-    };
-    let mut prev_hash: Option<[u8; 32]> = None;
-
-    for h in 0..=proof_h {
-        let hdr = store
-            .get_header(h)
-            .map_err(|e| format!("header store read h={h}: {e}"))?
-            .ok_or_else(|| {
-                format!("missing header h={h} needed for headers-anchored snapshot verify")
-            })?;
-        validate_pow(&hdr).map_err(|_| format!("stored header h={h} failed PoW"))?;
-        if h == 0 {
-            let expected = genesis_header();
-            if full_block_hash(&hdr) != full_block_hash(&expected) {
-                return Err("stored genesis header does not match hardcoded genesis".into());
-            }
-        } else if Some(hdr.prev_block_hash) != prev_hash {
-            return Err(format!("stored header h={h} is not linked to h={}", h - 1));
-        }
-
-        acc = acc.extend(
-            hdr.state_root,
-            noid_chain::hash_block_header(&hdr),
-            hdr.height,
-            snapshot_chain_claim_from_header(&hdr),
-        );
-        prev_hash = Some(full_block_hash(&hdr));
-    }
-
-    if proof_h == 0 && acc.chain_hash != genesis_acc.chain_hash {
-        return Err("stored genesis chain_hash replay mismatch".into());
-    }
-
-    Ok(acc.chain_hash)
-}
-
-fn validate_snapshot_headers_match_store(
-    store: &noid_chain::storage::MdbxStore,
-    headers: &[noid_chain::block_header::BlockHeader],
+fn verify_snapshot_history_proof_headers_anchored(
+    _manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    _proof_bytes: &[u8],
+    _store: &noid_chain::storage::MdbxStore,
 ) -> Result<(), String> {
-    use noid_chain::consensus::pow::full_block_hash;
-
-    for hdr in headers {
-        let stored = store
-            .get_header(hdr.height)
-            .map_err(|e| format!("header store read h={}: {e}", hdr.height))?
-            .ok_or_else(|| {
-                format!(
-                    "snapshot manifest references missing stored header h={}",
-                    hdr.height
-                )
-            })?;
-        if full_block_hash(&stored) != full_block_hash(hdr) {
-            return Err(format!(
-                "snapshot manifest header h={} does not match headers DB",
-                hdr.height
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn verify_snapshot_manifest_segment_roots(
-    manifest: &noid_p2p::protocol::GetStateManifestResponse,
-    expected_state_root: &[u8; 32],
-) -> Result<(), String> {
-    let computed = noid_chain::segmented_state::sparse_state_root_from_segment_roots(
-        manifest.log_slots as usize,
-        manifest.eff_log as usize,
-        &manifest.segment_ids,
-        &manifest.segment_roots,
-    )?;
-    if &computed != expected_state_root {
-        return Err("snapshot manifest segment-root table does not match tip state_root".into());
-    }
-    Ok(())
-}
-
-fn verify_snapshot_recursive_proof_headers_anchored(
-    manifest: &noid_p2p::protocol::GetStateManifestResponse,
-    proof_bytes: &[u8],
-    store: &noid_chain::storage::MdbxStore,
-) -> Result<(), String> {
-    use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
-    use noid_chain::consensus::pow::full_block_hash;
-    use noid_recursive::{verify_step_stark_only, RecursiveBlockProof};
-
-    let proof: RecursiveBlockProof =
-        bincode::deserialize(proof_bytes).map_err(|e| format!("proof deserialize: {e}"))?;
-
-    let snap_tip_h = manifest.tip_height;
-    let proof_h = proof.block_height;
-    if proof_h != snap_tip_h {
-        return Err(format!(
-            "exact-height snapshot required: recursive proof h={proof_h}, manifest h={snap_tip_h}"
-        ));
-    }
-
-    let genesis_acc = {
-        let g = genesis_header();
-        noid_recursive::genesis_accumulator(genesis_state_root(), noid_chain::hash_block_header(&g))
-    };
-
-    let (sorted_hdrs, _legacy_expected) =
-        validate_snapshot_headers(&manifest.recent_headers, &genesis_acc, proof_h)?;
-    validate_snapshot_headers_match_store(store, &sorted_hdrs)?;
-
-    let tip_header = store
-        .get_header(snap_tip_h)
-        .map_err(|e| format!("header store read h={snap_tip_h}: {e}"))?
-        .ok_or_else(|| format!("missing stored snapshot tip header h={snap_tip_h}"))?;
-    if full_block_hash(&tip_header) != manifest.tip_hash {
-        return Err("snapshot manifest tip_hash does not match headers DB tip header".into());
-    }
-    verify_snapshot_manifest_segment_roots(manifest, &tip_header.state_root)?;
-
-    let expected_chain_hash = expected_chain_hash_from_header_store(store, proof_h, &genesis_acc)?;
-
-    let prev_root = if proof_h == 0 {
-        [0u8; 32]
-    } else {
-        store
-            .get_header(proof_h - 1)
-            .map_err(|e| format!("header store read h={}: {e}", proof_h - 1))?
-            .ok_or_else(|| format!("missing stored header h={} for step proof", proof_h - 1))?
-            .state_root
-    };
-    let expected_new_root = tip_header.state_root;
-
-    verify_step_stark_only(&proof, &prev_root, &expected_new_root)
-        .map_err(|e| format!("exact-height recursive proof STARK failed at h={proof_h}: {e:?}"))?;
-    if proof.acc.state_root != expected_new_root {
-        return Err(format!(
-            "exact-height proof state_root mismatch at h={proof_h}"
-        ));
-    }
-    if proof.acc.chain_hash != expected_chain_hash {
-        return Err(format!(
-            "exact-height proof chain_hash mismatch at h={proof_h}"
-        ));
-    }
-    tracing::info!(proof_h, "snapshot: exact-height recursive proof verified");
-    Ok(())
+    Err(
+        "public snapshot sync is disabled until HistoryProof verifies the full accepted-block relation"
+            .into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,8 +952,7 @@ fn verify_snapshot_recursive_proof_headers_anchored(
 ///
 /// User-transaction blocks take the proof-native path: verify the full
 /// exact `BlockProof` against the pre-state, apply the proven state transition,
-/// then atomically commit to MDBX. Coinbase-only blocks are the explicit
-/// no-proof/stub exception.
+/// then atomically commit to MDBX. Coinbase-only blocks carry no block proof.
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
@@ -1262,7 +979,7 @@ async fn apply_p2p_block_offthread(
              anchor,
              pre_state,
              state| {
-                noid_block::validate_block_from_network(
+                noid_block::accept_block(
                     block,
                     proof_bytes,
                     auth_sidecar_bytes,
@@ -1324,7 +1041,7 @@ async fn apply_reorg_offthread(
             .iter()
             .map(|candidate| {
                 (
-                    noid_chain::consensus::pow::full_block_hash(&candidate.block.header),
+                    noid_chain::consensus::pow::block_id(&candidate.block.header),
                     (
                         candidate.block_proof_bytes.clone(),
                         candidate.block_auth_sidecar_bytes.clone(),
@@ -1341,7 +1058,7 @@ async fn apply_reorg_offthread(
             &block_bodies,
             local_time,
             |ctx, block, block_local_time| {
-                let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+                let block_hash = noid_chain::consensus::pow::block_id(&block.header);
                 let (proof_bytes, auth_sidecar_bytes) =
                     proof_by_hash.get(&block_hash).ok_or_else(|| {
                         noid_chain::storage::MdbxContextError::Consensus(
@@ -1365,7 +1082,7 @@ async fn apply_reorg_offthread(
                      anchor,
                      pre_state,
                      state| {
-                        noid_block::validate_block_from_network(
+                        noid_block::accept_block(
                             block,
                             proof_bytes,
                             auth_sidecar_bytes,
@@ -1445,16 +1162,21 @@ fn validate_p2p_block_proof_binding(
     }
     let proof: noid_block::BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|e| format!("proof/header binding invalid: proof deserialize failed: {e}"))?;
-    let expected = noid_block::block_recursive_claim_hash(&proof);
-    if block.header.proof_transcript_hash != expected {
-        return Err("proof/header binding invalid: block proof canonical transcript does not match header proof_transcript_hash".to_string());
+    let user_txs = block
+        .transactions
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .count();
+    if proof.meta.n_tx as usize != user_txs {
+        return Err("proof/header binding invalid: BlockProof tx count mismatch".to_string());
     }
     let sidecar: noid_block::BlockAuthSidecar = bincode::deserialize(block_auth_sidecar_bytes)
         .map_err(|e| {
             format!("proof/header binding invalid: auth sidecar deserialize failed: {e}")
         })?;
-    noid_block::validate_block_auth_sidecar_root(block, &sidecar)
-        .map_err(|e| format!("proof/header binding invalid: auth sidecar root mismatch: {e:?}"))?;
+    if sidecar.tx_auth.len() != user_txs {
+        return Err("proof/header binding invalid: auth sidecar tx count mismatch".to_string());
+    }
     Ok(())
 }
 
@@ -1493,8 +1215,6 @@ mod tests {
         let decoded: noid_block::BlockProof =
             bincode::deserialize(&loaded).expect("deserialize current BlockProof format");
         assert_eq!(decoded.meta.n_tx, 0);
-        assert_eq!(decoded.meta.n_air_per_tx, 0);
-        assert_eq!(decoded.meta.n_auth_slices_per_tx, 0);
     }
 }
 
@@ -1515,22 +1235,19 @@ async fn handle_p2p_events(
 
     // --- Snapshot verification state ---
     //
-    // Two-step snapshot sync:
-    //   (1) receive StateSnapshot  → store as pending, request RecursiveProof from same peer
-    //   (2) receive RecursiveProof → verify proof → apply snapshot (or discard on failure)
+    // Future two-step snapshot sync:
+    //   (1) receive immutable checkpoint snapshot manifest
+    //   (2) verify public HistoryProof for the manifest tip before segment download
     //
-    // The pending snapshot is stored here while we await the proof.
-    // If no matching proof arrives (e.g. the peer disconnects), the snapshot
-    // remains pending until a RecursiveProof arrives from the expected peer.
-    // Subsequent peer connections buffer new snapshots in snapshot_candidates
-    // without replacing the pending entry.
+    // Production currently disables arbitrary-peer snapshot application. The
+    // state below remains fail-closed until the real O(1) verifier is active.
     // --- Segmented state sync state ---
     //
-    // Sync flow (FIX1):
+    // Sync flow:
     //   1. Recent gaps (<= CONSENSUS_FINALITY_DEPTH) use SyncBlocksFrom and full
     //      block/proof validation.
     //   2. Deep gaps fail closed. Public arbitrary-peer snapshot sync is disabled
-    //      until immutable checkpoint generations and the real recursive verifier exist.
+    //      until immutable checkpoint generations and the history proof verifier are active.
     //
     // Normal restart (state persisted): our_height > 0 → block-by-block sync
     // for recent gaps only.
@@ -1557,9 +1274,9 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
-    // Legacy marker for old forced snapshot attempts. In FIX1 public snapshot
-    // recovery is rejected fail-closed; tip probes may still downgrade to recent
-    // block replay when peer_tip - our_tip is small.
+    // Tracks peers for forced snapshot attempts. Public snapshot recovery is
+    // rejected fail-closed; tip probes may still downgrade to recent block replay
+    // when peer_tip - our_tip is small.
     let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Count of manifest responses received (including tip=0 "no state" replies).
@@ -1700,7 +1417,7 @@ async fn handle_p2p_events(
                     );
                     continue;
                 }
-                let header_hash = noid_chain::consensus::pow::full_block_hash(&announced_header);
+                let header_hash = noid_chain::consensus::pow::block_id(&announced_header);
                 if header_hash != hash {
                     tracing::debug!(
                         peer = %from,
@@ -1748,32 +1465,12 @@ async fn handle_p2p_events(
                             &announced_header,
                             &parent,
                             &prev_timestamps,
+                            &prev_active_counts,
                             local_time,
                             anchor.anchor_height,
                             anchor.anchor_timestamp,
                             &anchor.anchor_target,
                         )
-                        .and_then(|_| {
-                            use noid_chain::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
-                            let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-                            let median_active = if prev_active_counts.is_empty() {
-                                parent.active_slot_count
-                            } else {
-                                noid_chain::consensus::median_u64(&prev_active_counts)
-                            };
-                            let trigger = median_active.saturating_mul(EXPAND_DENOM)
-                                >= prev_capacity.saturating_mul(EXPAND_NUM);
-                            let expected_log_slots = if trigger {
-                                parent.log_slots.saturating_add(1).min(LOG_SLOTS_MAX)
-                            } else {
-                                parent.log_slots
-                            };
-                            if announced_header.log_slots == expected_log_slots {
-                                Ok(())
-                            } else {
-                                Err(noid_chain::consensus::ConsensusError::BadLogSlotsExpansion)
-                            }
-                        })
                     };
                     if let Err(e) = precheck {
                         tracing::debug!(
@@ -1861,7 +1558,7 @@ async fn handle_p2p_events(
                 match noid_chain::block::Block::from_bytes(&block_bytes) {
                     Ok(block) => {
                         let local_time = unix_now();
-                        let block_hash = noid_chain::consensus::pow::full_block_hash(&block.header);
+                        let block_hash = noid_chain::consensus::pow::block_id(&block.header);
                         pending_block_fetches.remove(&(block.header.height, block_hash));
 
                         // Skip blocks at or below our current tip — we already have them.
@@ -1928,7 +1625,7 @@ async fn handle_p2p_events(
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
 
-                                // Store the BlockProof bytes so run_recursive_proof_updater
+                                // Store the BlockProof bytes so run_history_proof_updater
                                 // can build a real (non-null) recursive witness for this block.
                                 if !block_proof_bytes.is_empty() {
                                     let ctx = chain.read().await;
@@ -1975,7 +1672,7 @@ async fn handle_p2p_events(
                                     let orphan_proof_bytes = orphan.block_proof_bytes;
                                     let orphan_auth_sidecar_bytes = orphan.block_auth_sidecar_bytes;
                                     next_hash =
-                                        noid_chain::consensus::pow::full_block_hash(&orphan_block.header);
+                                        noid_chain::consensus::pow::block_id(&orphan_block.header);
                                     let orphan_result = apply_p2p_block_offthread(
                                         &chain,
                                         orphan_block.clone(),
@@ -2038,11 +1735,11 @@ async fn handle_p2p_events(
                                             block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
                                         }];
                                         let mut next_hash =
-                                            noid_chain::consensus::pow::full_block_hash(
+                                            noid_chain::consensus::pow::block_id(
                                                 &block.header,
                                             );
                                         while let Some(orphan) = orphan_pool.remove(&next_hash) {
-                                            next_hash = noid_chain::consensus::pow::full_block_hash(
+                                            next_hash = noid_chain::consensus::pow::block_id(
                                                 &orphan.block.header,
                                             );
                                             new_chain.push(ProvedBlockCandidate {
@@ -2165,7 +1862,7 @@ async fn handle_p2p_events(
                                                     tracing::warn!(err = ?e, "reorg failed, keeping current chain");
                                                     // Reorg failure means block-by-block recovery could not
                                                     // safely converge. Public arbitrary-peer snapshot recovery is
-                                                    // disabled in FIX1, so fail closed and wait for operator/trusted
+                                                    // disabled, so fail closed and wait for operator/trusted
                                                     // bootstrap rather than accepting peer state.
                                                     tracing::warn!(
                                                         peer = %from,
@@ -2199,7 +1896,7 @@ async fn handle_p2p_events(
                                         //
                                         // If the competing block is clearly deeper than our finality window,
                                         // block-by-block reorg is not safe/available. Public snapshot recovery is
-                                        // disabled in FIX1, so deep forks fail closed instead of requesting peer state.
+                                        // disabled, so deep forks fail closed instead of requesting peer state.
                                         //
                                         // FetchHeaders is only worth doing for shallow forks (within CONSENSUS_FINALITY_DEPTH)
                                         // where block-by-block reorg is possible.
@@ -2395,7 +2092,7 @@ async fn handle_p2p_events(
                     // Fresh node: request the state MANIFEST (tiny, ~few KB).
                     //
                     // Paranoid is a proof-native statechain: nodes sync via
-                    // current state + recursive proof, not block replay.
+                    // current state + history proof, not block replay.
                     // Manifest tells us which segments to download next.
                     // Segments are pulled in parallel after proof verification.
                     //
@@ -2492,14 +2189,14 @@ async fn handle_p2p_events(
                         tracing::info!(
                             peer = %from,
                             target_height = sync.target_height,
-                            "snapshot: header chain synced — requesting recursive proof again"
+                            "snapshot: header chain synced — requesting history proof again"
                         );
                         pending_manifest = Some(PendingManifest {
                             from,
                             manifest: sync.manifest,
                         });
                         let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: from })
+                            .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: from })
                             .await;
                     }
                     continue;
@@ -2516,7 +2213,7 @@ async fn handle_p2p_events(
                     // Find the highest header in the batch that is ALSO in our chain.
                     let mut found = None;
                     for hdr in &headers {
-                        let hash = noid_chain::consensus::pow::full_block_hash(hdr);
+                        let hash = noid_chain::consensus::pow::block_id(hdr);
                         if let Some(h) = ctx.find_ancestor_height(&hash) {
                             if found.is_none_or(|(fh, _)| h > fh) {
                                 found = Some((h, hash));
@@ -2555,7 +2252,7 @@ async fn handle_p2p_events(
                                 competing.len()
                             );
                             for hdr in &competing {
-                                let hdr_hash = noid_chain::consensus::pow::full_block_hash(hdr);
+                                let hdr_hash = noid_chain::consensus::pow::block_id(hdr);
                                 let inflight_key = (hdr.height, hdr_hash);
                                 if let Some(pending) = pending_block_fetches.get(&inflight_key) {
                                     if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
@@ -2797,14 +2494,14 @@ async fn handle_p2p_events(
                             segments = best_manifest.segment_ids.len(),
                             responded = manifest_response_count,
                             requested = manifest_requested_peers.len(),
-                            "selected best manifest — requesting recursive proof for verification"
+                            "selected best manifest — requesting history proof for verification"
                         );
                         pending_manifest = Some(PendingManifest {
                             from: best_peer,
                             manifest: best_manifest,
                         });
                         let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestRecursiveProof {
+                            .send(noid_p2p::NetworkCommand::RequestHistoryProof {
                                 peer: best_peer,
                             })
                             .await;
@@ -3076,23 +2773,22 @@ async fn handle_p2p_events(
                 }
             }
 
-            Ok(NetworkEvent::RecursiveProof {
+            Ok(NetworkEvent::HistoryProof {
                 from,
                 proof_bytes,
                 tip_header_bytes: _, // tip header from peer; we use recent_headers from snapshot
             }) => {
-                // SECURITY: RecursiveProof verification before applying snapshot.
-                // B-lite mode: verify the proof against the full headers DB. If the
-                // snapshot tip headers are not local yet, fetch headers only first;
-                // old block bodies/proofs remain pruned.
+                // SECURITY: HistoryProof verification before applying an
+                // immutable checkpoint snapshot. The verifier below is fail-closed
+                // until the proof proves the full accepted-block relation.
 
                 // If segment collection is already in progress (pending_segment_ids non-empty),
-                // a second RecursiveProof event would corrupt the active session.
+                // a second HistoryProof event would corrupt the active session.
                 // Ignore it to protect the in-flight segment download.
                 if !pending_segment_ids.is_empty() || !segment_queue.is_empty() {
                     tracing::debug!(
                         from = %from,
-                        "ignoring recursive proof — segment collection already in progress"
+                        "ignoring history proof — segment collection already in progress"
                     );
                     continue;
                 }
@@ -3102,13 +2798,13 @@ async fn handle_p2p_events(
                     Some(p) => {
                         tracing::warn!(
                             proof_from = %from, manifest_from = %p.from,
-                            "recursive proof from unexpected peer, discarding pending manifest"
+                            "history proof from unexpected peer, discarding pending manifest"
                         );
                         pending_manifest = Some(p);
                         continue;
                     }
                     None => {
-                        tracing::debug!(from = %from, "unexpected recursive proof, no pending manifest");
+                        tracing::debug!(from = %from, "unexpected history proof, no pending manifest");
                         continue;
                     }
                 };
@@ -3117,7 +2813,7 @@ async fn handle_p2p_events(
                     tracing::error!(
                         from = %from,
                         tip = snap.manifest.tip_height,
-                        "REJECTED manifest: snapshot sync requires a non-empty RecursiveProof; headers-only snapshots are not proof-native safe"
+                        "REJECTED manifest: snapshot sync requires a non-empty HistoryProof; headers-only snapshots are not proof-native safe"
                     );
                     reset_sync_state!();
                     continue;
@@ -3163,7 +2859,7 @@ async fn handle_p2p_events(
 
                     let verify_result = {
                         let ctx = chain.read().await;
-                        verify_snapshot_recursive_proof_headers_anchored(
+                        verify_snapshot_history_proof_headers_anchored(
                             &snap.manifest,
                             &proof_bytes,
                             &ctx.store,
@@ -3176,28 +2872,12 @@ async fn handle_p2p_events(
                                 from = %from,
                                 tip = snap.manifest.tip_height,
                                 segments = snap.manifest.segment_ids.len(),
-                                "recursive proof VERIFIED — starting segment download"
+                                "history proof VERIFIED — starting segment download"
                             );
-                            // Persist the verified proof and its height so proof-byte
-                            // pruning never races recursive-history catch-up.
-                            {
-                                match bincode::deserialize::<noid_recursive::RecursiveBlockProof>(
-                                    &proof_bytes,
-                                ) {
-                                    Ok(proof) => {
-                                        let ctx = chain.read().await;
-                                        if let Err(e) = ctx
-                                            .store
-                                            .put_recursive_proof_at(proof.block_height, &proof_bytes)
-                                        {
-                                            tracing::warn!(err = ?e, "failed to persist recursive proof");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(err = ?e, "verified recursive proof failed to decode for persistence");
-                                    }
-                                }
-                            }
+                            // Verified public history proofs are snapshot
+                            // authority, not local cache entries. Durable
+                            // storage for them must use the final HistoryProof
+                            // type, never the local cache format.
                             // Start downloading segments with concurrency cap.
                             // The StateSegment handler dispatches queued requests as responses arrive.
                             let tip_h = snap.manifest.tip_height;
@@ -3321,126 +3001,11 @@ async fn handle_p2p_events(
                         Err(e) => {
                             tracing::error!(
                                 from = %from, tip = snap.manifest.tip_height, err = %e,
-                                "REJECTED manifest: recursive proof verification failed — \
+                                "REJECTED manifest: history proof verification failed — \
                                  possible Eclipse attack or fabricated state"
                             );
                             reset_sync_state!();
                             continue;
-                        }
-                    }
-                }
-            }
-            Ok(NetworkEvent::RecursiveProofUpdate {
-                from,
-                height,
-                tip_hash: _,
-                proof_bytes,
-            }) => {
-                use noid_recursive::{verify_step_stark_only, RecursiveBlockProof};
-
-                // Single read lock to gather all required state.
-                let (already_have, prev_root_opt, expected_root_opt) = {
-                    let ctx = chain.read().await;
-                    let our_height = ctx.store
-                        .get_recursive_proof()
-                        .ok()
-                        .flatten()
-                        .and_then(|b| bincode::deserialize::<RecursiveBlockProof>(&b).ok())
-                        .map(|p| p.block_height);
-                    let already = our_height.is_some_and(|h| h >= height);
-                    if already {
-                        (true, None, None)
-                    } else {
-                        let prev_root = if height == 0 {
-                            Some([0u8; 32])
-                        } else {
-                            ctx.recent_headers
-                                .get(&(height - 1))
-                                .map(|h| h.state_root)
-                                .or_else(|| {
-                                    ctx.store
-                                        .get_header(height - 1)
-                                        .ok()
-                                        .flatten()
-                                        .map(|h| h.state_root)
-                                })
-                        };
-                        let expected_root = ctx.recent_headers
-                            .get(&height)
-                            .map(|h| h.state_root)
-                            .or_else(|| {
-                                ctx.store
-                                    .get_header(height)
-                                    .ok()
-                                    .flatten()
-                                    .map(|h| h.state_root)
-                            });
-                        (false, prev_root, expected_root)
-                    }
-                };
-
-                if already_have {
-                    tracing::debug!(
-                        from = %from,
-                        height,
-                        "RecursiveProofUpdate: stale, ignoring"
-                    );
-                } else {
-                    match (prev_root_opt, expected_root_opt) {
-                        (Some(prev_root), Some(expected_root)) => {
-                            match bincode::deserialize::<RecursiveBlockProof>(&proof_bytes) {
-                                Ok(proof) => {
-                                    if proof.block_height != height {
-                                        tracing::debug!(
-                                            from = %from,
-                                            height,
-                                            proof_height = proof.block_height,
-                                            "RecursiveProofUpdate: height mismatch, ignoring"
-                                        );
-                                        continue;
-                                    }
-                                    match verify_step_stark_only(&proof, &prev_root, &expected_root)
-                                    {
-                                        Ok(()) => {
-                                            let ctx = chain.read().await;
-                                            if let Err(e) = ctx
-                                                .store
-                                                .put_recursive_proof_at(proof.block_height, &proof_bytes)
-                                            {
-                                                tracing::warn!(
-                                                    err = ?e,
-                                                    "failed to store RecursiveProofUpdate"
-                                                );
-                                            } else {
-                                                tracing::debug!(
-                                                    from = %from,
-                                                    height,
-                                                    "RecursiveProofUpdate: stored"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                from = %from,
-                                                height,
-                                                err = ?e,
-                                                "RecursiveProofUpdate: STARK verify failed, ignoring"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::debug!(
-                                    from = %from,
-                                    "RecursiveProofUpdate: deserialize failed: {e}"
-                                ),
-                            }
-                        }
-                        _ => {
-                            tracing::debug!(
-                                from = %from,
-                                height,
-                                "RecursiveProofUpdate: missing headers for STARK verify, skipping"
-                            );
                         }
                     }
                 }
@@ -3528,7 +3093,7 @@ async fn handle_p2p_events(
                         manifest: best_manifest,
                     });
                     let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestRecursiveProof { peer: best_peer })
+                        .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: best_peer })
                         .await;
                 }
             }
@@ -3678,15 +3243,73 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 }
 
 // ---------------------------------------------------------------------------
-// Background recursive proof updater (P.19)
+// Background local history cache updater
 // ---------------------------------------------------------------------------
 
-/// Background recursive proof updater.
+fn recursive_header_timestamp_window(
+    ctx: &MdbxChainContext,
+    block_height: u64,
+) -> Result<Vec<u64>, String> {
+    let parent_height = block_height
+        .checked_sub(1)
+        .ok_or_else(|| "genesis has no parent timestamp window".to_string())?;
+    let start =
+        parent_height.saturating_sub(noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64 - 1);
+    let mut values = Vec::new();
+    for h in start..=parent_height {
+        let header = ctx
+            .get_header_from_store(h)
+            .map_err(|e| format!("read header h={h}: {e}"))?
+            .ok_or_else(|| format!("missing header h={h}"))?;
+        values.push(header.timestamp);
+    }
+    Ok(values)
+}
+
+fn recursive_active_count_window(
+    ctx: &MdbxChainContext,
+    block_height: u64,
+) -> Result<Vec<u64>, String> {
+    let parent_height = block_height
+        .checked_sub(1)
+        .ok_or_else(|| "genesis has no active-count window".to_string())?;
+    let start = parent_height
+        .saturating_sub(noid_chain::consensus::params::EXPANSION_WINDOW.saturating_sub(1));
+    let mut values = Vec::new();
+    for h in start..=parent_height {
+        let header = ctx
+            .get_header_from_store(h)
+            .map_err(|e| format!("read header h={h}: {e}"))?
+            .ok_or_else(|| format!("missing header h={h}"))?;
+        values.push(header.active_slot_count);
+    }
+    Ok(values)
+}
+
+fn recursive_anchor_info(
+    ctx: &MdbxChainContext,
+    block_height: u64,
+) -> Result<noid_chain::consensus::AnchorInfo, String> {
+    let parent_height = block_height
+        .checked_sub(1)
+        .ok_or_else(|| "genesis has no ASERT anchor context".to_string())?;
+    let anchor_height = noid_chain::consensus::epoch_anchor_height(parent_height);
+    let anchor_header = ctx
+        .get_header_from_store(anchor_height)
+        .map_err(|e| format!("read ASERT anchor h={anchor_height}: {e}"))?
+        .ok_or_else(|| format!("missing ASERT anchor header h={anchor_height}"))?;
+    Ok(noid_chain::consensus::AnchorInfo {
+        anchor_height,
+        anchor_timestamp: anchor_header.timestamp,
+        anchor_target: anchor_header.difficulty_target,
+    })
+}
+
+/// Background local history cache updater.
 ///
-/// Advances the chain's recursive proof one block at a time, storing the
-/// result in MDBX. The recursive proof provides O(1) trustless sync for new
-/// nodes: instead of replaying all blocks, they verify one constant-size
-/// (~38 KB encoded) STARK proof and trust the committed state root.
+/// Advances the chain's local finalized-history cache one block at a time,
+/// storing the result in MDBX. The cache is not public snapshot/pruning
+/// authority.
 ///
 /// ## Design
 ///
@@ -3696,15 +3319,16 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 ///   chain-hash accumulator still advances correctly.
 /// - Runs a tight loop when catching up; sleeps when at finality boundary.
 /// - Recursive proving runs in `spawn_blocking` so catch-up never blocks the async runtime.
-async fn run_recursive_proof_updater(
+async fn run_history_proof_updater(
     chain: Arc<RwLock<MdbxChainContext>>,
-    p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    _p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) {
-    use noid_block::BlockProof;
+    use noid_block::{accepted_block_claim, BlockAuthSidecar, BlockProof};
+    use noid_chain::block::Block;
     use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use noid_recursive::{
-        null_block_replay_witness, prove_genesis_recursive, prove_recursive_step,
-        verify_step_stark_only, RecursiveBlockProof,
+        accepted_block_claim_witness, advance_local_history_cache, init_genesis_history_cache,
+        verify_local_history_cache_step, LocalHistoryCache,
     };
     use std::time::Duration;
 
@@ -3721,21 +3345,21 @@ async fn run_recursive_proof_updater(
         just_advanced = false;
 
         // --- Read current state ---
-        let (tip, rec_proof_opt) = {
+        let (tip, local_cache_opt) = {
             let ctx = chain.read().await;
             let tip = ctx.tip_height();
-            let rec = match ctx.store.get_recursive_proof() {
-                Ok(Some(b)) => bincode::deserialize::<RecursiveBlockProof>(&b).ok(),
+            let cache = match ctx.store.get_local_history_cache() {
+                Ok(Some(b)) => bincode::deserialize::<LocalHistoryCache>(&b).ok(),
                 _ => None,
             };
-            (tip, rec)
+            (tip, cache)
         };
 
-        let rec_height_opt = rec_proof_opt.as_ref().map(|p| p.block_height);
+        let cache_height_opt = local_cache_opt.as_ref().map(|p| p.block_height);
 
-        // Determine next height to prove.
+        // Determine next height to cache.
         // None → start with genesis (height 0).
-        let next_height: u64 = match rec_height_opt {
+        let next_height: u64 = match cache_height_opt {
             None => 0,
             Some(h) => h + 1,
         };
@@ -3744,79 +3368,99 @@ async fn run_recursive_proof_updater(
         // This guarantees a reorg can never invalidate the stored proof.
         let finalized_tip = tip.saturating_sub(CONSENSUS_FINALITY_DEPTH);
         if next_height > finalized_tip {
-            let lag = tip.saturating_sub(rec_height_opt.unwrap_or(0));
+            let lag = tip.saturating_sub(cache_height_opt.unwrap_or(0));
             if lag > CONSENSUS_FINALITY_DEPTH {
                 tracing::warn!(
                     lag,
                     tip,
-                    rec_height = rec_height_opt.unwrap_or(0),
-                    "recursive proof DEGRADED — {lag} blocks behind finality boundary"
+                    cache_height = cache_height_opt.unwrap_or(0),
+                    "local history cache DEGRADED — {lag} blocks behind finality boundary"
                 );
             } else {
                 // Normal: tracking finality boundary (lag ≈ CONSENSUS_FINALITY_DEPTH)
                 tracing::debug!(
                     lag,
                     tip,
-                    rec_height = rec_height_opt.unwrap_or(0),
-                    "recursive proof NORMAL — at finality boundary"
+                    cache_height = cache_height_opt.unwrap_or(0),
+                    "local history cache NORMAL — at finality boundary"
                 );
             }
             continue;
         }
 
-        // --- Prove genesis (special case) ---
+        // --- Cache genesis (special case) ---
         if next_height == 0 {
-            tracing::debug!("recursive proof: proving genesis block");
+            tracing::debug!("local history cache: caching genesis block");
             let prove_started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(prove_genesis_recursive).await;
+            let result = tokio::task::spawn_blocking(init_genesis_history_cache).await;
             match result {
-                Ok(genesis_proof) => {
+                Ok(genesis_cache) => {
                     let genesis_header = noid_chain::consensus::genesis::genesis_header();
-                    if let Err(e) = verify_step_stark_only(
-                        &genesis_proof,
+                    if let Err(e) = verify_local_history_cache_step(
+                        &genesis_cache,
                         &[0u8; 32],
                         &genesis_header.state_root,
                     ) {
-                        tracing::error!(err = ?e, "genesis recursive proof failed self-verification");
+                        tracing::error!(err = ?e, "genesis local history cache failed self-verification");
                         continue;
                     }
                     let prove_ms = prove_started.elapsed().as_millis();
-                    let bytes = bincode::serialize(&genesis_proof).unwrap_or_default();
+                    let bytes = bincode::serialize(&genesis_cache).unwrap_or_default();
                     let (stored, tip_hash) = {
                         let ctx = chain.read().await;
                         let tip_hash = ctx.tip_hash();
                         let ok = ctx
                             .store
-                            .put_recursive_proof_at(genesis_proof.block_height, &bytes)
+                            .put_local_history_cache_at(genesis_cache.block_height, &bytes)
                             .is_ok();
                         (ok, tip_hash)
                     };
                     if stored {
-                        tracing::info!(prove_ms, "recursive proof: genesis proved");
+                        tracing::info!(prove_ms, "local history cache: genesis stored");
                         just_advanced = true;
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {
-                                height: 0,
-                                tip_hash,
-                                proof_bytes: bytes,
-                            })
-                            .await;
+                        let _ = tip_hash;
                     } else {
-                        tracing::error!("failed to store genesis recursive proof");
+                        tracing::error!("failed to store genesis local history cache");
                     }
                 }
-                Err(e) => tracing::error!(err = ?e, "genesis recursive proof task panicked"),
+                Err(e) => tracing::error!(err = ?e, "genesis local history cache task panicked"),
             }
             continue;
         }
 
         // --- Prove block at next_height ---
-        // Fetch the block header and any stored BlockProof bytes.
-        let (header_opt, block_proof_bytes_opt) = {
+        // Fetch the exact block body, parent/context, and retained witness bytes.
+        let (
+            header_opt,
+            parent_opt,
+            block_bytes_opt,
+            block_proof_bytes_opt,
+            block_auth_sidecar_bytes_opt,
+            prev_timestamps_res,
+            prev_active_counts_res,
+            anchor_res,
+        ) = {
             let ctx = chain.read().await;
             let hdr = ctx.store.get_header(next_height).ok().flatten();
+            let parent = next_height
+                .checked_sub(1)
+                .and_then(|h| ctx.store.get_header(h).ok().flatten());
+            let block_bytes = ctx.store.get_recent_block(next_height).ok().flatten();
             let bp = ctx.store.get_block_proof(next_height).ok().flatten();
-            (hdr, bp)
+            let sidecar = ctx.store.get_block_auth_sidecar(next_height).ok().flatten();
+            let prev_timestamps = recursive_header_timestamp_window(&ctx, next_height);
+            let prev_active_counts = recursive_active_count_window(&ctx, next_height);
+            let anchor = recursive_anchor_info(&ctx, next_height);
+            (
+                hdr,
+                parent,
+                block_bytes,
+                bp,
+                sidecar,
+                prev_timestamps,
+                prev_active_counts,
+                anchor,
+            )
         };
 
         let header = match header_opt {
@@ -3826,109 +3470,182 @@ async fn run_recursive_proof_updater(
                 continue;
             }
         };
-
-        // Build the replay witness.
-        // Coinbase-only block   → null witness (accumulator still advances correctly).
-        // User-transaction block proofs are minimal and no longer contain the
-        // old bucket transcript required by this historical recursive circuit.
-        // Until the real recursive verifier lands, those blocks stay fail-closed
-        // for recursive advancement.
-        // SECURITY: Only use null witness for blocks whose header declares the
-        // stub marker. Blocks with a real proof_transcript_hash MUST have proof
-        // bytes; if missing, wait instead of fabricating a zero-claim chain_hash.
-        const STUB_MARKER: [u8; 32] = [1u8; 32];
-        let is_coinbase_only = header.proof_transcript_hash == STUB_MARKER;
-        let witness = match block_proof_bytes_opt {
-            Some(ref bytes) if !bytes.is_empty() => {
-                match bincode::deserialize::<BlockProof>(bytes) {
-                    Ok(_bp) => {
-                        tracing::warn!(
-                            next_height,
-                            "recursive proof cannot advance over minimal user block proof until real recursive verifier is enabled"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        if is_coinbase_only {
-                            tracing::warn!(
-                                next_height,
-                                err = ?e,
-                                "block proof decode failed on coinbase-only block — using null witness"
-                            );
-                            null_block_replay_witness()
-                        } else {
-                            tracing::warn!(
-                                next_height,
-                                err = ?e,
-                                "block proof decode failed — cannot advance, waiting for re-sync"
-                            );
-                            continue;
-                        }
-                    }
-                }
+        let parent = match parent_opt {
+            Some(h) => h,
+            None => {
+                tracing::debug!(next_height, "no parent header available yet, waiting");
+                continue;
             }
-            _ => {
-                if is_coinbase_only {
-                    null_block_replay_witness()
-                } else {
-                    tracing::debug!(
+        };
+        let block_bytes = match block_bytes_opt {
+            Some(bytes) => bytes,
+            None => {
+                tracing::debug!(next_height, "no retained block body available yet, waiting");
+                continue;
+            }
+        };
+        let block = match Block::from_bytes(&block_bytes) {
+            Ok(block) => block,
+            Err(e) => {
+                tracing::warn!(next_height, err = ?e, "retained block body decode failed");
+                continue;
+            }
+        };
+        if block.header != header {
+            tracing::warn!(
+                next_height,
+                "retained block body/header mismatch — local history cache waits"
+            );
+            continue;
+        }
+        let prev_timestamps = match prev_timestamps_res {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::debug!(next_height, err = %e, "header timestamp context incomplete");
+                continue;
+            }
+        };
+        let prev_active_counts = match prev_active_counts_res {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::debug!(next_height, err = %e, "active-count context incomplete");
+                continue;
+            }
+        };
+        let anchor = match anchor_res {
+            Ok(anchor) => anchor,
+            Err(e) => {
+                tracing::debug!(next_height, err = %e, "ASERT anchor context incomplete");
+                continue;
+            }
+        };
+
+        let user_txs = block
+            .transactions
+            .iter()
+            .filter(|tx| !tx.body.is_coinbase)
+            .count();
+        let proof = if user_txs == 0 {
+            if block_proof_bytes_opt
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty())
+                || block_auth_sidecar_bytes_opt
+                    .as_ref()
+                    .is_some_and(|bytes| !bytes.is_empty())
+            {
+                tracing::warn!(
+                    next_height,
+                    "coinbase-only block has retained witness bytes — local history cache waits"
+                );
+                continue;
+            }
+            None
+        } else {
+            let Some(bytes) = block_proof_bytes_opt
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+            else {
+                tracing::debug!(next_height, "missing retained BlockProof bytes");
+                continue;
+            };
+            match bincode::deserialize::<BlockProof>(bytes) {
+                Ok(proof) => Some(proof),
+                Err(e) => {
+                    tracing::warn!(
                         next_height,
-                        "non-coinbase block missing proof bytes — waiting"
+                        err = ?e,
+                        "block proof decode failed — local history cache waits"
                     );
                     continue;
                 }
             }
         };
+        let auth_sidecar = if user_txs == 0 {
+            BlockAuthSidecar::default()
+        } else {
+            let Some(bytes) = block_auth_sidecar_bytes_opt
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+            else {
+                tracing::debug!(next_height, "missing retained BlockAuthSidecar bytes");
+                continue;
+            };
+            match bincode::deserialize::<BlockAuthSidecar>(bytes) {
+                Ok(sidecar) => sidecar,
+                Err(e) => {
+                    tracing::warn!(
+                        next_height,
+                        err = ?e,
+                        "auth sidecar decode failed — local history cache waits"
+                    );
+                    continue;
+                }
+            }
+        };
+        let chain_claim = match accepted_block_claim(
+            &block,
+            &parent,
+            &prev_timestamps,
+            &prev_active_counts,
+            &anchor,
+            proof.as_ref(),
+            &auth_sidecar,
+        ) {
+            Ok(claim) => claim,
+            Err(e) => {
+                tracing::warn!(
+                    next_height,
+                    err = ?e,
+                    "accepted-block claim construction failed — local history cache waits"
+                );
+                continue;
+            }
+        };
+        let witness = accepted_block_claim_witness(chain_claim);
 
-        // prev_acc comes from the last proved block's accumulator.
-        // safe: we only reach here when next_height > 0 and rec_proof_opt is Some.
-        let prev_acc = rec_proof_opt.as_ref().unwrap().acc.clone();
-        // Move rec_proof_opt into the closure — RecursiveBlockProof is not Clone.
+        // prev_acc comes from the last cached block's accumulator.
+        // safe: we only reach here when next_height > 0 and local_cache_opt is Some.
+        let prev_acc = local_cache_opt.as_ref().unwrap().acc.clone();
+        // Move local_cache_opt into the closure — LocalHistoryCache is not Clone.
         // prev_acc is already extracted above (ChainAccumulator: Clone).
 
         let header_for_verify = header;
         let prev_state_root_for_verify = prev_acc.state_root;
 
-        tracing::debug!(next_height, "recursive proof: proving step");
+        tracing::debug!(next_height, "local history cache: folding step");
         let prove_started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
-            prove_recursive_step(&witness, &header, &prev_acc, rec_proof_opt.as_ref())
+            advance_local_history_cache(&witness, &header, &prev_acc, local_cache_opt.as_ref())
         })
         .await;
 
         match result {
-            Ok(new_proof) => {
-                let h = new_proof.block_height;
-                if let Err(e) = verify_step_stark_only(
-                    &new_proof,
+            Ok(new_cache) => {
+                let h = new_cache.block_height;
+                if let Err(e) = verify_local_history_cache_step(
+                    &new_cache,
                     &prev_state_root_for_verify,
                     &header_for_verify.state_root,
                 ) {
-                    tracing::error!(height = h, err = ?e, "recursive proof failed self-verification — not storing");
+                    tracing::error!(height = h, err = ?e, "local history cache failed self-verification — not storing");
                     continue;
                 }
                 let prove_ms = prove_started.elapsed().as_millis();
-                let bytes = bincode::serialize(&new_proof).unwrap_or_default();
+                let bytes = bincode::serialize(&new_cache).unwrap_or_default();
                 let (stored, tip_hash) = {
                     let ctx = chain.read().await;
                     let tip_hash = ctx.tip_hash();
-                    let ok = ctx.store.put_recursive_proof_at(h, &bytes).is_ok();
+                    let ok = ctx.store.put_local_history_cache_at(h, &bytes).is_ok();
                     (ok, tip_hash)
                 };
                 if stored {
-                    tracing::info!(height = h, prove_ms, "recursive proof advanced");
+                    tracing::info!(height = h, prove_ms, "local history cache advanced");
                     just_advanced = true;
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::BroadcastRecursiveProof {
-                            height: h,
-                            tip_hash,
-                            proof_bytes: bytes,
-                        })
-                        .await;
+                    let _ = tip_hash;
                 } else {
                     tracing::error!(
                         err = "store failed",
-                        "failed to store recursive proof at height {h}"
+                        "failed to store local history cache at height {h}"
                     );
                 }
             }
@@ -3936,7 +3653,7 @@ async fn run_recursive_proof_updater(
                 tracing::error!(
                     next_height,
                     err = ?e,
-                    "recursive proof task panicked — skipping block"
+                    "local history cache task panicked — skipping block"
                 );
             }
         }
@@ -4060,7 +3777,7 @@ fn print_startup_banner(
         }
     };
 
-    // Recursive proof lag
+    // History proof lag
     let rec_str = match rec_proof_height {
         Some(h) if tip_height > h => format!("h={}  ({} behind)", h, tip_height - h),
         Some(h) => format!("h={h}  current"),
@@ -4131,7 +3848,7 @@ fn print_startup_banner(
         row("mining", &ylw("disabled"));
     }
 
-    // Recursive proof
+    // History proof
     row("rec proof", &dim(&rec_str));
 
     println!("{line}");
@@ -4163,7 +3880,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
     }
 }
 
-/// Parse a miner/wallet address from bech32m (`noid1…`) or legacy 64-char hex.
+/// Parse a miner/wallet address from canonical bech32m (`noid1…`).
 fn parse_address(s: &str) -> anyhow::Result<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));

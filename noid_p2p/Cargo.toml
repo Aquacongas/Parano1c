@@ -8,6 +8,7 @@ license.workspace = true
 noid_chain    = { path = "../noid_chain" }
 noid_tx       = { path = "../noid_tx" }
 noid_mempool = { path = "../noid_mempool" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
 libp2p       = { version = "0.54", features = [
     "tokio", "tcp", "noise", "yamux", "dns",
     "gossipsub", "request-response", "cbor", "identify",
@@ -19,7 +20,6 @@ libp2p       = { version = "0.54", features = [
 ] }
 libp2p-connection-limits = "0.4"
 bincode  = "1"
-blake3   = "1"
 futures  = "0.3"
 tokio      = { workspace = true }
 tracing    = { workspace = true }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Native reference model for the exact block state-transition surface.
+//! Canonical native model for the exact block state-transition surface.
 //!
 //! This module formalizes the ordered touched-slot relation used to build the
 //! exact authenticated state transition proof:
@@ -293,8 +293,8 @@ pub fn exact_action_surface_from_surface(surface: StateDeltaActionSurface) -> Ex
 /// Build a compact ordered state-delta witness and apply it to `state` on success.
 ///
 /// On `Err`, the input state is left untouched. This mirrors the atomic behavior
-/// required from consensus validation and gives the proof redesign a single native
-/// reference relation.
+/// required from consensus validation and gives the proof system a single
+/// canonical native relation.
 pub fn build_state_delta_witness(
     state: &mut SegmentedFriState,
     bodies: &[TxBody],
@@ -718,6 +718,40 @@ mod tests {
         assert_eq!(exact.spent_slots, vec![1, 5]);
         assert_eq!(exact.spends, 2);
         assert_eq!(exact.mints, 2);
+    }
+
+    #[test]
+    fn exact_surface_keeps_transient_empty_mint_spend_empty_slot() {
+        let alice = owner(0x11);
+
+        let segmented = fresh_segmented();
+        let tx0 = body(vec![], vec![mk_output(10, 123, alice)]);
+        let tx1 = body(vec![mk_input(10, 123, alice)], vec![]);
+        let bodies = vec![tx0, tx1];
+        let cs = commitments(&bodies);
+
+        let exact = build_exact_action_surface(&segmented, &bodies, &cs).unwrap();
+
+        assert_eq!(exact.spends, 1);
+        assert_eq!(exact.mints, 1);
+        assert_eq!(exact.touched_indices, vec![10]);
+        assert_eq!(exact.old_slots, vec![SlotValue::EMPTY]);
+        assert_eq!(exact.new_slots, vec![SlotValue::EMPTY]);
+        assert_eq!(exact.spent_slots, vec![10]);
+        assert_eq!(exact.actions.len(), 2);
+        assert_eq!(exact.actions[0].kind, StateDeltaActionKind::Mint);
+        assert_eq!(exact.actions[0].tx_index, 0);
+        assert_eq!(exact.actions[0].slot_index, 10);
+        assert_eq!(exact.actions[0].pre, SlotValue::EMPTY);
+        assert_eq!(
+            exact.actions[0].post,
+            slot_value_from_output(&mk_output(10, 123, alice))
+        );
+        assert_eq!(exact.actions[1].kind, StateDeltaActionKind::Spend);
+        assert_eq!(exact.actions[1].tx_index, 1);
+        assert_eq!(exact.actions[1].slot_index, 10);
+        assert_eq!(exact.actions[1].pre, exact.actions[0].post);
+        assert_eq!(exact.actions[1].post, SlotValue::EMPTY);
     }
 
     #[test]

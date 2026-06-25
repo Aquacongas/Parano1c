@@ -11,11 +11,11 @@
 //! `noid_poseidon2b::primitives::hash_tx_body` on any fixture, we have
 //! a protocol bug, not a benchmark discrepancy.
 
-use noid_air::airs::tx_body_merkle::layout::InstanceRole;
 use noid_core::{Block128, CanonicalSerialize};
 use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
 
 use crate::circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
+use crate::tx_body_layout::InstanceRole;
 
 /// Padding block pushed by a sponge `finalize()` when the absorb
 /// buffer is empty: 32-byte `[0x80, 0, ..., 0, 0x01]` split into two
@@ -49,7 +49,7 @@ impl SlotState {
 pub struct SpineWitness {
     pub slots: Vec<SlotState>,
     /// Final `tx_body_hash` as two field lanes — this is the output
-    /// cell bound via `TxBodyMerkleBoundaryPins::tx_body_hash`.
+    /// canonical tx-body hash output cell.
     pub tx_body_hash: [Block128; 2],
 }
 
@@ -64,9 +64,9 @@ impl SpineWitness {
     }
 }
 
-/// Drive the 59 permutations in post-order, producing the full
-/// witness. This is a straight-line native reference implementation
-/// and is not meant to be fast.
+/// Drive the 59 permutations in post-order, producing the full witness.
+/// This is the straight-line native witness builder and is not meant to be
+/// fast.
 pub fn evaluate_spine(circuit: &SpineCircuit, inputs: &SpineInputs) -> SpineWitness {
     let perm = Poseidon2bPermutation;
     let mut slots: Vec<SlotState> = Vec::with_capacity(circuit.slots.len());

@@ -22,9 +22,8 @@
 //!
 //! Soundness: W(r_B) is recomputed by the verifier as
 //! `Σ_i α_i · eq(r_i, r_B)`. `v_B = B(r_B)` is the reduced claim that
-//! the caller discharges — in γ₂ by a native evaluation on the
-//! concatenated boundary MLE; in γ₃ by a STARK multipoint opening on
-//! the committed boundary column.
+//! the caller discharges through either native differential checks or the
+//! composed recursive batch relation.
 //!
 //! Why a fresh primitive rather than the old per-slot degree-3 product
 //! sumcheck: the per-slot prover folded in an extra `eq(r, x)` factor
@@ -155,6 +154,44 @@ pub struct BatchEvalReduction {
     pub value: Block128,
 }
 
+/// One term in a public linear relation over a committed MLE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearEvalTerm {
+    pub point: Vec<Block128>,
+    pub coeff: Block128,
+}
+
+/// Public linear relation:
+///
+/// ```text
+/// Σ_j coeff_j * B(point_j) == value
+/// ```
+///
+/// The proof reduces many such relations to one terminal claim on `B`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearEvalClaim {
+    pub terms: Vec<LinearEvalTerm>,
+    pub value: Block128,
+}
+
+/// Sumcheck proof for a set of linear relations over one committed MLE.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinearEvalProof {
+    pub rounds: Vec<BatchEvalRound>,
+    pub b_final: Block128,
+}
+
+impl LinearEvalProof {
+    pub fn byte_len(&self) -> usize {
+        self.rounds.len() * 3 * 16 + 16
+    }
+}
+
+enum LinearEvalBinding {
+    Explicit,
+    Prebound { relation_tag: u128 },
+}
+
 /// Flat-basis fold: folds a `Vec<u128>` table in place using `clmul_gcm` (~4 ns/mul).
 /// ~7x faster than the tower-basis `fold_highest_var_par`.
 fn fold_flat(tbl: &mut Vec<u128>, r_flat: u128) {
@@ -193,9 +230,26 @@ fn build_w_table_flat(claims: &[EvalClaim], alphas: &[Block128], n: usize) -> Ve
     use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
     debug_assert_eq!(claims.len(), alphas.len());
     let len = 1usize << n;
-    claims
+
+    let mut out = vec![0u128; len];
+    let mut dense_claims = Vec::new();
+    let mut dense_alphas = Vec::new();
+    for (claim, &alpha) in claims.iter().zip(alphas.iter()) {
+        if let Some(index) = boolean_point_index(&claim.point) {
+            out[index] ^= tower_to_flat_u128(alpha.0);
+        } else {
+            dense_claims.push(claim);
+            dense_alphas.push(alpha);
+        }
+    }
+
+    if dense_claims.is_empty() {
+        return out;
+    }
+
+    let dense = dense_claims
         .par_iter()
-        .zip(alphas.par_iter())
+        .zip(dense_alphas.par_iter())
         .map(|(claim, &alpha)| {
             let alpha_flat = tower_to_flat_u128(alpha.0);
             let point_flat: Vec<u128> = claim
@@ -222,7 +276,82 @@ fn build_w_table_flat(claims: &[EvalClaim], alphas: &[Block128], n: usize) -> Ve
                 a.iter_mut().zip(b.iter()).for_each(|(ai, bi)| *ai ^= bi);
                 a
             },
-        )
+        );
+    out.iter_mut()
+        .zip(dense.iter())
+        .for_each(|(out_i, dense_i)| *out_i ^= *dense_i);
+    out
+}
+
+fn build_linear_w_table_flat(
+    claims: &[LinearEvalClaim],
+    alphas: &[Block128],
+    n: usize,
+) -> Vec<u128> {
+    use noid_core::hardware::{clmul_gcm, tower_to_flat_u128};
+    debug_assert_eq!(claims.len(), alphas.len());
+    let len = 1usize << n;
+
+    let mut out = vec![0u128; len];
+    let mut dense_terms = Vec::<(&LinearEvalTerm, Block128)>::new();
+
+    for (claim, &alpha) in claims.iter().zip(alphas.iter()) {
+        for term in &claim.terms {
+            let weighted = alpha * term.coeff;
+            if let Some(index) = boolean_point_index(&term.point) {
+                out[index] ^= tower_to_flat_u128(weighted.0);
+            } else {
+                dense_terms.push((term, weighted));
+            }
+        }
+    }
+
+    if dense_terms.is_empty() {
+        return out;
+    }
+
+    let dense = dense_terms
+        .par_iter()
+        .map(|(term, weighted)| {
+            let weighted_flat = tower_to_flat_u128(weighted.0);
+            let point_flat: Vec<u128> =
+                term.point.iter().map(|v| tower_to_flat_u128(v.0)).collect();
+            let mut eq: Vec<u128> = Vec::with_capacity(len);
+            eq.push(weighted_flat);
+            for &r_flat in &point_flat {
+                let cur = eq.len();
+                for j in 0..cur {
+                    let prod = clmul_gcm(eq[j], r_flat);
+                    eq[j] ^= prod;
+                    eq.push(prod);
+                }
+            }
+            debug_assert_eq!(eq.len(), len);
+            eq
+        })
+        .reduce(
+            || vec![0u128; len],
+            |mut a, b| {
+                a.iter_mut().zip(b.iter()).for_each(|(ai, bi)| *ai ^= bi);
+                a
+            },
+        );
+    out.iter_mut()
+        .zip(dense.iter())
+        .for_each(|(out_i, dense_i)| *out_i ^= *dense_i);
+    out
+}
+
+fn boolean_point_index(point: &[Block128]) -> Option<usize> {
+    let mut index = 0usize;
+    for (bit, value) in point.iter().enumerate() {
+        if *value == Block128::ONE {
+            index |= 1usize << bit;
+        } else if *value != Block128::ZERO {
+            return None;
+        }
+    }
+    Some(index)
 }
 
 /// Flat-basis round polynomial evaluation. Uses clmul_gcm (~4 ns/mul) vs
@@ -273,6 +402,40 @@ fn evaluate_w_at(claims: &[EvalClaim], alphas: &[Block128], r: &[Block128]) -> B
     acc
 }
 
+fn evaluate_linear_w_at(
+    claims: &[LinearEvalClaim],
+    alphas: &[Block128],
+    r: &[Block128],
+) -> Block128 {
+    debug_assert_eq!(claims.len(), alphas.len());
+    let mut acc = Block128::ZERO;
+    for (claim, &alpha) in claims.iter().zip(alphas.iter()) {
+        for term in &claim.terms {
+            debug_assert_eq!(term.point.len(), r.len());
+            let eq = if let Some(index) = boolean_point_index(&term.point) {
+                eq_at_boolean_index(index, term.point.len(), r)
+            } else {
+                eq_ind(&term.point, r)
+            };
+            acc += alpha * term.coeff * eq;
+        }
+    }
+    acc
+}
+
+fn eq_at_boolean_index(index: usize, n: usize, r: &[Block128]) -> Block128 {
+    debug_assert_eq!(r.len(), n);
+    let mut acc = Block128::ONE;
+    for (bit, &coord) in r.iter().enumerate().take(n) {
+        if (index >> bit) & 1 == 1 {
+            acc *= coord;
+        } else {
+            acc *= Block128::ONE + coord;
+        }
+    }
+    acc
+}
+
 /// Squeeze one RLC challenge per claim.
 fn squeeze_alphas<T: FiatShamir<Block128>>(channel: &mut T, m: usize) -> Vec<Block128> {
     (0..m).map(|_| channel.squeeze()).collect()
@@ -282,14 +445,81 @@ fn squeeze_alphas<T: FiatShamir<Block128>>(channel: &mut T, m: usize) -> Vec<Blo
 /// bound to the exact set of claims being batched.
 fn absorb_claims<T: FiatShamir<Block128>>(channel: &mut T, claims: &[EvalClaim]) {
     for c in claims {
-        for e in &c.point {
-            channel.absorb(*e);
+        if let Some(index) = boolean_point_index(&c.point) {
+            channel.absorb(Block128::from(CLAIM_POINT_BOOL_TAG));
+            channel.absorb(Block128::from(c.point.len() as u128));
+            channel.absorb(Block128::from(index as u128));
+        } else {
+            channel.absorb(Block128::from(CLAIM_POINT_DENSE_TAG));
+            channel.absorb(Block128::from(c.point.len() as u128));
+            for e in &c.point {
+                channel.absorb(*e);
+            }
         }
         channel.absorb(c.value);
     }
 }
 
+fn absorb_point<T: FiatShamir<Block128>>(channel: &mut T, point: &[Block128]) {
+    if let Some(index) = boolean_point_index(point) {
+        channel.absorb(Block128::from(CLAIM_POINT_BOOL_TAG));
+        channel.absorb(Block128::from(point.len() as u128));
+        channel.absorb(Block128::from(index as u128));
+    } else {
+        channel.absorb(Block128::from(CLAIM_POINT_DENSE_TAG));
+        channel.absorb(Block128::from(point.len() as u128));
+        for e in point {
+            channel.absorb(*e);
+        }
+    }
+}
+
+fn absorb_linear_claims<T: FiatShamir<Block128>>(channel: &mut T, claims: &[LinearEvalClaim]) {
+    channel.absorb(Block128::from(LINEAR_EVAL_TAG));
+    channel.absorb(Block128::from(claims.len() as u128));
+    for claim in claims {
+        channel.absorb(Block128::from(claim.terms.len() as u128));
+        for term in &claim.terms {
+            channel.absorb(term.coeff);
+            absorb_point(channel, &term.point);
+        }
+        channel.absorb(claim.value);
+    }
+}
+
+fn absorb_linear_claims_prebound<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    relation_tag: u128,
+    n: usize,
+    claims: &[LinearEvalClaim],
+) {
+    let total_terms: usize = claims.iter().map(|claim| claim.terms.len()).sum();
+    channel.absorb(Block128::from(LINEAR_EVAL_PREBOUND_TAG));
+    channel.absorb(Block128::from(relation_tag));
+    channel.absorb(Block128::from(n as u128));
+    channel.absorb(Block128::from(claims.len() as u128));
+    channel.absorb(Block128::from(total_terms as u128));
+}
+
+fn absorb_linear_binding<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    binding: &LinearEvalBinding,
+    n: usize,
+    claims: &[LinearEvalClaim],
+) {
+    match *binding {
+        LinearEvalBinding::Explicit => absorb_linear_claims(channel, claims),
+        LinearEvalBinding::Prebound { relation_tag } => {
+            absorb_linear_claims_prebound(channel, relation_tag, n, claims)
+        }
+    }
+}
+
 const MULTI_BATCH_EVAL_TAG: u128 = 0xA07D_6B12_BA7C_0001;
+const CLAIM_POINT_BOOL_TAG: u128 = 0xA07D_6B12_C1A1_0001;
+const CLAIM_POINT_DENSE_TAG: u128 = 0xA07D_6B12_C1A1_0002;
+const LINEAR_EVAL_TAG: u128 = 0xA07D_6B12_11EA_0001;
+const LINEAR_EVAL_PREBOUND_TAG: u128 = 0xA07D_6B12_11EA_0002;
 
 fn absorb_multi_claims<T: FiatShamir<Block128>>(
     channel: &mut T,
@@ -325,6 +555,14 @@ fn initial_multi_claim(
         }
     }
     claim
+}
+
+fn initial_linear_claim(claims: &[LinearEvalClaim], alphas: &[Block128]) -> Block128 {
+    claims
+        .iter()
+        .zip(alphas.iter())
+        .map(|(claim, &alpha)| alpha * claim.value)
+        .fold(Block128::ZERO, |a, b| a + b)
 }
 
 /// Honest prover.
@@ -460,6 +698,184 @@ pub fn verify_batch_eval<T: FiatShamir<Block128>>(
 
     // Final check: claim == W(r_B) · b_final.
     let w_at = evaluate_w_at(claims, &alphas, &challenges);
+    if claim != w_at * proof.b_final {
+        return None;
+    }
+
+    Some(BatchEvalReduction {
+        point: challenges,
+        value: proof.b_final,
+    })
+}
+
+/// Honest prover for public linear relations over one committed MLE.
+pub fn prove_linear_eval<T: FiatShamir<Block128>>(
+    b: &[Block128],
+    claims: &[LinearEvalClaim],
+    channel: &mut T,
+) -> (LinearEvalProof, BatchEvalReduction) {
+    prove_linear_eval_inner(b, claims, channel, LinearEvalBinding::Explicit)
+}
+
+/// Honest prover for public linear relations whose full constraint set is
+/// deterministically derived from already-absorbed public statement data.
+///
+/// This mode is for large relations such as Merkle path-chain continuity where
+/// serializing every Boolean point into the Fiat-Shamir channel would dominate
+/// verification. The caller must ensure the public statement defining `claims`
+/// was absorbed before this call, and must use a unique `relation_tag`.
+pub fn prove_linear_eval_prebound<T: FiatShamir<Block128>>(
+    b: &[Block128],
+    claims: &[LinearEvalClaim],
+    relation_tag: u128,
+    channel: &mut T,
+) -> (LinearEvalProof, BatchEvalReduction) {
+    prove_linear_eval_inner(
+        b,
+        claims,
+        channel,
+        LinearEvalBinding::Prebound { relation_tag },
+    )
+}
+
+fn prove_linear_eval_inner<T: FiatShamir<Block128>>(
+    b: &[Block128],
+    claims: &[LinearEvalClaim],
+    channel: &mut T,
+    binding: LinearEvalBinding,
+) -> (LinearEvalProof, BatchEvalReduction) {
+    let n = b.len().trailing_zeros() as usize;
+    assert_eq!(b.len(), 1 << n);
+    assert!(!claims.is_empty());
+    for claim in claims {
+        assert!(!claim.terms.is_empty());
+        for term in &claim.terms {
+            assert_eq!(term.point.len(), n);
+        }
+    }
+
+    absorb_linear_binding(channel, &binding, n, claims);
+    let alphas = squeeze_alphas(channel, claims.len());
+    let mut claim = initial_linear_claim(claims, &alphas);
+    let mut w_flat = build_linear_w_table_flat(claims, &alphas, n);
+    let mut b_flat: Vec<u128> = {
+        use noid_core::hardware::tower_to_flat_u128;
+        if b.len() >= 4096 {
+            b.par_iter().map(|v| tower_to_flat_u128(v.0)).collect()
+        } else {
+            b.iter().map(|v| tower_to_flat_u128(v.0)).collect()
+        }
+    };
+
+    let mut rounds = Vec::with_capacity(n);
+    let mut challenges = Vec::with_capacity(n);
+
+    for _round in 0..n {
+        let half = w_flat.len() / 2;
+        let evals_flat = eval_round_flat(&w_flat, &b_flat, half);
+        let evals: [Block128; 3] =
+            evals_flat.map(|v| Block128::from(noid_core::hardware::flat_to_tower_u128(v)));
+        let re = BatchEvalRound { evals };
+        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
+
+        for e in &re.evals {
+            channel.absorb(*e);
+        }
+        let r_i = channel.squeeze();
+        let r_i_flat = noid_core::hardware::tower_to_flat_u128(r_i.0);
+
+        claim = re.evaluate(r_i);
+        fold_flat(&mut w_flat, r_i_flat);
+        fold_flat_zeroing_truncated(&mut b_flat, r_i_flat);
+
+        rounds.push(re);
+        challenges.push(r_i);
+    }
+
+    debug_assert_eq!(w_flat.len(), 1);
+    debug_assert_eq!(b_flat.len(), 1);
+    let b_final = Block128::from(noid_core::hardware::flat_to_tower_u128(b_flat[0]));
+    let w_final = Block128::from(noid_core::hardware::flat_to_tower_u128(w_flat[0]));
+    debug_assert_eq!(claim, w_final * b_final);
+    w_flat.zeroize();
+    b_flat.zeroize();
+
+    challenges.reverse();
+    let proof = LinearEvalProof { rounds, b_final };
+    let reduction = BatchEvalReduction {
+        point: challenges,
+        value: b_final,
+    };
+    (proof, reduction)
+}
+
+/// Verifier for [`prove_linear_eval`].
+pub fn verify_linear_eval<T: FiatShamir<Block128>>(
+    proof: &LinearEvalProof,
+    claims: &[LinearEvalClaim],
+    n: usize,
+    channel: &mut T,
+) -> Option<BatchEvalReduction> {
+    verify_linear_eval_inner(proof, claims, n, channel, LinearEvalBinding::Explicit)
+}
+
+/// Verifier for [`prove_linear_eval_prebound`].
+pub fn verify_linear_eval_prebound<T: FiatShamir<Block128>>(
+    proof: &LinearEvalProof,
+    claims: &[LinearEvalClaim],
+    n: usize,
+    relation_tag: u128,
+    channel: &mut T,
+) -> Option<BatchEvalReduction> {
+    verify_linear_eval_inner(
+        proof,
+        claims,
+        n,
+        channel,
+        LinearEvalBinding::Prebound { relation_tag },
+    )
+}
+
+fn verify_linear_eval_inner<T: FiatShamir<Block128>>(
+    proof: &LinearEvalProof,
+    claims: &[LinearEvalClaim],
+    n: usize,
+    channel: &mut T,
+    binding: LinearEvalBinding,
+) -> Option<BatchEvalReduction> {
+    if claims.is_empty() || proof.rounds.len() != n {
+        return None;
+    }
+    for claim in claims {
+        if claim.terms.is_empty() {
+            return None;
+        }
+        for term in &claim.terms {
+            if term.point.len() != n {
+                return None;
+            }
+        }
+    }
+
+    absorb_linear_binding(channel, &binding, n, claims);
+    let alphas = squeeze_alphas(channel, claims.len());
+    let mut claim = initial_linear_claim(claims, &alphas);
+
+    let mut challenges = Vec::with_capacity(n);
+    for re in &proof.rounds {
+        if re.sum_at_0_plus_1() != claim {
+            return None;
+        }
+        for e in &re.evals {
+            channel.absorb(*e);
+        }
+        let r_i = channel.squeeze();
+        claim = re.evaluate(r_i);
+        challenges.push(r_i);
+    }
+    challenges.reverse();
+
+    let w_at = evaluate_linear_w_at(claims, &alphas, &challenges);
     if claim != w_at * proof.b_final {
         return None;
     }
@@ -734,6 +1150,98 @@ mod tests {
             assert_eq!(red.value, evaluate_slice(col, &red.point));
         }
         assert!(red_v.windows(2).all(|w| w[0].point == w[1].point));
+    }
+
+    #[test]
+    fn honest_linear_eval_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(44);
+        let n = 5;
+        let b = rand_vec(&mut rng, 1 << n);
+        let p0 = rand_vec(&mut rng, n);
+        let p1 = rand_vec(&mut rng, n);
+        let c0 = Block128::from(7u128);
+        let c1 = Block128::from(11u128);
+        let value = c0 * evaluate_slice(&b, &p0) + c1 * evaluate_slice(&b, &p1);
+        let claims = vec![LinearEvalClaim {
+            terms: vec![
+                LinearEvalTerm {
+                    point: p0,
+                    coeff: c0,
+                },
+                LinearEvalTerm {
+                    point: p1,
+                    coeff: c1,
+                },
+            ],
+            value,
+        }];
+
+        let mut cp = fresh_channel(101);
+        let (proof, red_p) = prove_linear_eval(&b, &claims, &mut cp);
+        let mut cv = fresh_channel(101);
+        let red_v = verify_linear_eval(&proof, &claims, n, &mut cv).unwrap();
+
+        assert_eq!(red_p, red_v);
+        assert_eq!(red_v.value, evaluate_slice(&b, &red_v.point));
+    }
+
+    #[test]
+    fn linear_eval_tampered_value_rejected() {
+        let mut rng = StdRng::seed_from_u64(45);
+        let n = 5;
+        let b = rand_vec(&mut rng, 1 << n);
+        let point = rand_vec(&mut rng, n);
+        let claims = vec![LinearEvalClaim {
+            terms: vec![LinearEvalTerm {
+                point: point.clone(),
+                coeff: Block128::ONE,
+            }],
+            value: evaluate_slice(&b, &point),
+        }];
+
+        let mut cp = fresh_channel(102);
+        let (proof, _) = prove_linear_eval(&b, &claims, &mut cp);
+        let mut bad_claims = claims.clone();
+        bad_claims[0].value += Block128::ONE;
+
+        let mut cv = fresh_channel(102);
+        assert!(verify_linear_eval(&proof, &bad_claims, n, &mut cv).is_none());
+    }
+
+    #[test]
+    fn prebound_linear_eval_relation_tag_is_binding() {
+        let mut rng = StdRng::seed_from_u64(46);
+        let n = 4;
+        let b = rand_vec(&mut rng, 1 << n);
+        let point = (0..n)
+            .map(|bit| {
+                if bit % 2 == 0 {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                }
+            })
+            .collect::<Vec<_>>();
+        let claims = vec![LinearEvalClaim {
+            terms: vec![LinearEvalTerm {
+                point: point.clone(),
+                coeff: Block128::ONE,
+            }],
+            value: evaluate_slice(&b, &point),
+        }];
+
+        let mut cp = fresh_channel(103);
+        let (proof, red_p) = prove_linear_eval_prebound(&b, &claims, 0xAA55, &mut cp);
+        let mut cv = fresh_channel(103);
+        let red_v = verify_linear_eval_prebound(&proof, &claims, n, 0xAA55, &mut cv)
+            .expect("matching relation tag accepts");
+        assert_eq!(red_p, red_v);
+
+        let mut cv_bad = fresh_channel(103);
+        assert!(
+            verify_linear_eval_prebound(&proof, &claims, n, 0xAA56, &mut cv_bad).is_none(),
+            "changed relation tag must alter Fiat-Shamir challenges"
+        );
     }
 
     #[test]

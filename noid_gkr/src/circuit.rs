@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Typed topology description of the 59-slot tx-body Merkle Poseidon2b
-//! spine. Sourced from the existing layout module in
-//! `noid_air::airs::tx_body_merkle::layout` — this crate never
-//! duplicates the layout, it reads it.
+//! Typed topology description of the 59-slot tx-body Merkle Poseidon2b spine.
 //!
 //! The topology is static: 4 input leaves (3 perms each) + 8 output
 //! leaves (2 each) + 15 compress nodes (2 each) + 1 wrap = 59 slots,
@@ -13,7 +10,7 @@
 //! pre-MDS seed as `prev_output XOR absorb_block`; head slots take it
 //! as `[absorb_block, capacity_iv]` for the slot's role.
 
-use noid_air::airs::tx_body_merkle::layout::{
+use crate::tx_body_layout::{
     build_instance_layout, InstanceMeta, InstanceRole, N_INSTANCES, TREE_LEAF_INPUT_BASE,
     TREE_LEAF_OUTPUT_BASE, TXBODY_N_INPUT_LEAVES, TXBODY_N_OUTPUT_LEAVES,
 };
@@ -27,9 +24,9 @@ use noid_poseidon2b::native::domain::{
 /// output or from an external boundary source (leaf payload / IV).
 #[derive(Debug, Clone, Copy)]
 pub struct SlotDescriptor {
-    /// Instance id in `0..N_INSTANCES` (matches the AIR layout).
+    /// Instance id in `0..N_INSTANCES` (matches the canonical tx-body layout).
     pub id: usize,
-    /// Original `InstanceRole` from the AIR layout.
+    /// Canonical tx-body layout role.
     pub role: InstanceRole,
     /// Capacity IV used at the head of the sub-sponge this slot lives
     /// in. Every slot under the same sub-sponge shares one IV; we
@@ -154,7 +151,6 @@ pub const fn output_tree_leaf(leaf_slot: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_air::airs::tx_body_merkle::layout::N_INSTANCES;
 
     #[test]
     fn build_has_59_slots_with_one_wrap() {

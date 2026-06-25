@@ -44,6 +44,12 @@ use std::path::Path;
 use crate::block::{apply_state_delta, Block};
 use crate::block_header::BlockHeader;
 use crate::chain_context::ChainContext;
+use crate::checkpoint::{
+    checkpoint_payload_root, CheckpointCoverage, CheckpointSegmentPayload,
+    ImmutableCheckpointManifest, ImmutableCheckpointPackage, CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN,
+    CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN, CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN,
+    CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN, CHECKPOINT_VERSION,
+};
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
     difficulty::{add_work, block_work},
@@ -52,12 +58,15 @@ use crate::consensus::{
         ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET,
         MEDIAN_TIME_BLOCKS,
     },
-    pow::full_block_hash,
+    pow::block_id,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
+use crate::exact_state_hash::composite_state_root;
+use crate::reuse_guard::REUSE_GUARD_BUCKETS;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
+use crate::storage::serial::encode_segment;
 use crate::storage::{ConsensusMeta, FinalizedCheckpoint, MdbxStore, StoreError};
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -158,7 +167,7 @@ impl MdbxChainContext {
     /// once (provider outage), each resumes from its own verified local state instead
     /// of requiring peers to serve a snapshot that nobody has.
     ///
-    /// T_HEADERS, T_HASH_TO_HEIGHT, and T_RECURSIVE_PROOF are always preserved.
+    /// Headers, hash-to-height indexes, and the local history cache are always preserved.
     pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError> {
         let store = MdbxStore::open(path)?;
 
@@ -254,7 +263,7 @@ impl MdbxChainContext {
                     .recent_headers
                     .get(&0)
                     .expect("easy genesis header must exist");
-                let genesis_hash = full_block_hash(&genesis);
+                let genesis_hash = block_id(&genesis);
                 let meta = ConsensusMeta {
                     tip_height: 0,
                     tip_hash: genesis_hash,
@@ -283,7 +292,7 @@ impl MdbxChainContext {
         use crate::consensus::genesis::genesis_header;
 
         let genesis = genesis_header();
-        let genesis_hash = full_block_hash(&genesis);
+        let genesis_hash = block_id(&genesis);
         let meta = ConsensusMeta {
             tip_height: 0,
             tip_hash: genesis_hash,
@@ -365,7 +374,7 @@ impl MdbxChainContext {
         let tip_hdr = store
             .get_header(tip_height)?
             .ok_or(MdbxContextError::Corrupt("tip header missing from store"))?;
-        if full_block_hash(&tip_hdr) != tip_hash {
+        if block_id(&tip_hdr) != tip_hash {
             return Err(MdbxContextError::Corrupt(
                 "tip hash mismatch with persisted tip header",
             ));
@@ -376,7 +385,7 @@ impl MdbxChainContext {
                 .ok_or(MdbxContextError::Corrupt(
                     "finalized header missing from store",
                 ))?;
-        if full_block_hash(&finalized_hdr) != finalized.hash {
+        if block_id(&finalized_hdr) != finalized.hash {
             return Err(MdbxContextError::Corrupt(
                 "finalized hash mismatch with persisted finalized header",
             ));
@@ -432,7 +441,7 @@ impl MdbxChainContext {
                 ))?;
         Ok(FinalizedCheckpoint {
             height: finalized_height,
-            hash: full_block_hash(&header),
+            hash: block_id(&header),
         })
     }
 
@@ -459,7 +468,7 @@ impl MdbxChainContext {
 
         let tx_hashes: Vec<TxBodyHash> =
             block.transactions.iter().map(|t| t.tx_body_hash).collect();
-        let block_hash = full_block_hash(&block.header);
+        let block_hash = block_id(&block.header);
         let new_tip_chain_work = add_work(
             &self.tip_chain_work,
             &block_work(&block.header.difficulty_target),
@@ -514,10 +523,10 @@ impl MdbxChainContext {
     ///
     /// For user-transaction blocks, `validate_and_apply` must verify the full
     /// network `BlockProof` against the pre-block state and mutate `state` to the
-    /// post-block state (the node passes `noid_block::validate_block_from_network`).
+    /// post-block state (the node passes `noid_block::accept_block`).
     /// The sequential interpreter is not a second production validity source.
     /// Coinbase-only blocks are the sole no-proof exception, but they still go
-    /// through this same method: proof/header stub binding, cheap consensus checks,
+    /// through this same method: detached-proof presence checks, cheap consensus checks,
     /// `apply_state_delta`, then atomic commit.
     pub fn apply_next_block<F, E>(
         &mut self,
@@ -549,6 +558,11 @@ impl MdbxChainContext {
                     "coinbase-only proof binding invalid: {e}"
                 )))
             })?;
+            if !block_auth_sidecar_bytes.is_empty() {
+                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                    "coinbase-only block unexpectedly carried auth sidecar bytes".to_string(),
+                )));
+            }
         }
 
         let parent = *self.tip_header();
@@ -610,6 +624,236 @@ impl MdbxChainContext {
     }
 
     // -----------------------------------------------------------------------
+    // Immutable checkpoint generation
+    // -----------------------------------------------------------------------
+
+    /// Generate and persist an immutable local checkpoint package for the
+    /// current hard-finalized height.
+    ///
+    /// This is not an alternate block acceptance path. It records an already
+    /// accepted finalized prefix and fails closed if any retained body/proof/
+    /// sidecar data needed by the package is missing.
+    pub fn generate_immutable_checkpoint(
+        &mut self,
+    ) -> Result<ImmutableCheckpointPackage, MdbxContextError> {
+        self.generate_immutable_checkpoint_at(self.finalized.height)
+    }
+
+    pub fn generate_immutable_checkpoint_at(
+        &mut self,
+        height: u64,
+    ) -> Result<ImmutableCheckpointPackage, MdbxContextError> {
+        if height != self.finalized.height {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint generation requires the latest finalized height",
+            ));
+        }
+        if height > self.tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint height is above canonical tip",
+            ));
+        }
+        if self.tip_height.saturating_sub(height) > CONSENSUS_FINALITY_DEPTH {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint height is outside retained undo window",
+            ));
+        }
+
+        let header = self
+            .get_header_from_store(height)?
+            .ok_or(MdbxContextError::Corrupt("checkpoint header missing"))?;
+        let block_hash = block_id(&header);
+        if block_hash != self.finalized.hash {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint finalized hash mismatch",
+            ));
+        }
+        let cumulative_chainwork = self
+            .store
+            .get_chain_work(height)?
+            .ok_or(MdbxContextError::Corrupt("checkpoint chainwork missing"))?;
+
+        let checkpoint_state = self.reconstruct_state_at_height(height)?;
+        let guard_root = checkpoint_state.reuse_guard.root();
+        let state_root =
+            composite_state_root(header.log_slots, checkpoint_state.utxo_root, guard_root);
+        if state_root != header.state_root {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint reconstructed state_root mismatch",
+            ));
+        }
+        if checkpoint_state.state.log_slots() as u32 != header.log_slots {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint reconstructed log_slots mismatch",
+            ));
+        }
+        if checkpoint_state.active_slot_count != header.active_slot_count {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint reconstructed active_slot_count mismatch",
+            ));
+        }
+        if checkpoint_state.alloc_counter != header.alloc_counter {
+            return Err(MdbxContextError::Corrupt(
+                "checkpoint reconstructed alloc_counter mismatch",
+            ));
+        }
+
+        let (segments, segment_payload_root) =
+            checkpoint_segments_and_root(checkpoint_state.clone());
+        let (covered_from, covered_to, block_body_root, block_proof_root, block_auth_sidecar_root) =
+            self.checkpoint_payload_roots(height)?;
+
+        let reuse_guard_buckets = checkpoint_state.reuse_guard.buckets().to_vec();
+        let manifest = ImmutableCheckpointManifest {
+            version: CHECKPOINT_VERSION,
+            height,
+            block_hash,
+            cumulative_chainwork,
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            utxo_root: checkpoint_state.utxo_root,
+            guard_root,
+            state_root,
+            covered_from,
+            covered_to,
+            block_body_root,
+            block_proof_root,
+            block_auth_sidecar_root,
+            segment_payload_root,
+            segment_count: segments.len() as u32,
+            reuse_guard_bucket_count: REUSE_GUARD_BUCKETS as u32,
+        };
+        let package = ImmutableCheckpointPackage {
+            manifest,
+            segments,
+            reuse_guard_buckets,
+        };
+        let coverage = CheckpointCoverage {
+            checkpoint_id: package.checkpoint_id(),
+            height,
+            block_hash,
+            covered_from,
+            covered_to,
+            history_proof_covered_to: None,
+        };
+        self.store
+            .put_checkpoint_package_and_coverage(&package, &coverage)?;
+        Ok(package)
+    }
+
+    fn reconstruct_state_at_height(&mut self, height: u64) -> Result<ChainState, MdbxContextError> {
+        self.preload_all_evicted_segments()?;
+        let mut checkpoint_state = self.state.clone();
+        for h in (height + 1..=self.tip_height).rev() {
+            let undo = self
+                .store
+                .get_undo_log(h)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "checkpoint reconstruction undo log missing",
+                ))?;
+            revert_block(&mut checkpoint_state.state, &undo);
+            crate::consensus::reorg::revert_state_counters(&mut checkpoint_state, &undo);
+            crate::consensus::reorg::revert_reuse_guard(&mut checkpoint_state, &undo);
+        }
+        checkpoint_state
+            .rebuild_exact_utxo_root_loaded()
+            .map_err(|_| MdbxContextError::Corrupt("checkpoint exact root rebuild failed"))?;
+        Ok(checkpoint_state)
+    }
+
+    fn checkpoint_payload_roots(
+        &self,
+        height: u64,
+    ) -> Result<(u64, u64, [u8; 32], [u8; 32], [u8; 32]), MdbxContextError> {
+        if height == 0 {
+            return Ok((
+                1,
+                0,
+                checkpoint_payload_root(
+                    CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN,
+                    std::iter::empty::<(u64, Vec<u8>)>(),
+                ),
+                checkpoint_payload_root(
+                    CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN,
+                    std::iter::empty::<(u64, Vec<u8>)>(),
+                ),
+                checkpoint_payload_root(
+                    CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN,
+                    std::iter::empty::<(u64, Vec<u8>)>(),
+                ),
+            ));
+        }
+
+        let mut body_leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut proof_leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut sidecar_leaves: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        for h in 1..=height {
+            let body = self
+                .store
+                .get_recent_block(h)?
+                .ok_or(MdbxContextError::Corrupt("checkpoint block body missing"))?;
+            let block = Block::from_bytes(&body)
+                .map_err(|_| MdbxContextError::Corrupt("checkpoint block body decode failed"))?;
+            let header = self
+                .get_header_from_store(h)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "checkpoint payload header missing",
+                ))?;
+            if block.header != header || block.header.height != h {
+                return Err(MdbxContextError::Corrupt(
+                    "checkpoint block body/header mismatch",
+                ));
+            }
+
+            let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+            let proof = self.store.get_block_proof(h)?;
+            let sidecar = self.store.get_block_auth_sidecar(h)?;
+            let proof_bytes = match (has_user_txs, proof) {
+                (true, Some(bytes)) if !bytes.is_empty() => bytes,
+                (true, _) => {
+                    return Err(MdbxContextError::Corrupt(
+                        "checkpoint user block proof missing",
+                    ))
+                }
+                (false, Some(bytes)) if !bytes.is_empty() => {
+                    return Err(MdbxContextError::Corrupt(
+                        "checkpoint coinbase block has unexpected proof bytes",
+                    ))
+                }
+                (false, _) => Vec::new(),
+            };
+            let sidecar_bytes = match (has_user_txs, sidecar) {
+                (true, Some(bytes)) if !bytes.is_empty() => bytes,
+                (true, _) => {
+                    return Err(MdbxContextError::Corrupt(
+                        "checkpoint user block auth sidecar missing",
+                    ))
+                }
+                (false, Some(bytes)) if !bytes.is_empty() => {
+                    return Err(MdbxContextError::Corrupt(
+                        "checkpoint coinbase block has unexpected auth sidecar bytes",
+                    ))
+                }
+                (false, _) => Vec::new(),
+            };
+
+            body_leaves.push((h, body));
+            proof_leaves.push((h, proof_bytes));
+            sidecar_leaves.push((h, sidecar_bytes));
+        }
+
+        Ok((
+            1,
+            height,
+            checkpoint_payload_root(CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN, body_leaves),
+            checkpoint_payload_root(CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN, proof_leaves),
+            checkpoint_payload_root(CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN, sidecar_leaves),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
     // Chain reorganization (MDBX-backed)
     // -----------------------------------------------------------------------
 
@@ -621,7 +865,7 @@ impl MdbxChainContext {
     pub fn find_ancestor_height(&self, hash: &[u8; 32]) -> Option<u64> {
         // Search recent_headers first (fast path in RAM).
         for (height, header) in &self.recent_headers {
-            if &full_block_hash(header) == hash {
+            if &block_id(header) == hash {
                 return Some(*height);
             }
         }
@@ -641,7 +885,7 @@ impl MdbxChainContext {
     /// 3. Applies `new_blocks` on top of `ancestor_height` through the caller's
     ///    proof-native applier. The node passes a closure that calls this type's
     ///    single production `apply_next_block` method with the matching `BlockProof`
-    ///    bytes and `noid_block::validate_block_from_network`.
+    ///    bytes and `noid_block::accept_block`.
     ///
     /// Returns the hashes of reclaimed transactions for mempool re-admission.
     ///
@@ -683,7 +927,7 @@ impl MdbxChainContext {
                     .ok_or(MdbxContextError::Corrupt(
                         "finalized ancestor header missing",
                     ))?;
-            if full_block_hash(&ancestor_header) != self.finalized.hash {
+            if block_id(&ancestor_header) != self.finalized.hash {
                 tracing::warn!(
                     ancestor_height,
                     "reorg rejected: finalized checkpoint hash mismatch"
@@ -797,7 +1041,7 @@ impl MdbxChainContext {
                 ))?;
 
         self.tip_height = ancestor_height;
-        self.tip_hash = full_block_hash(&ancestor_header);
+        self.tip_hash = block_id(&ancestor_header);
         self.tip_chain_work = ancestor_chain_work;
 
         // -----------------------------------------------------------------------
@@ -891,7 +1135,7 @@ impl MdbxChainContext {
             .map(|(id, eff, cols)| (*id, *eff, cols))
             .collect();
 
-        let ancestor_hash = full_block_hash(ancestor_header);
+        let ancestor_hash = block_id(ancestor_header);
         let consensus_meta = ConsensusMeta {
             tip_height: ancestor_header.height,
             tip_hash: ancestor_hash,
@@ -1001,11 +1245,11 @@ impl MdbxChainContext {
 
     /// Apply a full state snapshot received from a peer during initial sync.
     ///
-    /// FIX1 fail-closed policy: public arbitrary-peer snapshots are disabled until
-    /// immutable exact-height checkpoint generations and the real recursive verifier
-    /// are implemented. Installing a snapshot here would otherwise require exact
-    /// persisted chainwork, finalized checkpoint compatibility, and atomic
-    /// metadata replacement.
+    /// Public arbitrary-peer snapshots are disabled until immutable exact-height
+    /// checkpoint generations and the history proof verifier are authority.
+    /// Installing a snapshot here would otherwise require exact persisted
+    /// chainwork, finalized checkpoint compatibility, and atomic metadata
+    /// replacement.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_state_snapshot<I>(
         &mut self,
@@ -1061,7 +1305,7 @@ impl MdbxChainContext {
     /// `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` (≥ EXPANSION_WINDOW) blocks.
     pub fn prev_active_counts(&self) -> Vec<u64> {
         let tip = self.tip_height;
-        let start = tip.saturating_sub(EXPANSION_WINDOW);
+        let start = tip.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
         (start..=tip)
             .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.active_slot_count))
             .collect()
@@ -1090,7 +1334,7 @@ impl MdbxChainContext {
         (lo..=tip_height).any(|h| {
             self.recent_headers
                 .get(&h)
-                .map(|hdr| full_block_hash(hdr) == *anchor_hash)
+                .map(|hdr| block_id(hdr) == *anchor_hash)
                 .unwrap_or(false)
         })
     }
@@ -1109,6 +1353,32 @@ impl MdbxChainContext {
     }
 }
 
+fn checkpoint_segments_and_root(
+    mut state: ChainState,
+) -> (Vec<CheckpointSegmentPayload>, [u8; 32]) {
+    let eff_log = state.state.effective_log_segment_size() as u8;
+    let active_segments: Vec<u16> = state.state.active_segment_ids().collect();
+    let mut segments = Vec::with_capacity(active_segments.len());
+
+    for segment_id in active_segments {
+        let cols = state.state.segment_columns_for_persistence(segment_id);
+        let encoded_segment = encode_segment(&cols, eff_log);
+        segments.push(CheckpointSegmentPayload {
+            segment_id,
+            effective_log_segment_size: eff_log,
+            encoded_segment,
+        });
+    }
+
+    let root = checkpoint_payload_root(
+        CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN,
+        segments
+            .iter()
+            .map(|segment| (segment.segment_id as u64, segment.encoded_segment.clone())),
+    );
+    (segments, root)
+}
+
 // The old `ApplySegmentColumns` extension trait has been removed.
 // Segment restore now uses `SegmentedFriState::set_segment_columns` directly,
 // which is faster (O(1) per segment vs O(n) slot-by-slot), correct about dirty
@@ -1123,7 +1393,7 @@ mod tests {
     use super::*;
     use crate::block::{compute_tx_root, Block};
     use crate::block_header::BlockHeader;
-    use crate::consensus::{params::BLOCK_TIME, pow::full_block_hash};
+    use crate::consensus::{params::BLOCK_TIME, pow::block_id};
     use noid_poseidon2b::primitives::Address;
 
     fn build_empty_block_on(ctx: &mut MdbxChainContext) -> Block {
@@ -1134,7 +1404,7 @@ mod tests {
         // Use TEST_TARGET so nonce=0 trivially satisfies PoW.
         // ASERT with perfect BLOCK_TIME timing returns TEST_TARGET → consistent.
         let header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: new_root,
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -1142,8 +1412,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
@@ -1159,10 +1427,20 @@ mod tests {
         block: &Block,
         local_time: u64,
     ) -> Result<[u8; 32], MdbxContextError> {
+        apply_coinbase_only_with_witness_for_test(ctx, block, &[], &[], local_time)
+    }
+
+    fn apply_coinbase_only_with_witness_for_test(
+        ctx: &mut MdbxChainContext,
+        block: &Block,
+        block_proof_bytes: &[u8],
+        block_auth_sidecar_bytes: &[u8],
+        local_time: u64,
+    ) -> Result<[u8; 32], MdbxContextError> {
         ctx.apply_next_block(
             block,
-            &[],
-            &[],
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
             local_time,
             |_block,
              _proof_bytes,
@@ -1205,6 +1483,52 @@ mod tests {
             let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             assert_eq!(ctx.tip_height(), 1, "tip must survive restart");
         }
+    }
+
+    #[test]
+    fn invalid_detached_witness_does_not_poison_semantic_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let initial_tip_hash = ctx.tip_hash();
+        let block = build_empty_block_on(&mut ctx);
+        let block_hash = block_id(&block.header);
+        let ts = block.header.timestamp + 1;
+
+        let invalid_proof = apply_coinbase_only_with_witness_for_test(
+            &mut ctx,
+            &block,
+            b"invalid detached proof",
+            &[],
+            ts,
+        );
+        assert!(
+            invalid_proof.is_err(),
+            "coinbase-only block must reject unexpected proof bytes"
+        );
+        assert_eq!(ctx.tip_height(), 0);
+        assert_eq!(ctx.tip_hash(), initial_tip_hash);
+        assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
+        assert_eq!(block_id(&block.header), block_hash);
+
+        let invalid_sidecar = apply_coinbase_only_with_witness_for_test(
+            &mut ctx,
+            &block,
+            &[],
+            b"invalid auth sidecar",
+            ts,
+        );
+        assert!(
+            invalid_sidecar.is_err(),
+            "coinbase-only block must reject unexpected auth sidecar bytes"
+        );
+        assert_eq!(ctx.tip_height(), 0);
+        assert_eq!(ctx.tip_hash(), initial_tip_hash);
+
+        let accepted = apply_coinbase_only_for_test(&mut ctx, &block, ts)
+            .expect("same semantic block must accept with valid detached witness");
+        assert_eq!(ctx.tip_height(), 1);
+        assert_eq!(block_id(ctx.tip_header()), block_hash);
+        assert_eq!(accepted, block.header.state_root);
     }
 
     #[test]
@@ -1276,6 +1600,95 @@ mod tests {
             ctx.store.get_consensus_meta().unwrap().unwrap().finalized,
             expected_finalized
         );
+    }
+
+    #[test]
+    fn genesis_checkpoint_package_has_empty_payload_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let package = ctx.generate_immutable_checkpoint().unwrap();
+
+        assert_eq!(package.manifest.height, 0);
+        assert_eq!(package.manifest.covered_from, 1);
+        assert_eq!(package.manifest.covered_to, 0);
+        assert_eq!(package.manifest.segment_count, 0);
+        assert_eq!(
+            package.manifest.block_body_root,
+            checkpoint_payload_root(
+                CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN,
+                std::iter::empty::<(u64, Vec<u8>)>(),
+            )
+        );
+        assert_eq!(package.reuse_guard_buckets.len(), REUSE_GUARD_BUCKETS);
+        assert_eq!(
+            ctx.store.get_checkpoint_coverage().unwrap().unwrap().height,
+            0
+        );
+    }
+
+    #[test]
+    fn immutable_checkpoint_package_persists_after_restart() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_id;
+        let checkpoint_height;
+
+        {
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
+                let block = build_empty_block_on(&mut ctx);
+                apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+            }
+            let package = ctx.generate_immutable_checkpoint().unwrap();
+            checkpoint_id = package.checkpoint_id();
+            checkpoint_height = package.manifest.height;
+
+            assert_eq!(checkpoint_height, ctx.finalized_checkpoint().height);
+            assert_eq!(package.manifest.covered_from, 1);
+            assert_eq!(package.manifest.covered_to, checkpoint_height);
+            assert_eq!(package.manifest.segment_count, 0);
+
+            let coverage = ctx.store.get_checkpoint_coverage().unwrap().unwrap();
+            assert_eq!(coverage.checkpoint_id, checkpoint_id);
+            assert_eq!(coverage.height, checkpoint_height);
+            assert_eq!(coverage.history_proof_covered_to, None);
+        }
+
+        {
+            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            let package = ctx
+                .store
+                .get_checkpoint_package(checkpoint_height)
+                .unwrap()
+                .expect("checkpoint package must survive restart");
+            let coverage = ctx
+                .store
+                .get_checkpoint_coverage()
+                .unwrap()
+                .expect("checkpoint coverage must survive restart");
+            assert_eq!(package.checkpoint_id(), checkpoint_id);
+            assert_eq!(coverage.checkpoint_id, checkpoint_id);
+        }
+    }
+
+    #[test]
+    fn checkpoint_generation_rejects_non_latest_finalized_height() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
+            let block = build_empty_block_on(&mut ctx);
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+        }
+
+        assert!(matches!(
+            ctx.generate_immutable_checkpoint_at(1),
+            Err(MdbxContextError::Corrupt(
+                "checkpoint generation requires the latest finalized height"
+            ))
+        ));
     }
 
     #[test]

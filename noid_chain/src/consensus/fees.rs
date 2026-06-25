@@ -14,8 +14,10 @@
 
 use noid_tx::TxBody;
 
+#[cfg(test)]
+use crate::consensus::params::LOG_SLOTS_GENESIS;
 use crate::consensus::params::{
-    FEE_PER_INPUT, FEE_PER_OUTPUT, LOG_SLOTS_GENESIS, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
+    FEE_PER_INPUT, FEE_PER_OUTPUT, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
 };
 
 /// Occupancy pressure thresholds in basis points.
@@ -154,16 +156,6 @@ pub fn claimable_fee_for_tx_body(body: &TxBody, active_slot_count: u64, log_slot
     let actual = body.fee.min(u64::MAX as u128) as u64;
     let burned = burned_fee_for_tx_body(body, active_slot_count, log_slots);
     actual.saturating_sub(burned)
-}
-
-/// Compatibility estimator for legacy call sites that only know `n_outputs`.
-///
-/// Assumes a normal wallet send shape with one live input and the requested
-/// number of outputs at genesis/low pressure. New consensus-critical call sites
-/// should use [`required_fee_for_tx_body`] instead.
-#[inline]
-pub fn min_fee(n_outputs: u64) -> u64 {
-    fee_breakdown(1, n_outputs, 0, LOG_SLOTS_GENESIS).required_total
 }
 
 #[cfg(test)]

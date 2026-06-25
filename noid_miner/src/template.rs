@@ -8,12 +8,12 @@
 //! - State applied to scratch → `state_root` known
 //! - Coinbase constructed
 //! - Correct ASERT difficulty target computed
-//! - All header fields set except `nonce` and `proof_transcript_hash`
+//! - All semantic header fields set except `nonce`
 //!
 //! ## Template refresh triggers
 //!
 //! 1. Heartbeat every `refresh_interval_secs` seconds (safety net)
-//! 2. First `TxAdmitted` while a coinbase-only marker proof is done
+//! 2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
 //! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
 
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::next_target;
-use noid_chain::consensus::pow::full_block_hash;
+use noid_chain::consensus::pow::block_id;
 use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
 use noid_chain::consensus::AnchorInfo;
 use noid_chain::state::ChainState;
@@ -63,7 +63,7 @@ pub enum TemplateRefreshTrigger {
 
 /// A `BlockTemplate` ready for parallel PoW + block-certificate assembly.
 ///
-/// Security: `state_root` is in `header_core` which is the PoW input.
+/// Security: `state_root` is in the Poseidon2b PoW field schedule.
 /// An external miner CANNOT change the coinbase without regenerating the
 /// block certificate — they only brute-force the nonce.
 #[derive(Clone)]
@@ -87,23 +87,14 @@ pub struct BlockTemplate {
 impl BlockTemplate {
     /// Build the partial header for PoW search.
     ///
-    /// `proof_transcript_hash` and `witness_root` are zero — they are NOT in
-    /// the PoW hash (`header_core`). The miner only hashes `header_core`.
+    /// The miner hashes the fixed semantic header field schedule.
     pub fn header_for_pow(&self, nonce: u128) -> BlockHeader {
         self.inner.to_pow_header(nonce)
     }
 
     /// Assemble the final sealed block after PoW and certificate assembly complete.
-    pub fn seal(
-        &self,
-        nonce: u128,
-        proof_transcript_hash: [u8; 32],
-        witness_root: [u8; 32],
-    ) -> Block {
-        let header = self
-            .inner
-            .clone()
-            .into_header(nonce, proof_transcript_hash, witness_root);
+    pub fn seal(&self, nonce: u128) -> Block {
+        let header = self.inner.clone().into_header(nonce);
         Block {
             header,
             transactions: self.inner.all_txs(),
@@ -139,7 +130,7 @@ impl TemplateChainSnapshot {
         let tip_height = parent.height;
         let lo = tip_height.saturating_sub(noid_chain::consensus::params::ANCHOR_DEPTH);
         let fresh_anchor_hashes = (lo..=tip_height)
-            .filter_map(|h| ctx.header(h).map(full_block_hash))
+            .filter_map(|h| ctx.header(h).map(block_id))
             .collect();
 
         Ok(Self {

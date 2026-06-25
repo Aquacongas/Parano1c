@@ -36,23 +36,23 @@ pub trait ParanoidApi {
     #[method(name = "getBlockHeader")]
     async fn get_block_header(&self, height: u64) -> RpcResult<Option<BlockHeaderInfo>>;
 
-    /// Raw 276-byte block header hex at `height` (for developers).
+    /// Raw 212-byte block header hex at `height` (for developers).
     #[method(name = "getHeaderByHeight")]
     async fn get_header_by_height(&self, height: u64) -> RpcResult<Option<String>>;
 
-    /// Raw 276-byte block header hex by H_BLOCK hash.
+    /// Raw 212-byte block header hex by H_BLOCK hash.
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Latest recursive chain proof (~76 KB hex for ~38 KB raw proof). Covers the entire history in O(1).
-    #[method(name = "getRecursiveProof")]
-    async fn get_recursive_proof(&self) -> RpcResult<Option<String>>;
+    /// Trustless public history proof. Returns null until the real O(1) proof is active.
+    #[method(name = "getHistoryProof")]
+    async fn get_history_proof(&self) -> RpcResult<Option<String>>;
 
     /// UTXO slot contents by index.
     #[method(name = "getSlot")]
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo>;
 
-    /// All live UTXO slots owned by `address` (bech32m or 64-char hex).
+    /// All live UTXO slots owned by `address` (bech32m).
     /// Uses the persistent owner index — O(1) lookup.
     #[method(name = "getSlotsByOwner")]
     async fn get_slots_by_owner(&self, address: String) -> RpcResult<Vec<SlotInfo>>;
@@ -79,7 +79,7 @@ pub trait ParanoidApi {
     // Network / mining
     // =========================================================================
 
-    /// Mining and network state: difficulty, block reward, recursive proof height.
+    /// Mining and network state: difficulty, block reward, local history-cache height.
     #[method(name = "getMiningInfo")]
     async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
 
@@ -100,7 +100,7 @@ pub trait ParanoidApi {
     // Utilities
     // =========================================================================
 
-    /// Validate and normalise an address (bech32m or hex).
+    /// Validate and normalise an address (bech32m).
     /// Returns the canonical bech32m form on success.
     #[method(name = "validateAddress")]
     async fn validate_address(&self, address: String) -> RpcResult<AddressInfo>;

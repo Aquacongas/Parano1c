@@ -41,8 +41,8 @@ pub enum ChainChoice {
 /// - `target_b`, `hash_b`: difficulty target and block hash of tip B
 /// - `height_a`, `height_b`: chain heights
 ///
-/// Delegates to `choose_chain_by_work` with zero chainwork, which falls back
-/// to height-based comparison. Use `choose_chain_by_work` when cumulative
+/// Delegates to `choose_chain_by_work` with zero chainwork, which uses a
+/// compatibility height comparison. Use `choose_chain_by_work` when cumulative
 /// chainwork is available.
 pub fn choose_chain(
     target_a: &[u8; 32],
@@ -53,7 +53,7 @@ pub fn choose_chain(
     height_b: u64,
 ) -> ChainChoice {
     choose_chain_by_work(
-        &[0u8; 32], // chainwork unknown for this API - use height fallback
+        &[0u8; 32], // chainwork unknown for this compatibility API
         hash_a, height_a, target_a, &[0u8; 32], hash_b, height_b, target_b,
     )
 }
@@ -67,9 +67,9 @@ pub fn choose_chain(
 /// - `chainwork_a`: cumulative work for chain A (sum of block_work() for all blocks)
 /// - `chainwork_b`: cumulative work for chain B
 /// - `hash_a`, `hash_b`: tip hashes for tie-breaking
-/// - `target_a`, `target_b`: tip difficulty targets (used in height-fallback path)
+/// - `target_a`, `target_b`: tip difficulty targets (used in compatibility path)
 ///
-/// If chainwork is unavailable (zeros), falls back to height comparison.
+/// If chainwork is unavailable (zeros), uses compatibility height comparison.
 #[allow(clippy::too_many_arguments)]
 pub fn choose_chain_by_work(
     chainwork_a: &[u8; 32],
@@ -103,7 +103,7 @@ pub fn choose_chain_by_work(
         };
     }
 
-    // Fallback: height-based (for tests and genesis bootstrapping).
+    // Compatibility path: height-based, for tests and genesis bootstrapping.
     if height_a > height_b {
         return ChainChoice::A;
     }
@@ -163,10 +163,10 @@ mod tests {
 
     #[test]
     fn lower_target_wins_at_equal_height() {
-        // harder = smaller value (2^220) < easier (GENESIS_TARGET = 2^228)
+        // harder = smaller value (2^220) < easier (GENESIS_TARGET = 2^237)
         let harder = {
             let mut t = [0u8; 32];
-            t[27] = 0x10; // 2^(8*27+4) = 2^220 < 2^228 = GENESIS_TARGET
+            t[27] = 0x10; // 2^(8*27+4) = 2^220 < 2^237 = GENESIS_TARGET
             t
         };
         let easier = GENESIS_TARGET;

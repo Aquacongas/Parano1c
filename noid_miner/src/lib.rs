@@ -12,20 +12,20 @@
 //!  │                   Block Production Loop                    │
 //!  │                                                            │
 //!  │  1. Build template (txs from mempool + coinbase)           │
-//!  │     ├─ Empty block template first (marker proof only)      │
+//!  │     ├─ Empty block template first (no block proof)         │
 //!  │     └─ User-tx template with exact state certificate       │
 //!  │                                                            │
 //!  │  2. Parallel execution:                                    │
 //!  │     ┌──────────────────┐   ┌──────────────────────────┐   │
 //!  │     │  PoW Search      │   │  Certificate assembly    │   │
-//!  │     │  Blake3(core||n) │   │  proof + auth sidecar    │   │
+//!  │     │  Poseidon2b POW  │   │  proof + auth sidecar    │   │
 //!  │     │  < target        │   │                          │   │
 //!  │     └───────┬──────────┘   └──────────┬───────────────┘   │
 //!  │             │                         │                   │
 //!  │             └──────────┬──────────────┘                   │
 //!  │                        │ both complete                    │
 //!  │                        ▼                                  │
-//!  │  3. Seal: BlockHeader(core + proof_hash + nonce)          │
+//!  │  3. Seal: semantic header + detached witness bytes        │
 //!  │  4. Broadcast via P2P                                     │
 //!  └────────────────────────────────────────────────────────────┘
 //! ```
@@ -33,7 +33,7 @@
 //! ## Security property
 //!
 //! `state_root` (derived from all txs + miner_address via coinbase output) is
-//! in `header_core` which is the PoW input. An external miner CANNOT change
+//! in the fixed Poseidon2b PoW header schedule. An external miner CANNOT change
 //! the coinbase without regenerating the block certificate — the miner only
 //! brute-forces the nonce.
 
@@ -45,11 +45,11 @@ pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
 
-pub type ProvedBlockParts = ([u8; 32], [u8; 32], Vec<u8>, Vec<u8>);
+pub type ProvedBlockParts = (Vec<u8>, Vec<u8>);
 
 /// Public wrapper around the internal `run_prove_block` function.
 /// Used by the RPC `getBlockTemplate` to generate a fully-proved block
-/// for external miners that need complete block bytes (not just header_core).
+/// for external miners that need complete block bytes and detached proof data.
 pub fn run_prove_block_for_rpc(
     tmpl: &BlockTemplate,
     prev_state_root: [u8; 32],

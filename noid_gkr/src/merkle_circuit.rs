@@ -3,14 +3,15 @@
 
 //! Typed topology for the Merkle path Kill-Shot circuit.
 //!
-//! A Merkle path from a segment root to `state_root` consists of
+//! A Merkle path through a consensus Poseidon2b tree consists of
 //! `N_MERKLE_COMPRESSIONS` chained Poseidon2b compressions. Each
 //! compression is 2 permutations (PermA absorbs the left digest,
 //! PermB absorbs the right/sibling digest), totalling
 //! `N_MERKLE_SLOTS` permutation slots in a single linear chain.
 //!
-//! The circuit is parameterised by a maximum path depth (16 at
-//! `log_slots = 32`). Shorter paths zero-pad unused slots via the
+//! The circuit is parameterised by a maximum path depth of 32 so it can
+//! cover the exact UTXO sparse tree at maximum state size. Shorter paths
+//! zero-pad unused slots via the
 //! active cell mask `mu(x)` — same mechanism as spine/auth.
 //!
 //! ## What the circuit proves
@@ -31,10 +32,10 @@
 //! PermA(left) → PermB(right).
 
 use noid_core::{Block128, TowerField};
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
+use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
 
-/// Maximum supported Merkle path depth (segment_depth at log_slots=32).
-pub const MAX_MERKLE_DEPTH: usize = 16;
+/// Maximum supported Merkle path depth for the exact UTXO sparse tree.
+pub const MAX_MERKLE_DEPTH: usize = 32;
 
 /// Permutation slots per compression: absorb left (PermA) + absorb
 /// right (PermB).
@@ -78,13 +79,17 @@ pub struct MerkleSlotDescriptor {
 }
 
 /// Public inputs to the Merkle path GKR.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerklePathInputs {
     /// Leaf digest `[hi, lo]` — the segment root being opened.
     pub leaf: [Block128; 2],
     /// Sibling digests at each level. Unused levels (beyond
     /// `active_depth`) must be `[ZERO, ZERO]`.
     pub siblings: [[Block128; 2]; MAX_MERKLE_DEPTH],
+    /// `false`: current digest is left child and sibling is right child.
+    /// `true`: sibling is left child and current digest is right child.
+    /// Unused levels must be `false`.
+    pub directions: [bool; MAX_MERKLE_DEPTH],
     /// Expected root — `state_root`.
     pub expected_root: [Block128; 2],
     /// Number of active compression levels (8..=16). Determines which
@@ -97,6 +102,7 @@ impl MerklePathInputs {
         Self {
             leaf: [Block128::ZERO; 2],
             siblings: [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH],
+            directions: [false; MAX_MERKLE_DEPTH],
             expected_root: [Block128::ZERO; 2],
             active_depth: 0,
         }
@@ -106,12 +112,17 @@ impl MerklePathInputs {
 /// Static topology of the 32-slot Merkle path circuit.
 #[derive(Debug, Clone)]
 pub struct MerkleCircuit {
+    pub node_tag: DomainTag,
     pub slots: Vec<MerkleSlotDescriptor>,
 }
 
 impl MerkleCircuit {
     pub fn build() -> Self {
-        let iv = capacity_iv(TAG_COMPRESS);
+        Self::build_with_tag(TAG_COMPRESS)
+    }
+
+    pub fn build_with_tag(node_tag: DomainTag) -> Self {
+        let iv = capacity_iv(node_tag);
         let mut slots = Vec::with_capacity(N_MERKLE_SLOTS);
 
         for level in 0..MAX_MERKLE_DEPTH {
@@ -146,7 +157,7 @@ impl MerkleCircuit {
         }
 
         debug_assert_eq!(slots.len(), N_MERKLE_SLOTS);
-        Self { slots }
+        Self { node_tag, slots }
     }
 
     /// Slot id of the PermB at the given level — its `state_out[0..1]`
@@ -172,7 +183,8 @@ mod tests {
     fn build_has_expected_slot_count() {
         let c = MerkleCircuit::build();
         assert_eq!(c.slots.len(), N_MERKLE_SLOTS);
-        assert_eq!(N_MERKLE_SLOTS, 32);
+        assert_eq!(N_MERKLE_SLOTS, 64);
+        assert_eq!(c.node_tag, TAG_COMPRESS);
     }
 
     #[test]
@@ -198,6 +210,19 @@ mod tests {
         let iv = capacity_iv(TAG_COMPRESS);
         for s in &c.slots {
             assert_eq!(s.capacity_iv, iv);
+        }
+    }
+
+    #[test]
+    fn explicit_domain_changes_ivs() {
+        use noid_poseidon2b::native::domain::TAG_EXSTNOD;
+
+        let generic = MerkleCircuit::build();
+        let exact = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
+        assert_eq!(exact.node_tag, TAG_EXSTNOD);
+        assert_ne!(generic.slots[0].capacity_iv, exact.slots[0].capacity_iv);
+        for s in &exact.slots {
+            assert_eq!(s.capacity_iv, capacity_iv(TAG_EXSTNOD));
         }
     }
 

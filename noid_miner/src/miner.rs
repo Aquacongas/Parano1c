@@ -11,14 +11,14 @@
 //!
 //!   ┌─────────────────────────┐   ┌─────────────────────────────────┐
 //!   │  PoW Search             │   │  Block certificate assembly    │
-//!   │  Blake3(header_core||n) │   │  build proof + sidecar          │
+//!   │  Poseidon2b POW nonce   │   │  build proof + sidecar          │
 //!   │  < difficulty_target    │   │  exact state + auth sidecar     │
 //!   └──────────┬──────────────┘   └──────────────┬──────────────────┘
 //!              │                                 │
 //!              └────────────┬────────────────────┘
 //!                           │ both complete
 //!                           ▼
-//!   seal(nonce, proof_hash, witness_root) → Block
+//!   seal(nonce, detached proof/object ids) → Block
 //!   apply_to_chain + broadcast via P2P
 //! }
 //! ```
@@ -31,7 +31,7 @@
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
-//!   2. First `TxAdmitted` while a coinbase-only marker proof is done
+//!   2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
 //!   3. New chain tip from P2P (block received or snapshot applied)
 
 use std::sync::{
@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
 use noid_chain::block::Block;
-use noid_chain::consensus::pow::full_block_hash;
+use noid_chain::consensus::pow::block_id;
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
@@ -96,7 +96,8 @@ impl MinerConfig {
 // Events
 // ---------------------------------------------------------------------------
 
-/// Events emitted by the miner (for P2P broadcast, logging, RPC, recursive proof).
+/// Events emitted by the miner for P2P broadcast, logging, RPC, and local
+/// finalized-history coverage.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {
     /// New block found and sealed. Contains the sealed block bytes for P2P.
@@ -108,9 +109,9 @@ pub enum MinerEvent {
         /// Serialized Block bytes for P2P broadcast.
         block_bytes: Vec<u8>,
         /// Serialized BlockProof bytes for P2P broadcast.
-        /// Empty for coinbase-only blocks (stub proof).
+        /// Empty for coinbase-only blocks.
         block_proof_bytes: Vec<u8>,
-        /// Serialized public AuthGKR sidecar bytes bound by header.witness_root.
+        /// Serialized public AuthGKR sidecar bytes carried as detached witness.
         /// Empty for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
     },
@@ -411,7 +412,7 @@ impl BlockMiner {
 
             cancel.store(false, Ordering::Relaxed);
 
-            // Track when prove completes. Coinbase-only proofs are marker proofs; on the
+            // Track when prove completes. Coinbase-only blocks have no proof; on the
             // first admitted tx we cancel their PoW search and rebuild immediately. For
             // user-tx templates we intentionally do not listen to later mempool events:
             // dropping the JoinHandle would not cancel spawn_blocking proof work and would
@@ -420,8 +421,8 @@ impl BlockMiner {
             let prove_done_clone = prove_done.clone();
 
             // --- Parallel: PoW + certificate assembly ---
-            // Extract only the PoW header — avoids cloning the full BlockTemplate
-            // (which includes all transaction and proof bytes) just for PoW.
+            // Extract only the PoW header so PoW never depends on detached
+            // proof/sidecar witness bytes.
             let pow_header = tmpl.header_for_pow(0);
             let tmpl = Arc::new(tmpl);
             let tmpl_prove = tmpl.clone();
@@ -436,7 +437,7 @@ impl BlockMiner {
             let prove_permit = self.prove_semaphore.clone().try_acquire_owned();
 
             // If the semaphore is already held and the template has user txs we
-            // cannot legally use a stub proof — skip this iteration and wait for
+            // cannot legally seal without a block proof — skip this iteration and wait for
             // the running prove to release the permit.
             if prove_permit.is_err() && tmpl.n_user_txs() > 0 {
                 tracing::debug!(
@@ -447,13 +448,13 @@ impl BlockMiner {
                 continue;
             }
 
-            // PoW: Blake3 over header_core, CPU-bound via the dedicated PoW Rayon pool.
+            // PoW: Poseidon2b over semantic header fields, CPU-bound via the dedicated PoW Rayon pool.
             let pow_handle = tokio::task::spawn_blocking(move || {
                 pow_pool.install(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
             });
 
-            // Certificate assembly: run for real (permit held until done) or return a
-            // consensus-legal stub for coinbase-only blocks when the prove slot is occupied.
+            // Certificate assembly: run for real (permit held until done) or return
+            // empty detached witness bytes for coinbase-only blocks when the prove slot is occupied.
             let prove_handle = match prove_permit {
                 Ok(permit) => tokio::task::spawn_blocking(move || {
                     // Run prove inside a scope so the semaphore permit is released
@@ -470,15 +471,15 @@ impl BlockMiner {
                     (result, elapsed)
                 }),
                 Err(_) => {
-                    // Semaphore busy, but coinbase-only block — stub is consensus-legal.
+                    // Semaphore busy, but coinbase-only block — no proof is required.
                     tracing::debug!(
                         height,
-                        "prove task busy, will use stub proof (coinbase-only this round)"
+                        "prove task busy, coinbase-only block will carry no proof"
                     );
                     tokio::task::spawn_blocking(move || {
-                        // Stub is instant; mark prove_done so TxAdmitted can trigger rebuild.
+                        // Empty detached witness is instant; mark prove_done so TxAdmitted can trigger rebuild.
                         prove_done_clone.store(true, Ordering::Release);
-                        (Ok(([1u8; 32], [1u8; 32], vec![], vec![])), Duration::ZERO)
+                        (Ok((vec![], vec![])), Duration::ZERO)
                     })
                 }
             };
@@ -491,10 +492,10 @@ impl BlockMiner {
                     (p, r)
                 } => {
                     match (pow_res, prove_res) {
-                        (Ok(Some(sol)), Ok((Ok((proof_hash, witness_root, block_proof_bytes, block_auth_sidecar_bytes)), prove_elapsed))) => {
-                            let block = tmpl.seal(sol.nonce, proof_hash, witness_root);
+                        (Ok(Some(sol)), Ok((Ok((block_proof_bytes, block_auth_sidecar_bytes)), prove_elapsed))) => {
+                            let block = tmpl.seal(sol.nonce);
                             let block_bytes = block.to_bytes();
-                            let hash = full_block_hash(&block.header);
+                            let hash = block_id(&block.header);
                             let elapsed = pow_start.elapsed();
                             let elapsed_s = elapsed.as_secs_f64();
 
@@ -538,8 +539,8 @@ impl BlockMiner {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                             }
 
-                            // Store block proof + public auth sidecar bytes for recursive proof advancement
-                            // and for serving compact P2P pull requests.
+                            // Store block proof + public auth sidecar bytes for local
+                            // finalized-history coverage and compact P2P pull requests.
                             if !block_proof_bytes.is_empty() {
                                 let ctx = self.chain.read().await;
                                 if let Err(e) = ctx.store.put_block_proof(height, &block_proof_bytes) {
@@ -595,14 +596,13 @@ impl BlockMiner {
 
                 event = mempool_events.recv(), if tmpl.n_user_txs() == 0 => {
                     if let Ok(noid_mempool::MempoolEvent::TxAdmitted { .. }) = event {
-                        // Coinbase-only template: the proof is a zero-cost marker. Cancel
-                        // PoW immediately so the first admitted user transaction is not
-                        // delayed by an empty block. If the marker task has not set
-                        // prove_done yet, dropping its JoinHandle is still harmless: the
-                        // spawn_blocking task finishes quickly and releases the semaphore.
-                        let marker_done = prove_done.load(Ordering::Acquire);
+                        // Coinbase-only templates have no validation witness. Cancel PoW
+                        // immediately so the first admitted user transaction is not
+                        // delayed by an empty block. If the empty proof task has not set
+                        // prove_done yet, dropping its JoinHandle is still harmless.
+                        let empty_proof_done = prove_done.load(Ordering::Acquire);
                         cancel.store(true, Ordering::Relaxed);
-                        tracing::debug!(marker_done, "coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
+                        tracing::debug!(empty_proof_done, "coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
                     }
                 }
 
@@ -667,7 +667,7 @@ impl BlockMiner {
                      anchor,
                      pre_state,
                      state| {
-                        noid_block::validate_block_from_network(
+                        noid_block::accept_block(
                             block,
                             proof_bytes,
                             auth_sidecar_bytes,
@@ -712,7 +712,7 @@ impl BlockMiner {
 
 /// Run `prove_block` with the witnesses from the template's transactions.
 ///
-/// Returns `(proof_transcript_hash, witness_root, proof_bytes, auth_sidecar_bytes)` on success.
+/// Returns `(proof_bytes, auth_sidecar_bytes)` on success.
 ///
 /// # Correctness
 ///
@@ -730,19 +730,17 @@ pub(crate) fn run_prove_block(
     tmpl: &crate::template::BlockTemplate,
     prev_state_root: [u8; 32],
 ) -> Result<crate::ProvedBlockParts, String> {
-    use noid_block::{
-        block_auth_sidecar_root, block_recursive_claim_hash, BlockAuthSidecar, BlockProof,
-    };
+    use noid_block::{BlockAuthSidecar, BlockProof};
     use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
 
-    // Coinbase-only: marker proof, no block certificate needed.
+    // Coinbase-only: no block certificate needed.
     let non_cb_count = tmpl.n_user_txs();
     if non_cb_count == 0 {
         tracing::debug!(
             height = tmpl.inner.height,
-            "coinbase-only block — marker proof OK"
+            "coinbase-only block — no block proof required"
         );
-        return Ok(([1u8; 32], [1u8; 32], vec![], vec![]));
+        return Ok((vec![], vec![]));
     }
 
     let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
@@ -788,22 +786,12 @@ pub(crate) fn run_prove_block(
         exact_state_transition,
     );
     let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
-    let transcript_hash = block_recursive_claim_hash(&block_proof);
-    let root_block = tmpl.seal(0, transcript_hash, [0u8; 32]);
-    let witness_root = block_auth_sidecar_root(&root_block, &auth_sidecar)
-        .map_err(|e| format!("BlockAuthSidecar root failed: {e:?}"))?;
-
     tracing::info!(
         proof_bytes = proof_bytes.len(),
         auth_sidecar_bytes = auth_sidecar_bytes.len(),
         "prove_block succeeded"
     );
-    Ok((
-        transcript_hash,
-        witness_root,
-        proof_bytes,
-        auth_sidecar_bytes,
-    ))
+    Ok((proof_bytes, auth_sidecar_bytes))
 }
 
 #[cfg(test)]
@@ -814,11 +802,11 @@ mod tests {
         prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
         standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
     };
-    use noid_block::{validate_block_proof_transcript_hash, BlockProof};
+    use noid_block::BlockProof;
     use noid_chain::block::{compute_tx_root, Block};
     use noid_chain::consensus::genesis::{genesis_header, GENESIS_TIMESTAMP};
     use noid_chain::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
-    use noid_chain::consensus::pow::full_block_hash;
+    use noid_chain::consensus::pow::block_id;
     use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
     use noid_chain::fri_state::SlotValue;
     use noid_chain::state::{apply_tx, ChainState};
@@ -966,7 +954,7 @@ mod tests {
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
             miner_address: Address([0xCB; 32]),
             difficulty_target: GENESIS_TARGET,
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
         };
         crate::template::BlockTemplate {
             inner,
@@ -982,13 +970,13 @@ mod tests {
     fn prove_template_wire(
         tmpl: &crate::template::BlockTemplate,
     ) -> (Block, Vec<u8>, Vec<u8>, BlockProof) {
-        let (proof_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
+        let (proof_bytes, auth_sidecar_bytes) =
             run_prove_block(tmpl, tmpl.parent.state_root).expect("run_prove_block");
         assert!(
             !proof_bytes.is_empty(),
             "user-tx templates must carry BlockProof bytes"
         );
-        let block = tmpl.seal(0, proof_hash, witness_root);
+        let block = tmpl.seal(0);
         assert!(
             !auth_sidecar_bytes.is_empty(),
             "user-tx templates must carry BlockAuthSidecar bytes"
@@ -997,8 +985,8 @@ mod tests {
         let sidecar: noid_block::BlockAuthSidecar =
             bincode::deserialize(&auth_sidecar_bytes).expect("decode BlockAuthSidecar");
         assert_eq!(sidecar.tx_auth.len(), tmpl.n_user_txs());
-        noid_block::validate_block_auth_sidecar_root(&block, &sidecar).expect("sidecar root");
-        validate_block_proof_transcript_hash(&block, &proof).expect("header/proof binding");
+        noid_block::validate_block_auth_sidecar_shape(&block, &sidecar)
+            .expect("detached sidecar shape");
         (block, proof_bytes, auth_sidecar_bytes, proof)
     }
 
@@ -1009,10 +997,6 @@ mod tests {
 
     fn assert_minimal_proof(proof: &BlockProof, n_user_txs: usize) {
         assert_eq!(proof.meta.n_tx as usize, n_user_txs);
-        assert_eq!(proof.meta.n_air_per_tx, 0);
-        assert_eq!(proof.meta.n_auth_slices_per_tx, 0);
-        assert_eq!(proof.meta.log_rows, 0);
-        assert_eq!(proof.meta.n_block_spine_slices, 0);
     }
 
     #[test]

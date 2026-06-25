@@ -86,7 +86,7 @@ pub const UNDO_RETENTION_DEPTH: u64 = 18;
 /// Recent full-block retention depth for peer serving.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
 
-/// Backwards-compatible alias during the FIX1 migration.
+/// Compatibility alias for older internal callers.
 pub const FINALITY_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 
 /// Backwards-compatible alias for in-memory undo pruning.
@@ -119,55 +119,61 @@ pub const EXPAND_DENOM: u64 = 4;
 // PoW
 // ---------------------------------------------------------------------------
 
-/// Genesis difficulty target = 2^229.
+/// Genesis difficulty target = 2^237.
 ///
-/// Calibrated to ~2 seconds per block on a 12-core laptop (62 MH/s total):
-///   avg_nonces = 2^(256-229) = 2^27 = 134M
-///   time = 134M / 62M ≈ 2.2s
+/// Calibrated to roughly the same wall-clock genesis solve time as the previous
+/// difficulty floor, using production Poseidon2b PoW on the current 12-core laptop:
+///   measured parallel Poseidon2b PoW ≈ 186 KH/s
+///   avg_nonces = 2^(256-237) = 2^19 = 524,288
+///   time = 524K / 186K ≈ 2.8s
 ///
-/// LE 256-bit layout: byte 28 = 0x20 (bit 229 = bit 5 of byte 28).
-/// Bytes 29-31 = 0x00 so the target value equals 2^229.
+/// LE 256-bit layout: byte 29 = 0x20 (bit 237 = bit 5 of byte 29).
+/// Bytes 30-31 = 0x00 so the target value equals 2^237.
 ///
 /// This is the minimum allowed difficulty floor. ASERT may only move harder.
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    t[28] = 0x20; // bit 5 of byte 28 → 2^(8×28+5) = 2^229
+    t[29] = 0x20; // bit 5 of byte 29 -> 2^(8*29+5) = 2^237
     t
 };
 
 /// Minimum cumulative PoW work required to accept a state snapshot.
 ///
-/// Stored as LE u128 in bytes [0..16], matching `add_work`/`block_work` layout.
+/// Stored as LE u256, matching `add_work`/`block_work` layout.
 ///
 /// # Derivation
 ///
-/// The difficulty floor ensures every block contributes at least:
-///   block_work(GENESIS_TARGET) = 2^26 = 67,108,864  (26 leading zeros)
+/// Chainwork accounting uses the strict-`< target` expected-trial-count
+/// formula:
+///   Work(T) = floor((2^256 - 1) / T) + 1.
+///
+/// For `GENESIS_TARGET = 2^237`, every block contributes:
+///   block_work(GENESIS_TARGET) = 2^19 = 524,288
 ///
 /// We require CONSENSUS_FINALITY_DEPTH (18) blocks' worth of work:
 ///
-///   MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH × block_work(GENESIS_TARGET)
-///                          = 18 × 2^26 = 1,207,959,552 = 0x4800_0000
+///   MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH * block_work(GENESIS_TARGET)
+///                          = 18 * 2^19 = 9,437,184 = 0x0090_0000
 ///
 /// # Why CONSENSUS_FINALITY_DEPTH?
 ///
-/// The recursive proof updater only builds proofs for blocks that are
-/// CONSENSUS_FINALITY_DEPTH behind tip. Until a peer has 18+ finalized blocks it has
-/// NO recursive proof. Requiring 18 blocks of chainwork aligns these two:
+/// Local history cache updates only cover blocks that are
+/// CONSENSUS_FINALITY_DEPTH behind tip. Public arbitrary-peer snapshot sync is
+/// still disabled fail-closed until the history proof verifier is authority.
+/// The chainwork floor remains a resource/sanity guard for that path:
 ///
-///   tip < 18  → no recursive proof AND chainwork < threshold → peer cannot serve sync
-///   tip ≥ 18  → recursive proof exists AND chainwork ≥ threshold → peer can serve sync
+///   tip < 18  -> no finalized history cache and chainwork < threshold
+///   tip >= 18 -> local cache may exist, but is not snapshot authority
 ///
 /// # Security vs fake snapshots
 ///
-///   • 155 fake MAX_TARGET blocks (work=1/block) → chainwork = 155 ≪ 1.2B → FAILS
-///   • 18 real blocks + genesis  → chainwork ≥ 18 × 2^26 → PASSES
+///   - 155 fake MAX_TARGET blocks (work=2/block) -> chainwork = 310 << 9.4M -> FAILS
+///   - 18 real blocks + genesis  -> chainwork >= 18 * 2^19 -> PASSES
 pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
     let mut w = [0u8; 32];
-    // 18 × 2^26 = 0x12 × 0x400_0000 = 0x4800_0000 = 1,207,959,552
-    // In LE bytes: byte[3] = 0x48 (bits 24-31)
-    // Verify: 0x48 × 2^24 = 72 × 16,777,216 = 1,207,959,552 = 18 × 67,108,864 ✓
-    w[3] = 0x48; // = CONSENSUS_FINALITY_DEPTH(18) × block_work(GENESIS_TARGET)
+    // 18 * 2^19 = 0x90_0000 = 9,437,184
+    // In LE bytes: byte[2] = 0x90.
+    w[2] = 0x90; // = CONSENSUS_FINALITY_DEPTH(18) * block_work(GENESIS_TARGET)
     w
 };
 
@@ -186,7 +192,7 @@ pub const MAX_TARGET: [u8; 32] = [0xFF; 32];
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Emission  (ROADMAP2.md §Emission)
+// Emission
 // ---------------------------------------------------------------------------
 
 /// Precision: 1 NOID = 1_000_000 μNOID (microNOID).
@@ -225,37 +231,22 @@ pub const FEE_PER_INPUT: u64 = 100; // 0.0001 NOID per input
 /// at the historical 9_000 μNOID baseline together with state-growth burn.
 pub const FEE_PER_OUTPUT: u64 = 700; // 0.0007 NOID per output
 
-/// Compatibility alias for legacy source that only knows about a combined I/O
-/// unit. New consensus code uses `FEE_PER_INPUT` and `FEE_PER_OUTPUT`.
-pub const FEE_PER_IO: u64 = (FEE_PER_INPUT + FEE_PER_OUTPUT) / 2;
-
 /// Base fee charged per net-new live UTXO slot at low occupancy.
 /// This state-growth component is burned by consensus.
 pub const STATE_GROWTH_FEE_BASE: u64 = 2_500; // 0.0025 NOID per net-new slot
-
-/// Compatibility estimator for legacy call sites that only know `n_outputs`.
-/// Assumes one live input at low occupancy. New consensus-critical code should
-/// use `consensus::fees::required_fee_for_tx_body` instead.
-pub const fn min_fee(n_outputs: u64) -> u64 {
-    let net_new_outputs = n_outputs.saturating_sub(1);
-    MIN_FEE_BASE
-        + FEE_PER_INPUT
-        + FEE_PER_OUTPUT * n_outputs
-        + STATE_GROWTH_FEE_BASE * net_new_outputs
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn genesis_target_is_2_pow_229() {
-        // 2^229: bit 229 = bit 5 of byte 28 (LE). Bytes 29-31 = 0x00.
+    fn genesis_target_is_2_pow_237() {
+        // 2^237: bit 237 = bit 5 of byte 29 (LE). Bytes 30-31 = 0x00.
         let mut expected = [0u8; 32];
-        expected[28] = 0x20; // 2^5 at byte 28 → 2^(8*28+5) = 2^229
+        expected[29] = 0x20; // 2^5 at byte 29 -> 2^(8*29+5) = 2^237
         assert_eq!(GENESIS_TARGET, expected);
-        assert_eq!(GENESIS_TARGET[28], 0x20);
-        assert_eq!(GENESIS_TARGET[29], 0x00);
+        assert_eq!(GENESIS_TARGET[28], 0x00);
+        assert_eq!(GENESIS_TARGET[29], 0x20);
         assert_eq!(GENESIS_TARGET[30], 0x00);
         assert_eq!(GENESIS_TARGET[31], 0x00);
     }
@@ -273,18 +264,6 @@ mod tests {
         assert!(FLOOR_REWARD_MICRONOID > 0);
         assert!(BASE_REWARD_MICRONOID > FLOOR_REWARD_MICRONOID);
         assert_eq!(BASE_REWARD_MICRONOID, 50 * MICRONOID_PER_NOID);
-    }
-
-    #[test]
-    fn min_fee_formula() {
-        assert_eq!(min_fee(0), MIN_FEE_BASE + FEE_PER_INPUT);
-        assert_eq!(min_fee(1), MIN_FEE_BASE + FEE_PER_INPUT + FEE_PER_OUTPUT);
-        assert_eq!(min_fee(2), 9_000);
-        assert_eq!(
-            min_fee(8),
-            MIN_FEE_BASE + FEE_PER_INPUT + 8 * FEE_PER_OUTPUT + 7 * STATE_GROWTH_FEE_BASE
-        );
-        assert!(min_fee(0) > 0);
     }
 
     #[test]

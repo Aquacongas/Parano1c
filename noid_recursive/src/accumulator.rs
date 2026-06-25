@@ -22,13 +22,12 @@ pub struct ChainAccumulator {
     ///   chain_hash_0 = compress(ZERO, compress(H_BLOCK(genesis), claim_bytes_0))
     ///   chain_hash_n = compress(chain_hash_{n-1}, compress(H_BLOCK(header_n), claim_bytes_n))
     ///
-    /// where `claim_bytes_n` = canonical `chain_claim` zero-padded to 32 bytes.
+    /// where `claim_bytes_n` = canonical 32-byte `chain_claim`.
     ///
-    /// Binding both `H_BLOCK` (which includes `proof_transcript_hash`) and the
-    /// canonical chain claim into a single 32-byte commitment prevents a forger
-    /// from substituting a null or shape-local claim for a block that has a real
-    /// bucketized proof: the resulting `chain_hash` would diverge from the value
-    /// computed by honest nodes, making the forgery detectable.
+    /// Binding both the semantic block id and the canonical chain claim into a
+    /// single 32-byte commitment prevents a forger from substituting a different
+    /// local claim for a covered block: the resulting `chain_hash` would diverge
+    /// from the value computed by honest nodes, making the mismatch detectable.
     pub chain_hash: Digest,
 }
 
@@ -37,20 +36,21 @@ impl ChainAccumulator {
     ///
     /// # Parameters
     ///
-    /// - `block_hash`  = `hash_block_header(&header)` (embeds `proof_transcript_hash`)
-    /// - `chain_claim` = canonical block claim folded into recursive history.
-    ///   `Block128::ZERO` for coinbase-only / genesis blocks.
+    /// - `block_hash`  = `hash_block_header(&header)` semantic block id.
+    /// - `chain_claim` = canonical 32-byte block claim folded into recursive
+    ///   history. `[Block128::ZERO; 2]` for genesis.
     pub fn extend(
         &self,
         new_state_root: StateRoot,
         block_hash: Digest,
         new_height: u64,
-        chain_claim: Block128,
+        chain_claim: [Block128; 2],
     ) -> Self {
         use noid_poseidon2b::native::compress;
-        // Encode claim as 32 bytes (LE u128, zero-padded).
+        // Encode claim as 32 bytes (two LE u128 lanes).
         let mut claim_bytes = [0u8; 32];
-        claim_bytes[..16].copy_from_slice(&chain_claim.to_u128().to_le_bytes());
+        claim_bytes[..16].copy_from_slice(&chain_claim[0].to_u128().to_le_bytes());
+        claim_bytes[16..].copy_from_slice(&chain_claim[1].to_u128().to_le_bytes());
         // chain_hash = compress(prev, compress(H_BLOCK, claim))
         let inner = compress(&block_hash, &claim_bytes);
         let chain_hash = compress(&self.chain_hash, &inner);
@@ -65,10 +65,10 @@ impl ChainAccumulator {
 /// Build the genesis accumulator for a given genesis state root and genesis
 /// block hash.
 ///
-/// Genesis uses a null witness so `chain_claim = ZERO`.
+/// Genesis uses a null witness so `chain_claim = [ZERO; 2]`.
 /// Formula: `compress(ZERO, compress(genesis_block_hash, [0;32]))`
-/// — identical to calling `pre_genesis.extend(state_root, block_hash, 0, ZERO)`
-/// on an all-zero pre-genesis accumulator.
+/// — identical to calling `pre_genesis.extend(state_root, block_hash, 0,
+/// [ZERO; 2])` on an all-zero pre-genesis accumulator.
 pub fn genesis_accumulator(
     genesis_state_root: StateRoot,
     genesis_block_hash: Digest,
@@ -78,6 +78,11 @@ pub fn genesis_accumulator(
         state_root: [0u8; 32],
         chain_hash: [0u8; 32],
     };
-    // Genesis block has no BlockProof — chain_claim is ZERO.
-    pre_genesis.extend(genesis_state_root, genesis_block_hash, 0, Block128::ZERO)
+    // Genesis block has no BlockProof.
+    pre_genesis.extend(
+        genesis_state_root,
+        genesis_block_hash,
+        0,
+        [Block128::ZERO; 2],
+    )
 }

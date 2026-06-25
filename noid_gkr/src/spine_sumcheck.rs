@@ -4,8 +4,8 @@
 //! Spine utility functions: boundary MLE construction, state reconstruction,
 //! and tx-body hash computation.
 //!
-//! The legacy per-slot `prove_spine` / `verify_spine` chain has been
-//! superseded by the Kill-Shot protocol in `spine_killshot.rs`.
+//! Kill-Shot proves the full tx-body Poseidon2b spine from these canonical
+//! witness and hash helpers.
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::STATE_SIZE;

@@ -3,12 +3,12 @@
 
 //! Transparent transaction data types.
 //!
-//! Paranoid is a transparent UTXO chain: inputs carry raw `(value,
-//! owner, spend_secret, slot_index)` so the proof layer can enforce
-//! ownership (`owner = H_ADDR(spend_secret)`), range and balance, and
-//! state-tree opening directly against the witness.
-//! Outputs carry raw `(value, owner)`; the commitment leaf is derived
-//! deterministically via `hash_utxo_leaf` both natively and in-circuit.
+//! Paranoid is a transparent UTXO chain: public inputs carry raw
+//! `(value, owner, slot_index)` and outputs carry raw `(value, owner)`.
+//! `TxInput::spend_secret` is a local wallet/prover witness field only; public
+//! network serialization omits it and carries an authorization proof instead.
+//! The proof layer enforces ownership (`owner = H_ADDR(spend_secret)`), public
+//! range/balance predicates, and exact state membership against that witness.
 
 use noid_poseidon2b::primitives::{Address, Commitment, Digest, SpendSecret, TxBodyHash};
 
@@ -65,8 +65,8 @@ impl TxShape {
 }
 
 /// Maximum input slots for the currently-supported standard transaction proof.
-/// Dummy slots (`valid = false`) pad up to this bound so the AIR has a
-/// fixed-shape witness trace.
+/// Dummy slots (`valid = false`) pad up to this bound so the proof relation has
+/// a fixed-shape witness trace.
 pub const MAX_INPUTS: usize = 4;
 
 /// Maximum output slots for the currently-supported standard transaction proof.

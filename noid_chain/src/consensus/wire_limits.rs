@@ -46,14 +46,26 @@ pub const MAX_BLOCK_AUTH_SIDECAR_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum combined BlockProof + BlockAuthSidecar payload.
 pub const MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES: usize = 48 * 1024 * 1024;
 
+/// Maximum block resource weight accepted before expensive proof verification.
+///
+/// This is a policy/DoS guard, not a cryptographic parameter. It counts proof
+/// bytes and shape-driven verification work separately from the hard transaction
+/// count cap.
+pub const MAX_BLOCK_RESOURCE_WEIGHT: usize = 64 * 1024 * 1024;
+
+pub const BLOCK_WEIGHT_PER_USER_TX: usize = 16 * 1024;
+pub const BLOCK_WEIGHT_PER_LIVE_INPUT: usize = 2 * 1024;
+pub const BLOCK_WEIGHT_PER_OUTPUT: usize = 1024;
+pub const BLOCK_WEIGHT_PER_STATE_FRONTIER_NODE: usize = 256;
+
 /// Gossipsub message size. Large blocks must use compact announce + pull.
 pub const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Inline block gossip threshold for block + proof + sidecar.
 pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 
-/// Maximum recursive proof bytes accepted over RPC/P2P.
-pub const MAX_RECURSIVE_PROOF_BYTES: usize = 64 * 1024;
+/// Maximum history proof bytes accepted over RPC/P2P.
+pub const MAX_HISTORY_PROOF_BYTES: usize = 64 * 1024;
 
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;
@@ -108,6 +120,51 @@ pub fn proof_sidecar_combined_len_ok(proof_len: usize, sidecar_len: usize) -> bo
     proof_len.saturating_add(sidecar_len) <= MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES
 }
 
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn block_resource_weight(
+    block_body_len: usize,
+    proof_len: usize,
+    sidecar_len: usize,
+    user_txs: usize,
+    live_inputs: usize,
+    outputs: usize,
+    state_frontier_nodes: usize,
+) -> Option<usize> {
+    let mut weight = block_body_len
+        .checked_add(proof_len)?
+        .checked_add(sidecar_len)?;
+    weight = weight.checked_add(user_txs.checked_mul(BLOCK_WEIGHT_PER_USER_TX)?)?;
+    weight = weight.checked_add(live_inputs.checked_mul(BLOCK_WEIGHT_PER_LIVE_INPUT)?)?;
+    weight = weight.checked_add(outputs.checked_mul(BLOCK_WEIGHT_PER_OUTPUT)?)?;
+    weight = weight
+        .checked_add(state_frontier_nodes.checked_mul(BLOCK_WEIGHT_PER_STATE_FRONTIER_NODE)?)?;
+    Some(weight)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn block_resource_weight_ok(
+    block_body_len: usize,
+    proof_len: usize,
+    sidecar_len: usize,
+    user_txs: usize,
+    live_inputs: usize,
+    outputs: usize,
+    state_frontier_nodes: usize,
+) -> bool {
+    block_resource_weight(
+        block_body_len,
+        proof_len,
+        sidecar_len,
+        user_txs,
+        live_inputs,
+        outputs,
+        state_frontier_nodes,
+    )
+    .is_some_and(|weight| weight <= MAX_BLOCK_RESOURCE_WEIGHT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +184,7 @@ mod tests {
         assert_eq!(MAX_SNAPSHOT_MANIFEST_SEGMENTS, u16::MAX as usize + 1);
         assert!(MAX_SEGMENT_BYTES.saturating_mul(MAX_INFLIGHT_SEGMENTS) == 64 * 1024 * 1024);
         assert!(MAX_ORPHAN_POOL_BYTES >= MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES);
+        assert!(MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES <= MAX_BLOCK_RESOURCE_WEIGHT);
     }
 
     #[test]
@@ -144,6 +202,23 @@ mod tests {
             1
         ));
         assert!(!proof_sidecar_combined_len_ok(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn block_resource_weight_counts_work_units() {
+        let light = block_resource_weight(1024, 1024, 1024, 1, 1, 2, 3).unwrap();
+        let heavy = block_resource_weight(1024, 1024, 1024, 1, 25, 2, 27).unwrap();
+        assert!(heavy > light);
+        assert!(block_resource_weight_ok(1024, 1024, 1024, 1, 25, 2, 27));
+        assert!(!block_resource_weight_ok(
+            MAX_BLOCK_RESOURCE_WEIGHT,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0
+        ));
     }
 
     #[test]

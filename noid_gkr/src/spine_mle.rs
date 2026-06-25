@@ -8,8 +8,7 @@
 //! Architecture
 //! ------------
 //!
-//! Instead of one 9-variable MLE per slot (the legacy `PermMle` shape),
-//! the kill-shot prover represents the full 59-permutation spine as
+//! The kill-shot prover represents the full 59-permutation spine as
 //! four side-by-side 15-variable MLEs on a single hypercube of
 //! `2^15 = 32 768` cells:
 //!

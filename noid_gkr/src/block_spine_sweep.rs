@@ -8,13 +8,14 @@
 //! a dedicated public API instead of reusing the Standard4x8 `BlockSpineProof`
 //! type, while reusing the same low-level dynamic block-spine sumcheck machinery.
 
-use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 use crate::batch_eval::{
-    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
+    prove_linear_eval_prebound, prove_multi_batch_eval, verify_linear_eval_prebound,
+    verify_multi_batch_eval, BatchEvalReduction, EvalClaim, LinearEvalClaim, LinearEvalProof,
+    LinearEvalTerm, MultiBatchEvalProof,
 };
 use crate::block_spine::{
     prove_block_spine_shift, prove_block_spine_unified, verify_block_spine_shift,
@@ -29,6 +30,7 @@ use crate::spine_sumcheck_sweep::reconstruct_sweep_spine_slot_states;
 const ELEM_BITS: usize = N_SWEEP_SPINE_ELEM_VARS;
 const ROUND_BITS: usize = N_SWEEP_SPINE_ROUND_VARS;
 const ROUND_LIMIT: usize = 1 << ROUND_BITS;
+const SWEEP_BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x5357_4253_5049_4E01; // "SWBSPIN"+1
 
 const _: () = assert!(STATE_SIZE == 4);
 const _: () = assert!(N_ROUNDS <= ROUND_LIMIT);
@@ -144,9 +146,8 @@ impl SweepBlockSpineMle {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SweepBlockSpineProof {
     pub kill_shot: BlockSpineKillShotProof,
-    pub state_batch: BatchEvalProof,
-    pub sin_batch: BatchEvalProof,
-    pub sout_batch: BatchEvalProof,
+    pub tx_hash_pins: LinearEvalProof,
+    pub batch: MultiBatchEvalProof,
     pub num_vars: usize,
     pub live_slots: usize,
 }
@@ -161,13 +162,12 @@ impl SweepBlockSpineProof {
             + shift_polys
             + main_finals
             + shift_finals
-            + self.state_batch.byte_len()
-            + self.sin_batch.byte_len()
-            + self.sout_batch.byte_len()
+            + self.tx_hash_pins.byte_len()
+            + self.batch.byte_len()
     }
 }
 
-/// Reductions delivered to the future sweep bucket FRI/STARK bridge.
+/// Reductions delivered to the composed batch relation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepBlockSpineReductions {
     pub state: BatchEvalReduction,
@@ -193,6 +193,29 @@ fn absorb_tx_body_hashes<T: FiatShamir<Block128>>(
         channel.absorb(hash[0]);
         channel.absorb(hash[1]);
     }
+}
+
+fn tx_hash_pin_claims(
+    n_instances: usize,
+    tx_body_hashes: &[[Block128; 2]],
+    num_vars: usize,
+) -> Vec<LinearEvalClaim> {
+    let mut claims = Vec::with_capacity(n_instances * 2);
+    for (tx_idx, tx_hash) in tx_body_hashes.iter().enumerate().take(n_instances) {
+        let wrap_slot = tx_idx * N_SWEEP_SPINE_SLOTS + (N_SWEEP_SPINE_SLOTS - 1);
+        for lane in 0..2 {
+            claims.push(LinearEvalClaim {
+                terms: vec![LinearEvalTerm {
+                    point: crate::block_spine::block_spine_state_point(
+                        num_vars, wrap_slot, N_ROUNDS, lane,
+                    ),
+                    coeff: Block128::ONE,
+                }],
+                value: tx_hash[lane],
+            });
+        }
+    }
+    claims
 }
 
 /// Prove one Sweep25x2 block-level spine Kill-Shot over `n_instances * 142` slots.
@@ -226,6 +249,14 @@ pub fn prove_sweep_block_spine_killshot<T: FiatShamir<Block128>>(
 
     let (shift, r_double_prime) = prove_block_spine_shift(&mle.inner, &r_prime, &main_red, channel);
 
+    let tx_hash_pin_claims = tx_hash_pin_claims(n_instances, tx_body_hashes, num_vars);
+    let (tx_hash_pins, tx_hash_pin_red) = prove_linear_eval_prebound(
+        &mle.inner.state,
+        &tx_hash_pin_claims,
+        SWEEP_BLOCK_SPINE_TX_HASH_PIN_TAG,
+        channel,
+    );
+
     let state_claims = vec![
         EvalClaim {
             point: r_prime.clone(),
@@ -235,26 +266,32 @@ pub fn prove_sweep_block_spine_killshot<T: FiatShamir<Block128>>(
             point: r_double_prime.clone(),
             value: shift.state_at_r2,
         },
+        EvalClaim {
+            point: tx_hash_pin_red.point,
+            value: tx_hash_pin_red.value,
+        },
     ];
-    let (state_batch, state_red) = prove_batch_eval(&mle.inner.state, &state_claims, channel);
 
     let sin_claims = vec![EvalClaim {
         point: r_double_prime.clone(),
         value: shift.s_in_at_r2,
     }];
-    let (sin_batch, sin_red) = prove_batch_eval(&mle.inner.s_in, &sin_claims, channel);
 
     let sout_claims = vec![EvalClaim {
         point: r_double_prime,
         value: shift.s_out_at_r2,
     }];
-    let (sout_batch, sout_red) = prove_batch_eval(&mle.inner.s_out, &sout_claims, channel);
+    let columns: [&[Block128]; 3] = [&mle.inner.state, &mle.inner.s_in, &mle.inner.s_out];
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let (batch, reductions) = prove_multi_batch_eval(&columns, &claims_by_column, channel);
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions
+        .try_into()
+        .expect("multi-batch returns one reduction per column");
 
     let proof = SweepBlockSpineProof {
         kill_shot: BlockSpineKillShotProof { main, shift },
-        state_batch,
-        sin_batch,
-        sout_batch,
+        tx_hash_pins,
+        batch,
         num_vars,
         live_slots,
     };
@@ -293,6 +330,15 @@ pub fn verify_sweep_block_spine_killshot<T: FiatShamir<Block128>>(
     let shift_red =
         verify_block_spine_shift(&proof.kill_shot.shift, &main_red, proof.num_vars, channel)?;
 
+    let tx_hash_pin_claims = tx_hash_pin_claims(n_instances, tx_body_hashes, proof.num_vars);
+    let tx_hash_pin_red = verify_linear_eval_prebound(
+        &proof.tx_hash_pins,
+        &tx_hash_pin_claims,
+        proof.num_vars,
+        SWEEP_BLOCK_SPINE_TX_HASH_PIN_TAG,
+        channel,
+    )?;
+
     let state_claims = vec![
         EvalClaim {
             point: main_red.r_prime.clone(),
@@ -302,20 +348,25 @@ pub fn verify_sweep_block_spine_killshot<T: FiatShamir<Block128>>(
             point: shift_red.r_double_prime.clone(),
             value: shift_red.state_at_r2,
         },
+        EvalClaim {
+            point: tx_hash_pin_red.point,
+            value: tx_hash_pin_red.value,
+        },
     ];
-    let state_red = verify_batch_eval(&proof.state_batch, &state_claims, proof.num_vars, channel)?;
 
     let sin_claims = vec![EvalClaim {
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(&proof.sin_batch, &sin_claims, proof.num_vars, channel)?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
         value: shift_red.s_out_at_r2,
     }];
-    let sout_red = verify_batch_eval(&proof.sout_batch, &sout_claims, proof.num_vars, channel)?;
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let reductions =
+        verify_multi_batch_eval(&proof.batch, &claims_by_column, proof.num_vars, channel)?;
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions.try_into().ok()?;
 
     Some(SweepBlockSpineReductions {
         state: state_red,
@@ -330,10 +381,21 @@ pub fn discharge_sweep_block_spine_reductions_native(
     inputs: &[SweepSpineInputs],
     reductions: &SweepBlockSpineReductions,
 ) -> bool {
-    let mle = SweepBlockSpineMle::build(inputs);
-    evaluate_slice(&mle.inner.state, &reductions.state.point) == reductions.state.value
-        && evaluate_slice(&mle.inner.s_in, &reductions.sin.point) == reductions.sin.value
-        && evaluate_slice(&mle.inner.s_out, &reductions.sout.point) == reductions.sout.value
+    let circuit = SweepSpineCircuit::build();
+    let mut slot_state_ins = Vec::with_capacity(inputs.len() * N_SWEEP_SPINE_SLOTS);
+    for input in inputs {
+        slot_state_ins.extend(
+            reconstruct_sweep_spine_slot_states(&circuit, input)
+                .iter()
+                .map(|(state_in, _)| *state_in),
+        );
+    }
+    crate::block_spine::discharge_block_spine_batch_reductions_from_slot_state_ins_native(
+        &slot_state_ins,
+        &reductions.state,
+        &reductions.sin,
+        &reductions.sout,
+    )
 }
 
 #[cfg(test)]

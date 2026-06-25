@@ -448,9 +448,9 @@ impl UnifiedTables {
 // the round poly is degree ≤ 9 with 10 evaluation points.
 // ---------------------------------------------------------------------------
 
-/// Tower-basis reference implementation of the round polynomial. The
+/// Tower-basis parity implementation of the round polynomial. The
 /// prover hot path now goes through `compute_round_polynomial_flat`
-/// (flat-basis hot path); this version is kept as a parity oracle for the
+/// (flat-basis hot path); this version is kept only as a parity oracle for the
 /// `flat_round_poly_matches_tower_round_poly` unit test below.
 #[allow(dead_code)]
 fn compute_round_polynomial(
@@ -1354,7 +1354,7 @@ fn boolean_tensor(point: &[Block128]) -> Vec<Block128> {
     eq_ind_partial_eval::<Block128>(point)
 }
 
-/// Tower-basis reference implementation of the shift-gadget round
+/// Tower-basis parity implementation of the shift-gadget round
 /// polynomial. Kept as a parity oracle for
 /// `flat_shift_round_poly_matches_tower`. Production
 /// callers go through `compute_shift_round_polynomial_flat`.
@@ -1508,7 +1508,7 @@ mod tests {
     fn flat_round_poly_matches_tower_round_poly() {
         // Parity test: the flat-basis prover hot path (monomial form)
         // must compute the bit-identical round polynomial as both the
-        // tower-basis reference and the per-evaluation flat-basis
+        // tower-basis parity path and the per-evaluation flat-basis
         // baseline, in every round.
         let mle = random_mle(424242);
         let rho: Vec<Block128> = (0..N_SPINE_UNIFIED_VARS)
@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn flat_shift_round_poly_matches_tower() {
         // Flat-basis shift gadget parity: the round
-        // polynomial is bit-identical to the tower-basis reference.
+        // polynomial is bit-identical to the tower-basis parity path.
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let n: usize = 1 << N_SPINE_UNIFIED_VARS;

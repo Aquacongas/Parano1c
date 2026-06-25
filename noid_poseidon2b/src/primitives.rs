@@ -87,29 +87,20 @@ pub const ADDRESS_HRP: &str = "noid";
 /// Error returned when decoding a bech32m address fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
-    /// String is neither valid bech32m nor 64-char hex.
+    /// String is not a valid bech32m address.
     InvalidFormat,
     /// Bech32m decoded OK but HRP is not `noid`.
     WrongHrp(String),
     /// Decoded payload is not exactly 32 bytes.
     WrongLength(usize),
-    /// Hex decode failed (wrong chars or odd length).
-    InvalidHex,
 }
 
 impl std::fmt::Display for AddressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidFormat => write!(
-                f,
-                "invalid address format (expected bech32m noid1… or 64-char hex)"
-            ),
+            Self::InvalidFormat => write!(f, "invalid address format (expected bech32m noid1…)"),
             Self::WrongHrp(h) => write!(f, "wrong address network: got '{h}', expected 'noid'"),
             Self::WrongLength(n) => write!(f, "wrong address length: got {n} bytes, expected 32"),
-            Self::InvalidHex => write!(
-                f,
-                "invalid hex in address (expected 64 lowercase hex chars)"
-            ),
         }
     }
 }
@@ -126,11 +117,7 @@ impl Address {
         bech32::encode::<Bech32m>(hrp, &self.0).expect("32 bytes always encodes")
     }
 
-    /// Decode an address from bech32m (`noid1…`) or legacy 64-char hex.
-    ///
-    /// Accepts both formats so tooling can transition gracefully.
-    /// New code should always produce bech32m; hex input is accepted for
-    /// backward-compatibility only.
+    /// Decode an address from canonical bech32m (`noid1…`).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
         parse_address(s)
     }
@@ -146,23 +133,6 @@ impl std::str::FromStr for Address {
 
 fn parse_address(s: &str) -> Result<Address, AddressError> {
     let s = s.trim();
-
-    // Try to determine format:
-    // - 64-char pure hex (legacy) → hex path
-    // - anything else → try bech32m first
-    let clean = s.trim_start_matches("0x");
-    let looks_like_hex = clean.len() == 64 && clean.chars().all(|c| c.is_ascii_hexdigit());
-
-    if looks_like_hex {
-        // Legacy hex path — accepted for backward compatibility.
-        let bytes: [u8; 32] = hex::decode(clean)
-            .map_err(|_| AddressError::InvalidHex)?
-            .try_into()
-            .map_err(|_| AddressError::WrongLength(0))?;
-        return Ok(Address(bytes));
-    }
-
-    // Bech32m path — the canonical format going forward.
     let (hrp, data) = bech32::decode(s).map_err(|_| AddressError::InvalidFormat)?;
     // HRP comparison is case-insensitive (bech32 spec: HRP is lowercased).
     if hrp.as_str().to_ascii_lowercase() != ADDRESS_HRP {
@@ -336,9 +306,8 @@ pub fn hash_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
 /// Fixed-length 4-field sponge under IV `OUTLEAF_`:
 /// `[slot_index, value, owner_hi, owner_lo]` absorbed as two rate
 /// blocks and squeezed **without a padding flush** (2 permutations
-/// total). This matches the AIR's two-instance output-leaf schedule
-/// (`OutputLeafPermA + OutputLeafPermB`) in
-/// `noid_air::airs::tx_body_merkle` byte-for-byte.
+/// total). This matches the canonical tx-body GKR output-leaf schedule
+/// (`OutputLeafPermA + OutputLeafPermB`) byte-for-byte.
 ///
 /// Domain separation vs. [`hash_leaf`] — which uses `TAG_LEAF` and a
 /// padding-flush — comes from the distinct `TAG_OUTLEAF` capacity IV,
@@ -810,15 +779,17 @@ mod tests {
     }
 
     #[test]
-    fn hex_still_accepted_for_compat() {
+    fn hex_address_string_is_rejected() {
         let addr = Address([
             0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
             0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x09, 0x0a, 0x0b, 0x0c,
         ]);
         let hex = hex::encode(addr.0);
-        let from_hex = Address::parse(&hex).expect("64-char hex must parse");
-        assert_eq!(from_hex, addr);
+        assert!(matches!(
+            Address::parse(&hex),
+            Err(AddressError::InvalidFormat)
+        ));
     }
 
     #[test]

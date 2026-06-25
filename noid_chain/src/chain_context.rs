@@ -26,7 +26,7 @@ use crate::consensus::{
     genesis::genesis_header,
     header::epoch_anchor_height,
     params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS},
-    pow::full_block_hash,
+    pow::block_id,
     validation::{validate_block_consensus, AnchorInfo},
     ConsensusError,
 };
@@ -38,7 +38,7 @@ use crate::state::ChainState;
 /// nodes use the MDBX-backed proof-native context instead.
 pub struct ChainContext {
     /// All block headers ever seen, indexed by height. Never pruned.
-    /// 276 bytes × N blocks (≈ 1.5 GB after 10 years at 1 block/min).
+    /// 212 bytes × N blocks (≈ 1.1 GB after 10 years at 1 block/min).
     pub headers: HashMap<u64, BlockHeader>,
 
     /// Current exact UTXO/ReuseGuard chain state.
@@ -56,7 +56,7 @@ pub struct ChainContext {
 }
 
 /// PoW target that is trivially satisfiable for any nonce.
-/// Used exclusively in tests — any Blake3 hash is < `[0xFF; 32]`.
+/// Used exclusively in tests — any 256-bit PoW digest is < `[0xFF; 32]`.
 #[cfg(test)]
 pub(crate) const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
@@ -71,7 +71,7 @@ impl ChainContext {
         let state = ChainState::new();
 
         let mut headers = HashMap::new();
-        let genesis_hash = full_block_hash(&genesis);
+        let genesis_hash = block_id(&genesis);
         headers.insert(0u64, genesis);
 
         // Genesis: no txs and no undo log.
@@ -111,7 +111,7 @@ impl ChainContext {
     /// median expansion trigger. Returns oldest-first.
     pub fn prev_active_counts(&self) -> Vec<u64> {
         let tip = self.tip_height;
-        let start = tip.saturating_sub(EXPANSION_WINDOW);
+        let start = tip.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
         (start..=tip)
             .filter_map(|h| self.headers.get(&h).map(|hdr| hdr.active_slot_count))
             .collect()
@@ -177,7 +177,7 @@ impl ChainContext {
         )?;
 
         // All checks passed — update context.
-        let block_hash = full_block_hash(&block.header);
+        let block_hash = block_id(&block.header);
 
         // Store header (forever).
         self.headers.insert(block.header.height, block.header);
@@ -208,12 +208,12 @@ impl ChainContext {
         // so the rest of the consensus logic is exercised normally.
         let mut genesis = crate::consensus::genesis::genesis_header();
         genesis.difficulty_target = TEST_TARGET;
-        // nonce = 0 trivially satisfies TEST_TARGET (any Blake3 hash < 0xFF..FF).
+        // nonce = 0 trivially satisfies TEST_TARGET (any digest < 0xFF..FF).
         genesis.nonce = 0;
 
         let state = crate::state::ChainState::new();
         let mut headers = std::collections::HashMap::new();
-        let genesis_hash = crate::consensus::pow::full_block_hash(&genesis);
+        let genesis_hash = crate::consensus::pow::block_id(&genesis);
         headers.insert(0u64, genesis);
 
         Self {
@@ -237,10 +237,10 @@ mod tests {
     use crate::block_header::BlockHeader;
     use crate::consensus::{
         genesis::GENESIS_TIMESTAMP,
-        params::{BLOCK_TIME, MEDIAN_TIME_BLOCKS, UNDO_RETENTION_DEPTH},
-        pow::full_block_hash,
+        params::{BLOCK_TIME, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, UNDO_RETENTION_DEPTH},
+        pow::block_id,
     };
-    // Easy target for test blocks: any Blake3 hash satisfies hash < 0xFF..FF.
+    // Easy target for test blocks: any digest satisfies hash < 0xFF..FF.
     // ASERT with perfect BLOCK_TIME timing returns this same target for every
     // subsequent block, so all chained test blocks can use nonce = 0.
     use crate::chain_context::TEST_TARGET;
@@ -252,7 +252,7 @@ mod tests {
         let new_root = state_snap.state_root();
 
         let mut header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: new_root,
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -260,8 +260,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
@@ -280,9 +278,9 @@ mod tests {
         assert_eq!(ctx.tip_height, 0);
         assert_eq!(ctx.header_count(), 1);
         assert_eq!(ctx.undo_logs.len(), 0);
-        // Tip hash must equal full_block_hash(genesis_header()).
+        // Tip hash must equal block_id(genesis_header()).
         let genesis = genesis_header();
-        assert_eq!(ctx.tip_hash, full_block_hash(&genesis));
+        assert_eq!(ctx.tip_hash, block_id(&genesis));
     }
 
     #[test]
@@ -353,6 +351,19 @@ mod tests {
             MEDIAN_TIME_BLOCKS
         );
         assert!(!ts.is_empty());
+    }
+
+    #[test]
+    fn prev_active_counts_covers_exact_expansion_window() {
+        let mut ctx = ChainContext::init_from_easy_genesis();
+        for _ in 0..(EXPANSION_WINDOW + 4) {
+            let block = build_empty_block_on(&mut ctx);
+            let ts = block.header.timestamp + 1;
+            ctx.apply_next_block(&block, ts).expect("apply");
+        }
+        let active = ctx.prev_active_counts();
+        assert_eq!(active.len(), EXPANSION_WINDOW as usize);
+        assert!(!active.is_empty());
     }
 
     /// Ensure GENESIS_TIMESTAMP is a reasonable value (sanity check on the constant).

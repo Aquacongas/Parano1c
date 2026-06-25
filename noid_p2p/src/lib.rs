@@ -5,7 +5,7 @@
 //!
 //! Implements:
 //! - GossipSub broadcast: blocks (/paranoid/blocks/1), txs (/paranoid/txs/1)
-//! - Request-Response: headers, recent blocks, recursive proof (O(1) sync)
+//! - Request-Response: headers, recent blocks, and the public HistoryProof endpoint
 //! - Identify + Ping for peer management
 
 pub mod behaviour;

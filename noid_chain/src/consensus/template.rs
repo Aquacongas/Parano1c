@@ -6,16 +6,18 @@
 //! A `BlockTemplate` is a fully computed block ready for PoW search:
 //! - Transaction set selected and conflict-resolved
 //! - State applied to scratch copy → `state_root` known
-//! - All header fields computed except `nonce` and `proof_transcript_hash`
+//! - All semantic header fields computed except `nonce`
 //!
-//! The miner receives `header_core_bytes(nonce=0)` and searches for a valid nonce.
-//! When found, the full node finalises: `header = header_core + nonce + proof_hash`.
+//! The miner receives a semantic header with `nonce = 0` and searches for a
+//! valid nonce under the fixed Poseidon2b PoW field schedule.
+//! When found, the full node finalises the semantic header and attaches detached
+//! proof/sidecar witness bytes for validation.
 //!
-//! # Why state_root is in header_core (PoW input)
+//! # Why state_root is in the PoW input
 //!
 //! Including `state_root` in the PoW hash prevents external miners from changing
 //! the coinbase address: a different coinbase → different post-state → different
-//! `state_root` → different `header_core` → must redo PoW from scratch.
+//! `state_root` → different Poseidon2b PoW input → must redo PoW from scratch.
 //! This is Paranoid's block-withholding protection.
 
 use std::collections::HashSet;
@@ -24,7 +26,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
-use crate::consensus::pow::full_block_hash;
+use crate::consensus::pow::block_id;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
 // ---------------------------------------------------------------------------
@@ -33,8 +35,8 @@ use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
 /// A fully assembled block template ready for PoW search.
 ///
-/// All header fields except `nonce` and `proof_transcript_hash` are fixed.
-/// The miner iterates nonces over `header_core_bytes()` and returns a valid one.
+/// All semantic header fields except `nonce` are fixed.
+/// The miner iterates nonces over the fixed Poseidon2b PoW field schedule.
 #[derive(Debug, Clone)]
 pub struct BlockTemplate {
     /// Coinbase transaction (always first in the block).
@@ -64,16 +66,8 @@ pub struct BlockTemplate {
 }
 
 impl BlockTemplate {
-    /// Build a `BlockHeader` from this template with the given nonce and
-    /// proof_transcript_hash.
-    ///
-    /// Called after: (a) miner returns valid nonce, (b) BlockProof is ready.
-    pub fn into_header(
-        self,
-        nonce: u128,
-        proof_transcript_hash: Digest,
-        witness_root: Digest,
-    ) -> BlockHeader {
+    /// Build a semantic `BlockHeader` from this template with the given nonce.
+    pub fn into_header(self, nonce: u128) -> BlockHeader {
         BlockHeader {
             prev_block_hash: self.prev_block_hash,
             state_root: self.state_root,
@@ -83,16 +77,14 @@ impl BlockTemplate {
             miner_address: self.miner_address,
             nonce,
             difficulty_target: self.difficulty_target,
-            proof_transcript_hash,
-            witness_root,
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
         }
     }
 
-    /// Build a `BlockHeader` for PoW purposes (nonce=0, proof fields zeroed).
-    /// Use `header_core_bytes(hdr)` from pow.rs to get the 212-byte PoW input.
+    /// Build a `BlockHeader` for PoW purposes with the supplied nonce.
+    /// Use `pow_header_fields(hdr)` from pow.rs to get the fixed PoW input.
     pub fn to_pow_header(&self, nonce: u128) -> BlockHeader {
         BlockHeader {
             prev_block_hash: self.prev_block_hash,
@@ -103,8 +95,6 @@ impl BlockTemplate {
             miner_address: self.miner_address,
             nonce,
             difficulty_target: self.difficulty_target,
-            proof_transcript_hash: [0u8; 32], // excluded from PoW
-            witness_root: [0u8; 32],          // excluded from PoW
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
@@ -162,8 +152,8 @@ pub fn build_block_template(
 ) -> Result<BlockTemplate, TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
+    use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::{claimable_fee_for_tx_body, required_fee_for_tx_body};
-    use crate::consensus::timestamps::median_u64;
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
     use noid_tx::{hash_tx_body, TxBody, TxOutput};
 
@@ -173,20 +163,12 @@ pub fn build_block_template(
     // 2. Determine expansion trigger using median over prev_active_counts window.
     //    Must match validate_block_consensus exactly so the block we produce passes
     //    consensus validation.
-    use crate::consensus::params::{EXPAND_DENOM, EXPAND_NUM, LOG_SLOTS_MAX};
-    let prev_capacity = 1u64.checked_shl(parent.log_slots).unwrap_or(u64::MAX);
-    let median_active = if prev_active_counts.is_empty() {
-        parent.active_slot_count
-    } else {
-        median_u64(prev_active_counts)
-    };
-    let should_expand =
-        median_active.saturating_mul(EXPAND_DENOM) >= prev_capacity.saturating_mul(EXPAND_NUM);
-    let new_log_slots = if should_expand {
-        (parent.log_slots + 1).min(LOG_SLOTS_MAX)
-    } else {
-        parent.log_slots
-    };
+    let new_log_slots = expected_child_log_slots(
+        parent.log_slots,
+        parent.active_slot_count,
+        prev_active_counts,
+    );
+    let should_expand = new_log_slots != parent.log_slots;
 
     // Wallet proofs are bound to log_slots. If this block expands the state,
     // mempool transactions proved against the parent log_slots cannot be valid
@@ -261,7 +243,7 @@ pub fn build_block_template(
         .fold(0u64, |acc, f| acc.saturating_add(f));
     let coinbase_value = block_reward(new_log_slots).saturating_add(claimable_fee_sum);
 
-    let prev_block_hash = full_block_hash(parent);
+    let prev_block_hash = block_id(parent);
     let cb_body = TxBody::standard(
         prev_block_hash,
         0,
@@ -488,13 +470,7 @@ mod tests {
             owner: Address([0x44; 32]),
             valid: true,
         };
-        let body = TxBody::standard(
-            full_block_hash(&parent),
-            9_000,
-            vec![input],
-            vec![output],
-            false,
-        );
+        let body = TxBody::standard(block_id(&parent), 9_000, vec![input], vec![output], false);
         let tx = Transaction {
             tx_body_hash: hash_tx_body(
                 &body.epoch_anchor,
@@ -550,10 +526,10 @@ mod tests {
             GENESIS_TARGET,
         )
         .unwrap();
-        assert_eq!(tmpl1.coinbase.body.epoch_anchor, full_block_hash(&parent));
+        assert_eq!(tmpl1.coinbase.body.epoch_anchor, block_id(&parent));
 
         crate::state::apply_tx(&mut state, &tmpl1.coinbase.body).unwrap();
-        let parent2 = tmpl1.clone().into_header(0, [1u8; 32], [1u8; 32]);
+        let parent2 = tmpl1.clone().into_header(0);
         let tmpl2 = build_block_template(
             &parent2,
             &state,
@@ -565,7 +541,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(tmpl2.coinbase.body.epoch_anchor, full_block_hash(&parent2));
+        assert_eq!(tmpl2.coinbase.body.epoch_anchor, block_id(&parent2));
         assert_ne!(tmpl1.coinbase.tx_body_hash, tmpl2.coinbase.tx_body_hash);
     }
 
@@ -586,11 +562,9 @@ mod tests {
         )
         .unwrap();
 
-        let header = tmpl.clone().into_header(42u128, [1u8; 32], [2u8; 32]);
+        let header = tmpl.clone().into_header(42u128);
         assert_eq!(header.height, 1);
         assert_eq!(header.nonce, 42);
-        assert_eq!(header.proof_transcript_hash, [1u8; 32]);
-        assert_eq!(header.witness_root, [2u8; 32]);
         assert_eq!(header.state_root, tmpl.state_root);
     }
 }

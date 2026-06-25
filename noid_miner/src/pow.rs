@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Parallel Blake3 PoW nonce search.
+//! Parallel Poseidon2b PoW nonce search.
 //!
-//! PoW is computed over `header_core` (212 bytes, excludes `proof_transcript_hash`).
-//! This allows certificate assembly and PoW search to run concurrently.
+//! PoW is computed over the fixed semantic header field schedule. Detached
+//! proof and authorization sidecar bytes are not header fields, so certificate
+//! assembly and PoW search can run concurrently.
 //!
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::le256_lt;
-use noid_chain::consensus::pow::{header_core_bytes_into, NONCE_OFFSET};
+use noid_chain::consensus::pow::{poseidon_pow_digest_nonce_batch, pow_header_fields};
 
 /// Result of a successful PoW search.
 #[derive(Debug, Clone)]
@@ -21,8 +22,8 @@ pub struct PowSolution {
 /// Search for a valid PoW nonce using the current Rayon pool.
 /// Internal miner calls this inside its dedicated PoW pool.
 ///
-/// `header_template` must have `proof_transcript_hash = [0;32]` and `witness_root = [0;32]`
-/// (they are not part of the PoW hash; only `header_core` is hashed).
+/// Detached witness fields are not part of the PoW hash; only semantic header
+/// fields are absorbed under the `POWHDR__` domain.
 ///
 /// Returns `Some(PowSolution)` when found, or `None` if cancelled via the
 /// `cancel` channel (when a new P2P block arrives or a new template is ready).
@@ -46,9 +47,10 @@ pub fn search_pow_parallel(
     };
 
     // Partition the 128-bit nonce space into thread-sized chunks.
-    // Each thread checks cancel every per_thread iterations (~125K on 8 cores).
-    // At ~1M hashes/s/core this gives ~125ms cancel latency.
+    // Each thread checks cancel once per nonce batch; this keeps cancellation
+    // responsive without paying an atomic load for every permutation.
     const CHUNK_SIZE: u128 = 1_000_000;
+    const DIGEST_BATCH: usize = 256;
     let target = header_template.difficulty_target;
 
     let mut start_nonce: u128 = random_start;
@@ -56,34 +58,38 @@ pub fn search_pow_parallel(
     // Hoist thread count — it never changes during a chunk.
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE / num_threads as u128;
+    let fields = pow_header_fields(header_template);
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
 
-        // Search this chunk in parallel. Each thread gets a stack buffer
-        // (no heap allocation), patches only the 16 nonce bytes per iteration.
+        // Search this chunk in parallel. Each thread reuses one canonical field
+        // schedule and computes nonce digests in packed Poseidon2b batches.
         let solution: Option<PowSolution> =
             (0..num_threads).into_par_iter().find_map_any(|thread_id| {
                 let thread_start = start_nonce + (thread_id as u128) * per_thread;
                 let thread_end = thread_start + per_thread;
+                let fields = fields;
+                let mut digests = [[0u8; 32]; DIGEST_BATCH];
+                let mut nonce = thread_start;
 
-                let mut buf = [0u8; 212];
-                header_core_bytes_into(header_template, &mut buf);
-
-                for nonce in thread_start..thread_end {
+                while nonce < thread_end {
                     if cancel.load(Ordering::Relaxed) {
                         return None;
                     }
-                    buf[NONCE_OFFSET..NONCE_OFFSET + 16].copy_from_slice(&nonce.to_le_bytes());
-                    let hash = *blake3::hash(&buf).as_bytes();
-                    if le256_lt(&hash, &target) {
-                        return Some(PowSolution {
-                            nonce,
-                            pow_hash: hash,
-                        });
+                    let n = ((thread_end - nonce).min(DIGEST_BATCH as u128)) as usize;
+                    poseidon_pow_digest_nonce_batch(&fields, nonce, &mut digests[..n]);
+                    for (i, hash) in digests[..n].iter().enumerate() {
+                        if le256_lt(hash, &target) {
+                            return Some(PowSolution {
+                                nonce: nonce + i as u128,
+                                pow_hash: *hash,
+                            });
+                        }
                     }
+                    nonce += n as u128;
                 }
                 None
             });

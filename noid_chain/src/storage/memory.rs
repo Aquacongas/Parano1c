@@ -5,7 +5,7 @@
 //!
 //! `RamBackend` is a thin `StateBackend` wrapper around `SegmentedFriState`.
 //! Recommended for `log_slots ≤ 26` (≤ 3 GB peak usage). When
-//! `log_slots > 26` the node MUST switch to the MDBX disk backend (K.3).
+//! `log_slots > 26` the node must switch to the MDBX disk backend.
 
 use crate::fri_state::{SlotValue, StateRoot};
 use crate::segmented_state::{SegmentColumns, SegmentedFriState};

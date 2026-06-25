@@ -4,10 +4,8 @@
 //! Kill-Shot orchestration.
 //!
 //! Top-level entry point that runs the unified Spine Kill-Shot:
-//! replaces the legacy `prove_perm` chain with a single
-//! `prove_sweep_spine_unified` + `prove_sweep_spine_shift` pair, then collapses the
-//! four resulting witness claims into three column-level batch-eval
-//! reductions:
+//! uses a single `prove_sweep_spine_unified` + `prove_sweep_spine_shift` pair, then collapses the
+//! four resulting witness claims into one multi-column batch-eval proof:
 //!
 //! ```text
 //!         column           claims at points
@@ -21,8 +19,8 @@
 //! The three columns share the same hypercube topology.
 //!
 //! `s_in` and `s_out` MLEs are built once from the slot witnesses and
-//! reduced alongside `state` via `batch_eval`. All three columns are
-//! discharged via `batch_eval` reductions on the unified hypercube.
+//! reduced alongside `state` via one multi-column batch-eval. All three
+//! columns share one terminal point on the unified hypercube.
 //!
 //! Transcript order
 //! ----------------
@@ -32,10 +30,8 @@
 //!    final witness scalars).
 //! 4. Run `prove_sweep_spine_shift` (squeezes δ; 15 round polys; 3 final
 //!    witness scalars).
-//! 5. Run `prove_batch_eval` on `state` with claims `(r', state_at_r)`
-//!    and `(r'', state_at_r2)`.
-//! 6. Run `prove_batch_eval` on `s_in` with claim `(r'', s_in_at_r2)`.
-//! 7. Run `prove_batch_eval` on `s_out` with claim `(r'', s_out_at_r2)`.
+//! 5. Run one multi-column `batch_eval` over `state`, `s_in`, and
+//!    `s_out`.
 //!
 //! Each step's transcript-side effects are encapsulated by the
 //! sub-prover; both prover and verifier share one `Poseidon2bChannel`.
@@ -45,7 +41,8 @@ use noid_core::Block128;
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 use crate::batch_eval::{
-    prove_batch_eval, verify_batch_eval, BatchEvalProof, BatchEvalReduction, EvalClaim,
+    prove_multi_batch_eval, verify_multi_batch_eval, BatchEvalReduction, EvalClaim,
+    MultiBatchEvalProof,
 };
 use crate::circuit_sweep::N_SWEEP_SPINE_SLOTS;
 use crate::circuit_sweep::{SweepSpineCircuit, SweepSpineInputs};
@@ -64,13 +61,9 @@ use crate::spine_unified_sweep::{
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SweepSpineProofKillShot {
     pub kill_shot: SweepSpineKillShotProof,
-    /// Discharges `state(r')` and `state(r'')` against the committed
-    /// `state` MLE.
-    pub state_batch: BatchEvalProof,
-    /// Discharges `s_in(r'')` against the committed `s_in` MLE.
-    pub sin_batch: BatchEvalProof,
-    /// Discharges `s_out(r'')` against the committed `s_out` MLE.
-    pub sout_batch: BatchEvalProof,
+    /// Discharges `state(r')`, `state(r'')`, `s_in(r'')`, and `s_out(r'')`
+    /// against the committed MLE columns with one shared terminal point.
+    pub batch: MultiBatchEvalProof,
 }
 
 impl SweepSpineProofKillShot {
@@ -82,17 +75,11 @@ impl SweepSpineProofKillShot {
         let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
         let main_finals = 12 * 16; // 12 witness claims emitted by main.
         let shift_finals = 3 * 16; // 3 witness claims emitted by shift.
-        main_polys
-            + shift_polys
-            + main_finals
-            + shift_finals
-            + self.state_batch.byte_len()
-            + self.sin_batch.byte_len()
-            + self.sout_batch.byte_len()
+        main_polys + shift_polys + main_finals + shift_finals + self.batch.byte_len()
     }
 }
 
-/// Reduction outputs delivered to the FRI / STARK bridge. Each
+/// Reduction outputs delivered to the composed batch relation. Each
 /// `BatchEvalReduction` carries `(point, value)` — the column
 /// commitment must open to `value` at `point`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +152,6 @@ pub fn prove_sweep_spine_killshot_with_states<T: FiatShamir<Block128>>(
     // (2) Shift gadget.
     let (shift, r_double_prime) = prove_sweep_spine_shift(&mle, &r_prime, channel);
 
-    // (3) state column batch: 2 claims at r' and r''.
     let state_claims = vec![
         EvalClaim {
             point: r_prime.clone(),
@@ -176,27 +162,26 @@ pub fn prove_sweep_spine_killshot_with_states<T: FiatShamir<Block128>>(
             value: shift.state_at_r2,
         },
     ];
-    let (state_batch, state_red) = prove_batch_eval(&mle.state, &state_claims, channel);
 
-    // (4) s_in column batch: 1 claim at r''.
     let sin_claims = vec![EvalClaim {
         point: r_double_prime.clone(),
         value: shift.s_in_at_r2,
     }];
-    let (sin_batch, sin_red) = prove_batch_eval(&mle.s_in, &sin_claims, channel);
 
-    // (5) s_out column batch: 1 claim at r''.
     let sout_claims = vec![EvalClaim {
         point: r_double_prime,
         value: shift.s_out_at_r2,
     }];
-    let (sout_batch, sout_red) = prove_batch_eval(&mle.s_out, &sout_claims, channel);
+    let columns: [&[Block128]; 3] = [&mle.state, &mle.s_in, &mle.s_out];
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let (batch, reductions) = prove_multi_batch_eval(&columns, &claims_by_column, channel);
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions
+        .try_into()
+        .expect("multi-batch returns one reduction per column");
 
     let proof = SweepSpineProofKillShot {
         kill_shot: SweepSpineKillShotProof { main, shift },
-        state_batch,
-        sin_batch,
-        sout_batch,
+        batch,
     };
     let reductions = SweepSpineKillShotReductions {
         state: state_red,
@@ -258,34 +243,23 @@ pub fn verify_sweep_spine_killshot<T: FiatShamir<Block128>>(
             value: shift_red.state_at_r2,
         },
     ];
-    let state_red = verify_batch_eval(
-        &proof.state_batch,
-        &state_claims,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        channel,
-    )?;
-
     let sin_claims = vec![EvalClaim {
         point: shift_red.r_double_prime.clone(),
         value: shift_red.s_in_at_r2,
     }];
-    let sin_red = verify_batch_eval(
-        &proof.sin_batch,
-        &sin_claims,
-        N_SWEEP_SPINE_UNIFIED_VARS,
-        channel,
-    )?;
 
     let sout_claims = vec![EvalClaim {
         point: shift_red.r_double_prime,
         value: shift_red.s_out_at_r2,
     }];
-    let sout_red = verify_batch_eval(
-        &proof.sout_batch,
-        &sout_claims,
+    let claims_by_column: [&[EvalClaim]; 3] = [&state_claims, &sin_claims, &sout_claims];
+    let reductions = verify_multi_batch_eval(
+        &proof.batch,
+        &claims_by_column,
         N_SWEEP_SPINE_UNIFIED_VARS,
         channel,
     )?;
+    let [state_red, sin_red, sout_red]: [BatchEvalReduction; 3] = reductions.try_into().ok()?;
 
     Some(SweepSpineKillShotReductions {
         state: state_red,
@@ -381,14 +355,14 @@ mod tests {
     }
 
     #[test]
-    fn killshot_rejects_tampered_state_batch() {
+    fn killshot_rejects_tampered_batch_terminal() {
         let circuit = SweepSpineCircuit::build();
         let inputs = fixture_inputs();
         let claimed = compute_sweep_tx_body_hash(&circuit, &inputs);
 
         let mut ch_p = Poseidon2bChannel::new();
         let (mut proof, _) = prove_sweep_spine_killshot(&circuit, &inputs, claimed, &mut ch_p);
-        proof.state_batch.b_final += Block128::ONE;
+        proof.batch.b_finals[0] += Block128::ONE;
 
         let mut ch_v = Poseidon2bChannel::new();
         assert!(

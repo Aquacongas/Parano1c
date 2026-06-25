@@ -22,8 +22,9 @@ pub use primitives::{
 /// Bulk import surface for UTXO-layer callers.
 pub mod prelude {
     pub use crate::native::{
-        capacity_iv, compress, DomainTag, Poseidon2bSponge, TAG_ADDRFIX, TAG_BLOCKHDR, TAG_COMMIT,
-        TAG_COMPRESS, TAG_FSCHALNG, TAG_LEAF, TAG_TXBODY,
+        capacity_iv, compress, poseidon2b_hash_byte_slices, poseidon2b_hash_bytes, DomainTag,
+        Poseidon2bSponge, TAG_ACCBLK, TAG_ADDRFIX, TAG_BLOCKHDR, TAG_COMMIT, TAG_COMPRESS,
+        TAG_FSCHALNG, TAG_LEAF, TAG_POWHDR, TAG_TXBODY,
     };
     pub use crate::primitives::{
         derive_address, hash_leaf, hash_tx_body, hash_utxo_leaf, Address, Commitment, Digest,

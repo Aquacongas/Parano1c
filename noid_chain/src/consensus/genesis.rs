@@ -6,9 +6,9 @@
 //! The genesis block is hardcoded: same bytes on every node.
 //! It has:
 //! - Zero state (all slots empty)
-//! - Trivial PoW target (2^252 — findable in microseconds)
+//! - Fixed Poseidon2b PoW target
 //! - Coinbase to burn address (initial coins bootstrapping)
-//! - `proof_transcript_hash = [1u8;32]` (marker — no real proof for genesis)
+//! - zero detached witness metadata; genesis has no block proof
 //!
 //! The genesis state_root is the exact composite root of an empty chain state.
 
@@ -43,9 +43,7 @@ pub fn genesis_header() -> BlockHeader {
         miner_address: GENESIS_BURN_ADDRESS,
         nonce: GENESIS_NONCE,
         difficulty_target: GENESIS_TARGET,
-        // No BlockProof for genesis: marker value 0x01...01
-        proof_transcript_hash: [0x01u8; 32],
-        witness_root: [0u8; 32],
+        // No BlockProof for genesis.
         log_slots: LOG_SLOTS_GENESIS,
         active_slot_count: 0,
         alloc_counter: 0,
@@ -68,9 +66,8 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 ];
 
 /// Pre-mined genesis nonce.
-/// Satisfies: `Blake3(header_core_bytes(genesis_header())) < GENESIS_TARGET`.
-/// Recomputed after the source-binding Merkle hash width changed to 256 bits.
-const GENESIS_NONCE: u128 = 447_551_453;
+/// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
+const GENESIS_NONCE: u128 = 482_250;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -100,7 +97,6 @@ mod tests {
         assert_eq!(h.height, 0);
         assert_eq!(h.prev_block_hash, [0u8; 32]);
         assert_eq!(h.difficulty_target, GENESIS_TARGET);
-        assert_ne!(h.proof_transcript_hash, [0u8; 32]);
         assert_eq!(h.log_slots, LOG_SLOTS_GENESIS);
         assert_eq!(h.active_slot_count, 0);
         assert_eq!(h.alloc_counter, 0);
@@ -145,8 +141,6 @@ mod tests {
             miner_address: GENESIS_BURN_ADDRESS,
             nonce: 0,
             difficulty_target: GENESIS_TARGET,
-            proof_transcript_hash: [0x01u8; 32],
-            witness_root: [0u8; 32],
             log_slots: LOG_SLOTS_GENESIS,
             active_slot_count: 0,
             alloc_counter: 0,

@@ -6,19 +6,17 @@
 //!
 //! A `Block` is a header plus an ordered list of transactions. Live full-node
 //! validation is proof-native: the block proof establishes the state transition,
-//! then the node commits the proven delta with `apply_state_delta`. The older
-//! sequential interpreter remains for in-memory tests and non-live utilities.
+//! then the node commits the proven delta with `apply_state_delta`. The native
+//! sequential interpreter remains only for in-memory tests and local utilities.
 //! Per-tx state-root chaining is obsolete; block-level state validation ensures
 //! `header.state_root` matches the final computed post-root after all txs are applied, and
 //! `tx_root` equals the Merkle reduction over the transactions'
 //! `tx_body_hash`es (Poseidon2b COMPRESS domain, zero-padded to a power of two).
 //! The Poseidon2b-based Merkle tree is ZK-friendly: its internal nodes can be
 //! proved inside the GKR block spine and recursive circuits without expensive
-//! boolean decomposition. Blake3 is reserved for PoW and P2P deduplication.
+//! boolean decomposition. Byte-native hashes are reserved for transport/object IDs.
 
 use noid_poseidon2b::native::compress;
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_FSCHALNG};
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::wire::WireError;
 use noid_tx::{hash_tx_body_for_shape, Transaction};
@@ -31,32 +29,24 @@ use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 /// a malformed wire blob from allocating unbounded memory.
 pub const BLOCK_MAX_TXS: usize = 256;
 
-/// A block: header plus transactions. A block's STARK proof lives
-/// outside this struct; its transcript is bound into
-/// `header.proof_transcript_hash` via [`proof_transcript_hash`].
+/// A semantic block: header plus ordered transactions.
+///
+/// Validation proofs live outside this struct as detachable witnesses. Their
+/// serialized bytes are mandatory for accepting user-transaction blocks, but
+/// they are not part of semantic block identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
 }
 
-/// Consensus-legal marker for coinbase-only blocks that carry no user transaction proof.
-pub const STUB_PROOF_MARKER: [u8; 32] = [1u8; 32];
-
-/// Errors returned when checking that a block header binds the exact proof bytes
-/// received from the network or RPC mining API.
+/// Errors returned when checking detached witness presence for a semantic block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofBindingError {
-    /// A block with user transactions did not include `BlockProof` bytes.
+    /// A block with user transactions did not include detached `BlockProof` bytes.
     MissingProof,
-    /// A coinbase-only block carried proof bytes; those blocks must use the stub marker.
+    /// A coinbase-only block carried proof bytes. Empty blocks have no block proof.
     UnexpectedProofForCoinbaseOnly,
-    /// A coinbase-only block did not use the consensus stub marker.
-    BadCoinbaseStub,
-    /// A user-transaction block used the coinbase-only stub marker.
-    StubProofWithUserTxs,
-    /// The header's `proof_transcript_hash` does not equal the expected proof digest.
-    BadProofTranscriptHash,
 }
 
 impl std::fmt::Display for ProofBindingError {
@@ -66,29 +56,13 @@ impl std::fmt::Display for ProofBindingError {
             Self::UnexpectedProofForCoinbaseOnly => {
                 write!(f, "coinbase-only block unexpectedly carried proof bytes")
             }
-            Self::BadCoinbaseStub => {
-                write!(f, "coinbase-only block must use the stub proof marker")
-            }
-            Self::StubProofWithUserTxs => {
-                write!(f, "user-transaction block used stub proof marker")
-            }
-            Self::BadProofTranscriptHash => {
-                write!(
-                    f,
-                    "block proof digest does not match header proof_transcript_hash"
-                )
-            }
         }
     }
 }
 
 impl std::error::Error for ProofBindingError {}
 
-/// Validate the block/proof shape required before proof-native consensus checks.
-///
-/// For user-transaction blocks this is only a structural guard because this
-/// crate intentionally does not parse `BlockProof`. The canonical proof
-/// transcript hash is checked by the block proof verifier before state commit.
+/// Validate detached witness presence required before proof-native consensus checks.
 pub fn validate_block_proof_binding(
     block: &Block,
     block_proof_bytes: &[u8],
@@ -98,18 +72,9 @@ pub fn validate_block_proof_binding(
         if block_proof_bytes.is_empty() {
             return Err(ProofBindingError::MissingProof);
         }
-        if block.header.proof_transcript_hash == STUB_PROOF_MARKER {
-            return Err(ProofBindingError::StubProofWithUserTxs);
-        }
-        if block.header.proof_transcript_hash == [0u8; 32] {
-            return Err(ProofBindingError::BadProofTranscriptHash);
-        }
     } else {
         if !block_proof_bytes.is_empty() {
             return Err(ProofBindingError::UnexpectedProofForCoinbaseOnly);
-        }
-        if block.header.proof_transcript_hash != STUB_PROOF_MARKER {
-            return Err(ProofBindingError::BadCoinbaseStub);
         }
     }
     Ok(())
@@ -122,10 +87,6 @@ pub enum BlockApplyError {
     Tx(ApplyError),
     /// Block carries more transactions than the hard wire/DoS cap.
     TooManyTransactions,
-    /// Header does not bind a non-zero proof transcript digest.
-    MissingProofTranscriptHash,
-    /// Header does not bind a non-zero DA witness digest.
-    MissingWitnessRoot,
     /// Transaction uses a shape that is not supported by the current proof stack.
     UnsupportedTxShape,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
@@ -146,11 +107,6 @@ pub enum BlockApplyError {
     CoinbaseNotFirst,
     /// Coinbase transaction has non-empty inputs (coinbase must have zero inputs).
     CoinbaseHasInputs,
-    /// Block contains non-coinbase transactions but `proof_transcript_hash` is the
-    /// development stub marker `[1u8; 32]`. Such blocks are produced only by the
-    /// local miner as a fallback when proof generation fails; they must never be accepted
-    /// from the network. Any block with user transactions MUST carry a real proof hash.
-    StubProofWithUserTxs,
 }
 
 impl From<ApplyError> for BlockApplyError {
@@ -161,11 +117,12 @@ impl From<ApplyError> for BlockApplyError {
 
 /// Sequential state-transition interpreter.
 ///
-/// This is not the live MDBX/node production validity path for user-transaction
-/// blocks. Full nodes verify `BlockProof` and then commit the sealed exact
-/// transition. This interpreter is kept for in-memory tests and utility contexts
-/// that need to recompute a transition directly. On error, `state` is left
-/// untouched (work happens on a snapshot and is swapped only on success).
+/// This is not the live MDBX/node production validity path for
+/// user-transaction blocks. Full nodes verify `BlockProof` and then commit the
+/// sealed exact transition. This interpreter is kept for in-memory tests and
+/// utility contexts that need to recompute a transition directly. On error,
+/// `state` is left untouched (work happens on a snapshot and is swapped only on
+/// success).
 pub fn apply_block(
     state: &mut ChainState,
     block: &Block,
@@ -173,28 +130,6 @@ pub fn apply_block(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(BlockApplyError::TooManyTransactions);
     }
-    if block.header.proof_transcript_hash == [0u8; 32] {
-        return Err(BlockApplyError::MissingProofTranscriptHash);
-    }
-    if block.header.witness_root == [0u8; 32] {
-        return Err(BlockApplyError::MissingWitnessRoot);
-    }
-
-    // SECURITY: Reject blocks that carry user transactions but use the development
-    // stub marker [1u8;32] as proof_transcript_hash.
-    //
-    // The marker is only legal for coinbase-only blocks where there is nothing to
-    // prove. A block with user transactions MUST reference a real proof transcript
-    // digest. Accepting stub-proof blocks with user transactions would let any node
-    // craft arbitrary UTXOs without a valid proof.
-    //
-    // The stub value [1u8;32] is intentionally distinct from the zero sentinel
-    // [0u8;32] (which is rejected above) so both are caught deterministically.
-    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if has_user_txs && block.header.proof_transcript_hash == STUB_PROOF_MARKER {
-        return Err(BlockApplyError::StubProofWithUserTxs);
-    }
-
     // Coinbase structure: at most one, must be first, zero inputs.
     // Coinbase VALUE validation (≤ block_reward + fees) is in consensus checks.
     let coinbase_count = block
@@ -380,7 +315,7 @@ pub fn apply_state_delta(
 /// Apply the genesis block to `state` without requiring a BlockProof or witness root.
 ///
 /// Genesis (height = 0) is a special case: it has no transactions to prove
-/// and uses marker values for `proof_transcript_hash` and `witness_root`.
+/// and uses zero detached witness metadata.
 /// All other validation (state_root, tx_root, counters) still applies.
 ///
 /// MUST only be called with `block.header.height == 0`. Use `apply_block`
@@ -422,9 +357,7 @@ pub fn apply_genesis_block(
 ///
 /// Uses a Poseidon2b COMPRESS binary Merkle tree, padded to the next power
 /// of two (minimum 2). Poseidon2b is chosen because this Merkle root feeds
-/// directly into the BlockProof spine and recursive proof system — the internal
-/// nodes are proved in-circuit, which requires a ZK-native hash function.
-/// Blake3 is NOT ZK-friendly and would make in-circuit proofs prohibitively large.
+/// directly into the block proof and history-proof relations.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
     if txs.is_empty() {
         return [0u8; 32];
@@ -440,16 +373,6 @@ pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
             .collect();
     }
     level[0]
-}
-
-/// Compress a Fiat-Shamir transcript's byte stream into the 32-byte
-/// digest that a block header binds as `proof_transcript_hash`
-/// (CRYPTO.md §8.1). Uses the `FSCHALNG` capacity IV since this digest
-/// summarizes exactly the Fiat-Shamir transcript; no new tag is needed.
-pub fn proof_transcript_hash(transcript_bytes: &[u8]) -> Digest {
-    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_FSCHALNG));
-    s.update(transcript_bytes);
-    s.finalize()
 }
 
 // ---------------------------------------------------------------------------
@@ -533,24 +456,13 @@ mod tests {
     const TEST_LOG_SLOTS: usize = 6;
 
     /// Build a `BlockHeader` with the correct consensus fields for `snap`
-    /// after applying `txs`. Sets a non-zero `proof_transcript_hash` and
-    /// `witness_root` to satisfy the non-zero guards in `apply_block`.
-    ///
-    /// NOTE: Uses [0xAA;32] for `proof_transcript_hash` to distinguish from
-    /// the stub marker [1u8;32] (which is now rejected for blocks with user txs).
+    /// after applying `txs`. Detached witness fields are deliberately populated
+    /// with detached witness metadata so tests can prove they do not affect `apply_block`.
     fn mk_header(snap: &ChainState, txs: &[Transaction]) -> BlockHeader {
         let mut dry = snap.clone();
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
-        // Check if this block has user transactions
-        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
-        // Use a non-stub hash for user-tx blocks; stub [1u8;32] only for coinbase-only.
-        let proof_transcript_hash = if has_user_txs {
-            [0xAAu8; 32]
-        } else {
-            [1u8; 32]
-        };
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
@@ -560,8 +472,6 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash,
-            witness_root: [2u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: dry.active_slot_count,
             alloc_counter: dry.alloc_counter,
@@ -763,54 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_transcript_hash_is_deterministic() {
-        assert_eq!(proof_transcript_hash(b"abc"), proof_transcript_hash(b"abc"));
-        assert_ne!(proof_transcript_hash(b"a"), proof_transcript_hash(b"b"));
-    }
-
-    #[test]
-    fn apply_block_rejects_missing_proof_transcript_hash() {
-        let mut state = fresh_state();
-        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let txs = vec![tx];
-        let mut header = mk_header(&state, &txs);
-        header.proof_transcript_hash = [0u8; 32]; // zero → missing
-        let block = Block {
-            header,
-            transactions: txs,
-        };
-        assert_eq!(
-            apply_block(&mut state, &block),
-            Err(BlockApplyError::MissingProofTranscriptHash)
-        );
-    }
-
-    #[test]
-    fn apply_block_rejects_stub_proof_with_user_txs() {
-        // SECURITY: Blocks with user transactions MUST NOT use the stub marker [1u8;32].
-        // The stub is only valid for coinbase-only blocks.
-        let mut state = fresh_state();
-        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let txs = vec![tx];
-        let mut header = mk_header(&state, &txs);
-        // Force the stub marker (apply_block must reject this)
-        header.proof_transcript_hash = [1u8; 32];
-        let block = Block {
-            header,
-            transactions: txs,
-        };
-        assert_eq!(
-            apply_block(&mut state, &block),
-            Err(BlockApplyError::StubProofWithUserTxs),
-            "block with user txs and stub proof_transcript_hash must be rejected"
-        );
-        // Sanity: state must not be modified on rejection
-        assert_eq!(state.active_slot_count, 0);
-    }
-
-    #[test]
-    fn apply_block_allows_stub_proof_coinbase_only() {
-        // Stub [1u8;32] is valid for coinbase-only blocks (nothing to prove).
+    fn apply_block_allows_no_proof_coinbase_only() {
         let mut state = fresh_state();
         let txs: Vec<Transaction> = vec![]; // empty block (no coinbase in this test)
         let header = BlockHeader {
@@ -822,8 +685,6 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [1u8; 32], // stub OK for empty/coinbase-only block
-            witness_root: [2u8; 32],
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -832,25 +693,7 @@ mod tests {
             header,
             transactions: txs,
         };
-        // Should succeed (no user txs → stub marker is acceptable)
-        apply_block(&mut state, &block).expect("empty block with stub proof should be accepted");
-    }
-
-    #[test]
-    fn apply_block_rejects_missing_witness_root() {
-        let mut state = fresh_state();
-        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
-        let txs = vec![tx];
-        let mut header = mk_header(&state, &txs);
-        header.witness_root = [0u8; 32]; // zero → missing
-        let block = Block {
-            header,
-            transactions: txs,
-        };
-        assert_eq!(
-            apply_block(&mut state, &block),
-            Err(BlockApplyError::MissingWitnessRoot)
-        );
+        apply_block(&mut state, &block).expect("empty block without proof should be accepted");
     }
 
     #[test]
@@ -858,9 +701,7 @@ mod tests {
         let mut state = fresh_state();
         let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
         let txs = vec![tx];
-        let mut header = mk_header(&state, &txs);
-        header.proof_transcript_hash = proof_transcript_hash(b"hello");
-        header.witness_root = [0xAAu8; 32];
+        let header = mk_header(&state, &txs);
         let block = Block {
             header,
             transactions: txs,
@@ -888,8 +729,6 @@ mod tests {
                 miner_address: Address([0u8; 32]),
                 nonce: 0,
                 difficulty_target: [0xFFu8; 32],
-                proof_transcript_hash: [1u8; 32],
-                witness_root: [2u8; 32],
                 log_slots: 24,
                 active_slot_count: 0,
                 alloc_counter: 0,
@@ -1004,8 +843,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash: [0x01u8; 32], // genesis marker
-            witness_root: [0u8; 32],             // genesis marker
             log_slots: TEST_LOG_SLOTS as u32,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -1037,12 +874,6 @@ mod tests {
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
-        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
-        let proof_transcript_hash = if has_user_txs {
-            [0xAAu8; 32]
-        } else {
-            [1u8; 32]
-        };
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
@@ -1052,8 +883,6 @@ mod tests {
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
-            proof_transcript_hash,
-            witness_root: [2u8; 32],
             log_slots: new_log_slots as u32,
             active_slot_count: dry.active_slot_count,
             alloc_counter: dry.alloc_counter,
@@ -1307,7 +1136,7 @@ mod tests {
         use crate::consensus::{
             genesis::GENESIS_TIMESTAMP,
             params::BLOCK_TIME,
-            pow::full_block_hash,
+            pow::block_id,
             validation::{validate_block_consensus, AnchorInfo},
         };
         const TEST_TARGET: [u8; 32] = [0xFF; 32];
@@ -1326,8 +1155,6 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: 4,
             active_slot_count: 12, // this is what triggers expansion in validator
             alloc_counter: 12,
@@ -1337,7 +1164,7 @@ mod tests {
         let mut exp_state = state.clone();
         exp_state.state.expand();
         let mut expansion_header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: exp_state.state_root(),
             tx_root: compute_tx_root(&[]),
             timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
@@ -1345,8 +1172,6 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: 5,          // expanded!
             active_slot_count: 12, // unchanged (no mints/spends)
             alloc_counter: 12,

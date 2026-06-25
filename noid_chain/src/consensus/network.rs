@@ -91,9 +91,6 @@ pub struct NetworkConfig {
     /// Gossipsub topic for new TxIntent announcements.
     pub topic_txs: &'static str,
 
-    /// Gossipsub topic for recursive proof updates.
-    pub topic_rec_proofs: &'static str,
-
     /// DNS seeds for peer discovery.
     pub dns_seeds: &'static [&'static str],
 }
@@ -108,7 +105,6 @@ impl NetworkConfig {
             p2p_protocol_id: "/noid/mainnet/1.0.0",
             topic_blocks: "/noid/mainnet/blocks/1",
             topic_txs: "/noid/mainnet/txs/1",
-            topic_rec_proofs: "/noid/mainnet/recproofs/1",
             // DNS seeds — two formats supported:
             //
             // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9400

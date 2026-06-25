@@ -12,7 +12,7 @@
 //! - logical split compositions (26 and 50 inputs).
 
 use bench_prover::{
-    consolidation_scenario, fmt_bytes, fmt_ms, live_counts, proof_size_standard, proof_size_sweep,
+    authorization_size, consolidation_scenario, fmt_bytes, fmt_ms, live_counts,
     prove_standard_wallet, prove_sweep_wallet, standard_fixture, standard_scenario,
     standard_wallet_bundle_size, sweep_fixture, sweep_scenario, sweep_wallet_bundle_size,
     StandardFixture, StandardWalletBench, SweepFixture, SweepWalletBench,
@@ -23,7 +23,7 @@ const SAMPLES_SWEEP: usize = 3;
 
 fn print_standard(f: &StandardFixture, r: &StandardWalletBench) {
     let (n_in, n_out) = live_counts(&f.scenario.body);
-    let (total, stark, auth) = proof_size_standard(&r.proof);
+    let auth = authorization_size(&r.proof);
     println!("  --------------------------------------------------------------------");
     println!("  {}", f.scenario.label);
     println!("  {}", f.scenario.desc);
@@ -34,15 +34,13 @@ fn print_standard(f: &StandardFixture, r: &StandardWalletBench) {
     println!("    verify median:  {}", fmt_ms(r.verify_time));
     let bundle = standard_wallet_bundle_size(f, &r.proof);
     println!("    wallet bundle:  {}", fmt_bytes(bundle));
-    println!("    authorization:  {}", fmt_bytes(total));
-    println!("      STARK:        {}", fmt_bytes(stark));
-    println!("      AuthGKR:      {}", fmt_bytes(auth));
+    println!("    authorization:  {}", fmt_bytes(auth));
     println!();
 }
 
 fn print_sweep(f: &SweepFixture, r: &SweepWalletBench) {
     let (n_in, n_out) = live_counts(&f.scenario.body);
-    let (total, stark, auth, spine) = proof_size_sweep(&r.proof);
+    let auth = authorization_size(&r.proof);
     println!("  --------------------------------------------------------------------");
     println!("  {}", f.scenario.label);
     println!("  {}", f.scenario.desc);
@@ -53,13 +51,7 @@ fn print_sweep(f: &SweepFixture, r: &SweepWalletBench) {
     println!("    verify median:  {}", fmt_ms(r.verify_time));
     let bundle = sweep_wallet_bundle_size(f, &r.proof);
     println!("    wallet bundle:  {}", fmt_bytes(bundle));
-    println!("    authorization:  {}", fmt_bytes(total));
-    println!("      STARK:        {}", fmt_bytes(stark));
-    println!("      AuthGKR:      {}", fmt_bytes(auth));
-    println!(
-        "      Wallet spine: {} (removed; block-side only)",
-        fmt_bytes(spine)
-    );
+    println!("    authorization:  {}", fmt_bytes(auth));
     println!();
 }
 
@@ -105,8 +97,8 @@ fn main() {
     println!("  These rows are composition summaries using the measured wallet bundles above.");
     println!();
 
-    let (s25_total, _, _, _) = proof_size_sweep(&r_sweep_25x2.proof);
-    let (std_tail_total, _, _) = proof_size_standard(&r_standard_1x2.proof);
+    let s25_total = authorization_size(&r_sweep_25x2.proof);
+    let std_tail_total = authorization_size(&r_standard_1x2.proof);
     let s25_bundle = sweep_wallet_bundle_size(&sweep_25x2, &r_sweep_25x2.proof);
     let std_tail_bundle = standard_wallet_bundle_size(&standard_1x2, &r_standard_1x2.proof);
 

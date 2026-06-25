@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
     proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HEADER_BYTES, MAX_MEMPOOL_SYNC_BYTES,
-    MAX_MEMPOOL_SYNC_TXS, MAX_RECURSIVE_PROOF_BYTES, MAX_SEGMENT_BYTES,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES,
+    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
@@ -30,8 +30,8 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::protocol::{
-    BlockGossipMsg, GetHeadersResponse, GetRecentBlockResponse, GetRecursiveProofResponse,
-    GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics, RecursiveProofGossipMsg,
+    BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetRecentBlockResponse,
+    GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics,
 };
 
 struct PendingStateSegmentResponse {
@@ -74,12 +74,6 @@ pub enum NetworkCommand {
         /// Public AuthGKR sidecar bytes (for inline mode). Empty = compact-only.
         block_auth_sidecar_bytes: Vec<u8>,
     },
-    /// Broadcast a new recursive proof update to all peers.
-    BroadcastRecursiveProof {
-        height: u64,
-        tip_hash: [u8; 32],
-        proof_bytes: Vec<u8>,
-    },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Vec<u8> },
     /// Connect to a seed peer.
@@ -119,10 +113,10 @@ pub enum NetworkCommand {
         segment_id: u16,
         expected_tip_height: u64,
     },
-    /// Request the latest recursive chain proof from a peer.
-    /// Used to cryptographically verify a state snapshot before applying it.
-    /// Emits `NetworkEvent::RecursiveProof` when the response arrives.
-    RequestRecursiveProof { peer: PeerId },
+    /// Request the public `HistoryProof` from a peer.
+    /// Production peers return no proof until real O(1) authority is active.
+    /// Emits `NetworkEvent::HistoryProof` when the response arrives.
+    RequestHistoryProof { peer: PeerId },
     /// Request a peer's mempool contents (all pending TxIntent bytes).
     /// Triggered on peer connect so late-joining nodes receive existing TXs.
     /// Emits `NetworkEvent::MempoolSyncResponse` when the response arrives.
@@ -152,13 +146,6 @@ pub enum NetworkEvent {
         /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
     },
-    /// A recursive proof update arrived from a peer.
-    RecursiveProofUpdate {
-        from: PeerId,
-        height: u64,
-        tip_hash: [u8; 32],
-        proof_bytes: Vec<u8>,
-    },
     /// A new TxIntent arrived from a peer.
     NewTx { from: PeerId, intent_bytes: Vec<u8> },
     /// Response to FetchHeaders: decoded headers from the peer.
@@ -177,12 +164,12 @@ pub enum NetworkEvent {
         from: PeerId,
         response: crate::protocol::GetStateSegmentResponse,
     },
-    /// Recursive chain proof received from a peer (response to RequestRecursiveProof).
-    /// Contains serialized `RecursiveBlockProof` bytes and the peer's tip header bytes.
-    /// Used to cryptographically verify a state snapshot before applying it.
-    RecursiveProof {
+    /// Future public `HistoryProof` response received from a peer.
+    ///
+    /// Empty `proof_bytes` means O(1) public sync is not active.
+    HistoryProof {
         from: PeerId,
-        /// Serialized `RecursiveBlockProof` bytes, or empty if peer has no proof yet.
+        /// Serialized public `HistoryProof` bytes, or empty while disabled.
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
@@ -271,22 +258,6 @@ impl P2PNetwork {
             .await;
     }
 
-    pub async fn broadcast_recursive_proof(
-        &self,
-        height: u64,
-        tip_hash: [u8; 32],
-        proof_bytes: Vec<u8>,
-    ) {
-        let _ = self
-            .cmd_tx
-            .send(NetworkCommand::BroadcastRecursiveProof {
-                height,
-                tip_hash,
-                proof_bytes,
-            })
-            .await;
-    }
-
     pub async fn broadcast_tx(&self, intent_bytes: Vec<u8>) {
         let _ = self
             .cmd_tx
@@ -345,12 +316,12 @@ impl P2PNetwork {
             .await;
     }
 
-    /// Request the latest recursive chain proof from a peer.
-    /// The response arrives as `NetworkEvent::RecursiveProof`.
-    pub async fn request_recursive_proof(&self, peer: PeerId) {
+    /// Request the public history proof from a peer.
+    /// The response arrives as `NetworkEvent::HistoryProof`.
+    pub async fn request_history_proof(&self, peer: PeerId) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestRecursiveProof { peer })
+            .send(NetworkCommand::RequestHistoryProof { peer })
             .await;
     }
 
@@ -417,13 +388,8 @@ async fn run_swarm(
     // Subscribe to network-specific gossip topics.
     let blocks_topic = gossipsub::IdentTopic::new(topics.blocks.clone());
     let txs_topic = gossipsub::IdentTopic::new(topics.txs.clone());
-    let rec_proofs_topic = gossipsub::IdentTopic::new(topics.rec_proofs.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic)?;
     swarm.behaviour_mut().gossipsub.subscribe(&txs_topic)?;
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&rec_proofs_topic)?;
 
     swarm.listen_on(listen_addr)?;
 
@@ -464,8 +430,6 @@ async fn run_swarm(
     let mut block_event_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
     let mut tx_gossip_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
-        std::collections::HashMap::new();
-    let mut recursive_proof_gossip_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
     let mut mempool_sync_last_request: std::collections::HashMap<PeerId, Instant> =
         std::collections::HashMap::new();
@@ -517,7 +481,6 @@ async fn run_swarm(
                     &mut reconnect,
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
-                    &mut recursive_proof_gossip_rate,
                 )
                 .await;
             }
@@ -719,26 +682,6 @@ fn handle_network_command(
                 Err(e) => tracing::error!("BlockGossipMsg serialize: {e}"),
             }
         }
-        NetworkCommand::BroadcastRecursiveProof {
-            height,
-            tip_hash,
-            proof_bytes,
-        } => {
-            let msg = RecursiveProofGossipMsg {
-                height,
-                tip_hash,
-                proof_bytes,
-            };
-            match bincode::serialize(&msg) {
-                Ok(encoded) => {
-                    let topic = gossipsub::IdentTopic::new(topics.rec_proofs.clone());
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
-                        tracing::debug!("gossipsub rec_proof: {e}");
-                    }
-                }
-                Err(e) => tracing::error!("RecursiveProofGossipMsg serialize: {e}"),
-            }
-        }
         NetworkCommand::BroadcastTx { intent_bytes } => {
             let topic = gossipsub::IdentTopic::new(topics.txs.clone());
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
@@ -800,12 +743,12 @@ fn handle_network_command(
             );
             tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
-        NetworkCommand::RequestRecursiveProof { peer } => {
+        NetworkCommand::RequestHistoryProof { peer } => {
             let _ = swarm
                 .behaviour_mut()
                 .proof_sync
-                .send_request(&peer, crate::protocol::GetRecursiveProofRequest);
-            tracing::debug!(peer = %peer, "requesting recursive proof for snapshot verification");
+                .send_request(&peer, crate::protocol::GetHistoryProofRequest);
+            tracing::debug!(peer = %peer, "requesting history proof for snapshot verification");
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -856,7 +799,6 @@ async fn handle_swarm_event(
     >,
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
-    recursive_proof_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
 ) {
     match event {
         // --- GossipSub: received broadcast ---
@@ -966,38 +908,6 @@ async fn handle_swarm_event(
                         from: propagation_source,
                         intent_bytes: message.data,
                     });
-                }
-            } else if topic == topics.rec_proofs.as_str() {
-                match bincode::deserialize::<crate::protocol::RecursiveProofGossipMsg>(
-                    &message.data,
-                ) {
-                    Ok(msg) => {
-                        if msg.proof_bytes.len() > MAX_RECURSIVE_PROOF_BYTES {
-                            tracing::warn!(peer = %propagation_source, len = msg.proof_bytes.len(), "recursive proof gossip too large — dropped");
-                        } else {
-                            const REC_PROOF_RATE_WINDOW: Duration = Duration::from_secs(60);
-                            const REC_PROOF_RATE_MAX: u32 = 4;
-                            let now = Instant::now();
-                            let entry = recursive_proof_gossip_rate
-                                .entry(origin)
-                                .or_insert((0, now));
-                            if now.duration_since(entry.1) > REC_PROOF_RATE_WINDOW {
-                                *entry = (1, now);
-                            } else if entry.0 >= REC_PROOF_RATE_MAX {
-                                tracing::debug!(peer = %origin, "recursive proof gossip rate limit exceeded — dropped");
-                                return;
-                            } else {
-                                entry.0 += 1;
-                            }
-                            let _ = event_tx.send(NetworkEvent::RecursiveProofUpdate {
-                                from: origin,
-                                height: msg.height,
-                                tip_hash: msg.tip_hash,
-                                proof_bytes: msg.proof_bytes,
-                            });
-                        }
-                    }
-                    Err(e) => tracing::debug!("RecursiveProofGossipMsg decode: {e}"),
                 }
             }
         }
@@ -1339,7 +1249,7 @@ async fn handle_swarm_event(
             );
         }
 
-        // --- Request-Response: recursive proof ---
+        // --- Request-Response: public history proof ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
             request_response::Event::Message {
                 message: request_response::Message::Request { channel, .. },
@@ -1347,7 +1257,6 @@ async fn handle_swarm_event(
             },
         )) => {
             let ctx = chain.read().await;
-            let proof_bytes = ctx.store.get_recursive_proof().ok().flatten();
             let tip_bytes = {
                 let mut buf = Vec::new();
                 ctx.tip_header().encode(&mut buf);
@@ -1356,14 +1265,14 @@ async fn handle_swarm_event(
             drop(ctx);
             let _ = swarm.behaviour_mut().proof_sync.send_response(
                 channel,
-                GetRecursiveProofResponse {
-                    proof_bytes,
+                GetHistoryProofResponse {
+                    proof_bytes: None,
                     tip_header_bytes: tip_bytes,
                 },
             );
         }
 
-        // --- Request-Response: recursive proof client side (our proof request answered) ---
+        // --- Request-Response: public history proof client side ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
@@ -1372,8 +1281,8 @@ async fn handle_swarm_event(
         )) => {
             let proof_bytes = response.proof_bytes.unwrap_or_default();
             let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
-            if proof_bytes.len() > MAX_RECURSIVE_PROOF_BYTES {
-                tracing::warn!(peer = %peer, len = proof_bytes.len(), "recursive proof response too large — dropped");
+            if proof_bytes.len() > MAX_HISTORY_PROOF_BYTES {
+                tracing::warn!(peer = %peer, len = proof_bytes.len(), "history proof response too large — dropped");
                 return;
             }
             if tip_header_bytes.len() > MAX_HEADER_BYTES {
@@ -1383,9 +1292,9 @@ async fn handle_swarm_event(
             tracing::debug!(
                 from = %peer,
                 proof_len = proof_bytes.len(),
-                "received recursive proof from peer"
+                "received history proof from peer"
             );
-            let _ = event_tx.send(NetworkEvent::RecursiveProof {
+            let _ = event_tx.send(NetworkEvent::HistoryProof {
                 from: peer,
                 proof_bytes,
                 tip_header_bytes,
@@ -1394,10 +1303,9 @@ async fn handle_swarm_event(
 
         // --- State sync: manifest server (step 1) ---
         //
-        // FIX1 fail-closed policy: public arbitrary-peer state snapshots are not
-        // served until immutable checkpoint generations and the real recursive
-        // verifier exist. Recent block sync remains available through the
-        // GetRecentBlock path.
+        // Fail-closed policy: public arbitrary-peer state snapshots are not
+        // served until HistoryProof verifies the accepted-block relation.
+        // Recent block sync remains available through the GetRecentBlock path.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message:
@@ -1415,7 +1323,7 @@ async fn handle_swarm_event(
                 tracing::info!(
                     requester_height = request.requester_height,
                     our_height,
-                    "state manifest not served: public snapshot sync disabled until checkpoint generation"
+                    "state manifest not served: public snapshot sync disabled until HistoryProof authority is active"
                 );
             }
             let _ = swarm
@@ -1516,8 +1424,8 @@ async fn handle_swarm_event(
 
         // --- State sync: segment server (step 2) ---
         //
-        // FIX1 fail-closed policy: no public snapshot segments are served until
-        // immutable checkpoint generations pin height/hash/root/segment set.
+        // Fail-closed policy: no public snapshot segments are served until
+        // HistoryProof pins height/hash/root/segment set.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::Message {
                 message:
@@ -1530,7 +1438,7 @@ async fn handle_swarm_event(
             tracing::debug!(
                 segment = request.segment_id,
                 expected_tip_height = request.expected_tip_height,
-                "state segment not served: public snapshot sync disabled until checkpoint generation"
+                "state segment not served: public snapshot sync disabled until HistoryProof authority is active"
             );
             let _ = swarm.behaviour_mut().state_segment_sync.send_response(
                 channel,
@@ -1768,6 +1676,6 @@ mod tests {
         assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(MAX_RECURSIVE_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
+        assert!(MAX_HISTORY_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
     }
 }

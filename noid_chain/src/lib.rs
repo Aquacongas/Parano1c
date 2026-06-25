@@ -17,8 +17,8 @@
 pub mod block;
 pub mod block_header;
 pub mod chain_context;
+pub mod checkpoint;
 pub mod consensus;
-pub mod da;
 pub mod exact_state_hash;
 pub mod fri_state;
 pub mod mempool;
@@ -59,24 +59,23 @@ pub use storage::{
 };
 
 // ---------------------------------------------------------------------------
-// DA layer
-// ---------------------------------------------------------------------------
-
-pub use da::{
-    pack_trace, packed_witness_root, payload_bytes, trace_witness_root, unpack_trace, DaError,
-    PackedWitness, PackedWitnessColumn,
-};
-
-// ---------------------------------------------------------------------------
 // Block layer
 // ---------------------------------------------------------------------------
 
 pub use block::{
-    apply_block, apply_genesis_block, apply_state_delta, compute_tx_root, proof_transcript_hash,
+    apply_block, apply_genesis_block, apply_state_delta, compute_tx_root,
     validate_block_proof_binding, Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS,
-    STUB_PROOF_MARKER,
 };
-pub use block_header::{hash_block_header, BlockHeader};
+pub use block_header::{block_id, hash_block_header, BlockHeader};
+
+// ---------------------------------------------------------------------------
+// Checkpoint packages
+// ---------------------------------------------------------------------------
+
+pub use checkpoint::{
+    CheckpointCoverage, CheckpointSegmentPayload, ImmutableCheckpointManifest,
+    ImmutableCheckpointPackage,
+};
 
 // ---------------------------------------------------------------------------
 // Chain state
@@ -85,7 +84,7 @@ pub use block_header::{hash_block_header, BlockHeader};
 pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use reuse_guard::{GuardBucket, ReuseGuard, REUSE_DELAY, REUSE_GUARD_BUCKETS};
-pub use state::{apply_tx, ApplyError, ChainState, StateTransition};
+pub use state::{apply_tx, ApplyError, ChainState, SparseUtxoBuildError, StateTransition};
 pub use state_delta::{
     build_exact_action_surface, build_state_delta_action_surface, build_state_delta_witness,
     ExactActionSurface, StateDeltaAction, StateDeltaActionKind, StateDeltaActionSurface,

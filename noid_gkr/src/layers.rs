@@ -17,12 +17,12 @@
 //!   a deterministic **round-constant programme** `rc[i][r]` sourced
 //!   from `noid_poseidon2b::native::permutation`.
 //!
-//! The layout exactly mirrors `noid_air::airs::poseidon_perm`'s column
-//! semantics — partial-round rows zero out lanes 1..3 of `sin`, `x2`,
+//! The layout follows the native permutation semantics: partial-round rows
+//! zero out lanes 1..3 of `sin`, `x2`,
 //! `x4`, `x3`, `sout`, and the MDS_PARTIAL step reads `[sout[0],
 //! state[1], state[2], state[3]]` (lanes 1..3 come from the raw state,
 //! not from the zeroed S-box outputs). This is critical for the
-//! batch-eval sumcheck to line up with the AIR's committed columns.
+//! batch-eval sumcheck to line up with the committed MLE columns.
 //!
 //! This module produces *no* proof. Its sole contract is:
 //! `evaluate_permutation(state_in).final_state()` must byte-equal
@@ -46,9 +46,8 @@ pub enum RoundKind {
     Partial,
 }
 
-/// `true` iff round `r` is full. Byte-identical to
-/// `noid_air::airs::poseidon_perm::is_full_round` and to the native
-/// `permute_mut`'s branch.
+/// `true` iff round `r` is full. Byte-identical to the native
+/// `permute_mut` branch.
 #[inline]
 pub fn round_kind(r: usize) -> RoundKind {
     if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {

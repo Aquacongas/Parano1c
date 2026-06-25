@@ -20,8 +20,12 @@ use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES, MAX_RPC_SALT_BYTES,
     MAX_TX_INTENT_BYTES_GLOBAL,
 };
-use noid_chain::consensus::{allocator::generate_slot_hints, pow::full_block_hash};
+use noid_chain::consensus::{
+    allocator::generate_slot_hints,
+    pow::{block_id, pow_header_fields},
+};
 use noid_chain::storage::MdbxChainContext;
+use noid_chain::wire::BLOCK_HEADER_NONCE_OFFSET;
 use noid_mempool::AsyncMempool;
 use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 
@@ -43,6 +47,15 @@ fn trim_hex_prefix(s: &str) -> &str {
     s.strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s)
+}
+
+fn encode_pow_fields_hex(header: &noid_chain::BlockHeader) -> String {
+    let fields = pow_header_fields(header);
+    let mut bytes = Vec::with_capacity(fields.len() * 16);
+    for field in fields {
+        bytes.extend_from_slice(&field.to_u128().to_le_bytes());
+    }
+    hex::encode(bytes)
 }
 
 fn ensure_hex_max_chars(
@@ -274,13 +287,8 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
-    async fn get_recursive_proof(&self) -> RpcResult<Option<String>> {
-        let chain = self.chain.read().await;
-        match chain.store.get_recursive_proof() {
-            Ok(Some(bytes)) => Ok(Some(hex::encode(bytes))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(rpc_err(e.to_string())),
-        }
+    async fn get_history_proof(&self) -> RpcResult<Option<String>> {
+        Ok(None)
     }
 
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo> {
@@ -398,7 +406,7 @@ impl ParanoidApiServer for RpcHandler {
     async fn get_block_hash(&self, height: u64) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
         match chain.get_header_from_store(height) {
-            Ok(Some(hdr)) => Ok(Some(hex::encode(full_block_hash(&hdr)))),
+            Ok(Some(hdr)) => Ok(Some(hex::encode(block_id(&hdr)))),
             Ok(None) => Ok(None),
             Err(e) => Err(rpc_err(e.to_string())),
         }
@@ -409,7 +417,7 @@ impl ParanoidApiServer for RpcHandler {
         let chain = self.chain.read().await;
         match chain.get_header_from_store(height) {
             Ok(Some(hdr)) => {
-                let hash = full_block_hash(&hdr);
+                let hash = block_id(&hdr);
                 Ok(Some(BlockHeaderInfo {
                     height: hdr.height,
                     hash: hex::encode(hash),
@@ -419,7 +427,6 @@ impl ParanoidApiServer for RpcHandler {
                     timestamp: hdr.timestamp,
                     miner: Address(hdr.miner_address.0).to_bech32(),
                     difficulty_target: hex::encode(hdr.difficulty_target),
-                    proof_transcript_hash: hex::encode(hdr.proof_transcript_hash),
                     log_slots: hdr.log_slots,
                     active_slot_count: hdr.active_slot_count,
                     alloc_counter: hdr.alloc_counter,
@@ -459,7 +466,7 @@ impl ParanoidApiServer for RpcHandler {
                     .get_header_from_store(height)
                     .ok()
                     .flatten()
-                    .map(|h| hex::encode(full_block_hash(&h)))
+                    .map(|h| hex::encode(block_id(&h)))
                     .unwrap_or_default();
                 Ok(Some(TxInfo {
                     tx_hash: txhash,
@@ -505,10 +512,10 @@ impl ParanoidApiServer for RpcHandler {
         let reward = block_reward(tip.log_slots);
         let rec_height = chain
             .store
-            .get_recursive_proof()
+            .get_local_history_cache()
             .ok()
             .flatten()
-            .and_then(|b| bincode::deserialize::<noid_recursive::RecursiveBlockProof>(&b).ok())
+            .and_then(|b| bincode::deserialize::<noid_recursive::LocalHistoryCache>(&b).ok())
             .map(|p| p.block_height);
         Ok(MiningInfo {
             height,
@@ -517,7 +524,7 @@ impl ParanoidApiServer for RpcHandler {
             block_reward_micronoid: reward,
             block_reward_noid: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
-            recursive_proof_height: rec_height,
+            local_history_cache_height: rec_height,
         })
     }
 
@@ -596,7 +603,7 @@ impl ParanoidApiServer for RpcHandler {
     async fn get_epoch_anchor(&self) -> RpcResult<String> {
         let chain = self.chain.read().await;
         let tip = chain.tip_header();
-        let hash = full_block_hash(tip);
+        let hash = block_id(tip);
         Ok(hex::encode(hash))
     }
 
@@ -678,9 +685,9 @@ impl ParanoidApiServer for RpcHandler {
 
     /// Get a block template for external miners (or internal use).
     ///
-    /// Returns the 212-byte `header_core` as hex — the PoW input.
+    /// Returns the fixed Poseidon2b PoW field schedule as hex.
     /// The external miner brute-forces `nonce` such that:
-    ///   `Blake3(header_core || nonce) < difficulty_target`
+    ///   `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`
     ///
     /// CANNOT change the coinbase address: it is committed via the
     /// block certificate which the full node generates. Changing the
@@ -704,11 +711,11 @@ impl ParanoidApiServer for RpcHandler {
             // --allow-custom-coinbase is active (requires --mining-key):
             // accept any valid address. The bearer token is already validated
             // by the HTTP middleware before we reach this point.
-            parse_address_hex(&miner_address)?
+            parse_address_param(&miner_address)?
         } else {
             // Default: coinbase is locked to the node's payout address.
             // External callers cannot redirect rewards.
-            let requested = parse_address_hex(&miner_address)?;
+            let requested = parse_address_param(&miner_address)?;
             if requested.0 != self.mining_payout_address.0 {
                 return Err(rpc_err(
                     "miner_address must match the node's configured payout address. \
@@ -791,33 +798,31 @@ impl ParanoidApiServer for RpcHandler {
             })
             .fold(0u64, |acc, fee| acc.saturating_add(fee));
         let pow_header = tmpl.header_for_pow(0);
-        let header_core = noid_chain::consensus::pow::header_core_bytes(&pow_header);
+        let pow_fields_hex = encode_pow_fields_hex(&pow_header);
         let diff_target = pow_header.difficulty_target;
 
-        // Run certificate assembly so the full block (including proof fields) is ready.
+        // Run certificate assembly so detached proof data is ready.
         // External miner only needs to patch the nonce — no other computation required.
-        // Coinbase-only blocks use the marker path; user-tx blocks carry proof + auth sidecar.
+        // Coinbase-only blocks carry no proof; user-tx blocks carry proof + auth sidecar.
         let tmpl_for_prove = tmpl.clone();
-        let (proof_transcript_hash, witness_root, proof_bytes, auth_sidecar_bytes) =
-            tokio::task::spawn_blocking(move || {
-                noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
-            })
-            .await
-            .map_err(|e| rpc_err(format!("prove task: {e}")))?
-            .map_err(|e| rpc_err(format!("prove_block: {e}")))?;
+        let (proof_bytes, auth_sidecar_bytes) = tokio::task::spawn_blocking(move || {
+            noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
+        })
+        .await
+        .map_err(|e| rpc_err(format!("prove task: {e}")))?
+        .map_err(|e| rpc_err(format!("prove_block: {e}")))?;
 
         // Seal block with nonce = 0. External miner patches bytes [144..160].
-        let sealed = tmpl.seal(0, proof_transcript_hash, witness_root);
+        let sealed = tmpl.seal(0);
         let block_bytes = sealed.to_bytes();
 
-        // nonce_offset inside block bytes = header starts at byte 0,
-        // nonce is at NONCE_OFFSET (144) inside the header.
-        let nonce_offset = noid_chain::consensus::pow::NONCE_OFFSET;
+        // nonce_offset inside block bytes = header starts at byte 0.
+        let nonce_offset = BLOCK_HEADER_NONCE_OFFSET;
 
         let block_proof_hex = hex::encode(&proof_bytes);
         let block_auth_sidecar_hex = hex::encode(&auth_sidecar_bytes);
         Ok(BlockTemplateResponse {
-            header_core_hex: hex::encode(header_core),
+            pow_fields_hex,
             block_hex: hex::encode(block_bytes),
             block_proof_hex: block_proof_hex.clone(),
             block_auth_sidecar_hex,
@@ -903,7 +908,7 @@ impl ParanoidApiServer for RpcHandler {
                  anchor,
                  pre_state,
                  state| {
-                    noid_block::validate_block_from_network(
+                    noid_block::accept_block(
                         block,
                         proof_bytes,
                         auth_sidecar_bytes,
@@ -926,7 +931,7 @@ impl ParanoidApiServer for RpcHandler {
                     .put_block_auth_sidecar(block.header.height, &block_auth_sidecar_bytes)
                     .map_err(|e| rpc_err(format!("store block auth sidecar: {e}")))?;
             }
-            let hash = full_block_hash(&block.header);
+            let hash = block_id(&block.header);
             let view = noid_mempool::ChainView::from_mdbx(&ctx);
             (hash, view)
         };
@@ -1005,7 +1010,7 @@ impl ParanoidApiServer for RpcHandler {
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendPlan> {
-        let _to_address = parse_address_hex(&to_hex)?.0;
+        let _to_address = parse_address_param(&to_hex)?.0;
         let (active_slot_count, log_slots) = self.mempool.fee_context().await;
         let floor = self.mempool.fee_floor().await;
         self.wallet
@@ -1030,7 +1035,7 @@ impl ParanoidApiServer for RpcHandler {
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
         // 1. Parse recipient address.
-        let to_address = parse_address_hex(&to_hex)?.0;
+        let to_address = parse_address_param(&to_hex)?.0;
 
         // Plan the logical payment before proving. Automatic fees are computed
         // per actual planned chunk from live input/output counts; no tx pays a
@@ -1103,7 +1108,7 @@ impl ParanoidApiServer for RpcHandler {
                     let chain = self.chain.read().await;
                     let tip = chain.tip_header();
                     let log_slots = tip.log_slots;
-                    let epoch_anchor = full_block_hash(tip);
+                    let epoch_anchor = block_id(tip);
                     let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
                     let unique_seed = tip_seed.wrapping_add(
                         call_nonce
@@ -1351,7 +1356,7 @@ impl ParanoidApiServer for RpcHandler {
                 let chain = self.chain.read().await;
                 let tip = chain.tip_header();
                 let log_slots = tip.log_slots;
-                let epoch_anchor = full_block_hash(tip);
+                let epoch_anchor = block_id(tip);
                 let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
                 let unique_seed = tip_seed.wrapping_add(
                     call_nonce
@@ -1516,7 +1521,7 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Parse an address from bech32m (`noid1…`) or legacy 64-char hex.
+/// Parse an address from canonical bech32m (`noid1…`).
 /// Empty string → zero address (used when no miner address is configured).
 fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {
@@ -1526,9 +1531,8 @@ fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
         .map_err(|e| rpc_err(format!("invalid address: {e}")))
 }
 
-// Keep old name as alias so existing callers compile unchanged.
 #[inline]
-fn parse_address_hex(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
+fn parse_address_param(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     parse_address(s)
 }
 
@@ -1557,7 +1561,7 @@ mod tests {
     #[test]
     fn block_template_response_serializes_sweep_counts() {
         let response = BlockTemplateResponse {
-            header_core_hex: "00".into(),
+            pow_fields_hex: "00".into(),
             block_hex: "11".into(),
             block_proof_hex: "22".into(),
             block_auth_sidecar_hex: "33".into(),

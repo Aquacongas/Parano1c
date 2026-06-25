@@ -4,7 +4,7 @@
 //! Bounded ReuseGuard for exact-state ABA protection.
 
 use noid_core::Block128;
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
+use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_RGDBUCK, TAG_RGDNODE};
 
 use crate::consensus::params::ANCHOR_DEPTH;
@@ -15,6 +15,7 @@ pub const REUSE_DELAY: u64 = ANCHOR_DEPTH + 1;
 /// Fixed ring size for guard buckets.
 pub const REUSE_GUARD_BUCKETS: usize = 256;
 const GUARD_DEPTH: usize = 8;
+pub const REUSE_GUARD_DEPTH: usize = GUARD_DEPTH;
 
 /// One canonical ReuseGuard bucket.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -271,12 +272,7 @@ pub fn guard_bucket_hash(bucket: &GuardBucket) -> StateHash {
 
 /// Hash one ReuseGuard Merkle node.
 pub fn guard_node_hash(left: StateHash, right: StateHash) -> StateHash {
-    let [l0, l1] = fields_from_hash(left);
-    let [r0, r1] = fields_from_hash(right);
-    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_RGDNODE));
-    s.absorb_pair(l0, l1);
-    s.absorb_pair(r0, r1);
-    s.finalize_no_pad()
+    compress_with_tag(TAG_RGDNODE, &left, &right)
 }
 
 /// Compute the fixed depth-8 guard root.
@@ -401,18 +397,6 @@ fn validate_spent_slots(slots: &[u32], index: usize) -> Result<(), ReuseGuardErr
         return Err(ReuseGuardError::UnsortedOrDuplicateSlots { index });
     }
     Ok(())
-}
-
-#[inline]
-fn fields_from_hash(hash: StateHash) -> [Block128; 2] {
-    let mut lo = [0u8; 16];
-    let mut hi = [0u8; 16];
-    lo.copy_from_slice(&hash[..16]);
-    hi.copy_from_slice(&hash[16..]);
-    [
-        Block128::from(u128::from_le_bytes(lo)),
-        Block128::from(u128::from_le_bytes(hi)),
-    ]
 }
 
 #[cfg(test)]

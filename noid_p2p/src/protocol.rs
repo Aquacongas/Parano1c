@@ -78,16 +78,18 @@ pub struct GetRecentBlockResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Recursive chain proof
+// Public history proof
 // ---------------------------------------------------------------------------
 
-/// Get the current recursive chain proof (~38 KB encoded, O(1) sync).
+/// Request the current trustless public history proof.
+///
+/// Responses are empty until real `HistoryProof` verification is implemented.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetRecursiveProofRequest;
+pub struct GetHistoryProofRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetRecursiveProofResponse {
-    /// Serialized RecursiveBlockProof bytes (~38 KB encoded).
+pub struct GetHistoryProofResponse {
+    /// Serialized public `HistoryProof` bytes.
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
@@ -99,9 +101,9 @@ pub struct GetRecursiveProofResponse {
 
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
-/// FIX1: public arbitrary-peer snapshot serving is disabled fail-closed, so
-/// production peers return an empty manifest. This message shape is retained
-/// for future immutable checkpoint snapshot generations and as a legacy wire cap.
+/// Public arbitrary-peer snapshot serving is disabled fail-closed until
+/// `HistoryProof` is active, so production peers currently return an empty
+/// manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
@@ -110,9 +112,7 @@ pub struct GetStateManifestRequest {
 
 /// Manifest response: chain metadata + list of active segment IDs.
 ///
-/// In FIX1, `tip_height = 0` means no public snapshot is being advertised.
-/// Future checkpoint generations will use this shape or a successor with a
-/// generation identifier.
+/// `tip_height = 0` means no public snapshot is being advertised.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GetStateManifestResponse {
     /// Tip height at snapshot time.  0 = "use block sync instead".
@@ -125,9 +125,10 @@ pub struct GetStateManifestResponse {
     pub eff_log: u8,
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
-    /// FRI segment roots aligned with `segment_ids`.  The sparse Merkle root
-    /// reconstructed from this table and canonical zero leaves must equal the
-    /// snapshot tip header's `state_root` before segment download is trusted.
+    /// Exact sparse-state segment roots aligned with `segment_ids`. The sparse
+    /// Merkle root reconstructed from this table and canonical zero leaves must
+    /// equal the snapshot tip header's `state_root` before segment download is
+    /// trusted by a future public HistoryProof verifier.
     pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
@@ -139,9 +140,8 @@ pub struct GetStateManifestResponse {
 
 /// Request one state segment by ID.
 ///
-/// FIX1: public state segment serving is disabled and peers respond with
-/// `data = None`. Future checkpoint generations must use an immutable snapshot
-/// identifier, not only a height, to avoid live-state races.
+/// Public state segment serving is disabled until `HistoryProof` is active and
+/// peers respond with `data = None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
@@ -151,8 +151,8 @@ pub struct GetStateSegmentRequest {
 
 /// Response: one encoded state segment (~3 MB).
 ///
-/// `None` if the peer cannot serve this segment. In FIX1, public peers always
-/// return `None` for arbitrary snapshot segment requests.
+/// `None` if the peer cannot serve this segment. While public snapshot sync is
+/// disabled, peers always return `None` for arbitrary snapshot segment requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentResponse {
     pub segment_id: u16,
@@ -217,19 +217,6 @@ pub enum BlockGossipMsg {
 }
 
 // ---------------------------------------------------------------------------
-// Recursive proof gossip message
-// ---------------------------------------------------------------------------
-
-/// Gossipsub message broadcast when the recursive chain proof advances.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecursiveProofGossipMsg {
-    pub height: u64,
-    pub tip_hash: [u8; 32],
-    /// `RecursiveBlockProof` bincode bytes (~38 KB encoded).
-    pub proof_bytes: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
 // GossipSub topics
 // ---------------------------------------------------------------------------
 
@@ -238,14 +225,12 @@ pub struct Topics;
 impl Topics {
     pub const BLOCKS: &'static str = "/noid/devnet/blocks/1";
     pub const TXS: &'static str = "/noid/devnet/txs/1";
-    pub const REC_PROOFS: &'static str = "/noid/devnet/recproofs/1";
 }
 
 #[derive(Debug, Clone)]
 pub struct NetworkTopics {
     pub blocks: String,
     pub txs: String,
-    pub rec_proofs: String,
     pub protocol_id: String,
 }
 
@@ -254,7 +239,6 @@ impl NetworkTopics {
         Self {
             blocks: cfg.topic_blocks.to_string(),
             txs: cfg.topic_txs.to_string(),
-            rec_proofs: cfg.topic_rec_proofs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
         }
     }

@@ -13,9 +13,9 @@
 //! the Fiat-Shamir channel, draws one challenge, and folds the table
 //! along the highest variable.
 //!
-//! `round_degree` is a parameter, not a constant. The legacy spine /
-//! Auth / Merkle sumchecks pin `round_degree = 2`; the Spine Kill-Shot
-//! degree-7 sumcheck uses `round_degree = 8` (`d+1` for
+//! `round_degree` is a parameter, not a constant. Degree-2 product
+//! sumchecks and degree-7 KillShot sumchecks use the same engine with
+//! explicit degree selection. The degree-7 path uses `round_degree = 8` (`d+1` for
 //! degree-7 `g` under an `eq(r, x)` factor). For an honest *multilinear*
 //! `f` the round poly is intrinsically linear, so `round_degree >= 1`
 //! is always correct — higher degrees just record extra zero
@@ -99,12 +99,6 @@ impl<F: TowerField> RoundPolynomial<F> {
         }
         Self { coeffs: out }
     }
-
-    /// Legacy three-point constructor kept for callsites that still
-    /// hand in `(p(0), p(1), p(2))` for a degree-2 round poly.
-    pub fn from_three_evals_field(e0: F, e1: F, e2: F) -> Self {
-        Self::from_evals(&[e0, e1, e2])
-    }
 }
 
 /// Run the sumcheck prover for a single multilinear polynomial.
@@ -163,16 +157,6 @@ pub fn prove_single_d<F: TowerField, T: FiatShamir<F>>(
 
     debug_assert_eq!(current.len(), 1);
     (polys, current[0], challenges)
-}
-
-/// Degree-2 wrapper for the historical `prove_single` callsites
-/// (internal noid_core tests). New code should call `prove_single_d`
-/// directly with an explicit `round_degree`.
-pub fn prove_single<F: TowerField, T: FiatShamir<F>>(
-    evals: &[F],
-    channel: &mut T,
-) -> (Vec<RoundPolynomial<F>>, F, Vec<F>) {
-    prove_single_d(evals, 2, channel)
 }
 
 // ---------------------------------------------------------------------------
@@ -266,14 +250,6 @@ pub fn prove_single_packed_d<T: FiatShamir<Block128>>(
     (polys, current[0], challenges)
 }
 
-/// Degree-2 packed wrapper for legacy callers.
-pub fn prove_single_packed<T: FiatShamir<Block128>>(
-    evals: &[Block128],
-    channel: &mut T,
-) -> (Vec<RoundPolynomial<Block128>>, Block128, Vec<Block128>) {
-    prove_single_packed_d(evals, 2, channel)
-}
-
 /// Fold the highest variable in-place using packed operations.
 pub fn fold_highest_var_packed_inplace(
     current_evals: &mut Vec<Block128>,
@@ -316,8 +292,8 @@ mod tests {
     type F = Block128;
 
     /// Insecure deterministic FS mock for noid_core internal tests.
-    /// Mirrors the legacy XOR-sum behaviour just enough that prover and
-    /// verifier agree on the challenge stream when wired in lockstep.
+    /// It exists only so prover and verifier agree on the challenge stream
+    /// during local round-trip tests.
     #[derive(Default)]
     struct XorChannel {
         state: F,
@@ -358,21 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_three_evals_alias() {
-        let e0 = F::from(11u8);
-        let e1 = F::from(22u8);
-        let e2 = F::from(33u8);
-        let a = RoundPolynomial::from_three_evals_field(e0, e1, e2);
-        let b = RoundPolynomial::from_evals(&[e0, e1, e2]);
-        assert_eq!(a.coeffs, b.coeffs);
-    }
-
-    #[test]
     fn test_prove_single_sum_consistency() {
         let evals = vec![F::ZERO, F::ONE, F::ONE, F::ZERO];
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
         let mut channel = XorChannel::default();
-        let (round_polys, _, _) = prove_single(&evals, &mut channel);
+        let (round_polys, _, _) = prove_single_d(&evals, 2, &mut channel);
         assert_eq!(round_polys.len(), 2);
         let rp0 = &round_polys[0];
         assert_eq!(rp0.evaluate(F::ZERO) + rp0.evaluate(F::ONE), claimed_sum);
@@ -386,7 +352,7 @@ mod tests {
         let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
         let claimed_sum = evals.iter().fold(F::ZERO, |a, &b| a + b);
         let mut channel = XorChannel::default();
-        let (round_polys, _, _) = prove_single(&evals, &mut channel);
+        let (round_polys, _, _) = prove_single_d(&evals, 2, &mut channel);
         assert_eq!(round_polys.len(), n);
         assert_eq!(
             round_polys[0].evaluate(F::ZERO) + round_polys[0].evaluate(F::ONE),
@@ -402,10 +368,10 @@ mod tests {
         let evals: Vec<F> = (0..(1 << n)).map(|_| F::from(rng.gen::<u128>())).collect();
 
         let mut ch_s = XorChannel::default();
-        let (scalar_polys, scalar_final, scalar_ch) = prove_single(&evals, &mut ch_s);
+        let (scalar_polys, scalar_final, scalar_ch) = prove_single_d(&evals, 2, &mut ch_s);
 
         let mut ch_p = XorChannel::default();
-        let (packed_polys, packed_final, packed_ch) = prove_single_packed(&evals, &mut ch_p);
+        let (packed_polys, packed_final, packed_ch) = prove_single_packed_d(&evals, 2, &mut ch_p);
 
         assert_eq!(scalar_final, packed_final);
         assert_eq!(scalar_polys.len(), packed_polys.len());

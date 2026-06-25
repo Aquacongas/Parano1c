@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Native reference execution of the 142-permutation `Sweep25x2` tx-body
-//! spine.
+//! Native execution of the 142-permutation `Sweep25x2` tx-body spine.
 
 use noid_core::{Block128, CanonicalSerialize};
 use noid_poseidon2b::native::permutation::Poseidon2bPermutation;

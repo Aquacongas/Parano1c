@@ -4,6 +4,7 @@
 //! Auth-only wallet authorization artifact.
 
 use bincode::Options;
+use noid_core::Block128;
 use noid_poseidon2b::primitives::SpendSecret;
 use noid_tx::{validate_public_tx_logic, PublicLogicError, TxBody, TxShape};
 use serde::{Deserialize, Serialize};
@@ -11,12 +12,33 @@ use serde::{Deserialize, Serialize};
 use crate::{
     owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
     owner_auth_public_from_body, prove_owner_auth_killshot, verify_owner_auth_killshot,
-    OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthStatementError,
+    OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OwnerAuthStatementError,
 };
 
 pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
 pub const MAX_SWEEP_AUTHORIZATION_BYTES: usize = 256 * 1024;
 pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = MAX_SWEEP_AUTHORIZATION_BYTES;
+
+#[derive(Debug, Clone)]
+pub struct CanonicalAuthorizationStatement {
+    pub tx_index: usize,
+    pub tx_body_hash: [Block128; 2],
+    pub public: OwnerAuthPublicInputs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedAuthorization {
+    pub tx_index: usize,
+    pub owner_count: usize,
+    pub live_input_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedAuthorizationBatch {
+    pub user_tx_count: usize,
+    pub owner_count_total: usize,
+    pub live_input_count_total: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletAuthorizationBundle {
@@ -178,11 +200,47 @@ pub fn verify_wallet_authorization_proof(
     validate_public_tx_logic(body)?;
     let public = owner_auth_public_from_body(body)
         .map_err(|e| VerifyAuthorizationError::OwnerAuthStatement(e.to_string()))?;
-    let circuit = OwnerAuthCircuit::build(public.layout);
+    let statement = CanonicalAuthorizationStatement {
+        tx_index: 0,
+        tx_body_hash: public.tx_body_hash,
+        public,
+    };
+    verify_authorization_statement_proof(&statement, proof).map(|_| ())
+}
+
+pub fn canonical_authorization_statement_from_body(
+    tx_index: usize,
+    tx_body_hash: [Block128; 2],
+    body: &TxBody,
+) -> Result<CanonicalAuthorizationStatement, OwnerAuthStatementError> {
+    let public = owner_auth_public_from_body(body)?;
+    Ok(CanonicalAuthorizationStatement {
+        tx_index,
+        tx_body_hash,
+        public,
+    })
+}
+
+pub fn verify_authorization_statement_proof(
+    statement: &CanonicalAuthorizationStatement,
+    proof: &OwnerAuthProofKillShot,
+) -> Result<VerifiedAuthorization, VerifyAuthorizationError> {
+    let circuit = OwnerAuthCircuit::build(statement.public.layout);
     let mut channel = owner_auth_gkr_channel();
-    verify_owner_auth_killshot(proof, &circuit, &public, &mut channel)
+    verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
         .ok_or(VerifyAuthorizationError::AuthProof)?;
-    Ok(())
+
+    if statement.public.tx_body_hash != statement.tx_body_hash {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "statement tx_body_hash does not match canonical owner-auth public input".to_string(),
+        ));
+    }
+
+    Ok(VerifiedAuthorization {
+        tx_index: statement.tx_index,
+        owner_count: statement.public.layout.owner_count,
+        live_input_count: statement.public.live_input_positions.len(),
+    })
 }
 
 fn map_owner_auth_prove_error(err: OwnerAuthStatementError) -> ProveAuthorizationError {
@@ -365,6 +423,21 @@ mod tests {
 
         let public = owner_auth_public_from_body(&body).expect("public owner auth");
         assert_eq!(public.layout.owner_count, 1);
+    }
+
+    #[test]
+    fn statement_verifier_rejects_split_tx_body_hash() {
+        let (body, _, bundle) = prove_standard_fixture();
+        let public = owner_auth_public_from_body(&body).expect("public owner auth");
+        let mut statement =
+            canonical_authorization_statement_from_body(3, public.tx_body_hash, &body)
+                .expect("canonical authorization statement");
+        statement.tx_body_hash[0] += Block128::ONE;
+
+        assert!(matches!(
+            verify_authorization_statement_proof(&statement, &bundle.proof),
+            Err(VerifyAuthorizationError::OwnerAuthStatement(_))
+        ));
     }
 
     #[test]

@@ -131,7 +131,7 @@ impl MerkleTree {
         self.nodes[off]
     }
 
-    /// Number of layers (depth + 1). Matches legacy `data.len()`.
+    /// Number of layers (depth + 1). Matches the serialized `data.len()`.
     pub fn num_layers(&self) -> usize {
         self.layer_offsets.len()
     }

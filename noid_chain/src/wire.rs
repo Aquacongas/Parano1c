@@ -79,13 +79,11 @@ fn take_u128(src: &mut &[u8]) -> Result<u128, WireError> {
 ///   miner_address         32B
 ///   nonce                 16B
 ///   difficulty_target     32B
-///   proof_transcript_hash 32B
-///   witness_root          32B
 ///   log_slots              4B
 ///   active_slot_count      8B
 ///   alloc_counter          8B
 ///   ─────────────────────────
-///   Total                276B
+///   Total                212B
 /// ```
 pub const BLOCK_HEADER_WIRE_SIZE: usize =
     32   // prev_block_hash
@@ -96,12 +94,13 @@ pub const BLOCK_HEADER_WIRE_SIZE: usize =
     + 32 // miner_address
     + 16 // nonce
     + 32 // difficulty_target
-    + 32 // proof_transcript_hash
-    + 32 // witness_root
     + 4  // log_slots
     + 8  // active_slot_count
     + 8  // alloc_counter
-    ; // = 276
+    ; // = 212
+
+/// Byte offset of `BlockHeader::nonce` inside the canonical block-header wire.
+pub const BLOCK_HEADER_NONCE_OFFSET: usize = 32 + 32 + 32 + 8 + 8 + 32;
 
 impl BlockHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -113,8 +112,6 @@ impl BlockHeader {
         put_digest(buf, self.miner_address.as_bytes());
         put_u128(buf, self.nonce);
         put_digest(buf, &self.difficulty_target);
-        put_digest(buf, &self.proof_transcript_hash);
-        put_digest(buf, &self.witness_root);
         put_u32(buf, self.log_slots);
         put_u64(buf, self.active_slot_count);
         put_u64(buf, self.alloc_counter);
@@ -138,8 +135,6 @@ impl BlockHeader {
         let miner_address = Address(take_digest(src)?);
         let nonce = take_u128(src)?;
         let difficulty_target = take_digest(src)?;
-        let proof_transcript_hash = take_digest(src)?;
-        let witness_root = take_digest(src)?;
         let log_slots = take_u32(src)?;
         let active_slot_count = take_u64(src)?;
         let alloc_counter = take_u64(src)?;
@@ -152,8 +147,6 @@ impl BlockHeader {
             miner_address,
             nonce,
             difficulty_target,
-            proof_transcript_hash,
-            witness_root,
             log_slots,
             active_slot_count,
             alloc_counter,
@@ -184,8 +177,6 @@ mod tests {
             miner_address: Address([0x44u8; 32]),
             nonce: 0xDEAD_BEEF_CAFE_BABEu128,
             difficulty_target: [0x77u8; 32],
-            proof_transcript_hash: [0x55u8; 32],
-            witness_root: [0x66u8; 32],
             log_slots: 24,
             active_slot_count: 7_777,
             alloc_counter: 8_888,
@@ -194,7 +185,7 @@ mod tests {
 
     #[test]
     fn wire_size_constant_is_correct() {
-        assert_eq!(BLOCK_HEADER_WIRE_SIZE, 276);
+        assert_eq!(BLOCK_HEADER_WIRE_SIZE, 212);
         let h = hdr();
         assert_eq!(h.to_bytes().len(), BLOCK_HEADER_WIRE_SIZE);
     }

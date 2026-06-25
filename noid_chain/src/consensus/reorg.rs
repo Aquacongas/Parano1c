@@ -22,7 +22,7 @@ use crate::chain_context::ChainContext;
 use crate::consensus::{
     da_prune::{revert_block, BlockUndoLog},
     params::CONSENSUS_FINALITY_DEPTH,
-    pow::full_block_hash,
+    pow::block_id,
     ConsensusError,
 };
 use crate::fri_state::SlotValue;
@@ -74,7 +74,7 @@ pub struct ReorgResult {
 pub fn find_common_ancestor(ctx: &ChainContext, new_headers: &[(u64, BlockHeader)]) -> Option<u64> {
     let new_chain: HashMap<u64, [u8; 32]> = new_headers
         .iter()
-        .map(|(h, hdr)| (*h, full_block_hash(hdr)))
+        .map(|(h, hdr)| (*h, block_id(hdr)))
         .collect();
 
     let tip = ctx.tip_height;
@@ -82,7 +82,7 @@ pub fn find_common_ancestor(ctx: &ChainContext, new_headers: &[(u64, BlockHeader
 
     for height in (oldest_revertable..=tip).rev() {
         if let Some(our_header) = ctx.headers.get(&height) {
-            let our_hash = full_block_hash(our_header);
+            let our_hash = block_id(our_header);
             if new_chain.get(&height) == Some(&our_hash) {
                 return Some(height);
             }
@@ -182,7 +182,7 @@ pub fn apply_reorg(
     ctx.tip_hash = ctx
         .headers
         .get(&ancestor_height)
-        .map(full_block_hash)
+        .map(block_id)
         .unwrap_or([0u8; 32]);
 
     // -----------------------------------------------------------------------
@@ -224,13 +224,13 @@ pub fn apply_reorg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{compute_tx_root, Block, STUB_PROOF_MARKER};
+    use crate::block::{compute_tx_root, Block};
     use crate::block_header::BlockHeader;
     use crate::chain_context::ChainContext;
     use crate::consensus::{
         fees::required_fee_for_tx_body,
         params::{BLOCK_TIME, GENESIS_TARGET},
-        pow::full_block_hash,
+        pow::block_id,
     };
     use crate::fri_state::SlotValue;
     use crate::state::{apply_tx, ChainState};
@@ -244,7 +244,7 @@ mod tests {
         let parent = *ctx.tip_header();
         let new_root = ctx.state.state_root();
         let mut header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: new_root,
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -252,8 +252,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
@@ -276,7 +274,7 @@ mod tests {
         genesis.alloc_counter = 0;
         genesis.difficulty_target = TEST_TARGET;
         genesis.nonce = 0;
-        ctx.tip_hash = full_block_hash(genesis);
+        ctx.tip_hash = block_id(genesis);
         ctx
     }
 
@@ -317,9 +315,8 @@ mod tests {
         for tx in &txs {
             apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
         }
-        let has_user_txs = txs.iter().any(|tx| !tx.body.is_coinbase);
         let header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: dry.state_root(),
             tx_root: compute_tx_root(&txs),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -327,12 +324,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: if has_user_txs {
-                [0xAA; 32]
-            } else {
-                STUB_PROOF_MARKER
-            },
-            witness_root: [0xBB; 32],
             log_slots: dry.state.log_slots() as u32,
             active_slot_count: dry.active_slot_count,
             alloc_counter: dry.alloc_counter,
@@ -359,7 +350,7 @@ mod tests {
         for i in 0..n {
             let slot = 1 + i as u32;
             let out = output(slot, 10_000_000, 0x10u8.wrapping_add(i as u8));
-            let parent_hash = full_block_hash(ctx.tip_header());
+            let parent_hash = block_id(ctx.tip_header());
             let block = build_block(
                 ctx,
                 vec![coinbase_tx(
@@ -438,8 +429,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: GENESIS_TARGET,
-            proof_transcript_hash: [0u8; 32],
-            witness_root: [0u8; 32],
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,

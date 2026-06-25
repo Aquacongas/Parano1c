@@ -13,7 +13,7 @@
 //! - [`emission`]       — Block reward schedule (halves per state expansion).
 //! - [`fees`]           — Consensus fee model and burned state-growth fee.
 //! - [`difficulty`]     — ASERT difficulty adjustment (no floats).
-//! - [`pow`]            — Blake3 PoW over `header_core` (parallel-provable).
+//! - [`pow`]            — Poseidon2b PoW over semantic header fields.
 //! - [`timestamps`]     — Median-time-past and future-drift rules.
 //! - [`receipt`]        — ParanoidReceipt generation and verification.
 //! - [`header`]         — Per-block header validation rules.
@@ -52,6 +52,7 @@ pub mod header;
 pub mod params;
 pub mod pow;
 pub mod receipt;
+pub mod slot_expansion;
 pub mod timestamps;
 
 // Convenient re-exports.
@@ -75,18 +76,23 @@ pub use mempool_checks::validate_tx_for_mempool;
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use params::*;
-pub use params::{
-    min_fee, FEE_PER_INPUT, FEE_PER_IO, FEE_PER_OUTPUT, MIN_FEE_BASE, STATE_GROWTH_FEE_BASE,
+pub use pow::{
+    block_id, poseidon_pow_digest, pow_header_fields, search_pow, validate_pow, BlockHash,
 };
-pub use pow::{full_block_hash, header_core_bytes, search_pow, validate_pow, BlockHash};
 pub use receipt::{
     generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
     ReceiptVerifyResult, TxSummary,
 };
 pub use reorg::{apply_reorg, find_common_ancestor, ReorgError, ReorgResult};
+pub use slot_expansion::expected_child_log_slots;
 pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
-pub use timestamps::{median_time_past, median_u64, validate_timestamp};
-pub use validation::{validate_block_checks, validate_block_consensus, AnchorInfo};
+pub use timestamps::{
+    median_time_past, median_u64, validate_future_drift, validate_median_time_past,
+    validate_timestamp,
+};
+pub use validation::{
+    validate_block_checks, validate_block_checks_timeless, validate_block_consensus, AnchorInfo,
+};
 
 /// Consensus validation errors — one variant per block invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +107,8 @@ pub enum ConsensusError {
     BadDifficultyTarget,
     /// §16.5 — Timestamp violates MTP or future-drift rules.
     BadTimestamp,
-    /// §16.6 — `proof_transcript_hash` is zero (block has no proof transcript).
+    /// §16.6 — required detached proof/witness data is absent.
     MissingProof,
-    /// §16.7 — `log_slots < parent.log_slots` (slots must be monotone).
-    BadLogSlots,
     /// §16.8 — Block contains more than `BLOCK_MAX_TXS` transactions.
     TooManyTxs,
     /// §16.9 — `tx_root` does not match the computed Merkle root.
@@ -130,9 +134,6 @@ pub enum ConsensusError {
     BadLogSlotsExpansion,
     /// §16.16 — `state_root` does not match post-block state.
     BadStateRoot,
-    /// Block carries user transactions with the development stub proof marker [1u8;32].
-    /// User-tx blocks must reference a real proof transcript digest.
-    StubProof,
     /// Generic shape / length mismatch.
     ShapeMismatch(String),
 }

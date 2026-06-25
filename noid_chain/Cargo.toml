@@ -9,12 +9,9 @@ tracing = { workspace = true }
 noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_tx = { path = "../noid_tx" }
-noid_air = { path = "../noid_air" }
-noid_binius = { path = "../noid_binius" }
 noid_fri = { path = "../noid_fri" }
 noid_fri_binius = { path = "../noid_fri_binius" }
 rayon = "1.10"
-blake3 = "1"
 libmdbx = "0.6"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }

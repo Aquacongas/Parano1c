@@ -44,7 +44,7 @@ use noid_chain::consensus::wire_limits::{
     max_authorization_bytes_for_shape, max_tx_intent_bytes_for_shape, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::consensus::{
-    checks::validate_tx_consensus, pow::full_block_hash, required_fee_for_tx_body,
+    checks::validate_tx_consensus, pow::block_id, required_fee_for_tx_body,
 };
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
@@ -636,7 +636,7 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
             st.view
                 .recent_headers
                 .get(&h)
-                .map(|hdr| full_block_hash(hdr) == anchor_hash)
+                .map(|hdr| block_id(hdr) == anchor_hash)
                 .unwrap_or(false)
         });
         match found {

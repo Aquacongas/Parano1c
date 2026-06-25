@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! `BlockChainContext` — extends `ChainContext` with recursive proof tracking.
+//! `BlockChainContext` — extends `ChainContext` with a local history cache.
 //!
 //! `ChainContext` (in `noid_chain`) is an in-memory, non-live utility context.
 //! `BlockChainContext` wraps it and adds:
 //!
-//! - `recursive_proof: Option<RecursiveBlockProof>` — the current O(1) chain proof.
-//! - `update_recursive_proof(block_proof)` — advances the recursive proof by one block.
-//! - `init_from_genesis()` — initialises both consensus state and genesis recursive proof.
+//! - `local_history_cache: Option<LocalHistoryCache>` — local finalized-history accumulator cache.
+//! - `update_local_history_cache_with_claim(chain_claim)` — advances the cache by one block.
+//! - `init_from_genesis()` — initialises both consensus state and the genesis cache.
 //!
 //! The live full node does not use this wrapper as its block acceptance path; it
 //! uses `MdbxChainContext::apply_next_block` with full `BlockProof` validation.
@@ -21,67 +21,64 @@
 use noid_chain::block::Block;
 use noid_chain::consensus::ConsensusError;
 use noid_chain::ChainContext;
-use noid_recursive::{
-    prove::{prove_genesis_recursive, RecursiveBlockProof},
-    witness::BlockReplayWitness,
+use noid_core::Block128;
+use noid_recursive::prove::{
+    accepted_block_claim_witness, advance_local_history_cache, init_genesis_history_cache,
+    LocalHistoryCache,
 };
-
-use crate::BlockProof;
 
 #[derive(Debug)]
 pub enum ReplayWitnessError {
-    /// Current minimal `BlockProof` does not contain a recursive replay witness.
-    RealRecursiveVerifierUnavailable,
+    /// Local history cache has not been bootstrapped before a non-genesis update.
+    MissingPreviousLocalHistoryCache,
 }
 
-/// Full chain context: consensus state + recursive proof.
+/// Full chain context: consensus state + local finalized-history cache.
 ///
 /// The two components can advance at different rates:
 /// - Consensus state advances synchronously on each `apply_block_consensus` call.
-/// - Recursive proof advances asynchronously via `update_recursive_proof`.
+/// - Local cache advances asynchronously via `update_local_history_cache`.
 ///
-/// The recursive proof is never required for consensus validity. In FIX1 it is
-/// retained as finalized-history metadata; public arbitrary-peer snapshot sync
-/// remains disabled until the real recursive verifier/checkpoint generation work
-/// lands. Missing or lagging recursive proof does not affect block validation.
+/// Local cache is never required for consensus validity and is not public
+/// snapshot authority. Missing or lagging cache state does not affect block
+/// validation.
 pub struct BlockChainContext {
     /// Native consensus chain state (headers, UTXO state, ReuseGuard, undo logs).
     pub consensus: ChainContext,
-    /// Current recursive chain proof. `None` only if prove_genesis_recursive
-    /// failed or was skipped; this should be treated as DEGRADED mode (P.19).
-    pub recursive_proof: Option<RecursiveBlockProof>,
+    /// Current local finalized-history cache.
+    pub local_history_cache: Option<LocalHistoryCache>,
 }
 
 impl BlockChainContext {
-    /// Initialise from genesis: build `ChainContext` + genesis recursive proof.
+    /// Initialise from genesis: build `ChainContext` plus genesis local cache.
     ///
-    /// The genesis recursive proof is produced synchronously here.
+    /// The genesis local cache is produced synchronously here.
     ///
-    /// If the genesis recursive proof should be deferred (e.g. for fast startup),
-    /// use `init_from_genesis_no_proof()` and call `bootstrap_recursive_proof()` later.
+    /// If the genesis local cache should be deferred, use
+    /// `init_from_genesis_no_cache()` and call `bootstrap_local_history_cache()` later.
     pub fn init_from_genesis() -> Self {
         let consensus = ChainContext::init_from_genesis();
-        let recursive_proof = Some(prove_genesis_recursive());
+        let local_history_cache = Some(init_genesis_history_cache());
         Self {
             consensus,
-            recursive_proof,
+            local_history_cache,
         }
     }
 
-    /// Initialise from genesis WITHOUT producing the recursive proof.
+    /// Initialise from genesis without producing local history cache.
     ///
-    /// The node starts in DEGRADED recursive mode. Call `bootstrap_recursive_proof()`
-    /// when ready to start the recursive chain.
-    pub fn init_from_genesis_no_proof() -> Self {
+    /// The node starts without cache state. Call `bootstrap_local_history_cache()`
+    /// when ready to start local finalized-history caching.
+    pub fn init_from_genesis_no_cache() -> Self {
         Self {
             consensus: ChainContext::init_from_genesis(),
-            recursive_proof: None,
+            local_history_cache: None,
         }
     }
 
-    /// Generate the genesis recursive proof (used after `init_from_genesis_no_proof`).
-    pub fn bootstrap_recursive_proof(&mut self) {
-        self.recursive_proof = Some(prove_genesis_recursive());
+    /// Generate the genesis local cache entry.
+    pub fn bootstrap_local_history_cache(&mut self) {
+        self.local_history_cache = Some(init_genesis_history_cache());
     }
 
     // -----------------------------------------------------------------------
@@ -93,8 +90,9 @@ impl BlockChainContext {
     /// This is not the live full-node production path and does not verify the
     /// block's BlockProof. Live nodes use MDBX proof-native application.
     ///
-    /// Does NOT update the recursive proof. Call `update_recursive_proof`
-    /// after this to advance the recursive chain.
+    /// Does not update local history cache. Call
+    /// `update_local_history_cache_with_claim` after this if the utility
+    /// context should maintain its cache.
     pub fn apply_block_consensus(
         &mut self,
         block: &Block,
@@ -104,23 +102,31 @@ impl BlockChainContext {
     }
 
     // -----------------------------------------------------------------------
-    // Recursive proof update
+    // Local history cache update
     // -----------------------------------------------------------------------
 
-    /// Advance the recursive chain proof by one step.
+    /// Advance local finalized-history cache by one step.
     ///
     /// MUST be called after this utility context has advanced its in-memory tip
     /// so that `self.consensus.tip_header()` reflects the newly applied block.
     ///
-    /// Returns a reference to the new recursive proof.
+    /// Returns a reference to the new local cache object.
     ///
-    /// Until the real recursive verifier targets the frozen acceptance relation,
-    /// this updater fails closed for user blocks.
-    pub fn update_recursive_proof(
+    /// This is not public O(1) authority.
+    pub fn update_local_history_cache_with_claim(
         &mut self,
-        _block_proof: &BlockProof,
-    ) -> Result<&RecursiveBlockProof, ReplayWitnessError> {
-        Err(ReplayWitnessError::RealRecursiveVerifierUnavailable)
+        chain_claim: [Block128; 2],
+    ) -> Result<&LocalHistoryCache, ReplayWitnessError> {
+        let witness = accepted_block_claim_witness(chain_claim);
+        let prev = self
+            .local_history_cache
+            .as_ref()
+            .ok_or(ReplayWitnessError::MissingPreviousLocalHistoryCache)?;
+        let prev_acc = prev.acc.clone();
+        let header = *self.consensus.tip_header();
+        let next = advance_local_history_cache(&witness, &header, &prev_acc, Some(prev));
+        self.local_history_cache = Some(next);
+        Ok(self.local_history_cache.as_ref().expect("just stored"))
     }
 
     // -----------------------------------------------------------------------
@@ -137,36 +143,25 @@ impl BlockChainContext {
         self.consensus.tip_hash
     }
 
-    /// Recursive proof lag: how many blocks behind the consensus tip is the
-    /// recursive proof. 0 = fully caught up (NORMAL mode).
-    pub fn recursive_lag(&self) -> u64 {
-        match &self.recursive_proof {
+    /// Local cache lag: how many blocks behind the consensus tip cache is.
+    pub fn local_history_cache_lag(&self) -> u64 {
+        match &self.local_history_cache {
             Some(p) => self.consensus.tip_height.saturating_sub(p.block_height),
             None => self.consensus.tip_height + 1,
         }
     }
 
-    /// True if in NORMAL mode (recursive proof ≤ 3 blocks behind).
-    pub fn recursive_normal(&self) -> bool {
-        self.recursive_lag() <= 3
+    /// True if local cache is close to the tip.
+    pub fn local_history_cache_current(&self) -> bool {
+        self.local_history_cache_lag() <= 3
     }
 
     /// True if syncing nodes should fall back to native verification
-    /// (recursive proof > FINALITY_DEPTH blocks behind).
-    pub fn recursive_fallback(&self) -> bool {
+    /// (local cache > FINALITY_DEPTH blocks behind).
+    pub fn local_history_cache_too_stale(&self) -> bool {
         use noid_chain::consensus::params::FINALITY_DEPTH;
-        self.recursive_lag() > FINALITY_DEPTH
+        self.local_history_cache_lag() > FINALITY_DEPTH
     }
-}
-
-// ---------------------------------------------------------------------------
-// BlockProof → BlockReplayWitness extraction
-// ---------------------------------------------------------------------------
-
-pub fn extract_replay_witness(
-    _proof: &BlockProof,
-) -> Result<BlockReplayWitness, ReplayWitnessError> {
-    Err(ReplayWitnessError::RealRecursiveVerifierUnavailable)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,39 +176,36 @@ mod tests {
     use noid_recursive::accumulator::genesis_accumulator;
 
     #[test]
-    fn init_no_proof_starts_degraded() {
-        let ctx = BlockChainContext::init_from_genesis_no_proof();
-        assert!(ctx.recursive_proof.is_none());
+    fn init_no_cache_starts_degraded() {
+        let ctx = BlockChainContext::init_from_genesis_no_cache();
+        assert!(ctx.local_history_cache.is_none());
         // Lag = tip_height + 1 = 0 + 1 = 1 block behind.
-        assert_eq!(ctx.recursive_lag(), 1);
+        assert_eq!(ctx.local_history_cache_lag(), 1);
     }
 
     #[test]
-    fn recursive_lag_zero_after_genesis_init() {
-        // This test is fast because prove_genesis_recursive uses compact FRI
-        // with 0 FRI rounds (LOG_ROWS=8, COMPACT_TAU=8 → n_rounds=0).
+    fn local_history_cache_lag_zero_after_genesis_init() {
         let ctx = BlockChainContext::init_from_genesis();
-        // After init, recursive proof is at height 0 = tip_height.
-        assert_eq!(ctx.recursive_lag(), 0);
-        assert!(ctx.recursive_normal());
+        assert_eq!(ctx.local_history_cache_lag(), 0);
+        assert!(ctx.local_history_cache_current());
     }
 
     #[test]
-    fn genesis_recursive_proof_accumulator_is_correct() {
+    fn genesis_local_history_cache_accumulator_is_correct() {
         let ctx = BlockChainContext::init_from_genesis();
-        let proof = ctx.recursive_proof.as_ref().unwrap();
+        let cache = ctx.local_history_cache.as_ref().unwrap();
 
         use noid_chain::consensus::genesis::genesis_header;
         let genesis = genesis_header();
         let genesis_hash = hash_block_header(&genesis);
         let expected_acc = genesis_accumulator(genesis_state_root(), genesis_hash);
 
-        assert_eq!(proof.block_height, 0);
+        assert_eq!(cache.block_height, 0);
         assert_eq!(
-            proof.acc.chain_hash, expected_acc.chain_hash,
-            "recursive proof accumulator must match genesis_accumulator"
+            cache.acc.chain_hash, expected_acc.chain_hash,
+            "local history cache accumulator must match genesis_accumulator"
         );
-        assert_eq!(proof.acc.state_root, genesis.state_root);
+        assert_eq!(cache.acc.state_root, genesis.state_root);
     }
 
     #[test]
@@ -222,19 +214,19 @@ mod tests {
         use noid_chain::block_header::BlockHeader;
         use noid_chain::consensus::{
             params::{BLOCK_TIME, GENESIS_TARGET},
-            pow::full_block_hash,
+            pow::block_id,
         };
         use noid_poseidon2b::primitives::Address;
         use rayon::prelude::*;
 
-        let mut ctx = BlockChainContext::init_from_genesis_no_proof();
+        let mut ctx = BlockChainContext::init_from_genesis_no_cache();
 
         // Build a trivial empty block.
         let parent = *ctx.consensus.tip_header();
         let new_root = ctx.consensus.state.state_root();
 
         let mut header = BlockHeader {
-            prev_block_hash: full_block_hash(&parent),
+            prev_block_hash: block_id(&parent),
             state_root: new_root,
             tx_root: compute_tx_root(&[]),
             timestamp: parent.timestamp + BLOCK_TIME,
@@ -242,22 +234,20 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: GENESIS_TARGET,
-            proof_transcript_hash: [1u8; 32],
-            witness_root: [1u8; 32],
             log_slots: parent.log_slots,
             active_slot_count: 0,
             alloc_counter: 0,
         };
 
-        // GENESIS_TARGET = 2^228 requires avg 2^28 ≈ 268 M hash attempts.
-        // Expected wall time: ~1 s on a multi-core machine.
+        // GENESIS_TARGET keeps this test in the same easy mining class as
+        // genesis on the current Poseidon2b miner.
         {
             use noid_chain::consensus::pow::search_pow;
             let chunk = 10_000_000u128;
             header.nonce = (0u64..300)
                 .into_par_iter()
                 .find_map_any(|i| search_pow(&header, i as u128 * chunk, chunk))
-                .expect("mine: no nonce found in 3 B attempts (GENESIS_TARGET=2^228)");
+                .expect("mine: no nonce found in 3 B attempts");
         }
 
         let block = Block {
@@ -268,7 +258,7 @@ mod tests {
         let result = ctx.apply_block_consensus(&block, block.header.timestamp + 1);
         assert!(result.is_ok(), "empty block should apply: {:?}", result);
         assert_eq!(ctx.tip_height(), 1);
-        // No recursive proof at all (init_from_genesis_no_proof); lag = tip_height + 1 = 2.
-        assert_eq!(ctx.recursive_lag(), 2);
+        // No local cache at all; lag = tip_height + 1 = 2.
+        assert_eq!(ctx.local_history_cache_lag(), 2);
     }
 }

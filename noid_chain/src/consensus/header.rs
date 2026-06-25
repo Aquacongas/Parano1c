@@ -11,37 +11,90 @@
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     difficulty::next_target,
-    params::{ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH, LOG_SLOTS_MAX},
-    pow::{full_block_hash, validate_pow},
-    timestamps::validate_timestamp,
+    expected_child_log_slots,
+    params::{ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH},
+    pow::{block_id, validate_pow},
+    timestamps::{validate_future_drift, validate_median_time_past},
     ConsensusError,
 };
 
 /// Validate a candidate block header against its parent and recent timestamps.
 ///
 /// Checks (in order):
-/// 1. `prev_block_hash` == Blake3(full parent header)
+/// 1. `prev_block_hash` == semantic Poseidon2b block id of the parent
 /// 2. `height` == parent.height + 1
 /// 3. `difficulty_target` == ASERT-computed target
 /// 4. Timestamp rules (MTP + future drift)
-/// 5. Blake3 PoW satisfies difficulty_target
-/// 6. `proof_transcript_hash != [0;32]` (block has a proof transcript)
-/// 7. `log_slots >= parent.log_slots` (slot space monotone)
+/// 5. Poseidon2b PoW satisfies difficulty_target
+/// 6. `log_slots` equals the exact median-window expansion result
+///
+/// Detached validation witness presence is checked by the block acceptance
+/// path, not by semantic header validation.
 ///
 /// `prev_timestamps`: timestamps of the last ≤11 ancestors, oldest-first.
+/// `prev_active_counts`: active-slot counts of the last expansion-window
+/// ancestors ending at the parent, oldest-first.
 /// `local_time`: current wall-clock seconds (for future drift check).
 /// `anchor_*`: epoch anchor values for ASERT.
 pub fn validate_header(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
     local_time: u64,
     anchor_height: u64,
     anchor_timestamp: u64,
     anchor_target: &[u8; 32],
 ) -> Result<(), ConsensusError> {
+    validate_header_inner(
+        header,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        Some(local_time),
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+    )
+}
+
+/// Validate deterministic header consensus rules that can be proven for
+/// historical recursive checkpoints.
+///
+/// This excludes only the local wall-clock future-drift admission policy.
+pub fn validate_header_timeless(
+    header: &BlockHeader,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor_height: u64,
+    anchor_timestamp: u64,
+    anchor_target: &[u8; 32],
+) -> Result<(), ConsensusError> {
+    validate_header_inner(
+        header,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        None,
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+    )
+}
+
+fn validate_header_inner(
+    header: &BlockHeader,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: Option<u64>,
+    anchor_height: u64,
+    anchor_timestamp: u64,
+    anchor_target: &[u8; 32],
+) -> Result<(), ConsensusError> {
     // 1. Parent hash linkage.
-    let expected_parent_hash = full_block_hash(parent);
+    let expected_parent_hash = block_id(parent);
     if header.prev_block_hash != expected_parent_hash {
         return Err(ConsensusError::BadParentHash);
     }
@@ -64,26 +117,24 @@ pub fn validate_header(
     }
 
     // 4. Timestamp rules.
-    validate_timestamp(header.timestamp, prev_timestamps, local_time)
+    validate_median_time_past(header.timestamp, prev_timestamps)
         .map_err(|_| ConsensusError::BadTimestamp)?;
+    if let Some(local_time) = local_time {
+        validate_future_drift(header.timestamp, local_time)
+            .map_err(|_| ConsensusError::BadTimestamp)?;
+    }
 
-    // 5. PoW over header_core.
+    // 5. Poseidon2b PoW over semantic header fields.
     validate_pow(header)?;
 
-    // 6. Proof must be attached (non-zero proof_transcript_hash).
-    if header.proof_transcript_hash == [0u8; 32] {
-        return Err(ConsensusError::MissingProof);
-    }
-
-    // 7. Slot space monotone.
-    if header.log_slots < parent.log_slots {
-        return Err(ConsensusError::BadLogSlots);
-    }
-    if header.log_slots > LOG_SLOTS_MAX {
-        return Err(ConsensusError::ShapeMismatch(format!(
-            "log_slots {} exceeds max {}",
-            header.log_slots, LOG_SLOTS_MAX
-        )));
+    // 6. Exact slot-space expansion.
+    let expected_log_slots = expected_child_log_slots(
+        parent.log_slots,
+        parent.active_slot_count,
+        prev_active_counts,
+    );
+    if header.log_slots != expected_log_slots {
+        return Err(ConsensusError::BadLogSlotsExpansion);
     }
 
     Ok(())
@@ -123,7 +174,7 @@ mod tests {
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
 
     fn make_header(height: u64, timestamp: u64, parent: Option<&BlockHeader>) -> BlockHeader {
-        let prev_hash = parent.map(full_block_hash).unwrap_or([0u8; 32]);
+        let prev_hash = parent.map(block_id).unwrap_or([0u8; 32]);
         BlockHeader {
             prev_block_hash: prev_hash,
             state_root: [0u8; 32],
@@ -133,8 +184,6 @@ mod tests {
             miner_address: Address([0u8; 32]),
             nonce: 0,
             difficulty_target: TEST_TARGET,
-            proof_transcript_hash: [1u8; 32], // non-zero
-            witness_root: [0u8; 32],
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
@@ -153,16 +202,51 @@ mod tests {
         let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
         mine(&mut h1);
         let prev_ts = vec![genesis.timestamp];
+        let prev_active = vec![genesis.active_slot_count];
         let result = validate_header(
             &h1,
             &genesis,
             &prev_ts,
+            &prev_active,
             h1.timestamp + 1,
             0,
             genesis.timestamp,
             &genesis.difficulty_target,
         );
         assert!(result.is_ok(), "valid header should accept: {:?}", result);
+    }
+
+    #[test]
+    fn timeless_header_excludes_local_future_drift_policy() {
+        let genesis = make_header(0, 1_000_000, None);
+        let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
+        mine(&mut h1);
+        let prev_ts = vec![genesis.timestamp];
+        let prev_active = vec![genesis.active_slot_count];
+
+        assert_eq!(
+            validate_header(
+                &h1,
+                &genesis,
+                &prev_ts,
+                &prev_active,
+                1,
+                0,
+                genesis.timestamp,
+                &genesis.difficulty_target,
+            ),
+            Err(ConsensusError::BadTimestamp)
+        );
+        assert!(validate_header_timeless(
+            &h1,
+            &genesis,
+            &prev_ts,
+            &prev_active,
+            0,
+            genesis.timestamp,
+            &genesis.difficulty_target,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -175,6 +259,7 @@ mod tests {
             &h1,
             &genesis,
             &[genesis.timestamp],
+            &[genesis.active_slot_count],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
@@ -187,36 +272,19 @@ mod tests {
     fn wrong_height_rejects() {
         let genesis = make_header(0, 1_000_000, None);
         let mut h1 = make_header(2, 1_000_000 + BLOCK_TIME, Some(&genesis)); // height=2 wrong
-        h1.prev_block_hash = full_block_hash(&genesis);
+        h1.prev_block_hash = block_id(&genesis);
         mine(&mut h1);
         let result = validate_header(
             &h1,
             &genesis,
             &[genesis.timestamp],
+            &[genesis.active_slot_count],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
             &genesis.difficulty_target,
         );
         assert_eq!(result, Err(ConsensusError::BadHeight));
-    }
-
-    #[test]
-    fn missing_proof_rejects() {
-        let genesis = make_header(0, 1_000_000, None);
-        let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
-        h1.proof_transcript_hash = [0u8; 32]; // no proof
-        mine(&mut h1);
-        let result = validate_header(
-            &h1,
-            &genesis,
-            &[genesis.timestamp],
-            h1.timestamp + 1,
-            0,
-            genesis.timestamp,
-            &genesis.difficulty_target,
-        );
-        assert_eq!(result, Err(ConsensusError::MissingProof));
     }
 
     #[test]
@@ -229,12 +297,13 @@ mod tests {
             &h1,
             &genesis,
             &[genesis.timestamp],
+            &[genesis.active_slot_count],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
             &genesis.difficulty_target,
         );
-        assert_eq!(result, Err(ConsensusError::BadLogSlots));
+        assert_eq!(result, Err(ConsensusError::BadLogSlotsExpansion));
     }
 
     #[test]
