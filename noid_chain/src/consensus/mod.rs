@@ -91,7 +91,8 @@ pub use timestamps::{
     validate_timestamp,
 };
 pub use validation::{
-    validate_block_checks, validate_block_checks_timeless, validate_block_consensus, AnchorInfo,
+    block_semantic_counts, validate_block_checks, validate_block_checks_timeless,
+    validate_block_consensus, validate_block_semantic_limits, AnchorInfo, BlockSemanticCounts,
 };
 
 /// Consensus validation errors — one variant per block invariant.
@@ -109,8 +110,14 @@ pub enum ConsensusError {
     BadTimestamp,
     /// §16.6 — required detached proof/witness data is absent.
     MissingProof,
-    /// §16.8 — Block contains more than `BLOCK_MAX_TXS` transactions.
+    /// §16.8 — Block contains more than `BLOCK_MAX_TXS` decoded transactions.
     TooManyTxs,
+    /// §16.8b — Block exceeds the Standard4x8-calibrated semantic budget.
+    BlockSemanticLimitExceeded {
+        limit: &'static str,
+        actual: usize,
+        max: usize,
+    },
     /// §16.9 — `tx_root` does not match the computed Merkle root.
     BadTxRoot,
     /// §16.10 — Two transactions claim the same input or output slot.

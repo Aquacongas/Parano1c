@@ -20,6 +20,39 @@ bytes are not part of semantic block identity or mining work. Different valid
 encodings of the same validation witness cannot create different consensus
 blocks.
 
+### 1.1.1 Semantic Block Capacity
+
+Consensus capacity is defined by semantic counters, not by the decoded
+transaction count alone. `BLOCK_MAX_TXS = 256` is a decoder/DoS hard cap
+including coinbase. The consensus user-transaction budget is calibrated to:
+
+```text
+255 Standard4x8 user transactions + 1 coinbase
+```
+
+The resulting consensus caps are:
+
+```text
+max user txs       = 255
+max live inputs    = 255 * 4 = 1020
+max user outputs   = 255 * 8 = 2040
+max owner groups   = 1020
+max user actions   = 1020 + 2040 = 3060
+```
+
+For full `Sweep25x2` transactions with 25 live inputs each, the live-input cap
+allows at most:
+
+```text
+floor(1020 / 25) = 40
+```
+
+full sweeps in one consensus-valid block. A block with 255 full sweeps is not
+consensus-valid even though it is below the raw decoder transaction cap.
+
+Serialized body/proof/sidecar byte caps remain admission and DoS controls. They
+are not the consensus throughput measure and are not public O(1) authority.
+
 ### 1.2 Block ID
 
 The chain link is:
@@ -450,7 +483,7 @@ The recursive step must prove, not assume:
 - exact MTP, ASERT, target floor, and cumulative chainwork integer semantics;
 - exact log-slot expansion trigger from the 18-block active-count window;
 - transaction root binding to the ordered block body;
-- coinbase, fee, supply, shape, and resource-weight rules;
+- coinbase, fee, supply, shape, and semantic block-capacity rules;
 - owner-batched authorization verification for every non-coinbase transaction;
 - exact sparse-Merkle UTXO transition;
 - exact ReuseGuard transition;
@@ -467,7 +500,6 @@ Public O(1) activation has a single accepted verifier shape:
 VerifyHistoryProof(
     genesis_consensus_state,
     claimed_tip_consensus_state,
-    claimed_tip_accumulator,
     proof
 ) = true
 ```
@@ -477,8 +509,8 @@ Acceptance requires all of the following in one composed relation:
 - the previous `HistoryProof` verifier relation, or the fixed genesis base case;
 - the full accepted-block batch relation over finalized blocks;
 - exact start/end equality between the previous proof state and the new batch;
-- exact chain-accumulator transition over the same ordered block ids and
-  accepted-block claims;
+- exact header, execution, and authorization batch transitions over the same
+  `BatchContextDigest`;
 - exact final `state_root = H_STATE_ROOT(log_slots, utxo_root, guard_root)`;
 - exact cumulative chainwork and finalized-prefix state;
 - no host-supplied accepted claims, local cache entries, header traces, or
@@ -489,15 +521,13 @@ sync is fail-closed even when peers send non-empty proof bytes. The local
 history cache and component proofs are useful for construction and testing,
 but they are not a substitute for `VerifyHistoryProof`.
 
-History proof soundness theorem:
+History proof target theorem:
 
 ```text
-VerifyHistoryProof(S_0, S_n, A_n, Π_n) = true
+VerifyHistoryProof(S_0, S_n, Π_n) = true
     => there exists a canonical sequence of finalized semantic blocks
        B_1..B_n and detached validation witnesses W_1..W_n such that
        S_i = AcceptBlockTimeless(S_{i-1}, B_i, W_i) for every i,
-       and A_n is the deterministic Poseidon2b chain accumulator over exactly
-       those ordered block ids and accepted-block claims,
 ```
 
 except with the union of:
@@ -507,6 +537,27 @@ except with the union of:
 - authorization knowledge-soundness failure;
 - exact-state Merkle binding failure; and
 - recursive verifier soundness failure.
+
+The public `RecursiveConsensusState` for this theorem is:
+
+```text
+height
+block_id
+state_root
+utxo_root
+guard_root
+cumulative_chainwork
+log_slots
+active_slot_count
+alloc_counter
+ASERT anchor
+MTP window
+expansion window
+```
+
+Rolling chain accumulators and accepted-claim accumulators may exist as local
+cache or construction helpers. They are not public O(1) authority and are not
+arguments to `VerifyHistoryProof`.
 
 ### Checkpoint Poseidon Component
 
@@ -658,7 +709,7 @@ does not by itself prove:
 
 Those constraints remain part of the full `AcceptBlock` proof relation.
 
-The authorization subrelation is the native batch relation:
+The current authorization subrelation is the native batch relation:
 
 ```text
 VerifyAuthorizationBatchNative(block, BlockAuthSidecar)
@@ -686,9 +737,42 @@ verification with a digest, cache marker, or local acceptance flag.
 
 Current implementation note: `OwnerAuthProofKillShot` already makes the
 Poseidon2b/FROST relation small. The dominant serialized size is the
-private-column PCS opening used to bind the Auth witness MLE. Replacing that
-PCS discharge is a production optimization target, but until it is replaced,
-the native authorization verifier remains the authority.
+private-column PCS opening used to bind the Auth witness MLE. The selected O(1)
+authorization target is an `OwnerAuthAccumulationProof` over the existing
+wallet proofs:
+
+```text
+OwnerAuthProofKillShot[0..n) as private witness
+    -> CoreAuthAccumulatorProof
+    -> PcsFriSourceBatchDeciderProof
+    -> OwnerAuthAccumulationProof
+```
+
+The core accumulator proves the non-PCS verifier equations and the PCS batch
+decider proves compact FRI, source TensorFold, source-cap Merkle binding, and
+terminal-opening equality. Until both parts are implemented and composed into
+`HistoryProof`, the native authorization verifier remains the authority.
+
+Target authorization accumulation theorem:
+
+```text
+VerifyOwnerAuthAccumulation(BatchContext, Π_auth) accepts
+    => for every non-coinbase transaction i in the batch,
+       there exists wallet proof π_i such that
+       VerifyAuthorization(Stmt_i, π_i) accepts,
+```
+
+where `Stmt_i` is the canonical statement derived from the ordered transaction
+body and authenticated pre-state owners inside the proved execution relation.
+The error is bounded by the implemented accumulator soundness, the PCS
+FRI/source batch-decider soundness, Poseidon2b binding assumptions, and the
+sum of the underlying `OwnerAuthProofKillShot` authorization errors.
+
+Combined with the Authorization Knowledge Theorem above, this target theorem
+implies that every consumed owner in an accepted accumulated authorization
+batch is authorized, except with the composed error bound. The target theorem is
+not active public authority until `VerifyOwnerAuthAccumulation` is proven inside
+`HistoryProof`.
 
 The current PCS uses a source-cap optimization: the source cap is part of the
 absorbed commitment, and source paths prove queried leaves to that cap. This

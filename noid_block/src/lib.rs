@@ -459,8 +459,8 @@ pub enum VerifyBlockError {
     },
     /// Public AuthGKR sidecar length, ordering, or tx-shape tags are invalid.
     AuthSidecarShapeMismatch,
-    /// Block proof/sidecar/body plus shape-derived verification work exceed the
-    /// configured resource-weight limit.
+    /// Block proof/sidecar/body plus admission verification work exceed the
+    /// configured DoS resource-weight limit.
     BlockResourceWeightExceeded,
     /// Exact authenticated state transition proof failed.
     ExactStateTransition(ExactStateTransitionError),

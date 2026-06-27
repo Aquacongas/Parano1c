@@ -121,8 +121,8 @@ fn validate_tx_consensus_inner(
 /// or mint to the same output slot (SPEC §16 invariants 4-5).
 ///
 /// Returns `Err(ConsensusError::SlotConflict)` on the first conflict found.
-/// This is O(n × inputs) per block but n ≤ BLOCK_MAX_TXS and inputs are bounded
-/// by the admitted transaction proof shape.
+/// This is O(n × inputs) per block, bounded by the decoder transaction cap and
+/// the consensus semantic live-input budget.
 pub fn validate_block_slot_conflicts(txs: &[Transaction]) -> Result<(), ConsensusError> {
     use std::collections::HashSet;
     let mut spent_inputs: HashSet<u32> = HashSet::new();

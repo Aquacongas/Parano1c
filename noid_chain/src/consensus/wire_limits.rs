@@ -48,9 +48,9 @@ pub const MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES: usize = 48 * 1024 * 1024;
 
 /// Maximum block resource weight accepted before expensive proof verification.
 ///
-/// This is a policy/DoS guard, not a cryptographic parameter. It counts proof
-/// bytes and shape-driven verification work separately from the hard transaction
-/// count cap.
+/// This is an admission/DoS guard, not the consensus semantic throughput
+/// budget. Consensus semantic limits live in `consensus::params` and are
+/// calibrated to 255 maximum Standard4x8 user transactions.
 pub const MAX_BLOCK_RESOURCE_WEIGHT: usize = 64 * 1024 * 1024;
 
 pub const BLOCK_WEIGHT_PER_USER_TX: usize = 16 * 1024;

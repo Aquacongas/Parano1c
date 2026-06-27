@@ -25,9 +25,11 @@ use crate::block_header::BlockHeader;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
-/// The economic / consensus limit is enforced elsewhere; this just keeps
-/// a malformed wire blob from allocating unbounded memory.
-pub const BLOCK_MAX_TXS: usize = 256;
+///
+/// The consensus throughput budget is the semantic block budget in
+/// `consensus::params`; this cap only keeps malformed wire blobs from
+/// allocating unbounded memory.
+pub const BLOCK_MAX_TXS: usize = crate::consensus::params::BLOCK_MAX_TXS;
 
 /// A semantic block: header plus ordered transactions.
 ///

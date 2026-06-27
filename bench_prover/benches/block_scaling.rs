@@ -16,10 +16,13 @@ use bench_prover::{
     bench_full_block_proof_minimal, fmt_bytes, fmt_ms, minimal_tx_fixture, standard_scenario,
     sweep_scenario, time_once, BenchScenario, MinimalTxFixture,
 };
-use noid_chain::consensus::params::BLOCK_MAX_TXS;
+use noid_chain::consensus::params::{
+    BLOCK_MAX_FULL_SWEEP25X2_TXS, BLOCK_MAX_TXS, BLOCK_MAX_USER_TXS,
+};
 
 const MAX_TOTAL_BLOCK_TXS: usize = BLOCK_MAX_TXS;
-const MAX_USER_TXS: usize = BLOCK_MAX_TXS - 1;
+const MAX_STANDARD_USER_TXS: usize = BLOCK_MAX_USER_TXS;
+const MAX_FULL_SWEEP_TXS: usize = BLOCK_MAX_FULL_SWEEP25X2_TXS;
 
 fn build_standard_fixtures(n: usize, slot_base: u32) -> Vec<MinimalTxFixture> {
     (0..n)
@@ -95,7 +98,7 @@ fn env_usize_list(name: &str, default: &[usize]) -> Vec<usize> {
     let parsed = value
         .split(',')
         .filter_map(|part| part.trim().parse::<usize>().ok())
-        .filter(|&n| (1..=MAX_USER_TXS).contains(&n))
+        .filter(|&n| (1..=MAX_STANDARD_USER_TXS).contains(&n))
         .collect::<Vec<_>>();
     if parsed.is_empty() {
         default.to_vec()
@@ -187,9 +190,13 @@ fn main() {
 
     let standard_ns = env_usize_list(
         "NOID_BLOCK_SCALING_STANDARD_NS",
-        &[10usize, 20, 100, MAX_USER_TXS],
+        &[10usize, 20, 100, MAX_STANDARD_USER_TXS],
     );
-    let max_standard = standard_ns.iter().copied().max().unwrap_or(MAX_USER_TXS);
+    let max_standard = standard_ns
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(MAX_STANDARD_USER_TXS);
     eprintln!("  building {max_standard} standard fixtures...");
     let t = Instant::now();
     let standard_fixtures = build_standard_fixtures(max_standard, 0);
@@ -229,9 +236,9 @@ fn main() {
         let scenarios = build_sweep_scenarios(n, 10_000 + n as u32 * 1_000);
         print_sweep_block(n, &scenarios);
     }
-    eprintln!("  building max sweep-heavy fixtures {MAX_USER_TXS} user txs...");
-    let max_sweep_scenarios = build_sweep_heavy_scenarios(MAX_USER_TXS, 3_000_000);
-    print_sweep_block(MAX_USER_TXS, &max_sweep_scenarios);
+    eprintln!("  building max sweep-heavy fixtures {MAX_FULL_SWEEP_TXS} user txs...");
+    let max_sweep_scenarios = build_sweep_heavy_scenarios(MAX_FULL_SWEEP_TXS, 3_000_000);
+    print_sweep_block(MAX_FULL_SWEEP_TXS, &max_sweep_scenarios);
 
     print_mixed(8, 2);
     print_mixed(5, 5);
@@ -240,7 +247,10 @@ fn main() {
     println!("  NOTES:");
     println!("    - Rows measure production BlockProof + BlockAuthSidecar only.");
     println!(
-        "    - Max block rows use {MAX_USER_TXS} non-coinbase txs + 1 coinbase = {MAX_TOTAL_BLOCK_TXS} total txs."
+        "    - Standard max row uses {MAX_STANDARD_USER_TXS} non-coinbase txs + 1 coinbase = {MAX_TOTAL_BLOCK_TXS} total decoded txs."
+    );
+    println!(
+        "    - Sweep-heavy max row uses {MAX_FULL_SWEEP_TXS} full 25-input sweeps under the semantic live-input budget."
     );
     println!("    - Wallet pre-proof time is reported separately and is not block-time work.");
     println!("    - Historical bucket aggregation is not measured by this bench.");

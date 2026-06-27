@@ -26,13 +26,13 @@ use noid_gkr::{
     CompositeStateRootInputs, GuardBucketHashInputs, MerklePathInputs, SlotLeafInputs,
     MAX_MERKLE_DEPTH,
 };
-use noid_tx::TxShape;
 
-/// Maximum user transactions in a block with one coinbase.
-pub const MAX_EXACT_USER_TXS: usize = noid_chain::block::BLOCK_MAX_TXS - 1;
-/// Max touched slots under current Standard4x8/Sweep25x2 shapes plus coinbase output.
+/// Maximum user transactions under the consensus semantic block budget.
+pub const MAX_EXACT_USER_TXS: usize = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+/// Max touched user slots under the Standard4x8-calibrated semantic budget plus
+/// the required single coinbase output.
 pub const MAX_EXACT_TOUCHED_SLOTS: usize =
-    MAX_EXACT_USER_TXS * TxShape::Sweep25x2.max_claimed_slots() + 1;
+    noid_chain::consensus::params::BLOCK_MAX_USER_ACTIONS + 1;
 /// Conservative sibling bound before canonical deduplication.
 pub const MAX_EXACT_SLOT_SIBLINGS: usize = MAX_EXACT_TOUCHED_SLOTS * 32;
 /// Maximum raw sibling bytes under the conservative bound.

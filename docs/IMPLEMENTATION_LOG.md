@@ -1894,7 +1894,7 @@ Result: passed.
 
 Notable long-path coverage included:
 
-- max 255 authorization sidecar cap;
+- max Standard4x8-equivalent authorization sidecar cap;
 - accepted full-batch replay and retained component proof checks;
 - recursive header, chain, and checkpoint tests;
 - FRI-Binius source-binding tamper tests;
@@ -1902,3 +1902,83 @@ Notable long-path coverage included:
 - mempool Sweep25x2 admission and tamper/replay tests;
 - miner standard, sweep, mixed, and split sweep+standard proof serialization;
 - wallet proof serialization secrecy tests.
+
+## Public O(1) Roadmap and Auth Accumulator Lab
+
+Added the root `roadmap.md` as the active implementation plan for public O(1)
+snapshot sync. The selected architecture keeps the current wallet-produced
+`OwnerAuthProofKillShot` model and makes public history authority a recursive
+`HistoryProof` over `RecursiveConsensusState`. Wallet proof bytes remain
+private witness material for history proving; public O(1) authorization is
+targeted through:
+
+```text
+OwnerAuthProofKillShot[0..n) witness
+    -> CoreAuthAccumulatorProof
+    -> PcsFriSourceBatchDeciderProof
+    -> OwnerAuthAccumulationProof
+```
+
+Updated `docs/security.md` so the public O(1) target theorem no longer takes a
+rolling chain accumulator as a public verifier argument. Rolling accumulators
+and accepted-claim accumulators are documented as local cache or construction
+helpers, not public O(1) authority.
+
+The current bench-only laboratory is:
+
+```text
+cargo bench -p bench_prover --bench o1_auth_accumulator_lite
+```
+
+It measures real wallet proof material with a streaming binary-field CLMUL
+accumulator kernel. Current standard-only observations:
+
+```text
+Standard4x8 x1:
+    core_accum about 0.37 ms
+    full_scan  about 0.44 ms
+    wallet     about 63 KB
+    PCS tail   about 58 KB
+
+Standard4x8 x64:
+    core_accum about 22.9 ms
+    full_scan  about 27.3 ms
+    wallet     about 3.98 MB
+    PCS tail   about 3.64 MB
+```
+
+The lab is not consensus authority. It shows that the binary-field accumulator
+kernel is cheap on real proof material and that the next production target is
+the proof-native batch decider for the existing Auth PCS compact-FRI/source
+opening relation.
+
+## Semantic Block Capacity
+
+Changed block capacity from a raw "up to 255 user transactions" interpretation
+to a consensus semantic budget calibrated by the maximum Standard4x8 block:
+
+```text
+255 Standard4x8 user transactions + 1 coinbase
+```
+
+Consensus caps are now:
+
+```text
+max user txs       = 255
+max live inputs    = 1020
+max user outputs   = 2040
+max owner groups   = 1020
+max user actions   = 3060
+```
+
+`BLOCK_MAX_TXS = 256` remains a decoded transaction hard cap including
+coinbase. It is not the throughput measure. A block of full `Sweep25x2`
+transactions is limited by the live-input budget:
+
+```text
+floor(1020 / 25) = 40 full Sweep25x2 user transactions
+```
+
+The proof-native acceptance path checks the semantic budget before expensive
+proof verification. Byte caps and proof/sidecar resource weight remain
+admission/DoS controls, separate from consensus capacity.

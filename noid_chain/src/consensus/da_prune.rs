@@ -28,8 +28,8 @@ use noid_poseidon2b::primitives::TxBodyHash;
 /// Per-block undo log. Records the pre-image value of every UTXO slot
 /// mutated by the block, enabling reversion without the full block data.
 ///
-/// Maximum size: `BLOCK_MAX_TXS × (MAX_INPUTS + MAX_OUTPUTS) × sizeof(SlotValue)`
-/// ≈ 147 KB at genesis parameters.
+/// Maximum size is bounded by the consensus semantic action budget plus the
+/// single coinbase output, not by the raw decoded transaction cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.

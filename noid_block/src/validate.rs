@@ -26,7 +26,8 @@
 use noid_chain::block::{apply_state_delta, validate_block_proof_binding, Block};
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::validation::{
-    validate_block_checks, validate_block_checks_timeless, AnchorInfo,
+    validate_block_checks, validate_block_checks_timeless, validate_block_semantic_limits,
+    AnchorInfo,
 };
 use noid_chain::consensus::wire_limits::{
     block_resource_weight_ok, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
@@ -671,6 +672,7 @@ fn accept_block_inner_with_artifacts(
             crate::VerifyBlockError::AuthSidecarShapeMismatch,
         ));
     }
+    validate_block_semantic_limits(block).map_err(FullValidationError::Consensus)?;
     let (user_txs, live_inputs, outputs, state_frontier_nodes) = block_resource_counts(block);
     if !block_resource_weight_ok(
         block.to_bytes().len(),

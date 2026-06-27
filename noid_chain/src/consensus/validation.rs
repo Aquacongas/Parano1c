@@ -15,7 +15,7 @@
 //!  ✅  Coinbase value ≤ block_reward(log_slots) + Σ fees                [P.7 full]
 //!  ✅  Per-tx: body_hash binding, non-zero anchor                        [P.8]
 //!  ✅  Cross-tx slot conflicts                                           [P.8]
-//!  ✅  TooManyTxs                                                        [P.9]
+//!  ✅  Decoder tx cap and semantic block budget                          [P.9]
 //!  ✅  Sequential state transition (`validate_block_consensus` only)       [P.9]
 //!
 //! # Invariants checked by the production proof layer
@@ -35,7 +35,10 @@ use crate::consensus::{
     emission::max_coinbase_value_from_fee_sum,
     fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
     header::{validate_header, validate_header_timeless},
-    params::BLOCK_MAX_TXS,
+    params::{
+        block_semantic_limits_ok, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_OWNER_GROUPS, BLOCK_MAX_TXS,
+        BLOCK_MAX_USER_ACTIONS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS,
+    },
     ConsensusError,
 };
 use crate::state::ChainState;
@@ -48,6 +51,77 @@ pub struct AnchorInfo {
     pub anchor_timestamp: u64,
     /// Difficulty target at the ASERT anchor block.
     pub anchor_target: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockSemanticCounts {
+    pub user_txs: usize,
+    pub live_inputs: usize,
+    pub user_outputs: usize,
+    pub owner_groups_upper_bound: usize,
+    pub user_actions: usize,
+}
+
+pub fn block_semantic_counts(block: &Block) -> BlockSemanticCounts {
+    let mut counts = BlockSemanticCounts::default();
+    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
+        counts.user_txs += 1;
+        let live_inputs = tx.body.inputs.iter().filter(|input| input.valid).count();
+        let live_outputs = tx.body.outputs.iter().filter(|output| output.valid).count();
+        counts.live_inputs += live_inputs;
+        counts.user_outputs += live_outputs;
+    }
+    counts.owner_groups_upper_bound = counts.live_inputs;
+    counts.user_actions = counts.live_inputs + counts.user_outputs;
+    counts
+}
+
+pub fn validate_block_semantic_limits(
+    block: &Block,
+) -> Result<BlockSemanticCounts, ConsensusError> {
+    let counts = block_semantic_counts(block);
+    if block_semantic_limits_ok(
+        counts.user_txs,
+        counts.live_inputs,
+        counts.user_outputs,
+        counts.owner_groups_upper_bound,
+    ) {
+        return Ok(counts);
+    }
+
+    if counts.user_txs > BLOCK_MAX_USER_TXS {
+        return Err(ConsensusError::BlockSemanticLimitExceeded {
+            limit: "user_txs",
+            actual: counts.user_txs,
+            max: BLOCK_MAX_USER_TXS,
+        });
+    }
+    if counts.live_inputs > BLOCK_MAX_LIVE_INPUTS {
+        return Err(ConsensusError::BlockSemanticLimitExceeded {
+            limit: "live_inputs",
+            actual: counts.live_inputs,
+            max: BLOCK_MAX_LIVE_INPUTS,
+        });
+    }
+    if counts.user_outputs > BLOCK_MAX_USER_OUTPUTS {
+        return Err(ConsensusError::BlockSemanticLimitExceeded {
+            limit: "user_outputs",
+            actual: counts.user_outputs,
+            max: BLOCK_MAX_USER_OUTPUTS,
+        });
+    }
+    if counts.owner_groups_upper_bound > BLOCK_MAX_OWNER_GROUPS {
+        return Err(ConsensusError::BlockSemanticLimitExceeded {
+            limit: "owner_groups",
+            actual: counts.owner_groups_upper_bound,
+            max: BLOCK_MAX_OWNER_GROUPS,
+        });
+    }
+    Err(ConsensusError::BlockSemanticLimitExceeded {
+        limit: "user_actions",
+        actual: counts.user_actions,
+        max: BLOCK_MAX_USER_ACTIONS,
+    })
 }
 
 fn validate_fee_policy_and_claimable_fee_sum(
@@ -196,6 +270,7 @@ fn validate_block_checks_inner(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+    validate_block_semantic_limits(block)?;
     validate_coinbase_canonical(block, parent)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
@@ -254,6 +329,7 @@ pub fn validate_block_consensus(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(ConsensusError::TooManyTxs);
     }
+    validate_block_semantic_limits(block)?;
 
     validate_coinbase_canonical(block, parent)?;
 
@@ -317,7 +393,7 @@ mod tests {
     use crate::consensus::{genesis::GENESIS_TIMESTAMP, params::BLOCK_TIME};
     use crate::state::ChainState;
     use noid_poseidon2b::primitives::{Address, SpendSecret};
-    use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
+    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
 
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
     const TEST_LOG_SLOTS: usize = 6;
@@ -372,7 +448,8 @@ mod tests {
     }
 
     fn tx_from_body(body: TxBody) -> Transaction {
-        let hash = hash_tx_body(
+        let hash = hash_tx_body_for_shape(
+            body.shape,
             &body.epoch_anchor,
             body.fee,
             &body.inputs,
@@ -382,6 +459,62 @@ mod tests {
         Transaction {
             body,
             tx_body_hash: hash,
+        }
+    }
+
+    fn semantic_limit_tx(
+        shape: TxShape,
+        n_inputs: usize,
+        n_outputs: usize,
+        slot_base: u32,
+    ) -> Transaction {
+        let inputs = (0..n_inputs)
+            .map(|i| TxInput {
+                slot_index: slot_base + i as u32,
+                value: 100,
+                owner: Address([1u8; 32]),
+                spend_secret: SpendSecret([2u8; 32]),
+                valid: true,
+            })
+            .collect::<Vec<_>>();
+        let outputs = (0..n_outputs)
+            .map(|i| TxOutput {
+                slot_index: slot_base + 10_000 + i as u32,
+                value: 1,
+                owner: Address([3u8; 32]),
+                valid: true,
+            })
+            .collect::<Vec<_>>();
+        tx_from_body(TxBody {
+            shape,
+            epoch_anchor: [1u8; 32],
+            fee: 0,
+            inputs,
+            outputs,
+            is_coinbase: false,
+        })
+    }
+
+    fn semantic_limit_coinbase() -> Transaction {
+        tx_from_body(TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                slot_index: 0,
+                value: 1,
+                owner: Address([9u8; 32]),
+                valid: true,
+            }],
+            is_coinbase: true,
+        })
+    }
+
+    fn semantic_limit_block(transactions: Vec<Transaction>) -> Block {
+        Block {
+            header: mk_parent(1, GENESIS_TIMESTAMP + BLOCK_TIME, [0u8; 32], [0u8; 32]),
+            transactions,
         }
     }
 
@@ -456,6 +589,59 @@ mod tests {
             },
             transactions: txs,
         }
+    }
+
+    #[test]
+    fn semantic_limits_accept_standard_baseline_block() {
+        let mut txs = Vec::with_capacity(crate::consensus::params::BLOCK_MAX_TXS);
+        txs.push(semantic_limit_coinbase());
+        for i in 0..crate::consensus::params::BLOCK_MAX_USER_TXS {
+            txs.push(semantic_limit_tx(
+                TxShape::Standard4x8,
+                4,
+                8,
+                1_000 + i as u32 * 20,
+            ));
+        }
+        let counts = validate_block_semantic_limits(&semantic_limit_block(txs))
+            .expect("255 Standard4x8-equivalent block fits semantic budget");
+        assert_eq!(
+            counts.live_inputs,
+            crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
+        );
+        assert_eq!(
+            counts.user_outputs,
+            crate::consensus::params::BLOCK_MAX_USER_OUTPUTS
+        );
+        assert_eq!(
+            counts.user_actions,
+            crate::consensus::params::BLOCK_MAX_USER_ACTIONS
+        );
+    }
+
+    #[test]
+    fn semantic_limits_reject_41_full_sweeps() {
+        let mut txs = Vec::with_capacity(42);
+        txs.push(semantic_limit_coinbase());
+        for i in 0..(crate::consensus::params::BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) {
+            txs.push(semantic_limit_tx(
+                TxShape::Sweep25x2,
+                25,
+                2,
+                1_000 + i as u32 * 40,
+            ));
+        }
+
+        let err = validate_block_semantic_limits(&semantic_limit_block(txs))
+            .expect_err("41 full Sweep25x2 txs exceed live-input budget");
+        assert_eq!(
+            err,
+            ConsensusError::BlockSemanticLimitExceeded {
+                limit: "live_inputs",
+                actual: 1025,
+                max: crate::consensus::params::BLOCK_MAX_LIVE_INPUTS,
+            }
+        );
     }
 
     #[test]

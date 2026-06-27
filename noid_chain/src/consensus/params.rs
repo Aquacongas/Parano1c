@@ -26,17 +26,60 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 // Block limits
 // ---------------------------------------------------------------------------
 
-/// Maximum transactions per block.
+/// Maximum transactions decoded in one block, including coinbase.
 ///
-/// This is the consensus hard cap. Miner/template policy may choose fewer txs
-/// on weaker hardware, but validators accept any block within this cap.
+/// This is a hard decoder/DoS cap. The consensus throughput budget is the
+/// semantic block budget below, calibrated to 255 maximum Standard4x8 user
+/// transactions plus one coinbase.
 pub const BLOCK_MAX_TXS: usize = 256;
 
-/// Maximum inputs per transaction.
+/// Maximum inputs in the baseline Standard4x8 transaction shape.
 pub const MAX_INPUTS: usize = 4;
 
-/// Maximum outputs per transaction.
+/// Maximum outputs in the baseline Standard4x8 transaction shape.
 pub const MAX_OUTPUTS: usize = 8;
+
+/// Baseline non-coinbase block load used to define semantic block capacity.
+pub const BLOCK_BASELINE_STANDARD_USER_TXS: usize = BLOCK_MAX_TXS - 1;
+
+/// Maximum non-coinbase transactions accepted by consensus.
+pub const BLOCK_MAX_USER_TXS: usize = BLOCK_BASELINE_STANDARD_USER_TXS;
+
+/// Maximum valid user inputs accepted by consensus in one block.
+pub const BLOCK_MAX_LIVE_INPUTS: usize =
+    BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_inputs();
+
+/// Maximum valid user outputs accepted by consensus in one block.
+pub const BLOCK_MAX_USER_OUTPUTS: usize =
+    BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_outputs();
+
+/// Maximum unique owner groups accepted by consensus in one block.
+///
+/// A transaction cannot have more unique owner groups than live inputs, so this
+/// matches the baseline live-input budget.
+pub const BLOCK_MAX_OWNER_GROUPS: usize = BLOCK_MAX_LIVE_INPUTS;
+
+/// Maximum spend+mint user action count accepted by consensus in one block.
+pub const BLOCK_MAX_USER_ACTIONS: usize = BLOCK_MAX_LIVE_INPUTS + BLOCK_MAX_USER_OUTPUTS;
+
+/// Maximum full Sweep25x2 transactions admitted by the semantic live-input
+/// budget when every sweep uses 25 live inputs.
+pub const BLOCK_MAX_FULL_SWEEP25X2_TXS: usize =
+    BLOCK_MAX_LIVE_INPUTS / noid_tx::TxShape::Sweep25x2.max_inputs();
+
+#[inline]
+pub const fn block_semantic_limits_ok(
+    user_txs: usize,
+    live_inputs: usize,
+    user_outputs: usize,
+    owner_groups: usize,
+) -> bool {
+    user_txs <= BLOCK_MAX_USER_TXS
+        && live_inputs <= BLOCK_MAX_LIVE_INPUTS
+        && user_outputs <= BLOCK_MAX_USER_OUTPUTS
+        && owner_groups <= BLOCK_MAX_OWNER_GROUPS
+        && live_inputs + user_outputs <= BLOCK_MAX_USER_ACTIONS
+}
 
 // ---------------------------------------------------------------------------
 // Epoch anchor
@@ -256,6 +299,34 @@ mod tests {
         assert_eq!(HALFLIFE, EPOCH_LENGTH * BLOCK_TIME);
         assert_eq!(HALFLIFE, 90, "HALFLIFE = 6 epochs × 15s");
         assert_eq!(CONSENSUS_FINALITY_DEPTH, 3 * EPOCH_LENGTH);
+    }
+
+    #[test]
+    fn semantic_block_budget_is_standard_baseline() {
+        assert_eq!(BLOCK_MAX_TXS, 256);
+        assert_eq!(BLOCK_MAX_USER_TXS, 255);
+        assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1020);
+        assert_eq!(BLOCK_MAX_USER_OUTPUTS, 2040);
+        assert_eq!(BLOCK_MAX_USER_ACTIONS, 3060);
+        assert_eq!(BLOCK_MAX_OWNER_GROUPS, 1020);
+        assert_eq!(BLOCK_MAX_FULL_SWEEP25X2_TXS, 40);
+    }
+
+    #[test]
+    fn semantic_block_budget_rejects_full_sweep_overload() {
+        assert!(block_semantic_limits_ok(255, 1020, 2040, 1020));
+        assert!(block_semantic_limits_ok(
+            BLOCK_MAX_FULL_SWEEP25X2_TXS,
+            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_inputs(),
+            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_outputs(),
+            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_inputs(),
+        ));
+        assert!(!block_semantic_limits_ok(
+            BLOCK_MAX_FULL_SWEEP25X2_TXS + 1,
+            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_inputs(),
+            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_outputs(),
+            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_inputs(),
+        ));
     }
 
     #[test]
