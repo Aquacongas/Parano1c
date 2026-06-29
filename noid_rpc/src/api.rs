@@ -44,7 +44,8 @@ pub trait ParanoidApi {
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Trustless public history proof. Returns null until the real O(1) proof is active.
+    /// Current constant-size history proof envelope, if the local finalized cache is ready.
+    /// Snapshot authority remains fail-closed until the trustless verifier is active.
     #[method(name = "getHistoryProof")]
     async fn get_history_proof(&self) -> RpcResult<Option<String>>;
 
@@ -71,7 +72,7 @@ pub trait ParanoidApi {
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>>;
 
     /// Full block (header + transactions) at `height`, as hex.
-    /// Only the last 18 blocks are retained; older blocks are pruned.
+    /// Only retained recent blocks are served; older block bodies are pruned.
     #[method(name = "getBlock")]
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>>;
 

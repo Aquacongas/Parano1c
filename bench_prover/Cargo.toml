@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "o1_auth_accumulator_lite"
 harness = false
+
+[[bench]]
+name = "history_accumulator_lite"
+harness = false

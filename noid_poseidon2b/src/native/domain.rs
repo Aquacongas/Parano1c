@@ -80,6 +80,12 @@ pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
 pub const TAG_HDRPROJ: DomainTag = DomainTag::new(b"HDRPROJ_");
 /// Rolling header-chain anchor over canonical header projections.
 pub const TAG_HDRANCH: DomainTag = DomainTag::new(b"HDRANCH_");
+/// Accepted history/state transition digest for O(1) state sync.
+pub const TAG_HISTTRN: DomainTag = DomainTag::new(b"HISTTRN_");
+/// Accepted history/state claim digest for O(1) state sync.
+pub const TAG_HISTCLM: DomainTag = DomainTag::new(b"HISTCLM_");
+/// Constant public history proof envelope digest for O(1) state sync.
+pub const TAG_HISTPRF: DomainTag = DomainTag::new(b"HISTPRF_");
 /// Variable-length byte hashing with an explicit absorbed domain string.
 pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
 
@@ -112,6 +118,9 @@ mod tests {
             TAG_ACCBLK,
             TAG_HDRPROJ,
             TAG_HDRANCH,
+            TAG_HISTTRN,
+            TAG_HISTCLM,
+            TAG_HISTPRF,
             TAG_BYTEHASH,
         ];
         for i in 0..tags.len() {

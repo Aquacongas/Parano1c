@@ -138,6 +138,64 @@ pub struct ExactCompositeStateRootBatchInputs {
 }
 
 impl VerifiedStateTransition {
+    pub(crate) fn from_verified_no_spend_native(
+        inputs: &ExactStateTransitionInputs,
+        surface: &ExactActionSurface,
+        child_utxo_root: StateHash,
+    ) -> Result<Self, ExactStateTransitionError> {
+        if surface.spends != 0 || !surface.spent_slots.is_empty() {
+            return Err(ExactStateTransitionError::UnexpectedGuardProof);
+        }
+        match inputs.child_log_slots.cmp(&inputs.parent_log_slots) {
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater
+                if inputs.child_log_slots == inputs.parent_log_slots + 1 => {}
+            _ => return Err(ExactStateTransitionError::InvalidLogSlots),
+        }
+
+        let parent_composite = composite_state_root(
+            inputs.parent_log_slots,
+            inputs.parent_utxo_root,
+            inputs.parent_guard_root,
+        );
+        if parent_composite != inputs.parent_state_root {
+            return Err(ExactStateTransitionError::ParentRootMismatch);
+        }
+
+        let child_guard_root = inputs.parent_guard_root;
+        let child_state_root =
+            composite_state_root(inputs.child_log_slots, child_utxo_root, child_guard_root);
+        if child_state_root != inputs.child_state_root {
+            return Err(ExactStateTransitionError::ChildRootMismatch);
+        }
+        let active_slot_count = inputs
+            .parent_active_slot_count
+            .checked_add(surface.mints as u64)
+            .ok_or(ExactStateTransitionError::CounterOverflow)?;
+        let alloc_counter = inputs
+            .parent_alloc_counter
+            .checked_add(surface.mints as u64)
+            .ok_or(ExactStateTransitionError::CounterOverflow)?;
+        let slot_updates = surface
+            .touched_indices
+            .iter()
+            .copied()
+            .zip(surface.new_slots.iter().copied())
+            .collect();
+
+        Ok(Self {
+            parent_state_root: inputs.parent_state_root,
+            child_state_root,
+            child_utxo_root,
+            child_guard_root,
+            log_slots: inputs.child_log_slots,
+            slot_updates,
+            guard_bucket_update: None,
+            active_slot_count,
+            alloc_counter,
+        })
+    }
+
     pub fn parent_state_root(&self) -> StateHash {
         self.parent_state_root
     }
@@ -1135,9 +1193,12 @@ mod tests {
 
     #[test]
     fn max_shape_exact_proof_serializes_under_cap() {
-        assert_eq!(MAX_EXACT_TOUCHED_SLOTS, 6_886);
-        assert_eq!(MAX_EXACT_SLOT_SIBLINGS, 220_352);
-        assert_eq!(MAX_EXACT_SLOT_SIBLING_BYTES, 7_051_264);
+        assert_eq!(
+            MAX_EXACT_TOUCHED_SLOTS,
+            noid_chain::consensus::params::BLOCK_MAX_USER_ACTIONS + 1
+        );
+        assert_eq!(MAX_EXACT_SLOT_SIBLINGS, MAX_EXACT_TOUCHED_SLOTS * 32);
+        assert_eq!(MAX_EXACT_SLOT_SIBLING_BYTES, MAX_EXACT_SLOT_SIBLINGS * 32);
         let proof = ExactStateTransitionProof {
             slot_siblings: vec![[0u8; 32]; MAX_EXACT_SLOT_SIBLINGS],
             guard_update: Some(GuardBucketUpdateProof {

@@ -15,6 +15,7 @@
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use serde_json::Value;
 use std::io::{self, Write};
 
@@ -143,7 +144,7 @@ enum Command {
         height: u64,
     },
 
-    /// Full raw block at a given height (last 18 blocks only).
+    /// Full raw block at a given height (retained recent blocks only).
     #[command(alias = "blk")]
     Block {
         /// Block height to query.
@@ -593,7 +594,7 @@ async fn cmd_block(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
 
     if result.is_null() {
         warn_msg(&format!(
-            "Block {height} not available (only last 18 blocks are stored)."
+            "Block {height} not available (only last {RECENT_BLOCK_RETENTION_DEPTH} blocks are stored)."
         ));
         return Ok(());
     }
@@ -659,8 +660,8 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     if result.is_null() {
-        warn_msg("Trustless public HistoryProof is not active yet.");
-        println!("  Public O(1) snapshot authority remains disabled until HistoryProof is active.");
+        warn_msg("No local HistoryProof envelope is available yet.");
+        println!("  The finalized history cache has not produced proof bytes.");
         return Ok(());
     }
 
@@ -679,12 +680,12 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv2(
         "Size",
         &format!("{bytes} bytes ({kb:.1} KB)"),
-        "(public O(1) snapshot authority)",
+        "(constant-size history envelope)",
     );
     kv("Fingerprint", &proof_hash);
     println!();
     println!(
-        "  {} Public HistoryProof bytes are active.",
+        "  {} Untrusted snapshot authority remains fail-closed until the backend verifier is active.",
         c!(DIM, "Note:")
     );
 

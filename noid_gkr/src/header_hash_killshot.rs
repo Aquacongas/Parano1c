@@ -41,7 +41,7 @@ pub struct HeaderHashInputs {
     pub expected_block_id: [Block128; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderHashProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,
@@ -117,6 +117,29 @@ fn absorb_public_batch<T: FiatShamir<Block128>>(channel: &mut T, inputs: &[Heade
     channel.absorb(Block128::from(TAG_BLOCKHDR.as_u64() as u128));
     for input in inputs {
         absorb_public_header(channel, input);
+    }
+}
+
+fn zero_header_hash_input() -> HeaderHashInputs {
+    HeaderHashInputs {
+        fields: [Block128::ZERO; HEADER_HASH_FIELDS],
+        expected_pow_digest: [Block128::ZERO; 2],
+        expected_block_id: [Block128::ZERO; 2],
+    }
+}
+
+fn absorb_public_batch_padded<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+) {
+    channel.absorb(Block128::from(inputs.len() as u128));
+    channel.absorb(Block128::from(padded_headers as u128));
+    channel.absorb(Block128::from(TAG_POWHDR.as_u64() as u128));
+    channel.absorb(Block128::from(TAG_BLOCKHDR.as_u64() as u128));
+    let zero = zero_header_hash_input();
+    for idx in 0..padded_headers {
+        absorb_public_header(channel, inputs.get(idx).unwrap_or(&zero));
     }
 }
 
@@ -265,16 +288,67 @@ fn header_hash_claims(inputs: &[HeaderHashInputs], num_vars: usize) -> Vec<Linea
     claims
 }
 
+fn zero_linear_claims_like(mut claims: Vec<LinearEvalClaim>) -> Vec<LinearEvalClaim> {
+    for claim in &mut claims {
+        claim.value = Block128::ZERO;
+        for term in &mut claim.terms {
+            term.coeff = Block128::ZERO;
+        }
+    }
+    claims
+}
+
+fn header_hash_claims_padded(
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+    num_vars: usize,
+) -> Vec<LinearEvalClaim> {
+    let mut claims = header_hash_claims(inputs, num_vars);
+    if inputs.len() < padded_headers {
+        let zero = zero_header_hash_input();
+        let template =
+            zero_linear_claims_like(header_hash_claims(std::slice::from_ref(&zero), num_vars));
+        claims.reserve(template.len() * (padded_headers - inputs.len()));
+        for _ in inputs.len()..padded_headers {
+            claims.extend(template.iter().cloned());
+        }
+    }
+    claims
+}
+
 pub fn prove_header_hash_killshot<T: FiatShamir<Block128>>(
     inputs: &[HeaderHashInputs],
     channel: &mut T,
 ) -> (HeaderHashProofKillShot, HeaderHashReductions) {
+    prove_header_hash_killshot_with_shape(inputs, inputs.len(), false, channel)
+}
+
+pub fn prove_header_hash_killshot_padded<T: FiatShamir<Block128>>(
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+    channel: &mut T,
+) -> (HeaderHashProofKillShot, HeaderHashReductions) {
+    prove_header_hash_killshot_with_shape(inputs, padded_headers, true, channel)
+}
+
+fn prove_header_hash_killshot_with_shape<T: FiatShamir<Block128>>(
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+    pad_public_transcript: bool,
+    channel: &mut T,
+) -> (HeaderHashProofKillShot, HeaderHashReductions) {
     let slot_state_ins =
         evaluate_header_hashes(inputs).expect("prover asked to prove wrong header hash");
+    assert!(inputs.len() <= padded_headers);
+    let padded_live_slots = padded_headers * HEADER_HASH_PERMS_PER_ITEM;
 
-    absorb_public_batch(channel, inputs);
+    if pad_public_transcript {
+        absorb_public_batch_padded(channel, inputs, padded_headers);
+    } else {
+        absorb_public_batch(channel, inputs);
+    }
 
-    let mle = BlockSpineMle::build_from_slot_state_ins(&slot_state_ins);
+    let mle = BlockSpineMle::build_from_slot_state_ins_padded(&slot_state_ins, padded_live_slots);
     let (main, r_prime) = prove_block_spine_unified(&mle, channel);
     let main_red = BlockSpineUnifiedReduction {
         r_prime: r_prime.clone(),
@@ -289,7 +363,11 @@ pub fn prove_header_hash_killshot<T: FiatShamir<Block128>>(
     };
     let (shift, r_double_prime) = prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
 
-    let chain_claims = header_hash_claims(inputs, mle.num_vars);
+    let chain_claims = if pad_public_transcript {
+        header_hash_claims_padded(inputs, padded_headers, mle.num_vars)
+    } else {
+        header_hash_claims(inputs, mle.num_vars)
+    };
     let (chain, chain_red) = prove_linear_eval_prebound(
         &mle.state,
         &chain_claims,
@@ -347,9 +425,29 @@ pub fn verify_header_hash_killshot<T: FiatShamir<Block128>>(
     inputs: &[HeaderHashInputs],
     channel: &mut T,
 ) -> Option<HeaderHashReductions> {
+    verify_header_hash_killshot_with_shape(proof, inputs, inputs.len(), false, channel)
+}
+
+pub fn verify_header_hash_killshot_padded<T: FiatShamir<Block128>>(
+    proof: &HeaderHashProofKillShot,
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+    channel: &mut T,
+) -> Option<HeaderHashReductions> {
+    verify_header_hash_killshot_with_shape(proof, inputs, padded_headers, true, channel)
+}
+
+fn verify_header_hash_killshot_with_shape<T: FiatShamir<Block128>>(
+    proof: &HeaderHashProofKillShot,
+    inputs: &[HeaderHashInputs],
+    padded_headers: usize,
+    pad_public_transcript: bool,
+    channel: &mut T,
+) -> Option<HeaderHashReductions> {
     if inputs.is_empty()
         || proof.n_headers != inputs.len()
-        || proof.live_slots != inputs.len() * HEADER_HASH_PERMS_PER_ITEM
+        || inputs.len() > padded_headers
+        || proof.live_slots != padded_headers * HEADER_HASH_PERMS_PER_ITEM
     {
         return None;
     }
@@ -358,7 +456,11 @@ pub fn verify_header_hash_killshot<T: FiatShamir<Block128>>(
         return None;
     }
 
-    absorb_public_batch(channel, inputs);
+    if pad_public_transcript {
+        absorb_public_batch_padded(channel, inputs, padded_headers);
+    } else {
+        absorb_public_batch(channel, inputs);
+    }
 
     let main_red = verify_block_spine_unified(
         &proof.kill_shot.main,
@@ -369,7 +471,11 @@ pub fn verify_header_hash_killshot<T: FiatShamir<Block128>>(
     let shift_red =
         verify_block_spine_shift(&proof.kill_shot.shift, &main_red, proof.num_vars, channel)?;
 
-    let chain_claims = header_hash_claims(inputs, proof.num_vars);
+    let chain_claims = if pad_public_transcript {
+        header_hash_claims_padded(inputs, padded_headers, proof.num_vars)
+    } else {
+        header_hash_claims(inputs, proof.num_vars)
+    };
     let chain_red = verify_linear_eval_prebound(
         &proof.chain,
         &chain_claims,
@@ -416,9 +522,23 @@ pub fn discharge_header_hash_reductions_native(
     inputs: &[HeaderHashInputs],
     reductions: &HeaderHashReductions,
 ) -> bool {
+    discharge_header_hash_reductions_native_padded(inputs, reductions, inputs.len())
+}
+
+pub fn discharge_header_hash_reductions_native_padded(
+    inputs: &[HeaderHashInputs],
+    reductions: &HeaderHashReductions,
+    padded_headers: usize,
+) -> bool {
     let Some(slot_state_ins) = evaluate_header_hashes(inputs) else {
         return false;
     };
+    let padded_live_slots = padded_headers * HEADER_HASH_PERMS_PER_ITEM;
+    if slot_state_ins.len() > padded_live_slots {
+        return false;
+    }
+    let mut slot_state_ins = slot_state_ins;
+    slot_state_ins.resize(padded_live_slots, [Block128::ZERO; STATE_SIZE]);
     crate::block_spine::discharge_block_spine_batch_reductions_from_slot_state_ins_native(
         &slot_state_ins,
         &reductions.state,
@@ -481,6 +601,61 @@ mod tests {
         let verified = verify_header_hash_killshot(&proof, &inputs, &mut ch_v)
             .expect("header hash proof verifies");
         assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn header_hash_padded_roundtrip_size_constant_and_rejects_small_shape() {
+        let all_inputs = vec![input(1), input(2), input(3), input(4)];
+        let padded_headers = all_inputs.len();
+        let mut expected_len = None;
+
+        for n in [1usize, 3, padded_headers] {
+            let inputs = &all_inputs[..n];
+            let mut ch_p = Poseidon2bChannel::new();
+            let (proof, reductions) =
+                prove_header_hash_killshot_padded(inputs, padded_headers, &mut ch_p);
+            assert_eq!(proof.n_headers, n);
+            assert_eq!(
+                proof.live_slots,
+                padded_headers * HEADER_HASH_PERMS_PER_ITEM
+            );
+
+            let mut ch_v = Poseidon2bChannel::new();
+            let verified =
+                verify_header_hash_killshot_padded(&proof, inputs, padded_headers, &mut ch_v)
+                    .expect("padded header hash proof verifies");
+            assert_eq!(verified, reductions);
+            assert!(discharge_header_hash_reductions_native_padded(
+                inputs,
+                &verified,
+                padded_headers,
+            ));
+
+            if let Some(expected_len) = expected_len {
+                assert_eq!(proof.byte_len(), expected_len);
+            } else {
+                expected_len = Some(proof.byte_len());
+            }
+
+            if n < padded_headers {
+                let mut ch_small = Poseidon2bChannel::new();
+                assert!(
+                    verify_header_hash_killshot_padded(&proof, inputs, n, &mut ch_small).is_none()
+                );
+            }
+        }
+
+        let inputs = &all_inputs[..1];
+        let mut ch_p = Poseidon2bChannel::new();
+        let (small_shape_proof, _) = prove_header_hash_killshot(inputs, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_header_hash_killshot_padded(
+            &small_shape_proof,
+            inputs,
+            padded_headers,
+            &mut ch_v,
+        )
+        .is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! `BlockChainContext` wraps it and adds:
 //!
 //! - `local_history_cache: Option<LocalHistoryCache>` — local finalized-history accumulator cache.
-//! - `update_local_history_cache_with_claim(chain_claim)` — advances the cache by one block.
+//! - `update_local_history_cache_with_claim_fields(claim_fields)` — advances the cache by one block.
 //! - `init_from_genesis()` — initialises both consensus state and the genesis cache.
 //!
 //! The live full node does not use this wrapper as its block acceptance path; it
@@ -20,11 +20,12 @@
 
 use noid_chain::block::Block;
 use noid_chain::consensus::ConsensusError;
-use noid_chain::ChainContext;
+use noid_chain::{block_work, ChainContext};
 use noid_core::Block128;
+use noid_gkr::HISTORY_CLAIM_FIELDS;
 use noid_recursive::prove::{
-    accepted_block_claim_witness, advance_local_history_cache, init_genesis_history_cache,
-    LocalHistoryCache,
+    accepted_block_claim_witness_from_fields, advance_local_history_cache,
+    init_genesis_history_cache, LocalHistoryCache,
 };
 
 #[derive(Debug)]
@@ -113,18 +114,23 @@ impl BlockChainContext {
     /// Returns a reference to the new local cache object.
     ///
     /// This is not public O(1) authority.
-    pub fn update_local_history_cache_with_claim(
+    pub fn update_local_history_cache_with_claim_fields(
         &mut self,
-        chain_claim: [Block128; 2],
+        claim_fields: [Block128; HISTORY_CLAIM_FIELDS],
     ) -> Result<&LocalHistoryCache, ReplayWitnessError> {
-        let witness = accepted_block_claim_witness(chain_claim);
+        let witness = accepted_block_claim_witness_from_fields(claim_fields)
+            .map_err(|_| ReplayWitnessError::MissingPreviousLocalHistoryCache)?;
         let prev = self
             .local_history_cache
             .as_ref()
             .ok_or(ReplayWitnessError::MissingPreviousLocalHistoryCache)?;
-        let prev_acc = prev.acc.clone();
         let header = *self.consensus.tip_header();
-        let next = advance_local_history_cache(&witness, &header, &prev_acc, Some(prev));
+        let cumulative_chainwork = noid_chain::add_work(
+            &prev.anchor.cumulative_chainwork,
+            &block_work(&header.difficulty_target),
+        );
+        let next = advance_local_history_cache(prev, &witness, &header, cumulative_chainwork)
+            .map_err(|_| ReplayWitnessError::MissingPreviousLocalHistoryCache)?;
         self.local_history_cache = Some(next);
         Ok(self.local_history_cache.as_ref().expect("just stored"))
     }

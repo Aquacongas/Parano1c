@@ -258,12 +258,7 @@ pub fn verify_full_accepted_block_batch_native(
         .map_err(|source| FullAcceptedBlockBatchError::FullValidation { index, source })?;
 
         if has_user_txs {
-            let artifacts = validation.artifacts.ok_or_else(|| {
-                FullAcceptedBlockBatchError::FullValidation {
-                    index,
-                    source: FullValidationError::ZkProof(VerifyBlockError::ShapeMismatch),
-                }
-            })?;
+            let artifacts = validation.artifacts;
             let proof = proof
                 .as_ref()
                 .expect("user-transaction block proof decoded above");
@@ -328,11 +323,6 @@ pub fn verify_full_accepted_block_batch_native(
             authorization_totals.live_input_count_total = authorization_totals
                 .live_input_count_total
                 .saturating_add(artifacts.authorization.live_input_count_total);
-        } else if validation.artifacts.is_some() {
-            return Err(FullAcceptedBlockBatchError::FullValidation {
-                index,
-                source: FullValidationError::ZkProof(VerifyBlockError::ShapeMismatch),
-            });
         }
 
         let transcript = accepted_block_claim_transcript(

@@ -196,6 +196,27 @@ impl ChainState {
         Ok(cache)
     }
 
+    pub fn exact_utxo_root_after_slot_updates(
+        &self,
+        log_slots: u32,
+        slot_updates: &[(u32, SlotValue)],
+    ) -> Result<StateHash, ApplyExactTransitionError> {
+        let mut snapshot = self.clone();
+        while log_slots as usize > snapshot.state.log_slots() {
+            snapshot.state.expand();
+        }
+        if log_slots as usize != snapshot.state.log_slots() {
+            return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
+        }
+        snapshot
+            .state
+            .apply_delta_unrooted(slot_updates)
+            .map_err(|_| ApplyExactTransitionError::SlotOutOfRange)?;
+        snapshot
+            .rebuild_exact_utxo_root_loaded()
+            .map_err(ApplyExactTransitionError::ExactStateRead)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_verified_exact_transition(
         &mut self,
@@ -274,6 +295,7 @@ pub enum ApplyExactTransitionError {
     SlotOutOfRange,
     HeaderLogSlotsMismatch,
     ReuseGuardRootMismatch,
+    ExactStateRead(ExactStateReadError),
     ReuseGuard(crate::reuse_guard::ReuseGuardError),
 }
 

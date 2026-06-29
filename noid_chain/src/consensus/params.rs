@@ -138,7 +138,7 @@ pub const UNDO_LOG_RETENTION: u64 = UNDO_RETENTION_DEPTH;
 /// Number of finalised block headers used for the expansion trigger median.
 /// Using median over this window makes the trigger immune to single-block spam.
 /// Must be ≤ available recent-header retention.
-pub const EXPANSION_WINDOW: u64 = CONSENSUS_FINALITY_DEPTH; // 18 blocks
+pub const EXPANSION_WINDOW: u64 = CONSENSUS_FINALITY_DEPTH;
 
 // ---------------------------------------------------------------------------
 // Slot state

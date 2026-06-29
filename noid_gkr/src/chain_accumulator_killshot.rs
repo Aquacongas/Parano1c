@@ -48,7 +48,7 @@ pub struct ChainAccumulatorBatchInputs {
     pub expected_chain_hash: [Block128; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainAccumulatorProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,
@@ -94,6 +94,31 @@ fn absorb_public_batch<T: FiatShamir<Block128>>(
     absorb_digest_fields(channel, inputs.start_chain_hash);
     absorb_digest_fields(channel, inputs.expected_chain_hash);
     for item in &inputs.items {
+        absorb_digest_fields(channel, item.block_id);
+        absorb_digest_fields(channel, item.chain_claim);
+    }
+}
+
+fn zero_chain_accumulator_item() -> ChainAccumulatorItem {
+    ChainAccumulatorItem {
+        block_id: [Block128::ZERO; 2],
+        chain_claim: [Block128::ZERO; 2],
+    }
+}
+
+fn absorb_public_batch_padded<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+) {
+    channel.absorb(Block128::from(inputs.items.len() as u128));
+    channel.absorb(Block128::from(padded_items as u128));
+    channel.absorb(Block128::from(TAG_COMPRESS.as_u64() as u128));
+    absorb_digest_fields(channel, inputs.start_chain_hash);
+    absorb_digest_fields(channel, inputs.expected_chain_hash);
+    let zero = zero_chain_accumulator_item();
+    for idx in 0..padded_items {
+        let item = inputs.items.get(idx).unwrap_or(&zero);
         absorb_digest_fields(channel, item.block_id);
         absorb_digest_fields(channel, item.chain_claim);
     }
@@ -260,16 +285,119 @@ fn chain_claims(inputs: &ChainAccumulatorBatchInputs, num_vars: usize) -> Vec<Li
     claims
 }
 
+fn zero_state_claim(num_vars: usize, slot: usize, round: usize, lane: usize) -> LinearEvalTerm {
+    weighted_state_claim(num_vars, slot, round, lane, Block128::ZERO)
+}
+
+fn push_zero_prev_terms(
+    terms: &mut Vec<LinearEvalTerm>,
+    num_vars: usize,
+    prev_slot: usize,
+    lanes: impl IntoIterator<Item = usize>,
+) {
+    for src_lane in lanes {
+        terms.push(weighted_state_claim(
+            num_vars,
+            prev_slot,
+            N_ROUNDS,
+            src_lane,
+            Block128::ZERO,
+        ));
+    }
+}
+
+fn zero_chain_item_claims(item_idx: usize, num_vars: usize) -> Vec<LinearEvalClaim> {
+    let base = item_idx * CHAIN_ACC_PERMS_PER_ITEM;
+    let mut claims = Vec::with_capacity(CHAIN_ACC_PERMS_PER_ITEM * STATE_SIZE);
+
+    for lane in 0..STATE_SIZE {
+        claims.push(LinearEvalClaim {
+            terms: vec![zero_state_claim(num_vars, base, 0, lane)],
+            value: Block128::ZERO,
+        });
+    }
+
+    for lane in 0..STATE_SIZE {
+        let mut terms = vec![zero_state_claim(num_vars, base + 1, 0, lane)];
+        push_zero_prev_terms(&mut terms, num_vars, base, 0..STATE_SIZE);
+        claims.push(LinearEvalClaim {
+            terms,
+            value: Block128::ZERO,
+        });
+    }
+
+    for lane in 0..STATE_SIZE {
+        let mut terms = vec![zero_state_claim(num_vars, base + 2, 0, lane)];
+        if item_idx > 0 {
+            push_zero_prev_terms(&mut terms, num_vars, base - 1, [0usize, 1usize]);
+        }
+        claims.push(LinearEvalClaim {
+            terms,
+            value: Block128::ZERO,
+        });
+    }
+
+    for lane in 0..STATE_SIZE {
+        let mut terms = vec![zero_state_claim(num_vars, base + 3, 0, lane)];
+        push_zero_prev_terms(&mut terms, num_vars, base + 2, 0..STATE_SIZE);
+        push_zero_prev_terms(&mut terms, num_vars, base + 1, [0usize, 1usize]);
+        claims.push(LinearEvalClaim {
+            terms,
+            value: Block128::ZERO,
+        });
+    }
+
+    claims
+}
+
+fn chain_claims_padded(
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+    num_vars: usize,
+) -> Vec<LinearEvalClaim> {
+    let mut claims = chain_claims(inputs, num_vars);
+    if inputs.items.len() < padded_items {
+        claims.reserve((padded_items - inputs.items.len()) * CHAIN_ACC_PERMS_PER_ITEM * STATE_SIZE);
+        for item_idx in inputs.items.len()..padded_items {
+            claims.extend(zero_chain_item_claims(item_idx, num_vars));
+        }
+    }
+    claims
+}
+
 pub fn prove_chain_accumulator_killshot<T: FiatShamir<Block128>>(
     inputs: &ChainAccumulatorBatchInputs,
     channel: &mut T,
 ) -> (ChainAccumulatorProofKillShot, ChainAccumulatorReductions) {
+    prove_chain_accumulator_killshot_with_shape(inputs, inputs.items.len(), false, channel)
+}
+
+pub fn prove_chain_accumulator_killshot_padded<T: FiatShamir<Block128>>(
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+    channel: &mut T,
+) -> (ChainAccumulatorProofKillShot, ChainAccumulatorReductions) {
+    prove_chain_accumulator_killshot_with_shape(inputs, padded_items, true, channel)
+}
+
+fn prove_chain_accumulator_killshot_with_shape<T: FiatShamir<Block128>>(
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+    pad_public_transcript: bool,
+    channel: &mut T,
+) -> (ChainAccumulatorProofKillShot, ChainAccumulatorReductions) {
     let slot_state_ins =
         evaluate_chain_accumulator(inputs).expect("prover asked to prove wrong chain accumulator");
+    assert!(inputs.items.len() <= padded_items);
+    let padded_live_slots = padded_items * CHAIN_ACC_PERMS_PER_ITEM;
 
-    absorb_public_batch(channel, inputs);
+    if pad_public_transcript {
+        absorb_public_batch_padded(channel, inputs, padded_items);
+    } else {
+        absorb_public_batch(channel, inputs);
+    }
 
-    let mle = BlockSpineMle::build_from_slot_state_ins(&slot_state_ins);
+    let mle = BlockSpineMle::build_from_slot_state_ins_padded(&slot_state_ins, padded_live_slots);
     let (main, r_prime) = prove_block_spine_unified(&mle, channel);
     let main_red = BlockSpineUnifiedReduction {
         r_prime: r_prime.clone(),
@@ -284,7 +412,11 @@ pub fn prove_chain_accumulator_killshot<T: FiatShamir<Block128>>(
     };
     let (shift, r_double_prime) = prove_block_spine_shift(&mle, &r_prime, &main_red, channel);
 
-    let chain_claims = chain_claims(inputs, mle.num_vars);
+    let chain_claims = if pad_public_transcript {
+        chain_claims_padded(inputs, padded_items, mle.num_vars)
+    } else {
+        chain_claims(inputs, mle.num_vars)
+    };
     let (chain, chain_red) = prove_linear_eval_prebound(
         &mle.state,
         &chain_claims,
@@ -342,9 +474,29 @@ pub fn verify_chain_accumulator_killshot<T: FiatShamir<Block128>>(
     inputs: &ChainAccumulatorBatchInputs,
     channel: &mut T,
 ) -> Option<ChainAccumulatorReductions> {
+    verify_chain_accumulator_killshot_with_shape(proof, inputs, inputs.items.len(), false, channel)
+}
+
+pub fn verify_chain_accumulator_killshot_padded<T: FiatShamir<Block128>>(
+    proof: &ChainAccumulatorProofKillShot,
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+    channel: &mut T,
+) -> Option<ChainAccumulatorReductions> {
+    verify_chain_accumulator_killshot_with_shape(proof, inputs, padded_items, true, channel)
+}
+
+fn verify_chain_accumulator_killshot_with_shape<T: FiatShamir<Block128>>(
+    proof: &ChainAccumulatorProofKillShot,
+    inputs: &ChainAccumulatorBatchInputs,
+    padded_items: usize,
+    pad_public_transcript: bool,
+    channel: &mut T,
+) -> Option<ChainAccumulatorReductions> {
     if inputs.items.is_empty()
         || proof.n_items != inputs.items.len()
-        || proof.live_slots != inputs.items.len() * CHAIN_ACC_PERMS_PER_ITEM
+        || inputs.items.len() > padded_items
+        || proof.live_slots != padded_items * CHAIN_ACC_PERMS_PER_ITEM
     {
         return None;
     }
@@ -353,7 +505,11 @@ pub fn verify_chain_accumulator_killshot<T: FiatShamir<Block128>>(
         return None;
     }
 
-    absorb_public_batch(channel, inputs);
+    if pad_public_transcript {
+        absorb_public_batch_padded(channel, inputs, padded_items);
+    } else {
+        absorb_public_batch(channel, inputs);
+    }
 
     let main_red = verify_block_spine_unified(
         &proof.kill_shot.main,
@@ -364,7 +520,11 @@ pub fn verify_chain_accumulator_killshot<T: FiatShamir<Block128>>(
     let shift_red =
         verify_block_spine_shift(&proof.kill_shot.shift, &main_red, proof.num_vars, channel)?;
 
-    let chain_claims = chain_claims(inputs, proof.num_vars);
+    let chain_claims = if pad_public_transcript {
+        chain_claims_padded(inputs, padded_items, proof.num_vars)
+    } else {
+        chain_claims(inputs, proof.num_vars)
+    };
     let chain_red = verify_linear_eval_prebound(
         &proof.chain,
         &chain_claims,
@@ -411,9 +571,23 @@ pub fn discharge_chain_accumulator_reductions_native(
     inputs: &ChainAccumulatorBatchInputs,
     reductions: &ChainAccumulatorReductions,
 ) -> bool {
+    discharge_chain_accumulator_reductions_native_padded(inputs, reductions, inputs.items.len())
+}
+
+pub fn discharge_chain_accumulator_reductions_native_padded(
+    inputs: &ChainAccumulatorBatchInputs,
+    reductions: &ChainAccumulatorReductions,
+    padded_items: usize,
+) -> bool {
     let Some(slot_state_ins) = evaluate_chain_accumulator(inputs) else {
         return false;
     };
+    let padded_live_slots = padded_items * CHAIN_ACC_PERMS_PER_ITEM;
+    if slot_state_ins.len() > padded_live_slots {
+        return false;
+    }
+    let mut slot_state_ins = slot_state_ins;
+    slot_state_ins.resize(padded_live_slots, [Block128::ZERO; STATE_SIZE]);
     crate::block_spine::discharge_block_spine_batch_reductions_from_slot_state_ins_native(
         &slot_state_ins,
         &reductions.state,
@@ -488,6 +662,61 @@ mod tests {
         let verified = verify_chain_accumulator_killshot(&proof, &inputs, &mut ch_v)
             .expect("chain accumulator proof verifies");
         assert_eq!(verified, reductions);
+    }
+
+    #[test]
+    fn chain_accumulator_padded_roundtrip_size_constant_and_rejects_small_shape() {
+        let padded_items = 4;
+        let mut expected_len = None;
+
+        for n in [1usize, 3, padded_items] {
+            let inputs = inputs(n);
+            let mut ch_p = Poseidon2bChannel::new();
+            let (proof, reductions) =
+                prove_chain_accumulator_killshot_padded(&inputs, padded_items, &mut ch_p);
+            assert_eq!(proof.n_items, n);
+            assert_eq!(proof.live_slots, padded_items * CHAIN_ACC_PERMS_PER_ITEM);
+
+            let mut ch_v = Poseidon2bChannel::new();
+            let verified =
+                verify_chain_accumulator_killshot_padded(&proof, &inputs, padded_items, &mut ch_v)
+                    .expect("padded chain accumulator proof verifies");
+            assert_eq!(verified, reductions);
+            assert!(discharge_chain_accumulator_reductions_native_padded(
+                &inputs,
+                &verified,
+                padded_items,
+            ));
+
+            if let Some(expected_len) = expected_len {
+                assert_eq!(proof.byte_len(), expected_len);
+            } else {
+                expected_len = Some(proof.byte_len());
+            }
+
+            if n < padded_items {
+                let mut ch_small = Poseidon2bChannel::new();
+                assert!(verify_chain_accumulator_killshot_padded(
+                    &proof,
+                    &inputs,
+                    n,
+                    &mut ch_small
+                )
+                .is_none());
+            }
+        }
+
+        let inputs = inputs(1);
+        let mut ch_p = Poseidon2bChannel::new();
+        let (small_shape_proof, _) = prove_chain_accumulator_killshot(&inputs, &mut ch_p);
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_chain_accumulator_killshot_padded(
+            &small_shape_proof,
+            &inputs,
+            padded_items,
+            &mut ch_v,
+        )
+        .is_none());
     }
 
     #[test]

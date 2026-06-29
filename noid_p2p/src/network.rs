@@ -53,6 +53,40 @@ const MAX_SNAPSHOT_EXPORT_BYTES: usize = MAX_SEGMENT_BYTES * MAX_INFLIGHT_SEGMEN
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
+fn local_history_proof_bytes(ctx: &MdbxChainContext) -> Option<Vec<u8>> {
+    let cache_bytes = ctx.store.get_local_history_cache().ok().flatten()?;
+    let cache: noid_recursive::LocalHistoryCache = match bincode::deserialize(&cache_bytes) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!(err = ?e, "local history cache decode failed while serving proof");
+            return None;
+        }
+    };
+    let proof = match noid_recursive::prove_history_from_local_cache(&cache) {
+        Ok(proof) => proof,
+        Err(e) => {
+            tracing::warn!(err = ?e, "local history proof build failed while serving proof");
+            return None;
+        }
+    };
+    let bytes = match bincode::serialize(&proof) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(err = ?e, "local history proof encode failed while serving proof");
+            return None;
+        }
+    };
+    if bytes.len() > MAX_HISTORY_PROOF_BYTES {
+        tracing::warn!(
+            len = bytes.len(),
+            cap = MAX_HISTORY_PROOF_BYTES,
+            "local history proof exceeds wire cap"
+        );
+        return None;
+    }
+    Some(bytes)
+}
+
 #[inline]
 fn should_inline_block_gossip(
     block_bytes_len: usize,
@@ -177,12 +211,12 @@ pub enum NetworkEvent {
         from: PeerId,
         response: crate::protocol::GetStateSegmentResponse,
     },
-    /// Future public `HistoryProof` response received from a peer.
+    /// Public `HistoryProof` envelope response received from a peer.
     ///
-    /// Empty `proof_bytes` means O(1) public sync is not active.
+    /// Empty `proof_bytes` means the peer has no finalized cache proof ready.
     HistoryProof {
         from: PeerId,
-        /// Serialized public `HistoryProof` bytes, or empty while disabled.
+        /// Serialized public `HistoryProof` envelope bytes, or empty.
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
@@ -1295,6 +1329,7 @@ async fn handle_swarm_event(
             },
         )) => {
             let ctx = chain.read().await;
+            let proof_bytes = local_history_proof_bytes(&ctx);
             let tip_bytes = {
                 let mut buf = Vec::new();
                 ctx.tip_header().encode(&mut buf);
@@ -1304,7 +1339,7 @@ async fn handle_swarm_event(
             let _ = swarm.behaviour_mut().proof_sync.send_response(
                 channel,
                 GetHistoryProofResponse {
-                    proof_bytes: None,
+                    proof_bytes,
                     tip_header_bytes: tip_bytes,
                 },
             );

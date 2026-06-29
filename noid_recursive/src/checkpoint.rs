@@ -14,10 +14,10 @@
 
 use noid_chain::consensus::pow::pow_header_fields;
 use noid_gkr::{
-    discharge_chain_accumulator_reductions_native, discharge_header_hash_reductions_native,
-    prove_chain_accumulator_killshot, prove_header_hash_killshot,
-    verify_chain_accumulator_killshot, verify_header_hash_killshot, ChainAccumulatorProofKillShot,
-    HeaderHashProofKillShot,
+    discharge_chain_accumulator_reductions_native_padded,
+    discharge_header_hash_reductions_native_padded, prove_chain_accumulator_killshot_padded,
+    prove_header_hash_killshot_padded, verify_chain_accumulator_killshot_padded,
+    verify_header_hash_killshot_padded, ChainAccumulatorProofKillShot, HeaderHashProofKillShot,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 
@@ -25,7 +25,7 @@ use crate::accepted_batch::{chain_accumulator_proof_inputs, AcceptedClaimBatchWi
 use crate::accumulator::ChainAccumulator;
 use crate::pow_header::header_hash_proof_inputs;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointPoseidonProof {
     pub header_hash: HeaderHashProofKillShot,
     pub chain_accumulator: ChainAccumulatorProofKillShot,
@@ -104,19 +104,45 @@ pub fn prove_checkpoint_poseidon(
     end_accumulator: &ChainAccumulator,
     witness: &AcceptedClaimBatchWitness,
 ) -> Result<CheckpointPoseidonProof, CheckpointPoseidonError> {
+    prove_checkpoint_poseidon_padded(
+        start_accumulator,
+        end_accumulator,
+        witness,
+        witness.headers.len(),
+    )
+}
+
+/// Build the Poseidon2b checkpoint component proof with a fixed proof shape.
+///
+/// `padded_blocks` fixes the underlying permutation-spine size. Extra
+/// permutation slots are independent padding witnesses and are not accumulator
+/// rows, so the public checkpoint statement remains exactly the supplied
+/// `witness` and accumulator boundary.
+pub fn prove_checkpoint_poseidon_padded(
+    start_accumulator: &ChainAccumulator,
+    end_accumulator: &ChainAccumulator,
+    witness: &AcceptedClaimBatchWitness,
+    padded_blocks: usize,
+) -> Result<CheckpointPoseidonProof, CheckpointPoseidonError> {
     validate_shape(witness)?;
     validate_accumulator_boundary(start_accumulator, end_accumulator, witness)?;
+    if witness.headers.len() > padded_blocks {
+        return Err(CheckpointPoseidonError::ClaimCountMismatch {
+            headers: witness.headers.len(),
+            claims: padded_blocks,
+        });
+    }
 
     let header_inputs = header_hash_proof_inputs(&witness.headers);
     let chain_inputs = chain_accumulator_proof_inputs(start_accumulator, witness, end_accumulator);
     let (header_hash, chain_accumulator) = rayon::join(
         || {
             let mut channel = Poseidon2bChannel::new();
-            prove_header_hash_killshot(&header_inputs, &mut channel).0
+            prove_header_hash_killshot_padded(&header_inputs, padded_blocks, &mut channel).0
         },
         || {
             let mut channel = Poseidon2bChannel::new();
-            prove_chain_accumulator_killshot(&chain_inputs, &mut channel).0
+            prove_chain_accumulator_killshot_padded(&chain_inputs, padded_blocks, &mut channel).0
         },
     );
 
@@ -139,6 +165,24 @@ pub fn verify_checkpoint_poseidon(
     witness: &AcceptedClaimBatchWitness,
     proof: &CheckpointPoseidonProof,
 ) -> Result<(), CheckpointPoseidonError> {
+    verify_checkpoint_poseidon_padded(
+        start_accumulator,
+        end_accumulator,
+        witness,
+        proof,
+        witness.headers.len(),
+    )
+}
+
+/// Verify a Poseidon2b checkpoint proof whose underlying spine was padded to a
+/// fixed number of blocks.
+pub fn verify_checkpoint_poseidon_padded(
+    start_accumulator: &ChainAccumulator,
+    end_accumulator: &ChainAccumulator,
+    witness: &AcceptedClaimBatchWitness,
+    proof: &CheckpointPoseidonProof,
+    padded_blocks: usize,
+) -> Result<(), CheckpointPoseidonError> {
     validate_shape(witness)?;
     validate_accumulator_boundary(start_accumulator, end_accumulator, witness)?;
     if proof.n_blocks != witness.headers.len() {
@@ -147,16 +191,30 @@ pub fn verify_checkpoint_poseidon(
             claims: witness.headers.len(),
         });
     }
+    if witness.headers.len() > padded_blocks {
+        return Err(CheckpointPoseidonError::ClaimCountMismatch {
+            headers: witness.headers.len(),
+            claims: padded_blocks,
+        });
+    }
 
     let header_inputs = header_hash_proof_inputs(&witness.headers);
     let chain_inputs = chain_accumulator_proof_inputs(start_accumulator, witness, end_accumulator);
     let (header_result, chain_result) = rayon::join(
         || {
             let mut channel = Poseidon2bChannel::new();
-            let reductions =
-                verify_header_hash_killshot(&proof.header_hash, &header_inputs, &mut channel)
-                    .ok_or(CheckpointPoseidonError::HeaderHashProofRejected)?;
-            if discharge_header_hash_reductions_native(&header_inputs, &reductions) {
+            let reductions = verify_header_hash_killshot_padded(
+                &proof.header_hash,
+                &header_inputs,
+                padded_blocks,
+                &mut channel,
+            )
+            .ok_or(CheckpointPoseidonError::HeaderHashProofRejected)?;
+            if discharge_header_hash_reductions_native_padded(
+                &header_inputs,
+                &reductions,
+                padded_blocks,
+            ) {
                 Ok(())
             } else {
                 Err(CheckpointPoseidonError::HeaderHashProofRejected)
@@ -164,13 +222,18 @@ pub fn verify_checkpoint_poseidon(
         },
         || {
             let mut channel = Poseidon2bChannel::new();
-            let reductions = verify_chain_accumulator_killshot(
+            let reductions = verify_chain_accumulator_killshot_padded(
                 &proof.chain_accumulator,
                 &chain_inputs,
+                padded_blocks,
                 &mut channel,
             )
             .ok_or(CheckpointPoseidonError::ChainAccumulatorProofRejected)?;
-            if discharge_chain_accumulator_reductions_native(&chain_inputs, &reductions) {
+            if discharge_chain_accumulator_reductions_native_padded(
+                &chain_inputs,
+                &reductions,
+                padded_blocks,
+            ) {
                 Ok(())
             } else {
                 Err(CheckpointPoseidonError::ChainAccumulatorProofRejected)
@@ -207,29 +270,50 @@ mod tests {
         }
     }
 
-    fn fixture() -> (
+    fn fixture_n(
+        n: usize,
+    ) -> (
         ChainAccumulator,
         ChainAccumulator,
         AcceptedClaimBatchWitness,
     ) {
+        assert!(n > 0);
         let start = ChainAccumulator {
             height: 0,
             state_root: [1u8; 32],
             chain_hash: [0u8; 32],
         };
-        let h1 = header(1, [0u8; 32], 2);
-        let w1 = HeaderWitness::from_header(&h1);
-        let claim1 = [Block128::from(0xA1u128), Block128::from(0xA2u128)];
-        let acc1 = start.extend(h1.state_root, w1.block_id, h1.height, claim1);
-        let h2 = header(2, w1.block_id, 3);
-        let w2 = HeaderWitness::from_header(&h2);
-        let claim2 = [Block128::from(0xB1u128), Block128::from(0xB2u128)];
-        let end = acc1.extend(h2.state_root, w2.block_id, h2.height, claim2);
+        let mut acc = start.clone();
+        let mut prev_block_id = [0u8; 32];
+        let mut headers = Vec::with_capacity(n);
+        let mut claims = Vec::with_capacity(n);
+
+        for height in 1..=n as u64 {
+            let h = header(height, prev_block_id, height as u8 + 1);
+            let w = HeaderWitness::from_header(&h);
+            let claim = [
+                Block128::from(0xA0u128 + height as u128),
+                Block128::from(0xB0u128 + height as u128),
+            ];
+            acc = acc.extend(h.state_root, w.block_id, h.height, claim);
+            prev_block_id = w.block_id;
+            headers.push(w);
+            claims.push(claim);
+        }
+
         let witness = AcceptedClaimBatchWitness {
-            headers: vec![w1, w2],
-            accepted_block_claims: vec![claim1, claim2],
+            headers,
+            accepted_block_claims: claims,
         };
-        (start, end, witness)
+        (start, acc, witness)
+    }
+
+    fn fixture() -> (
+        ChainAccumulator,
+        ChainAccumulator,
+        AcceptedClaimBatchWitness,
+    ) {
+        fixture_n(2)
     }
 
     #[test]
@@ -238,6 +322,47 @@ mod tests {
         let proof = prove_checkpoint_poseidon(&start, &end, &witness).unwrap();
         verify_checkpoint_poseidon(&start, &end, &witness, &proof).unwrap();
         assert!(proof.byte_len() > 0);
+    }
+
+    #[test]
+    fn checkpoint_poseidon_padded_roundtrip_size_constant_and_rejects_small_shape() {
+        let padded_blocks = 4;
+        let mut expected_len = None;
+
+        for n in [1usize, 2, padded_blocks] {
+            let (start, end, witness) = fixture_n(n);
+            let proof =
+                prove_checkpoint_poseidon_padded(&start, &end, &witness, padded_blocks).unwrap();
+            verify_checkpoint_poseidon_padded(&start, &end, &witness, &proof, padded_blocks)
+                .unwrap();
+            assert_eq!(proof.n_blocks, n);
+
+            if let Some(expected_len) = expected_len {
+                assert_eq!(proof.byte_len(), expected_len);
+            } else {
+                expected_len = Some(proof.byte_len());
+            }
+
+            if n < padded_blocks {
+                assert_eq!(
+                    verify_checkpoint_poseidon_padded(&start, &end, &witness, &proof, n),
+                    Err(CheckpointPoseidonError::HeaderHashProofRejected)
+                );
+            }
+        }
+
+        let (start, end, witness) = fixture_n(1);
+        let small_shape_proof = prove_checkpoint_poseidon(&start, &end, &witness).unwrap();
+        assert_eq!(
+            verify_checkpoint_poseidon_padded(
+                &start,
+                &end,
+                &witness,
+                &small_shape_proof,
+                padded_blocks,
+            ),
+            Err(CheckpointPoseidonError::HeaderHashProofRejected)
+        );
     }
 
     #[test]
@@ -258,6 +383,17 @@ mod tests {
         witness.accepted_block_claims[1][1] += Block128::ONE;
         assert_eq!(
             verify_checkpoint_poseidon(&start, &end, &witness, &proof),
+            Err(CheckpointPoseidonError::ChainAccumulatorProofRejected)
+        );
+    }
+
+    #[test]
+    fn checkpoint_poseidon_rejects_end_chain_hash_tamper_under_padding() {
+        let (start, mut end, witness) = fixture_n(2);
+        let proof = prove_checkpoint_poseidon_padded(&start, &end, &witness, 4).unwrap();
+        end.chain_hash[0] ^= 1;
+        assert_eq!(
+            verify_checkpoint_poseidon_padded(&start, &end, &witness, &proof, 4),
             Err(CheckpointPoseidonError::ChainAccumulatorProofRejected)
         );
     }

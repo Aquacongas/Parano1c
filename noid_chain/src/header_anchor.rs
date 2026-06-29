@@ -102,6 +102,46 @@ pub fn extend_header_projection_root(
     sponge.finalize()
 }
 
+/// Extend a verified header-chain anchor by one canonical child header.
+///
+/// This stores no header copy.  It only carries forward the small rolling
+/// projection commitment and the exact cumulative chainwork already validated
+/// by the native header path.
+pub fn extend_header_chain_anchor(
+    previous: &HeaderChainAnchor,
+    header: &BlockHeader,
+    cumulative_chainwork: Digest,
+) -> Result<HeaderChainAnchor, HeaderChainAnchorError> {
+    let expected = previous.height.saturating_add(1);
+    if header.height != expected {
+        return Err(HeaderChainAnchorError::NonContiguous {
+            expected,
+            actual: header.height,
+        });
+    }
+    if header.prev_block_hash != previous.block_id {
+        return Err(HeaderChainAnchorError::BadParentLink {
+            height: header.height,
+        });
+    }
+
+    let block_id = hash_block_header(header);
+    let projection_root =
+        extend_header_projection_root(&previous.projection_root, header, &block_id);
+    Ok(HeaderChainAnchor {
+        height: header.height,
+        block_id,
+        state_root: header.state_root,
+        tx_root: header.tx_root,
+        miner_address: header.miner_address,
+        log_slots: header.log_slots,
+        active_slot_count: header.active_slot_count,
+        alloc_counter: header.alloc_counter,
+        cumulative_chainwork,
+        projection_root,
+    })
+}
+
 /// Build an anchor for a contiguous header prefix from genesis through tip.
 pub fn compute_header_chain_anchor<'a, I>(
     headers: I,
@@ -246,5 +286,16 @@ mod tests {
             compute_header_chain_anchor(headers.iter(), [0u8; 32]),
             Err(HeaderChainAnchorError::BadParentLink { height: 2 })
         );
+    }
+
+    #[test]
+    fn incremental_anchor_matches_full_prefix() {
+        let headers = three_headers();
+        let a0 = compute_header_chain_anchor(headers[..1].iter(), [1u8; 32]).unwrap();
+        let a1 = extend_header_chain_anchor(&a0, &headers[1], [2u8; 32]).unwrap();
+        let a2 = extend_header_chain_anchor(&a1, &headers[2], [3u8; 32]).unwrap();
+        let full = compute_header_chain_anchor(headers.iter(), [3u8; 32]).unwrap();
+
+        assert_eq!(a2, full);
     }
 }

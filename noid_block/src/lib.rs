@@ -12,6 +12,7 @@ pub mod accepted_block_batch;
 pub mod block_chain_context;
 pub mod exact_state_killshot;
 pub mod exact_state_transition;
+pub mod history_claim;
 pub mod validate;
 
 pub use accepted_block_batch::{
@@ -35,8 +36,14 @@ pub use exact_state_transition::{
     ExactStateMerkleBatchInputs, ExactStateTransitionError, ExactStateTransitionInputs,
     ExactStateTransitionProof, GuardBucketUpdateProof, VerifiedStateTransition,
 };
+pub use history_claim::{
+    accepted_state_transition_chain_claim, accepted_state_transition_claim_digest,
+    accepted_state_transition_claim_fields, AcceptedStateTransitionClaim,
+    ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS, ACCEPTED_STATE_TRANSITION_CLAIM_VERSION,
+};
 pub use validate::{
     accept_block, accept_block_timeless, accept_block_timeless_with_artifacts,
+    accept_block_with_artifacts, derive_no_user_tx_validation_artifacts,
     validate_block_auth_sidecar_shape, validate_block_authorizations, validate_block_full,
     validate_block_full_timeless, validate_block_full_timeless_with_artifacts,
     AcceptedBlockRawValidationOutput, AcceptedBlockValidationArtifacts,
@@ -464,6 +471,8 @@ pub enum VerifyBlockError {
     BlockResourceWeightExceeded,
     /// Exact authenticated state transition proof failed.
     ExactStateTransition(ExactStateTransitionError),
+    /// Accepted state-transition claim cannot be derived from the accepted block.
+    HistoryClaimMismatch,
 }
 
 #[cfg(test)]

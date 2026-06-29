@@ -51,6 +51,27 @@ use noid_poseidon2b::primitives::Address;
 
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
 
+fn history_claim_fields_bytes(
+    block: &Block,
+    parent: &noid_chain::BlockHeader,
+    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
+) -> Result<Vec<u8>, noid_block::FullValidationError> {
+    let claim =
+        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
+            .map_err(noid_block::FullValidationError::from)?;
+    Ok(bincode::serialize(&claim.fields().to_vec()).expect("history claim fields serialize"))
+}
+
+fn map_history_claim_error(
+    error: noid_block::FullValidationError,
+) -> noid_chain::storage::MdbxContextError {
+    noid_chain::storage::MdbxContextError::Consensus(
+        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+            "history claim derivation failed: {error}"
+        )),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -652,6 +673,25 @@ impl BlockMiner {
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
+                let mut history_claim_bytes = if block_owned
+                    .transactions
+                    .iter()
+                    .all(|tx| tx.body.is_coinbase)
+                {
+                    let parent = *ctx.tip_header();
+                    let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
+                        &block_owned,
+                        &parent,
+                        &ctx.state,
+                    )
+                    .map_err(map_history_claim_error)?;
+                    Some(
+                        history_claim_fields_bytes(&block_owned, &parent, &artifacts)
+                            .map_err(map_history_claim_error)?,
+                    )
+                } else {
+                    None
+                };
                 ctx.apply_next_block(
                     &block_owned,
                     &proof_bytes,
@@ -667,7 +707,7 @@ impl BlockMiner {
                      anchor,
                      pre_state,
                      state| {
-                        noid_block::accept_block(
+                        let output = noid_block::accept_block_with_artifacts(
                             block,
                             proof_bytes,
                             auth_sidecar_bytes,
@@ -678,9 +718,27 @@ impl BlockMiner {
                             anchor,
                             pre_state,
                             state,
-                        )
+                        )?;
+                        history_claim_bytes = Some(history_claim_fields_bytes(
+                            block,
+                            parent,
+                            &output.artifacts,
+                        )?);
+                        Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
                     },
                 )?;
+                if let Some(bytes) = &history_claim_bytes {
+                    if let Err(e) = ctx
+                        .store
+                        .put_history_claim(block_owned.header.height, bytes)
+                    {
+                        tracing::warn!(
+                            height = block_owned.header.height,
+                            err = %e,
+                            "failed to store mined history claim fields"
+                        );
+                    }
+                }
                 if let Some(h) = &hook {
                     h(&block_owned);
                 }

@@ -33,7 +33,7 @@
 //! |------|-------|-----|
 //! | Headers | MDBX (forever) | Random access by height/hash |
 //! | Segment columns | MDBX (forever) | Persist across restarts |
-//! | Undo logs | MDBX (18 blocks) | Reorg recovery |
+//! | Undo logs | MDBX retained window | Reorg recovery |
 //! | Block bodies/proofs/sidecars | MDBX (until checkpoint coverage) | Checkpoint generation and bounded peer sync |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
 //! | Recent headers | RAM (MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH) | Timestamp + anchor validation |

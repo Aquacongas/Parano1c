@@ -54,6 +54,9 @@ const T_BLOCK_PROOFS: &str = "block_proofs";
 /// Public AuthGKR sidecars retained with block bodies until checkpoint coverage.
 /// Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
+/// Accepted state-transition history claims retained until the finalized
+/// history cache consumes them. Key: height (u64 LE). Value: raw bincode bytes.
+const T_HISTORY_CLAIMS: &str = "history_claims";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
@@ -198,6 +201,7 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
@@ -449,6 +453,23 @@ impl MdbxStore {
     pub fn get_block_auth_sidecar(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw)
+    }
+
+    /// Store accepted state-transition claim fields for `height`.
+    pub fn put_history_claim(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve accepted state-transition claim fields for `height`.
+    pub fn get_history_claim(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw)
     }
@@ -1157,5 +1178,21 @@ impl crate::storage::BlockStore for MdbxStore {
 
     fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError> {
         MdbxStore::get_tx_index(self, hash)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_claim_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let bytes = vec![1u8, 2, 3, 4, 5];
+
+        assert_eq!(store.get_history_claim(7).unwrap(), None);
+        store.put_history_claim(7, &bytes).unwrap();
+        assert_eq!(store.get_history_claim(7).unwrap(), Some(bytes));
     }
 }

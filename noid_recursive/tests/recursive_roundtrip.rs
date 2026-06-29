@@ -3,13 +3,14 @@
 
 //! Tests for local history cache and accepted-claim batch boundaries.
 
-use noid_chain::{hash_block_header, BlockHeader};
+use noid_chain::{block_work, hash_block_header, BlockHeader};
 use noid_core::{Block128, TowerField};
+use noid_gkr::HISTORY_CLAIM_FIELDS;
 use noid_poseidon2b::primitives::Address;
 use noid_recursive::{
-    accepted_block_claim_witness, accumulator::genesis_accumulator, advance_local_history_cache,
-    empty_accepted_block_witness, init_genesis_history_cache, verify_local_history_cache_step,
-    RecVerifyError,
+    accepted_block_claim_witness_from_fields, accumulator::genesis_accumulator,
+    advance_local_history_cache, empty_accepted_block_witness, init_genesis_history_cache,
+    verify_local_history_cache_step, RecVerifyError, HISTORY_PROOF_VERSION,
 };
 
 #[test]
@@ -88,14 +89,32 @@ fn local_history_cache_roundtrip_accumulator() {
             alloc_counter: 0,
         };
 
-        let prev_acc = prev_cache.acc.clone();
         let witness = if height == 2 {
-            accepted_block_claim_witness([Block128::from(0xABCD_u128), Block128::from(0xDCBA_u128)])
+            let mut fields = [Block128::ZERO; HISTORY_CLAIM_FIELDS];
+            fields[0] = Block128::from(HISTORY_PROOF_VERSION as u128);
+            fields[1] = Block128::from(height as u128);
+            write_digest_fields(&mut fields, 2, &hash_block_header(&block_header));
+            write_digest_fields(&mut fields, 4, &prev_cache.anchor.block_id);
+            write_digest_fields(&mut fields, 6, &prev_header.state_root);
+            write_digest_fields(&mut fields, 8, &block_header.state_root);
+            accepted_block_claim_witness_from_fields(fields).expect("claim witness")
         } else {
-            empty_accepted_block_witness()
+            let mut fields = empty_accepted_block_witness().claim_fields;
+            fields[0] = Block128::from(HISTORY_PROOF_VERSION as u128);
+            fields[1] = Block128::from(height as u128);
+            write_digest_fields(&mut fields, 2, &hash_block_header(&block_header));
+            write_digest_fields(&mut fields, 4, &prev_cache.anchor.block_id);
+            write_digest_fields(&mut fields, 6, &prev_header.state_root);
+            write_digest_fields(&mut fields, 8, &block_header.state_root);
+            accepted_block_claim_witness_from_fields(fields).expect("claim witness")
         };
+        let cumulative_chainwork = noid_chain::add_work(
+            &prev_cache.anchor.cumulative_chainwork,
+            &block_work(&block_header.difficulty_target),
+        );
         let cache =
-            advance_local_history_cache(&witness, &block_header, &prev_acc, Some(&prev_cache));
+            advance_local_history_cache(&prev_cache, &witness, &block_header, cumulative_chainwork)
+                .expect("advance cache");
 
         verify_local_history_cache_step(&cache, &prev_header.state_root, &block_header.state_root)
             .unwrap_or_else(|e| panic!("local history cache at h={height} must verify: {e:?}"));
@@ -106,4 +125,13 @@ fn local_history_cache_roundtrip_accumulator() {
         prev_header = block_header;
         prev_cache = cache;
     }
+}
+
+fn write_digest_fields(
+    fields: &mut [Block128; HISTORY_CLAIM_FIELDS],
+    idx: usize,
+    digest: &[u8; 32],
+) {
+    fields[idx] = Block128::from(u128::from_le_bytes(digest[..16].try_into().unwrap()));
+    fields[idx + 1] = Block128::from(u128::from_le_bytes(digest[16..].try_into().unwrap()));
 }

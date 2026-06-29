@@ -69,8 +69,8 @@ pub use block::{
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
 pub use header_anchor::{
-    compute_header_chain_anchor, extend_header_projection_root, header_projection_digest,
-    HeaderChainAnchor, HeaderChainAnchorError,
+    compute_header_chain_anchor, extend_header_chain_anchor, extend_header_projection_root,
+    header_projection_digest, HeaderChainAnchor, HeaderChainAnchorError,
 };
 
 // ---------------------------------------------------------------------------

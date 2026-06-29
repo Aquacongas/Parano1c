@@ -23,7 +23,7 @@
 //! The `spend_secret` (private key) is NEVER transmitted, NEVER accessed
 //! here, and NEVER needed for verification.
 
-use noid_chain::block::{apply_state_delta, validate_block_proof_binding, Block};
+use noid_chain::block::{compute_tx_root, validate_block_proof_binding, Block};
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::validation::{
     validate_block_checks, validate_block_checks_timeless, validate_block_semantic_limits,
@@ -34,6 +34,7 @@ use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_PROOF_BYTES,
 };
 use noid_chain::consensus::ConsensusError;
+use noid_chain::segmented_state::SegmentedFriState;
 use noid_chain::state::ChainState;
 use noid_chain::state_delta::{build_exact_action_surface, ExactActionSurface, StateDeltaError};
 
@@ -107,7 +108,7 @@ pub struct AcceptedBlockValidationOutput {
 #[derive(Debug, Clone)]
 pub struct AcceptedBlockRawValidationOutput {
     pub state_root: [u8; 32],
-    pub artifacts: Option<AcceptedBlockValidationArtifacts>,
+    pub artifacts: AcceptedBlockValidationArtifacts,
 }
 
 pub trait AuthorizationVerifier: Sync {
@@ -269,6 +270,11 @@ fn validate_block_full_inner(
             prev_active_counts,
             anchor,
         )?,
+    }
+    if block.header.tx_root != compute_tx_root(&block.transactions) {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::BadTxRoot,
+        ));
     }
 
     validate_minimal_block_proof_shape(block, proof).map_err(FullValidationError::ZkProof)?;
@@ -568,6 +574,35 @@ pub fn accept_block(
     )
 }
 
+/// Live raw-witness `AcceptBlock` predicate that also returns proof-facing
+/// artifacts for the history accumulator.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_with_artifacts(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: u64,
+    anchor: &AnchorInfo,
+    pre_state: &SegmentedFriState,
+    state: &mut ChainState,
+) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
+    let _ = pre_state;
+    accept_block_inner_with_artifacts(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Live(local_time),
+        anchor,
+        state,
+    )
+}
+
 /// Timeless raw-witness `AcceptBlock` predicate for recursive batch witnesses.
 ///
 /// This is identical to [`accept_block`] except that local future-drift
@@ -713,14 +748,39 @@ fn accept_block_inner_with_artifacts(
                 anchor,
             )?,
         }
-        let transition = apply_state_delta(state, block).map_err(|e| {
-            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
-                format!("coinbase-only apply failed: {e:?}"),
-            ))
-        })?;
+        if block.header.tx_root != compute_tx_root(&block.transactions) {
+            return Err(FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::BadTxRoot,
+            ));
+        }
+        let artifacts = derive_no_user_tx_validation_artifacts(block, parent, state)?;
+        let applied_root = state
+            .apply_verified_exact_transition(
+                artifacts.verified_transition.log_slots(),
+                artifacts.verified_transition.child_utxo_root(),
+                artifacts.verified_transition.child_guard_root(),
+                artifacts.verified_transition.slot_updates(),
+                artifacts.verified_transition.guard_bucket_update().cloned(),
+                artifacts.verified_transition.active_slot_count(),
+                artifacts.verified_transition.alloc_counter(),
+            )
+            .map_err(|e| {
+                FullValidationError::Consensus(
+                    noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                        "coinbase-only apply failed: {e:?}"
+                    )),
+                )
+            })?;
+        if applied_root != block.header.state_root {
+            return Err(FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::ShapeMismatch(
+                    "coinbase-only state_root mismatch".into(),
+                ),
+            ));
+        }
         return Ok(AcceptedBlockRawValidationOutput {
-            state_root: transition.new_state_root,
-            artifacts: None,
+            state_root: applied_root,
+            artifacts,
         });
     }
 
@@ -754,7 +814,75 @@ fn accept_block_inner_with_artifacts(
     )
     .map(|output| AcceptedBlockRawValidationOutput {
         state_root: output.state_root,
-        artifacts: Some(output.artifacts),
+        artifacts: output.artifacts,
+    })
+}
+
+/// Derive proof-facing accepted-transition artifacts for a block with no user bodies.
+///
+/// Callers must run header/consensus checks before treating the result as an
+/// accepted block. This helper exists so coinbase-only and empty blocks produce
+/// the same sealed state-transition surface as proof-carrying blocks.
+pub fn derive_no_user_tx_validation_artifacts(
+    block: &Block,
+    parent: &BlockHeader,
+    state: &ChainState,
+) -> Result<AcceptedBlockValidationArtifacts, FullValidationError> {
+    let surface =
+        build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
+    let inputs = crate::ExactStateTransitionInputs {
+        parent_state_root: parent.state_root,
+        parent_log_slots: state.state.log_slots() as u32,
+        parent_utxo_root: state.utxo_root,
+        parent_guard_root: state.reuse_guard.root(),
+        child_state_root: block.header.state_root,
+        child_log_slots: block.header.log_slots,
+        height: block.header.height,
+        parent_active_slot_count: state.active_slot_count,
+        parent_alloc_counter: state.alloc_counter,
+    };
+    let slot_updates: Vec<_> = surface
+        .touched_indices
+        .iter()
+        .copied()
+        .zip(surface.new_slots.iter().copied())
+        .collect();
+    let child_utxo_root = state
+        .exact_utxo_root_after_slot_updates(block.header.log_slots, &slot_updates)
+        .map_err(|e| {
+            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
+                format!("no-user exact UTXO root derivation failed: {e:?}"),
+            ))
+        })?;
+    let verified = crate::VerifiedStateTransition::from_verified_no_spend_native(
+        &inputs,
+        &surface,
+        child_utxo_root,
+    )
+    .map_err(|e| FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e)))?;
+
+    if verified.active_slot_count() != block.header.active_slot_count {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch(
+                "active_slot_count mismatch".into(),
+            ),
+        ));
+    }
+    if verified.alloc_counter() != block.header.alloc_counter {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch("alloc_counter mismatch".into()),
+        ));
+    }
+
+    Ok(AcceptedBlockValidationArtifacts {
+        authorization: VerifiedAuthorizationBatch {
+            user_tx_count: 0,
+            owner_count_total: 0,
+            live_input_count_total: 0,
+        },
+        exact_state_inputs: inputs,
+        exact_action_surface: surface,
+        verified_transition: verified,
     })
 }
 
@@ -780,12 +908,17 @@ pub(crate) fn block_resource_counts(block: &Block) -> (usize, usize, usize, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_chain::block::Block;
+    use noid_chain::block::{compute_tx_root, Block};
     use noid_chain::block_header::BlockHeader;
     use noid_chain::consensus::wire_limits::{
         proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
     };
-    use noid_chain::consensus::{genesis::GENESIS_TIMESTAMP, params::GENESIS_TARGET};
+    use noid_chain::consensus::{
+        genesis::GENESIS_TIMESTAMP,
+        params::{BLOCK_TIME, GENESIS_TARGET},
+        pow::search_pow,
+        template::build_block_template,
+    };
     use noid_chain::state::ChainState;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{Transaction, TxBody, TxInput, TxOutput};
@@ -820,6 +953,135 @@ mod tests {
             body,
             tx_body_hash: hash,
         }
+    }
+
+    fn history_parent(state: &mut ChainState) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.state_root(),
+            tx_root: compute_tx_root(&[]),
+            timestamp: GENESIS_TIMESTAMP,
+            height: 0,
+            miner_address: Address([0x44; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: state.state.log_slots() as u32,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        }
+    }
+
+    fn history_anchor(parent: &BlockHeader) -> AnchorInfo {
+        AnchorInfo {
+            anchor_height: parent.height,
+            anchor_timestamp: parent.timestamp,
+            anchor_target: parent.difficulty_target,
+        }
+    }
+
+    #[test]
+    fn no_user_tx_coinbase_block_returns_history_claim_artifacts() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let parent = history_parent(&mut state);
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[parent.active_slot_count],
+            vec![],
+            Address([0x55; 32]),
+            parent.timestamp + BLOCK_TIME,
+            GENESIS_TARGET,
+        )
+        .expect("coinbase-only template");
+        let header = {
+            let pow_header = template.to_pow_header(0);
+            let nonce =
+                search_pow(&pow_header, 0, 100_000_000).expect("test target should mine quickly");
+            template.clone().into_header(nonce)
+        };
+        let block = Block {
+            header,
+            transactions: template.all_txs(),
+        };
+        let out = accept_block_timeless_with_artifacts(
+            &block,
+            &[],
+            &[],
+            &parent,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+            &history_anchor(&parent),
+            &mut state,
+        )
+        .expect("coinbase-only block accepted with artifacts");
+
+        assert_eq!(out.state_root, block.header.state_root);
+        assert_eq!(out.artifacts.exact_action_surface.spends, 0);
+        assert_eq!(out.artifacts.exact_action_surface.mints, 1);
+        assert_eq!(
+            out.artifacts.verified_transition.child_state_root(),
+            block.header.state_root
+        );
+
+        let claim = crate::AcceptedStateTransitionClaim::from_accepted_block(
+            &block,
+            &parent,
+            &out.artifacts,
+        )
+        .expect("history claim from coinbase artifacts");
+        assert_ne!(claim.claim_digest, [0u8; 32]);
+        assert_eq!(claim.touched_slot_count, 1);
+        assert_eq!(claim.mint_count, 1);
+        assert_eq!(claim.spend_count, 0);
+        assert_eq!(claim.reward_value, claim.minted_value);
+        assert!(claim.supply_delta > 0);
+    }
+
+    #[test]
+    fn empty_noop_block_still_returns_deterministic_history_claim() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let parent = history_parent(&mut state);
+        let mut header = BlockHeader {
+            prev_block_hash: noid_chain::hash_block_header(&parent),
+            state_root: parent.state_root,
+            tx_root: compute_tx_root(&[]),
+            timestamp: parent.timestamp + BLOCK_TIME,
+            height: parent.height + 1,
+            miner_address: Address([0x66; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: parent.log_slots,
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
+        };
+        header.nonce =
+            search_pow(&header, 0, 100_000_000).expect("test target should mine quickly");
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        let out = accept_block_timeless_with_artifacts(
+            &block,
+            &[],
+            &[],
+            &parent,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+            &history_anchor(&parent),
+            &mut state,
+        )
+        .expect("empty block accepted with no-op artifacts");
+
+        let claim = crate::AcceptedStateTransitionClaim::from_accepted_block(
+            &block,
+            &parent,
+            &out.artifacts,
+        )
+        .expect("history claim from no-op artifacts");
+        assert_ne!(claim.claim_digest, [0u8; 32]);
+        assert_eq!(claim.touched_slot_count, 0);
+        assert_eq!(claim.action_count, 0);
+        assert_eq!(claim.child_state_root, parent.state_root);
     }
 
     fn make_spend_body(slot: u32) -> TxBody {

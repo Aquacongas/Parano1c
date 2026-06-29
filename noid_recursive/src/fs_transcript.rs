@@ -28,10 +28,10 @@ use crate::authorization::FiatShamirTraceOp;
 
 const FS_TRANSCRIPT_LINEAR_RELATION_TAG: u128 = 0x4653_5452_4143_4501; // "FSTRACE"+1
 pub const FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH: usize = 16;
-pub const FIAT_SHAMIR_TRANSCRIPT_MAX_OPS_PER_TRACE: usize = 2048;
-pub const FIAT_SHAMIR_TRANSCRIPT_MAX_PERMUTATIONS_PER_BATCH: usize = 8192;
+pub const FIAT_SHAMIR_TRANSCRIPT_MAX_OPS_PER_TRACE: usize = 4096;
+pub const FIAT_SHAMIR_TRANSCRIPT_MAX_PERMUTATIONS_PER_BATCH: usize = 16384;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FiatShamirTranscriptProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,
@@ -42,7 +42,7 @@ pub struct FiatShamirTranscriptProofKillShot {
     pub live_slots: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FiatShamirTranscriptBatchProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

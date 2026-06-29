@@ -246,8 +246,21 @@ impl BlockSpineMle {
     /// batched Merkle paths.
     pub fn build_from_slot_state_ins(slot_state_ins: &[[Block128; STATE_SIZE]]) -> Self {
         let total_live = slot_state_ins.len();
+        Self::build_from_slot_state_ins_padded(slot_state_ins, total_live)
+    }
+
+    /// Build a dynamic Poseidon2b permutation-trace MLE with a fixed active
+    /// slot count. Slots beyond `slot_state_ins.len()` are independent zero
+    /// permutation witnesses; they fix the proof shape without changing the
+    /// caller's logical claims over the supplied slots.
+    pub fn build_from_slot_state_ins_padded(
+        slot_state_ins: &[[Block128; STATE_SIZE]],
+        padded_live_slots: usize,
+    ) -> Self {
+        let total_live = slot_state_ins.len();
         assert!(total_live > 0);
-        let num_vars = num_vars_for(total_live);
+        assert!(total_live <= padded_live_slots);
+        let num_vars = num_vars_for(padded_live_slots);
         let n_cells = 1usize << num_vars;
 
         let mut mle = BlockSpineMle {
@@ -256,13 +269,19 @@ impl BlockSpineMle {
             sigma: vec![Block128::ZERO; n_cells],
             state: vec![Block128::ZERO; n_cells],
             num_vars,
-            live_slots: total_live,
+            live_slots: padded_live_slots,
         };
 
         use rayon::prelude::*;
-        let witnesses: Vec<crate::layers::PermLayerWitness> = slot_state_ins
-            .par_iter()
-            .map(|&state_in| evaluate_permutation(state_in))
+        let witnesses: Vec<crate::layers::PermLayerWitness> = (0..padded_live_slots)
+            .into_par_iter()
+            .map(|slot| {
+                let state_in = slot_state_ins
+                    .get(slot)
+                    .copied()
+                    .unwrap_or([Block128::ZERO; STATE_SIZE]);
+                evaluate_permutation(state_in)
+            })
             .collect();
 
         for (slot, witness) in witnesses.iter().enumerate() {

@@ -17,8 +17,8 @@ use tokio::sync::RwLock;
 use noid_chain::block::Block;
 use noid_chain::consensus::wire_limits::{
     hex_chars_for_bytes, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES, MAX_RPC_SALT_BYTES,
-    MAX_TX_INTENT_BYTES_GLOBAL,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HISTORY_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES,
+    MAX_RPC_SALT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::consensus::{
     allocator::generate_slot_hints,
@@ -40,6 +40,44 @@ use crate::wallet_ops::WalletOps;
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
+}
+
+fn history_claim_fields_bytes(
+    block: &Block,
+    parent: &noid_chain::BlockHeader,
+    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
+) -> Result<Vec<u8>, noid_block::FullValidationError> {
+    let claim =
+        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
+            .map_err(noid_block::FullValidationError::from)?;
+    Ok(bincode::serialize(&claim.fields().to_vec()).expect("history claim fields serialize"))
+}
+
+fn map_history_claim_error(
+    error: noid_block::FullValidationError,
+) -> noid_chain::storage::MdbxContextError {
+    noid_chain::storage::MdbxContextError::Consensus(
+        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+            "history claim derivation failed: {error}"
+        )),
+    )
+}
+
+fn history_proof_bytes_from_cache(cache_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let cache: noid_recursive::LocalHistoryCache = bincode::deserialize(cache_bytes)
+        .map_err(|e| format!("local history cache decode failed: {e}"))?;
+    let proof = noid_recursive::prove_history_from_local_cache(&cache)
+        .map_err(|e| format!("local history proof build failed: {e}"))?;
+    let bytes = bincode::serialize(&proof)
+        .map_err(|e| format!("local history proof encode failed: {e}"))?;
+    if bytes.len() > MAX_HISTORY_PROOF_BYTES {
+        return Err(format!(
+            "local history proof too large: {} > {}",
+            bytes.len(),
+            MAX_HISTORY_PROOF_BYTES
+        ));
+    }
+    Ok(bytes)
 }
 
 #[inline]
@@ -288,7 +326,14 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_history_proof(&self) -> RpcResult<Option<String>> {
-        Ok(None)
+        let chain = self.chain.read().await;
+        match chain.store.get_local_history_cache() {
+            Ok(Some(cache_bytes)) => history_proof_bytes_from_cache(&cache_bytes)
+                .map(|bytes| Some(hex::encode(bytes)))
+                .map_err(rpc_err),
+            Ok(None) => Ok(None),
+            Err(e) => Err(rpc_err(e.to_string())),
+        }
     }
 
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo> {
@@ -893,6 +938,21 @@ impl ParanoidApiServer for RpcHandler {
         // proven transition, then commit atomically to MDBX.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
+            let mut history_claim_bytes = if block.transactions.iter().all(|tx| tx.body.is_coinbase)
+            {
+                let parent = *ctx.tip_header();
+                let artifacts =
+                    noid_block::derive_no_user_tx_validation_artifacts(&block, &parent, &ctx.state)
+                        .map_err(map_history_claim_error)
+                        .map_err(|e| rpc_err(format!("consensus: {e}")))?;
+                Some(
+                    history_claim_fields_bytes(&block, &parent, &artifacts)
+                        .map_err(map_history_claim_error)
+                        .map_err(|e| rpc_err(format!("consensus: {e}")))?,
+                )
+            } else {
+                None
+            };
             ctx.apply_next_block(
                 &block,
                 &block_proof_bytes,
@@ -908,7 +968,7 @@ impl ParanoidApiServer for RpcHandler {
                  anchor,
                  pre_state,
                  state| {
-                    noid_block::accept_block(
+                    let output = noid_block::accept_block_with_artifacts(
                         block,
                         proof_bytes,
                         auth_sidecar_bytes,
@@ -919,10 +979,21 @@ impl ParanoidApiServer for RpcHandler {
                         anchor,
                         pre_state,
                         state,
-                    )
+                    )?;
+                    history_claim_bytes = Some(history_claim_fields_bytes(
+                        block,
+                        parent,
+                        &output.artifacts,
+                    )?);
+                    Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
                 },
             )
             .map_err(|e| rpc_err(format!("consensus: {e}")))?;
+            if let Some(bytes) = &history_claim_bytes {
+                ctx.store
+                    .put_history_claim(block.header.height, bytes)
+                    .map_err(|e| rpc_err(format!("store history claim: {e}")))?;
+            }
             if !block_proof_bytes.is_empty() {
                 ctx.store
                     .put_block_proof(block.header.height, &block_proof_bytes)
@@ -1584,6 +1655,24 @@ mod tests {
         assert_eq!(json["sweep_tx_count"], 1);
         assert_eq!(json["tx_shapes"][1], "Sweep25x2");
         assert_eq!(json["has_block_proof"], true);
+    }
+
+    #[test]
+    fn history_proof_bytes_from_cache_roundtrip() {
+        let cache = noid_recursive::init_genesis_history_cache();
+        let cache_bytes = bincode::serialize(&cache).expect("serialize cache");
+        let proof_bytes = history_proof_bytes_from_cache(&cache_bytes).expect("proof bytes");
+        assert!(proof_bytes.len() < MAX_HISTORY_PROOF_BYTES);
+
+        let proof: noid_recursive::HistoryProof =
+            bincode::deserialize(&proof_bytes).expect("decode proof");
+        assert_eq!(proof.start_anchor, cache.start_anchor);
+        assert_eq!(proof.end_anchor, cache.anchor);
+    }
+
+    #[test]
+    fn history_proof_bytes_from_cache_rejects_bad_cache() {
+        assert!(history_proof_bytes_from_cache(b"not a cache").is_err());
     }
 }
 

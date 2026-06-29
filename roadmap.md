@@ -1,729 +1,386 @@
-# Public O(1) Roadmap
+# Header-Anchored O(1) History Roadmap
 
-This document is the working implementation roadmap for public O(1) snapshot
-sync. It starts from the current repository state and defines the selected
-architecture, the security target, and the exact implementation phases. The
-normative production security document remains `docs/security.md`; every phase
-that changes the accepted language or a theorem must update that file in the
-same patch.
+## Goal
 
-## 1. Current State
-
-The current production block-validation path is live and concrete:
+Build O(1) snapshot sync for history/state:
 
 ```text
-semantic block body
-+ BlockProof
-+ BlockAuthSidecar
-+ parent/state context
--> timeless AcceptBlock
+verified headers from genesis
++ O(1) proof over finalized state-transition history
++ snapshot segment recomputation to the proven state_root
+= accepted snapshot boundary
 ```
 
-What works today:
+Headers are linear and mandatory. They are stored once and validated by the
+node. The proof backend does not prove header consensus; it binds state history
+to the header anchors the node has already checked.
 
-- block identity and PoW use Poseidon2b domains `BLOCKHDR` and `POWHDR__`;
-- strict `pow_digest < target`, MTP, ASERT, chainwork, and log-slot expansion
-  have native/proof-facing relations and release tests;
-- exact UTXO and ReuseGuard state transitions are proven by the current
-  `BlockProof`;
-- every non-coinbase transaction carries a wallet-produced
-  `OwnerAuthProofKillShot`;
-- wallet secrets stay with wallets; block producers and history provers verify
-  wallet proofs, they do not know `spend_secret`;
-- retained batch replay derives component statements only after timeless
-  `AcceptBlock` succeeds;
-- public arbitrary-peer snapshot sync is fail-closed.
+## Selected Backend
 
-The remaining public O(1) problem is not the semantic block proof. The measured
-max-block payload is dominated by authorization sidecars:
+Use the in-tree binary-field backend, but not as one giant history batch proof.
+A single batch proof would still carry a size/verification dependency on the
+history length. The finalized history path must be an incremental accumulator:
+each step folds the previous accumulator plus the next accepted state-transition
+claim into a new constant-size accumulator instance.
 
 ```text
-255 Standard4x8:
-    BlockProof         about 160 KB
-    BlockAuthSidecar   about 14-16 MB
-
-40 full Sweep25x2:
-    consensus max under the 1020 live-input semantic budget
+History backend
+= Block128 binary tower field
+  + Poseidon2b transcript and claim hashing
+  + streaming CLMUL RLC accumulator for ordered history rows
+  + noid_fri_binius compact interleaved PCS for fixed step/decider openings
+  + ARC/PCD-style hash-based accumulation for unbounded finalized history
+  + chain accumulator over accepted state-transition claims
 ```
 
-The current `OwnerAuthProofKillShot` is itself sound, but its serialized size is
-dominated by the private-column PCS opening:
+This is the backend to implement first. It matches the current field, hash, FRI,
+and state commitment code already present in the repository. The PCS proves the
+fixed step relation and decider openings; the accumulation layer is what keeps
+the served finalized proof constant-size in the number of blocks.
+
+The proof rows are history/state rows:
+
+- header-anchor projection rows;
+- accepted state-transition claim rows;
+- exact state-root and counter transition rows;
+- chain accumulator items;
+- snapshot segment roots.
+
+The verifier sees constant-size endpoints, accumulator instances, and the final
+decider proof. The prover streams rows and folds them into the accumulator
+instead of materializing a large retained history table.
+
+Current measured native envelope baseline with the fixed decider hash-proof
+slot, release bench on 2026-06-29:
 
 ```text
-Standard4x8:
-    proof              about 63 KB
-    PCS opening        about 58-60 KB
+cargo test -p bench_prover --release --bench history_accumulator_lite -- --nocapture
 
-Sweep25x2:
-    proof              about 116-119 KB
-    PCS opening        about 112-113 KB
+n=1:   public_proof=9.71 KB, cache_proof=9.71 KB, local_cache=988 B, decider_statement=176 B, decider_proof=9.06 KB, decider_hash_proofs=8.02 KB, arc_pcd_accum=172 B, accum_state=188 B, arc_pcd_step_proof=12.47 KB, arc_pcd_chunk18_step_proof=21.97 KB, arc_pcd_one_step_proof=20.21 KB, arc_pcd_recursive_step_proof=8.02 KB, arc_pcd_recursive_chain_head=8.96 KB, recursive_head_cache=9.93 KB, arc_pcd_recursive_chunk_chain_head=15.26 KB, recursive_chunk_head_cache=16.23 KB, arc_pcd_recursive_history_proof=10.12 KB, arc_pcd_recursive_chunk_history_proof=16.42 KB, verify_envelope=9.30 ms, fold_envelope=20.06 ms, cache_fold=0.91 ms, cache_proof_time=18.10 ms, core_accum=0.08 ms
+n=18:  public_proof=9.71 KB, cache_proof=9.71 KB, local_cache=988 B, decider_statement=176 B, decider_proof=9.06 KB, decider_hash_proofs=8.02 KB, arc_pcd_accum=172 B, accum_state=188 B, arc_pcd_step_proof=12.47 KB, arc_pcd_chunk18_step_proof=21.97 KB, arc_pcd_one_step_proof=20.21 KB, arc_pcd_recursive_step_proof=8.02 KB, arc_pcd_recursive_chain_head=8.96 KB, recursive_head_cache=9.93 KB, arc_pcd_recursive_chunk_chain_head=15.26 KB, recursive_chunk_head_cache=16.23 KB, arc_pcd_recursive_history_proof=10.12 KB, arc_pcd_recursive_chunk_history_proof=16.42 KB, verify_envelope=7.92 ms, fold_envelope=28.39 ms, cache_fold=12.24 ms, cache_proof_time=21.89 ms, core_accum=0.21 ms
+n=255: public_proof=9.71 KB, cache_proof=9.71 KB, local_cache=988 B, decider_statement=176 B, decider_proof=9.06 KB, decider_hash_proofs=8.02 KB, arc_pcd_accum=172 B, accum_state=188 B, arc_pcd_step_proof=12.47 KB, arc_pcd_chunk18_step_proof=21.97 KB, arc_pcd_one_step_proof=20.21 KB, arc_pcd_recursive_step_proof=8.02 KB, arc_pcd_recursive_chain_head=8.96 KB, recursive_head_cache=9.93 KB, arc_pcd_recursive_chunk_chain_head=15.26 KB, recursive_chunk_head_cache=16.23 KB, arc_pcd_recursive_history_proof=10.12 KB, arc_pcd_recursive_chunk_history_proof=16.42 KB, verify_envelope=9.85 ms, fold_envelope=112.10 ms, cache_fold=143.94 ms, cache_proof_time=20.77 ms, core_accum=1.25 ms
+
+fixed field schedules:
+accum_state_hash_fields=16
+pcd_step_fields=54, pcd_step_hash_fields=56
+arc_pcd_accum_fields=12, arc_pcd_accum_hash_fields=14
+arc_recursive_step_fields=12, arc_recursive_step_hash_fields=14
+arc_recursive_chunk_step_fields=12, arc_recursive_chunk_step_hash_fields=14
+tagged_pair_hash_fields=6
+
+fixed step wrapper over one header projection + one 42-field claim:
+proof=5.47 KB, prove=15.40-16.57 ms, verify=3.88-4.39 ms, native discharge=1.32-3.20 ms
+
+fixed PCD step statement:
+statement=752 B, native build=3.53-5.44 ms
+
+batched fixed ARC/PCD step proof:
+proof=12.47 KB, prove=34.44-38.64 ms, verify=11.53-13.11 ms
+
+padded fixed ARC/PCD chunk step component:
+proof=21.97 KB, live=1/18/18 for n=1/18/255, prove=531.25-587.50 ms, verify=151.07-178.61 ms
+
+raw chunk verifier Fiat-Shamir transcript proof:
+proof=6.83 KB, traces=4, ops=10349, perms=5426, trace_build=151.44-179.14 ms, prove=2.38-2.65 s, verify=411.82-451.13 ms, native discharge=297.30-337.69 ms
+
+sound one-step `ArcPcdV1` base case:
+proof=20.21 KB, prove=59.00-61.74 ms, untrusted verify=23.49-24.64 ms
+
+fixed recursive ARC/PCD step component:
+statement=172 B, proof=8.02 KB, prove=20.03-22.71 ms, verify=5.95-7.62 ms
+
+staged recursive ARC/PCD chain head:
+proof head=8.96 KB, recursive-head cache=9.93 KB, worker_fold=77.74 ms/1.64 s/24.62 s for 1/18/255 blocks, serve_head=0.00-0.01 ms, shape verify=5.57-7.08 ms
+
+staged recursive ARC/PCD chunk chain head:
+proof head=15.26 KB, recursive-chunk-head cache=16.23 KB, chunk_count=1/1/15 for 1/18/255 blocks, worker_fold=846.36 ms/864.69 ms/15.38 s, serve_head=0.01-0.02 ms, shape verify=81.60-95.53 ms
+
+recursive chunk-step verifier Fiat-Shamir transcript proof:
+proof=5.94 KB, traces=2, ops=995, perms=588, trace_build=6.53-7.79 ms, prove=279.16-316.05 ms, verify=39.53-45.37 ms, native discharge=31.11-36.78 ms
+
+staged multi-step `ArcPcdV1` history proof from recursive-chunk-head cache:
+proof=16.42 KB, build_from_cache=87.26-104.53 ms, native shape verify=87.24-102.15 ms, untrusted fail-closed check=82.95-100.82 ms
+
+staged multi-step `ArcPcdV1` history proof from recursive-head cache:
+proof=10.12 KB, build_from_cache=8.02-9.49 ms, native shape verify=7.76-9.75 ms, untrusted fail-closed check=7.94-9.06 ms
+
+fixed-field GKR hash proofs for canonical history schedules:
+PCD step hash proof=4.45 KB, prove=15.81-17.51 ms, verify=2.81-4.33 ms, native discharge=1.42-2.36 ms
+ARC accumulator hash proof=3.86 KB, prove=6.23-8.21 ms, verify=1.55-2.85 ms, native discharge=0.64-0.74 ms
+tagged pair hash proof=3.56 KB, prove=3.83-5.55 ms, verify=2.02-2.51 ms, native discharge=0.47-0.57 ms
 ```
 
-The current laboratory benchmark is:
+This benchmark currently measures the constant public envelope, the incremental
+local finalized-history cache, a fixed-size decider proof slot with fixed hash
+proofs, and the streaming folding kernel. The served proof size is constant in
+the number of covered blocks. `cache_fold` is the one-time/incremental catch-up
+cost; `cache_proof_time` is proof assembly from an already-current cache and is
+constant in the covered history. The native decider slot proves the fixed hash
+schedules it checks, but it is not yet the final trustless backend proof. The
+native envelope now builds the `HistoryArcPcdAccumulator` by applying the fixed
+PCD step relation for every covered step, not by hashing only the start/end
+boundary. The accumulation-state, PCD-step, ARC-accumulator, and tagged-pair
+digests use explicit even no-padding field schedules so the GKR component
+proves the same schedule the native verifier hashes.
+The recursive payload digests are now canonical field transcripts, not Rust
+struct serialization. They absorb explicit domain tags, lengths, GKR round
+polynomials, batch-eval finals, metadata, statements, and accumulator digests
+in verifier-visible order. This gives the recursive backend a stable object to
+verify. It does not by itself prove previous proof-chain validity.
+The native decider hash slot now batches the five 6-field tagged-pair
+commitment checks into one fixed hash proof and keeps the 14-field ARC
+accumulator hash as one separate proof. That cuts the native proof/cache proof
+to 9.71 KB and the envelope verifier to 7.92-9.85 ms in the latest release
+bench.
+There is now a fixed-size `HistoryArcPcdStepProof` for one ARC/PCD accumulator
+transition. It batches the two 16-field previous/next accumulation-state digest
+checks into one fixed hash proof, keeps the 56-field PCD-step digest as one
+proof, and batches the two 6-field root/transcript tagged-pair updates into one
+fixed hash proof. This is still a step proof, not the final unbounded recursive
+verifier; untrusted snapshot acceptance remains fail-closed.
+There is also a padded fixed-size `HistoryArcPcdChunkStepProof` for proof-worker
+experiments. It always proves an 18-block shape: live blocks first, canonical
+zero padding after that. It batches 18 history claim hashes, 36 state hashes,
+18 PCD-step hashes, and 36 accumulator-update hashes. The component is
+constant-size at 21.97 KB and proves 18 live blocks in 531.25-587.50 ms, but
+raw native verification is still 151.07-178.61 ms for 18 live blocks. Its
+Fiat-Shamir verifier transcript proof is fixed-size at 6.83 KB, but costs
+2.38-2.65 s to prove and 411.82-451.13 ms to verify, with about 1.9 GB memory
+high-water in the current bench run. This is useful as a negative benchmark and
+as a chunked worker relation correctness oracle, not as the final public
+verifier path; the final path must verify the recursive decider, not replay
+this raw chunk verifier.
+`ArcPcdV1` now has a sound one-step base case: for `step_count == 1`, the
+public proof carries both the accepted-claim `HistoryStepProof` and the
+`HistoryArcPcdStepProof`, and `verify_history_proof_untrusted` verifies them
+end-to-end against local header anchors. The one-step decider is lean: it does
+not carry the duplicate native-fold decider hash proofs, and the verifier
+recomputes those decider commitments directly while requiring `hash_proofs ==
+None`. Multi-step `ArcPcdV1` remains fail-closed with `BackendVerifierMissing`
+until recursive accumulation is implemented.
+The next recursive component is also fixed: `HistoryArcPcdRecursiveStepProof`
+binds `(previous proof-chain digest, previous ARC accumulator, current one-step
+proof digest, next ARC accumulator)` into a new proof-chain digest with explicit
+14-field recursive-step and accumulator schedules. It batches the recursive-step
+statement hash plus previous/next ARC accumulator hashes into one fixed hash
+proof, with the next proof-chain digest as one separate tagged-pair proof. This
+is the object that will be verified inside the recursive backend; by itself it
+is not yet sufficient to open multi-step untrusted acceptance.
+There is now also a staged `HistoryArcPcdRecursiveChainHead` and a separate
+`LocalHistoryRecursiveHeadCache` for proof-worker use. The ordinary
+`LocalHistoryCache` remains the cheap node hot-path cache; the recursive-head
+cache wraps it and stores one final head object. Serving the already-current
+head is constant and measured at 0.00-0.01 ms, and shape verification is about
+5.57-7.08 ms. The recursive head is now an explicit staged payload in
+multi-step `ArcPcdV1 HistoryProof`; the served proof from an already-current
+recursive-head cache is 10.12 KB, builds in 8.02-9.49 ms, and native shape
+verification takes 7.76-9.75 ms. Public untrusted verification remains
+fail-closed with `BackendVerifierMissing` for this payload because the current
+head proves only the final recursive step shape, not the full accumulated
+recursive verifier relation. The worker fold is still one proof per finalized
+block and is measured at 24.62 s for 255 blocks, so this is an internal/async
+finalized-chain artifact, not the target <2 s served snapshot prover.
+
+There is now also a staged `HistoryArcPcdRecursiveChunkChainHead` and
+`LocalHistoryRecursiveChunkHeadCache`. This cache stores no pending headers or
+witnesses; callers pass a transient bounded chunk of `1..=18` finalized blocks
+to the proof worker, and the cache stores only one final chunk head. The head
+now carries the fixed Fiat-Shamir verifier transcript proof for its final
+recursive chunk-step verifier. In the latest release bench the head is
+constant-size at 15.26 KB, the cache is constant-size at 16.23 KB, and 255
+blocks fold as 15 chunks in 15.38 s. The chunk head has its own `ArcPcdV1
+HistoryProof` payload in the public envelope: served proof size is 16.42 KB,
+build-from-cache is 87.26-104.53 ms, and native verification is
+87.24-102.15 ms. The embedded recursive chunk-step verifier transcript proof
+remains fixed at 5.94 KB, proves in 279.16-316.05 ms, and verifies in
+39.53-45.37 ms. Multi-step untrusted acceptance still remains fail-closed with
+`BackendVerifierMissing`: this payload proves the final recursive verifier
+transcript and final accumulator boundary, but the full previous-proof validity
+relation is not yet implemented. Opening acceptance before that would be a
+digest-only shortcut and is explicitly forbidden.
+
+## Public Proof Language
+
+`HistoryProof` public inputs:
+
+- `start_anchor: HeaderChainAnchor`;
+- `end_anchor: HeaderChainAnchor`;
+- `history_accumulator_start`;
+- `history_accumulator_end`;
+- optional finalized checkpoint id;
+- snapshot root, which must equal `end_anchor.state_root`.
+
+`HeaderChainAnchor` is computed from the node's canonical header store. There
+must be no second header store.
+
+Verification rule:
 
 ```text
-cargo bench -p bench_prover --bench o1_auth_accumulator_lite
+local canonical headers -> local HeaderChainAnchor
+HistoryProof anchors    -> proof HeaderChainAnchor
+accept only if they match
 ```
 
-It builds real `OwnerAuthProofKillShot` objects, verifies them to the existing
-production verifier claims, then measures a streaming binary-field accumulator
-kernel. Current standard-only data:
+## State-Transition Claim
+
+Add a sealed `AcceptedStateTransitionClaim`. It is emitted only after full live
+block validation has accepted the block.
+
+Minimum fields:
+
+- height;
+- block id;
+- parent state root;
+- child state root, equal to `header.state_root`;
+- tx root, equal to `header.tx_root`;
+- parent and child `log_slots`;
+- parent and child `active_slot_count`;
+- parent and child `alloc_counter`;
+- parent and child exact UTXO root;
+- parent and child ReuseGuard root;
+- touched slot count;
+- minted, spent, fee, reward, and supply counters;
+- semantic resource counters;
+- exact state transition digest;
+- claim digest.
+
+Coinbase-only blocks must produce a non-empty claim. Miner reward is a real
+state transition and must be part of the history accumulator.
+
+## Finalized And Recent Ranges
+
+For a snapshot at tip `H`:
 
 ```text
-Standard4x8 x1:
-    core_accum         about 0.37 ms
-    full_scan          about 0.44 ms
-    wallet             about 63 KB
-    pcs_pending        about 58 KB
-
-Standard4x8 x64:
-    core_accum         about 22.9 ms
-    full_scan          about 27.3 ms
-    wallet             about 3.98 MB
-    pcs_pending        about 3.64 MB
+finalized HistoryProof through H-18
++ retained recent suffix H-17..H
+= snapshot boundary at H
 ```
 
-This shows that the binary-field accumulation kernel is not the bottleneck. The
-remaining work is a proof-native batch decider for the current Auth PCS
-FRI/source/Merkle opening relation.
+The recent suffix stays inside the normal retention window. If proof production
+lags near the 18-block boundary, pruning stops until the finalized proof catches
+up.
 
-## 2. Selected Architecture
-
-The selected architecture keeps the current wallet authorization model:
+If the transport wants a single served proof object:
 
 ```text
-wallet:
-    TxBody + OwnerAuthProofKillShot
-
-mempool/full node:
-    direct VerifyAuthorization(statement, proof)
-
-block producer / history prover:
-    use wallet proofs as private validation witness
-
-public snapshot verifier:
-    verify HistoryProof and compare cumulative_chainwork
+finalized HistoryProof
++ suffix transition proof
+= served current HistoryProof
 ```
 
-The public O(1) authority is:
-
-```text
-HistoryProof
-```
-
-The public O(1) authority is not:
-
-```text
-BlockAuthSidecar bytes
-local cache entries
-retained replay output
-transport checksums
-component statements supplied without their derivation relation
-```
-
-### 2.1 Recursive Consensus State
-
-The public history state is the minimal timeless consensus state:
-
-```rust
-pub struct RecursiveConsensusState {
-    pub height: u64,
-    pub block_id: [u8; 32],
-
-    pub state_root: [u8; 32],
-    pub utxo_root: [u8; 32],
-    pub guard_root: [u8; 32],
-
-    pub cumulative_chainwork: [u8; 32],
-    pub log_slots: u32,
-    pub active_slot_count: u64,
-    pub alloc_counter: u64,
-    pub asert_anchor: AsertAnchor,
-    pub mtp_window: MtpWindow,
-    pub expansion_window: ExpansionWindow,
-}
-```
-
-`state_root` remains:
-
-```text
-H_STATE_ROOT(log_slots, utxo_root, guard_root)
-```
-
-`utxo_root` and `guard_root` are explicit public state fields so snapshot
-manifest verification does not depend on an opaque root alone.
-
-### 2.2 Digest Graph
-
-The final statement graph is acyclic:
-
-```text
-BatchContextDigest =
-    H(start_state, end_state, batch_len, ordered headers, semantic counts)
-
-HeaderBatchStatementDigest =
-    H(BatchContextDigest, header-specific public inputs)
-
-TxBodyBatchStatementDigest =
-    H(BatchContextDigest, ordered tx-body commitments)
-
-ExactActionStatementDigest =
-    H(BatchContextDigest, exact action surfaces)
-
-ExactStateBatchStatementDigest =
-    H(BatchContextDigest, state transition public inputs)
-
-AuthorizationBatchStatementDigest =
-    H(BatchContextDigest, ordered authorization statements, layout counts)
-
-ExecutionBatchStatementDigest =
-    H(
-      BatchContextDigest,
-      TxBodyBatchStatementDigest,
-      ExactActionStatementDigest,
-      ExactStateBatchStatementDigest,
-      AuthorizationBatchStatementDigest
-    )
-
-HistoryStepStatementDigest =
-    H(previous_state_digest, end_state_digest,
-      HeaderBatchStatementDigest, ExecutionBatchStatementDigest)
-```
-
-No digest may include itself through another module digest. `ACCBLK__` may be
-used only as an internal semantic claim schedule derived inside the proved batch
-relation. It is not a standalone public acceptance object.
-
-### 2.3 Authorization Accumulation
-
-The final authorization proof object is:
-
-```rust
-pub struct OwnerAuthAccumulationProof {
-    pub statement_digest: [u8; 32],
-    pub layout_groups: Vec<AuthLayoutGroupDigest>,
-    pub core: CoreAuthAccumulatorProof,
-    pub pcs: PcsFriSourceBatchDeciderProof,
-}
-```
-
-The private witness contains the existing wallet proofs:
-
-```rust
-pub struct OwnerAuthAccumulationWitness {
-    pub canonical_statements: Vec<CanonicalAuthorizationStatement>,
-    pub wallet_proofs: Vec<OwnerAuthProofKillShot>,
-}
-```
-
-`CoreAuthAccumulatorProof` covers:
-
-- canonical statement binding;
-- Fiat-Shamir transcript order for the non-PCS verifier surface;
-- main/shift/boundary sumcheck verifier equations;
-- batch-eval terminal reduction;
-- continuity between verifier reductions and PCS opening claims.
-
-`PcsFriSourceBatchDeciderProof` covers:
-
-- arithmetic PCS commitment metadata and cap binding;
-- compact FRI root absorption and query derivation;
-- FRI fold equations;
-- batched Merkle path equations;
-- source TensorFold equations;
-- source cap and folded-root binding;
-- equality between the final PCS opening value and the batch-eval terminal
-  state claim.
-
-Large wallet proof objects become witness data. The public O(1) proof carries
-only the accumulated authorization proof.
-
-### 2.4 History IVC
-
-The final history step relation is:
-
-```text
-Verify(prev_history_proof) OR genesis base
-Verify(HeaderBatchProof)
-Verify(ExecutionBatchProof)
-Verify(OwnerAuthAccumulationProof)
-Check exact start/end RecursiveConsensusState equality
-Check one batch statement digest graph
-=> new HistoryProof
-```
-
-Fork choice remains outside `HistoryProof`:
-
-```text
-verify candidate HistoryProof objects
-choose highest cumulative_chainwork
-```
-
-## 3. Security Target
-
-This section defines the target the implementation must reach before public
-O(1) activation. Until then, snapshot sync remains fail-closed.
-
-### 3.1 Authorization Accumulation Soundness
-
-Let `B` be an ordered batch of semantic blocks. Let `Stmt_i` be the canonical
-authorization statement for non-coinbase transaction `i`, derived from:
-
-```text
-ordered TxBody
-authenticated pre-state owners
-ordered live input slots
-input_to_owner mapping
-owner_count and layout
-protocol domains
-the arithmetic Auth PCS commitment
-```
-
-Target theorem:
-
-```text
-VerifyOwnerAuthAccumulation(B, proof) accepts
-
-=> exists wallet proofs pi_i such that
-   VerifyAuthorization(Stmt_i, pi_i) accepts
-   for every non-coinbase transaction i in B
-```
-
-except with:
-
-```text
-epsilon_auth_accum
-+ sum_i epsilon_owner_auth_i
-+ epsilon_pcs_batch_decider
-+ epsilon_hash_binding
-```
-
-The theorem is existential over wallet proof bytes. It does not say that a node
-previously saw the proof; it says the proof relation accepts for some witness
-that is bound to the canonical statement.
-
-By the existing Authorization Knowledge Theorem in `docs/security.md`:
-
-```text
-VerifyAuthorization(Stmt_i, pi_i) accepts
-=> an extractor obtains spend_secret for every claimed owner
-```
-
-except with the owner-auth knowledge-soundness error. Therefore accepted
-accumulated authorization implies every consumed owner is authorized, under the
-same wallet-secret model as today.
-
-### 3.2 History Soundness
-
-Target theorem:
-
-```text
-VerifyHistoryProof(S_0, S_n, proof) accepts
-
-=> exists a canonical sequence of semantic blocks B_1..B_n
-   and validation witnesses W_1..W_n such that
-   S_i = AcceptBlockTimeless(S_{i-1}, B_i, W_i)
-   for every i
-```
-
-except with the union of:
-
-- Poseidon2b commitment assumptions;
-- binary-field IVC soundness;
-- header integer relation soundness;
-- execution relation soundness;
-- OwnerAuth accumulation soundness;
-- exact-state Merkle and ReuseGuard binding failures.
-
-The theorem must be proven in `docs/security.md` at activation time with exact
-module names and error accounting from the implemented backend.
-
-### 3.3 Current Proven Facts
-
-The following are current facts, not future claims:
-
-- direct `VerifyAuthorization(statement, OwnerAuthProofKillShot)` is the
-  production authorization verifier;
-- `OwnerAuthProofKillShot` knowledge soundness is the production theft-security
-  claim;
-- the bench-only accumulator shows the binary-field folding kernel is cheap on
-  real proof material;
-- the bench-only accumulator is not consensus authority and does not prove PCS
-  source binding.
-
-## 4. Implementation Plan
-
-Every phase must end with:
-
-- focused tests;
-- a benchmark gate where performance risk exists;
-- a `docs/security.md` update if the phase changes the security language;
-- no production path accepting a partial O(1) proof as authority.
-
-### Phase 0: Freeze Current Lab and Documentation
-
-Status: completed.
-
-Tasks:
-
-- keep only `bench_prover/benches/o1_auth_accumulator_lite.rs` for the current
-  authorization accumulator lab;
-- keep default benches small and require explicit env vars for large runs;
-- add this roadmap;
-- update `docs/security.md` so the selected public O(1) target is
-  `HistoryProof` over `RecursiveConsensusState`, not a rolling accumulator.
-
-Exit gate:
-
-```text
-cargo fmt --check
-cargo check -p bench_prover --benches
-cargo bench -p bench_prover --bench o1_auth_accumulator_lite
-```
-
-### Phase 1: OwnerAuth Verify Claim Shape
-
-Goal: define the exact typed claim language that the accumulator will prove.
-
-New module target:
-
-```text
-noid_gkr::owner_auth_accum
-```
-
-Core types:
-
-```rust
-pub struct OwnerAuthVerifyClaim {
-    pub statement_digest: [u8; 32],
-    pub layout_key: AuthLayoutKey,
-    pub transcript_digest: [u8; 32],
-    pub gkr: OwnerAuthGkrVerifierClaim,
-    pub batch_eval: OwnerAuthBatchEvalClaim,
-    pub pcs: OwnerAuthPcsOpeningClaim,
-}
-
-pub struct AuthLayoutKey {
-    pub owner_count: u8,
-    pub live_slots: u8,
-    pub slot_bits: u8,
-    pub num_vars: u8,
-    pub hash_backend: u8,
-}
-```
-
-Implementation:
-
-- build claims from the existing production verifier boundary;
-- bind `block_index` and `tx_index` into each authorization statement digest;
-- enforce canonical layout counts: sorted layout groups, no duplicate layout
-  keys, sum of group counts equals `user_tx_count`;
-- keep this claim builder as witness construction, not public authority.
-
-Tests:
-
-- direct verifier accepts iff claim construction succeeds;
-- wrong tx hash rejects;
-- swapped transaction position changes statement digest;
-- wrong owner mapping rejects;
-- wrong PCS backend rejects.
-
-Bench gate:
-
-```text
-255 Standard4x8 claim construction <= direct verify time + 10%
-40 full Sweep25x2 claim construction <= direct verify time + 10%
-```
-
-### Phase 2: CoreAuthAccumulatorProof
-
-Goal: implement the proof for the non-PCS authorization verifier surface.
-
-New proof object:
-
-```rust
-pub struct CoreAuthAccumulatorProof {
-    pub layout_groups: Vec<AuthLayoutGroupDigest>,
-    pub accumulator_commitment: [u8; 32],
-    pub terminal_claim: [Block128; 2],
-}
-```
-
-Implementation:
-
-- use a Poseidon2b transcript to bind batch context, ordered statements, layout
-  groups, and Auth PCS commitments before drawing accumulator challenges;
-- use streaming CLMUL for binary-field RLC inside the prover/decider relation;
-- prove main/shift/boundary sumcheck verifier equations and batch-eval terminal
-  continuity;
-- keep PCS opening checks as explicit unresolved inputs to the next phase, not
-  as accepted authority.
-
-Tests:
-
-- mutation of any non-PCS proof message rejects;
-- mutation of any returned verifier claim rejects;
-- removing, duplicating, or reordering an authorization proof rejects;
-- layout count mismatch rejects.
-
-Bench gate:
-
-```text
-255 Standard4x8:
-    core proof public bytes <= 150 KB
-    verify <= 150 ms
-    prover HWM <= 1 GB
-
-40 full Sweep25x2:
-    core proof public bytes <= 200 KB
-    verify <= 250 ms
-    prover HWM <= 1 GB
-```
-
-Security update:
-
-- add a `CoreAuthAccumulatorSoundness` lemma to `docs/security.md`;
-- explicitly state that this phase alone is not public authorization authority.
-
-### Phase 3: PcsFriSourceBatchDeciderProof
-
-Goal: remove the linear public PCS opening payload from public history.
-
-New proof object:
-
-```rust
-pub struct PcsFriSourceBatchDeciderProof {
-    pub layout_groups: Vec<AuthPcsLayoutGroupDigest>,
-    pub fri_decider: FriBatchDeciderProof,
-    pub source_decider: SourceTensorFoldBatchDeciderProof,
-    pub terminal_opening_claim: [Block128; 2],
-}
-```
-
-Implementation:
-
-- group proofs by canonical Auth PCS layout;
-- prove compact FRI query derivation and fold equations for all openings in one
-  grouped decider;
-- prove source TensorFold and source-cap Merkle equations in one grouped
-  decider;
-- prove equality between PCS terminal opening values and the batch-eval
-  reductions produced by Phase 2;
-- keep all FRI symbols, source symbols, Merkle siblings, and folded-layer data
-  as private witness.
-
-Tests:
-
-- tamper FRI root rejects;
-- tamper FRI queried symbol rejects;
-- tamper FRI sibling rejects;
-- tamper source cap node rejects;
-- tamper source symbol rejects;
-- tamper folded root rejects;
-- tamper folded query symbol rejects;
-- tamper terminal opening rejects;
-- wrong query schedule rejects;
-- extra or missing PCS opening rejects.
-
-Bench gate:
-
-```text
-1 Standard4x8:
-    auth accumulation proof <= 200 KB
-    verify <= 250 ms
-    HWM <= 1 GB
-
-255 Standard4x8:
-    auth accumulation proof <= 1 MB
-    verify <= 500 ms
-    HWM <= 1 GB
-
-40 full Sweep25x2:
-    auth accumulation proof <= 2 MB
-    verify <= 1 s
-    HWM <= 1.5 GB
-```
-
-Security update:
-
-- add `PcsFriSourceBatchDeciderSoundness`;
-- compose it with `CoreAuthAccumulatorSoundness`;
-- upgrade the target authorization theorem to a concrete theorem using the
-  implemented module names.
-
-### Phase 4: OwnerAuthAccumulationProof Integration
-
-Goal: replace public authorization sidecar authority in the public O(1) path.
-
-Implementation:
-
-- add `OwnerAuthAccumulationProof` verifier;
-- add witness builder that consumes retained wallet proofs;
-- update retained batch construction to produce the new proof as a component;
-- keep direct wallet proof verification for mempool/full-node validation and
-  differential tests;
-- do not remove live block sidecars from propagation until networking policy is
-  separately changed.
-
-Tests:
-
-- direct batch authorization and accumulated authorization agree on corpus
-  blocks;
-- missing, duplicated, swapped, or cross-transaction wallet proofs reject;
-- coinbase-only batch has one canonical empty authorization proof shape.
-
-Bench gate:
-
-```text
-255 Standard4x8 full block auth public payload <= 1 MB
-40 full Sweep25x2 full block auth public payload <= 2 MB
-```
-
-### Phase 5: ExecutionBatchProof
-
-Goal: make execution proof-native instead of relying on retained replay.
-
-Implementation:
-
-- prove tx-root over ordered bodies;
-- prove tx body hash spines;
-- prove exact action table;
-- prove exact UTXO and ReuseGuard transition;
-- prove fees, reward, supply, shape, and semantic resource bounds;
-- bind execution and authorization to the same `BatchContextDigest`.
-
-Tests:
-
-- differential native `AcceptBlock` vs `ExecutionBatchProof`;
-- action reorder rejects;
-- state root mismatch rejects;
-- fee/reward/supply mutation rejects;
-- semantic bounds mutation rejects.
-
-Security update:
-
-- add `ExecutionBatchSoundness` and compose with authorization theorem.
-
-### Phase 6: HeaderBatchProof
-
-Goal: make header consensus proof-native for the final IVC step.
-
-Implementation:
-
-- prove `POWHDR__` and `BLOCKHDR` schedules;
-- prove parent linkage;
-- prove strict target comparison;
-- prove ASERT, MTP, chainwork, and log-slot expansion;
-- remove any dependence on host equality shortcuts.
-
-Tests:
-
-- strict equality target reject;
-- parent mismatch reject;
-- ASERT mutation reject;
-- MTP mutation reject;
-- chainwork mutation reject;
-- expansion-window mutation reject.
-
-Bench gate:
-
-```text
-255 headers absorbed into IVC relation without shipping a linear header wrapper
-```
-
-### Phase 7: Binary-Field History IVC
-
-Goal: implement the public recursive history verifier.
-
-Implementation:
-
-```text
-base case:
-    fixed genesis RecursiveConsensusState
-
-step:
-    verify previous HistoryProof
-    verify HeaderBatchProof
-    verify ExecutionBatchProof
-    check BatchContextDigest graph
-    check exact start/end RecursiveConsensusState equality
-    output new HistoryProof
-```
-
-Target API:
-
-```rust
-pub struct HistoryProof {
-    pub proof_bytes: Vec<u8>,
-    pub start: RecursiveConsensusState,
-    pub end: RecursiveConsensusState,
-    pub statement_digest: [u8; 32],
-}
-
-pub fn verify_history_proof(
-    genesis: &RecursiveConsensusState,
-    claimed_tip: &RecursiveConsensusState,
-    proof: &HistoryProof,
-) -> Result<(), HistoryProofError>;
-```
-
-Tests:
-
-- genesis base accepts only the fixed genesis state;
-- wrong previous proof rejects;
-- wrong start/end state rejects;
-- wrong module digest rejects;
-- fork-choice test verifies two proofs and picks higher chainwork outside the
-  proof verifier.
-
-Bench gate:
-
-```text
-HistoryProof verify <= 1 s on target laptop for current max block sizes
-HistoryProof public size <= 2 MB before final tuning
-peak verifier RSS <= 1 GB
-```
-
-Security update:
-
-- replace target theorem text with the concrete `HistoryProof` theorem;
-- define exact soundness error accounting for the implemented IVC backend.
-
-### Phase 8: Public Snapshot Activation
-
-Goal: enable public arbitrary-peer snapshot sync.
-
-Implementation:
-
-- snapshot manifest carries `RecursiveConsensusState`, state roots, and
-  `HistoryProof`;
-- public verifier checks `HistoryProof`;
-- public verifier checks snapshot `utxo_root`, `guard_root`, and composite
-  `state_root`;
-- public verifier compares cumulative chainwork across candidate proofs;
-- retained replay remains only a local/test/witness-builder path.
-
-Activation matrix:
-
-- differential native vs proof corpus;
-- malformed witness and tamper matrix;
-- 1, 2, 16, 100, 255 Standard4x8 benches;
-- 1, 2, 16, 40 full Sweep25x2 benches;
-- auth-heavy mixed blocks;
-- coinbase-only ranges;
-- proof size, verify time, prover time, and peak RSS caps;
-- full `docs/security.md` audit pass.
-
-## 5. Current Next Step
-
-The immediate next implementation task is Phase 1:
-
-```text
-OwnerAuthVerifyClaim shape
-+ canonical statement digest with block_index and tx_index
-+ canonical layout grouping
-+ differential tests against direct VerifyAuthorization
-```
-
-Do not start the PCS batch decider until the claim language is frozen and tested.
-That prevents reworking the decider around changing statement shapes.
+## Implementation Phases
+
+### 1. Freeze The Claim Language
+
+- Add `AcceptedStateTransitionClaim`.
+- Build it from accepted validation artifacts.
+- Bind each claim to canonical header fields.
+- Cover coinbase-only blocks.
+- Add release tests for 1, 2, 18 blocks and coinbase-only blocks.
+
+### 2. Integrate Header Anchors
+
+- Use `HeaderChainAnchor` as the proof/header boundary.
+- Compute anchors from the existing header store only.
+- Reject snapshot proofs whose anchors do not match local headers.
+- Keep header validation native.
+
+### 3. Build History Accumulator Bench
+
+Create `history_accumulator_lite` from the existing streaming accumulator
+harness, but feed real history/state rows:
+
+- header projections;
+- accepted state-transition claims;
+- exact root/counter transitions;
+- chain accumulator rows;
+- snapshot segment roots.
+
+Run benches in release mode only. Do not record history performance numbers
+until this benchmark exists and has fresh results.
+
+### 4. Implement The Proof Backend
+
+Phase 4A, public envelope:
+
+- `HistoryProof` has no linear rows or claim vectors.
+- `HistoryProof` includes a fixed-size decider proof slot; benchmarked proof
+  size must include that slot.
+- `HistoryProofWitness` carries headers and transition rows only for the prover.
+- Release tests prove serialized `HistoryProof` size is constant for 1, 18, and
+  255 witness items.
+- Release bench prints proof size and envelope verifier time.
+- Untrusted verification rejects native and reserved backend variants until the
+  real backend verifier is implemented.
+
+Phase 4B, accumulator step:
+
+- Define the fixed step statement:
+  `prev_history_accumulator + header projection + AcceptedStateTransitionClaim
+  -> next_history_accumulator`.
+- Prove the step relation with the in-tree binary-field GKR/FRI-Binius backend.
+- The step must cover header projection folding, chain accumulator extension,
+  state root/counter continuity, and coinbase-only claims.
+- Public step verifier input must be fixed-size.
+
+Phase 4C, unbounded finalized history:
+
+- Use `HistoryPcdStepStatement` as the fixed recursive step relation:
+  `previous HistoryAccumulationState + verified HistoryStepProof ->
+  next HistoryAccumulationState`.
+- Use `HistoryArcPcdAccumulator` as the fixed public accumulator instance:
+  start state digest, current state digest, PCD root, step-relation digest, and
+  transcript digest.
+- Use canonical `Block128` field schedules for the decider backend:
+  `HistoryPcdStepStatement` has 54 semantic fields and a 56-field hash input;
+  `HistoryArcPcdAccumulator` has 12 semantic fields and a 14-field hash input.
+  Tagged-pair commitments use 6-field hash inputs. Digest checks must bind
+  these field schedules, not Rust struct serialization.
+- Implement ARC/PCD-style accumulation over step proofs.
+- The finalized accumulator instance must be constant-size.
+- The final decider proof must verify the accumulator against
+  `start_anchor`, `end_anchor`, `history_accumulator_start`, and
+  `history_accumulator_end`.
+- The untrusted snapshot path must not accept digest-only folded roots.
+
+### 5. Snapshot Verification
+
+Verification order:
+
+1. sync and validate headers from genesis;
+2. compute local `HeaderChainAnchor`;
+3. verify `HistoryProof`;
+4. recompute snapshot segment roots into one state root;
+5. compare recomputed root to `end_anchor.state_root`;
+6. apply the retained recent suffix if the snapshot is served at current tip.
+
+Target budget after implementation:
+
+- proof generation: <2 s for the served O(1) snapshot proof path;
+- verification: <1 s for the trustless verifier;
+- optimization below that is future work after the full verifier is sound.
+
+These are targets, not measured results.
+
+### 6. Live Tests
+
+After implementation:
+
+- two-node live sync with node 2 joining before block 18;
+- two-node live sync with node 2 joining after block 18 through snapshot;
+- 20+ block run at laptop start difficulty;
+- restart with snapshot enabled;
+- reorg-failed fallback into snapshot path;
+- log checks for manifest, anchor, suffix, snapshot root, and retention events.
+
+## Acceptance Gates
+
+- No history performance number without a fresh release bench.
+- No pruning before finalized proof covers the range.
+- No snapshot accept unless local headers match proof anchors.
+- No empty claim for coinbase-only blocks.
+- No second header store.
+- No untrusted `HistoryProof` verifier that accepts a digest-only folded root.
+- No multi-step `ArcPcdV1` acceptance until the proof verifies full previous-proof validity and current bounded-chunk validity, not just final head shape.
+- No temporary trusted snapshot path: if the verifier is not sound, it must fail closed.

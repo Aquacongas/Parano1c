@@ -22,8 +22,10 @@ pub mod block_spine_sweep;
 pub mod chain_accumulator_killshot;
 pub mod circuit;
 pub mod circuit_sweep;
+pub mod fixed_field_hash_killshot;
 pub mod guard_bucket_killshot;
 pub mod header_hash_killshot;
+pub mod history_claim_killshot;
 pub mod layers;
 pub mod merkle_batch_killshot;
 pub mod merkle_circuit;
@@ -73,8 +75,10 @@ pub use block_spine_sweep::{
     SweepBlockSpineReductions,
 };
 pub use chain_accumulator_killshot::{
-    discharge_chain_accumulator_reductions_native, prove_chain_accumulator_killshot,
-    verify_chain_accumulator_killshot, ChainAccumulatorBatchInputs, ChainAccumulatorItem,
+    discharge_chain_accumulator_reductions_native,
+    discharge_chain_accumulator_reductions_native_padded, prove_chain_accumulator_killshot,
+    prove_chain_accumulator_killshot_padded, verify_chain_accumulator_killshot,
+    verify_chain_accumulator_killshot_padded, ChainAccumulatorBatchInputs, ChainAccumulatorItem,
     ChainAccumulatorProofKillShot, ChainAccumulatorReductions,
 };
 pub use circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
@@ -82,15 +86,26 @@ pub use circuit_sweep::{
     SweepSlotDescriptor, SweepSpineCircuit, SweepSpineInputs, SweepSpineSlotRole,
     N_SWEEP_SPINE_SLOTS,
 };
+pub use fixed_field_hash_killshot::{
+    discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
+    verify_fixed_field_hash_killshot, FixedFieldHashInputs, FixedFieldHashParams,
+    FixedFieldHashProofKillShot, FixedFieldHashReductions, FIXED_FIELD_HASH_PIN_LANES,
+};
 pub use guard_bucket_killshot::{
     discharge_batched_guard_bucket_reductions_native, prove_batched_guard_bucket_killshot,
     verify_batched_guard_bucket_killshot, BatchedGuardBucketProofKillShot,
     BatchedGuardBucketReductions, GuardBucketHashInputs,
 };
 pub use header_hash_killshot::{
-    discharge_header_hash_reductions_native, prove_header_hash_killshot,
-    verify_header_hash_killshot, HeaderHashInputs, HeaderHashProofKillShot, HeaderHashReductions,
-    HEADER_HASH_FIELDS,
+    discharge_header_hash_reductions_native, discharge_header_hash_reductions_native_padded,
+    prove_header_hash_killshot, prove_header_hash_killshot_padded, verify_header_hash_killshot,
+    verify_header_hash_killshot_padded, HeaderHashInputs, HeaderHashProofKillShot,
+    HeaderHashReductions, HEADER_HASH_FIELDS,
+};
+pub use history_claim_killshot::{
+    discharge_history_claim_hash_reductions_native, prove_history_claim_hash_killshot,
+    verify_history_claim_hash_killshot, HistoryClaimHashInputs, HistoryClaimHashProofKillShot,
+    HistoryClaimHashReductions, HISTORY_CLAIM_FIELDS,
 };
 pub use layers::{evaluate_permutation, round_kind, PermLayerWitness, RoundKind};
 pub use merkle_batch_killshot::{

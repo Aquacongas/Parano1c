@@ -6,7 +6,7 @@
 //! # Architecture
 //!
 //! Blocks are pruned immediately after `apply_block`. Only the last
-//! FINALITY_DEPTH=18 blocks remain. There is NO historical block scan.
+//! Only the retained recent block window remains. There is NO historical block scan.
 //!
 //! The SegmentedFriState is kept FOREVER and is the source of truth for all UTXOs.
 //!

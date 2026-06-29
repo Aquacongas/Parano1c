@@ -81,16 +81,16 @@ pub struct GetRecentBlockResponse {
 // Public history proof
 // ---------------------------------------------------------------------------
 
-/// Request the current trustless public history proof.
+/// Request the current constant-size history proof envelope.
 ///
-/// Empty responses are accepted only by bootstrap profiles; public deployments
-/// must provide verifier-authorized proof bytes.
+/// A peer may return `None` while its finalized cache is not ready. Snapshot
+/// acceptance still depends on the local history-proof verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofResponse {
-    /// Serialized public `HistoryProof` bytes.
+    /// Serialized public `HistoryProof` envelope bytes.
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,

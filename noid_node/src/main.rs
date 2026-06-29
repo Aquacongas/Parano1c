@@ -1045,14 +1045,65 @@ fn verify_snapshot_history_proof_headers_anchored(
     }
 
     if proof_bytes.is_empty() {
-        return Ok(());
+        return Err("snapshot HistoryProof missing".into());
     }
-    Err("snapshot HistoryProof verifier is not implemented".into())
+    let proof: noid_recursive::HistoryProof = bincode::deserialize(proof_bytes)
+        .map_err(|e| format!("snapshot HistoryProof decode failed: {e}"))?;
+    if proof.end_anchor.height != manifest.tip_height {
+        return Err("snapshot HistoryProof tip height does not match manifest".into());
+    }
+
+    let local_start_anchor = compute_local_header_anchor(store, proof.start_anchor.height)?;
+    let local_end_anchor = compute_local_header_anchor(store, proof.end_anchor.height)?;
+    noid_recursive::verify_history_proof_untrusted(&proof, &local_start_anchor, &local_end_anchor)
+        .map_err(|e| format!("snapshot HistoryProof rejected: {e}"))
+}
+
+fn compute_local_header_anchor(
+    store: &noid_chain::storage::MdbxStore,
+    height: u64,
+) -> Result<noid_chain::HeaderChainAnchor, String> {
+    let mut headers = Vec::with_capacity(height.saturating_add(1) as usize);
+    for h in 0..=height {
+        let header = store
+            .get_header(h)
+            .map_err(|e| format!("snapshot header anchor read h={h} failed: {e}"))?
+            .ok_or_else(|| format!("snapshot header anchor missing h={h}"))?;
+        headers.push(header);
+    }
+    let chainwork = store
+        .get_chain_work(height)
+        .map_err(|e| format!("snapshot chainwork read h={height} failed: {e}"))?
+        .ok_or_else(|| format!("snapshot chainwork missing h={height}"))?;
+    noid_chain::compute_header_chain_anchor(headers.iter(), chainwork)
+        .map_err(|e| format!("snapshot header anchor compute failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
 // Blocking-I/O helpers
 // ---------------------------------------------------------------------------
+
+fn history_claim_fields_bytes(
+    block: &noid_chain::block::Block,
+    parent: &noid_chain::BlockHeader,
+    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
+) -> Result<Vec<u8>, noid_block::FullValidationError> {
+    let claim =
+        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
+            .map_err(noid_block::FullValidationError::from)?;
+    let fields = claim.fields().to_vec();
+    Ok(bincode::serialize(&fields).expect("history claim fields serialize"))
+}
+
+fn map_history_claim_error(
+    error: noid_block::FullValidationError,
+) -> noid_chain::storage::MdbxContextError {
+    noid_chain::storage::MdbxContextError::Consensus(
+        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+            "history claim derivation failed: {error}"
+        )),
+    )
+}
 
 /// Verify and apply a single P2P block off the tokio executor.
 ///
@@ -1070,6 +1121,21 @@ async fn apply_p2p_block_offthread(
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
         let block_height = block.header.height;
+        let mut history_claim_bytes = if block.transactions.iter().all(|tx| tx.body.is_coinbase) {
+            let parent = *ctx.tip_header();
+            let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
+                &block,
+                &parent,
+                &ctx.state,
+            )
+            .map_err(map_history_claim_error)?;
+            Some(
+                history_claim_fields_bytes(&block, &parent, &artifacts)
+                    .map_err(map_history_claim_error)?,
+            )
+        } else {
+            None
+        };
         let hash = ctx.apply_next_block(
             &block,
             &block_proof_bytes,
@@ -1085,7 +1151,7 @@ async fn apply_p2p_block_offthread(
              anchor,
              pre_state,
              state| {
-                noid_block::accept_block(
+                let output = noid_block::accept_block_with_artifacts(
                     block,
                     proof_bytes,
                     auth_sidecar_bytes,
@@ -1096,9 +1162,20 @@ async fn apply_p2p_block_offthread(
                     anchor,
                     pre_state,
                     state,
-                )
+                )?;
+                history_claim_bytes = Some(history_claim_fields_bytes(
+                    block,
+                    parent,
+                    &output.artifacts,
+                )?);
+                Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
             },
         )?;
+        if let Some(bytes) = &history_claim_bytes {
+            if let Err(e) = ctx.store.put_history_claim(block_height, bytes) {
+                tracing::warn!(height = block_height, err = %e, "failed to store history claim fields");
+            }
+        }
         if !block_proof_bytes.is_empty() {
             if let Err(e) = ctx.store.put_block_proof(block_height, &block_proof_bytes) {
                 tracing::warn!(height = block_height, err = %e, "failed to store P2P block proof bytes");
@@ -1173,6 +1250,20 @@ async fn apply_reorg_offthread(
                             ),
                         )
                     })?;
+                let mut history_claim_bytes =
+                    if block.transactions.iter().all(|tx| tx.body.is_coinbase) {
+                        let parent = *ctx.tip_header();
+                        let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
+                            block, &parent, &ctx.state,
+                        )
+                        .map_err(map_history_claim_error)?;
+                        Some(
+                            history_claim_fields_bytes(block, &parent, &artifacts)
+                                .map_err(map_history_claim_error)?,
+                        )
+                    } else {
+                        None
+                    };
                 ctx.apply_next_block(
                     block,
                     proof_bytes,
@@ -1188,7 +1279,7 @@ async fn apply_reorg_offthread(
                      anchor,
                      pre_state,
                      state| {
-                        noid_block::accept_block(
+                        let output = noid_block::accept_block_with_artifacts(
                             block,
                             proof_bytes,
                             auth_sidecar_bytes,
@@ -1199,9 +1290,24 @@ async fn apply_reorg_offthread(
                             anchor,
                             pre_state,
                             state,
-                        )
+                        )?;
+                        history_claim_bytes = Some(history_claim_fields_bytes(
+                            block,
+                            parent,
+                            &output.artifacts,
+                        )?);
+                        Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
                     },
                 )?;
+                if let Some(bytes) = &history_claim_bytes {
+                    if let Err(e) = ctx.store.put_history_claim(block.header.height, bytes) {
+                        tracing::warn!(
+                            height = block.header.height,
+                            err = %e,
+                            "failed to store reorg history claim fields"
+                        );
+                    }
+                }
                 Ok(())
             },
         );
@@ -1364,8 +1470,34 @@ mod tests {
             alloc_counter: h1.alloc_counter,
             ..Default::default()
         };
-        verify_snapshot_history_proof_headers_anchored(&manifest, &[], &store)
-            .expect("matching manifest boundary accepts");
+        assert!(
+            verify_snapshot_history_proof_headers_anchored(&manifest, &[], &store)
+                .expect_err("missing proof must reject")
+                .contains("HistoryProof missing")
+        );
+
+        let end_anchor =
+            noid_chain::compute_header_chain_anchor([h0, h1].iter(), h1_work).expect("anchor");
+        let start_accumulator = noid_recursive::ChainAccumulator {
+            height: end_anchor.height,
+            state_root: end_anchor.state_root,
+            chain_hash: [0x11; 32],
+        };
+        let native_proof = noid_recursive::prove_history_native(
+            end_anchor.clone(),
+            end_anchor,
+            start_accumulator,
+            &noid_recursive::HistoryProofWitness { items: vec![] },
+        )
+        .expect("native history proof");
+        let native_proof_bytes = bincode::serialize(&native_proof).expect("serialize proof");
+        assert!(verify_snapshot_history_proof_headers_anchored(
+            &manifest,
+            &native_proof_bytes,
+            &store,
+        )
+        .expect_err("native fold proof is not trustless")
+        .contains("not trustless"));
 
         let mut bad = manifest;
         bad.cumulative_chainwork = [3u8; 32];
@@ -1555,7 +1687,7 @@ async fn handle_p2p_events(
     //
     // Caps how many times we fetch further-back headers without finding a common
     // ancestor.  Each step covers 512 blocks, so 4 steps = 2048 blocks, well
-    // beyond CONSENSUS_FINALITY_DEPTH=18.  If the limit is hit we request a full state
+    // beyond CONSENSUS_FINALITY_DEPTH.  If the limit is hit we request a full state
     // snapshot instead (the designed deep-sync mechanism).
     let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
     const MAX_FETCH_DEPTH: u32 = 4;
@@ -3505,65 +3637,6 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 // Background local history cache updater
 // ---------------------------------------------------------------------------
 
-fn recursive_header_timestamp_window(
-    ctx: &MdbxChainContext,
-    block_height: u64,
-) -> Result<Vec<u64>, String> {
-    let parent_height = block_height
-        .checked_sub(1)
-        .ok_or_else(|| "genesis has no parent timestamp window".to_string())?;
-    let start =
-        parent_height.saturating_sub(noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64 - 1);
-    let mut values = Vec::new();
-    for h in start..=parent_height {
-        let header = ctx
-            .get_header_from_store(h)
-            .map_err(|e| format!("read header h={h}: {e}"))?
-            .ok_or_else(|| format!("missing header h={h}"))?;
-        values.push(header.timestamp);
-    }
-    Ok(values)
-}
-
-fn recursive_active_count_window(
-    ctx: &MdbxChainContext,
-    block_height: u64,
-) -> Result<Vec<u64>, String> {
-    let parent_height = block_height
-        .checked_sub(1)
-        .ok_or_else(|| "genesis has no active-count window".to_string())?;
-    let start = parent_height
-        .saturating_sub(noid_chain::consensus::params::EXPANSION_WINDOW.saturating_sub(1));
-    let mut values = Vec::new();
-    for h in start..=parent_height {
-        let header = ctx
-            .get_header_from_store(h)
-            .map_err(|e| format!("read header h={h}: {e}"))?
-            .ok_or_else(|| format!("missing header h={h}"))?;
-        values.push(header.active_slot_count);
-    }
-    Ok(values)
-}
-
-fn recursive_anchor_info(
-    ctx: &MdbxChainContext,
-    block_height: u64,
-) -> Result<noid_chain::consensus::AnchorInfo, String> {
-    let parent_height = block_height
-        .checked_sub(1)
-        .ok_or_else(|| "genesis has no ASERT anchor context".to_string())?;
-    let anchor_height = noid_chain::consensus::epoch_anchor_height(parent_height);
-    let anchor_header = ctx
-        .get_header_from_store(anchor_height)
-        .map_err(|e| format!("read ASERT anchor h={anchor_height}: {e}"))?
-        .ok_or_else(|| format!("missing ASERT anchor header h={anchor_height}"))?;
-    Ok(noid_chain::consensus::AnchorInfo {
-        anchor_height,
-        anchor_timestamp: anchor_header.timestamp,
-        anchor_target: anchor_header.difficulty_target,
-    })
-}
-
 /// Background local history cache updater.
 ///
 /// Advances the chain's local finalized-history cache one block at a time,
@@ -3574,20 +3647,18 @@ fn recursive_anchor_info(
 ///
 /// - Advances only for **finalised** blocks (>= CONSENSUS_FINALITY_DEPTH behind tip)
 ///   so reorgs never invalidate a stored proof.
-/// - Blocks with no real BlockProof (coinbase-only) use a null witness — the
-///   chain-hash accumulator still advances correctly.
+/// - Coinbase-only blocks emit a real accepted state-transition claim at
+///   acceptance time; the cache never uses an empty public claim.
 /// - Runs a tight loop when catching up; sleeps when at finality boundary.
 /// - Recursive proving runs in `spawn_blocking` so catch-up never blocks the async runtime.
 async fn run_history_proof_updater(
     chain: Arc<RwLock<MdbxChainContext>>,
     _p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
 ) {
-    use noid_block::{accepted_block_claim, BlockAuthSidecar, BlockProof};
-    use noid_chain::block::Block;
     use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use noid_recursive::{
-        accepted_block_claim_witness, advance_local_history_cache, init_genesis_history_cache,
-        verify_local_history_cache_step, LocalHistoryCache,
+        accepted_block_claim_witness_from_fields, advance_local_history_cache,
+        init_genesis_history_cache, verify_local_history_cache_step, LocalHistoryCache,
     };
     use std::time::Duration;
 
@@ -3687,39 +3758,16 @@ async fn run_history_proof_updater(
             continue;
         }
 
-        // --- Prove block at next_height ---
-        // Fetch the exact block body, parent/context, and retained witness bytes.
-        let (
-            header_opt,
-            parent_opt,
-            block_bytes_opt,
-            block_proof_bytes_opt,
-            block_auth_sidecar_bytes_opt,
-            prev_timestamps_res,
-            prev_active_counts_res,
-            anchor_res,
-        ) = {
+        // --- Fold finalized block at next_height ---
+        // The full 42-field history claim is emitted at block acceptance time.
+        // The updater only consumes that small sidecar plus the canonical header
+        // and exact chainwork already stored by native header validation.
+        let (header_opt, claim_bytes_opt, chainwork_opt) = {
             let ctx = chain.read().await;
             let hdr = ctx.store.get_header(next_height).ok().flatten();
-            let parent = next_height
-                .checked_sub(1)
-                .and_then(|h| ctx.store.get_header(h).ok().flatten());
-            let block_bytes = ctx.store.get_recent_block(next_height).ok().flatten();
-            let bp = ctx.store.get_block_proof(next_height).ok().flatten();
-            let sidecar = ctx.store.get_block_auth_sidecar(next_height).ok().flatten();
-            let prev_timestamps = recursive_header_timestamp_window(&ctx, next_height);
-            let prev_active_counts = recursive_active_count_window(&ctx, next_height);
-            let anchor = recursive_anchor_info(&ctx, next_height);
-            (
-                hdr,
-                parent,
-                block_bytes,
-                bp,
-                sidecar,
-                prev_timestamps,
-                prev_active_counts,
-                anchor,
-            )
+            let claim = ctx.store.get_history_claim(next_height).ok().flatten();
+            let chainwork = ctx.store.get_chain_work(next_height).ok().flatten();
+            (hdr, claim, chainwork)
         };
 
         let header = match header_opt {
@@ -3729,157 +3777,63 @@ async fn run_history_proof_updater(
                 continue;
             }
         };
-        let parent = match parent_opt {
-            Some(h) => h,
-            None => {
-                tracing::debug!(next_height, "no parent header available yet, waiting");
-                continue;
-            }
-        };
-        let block_bytes = match block_bytes_opt {
+        let claim_bytes = match claim_bytes_opt {
             Some(bytes) => bytes,
             None => {
-                tracing::debug!(next_height, "no retained block body available yet, waiting");
-                continue;
-            }
-        };
-        let block = match Block::from_bytes(&block_bytes) {
-            Ok(block) => block,
-            Err(e) => {
-                tracing::warn!(next_height, err = ?e, "retained block body decode failed");
-                continue;
-            }
-        };
-        if block.header != header {
-            tracing::warn!(
-                next_height,
-                "retained block body/header mismatch — local history cache waits"
-            );
-            continue;
-        }
-        let prev_timestamps = match prev_timestamps_res {
-            Ok(values) => values,
-            Err(e) => {
-                tracing::debug!(next_height, err = %e, "header timestamp context incomplete");
-                continue;
-            }
-        };
-        let prev_active_counts = match prev_active_counts_res {
-            Ok(values) => values,
-            Err(e) => {
-                tracing::debug!(next_height, err = %e, "active-count context incomplete");
-                continue;
-            }
-        };
-        let anchor = match anchor_res {
-            Ok(anchor) => anchor,
-            Err(e) => {
-                tracing::debug!(next_height, err = %e, "ASERT anchor context incomplete");
-                continue;
-            }
-        };
-
-        let user_txs = block
-            .transactions
-            .iter()
-            .filter(|tx| !tx.body.is_coinbase)
-            .count();
-        let proof = if user_txs == 0 {
-            if block_proof_bytes_opt
-                .as_ref()
-                .is_some_and(|bytes| !bytes.is_empty())
-                || block_auth_sidecar_bytes_opt
-                    .as_ref()
-                    .is_some_and(|bytes| !bytes.is_empty())
-            {
-                tracing::warn!(
+                tracing::debug!(
                     next_height,
-                    "coinbase-only block has retained witness bytes — local history cache waits"
+                    "no retained history claim available yet, waiting"
                 );
                 continue;
             }
-            None
-        } else {
-            let Some(bytes) = block_proof_bytes_opt
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-            else {
-                tracing::debug!(next_height, "missing retained BlockProof bytes");
+        };
+        let claim_fields = match bincode::deserialize::<Vec<noid_core::Block128>>(&claim_bytes)
+            .ok()
+            .and_then(|fields| fields.try_into().ok())
+        {
+            Some(fields) => fields,
+            None => {
+                tracing::warn!(next_height, "history claim decode failed");
                 continue;
-            };
-            match bincode::deserialize::<BlockProof>(bytes) {
-                Ok(proof) => Some(proof),
-                Err(e) => {
-                    tracing::warn!(
-                        next_height,
-                        err = ?e,
-                        "block proof decode failed — local history cache waits"
-                    );
-                    continue;
-                }
             }
         };
-        let auth_sidecar = if user_txs == 0 {
-            BlockAuthSidecar::default()
-        } else {
-            let Some(bytes) = block_auth_sidecar_bytes_opt
-                .as_ref()
-                .filter(|bytes| !bytes.is_empty())
-            else {
-                tracing::debug!(next_height, "missing retained BlockAuthSidecar bytes");
+        let cumulative_chainwork = match chainwork_opt {
+            Some(chainwork) => chainwork,
+            None => {
+                tracing::debug!(next_height, "no chainwork available yet, waiting");
                 continue;
-            };
-            match bincode::deserialize::<BlockAuthSidecar>(bytes) {
-                Ok(sidecar) => sidecar,
-                Err(e) => {
-                    tracing::warn!(
-                        next_height,
-                        err = ?e,
-                        "auth sidecar decode failed — local history cache waits"
-                    );
-                    continue;
-                }
             }
         };
-        let chain_claim = match accepted_block_claim(
-            &block,
-            &parent,
-            &prev_timestamps,
-            &prev_active_counts,
-            &anchor,
-            proof.as_ref(),
-            &auth_sidecar,
-        ) {
-            Ok(claim) => claim,
+        let witness = match accepted_block_claim_witness_from_fields(claim_fields) {
+            Ok(witness) => witness,
             Err(e) => {
                 tracing::warn!(
                     next_height,
                     err = ?e,
-                    "accepted-block claim construction failed — local history cache waits"
+                    "history claim witness construction failed — local history cache waits"
                 );
                 continue;
             }
         };
-        let witness = accepted_block_claim_witness(chain_claim);
 
-        // prev_acc comes from the last cached block's accumulator.
         // safe: we only reach here when next_height > 0 and local_cache_opt is Some.
-        let prev_acc = local_cache_opt.as_ref().unwrap().acc.clone();
-        // Move local_cache_opt into the closure — LocalHistoryCache is not Clone.
-        // prev_acc is already extracted above (ChainAccumulator: Clone).
+        let Some(prev_cache) = local_cache_opt else {
+            tracing::debug!(next_height, "missing previous local history cache");
+            continue;
+        };
 
         let header_for_verify = header;
-        let prev_state_root_for_verify = prev_acc.state_root;
+        let prev_state_root_for_verify = prev_cache.acc.state_root;
 
         tracing::debug!(next_height, "local history cache: folding step");
         let prove_started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
-            advance_local_history_cache(&witness, &header, &prev_acc, local_cache_opt.as_ref())
+            advance_local_history_cache(&prev_cache, &witness, &header, cumulative_chainwork)
         })
         .await;
 
         match result {
-            Ok(new_cache) => {
+            Ok(Ok(new_cache)) => {
                 let h = new_cache.block_height;
                 if let Err(e) = verify_local_history_cache_step(
                     &new_cache,
@@ -3907,6 +3861,13 @@ async fn run_history_proof_updater(
                         "failed to store local history cache at height {h}"
                     );
                 }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    next_height,
+                    err = ?e,
+                    "local history cache rejected finalized step"
+                );
             }
             Err(e) => {
                 tracing::error!(
