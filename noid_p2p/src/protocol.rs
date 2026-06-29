@@ -118,6 +118,8 @@ pub struct GetStateManifestResponse {
     /// Tip height at snapshot time.  0 = "use block sync instead".
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
+    /// Exact cumulative chainwork at `tip_height`, as validated with headers.
+    pub cumulative_chainwork: [u8; 32],
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,

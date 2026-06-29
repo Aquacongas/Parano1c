@@ -76,6 +76,10 @@ pub const TAG_RGDBUCK: DomainTag = DomainTag::new(b"RGDBUCK_");
 pub const TAG_RGDNODE: DomainTag = DomainTag::new(b"RGDNODE_");
 /// Accepted-block claim field transcript for recursive chain accumulation.
 pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
+/// Header projection item for public history anchoring.
+pub const TAG_HDRPROJ: DomainTag = DomainTag::new(b"HDRPROJ_");
+/// Rolling header-chain anchor over canonical header projections.
+pub const TAG_HDRANCH: DomainTag = DomainTag::new(b"HDRANCH_");
 /// Variable-length byte hashing with an explicit absorbed domain string.
 pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
 
@@ -106,6 +110,8 @@ mod tests {
             TAG_RGDBUCK,
             TAG_RGDNODE,
             TAG_ACCBLK,
+            TAG_HDRPROJ,
+            TAG_HDRANCH,
             TAG_BYTEHASH,
         ];
         for i in 0..tags.len() {

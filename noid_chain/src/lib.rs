@@ -21,6 +21,7 @@ pub mod checkpoint;
 pub mod consensus;
 pub mod exact_state_hash;
 pub mod fri_state;
+pub mod header_anchor;
 pub mod mempool;
 pub mod reuse_guard;
 pub mod segmented_state;
@@ -67,6 +68,10 @@ pub use block::{
     validate_block_proof_binding, Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS,
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
+pub use header_anchor::{
+    compute_header_chain_anchor, extend_header_projection_root, header_projection_digest,
+    HeaderChainAnchor, HeaderChainAnchorError,
+};
 
 // ---------------------------------------------------------------------------
 // Checkpoint packages

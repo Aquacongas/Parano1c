@@ -1439,9 +1439,30 @@ async fn handle_swarm_event(
                         }
                     }
 
-                    if !headers_ok || !segments_ok {
+                    let cumulative_chainwork = match ctx.store.get_chain_work(our_height) {
+                        Ok(Some(work)) => Some(work),
+                        Ok(None) => {
+                            tracing::warn!(
+                                height = our_height,
+                                "state manifest build failed: missing chainwork"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                height = our_height,
+                                err = %e,
+                                "state manifest build failed: chainwork read"
+                            );
+                            None
+                        }
+                    };
+
+                    if !headers_ok || !segments_ok || cumulative_chainwork.is_none() {
                         (GetStateManifestResponse::default(), None)
                     } else {
+                        let cumulative_chainwork =
+                            cumulative_chainwork.expect("checked cumulative_chainwork");
                         tracing::info!(
                             requester_height = request.requester_height,
                             our_height,
@@ -1452,6 +1473,7 @@ async fn handle_swarm_event(
                         let response = GetStateManifestResponse {
                             tip_height: our_height,
                             tip_hash,
+                            cumulative_chainwork,
                             log_slots: tip_header.log_slots,
                             active_slot_count: tip_header.active_slot_count,
                             alloc_counter: tip_header.alloc_counter,

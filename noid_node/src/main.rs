@@ -1009,10 +1009,41 @@ fn persist_snapshot_header_batch(
 }
 
 fn verify_snapshot_history_proof_headers_anchored(
-    _manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
     proof_bytes: &[u8],
-    _store: &noid_chain::storage::MdbxStore,
+    store: &noid_chain::storage::MdbxStore,
 ) -> Result<(), String> {
+    if manifest.tip_height == 0 {
+        return Err("snapshot manifest has no tip".into());
+    }
+
+    let tip_header = store
+        .get_header(manifest.tip_height)
+        .map_err(|e| format!("snapshot header anchor read failed: {e}"))?
+        .ok_or_else(|| format!("snapshot header anchor missing h={}", manifest.tip_height))?;
+    let tip_hash = noid_chain::hash_block_header(&tip_header);
+    if tip_hash != manifest.tip_hash {
+        return Err("snapshot manifest tip hash does not match local canonical header".into());
+    }
+    if tip_header.log_slots != manifest.log_slots {
+        return Err("snapshot manifest log_slots does not match local canonical header".into());
+    }
+    if tip_header.active_slot_count != manifest.active_slot_count {
+        return Err(
+            "snapshot manifest active_slot_count does not match local canonical header".into(),
+        );
+    }
+    if tip_header.alloc_counter != manifest.alloc_counter {
+        return Err("snapshot manifest alloc_counter does not match local canonical header".into());
+    }
+    let local_chainwork = store
+        .get_chain_work(manifest.tip_height)
+        .map_err(|e| format!("snapshot chainwork read failed: {e}"))?
+        .ok_or_else(|| format!("snapshot chainwork missing h={}", manifest.tip_height))?;
+    if local_chainwork != manifest.cumulative_chainwork {
+        return Err("snapshot manifest chainwork does not match local canonical headers".into());
+    }
+
     if proof_bytes.is_empty() {
         return Ok(());
     }
@@ -1257,6 +1288,8 @@ fn validate_p2p_block_proof_binding(
 
 #[cfg(test)]
 mod tests {
+    use super::{compare_manifest_fork_choice, verify_snapshot_history_proof_headers_anchored};
+
     fn minimal_current_block_proof() -> noid_block::BlockProof {
         noid_block::BlockProof::minimal(
             [0u8; 32],
@@ -1290,6 +1323,87 @@ mod tests {
         let decoded: noid_block::BlockProof =
             bincode::deserialize(&loaded).expect("deserialize current BlockProof format");
         assert_eq!(decoded.meta.n_tx, 0);
+    }
+
+    #[test]
+    fn snapshot_history_boundary_checks_local_header_chainwork() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = noid_chain::storage::MdbxStore::open(dir.path()).expect("open store");
+
+        let h0 = noid_chain::consensus::genesis::genesis_header();
+        let h0_hash = noid_chain::hash_block_header(&h0);
+        store
+            .put_verified_header_only(&h0, &h0_hash, &[1u8; 32])
+            .expect("store genesis header");
+
+        let h1 = noid_chain::BlockHeader {
+            prev_block_hash: h0_hash,
+            state_root: [2u8; 32],
+            tx_root: [3u8; 32],
+            timestamp: h0.timestamp + 15,
+            height: 1,
+            miner_address: h0.miner_address,
+            nonce: 1,
+            difficulty_target: h0.difficulty_target,
+            log_slots: h0.log_slots,
+            active_slot_count: 1,
+            alloc_counter: 1,
+        };
+        let h1_hash = noid_chain::hash_block_header(&h1);
+        let h1_work = [2u8; 32];
+        store
+            .put_verified_header_only(&h1, &h1_hash, &h1_work)
+            .expect("store h1 header");
+
+        let manifest = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 1,
+            tip_hash: h1_hash,
+            cumulative_chainwork: h1_work,
+            log_slots: h1.log_slots,
+            active_slot_count: h1.active_slot_count,
+            alloc_counter: h1.alloc_counter,
+            ..Default::default()
+        };
+        verify_snapshot_history_proof_headers_anchored(&manifest, &[], &store)
+            .expect("matching manifest boundary accepts");
+
+        let mut bad = manifest;
+        bad.cumulative_chainwork = [3u8; 32];
+        assert!(
+            verify_snapshot_history_proof_headers_anchored(&bad, &[], &store)
+                .expect_err("bad chainwork must reject")
+                .contains("chainwork")
+        );
+    }
+
+    #[test]
+    fn manifest_fork_choice_prefers_chainwork_then_height() {
+        let mut low_work_high_height = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 100,
+            ..Default::default()
+        };
+        low_work_high_height.cumulative_chainwork[0] = 5;
+
+        let mut high_work_low_height = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 99,
+            ..Default::default()
+        };
+        high_work_low_height.cumulative_chainwork[0] = 6;
+
+        assert_eq!(
+            compare_manifest_fork_choice(&high_work_low_height, &low_work_high_height),
+            std::cmp::Ordering::Greater
+        );
+
+        let equal_work_higher_height = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 101,
+            cumulative_chainwork: high_work_low_height.cumulative_chainwork,
+            ..Default::default()
+        };
+        assert_eq!(
+            compare_manifest_fork_choice(&equal_work_higher_height, &high_work_low_height),
+            std::cmp::Ordering::Greater
+        );
     }
 }
 
@@ -2621,7 +2735,7 @@ async fn handle_p2p_events(
                     if should_proceed {
                         let (best_peer, best_manifest) = manifest_candidates
                             .drain(..)
-                            .max_by_key(|(_, m)| m.tip_height)
+                            .max_by(|(_, a), (_, b)| compare_manifest_fork_choice(a, b))
                             .expect("manifest_candidates is non-empty");
                         tracing::info!(
                             from = %best_peer,
@@ -3213,7 +3327,7 @@ async fn handle_p2p_events(
                 if timed_out {
                     let (best_peer, best_manifest) = manifest_candidates
                         .drain(..)
-                        .max_by_key(|(_, m)| m.tip_height)
+                        .max_by(|(_, a), (_, b)| compare_manifest_fork_choice(a, b))
                         .expect("manifest_candidates is non-empty");
                     tracing::info!(
                         from = %best_peer,
@@ -3238,6 +3352,19 @@ async fn handle_p2p_events(
 // ---------------------------------------------------------------------------
 // Orphan pool helper
 // ---------------------------------------------------------------------------
+
+fn compare_manifest_fork_choice(
+    a: &noid_p2p::protocol::GetStateManifestResponse,
+    b: &noid_p2p::protocol::GetStateManifestResponse,
+) -> std::cmp::Ordering {
+    if noid_chain::work_gt(&a.cumulative_chainwork, &b.cumulative_chainwork) {
+        return std::cmp::Ordering::Greater;
+    }
+    if noid_chain::work_gt(&b.cumulative_chainwork, &a.cumulative_chainwork) {
+        return std::cmp::Ordering::Less;
+    }
+    a.tip_height.cmp(&b.tip_height)
+}
 
 /// Insert a block into the orphan pool, evicting the lowest-height entry when
 /// the pool is over count or retained-byte capacity.
