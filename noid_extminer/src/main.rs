@@ -78,7 +78,7 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
 
-    /// Your own payout address (bech32m noid1...).
+    /// Your own payout address (bech32m o1...).
     /// Only works when the node is started with --allow-custom-coinbase.
     /// Leave empty to use the node's configured payout address (pool mode).
     #[arg(long, value_name = "ADDRESS", default_value = "")]

@@ -169,7 +169,7 @@ enum Command {
     /// All UTXOs owned by an address (bech32m).
     #[command(name = "utxos-of")]
     UtxosOf {
-        /// Owner address (bech32m noid1…).
+        /// Owner address (bech32m o1…).
         #[arg(value_name = "ADDRESS")]
         address: String,
     },
@@ -488,7 +488,7 @@ fn print_error(msg: &str) {
         || msg.contains("invalid address")
         || msg.contains("WrongHrp")
     {
-        "Invalid address.\nUse a bech32m address (noid1…).\nExample: noid-cli send noid1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
+        "Invalid address.\nUse a bech32m address (o1…).\nExample: noid-cli send o1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
     } else {
         msg.to_string()
     };
@@ -1487,13 +1487,13 @@ async fn cmd_send(
     // Actual parsing/validation happens in the daemon; we just do a basic
     // sanity check to catch obvious typos before sending to RPC.
     let to_clean = to.trim();
-    let looks_like_bech32 = to_clean.to_ascii_lowercase().starts_with("noid1");
+    let looks_like_bech32 = to_clean.to_ascii_lowercase().starts_with("o1");
     if !looks_like_bech32 {
         bail!(
             "Invalid address format.\n\
-             \tExpected: bech32m address (noid1…)\n\
+             \tExpected: bech32m address (o1…)\n\
              \tGot:      {:?}\n\
-             \tExample:  noid1q9gnyj0z…",
+             \tExample:  o1q9gnyj0z…",
             &to_clean[..to_clean.len().min(30)]
         );
     }

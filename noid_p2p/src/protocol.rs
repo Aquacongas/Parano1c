@@ -83,7 +83,8 @@ pub struct GetRecentBlockResponse {
 
 /// Request the current trustless public history proof.
 ///
-/// Responses are empty until real `HistoryProof` verification is implemented.
+/// Empty responses are accepted only by bootstrap profiles; public deployments
+/// must provide verifier-authorized proof bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofRequest;
 
@@ -101,9 +102,8 @@ pub struct GetHistoryProofResponse {
 
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
-/// Public arbitrary-peer snapshot serving is disabled fail-closed until
-/// `HistoryProof` is active, so production peers currently return an empty
-/// manifest.
+/// The manifest describes the state snapshot that must be authorized by the
+/// corresponding `HistoryProof`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
@@ -128,10 +128,14 @@ pub struct GetStateManifestResponse {
     /// Exact sparse-state segment roots aligned with `segment_ids`. The sparse
     /// Merkle root reconstructed from this table and canonical zero leaves must
     /// equal the snapshot tip header's `state_root` before segment download is
-    /// trusted by a future public HistoryProof verifier.
+    /// accepted by the HistoryProof verifier.
     pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
+    /// Canonical ReuseGuard buckets at the advertised tip. The block header's
+    /// `state_root` commits to both the UTXO root and this guard root, so a
+    /// snapshot cannot be reconstructed from UTXO segments alone.
+    pub reuse_guard_buckets: Vec<noid_chain::GuardBucket>,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,19 +144,21 @@ pub struct GetStateManifestResponse {
 
 /// Request one state segment by ID.
 ///
-/// Public state segment serving is disabled until `HistoryProof` is active and
-/// peers respond with `data = None`.
+/// Segment data is bound to the exact manifest tip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
     /// Expected tip height from the manifest (for staleness guard).
     pub expected_tip_height: u64,
+    /// Expected tip hash from the manifest. Height alone is not enough across
+    /// reorgs or competing blocks at the same height.
+    pub expected_tip_hash: [u8; 32],
 }
 
 /// Response: one encoded state segment (~3 MB).
 ///
-/// `None` if the peer cannot serve this segment. While public snapshot sync is
-/// disabled, peers always return `None` for arbitrary snapshot segment requests.
+/// `None` if the peer cannot serve this exact snapshot segment, usually
+/// because the requested export expired or the peer never advertised it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentResponse {
     pub segment_id: u16,

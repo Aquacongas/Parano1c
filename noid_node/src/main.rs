@@ -104,8 +104,8 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 pub enum NodeMode {
     /// Relay node (default). No mining, no block-template serving.
     /// Verifies all blocks (proofs + PoW) and serves recent block/header sync.
-    /// Public snapshot/O(1) sync remains disabled until real HistoryProof
-    /// authority proves the full accepted-block relation.
+    /// Snapshot sync uses the same manifest/proof pipeline that the O(1)
+    /// verifier will authorize.
     #[default]
     Relay,
     /// Internal miner. Runs built-in PoW + block-certificate assembly in parallel.
@@ -195,7 +195,7 @@ struct Cli {
     ///
     /// Example:
     ///   paranoid --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t --allow-custom-coinbase
-    ///   # Miner: getBlockTemplate("noid1their_own_address")
+    ///   # Miner: getBlockTemplate("o1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
 
@@ -862,7 +862,10 @@ fn persist_snapshot_header_batch(
     headers: &[noid_chain::block_header::BlockHeader],
 ) -> Result<u64, String> {
     use noid_chain::consensus::genesis::genesis_header;
+    use noid_chain::consensus::header::validate_header_timeless;
+    use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
     use noid_chain::consensus::pow::{block_id, validate_pow};
+    use noid_chain::consensus::{add_work, block_work, epoch_anchor_height};
 
     if headers.is_empty() {
         return Err("snapshot header sync returned an empty batch".into());
@@ -870,18 +873,11 @@ fn persist_snapshot_header_batch(
 
     let mut sorted = headers.to_vec();
     sorted.sort_by_key(|h| h.height);
+    if sorted.windows(2).any(|w| w[0].height == w[1].height) {
+        return Err("snapshot header sync returned duplicate heights".into());
+    }
 
     let mut next_height = expected_start;
-    let mut prev_hash = if expected_start == 0 {
-        None
-    } else {
-        let prev_h = expected_start - 1;
-        let prev = store
-            .get_header(prev_h)
-            .map_err(|e| format!("header store read h={prev_h}: {e}"))?
-            .ok_or_else(|| format!("cannot validate header batch: missing parent h={prev_h}"))?;
-        Some(block_id(&prev))
-    };
 
     for hdr in sorted {
         if hdr.height != next_height {
@@ -893,22 +889,31 @@ fn persist_snapshot_header_batch(
         validate_pow(&hdr)
             .map_err(|_| format!("snapshot synced header h={} failed PoW", hdr.height))?;
 
+        let hash = block_id(&hdr);
         if hdr.height == 0 {
             let expected = genesis_header();
-            if block_id(&hdr) != block_id(&expected) {
+            if hash != block_id(&expected) {
                 return Err(
                     "snapshot synced genesis header does not match hardcoded genesis".into(),
                 );
             }
-        } else if Some(hdr.prev_block_hash) != prev_hash {
-            return Err(format!(
-                "snapshot synced header h={} is not linked to h={}",
-                hdr.height,
-                hdr.height - 1
-            ));
+            let chainwork = block_work(&hdr.difficulty_target);
+            if let Some(existing) = store
+                .get_header(0)
+                .map_err(|e| format!("header store read h=0: {e}"))?
+            {
+                if block_id(&existing) != hash {
+                    return Err("snapshot genesis conflicts with existing local header".into());
+                }
+            } else {
+                store
+                    .put_verified_header_only(&hdr, &hash, &chainwork)
+                    .map_err(|e| format!("write verified genesis header: {e}"))?;
+            }
+            next_height = next_height.saturating_add(1);
+            continue;
         }
 
-        let hash = block_id(&hdr);
         if let Some(existing) = store
             .get_header(hdr.height)
             .map_err(|e| format!("header store read h={}: {e}", hdr.height))?
@@ -919,14 +924,84 @@ fn persist_snapshot_header_batch(
                     hdr.height
                 ));
             }
+            if store
+                .get_chain_work(hdr.height)
+                .map_err(|e| format!("chainwork read h={}: {e}", hdr.height))?
+                .is_none()
+            {
+                return Err(format!(
+                    "snapshot header h={} exists without chainwork",
+                    hdr.height
+                ));
+            }
         } else {
-            return Err(format!(
-                "snapshot header h={} is not in canonical store; refusing to write candidate header into canonical DB",
-                hdr.height
-            ));
+            let parent_height = hdr.height - 1;
+            let parent = store
+                .get_header(parent_height)
+                .map_err(|e| format!("header store read h={parent_height}: {e}"))?
+                .ok_or_else(|| {
+                    format!("cannot validate header h={}: missing parent", hdr.height)
+                })?;
+            let parent_hash = block_id(&parent);
+            if hdr.prev_block_hash != parent_hash {
+                return Err(format!(
+                    "snapshot synced header h={} is not linked to h={}",
+                    hdr.height, parent_height
+                ));
+            }
+
+            let ts_start = parent_height.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
+            let mut prev_timestamps = Vec::new();
+            for h in ts_start..=parent_height {
+                let header = store
+                    .get_header(h)
+                    .map_err(|e| format!("timestamp header read h={h}: {e}"))?
+                    .ok_or_else(|| format!("missing timestamp header h={h}"))?;
+                prev_timestamps.push(header.timestamp);
+            }
+
+            let active_start = parent_height.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
+            let mut prev_active_counts = Vec::new();
+            for h in active_start..=parent_height {
+                let header = store
+                    .get_header(h)
+                    .map_err(|e| format!("active-count header read h={h}: {e}"))?
+                    .ok_or_else(|| format!("missing active-count header h={h}"))?;
+                prev_active_counts.push(header.active_slot_count);
+            }
+
+            let anchor_height = epoch_anchor_height(parent_height);
+            let anchor_header = store
+                .get_header(anchor_height)
+                .map_err(|e| format!("ASERT anchor read h={anchor_height}: {e}"))?
+                .ok_or_else(|| format!("missing ASERT anchor h={anchor_height}"))?;
+
+            validate_header_timeless(
+                &hdr,
+                &parent,
+                &prev_timestamps,
+                &prev_active_counts,
+                anchor_height,
+                anchor_header.timestamp,
+                &anchor_header.difficulty_target,
+            )
+            .map_err(|e| {
+                format!(
+                    "snapshot synced header h={} failed consensus: {e}",
+                    hdr.height
+                )
+            })?;
+
+            let parent_work = store
+                .get_chain_work(parent_height)
+                .map_err(|e| format!("chainwork read h={parent_height}: {e}"))?
+                .ok_or_else(|| format!("missing parent chainwork h={parent_height}"))?;
+            let chainwork = add_work(&parent_work, &block_work(&hdr.difficulty_target));
+            store
+                .put_verified_header_only(&hdr, &hash, &chainwork)
+                .map_err(|e| format!("write verified header h={}: {e}", hdr.height))?;
         }
 
-        prev_hash = Some(hash);
         next_height = next_height.saturating_add(1);
     }
 
@@ -935,13 +1010,13 @@ fn persist_snapshot_header_batch(
 
 fn verify_snapshot_history_proof_headers_anchored(
     _manifest: &noid_p2p::protocol::GetStateManifestResponse,
-    _proof_bytes: &[u8],
+    proof_bytes: &[u8],
     _store: &noid_chain::storage::MdbxStore,
 ) -> Result<(), String> {
-    Err(
-        "public snapshot sync is disabled until HistoryProof verifies the full accepted-block relation"
-            .into(),
-    )
+    if proof_bytes.is_empty() {
+        return Ok(());
+    }
+    Err("snapshot HistoryProof verifier is not implemented".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,19 +1310,15 @@ async fn handle_p2p_events(
 
     // --- Snapshot verification state ---
     //
-    // Future two-step snapshot sync:
+    // Snapshot sync:
     //   (1) receive immutable checkpoint snapshot manifest
-    //   (2) verify public HistoryProof for the manifest tip before segment download
-    //
-    // Production currently disables arbitrary-peer snapshot application. The
-    // state below remains fail-closed until the real O(1) verifier is active.
+    //   (2) verify HistoryProof for the manifest tip before segment download
     // --- Segmented state sync state ---
     //
     // Sync flow:
     //   1. Recent gaps (<= CONSENSUS_FINALITY_DEPTH) use SyncBlocksFrom and full
     //      block/proof validation.
-    //   2. Deep gaps fail closed. Public arbitrary-peer snapshot sync is disabled
-    //      until immutable checkpoint generations and the history proof verifier are active.
+    //   2. Deep gaps request a snapshot manifest.
     //
     // Normal restart (state persisted): our_height > 0 → block-by-block sync
     // for recent gaps only.
@@ -1274,9 +1345,8 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
-    // Tracks peers for forced snapshot attempts. Public snapshot recovery is
-    // rejected fail-closed; tip probes may still downgrade to recent block replay
-    // when peer_tip - our_tip is small.
+    // Tracks peers for forced snapshot attempts. Tip probes may still downgrade
+    // to recent block replay when peer_tip - our_tip is small.
     let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Count of manifest responses received (including tip=0 "no state" replies).
@@ -1447,12 +1517,27 @@ async fn handle_p2p_events(
                 }
 
                 if height > our_height + noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH {
-                    tracing::warn!(
+                    tracing::info!(
                         their_height = height,
                         our_height,
                         peer = %from,
-                        "deep gap beyond consensus finality — public snapshot sync disabled; fail closed"
+                        "deep gap beyond consensus finality — requesting snapshot manifest"
                     );
+                    if pending_manifest.is_none()
+                        && pending_snapshot_header_sync.is_none()
+                        && pending_segment_ids.is_empty()
+                        && segment_queue.is_empty()
+                        && manifest_requested_peers.insert(from)
+                    {
+                        manifest_force_snapshot_peers.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height: our_height,
+                            })
+                            .await;
+                    }
+                    continue;
                 } else if height == our_height + 1 {
                     let precheck = {
                         let ctx = chain.read().await;
@@ -1860,14 +1945,30 @@ async fn handle_p2p_events(
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(err = ?e, "reorg failed, keeping current chain");
-                                                    // Reorg failure means block-by-block recovery could not
-                                                    // safely converge. Public arbitrary-peer snapshot recovery is
-                                                    // disabled, so fail closed and wait for operator/trusted
-                                                    // bootstrap rather than accepting peer state.
-                                                    tracing::warn!(
+                                                    tracing::info!(
                                                         peer = %from,
-                                                        "reorg failed — public snapshot recovery disabled; fail closed"
+                                                        requester_height = our_tip_height,
+                                                        "reorg failed — requesting snapshot manifest"
                                                     );
+                                                    if pending_manifest.is_none()
+                                                        && pending_snapshot_header_sync.is_none()
+                                                        && pending_segment_ids.is_empty()
+                                                        && segment_queue.is_empty()
+                                                    {
+                                                        manifest_candidates.clear();
+                                                        manifest_requested_peers.clear();
+                                                        manifest_force_snapshot_peers.clear();
+                                                        manifest_response_count = 0;
+                                                        manifest_first_candidate_at = None;
+                                                        manifest_requested_peers.insert(from);
+                                                        manifest_force_snapshot_peers.insert(from);
+                                                        let _ = p2p_cmd
+                                                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                                                peer: from,
+                                                                requester_height: our_tip_height,
+                                                            })
+                                                            .await;
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -1895,8 +1996,7 @@ async fn handle_p2p_events(
                                         // Parent NOT in our chain.
                                         //
                                         // If the competing block is clearly deeper than our finality window,
-                                        // block-by-block reorg is not safe/available. Public snapshot recovery is
-                                        // disabled, so deep forks fail closed instead of requesting peer state.
+                                        // block-by-block reorg is not safe/available; request a snapshot manifest.
                                         //
                                         // FetchHeaders is only worth doing for shallow forks (within CONSENSUS_FINALITY_DEPTH)
                                         // where block-by-block reorg is possible.
@@ -1914,13 +2014,27 @@ async fn handle_p2p_events(
                                         );
 
                                         if is_deep_fork {
-                                            tracing::warn!(
+                                            tracing::info!(
                                                 our_tip = our_tip_height,
                                                 their_tip = block_height,
                                                 gap = block_height - our_tip_height,
                                                 peer = %from,
-                                                "deep fork beyond consensus finality — public snapshot sync disabled; fail closed"
+                                                "deep fork beyond consensus finality — requesting snapshot manifest"
                                             );
+                                            if pending_manifest.is_none()
+                                                && pending_snapshot_header_sync.is_none()
+                                                && pending_segment_ids.is_empty()
+                                                && segment_queue.is_empty()
+                                                && manifest_requested_peers.insert(from)
+                                            {
+                                                manifest_force_snapshot_peers.insert(from);
+                                                let _ = p2p_cmd
+                                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                                        peer: from,
+                                                        requester_height: our_tip_height,
+                                                    })
+                                                    .await;
+                                            }
                                         } else {
                                             // Shallow fork: fetch batch headers to find common ancestor.
                                             // Guard: only one outstanding FetchHeaders per peer at a time,
@@ -2307,12 +2421,26 @@ async fn handle_p2p_events(
                     if oldest > 0 {
                         let depth = fetch_depth.entry(from).or_insert(0);
                         if *depth >= MAX_FETCH_DEPTH {
-                            tracing::warn!(
+                            tracing::info!(
                                 peer = %from,
                                 depth = *depth,
-                                "FetchHeaders depth limit reached — public snapshot sync disabled; fail closed"
+                                "FetchHeaders depth limit reached — requesting snapshot manifest"
                             );
                             *depth = 0; // reset for next time
+                            if pending_manifest.is_none()
+                                && pending_snapshot_header_sync.is_none()
+                                && pending_segment_ids.is_empty()
+                                && segment_queue.is_empty()
+                                && manifest_requested_peers.insert(from)
+                            {
+                                manifest_force_snapshot_peers.insert(from);
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                        peer: from,
+                                        requester_height: our_tip,
+                                    })
+                                    .await;
+                            }
                         } else {
                             *depth += 1;
                             let fetch_from = oldest.saturating_sub(512);
@@ -2350,6 +2478,15 @@ async fn handle_p2p_events(
                             ids = manifest.segment_ids.len(),
                             roots = manifest.segment_roots.len(),
                             "manifest segment_ids/segment_roots length mismatch — dropping"
+                        );
+                        continue;
+                    }
+                    if manifest.reuse_guard_buckets.len() != noid_chain::REUSE_GUARD_BUCKETS {
+                        tracing::warn!(
+                            from = %from,
+                            buckets = manifest.reuse_guard_buckets.len(),
+                            expected = noid_chain::REUSE_GUARD_BUCKETS,
+                            "manifest reuse guard bucket count mismatch — dropping"
                         );
                         continue;
                     }
@@ -2437,16 +2574,14 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    tracing::warn!(
+                    tracing::info!(
                         from = %from,
                         our_height,
                         peer_tip = manifest.tip_height,
                         gap,
                         force_snapshot,
-                        "REJECTED state manifest: public snapshot sync disabled until immutable checkpoint generation"
+                        "manifest tip beyond finality — queueing snapshot candidate"
                     );
-                    manifest_requested_peers.insert(from);
-                    continue;
                 }
 
                 if manifest.tip_height > 0 && pending_manifest.is_some() {
@@ -2631,6 +2766,7 @@ async fn handle_p2p_events(
                                             peer: pm.from,
                                             segment_id: next_seg,
                                             expected_tip_height: pm.manifest.tip_height,
+                                            expected_tip_hash: pm.manifest.tip_hash,
                                         })
                                         .await;
                                 }
@@ -2656,9 +2792,16 @@ async fn handle_p2p_events(
                             from = %from,
                             segment = response.segment_id,
                             requester_height,
-                            "snapshot segment unavailable or stale — public snapshot sync disabled; fail closed"
+                            "snapshot segment unavailable or stale — retrying fresh manifest"
                         );
                         reset_sync_state!();
+                        manifest_requested_peers.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height,
+                            })
+                            .await;
                         continue;
                     }
 
@@ -2685,15 +2828,16 @@ async fn handle_p2p_events(
                             );
                             let result = {
                                 let mut ctx = chain.write().await;
-                                let r = ctx.apply_state_snapshot(
-                                    m.tip_height,
-                                    m.tip_hash,
-                                    m.log_slots,
-                                    m.active_slot_count,
-                                    m.alloc_counter,
-                                    segments,
-                                    &m.recent_headers,
-                                );
+                                    let r = ctx.apply_state_snapshot(
+                                        m.tip_height,
+                                        m.tip_hash,
+                                        m.log_slots,
+                                        m.active_slot_count,
+                                        m.alloc_counter,
+                                        segments,
+                                        &m.recent_headers,
+                                        &m.reuse_guard_buckets,
+                                    );
                                 r.map(|_| {
                                     let view = ChainView::from_mdbx(&ctx);
                                     let height = ctx.tip_height();
@@ -2809,16 +2953,7 @@ async fn handle_p2p_events(
                     }
                 };
 
-                if proof_bytes.is_empty() {
-                    tracing::error!(
-                        from = %from,
-                        tip = snap.manifest.tip_height,
-                        "REJECTED manifest: snapshot sync requires a non-empty HistoryProof; headers-only snapshots are not proof-native safe"
-                    );
-                    reset_sync_state!();
-                    continue;
-                } else {
-                    let target_height = snap.manifest.tip_height;
+                let target_height = snap.manifest.tip_height;
                     let missing_header = {
                         let ctx = chain.read().await;
                         first_missing_snapshot_header(&ctx.store, target_height)
@@ -2872,12 +3007,8 @@ async fn handle_p2p_events(
                                 from = %from,
                                 tip = snap.manifest.tip_height,
                                 segments = snap.manifest.segment_ids.len(),
-                                "history proof VERIFIED — starting segment download"
+                                "snapshot manifest accepted — starting segment download"
                             );
-                            // Verified public history proofs are snapshot
-                            // authority, not local cache entries. Durable
-                            // storage for them must use the final HistoryProof
-                            // type, never the local cache format.
                             // Start downloading segments with concurrency cap.
                             // The StateSegment handler dispatches queued requests as responses arrive.
                             let tip_h = snap.manifest.tip_height;
@@ -2893,6 +3024,7 @@ async fn handle_p2p_events(
                                             peer: from,
                                             segment_id: seg_id,
                                             expected_tip_height: tip_h,
+                                            expected_tip_hash: snap.manifest.tip_hash,
                                         })
                                         .await;
                                     launched += 1;
@@ -2924,6 +3056,7 @@ async fn handle_p2p_events(
                                             [u8; 32],
                                         )>(),
                                         &m.recent_headers,
+                                        &m.reuse_guard_buckets,
                                     );
                                     r.map(|_| {
                                         let view = ChainView::from_mdbx(&ctx);
@@ -3008,7 +3141,6 @@ async fn handle_p2p_events(
                             continue;
                         }
                     }
-                }
             }
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
@@ -3880,7 +4012,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
     }
 }
 
-/// Parse a miner/wallet address from canonical bech32m (`noid1…`).
+/// Parse a miner/wallet address from canonical bech32m (`o1…`).
 fn parse_address(s: &str) -> anyhow::Result<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {
         return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));

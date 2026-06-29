@@ -164,7 +164,7 @@ class Node:
 
     def address(self):
         addr = self.status()["address"]
-        if not addr.startswith("noid1"):
+        if not addr.startswith("o1"):
             raise LiveTestError(
                 f"{self.name} wallet returned non-canonical address: {addr}"
             )

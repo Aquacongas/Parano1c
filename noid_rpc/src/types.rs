@@ -367,7 +367,7 @@ pub struct StateInfo {
 pub struct AddressInfo {
     /// Whether the address is valid.
     pub valid: bool,
-    /// Canonical bech32m form (`noid1…`).
+    /// Canonical bech32m form (`o1…`).
     pub bech32: Option<String>,
     /// Raw 32-byte payload as hex.
     pub hex: Option<String>,

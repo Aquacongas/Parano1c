@@ -63,7 +63,7 @@ use crate::consensus::{
     ConsensusError,
 };
 use crate::exact_state_hash::composite_state_root;
-use crate::reuse_guard::REUSE_GUARD_BUCKETS;
+use crate::reuse_guard::{ReuseGuard, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use crate::storage::serial::encode_segment;
@@ -1245,28 +1245,199 @@ impl MdbxChainContext {
 
     /// Apply a full state snapshot received from a peer during initial sync.
     ///
-    /// Public arbitrary-peer snapshots are disabled until immutable exact-height
-    /// checkpoint generations and the history proof verifier are authority.
-    /// Installing a snapshot here would otherwise require exact persisted
-    /// chainwork, finalized checkpoint compatibility, and atomic metadata
-    /// replacement.
+    /// The caller must already have validated and persisted the canonical header
+    /// chain through `tip_height` and accepted the snapshot proof policy.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_state_snapshot<I>(
         &mut self,
-        _tip_height: u64,
-        _tip_hash: [u8; 32],
-        _log_slots: u32,
-        _active_slot_count: u64,
-        _alloc_counter: u64,
-        _segments: I,
-        _recent_headers_bytes: &[Vec<u8>],
+        tip_height: u64,
+        tip_hash: [u8; 32],
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        segments: I,
+        recent_headers_bytes: &[Vec<u8>],
+        reuse_guard_buckets: &[crate::reuse_guard::GuardBucket],
     ) -> Result<(), MdbxContextError>
     where
         I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
     {
-        Err(MdbxContextError::Corrupt(
-            "public state snapshot install disabled until exact checkpoint generation",
-        ))
+        if tip_height <= self.tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot tip is not ahead of local state",
+            ));
+        }
+
+        let tip_header = self
+            .store
+            .get_header(tip_height)?
+            .ok_or(MdbxContextError::Corrupt("snapshot tip header missing"))?;
+        if block_id(&tip_header) != tip_hash {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot tip hash does not match canonical header",
+            ));
+        }
+        if tip_header.log_slots != log_slots
+            || tip_header.active_slot_count != active_slot_count
+            || tip_header.alloc_counter != alloc_counter
+        {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot manifest counters do not match canonical header",
+            ));
+        }
+
+        let mut decoded_recent = Vec::with_capacity(recent_headers_bytes.len());
+        for bytes in recent_headers_bytes {
+            decoded_recent.push(
+                BlockHeader::from_bytes(bytes).map_err(|_| {
+                    MdbxContextError::Corrupt("snapshot recent header decode failed")
+                })?,
+            );
+        }
+        if decoded_recent.is_empty() {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot recent header window is empty",
+            ));
+        }
+        if decoded_recent.last().map(|h| h.height) != Some(tip_height) {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot recent header window does not end at tip",
+            ));
+        }
+        for pair in decoded_recent.windows(2) {
+            if pair[1].height != pair[0].height + 1 {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot recent headers are not contiguous",
+                ));
+            }
+            if pair[1].prev_block_hash != block_id(&pair[0]) {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot recent headers are not linked",
+                ));
+            }
+        }
+        for header in &decoded_recent {
+            let stored = self
+                .store
+                .get_header(header.height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "snapshot recent header missing from canonical store",
+                ))?;
+            if block_id(&stored) != block_id(header) {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot recent header conflicts with canonical store",
+                ));
+            }
+        }
+
+        let guard_array: [crate::reuse_guard::GuardBucket; REUSE_GUARD_BUCKETS] =
+            reuse_guard_buckets.to_vec().try_into().map_err(|_| {
+                MdbxContextError::Corrupt("snapshot reuse guard bucket count mismatch")
+            })?;
+        let reuse_guard = ReuseGuard::from_buckets(guard_array.clone())
+            .map_err(|_| MdbxContextError::Corrupt("snapshot reuse guard buckets invalid"))?;
+
+        let owned_segments: Vec<_> = segments.into_iter().collect();
+        let mut seg_state = SegmentedFriState::new_empty(log_slots as usize);
+        let expected_eff_log = seg_state.effective_log_segment_size() as u8;
+        let mut live_count = 0u64;
+        let mut seen_segments = std::collections::HashSet::new();
+        for (seg_id, eff_log, cols, expected_root) in &owned_segments {
+            if !seen_segments.insert(*seg_id) {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot contains duplicate segment id",
+                ));
+            }
+            if *eff_log != expected_eff_log {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot segment effective log mismatch",
+                ));
+            }
+            if (*seg_id as usize) >= seg_state.num_segments() {
+                return Err(MdbxContextError::Corrupt(
+                    "snapshot segment id out of range",
+                ));
+            }
+            let computed_root = crate::fri_state::compute_segment_root(
+                *eff_log as usize,
+                &cols.values,
+                &cols.owners_hi,
+                &cols.owners_lo,
+            );
+            if computed_root != *expected_root {
+                return Err(MdbxContextError::Corrupt("snapshot segment root mismatch"));
+            }
+            live_count = live_count.saturating_add(
+                cols.values
+                    .iter()
+                    .zip(cols.owners_hi.iter())
+                    .zip(cols.owners_lo.iter())
+                    .filter(|((v, hi), lo)| v.0 != 0 || hi.0 != 0 || lo.0 != 0)
+                    .count() as u64,
+            );
+            seg_state.set_segment_columns(*seg_id, cols.clone());
+        }
+        if live_count != active_slot_count {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot active slot count mismatch",
+            ));
+        }
+
+        let mut snapshot_state =
+            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter, reuse_guard)
+                .map_err(|_| MdbxContextError::Corrupt("snapshot exact state rebuild failed"))?;
+        if snapshot_state.state_root() != tip_header.state_root {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot reconstructed state_root mismatch",
+            ));
+        }
+        snapshot_state.state.clear_dirty();
+
+        let cumulative_chainwork = self
+            .store
+            .get_chain_work(tip_height)?
+            .ok_or(MdbxContextError::Corrupt("snapshot tip chainwork missing"))?;
+        let finalized_height = tip_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+        let finalized_header =
+            self.store
+                .get_header(finalized_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "snapshot finalized header missing",
+                ))?;
+        let finalized = FinalizedCheckpoint {
+            height: finalized_height,
+            hash: block_id(&finalized_header),
+        };
+        let consensus_meta = ConsensusMeta {
+            tip_height,
+            tip_hash,
+            cumulative_chainwork,
+            finalized,
+        };
+        let segment_refs: Vec<_> = owned_segments
+            .iter()
+            .map(|(seg_id, eff_log, cols, _)| (*seg_id, *eff_log, cols))
+            .collect();
+        self.store.install_state_snapshot(
+            &tip_header,
+            &tip_hash,
+            &consensus_meta,
+            &segment_refs,
+            &guard_array,
+        )?;
+
+        self.state = snapshot_state;
+        self.recent_headers.clear();
+        for header in decoded_recent {
+            self.recent_headers.insert(header.height, header);
+        }
+        self.tip_height = tip_height;
+        self.tip_hash = tip_hash;
+        self.tip_chain_work = cumulative_chainwork;
+        self.finalized = finalized;
+        self.defer_finality_updates = false;
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

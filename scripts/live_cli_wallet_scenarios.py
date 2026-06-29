@@ -298,14 +298,14 @@ def main():
         )
         out, _, _ = cli(n3, ["address"])
         assert_contains(out, "Wallet address [index=0]", "address output")
-        assert_contains(out, "noid1", "address output")
+        assert_contains(out, "o1", "address output")
 
         new1 = cli_json(n3, ["address", "--new"])
         new2 = cli_json(n3, ["address", "--new"])
         addr1 = new1["address"]
         addr2 = new2["address"]
         assert_true(
-            addr1.startswith("noid1") and addr2.startswith("noid1") and addr1 != addr2,
+            addr1.startswith("o1") and addr2.startswith("o1") and addr1 != addr2,
             "fresh addresses are invalid or not unique",
         )
         assert_true(
@@ -315,7 +315,7 @@ def main():
 
         out, _, _ = cli(n3, ["address", "--new"])
         assert_contains(out, "New receiving address", "address --new output")
-        assert_contains(out, "noid1", "address --new output")
+        assert_contains(out, "o1", "address --new output")
 
         out, _, _ = cli(n3, ["address", "--list"])
         assert_contains(out, "Wallet addresses", "address --list output")

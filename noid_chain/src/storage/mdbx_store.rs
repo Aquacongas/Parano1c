@@ -291,8 +291,8 @@ impl MdbxStore {
     /// Persist a historical header and its hash index without changing chain tip,
     /// state metadata, undo logs, or recent blocks.
     ///
-    /// Snapshot candidate headers must not be written into this canonical table
-    /// before full acceptance; public snapshot sync is fail-closed.
+    /// Snapshot header sync should use `put_verified_header_only`, which also
+    /// records exact cumulative chainwork.
     pub fn put_header_only(&self, header: &BlockHeader, hash: &[u8; 32]) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
 
@@ -309,6 +309,44 @@ impl MdbxStore {
             &h2h_tbl,
             hash.as_slice(),
             u64_key(header.height),
+            WriteFlags::empty(),
+        )?;
+
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Persist a fully validated canonical header plus exact cumulative chainwork
+    /// without changing state tip, consensus metadata, undo logs, or block bodies.
+    pub fn put_verified_header_only(
+        &self,
+        header: &BlockHeader,
+        hash: &[u8; 32],
+        cumulative_chainwork: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+
+        let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
+        txn.put(
+            &hdr_tbl,
+            u64_key(header.height),
+            encode_header(header),
+            WriteFlags::empty(),
+        )?;
+
+        let h2h_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
+        txn.put(
+            &h2h_tbl,
+            hash.as_slice(),
+            u64_key(header.height),
+            WriteFlags::empty(),
+        )?;
+
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        txn.put(
+            &work_tbl,
+            u64_key(header.height),
+            encode_chain_work(cumulative_chainwork),
             WriteFlags::empty(),
         )?;
 
@@ -590,6 +628,136 @@ impl MdbxStore {
                 )?;
             }
         }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Atomically install a snapshot state at an already-verified canonical header.
+    ///
+    /// This replaces volatile state tables only. Canonical headers, hash->height,
+    /// chainwork, and local history/checkpoint tables are preserved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_state_snapshot(
+        &self,
+        tip_header: &BlockHeader,
+        tip_hash: &[u8; 32],
+        consensus_meta: &ConsensusMeta,
+        segments: &[(u16, u8, &SegmentColumns)],
+        reuse_guard_buckets: &[GuardBucket; REUSE_GUARD_BUCKETS],
+    ) -> Result<(), StoreError> {
+        use std::collections::HashMap;
+
+        let txn = self.db.begin_rw_txn()?;
+
+        for name in [
+            T_SEGMENTS,
+            T_UNDO_LOGS,
+            T_RECENT_BLOCKS,
+            T_TX_INDEX,
+            T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
+            T_OWNER_INDEX,
+        ] {
+            let tbl = txn.open_table(Some(name))?;
+            let keys: Vec<Vec<u8>> = {
+                let mut cur = txn.cursor(&tbl)?;
+                let mut keys = Vec::new();
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                while let Some((k, _)) = item {
+                    keys.push(k);
+                    item = cur.next()?;
+                }
+                keys
+            };
+            for key in keys {
+                let _ = txn.del(&tbl, &key, None);
+            }
+        }
+
+        let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        for &(seg_id, eff_log, cols) in segments {
+            if segment_columns_empty(cols) {
+                continue;
+            }
+            txn.put(
+                &seg_tbl,
+                seg_id.to_le_bytes(),
+                encode_segment(cols, eff_log),
+                WriteFlags::empty(),
+            )?;
+        }
+
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        txn.put(
+            &tip_tbl,
+            KEY_TIP,
+            encode_chain_tip(tip_header.height, tip_hash),
+            WriteFlags::empty(),
+        )?;
+
+        let consensus_tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        txn.put(
+            &consensus_tbl,
+            KEY_CONSENSUS_META,
+            encode_consensus_meta(consensus_meta),
+            WriteFlags::empty(),
+        )?;
+
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        txn.put(
+            &work_tbl,
+            u64_key(tip_header.height),
+            encode_chain_work(&consensus_meta.cumulative_chainwork),
+            WriteFlags::empty(),
+        )?;
+
+        let meta_tbl = txn.open_table(Some(T_STATE_META))?;
+        txn.put(
+            &meta_tbl,
+            KEY_META,
+            encode_state_meta(
+                tip_header.log_slots,
+                tip_header.active_slot_count,
+                tip_header.alloc_counter,
+            ),
+            WriteFlags::empty(),
+        )?;
+
+        let guard_tbl = txn.open_table(Some(T_REUSE_GUARD))?;
+        txn.put(
+            &guard_tbl,
+            KEY_REUSE_GUARD,
+            encode_reuse_guard_buckets(reuse_guard_buckets),
+            WriteFlags::empty(),
+        )?;
+
+        let mut owner_map: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+        for &(seg_id, eff_log, cols) in segments {
+            let eff_log = eff_log as u32;
+            for local in 0..cols.values.len() {
+                let value = cols.values[local];
+                if value.0 == 0 {
+                    continue;
+                }
+                let owner = owner_key_from_fields(cols.owners_hi[local], cols.owners_lo[local]);
+                let slot = ((seg_id as u32) << eff_log) | (local as u32);
+                owner_map
+                    .entry(owner)
+                    .or_default()
+                    .push((slot, value.0 as u64));
+            }
+        }
+
+        let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        for (owner, entries) in owner_map {
+            txn.put(
+                &owner_tbl,
+                owner.as_slice(),
+                encode_owner_entries(&entries),
+                WriteFlags::empty(),
+            )?;
+        }
+
         txn.commit()?;
         Ok(())
     }
@@ -909,8 +1077,8 @@ impl MdbxStore {
     /// Normal startup does NOT clear these tables: `MdbxChainContext::open_or_create`
     /// first tries to restore persisted current state from MDBX and checks it against
     /// the tip header's `state_root`. This function is the local recovery path
-    /// for corrupt local state; public arbitrary-peer snapshot recovery remains fail-closed
-    /// until the history proof verifier is the trustless authority.
+    /// for corrupt local state; peer snapshot recovery goes through the
+    /// manifest/proof sync pipeline instead.
     pub fn clear_for_restart(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
         let volatile = [

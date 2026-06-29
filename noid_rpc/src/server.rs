@@ -1521,7 +1521,7 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Parse an address from canonical bech32m (`noid1…`).
+/// Parse an address from canonical bech32m (`o1…`).
 /// Empty string → zero address (used when no miner address is configured).
 fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {

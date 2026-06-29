@@ -81,15 +81,15 @@ newtype_digest!(
 // ---------------------------------------------------------------------------
 
 /// Human-readable part for Paranoid bech32m addresses.
-/// Produces addresses of the form `noid1q...` (~63 chars).
-pub const ADDRESS_HRP: &str = "noid";
+/// Produces addresses of the form `o1q...` (~60 chars).
+pub const ADDRESS_HRP: &str = "o";
 
 /// Error returned when decoding a bech32m address fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
     /// String is not a valid bech32m address.
     InvalidFormat,
-    /// Bech32m decoded OK but HRP is not `noid`.
+    /// Bech32m decoded OK but HRP is not `o`.
     WrongHrp(String),
     /// Decoded payload is not exactly 32 bytes.
     WrongLength(usize),
@@ -98,8 +98,8 @@ pub enum AddressError {
 impl std::fmt::Display for AddressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidFormat => write!(f, "invalid address format (expected bech32m noid1…)"),
-            Self::WrongHrp(h) => write!(f, "wrong address network: got '{h}', expected 'noid'"),
+            Self::InvalidFormat => write!(f, "invalid address format (expected bech32m o1…)"),
+            Self::WrongHrp(h) => write!(f, "wrong address network: got '{h}', expected 'o'"),
             Self::WrongLength(n) => write!(f, "wrong address length: got {n} bytes, expected 32"),
         }
     }
@@ -107,17 +107,17 @@ impl std::fmt::Display for AddressError {
 impl std::error::Error for AddressError {}
 
 impl Address {
-    /// Encode this address as a bech32m string (`noid1…`).
+    /// Encode this address as a bech32m string (`o1…`).
     ///
     /// This is the canonical display format. All user-facing output should
     /// call this or use the `Display` impl.
     pub fn to_bech32(&self) -> String {
         use bech32::{Bech32m, Hrp};
-        let hrp = Hrp::parse(ADDRESS_HRP).expect("noid is a valid HRP");
+        let hrp = Hrp::parse(ADDRESS_HRP).expect("o is a valid HRP");
         bech32::encode::<Bech32m>(hrp, &self.0).expect("32 bytes always encodes")
     }
 
-    /// Decode an address from canonical bech32m (`noid1…`).
+    /// Decode an address from canonical bech32m (`o1…`).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
         parse_address(s)
     }
@@ -742,16 +742,16 @@ mod tests {
             0x23, 0xaf, 0xcd, 0xb2,
         ]);
         let encoded = addr.to_bech32();
-        // Must start with noid1
+        // Must start with o1
         assert!(
-            encoded.starts_with("noid1"),
-            "expected noid1 prefix, got {encoded}"
+            encoded.starts_with("o1"),
+            "expected o1 prefix, got {encoded}"
         );
-        // Must be exactly 63 chars (5 HRP + 52 data + 6 checksum)
+        // Must be exactly 60 chars (1 HRP + 52 data + 6 checksum + separator)
         assert_eq!(
             encoded.len(),
-            63,
-            "expected 63 chars, got {}",
+            60,
+            "expected 60 chars, got {}",
             encoded.len()
         );
         // Round-trip
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn wrong_hrp_rejected() {
-        // Build a valid bech32m but with hrp "btc" instead of "noid"
+        // Build a valid bech32m but with hrp "btc" instead of "o"
         use bech32::{Bech32m, Hrp};
         let hrp = Hrp::parse("btc").unwrap();
         let fake = bech32::encode::<Bech32m>(hrp, &[0u8; 32]).unwrap();
@@ -808,7 +808,7 @@ mod tests {
     fn invalid_format_rejected() {
         assert!(Address::parse("notanaddress").is_err());
         assert!(Address::parse("").is_err());
-        assert!(Address::parse("noid1").is_err());
+        assert!(Address::parse("o1").is_err());
         // 62-char hex (too short)
         assert!(Address::parse(&"ab".repeat(31)).is_err());
     }
