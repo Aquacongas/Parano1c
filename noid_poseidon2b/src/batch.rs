@@ -15,7 +15,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::native::compression::Poseidon2bSponge;
-use crate::native::domain::{capacity_iv, TAG_COMPRESS};
+use crate::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
 use crate::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
@@ -23,6 +23,10 @@ use noid_core::hardware::tower_to_flat_u128;
 use noid_core::packed::{PackedBlock128, PACKED_LANES};
 use noid_core::Block128;
 use std::sync::OnceLock;
+
+/// Number of independent Block128 lanes used by the packed Poseidon2b kernels
+/// in this build.
+pub const POSEIDON2B_BATCH_LANES: usize = PACKED_LANES;
 
 /// Padding constants for Poseidon2b sponge finalization.
 const PAD0: u128 = u128::from_le_bytes([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -321,6 +325,18 @@ pub fn hash_concatenation_batch_interleaved(pairs: &[[u8; 32]]) -> Vec<[u8; 32]>
 /// pair with capacity IV = `COMPRESS` absorbed before `a`, then `b` XORed
 /// into the rate between permutations (CRYPTO.md §5.1).
 pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]]) {
+    compress_batch_interleaved_with_tag_into(TAG_COMPRESS, pairs, out);
+}
+
+/// Batched 2-to-1 compression of interleaved 32-byte digest pairs under a
+/// caller-selected capacity tag.
+///
+/// Matches `native::compress_with_tag(tag, left, right)` exactly.
+pub fn compress_batch_interleaved_with_tag_into(
+    tag: DomainTag,
+    pairs: &[[u8; 32]],
+    out: &mut [[u8; 32]],
+) {
     assert_eq!(
         pairs.len() & 1,
         0,
@@ -330,7 +346,7 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
     assert_eq!(out.len(), n, "Output length must match pair count");
 
     let scalar = |i: usize, out: &mut [[u8; 32]]| {
-        out[i] = crate::native::compress(&pairs[2 * i], &pairs[2 * i + 1]);
+        out[i] = crate::native::compress_with_tag(tag, &pairs[2 * i], &pairs[2 * i + 1]);
     };
 
     if PACKED_LANES == 1 || n < PACKED_LANES {
@@ -340,7 +356,7 @@ pub fn compress_batch_interleaved_into(pairs: &[[u8; 32]], out: &mut [[u8; 32]])
         return;
     }
 
-    let [iv_hi, iv_lo] = capacity_iv(TAG_COMPRESS);
+    let [iv_hi, iv_lo] = capacity_iv(tag);
     let chunks = n / PACKED_LANES;
 
     for chunk in 0..chunks {
@@ -712,6 +728,28 @@ mod tests {
             sponge.hash_concatenation(&interleaved[2], &interleaved[3]),
         ];
         let got = hash_concatenation_batch_interleaved(&interleaved);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_compress_batch_interleaved_with_tag_matches_scalar() {
+        use crate::native::DomainTag;
+
+        let mut rng = rand::thread_rng();
+        let tag = DomainTag::new(b"BTCHTST_");
+        let n = 257;
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for _ in 0..(n * 2) {
+            interleaved.push(rng.gen::<[u8; 32]>());
+        }
+
+        let mut got = vec![[0u8; 32]; n];
+        compress_batch_interleaved_with_tag_into(tag, &interleaved, &mut got);
+        let expected: Vec<[u8; 32]> = (0..n)
+            .map(|i| {
+                crate::native::compress_with_tag(tag, &interleaved[2 * i], &interleaved[2 * i + 1])
+            })
+            .collect();
         assert_eq!(got, expected);
     }
 }

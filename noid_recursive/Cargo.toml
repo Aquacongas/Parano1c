@@ -8,9 +8,14 @@ noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_chain = { path = "../noid_chain" }
 noid_gkr = { path = "../noid_gkr" }
+noid-ivc-prover = { path = "../noid_ivc_prover" }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 
 [dev-dependencies]
 noid_tx = { path = "../noid_tx" }
+
+[[bench]]
+name = "checkpoint_ivc"
+harness = false

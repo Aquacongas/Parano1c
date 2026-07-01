@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "history_accumulator_lite"
 harness = false
+
+[[bench]]
+name = "full_accepted_batch"
+harness = false

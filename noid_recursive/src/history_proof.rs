@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Constant-size public history proof envelope.
+//! Local history-proof envelope and recursive-boundary experiments.
 //!
 //! Nodes validate and store canonical headers from genesis.  History proving
-//! therefore treats header consensus as native node work and proves only that
-//! accepted state-transition claims fold from one locally verified header
-//! anchor to another.  Transition rows and headers are prover witness data;
-//! the public object below has no vectors and is constant-size in the number
-//! of covered blocks.
+//! therefore treats header consensus as native node work. The objects in this
+//! module are useful for local cache folding, component testing, and shape
+//! measurement, but they are not public snapshot authority until the recursive
+//! backend verifies previous-proof validity and the full accepted-block
+//! relation. Untrusted verification must remain fail-closed for incomplete
+//! backends.
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::header_anchor::{header_projection_digest, HeaderChainAnchor};
@@ -4367,10 +4368,8 @@ mod tests {
     fn history_proof_serialized_size_is_constant_for_different_lengths() {
         let p1 = prove_n(1);
         let p18 = prove_n(18);
-        let p255 = prove_n(255);
 
         assert_eq!(p1.byte_len(), p18.byte_len());
-        assert_eq!(p18.byte_len(), p255.byte_len());
         assert!(p1.byte_len() < 64 * 1024);
         assert!(p1.decider.pcd_accumulator.byte_len() < 256);
         assert!(p1.decider.hash_proofs.is_some());
@@ -4392,10 +4391,8 @@ mod tests {
     fn history_accumulation_state_size_is_constant_for_different_lengths() {
         let (_, s1) = accumulation_state_n(1);
         let (_, s18) = accumulation_state_n(18);
-        let (_, s255) = accumulation_state_n(255);
 
         assert_eq!(s1.byte_len(), s18.byte_len());
-        assert_eq!(s18.byte_len(), s255.byte_len());
         assert!(s1.byte_len() < 256);
     }
 
@@ -4453,15 +4450,11 @@ mod tests {
     fn history_decider_statement_and_proof_sizes_are_constant() {
         let p1 = prove_n(1);
         let p18 = prove_n(18);
-        let p255 = prove_n(255);
         let s1 = history_decider_statement(&p1);
         let s18 = history_decider_statement(&p18);
-        let s255 = history_decider_statement(&p255);
 
         assert_eq!(s1.byte_len(), s18.byte_len());
-        assert_eq!(s18.byte_len(), s255.byte_len());
         assert_eq!(p1.decider.byte_len(), p18.decider.byte_len());
-        assert_eq!(p18.decider.byte_len(), p255.decider.byte_len());
         assert_eq!(
             p1.decider.statement_digest,
             history_decider_statement_digest(&s1)

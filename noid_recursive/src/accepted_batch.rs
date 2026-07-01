@@ -9,16 +9,48 @@
 //! this transition, then replace the native verifier as public authority.
 
 use noid_core::Block128;
-use noid_gkr::{ChainAccumulatorBatchInputs, ChainAccumulatorItem};
+use noid_core::TowerField;
+use noid_gkr::{
+    discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
+    verify_fixed_field_hash_killshot, ChainAccumulatorBatchInputs, ChainAccumulatorItem,
+    FixedFieldHashInputs, FixedFieldHashParams, FixedFieldHashProofKillShot,
+};
+use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_HISTPRF};
+use noid_poseidon2b::native::Poseidon2bSponge;
+use noid_poseidon2b::primitives::Digest;
 
 use crate::accumulator::ChainAccumulator;
+use crate::checkpoint_proof::HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS;
 use crate::header_integer::{
     verify_header_integer_trace, HeaderIntegerBatchTrace, HeaderIntegerTraceError,
 };
 use crate::pow_header::{
     verify_pow_header_witness_batch_native, HeaderWitness, PowHeaderBatchError,
-    RecursiveConsensusState,
+    RecursiveConsensusState, EXPANSION_WINDOW_LEN,
 };
+use noid_chain::consensus::params::MEDIAN_TIME_BLOCKS;
+use noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT;
+
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_VERSION: u32 = 1;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS: usize = POW_HEADER_FIELD_COUNT + 6;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS: usize = 2;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS: usize =
+    16 + MEDIAN_TIME_BLOCKS + EXPANSION_WINDOW_LEN;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = 5;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS: usize =
+    ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS + ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS: usize = 1
+    + 1
+    + 1
+    + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS
+    + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS
+    + HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS
+    + 1;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS: usize =
+    2 + ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS;
+
+const ACB_DIG1: u128 = 0x4143_425F_4449_4731; // "ACB_DIG1"
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedClaimBatchWitness {
@@ -41,11 +73,278 @@ pub enum AcceptedClaimBatchError {
     HeaderInteger(HeaderIntegerTraceError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptedClaimBatchDigestError {
+    EmptyBatch,
+    TooManyClaims { actual: usize },
+    ClaimCountMismatch { headers: usize, claims: usize },
+    UnsupportedProofVersion { actual: u32 },
+    BadDigestProof,
+    BadDigestDischarge,
+}
+
+impl std::fmt::Display for AcceptedClaimBatchDigestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBatch => write!(f, "empty accepted-claim batch digest"),
+            Self::TooManyClaims { actual } => {
+                write!(f, "too many accepted-claim batch digest slots: {actual}")
+            }
+            Self::ClaimCountMismatch { headers, claims } => write!(
+                f,
+                "accepted-claim batch digest count mismatch: {headers} headers, {claims} claims"
+            ),
+            Self::UnsupportedProofVersion { actual } => {
+                write!(
+                    f,
+                    "unsupported accepted-claim batch digest proof version {actual}"
+                )
+            }
+            Self::BadDigestProof => write!(f, "bad accepted-claim batch digest proof"),
+            Self::BadDigestDischarge => {
+                write!(
+                    f,
+                    "accepted-claim batch digest proof failed native discharge"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcceptedClaimBatchDigestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedClaimBatchDigestProofV1 {
+    pub version: u32,
+    pub digest_hash: FixedFieldHashProofKillShot,
+}
+
+impl AcceptedClaimBatchDigestProofV1 {
+    pub fn byte_len(&self) -> usize {
+        bincode::serialized_size(self)
+            .expect("serialized AcceptedClaimBatchDigestProofV1 length fits usize") as usize
+    }
+}
+
 fn digest_to_fields(hash: [u8; 32]) -> [Block128; 2] {
     [
         Block128::from(u128::from_le_bytes(hash[..16].try_into().unwrap())),
         Block128::from(u128::from_le_bytes(hash[16..].try_into().unwrap())),
     ]
+}
+
+pub fn accepted_claim_batch_digest_v1(
+    witness: &AcceptedClaimBatchWitness,
+    output: &AcceptedClaimBatchOutput,
+) -> Result<Digest, AcceptedClaimBatchDigestError> {
+    Ok(digest_fixed_no_pad_from_fields(
+        &accepted_claim_batch_digest_hash_fields_v1(witness, output)?,
+    ))
+}
+
+pub fn accepted_claim_batch_digest_hash_fields_v1(
+    witness: &AcceptedClaimBatchWitness,
+    output: &AcceptedClaimBatchOutput,
+) -> Result<[Block128; ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS], AcceptedClaimBatchDigestError> {
+    validate_accepted_claim_batch_digest_shape(witness)?;
+    let mut fields = [Block128::ZERO; ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS];
+    let mut index = 0usize;
+    fields[index] = Block128::from(ACB_DIG1);
+    index += 1;
+    fields[index] = Block128::from(ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS as u128);
+    index += 1;
+    fields[index] = Block128::from(ACCEPTED_CLAIM_BATCH_DIGEST_VERSION as u128);
+    index += 1;
+    fields[index] = Block128::from(witness.headers.len() as u128);
+    index += 1;
+    fields[index] = Block128::from(HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u128);
+    index += 1;
+    push_consensus_fields(&mut fields, &mut index, &output.consensus_state);
+    push_accumulator_fields(&mut fields, &mut index, &output.accumulator);
+    for slot in 0..HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize {
+        if slot < witness.headers.len() {
+            push_header_witness_fields(&mut fields, &mut index, &witness.headers[slot]);
+            push_claim_fields(&mut fields, &mut index, witness.accepted_block_claims[slot]);
+        } else {
+            index += ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
+        }
+    }
+    index += 1;
+    debug_assert_eq!(index, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS);
+    Ok(fields)
+}
+
+pub fn accepted_claim_batch_digest_hash_params_v1() -> FixedFieldHashParams {
+    FixedFieldHashParams::with_default_relation_tag(
+        TAG_HISTPRF,
+        ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
+    )
+    .expect("accepted-claim batch digest hash schedule is valid")
+}
+
+pub fn prove_accepted_claim_batch_digest_v1(
+    witness: &AcceptedClaimBatchWitness,
+    output: &AcceptedClaimBatchOutput,
+) -> Result<AcceptedClaimBatchDigestProofV1, AcceptedClaimBatchDigestError> {
+    let fields = accepted_claim_batch_digest_hash_fields_v1(witness, output)?;
+    let expected_digest = digest_fixed_no_pad_from_fields(&fields);
+    let input = fixed_hash_input(&fields, &expected_digest);
+    let params = accepted_claim_batch_digest_hash_params_v1();
+    let mut channel = Poseidon2bChannel::new();
+    let inputs = [input];
+    let (digest_hash, reductions) = prove_fixed_field_hash_killshot(params, &inputs, &mut channel);
+    if !discharge_fixed_field_hash_reductions_native(params, &inputs, &reductions) {
+        return Err(AcceptedClaimBatchDigestError::BadDigestDischarge);
+    }
+    Ok(AcceptedClaimBatchDigestProofV1 {
+        version: ACCEPTED_CLAIM_BATCH_DIGEST_VERSION,
+        digest_hash,
+    })
+}
+
+pub fn verify_accepted_claim_batch_digest_v1(
+    witness: &AcceptedClaimBatchWitness,
+    output: &AcceptedClaimBatchOutput,
+    proof: &AcceptedClaimBatchDigestProofV1,
+) -> Result<(), AcceptedClaimBatchDigestError> {
+    if proof.version != ACCEPTED_CLAIM_BATCH_DIGEST_VERSION {
+        return Err(AcceptedClaimBatchDigestError::UnsupportedProofVersion {
+            actual: proof.version,
+        });
+    }
+    let fields = accepted_claim_batch_digest_hash_fields_v1(witness, output)?;
+    let expected_digest = digest_fixed_no_pad_from_fields(&fields);
+    let input = fixed_hash_input(&fields, &expected_digest);
+    let params = accepted_claim_batch_digest_hash_params_v1();
+    let mut channel = Poseidon2bChannel::new();
+    let inputs = [input];
+    let reductions =
+        verify_fixed_field_hash_killshot(params, &proof.digest_hash, &inputs, &mut channel)
+            .ok_or(AcceptedClaimBatchDigestError::BadDigestProof)?;
+    if discharge_fixed_field_hash_reductions_native(params, &inputs, &reductions) {
+        Ok(())
+    } else {
+        Err(AcceptedClaimBatchDigestError::BadDigestDischarge)
+    }
+}
+
+fn validate_accepted_claim_batch_digest_shape(
+    witness: &AcceptedClaimBatchWitness,
+) -> Result<(), AcceptedClaimBatchDigestError> {
+    if witness.headers.is_empty() {
+        return Err(AcceptedClaimBatchDigestError::EmptyBatch);
+    }
+    if witness.headers.len() > HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize {
+        return Err(AcceptedClaimBatchDigestError::TooManyClaims {
+            actual: witness.headers.len(),
+        });
+    }
+    if witness.headers.len() != witness.accepted_block_claims.len() {
+        return Err(AcceptedClaimBatchDigestError::ClaimCountMismatch {
+            headers: witness.headers.len(),
+            claims: witness.accepted_block_claims.len(),
+        });
+    }
+    Ok(())
+}
+
+fn push_header_witness_fields<const N: usize>(
+    fields: &mut [Block128; N],
+    index: &mut usize,
+    witness: &HeaderWitness,
+) {
+    for field in witness.pow_fields {
+        fields[*index] = field;
+        *index += 1;
+    }
+    push_digest_fields(fields, index, &witness.pow_digest);
+    push_digest_fields(fields, index, &witness.block_id);
+    push_digest_fields(fields, index, &witness.target);
+}
+
+fn push_consensus_fields<const N: usize>(
+    fields: &mut [Block128; N],
+    index: &mut usize,
+    consensus: &RecursiveConsensusState,
+) {
+    fields[*index] = Block128::from(consensus.height as u128);
+    *index += 1;
+    push_digest_fields(fields, index, &consensus.block_id);
+    push_digest_fields(fields, index, &consensus.state_root);
+    push_digest_fields(fields, index, &consensus.cumulative_chainwork);
+    fields[*index] = Block128::from(consensus.log_slots as u128);
+    *index += 1;
+    fields[*index] = Block128::from(consensus.active_slot_count as u128);
+    *index += 1;
+    fields[*index] = Block128::from(consensus.alloc_counter as u128);
+    *index += 1;
+    fields[*index] = Block128::from(consensus.asert_anchor_height as u128);
+    *index += 1;
+    fields[*index] = Block128::from(consensus.asert_anchor_timestamp as u128);
+    *index += 1;
+    push_digest_fields(fields, index, &consensus.asert_anchor_target);
+    fields[*index] = Block128::from(consensus.mtp_len as u128);
+    *index += 1;
+    for timestamp in consensus.mtp_timestamps {
+        fields[*index] = Block128::from(timestamp as u128);
+        *index += 1;
+    }
+    fields[*index] = Block128::from(consensus.expansion_len as u128);
+    *index += 1;
+    for count in consensus.expansion_counts {
+        fields[*index] = Block128::from(count as u128);
+        *index += 1;
+    }
+}
+
+fn push_accumulator_fields<const N: usize>(
+    fields: &mut [Block128; N],
+    index: &mut usize,
+    accumulator: &ChainAccumulator,
+) {
+    fields[*index] = Block128::from(accumulator.height as u128);
+    *index += 1;
+    push_digest_fields(fields, index, &accumulator.state_root);
+    push_digest_fields(fields, index, &accumulator.chain_hash);
+}
+
+fn push_claim_fields<const N: usize>(
+    fields: &mut [Block128; N],
+    index: &mut usize,
+    claim: [Block128; 2],
+) {
+    fields[*index] = claim[0];
+    *index += 1;
+    fields[*index] = claim[1];
+    *index += 1;
+}
+
+fn push_digest_fields<const N: usize>(
+    fields: &mut [Block128; N],
+    index: &mut usize,
+    digest: &Digest,
+) {
+    let [lo, hi] = digest_to_fields(*digest);
+    fields[*index] = lo;
+    *index += 1;
+    fields[*index] = hi;
+    *index += 1;
+}
+
+fn digest_fixed_no_pad_from_fields(fields: &[Block128]) -> Digest {
+    debug_assert_eq!(fields.len() % 2, 0);
+    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_HISTPRF));
+    for pair in fields.chunks_exact(2) {
+        sponge.absorb_pair(pair[0], pair[1]);
+    }
+    sponge.finalize_no_pad()
+}
+
+fn fixed_hash_input(fields: &[Block128], expected_digest: &Digest) -> FixedFieldHashInputs {
+    FixedFieldHashInputs {
+        fields: fields.to_vec(),
+        expected_digest: digest_to_fields(*expected_digest),
+    }
 }
 
 pub fn chain_accumulator_proof_inputs(
@@ -349,6 +648,27 @@ mod tests {
             verify_without_pow_for_tests(&start_consensus, &start_accumulator, &witness).unwrap();
         assert_eq!(out.consensus_state.height, 2);
         assert_eq!(out.consensus_state.state_root, h2.state_root);
+        assert_eq!(
+            accepted_claim_batch_digest_hash_fields_v1(&witness, &out)
+                .expect("digest fields")
+                .len(),
+            ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS
+        );
+        assert_ne!(
+            accepted_claim_batch_digest_v1(&witness, &out).expect("digest"),
+            [0u8; 32]
+        );
+        let digest_proof =
+            prove_accepted_claim_batch_digest_v1(&witness, &out).expect("digest proof");
+        verify_accepted_claim_batch_digest_v1(&witness, &out, &digest_proof)
+            .expect("digest proof verifies");
+
+        let mut tampered_out = out.clone();
+        tampered_out.accumulator.chain_hash = [0x99; 32];
+        assert_eq!(
+            verify_accepted_claim_batch_digest_v1(&witness, &tampered_out, &digest_proof),
+            Err(AcceptedClaimBatchDigestError::BadDigestProof)
+        );
 
         let expected = start_accumulator
             .extend(

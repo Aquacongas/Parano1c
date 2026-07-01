@@ -15,7 +15,11 @@
 pub mod accepted_batch;
 pub mod accumulator;
 pub mod authorization;
+pub mod block_certificate;
+pub mod block_certificate_backend;
 pub mod checkpoint;
+pub mod checkpoint_ivc_backend;
+pub mod checkpoint_proof;
 pub mod fs_transcript;
 pub mod header_integer;
 pub mod history_proof;
@@ -24,18 +28,82 @@ pub mod prove;
 pub mod verify;
 
 pub use accepted_batch::{
-    chain_accumulator_proof_inputs, verify_accepted_claim_batch_native,
-    verify_accepted_claim_batch_with_header_trace, AcceptedClaimBatchError,
-    AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
+    accepted_claim_batch_digest_hash_fields_v1, accepted_claim_batch_digest_hash_params_v1,
+    accepted_claim_batch_digest_v1, chain_accumulator_proof_inputs,
+    prove_accepted_claim_batch_digest_v1, verify_accepted_claim_batch_digest_v1,
+    verify_accepted_claim_batch_native, verify_accepted_claim_batch_with_header_trace,
+    AcceptedClaimBatchDigestError, AcceptedClaimBatchDigestProofV1, AcceptedClaimBatchError,
+    AcceptedClaimBatchOutput, AcceptedClaimBatchWitness, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
+    ACCEPTED_CLAIM_BATCH_DIGEST_VERSION,
 };
 pub use accumulator::{genesis_accumulator, ChainAccumulator};
 pub use authorization::{
     verify_authorization_batch_native, verify_authorization_batch_native_with_traces,
     AuthorizationBatchError, AuthorizationVerifierTrace, FiatShamirTraceOp,
 };
+pub use block_certificate::{
+    accepted_block_certificate_auth_sidecar_digest_v1,
+    accepted_block_certificate_batch_statement_digest_v1,
+    accepted_block_certificate_batch_statement_hash_fields_v1,
+    accepted_block_certificate_batch_statement_hash_params_v1,
+    accepted_block_certificate_batch_statement_v1, accepted_block_certificate_block_body_digest_v1,
+    accepted_block_certificate_block_proof_digest_v1, accepted_block_certificate_chain_claim_v1,
+    accepted_block_certificate_statement_digest_v1, accepted_block_certificate_statement_fields_v1,
+    accepted_block_certificate_statement_hash_fields_v1,
+    accepted_block_certificate_statement_hash_params_v1,
+    prove_accepted_block_certificate_batch_digest_proof_v1,
+    prove_accepted_block_certificate_digest_backend_v1,
+    prove_accepted_block_certificate_proof_v1_hash_only,
+    verify_accepted_block_certificate_batch_digest_proof_v1,
+    verify_accepted_block_certificate_digest_backend_v1,
+    verify_accepted_block_certificate_proof_v1_untrusted, AcceptedBlockCertificateBackendProofV1,
+    AcceptedBlockCertificateBatchDigestProofV1, AcceptedBlockCertificateBatchError,
+    AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateProofError,
+    AcceptedBlockCertificateProofV1, AcceptedBlockCertificateStatementV1,
+    ACCEPTED_BLOCK_CERTIFICATE_BATCH_STATEMENT_HASH_FIELDS,
+    ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+};
+pub use block_certificate_backend::{
+    verify_accepted_block_batch_components_v1, verify_exact_state_killshot_v1,
+    AcceptedBlockBatchComponentErrorV1, AcceptedBlockBatchComponentInputsV1,
+    AcceptedBlockBatchComponentProofV1, AuthorizationComponentInputV1, ExactStateKillShotErrorV1,
+    ExactStateKillShotInputsV1, ExactStateKillShotProofV1,
+};
 pub use checkpoint::{
     prove_checkpoint_poseidon, verify_checkpoint_poseidon, CheckpointPoseidonError,
     CheckpointPoseidonProof,
+};
+pub use checkpoint_ivc_backend::{
+    prove_history_checkpoint_ivc_chunk_core_v1, verify_history_checkpoint_ivc_chunk_core_v1,
+    HistoryCheckpointIvcChunkCoreError, HistoryCheckpointIvcChunkCoreProofV1,
+    HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION_V1, HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE,
+    HISTORY_CHECKPOINT_IVC_PCS_LOG_INV_RATE,
+};
+pub use checkpoint_proof::{
+    advance_history_checkpoint_head_v1_native, encode_history_checkpoint_recursive_payload_v1,
+    history_checkpoint_accumulator_digest, history_checkpoint_anchor_digest,
+    history_checkpoint_batch_summary_digest, history_checkpoint_consensus_digest,
+    history_checkpoint_head_digest, history_checkpoint_head_from_boundary_v1,
+    history_checkpoint_step_relation_digest, history_checkpoint_step_statement_digest,
+    history_checkpoint_step_statement_hash_fields, history_checkpoint_step_statement_hash_params,
+    prove_history_checkpoint_step_digest_proof_v1,
+    prove_history_checkpoint_step_proof_v1_batch_digest_only,
+    prove_history_checkpoint_step_proof_v1_from_block_components,
+    prove_history_checkpoint_step_proof_v1_from_certificate_statements,
+    prove_history_checkpoint_step_proof_v1_with_digest_components,
+    verify_history_checkpoint_proof_v1_untrusted, verify_history_checkpoint_step_digest_proof_v1,
+    verify_history_checkpoint_step_proof_v1_private_block_components_native,
+    verify_history_checkpoint_step_proof_v1_private_components_native,
+    verify_history_checkpoint_step_proof_v1_untrusted,
+    verify_history_checkpoint_step_statement_v1_native, HistoryCheckpointBatchSummaryV1,
+    HistoryCheckpointHeadV1, HistoryCheckpointProofError, HistoryCheckpointProofV1,
+    HistoryCheckpointRecursivePayloadV1, HistoryCheckpointStepBackendProofV1,
+    HistoryCheckpointStepDigestProofV1, HistoryCheckpointStepProofError,
+    HistoryCheckpointStepProofV1, HistoryCheckpointStepStatementV1,
+    HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS, HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
+    HISTORY_CHECKPOINT_PROOF_VERSION, HISTORY_CHECKPOINT_RETAINED_WINDOW_BLOCKS,
+    HISTORY_CHECKPOINT_STEP_STATEMENT_HASH_FIELDS,
 };
 pub use fs_transcript::{
     discharge_fiat_shamir_transcript_batch_reductions_native,

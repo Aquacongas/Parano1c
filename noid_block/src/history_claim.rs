@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Header-anchored accepted state-transition claim.
+//! Accepted state-transition claim.
 //!
-//! This is the native proof-language boundary for O(1) history/state sync.
-//! It is emitted only after block validation has accepted the exact transition.
+//! This compact summary is emitted only after block validation has accepted the
+//! exact transition. It is a local proof-worker witness, not standalone public
+//! snapshot authority: a future public history proof must either derive it from
+//! the full accepted-block relation or rely on a consensus commitment to its
+//! digest.
 
 use noid_chain::block::{compute_tx_root, Block};
 use noid_chain::block_header::BlockHeader;

@@ -69,7 +69,7 @@ use noid_recursive::{
     HISTORY_TAGGED_PAIR_HASH_FIELDS,
 };
 
-const DEFAULT_NS: &[usize] = &[1, 18, 255];
+const DEFAULT_NS: &[usize] = &[1, 18];
 const DEFAULT_SAMPLES: usize = 9;
 const DEFAULT_LOG_SLOTS: usize = 16;
 

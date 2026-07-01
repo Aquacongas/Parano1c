@@ -9,6 +9,7 @@
 //! - exact authenticated UTXO/ReuseGuard state transition.
 
 pub mod accepted_block_batch;
+pub mod accepted_block_certificate;
 pub mod block_chain_context;
 pub mod exact_state_killshot;
 pub mod exact_state_transition;
@@ -16,11 +17,24 @@ pub mod history_claim;
 pub mod validate;
 
 pub use accepted_block_batch::{
+    accepted_block_certificate_batch_statement_from_full_accepted_output_v1,
+    accepted_claim_batch_digest_v1, history_checkpoint_batch_summary_from_full_accepted_output_v1,
+    prove_history_checkpoint_step_proof_from_full_accepted_components_v1,
     prove_retained_full_accepted_block_batch_proof, verify_full_accepted_block_batch_native,
+    verify_history_checkpoint_step_proof_with_full_accepted_components_v1,
+    verify_retained_full_accepted_block_batch_checkpoint_step_v1,
     verify_retained_full_accepted_block_batch_proof, FullAcceptedBlockBatchError,
     FullAcceptedBlockBatchItem, FullAcceptedBlockBatchOutput,
     FullAcceptedBlockBatchProofComponents, FullAcceptedBlockBatchWitness,
     RetainedFullAcceptedBlockBatchProof,
+};
+pub use accepted_block_certificate::{
+    accepted_block_certificate_batch_statement_digest_v1,
+    accepted_block_certificate_batch_statement_v1, accepted_block_certificate_chain_claim_v1,
+    accepted_block_certificate_statement_digest_v1, accepted_block_certificate_statement_v1,
+    verify_accepted_block_certificate_statement_v1_native, AcceptedBlockCertificateBatchError,
+    AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateStatementV1,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
 };
 pub use block_chain_context::{BlockChainContext, ReplayWitnessError};
 pub use exact_state_killshot::{

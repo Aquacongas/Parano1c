@@ -5,6 +5,8 @@ members = [
     "noid_fri",
     "noid_fri_binius",
     "noid_poseidon2b",
+    "noid_ivc_core",
+    "noid_ivc_prover",
     "noid_tx",
     "noid_chain",
     "noid_gkr",
