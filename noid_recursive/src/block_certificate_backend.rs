@@ -38,8 +38,7 @@ use crate::accepted_batch::{
 use crate::accumulator::ChainAccumulator;
 use crate::authorization::{AuthorizationVerifierTrace, FiatShamirTraceOp};
 use crate::block_certificate::{
-    accepted_block_certificate_chain_claim_v1, AcceptedBlockCertificateStatementV1,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    accepted_block_certificate_chain_claim, AcceptedBlockCertificateStatement,
 };
 use crate::checkpoint::{
     verify_checkpoint_poseidon, CheckpointPoseidonError, CheckpointPoseidonProof,
@@ -52,7 +51,7 @@ use crate::header_integer::HeaderIntegerBatchTrace;
 use crate::pow_header::RecursiveConsensusState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizationComponentInputV1 {
+pub struct AuthorizationComponentInput {
     pub block_index: usize,
     pub tx_index: usize,
     pub tx_body_hash: [Block128; 2],
@@ -60,7 +59,7 @@ pub struct AuthorizationComponentInputV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExactStateKillShotInputsV1 {
+pub struct ExactStateKillShotInputs {
     pub slot_leaves: Vec<SlotLeafInputs>,
     pub state_paths: Vec<MerklePathInputs>,
     pub guard_buckets: Option<Vec<GuardBucketHashInputs>>,
@@ -69,7 +68,7 @@ pub struct ExactStateKillShotInputsV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExactStateKillShotProofV1 {
+pub struct ExactStateKillShotProof {
     pub slot_leaves: BatchedSlotLeafProofKillShot,
     pub state_paths: BatchedMerkleProofKillShot,
     pub guard_buckets: Option<BatchedGuardBucketProofKillShot>,
@@ -77,8 +76,8 @@ pub struct ExactStateKillShotProofV1 {
     pub state_roots: BatchedStateRootProofKillShot,
 }
 
-impl ExactStateKillShotProofV1 {
-    pub fn byte_len(&self, inputs: &ExactStateKillShotInputsV1) -> usize {
+impl ExactStateKillShotProof {
+    pub fn byte_len(&self, inputs: &ExactStateKillShotInputs) -> usize {
         self.slot_leaves.byte_len()
             + self.state_paths.byte_len(&inputs.state_paths)
             + self
@@ -95,9 +94,9 @@ impl ExactStateKillShotProofV1 {
 }
 
 #[derive(Debug, Clone)]
-pub struct AcceptedBlockBatchComponentInputsV1 {
+pub struct AcceptedBlockBatchComponentInputs {
     pub accepted_claim_witness: AcceptedClaimBatchWitness,
-    pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatementV1>,
+    pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatement>,
     pub accepted_claim_hash_inputs: Vec<AcceptedClaimHashInputs>,
     pub tx_body_standard_inputs: Vec<SpineInputs>,
     pub tx_body_standard_hashes: Vec<[Block128; 2]>,
@@ -105,26 +104,26 @@ pub struct AcceptedBlockBatchComponentInputsV1 {
     pub tx_body_sweep_hashes: Vec<[Block128; 2]>,
     pub tx_root_inputs: Vec<MerklePathInputs>,
     pub header_integer_trace: HeaderIntegerBatchTrace,
-    pub authorization_inputs: Vec<AuthorizationComponentInputV1>,
+    pub authorization_inputs: Vec<AuthorizationComponentInput>,
     pub authorization_witnesses: Vec<OwnerAuthProofKillShot>,
     pub authorization_traces: Vec<AuthorizationVerifierTrace>,
-    pub exact_state_killshot_inputs: Vec<ExactStateKillShotInputsV1>,
+    pub exact_state_killshot_inputs: Vec<ExactStateKillShotInputs>,
     pub authorization_totals: VerifiedAuthorizationBatch,
 }
 
 #[derive(Debug, Clone)]
-pub struct AcceptedBlockBatchComponentProofV1 {
+pub struct AcceptedBlockBatchComponentProof {
     pub accepted_claim_hash: AcceptedClaimHashProofKillShot,
     pub tx_body_standard: Option<BlockSpineProof>,
     pub tx_body_sweep: Option<SweepBlockSpineProof>,
     pub tx_root: Option<BatchedMerkleProofKillShot>,
     pub checkpoint_poseidon: CheckpointPoseidonProof,
-    pub exact_state: Vec<ExactStateKillShotProofV1>,
+    pub exact_state: Vec<ExactStateKillShotProof>,
     pub authorization_transcripts: Vec<FiatShamirTranscriptBatchProofKillShot>,
 }
 
-impl AcceptedBlockBatchComponentProofV1 {
-    pub fn byte_len(&self, inputs: &AcceptedBlockBatchComponentInputsV1) -> usize {
+impl AcceptedBlockBatchComponentProof {
+    pub fn byte_len(&self, inputs: &AcceptedBlockBatchComponentInputs) -> usize {
         self.accepted_claim_hash.byte_len()
             + self
                 .tx_body_standard
@@ -154,7 +153,7 @@ impl AcceptedBlockBatchComponentProofV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExactStateKillShotErrorV1 {
+pub enum ExactStateKillShotError {
     EmptyDerivedInput,
     GuardPresenceMismatch,
     SlotLeafProofRejected,
@@ -165,7 +164,7 @@ pub enum ExactStateKillShotErrorV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AcceptedBlockBatchComponentErrorV1 {
+pub enum AcceptedBlockBatchComponentError {
     ComponentShapeMismatch,
     CertificateStatementMismatch {
         index: usize,
@@ -185,17 +184,17 @@ pub enum AcceptedBlockBatchComponentErrorV1 {
     CheckpointPoseidon(CheckpointPoseidonError),
     ExactState {
         index: usize,
-        source: ExactStateKillShotErrorV1,
+        source: ExactStateKillShotError,
     },
 }
 
-pub fn verify_accepted_block_batch_components_v1(
+pub fn verify_accepted_block_batch_components(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     end_accumulator: &ChainAccumulator,
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentError> {
     validate_component_shape(inputs, proof)?;
     validate_certificate_statement_component_shape(inputs)?;
     verify_accepted_claim_hash_component(inputs, proof)?;
@@ -211,9 +210,9 @@ pub fn verify_accepted_block_batch_components_v1(
         &inputs.accepted_claim_witness,
         &inputs.header_integer_trace,
     )
-    .map_err(AcceptedBlockBatchComponentErrorV1::AcceptedClaimBatch)?;
+    .map_err(AcceptedBlockBatchComponentError::AcceptedClaimBatch)?;
     if accepted_claim_batch.accumulator != *end_accumulator {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
 
     verify_checkpoint_poseidon(
@@ -222,7 +221,7 @@ pub fn verify_accepted_block_batch_components_v1(
         &inputs.accepted_claim_witness,
         &proof.checkpoint_poseidon,
     )
-    .map_err(AcceptedBlockBatchComponentErrorV1::CheckpointPoseidon)?;
+    .map_err(AcceptedBlockBatchComponentError::CheckpointPoseidon)?;
 
     inputs
         .exact_state_killshot_inputs
@@ -230,17 +229,17 @@ pub fn verify_accepted_block_batch_components_v1(
         .zip(proof.exact_state.par_iter())
         .enumerate()
         .try_for_each(|(index, (inputs, proof))| {
-            verify_exact_state_killshot_v1(inputs, proof)
-                .map_err(|source| AcceptedBlockBatchComponentErrorV1::ExactState { index, source })
+            verify_exact_state_killshot(inputs, proof)
+                .map_err(|source| AcceptedBlockBatchComponentError::ExactState { index, source })
         })?;
 
     Ok(accepted_claim_batch)
 }
 
-pub fn verify_exact_state_killshot_v1(
-    inputs: &ExactStateKillShotInputsV1,
-    proof: &ExactStateKillShotProofV1,
-) -> Result<(), ExactStateKillShotErrorV1> {
+pub fn verify_exact_state_killshot(
+    inputs: &ExactStateKillShotInputs,
+    proof: &ExactStateKillShotProof,
+) -> Result<(), ExactStateKillShotError> {
     validate_exact_state_inputs(inputs)?;
 
     let (slot_result, (state_result, (bucket_result, (guard_path_result, root_result)))) =
@@ -252,11 +251,11 @@ pub fn verify_exact_state_killshot_v1(
                     &inputs.slot_leaves,
                     &mut channel,
                 )
-                .ok_or(ExactStateKillShotErrorV1::SlotLeafProofRejected)?;
+                .ok_or(ExactStateKillShotError::SlotLeafProofRejected)?;
                 if discharge_batched_slot_leaf_reductions_native(&inputs.slot_leaves, &reductions) {
                     Ok(())
                 } else {
-                    Err(ExactStateKillShotErrorV1::SlotLeafProofRejected)
+                    Err(ExactStateKillShotError::SlotLeafProofRejected)
                 }
             },
             || {
@@ -270,7 +269,7 @@ pub fn verify_exact_state_killshot_v1(
                             &inputs.state_paths,
                             &mut channel,
                         )
-                        .ok_or(ExactStateKillShotErrorV1::StateMerkleProofRejected)?;
+                        .ok_or(ExactStateKillShotError::StateMerkleProofRejected)?;
                         if discharge_batched_merkle_reductions_native(
                             &circuit,
                             &inputs.state_paths,
@@ -278,7 +277,7 @@ pub fn verify_exact_state_killshot_v1(
                         ) {
                             Ok(())
                         } else {
-                            Err(ExactStateKillShotErrorV1::StateMerkleProofRejected)
+                            Err(ExactStateKillShotError::StateMerkleProofRejected)
                         }
                     },
                     || {
@@ -291,18 +290,18 @@ pub fn verify_exact_state_killshot_v1(
                                         inputs,
                                         &mut channel,
                                     )
-                                    .ok_or(ExactStateKillShotErrorV1::GuardBucketProofRejected)?;
+                                    .ok_or(ExactStateKillShotError::GuardBucketProofRejected)?;
                                     if discharge_batched_guard_bucket_reductions_native(
                                         inputs,
                                         &reductions,
                                     ) {
                                         Ok(())
                                     } else {
-                                        Err(ExactStateKillShotErrorV1::GuardBucketProofRejected)
+                                        Err(ExactStateKillShotError::GuardBucketProofRejected)
                                     }
                                 }
                                 (None, None) => Ok(()),
-                                _ => Err(ExactStateKillShotErrorV1::GuardPresenceMismatch),
+                                _ => Err(ExactStateKillShotError::GuardPresenceMismatch),
                             },
                             || {
                                 rayon::join(
@@ -318,7 +317,7 @@ pub fn verify_exact_state_killshot_v1(
                                                 &mut channel,
                                             )
                                             .ok_or(
-                                                ExactStateKillShotErrorV1::GuardMerkleProofRejected,
+                                                ExactStateKillShotError::GuardMerkleProofRejected,
                                             )?;
                                             if discharge_batched_merkle_reductions_native(
                                                 &circuit,
@@ -328,12 +327,12 @@ pub fn verify_exact_state_killshot_v1(
                                                 Ok(())
                                             } else {
                                                 Err(
-                                                    ExactStateKillShotErrorV1::GuardMerkleProofRejected,
+                                                    ExactStateKillShotError::GuardMerkleProofRejected,
                                                 )
                                             }
                                         }
                                         (None, None) => Ok(()),
-                                        _ => Err(ExactStateKillShotErrorV1::GuardPresenceMismatch),
+                                        _ => Err(ExactStateKillShotError::GuardPresenceMismatch),
                                     },
                                     || {
                                         let mut channel = Poseidon2bChannel::new();
@@ -342,14 +341,14 @@ pub fn verify_exact_state_killshot_v1(
                                             &inputs.state_roots,
                                             &mut channel,
                                         )
-                                        .ok_or(ExactStateKillShotErrorV1::StateRootProofRejected)?;
+                                        .ok_or(ExactStateKillShotError::StateRootProofRejected)?;
                                         if discharge_batched_state_root_reductions_native(
                                             &inputs.state_roots,
                                             &reductions,
                                         ) {
                                             Ok(())
                                         } else {
-                                            Err(ExactStateKillShotErrorV1::StateRootProofRejected)
+                                            Err(ExactStateKillShotError::StateRootProofRejected)
                                         }
                                     },
                                 )
@@ -368,9 +367,9 @@ pub fn verify_exact_state_killshot_v1(
 }
 
 fn validate_component_shape(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     if inputs.exact_state_killshot_inputs.len() != proof.exact_state.len()
         || inputs.authorization_inputs.len() != inputs.authorization_witnesses.len()
         || inputs.authorization_traces.len() != inputs.authorization_witnesses.len()
@@ -380,19 +379,19 @@ fn validate_component_shape(
         || inputs.tx_body_standard_inputs.len() != inputs.tx_body_standard_hashes.len()
         || inputs.tx_body_sweep_inputs.len() != inputs.tx_body_sweep_hashes.len()
     {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(())
 }
 
 fn validate_certificate_statement_component_shape(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     let headers = &inputs.accepted_claim_witness.headers;
     let claims = &inputs.accepted_claim_witness.accepted_block_claims;
     let statements = &inputs.accepted_block_certificate_statements;
     if statements.len() != headers.len() || statements.len() != claims.len() {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     for (index, ((statement, header_witness), chain_claim)) in statements
         .iter()
@@ -400,30 +399,29 @@ fn validate_certificate_statement_component_shape(
         .zip(claims.iter().copied())
         .enumerate()
     {
-        if statement.version != ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION
-            || statement.block_id != header_witness.block_id
+        if statement.block_id != header_witness.block_id
             || statement.height != header_witness.header.height
             || statement.child_state_root != header_witness.header.state_root
             || statement.tx_root != header_witness.header.tx_root
-            || accepted_block_certificate_chain_claim_v1(statement) != chain_claim
+            || accepted_block_certificate_chain_claim(statement) != chain_claim
         {
-            return Err(AcceptedBlockBatchComponentErrorV1::CertificateStatementMismatch { index });
+            return Err(AcceptedBlockBatchComponentError::CertificateStatementMismatch { index });
         }
     }
     Ok(())
 }
 
 fn verify_accepted_claim_hash_component(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     for (input, claim) in inputs
         .accepted_claim_hash_inputs
         .iter()
         .zip(inputs.accepted_claim_witness.accepted_block_claims.iter())
     {
         if input.expected_claim != *claim {
-            return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+            return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
         }
     }
     let mut channel = Poseidon2bChannel::new();
@@ -432,31 +430,31 @@ fn verify_accepted_claim_hash_component(
         &inputs.accepted_claim_hash_inputs,
         &mut channel,
     )
-    .ok_or(AcceptedBlockBatchComponentErrorV1::AcceptedClaimHashProofRejected)?;
+    .ok_or(AcceptedBlockBatchComponentError::AcceptedClaimHashProofRejected)?;
     if discharge_accepted_claim_hash_reductions_native(
         &inputs.accepted_claim_hash_inputs,
         &reductions,
     ) {
         Ok(())
     } else {
-        Err(AcceptedBlockBatchComponentErrorV1::AcceptedClaimHashProofRejected)
+        Err(AcceptedBlockBatchComponentError::AcceptedClaimHashProofRejected)
     }
 }
 
 fn verify_standard_tx_body_component(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     if inputs.tx_body_standard_inputs.is_empty() {
         if proof.tx_body_standard.is_some() {
-            return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+            return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
         }
         return Ok(());
     }
     let tx_body_proof = proof
         .tx_body_standard
         .as_ref()
-        .ok_or(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch)?;
+        .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
     let mut channel = Poseidon2bChannel::new();
     let reductions = verify_block_spine_killshot(
         tx_body_proof,
@@ -464,7 +462,7 @@ fn verify_standard_tx_body_component(
         &inputs.tx_body_standard_hashes,
         &mut channel,
     )
-    .ok_or(AcceptedBlockBatchComponentErrorV1::TxBodyHashProofRejected)?;
+    .ok_or(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)?;
     let slot_state_ins = standard_tx_body_slot_state_ins(&inputs.tx_body_standard_inputs);
     if discharge_block_spine_reductions_native(
         inputs.tx_body_standard_inputs.len(),
@@ -473,24 +471,24 @@ fn verify_standard_tx_body_component(
     ) {
         Ok(())
     } else {
-        Err(AcceptedBlockBatchComponentErrorV1::TxBodyHashProofRejected)
+        Err(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)
     }
 }
 
 fn verify_sweep_tx_body_component(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     if inputs.tx_body_sweep_inputs.is_empty() {
         if proof.tx_body_sweep.is_some() {
-            return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+            return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
         }
         return Ok(());
     }
     let tx_body_proof = proof
         .tx_body_sweep
         .as_ref()
-        .ok_or(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch)?;
+        .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
     let mut channel = Poseidon2bChannel::new();
     let reductions = verify_sweep_block_spine_killshot(
         tx_body_proof,
@@ -498,28 +496,28 @@ fn verify_sweep_tx_body_component(
         &inputs.tx_body_sweep_hashes,
         &mut channel,
     )
-    .ok_or(AcceptedBlockBatchComponentErrorV1::TxBodyHashProofRejected)?;
+    .ok_or(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)?;
     if discharge_sweep_block_spine_reductions_native(&inputs.tx_body_sweep_inputs, &reductions) {
         Ok(())
     } else {
-        Err(AcceptedBlockBatchComponentErrorV1::TxBodyHashProofRejected)
+        Err(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)
     }
 }
 
 fn verify_tx_root_component(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     if inputs.tx_root_inputs.is_empty() {
         if proof.tx_root.is_some() {
-            return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+            return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
         }
         return Ok(());
     }
     let tx_root_proof = proof
         .tx_root
         .as_ref()
-        .ok_or(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch)?;
+        .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
     let circuit = MerkleCircuit::build();
     let mut channel = Poseidon2bChannel::new();
     let reductions = verify_batched_merkle_killshot(
@@ -528,19 +526,19 @@ fn verify_tx_root_component(
         &inputs.tx_root_inputs,
         &mut channel,
     )
-    .ok_or(AcceptedBlockBatchComponentErrorV1::TxRootProofRejected)?;
+    .ok_or(AcceptedBlockBatchComponentError::TxRootProofRejected)?;
     if discharge_batched_merkle_reductions_native(&circuit, &inputs.tx_root_inputs, &reductions) {
         Ok(())
     } else {
-        Err(AcceptedBlockBatchComponentErrorV1::TxRootProofRejected)
+        Err(AcceptedBlockBatchComponentError::TxRootProofRejected)
     }
 }
 
 fn verify_authorization_components(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     if inputs.authorization_inputs.len() != inputs.authorization_totals.user_tx_count {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     let auth_counts = inputs
         .authorization_inputs
@@ -555,7 +553,7 @@ fn verify_authorization_components(
             };
             let verified =
                 verify_authorization_statement_proof(&statement, proof).map_err(|_| {
-                    AcceptedBlockBatchComponentErrorV1::AuthorizationProofRejected {
+                    AcceptedBlockBatchComponentError::AuthorizationProofRejected {
                         index,
                         tx_index: input.tx_index,
                     }
@@ -574,18 +572,18 @@ fn verify_authorization_components(
     if owner_count_total != inputs.authorization_totals.owner_count_total
         || live_input_count_total != inputs.authorization_totals.live_input_count_total
     {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(())
 }
 
 fn verify_authorization_transcript_components(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-    proof: &AcceptedBlockBatchComponentProofV1,
-) -> Result<(), AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+) -> Result<(), AcceptedBlockBatchComponentError> {
     let chunks = authorization_transcript_chunks(inputs)?;
     if chunks.len() != proof.authorization_transcripts.len() {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     chunks
         .par_iter()
@@ -600,7 +598,7 @@ fn verify_authorization_transcript_components(
                     &mut channel,
                 )
                 .map_err(|_| {
-                    AcceptedBlockBatchComponentErrorV1::AuthorizationTranscriptRejected {
+                    AcceptedBlockBatchComponentError::AuthorizationTranscriptRejected {
                         chunk_index,
                         tx_index: *tx_index,
                     }
@@ -609,7 +607,7 @@ fn verify_authorization_transcript_components(
                     Ok(())
                 } else {
                     Err(
-                        AcceptedBlockBatchComponentErrorV1::AuthorizationTranscriptRejected {
+                        AcceptedBlockBatchComponentError::AuthorizationTranscriptRejected {
                             chunk_index,
                             tx_index: *tx_index,
                         },
@@ -620,10 +618,10 @@ fn verify_authorization_transcript_components(
 }
 
 fn authorization_transcript_chunks(
-    inputs: &AcceptedBlockBatchComponentInputsV1,
-) -> Result<Vec<(usize, Vec<Vec<FiatShamirTraceOp>>)>, AcceptedBlockBatchComponentErrorV1> {
+    inputs: &AcceptedBlockBatchComponentInputs,
+) -> Result<Vec<(usize, Vec<Vec<FiatShamirTraceOp>>)>, AcceptedBlockBatchComponentError> {
     if inputs.authorization_traces.len() != inputs.authorization_witnesses.len() {
-        return Err(AcceptedBlockBatchComponentErrorV1::ComponentShapeMismatch);
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(inputs
         .authorization_traces
@@ -640,17 +638,17 @@ fn authorization_transcript_chunks(
 }
 
 fn validate_exact_state_inputs(
-    inputs: &ExactStateKillShotInputsV1,
-) -> Result<(), ExactStateKillShotErrorV1> {
+    inputs: &ExactStateKillShotInputs,
+) -> Result<(), ExactStateKillShotError> {
     if inputs.slot_leaves.is_empty()
         || inputs.state_paths.is_empty()
         || inputs.state_roots.is_empty()
         || inputs.state_roots.len() % 2 != 0
     {
-        return Err(ExactStateKillShotErrorV1::EmptyDerivedInput);
+        return Err(ExactStateKillShotError::EmptyDerivedInput);
     }
     if inputs.guard_buckets.is_some() != inputs.guard_paths.is_some() {
-        return Err(ExactStateKillShotErrorV1::GuardPresenceMismatch);
+        return Err(ExactStateKillShotError::GuardPresenceMismatch);
     }
     Ok(())
 }

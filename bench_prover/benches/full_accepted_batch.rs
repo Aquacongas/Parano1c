@@ -13,12 +13,11 @@ use std::io::Write;
 
 use bench_prover::{fmt_bytes, fmt_ms, median, time_once};
 use noid_block::{
-    accepted_block_certificate_batch_statement_digest_v1, accepted_claim_batch_digest_v1,
-    build_exact_state_transition_proof,
-    history_checkpoint_batch_summary_from_full_accepted_output_v1,
-    prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1,
+    accepted_block_certificate_batch_statement_digest, accepted_claim_batch_digest,
+    build_exact_state_transition_proof, history_checkpoint_batch_summary_from_full_accepted_output,
+    prove_history_checkpoint_step_proof_from_verified_full_accepted_output,
     prove_retained_full_accepted_block_batch_proof,
-    verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1,
+    verify_history_checkpoint_step_proof_with_verified_full_accepted_output,
     verify_retained_full_accepted_block_batch_proof, BlockAuthSidecar, BlockProof,
     FullAcceptedBlockBatchItem, FullAcceptedBlockBatchWitness,
 };
@@ -38,13 +37,12 @@ use noid_gkr::{
 };
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
 use noid_recursive::{
-    advance_history_checkpoint_head_v1_native, history_checkpoint_head_from_boundary_v1,
-    prove_accepted_claim_batch_digest_v1, verify_accepted_claim_batch_digest_v1,
-    verify_history_checkpoint_step_proof_v1_untrusted,
-    verify_history_checkpoint_step_statement_v1_native, verify_pow_header_witness_batch_native,
-    ChainAccumulator, HeaderWitness, HistoryCheckpointIvcChunkCoreProofV1,
-    HistoryCheckpointStepBackendProofV1, HistoryCheckpointStepStatementV1, RecursiveConsensusState,
-    HISTORY_CHECKPOINT_PROOF_VERSION,
+    advance_history_checkpoint_head_native, history_checkpoint_head_from_boundary,
+    prove_accepted_claim_batch_digest, verify_accepted_claim_batch_digest,
+    verify_history_checkpoint_step_proof_checkpoint,
+    verify_history_checkpoint_step_statement_native, verify_pow_header_witness_batch_native,
+    ChainAccumulator, HeaderWitness, HistoryCheckpointIvcChunkCoreProof,
+    HistoryCheckpointStepBackendProof, HistoryCheckpointStepStatement, RecursiveConsensusState,
 };
 use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
 use rayon::prelude::*;
@@ -507,16 +505,16 @@ where
         verify_times.push(elapsed);
     }
     let verify_time = median(verify_times);
-    let accepted_claim_batch_digest = accepted_claim_batch_digest_v1(&out);
+    let accepted_claim_batch_digest = accepted_claim_batch_digest(&out);
     let (accepted_claim_digest_proof_time, accepted_claim_digest_proof) = time_once(|| {
-        prove_accepted_claim_batch_digest_v1(
+        prove_accepted_claim_batch_digest(
             &out.proof_components.accepted_claim_witness,
             &out.accepted_claim_batch,
         )
         .expect("accepted-claim batch digest proof builds")
     });
     let (accepted_claim_digest_verify_time, ()) = time_once(|| {
-        verify_accepted_claim_batch_digest_v1(
+        verify_accepted_claim_batch_digest(
             &out.proof_components.accepted_claim_witness,
             &out.accepted_claim_batch,
             &accepted_claim_digest_proof,
@@ -528,7 +526,7 @@ where
         start_consensus.cumulative_chainwork,
     )
     .expect("start anchor computes");
-    let summary = history_checkpoint_batch_summary_from_full_accepted_output_v1(
+    let summary = history_checkpoint_batch_summary_from_full_accepted_output(
         &start_anchor,
         &start_consensus,
         &start_accumulator,
@@ -536,24 +534,23 @@ where
         accepted_claim_batch_digest,
     )
     .expect("checkpoint summary builds");
-    let previous_head = history_checkpoint_head_from_boundary_v1(
+    let previous_head = history_checkpoint_head_from_boundary(
         &summary.start_anchor,
         &summary.start_accumulator,
         &summary.start_consensus,
     )
     .expect("previous checkpoint head builds");
-    let next_head = advance_history_checkpoint_head_v1_native(&previous_head, &summary)
+    let next_head = advance_history_checkpoint_head_native(&previous_head, &summary)
         .expect("next checkpoint head builds");
-    let step_statement = HistoryCheckpointStepStatementV1 {
-        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+    let step_statement = HistoryCheckpointStepStatement {
         previous_head,
         batch_summary: summary,
         next_head,
     };
-    verify_history_checkpoint_step_statement_v1_native(&step_statement)
+    verify_history_checkpoint_step_statement_native(&step_statement)
         .expect("checkpoint step statement verifies");
     let (step_proof_time, (step_proof, certificate_batch_statement)) = time_once(|| {
-        prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1(
+        prove_history_checkpoint_step_proof_from_verified_full_accepted_output(
             &step_statement,
             &out,
         )
@@ -568,10 +565,10 @@ where
         step_statement.batch_summary.accepted_claim_batch_digest
     );
     let certificate_batch_statement_digest =
-        accepted_block_certificate_batch_statement_digest_v1(&certificate_batch_statement);
+        accepted_block_certificate_batch_statement_digest(&certificate_batch_statement);
     assert_ne!(certificate_batch_statement_digest, [0u8; 32]);
     let (step_private_verify_time, ()) = time_once(|| {
-        verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1(
+        verify_history_checkpoint_step_proof_with_verified_full_accepted_output(
             &step_statement,
             &certificate_batch_statement,
             &out,
@@ -580,13 +577,13 @@ where
         .expect("checkpoint step already verified accepted output verifies")
     });
     let (step_verify_time, step_verify_result) = time_once(|| {
-        verify_history_checkpoint_step_proof_v1_untrusted(
+        verify_history_checkpoint_step_proof_checkpoint(
             &step_statement,
             &certificate_batch_statement,
             &step_proof,
         )
     });
-    step_verify_result.expect("checkpoint step public placeholder path verifies");
+    step_verify_result.expect("checkpoint step public checkpoint path verifies");
     println!(
         "    blocks={} claims={} build_fixture={} prove={} verify={} proof={} end_height={} start_height={} suffix_budget={}",
         witness.items.len(),
@@ -615,13 +612,13 @@ where
         CHECKPOINT_BATCH_TARGET_BLOCKS
     );
     println!(
-        "    checkpoint_step proof={} prove={} private_verify={} public_verify_placeholder=ok public_verify={}",
+        "    checkpoint_step proof={} prove={} private_verify={} public_verify={}",
         fmt_bytes(step_proof.byte_len()),
         fmt_ms(step_proof_time),
         fmt_ms(step_private_verify_time),
         fmt_ms(step_verify_time)
     );
-    let step_backend: HistoryCheckpointStepBackendProofV1 =
+    let step_backend: HistoryCheckpointStepBackendProof =
         bincode::deserialize(&step_proof.backend_proof).expect("checkpoint step backend decodes");
     println!(
         "    checkpoint_step_parts backend={} step_digest={} cert_digest={} claim_digest={} chunk_core={}",
@@ -680,7 +677,7 @@ where
     );
 }
 
-fn print_chunk_core_part(chunk_core: &HistoryCheckpointIvcChunkCoreProofV1) {
+fn print_chunk_core_part(chunk_core: &HistoryCheckpointIvcChunkCoreProof) {
     let handle_bytes = bincode::serialized_size(&chunk_core.certificate_validity_handles)
         .expect("certificate validity handles serialize") as usize;
     let receipt_bytes = bincode::serialized_size(&chunk_core.certificate_receipts)

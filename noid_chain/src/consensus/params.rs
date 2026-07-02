@@ -126,7 +126,11 @@ pub const CONSENSUS_FINALITY_DEPTH: u64 = 18; // testnet initial value
 /// tuned for operational needs; it must not silently define finality.
 pub const UNDO_RETENTION_DEPTH: u64 = 18;
 
-/// Recent full-block retention depth for peer serving.
+/// Recent full-block retention depth for peer serving and normal catch-up.
+///
+/// Nodes keep full block bodies, block proofs, auth sidecars, and undo material
+/// only for this recent window. Older full payloads are prunable once consumed
+/// by accepted-block certificate/checkpoint coverage; headers remain permanent.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
 
 /// Compatibility alias for older internal callers.
@@ -205,7 +209,7 @@ pub const GENESIS_TARGET: [u8; 32] = {
 /// O(1) boundary, and this chainwork floor remains a resource/sanity guard:
 ///
 ///   tip < 18  -> no finalized history boundary and chainwork < threshold
-///   tip >= 18 -> finalized history/checkpoint scaffold may serve snapshots
+///   tip >= 18 -> finalized history/checkpoint coverage may serve snapshots
 ///
 /// # Security vs fake snapshots
 ///

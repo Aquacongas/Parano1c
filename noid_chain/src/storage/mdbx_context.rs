@@ -48,7 +48,7 @@ use crate::checkpoint::{
     checkpoint_payload_root, CheckpointCoverage, CheckpointSegmentPayload,
     ImmutableCheckpointManifest, ImmutableCheckpointPackage, CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN,
     CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN, CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN,
-    CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN, CHECKPOINT_VERSION,
+    CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN,
 };
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
@@ -705,7 +705,6 @@ impl MdbxChainContext {
 
         let reuse_guard_buckets = checkpoint_state.reuse_guard.buckets().to_vec();
         let manifest = ImmutableCheckpointManifest {
-            version: CHECKPOINT_VERSION,
             height,
             block_hash,
             cumulative_chainwork,
@@ -763,8 +762,8 @@ impl MdbxChainContext {
     }
 
     /// Reconstruct an already-finalized state snapshot from the current state
-    /// and retained undo logs. This is used by the O(1) snapshot scaffold to
-    /// serve state at the same finalized height covered by the history proof.
+    /// and retained undo logs. This is used by snapshot serving to return state
+    /// at the same finalized height covered by the history proof.
     pub fn reconstruct_state_snapshot_at(
         &mut self,
         height: u64,
@@ -1970,6 +1969,65 @@ mod tests {
         assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
         assert_eq!(ctx.store.get_block_auth_sidecar(1).unwrap(), None);
         assert_eq!(ctx.store.get_history_claim(1).unwrap(), None);
+
+        assert!(ctx.store.get_header(1).unwrap().is_some());
+        assert!(ctx.store.get_header_anchor(1).unwrap().is_some());
+        assert_eq!(
+            ctx.store.get_accepted_block_certificate(1).unwrap(),
+            Some(b"certificate-1".to_vec())
+        );
+    }
+
+    #[test]
+    fn block_payloads_do_not_prune_without_history_proof_coverage() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+
+        let first = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
+        ctx.store.put_block_proof(1, b"proof-1").unwrap();
+        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
+        ctx.store.put_history_claim(1, b"claim-1").unwrap();
+        ctx.store
+            .put_accepted_block_certificate(1, b"certificate-1")
+            .unwrap();
+
+        for _ in 0..CONSENSUS_FINALITY_DEPTH {
+            let block = build_empty_block_on(&mut ctx);
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+        }
+        ctx.store
+            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
+                checkpoint_id: [0xA5; 32],
+                height: 1,
+                block_hash: crate::hash_block_header(&first.header),
+                covered_from: 1,
+                covered_to: 1,
+                history_proof_covered_to: None,
+            })
+            .unwrap();
+        let block = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+
+        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
+        assert_eq!(
+            ctx.store.get_block_proof(1).unwrap(),
+            Some(b"proof-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_block_auth_sidecar(1).unwrap(),
+            Some(b"sidecar-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_history_claim(1).unwrap(),
+            Some(b"claim-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_accepted_block_certificate(1).unwrap(),
+            Some(b"certificate-1".to_vec())
+        );
     }
 
     #[test]

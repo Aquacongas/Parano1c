@@ -14,35 +14,33 @@ use noid_chain::consensus::validation::AnchorInfo;
 use noid_chain::hash_block_header;
 
 pub use noid_recursive::{
-    accepted_block_certificate_auth_sidecar_digest_v1,
-    accepted_block_certificate_batch_statement_digest_v1,
-    accepted_block_certificate_batch_statement_v1, accepted_block_certificate_block_body_digest_v1,
-    accepted_block_certificate_block_proof_digest_v1, accepted_block_certificate_chain_claim_v1,
-    accepted_block_certificate_receipt_v1, accepted_block_certificate_statement_digest_v1,
-    accepted_block_certificate_statement_fields_v1, accepted_block_certificate_validity_handle_v1,
-    prove_accepted_block_certificate_proof_v1_hash_only,
-    verify_accepted_block_certificate_receipt_projection_v1, AcceptedBlockCertificateBatchError,
-    AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateProofError,
-    AcceptedBlockCertificateProofV1, AcceptedBlockCertificateReceiptError,
-    AcceptedBlockCertificateReceiptV1, AcceptedBlockCertificateStatementV1,
-    AcceptedBlockCertificateValidityHandleError, AcceptedBlockCertificateValidityHandleV1,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    accepted_block_certificate_auth_sidecar_digest, accepted_block_certificate_batch_statement,
+    accepted_block_certificate_batch_statement_digest,
+    accepted_block_certificate_block_body_digest, accepted_block_certificate_block_proof_digest,
+    accepted_block_certificate_chain_claim, accepted_block_certificate_receipt,
+    accepted_block_certificate_statement_digest, accepted_block_certificate_statement_fields,
+    accepted_block_certificate_validity_handle, prove_accepted_block_certificate_proof_ivc_receipt,
+    verify_accepted_block_certificate_receipt_projection, AcceptedBlockCertificateBatchError,
+    AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateProof,
+    AcceptedBlockCertificateProofError, AcceptedBlockCertificateReceipt,
+    AcceptedBlockCertificateReceiptError, AcceptedBlockCertificateStatement,
+    AcceptedBlockCertificateValidityHandle, AcceptedBlockCertificateValidityHandleError,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS,
 };
 
 use crate::{
     accepted_block_claim_hash_from_transcript, accepted_block_claim_transcript,
     accepted_state_transition_claim_digest, AcceptedBlockValidationArtifacts,
     AcceptedStateTransitionClaim, BlockAuthSidecar, BlockProof, VerifyBlockError,
-    ACCEPT_BLOCK_PREDICATE_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockCertificateRecord {
     pub height: u64,
-    pub statement: AcceptedBlockCertificateStatementV1,
-    pub proof: AcceptedBlockCertificateProofV1,
-    pub receipt: AcceptedBlockCertificateReceiptV1,
-    pub validity_handle: AcceptedBlockCertificateValidityHandleV1,
+    pub statement: AcceptedBlockCertificateStatement,
+    pub proof: AcceptedBlockCertificateProof,
+    pub receipt: AcceptedBlockCertificateReceipt,
+    pub validity_handle: AcceptedBlockCertificateValidityHandle,
 }
 
 #[derive(Debug)]
@@ -66,15 +64,15 @@ impl std::fmt::Display for AcceptedBlockCertificateRecordError {
 
 impl std::error::Error for AcceptedBlockCertificateRecordError {}
 
-pub fn accepted_block_certificate_record_hash_only_scaffold(
-    statement: AcceptedBlockCertificateStatementV1,
+pub fn accepted_block_certificate_record(
+    statement: AcceptedBlockCertificateStatement,
 ) -> Result<AcceptedBlockCertificateRecord, AcceptedBlockCertificateRecordError> {
-    let receipt = accepted_block_certificate_receipt_v1(&statement);
-    verify_accepted_block_certificate_receipt_projection_v1(&statement, &receipt)
+    let receipt = accepted_block_certificate_receipt(&statement);
+    verify_accepted_block_certificate_receipt_projection(&statement, &receipt)
         .map_err(AcceptedBlockCertificateRecordError::Receipt)?;
-    let proof = prove_accepted_block_certificate_proof_v1_hash_only(&statement)
+    let proof = prove_accepted_block_certificate_proof_ivc_receipt(&statement)
         .map_err(AcceptedBlockCertificateRecordError::Proof)?;
-    let validity_handle = accepted_block_certificate_validity_handle_v1(&proof)
+    let validity_handle = accepted_block_certificate_validity_handle(&proof)
         .map_err(AcceptedBlockCertificateRecordError::ValidityHandle)?;
     Ok(AcceptedBlockCertificateRecord {
         height: statement.height,
@@ -86,7 +84,7 @@ pub fn accepted_block_certificate_record_hash_only_scaffold(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn accepted_block_certificate_statement_v1(
+pub fn accepted_block_certificate_statement(
     block: &Block,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
@@ -95,7 +93,7 @@ pub fn accepted_block_certificate_statement_v1(
     block_proof_bytes: &[u8],
     block_auth_sidecar_bytes: &[u8],
     artifacts: &AcceptedBlockValidationArtifacts,
-) -> Result<AcceptedBlockCertificateStatementV1, VerifyBlockError> {
+) -> Result<AcceptedBlockCertificateStatement, VerifyBlockError> {
     let user_tx_count = block
         .transactions
         .iter()
@@ -131,18 +129,16 @@ pub fn accepted_block_certificate_statement_v1(
         AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)?;
     let block_body = block.to_bytes();
 
-    Ok(AcceptedBlockCertificateStatementV1 {
-        version: ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
-        accept_block_predicate_version: ACCEPT_BLOCK_PREDICATE_VERSION,
+    Ok(AcceptedBlockCertificateStatement {
         height: block.header.height,
         block_id: hash_block_header(&block.header),
         parent_block_id: hash_block_header(parent),
         parent_state_root: parent.state_root,
         child_state_root: block.header.state_root,
         tx_root: block.header.tx_root,
-        block_body_digest: accepted_block_certificate_block_body_digest_v1(&block_body),
-        block_proof_digest: accepted_block_certificate_block_proof_digest_v1(block_proof_bytes),
-        auth_sidecar_digest: accepted_block_certificate_auth_sidecar_digest_v1(
+        block_body_digest: accepted_block_certificate_block_body_digest(&block_body),
+        block_proof_digest: accepted_block_certificate_block_proof_digest(block_proof_bytes),
+        auth_sidecar_digest: accepted_block_certificate_auth_sidecar_digest(
             block_auth_sidecar_bytes,
         ),
         accepted_block_claim_digest,
@@ -164,8 +160,8 @@ pub fn accepted_block_certificate_statement_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_accepted_block_certificate_statement_v1_native(
-    expected: &AcceptedBlockCertificateStatementV1,
+pub fn verify_accepted_block_certificate_statement_native(
+    expected: &AcceptedBlockCertificateStatement,
     block: &Block,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
@@ -175,7 +171,7 @@ pub fn verify_accepted_block_certificate_statement_v1_native(
     block_auth_sidecar_bytes: &[u8],
     artifacts: &AcceptedBlockValidationArtifacts,
 ) -> Result<(), VerifyBlockError> {
-    let actual = accepted_block_certificate_statement_v1(
+    let actual = accepted_block_certificate_statement(
         block,
         parent,
         prev_timestamps,
@@ -195,10 +191,8 @@ pub fn verify_accepted_block_certificate_statement_v1_native(
 mod tests {
     use super::*;
 
-    fn statement() -> AcceptedBlockCertificateStatementV1 {
-        AcceptedBlockCertificateStatementV1 {
-            version: ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
-            accept_block_predicate_version: ACCEPT_BLOCK_PREDICATE_VERSION,
+    fn statement() -> AcceptedBlockCertificateStatement {
+        AcceptedBlockCertificateStatement {
             height: 7,
             block_id: [1u8; 32],
             parent_block_id: [2u8; 32],
@@ -225,11 +219,10 @@ mod tests {
     }
 
     #[test]
-    fn certificate_record_hash_only_scaffold_binds_statement_receipt_and_handle() {
+    fn certificate_record_binds_statement_receipt_and_handle() {
         let statement = statement();
-        let record = accepted_block_certificate_record_hash_only_scaffold(statement.clone())
-            .expect("record builds");
-        let digest = accepted_block_certificate_statement_digest_v1(&statement);
+        let record = accepted_block_certificate_record(statement.clone()).expect("record builds");
+        let digest = accepted_block_certificate_statement_digest(&statement);
 
         assert_eq!(record.height, statement.height);
         assert_eq!(record.statement, statement);
@@ -238,9 +231,9 @@ mod tests {
         assert_eq!(record.validity_handle.statement_digest, digest);
         assert_eq!(
             record.validity_handle,
-            accepted_block_certificate_validity_handle_v1(&record.proof).expect("handle")
+            accepted_block_certificate_validity_handle(&record.proof).expect("handle")
         );
-        verify_accepted_block_certificate_receipt_projection_v1(&record.statement, &record.receipt)
+        verify_accepted_block_certificate_receipt_projection(&record.statement, &record.receipt)
             .expect("receipt projection");
 
         let encoded = bincode::serialize(&record).expect("serialize record");

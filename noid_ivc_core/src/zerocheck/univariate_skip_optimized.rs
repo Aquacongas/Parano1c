@@ -1,7 +1,7 @@
 //! Round-1 prover message — fully optimized (shift_reduce + extract_c, scalar).
 //!
 //! Scalar Rust implementation (no NEON). Three layered optimizations on top of
-//! the [`super::round1_extract_c`] scaffold:
+//! the [`super::round1_extract_c`] reference implementation:
 //!
 //! 1. **Geometric small-eq + shift_reduce inner** (3 inner-most rest-dims).
 //!    Protocol fixes the three small challenges to

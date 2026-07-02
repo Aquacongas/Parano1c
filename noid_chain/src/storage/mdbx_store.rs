@@ -68,6 +68,9 @@ const T_ACCEPTED_BLOCK_CERTIFICATES: &str = "accepted_block_certificates";
 /// Key: end height (u64 LE). Value: raw bincode bytes owned by noid_block/noid_recursive.
 const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
     "accepted_block_batch_certificate_packages";
+/// Verified recursive checkpoint head records.
+/// Key: checkpoint height (u64 LE). Value: raw bincode bytes owned by noid_recursive.
+const T_HISTORY_CHECKPOINT_HEADS: &str = "history_checkpoint_heads";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
@@ -221,6 +224,7 @@ impl MdbxStore {
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
+            T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
@@ -558,6 +562,57 @@ impl MdbxStore {
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES))?;
         txn.del(&tbl, u64_key(end_height), None)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Store verified recursive checkpoint head material.
+    ///
+    /// The record bytes are intentionally owned by `noid_recursive` so
+    /// `noid_chain` stays independent of the recursive proof crate.
+    pub fn put_history_checkpoint_head_record(
+        &self,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CHECKPOINT_HEADS))?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve verified recursive checkpoint head material by checkpoint height.
+    pub fn get_history_checkpoint_head_record(
+        &self,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CHECKPOINT_HEADS))?;
+        Ok(txn.get(&tbl, &u64_key(height))?)
+    }
+
+    /// Return the greatest checkpoint height that has a verified head record.
+    pub fn latest_history_checkpoint_head_height(&self) -> Result<Option<u64>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CHECKPOINT_HEADS))?;
+        let mut cur = txn.cursor(&tbl)?;
+        let mut latest = None;
+        let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+        while let Some((k, _)) = item {
+            if let Some(height) = u64_from_key(&k) {
+                latest = Some(latest.map_or(height, |current: u64| current.max(height)));
+            }
+            item = cur.next()?;
+        }
+        Ok(latest)
+    }
+
+    /// Delete a verified recursive checkpoint head record by checkpoint height.
+    pub fn delete_history_checkpoint_head_record(&self, height: u64) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_HISTORY_CHECKPOINT_HEADS))?;
+        txn.del(&tbl, u64_key(height), None)?;
         txn.commit()?;
         Ok(())
     }
@@ -1280,6 +1335,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
+            T_HISTORY_CHECKPOINT_HEADS,
             T_CHECKPOINT_COVERAGE,
             T_OWNER_INDEX,
             T_STATE_META,
@@ -1419,6 +1475,40 @@ mod tests {
             store
                 .latest_accepted_block_batch_certificate_package_height()
                 .unwrap(),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn history_checkpoint_head_record_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let bytes = b"recursive-head-record".to_vec();
+
+        assert_eq!(store.get_history_checkpoint_head_record(16).unwrap(), None);
+        store
+            .put_history_checkpoint_head_record(16, &bytes)
+            .expect("store recursive head record bytes");
+        assert_eq!(
+            store.get_history_checkpoint_head_record(16).unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(
+            store.latest_history_checkpoint_head_height().unwrap(),
+            Some(16)
+        );
+        store
+            .put_history_checkpoint_head_record(32, b"second")
+            .expect("store second recursive head record");
+        assert_eq!(
+            store.latest_history_checkpoint_head_height().unwrap(),
+            Some(32)
+        );
+        store
+            .delete_history_checkpoint_head_record(32)
+            .expect("delete second recursive head record");
+        assert_eq!(
+            store.latest_history_checkpoint_head_height().unwrap(),
             Some(16)
         );
     }

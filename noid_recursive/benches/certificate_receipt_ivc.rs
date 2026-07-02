@@ -9,14 +9,11 @@ use std::env;
 
 use noid_poseidon2b::primitives::Digest;
 use noid_recursive::{
-    accepted_block_certificate_validity_handle_v1,
-    prove_accepted_block_certificate_proof_v1_ivc_receipt,
-    verify_accepted_block_certificate_proof_v1_checkpoint, AcceptedBlockCertificateStatementV1,
-    ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1,
+    accepted_block_certificate_validity_handle, prove_accepted_block_certificate_proof_ivc_receipt,
+    verify_accepted_block_certificate_proof_checkpoint, AcceptedBlockCertificateStatement,
     ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG,
     ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_BATCH_SIZE,
     ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE, ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
 };
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -56,10 +53,8 @@ fn digest(byte: u8) -> Digest {
     [byte; 32]
 }
 
-fn statement() -> AcceptedBlockCertificateStatementV1 {
-    AcceptedBlockCertificateStatementV1 {
-        version: ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
-        accept_block_predicate_version: 1,
+fn statement() -> AcceptedBlockCertificateStatement {
+    AcceptedBlockCertificateStatement {
         height: 42,
         block_id: digest(1),
         parent_block_id: digest(2),
@@ -91,7 +86,6 @@ fn main() {
 
     println!("noid_recursive certificate_receipt_ivc");
     println!("  backend=accepted_block_certificate_ivc_receipt");
-    println!("  backend_kind={ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1}");
     println!("  m={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M}");
     println!("  k_log={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG}");
     println!("  pcs_log_inv_rate={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE}");
@@ -105,11 +99,11 @@ fn main() {
     let mut proof = None;
     for _ in 0..samples {
         let (prove_time, built) = time_once(|| {
-            prove_accepted_block_certificate_proof_v1_ivc_receipt(&statement)
+            prove_accepted_block_certificate_proof_ivc_receipt(&statement)
                 .expect("certificate receipt IVC proof builds")
         });
         let (verify_time, ()) = time_once(|| {
-            verify_accepted_block_certificate_proof_v1_checkpoint(&statement, &built)
+            verify_accepted_block_certificate_proof_checkpoint(&statement, &built)
                 .expect("certificate receipt IVC proof verifies")
         });
         prove_times.push(prove_time);
@@ -117,7 +111,7 @@ fn main() {
         proof = Some(built);
     }
     let proof = proof.expect("at least one sample");
-    let handle = accepted_block_certificate_validity_handle_v1(&proof)
+    let handle = accepted_block_certificate_validity_handle(&proof)
         .expect("certificate receipt IVC handle builds");
 
     println!("  proof={}", fmt_bytes(proof.byte_len()));

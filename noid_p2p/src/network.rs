@@ -74,80 +74,50 @@ fn local_checkpoint_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8
         );
         return None;
     }
-    let package_bytes = ctx
+    let record_bytes = ctx
         .store
-        .get_accepted_block_batch_certificate_package(height)
+        .get_history_checkpoint_head_record(height)
         .ok()
         .flatten()?;
-    let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
-        match bincode::deserialize(&package_bytes) {
-            Ok(package) => package,
+    let record: noid_recursive::StoredHistoryCheckpointHeadRecord =
+        match bincode::deserialize(&record_bytes) {
+            Ok(record) => record,
             Err(e) => {
                 tracing::warn!(
                     height,
                     err = ?e,
-                    "checkpoint package decode failed while serving proof"
+                    "checkpoint head record decode failed while serving proof"
                 );
                 return None;
             }
         };
-    if package.end_height() != height {
+    if record.height != height {
         tracing::warn!(
             height,
-            package_end = package.end_height(),
-            "checkpoint package height mismatch while serving proof"
+            record_height = record.height,
+            "checkpoint head record height mismatch while serving proof"
         );
         return None;
     }
-    let local_start_anchor = ctx
-        .store
-        .get_header_anchor(package.start_height())
-        .ok()
-        .flatten()?;
-    if local_start_anchor != package.step_statement.batch_summary.start_anchor {
-        tracing::warn!(
-            height,
-            package_start = package.start_height(),
-            "checkpoint package start anchor is no longer canonical"
-        );
+    if let Err(e) = noid_recursive::verify_history_checkpoint_head_record(&record) {
+        tracing::warn!(height, err = ?e, "checkpoint head record self-check failed");
         return None;
     }
     let local_end_anchor = ctx.store.get_header_anchor(height).ok().flatten()?;
-    if local_end_anchor != package.step_statement.batch_summary.end_anchor {
-        tracing::warn!(
-            height,
-            "checkpoint package end anchor is no longer canonical"
-        );
-        return None;
-    }
-
-    let base_anchor = ctx.store.get_header_anchor(0).ok().flatten()?;
-    let genesis_header = ctx.store.get_header(0).ok().flatten()?;
-    let genesis_hash = noid_chain::hash_block_header(&genesis_header);
-    if base_anchor.height != 0 || base_anchor.block_id != genesis_hash {
-        tracing::warn!("genesis header anchor mismatch while serving checkpoint proof");
-        return None;
-    }
-    let base_accumulator =
-        noid_recursive::genesis_accumulator(genesis_header.state_root, genesis_hash);
-    let proof = match noid_block::public_history_checkpoint_proof_from_package_v1(
-        &base_anchor,
-        &base_accumulator,
-        &package,
-    ) {
+    let proof = match noid_recursive::public_history_checkpoint_proof_from_head_record(&record) {
         Ok(proof) => proof,
         Err(e) => {
             tracing::warn!(
                 height,
                 err = ?e,
-                "checkpoint public proof build failed while serving proof"
+                "checkpoint public proof decode failed while serving proof"
             );
             return None;
         }
     };
-    if let Err(e) = noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+    if let Err(e) = noid_recursive::verify_history_checkpoint_proof_checkpoint(
         &proof,
-        &base_anchor,
+        &proof.start_anchor,
         &local_end_anchor,
     ) {
         tracing::warn!(
@@ -157,13 +127,7 @@ fn local_checkpoint_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8
         );
         return None;
     }
-    let bytes = match bincode::serialize(&proof) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(height, err = ?e, "checkpoint public proof encode failed");
-            return None;
-        }
-    };
+    let bytes = record.proof_bytes;
     if bytes.len() > MAX_HISTORY_PROOF_BYTES {
         tracing::warn!(
             height,

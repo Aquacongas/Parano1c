@@ -10,42 +10,37 @@
 
 pub mod accepted_block_batch;
 pub mod accepted_block_certificate;
-pub mod block_chain_context;
 pub mod exact_state_killshot;
 pub mod exact_state_transition;
 pub mod history_claim;
 pub mod validate;
 
 pub use accepted_block_batch::{
-    accepted_block_certificate_batch_statement_from_full_accepted_output_v1,
-    accepted_claim_batch_digest_v1, history_checkpoint_batch_summary_from_full_accepted_output_v1,
-    prove_full_accepted_block_batch_checkpoint_package_from_boundary_v1,
-    prove_full_accepted_block_batch_checkpoint_package_v1,
-    prove_history_checkpoint_step_proof_from_full_accepted_components_v1,
-    prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1,
-    prove_retained_full_accepted_block_batch_proof,
-    public_history_checkpoint_proof_from_package_v1,
-    verify_full_accepted_block_batch_checkpoint_package_v1,
+    accepted_block_certificate_batch_statement_from_full_accepted_output,
+    accepted_claim_batch_digest, history_checkpoint_batch_summary_from_full_accepted_output,
+    prove_accepted_block_certificate_batch_checkpoint_package,
+    prove_history_checkpoint_step_proof_from_verified_full_accepted_output,
+    prove_retained_block_certificate_batch_checkpoint_package,
+    prove_retained_block_certificate_batch_checkpoint_package_from_boundary,
+    prove_retained_full_accepted_block_batch_proof, public_history_checkpoint_proof_from_package,
+    verify_accepted_block_certificate_batch_checkpoint_package,
     verify_full_accepted_block_batch_native,
-    verify_history_checkpoint_step_proof_with_full_accepted_components_v1,
-    verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1,
-    verify_retained_full_accepted_block_batch_checkpoint_step_v1,
-    verify_retained_full_accepted_block_batch_proof, FullAcceptedBlockBatchCheckpointPackageV1,
-    FullAcceptedBlockBatchError, FullAcceptedBlockBatchItem, FullAcceptedBlockBatchOutput,
-    FullAcceptedBlockBatchProofComponents, FullAcceptedBlockBatchWitness,
-    RetainedFullAcceptedBlockBatchProof,
+    verify_history_checkpoint_step_proof_with_verified_full_accepted_output,
+    verify_retained_full_accepted_block_batch_proof,
+    AcceptedBlockCertificateBatchCheckpointPackage, AcceptedBlockCertificateBatchItem,
+    AcceptedBlockCertificateBatchWitness, FullAcceptedBlockBatchError, FullAcceptedBlockBatchItem,
+    FullAcceptedBlockBatchOutput, FullAcceptedBlockBatchProofComponents,
+    FullAcceptedBlockBatchWitness, RetainedFullAcceptedBlockBatchProof,
 };
 pub use accepted_block_certificate::{
-    accepted_block_certificate_batch_statement_digest_v1,
-    accepted_block_certificate_batch_statement_v1, accepted_block_certificate_chain_claim_v1,
-    accepted_block_certificate_record_hash_only_scaffold,
-    accepted_block_certificate_statement_digest_v1, accepted_block_certificate_statement_v1,
-    verify_accepted_block_certificate_statement_v1_native, AcceptedBlockCertificateBatchError,
-    AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateRecord,
-    AcceptedBlockCertificateRecordError, AcceptedBlockCertificateStatementV1,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    accepted_block_certificate_batch_statement, accepted_block_certificate_batch_statement_digest,
+    accepted_block_certificate_chain_claim, accepted_block_certificate_record,
+    accepted_block_certificate_statement, accepted_block_certificate_statement_digest,
+    verify_accepted_block_certificate_statement_native, AcceptedBlockCertificateBatchError,
+    AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateRecord,
+    AcceptedBlockCertificateRecordError, AcceptedBlockCertificateStatement,
 };
-pub use block_chain_context::{BlockChainContext, ReplayWitnessError};
+
 pub use exact_state_killshot::{
     derive_exact_state_killshot_inputs, prove_exact_state_killshot, verify_exact_state_killshot,
     ExactStateKillShotError, ExactStateKillShotInputs, ExactStateKillShotProof,
@@ -62,7 +57,7 @@ pub use exact_state_transition::{
 pub use history_claim::{
     accepted_state_transition_chain_claim, accepted_state_transition_claim_digest,
     accepted_state_transition_claim_fields, AcceptedStateTransitionClaim,
-    ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS, ACCEPTED_STATE_TRANSITION_CLAIM_VERSION,
+    ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS,
 };
 pub use validate::{
     accept_block, accept_block_timeless, accept_block_timeless_with_artifacts,
@@ -72,7 +67,7 @@ pub use validate::{
     AcceptedBlockRawValidationOutput, AcceptedBlockValidationArtifacts,
     AcceptedBlockValidationOutput, AuthorizationProof, AuthorizationVerifier,
     CanonicalAuthorizationStatement, FullValidationError, OwnerAuthAuthorizationVerifier,
-    VerifiedAuthorization, VerifiedAuthorizationBatch, ACCEPT_BLOCK_PREDICATE_VERSION,
+    VerifiedAuthorization, VerifiedAuthorizationBatch,
 };
 
 use crate::exact_state_transition::ExactStateTransitionProof as BlockExactStateTransitionProof;
@@ -216,7 +211,6 @@ pub struct AcceptedBlockResourceClaim {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockClaimTranscript {
-    pub predicate_version: u32,
     pub block: AcceptedBlockHeaderClaim,
     pub context: AcceptedBlockContextClaim,
     pub resources: AcceptedBlockResourceClaim,
@@ -259,7 +253,6 @@ pub fn accepted_block_claim_transcript(
     let block_body_len = block.to_bytes().len() as u64;
 
     Ok(AcceptedBlockClaimTranscript {
-        predicate_version: validate::ACCEPT_BLOCK_PREDICATE_VERSION,
         block: AcceptedBlockHeaderClaim::from_header(&block.header),
         context: AcceptedBlockContextClaim {
             parent: AcceptedBlockHeaderClaim::from_header(parent),
@@ -330,7 +323,6 @@ pub fn accepted_block_claim_fields_from_transcript(
     transcript: &AcceptedBlockClaimTranscript,
 ) -> [Block128; ACCEPTED_BLOCK_CLAIM_FIELDS] {
     let mut fields = Vec::with_capacity(ACCEPTED_BLOCK_CLAIM_FIELDS);
-    fields.push(Block128::from(transcript.predicate_version as u128));
     push_header_claim_fields(&mut fields, &transcript.block);
     push_header_claim_fields(&mut fields, &transcript.context.parent);
     push_u64_window_fields(
@@ -364,6 +356,7 @@ pub fn accepted_block_claim_fields_from_transcript(
     fields.push(Block128::from(
         transcript.resources.state_frontier_node_count as u128,
     ));
+    fields.push(Block128::ZERO);
     fields
         .try_into()
         .expect("accepted-block claim schedule has fixed 80-field length")

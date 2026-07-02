@@ -136,7 +136,7 @@ pub fn round1_naive(
 //
 // The geometric-eq shift_reduce + convert-table tricks (which give the C++ its
 // final ~5× win) are a follow-up; they change the output by the C_s factor,
-// so doing them on a separately-validated scaffold is cleaner.
+// so doing them against a separately-validated reference is cleaner.
 
 /// Pack a bit vector LSB-first into bytes.
 pub fn pack_bits(bits: &[bool]) -> Vec<u8> {

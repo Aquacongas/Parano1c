@@ -533,8 +533,6 @@ pub fn validate_block_auth_sidecar_shape(
 // Network-facing entry point
 // ---------------------------------------------------------------------------
 
-pub const ACCEPT_BLOCK_PREDICATE_VERSION: u32 = 1;
-
 /// Normative production `AcceptBlock` predicate for a receiving full node.
 ///
 /// Takes the raw `block_proof_bytes` received over P2P and:

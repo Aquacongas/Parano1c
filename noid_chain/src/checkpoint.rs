@@ -11,22 +11,19 @@
 use crate::reuse_guard::GuardBucket;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
-pub const CHECKPOINT_VERSION: u32 = 1;
-const MANIFEST_DIGEST_DOMAIN: &[u8] = b"NOID_IMMUTABLE_CHECKPOINT_MANIFEST_V1";
+const MANIFEST_DIGEST_DOMAIN: &[u8] = b"NOID_IMMUTABLE_CHECKPOINT_MANIFEST";
 const MERKLE_EMPTY_TAG: &[u8] = b"empty";
 const MERKLE_LEAF_TAG: &[u8] = b"leaf";
 const MERKLE_NODE_TAG: &[u8] = b"node";
 const MERKLE_ROOT_TAG: &[u8] = b"root";
 
-pub const CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_BLOCK_BODY_ROOT_V1";
-pub const CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_BLOCK_PROOF_ROOT_V1";
-pub const CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_AUTH_SIDECAR_ROOT_V1";
-pub const CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN: &[u8] =
-    b"NOID_CHECKPOINT_SEGMENT_PAYLOAD_ROOT_V1";
+pub const CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_BLOCK_BODY_ROOT";
+pub const CHECKPOINT_BLOCK_PROOF_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_BLOCK_PROOF_ROOT";
+pub const CHECKPOINT_AUTH_SIDECAR_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_AUTH_SIDECAR_ROOT";
+pub const CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN: &[u8] = b"NOID_CHECKPOINT_SEGMENT_PAYLOAD_ROOT";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImmutableCheckpointManifest {
-    pub version: u32,
     pub height: u64,
     pub block_hash: [u8; 32],
     pub cumulative_chainwork: [u8; 32],
@@ -147,7 +144,6 @@ mod tests {
     #[test]
     fn manifest_digest_changes_when_roots_change() {
         let mut manifest = ImmutableCheckpointManifest {
-            version: CHECKPOINT_VERSION,
             height: 7,
             block_hash: [1; 32],
             cumulative_chainwork: [2; 32],

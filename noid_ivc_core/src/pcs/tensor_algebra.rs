@@ -117,8 +117,8 @@ impl AddAssign<&TensorAlgebra> for TensorAlgebra {
 /// at position `(i, j)`.
 /// On output: bit `j` of `elems[i]` becomes the old bit `i` of `elems[j]`.
 ///
-/// V1 implementation: naive O(D²) bit-scan. Each of 128² output bits is read
-/// from exactly one input bit.
+/// Naive O(D²) bit-scan. Each of 128² output bits is read from exactly one
+/// input bit.
 fn square_transpose(elems: &mut [F128]) {
     assert_eq!(
         elems.len(),

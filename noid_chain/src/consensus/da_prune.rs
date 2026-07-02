@@ -11,8 +11,8 @@
 //!
 //! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
 //! pruned (`prune_undo_logs`). MDBX also prunes retained block bytes,
-//! BlockProof bytes, and Auth sidecars once the finalized history/checkpoint
-//! scaffold has consumed the same heights.
+//! BlockProof bytes, and Auth sidecars once finalized history/checkpoint
+//! coverage has consumed the same heights.
 
 use std::collections::HashMap;
 

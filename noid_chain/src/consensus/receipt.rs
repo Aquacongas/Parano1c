@@ -21,7 +21,7 @@ use noid_poseidon2b::native::{compress, poseidon2b_hash_bytes};
 use crate::block_header::BlockHeader;
 use noid_poseidon2b::primitives::Address;
 
-const RECEIPT_SUMMARY_HASH_DOMAIN: &[u8] = b"NOID_RECEIPT_SUMMARY_V1";
+const RECEIPT_SUMMARY_HASH_DOMAIN: &[u8] = b"NOID_RECEIPT_SUMMARY";
 
 /// Compact summary of a transaction (public on-chain data only).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

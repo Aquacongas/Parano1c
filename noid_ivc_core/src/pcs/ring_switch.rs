@@ -2975,7 +2975,7 @@ mod tests {
             let (s0_mfr, s1_mfr) = fold_1b_rows_2way_mfr(&pw, &tensor0, &tensor1);
 
             assert_eq!(s0_mfr, s0_ref, "s_hat_v0 mismatch at m={m}");
-            assert_eq!(s1_mfr, s1_ref, "s_hat_v1 mismatch at m={m}");
+            assert_eq!(s1_mfr, s1_ref, "s_hat mismatch at m={m}");
         }
     }
 

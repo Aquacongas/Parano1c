@@ -115,8 +115,8 @@ pub struct GetStateManifestRequest {
 /// Manifest response: chain metadata + list of active segment IDs.
 ///
 /// `tip_height = 0` means no snapshot is being advertised.
-/// In V1 scaffold sync, `tip_height`, `tip_hash`, and `cumulative_chainwork`
-/// describe the finalized snapshot boundary `F`, not the peer's live tip.
+/// `tip_height`, `tip_hash`, and `cumulative_chainwork` describe the finalized
+/// snapshot boundary `F`, not the peer's live tip.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GetStateManifestResponse {
     /// Finalized snapshot boundary height. 0 = "use block sync instead".

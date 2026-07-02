@@ -33,7 +33,7 @@ use libp2p_connection_limits as connection_limits;
 use noid_chain::consensus::wire_limits::GOSSIP_MAX_TRANSMIT_BYTES;
 use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
-const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID_V1";
+const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::protocol::{
     GetHeadersRequest, GetHeadersResponse, GetHistoryProofRequest, GetHistoryProofResponse,

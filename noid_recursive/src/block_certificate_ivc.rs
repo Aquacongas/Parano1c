@@ -18,14 +18,13 @@ use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use noid_poseidon2b::primitives::Digest;
 
 use crate::block_certificate::{
-    accepted_block_certificate_receipt_v1, accepted_block_certificate_statement_digest_v1,
-    verify_accepted_block_certificate_receipt_projection_v1, AcceptedBlockCertificateProofError,
-    AcceptedBlockCertificateReceiptError, AcceptedBlockCertificateReceiptV1,
-    AcceptedBlockCertificateStatementV1, ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1,
-    ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION, ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION,
+    accepted_block_certificate_receipt, accepted_block_certificate_statement_digest,
+    verify_accepted_block_certificate_receipt_projection, AcceptedBlockCertificateProofError,
+    AcceptedBlockCertificateReceipt, AcceptedBlockCertificateReceiptError,
+    AcceptedBlockCertificateStatement,
 };
 
-pub const ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION_V1: u32 = 1;
+pub const ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION: u32 = 1;
 pub const ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M: usize = 14;
 pub const ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG: usize = 13;
 pub const ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE: usize = 4;
@@ -35,30 +34,22 @@ const TRANSCRIPT_DOMAIN: &[u8] = b"noid-accepted-block-certificate-ivc-receipt-v
 const STATEMENT_DIGEST_DOMAIN: &[u8] = b"NOID/ABC/IVC-RECEIPT/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AcceptedBlockCertificateIvcReceiptBackendProofV1 {
-    pub version: u32,
-    pub backend_kind: u32,
+pub struct AcceptedBlockCertificateIvcReceiptBackendProof {
     pub relation: u32,
-    pub receipt: AcceptedBlockCertificateReceiptV1,
+    pub receipt: AcceptedBlockCertificateReceipt,
     pub core_proof: Vec<u8>,
 }
 
-impl AcceptedBlockCertificateIvcReceiptBackendProofV1 {
+impl AcceptedBlockCertificateIvcReceiptBackendProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self)
-            .expect("serialized AcceptedBlockCertificateIvcReceiptBackendProofV1 length fits usize")
+            .expect("serialized AcceptedBlockCertificateIvcReceiptBackendProof length fits usize")
             as usize
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptedBlockCertificateIvcReceiptError {
-    UnsupportedVersion {
-        actual: u32,
-    },
-    UnsupportedBackendKind {
-        actual: u32,
-    },
     UnsupportedRelation {
         actual: u32,
     },
@@ -78,12 +69,6 @@ pub enum AcceptedBlockCertificateIvcReceiptError {
 impl std::fmt::Display for AcceptedBlockCertificateIvcReceiptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedVersion { actual } => {
-                write!(f, "unsupported certificate IVC receipt version {actual}")
-            }
-            Self::UnsupportedBackendKind { actual } => {
-                write!(f, "unsupported certificate IVC backend kind {actual}")
-            }
             Self::UnsupportedRelation { actual } => {
                 write!(f, "unsupported certificate IVC receipt relation {actual}")
             }
@@ -109,20 +94,20 @@ impl std::fmt::Display for AcceptedBlockCertificateIvcReceiptError {
 
 impl std::error::Error for AcceptedBlockCertificateIvcReceiptError {}
 
-pub fn prove_accepted_block_certificate_ivc_receipt_backend_v1(
-    statement: &AcceptedBlockCertificateStatementV1,
-) -> Result<AcceptedBlockCertificateIvcReceiptBackendProofV1, AcceptedBlockCertificateIvcReceiptError>
+pub fn prove_accepted_block_certificate_ivc_receipt_backend(
+    statement: &AcceptedBlockCertificateStatement,
+) -> Result<AcceptedBlockCertificateIvcReceiptBackendProof, AcceptedBlockCertificateIvcReceiptError>
 {
-    let receipt = accepted_block_certificate_receipt_v1(statement);
-    prove_accepted_block_certificate_ivc_receipt_backend_v1_with_receipt(statement, &receipt)
+    let receipt = accepted_block_certificate_receipt(statement);
+    prove_accepted_block_certificate_ivc_receipt_backend_with_receipt(statement, &receipt)
 }
 
-pub fn prove_accepted_block_certificate_ivc_receipt_backend_v1_with_receipt(
-    statement: &AcceptedBlockCertificateStatementV1,
-    receipt: &AcceptedBlockCertificateReceiptV1,
-) -> Result<AcceptedBlockCertificateIvcReceiptBackendProofV1, AcceptedBlockCertificateIvcReceiptError>
+pub fn prove_accepted_block_certificate_ivc_receipt_backend_with_receipt(
+    statement: &AcceptedBlockCertificateStatement,
+    receipt: &AcceptedBlockCertificateReceipt,
+) -> Result<AcceptedBlockCertificateIvcReceiptBackendProof, AcceptedBlockCertificateIvcReceiptError>
 {
-    verify_accepted_block_certificate_receipt_projection_v1(statement, receipt)
+    verify_accepted_block_certificate_receipt_projection(statement, receipt)
         .map_err(AcceptedBlockCertificateIvcReceiptError::BadReceiptProjection)?;
     let (r1cs, witness) = build_receipt_projection_r1cs(statement, receipt)?;
     if !r1cs.satisfies(&witness) {
@@ -137,34 +122,18 @@ pub fn prove_accepted_block_certificate_ivc_receipt_backend_v1_with_receipt(
     let mut challenger = receipt_challenger(statement, receipt);
     let (proof, commitment, _) =
         noid_ivc_prover::prover::prove(&r1cs, &z_packed, &pcs_params, &mut challenger);
-    Ok(AcceptedBlockCertificateIvcReceiptBackendProofV1 {
-        version: ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION,
-        backend_kind: ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1,
-        relation: ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION_V1,
+    Ok(AcceptedBlockCertificateIvcReceiptBackendProof {
+        relation: ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION,
         receipt: receipt.clone(),
         core_proof: R1csProofBundle { commitment, proof }.to_bytes(),
     })
 }
 
-pub fn verify_accepted_block_certificate_ivc_receipt_backend_v1(
-    statement: &AcceptedBlockCertificateStatementV1,
-    proof: &AcceptedBlockCertificateIvcReceiptBackendProofV1,
+pub fn verify_accepted_block_certificate_ivc_receipt_backend(
+    statement: &AcceptedBlockCertificateStatement,
+    proof: &AcceptedBlockCertificateIvcReceiptBackendProof,
 ) -> Result<(), AcceptedBlockCertificateIvcReceiptError> {
-    if proof.version != ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION {
-        return Err(
-            AcceptedBlockCertificateIvcReceiptError::UnsupportedVersion {
-                actual: proof.version,
-            },
-        );
-    }
-    if proof.backend_kind != ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1 {
-        return Err(
-            AcceptedBlockCertificateIvcReceiptError::UnsupportedBackendKind {
-                actual: proof.backend_kind,
-            },
-        );
-    }
-    if proof.relation != ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION_V1 {
+    if proof.relation != ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION {
         return Err(
             AcceptedBlockCertificateIvcReceiptError::UnsupportedRelation {
                 actual: proof.relation,
@@ -174,7 +143,7 @@ pub fn verify_accepted_block_certificate_ivc_receipt_backend_v1(
     if proof.core_proof.is_empty() {
         return Err(AcceptedBlockCertificateIvcReceiptError::EmptyCoreProof);
     }
-    verify_accepted_block_certificate_receipt_projection_v1(statement, &proof.receipt)
+    verify_accepted_block_certificate_receipt_projection(statement, &proof.receipt)
         .map_err(AcceptedBlockCertificateIvcReceiptError::BadReceiptProjection)?;
 
     let (r1cs, _) = build_receipt_projection_r1cs(statement, &proof.receipt)?;
@@ -193,35 +162,33 @@ pub fn verify_accepted_block_certificate_ivc_receipt_backend_v1(
     .map_err(|_| AcceptedBlockCertificateIvcReceiptError::CoreVerify)
 }
 
-pub fn prove_accepted_block_certificate_proof_v1_ivc_receipt(
-    statement: &AcceptedBlockCertificateStatementV1,
+pub fn prove_accepted_block_certificate_proof_ivc_receipt(
+    statement: &AcceptedBlockCertificateStatement,
 ) -> Result<
-    crate::block_certificate::AcceptedBlockCertificateProofV1,
+    crate::block_certificate::AcceptedBlockCertificateProof,
     AcceptedBlockCertificateProofError,
 > {
-    let backend = prove_accepted_block_certificate_ivc_receipt_backend_v1(statement)
+    let backend = prove_accepted_block_certificate_ivc_receipt_backend(statement)
         .map_err(|_| AcceptedBlockCertificateProofError::BadIvcReceiptBackend)?;
-    Ok(crate::block_certificate::AcceptedBlockCertificateProofV1 {
-        version: ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION,
-        backend_kind: ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1,
-        statement_digest: accepted_block_certificate_statement_digest_v1(statement),
+    Ok(crate::block_certificate::AcceptedBlockCertificateProof {
+        statement_digest: accepted_block_certificate_statement_digest(statement),
         backend_proof: bincode::serialize(&backend)
-            .expect("AcceptedBlockCertificateIvcReceiptBackendProofV1 serializes"),
+            .expect("AcceptedBlockCertificateIvcReceiptBackendProof serializes"),
     })
 }
 
-pub fn decode_and_verify_accepted_block_certificate_ivc_receipt_backend_v1(
-    statement: &AcceptedBlockCertificateStatementV1,
+pub fn decode_and_verify_accepted_block_certificate_ivc_receipt_backend(
+    statement: &AcceptedBlockCertificateStatement,
     bytes: &[u8],
 ) -> Result<(), AcceptedBlockCertificateIvcReceiptError> {
-    let backend: AcceptedBlockCertificateIvcReceiptBackendProofV1 = bincode::deserialize(bytes)
+    let backend: AcceptedBlockCertificateIvcReceiptBackendProof = bincode::deserialize(bytes)
         .map_err(|_| AcceptedBlockCertificateIvcReceiptError::DecodeCoreProof)?;
-    verify_accepted_block_certificate_ivc_receipt_backend_v1(statement, &backend)
+    verify_accepted_block_certificate_ivc_receipt_backend(statement, &backend)
 }
 
-pub fn accepted_block_certificate_ivc_receipt_relation_digest_v1() -> Digest {
+pub fn accepted_block_certificate_ivc_receipt_relation_digest() -> Digest {
     let constants = [
-        ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION_V1 as u64,
+        ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION as u64,
         ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M as u64,
         ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG as u64,
         ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE as u64,
@@ -235,8 +202,8 @@ pub fn accepted_block_certificate_ivc_receipt_relation_digest_v1() -> Digest {
 }
 
 fn build_receipt_projection_r1cs(
-    statement: &AcceptedBlockCertificateStatementV1,
-    receipt: &AcceptedBlockCertificateReceiptV1,
+    statement: &AcceptedBlockCertificateStatement,
+    receipt: &AcceptedBlockCertificateReceipt,
 ) -> Result<(BlockR1cs, Vec<bool>), AcceptedBlockCertificateIvcReceiptError> {
     let mut builder = BinaryR1csBuilder::new(ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG);
     let pairs = receipt_projection_pairs(statement, receipt);
@@ -257,15 +224,11 @@ fn build_receipt_projection_r1cs(
 }
 
 fn receipt_projection_pairs(
-    statement: &AcceptedBlockCertificateStatementV1,
-    receipt: &AcceptedBlockCertificateReceiptV1,
+    statement: &AcceptedBlockCertificateStatement,
+    receipt: &AcceptedBlockCertificateReceipt,
 ) -> Vec<(Block128, Block128)> {
-    let statement_digest = accepted_block_certificate_statement_digest_v1(statement);
-    let mut pairs = Vec::with_capacity(14);
-    pairs.push((
-        Block128::from(ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION as u128),
-        Block128::from(receipt.version as u128),
-    ));
+    let statement_digest = accepted_block_certificate_statement_digest(statement);
+    let mut pairs = Vec::with_capacity(13);
     push_digest_pair(&mut pairs, &statement_digest, &receipt.statement_digest);
     pairs.push((
         Block128::from(statement.height as u128),
@@ -335,14 +298,14 @@ fn validate_receipt_pcs_params(
 }
 
 fn receipt_challenger(
-    statement: &AcceptedBlockCertificateStatementV1,
-    receipt: &AcceptedBlockCertificateReceiptV1,
+    statement: &AcceptedBlockCertificateStatement,
+    receipt: &AcceptedBlockCertificateReceipt,
 ) -> FsChallenger {
     let mut challenger = FsChallenger::new(TRANSCRIPT_DOMAIN);
-    challenger.observe_bytes(&accepted_block_certificate_ivc_receipt_relation_digest_v1());
-    challenger.observe_bytes(&accepted_block_certificate_statement_digest_v1(statement));
+    challenger.observe_bytes(&accepted_block_certificate_ivc_receipt_relation_digest());
+    challenger.observe_bytes(&accepted_block_certificate_statement_digest(statement));
     challenger.observe_bytes(
-        &bincode::serialize(receipt).expect("AcceptedBlockCertificateReceiptV1 serializes"),
+        &bincode::serialize(receipt).expect("AcceptedBlockCertificateReceipt serializes"),
     );
     challenger
 }
@@ -355,10 +318,8 @@ mod tests {
         [byte; 32]
     }
 
-    fn statement() -> AcceptedBlockCertificateStatementV1 {
-        AcceptedBlockCertificateStatementV1 {
-            version: crate::block_certificate::ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
-            accept_block_predicate_version: 1,
+    fn statement() -> AcceptedBlockCertificateStatement {
+        AcceptedBlockCertificateStatement {
             height: 7,
             block_id: digest(1),
             parent_block_id: digest(2),
@@ -387,21 +348,20 @@ mod tests {
     #[test]
     fn receipt_ivc_backend_roundtrips_and_rejects_tamper() {
         let statement = statement();
-        let backend = prove_accepted_block_certificate_ivc_receipt_backend_v1(&statement)
+        let backend = prove_accepted_block_certificate_ivc_receipt_backend(&statement)
             .expect("receipt IVC backend proves");
-        assert_eq!(backend.version, ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION);
         assert_eq!(
-            backend.backend_kind,
-            ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1
+            backend.relation,
+            ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION
         );
         assert!(!backend.core_proof.is_empty());
-        verify_accepted_block_certificate_ivc_receipt_backend_v1(&statement, &backend)
+        verify_accepted_block_certificate_ivc_receipt_backend(&statement, &backend)
             .expect("receipt IVC backend verifies");
 
         let mut bad = backend.clone();
         bad.receipt.child_state_root = digest(0x55);
         assert!(matches!(
-            verify_accepted_block_certificate_ivc_receipt_backend_v1(&statement, &bad),
+            verify_accepted_block_certificate_ivc_receipt_backend(&statement, &bad),
             Err(AcceptedBlockCertificateIvcReceiptError::BadReceiptProjection(_))
         ));
 
@@ -409,7 +369,7 @@ mod tests {
         let last = bad.core_proof.len() - 1;
         bad.core_proof[last] ^= 1;
         assert!(matches!(
-            verify_accepted_block_certificate_ivc_receipt_backend_v1(&statement, &bad),
+            verify_accepted_block_certificate_ivc_receipt_backend(&statement, &bad),
             Err(AcceptedBlockCertificateIvcReceiptError::DecodeCoreProof
                 | AcceptedBlockCertificateIvcReceiptError::CoreVerify)
         ));
@@ -418,22 +378,17 @@ mod tests {
     #[test]
     fn top_level_certificate_proof_accepts_ivc_receipt_backend() {
         let statement = statement();
-        let proof = prove_accepted_block_certificate_proof_v1_ivc_receipt(&statement)
+        let proof = prove_accepted_block_certificate_proof_ivc_receipt(&statement)
             .expect("top-level IVC receipt proof builds");
-        assert_eq!(
-            proof.backend_kind,
-            ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1
-        );
-        crate::block_certificate::verify_accepted_block_certificate_proof_v1_checkpoint(
+        crate::block_certificate::verify_accepted_block_certificate_proof_checkpoint(
             &statement, &proof,
         )
         .expect("top-level IVC receipt proof verifies");
-        let handle =
-            crate::block_certificate::accepted_block_certificate_validity_handle_v1(&proof)
-                .expect("IVC receipt proof handle builds");
+        let handle = crate::block_certificate::accepted_block_certificate_validity_handle(&proof)
+            .expect("IVC receipt proof handle builds");
         assert_eq!(
             handle.statement_digest,
-            accepted_block_certificate_statement_digest_v1(&statement)
+            accepted_block_certificate_statement_digest(&statement)
         );
     }
 }

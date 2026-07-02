@@ -101,6 +101,11 @@ type VerifiedSnapshotSegment = (
     [u8; 32],
 );
 
+fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
+    peer_height
+        > local_height.saturating_add(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
+}
+
 mod config;
 mod wallet;
 use config::NodeConfig;
@@ -1063,12 +1068,9 @@ fn verify_snapshot_history_proof_headers_anchored(
     if proof_bytes.is_empty() {
         return Err("snapshot checkpoint proof missing".into());
     }
-    let proof: noid_recursive::HistoryCheckpointProofV1 = bincode::deserialize(proof_bytes)
+    let proof: noid_recursive::HistoryCheckpointProof = bincode::deserialize(proof_bytes)
         .map_err(|e| format!("snapshot checkpoint proof decode failed: {e}"))?;
-    if proof.version != noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION {
-        return Err("snapshot checkpoint proof version mismatch".into());
-    }
-    if proof.engine_id != noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1 {
+    if proof.engine_id != noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC {
         return Err("snapshot checkpoint proof engine mismatch".into());
     }
     if proof.checkpoint_height != manifest.tip_height
@@ -1081,7 +1083,7 @@ fn verify_snapshot_history_proof_headers_anchored(
         read_local_header_anchor(store, proof.start_anchor.height, "checkpoint start")?;
     let local_end_anchor =
         read_local_header_anchor(store, proof.end_anchor.height, "checkpoint end")?;
-    noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+    noid_recursive::verify_history_checkpoint_proof_checkpoint(
         &proof,
         &local_start_anchor,
         &local_end_anchor,
@@ -1127,7 +1129,7 @@ fn accepted_block_certificate_record_bytes(
     block_auth_sidecar_bytes: &[u8],
     artifacts: &noid_block::AcceptedBlockValidationArtifacts,
 ) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let statement = noid_block::accepted_block_certificate_statement_v1(
+    let statement = noid_block::accepted_block_certificate_statement(
         block,
         parent,
         prev_timestamps,
@@ -1137,14 +1139,13 @@ fn accepted_block_certificate_record_bytes(
         block_auth_sidecar_bytes,
         artifacts,
     )?;
-    let record = noid_block::accepted_block_certificate_record_hash_only_scaffold(statement)
-        .map_err(|e| {
-            noid_block::FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                    "accepted-block certificate record build failed: {e}"
-                )),
-            )
-        })?;
+    let record = noid_block::accepted_block_certificate_record(statement).map_err(|e| {
+        noid_block::FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                "accepted-block certificate record build failed: {e}"
+            )),
+        )
+    })?;
     Ok(bincode::serialize(&record).expect("AcceptedBlockCertificateRecord serializes"))
 }
 
@@ -1531,7 +1532,74 @@ fn validate_p2p_block_proof_binding(
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_manifest_fork_choice, verify_snapshot_history_proof_headers_anchored};
+    use super::{
+        compare_manifest_fork_choice, gap_requires_snapshot_sync,
+        verify_snapshot_history_proof_headers_anchored,
+    };
+
+    #[test]
+    fn sync_mode_uses_retained_block_window_boundary() {
+        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+        assert_eq!(
+            retention, 18,
+            "pre-launch retained full-block window is 18 blocks"
+        );
+        let local_height = 100;
+
+        assert!(!gap_requires_snapshot_sync(local_height, local_height));
+        assert!(!gap_requires_snapshot_sync(local_height, local_height + 17));
+        assert!(!gap_requires_snapshot_sync(local_height, local_height + 18));
+        assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
+    }
+
+    fn test_parent_header(state: &mut noid_chain::ChainState) -> noid_chain::BlockHeader {
+        noid_chain::BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.state_root(),
+            tx_root: noid_chain::compute_tx_root(&[]),
+            timestamp: 1_767_225_600,
+            height: 0,
+            miner_address: noid_poseidon2b::primitives::Address([0x11; 32]),
+            nonce: 0,
+            difficulty_target: noid_chain::consensus::params::MAX_TARGET,
+            log_slots: state.state.log_slots() as u32,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        }
+    }
+
+    fn test_empty_child(
+        parent: &noid_chain::BlockHeader,
+        state: &mut noid_chain::ChainState,
+    ) -> noid_chain::block::Block {
+        let timestamp = parent.timestamp + noid_chain::consensus::params::BLOCK_TIME;
+        let difficulty_target = noid_chain::consensus::difficulty::next_target(
+            0,
+            parent.timestamp,
+            &parent.difficulty_target,
+            parent.height + 1,
+            timestamp,
+        );
+        let mut header = noid_chain::BlockHeader {
+            prev_block_hash: noid_chain::hash_block_header(parent),
+            state_root: state.state_root(),
+            tx_root: noid_chain::compute_tx_root(&[]),
+            timestamp,
+            height: parent.height + 1,
+            miner_address: noid_poseidon2b::primitives::Address([0x22; 32]),
+            nonce: 0,
+            difficulty_target,
+            log_slots: parent.log_slots,
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
+        };
+        header.nonce = noid_chain::consensus::pow::search_pow(&header, 0, 1_000_000)
+            .expect("easy test target mines");
+        noid_chain::block::Block {
+            header,
+            transactions: vec![],
+        }
+    }
 
     fn minimal_current_block_proof() -> noid_block::BlockProof {
         noid_block::BlockProof::minimal(
@@ -1573,27 +1641,59 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = noid_chain::storage::MdbxStore::open(dir.path()).expect("open store");
 
-        let h0 = noid_chain::consensus::genesis::genesis_header();
+        let mut state = noid_chain::ChainState::with_log_slots(8);
+        let h0 = test_parent_header(&mut state);
         let h0_hash = noid_chain::hash_block_header(&h0);
+        let high_start_work = [2u8; 32];
         store
-            .put_verified_header_only(&h0, &h0_hash, &[1u8; 32])
+            .put_verified_header_only(&h0, &h0_hash, &high_start_work)
             .expect("store genesis header");
 
-        let h1 = noid_chain::BlockHeader {
-            prev_block_hash: h0_hash,
-            state_root: [2u8; 32],
-            tx_root: [3u8; 32],
-            timestamp: h0.timestamp + 15,
-            height: 1,
-            miner_address: h0.miner_address,
-            nonce: 1,
-            difficulty_target: h0.difficulty_target,
-            log_slots: h0.log_slots,
-            active_slot_count: 1,
-            alloc_counter: 1,
+        let start_consensus = noid_recursive::RecursiveConsensusState::from_header(
+            &h0,
+            high_start_work,
+            0,
+            h0.timestamp,
+            h0.difficulty_target,
+            &[h0.timestamp],
+            &[h0.active_slot_count],
+        );
+        let start_accumulator = noid_recursive::ChainAccumulator {
+            height: h0.height,
+            state_root: h0.state_root,
+            chain_hash: [0u8; 32],
         };
+        let start_anchor = noid_chain::header_anchor::compute_header_chain_anchor(
+            std::iter::once(&h0),
+            high_start_work,
+        )
+        .expect("start anchor computes");
+        let mut block_state = state.clone();
+        let block = test_empty_child(&h0, &mut block_state);
+        let witness = noid_block::FullAcceptedBlockBatchWitness {
+            items: vec![noid_block::FullAcceptedBlockBatchItem {
+                block,
+                block_proof_bytes: vec![],
+                block_auth_sidecar_bytes: vec![],
+            }],
+        };
+        let package =
+            noid_block::prove_retained_block_certificate_batch_checkpoint_package_from_boundary(
+                &start_anchor,
+                &start_consensus,
+                &start_accumulator,
+                &h0,
+                &state,
+                &witness,
+            )
+            .expect("strict checkpoint package proves");
+        let h1 = witness.items[0].block.header.clone();
         let h1_hash = noid_chain::hash_block_header(&h1);
-        let h1_work = [2u8; 32];
+        let h1_work = package
+            .step_statement
+            .batch_summary
+            .end_anchor
+            .cumulative_chainwork;
         store
             .put_verified_header_only(&h1, &h1_hash, &h1_work)
             .expect("store h1 header");
@@ -1613,58 +1713,16 @@ mod tests {
                 .contains("checkpoint proof missing")
         );
 
-        let checkpoint_start_anchor = store
-            .get_header_anchor(0)
-            .expect("read genesis anchor")
-            .expect("genesis anchor stored");
-        let checkpoint_end_anchor = store
-            .get_header_anchor(1)
-            .expect("read h1 anchor")
-            .expect("h1 anchor stored");
-        let checkpoint_start_accumulator =
-            noid_recursive::genesis_accumulator(h0.state_root, h0_hash);
-        let checkpoint_end_accumulator = noid_recursive::ChainAccumulator {
-            height: checkpoint_end_anchor.height,
-            state_root: checkpoint_end_anchor.state_root,
-            chain_hash: [0x55; 32],
-        };
-        let checkpoint_consensus = noid_recursive::RecursiveConsensusState::from_header(
-            &h1,
-            h1_work,
-            0,
-            h0.timestamp,
-            h0.difficulty_target,
-            &[h0.timestamp],
-            &[h0.active_slot_count],
-        );
-        let checkpoint_head = noid_recursive::history_checkpoint_head_from_boundary_v1(
-            &checkpoint_end_anchor,
-            &checkpoint_end_accumulator,
-            &checkpoint_consensus,
+        let checkpoint_proof = noid_block::public_history_checkpoint_proof_from_package(
+            &start_anchor,
+            &start_accumulator,
+            &package,
         )
-        .expect("checkpoint head builds");
-        let checkpoint_payload = noid_recursive::HistoryCheckpointRecursivePayloadV1 {
-            version: noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION,
-            engine_id: noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
-            head: checkpoint_head,
-            backend_proof: vec![0xA5; 32],
-        };
-        let checkpoint_proof = noid_recursive::HistoryCheckpointProofV1 {
-            version: noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION,
-            engine_id: noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
-            checkpoint_height: checkpoint_end_anchor.height,
-            start_anchor: checkpoint_start_anchor,
-            end_anchor: checkpoint_end_anchor,
-            start_accumulator: checkpoint_start_accumulator,
-            end_accumulator: checkpoint_end_accumulator,
-            recursive_proof: noid_recursive::encode_history_checkpoint_recursive_payload_v1(
-                &checkpoint_payload,
-            ),
-        };
+        .expect("public checkpoint proof exports from strict package");
         let checkpoint_proof_bytes =
             bincode::serialize(&checkpoint_proof).expect("serialize checkpoint proof");
         verify_snapshot_history_proof_headers_anchored(&manifest, &checkpoint_proof_bytes, &store)
-            .expect("checkpoint scaffold proof verifies");
+            .expect("strict checkpoint proof verifies");
 
         let mut tampered_projection = checkpoint_proof.clone();
         tampered_projection.end_anchor.projection_root[0] ^= 0x01;
@@ -1752,14 +1810,14 @@ async fn handle_p2p_events(
     //
     // Snapshot sync:
     //   (1) receive immutable checkpoint snapshot manifest
-    //   (2) verify the O(1) history/checkpoint scaffold for the manifest boundary
+    //   (2) verify the O(1) history/checkpoint proof for the manifest boundary
     //       before segment download
     // --- Segmented state sync state ---
     //
     // Sync flow:
-    //   1. Recent gaps (<= CONSENSUS_FINALITY_DEPTH) use SyncBlocksFrom and full
-    //      block/proof validation.
-    //   2. Deep gaps request a snapshot manifest.
+    //   1. Recent gaps that fit RECENT_BLOCK_RETENTION_DEPTH use SyncBlocksFrom
+    //      and full block/proof validation.
+    //   2. Deep gaps beyond the retained-block window request a snapshot manifest.
     //
     // Normal restart (state persisted): our_height > 0 → block-by-block sync
     // for recent gaps only.
@@ -1795,7 +1853,7 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
-    // Tracks peers for forced snapshot attempts. Manifest V1 advertises the
+    // Tracks peers for forced snapshot attempts. The manifest advertises the
     // snapshot boundary, so non-empty responses stay on the snapshot path.
     let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
@@ -1967,12 +2025,13 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if height > our_height + noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH {
+                if gap_requires_snapshot_sync(our_height, height) {
                     tracing::info!(
                         their_height = height,
                         our_height,
+                        retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
                         peer = %from,
-                        "deep gap beyond consensus finality — requesting snapshot manifest"
+                        "deep gap beyond retained-block window — requesting snapshot manifest"
                     );
                     if pending_manifest.is_none()
                         && pending_snapshot_header_sync.is_none()
@@ -2281,8 +2340,8 @@ async fn handle_p2p_events(
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
 
-                                // Store proof bytes so the checkpoint package worker can build
-                                // the retained full-block batch before pruning.
+                                // Store proof/sidecar bytes only for retained full-block replay
+                                // and local audit while the block remains inside the recent window.
                                 if !block_proof_bytes.is_empty() {
                                     let ctx = chain.read().await;
                                     if let Err(e) =
@@ -2315,7 +2374,7 @@ async fn handle_p2p_events(
                                     .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
                                         peer: from,
                                         from_height: height + 1,
-                                        count: 18,
+                                        count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
                                     })
                                     .await;
 
@@ -2858,7 +2917,7 @@ async fn handle_p2p_events(
                             .ok();
                     }
                 } else {
-                    // Already have persisted state. Manifest V1 is a snapshot
+                    // Already have persisted state. The manifest is a snapshot
                     // boundary probe, not a live peer-tip probe: non-empty means
                     // the peer can serve an O(1) snapshot at finalized F. Recent
                     // gaps still use block/header announcements and retained
@@ -3469,10 +3528,10 @@ async fn handle_p2p_events(
                 proof_bytes,
                 tip_header_bytes,
             }) => {
-                // O(1) checkpoint scaffold verification before applying an
+                // Check the current checkpoint proof envelope before applying an
                 // immutable snapshot. Header consensus is checked natively from
-                // stored headers; this proof binds execution/state roots to that
-                // header boundary while backend subrelations are filled in.
+                // stored headers; full trustless O(1) authority requires the
+                // recursive decider proof.
 
                 // If segment collection is already in progress (pending_segment_ids non-empty),
                 // a second HistoryProof event would corrupt the active session.
@@ -3674,7 +3733,7 @@ async fn handle_p2p_events(
                         Err(e) => {
                             tracing::error!(
                                 from = %from, tip = snap.manifest.tip_height, err = %e,
-                                "REJECTED manifest: checkpoint scaffold verification failed — \
+                                "REJECTED manifest: checkpoint proof verification failed — \
                                  possible Eclipse attack or fabricated state"
                             );
                             reset_sync_state!();
@@ -4020,7 +4079,7 @@ async fn apply_verified_snapshot_with_suffix(
         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
             peer,
             from_height: final_height + 1,
-            count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH as u16,
+            count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
         })
         .await;
     Ok(final_height)
@@ -4067,17 +4126,19 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 }
 
 // ---------------------------------------------------------------------------
-// Full accepted-batch checkpoint package worker helpers
+// Accepted-block certificate batch checkpoint package worker helpers
 // ---------------------------------------------------------------------------
 
-struct FullBatchPackageBuildInput {
-    previous_head: noid_recursive::HistoryCheckpointHeadV1,
+struct CertificateBatchPackageBuildInput {
+    previous_head: noid_recursive::HistoryCheckpointHead,
     start_anchor: noid_chain::HeaderChainAnchor,
     start_consensus: noid_recursive::RecursiveConsensusState,
     start_accumulator: noid_recursive::ChainAccumulator,
-    start_parent: noid_chain::BlockHeader,
-    start_state: noid_chain::state::ChainState,
-    witness: noid_block::FullAcceptedBlockBatchWitness,
+    end_anchor: noid_chain::HeaderChainAnchor,
+    end_consensus: noid_recursive::RecursiveConsensusState,
+    start_height: u64,
+    end_height: u64,
+    witness: noid_block::AcceptedBlockCertificateBatchWitness,
 }
 
 fn recursive_consensus_state_at_height(
@@ -4133,65 +4194,41 @@ fn recursive_consensus_state_at_height(
     ))
 }
 
-fn retained_full_batch_witness_from_store(
+fn accepted_block_certificate_batch_witness_from_store(
     store: &noid_chain::storage::MdbxStore,
     start_height: u64,
     end_height: u64,
-) -> Result<noid_block::FullAcceptedBlockBatchWitness, String> {
+) -> Result<noid_block::AcceptedBlockCertificateBatchWitness, String> {
     let mut items =
         Vec::with_capacity(end_height.saturating_sub(start_height).saturating_add(1) as usize);
     for height in start_height..=end_height {
-        let block_bytes = store
-            .get_recent_block(height)
-            .map_err(|e| format!("read retained block h={height}: {e}"))?
-            .ok_or_else(|| format!("missing retained block h={height}"))?;
-        let block = noid_chain::block::Block::from_bytes(&block_bytes)
-            .map_err(|e| format!("decode retained block h={height}: {e:?}"))?;
         let header = store
             .get_header(height)
             .map_err(|e| format!("read canonical header h={height}: {e}"))?
             .ok_or_else(|| format!("missing canonical header h={height}"))?;
-        if block.header != header || block.header.height != height {
-            return Err(format!("retained block/header mismatch h={height}"));
+        let bytes = store
+            .get_accepted_block_certificate(height)
+            .map_err(|e| format!("read accepted-block certificate h={height}: {e}"))?
+            .ok_or_else(|| format!("missing accepted-block certificate h={height}"))?;
+        let certificate_record: noid_block::AcceptedBlockCertificateRecord =
+            bincode::deserialize(&bytes)
+                .map_err(|e| format!("decode accepted-block certificate h={height}: {e}"))?;
+        if certificate_record.height != height || certificate_record.statement.height != height {
+            return Err(format!(
+                "accepted-block certificate height mismatch h={height}"
+            ));
         }
-
-        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-        let proof = store
-            .get_block_proof(height)
-            .map_err(|e| format!("read block proof h={height}: {e}"))?;
-        let sidecar = store
-            .get_block_auth_sidecar(height)
-            .map_err(|e| format!("read auth sidecar h={height}: {e}"))?;
-        let block_proof_bytes = match (has_user_txs, proof) {
-            (true, Some(bytes)) if !bytes.is_empty() => bytes,
-            (true, _) => return Err(format!("missing user block proof h={height}")),
-            (false, Some(bytes)) if !bytes.is_empty() => {
-                return Err(format!("coinbase-only block has proof bytes h={height}"));
-            }
-            (false, _) => Vec::new(),
-        };
-        let block_auth_sidecar_bytes = match (has_user_txs, sidecar) {
-            (true, Some(bytes)) if !bytes.is_empty() => bytes,
-            (true, _) => return Err(format!("missing user block auth sidecar h={height}")),
-            (false, Some(bytes)) if !bytes.is_empty() => {
-                return Err(format!(
-                    "coinbase-only block has auth sidecar bytes h={height}"
-                ));
-            }
-            (false, _) => Vec::new(),
-        };
-        items.push(noid_block::FullAcceptedBlockBatchItem {
-            block,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
+        items.push(noid_block::AcceptedBlockCertificateBatchItem {
+            header,
+            certificate_record,
         });
     }
-    Ok(noid_block::FullAcceptedBlockBatchWitness { items })
+    Ok(noid_block::AcceptedBlockCertificateBatchWitness { items })
 }
 
-fn full_batch_package_matches_canonical(
+fn certificate_batch_package_matches_canonical(
     store: &noid_chain::storage::MdbxStore,
-    package: &noid_block::FullAcceptedBlockBatchCheckpointPackageV1,
+    package: &noid_block::AcceptedBlockCertificateBatchCheckpointPackage,
 ) -> Result<bool, String> {
     let start_height = package.start_height();
     let end_height = package.end_height();
@@ -4210,67 +4247,72 @@ fn full_batch_package_matches_canonical(
     )
 }
 
-fn latest_canonical_full_batch_package(
+fn latest_canonical_certificate_batch_package(
     ctx: &MdbxChainContext,
-) -> Result<Option<noid_block::FullAcceptedBlockBatchCheckpointPackageV1>, String> {
+) -> Result<Option<noid_block::AcceptedBlockCertificateBatchCheckpointPackage>, String> {
     loop {
         let Some(height) = ctx
             .store
             .latest_accepted_block_batch_certificate_package_height()
-            .map_err(|e| format!("read latest full batch package height: {e}"))?
+            .map_err(|e| {
+                format!("read latest accepted-block certificate batch package height: {e}")
+            })?
         else {
             return Ok(None);
         };
         let Some(bytes) = ctx
             .store
             .get_accepted_block_batch_certificate_package(height)
-            .map_err(|e| format!("read full batch package h={height}: {e}"))?
+            .map_err(|e| {
+                format!("read accepted-block certificate batch package h={height}: {e}")
+            })?
         else {
             return Ok(None);
         };
-        let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+        let package: noid_block::AcceptedBlockCertificateBatchCheckpointPackage =
             match bincode::deserialize(&bytes) {
                 Ok(package) => package,
                 Err(e) => {
                     tracing::warn!(
                         height,
                         err = %e,
-                        "full accepted batch package decode failed; deleting stale bytes"
+                        "accepted-block certificate batch package decode failed; deleting stale bytes"
                     );
                     ctx.store
                         .delete_accepted_block_batch_certificate_package(height)
-                        .map_err(|e| format!("delete bad full batch package h={height}: {e}"))?;
+                        .map_err(|e| format!("delete bad accepted-block certificate batch package h={height}: {e}"))?;
                     continue;
                 }
             };
         if package.end_height() != height
-            || !full_batch_package_matches_canonical(&ctx.store, &package)?
+            || !certificate_batch_package_matches_canonical(&ctx.store, &package)?
         {
             tracing::warn!(
                 height,
                 package_end = package.end_height(),
-                "full accepted batch package no longer matches canonical headers; deleting"
+                "accepted-block certificate batch package no longer matches canonical headers; deleting"
             );
             ctx.store
                 .delete_accepted_block_batch_certificate_package(height)
-                .map_err(|e| format!("delete stale full batch package h={height}: {e}"))?;
+                .map_err(|e| {
+                    format!("delete stale accepted-block certificate batch package h={height}: {e}")
+                })?;
             continue;
         }
         return Ok(Some(package));
     }
 }
 
-fn prepare_full_batch_package_build(
+fn prepare_certificate_batch_package_build(
     ctx: &mut MdbxChainContext,
-) -> Result<Option<FullBatchPackageBuildInput>, String> {
-    use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+) -> Result<Option<CertificateBatchPackageBuildInput>, String> {
     use noid_recursive::{
-        genesis_accumulator, history_checkpoint_head_from_boundary_v1,
+        genesis_accumulator, history_checkpoint_head_from_boundary,
         HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
     };
 
     let tip = ctx.tip_height();
-    let latest_package = latest_canonical_full_batch_package(ctx)?;
+    let latest_package = latest_canonical_certificate_batch_package(ctx)?;
     let start_height = latest_package
         .as_ref()
         .map_or(1, |package| package.end_height().saturating_add(1));
@@ -4281,16 +4323,6 @@ fn prepare_full_batch_package_build(
     }
 
     let start_parent_height = start_height.saturating_sub(1);
-    if tip.saturating_sub(start_parent_height) > RECENT_BLOCK_RETENTION_DEPTH {
-        tracing::warn!(
-            start_height,
-            end_height,
-            tip,
-            "full accepted batch package cannot be built inside retained window; waiting for a newer retained boundary"
-        );
-        return Ok(None);
-    }
-
     let start_parent = ctx
         .store
         .get_header(start_parent_height)
@@ -4319,71 +4351,70 @@ fn prepare_full_batch_package_build(
     )?;
     let previous_head = match latest_package {
         Some(package) => package.step_statement.next_head,
-        None => history_checkpoint_head_from_boundary_v1(
+        None => history_checkpoint_head_from_boundary(
             &start_anchor,
             &start_accumulator,
             &start_consensus,
         )
         .map_err(|e| format!("build initial checkpoint head: {e:?}"))?,
     };
-    let mut start_state = ctx
-        .reconstruct_state_snapshot_at(start_parent_height)
-        .map_err(|e| format!("reconstruct package start state h={start_parent_height}: {e:?}"))?;
-    if start_state.state_root() != start_parent.state_root {
-        return Err(format!(
-            "package start state root mismatch h={start_parent_height}"
-        ));
-    }
-    let witness = retained_full_batch_witness_from_store(&ctx.store, start_height, end_height)?;
+    let end_anchor = ctx
+        .store
+        .get_header_anchor(end_height)
+        .map_err(|e| format!("read package end anchor h={end_height}: {e}"))?
+        .ok_or_else(|| format!("missing package end anchor h={end_height}"))?;
+    let end_consensus = recursive_consensus_state_at_height(&ctx.store, end_height)?;
+    let witness =
+        accepted_block_certificate_batch_witness_from_store(&ctx.store, start_height, end_height)?;
 
-    Ok(Some(FullBatchPackageBuildInput {
+    Ok(Some(CertificateBatchPackageBuildInput {
         previous_head,
         start_anchor,
         start_consensus,
         start_accumulator,
-        start_parent,
-        start_state,
+        end_anchor,
+        end_consensus,
+        start_height,
+        end_height,
         witness,
     }))
 }
 
-async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>) -> bool {
+async fn try_build_next_certificate_batch_package(chain: &Arc<RwLock<MdbxChainContext>>) -> bool {
     let build_input = {
         let mut ctx = chain.write().await;
-        match prepare_full_batch_package_build(&mut ctx) {
+        match prepare_certificate_batch_package_build(&mut ctx) {
             Ok(Some(input)) => input,
             Ok(None) => return false,
             Err(e) => {
-                tracing::warn!(err = %e, "full accepted batch package build preparation failed");
+                tracing::warn!(err = %e, "accepted-block certificate batch package build preparation failed");
                 return false;
             }
         }
     };
-    let start_height = build_input.start_parent.height.saturating_add(1);
-    let end_height = start_height
-        .saturating_add(noid_recursive::HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u64)
-        .saturating_sub(1);
+    let start_height = build_input.start_height;
+    let end_height = build_input.end_height;
     tracing::info!(
         start_height,
         end_height,
-        "full accepted batch package: proving retained chunk"
+        "accepted-block certificate batch package: proving checkpoint chunk"
     );
     let prove_started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        let package = noid_block::prove_full_accepted_block_batch_checkpoint_package_v1(
+        let package = noid_block::prove_accepted_block_certificate_batch_checkpoint_package(
             &build_input.previous_head,
             &build_input.start_anchor,
+            &build_input.end_anchor,
             &build_input.start_consensus,
+            &build_input.end_consensus,
             &build_input.start_accumulator,
-            &build_input.start_parent,
-            &build_input.start_state,
             &build_input.witness,
         )
-        .map_err(|e| format!("prove full accepted batch package: {e:?}"))?;
-        noid_block::verify_full_accepted_block_batch_checkpoint_package_v1(&package)
-            .map_err(|e| format!("verify full accepted batch package: {e:?}"))?;
+        .map_err(|e| format!("prove accepted-block certificate batch package: {e:?}"))?;
+        noid_block::verify_accepted_block_certificate_batch_checkpoint_package(&package)
+            .map_err(|e| format!("verify accepted-block certificate batch package: {e:?}"))?;
         let bytes = bincode::serialize(&package)
-            .map_err(|e| format!("serialize full accepted batch package: {e}"))?;
+            .map_err(|e| format!("serialize accepted-block certificate batch package: {e}"))?;
         Ok::<_, String>((package, bytes))
     })
     .await;
@@ -4395,7 +4426,7 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
                 start_height,
                 end_height,
                 err = %e,
-                "full accepted batch package proof failed"
+                "accepted-block certificate batch package proof failed"
             );
             return false;
         }
@@ -4404,7 +4435,7 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
                 start_height,
                 end_height,
                 err = ?e,
-                "full accepted batch package task panicked"
+                "accepted-block certificate batch package task panicked"
             );
             return false;
         }
@@ -4412,7 +4443,7 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
 
     let stored = {
         let ctx = chain.read().await;
-        match full_batch_package_matches_canonical(&ctx.store, &package) {
+        match certificate_batch_package_matches_canonical(&ctx.store, &package) {
             Ok(true) => ctx
                 .store
                 .put_accepted_block_batch_certificate_package(package.end_height(), &bytes)
@@ -4421,7 +4452,7 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
                 tracing::warn!(
                     start_height,
                     end_height,
-                    "full accepted batch package became non-canonical before store"
+                    "accepted-block certificate batch package became non-canonical before store"
                 );
                 false
             }
@@ -4430,7 +4461,7 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
                     start_height,
                     end_height,
                     err = %e,
-                    "full accepted batch package canonicality check failed before store"
+                    "accepted-block certificate batch package canonicality check failed before store"
                 );
                 false
             }
@@ -4442,17 +4473,19 @@ async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>
             end_height,
             prove_ms = prove_started.elapsed().as_millis(),
             bytes = bytes.len(),
-            "full accepted batch package stored"
+            "accepted-block certificate batch package stored"
         );
     }
     stored
 }
 
-async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainContext>>) -> bool {
+async fn try_promote_certificate_batch_package_coverage(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+) -> bool {
     use noid_chain::checkpoint::CheckpointCoverage;
     use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
 
-    let candidate = {
+    let (candidate, previous_record, base_anchor, base_accumulator) = {
         let ctx = chain.read().await;
         let finalized_tip = ctx.tip_height().saturating_sub(CONSENSUS_FINALITY_DEPTH);
         let current_covered = ctx
@@ -4467,6 +4500,51 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
         if next_end == 0 || next_end > finalized_tip {
             return false;
         }
+        let previous_record = if current_covered == 0 {
+            None
+        } else {
+            let Some(bytes) = (match ctx
+                .store
+                .get_history_checkpoint_head_record(current_covered)
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        height = current_covered,
+                        err = %e,
+                        "history checkpoint head record read failed"
+                    );
+                    return false;
+                }
+            }) else {
+                tracing::warn!(
+                    height = current_covered,
+                    "checkpoint coverage exists without matching head record"
+                );
+                return false;
+            };
+            let record: noid_recursive::StoredHistoryCheckpointHeadRecord =
+                match bincode::deserialize(&bytes) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        tracing::warn!(
+                            height = current_covered,
+                            err = %e,
+                            "history checkpoint head record decode failed"
+                        );
+                        return false;
+                    }
+                };
+            if let Err(e) = noid_recursive::verify_history_checkpoint_head_record(&record) {
+                tracing::warn!(
+                    height = current_covered,
+                    err = %e,
+                    "history checkpoint head record verification failed"
+                );
+                return false;
+            }
+            Some(record)
+        };
         let Some(bytes) = (match ctx
             .store
             .get_accepted_block_batch_certificate_package(next_end)
@@ -4476,21 +4554,21 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
                 tracing::warn!(
                     end_height = next_end,
                     err = %e,
-                    "full accepted batch package coverage read failed"
+                    "accepted-block certificate batch package coverage read failed"
                 );
                 return false;
             }
         }) else {
             return false;
         };
-        let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+        let package: noid_block::AcceptedBlockCertificateBatchCheckpointPackage =
             match bincode::deserialize(&bytes) {
                 Ok(package) => package,
                 Err(e) => {
                     tracing::warn!(
                         end_height = next_end,
                         err = %e,
-                        "full accepted batch package coverage decode failed"
+                        "accepted-block certificate batch package coverage decode failed"
                     );
                     return false;
                 }
@@ -4499,28 +4577,71 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
             tracing::warn!(
                 expected_end = next_end,
                 package_end = package.end_height(),
-                "full accepted batch package coverage end mismatch"
+                "accepted-block certificate batch package coverage end mismatch"
             );
             return false;
         }
-        package
+        let (base_anchor, base_accumulator) = match previous_record.as_ref() {
+            Some(record) => {
+                let proof = match noid_recursive::public_history_checkpoint_proof_from_head_record(
+                    record,
+                ) {
+                    Ok(proof) => proof,
+                    Err(e) => {
+                        tracing::warn!(
+                            height = record.height,
+                            err = %e,
+                            "previous history checkpoint head proof decode failed"
+                        );
+                        return false;
+                    }
+                };
+                (proof.start_anchor, proof.start_accumulator)
+            }
+            None => (
+                package.step_statement.batch_summary.start_anchor.clone(),
+                package
+                    .step_statement
+                    .batch_summary
+                    .start_accumulator
+                    .clone(),
+            ),
+        };
+        (package, previous_record, base_anchor, base_accumulator)
     };
 
     let end_height = candidate.end_height();
     let verify_candidate = candidate.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        noid_block::verify_full_accepted_block_batch_checkpoint_package_v1(&verify_candidate)
-            .map(|_| ())
-            .map_err(|e| format!("{e:?}"))
+    let previous_record_for_task = previous_record.clone();
+    let head_record_result = tokio::task::spawn_blocking(move || {
+        noid_block::verify_accepted_block_certificate_batch_checkpoint_package(&verify_candidate)
+            .map_err(|e| format!("verify package: {e:?}"))?;
+        let head_record = noid_recursive::prove_history_checkpoint_recursive_head_record(
+            previous_record_for_task.as_ref(),
+            &base_anchor,
+            &base_accumulator,
+            &verify_candidate.step_statement,
+            &verify_candidate.certificate_batch_statement,
+            &verify_candidate.checkpoint_step_proof,
+        )
+        .map_err(|e| format!("prove recursive head record: {e}"))?;
+        noid_recursive::verify_history_checkpoint_head_record_transition(
+            previous_record_for_task.as_ref(),
+            &head_record,
+        )
+        .map_err(|e| format!("verify recursive head record: {e}"))?;
+        let head_record_bytes = bincode::serialize(&head_record)
+            .map_err(|e| format!("serialize recursive head record: {e}"))?;
+        Ok::<_, String>((head_record, head_record_bytes))
     })
     .await;
-    match verified {
-        Ok(Ok(())) => {}
+    let (head_record, head_record_bytes) = match head_record_result {
+        Ok(Ok(record)) => record,
         Ok(Err(e)) => {
             tracing::warn!(
                 end_height,
                 err = %e,
-                "full accepted batch package coverage verification failed"
+                "accepted-block certificate batch package recursive head promotion failed"
             );
             return false;
         }
@@ -4528,11 +4649,11 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
             tracing::error!(
                 end_height,
                 err = ?e,
-                "full accepted batch package coverage verification task panicked"
+                "accepted-block certificate batch package recursive head promotion task panicked"
             );
             return false;
         }
-    }
+    };
 
     let promoted = {
         let ctx = chain.read().await;
@@ -4540,12 +4661,12 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
         if end_height > finalized_tip {
             return false;
         }
-        match full_batch_package_matches_canonical(&ctx.store, &candidate) {
+        match certificate_batch_package_matches_canonical(&ctx.store, &candidate) {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(
                     end_height,
-                    "full accepted batch package became non-canonical before coverage promotion"
+                    "accepted-block certificate batch package became non-canonical before coverage promotion"
                 );
                 return false;
             }
@@ -4553,7 +4674,7 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
                 tracing::warn!(
                     end_height,
                     err = %e,
-                    "full accepted batch package canonicality check failed before coverage promotion"
+                    "accepted-block certificate batch package canonicality check failed before coverage promotion"
                 );
                 return false;
             }
@@ -4567,15 +4688,22 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
         if current_covered >= end_height {
             return false;
         }
+        if ctx
+            .store
+            .put_history_checkpoint_head_record(end_height, &head_record_bytes)
+            .is_err()
+        {
+            return false;
+        }
         let mut coverage = existing.unwrap_or(CheckpointCoverage {
-            checkpoint_id: candidate.step_statement.next_head.recursive_digest,
+            checkpoint_id: head_record.head.recursive_digest,
             height: end_height,
             block_hash: end_anchor.block_id,
             covered_from: 1,
             covered_to: end_height,
             history_proof_covered_to: None,
         });
-        coverage.checkpoint_id = candidate.step_statement.next_head.recursive_digest;
+        coverage.checkpoint_id = head_record.head.recursive_digest;
         coverage.height = end_height;
         coverage.block_hash = end_anchor.block_id;
         coverage.covered_from = 1;
@@ -4585,7 +4713,10 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
     };
 
     if promoted {
-        tracing::info!(end_height, "full accepted batch package coverage promoted");
+        tracing::info!(
+            end_height,
+            "accepted-block certificate batch package coverage promoted"
+        );
     }
     promoted
 }
@@ -4596,14 +4727,13 @@ async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainCon
 
 /// Background checkpoint package worker.
 ///
-/// Builds fixed-size accepted-block checkpoint packages while their full
-/// witnesses are still inside the 18-block retained suffix, then promotes
-/// proven checkpoint coverage after the package is finalized and still
-/// canonical.
+/// Builds fixed-size accepted-block checkpoint packages from stored certificate
+/// records and canonical headers, then promotes proven checkpoint coverage after
+/// the package is finalized and still canonical.
 ///
 /// ## Design
 ///
-/// - Builds packages before pruning can remove full blocks/proofs/auth sidecars.
+/// - Does not read retained block bodies/proofs/auth sidecars.
 /// - Promotes only finalized sequential package ends.
 /// - Recursive/package proving runs in `spawn_blocking` inside the package
 ///   helpers, so catch-up does not block the async runtime.
@@ -4622,10 +4752,10 @@ async fn run_checkpoint_package_worker(chain: Arc<RwLock<MdbxChainContext>>) {
         }
         just_advanced = false;
 
-        if try_promote_full_batch_package_coverage(&chain).await {
+        if try_promote_certificate_batch_package_coverage(&chain).await {
             just_advanced = true;
         }
-        if try_build_next_full_batch_package(&chain).await {
+        if try_build_next_certificate_batch_package(&chain).await {
             just_advanced = true;
         }
     }

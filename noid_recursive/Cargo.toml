@@ -19,3 +19,7 @@ noid_tx = { path = "../noid_tx" }
 [[bench]]
 name = "checkpoint_ivc"
 harness = false
+
+[[bench]]
+name = "certificate_receipt_ivc"
+harness = false

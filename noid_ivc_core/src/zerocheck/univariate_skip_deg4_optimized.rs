@@ -633,7 +633,7 @@ fn shift_reduce_inner_abcd_scalar(
 // Top-level driver (scalar, single-thread).
 //
 // Mirrors round1_shift_reduce_extract_c_packed_padded but for deg-4. No rayon,
-// no padding-skip yet — pure correctness scaffolding for the math.
+// no padding-skip yet — pure correctness reference for the math.
 // ---------------------------------------------------------------------------
 
 /// Compute the degree-4 round-1 prover message via shift_reduce + extract_z,

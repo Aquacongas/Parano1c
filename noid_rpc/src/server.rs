@@ -87,74 +87,38 @@ fn checkpoint_history_proof_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u
     {
         return Ok(None);
     }
-    let Some(package_bytes) = ctx
+    let Some(record_bytes) = ctx
         .store
-        .get_accepted_block_batch_certificate_package(height)
-        .map_err(|e| format!("checkpoint package read h={height} failed: {e}"))?
+        .get_history_checkpoint_head_record(height)
+        .map_err(|e| format!("checkpoint head record read h={height} failed: {e}"))?
     else {
         return Ok(None);
     };
-    let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
-        bincode::deserialize(&package_bytes)
-            .map_err(|e| format!("checkpoint package decode h={height} failed: {e}"))?;
-    if package.end_height() != height {
+    let record: noid_recursive::StoredHistoryCheckpointHeadRecord =
+        bincode::deserialize(&record_bytes)
+            .map_err(|e| format!("checkpoint head record decode h={height} failed: {e}"))?;
+    if record.height != height {
         return Err(format!(
-            "checkpoint package height mismatch: coverage h={height}, package h={}",
-            package.end_height()
+            "checkpoint head record height mismatch: coverage h={height}, record h={}",
+            record.height
         ));
     }
-    let local_start_anchor = ctx
-        .store
-        .get_header_anchor(package.start_height())
-        .map_err(|e| format!("checkpoint start anchor read failed: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "missing checkpoint start anchor h={}",
-                package.start_height()
-            )
-        })?;
-    if local_start_anchor != package.step_statement.batch_summary.start_anchor {
-        return Ok(None);
-    }
+    noid_recursive::verify_history_checkpoint_head_record(&record)
+        .map_err(|e| format!("checkpoint head record self-check failed: {e}"))?;
     let local_end_anchor = ctx
         .store
         .get_header_anchor(height)
         .map_err(|e| format!("checkpoint end anchor read failed: {e}"))?
         .ok_or_else(|| format!("missing checkpoint end anchor h={height}"))?;
-    if local_end_anchor != package.step_statement.batch_summary.end_anchor {
-        return Ok(None);
-    }
-
-    let base_anchor = ctx
-        .store
-        .get_header_anchor(0)
-        .map_err(|e| format!("genesis anchor read failed: {e}"))?
-        .ok_or_else(|| "missing genesis header anchor".to_string())?;
-    let genesis_header = ctx
-        .store
-        .get_header(0)
-        .map_err(|e| format!("genesis header read failed: {e}"))?
-        .ok_or_else(|| "missing genesis header".to_string())?;
-    let genesis_hash = noid_chain::hash_block_header(&genesis_header);
-    if base_anchor.height != 0 || base_anchor.block_id != genesis_hash {
-        return Err("genesis header anchor mismatch".into());
-    }
-    let base_accumulator =
-        noid_recursive::genesis_accumulator(genesis_header.state_root, genesis_hash);
-    let proof = noid_block::public_history_checkpoint_proof_from_package_v1(
-        &base_anchor,
-        &base_accumulator,
-        &package,
-    )
-    .map_err(|e| format!("checkpoint proof build failed: {e:?}"))?;
-    noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+    let proof = noid_recursive::public_history_checkpoint_proof_from_head_record(&record)
+        .map_err(|e| format!("checkpoint proof decode failed: {e:?}"))?;
+    noid_recursive::verify_history_checkpoint_proof_checkpoint(
         &proof,
-        &base_anchor,
+        &proof.start_anchor,
         &local_end_anchor,
     )
     .map_err(|e| format!("checkpoint proof self-check failed: {e}"))?;
-    let bytes =
-        bincode::serialize(&proof).map_err(|e| format!("checkpoint proof encode failed: {e}"))?;
+    let bytes = record.proof_bytes;
     if bytes.len() > MAX_HISTORY_PROOF_BYTES {
         return Err(format!(
             "checkpoint proof too large: {} > {}",

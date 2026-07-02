@@ -21,12 +21,10 @@ use noid_poseidon2b::primitives::Digest;
 
 use crate::{AcceptedBlockValidationArtifacts, VerifyBlockError};
 
-pub const ACCEPTED_STATE_TRANSITION_CLAIM_VERSION: u32 = 1;
-pub const ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS: usize = 42;
+pub const ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedStateTransitionClaim {
-    pub version: u32,
     pub height: u64,
     pub block_id: Digest,
     pub parent_block_id: Digest,
@@ -98,7 +96,6 @@ impl AcceptedStateTransitionClaim {
             exact_transition_digest(&artifacts.exact_action_surface, verified.child_utxo_root());
 
         let mut claim = Self {
-            version: ACCEPTED_STATE_TRANSITION_CLAIM_VERSION,
             height: block.header.height,
             block_id: hash_block_header(&block.header),
             parent_block_id: hash_block_header(parent),
@@ -252,7 +249,6 @@ pub fn accepted_state_transition_claim_fields(
     claim: &AcceptedStateTransitionClaim,
 ) -> [Block128; ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS] {
     let mut fields = Vec::with_capacity(ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS);
-    fields.push(Block128::from(claim.version as u128));
     fields.push(Block128::from(claim.height as u128));
     push_digest_fields(&mut fields, &claim.block_id);
     push_digest_fields(&mut fields, &claim.parent_block_id);
@@ -283,7 +279,6 @@ pub fn accepted_state_transition_claim_fields(
     fields.push(Block128::from(claim.minted_value));
     fields.push(Block128::from(claim.supply_delta as u128));
     push_digest_fields(&mut fields, &claim.exact_transition_digest);
-    fields.push(Block128::ZERO);
     fields
         .try_into()
         .expect("accepted state-transition claim schedule has fixed length")

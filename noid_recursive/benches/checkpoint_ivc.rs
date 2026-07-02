@@ -20,30 +20,28 @@ use noid_chain::header_anchor::HeaderChainAnchor;
 use noid_core::Block128;
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_recursive::{
-    accepted_block_certificate_batch_statement_v1, accepted_block_certificate_receipt_v1,
-    accepted_block_certificate_validity_handle_v1, accepted_claim_batch_digest_v1,
-    advance_history_checkpoint_head_v1_native, history_checkpoint_head_from_boundary_v1,
-    prove_accepted_block_certificate_proof_v1_hash_only,
-    prove_history_checkpoint_ivc_chunk_receipt_handle_core_v1,
-    verify_history_checkpoint_ivc_chunk_core_v1, AcceptedBlockCertificateBatchStatementV1,
-    AcceptedBlockCertificateReceiptV1, AcceptedBlockCertificateStatementV1,
-    AcceptedBlockCertificateValidityHandleV1, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
-    ChainAccumulator, HeaderWitness, HistoryCheckpointBatchSummaryV1,
-    HistoryCheckpointStepStatementV1, RecursiveConsensusState,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
-    HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES,
+    accepted_block_certificate_batch_statement, accepted_block_certificate_receipt,
+    accepted_block_certificate_validity_handle, accepted_claim_batch_digest,
+    advance_history_checkpoint_head_native, history_checkpoint_head_from_boundary,
+    prove_accepted_block_certificate_proof_ivc_receipt,
+    prove_history_checkpoint_ivc_chunk_receipt_handle_core,
+    verify_history_checkpoint_ivc_chunk_core, AcceptedBlockCertificateBatchStatement,
+    AcceptedBlockCertificateReceipt, AcceptedBlockCertificateStatement,
+    AcceptedBlockCertificateValidityHandle, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
+    ChainAccumulator, HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointStepStatement,
+    RecursiveConsensusState, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
+    HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES,
     HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE, HISTORY_CHECKPOINT_IVC_PCS_LOG_INV_RATE,
-    HISTORY_CHECKPOINT_PROOF_VERSION,
 };
 
 const DEFAULT_SAMPLES: usize = 3;
 
 #[derive(Clone)]
 struct ChunkFixture {
-    statement: HistoryCheckpointStepStatementV1,
-    certificate_batch_statement: AcceptedBlockCertificateBatchStatementV1,
-    certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandleV1>,
-    certificate_receipts: Vec<AcceptedBlockCertificateReceiptV1>,
+    statement: HistoryCheckpointStepStatement,
+    certificate_batch_statement: AcceptedBlockCertificateBatchStatement,
+    certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandle>,
+    certificate_receipts: Vec<AcceptedBlockCertificateReceipt>,
     accepted_claim_witness: AcceptedClaimBatchWitness,
     accepted_claim_output: AcceptedClaimBatchOutput,
 }
@@ -85,8 +83,8 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
-fn prove_fixture(fixture: &ChunkFixture) -> noid_recursive::HistoryCheckpointIvcChunkCoreProofV1 {
-    prove_history_checkpoint_ivc_chunk_receipt_handle_core_v1(
+fn prove_fixture(fixture: &ChunkFixture) -> noid_recursive::HistoryCheckpointIvcChunkCoreProof {
+    prove_history_checkpoint_ivc_chunk_receipt_handle_core(
         &fixture.statement,
         &fixture.certificate_batch_statement,
         &fixture.certificate_validity_handles,
@@ -99,9 +97,9 @@ fn prove_fixture(fixture: &ChunkFixture) -> noid_recursive::HistoryCheckpointIvc
 
 fn verify_fixture(
     fixture: &ChunkFixture,
-    proof: &noid_recursive::HistoryCheckpointIvcChunkCoreProofV1,
+    proof: &noid_recursive::HistoryCheckpointIvcChunkCoreProof,
 ) {
-    verify_history_checkpoint_ivc_chunk_core_v1(
+    verify_history_checkpoint_ivc_chunk_core(
         &fixture.statement,
         &fixture.certificate_batch_statement,
         proof,
@@ -214,9 +212,7 @@ fn chunk_fixture() -> ChunkFixture {
         let header_witness = HeaderWitness::from_header(&header);
         let accepted_block_claim_digest = digest_with_seed(0x80 | index as u8);
         let claim = digest_to_fields(accepted_block_claim_digest);
-        let certificate = AcceptedBlockCertificateStatementV1 {
-            version: ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
-            accept_block_predicate_version: 1,
+        let certificate = AcceptedBlockCertificateStatement {
             height,
             block_id: header_witness.block_id,
             parent_block_id: previous_block_id,
@@ -267,9 +263,9 @@ fn chunk_fixture() -> ChunkFixture {
         accumulator: accumulator.clone(),
     };
     let accepted_claim_batch_digest =
-        accepted_claim_batch_digest_v1(&accepted_claim_witness, &accepted_claim_output)
+        accepted_claim_batch_digest(&accepted_claim_witness, &accepted_claim_output)
             .expect("accepted claim digest");
-    let certificate_batch_statement = accepted_block_certificate_batch_statement_v1(
+    let certificate_batch_statement = accepted_block_certificate_batch_statement(
         &certificate_statements,
         &accepted_claim_witness.accepted_block_claims,
         accepted_claim_batch_digest,
@@ -278,12 +274,12 @@ fn chunk_fixture() -> ChunkFixture {
     let mut certificate_receipts = Vec::with_capacity(chunk_capacity);
     let mut certificate_validity_handles = Vec::with_capacity(chunk_capacity);
     for certificate_statement in &certificate_statements {
-        certificate_receipts.push(accepted_block_certificate_receipt_v1(certificate_statement));
+        certificate_receipts.push(accepted_block_certificate_receipt(certificate_statement));
         let certificate_proof =
-            prove_accepted_block_certificate_proof_v1_hash_only(certificate_statement)
+            prove_accepted_block_certificate_proof_ivc_receipt(certificate_statement)
                 .expect("certificate handle proof builds");
         certificate_validity_handles.push(
-            accepted_block_certificate_validity_handle_v1(&certificate_proof)
+            accepted_block_certificate_validity_handle(&certificate_proof)
                 .expect("certificate validity handle builds"),
         );
     }
@@ -296,14 +292,10 @@ fn chunk_fixture() -> ChunkFixture {
             .header
             .tx_root,
     );
-    let previous_head = history_checkpoint_head_from_boundary_v1(
-        &start_anchor,
-        &start_accumulator,
-        &start_consensus,
-    )
-    .expect("previous head");
-    let batch_summary = HistoryCheckpointBatchSummaryV1 {
-        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+    let previous_head =
+        history_checkpoint_head_from_boundary(&start_anchor, &start_accumulator, &start_consensus)
+            .expect("previous head");
+    let batch_summary = HistoryCheckpointBatchSummary {
         batch_len: chunk_capacity as u32,
         start_anchor,
         end_anchor,
@@ -313,17 +305,16 @@ fn chunk_fixture() -> ChunkFixture {
         end_consensus: accepted_claim_output.consensus_state.clone(),
         accepted_claim_batch_digest,
     };
-    let next_head = advance_history_checkpoint_head_v1_native(&previous_head, &batch_summary)
-        .expect("next head");
-    let statement = HistoryCheckpointStepStatementV1 {
-        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+    let next_head =
+        advance_history_checkpoint_head_native(&previous_head, &batch_summary).expect("next head");
+    let statement = HistoryCheckpointStepStatement {
         previous_head,
         batch_summary,
         next_head,
     };
     assert_eq!(
         statement.next_head.engine_id,
-        HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1
+        HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC
     );
 
     ChunkFixture {

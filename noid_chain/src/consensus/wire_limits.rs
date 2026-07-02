@@ -65,7 +65,11 @@ pub const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024;
 pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 
 /// Maximum history proof bytes accepted over RPC/P2P.
-pub const MAX_HISTORY_PROOF_BYTES: usize = 64 * 1024;
+///
+/// This must exceed the current checkpoint IVC chunk core wire padding
+/// (`100 KiB`) plus recursive envelope overhead. Tighten after the final O(1)
+/// proof format is measured.
+pub const MAX_HISTORY_PROOF_BYTES: usize = 256 * 1024;
 
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;

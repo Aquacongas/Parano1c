@@ -23,7 +23,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 ///
 /// ```text
 ///   prev_block_hash       [32B]  hash of previous header
-///   state_root            [32B]  Poseidon2b Merkle over segment FRI roots
+///   state_root            [32B]  exact composite root H(log_slots, UTXO root, ReuseGuard root)
 ///   tx_root               [32B]  COMPRESS Merkle of tx_body_hashes
 ///   timestamp             [8B]   seconds since Unix epoch (LE u64)
 ///   height                [8B]   block height (LE u64)
@@ -39,9 +39,8 @@ use noid_poseidon2b::primitives::{Address, Digest};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockHeader {
     pub prev_block_hash: Digest,
-    /// Global state root — Poseidon2b Merkle root over per-segment FRI roots
-    /// For a single-segment state (`log_slots ≤ 16`)
-    /// this degenerates to the single segment's FRI combined root.
+    /// Exact composite state root:
+    /// `Poseidon2b(EXSTROT, log_slots, exact UTXO sparse-Merkle root, ReuseGuard root)`.
     pub state_root: Digest,
     /// COMPRESS-domain Merkle root of all `tx_body_hash`es in block order.
     pub tx_root: Digest,
