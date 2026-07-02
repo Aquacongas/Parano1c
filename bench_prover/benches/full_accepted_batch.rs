@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Full `AcceptBlock` batch benchmark for the final O(1) history path.
+//! Full `AcceptBlock` batch benchmark for the receipt issuance boundary.
 //!
-//! This benchmark measures the authority boundary that the final recursive
-//! checkpoint verifier must fold. It intentionally uses retained semantic
-//! blocks and detached witnesses, not pre-trusted local history claims.
+//! This benchmark measures the tx-dependent block-validation work that issues
+//! fixed accepted-block certificates before the checkpoint task folds receipts.
+//! It intentionally uses retained semantic blocks and detached witnesses, not
+//! pre-trusted local history claims.
 
 use std::env;
 use std::io::Write;
@@ -15,9 +16,9 @@ use noid_block::{
     accepted_block_certificate_batch_statement_digest_v1, accepted_claim_batch_digest_v1,
     build_exact_state_transition_proof,
     history_checkpoint_batch_summary_from_full_accepted_output_v1,
-    prove_history_checkpoint_step_proof_from_full_accepted_components_v1,
+    prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1,
     prove_retained_full_accepted_block_batch_proof,
-    verify_history_checkpoint_step_proof_with_full_accepted_components_v1,
+    verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1,
     verify_retained_full_accepted_block_batch_proof, BlockAuthSidecar, BlockProof,
     FullAcceptedBlockBatchItem, FullAcceptedBlockBatchWitness,
 };
@@ -26,7 +27,6 @@ use noid_chain::consensus::difficulty::{block_work, next_target};
 use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
 use noid_chain::consensus::pow::{search_pow, validate_pow};
-use noid_chain::exact_state_hash::composite_state_root;
 use noid_chain::fri_state::SlotValue;
 use noid_chain::header_anchor::compute_header_chain_anchor;
 use noid_chain::state::ChainState;
@@ -42,8 +42,9 @@ use noid_recursive::{
     prove_accepted_claim_batch_digest_v1, verify_accepted_claim_batch_digest_v1,
     verify_history_checkpoint_step_proof_v1_untrusted,
     verify_history_checkpoint_step_statement_v1_native, verify_pow_header_witness_batch_native,
-    ChainAccumulator, HeaderWitness, HistoryCheckpointStepProofError,
-    HistoryCheckpointStepStatementV1, RecursiveConsensusState, HISTORY_CHECKPOINT_PROOF_VERSION,
+    ChainAccumulator, HeaderWitness, HistoryCheckpointIvcChunkCoreProofV1,
+    HistoryCheckpointStepBackendProofV1, HistoryCheckpointStepStatementV1, RecursiveConsensusState,
+    HISTORY_CHECKPOINT_PROOF_VERSION,
 };
 use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
 use rayon::prelude::*;
@@ -57,6 +58,18 @@ const PREMINED_COINBASE_ONLY_NONCES: [u128; CHECKPOINT_BATCH_TARGET_BLOCKS] = [
     1_355_852, 479_822, 418_510, 220_161, 95_998,
 ];
 const PREMINED_USER_BLOCK_NONCE: u128 = 87_803;
+const PREMINED_USER_THEN_COINBASE_TAIL_NONCES: [u128; CHECKPOINT_BATCH_TARGET_BLOCKS - 1] = [
+    124_329, 1_886_009, 159_414, 531_286, 230_280, 689_257, 156_834, 582_378, 691_435, 566_052,
+    420_051, 94_211, 93_651, 134_834, 366_524,
+];
+
+type FullBatchFixture = (
+    RecursiveConsensusState,
+    ChainAccumulator,
+    BlockHeader,
+    ChainState,
+    FullAcceptedBlockBatchWitness,
+);
 
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
@@ -257,12 +270,13 @@ fn auth_proof_for_body(body: &TxBody) -> noid_gkr::OwnerAuthProofKillShot {
     prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel).0
 }
 
-fn one_user_block_batch() -> (
+fn one_user_block_item() -> (
     RecursiveConsensusState,
     ChainAccumulator,
     BlockHeader,
     ChainState,
-    FullAcceptedBlockBatchWitness,
+    FullAcceptedBlockBatchItem,
+    ChainState,
 ) {
     let secret = spend_secret(7);
     let owner = derive_address(&secret);
@@ -330,8 +344,8 @@ fn one_user_block_batch() -> (
     child_guard
         .apply_spends(parent.height + 1, &surface.spent_slots)
         .expect("guard spend apply");
-    let child_state_root =
-        composite_state_root(parent.log_slots, child_state.utxo_root, child_guard.root());
+    child_state.reuse_guard = child_guard;
+    let child_state_root = child_state.cached_state_root();
     let timestamp = parent.timestamp + BLOCK_TIME;
     let mut header = BlockHeader {
         prev_block_hash: hash_block_header(&parent),
@@ -349,8 +363,8 @@ fn one_user_block_batch() -> (
             timestamp,
         ),
         log_slots: parent.log_slots,
-        active_slot_count: start_state.active_slot_count,
-        alloc_counter: start_state.alloc_counter + 1,
+        active_slot_count: child_state.active_slot_count,
+        alloc_counter: child_state.alloc_counter,
     };
     let progress = env_bool("NOID_FULL_ACCEPTED_BATCH_PROGRESS", false);
     let (pow_time, ()) = time_once(|| {
@@ -379,12 +393,10 @@ fn one_user_block_batch() -> (
     let auth_sidecar = BlockAuthSidecar {
         tx_auth: vec![auth_proof_for_body(&body)],
     };
-    let witness = FullAcceptedBlockBatchWitness {
-        items: vec![FullAcceptedBlockBatchItem {
-            block,
-            block_proof_bytes: bincode::serialize(&block_proof).unwrap(),
-            block_auth_sidecar_bytes: bincode::serialize(&auth_sidecar).unwrap(),
-        }],
+    let item = FullAcceptedBlockBatchItem {
+        block,
+        block_proof_bytes: bincode::serialize(&block_proof).unwrap(),
+        block_auth_sidecar_bytes: bincode::serialize(&auth_sidecar).unwrap(),
     };
 
     (
@@ -392,19 +404,78 @@ fn one_user_block_batch() -> (
         start_accumulator,
         parent,
         start_state,
-        witness,
+        item,
+        child_state,
+    )
+}
+
+fn one_user_block_batch() -> FullBatchFixture {
+    let (start_consensus, start_accumulator, parent, start_state, item, _) = one_user_block_item();
+    (
+        start_consensus,
+        start_accumulator,
+        parent,
+        start_state,
+        FullAcceptedBlockBatchWitness { items: vec![item] },
+    )
+}
+
+fn user_then_coinbase_batch(n: usize) -> FullBatchFixture {
+    assert!(n > 0, "mixed bench needs at least the user block");
+    let (start_consensus, start_accumulator, start_parent, start_state, first_item, tail_state) =
+        one_user_block_item();
+    let progress = env_bool("NOID_FULL_ACCEPTED_BATCH_PROGRESS", false);
+    let mut items = Vec::with_capacity(n);
+    let mut parent = first_item.block.header.clone();
+    let mut rolling_consensus = verify_pow_header_witness_batch_native(
+        &start_consensus,
+        &[HeaderWitness::from_header(&parent)],
+    )
+    .expect("bench user header advances consensus");
+    items.push(first_item);
+
+    for tail_index in 0..n.saturating_sub(1) {
+        let premined_nonce = PREMINED_USER_THEN_COINBASE_TAIL_NONCES
+            .get(tail_index)
+            .copied();
+        let (block_time, block) =
+            time_once(|| empty_child(&parent, &tail_state, &rolling_consensus, premined_nonce));
+        if progress {
+            println!(
+                "    fixture mixed_tail block={}/{} height={} nonce={} build={}",
+                tail_index + 2,
+                n,
+                block.header.height,
+                block.header.nonce,
+                fmt_ms(block_time)
+            );
+            let _ = std::io::stdout().flush();
+        }
+        rolling_consensus = verify_pow_header_witness_batch_native(
+            &rolling_consensus,
+            &[HeaderWitness::from_header(&block.header)],
+        )
+        .expect("bench tail header advances consensus");
+        parent = block.header.clone();
+        items.push(FullAcceptedBlockBatchItem {
+            block,
+            block_proof_bytes: vec![],
+            block_auth_sidecar_bytes: vec![],
+        });
+    }
+
+    (
+        start_consensus,
+        start_accumulator,
+        start_parent,
+        start_state,
+        FullAcceptedBlockBatchWitness { items },
     )
 }
 
 fn bench_case<F>(label: &str, build_fixture: F, samples: usize)
 where
-    F: FnOnce() -> (
-        RecursiveConsensusState,
-        ChainAccumulator,
-        BlockHeader,
-        ChainState,
-        FullAcceptedBlockBatchWitness,
-    ),
+    F: FnOnce() -> FullBatchFixture,
 {
     println!("  case={label}");
     let (build_time, fixture) = time_once(build_fixture);
@@ -481,16 +552,13 @@ where
     };
     verify_history_checkpoint_step_statement_v1_native(&step_statement)
         .expect("checkpoint step statement verifies");
-    let (step_proof_time, (step_proof, certificate_batch_statement, step_output)) =
-        time_once(|| {
-            prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
-                &step_statement,
-                &out.proof_components,
-                &proof,
-            )
-            .expect("checkpoint step proof builds from full accepted components")
-        });
-    assert_eq!(step_output, out.accepted_claim_batch);
+    let (step_proof_time, (step_proof, certificate_batch_statement)) = time_once(|| {
+        prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1(
+            &step_statement,
+            &out,
+        )
+        .expect("checkpoint step proof builds from already verified accepted output")
+    });
     assert_eq!(
         certificate_batch_statement.batch_len,
         step_statement.batch_summary.batch_len
@@ -502,17 +570,15 @@ where
     let certificate_batch_statement_digest =
         accepted_block_certificate_batch_statement_digest_v1(&certificate_batch_statement);
     assert_ne!(certificate_batch_statement_digest, [0u8; 32]);
-    let (step_private_verify_time, verified_step_output) = time_once(|| {
-        verify_history_checkpoint_step_proof_with_full_accepted_components_v1(
+    let (step_private_verify_time, ()) = time_once(|| {
+        verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1(
             &step_statement,
             &certificate_batch_statement,
-            &out.proof_components,
-            &proof,
+            &out,
             &step_proof,
         )
-        .expect("checkpoint step full accepted components verify")
+        .expect("checkpoint step already verified accepted output verifies")
     });
-    assert_eq!(verified_step_output, out.accepted_claim_batch);
     let (step_verify_time, step_verify_result) = time_once(|| {
         verify_history_checkpoint_step_proof_v1_untrusted(
             &step_statement,
@@ -520,10 +586,7 @@ where
             &step_proof,
         )
     });
-    assert_eq!(
-        step_verify_result,
-        Err(HistoryCheckpointStepProofError::BackendVerifierMissing)
-    );
+    step_verify_result.expect("checkpoint step public placeholder path verifies");
     println!(
         "    blocks={} claims={} build_fixture={} prove={} verify={} proof={} end_height={} start_height={} suffix_budget={}",
         witness.items.len(),
@@ -552,16 +615,59 @@ where
         CHECKPOINT_BATCH_TARGET_BLOCKS
     );
     println!(
-        "    checkpoint_step proof={} prove={} private_verify={} public_verify_fail_closed={}",
+        "    checkpoint_step proof={} prove={} private_verify={} public_verify_placeholder=ok public_verify={}",
         fmt_bytes(step_proof.byte_len()),
         fmt_ms(step_proof_time),
         fmt_ms(step_private_verify_time),
         fmt_ms(step_verify_time)
     );
+    let step_backend: HistoryCheckpointStepBackendProofV1 =
+        bincode::deserialize(&step_proof.backend_proof).expect("checkpoint step backend decodes");
+    println!(
+        "    checkpoint_step_parts backend={} step_digest={} cert_digest={} claim_digest={} chunk_core={}",
+        fmt_bytes(step_backend.byte_len()),
+        fmt_bytes(step_backend.step_statement_digest_proof.byte_len()),
+        fmt_bytes(step_backend.certificate_batch_digest_proof.byte_len()),
+        fmt_bytes(
+            step_backend
+                .accepted_claim_batch_digest_proof
+                .as_ref()
+                .map_or(0, |proof| proof.byte_len())
+        ),
+        fmt_bytes(
+            step_backend
+                .checkpoint_ivc_chunk_core_proof
+                .as_ref()
+                .map_or(0, |proof| proof.byte_len())
+        )
+    );
+    if let Some(chunk_core) = &step_backend.checkpoint_ivc_chunk_core_proof {
+        print_chunk_core_part(chunk_core);
+    }
     println!(
         "    certificate_batch statement={} fixed_slots={} digest_bound=true",
         fmt_bytes(certificate_batch_statement.byte_len()),
         CHECKPOINT_BATCH_TARGET_BLOCKS
+    );
+    let certificate_proof_bytes: usize = out
+        .proof_components
+        .accepted_block_certificate_proofs
+        .iter()
+        .map(|proof| proof.byte_len())
+        .sum();
+    let certificate_handle_bytes = bincode::serialized_size(
+        &out.proof_components
+            .accepted_block_certificate_validity_handles,
+    )
+    .expect("certificate validity handles serialize") as usize;
+    let certificate_receipt_bytes =
+        bincode::serialized_size(&out.proof_components.accepted_block_certificate_receipts)
+            .expect("certificate receipts serialize") as usize;
+    println!(
+        "    certificate_sidecars proofs={} handles={} receipts={} fixed_history_inputs=true",
+        fmt_bytes(certificate_proof_bytes),
+        fmt_bytes(certificate_handle_bytes),
+        fmt_bytes(certificate_receipt_bytes)
     );
     println!(
         "    components claim_hashes={} exact_state={} auth_traces={} standard_spines={} sweep_spines={} tx_root_paths={}",
@@ -574,17 +680,37 @@ where
     );
 }
 
+fn print_chunk_core_part(chunk_core: &HistoryCheckpointIvcChunkCoreProofV1) {
+    let handle_bytes = bincode::serialized_size(&chunk_core.certificate_validity_handles)
+        .expect("certificate validity handles serialize") as usize;
+    let receipt_bytes = bincode::serialized_size(&chunk_core.certificate_receipts)
+        .expect("certificate receipts serialize") as usize;
+    let accepted_claim_digest_fields_bytes =
+        bincode::serialized_size(&chunk_core.accepted_claim_digest_hash_fields)
+            .expect("accepted-claim digest fields serialize") as usize;
+    println!(
+        "    checkpoint_chunk_core cert_handles={} receipts={} claim_digest_fields={} wire={} actual={} tx_count_dependent=false",
+        fmt_bytes(handle_bytes),
+        fmt_bytes(receipt_bytes),
+        fmt_bytes(accepted_claim_digest_fields_bytes),
+        fmt_bytes(chunk_core.core_proof.len()),
+        fmt_bytes(chunk_core.core_proof_len as usize)
+    );
+}
+
 fn main() {
     let samples = env_usize("NOID_FULL_ACCEPTED_BATCH_SAMPLES", 3);
     let no_user_blocks = env_usize("NOID_FULL_ACCEPTED_BATCH_BLOCKS", 1);
     println!("full_accepted_batch");
     println!("  relation=full-retained-AcceptBlock-batch");
+    println!("  role=receipt_issuance_boundary");
+    println!("  history_aggregation=false");
     println!("  retained_window_blocks={RETAINED_WINDOW_BLOCKS}");
     println!("  checkpoint_batch_target_blocks={CHECKPOINT_BATCH_TARGET_BLOCKS}");
     println!("  selected_no_user_blocks={no_user_blocks}");
     println!("  samples={samples}");
     println!("  public_o1_final=false");
-    println!("  purpose=measure authority batch that final recursive verifier must fold");
+    println!("  purpose=measure block-validation receipt issuance before fixed history folding");
 
     bench_case(
         "coinbase_only",
@@ -592,4 +718,9 @@ fn main() {
         samples,
     );
     bench_case("user_block_1", one_user_block_batch, samples);
+    bench_case(
+        "user_then_coinbase_16",
+        || user_then_coinbase_batch(CHECKPOINT_BATCH_TARGET_BLOCKS),
+        samples,
+    );
 }

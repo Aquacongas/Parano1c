@@ -18,10 +18,15 @@ pub use noid_recursive::{
     accepted_block_certificate_batch_statement_digest_v1,
     accepted_block_certificate_batch_statement_v1, accepted_block_certificate_block_body_digest_v1,
     accepted_block_certificate_block_proof_digest_v1, accepted_block_certificate_chain_claim_v1,
-    accepted_block_certificate_statement_digest_v1, accepted_block_certificate_statement_fields_v1,
-    AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatementV1,
-    AcceptedBlockCertificateStatementV1, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    accepted_block_certificate_receipt_v1, accepted_block_certificate_statement_digest_v1,
+    accepted_block_certificate_statement_fields_v1, accepted_block_certificate_validity_handle_v1,
+    prove_accepted_block_certificate_proof_v1_hash_only,
+    verify_accepted_block_certificate_receipt_projection_v1, AcceptedBlockCertificateBatchError,
+    AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateProofError,
+    AcceptedBlockCertificateProofV1, AcceptedBlockCertificateReceiptError,
+    AcceptedBlockCertificateReceiptV1, AcceptedBlockCertificateStatementV1,
+    AcceptedBlockCertificateValidityHandleError, AcceptedBlockCertificateValidityHandleV1,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
 };
 
 use crate::{
@@ -30,6 +35,55 @@ use crate::{
     AcceptedStateTransitionClaim, BlockAuthSidecar, BlockProof, VerifyBlockError,
     ACCEPT_BLOCK_PREDICATE_VERSION,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedBlockCertificateRecord {
+    pub height: u64,
+    pub statement: AcceptedBlockCertificateStatementV1,
+    pub proof: AcceptedBlockCertificateProofV1,
+    pub receipt: AcceptedBlockCertificateReceiptV1,
+    pub validity_handle: AcceptedBlockCertificateValidityHandleV1,
+}
+
+#[derive(Debug)]
+pub enum AcceptedBlockCertificateRecordError {
+    Proof(AcceptedBlockCertificateProofError),
+    Receipt(AcceptedBlockCertificateReceiptError),
+    ValidityHandle(AcceptedBlockCertificateValidityHandleError),
+}
+
+impl std::fmt::Display for AcceptedBlockCertificateRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proof(source) => write!(f, "accepted-block certificate proof: {source}"),
+            Self::Receipt(source) => write!(f, "accepted-block certificate receipt: {source}"),
+            Self::ValidityHandle(source) => {
+                write!(f, "accepted-block certificate validity handle: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcceptedBlockCertificateRecordError {}
+
+pub fn accepted_block_certificate_record_hash_only_scaffold(
+    statement: AcceptedBlockCertificateStatementV1,
+) -> Result<AcceptedBlockCertificateRecord, AcceptedBlockCertificateRecordError> {
+    let receipt = accepted_block_certificate_receipt_v1(&statement);
+    verify_accepted_block_certificate_receipt_projection_v1(&statement, &receipt)
+        .map_err(AcceptedBlockCertificateRecordError::Receipt)?;
+    let proof = prove_accepted_block_certificate_proof_v1_hash_only(&statement)
+        .map_err(AcceptedBlockCertificateRecordError::Proof)?;
+    let validity_handle = accepted_block_certificate_validity_handle_v1(&proof)
+        .map_err(AcceptedBlockCertificateRecordError::ValidityHandle)?;
+    Ok(AcceptedBlockCertificateRecord {
+        height: statement.height,
+        statement,
+        proof,
+        receipt,
+        validity_handle,
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn accepted_block_certificate_statement_v1(
@@ -135,4 +189,63 @@ pub fn verify_accepted_block_certificate_statement_v1_native(
         return Err(VerifyBlockError::HistoryClaimMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statement() -> AcceptedBlockCertificateStatementV1 {
+        AcceptedBlockCertificateStatementV1 {
+            version: ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+            accept_block_predicate_version: ACCEPT_BLOCK_PREDICATE_VERSION,
+            height: 7,
+            block_id: [1u8; 32],
+            parent_block_id: [2u8; 32],
+            parent_state_root: [3u8; 32],
+            child_state_root: [4u8; 32],
+            tx_root: [5u8; 32],
+            block_body_digest: [6u8; 32],
+            block_proof_digest: [7u8; 32],
+            auth_sidecar_digest: [8u8; 32],
+            accepted_block_claim_digest: [9u8; 32],
+            accepted_state_transition_claim_digest: [10u8; 32],
+            exact_transition_digest: [11u8; 32],
+            tx_count: 1,
+            user_tx_count: 0,
+            live_input_count: 0,
+            live_output_count: 1,
+            state_frontier_node_count: 0,
+            touched_slot_count: 1,
+            action_count: 1,
+            block_body_len: 128,
+            block_proof_len: 0,
+            auth_sidecar_len: 0,
+        }
+    }
+
+    #[test]
+    fn certificate_record_hash_only_scaffold_binds_statement_receipt_and_handle() {
+        let statement = statement();
+        let record = accepted_block_certificate_record_hash_only_scaffold(statement.clone())
+            .expect("record builds");
+        let digest = accepted_block_certificate_statement_digest_v1(&statement);
+
+        assert_eq!(record.height, statement.height);
+        assert_eq!(record.statement, statement);
+        assert_eq!(record.proof.statement_digest, digest);
+        assert_eq!(record.receipt.statement_digest, digest);
+        assert_eq!(record.validity_handle.statement_digest, digest);
+        assert_eq!(
+            record.validity_handle,
+            accepted_block_certificate_validity_handle_v1(&record.proof).expect("handle")
+        );
+        verify_accepted_block_certificate_receipt_projection_v1(&record.statement, &record.receipt)
+            .expect("receipt projection");
+
+        let encoded = bincode::serialize(&record).expect("serialize record");
+        let decoded: AcceptedBlockCertificateRecord =
+            bincode::deserialize(&encoded).expect("decode record");
+        assert_eq!(decoded, record);
+    }
 }

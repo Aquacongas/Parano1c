@@ -10,10 +10,9 @@
 //! restore the prior UTXO state.
 //!
 //! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
-//! pruned (`prune_undo_logs`). MDBX keeps raw block bytes, BlockProof bytes,
-//! and Auth sidecars until a real immutable checkpoint proof covers them. Older
-//! public arbitrary-peer sync remains disabled fail-closed until that checkpoint
-//! coverage exists.
+//! pruned (`prune_undo_logs`). MDBX also prunes retained block bytes,
+//! BlockProof bytes, and Auth sidecars once the finalized history/checkpoint
+//! scaffold has consumed the same heights.
 
 use std::collections::HashMap;
 

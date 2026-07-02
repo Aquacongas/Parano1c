@@ -28,27 +28,38 @@ use noid_gkr::{
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::primitives::Digest;
 use noid_recursive::{
+    accepted_block_certificate_receipt_v1, accepted_block_certificate_validity_handle_v1,
     accepted_claim_batch_digest_v1 as recursive_accepted_claim_batch_digest_v1,
-    build_header_integer_trace, prove_checkpoint_poseidon,
+    advance_history_checkpoint_head_v1_native, build_header_integer_trace,
+    encode_history_checkpoint_recursive_payload_v1, history_checkpoint_head_from_boundary_v1,
+    prove_accepted_block_certificate_proof_v1_hash_only, prove_checkpoint_poseidon,
     prove_fiat_shamir_transcript_batch_killshot,
-    prove_history_checkpoint_step_proof_v1_from_block_components,
+    prove_history_checkpoint_step_proof_v1_from_block_components_with_certificate_proofs_v1,
+    prove_history_checkpoint_step_proof_v1_with_ivc_chunk_certificate_proof_components,
     verify_accepted_block_batch_components_v1 as verify_recursive_accepted_block_batch_components_v1,
+    verify_accepted_block_certificate_receipt_projection_v1,
     verify_accepted_claim_batch_with_header_trace, verify_authorization_batch_native_with_traces,
     verify_history_checkpoint_step_proof_v1_private_block_components_native,
+    verify_history_checkpoint_step_proof_v1_private_components_native,
     verify_pow_header_witness_batch_native,
     AcceptedBlockBatchComponentErrorV1 as RecursiveBlockBatchComponentError,
     AcceptedBlockBatchComponentInputsV1 as RecursiveBlockBatchComponentInputs,
     AcceptedBlockBatchComponentProofV1 as RecursiveBlockBatchComponentProof,
+    AcceptedBlockCertificateProofError, AcceptedBlockCertificateProofV1,
+    AcceptedBlockCertificateReceiptError, AcceptedBlockCertificateReceiptV1,
+    AcceptedBlockCertificateValidityHandleError, AcceptedBlockCertificateValidityHandleV1,
     AcceptedClaimBatchError, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
     AuthorizationComponentInputV1 as RecursiveAuthorizationComponentInput,
     AuthorizationVerifierTrace, ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof,
     ExactStateKillShotInputsV1 as RecursiveExactStateKillShotInputs,
     ExactStateKillShotProofV1 as RecursiveExactStateKillShotProof, FiatShamirTraceOp,
     FiatShamirTranscriptBatchProofKillShot, HeaderIntegerBatchTrace, HeaderIntegerTraceError,
-    HeaderWitness, HistoryCheckpointBatchSummaryV1, HistoryCheckpointStepProofError,
-    HistoryCheckpointStepProofV1, HistoryCheckpointStepStatementV1, PowHeaderBatchError,
-    RecursiveConsensusState, FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH,
-    HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS, HISTORY_CHECKPOINT_PROOF_VERSION,
+    HeaderWitness, HistoryCheckpointBatchSummaryV1, HistoryCheckpointHeadV1,
+    HistoryCheckpointProofError, HistoryCheckpointProofV1, HistoryCheckpointRecursivePayloadV1,
+    HistoryCheckpointStepProofError, HistoryCheckpointStepProofV1,
+    HistoryCheckpointStepStatementV1, PowHeaderBatchError, RecursiveConsensusState,
+    FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
+    HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1, HISTORY_CHECKPOINT_PROOF_VERSION,
 };
 
 use crate::{
@@ -83,10 +94,13 @@ pub struct FullAcceptedBlockBatchOutput {
     pub proof_components: FullAcceptedBlockBatchProofComponents,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FullAcceptedBlockBatchProofComponents {
     pub accepted_claim_witness: AcceptedClaimBatchWitness,
     pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatementV1>,
+    pub accepted_block_certificate_proofs: Vec<AcceptedBlockCertificateProofV1>,
+    pub accepted_block_certificate_receipts: Vec<AcceptedBlockCertificateReceiptV1>,
+    pub accepted_block_certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandleV1>,
     pub accepted_claim_hash_inputs: Vec<AcceptedClaimHashInputs>,
     pub tx_body_standard_inputs: Vec<SpineInputs>,
     pub tx_body_standard_hashes: Vec<[Block128; 2]>,
@@ -101,7 +115,7 @@ pub struct FullAcceptedBlockBatchProofComponents {
     pub authorization_totals: VerifiedAuthorizationBatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationComponentInput {
     pub block_index: usize,
     pub tx_index: usize,
@@ -109,7 +123,7 @@ pub struct AuthorizationComponentInput {
     pub public: OwnerAuthPublicInputs,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetainedFullAcceptedBlockBatchProof {
     pub accepted_claim_hash: AcceptedClaimHashProofKillShot,
     pub tx_body_standard: Option<BlockSpineProof>,
@@ -118,6 +132,63 @@ pub struct RetainedFullAcceptedBlockBatchProof {
     pub checkpoint_poseidon: CheckpointPoseidonProof,
     pub exact_state: Vec<ExactStateKillShotProof>,
     pub authorization_transcripts: Vec<FiatShamirTranscriptBatchProofKillShot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FullAcceptedBlockBatchCheckpointPackageV1 {
+    pub step_statement: HistoryCheckpointStepStatementV1,
+    pub certificate_batch_statement: AcceptedBlockCertificateBatchStatementV1,
+    pub components: FullAcceptedBlockBatchProofComponents,
+    pub proof: RetainedFullAcceptedBlockBatchProof,
+    pub checkpoint_step_proof: HistoryCheckpointStepProofV1,
+}
+
+impl FullAcceptedBlockBatchCheckpointPackageV1 {
+    pub fn start_height(&self) -> u64 {
+        self.step_statement.batch_summary.start_anchor.height
+    }
+
+    pub fn end_height(&self) -> u64 {
+        self.step_statement.batch_summary.end_anchor.height
+    }
+
+    pub fn byte_len(&self) -> usize {
+        bincode::serialized_size(self)
+            .expect("serialized FullAcceptedBlockBatchCheckpointPackageV1 length fits usize")
+            as usize
+    }
+}
+
+pub fn public_history_checkpoint_proof_from_package_v1(
+    base_anchor: &HeaderChainAnchor,
+    base_accumulator: &ChainAccumulator,
+    package: &FullAcceptedBlockBatchCheckpointPackageV1,
+) -> Result<HistoryCheckpointProofV1, FullAcceptedBlockBatchError> {
+    if base_accumulator.height != base_anchor.height
+        || base_accumulator.state_root != base_anchor.state_root
+    {
+        return Err(FullAcceptedBlockBatchError::CheckpointSummaryStartMismatch);
+    }
+
+    let backend_proof = bincode::serialize(&package.checkpoint_step_proof)
+        .expect("HistoryCheckpointStepProofV1 serializes");
+    let payload = HistoryCheckpointRecursivePayloadV1 {
+        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+        engine_id: HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
+        head: package.step_statement.next_head.clone(),
+        backend_proof,
+    };
+
+    Ok(HistoryCheckpointProofV1 {
+        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+        engine_id: HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
+        checkpoint_height: package.step_statement.batch_summary.end_anchor.height,
+        start_anchor: base_anchor.clone(),
+        end_anchor: package.step_statement.batch_summary.end_anchor.clone(),
+        start_accumulator: base_accumulator.clone(),
+        end_accumulator: package.step_statement.batch_summary.end_accumulator.clone(),
+        recursive_proof: encode_history_checkpoint_recursive_payload_v1(&payload),
+    })
 }
 
 impl RetainedFullAcceptedBlockBatchProof {
@@ -192,6 +263,31 @@ pub enum FullAcceptedBlockBatchError {
     ComponentShapeMismatch,
     AcceptedClaimBatch(AcceptedClaimBatchError),
     CertificateBatch(AcceptedBlockCertificateBatchError),
+    CertificateValidityHandleProof {
+        index: usize,
+        source: AcceptedBlockCertificateProofError,
+    },
+    CertificateValidityHandle {
+        index: usize,
+        source: AcceptedBlockCertificateValidityHandleError,
+    },
+    CertificateReceipt {
+        index: usize,
+        source: AcceptedBlockCertificateReceiptError,
+    },
+    CertificateProofShape {
+        statements: usize,
+        proofs: usize,
+        receipts: usize,
+        handles: usize,
+    },
+    CertificateProofStatementMismatch {
+        index: usize,
+    },
+    CertificateValidityHandleMismatch {
+        index: usize,
+    },
+    CheckpointHead(HistoryCheckpointProofError),
     CheckpointSummaryStartMismatch,
     CheckpointSummaryEndMismatch,
     CheckpointStep(HistoryCheckpointStepProofError),
@@ -403,6 +499,32 @@ pub fn verify_full_accepted_block_batch_native(
         parent = item.block.header.clone();
     }
 
+    let accepted_block_certificate_receipts = accepted_block_certificate_statements
+        .iter()
+        .map(accepted_block_certificate_receipt_v1)
+        .collect::<Vec<_>>();
+    let certificate_proof_pairs = accepted_block_certificate_statements
+        .par_iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            let proof = prove_accepted_block_certificate_proof_v1_hash_only(statement).map_err(
+                |source| FullAcceptedBlockBatchError::CertificateValidityHandleProof {
+                    index,
+                    source,
+                },
+            )?;
+            let handle =
+                accepted_block_certificate_validity_handle_v1(&proof).map_err(|source| {
+                    FullAcceptedBlockBatchError::CertificateValidityHandle { index, source }
+                })?;
+            Ok((proof, handle))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (accepted_block_certificate_proofs, accepted_block_certificate_validity_handles): (
+        Vec<_>,
+        Vec<_>,
+    ) = certificate_proof_pairs.into_iter().unzip();
+
     let accepted_claim_witness = AcceptedClaimBatchWitness {
         headers: header_witnesses,
         accepted_block_claims,
@@ -424,6 +546,9 @@ pub fn verify_full_accepted_block_batch_native(
         proof_components: FullAcceptedBlockBatchProofComponents {
             accepted_claim_witness,
             accepted_block_certificate_statements,
+            accepted_block_certificate_proofs,
+            accepted_block_certificate_receipts,
+            accepted_block_certificate_validity_handles,
             accepted_claim_hash_inputs,
             tx_body_standard_inputs,
             tx_body_standard_hashes,
@@ -613,6 +738,93 @@ pub fn verify_retained_full_accepted_block_batch_proof(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn prove_full_accepted_block_batch_checkpoint_package_from_boundary_v1(
+    start_anchor: &HeaderChainAnchor,
+    start_consensus: &RecursiveConsensusState,
+    start_accumulator: &ChainAccumulator,
+    start_parent: &BlockHeader,
+    start_state: &ChainState,
+    witness: &FullAcceptedBlockBatchWitness,
+) -> Result<FullAcceptedBlockBatchCheckpointPackageV1, FullAcceptedBlockBatchError> {
+    let previous_head =
+        history_checkpoint_head_from_boundary_v1(start_anchor, start_accumulator, start_consensus)
+            .map_err(FullAcceptedBlockBatchError::CheckpointHead)?;
+    prove_full_accepted_block_batch_checkpoint_package_v1(
+        &previous_head,
+        start_anchor,
+        start_consensus,
+        start_accumulator,
+        start_parent,
+        start_state,
+        witness,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_full_accepted_block_batch_checkpoint_package_v1(
+    previous_head: &HistoryCheckpointHeadV1,
+    start_anchor: &HeaderChainAnchor,
+    start_consensus: &RecursiveConsensusState,
+    start_accumulator: &ChainAccumulator,
+    start_parent: &BlockHeader,
+    start_state: &ChainState,
+    witness: &FullAcceptedBlockBatchWitness,
+) -> Result<FullAcceptedBlockBatchCheckpointPackageV1, FullAcceptedBlockBatchError> {
+    let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+        start_consensus,
+        start_accumulator,
+        start_parent,
+        start_state,
+        witness,
+    )?;
+    let accepted_claim_batch_digest = accepted_claim_batch_digest_v1(&output);
+    let summary = history_checkpoint_batch_summary_from_full_accepted_output_v1(
+        start_anchor,
+        start_consensus,
+        start_accumulator,
+        &output,
+        accepted_claim_batch_digest,
+    )?;
+    let next_head = advance_history_checkpoint_head_v1_native(previous_head, &summary)
+        .map_err(FullAcceptedBlockBatchError::CheckpointHead)?;
+    let step_statement = HistoryCheckpointStepStatementV1 {
+        version: HISTORY_CHECKPOINT_PROOF_VERSION,
+        previous_head: previous_head.clone(),
+        batch_summary: summary,
+        next_head,
+    };
+    let (checkpoint_step_proof, certificate_batch_statement, checkpoint_output) =
+        prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
+            &step_statement,
+            &output.proof_components,
+            &proof,
+        )?;
+    if checkpoint_output != output.accepted_claim_batch {
+        return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
+    }
+
+    Ok(FullAcceptedBlockBatchCheckpointPackageV1 {
+        step_statement,
+        certificate_batch_statement,
+        components: output.proof_components,
+        proof,
+        checkpoint_step_proof,
+    })
+}
+
+pub fn verify_full_accepted_block_batch_checkpoint_package_v1(
+    package: &FullAcceptedBlockBatchCheckpointPackageV1,
+) -> Result<AcceptedClaimBatchOutput, FullAcceptedBlockBatchError> {
+    verify_history_checkpoint_step_proof_with_full_accepted_components_v1(
+        &package.step_statement,
+        &package.certificate_batch_statement,
+        &package.components,
+        &package.proof,
+        &package.checkpoint_step_proof,
+    )
+}
+
 pub fn history_checkpoint_batch_summary_from_full_accepted_output_v1(
     start_anchor: &HeaderChainAnchor,
     start_consensus: &RecursiveConsensusState,
@@ -699,6 +911,93 @@ pub fn accepted_block_certificate_batch_statement_from_full_accepted_output_v1(
     .map_err(FullAcceptedBlockBatchError::CertificateBatch)
 }
 
+fn validate_full_accepted_certificate_package_v1(
+    components: &FullAcceptedBlockBatchProofComponents,
+) -> Result<(), FullAcceptedBlockBatchError> {
+    let statements = &components.accepted_block_certificate_statements;
+    let proofs = &components.accepted_block_certificate_proofs;
+    let receipts = &components.accepted_block_certificate_receipts;
+    let handles = &components.accepted_block_certificate_validity_handles;
+    if proofs.len() != statements.len()
+        || receipts.len() != statements.len()
+        || handles.len() != statements.len()
+    {
+        return Err(FullAcceptedBlockBatchError::CertificateProofShape {
+            statements: statements.len(),
+            proofs: proofs.len(),
+            receipts: receipts.len(),
+            handles: handles.len(),
+        });
+    }
+    for (index, statement) in statements.iter().enumerate() {
+        verify_accepted_block_certificate_receipt_projection_v1(statement, &receipts[index])
+            .map_err(|source| FullAcceptedBlockBatchError::CertificateReceipt { index, source })?;
+        let statement_digest =
+            noid_recursive::accepted_block_certificate_statement_digest_v1(statement);
+        if proofs[index].statement_digest != statement_digest {
+            return Err(FullAcceptedBlockBatchError::CertificateProofStatementMismatch { index });
+        }
+        let expected_handle = accepted_block_certificate_validity_handle_v1(&proofs[index])
+            .map_err(
+                |source| FullAcceptedBlockBatchError::CertificateValidityHandle { index, source },
+            )?;
+        if expected_handle != handles[index] {
+            return Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index });
+        }
+    }
+    Ok(())
+}
+
+pub fn prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1(
+    statement: &HistoryCheckpointStepStatementV1,
+    output: &FullAcceptedBlockBatchOutput,
+) -> Result<
+    (
+        HistoryCheckpointStepProofV1,
+        AcceptedBlockCertificateBatchStatementV1,
+    ),
+    FullAcceptedBlockBatchError,
+> {
+    validate_full_accepted_certificate_package_v1(&output.proof_components)?;
+    let accepted_claim_batch_digest = accepted_claim_batch_digest_v1(output);
+    let certificate_batch_statement =
+        accepted_block_certificate_batch_statement_from_full_accepted_output_v1(
+            output,
+            accepted_claim_batch_digest,
+        )?;
+    let checkpoint_step_proof =
+        prove_history_checkpoint_step_proof_v1_with_ivc_chunk_certificate_proof_components(
+            statement,
+            &certificate_batch_statement,
+            &output
+                .proof_components
+                .accepted_block_certificate_statements,
+            &output.proof_components.accepted_block_certificate_proofs,
+            &output.proof_components.accepted_block_certificate_receipts,
+            &output.proof_components.accepted_claim_witness,
+            &output.accepted_claim_batch,
+        )
+        .map_err(FullAcceptedBlockBatchError::CheckpointStep)?;
+    Ok((checkpoint_step_proof, certificate_batch_statement))
+}
+
+pub fn verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1(
+    statement: &HistoryCheckpointStepStatementV1,
+    certificate_batch_statement: &AcceptedBlockCertificateBatchStatementV1,
+    output: &FullAcceptedBlockBatchOutput,
+    checkpoint_step_proof: &HistoryCheckpointStepProofV1,
+) -> Result<(), FullAcceptedBlockBatchError> {
+    validate_full_accepted_certificate_package_v1(&output.proof_components)?;
+    verify_history_checkpoint_step_proof_v1_private_components_native(
+        statement,
+        certificate_batch_statement,
+        &output.proof_components.accepted_claim_witness,
+        &output.accepted_claim_batch,
+        checkpoint_step_proof,
+    )
+    .map_err(FullAcceptedBlockBatchError::CheckpointStep)
+}
+
 pub fn prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
     statement: &HistoryCheckpointStepStatementV1,
     components: &FullAcceptedBlockBatchProofComponents,
@@ -711,12 +1010,15 @@ pub fn prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
     ),
     FullAcceptedBlockBatchError,
 > {
+    validate_full_accepted_certificate_package_v1(components)?;
     let recursive_inputs = recursive_component_inputs_from_components(components);
     let recursive_proof = recursive_component_proof_from_proof(proof);
-    prove_history_checkpoint_step_proof_v1_from_block_components(
+    prove_history_checkpoint_step_proof_v1_from_block_components_with_certificate_proofs_v1(
         statement,
         &recursive_inputs,
         &recursive_proof,
+        &components.accepted_block_certificate_proofs,
+        &components.accepted_block_certificate_receipts,
     )
     .map_err(FullAcceptedBlockBatchError::CheckpointStep)
 }
@@ -728,6 +1030,7 @@ pub fn verify_history_checkpoint_step_proof_with_full_accepted_components_v1(
     proof: &RetainedFullAcceptedBlockBatchProof,
     checkpoint_step_proof: &HistoryCheckpointStepProofV1,
 ) -> Result<AcceptedClaimBatchOutput, FullAcceptedBlockBatchError> {
+    validate_full_accepted_certificate_package_v1(components)?;
     let recursive_inputs = recursive_component_inputs_from_components(components);
     let recursive_proof = recursive_component_proof_from_proof(proof);
     verify_history_checkpoint_step_proof_v1_private_block_components_native(
@@ -1450,6 +1753,43 @@ mod tests {
             ),
             [0u8; 32]
         );
+        assert_eq!(
+            out.proof_components
+                .accepted_block_certificate_receipts
+                .len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components.accepted_block_certificate_proofs.len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .accepted_block_certificate_validity_handles
+                .len(),
+            1
+        );
+        let statement_digest = noid_recursive::accepted_block_certificate_statement_digest_v1(
+            &out.proof_components.accepted_block_certificate_statements[0],
+        );
+        assert_eq!(
+            out.proof_components.accepted_block_certificate_receipts[0].statement_digest,
+            statement_digest
+        );
+        noid_recursive::verify_accepted_block_certificate_validity_handle_v1(
+            &statement_digest,
+            &out.proof_components
+                .accepted_block_certificate_validity_handles[0],
+        )
+        .expect("accepted block certificate validity handle verifies");
+        assert_eq!(
+            accepted_block_certificate_validity_handle_v1(
+                &out.proof_components.accepted_block_certificate_proofs[0],
+            )
+            .expect("certificate proof derives validity handle"),
+            out.proof_components
+                .accepted_block_certificate_validity_handles[0]
+        );
         assert_eq!(out.proof_components.header_integer_trace.steps.len(), 1);
         assert!(out.proof_components.tx_root_inputs.is_empty());
         assert!(out.proof_components.exact_state_killshot_inputs.is_empty());
@@ -1586,6 +1926,92 @@ mod tests {
             crate::accepted_block_certificate_statement_digest_v1(&tampered_statement),
             original_certificate_digest
         );
+    }
+
+    #[test]
+    fn full_batch_checkpoint_package_serializes_and_verifies_without_blocks() {
+        let mut state = ChainState::with_log_slots(8);
+        let parent = parent_header(&mut state);
+        let start_consensus = RecursiveConsensusState::from_header(
+            &parent,
+            block_work(&parent.difficulty_target),
+            0,
+            parent.timestamp,
+            parent.difficulty_target,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+        );
+        let start_accumulator = ChainAccumulator {
+            height: parent.height,
+            state_root: parent.state_root,
+            chain_hash: [0u8; 32],
+        };
+        let mut block_state = state.clone();
+        let block = empty_child(&parent, &mut block_state);
+        let witness = FullAcceptedBlockBatchWitness {
+            items: vec![FullAcceptedBlockBatchItem {
+                block,
+                block_proof_bytes: vec![],
+                block_auth_sidecar_bytes: vec![],
+            }],
+        };
+        let start_anchor = compute_header_chain_anchor(
+            std::iter::once(&parent),
+            start_consensus.cumulative_chainwork,
+        )
+        .expect("start anchor computes");
+
+        let package = prove_full_accepted_block_batch_checkpoint_package_from_boundary_v1(
+            &start_anchor,
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            &state,
+            &witness,
+        )
+        .expect("full accepted checkpoint package proves");
+        assert_eq!(package.start_height(), 0);
+        assert_eq!(package.end_height(), 1);
+        assert!(package.byte_len() > 0);
+
+        let encoded = bincode::serialize(&package).expect("package serializes");
+        let decoded: FullAcceptedBlockBatchCheckpointPackageV1 =
+            bincode::deserialize(&encoded).expect("package decodes");
+        let accepted_claim_output =
+            verify_full_accepted_block_batch_checkpoint_package_v1(&decoded)
+                .expect("decoded package verifies without retained blocks");
+        assert_eq!(
+            accepted_claim_output.accumulator,
+            decoded.step_statement.batch_summary.end_accumulator
+        );
+        assert_eq!(
+            accepted_claim_output.consensus_state,
+            decoded.step_statement.batch_summary.end_consensus
+        );
+        let public_proof = public_history_checkpoint_proof_from_package_v1(
+            &start_anchor,
+            &start_accumulator,
+            &decoded,
+        )
+        .expect("public checkpoint proof exports from package");
+        noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+            &public_proof,
+            &start_anchor,
+            &decoded.step_statement.batch_summary.end_anchor,
+        )
+        .expect("exported public checkpoint proof verifies");
+
+        let mut tampered = decoded;
+        tampered
+            .components
+            .accepted_claim_witness
+            .accepted_block_claims[0][0] += Block128::ONE;
+        assert!(matches!(
+            verify_full_accepted_block_batch_checkpoint_package_v1(&tampered),
+            Err(FullAcceptedBlockBatchError::CheckpointStep(_))
+                | Err(FullAcceptedBlockBatchError::ComponentShapeMismatch)
+                | Err(FullAcceptedBlockBatchError::AcceptedClaimBatch(_))
+        ));
     }
 
     #[test]
@@ -1752,23 +2178,38 @@ mod tests {
             batch_summary: summary,
             next_head,
         };
-        let (checkpoint_step_proof, certificate_batch_statement, checkpoint_output) =
+        let (checkpoint_step_proof, certificate_batch_statement) =
+            prove_history_checkpoint_step_proof_from_verified_full_accepted_output_v1(
+                &checkpoint_statement,
+                &out,
+            )
+            .expect("checkpoint step proves from already verified accepted output");
+        verify_history_checkpoint_step_proof_with_verified_full_accepted_output_v1(
+            &checkpoint_statement,
+            &certificate_batch_statement,
+            &out,
+            &checkpoint_step_proof,
+        )
+        .expect("checkpoint step verifies already verified accepted output");
+
+        let (component_checkpoint_step_proof, component_certificate_batch, checkpoint_output) =
             prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
                 &checkpoint_statement,
                 &out.proof_components,
                 &component_proof,
             )
-            .expect("checkpoint step proves from full accepted components");
+            .expect("checkpoint step can still prove from retained components");
         assert_eq!(checkpoint_output, out.accepted_claim_batch);
+        assert_eq!(component_certificate_batch, certificate_batch_statement);
         let verified_checkpoint_output =
             verify_history_checkpoint_step_proof_with_full_accepted_components_v1(
                 &checkpoint_statement,
                 &certificate_batch_statement,
                 &out.proof_components,
                 &component_proof,
-                &checkpoint_step_proof,
+                &component_checkpoint_step_proof,
             )
-            .expect("checkpoint step verifies full accepted components");
+            .expect("checkpoint step verifies retained full accepted components");
         assert_eq!(verified_checkpoint_output, out.accepted_claim_batch);
         let retained_checkpoint_output =
             verify_retained_full_accepted_block_batch_checkpoint_step_v1(
@@ -1798,6 +2239,38 @@ mod tests {
                 &checkpoint_step_proof,
             ),
             Err(FullAcceptedBlockBatchError::CheckpointStep(_))
+        ));
+
+        let mut bad_components = out.proof_components.clone();
+        bad_components.accepted_block_certificate_validity_handles[0].proof_digest[0] ^= 1;
+        assert!(matches!(
+            prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
+                &checkpoint_statement,
+                &bad_components,
+                &component_proof,
+            ),
+            Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index: 0 })
+        ));
+        assert!(matches!(
+            verify_history_checkpoint_step_proof_with_full_accepted_components_v1(
+                &checkpoint_statement,
+                &certificate_batch_statement,
+                &bad_components,
+                &component_proof,
+                &checkpoint_step_proof,
+            ),
+            Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index: 0 })
+        ));
+
+        let mut bad_components = out.proof_components.clone();
+        bad_components.accepted_block_certificate_proofs[0].statement_digest[0] ^= 1;
+        assert!(matches!(
+            prove_history_checkpoint_step_proof_from_full_accepted_components_v1(
+                &checkpoint_statement,
+                &bad_components,
+                &component_proof,
+            ),
+            Err(FullAcceptedBlockBatchError::CertificateProofStatementMismatch { index: 0 })
         ));
 
         let mut bad_components = out.proof_components.clone();

@@ -98,7 +98,7 @@ pub fn lagrange_at_0_1_2(evals: &[Block128; 3], r: Block128) -> Block128 {
 }
 
 /// One `(r, v)` MLE-evaluation claim on the shared target MLE `B`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvalClaim {
     pub point: Vec<Block128>,
     pub value: Block128,
@@ -146,7 +146,7 @@ impl MultiBatchEvalProof {
 }
 
 /// Output of a successful verify.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchEvalReduction {
     /// `r_B` — the sumcheck's terminal point, in variable order.
     pub point: Vec<Block128>,

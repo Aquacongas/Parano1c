@@ -638,7 +638,7 @@ pub struct OwnerAuthUnifiedProof {
     pub state_lane_dec_at_r: [Block128; STATE_SIZE],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnerAuthUnifiedReduction {
     pub r_prime: Vec<Block128>,
     pub state_at_r: Block128,
@@ -651,7 +651,7 @@ pub struct OwnerAuthShiftProof {
     pub state_at_r2: Block128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnerAuthShiftReduction {
     pub r_double_prime: Vec<Block128>,
     pub state_at_r2: Block128,
@@ -663,7 +663,7 @@ pub struct OwnerAuthBoundaryProof {
     pub state_at_r: Block128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnerAuthBoundaryReduction {
     pub point: Vec<Block128>,
     pub state_at_r: Block128,
@@ -1499,7 +1499,7 @@ impl OwnerAuthProofKillShot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnerAuthVerifierClaims {
     pub main: OwnerAuthUnifiedReduction,
     pub shift: OwnerAuthShiftReduction,

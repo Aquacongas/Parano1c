@@ -26,7 +26,7 @@ use crate::block_spine::{
 const GUARD_BUCKET_LINEAR_RELATION_TAG: u128 = 0x5247_4442_5543_4B01; // "RGDBUCK"+1
 const GUARD_BUCKET_PIN_LANES: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardBucketHashInputs {
     pub occupied: bool,
     pub absolute_height: u64,
@@ -34,7 +34,7 @@ pub struct GuardBucketHashInputs {
     pub expected_hash: [Block128; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchedGuardBucketProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

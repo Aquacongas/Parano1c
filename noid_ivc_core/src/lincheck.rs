@@ -1097,18 +1097,32 @@ pub fn pack_z_lincheck_from_packed(
 /// univariate-skip variable ordering). The `k_log − k_skip` multilinear
 /// inner-rest dims occupy the next bits.
 ///
-/// Cost: 64 (Lagrange) + 32 (eq) + 2048 outer products ≈ tiny.
+/// Cost: `2^k_skip` Lagrange weights, `2^|x_inner_rest|` multilinear eq
+/// entries, then `2^k_log` outer-product multiplications. For production
+/// `k_log = 16`, the outer product is large enough to parallelize.
 pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) -> Vec<F128> {
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = Vec::with_capacity(total);
+    let mut out = crate::alloc_uninit_f128_vec(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for &er in &eq_rest {
-        for &ls in &lambda_skip {
-            out.push(ls * er);
+    const PAR_THRESHOLD: usize = 1 << 14;
+    if total >= PAR_THRESHOLD && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        out.par_chunks_mut(ell_skip)
+            .zip(eq_rest.par_iter())
+            .for_each(|(chunk, &er)| {
+                for (slot, &ls) in chunk.iter_mut().zip(lambda_skip.iter()) {
+                    *slot = ls * er;
+                }
+            });
+    } else {
+        for (chunk, &er) in out.chunks_mut(ell_skip).zip(eq_rest.iter()) {
+            for (slot, &ls) in chunk.iter_mut().zip(lambda_skip.iter()) {
+                *slot = ls * er;
+            }
         }
     }
     debug_assert_eq!(out.len(), total);

@@ -31,7 +31,7 @@ const SLOT_LEAF_LINEAR_RELATION_TAG: u128 = 0x4558_5354_534C_5401; // "EXSTSLT"+
 const SLOT_LEAF_PERMS: usize = 2;
 const SLOT_LEAF_PIN_LANES: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotLeafInputs {
     pub amount: u64,
     pub owner_hi: Block128,
@@ -39,7 +39,7 @@ pub struct SlotLeafInputs {
     pub expected_leaf: [Block128; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchedSlotLeafProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

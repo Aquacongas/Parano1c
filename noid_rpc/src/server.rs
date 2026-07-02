@@ -63,21 +63,106 @@ fn map_history_claim_error(
     )
 }
 
-fn history_proof_bytes_from_cache(cache_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let cache: noid_recursive::LocalHistoryCache = bincode::deserialize(cache_bytes)
-        .map_err(|e| format!("local history cache decode failed: {e}"))?;
-    let proof = noid_recursive::prove_history_from_local_cache(&cache)
-        .map_err(|e| format!("local history proof build failed: {e}"))?;
-    let bytes = bincode::serialize(&proof)
-        .map_err(|e| format!("local history proof encode failed: {e}"))?;
+#[inline]
+fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
+    proof_height <= tip_height
+        && tip_height.saturating_sub(proof_height)
+            <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+}
+
+fn checkpoint_history_proof_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u8>>, String> {
+    let Some(coverage) = ctx
+        .store
+        .get_checkpoint_coverage()
+        .map_err(|e| format!("checkpoint coverage read failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(height) = coverage.history_proof_covered_to else {
+        return Ok(None);
+    };
+    if height == 0
+        || height > ctx.tip_height()
+        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
+    {
+        return Ok(None);
+    }
+    let Some(package_bytes) = ctx
+        .store
+        .get_accepted_block_batch_certificate_package(height)
+        .map_err(|e| format!("checkpoint package read h={height} failed: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+        bincode::deserialize(&package_bytes)
+            .map_err(|e| format!("checkpoint package decode h={height} failed: {e}"))?;
+    if package.end_height() != height {
+        return Err(format!(
+            "checkpoint package height mismatch: coverage h={height}, package h={}",
+            package.end_height()
+        ));
+    }
+    let local_start_anchor = ctx
+        .store
+        .get_header_anchor(package.start_height())
+        .map_err(|e| format!("checkpoint start anchor read failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "missing checkpoint start anchor h={}",
+                package.start_height()
+            )
+        })?;
+    if local_start_anchor != package.step_statement.batch_summary.start_anchor {
+        return Ok(None);
+    }
+    let local_end_anchor = ctx
+        .store
+        .get_header_anchor(height)
+        .map_err(|e| format!("checkpoint end anchor read failed: {e}"))?
+        .ok_or_else(|| format!("missing checkpoint end anchor h={height}"))?;
+    if local_end_anchor != package.step_statement.batch_summary.end_anchor {
+        return Ok(None);
+    }
+
+    let base_anchor = ctx
+        .store
+        .get_header_anchor(0)
+        .map_err(|e| format!("genesis anchor read failed: {e}"))?
+        .ok_or_else(|| "missing genesis header anchor".to_string())?;
+    let genesis_header = ctx
+        .store
+        .get_header(0)
+        .map_err(|e| format!("genesis header read failed: {e}"))?
+        .ok_or_else(|| "missing genesis header".to_string())?;
+    let genesis_hash = noid_chain::hash_block_header(&genesis_header);
+    if base_anchor.height != 0 || base_anchor.block_id != genesis_hash {
+        return Err("genesis header anchor mismatch".into());
+    }
+    let base_accumulator =
+        noid_recursive::genesis_accumulator(genesis_header.state_root, genesis_hash);
+    let proof = noid_block::public_history_checkpoint_proof_from_package_v1(
+        &base_anchor,
+        &base_accumulator,
+        &package,
+    )
+    .map_err(|e| format!("checkpoint proof build failed: {e:?}"))?;
+    noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+        &proof,
+        &base_anchor,
+        &local_end_anchor,
+    )
+    .map_err(|e| format!("checkpoint proof self-check failed: {e}"))?;
+    let bytes =
+        bincode::serialize(&proof).map_err(|e| format!("checkpoint proof encode failed: {e}"))?;
     if bytes.len() > MAX_HISTORY_PROOF_BYTES {
         return Err(format!(
-            "local history proof too large: {} > {}",
+            "checkpoint proof too large: {} > {}",
             bytes.len(),
             MAX_HISTORY_PROOF_BYTES
         ));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 #[inline]
@@ -327,13 +412,9 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn get_history_proof(&self) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
-        match chain.store.get_local_history_cache() {
-            Ok(Some(cache_bytes)) => history_proof_bytes_from_cache(&cache_bytes)
-                .map(|bytes| Some(hex::encode(bytes)))
-                .map_err(rpc_err),
-            Ok(None) => Ok(None),
-            Err(e) => Err(rpc_err(e.to_string())),
-        }
+        checkpoint_history_proof_bytes(&chain)
+            .map(|bytes| bytes.map(hex::encode))
+            .map_err(rpc_err)
     }
 
     async fn get_slot(&self, slot_index: u32) -> RpcResult<SlotInfo> {
@@ -555,13 +636,12 @@ impl ParanoidApiServer for RpcHandler {
             }
         });
         let reward = block_reward(tip.log_slots);
-        let rec_height = chain
+        let checkpoint_proof_height = chain
             .store
-            .get_local_history_cache()
+            .get_checkpoint_coverage()
             .ok()
             .flatten()
-            .and_then(|b| bincode::deserialize::<noid_recursive::LocalHistoryCache>(&b).ok())
-            .map(|p| p.block_height);
+            .and_then(|coverage| coverage.history_proof_covered_to);
         Ok(MiningInfo {
             height,
             difficulty_bits: diff_bits,
@@ -569,7 +649,7 @@ impl ParanoidApiServer for RpcHandler {
             block_reward_micronoid: reward,
             block_reward_noid: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
-            local_history_cache_height: rec_height,
+            checkpoint_proof_height,
         })
     }
 
@@ -1658,21 +1738,12 @@ mod tests {
     }
 
     #[test]
-    fn history_proof_bytes_from_cache_roundtrip() {
-        let cache = noid_recursive::init_genesis_history_cache();
-        let cache_bytes = bincode::serialize(&cache).expect("serialize cache");
-        let proof_bytes = history_proof_bytes_from_cache(&cache_bytes).expect("proof bytes");
-        assert!(proof_bytes.len() < MAX_HISTORY_PROOF_BYTES);
-
-        let proof: noid_recursive::HistoryProof =
-            bincode::deserialize(&proof_bytes).expect("decode proof");
-        assert_eq!(proof.start_anchor, cache.start_anchor);
-        assert_eq!(proof.end_anchor, cache.anchor);
-    }
-
-    #[test]
-    fn history_proof_bytes_from_cache_rejects_bad_cache() {
-        assert!(history_proof_bytes_from_cache(b"not a cache").is_err());
+    fn checkpoint_proof_serving_requires_retained_suffix() {
+        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+        assert!(snapshot_suffix_is_retained(100, 100));
+        assert!(snapshot_suffix_is_retained(100, 100 - retention));
+        assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
+        assert!(!snapshot_suffix_is_retained(100, 101));
     }
 }
 

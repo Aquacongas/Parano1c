@@ -34,7 +34,7 @@
 //! | Headers | MDBX (forever) | Random access by height/hash |
 //! | Segment columns | MDBX (forever) | Persist across restarts |
 //! | Undo logs | MDBX retained window | Reorg recovery |
-//! | Block bodies/proofs/sidecars | MDBX (until checkpoint coverage) | Checkpoint generation and bounded peer sync |
+//! | Block bodies/proofs/sidecars | MDBX retained suffix after coverage | Bounded peer sync and prover input |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
 //! | Recent headers | RAM (MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH) | Timestamp + anchor validation |
 
@@ -167,7 +167,7 @@ impl MdbxChainContext {
     /// once (provider outage), each resumes from its own verified local state instead
     /// of requiring peers to serve a snapshot that nobody has.
     ///
-    /// Headers, hash-to-height indexes, and the local history cache are always preserved.
+    /// Headers, hash-to-height indexes, header anchors, and chainwork are always preserved.
     pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError> {
         let store = MdbxStore::open(path)?;
 
@@ -760,6 +760,26 @@ impl MdbxChainContext {
             .rebuild_exact_utxo_root_loaded()
             .map_err(|_| MdbxContextError::Corrupt("checkpoint exact root rebuild failed"))?;
         Ok(checkpoint_state)
+    }
+
+    /// Reconstruct an already-finalized state snapshot from the current state
+    /// and retained undo logs. This is used by the O(1) snapshot scaffold to
+    /// serve state at the same finalized height covered by the history proof.
+    pub fn reconstruct_state_snapshot_at(
+        &mut self,
+        height: u64,
+    ) -> Result<ChainState, MdbxContextError> {
+        if height > self.tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot reconstruction height is above canonical tip",
+            ));
+        }
+        if self.tip_height.saturating_sub(height) > CONSENSUS_FINALITY_DEPTH {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot reconstruction height is outside retained undo window",
+            ));
+        }
+        self.reconstruct_state_at_height(height)
     }
 
     fn checkpoint_payload_roots(
@@ -1397,7 +1417,10 @@ impl MdbxChainContext {
             .store
             .get_chain_work(tip_height)?
             .ok_or(MdbxContextError::Corrupt("snapshot tip chainwork missing"))?;
-        let finalized_height = tip_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+        // Snapshot manifests are served at a proof-covered finalized boundary.
+        // The retained suffix is replayed after snapshot application, so the
+        // snapshot height itself is the local finalized checkpoint.
+        let finalized_height = tip_height;
         let finalized_header =
             self.store
                 .get_header(finalized_height)?
@@ -1634,6 +1657,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(ctx.tip_height(), 0);
+        let h0 = *ctx.tip_header();
+        let expected_anchor =
+            crate::compute_header_chain_anchor(std::iter::once(&h0), *ctx.tip_chain_work())
+                .expect("genesis anchor");
+        assert_eq!(
+            ctx.store.get_header_anchor(0).unwrap(),
+            Some(expected_anchor)
+        );
     }
 
     #[test]
@@ -1653,6 +1684,15 @@ mod tests {
         {
             let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             assert_eq!(ctx.tip_height(), 1, "tip must survive restart");
+            let h0 = ctx.store.get_header(0).unwrap().expect("h0");
+            let h1 = ctx.store.get_header(1).unwrap().expect("h1");
+            let expected_anchor =
+                crate::compute_header_chain_anchor([h0, h1].iter(), *ctx.tip_chain_work())
+                    .expect("h1 anchor");
+            assert_eq!(
+                ctx.store.get_header_anchor(1).unwrap(),
+                Some(expected_anchor)
+            );
         }
     }
 
@@ -1887,6 +1927,93 @@ mod tests {
         assert_eq!(
             ctx.store.get_block_auth_sidecar(1).unwrap(),
             Some(b"sidecar-1".to_vec())
+        );
+    }
+
+    #[test]
+    fn block_payloads_prune_after_checkpoint_history_coverage() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+
+        let first = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
+        ctx.store.put_block_proof(1, b"proof-1").unwrap();
+        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
+        ctx.store.put_history_claim(1, b"claim-1").unwrap();
+        ctx.store
+            .put_accepted_block_certificate(1, b"certificate-1")
+            .unwrap();
+
+        for _ in 0..CONSENSUS_FINALITY_DEPTH {
+            let block = build_empty_block_on(&mut ctx);
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+        }
+        assert_eq!(ctx.tip_height(), CONSENSUS_FINALITY_DEPTH + 1);
+        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
+
+        ctx.store
+            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
+                checkpoint_id: [0xA5; 32],
+                height: 1,
+                block_hash: crate::hash_block_header(&first.header),
+                covered_from: 1,
+                covered_to: 1,
+                history_proof_covered_to: Some(1),
+            })
+            .unwrap();
+        let block = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+
+        assert_eq!(ctx.store.get_recent_block(1).unwrap(), None);
+        assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
+        assert_eq!(ctx.store.get_block_auth_sidecar(1).unwrap(), None);
+        assert_eq!(ctx.store.get_history_claim(1).unwrap(), None);
+    }
+
+    #[test]
+    fn block_payloads_do_not_prune_without_certificate_record() {
+        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+
+        let first = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
+        ctx.store.put_block_proof(1, b"proof-1").unwrap();
+        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
+        ctx.store.put_history_claim(1, b"claim-1").unwrap();
+
+        for _ in 0..CONSENSUS_FINALITY_DEPTH {
+            let block = build_empty_block_on(&mut ctx);
+            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+        }
+        ctx.store
+            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
+                checkpoint_id: [0xA5; 32],
+                height: 1,
+                block_hash: crate::hash_block_header(&first.header),
+                covered_from: 1,
+                covered_to: 1,
+                history_proof_covered_to: Some(1),
+            })
+            .unwrap();
+        let block = build_empty_block_on(&mut ctx);
+        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
+
+        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
+        assert_eq!(
+            ctx.store.get_block_proof(1).unwrap(),
+            Some(b"proof-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_block_auth_sidecar(1).unwrap(),
+            Some(b"sidecar-1".to_vec())
+        );
+        assert_eq!(
+            ctx.store.get_history_claim(1).unwrap(),
+            Some(b"claim-1".to_vec())
         );
     }
 

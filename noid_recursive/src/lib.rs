@@ -8,15 +8,16 @@
 //! - `LocalHistoryCache`: local finalized-history accumulator cache.
 //! - `advance_local_history_cache`: fold one accepted-block claim into the cache.
 //!
-//! The local cache is not a proof and is not public snapshot authority. Public
-//! O(1) sync is enabled only after a recursive verifier proves the full
-//! accepted-block batch relation.
+//! The local cache is the temporary finalized-history coverage source for the
+//! O(1) scaffold. The final backend keeps the same boundary but replaces the
+//! scaffold pieces with recursive accepted-block batch verification.
 
 pub mod accepted_batch;
 pub mod accumulator;
 pub mod authorization;
 pub mod block_certificate;
 pub mod block_certificate_backend;
+pub mod block_certificate_ivc;
 pub mod checkpoint;
 pub mod checkpoint_ivc_backend;
 pub mod checkpoint_proof;
@@ -48,21 +49,32 @@ pub use block_certificate::{
     accepted_block_certificate_batch_statement_hash_params_v1,
     accepted_block_certificate_batch_statement_v1, accepted_block_certificate_block_body_digest_v1,
     accepted_block_certificate_block_proof_digest_v1, accepted_block_certificate_chain_claim_v1,
-    accepted_block_certificate_statement_digest_v1, accepted_block_certificate_statement_fields_v1,
+    accepted_block_certificate_proof_digest_v1, accepted_block_certificate_receipt_chain_claim_v1,
+    accepted_block_certificate_receipt_v1, accepted_block_certificate_statement_digest_v1,
+    accepted_block_certificate_statement_fields_v1,
     accepted_block_certificate_statement_hash_fields_v1,
     accepted_block_certificate_statement_hash_params_v1,
+    accepted_block_certificate_validity_handle_v1,
     prove_accepted_block_certificate_batch_digest_proof_v1,
     prove_accepted_block_certificate_digest_backend_v1,
     prove_accepted_block_certificate_proof_v1_hash_only,
     verify_accepted_block_certificate_batch_digest_proof_v1,
     verify_accepted_block_certificate_digest_backend_v1,
-    verify_accepted_block_certificate_proof_v1_untrusted, AcceptedBlockCertificateBackendProofV1,
+    verify_accepted_block_certificate_proof_v1_checkpoint,
+    verify_accepted_block_certificate_receipt_projection_v1,
+    verify_accepted_block_certificate_validity_handle_v1, AcceptedBlockCertificateBackendProofV1,
     AcceptedBlockCertificateBatchDigestProofV1, AcceptedBlockCertificateBatchError,
     AcceptedBlockCertificateBatchStatementV1, AcceptedBlockCertificateProofError,
-    AcceptedBlockCertificateProofV1, AcceptedBlockCertificateStatementV1,
+    AcceptedBlockCertificateProofV1, AcceptedBlockCertificateReceiptError,
+    AcceptedBlockCertificateReceiptV1, AcceptedBlockCertificateStatementV1,
+    AcceptedBlockCertificateValidityHandleError, AcceptedBlockCertificateValidityHandleV1,
+    ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1,
+    ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1,
     ACCEPTED_BLOCK_CERTIFICATE_BATCH_STATEMENT_HASH_FIELDS,
-    ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION, ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS,
+    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_VERSION,
+    ACCEPTED_BLOCK_CERTIFICATE_VALIDITY_HANDLE_VERSION,
 };
 pub use block_certificate_backend::{
     verify_accepted_block_batch_components_v1, verify_exact_state_killshot_v1,
@@ -70,14 +82,29 @@ pub use block_certificate_backend::{
     AcceptedBlockBatchComponentProofV1, AuthorizationComponentInputV1, ExactStateKillShotErrorV1,
     ExactStateKillShotInputsV1, ExactStateKillShotProofV1,
 };
+pub use block_certificate_ivc::{
+    accepted_block_certificate_ivc_receipt_relation_digest_v1,
+    decode_and_verify_accepted_block_certificate_ivc_receipt_backend_v1,
+    prove_accepted_block_certificate_ivc_receipt_backend_v1,
+    prove_accepted_block_certificate_ivc_receipt_backend_v1_with_receipt,
+    prove_accepted_block_certificate_proof_v1_ivc_receipt,
+    verify_accepted_block_certificate_ivc_receipt_backend_v1,
+    AcceptedBlockCertificateIvcReceiptBackendProofV1, AcceptedBlockCertificateIvcReceiptError,
+    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG,
+    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_BATCH_SIZE,
+    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE, ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M,
+    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION_V1,
+};
 pub use checkpoint::{
     prove_checkpoint_poseidon, verify_checkpoint_poseidon, CheckpointPoseidonError,
     CheckpointPoseidonProof,
 };
 pub use checkpoint_ivc_backend::{
-    prove_history_checkpoint_ivc_chunk_core_v1, verify_history_checkpoint_ivc_chunk_core_v1,
-    HistoryCheckpointIvcChunkCoreError, HistoryCheckpointIvcChunkCoreProofV1,
-    HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION_V1, HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE,
+    prove_history_checkpoint_ivc_chunk_core_v1,
+    prove_history_checkpoint_ivc_chunk_receipt_handle_core_v1,
+    verify_history_checkpoint_ivc_chunk_core_v1, HistoryCheckpointIvcChunkCoreError,
+    HistoryCheckpointIvcChunkCoreProofV1, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION_V1,
+    HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES, HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE,
     HISTORY_CHECKPOINT_IVC_PCS_LOG_INV_RATE,
 };
 pub use checkpoint_proof::{
@@ -90,12 +117,17 @@ pub use checkpoint_proof::{
     prove_history_checkpoint_step_digest_proof_v1,
     prove_history_checkpoint_step_proof_v1_batch_digest_only,
     prove_history_checkpoint_step_proof_v1_from_block_components,
+    prove_history_checkpoint_step_proof_v1_from_block_components_with_certificate_proofs_v1,
+    prove_history_checkpoint_step_proof_v1_from_block_components_with_certificate_receipt_handles_v1,
     prove_history_checkpoint_step_proof_v1_from_certificate_statements,
     prove_history_checkpoint_step_proof_v1_with_digest_components,
-    verify_history_checkpoint_proof_v1_untrusted, verify_history_checkpoint_step_digest_proof_v1,
+    prove_history_checkpoint_step_proof_v1_with_ivc_chunk_certificate_proof_components,
+    prove_history_checkpoint_step_proof_v1_with_ivc_chunk_core_components,
+    prove_history_checkpoint_step_proof_v1_with_ivc_chunk_receipt_handle_components,
+    verify_history_checkpoint_proof_v1_checkpoint, verify_history_checkpoint_step_digest_proof_v1,
+    verify_history_checkpoint_step_proof_v1_checkpoint,
     verify_history_checkpoint_step_proof_v1_private_block_components_native,
     verify_history_checkpoint_step_proof_v1_private_components_native,
-    verify_history_checkpoint_step_proof_v1_untrusted,
     verify_history_checkpoint_step_statement_v1_native, HistoryCheckpointBatchSummaryV1,
     HistoryCheckpointHeadV1, HistoryCheckpointProofError, HistoryCheckpointProofV1,
     HistoryCheckpointRecursivePayloadV1, HistoryCheckpointStepBackendProofV1,
@@ -174,7 +206,7 @@ pub use history_proof::{
     verify_history_arc_pcd_recursive_step_proof_native,
     verify_history_arc_pcd_recursive_step_statement_shape,
     verify_history_arc_pcd_step_proof_native, verify_history_pcd_step_statement_shape,
-    verify_history_proof_native, verify_history_proof_untrusted, verify_history_step_native,
+    verify_history_proof_checkpoint_v1, verify_history_proof_native, verify_history_step_native,
     HistoryAccumulationState, HistoryArcPcdAccumulator, HistoryArcPcdChunkStepProof,
     HistoryArcPcdOneStepProof, HistoryArcPcdRecursiveChainHead,
     HistoryArcPcdRecursiveChunkChainHead, HistoryArcPcdRecursiveChunkStepProof,
@@ -209,5 +241,6 @@ pub use prove::{
     LOCAL_HISTORY_RECURSIVE_CHUNK_HEAD_CACHE_VERSION, LOCAL_HISTORY_RECURSIVE_HEAD_CACHE_VERSION,
 };
 pub use verify::{
-    reject_public_snapshot_authority, verify_local_history_cache_step, verify_tip, RecVerifyError,
+    accept_public_snapshot_authority_scaffold, reject_public_snapshot_authority,
+    verify_local_history_cache_step, verify_tip, RecVerifyError,
 };

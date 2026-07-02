@@ -20,13 +20,13 @@ use noid_gkr::{
 use noid_poseidon2b::Poseidon2bChannel;
 use rayon::prelude::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FiatShamirTraceOp {
     Absorb(Block128),
     Squeeze(Block128),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationVerifierTrace {
     pub tx_index: usize,
     pub owner_count: usize,

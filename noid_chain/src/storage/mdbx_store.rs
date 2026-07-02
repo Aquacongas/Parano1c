@@ -18,23 +18,29 @@ use noid_poseidon2b::primitives::TxBodyHash;
 use crate::block_header::BlockHeader;
 use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
-use crate::consensus::params::UNDO_RETENTION_DEPTH;
+use crate::consensus::params::{RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH};
+use crate::header_anchor::{
+    compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
+    HeaderChainAnchorError,
+};
 use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_checkpoint_coverage, decode_checkpoint_package,
-    decode_consensus_meta, decode_header, decode_reuse_guard_buckets, decode_segment,
-    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
-    encode_checkpoint_coverage, encode_checkpoint_package, encode_consensus_meta, encode_header,
-    encode_reuse_guard_buckets, encode_segment, encode_state_meta, encode_tx_index_value,
-    encode_undo_log, u64_from_key, u64_key,
+    decode_consensus_meta, decode_header, decode_header_chain_anchor, decode_reuse_guard_buckets,
+    decode_segment, decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip,
+    encode_chain_work, encode_checkpoint_coverage, encode_checkpoint_package,
+    encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_reuse_guard_buckets,
+    encode_segment, encode_state_meta, encode_tx_index_value, encode_undo_log, u64_from_key,
+    u64_key,
 };
 
 // ---------------------------------------------------------------------------
 // Table names
 // ---------------------------------------------------------------------------
 const T_HEADERS: &str = "headers";
+const T_HEADER_ANCHORS: &str = "header_anchors";
 const T_HASH_TO_HEIGHT: &str = "h2h";
 const T_CHAIN_TIP: &str = "tip";
 const T_CONSENSUS_META: &str = "consensus_meta";
@@ -44,8 +50,6 @@ const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
 const T_REUSE_GUARD: &str = "reuse_guard";
 const T_RECENT_BLOCKS: &str = "recent";
-/// Local finalized-history cache object. Key: KEY_LOCAL_HISTORY_CACHE. Value: raw bincode bytes.
-const T_LOCAL_HISTORY_CACHE: &str = "local_history_cache";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
 /// BlockProofs retained until finalized and covered by a real immutable checkpoint proof.
@@ -54,9 +58,16 @@ const T_BLOCK_PROOFS: &str = "block_proofs";
 /// Public AuthGKR sidecars retained with block bodies until checkpoint coverage.
 /// Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
-/// Accepted state-transition history claims retained until the finalized
-/// history cache consumes them. Key: height (u64 LE). Value: raw bincode bytes.
+/// Accepted state-transition history claims retained until checkpoint package
+/// coverage consumes them. Key: height (u64 LE). Value: raw bincode bytes.
 const T_HISTORY_CLAIMS: &str = "history_claims";
+/// Accepted-block certificate records produced at block acceptance time.
+/// Key: height (u64 LE). Value: raw bincode bytes owned by noid_block/noid_recursive.
+const T_ACCEPTED_BLOCK_CERTIFICATES: &str = "accepted_block_certificates";
+/// Full accepted-block checkpoint batch packages.
+/// Key: end height (u64 LE). Value: raw bincode bytes owned by noid_block/noid_recursive.
+const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
+    "accepted_block_batch_certificate_packages";
 /// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
 /// Maintained incrementally in commit_block. Used for O(1) wallet scan.
 const T_OWNER_INDEX: &str = "owner_idx";
@@ -71,8 +82,6 @@ const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
 const KEY_REUSE_GUARD: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
-const KEY_LOCAL_HISTORY_CACHE: &[u8] = &[0u8];
-const KEY_LOCAL_HISTORY_CACHE_HEIGHT: &[u8] = &[1u8];
 const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 
 // ---------------------------------------------------------------------------
@@ -83,6 +92,7 @@ const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 pub enum StoreError {
     Mdbx(libmdbx::Error),
     Decode(&'static str),
+    HeaderAnchor(HeaderChainAnchorError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -90,6 +100,7 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Mdbx(e) => write!(f, "mdbx: {e}"),
             Self::Decode(ctx) => write!(f, "decode error: {ctx}"),
+            Self::HeaderAnchor(e) => write!(f, "header anchor: {e}"),
         }
     }
 }
@@ -99,6 +110,12 @@ impl std::error::Error for StoreError {}
 impl From<libmdbx::Error> for StoreError {
     fn from(e: libmdbx::Error) -> Self {
         Self::Mdbx(e)
+    }
+}
+
+impl From<HeaderChainAnchorError> for StoreError {
+    fn from(e: HeaderChainAnchorError) -> Self {
+        Self::HeaderAnchor(e)
     }
 }
 
@@ -188,6 +205,7 @@ impl MdbxStore {
         let txn = db.begin_rw_txn()?;
         for name in [
             T_HEADERS,
+            T_HEADER_ANCHORS,
             T_HASH_TO_HEIGHT,
             T_CHAIN_TIP,
             T_CONSENSUS_META,
@@ -197,11 +215,12 @@ impl MdbxStore {
             T_STATE_META,
             T_REUSE_GUARD,
             T_RECENT_BLOCKS,
-            T_LOCAL_HISTORY_CACHE,
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
+            T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
@@ -271,6 +290,14 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_HEADERS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw.and_then(|b| decode_header(&b)))
+    }
+
+    pub fn get_header_anchor(&self, height: u64) -> Result<Option<HeaderChainAnchor>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        raw.map(|b| decode_header_chain_anchor(&b).ok_or(StoreError::Decode("header chain anchor")))
+            .transpose()
     }
 
     /// Look up a header by its `H_BLOCK` hash (O(1) via the h2h index).
@@ -354,6 +381,28 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
+        let anchor_tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let anchor = if header.height == 0 {
+            compute_header_chain_anchor(std::iter::once(header), *cumulative_chainwork)?
+        } else {
+            let previous_raw: Option<Vec<u8>> =
+                txn.get(&anchor_tbl, &u64_key(header.height - 1))?;
+            let previous = previous_raw
+                .as_deref()
+                .and_then(decode_header_chain_anchor)
+                .ok_or(StoreError::Decode("missing previous header chain anchor"))?;
+            extend_header_chain_anchor(&previous, header, *cumulative_chainwork)?
+        };
+        if anchor.block_id != *hash {
+            return Err(StoreError::Decode("header anchor block id mismatch"));
+        }
+        txn.put(
+            &anchor_tbl,
+            u64_key(header.height),
+            encode_header_chain_anchor(&anchor),
+            WriteFlags::empty(),
+        )?;
+
         txn.commit()?;
         Ok(())
     }
@@ -376,49 +425,6 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         Ok(txn.get(&tbl, &u64_key(height))?)
-    }
-
-    /// Read the persisted local finalized-history cache object, if present.
-    pub fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError> {
-        let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
-        Ok(txn.get(&tbl, KEY_LOCAL_HISTORY_CACHE)?)
-    }
-
-    /// Read the height of the persisted local finalized-history cache object, if known.
-    pub fn get_local_history_cache_height(&self) -> Result<Option<u64>, StoreError> {
-        let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
-        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_LOCAL_HISTORY_CACHE_HEIGHT)?;
-        Ok(raw.and_then(|b| u64_from_key(&b)))
-    }
-
-    /// Persist the local finalized-history cache object.
-    ///
-    /// Prefer `put_local_history_cache_at` in node code so proof-byte pruning
-    /// can retain finalized block proofs until history proof generation has
-    /// consumed them.
-    pub fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError> {
-        let txn = self.db.begin_rw_txn()?;
-        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
-        txn.put(&tbl, KEY_LOCAL_HISTORY_CACHE, bytes, WriteFlags::empty())?;
-        txn.commit()?;
-        Ok(())
-    }
-
-    /// Persist the local finalized-history cache object and its block height atomically.
-    pub fn put_local_history_cache_at(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        let txn = self.db.begin_rw_txn()?;
-        let tbl = txn.open_table(Some(T_LOCAL_HISTORY_CACHE))?;
-        txn.put(&tbl, KEY_LOCAL_HISTORY_CACHE, bytes, WriteFlags::empty())?;
-        txn.put(
-            &tbl,
-            KEY_LOCAL_HISTORY_CACHE_HEIGHT,
-            u64_key(height),
-            WriteFlags::empty(),
-        )?;
-        txn.commit()?;
-        Ok(())
     }
 
     /// Store a serialised `BlockProof` for `height`.
@@ -472,6 +478,88 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw)
+    }
+
+    /// Store accepted-block certificate material for `height`.
+    ///
+    /// The record bytes are intentionally owned by `noid_block`/`noid_recursive`
+    /// so `noid_chain` does not depend on the recursive proof crate.
+    pub fn put_accepted_block_certificate(
+        &self,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve accepted-block certificate material for `height`.
+    pub fn get_accepted_block_certificate(
+        &self,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+        Ok(txn.get(&tbl, &u64_key(height))?)
+    }
+
+    /// Store full accepted-block checkpoint batch package material.
+    ///
+    /// The bytes are intentionally owned by `noid_block`/`noid_recursive`
+    /// so `noid_chain` stays independent of the recursive proof crate.
+    pub fn put_accepted_block_batch_certificate_package(
+        &self,
+        end_height: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES))?;
+        txn.put(&tbl, u64_key(end_height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve full accepted-block checkpoint batch package material by end height.
+    pub fn get_accepted_block_batch_certificate_package(
+        &self,
+        end_height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES))?;
+        Ok(txn.get(&tbl, &u64_key(end_height))?)
+    }
+
+    /// Return the greatest end height that has a full accepted-block batch package.
+    pub fn latest_accepted_block_batch_certificate_package_height(
+        &self,
+    ) -> Result<Option<u64>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES))?;
+        let mut cur = txn.cursor(&tbl)?;
+        let mut latest = None;
+        let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+        while let Some((k, _)) = item {
+            if let Some(height) = u64_from_key(&k) {
+                latest = Some(latest.map_or(height, |current: u64| current.max(height)));
+            }
+            item = cur.next()?;
+        }
+        Ok(latest)
+    }
+
+    /// Delete a full accepted-block batch package by end height.
+    pub fn delete_accepted_block_batch_certificate_package(
+        &self,
+        end_height: u64,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES))?;
+        txn.del(&tbl, u64_key(end_height), None)?;
+        txn.commit()?;
+        Ok(())
     }
 
     /// Store an immutable local checkpoint package for a finalized prefix.
@@ -677,6 +765,9 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
+            T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_OWNER_INDEX,
         ] {
             let tbl = txn.open_table(Some(name))?;
@@ -828,9 +919,10 @@ impl MdbxStore {
     /// 8. Write recent_block bytes
     ///
     /// After commit (non-atomic, re-runnable):
-    ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH
-    ///   - Keep block bodies, BlockProofs, and Auth sidecars until a real
-    ///     immutable checkpoint proof covers them.
+    ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH.
+    ///   - Prune retained block bodies, BlockProofs, Auth sidecars, and local
+    ///     accepted-claim witnesses once checkpoint package coverage reaches
+    ///     the same heights and they are outside the recent serving window.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_block(
         &self,
@@ -903,6 +995,32 @@ impl MdbxStore {
             &work_tbl,
             u64_key(header.height),
             encode_chain_work(&consensus_meta.cumulative_chainwork),
+            WriteFlags::empty(),
+        )?;
+
+        // --- 5.5. persistent header-chain anchor ---
+        let anchor_tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let anchor = if header.height == 0 {
+            compute_header_chain_anchor(
+                std::iter::once(header),
+                consensus_meta.cumulative_chainwork,
+            )?
+        } else {
+            let previous_raw: Option<Vec<u8>> =
+                txn.get(&anchor_tbl, &u64_key(header.height - 1))?;
+            let previous = previous_raw
+                .as_deref()
+                .and_then(decode_header_chain_anchor)
+                .ok_or(StoreError::Decode("missing previous header chain anchor"))?;
+            extend_header_chain_anchor(&previous, header, consensus_meta.cumulative_chainwork)?
+        };
+        if anchor.block_id != *hash {
+            return Err(StoreError::Decode("header anchor block id mismatch"));
+        }
+        txn.put(
+            &anchor_tbl,
+            u64_key(header.height),
+            encode_header_chain_anchor(&anchor),
             WriteFlags::empty(),
         )?;
 
@@ -1060,40 +1178,92 @@ impl MdbxStore {
 
     fn prune_after_commit(&self, current_height: u64) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
+        macro_rules! prune_height_table {
+            ($tbl:expr, $cutoff:expr) => {{
+                let keys_to_del: Vec<u64> = {
+                    let mut cur = txn.cursor(&$tbl)?;
+                    let mut keys = Vec::new();
+                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                    while let Some((k, _)) = item {
+                        match u64_from_key(&k) {
+                            Some(h) if h <= $cutoff => keys.push(h),
+                            _ => break,
+                        }
+                        item = cur.next()?;
+                    }
+                    keys
+                };
+                for h in keys_to_del {
+                    txn.del(&$tbl, u64_key(h), None)?;
+                }
+            }};
+        }
 
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
         if current_height > UNDO_RETENTION_DEPTH {
             let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
             let cutoff = current_height - UNDO_RETENTION_DEPTH;
-            // Collect keys first (cursor must be dropped before del).
-            let keys_to_del: Vec<u64> = {
-                let mut cur = txn.cursor(&undo_tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    match u64_from_key(&k) {
-                        Some(h) if h <= cutoff => keys.push(h),
-                        _ => break,
-                    }
-                    item = cur.next()?;
-                }
-                keys
+            prune_height_table!(undo_tbl, cutoff);
+        }
+
+        // --- Prune retained block payloads after O(1) history coverage ---
+        //
+        // The node stores headers forever. Full block bytes, BlockProof bytes,
+        // Auth sidecars, and accepted-claim witnesses are transient witnesses.
+        // They may be deleted once both conditions are true:
+        //
+        // 1. The height is outside the recent serving/reorg window.
+        // 2. The local O(1) checkpoint package coverage has consumed it.
+        //
+        // A height is pruned only after accepted-block certificate material
+        // exists for it and proven checkpoint coverage explicitly reaches it.
+        if current_height > RECENT_BLOCK_RETENTION_DEPTH {
+            let retention_cutoff = current_height - RECENT_BLOCK_RETENTION_DEPTH;
+            let real_checkpoint_coverage = {
+                let cov_tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+                let raw: Option<Vec<u8>> = txn.get(&cov_tbl, KEY_CHECKPOINT_COVERAGE)?;
+                raw.and_then(|b| decode_checkpoint_coverage(&b))
+                    .and_then(|coverage| coverage.history_proof_covered_to)
             };
-            for h in keys_to_del {
-                txn.del(&undo_tbl, u64_key(h), None)?;
+            if let Some(coverage_height) = real_checkpoint_coverage {
+                let cutoff = retention_cutoff.min(coverage_height);
+                let cert_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+                for table_name in [
+                    T_RECENT_BLOCKS,
+                    T_BLOCK_PROOFS,
+                    T_BLOCK_AUTH_SIDECARS,
+                    T_HISTORY_CLAIMS,
+                ] {
+                    let tbl = txn.open_table(Some(table_name))?;
+                    let candidates: Vec<u64> = {
+                        let mut cur = txn.cursor(&tbl)?;
+                        let mut keys = Vec::new();
+                        let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
+                        while let Some((k, _)) = item {
+                            match u64_from_key(&k) {
+                                Some(h) if h <= cutoff => keys.push(h),
+                                _ => break,
+                            }
+                            item = cur.next()?;
+                        }
+                        keys
+                    };
+                    for h in candidates {
+                        let certificate: Option<Vec<u8>> = txn.get(&cert_tbl, &u64_key(h))?;
+                        if certificate.is_some() {
+                            txn.del(&tbl, u64_key(h), None)?;
+                        }
+                    }
+                }
             }
         }
 
-        // Block bodies, BlockProofs, and Auth sidecars are checkpoint inputs.
-        // They are pruned only after an immutable checkpoint package covers
-        // the exact heights being removed. No such coverage table exists in this
-        // implementation yet, so pruning these tables is intentionally disabled.
         txn.commit()?;
         Ok(())
     }
 
     /// Clear volatile tables after local state corruption is detected, keeping
-    /// append-only headers, hash->height index, and the local history cache.
+    /// append-only headers, hash->height index, header anchors, and chainwork.
     ///
     /// Normal startup does NOT clear these tables: `MdbxChainContext::open_or_create`
     /// first tries to restore persisted current state from MDBX and checks it against
@@ -1108,11 +1278,13 @@ impl MdbxStore {
             T_UNDO_LOGS,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
+            T_CHECKPOINT_COVERAGE,
             T_OWNER_INDEX,
             T_STATE_META,
             T_CHAIN_TIP,
             T_CONSENSUS_META,
-            T_CHAIN_WORK,
             T_TX_INDEX,
         ];
         for name in volatile {
@@ -1168,14 +1340,6 @@ impl crate::storage::BlockStore for MdbxStore {
         MdbxStore::get_recent_block(self, height)
     }
 
-    fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError> {
-        MdbxStore::get_local_history_cache(self)
-    }
-
-    fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError> {
-        MdbxStore::put_local_history_cache(self, bytes)
-    }
-
     fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError> {
         MdbxStore::get_tx_index(self, hash)
     }
@@ -1194,5 +1358,118 @@ mod tests {
         assert_eq!(store.get_history_claim(7).unwrap(), None);
         store.put_history_claim(7, &bytes).unwrap();
         assert_eq!(store.get_history_claim(7).unwrap(), Some(bytes));
+    }
+
+    #[test]
+    fn accepted_block_certificate_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let bytes = b"certificate-record".to_vec();
+
+        assert_eq!(store.get_accepted_block_certificate(7).unwrap(), None);
+        store
+            .put_accepted_block_certificate(7, &bytes)
+            .expect("store certificate bytes");
+        assert_eq!(
+            store.get_accepted_block_certificate(7).unwrap(),
+            Some(bytes)
+        );
+    }
+
+    #[test]
+    fn accepted_block_batch_certificate_package_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let bytes = b"full-batch-checkpoint-package".to_vec();
+
+        assert_eq!(
+            store
+                .get_accepted_block_batch_certificate_package(16)
+                .unwrap(),
+            None
+        );
+        store
+            .put_accepted_block_batch_certificate_package(16, &bytes)
+            .expect("store full batch package bytes");
+        assert_eq!(
+            store
+                .get_accepted_block_batch_certificate_package(16)
+                .unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(
+            store
+                .latest_accepted_block_batch_certificate_package_height()
+                .unwrap(),
+            Some(16)
+        );
+        store
+            .put_accepted_block_batch_certificate_package(32, b"second")
+            .expect("store second package");
+        assert_eq!(
+            store
+                .latest_accepted_block_batch_certificate_package_height()
+                .unwrap(),
+            Some(32)
+        );
+        store
+            .delete_accepted_block_batch_certificate_package(32)
+            .expect("delete second package");
+        assert_eq!(
+            store
+                .latest_accepted_block_batch_certificate_package_height()
+                .unwrap(),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn verified_headers_persist_header_chain_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let h0 = crate::consensus::genesis::genesis_header();
+        let h0_hash = crate::hash_block_header(&h0);
+        let h0_work = [1u8; 32];
+
+        {
+            let store = MdbxStore::open(dir.path()).unwrap();
+            store
+                .put_verified_header_only(&h0, &h0_hash, &h0_work)
+                .unwrap();
+            let expected_h0 = compute_header_chain_anchor(std::iter::once(&h0), h0_work).unwrap();
+            assert_eq!(store.get_header_anchor(0).unwrap(), Some(expected_h0));
+
+            let h1 = BlockHeader {
+                prev_block_hash: h0_hash,
+                state_root: [2u8; 32],
+                tx_root: [3u8; 32],
+                timestamp: h0.timestamp + 15,
+                height: 1,
+                miner_address: h0.miner_address,
+                nonce: 1,
+                difficulty_target: h0.difficulty_target,
+                log_slots: h0.log_slots,
+                active_slot_count: 1,
+                alloc_counter: 1,
+            };
+            let h1_hash = crate::hash_block_header(&h1);
+            let h1_work = [2u8; 32];
+            store
+                .put_verified_header_only(&h1, &h1_hash, &h1_work)
+                .unwrap();
+            let expected_h1 = compute_header_chain_anchor([h0, h1].iter(), h1_work).unwrap();
+            assert_eq!(store.get_header_anchor(1).unwrap(), Some(expected_h1));
+        }
+
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let anchor = store
+            .get_header_anchor(1)
+            .unwrap()
+            .expect("header anchor survives reopen");
+        assert_eq!(anchor.height, 1);
+        assert_eq!(anchor.cumulative_chainwork, [2u8; 32]);
+        assert_eq!(
+            anchor.block_id,
+            crate::hash_block_header(&store.get_header(1).unwrap().unwrap())
+        );
     }
 }

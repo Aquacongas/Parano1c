@@ -13,6 +13,7 @@ use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ACCBLK};
 use noid_poseidon2b::native::permutation::{Poseidon2bPermutation, MDS_FULL, N_ROUNDS, STATE_SIZE};
+use serde::ser::SerializeStruct;
 
 use crate::batch_eval::{
     prove_linear_eval_prebound, prove_multi_batch_eval, verify_linear_eval_prebound,
@@ -36,7 +37,48 @@ pub struct AcceptedClaimHashInputs {
     pub expected_claim: [Block128; ACCEPTED_CLAIM_PIN_LANES],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl serde::Serialize for AcceptedClaimHashInputs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("AcceptedClaimHashInputs", 2)?;
+        state.serialize_field("fields", self.fields.as_slice())?;
+        state.serialize_field("expected_claim", &self.expected_claim)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AcceptedClaimHashInputs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            fields: Vec<Block128>,
+            expected_claim: [Block128; ACCEPTED_CLAIM_PIN_LANES],
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let fields = match wire.fields.try_into() {
+            Ok(fields) => fields,
+            Err(fields) => {
+                let fields: Vec<Block128> = fields;
+                return Err(serde::de::Error::invalid_length(
+                    fields.len(),
+                    &"80 accepted-claim fields",
+                ));
+            }
+        };
+        Ok(Self {
+            fields,
+            expected_claim: wire.expected_claim,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedClaimHashProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

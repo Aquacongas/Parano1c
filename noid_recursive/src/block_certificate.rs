@@ -26,12 +26,17 @@ pub const ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS: usize =
     ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS + 3;
 pub const ACCEPTED_BLOCK_CERTIFICATE_BATCH_STATEMENT_HASH_FIELDS: usize = 40;
 pub const ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION: u32 = 1;
+pub const ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION: u32 = 1;
+pub const ACCEPTED_BLOCK_CERTIFICATE_VALIDITY_HANDLE_VERSION: u32 = 1;
+pub const ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1: u32 = 1;
+pub const ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1: u32 = 2;
 
 const ABC_STMT1: u128 = 0x4142_435F_5354_4D31; // "ABC_STM1"
 const ABC_BATCH1: u128 = 0x4142_435F_4241_5431; // "ABC_BAT1"
 const ABC_BODY1: &[u8] = b"NOID:ABC:BLOCK_BODY:V1";
 const ABC_PROOF1: &[u8] = b"NOID:ABC:BLOCK_PROOF:V1";
 const ABC_AUTH1: &[u8] = b"NOID:ABC:AUTH_SIDECAR:V1";
+const ABC_CERTPROOF1: &[u8] = b"NOID:ABC:CERT_PROOF:V1";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockCertificateStatementV1 {
@@ -72,13 +77,50 @@ impl AcceptedBlockCertificateStatementV1 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockCertificateProofV1 {
     pub version: u32,
+    pub backend_kind: u32,
     pub statement_digest: Digest,
     pub backend_proof: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedBlockCertificateValidityHandleV1 {
+    pub version: u32,
+    pub statement_digest: Digest,
+    pub proof_digest: Digest,
+}
+
+impl AcceptedBlockCertificateValidityHandleV1 {
+    pub fn byte_len(&self) -> usize {
+        bincode::serialized_size(self)
+            .expect("serialized AcceptedBlockCertificateValidityHandleV1 length fits usize")
+            as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcceptedBlockCertificateReceiptV1 {
+    pub version: u32,
+    pub statement_digest: Digest,
+    pub height: u64,
+    pub block_id: Digest,
+    pub parent_block_id: Digest,
+    pub parent_state_root: Digest,
+    pub child_state_root: Digest,
+    pub accepted_block_claim_digest: Digest,
+}
+
+impl AcceptedBlockCertificateReceiptV1 {
+    pub fn byte_len(&self) -> usize {
+        bincode::serialized_size(self)
+            .expect("serialized AcceptedBlockCertificateReceiptV1 length fits usize")
+            as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockCertificateBackendProofV1 {
     pub version: u32,
+    pub backend_kind: u32,
     pub statement_digest_hash: FixedFieldHashProofKillShot,
 }
 
@@ -130,6 +172,7 @@ impl AcceptedBlockCertificateBatchStatementV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptedBlockCertificateProofError {
     UnsupportedVersion { actual: u32 },
+    UnsupportedBackendKind { actual: u32 },
     StatementDigestMismatch,
     EmptyBackendProof,
     DecodeBackendProof,
@@ -137,7 +180,7 @@ pub enum AcceptedBlockCertificateProofError {
     BadStatementDigestDischarge,
     BadBatchStatementDigestProof,
     BadBatchStatementDigestDischarge,
-    BackendVerifierMissing,
+    BadIvcReceiptBackend,
 }
 
 impl std::fmt::Display for AcceptedBlockCertificateProofError {
@@ -147,6 +190,12 @@ impl std::fmt::Display for AcceptedBlockCertificateProofError {
                 write!(
                     f,
                     "unsupported accepted-block certificate proof version {actual}"
+                )
+            }
+            Self::UnsupportedBackendKind { actual } => {
+                write!(
+                    f,
+                    "unsupported accepted-block certificate backend kind {actual}"
                 )
             }
             Self::StatementDigestMismatch => {
@@ -171,17 +220,88 @@ impl std::fmt::Display for AcceptedBlockCertificateProofError {
                 f,
                 "accepted-block certificate batch statement digest proof failed native discharge"
             ),
-            Self::BackendVerifierMissing => {
-                write!(
-                    f,
-                    "accepted-block certificate recursive verifier is not implemented"
-                )
+            Self::BadIvcReceiptBackend => {
+                write!(f, "accepted-block certificate IVC receipt backend rejected")
             }
         }
     }
 }
 
 impl std::error::Error for AcceptedBlockCertificateProofError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptedBlockCertificateReceiptError {
+    UnsupportedVersion { actual: u32 },
+    StatementDigestMismatch,
+    ProjectionMismatch,
+}
+
+impl std::fmt::Display for AcceptedBlockCertificateReceiptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { actual } => {
+                write!(
+                    f,
+                    "unsupported accepted-block certificate receipt version {actual}"
+                )
+            }
+            Self::StatementDigestMismatch => {
+                write!(f, "accepted-block certificate receipt digest mismatch")
+            }
+            Self::ProjectionMismatch => {
+                write!(f, "accepted-block certificate receipt projection mismatch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcceptedBlockCertificateReceiptError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptedBlockCertificateValidityHandleError {
+    UnsupportedVersion { actual: u32 },
+    UnsupportedBackendKind { actual: u32 },
+    StatementDigestMismatch,
+    EmptyBackendProof,
+    DecodeBackendProof,
+    EmptyProofDigest,
+}
+
+impl std::fmt::Display for AcceptedBlockCertificateValidityHandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { actual } => {
+                write!(
+                    f,
+                    "unsupported accepted-block certificate validity handle version {actual}"
+                )
+            }
+            Self::UnsupportedBackendKind { actual } => {
+                write!(
+                    f,
+                    "unsupported accepted-block certificate validity handle backend kind {actual}"
+                )
+            }
+            Self::StatementDigestMismatch => {
+                write!(
+                    f,
+                    "accepted-block certificate validity handle statement digest mismatch"
+                )
+            }
+            Self::EmptyBackendProof => {
+                write!(f, "empty accepted-block certificate validity backend proof")
+            }
+            Self::DecodeBackendProof => {
+                write!(f, "bad accepted-block certificate validity backend proof")
+            }
+            Self::EmptyProofDigest => {
+                write!(f, "empty accepted-block certificate validity proof digest")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AcceptedBlockCertificateValidityHandleError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptedBlockCertificateBatchError {
@@ -337,6 +457,153 @@ pub fn accepted_block_certificate_chain_claim_v1(
     digest_to_fields(&statement.accepted_block_claim_digest)
 }
 
+pub fn accepted_block_certificate_receipt_v1(
+    statement: &AcceptedBlockCertificateStatementV1,
+) -> AcceptedBlockCertificateReceiptV1 {
+    AcceptedBlockCertificateReceiptV1 {
+        version: ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION,
+        statement_digest: accepted_block_certificate_statement_digest_v1(statement),
+        height: statement.height,
+        block_id: statement.block_id,
+        parent_block_id: statement.parent_block_id,
+        parent_state_root: statement.parent_state_root,
+        child_state_root: statement.child_state_root,
+        accepted_block_claim_digest: statement.accepted_block_claim_digest,
+    }
+}
+
+pub fn accepted_block_certificate_receipt_chain_claim_v1(
+    receipt: &AcceptedBlockCertificateReceiptV1,
+) -> [Block128; 2] {
+    digest_to_fields(&receipt.accepted_block_claim_digest)
+}
+
+pub fn verify_accepted_block_certificate_receipt_projection_v1(
+    statement: &AcceptedBlockCertificateStatementV1,
+    receipt: &AcceptedBlockCertificateReceiptV1,
+) -> Result<(), AcceptedBlockCertificateReceiptError> {
+    if receipt.version != ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION {
+        return Err(AcceptedBlockCertificateReceiptError::UnsupportedVersion {
+            actual: receipt.version,
+        });
+    }
+    if receipt.statement_digest != accepted_block_certificate_statement_digest_v1(statement) {
+        return Err(AcceptedBlockCertificateReceiptError::StatementDigestMismatch);
+    }
+    let expected = accepted_block_certificate_receipt_v1(statement);
+    if &expected == receipt {
+        Ok(())
+    } else {
+        Err(AcceptedBlockCertificateReceiptError::ProjectionMismatch)
+    }
+}
+
+pub fn accepted_block_certificate_proof_digest_v1(
+    proof: &AcceptedBlockCertificateProofV1,
+) -> Digest {
+    let version_bytes = proof.version.to_le_bytes();
+    let backend_kind_bytes = proof.backend_kind.to_le_bytes();
+    poseidon2b_hash_byte_slices(
+        ABC_CERTPROOF1,
+        &[
+            &version_bytes,
+            &backend_kind_bytes,
+            &proof.statement_digest,
+            proof.backend_proof.as_slice(),
+        ],
+    )
+}
+
+pub fn accepted_block_certificate_validity_handle_v1(
+    proof: &AcceptedBlockCertificateProofV1,
+) -> Result<AcceptedBlockCertificateValidityHandleV1, AcceptedBlockCertificateValidityHandleError> {
+    if proof.version != ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION {
+        return Err(
+            AcceptedBlockCertificateValidityHandleError::UnsupportedVersion {
+                actual: proof.version,
+            },
+        );
+    }
+    if proof.backend_proof.is_empty() {
+        return Err(AcceptedBlockCertificateValidityHandleError::EmptyBackendProof);
+    }
+    match proof.backend_kind {
+        ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1 => {
+            let backend: AcceptedBlockCertificateBackendProofV1 =
+                bincode::deserialize(&proof.backend_proof)
+                    .map_err(|_| AcceptedBlockCertificateValidityHandleError::DecodeBackendProof)?;
+            if backend.version != ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION {
+                return Err(
+                    AcceptedBlockCertificateValidityHandleError::UnsupportedVersion {
+                        actual: backend.version,
+                    },
+                );
+            }
+            if backend.backend_kind != proof.backend_kind {
+                return Err(
+                    AcceptedBlockCertificateValidityHandleError::UnsupportedBackendKind {
+                        actual: backend.backend_kind,
+                    },
+                );
+            }
+        }
+        ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1 => {
+            let backend: crate::block_certificate_ivc::AcceptedBlockCertificateIvcReceiptBackendProofV1 =
+                bincode::deserialize(&proof.backend_proof)
+                    .map_err(|_| AcceptedBlockCertificateValidityHandleError::DecodeBackendProof)?;
+            if backend.version != ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION {
+                return Err(
+                    AcceptedBlockCertificateValidityHandleError::UnsupportedVersion {
+                        actual: backend.version,
+                    },
+                );
+            }
+            if backend.backend_kind != proof.backend_kind {
+                return Err(
+                    AcceptedBlockCertificateValidityHandleError::UnsupportedBackendKind {
+                        actual: backend.backend_kind,
+                    },
+                );
+            }
+        }
+        0 => return Err(AcceptedBlockCertificateValidityHandleError::EmptyBackendProof),
+        actual => {
+            return Err(
+                AcceptedBlockCertificateValidityHandleError::UnsupportedBackendKind { actual },
+            );
+        }
+    }
+    let proof_digest = accepted_block_certificate_proof_digest_v1(proof);
+    if proof_digest == [0u8; 32] {
+        return Err(AcceptedBlockCertificateValidityHandleError::EmptyProofDigest);
+    }
+    Ok(AcceptedBlockCertificateValidityHandleV1 {
+        version: ACCEPTED_BLOCK_CERTIFICATE_VALIDITY_HANDLE_VERSION,
+        statement_digest: proof.statement_digest,
+        proof_digest,
+    })
+}
+
+pub fn verify_accepted_block_certificate_validity_handle_v1(
+    expected_statement_digest: &Digest,
+    handle: &AcceptedBlockCertificateValidityHandleV1,
+) -> Result<(), AcceptedBlockCertificateValidityHandleError> {
+    if handle.version != ACCEPTED_BLOCK_CERTIFICATE_VALIDITY_HANDLE_VERSION {
+        return Err(
+            AcceptedBlockCertificateValidityHandleError::UnsupportedVersion {
+                actual: handle.version,
+            },
+        );
+    }
+    if &handle.statement_digest != expected_statement_digest {
+        return Err(AcceptedBlockCertificateValidityHandleError::StatementDigestMismatch);
+    }
+    if handle.proof_digest == [0u8; 32] {
+        return Err(AcceptedBlockCertificateValidityHandleError::EmptyProofDigest);
+    }
+    Ok(())
+}
+
 pub fn accepted_block_certificate_block_body_digest_v1(bytes: &[u8]) -> Digest {
     certificate_bytes_digest(ABC_BODY1, bytes)
 }
@@ -456,6 +723,7 @@ pub fn prove_accepted_block_certificate_digest_backend_v1(
     }
     Ok(AcceptedBlockCertificateBackendProofV1 {
         version: ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION,
+        backend_kind: ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1,
         statement_digest_hash,
     })
 }
@@ -467,6 +735,11 @@ pub fn verify_accepted_block_certificate_digest_backend_v1(
     if proof.version != ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION {
         return Err(AcceptedBlockCertificateProofError::UnsupportedVersion {
             actual: proof.version,
+        });
+    }
+    if proof.backend_kind != ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1 {
+        return Err(AcceptedBlockCertificateProofError::UnsupportedBackendKind {
+            actual: proof.backend_kind,
         });
     }
     let fields = accepted_block_certificate_statement_hash_fields_v1(statement);
@@ -495,6 +768,7 @@ pub fn prove_accepted_block_certificate_proof_v1_hash_only(
     let backend = prove_accepted_block_certificate_digest_backend_v1(statement)?;
     Ok(AcceptedBlockCertificateProofV1 {
         version: ACCEPTED_BLOCK_CERTIFICATE_PROOF_VERSION,
+        backend_kind: ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1,
         statement_digest: accepted_block_certificate_statement_digest_v1(statement),
         backend_proof: bincode::serialize(&backend)
             .expect("AcceptedBlockCertificateBackendProofV1 serializes"),
@@ -550,7 +824,7 @@ pub fn verify_accepted_block_certificate_batch_digest_proof_v1(
     }
 }
 
-pub fn verify_accepted_block_certificate_proof_v1_untrusted(
+pub fn verify_accepted_block_certificate_proof_v1_checkpoint(
     statement: &AcceptedBlockCertificateStatementV1,
     proof: &AcceptedBlockCertificateProofV1,
 ) -> Result<(), AcceptedBlockCertificateProofError> {
@@ -566,12 +840,34 @@ pub fn verify_accepted_block_certificate_proof_v1_untrusted(
     if proof.backend_proof.is_empty() {
         return Err(AcceptedBlockCertificateProofError::EmptyBackendProof);
     }
-    let backend: AcceptedBlockCertificateBackendProofV1 =
-        bincode::deserialize(&proof.backend_proof)
-            .map_err(|_| AcceptedBlockCertificateProofError::DecodeBackendProof)?;
-    verify_accepted_block_certificate_digest_backend_v1(statement, &backend)?;
-
-    Err(AcceptedBlockCertificateProofError::BackendVerifierMissing)
+    match proof.backend_kind {
+        ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1 => {
+            let backend: AcceptedBlockCertificateBackendProofV1 =
+                bincode::deserialize(&proof.backend_proof)
+                    .map_err(|_| AcceptedBlockCertificateProofError::DecodeBackendProof)?;
+            if backend.backend_kind != proof.backend_kind {
+                return Err(AcceptedBlockCertificateProofError::UnsupportedBackendKind {
+                    actual: backend.backend_kind,
+                });
+            }
+            verify_accepted_block_certificate_digest_backend_v1(statement, &backend)
+        }
+        ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_IVC_RECEIPT_V1 => {
+            let backend: crate::block_certificate_ivc::AcceptedBlockCertificateIvcReceiptBackendProofV1 =
+                bincode::deserialize(&proof.backend_proof)
+                    .map_err(|_| AcceptedBlockCertificateProofError::DecodeBackendProof)?;
+            if backend.backend_kind != proof.backend_kind {
+                return Err(AcceptedBlockCertificateProofError::UnsupportedBackendKind {
+                    actual: backend.backend_kind,
+                });
+            }
+            crate::block_certificate_ivc::verify_accepted_block_certificate_ivc_receipt_backend_v1(
+                statement, &backend,
+            )
+            .map_err(|_| AcceptedBlockCertificateProofError::BadIvcReceiptBackend)
+        }
+        actual => Err(AcceptedBlockCertificateProofError::UnsupportedBackendKind { actual }),
+    }
 }
 
 fn certificate_bytes_digest(domain: &[u8], bytes: &[u8]) -> Digest {
@@ -699,6 +995,117 @@ mod tests {
     }
 
     #[test]
+    fn accepted_block_certificate_receipt_projects_fixed_history_fields() {
+        let stmt = statement();
+        let receipt = accepted_block_certificate_receipt_v1(&stmt);
+        assert_eq!(receipt.version, ACCEPTED_BLOCK_CERTIFICATE_RECEIPT_VERSION);
+        assert_eq!(
+            receipt.statement_digest,
+            accepted_block_certificate_statement_digest_v1(&stmt)
+        );
+        assert_eq!(receipt.height, stmt.height);
+        assert_eq!(receipt.block_id, stmt.block_id);
+        assert_eq!(receipt.parent_block_id, stmt.parent_block_id);
+        assert_eq!(receipt.parent_state_root, stmt.parent_state_root);
+        assert_eq!(receipt.child_state_root, stmt.child_state_root);
+        assert_eq!(
+            accepted_block_certificate_receipt_chain_claim_v1(&receipt),
+            accepted_block_certificate_chain_claim_v1(&stmt)
+        );
+        verify_accepted_block_certificate_receipt_projection_v1(&stmt, &receipt)
+            .expect("receipt projection verifies");
+
+        let mut bad = receipt.clone();
+        bad.child_state_root[0] ^= 1;
+        assert_eq!(
+            verify_accepted_block_certificate_receipt_projection_v1(&stmt, &bad),
+            Err(AcceptedBlockCertificateReceiptError::ProjectionMismatch)
+        );
+
+        let mut bad = receipt;
+        bad.statement_digest[0] ^= 1;
+        assert_eq!(
+            verify_accepted_block_certificate_receipt_projection_v1(&stmt, &bad),
+            Err(AcceptedBlockCertificateReceiptError::StatementDigestMismatch)
+        );
+    }
+
+    #[test]
+    fn accepted_block_certificate_validity_handle_binds_statement_and_proof() {
+        let stmt = statement();
+        let proof =
+            prove_accepted_block_certificate_proof_v1_hash_only(&stmt).expect("hash proof builds");
+        let handle =
+            accepted_block_certificate_validity_handle_v1(&proof).expect("validity handle builds");
+        assert_eq!(
+            handle.version,
+            ACCEPTED_BLOCK_CERTIFICATE_VALIDITY_HANDLE_VERSION
+        );
+        assert_eq!(
+            proof.backend_kind,
+            ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1
+        );
+        assert_eq!(
+            handle.statement_digest,
+            accepted_block_certificate_statement_digest_v1(&stmt)
+        );
+        assert_eq!(
+            handle.proof_digest,
+            accepted_block_certificate_proof_digest_v1(&proof)
+        );
+        assert_ne!(handle.proof_digest, [0u8; 32]);
+        verify_accepted_block_certificate_validity_handle_v1(
+            &accepted_block_certificate_statement_digest_v1(&stmt),
+            &handle,
+        )
+        .expect("validity handle verifies");
+
+        let wrong_statement_digest = [0x99; 32];
+        assert_eq!(
+            verify_accepted_block_certificate_validity_handle_v1(&wrong_statement_digest, &handle),
+            Err(AcceptedBlockCertificateValidityHandleError::StatementDigestMismatch)
+        );
+
+        let mut bad = proof.clone();
+        bad.backend_proof.clear();
+        assert_eq!(
+            accepted_block_certificate_validity_handle_v1(&bad),
+            Err(AcceptedBlockCertificateValidityHandleError::EmptyBackendProof)
+        );
+
+        let mut bad = proof.clone();
+        bad.backend_proof = vec![0x42];
+        assert_eq!(
+            accepted_block_certificate_validity_handle_v1(&bad),
+            Err(AcceptedBlockCertificateValidityHandleError::DecodeBackendProof)
+        );
+
+        let mut bad = proof.clone();
+        bad.backend_kind = 0;
+        assert_eq!(
+            accepted_block_certificate_validity_handle_v1(&bad),
+            Err(AcceptedBlockCertificateValidityHandleError::EmptyBackendProof)
+        );
+
+        let mut bad = proof.clone();
+        bad.backend_kind = 99;
+        assert_eq!(
+            accepted_block_certificate_validity_handle_v1(&bad),
+            Err(AcceptedBlockCertificateValidityHandleError::UnsupportedBackendKind { actual: 99 })
+        );
+
+        let mut bad_handle = handle;
+        bad_handle.proof_digest = [0u8; 32];
+        assert_eq!(
+            verify_accepted_block_certificate_validity_handle_v1(
+                &accepted_block_certificate_statement_digest_v1(&stmt),
+                &bad_handle,
+            ),
+            Err(AcceptedBlockCertificateValidityHandleError::EmptyProofDigest)
+        );
+    }
+
+    #[test]
     fn accepted_block_certificate_byte_domains_are_separated() {
         let body = accepted_block_certificate_block_body_digest_v1(b"same");
         let proof = accepted_block_certificate_block_proof_digest_v1(b"same");
@@ -709,44 +1116,57 @@ mod tests {
     }
 
     #[test]
-    fn accepted_block_certificate_recursive_proof_skeleton_fails_closed() {
+    fn accepted_block_certificate_digest_backend_verifies_public_placeholder_path() {
         let stmt = statement();
         let good_shape =
             prove_accepted_block_certificate_proof_v1_hash_only(&stmt).expect("hash proof builds");
         let backend: AcceptedBlockCertificateBackendProofV1 =
             bincode::deserialize(&good_shape.backend_proof).expect("backend proof decodes");
+        assert_eq!(
+            good_shape.backend_kind,
+            ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1
+        );
+        assert_eq!(
+            backend.backend_kind,
+            ACCEPTED_BLOCK_CERTIFICATE_BACKEND_KIND_DIGEST_ONLY_V1
+        );
         verify_accepted_block_certificate_digest_backend_v1(&stmt, &backend)
             .expect("statement digest backend verifies");
-        assert_eq!(
-            verify_accepted_block_certificate_proof_v1_untrusted(&stmt, &good_shape),
-            Err(AcceptedBlockCertificateProofError::BackendVerifierMissing)
-        );
+        verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &good_shape)
+            .expect("digest backend verifies through public checkpoint scaffold path");
 
         let mut bad = good_shape.clone();
         bad.version += 1;
         assert!(matches!(
-            verify_accepted_block_certificate_proof_v1_untrusted(&stmt, &bad),
+            verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &bad),
             Err(AcceptedBlockCertificateProofError::UnsupportedVersion { .. })
         ));
 
         let mut bad = good_shape.clone();
         bad.statement_digest = [0x99; 32];
         assert_eq!(
-            verify_accepted_block_certificate_proof_v1_untrusted(&stmt, &bad),
+            verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &bad),
             Err(AcceptedBlockCertificateProofError::StatementDigestMismatch)
+        );
+
+        let mut bad = good_shape.clone();
+        bad.backend_kind = 99;
+        assert_eq!(
+            verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &bad),
+            Err(AcceptedBlockCertificateProofError::UnsupportedBackendKind { actual: 99 })
         );
 
         let mut bad = good_shape.clone();
         bad.backend_proof.clear();
         assert_eq!(
-            verify_accepted_block_certificate_proof_v1_untrusted(&stmt, &bad),
+            verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &bad),
             Err(AcceptedBlockCertificateProofError::EmptyBackendProof)
         );
 
         let mut bad = good_shape;
         bad.backend_proof = vec![0x42];
         assert_eq!(
-            verify_accepted_block_certificate_proof_v1_untrusted(&stmt, &bad),
+            verify_accepted_block_certificate_proof_v1_checkpoint(&stmt, &bad),
             Err(AcceptedBlockCertificateProofError::DecodeBackendProof)
         );
     }

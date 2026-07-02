@@ -332,9 +332,8 @@ pub struct MiningInfo {
     pub block_reward_noid: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
     pub active_slot_count: u64,
-    /// Height covered by the latest local finalized-history cache object, if available.
-    /// This is a local diagnostic and is not public O(1) snapshot authority.
-    pub local_history_cache_height: Option<u64>,
+    /// Height covered by the latest promoted checkpoint proof package, if available.
+    pub checkpoint_proof_height: Option<u64>,
 }
 
 /// Current UTXO state dimensions and fill metrics.

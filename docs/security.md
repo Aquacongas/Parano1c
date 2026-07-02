@@ -1,12 +1,14 @@
 # Security Specification
 
 This document states the current security boundary for Paranoid consensus,
-history proofs, and snapshot sync. It avoids describing inactive proof
-experiments as production authority.
+history proofs, and snapshot sync. The O(1) checkpoint path is wired as a
+scaffold: the network flow, storage invariants, and proof envelopes match the
+final architecture while several cryptographic subrelations are still listed in
+`rodmap.md`.
 
 ## Current Status
 
-Trustless arbitrary-peer snapshot sync is not enabled.
+O(1) snapshot sync scaffold is enabled.
 
 The current network authority is:
 
@@ -14,10 +16,12 @@ The current network authority is:
 - native block validation for retained blocks;
 - detached block proof and authorization sidecar verification during block
   acceptance;
-- local storage of accepted history claim fields for future proof workers.
+- local storage of accepted history claim fields for the finalized
+  history/checkpoint scaffold.
 
-The current history claim sidecar is not public authority. It is a local witness
-derived after block acceptance.
+The current history claim sidecar is scaffold coverage input. It is derived
+after block acceptance and must be replaced by verified fixed accepted-block
+certificate projection before final cryptographic activation.
 
 ## Semantic Block
 
@@ -110,7 +114,8 @@ not consensus PoW, state-root, accepted-claim, or public history authority.
 accepted the transition. It contains 42 fixed `Block128` fields and a
 Poseidon2b `TAG_HISTCLM` digest.
 
-The claim is useful because it gives the history worker a compact witness for:
+The claim is useful because it gives the node's internal checkpoint task a
+compact witness for:
 
 - block height and block id;
 - parent and child state roots;
@@ -126,7 +131,7 @@ snapshot verifier must not accept arbitrary claim fields from a peer.
 Before public O(1) activation, the recursive history proof must derive the
 accepted claim from the full accepted-block relation.
 
-Until then, accepted-claim sidecars are local proof-worker inputs only.
+Until then, accepted-claim sidecars are local internal proof-task inputs only.
 
 ## Authorization Boundary
 
@@ -187,8 +192,8 @@ stays linear.
 
 ## Required O(1) History Language
 
-Public O(1) snapshot sync can be enabled only for a verifier whose accepted
-language is equivalent to:
+Public O(1) snapshot sync can be enabled only when the combined block layer and
+history layer accept exactly this language:
 
 ```text
 exists finalized semantic blocks and detached validation witnesses:
@@ -196,42 +201,59 @@ exists finalized semantic blocks and detached validation witnesses:
     for every finalized block in the proven range
 ```
 
-The recursive proof must check:
+The block layer checks the tx-dependent part before issuing each fixed
+accepted-block receipt:
+
+- transaction-root binding to ordered block bodies;
+- one authorization proof per non-coinbase transaction;
+- exact sparse-Merkle UTXO transition;
+- exact ReuseGuard transition;
+- exact state-root continuity;
+- accepted-claim reconstruction or a consensus claim commitment.
+
+The public history proof must then check only the fixed certificate/receipt
+layer:
 
 - previous proof validity or the fixed genesis base case;
 - exact start/end state continuity;
 - Poseidon2b `BLOCKHDR` ids and parent links;
 - Poseidon2b `POWHDR__` digest and strict target comparison, if headers are
   proven inside the recursive relation rather than verified natively;
-- transaction-root binding to ordered block bodies;
-- one authorization proof per non-coinbase transaction;
-- exact sparse-Merkle UTXO transition;
-- exact ReuseGuard transition;
-- exact state-root continuity;
-- accepted-claim reconstruction or a consensus claim commitment;
+- fixed accepted-block certificate proof validity;
+- fixed accepted-block receipt projection validity;
 - chain/checkpoint accumulator update over the same ordered accepted blocks.
 
-The current checkpoint IVC chunk core is not yet this full language. It proves
-fixed checkpoint/certificate/claim continuity; the next production gate is to
-encode the full accepted-block component verifier inside the IVC backend.
+The current checkpoint IVC chunk core consumes fixed certificate validity
+handles and fixed receipt projections, proves checkpoint/certificate/claim
+continuity, and the public step path is wired through explicit scaffold
+backends so the final network architecture runs end-to-end.
 
-## History Proof Activation Gate
+Final verification must replace the scaffold pieces with real fixed
+accepted-block certificate proof verification and recursive-head validity inside
+the IVC backend. It must not replay transaction bodies, authorization witnesses,
+tx-root paths, or exact-state slot paths inside history aggregation.
 
-Trustless public snapshot sync stays fail-closed until all are true:
+Accepted-block certificate proof bytes are retained as private witness data for
+that recursive verifier. Handles, receipts, digest-only certificate proofs, and
+locally checked checkpoint steps are scaffold subrelations until the roadmap
+closes them.
+
+## History Proof Completion Gate
+
+The scaffold becomes complete cryptographic O(1) sync when all are true:
 
 - final public proof size is constant across repeated checkpoint chunks;
 - final verifier checks previous-proof validity, not just final digest shape;
-- proof-core Merkle and Fiat-Shamir hashing on the public recursive path are
-  Poseidon2b-compatible;
-- accepted claims are derived in-proof from full block validation;
+- proof-core PCS commitments/openings and Fiat-Shamir transcript binding on the
+  public recursive path use Poseidon2b-compatible commitments;
+- accepted claims are projected from verified fixed accepted-block certificates;
 - snapshot root is checked against locally verified headers;
 - retained suffix replay is deterministic;
-- pruning waits for proven coverage.
+- pruning uses proven checkpoint coverage only.
 
-Forbidden before activation:
+Forbidden in the completed backend:
 
-- accepting peer snapshots as trustless;
-- pruning because of a digest-only worker head;
+- pruning because of a digest-only checkpoint-task head;
 - serving a linear chunk-receipt chain as the final O(1) proof;
 - treating local history claim sidecars as public authority;
 - accepting marker, stub, empty, or checksum-only proof objects;

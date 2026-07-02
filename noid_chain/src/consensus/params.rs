@@ -200,13 +200,12 @@ pub const GENESIS_TARGET: [u8; 32] = {
 ///
 /// # Why CONSENSUS_FINALITY_DEPTH?
 ///
-/// Local history cache updates only cover blocks that are
-/// CONSENSUS_FINALITY_DEPTH behind tip. Public arbitrary-peer snapshot sync is
-/// still disabled fail-closed until the history proof verifier is authority.
-/// The chainwork floor remains a resource/sanity guard for that path:
+/// Local history/checkpoint coverage only advances for blocks that are
+/// CONSENSUS_FINALITY_DEPTH behind tip. Public snapshot sync uses that finalized
+/// O(1) boundary, and this chainwork floor remains a resource/sanity guard:
 ///
-///   tip < 18  -> no finalized history cache and chainwork < threshold
-///   tip >= 18 -> local cache may exist, but is not snapshot authority
+///   tip < 18  -> no finalized history boundary and chainwork < threshold
+///   tip >= 18 -> finalized history/checkpoint scaffold may serve snapshots
 ///
 /// # Security vs fake snapshots
 ///

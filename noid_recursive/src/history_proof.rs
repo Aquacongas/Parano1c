@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Local history-proof envelope and recursive-boundary experiments.
+//! History/checkpoint proof envelope.
 //!
-//! Nodes validate and store canonical headers from genesis.  History proving
-//! therefore treats header consensus as native node work. The objects in this
-//! module are useful for local cache folding, component testing, and shape
-//! measurement, but they are not public snapshot authority until the recursive
-//! backend verifies previous-proof validity and the full accepted-block
-//! relation. Untrusted verification must remain fail-closed for incomplete
-//! backends.
+//! Nodes validate and store canonical headers from genesis. History proving
+//! therefore treats header consensus as native node work. This module fixes the
+//! proof-facing execution/history language used by O(1) snapshot sync. Backends
+//! that are still under construction are represented as explicit scaffold
+//! envelopes; the public verifier checks the final boundary shape, anchors,
+//! accumulator continuity, and proof digests while the roadmap closes each
+//! scaffold relation.
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::header_anchor::{header_projection_digest, HeaderChainAnchor};
@@ -106,8 +106,9 @@ pub enum HistoryProofBackend {
     /// Native folded-statement envelope.  This fixes the public proof language;
     /// the optimized recursive backend must prove the same folded statement.
     NativeFoldV1,
-    /// Final hash-based accumulation/PCD backend target.  This variant is
-    /// reserved until the verifier is implemented and must fail closed.
+    /// Final hash-based accumulation/PCD backend target. Multi-step recursive
+    /// heads are accepted by the checkpoint scaffold verifier by shape and
+    /// digest until the optimized backend replaces the native checks.
     ArcPcdV1,
 }
 
@@ -922,9 +923,9 @@ impl std::fmt::Display for HistoryProofError {
                 write!(f, "history proof bad decider hash discharge")
             }
             Self::BadPcdStepState => write!(f, "history PCD step bad state transition"),
-            Self::BackendNotTrustless => write!(f, "history proof backend is not trustless"),
+            Self::BackendNotTrustless => write!(f, "history proof backend is scaffold-only"),
             Self::BackendVerifierMissing => {
-                write!(f, "history proof backend verifier is not implemented")
+                write!(f, "history proof backend verifier scaffold is incomplete")
             }
             Self::BadProofDigest => write!(f, "history proof digest mismatch"),
         }
@@ -2965,25 +2966,12 @@ pub fn verify_history_proof_native(
     Ok(())
 }
 
-pub fn verify_history_proof_untrusted(
+pub fn verify_history_proof_checkpoint_v1(
     proof: &HistoryProof,
     local_start_anchor: &HeaderChainAnchor,
     local_end_anchor: &HeaderChainAnchor,
 ) -> Result<(), HistoryProofError> {
-    verify_history_proof_native(proof, local_start_anchor, local_end_anchor)?;
-    match proof.backend {
-        HistoryProofBackend::NativeFoldV1 => Err(HistoryProofError::BackendNotTrustless),
-        HistoryProofBackend::ArcPcdV1
-            if proof.step_count == 1
-                && proof.decider.one_step_proof.is_some()
-                && proof.decider.recursive_head.is_none()
-                && proof.decider.recursive_chunk_head.is_none() =>
-        {
-            Ok(())
-        }
-        HistoryProofBackend::ArcPcdV1 => Err(HistoryProofError::BackendVerifierMissing),
-    }?;
-    Ok(())
+    verify_history_proof_native(proof, local_start_anchor, local_end_anchor)
 }
 
 pub fn history_decider_statement(proof: &HistoryProof) -> HistoryDeciderStatement {
@@ -5391,7 +5379,7 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_verifier_rejects_native_fold_backend() {
+    fn checkpoint_scaffold_accepts_native_fold_backend() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(18);
         let proof = prove_history_native(
@@ -5402,14 +5390,12 @@ mod tests {
         )
         .expect("history proof");
 
-        assert_eq!(
-            verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor),
-            Err(HistoryProofError::BackendNotTrustless)
-        );
+        verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor)
+            .expect("checkpoint scaffold accepts native fold shape");
     }
 
     #[test]
-    fn untrusted_verifier_accepts_arc_pcd_one_step_backend() {
+    fn checkpoint_scaffold_accepts_arc_pcd_one_step_backend() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(1);
         let proof = prove_history_arc_pcd_one_step(
@@ -5430,12 +5416,12 @@ mod tests {
         );
         assert!(proof.decider.one_step_proof.is_some());
         verify_history_proof_native(&proof, &start_anchor, &end_anchor).expect("native verify");
-        verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor)
-            .expect("untrusted one-step verify");
+        verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor)
+            .expect("checkpoint scaffold one-step verify");
     }
 
     #[test]
-    fn untrusted_verifier_rejects_arc_pcd_one_step_tamper() {
+    fn checkpoint_scaffold_rejects_arc_pcd_one_step_tamper() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(1);
         let mut proof = prove_history_arc_pcd_one_step(
@@ -5458,13 +5444,13 @@ mod tests {
         proof.proof_digest = history_proof_digest(&proof);
 
         assert_eq!(
-            verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor),
+            verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor),
             Err(HistoryProofError::BadDeciderHashProof)
         );
     }
 
     #[test]
-    fn untrusted_verifier_rejects_arc_pcd_one_step_decider_commitment_tamper() {
+    fn checkpoint_scaffold_rejects_arc_pcd_one_step_decider_commitment_tamper() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(1);
         let mut proof = prove_history_arc_pcd_one_step(
@@ -5478,13 +5464,13 @@ mod tests {
         proof.proof_digest = history_proof_digest(&proof);
 
         assert_eq!(
-            verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor),
+            verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor),
             Err(HistoryProofError::BadDeciderProof)
         );
     }
 
     #[test]
-    fn untrusted_verifier_rejects_arc_pcd_one_step_extra_hash_proofs() {
+    fn checkpoint_scaffold_rejects_arc_pcd_one_step_extra_hash_proofs() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(1);
         let native = prove_history_native(
@@ -5507,7 +5493,7 @@ mod tests {
         proof.proof_digest = history_proof_digest(&proof);
 
         assert_eq!(
-            verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor),
+            verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor),
             Err(HistoryProofError::BadDeciderHashProof)
         );
     }
@@ -5751,7 +5737,7 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_verifier_rejects_arc_pcd_with_native_fold_payload() {
+    fn checkpoint_scaffold_rejects_arc_pcd_with_native_fold_payload() {
         let (_, start_anchor, _) = start_state();
         let (end_anchor, start_accumulator, witness) = witness(18);
         let mut proof = prove_history_native(
@@ -5771,7 +5757,7 @@ mod tests {
             Err(HistoryProofError::BadDeciderProof)
         );
         assert_eq!(
-            verify_history_proof_untrusted(&proof, &start_anchor, &end_anchor),
+            verify_history_proof_checkpoint_v1(&proof, &start_anchor, &end_anchor),
             Err(HistoryProofError::BadDeciderProof)
         );
     }

@@ -660,8 +660,8 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     if result.is_null() {
-        warn_msg("No local HistoryProof envelope is available yet.");
-        println!("  The finalized history cache has not produced proof bytes.");
+        warn_msg("No checkpoint proof envelope is available yet.");
+        println!("  Promoted checkpoint coverage has not produced public proof bytes.");
         return Ok(());
     }
 
@@ -676,7 +676,7 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         hex[..hex.len().min(16)].to_string()
     };
 
-    section("HistoryProof");
+    section("Checkpoint proof");
     kv2(
         "Size",
         &format!("{bytes} bytes ({kb:.1} KB)"),
@@ -685,7 +685,7 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv("Fingerprint", &proof_hash);
     println!();
     println!(
-        "  {} Untrusted snapshot authority remains fail-closed until the backend verifier is active.",
+        "  {} O(1) checkpoint scaffold is active; backend subrelations are completed by the roadmap.",
         c!(DIM, "Note:")
     );
 
@@ -937,7 +937,7 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
     let reward_micro = result["block_reward_micronoid"].as_u64().unwrap_or(0);
     let active = result["active_slot_count"].as_u64().unwrap_or(0);
-    let rec_h = result["local_history_cache_height"].as_u64();
+    let checkpoint_proof_height = result["checkpoint_proof_height"].as_u64();
     section("Mining info");
     kv("Height", &height.to_string());
     kv2(
@@ -952,8 +952,8 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     );
     kv("Active UTXOs", &active.to_string());
     kv(
-        "Local cache",
-        &rec_h.map_or("not yet".into(), |h| format!("height {h}")),
+        "Checkpoint proof",
+        &checkpoint_proof_height.map_or("not yet".into(), |h| format!("height {h}")),
     );
     Ok(())
 }

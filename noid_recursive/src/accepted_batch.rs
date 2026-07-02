@@ -52,13 +52,13 @@ pub const ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS: usize =
 
 const ACB_DIG1: u128 = 0x4143_425F_4449_4731; // "ACB_DIG1"
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedClaimBatchWitness {
     pub headers: Vec<HeaderWitness>,
     pub accepted_block_claims: Vec<[Block128; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedClaimBatchOutput {
     pub consensus_state: RecursiveConsensusState,
     pub accumulator: ChainAccumulator,
@@ -78,6 +78,8 @@ pub enum AcceptedClaimBatchDigestError {
     EmptyBatch,
     TooManyClaims { actual: usize },
     ClaimCountMismatch { headers: usize, claims: usize },
+    DigestFieldCountMismatch { actual: usize },
+    DigestMismatch,
     UnsupportedProofVersion { actual: u32 },
     BadDigestProof,
     BadDigestDischarge,
@@ -94,6 +96,11 @@ impl std::fmt::Display for AcceptedClaimBatchDigestError {
                 f,
                 "accepted-claim batch digest count mismatch: {headers} headers, {claims} claims"
             ),
+            Self::DigestFieldCountMismatch { actual } => write!(
+                f,
+                "accepted-claim batch digest field count mismatch: {actual}"
+            ),
+            Self::DigestMismatch => write!(f, "accepted-claim batch digest mismatch"),
             Self::UnsupportedProofVersion { actual } => {
                 write!(
                     f,
@@ -200,6 +207,44 @@ pub fn prove_accepted_claim_batch_digest_v1(
         version: ACCEPTED_CLAIM_BATCH_DIGEST_VERSION,
         digest_hash,
     })
+}
+
+pub fn accepted_claim_batch_digest_from_hash_fields_v1(
+    fields: &[Block128],
+) -> Result<Digest, AcceptedClaimBatchDigestError> {
+    if fields.len() != ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS {
+        return Err(AcceptedClaimBatchDigestError::DigestFieldCountMismatch {
+            actual: fields.len(),
+        });
+    }
+    Ok(digest_fixed_no_pad_from_fields(fields))
+}
+
+pub fn verify_accepted_claim_batch_digest_hash_fields_v1(
+    fields: &[Block128],
+    expected_digest: Digest,
+    proof: &AcceptedClaimBatchDigestProofV1,
+) -> Result<(), AcceptedClaimBatchDigestError> {
+    if proof.version != ACCEPTED_CLAIM_BATCH_DIGEST_VERSION {
+        return Err(AcceptedClaimBatchDigestError::UnsupportedProofVersion {
+            actual: proof.version,
+        });
+    }
+    if accepted_claim_batch_digest_from_hash_fields_v1(fields)? != expected_digest {
+        return Err(AcceptedClaimBatchDigestError::DigestMismatch);
+    }
+    let input = fixed_hash_input(fields, &expected_digest);
+    let params = accepted_claim_batch_digest_hash_params_v1();
+    let mut channel = Poseidon2bChannel::new();
+    let inputs = [input];
+    let reductions =
+        verify_fixed_field_hash_killshot(params, &proof.digest_hash, &inputs, &mut channel)
+            .ok_or(AcceptedClaimBatchDigestError::BadDigestProof)?;
+    if discharge_fixed_field_hash_reductions_native(params, &inputs, &reductions) {
+        Ok(())
+    } else {
+        Err(AcceptedClaimBatchDigestError::BadDigestDischarge)
+    }
 }
 
 pub fn verify_accepted_claim_batch_digest_v1(

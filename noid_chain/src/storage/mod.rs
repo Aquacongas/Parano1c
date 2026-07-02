@@ -23,9 +23,10 @@ pub use mdbx_store::{MdbxStore, StoreError};
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};
 pub use serial::{
-    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header, decode_segment,
-    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
-    encode_consensus_meta, encode_header, encode_segment, encode_slot_value, encode_state_meta,
+    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
+    decode_header_chain_anchor, decode_segment, decode_state_meta, decode_tx_index_value,
+    decode_undo_log, encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
+    encode_header_chain_anchor, encode_segment, encode_slot_value, encode_state_meta,
     encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
     encoded_segments_total_len, u64_key,
 };
@@ -73,7 +74,7 @@ pub trait HeaderProvider {
 
 /// Combined durable chain store.
 ///
-/// Implementors provide unified access to headers, local history cache, the
+/// Implementors provide unified access to headers, checkpoint coverage, the
 /// transaction index, and retained full blocks. `MdbxStore` implements this
 /// trait for the disk-backed node.
 pub trait BlockStore: Send + Sync {
@@ -87,15 +88,9 @@ pub trait BlockStore: Send + Sync {
     /// Retrieve a header by its `H_BLOCK` hash.
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
 
-    /// Retrieve a retained block's raw bytes. Data is retained until checkpoint
-    /// coverage; returns `None` only if not stored or deliberately pruned later.
+    /// Retrieve a retained block's raw bytes. Data is retained only for the
+    /// bounded recent suffix once history/checkpoint coverage consumes it.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
-
-    /// Retrieve the persisted local finalized-history cache object.
-    fn get_local_history_cache(&self) -> Result<Option<Vec<u8>>, StoreError>;
-
-    /// Persist a new local finalized-history cache object.
-    fn put_local_history_cache(&self, bytes: &[u8]) -> Result<(), StoreError>;
 
     /// Look up a transaction by body hash. Returns `(block_height, tx_pos)`
     /// for O(1) receipt lookup and Merkle path reconstruction.

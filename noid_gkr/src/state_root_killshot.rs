@@ -23,7 +23,7 @@ const STATE_ROOT_LINEAR_RELATION_TAG: u128 = 0x4558_5354_524F_5401; // "EXSTROT"
 const STATE_ROOT_PERMS: usize = 3;
 const STATE_ROOT_PIN_LANES: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompositeStateRootInputs {
     pub log_slots: u32,
     pub utxo_root: [Block128; 2],
@@ -31,7 +31,7 @@ pub struct CompositeStateRootInputs {
     pub expected_state_root: [Block128; 2],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchedStateRootProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

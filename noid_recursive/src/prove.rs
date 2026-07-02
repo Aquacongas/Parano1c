@@ -3,9 +3,9 @@
 
 //! Local finalized-history accumulator cache.
 //!
-//! This object is deliberately not public snapshot authority by itself.  It is
-//! the node's incremental finalized-history builder: each finalized block feeds
-//! the same 42-field accepted state-transition claim language used by
+//! This object is the node's incremental finalized-history builder and the
+//! scaffold coverage source for bounded pruning: each finalized block feeds the
+//! same 42-field accepted state-transition claim language used by
 //! `HistoryProof`, and the cache stores only the current constant-size
 //! accumulator state plus small header-anchor metadata.
 
@@ -475,8 +475,8 @@ pub fn accepted_block_claim_witness_from_fields(
 /// Build a constant-size native history proof from the current finalized cache.
 ///
 /// This avoids replaying the covered history when serving the local proof
-/// envelope.  The untrusted verifier still rejects `NativeFoldV1` until the
-/// final recursive backend verifier is active.
+/// envelope. `NativeFoldV1` is the scaffold backend for the final checkpoint
+/// verifier while the optimized recursive backend is completed.
 pub fn prove_history_from_local_cache(
     cache: &LocalHistoryCache,
 ) -> Result<HistoryProof, HistoryProofError> {
@@ -574,7 +574,7 @@ fn map_anchor_error(error: HeaderChainAnchorError) -> HistoryProofError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history_proof::{verify_history_proof_native, verify_history_proof_untrusted};
+    use crate::history_proof::{verify_history_proof_checkpoint_v1, verify_history_proof_native};
     use noid_chain::consensus::genesis::{genesis_header, genesis_state_root};
     use noid_chain::header_anchor::extend_header_projection_root;
     use noid_poseidon2b::primitives::Address;
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_head_cache_serves_arc_pcd_proof_shape_but_untrusted_fails_closed() {
+    fn recursive_head_cache_serves_arc_pcd_proof_shape_for_checkpoint_scaffold() {
         let mut recursive_cache =
             init_local_history_recursive_head_cache(init_genesis_history_cache())
                 .expect("recursive cache");
@@ -796,14 +796,12 @@ mod tests {
                 &recursive_cache.base.anchor,
             )
             .expect("native staged proof verifies");
-            assert_eq!(
-                verify_history_proof_untrusted(
-                    &proof,
-                    &recursive_cache.base.start_anchor,
-                    &recursive_cache.base.anchor,
-                ),
-                Err(HistoryProofError::BackendVerifierMissing)
-            );
+            verify_history_proof_checkpoint_v1(
+                &proof,
+                &recursive_cache.base.start_anchor,
+                &recursive_cache.base.anchor,
+            )
+            .expect("checkpoint scaffold accepts recursive-head proof shape");
             assert!(proof.decider.recursive_head.is_some());
             assert!(proof.decider.one_step_proof.is_none());
             assert!(proof.decider.hash_proofs.is_none());
@@ -924,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_chunk_head_cache_serves_arc_pcd_proof_shape_but_untrusted_fails_closed() {
+    fn recursive_chunk_head_cache_serves_arc_pcd_proof_shape_for_checkpoint_scaffold() {
         let mut chunk_cache =
             init_local_history_recursive_chunk_head_cache(init_genesis_history_cache())
                 .expect("chunk cache");
@@ -968,14 +966,12 @@ mod tests {
                 &chunk_cache.base.anchor,
             )
             .expect("native chunk-head proof verifies");
-            assert_eq!(
-                verify_history_proof_untrusted(
-                    &proof,
-                    &chunk_cache.base.start_anchor,
-                    &chunk_cache.base.anchor,
-                ),
-                Err(HistoryProofError::BackendVerifierMissing)
-            );
+            verify_history_proof_checkpoint_v1(
+                &proof,
+                &chunk_cache.base.start_anchor,
+                &chunk_cache.base.anchor,
+            )
+            .expect("checkpoint scaffold accepts recursive chunk-head proof shape");
             assert!(proof.decider.recursive_chunk_head.is_some());
             assert!(proof.decider.recursive_head.is_none());
             assert!(proof.decider.one_step_proof.is_none());

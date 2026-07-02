@@ -14,6 +14,7 @@ use crate::block_header::BlockHeader;
 use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::fri_state::SlotValue;
+use crate::header_anchor::HeaderChainAnchor;
 use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
@@ -51,6 +52,78 @@ pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
 /// Deserialize a `BlockHeader` from bytes.
 pub fn decode_header(bytes: &[u8]) -> Option<BlockHeader> {
     BlockHeader::from_bytes(bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// HeaderChainAnchor
+// ---------------------------------------------------------------------------
+
+pub const ENCODED_HEADER_CHAIN_ANCHOR_BYTES: usize = 220;
+
+pub fn encode_header_chain_anchor(
+    anchor: &HeaderChainAnchor,
+) -> [u8; ENCODED_HEADER_CHAIN_ANCHOR_BYTES] {
+    let mut out = [0u8; ENCODED_HEADER_CHAIN_ANCHOR_BYTES];
+    let mut pos = 0usize;
+    out[pos..pos + 8].copy_from_slice(&anchor.height.to_le_bytes());
+    pos += 8;
+    out[pos..pos + 32].copy_from_slice(&anchor.block_id);
+    pos += 32;
+    out[pos..pos + 32].copy_from_slice(&anchor.state_root);
+    pos += 32;
+    out[pos..pos + 32].copy_from_slice(&anchor.tx_root);
+    pos += 32;
+    out[pos..pos + 32].copy_from_slice(anchor.miner_address.as_bytes());
+    pos += 32;
+    out[pos..pos + 4].copy_from_slice(&anchor.log_slots.to_le_bytes());
+    pos += 4;
+    out[pos..pos + 8].copy_from_slice(&anchor.active_slot_count.to_le_bytes());
+    pos += 8;
+    out[pos..pos + 8].copy_from_slice(&anchor.alloc_counter.to_le_bytes());
+    pos += 8;
+    out[pos..pos + 32].copy_from_slice(&anchor.cumulative_chainwork);
+    pos += 32;
+    out[pos..pos + 32].copy_from_slice(&anchor.projection_root);
+    debug_assert_eq!(pos + 32, ENCODED_HEADER_CHAIN_ANCHOR_BYTES);
+    out
+}
+
+pub fn decode_header_chain_anchor(bytes: &[u8]) -> Option<HeaderChainAnchor> {
+    if bytes.len() != ENCODED_HEADER_CHAIN_ANCHOR_BYTES {
+        return None;
+    }
+    let mut pos = 0usize;
+    let height = u64::from_le_bytes(bytes[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+    let block_id = bytes[pos..pos + 32].try_into().ok()?;
+    pos += 32;
+    let state_root = bytes[pos..pos + 32].try_into().ok()?;
+    pos += 32;
+    let tx_root = bytes[pos..pos + 32].try_into().ok()?;
+    pos += 32;
+    let miner_address = noid_poseidon2b::primitives::Address(bytes[pos..pos + 32].try_into().ok()?);
+    pos += 32;
+    let log_slots = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+    let active_slot_count = u64::from_le_bytes(bytes[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+    let alloc_counter = u64::from_le_bytes(bytes[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+    let cumulative_chainwork = bytes[pos..pos + 32].try_into().ok()?;
+    pos += 32;
+    let projection_root = bytes[pos..pos + 32].try_into().ok()?;
+    Some(HeaderChainAnchor {
+        height,
+        block_id,
+        state_root,
+        tx_root,
+        miner_address,
+        log_slots,
+        active_slot_count,
+        alloc_counter,
+        cumulative_chainwork,
+        projection_root,
+    })
 }
 
 // ---------------------------------------------------------------------------

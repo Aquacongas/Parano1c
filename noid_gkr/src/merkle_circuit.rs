@@ -79,7 +79,7 @@ pub struct MerkleSlotDescriptor {
 }
 
 /// Public inputs to the Merkle path GKR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MerklePathInputs {
     /// Leaf digest `[hi, lo]` — the segment root being opened.
     pub leaf: [Block128; 2],

@@ -26,14 +26,14 @@ pub struct CanonicalAuthorizationStatement {
     pub public: OwnerAuthPublicInputs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedAuthorization {
     pub tx_index: usize,
     pub owner_count: usize,
     pub live_input_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedAuthorizationBatch {
     pub user_tx_count: usize,
     pub owner_count_total: usize,

@@ -2100,7 +2100,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
 /// (large message domain, many queries); deeper levels stay dense.
 ///
 /// Both paths are byte-identical (see `induce_sumcheck_poly_via_ntt_matches_dense`),
-/// so a mis-dispatch only costs time. Tuned/validated at blake m=30.
+/// so a mis-dispatch only costs time. Tuned/validated at the m=30 profile.
 pub(crate) fn induce_sumcheck_poly_auto(
     log_msg_cols: usize,
     log_inv_rate: usize,

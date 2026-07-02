@@ -15,6 +15,7 @@ unsound-challenger = []
 
 [dependencies]
 rayon = "1"
+noid_core = { path = "../noid_core" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

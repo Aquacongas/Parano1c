@@ -55,8 +55,7 @@ pub struct GetHeadersResponse {
 // Block pull: full block + proof
 // ---------------------------------------------------------------------------
 
-/// Request a retained full block. Large-gap public sync still fails closed
-/// until immutable checkpoint coverage exists.
+/// Request a retained full block from the bounded suffix window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockRequest {
     pub height: u64,
@@ -69,6 +68,7 @@ pub struct GetRecentBlockRequest {
 /// for coinbase-only blocks that carry no user transactions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockResponse {
+    pub height: u64,
     /// `Block::to_bytes()` — header + transactions.
     pub block_bytes: Option<Vec<u8>>,
     /// `BlockProof` bincode bytes.  `None` for coinbase-only blocks.
@@ -81,16 +81,18 @@ pub struct GetRecentBlockResponse {
 // Public history proof
 // ---------------------------------------------------------------------------
 
-/// Request the current constant-size history proof envelope.
+/// Request the current constant-size public history/checkpoint proof envelope.
 ///
-/// A peer may return `None` while its finalized cache is not ready. Snapshot
-/// acceptance still depends on the local history-proof verifier.
+/// A peer may return `None` while promoted checkpoint package coverage is not
+/// ready or cannot be served with the retained suffix. Snapshot acceptance
+/// depends on the local checkpoint verifier and the node-validated header
+/// boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofResponse {
-    /// Serialized public `HistoryProof` envelope bytes.
+    /// Serialized public history/checkpoint proof envelope bytes.
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
@@ -102,8 +104,8 @@ pub struct GetHistoryProofResponse {
 
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
-/// The manifest describes the state snapshot that must be authorized by the
-/// corresponding `HistoryProof`.
+/// The manifest describes the state snapshot authorized by the corresponding
+/// O(1) history/checkpoint proof envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
@@ -112,10 +114,12 @@ pub struct GetStateManifestRequest {
 
 /// Manifest response: chain metadata + list of active segment IDs.
 ///
-/// `tip_height = 0` means no public snapshot is being advertised.
+/// `tip_height = 0` means no snapshot is being advertised.
+/// In V1 scaffold sync, `tip_height`, `tip_hash`, and `cumulative_chainwork`
+/// describe the finalized snapshot boundary `F`, not the peer's live tip.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GetStateManifestResponse {
-    /// Tip height at snapshot time.  0 = "use block sync instead".
+    /// Finalized snapshot boundary height. 0 = "use block sync instead".
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
     /// Exact cumulative chainwork at `tip_height`, as validated with headers.
@@ -130,11 +134,11 @@ pub struct GetStateManifestResponse {
     /// Exact sparse-state segment roots aligned with `segment_ids`. The sparse
     /// Merkle root reconstructed from this table and canonical zero leaves must
     /// equal the snapshot tip header's `state_root` before segment download is
-    /// accepted by the HistoryProof verifier.
+    /// accepted by the checkpoint proof verifier.
     pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
-    /// Canonical ReuseGuard buckets at the advertised tip. The block header's
+    /// Canonical ReuseGuard buckets at the advertised snapshot boundary. The block header's
     /// `state_root` commits to both the UTXO root and this guard root, so a
     /// snapshot cannot be reconstructed from UTXO segments alone.
     pub reuse_guard_buckets: Vec<noid_chain::GuardBucket>,
@@ -146,13 +150,13 @@ pub struct GetStateManifestResponse {
 
 /// Request one state segment by ID.
 ///
-/// Segment data is bound to the exact manifest tip.
+/// Segment data is bound to the exact manifest snapshot boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
-    /// Expected tip height from the manifest (for staleness guard).
+    /// Expected snapshot height from the manifest (for staleness guard).
     pub expected_tip_height: u64,
-    /// Expected tip hash from the manifest. Height alone is not enough across
+    /// Expected snapshot hash from the manifest. Height alone is not enough across
     /// reorgs or competing blocks at the same height.
     pub expected_tip_hash: [u8; 32],
 }

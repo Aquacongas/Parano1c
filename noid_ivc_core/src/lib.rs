@@ -21,6 +21,7 @@
 
 pub mod bits;
 pub mod challenger;
+pub mod circuit;
 pub mod field;
 pub mod lincheck;
 pub mod merkle;

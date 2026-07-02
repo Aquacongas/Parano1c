@@ -9,8 +9,8 @@
 //! - canonical semantic-header and PoW-header Poseidon2b hashing;
 //! - rolling chain-accumulator compression.
 //!
-//! It is deliberately not public snapshot authority by itself. Header integer
-//! rules and the full block-validity relation are separate proof obligations.
+//! It is a subrelation of the public checkpoint scaffold. Header integer rules
+//! and the full block-validity relation are wired as separate proof obligations.
 
 use noid_chain::consensus::pow::pow_header_fields;
 use noid_gkr::{

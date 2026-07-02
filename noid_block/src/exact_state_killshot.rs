@@ -32,7 +32,7 @@ use crate::exact_state_transition::{
     VerifiedStateTransition,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactStateKillShotInputs {
     pub slot_leaves: Vec<SlotLeafInputs>,
     pub state_paths: Vec<MerklePathInputs>,
@@ -41,7 +41,7 @@ pub struct ExactStateKillShotInputs {
     pub state_roots: Vec<CompositeStateRootInputs>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactStateKillShotProof {
     pub slot_leaves: BatchedSlotLeafProofKillShot,
     pub state_paths: BatchedMerkleProofKillShot,

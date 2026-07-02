@@ -53,38 +53,131 @@ const MAX_SNAPSHOT_EXPORT_BYTES: usize = MAX_SEGMENT_BYTES * MAX_INFLIGHT_SEGMEN
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
-fn local_history_proof_bytes(ctx: &MdbxChainContext) -> Option<Vec<u8>> {
-    let cache_bytes = ctx.store.get_local_history_cache().ok().flatten()?;
-    let cache: noid_recursive::LocalHistoryCache = match bincode::deserialize(&cache_bytes) {
-        Ok(cache) => cache,
-        Err(e) => {
-            tracing::warn!(err = ?e, "local history cache decode failed while serving proof");
-            return None;
-        }
-    };
-    let proof = match noid_recursive::prove_history_from_local_cache(&cache) {
+fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
+    proof_height <= tip_height
+        && tip_height.saturating_sub(proof_height)
+            <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+}
+
+fn local_checkpoint_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8>)> {
+    let coverage = ctx.store.get_checkpoint_coverage().ok().flatten()?;
+    let height = coverage.history_proof_covered_to?;
+    if height == 0 || height > ctx.tip_height() {
+        return None;
+    }
+    if !snapshot_suffix_is_retained(ctx.tip_height(), height) {
+        tracing::debug!(
+            proof_height = height,
+            tip_height = ctx.tip_height(),
+            retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+            "checkpoint proof is too old to serve with retained suffix"
+        );
+        return None;
+    }
+    let package_bytes = ctx
+        .store
+        .get_accepted_block_batch_certificate_package(height)
+        .ok()
+        .flatten()?;
+    let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+        match bincode::deserialize(&package_bytes) {
+            Ok(package) => package,
+            Err(e) => {
+                tracing::warn!(
+                    height,
+                    err = ?e,
+                    "checkpoint package decode failed while serving proof"
+                );
+                return None;
+            }
+        };
+    if package.end_height() != height {
+        tracing::warn!(
+            height,
+            package_end = package.end_height(),
+            "checkpoint package height mismatch while serving proof"
+        );
+        return None;
+    }
+    let local_start_anchor = ctx
+        .store
+        .get_header_anchor(package.start_height())
+        .ok()
+        .flatten()?;
+    if local_start_anchor != package.step_statement.batch_summary.start_anchor {
+        tracing::warn!(
+            height,
+            package_start = package.start_height(),
+            "checkpoint package start anchor is no longer canonical"
+        );
+        return None;
+    }
+    let local_end_anchor = ctx.store.get_header_anchor(height).ok().flatten()?;
+    if local_end_anchor != package.step_statement.batch_summary.end_anchor {
+        tracing::warn!(
+            height,
+            "checkpoint package end anchor is no longer canonical"
+        );
+        return None;
+    }
+
+    let base_anchor = ctx.store.get_header_anchor(0).ok().flatten()?;
+    let genesis_header = ctx.store.get_header(0).ok().flatten()?;
+    let genesis_hash = noid_chain::hash_block_header(&genesis_header);
+    if base_anchor.height != 0 || base_anchor.block_id != genesis_hash {
+        tracing::warn!("genesis header anchor mismatch while serving checkpoint proof");
+        return None;
+    }
+    let base_accumulator =
+        noid_recursive::genesis_accumulator(genesis_header.state_root, genesis_hash);
+    let proof = match noid_block::public_history_checkpoint_proof_from_package_v1(
+        &base_anchor,
+        &base_accumulator,
+        &package,
+    ) {
         Ok(proof) => proof,
         Err(e) => {
-            tracing::warn!(err = ?e, "local history proof build failed while serving proof");
+            tracing::warn!(
+                height,
+                err = ?e,
+                "checkpoint public proof build failed while serving proof"
+            );
             return None;
         }
     };
+    if let Err(e) = noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+        &proof,
+        &base_anchor,
+        &local_end_anchor,
+    ) {
+        tracing::warn!(
+            height,
+            err = ?e,
+            "checkpoint public proof self-check failed while serving proof"
+        );
+        return None;
+    }
     let bytes = match bincode::serialize(&proof) {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::warn!(err = ?e, "local history proof encode failed while serving proof");
+            tracing::warn!(height, err = ?e, "checkpoint public proof encode failed");
             return None;
         }
     };
     if bytes.len() > MAX_HISTORY_PROOF_BYTES {
         tracing::warn!(
+            height,
             len = bytes.len(),
             cap = MAX_HISTORY_PROOF_BYTES,
-            "local history proof exceeds wire cap"
+            "checkpoint public proof exceeds wire cap"
         );
         return None;
     }
-    Some(bytes)
+    Some((height, bytes))
+}
+
+fn local_public_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8>)> {
+    local_checkpoint_history_proof(ctx)
 }
 
 #[inline]
@@ -149,7 +242,7 @@ pub enum NetworkCommand {
         count: u16, // max 512
     },
     /// Request the state manifest from a peer (step 1 of snapshot sync, or a
-    /// lightweight peer-tip probe for recent persisted-state catch-up).
+    /// lightweight snapshot-boundary probe for persisted-state catch-up).
     /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
     RequestStateManifest { peer: PeerId, requester_height: u64 },
     /// Request a single state segment from a peer (step 2, one per segment).
@@ -160,8 +253,8 @@ pub enum NetworkCommand {
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
     },
-    /// Request the public `HistoryProof` from a peer.
-    /// Production peers return no proof until real O(1) authority is active.
+    /// Request the public checkpoint/history proof from a peer.
+    /// Peers return no proof until promoted checkpoint package coverage is ready.
     /// Emits `NetworkEvent::HistoryProof` when the response arrives.
     RequestHistoryProof { peer: PeerId },
     /// Request a peer's mempool contents (all pending TxIntent bytes).
@@ -193,6 +286,8 @@ pub enum NetworkEvent {
         /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
     },
+    /// A requested retained full block is no longer available from this peer.
+    RecentBlockUnavailable { from: PeerId, height: u64 },
     /// A new TxIntent arrived from a peer.
     NewTx { from: PeerId, intent_bytes: Vec<u8> },
     /// Response to FetchHeaders: decoded headers from the peer.
@@ -211,12 +306,12 @@ pub enum NetworkEvent {
         from: PeerId,
         response: crate::protocol::GetStateSegmentResponse,
     },
-    /// Public `HistoryProof` envelope response received from a peer.
+    /// Public checkpoint/history proof envelope response received from a peer.
     ///
-    /// Empty `proof_bytes` means the peer has no finalized cache proof ready.
+    /// Empty `proof_bytes` means the peer has no servable checkpoint proof ready.
     HistoryProof {
         from: PeerId,
-        /// Serialized public `HistoryProof` envelope bytes, or empty.
+        /// Serialized public checkpoint/history proof envelope bytes, or empty.
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
@@ -1239,6 +1334,16 @@ async fn handle_swarm_event(
                         });
                     }
                 }
+            } else {
+                tracing::debug!(
+                    peer = %peer,
+                    height = response.height,
+                    "requested recent block unavailable"
+                );
+                let _ = event_tx.send(NetworkEvent::RecentBlockUnavailable {
+                    from: peer,
+                    height: response.height,
+                });
             }
         }
 
@@ -1314,6 +1419,7 @@ async fn handle_swarm_event(
             let _ = swarm.behaviour_mut().block_sync.send_response(
                 channel,
                 GetRecentBlockResponse {
+                    height: request.height,
                     block_bytes,
                     block_proof_bytes,
                     block_auth_sidecar_bytes,
@@ -1329,7 +1435,7 @@ async fn handle_swarm_event(
             },
         )) => {
             let ctx = chain.read().await;
-            let proof_bytes = local_history_proof_bytes(&ctx);
+            let proof_bytes = local_public_history_proof(&ctx).map(|(_, bytes)| bytes);
             let tip_bytes = {
                 let mut buf = Vec::new();
                 ctx.tip_header().encode(&mut buf);
@@ -1377,8 +1483,8 @@ async fn handle_swarm_event(
         // --- State sync: manifest server (step 1) ---
         //
         // Serve a manifest together with a short-lived in-memory segment export
-        // keyed by the advertised tip, so live mining cannot make the manifest
-        // stale before peers request its segments.
+        // keyed by the advertised snapshot boundary, so live mining cannot make
+        // the manifest stale before peers request its segments.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message:
@@ -1389,138 +1495,178 @@ async fn handle_swarm_event(
             },
         )) => {
             prune_snapshot_exports(snapshot_exports);
-            let (response, export_segments) = {
-                let ctx = chain.read().await;
+            let (response, export_segments) = 'build_manifest: {
+                let mut ctx = chain.write().await;
                 let our_height = ctx.tip_height();
-                if our_height <= request.requester_height {
-                    (GetStateManifestResponse::default(), None)
-                } else {
-                    let tip_header = *ctx.tip_header();
-                    let tip_hash = ctx.tip_hash();
-                    let eff_log = ctx.state.state.effective_log_segment_size() as u8;
-
-                    let mut segments_ok = true;
-                    let stored_segments = match ctx.store.all_segments() {
-                        Ok(segments) => segments,
-                        Err(e) => {
-                            segments_ok = false;
-                            tracing::warn!(err = %e, "state manifest build failed: segment store read");
-                            Vec::new()
-                        }
-                    };
-                    let mut segment_ids = Vec::with_capacity(stored_segments.len());
-                    let mut segment_roots = Vec::with_capacity(stored_segments.len());
-                    let mut encoded_segments =
-                        std::collections::HashMap::with_capacity(stored_segments.len());
-                    let mut encoded_total_bytes = 0usize;
-                    for (segment_id, stored_eff_log, cols) in &stored_segments {
-                        if *stored_eff_log != eff_log {
-                            tracing::warn!(
-                                segment_id,
-                                stored_eff_log,
-                                eff_log,
-                                "state manifest skipped segment with unexpected effective log"
-                            );
-                            continue;
-                        }
-                        let root = noid_chain::fri_state::compute_segment_root(
-                            *stored_eff_log as usize,
-                            &cols.values,
-                            &cols.owners_hi,
-                            &cols.owners_lo,
+                let snapshot_height = match local_public_history_proof(&ctx) {
+                    Some((height, _)) if height <= our_height => height,
+                    Some((height, _)) => {
+                        tracing::warn!(
+                            height,
+                            our_height,
+                            "state manifest build skipped: public proof height is ahead of local tip"
                         );
-                        segment_ids.push(*segment_id);
-                        segment_roots.push(root);
-                        let encoded = encode_segment(cols, *stored_eff_log);
-                        encoded_total_bytes = encoded_total_bytes.saturating_add(encoded.len());
-                        if encoded_total_bytes > MAX_SNAPSHOT_EXPORT_BYTES {
-                            segments_ok = false;
+                        0
+                    }
+                    None => {
+                        tracing::debug!(
+                            our_height,
+                            "state manifest build skipped: no finalized public history proof yet"
+                        );
+                        0
+                    }
+                };
+                if snapshot_height == 0 || snapshot_height <= request.requester_height {
+                    break 'build_manifest (GetStateManifestResponse::default(), None);
+                }
+
+                let snapshot_header = match ctx.store.get_header(snapshot_height) {
+                    Ok(Some(header)) => header,
+                    Ok(None) => {
+                        tracing::warn!(
+                            snapshot_height,
+                            "state manifest build failed: snapshot header missing"
+                        );
+                        break 'build_manifest (GetStateManifestResponse::default(), None);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            snapshot_height,
+                            err = %e,
+                            "state manifest build failed: snapshot header read"
+                        );
+                        break 'build_manifest (GetStateManifestResponse::default(), None);
+                    }
+                };
+                let tip_hash = noid_chain::hash_block_header(&snapshot_header);
+                let mut snapshot_state = match ctx.reconstruct_state_snapshot_at(snapshot_height) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        tracing::warn!(
+                            snapshot_height,
+                            err = ?e,
+                            "state manifest build failed: finalized state reconstruction"
+                        );
+                        break 'build_manifest (GetStateManifestResponse::default(), None);
+                    }
+                };
+                if snapshot_state.state_root() != snapshot_header.state_root {
+                    tracing::warn!(
+                        snapshot_height,
+                        "state manifest build failed: reconstructed state root mismatch"
+                    );
+                    break 'build_manifest (GetStateManifestResponse::default(), None);
+                }
+                let eff_log = snapshot_state.state.effective_log_segment_size() as u8;
+
+                let mut segments_ok = true;
+                let active_segment_ids: Vec<u16> =
+                    snapshot_state.state.active_segment_ids().collect();
+                let mut segment_ids = Vec::with_capacity(active_segment_ids.len());
+                let mut segment_roots = Vec::with_capacity(active_segment_ids.len());
+                let mut encoded_segments =
+                    std::collections::HashMap::with_capacity(active_segment_ids.len());
+                let mut encoded_total_bytes = 0usize;
+                for segment_id in active_segment_ids {
+                    let cols = snapshot_state.state.segment_columns(segment_id).clone();
+                    let root = noid_chain::fri_state::compute_segment_root(
+                        eff_log as usize,
+                        &cols.values,
+                        &cols.owners_hi,
+                        &cols.owners_lo,
+                    );
+                    segment_ids.push(segment_id);
+                    segment_roots.push(root);
+                    let encoded = encode_segment(&cols, eff_log);
+                    encoded_total_bytes = encoded_total_bytes.saturating_add(encoded.len());
+                    if encoded_total_bytes > MAX_SNAPSHOT_EXPORT_BYTES {
+                        segments_ok = false;
+                        tracing::warn!(
+                            snapshot_height,
+                            encoded_total_bytes,
+                            max = MAX_SNAPSHOT_EXPORT_BYTES,
+                            "state manifest build skipped: snapshot export exceeds memory cap"
+                        );
+                        break;
+                    }
+                    encoded_segments.insert(segment_id, encoded);
+                }
+
+                let header_window = noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64
+                    + noid_chain::consensus::params::ANCHOR_DEPTH;
+                let start_height = snapshot_height.saturating_sub(header_window);
+                let mut recent_headers = Vec::new();
+                let mut headers_ok = true;
+                for h in start_height..=snapshot_height {
+                    match ctx.get_header_from_store(h) {
+                        Ok(Some(hdr)) => {
+                            let mut buf = Vec::new();
+                            hdr.encode(&mut buf);
+                            recent_headers.push(buf);
+                        }
+                        Ok(None) => {
+                            headers_ok = false;
                             tracing::warn!(
-                                our_height,
-                                encoded_total_bytes,
-                                max = MAX_SNAPSHOT_EXPORT_BYTES,
-                                "state manifest build skipped: snapshot export exceeds memory cap"
+                                height = h,
+                                "state manifest build failed: missing header"
                             );
                             break;
                         }
-                        encoded_segments.insert(*segment_id, encoded);
-                    }
-
-                    let header_window = noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64
-                        + noid_chain::consensus::params::ANCHOR_DEPTH;
-                    let start_height = our_height.saturating_sub(header_window);
-                    let mut recent_headers = Vec::new();
-                    let mut headers_ok = true;
-                    for h in start_height..=our_height {
-                        match ctx.get_header_from_store(h) {
-                            Ok(Some(hdr)) => {
-                                let mut buf = Vec::new();
-                                hdr.encode(&mut buf);
-                                recent_headers.push(buf);
-                            }
-                            Ok(None) => {
-                                headers_ok = false;
-                                tracing::warn!(
-                                    height = h,
-                                    "state manifest build failed: missing header"
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                headers_ok = false;
-                                tracing::warn!(height = h, err = %e, "state manifest build failed: header read");
-                                break;
-                            }
-                        }
-                    }
-
-                    let cumulative_chainwork = match ctx.store.get_chain_work(our_height) {
-                        Ok(Some(work)) => Some(work),
-                        Ok(None) => {
-                            tracing::warn!(
-                                height = our_height,
-                                "state manifest build failed: missing chainwork"
-                            );
-                            None
-                        }
                         Err(e) => {
-                            tracing::warn!(
-                                height = our_height,
-                                err = %e,
-                                "state manifest build failed: chainwork read"
-                            );
-                            None
+                            headers_ok = false;
+                            tracing::warn!(height = h, err = %e, "state manifest build failed: header read");
+                            break;
                         }
-                    };
-
-                    if !headers_ok || !segments_ok || cumulative_chainwork.is_none() {
-                        (GetStateManifestResponse::default(), None)
-                    } else {
-                        let cumulative_chainwork =
-                            cumulative_chainwork.expect("checked cumulative_chainwork");
-                        tracing::info!(
-                            requester_height = request.requester_height,
-                            our_height,
-                            segments = segment_ids.len(),
-                            export_bytes = encoded_total_bytes,
-                            "serving state snapshot manifest"
-                        );
-                        let response = GetStateManifestResponse {
-                            tip_height: our_height,
-                            tip_hash,
-                            cumulative_chainwork,
-                            log_slots: tip_header.log_slots,
-                            active_slot_count: tip_header.active_slot_count,
-                            alloc_counter: tip_header.alloc_counter,
-                            eff_log,
-                            segment_ids,
-                            segment_roots,
-                            recent_headers,
-                            reuse_guard_buckets: ctx.state.reuse_guard.buckets().to_vec(),
-                        };
-                        (response, Some(encoded_segments))
                     }
                 }
+
+                let cumulative_chainwork = match ctx.store.get_chain_work(snapshot_height) {
+                    Ok(Some(work)) => Some(work),
+                    Ok(None) => {
+                        tracing::warn!(
+                            height = snapshot_height,
+                            "state manifest build failed: missing chainwork"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            height = snapshot_height,
+                            err = %e,
+                            "state manifest build failed: chainwork read"
+                        );
+                        None
+                    }
+                };
+
+                if !headers_ok || !segments_ok || cumulative_chainwork.is_none() {
+                    break 'build_manifest (GetStateManifestResponse::default(), None);
+                }
+
+                let cumulative_chainwork =
+                    cumulative_chainwork.expect("checked cumulative_chainwork");
+                tracing::info!(
+                    requester_height = request.requester_height,
+                    our_height,
+                    snapshot_height,
+                    segments = segment_ids.len(),
+                    export_bytes = encoded_total_bytes,
+                    "serving state snapshot manifest"
+                );
+                let response = GetStateManifestResponse {
+                    tip_height: snapshot_height,
+                    tip_hash,
+                    cumulative_chainwork,
+                    log_slots: snapshot_header.log_slots,
+                    active_slot_count: snapshot_header.active_slot_count,
+                    alloc_counter: snapshot_header.alloc_counter,
+                    eff_log,
+                    segment_ids,
+                    segment_roots,
+                    recent_headers,
+                    reuse_guard_buckets: snapshot_state.reuse_guard.buckets().to_vec(),
+                };
+                break 'build_manifest (response, Some(encoded_segments));
             };
             if let Some(segments) = export_segments {
                 snapshot_exports.insert(
@@ -1640,9 +1786,9 @@ async fn handle_swarm_event(
 
         // --- State sync: segment server (step 2) ---
         //
-        // Responses are pinned to the exact manifest tip (height + hash). A
-        // short in-memory export cache keeps the advertised snapshot available
-        // while a live miner advances.
+        // Responses are pinned to the exact manifest snapshot boundary
+        // (height + hash). A short in-memory export cache keeps the advertised
+        // snapshot available while a live miner advances.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::Message {
                 message:
@@ -1962,6 +2108,15 @@ mod tests {
             256 * 1024,
             INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024 + 1,
         ));
+    }
+
+    #[test]
+    fn snapshot_proof_serving_requires_retained_suffix() {
+        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+        assert!(snapshot_suffix_is_retained(100, 100));
+        assert!(snapshot_suffix_is_retained(100, 100 - retention));
+        assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
+        assert!(!snapshot_suffix_is_retained(100, 101));
     }
 
     #[test]

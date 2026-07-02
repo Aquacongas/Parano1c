@@ -31,7 +31,7 @@ use noid_poseidon2b::native::permutation::MDS_FULL;
 const MERKLE_CHAIN_LINEAR_RELATION_TAG: u128 = 0x4D45_524B_4C45_4348; // "MERKLECH"
 const MERKLE_PIN_LANES: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchedMerkleProofKillShot {
     pub kill_shot: BlockSpineKillShotProof,
     pub chain: LinearEvalProof,

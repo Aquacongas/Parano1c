@@ -44,8 +44,7 @@ pub trait ParanoidApi {
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Current constant-size history proof envelope, if the local finalized cache is ready.
-    /// Snapshot authority remains fail-closed until the trustless verifier is active.
+    /// Current public checkpoint proof envelope, if promoted checkpoint coverage is ready.
     #[method(name = "getHistoryProof")]
     async fn get_history_proof(&self) -> RpcResult<Option<String>>;
 
@@ -80,7 +79,7 @@ pub trait ParanoidApi {
     // Network / mining
     // =========================================================================
 
-    /// Mining and network state: difficulty, block reward, local history-cache height.
+    /// Mining and network state: difficulty, block reward, checkpoint proof height.
     #[method(name = "getMiningInfo")]
     async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
 

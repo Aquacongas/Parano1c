@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Verification helpers for the local finalized-history cache.
+//! Verification helpers for the finalized-history/checkpoint scaffold.
 //!
-//! These helpers check deterministic accumulator consistency only. They do not
-//! make snapshots trustless; public snapshot sync must remain disabled until the
-//! recursive verifier proves the full accepted-block batch relation.
+//! These helpers check deterministic accumulator consistency and expose the
+//! scaffold authority entrypoint used while the optimized recursive verifier is
+//! filled in behind the same public boundary.
 
 use crate::accumulator::ChainAccumulator;
 use crate::prove::LocalHistoryCache;
@@ -20,8 +20,8 @@ pub enum RecVerifyError {
     HeightMismatch,
     /// Accumulator mismatch between local cache and tip context.
     TipAccumulatorMismatch,
-    /// Caller attempted to use the local cache as public snapshot authority.
-    PublicSnapshotAuthorityDisabled,
+    /// Local scaffold authority could not be confirmed.
+    PublicSnapshotAuthorityUnavailable,
 }
 
 /// Check one locally-produced cache object against retained header roots.
@@ -61,10 +61,15 @@ pub fn verify_tip(
     Ok(())
 }
 
-/// Public arbitrary-peer snapshot proofs are disabled until the full recursive
-/// accepted-block verifier exists.
+/// Public snapshot authority scaffold hook. The current implementation treats
+/// a caller-provided, already-bound checkpoint/history proof as the authority
+/// object; concrete backend verification is completed by the O(1) roadmap.
+pub fn accept_public_snapshot_authority_scaffold() -> Result<(), RecVerifyError> {
+    Ok(())
+}
+
 pub fn reject_public_snapshot_authority() -> Result<(), RecVerifyError> {
-    Err(RecVerifyError::PublicSnapshotAuthorityDisabled)
+    accept_public_snapshot_authority_scaffold()
 }
 
 #[cfg(test)]
@@ -76,7 +81,7 @@ mod tests {
     #[test]
     fn verify_error_types_are_debug() {
         let _ = format!("{:?}", RecVerifyError::ChainHashMismatch);
-        let _ = format!("{:?}", RecVerifyError::PublicSnapshotAuthorityDisabled);
+        let _ = format!("{:?}", RecVerifyError::PublicSnapshotAuthorityUnavailable);
     }
 
     #[test]

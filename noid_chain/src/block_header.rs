@@ -36,7 +36,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 /// ```
 ///
 /// Total: 212 bytes (see `BLOCK_HEADER_WIRE_SIZE`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockHeader {
     pub prev_block_hash: Digest,
     /// Global state root — Poseidon2b Merkle root over per-segment FRI roots

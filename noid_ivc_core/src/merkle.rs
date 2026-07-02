@@ -21,7 +21,7 @@ pub type Hash = [u8; 32];
 const POSEIDON_MERKLE_LEAF_DOMAIN: &[u8] = b"NOID/IVC/PCS-LEAF/v1";
 const POSEIDON_MERKLE_NODE_TAG: DomainTag = DomainTag::new(b"IVCPCSN_");
 
-/// Global proof-core Merkle hash counters, enabled with
+/// Global PCS commitment-tree Poseidon2b counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
 #[cfg(feature = "hash-count")]

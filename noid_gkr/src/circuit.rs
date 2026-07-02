@@ -52,7 +52,7 @@ pub struct SlotDescriptor {
 /// are the values the STARK either already binds via public cells
 /// (leaf payloads, fee, epoch_anchor, is_coinbase) or derives from
 /// deterministic structure (capacity IVs).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpineInputs {
     /// `epoch_anchor` as two field lanes (tree leaf L0). Replaces the
     /// former `prev_state_root` — provides fork-binding without state

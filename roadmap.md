@@ -1,958 +1,900 @@
-# Final O(1) History Roadmap
+# O(1) Sync Roadmap
 
-This document is the production target for trustless O(1) snapshot sync. It is
-intentionally narrow: it describes the final architecture, the proof
-obligations, what is already implemented, and the concrete path from the
-current code to the final verifier.
+This roadmap tracks the path from the current O(1) checkpoint scaffold to the
+complete cryptographic implementation.
 
-## Final Goal
+## 1. Current Architecture
 
-A new node must be able to sync from arbitrary peers without replaying old
-block bodies:
+The current tree is wired as an end-to-end O(1) sync scaffold:
 
-```text
-headers from genesis to tip
-+ one constant-size finalized-history proof at checkpoint F
-+ snapshot state whose root equals header[F].state_root
-+ normally verified suffix blocks F+1..tip
-= accepted local tip state
-```
-
-The retained data window is 18 blocks. The checkpoint batch target is 16
-accepted blocks. There is no larger history batch target in this protocol path.
-
-The old finalized body data may be pruned only after the recursive history
-proof covers it.
-
-## Prefix Proof vs Retained Window
-
-The O(1) history proof covers a monotonic finalized prefix. It is not a proof
-of the moving last-18-block window.
-
-```text
-height H:
-
-[ finalized prefix already covered by Proof_C ] [ unaggregated retained suffix ]
-0 ......................................... C   C+1 ....................... H
-
-public sync checks:
-  Proof_C verifies the prefix up to C
-  suffix blocks C+1..H are replayed normally
-```
-
-When enough finalized suffix blocks accumulate, the worker folds the next
-checkpoint chunk:
-
-```text
-Proof_C + blocks C+1..C+16 + BlockProof/AuthSidecar witnesses
-    -> Proof_{C+16}
-```
-
-After that, the coverage height advances:
-
-```text
-[ finalized prefix covered by Proof_{C+16} ] [ fresh retained suffix ]
-0 .................................... C+16   C+17 ...................... H
-```
-
-The retained window is only the local safety buffer for recent block bodies,
-reorg/finality handling, and worker lag. The batch target is 16 so the worker
-can fold finalized data before the 18-block retention boundary is reached. The
-node must never prune block bodies that are older than the retained suffix
-unless `history_proof_covered_to` has already passed them.
-
-## Trust Model
-
-The sync peer is untrusted. The peer may send headers, snapshot chunks, block
-proofs, sidecars, and the history proof, but none of those objects are trusted
-without verification.
-
-The node accepts a snapshot only if all checks below pass:
-
-```text
-             headers[0..tip]
-                  |
-                  v
-       native PoW + chainwork verification
-                  |
-                  v
-       local HeaderChainAnchor at F
-                  |
-                  +------------------------------+
-                                                 |
-HistoryCheckpointProofV1                         |
-  recursive_proof                                |
-  end_anchor ------------------------------------+
-  end_accumulator.state_root
-                  |
-                  v
-       O(1) recursive verifier
-                  |
-                  v
-       proven checkpoint state root
-                  |
-                  v
-       must equal header[F].state_root
-                  |
-                  v
-       verify snapshot chunks against that root
-                  |
-                  v
-       replay suffix blocks F+1..tip normally
-```
-
-Headers protect ordering and work. The recursive history proof protects the
-validity of the old block transitions. The snapshot root binds the state bytes
-to the proven checkpoint. The retained suffix is checked by the normal block
-acceptance path.
-
-## Non-Negotiable Design
-
-- The public recursive path uses Poseidon2b/KillShot-compatible hashing only.
-- Non-production hash/comparator experiments cannot become public recursive
+- Headers are stored forever from genesis. Header consensus stays native:
+  PoW, chainwork, ASERT, MTP, log slots, state counters.
+- Full block bytes, `BlockProof` bytes, `BlockAuthSidecar` bytes, and accepted
+  history claim witnesses are transient. After finalized history coverage they
+  are pruned outside the last 18-block suffix, but only after an accepted-block
+  certificate record exists for that height.
+- Accepted-block certificate records are produced at block acceptance time and
+  stored as raw bytes in MDBX. They currently contain the hash-only certificate
+  proof scaffold and act as a per-height pruning guard.
+- Full accepted-block checkpoint batch packages can now be built from retained
+  blocks, serialized, stored as raw bytes in MDBX, and verified later without
+  retained `Block`/`BlockProof`/`BlockAuthSidecar` witnesses. They contain the
+  checkpoint step statement, certificate batch statement, full proof-facing
+  components, retained component proof, and checkpoint step proof.
+- The background updater builds fixed 16-block checkpoint packages while their
+  full witnesses are still inside the 18-block retained suffix, then promotes
+  `CheckpointCoverage.history_proof_covered_to` only after the package is
+  finalized and still matches canonical header anchors.
+- P2P and RPC history proof serving use a public `HistoryCheckpointProofV1`
+  exported from the latest promoted checkpoint package. The public proof is
+  light and does not include retained blocks. There is no local-cache public
+  proof fallback.
+- P2P state manifests are served at the locally servable public proof height,
+  not at the live tip. The peer reconstructs that finalized state from retained
+  undo logs and exports segment roots/data for that exact height.
+- Scaffold serving refuses to advertise a public proof if
+  `local_tip - proof_height > RECENT_BLOCK_RETENTION_DEPTH`, because the peer
+  can no longer provide the retained suffix after the snapshot boundary.
+- After a snapshot proof is accepted, the client decodes the peer live tip from
+  the proof response and prefetches `F+1..peer_tip` into a bounded in-memory
+  suffix buffer before downloading state segments. The snapshot is applied at
+  `F`, then the prefetched suffix is replayed with normal full block/proof/auth
+  validation.
+- Current protocol V1 overloads `GetStateManifestResponse.tip_height`,
+  `tip_hash`, and `cumulative_chainwork` with the snapshot height `F` fields.
+  It does not yet carry the peer's live tip separately, so manifest candidate
+  selection currently compares snapshot chainwork rather than live-tip
+  chainwork.
+- Because `tip_height` is `F` in Manifest V1, the client treats every non-empty
+  ahead manifest as a snapshot candidate. Shallow `<=18` sync is selected from
+  block/header announcements, not from `F - local_tip`.
+- If a retained suffix block is already unavailable, the client requests a fresh
+  snapshot manifest instead of expecting the peer to keep a 19th block.
+- Snapshot verification checks the manifest against locally verified headers
+  through persisted `HeaderChainAnchor` records and a constant-size public
+  proof envelope. Production snapshot sync accepts `HistoryCheckpointProofV1`
+  only; the old `HistoryProof`/`NativeFoldV1` path is no longer a public
   authority.
-- The final proof derives accepted claims from verified block certificates.
-  Peer-provided accepted-claim sidecars are cache hints only.
-- History aggregation never re-proves transaction internals as its public
-  surface. Transaction-dependent work belongs to the existing block proof
-  layer.
-- The final public proof size and public verification time do not depend on the
-  number of transactions in historical blocks.
-- P2P/RPC snapshot acceptance stays fail-closed until the multi-step recursive
-  backend verifies real proofs.
+- After applying the finalized snapshot, the node replays the retained suffix
+  with normal full block validation.
 
-There are two verifier layers and they must not be conflated:
+Current sync mode selection:
+
+Terminology below uses the final/live-tip wording. In the current scaffold,
+block/header gossip discovers the deep gap, while manifest V1 advertises the
+snapshot boundary `F` under the legacy `tip_height` field name.
 
 ```text
-production block verifier in noid_block:
-  block body + BlockProof + BlockAuthSidecar + state/auth witnesses
-  -> accepted block artifacts
+peer_tip <= local_tip:
+  no sync
 
-history aggregation verifier in noid_recursive:
-  canonical components derived from those accepted artifacts
-  -> accepted-claim batch + checkpoint step
+peer_tip - local_tip <= CONSENSUS_FINALITY_DEPTH:
+  shallow sync
+  -> request retained full blocks from local_tip + 1
+  -> verify each block/proof/auth sidecar normally
+  -> apply blocks one by one
+
+peer_tip - local_tip > CONSENSUS_FINALITY_DEPTH:
+  O(1) checkpoint snapshot sync
+  -> sync/verify headers
+  -> verify checkpoint/history proof at finalized snapshot height F
+  -> download/apply state snapshot at F
+  -> replay retained suffix blocks after F
 ```
 
-`noid_recursive` must not become the owner of block parsing, transaction
-application, or serialized `BlockProof` replay. Those stay in `noid_block` and
-are still measured by `block_scaling`.
+O(1) is only the deep-sync path. The normal path for gaps up to 18 blocks is
+still ordinary full-block replay.
 
-## Final Objects
+Important current files:
 
-### Existing block layer
+- `noid_node/src/main.rs`
+  - `verify_snapshot_history_proof_headers_anchored`
+  - `run_checkpoint_package_worker`
+- `noid_p2p/src/network.rs`
+  - state manifest export at servable public proof height
+  - checkpoint package proof serving
+- `noid_block/src/accepted_block_batch.rs`
+  - full accepted-block checkpoint package build/verify/export
+- `noid_chain/src/storage/mdbx_store.rs`
+  - persistent `T_HEADER_ANCHORS`
+  - pruning by `RECENT_BLOCK_RETENTION_DEPTH` and history/checkpoint coverage
+- `noid_recursive/src/checkpoint_proof.rs`
+  - `verify_history_checkpoint_proof_v1_checkpoint`
+- `noid_recursive/src/block_certificate.rs`
+  - `verify_accepted_block_certificate_proof_v1_checkpoint`
 
-This layer already exists and remains owned by block production and normal
-block validation.
+Current scaffold limitations:
 
-Objects:
+- `NativeFoldV1` still exists in `noid_recursive` library/tests as a scaffold
+  type, but node/P2P/RPC snapshot authority no longer accepts it.
+- Digest/hash-only accepted-block certificate paths still exist as scaffold
+  per-height inputs.
+- `HistoryCheckpointProofV1` verifies the envelope/head shape, but the final
+  recursive backend proof still needs real previous-head and certificate-validity
+  verification.
+- Full accepted-block checkpoint batch package generation, MDBX raw-byte
+  storage, background finalized chunk building, sequential coverage promotion,
+  and P2P proof serving are wired. The public checkpoint proof still carries a
+  scaffold recursive backend payload until Phase 4 closes previous-head
+  recursion.
+- Manifest V1 does not bind `snapshot_height` and `peer_tip_height` separately.
+  The suffix is requested after applying the snapshot, but the manifest itself
+  cannot yet state the exact `F+1..peer_tip` range.
+- Pruning uses proven checkpoint coverage only and also requires an
+  accepted-block certificate record at each pruned height.
 
-- `BlockProof`
-- `BlockAuthSidecar`
-- block body
-- state witnesses
-- authorization witnesses
-- exact-state witnesses
+Current crypto backend / verifier status:
 
-This layer may have prover cost and proof component sizes that depend on the
-transaction shape, within protocol block limits. That is expected. It is not
-the O(1) history proof.
+What already exists:
 
-The required statement is:
+- Low-level crypto/proof infrastructure:
+  `noid_gkr`, `noid_ivc_core`, `noid_ivc_prover`, Poseidon2b hash schedules,
+  fixed-field hash KillShot proofs, transcript proofs, and PCS/IVC components.
+- Full native accepted-block batch boundary:
+  `noid_block/src/accepted_block_batch.rs` re-verifies retained full blocks and
+  reconstructs accepted claims/certificate material.
+- Accepted-block certificate statement/receipt/handle types:
+  `noid_recursive/src/block_certificate.rs`.
+- Certificate receipt-projection IVC subrelation:
+  `noid_recursive/src/block_certificate_ivc.rs`.
+- Checkpoint chunk continuity IVC core:
+  `noid_recursive/src/checkpoint_ivc_backend.rs`.
+- Current scaffold verifier entrypoint names are temporary:
 
-```text
-VerifyBlockCertificate(parent_state, block, BlockProof, BlockAuthSidecar)
-  -> child_state
-  -> AcceptedStateTransitionClaim
+```rust
+verify_accepted_block_certificate_proof_v1_checkpoint(...)
+verify_history_checkpoint_step_proof_v1_checkpoint(...)
+verify_history_checkpoint_proof_v1_checkpoint(...)
 ```
 
-The final history prover may use these objects as private witnesses, but the
-network-facing history proof exposes only a constant-size recursive proof and
-fixed checkpoint boundary data.
+Before first public launch these names must be flattened to one clean API
+without `_v1`, `V1`, `V2`, `version`, backend-kind, or compatibility wrappers.
+There is no deployed compatibility contract yet, so final code should not carry
+legacy branches.
 
-### Accepted-claim certificate layer
+What is still scaffold:
 
-This is the bridge between full block validation and history folding.
+- `NativeFoldV1` remains as non-authoritative recursive/library scaffold, not
+  as production snapshot authority.
+- `prove_accepted_block_certificate_proof_v1_hash_only` still appears in
+  scaffold paths. It proves statement/digest shape, not the full block-validity
+  relation.
+- `verify_history_checkpoint_proof_v1_checkpoint` checks the public checkpoint
+  envelope and recursive head shape, but the recursive `backend_proof` is not
+  yet the final previous-head-validity proof.
+- The checkpoint IVC core currently consumes certificate handles/receipts; the
+  final backend must verify certificate proof validity inside the recursive
+  path.
+- `verify_checkpoint_step_certificate_validity_backend_v1` still treats empty
+  certificate statement/proof sidecars as acceptable scaffold shape.
+- `checkpoint_ivc_backend.rs` can still derive receipt/handle pairs from
+  certificate statements by building hash-only certificate proofs internally.
+  Final code must consume persisted certificate proofs produced before pruning
+  instead.
 
-For each historical block:
+So the answer is: the crypto building blocks mostly exist, but the final public
+recursive verifier is not fully assembled yet. The roadmap work is integration
+and replacement of scaffold subrelations, not inventing the whole crypto stack
+from zero.
+
+Final crypto design decision:
+
+- Do not introduce a new public primitive stack for the first launch. The
+  existing stack is sufficient:
+  - Poseidon2b over `Block128` for block ids, state roots, transcript binding,
+    statement digests, proof digests, and Fiat-Shamir.
+  - `noid_gkr` KillShot proofs for fixed-field hashes, tx-body spines, tx-root
+    Merkle checks, authorization transcript checks, exact-state slot/path/root
+    checks, and ReUseGuard checks.
+  - `noid_ivc_core` / `noid_ivc_prover` Boolean R1CS + sumcheck/zerocheck +
+    multilinear PCS/Ligerito for fixed certificate and checkpoint proof cores.
+  - Native header verification for PoW, chainwork, ASERT, MTP, and log slots.
+- The final proof stack is two-layered:
+  1. Accepted-block certificate issuance proves the tx-dependent block-validity
+     relation while full block/proof/auth bytes are still retained.
+  2. Checkpoint recursion folds only fixed-size certificate statements,
+     receipts, validity proofs/handles, header anchors, and accumulator
+     transitions.
+- `noid_recursive/src/block_certificate_backend.rs` is the verifier-language
+  boundary for final certificate validity. It already names the components that
+  must be proven: accepted claim hash, tx body hash/spine, tx root, auth
+  statements/transcripts, checkpoint Poseidon transition, exact state paths, and
+  ReUseGuard paths.
+- `noid_recursive/src/block_certificate_ivc.rs` remains a subrelation for
+  receipt projection. It is not full certificate validity by itself.
+- `noid_recursive/src/checkpoint_ivc_backend.rs` remains the fixed 16-slot
+  checkpoint core. Its final form must prove certificate validity and previous
+  recursive-head validity inside the backend, not only receipt/handle shape.
+- The checkpoint backend must not synthesize certificate handles from statements
+  during proof generation or verification. Handles come from already-verified
+  certificate proofs stored at block acceptance time.
+- The history/checkpoint layer must never replay transaction-shaped component
+  lists. Tx-count-dependent work ends at certificate issuance; checkpoint
+  proving consumes fixed certificate outputs.
+- Keep one field/hash/transcript family end to end. Avoid Groth16/STARK/foreign
+  field adapters/new hash functions/new PCS unless profiling later proves an
+  unavoidable bottleneck. Those would add complexity without changing the core
+  O(1) architecture.
+- Before first launch there is one clean proof shape and one clean verifier API.
+  Remove public `version`, backend-kind dispatch, `_v1`, `V1`/`V2`, and
+  compatibility branches instead of carrying dormant legacy code.
+
+## 2. Final Architecture And Invariants
+
+Final sync cost:
 
 ```text
-full block certificate is verified
-accepted claim is derived inside the proof
-accepted claim is folded into the history accumulator
+O(headers) native header sync
++ O(1) execution/history proof verification
++ O(live state) snapshot download
++ O(18) suffix replay
 ```
 
-The peer must not be able to choose accepted claim fields directly. A bad claim
-must require forging either the block certificate verifier or the recursive
-proof.
+Hard invariants:
 
-Current code already has the native digest boundary:
+- Headers are stored forever and are the only source of header consensus truth.
+- Header work, ASERT, MTP, and log-slot consensus are not inside history
+  aggregation.
+- Full block bytes, `BlockProof` bytes, `BlockAuthSidecar` bytes, and local
+  accepted-claim witnesses are stored only for the retained suffix.
+- `18` is finality/suffix/retention depth. It is not the recursive batch size.
+- Recursive checkpoint batch size stays independent, currently `16`.
+- The miner/block layer handles tx-size-dependent work:
+  tx body binding, authorization proof, tx root, exact UTXO/ReUseGuard state
+  transition, and accepted-block certificate issuance.
+- The history/checkpoint layer consumes only fixed-size accepted-block
+  receipts/certificates.
+- Snapshot manifest height is a finalized proof-covered height `F`.
+- `F` must be serveable with the retained suffix invariant:
+  `F <= peer_tip - CONSENSUS_FINALITY_DEPTH` and
+  `peer_tip - F <= RECENT_BLOCK_RETENTION_DEPTH`. With both constants currently
+  equal to `18`, a fully up-to-date peer advertises `F = peer_tip - 18`.
+- Live mining can move the retained suffix while a snapshot is downloading. The
+  node must never solve that by storing block `tip - 18` as a 19th retained
+  block. The final client should prefetch the manifest suffix `F+1..peer_tip`
+  into a bounded pending buffer before downloading the state snapshot. If
+  `F+1` is already unavailable, restart from a fresh manifest at the newer
+  finalized boundary.
+- Any retention slack must be explicit protocol configuration, not hidden
+  behavior. If the design ever changes to keep more than 18 full blocks, it
+  must be represented as `RECENT_BLOCK_RETENTION_DEPTH > CONSENSUS_FINALITY_DEPTH`
+  and tested as a new invariant. The current target remains exactly 18.
+- `MIN_SNAPSHOT_CHAINWORK` is an admission/resource floor for a header-verified
+  snapshot boundary. It is not fork choice. Fork choice remains exact cumulative
+  PoW chainwork over natively verified headers.
+- Snapshot state root must equal the locally verified header `state_root` at
+  `F`.
+- Suffix blocks `F+1..tip` are always replayed with normal validation.
 
-- `noid_recursive::accepted_claim_batch_digest_v1`
-- `noid_block::accepted_claim_batch_digest_v1` as a thin wrapper over the
-  recursive schedule
-- `noid_block::history_checkpoint_batch_summary_from_full_accepted_output_v1`
-
-Important: `accepted_claim_batch_digest_v1` uses a fixed 16-slot
-Poseidon2b/KillShot-compatible schedule over header witnesses, accepted claims,
-end consensus state, and end accumulator. It does not absorb tx-body,
-exact-state, authorization, or tx-root statement lists. Those details are
-verified by the block certificate layer and are private to the history prover.
-
-### Checkpoint step layer
-
-A checkpoint step folds up to 16 accepted blocks:
+Final sync mode selection remains the same:
 
 ```text
-previous HistoryCheckpointHeadV1
-+ HistoryCheckpointBatchSummaryV1
-= next HistoryCheckpointHeadV1
+gap <= 18:
+  block replay only
+
+gap > 18:
+  checkpoint snapshot at finalized proof-covered F
+  then bounded suffix prefetch
+  then snapshot apply
+  then suffix replay
 ```
 
-Public step statement:
+Final data flow:
 
 ```text
-HistoryCheckpointStepStatementV1 {
-    previous_head,
-    batch_summary,
-    next_head,
+Block accepted
+  -> emit accepted-block certificate statement/proof/receipt
+  -> fold finalized receipts in 16-block checkpoint chunks
+  -> update recursive checkpoint head
+  -> mark checkpoint coverage height F
+  -> advertise snapshot only if peer_tip - F <= 18
+  -> prune payload witnesses older than tip - 18 and <= F
+
+Joining node
+  -> sync/verify headers
+  -> request checkpoint snapshot manifest with F and peer live tip
+  -> verify O(1) checkpoint proof at F
+  -> prefetch full suffix blocks F+1..peer_tip into a bounded <=18 buffer
+  -> download/verify state segments for F
+  -> apply snapshot at F
+  -> replay prefetched suffix blocks F+1..peer_tip
+  -> shallow-sync any blocks mined after peer_tip
+```
+
+Final manifest shape:
+
+```rust
+pub struct CheckpointSnapshotManifest {
+    pub snapshot_height: u64,
+    pub snapshot_block_id: [u8; 32],
+    pub snapshot_state_root: [u8; 32],
+    pub snapshot_chainwork: [u8; 32],
+
+    pub peer_tip_height: u64,
+    pub peer_tip_block_id: [u8; 32],
+    pub peer_tip_chainwork: [u8; 32],
+
+    pub checkpoint_proof_bytes: Vec<u8>,
+
+    pub eff_log: u8,
+    pub segment_ids: Vec<u16>,
+    pub segment_roots: Vec<[u8; 32]>,
+    pub reuse_guard_buckets: Vec<noid_chain::reuse_guard::GuardBucket>,
+
+    pub suffix_start: u64,
+    pub suffix_end: u64,
 }
 ```
 
-Batch summary:
+## 3. Concrete Phases To Full O(1)
+
+### Phase 0: Scaffold Wiring
+
+Status: implemented in this branch.
+
+Done:
+
+- Manifest export is finalized-height based.
+- Snapshot apply treats the manifest height as finalized.
+- Manifest V1 still names that finalized snapshot height `tip_height`; the final
+  manifest removes this naming/semantics overload.
+- Manifest V1 handling no longer downgrades to shallow block sync from
+  `manifest.tip_height - local_tip`, because that value is `F - local_tip`, not
+  `peer_tip - local_tip`.
+- Missing retained next-block responses trigger fresh snapshot manifest retry.
+- Snapshot verification rejects boundaries below `MIN_SNAPSHOT_CHAINWORK` after
+  matching manifest chainwork to locally verified headers.
+- Snapshot verification accepts `HistoryCheckpointProofV1` against local header
+  anchors and rejects old `HistoryProof`/`NativeFoldV1` public authority bytes.
+- P2P and RPC proof serving use checkpoint package proofs only.
+- Snapshot client prefetches the bounded retained suffix before segment
+  download and replays it after applying the snapshot.
+- Pruning of retained payloads is back and coverage-gated.
+- Old disabled/public-blocker wording was replaced by checkpoint scaffold
+  wording.
+
+Acceptance:
 
 ```text
-HistoryCheckpointBatchSummaryV1 {
-    batch_len <= 16,
+cargo fmt --all
+cargo check -p noid_node -p noid_p2p --release
+cargo test -p noid_block --release full_batch_checkpoint_package_serializes_and_verifies_without_blocks
+cargo test -p noid_node --release snapshot_history_boundary_checks_local_header_chainwork
+cargo test -p noid_chain --release block_payloads_prune_after_checkpoint_history_coverage
+cargo test -p noid_recursive --release --lib checkpoint_scaffold
+```
+
+### Phase 1: Persistent Header Anchor Table
+
+Status: implemented in this branch.
+
+Done:
+
+- Added persistent `T_HEADER_ANCHORS` in MDBX.
+- Added fixed storage encoding for `HeaderChainAnchor`.
+- `commit_block` stores a header anchor atomically with canonical header and
+  cumulative chainwork.
+- `put_verified_header_only` stores a header anchor for header-only sync.
+- Snapshot history proof verification now reads local start/end anchors from
+  MDBX and rejects proof-supplied projection-root tampering.
+- `local_header_boundary_anchor_scaffold` was removed.
+
+Original goal: remove `local_header_boundary_anchor_scaffold`.
+
+Implemented MDBX table:
+
+```rust
+const T_HEADER_ANCHORS: &str = "header_anchors";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredHeaderAnchor {
+    pub height: u64,
+    pub anchor: noid_chain::HeaderChainAnchor,
+}
+```
+
+Canonical header inserts now compute the anchor in the same MDBX transaction as
+the header and cumulative chainwork:
+
+```rust
+let previous = store.get_header_anchor(header.height - 1)?;
+let anchor = extend_header_chain_anchor(&previous, header, cumulative_chainwork)?;
+txn.put(T_HEADER_ANCHORS, header.height, encode_header_chain_anchor(&anchor))?;
+```
+
+For genesis:
+
+```rust
+let genesis_anchor = compute_header_chain_anchor([&genesis_header], genesis_work)?;
+txn.put(T_HEADER_ANCHORS, 0, encode_header_chain_anchor(&genesis_anchor))?;
+```
+
+Snapshot verification now resolves local anchors through storage:
+
+```rust
+store.get_header_anchor(height)?
+```
+
+Tests:
+
+- Restart preserves anchors.
+- Header-only sync persists anchors.
+- Tampered proof `projection_root` is rejected.
+- Fresh node snapshot verification does not scan `0..height`.
+
+Acceptance:
+
+```text
+cargo test -p noid_chain --release verified_headers_persist_header_chain_anchors
+cargo test -p noid_chain --release open_fresh_database
+cargo test -p noid_chain --release apply_one_block_and_reopen
+cargo test -p noid_node --release snapshot_history_boundary_checks_local_header_chainwork
+cargo check -p noid_node -p noid_p2p --release
+```
+
+### Phase 2: Accepted-Block Certificate Issuance And Full Batch Package
+
+Status: implemented for Phase 2 scope. Per-height pruning guard and
+component-backed batch package storage are wired; replacing the scaffold
+certificate-validity backend is Phase 4/7 crypto work, not a Phase 2 carryover.
+
+Done:
+
+- Added persistent raw `accepted_block_certificates` table in MDBX.
+- Added `AcceptedBlockCertificateRecord` in `noid_block`.
+- P2P block acceptance and reorg application now build and store certificate
+  records before old payload witnesses are eligible for pruning.
+- Current records use the existing hash-only certificate proof scaffold.
+- Payload pruning now requires both history/checkpoint coverage and an
+  accepted-block certificate record for that height.
+- Snapshot install/restart cleanup clears transient certificate records with
+  other payload witness tables.
+- Added `FullAcceptedBlockBatchCheckpointPackageV1` in `noid_block`.
+- The package builder replays retained blocks once, proves
+  `FullAcceptedBlockBatchProofComponents`, builds the checkpoint step statement,
+  and proves the checkpoint step from the full components.
+- The package verifier checks the decoded component proof and checkpoint step
+  without retained block bodies/proofs/auth sidecars.
+- Added persistent raw `accepted_block_batch_certificate_packages` table in
+  MDBX, keyed by checkpoint package end height.
+- Added serde/wire support for the proof-facing component structs needed by the
+  package.
+
+Goal: every block has fixed certificate material before it leaves the 18-block
+window, and every finalized chunk can be represented by a persistent proof-side
+package before payload witnesses are pruned.
+
+Implemented persistent certificate table:
+
+```rust
+const T_ACCEPTED_BLOCK_CERTIFICATES: &str = "accepted_block_certificates";
+const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
+    "accepted_block_batch_certificate_packages";
+
+pub struct AcceptedBlockCertificateRecord {
+    pub height: u64,
+    pub statement: AcceptedBlockCertificateStatement,
+    pub proof: AcceptedBlockCertificateProof,
+    pub receipt: AcceptedBlockCertificateReceipt,
+    pub validity_handle: AcceptedBlockCertificateValidityHandle,
+}
+
+pub struct FullAcceptedBlockBatchCheckpointPackage {
+    pub step_statement: HistoryCheckpointStepStatement,
+    pub certificate_batch_statement: AcceptedBlockCertificateBatchStatement,
+    pub components: FullAcceptedBlockBatchProofComponents,
+    pub proof: RetainedFullAcceptedBlockBatchProof,
+    pub checkpoint_step_proof: HistoryCheckpointStepProof,
+}
+```
+
+Block acceptance must do:
+
+```rust
+let statement = accepted_block_certificate_statement(...)?;
+let proof = prove_accepted_block_certificate_proof_hash_only_scaffold(&statement)?;
+let receipt = accepted_block_certificate_receipt(&statement);
+let handle = accepted_block_certificate_validity_handle(&proof)?;
+store.put_accepted_block_certificate(height, record)?;
+```
+
+Full batch package path:
+
+```rust
+let package = prove_full_accepted_block_batch_checkpoint_package_from_boundary(
     start_anchor,
-    end_anchor,
-    start_accumulator,
-    end_accumulator,
     start_consensus,
-    end_consensus,
-    accepted_claim_batch_digest,
-}
-```
-
-The summary is fixed-shape for a batch. It binds only the information needed by
-the recursive head:
-
-```text
-start boundary
-  (anchor, accumulator, consensus)
-accepted-claim batch digest
-end boundary
-  (anchor, accumulator, consensus)
-```
-
-It is not a list of transaction proofs.
-
-### Recursive checkpoint proof
-
-Network proof object:
-
-```text
-HistoryCheckpointProofV1 {
-    version,
-    engine_id,
-    checkpoint_height,
-    start_anchor,
-    end_anchor,
     start_accumulator,
-    end_accumulator,
-    recursive_proof,
+    start_parent,
+    start_state,
+    retained_witness,
+)?;
+verify_full_accepted_block_batch_checkpoint_package(&package)?;
+store.put_accepted_block_batch_certificate_package(package.end_height(), bytes)?;
+```
+
+Remaining cryptographic replacement:
+
+```rust
+prove_accepted_block_certificate_proof_hash_only
+```
+
+The hash-only per-height proof remains temporary. The full batch package already
+proves accepted-block components, but the final public recursive backend must
+make certificate validity part of the recursive proof rather than relying on
+digest-only certificate handles.
+
+Tests:
+
+- A block cannot be pruned unless certificate record exists.
+- Tampered tx root, auth sidecar digest, exact transition digest, or claim digest
+  makes certificate verification fail.
+- Tampered certificate component proof is rejected by
+  `verify_accepted_block_batch_components`.
+- Coinbase-only blocks still produce a fixed certificate/receipt.
+
+Acceptance:
+
+```text
+cargo test -p noid_block --release certificate_record_hash_only_scaffold_binds_statement_receipt_and_handle
+cargo test -p noid_chain --release accepted_block_certificate_roundtrip
+cargo test -p noid_chain --release accepted_block_batch_certificate_package_roundtrip
+cargo test -p noid_block --release full_batch_checkpoint_package_serializes_and_verifies_without_blocks
+cargo test -p noid_chain --release block_payloads_prune_after_checkpoint_history_coverage
+cargo test -p noid_chain --release block_payloads_do_not_prune_without_certificate_record
+cargo test -p noid_node --release snapshot_history_boundary_checks_local_header_chainwork
+cargo check -p noid_node -p noid_p2p --release
+```
+
+### Phase 3: 16-Block Checkpoint Chunk Worker
+
+Status: implemented in this branch. Package build/store, sequential finalized
+coverage promotion, public checkpoint proof export, P2P/RPC proof serving,
+manifest selection by servable public proof height, checkpoint-only pruning, and
+local-cache storage removal are complete for this milestone.
+
+Goal: automatically fold finalized accepted-block packages in fixed chunks and
+advance local proven checkpoint coverage.
+
+The raw package table already exists:
+
+```rust
+const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
+    "accepted_block_batch_certificate_packages";
+
+pub struct FullAcceptedBlockBatchCheckpointPackage {
+    pub start_height: u64,
+    pub end_height: u64,
+    pub statement: HistoryCheckpointStepStatement,
+    pub certificate_batch_statement: AcceptedBlockCertificateBatchStatement,
+    pub components: FullAcceptedBlockBatchProofComponents,
+    pub proof: RetainedFullAcceptedBlockBatchProof,
+    pub checkpoint_step_proof: HistoryCheckpointStepProof,
 }
 ```
 
-Recursive payload:
+Worker loop:
 
-```text
-HistoryCheckpointRecursivePayloadV1 {
-    version,
-    engine_id,
-    head: HistoryCheckpointHeadV1,
-    backend_proof,
+```rust
+let start = previous_head.checkpoint_height + 1;
+let end = start + HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS - 1;
+// Build while still retained, before finality promotion.
+let retained = store.get_retained_full_batch_witness(start..=end)?;
+let package = prove_full_accepted_block_batch_checkpoint_package(
+    previous_head,
+    start_anchor,
+    start_consensus,
+    start_accumulator,
+    start_parent,
+    start_state,
+    retained,
+)?;
+verify_full_accepted_block_batch_checkpoint_package(&package)?;
+store.put_accepted_block_batch_certificate_package(package.end_height(), bytes)?;
+// Promote later, only after end <= tip - 18 and anchors still match canonical headers.
+store.put_checkpoint_coverage(history_proof_covered_to = Some(package.end_height()))?;
+```
+
+Implemented worker behavior:
+
+- Builds the next 16-block package as soon as `end <= tip` and the package
+  start state is still reconstructable from at most 18 undo logs.
+- Deletes stale/corrupt latest packages if their decoded end height or boundary
+  anchors no longer match canonical stored header anchors.
+- Promotes coverage sequentially (`covered + 16`), so an unfinalized later
+  package cannot block promotion of an earlier finalized package.
+- Re-verifies the package and re-checks canonical anchors immediately before
+  `CheckpointCoverage.history_proof_covered_to` advances.
+- Exports a public `HistoryCheckpointProofV1` from the latest promoted package
+  without retained blocks and serves it as the only public proof authority.
+- Refuses to serve checkpoint proof bytes for snapshot sync when
+  `tip - proof_height` exceeds `RECENT_BLOCK_RETENTION_DEPTH`; this prevents
+  fast-mining bursts from producing stale manifest/proof pairs that cannot be
+  completed with the retained suffix.
+- Client-side scaffold now uses the proof response peer tip header to prefetch
+  the retained suffix before state segments. If the suffix length is greater
+  than `RECENT_BLOCK_RETENTION_DEPTH`, or a suffix block is unavailable, the
+  session is discarded and a fresh manifest is requested.
+
+The chunk backend receives fixed certificate data only:
+
+```rust
+certificate_statements: [AcceptedBlockCertificateStatement; 16]
+certificate_receipts: [AcceptedBlockCertificateReceipt; 16]
+certificate_validity: [AcceptedBlockCertificateProof; 16]
+accepted_claim_batch_digest
+start/end header anchors
+start/end chain accumulators
+```
+
+It must not receive block bodies, transaction bodies, authorization sidecars, or
+exact-state path lists.
+
+Tests:
+
+- Missing certificate blocks chunk generation.
+- Bad receipt order fails.
+- Chunk `end_height` must equal previous height + batch len.
+- Chunk size remains independent from tx count.
+- Restart resumes from the latest stored package/head.
+- Checkpoint coverage advances only after package verification succeeds.
+- Pruning uses proven package coverage only and never uses local-cache height as
+  coverage.
+- The worker never asks storage for height `tip - 18 - 1`; if the chunk cannot
+  be built from retained witnesses, it waits for or fetches a newer manifest
+  instead of expanding the full-block retention invariant.
+
+### Phase 4: Recursive Checkpoint Head
+
+Goal: `HistoryCheckpointProof` verifies previous-head validity, not just final
+head shape.
+
+Add table:
+
+```rust
+const T_HISTORY_CHECKPOINT_HEADS: &str = "history_checkpoint_heads";
+
+pub struct HistoryCheckpointHeadRecord {
+    pub height: u64,
+    pub head: HistoryCheckpointHead,
+    pub recursive_proof: HistoryCheckpointProof,
 }
 ```
 
-The final verifier must check:
+Final verifier must check:
 
-```text
-payload.head.checkpoint_height == proof.checkpoint_height
-payload.head.anchor_digest == Digest(proof.end_anchor)
-payload.head.accumulator_digest == Digest(proof.end_accumulator)
-VerifyRecursiveBackend(payload.backend_proof, payload.head) == true
+```rust
+verify_previous_recursive_head(previous_head, previous_proof)?;
+verify_checkpoint_step(statement, certificate_batch, step_proof)?;
+verify_head_transition(previous_head, batch_summary, next_head)?;
 ```
 
-Today the public shape checks exist and the untrusted verifier still returns
-`BackendVerifierMissing`. That is intentional fail-closed behavior until the
-recursive/IVC backend is connected.
+Replace `HistoryCheckpointRecursivePayload.backend_proof` scaffold bytes with
+the actual recursive backend proof.
 
-The real retained accepted-block component verifier now exists below that
-public boundary: `noid_block` first uses the production block verifier to
-replay existing `BlockProof`/`BlockAuthSidecar` objects and derive canonical
-components, and `noid_recursive::block_certificate_backend` verifies those
-components without depending on `noid_block`.
+The final public checkpoint proof is constant-size with respect to chain height:
+it verifies one recursive head, not a linear list of historical chunks.
 
-## Final Proof Relation
+Tests:
 
-For one 16-block step, the recursive backend must prove the following relation:
+- Swapping previous head fails.
+- Swapping backend proof fails.
+- Empty backend proof fails.
+- Proof size stays constant across 1, 2, 10 chunks.
 
-```text
-input:
-  previous_head
-  batch_summary
-  next_head
+### Phase 5: Final Manifest And Suffix Tip Binding
 
-private witnesses:
-  previous recursive proof, unless this is the base step
-  block bodies B_1..B_k
-  BlockProof_1..BlockProof_k
-  BlockAuthSidecar_1..BlockAuthSidecar_k
-  state/auth/tx witnesses needed by the existing block certificate verifier
+Goal: manifest advertises both snapshot height `F` and peer live tip.
 
-constraints:
-  1. k == batch_summary.batch_len and 1 <= k <= 16
+Add protocol:
 
-  2. previous_head matches batch_summary.start_*:
-       previous_head.checkpoint_height == start_anchor.height
-       previous_head.anchor_digest == Digest(start_anchor)
-       previous_head.accumulator_digest == Digest(start_accumulator)
-       previous_head.consensus_digest == Digest(start_consensus)
-
-  3. for each block i in order:
-       VerifyHeaderPoWAndParent(header_i, anchor_{i-1}, consensus_{i-1})
-       VerifyBlockCertificate(B_i, BlockProof_i, BlockAuthSidecar_i)
-       claim_i = DeriveAcceptedStateTransitionClaim(B_i, verified_artifacts_i)
-       accumulator_i = FoldAcceptedClaim(accumulator_{i-1}, claim_i)
-       anchor_i, consensus_i = ExtendHeaderAnchor(anchor_{i-1}, consensus_{i-1}, header_i)
-
-  4. accepted_claim_batch_digest ==
-       Digest(header_witnesses_1..k, claim_1..k, end_consensus, end_accumulator)
-
-  5. batch_summary.end_* equals the computed end boundary
-
-  6. next_head ==
-       AdvanceHistoryCheckpointHead(previous_head, batch_summary)
-
-  7. if previous_head.batch_count > 0:
-       VerifyRecursiveBackend(previous_proof, previous_head)
+```rust
+GetCheckpointSnapshotManifest
+GetCheckpointSnapshotSegment
+GetCheckpointProof
 ```
 
-The public verifier sees one constant-size proof for the final head. The heavy
-per-block witnesses are private to the prover and do not travel with the final
-snapshot package.
+Serving rule:
 
-## Why This Is Trustless
-
-Invalid headers are rejected by native PoW and chainwork verification before
-the snapshot proof is trusted.
-
-Invalid old block transitions are rejected because the recursive backend must
-verify the existing block certificate path and derive the accepted claims
-inside the proof.
-
-Fake accepted claims are rejected because the history step folds only claims
-that come from verified block certificates. A sidecar claim from a peer is not
-authority.
-
-Fake snapshots are rejected because the snapshot root must equal
-`header[F].state_root`, and the recursive proof must end at the same checkpoint
-anchor and accumulator.
-
-Data withholding can still stop sync from that peer, but it cannot make an
-invalid snapshot accepted.
-
-## Current Code Map
-
-### `noid_block::accepted_block_batch`
-
-Status: native authority boundary and benchmark harness.
-
-What it does now:
-
-- replays retained full `AcceptBlock` data;
-- keeps the production block verifier for `BlockProof`, transaction bodies,
-  authorization sidecars, exact state, and consensus checks;
-- reconstructs accepted claims after full validation;
-- verifies component proofs for accepted claim hash, tx body, tx root,
-  checkpoint Poseidon, exact state, and authorization transcripts;
-- builds `HistoryCheckpointBatchSummaryV1` from a real accepted batch;
-- builds and verifies checkpoint step proofs from full accepted components via
-  `noid_recursive`;
-- exposes a wrapper for `noid_recursive::accepted_claim_batch_digest_v1`.
-
-What it is not:
-
-- it is not the final public O(1) recursive verifier;
-- it is not supposed to make history aggregation depend on tx count.
-
-### `noid_recursive`
-
-Status: final public envelope, native checkpoint step, certificate statement
-digest proofs, certificate-batch digest proofs, accepted-claim digest proof,
-real retained accepted-block component verification, and the first
-Poseidon2b-backed checkpoint IVC core exist. The final IVC encoding of the full
-accepted-block component verifier and the multi-step fold verifier are still
-missing.
-
-What it does now:
-
-- defines `HistoryCheckpointProofV1`;
-- defines `HistoryCheckpointRecursivePayloadV1`;
-- defines `HistoryCheckpointHeadV1`;
-- defines `HistoryCheckpointBatchSummaryV1`;
-- defines `HistoryCheckpointStepStatementV1`;
-- checks version, engine, anchors, accumulators, checkpoint height, and payload
-  shape;
-- verifies the native checkpoint step relation;
-- proves and verifies the fixed-schedule Poseidon2b digest of
-  `AcceptedBlockCertificateStatementV1`;
-- proves and verifies the fixed-schedule Poseidon2b digest of
-  `AcceptedBlockCertificateBatchStatementV1`;
-- proves and verifies the fixed 16-slot accepted-claim batch digest;
-- proves and verifies the fixed-schedule Poseidon2b digest of
-  `HistoryCheckpointStepStatementV1`;
-- verifies existing `BlockProof`/`BlockAuthSidecar`-derived retained batch
-  components in `noid_recursive::block_certificate_backend`;
-- verifies a checkpoint step against full accepted components through
-  `verify_history_checkpoint_step_proof_v1_private_block_components_native`;
-- decodes the checkpoint-step backend proof and checks the certificate-batch
-  digest and step-statement digest components before failing closed;
-- exposes `checkpoint_ivc_backend`, which proves a fixed 16-slot R1CS chunk
-  core over checkpoint boundary, certificate statement digests, accepted-claim
-  digest witnesses, state roots, heights, and block-id continuity;
-- fails closed at `BackendVerifierMissing`.
-
-What must be added:
-
-- encode `verify_accepted_block_batch_components_v1` inside the
-  Poseidon2b-backed IVC backend instead of prechecking it natively;
-- proof of previous head validity inside the next step;
-- replace the checkpoint-step `BackendVerifierMissing` with public IVC
-  verification so the component witnesses remain private and only a constant
-  public proof is sent over the network.
-
-### Removed Lab Crate
-
-Status: removed.
-
-The useful proof-core ideas have been promoted into `noid_ivc_core`,
-`noid_ivc_prover`, and `noid_recursive::checkpoint_ivc_backend`. The benchmark
-coverage that matters now lives in production-path crates:
-
-- `noid_recursive --bench checkpoint_ivc` for the Poseidon2b IVC chunk core;
-- `bench_prover --bench full_accepted_batch` for the retained full
-  `AcceptBlock` authority boundary;
-- `bench_prover --bench history_accumulator_lite` for the older local
-  accumulator shape checks until the final worker replaces them.
-
-There is no second production history-proof API.
-
-## Performance Budget
-
-The block interval target is 15 seconds. The history worker must stay ahead of
-the retained window.
-
-Targets:
-
-- prove one 16-block checkpoint step in less than 2 seconds on the benchmark
-  machine;
-- verify the final public proof in less than 1 second;
-- keep the final public proof below 64 KiB;
-- keep public proof size independent of historical transaction count;
-- stop pruning if `history_proof_covered_to` falls behind retained data.
-
-Current useful measurements:
-
-```text
-noid_recursive checkpoint_ivc chunk core, 16 slots:
-  proof core Poseidon2b BaseFold/R1CS, pcs_log_inv_rate=4,
-  pcs_log_batch_size=5
-  fixture 4.71 ms, prove 46.98 ms, verify 52.32 ms
-  proof 97.59 KiB, core proof 97.57 KiB
-  current scope: checkpoint/certificate/claim continuity core, not yet the full
-  accepted-block component verifier
-
-noid_recursive n=18 older local shape:
-  public_proof 9.71 KiB
-  recursive_head_history_proof 10.12 KiB
-  recursive_chunk_head_history_proof 16.42 KiB
-  promising shape, but multi-step untrusted verifier still fails closed
-
-full accepted batch, 1 user block:
-  build fixture 85.37 ms, prove 170.52 ms, verify 146.13 ms, proof 46.61 KiB
-  checkpoint step statement 1.70 KiB, certificate batch statement 552 B
-  accepted-claim batch digest proof 5.68 KiB, prove 103.52 ms, verify 31.17 ms
-  checkpoint step proof from full accepted components 14.63 KiB, prove 200.24 ms,
-    private full-component verify 134.42 ms, public verify-to-fail-closed 10.05 ms
-
-full accepted batch, 16 no-user blocks:
-  build fixture 19.01 ms, prove 396.48 ms, verify 143.26 ms, proof 16.33 KiB
-  checkpoint step statement 1.70 KiB, certificate batch statement 552 B
-  accepted-claim batch digest proof 5.68 KiB, prove 94.25 ms, verify 28.36 ms
-  checkpoint step proof from full accepted components 14.63 KiB, prove 212.79 ms,
-    private full-component verify 156.28 ms, public verify-to-fail-closed 10.09 ms
+```rust
+let peer_tip = store.tip_height();
+let f = store.latest_checkpoint_coverage_height()?;
+require(f <= peer_tip - CONSENSUS_FINALITY_DEPTH);
+require(peer_tip - f <= RECENT_BLOCK_RETENTION_DEPTH);
+manifest.snapshot_height = f;
+manifest.suffix_start = f + 1;
+manifest.suffix_end = peer_tip;
 ```
 
-The full accepted batch bench uses saved valid PoW nonces, so the 16-block
-measurement is proof cost rather than deterministic fixture mining cost.
+Client rule:
 
-## Milestones To Final O(1)
-
-### M0. Cleanup and safety rails
-
-Status: done.
-
-Delivered:
-
-- removed the legacy long-history target from docs, tests, and bench defaults;
-- kept the retained window at 18 and checkpoint batch target at 16;
-- clarified that SHA proof-core paths are diagnostic only;
-- kept incomplete public verification fail-closed.
-
-Exit condition:
-
-- there is one visible final architecture and no competing long-history
-  plan.
-
-### M1. Final public envelope
-
-Status: done.
-
-Delivered:
-
-- `HistoryCheckpointProofV1`;
-- `HistoryCheckpointRecursivePayloadV1`;
-- `HistoryCheckpointHeadV1`;
-- `HistoryCheckpointBatchSummaryV1`;
-- `HistoryCheckpointStepStatementV1`;
-- deterministic Poseidon2b digests for anchors, accumulators, consensus state,
-  batch summaries, heads, and step statements;
-- fixed 12-field Poseidon2b/KillShot hash schedule for the checkpoint step
-  statement digest;
-- negative tests for bad versions, engines, anchors, accumulators, payloads,
-  and head mismatches.
-
-Exit condition:
-
-- P2P/RPC can carry the final proof type without accepting incomplete proofs.
-
-### M2. Native accepted-batch handoff
-
-Status: done for the native boundary.
-
-Delivered:
-
-- `noid_block::accepted_block_batch` verifies full retained `AcceptBlock`
-  batches natively;
-- accepted claims are reconstructed after full validation;
-- `accepted_claim_batch_digest_v1` binds fixed per-block header witnesses and
-  accepted claims;
-- `accepted_claim_batch_digest_v1` now lives in `noid_recursive` as a fixed
-  440-field Poseidon2b/KillShot schedule with a proof component;
-- `history_checkpoint_batch_summary_from_full_accepted_output_v1` builds the
-  checkpoint summary from real batch output;
-- release tests cover summary construction and tampering.
-
-Delivered in the certificate handoff:
-
-- `AcceptedBlockCertificateStatementV1`;
-- `accepted_block_certificate_statement_v1`;
-- `accepted_block_certificate_statement_digest_v1`;
-- `accepted_block_certificate_chain_claim_v1`;
-- fixed 35-field statement projection in `noid_recursive`;
-- fixed 38-field Poseidon2b/KillShot hash schedule for the certificate
-  statement digest;
-- fixed 40-field Poseidon2b/KillShot hash schedule for the certificate batch
-  statement digest;
-- native statement verification against an accepted block and its artifacts;
-- full accepted batches now carry one certificate statement per block and derive
-  the folded chain claim from that statement.
-
-Exit condition:
-
-- the recursive backend has a precise target statement instead of relying on
-  native helper output.
-
-### M3. One-block certificate verifier inside the recursive backend
-
-Status: done for the dependency-clean retained component verifier. The public
-one-block recursive proof wrapper is still fail-closed.
-
-Goal:
-
-```text
-BlockProof + BlockAuthSidecar + block body + witnesses
-  -> verified accepted block
-  -> derived AcceptedStateTransitionClaim
+```rust
+verify headers through manifest.peer_tip_height;
+verify checkpoint proof at manifest.snapshot_height;
+reject if manifest.suffix_end - manifest.snapshot_height > RECENT_BLOCK_RETENTION_DEPTH;
+select candidate by manifest.peer_tip_chainwork, then manifest.peer_tip_height;
+require snapshot_chainwork >= MIN_SNAPSHOT_CHAINWORK;
+prefetch full blocks manifest.suffix_start..=manifest.suffix_end into a bounded pending buffer;
+verify each prefetched suffix block header/proof/auth sidecar shape before committing snapshot;
+if manifest.suffix_start is unavailable, discard the session and request a fresh manifest;
+download and verify snapshot segments for manifest.snapshot_height;
+apply snapshot at F;
+replay the prefetched suffix;
+shallow-sync blocks after manifest.peer_tip_height if new blocks appeared;
 ```
 
-Tasks:
+Tests:
 
-- done: define `AcceptedBlockCertificateStatementV1`;
-- done: bind block body digest, proof digest, auth sidecar digest, folded
-  accepted-block claim digest, semantic state-transition claim digest, roots,
-  counts, and witness lengths;
-- done: make `noid_block::accepted_block_batch` derive the folded claim from
-  the certificate statement instead of from a parallel free claim path;
-- done: move the data-only certificate statement and digest schedule into
-  `noid_recursive` so the final verifier does not depend on `noid_block`;
-- done: add `AcceptedBlockCertificateProofV1` as a fail-closed recursive proof
-  shape;
-- done: add `AcceptedBlockCertificateBackendProofV1`, which proves the
-  fixed-schedule statement digest with `FixedFieldHashProofKillShot`;
-- done: make malformed certificate backend bytes reject before the final
-  fail-closed verifier boundary;
-- done: add `noid_recursive::block_certificate_backend`, the real verifier
-  relation for canonical components derived by `noid_block` after it verifies
-  existing `BlockProof`/`BlockAuthSidecar` bytes:
-  accepted-claim hash, tx body hash, tx root, owner authorization,
-  authorization transcript, header trace, checkpoint Poseidon, exact-state
-  KillShot, certificate statement projection, consensus state, and accumulator;
-- done: keep `noid_block` as the extractor/builder for canonical components
-  from actual blocks, block proofs, and sidecars; the production block verifier
-  and `block_scaling` benchmark stay there;
-- wrap this component verifier in the public recursive proof backend;
-- make the final public proof shape fixed under protocol block caps;
-- extend tamper tests across block body bytes, proof bytes, auth sidecar bytes,
-  parent root, child root, tx root, owner auth, and claim fields.
+- Manifest with suffix longer than 18 is rejected.
+- Peer refuses to advertise a snapshot when checkpoint coverage lags beyond the
+  retained suffix window.
+- Live miner advances during snapshot download; if the first replay block falls
+  out of the retained suffix before suffix prefetch, the client retries from a
+  fresh manifest.
+- Live miner advances during snapshot download after suffix prefetch; the
+  prefetched bounded suffix still replays to the manifest peer tip, then the
+  node continues with ordinary shallow sync.
+- Pending suffix buffer never exceeds `RECENT_BLOCK_RETENTION_DEPTH`.
+- No hidden 19th/20th block retention is required or accepted by tests.
+- Snapshot below `MIN_SNAPSHOT_CHAINWORK` is rejected, but this floor is never
+  used to choose between competing chains.
+- Manifest snapshot root must match local header at `F`.
+- Peer tip chainwork tie-break uses header-verified chainwork.
 
-Exit condition:
+### Phase 6: Final Pruning Gate
 
-- one block certificate can be proved recursively and verified publicly without
-  trusting a peer-provided accepted claim.
+Status: completed early in Phase 3.
 
-### M4. Sixteen-block checkpoint step
+Final pruning authority is already checkpoint coverage only:
 
-Status: fixed certificate batch statement, fixed digest proof components,
-accepted-claim digest component, full accepted component native verifier,
-fail-closed step proof shape, extracted Poseidon2b IVC core/prover crates, and
-the first checkpoint IVC chunk-core proof are done. The full accepted-block
-component verifier is not yet encoded inside the public IVC backend.
-
-Goal:
-
-```text
-previous HistoryCheckpointHeadV1
-+ up to 16 verified block certificates
-+ derived accepted claims
-= next HistoryCheckpointHeadV1
+```rust
+coverage_height = real_checkpoint_coverage
+    .and_then(|c| c.history_proof_covered_to);
 ```
 
-Tasks:
+Pruning rule:
 
-- done: add `AcceptedBlockCertificateBatchStatementV1`, a fixed 16-slot
-  statement over certificate statement digests;
-- done: bind certificate batch length and accepted-claim batch digest to
-  `HistoryCheckpointStepStatementV1`;
-- done: add `HistoryCheckpointStepProofV1`, a fail-closed proof shape for the
-  checkpoint step backend;
-- done: add `HistoryCheckpointStepDigestProofV1`, which proves the fixed
-  `HistoryCheckpointStepStatementV1` digest with `FixedFieldHashProofKillShot`;
-- done: add `AcceptedBlockCertificateBatchDigestProofV1`, which proves the
-  fixed 16-slot certificate-batch statement digest with
-  `FixedFieldHashProofKillShot`;
-- done: add `AcceptedClaimBatchDigestProofV1`, which proves the fixed 16-slot
-  accepted-claim batch digest with `FixedFieldHashProofKillShot`;
-- done: add `HistoryCheckpointStepBackendProofV1`, decode it in the untrusted
-  step verifier, verify the public step-statement digest proof and
-  certificate-batch digest proof, then fail closed at the missing recursive
-  fold verifier;
-- done: connect `AcceptedClaimBatchDigestProofV1` to the checkpoint step
-  backend as a private component and add a native private-component verifier
-  for benches;
-- done: add `prove_history_checkpoint_step_proof_v1_from_certificate_statements`,
-  which rebuilds `AcceptedBlockCertificateBatchStatementV1` from certificate
-  statements and accepted-claim witness projection before proving the step;
-- done: add `prove_history_checkpoint_step_proof_v1_from_block_components`,
-  which first verifies the real accepted-block components and then builds the
-  checkpoint step proof from the derived accepted-claim output;
-- done: add
-  `verify_history_checkpoint_step_proof_v1_private_block_components_native`,
-  which verifies public step/certificate digest components and the real
-  accepted-block component verifier before accepting the step privately;
-- done: add `noid_block` bridge helpers that build and verify checkpoint step
-  proofs from retained full accepted components;
-- done: bench the accepted-claim batch digest proof shape:
-  5.68 KiB, prove about 94-104 ms, verify about 28-31 ms;
-- done: bench the checkpoint step proof built from full accepted components:
-  14.63 KiB, prove about 200-213 ms, private full-component verify about
-  134-156 ms, public verify-to-fail-closed about 10 ms;
-- done: batch 1..16 real accepted-block component verifications through
-  `noid_recursive`;
-- done: derive the accepted-claim batch digest in the native step from
-  certificate-derived claims;
-- done: fold the chain accumulator and header anchor in the native component
-  verifier via accepted-claim batch/header trace checks;
-- done: extract the useful proof-core technology into `noid_ivc_core` and
-  `noid_ivc_prover`, with Poseidon2b as the mandatory proof-core boundary;
-- done: add `noid_recursive::checkpoint_ivc_backend`, a fixed 16-slot IVC
-  chunk-core proof for checkpoint/certificate/claim continuity;
-- encode `verify_accepted_block_batch_components_v1` inside the public
-  recursive/IVC backend;
-- connect `HistoryCheckpointStepStatementV1` to that backend and remove the
-  fail-closed placeholder;
-- reject wrong order, skipped height, wrong parent, wrong PoW target, wrong
-  state root, wrong accumulator, and wrong accepted-claim digest;
-- benchmark no-user, one-user, and mixed 16-block fixtures.
-
-Exit condition:
-
-- one retained 16-block batch verifies as a public recursive step, not only as
-  a native/private component statement.
-
-### M5. Recursive head chaining
-
-Status: not done. It starts after the full 16-block component verifier is
-inside the IVC backend.
-
-Goal:
-
-```text
-base head
-  -> step 1 proof
-  -> step 2 proof verifies step 1
-  -> ...
-  -> final constant-size checkpoint proof
+```rust
+let cutoff = min(tip - RECENT_BLOCK_RETENTION_DEPTH, coverage_height);
+delete from recent/block_proofs/auth_sidecars/history_claims where height <= cutoff;
 ```
 
-Tasks:
+Tests:
 
-- verify previous recursive proof inside the next step;
-- fold `recursive_digest` deterministically;
-- serialize only the latest recursive proof as public proof bytes;
-- replace `BackendVerifierMissing` with real backend verification;
-- keep worker caches separate from network proof bytes.
+- No recursive checkpoint coverage means no payload pruning.
+- Coverage to `F` prunes exactly `<= min(tip-18, F)`.
+- Last 18 full blocks always remain serveable.
 
-Exit condition:
+### Phase 7: Remove Scaffold Backends
 
-- many checkpoint batches verify with one constant-size public proof.
+Goal: final clean names stay, scaffold internals disappear.
 
-### M6. History worker and pruning gate
+Remove production use of:
 
-Status: not done.
+- `NativeFoldV1` as snapshot authority.
+- `ArcPcdV1` / backend-kind dispatch as public authority.
+- local claim sidecars as pruning coverage.
+- `prove_accepted_block_certificate_proof_v1_hash_only`.
+- digest-only certificate backend in checkpoint paths.
+- proof-supplied header projection root.
+- `version` fields, `V1`/`V2` type suffixes, and compatibility wrappers.
 
-Goal:
+Keep only:
 
-```text
-while history_proof_covered_to + 16 <= finalized_height:
-    load retained blocks, BlockProofs, BlockAuthSidecars
-    prove one checkpoint step
-    persist new head and recursive proof
-    advance history_proof_covered_to
+```rust
+verify_history_proof_checkpoint
+verify_history_checkpoint_proof
+verify_history_checkpoint_step_proof
+verify_accepted_block_certificate_proof
 ```
 
-Tasks:
+The implementations behind those names are fully recursive.
 
-- persist proof head, coverage height, proof digest, and pending suffix count;
-- resume safely after restart;
-- expose metrics for prove time, verify time, proof size, and coverage lag;
-- block pruning if proof coverage lags behind retained data;
-- keep the latest 18 blocks available for normal validation and reorg safety.
+## 4. Placeholder And TODO Closure Order
 
-Exit condition:
+Close these in order:
 
-- old data cannot be deleted before the O(1) proof covers it.
+1. Completed: persistent header anchors
+   - `noid_node/src/main.rs::local_header_boundary_anchor_scaffold` was
+     removed.
+   - Snapshot proof verification now uses stored `HeaderChainAnchor` records.
 
-### M7. Snapshot sync package
+2. Completed: `noid_node/src/main.rs::run_checkpoint_package_worker`
+   - Accepted-block certificate storage is now produced at block acceptance.
+   - Build retained `FullAcceptedBlockBatchWitness` for finalized 16-block
+     chunks while those blocks are still inside the 18-block window.
+   - Call `prove_full_accepted_block_batch_checkpoint_package`.
+   - Store the serialized package in
+     `accepted_block_batch_certificate_packages`.
+   - Advance `CheckpointCoverage.history_proof_covered_to` only after package
+     verification succeeds.
+   - Old local-cache coverage production was removed from the node worker.
 
-Status: not done.
+3. Completed: public proof serving
+   - `noid_block::public_history_checkpoint_proof_from_package_v1` exports a
+     `HistoryCheckpointProofV1` from a promoted package without retained blocks.
+   - `noid_p2p` and `noid_rpc` serve checkpoint package proofs only.
+   - Snapshot verification accepts checkpoint proof bytes only.
+   - Local-cache public proof serving, local-cache pruning authority, and
+     local-cache MDBX storage were removed from the runtime/storage path.
 
-Goal:
+4. `noid_block/src/accepted_block_certificate.rs` and
+   `noid_block/src/accepted_block_batch.rs`
+   - Keep `FullAcceptedBlockBatchCheckpointPackage` as the persisted
+     proof-side package.
+   - Replace `accepted_block_certificate_record_hash_only_scaffold` and
+     `prove_accepted_block_certificate_proof_hash_only` with the final
+     certificate-validity proof once `checkpoint_ivc_backend` consumes full
+     certificate proofs instead of digest-only handles.
 
-```text
-SnapshotPackage {
-    headers,
-    checkpoint_height F,
-    HistoryCheckpointProofV1,
-    snapshot chunks,
-    suffix blocks F+1..tip,
-}
-```
+5. `noid_recursive/src/block_certificate.rs`
+   - Remove digest-only backend from checkpoint verifier.
 
-Verification order:
+6. `noid_recursive/src/block_certificate_ivc.rs`
+   - Keep receipt projection IVC as a subrelation, but do not treat it as full
+     certificate validity.
 
-1. Verify headers from genesis.
-2. Compute local `HeaderChainAnchor` at checkpoint `F`.
-3. Verify `HistoryCheckpointProofV1`.
-4. Verify snapshot chunks against the snapshot root.
-5. Require snapshot root equals `header[F].state_root`.
-6. Replay suffix blocks `F+1..tip` normally.
+7. `noid_recursive/src/checkpoint_ivc_backend.rs`
+   - Replace validity handles-only logic with actual certificate proof
+     verification inside the recursive backend.
+   - Remove internal hash-only certificate proof synthesis from certificate
+     statements.
 
-Exit condition:
+8. `noid_recursive/src/checkpoint_proof.rs`
+   - Make `verify_history_checkpoint_proof` verify backend proof
+     recursion, previous head validity, and step proof validity.
+   - Remove the empty-certificate-sidecar success path from
+     `verify_checkpoint_step_certificate_validity_backend`.
 
-- a fresh node can sync from arbitrary peers without trusting peer-local
-  history caches.
+9. `noid_recursive/src/verify.rs::accept_public_snapshot_authority_scaffold`
+   - Remove the exported scaffold authority hook, or make it a thin wrapper over
+     the real checkpoint verifier.
 
-### M8. Performance hardening
+10. Completed: `noid_chain/src/storage/mdbx_store.rs`
+   - Pruning now uses only
+     `CheckpointCoverage.history_proof_covered_to`.
+   - Header bytes, header anchors, hash-to-height indexes, and chainwork are
+     preserved by local recovery cleanup.
+   - Checkpoint coverage is cleared together with checkpoint package bytes if
+     local state recovery resets volatile state.
 
-Status: not done.
+11. `noid_chain/src/storage/mdbx_context.rs::generate_immutable_checkpoint_at`
+   - Replace prefix rebuild of payload roots with rolling payload roots, because
+     full block payloads are retained only for the suffix.
 
-Tasks:
+12. `noid_p2p/src/protocol.rs`
+    - Replace the scaffold manifest with the final manifest carrying separate
+      `snapshot_height` and `peer_tip_height`.
 
-- keep `block_scaling` as the separate block-proof benchmark;
-- keep `full_accepted_batch` for the retained-batch authority boundary;
-- add final recursive-step benches for 1, 16, and mixed blocks;
-- add final public verifier benches for repeated checkpoint depth;
-- enforce public proof size and verify-time budgets in release CI;
-- replace older local accumulator shape benches with final worker benches once
-  recursive head chaining is implemented.
+13. `noid_p2p/src/network.rs`
+    - Stop overloading manifest `tip_height` as snapshot height; serve a final
+      manifest only when `F` is finalized and
+      `peer_tip - F <= RECENT_BLOCK_RETENTION_DEPTH`.
+    - Import or request checkpoint packages/public checkpoint heads after a
+      remote snapshot is accepted, so a node that was offline during local
+      package construction can become a proof-serving peer without replaying
+      pruned retained witnesses.
 
-Exit condition:
+14. Global cleanup before first public launch
+    - Delete `_v1` functions, `V1`/`V2` type suffixes, `version` fields,
+      backend-kind enums, unused wrappers, and all compatibility-only branches.
+      Do not leave dead legacy paths in production code.
 
-- the worker comfortably covers the 18-block retained window under a 15-second
-  block interval.
+15. `docs/security.md`
+    - Move scaffold caveats into an archived section when phases 1-7 are done.
 
-## Work Completed In This Pass
+## 5. Final Acceptance Checklist
 
-- Removed the legacy long-history target from the history accumulator bench
-  defaults.
-- Removed legacy long-history checks from `noid_recursive` size tests.
-- Clarified that `noid_recursive` multi-step recursive heads are not public
-  authority while they fail closed.
-- Clarified docs/security: public recursive path must be Poseidon2b-compatible.
-- Added `bench_prover --bench full_accepted_batch` for the full retained
-  `AcceptBlock` authority boundary.
-- Added saved valid PoW nonces for the deterministic full accepted batch bench.
-- Measured the 16-block no-user full accepted batch:
-  build 16.80 ms, prove 360.54 ms, verify 117.88 ms, proof 16.33 KiB.
-- Added `HistoryCheckpointProofV1` and fail-closed untrusted verifier skeleton
-  in `noid_recursive`.
-- Added `HistoryCheckpointHeadV1`, `HistoryCheckpointBatchSummaryV1`, and
-  `HistoryCheckpointStepStatementV1`.
-- Added Poseidon2b digests for checkpoint anchors, accumulators, consensus
-  state, batch summary, head, step relation, and step statement.
-- Added native checkpoint step verification.
-- Added the accepted-claim batch digest boundary: the fixed 16-slot,
-  440-field Poseidon2b schedule lives in `noid_recursive`, while `noid_block`
-  exposes a wrapper over full accepted batch output.
-- Added `AcceptedClaimBatchDigestProofV1`.
-- Added `AcceptedBlockCertificateStatementV1`, its Poseidon2b digest, native
-  verifier, and chain-claim projection.
-- Moved the data-only certificate statement/digest/projection into
-  `noid_recursive` and left `noid_block` as the full-`AcceptBlock` builder.
-- Added `AcceptedBlockCertificateProofV1`, fail-closed one-block proof
-  skeleton.
-- Added `AcceptedBlockCertificateBatchStatementV1`, fixed 16-slot certificate
-  batch statement, and `HistoryCheckpointStepProofV1`, fail-closed checkpoint
-  step proof skeleton.
-- Changed certificate statement and certificate-batch digests to fixed
-  no-padding Poseidon2b schedules that can be proven by
-  `FixedFieldHashProofKillShot`.
-- Added certificate statement digest proof and certificate-batch digest proof
-  components.
-- Added checkpoint step statement digest proof and included it in
-  `HistoryCheckpointStepBackendProofV1`.
-- Added `HistoryCheckpointStepBackendProofV1`; the untrusted checkpoint step
-  verifier now decodes backend bytes, verifies public step-statement and
-  certificate-batch digest proofs, and returns `BackendVerifierMissing`.
-- Wired `AcceptedClaimBatchDigestProofV1` into the checkpoint step backend as a
-  private component and added a native private-component verifier for benches.
-- Added a checkpoint-step prover helper that derives the certificate batch
-  statement from `AcceptedBlockCertificateStatementV1` values and their
-  projected accepted claims before building the bundled step proof.
-- Added `noid_recursive::block_certificate_backend`, a dependency-clean real
-  verifier for retained accepted-block components derived from existing
-  `BlockProof`/`BlockAuthSidecar`.
-- Rewired `noid_block::verify_full_accepted_block_batch_components` to call the
-  `noid_recursive` component verifier instead of a local verifier clone.
-- Added
-  `verify_history_checkpoint_step_proof_v1_private_block_components_native`
-  and `prove_history_checkpoint_step_proof_v1_from_block_components`, so a
-  checkpoint step can be proved and privately verified from real accepted-block
-  components rather than from accepted-claim-only data.
-- Added `noid_block` bridge helpers for checkpoint steps over retained full
-  accepted batch output/proofs.
-- Connected full accepted batches so each folded chain claim is derived from the
-  accepted block certificate statement.
-- Connected `noid_block::accepted_block_batch` output to
-  `HistoryCheckpointBatchSummaryV1`.
-- Updated the full accepted batch bench to build and verify the checkpoint step
-  statement over real bench fixtures.
-- Updated the full accepted batch bench to prove and verify-to-fail-closed the
-  bundled checkpoint-step component backend.
-- Updated the full accepted batch bench to prove and verify the accepted-claim
-  batch digest component.
-- Updated the full accepted batch bench to build checkpoint step proofs from
-  full accepted components, not from a prebuilt trusted certificate-batch
-  digest.
-- Extracted the history proof-core technology into `noid_ivc_core` and
-  `noid_ivc_prover`.
-- Made the new IVC proof-core boundary Poseidon2b-only: statement digests,
-  Merkle commitments, Fiat-Shamir grinding, and proof serialization no longer
-  expose the old comparator/hash-chain APIs.
-- Removed the old `r1cs_hashes`, `chain`, and `merkle_path` modules from
-  `noid_ivc_prover`.
-- Added small-outer fallback support in lincheck byte-stripe packing/folding so
-  fixed chunk-core relations with `m == k_log` can be proven without padding
-  the relation by dummy outer blocks.
-- Added `noid_recursive::checkpoint_ivc_backend`, proving and verifying a
-  fixed 16-slot checkpoint chunk core over boundary continuity, certificate
-  statement digests, accepted-claim digest witnesses, heights, state roots, and
-  block ids.
-- Added `noid_recursive --bench checkpoint_ivc` for the production-path
-  Poseidon2b checkpoint IVC chunk core.
-- Removed the deprecated history workbench crate after moving the relevant
-  proof-core measurement into `noid_recursive`.
-- Optimized checkpoint IVC chunk-core statement binding so the prover/verifier
-  hash a compact Poseidon2b statement digest instead of re-hashing sparse R1CS
-  matrices in the hot path.
-- Tuned the BaseFold PCS chunk-core profile to `pcs_log_inv_rate=4` and
-  `pcs_log_batch_size=5`, with explicit rate-aware query counts.
-- Bound PCS parameters into the IVC Fiat-Shamir transcript alongside the R1CS
-  statement digest and Merkle root.
-- Moved release R1CS self-checking behind debug builds or
-  `CHECKPOINT_IVC_ASSERT_R1CS=1`; normal release proving keeps native private
-  input validation and lets the proof system enforce the relation.
-- Current clean checkpoint IVC chunk-core bench:
-  fixture 4.71 ms, prove 46.98 ms, verify 52.32 ms, proof 97.59 KiB.
-- Current clean release bench:
-  16 no-user blocks prove 396.48 ms, verify 143.26 ms, checkpoint step from
-  full components prove 212.79 ms and private verify 156.28 ms;
-  1 user block prove 170.52 ms, verify 146.13 ms, checkpoint step from full
-  components prove 200.24 ms and private verify 134.42 ms.
-
-## Required Commands
-
-Use release/bench optimized mode only:
-
-```bash
-cargo test --workspace --release
-cargo test -p noid_recursive --release
-cargo test -p noid-ivc-core --release
-cargo test -p noid-ivc-prover --release
-cargo test -p noid_recursive --release checkpoint_ivc
-cargo test -p noid_block --release
-
-NOID_RECURSIVE_CHECKPOINT_IVC_SAMPLES=3 \
-  cargo bench -p noid_recursive --bench checkpoint_ivc -- --nocapture
-
-NOID_FULL_ACCEPTED_BATCH_SAMPLES=1 \
-NOID_FULL_ACCEPTED_BATCH_BLOCKS=16 \
-  cargo bench -p bench_prover --bench full_accepted_batch -- --nocapture
-
-NOID_HISTORY_ACCUM_NS=1,18 \
-NOID_HISTORY_ACCUM_SAMPLES=3 \
-  cargo bench -p bench_prover --bench history_accumulator_lite -- --nocapture
-
-```
-
-## Immediate Next Step
-
-Encode the real retained accepted-block component verifier in the public
-recursive/IVC backend and replace the checkpoint-step `BackendVerifierMissing`
-boundary:
-
-```text
-HistoryCheckpointStepProofV1
-  verifies previous recursive head/proof
-  verifies current step statement
-  proves verify_accepted_block_batch_components_v1 privately
-  exposes one constant public proof for the new head
-```
-
-Then chain those steps so the public network object proves:
-
-```text
-base head -> step_1 -> ... -> final checkpoint head
-```
+- Fresh node syncs by headers + O(1) checkpoint proof + state snapshot + 18
+  suffix blocks.
+- Verification time for history proof is independent of chain height.
+- Snapshot state bytes scale only with live state, not history.
+- Full block/proof/auth storage stays bounded to 18 blocks after coverage.
+- Snapshot serving is refused when checkpoint coverage is older than the
+  retained 18-block suffix.
+- Manifest candidate selection uses live peer-tip chainwork, not snapshot
+  chainwork.
+- Tampering any certificate, receipt, checkpoint step, recursive head, state
+  segment, reuse guard bucket, or suffix block fails deterministically.
+- Removing transaction bodies older than 18 does not prevent future checkpoint
+  proof serving.

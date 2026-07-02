@@ -42,7 +42,7 @@ pub struct RecursiveConsensusState {
     pub expansion_len: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderWitness {
     pub header: BlockHeader,
     pub pow_fields: PowHeaderFields,

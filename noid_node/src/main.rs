@@ -88,6 +88,19 @@ impl OrphanBlock {
     }
 }
 
+struct PrefetchedSnapshotBlock {
+    block: noid_chain::block::Block,
+    block_proof_bytes: Vec<u8>,
+    block_auth_sidecar_bytes: Vec<u8>,
+}
+
+type VerifiedSnapshotSegment = (
+    u16,
+    u8,
+    noid_chain::segmented_state::SegmentColumns,
+    [u8; 32],
+);
+
 mod config;
 mod wallet;
 use config::NodeConfig;
@@ -721,11 +734,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // --- Background local history cache updater ---
+    // --- Background checkpoint package worker ---
     let rec_chain = chain.clone();
-    let rec_p2p_cmd = p2p.cmd_tx.clone();
     tokio::spawn(async move {
-        run_history_proof_updater(rec_chain, rec_p2p_cmd).await;
+        run_checkpoint_package_worker(rec_chain).await;
     });
 
     // --- Startup Banner ---
@@ -756,14 +768,12 @@ async fn main() -> anyhow::Result<()> {
         let mat_segs = ctx.state.state.active_segment_ids().count();
         let reward = block_reward(log_slots) as f64 / 1_000_000.0;
 
-        // Get local finalized-history cache height from store.
-        let rec_h = ctx
+        let checkpoint_proof_height = ctx
             .store
-            .get_local_history_cache()
+            .get_checkpoint_coverage()
             .ok()
             .flatten()
-            .and_then(|b| bincode::deserialize::<noid_recursive::LocalHistoryCache>(&b).ok())
-            .map(|p| p.block_height);
+            .and_then(|coverage| coverage.history_proof_covered_to);
         drop(ctx);
 
         let p2p_display = listen_addr
@@ -784,7 +794,7 @@ async fn main() -> anyhow::Result<()> {
             mat_segs,
             num_segs,
             reward,
-            rec_h,
+            checkpoint_proof_height,
             wallet_bech32.as_deref(),
             cfg.mining.enabled,
             miner_bech32.as_deref(),
@@ -1023,7 +1033,7 @@ fn verify_snapshot_history_proof_headers_anchored(
         .ok_or_else(|| format!("snapshot header anchor missing h={}", manifest.tip_height))?;
     let tip_hash = noid_chain::hash_block_header(&tip_header);
     if tip_hash != manifest.tip_hash {
-        return Err("snapshot manifest tip hash does not match local canonical header".into());
+        return Err("snapshot manifest boundary hash does not match local canonical header".into());
     }
     if tip_header.log_slots != manifest.log_slots {
         return Err("snapshot manifest log_slots does not match local canonical header".into());
@@ -1043,40 +1053,51 @@ fn verify_snapshot_history_proof_headers_anchored(
     if local_chainwork != manifest.cumulative_chainwork {
         return Err("snapshot manifest chainwork does not match local canonical headers".into());
     }
+    if noid_chain::work_gt(
+        &noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK,
+        &local_chainwork,
+    ) {
+        return Err("snapshot chainwork below minimum snapshot work floor".into());
+    }
 
     if proof_bytes.is_empty() {
-        return Err("snapshot HistoryProof missing".into());
+        return Err("snapshot checkpoint proof missing".into());
     }
-    let proof: noid_recursive::HistoryProof = bincode::deserialize(proof_bytes)
-        .map_err(|e| format!("snapshot HistoryProof decode failed: {e}"))?;
-    if proof.end_anchor.height != manifest.tip_height {
-        return Err("snapshot HistoryProof tip height does not match manifest".into());
+    let proof: noid_recursive::HistoryCheckpointProofV1 = bincode::deserialize(proof_bytes)
+        .map_err(|e| format!("snapshot checkpoint proof decode failed: {e}"))?;
+    if proof.version != noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION {
+        return Err("snapshot checkpoint proof version mismatch".into());
+    }
+    if proof.engine_id != noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1 {
+        return Err("snapshot checkpoint proof engine mismatch".into());
+    }
+    if proof.checkpoint_height != manifest.tip_height
+        || proof.end_anchor.height != manifest.tip_height
+    {
+        return Err("snapshot checkpoint proof height does not match manifest".into());
     }
 
-    let local_start_anchor = compute_local_header_anchor(store, proof.start_anchor.height)?;
-    let local_end_anchor = compute_local_header_anchor(store, proof.end_anchor.height)?;
-    noid_recursive::verify_history_proof_untrusted(&proof, &local_start_anchor, &local_end_anchor)
-        .map_err(|e| format!("snapshot HistoryProof rejected: {e}"))
+    let local_start_anchor =
+        read_local_header_anchor(store, proof.start_anchor.height, "checkpoint start")?;
+    let local_end_anchor =
+        read_local_header_anchor(store, proof.end_anchor.height, "checkpoint end")?;
+    noid_recursive::verify_history_checkpoint_proof_v1_checkpoint(
+        &proof,
+        &local_start_anchor,
+        &local_end_anchor,
+    )
+    .map_err(|e| format!("snapshot checkpoint proof rejected: {e}"))
 }
 
-fn compute_local_header_anchor(
+fn read_local_header_anchor(
     store: &noid_chain::storage::MdbxStore,
     height: u64,
+    label: &str,
 ) -> Result<noid_chain::HeaderChainAnchor, String> {
-    let mut headers = Vec::with_capacity(height.saturating_add(1) as usize);
-    for h in 0..=height {
-        let header = store
-            .get_header(h)
-            .map_err(|e| format!("snapshot header anchor read h={h} failed: {e}"))?
-            .ok_or_else(|| format!("snapshot header anchor missing h={h}"))?;
-        headers.push(header);
-    }
-    let chainwork = store
-        .get_chain_work(height)
-        .map_err(|e| format!("snapshot chainwork read h={height} failed: {e}"))?
-        .ok_or_else(|| format!("snapshot chainwork missing h={height}"))?;
-    noid_chain::compute_header_chain_anchor(headers.iter(), chainwork)
-        .map_err(|e| format!("snapshot header anchor compute failed: {e}"))
+    store
+        .get_header_anchor(height)
+        .map_err(|e| format!("snapshot {label} header anchor read h={height} failed: {e}"))?
+        .ok_or_else(|| format!("snapshot {label} header anchor missing h={height}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,12 +1116,44 @@ fn history_claim_fields_bytes(
     Ok(bincode::serialize(&fields).expect("history claim fields serialize"))
 }
 
-fn map_history_claim_error(
+#[allow(clippy::too_many_arguments)]
+fn accepted_block_certificate_record_bytes(
+    block: &noid_chain::block::Block,
+    parent: &noid_chain::BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &noid_chain::consensus::validation::AnchorInfo,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
+) -> Result<Vec<u8>, noid_block::FullValidationError> {
+    let statement = noid_block::accepted_block_certificate_statement_v1(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        artifacts,
+    )?;
+    let record = noid_block::accepted_block_certificate_record_hash_only_scaffold(statement)
+        .map_err(|e| {
+            noid_block::FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                    "accepted-block certificate record build failed: {e}"
+                )),
+            )
+        })?;
+    Ok(bincode::serialize(&record).expect("AcceptedBlockCertificateRecord serializes"))
+}
+
+fn map_acceptance_artifact_error(
     error: noid_block::FullValidationError,
 ) -> noid_chain::storage::MdbxContextError {
     noid_chain::storage::MdbxContextError::Consensus(
         noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-            "history claim derivation failed: {error}"
+            "acceptance artifact derivation failed: {error}"
         )),
     )
 }
@@ -1121,20 +1174,36 @@ async fn apply_p2p_block_offthread(
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
         let block_height = block.header.height;
-        let mut history_claim_bytes = if block.transactions.iter().all(|tx| tx.body.is_coinbase) {
+        let is_coinbase_only = block.transactions.iter().all(|tx| tx.body.is_coinbase);
+        let (mut history_claim_bytes, mut certificate_record_bytes) = if is_coinbase_only {
             let parent = *ctx.tip_header();
-            let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
-                &block,
-                &parent,
-                &ctx.state,
-            )
-            .map_err(map_history_claim_error)?;
-            Some(
-                history_claim_fields_bytes(&block, &parent, &artifacts)
-                    .map_err(map_history_claim_error)?,
+            let prev_timestamps = ctx.prev_timestamps();
+            let prev_active_counts = ctx.prev_active_counts();
+            let anchor = ctx.anchor_info();
+            let artifacts =
+                noid_block::derive_no_user_tx_validation_artifacts(&block, &parent, &ctx.state)
+                    .map_err(map_acceptance_artifact_error)?;
+            (
+                Some(
+                    history_claim_fields_bytes(&block, &parent, &artifacts)
+                        .map_err(map_acceptance_artifact_error)?,
+                ),
+                Some(
+                    accepted_block_certificate_record_bytes(
+                        &block,
+                        &parent,
+                        &prev_timestamps,
+                        &prev_active_counts,
+                        &anchor,
+                        &block_proof_bytes,
+                        &block_auth_sidecar_bytes,
+                        &artifacts,
+                    )
+                    .map_err(map_acceptance_artifact_error)?,
+                ),
             )
         } else {
-            None
+            (None, None)
         };
         let hash = ctx.apply_next_block(
             &block,
@@ -1168,6 +1237,16 @@ async fn apply_p2p_block_offthread(
                     parent,
                     &output.artifacts,
                 )?);
+                certificate_record_bytes = Some(accepted_block_certificate_record_bytes(
+                    block,
+                    parent,
+                    prev_timestamps,
+                    prev_active_counts,
+                    anchor,
+                    proof_bytes,
+                    auth_sidecar_bytes,
+                    &output.artifacts,
+                )?);
                 Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
             },
         )?;
@@ -1175,6 +1254,19 @@ async fn apply_p2p_block_offthread(
             if let Err(e) = ctx.store.put_history_claim(block_height, bytes) {
                 tracing::warn!(height = block_height, err = %e, "failed to store history claim fields");
             }
+        }
+        if let Some(bytes) = &certificate_record_bytes {
+            if let Err(e) = ctx
+                .store
+                .put_accepted_block_certificate(block_height, bytes)
+            {
+                tracing::warn!(height = block_height, err = %e, "failed to store accepted-block certificate record");
+            }
+        } else {
+            tracing::warn!(
+                height = block_height,
+                "accepted block committed without certificate record bytes"
+            );
         }
         if !block_proof_bytes.is_empty() {
             if let Err(e) = ctx.store.put_block_proof(block_height, &block_proof_bytes) {
@@ -1250,20 +1342,38 @@ async fn apply_reorg_offthread(
                             ),
                         )
                     })?;
-                let mut history_claim_bytes =
-                    if block.transactions.iter().all(|tx| tx.body.is_coinbase) {
-                        let parent = *ctx.tip_header();
-                        let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
-                            block, &parent, &ctx.state,
-                        )
-                        .map_err(map_history_claim_error)?;
+                let is_coinbase_only = block.transactions.iter().all(|tx| tx.body.is_coinbase);
+                let (mut history_claim_bytes, mut certificate_record_bytes) = if is_coinbase_only {
+                    let parent = *ctx.tip_header();
+                    let prev_timestamps = ctx.prev_timestamps();
+                    let prev_active_counts = ctx.prev_active_counts();
+                    let anchor = ctx.anchor_info();
+                    let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
+                        block, &parent, &ctx.state,
+                    )
+                    .map_err(map_acceptance_artifact_error)?;
+                    (
                         Some(
                             history_claim_fields_bytes(block, &parent, &artifacts)
-                                .map_err(map_history_claim_error)?,
-                        )
-                    } else {
-                        None
-                    };
+                                .map_err(map_acceptance_artifact_error)?,
+                        ),
+                        Some(
+                            accepted_block_certificate_record_bytes(
+                                block,
+                                &parent,
+                                &prev_timestamps,
+                                &prev_active_counts,
+                                &anchor,
+                                proof_bytes,
+                                auth_sidecar_bytes,
+                                &artifacts,
+                            )
+                            .map_err(map_acceptance_artifact_error)?,
+                        ),
+                    )
+                } else {
+                    (None, None)
+                };
                 ctx.apply_next_block(
                     block,
                     proof_bytes,
@@ -1296,6 +1406,16 @@ async fn apply_reorg_offthread(
                             parent,
                             &output.artifacts,
                         )?);
+                        certificate_record_bytes = Some(accepted_block_certificate_record_bytes(
+                            block,
+                            parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            anchor,
+                            proof_bytes,
+                            auth_sidecar_bytes,
+                            &output.artifacts,
+                        )?);
                         Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
                     },
                 )?;
@@ -1307,6 +1427,23 @@ async fn apply_reorg_offthread(
                             "failed to store reorg history claim fields"
                         );
                     }
+                }
+                if let Some(bytes) = &certificate_record_bytes {
+                    if let Err(e) = ctx
+                        .store
+                        .put_accepted_block_certificate(block.header.height, bytes)
+                    {
+                        tracing::warn!(
+                            height = block.header.height,
+                            err = %e,
+                            "failed to store reorg accepted-block certificate record"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        height = block.header.height,
+                        "reorg block committed without certificate record bytes"
+                    );
                 }
                 Ok(())
             },
@@ -1473,38 +1610,95 @@ mod tests {
         assert!(
             verify_snapshot_history_proof_headers_anchored(&manifest, &[], &store)
                 .expect_err("missing proof must reject")
-                .contains("HistoryProof missing")
+                .contains("checkpoint proof missing")
         );
 
-        let end_anchor =
-            noid_chain::compute_header_chain_anchor([h0, h1].iter(), h1_work).expect("anchor");
-        let start_accumulator = noid_recursive::ChainAccumulator {
-            height: end_anchor.height,
-            state_root: end_anchor.state_root,
-            chain_hash: [0x11; 32],
+        let checkpoint_start_anchor = store
+            .get_header_anchor(0)
+            .expect("read genesis anchor")
+            .expect("genesis anchor stored");
+        let checkpoint_end_anchor = store
+            .get_header_anchor(1)
+            .expect("read h1 anchor")
+            .expect("h1 anchor stored");
+        let checkpoint_start_accumulator =
+            noid_recursive::genesis_accumulator(h0.state_root, h0_hash);
+        let checkpoint_end_accumulator = noid_recursive::ChainAccumulator {
+            height: checkpoint_end_anchor.height,
+            state_root: checkpoint_end_anchor.state_root,
+            chain_hash: [0x55; 32],
         };
-        let native_proof = noid_recursive::prove_history_native(
-            end_anchor.clone(),
-            end_anchor,
-            start_accumulator,
-            &noid_recursive::HistoryProofWitness { items: vec![] },
+        let checkpoint_consensus = noid_recursive::RecursiveConsensusState::from_header(
+            &h1,
+            h1_work,
+            0,
+            h0.timestamp,
+            h0.difficulty_target,
+            &[h0.timestamp],
+            &[h0.active_slot_count],
+        );
+        let checkpoint_head = noid_recursive::history_checkpoint_head_from_boundary_v1(
+            &checkpoint_end_anchor,
+            &checkpoint_end_accumulator,
+            &checkpoint_consensus,
         )
-        .expect("native history proof");
-        let native_proof_bytes = bincode::serialize(&native_proof).expect("serialize proof");
+        .expect("checkpoint head builds");
+        let checkpoint_payload = noid_recursive::HistoryCheckpointRecursivePayloadV1 {
+            version: noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION,
+            engine_id: noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
+            head: checkpoint_head,
+            backend_proof: vec![0xA5; 32],
+        };
+        let checkpoint_proof = noid_recursive::HistoryCheckpointProofV1 {
+            version: noid_recursive::HISTORY_CHECKPOINT_PROOF_VERSION,
+            engine_id: noid_recursive::HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC_V1,
+            checkpoint_height: checkpoint_end_anchor.height,
+            start_anchor: checkpoint_start_anchor,
+            end_anchor: checkpoint_end_anchor,
+            start_accumulator: checkpoint_start_accumulator,
+            end_accumulator: checkpoint_end_accumulator,
+            recursive_proof: noid_recursive::encode_history_checkpoint_recursive_payload_v1(
+                &checkpoint_payload,
+            ),
+        };
+        let checkpoint_proof_bytes =
+            bincode::serialize(&checkpoint_proof).expect("serialize checkpoint proof");
+        verify_snapshot_history_proof_headers_anchored(&manifest, &checkpoint_proof_bytes, &store)
+            .expect("checkpoint scaffold proof verifies");
+
+        let mut tampered_projection = checkpoint_proof.clone();
+        tampered_projection.end_anchor.projection_root[0] ^= 0x01;
+        let tampered_projection_bytes =
+            bincode::serialize(&tampered_projection).expect("serialize tampered proof");
         assert!(verify_snapshot_history_proof_headers_anchored(
             &manifest,
-            &native_proof_bytes,
+            &tampered_projection_bytes,
             &store,
         )
-        .expect_err("native fold proof is not trustless")
-        .contains("not trustless"));
+        .expect_err("proof-supplied projection root must not be trusted")
+        .contains("end anchor mismatch"));
 
-        let mut bad = manifest;
+        let mut bad = manifest.clone();
         bad.cumulative_chainwork = [3u8; 32];
         assert!(
             verify_snapshot_history_proof_headers_anchored(&bad, &[], &store)
                 .expect_err("bad chainwork must reject")
                 .contains("chainwork")
+        );
+
+        let mut low_work = [0u8; 32];
+        low_work[0] = 1;
+        store
+            .put_verified_header_only(&h1, &h1_hash, &low_work)
+            .expect("overwrite h1 low chainwork");
+        let low_work_manifest = noid_p2p::protocol::GetStateManifestResponse {
+            cumulative_chainwork: low_work,
+            ..manifest
+        };
+        assert!(
+            verify_snapshot_history_proof_headers_anchored(&low_work_manifest, &[], &store)
+                .expect_err("below minimum snapshot work must reject")
+                .contains("minimum snapshot work")
         );
     }
 
@@ -1558,7 +1752,8 @@ async fn handle_p2p_events(
     //
     // Snapshot sync:
     //   (1) receive immutable checkpoint snapshot manifest
-    //   (2) verify HistoryProof for the manifest tip before segment download
+    //   (2) verify the O(1) history/checkpoint scaffold for the manifest boundary
+    //       before segment download
     // --- Segmented state sync state ---
     //
     // Sync flow:
@@ -1575,6 +1770,7 @@ async fn handle_p2p_events(
     struct PendingManifest {
         from: libp2p::PeerId,
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+        prefetched_suffix: Vec<PrefetchedSnapshotBlock>,
     }
     struct PendingSnapshotHeaderSync {
         from: libp2p::PeerId,
@@ -1582,8 +1778,16 @@ async fn handle_p2p_events(
         next_height: u64,
         target_height: u64,
     }
+    struct PendingSnapshotSuffix {
+        from: libp2p::PeerId,
+        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+        next_height: u64,
+        end_height: u64,
+        blocks: Vec<PrefetchedSnapshotBlock>,
+    }
     let mut pending_manifest: Option<PendingManifest> = None;
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
+    let mut pending_snapshot_suffix: Option<PendingSnapshotSuffix> = None;
     let mut manifest_candidates: Vec<(
         libp2p::PeerId,
         Box<noid_p2p::protocol::GetStateManifestResponse>,
@@ -1591,8 +1795,8 @@ async fn handle_p2p_events(
     // Tracks peers already asked; cleared on failure so recovery is automatic.
     let mut manifest_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
-    // Tracks peers for forced snapshot attempts. Tip probes may still downgrade
-    // to recent block replay when peer_tip - our_tip is small.
+    // Tracks peers for forced snapshot attempts. Manifest V1 advertises the
+    // snapshot boundary, so non-empty responses stay on the snapshot path.
     let mut manifest_force_snapshot_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Count of manifest responses received (including tip=0 "no state" replies).
@@ -1622,6 +1826,7 @@ async fn handle_p2p_events(
         () => {{
             pending_manifest = None;
             pending_snapshot_header_sync = None;
+            pending_snapshot_suffix = None;
             manifest_candidates.clear();
             manifest_requested_peers.clear();
             manifest_force_snapshot_peers.clear();
@@ -1771,6 +1976,7 @@ async fn handle_p2p_events(
                     );
                     if pending_manifest.is_none()
                         && pending_snapshot_header_sync.is_none()
+                        && pending_snapshot_suffix.is_none()
                         && pending_segment_ids.is_empty()
                         && segment_queue.is_empty()
                         && manifest_requested_peers.insert(from)
@@ -1864,6 +2070,125 @@ async fn handle_p2p_events(
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
             }) => {
+                if pending_snapshot_suffix.is_some() {
+                    let Some(pending) = pending_snapshot_suffix.as_mut() else {
+                        unreachable!();
+                    };
+                    if pending.from != from {
+                        tracing::debug!(
+                            peer = %from,
+                            expected_peer = %pending.from,
+                            "dropping block while snapshot suffix prefetch is active"
+                        );
+                        continue;
+                    }
+                    let block = match noid_chain::block::Block::from_bytes(&block_bytes) {
+                        Ok(block) => block,
+                        Err(e) => {
+                            tracing::warn!(peer = %from, err = ?e, "snapshot suffix block decode failed");
+                            reset_sync_state!();
+                            continue;
+                        }
+                    };
+                    let expected_height = pending.next_height;
+                    if block.header.height != expected_height {
+                        tracing::warn!(
+                            peer = %from,
+                            expected_height,
+                            got_height = block.header.height,
+                            "snapshot suffix block height mismatch"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                    let expected_prev_hash = pending
+                        .blocks
+                        .last()
+                        .map(|item| noid_chain::consensus::pow::block_id(&item.block.header))
+                        .unwrap_or(pending.manifest.tip_hash);
+                    if block.header.prev_block_hash != expected_prev_hash {
+                        tracing::warn!(
+                            peer = %from,
+                            height = block.header.height,
+                            "snapshot suffix block does not extend snapshot/prefetched suffix"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                    if let Err(e) = validate_p2p_block_proof_binding(
+                        &block,
+                        &block_proof_bytes,
+                        &block_auth_sidecar_bytes,
+                    ) {
+                        tracing::warn!(
+                            peer = %from,
+                            height = block.header.height,
+                            err = %e,
+                            "snapshot suffix block proof/header binding invalid"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                    pending.blocks.push(PrefetchedSnapshotBlock {
+                        block,
+                        block_proof_bytes,
+                        block_auth_sidecar_bytes,
+                    });
+                    if expected_height < pending.end_height {
+                        pending.next_height = expected_height + 1;
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestBlock {
+                                peer: from,
+                                height: pending.next_height,
+                            })
+                            .await;
+                    } else {
+                        let pending = pending_snapshot_suffix
+                            .take()
+                            .expect("suffix prefetch exists");
+                        tracing::info!(
+                            from = %from,
+                            snapshot_height = pending.manifest.tip_height,
+                            suffix_end = pending.end_height,
+                            suffix_blocks = pending.blocks.len(),
+                            "snapshot suffix prefetched — starting segment download"
+                        );
+                        queue_snapshot_segment_download(
+                            &p2p_cmd,
+                            from,
+                            &pending.manifest,
+                            &mut pending_segment_ids,
+                            &mut segment_queue,
+                        )
+                        .await;
+                        pending_manifest = Some(PendingManifest {
+                            from,
+                            manifest: pending.manifest,
+                            prefetched_suffix: pending.blocks,
+                        });
+                        if pending_segment_ids.is_empty() && segment_queue.is_empty() {
+                            let pending = pending_manifest.take().unwrap();
+                            if let Err(e) = apply_verified_snapshot_with_suffix(
+                                &chain,
+                                &mempool,
+                                &wallet,
+                                &sync_ready,
+                                &p2p_cmd,
+                                from,
+                                *pending.manifest,
+                                Vec::new(),
+                                pending.prefetched_suffix,
+                            )
+                            .await
+                            {
+                                tracing::error!(err = %e, "failed to apply empty snapshot after suffix prefetch");
+                                reset_sync_state!();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
                 {
@@ -1956,8 +2281,8 @@ async fn handle_p2p_events(
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
 
-                                // Store the BlockProof bytes so run_history_proof_updater
-                                // can build a real (non-null) recursive witness for this block.
+                                // Store proof bytes so the checkpoint package worker can build
+                                // the retained full-block batch before pruning.
                                 if !block_proof_bytes.is_empty() {
                                     let ctx = chain.read().await;
                                     if let Err(e) =
@@ -2198,6 +2523,7 @@ async fn handle_p2p_events(
                                                     );
                                                     if pending_manifest.is_none()
                                                         && pending_snapshot_header_sync.is_none()
+                                                        && pending_snapshot_suffix.is_none()
                                                         && pending_segment_ids.is_empty()
                                                         && segment_queue.is_empty()
                                                     {
@@ -2269,6 +2595,7 @@ async fn handle_p2p_events(
                                             );
                                             if pending_manifest.is_none()
                                                 && pending_snapshot_header_sync.is_none()
+                                                && pending_snapshot_suffix.is_none()
                                                 && pending_segment_ids.is_empty()
                                                 && segment_queue.is_empty()
                                                 && manifest_requested_peers.insert(from)
@@ -2332,6 +2659,68 @@ async fn handle_p2p_events(
                     Err(e) => {
                         tracing::warn!(peer = %from, err = ?e, "P2P block decode failed");
                     }
+                }
+            }
+            Ok(NetworkEvent::RecentBlockUnavailable { from, height }) => {
+                if let Some(pending) = pending_snapshot_suffix.as_ref() {
+                    if pending.from == from && pending.next_height == height {
+                        let requester_height = chain.read().await.tip_height();
+                        tracing::warn!(
+                            peer = %from,
+                            requested_height = height,
+                            requester_height,
+                            "snapshot suffix block unavailable — requesting fresh manifest"
+                        );
+                        reset_sync_state!();
+                        manifest_requested_peers.insert(from);
+                        manifest_force_snapshot_peers.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height,
+                            })
+                            .await;
+                        continue;
+                    }
+                }
+                let our_tip = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                if height == our_tip.saturating_add(1) {
+                    tracing::info!(
+                        peer = %from,
+                        requested_height = height,
+                        our_tip,
+                        "next retained block unavailable — requesting fresh snapshot manifest"
+                    );
+                    if pending_manifest.is_none()
+                        && pending_snapshot_header_sync.is_none()
+                        && pending_snapshot_suffix.is_none()
+                        && pending_segment_ids.is_empty()
+                        && segment_queue.is_empty()
+                    {
+                        manifest_candidates.clear();
+                        manifest_requested_peers.clear();
+                        manifest_force_snapshot_peers.clear();
+                        manifest_response_count = 0;
+                        manifest_first_candidate_at = None;
+                        manifest_requested_peers.insert(from);
+                        manifest_force_snapshot_peers.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height: our_tip,
+                            })
+                            .await;
+                    }
+                } else {
+                    tracing::debug!(
+                        peer = %from,
+                        requested_height = height,
+                        our_tip,
+                        "non-next retained block unavailable"
+                    );
                 }
             }
             Ok(NetworkEvent::MempoolSyncResponse { from, txs }) => {
@@ -2469,13 +2858,11 @@ async fn handle_p2p_events(
                             .ok();
                     }
                 } else {
-                    // Already have persisted state. First ask for a tiny manifest
-                    // as a peer-tip probe; the StateManifest handler chooses the
-                    // correct sync path from the measured gap:
-                    //   gap <= CONSENSUS_FINALITY_DEPTH  -> recent block replay;
-                    //   gap >  CONSENSUS_FINALITY_DEPTH  -> proof-verified state snapshot.
-                    // This prevents stale nodes from blindly replaying a near-pruned
-                    // window before discovering they needed snapshot sync.
+                    // Already have persisted state. Manifest V1 is a snapshot
+                    // boundary probe, not a live peer-tip probe: non-empty means
+                    // the peer can serve an O(1) snapshot at finalized F. Recent
+                    // gaps still use block/header announcements and retained
+                    // full-block replay.
                     p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestStateManifest {
                             peer,
@@ -2485,7 +2872,7 @@ async fn handle_p2p_events(
                         .ok();
                     tracing::debug!(
                         requester_height = our_height,
-                        "triggered manifest tip probe for persisted-state sync"
+                        "triggered manifest snapshot-boundary probe for persisted-state sync"
                     );
                 }
 
@@ -2554,6 +2941,7 @@ async fn handle_p2p_events(
                         pending_manifest = Some(PendingManifest {
                             from,
                             manifest: sync.manifest,
+                            prefetched_suffix: Vec::new(),
                         });
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: from })
@@ -2675,6 +3063,7 @@ async fn handle_p2p_events(
                             *depth = 0; // reset for next time
                             if pending_manifest.is_none()
                                 && pending_snapshot_header_sync.is_none()
+                                && pending_snapshot_suffix.is_none()
                                 && pending_segment_ids.is_empty()
                                 && segment_queue.is_empty()
                                 && manifest_requested_peers.insert(from)
@@ -2791,42 +3180,24 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         ctx.tip_height()
                     };
-                    if manifest.tip_height <= our_height && !force_snapshot {
+                    if manifest.tip_height <= our_height {
                         tracing::debug!(
                             from = %from,
                             our_height,
-                            peer_tip = manifest.tip_height,
-                            "manifest tip probe not ahead"
+                            snapshot_height = manifest.tip_height,
+                            "manifest snapshot boundary not ahead"
                         );
                         continue;
                     }
 
-                    let gap = manifest.tip_height.saturating_sub(our_height);
-                    if !force_snapshot && gap <= CONSENSUS_FINALITY_DEPTH {
-                        tracing::info!(
-                            from = %from,
-                            our_height,
-                            peer_tip = manifest.tip_height,
-                            gap,
-                            "manifest tip within finality — requesting recent blocks"
-                        );
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                peer: from,
-                                from_height: our_height + 1,
-                                count: gap as u16,
-                            })
-                            .await;
-                        continue;
-                    }
-
+                    let snapshot_gap = manifest.tip_height.saturating_sub(our_height);
                     tracing::info!(
                         from = %from,
                         our_height,
-                        peer_tip = manifest.tip_height,
-                        gap,
+                        snapshot_height = manifest.tip_height,
+                        snapshot_gap,
                         force_snapshot,
-                        "manifest tip beyond finality — queueing snapshot candidate"
+                        "manifest snapshot boundary ahead — queueing snapshot candidate"
                     );
                 }
 
@@ -2880,6 +3251,7 @@ async fn handle_p2p_events(
                         pending_manifest = Some(PendingManifest {
                             from: best_peer,
                             manifest: best_manifest,
+                            prefetched_suffix: Vec::new(),
                         });
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryProof {
@@ -3052,111 +3424,40 @@ async fn handle_p2p_events(
                     }
 
                     // All segments received: assemble + apply snapshot.
-                    if pending_segment_ids.is_empty() && segment_queue.is_empty() && !collected_segments.is_empty() {
+                    if pending_segment_ids.is_empty()
+                        && segment_queue.is_empty()
+                        && !collected_segments.is_empty()
+                    {
                         if let Some(pending) = pending_manifest.take() {
-                            let m = pending.manifest;
-                            let segments: Vec<(
-                                u16,
-                                u8,
-                                noid_chain::segmented_state::SegmentColumns,
-                                [u8; 32],
-                            )> = {
+                            let segments: Vec<VerifiedSnapshotSegment> = {
                                 let decoded: Vec<_> = collected_segments
                                     .drain()
-                                    .map(|(seg_id, (eff_log, cols, root))| (seg_id, eff_log, cols, root))
+                                    .map(|(seg_id, (eff_log, cols, root))| {
+                                        (seg_id, eff_log, cols, root)
+                                    })
                                     .collect();
                                 decoded
                             };
                             tracing::info!(
                                 segments = segments.len(),
-                                tip = m.tip_height,
+                                tip = pending.manifest.tip_height,
                                 "snapshot: all segments received, writing to MDBX…"
                             );
-                            let result = {
-                                let mut ctx = chain.write().await;
-                                    let r = ctx.apply_state_snapshot(
-                                        m.tip_height,
-                                        m.tip_hash,
-                                        m.log_slots,
-                                        m.active_slot_count,
-                                        m.alloc_counter,
-                                        segments,
-                                        &m.recent_headers,
-                                        &m.reuse_guard_buckets,
-                                    );
-                                r.map(|_| {
-                                    let view = ChainView::from_mdbx(&ctx);
-                                    let height = ctx.tip_height();
-                                    (height, view)
-                                })
-                            };
-                            match result {
-                                Ok((new_height, new_view)) => {
-                                    mempool.on_new_block(&[], new_height, new_view).await;
-                                    sync_ready.notify_one();
-                                    tracing::info!(height = new_height, "snapshot: fully applied");
-                                    tracing::info!(
-                                        height = new_height,
-                                        "chain snapshot applied — mining can begin"
-                                    );
-                                    // Trigger wallet scan in background after snapshot sync.
-                                    // UTXOs created before the snapshot are not tracked by
-                                    // incremental block updates, so a full scan is needed.
-                                    {
-                                        let wallet_snap = wallet.clone();
-                                        let chain_snap = chain.clone();
-                                        tokio::spawn(async move {
-                                            let ctx = chain_snap.read().await;
-                                            let height = ctx.tip_height();
-                                            let (master, hint_next_index) = {
-                                                let guard = wallet_snap.lock().unwrap();
-                                                match guard.as_ref() {
-                                                    None => return,
-                                                    Some(w) => (w.secret_clone(), w.next_index),
-                                                }
-                                            };
-                                            let (utxos, known_addresses, next_index) =
-                                                wallet::scanner::scan_state_for_utxos(
-                                                    &ctx.state.state,
-                                                    &master,
-                                                    height,
-                                                    hint_next_index,
-                                                );
-                                            drop(ctx);
-                                            let found = utxos.len();
-                                            let balance: u64 =
-                                                utxos.iter().map(|u| u.value).sum();
-                                            {
-                                                let mut guard = wallet_snap.lock().unwrap();
-                                                if let Some(w) = guard.as_mut() {
-                                                    w.apply_scan_results(
-                                                        utxos,
-                                                        known_addresses,
-                                                        next_index,
-                                                    );
-                                                }
-                                            }
-                                            tracing::info!(
-                                                height,
-                                                utxos = found,
-                                                balance_micronoid = balance,
-                                                "wallet: auto-scan complete after snapshot sync"
-                                            );
-                                        });
-                                    }
-                                    let _ = p2p_cmd
-                                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                            peer: from,
-                                            from_height: new_height + 1,
-                                            count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
-                                                as u16,
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    tracing::error!(err = ?e, "failed to apply verified state snapshot");
-                                    reset_sync_state!();
-                                }
+                            if let Err(e) = apply_verified_snapshot_with_suffix(
+                                &chain,
+                                &mempool,
+                                &wallet,
+                                &sync_ready,
+                                &p2p_cmd,
+                                from,
+                                *pending.manifest,
+                                segments,
+                                pending.prefetched_suffix,
+                            )
+                            .await
+                            {
+                                tracing::error!(err = %e, "failed to apply verified state snapshot");
+                                reset_sync_state!();
                             }
                         }
                     }
@@ -3166,16 +3467,20 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::HistoryProof {
                 from,
                 proof_bytes,
-                tip_header_bytes: _, // tip header from peer; we use recent_headers from snapshot
+                tip_header_bytes,
             }) => {
-                // SECURITY: HistoryProof verification before applying an
-                // immutable checkpoint snapshot. The verifier below is fail-closed
-                // until the proof proves the full accepted-block relation.
+                // O(1) checkpoint scaffold verification before applying an
+                // immutable snapshot. Header consensus is checked natively from
+                // stored headers; this proof binds execution/state roots to that
+                // header boundary while backend subrelations are filled in.
 
                 // If segment collection is already in progress (pending_segment_ids non-empty),
                 // a second HistoryProof event would corrupt the active session.
                 // Ignore it to protect the in-flight segment download.
-                if !pending_segment_ids.is_empty() || !segment_queue.is_empty() {
+                if !pending_segment_ids.is_empty()
+                    || !segment_queue.is_empty()
+                    || pending_snapshot_suffix.is_some()
+                {
                     tracing::debug!(
                         from = %from,
                         "ignoring history proof — segment collection already in progress"
@@ -3249,138 +3554,127 @@ async fn handle_p2p_events(
 
                     match verify_result {
                         Ok(()) => {
+                            let peer_tip_height = if tip_header_bytes.is_empty() {
+                                snap.manifest.tip_height
+                            } else {
+                                match noid_chain::block_header::BlockHeader::from_bytes(
+                                    &tip_header_bytes,
+                                ) {
+                                    Ok(header) => header.height,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            from = %from,
+                                            err = ?e,
+                                            "snapshot proof response carried bad peer tip header"
+                                        );
+                                        reset_sync_state!();
+                                        continue;
+                                    }
+                                }
+                            };
+                            if peer_tip_height < snap.manifest.tip_height {
+                                tracing::warn!(
+                                    from = %from,
+                                    snapshot_height = snap.manifest.tip_height,
+                                    peer_tip_height,
+                                    "snapshot proof peer tip is behind manifest boundary"
+                                );
+                                reset_sync_state!();
+                                continue;
+                            }
+                            let suffix_len = peer_tip_height - snap.manifest.tip_height;
+                            if suffix_len
+                                > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+                            {
+                                let requester_height = chain.read().await.tip_height();
+                                tracing::warn!(
+                                    from = %from,
+                                    snapshot_height = snap.manifest.tip_height,
+                                    peer_tip_height,
+                                    suffix_len,
+                                    retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+                                    "snapshot suffix exceeds retained window — requesting fresh manifest"
+                                );
+                                reset_sync_state!();
+                                manifest_requested_peers.insert(from);
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                        peer: from,
+                                        requester_height,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            if suffix_len > 0 {
+                                let first_suffix_height = snap.manifest.tip_height + 1;
+                                tracing::info!(
+                                    from = %from,
+                                    snapshot_height = snap.manifest.tip_height,
+                                    peer_tip_height,
+                                    suffix_len,
+                                    "snapshot manifest accepted — prefetching retained suffix before segments"
+                                );
+                                pending_snapshot_suffix = Some(PendingSnapshotSuffix {
+                                    from,
+                                    manifest: snap.manifest,
+                                    next_height: first_suffix_height,
+                                    end_height: peer_tip_height,
+                                    blocks: Vec::with_capacity(suffix_len as usize),
+                                });
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestBlock {
+                                        peer: from,
+                                        height: first_suffix_height,
+                                    })
+                                    .await;
+                                continue;
+                            }
                             tracing::info!(
                                 from = %from,
                                 tip = snap.manifest.tip_height,
                                 segments = snap.manifest.segment_ids.len(),
                                 "snapshot manifest accepted — starting segment download"
                             );
-                            // Start downloading segments with concurrency cap.
-                            // The StateSegment handler dispatches queued requests as responses arrive.
-                            let tip_h = snap.manifest.tip_height;
-                            for &seg_id in &snap.manifest.segment_ids {
-                                segment_queue.push_back(seg_id);
-                            }
-                            let mut launched = 0usize;
-                            while launched < MAX_INFLIGHT_SEGMENTS {
-                                if let Some(seg_id) = segment_queue.pop_front() {
-                                    pending_segment_ids.insert(seg_id);
-                                    let _ = p2p_cmd
-                                        .send(noid_p2p::NetworkCommand::RequestStateSegment {
-                                            peer: from,
-                                            segment_id: seg_id,
-                                            expected_tip_height: tip_h,
-                                            expected_tip_hash: snap.manifest.tip_hash,
-                                        })
-                                        .await;
-                                    launched += 1;
-                                } else {
-                                    break;
-                                }
-                            }
+                            queue_snapshot_segment_download(
+                                &p2p_cmd,
+                                from,
+                                &snap.manifest,
+                                &mut pending_segment_ids,
+                                &mut segment_queue,
+                            )
+                            .await;
                             // Restore pending_manifest for the StateSegment handler to use.
                             pending_manifest = Some(PendingManifest {
                                 from,
                                 manifest: snap.manifest,
+                                prefetched_suffix: Vec::new(),
                             });
                             if pending_segment_ids.is_empty() && segment_queue.is_empty() {
                                 // No segments (fresh network, no UTXOs yet).
                                 // Apply directly with empty segment list.
-                                let m = pending_manifest.take().unwrap().manifest;
-                                let result = {
-                                    let mut ctx = chain.write().await;
-                                    let r = ctx.apply_state_snapshot(
-                                        m.tip_height,
-                                        m.tip_hash,
-                                        m.log_slots,
-                                        m.active_slot_count,
-                                        m.alloc_counter,
-                                        std::iter::empty::<(
-                                            u16,
-                                            u8,
-                                            noid_chain::segmented_state::SegmentColumns,
-                                            [u8; 32],
-                                        )>(),
-                                        &m.recent_headers,
-                                        &m.reuse_guard_buckets,
-                                    );
-                                    r.map(|_| {
-                                        let view = ChainView::from_mdbx(&ctx);
-                                        let height = ctx.tip_height();
-                                        (height, view)
-                                    })
-                                };
-                                match result {
-                                    Ok((new_height, new_view)) => {
-                                        mempool.on_new_block(&[], new_height, new_view).await;
-                                        sync_ready.notify_one();
-                                        tracing::info!(
-                                            height = new_height,
-                                            "snapshot: applied (no segments)"
-                                        );
-                                        // Trigger wallet scan in background after snapshot sync.
-                                        {
-                                            let wallet_snap = wallet.clone();
-                                            let chain_snap = chain.clone();
-                                            tokio::spawn(async move {
-                                                let ctx = chain_snap.read().await;
-                                                let height = ctx.tip_height();
-                                                let (master, hint_next_index) = {
-                                                    let guard = wallet_snap.lock().unwrap();
-                                                    match guard.as_ref() {
-                                                        None => return,
-                                                        Some(w) => (w.secret_clone(), w.next_index),
-                                                    }
-                                                };
-                                                let (utxos, known_addresses, next_index) =
-                                                    wallet::scanner::scan_state_for_utxos(
-                                                        &ctx.state.state,
-                                                        &master,
-                                                        height,
-                                                        hint_next_index,
-                                                    );
-                                                drop(ctx);
-                                                let found = utxos.len();
-                                                let balance: u64 =
-                                                    utxos.iter().map(|u| u.value).sum();
-                                                {
-                                                    let mut guard = wallet_snap.lock().unwrap();
-                                                    if let Some(w) = guard.as_mut() {
-                                                        w.apply_scan_results(
-                                                            utxos,
-                                                            known_addresses,
-                                                            next_index,
-                                                        );
-                                                    }
-                                                }
-                                                tracing::info!(
-                                                    height,
-                                                    utxos = found,
-                                                    balance_micronoid = balance,
-                                                    "wallet: auto-scan complete after snapshot sync"
-                                                );
-                                            });
-                                        }
-                                        let _ = p2p_cmd
-                                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                                peer: from,
-                                                from_height: new_height + 1,
-                                                count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
-                                                    as u16,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(err = ?e, "failed to apply empty snapshot");
-                                        reset_sync_state!();
-                                    }
+                                let pending = pending_manifest.take().unwrap();
+                                if let Err(e) = apply_verified_snapshot_with_suffix(
+                                    &chain,
+                                    &mempool,
+                                    &wallet,
+                                    &sync_ready,
+                                    &p2p_cmd,
+                                    from,
+                                    *pending.manifest,
+                                    Vec::new(),
+                                    pending.prefetched_suffix,
+                                )
+                                .await
+                                {
+                                    tracing::error!(err = %e, "failed to apply empty snapshot");
+                                    reset_sync_state!();
                                 }
                             }
                         }
                         Err(e) => {
                             tracing::error!(
                                 from = %from, tip = snap.manifest.tip_height, err = %e,
-                                "REJECTED manifest: history proof verification failed — \
+                                "REJECTED manifest: checkpoint scaffold verification failed — \
                                  possible Eclipse attack or fabricated state"
                             );
                             reset_sync_state!();
@@ -3469,6 +3763,7 @@ async fn handle_p2p_events(
                     pending_manifest = Some(PendingManifest {
                         from: best_peer,
                         manifest: best_manifest,
+                        prefetched_suffix: Vec::new(),
                     });
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: best_peer })
@@ -3496,6 +3791,35 @@ fn compare_manifest_fork_choice(
         return std::cmp::Ordering::Less;
     }
     a.tip_height.cmp(&b.tip_height)
+}
+
+async fn queue_snapshot_segment_download(
+    p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    peer: libp2p::PeerId,
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    pending_segment_ids: &mut std::collections::HashSet<u16>,
+    segment_queue: &mut std::collections::VecDeque<u16>,
+) {
+    for &seg_id in &manifest.segment_ids {
+        segment_queue.push_back(seg_id);
+    }
+    let mut launched = 0usize;
+    while launched < MAX_INFLIGHT_SEGMENTS {
+        if let Some(seg_id) = segment_queue.pop_front() {
+            pending_segment_ids.insert(seg_id);
+            let _ = p2p_cmd
+                .send(noid_p2p::NetworkCommand::RequestStateSegment {
+                    peer,
+                    segment_id: seg_id,
+                    expected_tip_height: manifest.tip_height,
+                    expected_tip_hash: manifest.tip_hash,
+                })
+                .await;
+            launched += 1;
+        } else {
+            break;
+        }
+    }
 }
 
 /// Insert a block into the orphan pool, evicting the lowest-height entry when
@@ -3593,6 +3917,115 @@ async fn rescan_wallet_from_chain(
     );
 }
 
+async fn replay_prefetched_snapshot_suffix(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    mempool: &AsyncMempool,
+    suffix: Vec<PrefetchedSnapshotBlock>,
+) -> Result<u64, String> {
+    let mut current_height = chain.read().await.tip_height();
+    for item in suffix {
+        let expected_height = current_height.saturating_add(1);
+        if item.block.header.height != expected_height {
+            return Err(format!(
+                "prefetched suffix height mismatch: expected h={expected_height}, got h={}",
+                item.block.header.height
+            ));
+        }
+        let confirmed: Vec<_> = item
+            .block
+            .transactions
+            .iter()
+            .map(|tx| tx.tx_body_hash)
+            .collect();
+        let (_hash, view) = apply_p2p_block_offthread(
+            chain,
+            item.block.clone(),
+            item.block_proof_bytes,
+            item.block_auth_sidecar_bytes,
+            unix_now(),
+        )
+        .await
+        .map_err(|e| format!("prefetched suffix apply failed h={expected_height}: {e:?}"))?;
+        current_height = expected_height;
+        mempool.on_new_block(&confirmed, current_height, view).await;
+        tracing::info!(
+            height = current_height,
+            "snapshot: replayed prefetched suffix block"
+        );
+    }
+    Ok(current_height)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_verified_snapshot_with_suffix(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    mempool: &AsyncMempool,
+    wallet: &SharedWallet,
+    sync_ready: &Arc<tokio::sync::Notify>,
+    p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    peer: libp2p::PeerId,
+    manifest: noid_p2p::protocol::GetStateManifestResponse,
+    segments: Vec<VerifiedSnapshotSegment>,
+    suffix: Vec<PrefetchedSnapshotBlock>,
+) -> Result<u64, String> {
+    let snapshot_height = manifest.tip_height;
+    let segment_count = segments.len();
+    let result = {
+        let mut ctx = chain.write().await;
+        let r = ctx.apply_state_snapshot(
+            manifest.tip_height,
+            manifest.tip_hash,
+            manifest.log_slots,
+            manifest.active_slot_count,
+            manifest.alloc_counter,
+            segments,
+            &manifest.recent_headers,
+            &manifest.reuse_guard_buckets,
+        );
+        r.map(|_| {
+            let view = ChainView::from_mdbx(&ctx);
+            let height = ctx.tip_height();
+            (height, view)
+        })
+    }
+    .map_err(|e| format!("failed to apply verified state snapshot: {e:?}"))?;
+
+    let (applied_height, view) = result;
+    mempool.on_new_block(&[], applied_height, view).await;
+    let final_height = match replay_prefetched_snapshot_suffix(chain, mempool, suffix).await {
+        Ok(height) => height,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                snapshot_height,
+                "snapshot applied but prefetched suffix replay failed; falling back to shallow catch-up"
+            );
+            chain.read().await.tip_height()
+        }
+    };
+
+    sync_ready.notify_one();
+    tracing::info!(
+        snapshot_height,
+        final_height,
+        segments = segment_count,
+        "snapshot: fully applied"
+    );
+    tracing::info!(
+        height = final_height,
+        "chain snapshot applied — mining can begin"
+    );
+    rescan_wallet_from_chain(wallet, chain, "snapshot sync").await;
+    let _ = p2p_cmd
+        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+            peer,
+            from_height: final_height + 1,
+            count: noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH as u16,
+        })
+        .await;
+    Ok(final_height)
+}
+
 /// Apply a newly confirmed block to the in-process wallet state.
 ///
 /// Must be called after `apply_next_block` succeeds and before block pruning.
@@ -3634,32 +4067,547 @@ fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Blo
 }
 
 // ---------------------------------------------------------------------------
-// Background local history cache updater
+// Full accepted-batch checkpoint package worker helpers
 // ---------------------------------------------------------------------------
 
-/// Background local history cache updater.
+struct FullBatchPackageBuildInput {
+    previous_head: noid_recursive::HistoryCheckpointHeadV1,
+    start_anchor: noid_chain::HeaderChainAnchor,
+    start_consensus: noid_recursive::RecursiveConsensusState,
+    start_accumulator: noid_recursive::ChainAccumulator,
+    start_parent: noid_chain::BlockHeader,
+    start_state: noid_chain::state::ChainState,
+    witness: noid_block::FullAcceptedBlockBatchWitness,
+}
+
+fn recursive_consensus_state_at_height(
+    store: &noid_chain::storage::MdbxStore,
+    height: u64,
+) -> Result<noid_recursive::RecursiveConsensusState, String> {
+    use noid_chain::consensus::header::epoch_anchor_height;
+    use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
+
+    let header = store
+        .get_header(height)
+        .map_err(|e| format!("read header h={height}: {e}"))?
+        .ok_or_else(|| format!("missing header h={height}"))?;
+    let cumulative_chainwork = store
+        .get_chain_work(height)
+        .map_err(|e| format!("read chainwork h={height}: {e}"))?
+        .ok_or_else(|| format!("missing chainwork h={height}"))?;
+
+    let timestamp_start = height.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
+    let mut prev_timestamps = Vec::new();
+    for h in timestamp_start..=height {
+        let header = store
+            .get_header(h)
+            .map_err(|e| format!("read timestamp header h={h}: {e}"))?
+            .ok_or_else(|| format!("missing timestamp header h={h}"))?;
+        prev_timestamps.push(header.timestamp);
+    }
+
+    let active_start = height.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
+    let mut prev_active_counts = Vec::new();
+    for h in active_start..=height {
+        let header = store
+            .get_header(h)
+            .map_err(|e| format!("read active-count header h={h}: {e}"))?
+            .ok_or_else(|| format!("missing active-count header h={h}"))?;
+        prev_active_counts.push(header.active_slot_count);
+    }
+
+    let anchor_height = epoch_anchor_height(height);
+    let anchor_header = store
+        .get_header(anchor_height)
+        .map_err(|e| format!("read ASERT anchor header h={anchor_height}: {e}"))?
+        .ok_or_else(|| format!("missing ASERT anchor header h={anchor_height}"))?;
+
+    Ok(noid_recursive::RecursiveConsensusState::from_header(
+        &header,
+        cumulative_chainwork,
+        anchor_height,
+        anchor_header.timestamp,
+        anchor_header.difficulty_target,
+        &prev_timestamps,
+        &prev_active_counts,
+    ))
+}
+
+fn retained_full_batch_witness_from_store(
+    store: &noid_chain::storage::MdbxStore,
+    start_height: u64,
+    end_height: u64,
+) -> Result<noid_block::FullAcceptedBlockBatchWitness, String> {
+    let mut items =
+        Vec::with_capacity(end_height.saturating_sub(start_height).saturating_add(1) as usize);
+    for height in start_height..=end_height {
+        let block_bytes = store
+            .get_recent_block(height)
+            .map_err(|e| format!("read retained block h={height}: {e}"))?
+            .ok_or_else(|| format!("missing retained block h={height}"))?;
+        let block = noid_chain::block::Block::from_bytes(&block_bytes)
+            .map_err(|e| format!("decode retained block h={height}: {e:?}"))?;
+        let header = store
+            .get_header(height)
+            .map_err(|e| format!("read canonical header h={height}: {e}"))?
+            .ok_or_else(|| format!("missing canonical header h={height}"))?;
+        if block.header != header || block.header.height != height {
+            return Err(format!("retained block/header mismatch h={height}"));
+        }
+
+        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
+        let proof = store
+            .get_block_proof(height)
+            .map_err(|e| format!("read block proof h={height}: {e}"))?;
+        let sidecar = store
+            .get_block_auth_sidecar(height)
+            .map_err(|e| format!("read auth sidecar h={height}: {e}"))?;
+        let block_proof_bytes = match (has_user_txs, proof) {
+            (true, Some(bytes)) if !bytes.is_empty() => bytes,
+            (true, _) => return Err(format!("missing user block proof h={height}")),
+            (false, Some(bytes)) if !bytes.is_empty() => {
+                return Err(format!("coinbase-only block has proof bytes h={height}"));
+            }
+            (false, _) => Vec::new(),
+        };
+        let block_auth_sidecar_bytes = match (has_user_txs, sidecar) {
+            (true, Some(bytes)) if !bytes.is_empty() => bytes,
+            (true, _) => return Err(format!("missing user block auth sidecar h={height}")),
+            (false, Some(bytes)) if !bytes.is_empty() => {
+                return Err(format!(
+                    "coinbase-only block has auth sidecar bytes h={height}"
+                ));
+            }
+            (false, _) => Vec::new(),
+        };
+        items.push(noid_block::FullAcceptedBlockBatchItem {
+            block,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+        });
+    }
+    Ok(noid_block::FullAcceptedBlockBatchWitness { items })
+}
+
+fn full_batch_package_matches_canonical(
+    store: &noid_chain::storage::MdbxStore,
+    package: &noid_block::FullAcceptedBlockBatchCheckpointPackageV1,
+) -> Result<bool, String> {
+    let start_height = package.start_height();
+    let end_height = package.end_height();
+    if end_height != package.step_statement.batch_summary.end_anchor.height {
+        return Ok(false);
+    }
+    let local_start_anchor = store
+        .get_header_anchor(start_height)
+        .map_err(|e| format!("read start anchor h={start_height}: {e}"))?;
+    let local_end_anchor = store
+        .get_header_anchor(end_height)
+        .map_err(|e| format!("read end anchor h={end_height}: {e}"))?;
+    Ok(
+        local_start_anchor.as_ref() == Some(&package.step_statement.batch_summary.start_anchor)
+            && local_end_anchor.as_ref() == Some(&package.step_statement.batch_summary.end_anchor),
+    )
+}
+
+fn latest_canonical_full_batch_package(
+    ctx: &MdbxChainContext,
+) -> Result<Option<noid_block::FullAcceptedBlockBatchCheckpointPackageV1>, String> {
+    loop {
+        let Some(height) = ctx
+            .store
+            .latest_accepted_block_batch_certificate_package_height()
+            .map_err(|e| format!("read latest full batch package height: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = ctx
+            .store
+            .get_accepted_block_batch_certificate_package(height)
+            .map_err(|e| format!("read full batch package h={height}: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+            match bincode::deserialize(&bytes) {
+                Ok(package) => package,
+                Err(e) => {
+                    tracing::warn!(
+                        height,
+                        err = %e,
+                        "full accepted batch package decode failed; deleting stale bytes"
+                    );
+                    ctx.store
+                        .delete_accepted_block_batch_certificate_package(height)
+                        .map_err(|e| format!("delete bad full batch package h={height}: {e}"))?;
+                    continue;
+                }
+            };
+        if package.end_height() != height
+            || !full_batch_package_matches_canonical(&ctx.store, &package)?
+        {
+            tracing::warn!(
+                height,
+                package_end = package.end_height(),
+                "full accepted batch package no longer matches canonical headers; deleting"
+            );
+            ctx.store
+                .delete_accepted_block_batch_certificate_package(height)
+                .map_err(|e| format!("delete stale full batch package h={height}: {e}"))?;
+            continue;
+        }
+        return Ok(Some(package));
+    }
+}
+
+fn prepare_full_batch_package_build(
+    ctx: &mut MdbxChainContext,
+) -> Result<Option<FullBatchPackageBuildInput>, String> {
+    use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+    use noid_recursive::{
+        genesis_accumulator, history_checkpoint_head_from_boundary_v1,
+        HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
+    };
+
+    let tip = ctx.tip_height();
+    let latest_package = latest_canonical_full_batch_package(ctx)?;
+    let start_height = latest_package
+        .as_ref()
+        .map_or(1, |package| package.end_height().saturating_add(1));
+    let batch_len = HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u64;
+    let end_height = start_height.saturating_add(batch_len).saturating_sub(1);
+    if end_height > tip {
+        return Ok(None);
+    }
+
+    let start_parent_height = start_height.saturating_sub(1);
+    if tip.saturating_sub(start_parent_height) > RECENT_BLOCK_RETENTION_DEPTH {
+        tracing::warn!(
+            start_height,
+            end_height,
+            tip,
+            "full accepted batch package cannot be built inside retained window; waiting for a newer retained boundary"
+        );
+        return Ok(None);
+    }
+
+    let start_parent = ctx
+        .store
+        .get_header(start_parent_height)
+        .map_err(|e| format!("read package start parent h={start_parent_height}: {e}"))?
+        .ok_or_else(|| format!("missing package start parent h={start_parent_height}"))?;
+    let start_anchor = match latest_package.as_ref() {
+        Some(package) => package.step_statement.batch_summary.end_anchor.clone(),
+        None => ctx
+            .store
+            .get_header_anchor(start_parent_height)
+            .map_err(|e| format!("read genesis/start anchor h={start_parent_height}: {e}"))?
+            .ok_or_else(|| format!("missing genesis/start anchor h={start_parent_height}"))?,
+    };
+    let start_consensus = latest_package.as_ref().map_or_else(
+        || recursive_consensus_state_at_height(&ctx.store, start_parent_height),
+        |package| Ok(package.step_statement.batch_summary.end_consensus.clone()),
+    )?;
+    let start_accumulator = latest_package.as_ref().map_or_else(
+        || {
+            Ok::<noid_recursive::ChainAccumulator, String>(genesis_accumulator(
+                start_parent.state_root,
+                noid_chain::hash_block_header(&start_parent),
+            ))
+        },
+        |package| Ok(package.step_statement.batch_summary.end_accumulator.clone()),
+    )?;
+    let previous_head = match latest_package {
+        Some(package) => package.step_statement.next_head,
+        None => history_checkpoint_head_from_boundary_v1(
+            &start_anchor,
+            &start_accumulator,
+            &start_consensus,
+        )
+        .map_err(|e| format!("build initial checkpoint head: {e:?}"))?,
+    };
+    let mut start_state = ctx
+        .reconstruct_state_snapshot_at(start_parent_height)
+        .map_err(|e| format!("reconstruct package start state h={start_parent_height}: {e:?}"))?;
+    if start_state.state_root() != start_parent.state_root {
+        return Err(format!(
+            "package start state root mismatch h={start_parent_height}"
+        ));
+    }
+    let witness = retained_full_batch_witness_from_store(&ctx.store, start_height, end_height)?;
+
+    Ok(Some(FullBatchPackageBuildInput {
+        previous_head,
+        start_anchor,
+        start_consensus,
+        start_accumulator,
+        start_parent,
+        start_state,
+        witness,
+    }))
+}
+
+async fn try_build_next_full_batch_package(chain: &Arc<RwLock<MdbxChainContext>>) -> bool {
+    let build_input = {
+        let mut ctx = chain.write().await;
+        match prepare_full_batch_package_build(&mut ctx) {
+            Ok(Some(input)) => input,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(err = %e, "full accepted batch package build preparation failed");
+                return false;
+            }
+        }
+    };
+    let start_height = build_input.start_parent.height.saturating_add(1);
+    let end_height = start_height
+        .saturating_add(noid_recursive::HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u64)
+        .saturating_sub(1);
+    tracing::info!(
+        start_height,
+        end_height,
+        "full accepted batch package: proving retained chunk"
+    );
+    let prove_started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let package = noid_block::prove_full_accepted_block_batch_checkpoint_package_v1(
+            &build_input.previous_head,
+            &build_input.start_anchor,
+            &build_input.start_consensus,
+            &build_input.start_accumulator,
+            &build_input.start_parent,
+            &build_input.start_state,
+            &build_input.witness,
+        )
+        .map_err(|e| format!("prove full accepted batch package: {e:?}"))?;
+        noid_block::verify_full_accepted_block_batch_checkpoint_package_v1(&package)
+            .map_err(|e| format!("verify full accepted batch package: {e:?}"))?;
+        let bytes = bincode::serialize(&package)
+            .map_err(|e| format!("serialize full accepted batch package: {e}"))?;
+        Ok::<_, String>((package, bytes))
+    })
+    .await;
+
+    let (package, bytes) = match result {
+        Ok(Ok(package)) => package,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                start_height,
+                end_height,
+                err = %e,
+                "full accepted batch package proof failed"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::error!(
+                start_height,
+                end_height,
+                err = ?e,
+                "full accepted batch package task panicked"
+            );
+            return false;
+        }
+    };
+
+    let stored = {
+        let ctx = chain.read().await;
+        match full_batch_package_matches_canonical(&ctx.store, &package) {
+            Ok(true) => ctx
+                .store
+                .put_accepted_block_batch_certificate_package(package.end_height(), &bytes)
+                .is_ok(),
+            Ok(false) => {
+                tracing::warn!(
+                    start_height,
+                    end_height,
+                    "full accepted batch package became non-canonical before store"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    start_height,
+                    end_height,
+                    err = %e,
+                    "full accepted batch package canonicality check failed before store"
+                );
+                false
+            }
+        }
+    };
+    if stored {
+        tracing::info!(
+            start_height,
+            end_height,
+            prove_ms = prove_started.elapsed().as_millis(),
+            bytes = bytes.len(),
+            "full accepted batch package stored"
+        );
+    }
+    stored
+}
+
+async fn try_promote_full_batch_package_coverage(chain: &Arc<RwLock<MdbxChainContext>>) -> bool {
+    use noid_chain::checkpoint::CheckpointCoverage;
+    use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
+
+    let candidate = {
+        let ctx = chain.read().await;
+        let finalized_tip = ctx.tip_height().saturating_sub(CONSENSUS_FINALITY_DEPTH);
+        let current_covered = ctx
+            .store
+            .get_checkpoint_coverage()
+            .ok()
+            .flatten()
+            .and_then(|coverage| coverage.history_proof_covered_to)
+            .unwrap_or(0);
+        let next_end = current_covered
+            .saturating_add(noid_recursive::HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u64);
+        if next_end == 0 || next_end > finalized_tip {
+            return false;
+        }
+        let Some(bytes) = (match ctx
+            .store
+            .get_accepted_block_batch_certificate_package(next_end)
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    end_height = next_end,
+                    err = %e,
+                    "full accepted batch package coverage read failed"
+                );
+                return false;
+            }
+        }) else {
+            return false;
+        };
+        let package: noid_block::FullAcceptedBlockBatchCheckpointPackageV1 =
+            match bincode::deserialize(&bytes) {
+                Ok(package) => package,
+                Err(e) => {
+                    tracing::warn!(
+                        end_height = next_end,
+                        err = %e,
+                        "full accepted batch package coverage decode failed"
+                    );
+                    return false;
+                }
+            };
+        if package.end_height() != next_end {
+            tracing::warn!(
+                expected_end = next_end,
+                package_end = package.end_height(),
+                "full accepted batch package coverage end mismatch"
+            );
+            return false;
+        }
+        package
+    };
+
+    let end_height = candidate.end_height();
+    let verify_candidate = candidate.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        noid_block::verify_full_accepted_block_batch_checkpoint_package_v1(&verify_candidate)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    })
+    .await;
+    match verified {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                end_height,
+                err = %e,
+                "full accepted batch package coverage verification failed"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::error!(
+                end_height,
+                err = ?e,
+                "full accepted batch package coverage verification task panicked"
+            );
+            return false;
+        }
+    }
+
+    let promoted = {
+        let ctx = chain.read().await;
+        let finalized_tip = ctx.tip_height().saturating_sub(CONSENSUS_FINALITY_DEPTH);
+        if end_height > finalized_tip {
+            return false;
+        }
+        match full_batch_package_matches_canonical(&ctx.store, &candidate) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    end_height,
+                    "full accepted batch package became non-canonical before coverage promotion"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    end_height,
+                    err = %e,
+                    "full accepted batch package canonicality check failed before coverage promotion"
+                );
+                return false;
+            }
+        }
+        let end_anchor = candidate.step_statement.batch_summary.end_anchor.clone();
+        let existing = ctx.store.get_checkpoint_coverage().ok().flatten();
+        let current_covered = existing
+            .as_ref()
+            .and_then(|coverage| coverage.history_proof_covered_to)
+            .unwrap_or(0);
+        if current_covered >= end_height {
+            return false;
+        }
+        let mut coverage = existing.unwrap_or(CheckpointCoverage {
+            checkpoint_id: candidate.step_statement.next_head.recursive_digest,
+            height: end_height,
+            block_hash: end_anchor.block_id,
+            covered_from: 1,
+            covered_to: end_height,
+            history_proof_covered_to: None,
+        });
+        coverage.checkpoint_id = candidate.step_statement.next_head.recursive_digest;
+        coverage.height = end_height;
+        coverage.block_hash = end_anchor.block_id;
+        coverage.covered_from = 1;
+        coverage.covered_to = end_height;
+        coverage.history_proof_covered_to = Some(end_height);
+        ctx.store.put_checkpoint_coverage(&coverage).is_ok()
+    };
+
+    if promoted {
+        tracing::info!(end_height, "full accepted batch package coverage promoted");
+    }
+    promoted
+}
+
+// ---------------------------------------------------------------------------
+// Background checkpoint package worker
+// ---------------------------------------------------------------------------
+
+/// Background checkpoint package worker.
 ///
-/// Advances the chain's local finalized-history cache one block at a time,
-/// storing the result in MDBX. The cache is not public snapshot/pruning
-/// authority.
+/// Builds fixed-size accepted-block checkpoint packages while their full
+/// witnesses are still inside the 18-block retained suffix, then promotes
+/// proven checkpoint coverage after the package is finalized and still
+/// canonical.
 ///
 /// ## Design
 ///
-/// - Advances only for **finalised** blocks (>= CONSENSUS_FINALITY_DEPTH behind tip)
-///   so reorgs never invalidate a stored proof.
-/// - Coinbase-only blocks emit a real accepted state-transition claim at
-///   acceptance time; the cache never uses an empty public claim.
-/// - Runs a tight loop when catching up; sleeps when at finality boundary.
-/// - Recursive proving runs in `spawn_blocking` so catch-up never blocks the async runtime.
-async fn run_history_proof_updater(
-    chain: Arc<RwLock<MdbxChainContext>>,
-    _p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
-) {
-    use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
-    use noid_recursive::{
-        accepted_block_claim_witness_from_fields, advance_local_history_cache,
-        init_genesis_history_cache, verify_local_history_cache_step, LocalHistoryCache,
-    };
+/// - Builds packages before pruning can remove full blocks/proofs/auth sidecars.
+/// - Promotes only finalized sequential package ends.
+/// - Recursive/package proving runs in `spawn_blocking` inside the package
+///   helpers, so catch-up does not block the async runtime.
+async fn run_checkpoint_package_worker(chain: Arc<RwLock<MdbxChainContext>>) {
     use std::time::Duration;
 
     const POLL_INTERVAL_SECS: u64 = 5;
@@ -3674,208 +4622,11 @@ async fn run_history_proof_updater(
         }
         just_advanced = false;
 
-        // --- Read current state ---
-        let (tip, local_cache_opt) = {
-            let ctx = chain.read().await;
-            let tip = ctx.tip_height();
-            let cache = match ctx.store.get_local_history_cache() {
-                Ok(Some(b)) => bincode::deserialize::<LocalHistoryCache>(&b).ok(),
-                _ => None,
-            };
-            (tip, cache)
-        };
-
-        let cache_height_opt = local_cache_opt.as_ref().map(|p| p.block_height);
-
-        // Determine next height to cache.
-        // None → start with genesis (height 0).
-        let next_height: u64 = match cache_height_opt {
-            None => 0,
-            Some(h) => h + 1,
-        };
-
-        // Only prove blocks that are finalised (CONSENSUS_FINALITY_DEPTH behind tip).
-        // This guarantees a reorg can never invalidate the stored proof.
-        let finalized_tip = tip.saturating_sub(CONSENSUS_FINALITY_DEPTH);
-        if next_height > finalized_tip {
-            let lag = tip.saturating_sub(cache_height_opt.unwrap_or(0));
-            if lag > CONSENSUS_FINALITY_DEPTH {
-                tracing::warn!(
-                    lag,
-                    tip,
-                    cache_height = cache_height_opt.unwrap_or(0),
-                    "local history cache DEGRADED — {lag} blocks behind finality boundary"
-                );
-            } else {
-                // Normal: tracking finality boundary (lag ≈ CONSENSUS_FINALITY_DEPTH)
-                tracing::debug!(
-                    lag,
-                    tip,
-                    cache_height = cache_height_opt.unwrap_or(0),
-                    "local history cache NORMAL — at finality boundary"
-                );
-            }
-            continue;
+        if try_promote_full_batch_package_coverage(&chain).await {
+            just_advanced = true;
         }
-
-        // --- Cache genesis (special case) ---
-        if next_height == 0 {
-            tracing::debug!("local history cache: caching genesis block");
-            let prove_started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(init_genesis_history_cache).await;
-            match result {
-                Ok(genesis_cache) => {
-                    let genesis_header = noid_chain::consensus::genesis::genesis_header();
-                    if let Err(e) = verify_local_history_cache_step(
-                        &genesis_cache,
-                        &[0u8; 32],
-                        &genesis_header.state_root,
-                    ) {
-                        tracing::error!(err = ?e, "genesis local history cache failed self-verification");
-                        continue;
-                    }
-                    let prove_ms = prove_started.elapsed().as_millis();
-                    let bytes = bincode::serialize(&genesis_cache).unwrap_or_default();
-                    let (stored, tip_hash) = {
-                        let ctx = chain.read().await;
-                        let tip_hash = ctx.tip_hash();
-                        let ok = ctx
-                            .store
-                            .put_local_history_cache_at(genesis_cache.block_height, &bytes)
-                            .is_ok();
-                        (ok, tip_hash)
-                    };
-                    if stored {
-                        tracing::info!(prove_ms, "local history cache: genesis stored");
-                        just_advanced = true;
-                        let _ = tip_hash;
-                    } else {
-                        tracing::error!("failed to store genesis local history cache");
-                    }
-                }
-                Err(e) => tracing::error!(err = ?e, "genesis local history cache task panicked"),
-            }
-            continue;
-        }
-
-        // --- Fold finalized block at next_height ---
-        // The full 42-field history claim is emitted at block acceptance time.
-        // The updater only consumes that small sidecar plus the canonical header
-        // and exact chainwork already stored by native header validation.
-        let (header_opt, claim_bytes_opt, chainwork_opt) = {
-            let ctx = chain.read().await;
-            let hdr = ctx.store.get_header(next_height).ok().flatten();
-            let claim = ctx.store.get_history_claim(next_height).ok().flatten();
-            let chainwork = ctx.store.get_chain_work(next_height).ok().flatten();
-            (hdr, claim, chainwork)
-        };
-
-        let header = match header_opt {
-            Some(h) => h,
-            None => {
-                tracing::debug!(next_height, "no header available yet, waiting");
-                continue;
-            }
-        };
-        let claim_bytes = match claim_bytes_opt {
-            Some(bytes) => bytes,
-            None => {
-                tracing::debug!(
-                    next_height,
-                    "no retained history claim available yet, waiting"
-                );
-                continue;
-            }
-        };
-        let claim_fields = match bincode::deserialize::<Vec<noid_core::Block128>>(&claim_bytes)
-            .ok()
-            .and_then(|fields| fields.try_into().ok())
-        {
-            Some(fields) => fields,
-            None => {
-                tracing::warn!(next_height, "history claim decode failed");
-                continue;
-            }
-        };
-        let cumulative_chainwork = match chainwork_opt {
-            Some(chainwork) => chainwork,
-            None => {
-                tracing::debug!(next_height, "no chainwork available yet, waiting");
-                continue;
-            }
-        };
-        let witness = match accepted_block_claim_witness_from_fields(claim_fields) {
-            Ok(witness) => witness,
-            Err(e) => {
-                tracing::warn!(
-                    next_height,
-                    err = ?e,
-                    "history claim witness construction failed — local history cache waits"
-                );
-                continue;
-            }
-        };
-
-        // safe: we only reach here when next_height > 0 and local_cache_opt is Some.
-        let Some(prev_cache) = local_cache_opt else {
-            tracing::debug!(next_height, "missing previous local history cache");
-            continue;
-        };
-
-        let header_for_verify = header;
-        let prev_state_root_for_verify = prev_cache.acc.state_root;
-
-        tracing::debug!(next_height, "local history cache: folding step");
-        let prove_started = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            advance_local_history_cache(&prev_cache, &witness, &header, cumulative_chainwork)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(new_cache)) => {
-                let h = new_cache.block_height;
-                if let Err(e) = verify_local_history_cache_step(
-                    &new_cache,
-                    &prev_state_root_for_verify,
-                    &header_for_verify.state_root,
-                ) {
-                    tracing::error!(height = h, err = ?e, "local history cache failed self-verification — not storing");
-                    continue;
-                }
-                let prove_ms = prove_started.elapsed().as_millis();
-                let bytes = bincode::serialize(&new_cache).unwrap_or_default();
-                let (stored, tip_hash) = {
-                    let ctx = chain.read().await;
-                    let tip_hash = ctx.tip_hash();
-                    let ok = ctx.store.put_local_history_cache_at(h, &bytes).is_ok();
-                    (ok, tip_hash)
-                };
-                if stored {
-                    tracing::info!(height = h, prove_ms, "local history cache advanced");
-                    just_advanced = true;
-                    let _ = tip_hash;
-                } else {
-                    tracing::error!(
-                        err = "store failed",
-                        "failed to store local history cache at height {h}"
-                    );
-                }
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    next_height,
-                    err = ?e,
-                    "local history cache rejected finalized step"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    next_height,
-                    err = ?e,
-                    "local history cache task panicked — skipping block"
-                );
-            }
+        if try_build_next_full_batch_package(&chain).await {
+            just_advanced = true;
         }
     }
 }
@@ -3928,7 +4679,7 @@ fn print_startup_banner(
     materialized_segs: usize,
     total_segs: usize,
     block_reward_noid: f64,
-    rec_proof_height: Option<u64>,
+    checkpoint_proof_height: Option<u64>,
     wallet_addr: Option<&str>,
     mining: bool,
     coinbase: Option<&str>,
@@ -3997,8 +4748,7 @@ fn print_startup_banner(
         }
     };
 
-    // History proof lag
-    let rec_str = match rec_proof_height {
+    let checkpoint_str = match checkpoint_proof_height {
         Some(h) if tip_height > h => format!("h={}  ({} behind)", h, tip_height - h),
         Some(h) => format!("h={h}  current"),
         None => "building...".to_string(),
@@ -4068,8 +4818,7 @@ fn print_startup_banner(
         row("mining", &ylw("disabled"));
     }
 
-    // History proof
-    row("rec proof", &dim(&rec_str));
+    row("checkpoint", &dim(&checkpoint_str));
 
     println!("{line}");
     println!();
