@@ -19,3 +19,5 @@ bincode = "1"
 
 [dev-dependencies]
 noid-ivc-core = { path = "../noid_ivc_core", features = ["unsound-challenger"] }
+noid_core = { path = "../noid_core" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }

@@ -1,7 +1,7 @@
 //! End-to-end FieldR1cs prove → verify tests (P1): honest roundtrip, false
 //! witnesses, and mutation of every proof/commitment component → reject.
 
-use noid_ivc_core::challenger::{Challenger, FsChallenger};
+use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::synthetic_satisfiable;
 use noid_ivc_core::pcs::{self, PcsParams};
@@ -27,10 +27,10 @@ fn honest_roundtrip_multiple_shapes() {
         assert!(r1cs.satisfies(&z));
         let params = params_for(m);
 
-        let mut ch_p = FsChallenger::new(TEST_DOMAIN);
+        let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
         let (proof, commitment, claim_p) = prove_field(&r1cs, &z, &params, &mut ch_p);
 
-        let mut ch_v = FsChallenger::new(TEST_DOMAIN);
+        let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
         let claim_v = verify_field(&r1cs, &commitment, &proof, &mut ch_v)
             .unwrap_or_else(|e| panic!("honest proof rejected (m={m}, k_log={k_log}): {e:?}"));
         assert_eq!(claim_p, claim_v, "claim mismatch m={m}");
@@ -53,9 +53,9 @@ fn false_witnesses_rejected() {
         };
         assert!(!r1cs.satisfies(&bad_z), "corruption did not break satisfiability");
 
-        let mut ch_p = FsChallenger::new(TEST_DOMAIN);
+        let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
         let (proof, commitment, _) = prove_field(&r1cs, &bad_z, &params, &mut ch_p);
-        let mut ch_v = FsChallenger::new(TEST_DOMAIN);
+        let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
         assert!(
             verify_field(&r1cs, &commitment, &proof, &mut ch_v).is_err(),
             "false witness accepted (seed={seed})"
@@ -69,11 +69,11 @@ fn false_witnesses_rejected() {
 fn mutations_rejected() {
     let (r1cs, z) = synthetic_satisfiable(11, 7, 7);
     let params = params_for(11);
-    let mut ch_p = FsChallenger::new(TEST_DOMAIN);
+    let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
     let (proof, commitment, _) = prove_field(&r1cs, &z, &params, &mut ch_p);
 
     // Sanity: honest accepts.
-    let mut ch = FsChallenger::new(TEST_DOMAIN);
+    let mut ch = FsLaneChallenger::new(TEST_DOMAIN);
     assert!(verify_field(&r1cs, &commitment, &proof, &mut ch).is_ok());
 
     let mut cases: Vec<(String, FieldR1csProof)> = Vec::new();
@@ -145,7 +145,7 @@ fn mutations_rejected() {
     }
 
     for (label, bad) in cases {
-        let mut ch = FsChallenger::new(TEST_DOMAIN);
+        let mut ch = FsLaneChallenger::new(TEST_DOMAIN);
         assert!(
             verify_field(&r1cs, &commitment, &bad, &mut ch).is_err(),
             "mutation {label} accepted"
@@ -155,7 +155,7 @@ fn mutations_rejected() {
     // Commitment-root substitution.
     let mut bad_commitment = commitment.clone();
     bad_commitment.root[0] ^= 1;
-    let mut ch = FsChallenger::new(TEST_DOMAIN);
+    let mut ch = FsLaneChallenger::new(TEST_DOMAIN);
     assert!(
         verify_field(&r1cs, &bad_commitment, &proof, &mut ch).is_err(),
         "commitment root tamper accepted"
@@ -164,7 +164,7 @@ fn mutations_rejected() {
     // Statement substitution: a different instance must not verify the same
     // proof (the statement digest is transcript-bound).
     let (other_r1cs, _) = synthetic_satisfiable(11, 7, 8);
-    let mut ch = FsChallenger::new(TEST_DOMAIN);
+    let mut ch = FsLaneChallenger::new(TEST_DOMAIN);
     assert!(
         verify_field(&other_r1cs, &commitment, &proof, &mut ch).is_err(),
         "statement substitution accepted"
@@ -177,7 +177,7 @@ fn mutations_rejected() {
 fn serialized_bitflips_rejected() {
     let (r1cs, z) = synthetic_satisfiable(10, 7, 99);
     let params = params_for(10);
-    let mut ch_p = FsChallenger::new(TEST_DOMAIN);
+    let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
     let (proof, commitment, _) = prove_field(&r1cs, &z, &params, &mut ch_p);
 
     let bytes = bincode::serialize(&proof).expect("proof serializes");
@@ -189,7 +189,7 @@ fn serialized_bitflips_rejected() {
         let Ok(bad): Result<FieldR1csProof, _> = bincode::deserialize(&mutated) else {
             continue; // shape-destroying flip — rejected at decode
         };
-        let mut ch = FsChallenger::new(TEST_DOMAIN);
+        let mut ch = FsLaneChallenger::new(TEST_DOMAIN);
         assert!(
             verify_field(&r1cs, &commitment, &bad, &mut ch).is_err(),
             "byte flip at {pos} accepted"

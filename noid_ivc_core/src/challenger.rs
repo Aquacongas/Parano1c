@@ -415,6 +415,269 @@ fn digest_has_leading_zero_bits(h: &[u8; 32], bits: u32) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// FsLaneChallenger — lane-oriented Fiat-Shamir transcript (the FieldR1cs /
+// SVT-facing challenger, P2).
+//
+// The byte-oriented FsChallenger above absorbs 1–2-byte op tags, so its lane
+// packing is never 16-byte aligned and an in-circuit replay would need
+// bit-splitting with range checks. This challenger absorbs whole 16-byte
+// LANES only: every op is one constant header lane (op, kind, length)
+// followed by value/byte lanes, so an absorbed lane is an *affine* function
+// of the observed field elements — exactly what the SVT trace gadget
+// (`crate::field_circuit::FsChannelTrace`) replays, and the same shape as
+// the killshot channel (`Poseidon2bChannel`) that P3 replays.
+//
+// State is kept in the FLAT (GCM) basis — bit-identical to the circuit's
+// F128 wires; the permutation runs through the tower-basis production
+// `Poseidon2bPermutation` via the `noid_core::hardware` basis isomorphism.
+// Duplex semantics mirror `Poseidon2bSponge` + `Poseidon2bChannel`:
+// rate-2 pair buffering, `0x80…01` pad block on odd flush, squeeze emits
+// `state[0]` and holds `state[1]` pending, then permutes.
+// ---------------------------------------------------------------------------
+
+pub const FS_OP_DOMAIN: u8 = 0x01;
+pub const FS_OP_LABEL: u8 = 0x02;
+pub const FS_OP_OBSERVE: u8 = 0x03;
+pub const FS_OP_SQUEEZE: u8 = 0x04;
+pub const FS_OP_BYTES: u8 = 0x05;
+pub const FS_OP_POW: u8 = 0x06;
+pub const FS_KIND_SCALAR: u8 = 0x01;
+pub const FS_KIND_SLICE: u8 = 0x02;
+
+/// PoW domain for the lane challenger's grind permutation.
+const TAG_FS_POW_LANE: noid_poseidon2b::native::DomainTag =
+    noid_poseidon2b::native::DomainTag::new(b"FSPOWLNE");
+
+#[inline]
+fn f128_of_u128(v: u128) -> F128 {
+    F128 {
+        lo: v as u64,
+        hi: (v >> 64) as u64,
+    }
+}
+
+#[inline]
+fn u128_of_f128(v: F128) -> u128 {
+    (v.lo as u128) | ((v.hi as u128) << 64)
+}
+
+/// Canonical op-header lane: `lo = op | kind << 8`, `hi = len`.
+#[inline]
+pub fn fs_op_lane(op: u8, kind: u8, len: u64) -> F128 {
+    F128 {
+        lo: op as u64 | ((kind as u64) << 8),
+        hi: len,
+    }
+}
+
+/// Pack a byte string into 16-byte little-endian lanes, zero-padding the
+/// last lane. Unambiguous because every op header carries the byte length.
+pub fn fs_pack_bytes_lanes(bytes: &[u8]) -> Vec<F128> {
+    bytes
+        .chunks(16)
+        .map(|chunk| {
+            let mut buf = [0u8; 16];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            f128_of_u128(u128::from_le_bytes(buf))
+        })
+        .collect()
+}
+
+/// Capacity IV (`TAG_FSCHALNG`) lanes in the flat basis: `[state[2], state[3]]`.
+pub fn fs_lane_iv_flat() -> [F128; 2] {
+    let [hi, lo] = capacity_iv(TAG_FSCHALNG);
+    [
+        f128_of_u128(noid_core::hardware::tower_to_flat_u128(hi.0)),
+        f128_of_u128(noid_core::hardware::tower_to_flat_u128(lo.0)),
+    ]
+}
+
+/// PoW capacity IV (`FSPOWLNE`) lanes in the flat basis.
+pub fn fs_pow_iv_flat() -> [F128; 2] {
+    let [hi, lo] = capacity_iv(TAG_FS_POW_LANE);
+    [
+        f128_of_u128(noid_core::hardware::tower_to_flat_u128(hi.0)),
+        f128_of_u128(noid_core::hardware::tower_to_flat_u128(lo.0)),
+    ]
+}
+
+/// The sponge pad block (`0x80 … 0x01` over one lane) in the flat basis.
+pub fn fs_pad_lane_flat() -> F128 {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0x80;
+    bytes[15] = 0x01;
+    let tower = u128::from_le_bytes(bytes);
+    f128_of_u128(noid_core::hardware::tower_to_flat_u128(tower))
+}
+
+/// Lane-oriented Fiat-Shamir challenger (see module section above).
+#[derive(Clone)]
+pub struct FsLaneChallenger {
+    /// Sponge state in the FLAT basis (bit-identical to circuit wires).
+    state: [F128; 4],
+    buffered: Option<F128>,
+    pending: Option<F128>,
+    perms: usize,
+}
+
+/// Run the production Poseidon2b permutation on a flat-basis state.
+fn permute_flat(state: &mut [F128; 4]) {
+    use noid_core::Block128;
+    use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
+    let mut tower: [Block128; 4] =
+        std::array::from_fn(|i| Block128(flat_to_tower_u128(u128_of_f128(state[i]))));
+    noid_poseidon2b::native::permutation::Poseidon2bPermutation.permute_mut(&mut tower);
+    for i in 0..4 {
+        state[i] = f128_of_u128(tower_to_flat_u128(tower[i].0));
+    }
+}
+
+impl FsLaneChallenger {
+    pub fn new(domain: &[u8]) -> Self {
+        let [iv0, iv1] = fs_lane_iv_flat();
+        let mut c = Self {
+            state: [F128::ZERO, F128::ZERO, iv0, iv1],
+            buffered: None,
+            pending: None,
+            perms: 0,
+        };
+        c.absorb_lane(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
+        for lane in fs_pack_bytes_lanes(domain) {
+            c.absorb_lane(lane);
+        }
+        c
+    }
+
+    /// Permutations executed so far (lockstep pin for the trace gadget).
+    pub fn perms(&self) -> usize {
+        self.perms
+    }
+
+    fn permute(&mut self) {
+        permute_flat(&mut self.state);
+        self.perms += 1;
+    }
+
+    fn absorb_lane(&mut self, lane: F128) {
+        self.pending = None;
+        if let Some(first) = self.buffered.take() {
+            self.state[0] += first;
+            self.state[1] += lane;
+            self.permute();
+        } else {
+            self.buffered = Some(lane);
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(first) = self.buffered.take() {
+            self.state[0] += first;
+            self.state[1] += fs_pad_lane_flat();
+            self.permute();
+        }
+    }
+
+    fn squeeze_lane(&mut self) -> F128 {
+        if let Some(p) = self.pending.take() {
+            return p;
+        }
+        self.flush();
+        let out = self.state[0];
+        self.pending = Some(self.state[1]);
+        self.permute();
+        out
+    }
+
+    /// PoW predicate: one permutation over `[d0 + nonce, d1, POW_IV]`; the
+    /// output lane's top `bits` bits must be zero.
+    fn pow_ok(d0: F128, d1: F128, nonce: u64, bits: u32) -> bool {
+        debug_assert!(bits <= 64);
+        if bits == 0 {
+            return true;
+        }
+        let [iv0, iv1] = fs_pow_iv_flat();
+        let mut state = [d0 + F128 { lo: nonce, hi: 0 }, d1, iv0, iv1];
+        permute_flat(&mut state);
+        (state[0].hi >> (64 - bits)) == 0
+    }
+}
+
+impl Challenger for FsLaneChallenger {
+    fn observe_label(&mut self, label: &[u8]) {
+        self.absorb_lane(fs_op_lane(FS_OP_LABEL, 0, label.len() as u64));
+        for lane in fs_pack_bytes_lanes(label) {
+            self.absorb_lane(lane);
+        }
+    }
+
+    fn observe_f128(&mut self, value: F128) {
+        self.absorb_lane(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SCALAR, 0));
+        self.absorb_lane(value);
+    }
+
+    fn observe_f128_slice(&mut self, values: &[F128]) {
+        self.absorb_lane(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SLICE, values.len() as u64));
+        for v in values {
+            self.absorb_lane(*v);
+        }
+    }
+
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        self.absorb_lane(fs_op_lane(FS_OP_BYTES, 0, bytes.len() as u64));
+        for lane in fs_pack_bytes_lanes(bytes) {
+            self.absorb_lane(lane);
+        }
+    }
+
+    fn sample_f128(&mut self) -> F128 {
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb_lane(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
+        self.squeeze_lane()
+    }
+
+    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb_lane(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SLICE, n as u64));
+        (0..n).map(|_| self.squeeze_lane()).collect()
+    }
+
+    fn grind_pow(&mut self, bits: u32) -> u64 {
+        self.flush();
+        let (d0, d1) = (self.state[0], self.state[1]);
+        let nonce = if bits == 0 {
+            0
+        } else {
+            let mut n = 0u64;
+            loop {
+                if Self::pow_ok(d0, d1, n, bits) {
+                    break n;
+                }
+                n = n.wrapping_add(1);
+            }
+        };
+        self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.absorb_lane(F128 { lo: nonce, hi: 0 });
+        nonce
+    }
+
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+        self.flush();
+        let ok = if bits == 0 {
+            // Canonical zero nonce at zero-bit sites (same non-malleability
+            // rule as FsChallenger).
+            nonce == 0
+        } else {
+            Self::pow_ok(self.state[0], self.state[1], nonce, bits)
+        };
+        self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.absorb_lane(F128 { lo: nonce, hi: 0 });
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

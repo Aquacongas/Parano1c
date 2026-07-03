@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use bench_prover::{fmt_bytes, fmt_ms};
-use noid_ivc_prover::challenger::FsChallenger;
+use noid_ivc_prover::challenger::FsLaneChallenger;
 use noid_ivc_prover::field_r1cs::synthetic_satisfiable;
 use noid_ivc_prover::pcs::{self, PcsParams};
 use noid_ivc_prover::verifier::verify_field;
@@ -61,7 +61,7 @@ fn main() {
         let mut best = Duration::MAX;
         let mut artifacts = None;
         for _ in 0..REPEATS {
-            let mut ch = FsChallenger::new(DOMAIN);
+            let mut ch = FsLaneChallenger::new(DOMAIN);
             let t = Instant::now();
             let out = prove_field(&r1cs, &z, &params, &mut ch);
             let dt = t.elapsed();
@@ -73,7 +73,7 @@ fn main() {
         let (proof, commitment, _claim) = artifacts.unwrap();
 
         // Verify.
-        let mut ch = FsChallenger::new(DOMAIN);
+        let mut ch = FsLaneChallenger::new(DOMAIN);
         let t = Instant::now();
         verify_field(&r1cs, &commitment, &proof, &mut ch).expect("honest proof verifies");
         let verify_time = t.elapsed();
