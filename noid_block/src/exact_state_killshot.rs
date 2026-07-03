@@ -11,18 +11,15 @@
 use noid_chain::reuse_guard::ReuseGuard;
 use noid_chain::state_delta::ExactActionSurface;
 use noid_gkr::{
-    discharge_batched_guard_bucket_reductions_native, discharge_batched_merkle_reductions_native,
-    discharge_batched_slot_leaf_reductions_native, discharge_batched_state_root_reductions_native,
     prove_batched_guard_bucket_killshot, prove_batched_merkle_killshot,
-    prove_batched_slot_leaf_killshot, prove_batched_state_root_killshot,
-    verify_batched_guard_bucket_killshot, verify_batched_merkle_killshot,
-    verify_batched_slot_leaf_killshot, verify_batched_state_root_killshot,
-    BatchedGuardBucketProofKillShot, BatchedMerkleProofKillShot, BatchedSlotLeafProofKillShot,
-    BatchedStateRootProofKillShot, CompositeStateRootInputs, GuardBucketHashInputs, MerkleCircuit,
-    MerklePathInputs, SlotLeafInputs,
+    prove_batched_slot_leaf_killshot, prove_batched_state_root_killshot, MerkleCircuit,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::{TAG_EXSTNOD, TAG_RGDNODE};
+use noid_recursive::block_certificate_backend::{
+    verify_exact_state_killshot as verify_exact_state_killshot_backend,
+    ExactStateKillShotError as BackendExactStateKillShotError,
+};
 
 use crate::exact_state_transition::{
     derive_exact_composite_state_root_inputs, derive_exact_guard_bucket_hash_inputs,
@@ -32,40 +29,13 @@ use crate::exact_state_transition::{
     VerifiedStateTransition,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExactStateKillShotInputs {
-    pub slot_leaves: Vec<SlotLeafInputs>,
-    pub state_paths: Vec<MerklePathInputs>,
-    pub guard_buckets: Option<Vec<GuardBucketHashInputs>>,
-    pub guard_paths: Option<Vec<MerklePathInputs>>,
-    pub state_roots: Vec<CompositeStateRootInputs>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExactStateKillShotProof {
-    pub slot_leaves: BatchedSlotLeafProofKillShot,
-    pub state_paths: BatchedMerkleProofKillShot,
-    pub guard_buckets: Option<BatchedGuardBucketProofKillShot>,
-    pub guard_paths: Option<BatchedMerkleProofKillShot>,
-    pub state_roots: BatchedStateRootProofKillShot,
-}
-
-impl ExactStateKillShotProof {
-    pub fn byte_len(&self, inputs: &ExactStateKillShotInputs) -> usize {
-        self.slot_leaves.byte_len()
-            + self.state_paths.byte_len(&inputs.state_paths)
-            + self
-                .guard_buckets
-                .as_ref()
-                .map_or(0, BatchedGuardBucketProofKillShot::byte_len)
-            + self
-                .guard_paths
-                .as_ref()
-                .zip(inputs.guard_paths.as_ref())
-                .map_or(0, |(proof, paths)| proof.byte_len(paths))
-            + self.state_roots.byte_len()
-    }
-}
+// Shared with the dependency-clean recursive verifier language — the wrapper
+// types live in one place so the verifier logic cannot fork between the block
+// path and the O(1) path (they used to be 1:1 mirrors with per-verify deep
+// conversions).
+pub use noid_recursive::block_certificate_backend::{
+    ExactStateKillShotInputs, ExactStateKillShotProof,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactStateKillShotError {
@@ -207,135 +177,37 @@ pub fn prove_exact_state_killshot(
     })
 }
 
+/// Delegates to the canonical verifier in
+/// `noid_recursive::block_certificate_backend` — the logic used to be
+/// duplicated here line-for-line on mirror types; one copy must stay the
+/// single reference the SVT trace shadows (roadmap O1b / risk R5).
 pub fn verify_exact_state_killshot(
     inputs: &ExactStateKillShotInputs,
     proof: &ExactStateKillShotProof,
 ) -> Result<(), ExactStateKillShotError> {
-    validate_inputs(inputs)?;
-
-    let (slot_result, (state_result, (bucket_result, (guard_path_result, root_result)))) =
-        rayon::join(
-            || {
-                let mut channel = Poseidon2bChannel::new();
-                let reductions = verify_batched_slot_leaf_killshot(
-                    &proof.slot_leaves,
-                    &inputs.slot_leaves,
-                    &mut channel,
-                )
-                .ok_or(ExactStateKillShotError::SlotLeafProofRejected)?;
-                if discharge_batched_slot_leaf_reductions_native(&inputs.slot_leaves, &reductions) {
-                    Ok(())
-                } else {
-                    Err(ExactStateKillShotError::SlotLeafProofRejected)
-                }
-            },
-            || {
-                rayon::join(
-                    || {
-                        let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-                        let mut channel = Poseidon2bChannel::new();
-                        let reductions = verify_batched_merkle_killshot(
-                            &circuit,
-                            &proof.state_paths,
-                            &inputs.state_paths,
-                            &mut channel,
-                        )
-                        .ok_or(ExactStateKillShotError::StateMerkleProofRejected)?;
-                        if discharge_batched_merkle_reductions_native(
-                            &circuit,
-                            &inputs.state_paths,
-                            &reductions,
-                        ) {
-                            Ok(())
-                        } else {
-                            Err(ExactStateKillShotError::StateMerkleProofRejected)
-                        }
-                    },
-                    || {
-                        rayon::join(
-                            || match (&inputs.guard_buckets, &proof.guard_buckets) {
-                                (Some(inputs), Some(proof)) => {
-                                    let mut channel = Poseidon2bChannel::new();
-                                    let reductions = verify_batched_guard_bucket_killshot(
-                                        proof,
-                                        inputs,
-                                        &mut channel,
-                                    )
-                                    .ok_or(ExactStateKillShotError::GuardBucketProofRejected)?;
-                                    if discharge_batched_guard_bucket_reductions_native(
-                                        inputs,
-                                        &reductions,
-                                    ) {
-                                        Ok(())
-                                    } else {
-                                        Err(ExactStateKillShotError::GuardBucketProofRejected)
-                                    }
-                                }
-                                (None, None) => Ok(()),
-                                _ => Err(ExactStateKillShotError::GuardPresenceMismatch),
-                            },
-                            || {
-                                rayon::join(
-                                    || match (&inputs.guard_paths, &proof.guard_paths) {
-                                        (Some(inputs), Some(proof)) => {
-                                            let circuit =
-                                                MerkleCircuit::build_with_tag(TAG_RGDNODE);
-                                            let mut channel = Poseidon2bChannel::new();
-                                            let reductions = verify_batched_merkle_killshot(
-                                                &circuit,
-                                                proof,
-                                                inputs,
-                                                &mut channel,
-                                            )
-                                            .ok_or(
-                                                ExactStateKillShotError::GuardMerkleProofRejected,
-                                            )?;
-                                            if discharge_batched_merkle_reductions_native(
-                                                &circuit,
-                                                inputs,
-                                                &reductions,
-                                            ) {
-                                                Ok(())
-                                            } else {
-                                                Err(
-                                                    ExactStateKillShotError::GuardMerkleProofRejected,
-                                                )
-                                            }
-                                        }
-                                        (None, None) => Ok(()),
-                                        _ => Err(ExactStateKillShotError::GuardPresenceMismatch),
-                                    },
-                                    || {
-                                        let mut channel = Poseidon2bChannel::new();
-                                        let reductions = verify_batched_state_root_killshot(
-                                            &proof.state_roots,
-                                            &inputs.state_roots,
-                                            &mut channel,
-                                        )
-                                        .ok_or(ExactStateKillShotError::StateRootProofRejected)?;
-                                        if discharge_batched_state_root_reductions_native(
-                                            &inputs.state_roots,
-                                            &reductions,
-                                        ) {
-                                            Ok(())
-                                        } else {
-                                            Err(ExactStateKillShotError::StateRootProofRejected)
-                                        }
-                                    },
-                                )
-                            },
-                        )
-                    },
-                )
-            },
-        );
-    slot_result?;
-    state_result?;
-    bucket_result?;
-    guard_path_result?;
-    root_result?;
-
-    Ok(())
+    verify_exact_state_killshot_backend(inputs, proof).map_err(|error| match error {
+        BackendExactStateKillShotError::EmptyDerivedInput => {
+            ExactStateKillShotError::EmptyDerivedInput
+        }
+        BackendExactStateKillShotError::GuardPresenceMismatch => {
+            ExactStateKillShotError::GuardPresenceMismatch
+        }
+        BackendExactStateKillShotError::SlotLeafProofRejected => {
+            ExactStateKillShotError::SlotLeafProofRejected
+        }
+        BackendExactStateKillShotError::StateMerkleProofRejected => {
+            ExactStateKillShotError::StateMerkleProofRejected
+        }
+        BackendExactStateKillShotError::GuardBucketProofRejected => {
+            ExactStateKillShotError::GuardBucketProofRejected
+        }
+        BackendExactStateKillShotError::GuardMerkleProofRejected => {
+            ExactStateKillShotError::GuardMerkleProofRejected
+        }
+        BackendExactStateKillShotError::StateRootProofRejected => {
+            ExactStateKillShotError::StateRootProofRejected
+        }
+    })
 }
 
 #[cfg(test)]

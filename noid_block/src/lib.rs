@@ -63,7 +63,8 @@ pub use history_claim::{
 };
 pub use validate::{
     accept_block, accept_block_timeless, accept_block_timeless_with_artifacts,
-    accept_block_with_artifacts, derive_no_user_tx_validation_artifacts,
+    accept_block_timeless_with_artifacts_with_auth_verifier, accept_block_with_artifacts,
+    derive_no_user_tx_validation_artifacts,
     validate_block_auth_sidecar_shape, validate_block_authorizations, validate_block_full,
     validate_block_full_timeless, validate_block_full_timeless_with_artifacts,
     AcceptedBlockRawValidationOutput, AcceptedBlockValidationArtifacts,

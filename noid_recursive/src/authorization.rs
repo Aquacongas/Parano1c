@@ -15,7 +15,7 @@ use noid_gkr::{
     canonical_authorization_statement_from_body, init_owner_auth_gkr_channel,
     verify_owner_auth_killshot_with_claims, CanonicalAuthorizationStatement, OwnerAuthCircuit,
     OwnerAuthProofKillShot, OwnerAuthVerifierClaims, VerifiedAuthorization,
-    VerifiedAuthorizationBatch,
+    VerifiedAuthorizationBatch, VerifyAuthorizationError,
 };
 use noid_poseidon2b::Poseidon2bChannel;
 use rayon::prelude::*;
@@ -84,24 +84,29 @@ pub enum AuthorizationBatchError {
     },
 }
 
-fn verify_authorization_statement_with_trace(
+/// Canonical traced form of `noid_gkr::verify_authorization_statement_proof`:
+/// the same checks with the same error semantics, additionally capturing the
+/// verifier's FS transcript and final claims for recursive component inputs.
+///
+/// The `AcceptBlock` batch replay injects this through a tracing
+/// `AuthorizationVerifier` so every owner-auth killshot is verified exactly
+/// once per block.
+pub fn verify_authorization_statement_proof_with_trace(
     statement: &CanonicalAuthorizationStatement,
     proof: &OwnerAuthProofKillShot,
-) -> Result<(VerifiedAuthorization, AuthorizationVerifierTrace), AuthorizationBatchError> {
-    if statement.public.tx_body_hash != statement.tx_body_hash {
-        return Err(AuthorizationBatchError::Proof {
-            tx_index: statement.tx_index,
-        });
-    }
-
+) -> Result<(VerifiedAuthorization, AuthorizationVerifierTrace), VerifyAuthorizationError> {
     let circuit = OwnerAuthCircuit::build(statement.public.layout);
     let mut channel = TracingPoseidon2bChannel::new();
     init_owner_auth_gkr_channel(&mut channel);
     let verifier_claims =
         verify_owner_auth_killshot_with_claims(proof, &circuit, &statement.public, &mut channel)
-            .ok_or(AuthorizationBatchError::Proof {
-                tx_index: statement.tx_index,
-            })?;
+            .ok_or(VerifyAuthorizationError::AuthProof)?;
+
+    if statement.public.tx_body_hash != statement.tx_body_hash {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "statement tx_body_hash does not match canonical owner-auth public input".to_string(),
+        ));
+    }
 
     let verified = VerifiedAuthorization {
         tx_index: statement.tx_index,
@@ -117,6 +122,17 @@ fn verify_authorization_statement_with_trace(
         verifier_claims,
     };
     Ok((verified, trace))
+}
+
+fn verify_authorization_statement_with_trace(
+    statement: &CanonicalAuthorizationStatement,
+    proof: &OwnerAuthProofKillShot,
+) -> Result<(VerifiedAuthorization, AuthorizationVerifierTrace), AuthorizationBatchError> {
+    verify_authorization_statement_proof_with_trace(statement, proof).map_err(|_| {
+        AuthorizationBatchError::Proof {
+            tx_index: statement.tx_index,
+        }
+    })
 }
 
 pub fn verify_authorization_batch_native(

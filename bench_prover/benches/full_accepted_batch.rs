@@ -508,14 +508,14 @@ where
     let accepted_claim_batch_digest = accepted_claim_batch_digest(&out);
     let (accepted_claim_digest_proof_time, accepted_claim_digest_proof) = time_once(|| {
         prove_accepted_claim_batch_digest(
-            &out.proof_components.accepted_claim_witness,
+            &out.proof_components.component_inputs.accepted_claim_witness,
             &out.accepted_claim_batch,
         )
         .expect("accepted-claim batch digest proof builds")
     });
     let (accepted_claim_digest_verify_time, ()) = time_once(|| {
         verify_accepted_claim_batch_digest(
-            &out.proof_components.accepted_claim_witness,
+            &out.proof_components.component_inputs.accepted_claim_witness,
             &out.accepted_claim_batch,
             &accepted_claim_digest_proof,
         )
@@ -588,13 +588,13 @@ where
         "    blocks={} claims={} build_fixture={} prove={} verify={} proof={} end_height={} start_height={} suffix_budget={}",
         witness.items.len(),
         out.proof_components
-            .accepted_claim_witness
+            .component_inputs.accepted_claim_witness
             .accepted_block_claims
             .len(),
         fmt_ms(build_time),
         fmt_ms(prove_time),
         fmt_ms(verify_time),
-        fmt_bytes(proof.byte_len(&out.proof_components)),
+        fmt_bytes(proof.byte_len(&out.proof_components.component_inputs)),
         out.accepted_claim_batch.consensus_state.height,
         start_consensus.height,
         RETAINED_WINDOW_BLOCKS.saturating_sub(CHECKPOINT_BATCH_TARGET_BLOCKS)
@@ -669,12 +669,12 @@ where
     );
     println!(
         "    components claim_hashes={} exact_state={} auth_traces={} standard_spines={} sweep_spines={} tx_root_paths={}",
-        out.proof_components.accepted_claim_hash_inputs.len(),
+        out.proof_components.component_inputs.accepted_claim_hash_inputs.len(),
         proof.exact_state.len(),
         proof.authorization_transcripts.len(),
         usize::from(proof.tx_body_standard.is_some()),
         usize::from(proof.tx_body_sweep.is_some()),
-        out.proof_components.tx_root_inputs.len()
+        out.proof_components.component_inputs.tx_root_inputs.len()
     );
 }
 

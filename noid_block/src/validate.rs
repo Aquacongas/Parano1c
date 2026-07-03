@@ -128,15 +128,22 @@ impl AuthorizationVerifier for OwnerAuthAuthorizationVerifier {
         statement: &CanonicalAuthorizationStatement,
         proof: &AuthorizationProof,
     ) -> Result<VerifiedAuthorization, VerifyBlockError> {
-        match verify_authorization_statement_proof(statement, proof) {
-            Ok(verified) => Ok(verified),
-            Err(VerifyAuthorizationError::AuthProof) => {
-                Err(VerifyBlockError::AuthKillShot(statement.tx_index))
-            }
-            Err(VerifyAuthorizationError::OwnerAuthStatement(_))
-            | Err(VerifyAuthorizationError::PublicLogic(_)) => {
-                Err(VerifyBlockError::AuthSpineBridge(statement.tx_index))
-            }
+        verify_authorization_statement_proof(statement, proof)
+            .map_err(|error| map_verify_authorization_error(error, statement.tx_index))
+    }
+}
+
+/// Map [`VerifyAuthorizationError`] to the block-level error exactly as the
+/// production `AcceptBlock` authorization step reports it. Shared by every
+/// [`AuthorizationVerifier`] implementation so error semantics cannot drift.
+pub(crate) fn map_verify_authorization_error(
+    error: VerifyAuthorizationError,
+    tx_index: usize,
+) -> VerifyBlockError {
+    match error {
+        VerifyAuthorizationError::AuthProof => VerifyBlockError::AuthKillShot(tx_index),
+        VerifyAuthorizationError::OwnerAuthStatement(_) | VerifyAuthorizationError::PublicLogic(_) => {
+            VerifyBlockError::AuthSpineBridge(tx_index)
         }
     }
 }
@@ -175,6 +182,7 @@ pub fn validate_block_full(
         TimestampPolicy::Live(local_time),
         anchor,
         state,
+        &OwnerAuthAuthorizationVerifier,
     )
     .map(|output| output.state_root)
 }
@@ -232,6 +240,7 @@ pub fn validate_block_full_timeless_with_artifacts(
         TimestampPolicy::Timeless,
         anchor,
         state,
+        &OwnerAuthAuthorizationVerifier,
     )
 }
 
@@ -242,7 +251,7 @@ enum TimestampPolicy {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_block_full_inner(
+fn validate_block_full_inner<V: AuthorizationVerifier>(
     block: &Block,
     proof: &BlockProof,
     auth_sidecar: &BlockAuthSidecar,
@@ -252,6 +261,7 @@ fn validate_block_full_inner(
     timestamp_policy: TimestampPolicy,
     anchor: &AnchorInfo,
     state: &mut ChainState,
+    auth_verifier: &V,
 ) -> Result<AcceptedBlockValidationOutput, FullValidationError> {
     // Header + tx checks (cheap, fail-fast — no state reads, no apply_block).
     match timestamp_policy {
@@ -289,12 +299,8 @@ fn validate_block_full_inner(
         ));
     }
     validate_block_public_logic(block).map_err(FullValidationError::ZkProof)?;
-    let authorization = validate_block_authorizations_with_output(
-        block,
-        auth_sidecar,
-        &OwnerAuthAuthorizationVerifier,
-    )
-    .map_err(FullValidationError::ZkProof)?;
+    let authorization = validate_block_authorizations_with_output(block, auth_sidecar, auth_verifier)
+        .map_err(FullValidationError::ZkProof)?;
 
     let surface =
         build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
@@ -379,17 +385,23 @@ fn validate_minimal_block_proof_shape(
 }
 
 fn validate_block_public_logic(block: &Block) -> Result<(), VerifyBlockError> {
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
-        if tx.body.is_coinbase {
-            continue;
-        }
-        let facts = validate_public_tx_logic(&tx.body)
-            .map_err(|error| VerifyBlockError::TxPublicLogic { tx_index, error })?;
-        if tx.tx_body_hash != facts.tx_body_hash {
-            return Err(VerifyBlockError::TxPublicInputsMismatch { tx_index });
-        }
-    }
-    Ok(())
+    let results: Vec<Result<(), VerifyBlockError>> = block
+        .transactions
+        .par_iter()
+        .enumerate()
+        .map(|(tx_index, tx)| {
+            if tx.body.is_coinbase {
+                return Ok(());
+            }
+            let facts = validate_public_tx_logic(&tx.body)
+                .map_err(|error| VerifyBlockError::TxPublicLogic { tx_index, error })?;
+            if tx.tx_body_hash != facts.tx_body_hash {
+                return Err(VerifyBlockError::TxPublicInputsMismatch { tx_index });
+            }
+            Ok(())
+        })
+        .collect();
+    results.into_iter().collect()
 }
 
 pub fn validate_block_authorizations<V: AuthorizationVerifier>(
@@ -598,6 +610,7 @@ pub fn accept_block_with_artifacts(
         TimestampPolicy::Live(local_time),
         anchor,
         state,
+        &OwnerAuthAuthorizationVerifier,
     )
 }
 
@@ -642,6 +655,38 @@ pub fn accept_block_timeless_with_artifacts(
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
+    accept_block_timeless_with_artifacts_with_auth_verifier(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        state,
+        &OwnerAuthAuthorizationVerifier,
+    )
+}
+
+/// [`accept_block_timeless_with_artifacts`] with a caller-supplied
+/// authorization verifier.
+///
+/// The batch replay (`verify_full_accepted_block_batch_native`) injects a
+/// tracing verifier here so each owner-auth killshot is verified exactly once,
+/// with its FS transcript captured for the recursive component inputs, instead
+/// of re-verifying the sidecar in a second pass.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_timeless_with_artifacts_with_auth_verifier<V: AuthorizationVerifier>(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    state: &mut ChainState,
+    auth_verifier: &V,
+) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
     accept_block_inner_with_artifacts(
         block,
         block_proof_bytes,
@@ -652,6 +697,7 @@ pub fn accept_block_timeless_with_artifacts(
         TimestampPolicy::Timeless,
         anchor,
         state,
+        auth_verifier,
     )
 }
 
@@ -677,12 +723,13 @@ fn accept_block_inner(
         timestamp_policy,
         anchor,
         state,
+        &OwnerAuthAuthorizationVerifier,
     )
     .map(|output| output.state_root)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn accept_block_inner_with_artifacts(
+fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
     block: &Block,
     block_proof_bytes: &[u8],
     block_auth_sidecar_bytes: &[u8],
@@ -692,6 +739,7 @@ fn accept_block_inner_with_artifacts(
     timestamp_policy: TimestampPolicy,
     anchor: &AnchorInfo,
     state: &mut ChainState,
+    auth_verifier: &V,
 ) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
     if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
         || !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len())
@@ -809,6 +857,7 @@ fn accept_block_inner_with_artifacts(
         timestamp_policy,
         anchor,
         state,
+        auth_verifier,
     )
     .map(|output| AcceptedBlockRawValidationOutput {
         state_root: output.state_root,

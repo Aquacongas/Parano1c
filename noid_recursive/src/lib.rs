@@ -35,7 +35,8 @@ pub use accepted_batch::{
 pub use accumulator::{genesis_accumulator, ChainAccumulator};
 pub use authorization::{
     verify_authorization_batch_native, verify_authorization_batch_native_with_traces,
-    AuthorizationBatchError, AuthorizationVerifierTrace, FiatShamirTraceOp,
+    verify_authorization_statement_proof_with_trace, AuthorizationBatchError,
+    AuthorizationVerifierTrace, FiatShamirTraceOp,
 };
 pub use block_certificate::{
     accepted_block_certificate_auth_sidecar_digest, accepted_block_certificate_batch_statement,

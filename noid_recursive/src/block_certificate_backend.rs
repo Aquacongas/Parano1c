@@ -50,7 +50,7 @@ use crate::fs_transcript::{
 use crate::header_integer::HeaderIntegerBatchTrace;
 use crate::pow_header::RecursiveConsensusState;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationComponentInput {
     pub block_index: usize,
     pub tx_index: usize,
@@ -58,7 +58,7 @@ pub struct AuthorizationComponentInput {
     pub public: OwnerAuthPublicInputs,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactStateKillShotInputs {
     pub slot_leaves: Vec<SlotLeafInputs>,
     pub state_paths: Vec<MerklePathInputs>,
@@ -67,7 +67,7 @@ pub struct ExactStateKillShotInputs {
     pub state_roots: Vec<CompositeStateRootInputs>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactStateKillShotProof {
     pub slot_leaves: BatchedSlotLeafProofKillShot,
     pub state_paths: BatchedMerkleProofKillShot,
@@ -93,7 +93,7 @@ impl ExactStateKillShotProof {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockBatchComponentInputs {
     pub accepted_claim_witness: AcceptedClaimBatchWitness,
     pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatement>,
@@ -111,7 +111,7 @@ pub struct AcceptedBlockBatchComponentInputs {
     pub authorization_totals: VerifiedAuthorizationBatch,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockBatchComponentProof {
     pub accepted_claim_hash: AcceptedClaimHashProofKillShot,
     pub tx_body_standard: Option<BlockSpineProof>,
@@ -197,41 +197,102 @@ pub fn verify_accepted_block_batch_components(
 ) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentError> {
     validate_component_shape(inputs, proof)?;
     validate_certificate_statement_component_shape(inputs)?;
-    verify_accepted_claim_hash_component(inputs, proof)?;
-    verify_standard_tx_body_component(inputs, proof)?;
-    verify_sweep_tx_body_component(inputs, proof)?;
-    verify_tx_root_component(inputs, proof)?;
-    verify_authorization_components(inputs)?;
-    verify_authorization_transcript_components(inputs, proof)?;
 
-    let accepted_claim_batch = verify_accepted_claim_batch_with_header_trace(
-        start_consensus,
-        start_accumulator,
-        &inputs.accepted_claim_witness,
-        &inputs.header_integer_trace,
-    )
-    .map_err(AcceptedBlockBatchComponentError::AcceptedClaimBatch)?;
+    // All component verifications are independent, so run them as one parallel
+    // join tree (mirroring the prover side in `noid_block`). Results are
+    // unwrapped below in the same order the old sequential code checked them,
+    // so error precedence is unchanged when several components fail at once.
+    let (
+        (claim_hash_result, (standard_result, sweep_result)),
+        (
+            (tx_root_result, authorization_result),
+            (transcript_result, (claim_batch_result, (checkpoint_result, exact_state_result))),
+        ),
+    ) = rayon::join(
+        || {
+            rayon::join(
+                || verify_accepted_claim_hash_component(inputs, proof),
+                || {
+                    rayon::join(
+                        || verify_standard_tx_body_component(inputs, proof),
+                        || verify_sweep_tx_body_component(inputs, proof),
+                    )
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || verify_tx_root_component(inputs, proof),
+                        || verify_authorization_components(inputs),
+                    )
+                },
+                || {
+                    rayon::join(
+                        || verify_authorization_transcript_components(inputs, proof),
+                        || {
+                            rayon::join(
+                                || {
+                                    verify_accepted_claim_batch_with_header_trace(
+                                        start_consensus,
+                                        start_accumulator,
+                                        &inputs.accepted_claim_witness,
+                                        &inputs.header_integer_trace,
+                                    )
+                                    .map_err(AcceptedBlockBatchComponentError::AcceptedClaimBatch)
+                                },
+                                || {
+                                    rayon::join(
+                                        || {
+                                            verify_checkpoint_poseidon(
+                                                start_accumulator,
+                                                end_accumulator,
+                                                &inputs.accepted_claim_witness,
+                                                &proof.checkpoint_poseidon,
+                                            )
+                                            .map_err(
+                                                AcceptedBlockBatchComponentError::CheckpointPoseidon,
+                                            )
+                                        },
+                                        || {
+                                            inputs
+                                                .exact_state_killshot_inputs
+                                                .par_iter()
+                                                .zip(proof.exact_state.par_iter())
+                                                .enumerate()
+                                                .try_for_each(|(index, (inputs, proof))| {
+                                                    verify_exact_state_killshot(inputs, proof)
+                                                        .map_err(|source| {
+                                                            AcceptedBlockBatchComponentError::ExactState {
+                                                                index,
+                                                                source,
+                                                            }
+                                                        })
+                                                })
+                                        },
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+
+    claim_hash_result?;
+    standard_result?;
+    sweep_result?;
+    tx_root_result?;
+    authorization_result?;
+    transcript_result?;
+    let accepted_claim_batch = claim_batch_result?;
     if accepted_claim_batch.accumulator != *end_accumulator {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
-
-    verify_checkpoint_poseidon(
-        start_accumulator,
-        end_accumulator,
-        &inputs.accepted_claim_witness,
-        &proof.checkpoint_poseidon,
-    )
-    .map_err(AcceptedBlockBatchComponentError::CheckpointPoseidon)?;
-
-    inputs
-        .exact_state_killshot_inputs
-        .par_iter()
-        .zip(proof.exact_state.par_iter())
-        .enumerate()
-        .try_for_each(|(index, (inputs, proof))| {
-            verify_exact_state_killshot(inputs, proof)
-                .map_err(|source| AcceptedBlockBatchComponentError::ExactState { index, source })
-        })?;
+    checkpoint_result?;
+    exact_state_result?;
 
     Ok(accepted_claim_batch)
 }

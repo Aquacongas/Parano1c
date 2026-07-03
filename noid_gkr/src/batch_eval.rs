@@ -402,23 +402,44 @@ fn evaluate_w_at(claims: &[EvalClaim], alphas: &[Block128], r: &[Block128]) -> B
     acc
 }
 
+fn linear_claim_w_contribution(
+    claim: &LinearEvalClaim,
+    alpha: Block128,
+    r: &[Block128],
+) -> Block128 {
+    let mut acc = Block128::ZERO;
+    for term in &claim.terms {
+        debug_assert_eq!(term.point.len(), r.len());
+        let eq = if let Some(index) = boolean_point_index(&term.point) {
+            eq_at_boolean_index(index, term.point.len(), r)
+        } else {
+            eq_ind(&term.point, r)
+        };
+        acc += alpha * term.coeff * eq;
+    }
+    acc
+}
+
+/// Claim-count threshold above which the public w(r) evaluation fans out to
+/// rayon. Field addition is XOR, so the parallel reduction is bit-exact.
+const LINEAR_W_PAR_THRESHOLD: usize = 1024;
+
 fn evaluate_linear_w_at(
     claims: &[LinearEvalClaim],
     alphas: &[Block128],
     r: &[Block128],
 ) -> Block128 {
     debug_assert_eq!(claims.len(), alphas.len());
+    if claims.len() >= LINEAR_W_PAR_THRESHOLD {
+        return claims
+            .par_iter()
+            .zip(alphas.par_iter())
+            .map(|(claim, &alpha)| linear_claim_w_contribution(claim, alpha, r))
+            .reduce(|| Block128::ZERO, |a, b| a + b);
+    }
     let mut acc = Block128::ZERO;
     for (claim, &alpha) in claims.iter().zip(alphas.iter()) {
-        for term in &claim.terms {
-            debug_assert_eq!(term.point.len(), r.len());
-            let eq = if let Some(index) = boolean_point_index(&term.point) {
-                eq_at_boolean_index(index, term.point.len(), r)
-            } else {
-                eq_ind(&term.point, r)
-            };
-            acc += alpha * term.coeff * eq;
-        }
+        acc += linear_claim_w_contribution(claim, alpha, r);
     }
     acc
 }
@@ -558,6 +579,13 @@ fn initial_multi_claim(
 }
 
 fn initial_linear_claim(claims: &[LinearEvalClaim], alphas: &[Block128]) -> Block128 {
+    if claims.len() >= LINEAR_W_PAR_THRESHOLD {
+        return claims
+            .par_iter()
+            .zip(alphas.par_iter())
+            .map(|(claim, &alpha)| alpha * claim.value)
+            .reduce(|| Block128::ZERO, |a, b| a + b);
+    }
     claims
         .iter()
         .zip(alphas.iter())

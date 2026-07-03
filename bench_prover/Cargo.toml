@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "full_accepted_batch"
 harness = false
+
+[[bench]]
+name = "tier1_shape_stats"
+harness = false
