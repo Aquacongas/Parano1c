@@ -34,15 +34,15 @@ use crate::accepted_batch::{
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_receipt,
-    accepted_block_certificate_receipt_chain_claim, accepted_block_certificate_validity_handle,
+    accepted_block_certificate_receipt_chain_claim, accepted_block_receipt_projection_handle,
     verify_accepted_block_certificate_receipt_projection,
-    verify_accepted_block_certificate_validity_handle, AcceptedBlockCertificateBatchError,
+    verify_accepted_block_receipt_projection_handle, AcceptedBlockCertificateBatchError,
     AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateProofError,
     AcceptedBlockCertificateReceipt, AcceptedBlockCertificateReceiptError,
-    AcceptedBlockCertificateStatement, AcceptedBlockCertificateValidityHandle,
-    AcceptedBlockCertificateValidityHandleError,
+    AcceptedBlockCertificateStatement, AcceptedBlockReceiptProjectionHandle,
+    AcceptedBlockReceiptProjectionHandleError,
 };
-use crate::block_certificate_ivc::prove_accepted_block_certificate_proof_ivc_receipt;
+use crate::block_certificate_ivc::prove_accepted_block_certificate_receipt_projection_proof;
 use crate::checkpoint_proof::{
     verify_history_checkpoint_step_statement_native, HistoryCheckpointProofError,
     HistoryCheckpointStepStatement, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
@@ -51,8 +51,8 @@ use crate::checkpoint_proof::{
 pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION: u32 = 1;
 pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES: usize = 100 * 1024;
 
-const TRANSCRIPT_DOMAIN: &[u8] = b"noid-recursive-checkpoint-ivc-chunk-core-v1";
-const STATEMENT_DIGEST_DOMAIN: &[u8] = b"NOID/REC/CHK-IVC-STMT/v1";
+const TRANSCRIPT_DOMAIN: &[u8] = b"noid-recursive-checkpoint-ivc-chunk-core";
+const STATEMENT_DIGEST_DOMAIN: &[u8] = b"NOID/REC/CHK-IVC-STMT";
 const CHUNK_CAPACITY: usize = HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize;
 const CHUNK_M: usize = 16;
 const CHUNK_K_LOG: usize = 16;
@@ -88,7 +88,7 @@ const _: () = assert!(SLOT_USEFUL_BITS <= SLOT_BITS);
 pub struct HistoryCheckpointIvcChunkCoreProof {
     pub relation: u32,
     pub chunk_len: u32,
-    pub certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandle>,
+    pub certificate_receipt_projection_handles: Vec<AcceptedBlockReceiptProjectionHandle>,
     pub certificate_receipts: Vec<AcceptedBlockCertificateReceipt>,
     pub accepted_claim_digest_hash_fields: Vec<Block128>,
     pub core_proof_len: u32,
@@ -117,11 +117,11 @@ pub enum HistoryCheckpointIvcChunkCoreError {
         index: usize,
         source: AcceptedBlockCertificateReceiptError,
     },
-    BadCertificateValidityHandle {
+    BadCertificateReceiptProjectionHandle {
         index: usize,
-        source: AcceptedBlockCertificateValidityHandleError,
+        source: AcceptedBlockReceiptProjectionHandleError,
     },
-    BadCertificateValidityHandleProof {
+    BadCertificateReceiptProjectionProof {
         index: usize,
         source: AcceptedBlockCertificateProofError,
     },
@@ -172,16 +172,16 @@ impl std::fmt::Display for HistoryCheckpointIvcChunkCoreError {
                     "bad checkpoint IVC certificate receipt at {index}: {source}"
                 )
             }
-            Self::BadCertificateValidityHandle { index, source } => {
+            Self::BadCertificateReceiptProjectionHandle { index, source } => {
                 write!(
                     f,
-                    "bad checkpoint IVC certificate validity handle at {index}: {source}"
+                    "bad checkpoint IVC certificate receipt projection handle at {index}: {source}"
                 )
             }
-            Self::BadCertificateValidityHandleProof { index, source } => {
+            Self::BadCertificateReceiptProjectionProof { index, source } => {
                 write!(
                     f,
-                    "bad checkpoint IVC certificate validity handle proof at {index}: {source}"
+                    "bad checkpoint IVC certificate receipt projection handle proof at {index}: {source}"
                 )
             }
             Self::BadAcceptedClaimBatchDigest(source) => {
@@ -256,7 +256,7 @@ pub fn prove_history_checkpoint_ivc_chunk_core(
 pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
     statement: &HistoryCheckpointStepStatement,
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
     accepted_claim_witness: &AcceptedClaimBatchWitness,
     accepted_claim_output: &AcceptedClaimBatchOutput,
@@ -269,7 +269,7 @@ pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
     validate_private_chunk_inputs(
         statement,
         certificate_batch_statement,
-        certificate_validity_handles,
+        certificate_receipt_projection_handles,
         certificate_receipts,
         accepted_claim_witness,
         accepted_claim_output,
@@ -279,7 +279,7 @@ pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
     let r1cs = build_chunk_core_r1cs(
         statement,
         certificate_batch_statement,
-        certificate_validity_handles,
+        certificate_receipt_projection_handles,
         certificate_receipts,
     );
     checkpoint_ivc_trace_step(trace, &mut trace_mark, "build_r1cs");
@@ -316,7 +316,7 @@ pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
     let mut challenger = public_challenger(
         statement,
         certificate_batch_statement,
-        certificate_validity_handles,
+        certificate_receipt_projection_handles,
         certificate_receipts,
     );
     let (proof, commitment, _) =
@@ -337,7 +337,7 @@ pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
     Ok(HistoryCheckpointIvcChunkCoreProof {
         relation: HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION,
         chunk_len: statement.batch_summary.batch_len,
-        certificate_validity_handles: certificate_validity_handles.to_vec(),
+        certificate_receipt_projection_handles: certificate_receipt_projection_handles.to_vec(),
         certificate_receipts: certificate_receipts.to_vec(),
         accepted_claim_digest_hash_fields: accepted_claim_digest_hash_fields.to_vec(),
         core_proof_len: core_proof_len.try_into().map_err(|_| {
@@ -369,9 +369,9 @@ pub fn verify_history_checkpoint_ivc_chunk_core(
             actual: proof.chunk_len as usize,
         });
     }
-    validate_public_certificate_validity_handles(
+    validate_public_certificate_receipt_projection_handles(
         certificate_batch_statement,
-        &proof.certificate_validity_handles,
+        &proof.certificate_receipt_projection_handles,
     )?;
     validate_public_chunk_receipts(certificate_batch_statement, &proof.certificate_receipts)?;
     validate_public_accepted_claim_digest_fields(
@@ -410,14 +410,14 @@ pub fn verify_history_checkpoint_ivc_chunk_core(
     let r1cs = build_chunk_core_r1cs(
         statement,
         certificate_batch_statement,
-        &proof.certificate_validity_handles,
+        &proof.certificate_receipt_projection_handles,
         &proof.certificate_receipts,
     );
     checkpoint_ivc_trace_step(trace, &mut trace_mark, "build_r1cs");
     let mut challenger = public_challenger(
         statement,
         certificate_batch_statement,
-        &proof.certificate_validity_handles,
+        &proof.certificate_receipt_projection_handles,
         &proof.certificate_receipts,
     );
     noid_ivc_prover::verifier::verify(
@@ -458,15 +458,15 @@ fn validate_public_chunk_inputs(
 fn validate_private_chunk_inputs(
     statement: &HistoryCheckpointStepStatement,
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
     accepted_claim_witness: &AcceptedClaimBatchWitness,
     accepted_claim_output: &AcceptedClaimBatchOutput,
 ) -> Result<(), HistoryCheckpointIvcChunkCoreError> {
     let chunk_len = validate_public_chunk_inputs(statement, certificate_batch_statement)?;
-    validate_public_certificate_validity_handles(
+    validate_public_certificate_receipt_projection_handles(
         certificate_batch_statement,
-        certificate_validity_handles,
+        certificate_receipt_projection_handles,
     )?;
     if certificate_receipts.len() != chunk_len {
         return Err(HistoryCheckpointIvcChunkCoreError::BadChunkLength {
@@ -508,6 +508,7 @@ fn validate_private_chunk_inputs(
             || receipt.parent_block_id != header_witness.header.prev_block_hash
             || receipt.parent_state_root != accumulator.state_root
             || receipt.child_state_root != header_witness.header.state_root
+            || receipt.tx_root != header_witness.header.tx_root
             || accepted_block_certificate_receipt_chain_claim(receipt)
                 != accepted_claim_witness.accepted_block_claims[index]
         {
@@ -527,23 +528,26 @@ fn validate_private_chunk_inputs(
     Ok(())
 }
 
-fn validate_public_certificate_validity_handles(
+fn validate_public_certificate_receipt_projection_handles(
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
 ) -> Result<(), HistoryCheckpointIvcChunkCoreError> {
     let chunk_len = certificate_batch_statement.batch_len as usize;
-    if certificate_validity_handles.len() != chunk_len {
+    if certificate_receipt_projection_handles.len() != chunk_len {
         return Err(HistoryCheckpointIvcChunkCoreError::BadChunkLength {
-            actual: certificate_validity_handles.len(),
+            actual: certificate_receipt_projection_handles.len(),
         });
     }
-    for (index, handle) in certificate_validity_handles.iter().enumerate() {
-        verify_accepted_block_certificate_validity_handle(
+    for (index, handle) in certificate_receipt_projection_handles.iter().enumerate() {
+        verify_accepted_block_receipt_projection_handle(
             &certificate_batch_statement.certificate_statement_digests[index],
             handle,
         )
         .map_err(|source| {
-            HistoryCheckpointIvcChunkCoreError::BadCertificateValidityHandle { index, source }
+            HistoryCheckpointIvcChunkCoreError::BadCertificateReceiptProjectionHandle {
+                index,
+                source,
+            }
         })?;
     }
     Ok(())
@@ -634,7 +638,7 @@ fn validate_public_accepted_claim_digest_fields(
 fn build_chunk_core_r1cs(
     statement: &HistoryCheckpointStepStatement,
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
 ) -> BlockR1cs {
     let k = 1usize << CHUNK_K_LOG;
@@ -734,7 +738,7 @@ fn build_chunk_core_r1cs(
         .set(chunk_core_r1cs_statement_digest(
             statement,
             certificate_batch_statement,
-            certificate_validity_handles,
+            certificate_receipt_projection_handles,
             certificate_receipts,
         ))
         .expect("fresh R1CS digest cache accepts compact statement digest");
@@ -768,7 +772,7 @@ fn build_chunk_core_r1cs(
 fn chunk_core_r1cs_statement_digest(
     statement: &HistoryCheckpointStepStatement,
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
 ) -> Digest {
     let constants = [
@@ -788,8 +792,8 @@ fn chunk_core_r1cs_statement_digest(
         bincode::serialize(statement).expect("HistoryCheckpointStepStatement serializes");
     let certificate_bytes = bincode::serialize(certificate_batch_statement)
         .expect("AcceptedBlockCertificateBatchStatement serializes");
-    let handle_bytes = bincode::serialize(certificate_validity_handles)
-        .expect("certificate validity handles serialize");
+    let handle_bytes = bincode::serialize(certificate_receipt_projection_handles)
+        .expect("certificate receipt projection handles serialize");
     let receipt_bytes =
         bincode::serialize(certificate_receipts).expect("certificate receipts serialize");
     poseidon2b_hash_byte_slices(
@@ -956,7 +960,7 @@ fn receipts_and_handles_from_certificate_statements(
 ) -> Result<
     (
         Vec<AcceptedBlockCertificateReceipt>,
-        Vec<AcceptedBlockCertificateValidityHandle>,
+        Vec<AcceptedBlockReceiptProjectionHandle>,
     ),
     HistoryCheckpointIvcChunkCoreError,
 > {
@@ -971,14 +975,18 @@ fn receipts_and_handles_from_certificate_statements(
                     source,
                 },
             )?;
-            let proof = prove_accepted_block_certificate_proof_ivc_receipt(statement).map_err(
-                |source| HistoryCheckpointIvcChunkCoreError::BadCertificateValidityHandleProof {
+            let proof = prove_accepted_block_certificate_receipt_projection_proof(statement)
+                .map_err(|source| {
+                    HistoryCheckpointIvcChunkCoreError::BadCertificateReceiptProjectionProof {
+                        index,
+                        source,
+                    }
+                })?;
+            let handle = accepted_block_receipt_projection_handle(&proof).map_err(|source| {
+                HistoryCheckpointIvcChunkCoreError::BadCertificateReceiptProjectionHandle {
                     index,
                     source,
-                },
-            )?;
-            let handle = accepted_block_certificate_validity_handle(&proof).map_err(|source| {
-                HistoryCheckpointIvcChunkCoreError::BadCertificateValidityHandle { index, source }
+                }
             })?;
             Ok((receipt, handle))
         })
@@ -989,17 +997,17 @@ fn receipts_and_handles_from_certificate_statements(
 fn public_challenger(
     statement: &HistoryCheckpointStepStatement,
     certificate_batch_statement: &AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: &[AcceptedBlockCertificateValidityHandle],
+    certificate_receipt_projection_handles: &[AcceptedBlockReceiptProjectionHandle],
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
 ) -> FsChallenger {
     let mut challenger = FsChallenger::new(TRANSCRIPT_DOMAIN);
-    challenger.observe_label(b"checkpoint-ivc-public-v1");
+    challenger.observe_label(b"checkpoint-ivc-public");
     let statement_bytes =
         bincode::serialize(statement).expect("HistoryCheckpointStepStatement serializes");
     let certificate_bytes = bincode::serialize(certificate_batch_statement)
         .expect("AcceptedBlockCertificateBatchStatement serializes");
-    let handle_bytes = bincode::serialize(certificate_validity_handles)
-        .expect("certificate validity handles serialize");
+    let handle_bytes = bincode::serialize(certificate_receipt_projection_handles)
+        .expect("certificate receipt projection handles serialize");
     let receipt_bytes =
         bincode::serialize(certificate_receipts).expect("certificate receipts serialize");
     challenger.observe_bytes(&statement_bytes);
@@ -1265,25 +1273,35 @@ mod tests {
         ));
 
         let mut bad_handle_digest = proof.clone();
-        bad_handle_digest.certificate_validity_handles[0].statement_digest[0] ^= 1;
+        bad_handle_digest.certificate_receipt_projection_handles[0].statement_digest[0] ^= 1;
         assert!(matches!(
             verify_history_checkpoint_ivc_chunk_core(
                 &fixture.statement,
                 &fixture.certificate_batch_statement,
                 &bad_handle_digest,
             ),
-            Err(HistoryCheckpointIvcChunkCoreError::BadCertificateValidityHandle { index: 0, .. })
+            Err(
+                HistoryCheckpointIvcChunkCoreError::BadCertificateReceiptProjectionHandle {
+                    index: 0,
+                    ..
+                }
+            )
         ));
 
         let mut bad_handle_proof_digest = proof.clone();
-        bad_handle_proof_digest.certificate_validity_handles[0].proof_digest = [0u8; 32];
+        bad_handle_proof_digest.certificate_receipt_projection_handles[0].proof_digest = [0u8; 32];
         assert!(matches!(
             verify_history_checkpoint_ivc_chunk_core(
                 &fixture.statement,
                 &fixture.certificate_batch_statement,
                 &bad_handle_proof_digest,
             ),
-            Err(HistoryCheckpointIvcChunkCoreError::BadCertificateValidityHandle { index: 0, .. })
+            Err(
+                HistoryCheckpointIvcChunkCoreError::BadCertificateReceiptProjectionHandle {
+                    index: 0,
+                    ..
+                }
+            )
         ));
 
         let mut bad_receipt_projection = proof.clone();
@@ -1350,7 +1368,7 @@ mod tests {
         .expect("prove short chunk core");
         assert_eq!(proof.chunk_len, 1);
         assert_eq!(proof.certificate_receipts.len(), 1);
-        assert_eq!(proof.certificate_validity_handles.len(), 1);
+        assert_eq!(proof.certificate_receipt_projection_handles.len(), 1);
         verify_history_checkpoint_ivc_chunk_core(
             &fixture.statement,
             &fixture.certificate_batch_statement,

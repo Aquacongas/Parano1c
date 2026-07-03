@@ -64,7 +64,7 @@ pub fn bind_statement<Ch: Challenger>(
     r1cs: &BlockR1cs,
     commitment: &Commitment,
 ) {
-    challenger.observe_label(b"history-r1cs-v1");
+    challenger.observe_label(b"history-r1cs");
     challenger.observe_bytes(&r1cs.statement_digest());
     let pcs_params = bincode::serialize(&commitment.params).expect("PcsParams serializes");
     challenger.observe_bytes(&pcs_params);

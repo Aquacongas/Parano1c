@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Bench for the fixed accepted-block certificate receipt-projection IVC
-//! backend. This is a sub-relation of the final certificate verifier, not the
-//! tx-dependent block proof.
+//! Bench for the fixed accepted-block certificate receipt-projection backend.
+//! This is a receipt adapter, not the production tx/auth/state block proof.
 
 use std::env;
 
 use noid_poseidon2b::primitives::Digest;
 use noid_recursive::{
-    accepted_block_certificate_validity_handle, prove_accepted_block_certificate_proof_ivc_receipt,
+    accepted_block_receipt_projection_handle,
+    prove_accepted_block_certificate_receipt_projection_proof,
     verify_accepted_block_certificate_proof_checkpoint, AcceptedBlockCertificateStatement,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_BATCH_SIZE,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE, ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M,
+    ACCEPTED_BLOCK_RECEIPT_PROJECTION_K_LOG, ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_BATCH_SIZE,
+    ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_INV_RATE, ACCEPTED_BLOCK_RECEIPT_PROJECTION_M,
 };
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -81,15 +80,15 @@ fn statement() -> AcceptedBlockCertificateStatement {
 }
 
 fn main() {
-    let samples = env_usize("NOID_CERTIFICATE_RECEIPT_IVC_SAMPLES", 3);
+    let samples = env_usize("NOID_CERTIFICATE_RECEIPT_PROJECTION_SAMPLES", 3);
     let statement = statement();
 
-    println!("noid_recursive certificate_receipt_ivc");
-    println!("  backend=accepted_block_certificate_ivc_receipt");
-    println!("  m={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M}");
-    println!("  k_log={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG}");
-    println!("  pcs_log_inv_rate={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE}");
-    println!("  pcs_log_batch_size={ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_BATCH_SIZE}");
+    println!("noid_recursive certificate_receipt_projection");
+    println!("  backend=accepted_block_receipt_projection");
+    println!("  m={ACCEPTED_BLOCK_RECEIPT_PROJECTION_M}");
+    println!("  k_log={ACCEPTED_BLOCK_RECEIPT_PROJECTION_K_LOG}");
+    println!("  pcs_log_inv_rate={ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_INV_RATE}");
+    println!("  pcs_log_batch_size={ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_BATCH_SIZE}");
     println!("  tx_count_dependent=false");
     println!("  final_accept_block_validity=false");
     println!("  samples={samples}");
@@ -99,20 +98,20 @@ fn main() {
     let mut proof = None;
     for _ in 0..samples {
         let (prove_time, built) = time_once(|| {
-            prove_accepted_block_certificate_proof_ivc_receipt(&statement)
-                .expect("certificate receipt IVC proof builds")
+            prove_accepted_block_certificate_receipt_projection_proof(&statement)
+                .expect("certificate receipt-projection proof builds")
         });
         let (verify_time, ()) = time_once(|| {
             verify_accepted_block_certificate_proof_checkpoint(&statement, &built)
-                .expect("certificate receipt IVC proof verifies")
+                .expect("certificate receipt-projection proof verifies")
         });
         prove_times.push(prove_time);
         verify_times.push(verify_time);
         proof = Some(built);
     }
     let proof = proof.expect("at least one sample");
-    let handle = accepted_block_certificate_validity_handle(&proof)
-        .expect("certificate receipt IVC handle builds");
+    let handle = accepted_block_receipt_projection_handle(&proof)
+        .expect("certificate receipt-projection handle builds");
 
     println!("  proof={}", fmt_bytes(proof.byte_len()));
     println!("  backend_proof={}", fmt_bytes(proof.backend_proof.len()));

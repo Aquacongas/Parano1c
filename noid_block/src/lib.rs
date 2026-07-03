@@ -36,9 +36,11 @@ pub use accepted_block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_batch_statement_digest,
     accepted_block_certificate_chain_claim, accepted_block_certificate_record,
     accepted_block_certificate_statement, accepted_block_certificate_statement_digest,
+    block_proof_acceptance_receipt, block_proof_acceptance_receipt_digest,
     verify_accepted_block_certificate_statement_native, AcceptedBlockCertificateBatchError,
     AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateRecord,
     AcceptedBlockCertificateRecordError, AcceptedBlockCertificateStatement,
+    BlockProofAcceptanceReceipt,
 };
 
 pub use exact_state_killshot::{

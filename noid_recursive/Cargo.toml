@@ -21,5 +21,5 @@ name = "checkpoint_ivc"
 harness = false
 
 [[bench]]
-name = "certificate_receipt_ivc"
+name = "certificate_receipt_projection"
 harness = false

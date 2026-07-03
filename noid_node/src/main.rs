@@ -1129,7 +1129,7 @@ fn accepted_block_certificate_record_bytes(
     block_auth_sidecar_bytes: &[u8],
     artifacts: &noid_block::AcceptedBlockValidationArtifacts,
 ) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let statement = noid_block::accepted_block_certificate_statement(
+    let acceptance_receipt = noid_block::block_proof_acceptance_receipt(
         block,
         parent,
         prev_timestamps,
@@ -1139,13 +1139,14 @@ fn accepted_block_certificate_record_bytes(
         block_auth_sidecar_bytes,
         artifacts,
     )?;
-    let record = noid_block::accepted_block_certificate_record(statement).map_err(|e| {
-        noid_block::FullValidationError::Consensus(
-            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                "accepted-block certificate record build failed: {e}"
-            )),
-        )
-    })?;
+    let record =
+        noid_block::accepted_block_certificate_record(acceptance_receipt).map_err(|e| {
+            noid_block::FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                    "accepted-block certificate record build failed: {e}"
+                )),
+            )
+        })?;
     Ok(bincode::serialize(&record).expect("AcceptedBlockCertificateRecord serializes"))
 }
 

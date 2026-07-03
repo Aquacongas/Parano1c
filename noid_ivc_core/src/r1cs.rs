@@ -194,10 +194,7 @@ impl BlockR1cs {
             absorb_matrix(&mut bytes, &self.a_0);
             absorb_matrix(&mut bytes, &self.b_0);
             absorb_matrix(&mut bytes, &self.c_0);
-            noid_poseidon2b::native::poseidon2b_hash_byte_slices(
-                b"NOID/IVC/R1CS-STMT/v1",
-                &[&bytes],
-            )
+            noid_poseidon2b::native::poseidon2b_hash_byte_slices(b"NOID/IVC/R1CS-STMT", &[&bytes])
         })
     }
 

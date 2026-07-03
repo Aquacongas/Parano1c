@@ -654,9 +654,10 @@ where
         .sum();
     let certificate_handle_bytes = bincode::serialized_size(
         &out.proof_components
-            .accepted_block_certificate_validity_handles,
+            .accepted_block_receipt_projection_handles,
     )
-    .expect("certificate validity handles serialize") as usize;
+    .expect("certificate receipt projection handles serialize")
+        as usize;
     let certificate_receipt_bytes =
         bincode::serialized_size(&out.proof_components.accepted_block_certificate_receipts)
             .expect("certificate receipts serialize") as usize;
@@ -678,8 +679,8 @@ where
 }
 
 fn print_chunk_core_part(chunk_core: &HistoryCheckpointIvcChunkCoreProof) {
-    let handle_bytes = bincode::serialized_size(&chunk_core.certificate_validity_handles)
-        .expect("certificate validity handles serialize") as usize;
+    let handle_bytes = bincode::serialized_size(&chunk_core.certificate_receipt_projection_handles)
+        .expect("certificate receipt projection handles serialize") as usize;
     let receipt_bytes = bincode::serialized_size(&chunk_core.certificate_receipts)
         .expect("certificate receipts serialize") as usize;
     let accepted_claim_digest_fields_bytes =

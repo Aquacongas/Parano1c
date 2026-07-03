@@ -37,12 +37,14 @@ use noid_recursive::block_certificate_backend::{
     ExactStateKillShotProof as RecursiveExactStateKillShotProof,
 };
 use noid_recursive::{
-    accepted_block_certificate_receipt, accepted_block_certificate_validity_handle,
+    accepted_block_certificate_receipt,
+    accepted_block_certificate_statement_from_acceptance_receipt,
+    accepted_block_receipt_projection_handle,
     accepted_claim_batch_digest as recursive_accepted_claim_batch_digest,
     advance_history_checkpoint_head_native, build_header_integer_trace,
-    history_checkpoint_head_from_boundary, prove_accepted_block_certificate_proof_ivc_receipt,
-    prove_checkpoint_poseidon, prove_fiat_shamir_transcript_batch_killshot,
-    prove_history_checkpoint_recursive_head_record,
+    history_checkpoint_head_from_boundary,
+    prove_accepted_block_certificate_receipt_projection_proof, prove_checkpoint_poseidon,
+    prove_fiat_shamir_transcript_batch_killshot, prove_history_checkpoint_recursive_head_record,
     prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components,
     verify_accepted_block_certificate_proof_checkpoint,
     verify_accepted_block_certificate_receipt_projection,
@@ -51,10 +53,10 @@ use noid_recursive::{
     verify_history_checkpoint_step_proof_private_components_native,
     verify_pow_header_witness_batch_native, AcceptedBlockCertificateProof,
     AcceptedBlockCertificateProofError, AcceptedBlockCertificateReceipt,
-    AcceptedBlockCertificateReceiptError, AcceptedBlockCertificateValidityHandle,
-    AcceptedBlockCertificateValidityHandleError, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
-    AcceptedClaimBatchWitness, AuthorizationVerifierTrace, ChainAccumulator,
-    CheckpointPoseidonError, CheckpointPoseidonProof, FiatShamirTraceOp,
+    AcceptedBlockCertificateReceiptError, AcceptedBlockReceiptProjectionHandle,
+    AcceptedBlockReceiptProjectionHandleError, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
+    AcceptedClaimBatchWitness, AuthorizationVerifierTrace, BlockProofAcceptanceReceipt,
+    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof, FiatShamirTraceOp,
     FiatShamirTranscriptBatchProofKillShot, HeaderIntegerBatchTrace, HeaderIntegerTraceError,
     HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointHead, HistoryCheckpointProof,
     HistoryCheckpointProofError, HistoryCheckpointStepProof, HistoryCheckpointStepProofError,
@@ -64,9 +66,9 @@ use noid_recursive::{
 
 use crate::{
     accept_block_timeless_with_artifacts, accepted_block_certificate_batch_statement,
-    accepted_block_certificate_chain_claim, accepted_block_certificate_statement,
-    accepted_block_claim_fields_from_transcript, accepted_block_claim_from_transcript,
-    accepted_block_claim_transcript, derive_exact_state_killshot_inputs,
+    accepted_block_certificate_chain_claim, accepted_block_claim_fields_from_transcript,
+    accepted_block_claim_from_transcript, accepted_block_claim_transcript,
+    block_proof_acceptance_receipt, derive_exact_state_killshot_inputs,
     AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatement,
     AcceptedBlockCertificateRecord, AcceptedBlockCertificateStatement, BlockAuthSidecar,
     BlockProof, ExactStateKillShotError, ExactStateKillShotInputs, ExactStateKillShotProof,
@@ -108,10 +110,11 @@ pub struct FullAcceptedBlockBatchOutput {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FullAcceptedBlockBatchProofComponents {
     pub accepted_claim_witness: AcceptedClaimBatchWitness,
+    pub accepted_block_acceptance_receipts: Vec<BlockProofAcceptanceReceipt>,
     pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatement>,
     pub accepted_block_certificate_proofs: Vec<AcceptedBlockCertificateProof>,
     pub accepted_block_certificate_receipts: Vec<AcceptedBlockCertificateReceipt>,
-    pub accepted_block_certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandle>,
+    pub accepted_block_receipt_projection_handles: Vec<AcceptedBlockReceiptProjectionHandle>,
     pub accepted_claim_hash_inputs: Vec<AcceptedClaimHashInputs>,
     pub tx_body_standard_inputs: Vec<SpineInputs>,
     pub tx_body_standard_hashes: Vec<[Block128; 2]>,
@@ -264,19 +267,20 @@ pub enum FullAcceptedBlockBatchError {
     ComponentShapeMismatch,
     AcceptedClaimBatch(AcceptedClaimBatchError),
     CertificateBatch(AcceptedBlockCertificateBatchError),
-    CertificateValidityHandleProof {
+    CertificateReceiptProjectionProof {
         index: usize,
         source: AcceptedBlockCertificateProofError,
     },
-    CertificateValidityHandle {
+    CertificateReceiptProjectionHandle {
         index: usize,
-        source: AcceptedBlockCertificateValidityHandleError,
+        source: AcceptedBlockReceiptProjectionHandleError,
     },
     CertificateReceipt {
         index: usize,
         source: AcceptedBlockCertificateReceiptError,
     },
     CertificateProofShape {
+        acceptance_receipts: usize,
         statements: usize,
         proofs: usize,
         receipts: usize,
@@ -285,7 +289,7 @@ pub enum FullAcceptedBlockBatchError {
     CertificateProofStatementMismatch {
         index: usize,
     },
-    CertificateValidityHandleMismatch {
+    CertificateReceiptProjectionHandleMismatch {
         index: usize,
     },
     CheckpointHead(HistoryCheckpointProofError),
@@ -323,6 +327,7 @@ pub fn verify_full_accepted_block_batch_native(
     let mut rolling_consensus = start_consensus.clone();
     let mut header_witnesses = Vec::with_capacity(witness.items.len());
     let mut accepted_block_claims = Vec::with_capacity(witness.items.len());
+    let mut accepted_block_acceptance_receipts = Vec::with_capacity(witness.items.len());
     let mut accepted_block_certificate_statements = Vec::with_capacity(witness.items.len());
     let mut accepted_claim_hash_inputs = Vec::with_capacity(witness.items.len());
     let mut tx_body_standard_inputs = Vec::new();
@@ -455,7 +460,7 @@ pub fn verify_full_accepted_block_batch_native(
             &sidecar,
         )
         .map_err(|source| FullAcceptedBlockBatchError::Claim { index, source })?;
-        let certificate_statement = accepted_block_certificate_statement(
+        let acceptance_receipt = block_proof_acceptance_receipt(
             &item.block,
             &parent,
             &prev_timestamps,
@@ -466,6 +471,8 @@ pub fn verify_full_accepted_block_batch_native(
             &validation.artifacts,
         )
         .map_err(|source| FullAcceptedBlockBatchError::Claim { index, source })?;
+        let certificate_statement =
+            accepted_block_certificate_statement_from_acceptance_receipt(&acceptance_receipt);
         let claim = accepted_block_certificate_chain_claim(&certificate_statement);
         if claim != accepted_block_claim_from_transcript(&transcript) {
             return Err(FullAcceptedBlockBatchError::Claim {
@@ -496,6 +503,7 @@ pub fn verify_full_accepted_block_batch_native(
                 .map_err(|source| FullAcceptedBlockBatchError::HeaderWork { index, source })?;
         header_witnesses.push(header_witness);
         accepted_block_claims.push(claim);
+        accepted_block_acceptance_receipts.push(acceptance_receipt);
         accepted_block_certificate_statements.push(certificate_statement);
         parent = item.block.header.clone();
     }
@@ -508,19 +516,17 @@ pub fn verify_full_accepted_block_batch_native(
         .par_iter()
         .enumerate()
         .map(|(index, statement)| {
-            let proof = prove_accepted_block_certificate_proof_ivc_receipt(statement).map_err(
-                |source| FullAcceptedBlockBatchError::CertificateValidityHandleProof {
-                    index,
-                    source,
-                },
-            )?;
-            let handle = accepted_block_certificate_validity_handle(&proof).map_err(|source| {
-                FullAcceptedBlockBatchError::CertificateValidityHandle { index, source }
+            let proof = prove_accepted_block_certificate_receipt_projection_proof(statement)
+                .map_err(|source| {
+                    FullAcceptedBlockBatchError::CertificateReceiptProjectionProof { index, source }
+                })?;
+            let handle = accepted_block_receipt_projection_handle(&proof).map_err(|source| {
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandle { index, source }
             })?;
             Ok((proof, handle))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (accepted_block_certificate_proofs, accepted_block_certificate_validity_handles): (
+    let (accepted_block_certificate_proofs, accepted_block_receipt_projection_handles): (
         Vec<_>,
         Vec<_>,
     ) = certificate_proof_pairs.into_iter().unzip();
@@ -545,10 +551,11 @@ pub fn verify_full_accepted_block_batch_native(
         end_state: state,
         proof_components: FullAcceptedBlockBatchProofComponents {
             accepted_claim_witness,
+            accepted_block_acceptance_receipts,
             accepted_block_certificate_statements,
             accepted_block_certificate_proofs,
             accepted_block_certificate_receipts,
-            accepted_block_certificate_validity_handles,
+            accepted_block_receipt_projection_handles,
             accepted_claim_hash_inputs,
             tx_body_standard_inputs,
             tx_body_standard_hashes,
@@ -815,10 +822,11 @@ fn certificate_batch_witness_from_retained_output(
 ) -> Result<AcceptedBlockCertificateBatchWitness, FullAcceptedBlockBatchError> {
     let components = &output.proof_components;
     let len = retained_witness.items.len();
-    if components.accepted_block_certificate_statements.len() != len
+    if components.accepted_block_acceptance_receipts.len() != len
+        || components.accepted_block_certificate_statements.len() != len
         || components.accepted_block_certificate_proofs.len() != len
         || components.accepted_block_certificate_receipts.len() != len
-        || components.accepted_block_certificate_validity_handles.len() != len
+        || components.accepted_block_receipt_projection_handles.len() != len
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -827,11 +835,13 @@ fn certificate_batch_witness_from_retained_output(
         .map(|index| AcceptedBlockCertificateBatchItem {
             header: retained_witness.items[index].block.header.clone(),
             certificate_record: AcceptedBlockCertificateRecord {
-                height: components.accepted_block_certificate_statements[index].height,
+                height: components.accepted_block_acceptance_receipts[index].height,
+                acceptance_receipt: components.accepted_block_acceptance_receipts[index].clone(),
                 statement: components.accepted_block_certificate_statements[index].clone(),
                 proof: components.accepted_block_certificate_proofs[index].clone(),
                 receipt: components.accepted_block_certificate_receipts[index].clone(),
-                validity_handle: components.accepted_block_certificate_validity_handles[index]
+                receipt_projection_handle: components.accepted_block_receipt_projection_handles
+                    [index]
                     .clone(),
             },
         })
@@ -872,6 +882,10 @@ pub fn prove_accepted_block_certificate_batch_checkpoint_package(
         .iter()
         .map(|record| record.receipt.clone())
         .collect::<Vec<_>>();
+    let certificate_acceptance_receipts = certificate_records
+        .iter()
+        .map(|record| record.acceptance_receipt.clone())
+        .collect::<Vec<_>>();
     let certificate_batch_statement = accepted_block_certificate_batch_statement(
         &certificate_statements,
         &accepted_claim_witness.accepted_block_claims,
@@ -903,6 +917,7 @@ pub fn prove_accepted_block_certificate_batch_checkpoint_package(
         prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components(
             &step_statement,
             &certificate_batch_statement,
+            &certificate_acceptance_receipts,
             &certificate_statements,
             &certificate_proofs,
             &certificate_receipts,
@@ -952,6 +967,9 @@ fn verify_accepted_block_certificate_batch_witness(
 
     let mut previous_block_id = start_anchor.block_id;
     let mut previous_state_root = start_anchor.state_root;
+    let mut previous_log_slots = start_anchor.log_slots;
+    let mut previous_active_slot_count = start_anchor.active_slot_count;
+    let mut previous_alloc_counter = start_anchor.alloc_counter;
     let mut accumulator = start_accumulator.clone();
     let mut headers = Vec::with_capacity(witness.items.len());
     let mut claims = Vec::with_capacity(witness.items.len());
@@ -965,8 +983,15 @@ fn verify_accepted_block_certificate_batch_witness(
         let header = &item.header;
         let record = &item.certificate_record;
         let statement = &record.statement;
+        let expected_statement = accepted_block_certificate_statement_from_acceptance_receipt(
+            &record.acceptance_receipt,
+        );
+        if &expected_statement != statement {
+            return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
+        }
         if header.height != expected_height
             || record.height != expected_height
+            || record.acceptance_receipt.height != expected_height
             || statement.height != expected_height
             || statement.block_id != hash_block_header(header)
             || header.prev_block_hash != previous_block_id
@@ -974,6 +999,12 @@ fn verify_accepted_block_certificate_batch_witness(
             || statement.parent_state_root != previous_state_root
             || statement.child_state_root != header.state_root
             || statement.tx_root != header.tx_root
+            || record.acceptance_receipt.parent_log_slots != previous_log_slots
+            || record.acceptance_receipt.child_log_slots != header.log_slots
+            || record.acceptance_receipt.parent_active_slot_count != previous_active_slot_count
+            || record.acceptance_receipt.child_active_slot_count != header.active_slot_count
+            || record.acceptance_receipt.parent_alloc_counter != previous_alloc_counter
+            || record.acceptance_receipt.child_alloc_counter != header.alloc_counter
         {
             return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
         }
@@ -981,14 +1012,19 @@ fn verify_accepted_block_certificate_batch_witness(
         verify_accepted_block_certificate_receipt_projection(statement, &record.receipt)
             .map_err(|source| FullAcceptedBlockBatchError::CertificateReceipt { index, source })?;
         verify_accepted_block_certificate_proof_checkpoint(statement, &record.proof).map_err(
-            |source| FullAcceptedBlockBatchError::CertificateValidityHandleProof { index, source },
+            |source| FullAcceptedBlockBatchError::CertificateReceiptProjectionProof {
+                index,
+                source,
+            },
         )?;
         let expected_handle =
-            accepted_block_certificate_validity_handle(&record.proof).map_err(|source| {
-                FullAcceptedBlockBatchError::CertificateValidityHandle { index, source }
+            accepted_block_receipt_projection_handle(&record.proof).map_err(|source| {
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandle { index, source }
             })?;
-        if expected_handle != record.validity_handle {
-            return Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index });
+        if expected_handle != record.receipt_projection_handle {
+            return Err(
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandleMismatch { index },
+            );
         }
 
         let header_witness = HeaderWitness::from_header(header);
@@ -1001,6 +1037,9 @@ fn verify_accepted_block_certificate_batch_witness(
         );
         previous_block_id = statement.block_id;
         previous_state_root = statement.child_state_root;
+        previous_log_slots = header.log_slots;
+        previous_active_slot_count = header.active_slot_count;
+        previous_alloc_counter = header.alloc_counter;
 
         headers.push(header_witness);
         claims.push(chain_claim);
@@ -1114,15 +1153,18 @@ pub fn accepted_block_certificate_batch_statement_from_full_accepted_output(
 fn validate_full_accepted_certificate_package(
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<(), FullAcceptedBlockBatchError> {
+    let acceptance_receipts = &components.accepted_block_acceptance_receipts;
     let statements = &components.accepted_block_certificate_statements;
     let proofs = &components.accepted_block_certificate_proofs;
     let receipts = &components.accepted_block_certificate_receipts;
-    let handles = &components.accepted_block_certificate_validity_handles;
-    if proofs.len() != statements.len()
+    let handles = &components.accepted_block_receipt_projection_handles;
+    if acceptance_receipts.len() != statements.len()
+        || proofs.len() != statements.len()
         || receipts.len() != statements.len()
         || handles.len() != statements.len()
     {
         return Err(FullAcceptedBlockBatchError::CertificateProofShape {
+            acceptance_receipts: acceptance_receipts.len(),
             statements: statements.len(),
             proofs: proofs.len(),
             receipts: receipts.len(),
@@ -1130,6 +1172,11 @@ fn validate_full_accepted_certificate_package(
         });
     }
     for (index, statement) in statements.iter().enumerate() {
+        if accepted_block_certificate_statement_from_acceptance_receipt(&acceptance_receipts[index])
+            != *statement
+        {
+            return Err(FullAcceptedBlockBatchError::CertificateProofStatementMismatch { index });
+        }
         verify_accepted_block_certificate_receipt_projection(statement, &receipts[index])
             .map_err(|source| FullAcceptedBlockBatchError::CertificateReceipt { index, source })?;
         let statement_digest =
@@ -1138,11 +1185,13 @@ fn validate_full_accepted_certificate_package(
             return Err(FullAcceptedBlockBatchError::CertificateProofStatementMismatch { index });
         }
         let expected_handle =
-            accepted_block_certificate_validity_handle(&proofs[index]).map_err(|source| {
-                FullAcceptedBlockBatchError::CertificateValidityHandle { index, source }
+            accepted_block_receipt_projection_handle(&proofs[index]).map_err(|source| {
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandle { index, source }
             })?;
         if expected_handle != handles[index] {
-            return Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index });
+            return Err(
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandleMismatch { index },
+            );
         }
     }
     Ok(())
@@ -1169,6 +1218,7 @@ pub fn prove_history_checkpoint_step_proof_from_verified_full_accepted_output(
         prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components(
             statement,
             &certificate_batch_statement,
+            &output.proof_components.accepted_block_acceptance_receipts,
             &output
                 .proof_components
                 .accepted_block_certificate_statements,
@@ -1888,7 +1938,7 @@ mod tests {
         );
         assert_eq!(
             out.proof_components
-                .accepted_block_certificate_validity_handles
+                .accepted_block_receipt_projection_handles
                 .len(),
             1
         );
@@ -1899,19 +1949,19 @@ mod tests {
             out.proof_components.accepted_block_certificate_receipts[0].statement_digest,
             statement_digest
         );
-        noid_recursive::verify_accepted_block_certificate_validity_handle(
+        noid_recursive::verify_accepted_block_receipt_projection_handle(
             &statement_digest,
             &out.proof_components
-                .accepted_block_certificate_validity_handles[0],
+                .accepted_block_receipt_projection_handles[0],
         )
-        .expect("accepted block certificate validity handle verifies");
+        .expect("accepted block certificate receipt projection handle verifies");
         assert_eq!(
-            accepted_block_certificate_validity_handle(
+            accepted_block_receipt_projection_handle(
                 &out.proof_components.accepted_block_certificate_proofs[0],
             )
-            .expect("certificate proof derives validity handle"),
+            .expect("certificate proof derives receipt projection handle"),
             out.proof_components
-                .accepted_block_certificate_validity_handles[0]
+                .accepted_block_receipt_projection_handles[0]
         );
         assert_eq!(out.proof_components.header_integer_trace.steps.len(), 1);
         assert!(out.proof_components.tx_root_inputs.is_empty());
@@ -2318,14 +2368,18 @@ mod tests {
         };
         bad_out
             .proof_components
-            .accepted_block_certificate_validity_handles[0]
+            .accepted_block_receipt_projection_handles[0]
             .proof_digest[0] ^= 1;
         assert!(matches!(
             prove_history_checkpoint_step_proof_from_verified_full_accepted_output(
                 &checkpoint_statement,
                 &bad_out,
             ),
-            Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index: 0 })
+            Err(
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandleMismatch {
+                    index: 0
+                }
+            )
         ));
         assert!(matches!(
             verify_history_checkpoint_step_proof_with_verified_full_accepted_output(
@@ -2334,7 +2388,11 @@ mod tests {
                 &bad_out,
                 &checkpoint_step_proof,
             ),
-            Err(FullAcceptedBlockBatchError::CertificateValidityHandleMismatch { index: 0 })
+            Err(
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandleMismatch {
+                    index: 0
+                }
+            )
         ));
 
         let mut bad_out = FullAcceptedBlockBatchOutput {

@@ -18,7 +18,7 @@ use rayon::prelude::*;
 
 pub type Hash = [u8; 32];
 
-const POSEIDON_MERKLE_LEAF_DOMAIN: &[u8] = b"NOID/IVC/PCS-LEAF/v1";
+const POSEIDON_MERKLE_LEAF_DOMAIN: &[u8] = b"NOID/IVC/PCS-LEAF";
 const POSEIDON_MERKLE_NODE_TAG: DomainTag = DomainTag::new(b"IVCPCSN_");
 
 /// Global PCS commitment-tree Poseidon2b counters, enabled with

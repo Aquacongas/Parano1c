@@ -21,13 +21,13 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_recursive::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_receipt,
-    accepted_block_certificate_validity_handle, accepted_claim_batch_digest,
+    accepted_block_receipt_projection_handle, accepted_claim_batch_digest,
     advance_history_checkpoint_head_native, history_checkpoint_head_from_boundary,
-    prove_accepted_block_certificate_proof_ivc_receipt,
+    prove_accepted_block_certificate_receipt_projection_proof,
     prove_history_checkpoint_ivc_chunk_receipt_handle_core,
     verify_history_checkpoint_ivc_chunk_core, AcceptedBlockCertificateBatchStatement,
     AcceptedBlockCertificateReceipt, AcceptedBlockCertificateStatement,
-    AcceptedBlockCertificateValidityHandle, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
+    AcceptedBlockReceiptProjectionHandle, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
     ChainAccumulator, HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointStepStatement,
     RecursiveConsensusState, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
     HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES,
@@ -40,7 +40,7 @@ const DEFAULT_SAMPLES: usize = 3;
 struct ChunkFixture {
     statement: HistoryCheckpointStepStatement,
     certificate_batch_statement: AcceptedBlockCertificateBatchStatement,
-    certificate_validity_handles: Vec<AcceptedBlockCertificateValidityHandle>,
+    certificate_receipt_projection_handles: Vec<AcceptedBlockReceiptProjectionHandle>,
     certificate_receipts: Vec<AcceptedBlockCertificateReceipt>,
     accepted_claim_witness: AcceptedClaimBatchWitness,
     accepted_claim_output: AcceptedClaimBatchOutput,
@@ -87,7 +87,7 @@ fn prove_fixture(fixture: &ChunkFixture) -> noid_recursive::HistoryCheckpointIvc
     prove_history_checkpoint_ivc_chunk_receipt_handle_core(
         &fixture.statement,
         &fixture.certificate_batch_statement,
-        &fixture.certificate_validity_handles,
+        &fixture.certificate_receipt_projection_handles,
         &fixture.certificate_receipts,
         &fixture.accepted_claim_witness,
         &fixture.accepted_claim_output,
@@ -126,8 +126,8 @@ fn bench(samples: usize, fixture: &ChunkFixture) {
     let proof_bytes = proof.byte_len();
     let core_proof_wire_bytes = proof.core_proof.len();
     let core_proof_actual_bytes = proof.core_proof_len as usize;
-    let handle_bytes = bincode::serialized_size(&proof.certificate_validity_handles)
-        .expect("certificate validity handles serialize") as usize;
+    let handle_bytes = bincode::serialized_size(&proof.certificate_receipt_projection_handles)
+        .expect("certificate receipt projection handles serialize") as usize;
     let receipt_bytes = bincode::serialized_size(&proof.certificate_receipts)
         .expect("certificate receipts serialize") as usize;
     let accepted_claim_digest_fields_bytes =
@@ -137,7 +137,10 @@ fn bench(samples: usize, fixture: &ChunkFixture) {
     println!("  chunk_len={}", proof.chunk_len);
     println!("  relation={}", proof.relation);
     println!("  proof_bytes={}", fmt_bytes(proof_bytes));
-    println!("  certificate_validity_handles={}", fmt_bytes(handle_bytes));
+    println!(
+        "  certificate_receipt_projection_handles={}",
+        fmt_bytes(handle_bytes)
+    );
     println!("  certificate_receipts={}", fmt_bytes(receipt_bytes));
     println!(
         "  accepted_claim_digest_fields={}",
@@ -272,15 +275,15 @@ fn chunk_fixture() -> ChunkFixture {
     )
     .expect("certificate batch");
     let mut certificate_receipts = Vec::with_capacity(chunk_capacity);
-    let mut certificate_validity_handles = Vec::with_capacity(chunk_capacity);
+    let mut certificate_receipt_projection_handles = Vec::with_capacity(chunk_capacity);
     for certificate_statement in &certificate_statements {
         certificate_receipts.push(accepted_block_certificate_receipt(certificate_statement));
         let certificate_proof =
-            prove_accepted_block_certificate_proof_ivc_receipt(certificate_statement)
+            prove_accepted_block_certificate_receipt_projection_proof(certificate_statement)
                 .expect("certificate handle proof builds");
-        certificate_validity_handles.push(
-            accepted_block_certificate_validity_handle(&certificate_proof)
-                .expect("certificate validity handle builds"),
+        certificate_receipt_projection_handles.push(
+            accepted_block_receipt_projection_handle(&certificate_proof)
+                .expect("certificate receipt projection handle builds"),
         );
     }
     let end_anchor = anchor_from_consensus(
@@ -320,7 +323,7 @@ fn chunk_fixture() -> ChunkFixture {
     ChunkFixture {
         statement,
         certificate_batch_statement,
-        certificate_validity_handles,
+        certificate_receipt_projection_handles,
         certificate_receipts,
         accepted_claim_witness,
         accepted_claim_output,

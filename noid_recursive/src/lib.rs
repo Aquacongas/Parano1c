@@ -6,6 +6,7 @@
 //! The target path folds fixed accepted-block certificate chunks and binds them
 //! to locally verified header anchors.
 
+pub mod acceptance;
 pub mod accepted_batch;
 pub mod accumulator;
 pub mod authorization;
@@ -17,8 +18,12 @@ pub mod checkpoint_ivc_backend;
 pub mod checkpoint_proof;
 pub mod fs_transcript;
 pub mod header_integer;
+pub mod header_projection;
 pub mod pow_header;
 
+pub use acceptance::{
+    verify_acceptance_against_projection, AcceptanceProof, AcceptanceRelationError,
+};
 pub use accepted_batch::{
     accepted_claim_batch_digest, accepted_claim_batch_digest_hash_fields,
     accepted_claim_batch_digest_hash_params, chain_accumulator_proof_inputs,
@@ -38,37 +43,37 @@ pub use block_certificate::{
     accepted_block_certificate_batch_statement_hash_fields,
     accepted_block_certificate_batch_statement_hash_params,
     accepted_block_certificate_block_body_digest, accepted_block_certificate_block_proof_digest,
-    accepted_block_certificate_chain_claim, accepted_block_certificate_proof_digest,
-    accepted_block_certificate_receipt, accepted_block_certificate_receipt_chain_claim,
-    accepted_block_certificate_statement_digest, accepted_block_certificate_statement_fields,
+    accepted_block_certificate_block_proof_meta_digest, accepted_block_certificate_chain_claim,
+    accepted_block_certificate_proof_digest, accepted_block_certificate_receipt,
+    accepted_block_certificate_receipt_chain_claim, accepted_block_certificate_statement_digest,
+    accepted_block_certificate_statement_fields,
+    accepted_block_certificate_statement_from_acceptance_receipt,
     accepted_block_certificate_statement_hash_fields,
-    accepted_block_certificate_statement_hash_params, accepted_block_certificate_validity_handle,
-    prove_accepted_block_certificate_batch_digest_proof,
+    accepted_block_certificate_statement_hash_params, accepted_block_receipt_projection_handle,
+    block_proof_acceptance_receipt_digest, prove_accepted_block_certificate_batch_digest_proof,
     verify_accepted_block_certificate_batch_digest_proof,
     verify_accepted_block_certificate_proof_checkpoint,
     verify_accepted_block_certificate_receipt_projection,
-    verify_accepted_block_certificate_validity_handle, AcceptedBlockCertificateBatchDigestProof,
+    verify_accepted_block_receipt_projection_handle, AcceptedBlockCertificateBatchDigestProof,
     AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatement,
     AcceptedBlockCertificateProof, AcceptedBlockCertificateProofError,
     AcceptedBlockCertificateReceipt, AcceptedBlockCertificateReceiptError,
-    AcceptedBlockCertificateStatement, AcceptedBlockCertificateValidityHandle,
-    AcceptedBlockCertificateValidityHandleError,
+    AcceptedBlockCertificateStatement, AcceptedBlockReceiptProjectionHandle,
+    AcceptedBlockReceiptProjectionHandleError, BlockProofAcceptanceReceipt,
     ACCEPTED_BLOCK_CERTIFICATE_BATCH_STATEMENT_HASH_FIELDS,
     ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS,
 };
 
 pub use block_certificate_ivc::{
-    accepted_block_certificate_ivc_receipt_relation_digest,
-    decode_and_verify_accepted_block_certificate_ivc_receipt_backend,
-    prove_accepted_block_certificate_ivc_receipt_backend,
-    prove_accepted_block_certificate_ivc_receipt_backend_with_receipt,
-    prove_accepted_block_certificate_proof_ivc_receipt,
-    verify_accepted_block_certificate_ivc_receipt_backend,
-    AcceptedBlockCertificateIvcReceiptBackendProof, AcceptedBlockCertificateIvcReceiptError,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_K_LOG,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_BATCH_SIZE,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_LOG_INV_RATE, ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_M,
-    ACCEPTED_BLOCK_CERTIFICATE_IVC_RECEIPT_RELATION,
+    accepted_block_receipt_projection_relation_digest,
+    decode_and_verify_accepted_block_receipt_projection,
+    prove_accepted_block_certificate_receipt_projection_proof,
+    prove_accepted_block_receipt_projection, prove_accepted_block_receipt_projection_with_receipt,
+    verify_accepted_block_receipt_projection, AcceptedBlockReceiptProjectionError,
+    AcceptedBlockReceiptProjectionProof, ACCEPTED_BLOCK_RECEIPT_PROJECTION_K_LOG,
+    ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_BATCH_SIZE,
+    ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_INV_RATE, ACCEPTED_BLOCK_RECEIPT_PROJECTION_M,
+    ACCEPTED_BLOCK_RECEIPT_PROJECTION_RELATION,
 };
 pub use checkpoint::{
     prove_checkpoint_poseidon, verify_checkpoint_poseidon, CheckpointPoseidonError,
@@ -91,10 +96,8 @@ pub use checkpoint_proof::{
     history_checkpoint_step_statement_hash_fields, history_checkpoint_step_statement_hash_params,
     prove_history_checkpoint_recursive_head_record, prove_history_checkpoint_step_digest_proof,
     prove_history_checkpoint_step_proof_from_certificate_statements,
-    prove_history_checkpoint_step_proof_with_digest_components,
     prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components,
     prove_history_checkpoint_step_proof_with_ivc_chunk_core_components,
-    prove_history_checkpoint_step_proof_with_ivc_chunk_receipt_handle_components,
     public_history_checkpoint_proof_from_head_record, verify_history_checkpoint_head_record,
     verify_history_checkpoint_head_record_transition, verify_history_checkpoint_proof_checkpoint,
     verify_history_checkpoint_step_digest_proof, verify_history_checkpoint_step_proof_checkpoint,
@@ -120,6 +123,11 @@ pub use fs_transcript::{
 pub use header_integer::{
     build_header_integer_trace, verify_header_integer_trace, HeaderIntegerBatchTrace,
     HeaderIntegerStepTrace, HeaderIntegerTraceError,
+};
+pub use header_projection::{
+    extend_header_projection_root_from_slot, header_projection_chunk_from_slots,
+    header_projection_slot_digest, validate_header_projection_chunk, HeaderProjectionChunk,
+    HeaderProjectionChunkError, HeaderProjectionSlot, HEADER_PROJECTION_CHUNK_CAPACITY,
 };
 
 pub use pow_header::{

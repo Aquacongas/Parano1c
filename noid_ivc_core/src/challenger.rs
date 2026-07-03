@@ -394,7 +394,7 @@ fn proof_hash_has_leading_zero_bits(state_digest: &[u8; 32], nonce: u64, bits: u
 
     let h: [u8; 32] = {
         let nonce_bytes = nonce.to_le_bytes();
-        poseidon2b_hash_byte_slices(b"NOID/IVC/FS-POW/v1", &[state_digest, &nonce_bytes])
+        poseidon2b_hash_byte_slices(b"NOID/IVC/FS-POW", &[state_digest, &nonce_bytes])
     };
 
     digest_has_leading_zero_bits(&h, bits)
