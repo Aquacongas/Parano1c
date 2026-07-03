@@ -14,9 +14,11 @@
 use noid_core::transcript::FiatShamir;
 use noid_core::{AdditiveNTT, Block128};
 use noid_fri::Channel;
+use noid_fri_binius::interleaved_commit::SourceMerkleTree;
 use noid_fri_binius::{
     absorb_cap, interleaved_commit_arithmetic, prove_mixed_opening, verify_mixed_opening,
-    CommitmentHashBackend, InterleavedCommitment, MixedOpeningProof, COMPACT_NUM_QUERIES,
+    CommitmentHashBackend, InterleavedCommitment, InterleavedProverState, MixedOpeningProof,
+    COMPACT_NUM_QUERIES,
 };
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use zeroize::Zeroize;
@@ -57,11 +59,22 @@ impl AuthMleOpeningProof {
 pub struct AuthMleCommittedColumn {
     pub commitment: InterleavedCommitment,
     column: Vec<Block128>,
+    /// Prover-state parts retained from commitment so the opening does not
+    /// re-encode and re-hash the whole column (that would double the PCS
+    /// cost, which dominates wallet proving). Consumed by the one opening.
+    encoded_cols: Option<Vec<Vec<Block128>>>,
+    source_tree: Option<SourceMerkleTree>,
 }
 
 impl Drop for AuthMleCommittedColumn {
     fn drop(&mut self) {
         self.column.zeroize();
+        // The RS-encoded column is secret-derived; wipe it as well.
+        if let Some(encoded_cols) = self.encoded_cols.as_mut() {
+            for col in encoded_cols.iter_mut() {
+                col.zeroize();
+            }
+        }
     }
 }
 
@@ -74,8 +87,18 @@ pub fn commit_auth_mle_column(column: &[Block128], num_vars: usize) -> AuthMleCo
     let hasher = Poseidon2bSponge::new();
     let column = column.to_vec();
     let col_refs: [&[Block128]; 1] = [column.as_slice()];
-    let (commitment, _) = interleaved_commit_arithmetic(&col_refs, &ntt, &hasher);
-    AuthMleCommittedColumn { commitment, column }
+    let (commitment, prover_state) = interleaved_commit_arithmetic(&col_refs, &ntt, &hasher);
+    let InterleavedProverState {
+        encoded_cols,
+        source_tree,
+        ..
+    } = prover_state;
+    AuthMleCommittedColumn {
+        commitment,
+        column,
+        encoded_cols: Some(encoded_cols),
+        source_tree: Some(source_tree),
+    }
 }
 
 /// Absorb an Auth capsule MLE commitment into the AuthGKR Fiat-Shamir channel.
@@ -101,7 +124,7 @@ pub fn absorb_auth_mle_commitment<T: FiatShamir<Block128>>(
 }
 
 pub fn open_auth_mle_committed(
-    committed: &AuthMleCommittedColumn,
+    committed: &mut AuthMleCommittedColumn,
     num_vars: usize,
     reduction: &BatchEvalReduction,
 ) -> AuthMleOpeningProof {
@@ -112,16 +135,22 @@ pub fn open_auth_mle_committed(
 
     let ntt = AdditiveNTT::<Block128>::new(num_vars + noid_fri::code::LOG_RATE);
     let hasher = Poseidon2bSponge::new();
-    let raw_cols: [&[Block128]; 1] = [committed.column.as_slice()];
-    let (rebuilt_commitment, prover_state) =
-        interleaved_commit_arithmetic(&raw_cols, &ntt, &hasher);
-    assert_eq!(rebuilt_commitment.cap, committed.commitment.cap);
-    assert_eq!(rebuilt_commitment.log_rows, committed.commitment.log_rows);
-    assert_eq!(rebuilt_commitment.n_cols, committed.commitment.n_cols);
-    assert_eq!(
-        rebuilt_commitment.hash_backend,
-        committed.commitment.hash_backend
-    );
+    let encoded_cols = committed
+        .encoded_cols
+        .take()
+        .expect("auth MLE commitment supports exactly one opening");
+    let source_tree = committed
+        .source_tree
+        .take()
+        .expect("auth MLE commitment supports exactly one opening");
+    let prover_state = InterleavedProverState {
+        raw_cols: vec![committed.column.as_slice()],
+        log_rows: num_vars,
+        n_cols: 1,
+        encoded_cols,
+        source_tree,
+        hash_backend: committed.commitment.hash_backend,
+    };
     let primary_point = reduction.point.clone();
     let mut channel = Channel::new();
     absorb_cap(&mut channel, &committed.commitment.cap);
@@ -137,6 +166,14 @@ pub fn open_auth_mle_committed(
 
     debug_assert_eq!(opening.all_openings.len(), 1);
     debug_assert_eq!(opening.all_openings[0], reduction.value);
+
+    // The RS-encoded column is secret-derived; wipe it before dropping.
+    let InterleavedProverState {
+        mut encoded_cols, ..
+    } = prover_state;
+    for col in encoded_cols.iter_mut() {
+        col.zeroize();
+    }
 
     AuthMleOpeningProof {
         commitment: committed.commitment.clone(),
@@ -198,8 +235,8 @@ mod tests {
         let value = evaluate_slice(&column, &point);
         let reduction = BatchEvalReduction { point, value };
 
-        let committed = commit_auth_mle_column(&column, num_vars);
-        let proof = open_auth_mle_committed(&committed, num_vars, &reduction);
+        let mut committed = commit_auth_mle_column(&column, num_vars);
+        let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
         assert_eq!(
             proof.commitment.hash_backend,
             CommitmentHashBackend::Arithmetic
@@ -218,8 +255,8 @@ mod tests {
             .collect();
         let value = evaluate_slice(&column, &point);
         let reduction = BatchEvalReduction { point, value };
-        let committed = commit_auth_mle_column(&column, num_vars);
-        let proof = open_auth_mle_committed(&committed, num_vars, &reduction);
+        let mut committed = commit_auth_mle_column(&column, num_vars);
+        let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
 
         let bad = BatchEvalReduction {
             point: reduction.point.clone(),

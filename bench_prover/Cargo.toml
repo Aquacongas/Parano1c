@@ -14,6 +14,7 @@ noid_tx = { path = "../noid_tx" }
 noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
 noid_recursive = { path = "../noid_recursive" }
+noid-ivc-prover = { path = "../noid_ivc_prover" }
 rayon = "1.10"
 bincode = "1"
 hex = "0.4"
@@ -48,4 +49,8 @@ harness = false
 
 [[bench]]
 name = "tier1_shape_stats"
+harness = false
+
+[[bench]]
+name = "field_r1cs_g1"
 harness = false

@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128};
 use noid_core::mle::eq::eq_ind_partial_eval;
-use noid_core::mle::evaluate::{evaluate_flat, evaluate_slice};
+use noid_core::mle::evaluate::{evaluate_flat, evaluate_preflat};
 use noid_core::packed::pow7::pow7_block128;
 use noid_core::sumcheck::RoundPolynomial;
 use noid_core::transcript::FiatShamir;
@@ -560,6 +560,17 @@ struct OwnerAuthPublicTables {
     mds_lane_dec: [Vec<Block128>; STATE_SIZE],
     sigma_lane_dec: [Vec<Block128>; STATE_SIZE],
     rc_lane_dec: [Vec<Block128>; STATE_SIZE],
+    /// Flat (GCM-basis) copies of the same tables for the verifier's final
+    /// MLE evaluations (`evaluate_preflat` folds with clmul instead of tower
+    /// multiplication). Built once per layout alongside the tower tables.
+    mds_lane_dec_flat: [Vec<u128>; STATE_SIZE],
+    sigma_lane_dec_flat: [Vec<u128>; STATE_SIZE],
+    rc_lane_dec_flat: [Vec<u128>; STATE_SIZE],
+}
+
+fn owner_auth_table_to_flat(table: &[Block128]) -> Vec<u128> {
+    use noid_core::hardware::tower_to_flat_u128;
+    table.iter().map(|v| tower_to_flat_u128(v.0)).collect()
 }
 
 fn build_owner_auth_public_tables(layout: OwnerAuthLayout) -> OwnerAuthPublicTables {
@@ -572,10 +583,17 @@ fn build_owner_auth_public_tables(layout: OwnerAuthLayout) -> OwnerAuthPublicTab
         std::array::from_fn(|j| owner_auth_project_lane(layout, &sigma_dec, j));
     let rc_lane_dec: [Vec<Block128>; STATE_SIZE] =
         std::array::from_fn(|j| owner_auth_project_lane(layout, &rc_dec, j));
+    let mds_lane_dec_flat = std::array::from_fn(|j| owner_auth_table_to_flat(&mds_lane_dec[j]));
+    let sigma_lane_dec_flat =
+        std::array::from_fn(|j| owner_auth_table_to_flat(&sigma_lane_dec[j]));
+    let rc_lane_dec_flat = std::array::from_fn(|j| owner_auth_table_to_flat(&rc_lane_dec[j]));
     OwnerAuthPublicTables {
         mds_lane_dec,
         sigma_lane_dec,
         rc_lane_dec,
+        mds_lane_dec_flat,
+        sigma_lane_dec_flat,
+        rc_lane_dec_flat,
     }
 }
 
@@ -1017,9 +1035,9 @@ pub fn verify_owner_auth_unified<T: FiatShamir<Block128>>(
     let mut sigma_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
     let mut rc_lane_dec_at_r = [Block128::ZERO; STATE_SIZE];
     for j in 0..STATE_SIZE {
-        mds_lane_dec_at_r[j] = evaluate_slice(&public.mds_lane_dec[j], &r_prime);
-        sigma_lane_dec_at_r[j] = evaluate_slice(&public.sigma_lane_dec[j], &r_prime);
-        rc_lane_dec_at_r[j] = evaluate_slice(&public.rc_lane_dec[j], &r_prime);
+        mds_lane_dec_at_r[j] = evaluate_preflat(&public.mds_lane_dec_flat[j], &r_prime);
+        sigma_lane_dec_at_r[j] = evaluate_preflat(&public.sigma_lane_dec_flat[j], &r_prime);
+        rc_lane_dec_at_r[j] = evaluate_preflat(&public.rc_lane_dec_flat[j], &r_prime);
     }
 
     let mut q_at_r = proof.state_at_r;
@@ -1074,14 +1092,20 @@ fn build_owner_combined_weights(
     let d4 = d3 * delta;
     let lane_state = [d1, d2, d3, d4];
 
-    let mut w_state = vec![Block128::ZERO; layout.cells()];
-    for x in 0..layout.cells() {
+    use rayon::prelude::*;
+    let fill = |(x, w_out): (usize, &mut Block128)| {
         let slot = owner_auth_slot_of(layout, x);
         let round = owner_auth_round_of(layout, x);
         let elem = owner_auth_elem_of(x);
         let w_direct = eq_slot_tab[slot] * eq_round_tab[round] * eq_elem_tab[elem];
         let es_er = eq_slot_tab[slot] * eq_round_at_inc[round];
-        w_state[x] = d0 * w_direct + lane_state[elem] * es_er;
+        *w_out = d0 * w_direct + lane_state[elem] * es_er;
+    };
+    let mut w_state = vec![Block128::ZERO; layout.cells()];
+    if layout.cells() >= 4096 {
+        w_state.par_iter_mut().enumerate().for_each(fill);
+    } else {
+        w_state.iter_mut().enumerate().for_each(fill);
     }
 
     OwnerCombinedWeights { w_state }
@@ -1187,7 +1211,7 @@ fn verify_weighted_state_sumcheck<T: FiatShamir<Block128>>(
         r.push(challenge);
     }
     r.reverse();
-    let w_at_r = evaluate_slice(weights, &r);
+    let w_at_r = evaluate_flat(weights, &r);
     if expected != w_at_r * state_at_r {
         return None;
     }
@@ -1412,7 +1436,9 @@ pub fn prove_owner_auth_boundary<T: FiatShamir<Block128>>(
     let constraints = owner_auth_boundary_constraints(circuit, public);
     channel.absorb(Block128::from(OWNER_AUTH_BOUNDARY_DOMAIN_TAG));
     channel.absorb(Block128::from(constraints.len() as u128));
-    let alphas: Vec<Block128> = (0..constraints.len()).map(|_| channel.squeeze()).collect();
+    // Squeeze-diet RLC weights (powers of one challenge) — see
+    // `batch_eval::squeeze_alphas` for the soundness note.
+    let alphas = crate::batch_eval::squeeze_alphas(channel, constraints.len());
     let (weights, target) = owner_boundary_weights_and_target(public.layout, &constraints, &alphas);
     let (round_polys, point, state_at_r) =
         prove_weighted_state_sumcheck(&mle.state, weights, target, channel);
@@ -1438,7 +1464,9 @@ pub fn verify_owner_auth_boundary<T: FiatShamir<Block128>>(
     let constraints = owner_auth_boundary_constraints(circuit, public);
     channel.absorb(Block128::from(OWNER_AUTH_BOUNDARY_DOMAIN_TAG));
     channel.absorb(Block128::from(constraints.len() as u128));
-    let alphas: Vec<Block128> = (0..constraints.len()).map(|_| channel.squeeze()).collect();
+    // Squeeze-diet RLC weights (powers of one challenge) — see
+    // `batch_eval::squeeze_alphas` for the soundness note.
+    let alphas = crate::batch_eval::squeeze_alphas(channel, constraints.len());
     let (weights, target) = owner_boundary_weights_and_target(public.layout, &constraints, &alphas);
     let point = verify_weighted_state_sumcheck(
         &proof.round_polys,
@@ -1595,7 +1623,7 @@ pub fn prove_owner_auth_killshot_from_mle<T: FiatShamir<Block128>>(
     let layout = public.layout;
     assert_eq!(circuit.layout, layout);
     assert_eq!(mle.layout, layout);
-    let committed = commit_auth_mle_column(mle.state.as_slice(), layout.num_vars);
+    let mut committed = commit_auth_mle_column(mle.state.as_slice(), layout.num_vars);
 
     absorb_owner_public_boundary(channel, public);
     absorb_auth_mle_commitment(channel, &committed.commitment);
@@ -1625,7 +1653,7 @@ pub fn prove_owner_auth_killshot_from_mle<T: FiatShamir<Block128>>(
     ];
 
     let (batch, red) = prove_batch_eval(mle.state.as_slice(), &state_claims, channel);
-    let pcs = open_auth_mle_committed(&committed, layout.num_vars, &red);
+    let pcs = open_auth_mle_committed(&mut committed, layout.num_vars, &red);
     let proof = OwnerAuthProofKillShot {
         kill_shot: OwnerAuthKillShotProof { main, shift },
         boundary,
@@ -1710,7 +1738,7 @@ pub fn discharge_owner_auth_reductions_native(
     reductions: &OwnerAuthKillShotReductions,
 ) -> bool {
     let mle = build_owner_auth_unified_from_inputs(circuit, inputs);
-    evaluate_slice(&mle.state, &reductions.state.point) == reductions.state.value
+    evaluate_flat(&mle.state, &reductions.state.point) == reductions.state.value
 }
 
 #[derive(Debug)]

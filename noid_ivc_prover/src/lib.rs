@@ -14,5 +14,6 @@
 
 pub use noid_ivc_core::*;
 
+pub mod field_prover;
 pub mod proof_io;
 pub mod prover;

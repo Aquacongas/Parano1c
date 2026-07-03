@@ -32,6 +32,31 @@ pub struct R1csProofLigerito {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
+/// Top-level **FieldR1cs** proof (P1): field zerocheck + lincheck
+/// transcripts, plus one batched quirky-direct PCS opening (BaseFold, no
+/// ring-switch — the committed vector IS the F128-element witness).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FieldR1csProof {
+    pub zerocheck: zerocheck::ZerocheckProof,
+    pub lincheck: lincheck::LincheckProof,
+    /// Batched quirky-direct opening covering the `ab` and `c` z-claims.
+    pub pcs_open: pcs::BaseFoldProof,
+}
+
+/// FieldR1cs statement binding — mirror of [`bind_statement`] with the field
+/// instance digest and a distinct label.
+pub fn bind_statement_field<Ch: Challenger>(
+    challenger: &mut Ch,
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+) {
+    challenger.observe_label(b"history-field-r1cs");
+    challenger.observe_bytes(&r1cs.statement_digest());
+    let pcs_params = bincode::serialize(&commitment.params).expect("PcsParams serializes");
+    challenger.observe_bytes(&pcs_params);
+    challenger.observe_bytes(&commitment.root);
+}
+
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZClaim {

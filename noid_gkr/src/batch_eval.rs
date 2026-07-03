@@ -457,9 +457,41 @@ fn eq_at_boolean_index(index: usize, n: usize, r: &[Block128]) -> Block128 {
     acc
 }
 
-/// Squeeze one RLC challenge per claim.
-fn squeeze_alphas<T: FiatShamir<Block128>>(channel: &mut T, m: usize) -> Vec<Block128> {
-    (0..m).map(|_| channel.squeeze()).collect()
+/// RLC batching weights for `m` claims: the powers `(1, α, α², …, α^{m−1})`
+/// of ONE squeezed challenge α (the F2 squeeze diet, roadmap O3; previously
+/// one squeeze per claim).
+///
+/// Soundness: for a nonzero claim-error vector `e`, the batched check only
+/// vanishes if the degree-(m−1) polynomial `Σ eᵢ·xⁱ` vanishes at the random
+/// α, so the batching error is ≤ (m−1)/2^128 (Schwartz–Zippel) instead of
+/// 2^-128 with independent challenges. Largest batches in the protocol:
+/// the auth-FS transcript chain ≈ 2^15 claims @16 txs (native-only path,
+/// retired in P7) and the batched Merkle path chains ≈ 2^17 claims at the
+/// 255-tx max shape ⇒ worst-case batching error ≈ 2^-111. This is the
+/// accepted trade for removing ~1 FS permutation per claim from every
+/// verifier transcript (and ~360 constraints per claim from the SVT trace).
+/// If a pre-mainnet audit requires a strict ≥ 120-bit batching term, the
+/// localized upgrade is two-level batching (α-powers inside fixed-size
+/// chunks, β-powers across chunks) at one extra squeeze — decide before
+/// transcripts freeze.
+///
+/// The prover and the verifier derive the weights through this same helper,
+/// so the channel stays in lockstep by construction.
+pub(crate) fn squeeze_alphas<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    m: usize,
+) -> Vec<Block128> {
+    if m == 0 {
+        return Vec::new();
+    }
+    let alpha = channel.squeeze();
+    let mut alphas = Vec::with_capacity(m);
+    let mut acc = Block128::ONE;
+    for _ in 0..m {
+        alphas.push(acc);
+        acc *= alpha;
+    }
+    alphas
 }
 
 /// Absorb all claim points and values into the channel so `α_i` are

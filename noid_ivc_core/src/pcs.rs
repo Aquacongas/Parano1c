@@ -125,6 +125,186 @@ pub struct PackedDirectClaim {
     pub eq_ind: DirectEqInd,
 }
 
+/// A **quirky-point** evaluation claim on the packed MLE — the FieldR1cs
+/// opening (P1). The committed vector is read as `2^L` F128 *elements*
+/// (`L = m − LOG_PACKING`) and the claim point is a zerocheck/lincheck
+/// QuirkyPoint over those element variables: `z_skip` binds the low `k_skip`
+/// vars via the φ_8 Lagrange basis, `x_rest` (length `L − k_skip`) binds the
+/// remaining vars multilinearly.
+///
+/// Like [`PackedDirectClaim`] this skips ring-switching entirely (there is no
+/// bit-MLE ↔ packed-MLE bridge to cross — the witness IS the element vector);
+/// unlike it, the eq weighting on the skip block is Lagrange, not multilinear,
+/// so it gets its own combine/final_b path
+/// ([`open_batch_quirky_direct`] / [`verify_opening_batch_quirky_direct`]).
+#[derive(Clone, Debug)]
+pub struct QuirkyDirectClaim {
+    pub z_skip: F128,
+    pub k_skip: usize,
+    /// Multilinear coords for vars `k_skip..L`, LSB-first.
+    pub x_rest: Vec<F128>,
+    /// Claimed evaluation.
+    pub value: F128,
+}
+
+/// Verifier-side borrow of a [`QuirkyDirectClaim`].
+#[derive(Clone, Copy, Debug)]
+pub struct QuirkyDirectClaimRef<'a> {
+    pub z_skip: F128,
+    pub k_skip: usize,
+    pub x_rest: &'a [F128],
+    pub value: F128,
+}
+
+/// Batched open over quirky-direct claims only (the FieldR1cs path): one
+/// BaseFold on the γ-combined quirky eq tensors. No ring-switch messages —
+/// the proof is a bare [`BaseFoldProof`].
+///
+/// Transcript: label → per-claim (label + value observe) → γ per claim →
+/// BaseFold. The claim *points* are protocol challenges already bound to the
+/// transcript by the sub-protocols that produced them; only the values are
+/// fresh prover messages.
+pub fn open_batch_quirky_direct<Ch: Challenger>(
+    packed_witness: &[F128],
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    claims: &[QuirkyDirectClaim],
+    challenger: &mut Ch,
+) -> BaseFoldProof {
+    use rayon::prelude::*;
+
+    assert!(!claims.is_empty(), "need at least one claim");
+    let l = packed_witness.len();
+    debug_assert!(l.is_power_of_two());
+    let l_log = l.trailing_zeros() as usize;
+    for c in claims {
+        assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point/witness L mismatch");
+    }
+
+    challenger.observe_label(b"history-pcs-open-field-v0");
+    for c in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-v0");
+        challenger.observe_f128(c.value);
+    }
+    let gammas: Vec<F128> = (0..claims.len()).map(|_| challenger.sample_f128()).collect();
+
+    let mut target_combined = F128::ZERO;
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        target_combined += *g * c.value;
+    }
+
+    // b_combined[i] = Σ_k γ_k · L_{i_skip}(z_skip_k) · eq(x_rest_k, i_rest).
+    // γ_k is baked into the (tiny) Lagrange table; the outer eq tables are
+    // built once per claim.
+    let per_claim: Vec<(Vec<F128>, Vec<F128>, usize)> = claims
+        .iter()
+        .zip(gammas.iter())
+        .map(|(c, g)| {
+            let mut weights =
+                crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
+            for w in weights.iter_mut() {
+                *w *= *g;
+            }
+            let eq_rest = crate::lincheck::build_eq_table(&c.x_rest);
+            (weights, eq_rest, 1usize << c.k_skip)
+        })
+        .collect();
+    let block = per_claim[0].2;
+    debug_assert!(per_claim.iter().all(|p| p.2 == block));
+    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    b_combined
+        .par_chunks_mut(block)
+        .enumerate()
+        .for_each(|(hi, out_block)| {
+            for (ci, (weights, eq_rest, _)) in per_claim.iter().enumerate() {
+                let e_hi = eq_rest[hi];
+                if ci == 0 {
+                    for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
+                        *slot = *w * e_hi;
+                    }
+                } else {
+                    for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
+                        *slot += *w * e_hi;
+                    }
+                }
+            }
+        });
+
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    basefold::prove(
+        packed_witness,
+        b_combined,
+        target_combined,
+        &prover_data.codeword,
+        &prover_data.merkle_tree,
+        &ntt,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        default_fri_queries(commitment.params.log_inv_rate),
+        challenger,
+    )
+}
+
+/// Verify a [`open_batch_quirky_direct`] proof. Mirror transcript; the
+/// `final_b` contribution of each claim factorizes as
+/// `(Σ_{i ∈ {0,1}^k_skip} eq(challenges[..k_skip], i) · L_i(z_skip)) ·
+/// eq(x_rest, challenges[k_skip..])` — the MLE of the Lagrange-weight table
+/// over the skip bits, times the standard multilinear factor.
+pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[QuirkyDirectClaimRef<'_>],
+    proof: &BaseFoldProof,
+    challenger: &mut Ch,
+) -> Result<(), VerifyError> {
+    use crate::zerocheck::multilinear::{eq_eval, lagrange_weights_naive};
+
+    assert!(!claims.is_empty(), "need at least one claim");
+    let l_log = commitment.params.m - LOG_PACKING;
+    for c in claims {
+        assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point/witness L mismatch");
+    }
+
+    challenger.observe_label(b"history-pcs-open-field-v0");
+    for c in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-v0");
+        challenger.observe_f128(c.value);
+    }
+    let gammas: Vec<F128> = (0..claims.len()).map(|_| challenger.sample_f128()).collect();
+
+    let mut target_combined = F128::ZERO;
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        target_combined += *g * c.value;
+    }
+
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    let challenges = basefold::verify(
+        target_combined,
+        proof,
+        &commitment.root,
+        &ntt,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        challenger,
+    )
+    .map_err(VerifyError::BaseFold)?;
+    debug_assert_eq!(challenges.len(), l_log);
+
+    let mut expected_final_b = F128::ZERO;
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        let weights = lagrange_weights_naive(c.k_skip, c.z_skip);
+        let eq_skip = crate::lincheck::build_eq_table(&challenges[..c.k_skip]);
+        let mut skip_factor = F128::ZERO;
+        for (w, e) in weights.iter().zip(eq_skip.iter()) {
+            skip_factor += *w * *e;
+        }
+        expected_final_b += *g * skip_factor * eq_eval(c.x_rest, &challenges[c.k_skip..]);
+    }
+    if expected_final_b != proof.final_b {
+        return Err(VerifyError::FinalBMismatch);
+    }
+    Ok(())
+}
+
 /// Open the committed witness at a zerocheck-style point `(z_skip, x_outer)`.
 ///
 /// `packed_witness` is the same F_{2^128}-packed witness that was passed to
@@ -1563,5 +1743,108 @@ mod tests {
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Quirky-direct claims (FieldR1cs path, P1)
+    // -----------------------------------------------------------------------
+
+    /// Quirky MLE evaluation of an F128-element vector at
+    /// `(z_skip, x_rest)`: `Σ_i v[i] · L_{i mod 2^k}(z_skip) · eq(x_rest, i >> k)`.
+    fn zhat_quirky_reference(v: &[F128], k_skip: usize, z_skip: F128, x_rest: &[F128]) -> F128 {
+        let ell = 1usize << k_skip;
+        assert_eq!(v.len(), ell << x_rest.len());
+        let weights =
+            crate::zerocheck::multilinear::lagrange_weights_naive(k_skip, z_skip);
+        let eq = build_eq(x_rest);
+        let mut acc = F128::ZERO;
+        for (i, &x) in v.iter().enumerate() {
+            acc += x * weights[i % ell] * eq[i / ell];
+        }
+        acc
+    }
+
+    /// Roundtrip two quirky-direct claims through `open_batch_quirky_direct`
+    /// / `verify_opening_batch_quirky_direct`, then reject tampers.
+    #[test]
+    fn pcs_quirky_direct_roundtrip_and_tampers() {
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0x0F1E1D);
+        for &m in &[14usize, 16] {
+            let l = m - LOG_PACKING;
+            // The committed vector IS the field witness (2^l F128 elements).
+            let z: Vec<F128> = (0..(1usize << l)).map(|_| rng.f128()).collect();
+
+            let mk_claim = |rng: &mut Rng| {
+                let z_skip = rng.f128();
+                let x_rest: Vec<F128> = (0..(l - K_SKIP)).map(|_| rng.f128()).collect();
+                let value = zhat_quirky_reference(&z, K_SKIP, z_skip, &x_rest);
+                QuirkyDirectClaim {
+                    z_skip,
+                    k_skip: K_SKIP,
+                    x_rest,
+                    value,
+                }
+            };
+            let claims = vec![mk_claim(&mut rng), mk_claim(&mut rng)];
+
+            let params = default_params(m);
+            let (commitment, prover_data) = commit(&z, &params);
+
+            let mut ch_p = FsChallenger::new(b"history-test-v0");
+            let proof =
+                open_batch_quirky_direct(&z, &prover_data, &commitment, &claims, &mut ch_p);
+
+            let refs: Vec<QuirkyDirectClaimRef<'_>> = claims
+                .iter()
+                .map(|c| QuirkyDirectClaimRef {
+                    z_skip: c.z_skip,
+                    k_skip: c.k_skip,
+                    x_rest: &c.x_rest,
+                    value: c.value,
+                })
+                .collect();
+            let mut ch_v = FsChallenger::new(b"history-test-v0");
+            verify_opening_batch_quirky_direct(&commitment, &refs, &proof, &mut ch_v)
+                .unwrap_or_else(|e| panic!("honest quirky-direct rejected at m={m}: {e:?}"));
+
+            // Tamper: wrong claimed value.
+            let mut bad_refs = refs.clone();
+            bad_refs[0].value += F128::ONE;
+            let mut ch = FsChallenger::new(b"history-test-v0");
+            assert!(
+                verify_opening_batch_quirky_direct(&commitment, &bad_refs, &proof, &mut ch)
+                    .is_err(),
+                "wrong value accepted at m={m}"
+            );
+
+            // Tamper: wrong z_skip (point substitution).
+            let mut bad_refs = refs.clone();
+            bad_refs[1].z_skip += F128::ONE;
+            let mut ch = FsChallenger::new(b"history-test-v0");
+            assert!(
+                verify_opening_batch_quirky_direct(&commitment, &bad_refs, &proof, &mut ch)
+                    .is_err(),
+                "wrong z_skip accepted at m={m}"
+            );
+
+            // Tamper: proof final_b flip.
+            let mut bad = proof.clone();
+            bad.final_b += F128::ONE;
+            let mut ch = FsChallenger::new(b"history-test-v0");
+            assert!(
+                verify_opening_batch_quirky_direct(&commitment, &refs, &bad, &mut ch).is_err(),
+                "final_b tamper accepted at m={m}"
+            );
+
+            // Tamper: truncate FRI queries.
+            let mut bad = proof.clone();
+            bad.queries.truncate(1);
+            let mut ch = FsChallenger::new(b"history-test-v0");
+            assert!(
+                verify_opening_batch_quirky_direct(&commitment, &refs, &bad, &mut ch).is_err(),
+                "query truncation accepted at m={m}"
+            );
+        }
     }
 }

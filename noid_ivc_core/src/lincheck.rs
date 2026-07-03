@@ -1632,6 +1632,121 @@ fn prove_padded_inner<Ch: Challenger>(
     (proof, claim, captured_z_vec)
 }
 
+/// Field-witness lincheck prover (P1, `FieldR1cs`): the witness is `2^m`
+/// F128 **elements** in element-major layout (`z[i_inner + k·i_outer]`)
+/// instead of stripe-packed bits, and the circuit carries F128 coefficients
+/// (`crate::field_r1cs::FieldCscCircuit`). The transcript, the sumcheck
+/// rounds, and the output claim shape are identical to the boolean path —
+/// [`verify`] is shared verbatim (it is message-algebra only; the witness
+/// semantics enter solely through the circuit's `fold_alpha_batched` and the
+/// caller's `v_a`/`v_b`).
+///
+/// `useful_rows ≤ 2^k_log` declares how many rows of each block carry real
+/// witness data; rows `[useful_rows, 2^k_log)` must be zero (their partial
+/// fold is skipped, byte-identical output on honest padding).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field<Ch: Challenger>(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_rows: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim) {
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let n_log = m - k_log;
+    assert!(m >= k_log);
+    assert!(k_skip <= k_log, "k_skip must be ≤ k_log");
+    assert!(useful_rows <= k, "useful_rows ({useful_rows}) > k ({k})");
+    assert_eq!(z.len(), 1usize << m);
+    let inner_rest_len = k_log - k_skip;
+    assert_eq!(circuit.n_cols(), k);
+    assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len);
+    assert_eq!(x_ab.x_outer.len(), n_log);
+
+    challenger.observe_label(b"history-lincheck-v0");
+
+    // 1. Sample α (matches verifier's order).
+    let alpha = challenger.sample_f128();
+
+    // 2. α-batched comb_vec via the coefficient-carrying circuit fold.
+    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+
+    // 2b. Constant-wire pin (see docs/const-wire-pin.md; identical to the
+    //     boolean path — the committed constant column must be all-ones in
+    //     every block, padding included).
+    if let Some(col) = circuit.const_pin_col() {
+        let beta = challenger.sample_f128();
+        comb_vec[col] += beta;
+    }
+
+    // 3. Partial fold of the field witness at the shared outer half:
+    //    z_vec[i_inner] = Σ_{i_outer} eq(x_outer, i_outer) · z[i_inner + k·i_outer].
+    //    Padding rows (≥ useful_rows) are zero by contract — skipped.
+    let eq_x_outer = build_eq_table(&x_ab.x_outer);
+    let mut z_vec = vec![F128::ZERO; k];
+    z_vec[..useful_rows]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i_inner, slot)| {
+            let mut acc = F128::ZERO;
+            for (i_outer, w) in eq_x_outer.iter().enumerate() {
+                acc += *w * z[i_inner + (i_outer << k_log)];
+            }
+            *slot = acc;
+        });
+
+    // 4. Multilinear product-sumcheck over the high inner_rest bits —
+    //    identical loop to the boolean `prove_padded_inner`.
+    let mut rounds = Vec::with_capacity(inner_rest_len);
+    let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    if inner_rest_len > 0 {
+        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
+        for t in 0..inner_rest_len {
+            challenger.observe_f128(e1);
+            challenger.observe_f128(einf);
+            let r = challenger.sample_f128();
+            rounds.push((e1, einf));
+            r_rounds.push(r);
+            if t + 1 < inner_rest_len {
+                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                e1 = ne1;
+                einf = neinf;
+            } else {
+                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+                sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+        }
+    }
+
+    // 5. Send z_partial; sample fresh z_skip AFTER observing it; derive the
+    //    output claim value via φ8 Lagrange (same as the boolean path).
+    let z_partial = z_vec;
+    challenger.observe_f128_slice(&z_partial);
+    let r_inner_skip = challenger.sample_f128();
+    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let w = inner_product(&lambda, &z_partial);
+
+    let mut r_inner_rest = r_rounds;
+    r_inner_rest.reverse();
+
+    let proof = LincheckProof {
+        rounds,
+        z_partial,
+    };
+    let claim = LincheckClaim {
+        r_inner_skip,
+        r_inner_rest,
+        w,
+    };
+    (proof, claim)
+}
+
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
 /// performs the three scalar consistency checks against `v, v', v''`, and
 /// derives the three output z claims.
@@ -2411,5 +2526,166 @@ mod tests {
             ),
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Field-witness lincheck (P1)
+    // -----------------------------------------------------------------------
+
+    /// Quirky MLE evaluation of an F128 vector: `Σ_i f[i] · L_{i_skip}(z_skip)
+    /// · eq(x_inner_rest, i_inner_rest) · eq(x_outer, i_outer)`.
+    fn mle_eval_field_quirky(
+        f: &[F128],
+        m: usize,
+        k_log: usize,
+        k_skip: usize,
+        point: &QuirkyPoint,
+    ) -> F128 {
+        assert_eq!(f.len(), 1 << m);
+        let ell = 1usize << k_skip;
+        let weights = lagrange_weights_naive(k_skip, point.z_skip);
+        let eq_rest = build_eq_table(&point.x_inner_rest);
+        let eq_outer = build_eq_table(&point.x_outer);
+        let mut acc = F128::ZERO;
+        for (i, &v) in f.iter().enumerate() {
+            let i_inner = i & ((1 << k_log) - 1);
+            let i_outer = i >> k_log;
+            acc += v * weights[i_inner % ell] * eq_rest[i_inner / ell] * eq_outer[i_outer];
+        }
+        acc
+    }
+
+    /// Field-witness roundtrip: prove_field against the coefficient-carrying
+    /// circuit, verify with the SHARED boolean verify; claims agree, the
+    /// output w is the true quirky MLE evaluation of z, and wrong v_a/v_b are
+    /// rejected. Covers inner_rest_len = 0 (k_log == k_skip) and > 0.
+    #[test]
+    fn field_lincheck_roundtrip() {
+        use crate::field_r1cs::{FieldCscCircuit, SparseFieldMatrix, apply_block_diag_field};
+
+        for &(m, k_log, k_skip, seed) in &[
+            (9usize, 6usize, 6usize, 1u64),
+            (10, 7, 6, 2),
+            (12, 8, 6, 3),
+        ] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(0xF1E1D ^ seed);
+            let gen_matrix = |rng: &mut Rng| SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows: (0..k)
+                    .map(|_| {
+                        let n_nonzero = 1 + (rng.next_u64() % 4) as usize;
+                        (0..n_nonzero)
+                            .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
+                            .collect()
+                    })
+                    .collect(),
+            };
+            let a_0 = gen_matrix(&mut rng);
+            let b_0 = gen_matrix(&mut rng);
+            let z = rng.f128_vec(1 << m);
+            let a = apply_block_diag_field(&a_0, &z, k_log);
+            let b = apply_block_diag_field(&b_0, &z, k_log);
+
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let v_a = mle_eval_field_quirky(&a, m, k_log, k_skip, &x_ab);
+            let v_b = mle_eval_field_quirky(&b, m, k_log, k_skip, &x_ab);
+
+            let circuit = FieldCscCircuit::from_matrices(&a_0, &b_0);
+            let mut ch_prove = FsChallenger::new(b"field-lc-test-v0");
+            let (proof, claim_p) =
+                prove_field(&z, m, k_log, k_skip, k, &circuit, &x_ab, &mut ch_prove);
+
+            let mut ch_verify = FsChallenger::new(b"field-lc-test-v0");
+            let claim_v = verify(
+                m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof, &mut ch_verify,
+            )
+            .unwrap_or_else(|e| {
+                panic!("verify rejected honest field lincheck (m={m}, k_log={k_log}): {e:?}")
+            });
+            assert_eq!(claim_p, claim_v, "claim mismatch m={m}");
+
+            // Output claim value is the true quirky MLE eval of z at
+            // ((r_inner_skip, r_inner_rest), x_ab.x_outer).
+            let out_point = QuirkyPoint {
+                z_skip: claim_v.r_inner_skip,
+                x_inner_rest: claim_v.r_inner_rest.clone(),
+                x_outer: x_ab.x_outer.clone(),
+            };
+            let w_expected = mle_eval_field_quirky(&z, m, k_log, k_skip, &out_point);
+            assert_eq!(claim_v.w, w_expected, "w mismatch m={m}");
+
+            // Wrong v_a → reject.
+            let mut ch = FsChallenger::new(b"field-lc-test-v0");
+            assert!(
+                verify(
+                    m,
+                    k_log,
+                    k_skip,
+                    &circuit,
+                    &x_ab,
+                    v_a + F128::ONE,
+                    v_b,
+                    &proof,
+                    &mut ch,
+                )
+                .is_err(),
+                "wrong v_a accepted m={m}"
+            );
+
+            // Tampered z_partial → reject.
+            let mut bad = proof.clone();
+            bad.z_partial[0] += F128::ONE;
+            let mut ch = FsChallenger::new(b"field-lc-test-v0");
+            assert!(
+                verify(m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &bad, &mut ch).is_err(),
+                "tampered z_partial accepted m={m}"
+            );
+        }
+    }
+
+    /// prove_field honors useful_rows padding: a witness whose padding rows
+    /// are zero yields a byte-identical proof whether the fold skips them or
+    /// not.
+    #[test]
+    fn field_lincheck_padding_byte_identical() {
+        use crate::field_r1cs::{FieldCscCircuit, SparseFieldMatrix};
+
+        let (m, k_log, k_skip) = (10usize, 7usize, 6usize);
+        let k = 1usize << k_log;
+        let useful = 100usize; // < k = 128
+        let mut rng = Rng::new(0xDAD5EED);
+        let gen_matrix = |rng: &mut Rng| SparseFieldMatrix {
+            num_rows: k,
+            num_cols: k,
+            rows: (0..k)
+                .map(|r| {
+                    if r >= useful {
+                        return Vec::new();
+                    }
+                    vec![((rng.next_u64() as usize % k) as u32, rng.f128())]
+                })
+                .collect(),
+        };
+        let a_0 = gen_matrix(&mut rng);
+        let b_0 = gen_matrix(&mut rng);
+        let mut z = rng.f128_vec(1 << m);
+        // Zero the padding rows of every block.
+        for blk in 0..(1usize << (m - k_log)) {
+            for r in useful..k {
+                z[blk * k + r] = F128::ZERO;
+            }
+        }
+        let circuit = FieldCscCircuit::from_matrices(&a_0, &b_0);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+
+        let mut ch1 = FsChallenger::new(b"field-lc-pad-v0");
+        let (p_dense, c_dense) = prove_field(&z, m, k_log, k_skip, k, &circuit, &x_ab, &mut ch1);
+        let mut ch2 = FsChallenger::new(b"field-lc-pad-v0");
+        let (p_padded, c_padded) =
+            prove_field(&z, m, k_log, k_skip, useful, &circuit, &x_ab, &mut ch2);
+        assert_eq!(p_dense, p_padded);
+        assert_eq!(c_dense, c_padded);
     }
 }

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! P0 measured tier-1 verifier statistics — the empirical shape inputs for the
-//! SVT trace (`s4-design.md` §6, `roadmap.md` P0).
+//! Measured tier-1 verifier statistics — the empirical shape inputs for the
+//! SVT trace (`s4-design.md` §6, `roadmap.md` P0/P0.5).
 //!
-//! Measured 2026-07-03 by `bench_prover/benches/tier1_shape_stats.rs`: every
+//! Measured 2026-07-03 by `bench_prover/benches/tier1_shape_stats.rs`
+//! **after the O3 squeeze diet** (RLC batching weights are powers of one
+//! squeezed challenge — `noid_gkr::batch_eval::squeeze_alphas`; the P0
+//! pre-diet snapshot had 24,726 squeezes / 30,120 perms @16 txs): every
 //! killshot verifier that `verify_accepted_block_batch_components` runs for a
 //! real accepted block was replayed with a counting Fiat-Shamir channel
 //! (exact production challenge stream; exact Poseidon2b permutation counts).
@@ -13,9 +16,8 @@
 //! final padding maxima and loop bounds (the real `shape_digest` of
 //! `s4-design.md` §4.3) are fixed in P3, after the [K] restructuring decisions
 //! recorded in `s4-design.md` §6 (drop of the auth-FS-transcript killshot from
-//! the trace, squeeze-diet decision after gate G1). Until then, any consumer
-//! of these numbers must treat them as the P0 snapshot pinned by
-//! [`shape_stats_digest`].
+//! the trace — F1). Until then, any consumer of these numbers must treat them
+//! as the P0.5 snapshot pinned by [`shape_stats_digest`].
 //!
 //! Regenerate: `cargo bench -p bench_prover --bench tier1_shape_stats`
 //! (update this file and the digest test in the same commit).
@@ -80,6 +82,7 @@ impl CaseStats {
 
 pub const ACCEPTED_CLAIM_HASH: &str = "accepted_claim_hash";
 pub const TX_BODY_STANDARD_SPINE: &str = "tx_body_standard_spine";
+pub const TX_BODY_SWEEP_SPINE: &str = "tx_body_sweep_spine";
 pub const TX_ROOT_MERKLE: &str = "tx_root_merkle";
 pub const OWNER_AUTH: &str = "owner_auth";
 pub const AUTH_FS_TRANSCRIPTS: &str = "auth_fs_transcripts";
@@ -96,9 +99,9 @@ pub const CASE_COINBASE_ONLY: CaseStats = CaseStats {
     name: "coinbase_only_1_block",
     user_txs: 0,
     components: &[
-        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 245, perms: 421 },
-        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 150, perms: 327 },
-        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 81, perms: 240 },
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
     ],
 };
 
@@ -107,18 +110,18 @@ pub const CASE_USER_TXS_1: CaseStats = CaseStats {
     name: "user_txs_1",
     user_txs: 1,
     components: &[
-        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 245, perms: 421 },
-        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 405, squeezes: 85, perms: 299 },
-        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 511, squeezes: 83, perms: 337 },
-        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 374, squeezes: 53, perms: 253 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 1308, squeezes: 1158, perms: 1295 },
-        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 150, perms: 327 },
-        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 81, perms: 240 },
-        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 353, squeezes: 108, perms: 274 },
-        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 785, squeezes: 214, perms: 550 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 320, squeezes: 83, perms: 242 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 210, perms: 447 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 96, perms: 265 },
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 405, squeezes: 82, perms: 298 },
+        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 511, squeezes: 62, perms: 327 },
+        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 374, squeezes: 48, perms: 251 },
+        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 1298, squeezes: 92, perms: 757 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
+        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 353, squeezes: 67, perms: 254 },
+        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 785, squeezes: 77, perms: 482 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 320, squeezes: 62, perms: 232 },
+        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 77, perms: 381 },
+        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
     ],
 };
 
@@ -127,18 +130,18 @@ pub const CASE_USER_TXS_4: CaseStats = CaseStats {
     name: "user_txs_4",
     user_txs: 4,
     components: &[
-        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 245, perms: 421 },
-        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 459, squeezes: 101, perms: 341 },
-        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 761, squeezes: 145, perms: 500 },
-        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 1496, squeezes: 212, perms: 1012 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 3921, squeezes: 4363, perms: 4210 },
-        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 150, perms: 327 },
-        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 81, perms: 240 },
-        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 461, squeezes: 238, perms: 400 },
-        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 2069, squeezes: 1149, perms: 1670 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 347, squeezes: 92, perms: 263 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 210, perms: 447 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 96, perms: 265 },
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 459, squeezes: 92, perms: 337 },
+        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 761, squeezes: 72, perms: 464 },
+        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 1496, squeezes: 192, perms: 1004 },
+        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 3881, squeezes: 102, perms: 2060 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
+        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 461, squeezes: 77, perms: 320 },
+        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 2069, squeezes: 92, perms: 1142 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
+        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 77, perms: 381 },
+        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
     ],
 };
 
@@ -147,18 +150,60 @@ pub const CASE_USER_TXS_16: CaseStats = CaseStats {
     name: "user_txs_16",
     user_txs: 16,
     components: &[
-        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 245, perms: 421 },
-        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 531, squeezes: 135, perms: 401 },
-        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 2045, squeezes: 632, perms: 1396 },
-        ComponentStats { name: OWNER_AUTH, instances: 16, absorbs: 5984, squeezes: 848, perms: 4048 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 14229, squeezes: 17153, perms: 15766 },
-        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 150, perms: 327 },
-        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 81, perms: 240 },
-        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 749, squeezes: 728, perms: 796 },
-        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 6965, squeezes: 4327, perms: 5714 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 383, squeezes: 121, perms: 299 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 210, perms: 447 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 96, perms: 265 },
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 531, squeezes: 102, perms: 385 },
+        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 2045, squeezes: 87, perms: 1124 },
+        ComponentStats { name: OWNER_AUTH, instances: 16, absorbs: 5984, squeezes: 768, perms: 4016 },
+        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 14069, squeezes: 112, perms: 7166 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
+        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 749, squeezes: 87, perms: 476 },
+        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 6965, squeezes: 102, perms: 3602 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 383, squeezes: 72, perms: 275 },
+        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 77, perms: 381 },
+        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
+    ],
+};
+
+/// One block with 1 full Sweep25x2 user transaction (25 live inputs, distinct
+/// owner per input, 2 outputs — the heaviest per-tx authorization shape).
+pub const CASE_SWEEP_TXS_1: CaseStats = CaseStats {
+    name: "sweep_txs_1",
+    user_txs: 1,
+    components: &[
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 453, squeezes: 92, perms: 334 },
+        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 511, squeezes: 62, perms: 327 },
+        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 609, squeezes: 73, perms: 400 },
+        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 1842, squeezes: 97, perms: 1035 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
+        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 699, squeezes: 87, perms: 451 },
+        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 5955, squeezes: 102, perms: 3097 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 392, squeezes: 72, perms: 280 },
+        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 77, perms: 381 },
+        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
+    ],
+};
+
+/// One block with 4 full Sweep25x2 user transactions. The dominant component
+/// is the exact-state path batch (216 Merkle paths: 27 touched slots per tx).
+pub const CASE_SWEEP_TXS_4: CaseStats = CaseStats {
+    name: "sweep_txs_4",
+    user_txs: 4,
+    components: &[
+        ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 488, squeezes: 82, perms: 340 },
+        ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 507, squeezes: 102, perms: 373 },
+        ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 761, squeezes: 72, perms: 464 },
+        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 2436, squeezes: 292, perms: 1600 },
+        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 5985, squeezes: 107, perms: 3118 },
+        ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 403, squeezes: 77, perms: 291 },
+        ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 318, squeezes: 62, perms: 231 },
+        ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 1557, squeezes: 97, perms: 892 },
+        ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 22365, squeezes: 112, perms: 11314 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 515, squeezes: 82, perms: 353 },
+        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 583, squeezes: 77, perms: 381 },
+        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 347, squeezes: 67, perms: 251 },
     ],
 };
 
@@ -167,15 +212,27 @@ pub const MEASURED_CASES: &[&CaseStats] = &[
     &CASE_USER_TXS_1,
     &CASE_USER_TXS_4,
     &CASE_USER_TXS_16,
+    &CASE_SWEEP_TXS_1,
+    &CASE_SWEEP_TXS_4,
 ];
 
 /// Marginal verifier-FS permutations per standard tx, full replay:
-/// (30120 - 988) / 16, floored.
-pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 1_820;
+/// (18538 - 862) / 16, floored. (Pre-diet P0 value: 1,820.)
+pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 1_104;
 
 /// Marginal perms per standard tx once the auth-FS-transcript killshot is
-/// dropped from the trace (F1): (14354 - 988) / 16.
-pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 = 835;
+/// dropped from the trace (F1): (11372 - 862) / 16, floored.
+/// (Pre-diet P0 value: 835.)
+pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 = 656;
+
+/// Marginal verifier-FS permutations per full Sweep25x2 tx, full replay:
+/// (19608 - 862) / 4, floored.
+pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 4_686;
+
+/// Marginal perms per full Sweep25x2 tx after F1 (auth-FS-transcript killshot
+/// dropped): (19608 - 3118 - 862) / 4. Dominated by the exact-state Merkle
+/// path batch (27 touched slots per sweep vs 2 per standard tx).
+pub const MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS: u32 = 3_907;
 
 /// Consensus block maxima (source of truth: `noid_chain::consensus::params`).
 /// 255 standard user txs + coinbase, or 40 full Sweep25x2 txs.
@@ -184,17 +241,43 @@ pub const BLOCK_MAX_FULL_SWEEP_TXS: usize =
     noid_chain::consensus::params::BLOCK_MAX_FULL_SWEEP25X2_TXS;
 
 /// Projected full-replay [K] permutations for a block of `n` standard txs,
-/// after F1 (auth-FS-transcript killshot dropped). Linear extrapolation of the
-/// P0 measurement; refresh after the P0.5 optimization pass.
+/// after F1 (auth-FS-transcript killshot dropped).
+///
+/// Linear extrapolation of the 16-tx measurement — a conservative UPPER
+/// bound: the env-gated 255-tx run (`NOID_SHAPE_MAX_STD=1`, 2026-07-03,
+/// post-diet) measured 134,904 perms after F1 vs 168,142 projected (−20%),
+/// because batched-killshot round/terminal costs amortize with batch size
+/// while this projection scales them linearly.
 pub fn projected_perms_std_txs_no_auth_fs(n: usize) -> u64 {
     CASE_COINBASE_ONLY.total_perms() + n as u64 * MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS as u64
 }
 
-const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P0-V1";
+/// Projected full-replay [K] permutations for a block of `n` full Sweep25x2
+/// txs, after F1. Same conservative linear extrapolation as
+/// [`projected_perms_std_txs_no_auth_fs`].
+pub fn projected_perms_sweep_txs_no_auth_fs(n: usize) -> u64 {
+    CASE_COINBASE_ONLY.total_perms() + n as u64 * MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS as u64
+}
 
-/// Digest pinning this P0 measurement snapshot. Referenced by `s4-design.md`
-/// §6 so later phases can detect a stale table. NOT the protocol
-/// `shape_digest` of the SVT public interface (that is frozen in P3).
+/// Conservative [K] perms upper bound for the consensus-max standard block
+/// (255 user txs). Measured post-diet @255: 134,904 perms after F1
+/// (249,138 full replay, ~2^26.4 constraints full / ~2^25.5 after F1).
+pub fn projected_perms_max_standard_block_no_auth_fs() -> u64 {
+    projected_perms_std_txs_no_auth_fs(BLOCK_MAX_STANDARD_USER_TXS)
+}
+
+/// Conservative [K] perms upper bound for the consensus-max sweep block
+/// (40 full Sweep25x2 txs).
+pub fn projected_perms_max_sweep_block_no_auth_fs() -> u64 {
+    projected_perms_sweep_txs_no_auth_fs(BLOCK_MAX_FULL_SWEEP_TXS)
+}
+
+const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V2";
+
+/// Digest pinning this P0.5 (post-squeeze-diet) measurement snapshot.
+/// Referenced by `s4-design.md` §6 so later phases can detect a stale table.
+/// NOT the protocol `shape_digest` of the SVT public interface (that is
+/// frozen in P3).
 pub fn shape_stats_digest() -> [u8; 32] {
     let mut encoded: Vec<u8> = Vec::new();
     encoded.extend_from_slice(&(PERM_TRACE_CONSTRAINTS as u32).to_le_bytes());
@@ -220,13 +303,20 @@ mod tests {
 
     #[test]
     fn case_totals_match_measurement() {
-        assert_eq!(CASE_COINBASE_ONLY.total_perms(), 988);
-        assert_eq!(CASE_USER_TXS_1.total_perms(), 4_950);
-        assert_eq!(CASE_USER_TXS_4.total_perms(), 10_096);
-        assert_eq!(CASE_USER_TXS_16.total_perms(), 30_120);
-        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 33_025);
-        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 24_726);
-        assert_eq!(CASE_USER_TXS_16.perms_without_auth_fs(), 14_354);
+        assert_eq!(CASE_COINBASE_ONLY.total_perms(), 862);
+        assert_eq!(CASE_USER_TXS_1.total_perms(), 4_095);
+        assert_eq!(CASE_USER_TXS_4.total_perms(), 7_072);
+        assert_eq!(CASE_USER_TXS_16.total_perms(), 18_538);
+        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 32_865);
+        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 1_695);
+        assert_eq!(CASE_USER_TXS_16.perms_without_auth_fs(), 11_372);
+        assert_eq!(CASE_SWEEP_TXS_1.total_perms(), 7_418);
+        assert_eq!(CASE_SWEEP_TXS_1.total_absorbs(), 12_600);
+        assert_eq!(CASE_SWEEP_TXS_1.total_squeezes(), 950);
+        assert_eq!(CASE_SWEEP_TXS_4.total_perms(), 19_608);
+        assert_eq!(CASE_SWEEP_TXS_4.total_absorbs(), 36_265);
+        assert_eq!(CASE_SWEEP_TXS_4.total_squeezes(), 1_229);
+        assert_eq!(CASE_SWEEP_TXS_4.perms_without_auth_fs(), 16_490);
         assert_eq!(
             MARGINAL_PERMS_PER_STANDARD_TX_FULL as u64,
             (CASE_USER_TXS_16.total_perms() - CASE_COINBASE_ONLY.total_perms()) / 16
@@ -235,6 +325,25 @@ mod tests {
             MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS as u64,
             (CASE_USER_TXS_16.perms_without_auth_fs() - CASE_COINBASE_ONLY.total_perms()) / 16
         );
+        assert_eq!(
+            MARGINAL_PERMS_PER_SWEEP_TX_FULL as u64,
+            (CASE_SWEEP_TXS_4.total_perms() - CASE_COINBASE_ONLY.total_perms()) / 4
+        );
+        assert_eq!(
+            MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS as u64,
+            (CASE_SWEEP_TXS_4.perms_without_auth_fs() - CASE_COINBASE_ONLY.total_perms()) / 4
+        );
+    }
+
+    #[test]
+    fn max_shape_projections_track_consensus_params() {
+        assert_eq!(BLOCK_MAX_STANDARD_USER_TXS, 255);
+        assert_eq!(BLOCK_MAX_FULL_SWEEP_TXS, 40);
+        assert_eq!(projected_perms_max_standard_block_no_auth_fs(), 168_142);
+        assert_eq!(projected_perms_max_sweep_block_no_auth_fs(), 157_142);
+        // The linear projection must stay an upper bound on the measured
+        // env-gated 255-tx run (134,904 perms after F1, 2026-07-03).
+        assert!(projected_perms_max_standard_block_no_auth_fs() >= 134_904);
     }
 
     #[test]

@@ -96,7 +96,23 @@ impl Mul for F128 {
             // SAFETY: aes target feature is enabled at compile time.
             unsafe { aarch64::ghash_mul_binius(self, rhs) }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "sse4.1"
+        ))]
+        {
+            // SAFETY: pclmulqdq + sse4.1 are enabled at compile time.
+            unsafe { x86_64_clmul::ghash_mul_clmul(self, rhs) }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(
+                target_arch = "x86_64",
+                target_feature = "pclmulqdq",
+                target_feature = "sse4.1"
+            )
+        )))]
         {
             software::ghash_mul(self, rhs)
         }
@@ -540,9 +556,115 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
         // SAFETY: aes target feature is enabled at compile time.
         unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "pclmulqdq",
+        target_feature = "sse4.1"
+    ))]
+    {
+        // SAFETY: pclmulqdq + sse4.1 are enabled at compile time.
+        unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "sse4.1"
+        )
+    )))]
     {
         software::ghash_mul_unreduced(a, b)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// x86_64 + PCLMULQDQ: carry-less multiplication variants. Mirrors the
+// aarch64 module; enabled when the workspace `target-cpu=native` build (or an
+// explicit `-C target-feature=+pclmulqdq,+sse4.1`) makes the features static.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "pclmulqdq",
+    target_feature = "sse4.1"
+))]
+pub mod x86_64_clmul {
+    use super::{F128, F256Unreduced};
+    use core::arch::x86_64::*;
+
+    #[inline]
+    unsafe fn to_vec(a: F128) -> __m128i {
+        // lane 0 = lo, lane 1 = hi (little-endian qwords).
+        unsafe { _mm_set_epi64x(a.hi as i64, a.lo as i64) }
+    }
+
+    /// Binius-style double-fold reduction — port of
+    /// [`super::aarch64::ghash_mul_binius`]: 4 schoolbook CLMULs plus 2
+    /// reduction CLMULs by `x^7 + x^2 + x + 1` (0x87), folding 64 bits at a
+    /// time. No shift/overflow bookkeeping.
+    ///
+    /// # Safety
+    /// Requires the `pclmulqdq` and `sse4.1` target features; only call where
+    /// they are statically enabled.
+    #[target_feature(enable = "pclmulqdq", enable = "sse4.1")]
+    pub unsafe fn ghash_mul_clmul(a: F128, b: F128) -> F128 {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let va = to_vec(a);
+            let vb = to_vec(b);
+            let poly = _mm_set_epi64x(0, 0x87);
+
+            let t0 = _mm_clmulepi64_si128(va, vb, 0x00); // a.lo · b.lo
+            let t1a = _mm_clmulepi64_si128(va, vb, 0x10); // a.lo · b.hi
+            let t1b = _mm_clmulepi64_si128(va, vb, 0x01); // a.hi · b.lo
+            let t2 = _mm_clmulepi64_si128(va, vb, 0x11); // a.hi · b.hi
+            let mut t1 = _mm_xor_si128(t1a, t1b);
+
+            // First fold: t1 ^= (t2.lo << 64) ^ (t2.hi · 0x87).
+            t1 = _mm_xor_si128(t1, _mm_slli_si128(t2, 8));
+            t1 = _mm_xor_si128(t1, _mm_clmulepi64_si128(t2, poly, 0x01));
+
+            // Second fold: t0 ^= (t1.lo << 64) ^ (t1.hi · 0x87).
+            let mut t0 = t0;
+            t0 = _mm_xor_si128(t0, _mm_slli_si128(t1, 8));
+            t0 = _mm_xor_si128(t0, _mm_clmulepi64_si128(t1, poly, 0x01));
+
+            F128 {
+                lo: _mm_extract_epi64::<0>(t0) as u64,
+                hi: _mm_extract_epi64::<1>(t0) as u64,
+            }
+        }
+    }
+
+    /// Unreduced 256-bit product — mirror of
+    /// [`super::software::ghash_mul_unreduced`] on CLMUL: 4 schoolbook
+    /// products, cross terms XOR-folded into the middle words.
+    ///
+    /// # Safety
+    /// Requires the `pclmulqdq` and `sse4.1` target features; only call where
+    /// they are statically enabled.
+    #[target_feature(enable = "pclmulqdq", enable = "sse4.1")]
+    pub unsafe fn ghash_mul_unreduced_clmul(a: F128, b: F128) -> F256Unreduced {
+        // SAFETY: function carries the required target features.
+        unsafe {
+            let va = to_vec(a);
+            let vb = to_vec(b);
+            let p_ll = _mm_clmulepi64_si128(va, vb, 0x00);
+            let p_lh = _mm_clmulepi64_si128(va, vb, 0x10);
+            let p_hl = _mm_clmulepi64_si128(va, vb, 0x01);
+            let p_hh = _mm_clmulepi64_si128(va, vb, 0x11);
+            let cross = _mm_xor_si128(p_lh, p_hl);
+
+            F256Unreduced {
+                r0: _mm_extract_epi64::<0>(p_ll) as u64,
+                r1: (_mm_extract_epi64::<1>(p_ll) as u64)
+                    ^ (_mm_extract_epi64::<0>(cross) as u64),
+                r2: (_mm_extract_epi64::<0>(p_hh) as u64)
+                    ^ (_mm_extract_epi64::<1>(cross) as u64),
+                r3: _mm_extract_epi64::<1>(p_hh) as u64,
+            }
+        }
     }
 }
 
@@ -567,6 +689,46 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+    }
+
+    /// The x86_64 CLMUL kernels are bit-exact with the portable software
+    /// path (which itself is pinned by the algebraic identity tests below).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "pclmulqdq",
+        target_feature = "sse4.1"
+    ))]
+    #[test]
+    fn x86_clmul_matches_software() {
+        let mut rng = Rng::new(0xC1_4A11);
+        let mut cases: Vec<(F128, F128)> = vec![
+            (F128::ZERO, F128::ZERO),
+            (F128::ONE, F128::ONE),
+            (F128::ZERO, F128::ONE),
+            (
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+            ),
+            (F128::generator(), F128 { lo: 0, hi: 1 << 63 }),
+        ];
+        for _ in 0..4096 {
+            cases.push((rng.next_f128(), rng.next_f128()));
+        }
+        for (a, b) in cases {
+            let fast = unsafe { x86_64_clmul::ghash_mul_clmul(a, b) };
+            let slow = software::ghash_mul(a, b);
+            assert_eq!(fast, slow, "mul mismatch a={a:?} b={b:?}");
+
+            let fast_u = unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) };
+            let slow_u = software::ghash_mul_unreduced(a, b);
+            assert_eq!(fast_u, slow_u, "unreduced mismatch a={a:?} b={b:?}");
         }
     }
 

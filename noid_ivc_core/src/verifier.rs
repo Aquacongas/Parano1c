@@ -306,6 +306,97 @@ fn verify_claims_inner<Ch: Challenger>(
     pcs::verify_opening_batch(commitment, &values, &z_skips, &x_refs, pcs_open, challenger)
 }
 
+/// Verify a **FieldR1cs** proof (P1): field zerocheck → shared lincheck
+/// (coefficient-carrying circuit) → batched quirky-direct PCS opening.
+/// Structural mirror of [`verify`]; same single-threaded pool policy.
+pub fn verify_field<Ch: Challenger>(
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::FieldR1csProof,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    verifier_pool().install(move || verify_field_inner(r1cs, commitment, proof, challenger))
+}
+
+fn verify_field_inner<Ch: Challenger>(
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::FieldR1csProof,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    // ---- Bind the FS transcript to the statement (mirrors prove_field).
+    crate::proof::bind_statement_field(challenger, r1cs, commitment);
+
+    // ---- Field zerocheck.
+    let zc_claim = zerocheck::field::verify(r1cs.m, &proof.zerocheck, challenger)
+        .map_err(VerifyError::Zerocheck)?;
+
+    // ---- Lincheck (shared verify; witness semantics enter via the circuit).
+    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+    let x_ab = QuirkyPoint {
+        z_skip: zc_claim.z,
+        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let lc_claim = lincheck::verify(
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        r1cs.csc_lincheck_circuit(),
+        &x_ab,
+        zc_claim.a_eval,
+        zc_claim.b_eval,
+        &proof.lincheck,
+        challenger,
+    )
+    .map_err(VerifyError::Lincheck)?;
+
+    // ---- The two z-claims (must match what prove_field returned).
+    let ab = ZClaim {
+        point: QuirkyPoint {
+            z_skip: lc_claim.r_inner_skip,
+            x_inner_rest: lc_claim.r_inner_rest.clone(),
+            x_outer: x_ab.x_outer.clone(),
+        },
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: QuirkyPoint {
+            z_skip: zc_claim.z,
+            x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
+            x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
+        },
+        value: zc_claim.c_eval,
+    };
+
+    // ---- Batched quirky-direct PCS opening over both claims.
+    let x_rest_of = |zc: &ZClaim| -> Vec<F128> {
+        let mut v = zc.point.x_inner_rest.clone();
+        v.extend_from_slice(&zc.point.x_outer);
+        v
+    };
+    let ab_rest = x_rest_of(&ab);
+    let c_rest = x_rest_of(&c);
+    let refs = [
+        pcs::QuirkyDirectClaimRef {
+            z_skip: ab.point.z_skip,
+            k_skip: r1cs.k_skip,
+            x_rest: &ab_rest,
+            value: ab.value,
+        },
+        pcs::QuirkyDirectClaimRef {
+            z_skip: c.point.z_skip,
+            k_skip: r1cs.k_skip,
+            x_rest: &c_rest,
+            value: c.value,
+        },
+    ];
+    pcs::verify_opening_batch_quirky_direct(commitment, &refs, &proof.pcs_open, challenger)
+        .map_err(VerifyError::PcsAb)?;
+
+    Ok(R1csClaim { ab, c })
+}
+
 #[cfg(test)]
 mod tests {
     /// The verifier is intentionally single-threaded: every `par_*` reached
