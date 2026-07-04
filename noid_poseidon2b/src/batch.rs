@@ -544,12 +544,22 @@ fn flat_tables() -> &'static FlatTables {
 /// start and flat→tower pass at the end replaces what was previously 3
 /// basis conversions per CLMUL (hundreds per permutation).
 pub fn packed_poseidon2b_permute(states: &mut [PackedBlock128; STATE_SIZE]) {
-    let tables = flat_tables();
-
     // Convert state to flat basis once.
     for i in 0..STATE_SIZE {
         states[i] = states[i].to_flat();
     }
+    packed_poseidon2b_permute_flat(states);
+    // Convert back to tower basis.
+    for i in 0..STATE_SIZE {
+        states[i] = states[i].to_tower();
+    }
+}
+
+/// Packed permutation acting on states whose lanes already carry **flat
+/// (GCM) basis** bit patterns — the batched twin of
+/// `native::permutation::permute_flat_u128`, with no boundary conversion.
+pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE]) {
+    let tables = flat_tables();
 
     // Initial MDS_FULL multiplication (flat basis).
     packed_apply_mds_full_flat(states, tables);
@@ -581,10 +591,82 @@ pub fn packed_poseidon2b_permute(states: &mut [PackedBlock128; STATE_SIZE]) {
             packed_apply_mds_partial_flat(states, tables);
         }
     }
+}
 
-    // Convert back to tower basis.
-    for i in 0..STATE_SIZE {
-        states[i] = states[i].to_tower();
+/// Batched flat-basis 1-permutation feed-forward compression of interleaved
+/// 32-byte digest pairs. Matches
+/// `native::compress_flat_feed_forward_with_tag(tag, left, right)` exactly.
+pub fn compress_flat_ff_batch_interleaved_with_tag_into(
+    tag: DomainTag,
+    pairs: &[[u8; 32]],
+    out: &mut [[u8; 32]],
+) {
+    assert_eq!(
+        pairs.len() & 1,
+        0,
+        "Interleaved pairs must have even length"
+    );
+    let n = pairs.len() / 2;
+    assert_eq!(out.len(), n, "Output length must match pair count");
+
+    let scalar = |i: usize, out: &mut [[u8; 32]]| {
+        out[i] = crate::native::compression::compress_flat_feed_forward_with_tag(
+            tag,
+            &pairs[2 * i],
+            &pairs[2 * i + 1],
+        );
+    };
+
+    if PACKED_LANES == 1 || n < PACKED_LANES {
+        for i in 0..n {
+            scalar(i, out);
+        }
+        return;
+    }
+
+    let [iv_hi, iv_lo] = crate::native::domain::capacity_iv_flat(tag);
+    let chunks = n / PACKED_LANES;
+
+    for chunk in 0..chunks {
+        let mut states = [PackedBlock128::ZERO; STATE_SIZE];
+        let off = chunk * PACKED_LANES;
+
+        // state = [a0, a1, b0 ^ IV_hi, b1 ^ IV_lo] (all lanes flat bit
+        // patterns; Block128 is used as a plain 128-bit container here).
+        let mut a0s = PackedBlock128::ZERO;
+        let mut a1s = PackedBlock128::ZERO;
+        for lane in 0..PACKED_LANES {
+            let a = &pairs[2 * (off + lane)];
+            let b = &pairs[2 * (off + lane) + 1];
+            let a0 = u128::from_le_bytes(a[0..16].try_into().unwrap());
+            let a1 = u128::from_le_bytes(a[16..32].try_into().unwrap());
+            let b0 = u128::from_le_bytes(b[0..16].try_into().unwrap());
+            let b1 = u128::from_le_bytes(b[16..32].try_into().unwrap());
+            a0s = a0s.set_lane(lane, Block128::from(a0));
+            a1s = a1s.set_lane(lane, Block128::from(a1));
+            states[0] = states[0].set_lane(lane, Block128::from(a0));
+            states[1] = states[1].set_lane(lane, Block128::from(a1));
+            states[2] = states[2].set_lane(lane, Block128::from(b0 ^ iv_hi));
+            states[3] = states[3].set_lane(lane, Block128::from(b1 ^ iv_lo));
+        }
+
+        packed_poseidon2b_permute_flat(&mut states);
+
+        // Feed-forward of the left input on the truncated lanes.
+        states[0] = states[0].xor(a0s);
+        states[1] = states[1].xor(a1s);
+
+        for lane in 0..PACKED_LANES {
+            let s0 = states[0].get_lane(lane);
+            let s1 = states[1].get_lane(lane);
+            out[off + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
+            out[off + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
+        }
+    }
+
+    let rem_off = chunks * PACKED_LANES;
+    for i in rem_off..n {
+        scalar(i, out);
     }
 }
 
@@ -748,6 +830,33 @@ mod tests {
         let expected: Vec<[u8; 32]> = (0..n)
             .map(|i| {
                 crate::native::compress_with_tag(tag, &interleaved[2 * i], &interleaved[2 * i + 1])
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_compress_flat_ff_batch_matches_scalar() {
+        use crate::native::DomainTag;
+
+        let mut rng = rand::thread_rng();
+        let tag = DomainTag::new(b"FFTBTST_");
+        // 257 exercises both the packed chunks and the scalar remainder.
+        let n = 257;
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for _ in 0..(n * 2) {
+            interleaved.push(rng.gen::<[u8; 32]>());
+        }
+
+        let mut got = vec![[0u8; 32]; n];
+        compress_flat_ff_batch_interleaved_with_tag_into(tag, &interleaved, &mut got);
+        let expected: Vec<[u8; 32]> = (0..n)
+            .map(|i| {
+                crate::native::compress_flat_feed_forward_with_tag(
+                    tag,
+                    &interleaved[2 * i],
+                    &interleaved[2 * i + 1],
+                )
             })
             .collect();
         assert_eq!(got, expected);

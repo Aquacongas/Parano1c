@@ -5,8 +5,8 @@
 //!
 //! Sponge parameters: t=4, rate=2, cap=2.
 
-use super::domain::{capacity_iv, DomainTag, TAG_BYTEHASH, TAG_COMPRESS};
-use super::permutation::Poseidon2bPermutation;
+use super::domain::{capacity_iv, capacity_iv_flat, DomainTag, TAG_BYTEHASH, TAG_COMPRESS};
+use super::permutation::{permute_flat_u128, Poseidon2bPermutation};
 use noid_core::{Block128, CanonicalSerialize, TowerField};
 
 const STATE_SIZE: usize = 4;
@@ -237,6 +237,121 @@ fn fill_padding(data: &mut [u8]) {
     data[data.len() - 1] |= PADDING_END;
 }
 
+// ---------------------------------------------------------------------------
+// Flat-basis (GCM) primitives
+// ---------------------------------------------------------------------------
+//
+// The permutation schedule runs in the flat basis internally
+// (`permute_flat_u128`); the constructions below keep their whole state
+// there, so data that already lives in the flat basis — F_{2^128} PCS
+// codeword values, lane-oriented transcript digests — is absorbed with no
+// basis conversion at all. Byte encoding: one lane = 16 little-endian bytes
+// read as a u128 flat value.
+
+/// 1-permutation 2-to-1 compression of two 32-byte digests, **flat basis**,
+/// with an input-whitening domain tag and left-input feed-forward:
+///
+/// ```text
+/// state = [a0, a1, b0 ^ IV_hi, b1 ^ IV_lo]
+/// permute (flat)
+/// return (state[0] ^ a0) || (state[1] ^ a1)
+/// ```
+///
+/// This is the truncated-permutation compression mode: the feed-forward
+/// makes the map one-way (a bare truncated permutation would be freely
+/// invertible on the observed lanes), and the caller-selected tag whitens
+/// the right-input lanes so distinct trees cannot share collisions. One
+/// permutation per node — half the sponge-mode [`compress_with_tag`] cost,
+/// which is what a proof replaying every Merkle query pays per level.
+#[inline]
+pub fn compress_flat_feed_forward_with_tag(tag: DomainTag, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let a0 = u128::from_le_bytes(a[..16].try_into().unwrap());
+    let a1 = u128::from_le_bytes(a[16..].try_into().unwrap());
+    let b0 = u128::from_le_bytes(b[..16].try_into().unwrap());
+    let b1 = u128::from_le_bytes(b[16..].try_into().unwrap());
+
+    let [iv_hi, iv_lo] = capacity_iv_flat(tag);
+    let mut state = [a0, a1, b0 ^ iv_hi, b1 ^ iv_lo];
+    permute_flat_u128(&mut state);
+
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&(state[0] ^ a0).to_le_bytes());
+    out[16..].copy_from_slice(&(state[1] ^ a1).to_le_bytes());
+    out
+}
+
+/// Poseidon2b sponge whose state lives in the **flat (GCM) basis**.
+///
+/// Same t=4/rate-2 duplex, buffering and `0x80…01` padding as
+/// [`Poseidon2bSponge`], but absorbed bytes are interpreted as flat-basis
+/// lanes and the permutation runs with no boundary conversion. Used for the
+/// proof-core PCS Merkle leaves, whose payloads are flat F_{2^128} values.
+#[derive(Debug, Clone)]
+pub struct Poseidon2bFlatSponge {
+    state: [u128; STATE_SIZE],
+    buffer: [u8; 32],
+    filled_bytes: usize,
+}
+
+impl Poseidon2bFlatSponge {
+    /// Construct a flat sponge seeded with the tag's capacity IV (flat).
+    pub fn with_tag(tag: DomainTag) -> Self {
+        let [iv_hi, iv_lo] = capacity_iv_flat(tag);
+        Self {
+            state: [0, 0, iv_hi, iv_lo],
+            buffer: [0u8; 32],
+            filled_bytes: 0,
+        }
+    }
+
+    /// Absorb raw bytes (interpreted as flat-basis lanes).
+    pub fn update(&mut self, mut data: &[u8]) {
+        if self.filled_bytes != 0 {
+            let to_copy = std::cmp::min(data.len(), 32 - self.filled_bytes);
+            self.buffer[self.filled_bytes..self.filled_bytes + to_copy]
+                .copy_from_slice(&data[..to_copy]);
+            data = &data[to_copy..];
+            self.filled_bytes += to_copy;
+
+            if self.filled_bytes == 32 {
+                self.permute_buffer();
+                self.filled_bytes = 0;
+            }
+        }
+
+        for chunk in data.chunks_exact(32) {
+            self.buffer.copy_from_slice(chunk);
+            self.permute_buffer();
+        }
+
+        let remaining = data.chunks_exact(32).remainder();
+        if !remaining.is_empty() {
+            self.buffer[..remaining.len()].copy_from_slice(remaining);
+            self.filled_bytes = remaining.len();
+        }
+    }
+
+    /// Finalize with the `0x80…01` pad block and squeeze a 32-byte digest
+    /// (the two rate lanes, flat LE bytes).
+    pub fn finalize(mut self) -> [u8; 32] {
+        fill_padding(&mut self.buffer[self.filled_bytes..]);
+        self.permute_buffer();
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&self.state[0].to_le_bytes());
+        out[16..].copy_from_slice(&self.state[1].to_le_bytes());
+        out
+    }
+
+    fn permute_buffer(&mut self) {
+        for i in 0..RATE {
+            let mut word = [0u8; 16];
+            word.copy_from_slice(&self.buffer[i * 16..(i + 1) * 16]);
+            self.state[i] ^= u128::from_le_bytes(word);
+        }
+        permute_flat_u128(&mut self.state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +417,80 @@ mod tests {
         sponge.absorb(Block128::from(123u8));
         let _digest = sponge.finalize();
         // Just ensure it doesn't panic
+    }
+
+    #[test]
+    fn test_compress_ff_deterministic_order_and_tag_sensitive() {
+        use super::super::domain::DomainTag;
+        let t1 = DomainTag::new(b"FFTESTA_");
+        let t2 = DomainTag::new(b"FFTESTB_");
+        let a = [7u8; 32];
+        let b = [42u8; 32];
+        let h = compress_flat_feed_forward_with_tag(t1, &a, &b);
+        assert_eq!(h, compress_flat_feed_forward_with_tag(t1, &a, &b));
+        assert_ne!(h, compress_flat_feed_forward_with_tag(t1, &b, &a));
+        assert_ne!(h, compress_flat_feed_forward_with_tag(t2, &a, &b));
+    }
+
+    /// The feed-forward is the one-wayness step: the output must NOT equal
+    /// the bare truncated permutation of the whitened input.
+    #[test]
+    fn test_compress_ff_feed_forward_present() {
+        use super::super::domain::{capacity_iv_flat, DomainTag};
+        let tag = DomainTag::new(b"FFTESTC_");
+        let a = [3u8; 32];
+        let b = [9u8; 32];
+        let a0 = u128::from_le_bytes(a[..16].try_into().unwrap());
+        let a1 = u128::from_le_bytes(a[16..].try_into().unwrap());
+        let b0 = u128::from_le_bytes(b[..16].try_into().unwrap());
+        let b1 = u128::from_le_bytes(b[16..].try_into().unwrap());
+        let [iv_hi, iv_lo] = capacity_iv_flat(tag);
+        let mut state = [a0, a1, b0 ^ iv_hi, b1 ^ iv_lo];
+        permute_flat_u128(&mut state);
+        let mut bare = [0u8; 32];
+        bare[..16].copy_from_slice(&state[0].to_le_bytes());
+        bare[16..].copy_from_slice(&state[1].to_le_bytes());
+        let h = compress_flat_feed_forward_with_tag(tag, &a, &b);
+        assert_ne!(h, bare);
+    }
+
+    #[test]
+    fn test_flat_sponge_deterministic_length_and_tag_bound() {
+        use super::super::domain::DomainTag;
+        let t1 = DomainTag::new(b"FLSPNGA_");
+        let t2 = DomainTag::new(b"FLSPNGB_");
+        let data: Vec<u8> = (0..64u8).collect();
+
+        let hash = |tag, bytes: &[u8]| {
+            let mut s = Poseidon2bFlatSponge::with_tag(tag);
+            s.update(bytes);
+            s.finalize()
+        };
+        assert_eq!(hash(t1, &data), hash(t1, &data));
+        assert_ne!(hash(t1, &data), hash(t2, &data));
+        // Sponge padding separates a full-block message from its extension.
+        assert_ne!(hash(t1, &data[..32]), hash(t1, &data[..48]));
+        // Split updates equal one whole update (byte-stream semantics).
+        let mut split = Poseidon2bFlatSponge::with_tag(t1);
+        split.update(&data[..7]);
+        split.update(&data[7..40]);
+        split.update(&data[40..]);
+        assert_eq!(split.finalize(), hash(t1, &data));
+    }
+
+    /// `permute_flat_u128` is exactly the conversion-free core of
+    /// `Poseidon2bPermutation::permute_mut`.
+    #[test]
+    fn test_permute_flat_matches_tower_permutation() {
+        use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
+        let tower: [Block128; 4] = std::array::from_fn(|i| Block128::from((i as u128) * 77 + 5));
+        let mut expected = tower;
+        Poseidon2bPermutation.permute_mut(&mut expected);
+
+        let mut flat: [u128; 4] = std::array::from_fn(|i| tower_to_flat_u128(tower[i].0));
+        permute_flat_u128(&mut flat);
+        for i in 0..4 {
+            assert_eq!(flat_to_tower_u128(flat[i]), expected[i].0, "lane {i}");
+        }
     }
 }

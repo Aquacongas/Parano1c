@@ -9,16 +9,30 @@
 //! Total nodes: `2·num_leaves − 1`. The flat layout keeps the tree contiguous
 //! in memory for cheap Merkle-path extraction later.
 //!
-//! Leaves and internal nodes use domain-separated Poseidon2b helpers from
-//! `noid_poseidon2b`.
+//! Leaves and internal nodes are Poseidon2b constructions whose state lives
+//! in the **flat (GCM) basis** end to end — the basis of the committed
+//! F_{2^128} codeword values and of the lane-oriented proof transcript:
+//!
+//! - **Leaf**: a rate-2 duplex sponge with the `IVCPCSL_` capacity IV
+//!   absorbing the leaf bytes as 16-byte flat lanes (`0x80…01` pad), i.e.
+//!   `⌈lanes/2⌉ + (lanes odd ? 0 : 1)` permutations per leaf. PCS leaf
+//!   payloads are F_{2^128} values, so every absorb is lane-aligned.
+//! - **Inner node**: the 1-permutation feed-forward compression
+//!   (`compress_flat_feed_forward_with_tag`, tag `IVCPCSN_`) — half the
+//!   two-permutation sponge compress, which is what an in-circuit verifier
+//!   replaying every FRI query path pays per tree level.
 
-use noid_poseidon2b::batch::{POSEIDON2B_BATCH_LANES, compress_batch_interleaved_with_tag_into};
-use noid_poseidon2b::native::{DomainTag, compress_with_tag, poseidon2b_hash_byte_slices};
+use noid_poseidon2b::batch::{
+    POSEIDON2B_BATCH_LANES, compress_flat_ff_batch_interleaved_with_tag_into,
+};
+use noid_poseidon2b::native::{
+    DomainTag, Poseidon2bFlatSponge, compress_flat_feed_forward_with_tag,
+};
 use rayon::prelude::*;
 
 pub type Hash = [u8; 32];
 
-const POSEIDON_MERKLE_LEAF_DOMAIN: &[u8] = b"NOID/IVC/PCS-LEAF";
+const POSEIDON_MERKLE_LEAF_TAG: DomainTag = DomainTag::new(b"IVCPCSL_");
 const POSEIDON_MERKLE_NODE_TAG: DomainTag = DomainTag::new(b"IVCPCSN_");
 
 /// Global PCS commitment-tree Poseidon2b counters, enabled with
@@ -35,17 +49,15 @@ pub mod hash_count {
     /// Hash work units for one leaf hash of `len` bytes.
     #[inline]
     pub fn leaf_hash_units(len: usize) -> u64 {
-        // `poseidon2b_hash_byte_slices(domain, &[data])` absorbs:
-        // domain_len, domain, pieces_len, piece_len, data, then one final
-        // padded permutation.
-        let absorbed = 8 + super::POSEIDON_MERKLE_LEAF_DOMAIN.len() + 8 + 8 + len;
-        (absorbed / 32 + 1) as u64
+        // The flat leaf sponge absorbs `len` bytes (IV in capacity, no
+        // domain-string prefix), then one final padded permutation.
+        (len / 32 + 1) as u64
     }
 
     #[inline]
     pub fn pair_hash_units() -> u64 {
-        // One permutation for the left child, one after XORing the right child.
-        2
+        // One feed-forward permutation per inner node.
+        1
     }
 
     pub fn reset() {
@@ -64,7 +76,7 @@ pub mod hash_count {
     }
 }
 
-/// Hash one leaf of arbitrary byte length.
+/// Hash one leaf of arbitrary byte length (flat-basis lane sponge).
 #[inline]
 pub fn hash_leaf(data: &[u8]) -> Hash {
     #[cfg(feature = "hash-count")]
@@ -73,15 +85,18 @@ pub fn hash_leaf(data: &[u8]) -> Hash {
         hash_count::LEAF_CALLS.fetch_add(1, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(hash_count::leaf_hash_units(data.len()), Relaxed);
     }
-    poseidon2b_hash_byte_slices(POSEIDON_MERKLE_LEAF_DOMAIN, &[data])
+    let mut sponge = Poseidon2bFlatSponge::with_tag(POSEIDON_MERKLE_LEAF_TAG);
+    sponge.update(data);
+    sponge.finalize()
 }
 
-/// Hash a pair of children into a parent node (64 B → 32 B).
+/// Hash a pair of children into a parent node (64 B → 32 B, one
+/// feed-forward permutation).
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    compress_with_tag(POSEIDON_MERKLE_NODE_TAG, left, right)
+    compress_flat_feed_forward_with_tag(POSEIDON_MERKLE_NODE_TAG, left, right)
 }
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
@@ -143,13 +158,17 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
             const SERIAL_LEVEL_NODES: usize = 1024;
             const PAR_CHUNK_NODES: usize = 1024;
             if write.len() <= SERIAL_LEVEL_NODES {
-                compress_batch_interleaved_with_tag_into(POSEIDON_MERKLE_NODE_TAG, read, write);
+                compress_flat_ff_batch_interleaved_with_tag_into(
+                    POSEIDON_MERKLE_NODE_TAG,
+                    read,
+                    write,
+                );
             } else {
                 write
                     .par_chunks_mut(PAR_CHUNK_NODES)
                     .zip(read.par_chunks(2 * PAR_CHUNK_NODES))
                     .for_each(|(out, input)| {
-                        compress_batch_interleaved_with_tag_into(
+                        compress_flat_ff_batch_interleaved_with_tag_into(
                             POSEIDON_MERKLE_NODE_TAG,
                             input,
                             out,

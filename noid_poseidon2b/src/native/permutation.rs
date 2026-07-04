@@ -25,37 +25,48 @@ pub struct Poseidon2bPermutation;
 impl Poseidon2bPermutation {
     /// Apply the full permutation to `state` in-place.
     pub fn permute_mut(&self, state: &mut [Block128; STATE_SIZE]) {
-        let tables = flat_tables();
         let mut flat = [0u128; STATE_SIZE];
         for i in 0..STATE_SIZE {
             flat[i] = tower_to_flat_u128(state[i].0);
         }
-
-        // Initial MDS_FULL multiplication.
-        apply_mds_full_flat(&mut flat, tables);
-
-        // Full and partial rounds, entirely in flat/GCM basis. This is
-        // algebraically identical to the tower schedule but avoids a
-        // tower<->flat conversion around every CLMUL multiplication.
-        #[allow(clippy::needless_range_loop)]
-        for r in 0..N_ROUNDS {
-            if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {
-                // Full round.
-                for i in 0..STATE_SIZE {
-                    flat[i] ^= tables.rc[i][r];
-                    flat[i] = sbox_x7_flat_u128(flat[i]);
-                }
-                apply_mds_full_flat(&mut flat, tables);
-            } else {
-                // Partial round.
-                flat[0] ^= tables.rc[0][r];
-                flat[0] = sbox_x7_flat_u128(flat[0]);
-                apply_mds_partial_flat(&mut flat, tables);
-            }
-        }
-
+        permute_flat_u128(&mut flat);
         for i in 0..STATE_SIZE {
             state[i] = Block128(flat_to_tower_u128(flat[i]));
+        }
+    }
+}
+
+/// The Poseidon2b permutation acting directly on a **flat (GCM) basis**
+/// state, with no basis conversion at the boundaries.
+///
+/// [`Poseidon2bPermutation::permute_mut`] is exactly
+/// `tower→flat → permute_flat_u128 → flat→tower`: the round schedule always
+/// runs in the flat basis internally. Callers whose data already lives in
+/// the flat basis (lane-oriented transcripts, the proof-core PCS Merkle
+/// primitives) use this entry point and skip both conversions.
+pub fn permute_flat_u128(flat: &mut [u128; STATE_SIZE]) {
+    let tables = flat_tables();
+
+    // Initial MDS_FULL multiplication.
+    apply_mds_full_flat(flat, tables);
+
+    // Full and partial rounds, entirely in flat/GCM basis. This is
+    // algebraically identical to the tower schedule but avoids a
+    // tower<->flat conversion around every CLMUL multiplication.
+    #[allow(clippy::needless_range_loop)]
+    for r in 0..N_ROUNDS {
+        if !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r) {
+            // Full round.
+            for i in 0..STATE_SIZE {
+                flat[i] ^= tables.rc[i][r];
+                flat[i] = sbox_x7_flat_u128(flat[i]);
+            }
+            apply_mds_full_flat(flat, tables);
+        } else {
+            // Partial round.
+            flat[0] ^= tables.rc[0][r];
+            flat[0] = sbox_x7_flat_u128(flat[0]);
+            apply_mds_partial_flat(flat, tables);
         }
     }
 }

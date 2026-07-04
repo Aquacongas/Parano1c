@@ -39,6 +39,18 @@ pub fn capacity_iv(tag: DomainTag) -> [Block128; 2] {
     [high, low]
 }
 
+/// [`capacity_iv`] mapped into the **flat (GCM) basis** — IV words for
+/// constructions whose state lives in the flat basis end to end
+/// (`compress_flat_feed_forward_with_tag`, `Poseidon2bFlatSponge`).
+#[inline]
+pub fn capacity_iv_flat(tag: DomainTag) -> [u128; 2] {
+    let [high, low] = capacity_iv(tag);
+    [
+        noid_core::hardware::tower_to_flat_u128(high.0),
+        noid_core::hardware::tower_to_flat_u128(low.0),
+    ]
+}
+
 pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
 pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
 pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");

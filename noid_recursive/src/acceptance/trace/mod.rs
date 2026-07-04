@@ -42,6 +42,7 @@ pub mod checkpoint_poseidon;
 pub mod exact_state;
 pub mod merkle_path;
 pub mod owner_auth;
+pub mod self_verify;
 pub mod tx_body_spine;
 
 use std::collections::HashMap;

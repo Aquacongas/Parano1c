@@ -43,6 +43,13 @@ pub struct FieldR1csProof {
     pub pcs_open: pcs::BaseFoldProof,
 }
 
+/// Canonical statement byte encoding of the PCS parameters — shared by the
+/// native statement bindings below and their in-trace twins, so the two can
+/// never drift on serialization details.
+pub fn pcs_params_statement_bytes(params: &pcs::PcsParams) -> Vec<u8> {
+    bincode::serialize(params).expect("PcsParams serializes")
+}
+
 /// FieldR1cs statement binding — mirror of [`bind_statement`] with the field
 /// instance digest and a distinct label.
 pub fn bind_statement_field<Ch: Challenger>(
@@ -52,8 +59,7 @@ pub fn bind_statement_field<Ch: Challenger>(
 ) {
     challenger.observe_label(b"history-field-r1cs");
     challenger.observe_bytes(&r1cs.statement_digest());
-    let pcs_params = bincode::serialize(&commitment.params).expect("PcsParams serializes");
-    challenger.observe_bytes(&pcs_params);
+    challenger.observe_bytes(&pcs_params_statement_bytes(&commitment.params));
     challenger.observe_bytes(&commitment.root);
 }
 
@@ -91,7 +97,6 @@ pub fn bind_statement<Ch: Challenger>(
 ) {
     challenger.observe_label(b"history-r1cs");
     challenger.observe_bytes(&r1cs.statement_digest());
-    let pcs_params = bincode::serialize(&commitment.params).expect("PcsParams serializes");
-    challenger.observe_bytes(&pcs_params);
+    challenger.observe_bytes(&pcs_params_statement_bytes(&commitment.params));
     challenger.observe_bytes(&commitment.root);
 }
