@@ -1492,9 +1492,17 @@ fn tx_root_merkle_inputs(block: &Block) -> Result<Vec<MerklePathInputs>, ()> {
         return Err(());
     }
 
+    // Paths are emitted for the REAL leaves only. Padding slots
+    // (transactions.len()..target) are constant zero leaves whose subtree
+    // hashes appear as the right-hand siblings of the last real path; the
+    // root reconstruction above already binds them natively, and a replay
+    // that treats siblings as free witness must pin those right-hand
+    // siblings to the canonical zero-subtree constants (the last path's
+    // sibling at level L is the depth-L zero subtree whenever its direction
+    // bit says "left child").
     let expected_root = digest_to_fields(root);
-    let mut inputs = Vec::with_capacity(target);
-    for leaf_index in 0..target {
+    let mut inputs = Vec::with_capacity(block.transactions.len());
+    for leaf_index in 0..block.transactions.len() {
         let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
         let mut directions = [false; MAX_MERKLE_DEPTH];
         let mut index = leaf_index;

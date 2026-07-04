@@ -69,13 +69,22 @@ fn absorb_pair<T: FiatShamir<Block128>>(channel: &mut T, pair: &[Block128; 2]) {
 }
 
 fn absorb_public_path<T: FiatShamir<Block128>>(channel: &mut T, inputs: &MerklePathInputs) {
+    // Prefix-decodable: the depth comes FIRST and bounds the sibling loop.
+    // Levels past `active_depth` are canonical zeros (`inputs_are_canonical`)
+    // — absorbing them bought nothing and cost `(MAX_MERKLE_DEPTH − depth)·3`
+    // pure-padding lanes per path. Direction bits pack into ONE lane
+    // (bit `level` of the last absorbed field) instead of a whole lane each.
+    channel.absorb(Block128::from(inputs.active_depth as u128));
     absorb_pair(channel, &inputs.expected_root);
     absorb_pair(channel, &inputs.leaf);
-    for level in 0..MAX_MERKLE_DEPTH {
+    let mut directions = 0u128;
+    for level in 0..inputs.active_depth {
         absorb_pair(channel, &inputs.siblings[level]);
-        channel.absorb(Block128::from(inputs.directions[level] as u128));
+        if inputs.directions[level] {
+            directions |= 1 << level;
+        }
     }
-    channel.absorb(Block128::from(inputs.active_depth as u128));
+    channel.absorb(Block128::from(directions));
 }
 
 fn absorb_public_batch<T: FiatShamir<Block128>>(

@@ -136,24 +136,23 @@ fn absorb_public_batch_trace(
     ch.absorb_const_tower(b, inputs.len() as u128);
     ch.absorb_const_tower(b, circuit.node_tag.as_u64() as u128);
     for input in inputs {
-        // absorb_public_path
+        // absorb_public_path: depth-first prefix, active levels only, all
+        // direction bits packed into one lane. Depth and directions are
+        // trace structure, so both packed lanes enter as constants.
+        ch.absorb_const_tower(b, input.active_depth as u128);
         ch.absorb(b, &input.expected_root[0]);
         ch.absorb(b, &input.expected_root[1]);
         ch.absorb(b, &input.leaf[0]);
         ch.absorb(b, &input.leaf[1]);
-        for level in 0..MAX_MERKLE_DEPTH {
-            if level < input.active_depth {
-                ch.absorb(b, &input.siblings[level][0]);
-                ch.absorb(b, &input.siblings[level][1]);
-                ch.absorb_const_tower(b, input.directions[level] as u128);
-            } else {
-                // Canonical zero padding — constants.
-                ch.absorb_const_tower(b, 0);
-                ch.absorb_const_tower(b, 0);
-                ch.absorb_const_tower(b, 0);
+        let mut directions = 0u128;
+        for level in 0..input.active_depth {
+            ch.absorb(b, &input.siblings[level][0]);
+            ch.absorb(b, &input.siblings[level][1]);
+            if input.directions[level] {
+                directions |= 1 << level;
             }
         }
-        ch.absorb_const_tower(b, input.active_depth as u128);
+        ch.absorb_const_tower(b, directions);
     }
 }
 
