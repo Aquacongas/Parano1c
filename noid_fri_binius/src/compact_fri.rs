@@ -7,7 +7,8 @@
 //!
 //! Key differences from the generic `noid_fri::prover`:
 //! - TAU=8 (256 upper partials) instead of 7 (128) -> 5 FRI rounds instead of 6
-//! - 64 queries with batched Merkle proof compression (proven 128-bit soundness)
+//! - 64 queries with batched Merkle proof compression (128-bit under the RS
+//!   capacity conjecture; see [`COMPACT_NUM_QUERIES`] for the provable bounds)
 //! - Batch Merkle paths deduplicate shared ancestors across queries (~40% savings)
 //!
 //! Proof size target: ~38KB (down from 70KB in the generic FRI)
@@ -34,8 +35,15 @@ use std::time::{Duration, Instant};
 /// best size/verify balance for the production mix.
 pub const COMPACT_TAU: usize = 8;
 
-/// Number of FRI queries for full security. 64 queries with rate-4 code gives:
-/// - Proven soundness: 64 * log2(4) = 128 bits
+/// Number of FRI queries. 64 queries with the rate-1/4 code gives:
+/// - 128 bits **under the Reed-Solomon capacity conjecture** (each query
+///   contributes log2(4) = 2 bits there — conjectured, not proven);
+/// - roughly 64 bits provable in the Johnson/list-decoding regime
+///   (proximity gaps), and roughly 43 bits under unique decoding.
+///
+/// Any consumer quoting this proof system's security must name the regime.
+/// Closing the provable gap by queries alone (~148 for 128-bit Johnson)
+/// would roughly double the opening bytes.
 ///
 /// Uses batched Merkle proofs to compress shared ancestors, yielding ~40% path
 /// savings vs independent per-query paths.

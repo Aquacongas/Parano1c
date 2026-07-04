@@ -16,11 +16,14 @@ use noid_poseidon2b::native::domain::{TAG_FRICHANL, capacity_iv};
 use crate::merkle::VectorCommitment;
 use crate::prover::FriCommitment;
 
-/// Number of FRI queries. With code rate R = 4 each query contributes
-/// `log2(R) = 2` bits of proven soundness (JACM FRI bound). We target
-/// **128-bit proven soundness**, which requires `ceil(128 / 2) = 64`
-/// queries. This exceeds the sumcheck bottleneck (~120 bits) while
-/// cutting proof size and verifier work by 33% vs the former 96.
+/// Number of FRI queries. With inverse rate 4, each query contributes
+/// `log2(4) = 2` bits **under the Reed-Solomon capacity conjecture**
+/// (conjectured, not proven): 64 queries = 128-bit conjectured soundness.
+/// The PROVABLE bounds for this phase are materially lower — roughly
+/// 64 bits under the Johnson/list-decoding regime (proximity gaps) and
+/// roughly 43 bits under unique decoding — so any security statement for
+/// this proof system must name which regime it is quoting. 64 queries
+/// keeps proof size and verifier work 33% below the former 96.
 ///
 /// In debug builds (cargo test, cargo run without --release) we use a
 /// smaller count so the test suite runs quickly — the protocol is still

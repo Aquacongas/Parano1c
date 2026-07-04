@@ -28,7 +28,12 @@
 //! |-----------|----------|
 //! | Merkle cap backend | 128-bit collision target |
 //! | Gamma batching | (n-1)/2^128 (Horner RLC) |
-//! | Compact FRI | 64 queries * 2 bits = 128-bit proven |
+//! | Compact FRI | 128-bit under the RS capacity CONJECTURE; provable ~64-bit (Johnson) / ~43-bit (unique decoding) |
+//!
+//! The FRI query phase is the weakest provable link of the whole proof
+//! chain: only the capacity-conjecture figure reaches the 128-bit target,
+//! and raising the provable floor by query count alone (~148 queries for
+//! 128-bit Johnson) would roughly double the opening bytes.
 
 pub mod compact_fri;
 pub mod interleaved_commit;
