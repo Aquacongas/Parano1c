@@ -185,6 +185,18 @@ fn mutations_rejected() {
         let mut p = proof.clone();
         p.pcs_open.pow_nonce = p.pcs_open.pow_nonce.wrapping_add(1);
         cases.push(("pcs.pow_nonce".to_string(), p));
+        if !proof.pcs_open.plaintext_tail.is_empty() {
+            let mut p = proof.clone();
+            p.pcs_open.plaintext_tail[0].lo ^= 1;
+            cases.push(("pcs.plaintext_tail[0]".to_string(), p));
+            let mut p = proof.clone();
+            let last = p.pcs_open.plaintext_tail.len() - 1;
+            p.pcs_open.plaintext_tail[last].hi ^= 1;
+            cases.push(("pcs.plaintext_tail[last]".to_string(), p));
+            let mut p = proof.clone();
+            p.pcs_open.plaintext_tail.pop();
+            cases.push(("pcs.plaintext_tail truncated".to_string(), p));
+        }
         let mut p = proof.clone();
         p.pcs_open.queries.truncate(p.pcs_open.queries.len() / 2);
         cases.push(("pcs.queries truncated".to_string(), p));

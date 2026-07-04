@@ -127,6 +127,39 @@ pub fn default_fri_queries(log_inv_rate: usize) -> usize {
     }
 }
 
+/// FRI layers of at most this many F_{2^128} elements are sent PLAINTEXT
+/// (absorbed whole into the transcript at their epoch boundary) instead of
+/// Merkle-committed. Every deeper epoch tree disappears: queries read the
+/// layer directly and the verifier folds it to the final codeword once.
+/// The one-time absorb costs `len/2` permutations while committed epochs
+/// cost every query a leaf hash plus a Merkle path — the crossover sits in
+/// the thousands of elements for ~100 queries, so 2^10 keeps a safety
+/// margin on both proof bytes (≤16 KB of plaintext) and absorb work.
+pub const PLAINTEXT_TAIL_MAX_F128: usize = 1024;
+
+/// The FRI commit layout under the plaintext-tail rule, derived purely from
+/// the shape (shared by the prover, the verifier, and in-circuit replays so
+/// they can never disagree): how many epoch boundaries carry Merkle
+/// commitments, and — if some boundary layer fits the plaintext cutoff —
+/// that layer's length and the number of FRI rounds folded before it.
+///
+/// Boundaries are indexed by the epoch they FEED: boundary `b` (for
+/// `b in 1..arities.len()`) is the layer entering epoch `b`, of length
+/// `2^(k_code − Σ arities[..b])`. The first boundary at or below
+/// [`PLAINTEXT_TAIL_MAX_F128`] becomes the tail; boundaries past it commit
+/// nothing.
+pub fn fri_commit_layout(k_code: usize, arities: &[usize]) -> (usize, Option<(usize, usize)>) {
+    let mut cum_arity = 0usize;
+    for b in 1..arities.len() {
+        cum_arity += arities[b - 1];
+        let layer_len = 1usize << (k_code - cum_arity);
+        if layer_len <= PLAINTEXT_TAIL_MAX_F128 {
+            return (b - 1, Some((layer_len, cum_arity)));
+        }
+    }
+    (arities.len().saturating_sub(1), None)
+}
+
 /// Derive `n` query positions from the transcript with ONE vector squeeze:
 /// each squeezed lane yields `floor(128 / k_code)` positions as consecutive
 /// `k_code`-bit windows of its 128-bit flat pattern (low windows first).
@@ -210,6 +243,10 @@ pub struct BaseFoldProof {
     pub final_b: F128,
     /// Final codeword (length `2^log_inv_rate`, must be constant).
     pub final_codeword: Vec<F128>,
+    /// The plaintext-tail FRI layer (see [`PLAINTEXT_TAIL_MAX_F128`]):
+    /// absorbed whole into the transcript at its epoch boundary in place of
+    /// a Merkle commitment. Empty iff the shape has no qualifying boundary.
+    pub plaintext_tail: Vec<F128>,
     /// Transcript-grinding nonce spent before query sampling
     /// ([`QUERY_GRIND_BITS`] leading zero bits).
     pub pow_nonce: u64,
@@ -457,8 +494,8 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
 
     let arities = crate::pcs::compute_fri_arities(log_dim);
     debug_assert_eq!(arities.iter().sum::<usize>(), log_dim);
-    let num_epochs = arities.len();
-    let num_fri_commits = num_epochs.saturating_sub(1);
+    let (num_fri_commits, tail_layout) = fri_commit_layout(k_code, &arities);
+    let mut plaintext_tail: Vec<F128> = Vec::new();
 
     let mut running_target = target;
     let mut round_messages = Vec::with_capacity(log_msg_len);
@@ -680,12 +717,16 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
 
             rounds_in_epoch += 1;
 
-            // Epoch boundary?
+            // Epoch boundary? Boundary b = current_epoch + 1 (the layer
+            // entering epoch b): the first `num_fri_commits` boundaries get
+            // Merkle commitments; the plaintext-tail boundary absorbs its
+            // whole layer instead; anything past the tail commits nothing
+            // (the verifier folds the tail locally).
             if rounds_in_epoch == arities[current_epoch] {
-                let is_last_epoch = current_epoch + 1 == num_epochs;
-                if !is_last_epoch {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
                     let t = std::time::Instant::now();
-                    let next_arity = arities[current_epoch + 1];
+                    let next_arity = arities[boundary];
                     let leaf_f128 = 1usize << next_arity;
                     let n_leaves = cw_len / leaf_f128;
                     let cw_bytes: &[u8] = unsafe {
@@ -704,6 +745,14 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                     if trace {
                         epoch_merkle_ms += t.elapsed().as_secs_f64() * 1e3;
                     }
+                } else if let Some((tail_len, _)) = tail_layout
+                    && boundary == num_fri_commits + 1
+                {
+                    debug_assert_eq!(cw_len, tail_len);
+                    for &v in &codeword_active[..cw_len] {
+                        challenger.observe_f128(v);
+                    }
+                    plaintext_tail = codeword_active[..cw_len].to_vec();
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;
@@ -863,6 +912,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         final_a,
         final_b,
         final_codeword,
+        plaintext_tail,
         pow_nonce,
         queries,
         initial_multi_proof,
@@ -903,12 +953,14 @@ pub fn verify<Ch: Challenger>(
     let k_code = log_dim + log_inv_rate;
     let num_ntts = 1usize << log_batch_size;
     let arities = crate::pcs::compute_fri_arities(log_dim);
-    let num_epochs = arities.len();
-    let num_fri_commits = num_epochs.saturating_sub(1);
+    let (num_fri_commits, tail_layout) = fri_commit_layout(k_code, &arities);
 
     challenger.observe_label(b"history-basefold-v0");
 
     if proof.round_commitments.len() != num_fri_commits {
+        return Err(VerifyError::InvalidProofShape);
+    }
+    if proof.plaintext_tail.len() != tail_layout.map_or(0, |(len, _)| len) {
         return Err(VerifyError::InvalidProofShape);
     }
 
@@ -946,10 +998,17 @@ pub fn verify<Ch: Challenger>(
         if round >= log_batch_size {
             rounds_in_epoch += 1;
             if rounds_in_epoch == arities[current_epoch] {
-                let is_last_epoch = current_epoch + 1 == num_epochs;
-                if !is_last_epoch {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
                     let root = proof.round_commitments[current_epoch].root;
                     observe_root(challenger, &root);
+                } else if tail_layout.is_some() && boundary == num_fri_commits + 1 {
+                    // The plaintext-tail layer replaces this boundary's
+                    // commitment: absorb it whole (proof data), binding the
+                    // query positions drawn below to it.
+                    for &v in &proof.plaintext_tail {
+                        challenger.observe_f128(v);
+                    }
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;
@@ -1101,13 +1160,54 @@ pub fn verify<Ch: Challenger>(
             cum_arity += next_arity;
         }
 
-        // Final check against the plaintext final codeword.
-        let p_final = q.position >> cum_arity;
-        if proof.final_codeword[p_final] != expected {
-            return Err(VerifyError::FoldMismatch {
-                query_index: qi,
-                epoch: num_fri_commits,
-            });
+        // Final check: against the plaintext tail layer when one exists
+        // (the tail itself folds to the final codeword once, below), else
+        // directly against the plaintext final codeword.
+        if let Some((_, tail_cum)) = tail_layout {
+            debug_assert_eq!(cum_arity, tail_cum);
+            let p_tail = q.position >> cum_arity;
+            if proof.plaintext_tail[p_tail] != expected {
+                return Err(VerifyError::FoldMismatch {
+                    query_index: qi,
+                    epoch: num_fri_commits,
+                });
+            }
+        } else {
+            let p_final = q.position >> cum_arity;
+            if proof.final_codeword[p_final] != expected {
+                return Err(VerifyError::FoldMismatch {
+                    query_index: qi,
+                    epoch: num_fri_commits,
+                });
+            }
+        }
+    }
+
+    // The plaintext tail must itself fold to the final codeword: each
+    // contiguous 2^rem-element coset folds through the remaining FRI
+    // challenges to one final-layer element.
+    if let Some((tail_len, tail_cum)) = tail_layout {
+        let rem = log_dim - tail_cum;
+        let coset = 1usize << rem;
+        debug_assert_eq!(tail_len >> rem, 1usize << log_inv_rate);
+        let fri_challenge_start = log_batch_size;
+        let rem_challenges =
+            &challenges[fri_challenge_start + tail_cum..fri_challenge_start + log_dim];
+        let input_layer = k_code - tail_cum;
+        for f in 0..(tail_len >> rem) {
+            let folded = fri_fold_coset(
+                &proof.plaintext_tail[f * coset..(f + 1) * coset],
+                rem_challenges,
+                ntt,
+                input_layer,
+                f,
+            );
+            if folded != proof.final_codeword[f] {
+                return Err(VerifyError::FoldMismatch {
+                    query_index: 0,
+                    epoch: num_fri_commits,
+                });
+            }
         }
     }
 

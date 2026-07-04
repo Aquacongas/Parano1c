@@ -793,6 +793,8 @@ pub struct BaseFoldProofTrace {
     pub final_a: LinExpr,
     pub final_b: LinExpr,
     pub final_codeword: Vec<LinExpr>,
+    /// Plaintext-tail FRI layer (empty iff the shape has no tail boundary).
+    pub plaintext_tail: Vec<LinExpr>,
     /// Pre-query grinding nonce as a flat lane (`lo = nonce, hi = 0`).
     pub pow_nonce: LinExpr,
     pub queries: Vec<QueryOpeningTrace>,
@@ -814,10 +816,15 @@ impl BaseFoldProofTrace {
         let k_code = log_dim + params.log_inv_rate;
         let num_ntts = 1usize << log_batch_size;
         let arities = compute_fri_arities(log_dim);
-        let num_fri_commits = arities.len().saturating_sub(1);
+        let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
         let arity_0 = arities.first().copied().unwrap_or(0);
 
         assert_eq!(native.round_messages.len(), log_msg_len, "rounds off shape");
+        assert_eq!(
+            native.plaintext_tail.len(),
+            tail_layout.map_or(0, |(len, _)| len),
+            "plaintext tail off shape"
+        );
         assert_eq!(
             native.round_commitments.len(),
             num_fri_commits,
@@ -869,6 +876,7 @@ impl BaseFoldProofTrace {
         let final_a = LinExpr::from_wire(b.alloc_f128(native.final_a));
         let final_b = LinExpr::from_wire(b.alloc_f128(native.final_b));
         let final_codeword = alloc_vec(b, &native.final_codeword);
+        let plaintext_tail = alloc_vec(b, &native.plaintext_tail);
         // The native challenger absorbs the nonce as `F128 { lo, hi: 0 }`.
         let pow_nonce =
             LinExpr::from_wire(b.alloc_f128(f128_from_u128(native.pow_nonce as u128)));
@@ -912,6 +920,7 @@ impl BaseFoldProofTrace {
             final_a,
             final_b,
             final_codeword,
+            plaintext_tail,
             pow_nonce,
             queries,
             initial_multi_proof: alloc_digests(b, &native.initial_multi_proof),
@@ -1115,8 +1124,7 @@ pub fn basefold_verify_trace(
     let log_dim = log_msg_len - log_batch_size;
     let k_code = log_dim + log_inv_rate;
     let arities = compute_fri_arities(log_dim);
-    let num_epochs = arities.len();
-    let num_fri_commits = num_epochs.saturating_sub(1);
+    let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
     let arity_0 = arities.first().copied().unwrap_or(0);
     let ntt = AdditiveNttF128::standard(k_code);
 
@@ -1147,9 +1155,16 @@ pub fn basefold_verify_trace(
         if round >= log_batch_size {
             rounds_in_epoch += 1;
             if rounds_in_epoch == arities[current_epoch] {
-                if current_epoch + 1 != num_epochs {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
                     ch.observe_f128(b, &proof.round_commitments[current_epoch][0]);
                     ch.observe_f128(b, &proof.round_commitments[current_epoch][1]);
+                } else if tail_layout.is_some() && boundary == num_fri_commits + 1 {
+                    // Plaintext-tail boundary: absorb the whole layer, one
+                    // lane per element (mirror of the native absorb).
+                    for lane in &proof.plaintext_tail {
+                        ch.observe_f128(b, lane);
+                    }
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;
@@ -1255,8 +1270,40 @@ pub fn basefold_verify_trace(
             cum_arity += next_arity;
         }
 
-        let p_final = q.position >> cum_arity;
-        pin_eq(b, &proof.final_codeword[p_final], &expected);
+        // Final per-query check: against the plaintext tail when one
+        // exists (the tail folds to the final codeword once, below), else
+        // directly against the final codeword.
+        if let Some((_, tail_cum)) = tail_layout {
+            assert_eq!(cum_arity, tail_cum, "tail layer offset off shape");
+            let p_tail = q.position >> cum_arity;
+            pin_eq(b, &proof.plaintext_tail[p_tail], &expected);
+        } else {
+            let p_final = q.position >> cum_arity;
+            pin_eq(b, &proof.final_codeword[p_final], &expected);
+        }
+    }
+
+    // ---- The plaintext tail folds to the final codeword: one coset of
+    // 2^rem elements per final-layer slot (value checks → pins).
+    if let Some((tail_len, tail_cum)) = tail_layout {
+        let rem = log_dim - tail_cum;
+        let coset = 1usize << rem;
+        assert_eq!(tail_len >> rem, 1usize << log_inv_rate, "tail off shape");
+        let fri_challenge_start = log_batch_size;
+        let rem_challenges =
+            &challenges[fri_challenge_start + tail_cum..fri_challenge_start + log_dim];
+        let input_layer = k_code - tail_cum;
+        for f in 0..(tail_len >> rem) {
+            let folded = fri_fold_coset_trace(
+                b,
+                &proof.plaintext_tail[f * coset..(f + 1) * coset],
+                rem_challenges,
+                &ntt,
+                input_layer,
+                f,
+            );
+            pin_eq(b, &folded, &proof.final_codeword[f]);
+        }
     }
 
     // ---- Batched Merkle verification, one multi-proof per tree.
