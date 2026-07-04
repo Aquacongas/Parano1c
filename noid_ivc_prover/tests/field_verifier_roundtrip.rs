@@ -63,6 +63,54 @@ fn false_witnesses_rejected() {
     }
 }
 
+/// Adversarial proof/commitment SHAPES must be rejected as errors, never
+/// panic: the snapshot decider runs this verifier on untrusted envelopes.
+#[test]
+fn adversarial_shapes_rejected_not_panicking() {
+    use noid_ivc_core::verifier::VerifyError;
+
+    let (r1cs, z) = synthetic_satisfiable(10, 7, 99);
+    let params = params_for(10);
+    let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
+    let (proof, commitment, _) = prove_field(&r1cs, &z, &params, &mut ch_p);
+
+    // Commitment parameters that disagree with the instance shape.
+    for delta in [-1i64, 1, 7] {
+        let mut bad = commitment.clone();
+        bad.params.m = (bad.params.m as i64 + delta) as usize;
+        let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
+        let res = verify_field(&r1cs, &bad, &proof, &mut ch_v);
+        assert!(
+            matches!(res, Err(VerifyError::ParamsMismatch)),
+            "params.m off by {delta} must be ParamsMismatch, got {res:?}"
+        );
+    }
+    {
+        let mut bad = commitment.clone();
+        bad.params.log_batch_size = bad.params.m; // log_dim would underflow
+        let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
+        let res = verify_field(&r1cs, &bad, &proof, &mut ch_v);
+        assert!(matches!(res, Err(VerifyError::ParamsMismatch)), "got {res:?}");
+    }
+
+    // A proof whose sumcheck depth disagrees with the commitment.
+    let mut truncated = proof.clone();
+    truncated.pcs_open.round_messages.pop();
+    let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
+    assert!(
+        verify_field(&r1cs, &commitment, &truncated, &mut ch_v).is_err(),
+        "truncated PCS round messages accepted"
+    );
+    let mut extended = proof.clone();
+    let extra = extended.pcs_open.round_messages[0].clone();
+    extended.pcs_open.round_messages.push(extra);
+    let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
+    assert!(
+        verify_field(&r1cs, &commitment, &extended, &mut ch_v).is_err(),
+        "extended PCS round messages accepted"
+    );
+}
+
 /// Every structured proof element, mutated one at a time → reject. Plus
 /// commitment-root and statement substitution.
 #[test]

@@ -282,6 +282,7 @@ pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
         proof,
         &commitment.root,
         &ntt,
+        l_log,
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
@@ -1057,6 +1058,7 @@ pub fn verify_opening_batch_mixed<Ch: Challenger>(
         &proof.basefold,
         &commitment.root,
         &ntt,
+        commitment.params.log_msg_len(),
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
@@ -1273,6 +1275,7 @@ pub fn verify_opening<Ch: Challenger>(
         &proof.basefold,
         &commitment.root,
         &ntt,
+        commitment.params.log_msg_len(),
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         challenger,
@@ -1456,6 +1459,53 @@ mod tests {
                     ))
                 ),
                 "truncating to {keep} queries must be rejected, got {res:?}"
+            );
+        }
+    }
+
+    /// SECURITY REGRESSION: the sumcheck depth (`log_msg_len`) is a
+    /// commitment parameter; a proof carrying a different number of round
+    /// messages must be rejected on shape, not allowed to redefine every
+    /// downstream size (epoch arities, query masks, challenge count) —
+    /// mismatches used to surface as release-mode panics in the caller.
+    #[test]
+    fn pcs_verify_rejects_wrong_sumcheck_depth() {
+        let m = 10;
+        let mut rng = Rng::new(0x0DD_D3B7);
+        let z = rng.bits(1 << m);
+        let z_skip = rng.f128();
+        let x_outer: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let claim = zhat_skip_reference(&z, m, z_skip, &x_outer);
+
+        let params = default_params(m);
+        let z_packed = pack_witness(&z, m);
+        let (commitment, prover_data) = commit(&z_packed, &params);
+
+        let mut ch_p = FsChallenger::new(b"history-test-v0");
+        let honest = open(&z_packed, &prover_data, &commitment, &x_outer, &mut ch_p);
+
+        let mut ch_ok = FsChallenger::new(b"history-test-v0");
+        assert!(verify_opening(&commitment, claim, z_skip, &x_outer, &honest, &mut ch_ok).is_ok());
+
+        // Truncated and extended round-message vectors must both be shape
+        // errors before any challenge is drawn from them.
+        let mut truncated = honest.clone();
+        truncated.basefold.round_messages.pop();
+        let mut extended = honest.clone();
+        let extra = extended.basefold.round_messages[0].clone();
+        extended.basefold.round_messages.push(extra);
+
+        for (label, proof) in [("truncated", truncated), ("extended", extended)] {
+            let mut ch_v = FsChallenger::new(b"history-test-v0");
+            let res = verify_opening(&commitment, claim, z_skip, &x_outer, &proof, &mut ch_v);
+            assert!(
+                matches!(
+                    res,
+                    Err(VerifyError::BaseFold(
+                        basefold::VerifyError::InvalidProofShape
+                    ))
+                ),
+                "{label} round messages must be a shape error, got {res:?}"
             );
         }
     }

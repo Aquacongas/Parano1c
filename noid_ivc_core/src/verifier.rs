@@ -13,6 +13,11 @@ use crate::zerocheck;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    /// The commitment's PCS parameters do not match the instance shape.
+    /// A hard error (not a debug assert): the snapshot decider feeds this
+    /// path adversarial envelopes, and a mismatched `m` would otherwise
+    /// size downstream structures from attacker-supplied bytes.
+    ParamsMismatch,
     Zerocheck(zerocheck::VerifyError),
     Lincheck(lincheck::VerifyError),
     PcsAb(pcs::VerifyError),
@@ -190,6 +195,14 @@ fn verify_core_inner<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
+    // Boolean-witness path: the packed commitment covers exactly the 2^m
+    // witness bits. Same hard shape gate as the field path.
+    if commitment.params.m != r1cs.m
+        || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
+    {
+        return Err(VerifyError::ParamsMismatch);
+    }
+
     let trace = std::env::var("VERIFY_TRACE").is_ok();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
@@ -324,6 +337,15 @@ fn verify_field_inner<Ch: Challenger>(
     proof: &crate::proof::FieldR1csProof,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
+    // The commitment must be sized for THIS instance (one committed F128
+    // element per witness element) before any parameter-derived structure
+    // is built. See [`VerifyError::ParamsMismatch`].
+    if commitment.params.m != r1cs.m + pcs::LOG_PACKING
+        || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
+    {
+        return Err(VerifyError::ParamsMismatch);
+    }
+
     // ---- Bind the FS transcript to the statement (mirrors prove_field).
     crate::proof::bind_statement_field(challenger, r1cs, commitment);
 

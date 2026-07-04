@@ -332,11 +332,19 @@ fn f128_slice_to_bytes(values: &[F128]) -> Vec<u8> {
     bytes
 }
 
-fn root_to_f128(root: &Hash) -> F128 {
-    F128 {
+/// Absorb a 32-byte commitment root into the transcript as two flat lanes
+/// (the digest's LE halves). Full-digest binding: anything less would leave
+/// an equivocation window on the roots that anchor every FRI query — a
+/// half-bound root admits 2^128 sibling digests sharing its bound half.
+fn observe_root<Ch: Challenger>(challenger: &mut Ch, root: &Hash) {
+    challenger.observe_f128(F128 {
         lo: u64::from_le_bytes(root[0..8].try_into().unwrap()),
         hi: u64::from_le_bytes(root[8..16].try_into().unwrap()),
-    }
+    });
+    challenger.observe_f128(F128 {
+        lo: u64::from_le_bytes(root[16..24].try_into().unwrap()),
+        hi: u64::from_le_bytes(root[24..32].try_into().unwrap()),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +606,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                     let n_leaves = cw_len / post_row_batch_leaf_f128;
                     post_row_batch_tree = merkle::merkle_tree(cw_bytes, n_leaves);
                     post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty");
-                    challenger.observe_f128(root_to_f128(&post_row_batch_commit_root));
+                    observe_root(challenger, &post_row_batch_commit_root);
                     post_row_batch_codeword = codeword_active[..cw_len].to_vec();
                     if trace {
                         post_row_batch_merkle_ms += t.elapsed().as_secs_f64() * 1e3;
@@ -641,7 +649,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
                     };
                     let tree = merkle::merkle_tree(cw_bytes, n_leaves);
                     let root = *tree.last().unwrap();
-                    challenger.observe_f128(root_to_f128(&root));
+                    observe_root(challenger, &root);
                     round_commitments.push(RoundCommitment { root });
                     epoch_codewords.push(codeword_active[..cw_len].to_vec());
                     epoch_trees.push(tree);
@@ -827,11 +835,19 @@ pub fn verify<Ch: Challenger>(
     proof: &BaseFoldProof,
     initial_codeword_root: &Hash,
     ntt: &AdditiveNttF128,
+    log_msg_len: usize,
     log_inv_rate: usize,
     log_batch_size: usize,
     challenger: &mut Ch,
 ) -> Result<Vec<F128>, VerifyError> {
-    let log_msg_len = proof.round_messages.len();
+    // SECURITY: the sumcheck depth is a commitment parameter, not a prover
+    // choice. Deriving it from the proof would let adversarial bytes select
+    // every downstream shape (epoch arities, codeword sizes, query masks,
+    // challenge-vector length) and reach release-mode panics in the caller
+    // before any binding check fires. Hard-reject a mismatched proof.
+    if proof.round_messages.len() != log_msg_len {
+        return Err(VerifyError::InvalidProofShape);
+    }
     if log_batch_size > log_msg_len {
         return Err(VerifyError::InvalidProofShape);
     }
@@ -876,7 +892,7 @@ pub fn verify<Ch: Challenger>(
         running_target = msg.u_0 + r * u_1 + r * r * msg.u_2;
 
         if round + 1 == log_batch_size && !arities.is_empty() {
-            challenger.observe_f128(root_to_f128(&proof.post_row_batch_commit.root));
+            observe_root(challenger, &proof.post_row_batch_commit.root);
         }
 
         if round >= log_batch_size {
@@ -885,7 +901,7 @@ pub fn verify<Ch: Challenger>(
                 let is_last_epoch = current_epoch + 1 == num_epochs;
                 if !is_last_epoch {
                     let root = proof.round_commitments[current_epoch].root;
-                    challenger.observe_f128(root_to_f128(&root));
+                    observe_root(challenger, &root);
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;

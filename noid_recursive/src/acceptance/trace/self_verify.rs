@@ -1113,14 +1113,17 @@ pub fn basefold_verify_trace(
         challenges.push(r);
 
         if round + 1 == log_batch_size && !arities.is_empty() {
-            // Native observes root_to_f128(root) = the first 16 bytes.
+            // Full-digest binding: both flat lanes of the root, matching the
+            // native verifier's two-lane absorb.
             ch.observe_f128(b, &proof.post_row_batch_commit[0]);
+            ch.observe_f128(b, &proof.post_row_batch_commit[1]);
         }
         if round >= log_batch_size {
             rounds_in_epoch += 1;
             if rounds_in_epoch == arities[current_epoch] {
                 if current_epoch + 1 != num_epochs {
                     ch.observe_f128(b, &proof.round_commitments[current_epoch][0]);
+                    ch.observe_f128(b, &proof.round_commitments[current_epoch][1]);
                 }
                 rounds_in_epoch = 0;
                 current_epoch += 1;
