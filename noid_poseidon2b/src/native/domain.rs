@@ -59,7 +59,19 @@ pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 /// Proof-of-work header digest. Distinct from `BLOCKHDR`: the same semantic
 /// header has separate chain-link and mining-difficulty hash domains.
 pub const TAG_POWHDR: DomainTag = DomainTag::new(b"POWHDR__");
+/// Byte-oriented Fiat-Shamir challenger (`FsChallenger`: op headers +
+/// length-prefixed byte absorbs).
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
+/// Lane-oriented Fiat-Shamir challenger for the proof-core transcripts
+/// (`FsLaneChallenger` and its in-trace twin). Distinct from the other
+/// Fiat-Shamir families so no transcript state can be replayed across
+/// challenger constructions that absorb different framings.
+pub const TAG_LANECHAL: DomainTag = DomainTag::new(b"LANECHAL");
+/// Killshot Fiat-Shamir channel (`Poseidon2bChannel`, the bare rate-2
+/// duplex every GKR verifier runs on) and its replays.
+pub const TAG_KSCHANNL: DomainTag = DomainTag::new(b"KSCHANNL");
+/// Wallet-capsule FRI transcript (`noid_fri::Channel`) and its replays.
+pub const TAG_FRICHANL: DomainTag = DomainTag::new(b"FRICHANL");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
 pub const TAG_DAWTNSS: DomainTag = DomainTag::new(b"DAWTNSS_");
 pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
@@ -116,6 +128,9 @@ mod tests {
             TAG_BLOCKHDR,
             TAG_POWHDR,
             TAG_FSCHALNG,
+            TAG_LANECHAL,
+            TAG_KSCHANNL,
+            TAG_FRICHANL,
             TAG_COMPRESS,
             TAG_DAWTNSS,
             TAG_FRISTATE,

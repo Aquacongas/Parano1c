@@ -138,13 +138,14 @@ pub fn merkle_root_trace(b: &mut FieldR1csBuilder, mut layer: Vec<DigestExpr>) -
 // noid_fri::Channel trace
 // ---------------------------------------------------------------------------
 
-/// In-circuit replay of `noid_fri::Channel`: a **zero-IV** `Poseidon2bSponge`
-/// duplex (no domain absorb, no op headers), byte-streaming buffer that — with
-/// every protocol absorb 16-byte aligned — always holds 0 or 1 whole lanes.
-/// `squeeze` mirrors `Channel::squeeze_block`: pad-flush once on the
-/// absorb→squeeze transition, emit `state[0]`, hold `state[1]` pending,
-/// advance the sponge; an absorb drops any pending lane and re-enters absorb
-/// mode (`enter_absorb_mode`).
+/// In-circuit replay of `noid_fri::Channel`: a `FRICHANL`-IV
+/// `Poseidon2bSponge` duplex (no domain absorb, no op headers),
+/// byte-streaming buffer that — with every protocol absorb 16-byte aligned —
+/// always holds 0 or 1 whole lanes. `squeeze` mirrors
+/// `Channel::squeeze_block`: pad-flush once on the absorb→squeeze
+/// transition, emit `state[0]`, hold `state[1]` pending, advance the sponge;
+/// an absorb drops any pending lane and re-enters absorb mode
+/// (`enter_absorb_mode`).
 pub struct FriChannelTrace {
     state: [LinExpr; 4],
     buffered: Option<LinExpr>,
@@ -154,11 +155,18 @@ pub struct FriChannelTrace {
 }
 
 impl FriChannelTrace {
-    /// Mirror of `Channel::new()` — `Poseidon2bSponge::new()` has an
-    /// all-zero state (no capacity IV).
+    /// Mirror of `Channel::new()`: zero rate lanes, `FRICHANL` capacity IV
+    /// (φ-mapped into the flat wire basis, like every absorbed tower value).
     pub fn new() -> Self {
+        let [iv_hi, iv_lo] =
+            noid_poseidon2b::native::capacity_iv(noid_poseidon2b::native::TAG_FRICHANL);
         Self {
-            state: std::array::from_fn(|_| LinExpr::zero()),
+            state: [
+                LinExpr::zero(),
+                LinExpr::zero(),
+                LinExpr::constant(flat_const(iv_hi.0)),
+                LinExpr::constant(flat_const(iv_lo.0)),
+            ],
             buffered: None,
             pending: None,
             squeezing: false,

@@ -18,7 +18,7 @@
 
 use crate::field::F128;
 use noid_poseidon2b::native::{
-    Poseidon2bSponge, TAG_FSCHALNG, capacity_iv, poseidon2b_hash_byte_slices,
+    Poseidon2bSponge, TAG_FSCHALNG, TAG_LANECHAL, capacity_iv, poseidon2b_hash_byte_slices,
 };
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
@@ -485,13 +485,28 @@ pub fn fs_pack_bytes_lanes(bytes: &[u8]) -> Vec<F128> {
         .collect()
 }
 
-/// Capacity IV (`TAG_FSCHALNG`) lanes in the flat basis: `[state[2], state[3]]`.
-pub fn fs_lane_iv_flat() -> [F128; 2] {
-    let [hi, lo] = capacity_iv(TAG_FSCHALNG);
+/// Capacity IV lanes of a domain tag in the flat basis:
+/// `[state[2], state[3]]` as circuit-wire bit patterns.
+pub fn capacity_iv_flat_lanes(tag: noid_poseidon2b::native::DomainTag) -> [F128; 2] {
+    let [hi, lo] = capacity_iv(tag);
     [
         f128_of_u128(noid_core::hardware::tower_to_flat_u128(hi.0)),
         f128_of_u128(noid_core::hardware::tower_to_flat_u128(lo.0)),
     ]
+}
+
+/// Capacity IV (`TAG_LANECHAL`) lanes of the lane-oriented challenger, in
+/// the flat basis. Each Fiat-Shamir family gets its own capacity IV so no
+/// transcript state is replayable across constructions.
+pub fn fs_lane_iv_flat() -> [F128; 2] {
+    capacity_iv_flat_lanes(TAG_LANECHAL)
+}
+
+/// Capacity IV (`TAG_KSCHANNL`) lanes of the killshot channel
+/// (`Poseidon2bChannel`), in the flat basis — the seed of its in-trace
+/// replay ([`crate::field_circuit::RawChannelTrace`]).
+pub fn ks_channel_iv_flat() -> [F128; 2] {
+    capacity_iv_flat_lanes(noid_poseidon2b::native::TAG_KSCHANNL)
 }
 
 /// PoW capacity IV (`FSPOWLNE`) lanes in the flat basis.

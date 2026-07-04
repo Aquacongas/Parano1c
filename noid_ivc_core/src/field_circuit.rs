@@ -708,7 +708,7 @@ impl FsChannelTrace {
 /// (`noid_poseidon2b::channel::Poseidon2bChannel` — the `FiatShamir<Block128>`
 /// implementation every `noid_gkr` verifier runs on). Unlike
 /// [`FsChannelTrace`], the raw channel has NO op-header lanes and NO domain
-/// absorb: it is a bare rate-2 duplex seeded with the `FSCHALNG` capacity IV,
+/// absorb: it is a bare rate-2 duplex seeded with the `KSCHANNL` capacity IV,
 /// where every absorbed `Block128` is one whole lane and every squeeze emits
 /// `state[0]` / holds `state[1]` pending.
 ///
@@ -726,10 +726,10 @@ pub struct RawChannelTrace {
 }
 
 impl RawChannelTrace {
-    /// Mirror of `Poseidon2bChannel::new()`: zero rate lanes, `FSCHALNG`
+    /// Mirror of `Poseidon2bChannel::new()`: zero rate lanes, `KSCHANNL`
     /// capacity IV, empty buffer, no pending challenge.
     pub fn new() -> Self {
-        let [iv0, iv1] = crate::challenger::fs_lane_iv_flat();
+        let [iv0, iv1] = crate::challenger::ks_channel_iv_flat();
         Self {
             state: [
                 LinExpr::zero(),

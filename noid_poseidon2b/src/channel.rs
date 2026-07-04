@@ -8,16 +8,18 @@
 //! previously used the insecure XOR-sum placeholder. Every squeeze advances
 //! the sponge by one permutation and emits one Block128 challenge.
 //!
-//! Breaking change: the channel is now seeded with the capacity IV
-//! `FSCHALNG` (CRYPTO.md §4.8). Any pinned test vectors downstream
-//! (notably in `noid_fri` prover/verifier and sumcheck transcripts)
-//! must be regenerated in the same commit that bumps this crate.
+//! The channel is seeded with its own capacity IV (`KSCHANNL`) so its
+//! transcript states are not replayable across the other Fiat-Shamir
+//! families (byte challenger, lane challenger, FRI channel). Any pinned
+//! test vectors downstream (notably in `noid_fri` prover/verifier and
+//! sumcheck transcripts) must be regenerated in the same commit that
+//! changes the seed.
 
 use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 
 use crate::native::compression::Poseidon2bSponge;
-use crate::native::domain::{capacity_iv, TAG_FSCHALNG};
+use crate::native::domain::{capacity_iv, TAG_KSCHANNL};
 
 /// Fiat-Shamir channel backed by a Poseidon2b sponge.
 #[derive(Debug, Clone)]
@@ -37,7 +39,7 @@ impl Default for Poseidon2bChannel {
 impl Poseidon2bChannel {
     pub fn new() -> Self {
         Self {
-            sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_FSCHALNG)),
+            sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_KSCHANNL)),
             pending: None,
         }
     }

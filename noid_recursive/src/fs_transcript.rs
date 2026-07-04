@@ -21,7 +21,7 @@ use noid_gkr::block_spine::{
     verify_block_spine_shift, verify_block_spine_unified,
 };
 use noid_gkr::{BlockSpineKillShotProof, BlockSpineMle, BlockSpineUnifiedReduction};
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_FSCHALNG};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_KSCHANNL};
 use noid_poseidon2b::native::permutation::{Poseidon2bPermutation, MDS_FULL, N_ROUNDS, STATE_SIZE};
 
 use crate::authorization::FiatShamirTraceOp;
@@ -133,7 +133,7 @@ impl LaneExpr {
 type StateExpr = [LaneExpr; STATE_SIZE];
 
 fn initial_state_expr() -> StateExpr {
-    let [iv_hi, iv_lo] = capacity_iv(TAG_FSCHALNG);
+    let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
     [
         LaneExpr::constant(Block128::ZERO),
         LaneExpr::constant(Block128::ZERO),
@@ -302,7 +302,7 @@ fn evaluate_trace_permutations(
         return Err(FiatShamirTranscriptError::TraceTooLong);
     }
 
-    let [iv_hi, iv_lo] = capacity_iv(TAG_FSCHALNG);
+    let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
     let mut state = [Block128::ZERO, Block128::ZERO, iv_hi, iv_lo];
     let mut buffered: Option<Block128> = None;
     let mut pending: Option<Block128> = None;
@@ -353,7 +353,7 @@ fn evaluate_trace_permutations(
 
 fn absorb_trace_public<T: FiatShamir<Block128>>(channel: &mut T, ops: &[FiatShamirTraceOp]) {
     channel.absorb(Block128::from(ops.len() as u128));
-    channel.absorb(Block128::from(TAG_FSCHALNG.as_u64() as u128));
+    channel.absorb(Block128::from(TAG_KSCHANNL.as_u64() as u128));
     for op in ops {
         match *op {
             FiatShamirTraceOp::Absorb(value) => {
@@ -373,7 +373,7 @@ fn absorb_trace_batch_public<T: FiatShamir<Block128>>(
     traces: &[Vec<FiatShamirTraceOp>],
 ) {
     channel.absorb(Block128::from(traces.len() as u128));
-    channel.absorb(Block128::from(TAG_FSCHALNG.as_u64() as u128));
+    channel.absorb(Block128::from(TAG_KSCHANNL.as_u64() as u128));
     for ops in traces {
         channel.absorb(Block128::from(ops.len() as u128));
         for op in ops {

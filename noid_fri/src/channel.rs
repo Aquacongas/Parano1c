@@ -11,6 +11,7 @@
 
 use noid_core::{Block128, CanonicalSerialize};
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
+use noid_poseidon2b::native::domain::{TAG_FRICHANL, capacity_iv};
 
 use crate::merkle::VectorCommitment;
 use crate::prover::FriCommitment;
@@ -47,7 +48,11 @@ pub struct Channel {
 impl Channel {
     pub fn new() -> Self {
         Self {
-            sponge: Poseidon2bSponge::new(),
+            // Seeded with the FRI-transcript capacity IV: a zero-IV duplex
+            // would share states with any other bare-sponge construction on
+            // identical absorbs; the tag makes this transcript family
+            // non-replayable across the other Fiat-Shamir channels.
+            sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_FRICHANL)),
             pending: None,
             squeezing: false,
         }
