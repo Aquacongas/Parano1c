@@ -202,9 +202,13 @@ pub struct RoundCommitment {
     pub root: Hash,
 }
 
-/// A single FRI query opening (multi-arity layout). Leaf payloads only; the
-/// Merkle paths binding these leaves to their roots are shared across all
-/// queries via [`BaseFoldProof`]'s multi-proof fields.
+/// A single FRI query opening (multi-arity layout). Each query carries its
+/// own full-depth Merkle paths: paths are deliberately NOT deduplicated
+/// across queries, so the verification schedule is a pure function of the
+/// commitment shape (query count × fixed tree depths) rather than of the
+/// sampled positions. A replay of this verifier inside an arithmetic trace
+/// needs that fixed schedule; the byte cost of the duplicated upper-path
+/// siblings is priced in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryOpening {
     /// Random initial codeword position in `[0, 2^k_code)`.
@@ -214,16 +218,25 @@ pub struct QueryOpening {
     /// folds these (using `log_batch_size` sumcheck challenges) down to a
     /// single F_{2^128} value, then cross-checks against `post_row_batch_leaf`.
     pub initial_leaf: Vec<F128>,
+    /// Merkle path for `initial_leaf` in the T1 (initial) tree; length is
+    /// exactly `k_code`.
+    pub initial_path: Vec<Hash>,
     /// Multi-arity post-row-batch leaf: `2^arity_0` F_{2^128} values covering
     /// `2^arity_0` consecutive post-row-batch codeword positions (including
     /// the queried one). Enables the verifier to do `arity_0` consecutive
     /// FRI folds with a single Merkle opening.
     pub post_row_batch_leaf: Vec<F128>,
+    /// Merkle path for `post_row_batch_leaf` in the T2 tree; length is
+    /// exactly `k_code − arity_0`. Empty iff `arities.is_empty()`.
+    pub post_row_batch_path: Vec<Hash>,
     /// One entry per FRI commit (= `arities.len() − 1` entries; last epoch
     /// sends `final_codeword` in plaintext). Entry `i` is the coset of
     /// `2^arities[i+1]` F_{2^128} values committed at the end of epoch `i`,
     /// which is the input to epoch `i+1`'s arity_{i+1} folds.
     pub epoch_leaves: Vec<Vec<F128>>,
+    /// Merkle path per epoch leaf, aligned with `epoch_leaves`; entry `i`
+    /// has length `k_code − Σ_{j≤i+1} arities[j]`.
+    pub epoch_paths: Vec<Vec<Hash>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,16 +263,9 @@ pub struct BaseFoldProof {
     /// Transcript-grinding nonce spent before query sampling
     /// ([`QUERY_GRIND_BITS`] leading zero bits).
     pub pow_nonce: u64,
+    /// Per-query openings, each with its own independent Merkle paths (see
+    /// [`QueryOpening`] for why paths are not deduplicated across queries).
     pub queries: Vec<QueryOpening>,
-    /// Octopus multi-proof for the T1 (initial) tree: shared sibling hashes
-    /// covering every `queries[*].initial_leaf` against `initial_codeword_root`.
-    pub initial_multi_proof: Vec<Hash>,
-    /// Octopus multi-proof for the T2 (post-row-batch) tree. Empty iff
-    /// `arities.is_empty()` (i.e. `log_dim == 0`).
-    pub post_row_batch_multi_proof: Vec<Hash>,
-    /// One octopus multi-proof per FRI commit (length = `round_commitments.len()`),
-    /// aligned with `queries[*].epoch_leaves[i]`.
-    pub epoch_multi_proofs: Vec<Vec<Hash>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -773,72 +779,52 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     let pow_nonce = challenger.grind_pow(QUERY_GRIND_BITS);
     let mut queries = Vec::with_capacity(n_queries);
     let initial_leaf_f128 = num_ntts;
-
-    let mut initial_positions = Vec::with_capacity(n_queries);
-    let mut post_rb_positions = Vec::with_capacity(n_queries);
-    let mut epoch_positions: Vec<Vec<usize>> = (0..num_fri_commits)
-        .map(|_| Vec::with_capacity(n_queries))
-        .collect();
+    let n_initial_leaves = initial_codeword.len() / initial_leaf_f128;
 
     for position in sample_query_positions(challenger, n_queries, k_code) {
-        // T1 leaf (= position).
+        // T1 leaf (= position) with its own full-depth path.
         let initial_start = position * initial_leaf_f128;
         let initial_leaf =
             initial_codeword[initial_start..initial_start + initial_leaf_f128].to_vec();
-        initial_positions.push(position);
+        let initial_path = merkle::merkle_proof(initial_tree, n_initial_leaves, position);
 
         // T2 leaf (multi-arity coset of arity_0 consecutive positions).
-        let post_row_batch_leaf = if arities.is_empty() {
-            Vec::new()
+        let (post_row_batch_leaf, post_row_batch_path) = if arities.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
             let leaf_idx = position >> arity_0;
             let start = leaf_idx * post_row_batch_leaf_f128;
-            post_rb_positions.push(leaf_idx);
-            post_row_batch_codeword[start..start + post_row_batch_leaf_f128].to_vec()
+            let n_leaves = post_row_batch_codeword.len() / post_row_batch_leaf_f128;
+            (
+                post_row_batch_codeword[start..start + post_row_batch_leaf_f128].to_vec(),
+                merkle::merkle_proof(&post_row_batch_tree, n_leaves, leaf_idx),
+            )
         };
 
-        // Per-epoch leaves.
+        // Per-epoch leaves with their paths.
         let mut epoch_leaves = Vec::with_capacity(num_fri_commits);
+        let mut epoch_paths = Vec::with_capacity(num_fri_commits);
         let mut cum_arity = arity_0;
         for i in 0..num_fri_commits {
             let p_next = position >> cum_arity;
             let leaf_f128 = epoch_leaf_f128s[i];
             let leaf_idx = p_next / leaf_f128;
             let start = leaf_idx * leaf_f128;
+            let n_leaves = epoch_codewords[i].len() / leaf_f128;
             epoch_leaves.push(epoch_codewords[i][start..start + leaf_f128].to_vec());
-            epoch_positions[i].push(leaf_idx);
+            epoch_paths.push(merkle::merkle_proof(&epoch_trees[i], n_leaves, leaf_idx));
             cum_arity += arities[i + 1];
         }
 
         queries.push(QueryOpening {
             position,
             initial_leaf,
+            initial_path,
             post_row_batch_leaf,
+            post_row_batch_path,
             epoch_leaves,
+            epoch_paths,
         });
-    }
-
-    // --- Build one multi-proof per tree (shared across all queries).
-    let n_initial_leaves = initial_codeword.len() / initial_leaf_f128;
-    let initial_multi_proof =
-        merkle::merkle_multi_proof(initial_tree, n_initial_leaves, &initial_positions);
-
-    let post_row_batch_multi_proof = if arities.is_empty() {
-        Vec::new()
-    } else {
-        let n_leaves = post_row_batch_codeword.len() / post_row_batch_leaf_f128;
-        merkle::merkle_multi_proof(&post_row_batch_tree, n_leaves, &post_rb_positions)
-    };
-
-    let mut epoch_multi_proofs = Vec::with_capacity(num_fri_commits);
-    for i in 0..num_fri_commits {
-        let leaf_f128 = epoch_leaf_f128s[i];
-        let n_leaves = epoch_codewords[i].len() / leaf_f128;
-        epoch_multi_proofs.push(merkle::merkle_multi_proof(
-            &epoch_trees[i],
-            n_leaves,
-            &epoch_positions[i],
-        ));
     }
     let query_openings_ms = t_queries.elapsed().as_secs_f64() * 1e3;
 
@@ -915,9 +901,6 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         plaintext_tail,
         pow_nonce,
         queries,
-        initial_multi_proof,
-        post_row_batch_multi_proof,
-        epoch_multi_proofs,
     }
 }
 
@@ -1047,22 +1030,6 @@ pub fn verify<Ch: Challenger>(
     let initial_leaf_f128 = num_ntts; // T1: one position's row-batch lanes
     let post_row_batch_leaf_f128 = 1usize << arity_0;
 
-    if proof.epoch_multi_proofs.len() != num_fri_commits {
-        return Err(VerifyError::InvalidProofShape);
-    }
-
-    // Per-tree accumulators: leaf indices + leaf hashes, one entry per query.
-    let mut initial_positions = Vec::with_capacity(n_queries);
-    let mut initial_hashes = Vec::with_capacity(n_queries);
-    let mut post_rb_positions = Vec::with_capacity(n_queries);
-    let mut post_rb_hashes = Vec::with_capacity(n_queries);
-    let mut epoch_positions: Vec<Vec<usize>> = (0..num_fri_commits)
-        .map(|_| Vec::with_capacity(n_queries))
-        .collect();
-    let mut epoch_hashes: Vec<Vec<Hash>> = (0..num_fri_commits)
-        .map(|_| Vec::with_capacity(n_queries))
-        .collect();
-
     for (qi, q) in proof.queries.iter().enumerate() {
         if q.position != positions[qi] {
             return Err(VerifyError::FoldMismatch {
@@ -1073,13 +1040,25 @@ pub fn verify<Ch: Challenger>(
         if q.initial_leaf.len() != initial_leaf_f128 {
             return Err(VerifyError::InitialMerkleFailed { query_index: qi });
         }
-        if q.epoch_leaves.len() != num_fri_commits {
+        if q.epoch_leaves.len() != num_fri_commits || q.epoch_paths.len() != num_fri_commits {
             return Err(VerifyError::InvalidProofShape);
         }
 
-        // T1: hash the initial leaf; Merkle path verified below in a batch.
-        initial_positions.push(q.position);
-        initial_hashes.push(merkle::hash_leaf(&f128_slice_to_bytes(&q.initial_leaf)));
+        // T1: hash the initial leaf and verify its own full-depth path. The
+        // path length IS the tree depth — a shorter path would prove
+        // membership against an inner node, so it is shape-checked exactly.
+        if q.initial_path.len() != k_code {
+            return Err(VerifyError::InvalidProofShape);
+        }
+        let initial_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(&q.initial_leaf));
+        if !merkle::verify_merkle_proof(
+            initial_codeword_root,
+            &initial_leaf_hash,
+            q.position,
+            &q.initial_path,
+        ) {
+            return Err(VerifyError::InitialMerkleFailed { query_index: qi });
+        }
 
         // Row-batch fold T1's lanes to a single post-row-batch F_{2^128}.
         let post_row_batch_value =
@@ -1097,11 +1076,19 @@ pub fn verify<Ch: Challenger>(
             if q.post_row_batch_leaf.len() != post_row_batch_leaf_f128 {
                 return Err(VerifyError::InvalidProofShape);
             }
+            if q.post_row_batch_path.len() != k_code - arity_0 {
+                return Err(VerifyError::InvalidProofShape);
+            }
             let post_leaf_idx = q.position >> arity_0;
-            post_rb_positions.push(post_leaf_idx);
-            post_rb_hashes.push(merkle::hash_leaf(&f128_slice_to_bytes(
-                &q.post_row_batch_leaf,
-            )));
+            let post_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(&q.post_row_batch_leaf));
+            if !merkle::verify_merkle_proof(
+                &proof.post_row_batch_commit.root,
+                &post_leaf_hash,
+                post_leaf_idx,
+                &q.post_row_batch_path,
+            ) {
+                return Err(VerifyError::InitialMerkleFailed { query_index: qi });
+            }
 
             // Cross-check: T2 at the queried offset within its leaf must equal
             // the row-batch fold of T1.
@@ -1135,8 +1122,21 @@ pub fn verify<Ch: Challenger>(
             let leaf_idx = p_at_this_layer >> next_arity;
             let offset = p_at_this_layer & ((1usize << next_arity) - 1);
 
-            epoch_positions[i].push(leaf_idx);
-            epoch_hashes[i].push(merkle::hash_leaf(&f128_slice_to_bytes(leaf)));
+            if q.epoch_paths[i].len() != k_code - cum_arity - next_arity {
+                return Err(VerifyError::InvalidProofShape);
+            }
+            let epoch_leaf_hash = merkle::hash_leaf(&f128_slice_to_bytes(leaf));
+            if !merkle::verify_merkle_proof(
+                &proof.round_commitments[i].root,
+                &epoch_leaf_hash,
+                leaf_idx,
+                &q.epoch_paths[i],
+            ) {
+                return Err(VerifyError::RoundMerkleFailed {
+                    query_index: qi,
+                    epoch: i,
+                });
+            }
 
             // Check the leaf carries the expected value at the relevant offset.
             if leaf[offset] != expected {
@@ -1211,86 +1211,5 @@ pub fn verify<Ch: Challenger>(
         }
     }
 
-    // Batch-verify the three categories of Merkle paths in one shot per tree.
-    if !verify_multi_with_dedup(
-        initial_codeword_root,
-        1usize << k_code,
-        &initial_positions,
-        &initial_hashes,
-        &proof.initial_multi_proof,
-    ) {
-        return Err(VerifyError::InitialMerkleFailed { query_index: 0 });
-    }
-    if !arities.is_empty() {
-        let n_post_rb_leaves = 1usize << (k_code - arity_0);
-        if !verify_multi_with_dedup(
-            &proof.post_row_batch_commit.root,
-            n_post_rb_leaves,
-            &post_rb_positions,
-            &post_rb_hashes,
-            &proof.post_row_batch_multi_proof,
-        ) {
-            return Err(VerifyError::InitialMerkleFailed { query_index: 0 });
-        }
-    }
-    let mut cum_arity_check = arity_0;
-    for i in 0..num_fri_commits {
-        let next_arity = arities[i + 1];
-        let n_leaves = 1usize << (k_code - cum_arity_check - next_arity);
-        if !verify_multi_with_dedup(
-            &proof.round_commitments[i].root,
-            n_leaves,
-            &epoch_positions[i],
-            &epoch_hashes[i],
-            &proof.epoch_multi_proofs[i],
-        ) {
-            return Err(VerifyError::RoundMerkleFailed {
-                query_index: 0,
-                epoch: i,
-            });
-        }
-        cum_arity_check += next_arity;
-    }
-
     Ok(challenges)
-}
-
-/// Batched Merkle verification with input dedup. The verifier feeds positions
-/// + leaf hashes in QUERY order; this helper sorts + dedupes them (rejecting
-/// any two queries that claim the same position with different leaf hashes)
-/// and forwards to [`merkle::verify_merkle_multi_proof`].
-fn verify_multi_with_dedup(
-    root: &Hash,
-    num_leaves: usize,
-    positions: &[usize],
-    leaf_hashes: &[Hash],
-    proof: &[Hash],
-) -> bool {
-    if positions.len() != leaf_hashes.len() {
-        return false;
-    }
-    if positions.is_empty() {
-        return proof.is_empty();
-    }
-    let mut paired: Vec<(usize, Hash)> = positions
-        .iter()
-        .copied()
-        .zip(leaf_hashes.iter().copied())
-        .collect();
-    paired.sort_by_key(|(p, _)| *p);
-    let mut deduped: Vec<(usize, Hash)> = Vec::with_capacity(paired.len());
-    for (p, h) in paired {
-        if let Some(last) = deduped.last()
-            && last.0 == p
-        {
-            if last.1 != h {
-                return false;
-            }
-            continue;
-        }
-        deduped.push((p, h));
-    }
-    let positions_sorted: Vec<usize> = deduped.iter().map(|(p, _)| *p).collect();
-    let hashes_sorted: Vec<Hash> = deduped.iter().map(|(_, h)| *h).collect();
-    merkle::verify_merkle_multi_proof(root, num_leaves, &positions_sorted, &hashes_sorted, proof)
 }

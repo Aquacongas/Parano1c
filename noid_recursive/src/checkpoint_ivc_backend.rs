@@ -49,7 +49,11 @@ use crate::checkpoint_proof::{
 };
 
 pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION: u32 = 1;
-pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES: usize = 100 * 1024;
+/// DoS cap on the serialized chunk-core proof. Sized for the FieldR1cs
+/// proof format with per-query independent Merkle paths (each FRI query
+/// carries its own full-depth paths; ~118 KB at the chunk shape), plus
+/// headroom.
+pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES: usize = 160 * 1024;
 
 const TRANSCRIPT_DOMAIN: &[u8] = b"noid-recursive-checkpoint-ivc-chunk-core";
 const STATEMENT_DIGEST_DOMAIN: &[u8] = b"NOID/REC/CHK-IVC-STMT";

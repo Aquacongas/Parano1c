@@ -770,17 +770,22 @@ pub fn lincheck_verify_trace(
 // ---------------------------------------------------------------------------
 
 /// Witness allocation of one `basefold::QueryOpening`. The query `position`
-/// is trace STRUCTURE (it selects Merkle leaf indices and coset offsets);
+/// is trace STRUCTURE (it selects Merkle path directions and coset offsets);
 /// soundness of the binding is the pinned bit decomposition of the squeezed
 /// position challenge in [`basefold_verify_trace`]. Structure derived from
 /// proof data is interim until the shape-freeze pass turns index bits into
 /// witness selectors (the recursion needs protocol-constant matrices) —
-/// same caveat as the wallet-capsule `gen_compact_queries_trace`.
+/// same caveat as the wallet-capsule `gen_compact_queries_trace`. The
+/// per-query independent paths already make the HASHING schedule a pure
+/// function of the shape (query count × fixed tree depths).
 pub struct QueryOpeningTrace {
     pub position: usize,
     pub initial_leaf: Vec<LinExpr>,
+    pub initial_path: Vec<FlatDigestExpr>,
     pub post_row_batch_leaf: Vec<LinExpr>,
+    pub post_row_batch_path: Vec<FlatDigestExpr>,
     pub epoch_leaves: Vec<Vec<LinExpr>>,
+    pub epoch_paths: Vec<Vec<FlatDigestExpr>>,
 }
 
 /// Witness allocation of a `pcs::BaseFoldProof` under the frozen shape
@@ -798,9 +803,6 @@ pub struct BaseFoldProofTrace {
     /// Pre-query grinding nonce as a flat lane (`lo = nonce, hi = 0`).
     pub pow_nonce: LinExpr,
     pub queries: Vec<QueryOpeningTrace>,
-    pub initial_multi_proof: Vec<FlatDigestExpr>,
-    pub post_row_batch_multi_proof: Vec<FlatDigestExpr>,
-    pub epoch_multi_proofs: Vec<Vec<FlatDigestExpr>>,
 }
 
 impl BaseFoldProofTrace {
@@ -842,11 +844,6 @@ impl BaseFoldProofTrace {
             1usize << params.log_inv_rate,
             "final codeword off shape"
         );
-        assert_eq!(
-            native.epoch_multi_proofs.len(),
-            num_fri_commits,
-            "epoch multi-proofs off shape"
-        );
 
         let alloc_vec = |b: &mut FieldR1csBuilder, vs: &[F128]| -> Vec<LinExpr> {
             vs.iter()
@@ -887,27 +884,49 @@ impl BaseFoldProofTrace {
             .map(|q| {
                 assert!(q.position < (1usize << k_code), "query position off shape");
                 assert_eq!(q.initial_leaf.len(), num_ntts, "initial leaf off shape");
+                assert_eq!(q.initial_path.len(), k_code, "initial path off shape");
                 if arities.is_empty() {
                     assert!(q.post_row_batch_leaf.is_empty(), "post-rb leaf off shape");
+                    assert!(q.post_row_batch_path.is_empty(), "post-rb path off shape");
                 } else {
                     assert_eq!(
                         q.post_row_batch_leaf.len(),
                         1usize << arity_0,
                         "post-rb leaf off shape"
                     );
+                    assert_eq!(
+                        q.post_row_batch_path.len(),
+                        k_code - arity_0,
+                        "post-rb path off shape"
+                    );
                 }
                 assert_eq!(q.epoch_leaves.len(), num_fri_commits, "epoch leaves off shape");
-                for (i, leaf) in q.epoch_leaves.iter().enumerate() {
+                assert_eq!(q.epoch_paths.len(), num_fri_commits, "epoch paths off shape");
+                let mut cum = arity_0;
+                for (i, (leaf, path)) in q.epoch_leaves.iter().zip(&q.epoch_paths).enumerate() {
                     assert_eq!(leaf.len(), 1usize << arities[i + 1], "epoch leaf off shape");
+                    assert_eq!(
+                        path.len(),
+                        k_code - cum - arities[i + 1],
+                        "epoch path off shape"
+                    );
+                    cum += arities[i + 1];
                 }
                 QueryOpeningTrace {
                     position: q.position,
                     initial_leaf: alloc_vec(b, &q.initial_leaf),
+                    initial_path: alloc_digests(b, &q.initial_path),
                     post_row_batch_leaf: alloc_vec(b, &q.post_row_batch_leaf),
+                    post_row_batch_path: alloc_digests(b, &q.post_row_batch_path),
                     epoch_leaves: q
                         .epoch_leaves
                         .iter()
                         .map(|l| alloc_vec(b, l))
+                        .collect(),
+                    epoch_paths: q
+                        .epoch_paths
+                        .iter()
+                        .map(|p| alloc_digests(b, p))
                         .collect(),
                 }
             })
@@ -923,13 +942,6 @@ impl BaseFoldProofTrace {
             plaintext_tail,
             pow_nonce,
             queries,
-            initial_multi_proof: alloc_digests(b, &native.initial_multi_proof),
-            post_row_batch_multi_proof: alloc_digests(b, &native.post_row_batch_multi_proof),
-            epoch_multi_proofs: native
-                .epoch_multi_proofs
-                .iter()
-                .map(|p| alloc_digests(b, p))
-                .collect(),
         }
     }
 }
@@ -1025,83 +1037,31 @@ fn fri_fold_coset_trace(
     buf.pop().unwrap()
 }
 
-/// Trace twin of `basefold::verify_multi_with_dedup` +
-/// `merkle::verify_merkle_multi_proof`. The sort/dedup schedule and the
-/// per-level sibling consumption order are trace structure derived from the
-/// (position-bound) query indices; the value checks — duplicate-position
-/// leaf equality and the final root equality — are pins.
-fn verify_multi_with_dedup_trace(
+/// Trace twin of `merkle::verify_merkle_proof`: fold the leaf hash up its
+/// own full-depth path and pin the reconstructed root. The hashing schedule
+/// (`path.len()` compressions per query) is a pure function of the
+/// commitment shape; only the per-level left/right order is still trace
+/// structure derived from the (position-bound) leaf index — interim until
+/// the shape-freeze pass replaces it with witness-bit selectors.
+fn verify_merkle_path_trace(
     b: &mut FieldR1csBuilder,
     root: &FlatDigestExpr,
-    num_leaves: usize,
-    positions: &[usize],
-    leaf_hashes: &[FlatDigestExpr],
-    proof: &[FlatDigestExpr],
+    leaf_hash: &FlatDigestExpr,
+    index: usize,
+    path: &[FlatDigestExpr],
 ) {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(positions.len(), leaf_hashes.len());
-    if positions.is_empty() {
-        assert!(proof.is_empty(), "unused multi-proof siblings");
-        return;
+    let mut acc = leaf_hash.clone();
+    let mut idx = index;
+    for sibling in path {
+        let (left, right) = if idx & 1 == 0 {
+            (acc, sibling.clone())
+        } else {
+            (sibling.clone(), acc)
+        };
+        acc = merkle_hash_pair_trace(b, &left, &right);
+        idx >>= 1;
     }
-
-    // Sort + dedup (query order preserved among equals — stable sort, as
-    // native); duplicated positions must carry equal leaf hashes.
-    let mut paired: Vec<(usize, FlatDigestExpr)> = positions
-        .iter()
-        .copied()
-        .zip(leaf_hashes.iter().cloned())
-        .collect();
-    paired.sort_by_key(|(p, _)| *p);
-    let mut active: Vec<(usize, FlatDigestExpr)> = Vec::with_capacity(paired.len());
-    for (p, h) in paired {
-        assert!(p < num_leaves, "leaf position out of range");
-        if let Some(last) = active.last() {
-            if last.0 == p {
-                let kept = active.last().unwrap().1.clone();
-                pin_flat_digest_eq(b, &kept, &h);
-                continue;
-            }
-        }
-        active.push((p, h));
-    }
-
-    if num_leaves == 1 {
-        assert!(proof.is_empty(), "unused multi-proof siblings");
-        pin_flat_digest_eq(b, &active[0].1, root);
-        return;
-    }
-
-    let mut proof_iter = proof.iter();
-    let mut level_len = num_leaves;
-    while level_len > 1 {
-        let mut next: Vec<(usize, FlatDigestExpr)> = Vec::with_capacity(active.len());
-        let mut i = 0usize;
-        while i < active.len() {
-            let (p, h) = active[i].clone();
-            let sib_active = i + 1 < active.len() && active[i + 1].0 == (p ^ 1);
-            let (left, right) = if sib_active {
-                let h_sib = active[i + 1].1.clone();
-                i += 2;
-                (h, h_sib)
-            } else {
-                // Native "proof exhausted" → structural build failure.
-                let sib = proof_iter
-                    .next()
-                    .expect("insufficient multi-proof siblings")
-                    .clone();
-                i += 1;
-                if p & 1 == 0 { (h, sib) } else { (sib, h) }
-            };
-            let parent = merkle_hash_pair_trace(b, &left, &right);
-            next.push((p >> 1, parent));
-        }
-        active = next;
-        level_len >>= 1;
-    }
-    assert!(proof_iter.next().is_none(), "unused multi-proof siblings");
-    assert_eq!(active.len(), 1);
-    pin_flat_digest_eq(b, &active[0].1, root);
+    pin_flat_digest_eq(b, &acc, root);
 }
 
 /// Trace twin of `basefold::verify`. Replays the sumcheck/commit transcript
@@ -1204,18 +1164,16 @@ pub fn basefold_verify_trace(
     }
     assert_eq!(qi, n_queries, "query positions exhausted off shape");
 
-    // ---- Per-query fold replay + per-tree leaf-hash accumulation.
-    let mut initial_positions = Vec::with_capacity(n_queries);
-    let mut initial_hashes: Vec<FlatDigestExpr> = Vec::with_capacity(n_queries);
-    let mut post_rb_positions = Vec::with_capacity(n_queries);
-    let mut post_rb_hashes: Vec<FlatDigestExpr> = Vec::with_capacity(n_queries);
-    let mut epoch_positions: Vec<Vec<usize>> = vec![Vec::with_capacity(n_queries); num_fri_commits];
-    let mut epoch_hashes: Vec<Vec<FlatDigestExpr>> =
-        vec![Vec::with_capacity(n_queries); num_fri_commits];
-
+    // ---- Per-query fold replay + per-query independent Merkle paths.
     for q in &proof.queries {
-        initial_positions.push(q.position);
-        initial_hashes.push(merkle_hash_leaf_lanes_trace(b, &q.initial_leaf));
+        let initial_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.initial_leaf);
+        verify_merkle_path_trace(
+            b,
+            initial_codeword_root,
+            &initial_leaf_hash,
+            q.position,
+            &q.initial_path,
+        );
 
         // Row-batch fold T1's lanes to one post-row-batch value.
         let post_row_batch_value =
@@ -1228,8 +1186,14 @@ pub fn basefold_verify_trace(
             expected = post_row_batch_value;
         } else {
             let post_leaf_idx = q.position >> arity_0;
-            post_rb_positions.push(post_leaf_idx);
-            post_rb_hashes.push(merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf));
+            let post_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf);
+            verify_merkle_path_trace(
+                b,
+                &proof.post_row_batch_commit,
+                &post_leaf_hash,
+                post_leaf_idx,
+                &q.post_row_batch_path,
+            );
 
             // Cross-check T2 against the row-batch fold (value check → pin).
             let inner_offset = q.position & ((1usize << arity_0) - 1);
@@ -1252,8 +1216,14 @@ pub fn basefold_verify_trace(
             let leaf_idx = p_at_this_layer >> next_arity;
             let offset = p_at_this_layer & ((1usize << next_arity) - 1);
 
-            epoch_positions[i].push(leaf_idx);
-            epoch_hashes[i].push(merkle_hash_leaf_lanes_trace(b, leaf));
+            let epoch_leaf_hash = merkle_hash_leaf_lanes_trace(b, leaf);
+            verify_merkle_path_trace(
+                b,
+                &proof.round_commitments[i],
+                &epoch_leaf_hash,
+                leaf_idx,
+                &q.epoch_paths[i],
+            );
 
             pin_eq(b, &leaf[offset], &expected);
 
@@ -1304,39 +1274,6 @@ pub fn basefold_verify_trace(
             );
             pin_eq(b, &folded, &proof.final_codeword[f]);
         }
-    }
-
-    // ---- Batched Merkle verification, one multi-proof per tree.
-    verify_multi_with_dedup_trace(
-        b,
-        initial_codeword_root,
-        1usize << k_code,
-        &initial_positions,
-        &initial_hashes,
-        &proof.initial_multi_proof,
-    );
-    if !arities.is_empty() {
-        verify_multi_with_dedup_trace(
-            b,
-            &proof.post_row_batch_commit,
-            1usize << (k_code - arity_0),
-            &post_rb_positions,
-            &post_rb_hashes,
-            &proof.post_row_batch_multi_proof,
-        );
-    }
-    let mut cum_arity_check = arity_0;
-    for i in 0..num_fri_commits {
-        let next_arity = arities[i + 1];
-        verify_multi_with_dedup_trace(
-            b,
-            &proof.round_commitments[i],
-            1usize << (k_code - cum_arity_check - next_arity),
-            &epoch_positions[i],
-            &epoch_hashes[i],
-            &proof.epoch_multi_proofs[i],
-        );
-        cum_arity_check += next_arity;
     }
 
     challenges

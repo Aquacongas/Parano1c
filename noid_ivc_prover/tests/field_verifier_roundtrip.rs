@@ -205,6 +205,44 @@ fn mutations_rejected() {
             p.pcs_open.round_messages[i].u_0.lo ^= 1;
             cases.push((format!("pcs.round_messages[{i}].u_0"), p));
         }
+
+        // Per-query independent Merkle paths: sibling flips at the bottom
+        // and top level, truncation/extension (depth is an exact shape
+        // check), leaf flips and a desynced position.
+        let mut p = proof.clone();
+        p.pcs_open.queries[0].initial_path[0][0] ^= 1;
+        cases.push(("pcs.q0.initial_path[bottom]".to_string(), p));
+        let mut p = proof.clone();
+        let top = p.pcs_open.queries[0].initial_path.len() - 1;
+        p.pcs_open.queries[0].initial_path[top][31] ^= 1;
+        cases.push(("pcs.q0.initial_path[top]".to_string(), p));
+        let mut p = proof.clone();
+        p.pcs_open.queries[0].initial_path.pop();
+        cases.push(("pcs.q0.initial_path truncated".to_string(), p));
+        let mut p = proof.clone();
+        p.pcs_open.queries[0].initial_path.push([0u8; 32]);
+        cases.push(("pcs.q0.initial_path extended".to_string(), p));
+        let mut p = proof.clone();
+        p.pcs_open.queries[0].initial_leaf[0].lo ^= 1;
+        cases.push(("pcs.q0.initial_leaf[0]".to_string(), p));
+        let mut p = proof.clone();
+        p.pcs_open.queries[0].position ^= 1;
+        cases.push(("pcs.q0.position".to_string(), p));
+        if !proof.pcs_open.queries[0].post_row_batch_path.is_empty() {
+            let mut p = proof.clone();
+            p.pcs_open.queries[0].post_row_batch_path[0][0] ^= 1;
+            cases.push(("pcs.q0.post_rb_path[bottom]".to_string(), p));
+            let mut p = proof.clone();
+            p.pcs_open.queries[0].post_row_batch_leaf[0].lo ^= 1;
+            cases.push(("pcs.q0.post_rb_leaf[0]".to_string(), p));
+        }
+        if let Some(first_epoch_path) = proof.pcs_open.queries[0].epoch_paths.first() {
+            if !first_epoch_path.is_empty() {
+                let mut p = proof.clone();
+                p.pcs_open.queries[0].epoch_paths[0][0][0] ^= 1;
+                cases.push(("pcs.q0.epoch_path[0][bottom]".to_string(), p));
+            }
+        }
     }
 
     for (label, bad) in cases {
