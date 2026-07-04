@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "field_r1cs_g1"
 harness = false
+
+[[bench]]
+name = "self_verify_rows"
+harness = false

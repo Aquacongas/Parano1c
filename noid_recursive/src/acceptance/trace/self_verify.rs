@@ -27,7 +27,8 @@ use noid_ivc_core::field::PHI_8_TABLE;
 use noid_ivc_core::field_circuit::{f128_from_u128, FsChannelTrace};
 use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::merkle::{self, Hash};
-use noid_ivc_core::pcs::PcsParams;
+use noid_ivc_core::ntt::AdditiveNttF128;
+use noid_ivc_core::pcs::{self, compute_fri_arities, default_fri_queries, PcsParams, LOG_PACKING};
 use noid_ivc_core::zerocheck::{self, K_SKIP};
 use noid_poseidon2b::native::{capacity_iv_flat, DomainTag};
 
@@ -745,6 +746,700 @@ pub fn lincheck_verify_trace(
 }
 
 // ---------------------------------------------------------------------------
+// BaseFold PCS verify replay
+// ---------------------------------------------------------------------------
+
+/// Witness allocation of one `basefold::QueryOpening`. The query `position`
+/// is trace STRUCTURE (it selects Merkle leaf indices and coset offsets);
+/// soundness of the binding is the pinned bit decomposition of the squeezed
+/// position challenge in [`basefold_verify_trace`]. Structure derived from
+/// proof data is interim until the shape-freeze pass turns index bits into
+/// witness selectors (the recursion needs protocol-constant matrices) —
+/// same caveat as the wallet-capsule `gen_compact_queries_trace`.
+pub struct QueryOpeningTrace {
+    pub position: usize,
+    pub initial_leaf: Vec<LinExpr>,
+    pub post_row_batch_leaf: Vec<LinExpr>,
+    pub epoch_leaves: Vec<Vec<LinExpr>>,
+}
+
+/// Witness allocation of a `pcs::BaseFoldProof` under the frozen shape
+/// derived from the (protocol-constant) `PcsParams`. Every native
+/// `InvalidProofShape` branch is an alloc assert here.
+pub struct BaseFoldProofTrace {
+    pub round_messages: Vec<(LinExpr, LinExpr)>,
+    pub post_row_batch_commit: FlatDigestExpr,
+    pub round_commitments: Vec<FlatDigestExpr>,
+    pub final_a: LinExpr,
+    pub final_b: LinExpr,
+    pub final_codeword: Vec<LinExpr>,
+    pub queries: Vec<QueryOpeningTrace>,
+    pub initial_multi_proof: Vec<FlatDigestExpr>,
+    pub post_row_batch_multi_proof: Vec<FlatDigestExpr>,
+    pub epoch_multi_proofs: Vec<Vec<FlatDigestExpr>>,
+}
+
+impl BaseFoldProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &pcs::BaseFoldProof,
+        params: &PcsParams,
+    ) -> Self {
+        let log_msg_len = params.m - LOG_PACKING;
+        let log_batch_size = params.log_batch_size;
+        assert!(log_batch_size <= log_msg_len, "invalid proof shape");
+        let log_dim = log_msg_len - log_batch_size;
+        let k_code = log_dim + params.log_inv_rate;
+        let num_ntts = 1usize << log_batch_size;
+        let arities = compute_fri_arities(log_dim);
+        let num_fri_commits = arities.len().saturating_sub(1);
+        let arity_0 = arities.first().copied().unwrap_or(0);
+
+        assert_eq!(native.round_messages.len(), log_msg_len, "rounds off shape");
+        assert_eq!(
+            native.round_commitments.len(),
+            num_fri_commits,
+            "round commitments off shape"
+        );
+        // SECURITY (mirror of the native check): the query count is a
+        // soundness parameter, not a prover choice.
+        assert_eq!(
+            native.queries.len(),
+            default_fri_queries(params.log_inv_rate),
+            "query count off shape"
+        );
+        assert_eq!(
+            native.final_codeword.len(),
+            1usize << params.log_inv_rate,
+            "final codeword off shape"
+        );
+        assert_eq!(
+            native.epoch_multi_proofs.len(),
+            num_fri_commits,
+            "epoch multi-proofs off shape"
+        );
+
+        let alloc_vec = |b: &mut FieldR1csBuilder, vs: &[F128]| -> Vec<LinExpr> {
+            vs.iter()
+                .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+                .collect()
+        };
+        let alloc_digests = |b: &mut FieldR1csBuilder, ds: &[Hash]| -> Vec<FlatDigestExpr> {
+            ds.iter().map(|d| alloc_flat_digest(b, d)).collect()
+        };
+
+        let round_messages = native
+            .round_messages
+            .iter()
+            .map(|m| {
+                (
+                    LinExpr::from_wire(b.alloc_f128(m.u_0)),
+                    LinExpr::from_wire(b.alloc_f128(m.u_2)),
+                )
+            })
+            .collect();
+        let post_row_batch_commit = alloc_flat_digest(b, &native.post_row_batch_commit.root);
+        let round_commitments = native
+            .round_commitments
+            .iter()
+            .map(|c| alloc_flat_digest(b, &c.root))
+            .collect();
+        let final_a = LinExpr::from_wire(b.alloc_f128(native.final_a));
+        let final_b = LinExpr::from_wire(b.alloc_f128(native.final_b));
+        let final_codeword = alloc_vec(b, &native.final_codeword);
+
+        let queries = native
+            .queries
+            .iter()
+            .map(|q| {
+                assert!(q.position < (1usize << k_code), "query position off shape");
+                assert_eq!(q.initial_leaf.len(), num_ntts, "initial leaf off shape");
+                if arities.is_empty() {
+                    assert!(q.post_row_batch_leaf.is_empty(), "post-rb leaf off shape");
+                } else {
+                    assert_eq!(
+                        q.post_row_batch_leaf.len(),
+                        1usize << arity_0,
+                        "post-rb leaf off shape"
+                    );
+                }
+                assert_eq!(q.epoch_leaves.len(), num_fri_commits, "epoch leaves off shape");
+                for (i, leaf) in q.epoch_leaves.iter().enumerate() {
+                    assert_eq!(leaf.len(), 1usize << arities[i + 1], "epoch leaf off shape");
+                }
+                QueryOpeningTrace {
+                    position: q.position,
+                    initial_leaf: alloc_vec(b, &q.initial_leaf),
+                    post_row_batch_leaf: alloc_vec(b, &q.post_row_batch_leaf),
+                    epoch_leaves: q
+                        .epoch_leaves
+                        .iter()
+                        .map(|l| alloc_vec(b, l))
+                        .collect(),
+                }
+            })
+            .collect();
+
+        Self {
+            round_messages,
+            post_row_batch_commit,
+            round_commitments,
+            final_a,
+            final_b,
+            final_codeword,
+            queries,
+            initial_multi_proof: alloc_digests(b, &native.initial_multi_proof),
+            post_row_batch_multi_proof: alloc_digests(b, &native.post_row_batch_multi_proof),
+            epoch_multi_proofs: native
+                .epoch_multi_proofs
+                .iter()
+                .map(|p| alloc_digests(b, p))
+                .collect(),
+        }
+    }
+}
+
+/// Bind a query position to its squeezed challenge: the native rule is
+/// `position = (challenge.lo as usize) & (2^k_code − 1)` — the low k_code
+/// bits of the FLAT representation. The trace pins
+/// `challenge = Σ_{i<k_code} pos_i·2^i + Σ_{i≥k_code} b_i·2^i` with the
+/// position bits as structural constants and the top bits as witness
+/// booleans (flat-basis powers — NOT φ(2^i): the native rule reads flat
+/// bits). Returns the structural index.
+fn bind_query_position_trace(
+    b: &mut FieldR1csBuilder,
+    challenge: &LinExpr,
+    k_code: usize,
+) -> usize {
+    let raw = expr_flat_u128(b, challenge);
+    let position = (raw as u64 as usize) & ((1usize << k_code) - 1);
+    let mut sum = LinExpr::zero();
+    for i in 0..k_code {
+        if (position >> i) & 1 == 1 {
+            sum = sum.add_const(f128_from_u128(1u128 << i));
+        }
+    }
+    for i in k_code..128 {
+        let bit = b.alloc_bool((raw >> i) & 1 == 1);
+        sum = sum.add(&LinExpr::from_wire(bit).scale(f128_from_u128(1u128 << i)));
+    }
+    super::pin_zero(b, &sum.add(challenge));
+    position
+}
+
+/// Trace twin of `basefold::row_batch_fold_one` (nested per-round folds of
+/// one position's lanes): one multiplication per fold pair.
+fn row_batch_fold_one_trace(
+    b: &mut FieldR1csBuilder,
+    lanes: &[LinExpr],
+    challenges: &[LinExpr],
+) -> LinExpr {
+    assert_eq!(lanes.len(), 1usize << challenges.len());
+    let mut buf = lanes.to_vec();
+    for r in challenges {
+        let half = buf.len() / 2;
+        let mut next = Vec::with_capacity(half);
+        for j in 0..half {
+            let u = &buf[2 * j];
+            let v = &buf[2 * j + 1];
+            next.push(u.add(&mul(b, r, &u.add(v))));
+        }
+        buf = next;
+    }
+    buf.pop().unwrap()
+}
+
+/// Trace twin of `basefold::fri_fold_coset`. `fold_pair` with a constant
+/// twiddle is affine up to the challenge product:
+/// `v = v_in + u_in; u = u_in + v·t; out = u + r·(u + v)` — one
+/// multiplication per pair.
+fn fri_fold_coset_trace(
+    b: &mut FieldR1csBuilder,
+    coset: &[LinExpr],
+    challenges: &[LinExpr],
+    ntt: &AdditiveNttF128,
+    input_layer: usize,
+    coset_idx: usize,
+) -> LinExpr {
+    assert_eq!(coset.len(), 1usize << challenges.len());
+    let mut buf = coset.to_vec();
+    for (k, r) in challenges.iter().enumerate() {
+        let post_fold_layer = input_layer - k - 1;
+        let n = buf.len() / 2;
+        let mut next = Vec::with_capacity(n);
+        for j in 0..n {
+            let u_in = &buf[2 * j];
+            let v_in = &buf[2 * j + 1];
+            let pos = coset_idx * n + j;
+            let twiddle = ntt.twiddle(post_fold_layer, pos);
+            let v = v_in.add(u_in);
+            let u = u_in.add(&v.scale(twiddle));
+            next.push(u.add(&mul(b, r, &u.add(&v))));
+        }
+        buf = next;
+    }
+    buf.pop().unwrap()
+}
+
+/// Trace twin of `basefold::verify_multi_with_dedup` +
+/// `merkle::verify_merkle_multi_proof`. The sort/dedup schedule and the
+/// per-level sibling consumption order are trace structure derived from the
+/// (position-bound) query indices; the value checks — duplicate-position
+/// leaf equality and the final root equality — are pins.
+fn verify_multi_with_dedup_trace(
+    b: &mut FieldR1csBuilder,
+    root: &FlatDigestExpr,
+    num_leaves: usize,
+    positions: &[usize],
+    leaf_hashes: &[FlatDigestExpr],
+    proof: &[FlatDigestExpr],
+) {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    assert_eq!(positions.len(), leaf_hashes.len());
+    if positions.is_empty() {
+        assert!(proof.is_empty(), "unused multi-proof siblings");
+        return;
+    }
+
+    // Sort + dedup (query order preserved among equals — stable sort, as
+    // native); duplicated positions must carry equal leaf hashes.
+    let mut paired: Vec<(usize, FlatDigestExpr)> = positions
+        .iter()
+        .copied()
+        .zip(leaf_hashes.iter().cloned())
+        .collect();
+    paired.sort_by_key(|(p, _)| *p);
+    let mut active: Vec<(usize, FlatDigestExpr)> = Vec::with_capacity(paired.len());
+    for (p, h) in paired {
+        assert!(p < num_leaves, "leaf position out of range");
+        if let Some(last) = active.last() {
+            if last.0 == p {
+                let kept = active.last().unwrap().1.clone();
+                pin_flat_digest_eq(b, &kept, &h);
+                continue;
+            }
+        }
+        active.push((p, h));
+    }
+
+    if num_leaves == 1 {
+        assert!(proof.is_empty(), "unused multi-proof siblings");
+        pin_flat_digest_eq(b, &active[0].1, root);
+        return;
+    }
+
+    let mut proof_iter = proof.iter();
+    let mut level_len = num_leaves;
+    while level_len > 1 {
+        let mut next: Vec<(usize, FlatDigestExpr)> = Vec::with_capacity(active.len());
+        let mut i = 0usize;
+        while i < active.len() {
+            let (p, h) = active[i].clone();
+            let sib_active = i + 1 < active.len() && active[i + 1].0 == (p ^ 1);
+            let (left, right) = if sib_active {
+                let h_sib = active[i + 1].1.clone();
+                i += 2;
+                (h, h_sib)
+            } else {
+                // Native "proof exhausted" → structural build failure.
+                let sib = proof_iter
+                    .next()
+                    .expect("insufficient multi-proof siblings")
+                    .clone();
+                i += 1;
+                if p & 1 == 0 { (h, sib) } else { (sib, h) }
+            };
+            let parent = merkle_hash_pair_trace(b, &left, &right);
+            next.push((p >> 1, parent));
+        }
+        active = next;
+        level_len >>= 1;
+    }
+    assert!(proof_iter.next().is_none(), "unused multi-proof siblings");
+    assert_eq!(active.len(), 1);
+    pin_flat_digest_eq(b, &active[0].1, root);
+}
+
+/// Trace twin of `basefold::verify`. Replays the sumcheck/commit transcript
+/// on the lane channel, binds resampled query positions, replays every
+/// query's leaf hashing / row-batch fold / FRI coset folds / final-codeword
+/// check, and batch-verifies the per-tree Merkle multi-proofs. Native value
+/// rejections → pins; shape rejections were alloc asserts. Returns the
+/// sumcheck challenges.
+pub fn basefold_verify_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    target: &LinExpr,
+    proof: &BaseFoldProofTrace,
+    initial_codeword_root: &FlatDigestExpr,
+    params: &PcsParams,
+) -> Vec<LinExpr> {
+    let log_msg_len = params.m - LOG_PACKING;
+    let log_batch_size = params.log_batch_size;
+    let log_inv_rate = params.log_inv_rate;
+    let log_dim = log_msg_len - log_batch_size;
+    let k_code = log_dim + log_inv_rate;
+    let arities = compute_fri_arities(log_dim);
+    let num_epochs = arities.len();
+    let num_fri_commits = num_epochs.saturating_sub(1);
+    let arity_0 = arities.first().copied().unwrap_or(0);
+    let ntt = AdditiveNttF128::standard(k_code);
+
+    ch.observe_label(b, b"history-basefold-v0");
+
+    // ---- Sumcheck rounds in lockstep, with the T2 / epoch commit observes.
+    let mut running = target.clone();
+    let mut challenges: Vec<LinExpr> = Vec::with_capacity(log_msg_len);
+    let mut current_epoch = 0usize;
+    let mut rounds_in_epoch = 0usize;
+    for round in 0..log_msg_len {
+        let (u_0, u_2) = &proof.round_messages[round];
+        ch.observe_f128(b, u_0);
+        ch.observe_f128(b, u_2);
+        let r = ch.sample_f128(b);
+
+        let u_1 = running.add(u_2);
+        let r_sq = mul(b, &r, &r);
+        running = u_0.add(&mul(b, &r, &u_1)).add(&mul(b, &r_sq, u_2));
+        challenges.push(r);
+
+        if round + 1 == log_batch_size && !arities.is_empty() {
+            // Native observes root_to_f128(root) = the first 16 bytes.
+            ch.observe_f128(b, &proof.post_row_batch_commit[0]);
+        }
+        if round >= log_batch_size {
+            rounds_in_epoch += 1;
+            if rounds_in_epoch == arities[current_epoch] {
+                if current_epoch + 1 != num_epochs {
+                    ch.observe_f128(b, &proof.round_commitments[current_epoch][0]);
+                }
+                rounds_in_epoch = 0;
+                current_epoch += 1;
+            }
+        }
+    }
+
+    // ---- Final sumcheck consistency (native reject → pin).
+    let ab = mul(b, &proof.final_a, &proof.final_b);
+    pin_eq(b, &ab, &running);
+
+    // ---- Final codeword constancy + equality with final_a.
+    let constant = &proof.final_codeword[0];
+    for v in proof.final_codeword.iter().skip(1) {
+        pin_eq(b, v, constant);
+    }
+    pin_eq(b, constant, &proof.final_a);
+
+    // ---- Resample query positions; bind each to its allocated structure.
+    let n_queries = proof.queries.len();
+    for qi in 0..n_queries {
+        let raw = ch.sample_f128(b);
+        let position = bind_query_position_trace(b, &raw, k_code);
+        // Native `q.position != positions[qi]` → the allocated structure
+        // must match the transcript-derived index (build-time assert).
+        assert_eq!(
+            proof.queries[qi].position, position,
+            "query position desynced from transcript"
+        );
+    }
+
+    // ---- Per-query fold replay + per-tree leaf-hash accumulation.
+    let mut initial_positions = Vec::with_capacity(n_queries);
+    let mut initial_hashes: Vec<FlatDigestExpr> = Vec::with_capacity(n_queries);
+    let mut post_rb_positions = Vec::with_capacity(n_queries);
+    let mut post_rb_hashes: Vec<FlatDigestExpr> = Vec::with_capacity(n_queries);
+    let mut epoch_positions: Vec<Vec<usize>> = vec![Vec::with_capacity(n_queries); num_fri_commits];
+    let mut epoch_hashes: Vec<Vec<FlatDigestExpr>> =
+        vec![Vec::with_capacity(n_queries); num_fri_commits];
+
+    for q in &proof.queries {
+        initial_positions.push(q.position);
+        initial_hashes.push(merkle_hash_leaf_lanes_trace(b, &q.initial_leaf));
+
+        // Row-batch fold T1's lanes to one post-row-batch value.
+        let post_row_batch_value =
+            row_batch_fold_one_trace(b, &q.initial_leaf, &challenges[..log_batch_size]);
+
+        let fri_challenge_start = log_batch_size;
+        let mut cum_arity = arity_0;
+        let mut expected;
+        if arities.is_empty() {
+            expected = post_row_batch_value;
+        } else {
+            let post_leaf_idx = q.position >> arity_0;
+            post_rb_positions.push(post_leaf_idx);
+            post_rb_hashes.push(merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf));
+
+            // Cross-check T2 against the row-batch fold (value check → pin).
+            let inner_offset = q.position & ((1usize << arity_0) - 1);
+            pin_eq(b, &q.post_row_batch_leaf[inner_offset], &post_row_batch_value);
+
+            expected = fri_fold_coset_trace(
+                b,
+                &q.post_row_batch_leaf,
+                &challenges[fri_challenge_start..fri_challenge_start + arity_0],
+                &ntt,
+                k_code,
+                post_leaf_idx,
+            );
+        }
+
+        for i in 0..num_fri_commits {
+            let leaf = &q.epoch_leaves[i];
+            let next_arity = arities[i + 1];
+            let p_at_this_layer = q.position >> cum_arity;
+            let leaf_idx = p_at_this_layer >> next_arity;
+            let offset = p_at_this_layer & ((1usize << next_arity) - 1);
+
+            epoch_positions[i].push(leaf_idx);
+            epoch_hashes[i].push(merkle_hash_leaf_lanes_trace(b, leaf));
+
+            pin_eq(b, &leaf[offset], &expected);
+
+            let input_layer = k_code - cum_arity;
+            expected = fri_fold_coset_trace(
+                b,
+                leaf,
+                &challenges[fri_challenge_start + cum_arity
+                    ..fri_challenge_start + cum_arity + next_arity],
+                &ntt,
+                input_layer,
+                leaf_idx,
+            );
+            cum_arity += next_arity;
+        }
+
+        let p_final = q.position >> cum_arity;
+        pin_eq(b, &proof.final_codeword[p_final], &expected);
+    }
+
+    // ---- Batched Merkle verification, one multi-proof per tree.
+    verify_multi_with_dedup_trace(
+        b,
+        initial_codeword_root,
+        1usize << k_code,
+        &initial_positions,
+        &initial_hashes,
+        &proof.initial_multi_proof,
+    );
+    if !arities.is_empty() {
+        verify_multi_with_dedup_trace(
+            b,
+            &proof.post_row_batch_commit,
+            1usize << (k_code - arity_0),
+            &post_rb_positions,
+            &post_rb_hashes,
+            &proof.post_row_batch_multi_proof,
+        );
+    }
+    let mut cum_arity_check = arity_0;
+    for i in 0..num_fri_commits {
+        let next_arity = arities[i + 1];
+        verify_multi_with_dedup_trace(
+            b,
+            &proof.round_commitments[i],
+            1usize << (k_code - cum_arity_check - next_arity),
+            &epoch_positions[i],
+            &epoch_hashes[i],
+            &proof.epoch_multi_proofs[i],
+        );
+        cum_arity_check += next_arity;
+    }
+
+    challenges
+}
+
+// ---------------------------------------------------------------------------
+// Quirky-direct batched opening verify replay
+// ---------------------------------------------------------------------------
+
+/// A `pcs::QuirkyDirectClaim` as expressions (the claim point comes from
+/// replayed sub-protocol challenges; only the value is fresh proof data).
+pub struct QuirkyDirectClaimTrace {
+    pub z_skip: LinExpr,
+    pub k_skip: usize,
+    pub x_rest: Vec<LinExpr>,
+    pub value: LinExpr,
+}
+
+/// Trace twin of `pcs::verify_opening_batch_quirky_direct`: mirror
+/// transcript (labels, per-claim value observes, γ batching), the shared
+/// BaseFold replay, then the quirky `final_b` factorization
+/// `(Σ_i eq(challenges[..k_skip], i)·L_i(z_skip)) · eq(x_rest, challenges[k_skip..])`
+/// pinned against the proof's `final_b`.
+pub fn verify_opening_batch_quirky_direct_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    commitment_root: &FlatDigestExpr,
+    claims: &[QuirkyDirectClaimTrace],
+    proof: &BaseFoldProofTrace,
+    params: &PcsParams,
+) {
+    assert!(!claims.is_empty(), "need at least one claim");
+    let l_log = params.m - LOG_PACKING;
+    for c in claims {
+        assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point off shape");
+    }
+
+    ch.observe_label(b, b"history-pcs-open-field-v0");
+    for c in claims {
+        ch.observe_label(b, b"history-pcs-quirky-direct-v0");
+        ch.observe_f128(b, &c.value);
+    }
+    let gammas: Vec<LinExpr> = (0..claims.len()).map(|_| ch.sample_f128(b)).collect();
+
+    let mut target_combined = LinExpr::zero();
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        target_combined = target_combined.add(&mul(b, g, &c.value));
+    }
+
+    let challenges =
+        basefold_verify_trace(b, ch, &target_combined, proof, commitment_root, params);
+    assert_eq!(challenges.len(), l_log);
+
+    let mut expected_final_b = LinExpr::zero();
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        let ell = 1usize << c.k_skip;
+        let weights = lagrange_weights_window_trace(b, &c.z_skip, 0, ell, 0);
+        let eq_skip = super::eq_ind_partial_eval_trace(b, &challenges[..c.k_skip]);
+        let skip_factor = dot_trace(b, &weights, &eq_skip);
+        let eq_rest = b.eq_eval_trace(&c.x_rest, &challenges[c.k_skip..]);
+        let term = mul(b, g, &skip_factor);
+        expected_final_b = expected_final_b.add(&mul(b, &term, &eq_rest));
+    }
+    pin_eq(b, &expected_final_b, &proof.final_b);
+}
+
+// ---------------------------------------------------------------------------
+// Top-level FieldR1cs verifier replay ([R])
+// ---------------------------------------------------------------------------
+
+/// A `proof::ZClaim` as expressions (quirky point + value).
+pub struct ZClaimTrace {
+    pub z_skip: LinExpr,
+    pub x_inner_rest: Vec<LinExpr>,
+    pub x_outer: Vec<LinExpr>,
+    pub value: LinExpr,
+}
+
+/// The `proof::R1csClaim` pair as expressions.
+pub struct R1csClaimTrace {
+    pub ab: ZClaimTrace,
+    pub c: ZClaimTrace,
+}
+
+/// Witness allocation of a full `proof::FieldR1csProof`.
+pub struct FieldR1csProofTrace {
+    pub zerocheck: ZerocheckProofTrace,
+    pub lincheck: LincheckProofTrace,
+    pub pcs_open: BaseFoldProofTrace,
+}
+
+impl FieldR1csProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::FieldR1csProof,
+        r1cs: &FieldR1cs,
+        pcs_params: &PcsParams,
+    ) -> Self {
+        Self {
+            zerocheck: ZerocheckProofTrace::alloc(b, &native.zerocheck, r1cs.m),
+            lincheck: LincheckProofTrace::alloc(b, &native.lincheck, r1cs.k_log, r1cs.k_skip),
+            pcs_open: BaseFoldProofTrace::alloc(b, &native.pcs_open, pcs_params),
+        }
+    }
+}
+
+/// Trace twin of `verifier::verify_field` — the [R] slot body. The verified
+/// instance and its PCS parameters are protocol constants; the commitment
+/// root and every proof field are witness. Statement binding → field
+/// zerocheck → shared lincheck → batched quirky-direct PCS opening; returns
+/// the two z-claims for the caller's public-input chaining.
+pub fn verify_field_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+) -> R1csClaimTrace {
+    assert_eq!(
+        pcs_params.m,
+        r1cs.m + LOG_PACKING,
+        "pcs_params.m must be r1cs.m + LOG_PACKING"
+    );
+
+    // ---- Bind the FS transcript to the statement.
+    bind_statement_field_trace(b, ch, r1cs, pcs_params, commitment_root);
+
+    // ---- Field zerocheck.
+    let zc_claim = zerocheck_field_verify_trace(b, ch, r1cs.m, &proof.zerocheck);
+
+    // ---- Lincheck at the zerocheck's quirky point.
+    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+    let x_ab = QuirkyPointTrace {
+        z_skip: zc_claim.z.clone(),
+        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let lc_claim = lincheck_verify_trace(
+        b,
+        ch,
+        r1cs,
+        r1cs.m,
+        &x_ab,
+        &zc_claim.a_eval,
+        &zc_claim.b_eval,
+        &proof.lincheck,
+    );
+
+    // ---- The two z-claims (mirror of verify_field_inner).
+    let ab = ZClaimTrace {
+        z_skip: lc_claim.r_inner_skip.clone(),
+        x_inner_rest: lc_claim.r_inner_rest.clone(),
+        x_outer: x_ab.x_outer.clone(),
+        value: lc_claim.w.clone(),
+    };
+    let c = ZClaimTrace {
+        z_skip: zc_claim.z.clone(),
+        x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
+        x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
+        value: zc_claim.c_eval.clone(),
+    };
+
+    // ---- Batched quirky-direct PCS opening over both claims.
+    let x_rest_of = |zc: &ZClaimTrace| -> Vec<LinExpr> {
+        let mut v = zc.x_inner_rest.clone();
+        v.extend_from_slice(&zc.x_outer);
+        v
+    };
+    let claims = [
+        QuirkyDirectClaimTrace {
+            z_skip: ab.z_skip.clone(),
+            k_skip: r1cs.k_skip,
+            x_rest: x_rest_of(&ab),
+            value: ab.value.clone(),
+        },
+        QuirkyDirectClaimTrace {
+            z_skip: c.z_skip.clone(),
+            k_skip: r1cs.k_skip,
+            x_rest: x_rest_of(&c),
+            value: c.value.clone(),
+        },
+    ];
+    verify_opening_batch_quirky_direct_trace(
+        b,
+        ch,
+        commitment_root,
+        &claims,
+        &proof.pcs_open,
+        pcs_params,
+    );
+
+    R1csClaimTrace { ab, c }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1159,6 +1854,274 @@ mod tests {
         assert!(
             survivors.is_empty(),
             "lincheck mutation survivors: {survivors:?}"
+        );
+    }
+
+    /// Native commit + quirky-direct batched open over a random element
+    /// witness, for the PCS lockstep/mutation gates.
+    fn pcs_fixture(
+        l_log: usize,
+        lb: usize,
+        lir: usize,
+        k_skip: usize,
+        seed: u128,
+    ) -> (
+        PcsParams,
+        pcs::Commitment,
+        Vec<pcs::QuirkyDirectClaim>,
+        pcs::BaseFoldProof,
+    ) {
+        use noid_ivc_core::lincheck::build_eq_table;
+        use noid_ivc_core::zerocheck::multilinear::lagrange_weights_naive;
+
+        let params = PcsParams {
+            m: l_log + LOG_PACKING,
+            log_inv_rate: lir,
+            log_batch_size: lb,
+            profile: Default::default(),
+        };
+        let mut rng = Rng(seed);
+        let witness: Vec<F128> = (0..1usize << l_log).map(|_| rng.next_f128()).collect();
+        let (commitment, prover_data) = pcs::commit(&witness, &params);
+
+        // Two quirky claims at random points; values by direct evaluation.
+        let quirky_eval = |z_skip: F128, x_rest: &[F128]| -> F128 {
+            let ell = 1usize << k_skip;
+            let weights = lagrange_weights_naive(k_skip, z_skip);
+            let eq = build_eq_table(x_rest);
+            let mut acc = F128::ZERO;
+            for (i, &v) in witness.iter().enumerate() {
+                acc += v * weights[i % ell] * eq[i / ell];
+            }
+            acc
+        };
+        let claims: Vec<pcs::QuirkyDirectClaim> = (0..2)
+            .map(|_| {
+                let z_skip = rng.next_f128();
+                let x_rest: Vec<F128> = (0..l_log - k_skip).map(|_| rng.next_f128()).collect();
+                let value = quirky_eval(z_skip, &x_rest);
+                pcs::QuirkyDirectClaim {
+                    z_skip,
+                    k_skip,
+                    x_rest,
+                    value,
+                }
+            })
+            .collect();
+
+        let mut ch = FsLaneChallenger::new(b"self-verify-pcs-test");
+        let proof = pcs::open_batch_quirky_direct(
+            &witness,
+            &prover_data,
+            &commitment,
+            &claims,
+            &mut ch,
+        );
+        (params, commitment, claims, proof)
+    }
+
+    /// Build the trace replay of a quirky-direct opening; returns the built
+    /// instance/witness plus the proof-wire range for the mutation gate.
+    fn build_pcs_trace(
+        params: &PcsParams,
+        commitment: &pcs::Commitment,
+        claims: &[pcs::QuirkyDirectClaim],
+        proof: &pcs::BaseFoldProof,
+    ) -> (FieldR1cs, Vec<F128>, std::ops::Range<usize>) {
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-pcs-test");
+
+        let mutation_start = b.num_wires();
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let claims_e: Vec<QuirkyDirectClaimTrace> = claims
+            .iter()
+            .map(|c| QuirkyDirectClaimTrace {
+                z_skip: LinExpr::from_wire(b.alloc_f128(c.z_skip)),
+                k_skip: c.k_skip,
+                x_rest: c
+                    .x_rest
+                    .iter()
+                    .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+                    .collect(),
+                value: LinExpr::from_wire(b.alloc_f128(c.value)),
+            })
+            .collect();
+        let proof_e = BaseFoldProofTrace::alloc(&mut b, proof, params);
+        let mutation_end = b.num_wires();
+
+        verify_opening_batch_quirky_direct_trace(&mut b, &mut ch, &root, &claims_e, &proof_e, params);
+
+        // Native/trace transcript lockstep after the full replay.
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-pcs-test");
+        let refs: Vec<pcs::QuirkyDirectClaimRef> = claims
+            .iter()
+            .map(|c| pcs::QuirkyDirectClaimRef {
+                z_skip: c.z_skip,
+                k_skip: c.k_skip,
+                x_rest: &c.x_rest,
+                value: c.value,
+            })
+            .collect();
+        pcs::verify_opening_batch_quirky_direct(commitment, &refs, proof, &mut ch_native)
+            .expect("native accepts honest opening");
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "post-verify challenge diverged");
+
+        let (r1cs, z) = b.build();
+        (r1cs, z, mutation_start..mutation_end)
+    }
+
+    /// THE PCS lockstep gate: honest quirky-direct openings replay to a
+    /// satisfiable trace, in transcript lockstep with the native verifier —
+    /// covering a single-epoch shape and a multi-epoch (FRI commit) shape.
+    #[test]
+    fn pcs_replay_lockstep_matches_native() {
+        for &(l_log, lb, lir, k_skip, seed) in
+            &[(6usize, 2usize, 2usize, 4usize, 0xA1u128), (9, 2, 3, 6, 0xB2)]
+        {
+            let (params, commitment, claims, proof) = pcs_fixture(l_log, lb, lir, k_skip, seed);
+            let (r1cs, z, _) = build_pcs_trace(&params, &commitment, &claims, &proof);
+            assert!(r1cs.satisfies(&z), "l_log={l_log} lir={lir}");
+        }
+    }
+
+    /// THE PCS mutation gate: flipping ANY wire of the allocated proof data
+    /// (commitment root, claim points/values, every BaseFold proof field,
+    /// every multi-proof sibling) leaves the trace unsatisfiable.
+    #[test]
+    fn pcs_replay_rejects_mutations() {
+        let (params, commitment, claims, proof) = pcs_fixture(6, 2, 2, 4, 0xC3);
+        let (r1cs, z, range) = build_pcs_trace(&params, &commitment, &claims, &proof);
+        assert!(r1cs.satisfies(&z));
+
+        let mut survivors = Vec::new();
+        for target in range {
+            let mut bad = z.clone();
+            bad[target] += F128::ONE;
+            if r1cs.satisfies(&bad) {
+                survivors.push(target);
+            }
+        }
+        assert!(survivors.is_empty(), "PCS mutation survivors: {survivors:?}");
+    }
+
+    /// Full prove_field pipeline over a synthetic satisfiable instance —
+    /// the [R] gate fixture.
+    fn field_proof_fixture(
+        m: usize,
+        lir: usize,
+        seed: u64,
+    ) -> (
+        FieldR1cs,
+        PcsParams,
+        pcs::Commitment,
+        noid_ivc_core::proof::FieldR1csProof,
+        noid_ivc_core::proof::R1csClaim,
+    ) {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_prover::field_prover::prove_field;
+
+        let (r1cs, z) = synthetic_satisfiable(m, m, seed);
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: lir,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch = FsLaneChallenger::new(b"self-verify-field-test");
+        let (proof, commitment, claim) = prove_field(&r1cs, &z, &params, &mut ch);
+        (r1cs, params, commitment, proof, claim)
+    }
+
+    /// Build the full [R] trace; returns instance/witness, the proof-wire
+    /// mutation range, and the claim expressions' evaluations.
+    #[allow(clippy::type_complexity)]
+    fn build_field_verify_trace(
+        r1cs: &FieldR1cs,
+        params: &PcsParams,
+        commitment: &pcs::Commitment,
+        proof: &noid_ivc_core::proof::FieldR1csProof,
+    ) -> (
+        FieldR1cs,
+        Vec<F128>,
+        std::ops::Range<usize>,
+        [(F128, F128); 2],
+        usize,
+    ) {
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-field-test");
+
+        let mutation_start = b.num_wires();
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let proof_e = FieldR1csProofTrace::alloc(&mut b, proof, r1cs, params);
+        let mutation_end = b.num_wires();
+
+        let claim = verify_field_trace(&mut b, &mut ch, r1cs, params, &root, &proof_e);
+        let rows = b.num_wires();
+
+        // Native lockstep reference.
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-field-test");
+        noid_ivc_core::verifier::verify_field(r1cs, commitment, proof, &mut ch_native)
+            .expect("native verify_field accepts honest proof");
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "post-verify challenge diverged");
+
+        let claim_evals = [
+            (claim.ab.value.eval(b.values()), claim.ab.z_skip.eval(b.values())),
+            (claim.c.value.eval(b.values()), claim.c.z_skip.eval(b.values())),
+        ];
+        let (out_r1cs, out_z) = b.build();
+        (out_r1cs, out_z, mutation_start..mutation_end, claim_evals, rows)
+    }
+
+    /// THE [R] lockstep gate: the full verify_field replay on an honest
+    /// prove_field proof — claims match native, transcript in lockstep,
+    /// trace satisfiable. Also reports the measured [R] row count for this
+    /// shape (the production-shape measurement lives in bench_prover).
+    #[test]
+    fn verify_field_replay_lockstep_e2e() {
+        let (r1cs, params, commitment, proof, native_claim) = field_proof_fixture(8, 2, 42);
+        let (out_r1cs, out_z, _, claim_evals, rows) =
+            build_field_verify_trace(&r1cs, &params, &commitment, &proof);
+
+        assert_eq!(claim_evals[0].0, native_claim.ab.value, "ab value");
+        assert_eq!(claim_evals[0].1, native_claim.ab.point.z_skip, "ab z_skip");
+        assert_eq!(claim_evals[1].0, native_claim.c.value, "c value");
+        assert_eq!(claim_evals[1].1, native_claim.c.point.z_skip, "c z_skip");
+
+        eprintln!(
+            "[self-verify] m={} lir={} → [R] rows = {}",
+            r1cs.m, params.log_inv_rate, rows
+        );
+        assert!(out_r1cs.satisfies(&out_z), "honest [R] trace unsatisfiable");
+    }
+
+    /// THE [R] auto-mutator gate: flipping ANY allocated proof wire —
+    /// commitment root, every zerocheck/lincheck/BaseFold proof field, every
+    /// query leaf lane, every multi-proof sibling — leaves the trace
+    /// unsatisfiable. 0 survivors.
+    #[test]
+    fn verify_field_replay_rejects_all_proof_mutations() {
+        use rayon::prelude::*;
+
+        let (r1cs, params, commitment, proof, _) = field_proof_fixture(7, 2, 43);
+        let (out_r1cs, out_z, range, _, _) =
+            build_field_verify_trace(&r1cs, &params, &commitment, &proof);
+        assert!(out_r1cs.satisfies(&out_z));
+
+        let survivors: Vec<usize> = range
+            .into_par_iter()
+            .filter(|&target| {
+                let mut bad = out_z.clone();
+                bad[target] += F128::ONE;
+                out_r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "[R] mutation survivors: {survivors:?}"
         );
     }
 
