@@ -20,8 +20,8 @@
 //!   one Merkle opening suffices for the first FRI epoch's `arity_0` folds.
 //!
 //! Subsequent FRI epochs get their own commits via the multi-arity scheme:
-//! `arities = [6, 6, 5]` for `log_dim = 17` → 1 (T₂) + 2 (FRI epoch boundaries)
-//! commits inside basefold, plus T₁ from outside.
+//! `arities = [4, 4, 4, 2]` for `log_dim = 14` → 1 (T₂) + 3 (FRI epoch
+//! boundaries) commits inside basefold, plus T₁ from outside.
 //!
 //! ## Per-query work
 //!

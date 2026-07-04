@@ -22,16 +22,22 @@ use serde::{Deserialize, Serialize};
 
 /// Log of the per-epoch FRI fold arity. `2^LOG_FRI_ARITY` codeword positions
 /// fold together between Merkle commits. Bigger = fewer Merkle trees (cheaper
-/// prover) but bigger query proofs.
-pub const LOG_FRI_ARITY: usize = 6;
+/// prover, fewer transcript roots) but bigger per-query leaves — and a
+/// verifier that replays every query pays `2^LOG_FRI_ARITY / 2` permutations
+/// per leaf per tree, which is what an in-circuit replay of this verifier
+/// amortizes worst. Arity 4 (16-lane / 8-permutation leaves) balances the
+/// replay cost against tree count; the previous arity 6 (64-lane / 33-perm
+/// leaves at the time) made per-query leaf hashing the dominant term of the
+/// whole recursive trace.
+pub const LOG_FRI_ARITY: usize = 4;
 
 /// Decompose `log_dim` FRI rounds into a sequence of epoch arities, each at
 /// most [`LOG_FRI_ARITY`]. The last epoch may be smaller than [`LOG_FRI_ARITY`]
 /// if `log_dim` doesn't divide evenly.
 ///
-/// Examples (`LOG_FRI_ARITY = 6`):
-/// - `log_dim = 17` → `[6, 6, 5]`
-/// - `log_dim = 8`  → `[6, 2]`
+/// Examples (`LOG_FRI_ARITY = 4`):
+/// - `log_dim = 14` → `[4, 4, 4, 2]`
+/// - `log_dim = 8`  → `[4, 4]`
 /// - `log_dim = 3`  → `[3]`
 pub fn compute_fri_arities(log_dim: usize) -> Vec<usize> {
     let mut arities = Vec::new();
