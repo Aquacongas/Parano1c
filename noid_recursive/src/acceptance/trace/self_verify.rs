@@ -793,6 +793,8 @@ pub struct BaseFoldProofTrace {
     pub final_a: LinExpr,
     pub final_b: LinExpr,
     pub final_codeword: Vec<LinExpr>,
+    /// Pre-query grinding nonce as a flat lane (`lo = nonce, hi = 0`).
+    pub pow_nonce: LinExpr,
     pub queries: Vec<QueryOpeningTrace>,
     pub initial_multi_proof: Vec<FlatDigestExpr>,
     pub post_row_batch_multi_proof: Vec<FlatDigestExpr>,
@@ -867,6 +869,9 @@ impl BaseFoldProofTrace {
         let final_a = LinExpr::from_wire(b.alloc_f128(native.final_a));
         let final_b = LinExpr::from_wire(b.alloc_f128(native.final_b));
         let final_codeword = alloc_vec(b, &native.final_codeword);
+        // The native challenger absorbs the nonce as `F128 { lo, hi: 0 }`.
+        let pow_nonce =
+            LinExpr::from_wire(b.alloc_f128(f128_from_u128(native.pow_nonce as u128)));
 
         let queries = native
             .queries
@@ -907,6 +912,7 @@ impl BaseFoldProofTrace {
             final_a,
             final_b,
             final_codeword,
+            pow_nonce,
             queries,
             initial_multi_proof: alloc_digests(b, &native.initial_multi_proof),
             post_row_batch_multi_proof: alloc_digests(b, &native.post_row_batch_multi_proof),
@@ -919,32 +925,41 @@ impl BaseFoldProofTrace {
     }
 }
 
-/// Bind a query position to its squeezed challenge: the native rule is
-/// `position = (challenge.lo as usize) & (2^k_code − 1)` — the low k_code
-/// bits of the FLAT representation. The trace pins
-/// `challenge = Σ_{i<k_code} pos_i·2^i + Σ_{i≥k_code} b_i·2^i` with the
-/// position bits as structural constants and the top bits as witness
-/// booleans (flat-basis powers — NOT φ(2^i): the native rule reads flat
-/// bits). Returns the structural index.
-fn bind_query_position_trace(
+/// Bind the query positions carried by ONE squeezed lane: the native rule
+/// (`pcs::sample_query_positions`) reads `floor(128 / k_code)` positions as
+/// consecutive `k_code`-bit windows of the lane's FLAT bit pattern, low
+/// windows first. The trace pins
+/// `lane = Σ_w Σ_{i<k_code} pos_w[i]·2^{w·k_code+i} + Σ leftover b_j·2^j`
+/// with the used windows' position bits as structural constants and every
+/// bit outside them as a witness boolean (flat-basis powers — NOT φ(2^i):
+/// the native rule reads flat bits). Returns the structural indices.
+fn bind_query_positions_lane_trace(
     b: &mut FieldR1csBuilder,
-    challenge: &LinExpr,
+    lane: &LinExpr,
     k_code: usize,
-) -> usize {
-    let raw = expr_flat_u128(b, challenge);
-    let position = (raw as u64 as usize) & ((1usize << k_code) - 1);
+    n_used: usize,
+) -> Vec<usize> {
+    let per_lane = 128 / k_code;
+    assert!(n_used >= 1 && n_used <= per_lane, "window count off shape");
+    let raw = expr_flat_u128(b, lane);
+    let mask = (1u128 << k_code) - 1;
     let mut sum = LinExpr::zero();
-    for i in 0..k_code {
-        if (position >> i) & 1 == 1 {
-            sum = sum.add_const(f128_from_u128(1u128 << i));
+    let mut positions = Vec::with_capacity(n_used);
+    for w in 0..n_used {
+        let pos = ((raw >> (w * k_code)) & mask) as usize;
+        positions.push(pos);
+        for i in 0..k_code {
+            if (pos >> i) & 1 == 1 {
+                sum = sum.add_const(f128_from_u128(1u128 << (w * k_code + i)));
+            }
         }
     }
-    for i in k_code..128 {
-        let bit = b.alloc_bool((raw >> i) & 1 == 1);
-        sum = sum.add(&LinExpr::from_wire(bit).scale(f128_from_u128(1u128 << i)));
+    for j in (n_used * k_code)..128 {
+        let bit = b.alloc_bool((raw >> j) & 1 == 1);
+        sum = sum.add(&LinExpr::from_wire(bit).scale(f128_from_u128(1u128 << j)));
     }
-    super::pin_zero(b, &sum.add(challenge));
-    position
+    super::pin_zero(b, &sum.add(lane));
+    positions
 }
 
 /// Trace twin of `basefold::row_batch_fold_one` (nested per-round folds of
@@ -1153,18 +1168,26 @@ pub fn basefold_verify_trace(
     }
     pin_eq(b, constant, &proof.final_a);
 
-    // ---- Resample query positions; bind each to its allocated structure.
+    // ---- Grinding check, then resample query positions with one vector
+    // squeeze; bind each to its allocated structure.
+    ch.verify_pow_trace(b, &proof.pow_nonce, pcs::QUERY_GRIND_BITS);
     let n_queries = proof.queries.len();
-    for qi in 0..n_queries {
-        let raw = ch.sample_f128(b);
-        let position = bind_query_position_trace(b, &raw, k_code);
-        // Native `q.position != positions[qi]` → the allocated structure
-        // must match the transcript-derived index (build-time assert).
-        assert_eq!(
-            proof.queries[qi].position, position,
-            "query position desynced from transcript"
-        );
+    let per_lane = 128 / k_code;
+    let lanes = ch.sample_f128_vec(b, n_queries.div_ceil(per_lane));
+    let mut qi = 0usize;
+    for lane in &lanes {
+        let used = per_lane.min(n_queries - qi);
+        for position in bind_query_positions_lane_trace(b, lane, k_code, used) {
+            // Native `q.position != positions[qi]` → the allocated structure
+            // must match the transcript-derived index (build-time assert).
+            assert_eq!(
+                proof.queries[qi].position, position,
+                "query position desynced from transcript"
+            );
+            qi += 1;
+        }
     }
+    assert_eq!(qi, n_queries, "query positions exhausted off shape");
 
     // ---- Per-query fold replay + per-tree leaf-hash accumulation.
     let mut initial_positions = Vec::with_capacity(n_queries);

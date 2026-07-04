@@ -28,7 +28,8 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use basefold::{
-    BaseFoldProof, DEFAULT_FRI_QUERIES, RoundCommitment, RoundMessage, default_fri_queries,
+    BaseFoldProof, DEFAULT_FRI_QUERIES, QUERY_GRIND_BITS, RoundCommitment, RoundMessage,
+    default_fri_queries, sample_query_positions,
 };
 pub use commit::{
     Commitment, LOG_FRI_ARITY, PcsParams, ProverData, commit, commit_into, compute_fri_arities,

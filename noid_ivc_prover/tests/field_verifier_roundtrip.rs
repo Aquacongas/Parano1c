@@ -174,7 +174,7 @@ fn mutations_rejected() {
         cases.push((format!("lc.z_partial[{i}]"), p));
     }
 
-    // PCS: final values, round messages, FRI query shape.
+    // PCS: final values, grinding nonce, round messages, FRI query shape.
     {
         let mut p = proof.clone();
         p.pcs_open.final_a += F128::ONE;
@@ -182,6 +182,9 @@ fn mutations_rejected() {
         let mut p = proof.clone();
         p.pcs_open.final_b += F128::ONE;
         cases.push(("pcs.final_b".to_string(), p));
+        let mut p = proof.clone();
+        p.pcs_open.pow_nonce = p.pcs_open.pow_nonce.wrapping_add(1);
+        cases.push(("pcs.pow_nonce".to_string(), p));
         let mut p = proof.clone();
         p.pcs_open.queries.truncate(p.pcs_open.queries.len() / 2);
         cases.push(("pcs.queries truncated".to_string(), p));

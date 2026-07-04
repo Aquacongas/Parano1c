@@ -663,15 +663,33 @@ impl Challenger for FsLaneChallenger {
     fn grind_pow(&mut self, bits: u32) -> u64 {
         self.flush();
         let (d0, d1) = (self.state[0], self.state[1]);
+        // Same parallel-dispatch policy and determinism argument as
+        // `FsChallenger::grind_pow`: block-parallel `find_first` returns the
+        // globally smallest satisfying nonce, identical to the sequential
+        // search; tiny grinds stay serial below the rayon break-even.
+        const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
         let nonce = if bits == 0 {
             0
-        } else {
+        } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
             let mut n = 0u64;
             loop {
                 if Self::pow_ok(d0, d1, n, bits) {
                     break n;
                 }
                 n = n.wrapping_add(1);
+            }
+        } else {
+            use rayon::prelude::*;
+            let block: u64 = 1 << (bits.min(24) + 1);
+            let mut start: u64 = 0;
+            loop {
+                if let Some(n) = (start..start.saturating_add(block))
+                    .into_par_iter()
+                    .find_first(|&n| Self::pow_ok(d0, d1, n, bits))
+                {
+                    break n;
+                }
+                start = start.saturating_add(block);
             }
         };
         self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));

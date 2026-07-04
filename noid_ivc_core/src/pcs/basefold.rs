@@ -63,10 +63,23 @@ use crate::merkle::{self, Hash};
 use crate::ntt::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
-/// Default FRI query count at **rate 1/2** (= `log_inv_rate = 1`). 243
-/// queries give 100 bits of provable soundness in the **unique-decoding
-/// regime** (UDR). See [`default_fri_queries`] for the rate-aware lookup
-/// used by [`super::open`] / [`super::open_batch_padded`].
+/// Transcript grinding spent immediately before query-position sampling:
+/// the prover searches a nonce whose transcript-bound PoW hash clears this
+/// many leading zero bits (one search of `2^QUERY_GRIND_BITS` expected
+/// permutations, once per proof), and every query in [`default_fri_queries`]
+/// then only needs to close `100 − QUERY_GRIND_BITS` bits. A verifier —
+/// native or in-circuit — pays ONE extra permutation to check the nonce,
+/// while the query-count reduction removes whole Merkle-path replays per
+/// proof; the trade is strongly verifier-favorable. 16 bits keeps the
+/// prover's grind under ~0.5 s single-threaded.
+pub const QUERY_GRIND_BITS: u32 = 16;
+
+/// Default FRI query count at **rate 1/2** (= `log_inv_rate = 1`). 204
+/// queries give `100 − QUERY_GRIND_BITS = 84` bits of provable soundness in
+/// the **unique-decoding regime** (UDR); the grinding contributes the
+/// remaining 16 to the 100-bit query-phase target. See
+/// [`default_fri_queries`] for the rate-aware lookup used by
+/// [`super::open`] / [`super::open_batch_padded`].
 ///
 /// Within distance `γ = (1−ρ)/2 − ε*` of the RS code (strictly inside the
 /// unique decoding radius, with proximity loss `ε* = 10⁻³` so BCHKS25
@@ -75,23 +88,24 @@ use serde::{Deserialize, Serialize};
 /// query catches a γ-far prover with probability ≥ γ:
 ///
 /// ```text
-/// soundness error ≤ (1 − γ)^t
+/// soundness error ≤ 2^−QUERY_GRIND_BITS · (1 − γ)^t
 /// ```
 ///
-/// For 100 bits we need
+/// For 100 bits total we need
 ///
 /// ```text
-/// t · (−log₂(1 − γ)) ≥ 100.
+/// t · (−log₂(1 − γ)) ≥ 100 − QUERY_GRIND_BITS.
 /// ```
 ///
 /// The fold-consistency (proximity-gap) term is `a ≤ 2/ε*` by Theorem 1.4,
 /// independent of codeword length, so over F128 it sits ≥ 115 bits below the
 /// challenge space and needs no grinding. Matches ligerito's `udr_queries` /
 /// `UDR_PROXIMITY_LOSS` derivation.
-pub const DEFAULT_FRI_QUERIES: usize = 243;
+pub const DEFAULT_FRI_QUERIES: usize = 204;
 
-/// FRI query count required for 100 bits of soundness at the given
-/// `log_inv_rate`, in the unique-decoding regime documented on
+/// FRI query count required for the 100-bit query-phase target at the given
+/// `log_inv_rate` — [`QUERY_GRIND_BITS`] of it from transcript grinding,
+/// the rest from queries in the unique-decoding regime documented on
 /// [`DEFAULT_FRI_QUERIES`]. Slimmer codes (larger `log_inv_rate`) have
 /// larger γ, so each query closes more soundness — but per-query soundness
 /// saturates below 1 bit (γ < 1/2 always), unlike the Johnson regime where
@@ -102,15 +116,42 @@ pub const DEFAULT_FRI_QUERIES: usize = 243;
 pub fn default_fri_queries(log_inv_rate: usize) -> usize {
     match log_inv_rate {
         1 => DEFAULT_FRI_QUERIES, // rate 1/2: γ ≈ 0.249, ~0.413 bits/query
-        2 => 148,                 // rate 1/4: γ ≈ 0.374, ~0.676 bits/query
-        3 => 121,                 // rate 1/8: γ ≈ 0.436, ~0.828 bits/query
-        4 => 110,                 // rate 1/16: γ ≈ 0.468, ~0.910 bits/query
-        5 => 105,                 // rate 1/32: γ ≈ 0.483, ~0.953 bits/query
+        2 => 125,                 // rate 1/4: γ ≈ 0.374, ~0.676 bits/query
+        3 => 102,                 // rate 1/8: γ ≈ 0.436, ~0.828 bits/query
+        4 => 93,                  // rate 1/16: γ ≈ 0.468, ~0.910 bits/query
+        5 => 89,                  // rate 1/32: γ ≈ 0.483, ~0.953 bits/query
         _ => panic!(
             "default_fri_queries: unsupported log_inv_rate {log_inv_rate} \
              — add a soundness-derived entry to the table"
         ),
     }
+}
+
+/// Derive `n` query positions from the transcript with ONE vector squeeze:
+/// each squeezed lane yields `floor(128 / k_code)` positions as consecutive
+/// `k_code`-bit windows of its 128-bit flat pattern (low windows first).
+/// Shared by the prover and the verifier so the derivation can never drift.
+pub fn sample_query_positions<Ch: Challenger>(
+    challenger: &mut Ch,
+    n: usize,
+    k_code: usize,
+) -> Vec<usize> {
+    assert!(k_code > 0 && k_code <= 64, "position windows fit a lane");
+    let per_lane = 128 / k_code;
+    let n_lanes = n.div_ceil(per_lane);
+    let lanes = challenger.sample_f128_vec(n_lanes);
+    let mask = (1u128 << k_code) - 1;
+    let mut out = Vec::with_capacity(n);
+    'lanes: for lane in lanes {
+        let full = ((lane.hi as u128) << 64) | lane.lo as u128;
+        for w in 0..per_lane {
+            if out.len() == n {
+                break 'lanes;
+            }
+            out.push(((full >> (w * k_code)) & mask) as usize);
+        }
+    }
+    out
 }
 
 /// Per-round sumcheck message: `u_0 = u(0)`, `u_2 = u(∞)`. Middle coeff is
@@ -169,6 +210,9 @@ pub struct BaseFoldProof {
     pub final_b: F128,
     /// Final codeword (length `2^log_inv_rate`, must be constant).
     pub final_codeword: Vec<F128>,
+    /// Transcript-grinding nonce spent before query sampling
+    /// ([`QUERY_GRIND_BITS`] leading zero bits).
+    pub pow_nonce: u64,
     pub queries: Vec<QueryOpening>,
     /// Octopus multi-proof for the T1 (initial) tree: shared sibling hashes
     /// covering every `queries[*].initial_leaf` against `initial_codeword_root`.
@@ -186,6 +230,9 @@ pub enum VerifyError {
     SumcheckFinalMismatch,
     FinalCodewordNotConstant,
     SumcheckFriMismatch,
+    /// The pre-query transcript-grinding nonce fails its
+    /// [`QUERY_GRIND_BITS`] leading-zero check.
+    GrindingFailed,
     InitialMerkleFailed { query_index: usize },
     RoundMerkleFailed { query_index: usize, epoch: usize },
     FoldMismatch { query_index: usize, epoch: usize },
@@ -670,8 +717,11 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     let final_b = b[0];
     let final_codeword = codeword_active[..cw_len].to_vec();
 
-    // --- Sample query positions and gather per-tree leaf indices.
+    // --- Grind, then sample query positions and gather per-tree leaf
+    // indices. The grind pins down the transcript state the positions are
+    // drawn from; its soundness contribution is priced into the query table.
     let t_queries = std::time::Instant::now();
+    let pow_nonce = challenger.grind_pow(QUERY_GRIND_BITS);
     let mut queries = Vec::with_capacity(n_queries);
     let initial_leaf_f128 = num_ntts;
 
@@ -681,10 +731,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         .map(|_| Vec::with_capacity(n_queries))
         .collect();
 
-    for _ in 0..n_queries {
-        let raw = challenger.sample_f128();
-        let position = (raw.lo as usize) & ((1 << k_code) - 1);
-
+    for position in sample_query_positions(challenger, n_queries, k_code) {
         // T1 leaf (= position).
         let initial_start = position * initial_leaf_f128;
         let initial_leaf =
@@ -816,6 +863,7 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
         final_a,
         final_b,
         final_codeword,
+        pow_nonce,
         queries,
         initial_multi_proof,
         post_row_batch_multi_proof,
@@ -928,13 +976,13 @@ pub fn verify<Ch: Challenger>(
         return Err(VerifyError::SumcheckFriMismatch);
     }
 
-    // Resample query positions (challenger state matches prover).
-    let n_queries = proof.queries.len();
-    let mut positions = Vec::with_capacity(n_queries);
-    for _ in 0..n_queries {
-        let raw = challenger.sample_f128();
-        positions.push((raw.lo as usize) & ((1 << k_code) - 1));
+    // Check the pre-query transcript grinding, then resample query
+    // positions (challenger state matches prover).
+    if !challenger.verify_pow(proof.pow_nonce, QUERY_GRIND_BITS) {
+        return Err(VerifyError::GrindingFailed);
     }
+    let n_queries = proof.queries.len();
+    let positions = sample_query_positions(challenger, n_queries, k_code);
 
     let arity_0 = arities.first().copied().unwrap_or(0);
     let initial_leaf_f128 = num_ntts; // T1: one position's row-batch lanes
