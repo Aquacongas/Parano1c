@@ -159,7 +159,7 @@ pub fn merkle_hash_leaf_lanes_trace(
         LinExpr::constant(iv_hi),
         LinExpr::constant(iv_lo),
     ];
-    let mut absorb_block = |b: &mut FieldR1csBuilder,
+    let absorb_block = |b: &mut FieldR1csBuilder,
                             state: &mut [LinExpr; 4],
                             lane0: &LinExpr,
                             lane1: &LinExpr| {
@@ -486,6 +486,265 @@ pub fn zerocheck_field_verify_trace(
 }
 
 // ---------------------------------------------------------------------------
+// Lincheck verify replay
+// ---------------------------------------------------------------------------
+
+/// A `lincheck::QuirkyPoint` as expressions.
+pub struct QuirkyPointTrace {
+    pub z_skip: LinExpr,
+    pub x_inner_rest: Vec<LinExpr>,
+    pub x_outer: Vec<LinExpr>,
+}
+
+/// Witness allocation of a `lincheck::LincheckProof` under the frozen shape.
+pub struct LincheckProofTrace {
+    pub rounds: Vec<(LinExpr, LinExpr)>,
+    pub z_partial: Vec<LinExpr>,
+}
+
+impl LincheckProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::lincheck::LincheckProof,
+        k_log: usize,
+        k_skip: usize,
+    ) -> Self {
+        assert_eq!(native.rounds.len(), k_log - k_skip, "rounds off shape");
+        assert_eq!(native.z_partial.len(), 1usize << k_skip, "z_partial off shape");
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|&(e1, einf)| {
+                    (
+                        LinExpr::from_wire(b.alloc_f128(e1)),
+                        LinExpr::from_wire(b.alloc_f128(einf)),
+                    )
+                })
+                .collect(),
+            z_partial: native
+                .z_partial
+                .iter()
+                .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+                .collect(),
+        }
+    }
+}
+
+/// The `lincheck::LincheckClaim` as expressions.
+pub struct LincheckClaimTrace {
+    pub r_inner_skip: LinExpr,
+    pub r_inner_rest: Vec<LinExpr>,
+    pub w: LinExpr,
+}
+
+/// The final lincheck consistency sum `Σ_s comb_partial[s] · z_partial[s]`
+/// as a bilinear form over the CONSTANT matrices (fixed-shape invariant: the
+/// verified instance's matrices are protocol constants, which is exactly
+/// what makes this replay affordable).
+///
+/// Native computes `comb_vec = α·(A^T·eq_inner) + B^T·eq_inner (+β·1_pin)`
+/// over all `2^k_log` columns, folds it through the sumcheck challenges,
+/// and dots with `z_partial`. Expanding instead (field identity — exact
+/// value, FS schedule untouched):
+///
+/// ```text
+/// F = Σ_{(r,c)∈M'} κ_rc · λ[r_s]·e[r_x] · zp[c_s]·q[c_x]  (+ β·zp[p_s]·q[p_x])
+///   = Σ_{64×64 blocks (R,X)} e[R]·q[X] · (Σ_{(i,j)∈block} κ·λ_i·zp_j)
+/// ```
+///
+/// where `λ` = skip Lagrange weights at `z_skip`, `e` = eq(x_inner_rest),
+/// `q` = eq(r_inner_rest) (the fold weights of the bound rounds), `zp` =
+/// z_partial. The inner block sums are symbolic over the ≤ 2^{2·k_skip}
+/// materialized products `P[i][j] = λ_i·zp_j`, so the cost is
+/// `2·2^{k_log−k_skip}` (tensors) + `|P|` + ~2 muls per nonzero block —
+/// instead of Θ(2^k_log) for a materialized comb_vec.
+fn lincheck_final_sum_trace(
+    b: &mut FieldR1csBuilder,
+    r1cs: &FieldR1cs,
+    alpha: &LinExpr,
+    beta: Option<&LinExpr>,
+    lambda: &[LinExpr],
+    e_rest: &[LinExpr],
+    q_rest: &[LinExpr],
+    z_partial: &[LinExpr],
+) -> LinExpr {
+    use std::collections::BTreeMap;
+
+    let ell = 1usize << r1cs.k_skip;
+    assert_eq!(lambda.len(), ell);
+    assert_eq!(z_partial.len(), ell);
+    assert_eq!(e_rest.len(), 1usize << (r1cs.k_log - r1cs.k_skip));
+    assert_eq!(q_rest.len(), e_rest.len());
+
+    // ---- Collect per-block coefficient lists from the constant matrices.
+    // BTreeMaps keep wire allocation deterministic (fixed shape).
+    type Block = Vec<(usize, usize, F128)>; // (i, j, κ)
+    let mut blocks_a: BTreeMap<(usize, usize), Block> = BTreeMap::new();
+    let mut blocks_b: BTreeMap<(usize, usize), Block> = BTreeMap::new();
+    let k_skip = r1cs.k_skip;
+    let mask = ell - 1;
+    for (rows, blocks) in [(&r1cs.a_0.rows, &mut blocks_a), (&r1cs.b_0.rows, &mut blocks_b)] {
+        for (r, row) in rows.iter().enumerate() {
+            for &(c, kappa) in row {
+                let c = c as usize;
+                blocks
+                    .entry((r >> k_skip, c >> k_skip))
+                    .or_default()
+                    .push((r & mask, c & mask, kappa));
+            }
+        }
+    }
+
+    // ---- Materialize the needed P[i][j] = λ_i · zp_j products.
+    let mut p: BTreeMap<(usize, usize), LinExpr> = BTreeMap::new();
+    for block in blocks_a.values().chain(blocks_b.values()) {
+        for &(i, j, _) in block {
+            p.entry((i, j))
+                .or_insert_with_key(|_| LinExpr::zero());
+        }
+    }
+    let keys: Vec<(usize, usize)> = p.keys().copied().collect();
+    for (i, j) in keys {
+        let prod = mul(b, &lambda[i], &z_partial[j]);
+        p.insert((i, j), prod);
+    }
+
+    // ---- Per-block: t = e[R]·q[X] (shared between A and B), then one mul
+    // with each symbolic block sum.
+    let mut pair_products: BTreeMap<(usize, usize), LinExpr> = BTreeMap::new();
+    let mut all_keys: Vec<(usize, usize)> = blocks_a.keys().chain(blocks_b.keys()).copied().collect();
+    all_keys.sort_unstable();
+    all_keys.dedup();
+    for &(r_blk, x_blk) in &all_keys {
+        let t = mul(b, &e_rest[r_blk], &q_rest[x_blk]);
+        pair_products.insert((r_blk, x_blk), t);
+    }
+
+    let block_sum = |blocks: &BTreeMap<(usize, usize), Block>,
+                     p: &BTreeMap<(usize, usize), LinExpr>,
+                     b: &mut FieldR1csBuilder,
+                     pair_products: &BTreeMap<(usize, usize), LinExpr>|
+     -> LinExpr {
+        let mut acc = LinExpr::zero();
+        for (key, entries) in blocks {
+            let mut g = LinExpr::zero();
+            for &(i, j, kappa) in entries {
+                g = g.add(&p[&(i, j)].scale(kappa));
+            }
+            acc = acc.add(&mul(b, &pair_products[key], &g));
+        }
+        acc
+    };
+    let t_a = block_sum(&blocks_a, &p, b, &pair_products);
+    let t_b = block_sum(&blocks_b, &p, b, &pair_products);
+
+    let mut f = mul(b, alpha, &t_a).add(&t_b);
+
+    // ---- Constant-wire pin: comb_vec[pin] += β folds to β·zp[p_s]·q[p_x].
+    if let (Some(beta), Some(col)) = (beta, r1cs.const_pin) {
+        let u_pin = mul(b, &z_partial[col & mask], &q_rest[col >> k_skip]);
+        f = f.add(&mul(b, beta, &u_pin));
+    }
+    f
+}
+
+/// Trace twin of `lincheck::verify` for a **protocol-constant** FieldR1cs
+/// instance (its CSC circuit is `r1cs.csc_lincheck_circuit()` — coefficient
+/// semantics enter through the constant matrices). Native shape errors are
+/// alloc/build asserts; the two value checks (sumcheck-final consistency)
+/// are pins.
+#[allow(clippy::too_many_arguments)]
+pub fn lincheck_verify_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    r1cs: &FieldR1cs,
+    m: usize,
+    x_ab: &QuirkyPointTrace,
+    v_a: &LinExpr,
+    v_b: &LinExpr,
+    proof: &LincheckProofTrace,
+) -> LincheckClaimTrace {
+    let k_log = r1cs.k_log;
+    let k_skip = r1cs.k_skip;
+    let ell = 1usize << k_skip;
+    let inner_rest_len = k_log - k_skip;
+    assert!(k_skip <= k_log, "k_skip exceeds k_log");
+    assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len, "x_inner_rest off shape");
+    assert_eq!(x_ab.x_outer.len(), m - k_log, "x_outer off shape");
+    assert_eq!(proof.rounds.len(), inner_rest_len, "rounds off shape");
+    assert_eq!(proof.z_partial.len(), ell, "z_partial off shape");
+
+    ch.observe_label(b, b"history-lincheck-v0");
+
+    // 1. Sample α (matches prover's order).
+    let alpha = ch.sample_f128(b);
+
+    // 2. The α-batched comb fold is deferred into the final bilinear sum
+    //    (see lincheck_final_sum_trace); here only its ingredients that
+    //    depend on x_ab: λ(z_skip) and eq(x_inner_rest).
+    let lambda = lagrange_weights_window_trace(b, &x_ab.z_skip, 0, ell, 0);
+    let e_rest = super::eq_ind_partial_eval_trace(b, &x_ab.x_inner_rest);
+
+    // 3. Replay the product-sumcheck. β is sampled after α (mirror of the
+    //    native const-pin branch); the initial target gains +β.
+    let v_a_alpha = mul(b, &alpha, v_a);
+    let mut target = v_a_alpha.add(v_b);
+    let beta = if r1cs.const_pin.is_some() {
+        let beta = ch.sample_f128(b);
+        target = target.add(&beta);
+        Some(beta)
+    } else {
+        None
+    };
+    let mut running = target;
+    let mut r_rounds: Vec<LinExpr> = Vec::with_capacity(inner_rest_len);
+    for (e1, einf) in &proof.rounds {
+        ch.observe_f128(b, e1);
+        ch.observe_f128(b, einf);
+        let r = ch.sample_f128(b);
+        // q(0) = claim + q(1) in char 2; q(X) = einf·X² + c1·X + e0.
+        let e0 = running.add(e1);
+        let c1 = e0.add(e1).add(einf);
+        let r_sq = mul(b, &r, &r);
+        running = mul(b, einf, &r_sq).add(&mul(b, &c1, &r)).add(&e0);
+        r_rounds.push(r);
+    }
+
+    // 4. Observe z_partial AFTER the sumcheck rounds (matches prover order).
+    ch.observe_f128_slice(b, &proof.z_partial);
+
+    // 5. Final sumcheck consistency (native `ConsistencyFailed` → pin). The
+    //    fold weights of the bound rounds are eq(r_inner_rest) LSB-first.
+    let r_inner_rest: Vec<LinExpr> = r_rounds.iter().rev().cloned().collect();
+    let q_rest = super::eq_ind_partial_eval_trace(b, &r_inner_rest);
+    let final_sum = lincheck_final_sum_trace(
+        b,
+        r1cs,
+        &alpha,
+        beta.as_ref(),
+        &lambda,
+        &e_rest,
+        &q_rest,
+        &proof.z_partial,
+    );
+    pin_eq(b, &running, &final_sum);
+
+    // 6. Sample fresh z_skip AFTER z_partial — SZ on the φ8 dim.
+    let r_inner_skip = ch.sample_f128(b);
+
+    // 7. Output claim value via φ8 Lagrange on z_partial at r_inner_skip.
+    let lambda_out = lagrange_weights_window_trace(b, &r_inner_skip, 0, ell, 0);
+    let w = dot_trace(b, &lambda_out, &proof.z_partial);
+
+    LincheckClaimTrace {
+        r_inner_skip,
+        r_inner_rest,
+        w,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -738,6 +997,168 @@ mod tests {
         assert!(
             survivors.is_empty(),
             "zerocheck mutation survivors: {survivors:?}"
+        );
+    }
+
+    /// Native prove pipeline (zerocheck + lincheck) over a synthetic
+    /// satisfiable FieldR1cs, for the lincheck lockstep/mutation gates.
+    fn lincheck_fixture(
+        m: usize,
+        k_log: usize,
+        seed: u64,
+    ) -> (
+        FieldR1cs,
+        zerocheck::ZerocheckProof,
+        noid_ivc_core::lincheck::LincheckProof,
+    ) {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::lincheck::{self, QuirkyPoint};
+
+        let (r1cs, z) = synthetic_satisfiable(m, k_log, seed);
+        let a = r1cs.apply_a(&z);
+        let bb = r1cs.apply_b(&z);
+        // C = I ⇒ the zerocheck statement a·b + c = 0 holds with c = z.
+        let mut ch = FsLaneChallenger::new(b"self-verify-lc-test");
+        let (zc_proof, zc_claim) = zerocheck::field::prove(&a, &bb, &z, m, &mut ch);
+        let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+        let x_ab = QuirkyPoint {
+            z_skip: zc_claim.z,
+            x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+            x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+        };
+        let (lc_proof, _) = lincheck::prove_field(
+            &z,
+            m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_rows,
+            r1cs.csc_lincheck_circuit(),
+            &x_ab,
+            &mut ch,
+        );
+        (r1cs, zc_proof, lc_proof)
+    }
+
+    /// THE lincheck lockstep gate: replay zerocheck + lincheck in-trace
+    /// against the native verify chain — claims, transcript and
+    /// satisfiability all in lockstep. Exercises both a block-diagonal
+    /// instance (m > k_log) and the builder shape (m = k_log).
+    #[test]
+    fn lincheck_replay_lockstep_matches_native() {
+        use noid_ivc_core::lincheck::{self, QuirkyPoint};
+
+        for &(m, k_log, seed) in &[(10usize, 8usize, 7u64), (9, 9, 8), (8, 7, 9)] {
+            let (r1cs, zc_proof, lc_proof) = lincheck_fixture(m, k_log, seed);
+
+            // ---- Native verify chain.
+            let mut ch_native = FsLaneChallenger::new(b"self-verify-lc-test");
+            let zc_claim = zerocheck::field::verify(m, &zc_proof, &mut ch_native)
+                .expect("native zerocheck accepts");
+            let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+            let x_ab = QuirkyPoint {
+                z_skip: zc_claim.z,
+                x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+                x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+            };
+            let native_claim = lincheck::verify(
+                m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.csc_lincheck_circuit(),
+                &x_ab,
+                zc_claim.a_eval,
+                zc_claim.b_eval,
+                &lc_proof,
+                &mut ch_native,
+            )
+            .expect("native lincheck accepts");
+
+            // ---- Trace replay chain.
+            let mut b = FieldR1csBuilder::new();
+            let mut ch = FsChannelTrace::new(&mut b, b"self-verify-lc-test");
+            let zc_e = ZerocheckProofTrace::alloc(&mut b, &zc_proof, m);
+            let zc_claim_e = zerocheck_field_verify_trace(&mut b, &mut ch, m, &zc_e);
+            let x_ab_e = QuirkyPointTrace {
+                z_skip: zc_claim_e.z.clone(),
+                x_inner_rest: zc_claim_e.mlv_challenges[..inner_rest_len].to_vec(),
+                x_outer: zc_claim_e.mlv_challenges[inner_rest_len..].to_vec(),
+            };
+            let lc_e = LincheckProofTrace::alloc(&mut b, &lc_proof, r1cs.k_log, r1cs.k_skip);
+            let claim = lincheck_verify_trace(
+                &mut b,
+                &mut ch,
+                &r1cs,
+                m,
+                &x_ab_e,
+                &zc_claim_e.a_eval,
+                &zc_claim_e.b_eval,
+                &lc_e,
+            );
+
+            assert_eq!(
+                claim.r_inner_skip.eval(b.values()),
+                native_claim.r_inner_skip,
+                "r_inner_skip (m={m},k_log={k_log})"
+            );
+            for (e, n) in claim.r_inner_rest.iter().zip(&native_claim.r_inner_rest) {
+                assert_eq!(e.eval(b.values()), *n, "r_inner_rest (m={m},k_log={k_log})");
+            }
+            assert_eq!(
+                claim.w.eval(b.values()),
+                native_claim.w,
+                "w (m={m},k_log={k_log})"
+            );
+
+            let c_n = ch_native.sample_f128();
+            let c_t = ch.sample_f128(&mut b);
+            assert_eq!(c_t.eval(b.values()), c_n, "post-verify challenge");
+
+            let (out_r1cs, out_z) = b.build();
+            assert!(out_r1cs.satisfies(&out_z), "m={m} k_log={k_log}");
+        }
+    }
+
+    /// Mutating any lincheck proof wire makes the trace unsatisfiable.
+    #[test]
+    fn lincheck_replay_rejects_mutations() {
+        let (m, k_log, seed) = (9usize, 8usize, 0x11u64);
+        let (r1cs, zc_proof, lc_proof) = lincheck_fixture(m, k_log, seed);
+        let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+        let n_lc_wires = 2 * inner_rest_len + (1usize << r1cs.k_skip);
+
+        let mut survivors = Vec::new();
+        for target in 0..n_lc_wires {
+            let mut b = FieldR1csBuilder::new();
+            let mut ch = FsChannelTrace::new(&mut b, b"self-verify-lc-test");
+            let zc_e = ZerocheckProofTrace::alloc(&mut b, &zc_proof, m);
+            let zc_claim_e = zerocheck_field_verify_trace(&mut b, &mut ch, m, &zc_e);
+            let x_ab_e = QuirkyPointTrace {
+                z_skip: zc_claim_e.z.clone(),
+                x_inner_rest: zc_claim_e.mlv_challenges[..inner_rest_len].to_vec(),
+                x_outer: zc_claim_e.mlv_challenges[inner_rest_len..].to_vec(),
+            };
+            let first_wire = b.num_wires();
+            let lc_e = LincheckProofTrace::alloc(&mut b, &lc_proof, r1cs.k_log, r1cs.k_skip);
+            let _ = lincheck_verify_trace(
+                &mut b,
+                &mut ch,
+                &r1cs,
+                m,
+                &x_ab_e,
+                &zc_claim_e.a_eval,
+                &zc_claim_e.b_eval,
+                &lc_e,
+            );
+            let (out_r1cs, mut out_z) = b.build();
+            assert!(out_r1cs.satisfies(&out_z));
+            out_z[first_wire + target] += F128::ONE;
+            if out_r1cs.satisfies(&out_z) {
+                survivors.push(target);
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "lincheck mutation survivors: {survivors:?}"
         );
     }
 
