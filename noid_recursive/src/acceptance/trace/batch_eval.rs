@@ -12,16 +12,15 @@
 //!   (spine chain relations, Merkle path chains) has structural points; the
 //!   native `boolean_point_index` branch is then decided at build time.
 //! - Multi-batch claims carry **dense expression points** (they are always
-//!   sumcheck challenge vectors). Native takes the dense absorb branch unless
-//!   a challenge point happens to be exactly boolean — probability ≤ n·2^−121
-//!   per proof; on that measure-zero set an honest native transcript and the
-//!   trace diverge and the (honest) proof is simply unprovable in-trace.
-//!   Soundness is unaffected: the trace's own FS binding is what π proves.
+//!   sumcheck challenge vectors). The prebound claim binding absorbs only
+//!   point lengths and values — the points are the channel's own squeezed
+//!   reduction vectors, already transcript-determined — so the old
+//!   dense-vs-boolean absorb divergence no longer exists.
 
 use noid_core::{Block128, TowerField};
 use noid_gkr::batch_eval::{
     BatchEvalRound, LinearEvalProof, MultiBatchEvalProof, CLAIM_POINT_BOOL_TAG,
-    CLAIM_POINT_DENSE_TAG, LINEAR_EVAL_PREBOUND_TAG, MULTI_BATCH_EVAL_TAG,
+    LINEAR_EVAL_PREBOUND_TAG, MULTI_BATCH_EVAL_PREBOUND_TAG,
 };
 
 use super::{
@@ -199,33 +198,22 @@ pub fn squeeze_alphas_trace(
     alphas
 }
 
-/// Trace twin of `batch_eval::absorb_point` for a dense expression point.
-fn absorb_point_dense_trace(
-    b: &mut FieldR1csBuilder,
-    ch: &mut RawChannelTrace,
-    point: &[LinExpr],
-) {
-    ch.absorb_const_tower(b, CLAIM_POINT_DENSE_TAG);
-    ch.absorb_const_tower(b, point.len() as u128);
-    for e in point {
-        ch.absorb(b, e);
-    }
-}
-
-/// Trace twin of `batch_eval::absorb_claims` (dense branch — module docs).
+/// Trace twin of the native prebound claim binding: point LENGTH + VALUE
+/// per claim, never the point coordinates (they are the channel's own
+/// squeezed reduction points, already transcript-determined).
 fn absorb_claims_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut RawChannelTrace,
     claims: &[EvalClaimTrace],
 ) {
     for c in claims {
-        absorb_point_dense_trace(b, ch, &c.point);
+        ch.absorb_const_tower(b, c.point.len() as u128);
         ch.absorb(b, &c.value);
     }
 }
 
 // Compile-time reference so the boolean tag stays linked to the native
-// definition even though the dense-only absorb above never emits it.
+// definition even though the prebound absorb above never emits it.
 #[allow(dead_code)]
 const _BOOL_TAG_LINK: u128 = CLAIM_POINT_BOOL_TAG;
 
@@ -405,8 +393,8 @@ pub fn verify_multi_batch_eval_trace(
     }
     assert_eq!(proof.rounds.len(), n);
 
-    // absorb_multi_claims
-    ch.absorb_const_tower(b, MULTI_BATCH_EVAL_TAG);
+    // absorb_multi_claims (prebound schedule)
+    ch.absorb_const_tower(b, MULTI_BATCH_EVAL_PREBOUND_TAG);
     ch.absorb_const_tower(b, claims_by_column.len() as u128);
     for (col_idx, claims) in claims_by_column.iter().enumerate() {
         ch.absorb_const_tower(b, col_idx as u128);

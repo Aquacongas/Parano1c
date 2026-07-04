@@ -496,21 +496,20 @@ pub(crate) fn squeeze_alphas<T: FiatShamir<Block128>>(
     alphas
 }
 
-/// Absorb all claim points and values into the channel so `α_i` are
-/// bound to the exact set of claims being batched.
+/// Bind the batched claims to the channel so `α_i` are tied to the exact
+/// claim set. PREBOUND schedule: only each claim's point LENGTH and VALUE
+/// are absorbed, never the point coordinates. Sound because every closure
+/// in the protocol batches claims whose points are the channel's OWN
+/// squeezed challenge vectors (unified/shift reduction points, chain and
+/// boundary points) — already determined by the transcript state at entry;
+/// re-absorbing them bound nothing and cost `~(2 + num_vars)` lanes per
+/// point. Values must stay absorbed: sub-reduction `b_final`s enter the
+/// transcript only here. A future caller whose points are NOT
+/// transcript-determined must absorb them explicitly first (see
+/// [`absorb_point`] / the dense linear-claim schedule).
 fn absorb_claims<T: FiatShamir<Block128>>(channel: &mut T, claims: &[EvalClaim]) {
     for c in claims {
-        if let Some(index) = boolean_point_index(&c.point) {
-            channel.absorb(Block128::from(CLAIM_POINT_BOOL_TAG));
-            channel.absorb(Block128::from(c.point.len() as u128));
-            channel.absorb(Block128::from(index as u128));
-        } else {
-            channel.absorb(Block128::from(CLAIM_POINT_DENSE_TAG));
-            channel.absorb(Block128::from(c.point.len() as u128));
-            for e in &c.point {
-                channel.absorb(*e);
-            }
-        }
+        channel.absorb(Block128::from(c.point.len() as u128));
         channel.absorb(c.value);
     }
 }
@@ -573,17 +572,18 @@ fn absorb_linear_binding<T: FiatShamir<Block128>>(
 // Public: the in-circuit trace transliterations (`noid_recursive::acceptance::trace`)
 // absorb these same tags; referencing one definition keeps native and trace
 // in lockstep by construction; change both together.
-pub const MULTI_BATCH_EVAL_TAG: u128 = 0xA07D_6B12_BA7C_0001;
+pub const MULTI_BATCH_EVAL_PREBOUND_TAG: u128 = 0xA07D_6B12_BA7C_0002;
 pub const CLAIM_POINT_BOOL_TAG: u128 = 0xA07D_6B12_C1A1_0001;
 pub const CLAIM_POINT_DENSE_TAG: u128 = 0xA07D_6B12_C1A1_0002;
 pub const LINEAR_EVAL_TAG: u128 = 0xA07D_6B12_11EA_0001;
 pub const LINEAR_EVAL_PREBOUND_TAG: u128 = 0xA07D_6B12_11EA_0002;
 
+/// Multi-column claim binding, prebound schedule (see [`absorb_claims`]).
 fn absorb_multi_claims<T: FiatShamir<Block128>>(
     channel: &mut T,
     claims_by_column: &[&[EvalClaim]],
 ) {
-    channel.absorb(Block128::from(MULTI_BATCH_EVAL_TAG));
+    channel.absorb(Block128::from(MULTI_BATCH_EVAL_PREBOUND_TAG));
     channel.absorb(Block128::from(claims_by_column.len() as u128));
     for (col_idx, claims) in claims_by_column.iter().enumerate() {
         channel.absorb(Block128::from(col_idx as u128));
