@@ -56,8 +56,11 @@ pub struct FiatShamirTranscriptBatchProofKillShot {
 
 impl FiatShamirTranscriptBatchProofKillShot {
     pub fn byte_len(&self) -> usize {
-        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
-        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_polys =
+            self.kill_shot.main.round_polys.len() * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE * 16;
+        let shift_polys = self.kill_shot.shift.round_polys.len()
+            * noid_gkr::block_spine::BLOCK_SPINE_SHIFT_DEGREE
+            * 16;
         let main_finals = 12 * 16;
         let shift_finals = 3 * 16;
         main_polys
@@ -71,8 +74,11 @@ impl FiatShamirTranscriptBatchProofKillShot {
 
 impl FiatShamirTranscriptProofKillShot {
     pub fn byte_len(&self) -> usize {
-        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
-        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_polys =
+            self.kill_shot.main.round_polys.len() * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE * 16;
+        let shift_polys = self.kill_shot.shift.round_polys.len()
+            * noid_gkr::block_spine::BLOCK_SPINE_SHIFT_DEGREE
+            * 16;
         let main_finals = 12 * 16;
         let shift_finals = 3 * 16;
         main_polys

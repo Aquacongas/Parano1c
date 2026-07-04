@@ -404,7 +404,7 @@ mod tests {
         f: &mut dyn FnMut(&mut Block128),
     ) {
         for rp in &mut p.kill_shot.main.round_polys {
-            for c in &mut rp.coeffs {
+            for c in &mut rp.coeffs_no_linear {
                 f(c);
             }
         }
@@ -419,7 +419,7 @@ mod tests {
             f(v);
         }
         for rp in &mut p.kill_shot.shift.round_polys {
-            for c in &mut rp.coeffs {
+            for c in &mut rp.coeffs_no_linear {
                 f(c);
             }
         }

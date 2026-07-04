@@ -15,7 +15,7 @@ use noid_core::hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::{evaluate_flat, evaluate_preflat};
 use noid_core::packed::pow7::pow7_block128;
-use noid_core::sumcheck::RoundPolynomial;
+use noid_core::sumcheck::{CompressedRoundPolynomial, RoundPolynomial};
 use noid_core::transcript::FiatShamir;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::channel::Poseidon2bChannel;
@@ -651,7 +651,7 @@ pub const OWNER_AUTH_BOUNDARY_ROUND_DEGREE: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnerAuthUnifiedProof {
-    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub round_polys: Vec<CompressedRoundPolynomial<Block128>>,
     pub state_at_r: Block128,
     pub state_lane_dec_at_r: [Block128; STATE_SIZE],
 }
@@ -974,14 +974,15 @@ pub fn prove_owner_auth_unified<T: FiatShamir<Block128>>(
     let mut r_prime = vec![Block128::ZERO; layout.num_vars];
     for round in 0..layout.num_vars {
         let poly = compute_owner_state_round_polynomial_flat(&tabs);
-        for &c in &poly.coeffs {
+        let wire = CompressedRoundPolynomial::compress(&poly);
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
         let challenge_flat = tower_to_flat_u128(challenge.to_u128());
         tabs.fold_flat(challenge_flat);
         r_prime[layout.num_vars - 1 - round] = challenge;
-        round_polys.push(poly);
+        round_polys.push(wire);
     }
 
     let final_claims = tabs.final_claims_tower();
@@ -1007,7 +1008,7 @@ pub fn verify_owner_auth_unified<T: FiatShamir<Block128>>(
         return None;
     }
     for p in &proof.round_polys {
-        if p.degree() > OWNER_AUTH_STATE_ROUND_DEGREE {
+        if p.degree() != OWNER_AUTH_STATE_ROUND_DEGREE {
             return None;
         }
     }
@@ -1016,12 +1017,11 @@ pub fn verify_owner_auth_unified<T: FiatShamir<Block128>>(
 
     let mut expected = Block128::ZERO;
     let mut r_prime = vec![Block128::ZERO; layout.num_vars];
-    for (round, poly) in proof.round_polys.iter().enumerate() {
-        let s = poly.evaluate(Block128::ZERO) + poly.evaluate(Block128::ONE);
-        if s != expected {
-            return None;
-        }
-        for &c in &poly.coeffs {
+    for (round, wire) in proof.round_polys.iter().enumerate() {
+        // Linear coefficient reconstructed from the running claim — the
+        // per-round sum check holds by construction.
+        let poly = wire.reconstruct(expected);
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
@@ -1497,7 +1497,7 @@ impl OwnerAuthProofKillShot {
             .main
             .round_polys
             .iter()
-            .map(|p| p.coeffs.len() * 16)
+            .map(|p| p.coeffs_no_linear.len() * 16)
             .sum();
         let shift_polys: usize = self
             .kill_shot
@@ -2069,6 +2069,48 @@ mod tests {
         let (mut proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
         proof.kill_shot.main.state_at_r += Block128::ONE;
 
+        let mut ch_v = owner_auth_gkr_channel();
+        assert!(
+            verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut ch_v).is_none()
+        );
+    }
+
+    #[test]
+    fn owner_auth_rejects_tampered_or_off_shape_round_polys() {
+        let secrets = [secret(71), secret(72)];
+        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
+        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let circuit = OwnerAuthCircuit::build(inputs.layout);
+        let prove = || {
+            let mut ch = owner_auth_gkr_channel();
+            prove_owner_auth_killshot(&circuit, &inputs, &mut ch).0
+        };
+
+        // Compressed rounds have no per-round sum check; a flipped
+        // coefficient must still die at the final constraint check.
+        for (poly_idx, coeff_idx) in [(0usize, 0usize), (2, 7)] {
+            let mut proof = prove();
+            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] +=
+                Block128::ONE;
+            let mut ch_v = owner_auth_gkr_channel();
+            assert!(
+                verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut ch_v)
+                    .is_none()
+            );
+        }
+
+        // Wire length is an exact shape check in both directions.
+        let mut proof = prove();
+        proof.kill_shot.main.round_polys[1].coeffs_no_linear.pop();
+        let mut ch_v = owner_auth_gkr_channel();
+        assert!(
+            verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut ch_v).is_none()
+        );
+
+        let mut proof = prove();
+        proof.kill_shot.main.round_polys[1]
+            .coeffs_no_linear
+            .push(Block128::ZERO);
         let mut ch_v = owner_auth_gkr_channel();
         assert!(
             verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut ch_v).is_none()

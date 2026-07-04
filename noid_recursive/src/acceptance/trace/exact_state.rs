@@ -928,13 +928,13 @@ mod tests {
             Box::new(|p| p.state_paths.chain.rounds[0].evals_at_1_2[1] += Block128::ONE),
             Box::new(|p| {
                 let g = p.guard_buckets.as_mut().unwrap();
-                g.kill_shot.main.round_polys[0].coeffs[3] += Block128::ONE;
+                g.kill_shot.main.round_polys[0].coeffs_no_linear[3] += Block128::ONE;
             }),
             Box::new(|p| {
                 let g = p.guard_paths.as_mut().unwrap();
                 g.batch.b_finals[2] += Block128::ONE;
             }),
-            Box::new(|p| p.state_roots.kill_shot.shift.round_polys[1].coeffs[0] += Block128::ONE),
+            Box::new(|p| p.state_roots.kill_shot.shift.round_polys[1].coeffs_no_linear[0] += Block128::ONE),
             Box::new(|p| p.state_roots.batch.rounds[2].evals_at_1_2[0] += Block128::ONE),
         ];
         for (idx, mutate) in mutations.iter().enumerate() {

@@ -42,6 +42,56 @@ pub struct RoundPolynomial<F> {
     pub coeffs: Vec<F>,
 }
 
+/// Sumcheck round polynomial in transcript form: `[c_0, c_2, …, c_d]`,
+/// with the linear coefficient omitted. In characteristic 2 the round
+/// identity `p(0) + p(1) = claim` reads `Σ_{i≥1} c_i = claim`, so
+/// `c_1 = claim + Σ_{i≥2} c_i` is redundant given the running claim.
+/// The verifier reconstructs it, which makes the per-round sum check
+/// hold by construction and drops one field element per round from
+/// both the transcript and the serialized proof.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompressedRoundPolynomial<F> {
+    /// `[c_0, c_2, …, c_d]` — `d` entries for a degree-`d` polynomial.
+    pub coeffs_no_linear: Vec<F>,
+}
+
+impl<F: TowerField> CompressedRoundPolynomial<F> {
+    /// Drop the linear coefficient from a full round polynomial. Only
+    /// use on polynomials that satisfy the round identity against the
+    /// claim the verifier will reconstruct with — every honest sumcheck
+    /// round does.
+    pub fn compress(poly: &RoundPolynomial<F>) -> Self {
+        assert!(
+            poly.coeffs.len() >= 2,
+            "round polynomial must be at least linear"
+        );
+        let mut coeffs_no_linear = Vec::with_capacity(poly.coeffs.len() - 1);
+        coeffs_no_linear.push(poly.coeffs[0]);
+        coeffs_no_linear.extend_from_slice(&poly.coeffs[2..]);
+        Self { coeffs_no_linear }
+    }
+
+    /// Degree of the reconstructed polynomial.
+    pub fn degree(&self) -> usize {
+        self.coeffs_no_linear.len()
+    }
+
+    /// Rebuild the full polynomial from the running sumcheck claim:
+    /// `c_1 = claim + Σ_{i≥2} c_i`.
+    pub fn reconstruct(&self, claim: F) -> RoundPolynomial<F> {
+        assert!(!self.coeffs_no_linear.is_empty(), "empty round polynomial");
+        let mut c1 = claim;
+        for &c in &self.coeffs_no_linear[1..] {
+            c1 += c;
+        }
+        let mut coeffs = Vec::with_capacity(self.coeffs_no_linear.len() + 1);
+        coeffs.push(self.coeffs_no_linear[0]);
+        coeffs.push(c1);
+        coeffs.extend_from_slice(&self.coeffs_no_linear[1..]);
+        RoundPolynomial { coeffs }
+    }
+}
+
 impl<F: TowerField> RoundPolynomial<F> {
     pub fn from_coeffs(coeffs: Vec<F>) -> Self {
         Self { coeffs }
@@ -379,6 +429,38 @@ mod tests {
             assert_eq!(s.coeffs, p.coeffs);
         }
         assert_eq!(scalar_ch, packed_ch);
+    }
+
+    #[test]
+    fn test_compressed_round_poly_roundtrip() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for degree in 1..=10usize {
+            let coeffs: Vec<F> = (0..=degree).map(|_| F::from(rng.gen::<u128>())).collect();
+            let poly = RoundPolynomial::from_coeffs(coeffs);
+            // The claim the verifier reconstructs against is p(0) + p(1).
+            let claim = poly.evaluate(F::ZERO) + poly.evaluate(F::ONE);
+            let wire = CompressedRoundPolynomial::compress(&poly);
+            assert_eq!(wire.degree(), degree);
+            assert_eq!(wire.coeffs_no_linear.len(), degree);
+            let rebuilt = wire.reconstruct(claim);
+            assert_eq!(rebuilt, poly);
+        }
+    }
+
+    #[test]
+    fn test_compressed_round_poly_wrong_claim_changes_linear_term() {
+        let poly = RoundPolynomial::from_coeffs(vec![F::from(3u8), F::from(7u8), F::from(9u8)]);
+        let claim = poly.evaluate(F::ZERO) + poly.evaluate(F::ONE);
+        let wire = CompressedRoundPolynomial::compress(&poly);
+        let bad = wire.reconstruct(claim + F::ONE);
+        assert_ne!(bad, poly);
+        assert_eq!(bad.coeffs[1], poly.coeffs[1] + F::ONE);
+        // Reconstruction pins the round identity by construction.
+        assert_eq!(
+            bad.evaluate(F::ZERO) + bad.evaluate(F::ONE),
+            claim + F::ONE
+        );
     }
 
     #[test]

@@ -156,8 +156,11 @@ pub struct SweepBlockSpineProof {
 
 impl SweepBlockSpineProof {
     pub fn byte_len(&self) -> usize {
-        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
-        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_polys =
+            self.kill_shot.main.round_polys.len() * crate::block_spine::BLOCK_SPINE_ROUND_DEGREE * 16;
+        let shift_polys = self.kill_shot.shift.round_polys.len()
+            * crate::block_spine::BLOCK_SPINE_SHIFT_DEGREE
+            * 16;
         let main_finals = 12 * 16;
         let shift_finals = 3 * 16;
         main_polys

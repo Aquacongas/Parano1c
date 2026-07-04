@@ -144,7 +144,7 @@ impl OwnerAuthProofTrace {
             main_round_polys: main
                 .round_polys
                 .iter()
-                .map(|p| RoundPolyTrace::alloc(b, p, OWNER_AUTH_STATE_ROUND_DEGREE + 1))
+                .map(|p| RoundPolyTrace::alloc(b, p, OWNER_AUTH_STATE_ROUND_DEGREE))
                 .collect(),
             main_state_at_r: alloc_block(b, main.state_at_r),
             main_state_lane_dec_at_r: std::array::from_fn(|i| {
@@ -355,10 +355,11 @@ fn verify_owner_auth_unified_trace(
     let mut expected = LinExpr::zero();
     let mut r_prime: Vec<Option<LinExpr>> = vec![None; layout.num_vars];
     for (round, poly) in proof.main_round_polys.iter().enumerate() {
-        pin_zero(b, &poly.sum_at_0_plus_1().add(&expected));
+        // The linear coefficient comes from the running claim, so the
+        // per-round sum check holds by construction (no pin).
         poly.absorb_coeffs(b, ch);
         let challenge = ch.squeeze(b);
-        expected = poly.evaluate(b, &challenge);
+        expected = poly.evaluate_reconstructed(b, &expected, &challenge);
         r_prime[layout.num_vars - 1 - round] = Some(challenge);
     }
     let r_prime: Vec<LinExpr> = r_prime.into_iter().map(Option::unwrap).collect();
@@ -804,7 +805,7 @@ mod tests {
 
     fn visit_gkr_proof_fields(p: &mut OwnerAuthProofKillShot, f: &mut dyn FnMut(&mut Block128)) {
         for rp in &mut p.kill_shot.main.round_polys {
-            for c in &mut rp.coeffs {
+            for c in &mut rp.coeffs_no_linear {
                 f(c);
             }
         }

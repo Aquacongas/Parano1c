@@ -68,7 +68,7 @@ impl BlockSpineUnifiedProofTrace {
             round_polys: native
                 .round_polys
                 .iter()
-                .map(|p| RoundPolyTrace::alloc(b, p, BLOCK_SPINE_ROUND_DEGREE + 1))
+                .map(|p| RoundPolyTrace::alloc(b, p, BLOCK_SPINE_ROUND_DEGREE))
                 .collect(),
             s_in_dec_at_r: alloc_block(b, native.s_in_dec_at_r),
             s_out_dec_at_r: alloc_block(b, native.s_out_dec_at_r),
@@ -119,7 +119,7 @@ impl BlockSpineShiftProofTrace {
             round_polys: native
                 .round_polys
                 .iter()
-                .map(|p| RoundPolyTrace::alloc(b, p, BLOCK_SPINE_SHIFT_DEGREE + 1))
+                .map(|p| RoundPolyTrace::alloc(b, p, BLOCK_SPINE_SHIFT_DEGREE))
                 .collect(),
             s_in_at_r2: alloc_block(b, native.s_in_at_r2),
             s_out_at_r2: alloc_block(b, native.s_out_at_r2),
@@ -272,10 +272,11 @@ pub fn verify_block_spine_unified_trace(
     let mut r_prime: Vec<Option<LinExpr>> = vec![None; num_vars];
 
     for (round, poly) in proof.round_polys.iter().enumerate() {
-        pin_zero(b, &poly.sum_at_0_plus_1().add(&expected));
+        // The linear coefficient comes from the running claim, so the
+        // per-round sum check holds by construction (no pin).
         poly.absorb_coeffs(b, ch);
         let challenge = ch.squeeze(b);
-        expected = poly.evaluate(b, &challenge);
+        expected = poly.evaluate_reconstructed(b, &expected, &challenge);
         r_prime[num_vars - 1 - round] = Some(challenge);
     }
     let r_prime: Vec<LinExpr> = r_prime.into_iter().map(Option::unwrap).collect();
@@ -449,10 +450,11 @@ pub fn verify_block_spine_shift_trace(
     let mut r_double_prime: Vec<Option<LinExpr>> = vec![None; num_vars];
 
     for (round, poly) in proof.round_polys.iter().enumerate() {
-        pin_zero(b, &poly.sum_at_0_plus_1().add(&expected));
+        // Same reconstruction as the unified loop — sum check by
+        // construction.
         poly.absorb_coeffs(b, ch);
         let challenge = ch.squeeze(b);
-        expected = poly.evaluate(b, &challenge);
+        expected = poly.evaluate_reconstructed(b, &expected, &challenge);
         r_double_prime[num_vars - 1 - round] = Some(challenge);
     }
     let r_double_prime: Vec<LinExpr> = r_double_prime.into_iter().map(Option::unwrap).collect();

@@ -246,48 +246,58 @@ pub fn pin_lt_strict(b: &mut FieldR1csBuilder, a_bits: &[Wire], b_bits: &[Wire])
     pin_zero(b, &acc_lt.add_const(F128::ONE));
 }
 
-/// A univariate round polynomial in coefficient form, allocated from a native
-/// `RoundPolynomial<Block128>` (`noid_core::sumcheck`). The coefficient count
-/// is part of the trace shape: native's `degree() > BOUND → reject` becomes
-/// an alloc-time assertion (an off-shape proof is unrepresentable).
+/// A univariate round polynomial in transcript form, allocated from a native
+/// `CompressedRoundPolynomial<Block128>` (`noid_core::sumcheck`): the linear
+/// coefficient is omitted on the wire and reconstructed from the running
+/// sumcheck claim. The coefficient count is part of the trace shape:
+/// native's degree check becomes an alloc-time assertion (an off-shape
+/// proof is unrepresentable).
 pub struct RoundPolyTrace {
-    pub coeffs: Vec<LinExpr>,
+    /// Wire coefficients `[c_0, c_2, …, c_d]`.
+    pub coeffs_no_linear: Vec<LinExpr>,
 }
 
 impl RoundPolyTrace {
     pub fn alloc(
         b: &mut FieldR1csBuilder,
-        native: &noid_core::sumcheck::prove::RoundPolynomial<Block128>,
-        expected_coeffs: usize,
+        native: &noid_core::sumcheck::CompressedRoundPolynomial<Block128>,
+        expected_degree: usize,
     ) -> Self {
         assert_eq!(
-            native.coeffs.len(),
-            expected_coeffs,
+            native.coeffs_no_linear.len(),
+            expected_degree,
             "round polynomial off the frozen trace shape"
         );
         Self {
-            coeffs: alloc_blocks(b, &native.coeffs),
+            coeffs_no_linear: alloc_blocks(b, &native.coeffs_no_linear),
         }
     }
 
-    /// `p(0) + p(1)` — in char 2 this is `Σ_{i≥1} coeffs[i]`, linear (free).
-    pub fn sum_at_0_plus_1(&self) -> LinExpr {
-        let mut acc = LinExpr::zero();
-        for c in self.coeffs.iter().skip(1) {
-            acc = acc.add(c);
+    /// Trace twin of `CompressedRoundPolynomial::reconstruct` followed by
+    /// `RoundPolynomial::evaluate`: `c_1 = claim + Σ_{i≥2} c_i` is affine
+    /// (free), so the round identity `p(0) + p(1) = claim` holds by
+    /// construction; Horner still spends `degree` multiplications.
+    pub fn evaluate_reconstructed(
+        &self,
+        b: &mut FieldR1csBuilder,
+        claim: &LinExpr,
+        x: &LinExpr,
+    ) -> LinExpr {
+        let mut c1 = claim.clone();
+        for c in &self.coeffs_no_linear[1..] {
+            c1 = c1.add(c);
         }
-        acc
+        let mut coeffs = Vec::with_capacity(self.coeffs_no_linear.len() + 1);
+        coeffs.push(self.coeffs_no_linear[0].clone());
+        coeffs.push(c1);
+        coeffs.extend_from_slice(&self.coeffs_no_linear[1..]);
+        b.horner_eval(&coeffs, x)
     }
 
-    /// Horner evaluation at an expression point — the trace twin of
-    /// `RoundPolynomial::evaluate` (`degree` multiplications).
-    pub fn evaluate(&self, b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
-        b.horner_eval(&self.coeffs, x)
-    }
-
-    /// Absorb the coefficients in native order (`for &c in &poly.coeffs`).
+    /// Absorb the wire coefficients in native order
+    /// (`for &c in &wire.coeffs_no_linear`).
     pub fn absorb_coeffs(&self, b: &mut FieldR1csBuilder, ch: &mut RawChannelTrace) {
-        for c in &self.coeffs {
+        for c in &self.coeffs_no_linear {
             ch.absorb(b, c);
         }
     }

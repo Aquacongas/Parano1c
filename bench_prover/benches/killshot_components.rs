@@ -102,20 +102,20 @@ fn owner_auth_size_breakdown(proof: &OwnerAuthProofKillShot) -> (usize, usize, u
         .main
         .round_polys
         .iter()
-        .map(|p| p.coeffs.len() * 16)
+        .map(|p| p.coeffs_no_linear.len() * 16)
         .sum();
     let shift_polys: usize = proof
         .kill_shot
         .shift
         .round_polys
         .iter()
-        .map(|p| p.evals.len() * 16)
+        .map(|p| p.evals_at_1_2.len() * 16)
         .sum();
     let boundary_polys: usize = proof
         .boundary
         .round_polys
         .iter()
-        .map(|p| p.evals.len() * 16)
+        .map(|p| p.evals_at_1_2.len() * 16)
         .sum();
     let frost = main_polys + shift_polys + boundary_polys + (1 + STATE_SIZE) * 16 + 16 + 16;
     (

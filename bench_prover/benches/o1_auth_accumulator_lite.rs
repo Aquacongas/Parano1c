@@ -358,8 +358,8 @@ fn absorb_public_fields<S: FieldSink>(sink: &mut S, index: usize, public: &Owner
 fn absorb_gkr_proof_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKillShot) {
     sink.absorb_usize(proof.kill_shot.main.round_polys.len());
     for poly in &proof.kill_shot.main.round_polys {
-        sink.absorb_usize(poly.coeffs.len());
-        for &coeff in &poly.coeffs {
+        sink.absorb_usize(poly.coeffs_no_linear.len());
+        for &coeff in &poly.coeffs_no_linear {
             sink.absorb(coeff);
         }
     }
@@ -370,7 +370,7 @@ fn absorb_gkr_proof_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKil
 
     sink.absorb_usize(proof.kill_shot.shift.round_polys.len());
     for round in &proof.kill_shot.shift.round_polys {
-        for &eval in &round.evals {
+        for &eval in &round.evals_at_1_2 {
             sink.absorb(eval);
         }
     }
@@ -378,7 +378,7 @@ fn absorb_gkr_proof_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKil
 
     sink.absorb_usize(proof.boundary.round_polys.len());
     for round in &proof.boundary.round_polys {
-        for &eval in &round.evals {
+        for &eval in &round.evals_at_1_2 {
             sink.absorb(eval);
         }
     }
@@ -386,7 +386,7 @@ fn absorb_gkr_proof_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKil
 
     sink.absorb_usize(proof.batch.rounds.len());
     for round in &proof.batch.rounds {
-        for &eval in &round.evals {
+        for &eval in &round.evals_at_1_2 {
             sink.absorb(eval);
         }
     }

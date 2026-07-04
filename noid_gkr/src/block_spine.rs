@@ -47,7 +47,7 @@ use crate::layers::{
 };
 use crate::spine_mle::{sigma_at, N_SPINE_ELEM_VARS, N_SPINE_ROUND_VARS};
 use crate::spine_sumcheck::N_SPINE_SLOTS;
-use noid_core::sumcheck::RoundPolynomial;
+use noid_core::sumcheck::{CompressedRoundPolynomial, RoundPolynomial};
 use std::time::{Duration, Instant};
 
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
@@ -651,7 +651,7 @@ fn project_lane_dec_flat_dyn(src: &[Block128], lane: usize) -> Vec<u128> {
 /// Output of the block-level unified spine sumcheck.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineUnifiedProof {
-    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub round_polys: Vec<CompressedRoundPolynomial<Block128>>,
     pub s_in_dec_at_r: Block128,
     pub s_out_dec_at_r: Block128,
     pub state_dec_at_r: Block128,
@@ -1166,7 +1166,8 @@ pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
         }
 
         let t0 = profiler.enabled().then(Instant::now);
-        for &c in &poly.coeffs {
+        let wire = CompressedRoundPolynomial::compress(&poly);
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
@@ -1182,7 +1183,7 @@ pub fn prove_block_spine_unified<T: FiatShamir<Block128>>(
         }
 
         r_prime[num_vars - 1 - round] = challenge;
-        round_polys.push(poly);
+        round_polys.push(wire);
     }
     profiler.record("round_polynomials_total", round_poly_total);
     profiler.record("round_transcript_total", transcript_total);
@@ -1228,7 +1229,7 @@ pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
         return None;
     }
     for p in &proof.round_polys {
-        if p.degree() > BLOCK_SPINE_ROUND_DEGREE {
+        if p.degree() != BLOCK_SPINE_ROUND_DEGREE {
             return None;
         }
     }
@@ -1240,12 +1241,12 @@ pub fn verify_block_spine_unified<T: FiatShamir<Block128>>(
     let mut expected = Block128::ZERO;
     let mut r_prime = vec![Block128::ZERO; num_vars];
 
-    for (round, poly) in proof.round_polys.iter().enumerate() {
-        let s = poly.evaluate(Block128::ZERO) + poly.evaluate(Block128::ONE);
-        if s != expected {
-            return None;
-        }
-        for &c in &poly.coeffs {
+    for (round, wire) in proof.round_polys.iter().enumerate() {
+        // The reconstruction seeds the linear coefficient from the
+        // running claim, so `p(0) + p(1) = expected` holds by
+        // construction — no explicit sum check.
+        let poly = wire.reconstruct(expected);
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
@@ -1310,7 +1311,7 @@ pub const BLOCK_SPINE_SHIFT_DEGREE: usize = 2;
 /// Shift proof for the block spine.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockSpineShiftProof {
-    pub round_polys: Vec<RoundPolynomial<Block128>>,
+    pub round_polys: Vec<CompressedRoundPolynomial<Block128>>,
     pub s_in_at_r2: Block128,
     pub s_out_at_r2: Block128,
     pub state_at_r2: Block128,
@@ -1599,9 +1600,9 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
             .iter()
             .map(|&c| Block128::from(flat_to_tower_u128(c)))
             .collect();
-        let poly = RoundPolynomial::from_coeffs(coeffs_tower);
+        let wire = CompressedRoundPolynomial::compress(&RoundPolynomial::from_coeffs(coeffs_tower));
         let t0 = profiler.enabled().then(Instant::now);
-        for &c in &poly.coeffs {
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
@@ -1621,7 +1622,7 @@ pub fn prove_block_spine_shift<T: FiatShamir<Block128>>(
             fold_total += t0.elapsed();
         }
         r_double_prime[num_vars - 1 - round] = challenge;
-        round_polys.push(poly);
+        round_polys.push(wire);
     }
     profiler.record("round_polynomials_total", round_poly_total);
     profiler.record("round_transcript_total", transcript_total);
@@ -1660,7 +1661,7 @@ pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
         return None;
     }
     for p in &proof.round_polys {
-        if p.degree() > BLOCK_SPINE_SHIFT_DEGREE {
+        if p.degree() != BLOCK_SPINE_SHIFT_DEGREE {
             return None;
         }
     }
@@ -1671,12 +1672,11 @@ pub fn verify_block_spine_shift<T: FiatShamir<Block128>>(
     let mut expected = expected_target;
     let mut r_double_prime = vec![Block128::ZERO; num_vars];
 
-    for (round, poly) in proof.round_polys.iter().enumerate() {
-        let s = poly.evaluate(Block128::ZERO) + poly.evaluate(Block128::ONE);
-        if s != expected {
-            return None;
-        }
-        for &c in &poly.coeffs {
+    for (round, wire) in proof.round_polys.iter().enumerate() {
+        // Linear coefficient reconstructed from the running claim — the
+        // per-round sum check holds by construction.
+        let poly = wire.reconstruct(expected);
+        for &c in &wire.coeffs_no_linear {
             channel.absorb(c);
         }
         let challenge = channel.squeeze();
@@ -1720,8 +1720,8 @@ pub struct BlockSpineProof {
 
 impl BlockSpineProof {
     pub fn byte_len(&self) -> usize {
-        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
-        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_polys = self.kill_shot.main.round_polys.len() * BLOCK_SPINE_ROUND_DEGREE * 16;
+        let shift_polys = self.kill_shot.shift.round_polys.len() * BLOCK_SPINE_SHIFT_DEGREE * 16;
         let main_finals = 12 * 16;
         let shift_finals = 3 * 16;
         main_polys
@@ -2234,5 +2234,59 @@ mod tests {
 
         let mut ch_v = Poseidon2bChannel::new();
         assert!(verify_block_spine_killshot(&proof, 2, &tx_body_hashes, &mut ch_v).is_none());
+    }
+
+    fn one_tx_proof() -> (BlockSpineProof, Vec<[Block128; 2]>) {
+        let circuit = SpineCircuit::build();
+        let inputs = fixture_inputs(7);
+        let inputs_list = vec![inputs];
+        let all_state_ins = collect_slot_state_ins(&circuit, &inputs_list);
+        let states = reconstruct_slot_states(&circuit, &inputs_list[0]);
+        let wrap = states.last().unwrap();
+        let tx_body_hashes = vec![[wrap.1[0], wrap.1[1]]];
+        let mle = BlockSpineMle::build(1, &all_state_ins);
+        let mut ch_p = Poseidon2bChannel::new();
+        let (proof, _) = prove_block_spine_killshot(1, &mle, &tx_body_hashes, &mut ch_p);
+        (proof, tx_body_hashes)
+    }
+
+    #[test]
+    fn block_spine_rejects_tampered_round_coefficients() {
+        // Compressed rounds have no per-round sum check; rejection must
+        // come from the final constraint / claim chain instead. Flip the
+        // constant term and one high-degree term separately.
+        for (poly_idx, coeff_idx) in [(0usize, 0usize), (3, 5)] {
+            let (mut proof, hashes) = one_tx_proof();
+            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] +=
+                Block128::ONE;
+            let mut ch_v = Poseidon2bChannel::new();
+            assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
+        }
+        let (mut proof, hashes) = one_tx_proof();
+        proof.kill_shot.shift.round_polys[2].coeffs_no_linear[1] += Block128::ONE;
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
+    }
+
+    #[test]
+    fn block_spine_rejects_off_shape_round_polys() {
+        // Wire length is an exact shape check: shorter AND longer rounds
+        // must both be rejected before any transcript interaction.
+        let (mut proof, hashes) = one_tx_proof();
+        proof.kill_shot.main.round_polys[1].coeffs_no_linear.pop();
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
+
+        let (mut proof, hashes) = one_tx_proof();
+        proof.kill_shot.main.round_polys[1]
+            .coeffs_no_linear
+            .push(Block128::ZERO);
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
+
+        let (mut proof, hashes) = one_tx_proof();
+        proof.kill_shot.shift.round_polys[0].coeffs_no_linear.pop();
+        let mut ch_v = Poseidon2bChannel::new();
+        assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
     }
 }

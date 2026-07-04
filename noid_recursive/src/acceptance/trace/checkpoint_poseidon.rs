@@ -916,7 +916,7 @@ mod tests {
         ];
         for ks in spines {
             for rp in &mut ks.main.round_polys {
-                for c in &mut rp.coeffs {
+                for c in &mut rp.coeffs_no_linear {
                     f(c);
                 }
             }
@@ -931,7 +931,7 @@ mod tests {
                 f(v);
             }
             for rp in &mut ks.shift.round_polys {
-                for c in &mut rp.coeffs {
+                for c in &mut rp.coeffs_no_linear {
                     f(c);
                 }
             }
