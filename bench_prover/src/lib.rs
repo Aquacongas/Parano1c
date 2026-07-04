@@ -114,6 +114,41 @@ pub fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
+/// A builder-produced Poseidon2b chain circuit of `chain` permutations —
+/// the representative FieldR1cs instance shape: real verifier-replay traces
+/// are builder-produced single-block (`m = k_log`) circuits dominated by
+/// Poseidon2b permutation gadgets, with the same coefficient density
+/// (~20 nnz/row across A+B) and strong wire locality. Synthetic multi-block
+/// instances understate both, so throughput gates must run on this shape.
+pub fn poseidon_chain_field_instance(
+    chain: usize,
+) -> (
+    noid_ivc_prover::field_r1cs::FieldR1cs,
+    Vec<noid_ivc_prover::field::F128>,
+) {
+    use noid_ivc_prover::field_circuit::{LinExpr, flat_const, poseidon2b_permute};
+    use noid_poseidon2b::native::permutation::{Poseidon2bPermutation, STATE_SIZE};
+    use noid_recursive::acceptance::trace::FieldR1csBuilder;
+
+    let seed: [Block128; STATE_SIZE] =
+        std::array::from_fn(|i| Block128(0x1234_5678_9abc_def0 + i as u128));
+    let mut expected = seed;
+    for _ in 0..chain {
+        Poseidon2bPermutation.permute_mut(&mut expected);
+    }
+    let mut b = FieldR1csBuilder::new();
+    let mut state: [LinExpr; STATE_SIZE] =
+        std::array::from_fn(|i| LinExpr::from_wire(b.alloc_f128(flat_const(seed[i].0))));
+    for _ in 0..chain {
+        state = poseidon2b_permute(&mut b, state);
+    }
+    for lane in state.iter() {
+        let v = lane.eval(b.values());
+        b.pin_f128(lane, v);
+    }
+    b.build()
+}
+
 pub fn median(mut xs: Vec<Duration>) -> Duration {
     xs.sort();
     xs[xs.len() / 2]

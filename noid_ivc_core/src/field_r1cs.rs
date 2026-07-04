@@ -160,25 +160,63 @@ impl FieldR1cs {
 
     /// Poseidon2b hash of the instance (parameters + coefficient matrices).
     /// Binds the Fiat-Shamir transcript to the statement being proved.
+    ///
+    /// Two-level chunked construction: matrix rows are serialized in fixed
+    /// [`DIGEST_SPAN_ROWS`]-row spans, each span hashed independently (in
+    /// parallel — a big instance serializes to hundreds of MB, which a single
+    /// sequential sponge would take tens of seconds to absorb, and this way
+    /// the full serialization is never materialized at once), and the top
+    /// hash absorbs the header fields plus the span digests in order. The
+    /// encoding stays injective: the header fixes both matrices' row counts
+    /// (hence the span count), every row is length-prefixed inside its span,
+    /// and span digests are fixed-width.
+    ///
+    /// For production verifier-trace shapes the matrix is a protocol
+    /// constant, so this value is a per-shape-class constant: compute it
+    /// once and install it on fresh instances with
+    /// [`Self::seed_statement_digest`] instead of re-hashing per instance.
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut bytes = Vec::new();
-            push_u64(&mut bytes, self.m as u64);
-            push_u64(&mut bytes, self.k_log as u64);
-            push_u64(&mut bytes, self.k_skip as u64);
-            push_u64(&mut bytes, self.useful_rows as u64);
+            let mut top = Vec::new();
+            push_u64(&mut top, self.m as u64);
+            push_u64(&mut top, self.k_log as u64);
+            push_u64(&mut top, self.k_skip as u64);
+            push_u64(&mut top, self.useful_rows as u64);
             // Encode the pin unambiguously: 0 = None, 1 + col = Some(col).
             push_u64(
-                &mut bytes,
+                &mut top,
                 self.const_pin.map(|c| 1 + c as u64).unwrap_or(0),
             );
-            absorb_field_matrix(&mut bytes, &self.a_0);
-            absorb_field_matrix(&mut bytes, &self.b_0);
+            for m_0 in [&self.a_0, &self.b_0] {
+                push_u64(&mut top, m_0.num_rows as u64);
+                push_u64(&mut top, m_0.num_cols as u64);
+                for digest in matrix_span_digests(m_0) {
+                    top.extend_from_slice(&digest);
+                }
+            }
             noid_poseidon2b::native::poseidon2b_hash_byte_slices(
                 b"NOID/IVC/FIELD-R1CS-STMT",
-                &[&bytes],
+                &[&top],
             )
         })
+    }
+
+    /// Install a precomputed statement digest — the per-shape-class protocol
+    /// constant — skipping the content hash entirely.
+    ///
+    /// Safe against abuse by construction: verifiers bind the Fiat-Shamir
+    /// transcript to *their* digest value, so seeding a digest that does not
+    /// match the instance's true content hash cannot forge anything — it
+    /// only produces proofs (or verdicts) that disagree with every honest
+    /// party. Panics if a different digest is already cached.
+    pub fn seed_statement_digest(&self, digest: [u8; 32]) {
+        if self.digest_cache.set(digest).is_err() {
+            assert_eq!(
+                *self.digest_cache.get().expect("cache is set"),
+                digest,
+                "seed_statement_digest: a different digest is already cached"
+            );
+        }
     }
 
     /// CSC-transposed `LincheckCircuit` over `(a_0, b_0)` with F128
@@ -190,18 +228,35 @@ impl FieldR1cs {
     }
 }
 
-/// Length-prefixed absorption of a coefficient matrix into statement bytes.
-fn absorb_field_matrix(out: &mut Vec<u8>, m: &SparseFieldMatrix) {
-    push_u64(out, m.num_rows as u64);
-    push_u64(out, m.num_cols as u64);
-    for row in &m.rows {
-        push_u64(out, row.len() as u64);
-        for &(col, coeff) in row {
-            push_u64(out, col as u64);
-            push_u64(out, coeff.lo);
-            push_u64(out, coeff.hi);
-        }
-    }
+/// Rows per statement-digest span. Small enough that per-span buffers stay
+/// cache-friendly (a ~20-nnz/row span is ~1 MB), large enough that span
+/// digests are negligible against the span payloads.
+const DIGEST_SPAN_ROWS: usize = 2048;
+
+/// Independent Poseidon2b digests of a coefficient matrix's rows in
+/// [`DIGEST_SPAN_ROWS`]-row spans (parallel), each span serialized as
+/// length-prefixed rows of `(column, coeff.lo, coeff.hi)` u64 triples.
+fn matrix_span_digests(m: &SparseFieldMatrix) -> Vec<[u8; 32]> {
+    use rayon::prelude::*;
+    m.rows
+        .par_chunks(DIGEST_SPAN_ROWS)
+        .map(|span| {
+            let payload: usize = span.iter().map(|row| 8 + 24 * row.len()).sum();
+            let mut bytes = Vec::with_capacity(payload);
+            for row in span {
+                push_u64(&mut bytes, row.len() as u64);
+                for &(col, coeff) in row {
+                    push_u64(&mut bytes, col as u64);
+                    push_u64(&mut bytes, coeff.lo);
+                    push_u64(&mut bytes, coeff.hi);
+                }
+            }
+            noid_poseidon2b::native::poseidon2b_hash_byte_slices(
+                b"NOID/IVC/FIELD-R1CS-SPAN",
+                &[&bytes],
+            )
+        })
+        .collect()
 }
 
 #[inline]
@@ -587,6 +642,56 @@ mod tests {
         // Same content → same digest (cache-independent).
         let r1cs_d = r1cs_a.clone();
         assert_eq!(r1cs_a.statement_digest(), r1cs_d.statement_digest());
+    }
+
+    /// The chunked digest is sensitive to content in EVERY span, not just the
+    /// first: k = 2^12 rows = two spans of `DIGEST_SPAN_ROWS`.
+    #[test]
+    fn statement_digest_covers_all_spans() {
+        let (r1cs, _) = random_satisfiable(12, 12, 5);
+        assert!(r1cs.k() > DIGEST_SPAN_ROWS, "instance must span ≥2 chunks");
+        let base = r1cs.statement_digest();
+
+        for &row in &[1usize, DIGEST_SPAN_ROWS - 1, DIGEST_SPAN_ROWS, r1cs.k() - 1] {
+            let mut mutated = r1cs.clone();
+            let entry = mutated.b_0.rows[row]
+                .first_mut()
+                .expect("synthetic rows are nonempty");
+            entry.1 += F128::ONE;
+            assert_ne!(
+                base,
+                mutated.statement_digest(),
+                "coefficient change in row {row} must flip the digest"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_statement_digest_installs_constant() {
+        let (r1cs, _) = random_satisfiable(8, 4, 21);
+        let true_digest = r1cs.statement_digest();
+
+        // Seeding a fresh instance short-circuits the content hash.
+        let fresh = r1cs.clone();
+        fresh.seed_statement_digest(true_digest);
+        assert_eq!(fresh.statement_digest(), true_digest);
+
+        // Seeding the already-computed digest again is a no-op.
+        fresh.seed_statement_digest(true_digest);
+
+        // A seeded digest wins even if it is not the content hash — the
+        // documented trust model: honest verifiers bind their own value.
+        let mislabeled = r1cs.clone();
+        mislabeled.seed_statement_digest([0xAB; 32]);
+        assert_eq!(mislabeled.statement_digest(), [0xAB; 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "different digest is already cached")]
+    fn seed_statement_digest_rejects_conflict() {
+        let (r1cs, _) = random_satisfiable(8, 4, 22);
+        let _ = r1cs.statement_digest();
+        r1cs.seed_statement_digest([0xCD; 32]);
     }
 
     #[test]

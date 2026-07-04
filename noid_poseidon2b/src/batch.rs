@@ -670,6 +670,114 @@ pub fn compress_flat_ff_batch_interleaved_with_tag_into(
     }
 }
 
+/// Batched flat-basis leaf-sponge hash of equal-length leaves stored
+/// contiguously in `data` (`data.len() = leaf_size · out.len()`). Matches
+/// `Poseidon2bFlatSponge::with_tag(tag)` + `update(leaf)` + `finalize()`
+/// exactly, running `PACKED_LANES` leaf sponges in lockstep — the absorb
+/// schedule is identical across leaves because all leaves share one length.
+pub fn leaf_sponge_flat_batch_with_tag_into(
+    tag: DomainTag,
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [[u8; 32]],
+) {
+    assert!(leaf_size > 0, "leaf_size must be nonzero");
+    assert_eq!(
+        data.len(),
+        leaf_size * out.len(),
+        "data length must be leaf_size × leaf count"
+    );
+
+    let scalar = |i: usize, out: &mut [[u8; 32]]| {
+        let mut sponge = crate::native::Poseidon2bFlatSponge::with_tag(tag);
+        sponge.update(&data[i * leaf_size..(i + 1) * leaf_size]);
+        out[i] = sponge.finalize();
+    };
+
+    let n = out.len();
+    if PACKED_LANES == 1 || n < PACKED_LANES {
+        for i in 0..n {
+            scalar(i, out);
+        }
+        return;
+    }
+
+    let [iv_hi, iv_lo] = crate::native::domain::capacity_iv_flat(tag);
+    let full_blocks = leaf_size / 32;
+    let rem = leaf_size % 32;
+    let chunks = n / PACKED_LANES;
+
+    for chunk in 0..chunks {
+        let off = chunk * PACKED_LANES;
+        let mut states = [
+            PackedBlock128::ZERO,
+            PackedBlock128::ZERO,
+            PackedBlock128::broadcast(Block128::from(iv_hi)),
+            PackedBlock128::broadcast(Block128::from(iv_lo)),
+        ];
+
+        let lane_word = |lane: usize, block_off: usize, word: usize| -> Block128 {
+            let base = (off + lane) * leaf_size + block_off + word * 16;
+            Block128::from(u128::from_le_bytes(
+                data[base..base + 16].try_into().unwrap(),
+            ))
+        };
+
+        for b in 0..full_blocks {
+            let mut w0 = PackedBlock128::ZERO;
+            let mut w1 = PackedBlock128::ZERO;
+            for lane in 0..PACKED_LANES {
+                w0 = w0.set_lane(lane, lane_word(lane, b * 32, 0));
+                w1 = w1.set_lane(lane, lane_word(lane, b * 32, 1));
+            }
+            states[0] = states[0].xor(w0);
+            states[1] = states[1].xor(w1);
+            packed_poseidon2b_permute_flat(&mut states);
+        }
+
+        // Final permutation: the 0x80…01-padded tail block — a pure pad
+        // block when the leaf is block-aligned, else the leftover bytes with
+        // the pad markers OR'd into the zero-filled remainder.
+        if rem == 0 {
+            states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
+            states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
+        } else {
+            let mut w0 = PackedBlock128::ZERO;
+            let mut w1 = PackedBlock128::ZERO;
+            for lane in 0..PACKED_LANES {
+                let mut tail = [0u8; 32];
+                let base = (off + lane) * leaf_size + full_blocks * 32;
+                tail[..rem].copy_from_slice(&data[base..base + rem]);
+                tail[rem] |= 0x80;
+                tail[31] |= 0x01;
+                w0 = w0.set_lane(
+                    lane,
+                    Block128::from(u128::from_le_bytes(tail[..16].try_into().unwrap())),
+                );
+                w1 = w1.set_lane(
+                    lane,
+                    Block128::from(u128::from_le_bytes(tail[16..].try_into().unwrap())),
+                );
+            }
+            states[0] = states[0].xor(w0);
+            states[1] = states[1].xor(w1);
+        }
+        packed_poseidon2b_permute_flat(&mut states);
+
+        for lane in 0..PACKED_LANES {
+            let s0 = states[0].get_lane(lane);
+            let s1 = states[1].get_lane(lane);
+            out[off + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
+            out[off + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
+        }
+    }
+
+    let rem_off = chunks * PACKED_LANES;
+    for i in rem_off..n {
+        scalar(i, out);
+    }
+}
+
 /// Packed S-box x → x^7 entirely in flat basis.
 ///
 /// x^2, x^4 use `flat_square` (CLMUL-free bit spread + reduction); the
@@ -860,5 +968,42 @@ mod tests {
             })
             .collect();
         assert_eq!(got, expected);
+    }
+
+    /// Batched leaf sponge vs the scalar `Poseidon2bFlatSponge` oracle across
+    /// leaf sizes hitting every tail shape: block-aligned, 16-byte-aligned,
+    /// rem ∈ {1, 15, 31} (31 makes both pad markers share one byte), and a
+    /// leaf count exercising packed chunks plus a scalar remainder.
+    #[test]
+    fn test_leaf_sponge_flat_batch_matches_scalar() {
+        use crate::native::{DomainTag, Poseidon2bFlatSponge};
+
+        let mut rng = rand::thread_rng();
+        let tag = DomainTag::new(b"LEAFTST_");
+        for &(n, leaf_size) in &[
+            (257usize, 64usize),
+            (64, 512),
+            (33, 48),
+            (17, 33),
+            (9, 31),
+            (16, 63),
+            (8, 1),
+            (3, 16), // below PACKED_LANES on typical builds → scalar fallback
+        ] {
+            let mut data = vec![0u8; n * leaf_size];
+            rng.fill(&mut data[..]);
+
+            let mut got = vec![[0u8; 32]; n];
+            leaf_sponge_flat_batch_with_tag_into(tag, &data, leaf_size, &mut got);
+
+            let expected: Vec<[u8; 32]> = (0..n)
+                .map(|i| {
+                    let mut sponge = Poseidon2bFlatSponge::with_tag(tag);
+                    sponge.update(&data[i * leaf_size..(i + 1) * leaf_size]);
+                    sponge.finalize()
+                })
+                .collect();
+            assert_eq!(got, expected, "n={n} leaf_size={leaf_size}");
+        }
     }
 }

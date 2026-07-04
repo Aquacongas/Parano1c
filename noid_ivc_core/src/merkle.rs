@@ -24,6 +24,7 @@
 
 use noid_poseidon2b::batch::{
     POSEIDON2B_BATCH_LANES, compress_flat_ff_batch_interleaved_with_tag_into,
+    leaf_sponge_flat_batch_with_tag_into,
 };
 use noid_poseidon2b::native::{
     DomainTag, Poseidon2bFlatSponge, compress_flat_feed_forward_with_tag,
@@ -129,11 +130,37 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     // was just written) and writes itself.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
-    // 1. Leaves.
-    tree[..num_leaves]
-        .par_iter_mut()
-        .zip(data.par_chunks(leaf_size))
-        .for_each(|(out, leaf)| *out = hash_leaf(leaf));
+    // 1. Leaves — the tree's dominant hashing volume (leaf payloads outweigh
+    // the 32-byte inner nodes), so it runs on the lockstep packed sponge:
+    // all leaves share one length, giving an identical absorb schedule.
+    if POSEIDON2B_BATCH_LANES == 1 {
+        tree[..num_leaves]
+            .par_iter_mut()
+            .zip(data.par_chunks(leaf_size))
+            .for_each(|(out, leaf)| *out = hash_leaf(leaf));
+    } else {
+        #[cfg(feature = "hash-count")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            hash_count::LEAF_CALLS.fetch_add(num_leaves as u64, Relaxed);
+            hash_count::LEAF_COMPRESSIONS.fetch_add(
+                num_leaves as u64 * hash_count::leaf_hash_units(leaf_size),
+                Relaxed,
+            );
+        }
+        const LEAF_PAR_CHUNK: usize = 256;
+        tree[..num_leaves]
+            .par_chunks_mut(LEAF_PAR_CHUNK)
+            .zip(data.par_chunks(LEAF_PAR_CHUNK * leaf_size))
+            .for_each(|(out, input)| {
+                leaf_sponge_flat_batch_with_tag_into(
+                    POSEIDON_MERKLE_LEAF_TAG,
+                    input,
+                    leaf_size,
+                    out,
+                );
+            });
+    }
 
     // 2. Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
@@ -450,7 +477,16 @@ mod tests {
     /// remainder fallback.
     #[test]
     fn parallel_matches_sequential_tail_shapes() {
-        for (n_leaves, leaf_size) in [(64, 1024), (64, 100), (64, 60), (64, 56), (2, 48), (16, 1)] {
+        for (n_leaves, leaf_size) in [
+            (64, 1024),
+            (64, 100),
+            (64, 60),
+            (64, 56),
+            (64, 63),
+            (64, 31),
+            (2, 48),
+            (16, 1),
+        ] {
             let mut data = vec![0u8; n_leaves * leaf_size];
             for (i, b) in data.iter_mut().enumerate() {
                 *b = ((i.wrapping_mul(0x6C8E944D)) & 0xff) as u8;

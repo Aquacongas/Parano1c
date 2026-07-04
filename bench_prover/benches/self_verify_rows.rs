@@ -23,10 +23,9 @@
 
 use std::time::Instant;
 
+use bench_prover::poseidon_chain_field_instance;
 use noid_ivc_prover::challenger::FsLaneChallenger;
-use noid_ivc_prover::field_circuit::{
-    flat_const, poseidon2b_permute, FsChannelTrace, LinExpr,
-};
+use noid_ivc_prover::field_circuit::FsChannelTrace;
 use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
 use noid_ivc_prover::field_prover::prove_field;
 use noid_ivc_prover::pcs::{self, PcsParams};
@@ -38,29 +37,6 @@ use noid_recursive::acceptance::trace::self_verify::{
 use noid_recursive::acceptance::trace::FieldR1csBuilder;
 
 const DOMAIN: &[u8] = b"self-verify-rows-bench-v0";
-
-/// A builder-produced Poseidon2b chain circuit of `chain` permutations —
-/// the locality-representative stand-in for a verifier-replay trace.
-fn poseidon_chain_instance(chain: usize) -> (FieldR1cs, Vec<F128>) {
-    use noid_poseidon2b::native::permutation::{Poseidon2bPermutation, STATE_SIZE};
-    let seed: [noid_core::Block128; STATE_SIZE] =
-        std::array::from_fn(|i| noid_core::Block128(0x1234_5678_9abc_def0 + i as u128));
-    let mut expected = seed;
-    for _ in 0..chain {
-        Poseidon2bPermutation.permute_mut(&mut expected);
-    }
-    let mut b = FieldR1csBuilder::new();
-    let mut state: [LinExpr; STATE_SIZE] =
-        std::array::from_fn(|i| LinExpr::from_wire(b.alloc_f128(flat_const(seed[i].0))));
-    for _ in 0..chain {
-        state = poseidon2b_permute(&mut b, state);
-    }
-    for lane in state.iter() {
-        let v = lane.eval(b.values());
-        b.pin_f128(lane, v);
-    }
-    b.build()
-}
 
 fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
     let m = r1cs.m;
@@ -136,7 +112,7 @@ fn main() {
         (1456, 4, 5),
         (1456, 5, 5),
     ] {
-        let (r1cs, z) = poseidon_chain_instance(chain);
+        let (r1cs, z) = poseidon_chain_field_instance(chain);
         measure("poseidon-chain", &r1cs, &z, lir, lb);
     }
 
