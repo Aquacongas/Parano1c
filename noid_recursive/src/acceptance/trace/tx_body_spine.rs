@@ -769,13 +769,13 @@ mod tests {
         f(&mut p.kill_shot.shift.s_out_at_r2);
         f(&mut p.kill_shot.shift.state_at_r2);
         for r in &mut p.tx_hash_pins.rounds {
-            for e in &mut r.evals {
+            for e in &mut r.evals_at_1_2 {
                 f(e);
             }
         }
         f(&mut p.tx_hash_pins.b_final);
         for r in &mut p.batch.rounds {
-            for e in &mut r.evals {
+            for e in &mut r.evals_at_1_2 {
                 f(e);
             }
         }

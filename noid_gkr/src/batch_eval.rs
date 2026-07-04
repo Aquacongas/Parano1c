@@ -63,22 +63,31 @@ fn denom_inv_3() -> &'static [Block128; 3] {
 
 const PAR_THRESHOLD: usize = 64;
 
-/// One round of the degree-2 batch-eval sumcheck, stored as its
-/// evaluations at `X = 0, 1, 2`.
+/// One round of the degree-2 batch-eval sumcheck, stored COMPRESSED as its
+/// evaluations at `X = 1, 2`. The evaluation at 0 is derivable from the
+/// running claim — `p(0) + p(1) = claim` in characteristic 2 — so shipping
+/// or absorbing it bound nothing, and reconstructing it makes the
+/// per-round sum check true by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchEvalRound {
-    pub evals: [Block128; 3],
+    pub evals_at_1_2: [Block128; 2],
 }
 
 impl BatchEvalRound {
+    /// Reconstruct `p(0)` from the running claim: `p(0) = claim + p(1)`.
     #[inline]
-    pub fn sum_at_0_plus_1(&self) -> Block128 {
-        self.evals[0] + self.evals[1]
+    pub fn eval_at_0(&self, claim: Block128) -> Block128 {
+        claim + self.evals_at_1_2[0]
     }
 
-    /// Lagrange-interpolate at `r` from evaluations at `{0,1,2}`.
-    pub fn evaluate(&self, r: Block128) -> Block128 {
-        lagrange_at_0_1_2(&self.evals, r)
+    /// Lagrange-interpolate at `r`, reconstructing `p(0)` from the claim.
+    pub fn evaluate(&self, claim: Block128, r: Block128) -> Block128 {
+        let evals = [
+            self.eval_at_0(claim),
+            self.evals_at_1_2[0],
+            self.evals_at_1_2[1],
+        ];
+        lagrange_at_0_1_2(&evals, r)
     }
 }
 
@@ -121,7 +130,7 @@ impl BatchEvalProof {
     /// Raw field-element byte size: `rounds.len() * 3` degree-2 round
     /// evals plus `b_final`, 16 bytes each.
     pub fn byte_len(&self) -> usize {
-        self.rounds.len() * 3 * 16 + 16
+        self.rounds.len() * 2 * 16 + 16
     }
 }
 
@@ -141,7 +150,7 @@ impl MultiBatchEvalProof {
     /// Raw field-element byte size: `rounds.len() * 3` degree-2 round evals
     /// plus one terminal column value per batched column.
     pub fn byte_len(&self) -> usize {
-        self.rounds.len() * 3 * 16 + self.b_finals.len() * 16
+        self.rounds.len() * 2 * 16 + self.b_finals.len() * 16
     }
 }
 
@@ -183,7 +192,7 @@ pub struct LinearEvalProof {
 
 impl LinearEvalProof {
     pub fn byte_len(&self) -> usize {
-        self.rounds.len() * 3 * 16 + 16
+        self.rounds.len() * 2 * 16 + 16
     }
 }
 
@@ -681,17 +690,18 @@ pub fn prove_batch_eval<T: FiatShamir<Block128>>(
         let evals_flat = eval_round_flat(&w_flat, &b_flat, half);
         let evals: [Block128; 3] =
             evals_flat.map(|v| Block128::from(noid_core::hardware::flat_to_tower_u128(v)));
-        let re = BatchEvalRound { evals };
+        debug_assert_eq!(evals[0] + evals[1], claim);
+        let re = BatchEvalRound {
+            evals_at_1_2: [evals[1], evals[2]],
+        };
 
-        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
-
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
         let r_i_flat = noid_core::hardware::tower_to_flat_u128(r_i.0);
 
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         fold_flat(&mut w_flat, r_i_flat);
         fold_flat_zeroing_truncated(&mut b_flat, r_i_flat);
 
@@ -749,14 +759,11 @@ pub fn verify_batch_eval<T: FiatShamir<Block128>>(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        if re.sum_at_0_plus_1() != claim {
-            return None;
-        }
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         challenges.push(r_i);
     }
     challenges.reverse();
@@ -840,16 +847,18 @@ fn prove_linear_eval_inner<T: FiatShamir<Block128>>(
         let evals_flat = eval_round_flat(&w_flat, &b_flat, half);
         let evals: [Block128; 3] =
             evals_flat.map(|v| Block128::from(noid_core::hardware::flat_to_tower_u128(v)));
-        let re = BatchEvalRound { evals };
-        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
+        debug_assert_eq!(evals[0] + evals[1], claim);
+        let re = BatchEvalRound {
+            evals_at_1_2: [evals[1], evals[2]],
+        };
 
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
         let r_i_flat = noid_core::hardware::tower_to_flat_u128(r_i.0);
 
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         fold_flat(&mut w_flat, r_i_flat);
         fold_flat_zeroing_truncated(&mut b_flat, r_i_flat);
 
@@ -928,14 +937,11 @@ fn verify_linear_eval_inner<T: FiatShamir<Block128>>(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        if re.sum_at_0_plus_1() != claim {
-            return None;
-        }
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         challenges.push(r_i);
     }
     challenges.reverse();
@@ -1007,16 +1013,18 @@ pub fn prove_multi_batch_eval<T: FiatShamir<Block128>>(
         }
         let evals: [Block128; 3] =
             evals_flat.map(|v| Block128::from(noid_core::hardware::flat_to_tower_u128(v)));
-        let re = BatchEvalRound { evals };
-        debug_assert_eq!(re.sum_at_0_plus_1(), claim);
+        debug_assert_eq!(evals[0] + evals[1], claim);
+        let re = BatchEvalRound {
+            evals_at_1_2: [evals[1], evals[2]],
+        };
 
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
         let r_i_flat = noid_core::hardware::tower_to_flat_u128(r_i.0);
 
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         for w in &mut w_tables {
             fold_flat(w, r_i_flat);
         }
@@ -1088,14 +1096,11 @@ pub fn verify_multi_batch_eval<T: FiatShamir<Block128>>(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        if re.sum_at_0_plus_1() != claim {
-            return None;
-        }
-        for e in &re.evals {
+        for e in &re.evals_at_1_2 {
             channel.absorb(*e);
         }
         let r_i = channel.squeeze();
-        claim = re.evaluate(r_i);
+        claim = re.evaluate(claim, r_i);
         challenges.push(r_i);
     }
     challenges.reverse();

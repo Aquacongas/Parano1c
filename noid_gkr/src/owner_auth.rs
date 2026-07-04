@@ -1151,7 +1151,10 @@ fn compute_weighted_state_round_polynomial_flat(
 
     let evals_tower: [Block128; OWNER_AUTH_SHIFT_ROUND_DEGREE + 1] =
         std::array::from_fn(|k| Block128::from(flat_to_tower_u128(evals[k])));
-    BatchEvalRound { evals: evals_tower }
+    debug_assert_eq!(evals_tower.len(), 3);
+    BatchEvalRound {
+        evals_at_1_2: [evals_tower[1], evals_tower[2]],
+    }
 }
 
 fn prove_weighted_state_sumcheck<T: FiatShamir<Block128>>(
@@ -1170,13 +1173,12 @@ fn prove_weighted_state_sumcheck<T: FiatShamir<Block128>>(
     let mut r = vec![Block128::ZERO; n];
     for round in 0..n {
         let poly = compute_weighted_state_round_polynomial_flat(&state, &weights);
-        debug_assert_eq!(poly.sum_at_0_plus_1(), expected);
-        for &e in &poly.evals {
+        for &e in &poly.evals_at_1_2 {
             channel.absorb(e);
         }
         let challenge = channel.squeeze();
         let challenge_flat = tower_to_flat_u128(challenge.to_u128());
-        expected = poly.evaluate(challenge);
+        expected = poly.evaluate(expected, challenge);
         fold_secret_highest_var_inplace_flat(&mut state, challenge_flat);
         fold_highest_var_inplace_flat(&mut weights, challenge_flat);
         r[n - 1 - round] = challenge;
@@ -1200,14 +1202,11 @@ fn verify_weighted_state_sumcheck<T: FiatShamir<Block128>>(
     let mut expected = target;
     let mut r = Vec::with_capacity(n);
     for poly in round_polys {
-        if poly.sum_at_0_plus_1() != expected {
-            return None;
-        }
-        for &e in &poly.evals {
+        for &e in &poly.evals_at_1_2 {
             channel.absorb(e);
         }
         let challenge = channel.squeeze();
-        expected = poly.evaluate(challenge);
+        expected = poly.evaluate(expected, challenge);
         r.push(challenge);
     }
     r.reverse();
@@ -1505,13 +1504,13 @@ impl OwnerAuthProofKillShot {
             .shift
             .round_polys
             .iter()
-            .map(|p| p.evals.len() * 16)
+            .map(|p| p.evals_at_1_2.len() * 16)
             .sum();
         let boundary_polys: usize = self
             .boundary
             .round_polys
             .iter()
-            .map(|p| p.evals.len() * 16)
+            .map(|p| p.evals_at_1_2.len() * 16)
             .sum();
         let main_finals = (1 + STATE_SIZE) * 16;
         let shift_finals = 16;

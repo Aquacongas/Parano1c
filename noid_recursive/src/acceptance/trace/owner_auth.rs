@@ -407,10 +407,9 @@ fn weighted_state_rounds_trace(
     let mut expected = target;
     let mut r = Vec::with_capacity(round_polys.len());
     for poly in round_polys {
-        pin_zero(b, &poly.sum_at_0_plus_1().add(&expected));
         poly.absorb_evals(b, ch);
         let challenge = ch.squeeze(b);
-        expected = poly.evaluate(b, &challenge);
+        expected = poly.evaluate(b, &expected.clone(), &challenge);
         r.push(challenge);
     }
     r.reverse();
@@ -814,19 +813,19 @@ mod tests {
             f(v);
         }
         for r in &mut p.kill_shot.shift.round_polys {
-            for e in &mut r.evals {
+            for e in &mut r.evals_at_1_2 {
                 f(e);
             }
         }
         f(&mut p.kill_shot.shift.state_at_r2);
         for r in &mut p.boundary.round_polys {
-            for e in &mut r.evals {
+            for e in &mut r.evals_at_1_2 {
                 f(e);
             }
         }
         f(&mut p.boundary.state_at_r);
         for r in &mut p.batch.rounds {
-            for e in &mut r.evals {
+            for e in &mut r.evals_at_1_2 {
                 f(e);
             }
         }

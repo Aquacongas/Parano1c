@@ -32,26 +32,30 @@ use super::{
 // Proof / claim wire types
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `BatchEvalRound` — degree-2 round stored as evaluations at
-/// `{0, 1, 2}`.
+/// Trace twin of `BatchEvalRound` — degree-2 round stored COMPRESSED as its
+/// evaluations at `{1, 2}`; the evaluation at 0 is reconstructed from the
+/// running claim (`p(0) = claim + p(1)`, a free linear expression), which
+/// makes the old per-round sum pin true by construction.
 pub struct BatchEvalRoundTrace {
-    pub evals: [LinExpr; 3],
+    pub evals_at_1_2: [LinExpr; 2],
 }
 
 impl BatchEvalRoundTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &BatchEvalRound) -> Self {
         Self {
-            evals: std::array::from_fn(|i| alloc_block(b, native.evals[i])),
+            evals_at_1_2: std::array::from_fn(|i| alloc_block(b, native.evals_at_1_2[i])),
         }
     }
 
-    /// `evals[0] + evals[1]` — linear, free.
-    pub fn sum_at_0_plus_1(&self) -> LinExpr {
-        self.evals[0].add(&self.evals[1])
-    }
-
-    /// Trace twin of `batch_eval::lagrange_at_0_1_2` (6 multiplications).
-    pub fn evaluate(&self, b: &mut FieldR1csBuilder, r: &LinExpr) -> LinExpr {
+    /// Trace twin of `batch_eval::lagrange_at_0_1_2` on the reconstructed
+    /// triple (6 multiplications).
+    pub fn evaluate(
+        &self,
+        b: &mut FieldR1csBuilder,
+        claim: &LinExpr,
+        r: &LinExpr,
+    ) -> LinExpr {
+        let e0 = claim.add(&self.evals_at_1_2[0]);
         let denom_inv = denom_inv_3_flat();
         let r0 = r.clone();
         let r1 = r.add_const(super::flat_of(Block128::from(1u128)));
@@ -59,14 +63,14 @@ impl BatchEvalRoundTrace {
         let n0 = mul(b, &r1, &r2);
         let n1 = mul(b, &r0, &r2);
         let n2 = mul(b, &r0, &r1);
-        let t0 = mul(b, &self.evals[0], &n0).scale(denom_inv[0]);
-        let t1 = mul(b, &self.evals[1], &n1).scale(denom_inv[1]);
-        let t2 = mul(b, &self.evals[2], &n2).scale(denom_inv[2]);
+        let t0 = mul(b, &e0, &n0).scale(denom_inv[0]);
+        let t1 = mul(b, &self.evals_at_1_2[0], &n1).scale(denom_inv[1]);
+        let t2 = mul(b, &self.evals_at_1_2[1], &n2).scale(denom_inv[2]);
         t0.add(&t1).add(&t2)
     }
 
     pub fn absorb_evals(&self, b: &mut FieldR1csBuilder, ch: &mut RawChannelTrace) {
-        for e in &self.evals {
+        for e in &self.evals_at_1_2 {
             ch.absorb(b, e);
         }
     }
@@ -258,10 +262,9 @@ pub fn verify_linear_eval_prebound_trace(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        pin_zero(b, &re.sum_at_0_plus_1().add(&claim));
         re.absorb_evals(b, ch);
         let r_i = ch.squeeze(b);
-        claim = re.evaluate(b, &r_i);
+        claim = re.evaluate(b, &claim.clone(), &r_i);
         challenges.push(r_i);
     }
     challenges.reverse();
@@ -344,10 +347,9 @@ pub fn verify_batch_eval_trace(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        pin_zero(b, &re.sum_at_0_plus_1().add(&claim));
         re.absorb_evals(b, ch);
         let r_i = ch.squeeze(b);
-        claim = re.evaluate(b, &r_i);
+        claim = re.evaluate(b, &claim.clone(), &r_i);
         challenges.push(r_i);
     }
     challenges.reverse();
@@ -422,10 +424,9 @@ pub fn verify_multi_batch_eval_trace(
 
     let mut challenges = Vec::with_capacity(n);
     for re in &proof.rounds {
-        pin_zero(b, &re.sum_at_0_plus_1().add(&claim));
         re.absorb_evals(b, ch);
         let r_i = ch.squeeze(b);
-        claim = re.evaluate(b, &r_i);
+        claim = re.evaluate(b, &claim.clone(), &r_i);
         challenges.push(r_i);
     }
     challenges.reverse();

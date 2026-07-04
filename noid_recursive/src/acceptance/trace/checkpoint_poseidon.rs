@@ -941,7 +941,7 @@ mod tests {
         }
         for chain in [&mut p.header_hash.chain, &mut p.chain_accumulator.chain] {
             for r in &mut chain.rounds {
-                for e in &mut r.evals {
+                for e in &mut r.evals_at_1_2 {
                     f(e);
                 }
             }
@@ -949,7 +949,7 @@ mod tests {
         }
         for batch in [&mut p.header_hash.batch, &mut p.chain_accumulator.batch] {
             for r in &mut batch.rounds {
-                for e in &mut r.evals {
+                for e in &mut r.evals_at_1_2 {
                     f(e);
                 }
             }
