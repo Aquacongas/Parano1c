@@ -6,31 +6,120 @@
 //! (`trace::self_verify::verify_field_trace`) cost, as a function of the
 //! verified instance size and the PCS code rate?
 //!
-//! The verified instance is a synthetic satisfiable FieldR1cs shaped like a
-//! verifier-replay trace (1–4 nonzeros per matrix row, strictly
-//! lower-triangular). Reported per case:
-//! - the [R] trace row count and its per-phase split (statement+zerocheck /
-//!   lincheck / PCS),
-//! - the nonzero 64×64 block count of the verified matrices (the lincheck
-//!   bilinear replay pays ~2 muls per block),
-//! - native prove/verify wall times for context.
+//! Two families of verified instances:
+//! - **Poseidon2b permutation chains** built with `FieldR1csBuilder` — the
+//!   representative shape: real verifier-replay traces are builder-produced
+//!   and have the same strong wire locality, so their 64×64 matrix block
+//!   count (the lincheck bilinear replay pays ~2 rows per block) is small.
+//! - **Synthetic instances** (`synthetic_satisfiable`) — an adversarial
+//!   locality bound: columns are uniformly random over earlier wires, so
+//!   nearly every nonzero lands in its own block.
+//!
+//! Reported per case: the [R] trace row count and the proof-wire /
+//! verifier-row split, the verified-matrix block count, native prove and
+//! verify wall times, and the trace build time.
 //!
 //! Rerun after any change to the FieldR1cs verifier or the trace gadgets.
 
 use std::time::Instant;
 
 use noid_ivc_prover::challenger::FsLaneChallenger;
-use noid_ivc_prover::field_r1cs::synthetic_satisfiable;
+use noid_ivc_prover::field_circuit::{
+    flat_const, poseidon2b_permute, FsChannelTrace, LinExpr,
+};
+use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
 use noid_ivc_prover::field_prover::prove_field;
 use noid_ivc_prover::pcs::{self, PcsParams};
 use noid_ivc_prover::verifier::verify_field;
-use noid_ivc_prover::field_circuit::FsChannelTrace;
+use noid_ivc_prover::field::F128;
 use noid_recursive::acceptance::trace::self_verify::{
     alloc_flat_digest, verify_field_trace, FieldR1csProofTrace,
 };
 use noid_recursive::acceptance::trace::FieldR1csBuilder;
 
 const DOMAIN: &[u8] = b"self-verify-rows-bench-v0";
+
+/// A builder-produced Poseidon2b chain circuit of `chain` permutations —
+/// the locality-representative stand-in for a verifier-replay trace.
+fn poseidon_chain_instance(chain: usize) -> (FieldR1cs, Vec<F128>) {
+    use noid_poseidon2b::native::permutation::{Poseidon2bPermutation, STATE_SIZE};
+    let seed: [noid_core::Block128; STATE_SIZE] =
+        std::array::from_fn(|i| noid_core::Block128(0x1234_5678_9abc_def0 + i as u128));
+    let mut expected = seed;
+    for _ in 0..chain {
+        Poseidon2bPermutation.permute_mut(&mut expected);
+    }
+    let mut b = FieldR1csBuilder::new();
+    let mut state: [LinExpr; STATE_SIZE] =
+        std::array::from_fn(|i| LinExpr::from_wire(b.alloc_f128(flat_const(seed[i].0))));
+    for _ in 0..chain {
+        state = poseidon2b_permute(&mut b, state);
+    }
+    for lane in state.iter() {
+        let v = lane.eval(b.values());
+        b.pin_f128(lane, v);
+    }
+    b.build()
+}
+
+fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
+    let m = r1cs.m;
+    let params = PcsParams {
+        m: m + pcs::LOG_PACKING,
+        log_inv_rate: lir,
+        log_batch_size: lb,
+        profile: Default::default(),
+    };
+
+    let t = Instant::now();
+    let mut ch = FsLaneChallenger::new(DOMAIN);
+    let (proof, commitment, _claim) = prove_field(r1cs, z, &params, &mut ch);
+    let prove_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = Instant::now();
+    let mut ch = FsLaneChallenger::new(DOMAIN);
+    verify_field(r1cs, &commitment, &proof, &mut ch).expect("native verify");
+    let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // Nonzero 64×64 block count of the verified matrices (lincheck cost
+    // driver in-trace: ~2 rows per block).
+    let block_count = {
+        use std::collections::BTreeSet;
+        let mut blocks: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for rows in [&r1cs.a_0.rows, &r1cs.b_0.rows] {
+            for (r, row) in rows.iter().enumerate() {
+                for &(c, _) in row {
+                    blocks.insert((r >> r1cs.k_skip, (c as usize) >> r1cs.k_skip));
+                }
+            }
+        }
+        blocks.len()
+    };
+
+    let t = Instant::now();
+    let mut b = FieldR1csBuilder::new();
+    let mut tch = FsChannelTrace::new(&mut b, DOMAIN);
+    let root = alloc_flat_digest(&mut b, &commitment.root);
+    let proof_e = FieldR1csProofTrace::alloc(&mut b, &proof, r1cs, &params);
+    let rows_before = b.num_wires();
+    let _ = verify_field_trace(&mut b, &mut tch, r1cs, &params, &root, &proof_e);
+    let rows_total = b.num_wires();
+    let build_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+        "{label}: m=2^{m} lir={lir} lb={lb} (queries {q}) → [R] rows = {rows_total} (2^{log:.1})",
+        q = pcs::default_fri_queries(lir),
+        log = (rows_total as f64).log2(),
+    );
+    println!(
+        "    proof wires {pw}, verifier rows {vr}; verified-matrix nnz blocks = {block_count}",
+        pw = rows_before,
+        vr = rows_total - rows_before,
+    );
+    println!(
+        "    native prove {prove_ms:.0} ms, native verify {verify_ms:.1} ms, trace build {build_ms:.0} ms\n"
+    );
+}
 
 fn main() {
     noid_ivc_prover::init_perf_thread_pool();
@@ -39,72 +128,21 @@ fn main() {
         rayon::current_num_threads()
     );
 
-    // (m, log_inv_rate, log_batch_size). m is the verified instance's
-    // witness log-size; production π traces sit at m ≈ 20–25 (tx-count
-    // dependent until the folding layer lands). The query counts are
-    // 148 @ rate 1/4, 121 @ 1/8, 110 @ 1/16, 105 @ 1/32.
-    for &(m, lir, lb) in &[
-        (14usize, 2usize, 2usize),
-        (16, 2, 5),
-        (16, 4, 5),
-        (18, 4, 5),
-        (20, 4, 5),
-        (20, 5, 2),
+    // Poseidon chains: ~2^17 and ~2^19 rows (the second is the shape class
+    // of a small production trace; the real π sits at 2^20+ until folding).
+    for &(chain, lir, lb) in &[
+        (364usize, 2usize, 2usize), // 364·360+5 ≈ 2^17
+        (1456, 2, 5),               // ≈ 2^19
+        (1456, 4, 5),
+        (1456, 5, 5),
     ] {
-        let (r1cs, z) = synthetic_satisfiable(m, m, 0x5EED ^ (m as u64) ^ ((lir as u64) << 8));
-        let params = PcsParams {
-            m: m + pcs::LOG_PACKING,
-            log_inv_rate: lir,
-            log_batch_size: lb,
-            profile: Default::default(),
-        };
+        let (r1cs, z) = poseidon_chain_instance(chain);
+        measure("poseidon-chain", &r1cs, &z, lir, lb);
+    }
 
-        let t = Instant::now();
-        let mut ch = FsLaneChallenger::new(DOMAIN);
-        let (proof, commitment, _claim) = prove_field(&r1cs, &z, &params, &mut ch);
-        let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        let t = Instant::now();
-        let mut ch = FsLaneChallenger::new(DOMAIN);
-        verify_field(&r1cs, &commitment, &proof, &mut ch).expect("native verify");
-        let verify_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        // Nonzero 64×64 block count of the verified matrices (lincheck cost
-        // driver in-trace).
-        let block_count = {
-            use std::collections::BTreeSet;
-            let mut blocks: BTreeSet<(usize, usize)> = BTreeSet::new();
-            for rows in [&r1cs.a_0.rows, &r1cs.b_0.rows] {
-                for (r, row) in rows.iter().enumerate() {
-                    for &(c, _) in row {
-                        blocks.insert((r >> r1cs.k_skip, (c as usize) >> r1cs.k_skip));
-                    }
-                }
-            }
-            blocks.len()
-        };
-
-        let t = Instant::now();
-        let mut b = FieldR1csBuilder::new();
-        let mut tch = FsChannelTrace::new(&mut b, DOMAIN);
-        let root = alloc_flat_digest(&mut b, &commitment.root);
-        let proof_e = FieldR1csProofTrace::alloc(&mut b, &proof, &r1cs, &params);
-        let rows_before = b.num_wires();
-        let _ = verify_field_trace(&mut b, &mut tch, &r1cs, &params, &root, &proof_e);
-        let rows_total = b.num_wires();
-        let build_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        println!(
-            "m=2^{m} lir={lir} lb={lb} (queries {q}): [R] rows = {rows_total} \
-             (proof wires {pw}, verifier rows {vr}) — 2^{log:.1}",
-            q = pcs::default_fri_queries(lir),
-            pw = rows_before,
-            vr = rows_total - rows_before,
-            log = (rows_total as f64).log2(),
-        );
-        println!(
-            "    verified-matrix nnz blocks = {block_count}; native prove {prove_ms:.0} ms, \
-             native verify {verify_ms:.1} ms, trace build {build_ms:.0} ms\n"
-        );
+    // Synthetic adversarial-locality instances (block count ≈ nnz).
+    for &(m, lir, lb) in &[(14usize, 2usize, 2usize), (16, 2, 5)] {
+        let (r1cs, z) = synthetic_satisfiable(m, m, 0x5EED ^ (m as u64));
+        measure("synthetic", &r1cs, &z, lir, lb);
     }
 }

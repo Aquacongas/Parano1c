@@ -622,20 +622,29 @@ fn lincheck_final_sum_trace(
         pair_products.insert((r_blk, x_blk), t);
     }
 
+    // Per-block products are fresh single wires allocated in ascending
+    // order, so the block sums are assembled as one sorted term list —
+    // NOT by repeated `LinExpr::add` (which is quadratic in block count).
     let block_sum = |blocks: &BTreeMap<(usize, usize), Block>,
                      p: &BTreeMap<(usize, usize), LinExpr>,
                      b: &mut FieldR1csBuilder,
                      pair_products: &BTreeMap<(usize, usize), LinExpr>|
      -> LinExpr {
-        let mut acc = LinExpr::zero();
+        let mut terms: Vec<(u32, F128)> = Vec::with_capacity(blocks.len());
         for (key, entries) in blocks {
             let mut g = LinExpr::zero();
             for &(i, j, kappa) in entries {
                 g = g.add(&p[&(i, j)].scale(kappa));
             }
-            acc = acc.add(&mul(b, &pair_products[key], &g));
+            let prod = mul(b, &pair_products[key], &g);
+            debug_assert!(prod.terms.len() == 1 && prod.constant == F128::ZERO);
+            terms.push(prod.terms[0]);
         }
-        acc
+        debug_assert!(terms.windows(2).all(|w| w[0].0 < w[1].0));
+        LinExpr {
+            terms,
+            constant: F128::ZERO,
+        }
     };
     let t_a = block_sum(&blocks_a, &p, b, &pair_products);
     let t_b = block_sum(&blocks_b, &p, b, &pair_products);
