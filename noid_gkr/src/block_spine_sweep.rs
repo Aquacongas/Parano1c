@@ -30,7 +30,9 @@ use crate::spine_sumcheck_sweep::reconstruct_sweep_spine_slot_states;
 const ELEM_BITS: usize = N_SWEEP_SPINE_ELEM_VARS;
 const ROUND_BITS: usize = N_SWEEP_SPINE_ROUND_VARS;
 const ROUND_LIMIT: usize = 1 << ROUND_BITS;
-const SWEEP_BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x5357_4253_5049_4E01; // "SWBSPIN"+1
+// Public: the in-circuit trace transliteration replays the tx-hash pin relation
+// from this same definition; change both together.
+pub const SWEEP_BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x5357_4253_5049_4E01; // "SWBSPIN"+1
 
 const _: () = assert!(STATE_SIZE == 4);
 const _: () = assert!(N_ROUNDS <= ROUND_LIMIT);

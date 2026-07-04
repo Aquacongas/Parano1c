@@ -58,7 +58,7 @@ const DIRECT_SOURCE_EXPANSION_MIN_LOG: usize = 20;
 const DIRECT_SOURCE_EXPANSION_MIN_LOG: usize = crate::compact_fri::COMPACT_TAU + 2;
 
 #[inline]
-fn use_direct_source_expansion(n_cols: usize, tau: usize, log_n: usize) -> bool {
+pub fn use_direct_source_expansion(n_cols: usize, tau: usize, log_n: usize) -> bool {
     n_cols == 1 && tau > 1 && log_n >= DIRECT_SOURCE_EXPANSION_MIN_LOG
 }
 
@@ -531,7 +531,18 @@ pub fn verify_mixed_opening(
     Ok(proof.all_openings[..n_cols].to_vec())
 }
 
-const MIXED_SOURCE_BINDING_TAG: u128 = 0x5B1D_0000_0000_0001u128;
+/// Domain tag for the source-binding sub-transcript.
+///
+/// Public so the in-circuit trace twin (`noid_recursive::acceptance::trace`)
+/// can replay this definition; any change here must change the trace in the
+/// same commit.
+pub const MIXED_SOURCE_BINDING_TAG: u128 = 0x5B1D_0000_0000_0001u128;
+
+/// Domain tag for high-fold pair leaf hashes (see `high_pair_leaf_hash`).
+///
+/// Public so the in-circuit trace twin can replay this definition;
+/// change both together.
+pub const HIGH_PAIR_DOMAIN: u128 = 0xF21B_1D50_0000_0002u128;
 
 struct HighFoldLayer {
     log_rows: usize,
@@ -1145,11 +1156,11 @@ fn mle_evaluate_small(evals: &[Block128], point: &[Block128]) -> Block128 {
     buf[0]
 }
 
-fn high_pair_tree_depth(layer_log: usize) -> usize {
+pub fn high_pair_tree_depth(layer_log: usize) -> usize {
     layer_log + LOG_RATE - 1
 }
 
-fn high_fold_h_code_index(query_index: usize, log_n: usize, tau: usize) -> usize {
+pub fn high_fold_h_code_index(query_index: usize, log_n: usize, tau: usize) -> usize {
     let mut idx = high_pair_leaf_index(query_index, log_n);
     for layer_idx in 0..tau.saturating_sub(1) {
         let layer_log = log_n - 1 - layer_idx;
@@ -1158,7 +1169,7 @@ fn high_fold_h_code_index(query_index: usize, log_n: usize, tau: usize) -> usize
     idx
 }
 
-fn high_expansion_source_leaf_indices(
+pub fn high_expansion_source_leaf_indices(
     query_indices: &[usize],
     log_n: usize,
     tau: usize,
@@ -1265,7 +1276,7 @@ fn source_high_fold_symbol(
     tensor_high_fold_pair(r, before_log, code_index, s0, s1)
 }
 
-fn high_pair_leaf_index(code_index: usize, layer_log: usize) -> usize {
+pub fn high_pair_leaf_index(code_index: usize, layer_log: usize) -> usize {
     debug_assert!(layer_log > 0);
     let local_mask = (1usize << layer_log) - 1;
     let local = code_index & local_mask;
@@ -1274,12 +1285,12 @@ fn high_pair_leaf_index(code_index: usize, layer_log: usize) -> usize {
     (coset << (layer_log - 1)) | low
 }
 
-fn high_pair_parity(code_index: usize, layer_log: usize) -> usize {
+pub fn high_pair_parity(code_index: usize, layer_log: usize) -> usize {
     let local = code_index & ((1usize << layer_log) - 1);
     (local >> (layer_log - 1)) & 1
 }
 
-fn high_pair_positions(layer_log: usize, leaf_index: usize) -> (usize, usize) {
+pub fn high_pair_positions(layer_log: usize, leaf_index: usize) -> (usize, usize) {
     debug_assert!(layer_log > 0);
     let half = 1usize << (layer_log - 1);
     let local = leaf_index & (half - 1);
@@ -1288,7 +1299,7 @@ fn high_pair_positions(layer_log: usize, leaf_index: usize) -> (usize, usize) {
     (base, base + half)
 }
 
-fn tensor_high_fold_pair(
+pub fn tensor_high_fold_pair(
     r: Block128,
     layer_log: usize,
     leaf_index: usize,
@@ -1310,7 +1321,6 @@ fn high_pair_leaf_hash(
     hasher: &dyn CryptographicHasher,
 ) -> SourceHash {
     let _ = backend;
-    const HIGH_PAIR_DOMAIN: u128 = 0xF21B_1D50_0000_0002u128;
     let mut acc = hasher.hash_pair(
         &Block128::from(HIGH_PAIR_DOMAIN),
         &Block128::from(layer_log as u128),

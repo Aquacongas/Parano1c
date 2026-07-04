@@ -1,4 +1,5 @@
-//! `FieldR1csBuilder` and the base SVT gadgets (P2, `s4-design.md` §4.2).
+//! `FieldR1csBuilder` and the base in-circuit gadgets of the acceptance-
+//! proof trace (the arithmetic F128 replay of the block verifiers).
 //!
 //! The builder emits a satisfiable [`FieldR1cs`] (option A: F128 coefficients
 //! in the sparse matrices, `C = I`) together with its witness. Linear
@@ -509,8 +510,9 @@ pub const POSEIDON2B_PERMUTE_CONSTRAINTS: usize =
 ///
 /// Every observed value enters as a [`LinExpr`] (witness data or a public
 /// constant); every squeeze returns the state-lane expression, which the
-/// caller's replayed verifier algebra then consumes — that is exactly
-/// invariant I2 of `s4-design.md` §5.
+/// caller's replayed verifier algebra then consumes — the transcript
+/// invariant of the recursion: the in-circuit channel matches the native
+/// challenger bit-for-bit (permutation, IV, padding, absorb/squeeze order).
 pub struct FsChannelTrace {
     state: [LinExpr; STATE_SIZE],
     buffered: Option<LinExpr>,
@@ -699,6 +701,116 @@ impl FsChannelTrace {
 }
 
 // ---------------------------------------------------------------------------
+// Raw Fiat-Shamir channel trace gadget
+// ---------------------------------------------------------------------------
+
+/// In-circuit replay of the production killshot channel
+/// (`noid_poseidon2b::channel::Poseidon2bChannel` — the `FiatShamir<Block128>`
+/// implementation every `noid_gkr` verifier runs on). Unlike
+/// [`FsChannelTrace`], the raw channel has NO op-header lanes and NO domain
+/// absorb: it is a bare rate-2 duplex seeded with the `FSCHALNG` capacity IV,
+/// where every absorbed `Block128` is one whole lane and every squeeze emits
+/// `state[0]` / holds `state[1]` pending.
+///
+/// Basis: absorbed tower values enter as their flat (GCM) images
+/// (`flat_const` for constants, φ-mapped witness wires otherwise); squeezed
+/// expressions evaluate to the flat images of the native channel's tower
+/// challenges. XOR commutes with φ and the permutation gadget shadows the
+/// native permutation on flat images, so the trace state is φ(native state)
+/// lane-for-lane (the transcript-lockstep invariant).
+pub struct RawChannelTrace {
+    state: [LinExpr; STATE_SIZE],
+    buffered: Option<LinExpr>,
+    pending: Option<LinExpr>,
+    perms: usize,
+}
+
+impl RawChannelTrace {
+    /// Mirror of `Poseidon2bChannel::new()`: zero rate lanes, `FSCHALNG`
+    /// capacity IV, empty buffer, no pending challenge.
+    pub fn new() -> Self {
+        let [iv0, iv1] = crate::challenger::fs_lane_iv_flat();
+        Self {
+            state: [
+                LinExpr::zero(),
+                LinExpr::zero(),
+                LinExpr::constant(iv0),
+                LinExpr::constant(iv1),
+            ],
+            buffered: None,
+            pending: None,
+            perms: 0,
+        }
+    }
+
+    /// Transcript permutations executed so far (lockstep pin).
+    pub fn perms(&self) -> usize {
+        self.perms
+    }
+
+    fn permute(&mut self, b: &mut FieldR1csBuilder) {
+        self.state = poseidon2b_permute(b, std::mem::take(&mut self.state));
+        self.perms += 1;
+    }
+
+    /// Mirror of `FiatShamir::absorb`: one whole lane, rate-2 pair buffering
+    /// (`Poseidon2bSponge::update` with 16-byte writes keeps 0 or 1 whole
+    /// lanes buffered). Absorbing invalidates any pending challenge.
+    pub fn absorb(&mut self, b: &mut FieldR1csBuilder, lane: &LinExpr) {
+        self.pending = None;
+        if let Some(first) = self.buffered.take() {
+            self.state[0] = self.state[0].add(&first);
+            self.state[1] = self.state[1].add(lane);
+            self.permute(b);
+        } else {
+            self.buffered = Some(lane.clone());
+        }
+    }
+
+    /// Absorb a build-time constant (tower basis), φ-mapped.
+    pub fn absorb_const_tower(&mut self, b: &mut FieldR1csBuilder, tower: u128) {
+        self.absorb(b, &LinExpr::constant(flat_const(tower)));
+    }
+
+    /// Mirror of `Poseidon2bSponge::flush_to_squeeze`: commit a buffered odd
+    /// lane with the sponge pad block (`0x80 … 0x01`).
+    fn flush(&mut self, b: &mut FieldR1csBuilder) {
+        if let Some(first) = self.buffered.take() {
+            self.state[0] = self.state[0].add(&first);
+            self.state[1] = self
+                .state[1]
+                .add_const(crate::challenger::fs_pad_lane_flat());
+            self.permute(b);
+        }
+    }
+
+    /// Mirror of `Poseidon2bChannel::squeeze`: pending lane if buffered from
+    /// the previous squeeze, else flush + emit `state[0]`, hold `state[1]`
+    /// pending, advance the sponge.
+    pub fn squeeze(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
+        if let Some(p) = self.pending.take() {
+            return p;
+        }
+        self.flush(b);
+        let out = self.state[0].clone();
+        self.pending = Some(self.state[1].clone());
+        self.permute(b);
+        out
+    }
+
+    /// Mirror of `FiatShamir::squeeze_n`.
+    pub fn squeeze_n(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
+        (0..n).map(|_| self.squeeze(b)).collect()
+    }
+}
+
+impl Default for RawChannelTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -820,7 +932,7 @@ mod tests {
             let out = poseidon2b_permute(&mut b, state);
             let cost = b.num_wires() - before;
             assert_eq!(cost, POSEIDON2B_PERMUTE_CONSTRAINTS);
-            assert!(cost <= 400, "P2 exit: permutation ≤ 400 constraints");
+            assert!(cost <= 400, "permutation gadget budget: ≤ 400 constraints");
 
             for i in 0..STATE_SIZE {
                 assert_eq!(
@@ -906,7 +1018,7 @@ mod tests {
         assert!(!r1cs.satisfies(&bad));
     }
 
-    /// THE P2 lockstep gate: 1000 random op schedules; the trace gadget
+    /// THE lockstep gate: 1000 random op schedules; the trace gadget
     /// mirrors `FsLaneChallenger` exactly — same permutation count, squeezed
     /// expressions evaluate to the native challenges, and the built R1CS is
     /// satisfiable. Covers labels, scalar/slice observes, byte observes,
@@ -984,6 +1096,67 @@ mod tests {
 
             let (r1cs, z) = b.build();
             assert!(r1cs.satisfies(&z), "trace {trace_idx} unsatisfiable");
+        }
+    }
+
+    /// THE raw-channel lockstep gate: 1000 random absorb/squeeze schedules; the raw
+    /// channel trace mirrors the production `Poseidon2bChannel` exactly —
+    /// every squeezed expression evaluates to the flat image of the native
+    /// tower challenge, and the built R1CS is satisfiable. Covers pair
+    /// buffering (odd/even absorb parity), the pad-flush on odd squeezes,
+    /// pending-lane reuse and pending invalidation by interleaved absorbs.
+    #[test]
+    fn raw_channel_trace_lockstep_1000_random_schedules() {
+        use noid_core::transcript::FiatShamir;
+        use noid_poseidon2b::channel::Poseidon2bChannel;
+
+        let mut rng = Rng::new(0x0A0B_CDEF_1234_5678);
+        for schedule_idx in 0..1000 {
+            let mut native = Poseidon2bChannel::new();
+            let mut b = FieldR1csBuilder::new();
+            let mut trace = RawChannelTrace::new();
+
+            let n_ops = 1 + (rng.next_u64() % 12) as usize;
+            for _ in 0..n_ops {
+                match rng.next_u64() % 3 {
+                    0 => {
+                        // Witness-carried absorb (tower value → flat wire).
+                        let tower = rng.u128v();
+                        native.absorb(Block128(tower));
+                        let w = LinExpr::from_wire(b.alloc_f128(flat_const(tower)));
+                        trace.absorb(&mut b, &w);
+                    }
+                    1 => {
+                        // Constant absorb (public statement data).
+                        let tower = rng.next_u64() as u128;
+                        native.absorb(Block128(tower));
+                        trace.absorb_const_tower(&mut b, tower);
+                    }
+                    _ => {
+                        let c = native.squeeze();
+                        let e = trace.squeeze(&mut b);
+                        assert_eq!(
+                            e.eval(b.values()),
+                            flat_const(c.0),
+                            "squeeze diverged (schedule {schedule_idx})"
+                        );
+                    }
+                }
+            }
+            // Trailing divergence check: two more challenges (exercises the
+            // pending lane and the no-buffer squeeze path).
+            for _ in 0..2 {
+                let c = native.squeeze();
+                let e = trace.squeeze(&mut b);
+                assert_eq!(
+                    e.eval(b.values()),
+                    flat_const(c.0),
+                    "trailing squeeze diverged (schedule {schedule_idx})"
+                );
+            }
+
+            let (r1cs, z) = b.build();
+            assert!(r1cs.satisfies(&z), "schedule {schedule_idx} unsatisfiable");
         }
     }
 

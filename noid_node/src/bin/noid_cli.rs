@@ -685,7 +685,7 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     kv("Fingerprint", &proof_hash);
     println!();
     println!(
-        "  {} O(1) checkpoint proof path is active; remaining cryptographic work is tracked in roadmap.md.",
+        "  {} O(1) checkpoint proof path is active; the recursive acceptance-proof path is still under construction.",
         c!(DIM, "Note:")
     );
 

@@ -306,7 +306,7 @@ fn verify_claims_inner<Ch: Challenger>(
     pcs::verify_opening_batch(commitment, &values, &z_skips, &x_refs, pcs_open, challenger)
 }
 
-/// Verify a **FieldR1cs** proof (P1): field zerocheck → shared lincheck
+/// Verify a **FieldR1cs** proof: field zerocheck → shared lincheck
 /// (coefficient-carrying circuit) → batched quirky-direct PCS opening.
 /// Structural mirror of [`verify`]; same single-threaded pool policy.
 pub fn verify_field<Ch: Challenger>(

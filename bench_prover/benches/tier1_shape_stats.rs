@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Tier-1 shape statistics for the SVT design (roadmap P0).
+//! Tier-1 shape statistics for the acceptance-proof trace.
 //!
 //! Replays every killshot verifier that `verify_accepted_block_batch_components`
 //! runs for a real accepted block, with a counting Fiat-Shamir channel wrapped
 //! around the production `Poseidon2bChannel`. Prints, per component:
 //! absorb/squeeze op counts, exact Poseidon2b permutation counts, and proof
-//! sizes — the measured inputs for the trace-size table in `s4-design.md` §6
-//! and the shape constants of `noid_recursive::acceptance::shape`.
+//! sizes — the measured inputs behind the shape constants of
+//! `noid_recursive::acceptance::shape` (the empirical cost model of the
+//! acceptance-proof trace).
 //!
 //! This tool is measurement-only: it must not diverge from the call structure
 //! of `block_certificate_backend.rs` / `checkpoint.rs`. When those change,
@@ -64,7 +65,8 @@ use noid_tx::{
 use rayon::prelude::*;
 
 // Constraint cost of one Poseidon2b permutation in the F128 arithmetic trace
-// (option A of s4-design.md §4.1): 90 S-boxes x 4 multiplications.
+// (linear layers live in the F128-coefficient matrices for free):
+// 90 S-boxes x 4 multiplications.
 const PERM_TRACE_CONSTRAINTS: usize = 360;
 const PREMINED_COINBASE_NONCE: u128 = 69_582;
 const PREMINED_USER_BLOCK_NONCE: u128 = 87_803;
@@ -509,7 +511,7 @@ fn sweep_spend_secret(tx_index: usize, input_index: usize) -> SpendSecret {
 
 /// A single block with `n` independent full Sweep25x2 user transactions
 /// (25 live inputs with a distinct owner each / 2 outputs — the heaviest
-/// per-tx authorization shape; roadmap P0.5/O4 sweep-heavy case).
+/// per-tx authorization shape; the sweep-heavy adversarial case).
 fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
     assert!(n >= 1);
     const SWEEP_INPUTS: usize = 25;
@@ -992,7 +994,7 @@ fn print_data_volumes(components: &FullAcceptedBlockBatchProofComponents) {
 }
 
 // ---------------------------------------------------------------------------
-// Coarse replay-phase probe (roadmap P0.5/O1c): times the public pieces of the
+// Coarse replay-phase probe: times the public pieces of the
 // AcceptBlock replay on the same fixture to rank where the replay half of
 // native_verify goes. This is subtraction-based ranking, not a call-structure
 // shadow: `exact+apply+decode` is accept minus the measured pieces and covers
@@ -1109,7 +1111,7 @@ fn profile_replay_phases(
 }
 
 // ---------------------------------------------------------------------------
-// Component-leaf probe (roadmap P0.5/O1c): times the dominant killshot leaves
+// Component-leaf probe: times the dominant killshot leaves
 // of `verify_accepted_block_batch_components` in isolation. The component
 // verify runs these on a parallel join tree, so its wall time is bounded from
 // below by the slowest single leaf; this probe identifies that leaf.
@@ -1213,7 +1215,7 @@ fn run_case(label: &str, fixture: FullBatchFixture) {
     assert!(verified, "production verify_retained path rejected the fixture");
 
     // Phase split of the full verify: native AcceptBlock replay vs killshot
-    // component verification (roadmap O1c).
+    // component verification.
     let (native_replay_time, _) = time_once(|| {
         verify_full_accepted_block_batch_native(
             &start_consensus,
@@ -1279,8 +1281,8 @@ fn run_case(label: &str, fixture: FullBatchFixture) {
 }
 
 fn main() {
-    println!("tier1_shape_stats — SVT P0 (see s4-design.md §6, roadmap.md P0)");
-    println!("counts are exact production-transcript replays; estimates use the option-A cost model");
+    println!("tier1_shape_stats — verifier-replay shape statistics");
+    println!("counts are exact production-transcript replays; estimates use the F128-trace cost model");
     // NOID_SHAPE_CASE=<substring> runs only matching cases (iteration aid).
     let case_filter = std::env::var("NOID_SHAPE_CASE").ok();
     let wants = |label: &str| {
@@ -1307,7 +1309,7 @@ fn main() {
         run_case("sweep_txs_4", sweep_txs_block_batch(4));
     }
     // Consensus max-shape case (255 standard txs): minutes of runtime, so it
-    // only runs when explicitly requested (roadmap P0.5/O4).
+    // only runs when explicitly requested.
     if std::env::var_os("NOID_SHAPE_MAX_STD").is_some() && wants("user_txs_255") {
         run_case("user_txs_255", user_txs_block_batch(255));
     }

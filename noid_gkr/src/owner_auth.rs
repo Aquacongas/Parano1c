@@ -1425,7 +1425,7 @@ fn owner_boundary_weights_and_target(
     (weights, target)
 }
 
-const OWNER_AUTH_BOUNDARY_DOMAIN_TAG: u128 = 0xA07D_0B47_B0A0_0001;
+pub const OWNER_AUTH_BOUNDARY_DOMAIN_TAG: u128 = 0xA07D_0B47_B0A0_0001;
 
 pub fn prove_owner_auth_boundary<T: FiatShamir<Block128>>(
     circuit: &OwnerAuthCircuit,
@@ -1541,7 +1541,7 @@ pub struct OwnerAuthKillShotReductions {
     pub state: BatchEvalReduction,
 }
 
-const OWNER_AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0003;
+pub const OWNER_AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0003;
 
 pub fn init_owner_auth_gkr_channel<T: FiatShamir<Block128>>(channel: &mut T) {
     channel.absorb(Block128::from(OWNER_AUTH_GKR_DOMAIN_TAG));

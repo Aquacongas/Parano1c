@@ -2529,7 +2529,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Field-witness lincheck (P1)
+    // Field-witness lincheck
     // -----------------------------------------------------------------------
 
     /// Quirky MLE evaluation of an F128 vector: `Σ_i f[i] · L_{i_skip}(z_skip)

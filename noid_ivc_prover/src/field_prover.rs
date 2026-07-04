@@ -1,4 +1,4 @@
-//! Top-level **FieldR1cs** prover (P1): commit → bind → field zerocheck →
+//! Top-level **FieldR1cs** prover: commit → bind → field zerocheck →
 //! field lincheck → batched quirky-direct PCS open. Structural mirror of
 //! [`crate::prover::prove`] on the F128-element witness; the verifier is
 //! `noid_ivc_core::verifier::verify_field`.

@@ -31,9 +31,11 @@ use crate::block_spine::{
     BlockSpineUnifiedReduction,
 };
 
-const CHAIN_ACC_LINEAR_RELATION_TAG: u128 = 0x4348_4149_4E41_4301; // "CHAINAC"+1
-const CHAIN_ACC_PERMS_PER_ITEM: usize = 4;
-const CHAIN_ACC_PIN_LANES: usize = 2;
+// Public: the in-circuit trace transliteration (`noid_recursive::acceptance::trace`)
+// replays the chain relation from these same definitions; change both together.
+pub const CHAIN_ACC_LINEAR_RELATION_TAG: u128 = 0x4348_4149_4E41_4301; // "CHAINAC"+1
+pub const CHAIN_ACC_PERMS_PER_ITEM: usize = 4;
+pub const CHAIN_ACC_PIN_LANES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainAccumulatorItem {

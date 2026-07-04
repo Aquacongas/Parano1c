@@ -53,7 +53,9 @@ use std::time::{Duration, Instant};
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
 const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
 const ROUND_LIMIT: usize = 1 << ROUND_BITS; // 128
-const BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x4253_5049_4E54_5801; // "BSPINTX"+1
+// Public: the in-circuit trace transliteration replays the tx-hash pin relation
+// from this same definition; change both together.
+pub const BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x4253_5049_4E54_5801; // "BSPINTX"+1
 
 /// Per-variable degree of the unified block sumcheck (same as per-tx).
 pub const BLOCK_SPINE_ROUND_DEGREE: usize = 9;

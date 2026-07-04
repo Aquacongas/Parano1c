@@ -458,7 +458,7 @@ fn eq_at_boolean_index(index: usize, n: usize, r: &[Block128]) -> Block128 {
 }
 
 /// RLC batching weights for `m` claims: the powers `(1, α, α², …, α^{m−1})`
-/// of ONE squeezed challenge α (the F2 squeeze diet, roadmap O3; previously
+/// of ONE squeezed challenge α (the squeeze-diet transcript rule; previously
 /// one squeeze per claim).
 ///
 /// Soundness: for a nonzero claim-error vector `e`, the batched check only
@@ -466,10 +466,12 @@ fn eq_at_boolean_index(index: usize, n: usize, r: &[Block128]) -> Block128 {
 /// α, so the batching error is ≤ (m−1)/2^128 (Schwartz–Zippel) instead of
 /// 2^-128 with independent challenges. Largest batches in the protocol:
 /// the auth-FS transcript chain ≈ 2^15 claims @16 txs (native-only path,
-/// retired in P7) and the batched Merkle path chains ≈ 2^17 claims at the
+/// retired with the legacy checkpoint path) and the batched Merkle path
+/// chains ≈ 2^17 claims at the
 /// 255-tx max shape ⇒ worst-case batching error ≈ 2^-111. This is the
 /// accepted trade for removing ~1 FS permutation per claim from every
-/// verifier transcript (and ~360 constraints per claim from the SVT trace).
+/// verifier transcript (and ~360 constraints per claim from the in-circuit
+/// trace replay).
 /// If a pre-mainnet audit requires a strict ≥ 120-bit batching term, the
 /// localized upgrade is two-level batching (α-powers inside fixed-size
 /// chunks, β-powers across chunks) at one extra squeeze — decide before
@@ -568,11 +570,14 @@ fn absorb_linear_binding<T: FiatShamir<Block128>>(
     }
 }
 
-const MULTI_BATCH_EVAL_TAG: u128 = 0xA07D_6B12_BA7C_0001;
-const CLAIM_POINT_BOOL_TAG: u128 = 0xA07D_6B12_C1A1_0001;
-const CLAIM_POINT_DENSE_TAG: u128 = 0xA07D_6B12_C1A1_0002;
-const LINEAR_EVAL_TAG: u128 = 0xA07D_6B12_11EA_0001;
-const LINEAR_EVAL_PREBOUND_TAG: u128 = 0xA07D_6B12_11EA_0002;
+// Public: the in-circuit trace transliterations (`noid_recursive::acceptance::trace`)
+// absorb these same tags; referencing one definition keeps native and trace
+// in lockstep by construction; change both together.
+pub const MULTI_BATCH_EVAL_TAG: u128 = 0xA07D_6B12_BA7C_0001;
+pub const CLAIM_POINT_BOOL_TAG: u128 = 0xA07D_6B12_C1A1_0001;
+pub const CLAIM_POINT_DENSE_TAG: u128 = 0xA07D_6B12_C1A1_0002;
+pub const LINEAR_EVAL_TAG: u128 = 0xA07D_6B12_11EA_0001;
+pub const LINEAR_EVAL_PREBOUND_TAG: u128 = 0xA07D_6B12_11EA_0002;
 
 fn absorb_multi_claims<T: FiatShamir<Block128>>(
     channel: &mut T,

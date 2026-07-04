@@ -614,15 +614,15 @@ pub(crate) fn source_leaf_count(log_rows: usize) -> usize {
     1usize << (log_rows + LOG_RATE - 1)
 }
 
-pub(crate) fn source_tree_depth(log_rows: usize) -> usize {
+pub fn source_tree_depth(log_rows: usize) -> usize {
     log_rows + LOG_RATE - 1
 }
 
-pub(crate) fn source_cap_depth(log_rows: usize) -> usize {
+pub fn source_cap_depth(log_rows: usize) -> usize {
     SOURCE_CAP_DEPTH.min(source_tree_depth(log_rows))
 }
 
-pub(crate) fn source_cap_from_commitment_cap(
+pub fn source_cap_from_commitment_cap(
     cap: &MerkleCap,
     log_rows: usize,
 ) -> Option<&[SourceHash]> {
@@ -648,6 +648,12 @@ pub(crate) fn source_leaf_hash(
     source_leaf_hash_arithmetic(log_rows, n_cols, leaf_index, symbols, hasher)
 }
 
+/// Domain tag for encoded-source leaf hashes.
+///
+/// Public so the in-circuit trace twin can replay this definition;
+/// change both together.
+pub const SOURCE_LEAF_DOMAIN: u128 = 0xF21B_1D50_0000_0001u128;
+
 fn source_leaf_hash_arithmetic(
     log_rows: usize,
     n_cols: usize,
@@ -655,7 +661,6 @@ fn source_leaf_hash_arithmetic(
     symbols: &[Block128],
     hasher: &dyn CryptographicHasher,
 ) -> SourceHash {
-    const SOURCE_LEAF_DOMAIN: u128 = 0xF21B_1D50_0000_0001u128;
     let mut acc = hasher.hash_pair(
         &Block128::from(SOURCE_LEAF_DOMAIN),
         &Block128::from(log_rows as u128),
@@ -673,7 +678,7 @@ fn source_leaf_hash_arithmetic(
     acc
 }
 
-pub(crate) fn source_leaf_positions(log_rows: usize, leaf_index: usize) -> (usize, usize) {
+pub fn source_leaf_positions(log_rows: usize, leaf_index: usize) -> (usize, usize) {
     assert!(log_rows > 0);
     let half = 1usize << (log_rows - 1);
     let local_mask = half - 1;

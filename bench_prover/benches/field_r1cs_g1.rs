@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Gate **G1** bench for the FieldR1cs substrate (roadmap P1, `s4-design.md`
-//! §6): prove a synthetic 2^19-constraint F128 trace and check the ≤ 4 s
-//! budget on reference hardware; report sustained constraints/s for the G1b
-//! decision (required ≈ 0.27M/s for the post-diet 16-tx [K] at the 15 s block
-//! time; ≈ 1.0M/s for a 4 s p95 target).
+//! Substrate throughput bench for the FieldR1cs prover: prove a synthetic
+//! 2^19-constraint F128 trace and check the ≤ 4 s budget on reference
+//! hardware; report sustained constraints/s against the per-block proving
+//! budget (a 16-tx verifier-replay trace is ≈ 4M constraints and must be
+//! provable well inside the 15 s block time; ≈ 0.27M/s sustained is the
+//! floor, ≈ 1.0M/s the 4 s p95 target).
 //!
 //! Cases: 2^17 / 2^18 / 2^19 constraints (k_log = 16 — production-shaped
-//! blocks), PCS log_inv_rate = 4 (the G1 profile), log_batch_size = 5.
+//! blocks), PCS log_inv_rate = 4, log_batch_size = 5.
 //! `NOIDH_FIELD_PROVE_TIMING=1` adds the per-phase prover split.
 
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ const REPEATS: usize = 3;
 fn main() {
     noid_ivc_prover::init_perf_thread_pool();
     let threads = rayon::current_num_threads();
-    println!("== FieldR1cs G1 bench (P1) — rayon threads: {threads} ==\n");
+    println!("== FieldR1cs substrate bench — rayon threads: {threads} ==\n");
 
     let mut g1_result: Option<(Duration, f64)> = None;
 
@@ -35,7 +36,7 @@ fn main() {
     // rates — the commit (Merkle over the codeword) is the dominant prover
     // cost, and rate trades hashing volume against FRI query count
     // (110 @ 1/16 … 148 @ 1/4), i.e. prover time against proof size and the
-    // P4 [R]-trace query-replay budget.
+    // recursion slot's in-circuit query-replay budget.
     for &(m, k_log, log_inv_rate) in &[
         (17usize, 16usize, 2usize),
         (18, 16, 2),

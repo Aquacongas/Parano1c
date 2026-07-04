@@ -417,16 +417,17 @@ fn digest_has_leading_zero_bits(h: &[u8; 32], bits: u32) -> bool {
 
 // ---------------------------------------------------------------------------
 // FsLaneChallenger — lane-oriented Fiat-Shamir transcript (the FieldR1cs /
-// SVT-facing challenger, P2).
+// trace-facing challenger).
 //
 // The byte-oriented FsChallenger above absorbs 1–2-byte op tags, so its lane
 // packing is never 16-byte aligned and an in-circuit replay would need
 // bit-splitting with range checks. This challenger absorbs whole 16-byte
 // LANES only: every op is one constant header lane (op, kind, length)
 // followed by value/byte lanes, so an absorbed lane is an *affine* function
-// of the observed field elements — exactly what the SVT trace gadget
+// of the observed field elements — exactly what the in-circuit trace gadget
 // (`crate::field_circuit::FsChannelTrace`) replays, and the same shape as
-// the killshot channel (`Poseidon2bChannel`) that P3 replays.
+// the killshot channel (`Poseidon2bChannel`) that the killshot traces
+// replay.
 //
 // State is kept in the FLAT (GCM) basis — bit-identical to the circuit's
 // F128 wires; the permutation runs through the tower-basis production

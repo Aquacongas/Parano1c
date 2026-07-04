@@ -180,7 +180,7 @@ pub fn prove_exact_state_killshot(
 /// Delegates to the canonical verifier in
 /// `noid_recursive::block_certificate_backend` — the logic used to be
 /// duplicated here line-for-line on mirror types; one copy must stay the
-/// single reference the SVT trace shadows (roadmap O1b / risk R5).
+/// single reference the in-circuit trace shadows; change both together.
 pub fn verify_exact_state_killshot(
     inputs: &ExactStateKillShotInputs,
     proof: &ExactStateKillShotProof,

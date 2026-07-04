@@ -1,4 +1,4 @@
-//! End-to-end FieldR1cs prove → verify tests (P1): honest roundtrip, false
+//! End-to-end FieldR1cs prove → verify tests: honest roundtrip, false
 //! witnesses, and mutation of every proof/commitment component → reject.
 
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};

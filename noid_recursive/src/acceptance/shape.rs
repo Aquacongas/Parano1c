@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 //! Measured tier-1 verifier statistics — the empirical shape inputs for the
-//! SVT trace (`s4-design.md` §6, `roadmap.md` P0/P0.5).
+//! acceptance-proof trace (the arithmetic F128 replay of the block
+//! verifiers).
 //!
 //! Measured 2026-07-03 by `bench_prover/benches/tier1_shape_stats.rs`
 //! **after the O3 squeeze diet** (RLC batching weights are powers of one
@@ -13,11 +14,13 @@
 //! (exact production challenge stream; exact Poseidon2b permutation counts).
 //!
 //! These are *measured statistics*, not yet the frozen protocol shape: the
-//! final padding maxima and loop bounds (the real `shape_digest` of
-//! `s4-design.md` §4.3) are fixed in P3, after the [K] restructuring decisions
-//! recorded in `s4-design.md` §6 (drop of the auth-FS-transcript killshot from
-//! the trace — F1). Until then, any consumer of these numbers must treat them
-//! as the P0.5 snapshot pinned by [`shape_stats_digest`].
+//! final padding maxima and loop bounds (the real `shape_digest` of the
+//! public proof interface) are frozen together with the shape classes. Note
+//! that the auth-FS-transcript killshot is excluded from the trace budget:
+//! replaying the owner-auth verifier directly is ~3.9x cheaper than
+//! verifying the killshot that proves its transcript hashing. Until the
+//! freeze, any consumer of these numbers must treat them as the measurement
+//! snapshot pinned by [`shape_stats_digest`].
 //!
 //! Regenerate: `cargo bench -p bench_prover --bench tier1_shape_stats`
 //! (update this file and the digest test in the same commit).
@@ -25,7 +28,8 @@
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 /// Constraint cost of one Poseidon2b permutation in the F128 arithmetic trace
-/// (option A of `s4-design.md` §4.1): 90 S-boxes x 4 multiplications.
+/// (linear layers live in the F128-coefficient matrices for free):
+/// 90 S-boxes x 4 multiplications.
 pub const PERM_TRACE_CONSTRAINTS: usize = 360;
 
 /// Aggregate Fiat-Shamir transcript statistics of one verifier component
@@ -68,7 +72,7 @@ impl CaseStats {
     }
 
     /// [K] perms excluding the auth-FS-transcript killshot, which has negative
-    /// leverage inside the trace (finding F1 in `s4-design.md` §6): replaying
+    /// leverage inside the trace: replaying
     /// the owner-auth verifier directly is ~3.9x cheaper than verifying the
     /// killshot that proves its transcript hashing.
     pub fn perms_without_auth_fs(&self) -> u64 {
@@ -217,19 +221,19 @@ pub const MEASURED_CASES: &[&CaseStats] = &[
 ];
 
 /// Marginal verifier-FS permutations per standard tx, full replay:
-/// (18538 - 862) / 16, floored. (Pre-diet P0 value: 1,820.)
+/// (18538 - 862) / 16, floored. (Pre-squeeze-diet value: 1,820.)
 pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 1_104;
 
 /// Marginal perms per standard tx once the auth-FS-transcript killshot is
-/// dropped from the trace (F1): (11372 - 862) / 16, floored.
-/// (Pre-diet P0 value: 835.)
+/// dropped from the trace: (11372 - 862) / 16, floored.
+/// (Pre-squeeze-diet value: 835.)
 pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 = 656;
 
 /// Marginal verifier-FS permutations per full Sweep25x2 tx, full replay:
 /// (19608 - 862) / 4, floored.
 pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 4_686;
 
-/// Marginal perms per full Sweep25x2 tx after F1 (auth-FS-transcript killshot
+/// Marginal perms per full Sweep25x2 tx (auth-FS-transcript killshot
 /// dropped): (19608 - 3118 - 862) / 4. Dominated by the exact-state Merkle
 /// path batch (27 touched slots per sweep vs 2 per standard tx).
 pub const MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS: u32 = 3_907;
@@ -241,11 +245,11 @@ pub const BLOCK_MAX_FULL_SWEEP_TXS: usize =
     noid_chain::consensus::params::BLOCK_MAX_FULL_SWEEP25X2_TXS;
 
 /// Projected full-replay [K] permutations for a block of `n` standard txs,
-/// after F1 (auth-FS-transcript killshot dropped).
+/// without the auth-FS-transcript killshot.
 ///
 /// Linear extrapolation of the 16-tx measurement — a conservative UPPER
 /// bound: the env-gated 255-tx run (`NOID_SHAPE_MAX_STD=1`, 2026-07-03,
-/// post-diet) measured 134,904 perms after F1 vs 168,142 projected (−20%),
+/// post-diet) measured 134,904 perms (no auth-FS) vs 168,142 projected (−20%),
 /// because batched-killshot round/terminal costs amortize with batch size
 /// while this projection scales them linearly.
 pub fn projected_perms_std_txs_no_auth_fs(n: usize) -> u64 {
@@ -253,15 +257,16 @@ pub fn projected_perms_std_txs_no_auth_fs(n: usize) -> u64 {
 }
 
 /// Projected full-replay [K] permutations for a block of `n` full Sweep25x2
-/// txs, after F1. Same conservative linear extrapolation as
+/// txs, without the auth-FS-transcript killshot. Same conservative linear
+/// extrapolation as
 /// [`projected_perms_std_txs_no_auth_fs`].
 pub fn projected_perms_sweep_txs_no_auth_fs(n: usize) -> u64 {
     CASE_COINBASE_ONLY.total_perms() + n as u64 * MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS as u64
 }
 
 /// Conservative [K] perms upper bound for the consensus-max standard block
-/// (255 user txs). Measured post-diet @255: 134,904 perms after F1
-/// (249,138 full replay, ~2^26.4 constraints full / ~2^25.5 after F1).
+/// (255 user txs). Measured post-diet @255: 134,904 perms without auth-FS
+/// (249,138 full replay, ~2^26.4 constraints full / ~2^25.5 without).
 pub fn projected_perms_max_standard_block_no_auth_fs() -> u64 {
     projected_perms_std_txs_no_auth_fs(BLOCK_MAX_STANDARD_USER_TXS)
 }
@@ -274,10 +279,10 @@ pub fn projected_perms_max_sweep_block_no_auth_fs() -> u64 {
 
 const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V2";
 
-/// Digest pinning this P0.5 (post-squeeze-diet) measurement snapshot.
-/// Referenced by `s4-design.md` §6 so later phases can detect a stale table.
-/// NOT the protocol `shape_digest` of the SVT public interface (that is
-/// frozen in P3).
+/// Digest pinning this (post-squeeze-diet) measurement snapshot, so
+/// downstream consumers can detect a stale table. NOT the protocol
+/// `shape_digest` of the public proof interface (that is frozen with the
+/// shape classes).
 pub fn shape_stats_digest() -> [u8; 32] {
     let mut encoded: Vec<u8> = Vec::new();
     encoded.extend_from_slice(&(PERM_TRACE_CONSTRAINTS as u32).to_le_bytes());
@@ -342,7 +347,7 @@ mod tests {
         assert_eq!(projected_perms_max_standard_block_no_auth_fs(), 168_142);
         assert_eq!(projected_perms_max_sweep_block_no_auth_fs(), 157_142);
         // The linear projection must stay an upper bound on the measured
-        // env-gated 255-tx run (134,904 perms after F1, 2026-07-03).
+        // env-gated 255-tx run (134,904 perms without auth-FS, 2026-07-03).
         assert!(projected_perms_max_standard_block_no_auth_fs() >= 134_904);
     }
 

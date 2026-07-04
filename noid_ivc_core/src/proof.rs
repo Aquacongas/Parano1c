@@ -32,7 +32,7 @@ pub struct R1csProofLigerito {
     pub pcs_open: pcs::BatchOpeningProofLigerito,
 }
 
-/// Top-level **FieldR1cs** proof (P1): field zerocheck + lincheck
+/// Top-level **FieldR1cs** proof: field zerocheck + lincheck
 /// transcripts, plus one batched quirky-direct PCS opening (BaseFold, no
 /// ring-switch — the committed vector IS the F128-element witness).
 #[derive(Clone, Debug, Serialize, Deserialize)]

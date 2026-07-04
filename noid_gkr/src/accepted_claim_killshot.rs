@@ -27,9 +27,11 @@ use crate::block_spine::{
 };
 
 pub const ACCEPTED_CLAIM_FIELDS: usize = 80;
-const ACCEPTED_CLAIM_BLOCKS: usize = ACCEPTED_CLAIM_FIELDS / 2;
-const ACCEPTED_CLAIM_PIN_LANES: usize = 2;
-const ACCEPTED_CLAIM_LINEAR_RELATION_TAG: u128 = 0x4143_4342_4C4B_0001; // "ACCBLK"+1
+// Public: the in-circuit trace transliteration replays the claim-chain relation and
+// the prebound linear-eval tag from these same definitions; change both together.
+pub const ACCEPTED_CLAIM_BLOCKS: usize = ACCEPTED_CLAIM_FIELDS / 2;
+pub const ACCEPTED_CLAIM_PIN_LANES: usize = 2;
+pub const ACCEPTED_CLAIM_LINEAR_RELATION_TAG: u128 = 0x4143_4342_4C4B_0001; // "ACCBLK"+1
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedClaimHashInputs {

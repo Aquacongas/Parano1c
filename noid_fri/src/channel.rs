@@ -87,17 +87,26 @@ impl Channel {
     }
 
     /// Absorb a `VectorCommitment` (root hash + depth).
+    ///
+    /// The depth is absorbed as one whole 16-byte lane (u128 LE) so every
+    /// absorb in the protocol stays rate-lane aligned — the in-circuit
+    /// replay of this channel (the recursive acceptance proof re-verifies
+    /// FRI openings in-circuit) is a lane duplex, and a misaligned integer
+    /// absorb would force bit-split range checks on every subsequent witness
+    /// value.
     pub fn observe_vector_commitment(&mut self, commitment: &VectorCommitment) {
         self.enter_absorb_mode();
         self.sponge.update(&commitment.root);
-        self.sponge.update(&(commitment.depth as u64).to_le_bytes());
+        self.sponge.update(&(commitment.depth as u128).to_le_bytes());
     }
 
     /// Absorb a `FriCommitment` (vector commitment + packing factor).
+    ///
+    /// Same lane-alignment rule as [`Self::observe_vector_commitment`].
     pub fn observe_fri_commitment(&mut self, commitment: &FriCommitment) {
         self.observe_vector_commitment(&commitment.vector_commitment);
         self.sponge
-            .update(&(commitment.packing_factor as u64).to_le_bytes());
+            .update(&(commitment.packing_factor as u128).to_le_bytes());
     }
 
     // -----------------------------------------------------------------------

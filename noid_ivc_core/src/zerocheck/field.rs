@@ -1,5 +1,5 @@
-//! Zerocheck PIOP over an **F128-valued** hypercube — the FieldR1cs substrate
-//! (P1, `s4-design.md` §4.1).
+//! Zerocheck PIOP over an **F128-valued** hypercube — the FieldR1cs
+//! substrate.
 //!
 //! Proves `a(y) · b(y) + c(y) = 0` for all `y ∈ {0,1}^m`, where `a`, `b`, `c`
 //! are vectors of `2^m` **field elements** (the boolean parent module proves
@@ -22,7 +22,8 @@
 //!    Every eq weight in this protocol is drawn from the transcript.
 //! 2. **No `r_skip` sampling.** The boolean path samples `k_skip` challenges
 //!    it never uses (vestigial lockstep). Dropping them saves 6 squeezes per
-//!    verify — which the SVT trace replays at ~360 constraints each.
+//!    verify — which the in-circuit verifier trace replays at ~360
+//!    constraints each.
 //! 3. **Fresh domain label** (`history-field-zerocheck-v0`): field and boolean
 //!    transcripts can never be confused for one another.
 //!

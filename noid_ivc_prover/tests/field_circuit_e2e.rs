@@ -1,7 +1,7 @@
-//! P2 end-to-end: builder-produced traces through the full FieldR1cs
+//! End-to-end: builder-produced traces through the full FieldR1cs
 //! prove → verify pipeline with the lane-oriented challenger.
 //!
-//! The 1000-permutation chain is the P1/P2 synthetic-trace acceptance test:
+//! The 1000-permutation chain is the synthetic-trace acceptance test:
 //! a real 2^19-constraint instance whose witness is a Poseidon2b permutation
 //! chain, with the final state pinned to the natively computed value.
 
@@ -83,7 +83,7 @@ fn thousand_permutation_chain_roundtrip() {
 
 /// An FS-trace circuit proven end-to-end: the trace replays a lane-challenger
 /// transcript (labels, observes, samples, PoW) and pins the sampled
-/// challenges to the natively derived values — the P3 [K]-slot pattern in
+/// challenges to the natively derived values — the killshot-slot pattern in
 /// miniature.
 #[test]
 fn fs_trace_circuit_roundtrip() {

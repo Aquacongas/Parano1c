@@ -126,7 +126,7 @@ pub struct PackedDirectClaim {
 }
 
 /// A **quirky-point** evaluation claim on the packed MLE — the FieldR1cs
-/// opening (P1). The committed vector is read as `2^L` F128 *elements*
+/// opening. The committed vector is read as `2^L` F128 *elements*
 /// (`L = m − LOG_PACKING`) and the claim point is a zerocheck/lincheck
 /// QuirkyPoint over those element variables: `z_skip` binds the low `k_skip`
 /// vars via the φ_8 Lagrange basis, `x_rest` (length `L − k_skip`) binds the

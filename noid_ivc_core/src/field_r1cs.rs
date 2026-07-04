@@ -1,11 +1,12 @@
-//! Block-diagonal R1CS over F_{2^128} — the SVT substrate (P1).
+//! Block-diagonal R1CS over F_{2^128} — the substrate of the recursive
+//! acceptance proof.
 //!
 //! Generalizes [`crate::r1cs::BlockR1cs`] from a boolean witness to
 //! `z ∈ F_{2^128}^{2^m}`: the relation is `(A·z) ⊙ (B·z) = C·z` with the
 //! Hadamard product now a genuine field multiplication per constraint row.
-//! Design: `s4-design.md` §4.1, **option A** — the sparse base matrices carry
-//! F128 coefficients, so linear layers (Poseidon2b MDS, round constants via
-//! the constant wire) cost zero extra constraints.
+//! The sparse base matrices carry F128 coefficients, so linear layers
+//! (Poseidon2b MDS, round constants via the constant wire) cost zero extra
+//! constraints.
 //!
 //! Conventions shared with the boolean path:
 //! - `C = I` (circuit R1CS): every witness element is constrained as
@@ -237,7 +238,7 @@ pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize)
 // ---------------------------------------------------------------------------
 
 /// Column-major (CSC) [`LincheckCircuit`] over a pair of F128-coefficient
-/// matrices — the option-A seam (`s4-design.md` §4.1): the eq-weighted column
+/// matrices: vs the binary-matrix fold, the eq-weighted column
 /// marginal gains one field multiplication per nonzero,
 ///
 ///   `comb[c] = α · Σ_{(r,κ) ∈ colA(c)} κ · eq_inner[r]
@@ -358,13 +359,13 @@ impl LincheckCircuit for FieldCscCircuit {
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic instances (tests + the G1 bench)
+// Synthetic instances (tests + the substrate throughput bench)
 // ---------------------------------------------------------------------------
 
-/// Deterministic synthetic satisfiable instance + witness — the P1 test/bench
-/// fixture (a stand-in for the P2 gadget traces).
+/// Deterministic synthetic satisfiable instance + witness — test/bench
+/// fixture (a stand-in for builder-produced gadget traces).
 ///
-/// Shape mimics an SVT verifier trace: column 0 of every block is the
+/// Shape mimics a verifier-replay trace: column 0 of every block is the
 /// constant-one wire (`const_pin = Some(0)`, row-0 constraint `z_0² = z_0`
 /// with the honest witness at 1), every later row is a multiplication of two
 /// coefficient-weighted combinations of earlier wires (strictly

@@ -711,7 +711,7 @@ where
 /// identifies which sibling nodes are NOT derivable from other query leaves
 /// and stores only those. Nodes that appear as query leaves or as
 /// computable parents of query leaves are omitted.
-pub(crate) fn build_batched_merkle_proof(
+pub fn build_batched_merkle_proof(
     tree: &MerkleTree,
     leaf_indices: &[usize],
     depth: usize,
@@ -882,7 +882,7 @@ fn sorted_unique_leaf_hashes(
 // ---------------------------------------------------------------------------
 
 /// Generate compact query indices.
-pub(crate) fn gen_compact_queries(
+pub fn gen_compact_queries(
     channel: &mut Channel,
     log_max_len: usize,
     num_queries: usize,
@@ -901,7 +901,10 @@ pub(crate) fn gen_compact_queries(
 }
 
 /// Compute the tree depth for a given round.
-fn compute_round_depth(n_rounds: usize, round: usize) -> usize {
+///
+/// Public so the in-circuit trace twin can replay this definition;
+/// change both together.
+pub fn compute_round_depth(n_rounds: usize, round: usize) -> usize {
     // Round 0: domain = 2^(n_rounds + LOG_RATE), tree over pairs = 2^(n_rounds + LOG_RATE - 1)
     // depth = n_rounds + LOG_RATE - 1 - round
     n_rounds + LOG_RATE - 1 - round

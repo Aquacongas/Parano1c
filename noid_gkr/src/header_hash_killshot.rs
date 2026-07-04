@@ -28,11 +28,13 @@ use crate::block_spine::{
 };
 
 pub const HEADER_HASH_FIELDS: usize = 16;
-const HEADER_HASH_BLOCK_PERMS: usize = 9;
-const HEADER_HASH_POW_PERMS: usize = 8;
-const HEADER_HASH_PERMS_PER_ITEM: usize = HEADER_HASH_BLOCK_PERMS + HEADER_HASH_POW_PERMS;
-const HEADER_HASH_PIN_LANES: usize = 2;
-const HEADER_HASH_LINEAR_RELATION_TAG: u128 = 0x4844_5248_4153_4801; // "HDRHASH"+1
+// Public: the in-circuit trace transliteration (`noid_recursive::acceptance::trace`)
+// replays the chain relation from these same definitions; change both together.
+pub const HEADER_HASH_BLOCK_PERMS: usize = 9;
+pub const HEADER_HASH_POW_PERMS: usize = 8;
+pub const HEADER_HASH_PERMS_PER_ITEM: usize = HEADER_HASH_BLOCK_PERMS + HEADER_HASH_POW_PERMS;
+pub const HEADER_HASH_PIN_LANES: usize = 2;
+pub const HEADER_HASH_LINEAR_RELATION_TAG: u128 = 0x4844_5248_4153_4801; // "HDRHASH"+1
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderHashInputs {

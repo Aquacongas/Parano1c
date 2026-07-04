@@ -27,9 +27,9 @@ use crate::block_spine::{
     BlockSpineUnifiedReduction,
 };
 
-const SLOT_LEAF_LINEAR_RELATION_TAG: u128 = 0x4558_5354_534C_5401; // "EXSTSLT"+1
-const SLOT_LEAF_PERMS: usize = 2;
-const SLOT_LEAF_PIN_LANES: usize = 2;
+pub const SLOT_LEAF_LINEAR_RELATION_TAG: u128 = 0x4558_5354_534C_5401; // "EXSTSLT"+1
+pub const SLOT_LEAF_PERMS: usize = 2;
+pub const SLOT_LEAF_PIN_LANES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotLeafInputs {

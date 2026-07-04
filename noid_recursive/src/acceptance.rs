@@ -10,24 +10,26 @@
 //! payloads are pruned. So the recursion must carry a *proof* that the block's
 //! execution was verified. That proof is the tier-1 deliverable.
 //!
-//! Strategy (current, 2026-07-03): **Self-Verifying Trace (SVT)** — see
-//! `s4-design.md` (spec) and `roadmap.md` (P0–P7). The acceptance proof is a
+//! Strategy: **Self-Verifying Trace** — the acceptance proof is a
 //! zero-check killshot over an arithmetic F128 trace that replays the block's
 //! killshot verifiers ([K]), their discharges ([D]), the full verifier of the
 //! previous proof ([R] — real recursion), and the receipt/accumulator bindings
-//! ([B]). The earlier boolean-R1CS + deferred-FRI strategy was measured out in
-//! Slice 2 (one Poseidon2b permutation ≈ 1.69M boolean rows) and replaced; the
-//! boolean sponge tests below remain as substrate proof-of-life until P7.
+//! ([B]). An earlier boolean-R1CS strategy was measured out (one Poseidon2b
+//! permutation ≈ 1.69M boolean rows vs ≈ 360 F128-trace constraints) and
+//! replaced; the boolean sponge tests below remain as substrate
+//! proof-of-life until the cut-over completes.
 //!
 //! This module currently provides the strategy-independent boundary:
-//!   * the [`AcceptanceProof`] envelope (v1; becomes the π envelope in P5),
+//!   * the [`AcceptanceProof`] envelope (v1; becomes the recursive-proof
+//!     envelope),
 //!   * the native reference relation [`verify_acceptance_against_projection`],
 //!     which binds a [`BlockProofAcceptanceReceipt`] to the locally validated
 //!     [`HeaderProjectionSlot`] — pure equality, never re-proving PoW/ASERT/MTP
 //!     (this is the [B] slot of the trace), and
-//!   * [`shape`] — the P0 measured verifier statistics that size the trace.
+//!   * [`shape`] — measured verifier statistics that size the trace.
 
 pub mod shape;
+pub mod trace;
 
 use noid_poseidon2b::primitives::Digest;
 
