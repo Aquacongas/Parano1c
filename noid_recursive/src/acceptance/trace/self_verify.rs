@@ -139,8 +139,10 @@ fn pad_half_block_lane() -> F128 {
 
 /// Trace twin of `noid_ivc_core::merkle::hash_leaf` for a lane-aligned leaf
 /// (`data = lanes × 16 bytes` — every PCS leaf payload is a slice of
-/// F_{2^128} values). Replays the `IVCPCSL_` flat duplex: rate-2 absorbs,
-/// `0x80…01` pad, digest = the two rate lanes. All-constant inputs fold.
+/// F_{2^128} values). Mirrors the native length dispatch: an even lane
+/// count (block-aligned bytes) runs the fixed-length no-pad mode
+/// (`IVCPCSF_`, length-bound IV, one permutation per block); an odd count
+/// runs the padded `IVCPCSL_` duplex. All-constant inputs fold.
 pub fn merkle_hash_leaf_lanes_trace(
     b: &mut FieldR1csBuilder,
     lanes: &[LinExpr],
@@ -153,7 +155,13 @@ pub fn merkle_hash_leaf_lanes_trace(
         return const_flat_digest(&merkle::hash_leaf(&bytes));
     }
 
-    let [iv_hi, iv_lo] = tag_iv_flat_f128(MERKLE_LEAF_TAG);
+    let fixed = !lanes.is_empty() && lanes.len() % 2 == 0;
+    let [iv_hi, iv_lo] = if fixed {
+        let [hi, lo] = merkle::leaf_fixed_iv_flat(lanes.len() * 16);
+        [f128_from_u128(hi), f128_from_u128(lo)]
+    } else {
+        tag_iv_flat_f128(MERKLE_LEAF_TAG)
+    };
     let mut state = [
         LinExpr::zero(),
         LinExpr::zero(),
@@ -178,8 +186,8 @@ pub fn merkle_hash_leaf_lanes_trace(
             let pad = LinExpr::constant(pad_half_block_lane());
             absorb_block(b, &mut state, &last.clone(), &pad);
         }
-        _ => {
-            // Whole number of blocks absorbed: a full pad block follows.
+        _ if !fixed => {
+            // Padded mode, whole number of blocks: a full pad block follows.
             let [p0, p1] = pad_full_block_lanes();
             absorb_block(
                 b,
@@ -187,6 +195,9 @@ pub fn merkle_hash_leaf_lanes_trace(
                 &LinExpr::constant(p0),
                 &LinExpr::constant(p1),
             );
+        }
+        _ => {
+            // Fixed no-pad mode: squeeze the block-aligned state directly.
         }
     }
     [state[0].clone(), state[1].clone()]
@@ -1484,9 +1495,10 @@ mod tests {
     }
 
     /// The module's private tag copies match the ones `noid_ivc_core::merkle`
-    /// actually hashes with: a one-permutation feed-forward compress and a
-    /// flat leaf sponge built here from the DUPLICATED tags reproduce the
-    /// native digests.
+    /// actually hashes with: a one-permutation feed-forward compress plus
+    /// both leaf modes (fixed no-pad for block-aligned lengths, padded
+    /// otherwise) built here from the DUPLICATED tags / shared IV helper
+    /// reproduce the native digests.
     #[test]
     fn duplicated_tags_match_native_merkle() {
         use noid_poseidon2b::native::{
@@ -1498,7 +1510,13 @@ mod tests {
             merkle::hash_pair(&l, &r),
             compress_flat_feed_forward_with_tag(MERKLE_NODE_TAG, &l, &r),
         );
+        // Block-aligned leaf → fixed no-pad mode on the length-bound IV.
         let data: Vec<u8> = (0..64u8).collect();
+        let mut s = Poseidon2bFlatSponge::with_iv_flat(merkle::leaf_fixed_iv_flat(data.len()));
+        s.update(&data);
+        assert_eq!(merkle::hash_leaf(&data), s.finalize_no_pad());
+        // Odd-lane leaf → padded duplex on the module's duplicated tag.
+        let data: Vec<u8> = (0..48u8).collect();
         let mut s = Poseidon2bFlatSponge::with_tag(MERKLE_LEAF_TAG);
         s.update(&data);
         assert_eq!(merkle::hash_leaf(&data), s.finalize());

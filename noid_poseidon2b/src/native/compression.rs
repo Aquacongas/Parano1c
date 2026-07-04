@@ -296,9 +296,15 @@ pub struct Poseidon2bFlatSponge {
 impl Poseidon2bFlatSponge {
     /// Construct a flat sponge seeded with the tag's capacity IV (flat).
     pub fn with_tag(tag: DomainTag) -> Self {
-        let [iv_hi, iv_lo] = capacity_iv_flat(tag);
+        Self::with_iv_flat(capacity_iv_flat(tag))
+    }
+
+    /// Construct a flat sponge from explicit flat capacity-IV words — for
+    /// constructions that bind extra domain data (e.g. a fixed message
+    /// length) into the capacity alongside the tag.
+    pub fn with_iv_flat(iv: [u128; 2]) -> Self {
         Self {
-            state: [0, 0, iv_hi, iv_lo],
+            state: [0, 0, iv[0], iv[1]],
             buffer: [0u8; 32],
             filled_bytes: 0,
         }
@@ -336,6 +342,23 @@ impl Poseidon2bFlatSponge {
     pub fn finalize(mut self) -> [u8; 32] {
         fill_padding(&mut self.buffer[self.filled_bytes..]);
         self.permute_buffer();
+        self.squeeze_32()
+    }
+
+    /// Squeeze a 32-byte digest without a padding flush. Only sound for
+    /// **fixed-length** absorb schedules that end block-aligned
+    /// (`filled_bytes == 0`); domain separation from the pad-flushed
+    /// [`Self::finalize`] must come from the capacity IV (a distinct tag,
+    /// with the fixed length bound in — see the PCS fixed-leaf mode).
+    pub fn finalize_no_pad(self) -> [u8; 32] {
+        debug_assert_eq!(
+            self.filled_bytes, 0,
+            "finalize_no_pad requires a whole number of rate blocks"
+        );
+        self.squeeze_32()
+    }
+
+    fn squeeze_32(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
         out[..16].copy_from_slice(&self.state[0].to_le_bytes());
         out[16..].copy_from_slice(&self.state[1].to_le_bytes());

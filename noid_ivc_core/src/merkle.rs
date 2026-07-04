@@ -24,17 +24,30 @@
 
 use noid_poseidon2b::batch::{
     POSEIDON2B_BATCH_LANES, compress_flat_ff_batch_interleaved_with_tag_into,
-    leaf_sponge_flat_batch_with_tag_into,
+    leaf_sponge_flat_batch_with_iv_into,
 };
 use noid_poseidon2b::native::{
-    DomainTag, Poseidon2bFlatSponge, compress_flat_feed_forward_with_tag,
+    DomainTag, Poseidon2bFlatSponge, capacity_iv_flat, compress_flat_feed_forward_with_tag,
 };
 use rayon::prelude::*;
 
 pub type Hash = [u8; 32];
 
 const POSEIDON_MERKLE_LEAF_TAG: DomainTag = DomainTag::new(b"IVCPCSL_");
+/// Fixed-length (no-pad) leaf mode: block-aligned leaves skip the padding
+/// permutation. Distinct from `IVCPCSL_` so the two modes cannot collide,
+/// with the leaf byte length bound into the capacity IV because the no-pad
+/// sponge drops the length framing that padding provides.
+const POSEIDON_MERKLE_LEAF_FIXED_TAG: DomainTag = DomainTag::new(b"IVCPCSF_");
 const POSEIDON_MERKLE_NODE_TAG: DomainTag = DomainTag::new(b"IVCPCSN_");
+
+/// Capacity IV of the fixed-length leaf mode for `len`-byte leaves
+/// (`len % 32 == 0`): the tag IV with the length XOR-bound into the high
+/// capacity word — every leaf length is its own hash domain.
+pub fn leaf_fixed_iv_flat(len: usize) -> [u128; 2] {
+    let [hi, lo] = capacity_iv_flat(POSEIDON_MERKLE_LEAF_FIXED_TAG);
+    [hi ^ (len as u128), lo]
+}
 
 /// Global PCS commitment-tree Poseidon2b counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
@@ -50,9 +63,13 @@ pub mod hash_count {
     /// Hash work units for one leaf hash of `len` bytes.
     #[inline]
     pub fn leaf_hash_units(len: usize) -> u64 {
-        // The flat leaf sponge absorbs `len` bytes (IV in capacity, no
-        // domain-string prefix), then one final padded permutation.
-        (len / 32 + 1) as u64
+        // Block-aligned leaves run the fixed-length no-pad mode (one
+        // permutation per rate block); others pay one padded permutation.
+        if len % 32 == 0 && len > 0 {
+            (len / 32) as u64
+        } else {
+            (len / 32 + 1) as u64
+        }
     }
 
     #[inline]
@@ -77,7 +94,12 @@ pub mod hash_count {
     }
 }
 
-/// Hash one leaf of arbitrary byte length (flat-basis lane sponge).
+/// Hash one leaf (flat-basis lane sponge). Dispatches on the byte length:
+/// block-aligned leaves — every PCS leaf is a whole number of rate blocks —
+/// run the fixed-length no-pad mode (`IVCPCSF_` + length-bound IV, one
+/// permutation per block); any other length runs the padded `IVCPCSL_`
+/// duplex. The dispatch is a pure function of the length, so tree builders
+/// and query verifiers can never disagree on the mode.
 #[inline]
 pub fn hash_leaf(data: &[u8]) -> Hash {
     #[cfg(feature = "hash-count")]
@@ -86,9 +108,15 @@ pub fn hash_leaf(data: &[u8]) -> Hash {
         hash_count::LEAF_CALLS.fetch_add(1, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(hash_count::leaf_hash_units(data.len()), Relaxed);
     }
-    let mut sponge = Poseidon2bFlatSponge::with_tag(POSEIDON_MERKLE_LEAF_TAG);
-    sponge.update(data);
-    sponge.finalize()
+    if data.len() % 32 == 0 && !data.is_empty() {
+        let mut sponge = Poseidon2bFlatSponge::with_iv_flat(leaf_fixed_iv_flat(data.len()));
+        sponge.update(data);
+        sponge.finalize_no_pad()
+    } else {
+        let mut sponge = Poseidon2bFlatSponge::with_tag(POSEIDON_MERKLE_LEAF_TAG);
+        sponge.update(data);
+        sponge.finalize()
+    }
 }
 
 /// Hash a pair of children into a parent node (64 B → 32 B, one
@@ -148,17 +176,18 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
                 Relaxed,
             );
         }
+        // Same mode dispatch as `hash_leaf`: block-aligned → fixed no-pad.
+        let (iv, pad) = if leaf_size % 32 == 0 {
+            (leaf_fixed_iv_flat(leaf_size), false)
+        } else {
+            (capacity_iv_flat(POSEIDON_MERKLE_LEAF_TAG), true)
+        };
         const LEAF_PAR_CHUNK: usize = 256;
         tree[..num_leaves]
             .par_chunks_mut(LEAF_PAR_CHUNK)
             .zip(data.par_chunks(LEAF_PAR_CHUNK * leaf_size))
             .for_each(|(out, input)| {
-                leaf_sponge_flat_batch_with_tag_into(
-                    POSEIDON_MERKLE_LEAF_TAG,
-                    input,
-                    leaf_size,
-                    out,
-                );
+                leaf_sponge_flat_batch_with_iv_into(iv, pad, input, leaf_size, out);
             });
     }
 

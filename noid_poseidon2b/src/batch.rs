@@ -681,7 +681,33 @@ pub fn leaf_sponge_flat_batch_with_tag_into(
     leaf_size: usize,
     out: &mut [[u8; 32]],
 ) {
+    leaf_sponge_flat_batch_with_iv_into(
+        crate::native::domain::capacity_iv_flat(tag),
+        true,
+        data,
+        leaf_size,
+        out,
+    );
+}
+
+/// [`leaf_sponge_flat_batch_with_tag_into`] on explicit flat capacity-IV
+/// words, optionally in the **no-pad fixed-length** mode (`pad = false`,
+/// requires `leaf_size % 32 == 0`): the final permutation of the padded
+/// duplex is dropped, matching `Poseidon2bFlatSponge::with_iv_flat` +
+/// `update` + `finalize_no_pad`. The caller owns the domain-separation
+/// argument for the IV (a distinct tag, fixed length bound in).
+pub fn leaf_sponge_flat_batch_with_iv_into(
+    iv: [u128; 2],
+    pad: bool,
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [[u8; 32]],
+) {
     assert!(leaf_size > 0, "leaf_size must be nonzero");
+    assert!(
+        pad || leaf_size % 32 == 0,
+        "no-pad mode requires whole rate blocks"
+    );
     assert_eq!(
         data.len(),
         leaf_size * out.len(),
@@ -689,9 +715,13 @@ pub fn leaf_sponge_flat_batch_with_tag_into(
     );
 
     let scalar = |i: usize, out: &mut [[u8; 32]]| {
-        let mut sponge = crate::native::Poseidon2bFlatSponge::with_tag(tag);
+        let mut sponge = crate::native::Poseidon2bFlatSponge::with_iv_flat(iv);
         sponge.update(&data[i * leaf_size..(i + 1) * leaf_size]);
-        out[i] = sponge.finalize();
+        out[i] = if pad {
+            sponge.finalize()
+        } else {
+            sponge.finalize_no_pad()
+        };
     };
 
     let n = out.len();
@@ -702,7 +732,7 @@ pub fn leaf_sponge_flat_batch_with_tag_into(
         return;
     }
 
-    let [iv_hi, iv_lo] = crate::native::domain::capacity_iv_flat(tag);
+    let [iv_hi, iv_lo] = iv;
     let full_blocks = leaf_size / 32;
     let rem = leaf_size % 32;
     let chunks = n / PACKED_LANES;
@@ -735,34 +765,37 @@ pub fn leaf_sponge_flat_batch_with_tag_into(
             packed_poseidon2b_permute_flat(&mut states);
         }
 
-        // Final permutation: the 0x80…01-padded tail block — a pure pad
-        // block when the leaf is block-aligned, else the leftover bytes with
-        // the pad markers OR'd into the zero-filled remainder.
-        if rem == 0 {
-            states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
-            states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
-        } else {
-            let mut w0 = PackedBlock128::ZERO;
-            let mut w1 = PackedBlock128::ZERO;
-            for lane in 0..PACKED_LANES {
-                let mut tail = [0u8; 32];
-                let base = (off + lane) * leaf_size + full_blocks * 32;
-                tail[..rem].copy_from_slice(&data[base..base + rem]);
-                tail[rem] |= 0x80;
-                tail[31] |= 0x01;
-                w0 = w0.set_lane(
-                    lane,
-                    Block128::from(u128::from_le_bytes(tail[..16].try_into().unwrap())),
-                );
-                w1 = w1.set_lane(
-                    lane,
-                    Block128::from(u128::from_le_bytes(tail[16..].try_into().unwrap())),
-                );
+        // Final permutation (padded mode only): the 0x80…01-padded tail
+        // block — a pure pad block when the leaf is block-aligned, else the
+        // leftover bytes with the pad markers OR'd into the zero-filled
+        // remainder. The no-pad mode ends block-aligned and squeezes as-is.
+        if pad {
+            if rem == 0 {
+                states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
+                states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
+            } else {
+                let mut w0 = PackedBlock128::ZERO;
+                let mut w1 = PackedBlock128::ZERO;
+                for lane in 0..PACKED_LANES {
+                    let mut tail = [0u8; 32];
+                    let base = (off + lane) * leaf_size + full_blocks * 32;
+                    tail[..rem].copy_from_slice(&data[base..base + rem]);
+                    tail[rem] |= 0x80;
+                    tail[31] |= 0x01;
+                    w0 = w0.set_lane(
+                        lane,
+                        Block128::from(u128::from_le_bytes(tail[..16].try_into().unwrap())),
+                    );
+                    w1 = w1.set_lane(
+                        lane,
+                        Block128::from(u128::from_le_bytes(tail[16..].try_into().unwrap())),
+                    );
+                }
+                states[0] = states[0].xor(w0);
+                states[1] = states[1].xor(w1);
             }
-            states[0] = states[0].xor(w0);
-            states[1] = states[1].xor(w1);
+            packed_poseidon2b_permute_flat(&mut states);
         }
-        packed_poseidon2b_permute_flat(&mut states);
 
         for lane in 0..PACKED_LANES {
             let s0 = states[0].get_lane(lane);
@@ -1001,6 +1034,36 @@ mod tests {
                     let mut sponge = Poseidon2bFlatSponge::with_tag(tag);
                     sponge.update(&data[i * leaf_size..(i + 1) * leaf_size]);
                     sponge.finalize()
+                })
+                .collect();
+            assert_eq!(got, expected, "n={n} leaf_size={leaf_size}");
+        }
+    }
+
+    /// No-pad fixed-length mode vs the scalar `finalize_no_pad` oracle on a
+    /// caller-supplied (length-bound) IV, across block-aligned sizes and a
+    /// scalar remainder.
+    #[test]
+    fn test_leaf_sponge_flat_batch_no_pad_matches_scalar() {
+        use crate::native::domain::{DomainTag, capacity_iv_flat};
+        use crate::native::Poseidon2bFlatSponge;
+
+        let mut rng = rand::thread_rng();
+        let tag = DomainTag::new(b"LEAFFIX_");
+        for &(n, leaf_size) in &[(257usize, 64usize), (64, 512), (9, 32), (3, 32)] {
+            let [hi, lo] = capacity_iv_flat(tag);
+            let iv = [hi ^ leaf_size as u128, lo];
+            let mut data = vec![0u8; n * leaf_size];
+            rng.fill(&mut data[..]);
+
+            let mut got = vec![[0u8; 32]; n];
+            leaf_sponge_flat_batch_with_iv_into(iv, false, &data, leaf_size, &mut got);
+
+            let expected: Vec<[u8; 32]> = (0..n)
+                .map(|i| {
+                    let mut sponge = Poseidon2bFlatSponge::with_iv_flat(iv);
+                    sponge.update(&data[i * leaf_size..(i + 1) * leaf_size]);
+                    sponge.finalize_no_pad()
                 })
                 .collect();
             assert_eq!(got, expected, "n={n} leaf_size={leaf_size}");
