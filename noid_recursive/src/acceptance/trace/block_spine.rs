@@ -650,6 +650,12 @@ impl ColumnAccumulator {
 
     /// Replay one slot's permutation, fold its rows into the accumulators,
     /// and return the permutation output state (state row `N_ROUNDS`).
+    ///
+    /// Rows are weighted by `eq_round` alone inside the slot and the slot
+    /// weight multiplies each per-slot column sum ONCE at the end —
+    /// `Σ_r (w_slot·eq_r)·inner_r = w_slot·Σ_r eq_r·inner_r` exactly
+    /// (associativity), replacing one `w_slot·eq_r` product per row with
+    /// three products per slot.
     pub fn push_slot(
         &mut self,
         b: &mut FieldR1csBuilder,
@@ -663,10 +669,14 @@ impl ColumnAccumulator {
         let mut current: [LinExpr; STATE_SIZE] = state_in.clone();
         apply_mds_symbolic_local(&mut current, &t.mds_full);
 
+        let mut slot_state = LinExpr::zero();
+        let mut slot_sin = LinExpr::zero();
+        let mut slot_sout = LinExpr::zero();
+
         for round in 0..N_ROUNDS {
-            let row_weight = mul(b, &slot_weight, &self.eq_round[round]);
+            let row_weight = &self.eq_round[round];
             let state_row = current.clone();
-            accumulate_row_trace(b, &mut self.state_acc, &state_row, &row_weight, &self.eq_elem);
+            accumulate_row_trace(b, &mut slot_state, &state_row, row_weight, &self.eq_elem);
 
             let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
             if !is_partial {
@@ -676,8 +686,8 @@ impl ColumnAccumulator {
                     sin[lane] = current[lane].add_const(t.rc[lane][round]);
                     sout[lane] = b.pow7(&sin[lane]);
                 }
-                accumulate_row_trace(b, &mut self.sin_acc, &sin, &row_weight, &self.eq_elem);
-                accumulate_row_trace(b, &mut self.sout_acc, &sout, &row_weight, &self.eq_elem);
+                accumulate_row_trace(b, &mut slot_sin, &sin, row_weight, &self.eq_elem);
+                accumulate_row_trace(b, &mut slot_sout, &sout, row_weight, &self.eq_elem);
                 current = sout;
                 apply_mds_symbolic_local(&mut current, &t.mds_full);
             } else {
@@ -685,8 +695,8 @@ impl ColumnAccumulator {
                 let mut sout: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
                 sin[0] = current[0].add_const(t.rc[0][round]);
                 sout[0] = b.pow7(&sin[0]);
-                accumulate_row_trace(b, &mut self.sin_acc, &sin, &row_weight, &self.eq_elem);
-                accumulate_row_trace(b, &mut self.sout_acc, &sout, &row_weight, &self.eq_elem);
+                accumulate_row_trace(b, &mut slot_sin, &sin, row_weight, &self.eq_elem);
+                accumulate_row_trace(b, &mut slot_sout, &sout, row_weight, &self.eq_elem);
                 current = [
                     sout[0].clone(),
                     current[1].clone(),
@@ -697,8 +707,12 @@ impl ColumnAccumulator {
             }
         }
 
-        let final_row_weight = mul(b, &slot_weight, &self.eq_round[N_ROUNDS]);
-        accumulate_row_trace(b, &mut self.state_acc, &current, &final_row_weight, &self.eq_elem);
+        let final_row_weight = &self.eq_round[N_ROUNDS];
+        accumulate_row_trace(b, &mut slot_state, &current, final_row_weight, &self.eq_elem);
+
+        self.state_acc = self.state_acc.add(&mul(b, &slot_weight, &slot_state));
+        self.sin_acc = self.sin_acc.add(&mul(b, &slot_weight, &slot_sin));
+        self.sout_acc = self.sout_acc.add(&mul(b, &slot_weight, &slot_sout));
         current
     }
 

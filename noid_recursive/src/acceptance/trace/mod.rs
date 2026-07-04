@@ -91,9 +91,19 @@ pub fn pin_eq(b: &mut FieldR1csBuilder, lhs: &LinExpr, rhs: &LinExpr) {
     pin_zero(b, &lhs.add(rhs));
 }
 
-/// One multiplication, returned as an expression.
+/// One multiplication, returned as an expression. Constant operands fold:
+/// multiplying by a build-time constant is F128-linear (`scale`), and two
+/// constants multiply at build time — zero constraint rows either way, with
+/// a value bit-identical to the allocated product (the association-of-
+/// products allowance), so transcripts and replays are unaffected.
 #[inline]
 pub fn mul(b: &mut FieldR1csBuilder, x: &LinExpr, y: &LinExpr) -> LinExpr {
+    if y.is_const() {
+        return x.scale(y.constant);
+    }
+    if x.is_const() {
+        return y.scale(x.constant);
+    }
     LinExpr::from_wire(b.mul(x, y))
 }
 
