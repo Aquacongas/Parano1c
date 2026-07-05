@@ -454,6 +454,34 @@ mod tests {
         r1cs.satisfies(&z)
     }
 
+    /// Fixed-matrix class gate: two batches of the SAME class (same depth
+    /// sequence) but different content — leaves, siblings, keys and
+    /// DIRECTIONS — must build byte-identical R1CS matrices. This is the
+    /// recursion's protocol-constant-matrix requirement; a failure means
+    /// block content leaked back into trace structure.
+    #[test]
+    fn fixed_matrix_within_class() {
+        let digest = |seeds: [u64; 3], dirs: [u32; 3]| {
+            let circuit = MerkleCircuit::build();
+            let inputs = vec![
+                fixture(seeds[0], 3, dirs[0]),
+                fixture(seeds[1], 1, dirs[1]),
+                fixture(seeds[2], 5, dirs[2]),
+            ];
+            let mut ch = Poseidon2bChannel::new();
+            let (proof, _) = prove_batched_merkle_killshot(&circuit, &inputs, &mut ch);
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_batched_merkle_slot(&mut b, &circuit, &proof, &inputs);
+            let (r1cs, _z) = b.build();
+            r1cs.statement_digest()
+        };
+        assert_eq!(
+            digest([1, 2, 3], [0b101, 0b1, 0b01010]),
+            digest([7, 8, 9], [0b010, 0b0, 0b10101]),
+            "Merkle slot matrix depends on block content"
+        );
+    }
+
     #[test]
     fn batched_merkle_trace_positive() {
         let f = make_fixture();

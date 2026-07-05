@@ -691,6 +691,39 @@ mod tests {
         r1cs.satisfies(&z)
     }
 
+    /// Fixed-matrix class gate: same tx count, different tx content must
+    /// build byte-identical R1CS matrices (the recursion's
+    /// protocol-constant-matrix requirement).
+    #[test]
+    fn fixed_matrix_within_class() {
+        let digest = |n: usize, seed0: u128| {
+            let circuit = SpineCircuit::build();
+            let inputs: Vec<SpineInputs> = (0..n)
+                .map(|i| standard_inputs(seed0 + i as u128 * 97))
+                .collect();
+            let mut all_state_ins = Vec::new();
+            let mut hashes = Vec::new();
+            for input in &inputs {
+                let states = reconstruct_slot_states(&circuit, input);
+                all_state_ins.extend(states.iter().map(|(s, _)| *s));
+                let wrap = states.last().unwrap();
+                hashes.push([wrap.1[0], wrap.1[1]]);
+            }
+            let mle = BlockSpineMle::build(n, &all_state_ins);
+            let mut ch = Poseidon2bChannel::new();
+            let (proof, _) = prove_block_spine_killshot(n, &mle, &hashes, &mut ch);
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_standard_tx_body_slot(&mut b, &proof, &inputs, &hashes);
+            let (r1cs, _z) = b.build();
+            r1cs.statement_digest()
+        };
+        assert_eq!(
+            digest(2, 5),
+            digest(2, 987_654),
+            "standard tx-body slot matrix depends on block content"
+        );
+    }
+
     #[test]
     fn standard_tx_body_trace_positive() {
         for n in [1usize, 2] {

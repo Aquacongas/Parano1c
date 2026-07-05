@@ -739,6 +739,58 @@ mod tests {
         (inputs, public)
     }
 
+    /// Fixed-matrix class gate: same owner count (= same layout class),
+    /// different secrets AND different live positions / slot indices.
+    ///
+    /// IGNORED — currently FAILS: the layout index vectors
+    /// (`live_input_positions`, `live_slot_indices`, `input_to_group`)
+    /// enter the trace as build-time constants (absorbs AND the boundary
+    /// constraint weights), so the matrix varies with block content. The
+    /// shape-classes pass must turn them into witness wires with
+    /// eq-selected boundary weights and canonical padding, then un-ignore
+    /// this gate.
+    #[test]
+    #[ignore = "owner-auth layout vectors are still trace structure"]
+    fn fixed_matrix_within_class() {
+        let digest = |seed: u128, slot_base: u32, positions: Vec<usize>| {
+            let layout = OwnerAuthLayout::for_owner_count(2).unwrap();
+            let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(layout);
+            let spend_secret: Vec<[Block128; 2]> = (0..2)
+                .map(|i| {
+                    [
+                        Block128::from(seed + 1000 + i as u128),
+                        Block128::from(seed + 2000 + i as u128),
+                    ]
+                })
+                .collect();
+            let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
+            let expected_address =
+                compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
+            let live_slot_indices: Vec<u32> = (0..2u32).map(|i| slot_base + 3 * i).collect();
+            let input_to_group: Vec<usize> = (0..2).collect();
+            let public = OwnerAuthPublicInputs::new(
+                layout,
+                tx_body_hash,
+                positions,
+                live_slot_indices,
+                input_to_group,
+                expected_address,
+            )
+            .unwrap();
+            let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
+            let proof = prove(&inputs);
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_owner_auth_slot(&mut b, &proof, &public);
+            let (r1cs, _z) = b.build();
+            r1cs.statement_digest()
+        };
+        assert_eq!(
+            digest(11, 100, vec![0, 1]),
+            digest(999, 55, vec![0, 2]),
+            "owner-auth slot matrix depends on block content (layout vectors)"
+        );
+    }
+
     fn prove(inputs: &OwnerAuthInputs) -> OwnerAuthProofKillShot {
         let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
