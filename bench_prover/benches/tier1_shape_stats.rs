@@ -67,8 +67,8 @@ use rayon::prelude::*;
 // (linear layers live in the F128-coefficient matrices for free):
 // 90 S-boxes x 4 multiplications.
 const PERM_TRACE_CONSTRAINTS: usize = 360;
-const PREMINED_COINBASE_NONCE: u128 = 69_582;
-const PREMINED_USER_BLOCK_NONCE: u128 = 87_803;
+const PREMINED_COINBASE_NONCE: u128 = 142_522;
+const PREMINED_USER_BLOCK_NONCE: u128 = 399_004;
 const BENCH_POW_SEARCH_RANGE: u128 = 100_000_000;
 const BENCH_POW_CHUNK_SIZE: u128 = 65_536;
 

@@ -6,10 +6,11 @@
 //! verifiers).
 //!
 //! Measured 2026-07-05 by `bench_prover/benches/tier1_shape_stats.rs`
-//! **after the transcript-freeze diet** (squeeze diet + prefix-decodable
-//! Merkle statement absorbs + real-leaf-only tx-root paths + prebound
-//! batch-eval claims + compressed sumcheck rounds; the P0 pre-diet
-//! snapshot had 24,726 squeezes / 30,120 perms @16 txs): every
+//! **after the transcript-freeze diet and the class-shaped statements**
+//! (squeeze diet + prefix-decodable Merkle statement absorbs +
+//! real-leaf-only tx-root paths + prebound batch-eval claims + compressed
+//! sumcheck rounds + capacity-padded owner-auth/guard statements; the P0
+//! pre-diet snapshot had 24,726 squeezes / 30,120 perms @16 txs): every
 //! killshot verifier that `verify_accepted_block_batch_components` runs for a
 //! real accepted block was replayed with a counting Fiat-Shamir channel
 //! (exact production challenge stream; exact Poseidon2b permutation counts).
@@ -116,12 +117,12 @@ pub const CASE_USER_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 348, squeezes: 82, perms: 255 },
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 265, squeezes: 82, perms: 213 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 198, squeezes: 57, perms: 154 },
-        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 308, squeezes: 48, perms: 200 },
+        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 318, squeezes: 48, perms: 205 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 240, squeezes: 67, perms: 185 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 306, squeezes: 77, perms: 228 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 216, squeezes: 62, perms: 169 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 252, squeezes: 72, perms: 197 },
         ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
         ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
@@ -135,12 +136,12 @@ pub const CASE_USER_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 348, squeezes: 82, perms: 255 },
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 301, squeezes: 92, perms: 241 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 275, squeezes: 72, perms: 208 },
-        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 1232, squeezes: 192, perms: 800 },
+        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 1272, squeezes: 192, perms: 820 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 330, squeezes: 77, perms: 240 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 647, squeezes: 92, perms: 414 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 264, squeezes: 72, perms: 203 },
         ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
         ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
@@ -154,12 +155,12 @@ pub const CASE_USER_TXS_16: CaseStats = CaseStats {
         ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 348, squeezes: 82, perms: 255 },
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 355, squeezes: 102, perms: 278 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 504, squeezes: 87, perms: 337 },
-        ComponentStats { name: OWNER_AUTH, instances: 16, absorbs: 4928, squeezes: 768, perms: 3200 },
+        ComponentStats { name: OWNER_AUTH, instances: 16, absorbs: 5088, squeezes: 768, perms: 3280 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 600, squeezes: 87, perms: 385 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 1733, squeezes: 102, perms: 967 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 261, squeezes: 72, perms: 201 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 342, squeezes: 82, perms: 252 },
         ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
         ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
@@ -174,12 +175,12 @@ pub const CASE_SWEEP_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 348, squeezes: 82, perms: 255 },
         ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 295, squeezes: 92, perms: 238 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 198, squeezes: 57, perms: 154 },
-        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 508, squeezes: 73, perms: 322 },
+        ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 523, squeezes: 73, perms: 329 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 550, squeezes: 87, perms: 360 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 1513, squeezes: 102, perms: 857 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 270, squeezes: 72, perms: 206 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 288, squeezes: 77, perms: 219 },
         ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
         ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
@@ -194,12 +195,12 @@ pub const CASE_SWEEP_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: ACCEPTED_CLAIM_HASH, instances: 1, absorbs: 348, squeezes: 82, perms: 255 },
         ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 331, squeezes: 102, perms: 266 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 275, squeezes: 72, perms: 208 },
-        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 2032, squeezes: 292, perms: 1288 },
+        ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 2092, squeezes: 292, perms: 1316 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 1390, squeezes: 97, perms: 790 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 5107, squeezes: 112, perms: 2664 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 375, squeezes: 82, perms: 268 },
+        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 378, squeezes: 82, perms: 270 },
         ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
         ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
@@ -215,17 +216,17 @@ pub const MEASURED_CASES: &[&CaseStats] = &[
 ];
 
 /// Marginal verifier-FS permutations per standard tx (the auth-FS
-/// transcript killshot no longer exists): (6406 - 634) / 16, floored.
-pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 360;
+/// transcript killshot no longer exists): (6537 - 634) / 16, floored.
+pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 368;
 
 /// Historical alias — equals the full marginal now.
 pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 =
     MARGINAL_PERMS_PER_STANDARD_TX_FULL;
 
 /// Marginal verifier-FS permutations per full Sweep25x2 tx:
-/// (6522 - 634) / 4. Dominated by the exact-state Merkle path batch
-/// (27 touched slots per sweep vs 2 per standard tx).
-pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 1_472;
+/// (6552 - 634) / 4, floored. Dominated by the exact-state Merkle path
+/// batch (27 touched slots per sweep vs 2 per standard tx).
+pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 1_479;
 
 /// Historical alias — equals the full marginal now.
 pub const MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS: u32 =
@@ -242,9 +243,9 @@ pub const BLOCK_MAX_FULL_SWEEP_TXS: usize =
 ///
 /// Linear extrapolation of the 16-tx measurement — a conservative UPPER
 /// bound: the env-gated 255-tx run (`NOID_SHAPE_MAX_STD=1`, 2026-07-05,
-/// post-freeze-diet) measured 71,459 perms vs 92,434 projected (−23%),
-/// because batched-killshot round/terminal costs amortize with batch size
-/// while this projection scales them linearly.
+/// class-shaped statements) measured 73,143 perms vs 94,474 projected
+/// (-23%), because batched-killshot round/terminal costs amortize with
+/// batch size while this projection scales them linearly.
 pub fn projected_perms_std_txs_no_auth_fs(n: usize) -> u64 {
     CASE_COINBASE_ONLY.total_perms() + n as u64 * MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS as u64
 }
@@ -258,8 +259,8 @@ pub fn projected_perms_sweep_txs_no_auth_fs(n: usize) -> u64 {
 }
 
 /// Conservative [K] perms upper bound for the consensus-max standard block
-/// (255 user txs). Measured post-freeze-diet @255: 71,459 perms
-/// (~2^24.6 trace constraints; the auth-FS killshot is deleted).
+/// (255 user txs). Measured @255 with class-shaped statements: 73,143
+/// perms (~2^24.7 trace constraints; the auth-FS killshot is deleted).
 pub fn projected_perms_max_standard_block_no_auth_fs() -> u64 {
     projected_perms_std_txs_no_auth_fs(BLOCK_MAX_STANDARD_USER_TXS)
 }
@@ -270,7 +271,80 @@ pub fn projected_perms_max_sweep_block_no_auth_fs() -> u64 {
     projected_perms_sweep_txs_no_auth_fs(BLOCK_MAX_FULL_SWEEP_TXS)
 }
 
-const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V4";
+// ---------------------------------------------------------------------------
+// Shape classes
+// ---------------------------------------------------------------------------
+
+/// One block shape class: the pair of powers-of-two transaction-count tiers
+/// (source of truth: `noid_chain::consensus::params` tier tables). Every
+/// proof-facing per-block structure is padded to its class's parameters, so
+/// the proof system works over this finite family instead of per-content
+/// shapes; the R1CS matrix of a class is a protocol constant.
+///
+/// What the class fixes today: the guard-update spend capacity (killshot
+/// schedule + trace matrix) and the per-tx statement paddings (owner-auth
+/// input capacity per tx shape). What still varies below class granularity
+/// until the folding layer replaces per-tx replay slots: the number of
+/// per-tx replay instances in the assembled trace (absent txs do not yet
+/// materialize canonical empty slots) and the per-tx owner-auth `num_vars`
+/// tier. Per-class R1CS statement digests are pinned once the assembly
+/// builds at class shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShapeClass {
+    pub standard_tier: usize,
+    pub sweep_tier: usize,
+}
+
+impl ShapeClass {
+    /// The class holding a block with the given user-tx composition, or
+    /// None past the consensus tier tables.
+    pub fn for_counts(standard_txs: usize, sweep_txs: usize) -> Option<Self> {
+        Some(Self {
+            standard_tier: noid_chain::consensus::params::standard_tx_class_tier(standard_txs)?,
+            sweep_tier: noid_chain::consensus::params::sweep_tx_class_tier(sweep_txs)?,
+        })
+    }
+
+    /// The class's live-input (spend) capacity — the guard-update padding.
+    pub fn spend_capacity(&self) -> usize {
+        noid_chain::consensus::params::block_class_spend_capacity(
+            self.standard_tier,
+            self.sweep_tier,
+        )
+    }
+
+    /// Class identity digest: a domain-tagged hash of the class key and its
+    /// structural parameters. This names the class in proof statements and
+    /// tables; it is NOT the R1CS statement digest of the class matrix
+    /// (those are seeded per class from the builder once the assembly
+    /// builds at class shapes).
+    pub fn shape_digest(&self) -> [u8; 32] {
+        let mut encoded = Vec::with_capacity(24);
+        encoded.extend_from_slice(&(self.standard_tier as u64).to_le_bytes());
+        encoded.extend_from_slice(&(self.sweep_tier as u64).to_le_bytes());
+        encoded.extend_from_slice(&(self.spend_capacity() as u64).to_le_bytes());
+        poseidon2b_hash_byte_slices(SHAPE_CLASS_DOMAIN, &[&encoded])
+    }
+}
+
+/// Every shape class in canonical order (standard tier major, sweep tier
+/// minor) — the finite family a decider precomputes matrices for.
+pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
+    noid_chain::consensus::params::STANDARD_TX_CLASS_TIERS
+        .into_iter()
+        .flat_map(|standard_tier| {
+            noid_chain::consensus::params::SWEEP_TX_CLASS_TIERS
+                .into_iter()
+                .map(move |sweep_tier| ShapeClass {
+                    standard_tier,
+                    sweep_tier,
+                })
+        })
+}
+
+const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-SHAPE-CLASS-V1";
+
+const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V5";
 
 /// Digest pinning this (post-squeeze-diet) measurement snapshot, so
 /// downstream consumers can detect a stale table. NOT the protocol
@@ -302,16 +376,16 @@ mod tests {
     #[test]
     fn case_totals_match_measurement() {
         assert_eq!(CASE_COINBASE_ONLY.total_perms(), 634);
-        assert_eq!(CASE_USER_TXS_1.total_perms(), 2_187);
-        assert_eq!(CASE_USER_TXS_4.total_perms(), 3_123);
-        assert_eq!(CASE_USER_TXS_16.total_perms(), 6_406);
-        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 9_743);
-        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 1_583);
-        assert_eq!(CASE_SWEEP_TXS_1.total_perms(), 3_175);
-        assert_eq!(CASE_SWEEP_TXS_1.total_absorbs(), 4_696);
-        assert_eq!(CASE_SWEEP_TXS_1.total_squeezes(), 848);
-        assert_eq!(CASE_SWEEP_TXS_4.total_perms(), 6_522);
-        assert_eq!(CASE_SWEEP_TXS_4.total_absorbs(), 10_872);
+        assert_eq!(CASE_USER_TXS_1.total_perms(), 2_220);
+        assert_eq!(CASE_USER_TXS_4.total_perms(), 3_164);
+        assert_eq!(CASE_USER_TXS_16.total_perms(), 6_537);
+        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 9_984);
+        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 1_593);
+        assert_eq!(CASE_SWEEP_TXS_1.total_perms(), 3_195);
+        assert_eq!(CASE_SWEEP_TXS_1.total_absorbs(), 4_729);
+        assert_eq!(CASE_SWEEP_TXS_1.total_squeezes(), 853);
+        assert_eq!(CASE_SWEEP_TXS_4.total_perms(), 6_552);
+        assert_eq!(CASE_SWEEP_TXS_4.total_absorbs(), 10_935);
         assert_eq!(CASE_SWEEP_TXS_4.total_squeezes(), 1_122);
         assert_eq!(
             MARGINAL_PERMS_PER_STANDARD_TX_FULL as u64,
@@ -327,11 +401,11 @@ mod tests {
     fn max_shape_projections_track_consensus_params() {
         assert_eq!(BLOCK_MAX_STANDARD_USER_TXS, 255);
         assert_eq!(BLOCK_MAX_FULL_SWEEP_TXS, 40);
-        assert_eq!(projected_perms_max_standard_block_no_auth_fs(), 92_434);
-        assert_eq!(projected_perms_max_sweep_block_no_auth_fs(), 59_514);
+        assert_eq!(projected_perms_max_standard_block_no_auth_fs(), 94_474);
+        assert_eq!(projected_perms_max_sweep_block_no_auth_fs(), 59_794);
         // The linear projection must stay an upper bound on the measured
-        // env-gated 255-tx run (71,459 perms without auth-FS, 2026-07-05).
-        assert!(projected_perms_max_standard_block_no_auth_fs() >= 71_459);
+        // env-gated 255-tx run (73,143 perms, 2026-07-05).
+        assert!(projected_perms_max_standard_block_no_auth_fs() >= 73_143);
     }
 
     #[test]
@@ -340,5 +414,30 @@ mod tests {
         let b = shape_stats_digest();
         assert_eq!(a, b);
         assert_ne!(a, [0u8; 32]);
+    }
+
+    #[test]
+    fn shape_class_table_is_finite_and_injective() {
+        let classes: Vec<ShapeClass> = enumerate_shape_classes().collect();
+        assert_eq!(classes.len(), 10 * 8);
+        let digests: std::collections::HashSet<[u8; 32]> =
+            classes.iter().map(ShapeClass::shape_digest).collect();
+        assert_eq!(digests.len(), classes.len(), "class digests must be distinct");
+
+        // Every consensus-admissible composition maps into the table and its
+        // capacity covers the composition's live-input maximum.
+        let class = ShapeClass::for_counts(9, 3).expect("in-range composition");
+        assert_eq!(class.standard_tier, 16);
+        assert_eq!(class.sweep_tier, 4);
+        assert!(class.spend_capacity() >= 9 * 4 + 3 * 25);
+        assert!(ShapeClass::for_counts(256, 0).is_none());
+        assert!(ShapeClass::for_counts(0, 41).is_none());
+
+        // The top class saturates at the semantic live-input budget.
+        let max = ShapeClass::for_counts(255, 40).expect("max composition");
+        assert_eq!(
+            max.spend_capacity(),
+            noid_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS
+        );
     }
 }
