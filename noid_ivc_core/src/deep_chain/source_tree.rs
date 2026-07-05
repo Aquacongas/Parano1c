@@ -551,7 +551,6 @@ mod tests {
         let leaf_log = 3usize;
         let tree = SourceTree { leaf_log };
         let w_log = tree.slots_log();
-        let w = 1usize << w_log;
         let half = 1usize << (w_log - 1);
         let iv = compress_iv_flat();
 
