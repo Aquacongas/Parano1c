@@ -22,6 +22,7 @@
 pub mod bits;
 pub mod challenger;
 pub mod circuit;
+pub mod deep_chain;
 pub mod field;
 pub mod field_circuit;
 pub mod field_r1cs;
