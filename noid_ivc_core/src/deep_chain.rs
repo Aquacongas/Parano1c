@@ -38,6 +38,7 @@
 
 pub mod encode_kernel;
 pub mod family;
+pub mod leaf_hash;
 pub mod relations;
 pub mod schedule;
 pub mod source_tree;

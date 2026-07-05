@@ -636,7 +636,7 @@ pub fn source_cap_from_commitment_cap(
     Some(&cap.hashes[start..end])
 }
 
-pub(crate) fn source_leaf_hash(
+pub fn source_leaf_hash(
     _backend: CommitmentHashBackend,
     log_rows: usize,
     n_cols: usize,

@@ -79,6 +79,14 @@ pub fn permute_flat_state(raw: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     state
 }
 
+/// Flat-basis one-permutation `hash_pair(a, b)`: `permute([a, b, 0, 0])`,
+/// output lanes `(0, 1)`. Mirrors `noid_poseidon2b`'s tower `hash_pair`
+/// lane-for-lane under φ (zero capacity is basis-invariant).
+pub fn flat_hash_pair(a: F128, b: F128) -> [F128; 2] {
+    let s = permute_flat_state([a, b, F128::ZERO, F128::ZERO]);
+    [s[0], s[1]]
+}
+
 /// Flat-basis two-permutation `compress(a, b)` with capacity IV `iv`:
 ///
 /// ```text
