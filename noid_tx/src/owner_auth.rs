@@ -46,6 +46,11 @@ pub struct CanonicalOwnerAuth {
     pub groups: Vec<OwnerAuthGroup>,
     /// For each live input position, the index into `groups`.
     pub input_to_group: Vec<usize>,
+    /// Transcript padding width for the per-input vectors: the shape's input
+    /// capacity (`TxShape::max_inputs`). The authorization transcript absorbs
+    /// each vector padded to this length with a sentinel so that the absorb
+    /// schedule depends only on the shape, never on the live-input count.
+    pub padded_input_len: usize,
 }
 
 impl CanonicalOwnerAuth {
@@ -131,6 +136,7 @@ pub fn canonical_owner_auth(body: &TxBody) -> Result<CanonicalOwnerAuth, OwnerAu
         live_slot_indices,
         groups,
         input_to_group,
+        padded_input_len: max_inputs,
     })
 }
 

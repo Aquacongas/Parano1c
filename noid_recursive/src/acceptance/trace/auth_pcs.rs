@@ -855,6 +855,7 @@ mod tests {
             live_slot_indices,
             input_to_group,
             expected_address,
+            owner_count.max(4),
         )
         .unwrap();
         let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);

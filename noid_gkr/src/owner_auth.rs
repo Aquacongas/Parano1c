@@ -44,6 +44,13 @@ pub const OWNER_AUTH_ELEM_VARS: usize = 2;
 pub const OWNER_AUTH_MIN_SLOT_BITS: usize = 0;
 pub const OWNER_AUTH_MIN_OWNERS: usize = 1;
 pub const OWNER_AUTH_MAX_OWNERS: usize = 25;
+/// Upper bound on the transcript padding width of the per-input statement
+/// vectors (`padded_input_len`): the largest input capacity of any supported
+/// transaction shape.
+pub const OWNER_AUTH_MAX_PADDED_INPUTS: usize = 25;
+/// Sentinel absorbed for padding entries of the per-input statement vectors.
+/// Real entries are small indices, so the all-ones word can never collide.
+pub const OWNER_AUTH_INPUT_PAD_SENTINEL: u128 = u128::MAX;
 
 const ELEM_LO: usize = 0;
 const ELEM_HI: usize = ELEM_LO + OWNER_AUTH_ELEM_VARS;
@@ -186,9 +193,15 @@ pub struct OwnerAuthPublicInputs {
     pub live_slot_indices: Vec<u32>,
     pub input_to_group: Vec<usize>,
     pub expected_address: Vec<[Block128; 2]>,
+    /// Transcript padding width for the three per-input vectors (the shape's
+    /// input capacity). The boundary absorb pads each vector to this length
+    /// with [`OWNER_AUTH_INPUT_PAD_SENTINEL`] so the absorb schedule depends
+    /// only on (shape, layout), never on the live-input count.
+    pub padded_input_len: usize,
 }
 
 impl OwnerAuthPublicInputs {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: OwnerAuthLayout,
         tx_body_hash: [Block128; 2],
@@ -196,6 +209,7 @@ impl OwnerAuthPublicInputs {
         live_slot_indices: Vec<u32>,
         input_to_group: Vec<usize>,
         expected_address: Vec<[Block128; 2]>,
+        padded_input_len: usize,
     ) -> Option<Self> {
         if expected_address.len() != layout.owner_count
             || live_input_positions.is_empty()
@@ -204,6 +218,8 @@ impl OwnerAuthPublicInputs {
             || input_to_group
                 .iter()
                 .any(|&group_idx| group_idx >= layout.owner_count)
+            || padded_input_len < live_input_positions.len()
+            || padded_input_len > OWNER_AUTH_MAX_PADDED_INPUTS
         {
             return None;
         }
@@ -214,7 +230,18 @@ impl OwnerAuthPublicInputs {
             live_slot_indices,
             input_to_group,
             expected_address,
+            padded_input_len,
         })
+    }
+
+    /// Statement shape checks shared by the prove and verify entries.
+    fn shape_ok(&self) -> bool {
+        self.expected_address.len() == self.layout.owner_count
+            && !self.live_input_positions.is_empty()
+            && self.live_slot_indices.len() == self.live_input_positions.len()
+            && self.input_to_group.len() == self.live_input_positions.len()
+            && self.padded_input_len >= self.live_input_positions.len()
+            && self.padded_input_len <= OWNER_AUTH_MAX_PADDED_INPUTS
     }
 }
 
@@ -227,6 +254,7 @@ pub struct OwnerAuthInputs {
     pub live_slot_indices: Vec<u32>,
     pub input_to_group: Vec<usize>,
     pub expected_address: Vec<[Block128; 2]>,
+    pub padded_input_len: usize,
 }
 
 impl Drop for OwnerAuthInputs {
@@ -244,6 +272,7 @@ impl OwnerAuthInputs {
             live_slot_indices: self.live_slot_indices.clone(),
             input_to_group: self.input_to_group.clone(),
             expected_address: self.expected_address.clone(),
+            padded_input_len: self.padded_input_len,
         }
     }
 
@@ -256,6 +285,7 @@ impl OwnerAuthInputs {
             live_slot_indices: public.live_slot_indices.clone(),
             input_to_group: public.input_to_group.clone(),
             expected_address: public.expected_address.clone(),
+            padded_input_len: public.padded_input_len,
         }
     }
 }
@@ -351,6 +381,7 @@ pub fn compute_owner_auth_boundary(
         live_slot_indices: (0..circuit.layout.owner_count).map(|i| i as u32).collect(),
         input_to_group: (0..circuit.layout.owner_count).collect(),
         expected_address: vec![[Block128::ZERO; 2]; circuit.layout.owner_count],
+        padded_input_len: circuit.layout.owner_count,
     };
     let w = evaluate_owner_auth(circuit, &inputs);
     w.derived_address.clone()
@@ -1384,14 +1415,32 @@ fn owner_auth_boundary_constraints(
     let layout = public.layout;
     debug_assert_eq!(circuit.layout, layout);
     let iv_addr = capacity_iv(TAG_ADDRFIX);
-    let mut constraints = Vec::with_capacity(layout.owner_count * 4);
+    let mut constraints = Vec::with_capacity(layout.padded_slots * 4);
 
-    for owner_idx in 0..layout.owner_count {
-        let base = owner_idx * OWNER_AUTH_SLOTS_PER_OWNER;
+    // One constraint group per PADDED slot, so the constraint count (and the
+    // alpha squeeze schedule) is a function of `padded_slots` alone. Ghost
+    // slots (at or past `owner_count`) reuse the live term structure with
+    // zero right-hand sides — the padded MLE is zero there, so an honest
+    // witness satisfies them identically.
+    for slot in 0..layout.padded_slots {
+        let base = slot * OWNER_AUTH_SLOTS_PER_OWNER;
         let haddr = base;
+        let live = slot < layout.owner_count;
 
-        owner_boundary_push_pre_equals_const(&mut constraints, layout, haddr, 2, iv_addr[0]);
-        owner_boundary_push_pre_equals_const(&mut constraints, layout, haddr, 3, iv_addr[1]);
+        owner_boundary_push_pre_equals_const(
+            &mut constraints,
+            layout,
+            haddr,
+            2,
+            if live { iv_addr[0] } else { Block128::ZERO },
+        );
+        owner_boundary_push_pre_equals_const(
+            &mut constraints,
+            layout,
+            haddr,
+            3,
+            if live { iv_addr[1] } else { Block128::ZERO },
+        );
 
         for lane in 0..OWNER_AUTH_PIN_LANES {
             owner_boundary_push_output_equals_const(
@@ -1399,7 +1448,11 @@ fn owner_auth_boundary_constraints(
                 layout,
                 haddr,
                 lane,
-                public.expected_address[owner_idx][lane],
+                if live {
+                    public.expected_address[slot][lane]
+                } else {
+                    Block128::ZERO
+                },
             );
         }
     }
@@ -1558,6 +1611,25 @@ fn absorb_pair<T: FiatShamir<Block128>>(channel: &mut T, pair: &[Block128; 2]) {
     channel.absorb(pair[1]);
 }
 
+/// Absorbs one per-input statement vector padded to `padded_len` entries:
+/// the live length first, then real entries, then the pad sentinel. The
+/// absorb count is a function of `padded_len` alone.
+fn absorb_padded_input_vector<T: FiatShamir<Block128>>(
+    channel: &mut T,
+    values: impl ExactSizeIterator<Item = u128>,
+    padded_len: usize,
+) {
+    let live_len = values.len();
+    debug_assert!(live_len <= padded_len);
+    channel.absorb(Block128::from(live_len as u128));
+    for value in values {
+        channel.absorb(Block128::from(value));
+    }
+    for _ in live_len..padded_len {
+        channel.absorb(Block128::from(OWNER_AUTH_INPUT_PAD_SENTINEL));
+    }
+}
+
 fn absorb_owner_public_boundary<T: FiatShamir<Block128>>(
     channel: &mut T,
     inputs: &OwnerAuthPublicInputs,
@@ -1568,20 +1640,31 @@ fn absorb_owner_public_boundary<T: FiatShamir<Block128>>(
     channel.absorb(Block128::from(inputs.layout.num_vars as u128));
     channel.absorb(Block128::from(inputs.layout.padded_slots as u128));
     absorb_pair(channel, &inputs.tx_body_hash);
-    channel.absorb(Block128::from(inputs.live_input_positions.len() as u128));
-    for &position in &inputs.live_input_positions {
-        channel.absorb(Block128::from(position as u128));
-    }
-    channel.absorb(Block128::from(inputs.live_slot_indices.len() as u128));
-    for &slot_index in &inputs.live_slot_indices {
-        channel.absorb(Block128::from(slot_index as u128));
-    }
-    channel.absorb(Block128::from(inputs.input_to_group.len() as u128));
-    for &group_idx in &inputs.input_to_group {
-        channel.absorb(Block128::from(group_idx as u128));
-    }
-    for pair in &inputs.expected_address {
-        absorb_pair(channel, pair);
+    channel.absorb(Block128::from(inputs.padded_input_len as u128));
+    absorb_padded_input_vector(
+        channel,
+        inputs.live_input_positions.iter().map(|&p| p as u128),
+        inputs.padded_input_len,
+    );
+    absorb_padded_input_vector(
+        channel,
+        inputs.live_slot_indices.iter().map(|&s| s as u128),
+        inputs.padded_input_len,
+    );
+    absorb_padded_input_vector(
+        channel,
+        inputs.input_to_group.iter().map(|&g| g as u128),
+        inputs.padded_input_len,
+    );
+    // Addresses are absorbed for every padded slot (ghost slots as zero
+    // pairs) so the schedule depends on `padded_slots`, not `owner_count`.
+    for slot in 0..inputs.layout.padded_slots {
+        let pair = inputs
+            .expected_address
+            .get(slot)
+            .copied()
+            .unwrap_or([Block128::ZERO; 2]);
+        absorb_pair(channel, &pair);
     }
 }
 
@@ -1622,6 +1705,7 @@ pub fn prove_owner_auth_killshot_from_mle<T: FiatShamir<Block128>>(
     let layout = public.layout;
     assert_eq!(circuit.layout, layout);
     assert_eq!(mle.layout, layout);
+    assert!(public.shape_ok(), "owner-auth statement shape");
     let mut committed = commit_auth_mle_column(mle.state.as_slice(), layout.num_vars);
 
     absorb_owner_public_boundary(channel, public);
@@ -1670,10 +1754,7 @@ pub fn verify_owner_auth_killshot_with_claims<T: FiatShamir<Block128>>(
     channel: &mut T,
 ) -> Option<OwnerAuthVerifierClaims> {
     if circuit.layout != inputs.layout
-        || inputs.expected_address.len() != inputs.layout.owner_count
-        || inputs.live_input_positions.is_empty()
-        || inputs.live_slot_indices.len() != inputs.live_input_positions.len()
-        || inputs.input_to_group.len() != inputs.live_input_positions.len()
+        || !inputs.shape_ok()
         || inputs
             .input_to_group
             .iter()
@@ -1801,6 +1882,7 @@ pub fn owner_auth_public_from_statement(
         live_slot_indices: statement.live_slot_indices.clone(),
         input_to_group: statement.input_to_group.clone(),
         expected_address,
+        padded_input_len: statement.padded_input_len,
     })
 }
 
