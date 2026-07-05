@@ -38,6 +38,7 @@
 
 pub mod family;
 pub mod relations;
+pub mod schedule;
 
 use crate::challenger::Challenger;
 use crate::field::F128;

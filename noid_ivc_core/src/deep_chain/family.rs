@@ -284,13 +284,14 @@ pub fn run_family<Ch: Challenger>(
         let cols = RelationColumns {
             committed: &committed_refs,
             internal: &[],
+            fixed: &[],
         };
         let (p, pt, _) = prove_column_relation(F128::ZERO, &rho, &bool_terms, &cols, transcript);
         proofs.booleanity = Some(p);
         pt
     } else {
         let p = proofs.booleanity.as_ref().ok_or("missing booleanity")?;
-        verify_column_relation(W_LOG, F128::ZERO, &rho, &bool_terms, p, transcript)
+        verify_column_relation(W_LOG, F128::ZERO, &rho, &bool_terms, &[], p, transcript)
             .map_err(|e| format!("booleanity: {e}"))?
     };
     let bool_proof = proofs.booleanity.as_ref().unwrap();
@@ -313,13 +314,14 @@ pub fn run_family<Ch: Challenger>(
             let cols = RelationColumns {
                 committed: &committed_refs,
                 internal: &[],
+                fixed: &[],
             };
             let (p, pt, _) = prove_column_relation(F128::ZERO, &rho, &terms, &cols, transcript);
             *slot = Some(p);
             pt
         } else {
             let p = slot.as_ref().ok_or("missing selector proof")?;
-            verify_column_relation(W_LOG, F128::ZERO, &rho, &terms, p, transcript)
+            verify_column_relation(W_LOG, F128::ZERO, &rho, &terms, &[], p, transcript)
                 .map_err(|e| format!("{name}: {e}"))?
         };
         let proof = slot.as_ref().unwrap();
@@ -353,13 +355,14 @@ pub fn run_family<Ch: Challenger>(
         let cols = RelationColumns {
             committed: &committed_refs,
             internal: &internal,
+            fixed: &[],
         };
         let (p, pt, _) = prove_column_relation(F128::ZERO, &rho_sel, &sel_terms, &cols, transcript);
         proofs.selection = Some(p);
         pt
     } else {
         let p = proofs.selection.as_ref().ok_or("missing selection")?;
-        verify_column_relation(W_LOG, F128::ZERO, &rho_sel, &sel_terms, p, transcript)
+        verify_column_relation(W_LOG, F128::ZERO, &rho_sel, &sel_terms, &[], p, transcript)
             .map_err(|e| format!("selection: {e}"))?
     };
     let sel_proof = proofs.selection.as_ref().unwrap();
@@ -388,13 +391,14 @@ pub fn run_family<Ch: Challenger>(
         let cols = RelationColumns {
             committed: &committed_refs,
             internal: &internal,
+            fixed: &[],
         };
         let (p, pt, _) = prove_column_relation(F128::ZERO, &rho_out, &out_terms, &cols, transcript);
         proofs.output = Some(p);
         pt
     } else {
         let p = proofs.output.as_ref().ok_or("missing output")?;
-        verify_column_relation(W_LOG, F128::ZERO, &rho_out, &out_terms, p, transcript)
+        verify_column_relation(W_LOG, F128::ZERO, &rho_out, &out_terms, &[], p, transcript)
             .map_err(|e| format!("output: {e}"))?
     };
     let out_proof = proofs.output.as_ref().unwrap();
@@ -465,6 +469,7 @@ pub fn run_family<Ch: Challenger>(
         let cols = RelationColumns {
             committed: &committed_refs,
             internal: &[],
+            fixed: &[],
         };
         let (pr, pt, _) =
             prove_column_relation(target, &terminal.point, &sub_terms, &cols, transcript);
@@ -472,7 +477,7 @@ pub fn run_family<Ch: Challenger>(
         pt
     } else {
         let pr = proofs.substitution.as_ref().ok_or("missing substitution")?;
-        verify_column_relation(W_LOG, target, &terminal.point, &sub_terms, pr, transcript)
+        verify_column_relation(W_LOG, target, &terminal.point, &sub_terms, &[], pr, transcript)
             .map_err(|e| format!("substitution: {e}"))?
     };
     let sub_proof = proofs.substitution.as_ref().unwrap();
@@ -490,7 +495,9 @@ pub fn run_family<Ch: Challenger>(
                 assert_eq!(*c, C);
                 shift_target = Some(*v);
             }
-            ColRef::Internal(_) => unreachable!("substitution touches committed data only"),
+            ColRef::Internal(_) | ColRef::Fixed(_) | ColRef::CommittedShift2(_) => {
+                unreachable!("substitution touches committed data only")
+            }
         }
     }
 

@@ -17,7 +17,7 @@
 //! batching.
 
 use noid_ivc_core::deep_chain::relations::{
-    distinct_refs, ColRef, ColumnRelationProof, RelationTerm, ShiftDischargeProof,
+    claimed_refs, ColRef, ColumnRelationProof, FixedPattern, RelationTerm, ShiftDischargeProof,
     MAX_TERM_FACTORS, RELATION_DEGREE,
 };
 use noid_ivc_core::deep_chain::{
@@ -291,6 +291,8 @@ fn absorb_relation_header_trace(
                 ColRef::Committed(i) => (0u64, *i as u64),
                 ColRef::CommittedShift(i) => (1, *i as u64),
                 ColRef::Internal(i) => (2, *i as u64),
+                ColRef::Fixed(i) => (3, *i as u64),
+                ColRef::CommittedShift2(i) => (4, *i as u64),
             };
             lanes.push(lane(kind, idx));
         }
@@ -298,9 +300,40 @@ fn absorb_relation_header_trace(
     ch.observe_f128_slice(b, &lanes);
 }
 
+/// Closed-form MLE evaluation of a [`FixedPattern`] at an expression point:
+/// build the eq tensor of the low `low_log` coordinates (2^low_log − 1
+/// multiplications), then dot it with the constant table (zero rows).
+pub fn fixed_pattern_eval_trace(
+    b: &mut FieldR1csBuilder,
+    pattern: &FixedPattern,
+    point: &[LinExpr],
+) -> LinExpr {
+    assert!(point.len() >= pattern.low_log, "fixed pattern point arity");
+    let mut tensor: Vec<LinExpr> = vec![LinExpr::constant(F128::ONE)];
+    for p_j in &point[..pattern.low_log] {
+        // Mirrors `build_eq_table`: the new variable is the HIGH bit;
+        // (1+p)·t = t + p·t, so one multiplication per parent entry.
+        let his: Vec<LinExpr> = tensor.iter().map(|t| mul(b, t, p_j)).collect();
+        let mut next = Vec::with_capacity(tensor.len() * 2);
+        for (t, hi) in tensor.iter().zip(his.iter()) {
+            next.push(t.add(hi));
+        }
+        next.extend(his);
+        tensor = next;
+    }
+    let mut acc = LinExpr::zero();
+    for (v, t) in pattern.table.iter().zip(tensor.iter()) {
+        if *v != F128::ZERO {
+            acc = acc.add(&t.scale(*v));
+        }
+    }
+    acc
+}
+
 /// Trace twin of `relations::verify_column_relation`; returns the derived
 /// point (final claim values live in `proof.final_values`, ordered by
-/// [`distinct_refs`]-equivalent structure order).
+/// [`claimed_refs`]-equivalent structure order; Fixed factors are
+/// evaluated in closed form from the protocol-constant patterns).
 pub fn verify_column_relation_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut FsChannelTrace,
@@ -308,6 +341,7 @@ pub fn verify_column_relation_trace(
     target: &LinExpr,
     eq_point: &[LinExpr],
     terms: &[RelationTermTrace],
+    fixed: &[FixedPattern],
     proof: &ColumnRelationProofTrace,
 ) -> Vec<LinExpr> {
     assert_eq!(eq_point.len(), w_log);
@@ -322,8 +356,8 @@ pub fn verify_column_relation_trace(
             }
         })
         .collect();
-    let refs = distinct_refs(&native_shape);
-    assert_eq!(proof.final_values.len(), refs.len());
+    let claimed = claimed_refs(&native_shape);
+    assert_eq!(proof.final_values.len(), claimed.len());
 
     absorb_relation_header_trace(b, ch, target, eq_point, terms);
 
@@ -337,12 +371,29 @@ pub fn verify_column_relation_trace(
     }
     ch.observe_f128_slice(b, &proof.final_values);
 
+    // Each distinct Fixed ref is evaluated once per relation.
+    let mut fixed_cache: Vec<Option<LinExpr>> = vec![None; fixed.len()];
     let mut sum = LinExpr::zero();
     for t in terms {
         let mut prod = t.coeff.clone();
         for f in &t.factors {
-            let fi = refs.iter().position(|r| r == f).expect("distinct ref");
-            prod = mul(b, &prod, &proof.final_values[fi]);
+            let value = match f {
+                ColRef::Fixed(i) => {
+                    if fixed_cache[*i].is_none() {
+                        fixed_cache[*i] =
+                            Some(fixed_pattern_eval_trace(b, &fixed[*i], &point));
+                    }
+                    fixed_cache[*i].clone().expect("cached")
+                }
+                _ => {
+                    let fi = claimed
+                        .iter()
+                        .position(|r| r == f)
+                        .expect("claimed ref");
+                    proof.final_values[fi].clone()
+                }
+            };
+            prod = mul(b, &prod, &value);
         }
         sum = sum.add(&prod);
     }
@@ -405,20 +456,53 @@ pub fn shift_kernel_eval_trace(
     acc
 }
 
-/// Trace twin of `relations::verify_shift_discharge`; returns the derived
-/// point (pair it with `proof.final_value` as the plain column claim).
+/// `2^shift_log`-step kernel on expressions (see
+/// `relations::shift_pow2_kernel_eval`): matched low coordinates times the
+/// successor kernel on the rest.
+pub fn shift_pow2_kernel_eval_trace(
+    b: &mut FieldR1csBuilder,
+    shift_log: usize,
+    rho: &[LinExpr],
+    sigma: &[LinExpr],
+) -> LinExpr {
+    assert_eq!(rho.len(), sigma.len());
+    assert!(shift_log < rho.len());
+    let one = LinExpr::constant(F128::ONE);
+    let mut acc = LinExpr::constant(F128::ONE);
+    for i in 0..shift_log {
+        let m1 = mul(b, &rho[i], &sigma[i]);
+        let m2 = mul(b, &one.add(&rho[i]), &one.add(&sigma[i]));
+        let matched = m1.add(&m2);
+        acc = mul(b, &acc, &matched);
+    }
+    let high = shift_kernel_eval_trace(b, &rho[shift_log..], &sigma[shift_log..]);
+    mul(b, &acc, &high)
+}
+
+/// Trace twin of `relations::verify_shift_discharge` (and its
+/// `2^shift_log` variant); returns the derived point (pair it with
+/// `proof.final_value` as the plain column claim).
 pub fn verify_shift_discharge_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut FsChannelTrace,
     w_log: usize,
     sigma: &[LinExpr],
     target: &LinExpr,
+    shift_log: usize,
     proof: &ShiftDischargeProofTrace,
 ) -> Vec<LinExpr> {
     assert_eq!(sigma.len(), w_log);
     assert_eq!(proof.rounds.len(), w_log);
+    assert!(shift_log < w_log);
 
     ch.observe_label(b, b"history-deep-chain-shift-v0");
+    ch.observe_f128(
+        b,
+        &LinExpr::constant(F128 {
+            lo: shift_log as u64,
+            hi: 0,
+        }),
+    );
     ch.observe_f128(b, target);
     ch.observe_f128_slice(b, sigma);
 
@@ -436,7 +520,7 @@ pub fn verify_shift_discharge_trace(
     }
     ch.observe_f128(b, &proof.final_value);
 
-    let kernel = shift_kernel_eval_trace(b, sigma, &point);
+    let kernel = shift_pow2_kernel_eval_trace(b, shift_log, sigma, &point);
     let expected = mul(b, &kernel, &proof.final_value);
     pin_eq(b, &expected, &claim);
     point
@@ -553,6 +637,99 @@ mod tests {
         assert!(survivors.is_empty(), "walk twin survivors: {survivors:?}");
     }
 
+    /// Fixed-pattern factors in the twin: a periodic selector gating a
+    /// 3-factor term, lockstep with the native verifier, mutations
+    /// rejected. Exercises the closed-form tensor evaluation.
+    #[test]
+    fn fixed_pattern_twin_lockstep_and_mutations() {
+        use noid_ivc_core::deep_chain::relations::FixedPattern;
+        let w_log = 4;
+        let low_log = 2;
+        let w = 1usize << w_log;
+        let mut rng = Rng(0xF17ED2);
+        let sel: Vec<F128> = (0..w)
+            .map(|_| {
+                if rng.f128().lo & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect();
+        let a: Vec<F128> = (0..w).map(|_| rng.f128()).collect();
+        let mut table = vec![F128::ZERO; 1 << low_log];
+        table[1] = F128::ONE;
+        table[2] = F128 { lo: 9, hi: 0 };
+        let fixed = vec![FixedPattern::new(low_log, table.clone())];
+        let terms = vec![
+            noid_ivc_core::deep_chain::relations::RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Fixed(0), ColRef::Committed(0), ColRef::Committed(1)],
+            },
+            noid_ivc_core::deep_chain::relations::RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Committed(1)],
+            },
+        ];
+        let mut rng2 = Rng(0xEE2);
+        let eq_point: Vec<F128> = (0..w_log).map(|_| rng2.f128()).collect();
+        let eq = build_eq_table(&eq_point);
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            let pat = table[i & ((1 << low_log) - 1)];
+            target += eq[i] * (pat * sel[i] * a[i] + a[i]);
+        }
+
+        let committed: Vec<&[F128]> = vec![&sel, &a];
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &fixed,
+        };
+        let mut ch_native = FsLaneChallenger::new(b"fixed-twin-test");
+        let (proof, native_point, _) =
+            prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"fixed-twin-test");
+        let target_e = alloc_expr(&mut b, target);
+        let eq_point_e: Vec<LinExpr> = eq_point.iter().map(|&v| alloc_expr(&mut b, v)).collect();
+        let terms_e: Vec<RelationTermTrace> = terms
+            .iter()
+            .map(|t| RelationTermTrace {
+                coeff: LinExpr::constant(t.coeff),
+                factors: t.factors.clone(),
+            })
+            .collect();
+        let mutation_start = b.num_wires();
+        let proof_e = ColumnRelationProofTrace::alloc(&mut b, &proof, w_log, 2);
+        let mutation_end = b.num_wires();
+        let point_e = verify_column_relation_trace(
+            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &fixed, &proof_e,
+        );
+
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "fixed twin transcript diverged");
+        for (e, n) in point_e.iter().zip(native_point.iter()) {
+            assert_eq!(e.eval(b.values()), *n);
+        }
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest fixed twin unsatisfiable");
+
+        use rayon::prelude::*;
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&t| {
+                let mut bad = z.clone();
+                bad[t] += F128::ONE;
+                r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(survivors.is_empty(), "fixed twin survivors: {survivors:?}");
+    }
+
     /// Relation + shift twins: lockstep on a wiring-shaped relation and its
     /// shift discharge, satisfiable, wire mutations rejected.
     #[test]
@@ -566,6 +743,7 @@ mod tests {
         let columns = RelationColumns {
             committed: &committed,
             internal: &[],
+            fixed: &[],
         };
         let coeff3 = F128 { lo: 3, hi: 0 };
         let coeff5 = F128 { lo: 5, hi: 0 };
@@ -616,7 +794,7 @@ mod tests {
         let mutation_end = b.num_wires();
 
         let point_e = verify_column_relation_trace(
-            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &proof_e,
+            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &[], &proof_e,
         );
         let shift_point_e = verify_shift_discharge_trace(
             &mut b,
@@ -624,6 +802,7 @@ mod tests {
             w_log,
             &point_e,
             &proof_e.final_values[0],
+            0,
             &shift_e,
         );
 

@@ -117,6 +117,7 @@ fn region_slot_end_to_end() {
         &zero,
         &rho,
         &const_terms(&bool_terms),
+        &[],
         &proof_e,
     );
     pending.push(PendingClaimTrace {
@@ -140,7 +141,8 @@ fn region_slot_end_to_end() {
             &zero,
             &rho,
             &const_terms(&terms),
-            &proof_e,
+            &[],
+        &proof_e,
         );
         for (r, v) in refs.iter().zip(proof_e.final_values.iter()) {
             if let ColRef::Committed(c) = r {
@@ -178,6 +180,7 @@ fn region_slot_end_to_end() {
         &zero,
         &rho_sel,
         &const_terms(&sel_terms),
+        &[],
         &sel_proof_e,
     );
     pending.push(PendingClaimTrace {
@@ -211,6 +214,7 @@ fn region_slot_end_to_end() {
         &zero,
         &rho_out,
         &const_terms(&out_terms),
+        &[],
         &out_proof_e,
     );
     let out_refs = noid_ivc_core::deep_chain::relations::distinct_refs(&out_terms);
@@ -301,6 +305,7 @@ fn region_slot_end_to_end() {
         &target,
         &terminal.point,
         &sub_terms_e,
+        &[],
         &sub_proof_e,
     );
     let mut shift_target = None;
@@ -312,7 +317,7 @@ fn region_slot_end_to_end() {
                 value: v.clone(),
             }),
             ColRef::CommittedShift(_) => shift_target = Some(v.clone()),
-            ColRef::Internal(_) => unreachable!(),
+            ColRef::Internal(_) | ColRef::Fixed(_) | ColRef::CommittedShift2(_) => unreachable!(),
         }
     }
 
@@ -328,6 +333,7 @@ fn region_slot_end_to_end() {
         W_LOG,
         &sub_point,
         &shift_target.expect("wiring references the carry shift"),
+        0,
         &shift_e,
     );
     pending.push(PendingClaimTrace {

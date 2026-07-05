@@ -24,6 +24,16 @@
 //! sumcheck against the successor kernel `N(σ,w) = eq(σ, w+1)`, whose
 //! closed form ([`shift_kernel_eval`]) both verifiers evaluate in O(n).
 //!
+//! Besides witness columns, terms may reference FIXED columns
+//! ([`ColRef::Fixed`] / [`FixedPattern`]): protocol-constant selector or
+//! constant-value columns that are periodic in the low `low_log` index
+//! bits. Their MLE factorizes — `pat~(ρ) = table~(ρ[..low_log])` — so the
+//! verifier evaluates them itself in O(2^low_log) and they never appear in
+//! `final_values`. This is what keeps chain-schedule wiring (start/absorb/
+//! pad selectors, IV and domain-tag constants) out of the committed
+//! witness and independent of how many schedule copies tile the slot
+//! domain.
+//!
 //! Round polynomials use the compressed wire form (`[c_0, c_2..c_d]`, the
 //! linear coefficient reconstructed from the running claim).
 
@@ -32,10 +42,13 @@ use crate::field::F128;
 use crate::lincheck::build_eq_table;
 use rayon::prelude::*;
 
-/// Maximum column factors per term (degree 3 with the eq prefix).
-pub const MAX_TERM_FACTORS: usize = 2;
+/// Maximum column factors per term (degree 4 with the eq prefix). Three
+/// factors admit selector-gated products like `EVEN·D·SIB` without minting
+/// combined selector columns — committed columns cost 2^w_log witness
+/// cells each at attack scale, an extra round coefficient costs one wire.
+pub const MAX_TERM_FACTORS: usize = 3;
 
-/// Relation sumcheck degree: eq · (≤ two column factors).
+/// Relation sumcheck degree: eq · (≤ [`MAX_TERM_FACTORS`] column factors).
 pub const RELATION_DEGREE: usize = 1 + MAX_TERM_FACTORS;
 
 /// A reference to one column of the relation instance.
@@ -47,12 +60,57 @@ pub enum ColRef {
     /// A committed column read at the PREDECESSOR slot (`col(w−1)`, zero at
     /// slot 0) — its terminal claim needs [`prove_shift_discharge`].
     CommittedShift(usize),
+    /// A committed column read TWO slots back (`col(w−2)`, zero at slots
+    /// 0/1) — the node-to-node digest carry of two-permutation compress
+    /// chains. Discharged by [`prove_shift_discharge_pow2`] with
+    /// `shift_log = 1`.
+    CommittedShift2(usize),
     /// An internal (uncommitted) column — its terminal claim must feed a
     /// walk claim group or another relation's target.
     Internal(usize),
+    /// A protocol-constant column ([`FixedPattern`]) — the verifier
+    /// evaluates its MLE itself; no terminal claim, no `final_values`
+    /// entry.
+    Fixed(usize),
 }
 
-/// One product term: `coeff · Π factors` (0..=2 factors; empty = constant).
+/// A protocol-constant column, periodic in the low `low_log` index bits:
+/// `col(w) = table[w mod 2^low_log]`. Its MLE at any point ρ (with
+/// `ρ.len() ≥ low_log`) is `table~(ρ[..low_log])` — the high coordinates
+/// integrate out because `Σ_hi eq(ρ_hi, hi) = 1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedPattern {
+    pub low_log: usize,
+    pub table: Vec<F128>,
+}
+
+impl FixedPattern {
+    pub fn new(low_log: usize, table: Vec<F128>) -> Self {
+        assert_eq!(table.len(), 1usize << low_log, "fixed pattern length");
+        Self { low_log, table }
+    }
+
+    /// MLE evaluation at a point of ≥ `low_log` coordinates.
+    pub fn eval(&self, point: &[F128]) -> F128 {
+        assert!(point.len() >= self.low_log, "fixed pattern point arity");
+        let eq = build_eq_table(&point[..self.low_log]);
+        let mut acc = F128::ZERO;
+        for (v, e) in self.table.iter().zip(eq.iter()) {
+            acc += *v * *e;
+        }
+        acc
+    }
+
+    /// The periodic extension over a `2^w_log`-slot domain (prover side).
+    pub fn materialize(&self, w: usize) -> Vec<F128> {
+        assert!(w >= self.table.len(), "domain below pattern period");
+        let mask = self.table.len() - 1;
+        (0..w).map(|i| self.table[i & mask]).collect()
+    }
+}
+
+/// One product term: `coeff · Π factors` (0..=[`MAX_TERM_FACTORS`]
+/// factors; empty = constant).
 #[derive(Clone, Debug)]
 pub struct RelationTerm {
     pub coeff: F128,
@@ -62,9 +120,10 @@ pub struct RelationTerm {
 /// Proof wires of one relation sumcheck.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnRelationProof {
-    /// Per round: `[c_0, c_2, c_3]`.
+    /// Per round: `[c_0, c_2, .., c_d]` (compressed wire form).
     pub rounds: Vec<[F128; RELATION_DEGREE]>,
-    /// MLE evaluation at the derived point per DISTINCT ColRef, in
+    /// MLE evaluation at the derived point per DISTINCT CLAIMED ColRef
+    /// (Fixed refs excluded — the verifier evaluates those itself), in
     /// first-occurrence order over the term list.
     pub final_values: Vec<F128>,
 }
@@ -84,8 +143,8 @@ impl std::fmt::Display for RelationError {
     }
 }
 
-/// Distinct ColRefs in first-occurrence order — the layout of
-/// `final_values` and of the returned claims.
+/// Distinct ColRefs in first-occurrence order (Fixed included) — the
+/// prover's working-table layout.
 pub fn distinct_refs(terms: &[RelationTerm]) -> Vec<ColRef> {
     let mut out = Vec::new();
     for t in terms {
@@ -102,10 +161,21 @@ pub fn distinct_refs(terms: &[RelationTerm]) -> Vec<ColRef> {
     out
 }
 
-/// The columns backing a relation instance, prover side.
+/// Distinct CLAIMED ColRefs (Fixed excluded) in first-occurrence order —
+/// the layout of `final_values` and of the returned claims.
+pub fn claimed_refs(terms: &[RelationTerm]) -> Vec<ColRef> {
+    distinct_refs(terms)
+        .into_iter()
+        .filter(|r| !matches!(r, ColRef::Fixed(_)))
+        .collect()
+}
+
+/// The columns backing a relation instance, prover side. `fixed` is also
+/// consumed by the verifier (protocol constants, not witness).
 pub struct RelationColumns<'a> {
     pub committed: &'a [&'a [F128]],
     pub internal: &'a [&'a [F128]],
+    pub fixed: &'a [FixedPattern],
 }
 
 impl RelationColumns<'_> {
@@ -119,6 +189,13 @@ impl RelationColumns<'_> {
                 shifted[1..].copy_from_slice(&col[..w - 1]);
                 shifted
             }
+            ColRef::CommittedShift2(i) => {
+                let col = self.committed[i];
+                let mut shifted = vec![F128::ZERO; w];
+                shifted[2..].copy_from_slice(&col[..w - 2]);
+                shifted
+            }
+            ColRef::Fixed(i) => self.fixed[i].materialize(w),
         }
     }
 }
@@ -144,6 +221,11 @@ fn absorb_relation_header<Ch: Challenger>(
                 ColRef::Committed(i) => (0u64, *i as u64),
                 ColRef::CommittedShift(i) => (1, *i as u64),
                 ColRef::Internal(i) => (2, *i as u64),
+                // Fixed pattern CONTENT is a protocol constant on both
+                // sides (like the term structure itself) — only the
+                // reference is bound.
+                ColRef::Fixed(i) => (3, *i as u64),
+                ColRef::CommittedShift2(i) => (4, *i as u64),
             };
             lanes.push(lane(kind, idx));
         }
@@ -159,29 +241,40 @@ fn f128_of_usize(t: usize) -> F128 {
     }
 }
 
-fn reconstruct_deg3(wire: &[F128; RELATION_DEGREE], claim: F128) -> [F128; RELATION_DEGREE + 1] {
+const RELATION_NODES: usize = RELATION_DEGREE + 1;
+
+fn reconstruct_round(wire: &[F128; RELATION_DEGREE], claim: F128) -> [F128; RELATION_NODES] {
     // c_1 = claim + Σ_{i≥2} c_i (char 2).
     let mut c1 = claim;
     for &c in &wire[1..] {
         c1 += c;
     }
-    [wire[0], c1, wire[1], wire[2]]
+    let mut coeffs = [F128::ZERO; RELATION_NODES];
+    coeffs[0] = wire[0];
+    coeffs[1] = c1;
+    coeffs[2..].copy_from_slice(&wire[1..]);
+    coeffs
 }
 
 #[inline]
-fn horner4(coeffs: &[F128; RELATION_DEGREE + 1], x: F128) -> F128 {
-    ((coeffs[3] * x + coeffs[2]) * x + coeffs[1]) * x + coeffs[0]
+fn horner_round(coeffs: &[F128; RELATION_NODES], x: F128) -> F128 {
+    let mut acc = coeffs[RELATION_NODES - 1];
+    for &c in coeffs[..RELATION_NODES - 1].iter().rev() {
+        acc = acc * x + c;
+    }
+    acc
 }
 
-/// Interpolate a degree-3 polynomial from evaluations at 0..=3 into
-/// monomial coefficients (char-2 exact).
-fn interpolate_deg3(evals: &[F128; RELATION_DEGREE + 1]) -> [F128; RELATION_DEGREE + 1] {
-    // Nodes 0,1,2,3 in the flat basis. Precompute basis once.
-    static BASIS: std::sync::OnceLock<[[F128; 4]; 4]> = std::sync::OnceLock::new();
+/// Interpolate a degree-[`RELATION_DEGREE`] polynomial from evaluations at
+/// the flat-basis nodes 0..=[`RELATION_DEGREE`] into monomial coefficients
+/// (char-2 exact).
+fn interpolate_round(evals: &[F128; RELATION_NODES]) -> [F128; RELATION_NODES] {
+    static BASIS: std::sync::OnceLock<[[F128; RELATION_NODES]; RELATION_NODES]> =
+        std::sync::OnceLock::new();
     let basis = BASIS.get_or_init(|| {
-        let nodes: [F128; 4] = std::array::from_fn(|i| f128_of_usize(i));
+        let nodes: [F128; RELATION_NODES] = std::array::from_fn(f128_of_usize);
         std::array::from_fn(|i| {
-            let mut poly = [F128::ZERO; 4];
+            let mut poly = [F128::ZERO; RELATION_NODES];
             poly[0] = F128::ONE;
             let mut deg = 0usize;
             let mut denom = F128::ONE;
@@ -190,7 +283,7 @@ fn interpolate_deg3(evals: &[F128; RELATION_DEGREE + 1]) -> [F128; RELATION_DEGR
                     continue;
                 }
                 denom = denom * (nodes[i] + t_j);
-                let mut next = [F128::ZERO; 4];
+                let mut next = [F128::ZERO; RELATION_NODES];
                 for d in 0..=deg {
                     next[d + 1] += poly[d];
                     next[d] += poly[d] * t_j;
@@ -202,9 +295,9 @@ fn interpolate_deg3(evals: &[F128; RELATION_DEGREE + 1]) -> [F128; RELATION_DEGR
             std::array::from_fn(|d| poly[d] * inv)
         })
     });
-    let mut coeffs = [F128::ZERO; 4];
+    let mut coeffs = [F128::ZERO; RELATION_NODES];
     for (i, &e) in evals.iter().enumerate() {
-        for d in 0..4 {
+        for d in 0..RELATION_NODES {
             coeffs[d] += e * basis[i][d];
         }
     }
@@ -227,6 +320,7 @@ pub fn prove_column_relation<Ch: Challenger>(
     let w_log = eq_point.len();
     let w = 1usize << w_log;
     let refs = distinct_refs(terms);
+    let claimed = claimed_refs(terms);
 
     absorb_relation_header(challenger, target, eq_point, terms);
 
@@ -259,7 +353,7 @@ pub fn prove_column_relation<Ch: Challenger>(
         let evals = (0..half)
             .into_par_iter()
             .fold(
-                || [F128::ZERO; RELATION_DEGREE + 1],
+                || [F128::ZERO; RELATION_NODES],
                 |mut acc, p| {
                     let eq_base = eq[2 * p];
                     let eq_delta = eq[2 * p] + eq[2 * p + 1];
@@ -285,7 +379,7 @@ pub fn prove_column_relation<Ch: Challenger>(
                 },
             )
             .reduce(
-                || [F128::ZERO; RELATION_DEGREE + 1],
+                || [F128::ZERO; RELATION_NODES],
                 |mut a, b| {
                     for (x, y) in a.iter_mut().zip(b.iter()) {
                         *x += *y;
@@ -293,12 +387,14 @@ pub fn prove_column_relation<Ch: Challenger>(
                     a
                 },
             );
-        let full = interpolate_deg3(&evals);
-        debug_assert_eq!(full[0] + horner4(&full, F128::ONE), claim);
-        let wire = [full[0], full[2], full[3]];
+        let full = interpolate_round(&evals);
+        debug_assert_eq!(full[0] + horner_round(&full, F128::ONE), claim);
+        let mut wire = [F128::ZERO; RELATION_DEGREE];
+        wire[0] = full[0];
+        wire[1..].copy_from_slice(&full[2..]);
         challenger.observe_f128_slice(&wire);
         let r = challenger.sample_f128();
-        claim = horner4(&full, r);
+        claim = horner_round(&full, r);
         point.push(r);
         rounds.push(wire);
         fold_table(&mut eq, r);
@@ -307,7 +403,14 @@ pub fn prove_column_relation<Ch: Challenger>(
         }
     }
 
-    let final_values: Vec<F128> = tables.iter().map(|t| t[0]).collect();
+    // Only claimed refs travel; Fixed values are verifier-computed.
+    let final_values: Vec<F128> = refs
+        .iter()
+        .zip(tables.iter())
+        .filter(|(r, _)| !matches!(r, ColRef::Fixed(_)))
+        .map(|(_, t)| t[0])
+        .collect();
+    debug_assert_eq!(final_values.len(), claimed.len());
     challenger.observe_f128_slice(&final_values);
     debug_assert_eq!(
         {
@@ -315,7 +418,7 @@ pub fn prove_column_relation<Ch: Challenger>(
             for (coeff, fidx) in &term_refs {
                 let mut prod = *coeff;
                 for &fi in fidx {
-                    prod = prod * final_values[fi];
+                    prod = prod * tables[fi][0];
                 }
                 sum += prod;
             }
@@ -336,19 +439,21 @@ pub fn prove_column_relation<Ch: Challenger>(
 }
 
 /// Verify a relation sumcheck; returns the derived point (the per-ref
-/// values live in `proof.final_values`, ordered by [`distinct_refs`]).
+/// values live in `proof.final_values`, ordered by [`claimed_refs`];
+/// Fixed factors are evaluated from `fixed` in closed form).
 pub fn verify_column_relation<Ch: Challenger>(
     w_log: usize,
     target: F128,
     eq_point: &[F128],
     terms: &[RelationTerm],
+    fixed: &[FixedPattern],
     proof: &ColumnRelationProof,
     challenger: &mut Ch,
 ) -> Result<Vec<F128>, RelationError> {
-    let refs = distinct_refs(terms);
+    let claimed = claimed_refs(terms);
     if eq_point.len() != w_log
         || proof.rounds.len() != w_log
-        || proof.final_values.len() != refs.len()
+        || proof.final_values.len() != claimed.len()
     {
         return Err(RelationError::Shape);
     }
@@ -359,9 +464,9 @@ pub fn verify_column_relation<Ch: Challenger>(
     let mut point = Vec::with_capacity(w_log);
     for wire in &proof.rounds {
         challenger.observe_f128_slice(wire);
-        let full = reconstruct_deg3(wire, claim);
+        let full = reconstruct_round(wire, claim);
         let r = challenger.sample_f128();
-        claim = horner4(&full, r);
+        claim = horner_round(&full, r);
         point.push(r);
     }
     challenger.observe_f128_slice(&proof.final_values);
@@ -370,8 +475,17 @@ pub fn verify_column_relation<Ch: Challenger>(
     for t in terms {
         let mut prod = t.coeff;
         for f in &t.factors {
-            let fi = refs.iter().position(|r| r == f).expect("distinct ref");
-            prod = prod * proof.final_values[fi];
+            prod = prod
+                * match f {
+                    ColRef::Fixed(i) => fixed[*i].eval(&point),
+                    _ => {
+                        let fi = claimed
+                            .iter()
+                            .position(|r| r == f)
+                            .expect("claimed ref");
+                        proof.final_values[fi]
+                    }
+                };
         }
         sum += prod;
     }
@@ -424,6 +538,21 @@ pub fn shift_kernel_eval(rho: &[F128], sigma: &[F128]) -> F128 {
     acc
 }
 
+/// Closed form of the `2^shift_log`-step kernel
+/// `N_s(ρ, σ) = Σ_w eq(ρ, w + 2^shift_log)·eq(σ, w)`: adding `2^k` leaves
+/// the low `k` bits untouched and increments the high part by one, so the
+/// kernel factors into matched low bits times the successor kernel on the
+/// high coordinates.
+pub fn shift_pow2_kernel_eval(shift_log: usize, rho: &[F128], sigma: &[F128]) -> F128 {
+    assert_eq!(rho.len(), sigma.len());
+    assert!(shift_log < rho.len(), "shift below the domain size");
+    let mut acc = F128::ONE;
+    for i in 0..shift_log {
+        acc = acc * (rho[i] * sigma[i] + (F128::ONE + rho[i]) * (F128::ONE + sigma[i]));
+    }
+    acc * shift_kernel_eval(&rho[shift_log..], &sigma[shift_log..])
+}
+
 /// Proof wires of one shift discharge (degree-2 rounds `[c_0, c_2]` plus
 /// the terminal plain MLE value).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,21 +569,31 @@ pub fn prove_shift_discharge<Ch: Challenger>(
     target: F128,
     challenger: &mut Ch,
 ) -> (ShiftDischargeProof, Vec<F128>) {
+    prove_shift_discharge_pow2(col, sigma, target, 0, challenger)
+}
+
+/// Prove the `2^shift_log`-step variant: discharge
+/// `Σ_w eq(σ,w)·col(w − 2^shift_log) = target` into a plain claim.
+pub fn prove_shift_discharge_pow2<Ch: Challenger>(
+    col: &[F128],
+    sigma: &[F128],
+    target: F128,
+    shift_log: usize,
+    challenger: &mut Ch,
+) -> (ShiftDischargeProof, Vec<F128>) {
     let w = col.len();
     assert!(w.is_power_of_two());
     let w_log = w.trailing_zeros() as usize;
     assert_eq!(sigma.len(), w_log);
+    let shift = 1usize << shift_log;
+    assert!(shift < w);
 
-    challenger.observe_label(b"history-deep-chain-shift-v0");
-    challenger.observe_f128(target);
-    challenger.observe_f128_slice(sigma);
+    absorb_shift_header(challenger, target, sigma, shift_log);
 
-    // N table: N[w] = eq(σ, w+1), 0 at the top slot.
+    // N table: N[w] = eq(σ, w + shift), 0 at the top slots.
     let eq_sigma = build_eq_table(sigma);
     let mut n_table = vec![F128::ZERO; w];
-    if w > 1 {
-        n_table[..w - 1].copy_from_slice(&eq_sigma[1..]);
-    }
+    n_table[..w - shift].copy_from_slice(&eq_sigma[shift..]);
     let mut col_table = col.to_vec();
 
     let mut claim = target;
@@ -513,6 +652,21 @@ pub fn prove_shift_discharge<Ch: Challenger>(
     )
 }
 
+fn absorb_shift_header<Ch: Challenger>(
+    challenger: &mut Ch,
+    target: F128,
+    sigma: &[F128],
+    shift_log: usize,
+) {
+    challenger.observe_label(b"history-deep-chain-shift-v0");
+    challenger.observe_f128(F128 {
+        lo: shift_log as u64,
+        hi: 0,
+    });
+    challenger.observe_f128(target);
+    challenger.observe_f128_slice(sigma);
+}
+
 /// Verify a shift discharge; returns the derived point (pair it with
 /// `proof.final_value` as the plain committed-column claim).
 pub fn verify_shift_discharge<Ch: Challenger>(
@@ -522,12 +676,22 @@ pub fn verify_shift_discharge<Ch: Challenger>(
     proof: &ShiftDischargeProof,
     challenger: &mut Ch,
 ) -> Result<Vec<F128>, RelationError> {
-    if sigma.len() != w_log || proof.rounds.len() != w_log {
+    verify_shift_discharge_pow2(w_log, sigma, target, 0, proof, challenger)
+}
+
+/// Verify the `2^shift_log`-step variant.
+pub fn verify_shift_discharge_pow2<Ch: Challenger>(
+    w_log: usize,
+    sigma: &[F128],
+    target: F128,
+    shift_log: usize,
+    proof: &ShiftDischargeProof,
+    challenger: &mut Ch,
+) -> Result<Vec<F128>, RelationError> {
+    if sigma.len() != w_log || proof.rounds.len() != w_log || shift_log >= w_log {
         return Err(RelationError::Shape);
     }
-    challenger.observe_label(b"history-deep-chain-shift-v0");
-    challenger.observe_f128(target);
-    challenger.observe_f128_slice(sigma);
+    absorb_shift_header(challenger, target, sigma, shift_log);
 
     let mut claim = target;
     let mut point = Vec::with_capacity(w_log);
@@ -541,7 +705,7 @@ pub fn verify_shift_discharge<Ch: Challenger>(
     }
     challenger.observe_f128(proof.final_value);
 
-    if shift_kernel_eval(sigma, &point) * proof.final_value != claim {
+    if shift_pow2_kernel_eval(shift_log, sigma, &point) * proof.final_value != claim {
         return Err(RelationError::FinalMismatch);
     }
     Ok(point)
@@ -633,6 +797,51 @@ mod tests {
     }
 
     #[test]
+    fn shift_pow2_kernel_and_roundtrip() {
+        let mut rng = Rng(0x511F8);
+        // Kernel closed form vs the direct double sum, shifts 2 and 4.
+        for (shift_log, n) in [(1usize, 4usize), (1, 6), (2, 5)] {
+            let shift = 1usize << shift_log;
+            let rho: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let sigma: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let eq_rho = build_eq_table(&rho);
+            let eq_sigma = build_eq_table(&sigma);
+            let mut direct = F128::ZERO;
+            for w in 0..(1usize << n) - shift {
+                direct += eq_rho[w + shift] * eq_sigma[w];
+            }
+            assert_eq!(
+                shift_pow2_kernel_eval(shift_log, &rho, &sigma),
+                direct,
+                "shift_log={shift_log} n={n}"
+            );
+        }
+
+        // Discharge roundtrip at shift 2.
+        let w_log = 5;
+        let w = 1usize << w_log;
+        let col = random_col(&mut rng, w);
+        let sigma: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let eq = build_eq_table(&sigma);
+        let mut target = F128::ZERO;
+        for i in 2..w {
+            target += eq[i] * col[i - 2];
+        }
+        let mut ch_p = FsLaneChallenger::new(b"shift2-test");
+        let (proof, point_p) = prove_shift_discharge_pow2(&col, &sigma, target, 1, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(b"shift2-test");
+        let point_v = verify_shift_discharge_pow2(w_log, &sigma, target, 1, &proof, &mut ch_v)
+            .expect("honest shift2 discharge");
+        assert_eq!(point_p, point_v);
+        assert_eq!(mle_eval(&col, &point_v), proof.final_value);
+
+        // The shift amount is transcript-bound: verifying the same proof
+        // as a 1-step discharge fails.
+        let mut ch = FsLaneChallenger::new(b"shift2-test");
+        assert!(verify_shift_discharge(w_log, &sigma, target, &proof, &mut ch).is_err());
+    }
+
+    #[test]
     fn shift_discharge_roundtrip_and_mutations() {
         let mut rng = Rng(0xD15C);
         let w_log = 5;
@@ -695,6 +904,7 @@ mod tests {
         let columns = RelationColumns {
             committed: &committed,
             internal: &internal_cols,
+            fixed: &[],
         };
 
         // relation(w) = 3·sel(w)·carry(w−1) + 5·(absorb(w)) + 7·internal(w)
@@ -727,7 +937,7 @@ mod tests {
         let (proof, point_p, values_p) =
             prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"relation-test");
-        let point_v = verify_column_relation(w_log, target, &eq_point, &terms, &proof, &mut ch_v)
+        let point_v = verify_column_relation(w_log, target, &eq_point, &terms, &[], &proof, &mut ch_v)
             .expect("honest relation");
         assert_eq!(point_p, point_v);
         assert_eq!(values_p, proof.final_values);
@@ -757,6 +967,7 @@ mod tests {
             target + F128::ONE,
             &eq_point,
             &terms,
+            &[],
             &proof,
             &mut ch
         )
@@ -768,7 +979,7 @@ mod tests {
                 let mut bad = proof.clone();
                 bad.rounds[round][c] += F128::ONE;
                 let mut ch = FsLaneChallenger::new(b"relation-test");
-                match verify_column_relation(w_log, target, &eq_point, &terms, &bad, &mut ch) {
+                match verify_column_relation(w_log, target, &eq_point, &terms, &[], &bad, &mut ch) {
                     Err(_) => {}
                     Ok(pt) => {
                         // A surviving run must have shifted the derived point
@@ -799,6 +1010,107 @@ mod tests {
         assert!(survivors.is_empty(), "relation mutation survivors: {survivors:?}");
     }
 
+    /// Fixed patterns: a periodic selector gating a 3-factor term. The
+    /// verifier evaluates the pattern itself; the folded prover table and
+    /// the closed form must agree, and the roundtrip must hold on a domain
+    /// LARGER than the pattern period (the tiling case).
+    #[test]
+    fn fixed_pattern_factors() {
+        let mut rng = Rng(0xF17ED);
+        let w_log = 5;
+        let low_log = 3;
+        let w = 1usize << w_log;
+        let sel: Vec<F128> = (0..w).map(|_| rng.bit()).collect();
+        let a = random_col(&mut rng, w);
+        let b = random_col(&mut rng, w);
+        // Period-8 pattern: 1 at slots ≡ 0, 3 (mod 8); constant 7 at slot 5.
+        let mut table = vec![F128::ZERO; 1 << low_log];
+        table[0] = F128::ONE;
+        table[3] = F128::ONE;
+        table[5] = f128_of_usize(7);
+        let fixed = vec![FixedPattern::new(low_log, table.clone())];
+
+        // relation(w) = pat·sel·a + pat·b + a  (a 3-factor term, a gated
+        // single factor, and an ungated one).
+        let terms = vec![
+            RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Fixed(0), ColRef::Committed(0), ColRef::Committed(1)],
+            },
+            RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Fixed(0), ColRef::Committed(2)],
+            },
+            RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Committed(1)],
+            },
+        ];
+        let eq_point: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let eq = build_eq_table(&eq_point);
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            let pat = table[i & ((1 << low_log) - 1)];
+            target += eq[i] * (pat * sel[i] * a[i] + pat * b[i] + a[i]);
+        }
+
+        let committed: Vec<&[F128]> = vec![&sel, &a, &b];
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &fixed,
+        };
+        let mut ch_p = FsLaneChallenger::new(b"fixed-test");
+        let (proof, point_p, _) =
+            prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_p);
+        // Only the three committed refs are claimed.
+        assert_eq!(proof.final_values.len(), 3);
+
+        let mut ch_v = FsLaneChallenger::new(b"fixed-test");
+        let point_v =
+            verify_column_relation(w_log, target, &eq_point, &terms, &fixed, &proof, &mut ch_v)
+                .expect("honest fixed-pattern relation");
+        assert_eq!(point_p, point_v);
+        assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
+
+        // Closed-form eval == folded periodic table at the derived point.
+        let materialized = fixed[0].materialize(w);
+        assert_eq!(fixed[0].eval(&point_v), mle_eval(&materialized, &point_v));
+
+        // Terminal claims true against the columns.
+        for (r, v) in claimed_refs(&terms).iter().zip(proof.final_values.iter()) {
+            let ColRef::Committed(c) = r else {
+                unreachable!()
+            };
+            let col: &[F128] = committed[*c];
+            assert_eq!(*v, mle_eval(col, &point_v));
+        }
+
+        // A verifier with a WRONG pattern rejects (or derives false claims).
+        let mut bad_table = table.clone();
+        bad_table[0] += F128::ONE;
+        let bad_fixed = vec![FixedPattern::new(low_log, bad_table)];
+        let mut ch = FsLaneChallenger::new(b"fixed-test");
+        match verify_column_relation(
+            w_log, target, &eq_point, &terms, &bad_fixed, &proof, &mut ch,
+        ) {
+            Err(_) => {}
+            Ok(pt) => {
+                let all_true = claimed_refs(&terms)
+                    .iter()
+                    .zip(proof.final_values.iter())
+                    .all(|(r, v)| {
+                        let ColRef::Committed(c) = r else {
+                            unreachable!()
+                        };
+                        let col: &[F128] = committed[*c];
+                        mle_eval(col, &pt) == *v
+                    });
+                assert!(!all_true, "wrong fixed pattern accepted");
+            }
+        }
+    }
+
     /// Booleanity as a relation: `0 = Σ eq·(b² + b)` accepts boolean
     /// columns and rejects a non-boolean lane.
     #[test]
@@ -823,12 +1135,13 @@ mod tests {
         let columns = RelationColumns {
             committed: &committed,
             internal: &[],
+            fixed: &[],
         };
         let mut ch_p = FsLaneChallenger::new(b"bool-test");
         let (proof, _, _) =
             prove_column_relation(F128::ZERO, &eq_point, &terms, &columns, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"bool-test");
-        let pt = verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &proof, &mut ch_v)
+        let pt = verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &[], &proof, &mut ch_v)
             .expect("boolean column accepted");
         assert_eq!(proof.final_values[0], mle_eval(&good, &pt));
 
@@ -840,12 +1153,13 @@ mod tests {
         let columns = RelationColumns {
             committed: &committed,
             internal: &[],
+            fixed: &[],
         };
         let mut ch_p = FsLaneChallenger::new(b"bool-test");
         let (proof, _, _) =
             prove_column_relation(F128::ZERO, &eq_point, &terms, &columns, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"bool-test");
-        match verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &proof, &mut ch_v) {
+        match verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &[], &proof, &mut ch_v) {
             Err(_) => {}
             Ok(pt) => {
                 assert_ne!(
