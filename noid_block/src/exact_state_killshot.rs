@@ -60,6 +60,7 @@ pub fn derive_exact_state_killshot_inputs(
     surface: &ExactActionSurface,
     guard: &ReuseGuard,
     proof: &ExactStateTransitionProof,
+    padded_spent_len: usize,
 ) -> Result<(ExactStateKillShotInputs, VerifiedStateTransition), ExactStateKillShotError> {
     let verified = verify_exact_state_transition(inputs, surface, guard, proof)?;
 
@@ -75,8 +76,8 @@ pub fn derive_exact_state_killshot_inputs(
     state_paths.extend(state_inputs.old_paths);
     state_paths.extend(state_inputs.new_paths);
 
-    let guard_buckets = derive_exact_guard_bucket_hash_inputs(inputs, surface, guard, proof)?
-        .map(|derived| vec![derived.old_bucket, derived.new_bucket]);
+    let guard_buckets =
+        derive_exact_guard_bucket_hash_inputs(inputs, surface, guard, proof, padded_spent_len)?;
     let guard_paths = derive_exact_guard_merkle_batch_inputs(inputs, surface, guard, proof)?
         .map(|derived| vec![derived.old_path, derived.new_path]);
 
@@ -301,7 +302,7 @@ mod tests {
             crate::build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
 
         let (killshot_inputs, verified) =
-            derive_exact_state_killshot_inputs(&inputs, &surface, &guard, &exact_proof).unwrap();
+            derive_exact_state_killshot_inputs(&inputs, &surface, &guard, &exact_proof, 8).unwrap();
         assert_eq!(verified.child_state_root(), inputs.child_state_root);
         let proof = prove_exact_state_killshot(&killshot_inputs).unwrap();
         verify_exact_state_killshot(&killshot_inputs, &proof).unwrap();
@@ -321,7 +322,7 @@ mod tests {
         let exact_proof =
             crate::build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
         let (mut killshot_inputs, _) =
-            derive_exact_state_killshot_inputs(&inputs, &surface, &guard, &exact_proof).unwrap();
+            derive_exact_state_killshot_inputs(&inputs, &surface, &guard, &exact_proof, 8).unwrap();
         let proof = prove_exact_state_killshot(&killshot_inputs).unwrap();
         killshot_inputs.slot_leaves[0].expected_leaf[0] += Block128::ONE;
         assert_eq!(

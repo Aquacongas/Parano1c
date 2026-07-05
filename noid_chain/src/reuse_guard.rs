@@ -5,7 +5,8 @@
 
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_RGDBUCK, TAG_RGDNODE};
+use noid_core::TowerField;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_RGDBUCK, TAG_RGDNODE, TAG_RGDSLOT};
 
 use crate::consensus::params::ANCHOR_DEPTH;
 use crate::exact_state_hash::StateHash;
@@ -249,24 +250,38 @@ pub fn is_active_height(spent_height: u64, at_height: u64) -> bool {
     at_height < spent_height.saturating_add(REUSE_DELAY)
 }
 
-/// Hash a canonical guard bucket.
+/// Hash a canonical spent-slot list: the inner digest nested inside a guard
+/// bucket leaf. Keeping the (unbounded) slot list one indirection below the
+/// leaf means any consumer that only needs to bind a bucket's height — in
+/// particular the reuse-expiry check on the bucket being overwritten — can
+/// open the constant-size leaf preimage without ever walking the old list.
+pub fn guard_slots_digest(spent_slots: &[u32]) -> [Block128; 2] {
+    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_RGDSLOT));
+    s.absorb(Block128::from(spent_slots.len() as u64));
+    for &slot in spent_slots {
+        s.absorb(Block128::from(slot));
+    }
+    crate::exact_state_hash::fields_from_digest(s.finalize())
+}
+
+/// Hash a canonical guard bucket leaf: a fixed four-field sponge over
+/// `(occupied, absolute_height, slots_digest)`. Empty buckets hash the
+/// all-zero preimage; occupied buckets nest [`guard_slots_digest`].
 pub fn guard_bucket_hash(bucket: &GuardBucket) -> StateHash {
-    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_RGDBUCK));
-    match bucket {
-        GuardBucket::Empty => {
-            s.absorb(Block128::from(0u8));
-        }
+    let (occupied, absolute_height, digest) = match bucket {
+        GuardBucket::Empty => (Block128::ZERO, Block128::ZERO, [Block128::ZERO; 2]),
         GuardBucket::Occupied {
             absolute_height,
             spent_slots,
-        } => {
-            s.absorb_pair(Block128::from(1u8), Block128::from(*absolute_height));
-            s.absorb(Block128::from(spent_slots.len() as u64));
-            for &slot in spent_slots {
-                s.absorb(Block128::from(slot));
-            }
-        }
-    }
+        } => (
+            Block128::from(1u8),
+            Block128::from(*absolute_height),
+            guard_slots_digest(spent_slots),
+        ),
+    };
+    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_RGDBUCK));
+    s.absorb_pair(occupied, absolute_height);
+    s.absorb_pair(digest[0], digest[1]);
     s.finalize()
 }
 

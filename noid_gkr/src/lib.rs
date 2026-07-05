@@ -92,9 +92,10 @@ pub use fixed_field_hash_killshot::{
     FixedFieldHashProofKillShot, FixedFieldHashReductions, FIXED_FIELD_HASH_PIN_LANES,
 };
 pub use guard_bucket_killshot::{
-    discharge_batched_guard_bucket_reductions_native, prove_batched_guard_bucket_killshot,
+    discharge_batched_guard_bucket_reductions_native, guard_slots_chain_len,
+    guard_update_live_slots, prove_batched_guard_bucket_killshot,
     verify_batched_guard_bucket_killshot, BatchedGuardBucketProofKillShot,
-    BatchedGuardBucketReductions, GuardBucketHashInputs,
+    BatchedGuardBucketReductions, GuardBucketUpdateInputs, GuardLeafHashInputs,
 };
 pub use header_hash_killshot::{
     discharge_header_hash_reductions_native, discharge_header_hash_reductions_native_padded,

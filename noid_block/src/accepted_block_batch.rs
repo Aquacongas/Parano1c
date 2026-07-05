@@ -374,11 +374,26 @@ pub fn verify_full_accepted_block_batch_native(
             let proof = proof
                 .as_ref()
                 .expect("user-transaction block proof decoded above");
+            let (standard_txs, sweep_txs) = item.block.transactions.iter().fold(
+                (0usize, 0usize),
+                |(s, w), tx| match tx.body.shape {
+                    _ if tx.body.is_coinbase => (s, w),
+                    noid_tx::TxShape::Standard4x8 => (s + 1, w),
+                    noid_tx::TxShape::Sweep25x2 => (s, w + 1),
+                },
+            );
+            let padded_spent_len =
+                noid_chain::consensus::params::block_class_spend_capacity_for_counts(
+                    standard_txs,
+                    sweep_txs,
+                )
+                .ok_or(FullAcceptedBlockBatchError::ComponentShapeMismatch)?;
             let (inputs, verified) = derive_exact_state_killshot_inputs(
                 &artifacts.exact_state_inputs,
                 &artifacts.exact_action_surface,
                 &pre_validation_guard,
                 &proof.state_transition,
+                padded_spent_len,
             )
             .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent { index, source })?;
             if verified != artifacts.verified_transition {

@@ -863,7 +863,7 @@ fn replay_components(
                 name: format!("exact_state[{index}].guard_buckets"),
                 stats: ch.stats(),
                 proof_bytes: bucket_proof.byte_len(),
-                note: format!("buckets={}", bucket_inputs.len()),
+                note: format!("spends={}", bucket_inputs.spent_slots.len()),
             });
         }
         if let (Some(path_inputs), Some(path_proof)) = (&inputs.guard_paths, &es_proof.guard_paths) {
@@ -959,7 +959,7 @@ fn print_data_volumes(components: &FullAcceptedBlockBatchProofComponents) {
             "    exact_state[{index}]: slot_leaves={} state_paths={} guard_buckets={} guard_paths={} state_roots={}",
             es.slot_leaves.len(),
             es.state_paths.len(),
-            es.guard_buckets.as_ref().map_or(0, Vec::len),
+            es.guard_buckets.as_ref().map_or(0, |u| u.spent_slots.len()),
             es.guard_paths.as_ref().map_or(0, Vec::len),
             es.state_roots.len(),
         );

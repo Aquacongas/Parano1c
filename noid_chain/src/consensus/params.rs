@@ -82,6 +82,61 @@ pub const fn block_semantic_limits_ok(
 }
 
 // ---------------------------------------------------------------------------
+// Block shape classes
+// ---------------------------------------------------------------------------
+
+/// Standard4x8 transaction-count tiers. Every proof-facing per-block
+/// structure is padded up to the smallest tier holding the block's standard
+/// tx count, so the proof system sees a small fixed family of shapes
+/// (worst-case padding is 2x) instead of per-count structures.
+pub const STANDARD_TX_CLASS_TIERS: [usize; 10] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 255];
+
+/// Sweep25x2 transaction-count tiers (same role as the standard tiers; the
+/// top tier is the live-input budget's sweep capacity).
+pub const SWEEP_TX_CLASS_TIERS: [usize; 8] = [0, 1, 2, 4, 8, 16, 32, 40];
+
+/// Smallest tier in `tiers` holding `count`, or None past the top tier.
+#[inline]
+fn class_tier_for(tiers: &[usize], count: usize) -> Option<usize> {
+    tiers.iter().copied().find(|&tier| tier >= count)
+}
+
+/// Standard-tx class tier for a block's standard tx count.
+#[inline]
+pub fn standard_tx_class_tier(count: usize) -> Option<usize> {
+    class_tier_for(&STANDARD_TX_CLASS_TIERS, count)
+}
+
+/// Sweep-tx class tier for a block's sweep tx count.
+#[inline]
+pub fn sweep_tx_class_tier(count: usize) -> Option<usize> {
+    class_tier_for(&SWEEP_TX_CLASS_TIERS, count)
+}
+
+/// Live-input (spend) capacity of a shape class: what the class's guard
+/// bucket and per-input structures are padded to. Capped by the semantic
+/// block budget, which admits the tier mix only up to the global
+/// live-input maximum.
+#[inline]
+pub fn block_class_spend_capacity(standard_tier: usize, sweep_tier: usize) -> usize {
+    let cap = standard_tier * noid_tx::TxShape::Standard4x8.max_inputs()
+        + sweep_tier * noid_tx::TxShape::Sweep25x2.max_inputs();
+    cap.min(BLOCK_MAX_LIVE_INPUTS)
+}
+
+/// Spend capacity of the shape class holding a block with the given user-tx
+/// composition, or None past the tier tables (over consensus limits).
+#[inline]
+pub fn block_class_spend_capacity_for_counts(
+    standard_txs: usize,
+    sweep_txs: usize,
+) -> Option<usize> {
+    let standard_tier = standard_tx_class_tier(standard_txs)?;
+    let sweep_tier = sweep_tx_class_tier(sweep_txs)?;
+    Some(block_class_spend_capacity(standard_tier, sweep_tier))
+}
+
+// ---------------------------------------------------------------------------
 // Epoch anchor
 // ---------------------------------------------------------------------------
 

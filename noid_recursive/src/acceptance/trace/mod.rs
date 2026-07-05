@@ -226,10 +226,10 @@ pub fn range_check_bits(b: &mut FieldR1csBuilder, expr: &LinExpr, n_bits: usize)
     bits
 }
 
-/// Enforce strict unsigned `a < b` over two already range-checked bit
-/// decompositions (LSB-first, same width): MSB-first borrow fold, then pin
-/// the less-than accumulator to 1. ~3 multiplications per bit.
-pub fn pin_lt_strict(b: &mut FieldR1csBuilder, a_bits: &[Wire], b_bits: &[Wire]) {
+/// Strict unsigned `a < b` over two already range-checked bit
+/// decompositions (LSB-first, same width) as a boolean-valued expression:
+/// MSB-first borrow fold. ~3 multiplications per bit.
+pub fn lt_strict_expr(b: &mut FieldR1csBuilder, a_bits: &[Wire], b_bits: &[Wire]) -> LinExpr {
     assert_eq!(a_bits.len(), b_bits.len());
     assert!(!a_bits.is_empty());
     let mut acc_lt = LinExpr::zero();
@@ -243,6 +243,12 @@ pub fn pin_lt_strict(b: &mut FieldR1csBuilder, a_bits: &[Wire], b_bits: &[Wire])
         // eq_i = 1 + a_i + b_i (char-2 bit equality).
         acc_eq = mul(b, &acc_eq, &a_e.add(&b_e).add_const(F128::ONE));
     }
+    acc_lt
+}
+
+/// Enforce strict unsigned `a < b`: pin the less-than accumulator to 1.
+pub fn pin_lt_strict(b: &mut FieldR1csBuilder, a_bits: &[Wire], b_bits: &[Wire]) {
+    let acc_lt = lt_strict_expr(b, a_bits, b_bits);
     pin_zero(b, &acc_lt.add_const(F128::ONE));
 }
 

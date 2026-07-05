@@ -23,7 +23,7 @@ use noid_gkr::{
     verify_sweep_block_spine_killshot, AcceptedClaimHashInputs, AcceptedClaimHashProofKillShot,
     BatchedGuardBucketProofKillShot, BatchedMerkleProofKillShot, BatchedSlotLeafProofKillShot,
     BatchedStateRootProofKillShot, BlockSpineProof, CanonicalAuthorizationStatement,
-    CompositeStateRootInputs, GuardBucketHashInputs, MerkleCircuit, MerklePathInputs,
+    CompositeStateRootInputs, GuardBucketUpdateInputs, MerkleCircuit, MerklePathInputs,
     OwnerAuthProofKillShot, OwnerAuthPublicInputs, SlotLeafInputs, SpineCircuit, SpineInputs,
     SweepBlockSpineProof, SweepSpineInputs, VerifiedAuthorizationBatch,
 };
@@ -58,7 +58,7 @@ pub struct AuthorizationComponentInput {
 pub struct ExactStateKillShotInputs {
     pub slot_leaves: Vec<SlotLeafInputs>,
     pub state_paths: Vec<MerklePathInputs>,
-    pub guard_buckets: Option<Vec<GuardBucketHashInputs>>,
+    pub guard_buckets: Option<GuardBucketUpdateInputs>,
     pub guard_paths: Option<Vec<MerklePathInputs>>,
     pub state_roots: Vec<CompositeStateRootInputs>,
 }

@@ -35,8 +35,9 @@ impl core::fmt::Display for ExactStateHashError {
 
 impl std::error::Error for ExactStateHashError {}
 
+/// Split a 32-byte state hash into its two canonical field lanes.
 #[inline]
-fn fields_from_digest(hash: StateHash) -> [Block128; 2] {
+pub fn fields_from_digest(hash: StateHash) -> [Block128; 2] {
     let mut lo = [0u8; 16];
     let mut hi = [0u8; 16];
     lo.copy_from_slice(&hash[..16]);

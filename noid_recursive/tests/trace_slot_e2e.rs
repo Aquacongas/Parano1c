@@ -5,8 +5,7 @@
 //! verified through the FieldR1cs pipeline (the same prover/verifier the
 //! recursion slot replays).
 
-use noid_core::transcript::FiatShamir;
-use noid_core::{Block128, TowerField};
+use noid_core::Block128;
 use noid_gkr::accepted_claim_killshot::{
     prove_accepted_claim_hash_killshot, AcceptedClaimHashInputs, ACCEPTED_CLAIM_FIELDS,
 };

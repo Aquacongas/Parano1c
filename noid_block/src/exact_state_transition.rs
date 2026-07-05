@@ -23,8 +23,8 @@ use noid_chain::sparse_merkle::{
 use noid_chain::state_delta::{ExactActionSurface, StateDeltaActionKind};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    CompositeStateRootInputs, GuardBucketHashInputs, MerklePathInputs, SlotLeafInputs,
-    MAX_MERKLE_DEPTH,
+    CompositeStateRootInputs, GuardBucketUpdateInputs, GuardLeafHashInputs, MerklePathInputs,
+    SlotLeafInputs, MAX_MERKLE_DEPTH,
 };
 
 /// Maximum user transactions under the consensus semantic block budget.
@@ -123,12 +123,9 @@ pub struct ExactSlotLeafBatchInputs {
     pub new_leaves: Vec<SlotLeafInputs>,
 }
 
-/// Public bucket-hash inputs for a ReuseGuard old/new bucket update.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExactGuardBucketHashBatchInputs {
-    pub old_bucket: GuardBucketHashInputs,
-    pub new_bucket: GuardBucketHashInputs,
-}
+/// Public bucket-hash inputs for a ReuseGuard old/new bucket update: the
+/// class-shaped killshot statement (old leaf, new leaf, new spent list).
+pub type ExactGuardBucketHashBatchInputs = GuardBucketUpdateInputs;
 
 /// Public composite state-root hash inputs for parent and child state roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +252,7 @@ pub enum ExactStateTransitionError {
     ReuseGuard(ReuseGuardError),
     NonCanonicalSlot,
     ProofDepthUnsupported { depth: u32, max_depth: usize },
+    SpendCapacityExceeded { spends: usize, capacity: usize },
 }
 
 impl From<SparseMerkleError> for ExactStateTransitionError {
@@ -476,18 +474,27 @@ pub fn derive_exact_guard_merkle_batch_inputs(
     }))
 }
 
-/// Derive `RGDBUCK_` bucket-hash proof inputs for the ReuseGuard update.
+/// Derive the guard-update killshot statement for the ReuseGuard update.
+/// `padded_spent_len` is the block shape class's spend capacity; the spent
+/// list must fit it.
 pub fn derive_exact_guard_bucket_hash_inputs(
     inputs: &ExactStateTransitionInputs,
     surface: &ExactActionSurface,
     guard: &ReuseGuard,
     proof: &ExactStateTransitionProof,
+    padded_spent_len: usize,
 ) -> Result<Option<ExactGuardBucketHashBatchInputs>, ExactStateTransitionError> {
     if surface.spent_slots.is_empty() {
         if proof.guard_update.is_some() {
             return Err(ExactStateTransitionError::UnexpectedGuardProof);
         }
         return Ok(None);
+    }
+    if surface.spent_slots.len() > padded_spent_len {
+        return Err(ExactStateTransitionError::SpendCapacityExceeded {
+            spends: surface.spent_slots.len(),
+            capacity: padded_spent_len,
+        });
     }
 
     let guard_proof = proof
@@ -506,9 +513,11 @@ pub fn derive_exact_guard_bucket_hash_inputs(
     if old_root != inputs.parent_guard_root {
         return Err(ExactStateTransitionError::OldGuardRootMismatch);
     }
-    Ok(Some(ExactGuardBucketHashBatchInputs {
-        old_bucket: guard_bucket_to_hash_input(old_bucket),
-        new_bucket: guard_bucket_to_hash_input(&new_bucket),
+    Ok(Some(GuardBucketUpdateInputs {
+        old_leaf: guard_bucket_to_leaf_input(old_bucket),
+        new_leaf: guard_bucket_to_leaf_input(&new_bucket),
+        spent_slots: surface.spent_slots.clone(),
+        padded_spent_len,
     }))
 }
 
@@ -709,22 +718,22 @@ fn guard_path_to_gkr(
     }
 }
 
-fn guard_bucket_to_hash_input(bucket: &GuardBucket) -> GuardBucketHashInputs {
+fn guard_bucket_to_leaf_input(bucket: &GuardBucket) -> GuardLeafHashInputs {
     let expected_hash = digest_to_fields(guard_bucket_hash(bucket));
     match bucket {
-        GuardBucket::Empty => GuardBucketHashInputs {
+        GuardBucket::Empty => GuardLeafHashInputs {
             occupied: false,
             absolute_height: 0,
-            spent_slots: Vec::new(),
+            slots_digest: [Block128::ZERO; 2],
             expected_hash,
         },
         GuardBucket::Occupied {
             absolute_height,
             spent_slots,
-        } => GuardBucketHashInputs {
+        } => GuardLeafHashInputs {
             occupied: true,
             absolute_height: *absolute_height,
-            spent_slots: spent_slots.clone(),
+            slots_digest: noid_chain::reuse_guard::guard_slots_digest(spent_slots),
             expected_hash,
         },
     }
@@ -1062,17 +1071,17 @@ mod tests {
         let proof =
             build_exact_state_transition_proof(&parent_cache, &surface, &guard, 10).unwrap();
 
-        let derived = derive_exact_guard_bucket_hash_inputs(&inputs, &surface, &guard, &proof)
+        let derived = derive_exact_guard_bucket_hash_inputs(&inputs, &surface, &guard, &proof, 4)
             .unwrap()
             .expect("spend block has guard bucket update");
-        assert!(!derived.old_bucket.occupied);
-        assert!(derived.new_bucket.occupied);
+        assert!(!derived.old_leaf.occupied);
+        assert!(derived.new_leaf.occupied);
+        assert_eq!(derived.spent_slots, vec![2]);
 
-        let buckets = vec![derived.old_bucket, derived.new_bucket];
         let mut ch_p = Poseidon2bChannel::new();
-        let (bucket_proof, reductions) = prove_batched_guard_bucket_killshot(&buckets, &mut ch_p);
+        let (bucket_proof, reductions) = prove_batched_guard_bucket_killshot(&derived, &mut ch_p);
         let mut ch_v = Poseidon2bChannel::new();
-        let verified = verify_batched_guard_bucket_killshot(&bucket_proof, &buckets, &mut ch_v)
+        let verified = verify_batched_guard_bucket_killshot(&bucket_proof, &derived, &mut ch_v)
             .expect("ReuseGuard bucket hashes verify under RGDBUCK");
         assert_eq!(verified, reductions);
     }

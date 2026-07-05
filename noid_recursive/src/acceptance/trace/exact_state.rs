@@ -18,14 +18,16 @@
 //! Native implicit integer bounds become explicit range decompositions:
 //! slot-leaf `amount: u64`, guard `absolute_height: u64` and
 //! `spent_slots: Vec<u32>` (plus the strict-ascending canonicity check from
-//! `inputs_are_canonical`), state-root `log_slots: u32`. Bucket occupancy
-//! and spent-slot counts are trace structure (see the shape note in
-//! `merkle_path.rs` — the same selector-freeze resolution applies).
+//! `inputs_are_canonical`), state-root `log_slots: u32`. The guard update
+//! statement is fully witness-carried: occupancy, heights, digests and the
+//! class-padded spent list travel as wires with liveness selectors, so the
+//! guard slot's matrix depends only on the class's spend capacity.
 
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 use noid_gkr::guard_bucket_killshot::{
-    GuardBucketHashInputs, GUARD_BUCKET_LINEAR_RELATION_TAG,
-    GUARD_BUCKET_PIN_LANES,
+    guard_slots_chain_len, guard_update_live_slots, GuardBucketUpdateInputs,
+    GuardLeafHashInputs, GUARD_BUCKET_LINEAR_RELATION_TAG, GUARD_BUCKET_PIN_LANES,
+    GUARD_LEAF_CHAIN_SLOTS,
 };
 use noid_gkr::merkle_circuit::MerkleCircuit;
 use noid_gkr::state_leaf_killshot::{
@@ -37,25 +39,27 @@ use noid_gkr::state_root_killshot::{
     STATE_ROOT_PERMS, STATE_ROOT_PIN_LANES,
 };
 use noid_poseidon2b::native::domain::{
-    capacity_iv, TAG_EXSTNOD, TAG_EXSTROT, TAG_EXSTSLT, TAG_RGDBUCK, TAG_RGDNODE,
+    capacity_iv, TAG_EXSTNOD, TAG_EXSTROT, TAG_EXSTSLT, TAG_RGDBUCK, TAG_RGDNODE, TAG_RGDSLOT,
 };
 
 use super::batch_eval::{
-    verify_linear_eval_prebound_trace, LinearEvalProofTrace, MultiBatchEvalProofTrace,
+    verify_linear_eval_prebound_trace, LinearEvalClaimTrace, LinearEvalProofTrace,
+    LinearEvalTermTrace, MultiBatchEvalProofTrace,
 };
 use super::block_spine::{
-    close_spine_family_batch, discharge_sponge_chains_trace, sponge_chain_claims_trace,
-    verify_block_spine_shift_trace, verify_block_spine_unified_trace, BlockSpineShiftProofTrace,
-    BlockSpineUnifiedProofTrace, SpongeChainTrace,
+    close_spine_family_batch, discharge_sponge_chains_trace, spine_point_index,
+    sponge_chain_claims_trace, verify_block_spine_shift_trace, verify_block_spine_unified_trace,
+    BlockSpineShiftProofTrace, BlockSpineUnifiedProofTrace, ColumnAccumulator, SpongeChainTrace,
 };
 use super::merkle_path::{
     discharge_batched_merkle_trace, verify_batched_merkle_killshot_trace, BatchedMerkleProofTrace,
     MerklePathInputsTrace,
 };
 use super::{
-    alloc_block, const_block, pin_lt_strict, range_check_bits, BatchEvalReductionTrace,
-    FieldR1csBuilder, LinExpr, RawChannelTrace,
+    alloc_block, const_block, flat_of, lt_strict_expr, mul, pin_zero, range_check_bits,
+    BatchEvalReductionTrace, FieldR1csBuilder, LinExpr, RawChannelTrace,
 };
+use noid_poseidon2b::native::permutation::{MDS_FULL, N_ROUNDS, STATE_SIZE};
 
 fn pad_after_one_field() -> Block128 {
     let mut bytes = [0u8; 16];
@@ -223,76 +227,188 @@ pub fn discharge_batched_slot_leaf_trace(
 // guard_bucket (step 6)
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `GuardBucketHashInputs`. `occupied` and the spent-slot
-/// count are trace structure; heights and slots are range-checked witness
-/// values with the strict-ascending canonicity pins from
-/// `inputs_are_canonical`.
-pub struct GuardBucketHashInputsTrace {
-    pub occupied: bool,
+/// Trace twin of `GuardLeafHashInputs`: everything is a witness wire.
+/// Occupancy is a boolean selector; the canonical empty form (zero height
+/// and digest) is enforced in-circuit through the complement selector.
+pub struct GuardLeafHashInputsTrace {
+    pub occupied: LinExpr,
     pub absolute_height: LinExpr,
-    pub spent_slots: Vec<LinExpr>,
+    pub slots_digest: [LinExpr; 2],
     pub expected_hash: [LinExpr; 2],
 }
 
-impl GuardBucketHashInputsTrace {
-    pub fn alloc(b: &mut FieldR1csBuilder, native: &GuardBucketHashInputs) -> Self {
-        if !native.occupied {
-            // Canonical empty bucket: structural constants.
-            assert_eq!(native.absolute_height, 0, "non-canonical empty bucket");
-            assert!(native.spent_slots.is_empty(), "non-canonical empty bucket");
-            return Self {
-                occupied: false,
-                absolute_height: LinExpr::zero(),
-                spent_slots: Vec::new(),
-                expected_hash: std::array::from_fn(|i| alloc_block(b, native.expected_hash[i])),
-            };
-        }
-        assert!(!native.spent_slots.is_empty(), "non-canonical bucket");
+impl GuardLeafHashInputsTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &GuardLeafHashInputs) -> Self {
+        let occupied = LinExpr::from_wire(b.alloc_bool(native.occupied));
         let absolute_height = alloc_block(b, Block128::from(native.absolute_height));
         range_check_bits(b, &absolute_height, 64);
-        let spent_slots: Vec<LinExpr> = native
-            .spent_slots
-            .iter()
-            .map(|&s| alloc_block(b, Block128::from(s)))
-            .collect();
-        // Strict ascending order (inputs_are_canonical): range-check each
-        // slot to u32, then pin pairwise a < b.
-        let bit_decs: Vec<_> = spent_slots
-            .iter()
-            .map(|s| range_check_bits(b, s, 32))
-            .collect();
-        for w in bit_decs.windows(2) {
-            pin_lt_strict(b, &w[0], &w[1]);
+        let slots_digest: [LinExpr; 2] =
+            std::array::from_fn(|i| alloc_block(b, native.slots_digest[i]));
+        // Canonical empty leaf: (1 + occupied) selects the ghost form and
+        // zeroes height and digest.
+        let ghost = occupied.add(&const_block(Block128::ONE));
+        let v = mul(b, &ghost, &absolute_height);
+        pin_zero(b, &v);
+        for lane in &slots_digest {
+            let v = mul(b, &ghost, lane);
+            pin_zero(b, &v);
         }
         Self {
-            occupied: true,
+            occupied,
             absolute_height,
-            spent_slots,
+            slots_digest,
             expected_hash: std::array::from_fn(|i| alloc_block(b, native.expected_hash[i])),
         }
     }
 
-    /// Trace twin of `bucket_blocks`.
+    /// Trace twin of `leaf_blocks`: the fixed three-block leaf chain.
     fn blocks(&self) -> Vec<[LinExpr; 2]> {
-        if !self.occupied {
-            return vec![[LinExpr::zero(), const_block(pad_after_one_field())]];
+        let [p0, p1] = pad_empty_block();
+        vec![
+            [self.occupied.clone(), self.absolute_height.clone()],
+            [self.slots_digest[0].clone(), self.slots_digest[1].clone()],
+            [const_block(p0), const_block(p1)],
+        ]
+    }
+}
+
+/// Trace twin of `GuardBucketUpdateInputs`. The spent list is carried at
+/// the class's spend capacity with field-position liveness selectors
+/// `h_q = [q <= len]` (boolean, monotone, unary-bound to the length wire);
+/// zero tails are pinned through the complement selectors and the
+/// strict-ascending canonicity check is gated per adjacent live pair.
+pub struct GuardBucketUpdateInputsTrace {
+    pub old_leaf: GuardLeafHashInputsTrace,
+    pub new_leaf: GuardLeafHashInputsTrace,
+    pub padded_spent_len: usize,
+    pub live_len: LinExpr,
+    pub spent_slots: Vec<LinExpr>,
+    /// `h_q` for `q` in `1..=padded_spent_len`.
+    pub slot_live: Vec<LinExpr>,
+}
+
+impl GuardBucketUpdateInputsTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &GuardBucketUpdateInputs) -> Self {
+        let len = native.spent_slots.len();
+        assert!(len >= 1, "non-canonical guard update (empty spend list)");
+        assert!(len <= native.padded_spent_len);
+
+        let old_leaf = GuardLeafHashInputsTrace::alloc(b, &native.old_leaf);
+        let new_leaf = GuardLeafHashInputsTrace::alloc(b, &native.new_leaf);
+        // The new leaf is always occupied: pin its selector to one.
+        pin_zero(b, &new_leaf.occupied.add(&const_block(Block128::ONE)));
+
+        let live_len = alloc_block(b, Block128::from(len as u64));
+        let spent_slots: Vec<LinExpr> = (0..native.padded_spent_len)
+            .map(|i| {
+                let v = native.spent_slots.get(i).copied().unwrap_or(0);
+                alloc_block(b, Block128::from(v))
+            })
+            .collect();
+
+        // Liveness selectors: boolean, monotone, single-boundary telescoping
+        // binding to the length wire (same construction as the owner-auth
+        // slot selectors).
+        let slot_live: Vec<LinExpr> = (0..native.padded_spent_len)
+            .map(|i| LinExpr::from_wire(b.alloc_bool(i < len)))
+            .collect();
+        for s in 1..slot_live.len() {
+            let prev_ghost = slot_live[s - 1].add(&const_block(Block128::ONE));
+            let violation = mul(b, &slot_live[s], &prev_ghost);
+            pin_zero(b, &violation);
         }
-        let mut blocks = vec![[const_block(Block128::from(1u8)), self.absolute_height.clone()]];
-        let mut fields = Vec::with_capacity(self.spent_slots.len() + 1);
-        fields.push(const_block(Block128::from(self.spent_slots.len() as u64)));
-        fields.extend(self.spent_slots.iter().cloned());
-        let mut iter = fields.chunks_exact(2);
-        for pair in &mut iter {
-            blocks.push([pair[0].clone(), pair[1].clone()]);
+        let mut unary_value = LinExpr::zero();
+        for s in 0..slot_live.len() {
+            let boundary = if s + 1 < slot_live.len() {
+                slot_live[s].add(&slot_live[s + 1])
+            } else {
+                slot_live[s].clone()
+            };
+            unary_value = unary_value.add(&boundary.scale(flat_of(Block128::from(s as u128 + 1))));
         }
-        let rem = iter.remainder();
-        if rem.is_empty() {
-            let [p0, p1] = pad_empty_block();
-            blocks.push([const_block(p0), const_block(p1)]);
+        pin_zero(b, &unary_value.add(&live_len));
+
+        // Zero tails, u32 ranges, and the gated strict-ascending pins:
+        // adjacent live pairs must ascend; pairs with a ghost member are
+        // exempt (their violation term is zeroed by the pair selector).
+        let bit_decs: Vec<_> = spent_slots
+            .iter()
+            .map(|s| range_check_bits(b, s, 32))
+            .collect();
+        for (i, slot) in spent_slots.iter().enumerate() {
+            let ghost = slot_live[i].add(&const_block(Block128::ONE));
+            let v = mul(b, &ghost, slot);
+            pin_zero(b, &v);
+        }
+        for i in 1..spent_slots.len() {
+            let lt = lt_strict_expr(b, &bit_decs[i - 1], &bit_decs[i]);
+            let not_lt = lt.add(&const_block(Block128::ONE));
+            // Both live (monotone: h_{i+1} implies h_i) and not ascending.
+            let violation = mul(b, &slot_live[i], &not_lt);
+            pin_zero(b, &violation);
+        }
+
+        Self {
+            old_leaf,
+            new_leaf,
+            padded_spent_len: native.padded_spent_len,
+            live_len,
+            spent_slots,
+            slot_live,
+        }
+    }
+
+    /// Field-position liveness `h_q` over the absorbed stream (`q = 0` is
+    /// the always-live length field; positions past the capacity are ghost).
+    fn h(&self, q: isize) -> LinExpr {
+        if q <= 0 {
+            const_block(Block128::ONE)
+        } else if q as usize <= self.padded_spent_len {
+            self.slot_live[q as usize - 1].clone()
         } else {
-            blocks.push([rem[0].clone(), const_block(pad_after_one_field())]);
+            LinExpr::zero()
         }
-        blocks
+    }
+
+    /// Trace twin of `slots_field_at`: the absorbed-field stream value at
+    /// position `q`, affine in the liveness selectors (the two sponge pad
+    /// markers enter on the stream boundary indicators).
+    fn field_expr(&self, q: usize) -> LinExpr {
+        if q == 0 {
+            return self.live_len.clone();
+        }
+        let qi = q as isize;
+        // Ghost slot wires are pinned zero, so the liveness selection
+        // `h_q * slot_q` is the identity on every satisfying witness —
+        // using the wire directly keeps the stream affine.
+        let mut expr = if q <= self.padded_spent_len {
+            self.spent_slots[q - 1].clone()
+        } else {
+            LinExpr::zero()
+        };
+        let at_pad = self.h(qi - 1).add(&self.h(qi));
+        if q % 2 == 0 {
+            expr = expr.add(&at_pad.scale(flat_of(pad_empty_block()[0])));
+        } else {
+            expr = expr.add(&at_pad.scale(flat_of(pad_after_one_field())));
+            let at_pad_hi = self.h(qi - 2).add(&self.h(qi - 1));
+            expr = expr.add(&at_pad_hi.scale(flat_of(pad_empty_block()[1])));
+        }
+        expr
+    }
+
+    /// Chain-block liveness `l_p = h(2p - 1)` (block 0 is always live).
+    fn block_live(&self, p: usize) -> LinExpr {
+        if p == 0 {
+            const_block(Block128::ONE)
+        } else {
+            self.h(2 * p as isize - 1)
+        }
+    }
+
+    /// Last-live-block boundary `l_p - l_{p+1}` (char-2 sum).
+    fn block_boundary(&self, p: usize) -> LinExpr {
+        self.h(2 * p as isize - 1).add(&self.h(2 * p as isize + 1))
     }
 }
 
@@ -301,57 +417,168 @@ pub fn verify_batched_guard_bucket_killshot_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut RawChannelTrace,
     proof: &SpongeFamilyProofTrace,
-    inputs: &[GuardBucketHashInputsTrace],
+    inputs: &GuardBucketUpdateInputsTrace,
 ) -> [BatchEvalReductionTrace; 3] {
-    assert!(!inputs.is_empty());
-    let live_slots: usize = inputs.iter().map(|i| i.blocks().len()).sum();
-    assert_eq!(proof.live_slots, live_slots);
+    assert_eq!(
+        proof.live_slots,
+        guard_update_live_slots(inputs.padded_spent_len)
+    );
 
     // absorb_public_batch
-    ch.absorb_const_tower(b, inputs.len() as u128);
     ch.absorb_const_tower(b, TAG_RGDBUCK.as_u64() as u128);
-    for input in inputs {
-        ch.absorb_const_tower(b, input.occupied as u128);
-        ch.absorb(b, &input.absolute_height);
-        ch.absorb_const_tower(b, input.spent_slots.len() as u128);
-        for slot in &input.spent_slots {
-            ch.absorb(b, slot);
-        }
-        ch.absorb(b, &input.expected_hash[0]);
-        ch.absorb(b, &input.expected_hash[1]);
+    ch.absorb_const_tower(b, inputs.padded_spent_len as u128);
+    for leaf in [&inputs.old_leaf, &inputs.new_leaf] {
+        ch.absorb(b, &leaf.occupied);
+        ch.absorb(b, &leaf.absolute_height);
+        ch.absorb(b, &leaf.slots_digest[0]);
+        ch.absorb(b, &leaf.slots_digest[1]);
+        ch.absorb(b, &leaf.expected_hash[0]);
+        ch.absorb(b, &leaf.expected_hash[1]);
+    }
+    ch.absorb(b, &inputs.live_len);
+    for slot in &inputs.spent_slots {
+        ch.absorb(b, slot);
     }
 
-    let mut chain_claims = Vec::new();
-    let mut slot_offset = 0usize;
-    for input in inputs {
-        let blocks = input.blocks();
-        chain_claims.extend(sponge_chain_claims_trace(
-            &blocks,
-            capacity_iv(TAG_RGDBUCK),
-            &input.expected_hash[..GUARD_BUCKET_PIN_LANES],
-            slot_offset,
-            proof.num_vars,
-        ));
-        slot_offset += blocks.len();
-    }
+    let chain_claims = guard_update_chain_claims_trace(b, inputs, proof.num_vars);
     proof.verify_tail(b, ch, &chain_claims, GUARD_BUCKET_LINEAR_RELATION_TAG)
 }
 
-/// Trace twin of `discharge_batched_guard_bucket_reductions_native`.
+/// Trace twin of `guard_update_chain_claims`: two fixed leaf chains plus
+/// the selector-scheduled spent-slot chain.
+fn guard_update_chain_claims_trace(
+    b: &mut FieldR1csBuilder,
+    inputs: &GuardBucketUpdateInputsTrace,
+    num_vars: usize,
+) -> Vec<LinearEvalClaimTrace> {
+    let mds = |row: usize, col: usize| Block128::from(MDS_FULL[row][col]);
+
+    let mut claims = sponge_chain_claims_trace(
+        &inputs.old_leaf.blocks(),
+        capacity_iv(TAG_RGDBUCK),
+        &inputs.old_leaf.expected_hash[..GUARD_BUCKET_PIN_LANES],
+        0,
+        num_vars,
+    );
+    claims.extend(sponge_chain_claims_trace(
+        &inputs.new_leaf.blocks(),
+        capacity_iv(TAG_RGDBUCK),
+        &inputs.new_leaf.expected_hash[..GUARD_BUCKET_PIN_LANES],
+        GUARD_LEAF_CHAIN_SLOTS,
+        num_vars,
+    ));
+
+    // Spent-slot chain (offset 2 * GUARD_LEAF_CHAIN_SLOTS): every term
+    // coefficient is the class-fixed structure scaled by the liveness /
+    // boundary selectors, mirroring `slots_chain_claims` value-for-value.
+    let offset = 2 * GUARD_LEAF_CHAIN_SLOTS;
+    let chain_len = guard_slots_chain_len(inputs.padded_spent_len);
+    let iv = capacity_iv(TAG_RGDSLOT);
+    for p in 0..chain_len {
+        let slot = offset + p;
+        let f_a = inputs.field_expr(2 * p);
+        let f_b = inputs.field_expr(2 * p + 1);
+        let live = inputs.block_live(p);
+        for lane in 0..STATE_SIZE {
+            let mut terms = vec![LinearEvalTermTrace {
+                index: spine_point_index(num_vars, slot, 0, lane),
+                coeff: live.clone(),
+            }];
+            let absorbed = f_a
+                .scale(flat_of(mds(lane, 0)))
+                .add(&f_b.scale(flat_of(mds(lane, 1))));
+            let value = if p == 0 {
+                absorbed.add_const(flat_of(mds(lane, 2) * iv[0] + mds(lane, 3) * iv[1]))
+            } else {
+                for src_lane in 0..STATE_SIZE {
+                    terms.push(LinearEvalTermTrace {
+                        index: spine_point_index(num_vars, slot - 1, N_ROUNDS, src_lane),
+                        coeff: live.scale(flat_of(mds(lane, src_lane))),
+                    });
+                }
+                mul(b, &live, &absorbed)
+            };
+            claims.push(LinearEvalClaimTrace { terms, value });
+        }
+    }
+    for lane in 0..GUARD_BUCKET_PIN_LANES {
+        let terms = (0..chain_len)
+            .map(|p| LinearEvalTermTrace {
+                index: spine_point_index(num_vars, offset + p, N_ROUNDS, lane),
+                coeff: inputs.block_boundary(p),
+            })
+            .collect();
+        claims.push(LinearEvalClaimTrace {
+            terms,
+            value: inputs.new_leaf.slots_digest[lane].clone(),
+        });
+    }
+    claims
+}
+
+/// Trace twin of `discharge_batched_guard_bucket_reductions_native`: the two
+/// leaf chains replay as fixed sponge chains; the spent-slot chain replays
+/// with selector-muxed state feeds (a ghost position runs the permutation on
+/// the all-zero state, exactly the padded prover schedule) and pins the
+/// digest at the boundary-selected last live position.
 pub fn discharge_batched_guard_bucket_trace(
     b: &mut FieldR1csBuilder,
-    inputs: &[GuardBucketHashInputsTrace],
+    inputs: &GuardBucketUpdateInputsTrace,
     reductions: &[BatchEvalReductionTrace; 3],
 ) {
-    let chains: Vec<SpongeChainTrace> = inputs
-        .iter()
-        .map(|input| SpongeChainTrace {
-            blocks: input.blocks(),
-            iv: capacity_iv(TAG_RGDBUCK),
-            expected: input.expected_hash.clone(),
-        })
-        .collect();
-    discharge_sponge_chains_trace(b, &chains, reductions);
+    let live_slots = guard_update_live_slots(inputs.padded_spent_len);
+    let mut acc = ColumnAccumulator::new(b, &reductions[0].point, live_slots);
+
+    for leaf in [&inputs.old_leaf, &inputs.new_leaf] {
+        let iv = capacity_iv(TAG_RGDBUCK);
+        let mut state: [LinExpr; STATE_SIZE] = [
+            LinExpr::zero(),
+            LinExpr::zero(),
+            const_block(iv[0]),
+            const_block(iv[1]),
+        ];
+        for block in &leaf.blocks() {
+            state[0] = state[0].add(&block[0]);
+            state[1] = state[1].add(&block[1]);
+            state = acc.push_slot(b, &state);
+        }
+        pin_zero(b, &state[0].add(&leaf.expected_hash[0]));
+        pin_zero(b, &state[1].add(&leaf.expected_hash[1]));
+    }
+
+    let iv = capacity_iv(TAG_RGDSLOT);
+    let chain_len = guard_slots_chain_len(inputs.padded_spent_len);
+    let mut prev_out: [LinExpr; STATE_SIZE] = [
+        LinExpr::zero(),
+        LinExpr::zero(),
+        const_block(iv[0]),
+        const_block(iv[1]),
+    ];
+    let mut digest_sel: [LinExpr; 2] = [LinExpr::zero(), LinExpr::zero()];
+    for p in 0..chain_len {
+        let live = inputs.block_live(p);
+        let mut state_in: [LinExpr; STATE_SIZE] = prev_out.clone();
+        state_in[0] = state_in[0].add(&inputs.field_expr(2 * p));
+        state_in[1] = state_in[1].add(&inputs.field_expr(2 * p + 1));
+        if p > 0 {
+            // Ghost positions run on the all-zero state: mux the whole
+            // chained input through the liveness selector.
+            state_in = std::array::from_fn(|lane| mul(b, &live, &state_in[lane]));
+        }
+        let out = acc.push_slot(b, &state_in);
+        let boundary = inputs.block_boundary(p);
+        for lane in 0..2 {
+            digest_sel[lane] = digest_sel[lane].add(&mul(b, &boundary, &out[lane]));
+        }
+        prev_out = out;
+    }
+    pin_zero(b, &digest_sel[0].add(&inputs.new_leaf.slots_digest[0]));
+    pin_zero(b, &digest_sel[1].add(&inputs.new_leaf.slots_digest[1]));
+
+    let (state_value, sin_value, sout_value) = acc.finish();
+    pin_zero(b, &state_value.add(&reductions[0].value));
+    pin_zero(b, &sin_value.add(&reductions[1].value));
+    pin_zero(b, &sout_value.add(&reductions[2].value));
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +683,7 @@ pub fn discharge_batched_state_root_trace(
 pub struct ExactStateSlotWires {
     pub slot_leaves: Vec<SlotLeafInputsTrace>,
     pub state_paths: Vec<MerklePathInputsTrace>,
-    pub guard_buckets: Option<Vec<GuardBucketHashInputsTrace>>,
+    pub guard_buckets: Option<GuardBucketUpdateInputsTrace>,
     pub guard_paths: Option<Vec<MerklePathInputsTrace>>,
     pub state_roots: Vec<CompositeStateRootInputsTrace>,
 }
@@ -520,11 +747,8 @@ pub fn build_exact_state_slot(
     // Guard buckets + guard paths (optional, present together).
     let guard_buckets = match (&inputs.guard_buckets, &proof.guard_buckets) {
         (Some(bucket_inputs), Some(bucket_proof)) => {
-            let buckets: Vec<GuardBucketHashInputsTrace> = bucket_inputs
-                .iter()
-                .map(|i| GuardBucketHashInputsTrace::alloc(b, i))
-                .collect();
-            let live_slots: usize = buckets.iter().map(|i| i.blocks().len()).sum();
+            let update = GuardBucketUpdateInputsTrace::alloc(b, bucket_inputs);
+            assert_eq!(bucket_proof.padded_spent_len, update.padded_spent_len);
             let family = SpongeFamilyProofTrace::alloc(
                 b,
                 &bucket_proof.kill_shot,
@@ -532,13 +756,12 @@ pub fn build_exact_state_slot(
                 &bucket_proof.batch,
                 bucket_proof.num_vars,
                 bucket_proof.live_slots,
-                live_slots,
+                guard_update_live_slots(update.padded_spent_len),
             );
-            assert_eq!(bucket_proof.n_buckets, buckets.len());
             let mut ch = RawChannelTrace::new();
-            let reds = verify_batched_guard_bucket_killshot_trace(b, &mut ch, &family, &buckets);
-            discharge_batched_guard_bucket_trace(b, &buckets, &reds);
-            Some(buckets)
+            let reds = verify_batched_guard_bucket_killshot_trace(b, &mut ch, &family, &update);
+            discharge_batched_guard_bucket_trace(b, &update, &reds);
+            Some(update)
         }
         (None, None) => None,
         _ => unreachable!("guard presence asserted above"),
@@ -634,52 +857,68 @@ mod tests {
         }
     }
 
-    fn bucket_fixture(seed: u64, occupied: bool, n_slots: usize) -> GuardBucketHashInputs {
-        let (absolute_height, spent_slots) = if occupied {
-            (1000 + seed, (0..n_slots).map(|i| (seed as u32) + 3 * i as u32).collect())
-        } else {
-            (0, Vec::new())
-        };
-        let mut input = GuardBucketHashInputs {
-            occupied,
-            absolute_height,
-            spent_slots,
-            expected_hash: [Block128::ZERO; 2],
-        };
-        // Derive the honest hash through the native evaluation by asking the
-        // prover-side helper: replicate bucket_blocks + sponge chain.
-        let [iv_hi, iv_lo] = capacity_iv(TAG_RGDBUCK);
-        let mut state = [Block128::ZERO, Block128::ZERO, iv_hi, iv_lo];
-        let blocks = {
-            // Same layout as guard_bucket_killshot::bucket_blocks.
-            if !input.occupied {
-                vec![[Block128::ZERO, super::pad_after_one_field()]]
-            } else {
-                let mut blocks =
-                    vec![[Block128::from(1u8), Block128::from(input.absolute_height)]];
-                let mut fields = vec![Block128::from(input.spent_slots.len() as u64)];
-                fields.extend(input.spent_slots.iter().map(|&s| Block128::from(s)));
-                let mut it = fields.chunks_exact(2);
-                for pair in &mut it {
-                    blocks.push([pair[0], pair[1]]);
-                }
-                let rem = it.remainder();
-                if rem.is_empty() {
-                    blocks.push(super::pad_empty_block());
-                } else {
-                    blocks.push([rem[0], super::pad_after_one_field()]);
-                }
-                blocks
-            }
-        };
+    fn sponge_chain(iv: [Block128; 2], fields: &[Block128]) -> [Block128; 2] {
         let perm = noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+        let mut state = [Block128::ZERO, Block128::ZERO, iv[0], iv[1]];
+        let mut blocks = Vec::new();
+        let mut it = fields.chunks_exact(2);
+        for pair in &mut it {
+            blocks.push([pair[0], pair[1]]);
+        }
+        let rem = it.remainder();
+        if rem.is_empty() {
+            blocks.push(super::pad_empty_block());
+        } else {
+            blocks.push([rem[0], super::pad_after_one_field()]);
+        }
         for block in blocks {
             state[0] += block[0];
             state[1] += block[1];
             perm.permute_mut(&mut state);
         }
-        input.expected_hash = [state[0], state[1]];
-        input
+        [state[0], state[1]]
+    }
+
+    fn guard_slots_digest_fixture(slots: &[u32]) -> [Block128; 2] {
+        let mut fields = vec![Block128::from(slots.len() as u64)];
+        fields.extend(slots.iter().map(|&s| Block128::from(s)));
+        sponge_chain(capacity_iv(noid_poseidon2b::native::domain::TAG_RGDSLOT), &fields)
+    }
+
+    fn guard_leaf_fixture(occupied: bool, height: u64, slots: &[u32]) -> GuardLeafHashInputs {
+        let slots_digest = if occupied {
+            guard_slots_digest_fixture(slots)
+        } else {
+            [Block128::ZERO; 2]
+        };
+        let expected_hash = sponge_chain(
+            capacity_iv(TAG_RGDBUCK),
+            &[
+                Block128::from(occupied as u128),
+                Block128::from(height),
+                slots_digest[0],
+                slots_digest[1],
+            ],
+        );
+        GuardLeafHashInputs {
+            occupied,
+            absolute_height: if occupied { height } else { 0 },
+            slots_digest,
+            expected_hash,
+        }
+    }
+
+    fn guard_update_fixture(seed: u64, old_occupied: bool, n_slots: usize) -> GuardBucketUpdateInputs {
+        let old_slots: Vec<u32> = (0..2u32).map(|i| (seed as u32) + 7 * i).collect();
+        let spent_slots: Vec<u32> = (0..n_slots)
+            .map(|i| (seed as u32) + 3 * i as u32)
+            .collect();
+        GuardBucketUpdateInputs {
+            old_leaf: guard_leaf_fixture(old_occupied, if old_occupied { 700 + seed } else { 0 }, &old_slots),
+            new_leaf: guard_leaf_fixture(true, 1000 + seed, &spent_slots),
+            spent_slots,
+            padded_spent_len: 8,
+        }
     }
 
     fn root_fixture(seed: u128) -> CompositeStateRootInputs {
@@ -744,7 +983,7 @@ mod tests {
             path_fixture(&state_circuit, 1, 3, 0b011),
             path_fixture(&state_circuit, 2, 2, 0b10),
         ];
-        let guard_buckets = with_guard.then(|| vec![bucket_fixture(7, true, 3), bucket_fixture(8, false, 0)]);
+        let guard_buckets = with_guard.then(|| guard_update_fixture(7, true, 3));
         let guard_paths = with_guard.then(|| vec![path_fixture(&guard_circuit, 9, 2, 0b01)]);
         let state_roots = vec![root_fixture(11), root_fixture(12)];
 
@@ -829,16 +1068,32 @@ mod tests {
             Box::new(|i| i.state_paths[0].siblings[1][0] += Block128::ONE),
             Box::new(|i| i.state_paths[1].expected_root[0] += Block128::ONE),
             Box::new(|i| {
-                let buckets = i.guard_buckets.as_mut().unwrap();
-                buckets[0].absolute_height = buckets[0].absolute_height.wrapping_add(1);
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.old_leaf.absolute_height = update.old_leaf.absolute_height.wrapping_add(1);
             }),
             Box::new(|i| {
-                let buckets = i.guard_buckets.as_mut().unwrap();
-                buckets[0].spent_slots[1] += 1;
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.new_leaf.absolute_height = update.new_leaf.absolute_height.wrapping_add(1);
             }),
             Box::new(|i| {
-                let buckets = i.guard_buckets.as_mut().unwrap();
-                buckets[0].expected_hash[0] += Block128::ONE;
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.spent_slots[1] += 1;
+            }),
+            Box::new(|i| {
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.new_leaf.slots_digest[0] += Block128::ONE;
+            }),
+            Box::new(|i| {
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.old_leaf.slots_digest[1] += Block128::ONE;
+            }),
+            Box::new(|i| {
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.new_leaf.expected_hash[0] += Block128::ONE;
+            }),
+            Box::new(|i| {
+                let update = i.guard_buckets.as_mut().unwrap();
+                update.old_leaf.expected_hash[1] += Block128::ONE;
             }),
             Box::new(|i| {
                 let paths = i.guard_paths.as_mut().unwrap();
@@ -868,41 +1123,20 @@ mod tests {
 
     /// The strict-ascending canonicity pin: an unsorted spent-slot list is
     /// rejected natively (`inputs_are_canonical`) and unsatisfiable in-trace
-    /// (`pin_lt_strict`), even when the bucket hash is recomputed to match
-    /// the reordered data.
+    /// (the gated less-than pins), even when the digests and leaf hashes are
+    /// recomputed to match the reordered data.
     #[test]
     fn exact_state_rejects_unsorted_guard_slots() {
         let (mut inputs, proof) = fixture(true);
-        let bucket = &mut inputs.guard_buckets.as_mut().unwrap()[0];
-        bucket.spent_slots.swap(0, 1);
-        // Recompute the hash so ONLY the canonicity check can catch it.
-        *bucket = {
-            let mut b = bucket_fixture(7, true, 3);
-            b.spent_slots = bucket.spent_slots.clone();
-            let [iv_hi, iv_lo] = capacity_iv(TAG_RGDBUCK);
-            let perm = noid_poseidon2b::native::permutation::Poseidon2bPermutation;
-            let mut state = [Block128::ZERO, Block128::ZERO, iv_hi, iv_lo];
-            let mut fields = vec![Block128::from(b.spent_slots.len() as u64)];
-            fields.extend(b.spent_slots.iter().map(|&s| Block128::from(s)));
-            let mut blocks = vec![[Block128::from(1u8), Block128::from(b.absolute_height)]];
-            let mut it = fields.chunks_exact(2);
-            for pair in &mut it {
-                blocks.push([pair[0], pair[1]]);
-            }
-            let rem = it.remainder();
-            if rem.is_empty() {
-                blocks.push(super::pad_empty_block());
-            } else {
-                blocks.push([rem[0], super::pad_after_one_field()]);
-            }
-            for block in blocks {
-                state[0] += block[0];
-                state[1] += block[1];
-                perm.permute_mut(&mut state);
-            }
-            b.expected_hash = [state[0], state[1]];
-            b
-        };
+        let update = inputs.guard_buckets.as_mut().unwrap();
+        update.spent_slots.swap(0, 1);
+        // Recompute the digest and leaf so ONLY the canonicity check can
+        // catch it.
+        update.new_leaf = guard_leaf_fixture(
+            true,
+            update.new_leaf.absolute_height,
+            &update.spent_slots,
+        );
         assert!(
             verify_exact_state_killshot(&inputs, &proof).is_err(),
             "native accepted an unsorted bucket"
@@ -910,6 +1144,41 @@ mod tests {
         assert!(
             !trace_accepts(&inputs, &proof),
             "trace accepted an unsorted bucket"
+        );
+    }
+
+    /// Fixed-matrix class gate for the guard slot: two updates in one class
+    /// (same spend capacity) with different occupancies, heights, spend
+    /// counts and slot values must produce byte-identical matrices.
+    #[test]
+    fn guard_fixed_matrix_within_class() {
+        let digest = |seed: u64, old_occupied: bool, n_slots: usize| {
+            let update = guard_update_fixture(seed, old_occupied, n_slots);
+            let mut ch = Poseidon2bChannel::new();
+            let (proof, _) = prove_batched_guard_bucket_killshot(&update, &mut ch);
+            let mut b = FieldR1csBuilder::new();
+            let trace = GuardBucketUpdateInputsTrace::alloc(&mut b, &update);
+            let family = SpongeFamilyProofTrace::alloc(
+                &mut b,
+                &proof.kill_shot,
+                &proof.chain,
+                &proof.batch,
+                proof.num_vars,
+                proof.live_slots,
+                guard_update_live_slots(update.padded_spent_len),
+            );
+            let mut ch = RawChannelTrace::new();
+            let reds =
+                verify_batched_guard_bucket_killshot_trace(&mut b, &mut ch, &family, &trace);
+            discharge_batched_guard_bucket_trace(&mut b, &trace, &reds);
+            let (r1cs, z) = b.build();
+            assert!(r1cs.satisfies(&z), "honest guard slot unsat");
+            r1cs.statement_digest()
+        };
+        assert_eq!(
+            digest(7, true, 3),
+            digest(1234, false, 7),
+            "guard slot matrix must depend only on the shape class"
         );
     }
 

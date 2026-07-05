@@ -37,7 +37,7 @@ use noid_gkr::{
     verify_block_spine_killshot, verify_chain_accumulator_killshot, verify_header_hash_killshot,
     verify_owner_auth_killshot, verify_sweep_block_spine_killshot, BlockSpineMle,
     ChainAccumulatorBatchInputs, ChainAccumulatorItem, CompositeStateRootInputs,
-    GuardBucketHashInputs, HeaderHashInputs, MerkleCircuit, MerklePathInputs, SlotLeafInputs,
+    GuardBucketUpdateInputs, GuardLeafHashInputs, HeaderHashInputs, MerkleCircuit, MerklePathInputs, SlotLeafInputs,
     SpineCircuit, SpineInputs, SweepBlockSpineMle, SweepSpineCircuit, MAX_MERKLE_DEPTH,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
@@ -279,17 +279,39 @@ fn slot_leaf_input(seed: u128) -> SlotLeafInputs {
     }
 }
 
-fn guard_bucket_input(seed: u128) -> GuardBucketHashInputs {
-    let base = (seed as u32).wrapping_mul(16);
-    let bucket = GuardBucket::Occupied {
-        absolute_height: 1_000 + seed as u64,
-        spent_slots: vec![base + 1, base + 3, base + 7, base + 15],
+fn guard_leaf_input(bucket: &GuardBucket) -> GuardLeafHashInputs {
+    let (occupied, absolute_height, slots_digest) = match bucket {
+        GuardBucket::Empty => (false, 0, [noid_core::Block128::from(0u128); 2]),
+        GuardBucket::Occupied {
+            absolute_height,
+            spent_slots,
+        } => (
+            true,
+            *absolute_height,
+            noid_chain::reuse_guard::guard_slots_digest(spent_slots),
+        ),
     };
-    GuardBucketHashInputs {
-        occupied: true,
+    GuardLeafHashInputs {
+        occupied,
+        absolute_height,
+        slots_digest,
+        expected_hash: digest_to_fields(guard_bucket_hash(bucket)),
+    }
+}
+
+fn guard_update_input(seed: u128, padded_spent_len: usize) -> GuardBucketUpdateInputs {
+    let base = (seed as u32).wrapping_mul(16);
+    let spent_slots = vec![base + 1, base + 3, base + 7, base + 15];
+    let old_bucket = GuardBucket::Empty;
+    let new_bucket = GuardBucket::Occupied {
         absolute_height: 1_000 + seed as u64,
-        spent_slots: vec![base + 1, base + 3, base + 7, base + 15],
-        expected_hash: digest_to_fields(guard_bucket_hash(&bucket)),
+        spent_slots: spent_slots.clone(),
+    };
+    GuardBucketUpdateInputs {
+        old_leaf: guard_leaf_input(&old_bucket),
+        new_leaf: guard_leaf_input(&new_bucket),
+        spent_slots,
+        padded_spent_len,
     }
 }
 
@@ -340,9 +362,7 @@ fn exact_state_killshot_inputs(n: usize) -> ExactStateKillShotInputs {
     let state_paths: Vec<_> = (0..(2 * n))
         .map(|i| merkle_inputs_with_tag(MAX_MERKLE_DEPTH, 0xE100 + i as u128 * 1000, TAG_EXSTNOD))
         .collect();
-    let guard_buckets: Vec<_> = (0..(2 * n))
-        .map(|i| guard_bucket_input(0xE200 + i as u128))
-        .collect();
+    let guard_buckets = guard_update_input(0xE200, 8);
     let guard_paths: Vec<_> = (0..(2 * n))
         .map(|i| merkle_inputs_with_tag(8, 0xE300 + i as u128 * 1000, TAG_RGDNODE))
         .collect();
@@ -501,9 +521,7 @@ fn bench_exact_state_components(n: usize) {
         slot_verified == Some(slot_reductions)
     );
 
-    let bucket_inputs: Vec<_> = (0..n)
-        .map(|i| guard_bucket_input(0xB000 + i as u128))
-        .collect();
+    let bucket_inputs = guard_update_input(0xB000, 4 * n.max(1));
     let (bucket_prove, (bucket_proof, bucket_reductions)) = time_once(|| {
         let mut ch = Poseidon2bChannel::new();
         prove_batched_guard_bucket_killshot(&bucket_inputs, &mut ch)
@@ -560,7 +578,7 @@ fn bench_exact_state_composed(n: usize) {
     println!("    state paths               {}", inputs.state_paths.len());
     println!(
         "    guard bucket claims       {}",
-        inputs.guard_buckets.as_ref().map_or(0, Vec::len)
+        inputs.guard_buckets.as_ref().map_or(0, |u| u.spent_slots.len())
     );
     println!(
         "    guard paths               {}",

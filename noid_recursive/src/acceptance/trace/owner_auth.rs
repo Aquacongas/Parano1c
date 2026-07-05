@@ -355,7 +355,6 @@ struct OwnerUnifiedReductionTrace {
 /// full-table `evaluate_flat`/`evaluate_preflat` calls.
 fn owner_unified_final_evals(
     b: &mut FieldR1csBuilder,
-    layout: OwnerAuthLayout,
     slot_live: &[LinExpr],
     rho: &[LinExpr],
     r_prime: &[LinExpr],
@@ -464,7 +463,7 @@ fn verify_owner_auth_unified_trace(
     let r_prime: Vec<LinExpr> = r_prime.into_iter().map(Option::unwrap).collect();
 
     let (u_at_r, mds_lane, sigma_lane, rc_lane) =
-        owner_unified_final_evals(b, layout, slot_live, &rho, &r_prime);
+        owner_unified_final_evals(b, slot_live, &rho, &r_prime);
 
     let mut q_at_r = proof.main_state_at_r.clone();
     for j in 0..STATE_SIZE {

@@ -96,6 +96,9 @@ pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"EXSTNOD_");
 pub const TAG_EXSTROT: DomainTag = DomainTag::new(b"EXSTROT_");
 /// ReuseGuard canonical bucket: `PARANOID/REUSE-GUARD-BUCKET/256/v1`.
 pub const TAG_RGDBUCK: DomainTag = DomainTag::new(b"RGDBUCK_");
+/// ReuseGuard spent-slot list digest (the inner hash nested inside a
+/// bucket leaf): `PARANOID/REUSE-GUARD-SLOTS/256/v1`.
+pub const TAG_RGDSLOT: DomainTag = DomainTag::new(b"RGDSLOT_");
 /// ReuseGuard fixed-depth Merkle node: `PARANOID/REUSE-GUARD-NODE/256/v1`.
 pub const TAG_RGDNODE: DomainTag = DomainTag::new(b"RGDNODE_");
 /// Accepted-block claim field transcript for recursive chain accumulation.
@@ -141,6 +144,7 @@ mod tests {
             TAG_EXSTNOD,
             TAG_EXSTROT,
             TAG_RGDBUCK,
+            TAG_RGDSLOT,
             TAG_RGDNODE,
             TAG_ACCBLK,
             TAG_HDRPROJ,
