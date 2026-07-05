@@ -597,6 +597,21 @@ where
     point
 }
 
+/// `eq(right, x) = Π_l [right_l·x_l + (1+right_l)(1+x_l)]` on expressions —
+/// the H-claim discharge weight (`H~(right) = Σ_i eq(right,i)·H[i]`), and the
+/// closed-form `weights~(point)` callback for [`verify_weighted_sum_trace`].
+pub fn eq_at_trace(b: &mut FieldR1csBuilder, right: &[LinExpr], x: &[LinExpr]) -> LinExpr {
+    assert_eq!(right.len(), x.len(), "eq arity");
+    let one = LinExpr::constant(F128::ONE);
+    let mut acc = one.clone();
+    for (r, xx) in right.iter().zip(x.iter()) {
+        let hit = mul(b, r, xx);
+        let miss = mul(b, &one.add(r), &one.add(xx));
+        acc = mul(b, &acc, &hit.add(&miss));
+    }
+    acc
+}
+
 /// Trace twin of `encode_kernel::source_weight_at`: the MLE of the
 /// source-binding weight sequence `W_i = K_i(z)·eq(right,i)` at an expression
 /// point `x`. Flat-basis twiddles `tower_to_flat(2^{c+l})` are constants, so
@@ -1030,5 +1045,68 @@ mod tests {
             })
             .collect();
         assert!(survivors.is_empty(), "wsum twin survivors: {survivors:?}");
+    }
+
+    /// The H-claim twin: `H~(right) = claim` as a weighted-sum discharge with
+    /// the `eq(right,·)` weight — the second source-binding leg, in-region,
+    /// matching the native reduction and 0-mutant.
+    #[test]
+    fn h_claim_eq_weight_twin() {
+        use noid_ivc_core::deep_chain::relations::prove_weighted_sum;
+
+        let n_rounds = 5usize;
+        let w = 1usize << n_rounds;
+        let mut rng = Rng(0x11C1A1);
+        let h: Vec<F128> = (0..w).map(|_| rng.f128()).collect();
+        let right: Vec<F128> = (0..n_rounds).map(|_| rng.f128()).collect();
+        let eq_weights = build_eq_table(&right);
+        let claim = {
+            let mut c = F128::ZERO;
+            for i in 0..w {
+                c += eq_weights[i] * h[i];
+            }
+            c
+        };
+
+        let mut ch_native = FsLaneChallenger::new(b"hclaim-twin");
+        let (proof, native_point) = prove_weighted_sum(&h, &eq_weights, claim, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"hclaim-twin");
+        let claim_e = alloc_expr(&mut b, claim);
+        let right_e: Vec<LinExpr> = right.iter().map(|&v| alloc_expr(&mut b, v)).collect();
+        let mutation_start = b.num_wires();
+        let proof_e = WeightedSumProofTrace::alloc(&mut b, &proof, n_rounds);
+        let mutation_end = b.num_wires();
+
+        let point_e = verify_weighted_sum_trace(
+            &mut b,
+            &mut ch,
+            n_rounds,
+            &claim_e,
+            &proof_e,
+            |b, pt| eq_at_trace(b, &right_e, pt),
+        );
+
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "h-claim twin transcript diverged");
+        for (e, n) in point_e.iter().zip(native_point.iter()) {
+            assert_eq!(e.eval(b.values()), *n);
+        }
+        assert_eq!(mle_eval(&h, &native_point), proof.final_value);
+
+        let (r1cs, zz) = b.build();
+        assert!(r1cs.satisfies(&zz), "honest h-claim twin unsatisfiable");
+        use rayon::prelude::*;
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&t| {
+                let mut bad = zz.clone();
+                bad[t] += F128::ONE;
+                r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(survivors.is_empty(), "h-claim twin survivors: {survivors:?}");
     }
 }
