@@ -165,7 +165,7 @@ pub struct SourceTreeColumns {
 
 /// Run one permutation from its raw pre-MDS input, returning the walk's
 /// `s0` (post-`initial_mds`) and the output state (`s_out == c`).
-fn run_perm(raw: [F128; STATE_SIZE]) -> ([F128; STATE_SIZE], [F128; STATE_SIZE]) {
+pub fn run_perm(raw: [F128; STATE_SIZE]) -> ([F128; STATE_SIZE], [F128; STATE_SIZE]) {
     let s0 = initial_mds(raw);
     let mut state = s0;
     for q in 0..N_ROUNDS {
