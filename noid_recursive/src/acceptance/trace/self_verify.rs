@@ -240,6 +240,26 @@ pub fn bind_statement_field_trace(
     observe_flat_digest(b, ch, root);
 }
 
+/// Twin of `proof::bind_statement_field_parts`: the verified instance's
+/// digest enters as WIRES (the self-verification chain reads it from the
+/// previous envelope's IO) instead of a baked constant; the PCS
+/// parameters stay a class constant.
+pub fn bind_statement_field_parts_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    statement_digest: &FlatDigestExpr,
+    pcs_params: &PcsParams,
+    root: &FlatDigestExpr,
+) {
+    ch.observe_label(b, b"history-field-r1cs");
+    observe_flat_digest(b, ch, statement_digest);
+    ch.observe_bytes_const(
+        b,
+        &noid_ivc_core::proof::pcs_params_statement_bytes(pcs_params),
+    );
+    observe_flat_digest(b, ch, root);
+}
+
 // ---------------------------------------------------------------------------
 // Lagrange interpolation over φ_8 node windows
 // ---------------------------------------------------------------------------
@@ -255,7 +275,7 @@ pub fn bind_statement_field_trace(
 /// factors `z + s_j` (association of products — value-identical to native's
 /// sequential Π); denominators are all-constant and fold natively.
 /// Cost: ~3·node_count multiplications.
-fn lagrange_weights_window_trace(
+pub fn lagrange_weights_window_trace(
     b: &mut FieldR1csBuilder,
     z: &LinExpr,
     node_start: usize,
@@ -763,6 +783,106 @@ pub fn lincheck_verify_trace(
         r_inner_rest,
         w,
     }
+}
+
+/// Twin of `lincheck::verify_deferred` — the matrix-free lincheck replay
+/// of the self-verification chain. Transcript-identical to
+/// [`lincheck_verify_trace`] (same absorbs and samples), but instead of
+/// the baked-matrix bilinear final sum it returns the deferred claim
+/// wires for the accumulator fold: the β const-pin term is peeled off
+/// in-trace (one eq product over constant pin bits — no tensors), and no
+/// λ/eq tensors are materialized at all.
+#[allow(clippy::too_many_arguments)]
+pub fn lincheck_verify_trace_deferred(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    k_log: usize,
+    k_skip: usize,
+    const_pin: Option<usize>,
+    m: usize,
+    x_ab: &QuirkyPointTrace,
+    v_a: &LinExpr,
+    v_b: &LinExpr,
+    proof: &LincheckProofTrace,
+) -> (
+    LincheckClaimTrace,
+    super::matrix_fold::FreshLincheckClaimTrace,
+) {
+    let ell = 1usize << k_skip;
+    let inner_rest_len = k_log - k_skip;
+    assert!(k_skip <= k_log, "k_skip exceeds k_log");
+    assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len, "x_inner_rest off shape");
+    assert_eq!(x_ab.x_outer.len(), m - k_log, "x_outer off shape");
+    assert_eq!(proof.rounds.len(), inner_rest_len, "rounds off shape");
+    assert_eq!(proof.z_partial.len(), ell, "z_partial off shape");
+
+    ch.observe_label(b, b"history-lincheck-v0");
+
+    let alpha = ch.sample_f128(b);
+
+    let v_a_alpha = mul(b, &alpha, v_a);
+    let mut target = v_a_alpha.add(v_b);
+    let beta = if const_pin.is_some() {
+        let beta = ch.sample_f128(b);
+        target = target.add(&beta);
+        Some(beta)
+    } else {
+        None
+    };
+    let mut running = target;
+    let mut r_rounds: Vec<LinExpr> = Vec::with_capacity(inner_rest_len);
+    for (e1, einf) in &proof.rounds {
+        ch.observe_f128(b, e1);
+        ch.observe_f128(b, einf);
+        let r = ch.sample_f128(b);
+        let e0 = running.add(e1);
+        let c1 = e0.add(e1).add(einf);
+        let r_sq = mul(b, &r, &r);
+        running = mul(b, einf, &r_sq).add(&mul(b, &c1, &r)).add(&e0);
+        r_rounds.push(r);
+    }
+
+    ch.observe_f128_slice(b, &proof.z_partial);
+
+    let r_inner_rest: Vec<LinExpr> = r_rounds.iter().rev().cloned().collect();
+
+    // Peel the matrix-independent β pin term: β·zp[pin mod 2^k_skip]·
+    // eq(r_inner_rest, bits(pin div 2^k_skip)) — the eq against CONSTANT
+    // bits is a product of affine factors.
+    let mut fresh_value = running.clone();
+    if let (Some(beta), Some(col)) = (beta, const_pin) {
+        let mask = ell - 1;
+        let one = LinExpr::constant(F128::ONE);
+        let mut q_pin = LinExpr::constant(F128::ONE);
+        for (i, r) in r_inner_rest.iter().enumerate() {
+            let bit = (col >> k_skip >> i) & 1;
+            let factor = if bit == 1 { r.clone() } else { one.add(r) };
+            q_pin = mul(b, &q_pin, &factor);
+        }
+        let t = mul(b, &beta, &proof.z_partial[col & mask]);
+        fresh_value = fresh_value.add(&mul(b, &t, &q_pin));
+    }
+    let fresh = super::matrix_fold::FreshLincheckClaimTrace {
+        alpha,
+        z_skip: x_ab.z_skip.clone(),
+        x_inner_rest: x_ab.x_inner_rest.clone(),
+        r_inner_rest: r_inner_rest.clone(),
+        z_partial: proof.z_partial.clone(),
+        value: fresh_value,
+    };
+
+    let r_inner_skip = ch.sample_f128(b);
+    let lambda_out = lagrange_weights_window_trace(b, &r_inner_skip, 0, ell, 0);
+    let w = dot_trace(b, &lambda_out, &proof.z_partial);
+
+    (
+        LincheckClaimTrace {
+            r_inner_skip,
+            r_inner_rest,
+            w,
+        },
+        fresh,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,9 +1562,25 @@ impl FieldR1csProofTrace {
         r1cs: &FieldR1cs,
         pcs_params: &PcsParams,
     ) -> Self {
+        Self::alloc_shape(
+            b,
+            native,
+            &noid_ivc_core::proof::FieldShape::of(r1cs),
+            pcs_params,
+        )
+    }
+
+    /// [`Self::alloc`] from the class shape alone (the self-verification
+    /// chain has no materialized instance of the verified class).
+    pub fn alloc_shape(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::FieldR1csProof,
+        shape: &noid_ivc_core::proof::FieldShape,
+        pcs_params: &PcsParams,
+    ) -> Self {
         Self {
-            zerocheck: ZerocheckProofTrace::alloc(b, &native.zerocheck, r1cs.m),
-            lincheck: LincheckProofTrace::alloc(b, &native.lincheck, r1cs.k_log, r1cs.k_skip),
+            zerocheck: ZerocheckProofTrace::alloc(b, &native.zerocheck, shape.m),
+            lincheck: LincheckProofTrace::alloc(b, &native.lincheck, shape.k_log, shape.k_skip),
             pcs_open: BaseFoldProofTrace::alloc(b, &native.pcs_open, pcs_params),
         }
     }
@@ -1545,6 +1681,102 @@ pub fn verify_field_trace_with_public_io(
         proof,
         Some((spec, io)),
     )
+}
+
+/// Twin of `verifier::verify_field_deferred_matrix` — the matrix-free
+/// [R] body of the self-verification chain. The verified class enters
+/// only through its SHAPE (a protocol constant) and its statement digest
+/// WIRES (from the previous envelope's IO); the lincheck final becomes
+/// the returned deferred claim, which the caller folds into the chain
+/// accumulator ([`super::matrix_fold`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_trace_deferred(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+) -> (
+    R1csClaimTrace,
+    super::matrix_fold::FreshLincheckClaimTrace,
+) {
+    assert_eq!(
+        pcs_params.m,
+        shape.m + LOG_PACKING,
+        "pcs_params.m must be shape.m + LOG_PACKING"
+    );
+
+    bind_statement_field_parts_trace(b, ch, statement_digest, pcs_params, commitment_root);
+    let io_claims = bind_public_io_trace(b, ch, spec, io, shape.m);
+
+    let zc_claim = zerocheck_field_verify_trace(b, ch, shape.m, &proof.zerocheck);
+
+    let inner_rest_len = shape.k_log - shape.k_skip;
+    let x_ab = QuirkyPointTrace {
+        z_skip: zc_claim.z.clone(),
+        x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let (lc_claim, fresh) = lincheck_verify_trace_deferred(
+        b,
+        ch,
+        shape.k_log,
+        shape.k_skip,
+        shape.const_pin,
+        shape.m,
+        &x_ab,
+        &zc_claim.a_eval,
+        &zc_claim.b_eval,
+        &proof.lincheck,
+    );
+
+    let ab = ZClaimTrace {
+        z_skip: lc_claim.r_inner_skip.clone(),
+        x_inner_rest: lc_claim.r_inner_rest.clone(),
+        x_outer: x_ab.x_outer.clone(),
+        value: lc_claim.w.clone(),
+    };
+    let c = ZClaimTrace {
+        z_skip: zc_claim.z.clone(),
+        x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
+        x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
+        value: zc_claim.c_eval.clone(),
+    };
+
+    let x_rest_of = |zc: &ZClaimTrace| -> Vec<LinExpr> {
+        let mut v = zc.x_inner_rest.clone();
+        v.extend_from_slice(&zc.x_outer);
+        v
+    };
+    let mut claims = vec![
+        QuirkyDirectClaimTrace {
+            z_skip: ab.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: x_rest_of(&ab),
+            value: ab.value.clone(),
+        },
+        QuirkyDirectClaimTrace {
+            z_skip: c.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: x_rest_of(&c),
+            value: c.value.clone(),
+        },
+    ];
+    claims.extend(io_claims);
+    verify_opening_batch_quirky_direct_trace(
+        b,
+        ch,
+        commitment_root,
+        &claims,
+        &proof.pcs_open,
+        pcs_params,
+    );
+
+    (R1csClaimTrace { ab, c }, fresh)
 }
 
 fn verify_field_trace_inner(
@@ -2209,13 +2441,10 @@ mod tests {
         let (r1cs, z, ranges) = build_pcs_trace(&params, &commitment, &claims, &proof);
         assert!(r1cs.satisfies(&z));
 
+        let mut battery = r1cs.flip_battery(&z);
         let mut survivors = Vec::new();
-        for target in ranges.into_iter().flatten() {
-            let mut bad = z.clone();
-            bad[target] += F128::ONE;
-            if r1cs.satisfies(&bad) {
-                survivors.push(target);
-            }
+        for range in ranges {
+            survivors.extend(battery.survivors(range));
         }
         assert!(survivors.is_empty(), "PCS mutation survivors: {survivors:?}");
     }
@@ -2325,14 +2554,7 @@ mod tests {
             build_field_verify_trace(&r1cs, &params, &commitment, &proof);
         assert!(out_r1cs.satisfies(&out_z));
 
-        let survivors: Vec<usize> = range
-            .into_par_iter()
-            .filter(|&target| {
-                let mut bad = out_z.clone();
-                bad[target] += F128::ONE;
-                out_r1cs.satisfies(&bad)
-            })
-            .collect();
+        let survivors = out_r1cs.flip_battery(&out_z).survivors(range);
         assert!(
             survivors.is_empty(),
             "[R] mutation survivors: {survivors:?}"
@@ -2460,17 +2682,170 @@ mod tests {
         let (out_r1cs, out_z) = b.build();
         assert!(out_r1cs.satisfies(&out_z), "honest public-io trace unsat");
 
-        let survivors: Vec<usize> = (mutation_start..mutation_end)
-            .into_par_iter()
-            .filter(|&target| {
-                let mut bad = out_z.clone();
-                bad[target] += F128::ONE;
-                out_r1cs.satisfies(&bad)
-            })
-            .collect();
+        let survivors = out_r1cs
+            .flip_battery(&out_z)
+            .survivors(mutation_start..mutation_end);
         assert!(
             survivors.is_empty(),
             "public-io mutation survivors: {survivors:?}"
+        );
+    }
+
+    /// Deferred-matrix [R] lockstep gate: the matrix-free replay (digest
+    /// as WIRES, deferred lincheck claim) accepts an honest public-io
+    /// proof in lockstep with `verify_field_deferred_matrix`, the fold
+    /// twin folds the fresh claim in lockstep with the native fold, the
+    /// accumulator agrees and is TRUE against the verified matrices, and
+    /// every allocated wire (digest lanes included) mutates to unsat.
+    #[test]
+    fn verify_field_deferred_lockstep_and_mutations() {
+        use noid_ivc_core::field_r1cs::SparseFieldMatrix;
+        use noid_ivc_core::matrix_claim::{
+            prove_matrix_claim_fold, stacked_matrix_mle_eval, MatrixAccClaim,
+        };
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use rayon::prelude::*;
+
+        use crate::acceptance::trace::matrix_fold::{
+            verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
+        };
+
+        let (m, k_log) = (7usize, 7usize);
+        let k = 1usize << k_log;
+        let inner = FieldR1cs {
+            m,
+            k_log,
+            k_skip: K_SKIP,
+            useful_rows: k,
+            a_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows: (0..k)
+                    .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
+                    .collect(),
+            },
+            b_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows: (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
+            },
+            const_pin: Some(0),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let mut rng = Rng(0xDEF2);
+        let mut z: Vec<F128> = (0..1usize << m).map(|_| rng.next_f128()).collect();
+        for blk in 0..(1usize << (m - k_log)) {
+            z[blk * k] = F128::ONE;
+        }
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 2,
+                index: 4,
+            },
+            io_len: 4,
+            claims: vec![],
+        };
+        let io: Vec<F128> = (0..4).map(|_| rng.next_f128()).collect();
+        for (t, lane) in io.iter().enumerate() {
+            z[16 + t] = *lane;
+        }
+        assert!(inner.satisfies(&z));
+
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(b"self-verify-def-test");
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&inner, &z, &params, &spec, &io, &mut ch_p);
+
+        // Native deferred reference + native fold (genesis gate).
+        let shape = FieldShape::of(&inner);
+        let digest = inner.statement_digest();
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-def-test");
+        let (_, fresh_native) = noid_ivc_core::verifier::verify_field_deferred_matrix(
+            &shape,
+            &digest,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            &mut ch_native,
+        )
+        .expect("native deferred verify accepts");
+        let junk = MatrixAccClaim::zero(k_log);
+        let mut fold_native = FsLaneChallenger::new(b"self-verify-def-fold");
+        let (fold_proof, acc_native) =
+            prove_matrix_claim_fold(&inner, &fresh_native, &junk, false, &mut fold_native);
+        assert_eq!(
+            stacked_matrix_mle_eval(&inner, &acc_native),
+            acc_native.value,
+            "native accumulator claim is true"
+        );
+
+        // Trace replay: digest as wires, deferred lincheck, fold twin.
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-def-test");
+        let mutation_start = b.num_wires();
+        let digest_e = alloc_flat_digest(&mut b, &digest);
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let io_wires: Vec<LinExpr> = io
+            .iter()
+            .map(|&lane| LinExpr::from_wire(b.alloc_f128(lane)))
+            .collect();
+        let proof_e = FieldR1csProofTrace::alloc_shape(&mut b, &proof, &shape, &params);
+        let incoming_e = MatrixAccClaimTrace::alloc(&mut b, &junk);
+        let fold_proof_e = MatrixFoldProofTrace::alloc(&mut b, &fold_proof, k_log);
+        let mutation_end = b.num_wires();
+        let (_claim, fresh_e) = verify_field_trace_deferred(
+            &mut b, &mut ch, &shape, &params, &digest_e, &root, &proof_e, &spec, &io_wires,
+        );
+        let mut fold_ch = FsChannelTrace::new(&mut b, b"self-verify-def-fold");
+        let gate = LinExpr::zero();
+        let acc_e = verify_matrix_claim_fold_trace(
+            &mut b,
+            &mut fold_ch,
+            k_log,
+            K_SKIP,
+            &fresh_e,
+            &incoming_e,
+            &gate,
+            &fold_proof_e,
+        );
+        let rows = b.num_wires();
+        eprintln!("[self-verify] deferred m={m} rows = {rows}");
+
+        // Lockstep on both channels; fresh + accumulator agreement.
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "deferred transcript diverged");
+        let f_n = fold_native.sample_f128();
+        let f_t = fold_ch.sample_f128(&mut b);
+        assert_eq!(f_t.eval(b.values()), f_n, "fold transcript diverged");
+        assert_eq!(
+            fresh_e.value.eval(b.values()),
+            fresh_native.value,
+            "deferred claim value diverged"
+        );
+        for (e, n) in acc_e.point.iter().zip(acc_native.point.iter()) {
+            assert_eq!(e.eval(b.values()), *n, "accumulator point diverged");
+        }
+        assert_eq!(acc_e.value.eval(b.values()), acc_native.value);
+
+        let (out_r1cs, out_z) = b.build();
+        assert!(out_r1cs.satisfies(&out_z), "honest deferred trace unsat");
+
+        let survivors = out_r1cs
+            .flip_battery(&out_z)
+            .survivors(mutation_start..mutation_end);
+        assert!(
+            survivors.is_empty(),
+            "deferred mutation survivors: {survivors:?}"
         );
     }
 

@@ -158,6 +158,13 @@ impl FieldR1cs {
             .all(|((ai, bi), zi)| *ai * *bi == *zi)
     }
 
+    /// Build a [`FlipBattery`] over this instance and an honest witness —
+    /// the fast path for wire-flip mutation gates (`O(column degree)` per
+    /// flip instead of a full [`Self::satisfies`] pass).
+    pub fn flip_battery(&self, z: &[F128]) -> FlipBattery<'_> {
+        FlipBattery::new(self, z)
+    }
+
     /// Poseidon2b hash of the instance (parameters + coefficient matrices).
     /// Binds the Fiat-Shamir transcript to the statement being proved.
     ///
@@ -286,6 +293,118 @@ pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize)
             }
         });
     out
+}
+
+// ---------------------------------------------------------------------------
+// FlipBattery: incremental single-wire mutation checks
+// ---------------------------------------------------------------------------
+
+/// Incremental wire-flip mutation checker: precomputes `Az`, `Bz` and
+/// per-column row lists once, then answers "does the trace still satisfy
+/// after `z[w] += 1`?" in `O(deg_A(w) + deg_B(w))` — a single-wire flip
+/// only perturbs the rows whose A/B row reads that wire (block-diagonal
+/// relation, `C = I`, so the flipped wire's own row is the only RHS
+/// change). Semantically identical to cloning the witness, flipping, and
+/// running the full [`FieldR1cs::satisfies`]; mutation batteries at
+/// verifier-trace scale (`2^20+` rows × 10⁴+ targets) are infeasible
+/// with full passes and instant with this.
+pub struct FlipBattery<'a> {
+    r1cs: &'a FieldR1cs,
+    z: Vec<F128>,
+    az: Vec<F128>,
+    bz: Vec<F128>,
+    /// Per inner column: the block-local rows reading it, with coefficients.
+    cols_a: Vec<Vec<(u32, F128)>>,
+    cols_b: Vec<Vec<(u32, F128)>>,
+}
+
+impl<'a> FlipBattery<'a> {
+    pub fn new(r1cs: &'a FieldR1cs, z: &[F128]) -> Self {
+        assert_eq!(z.len(), r1cs.n());
+        let az = r1cs.apply_a(z);
+        let bz = r1cs.apply_b(z);
+        assert!(
+            az.iter()
+                .zip(bz.iter())
+                .zip(z.iter())
+                .all(|((a, b), zi)| *a * *b == *zi),
+            "FlipBattery requires an honest witness"
+        );
+        let transpose = |m: &SparseFieldMatrix| {
+            let mut cols: Vec<Vec<(u32, F128)>> = vec![Vec::new(); m.num_cols];
+            for (r, row) in m.rows.iter().enumerate() {
+                for &(c, coeff) in row {
+                    cols[c as usize].push((r as u32, coeff));
+                }
+            }
+            cols
+        };
+        Self {
+            r1cs,
+            z: z.to_vec(),
+            az,
+            bz,
+            cols_a: transpose(&r1cs.a_0),
+            cols_b: transpose(&r1cs.b_0),
+        }
+    }
+
+    /// Whether the trace still satisfies after flipping `z[w] += 1`
+    /// (leaves the battery state unchanged).
+    pub fn survives_flip(&mut self, w: usize) -> bool {
+        let k_log = self.r1cs.k_log;
+        let base = (w >> k_log) << k_log;
+        let i = w & ((1usize << k_log) - 1);
+
+        // Apply the delta (char 2: Δz = 1 ⇒ Δ(Az)[r] = A[r][i]).
+        self.z[w] += F128::ONE;
+        for &(r, coeff) in &self.cols_a[i] {
+            self.az[base + r as usize] += coeff;
+        }
+        for &(r, coeff) in &self.cols_b[i] {
+            self.bz[base + r as usize] += coeff;
+        }
+
+        // Check the affected rows (both column lists plus the wire's own
+        // row); duplicates re-check harmlessly.
+        let mut ok = {
+            let r = w;
+            self.az[r] * self.bz[r] == self.z[r]
+        };
+        if ok {
+            for &(r, _) in &self.cols_a[i] {
+                let r = base + r as usize;
+                if self.az[r] * self.bz[r] != self.z[r] {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            for &(r, _) in &self.cols_b[i] {
+                let r = base + r as usize;
+                if self.az[r] * self.bz[r] != self.z[r] {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        // Revert (char 2: adding the same deltas again).
+        self.z[w] += F128::ONE;
+        for &(r, coeff) in &self.cols_a[i] {
+            self.az[base + r as usize] += coeff;
+        }
+        for &(r, coeff) in &self.cols_b[i] {
+            self.bz[base + r as usize] += coeff;
+        }
+        ok
+    }
+
+    /// Run the battery over a wire range, returning the survivors.
+    pub fn survivors(&mut self, range: std::ops::Range<usize>) -> Vec<usize> {
+        range.filter(|&w| self.survives_flip(w)).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +811,34 @@ mod tests {
         let (r1cs, _) = random_satisfiable(8, 4, 22);
         let _ = r1cs.statement_digest();
         r1cs.seed_statement_digest([0xCD; 32]);
+    }
+
+    /// FlipBattery answers exactly what a full clone-flip-satisfies pass
+    /// answers, for EVERY wire of several instances (multi-block shapes
+    /// included), and leaves its state intact between queries.
+    #[test]
+    fn flip_battery_matches_full_satisfies() {
+        for (m, k_log, seed) in [(6usize, 6usize, 1u64), (8, 5, 2), (7, 7, 3)] {
+            let (r1cs, z) = random_satisfiable(m, k_log, seed);
+            assert!(r1cs.satisfies(&z));
+            let mut battery = r1cs.flip_battery(&z);
+            for w in 0..z.len() {
+                let mut bad = z.clone();
+                bad[w] += F128::ONE;
+                let full = r1cs.satisfies(&bad);
+                assert_eq!(
+                    battery.survives_flip(w),
+                    full,
+                    "m={m} k_log={k_log} wire {w}"
+                );
+            }
+            // State intact: a second pass agrees with itself.
+            for w in (0..z.len()).step_by(7) {
+                let mut bad = z.clone();
+                bad[w] += F128::ONE;
+                assert_eq!(battery.survives_flip(w), r1cs.satisfies(&bad));
+            }
+        }
     }
 
     #[test]

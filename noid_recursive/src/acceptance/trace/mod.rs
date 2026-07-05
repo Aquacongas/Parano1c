@@ -41,6 +41,7 @@ pub mod block_spine;
 pub mod accepted_claim_batch;
 pub mod checkpoint_poseidon;
 pub mod exact_state;
+pub mod matrix_fold;
 pub mod merkle_path;
 pub mod owner_auth;
 pub mod self_verify;

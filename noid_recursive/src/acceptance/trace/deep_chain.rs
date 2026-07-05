@@ -538,7 +538,7 @@ mod tests {
         prove_column_relation, prove_shift_discharge, RelationColumns,
     };
     use noid_ivc_core::deep_chain::{
-        apply_round, initial_mds, prove_deep_chain_walk, LaneClaimGroup,
+        apply_round, prove_deep_chain_walk, LaneClaimGroup,
     };
     use noid_ivc_core::lincheck::build_eq_table;
 
