@@ -35,6 +35,7 @@
 pub mod accepted_claim_hash;
 pub mod auth_pcs;
 pub mod batch_eval;
+pub mod deep_chain;
 pub mod fri_pcs;
 pub mod block_spine;
 pub mod accepted_claim_batch;

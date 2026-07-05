@@ -1,0 +1,654 @@
+//! Trace twins of the deep-chain engine verifiers — the [G] slot bodies.
+//!
+//! Line-by-line transliterations of `noid_ivc_core::deep_chain`:
+//! [`verify_deep_chain_walk_trace`] replays the 66-layer walk verifier,
+//! [`verify_column_relation_trace`] the generic column-relation sumcheck,
+//! [`verify_shift_discharge_trace`] the successor-kernel reduction. Same
+//! absorb/squeeze order on the [`FsChannelTrace`], same checks; every
+//! proof field is witness, every relation structure and round schedule is
+//! a protocol constant baked at build time.
+//!
+//! Cost drivers (per the module they mirror): the walk absorbs
+//! `w_log`×8-lane compressed round polynomials per layer (~5 permutations
+//! each) — near-flat in transaction count; the relation and shift twins
+//! are O(w_log) rounds each. All MDS/round-constant algebra folds into
+//! affine expressions (zero rows); the only multiplications are Horner
+//! walks, S-boxes on claimed values, per-group eq evaluations, and claim
+//! batching.
+
+use noid_ivc_core::deep_chain::relations::{
+    distinct_refs, ColRef, ColumnRelationProof, RelationTerm, ShiftDischargeProof,
+    MAX_TERM_FACTORS, RELATION_DEGREE,
+};
+use noid_ivc_core::deep_chain::{
+    flat_mds, flat_round_constant, is_full_round, DeepChainWalkProof, WALK_DEGREE,
+};
+use noid_ivc_core::field_circuit::FsChannelTrace;
+use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
+
+use super::{mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
+
+// ---------------------------------------------------------------------------
+// Proof wires
+// ---------------------------------------------------------------------------
+
+/// A claim group as expressions.
+pub struct LaneClaimGroupTrace {
+    pub point: Vec<LinExpr>,
+    pub values: [LinExpr; STATE_SIZE],
+}
+
+/// Witness allocation of a [`DeepChainWalkProof`].
+pub struct DeepChainWalkProofTrace {
+    pub layers: Vec<WalkLayerProofTrace>,
+}
+
+pub struct WalkLayerProofTrace {
+    pub round_coeffs: Vec<[LinExpr; WALK_DEGREE]>,
+    pub next_values: [LinExpr; STATE_SIZE],
+}
+
+impl DeepChainWalkProofTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &DeepChainWalkProof, w_log: usize) -> Self {
+        assert_eq!(native.layers.len(), N_ROUNDS, "walk proof layer count");
+        let layers = native
+            .layers
+            .iter()
+            .map(|l| {
+                assert_eq!(l.round_coeffs.len(), w_log, "walk proof round count");
+                WalkLayerProofTrace {
+                    round_coeffs: l
+                        .round_coeffs
+                        .iter()
+                        .map(|wire| std::array::from_fn(|i| alloc_expr(b, wire[i])))
+                        .collect(),
+                    next_values: std::array::from_fn(|i| alloc_expr(b, l.next_values[i])),
+                }
+            })
+            .collect();
+        Self { layers }
+    }
+}
+
+fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
+    LinExpr::from_wire(b.alloc_f128(v))
+}
+
+/// x^7 on an expression: 4 multiplication rows.
+pub fn sbox7_trace(b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
+    let x2 = mul(b, x, x);
+    let x4 = mul(b, &x2, &x2);
+    let x3 = mul(b, x, &x2);
+    mul(b, &x3, &x4)
+}
+
+// ---------------------------------------------------------------------------
+// Shared sumcheck pieces
+// ---------------------------------------------------------------------------
+
+/// Reconstruct + Horner for a compressed wire `[c_0, c_2..c_d]`: the linear
+/// coefficient is `claim + Σ_{i≥2} c_i` (free XOR algebra), then evaluate
+/// at `r` with d multiplications.
+fn compressed_horner(
+    b: &mut FieldR1csBuilder,
+    wire: &[LinExpr],
+    claim: &LinExpr,
+    r: &LinExpr,
+) -> LinExpr {
+    let mut c1 = claim.clone();
+    for c in &wire[1..] {
+        c1 = c1.add(c);
+    }
+    // coeffs = [wire[0], c1, wire[1], .., wire[d−1]] — Horner top-down.
+    let mut acc = wire[wire.len() - 1].clone();
+    for c in wire[1..wire.len() - 1].iter().rev() {
+        let t = mul(b, &acc, r);
+        acc = t.add(c);
+    }
+    let t = mul(b, &acc, r);
+    acc = t.add(&c1);
+    let t = mul(b, &acc, r);
+    t.add(&wire[0])
+}
+
+// ---------------------------------------------------------------------------
+// The walk verifier twin
+// ---------------------------------------------------------------------------
+
+/// Trace twin of `deep_chain::verify_deep_chain_walk`. Group points and
+/// values are expressions the caller ties to its relation twins; returns
+/// the terminal layer-0 claim group for the wiring substitution.
+pub fn verify_deep_chain_walk_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    w_log: usize,
+    out_groups: &[LaneClaimGroupTrace],
+    proof: &DeepChainWalkProofTrace,
+) -> LaneClaimGroupTrace {
+    assert!(!out_groups.is_empty());
+    for g in out_groups {
+        assert_eq!(g.point.len(), w_log, "walk group point arity");
+    }
+    assert_eq!(proof.layers.len(), N_ROUNDS);
+
+    ch.observe_label(b, b"history-deep-chain-walk-v0");
+    for g in out_groups {
+        ch.observe_f128_slice(b, &g.point);
+        ch.observe_f128_slice(b, &g.values);
+    }
+
+    let mut group_points: Vec<Vec<LinExpr>> =
+        out_groups.iter().map(|g| g.point.clone()).collect();
+    let mut group_values: Vec<[LinExpr; STATE_SIZE]> =
+        out_groups.iter().map(|g| g.values.clone()).collect();
+
+    let mut terminal: Option<LaneClaimGroupTrace> = None;
+    for (li, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - li;
+        let q = layer - 1;
+        let alpha = ch.sample_f128(b);
+
+        // Lane weights α^{4g+i+1} — a running product chain of wires.
+        let mut weights: Vec<[LinExpr; STATE_SIZE]> =
+            Vec::with_capacity(group_points.len());
+        let mut power = LinExpr::constant(F128::ONE);
+        for _ in 0..group_points.len() {
+            let w: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| {
+                power = mul(b, &power, &alpha);
+                power.clone()
+            });
+            weights.push(w);
+        }
+
+        // Running claim.
+        let mut claim = LinExpr::zero();
+        for (vals, w_g) in group_values.iter().zip(weights.iter()) {
+            for i in 0..STATE_SIZE {
+                claim = claim.add(&mul(b, &w_g[i], &vals[i]));
+            }
+        }
+
+        let mut point = Vec::with_capacity(w_log);
+        for wire in &layer_proof.round_coeffs {
+            ch.observe_f128_slice(b, wire);
+            let r = ch.sample_f128(b);
+            claim = compressed_horner(b, wire, &claim, &r);
+            point.push(r);
+        }
+        ch.observe_f128_slice(b, &layer_proof.next_values);
+
+        // term_j on the claimed next values (round constants are free adds).
+        let mds = flat_mds(is_full_round(q));
+        let terms: [LinExpr; STATE_SIZE] = if is_full_round(q) {
+            std::array::from_fn(|j| {
+                let x = layer_proof.next_values[j]
+                    .add(&LinExpr::constant(flat_round_constant(j, q)));
+                sbox7_trace(b, &x)
+            })
+        } else {
+            std::array::from_fn(|j| {
+                if j == 0 {
+                    let x = layer_proof.next_values[0]
+                        .add(&LinExpr::constant(flat_round_constant(0, q)));
+                    sbox7_trace(b, &x)
+                } else {
+                    layer_proof.next_values[j].clone()
+                }
+            })
+        };
+
+        // expected = Σ_g eq(ρ_g, point) · Σ_j c_{g,j}·term_j with
+        // c_{g,j} = Σ_i w_{g,i}·MDS[i][j] — MDS entries are constants, so
+        // c_{g,j} is affine in the weight wires (zero rows).
+        let mut expected = LinExpr::zero();
+        for (g_point, w_g) in group_points.iter().zip(weights.iter()) {
+            let mut dot = LinExpr::zero();
+            for j in 0..STATE_SIZE {
+                let mut c_gj = LinExpr::zero();
+                for i in 0..STATE_SIZE {
+                    c_gj = c_gj.add(&w_g[i].scale(mds[i][j]));
+                }
+                dot = dot.add(&mul(b, &c_gj, &terms[j]));
+            }
+            let eq = b.eq_eval_trace(g_point, &point);
+            expected = expected.add(&mul(b, &eq, &dot));
+        }
+        pin_eq(b, &expected, &claim);
+
+        group_points = vec![point.clone()];
+        group_values = vec![layer_proof.next_values.clone()];
+        terminal = Some(LaneClaimGroupTrace {
+            point,
+            values: layer_proof.next_values.clone(),
+        });
+    }
+    terminal.expect("N_ROUNDS ≥ 1")
+}
+
+// ---------------------------------------------------------------------------
+// Column-relation verifier twin
+// ---------------------------------------------------------------------------
+
+/// Witness allocation of a [`ColumnRelationProof`].
+pub struct ColumnRelationProofTrace {
+    pub rounds: Vec<[LinExpr; RELATION_DEGREE]>,
+    pub final_values: Vec<LinExpr>,
+}
+
+impl ColumnRelationProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &ColumnRelationProof,
+        w_log: usize,
+        n_refs: usize,
+    ) -> Self {
+        assert_eq!(native.rounds.len(), w_log, "relation round count");
+        assert_eq!(native.final_values.len(), n_refs, "relation value count");
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|wire| std::array::from_fn(|i| alloc_expr(b, wire[i])))
+                .collect(),
+            final_values: native
+                .final_values
+                .iter()
+                .map(|&v| alloc_expr(b, v))
+                .collect(),
+        }
+    }
+}
+
+/// The relation term list as the trace consumes it: structure (factor refs)
+/// is a protocol constant; coefficients may be expressions (challenge-
+/// derived, e.g. the α-batched MDS weights of a wiring substitution).
+pub struct RelationTermTrace {
+    pub coeff: LinExpr,
+    pub factors: Vec<ColRef>,
+}
+
+/// The native header absorbs `(target, eq_point, structure lanes)`; the
+/// twin mirrors it with the structure lanes as constants. The structure
+/// lanes bind ONLY the term/factor encoding — coefficients are absorbed as
+/// expressions so challenge-derived coefficients stay sound.
+fn absorb_relation_header_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    target: &LinExpr,
+    eq_point: &[LinExpr],
+    terms: &[RelationTermTrace],
+) {
+    ch.observe_label(b, b"history-deep-chain-relation-v0");
+    ch.observe_f128(b, target);
+    ch.observe_f128_slice(b, eq_point);
+    let lane = |a: u64, bb: u64| LinExpr::constant(F128 { lo: a, hi: bb });
+    let mut lanes = vec![lane(terms.len() as u64, 0)];
+    for t in terms {
+        lanes.push(t.coeff.clone());
+        lanes.push(lane(t.factors.len() as u64, 0));
+        for f in &t.factors {
+            let (kind, idx) = match f {
+                ColRef::Committed(i) => (0u64, *i as u64),
+                ColRef::CommittedShift(i) => (1, *i as u64),
+                ColRef::Internal(i) => (2, *i as u64),
+            };
+            lanes.push(lane(kind, idx));
+        }
+    }
+    ch.observe_f128_slice(b, &lanes);
+}
+
+/// Trace twin of `relations::verify_column_relation`; returns the derived
+/// point (final claim values live in `proof.final_values`, ordered by
+/// [`distinct_refs`]-equivalent structure order).
+pub fn verify_column_relation_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    w_log: usize,
+    target: &LinExpr,
+    eq_point: &[LinExpr],
+    terms: &[RelationTermTrace],
+    proof: &ColumnRelationProofTrace,
+) -> Vec<LinExpr> {
+    assert_eq!(eq_point.len(), w_log);
+    assert_eq!(proof.rounds.len(), w_log);
+    let native_shape: Vec<RelationTerm> = terms
+        .iter()
+        .map(|t| {
+            assert!(t.factors.len() <= MAX_TERM_FACTORS);
+            RelationTerm {
+                coeff: F128::ZERO,
+                factors: t.factors.clone(),
+            }
+        })
+        .collect();
+    let refs = distinct_refs(&native_shape);
+    assert_eq!(proof.final_values.len(), refs.len());
+
+    absorb_relation_header_trace(b, ch, target, eq_point, terms);
+
+    let mut claim = target.clone();
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        ch.observe_f128_slice(b, wire);
+        let r = ch.sample_f128(b);
+        claim = compressed_horner(b, wire, &claim, &r);
+        point.push(r);
+    }
+    ch.observe_f128_slice(b, &proof.final_values);
+
+    let mut sum = LinExpr::zero();
+    for t in terms {
+        let mut prod = t.coeff.clone();
+        for f in &t.factors {
+            let fi = refs.iter().position(|r| r == f).expect("distinct ref");
+            prod = mul(b, &prod, &proof.final_values[fi]);
+        }
+        sum = sum.add(&prod);
+    }
+    let eq = b.eq_eval_trace(eq_point, &point);
+    let expected = mul(b, &eq, &sum);
+    pin_eq(b, &expected, &claim);
+    point
+}
+
+// ---------------------------------------------------------------------------
+// Shift-discharge verifier twin
+// ---------------------------------------------------------------------------
+
+pub struct ShiftDischargeProofTrace {
+    pub rounds: Vec<[LinExpr; 2]>,
+    pub final_value: LinExpr,
+}
+
+impl ShiftDischargeProofTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &ShiftDischargeProof, w_log: usize) -> Self {
+        assert_eq!(native.rounds.len(), w_log, "shift round count");
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|wire| std::array::from_fn(|i| alloc_expr(b, wire[i])))
+                .collect(),
+            final_value: alloc_expr(b, native.final_value),
+        }
+    }
+}
+
+/// Closed-form successor kernel `N(ρ, σ)` on expressions (see
+/// `relations::shift_kernel_eval`): prefix/suffix products over the
+/// coordinate pairs — O(n) multiplications.
+pub fn shift_kernel_eval_trace(
+    b: &mut FieldR1csBuilder,
+    rho: &[LinExpr],
+    sigma: &[LinExpr],
+) -> LinExpr {
+    assert_eq!(rho.len(), sigma.len());
+    let n = rho.len();
+    let one = LinExpr::constant(F128::ONE);
+    let mut suffix = vec![LinExpr::constant(F128::ONE); n + 1];
+    for i in (0..n).rev() {
+        let m1 = mul(b, &rho[i], &sigma[i]);
+        let m2 = mul(b, &one.add(&rho[i]), &one.add(&sigma[i]));
+        let matched = m1.add(&m2);
+        suffix[i] = mul(b, &matched, &suffix[i + 1]);
+    }
+    let mut acc = LinExpr::zero();
+    let mut prefix = LinExpr::constant(F128::ONE);
+    for k in 0..n {
+        let t1 = mul(b, &prefix, &rho[k]);
+        let t2 = mul(b, &t1, &one.add(&sigma[k]));
+        acc = acc.add(&mul(b, &t2, &suffix[k + 1]));
+        let p1 = mul(b, &prefix, &sigma[k]);
+        prefix = mul(b, &p1, &one.add(&rho[k]));
+    }
+    acc
+}
+
+/// Trace twin of `relations::verify_shift_discharge`; returns the derived
+/// point (pair it with `proof.final_value` as the plain column claim).
+pub fn verify_shift_discharge_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    w_log: usize,
+    sigma: &[LinExpr],
+    target: &LinExpr,
+    proof: &ShiftDischargeProofTrace,
+) -> Vec<LinExpr> {
+    assert_eq!(sigma.len(), w_log);
+    assert_eq!(proof.rounds.len(), w_log);
+
+    ch.observe_label(b, b"history-deep-chain-shift-v0");
+    ch.observe_f128(b, target);
+    ch.observe_f128_slice(b, sigma);
+
+    let mut claim = target.clone();
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        ch.observe_f128_slice(b, wire);
+        // Degree 2: c_1 = claim + c_2; p(r) = (c_2·r + c_1)·r + c_0.
+        let c1 = claim.add(&wire[1]);
+        let r = ch.sample_f128(b);
+        let t = mul(b, &wire[1], &r);
+        let t = mul(b, &t.add(&c1), &r);
+        claim = t.add(&wire[0]);
+        point.push(r);
+    }
+    ch.observe_f128(b, &proof.final_value);
+
+    let kernel = shift_kernel_eval_trace(b, sigma, &point);
+    let expected = mul(b, &kernel, &proof.final_value);
+    pin_eq(b, &expected, &claim);
+    point
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
+    use noid_ivc_core::deep_chain::relations::{
+        prove_column_relation, prove_shift_discharge, RelationColumns,
+    };
+    use noid_ivc_core::deep_chain::{
+        apply_round, initial_mds, prove_deep_chain_walk, LaneClaimGroup,
+    };
+    use noid_ivc_core::lincheck::build_eq_table;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn f128(&mut self) -> F128 {
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            }
+        }
+    }
+
+    fn mle_eval(col: &[F128], point: &[F128]) -> F128 {
+        let eq = build_eq_table(point);
+        let mut acc = F128::ZERO;
+        for (v, e) in col.iter().zip(eq.iter()) {
+            acc += *v * *e;
+        }
+        acc
+    }
+
+    /// Walk twin: lockstep with the native verifier, satisfiable trace,
+    /// proof-wire auto-mutator with 0 survivors, measured row count.
+    #[test]
+    fn walk_twin_lockstep_and_mutations() {
+        let w_log = 3;
+        let w = 1usize << w_log;
+        let mut rng = Rng(0x7A1C);
+        let s0: [Vec<F128>; STATE_SIZE] =
+            std::array::from_fn(|_| (0..w).map(|_| rng.f128()).collect());
+        let mut out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+        for widx in 0..w {
+            let mut state: [F128; STATE_SIZE] = std::array::from_fn(|j| s0[j][widx]);
+            for q in 0..N_ROUNDS {
+                state = apply_round(q, state);
+            }
+            for j in 0..STATE_SIZE {
+                out[j][widx] = state[j];
+            }
+        }
+        let point: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let values: [F128; STATE_SIZE] = std::array::from_fn(|j| mle_eval(&out[j], &point));
+        let groups = [LaneClaimGroup {
+            point: point.clone(),
+            values,
+        }];
+
+        let mut ch_native = FsLaneChallenger::new(b"walk-twin-test");
+        let (proof, native_terminal) = prove_deep_chain_walk(&s0, &groups, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"walk-twin-test");
+        let groups_e = [LaneClaimGroupTrace {
+            point: point.iter().map(|&v| alloc_expr(&mut b, v)).collect(),
+            values: std::array::from_fn(|j| alloc_expr(&mut b, values[j])),
+        }];
+        let mutation_start = b.num_wires();
+        let proof_e = DeepChainWalkProofTrace::alloc(&mut b, &proof, w_log);
+        let mutation_end = b.num_wires();
+        let terminal = verify_deep_chain_walk_trace(&mut b, &mut ch, w_log, &groups_e, &proof_e);
+        let rows = b.num_wires();
+
+        // Lockstep + terminal agreement.
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "walk twin transcript diverged");
+        for j in 0..STATE_SIZE {
+            assert_eq!(
+                terminal.values[j].eval(b.values()),
+                native_terminal.values[j],
+                "terminal value lane {j}"
+            );
+        }
+        eprintln!("[deep-chain] walk twin rows @w_log={w_log}: {rows}");
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest walk twin unsatisfiable");
+
+        use rayon::prelude::*;
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&t| {
+                let mut bad = z.clone();
+                bad[t] += F128::ONE;
+                r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(survivors.is_empty(), "walk twin survivors: {survivors:?}");
+    }
+
+    /// Relation + shift twins: lockstep on a wiring-shaped relation and its
+    /// shift discharge, satisfiable, wire mutations rejected.
+    #[test]
+    fn relation_and_shift_twins_lockstep_and_mutations() {
+        let w_log = 3;
+        let w = 1usize << w_log;
+        let mut rng = Rng(0x511AD);
+        let carry: Vec<F128> = (0..w).map(|_| rng.f128()).collect();
+        let absorb: Vec<F128> = (0..w).map(|_| rng.f128()).collect();
+        let committed: Vec<&[F128]> = vec![&carry, &absorb];
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &[],
+        };
+        let coeff3 = F128 { lo: 3, hi: 0 };
+        let coeff5 = F128 { lo: 5, hi: 0 };
+        let terms = vec![
+            noid_ivc_core::deep_chain::relations::RelationTerm {
+                coeff: coeff3,
+                factors: vec![ColRef::CommittedShift(0)],
+            },
+            noid_ivc_core::deep_chain::relations::RelationTerm {
+                coeff: coeff5,
+                factors: vec![ColRef::Committed(1)],
+            },
+        ];
+        let mut rng2 = Rng(0xEEE);
+        let eq_point: Vec<F128> = (0..w_log).map(|_| rng2.f128()).collect();
+        let eq = build_eq_table(&eq_point);
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            let sh = if i == 0 { F128::ZERO } else { carry[i - 1] };
+            target += eq[i] * (coeff3 * sh + coeff5 * absorb[i]);
+        }
+
+        let mut ch_native = FsLaneChallenger::new(b"relation-twin-test");
+        let (proof, native_point, _) =
+            prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_native);
+        // Follow with the shift discharge natively.
+        let shift_value = proof.final_values[0];
+        let (shift_proof, native_shift_point) =
+            prove_shift_discharge(&carry, &native_point, shift_value, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"relation-twin-test");
+        let target_e = alloc_expr(&mut b, target);
+        let eq_point_e: Vec<LinExpr> = eq_point.iter().map(|&v| alloc_expr(&mut b, v)).collect();
+        let terms_e = vec![
+            RelationTermTrace {
+                coeff: LinExpr::constant(coeff3),
+                factors: vec![ColRef::CommittedShift(0)],
+            },
+            RelationTermTrace {
+                coeff: LinExpr::constant(coeff5),
+                factors: vec![ColRef::Committed(1)],
+            },
+        ];
+        let mutation_start = b.num_wires();
+        let proof_e = ColumnRelationProofTrace::alloc(&mut b, &proof, w_log, 2);
+        let shift_e = ShiftDischargeProofTrace::alloc(&mut b, &shift_proof, w_log);
+        let mutation_end = b.num_wires();
+
+        let point_e = verify_column_relation_trace(
+            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &proof_e,
+        );
+        let shift_point_e = verify_shift_discharge_trace(
+            &mut b,
+            &mut ch,
+            w_log,
+            &point_e,
+            &proof_e.final_values[0],
+            &shift_e,
+        );
+
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "relation twin transcript diverged");
+        for (e, n) in point_e.iter().zip(native_point.iter()) {
+            assert_eq!(e.eval(b.values()), *n);
+        }
+        for (e, n) in shift_point_e.iter().zip(native_shift_point.iter()) {
+            assert_eq!(e.eval(b.values()), *n);
+        }
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest relation twin unsatisfiable");
+
+        use rayon::prelude::*;
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&t| {
+                let mut bad = z.clone();
+                bad[t] += F128::ONE;
+                r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(survivors.is_empty(), "relation twin survivors: {survivors:?}");
+    }
+}

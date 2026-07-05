@@ -106,6 +106,21 @@ pub fn is_full_round(q: usize) -> bool {
     !(F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&q)
 }
 
+/// Flat-basis round constant of `lane` at round `q` (a protocol constant —
+/// verifier twins fold it into affine expressions).
+pub fn flat_round_constant(lane: usize, q: usize) -> F128 {
+    schedule().rc[lane][q]
+}
+
+/// Flat-basis MDS matrix (full or partial) — protocol constants.
+pub fn flat_mds(full: bool) -> &'static [[F128; STATE_SIZE]; STATE_SIZE] {
+    if full {
+        &schedule().mds_full
+    } else {
+        &schedule().mds_partial
+    }
+}
+
 /// The initial `MDS_FULL` the permutation applies before round 0 — callers
 /// fold it into the layer-0 columns (it is linear, so chain-wiring
 /// relations compose with it for free).
