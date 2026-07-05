@@ -18,8 +18,9 @@
 
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, ColRef, ColumnRelationProof, FixedPattern, RelationTerm, ShiftDischargeProof,
-    MAX_TERM_FACTORS, RELATION_DEGREE,
+    WeightedSumProof, MAX_TERM_FACTORS, RELATION_DEGREE,
 };
+use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::deep_chain::{
     flat_mds, flat_round_constant, is_full_round, DeepChainWalkProof, WALK_DEGREE,
 };
@@ -534,6 +535,119 @@ pub fn verify_shift_discharge_trace(
 }
 
 // ---------------------------------------------------------------------------
+// Weighted-sum discharge verifier twin + source-binding encode kernel
+// ---------------------------------------------------------------------------
+
+pub struct WeightedSumProofTrace {
+    pub rounds: Vec<[LinExpr; 2]>,
+    pub final_value: LinExpr,
+}
+
+impl WeightedSumProofTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &WeightedSumProof, w_log: usize) -> Self {
+        assert_eq!(native.rounds.len(), w_log, "weighted-sum round count");
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|wire| std::array::from_fn(|i| alloc_expr(b, wire[i])))
+                .collect(),
+            final_value: alloc_expr(b, native.final_value),
+        }
+    }
+}
+
+/// Trace twin of `relations::verify_weighted_sum`: the degree-2 sumcheck
+/// `Σ_i weights[i]·col[i] = target` reduced to a plain `col~(point)` claim.
+/// `weight_eval` builds `weights~(point)` as an expression from the derived
+/// point (the closed-form kernel — only known after the rounds are drawn),
+/// mirroring the native callback. Returns the derived point.
+pub fn verify_weighted_sum_trace<W>(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    w_log: usize,
+    target: &LinExpr,
+    proof: &WeightedSumProofTrace,
+    weight_eval: W,
+) -> Vec<LinExpr>
+where
+    W: FnOnce(&mut FieldR1csBuilder, &[LinExpr]) -> LinExpr,
+{
+    assert_eq!(proof.rounds.len(), w_log);
+    ch.observe_label(b, b"history-deep-chain-weighted-v0");
+    ch.observe_f128(b, target);
+
+    let mut claim = target.clone();
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        ch.observe_f128_slice(b, wire);
+        // Degree 2: c_1 = claim + c_2; p(r) = (c_2·r + c_1)·r + c_0.
+        let c1 = claim.add(&wire[1]);
+        let r = ch.sample_f128(b);
+        let t = mul(b, &wire[1], &r);
+        let t = mul(b, &t.add(&c1), &r);
+        claim = t.add(&wire[0]);
+        point.push(r);
+    }
+    ch.observe_f128(b, &proof.final_value);
+
+    let weight = weight_eval(b, &point);
+    let expected = mul(b, &weight, &proof.final_value);
+    pin_eq(b, &expected, &claim);
+    point
+}
+
+/// Trace twin of `encode_kernel::source_weight_at`: the MLE of the
+/// source-binding weight sequence `W_i = K_i(z)·eq(right,i)` at an expression
+/// point `x`. Flat-basis twiddles `tower_to_flat(2^{c+l})` are constants, so
+/// the only multiplications are the per-bit tensor folds — `O(n_rounds)`.
+pub fn source_weight_at_trace(
+    b: &mut FieldR1csBuilder,
+    z: &[LinExpr],
+    right: &[LinExpr],
+    x: &[LinExpr],
+    n_rounds: usize,
+) -> LinExpr {
+    assert_eq!(z.len(), n_rounds + 2, "encode kernel point arity");
+    assert_eq!(right.len(), n_rounds, "right arity");
+    assert_eq!(x.len(), n_rounds, "message point arity");
+    let z_pos = &z[..n_rounds];
+    let z_hi = &z[n_rounds..];
+    let one = LinExpr::constant(F128::ONE);
+    let mut total = LinExpr::zero();
+    for c in 0..4usize {
+        // eq₂(z_hi; c).
+        let mut eq2 = one.clone();
+        for (k, zk) in z_hi.iter().enumerate() {
+            let factor = if (c >> k) & 1 == 1 {
+                zk.clone()
+            } else {
+                one.add(zk)
+            };
+            eq2 = mul(b, &eq2, &factor);
+        }
+        // Π_l [ h_l(0)(1+x_l) + h_l(1)·x_l ], h_l(bit) = f_l(bit)·g_l(bit).
+        let mut prod = one.clone();
+        for l in 0..n_rounds {
+            let two = LinExpr::constant(flat_of_tower_u128(1u128 << (c + l)));
+            // f0 = 1 + z_l·(1+two); f1 = 1 + z_l·two (mul-by-const folds).
+            let f0 = one.add(&mul(b, &z_pos[l], &one.add(&two)));
+            let f1 = one.add(&mul(b, &z_pos[l], &two));
+            let g0 = one.add(&right[l]);
+            let g1 = right[l].clone();
+            let h0 = mul(b, &f0, &g0);
+            let h1 = mul(b, &f1, &g1);
+            let lo = mul(b, &h0, &one.add(&x[l]));
+            let hi = mul(b, &h1, &x[l]);
+            let term = lo.add(&hi);
+            prod = mul(b, &prod, &term);
+        }
+        total = total.add(&mul(b, &eq2, &prod));
+    }
+    total
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -836,5 +950,85 @@ mod tests {
             })
             .collect();
         assert!(survivors.is_empty(), "relation twin survivors: {survivors:?}");
+    }
+
+    /// The source-binding discharge twin: the in-trace weighted-sum verifier
+    /// with the encode-kernel weight (`K_i(z)·eq(right,i)`) matches the native
+    /// reduction lane-for-lane — same transcript, same derived point, honest
+    /// R1CS satisfiable, and the terminal claim is the true `H` opening.
+    #[test]
+    fn weighted_sum_source_binding_twin() {
+        use noid_ivc_core::deep_chain::encode_kernel::source_weight_at;
+        use noid_ivc_core::deep_chain::relations::prove_weighted_sum;
+
+        let n_rounds = 5usize;
+        let w = 1usize << n_rounds;
+        let mut rng = Rng(0x50FA11);
+        let h: Vec<F128> = (0..w).map(|_| rng.f128()).collect();
+        let right: Vec<F128> = (0..n_rounds).map(|_| rng.f128()).collect();
+        let z: Vec<F128> = (0..n_rounds + 2).map(|_| rng.f128()).collect();
+        let weights: Vec<F128> = (0..w)
+            .map(|i| {
+                let x: Vec<F128> = (0..n_rounds)
+                    .map(|l| {
+                        if (i >> l) & 1 == 1 {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        }
+                    })
+                    .collect();
+                source_weight_at(&z, &right, &x, n_rounds)
+            })
+            .collect();
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            target += weights[i] * h[i];
+        }
+
+        let mut ch_native = FsLaneChallenger::new(b"wsum-twin");
+        let (proof, native_point) = prove_weighted_sum(&h, &weights, target, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"wsum-twin");
+        let target_e = alloc_expr(&mut b, target);
+        let z_e: Vec<LinExpr> = z.iter().map(|&v| alloc_expr(&mut b, v)).collect();
+        let right_e: Vec<LinExpr> = right.iter().map(|&v| alloc_expr(&mut b, v)).collect();
+        let mutation_start = b.num_wires();
+        let proof_e = WeightedSumProofTrace::alloc(&mut b, &proof, n_rounds);
+        let mutation_end = b.num_wires();
+
+        let point_e = verify_weighted_sum_trace(
+            &mut b,
+            &mut ch,
+            n_rounds,
+            &target_e,
+            &proof_e,
+            |b, pt| source_weight_at_trace(b, &z_e, &right_e, pt, n_rounds),
+        );
+
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(c_t.eval(b.values()), c_n, "wsum twin transcript diverged");
+        for (e, n) in point_e.iter().zip(native_point.iter()) {
+            assert_eq!(e.eval(b.values()), *n, "wsum twin point diverged");
+        }
+        // The terminal claim is the true H opening at the derived point.
+        assert_eq!(mle_eval(&h, &native_point), proof.final_value);
+
+        let (r1cs, zz) = b.build();
+        assert!(r1cs.satisfies(&zz), "honest wsum twin unsatisfiable");
+
+        // Every allocated proof wire is constrained (0 surviving mutants).
+        use rayon::prelude::*;
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&t| {
+                let mut bad = zz.clone();
+                bad[t] += F128::ONE;
+                r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(survivors.is_empty(), "wsum twin survivors: {survivors:?}");
     }
 }
