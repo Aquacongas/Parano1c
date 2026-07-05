@@ -11,20 +11,16 @@
 //! component (`MerkleCircuit::build()`, TAG_COMPRESS) and the exact-state
 //! path batches (`TAG_EXSTNOD` / `TAG_RGDNODE`).
 //!
-//! ## Shape note (data-dependent structure)
+//! ## Shape note
 //!
-//! `directions` and `active_depth` are TRACE-STRUCTURE constants here: they
-//! select the claim/term layout at build time, exactly as the native
-//! verifier's data-dependent branches select it at run time. For the tx-root
-//! tree at the frozen shape maxima this is genuinely structural (depth and
-//! directions are functions of the padded tx index). For the exact-state
-//! trie the directions/depths derive from slot keys and `log_slots`, i.e.
-//! the R1CS matrix varies with block content — that violates the
-//! fixed-shape requirement of the recursion (the previous-proof verifier
-//! needs a protocol-constant matrix), and is resolved by the shape-freeze
-//! pass: direction bits become witness selectors with canonical padding.
-//! The per-instance soundness of THIS module is unaffected — the trace
-//! checks everything the native verifier checks for the given statement.
+//! `active_depth` is a TRACE-STRUCTURE constant: it is a class parameter
+//! (padded tx-tree depth, state-trie `log_slots`, guard depth), not block
+//! content. Path DIRECTIONS are block content (slot keys, tx indices) and
+//! enter as witness booleans: the absorbed packed-directions lane is an
+//! affine combination of the bit wires, the chain claims carry the union
+//! of both branches' terms with bit-scaled coefficients (mirroring the
+//! native union form), and the discharge replays each level through a
+//! left/right mux — so the R1CS matrix depends only on the shape class.
 
 use noid_core::{Block128, TowerField};
 use noid_gkr::merkle_batch_killshot::{
@@ -44,18 +40,19 @@ use super::block_spine::{
     ColumnAccumulator,
 };
 use super::{
-    alloc_block, const_block, flat_of, pin_zero, BatchEvalReductionTrace, FieldR1csBuilder,
-    LinExpr, RawChannelTrace,
+    alloc_block, const_block, flat_of, mul, pin_zero, BatchEvalReductionTrace, FieldR1csBuilder,
+    LinExpr, RawChannelTrace, F128,
 };
 
 /// Trace twin of `MerklePathInputs`. Digest lanes are witness expressions;
-/// `directions` / `active_depth` are trace structure (module docs). The
-/// canonical zero padding beyond `active_depth` (native
-/// `inputs_are_canonical`) is structural: those lanes are constants.
+/// `active_depth` is trace structure (module docs); `direction_bits` are
+/// witness booleans. The canonical zero padding beyond `active_depth`
+/// (native `inputs_are_canonical`) is structural: those lanes are
+/// constants, and the packed-directions lane sums only the active bits.
 pub struct MerklePathInputsTrace {
     pub leaf: [LinExpr; 2],
     pub siblings: Vec<[LinExpr; 2]>,
-    pub directions: Vec<bool>,
+    pub direction_bits: Vec<LinExpr>,
     pub expected_root: [LinExpr; 2],
     pub active_depth: usize,
 }
@@ -81,7 +78,10 @@ impl MerklePathInputsTrace {
             siblings: (0..native.active_depth)
                 .map(|l| std::array::from_fn(|i| alloc_block(b, native.siblings[l][i])))
                 .collect(),
-            directions: native.directions[..native.active_depth].to_vec(),
+            direction_bits: native.directions[..native.active_depth]
+                .iter()
+                .map(|&d| LinExpr::from_wire(b.alloc_bool(d)))
+                .collect(),
             expected_root: std::array::from_fn(|i| alloc_block(b, native.expected_root[i])),
             active_depth: native.active_depth,
         }
@@ -137,28 +137,34 @@ fn absorb_public_batch_trace(
     ch.absorb_const_tower(b, circuit.node_tag.as_u64() as u128);
     for input in inputs {
         // absorb_public_path: depth-first prefix, active levels only, all
-        // direction bits packed into one lane. Depth and directions are
-        // trace structure, so both packed lanes enter as constants.
+        // direction bits packed into one lane. Depth is trace structure
+        // (constant lane); the directions lane is the affine combination
+        // Σ bit_level·2^level of the witness bits (tower-basis powers —
+        // native packs an integer), which binds the bits to the killshot
+        // transcript.
         ch.absorb_const_tower(b, input.active_depth as u128);
         ch.absorb(b, &input.expected_root[0]);
         ch.absorb(b, &input.expected_root[1]);
         ch.absorb(b, &input.leaf[0]);
         ch.absorb(b, &input.leaf[1]);
-        let mut directions = 0u128;
+        let mut directions = LinExpr::zero();
         for level in 0..input.active_depth {
             ch.absorb(b, &input.siblings[level][0]);
             ch.absorb(b, &input.siblings[level][1]);
-            if input.directions[level] {
-                directions |= 1 << level;
-            }
+            directions = directions.add(
+                &input.direction_bits[level].scale(flat_of(Block128::from(1u128 << level))),
+            );
         }
-        ch.absorb_const_tower(b, directions);
+        ch.absorb(b, &directions);
     }
 }
 
 /// Trace twin of `append_path_chain_claims_at_offset` — same claim and term
-/// order; the direction branches are decided by the structural constants.
+/// order as the native union form: both branches' terms are present, with
+/// coefficients and values scaled by the direction bit `d` / `1 + d`
+/// (char 2), so the claim layout depends only on the depth.
 fn append_path_chain_claims_trace(
+    b: &mut FieldR1csBuilder,
     circuit: &MerkleCircuit,
     input: &MerklePathInputsTrace,
     slot_offset: usize,
@@ -175,48 +181,70 @@ fn append_path_chain_claims_trace(
             .scale(flat_of(mds(lane, 0)))
             .add(&pair[1].scale(flat_of(mds(lane, 1))))
     };
-    let state_term = |slot: usize, round: usize, lane: usize, coeff: Block128| LinearEvalTermTrace {
+    let state_term = |slot: usize, round: usize, lane: usize, coeff: LinExpr| LinearEvalTermTrace {
         index: spine_point_index(num_vars, slot, round, lane),
         coeff,
     };
+    let const_coeff = |v: Block128| LinExpr::constant(flat_of(v));
 
     for level in 0..depth {
         let perm_a_slot = slot_offset + level * 2;
         let perm_b_slot = perm_a_slot + 1;
-        let current_is_right = input.directions[level];
+        let d = &input.direction_bits[level];
+        let not_d = d.add_const(F128::ONE);
 
         for lane in 0..STATE_SIZE {
-            let mut terms = vec![state_term(perm_a_slot, 0, lane, Block128::ONE)];
-            let value = if current_is_right {
-                mds_pair(lane, &input.siblings[level]).add_const(iv_const(lane))
-            } else if level == 0 {
-                mds_pair(lane, &input.leaf).add_const(iv_const(lane))
+            let mut terms = vec![state_term(perm_a_slot, 0, lane, const_coeff(Block128::ONE))];
+            let mut value = mul(b, d, &mds_pair(lane, &input.siblings[level]))
+                .add_const(iv_const(lane));
+            if level == 0 {
+                value = value.add(&mul(b, &not_d, &mds_pair(lane, &input.leaf)));
             } else {
                 let prev_perm_b = perm_a_slot - 1;
-                terms.push(state_term(prev_perm_b, N_ROUNDS, 0, mds(lane, 0)));
-                terms.push(state_term(prev_perm_b, N_ROUNDS, 1, mds(lane, 1)));
-                LinExpr::constant(iv_const(lane))
-            };
+                terms.push(state_term(
+                    prev_perm_b,
+                    N_ROUNDS,
+                    0,
+                    not_d.scale(flat_of(mds(lane, 0))),
+                ));
+                terms.push(state_term(
+                    prev_perm_b,
+                    N_ROUNDS,
+                    1,
+                    not_d.scale(flat_of(mds(lane, 1))),
+                ));
+            }
             claims.push(LinearEvalClaimTrace { terms, value });
         }
 
         for lane in 0..STATE_SIZE {
-            let mut terms = vec![state_term(perm_b_slot, 0, lane, Block128::ONE)];
+            let mut terms = vec![state_term(perm_b_slot, 0, lane, const_coeff(Block128::ONE))];
             for src_lane in 0..STATE_SIZE {
-                terms.push(state_term(perm_a_slot, N_ROUNDS, src_lane, mds(lane, src_lane)));
+                terms.push(state_term(
+                    perm_a_slot,
+                    N_ROUNDS,
+                    src_lane,
+                    const_coeff(mds(lane, src_lane)),
+                ));
             }
-            let value = if current_is_right {
-                if level == 0 {
-                    mds_pair(lane, &input.leaf)
-                } else {
-                    let prev_perm_b = perm_a_slot - 1;
-                    terms.push(state_term(prev_perm_b, N_ROUNDS, 0, mds(lane, 0)));
-                    terms.push(state_term(prev_perm_b, N_ROUNDS, 1, mds(lane, 1)));
-                    LinExpr::zero()
-                }
+            let mut value = mul(b, &not_d, &mds_pair(lane, &input.siblings[level]));
+            if level == 0 {
+                value = value.add(&mul(b, d, &mds_pair(lane, &input.leaf)));
             } else {
-                mds_pair(lane, &input.siblings[level])
-            };
+                let prev_perm_b = perm_a_slot - 1;
+                terms.push(state_term(
+                    prev_perm_b,
+                    N_ROUNDS,
+                    0,
+                    d.scale(flat_of(mds(lane, 0))),
+                ));
+                terms.push(state_term(
+                    prev_perm_b,
+                    N_ROUNDS,
+                    1,
+                    d.scale(flat_of(mds(lane, 1))),
+                ));
+            }
             claims.push(LinearEvalClaimTrace { terms, value });
         }
     }
@@ -224,7 +252,7 @@ fn append_path_chain_claims_trace(
     let last_perm_b = slot_offset + (depth - 1) * 2 + 1;
     for lane in 0..MERKLE_PIN_LANES {
         claims.push(LinearEvalClaimTrace {
-            terms: vec![state_term(last_perm_b, N_ROUNDS, lane, Block128::ONE)],
+            terms: vec![state_term(last_perm_b, N_ROUNDS, lane, const_coeff(Block128::ONE))],
             value: input.expected_root[lane].clone(),
         });
     }
@@ -256,7 +284,14 @@ pub fn verify_batched_merkle_killshot_trace(
     let mut chain_claims = Vec::new();
     let mut slot_offset = 0usize;
     for input in inputs {
-        append_path_chain_claims_trace(circuit, input, slot_offset, proof.num_vars, &mut chain_claims);
+        append_path_chain_claims_trace(
+            b,
+            circuit,
+            input,
+            slot_offset,
+            proof.num_vars,
+            &mut chain_claims,
+        );
         slot_offset += input.live_slots();
     }
     let chain_red = verify_linear_eval_prebound_trace(
@@ -292,11 +327,16 @@ pub fn discharge_batched_merkle_trace(
         let mut current = [input.leaf[0].clone(), input.leaf[1].clone()];
         for level in 0..input.active_depth {
             let sibling = &input.siblings[level];
-            let (left, right) = if input.directions[level] {
-                (sibling.clone(), current.clone())
-            } else {
-                (current.clone(), sibling.clone())
-            };
+            // Left/right mux on the direction bit (d = 1 → current digest
+            // is the right child): one shared product per lane.
+            let d = &input.direction_bits[level];
+            let mut left = [LinExpr::zero(), LinExpr::zero()];
+            let mut right = [LinExpr::zero(), LinExpr::zero()];
+            for lane in 0..2 {
+                let t = mul(b, d, &current[lane].add(&sibling[lane]));
+                left[lane] = current[lane].add(&t);
+                right[lane] = sibling[lane].add(&t);
+            }
             let perm_a_in: [LinExpr; STATE_SIZE] = [
                 left[0].clone(),
                 left[1].clone(),

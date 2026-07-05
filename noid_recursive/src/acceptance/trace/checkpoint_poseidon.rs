@@ -241,7 +241,7 @@ fn header_hash_claims_padded_trace(
             for claim in &mut template {
                 claim.value = LinExpr::zero();
                 for term in &mut claim.terms {
-                    term.coeff = Block128::ZERO;
+                    term.coeff = LinExpr::zero();
                 }
             }
             claims.extend(template);
@@ -462,7 +462,7 @@ fn chain_acc_claims_padded_trace(
     let mds = |row: usize, col: usize| Block128::from(MDS_FULL[row][col]);
     let state_term = |slot: usize, round: usize, lane: usize, coeff: Block128| LinearEvalTermTrace {
         index: spine_point_index(num_vars, slot, round, lane),
-        coeff,
+        coeff: LinExpr::constant(flat_of(coeff)),
     };
     let mds_pair = |lane: usize, a: &LinExpr, b_: &LinExpr, c0: usize, c1: usize| {
         a.scale(flat_of(mds(lane, c0)))

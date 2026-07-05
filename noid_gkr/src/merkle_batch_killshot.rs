@@ -169,41 +169,49 @@ fn append_path_chain_claims_at_offset(
     }
     let depth = inputs.active_depth;
 
+    // Direction-independent claim SHAPE: every claim carries the union of
+    // both branches' terms, with per-term coefficients and values scaled by
+    // `d` / `1 + d` (`d` = 1 iff the current digest is the right child;
+    // char 2). A branch's absent term appears with a zero coefficient, so
+    // the claim VALUES equal the branch form exactly, while the term list —
+    // and therefore the verifying replay's structure — depends only on the
+    // depth. An arithmetic replay of this verifier needs that.
     let [iv_hi, iv_lo] = capacity_iv(circuit.node_tag);
     for level in 0..depth {
         let perm_a_slot = slot_offset + level * 2;
         let perm_b_slot = perm_a_slot + 1;
 
-        let current_is_right = inputs.directions[level];
+        let d = if inputs.directions[level] {
+            Block128::ONE
+        } else {
+            Block128::ZERO
+        };
+        let not_d = Block128::ONE + d;
+        let sibling = inputs.siblings[level];
 
-        // PermA row 0 must be the initial-MDS output for the left child.
-        // If the current digest is the right child, the sibling is absorbed
-        // first; otherwise the current digest is absorbed first.
+        // PermA row 0 must be the initial-MDS output for the left child:
+        // the sibling when the current digest is the right child, else the
+        // current digest (the leaf at level 0, the chained previous root
+        // above it).
         for lane in 0..STATE_SIZE {
             let mut terms = term_vec_with_first(
                 state_claim(num_vars, perm_a_slot, 0, lane),
-                if current_is_right || level == 0 { 1 } else { 3 },
+                if level == 0 { 1 } else { 3 },
             );
-            let value = if current_is_right {
-                mds_constant(
+            let mut value = mds_constant(
+                lane,
+                &[
+                    (0, d * sibling[0]),
+                    (1, d * sibling[1]),
+                    (2, iv_hi),
+                    (3, iv_lo),
+                ],
+            );
+            if level == 0 {
+                value += mds_constant(
                     lane,
-                    &[
-                        (0, inputs.siblings[level][0]),
-                        (1, inputs.siblings[level][1]),
-                        (2, iv_hi),
-                        (3, iv_lo),
-                    ],
-                )
-            } else if level == 0 {
-                mds_constant(
-                    lane,
-                    &[
-                        (0, inputs.leaf[0]),
-                        (1, inputs.leaf[1]),
-                        (2, iv_hi),
-                        (3, iv_lo),
-                    ],
-                )
+                    &[(0, not_d * inputs.leaf[0]), (1, not_d * inputs.leaf[1])],
+                );
             } else {
                 let prev_perm_b = perm_a_slot - 1;
                 terms.push(weighted_state_claim(
@@ -211,26 +219,26 @@ fn append_path_chain_claims_at_offset(
                     prev_perm_b,
                     N_ROUNDS,
                     0,
-                    mds_coeff(lane, 0),
+                    not_d * mds_coeff(lane, 0),
                 ));
                 terms.push(weighted_state_claim(
                     num_vars,
                     prev_perm_b,
                     N_ROUNDS,
                     1,
-                    mds_coeff(lane, 1),
+                    not_d * mds_coeff(lane, 1),
                 ));
-                mds_constant(lane, &[(2, iv_hi), (3, iv_lo)])
-            };
+            }
             claims.push(LinearEvalClaim { terms, value });
         }
 
         // PermB row 0 must be the initial-MDS output after XOR-absorbing
-        // the right child into the PermA output rate lanes.
+        // the right child into the PermA output rate lanes: the current
+        // digest when it is the right child, else the sibling.
         for lane in 0..STATE_SIZE {
             let mut terms = term_vec_with_first(
                 state_claim(num_vars, perm_b_slot, 0, lane),
-                if current_is_right && level > 0 { 7 } else { 5 },
+                if level == 0 { 5 } else { 7 },
             );
             for src_lane in 0..STATE_SIZE {
                 terms.push(weighted_state_claim(
@@ -241,31 +249,30 @@ fn append_path_chain_claims_at_offset(
                     mds_coeff(lane, src_lane),
                 ));
             }
-            let value = if current_is_right {
-                if level == 0 {
-                    mds_constant(lane, &[(0, inputs.leaf[0]), (1, inputs.leaf[1])])
-                } else {
-                    let prev_perm_b = perm_a_slot - 1;
-                    terms.push(weighted_state_claim(
-                        num_vars,
-                        prev_perm_b,
-                        N_ROUNDS,
-                        0,
-                        mds_coeff(lane, 0),
-                    ));
-                    terms.push(weighted_state_claim(
-                        num_vars,
-                        prev_perm_b,
-                        N_ROUNDS,
-                        1,
-                        mds_coeff(lane, 1),
-                    ));
-                    Block128::ZERO
-                }
+            let mut value =
+                mds_constant(lane, &[(0, not_d * sibling[0]), (1, not_d * sibling[1])]);
+            if level == 0 {
+                value += mds_constant(
+                    lane,
+                    &[(0, d * inputs.leaf[0]), (1, d * inputs.leaf[1])],
+                );
             } else {
-                let sibling = inputs.siblings[level];
-                mds_constant(lane, &[(0, sibling[0]), (1, sibling[1])])
-            };
+                let prev_perm_b = perm_a_slot - 1;
+                terms.push(weighted_state_claim(
+                    num_vars,
+                    prev_perm_b,
+                    N_ROUNDS,
+                    0,
+                    d * mds_coeff(lane, 0),
+                ));
+                terms.push(weighted_state_claim(
+                    num_vars,
+                    prev_perm_b,
+                    N_ROUNDS,
+                    1,
+                    d * mds_coeff(lane, 1),
+                ));
+            }
             claims.push(LinearEvalClaim { terms, value });
         }
     }

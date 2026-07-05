@@ -567,7 +567,7 @@ pub fn sponge_chain_claims_trace(
         for lane in 0..STATE_SIZE {
             let mut terms = vec![LinearEvalTermTrace {
                 index: spine_point_index(num_vars, slot, 0, lane),
-                coeff: Block128::ONE,
+                coeff: LinExpr::constant(F128::ONE),
             }];
             let value = if block_idx == 0 {
                 block[0]
@@ -578,7 +578,7 @@ pub fn sponge_chain_claims_trace(
                 for src_lane in 0..STATE_SIZE {
                     terms.push(LinearEvalTermTrace {
                         index: spine_point_index(num_vars, slot - 1, N_ROUNDS, src_lane),
-                        coeff: mds(lane, src_lane),
+                        coeff: LinExpr::constant(super::flat_of(mds(lane, src_lane))),
                     });
                 }
                 block[0]
@@ -593,7 +593,7 @@ pub fn sponge_chain_claims_trace(
         claims.push(LinearEvalClaimTrace {
             terms: vec![LinearEvalTermTrace {
                 index: spine_point_index(num_vars, last_slot, N_ROUNDS, lane),
-                coeff: Block128::ONE,
+                coeff: LinExpr::constant(F128::ONE),
             }],
             value: exp.clone(),
         });

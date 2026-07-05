@@ -46,6 +46,7 @@ use super::block_spine::{
 };
 use super::{
     alloc_block, const_block, BatchEvalReductionTrace, FieldR1csBuilder, LinExpr, RawChannelTrace,
+    F128,
 };
 
 /// Trace twin of the oracles' `padding_absorb_block` (`[0x80, 0x01 << 120]`).
@@ -183,7 +184,7 @@ fn tx_hash_pin_claims_trace(
             claims.push(LinearEvalClaimTrace {
                 terms: vec![LinearEvalTermTrace {
                     index: spine_point_index(num_vars, wrap_slot, N_ROUNDS, lane),
-                    coeff: Block128::ONE,
+                    coeff: LinExpr::constant(F128::ONE),
                 }],
                 value: tx_hash[lane].clone(),
             });

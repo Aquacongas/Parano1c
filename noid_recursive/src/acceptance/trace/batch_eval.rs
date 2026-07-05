@@ -160,7 +160,11 @@ pub struct EvalClaimTrace {
 pub struct LinearEvalTermTrace {
     /// Packed boolean point: bit `b` of `index` is coordinate `b`.
     pub index: usize,
-    pub coeff: Block128,
+    /// Flat-basis coefficient. Constant for direction-independent terms;
+    /// an affine expression in statement selector bits (e.g. Merkle
+    /// direction bits) where the claim shape is the union of data-dependent
+    /// branches.
+    pub coeff: LinExpr,
 }
 
 /// Trace twin of `LinearEvalClaim`: `Σ_j coeff_j · B(point_j) == value`.
@@ -278,7 +282,11 @@ pub fn verify_linear_eval_prebound_trace(
         let mut inner = LinExpr::zero();
         for term in &c.terms {
             let eq = eq_cache.eq_at_index(b, term.index);
-            inner = inner.add(&eq.scale(super::flat_of(term.coeff)));
+            if term.coeff.is_const() {
+                inner = inner.add(&eq.scale(term.coeff.constant));
+            } else {
+                inner = inner.add(&mul(b, &eq, &term.coeff));
+            }
         }
         // α_0 = 1: the first claim's contribution needs no multiplication.
         if a.is_const() && a.constant == F128::ONE {
@@ -469,6 +477,7 @@ pub fn verify_multi_batch_eval_trace(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{assert_expr_is, tower_value};
+    use super::super::flat_of;
     use super::*;
     use noid_core::mle::evaluate::evaluate_slice;
     use noid_core::transcript::FiatShamir;
@@ -567,7 +576,7 @@ mod tests {
                             .enumerate()
                             .map(|(i, v)| ((*v == Block128::ONE) as usize) << i)
                             .sum(),
-                        coeff: t.coeff,
+                        coeff: LinExpr::constant(flat_of(t.coeff)),
                     })
                     .collect(),
                 value: super::super::alloc_block(&mut b, c.value),
