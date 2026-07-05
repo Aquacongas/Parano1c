@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "self_verify_rows"
 harness = false
+
+[[bench]]
+name = "wallet_field_auth"
+harness = false
