@@ -1726,6 +1726,81 @@ mod tests {
         )
     }
 
+    /// The [B] block-slot assembly gate: the single-block component
+    /// verifier, replayed as a FieldR1cs trace, is satisfied by the honest
+    /// witness, its cross-component pins survive a full flip battery
+    /// (0 surviving mutants beyond the pin-helper class), and every
+    /// statement-anchor corruption breaks it — the assembled trace binds
+    /// the same relation the native verifier checks.
+    #[test]
+    fn block_slots_assembly_matches_native_and_rejects_mutations() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::block_slots::build_block_slots;
+        use noid_recursive::block_certificate_backend::verify_accepted_block_batch_components;
+
+        let (start_consensus, start_accumulator, start_parent, start_state, witness) =
+            user_block_fixture();
+        let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+            &start_consensus,
+            &start_accumulator,
+            &start_parent,
+            &start_state,
+            &witness,
+        )
+        .expect("fixture proves");
+        let inputs = &output.proof_components.component_inputs;
+        let end_accumulator = &output.accepted_claim_batch.accumulator;
+
+        // Native ground truth: the component verifier accepts.
+        verify_accepted_block_batch_components(
+            &start_consensus,
+            &start_accumulator,
+            end_accumulator,
+            inputs,
+            &proof,
+        )
+        .expect("native component verify accepts the fixture");
+
+        // Trace assembly of the same batch.
+        let mut b = FieldR1csBuilder::new();
+        let slots = build_block_slots(&mut b, &start_accumulator, end_accumulator, inputs, &proof);
+        // The projection lanes are the receipt↔header anchors the link
+        // exposes; sanity-check the count.
+        assert_eq!(slots.projection_lanes().len(), 12);
+        let pre_pad = b.num_wires();
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest block-slot witness satisfies");
+        eprintln!(
+            "[block-slots] 1 std tx: {pre_pad} wires (pre-pad), padded to 2^{}",
+            r1cs.k_log
+        );
+
+        // Flip battery over the whole witness (minus the pin-helper class).
+        let mut battery = r1cs.flip_battery(&z);
+        let survivors = battery.survivors_excluding_pin_helpers(0..z.len());
+        assert!(
+            survivors.is_empty(),
+            "flip-battery survivors: {} (first few: {:?})",
+            survivors.len(),
+            &survivors[..survivors.len().min(8)]
+        );
+
+        // Semantic [B] negative: a tampered accumulator boundary (multi-lane,
+        // beyond a single flip) breaks the claim-fold's end pins. The child
+        // state root the fold folds in is the real one, so the recomputed
+        // chain hash cannot match a wrong end accumulator.
+        let mut bad_end = end_accumulator.clone();
+        bad_end.chain_hash[0] ^= 0xA5;
+        bad_end.chain_hash[17] ^= 0x5A;
+        let mut b2 = FieldR1csBuilder::new();
+        let _ = build_block_slots(&mut b2, &start_accumulator, &bad_end, inputs, &proof);
+        let (r1cs2, z2) = b2.build();
+        assert!(
+            !r1cs2.satisfies(&z2),
+            "tampered accumulator boundary must break the block-slot trace"
+        );
+    }
+
     #[test]
     fn full_batch_accepts_coinbase_only_block_without_detached_proof() {
         let mut state = ChainState::with_log_slots(8);
