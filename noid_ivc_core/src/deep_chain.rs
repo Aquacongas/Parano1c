@@ -36,6 +36,8 @@
 //! (the linear coefficient is reconstructed from the running claim, so
 //! `p(0) + p(1) = claim` holds by construction).
 
+pub mod relations;
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -182,7 +184,7 @@ impl std::fmt::Display for WalkError {
 // Interpolation constants (evaluations at 0..=8 → monomial coefficients)
 // ---------------------------------------------------------------------------
 
-fn f128_inv(x: F128) -> F128 {
+pub(crate) fn f128_inv_pub(x: F128) -> F128 {
     // Fermat: x^(2^128 − 2).
     let exp: u128 = u128::MAX - 1;
     let mut result = F128::ONE;
@@ -223,7 +225,7 @@ fn interpolation_basis() -> &'static [[F128; WALK_DEGREE + 1]; WALK_DEGREE + 1] 
                 deg += 1;
                 poly = next;
             }
-            let inv = f128_inv(denom);
+            let inv = f128_inv_pub(denom);
             std::array::from_fn(|d| poly[d] * inv)
         })
     })
@@ -333,6 +335,10 @@ fn absorb_groups<Ch: Challenger>(challenger: &mut Ch, groups: &[LaneClaimGroup])
 }
 
 /// eq(a, b) for equal-length points.
+pub(crate) fn eq_eval_pub(a: &[F128], b: &[F128]) -> F128 {
+    eq_eval(a, b)
+}
+
 fn eq_eval(a: &[F128], b: &[F128]) -> F128 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = F128::ONE;
